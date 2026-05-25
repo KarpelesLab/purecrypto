@@ -4,7 +4,8 @@
 //! core produces BLAKE2b-256/384/512 and BLAKE2s-256. Keyed mode, salt, and
 //! personalization are not exposed.
 
-use super::Digest;
+use super::{Digest, Mac};
+use crate::ct::{Choice, ConstantTimeEq};
 
 /// Message-word schedule (12 rounds). BLAKE2b uses all 12; BLAKE2s uses the
 /// first 10.
@@ -519,6 +520,28 @@ impl Blake2bMac {
         debug_assert_eq!(out.len(), self.out_len);
         self.state.finalize_into(out);
     }
+    /// Consumes the MAC and checks it against `expected` in constant time.
+    pub fn verify(self, expected: &[u8]) -> Choice {
+        let mut buf = [0u8; 64];
+        let n = self.out_len;
+        self.state.finalize_into(&mut buf[..n]);
+        // Fails closed if `expected.len() != out_len`.
+        let eq = buf[..n].ct_eq(expected);
+        super::zeroize::zero_bytes(&mut buf);
+        eq
+    }
+}
+
+impl Mac for Blake2bMac {
+    fn update(&mut self, data: &[u8]) {
+        Blake2bMac::update(self, data);
+    }
+    fn finalize_into(self, out: &mut [u8]) {
+        Blake2bMac::finalize_into(self, out);
+    }
+    fn verify(self, expected: &[u8]) -> Choice {
+        Blake2bMac::verify(self, expected)
+    }
 }
 
 /// BLAKE2s in keyed mode — a MAC with a caller-chosen key and output length.
@@ -544,6 +567,28 @@ impl Blake2sMac {
     pub fn finalize_into(self, out: &mut [u8]) {
         debug_assert_eq!(out.len(), self.out_len);
         self.state.finalize_into(out);
+    }
+    /// Consumes the MAC and checks it against `expected` in constant time.
+    pub fn verify(self, expected: &[u8]) -> Choice {
+        let mut buf = [0u8; 32];
+        let n = self.out_len;
+        self.state.finalize_into(&mut buf[..n]);
+        // Fails closed if `expected.len() != out_len`.
+        let eq = buf[..n].ct_eq(expected);
+        super::zeroize::zero_bytes(&mut buf);
+        eq
+    }
+}
+
+impl Mac for Blake2sMac {
+    fn update(&mut self, data: &[u8]) {
+        Blake2sMac::update(self, data);
+    }
+    fn finalize_into(self, out: &mut [u8]) {
+        Blake2sMac::finalize_into(self, out);
+    }
+    fn verify(self, expected: &[u8]) -> Choice {
+        Blake2sMac::verify(self, expected)
     }
 }
 
@@ -809,6 +854,41 @@ mod tests {
             out,
             from_hex::<32>("48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
         );
+    }
+
+    #[test]
+    fn keyed_mac_verify_constant_time() {
+        let key = b"a secret key";
+        let msg = b"authenticate me";
+
+        let mut tag = [0u8; 32];
+        let mut m = Blake2bMac::new(key, 32);
+        m.update(msg);
+        m.finalize_into(&mut tag);
+
+        let mut m = Blake2bMac::new(key, 32);
+        m.update(msg);
+        assert!(bool::from(m.verify(&tag)));
+
+        let mut bad = tag;
+        bad[7] ^= 0x80;
+        let mut m = Blake2bMac::new(key, 32);
+        m.update(msg);
+        assert!(!bool::from(m.verify(&bad)));
+
+        // Wrong length fails closed.
+        let mut m = Blake2bMac::new(key, 32);
+        m.update(msg);
+        assert!(!bool::from(m.verify(&tag[..16])));
+
+        // BLAKE2s MAC round-trip.
+        let mut tag = [0u8; 16];
+        let mut m = Blake2sMac::new(key, 16);
+        m.update(msg);
+        m.finalize_into(&mut tag);
+        let mut m = Blake2sMac::new(key, 16);
+        m.update(msg);
+        assert!(bool::from(m.verify(&tag)));
     }
 
     // Official BLAKE2X KAT: input = 00..ff (256 bytes), 256-byte output
