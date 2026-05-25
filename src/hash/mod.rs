@@ -30,7 +30,8 @@ mod shake;
 mod sm3;
 
 pub use blake2::{
-    Blake2b256, Blake2b384, Blake2b512, Blake2s256, blake2b256, blake2b384, blake2b512, blake2s256,
+    Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
+    Blake2xbReader, Blake2xs, Blake2xsReader, blake2b256, blake2b384, blake2b512, blake2s256,
 };
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
