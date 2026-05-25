@@ -102,6 +102,36 @@ pub struct ClientConnection {
 }
 
 impl ClientConnection {
+    /// The negotiated cipher suite's wire identifier (e.g. `0x1301` for
+    /// `TLS_AES_128_GCM_SHA256`), available once the `ServerHello` has been
+    /// processed.
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.suite.map(|s| s.suite.0)
+    }
+
+    /// The IANA name of the negotiated cipher suite, if known.
+    pub fn negotiated_cipher_suite_name(&self) -> Option<&'static str> {
+        self.negotiated_cipher_suite().map(|id| match id {
+            0x1301 => "TLS_AES_128_GCM_SHA256",
+            0x1302 => "TLS_AES_256_GCM_SHA384",
+            _ => "UNKNOWN",
+        })
+    }
+
+    /// The negotiated protocol version string (always `"TLSv1.3"` here),
+    /// available once the `ServerHello` has been processed.
+    pub fn protocol_version(&self) -> Option<&'static str> {
+        self.suite.map(|_| "TLSv1.3")
+    }
+
+    /// The peer's certificate chain in wire order (DER), leaf first. Empty until
+    /// the server's `Certificate` message has been received.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.cert_chain
+    }
+}
+
+impl ClientConnection {
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
     /// `rng` supplies the ephemeral key shares and the client random. Offers
     /// both cipher suites and both key-exchange groups.
