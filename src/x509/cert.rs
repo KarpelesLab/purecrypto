@@ -6,7 +6,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{DistinguishedName, Error, Validity, algorithm_identifier, oid};
+use super::{
+    AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error, Validity,
+    algorithm_identifier, oid,
+};
 use crate::der::{
     Reader, encode_bit_string, encode_boolean, encode_context, encode_integer, encode_octet_string,
     encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
@@ -53,7 +56,7 @@ fn basic_constraints_ext(is_ca: bool) -> Vec<u8> {
 }
 
 /// Encodes a `subjectAltName` extension (dNSName entries) as one `Extension`.
-fn subject_alt_name_ext(dns_names: &[&str]) -> Vec<u8> {
+pub(super) fn subject_alt_name_ext(dns_names: &[&str]) -> Vec<u8> {
     // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is [2] IA5String,
     // an IMPLICIT primitive context tag (0x82).
     let mut names = Vec::new();
@@ -76,7 +79,32 @@ fn extensions(is_ca: bool, dns_names: &[&str]) -> Vec<u8> {
     encode_context(3, &encode_sequence(&list))
 }
 
-/// Builds the DER `TBSCertificate`.
+/// Builds the DER `TBSCertificate` from a pre-encoded subject
+/// `SubjectPublicKeyInfo` and inner `signature` AlgorithmIdentifier.
+#[allow(clippy::too_many_arguments)]
+fn build_tbs_raw(
+    serial: u64,
+    issuer: &DistinguishedName,
+    subject: &DistinguishedName,
+    validity: &Validity,
+    spki_der: &[u8],
+    sig_algid: &[u8],
+    is_ca: bool,
+    dns_names: &[&str],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_context(0, &encode_integer(&[2]))); // version v3
+    body.extend_from_slice(&encode_integer(&serial.to_be_bytes()));
+    body.extend_from_slice(sig_algid);
+    body.extend_from_slice(&issuer.to_der());
+    body.extend_from_slice(&validity.to_der());
+    body.extend_from_slice(&subject.to_der());
+    body.extend_from_slice(spki_der);
+    body.extend_from_slice(&extensions(is_ca, dns_names));
+    encode_sequence(&body)
+}
+
+/// Builds the DER `TBSCertificate` for an RSA subject key (SHA-256 with RSA).
 #[allow(clippy::too_many_arguments)]
 fn build_tbs<const LIMBS: usize>(
     serial: u64,
@@ -87,16 +115,16 @@ fn build_tbs<const LIMBS: usize>(
     is_ca: bool,
     dns_names: &[&str],
 ) -> Vec<u8> {
-    let mut body = Vec::new();
-    body.extend_from_slice(&encode_context(0, &encode_integer(&[2]))); // version v3
-    body.extend_from_slice(&encode_integer(&serial.to_be_bytes()));
-    body.extend_from_slice(&algorithm_identifier(oid::SHA256_WITH_RSA, true));
-    body.extend_from_slice(&issuer.to_der());
-    body.extend_from_slice(&validity.to_der());
-    body.extend_from_slice(&subject.to_der());
-    body.extend_from_slice(&rsa_spki(subject_key));
-    body.extend_from_slice(&extensions(is_ca, dns_names));
-    encode_sequence(&body)
+    build_tbs_raw(
+        serial,
+        issuer,
+        subject,
+        validity,
+        &rsa_spki(subject_key),
+        &algorithm_identifier(oid::SHA256_WITH_RSA, true),
+        is_ca,
+        dns_names,
+    )
 }
 
 impl Certificate {
@@ -196,6 +224,83 @@ impl Certificate {
             serial,
             is_ca,
             dns_names,
+        )
+    }
+
+    /// Issues a certificate signed by `signer` (RSA or ECDSA), binding
+    /// `subject` to `subject_key`. This is the general form behind the RSA-only
+    /// [`issue`](Self::issue): the subject key may be any [`AnyPublicKey`] and
+    /// the CA key any [`CertSigner`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_general(
+        signer: &CertSigner,
+        issuer: &DistinguishedName,
+        subject: &DistinguishedName,
+        subject_key: &AnyPublicKey,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+        dns_names: &[&str],
+    ) -> Result<Certificate, Error> {
+        let algid = signer.algorithm_identifier();
+        let tbs = build_tbs_raw(
+            serial,
+            issuer,
+            subject,
+            validity,
+            &subject_key.to_spki_der(),
+            &algid,
+            is_ca,
+            dns_names,
+        );
+        let sig = signer.sign(&tbs)?;
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        Ok(Certificate { der })
+    }
+
+    /// Issues a self-signed certificate using `signer` for both the key and the
+    /// signature (RSA or ECDSA).
+    pub fn self_signed_general(
+        signer: &CertSigner,
+        subject: &DistinguishedName,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+        dns_names: &[&str],
+    ) -> Result<Certificate, Error> {
+        let key = signer.public_key();
+        Self::issue_general(
+            signer, subject, subject, &key, validity, serial, is_ca, dns_names,
+        )
+    }
+
+    /// Issues a certificate from a verified PKCS#10 [`CertificationRequest`].
+    ///
+    /// The CSR's self-signature is checked first; the new certificate takes its
+    /// subject, public key, and `subjectAltName` dNSNames from the request, and
+    /// is signed by `signer` under `issuer`.
+    pub fn issue_from_csr(
+        signer: &CertSigner,
+        issuer: &DistinguishedName,
+        csr: &CertificationRequest,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+    ) -> Result<Certificate, Error> {
+        csr.verify_self_signed()?;
+        let subject = csr.subject()?;
+        let subject_key = csr.public_key()?;
+        let sans = csr.subject_alt_names()?;
+        let san_refs: Vec<&str> = sans.iter().map(|s| s.as_str()).collect();
+        Self::issue_general(
+            signer,
+            issuer,
+            &subject,
+            &subject_key,
+            validity,
+            serial,
+            is_ca,
+            &san_refs,
         )
     }
 
@@ -373,7 +478,7 @@ impl Certificate {
 
 /// Parses a `SubjectAltName` value (`SEQUENCE OF GeneralName`), collecting the
 /// dNSName (`[2] IA5String`, tag 0x82) entries.
-fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
+pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
     while !seq.is_empty() {
@@ -491,6 +596,28 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
         assert!(matches!(key, crate::x509::AnyPublicKey::Ecdsa(_)));
         // Self-signed: verifies under its own embedded key.
         cert.verify_signature_with(&key).unwrap();
+    }
+
+    #[test]
+    fn ec_self_signed_general() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ec-ca", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("ec self-signed");
+
+        let cert =
+            Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[]).unwrap();
+
+        assert_eq!(cert.subject().unwrap(), name);
+        assert_eq!(cert.issuer().unwrap(), name);
+        // The ecdsa-with-SHA256 self-signature verifies under the embedded key.
+        let key = cert.subject_public_key().unwrap();
+        assert!(matches!(key, crate::x509::AnyPublicKey::Ecdsa(_)));
+        cert.verify_signature_with(&key).unwrap();
+        cert.check_well_formed().unwrap();
     }
 
     #[test]

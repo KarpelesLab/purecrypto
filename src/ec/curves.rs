@@ -107,6 +107,30 @@ impl CurveId {
     pub(crate) fn order_len(self) -> usize {
         self.params().order_len
     }
+
+    /// The X.509 / SEC1 named-curve OID arcs.
+    #[cfg(feature = "der")]
+    pub(crate) fn named_curve_oid(self) -> &'static [u64] {
+        match self {
+            CurveId::P256 => &[1, 2, 840, 10045, 3, 1, 7],
+            CurveId::P384 => &[1, 3, 132, 0, 34],
+            CurveId::P521 => &[1, 3, 132, 0, 35],
+            CurveId::Secp256k1 => &[1, 3, 132, 0, 10],
+        }
+    }
+
+    /// Maps a named-curve OID to a [`CurveId`], if supported.
+    #[cfg(feature = "der")]
+    pub(crate) fn from_named_curve_oid(arcs: &[u64]) -> Option<CurveId> {
+        [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+        ]
+        .into_iter()
+        .find(|id| id.named_curve_oid() == arcs)
+    }
 }
 
 /// Decodes a big-endian hex string (ASCII whitespace ignored) into a

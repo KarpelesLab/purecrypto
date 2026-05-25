@@ -6,13 +6,17 @@
 //! RSA with PKCS#1 v1.5 signatures.
 
 mod cert;
+mod csr;
 mod name;
 mod pubkey;
+mod signer;
 mod time;
 
 pub use cert::Certificate;
+pub use csr::CertificationRequest;
 pub use name::DistinguishedName;
 pub use pubkey::AnyPublicKey;
+pub use signer::CertSigner;
 pub use time::{Time, Validity};
 
 use alloc::vec::Vec;
@@ -58,6 +62,8 @@ pub mod oid {
     pub const BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
     /// `id-ce-subjectAltName` (2.5.29.17).
     pub const SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
+    /// `extensionRequest` PKCS#9 attribute (1.2.840.113549.1.9.14).
+    pub const EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
 }
 
 /// Errors from X.509 encoding, parsing, and verification.

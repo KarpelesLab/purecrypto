@@ -299,6 +299,59 @@ impl BoxedEcdsaSignature {
     }
 }
 
+/// SEC1 `ECPrivateKey` DER/PEM (`EC PRIVATE KEY`), the format OpenSSL emits for
+/// EC keys.
+#[cfg(feature = "der")]
+impl BoxedEcdsaPrivateKey {
+    /// Encodes the key as a SEC1 `ECPrivateKey` DER structure (with the named
+    /// curve and public key included).
+    pub fn to_sec1_der(&self) -> Vec<u8> {
+        use crate::der::{
+            encode_bit_string, encode_context, encode_integer, encode_octet_string,
+            encode_sequence, oid_tlv,
+        };
+        let order_len = self.curve.order_len();
+        let priv_oct = encode_octet_string(&self.d.to_be_bytes(order_len));
+        // parameters [0] EXPLICIT namedCurve OID.
+        let params = encode_context(0, &oid_tlv(self.curve.named_curve_oid()));
+        // publicKey [1] EXPLICIT BIT STRING (uncompressed SEC1 point).
+        let pubkey = encode_context(1, &encode_bit_string(&self.public_key().to_sec1()));
+        encode_sequence(&[encode_integer(&[1]), priv_oct, params, pubkey].concat())
+    }
+
+    /// Encodes the key as a SEC1 PEM document (`-----BEGIN EC PRIVATE KEY-----`).
+    pub fn to_sec1_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("EC PRIVATE KEY", &self.to_sec1_der())
+    }
+
+    /// Parses a SEC1 `ECPrivateKey` DER structure (the named curve must be one
+    /// of the supported curves).
+    pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
+        use crate::der::{Reader, parse_oid, tag};
+        let mut outer = Reader::new(der);
+        let mut seq = outer.read_sequence().map_err(|_| Error::Malformed)?;
+        seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version
+        let priv_bytes = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        if seq.peek_tag() != Some(tag::context(0)) {
+            return Err(Error::Malformed);
+        }
+        let params = seq
+            .read_tlv(tag::context(0))
+            .map_err(|_| Error::Malformed)?;
+        let mut pr = Reader::new(params);
+        let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?;
+        let curve = CurveId::from_named_curve_oid(&arcs).ok_or(Error::Malformed)?;
+        Self::from_bytes(curve, priv_bytes)
+    }
+
+    /// Parses a SEC1 PEM EC private key.
+    pub fn from_sec1_pem(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        Self::from_sec1_der(&der)
+    }
+}
+
 impl BoxedEcdhPrivateKey {
     /// Generates a new ECDH private key on `curve` from `rng`.
     pub fn generate<R: RngCore>(curve: CurveId, rng: &mut R) -> Self {
@@ -441,6 +494,27 @@ mod tests {
                 .to_sec1(),
             sec1
         );
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn ec_private_key_sec1_roundtrip() {
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"sec1", b"n", &[]);
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+
+            let pem = sk.to_sec1_pem();
+            assert!(pem.starts_with("-----BEGIN EC PRIVATE KEY-----"));
+            let parsed = BoxedEcdsaPrivateKey::from_sec1_pem(&pem).unwrap();
+            assert_eq!(parsed.curve(), curve);
+            // Same key: public points match.
+            assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
+        }
     }
 
     #[test]
