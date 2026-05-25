@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/purecrypto/compare/v0.0.2...v0.0.3) - 2026-05-25
+
+### Added
+
+- *(cli)* add s_client TLS 1.3 test client
+- *(cli)* add req and x509 tools (CSR + RSA/ECDSA CA management)
+- *(cli)* add purecrypto binary with hash, rand, genpkey, pkey
+- *(ffi)* add C ABI (hashing, HMAC, RNG, RSA/ECDSA, X.509)
+- *(x509,ec,tls)* general (RSA+ECDSA) issuance, PKCS#10 CSR, EC key PEM, TLS accessors
+- *(hash)* add TurboSHAKE and KangarooTwelve (12-round Keccak XOFs)
+- *(hash)* add TupleHash and ParallelHash (SP 800-185)
+- *(hash)* zeroize key/state material on drop for keyed types
+- *(hash)* add unified Mac trait + constant-time verify for KMAC and BLAKE2 MACs
+- *(hash)* add BLAKE3 (hash, keyed, derive-key; Digest + XOF)
+- *(hash)* add keyed BLAKE2 (MAC) and BLAKE2X (XOF)
+- *(hash)* add cSHAKE, KMAC128/256 and KMAC-XOF (SP 800-185)
+- *(hash)* add SM3 (GB/T 32905)
+- *(hash)* add XOF trait, SHAKE128/256, and Keccak-256
+
+### Other
+
+- attach release binaries — CLI, C library (.a/.so), and header
+- document the C ABI + CLI, add a C-ABI smoke-test CI job
+- *(hash)* document the completed hash module and mark it done
+
 ## [0.0.2](https://github.com/KarpelesLab/purecrypto/compare/v0.0.1...v0.0.2) - 2026-05-25
 
 ### Added
