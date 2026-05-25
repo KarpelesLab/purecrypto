@@ -6,8 +6,12 @@
 //! free; the encoding helpers require the `alloc` feature.
 
 #[cfg(feature = "alloc")]
+mod pem;
+#[cfg(feature = "alloc")]
 mod writer;
 
+#[cfg(feature = "alloc")]
+pub use pem::{base64_decode, base64_encode, pem_decode, pem_encode};
 #[cfg(feature = "alloc")]
 pub use writer::{
     encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
@@ -56,6 +60,9 @@ pub enum Error {
     Malformed,
     /// Unconsumed bytes remained after parsing.
     TrailingData,
+    /// A PEM document or its Base64 body was malformed (e.g. missing
+    /// `-----BEGIN/END-----` markers, label mismatch, or invalid Base64).
+    Pem,
 }
 
 impl core::fmt::Display for Error {
@@ -71,6 +78,7 @@ impl core::fmt::Display for Error {
             Error::InvalidLength => f.write_str("invalid DER length encoding"),
             Error::Malformed => f.write_str("malformed DER value"),
             Error::TrailingData => f.write_str("trailing data after DER value"),
+            Error::Pem => f.write_str("malformed PEM document"),
         }
     }
 }
