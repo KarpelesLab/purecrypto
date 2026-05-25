@@ -26,6 +26,7 @@ mod sha256;
 mod sha3;
 mod sha512;
 mod shake;
+mod sm3;
 
 pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2s256, blake2b256, blake2b384, blake2b512, blake2s256,
@@ -45,6 +46,7 @@ pub use sha3::{
 pub use sha256::{Sha224, Sha256, sha224, sha256};
 pub use sha512::{Sha384, Sha512, Sha512_224, Sha512_256, sha384, sha512, sha512_224, sha512_256};
 pub use shake::{Shake128, Shake256, shake128, shake256};
+pub use sm3::{Sm3, sm3};
 
 /// A cryptographic hash function with an incremental (streaming) interface.
 ///
