@@ -93,17 +93,38 @@ pub fn is_prime<const LIMBS: usize, R: RngCore>(
     true
 }
 
-/// Generates a random (probable) prime occupying the full `LIMBS * 64`-bit
-/// width: both the most-significant and least-significant bits are set, so the
-/// result is odd and has the expected size.
-pub fn random_prime<const LIMBS: usize, R: RngCore>(rng: &mut R, rounds: usize) -> Uint<LIMBS> {
+/// Masks `limbs` so only the low `bits` bits can be set.
+fn mask_to_bits(limbs: &mut [u64], bits: usize) {
+    for (i, limb) in limbs.iter_mut().enumerate() {
+        let low = i * 64;
+        if low >= bits {
+            *limb = 0;
+        } else if low + 64 > bits {
+            let keep = bits - low; // 1..=63
+            *limb &= (1u64 << keep) - 1;
+        }
+    }
+}
+
+/// Generates a random (probable) prime of exactly `bits` bits: bit `bits-1`
+/// (most significant) and bit 0 (odd) are forced set.
+///
+/// # Panics
+/// Panics if `bits` is not in `2..=LIMBS*64`.
+pub fn random_prime<const LIMBS: usize, R: RngCore>(
+    rng: &mut R,
+    bits: usize,
+    rounds: usize,
+) -> Uint<LIMBS> {
+    assert!(bits >= 2 && bits <= LIMBS * 64, "bits out of range");
     loop {
         let mut limbs = [0u64; LIMBS];
         for limb in &mut limbs {
             *limb = rng.next_u64();
         }
+        mask_to_bits(&mut limbs, bits);
+        limbs[(bits - 1) / 64] |= 1 << ((bits - 1) % 64); // top bit → exact size
         limbs[0] |= 1; // odd
-        limbs[LIMBS - 1] |= 1 << 63; // full width
         let candidate = Uint::from_limbs(limbs);
         if is_prime(&candidate, rng, rounds) {
             return candidate;
@@ -149,13 +170,15 @@ mod tests {
     fn generated_primes_are_prime() {
         let mut r = rng();
         for _ in 0..3 {
-            let p = random_prime::<1, _>(&mut r, 20);
+            let p = random_prime::<1, _>(&mut r, 64, 20);
             assert!(bool::from(p.is_odd()));
             assert!(p.as_limbs()[0] >> 63 == 1, "top bit should be set");
             assert!(is_prime(&p, &mut r, 25));
         }
-        // A 128-bit prime exercises the multi-limb path.
-        let p = random_prime::<2, _>(&mut r, 20);
+        // A 96-bit prime in a 2-limb Uint exercises masking + the multi-limb
+        // path (bit 95 set, limb 1's upper bits clear).
+        let p = random_prime::<2, _>(&mut r, 96, 20);
         assert!(is_prime(&p, &mut r, 25));
+        assert_eq!(p.as_limbs()[1] >> 31, 1, "bit 95 set, above cleared");
     }
 }
