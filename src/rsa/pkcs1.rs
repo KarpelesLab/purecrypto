@@ -196,48 +196,41 @@ mod tests {
     use super::*;
     use crate::hash::{Sha224, Sha256};
     use crate::rng::HmacDrbg;
-
-    fn rng(label: &[u8]) -> HmacDrbg<Sha256> {
-        HmacDrbg::new(label, b"nonce", &[])
-    }
+    use crate::test_util::rsa_test_key_a;
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        let mut r = rng(b"rsa-enc");
-        // 256-bit modulus: k = 32, so up to 21 message bytes.
-        let key = RsaPrivateKey::<4>::generate(Uint::from_u64(65537), &mut r, 16);
+        // RSA-2048: k = 256, so up to 245 message bytes.
+        let key = rsa_test_key_a();
         let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-enc", b"nonce", &[]);
 
         let msg = b"hello rsa";
         let ct = pk.encrypt_pkcs1v15(msg, &mut r).unwrap();
-        assert_eq!(ct.len(), 32);
+        assert_eq!(ct.len(), 256);
         assert_ne!(&ct[..], msg);
-        let pt = key.decrypt_pkcs1v15(&ct).unwrap();
-        assert_eq!(pt, msg);
+        assert_eq!(key.decrypt_pkcs1v15(&ct).unwrap(), msg);
     }
 
     #[test]
     fn encrypt_rejects_overlong() {
-        let mut r = rng(b"rsa-enc2");
-        let key = RsaPrivateKey::<4>::generate(Uint::from_u64(65537), &mut r, 16);
-        let pk = key.public_key();
-        // k - 11 = 21; 22 bytes must be rejected.
+        let pk = rsa_test_key_a().public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-enc2", b"nonce", &[]);
+        // k - 11 = 245; 246 bytes must be rejected.
         assert_eq!(
-            pk.encrypt_pkcs1v15(&[0u8; 22], &mut r),
+            pk.encrypt_pkcs1v15(&[0u8; 246], &mut r),
             Err(Error::MessageTooLong)
         );
     }
 
     #[test]
     fn sign_verify_roundtrip() {
-        let mut r = rng(b"rsa-sig");
-        // SHA-256 DigestInfo is 51 bytes, needing k >= 62, so RSA-512 (k=64).
-        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let key = rsa_test_key_a();
         let pk = key.public_key();
 
         let msg = b"sign me";
         let sig = key.sign_pkcs1v15::<Sha256>(msg).unwrap();
-        assert_eq!(sig.len(), 64);
+        assert_eq!(sig.len(), 256);
         assert!(pk.verify_pkcs1v15::<Sha256>(msg, &sig).is_ok());
 
         // Wrong message fails.
@@ -252,7 +245,7 @@ mod tests {
             pk.verify_pkcs1v15::<Sha256>(msg, &bad),
             Err(Error::Verification)
         );
-        // Wrong hash algorithm fails (different DigestInfo, but still fits k).
+        // Wrong hash algorithm fails (different DigestInfo).
         assert_eq!(
             pk.verify_pkcs1v15::<Sha224>(msg, &sig),
             Err(Error::Verification)

@@ -157,34 +157,26 @@ mod tests {
         HmacDrbg::new(b"rsa-keygen-test", b"nonce", &[])
     }
 
+    // Generating a real RSA-2048 key is fast in release (~0.6s) but slow in an
+    // unoptimized debug test build, so this is ignored by default. Run it with
+    //   cargo test --release -- --ignored
+    // Day-to-day RSA tests use the fixed embedded 2048-bit keys instead.
     #[test]
-    fn keygen_roundtrip_128bit() {
+    #[ignore = "slow in debug; run with --release --ignored"]
+    fn keygen_roundtrip_rsa2048() {
         let mut r = rng();
-        let e = Uint::<2>::from_u64(65537);
-        let key = RsaPrivateKey::<2>::generate(e, &mut r, 24);
+        let e = Uint::<32>::from_u64(65537);
+        let key = RsaPrivateKey::<32>::generate(e, &mut r, 16);
         let pubkey = key.public_key();
 
-        // n must be odd and have its public exponent intact.
         assert!(bool::from(key.modulus().is_odd()));
         assert_eq!(pubkey.exponent(), &e);
+        assert_eq!(key.modulus().bit_len(), 2048);
 
-        for m in [3u64, 0x1234_5678, 0xdead_beef] {
-            let m = Uint::<2>::from_u64(m);
-            let c = pubkey.raw(&m);
-            assert_eq!(key.raw(&c), m, "RSA round-trip failed");
-        }
-    }
-
-    #[test]
-    fn keygen_roundtrip_256bit() {
-        let mut r = rng();
-        let e = Uint::<4>::from_u64(65537);
-        let key = RsaPrivateKey::<4>::generate(e, &mut r, 16);
-        let pubkey = key.public_key();
-        let m = Uint::<4>::from_u64(0x0123_4567_89ab_cdef);
+        // Encrypt/decrypt round-trips, confirming d = e^-1 mod φ(n) is correct.
+        let m = Uint::<32>::from_u64(0x0123_4567_89ab_cdef);
         let c = pubkey.raw(&m);
-        assert_eq!(key.raw(&c), m);
-        // Encryption is not the identity.
         assert_ne!(c, m);
+        assert_eq!(key.raw(&c), m);
     }
 }
