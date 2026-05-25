@@ -24,7 +24,7 @@
 //! monomorphization and stores secrets in a length-tagged [`Secret`] buffer so
 //! a single type holds either a 32- or 48-byte secret.
 
-use crate::hash::{Digest, Sha256, Sha384};
+use crate::hash::{Digest, Hmac, Sha256, Sha384};
 use crate::kdf::{hkdf_expand, hkdf_extract};
 use alloc::vec::Vec;
 
@@ -257,6 +257,24 @@ pub(crate) fn finished_key(alg: HashAlg, secret: &Secret) -> Secret {
     let n = alg.output_len();
     expand_label_dyn(alg, secret.as_slice(), b"finished", &[], &mut out[..n]);
     Secret::new(&out[..n])
+}
+
+/// The Finished message `verify_data`:
+/// `HMAC(finished_key, Transcript-Hash(handshake))` (RFC 8446 §4.4.4).
+pub(crate) fn finished_verify_data(
+    alg: HashAlg,
+    traffic_secret: &Secret,
+    transcript_hash: &[u8],
+) -> Secret {
+    let fk = finished_key(alg, traffic_secret);
+    match alg {
+        HashAlg::Sha256 => {
+            Secret::new(Hmac::<Sha256>::mac(fk.as_slice(), transcript_hash).as_ref())
+        }
+        HashAlg::Sha384 => {
+            Secret::new(Hmac::<Sha384>::mac(fk.as_slice(), transcript_hash).as_ref())
+        }
+    }
 }
 
 #[cfg(test)]

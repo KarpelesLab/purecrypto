@@ -1,16 +1,17 @@
 //! TLS wire encoding/decoding: a small cursor + length-prefix helpers, plus
 //! record framing and handshake message structures.
 
+pub(crate) mod extension;
 mod handshake;
 mod primitives;
 mod record;
 
 #[allow(unused_imports)]
-pub(crate) use handshake::{ClientHello, ServerHello};
+pub(crate) use handshake::{ClientHello, RawExtension, ServerHello, hs_type, read_handshake};
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
 #[allow(unused_imports)]
-pub(crate) use record::{read_record, write_record};
+pub(crate) use record::{ParsedRecord, read_record, write_record};
 
 use super::Error;
 use alloc::vec::Vec;
