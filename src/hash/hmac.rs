@@ -1,7 +1,7 @@
 //! HMAC — Hash-based Message Authentication Code (RFC 2104), generic over any
 //! [`Digest`].
 
-use super::Digest;
+use super::{Digest, Mac};
 use crate::ct::{Choice, ConstantTimeEq};
 
 const IPAD: u8 = 0x36;
@@ -95,6 +95,26 @@ impl<D: Digest> Hmac<D> {
         let mut h = Self::new(key);
         h.update(data);
         h.finalize()
+    }
+}
+
+impl<D: Digest> Mac for Hmac<D> {
+    #[inline]
+    fn update(&mut self, data: &[u8]) {
+        Hmac::update(self, data);
+    }
+    /// Writes the full HMAC tag, truncated to `out.len()` if it is shorter than
+    /// the digest length.
+    #[inline]
+    fn finalize_into(self, out: &mut [u8]) {
+        let tag = self.finalize();
+        let t = tag.as_ref();
+        let n = out.len().min(t.len());
+        out[..n].copy_from_slice(&t[..n]);
+    }
+    #[inline]
+    fn verify(self, expected: &[u8]) -> Choice {
+        Hmac::verify(self, expected)
     }
 }
 

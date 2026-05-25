@@ -38,6 +38,7 @@ mod sha3;
 mod sha512;
 mod shake;
 mod sm3;
+mod zeroize;
 
 pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
@@ -151,4 +152,40 @@ pub trait ExtendableOutput: Clone {
 pub trait XofReader {
     /// Fills `out` with the next output bytes.
     fn read(&mut self, out: &mut [u8]);
+}
+
+/// A message authentication code: a keyed function producing an
+/// authentication tag, with constant-time verification.
+///
+/// Implemented by [`Hmac`], [`Kmac128`]/[`Kmac256`], and
+/// [`Blake2bMac`]/[`Blake2sMac`]. Each is constructed by its own keyed
+/// constructor; this trait unifies the post-construction interface so generic
+/// code can feed data, produce a tag, and verify it.
+pub trait Mac: Clone {
+    /// Feeds message bytes. May be called any number of times.
+    fn update(&mut self, data: &[u8]);
+
+    /// Consumes the MAC and writes the tag into `out`.
+    ///
+    /// For variable-length MACs (KMAC, BLAKE2-MAC) the tag length is
+    /// `out.len()`. For fixed-length MACs (HMAC) the full digest is written,
+    /// truncated to `out.len()` if shorter.
+    fn finalize_into(self, out: &mut [u8]);
+
+    /// Consumes the MAC and checks the tag against `expected` in constant time.
+    ///
+    /// The comparison time depends only on the (public) tag length, not on
+    /// where a mismatch occurs. The default implementation supports tags up to
+    /// 64 bytes; for longer tags use [`finalize_into`](Mac::finalize_into) with
+    /// [`ConstantTimeEq`](crate::ct::ConstantTimeEq) directly.
+    fn verify(self, expected: &[u8]) -> crate::ct::Choice {
+        use crate::ct::ConstantTimeEq;
+        let mut buf = [0u8; 64];
+        let n = expected.len().min(buf.len());
+        self.finalize_into(&mut buf[..n]);
+        // `ct_eq` fails closed when `n < expected.len()` (length mismatch).
+        let eq = buf[..n].ct_eq(expected);
+        zeroize::zero_bytes(&mut buf);
+        eq
+    }
 }

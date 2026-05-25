@@ -168,6 +168,19 @@ macro_rules! kmac {
                 self.keccak.finalize(0x04);
                 self.keccak.squeeze(out);
             }
+            /// Consumes the MAC and checks it against `expected` in constant
+            /// time (tags up to 64 bytes; see [`Mac::verify`](super::Mac::verify)).
+            pub fn verify(self, expected: &[u8]) -> crate::ct::Choice {
+                super::Mac::verify(self, expected)
+            }
+        }
+        impl super::Mac for $name {
+            fn update(&mut self, data: &[u8]) {
+                $name::update(self, data);
+            }
+            fn finalize_into(self, out: &mut [u8]) {
+                $name::finalize_into(self, out);
+            }
         }
     };
 }
@@ -275,6 +288,33 @@ mod tests {
             out,
             from_hex::<32>("c1c36925b6409a04f1b504fcbca9d82b4017277cb5ed2b2065fc1d3814d5aaf5")
         );
+    }
+
+    #[test]
+    fn kmac_verify_constant_time() {
+        let key = sample_key();
+        let data = [0x00u8, 0x01, 0x02, 0x03];
+        let mut tag = [0u8; 32];
+        let mut m = Kmac128::new(&key, b"");
+        m.update(&data);
+        m.finalize_into(&mut tag);
+
+        // Good tag verifies.
+        let mut m = Kmac128::new(&key, b"");
+        m.update(&data);
+        assert!(bool::from(m.verify(&tag)));
+
+        // Flipped bit fails.
+        let mut bad = tag;
+        bad[0] ^= 1;
+        let mut m = Kmac128::new(&key, b"");
+        m.update(&data);
+        assert!(!bool::from(m.verify(&bad)));
+
+        // Wrong length fails.
+        let mut m = Kmac128::new(&key, b"");
+        m.update(&data);
+        assert!(!bool::from(m.verify(&tag[..31])));
     }
 
     #[test]
