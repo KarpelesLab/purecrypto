@@ -18,11 +18,13 @@
 #![allow(dead_code)]
 
 mod codec;
+mod conn;
 mod crypto;
 mod error;
 mod pki;
 mod version;
 
+pub use conn::{ClientConfig, ClientConnection};
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::RootCertStore;
 pub use version::{ContentType, ProtocolVersion};

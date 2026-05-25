@@ -8,6 +8,7 @@ mod aead;
 mod hash;
 mod schedule;
 mod sign;
+mod suite;
 
 #[allow(unused_imports)]
 pub(crate) use aead::RecordCrypter;
@@ -15,7 +16,10 @@ pub(crate) use aead::RecordCrypter;
 pub(crate) use hash::Transcript;
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-    HashAlg, KeySchedule, Secret, derive_secret, expand_label_dyn, finished_key, traffic_key_iv,
+    HashAlg, KeySchedule, Secret, derive_secret, expand_label_dyn, finished_key,
+    finished_verify_data, traffic_key_iv,
 };
 #[allow(unused_imports)]
 pub(crate) use sign::{certificate_verify_content, verify_signature};
+#[allow(unused_imports)]
+pub(crate) use suite::{SuiteParams, lookup as lookup_suite};
