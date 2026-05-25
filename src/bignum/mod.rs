@@ -10,7 +10,9 @@
 //! Diffie-Hellman, ECDSA). Modular arithmetic (Montgomery form, modexp,
 //! inversion) is layered on top.
 
+mod montgomery;
 mod mul;
 mod uint;
 
+pub use montgomery::MontModulus;
 pub use uint::{LIMB_BITS, Limb, Uint};
