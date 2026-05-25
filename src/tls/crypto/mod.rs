@@ -4,9 +4,12 @@
 //! Both are generic over the negotiated hash (SHA-256 / SHA-384) and dispatch
 //! at the runtime cipher-suite boundary.
 
+mod aead;
 mod hash;
 mod schedule;
 
+#[allow(unused_imports)]
+pub(crate) use aead::RecordCrypter;
 #[allow(unused_imports)]
 pub(crate) use hash::Transcript;
 #[allow(unused_imports)]

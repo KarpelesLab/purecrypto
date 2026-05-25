@@ -81,6 +81,22 @@ pub(crate) mod test_util {
         out
     }
 
+    /// Decodes a hex string (ignoring ASCII whitespace) into a byte vector,
+    /// for variable-length fixtures such as the RFC 8448 record traces.
+    #[cfg(feature = "alloc")]
+    pub(crate) fn from_hex_vec(s: &str) -> alloc::vec::Vec<u8> {
+        let digits: alloc::vec::Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        assert_eq!(digits.len() % 2, 0, "hex string has odd length");
+        digits
+            .chunks(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).expect("invalid hex") as u8;
+                let lo = (pair[1] as char).to_digit(16).expect("invalid hex") as u8;
+                (hi << 4) | lo
+            })
+            .collect()
+    }
+
     /// A fixed 2048-bit RSA test key (32 limbs), parsed from an embedded
     /// PKCS#1 PEM fixture. Avoids per-test key generation while keeping tests
     /// at a realistic key size.
