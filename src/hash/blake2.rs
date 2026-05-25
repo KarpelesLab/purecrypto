@@ -178,6 +178,15 @@ impl Blake2bState {
         }
     }
 
+    /// Best-effort wipe of the chaining value and buffered block.
+    fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.h);
+        super::zeroize::zero_bytes(&mut self.buf);
+        self.t0 = 0;
+        self.t1 = 0;
+        self.buf_len = 0;
+    }
+
     fn update(&mut self, mut data: &[u8]) {
         let fill = 128 - self.buf_len;
         // Only compress a full buffer when more data is known to follow, so the
@@ -199,7 +208,7 @@ impl Blake2bState {
         self.buf_len += data.len();
     }
 
-    fn finalize_into(mut self, out: &mut [u8]) {
+    fn finalize_into(&mut self, out: &mut [u8]) {
         self.inc(self.buf_len as u64);
         for b in self.buf[self.buf_len..].iter_mut() {
             *b = 0;
@@ -367,6 +376,15 @@ impl Blake2sState {
         }
     }
 
+    /// Best-effort wipe of the chaining value and buffered block.
+    fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.h);
+        super::zeroize::zero_bytes(&mut self.buf);
+        self.t0 = 0;
+        self.t1 = 0;
+        self.buf_len = 0;
+    }
+
     fn update(&mut self, mut data: &[u8]) {
         let fill = 64 - self.buf_len;
         if data.len() > fill {
@@ -386,7 +404,7 @@ impl Blake2sState {
         self.buf_len += data.len();
     }
 
-    fn finalize_into(mut self, out: &mut [u8]) {
+    fn finalize_into(&mut self, out: &mut [u8]) {
         self.inc(self.buf_len as u32);
         for b in self.buf[self.buf_len..].iter_mut() {
             *b = 0;
@@ -433,10 +451,14 @@ macro_rules! blake2b {
                 self.state.update(data);
             }
             #[inline]
-            fn finalize(self) -> [u8; $out] {
+            fn finalize(mut self) -> [u8; $out] {
                 let mut out = [0u8; $out];
                 self.state.finalize_into(&mut out);
                 out
+            }
+            #[inline]
+            fn zeroize(&mut self) {
+                self.state.zeroize();
             }
         }
         #[doc = $doc]
@@ -480,10 +502,14 @@ impl Digest for Blake2s256 {
         self.state.update(data);
     }
     #[inline]
-    fn finalize(self) -> [u8; 32] {
+    fn finalize(mut self) -> [u8; 32] {
         let mut out = [0u8; 32];
         self.state.finalize_into(&mut out);
         out
+    }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
     }
 }
 
@@ -516,12 +542,12 @@ impl Blake2bMac {
     }
     /// Writes the `out_len`-byte tag into `out` (`out.len()` must equal the
     /// `out_len` given to [`new`](Self::new)).
-    pub fn finalize_into(self, out: &mut [u8]) {
+    pub fn finalize_into(mut self, out: &mut [u8]) {
         debug_assert_eq!(out.len(), self.out_len);
         self.state.finalize_into(out);
     }
     /// Consumes the MAC and checks it against `expected` in constant time.
-    pub fn verify(self, expected: &[u8]) -> Choice {
+    pub fn verify(mut self, expected: &[u8]) -> Choice {
         let mut buf = [0u8; 64];
         let n = self.out_len;
         self.state.finalize_into(&mut buf[..n]);
@@ -541,6 +567,12 @@ impl Mac for Blake2bMac {
     }
     fn verify(self, expected: &[u8]) -> Choice {
         Blake2bMac::verify(self, expected)
+    }
+}
+
+impl Drop for Blake2bMac {
+    fn drop(&mut self) {
+        self.state.zeroize();
     }
 }
 
@@ -564,12 +596,12 @@ impl Blake2sMac {
         self.state.update(data);
     }
     /// Writes the `out_len`-byte tag into `out`.
-    pub fn finalize_into(self, out: &mut [u8]) {
+    pub fn finalize_into(mut self, out: &mut [u8]) {
         debug_assert_eq!(out.len(), self.out_len);
         self.state.finalize_into(out);
     }
     /// Consumes the MAC and checks it against `expected` in constant time.
-    pub fn verify(self, expected: &[u8]) -> Choice {
+    pub fn verify(mut self, expected: &[u8]) -> Choice {
         let mut buf = [0u8; 32];
         let n = self.out_len;
         self.state.finalize_into(&mut buf[..n]);
@@ -589,6 +621,12 @@ impl Mac for Blake2sMac {
     }
     fn verify(self, expected: &[u8]) -> Choice {
         Blake2sMac::verify(self, expected)
+    }
+}
+
+impl Drop for Blake2sMac {
+    fn drop(&mut self) {
+        self.state.zeroize();
     }
 }
 
@@ -629,7 +667,7 @@ impl Blake2xb {
         self.state.update(data);
     }
     /// Finalizes and returns the output reader.
-    pub fn finalize_xof(self) -> Blake2xbReader {
+    pub fn finalize_xof(mut self) -> Blake2xbReader {
         let mut b0 = [0u8; 64];
         self.state.finalize_into(&mut b0);
         Blake2xbReader {
@@ -716,7 +754,7 @@ impl Blake2xs {
         self.state.update(data);
     }
     /// Finalizes and returns the output reader.
-    pub fn finalize_xof(self) -> Blake2xsReader {
+    pub fn finalize_xof(mut self) -> Blake2xsReader {
         let mut b0 = [0u8; 32];
         self.state.finalize_into(&mut b0);
         Blake2xsReader {

@@ -185,6 +185,14 @@ impl State512 {
         }
     }
 
+    /// Best-effort wipe of the state words and partial block.
+    fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.h);
+        super::zeroize::zero_bytes(&mut self.block);
+        self.block_len = 0;
+        self.msg_len = 0;
+    }
+
     /// Applies SHA-2 padding and returns the final state words.
     fn finalize(mut self) -> [u64; 8] {
         // 128-bit big-endian bit length occupies the last 16 bytes.
@@ -321,6 +329,11 @@ macro_rules! sha512_variant {
             #[inline]
             fn finalize(self) -> [u8; $out] {
                 truncate_words(&self.state.finalize())
+            }
+
+            #[inline]
+            fn zeroize(&mut self) {
+                self.state.zeroize();
             }
         }
 

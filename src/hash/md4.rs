@@ -146,6 +146,10 @@ impl Digest for Md4 {
     fn finalize(self) -> [u8; 16] {
         words_to_bytes_le(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// Computes the MD4 digest of `data`.

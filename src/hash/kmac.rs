@@ -182,6 +182,11 @@ macro_rules! kmac {
                 $name::finalize_into(self, out);
             }
         }
+        impl Drop for $name {
+            fn drop(&mut self) {
+                self.keccak.zeroize();
+            }
+        }
     };
 }
 

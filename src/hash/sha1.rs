@@ -86,6 +86,10 @@ impl Digest for Sha1 {
     fn finalize(self) -> [u8; 20] {
         words_to_bytes_be(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// Computes the SHA-1 digest of `data`.

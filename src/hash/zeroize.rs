@@ -15,3 +15,28 @@ pub(super) fn zero_bytes(bytes: &mut [u8]) {
     }
     let _ = core::hint::black_box(bytes);
 }
+
+/// Overwrites a slice of integer words with zeros.
+#[inline]
+pub(super) fn zero_words<T: Default + Copy>(words: &mut [T]) {
+    for w in words.iter_mut() {
+        *w = T::default();
+    }
+    let _ = core::hint::black_box(words);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wipes() {
+        let mut bytes = [0xABu8; 16];
+        zero_bytes(&mut bytes);
+        assert_eq!(bytes, [0u8; 16]);
+
+        let mut words = [0xDEAD_BEEFu32; 8];
+        zero_words(&mut words);
+        assert_eq!(words, [0u32; 8]);
+    }
+}
