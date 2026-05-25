@@ -1,84 +1,73 @@
-//! Modular inverse via the binary extended GCD.
+//! Modular inverse via the extended Euclidean algorithm.
 
 use super::Uint;
-use super::uint::LIMB_BITS;
 use crate::ct::ConstantTimeLess;
 
-/// Computes `a^-1 mod m` for an **odd** modulus `m`, returning `None` when no
-/// inverse exists (`gcd(a, m) != 1`, or `a == 0`).
+/// Computes `a^-1 mod m`, returning `None` when no inverse exists
+/// (`gcd(a, m) != 1`, or `a`/`m` is zero). Works for any modulus, even or odd.
 ///
-/// Uses the binary extended GCD. **This routine is not constant time** — its
-/// control flow and iteration count depend on the operand values. It is meant
-/// for key generation (computing `d = e^-1 mod λ(n)`, a one-time step), not for
-/// repeated operations on attacker-influenced secrets. A constant-time
-/// replacement (e.g. safegcd) can be dropped in later.
-///
-/// `a` is expected to be reduced (`a < m`).
+/// Uses the iterative extended Euclidean algorithm, tracking the Bézout
+/// coefficient for `a` as a sign-magnitude value (its magnitude stays below
+/// `m`). **This routine is not constant time** — its control flow and
+/// iteration count depend on the operands. It is intended for key generation
+/// (computing `d = e^-1 mod φ(n)`, a one-time step), not for repeated use on
+/// attacker-influenced secrets; a constant-time replacement (safegcd) can be
+/// dropped in later.
 pub fn inv_mod<const LIMBS: usize>(a: &Uint<LIMBS>, m: &Uint<LIMBS>) -> Option<Uint<LIMBS>> {
-    debug_assert!(bool::from(m.is_odd()), "modulus must be odd");
-    if bool::from(a.is_zero()) {
+    if bool::from(a.is_zero()) || bool::from(m.is_zero()) {
         return None;
     }
 
-    // Invariant: a * x1 ≡ u  and  a * x2 ≡ v  (mod m).
-    let mut u = *a;
-    let mut v = *m;
-    let mut x1 = Uint::ONE;
-    let mut x2 = Uint::ZERO;
-
     let one = Uint::ONE;
-    // Each main-loop turn strictly reduces u + v's size; this bound is generous
-    // and guarantees termination (returning None) for non-coprime inputs.
-    let max_iters = 8 * LIMBS * LIMB_BITS;
-    let mut iters = 0;
+    let (mut old_r, mut r) = (a.reduce(m), *m);
+    // Bézout coefficient for `a`, as (magnitude, is_negative).
+    let (mut old_s, mut old_neg) = (one, false);
+    let (mut s, mut s_neg) = (Uint::ZERO, false);
 
-    while u != one && v != one {
-        iters += 1;
-        if iters > max_iters {
-            return None;
-        }
+    while !bool::from(r.is_zero()) {
+        let (q, rem) = old_r.divrem(&r);
+        old_r = r;
+        r = rem;
 
-        while !bool::from(u.is_odd()) && !bool::from(u.is_zero()) {
-            u = u.shr1();
-            x1 = half_mod(&x1, m);
-        }
-        while !bool::from(v.is_odd()) && !bool::from(v.is_zero()) {
-            v = v.shr1();
-            x2 = half_mod(&x2, m);
-        }
-
-        // u >= v  ⇔  not (u < v)
-        if !bool::from(u.ct_lt(&v)) {
-            u = u.wrapping_sub(&v);
-            x1 = sub_mod(&x1, &x2, m);
-        } else {
-            v = v.wrapping_sub(&u);
-            x2 = sub_mod(&x2, &x1, m);
-        }
+        // new_s = old_s - q * s. The product q*|s| stays below m, so the low
+        // half of the widening multiply is exact.
+        let qs = q.mul_wide(&s).0;
+        let (new_s, new_neg) = signed_sub(&old_s, old_neg, &qs, s_neg);
+        old_s = s;
+        old_neg = s_neg;
+        s = new_s;
+        s_neg = new_neg;
     }
 
-    if u == one { Some(x1) } else { Some(x2) }
-}
-
-/// `(a - b) mod m`, for `a, b < m`.
-fn sub_mod<const LIMBS: usize>(a: &Uint<LIMBS>, b: &Uint<LIMBS>, m: &Uint<LIMBS>) -> Uint<LIMBS> {
-    let (diff, borrow) = a.sbb(b, 0);
-    let (wrapped, _) = diff.adc(m, 0);
-    if borrow == 1 { wrapped } else { diff }
-}
-
-/// `x / 2 mod m` (i.e. `x * 2^-1 mod m`) for odd `m` and `x < m`.
-fn half_mod<const LIMBS: usize>(x: &Uint<LIMBS>, m: &Uint<LIMBS>) -> Uint<LIMBS> {
-    if bool::from(x.is_odd()) {
-        // x odd, m odd => x + m even; halve the (LIMBS+1)-bit sum.
-        let (sum, carry) = x.adc(m, 0);
-        let mut limbs = *sum.shr1().as_limbs();
-        if carry == 1 {
-            limbs[LIMBS - 1] |= 1 << (LIMB_BITS - 1);
-        }
-        Uint::from_limbs(limbs)
+    if old_r != one {
+        return None; // gcd(a, m) != 1
+    }
+    // Reduce the (possibly negative) coefficient into [0, m).
+    if old_neg {
+        Some(m.wrapping_sub(&old_s))
     } else {
-        x.shr1()
+        Some(old_s)
+    }
+}
+
+/// Computes `(±a) - (±b)` in sign-magnitude, where the inputs and result all
+/// have magnitude `< m` (so the additions/subtractions don't overflow).
+fn signed_sub<const LIMBS: usize>(
+    a: &Uint<LIMBS>,
+    a_neg: bool,
+    b: &Uint<LIMBS>,
+    b_neg: bool,
+) -> (Uint<LIMBS>, bool) {
+    if a_neg == b_neg {
+        // Same sign: result = sign * (a - b).
+        if !bool::from(a.ct_lt(b)) {
+            (a.wrapping_sub(b), a_neg) // a >= b
+        } else {
+            (b.wrapping_sub(a), !a_neg)
+        }
+    } else {
+        // Opposite signs: result = sign(a) * (a + b).
+        (a.wrapping_add(b), a_neg)
     }
 }
 
@@ -95,27 +84,39 @@ mod tests {
             inv_mod(&Uint::<1>::from_u64(3), &Uint::<1>::from_u64(11)),
             Some(Uint::<1>::from_u64(4))
         );
-        // 7^-1 mod 15 = 13 (15 is composite but coprime to 7)
+        // 7^-1 mod 15 = 13
         assert_eq!(
             inv_mod(&Uint::<1>::from_u64(7), &Uint::<1>::from_u64(15)),
             Some(Uint::<1>::from_u64(13))
+        );
+        // Even modulus: 3^-1 mod 10 = 7
+        assert_eq!(
+            inv_mod(&Uint::<1>::from_u64(3), &Uint::<1>::from_u64(10)),
+            Some(Uint::<1>::from_u64(7))
+        );
+        // 1^-1 mod m = 1
+        assert_eq!(
+            inv_mod(&Uint::<1>::ONE, &Uint::<1>::from_u64(97)),
+            Some(Uint::<1>::ONE)
         );
     }
 
     #[test]
     fn non_invertible_returns_none() {
-        // gcd(3, 15) = 3
         assert_eq!(
             inv_mod(&Uint::<1>::from_u64(3), &Uint::<1>::from_u64(15)),
-            None
+            None // gcd = 3
         );
-        // gcd(0, m) — zero has no inverse
+        assert_eq!(
+            inv_mod(&Uint::<1>::from_u64(4), &Uint::<1>::from_u64(10)),
+            None // gcd = 2
+        );
         assert_eq!(inv_mod(&Uint::<1>::ZERO, &Uint::<1>::from_u64(7)), None);
     }
 
     #[test]
     fn inverse_property_u64() {
-        let moduli: [u64; 3] = [97, 0xFFFF_FFFF_FFFF_FFFF, 1_000_003];
+        let moduli: [u64; 4] = [97, 0xFFFF_FFFF_FFFF_FFFF, 1_000_003, 0x1_0000_0000];
         let vals: [u64; 4] = [2, 3, 0x1234_5678, 0xfedc_ba98_7654_3211];
         for &m in &moduli {
             for &a in &vals {
@@ -132,8 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn inverse_property_128bit() {
-        // Verify a * a^-1 ≡ 1 (mod m) using Montgomery mul, for an odd composite m.
+    fn inverse_property_128bit_odd() {
         let m = Uint::<2>::from_limbs([0x1234_5678_9abc_def1, 0x0fed_cba9_8765_4321]);
         let modulus = MontModulus::new(m);
         let a = Uint::<2>::from_u64(0x9e3779b97f4a7c15);
@@ -142,12 +142,12 @@ mod tests {
     }
 
     #[test]
-    fn rsa_style_exponent() {
-        // d = e^-1 mod λ, with e = 65537 and a composite λ; check e*d ≡ 1.
-        let lambda = Uint::<2>::from_u64(0x0003_a8f2_1c4b_d7e9); // arbitrary odd value
+    fn rsa_style_even_modulus() {
+        // φ(n) is even; check e * (e^-1 mod φ) ≡ 1 (mod φ) via long division.
+        let phi = Uint::<2>::from_u64(0x0003_a8f2_1c4b_d7e8); // even
         let e = Uint::<2>::from_u64(65537);
-        let d = inv_mod(&e, &lambda).expect("65537 coprime to lambda");
-        let modulus = MontModulus::new(lambda);
-        assert!(bool::from(modulus.mul_mod(&e, &d).ct_eq(&Uint::ONE)));
+        let d = inv_mod(&e, &phi).expect("65537 coprime to phi");
+        let prod = e.mul_wide(&d).0; // e*d fits in 2 limbs here
+        assert_eq!(prod.divrem(&phi).1, Uint::ONE);
     }
 }

@@ -191,6 +191,31 @@ impl<const LIMBS: usize> Uint<LIMBS> {
         }
         r
     }
+
+    /// Returns `(quotient, remainder)` for `self / divisor` via bitwise long
+    /// division. Constant time in the values; `divisor` must be nonzero.
+    pub fn divrem(&self, divisor: &Self) -> (Self, Self) {
+        let mut q = Self::ZERO;
+        let mut r = Self::ZERO;
+        let mut i = LIMBS;
+        while i > 0 {
+            i -= 1;
+            let mut bit = LIMB_BITS;
+            while bit > 0 {
+                bit -= 1;
+                // r = (r << 1) | next bit of self
+                let (mut shifted, carry) = r.adc(&r, 0);
+                shifted.limbs[0] |= (self.limbs[i] >> bit) & 1;
+                let (mut q_shifted, _) = q.adc(&q, 0); // q <<= 1
+                let (diff, borrow) = shifted.sbb(divisor, 0);
+                let ge = Choice::from((carry | (borrow ^ 1)) as u8);
+                r = Self::conditional_select(&diff, &shifted, ge);
+                q_shifted.limbs[0] |= ge.unwrap_u8() as u64; // quotient bit
+                q = q_shifted;
+            }
+        }
+        (q, r)
+    }
 }
 
 impl<const LIMBS: usize> Default for Uint<LIMBS> {
