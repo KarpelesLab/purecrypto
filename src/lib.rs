@@ -43,6 +43,9 @@ pub mod der;
 #[cfg(feature = "ec")]
 pub mod ec;
 
+#[cfg(feature = "ffi")]
+pub mod ffi;
+
 #[cfg(feature = "hash")]
 pub mod hash;
 

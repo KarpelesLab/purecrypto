@@ -31,12 +31,9 @@ der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
 ec = ["bignum", "rng", "hash", "alloc"]
 tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "alloc"]
-# bignum = []
-# keys   = []
-# asn1   = []
-# x509   = []
-# tls    = []
-# ffi    = []
+# C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
+# C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
+ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509"]
 
 [lints.rust]
 # Constant-time correctness depends on disciplined arithmetic; keep the
