@@ -78,6 +78,17 @@ pub fn encode_null() -> Vec<u8> {
     encode_tlv(tag::NULL, &[])
 }
 
+/// Encodes a `BOOLEAN` (DER uses `0xFF` for true).
+pub fn encode_boolean(value: bool) -> Vec<u8> {
+    encode_tlv(tag::BOOLEAN, &[if value { 0xff } else { 0x00 }])
+}
+
+/// Encodes a string value with the given string `tag` (e.g.
+/// [`tag::UTF8_STRING`], [`tag::PRINTABLE_STRING`], [`tag::UTC_TIME`]).
+pub fn encode_string(tag: u8, s: &str) -> Vec<u8> {
+    encode_tlv(tag, s.as_bytes())
+}
+
 /// Wraps `content` in a constructed context-specific tag `[n]`.
 pub fn encode_context(n: u8, content: &[u8]) -> Vec<u8> {
     encode_tlv(tag::context(n), content)
