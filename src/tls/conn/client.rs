@@ -277,6 +277,17 @@ impl ClientConnection {
             State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
             State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &msg),
             State::WaitFinished => self.on_finished(msg_type, body, &msg),
+            State::Connected => self.on_post_handshake(msg_type),
+            State::Closed => Err(Error::UnexpectedMessage),
+        }
+    }
+
+    /// Handles post-handshake messages (RFC 8446 §4.6). NewSessionTicket is
+    /// ignored (resumption is unsupported); KeyUpdate is accepted but not yet
+    /// acted on.
+    fn on_post_handshake(&mut self, msg_type: u8) -> Result<(), Error> {
+        match msg_type {
+            hs_type::NEW_SESSION_TICKET | hs_type::KEY_UPDATE => Ok(()),
             _ => Err(Error::UnexpectedMessage),
         }
     }

@@ -14,10 +14,12 @@ use alloc::vec::Vec;
 pub(crate) mod hs_type {
     pub(crate) const CLIENT_HELLO: u8 = 1;
     pub(crate) const SERVER_HELLO: u8 = 2;
+    pub(crate) const NEW_SESSION_TICKET: u8 = 4;
     pub(crate) const ENCRYPTED_EXTENSIONS: u8 = 8;
     pub(crate) const CERTIFICATE: u8 = 11;
     pub(crate) const CERTIFICATE_VERIFY: u8 = 15;
     pub(crate) const FINISHED: u8 = 20;
+    pub(crate) const KEY_UPDATE: u8 = 24;
 }
 
 /// A raw extension: its type and opaque body.
