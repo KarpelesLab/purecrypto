@@ -55,6 +55,9 @@ pub mod rng;
 #[cfg(feature = "rsa")]
 pub mod rsa;
 
+#[cfg(feature = "tls")]
+pub mod tls;
+
 #[cfg(feature = "x509")]
 pub mod x509;
 
