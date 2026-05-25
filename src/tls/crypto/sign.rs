@@ -5,8 +5,8 @@
 //! 16-bit `SignatureScheme` code (not an X.509 OID), so verification is
 //! dispatched here on the wire scheme and the peer's [`AnyPublicKey`].
 
-use crate::ec::ecdsa::Signature;
-use crate::hash::{Sha256, Sha384};
+use crate::ec::{BoxedEcdsaSignature, CurveId};
+use crate::hash::{Sha256, Sha384, Sha512};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
 use crate::x509::AnyPublicKey;
@@ -60,15 +60,37 @@ pub(crate) fn verify_signature(
             };
             r.map_err(|_| Error::BadCertificate)
         }
-        AnyPublicKey::EcdsaP256(k) => {
-            if scheme != SignatureScheme::ECDSA_SECP256R1_SHA256 {
+        AnyPublicKey::Ecdsa(k) => {
+            // The scheme fixes both the curve and the hash; the key's curve
+            // must match.
+            let (expected_curve, hash) = if scheme == SignatureScheme::ECDSA_SECP256R1_SHA256 {
+                (CurveId::P256, EcdsaHash::Sha256)
+            } else if scheme == SignatureScheme::ECDSA_SECP384R1_SHA384 {
+                (CurveId::P384, EcdsaHash::Sha384)
+            } else if scheme == SignatureScheme::ECDSA_SECP521R1_SHA512 {
+                (CurveId::P521, EcdsaHash::Sha512)
+            } else {
+                return Err(Error::PeerMisbehaved);
+            };
+            if k.curve() != expected_curve {
                 return Err(Error::PeerMisbehaved);
             }
-            let sig = Signature::from_der(signature).map_err(|_| Error::Decode)?;
-            k.verify::<Sha256>(message, &sig)
-                .map_err(|_| Error::BadCertificate)
+            let sig = BoxedEcdsaSignature::from_der(signature).map_err(|_| Error::Decode)?;
+            let r = match hash {
+                EcdsaHash::Sha256 => k.verify::<Sha256>(message, &sig),
+                EcdsaHash::Sha384 => k.verify::<Sha384>(message, &sig),
+                EcdsaHash::Sha512 => k.verify::<Sha512>(message, &sig),
+            };
+            r.map_err(|_| Error::BadCertificate)
         }
     }
+}
+
+/// Selects the hash for an ECDSA signature scheme.
+enum EcdsaHash {
+    Sha256,
+    Sha384,
+    Sha512,
 }
 
 #[cfg(test)]

@@ -8,11 +8,36 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::ecdsa::{EcdsaPublicKey, Signature};
-use crate::hash::{Sha256, Sha384};
+use crate::ec::{BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId};
+use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPublicKey;
 
 const SPKI_LABEL: &str = "PUBLIC KEY";
+
+/// The X.509 named-curve OID for a curve.
+fn curve_oid(curve: CurveId) -> &'static [u64] {
+    match curve {
+        CurveId::P256 => oid::PRIME256V1,
+        CurveId::P384 => oid::SECP384R1,
+        CurveId::P521 => oid::SECP521R1,
+        CurveId::Secp256k1 => oid::SECP256K1,
+    }
+}
+
+/// Maps a named-curve OID to a [`CurveId`].
+fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
+    if arcs == oid::PRIME256V1 {
+        Some(CurveId::P256)
+    } else if arcs == oid::SECP384R1 {
+        Some(CurveId::P384)
+    } else if arcs == oid::SECP521R1 {
+        Some(CurveId::P521)
+    } else if arcs == oid::SECP256K1 {
+        Some(CurveId::Secp256k1)
+    } else {
+        None
+    }
+}
 
 /// A public key whose algorithm is determined at runtime — the form recovered
 /// from a certificate or a PKIX SPKI document.
@@ -20,8 +45,8 @@ const SPKI_LABEL: &str = "PUBLIC KEY";
 pub enum AnyPublicKey {
     /// An RSA public key (runtime-sized).
     Rsa(BoxedRsaPublicKey),
-    /// A NIST P-256 ECDSA public key.
-    EcdsaP256(EcdsaPublicKey),
+    /// An ECDSA public key on one of the supported curves.
+    Ecdsa(BoxedEcdsaPublicKey),
 }
 
 impl AnyPublicKey {
@@ -32,9 +57,9 @@ impl AnyPublicKey {
                 let algid = algorithm_identifier(oid::RSA_ENCRYPTION, true);
                 encode_sequence(&[algid, encode_bit_string(&k.to_pkcs1_der())].concat())
             }
-            AnyPublicKey::EcdsaP256(k) => {
+            AnyPublicKey::Ecdsa(k) => {
                 let algid = encode_sequence(
-                    &[oid_tlv(oid::EC_PUBLIC_KEY), oid_tlv(oid::PRIME256V1)].concat(),
+                    &[oid_tlv(oid::EC_PUBLIC_KEY), oid_tlv(curve_oid(k.curve()))].concat(),
                 );
                 encode_sequence(&[algid, encode_bit_string(&k.to_sec1())].concat())
             }
@@ -59,12 +84,10 @@ impl AnyPublicKey {
                 key_bits,
             )?))
         } else if alg.as_slice() == oid::EC_PUBLIC_KEY {
-            let curve = parse_oid(algid.read_oid()?)?;
-            if curve.as_slice() != oid::PRIME256V1 {
-                return Err(Error::UnsupportedAlgorithm);
-            }
-            Ok(AnyPublicKey::EcdsaP256(
-                EcdsaPublicKey::from_sec1(key_bits).map_err(|_| Error::Malformed)?,
+            let curve_arcs = parse_oid(algid.read_oid()?)?;
+            let curve = curve_from_oid(curve_arcs.as_slice()).ok_or(Error::UnsupportedAlgorithm)?;
+            Ok(AnyPublicKey::Ecdsa(
+                BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?,
             ))
         } else {
             Err(Error::UnsupportedAlgorithm)
@@ -78,7 +101,8 @@ impl AnyPublicKey {
 
     /// Verifies `sig` over `msg` under the signature algorithm identified by
     /// `sig_alg` OID arcs. RSA signatures are PKCS#1 v1.5; ECDSA signatures are
-    /// DER `Ecdsa-Sig-Value`.
+    /// DER `Ecdsa-Sig-Value`. The hash is taken from `sig_alg`; the curve from
+    /// the key.
     pub fn verify(&self, sig_alg: &[u64], msg: &[u8], sig: &[u8]) -> Result<(), Error> {
         match self {
             AnyPublicKey::Rsa(k) => {
@@ -90,12 +114,14 @@ impl AnyPublicKey {
                     Err(Error::UnsupportedAlgorithm)
                 }
             }
-            AnyPublicKey::EcdsaP256(k) => {
-                let parsed = Signature::from_der(sig).map_err(|_| Error::Malformed)?;
+            AnyPublicKey::Ecdsa(k) => {
+                let parsed = BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Malformed)?;
                 let ok = if sig_alg == oid::ECDSA_WITH_SHA256 {
                     k.verify::<Sha256>(msg, &parsed)
                 } else if sig_alg == oid::ECDSA_WITH_SHA384 {
                     k.verify::<Sha384>(msg, &parsed)
+                } else if sig_alg == oid::ECDSA_WITH_SHA512 {
+                    k.verify::<Sha512>(msg, &parsed)
                 } else {
                     return Err(Error::UnsupportedAlgorithm);
                 };
@@ -108,7 +134,7 @@ impl AnyPublicKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ec::ecdsa::EcdsaPrivateKey;
+    use crate::ec::BoxedEcdsaPrivateKey;
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
 
@@ -135,21 +161,36 @@ mod tests {
 
     #[test]
     fn ec_spki_roundtrip_and_verify() {
-        let mut rng = HmacDrbg::<Sha256>::new(b"spki-ec", b"n", &[]);
-        let sk = EcdsaPrivateKey::generate(&mut rng);
-        let any = AnyPublicKey::EcdsaP256(sk.public_key());
+        // Each supported curve round-trips through SPKI and verifies a signature.
+        for (curve, sig_alg) in [
+            (CurveId::P256, oid::ECDSA_WITH_SHA256),
+            (CurveId::P384, oid::ECDSA_WITH_SHA384),
+            (CurveId::P521, oid::ECDSA_WITH_SHA512),
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"spki-ec", b"n", &[]);
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let any = AnyPublicKey::Ecdsa(sk.public_key());
 
-        let der = any.to_spki_der();
-        let parsed = AnyPublicKey::from_spki_der(&der).unwrap();
-        // Sign with ECDSA, DER-encode, verify through AnyPublicKey.
-        let sig = sk.sign::<Sha256>(b"hello").unwrap();
-        parsed
-            .verify(oid::ECDSA_WITH_SHA256, b"hello", &sig.to_der())
-            .unwrap();
-        assert!(
+            let der = any.to_spki_der();
+            let parsed = AnyPublicKey::from_spki_der(&der).unwrap();
+            match &parsed {
+                AnyPublicKey::Ecdsa(k) => assert_eq!(k.curve(), curve),
+                _ => panic!("expected ECDSA"),
+            }
+
+            let sig = match curve {
+                CurveId::P256 => sk.sign::<Sha256>(b"hello").unwrap(),
+                CurveId::P384 => sk.sign::<Sha384>(b"hello").unwrap(),
+                _ => sk.sign::<Sha512>(b"hello").unwrap(),
+            };
             parsed
-                .verify(oid::ECDSA_WITH_SHA256, b"other", &sig.to_der())
-                .is_err()
-        );
+                .verify(sig_alg, b"hello", &sig.to_der(curve))
+                .unwrap();
+            assert!(
+                parsed
+                    .verify(sig_alg, b"other", &sig.to_der(curve))
+                    .is_err()
+            );
+        }
     }
 }

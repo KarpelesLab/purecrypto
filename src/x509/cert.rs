@@ -488,7 +488,7 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
             DistinguishedName::common_name("purecrypto ec test")
         );
         let key = cert.subject_public_key().unwrap();
-        assert!(matches!(key, crate::x509::AnyPublicKey::EcdsaP256(_)));
+        assert!(matches!(key, crate::x509::AnyPublicKey::Ecdsa(_)));
         // Self-signed: verifies under its own embedded key.
         cert.verify_signature_with(&key).unwrap();
     }

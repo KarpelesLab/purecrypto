@@ -8,9 +8,8 @@
 //! traffic keys.
 
 use super::common::{ConnectionCore, Incoming};
-use crate::ec::ecdh::EcdhPrivateKey;
-use crate::ec::ecdsa::EcdsaPublicKey;
 use crate::ec::x25519::X25519PrivateKey;
+use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
@@ -91,7 +90,7 @@ pub struct ClientConnection {
     state: State,
 
     x25519: X25519PrivateKey,
-    p256: EcdhPrivateKey,
+    p256: BoxedEcdhPrivateKey,
 
     suite: Option<SuiteParams>,
     ks: Option<KeySchedule>,
@@ -130,7 +129,7 @@ impl ClientConnection {
         groups: &[NamedGroup],
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
-        let p256 = EcdhPrivateKey::generate(rng);
+        let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
 
@@ -166,10 +165,9 @@ impl ClientConnection {
                 NamedGroup::X25519 => {
                     key_shares.push((NamedGroup::X25519, self.x25519.public_key().to_vec()))
                 }
-                NamedGroup::SECP256R1 => key_shares.push((
-                    NamedGroup::SECP256R1,
-                    self.p256.public_key().to_sec1().to_vec(),
-                )),
+                NamedGroup::SECP256R1 => {
+                    key_shares.push((NamedGroup::SECP256R1, self.p256.public_key().to_sec1()))
+                }
                 _ => {}
             }
         }
@@ -353,7 +351,8 @@ impl ClientConnection {
                 Ok(Secret::new(&self.x25519.diffie_hellman(&peer)))
             }
             NamedGroup::SECP256R1 => {
-                let peer = EcdsaPublicKey::from_sec1(server_pub).map_err(|_| Error::Decode)?;
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, server_pub)
+                    .map_err(|_| Error::Decode)?;
                 let shared = self
                     .p256
                     .diffie_hellman(&peer)

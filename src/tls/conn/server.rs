@@ -7,10 +7,9 @@
 //! application traffic keys.
 
 use super::common::{ConnectionCore, Incoming};
-use crate::ec::ecdh::EcdhPrivateKey;
-use crate::ec::ecdsa::{EcdsaPrivateKey, EcdsaPublicKey};
 use crate::ec::x25519::X25519PrivateKey;
-use crate::hash::Sha256;
+use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
+use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
@@ -31,8 +30,8 @@ use crate::ct::ConstantTimeEq;
 enum ServerKey {
     /// An RSA key; signs with `rsa_pss_rsae_sha256`.
     Rsa(BoxedRsaPrivateKey),
-    /// A NIST P-256 key; signs with `ecdsa_secp256r1_sha256`.
-    EcdsaP256(EcdsaPrivateKey),
+    /// An ECDSA key; signs with the scheme matching its curve.
+    Ecdsa(BoxedEcdsaPrivateKey),
 }
 
 /// Configuration for a TLS server: a certificate chain and its signing key.
@@ -51,19 +50,24 @@ impl ServerConfig {
         }
     }
 
-    /// A configuration presenting `cert_chain` (leaf first) and signing with a
-    /// P-256 ECDSA private `key`.
-    pub fn with_ecdsa_p256(cert_chain: Vec<Vec<u8>>, key: EcdsaPrivateKey) -> Self {
+    /// A configuration presenting `cert_chain` (leaf first) and signing with an
+    /// ECDSA private `key` (the scheme follows the key's curve).
+    pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
         ServerConfig {
             cert_chain,
-            key: ServerKey::EcdsaP256(key),
+            key: ServerKey::Ecdsa(key),
         }
     }
 
     fn signature_scheme(&self) -> SignatureScheme {
-        match self.key {
+        match &self.key {
             ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
-            ServerKey::EcdsaP256(_) => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            ServerKey::Ecdsa(k) => match k.curve() {
+                CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+                CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+                CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
+                CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            },
         }
     }
 }
@@ -304,12 +308,13 @@ impl<R: RngCore> ServerConnection<R> {
                 Ok((sk.public_key().to_vec(), Secret::new(&shared)))
             }
             NamedGroup::SECP256R1 => {
-                let sk = EcdhPrivateKey::generate(&mut self.rng);
-                let peer = EcdsaPublicKey::from_sec1(client_pub).map_err(|_| Error::Decode)?;
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, client_pub)
+                    .map_err(|_| Error::Decode)?;
                 let shared = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
-                Ok((sk.public_key().to_sec1().to_vec(), Secret::new(&shared)))
+                Ok((sk.public_key().to_sec1(), Secret::new(&shared)))
             }
             _ => Err(Error::HandshakeFailure),
         }
@@ -344,10 +349,15 @@ impl<R: RngCore> ServerConnection<R> {
             ServerKey::Rsa(k) => k
                 .sign_pss::<Sha256, _>(&content, &mut self.rng)
                 .map_err(|_| Error::HandshakeFailure)?,
-            ServerKey::EcdsaP256(k) => k
-                .sign::<Sha256>(&content)
-                .map_err(|_| Error::HandshakeFailure)?
-                .to_der(),
+            ServerKey::Ecdsa(k) => {
+                let sig = match k.curve() {
+                    CurveId::P384 => k.sign::<Sha384>(&content),
+                    CurveId::P521 => k.sign::<Sha512>(&content),
+                    _ => k.sign::<Sha256>(&content),
+                }
+                .map_err(|_| Error::HandshakeFailure)?;
+                sig.to_der(k.curve())
+            }
         };
 
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
