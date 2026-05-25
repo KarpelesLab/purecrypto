@@ -41,7 +41,7 @@ Single crate, modules gated by Cargo features:
 | Randomness       | `rng`       | 🟡 RngCore/CryptoRng, HMAC-DRBG, OsRng (Unix) |
 | Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM (AEAD) |
 | Bignum (CT)      | `bignum`    | 🟡 Uint<LIMBS>, widening mul, Montgomery modular arith, modexp + Fermat inverse |
-| Asymmetric keys  | `keys`      | ⬜ planned (RSA, ECDSA, Ed25519, ML-KEM) |
+| Asymmetric keys  | `rsa`       | 🟡 RSA keygen, raw, PKCS#1 v1.5 enc/sign (ECDSA/Ed25519/ML-KEM planned) |
 | ASN.1            | `asn1`      | ⬜ planned |
 | X.509            | `x509`      | ⬜ planned |
 | TLS / DTLS       | `tls`       | ⬜ planned |

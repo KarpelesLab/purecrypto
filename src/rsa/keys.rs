@@ -83,6 +83,19 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         }
     }
 
+    /// Constructs a private key from raw components, without the prime factors
+    /// `p`/`q` (so CRT-based speedups are unavailable). Useful for importing an
+    /// existing key.
+    pub fn from_components(n: Uint<LIMBS>, e: Uint<LIMBS>, d: Uint<LIMBS>) -> Self {
+        RsaPrivateKey {
+            n,
+            e,
+            d,
+            p: Uint::ZERO,
+            q: Uint::ZERO,
+        }
+    }
+
     /// The public half of this key pair.
     pub fn public_key(&self) -> RsaPublicKey<LIMBS> {
         RsaPublicKey {
