@@ -232,6 +232,18 @@ impl<'a> Reader<'a> {
         Ok((tag, self.take(len)?))
     }
 
+    /// Reads one complete element, returning its **entire** encoding including
+    /// tag and length bytes (useful when a signature is computed over the raw
+    /// DER of a nested structure).
+    pub fn read_element(&mut self) -> Result<&'a [u8], Error> {
+        let start = self.data;
+        let _tag = self.read_u8()?;
+        let len = self.read_length()?;
+        let header = start.len() - self.data.len();
+        self.take(len)?;
+        Ok(&start[..header + len])
+    }
+
     /// Succeeds only if all input has been consumed.
     pub fn finish(self) -> Result<(), Error> {
         if self.data.is_empty() {
