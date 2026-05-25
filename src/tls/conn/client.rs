@@ -81,8 +81,31 @@ pub struct ClientConnection {
 
 impl ClientConnection {
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
-    /// `rng` supplies the ephemeral key shares and the client random.
+    /// `rng` supplies the ephemeral key shares and the client random. Offers
+    /// both cipher suites and both key-exchange groups.
     pub fn new<R: RngCore>(config: ClientConfig, server_name: &str, rng: &mut R) -> Self {
+        Self::new_with_offer(
+            config,
+            server_name,
+            rng,
+            &[
+                CipherSuite::AES_128_GCM_SHA256,
+                CipherSuite::AES_256_GCM_SHA384,
+            ],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        )
+    }
+
+    /// Like [`new`](Self::new) but with an explicit cipher-suite and
+    /// key-exchange-group offer, letting callers (and tests) drive a specific
+    /// negotiation outcome.
+    pub(crate) fn new_with_offer<R: RngCore>(
+        config: ClientConfig,
+        server_name: &str,
+        rng: &mut R,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+    ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = EcdhPrivateKey::generate(rng);
         let mut random: Random = [0u8; 32];
@@ -101,27 +124,42 @@ impl ClientConnection {
             cert_chain: Vec::new(),
             leaf_key: None,
         };
-        let hello = conn.build_client_hello(random, String::from(server_name));
+        let hello = conn.build_client_hello(random, String::from(server_name), suites, groups);
         conn.core.emit_handshake(hello);
         conn
     }
 
-    fn build_client_hello(&self, random: Random, server_name: String) -> Vec<u8> {
-        let p256_pub = self.p256.public_key().to_sec1();
+    fn build_client_hello(
+        &self,
+        random: Random,
+        server_name: String,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+    ) -> Vec<u8> {
+        let mut key_shares = Vec::new();
+        for &g in groups {
+            match g {
+                NamedGroup::X25519 => {
+                    key_shares.push((NamedGroup::X25519, self.x25519.public_key().to_vec()))
+                }
+                NamedGroup::SECP256R1 => key_shares.push((
+                    NamedGroup::SECP256R1,
+                    self.p256.public_key().to_sec1().to_vec(),
+                )),
+                _ => {}
+            }
+        }
         let extensions = alloc::vec![
             ext::server_name(&server_name),
-            ext::supported_groups(),
+            ext::supported_groups_list(groups),
             ext::signature_algorithms(),
             ext::client_supported_versions(),
-            ext::client_key_share_pair(&self.x25519.public_key(), &p256_pub,),
+            ext::client_key_shares(&key_shares),
         ];
         ClientHello {
             random,
             session_id: Vec::new(),
-            cipher_suites: alloc::vec![
-                CipherSuite::AES_128_GCM_SHA256,
-                CipherSuite::AES_256_GCM_SHA384,
-            ],
+            cipher_suites: suites.to_vec(),
             extensions,
         }
         .encode()

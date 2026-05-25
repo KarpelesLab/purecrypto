@@ -15,9 +15,10 @@ asymmetric keys, ASN.1, X.509 and TLS — and is usable three ways:
 - as a **standalone command-line tool** (key generation, file encryption,
   building a CA, signing certificates, …).
 
-> Status: **early foundation.** Only the constant-time primitive layer exists
-> so far. APIs are unstable and nothing here has been audited — do not use it
-> for anything real yet.
+> Status: **work in progress.** The crypto stack up through a TLS 1.3
+> client and server (sans-I/O, with a blocking TCP adapter) is implemented and
+> validated against published test vectors, but APIs are unstable and nothing
+> here has been audited — do not use it for anything real yet.
 
 ## Design principles
 
@@ -44,8 +45,8 @@ Single crate, modules gated by Cargo features:
 | Key derivation   | `kdf`       | 🟡 PBKDF2, HKDF |
 | Elliptic curve   | `ec`        | 🟡 P-256 (ECDSA/ECDH), X25519; Ed25519/ML-KEM planned |
 | ASN.1 / DER      | `der`       | 🟡 DER reader/writer, base64, PEM; RSA PKCS#1 key (de)serialization |
-| X.509            | `x509`      | 🟡 self-signed + CA issuance, parse, verify (RSA/SHA-256); OpenSSL-interop |
-| TLS / DTLS       | `tls`       | ⬜ planned |
+| X.509            | `x509`      | 🟡 self-signed + CA issuance, parse, verify (RSA + P-256/ECDSA); PKIX SPKI; OpenSSL-interop |
+| TLS / DTLS       | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1, AES-GCM; RFC 8448 KATs |
 | C ABI            | `ffi`       | ⬜ planned |
 | CLI              | (binary)    | ⬜ planned |
 
