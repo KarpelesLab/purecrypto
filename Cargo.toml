@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec"]
 std = ["alloc"]
 alloc = []
 
@@ -29,6 +29,7 @@ rng = ["hash"]
 rsa = ["bignum", "rng", "hash"]
 der = []
 x509 = ["der", "rsa", "hash", "alloc"]
+ec = ["bignum", "rng", "hash"]
 # bignum = []
 # keys   = []
 # asn1   = []
