@@ -10,12 +10,20 @@
 //! Diffie-Hellman, ECDSA). Modular arithmetic (Montgomery form, modexp,
 //! inversion) is layered on top.
 
+#[cfg(feature = "alloc")]
+mod boxed;
+#[cfg(feature = "alloc")]
+mod boxed_montgomery;
 mod inverse;
 mod modpow;
 mod montgomery;
 mod mul;
 mod uint;
 
+#[cfg(feature = "alloc")]
+pub use boxed::BoxedUint;
+#[cfg(feature = "alloc")]
+pub use boxed_montgomery::BoxedMontModulus;
 pub use inverse::inv_mod;
 pub use montgomery::MontModulus;
 pub use uint::{LIMB_BITS, Limb, Uint};
