@@ -16,13 +16,14 @@ pub use stream::{Connection, Stream};
 #[cfg(test)]
 mod loopback_tests {
     use super::{ClientConnection, ServerConfig, ServerConnection};
+    use crate::ec::Ed25519PrivateKey;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::rsa::BoxedRsaPrivateKey;
     use crate::test_util::rsa_test_key_a;
     use crate::tls::codec::{CipherSuite, NamedGroup};
     use crate::tls::{ClientConfig, RootCertStore};
-    use crate::x509::{Certificate, DistinguishedName, Time, Validity};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
     use alloc::vec::Vec;
 
     /// An RSA self-signed server config plus its certificate DER (for the
@@ -40,10 +41,45 @@ mod loopback_tests {
         (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
     }
 
-    /// Runs a full in-process handshake with the given offer, then exchanges
+    /// An Ed25519 self-signed server config plus its certificate DER.
+    fn ed25519_server() -> (ServerConfig, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ed-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            ServerConfig::with_ed25519(alloc::vec![der.clone()], key),
+            der,
+        )
+    }
+
+    /// Runs a full in-process handshake with an RSA server, then exchanges
     /// application data in both directions.
     fn run(suites: &[CipherSuite], groups: &[NamedGroup]) {
-        let (server_config, cert_der) = rsa_server();
+        run_with(rsa_server(), suites, groups);
+    }
+
+    /// Runs a full in-process handshake against `(server_config, cert_der)`,
+    /// then exchanges application data in both directions.
+    fn run_with(
+        server: (ServerConfig, Vec<u8>),
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+    ) {
+        let (server_config, cert_der) = server;
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
 
@@ -107,6 +143,17 @@ mod loopback_tests {
     fn x25519_chacha20poly1305_sha256() {
         run(
             &[CipherSuite::CHACHA20_POLY1305_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn ed25519_server_certificate() {
+        // An Ed25519 server cert exercises Ed25519 chain verification and the
+        // Ed25519 CertificateVerify signature end to end.
+        run_with(
+            ed25519_server(),
+            &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519],
         );
     }

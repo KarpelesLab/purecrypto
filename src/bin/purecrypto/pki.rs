@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::util::die;
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::rng::{OsRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::x509::{AnyPublicKey, CertSigner, DistinguishedName, Time, Validity};
@@ -12,17 +12,21 @@ use purecrypto::x509::{AnyPublicKey, CertSigner, DistinguishedName, Time, Validi
 pub(crate) enum PrivateKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
+    Ed25519(Ed25519PrivateKey),
 }
 
 impl PrivateKey {
-    /// Loads an RSA PKCS#1 or EC SEC1 private-key PEM.
+    /// Loads an RSA PKCS#1, EC SEC1, or Ed25519 PKCS#8 private-key PEM.
     pub(crate) fn from_pem(pem: &str) -> Option<Self> {
         if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
             return Some(PrivateKey::Rsa(k));
         }
-        BoxedEcdsaPrivateKey::from_sec1_pem(pem)
+        if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
+            return Some(PrivateKey::Ec(k));
+        }
+        Ed25519PrivateKey::from_pkcs8_pem(pem)
             .ok()
-            .map(PrivateKey::Ec)
+            .map(PrivateKey::Ed25519)
     }
 
     /// Borrows a certificate/CSR signer.
@@ -30,6 +34,7 @@ impl PrivateKey {
         match self {
             PrivateKey::Rsa(k) => CertSigner::Rsa(k),
             PrivateKey::Ec(k) => CertSigner::Ecdsa(k),
+            PrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
         }
     }
 }
@@ -90,6 +95,7 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
                 CurveId::Secp256k1 => "secp256k1",
             }
         ),
+        AnyPublicKey::Ed25519(_) => "Ed25519".to_string(),
     }
 }
 

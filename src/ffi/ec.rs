@@ -3,7 +3,9 @@
 use alloc::boxed::Box;
 
 use super::common::{PcStatus, guard, out_write, slice};
-use crate::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId};
+use crate::ec::{
+    BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed25519PrivateKey, Ed25519Signature,
+};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::OsRng;
 use crate::x509::AnyPublicKey;
@@ -181,6 +183,149 @@ pub unsafe extern "C" fn pc_ec_verify(
 /// `key` from [`pc_ec_generate`]/[`pc_ec_from_pem`], not freed twice.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_ec_free(key: *mut PcEcKey) {
+    if !key.is_null() {
+        drop(unsafe { Box::from_raw(key) });
+    }
+}
+
+/// An opaque Ed25519 private key.
+pub struct PcEd25519Key(Ed25519PrivateKey);
+
+/// Generates an Ed25519 key, or NULL on failure.
+#[unsafe(no_mangle)]
+pub extern "C" fn pc_ed25519_generate() -> *mut PcEd25519Key {
+    Box::into_raw(Box::new(PcEd25519Key(Ed25519PrivateKey::generate(
+        &mut OsRng,
+    ))))
+}
+
+/// Parses a PKCS#8 `PRIVATE KEY` PEM into an Ed25519 key handle, or NULL.
+///
+/// # Safety
+/// `pem` must be valid for `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_from_pem(pem: *const u8, len: usize) -> *mut PcEd25519Key {
+    let Some(bytes) = (unsafe { slice(pem, len) }) else {
+        return core::ptr::null_mut();
+    };
+    let Ok(s) = core::str::from_utf8(bytes) else {
+        return core::ptr::null_mut();
+    };
+    match Ed25519PrivateKey::from_pkcs8_pem(s) {
+        Ok(k) => Box::into_raw(Box::new(PcEd25519Key(k))),
+        Err(_) => core::ptr::null_mut(),
+    }
+}
+
+/// Writes the key as a PKCS#8 `PRIVATE KEY` PEM string to `out`.
+///
+/// # Safety
+/// `key` valid; buffer rules for `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_private_to_pem(
+    key: *const PcEd25519Key,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let pem = unsafe { &*key }.0.to_pkcs8_pem();
+        unsafe { out_write(pem.as_bytes(), out, out_len) }
+    })
+}
+
+/// Writes the public key as a PKIX `PUBLIC KEY` (SPKI) PEM string to `out`.
+///
+/// # Safety
+/// `key` valid; buffer rules for `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_public_to_pem(
+    key: *const PcEd25519Key,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let pem = AnyPublicKey::Ed25519(unsafe { &*key }.0.public_key()).to_spki_pem();
+        unsafe { out_write(pem.as_bytes(), out, out_len) }
+    })
+}
+
+/// Signs `msg` with `key`, writing the raw 64-byte Ed25519 signature to `out`.
+///
+/// # Safety
+/// `key` valid; `msg` valid for `msg_len`; buffer rules for `out`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_sign(
+    key: *const PcEd25519Key,
+    msg: *const u8,
+    msg_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let Some(m) = (unsafe { slice(msg, msg_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let sig = unsafe { &*key }.0.sign(m);
+        unsafe { out_write(&sig.to_bytes(), out, out_len) }
+    })
+}
+
+/// Verifies a raw 64-byte Ed25519 signature `sig` over `msg` under the SPKI
+/// (PKIX `PUBLIC KEY`) DER in `spki`. Returns [`PcStatus::Ok`] iff valid.
+///
+/// # Safety
+/// All pointers valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_verify(
+    spki: *const u8,
+    spki_len: usize,
+    msg: *const u8,
+    msg_len: usize,
+    sig: *const u8,
+    sig_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(spki), Some(m), Some(sig)) = (
+            unsafe { slice(spki, spki_len) },
+            unsafe { slice(msg, msg_len) },
+            unsafe { slice(sig, sig_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        let key = match AnyPublicKey::from_spki_der(spki) {
+            Ok(AnyPublicKey::Ed25519(k)) => k,
+            Ok(_) => return PcStatus::Unsupported,
+            Err(_) => return PcStatus::BadEncoding,
+        };
+        let Ok(bytes) = <[u8; 64]>::try_from(sig) else {
+            return PcStatus::BadEncoding;
+        };
+        if key
+            .verify(m, &Ed25519Signature::from_bytes(bytes))
+            .is_ok()
+        {
+            PcStatus::Ok
+        } else {
+            PcStatus::Verification
+        }
+    })
+}
+
+/// Frees an Ed25519 key. NULL is ignored.
+///
+/// # Safety
+/// `key` from [`pc_ed25519_generate`]/[`pc_ed25519_from_pem`], not freed twice.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ed25519_free(key: *mut PcEd25519Key) {
     if !key.is_null() {
         drop(unsafe { Box::from_raw(key) });
     }

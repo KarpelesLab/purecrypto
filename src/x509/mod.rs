@@ -48,6 +48,9 @@ pub mod oid {
     pub const ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
     /// `ecdsa-with-SHA512` (1.2.840.10045.4.3.4).
     pub const ECDSA_WITH_SHA512: &[u64] = &[1, 2, 840, 10045, 4, 3, 4];
+    /// `id-Ed25519` (1.3.101.112) — both the key and signature algorithm
+    /// (RFC 8410).
+    pub const ID_ED25519: &[u64] = &[1, 3, 101, 112];
 
     /// `id-at-commonName` (2.5.4.3).
     pub const COMMON_NAME: &[u64] = &[2, 5, 4, 3];

@@ -246,3 +246,20 @@ fn genpkey_ec_then_inspect() {
     assert!(ok);
     assert!(text.contains("P-256"));
 }
+
+#[test]
+fn genpkey_ed25519_then_inspect() {
+    let (key_pem, ok) = run(&["genpkey", "-algorithm", "ED25519"], b"");
+    assert!(ok);
+    assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+
+    // Public key extraction (PKIX SPKI).
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], key_pem.as_bytes());
+    assert!(ok);
+    assert!(pub_pem.contains("BEGIN PUBLIC KEY"));
+
+    // Text inspection names the algorithm.
+    let (text, ok) = run(&["pkey", "-text"], key_pem.as_bytes());
+    assert!(ok);
+    assert!(text.contains("Ed25519"));
+}

@@ -51,6 +51,8 @@ u16_id!(
         ECDSA_SECP384R1_SHA384 = 0x0503,
         /// ecdsa_secp521r1_sha512.
         ECDSA_SECP521R1_SHA512 = 0x0603,
+        /// ed25519 (PureEdDSA).
+        ED25519 = 0x0807,
         /// rsa_pss_rsae_sha256.
         RSA_PSS_RSAE_SHA256 = 0x0804,
         /// rsa_pss_rsae_sha384.

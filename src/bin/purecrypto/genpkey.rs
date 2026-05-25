@@ -2,7 +2,7 @@
 
 use crate::util::{Args, die, write_output};
 use purecrypto::bignum::Uint;
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::RsaPrivateKey;
 
@@ -24,7 +24,7 @@ pub(crate) fn run(args: Args) {
         .value("-algorithm")
         .or_else(|| args.value("--algorithm"))
         .unwrap_or_else(|| {
-            die("usage: purecrypto genpkey -algorithm RSA|EC [-bits N|-curve NAME] [-out file]")
+            die("usage: purecrypto genpkey -algorithm RSA|EC|ED25519 [-bits N|-curve NAME] [-out file]")
         });
     let dest = args.value("-out");
 
@@ -55,7 +55,8 @@ pub(crate) fn run(args: Args) {
                 curve_from_name(name).unwrap_or_else(|| die(format!("unknown curve: {name}")));
             BoxedEcdsaPrivateKey::generate(curve, &mut OsRng).to_sec1_pem()
         }
-        other => die(format!("unknown algorithm: {other} (use RSA or EC)")),
+        "ED25519" => Ed25519PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
+        other => die(format!("unknown algorithm: {other} (use RSA, EC, or ED25519)")),
     };
 
     write_output(dest, pem.as_bytes());
