@@ -8,6 +8,10 @@
 mod keys;
 mod prime;
 
+#[cfg(feature = "alloc")]
+mod boxed;
+#[cfg(feature = "alloc")]
+mod emsa;
 #[cfg(all(feature = "der", feature = "alloc"))]
 mod encoding;
 #[cfg(feature = "alloc")]
@@ -15,6 +19,8 @@ mod pkcs1;
 #[cfg(feature = "alloc")]
 mod pss;
 
+#[cfg(feature = "alloc")]
+pub use boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
 pub use keys::{RsaPrivateKey, RsaPublicKey};
 pub use prime::{is_prime, random_prime};
 

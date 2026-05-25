@@ -4,7 +4,8 @@
 //! `/tmp/pss_pub.pem`, the message at `/tmp/pss_msg.txt`, and the signature at
 //! `/tmp/pss_sig.bin`. Prints OK on success.
 
-use purecrypto::rsa::RsaPublicKey;
+use purecrypto::der;
+use purecrypto::rsa::BoxedRsaPublicKey;
 use std::fs;
 
 fn main() {
@@ -12,8 +13,10 @@ fn main() {
     let msg = fs::read("/tmp/pss_msg.txt").expect("read msg");
     let sig = fs::read("/tmp/pss_sig.bin").expect("read sig");
 
-    // 2048-bit modulus => 32 limbs.
-    let pk = RsaPublicKey::<32>::from_pkcs1_pem(&pem).expect("parse pubkey");
+    // Runtime-sized key: parse the PKCS#1 PEM body into a BoxedRsaPublicKey,
+    // so the modulus size need not be known at compile time.
+    let der = der::pem_decode(&pem, "RSA PUBLIC KEY").expect("pem");
+    let pk = BoxedRsaPublicKey::from_pkcs1_der(&der).expect("parse pubkey");
     match pk.verify_pss::<purecrypto::hash::Sha256>(&msg, &sig) {
         Ok(()) => println!("OK: OpenSSL PSS signature verified by purecrypto"),
         Err(e) => {

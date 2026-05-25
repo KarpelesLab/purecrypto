@@ -11,11 +11,42 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, RsaPrivateKey, RsaPublicKey};
 use crate::bignum::Uint;
-use crate::ct::ConstantTimeEq;
 use crate::hash::Digest;
 use crate::rng::RngCore;
+
+/// Big-endian `k`-byte serialization of a fixed-width `Uint`.
+fn uint_to_k_bytes<const LIMBS: usize>(value: &Uint<LIMBS>) -> Vec<u8> {
+    let mut buf = vec![0u8; LIMBS * 8];
+    value.write_be_bytes(&mut buf);
+    buf
+}
+
+impl<const LIMBS: usize> RawPublic for RsaPublicKey<LIMBS> {
+    fn key_size(&self) -> usize {
+        LIMBS * 8
+    }
+    fn modulus_bits(&self) -> usize {
+        self.modulus().bit_len()
+    }
+    fn raw_public(&self, m: &[u8]) -> Vec<u8> {
+        uint_to_k_bytes(&self.raw(&Uint::<LIMBS>::from_be_bytes(m)))
+    }
+}
+
+impl<const LIMBS: usize> RawPrivate for RsaPrivateKey<LIMBS> {
+    fn key_size(&self) -> usize {
+        LIMBS * 8
+    }
+    fn modulus_bits(&self) -> usize {
+        self.modulus().bit_len()
+    }
+    fn raw_private(&self, c: &[u8]) -> Vec<u8> {
+        uint_to_k_bytes(&self.raw(&Uint::<LIMBS>::from_be_bytes(c)))
+    }
+}
 
 /// A hash usable with PKCS#1 v1.5 signatures: it carries the DER-encoded
 /// `DigestInfo` prefix that precedes the hash value in the signature encoding.
@@ -60,21 +91,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// # Errors
     /// [`Error::MessageTooLong`] if `msg.len() > k - 11`, where `k = LIMBS*8`.
     pub fn encrypt_pkcs1v15<R: RngCore>(&self, msg: &[u8], rng: &mut R) -> Result<Vec<u8>, Error> {
-        let k = LIMBS * 8;
-        if msg.len() + 11 > k {
-            return Err(Error::MessageTooLong);
-        }
-        // EM = 0x00 || 0x02 || PS || 0x00 || M, with PS >= 8 nonzero bytes.
-        let ps_len = k - msg.len() - 3;
-        let mut em = vec![0u8; k];
-        em[1] = 0x02;
-        fill_nonzero(&mut em[2..2 + ps_len], rng);
-        // em[2 + ps_len] stays 0x00 (separator)
-        em[k - msg.len()..].copy_from_slice(msg);
-
-        let m = Uint::<LIMBS>::from_be_bytes(&em);
-        let c = self.raw(&m);
-        Ok(to_bytes(&c, k))
+        emsa::encrypt_pkcs1v15(self, msg, rng)
     }
 
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.
@@ -83,20 +100,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// [`Error::Verification`] if the signature is invalid;
     /// [`Error::InvalidLength`] if `sig` is not `LIMBS*8` bytes.
     pub fn verify_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        let k = LIMBS * 8;
-        if sig.len() != k {
-            return Err(Error::InvalidLength);
-        }
-        let s = Uint::<LIMBS>::from_be_bytes(sig);
-        let m = self.raw(&s);
-        let em = to_bytes(&m, k);
-
-        let expected = encode_signature::<D>(msg, k)?;
-        if bool::from(em.as_slice().ct_eq(expected.as_slice())) {
-            Ok(())
-        } else {
-            Err(Error::Verification)
-        }
+        emsa::verify_pkcs1v15::<D, _>(self, msg, sig)
     }
 }
 
@@ -109,29 +113,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     ///
     /// See the module note: this is padding-oracle sensitive.
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
-        let k = LIMBS * 8;
-        if ct.len() != k {
-            return Err(Error::InvalidLength);
-        }
-        let c = Uint::<LIMBS>::from_be_bytes(ct);
-        let m = self.raw(&c);
-        let em = to_bytes(&m, k);
-
-        // EM = 0x00 || 0x02 || PS || 0x00 || M
-        if em[0] != 0x00 || em[1] != 0x02 {
-            return Err(Error::Decryption);
-        }
-        let mut sep = None;
-        for (i, &b) in em.iter().enumerate().skip(2) {
-            if b == 0x00 {
-                sep = Some(i);
-                break;
-            }
-        }
-        match sep {
-            Some(i) if i >= 10 => Ok(em[i + 1..].to_vec()), // PS is >= 8 bytes
-            _ => Err(Error::Decryption),
-        }
+        emsa::decrypt_pkcs1v15(self, ct)
     }
 
     /// Produces a PKCS#1 v1.5 signature over `msg`, hashing with `D`
@@ -140,54 +122,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// # Errors
     /// [`Error::MessageTooLong`] if the modulus is too small for the digest.
     pub fn sign_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
-        let k = LIMBS * 8;
-        let em = encode_signature::<D>(msg, k)?;
-        let m = Uint::<LIMBS>::from_be_bytes(&em);
-        let s = self.raw(&m);
-        Ok(to_bytes(&s, k))
-    }
-}
-
-/// Builds the EMSA-PKCS1-v1_5 encoded message:
-/// `0x00 || 0x01 || PS(0xff…) || 0x00 || DigestInfo`.
-fn encode_signature<D: Pkcs1Digest>(msg: &[u8], k: usize) -> Result<Vec<u8>, Error> {
-    let digest = D::digest(msg);
-    let t_len = D::DIGEST_INFO_PREFIX.len() + digest.as_ref().len();
-    if t_len + 11 > k {
-        return Err(Error::MessageTooLong);
-    }
-    let ps_len = k - t_len - 3;
-    let mut em = vec![0u8; k];
-    em[1] = 0x01;
-    for b in &mut em[2..2 + ps_len] {
-        *b = 0xff;
-    }
-    // em[2 + ps_len] stays 0x00 (separator)
-    let t_start = 2 + ps_len + 1;
-    em[t_start..t_start + D::DIGEST_INFO_PREFIX.len()].copy_from_slice(D::DIGEST_INFO_PREFIX);
-    em[t_start + D::DIGEST_INFO_PREFIX.len()..].copy_from_slice(digest.as_ref());
-    Ok(em)
-}
-
-/// Serializes `value` as a big-endian `k`-byte vector.
-fn to_bytes<const LIMBS: usize>(value: &Uint<LIMBS>, k: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; LIMBS * 8];
-    value.write_be_bytes(&mut buf);
-    debug_assert_eq!(k, LIMBS * 8);
-    buf
-}
-
-/// Fills `dst` with uniformly random nonzero bytes.
-fn fill_nonzero<R: RngCore>(dst: &mut [u8], rng: &mut R) {
-    for slot in dst.iter_mut() {
-        loop {
-            let mut b = [0u8; 1];
-            rng.fill_bytes(&mut b);
-            if b[0] != 0 {
-                *slot = b[0];
-                break;
-            }
-        }
+        emsa::sign_pkcs1v15::<D, _>(self, msg)
     }
 }
 
