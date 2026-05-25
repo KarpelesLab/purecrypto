@@ -7,6 +7,7 @@
 //!
 //! Exposes ECDSA signing and verification ([`ecdsa`]).
 
+pub mod ecdh;
 pub mod ecdsa;
 mod p256;
 
