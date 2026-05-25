@@ -2,8 +2,9 @@
 //!
 //! [`RngCore`] is the byte-source interface; [`CryptoRng`] marks generators
 //! that are cryptographically secure. [`HmacDrbg`] is a deterministic
-//! SP 800-90A generator built on our HMAC, and (on Unix with `std`) [`OsRng`]
-//! draws directly from the operating system's entropy pool.
+//! SP 800-90A generator built on our HMAC, and (with `std`) [`OsRng`] draws
+//! directly from the operating system's entropy pool — `/dev/urandom` on Unix,
+//! `ProcessPrng` on Windows.
 
 mod hmac_drbg;
 
@@ -58,7 +59,45 @@ impl RngCore for OsRng {
 #[cfg(all(feature = "std", unix))]
 impl CryptoRng for OsRng {}
 
-#[cfg(all(test, feature = "std", unix))]
+/// Operating-system entropy source for Windows, via the Win32 system CSPRNG.
+///
+/// Unlike Unix's `/dev/urandom`, Windows has no file-based entropy, so this
+/// calls `ProcessPrng` (bcryptprimitives.dll) directly — the crate's only use
+/// of `unsafe` outside the `ffi` module, confined here behind
+/// `#![allow(unsafe_code)]`.
+#[cfg(all(feature = "std", windows))]
+mod os_windows {
+    #![allow(unsafe_code)]
+    use super::{CryptoRng, RngCore};
+
+    // `BOOL ProcessPrng(PBYTE pbData, SIZE_T cbData)` — documented to always
+    // succeed (it returns TRUE), drawing from the same CSPRNG as BCryptGenRandom.
+    #[link(name = "bcryptprimitives")]
+    unsafe extern "system" {
+        fn ProcessPrng(data: *mut u8, len: usize) -> i32;
+    }
+
+    /// Operating-system entropy source.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub struct OsRng;
+
+    impl RngCore for OsRng {
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            if dest.is_empty() {
+                return;
+            }
+            let ok = unsafe { ProcessPrng(dest.as_mut_ptr(), dest.len()) };
+            assert!(ok != 0, "ProcessPrng failed to produce entropy");
+        }
+    }
+
+    impl CryptoRng for OsRng {}
+}
+
+#[cfg(all(feature = "std", windows))]
+pub use os_windows::OsRng;
+
+#[cfg(all(test, feature = "std", any(unix, windows)))]
 mod tests {
     use super::*;
 
