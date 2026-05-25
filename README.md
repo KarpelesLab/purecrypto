@@ -55,4 +55,4 @@ Requires Rust 1.95+ (edition 2024).
 
 ## License
 
-To be determined by the project owner.
+Licensed under the [MIT License](LICENSE).
