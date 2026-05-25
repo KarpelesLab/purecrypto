@@ -6,16 +6,36 @@
 //! convenience. Implementations are pure `no_std` and allocation-free,
 //! operating on fixed-size internal buffers.
 //!
-//! Currently implemented: the SHA-2 family ([`Sha224`], [`Sha256`],
-//! [`Sha384`], [`Sha512`], [`Sha512_224`], [`Sha512_256`]).
+//! Implemented:
+//! - SHA-2: [`Sha224`], [`Sha256`], [`Sha384`], [`Sha512`], [`Sha512_224`],
+//!   [`Sha512_256`].
+//! - SHA-3 (Keccak): [`Sha3_224`], [`Sha3_256`], [`Sha3_384`], [`Sha3_512`].
+//! - BLAKE2: [`Blake2b256`], [`Blake2b384`], [`Blake2b512`], [`Blake2s256`].
+//! - Legacy (interop only, not collision-resistant): [`Md4`], [`Md5`],
+//!   [`Sha1`], [`Ripemd160`].
 
+mod blake2;
+mod block;
 mod hmac;
+mod md4;
+mod md5;
+mod ripemd160;
+mod sha1;
 mod sha256;
+mod sha3;
 mod sha512;
 
+pub use blake2::{
+    Blake2b256, Blake2b384, Blake2b512, Blake2s256, blake2b256, blake2b384, blake2b512, blake2s256,
+};
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
 };
+pub use md4::{Md4, md4};
+pub use md5::{Md5, md5};
+pub use ripemd160::{Ripemd160, ripemd160};
+pub use sha1::{Sha1, sha1};
+pub use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, sha3_224, sha3_256, sha3_384, sha3_512};
 pub use sha256::{Sha224, Sha256, sha224, sha256};
 pub use sha512::{Sha384, Sha512, Sha512_224, Sha512_256, sha384, sha512, sha512_224, sha512_256};
 
