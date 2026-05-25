@@ -8,7 +8,7 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::{BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId};
+use crate::ec::{BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed25519PublicKey, Ed25519Signature};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPublicKey;
 
@@ -47,6 +47,8 @@ pub enum AnyPublicKey {
     Rsa(BoxedRsaPublicKey),
     /// An ECDSA public key on one of the supported curves.
     Ecdsa(BoxedEcdsaPublicKey),
+    /// An Ed25519 public key.
+    Ed25519(Ed25519PublicKey),
 }
 
 impl AnyPublicKey {
@@ -62,6 +64,11 @@ impl AnyPublicKey {
                     &[oid_tlv(oid::EC_PUBLIC_KEY), oid_tlv(curve_oid(k.curve()))].concat(),
                 );
                 encode_sequence(&[algid, encode_bit_string(&k.to_sec1())].concat())
+            }
+            AnyPublicKey::Ed25519(k) => {
+                // RFC 8410: AlgorithmIdentifier is the bare OID (no parameters).
+                let algid = encode_sequence(&oid_tlv(oid::ID_ED25519));
+                encode_sequence(&[algid, encode_bit_string(&k.to_bytes())].concat())
             }
         }
     }
@@ -89,6 +96,9 @@ impl AnyPublicKey {
             Ok(AnyPublicKey::Ecdsa(
                 BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?,
             ))
+        } else if alg.as_slice() == oid::ID_ED25519 {
+            let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+            Ok(AnyPublicKey::Ed25519(Ed25519PublicKey::from_bytes(bytes)))
         } else {
             Err(Error::UnsupportedAlgorithm)
         }
@@ -126,6 +136,15 @@ impl AnyPublicKey {
                     return Err(Error::UnsupportedAlgorithm);
                 };
                 ok.map_err(|_| Error::Verification)
+            }
+            AnyPublicKey::Ed25519(k) => {
+                if sig_alg != oid::ID_ED25519 {
+                    return Err(Error::UnsupportedAlgorithm);
+                }
+                // Ed25519 signatures are the raw 64-byte R‖S, not DER-wrapped.
+                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Malformed)?;
+                k.verify(msg, &Ed25519Signature::from_bytes(bytes))
+                    .map_err(|_| Error::Verification)
             }
         }
     }
@@ -192,5 +211,22 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn ed25519_spki_roundtrip_and_verify() {
+        use crate::ec::Ed25519PrivateKey;
+        let mut rng = HmacDrbg::<Sha256>::new(b"spki-ed", b"n", &[]);
+        let sk = Ed25519PrivateKey::generate(&mut rng);
+        let any = AnyPublicKey::Ed25519(sk.public_key());
+
+        let pem = any.to_spki_pem();
+        let parsed = AnyPublicKey::from_spki_pem(&pem).unwrap();
+        assert!(matches!(parsed, AnyPublicKey::Ed25519(_)));
+
+        // Ed25519 signatures are raw 64-byte R‖S, verified under id-Ed25519.
+        let sig = sk.sign(b"hello").to_bytes();
+        parsed.verify(oid::ID_ED25519, b"hello", &sig).unwrap();
+        assert!(parsed.verify(oid::ID_ED25519, b"other", &sig).is_err());
     }
 }

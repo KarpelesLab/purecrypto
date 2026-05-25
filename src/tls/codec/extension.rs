@@ -42,6 +42,7 @@ pub(crate) fn supported_groups_list(groups: &[NamedGroup]) -> RawExtension {
 /// `signature_algorithms` listing the schemes we can verify/produce.
 pub(crate) fn signature_algorithms() -> RawExtension {
     let schemes = [
+        SignatureScheme::ED25519,
         SignatureScheme::ECDSA_SECP256R1_SHA256,
         SignatureScheme::ECDSA_SECP384R1_SHA384,
         SignatureScheme::ECDSA_SECP521R1_SHA512,

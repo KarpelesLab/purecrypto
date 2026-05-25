@@ -8,7 +8,9 @@
 
 use super::common::{ConnectionCore, Incoming};
 use crate::ec::x25519::X25519PrivateKey;
-use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
+use crate::ec::{
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
+};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
@@ -32,6 +34,8 @@ enum ServerKey {
     Rsa(BoxedRsaPrivateKey),
     /// An ECDSA key; signs with the scheme matching its curve.
     Ecdsa(BoxedEcdsaPrivateKey),
+    /// An Ed25519 key; signs with `ed25519`.
+    Ed25519(Ed25519PrivateKey),
 }
 
 /// Configuration for a TLS server: a certificate chain and its signing key.
@@ -59,6 +63,15 @@ impl ServerConfig {
         }
     }
 
+    /// A configuration presenting `cert_chain` (leaf first) and signing with an
+    /// Ed25519 private `key`.
+    pub fn with_ed25519(cert_chain: Vec<Vec<u8>>, key: Ed25519PrivateKey) -> Self {
+        ServerConfig {
+            cert_chain,
+            key: ServerKey::Ed25519(key),
+        }
+    }
+
     fn signature_scheme(&self) -> SignatureScheme {
         match &self.key {
             ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
@@ -68,6 +81,7 @@ impl ServerConfig {
                 CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
                 CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             },
+            ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         }
     }
 }
@@ -358,6 +372,7 @@ impl<R: RngCore> ServerConnection<R> {
                 .map_err(|_| Error::HandshakeFailure)?;
                 sig.to_der(k.curve())
             }
+            ServerKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
         };
 
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];

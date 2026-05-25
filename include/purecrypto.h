@@ -72,6 +72,7 @@ typedef enum {
 typedef struct PcHash PcHash;
 typedef struct PcRsaKey PcRsaKey;
 typedef struct PcEcKey PcEcKey;
+typedef struct PcEd25519Key PcEd25519Key;
 typedef struct PcCert PcCert;
 
 /* ---- Hashing ---- */
@@ -116,6 +117,20 @@ pc_status pc_ec_sign(const PcEcKey *key, const uint8_t *msg, size_t msg_len,
 pc_status pc_ec_verify(const uint8_t *spki, size_t spki_len, const uint8_t *msg,
                        size_t msg_len, const uint8_t *sig, size_t sig_len);
 void pc_ec_free(PcEcKey *key);
+
+/* ---- Ed25519 ---- */
+PcEd25519Key *pc_ed25519_generate(void);
+PcEd25519Key *pc_ed25519_from_pem(const uint8_t *pem, size_t len);
+pc_status pc_ed25519_private_to_pem(const PcEd25519Key *key, uint8_t *out,
+                                    size_t *out_len);
+pc_status pc_ed25519_public_to_pem(const PcEd25519Key *key, uint8_t *out,
+                                   size_t *out_len);
+pc_status pc_ed25519_sign(const PcEd25519Key *key, const uint8_t *msg,
+                          size_t msg_len, uint8_t *out, size_t *out_len);
+pc_status pc_ed25519_verify(const uint8_t *spki, size_t spki_len,
+                            const uint8_t *msg, size_t msg_len,
+                            const uint8_t *sig, size_t sig_len);
+void pc_ed25519_free(PcEd25519Key *key);
 
 /* ---- X.509 ---- */
 PcCert *pc_cert_from_pem(const uint8_t *pem, size_t len);

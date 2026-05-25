@@ -12,12 +12,13 @@
 //!   the TLS and X.509 layers, where the peer's curve is known only at parse
 //!   time.
 //!
-//! Also exposes X25519 ([`x25519`]).
+//! Also exposes X25519 ([`x25519`]) and Ed25519 ([`ed25519`]).
 
 pub mod boxed;
 pub mod curves;
 pub mod ecdh;
 pub mod ecdsa;
+pub mod ed25519;
 mod p256;
 mod weierstrass;
 pub mod x25519;
@@ -26,6 +27,7 @@ pub use boxed::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
 };
 pub use curves::CurveId;
+pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

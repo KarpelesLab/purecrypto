@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use super::{AnyPublicKey, Error, algorithm_identifier, oid};
-use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPrivateKey;
 
@@ -12,12 +12,15 @@ use crate::rsa::BoxedRsaPrivateKey;
 ///
 /// RSA signs with PKCS#1 v1.5 over SHA-256 (`sha256WithRSAEncryption`); ECDSA
 /// signs `ecdsa-with-SHAxxx` with the hash matched to the curve (P-256 and
-/// secp256k1 → SHA-256, P-384 → SHA-384, P-521 → SHA-512).
+/// secp256k1 → SHA-256, P-384 → SHA-384, P-521 → SHA-512); Ed25519 signs
+/// `id-Ed25519` (PureEdDSA over SHA-512, RFC 8410).
 pub enum CertSigner<'a> {
     /// An RSA signing key.
     Rsa(&'a BoxedRsaPrivateKey),
     /// An ECDSA signing key.
     Ecdsa(&'a BoxedEcdsaPrivateKey),
+    /// An Ed25519 signing key.
+    Ed25519(&'a Ed25519PrivateKey),
 }
 
 impl CertSigner<'_> {
@@ -30,11 +33,12 @@ impl CertSigner<'_> {
                 CurveId::P384 => oid::ECDSA_WITH_SHA384,
                 CurveId::P521 => oid::ECDSA_WITH_SHA512,
             },
+            CertSigner::Ed25519(_) => oid::ID_ED25519,
         }
     }
 
     /// The DER `AlgorithmIdentifier` for the signature (RSA carries a NULL
-    /// `parameters`; ECDSA omits it).
+    /// `parameters`; ECDSA and Ed25519 omit it).
     pub(crate) fn algorithm_identifier(&self) -> Vec<u8> {
         algorithm_identifier(self.sig_alg_oid(), matches!(self, CertSigner::Rsa(_)))
     }
@@ -53,6 +57,8 @@ impl CertSigner<'_> {
                 .map_err(|_| Error::Verification)?;
                 Ok(sig.to_der(curve))
             }
+            // Ed25519 is PureEdDSA: the raw 64-byte R‖S over the message itself.
+            CertSigner::Ed25519(k) => Ok(k.sign(tbs).to_bytes().to_vec()),
         }
     }
 
@@ -61,6 +67,7 @@ impl CertSigner<'_> {
         match self {
             CertSigner::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
             CertSigner::Ecdsa(k) => AnyPublicKey::Ecdsa(k.public_key()),
+            CertSigner::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
         }
     }
 }

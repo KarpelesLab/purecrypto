@@ -75,6 +75,30 @@ int main(void) {
     return fail("pc_ec_sign");
   pc_ec_free(ec);
 
+  /* 6. Ed25519: generate, export keys, sign (64-byte signature). */
+  PcEd25519Key *ed = pc_ed25519_generate();
+  if (!ed)
+    return fail("pc_ed25519_generate");
+  uint8_t edpriv[128];
+  size_t edpriv_len = sizeof(edpriv);
+  if (pc_ed25519_private_to_pem(ed, edpriv, &edpriv_len) != PC_OK)
+    return fail("pc_ed25519_private_to_pem");
+  if (strncmp((const char *)edpriv, "-----BEGIN PRIVATE KEY-----", 27) != 0)
+    return fail("ed25519 private PEM header");
+  uint8_t edpub[128];
+  size_t edpub_len = sizeof(edpub);
+  if (pc_ed25519_public_to_pem(ed, edpub, &edpub_len) != PC_OK)
+    return fail("pc_ed25519_public_to_pem");
+  if (strncmp((const char *)edpub, "-----BEGIN PUBLIC KEY-----", 26) != 0)
+    return fail("ed25519 public PEM header");
+  uint8_t edsig[64];
+  size_t edsig_len = sizeof(edsig);
+  if (pc_ed25519_sign(ed, msg, sizeof(msg), edsig, &edsig_len) != PC_OK)
+    return fail("pc_ed25519_sign");
+  if (edsig_len != 64)
+    return fail("ed25519 signature length");
+  pc_ed25519_free(ed);
+
   printf("ffi_smoke: OK\n");
   return 0;
 }

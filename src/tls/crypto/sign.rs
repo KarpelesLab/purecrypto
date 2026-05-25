@@ -5,7 +5,7 @@
 //! 16-bit `SignatureScheme` code (not an X.509 OID), so verification is
 //! dispatched here on the wire scheme and the peer's [`AnyPublicKey`].
 
-use crate::ec::{BoxedEcdsaSignature, CurveId};
+use crate::ec::{BoxedEcdsaSignature, CurveId, Ed25519Signature};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
@@ -82,6 +82,14 @@ pub(crate) fn verify_signature(
                 EcdsaHash::Sha512 => k.verify::<Sha512>(message, &sig),
             };
             r.map_err(|_| Error::BadCertificate)
+        }
+        AnyPublicKey::Ed25519(k) => {
+            if scheme != SignatureScheme::ED25519 {
+                return Err(Error::PeerMisbehaved);
+            }
+            let bytes: [u8; 64] = signature.try_into().map_err(|_| Error::Decode)?;
+            k.verify(message, &Ed25519Signature::from_bytes(bytes))
+                .map_err(|_| Error::BadCertificate)
         }
     }
 }
