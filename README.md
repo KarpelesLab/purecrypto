@@ -1,5 +1,10 @@
 # purecrypto
 
+[![CI](https://github.com/KarpelesLab/purecrypto/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/purecrypto/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/purecrypto.svg)](https://crates.io/crates/purecrypto)
+[![docs.rs](https://img.shields.io/docsrs/purecrypto)](https://docs.rs/purecrypto)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A cryptography toolkit written **entirely in Rust**, depending on no foreign
 code. `purecrypto` is built from the ground up — starting at constant-time
 primitives and working up through hashing, ciphers, bignum arithmetic,
