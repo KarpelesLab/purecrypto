@@ -100,6 +100,37 @@ impl<const LIMBS: usize> Uint<LIMBS> {
         }
     }
 
+    /// Interprets `bytes` as a little-endian integer (least-significant byte
+    /// first). Shorter inputs are zero-extended.
+    ///
+    /// # Panics
+    /// Panics if `bytes` is longer than the integer can hold (`LIMBS * 8`).
+    pub fn from_le_bytes(bytes: &[u8]) -> Self {
+        assert!(bytes.len() <= LIMBS * 8, "input too large for Uint");
+        let mut limbs = [0; LIMBS];
+        let mut i = 0;
+        while i * 8 < bytes.len() {
+            let end = (i * 8 + 8).min(bytes.len());
+            let mut buf = [0u8; 8];
+            buf[..end - i * 8].copy_from_slice(&bytes[i * 8..end]);
+            limbs[i] = Limb::from_le_bytes(buf);
+            i += 1;
+        }
+        Uint { limbs }
+    }
+
+    /// Writes this integer little-endian into `out`, which must be exactly
+    /// `LIMBS * 8` bytes.
+    ///
+    /// # Panics
+    /// Panics if `out.len() != LIMBS * 8`.
+    pub fn write_le_bytes(&self, out: &mut [u8]) {
+        assert_eq!(out.len(), LIMBS * 8, "output buffer has wrong length");
+        for i in 0..LIMBS {
+            out[i * 8..i * 8 + 8].copy_from_slice(&self.limbs[i].to_le_bytes());
+        }
+    }
+
     /// Adds `self + rhs + carry`, returning the sum and the carry out of the
     /// most significant limb.
     pub fn adc(&self, rhs: &Self, carry: Limb) -> (Self, Limb) {
