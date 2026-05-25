@@ -72,7 +72,10 @@ mod os_windows {
 
     // `BOOL ProcessPrng(PBYTE pbData, SIZE_T cbData)` — documented to always
     // succeed (it returns TRUE), drawing from the same CSPRNG as BCryptGenRandom.
-    #[link(name = "bcryptprimitives")]
+    // `kind = "raw-dylib"` synthesizes the import from the DLL directly: the
+    // Windows SDK ships bcryptprimitives.dll but no import `.lib` for it (this is
+    // the approach the `getrandom` crate uses for the same function).
+    #[link(name = "bcryptprimitives", kind = "raw-dylib")]
     unsafe extern "system" {
         fn ProcessPrng(data: *mut u8, len: usize) -> i32;
     }
