@@ -1,8 +1,8 @@
 //! ECDSA over NIST P-256, with RFC 6979 deterministic nonces.
 
 use super::Error;
-use super::p256::{Fe, P256};
-use crate::bignum::{MontModulus, Uint, inv_mod};
+use super::p256::{Fe, P256, random_scalar};
+use crate::bignum::{MontModulus, inv_mod};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
 use crate::rng::RngCore;
@@ -63,16 +63,8 @@ impl EcdsaPrivateKey {
 
     /// Generates a new private key from `rng`.
     pub fn generate<R: RngCore>(rng: &mut R) -> EcdsaPrivateKey {
-        let n = P256::order();
-        loop {
-            let mut limbs = [0u64; 4];
-            for limb in &mut limbs {
-                *limb = rng.next_u64();
-            }
-            let d = Uint::from_limbs(limbs).reduce(&n);
-            if !bool::from(d.is_zero()) {
-                return EcdsaPrivateKey { d };
-            }
+        EcdsaPrivateKey {
+            d: random_scalar(rng),
         }
     }
 
@@ -131,6 +123,17 @@ impl EcdsaPublicKey {
             return Err(Error::InvalidInput);
         }
         Ok(EcdsaPublicKey { x, y })
+    }
+
+    /// The affine coordinates `(x, y)`.
+    pub(crate) fn coordinates(&self) -> (Fe, Fe) {
+        (self.x, self.y)
+    }
+
+    /// Builds a public key directly from affine coordinates (used internally
+    /// after a scalar multiplication that is known to be on-curve).
+    pub(crate) fn from_coordinates(x: Fe, y: Fe) -> Self {
+        EcdsaPublicKey { x, y }
     }
 
     /// Encodes the key as an uncompressed SEC1 point (`0x04 || X || Y`).

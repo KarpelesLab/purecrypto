@@ -2,9 +2,25 @@
 
 use crate::bignum::{MontModulus, Uint, inv_mod};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::rng::RngCore;
 
 /// Field elements and scalars are four 64-bit limbs (256 bits).
 pub(crate) type Fe = Uint<4>;
+
+/// Generates a uniformly random scalar in `[1, n-1]`.
+pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
+    let n = P256::order();
+    loop {
+        let mut limbs = [0u64; 4];
+        for limb in &mut limbs {
+            *limb = rng.next_u64();
+        }
+        let d = Uint::from_limbs(limbs).reduce(&n);
+        if !bool::from(d.is_zero()) {
+            return d;
+        }
+    }
+}
 
 // Curve parameters (hex, big-endian).
 const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
