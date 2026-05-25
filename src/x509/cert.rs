@@ -219,14 +219,8 @@ impl Certificate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bignum::Uint;
-    use crate::hash::Sha256 as Sha256Hash;
-    use crate::rng::HmacDrbg;
+    use crate::test_util::{rsa_test_key_a, rsa_test_key_b};
     use crate::x509::Time;
-
-    fn rng(label: &[u8]) -> HmacDrbg<Sha256Hash> {
-        HmacDrbg::new(label, b"nonce", &[])
-    }
 
     fn validity() -> Validity {
         Validity::new(
@@ -237,9 +231,7 @@ mod tests {
 
     #[test]
     fn self_signed_roundtrip_and_verify() {
-        let mut r = rng(b"x509-selfsigned");
-        // RSA-512 fits a SHA-256 signature.
-        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let key = rsa_test_key_a();
         let name =
             DistinguishedName::common_name("purecrypto test CA").with_organization("Karpelès Lab");
 
@@ -247,24 +239,22 @@ mod tests {
 
         // Structure round-trips through PEM.
         let pem = cert.to_pem();
-        let parsed = Certificate::from_pem(&pem).unwrap();
-        assert_eq!(parsed, cert);
+        assert_eq!(Certificate::from_pem(&pem).unwrap(), cert);
 
         // Fields parse back.
         assert_eq!(cert.subject().unwrap(), name);
         assert_eq!(cert.issuer().unwrap(), name);
-        let parsed_key = cert.public_key::<8>().unwrap();
+        let parsed_key = cert.public_key::<32>().unwrap();
         assert_eq!(parsed_key, key.public_key());
 
         // The self-signature verifies with the embedded key.
-        cert.verify_signature::<8>(&parsed_key).unwrap();
+        cert.verify_signature::<32>(&parsed_key).unwrap();
     }
 
     #[test]
     fn ca_signs_leaf() {
-        let mut r = rng(b"x509-ca");
-        let ca_key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
-        let leaf_key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let ca_key = rsa_test_key_a();
+        let leaf_key = rsa_test_key_b();
         let ca_name = DistinguishedName::common_name("Root CA");
         let leaf_name = DistinguishedName::common_name("leaf.example");
 
@@ -282,14 +272,13 @@ mod tests {
         assert_eq!(leaf.subject().unwrap(), leaf_name);
         assert_eq!(leaf.issuer().unwrap(), ca_name);
         // Verifies under the CA key, not under the leaf's own key.
-        leaf.verify_signature::<8>(&ca_key.public_key()).unwrap();
-        assert!(leaf.verify_signature::<8>(&leaf_key.public_key()).is_err());
+        leaf.verify_signature::<32>(&ca_key.public_key()).unwrap();
+        assert!(leaf.verify_signature::<32>(&leaf_key.public_key()).is_err());
     }
 
     #[test]
     fn tampered_cert_fails_verification() {
-        let mut r = rng(b"x509-tamper");
-        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let key = rsa_test_key_a();
         let cert = Certificate::self_signed(
             &key,
             &DistinguishedName::common_name("x"),
@@ -300,10 +289,10 @@ mod tests {
         .unwrap();
 
         let mut der = cert.to_der().to_vec();
-        // Flip a byte inside the TBS (the subject CN region near the front).
+        // Flip a byte inside the TBS.
         let idx = der.len() / 3;
         der[idx] ^= 1;
         let bad = Certificate::from_der(der).unwrap();
-        assert!(bad.verify_signature::<8>(&key.public_key()).is_err());
+        assert!(bad.verify_signature::<32>(&key.public_key()).is_err());
     }
 }

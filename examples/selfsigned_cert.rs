@@ -9,8 +9,8 @@ use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
 
 fn main() {
     let mut rng = OsRng;
-    // 512-bit modulus keeps the example fast; bump LIMBS for stronger keys.
-    let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut rng, 20);
+    // 2048-bit modulus (32 limbs).
+    let key = RsaPrivateKey::<32>::generate(Uint::from_u64(65537), &mut rng, 20);
 
     let name =
         DistinguishedName::common_name("purecrypto.example").with_organization("Karpelès Lab Inc.");

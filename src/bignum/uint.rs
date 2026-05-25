@@ -185,6 +185,19 @@ impl<const LIMBS: usize> Uint<LIMBS> {
         Choice::from((self.limbs[0] & 1) as u8)
     }
 
+    /// Returns the bit length (position of the most significant set bit plus
+    /// one); zero for a zero value. Not constant time — depends on the value.
+    pub fn bit_len(&self) -> usize {
+        let mut i = LIMBS;
+        while i > 0 {
+            i -= 1;
+            if self.limbs[i] != 0 {
+                return i * LIMB_BITS + (LIMB_BITS - self.limbs[i].leading_zeros() as usize);
+            }
+        }
+        0
+    }
+
     /// Returns `self >> 1` (one-bit logical right shift).
     pub fn shr1(&self) -> Self {
         let mut limbs = self.limbs;

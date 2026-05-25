@@ -12,6 +12,8 @@ mod prime;
 mod encoding;
 #[cfg(feature = "alloc")]
 mod pkcs1;
+#[cfg(feature = "alloc")]
+mod pss;
 
 pub use keys::{RsaPrivateKey, RsaPublicKey};
 pub use prime::{is_prime, random_prime};

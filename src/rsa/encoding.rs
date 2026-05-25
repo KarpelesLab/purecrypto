@@ -126,53 +126,44 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 mod tests {
     use super::*;
     use crate::hash::Sha256;
-    use crate::rng::HmacDrbg;
-
-    fn rng(label: &[u8]) -> HmacDrbg<Sha256> {
-        HmacDrbg::new(label, b"nonce", &[])
-    }
+    use crate::test_util::rsa_test_key_a;
 
     #[test]
     fn public_key_der_pem_roundtrip() {
-        let mut r = rng(b"enc-pub");
-        let key = RsaPrivateKey::<4>::generate(Uint::from_u64(65537), &mut r, 16);
-        let pk = key.public_key();
+        let pk = rsa_test_key_a().public_key();
 
         let der = pk.to_pkcs1_der();
         assert_eq!(der[0], 0x30); // SEQUENCE
-        assert_eq!(RsaPublicKey::<4>::from_pkcs1_der(&der).unwrap(), pk);
+        assert_eq!(RsaPublicKey::<32>::from_pkcs1_der(&der).unwrap(), pk);
 
         let pem = pk.to_pkcs1_pem();
-        assert_eq!(RsaPublicKey::<4>::from_pkcs1_pem(&pem).unwrap(), pk);
+        assert_eq!(RsaPublicKey::<32>::from_pkcs1_pem(&pem).unwrap(), pk);
     }
 
     #[test]
     fn private_key_der_pem_roundtrip() {
-        let mut r = rng(b"enc-priv");
-        let key = RsaPrivateKey::<4>::generate(Uint::from_u64(65537), &mut r, 16);
+        let key = rsa_test_key_a();
 
         let der = key.to_pkcs1_der();
-        let decoded = RsaPrivateKey::<4>::from_pkcs1_der(&der).unwrap();
+        let decoded = RsaPrivateKey::<32>::from_pkcs1_der(&der).unwrap();
         assert_eq!(decoded.modulus(), key.modulus());
         assert_eq!(decoded.private_exponent(), key.private_exponent());
         assert_eq!(decoded.primes(), key.primes());
 
         let pem = key.to_pkcs1_pem();
-        let decoded = RsaPrivateKey::<4>::from_pkcs1_pem(&pem).unwrap();
+        let decoded = RsaPrivateKey::<32>::from_pkcs1_pem(&pem).unwrap();
         assert_eq!(decoded.modulus(), key.modulus());
     }
 
     #[test]
     fn serialized_keys_still_work() {
         // Sign with a key round-tripped through PEM; verify with the public key
-        // round-tripped through DER. RSA-512 fits a SHA-256 signature.
-        let mut r = rng(b"enc-func");
-        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
-
+        // round-tripped through DER.
+        let key = rsa_test_key_a();
         let priv_pem = key.to_pkcs1_pem();
         let pub_der = key.public_key().to_pkcs1_der();
-        let priv2 = RsaPrivateKey::<8>::from_pkcs1_pem(&priv_pem).unwrap();
-        let pub2 = RsaPublicKey::<8>::from_pkcs1_der(&pub_der).unwrap();
+        let priv2 = RsaPrivateKey::<32>::from_pkcs1_pem(&priv_pem).unwrap();
+        let pub2 = RsaPublicKey::<32>::from_pkcs1_der(&pub_der).unwrap();
 
         let sig = priv2.sign_pkcs1v15::<Sha256>(b"serialized").unwrap();
         assert!(pub2.verify_pkcs1v15::<Sha256>(b"serialized", &sig).is_ok());

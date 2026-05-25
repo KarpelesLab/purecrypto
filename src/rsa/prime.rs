@@ -106,8 +106,10 @@ fn mask_to_bits(limbs: &mut [u64], bits: usize) {
     }
 }
 
-/// Generates a random (probable) prime of exactly `bits` bits: bit `bits-1`
-/// (most significant) and bit 0 (odd) are forced set.
+/// Generates a random (probable) prime of exactly `bits` bits. The top two
+/// bits and bit 0 are forced set: bit 0 makes it odd, and setting both
+/// `bits-1` and `bits-2` ensures the product of two such primes is a full
+/// `2*bits`-bit modulus (the standard RSA construction).
 ///
 /// # Panics
 /// Panics if `bits` is not in `2..=LIMBS*64`.
@@ -123,7 +125,8 @@ pub fn random_prime<const LIMBS: usize, R: RngCore>(
             *limb = rng.next_u64();
         }
         mask_to_bits(&mut limbs, bits);
-        limbs[(bits - 1) / 64] |= 1 << ((bits - 1) % 64); // top bit → exact size
+        limbs[(bits - 1) / 64] |= 1 << ((bits - 1) % 64); // ensure exact bit size
+        limbs[(bits - 2) / 64] |= 1 << ((bits - 2) % 64); // ensure full-width product
         limbs[0] |= 1; // odd
         let candidate = Uint::from_limbs(limbs);
         if is_prime(&candidate, rng, rounds) {

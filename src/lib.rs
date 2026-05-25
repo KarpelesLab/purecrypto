@@ -77,4 +77,20 @@ pub(crate) mod test_util {
         }
         out
     }
+
+    /// A fixed 2048-bit RSA test key (32 limbs), parsed from an embedded
+    /// PKCS#1 PEM fixture. Avoids per-test key generation while keeping tests
+    /// at a realistic key size.
+    #[cfg(all(feature = "rsa", feature = "der", feature = "alloc"))]
+    pub(crate) fn rsa_test_key_a() -> crate::rsa::RsaPrivateKey<32> {
+        crate::rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../testdata/rsa2048_test_a.pem"))
+            .expect("parse RSA-2048 test key A")
+    }
+
+    /// A second, distinct 2048-bit RSA test key.
+    #[cfg(all(feature = "rsa", feature = "der", feature = "alloc"))]
+    pub(crate) fn rsa_test_key_b() -> crate::rsa::RsaPrivateKey<32> {
+        crate::rsa::RsaPrivateKey::from_pkcs1_pem(include_str!("../testdata/rsa2048_test_b.pem"))
+            .expect("parse RSA-2048 test key B")
+    }
 }
