@@ -43,6 +43,9 @@ pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 
+#[cfg(feature = "rng")]
+pub mod rng;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {

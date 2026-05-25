@@ -261,6 +261,11 @@ impl Digest for Sha256 {
     }
 
     #[inline]
+    fn zeroed_output() -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    #[inline]
     fn update(&mut self, data: &[u8]) {
         self.state.update(data);
     }
@@ -294,6 +299,11 @@ impl Digest for Sha224 {
     #[inline]
     fn zeroed_block() -> [u8; 64] {
         [0u8; 64]
+    }
+
+    #[inline]
+    fn zeroed_output() -> [u8; 28] {
+        [0u8; 28]
     }
 
     #[inline]

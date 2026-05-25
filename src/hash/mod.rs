@@ -46,6 +46,10 @@ pub trait Digest: Clone {
     /// Returns a zeroed [block buffer](Digest::Block).
     fn zeroed_block() -> Self::Block;
 
+    /// Returns a zeroed [output buffer](Digest::Output). Useful to seed
+    /// fixed-size state generically (e.g. HMAC-DRBG's `K`/`V`).
+    fn zeroed_output() -> Self::Output;
+
     /// Feeds `data` into the hasher. May be called any number of times.
     fn update(&mut self, data: &[u8]);
 

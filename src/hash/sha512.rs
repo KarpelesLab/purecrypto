@@ -309,6 +309,11 @@ macro_rules! sha512_variant {
             }
 
             #[inline]
+            fn zeroed_output() -> [u8; $out] {
+                [0u8; $out]
+            }
+
+            #[inline]
             fn update(&mut self, data: &[u8]) {
                 self.state.update(data);
             }

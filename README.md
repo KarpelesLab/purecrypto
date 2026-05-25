@@ -38,6 +38,7 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | 🟡 SHA-2 (224/256/384/512, 512/224, 512/256), HMAC |
 | Key derivation   | `kdf`       | 🟡 PBKDF2 |
+| Randomness       | `rng`       | 🟡 RngCore/CryptoRng, HMAC-DRBG, OsRng (Unix) |
 | Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM (AEAD) |
 | Bignum (CT)      | `bignum`    | 🟡 Uint<LIMBS>, widening mul, Montgomery modular arith, modexp + Fermat inverse |
 | Asymmetric keys  | `keys`      | ⬜ planned (RSA, ECDSA, Ed25519, ML-KEM) |
