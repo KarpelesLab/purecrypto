@@ -43,7 +43,7 @@ Single crate, modules gated by Cargo features:
 | Bignum (CT)      | `bignum`    | 🟡 Uint<LIMBS>, widening mul, Montgomery modular arith, modexp + Fermat inverse |
 | Asymmetric keys  | `rsa`       | 🟡 RSA keygen, raw, PKCS#1 v1.5 enc/sign, PSS sign/verify, PKCS#1 DER/PEM |
 | Key derivation   | `kdf`       | 🟡 PBKDF2, HKDF |
-| Elliptic curve   | `ec`        | 🟡 P-256 (ECDSA/ECDH), X25519; Ed25519/ML-KEM planned |
+| Elliptic curve   | `ec`        | 🟡 ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519; Ed25519/ML-KEM planned |
 | ASN.1 / DER      | `der`       | 🟡 DER reader/writer, base64, PEM; RSA PKCS#1 key (de)serialization |
 | X.509            | `x509`      | 🟡 self-signed + CA issuance, parse, verify (RSA + P-256/ECDSA); PKIX SPKI; OpenSSL-interop |
 | TLS / DTLS       | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1, AES-GCM; RFC 8448 KATs |

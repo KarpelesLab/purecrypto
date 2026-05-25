@@ -1,11 +1,18 @@
-//! Elliptic-curve cryptography over the NIST P-256 curve (secp256r1).
+//! Elliptic-curve cryptography.
 //!
-//! Field and group arithmetic build on the constant-time
-//! [`bignum`](crate::bignum) layer, using the Renes–Costello–Batina complete
-//! addition formulas (for `a = -3`) so point operations are branch-free and
-//! correct for all inputs, including the identity.
+//! Two ECDSA/ECDH paths, both built on the constant-time
+//! [`bignum`](crate::bignum) layer with the Renes–Costello–Batina complete
+//! addition formulas (branch-free, correct for all inputs including the
+//! identity):
 //!
-//! Exposes ECDSA signing and verification ([`ecdsa`]).
+//! - a fast **const-generic P-256** path ([`ecdsa`], [`ecdh`]), for callers who
+//!   know the curve at compile time; and
+//! - a **runtime multi-curve** path ([`boxed`]) over heap-backed `BoxedUint`,
+//!   selecting P-256/P-384/P-521/secp256k1 at runtime via [`CurveId`] — used by
+//!   the TLS and X.509 layers, where the peer's curve is known only at parse
+//!   time.
+//!
+//! Also exposes X25519 ([`x25519`]).
 
 pub mod boxed;
 pub mod curves;
