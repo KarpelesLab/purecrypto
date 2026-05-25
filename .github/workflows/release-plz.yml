@@ -12,8 +12,6 @@ jobs:
   release-plz:
     name: Release-plz
     runs-on: ubuntu-latest
-    # Don't run on the release PRs that release-plz itself creates.
-    if: ${{ github.event.head_commit.author.name != 'github-actions[bot]' }}
     concurrency:
       group: release-plz-${{ github.ref }}
       cancel-in-progress: false
