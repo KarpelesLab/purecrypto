@@ -129,7 +129,7 @@ impl RawPrivate for BoxedRsaPrivateKey {
     }
 }
 
-/// PKCS#1 DER parsing for runtime-sized keys.
+/// PKCS#1 DER for runtime-sized keys.
 #[cfg(feature = "der")]
 impl BoxedRsaPublicKey {
     /// Parses a PKCS#1 `RSAPublicKey` DER structure (`SEQUENCE { n, e }`).
@@ -141,6 +141,14 @@ impl BoxedRsaPublicKey {
         seq.finish()?;
         reader.finish()?;
         Ok(BoxedRsaPublicKey::new(n, e))
+    }
+
+    /// Encodes the key as a PKCS#1 `RSAPublicKey` DER structure.
+    pub fn to_pkcs1_der(&self) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_sequence};
+        let n = self.n.to_be_bytes(self.k);
+        let e = self.e.to_be_bytes(self.e.bit_len().div_ceil(8).max(1));
+        encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat())
     }
 }
 

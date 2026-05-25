@@ -214,6 +214,24 @@ impl Certificate {
         issuer_key.verify_pkcs1v15::<Sha256>(parts.tbs, parts.signature)?;
         Ok(())
     }
+
+    /// The subject's public key as an algorithm-agnostic [`AnyPublicKey`]
+    /// (RSA of any size, or P-256 ECDSA).
+    pub fn subject_public_key(&self) -> Result<super::AnyPublicKey, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)?; // validity
+        DistinguishedName::decode(&mut seq)?; // subject
+        let spki = seq.read_element()?; // full SubjectPublicKeyInfo
+        super::AnyPublicKey::from_spki_der(spki)
+    }
+
+    /// Verifies the certificate signature against `issuer`, dispatching on the
+    /// certificate's `signatureAlgorithm` (RSA-PKCS#1 or ECDSA over SHA-256/384).
+    pub fn verify_signature_with(&self, issuer: &super::AnyPublicKey) -> Result<(), Error> {
+        let parts = self.parts()?;
+        issuer.verify(&parts.sig_alg, parts.tbs, parts.signature)
+    }
 }
 
 #[cfg(test)]
@@ -294,5 +312,32 @@ mod tests {
         der[idx] ^= 1;
         let bad = Certificate::from_der(der).unwrap();
         assert!(bad.verify_signature::<32>(&key.public_key()).is_err());
+    }
+
+    // A P-256 ECDSA self-signed certificate produced by OpenSSL
+    // (`openssl req -x509`, ecdsa-with-SHA256).
+    const OPENSSL_EC_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBjjCCATWgAwIBAgIUdDq5AMJ2buWe3Zp8FzA8x1IJ/I4wCgYIKoZIzj0EAwIw\n\
+HTEbMBkGA1UEAwwScHVyZWNyeXB0byBlYyB0ZXN0MB4XDTI2MDUyNTE1NTcwMloX\n\
+DTM2MDUyMjE1NTcwMlowHTEbMBkGA1UEAwwScHVyZWNyeXB0byBlYyB0ZXN0MFkw\n\
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEI/Rjb2Q5+virvsM30rQD4uAVpo5XDfzp\n\
+6QEzGS5q032wAZMNKRyj79yAAFn9UwJzHjtFjQ8dexLQ+yFTHj994KNTMFEwHQYD\n\
+VR0OBBYEFDkJ9uOVaokxPfzPjax49XgMM02PMB8GA1UdIwQYMBaAFDkJ9uOVaokx\n\
+PfzPjax49XgMM02PMA8GA1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwIDRwAwRAIg\n\
+RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
+3sC6s2rrQa4gzDiVjwYM2ggX\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn parse_and_verify_openssl_ec_cert() {
+        let cert = Certificate::from_pem(OPENSSL_EC_CERT).unwrap();
+        assert_eq!(
+            cert.subject().unwrap(),
+            DistinguishedName::common_name("purecrypto ec test")
+        );
+        let key = cert.subject_public_key().unwrap();
+        assert!(matches!(key, crate::x509::AnyPublicKey::EcdsaP256(_)));
+        // Self-signed: verifies under its own embedded key.
+        cert.verify_signature_with(&key).unwrap();
     }
 }

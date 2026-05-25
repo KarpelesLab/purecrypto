@@ -7,10 +7,12 @@
 
 mod cert;
 mod name;
+mod pubkey;
 mod time;
 
 pub use cert::Certificate;
 pub use name::DistinguishedName;
+pub use pubkey::AnyPublicKey;
 pub use time::{Time, Validity};
 
 use alloc::vec::Vec;
@@ -25,6 +27,15 @@ pub mod oid {
     pub const SHA384_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 12];
     /// `sha512WithRSAEncryption` (1.2.840.113549.1.1.13).
     pub const SHA512_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 13];
+
+    /// `id-ecPublicKey` (1.2.840.10045.2.1).
+    pub const EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
+    /// `prime256v1` / `secp256r1` (1.2.840.10045.3.1.7).
+    pub const PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+    /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
+    pub const ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
+    /// `ecdsa-with-SHA384` (1.2.840.10045.4.3.3).
+    pub const ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
 
     /// `id-at-commonName` (2.5.4.3).
     pub const COMMON_NAME: &[u64] = &[2, 5, 4, 3];
@@ -50,6 +61,8 @@ pub enum Error {
     UnsupportedAlgorithm,
     /// A structural problem in the certificate.
     Malformed,
+    /// A signature failed verification.
+    Verification,
 }
 
 impl From<crate::der::Error> for Error {
@@ -71,6 +84,7 @@ impl core::fmt::Display for Error {
             Error::Rsa(e) => write!(f, "X.509 RSA error: {e}"),
             Error::UnsupportedAlgorithm => f.write_str("unsupported X.509 algorithm"),
             Error::Malformed => f.write_str("malformed X.509 certificate"),
+            Error::Verification => f.write_str("X.509 signature verification failed"),
         }
     }
 }
