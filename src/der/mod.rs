@@ -6,20 +6,26 @@
 //! free; the encoding helpers require the `alloc` feature.
 
 #[cfg(feature = "alloc")]
+mod oid;
+#[cfg(feature = "alloc")]
 mod pem;
 #[cfg(feature = "alloc")]
 mod writer;
 
 #[cfg(feature = "alloc")]
+pub use oid::{encode_oid_arcs, oid_tlv, oid_to_string, parse_oid};
+#[cfg(feature = "alloc")]
 pub use pem::{base64_decode, base64_encode, pem_decode, pem_encode};
 #[cfg(feature = "alloc")]
 pub use writer::{
-    encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
-    encode_oid, encode_sequence, encode_tlv,
+    encode_bit_string, encode_boolean, encode_context, encode_integer, encode_null,
+    encode_octet_string, encode_oid, encode_sequence, encode_string, encode_tlv,
 };
 
 /// DER tag bytes for the supported types.
 pub mod tag {
+    /// `BOOLEAN`.
+    pub const BOOLEAN: u8 = 0x01;
     /// `INTEGER`.
     pub const INTEGER: u8 = 0x02;
     /// `BIT STRING`.
@@ -30,6 +36,16 @@ pub mod tag {
     pub const NULL: u8 = 0x05;
     /// `OBJECT IDENTIFIER`.
     pub const OID: u8 = 0x06;
+    /// `UTF8String`.
+    pub const UTF8_STRING: u8 = 0x0c;
+    /// `PrintableString`.
+    pub const PRINTABLE_STRING: u8 = 0x13;
+    /// `IA5String`.
+    pub const IA5_STRING: u8 = 0x16;
+    /// `UTCTime`.
+    pub const UTC_TIME: u8 = 0x17;
+    /// `GeneralizedTime`.
+    pub const GENERALIZED_TIME: u8 = 0x18;
     /// `SEQUENCE` (constructed).
     pub const SEQUENCE: u8 = 0x30;
     /// `SET` (constructed).
@@ -191,6 +207,29 @@ impl<'a> Reader<'a> {
             Some((0, rest)) => Ok(rest),
             _ => Err(Error::Malformed),
         }
+    }
+
+    /// Reads a `BOOLEAN`.
+    pub fn read_boolean(&mut self) -> Result<bool, Error> {
+        match self.read_tlv(tag::BOOLEAN)? {
+            [0x00] => Ok(false),
+            [0xff] => Ok(true),
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Returns the tag of the next value without consuming it, or `None` at end
+    /// of input. Useful for optional / `DEFAULT` fields.
+    #[inline]
+    pub fn peek_tag(&self) -> Option<u8> {
+        self.data.first().copied()
+    }
+
+    /// Reads a tag-length-value of any tag, returning `(tag, value)`.
+    pub fn read_any(&mut self) -> Result<(u8, &'a [u8]), Error> {
+        let tag = self.read_u8()?;
+        let len = self.read_length()?;
+        Ok((tag, self.take(len)?))
     }
 
     /// Succeeds only if all input has been consumed.
