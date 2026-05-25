@@ -37,6 +37,9 @@ pub mod cipher;
 #[cfg(feature = "hash")]
 pub mod hash;
 
+#[cfg(feature = "kdf")]
+pub mod kdf;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {
