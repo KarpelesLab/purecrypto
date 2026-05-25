@@ -18,10 +18,16 @@
 //! - Legacy (interop only, not collision-resistant): [`Md4`], [`Md5`],
 //!   [`Sha1`], [`Ripemd160`].
 //!
-//! Extendable-output functions ([`ExtendableOutput`]): [`Shake128`],
-//! [`Shake256`], [`CShake128`], [`CShake256`], [`KmacXof128`], [`KmacXof256`],
-//! [`Blake2xb`], [`Blake2xs`], and [`Blake3`]. Keyed/customizable MACs:
-//! [`Kmac128`], [`Kmac256`].
+//! Extendable-output functions ([`ExtendableOutput`] or an inherent
+//! `finalize_xof`): [`Shake128`], [`Shake256`], [`CShake128`], [`CShake256`],
+//! [`Blake2xb`], [`Blake2xs`], [`Blake3`], [`KmacXof128`], [`KmacXof256`],
+//! [`TupleHash128`]/[`TupleHash256`], [`ParallelHash128`]/[`ParallelHash256`],
+//! [`TurboShake128`]/[`TurboShake256`], and [`KangarooTwelve`].
+//!
+//! Message authentication codes ([`Mac`], with constant-time
+//! [`verify`](Mac::verify)): [`Hmac`], [`Kmac128`], [`Kmac256`],
+//! [`Blake2bMac`], [`Blake2sMac`]. Keyed constructions wipe their key-derived
+//! state on drop.
 
 mod blake2;
 mod blake3;
