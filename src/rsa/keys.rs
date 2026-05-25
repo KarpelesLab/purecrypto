@@ -116,6 +116,30 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         (&self.p, &self.q)
     }
 
+    /// The public exponent `e`.
+    #[inline]
+    pub fn exponent(&self) -> &Uint<LIMBS> {
+        &self.e
+    }
+
+    /// The private exponent `d`.
+    #[inline]
+    pub fn private_exponent(&self) -> &Uint<LIMBS> {
+        &self.d
+    }
+
+    /// Constructs a private key from all components, including the primes.
+    /// Used by key deserialization.
+    pub(crate) fn from_raw_parts(
+        n: Uint<LIMBS>,
+        e: Uint<LIMBS>,
+        d: Uint<LIMBS>,
+        p: Uint<LIMBS>,
+        q: Uint<LIMBS>,
+    ) -> Self {
+        RsaPrivateKey { n, e, d, p, q }
+    }
+
     /// The raw RSA private operation `c^d mod n` (decryption / signing
     /// primitive).
     pub fn raw(&self, c: &Uint<LIMBS>) -> Uint<LIMBS> {
