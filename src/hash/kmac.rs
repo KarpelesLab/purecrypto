@@ -1,8 +1,10 @@
-//! cSHAKE, KMAC, and KMAC-XOF (NIST SP 800-185), built on the Keccak sponge.
+//! NIST SP 800-185 functions built on the Keccak sponge: cSHAKE, KMAC (+ XOF),
+//! TupleHash (+ XOF), and ParallelHash (+ XOF).
 //!
 //! All `no_std` and allocation-free: the SP 800-185 prefix (`bytepad` of the
 //! encoded function name, customization, and key) is absorbed incrementally
-//! into the sponge rather than materialized.
+//! into the sponge rather than materialized. ParallelHash uses a const-generic
+//! block size so its per-block buffer needs no allocation.
 
 use super::keccak::{Keccak, KeccakReader};
 
@@ -232,6 +234,156 @@ macro_rules! kmac_xof {
 kmac_xof!(KmacXof128, 168, "KMAC128 in XOF mode.");
 kmac_xof!(KmacXof256, 136, "KMAC256 in XOF mode.");
 
+/// Defines a TupleHash at the given rate (SP 800-185). The same type offers a
+/// fixed-output [`finalize_into`](Self::finalize_into) and an XOF
+/// [`finalize_xof`](Self::finalize_xof) (TupleHashXOF).
+macro_rules! tuplehash {
+    ($name:ident, $rate:expr, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone)]
+        pub struct $name {
+            keccak: Keccak,
+        }
+        impl $name {
+            /// Creates a TupleHash with customization string `custom`.
+            pub fn new(custom: &[u8]) -> Self {
+                let (keccak, _) = cshake_init($rate, b"TupleHash", custom);
+                $name { keccak }
+            }
+            /// Absorbs one tuple element. The element boundaries are encoded
+            /// unambiguously, so distinct tuples never collide.
+            pub fn update(&mut self, element: &[u8]) {
+                let mut b = [0u8; 9];
+                let n = left_encode(&mut b, 8 * element.len() as u64);
+                self.keccak.update(&b[..n]);
+                self.keccak.update(element);
+            }
+            /// Finalizes into `out` (the output length is `out.len()`).
+            pub fn finalize_into(mut self, out: &mut [u8]) {
+                let mut b = [0u8; 9];
+                let n = right_encode(&mut b, 8 * out.len() as u64);
+                self.keccak.update(&b[..n]);
+                self.keccak.finalize(0x04);
+                self.keccak.squeeze(out);
+            }
+            /// Finalizes in XOF mode (TupleHashXOF) and returns an output reader.
+            pub fn finalize_xof(mut self) -> KeccakReader {
+                let mut b = [0u8; 9];
+                let n = right_encode(&mut b, 0);
+                self.keccak.update(&b[..n]);
+                KeccakReader::new(self.keccak, 0x04)
+            }
+        }
+    };
+}
+
+tuplehash!(
+    TupleHash128,
+    168,
+    "TupleHash128 (hashing of a tuple of strings)."
+);
+tuplehash!(
+    TupleHash256,
+    136,
+    "TupleHash256 (hashing of a tuple of strings)."
+);
+
+/// Defines a ParallelHash at the given rate (SP 800-185), with a const-generic
+/// block size `B`. Each `B`-byte block is hashed independently with plain
+/// SHAKE (rate `$inner_rate`) to a `$cv`-byte chaining value, which keeps the
+/// type allocation-free. Offers both a fixed-output and an XOF finalize.
+macro_rules! parallelhash {
+    ($name:ident, $rate:expr, $inner_rate:expr, $cv:expr, $doc:literal) => {
+        #[doc = $doc]
+        #[derive(Clone)]
+        pub struct $name<const B: usize> {
+            outer: Keccak,
+            leaf: [u8; B],
+            leaf_len: usize,
+            blocks: u64,
+        }
+        impl<const B: usize> $name<B> {
+            /// Creates a ParallelHash with customization string `custom`.
+            pub fn new(custom: &[u8]) -> Self {
+                let (mut outer, _) = cshake_init($rate, b"ParallelHash", custom);
+                let mut b = [0u8; 9];
+                let n = left_encode(&mut b, B as u64);
+                outer.update(&b[..n]);
+                $name {
+                    outer,
+                    leaf: [0u8; B],
+                    leaf_len: 0,
+                    blocks: 0,
+                }
+            }
+            /// Hashes the buffered leaf and absorbs its chaining value.
+            fn absorb_leaf(&mut self) {
+                let mut cv = [0u8; $cv];
+                let mut k = Keccak::new($inner_rate);
+                k.update(&self.leaf[..self.leaf_len]);
+                k.finalize(0x1F);
+                k.squeeze(&mut cv);
+                self.outer.update(&cv);
+                self.blocks += 1;
+                self.leaf_len = 0;
+            }
+            /// Feeds input, splitting it into `B`-byte parallel blocks.
+            pub fn update(&mut self, mut data: &[u8]) {
+                while !data.is_empty() {
+                    let take = (B - self.leaf_len).min(data.len());
+                    self.leaf[self.leaf_len..self.leaf_len + take].copy_from_slice(&data[..take]);
+                    self.leaf_len += take;
+                    data = &data[take..];
+                    if self.leaf_len == B {
+                        self.absorb_leaf();
+                    }
+                }
+            }
+            /// Absorbs any partial final block and the block count.
+            fn absorb_tail(&mut self) {
+                if self.leaf_len > 0 {
+                    self.absorb_leaf();
+                }
+                let mut b = [0u8; 9];
+                let n = right_encode(&mut b, self.blocks);
+                self.outer.update(&b[..n]);
+            }
+            /// Finalizes into `out` (the output length is `out.len()`).
+            pub fn finalize_into(mut self, out: &mut [u8]) {
+                self.absorb_tail();
+                let mut b = [0u8; 9];
+                let n = right_encode(&mut b, 8 * out.len() as u64);
+                self.outer.update(&b[..n]);
+                self.outer.finalize(0x04);
+                self.outer.squeeze(out);
+            }
+            /// Finalizes in XOF mode (ParallelHashXOF) and returns a reader.
+            pub fn finalize_xof(mut self) -> KeccakReader {
+                self.absorb_tail();
+                let mut b = [0u8; 9];
+                let n = right_encode(&mut b, 0);
+                self.outer.update(&b[..n]);
+                KeccakReader::new(self.outer, 0x04)
+            }
+        }
+    };
+}
+
+parallelhash!(
+    ParallelHash128,
+    168,
+    168,
+    32,
+    "ParallelHash128 with a const-generic block size `B`."
+);
+parallelhash!(
+    ParallelHash256,
+    136,
+    136,
+    64,
+    "ParallelHash256 with a const-generic block size `B`."
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +489,115 @@ mod tests {
         let mut x2 = KmacXof128::new(&key, b"App");
         x2.update(b"streamed message");
         x2.finalize_into(&mut b);
+        assert_eq!(a, b);
+    }
+
+    // NIST SP 800-185 TupleHash sample vectors (cross-checked with pycryptodome
+    // and an independent Keccak reference).
+    #[test]
+    fn tuplehash_nist_samples() {
+        let x1 = [0x00u8, 0x01, 0x02];
+        let x2 = [0x10u8, 0x11, 0x12, 0x13, 0x14, 0x15];
+        let x3 = [0x20u8, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28];
+
+        let mut out = [0u8; 32];
+        let mut t = TupleHash128::new(b"");
+        t.update(&x1);
+        t.update(&x2);
+        t.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("c5d8786c1afb9b82111ab34b65b2c0048fa64e6d48e263264ce1707d3ffc8ed1")
+        );
+
+        let mut out = [0u8; 32];
+        let mut t = TupleHash128::new(b"My Tuple App");
+        t.update(&x1);
+        t.update(&x2);
+        t.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("75cdb20ff4db1154e841d758e24160c54bae86eb8c13e7f5f40eb35588e96dfb")
+        );
+
+        let mut out = [0u8; 32];
+        let mut t = TupleHash128::new(b"My Tuple App");
+        t.update(&x1);
+        t.update(&x2);
+        t.update(&x3);
+        t.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("e60f202c89a2631eda8d4c588ca5fd07f39e5151998deccf973adb3804bb6e84")
+        );
+
+        let mut out = [0u8; 64];
+        let mut t = TupleHash256::new(b"");
+        t.update(&x1);
+        t.update(&x2);
+        t.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<64>(
+                "cfb7058caca5e668f81a12a20a2195ce97a925f1dba3e7449a56f82201ec607311ac2696b1ab5ea2352df1423bde7bd4bb78c9aed1a853c78672f9eb23bbe194"
+            )
+        );
+    }
+
+    // NIST SP 800-185 ParallelHash sample vectors (B = 8 bytes).
+    #[test]
+    fn parallelhash_nist_samples() {
+        let x = [
+            0x00u8, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+            0x16, 0x17, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+        ];
+
+        let mut out = [0u8; 32];
+        let mut p = ParallelHash128::<8>::new(b"");
+        p.update(&x);
+        p.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("ba8dc1d1d979331d3f813603c67f72609ab5e44b94a0b8f9af46514454a2b4f5")
+        );
+
+        let mut out = [0u8; 32];
+        let mut p = ParallelHash128::<8>::new(b"Parallel Data");
+        p.update(&x);
+        p.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<32>("fc484dcb3f84dceedc353438151bee58157d6efed0445a81f165e495795b7206")
+        );
+
+        let mut out = [0u8; 64];
+        let mut p = ParallelHash256::<8>::new(b"");
+        p.update(&x);
+        p.finalize_into(&mut out);
+        assert_eq!(
+            out,
+            from_hex::<64>(
+                "bc1ef124da34495e948ead207dd9842235da432d2bbc54b4c110e64c451105531b7f2a3e0ce055c02805e7c2de1fb746af97a1dd01f43b824e31b87612410429"
+            )
+        );
+    }
+
+    // Feeding ParallelHash in arbitrary chunks must match one block-sized feed.
+    #[test]
+    fn parallelhash_streaming_matches() {
+        let data: [u8; 100] = core::array::from_fn(|i| i as u8);
+
+        let mut a = [0u8; 32];
+        let mut p = ParallelHash128::<16>::new(b"ctx");
+        p.update(&data);
+        p.finalize_into(&mut a);
+
+        let mut b = [0u8; 32];
+        let mut p = ParallelHash128::<16>::new(b"ctx");
+        for c in data.chunks(7) {
+            p.update(c);
+        }
+        p.finalize_into(&mut b);
         assert_eq!(a, b);
     }
 }
