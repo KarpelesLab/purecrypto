@@ -192,6 +192,49 @@ impl Signature {
     }
 }
 
+/// DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` codec — the
+/// on-the-wire form used by TLS and X.509 (the fixed `r‖s` form is used by
+/// JOSE/raw APIs).
+#[cfg(all(feature = "der", feature = "alloc"))]
+impl Signature {
+    /// Encodes the signature as a DER `Ecdsa-Sig-Value`.
+    pub fn to_der(&self) -> alloc::vec::Vec<u8> {
+        use crate::der::{encode_integer, encode_sequence};
+        let raw = self.to_bytes();
+        encode_sequence(&[encode_integer(&raw[..32]), encode_integer(&raw[32..])].concat())
+    }
+
+    /// Decodes a DER `Ecdsa-Sig-Value` into a signature, left-padding `r`/`s`
+    /// to 32 bytes.
+    pub fn from_der(der: &[u8]) -> Result<Signature, Error> {
+        use crate::der::Reader;
+        let mut reader = Reader::new(der);
+        let mut seq = reader.read_sequence().map_err(|_| Error::Malformed)?;
+        let r = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        let s = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        seq.finish().map_err(|_| Error::Malformed)?;
+        reader.finish().map_err(|_| Error::Malformed)?;
+
+        let mut raw = [0u8; 64];
+        left_pad_32(r, &mut raw[..32])?;
+        left_pad_32(s, &mut raw[32..])?;
+        Ok(Signature::from_bytes(&raw))
+    }
+}
+
+/// Right-aligns a DER `INTEGER`'s magnitude (stripping a leading sign byte)
+/// into a 32-byte slot.
+#[cfg(all(feature = "der", feature = "alloc"))]
+fn left_pad_32(int: &[u8], out: &mut [u8]) -> Result<(), Error> {
+    let start = int.iter().position(|&b| b != 0).unwrap_or(int.len());
+    let mag = &int[start..];
+    if mag.len() > 32 {
+        return Err(Error::Malformed);
+    }
+    out[32 - mag.len()..].copy_from_slice(mag);
+    Ok(())
+}
+
 /// RFC 6979 deterministic nonce generation for a 256-bit group, using HMAC-`D`.
 fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
     let mut d_oct = [0u8; 32];
@@ -307,6 +350,20 @@ mod tests {
             pk.verify::<Sha256>(b"sample", &Signature::from_bytes(&raw))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn der_signature_roundtrip() {
+        let sig = priv_key().sign::<Sha256>(b"sample").unwrap();
+        let der = sig.to_der();
+        assert_eq!(der[0], 0x30); // SEQUENCE
+        assert_eq!(Signature::from_der(&der).unwrap(), sig);
+        // A DER-decoded signature still verifies.
+        let pk = priv_key().public_key();
+        pk.verify::<Sha256>(b"sample", &Signature::from_der(&der).unwrap())
+            .unwrap();
+        // Garbage DER is rejected.
+        assert!(Signature::from_der(&[0x30, 0x00]).is_err());
     }
 
     #[test]
