@@ -9,12 +9,22 @@
 //! Implemented:
 //! - SHA-2: [`Sha224`], [`Sha256`], [`Sha384`], [`Sha512`], [`Sha512_224`],
 //!   [`Sha512_256`].
-//! - SHA-3 (Keccak): [`Sha3_224`], [`Sha3_256`], [`Sha3_384`], [`Sha3_512`].
-//! - BLAKE2: [`Blake2b256`], [`Blake2b384`], [`Blake2b512`], [`Blake2s256`].
+//! - SHA-3 (Keccak): [`Sha3_224`], [`Sha3_256`], [`Sha3_384`], [`Sha3_512`],
+//!   and [`Keccak256`] (the legacy/Ethereum variant).
+//! - BLAKE2: [`Blake2b256`], [`Blake2b384`], [`Blake2b512`], [`Blake2s256`],
+//!   plus the keyed MACs [`Blake2bMac`]/[`Blake2sMac`].
+//! - [`Blake3`] — also an XOF, with keyed and key-derivation modes.
+//! - SM3: [`Sm3`].
 //! - Legacy (interop only, not collision-resistant): [`Md4`], [`Md5`],
 //!   [`Sha1`], [`Ripemd160`].
+//!
+//! Extendable-output functions ([`ExtendableOutput`]): [`Shake128`],
+//! [`Shake256`], [`CShake128`], [`CShake256`], [`KmacXof128`], [`KmacXof256`],
+//! [`Blake2xb`], [`Blake2xs`], and [`Blake3`]. Keyed/customizable MACs:
+//! [`Kmac128`], [`Kmac256`].
 
 mod blake2;
+mod blake3;
 mod block;
 mod hmac;
 mod keccak;
@@ -33,6 +43,7 @@ pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
     Blake2xbReader, Blake2xs, Blake2xsReader, blake2b256, blake2b384, blake2b512, blake2s256,
 };
+pub use blake3::{Blake3, Blake3Reader, blake3};
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
 };
