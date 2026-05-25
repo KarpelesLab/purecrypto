@@ -17,8 +17,8 @@ use alloc::vec::Vec;
 pub(crate) enum Incoming {
     /// A complete handshake message, including its 4-byte header.
     Handshake(Vec<u8>),
-    /// Application data (post-handshake).
-    ApplicationData(Vec<u8>),
+    /// Application data arrived (the bytes are buffered for the reader).
+    ApplicationData,
     /// An alert from the peer.
     Alert(Alert),
 }
@@ -191,7 +191,7 @@ impl ConnectionCore {
             }
             ContentType::ApplicationData => {
                 self.app_in.extend_from_slice(&content);
-                Ok(Some(Incoming::ApplicationData(content)))
+                Ok(Some(Incoming::ApplicationData))
             }
             ContentType::Alert => Ok(Some(parse_alert(&content)?)),
             _ => Err(Error::UnexpectedMessage),

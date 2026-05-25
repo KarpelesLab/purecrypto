@@ -74,13 +74,6 @@ impl<'a> ReadCursor<'a> {
         self.take(n)
     }
 
-    /// Consumes and returns the rest of the input.
-    pub(crate) fn rest(&mut self) -> &'a [u8] {
-        let s = &self.data[self.pos..];
-        self.pos = self.data.len();
-        s
-    }
-
     /// Succeeds only if all input has been consumed.
     pub(crate) fn expect_empty(&self) -> Result<(), Error> {
         if self.is_empty() {

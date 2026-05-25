@@ -166,6 +166,7 @@ impl KeySchedule {
     }
 
     /// The current Early Secret (only meaningful right after `new`).
+    #[cfg(test)]
     pub(crate) fn early_secret(&self) -> Secret {
         self.secret
     }
@@ -234,11 +235,6 @@ impl KeySchedule {
             b"s ap traffic",
             transcript,
         )
-    }
-
-    /// The negotiated hash.
-    pub(crate) fn alg(&self) -> HashAlg {
-        self.alg
     }
 }
 
