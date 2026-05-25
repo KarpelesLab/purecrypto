@@ -8,6 +8,7 @@ mod pkey;
 mod pki;
 mod rand;
 mod req;
+mod s_client;
 mod util;
 mod x509;
 
@@ -26,6 +27,7 @@ COMMANDS:
     pkey                 Inspect or convert a private key
     req                  Create or inspect a PKCS#10 certificate request
     x509                 Inspect, self-sign, or CA-sign a certificate
+    s_client             Open a TLS 1.3 connection and report the result
     help                 Show this help
 
 Run a command with no/invalid arguments to see its usage.";
@@ -42,6 +44,7 @@ fn main() {
         Some("pkey") => pkey::run(rest),
         Some("req") => req::run(rest),
         Some("x509") => x509::run(rest),
+        Some("s_client") => s_client::run(rest),
         Some("help") | Some("-h") | Some("--help") | None => println!("{USAGE}"),
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }

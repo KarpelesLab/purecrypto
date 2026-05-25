@@ -1,7 +1,7 @@
 //! Integration tests that drive the built `purecrypto` binary.
 #![cfg(feature = "cli")]
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
 /// Runs the CLI with `args`, feeding `stdin`, returning `(stdout, success)`.
@@ -160,6 +160,74 @@ fn ca_workflow_genpkey_req_sign() {
     assert!(text.contains("leaf.test"), "{text}");
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn s_client_loopback() {
+    use purecrypto::rng::OsRng;
+    use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+    use purecrypto::tls::{ServerConfig, ServerConnection, Stream};
+    use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
+    use std::net::TcpListener;
+
+    const KEY: &str = include_str!("../testdata/rsa2048_test_a.pem");
+
+    // A local TLS server that completes one handshake, echoes a reply, and exits.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let signing = RsaPrivateKey::<32>::from_pkcs1_pem(KEY).unwrap();
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(
+            &signing,
+            &DistinguishedName::common_name("127.0.0.1"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap();
+        let key = BoxedRsaPrivateKey::from_pkcs1_pem(KEY).unwrap();
+        let config = ServerConfig::with_rsa(vec![cert.to_der().to_vec()], key);
+        let mut conn = ServerConnection::new(config, OsRng);
+        let mut tls = Stream::new(&mut conn, &mut sock);
+        tls.complete_handshake().expect("server handshake");
+        let mut buf = [0u8; 64];
+        let _ = tls.read(&mut buf); // the client's "PING"
+        tls.write_all(b"PONG").unwrap();
+        tls.flush().unwrap();
+    });
+
+    // The CLI connects (insecure: self-signed), sends PING, prints the reply.
+    let (out, ok) = run(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-quiet",
+        ],
+        b"PING",
+    );
+    server.join().unwrap();
+    assert!(ok, "s_client exited with failure");
+    assert!(
+        out.contains("PONG"),
+        "expected PONG in stdout, got: {out:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires network access"]
+fn s_client_live_cloudflare() {
+    let (_out, ok) = run(
+        &["s_client", "-connect", "cloudflare.com:443"],
+        b"GET / HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n",
+    );
+    assert!(ok);
 }
 
 #[test]
