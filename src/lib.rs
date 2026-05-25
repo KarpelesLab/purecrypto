@@ -37,6 +37,9 @@ pub mod bignum;
 #[cfg(feature = "cipher")]
 pub mod cipher;
 
+#[cfg(feature = "der")]
+pub mod der;
+
 #[cfg(feature = "hash")]
 pub mod hash;
 
