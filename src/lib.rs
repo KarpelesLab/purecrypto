@@ -46,6 +46,9 @@ pub mod kdf;
 #[cfg(feature = "rng")]
 pub mod rng;
 
+#[cfg(feature = "rsa")]
+pub mod rsa;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {
