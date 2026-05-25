@@ -22,4 +22,4 @@ pub(crate) use schedule::{
 #[allow(unused_imports)]
 pub(crate) use sign::{certificate_verify_content, verify_signature};
 #[allow(unused_imports)]
-pub(crate) use suite::{SuiteParams, lookup as lookup_suite, supported as supported_suites};
+pub(crate) use suite::{AeadAlg, SuiteParams, lookup as lookup_suite, supported as supported_suites};

@@ -133,8 +133,8 @@ impl ClientConnection {
 
 impl ClientConnection {
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
-    /// `rng` supplies the ephemeral key shares and the client random. Offers
-    /// both cipher suites and both key-exchange groups.
+    /// `rng` supplies the ephemeral key shares and the client random. Offers all
+    /// supported cipher suites and both key-exchange groups.
     pub fn new<R: RngCore>(config: ClientConfig, server_name: &str, rng: &mut R) -> Self {
         Self::new_with_offer(
             config,
@@ -143,6 +143,7 @@ impl ClientConnection {
             &[
                 CipherSuite::AES_128_GCM_SHA256,
                 CipherSuite::AES_256_GCM_SHA384,
+                CipherSuite::CHACHA20_POLY1305_SHA256,
             ],
             &[NamedGroup::X25519, NamedGroup::SECP256R1],
         )
@@ -361,9 +362,9 @@ impl ClientConnection {
         // Server -> client uses the server handshake key; client -> server
         // (our Finished) uses the client handshake key.
         self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.key_len, &shts));
+            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts));
         self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.key_len, &chts));
+            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts));
         self.core.emit_ccs(); // middlebox compatibility
 
         self.suite = Some(suite);
@@ -489,9 +490,9 @@ impl ClientConnection {
 
         // Switch to application traffic keys.
         self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.key_len, &cats));
+            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &cats));
         self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.key_len, &sats));
+            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &sats));
         self.state = State::Connected;
         Ok(())
     }
@@ -574,7 +575,7 @@ mod tests {
         let body = c.vec_u24().unwrap();
         let ch = ClientHello::decode(body).unwrap();
 
-        assert_eq!(ch.cipher_suites.len(), 2);
+        assert_eq!(ch.cipher_suites.len(), 3);
         assert!(ch.session_id.is_empty());
         for ty in [
             ExtensionType::SERVER_NAME,

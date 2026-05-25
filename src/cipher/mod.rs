@@ -1,26 +1,36 @@
 //! Symmetric ciphers.
 //!
-//! Currently provides the AES block cipher ([`Aes128`], [`Aes192`],
-//! [`Aes256`]) with a constant-time implementation: the S-box is computed by
-//! GF(2⁸) inversion rather than table lookup, so there are no
-//! secret-dependent memory accesses and hence no cache-timing leak.
+//! Provides the AES block cipher ([`Aes128`], [`Aes192`], [`Aes256`]) with a
+//! constant-time implementation: the S-box is computed by GF(2⁸) inversion
+//! rather than table lookup, so there are no secret-dependent memory accesses
+//! and hence no cache-timing leak.
 //!
 //! Block ciphers expose only the raw block transform via [`BlockCipher`];
 //! modes of operation (CTR, CBC, GCM, …) are layered on top separately.
+//!
+//! Also provides the [`ChaCha20`] stream cipher and [`Poly1305`] authenticator,
+//! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
+//! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 
 mod aes;
 mod cbc;
 mod cfb;
+mod chacha20;
+mod chacha20poly1305;
 mod ctr;
 mod gcm;
 mod ofb;
+mod poly1305;
 
 pub use aes::{Aes128, Aes192, Aes256};
 pub use cbc::Cbc;
 pub use cfb::Cfb;
+pub use chacha20::ChaCha20;
+pub use chacha20poly1305::ChaCha20Poly1305;
 pub use ctr::Ctr;
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use ofb::Ofb;
+pub use poly1305::Poly1305;
 
 /// A block cipher: a keyed, invertible permutation on fixed-size blocks.
 pub trait BlockCipher {

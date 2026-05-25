@@ -16,14 +16,16 @@
 //! (RFC 8446 §5.3).
 
 use super::schedule::{HashAlg, Secret, traffic_key_iv};
-use crate::cipher::{Aes128, Aes256, Gcm};
+use super::suite::AeadAlg;
+use crate::cipher::{Aes128, Aes256, ChaCha20Poly1305, Gcm};
 use crate::tls::{ContentType, Error};
 use alloc::vec::Vec;
 
-/// The record-protection AEAD (AES-GCM, keyed for the negotiated suite).
+/// The record-protection AEAD, keyed for the negotiated suite.
 enum Aead {
     Aes128(Gcm<Aes128>),
     Aes256(Gcm<Aes256>),
+    ChaCha20Poly1305(ChaCha20Poly1305),
 }
 
 impl Aead {
@@ -31,6 +33,7 @@ impl Aead {
         match self {
             Aead::Aes128(g) => g.encrypt(nonce, aad, buf),
             Aead::Aes256(g) => g.encrypt(nonce, aad, buf),
+            Aead::ChaCha20Poly1305(c) => c.encrypt(nonce, aad, buf),
         }
     }
 
@@ -38,6 +41,7 @@ impl Aead {
         let r = match self {
             Aead::Aes128(g) => g.decrypt(nonce, aad, buf, tag),
             Aead::Aes256(g) => g.decrypt(nonce, aad, buf, tag),
+            Aead::ChaCha20Poly1305(c) => c.decrypt(nonce, aad, buf, tag),
         };
         r.is_ok()
     }
@@ -53,22 +57,26 @@ pub(crate) struct RecordCrypter {
 
 impl RecordCrypter {
     /// Derives the write/read key and IV from a traffic secret (RFC 8446 §7.3)
-    /// and starts the sequence counter at zero. `key_len` is 16 for
-    /// `AES_128_GCM` or 32 for `AES_256_GCM`.
-    pub(crate) fn new(alg: HashAlg, key_len: usize, secret: &Secret) -> Self {
-        let (key, iv) = traffic_key_iv(alg, secret, key_len);
-        let aead = match key_len {
-            16 => {
+    /// and starts the sequence counter at zero. `alg` selects the AEAD; `key_len`
+    /// is its key size in bytes (16 for AES-128, 32 for AES-256/ChaCha20).
+    pub(crate) fn new(hash: HashAlg, alg: AeadAlg, key_len: usize, secret: &Secret) -> Self {
+        let (key, iv) = traffic_key_iv(hash, secret, key_len);
+        let aead = match alg {
+            AeadAlg::Aes128Gcm => {
                 let mut k = [0u8; 16];
-                k.copy_from_slice(&key);
+                k.copy_from_slice(&key[..16]);
                 Aead::Aes128(Gcm::new(Aes128::new(&k)))
             }
-            32 => {
+            AeadAlg::Aes256Gcm => {
                 let mut k = [0u8; 32];
-                k.copy_from_slice(&key);
+                k.copy_from_slice(&key[..32]);
                 Aead::Aes256(Gcm::new(Aes256::new(&k)))
             }
-            _ => panic!("unsupported AEAD key length {key_len}"),
+            AeadAlg::ChaCha20Poly1305 => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key[..32]);
+                Aead::ChaCha20Poly1305(ChaCha20Poly1305::new(&k))
+            }
         };
         RecordCrypter { aead, iv, seq: 0 }
     }
@@ -167,7 +175,7 @@ mod tests {
             "../../../testdata/rfc8448_server_flight_record.hex"
         ));
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, 16, &server_hs_secret());
+        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let out = c.encrypt(ContentType::Handshake, &payload);
         assert_eq!(out, record);
     }
@@ -181,7 +189,7 @@ mod tests {
             "../../../testdata/rfc8448_server_flight_record.hex"
         ));
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, 16, &server_hs_secret());
+        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let mut header = [0u8; 5];
         header.copy_from_slice(&record[..5]);
         let (ct, content) = c.decrypt(&header, &record[5..]).unwrap();
@@ -197,7 +205,7 @@ mod tests {
         let mut bad = record.clone();
         *bad.last_mut().unwrap() ^= 0x01;
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, 16, &server_hs_secret());
+        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let mut header = [0u8; 5];
         header.copy_from_slice(&bad[..5]);
         assert!(matches!(

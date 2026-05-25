@@ -262,9 +262,9 @@ impl<R: RngCore> ServerConnection<R> {
         // Server writes with the server handshake key; reads (client Finished)
         // with the client handshake key.
         self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.key_len, &shts));
+            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts));
         self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.key_len, &chts));
+            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts));
         self.core.emit_ccs();
 
         // Encrypted server flight.
@@ -282,7 +282,7 @@ impl<R: RngCore> ServerConnection<R> {
         // The server's subsequent writes use the application key; it still
         // reads the client Finished with the client handshake key.
         self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.key_len, &sats));
+            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &sats));
 
         self.suite = Some(suite);
         self.client_hs_secret = Some(chts);
@@ -394,7 +394,7 @@ impl<R: RngCore> ServerConnection<R> {
         // The client now talks under its application traffic key.
         let cats = self.client_app_secret.as_ref().expect("client app secret");
         self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.key_len, cats));
+            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, cats));
         self.state = State::Connected;
         Ok(())
     }

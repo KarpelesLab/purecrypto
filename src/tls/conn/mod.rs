@@ -104,6 +104,14 @@ mod loopback_tests {
     }
 
     #[test]
+    fn x25519_chacha20poly1305_sha256() {
+        run(
+            &[CipherSuite::CHACHA20_POLY1305_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
     fn both_offered_negotiates() {
         run(
             &[
