@@ -28,9 +28,8 @@ pub(crate) fn parse_selected_version(body: &[u8]) -> Result<ProtocolVersion, Err
     Ok(ProtocolVersion::from_u16(v))
 }
 
-/// `supported_groups` listing the groups we implement (x25519, secp256r1).
-pub(crate) fn supported_groups() -> RawExtension {
-    let groups = [NamedGroup::X25519, NamedGroup::SECP256R1];
+/// `supported_groups` listing the given groups.
+pub(crate) fn supported_groups_list(groups: &[NamedGroup]) -> RawExtension {
     let mut body = Vec::new();
     with_len_u16(&mut body, |b| {
         for g in groups {
@@ -68,22 +67,13 @@ pub(crate) fn server_name(host: &str) -> RawExtension {
     (ExtensionType::SERVER_NAME, body)
 }
 
-/// `key_share` for a ClientHello: a single offered group/public-key entry.
-pub(crate) fn client_key_share(group: NamedGroup, public_key: &[u8]) -> RawExtension {
+/// `key_share` for a ClientHello: a list of offered group/public-key entries.
+pub(crate) fn client_key_shares(shares: &[(NamedGroup, Vec<u8>)]) -> RawExtension {
     let mut body = Vec::new();
     with_len_u16(&mut body, |list| {
-        encode_key_share_entry(list, group, public_key)
-    });
-    (ExtensionType::KEY_SHARE, body)
-}
-
-/// `key_share` for a ClientHello offering both x25519 and secp256r1 entries
-/// (in that preference order), so the server can choose without a retry.
-pub(crate) fn client_key_share_pair(x25519: &[u8], secp256r1: &[u8]) -> RawExtension {
-    let mut body = Vec::new();
-    with_len_u16(&mut body, |list| {
-        encode_key_share_entry(list, NamedGroup::X25519, x25519);
-        encode_key_share_entry(list, NamedGroup::SECP256R1, secp256r1);
+        for (group, key) in shares {
+            encode_key_share_entry(list, *group, key);
+        }
     });
     (ExtensionType::KEY_SHARE, body)
 }

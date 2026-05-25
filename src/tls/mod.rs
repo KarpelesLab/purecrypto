@@ -25,6 +25,8 @@ mod pki;
 mod version;
 
 pub use conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+#[cfg(feature = "std")]
+pub use conn::{Connection, Stream};
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::RootCertStore;
 pub use version::{ContentType, ProtocolVersion};
