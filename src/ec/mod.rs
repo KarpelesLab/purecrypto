@@ -7,10 +7,18 @@
 //!
 //! Exposes ECDSA signing and verification ([`ecdsa`]).
 
+pub mod boxed;
+pub mod curves;
 pub mod ecdh;
 pub mod ecdsa;
 mod p256;
+mod weierstrass;
 pub mod x25519;
+
+pub use boxed::{
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
+};
+pub use curves::CurveId;
 
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

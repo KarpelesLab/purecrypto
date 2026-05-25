@@ -157,6 +157,29 @@ impl BoxedMontModulus {
         self.mont_mul_limbs(x, &one)
     }
 
+    /// The modulus as a [`BoxedUint`].
+    pub fn modulus(&self) -> BoxedUint {
+        BoxedUint::from_limbs(self.n.clone())
+    }
+
+    /// Converts a plain value `< n` into the Montgomery domain.
+    pub fn to_mont(&self, x: &BoxedUint) -> BoxedUint {
+        BoxedUint::from_limbs(self.to_mont_limbs(&x.limbs_resized(self.limbs)))
+    }
+
+    /// Converts a Montgomery-domain value back to a plain value.
+    pub fn from_mont(&self, x: &BoxedUint) -> BoxedUint {
+        BoxedUint::from_limbs(self.demont_limbs(&x.limbs_resized(self.limbs)))
+    }
+
+    /// Montgomery-domain multiply: given `a, b` in Montgomery form, returns
+    /// `a·b` in Montgomery form (a single CIOS reduction).
+    pub fn mont_mul(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
+        BoxedUint::from_limbs(
+            self.mont_mul_limbs(&a.limbs_resized(self.limbs), &b.limbs_resized(self.limbs)),
+        )
+    }
+
     /// Returns `(a * b) mod n` for `a, b < n`.
     pub fn mul_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         let a = a.limbs_resized(self.limbs);
