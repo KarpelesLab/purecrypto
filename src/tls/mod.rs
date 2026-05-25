@@ -20,7 +20,9 @@
 mod codec;
 mod crypto;
 mod error;
+mod pki;
 mod version;
 
 pub use error::{Alert, AlertDescription, Error};
+pub use pki::RootCertStore;
 pub use version::{ContentType, ProtocolVersion};
