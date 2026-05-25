@@ -59,6 +59,14 @@ impl<const W: usize> MdState<W> {
         }
     }
 
+    /// Best-effort wipe of the state words and partial block.
+    pub(super) fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.h);
+        super::zeroize::zero_bytes(&mut self.block);
+        self.block_len = 0;
+        self.msg_len = 0;
+    }
+
     /// Applies the padding and returns the final state words.
     pub(super) fn finalize(mut self) -> [u32; W] {
         let bit_len = self.msg_len.wrapping_mul(8);

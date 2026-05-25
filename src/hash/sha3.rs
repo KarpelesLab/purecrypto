@@ -47,6 +47,10 @@ macro_rules! keccak_hash {
                 self.keccak.squeeze(&mut out);
                 out
             }
+            #[inline]
+            fn zeroize(&mut self) {
+                self.keccak.zeroize();
+            }
         }
 
         #[doc = $doc]

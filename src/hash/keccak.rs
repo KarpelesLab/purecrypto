@@ -157,6 +157,14 @@ impl Keccak {
         self.squeeze_offset = 0;
     }
 
+    /// Best-effort wipe of the sponge state and absorb buffer.
+    pub(super) fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.state);
+        super::zeroize::zero_bytes(&mut self.buf);
+        self.buf_len = 0;
+        self.squeeze_offset = 0;
+    }
+
     /// Squeezes `out.len()` bytes, continuing the stream across calls.
     pub(super) fn squeeze(&mut self, out: &mut [u8]) {
         for b in out.iter_mut() {

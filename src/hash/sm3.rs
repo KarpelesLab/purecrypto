@@ -111,6 +111,10 @@ impl Digest for Sm3 {
     fn finalize(self) -> [u8; 32] {
         words_to_bytes_be(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// Computes the SM3 digest of `data`.

@@ -107,6 +107,14 @@ pub trait Digest: Clone {
         hasher.update(data);
         hasher.finalize()
     }
+
+    /// Best-effort wipe of the hasher's internal state.
+    ///
+    /// Defaults to a no-op; concrete hashers override it to zero their state
+    /// words and buffers. Keyed constructions such as [`Hmac`] call this on
+    /// drop so the key-derived state does not linger in memory.
+    #[inline]
+    fn zeroize(&mut self) {}
 }
 
 /// An extendable-output function (XOF): like a hash, but it produces an output

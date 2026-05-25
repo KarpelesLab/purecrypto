@@ -147,6 +147,14 @@ impl State256 {
         }
     }
 
+    /// Best-effort wipe of the state words and partial block.
+    fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.h);
+        super::zeroize::zero_bytes(&mut self.block);
+        self.block_len = 0;
+        self.msg_len = 0;
+    }
+
     /// Applies SHA-2 padding and returns the final state words.
     fn finalize(mut self) -> [u32; 8] {
         let bit_len = self.msg_len.wrapping_mul(8);
@@ -274,6 +282,10 @@ impl Digest for Sha256 {
     fn finalize(self) -> [u8; 32] {
         words_to_bytes(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// The SHA-224 hash function (SHA-256 with a different IV, truncated to 224
@@ -315,6 +327,10 @@ impl Digest for Sha224 {
     fn finalize(self) -> [u8; 28] {
         // First 7 of the 8 state words.
         words_to_bytes(&self.state.finalize())
+    }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
     }
 }
 

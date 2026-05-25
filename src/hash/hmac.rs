@@ -73,9 +73,12 @@ impl<D: Digest> Hmac<D> {
     /// Consumes the MAC and returns the authentication tag.
     #[inline]
     pub fn finalize(mut self) -> D::Output {
-        let inner = self.inner.finalize();
-        self.outer.update(inner.as_ref());
-        self.outer.finalize()
+        // Extract the hashers rather than moving them out of `self`, which the
+        // `Drop` impl forbids; the leftover fresh hashers are wiped on drop.
+        let inner = core::mem::replace(&mut self.inner, D::new()).finalize();
+        let mut outer = core::mem::replace(&mut self.outer, D::new());
+        outer.update(inner.as_ref());
+        outer.finalize()
     }
 
     /// Consumes the MAC and checks it against `expected` in constant time.
@@ -95,6 +98,14 @@ impl<D: Digest> Hmac<D> {
         let mut h = Self::new(key);
         h.update(data);
         h.finalize()
+    }
+}
+
+impl<D: Digest> Drop for Hmac<D> {
+    fn drop(&mut self) {
+        // Wipe the key-derived inner/outer hash state.
+        self.inner.zeroize();
+        self.outer.zeroize();
     }
 }
 

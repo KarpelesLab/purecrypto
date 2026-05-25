@@ -155,6 +155,10 @@ impl Digest for Ripemd160 {
     fn finalize(self) -> [u8; 20] {
         words_to_bytes_le(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// Computes the RIPEMD-160 digest of `data`.

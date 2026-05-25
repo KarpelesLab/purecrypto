@@ -141,6 +141,10 @@ impl Digest for Md5 {
     fn finalize(self) -> [u8; 16] {
         words_to_bytes_le(&self.state.finalize())
     }
+    #[inline]
+    fn zeroize(&mut self) {
+        self.state.zeroize();
+    }
 }
 
 /// Computes the MD5 digest of `data`.

@@ -223,6 +223,13 @@ impl ChunkState {
             flags: self.flags | self.start_flag() | CHUNK_END,
         }
     }
+
+    fn zeroize(&mut self) {
+        super::zeroize::zero_words(&mut self.cv);
+        super::zeroize::zero_bytes(&mut self.block);
+        self.block_len = 0;
+        self.blocks_compressed = 0;
+    }
 }
 
 fn parent_output(left: [u32; 8], right: [u32; 8], key: [u32; 8], flags: u32) -> Output {
@@ -359,6 +366,22 @@ impl Blake3 {
         h.update(data);
         h.finalize()
     }
+
+    /// Best-effort wipe of the key and tree state.
+    fn zeroize(&mut self) {
+        self.chunk_state.zeroize();
+        super::zeroize::zero_words(&mut self.key);
+        for cv in self.cv_stack.iter_mut() {
+            super::zeroize::zero_words(cv);
+        }
+        self.cv_stack_len = 0;
+    }
+}
+
+impl Drop for Blake3 {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
 impl Default for Blake3 {
@@ -434,6 +457,9 @@ impl Digest for Blake3 {
     }
     fn finalize(self) -> [u8; OUT_LEN] {
         Blake3::finalize(&self)
+    }
+    fn zeroize(&mut self) {
+        Blake3::zeroize(self);
     }
 }
 
