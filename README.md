@@ -63,6 +63,11 @@ Requires Rust 1.95+ (edition 2024).
 
 ## C library
 
+Prebuilt archives — the `purecrypto` CLI, the static (`.a`/`.lib`) and shared
+(`.so`/`.dylib`/`.dll`) C libraries, and the header — are attached to each
+[GitHub release](https://github.com/KarpelesLab/purecrypto/releases) for Linux,
+macOS, and Windows.
+
 The same code is callable from C via the `ffi` feature. Because the crate stays
 `rlib` by default (so the `no_std` build is unaffected), produce the C library
 with `cargo rustc`:
