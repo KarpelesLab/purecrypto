@@ -30,3 +30,6 @@ extern crate alloc;
 extern crate std;
 
 pub mod ct;
+
+#[cfg(feature = "hash")]
+pub mod hash;
