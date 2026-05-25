@@ -24,7 +24,7 @@ mod error;
 mod pki;
 mod version;
 
-pub use conn::{ClientConfig, ClientConnection};
+pub use conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::RootCertStore;
 pub use version::{ContentType, ProtocolVersion};

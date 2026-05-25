@@ -33,3 +33,8 @@ pub(crate) const SUPPORTED: [SuiteParams; 2] = [
 pub(crate) fn lookup(suite: CipherSuite) -> Option<SuiteParams> {
     SUPPORTED.iter().copied().find(|s| s.suite == suite)
 }
+
+/// The supported suites in descending preference order.
+pub(crate) fn supported() -> &'static [SuiteParams] {
+    &SUPPORTED
+}
