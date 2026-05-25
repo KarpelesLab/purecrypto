@@ -13,8 +13,12 @@ env:
 
 jobs:
   test:
-    name: Test & lint
-    runs-on: ubuntu-latest
+    name: Test & lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -25,8 +29,11 @@ jobs:
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
 
       - name: Format
+        if: runner.os == 'Linux' # formatting is platform-independent
         run: cargo fmt --all --check
 
       - name: Clippy (all features, warnings denied)
