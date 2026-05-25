@@ -17,13 +17,13 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash"]
+default = ["std", "hash", "cipher"]
 std = ["alloc"]
 alloc = []
 
 # --- module gates (added as each layer lands) ---
 hash = []
-# cipher = []
+cipher = []
 # bignum = []
 # keys   = []
 # asn1   = []

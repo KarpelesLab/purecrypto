@@ -268,8 +268,8 @@ pub fn sha224(data: &[u8]) -> [u8; 28] {
 
 #[cfg(test)]
 mod tests {
-    use super::super::from_hex;
     use super::*;
+    use crate::test_util::from_hex;
 
     #[test]
     fn sha256_vectors() {

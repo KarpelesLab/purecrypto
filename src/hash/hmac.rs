@@ -113,8 +113,8 @@ pub type HmacSha512_256 = Hmac<super::Sha512_256>;
 
 #[cfg(test)]
 mod tests {
-    use super::super::from_hex;
     use super::*;
+    use crate::test_util::from_hex;
 
     // RFC 4231 test vectors.
 

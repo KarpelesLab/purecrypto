@@ -286,8 +286,8 @@ sha512_variant!(
 
 #[cfg(test)]
 mod tests {
-    use super::super::from_hex;
     use super::*;
+    use crate::test_util::from_hex;
 
     #[test]
     fn sha512_vectors() {

@@ -60,20 +60,3 @@ pub trait Digest: Clone {
         hasher.finalize()
     }
 }
-
-/// Decodes a hex string into a fixed-size byte array. Test-only helper shared
-/// by the hash implementations' known-answer tests.
-#[cfg(test)]
-pub(crate) fn from_hex<const N: usize>(s: &str) -> [u8; N] {
-    let bytes = s.as_bytes();
-    assert_eq!(bytes.len(), 2 * N, "hex string has wrong length");
-    let mut out = [0u8; N];
-    let mut i = 0;
-    while i < N {
-        let hi = (bytes[2 * i] as char).to_digit(16).expect("invalid hex") as u8;
-        let lo = (bytes[2 * i + 1] as char).to_digit(16).expect("invalid hex") as u8;
-        out[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    out
-}
