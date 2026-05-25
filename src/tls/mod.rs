@@ -10,12 +10,9 @@
 //! versions. Cipher suites: `TLS_AES_128_GCM_SHA256` and
 //! `TLS_AES_256_GCM_SHA384`; key exchange: X25519 and secp256r1.
 //!
-//! **Status:** under construction — the wire codec and version handling are in
-//! place; the handshake state machine is being built up.
-
-// The module is built in phases; lower layers (codec, primitives) are consumed
-// by the handshake state machine landing in later phases. Remove once wired.
-#![allow(dead_code)]
+//! **Status:** experimental. A full 1-RTT handshake interoperates in-process
+//! and over TCP, and the key schedule, record protection, and signatures are
+//! validated against the RFC 8448 traces. Not audited; APIs may change.
 
 mod codec;
 mod conn;

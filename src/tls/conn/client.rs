@@ -14,7 +14,8 @@ use crate::ec::x25519::X25519PrivateKey;
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme, hs_type,
+    CipherSuite, ClientHello, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
+    hs_type, read_handshake,
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
@@ -215,7 +216,7 @@ impl ClientConnection {
                         return Err(e);
                     }
                 }
-                Ok(Some(Incoming::ApplicationData(_))) => {
+                Ok(Some(Incoming::ApplicationData)) => {
                     if self.state != State::Connected {
                         let e = Error::UnexpectedMessage;
                         self.fail(&e);
@@ -245,15 +246,14 @@ impl ClientConnection {
 
     fn handle_handshake(&mut self, msg: Vec<u8>) -> Result<(), Error> {
         let mut c = ReadCursor::new(&msg);
-        let msg_type = c.u8()?;
-        let body = c.vec_u24()?.to_vec();
+        let (msg_type, body) = read_handshake(&mut c)?;
 
         match self.state {
-            State::WaitServerHello => self.on_server_hello(msg_type, &body, &msg),
+            State::WaitServerHello => self.on_server_hello(msg_type, body, &msg),
             State::WaitEncryptedExtensions => self.on_encrypted_extensions(msg_type, &msg),
-            State::WaitCertificate => self.on_certificate(msg_type, &body, &msg),
-            State::WaitCertificateVerify => self.on_certificate_verify(msg_type, &body, &msg),
-            State::WaitFinished => self.on_finished(msg_type, &body, &msg),
+            State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
+            State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &msg),
+            State::WaitFinished => self.on_finished(msg_type, body, &msg),
             _ => Err(Error::UnexpectedMessage),
         }
     }

@@ -59,6 +59,8 @@ impl Transcript {
     ///
     /// # Panics
     /// Panics if the hash has not been selected with [`set_alg`].
+    // Wired in once HelloRetryRequest is handled by the connection layer.
+    #[allow(dead_code)]
     pub(crate) fn replace_with_message_hash(&mut self) {
         let alg = self
             .alg

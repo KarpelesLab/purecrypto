@@ -16,7 +16,7 @@ use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, with_len_u16, with_len_u24,
+    hs_type, read_handshake, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
@@ -158,7 +158,7 @@ impl<R: RngCore> ServerConnection<R> {
                         return Err(e);
                     }
                 }
-                Ok(Some(Incoming::ApplicationData(_))) => {
+                Ok(Some(Incoming::ApplicationData)) => {
                     if self.state != State::Connected {
                         return Err(Error::UnexpectedMessage);
                     }
@@ -182,11 +182,10 @@ impl<R: RngCore> ServerConnection<R> {
 
     fn handle_handshake(&mut self, msg: Vec<u8>) -> Result<(), Error> {
         let mut c = ReadCursor::new(&msg);
-        let msg_type = c.u8()?;
-        let body = c.vec_u24()?.to_vec();
+        let (msg_type, body) = read_handshake(&mut c)?;
         match self.state {
-            State::WaitClientHello => self.on_client_hello(msg_type, &body, &msg),
-            State::WaitClientFinished => self.on_client_finished(msg_type, &body, &msg),
+            State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
+            State::WaitClientFinished => self.on_client_finished(msg_type, body, &msg),
             _ => Err(Error::UnexpectedMessage),
         }
     }
@@ -209,6 +208,14 @@ impl<R: RngCore> ServerConnection<R> {
             .ok_or(Error::UnsupportedVersion)?;
         if !ext::client_offers_tls13(sv)? {
             return Err(Error::UnsupportedVersion);
+        }
+
+        // The client must accept the signature scheme our certificate uses.
+        let our_scheme = self.config.signature_scheme();
+        let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
+            .ok_or(Error::HandshakeFailure)?;
+        if !ext::parse_signature_algorithms(sig_algs)?.contains(&our_scheme) {
+            return Err(Error::HandshakeFailure);
         }
 
         self.core.transcript.set_alg(suite.hash);

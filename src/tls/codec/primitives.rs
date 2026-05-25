@@ -45,8 +45,6 @@ u16_id!(
         ECDSA_SECP256R1_SHA256 = 0x0403,
         /// rsa_pkcs1_sha384.
         RSA_PKCS1_SHA384 = 0x0501,
-        /// ecdsa_secp384r1_sha384.
-        ECDSA_SECP384R1_SHA384 = 0x0503,
         /// rsa_pss_rsae_sha256.
         RSA_PSS_RSAE_SHA256 = 0x0804,
         /// rsa_pss_rsae_sha384.
@@ -63,8 +61,6 @@ u16_id!(
         SUPPORTED_GROUPS = 0x000a,
         /// signature_algorithms.
         SIGNATURE_ALGORITHMS = 0x000d,
-        /// application_layer_protocol_negotiation (ALPN).
-        ALPN = 0x0010,
         /// supported_versions.
         SUPPORTED_VERSIONS = 0x002b,
         /// key_share.
