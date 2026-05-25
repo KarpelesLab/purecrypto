@@ -1,0 +1,45 @@
+[package]
+name = "purecrypto"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+description = "A pure-Rust cryptography toolkit with no foreign-code dependencies, from constant-time primitives up to keys, X.509 and TLS."
+repository = "https://github.com/KarpelesLab/purecrypto"
+keywords = ["crypto", "cryptography", "no-std", "constant-time"]
+categories = ["cryptography", "no-std::no-alloc"]
+# License: TBD by project owner.
+publish = false
+
+[lib]
+name = "purecrypto"
+
+[features]
+# `std` is the convenient default; it implies `alloc`. Disable default
+# features for a `no_std` build (`--no-default-features`), optionally
+# re-enabling `alloc` for heap-backed types.
+default = ["std"]
+std = ["alloc"]
+alloc = []
+
+# --- module gates (added as each layer lands) ---
+# hash   = []
+# cipher = []
+# bignum = []
+# keys   = []
+# asn1   = []
+# x509   = []
+# tls    = []
+# ffi    = []
+
+[lints.rust]
+# Constant-time correctness depends on disciplined arithmetic; keep the
+# foundation honest.
+missing_docs = "warn"
+unreachable_pub = "warn"
+# Deny (not forbid) so a future `ffi`/SIMD module can opt back in locally
+# with a scoped `#[allow(unsafe_code)]`; the core stays safe.
+unsafe_code = "deny"
+
+[profile.release]
+# Crypto code benefits from aggressive inlining of the small primitive ops.
+lto = "thin"
