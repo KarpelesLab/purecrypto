@@ -9,8 +9,10 @@
 //! modes of operation (CTR, CBC, GCM, …) are layered on top separately.
 
 mod aes;
+mod ctr;
 
 pub use aes::{Aes128, Aes192, Aes256};
+pub use ctr::Ctr;
 
 /// A block cipher: a keyed, invertible permutation on fixed-size blocks.
 pub trait BlockCipher {

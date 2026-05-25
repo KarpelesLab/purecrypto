@@ -32,7 +32,7 @@ Single crate, modules gated by Cargo features:
 | ---------------- | ----------- | ------ |
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | 🟡 SHA-2 (224/256/384/512, 512/224, 512/256), HMAC |
-| Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free) |
+| Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CTR mode |
 | Bignum (CT)      | `bignum`    | ⬜ planned |
 | Asymmetric keys  | `keys`      | ⬜ planned (RSA, ECDSA, Ed25519, ML-KEM) |
 | ASN.1            | `asn1`      | ⬜ planned |
