@@ -147,6 +147,26 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     pub fn is_zero(&self) -> Choice {
         self.ct_eq(&Self::ZERO)
     }
+
+    /// Returns a [`Choice`] that is true iff this value is odd.
+    #[inline]
+    pub fn is_odd(&self) -> Choice {
+        Choice::from((self.limbs[0] & 1) as u8)
+    }
+
+    /// Returns `self >> 1` (one-bit logical right shift).
+    pub fn shr1(&self) -> Self {
+        let mut limbs = self.limbs;
+        let mut carry = 0;
+        let mut i = LIMBS;
+        while i > 0 {
+            i -= 1;
+            let next_carry = limbs[i] & 1;
+            limbs[i] = (limbs[i] >> 1) | (carry << (LIMB_BITS - 1));
+            carry = next_carry;
+        }
+        Uint { limbs }
+    }
 }
 
 impl<const LIMBS: usize> Default for Uint<LIMBS> {
