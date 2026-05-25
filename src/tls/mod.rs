@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 mod codec;
+mod crypto;
 mod error;
 mod version;
 
