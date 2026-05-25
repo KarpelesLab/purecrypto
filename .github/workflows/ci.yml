@@ -52,3 +52,26 @@ jobs:
 
       - name: Build no_std with all module features
         run: cargo build --no-default-features --features bignum,hash,cipher,kdf
+
+  c_abi:
+    name: C ABI smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build the C library (static + shared)
+        run: |
+          cargo rustc --lib --release --features ffi --crate-type staticlib
+          cargo rustc --lib --release --features ffi --crate-type cdylib
+
+      - name: Compile and run the C smoke test
+        run: |
+          cc tests/ffi_smoke.c -I include target/release/libpurecrypto.a \
+             -lpthread -ldl -lm -o ffi_smoke
+          ./ffi_smoke
