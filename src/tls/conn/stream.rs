@@ -167,7 +167,6 @@ impl<C: Connection, T: Read + Write> Write for Stream<'_, C, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bignum::BoxedUint;
     use crate::rng::OsRng;
     use crate::rsa::BoxedRsaPrivateKey;
     use crate::test_util::rsa_test_key_a;
@@ -185,14 +184,7 @@ mod tests {
         );
         let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
         let der = cert.to_der().to_vec();
-        let mut buf = [0u8; 256];
-        key.modulus().write_be_bytes(&mut buf);
-        let n = BoxedUint::from_be_bytes(&buf);
-        key.exponent().write_be_bytes(&mut buf);
-        let e = BoxedUint::from_be_bytes(&buf);
-        key.private_exponent().write_be_bytes(&mut buf);
-        let d = BoxedUint::from_be_bytes(&buf);
-        let boxed = BoxedRsaPrivateKey::from_components(n, e, d);
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
         (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
     }
 

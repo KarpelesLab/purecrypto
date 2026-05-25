@@ -152,6 +152,35 @@ impl BoxedRsaPublicKey {
     }
 }
 
+/// PKCS#1 DER/PEM for runtime-sized private keys.
+#[cfg(feature = "der")]
+impl BoxedRsaPrivateKey {
+    /// Parses a PKCS#1 `RSAPrivateKey` DER structure, retaining the modulus,
+    /// public exponent, and private exponent (the CRT parameters are read and
+    /// discarded — the boxed key uses plain modular exponentiation).
+    pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        let mut reader = crate::der::Reader::new(der);
+        let mut seq = reader.read_sequence()?;
+        let _version = seq.read_integer_bytes()?;
+        let n = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
+        let e = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
+        let d = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
+        let _p = seq.read_integer_bytes()?;
+        let _q = seq.read_integer_bytes()?;
+        let _dp = seq.read_integer_bytes()?;
+        let _dq = seq.read_integer_bytes()?;
+        let _qinv = seq.read_integer_bytes()?;
+        seq.finish()?;
+        reader.finish()?;
+        Ok(BoxedRsaPrivateKey::from_components(n, e, d))
+    }
+
+    /// Decodes a PKCS#1 PEM private key (`-----BEGIN RSA PRIVATE KEY-----`).
+    pub fn from_pkcs1_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs1_der(&crate::der::pem_decode(pem, "RSA PRIVATE KEY")?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,7 +16,6 @@ pub use stream::{Connection, Stream};
 #[cfg(test)]
 mod loopback_tests {
     use super::{ClientConnection, ServerConfig, ServerConnection};
-    use crate::bignum::BoxedUint;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::rsa::BoxedRsaPrivateKey;
@@ -37,16 +36,7 @@ mod loopback_tests {
         );
         let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
         let der = cert.to_der().to_vec();
-
-        let mut buf = [0u8; 256];
-        key.modulus().write_be_bytes(&mut buf);
-        let n = BoxedUint::from_be_bytes(&buf);
-        key.exponent().write_be_bytes(&mut buf);
-        let e = BoxedUint::from_be_bytes(&buf);
-        key.private_exponent().write_be_bytes(&mut buf);
-        let d = BoxedUint::from_be_bytes(&buf);
-        let boxed = BoxedRsaPrivateKey::from_components(n, e, d);
-
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
         (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
     }
 
