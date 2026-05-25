@@ -530,4 +530,34 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
             ["example.com", "*.example.com", "localhost"]
         );
     }
+
+    // An OpenSSL-issued P-384 self-signed certificate (ecdsa-with-SHA384) —
+    // covers the parse + ECDSA-P-384 verification path offline.
+    const OPENSSL_P384_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIB0DCCAVagAwIBAgIUFfDkHLsaJs8XpNp/X26eBwaW0GwwCgYIKoZIzj0EAwMw\n\
+HzEdMBsGA1UEAwwUcHVyZWNyeXB0byBwMzg0IHRlc3QwHhcNMjYwNTI1MTc0MTA2\n\
+WhcNMzYwNTIyMTc0MTA2WjAfMR0wGwYDVQQDDBRwdXJlY3J5cHRvIHAzODQgdGVz\n\
+dDB2MBAGByqGSM49AgEGBSuBBAAiA2IABAaRzx9xN0xEjH+XylpvGcNzgATGjcJ5\n\
+EG6ZcuaFhG77H9Mt9FZkSDSgExkKfyw4Ux+FucZyuqi/R1HAhvZQbsfDESwSzKaX\n\
+eta82AAFlW21rNICGPlnbgcBWHdPRW75T6NTMFEwHQYDVR0OBBYEFMcuZqhquDSL\n\
+HxHY+LHcSb+Q7JhiMB8GA1UdIwQYMBaAFMcuZqhquDSLHxHY+LHcSb+Q7JhiMA8G\n\
+A1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDaAAwZQIxANhANplvbyG3UYpPKRBw\n\
+zonaqEOgq726vkmse4rPtI3e2qssKRgyBnJ7eK3aw/QtZAIwN67oHB6vv9uYce3C\n\
+ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn parse_and_verify_openssl_p384_cert() {
+        let cert = Certificate::from_pem(OPENSSL_P384_CERT).unwrap();
+        cert.check_well_formed().unwrap();
+        let key = cert.subject_public_key().unwrap();
+        match &key {
+            crate::x509::AnyPublicKey::Ecdsa(k) => {
+                assert_eq!(k.curve(), crate::ec::CurveId::P384)
+            }
+            _ => panic!("expected ECDSA P-384"),
+        }
+        // Self-signed: the ecdsa-with-SHA384 signature verifies under its key.
+        cert.verify_signature_with(&key).unwrap();
+    }
 }
