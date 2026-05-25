@@ -1,172 +1,15 @@
-//! SHA-3 (FIPS 202): SHA3-224, SHA3-256, SHA3-384, SHA3-512.
+//! SHA-3 (FIPS 202): SHA3-224/256/384/512, plus legacy Keccak-256 (Ethereum).
 //!
-//! Built on the Keccak-`f`[1600] permutation and a sponge. The rate (and hence
-//! the block size used by HMAC) is `200 - 2·output_len` bytes.
+//! Built on the shared Keccak-`f`[1600] sponge ([`super::keccak`]). SHA-3 uses
+//! the `0x06` domain byte; the original Keccak (as used by Ethereum) uses
+//! `0x01`. The rate (and the block size HMAC keys on) is `200 - 2*output_len`.
 
 use super::Digest;
+use super::keccak::Keccak;
 
-/// Keccak-f[1600] round constants.
-const RC: [u64; 24] = [
-    0x0000_0000_0000_0001,
-    0x0000_0000_0000_8082,
-    0x8000_0000_0000_808a,
-    0x8000_0000_8000_8000,
-    0x0000_0000_0000_808b,
-    0x0000_0000_8000_0001,
-    0x8000_0000_8000_8081,
-    0x8000_0000_0000_8009,
-    0x0000_0000_0000_008a,
-    0x0000_0000_0000_0088,
-    0x0000_0000_8000_8009,
-    0x0000_0000_8000_000a,
-    0x0000_0000_8000_808b,
-    0x8000_0000_0000_008b,
-    0x8000_0000_0000_8089,
-    0x8000_0000_0000_8003,
-    0x8000_0000_0000_8002,
-    0x8000_0000_0000_0080,
-    0x0000_0000_0000_800a,
-    0x8000_0000_8000_000a,
-    0x8000_0000_8000_8081,
-    0x8000_0000_0000_8080,
-    0x0000_0000_8000_0001,
-    0x8000_0000_8000_8008,
-];
-
-/// Rotation offsets for the combined ρ/π step.
-const RHO: [u32; 24] = [
-    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-];
-
-/// Lane permutation for the combined ρ/π step.
-const PI: [usize; 24] = [
-    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-];
-
-/// The Keccak-f[1600] permutation over a 5×5 array of 64-bit lanes.
-fn keccak_f(a: &mut [u64; 25]) {
-    for &rc in RC.iter() {
-        // θ
-        let mut c = [0u64; 5];
-        for x in 0..5 {
-            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
-        }
-        for x in 0..5 {
-            let d = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-            for y in 0..5 {
-                a[x + 5 * y] ^= d;
-            }
-        }
-
-        // ρ and π
-        let mut last = a[1];
-        for i in 0..24 {
-            let j = PI[i];
-            let tmp = a[j];
-            a[j] = last.rotate_left(RHO[i]);
-            last = tmp;
-        }
-
-        // χ
-        for y in 0..5 {
-            let row = [
-                a[5 * y],
-                a[5 * y + 1],
-                a[5 * y + 2],
-                a[5 * y + 3],
-                a[5 * y + 4],
-            ];
-            for x in 0..5 {
-                a[5 * y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
-            }
-        }
-
-        // ι
-        a[0] ^= rc;
-    }
-}
-
-/// Maximum SHA-3 rate (SHA3-224), bounding the buffer.
-const MAX_RATE: usize = 144;
-
-/// A Keccak sponge in absorbing mode, with the given rate (in bytes).
-#[derive(Clone)]
-struct Keccak {
-    state: [u64; 25],
-    buf: [u8; MAX_RATE],
-    buf_len: usize,
-    rate: usize,
-}
-
-impl Keccak {
-    fn new(rate: usize) -> Self {
-        Keccak {
-            state: [0u64; 25],
-            buf: [0u8; MAX_RATE],
-            buf_len: 0,
-            rate,
-        }
-    }
-
-    /// XORs the full `rate`-byte buffer into the state and permutes.
-    fn absorb_buf(&mut self) {
-        for (i, chunk) in self.buf[..self.rate].chunks_exact(8).enumerate() {
-            self.state[i] ^= u64::from_le_bytes(chunk.try_into().unwrap());
-        }
-        keccak_f(&mut self.state);
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        if self.buf_len > 0 {
-            let take = (self.rate - self.buf_len).min(data.len());
-            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&data[..take]);
-            self.buf_len += take;
-            data = &data[take..];
-            if self.buf_len == self.rate {
-                self.absorb_buf();
-                self.buf_len = 0;
-            }
-        }
-        while data.len() >= self.rate {
-            self.buf[..self.rate].copy_from_slice(&data[..self.rate]);
-            self.absorb_buf();
-            data = &data[self.rate..];
-        }
-        if !data.is_empty() {
-            self.buf[..data.len()].copy_from_slice(data);
-            self.buf_len = data.len();
-        }
-    }
-
-    /// Applies the SHA-3 pad (`0x06` … `0x80`) and squeezes `out.len()` bytes.
-    fn finalize_into(mut self, out: &mut [u8]) {
-        let len = self.buf_len;
-        for b in self.buf[len..self.rate].iter_mut() {
-            *b = 0;
-        }
-        self.buf[len] ^= 0x06;
-        self.buf[self.rate - 1] ^= 0x80;
-        self.absorb_buf();
-
-        let mut i = 0;
-        let mut lane = 0;
-        while i < out.len() {
-            if lane * 8 >= self.rate {
-                keccak_f(&mut self.state);
-                lane = 0;
-            }
-            let bytes = self.state[lane].to_le_bytes();
-            let take = (out.len() - i).min(8);
-            out[i..i + take].copy_from_slice(&bytes[..take]);
-            i += take;
-            lane += 1;
-        }
-    }
-}
-
-/// Generates a SHA-3 variant with the given output length (and rate).
-macro_rules! sha3 {
-    ($name:ident, $func:ident, $out:expr, $rate:expr, $doc:literal) => {
+/// Generates a fixed-output Keccak hash with the given rate and domain byte.
+macro_rules! keccak_hash {
+    ($name:ident, $func:ident, $out:expr, $rate:expr, $pad:expr, $doc:literal) => {
         #[doc = $doc]
         #[derive(Clone)]
         pub struct $name {
@@ -198,9 +41,10 @@ macro_rules! sha3 {
                 self.keccak.update(data);
             }
             #[inline]
-            fn finalize(self) -> [u8; $out] {
+            fn finalize(mut self) -> [u8; $out] {
                 let mut out = [0u8; $out];
-                self.keccak.finalize_into(&mut out);
+                self.keccak.finalize($pad);
+                self.keccak.squeeze(&mut out);
                 out
             }
         }
@@ -213,10 +57,46 @@ macro_rules! sha3 {
     };
 }
 
-sha3!(Sha3_224, sha3_224, 28, 144, "The SHA3-224 hash function.");
-sha3!(Sha3_256, sha3_256, 32, 136, "The SHA3-256 hash function.");
-sha3!(Sha3_384, sha3_384, 48, 104, "The SHA3-384 hash function.");
-sha3!(Sha3_512, sha3_512, 64, 72, "The SHA3-512 hash function.");
+keccak_hash!(
+    Sha3_224,
+    sha3_224,
+    28,
+    144,
+    0x06,
+    "The SHA3-224 hash function."
+);
+keccak_hash!(
+    Sha3_256,
+    sha3_256,
+    32,
+    136,
+    0x06,
+    "The SHA3-256 hash function."
+);
+keccak_hash!(
+    Sha3_384,
+    sha3_384,
+    48,
+    104,
+    0x06,
+    "The SHA3-384 hash function."
+);
+keccak_hash!(
+    Sha3_512,
+    sha3_512,
+    64,
+    72,
+    0x06,
+    "The SHA3-512 hash function."
+);
+keccak_hash!(
+    Keccak256,
+    keccak256,
+    32,
+    136,
+    0x01,
+    "The legacy Keccak-256 hash (Ethereum), i.e. SHA3-256 with `0x01` padding."
+);
 
 #[cfg(test)]
 mod tests {
@@ -276,6 +156,19 @@ mod tests {
             from_hex::<64>(
                 "b751850b1a57168a5693cd924b6b096e08f621827444f70d884f5d0240d2712e10e116e9192af3c91a7ec57647e3934057340b4cf408d5a56592f8274eec53f0"
             )
+        );
+    }
+
+    // Legacy Keccak-256 (Ethereum) — distinct from SHA3-256 (0x01 vs 0x06 pad).
+    #[test]
+    fn keccak256_vectors() {
+        assert_eq!(
+            keccak256(b""),
+            from_hex::<32>("c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470")
+        );
+        assert_eq!(
+            keccak256(b"abc"),
+            from_hex::<32>("4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45")
         );
     }
 
