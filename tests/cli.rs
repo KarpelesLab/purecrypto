@@ -51,6 +51,118 @@ fn rand_emits_hex() {
 }
 
 #[test]
+fn ca_workflow_genpkey_req_sign() {
+    // Unique scratch dir for this test process.
+    let dir = std::env::temp_dir().join(format!("pc_cli_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // CA key + self-signed CA cert.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("ca_key.pem")
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "x509",
+                "-new",
+                "--ca",
+                "-key",
+                &p("ca_key.pem"),
+                "-subj",
+                "/CN=Test CA",
+                "-out",
+                &p("ca.pem")
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // Leaf key + CSR.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf_key.pem")
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf_key.pem"),
+                "-subj",
+                "/CN=leaf.test",
+                "-addext",
+                "subjectAltName=DNS:leaf.test",
+                "-out",
+                &p("leaf.csr"),
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // CSR self-signature verifies.
+    let (vout, ok) = run(&["req", "-in", &p("leaf.csr"), "-verify"], b"");
+    assert!(ok && vout.contains("verify OK"));
+
+    // CA signs the CSR.
+    assert!(
+        run(
+            &[
+                "x509",
+                "-req",
+                "-in",
+                &p("leaf.csr"),
+                "-CA",
+                &p("ca.pem"),
+                "-CAkey",
+                &p("ca_key.pem"),
+                "-out",
+                &p("leaf.pem")
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // The issued cert carries the requested subject, the CA issuer, and the SAN.
+    let (text, ok) = run(&["x509", "-in", &p("leaf.pem"), "-text"], b"");
+    assert!(ok, "x509 -text failed: {text}");
+    assert!(text.contains("CN=leaf.test"), "{text}");
+    assert!(
+        text.contains("Issuer:") && text.contains("CN=Test CA"),
+        "{text}"
+    );
+    assert!(text.contains("leaf.test"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn genpkey_ec_then_inspect() {
     let (key_pem, ok) = run(&["genpkey", "-algorithm", "EC", "-curve", "P-256"], b"");
     assert!(ok);
