@@ -190,6 +190,7 @@ pub struct Sha256 {
 
 impl Digest for Sha256 {
     type Output = [u8; 32];
+    type Block = [u8; 64];
     const OUTPUT_LEN: usize = 32;
     const BLOCK_LEN: usize = 64;
 
@@ -198,6 +199,11 @@ impl Digest for Sha256 {
         Sha256 {
             state: State256::new(H256),
         }
+    }
+
+    #[inline]
+    fn zeroed_block() -> [u8; 64] {
+        [0u8; 64]
     }
 
     #[inline]
@@ -220,6 +226,7 @@ pub struct Sha224 {
 
 impl Digest for Sha224 {
     type Output = [u8; 28];
+    type Block = [u8; 64];
     const OUTPUT_LEN: usize = 28;
     const BLOCK_LEN: usize = 64;
 
@@ -228,6 +235,11 @@ impl Digest for Sha224 {
         Sha224 {
             state: State256::new(H224),
         }
+    }
+
+    #[inline]
+    fn zeroed_block() -> [u8; 64] {
+        [0u8; 64]
     }
 
     #[inline]

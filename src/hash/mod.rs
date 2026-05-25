@@ -9,9 +9,13 @@
 //! Currently implemented: the SHA-2 family ([`Sha224`], [`Sha256`],
 //! [`Sha384`], [`Sha512`], [`Sha512_224`], [`Sha512_256`]).
 
+mod hmac;
 mod sha256;
 mod sha512;
 
+pub use hmac::{
+    Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
+};
 pub use sha256::{Sha224, Sha256, sha224, sha256};
 pub use sha512::{Sha384, Sha512, Sha512_224, Sha512_256, sha384, sha512, sha512_224, sha512_256};
 
@@ -24,6 +28,11 @@ pub trait Digest: Clone {
     /// The fixed-size output type, e.g. `[u8; 32]` for SHA-256.
     type Output: AsRef<[u8]> + AsMut<[u8]> + Copy;
 
+    /// A block-sized byte buffer (`[u8; BLOCK_LEN]`), used by block-oriented
+    /// constructions such as HMAC that cannot name `[u8; BLOCK_LEN]` directly
+    /// in generic code on stable Rust.
+    type Block: AsRef<[u8]> + AsMut<[u8]> + Copy;
+
     /// Digest output length, in bytes.
     const OUTPUT_LEN: usize;
 
@@ -33,6 +42,9 @@ pub trait Digest: Clone {
 
     /// Creates a hasher in its initial state.
     fn new() -> Self;
+
+    /// Returns a zeroed [block buffer](Digest::Block).
+    fn zeroed_block() -> Self::Block;
 
     /// Feeds `data` into the hasher. May be called any number of times.
     fn update(&mut self, data: &[u8]);

@@ -232,6 +232,7 @@ macro_rules! sha512_variant {
 
         impl Digest for $name {
             type Output = [u8; $out];
+            type Block = [u8; 128];
             const OUTPUT_LEN: usize = $out;
             const BLOCK_LEN: usize = 128;
 
@@ -240,6 +241,11 @@ macro_rules! sha512_variant {
                 $name {
                     state: State512::new($iv),
                 }
+            }
+
+            #[inline]
+            fn zeroed_block() -> [u8; 128] {
+                [0u8; 128]
             }
 
             #[inline]
