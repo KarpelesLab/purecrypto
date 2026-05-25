@@ -10,6 +10,7 @@
 pub mod ecdh;
 pub mod ecdsa;
 mod p256;
+pub mod x25519;
 
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
