@@ -5,8 +5,11 @@
 mod genpkey;
 mod hash;
 mod pkey;
+mod pki;
 mod rand;
+mod req;
 mod util;
+mod x509;
 
 use util::{Args, die};
 
@@ -21,6 +24,8 @@ COMMANDS:
     rand <nbytes>        Emit cryptographically secure random bytes
     genpkey              Generate an RSA or EC private key
     pkey                 Inspect or convert a private key
+    req                  Create or inspect a PKCS#10 certificate request
+    x509                 Inspect, self-sign, or CA-sign a certificate
     help                 Show this help
 
 Run a command with no/invalid arguments to see its usage.";
@@ -35,6 +40,8 @@ fn main() {
         Some("rand") => rand::run(rest),
         Some("genpkey") => genpkey::run(rest),
         Some("pkey") => pkey::run(rest),
+        Some("req") => req::run(rest),
+        Some("x509") => x509::run(rest),
         Some("help") | Some("-h") | Some("--help") | None => println!("{USAGE}"),
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }
