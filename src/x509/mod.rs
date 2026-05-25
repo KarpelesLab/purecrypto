@@ -32,10 +32,18 @@ pub mod oid {
     pub const EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
     /// `prime256v1` / `secp256r1` (1.2.840.10045.3.1.7).
     pub const PRIME256V1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+    /// `secp384r1` (1.3.132.0.34).
+    pub const SECP384R1: &[u64] = &[1, 3, 132, 0, 34];
+    /// `secp521r1` (1.3.132.0.35).
+    pub const SECP521R1: &[u64] = &[1, 3, 132, 0, 35];
+    /// `secp256k1` (1.3.132.0.10).
+    pub const SECP256K1: &[u64] = &[1, 3, 132, 0, 10];
     /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
     pub const ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
     /// `ecdsa-with-SHA384` (1.2.840.10045.4.3.3).
     pub const ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
+    /// `ecdsa-with-SHA512` (1.2.840.10045.4.3.4).
+    pub const ECDSA_WITH_SHA512: &[u64] = &[1, 2, 840, 10045, 4, 3, 4];
 
     /// `id-at-commonName` (2.5.4.3).
     pub const COMMON_NAME: &[u64] = &[2, 5, 4, 3];
