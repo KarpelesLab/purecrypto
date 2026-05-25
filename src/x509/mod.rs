@@ -48,6 +48,8 @@ pub mod oid {
 
     /// `id-ce-basicConstraints` (2.5.29.19).
     pub const BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
+    /// `id-ce-subjectAltName` (2.5.29.17).
+    pub const SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
 }
 
 /// Errors from X.509 encoding, parsing, and verification.
@@ -63,6 +65,10 @@ pub enum Error {
     Malformed,
     /// A signature failed verification.
     Verification,
+    /// The certificate is outside its validity period (`notBefore`/`notAfter`).
+    Expired,
+    /// The certificate does not match the expected host name.
+    NameMismatch,
 }
 
 impl From<crate::der::Error> for Error {
@@ -85,6 +91,8 @@ impl core::fmt::Display for Error {
             Error::UnsupportedAlgorithm => f.write_str("unsupported X.509 algorithm"),
             Error::Malformed => f.write_str("malformed X.509 certificate"),
             Error::Verification => f.write_str("X.509 signature verification failed"),
+            Error::Expired => f.write_str("X.509 certificate outside its validity period"),
+            Error::NameMismatch => f.write_str("X.509 certificate host name mismatch"),
         }
     }
 }

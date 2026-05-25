@@ -21,9 +21,9 @@ use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
     finished_verify_data, lookup_suite, verify_signature,
 };
-use crate::tls::pki::{RootCertStore, verify_chain};
+use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
 use crate::tls::{AlertDescription, Error};
-use crate::x509::AnyPublicKey;
+use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -33,10 +33,15 @@ use crate::ct::ConstantTimeEq;
 pub struct ClientConfig {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
-    /// When `false`, the server certificate chain is not verified against
-    /// `roots` (the `CertificateVerify` signature is still checked against the
-    /// presented leaf key). Intended for tests and pinned-key scenarios.
+    /// When `false`, the certificate chain, validity period, and host name are
+    /// not checked (the `CertificateVerify` signature is still verified against
+    /// the presented leaf key, and the leaf is still rejected if malformed).
+    /// Intended for tests and pinned-key scenarios.
     pub verify_certificates: bool,
+    /// The time used for validity-period checks. Defaults (`None`) to the
+    /// system clock under the `std` feature; set it explicitly for `no_std`
+    /// targets or for reproducible verification.
+    pub verification_time: Option<Time>,
 }
 
 impl ClientConfig {
@@ -46,8 +51,24 @@ impl ClientConfig {
         ClientConfig {
             roots,
             verify_certificates: true,
+            verification_time: None,
         }
     }
+}
+
+/// The current time from the system clock, when available.
+#[cfg(feature = "std")]
+fn system_now() -> Option<Time> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| Time::from_unix(d.as_secs()))
+}
+
+#[cfg(not(feature = "std"))]
+fn system_now() -> Option<Time> {
+    None
 }
 
 /// The client handshake progress.
@@ -66,6 +87,7 @@ enum State {
 pub struct ClientConnection {
     core: ConnectionCore,
     config: ClientConfig,
+    server_name: String,
     state: State,
 
     x25519: X25519PrivateKey,
@@ -115,6 +137,7 @@ impl ClientConnection {
         let mut conn = ClientConnection {
             core: ConnectionCore::new(),
             config,
+            server_name: String::from(server_name),
             state: State::WaitServerHello,
             x25519,
             p256,
@@ -367,13 +390,21 @@ impl ClientConnection {
         let signature = c.vec_u16()?.to_vec();
         c.expect_empty()?;
 
-        // The leaf key: from chain verification, or just the presented leaf.
+        // Always reject a malformed leaf certificate, regardless of policy.
+        let leaf =
+            Certificate::from_der(self.cert_chain[0].clone()).map_err(|_| Error::BadCertificate)?;
+        leaf.check_well_formed()
+            .map_err(|_| Error::BadCertificate)?;
+
+        // Recover the leaf key, verifying the chain, validity, and host name
+        // unless the configuration disables certificate verification.
         let leaf_key = if self.config.verify_certificates {
-            verify_chain(&self.config.roots, &self.cert_chain)?
+            let now = self.config.verification_time.clone().or_else(system_now);
+            let key = verify_chain(&self.config.roots, &self.cert_chain, now.as_ref())?;
+            verify_hostname(&leaf, &self.server_name)?;
+            key
         } else {
-            crate::x509::Certificate::from_der(self.cert_chain[0].clone())
-                .map_err(|_| Error::BadCertificate)?
-                .subject_public_key()
+            leaf.subject_public_key()
                 .map_err(|_| Error::BadCertificate)?
         };
 

@@ -2,25 +2,31 @@
 //!
 //! Given the peer's certificate chain (end-entity first, as sent in the TLS
 //! `Certificate` message), each certificate is checked to be signed by the
-//! next, names are matched issuer-to-subject, and the topmost certificate is
-//! anchored to a trusted root.
+//! next, names are matched issuer-to-subject, the topmost certificate is
+//! anchored to a trusted root, and (when a verification time is supplied) every
+//! certificate is checked to be within its validity period.
+//! [`verify_hostname`] separately matches the end-entity certificate against
+//! the expected host name (subjectAltName dNSNames, falling back to the subject
+//! common name).
 //!
-//! **Not yet performed:** validity-period (`notBefore`/`notAfter`), basic
-//! constraints, key-usage/EKU, and name-constraint checks. The connection layer
-//! is expected to supply a verification time and hostname check in a later
-//! revision; for now this establishes the cryptographic chain of trust only.
+//! **Not yet performed:** basicConstraints path-length, key-usage/EKU, and
+//! name-constraint checks.
 
 use super::store::RootCertStore;
 use crate::tls::Error;
-use crate::x509::{AnyPublicKey, Certificate};
+use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::vec::Vec;
 
 /// Verifies a certificate `chain` (end-entity first) against `store` and, on
 /// success, returns the end-entity (leaf) public key — the key whose possession
 /// the peer proves in its `CertificateVerify`.
+///
+/// When `now` is `Some`, every certificate in the chain must be within its
+/// validity period at that time; pass `None` to skip the expiry check.
 pub(crate) fn verify_chain(
     store: &RootCertStore,
     chain: &[Vec<u8>],
+    now: Option<&Time>,
 ) -> Result<AnyPublicKey, Error> {
     if chain.is_empty() {
         return Err(Error::BadCertificate);
@@ -31,6 +37,16 @@ pub(crate) fn verify_chain(
         .map(|der| Certificate::from_der(der.clone()))
         .collect::<Result<_, _>>()
         .map_err(|_| Error::BadCertificate)?;
+
+    // Each certificate must currently be within its validity period.
+    if let Some(now) = now {
+        for cert in &certs {
+            let validity = cert.validity().map_err(|_| Error::BadCertificate)?;
+            if !validity.accepts(now) {
+                return Err(Error::BadCertificate);
+            }
+        }
+    }
 
     // Each certificate must be signed by the next, with matching names.
     for pair in certs.windows(2) {
@@ -66,6 +82,46 @@ fn names_differ(cert: &Certificate, issuer: &Certificate) -> Result<bool, Error>
     Ok(cert_issuer != issuer_subject)
 }
 
+/// Checks that the end-entity certificate identifies `host`. Prefers the
+/// `subjectAltName` dNSName entries (RFC 6125); if there are none, falls back
+/// to the subject common name.
+pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Error> {
+    let sans = cert
+        .subject_alt_names()
+        .map_err(|_| Error::BadCertificate)?;
+    let matched = if !sans.is_empty() {
+        sans.iter().any(|pattern| dns_name_matches(pattern, host))
+    } else {
+        cert.subject()
+            .map_err(|_| Error::BadCertificate)?
+            .common_name
+            .as_deref()
+            .map(|cn| dns_name_matches(cn, host))
+            .unwrap_or(false)
+    };
+    if matched {
+        Ok(())
+    } else {
+        Err(Error::BadCertificate)
+    }
+}
+
+/// Matches a certificate dNSName `pattern` against `host`, case-insensitively,
+/// allowing a single leftmost-label `*` wildcard (`*.example.com` matches
+/// `a.example.com` but not `example.com` or `a.b.example.com`).
+fn dns_name_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        match host.split_once('.') {
+            Some((label, rest)) => {
+                !label.is_empty() && !rest.is_empty() && rest.eq_ignore_ascii_case(suffix)
+            }
+            None => false,
+        }
+    } else {
+        !pattern.is_empty() && pattern.eq_ignore_ascii_case(host)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,7 +146,7 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(cert_der.clone()).unwrap();
 
-        let leaf_key = verify_chain(&store, &[cert_der]).unwrap();
+        let leaf_key = verify_chain(&store, &[cert_der], None).unwrap();
         assert!(matches!(leaf_key, AnyPublicKey::Rsa(_)));
     }
 
@@ -116,10 +172,17 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
 
+        // Within the validity window (exercises the expiry check positively).
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
         // Chain with the leaf alone (root supplied by the store).
-        verify_chain(&store, &[leaf.to_der().to_vec()]).unwrap();
+        verify_chain(&store, &[leaf.to_der().to_vec()], Some(&now)).unwrap();
         // Chain that also carries the root certificate.
-        verify_chain(&store, &[leaf.to_der().to_vec(), root.to_der().to_vec()]).unwrap();
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), root.to_der().to_vec()],
+            Some(&now),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -131,13 +194,13 @@ mod tests {
         // Empty store -> no anchor.
         let empty = RootCertStore::new();
         assert!(matches!(
-            verify_chain(&empty, &[root.to_der().to_vec()]),
+            verify_chain(&empty, &[root.to_der().to_vec()], None),
             Err(Error::BadCertificate)
         ));
 
         // Empty chain.
         assert!(matches!(
-            verify_chain(&empty, &[]),
+            verify_chain(&empty, &[], None),
             Err(Error::BadCertificate)
         ));
     }
@@ -165,8 +228,64 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
         assert!(matches!(
-            verify_chain(&store, &[bogus.to_der().to_vec()]),
+            verify_chain(&store, &[bogus.to_der().to_vec()], None),
             Err(Error::BadCertificate)
         ));
+    }
+
+    #[test]
+    fn rejects_expired_certificate() {
+        let ca_key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("expired.example");
+        let past = Validity::new(
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2021, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&ca_key, &name, &past, 1, true).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(cert.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        // Expired at `now`.
+        assert!(matches!(
+            verify_chain(&store, &[cert.to_der().to_vec()], Some(&now)),
+            Err(Error::BadCertificate)
+        ));
+        // Accepted when no clock is supplied (expiry skipped).
+        verify_chain(&store, &[cert.to_der().to_vec()], None).unwrap();
+    }
+
+    #[test]
+    fn hostname_san_and_cn() {
+        let key = rsa_test_key_a();
+        // SAN cert: matches SAN entries (incl. wildcard), ignores CN.
+        let san_cert = Certificate::self_signed_with_sans(
+            &key,
+            &DistinguishedName::common_name("ignored"),
+            &validity(),
+            1,
+            false,
+            &["example.com", "*.svc.example.com"],
+        )
+        .unwrap();
+        verify_hostname(&san_cert, "example.com").unwrap();
+        verify_hostname(&san_cert, "api.svc.example.com").unwrap();
+        assert!(verify_hostname(&san_cert, "ignored").is_err()); // CN not consulted
+        assert!(verify_hostname(&san_cert, "other.com").is_err());
+        assert!(verify_hostname(&san_cert, "svc.example.com").is_err()); // wildcard needs a label
+        assert!(verify_hostname(&san_cert, "a.b.svc.example.com").is_err()); // one label only
+
+        // No SAN: falls back to the subject common name.
+        let cn_cert = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("host.example"),
+            &validity(),
+            2,
+            false,
+        )
+        .unwrap();
+        verify_hostname(&cn_cert, "HOST.example").unwrap(); // case-insensitive
+        assert!(verify_hostname(&cn_cert, "wrong.example").is_err());
     }
 }
