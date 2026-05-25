@@ -56,6 +56,53 @@ impl Time {
     pub(crate) fn to_der(&self) -> Vec<u8> {
         encode_string(tag::UTC_TIME, &self.repr)
     }
+
+    /// Parses the stored ASN.1 time into chronologically sortable components
+    /// `(year, month, day, hour, minute, second)`. Handles both `UTCTime`
+    /// (`YYMMDDHHMMSSZ`, with the RFC 5280 1950–2049 century rule) and
+    /// `GeneralizedTime` (`YYYYMMDDHHMMSSZ`). Returns `None` if malformed.
+    fn components(&self) -> Option<(u16, u8, u8, u8, u8, u8)> {
+        let b = self.repr.as_bytes();
+        if b.last() != Some(&b'Z') {
+            return None;
+        }
+        let (year, off) = match b.len() {
+            13 => {
+                let yy = two(b, 0)?;
+                let year = if yy < 50 {
+                    2000 + yy as u16
+                } else {
+                    1900 + yy as u16
+                };
+                (year, 2)
+            }
+            15 => {
+                let year = digit(b, 0)? as u16 * 1000
+                    + digit(b, 1)? as u16 * 100
+                    + digit(b, 2)? as u16 * 10
+                    + digit(b, 3)? as u16;
+                (year, 4)
+            }
+            _ => return None,
+        };
+        Some((
+            year,
+            two(b, off)?,
+            two(b, off + 2)?,
+            two(b, off + 4)?,
+            two(b, off + 6)?,
+            two(b, off + 8)?,
+        ))
+    }
+}
+
+fn digit(b: &[u8], i: usize) -> Option<u8> {
+    let c = *b.get(i)?;
+    c.is_ascii_digit().then_some(c - b'0')
+}
+
+fn two(b: &[u8], i: usize) -> Option<u8> {
+    Some(digit(b, i)? * 10 + digit(b, i + 1)?)
 }
 
 fn push2(s: &mut String, v: u8) {
@@ -93,6 +140,19 @@ impl Validity {
         Validity {
             not_before,
             not_after,
+        }
+    }
+
+    /// Whether `now` falls within `[not_before, not_after]` (inclusive).
+    /// Returns `false` if any of the three times is malformed (fail-closed).
+    pub fn accepts(&self, now: &Time) -> bool {
+        match (
+            self.not_before.components(),
+            self.not_after.components(),
+            now.components(),
+        ) {
+            (Some(nb), Some(na), Some(n)) => nb <= n && n <= na,
+            _ => false,
         }
     }
 
@@ -137,5 +197,31 @@ mod tests {
         assert_eq!(Time::from_unix(1_609_459_200).as_str(), "210101000000Z");
         // 2024-02-29 (leap day) 23:59:59 UTC = 1709251199.
         assert_eq!(Time::from_unix(1_709_251_199).as_str(), "240229235959Z");
+    }
+
+    #[test]
+    fn validity_accepts_window() {
+        let v = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        assert!(v.accepts(&Time::utc(2026, 5, 26, 12, 0, 0)));
+        assert!(v.accepts(&Time::utc(2024, 1, 1, 0, 0, 0))); // boundary
+        assert!(v.accepts(&Time::utc(2034, 1, 1, 0, 0, 0))); // boundary
+        assert!(!v.accepts(&Time::utc(2023, 12, 31, 23, 59, 59))); // too early
+        assert!(!v.accepts(&Time::utc(2034, 1, 1, 0, 0, 1))); // expired
+    }
+
+    #[test]
+    fn utctime_century_rule_and_generalized() {
+        // UTCTime: YY < 50 => 20YY, so 49 (2049) sorts after 24 (2024).
+        let v = Validity::new(
+            Time::from_repr("240101000000Z"),
+            Time::from_repr("490101000000Z"),
+        );
+        assert!(v.accepts(&Time::utc(2030, 6, 1, 0, 0, 0)));
+        // A GeneralizedTime instant compares correctly against UTCTime bounds.
+        assert!(v.accepts(&Time::from_repr("20300601000000Z")));
+        assert!(!v.accepts(&Time::from_repr("20500101000000Z")));
     }
 }

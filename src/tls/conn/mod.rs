@@ -113,4 +113,71 @@ mod loopback_tests {
             &[NamedGroup::X25519, NamedGroup::SECP256R1],
         );
     }
+
+    /// Drives a handshake expecting the client to reject the server flight,
+    /// returning the client's error.
+    fn drive_until_client_error(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection<HmacDrbg<Sha256>>,
+    ) -> crate::tls::Error {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                if let Err(e) = client.process_new_packets() {
+                    return e;
+                }
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        panic!("expected the client to reject the certificate");
+    }
+
+    #[test]
+    fn rejects_wrong_hostname() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hostname-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"hostname-server", b"nonce", &[]);
+        // The server cert is for "loopback.example"; connect to a different name.
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "attacker.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::BadCertificate
+        );
+    }
+
+    #[test]
+    fn rejects_expired_certificate() {
+        use crate::x509::Time;
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        // The cert is valid 2024–2034; verify as if it were 2020.
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2020, 1, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"expiry-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"expiry-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::BadCertificate
+        );
+    }
 }

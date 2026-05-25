@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use super::{DistinguishedName, Error, Validity, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_boolean, encode_context, encode_integer, encode_octet_string,
-    encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
+    encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
 };
 use crate::hash::Sha256;
 use crate::rsa::{RsaPrivateKey, RsaPublicKey};
@@ -39,8 +39,8 @@ fn rsa_spki<const LIMBS: usize>(pk: &RsaPublicKey<LIMBS>) -> Vec<u8> {
     encode_sequence(&[algid, encode_bit_string(&key)].concat())
 }
 
-/// Encodes the `[3] Extensions` field with a critical `basicConstraints`.
-fn extensions(is_ca: bool) -> Vec<u8> {
+/// Encodes the critical `basicConstraints` extension as one `Extension`.
+fn basic_constraints_ext(is_ca: bool) -> Vec<u8> {
     let bc_value = if is_ca {
         encode_sequence(&encode_boolean(true))
     } else {
@@ -49,11 +49,35 @@ fn extensions(is_ca: bool) -> Vec<u8> {
     let mut ext = oid_tlv(oid::BASIC_CONSTRAINTS);
     ext.extend_from_slice(&encode_boolean(true)); // critical
     ext.extend_from_slice(&encode_octet_string(&bc_value));
-    let ext = encode_sequence(&ext);
-    encode_context(3, &encode_sequence(&ext))
+    encode_sequence(&ext)
+}
+
+/// Encodes a `subjectAltName` extension (dNSName entries) as one `Extension`.
+fn subject_alt_name_ext(dns_names: &[&str]) -> Vec<u8> {
+    // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is [2] IA5String,
+    // an IMPLICIT primitive context tag (0x82).
+    let mut names = Vec::new();
+    for name in dns_names {
+        names.extend_from_slice(&encode_tlv(0x82, name.as_bytes()));
+    }
+    let san = encode_sequence(&names);
+    let mut ext = oid_tlv(oid::SUBJECT_ALT_NAME);
+    ext.extend_from_slice(&encode_octet_string(&san));
+    encode_sequence(&ext)
+}
+
+/// Encodes the `[3] Extensions` field (basicConstraints, plus subjectAltName
+/// when `dns_names` is non-empty).
+fn extensions(is_ca: bool, dns_names: &[&str]) -> Vec<u8> {
+    let mut list = basic_constraints_ext(is_ca);
+    if !dns_names.is_empty() {
+        list.extend_from_slice(&subject_alt_name_ext(dns_names));
+    }
+    encode_context(3, &encode_sequence(&list))
 }
 
 /// Builds the DER `TBSCertificate`.
+#[allow(clippy::too_many_arguments)]
 fn build_tbs<const LIMBS: usize>(
     serial: u64,
     issuer: &DistinguishedName,
@@ -61,6 +85,7 @@ fn build_tbs<const LIMBS: usize>(
     validity: &Validity,
     subject_key: &RsaPublicKey<LIMBS>,
     is_ca: bool,
+    dns_names: &[&str],
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&encode_context(0, &encode_integer(&[2]))); // version v3
@@ -70,7 +95,7 @@ fn build_tbs<const LIMBS: usize>(
     body.extend_from_slice(&validity.to_der());
     body.extend_from_slice(&subject.to_der());
     body.extend_from_slice(&rsa_spki(subject_key));
-    body.extend_from_slice(&extensions(is_ca));
+    body.extend_from_slice(&extensions(is_ca, dns_names));
     encode_sequence(&body)
 }
 
@@ -87,7 +112,40 @@ impl Certificate {
         serial: u64,
         is_ca: bool,
     ) -> Result<Certificate, Error> {
-        let tbs = build_tbs(serial, issuer, subject, validity, subject_key, is_ca);
+        Self::issue_with_sans(
+            issuer_key,
+            issuer,
+            subject,
+            subject_key,
+            validity,
+            serial,
+            is_ca,
+            &[],
+        )
+    }
+
+    /// Like [`issue`](Self::issue) but adds a `subjectAltName` extension with
+    /// the given dNSName entries (the modern way to bind host names).
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_with_sans<const LIMBS: usize>(
+        issuer_key: &RsaPrivateKey<LIMBS>,
+        issuer: &DistinguishedName,
+        subject: &DistinguishedName,
+        subject_key: &RsaPublicKey<LIMBS>,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+        dns_names: &[&str],
+    ) -> Result<Certificate, Error> {
+        let tbs = build_tbs(
+            serial,
+            issuer,
+            subject,
+            validity,
+            subject_key,
+            is_ca,
+            dns_names,
+        );
         let sig = issuer_key.sign_pkcs1v15::<Sha256>(&tbs)?;
         let der = encode_sequence(
             &[
@@ -116,6 +174,28 @@ impl Certificate {
             validity,
             serial,
             is_ca,
+        )
+    }
+
+    /// Issues a self-signed certificate carrying a `subjectAltName` with the
+    /// given dNSName entries.
+    pub fn self_signed_with_sans<const LIMBS: usize>(
+        key: &RsaPrivateKey<LIMBS>,
+        subject: &DistinguishedName,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+        dns_names: &[&str],
+    ) -> Result<Certificate, Error> {
+        Self::issue_with_sans(
+            key,
+            subject,
+            subject,
+            &key.public_key(),
+            validity,
+            serial,
+            is_ca,
+            dns_names,
         )
     }
 
@@ -232,6 +312,78 @@ impl Certificate {
         let parts = self.parts()?;
         issuer.verify(&parts.sig_alg, parts.tbs, parts.signature)
     }
+
+    /// The certificate's validity period (`notBefore` / `notAfter`).
+    pub fn validity(&self) -> Result<Validity, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)
+    }
+
+    /// The dNSName entries of the `subjectAltName` extension, or an empty list
+    /// if the certificate has no such extension.
+    pub fn subject_alt_names(&self) -> Result<Vec<String>, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)?; // validity
+        DistinguishedName::decode(&mut seq)?; // subject
+        seq.read_element()?; // subjectPublicKeyInfo
+
+        // Skip the optional issuerUniqueID [1] and subjectUniqueID [2]
+        // (IMPLICIT primitive context tags 0x81 / 0x82).
+        while matches!(seq.peek_tag(), Some(0x81) | Some(0x82)) {
+            seq.read_element()?;
+        }
+        // The [3] EXPLICIT extensions wrapper (constructed context tag 0xA3).
+        if seq.peek_tag() != Some(tag::context(3)) {
+            return Ok(Vec::new());
+        }
+        let wrapper = seq.read_tlv(tag::context(3))?;
+        let mut outer = Reader::new(wrapper);
+        let mut exts = outer.read_sequence()?;
+
+        let mut names = Vec::new();
+        while !exts.is_empty() {
+            let mut ext = exts.read_sequence()?;
+            let id = parse_oid(ext.read_oid()?)?;
+            if ext.peek_tag() == Some(tag::BOOLEAN) {
+                ext.read_boolean()?; // critical
+            }
+            let value = ext.read_octet_string()?;
+            if id.as_slice() == oid::SUBJECT_ALT_NAME {
+                parse_dns_names(value, &mut names)?;
+            }
+        }
+        Ok(names)
+    }
+
+    /// Checks that the certificate is structurally well-formed: the outer
+    /// SEQUENCE, signature algorithm and value, and every parsed `TBSCertificate`
+    /// field (issuer, validity, subject, SPKI, extensions). Returns
+    /// [`Error::Malformed`] on any structural defect.
+    pub fn check_well_formed(&self) -> Result<(), Error> {
+        self.parts()?; // outer structure: tbs, signatureAlgorithm, signature
+        self.issuer()?;
+        self.validity()?;
+        self.subject()?;
+        self.subject_alt_names()?; // walks SPKI + extensions
+        Ok(())
+    }
+}
+
+/// Parses a `SubjectAltName` value (`SEQUENCE OF GeneralName`), collecting the
+/// dNSName (`[2] IA5String`, tag 0x82) entries.
+fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
+    let mut reader = Reader::new(der);
+    let mut seq = reader.read_sequence()?;
+    while !seq.is_empty() {
+        let (t, value) = seq.read_any()?;
+        if t == 0x82 {
+            let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
+            out.push(String::from(s));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -339,5 +491,43 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
         assert!(matches!(key, crate::x509::AnyPublicKey::EcdsaP256(_)));
         // Self-signed: verifies under its own embedded key.
         cert.verify_signature_with(&key).unwrap();
+    }
+
+    #[test]
+    fn validity_and_well_formed() {
+        let key = rsa_test_key_a();
+        let cert = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("x"),
+            &validity(),
+            1,
+            false,
+        )
+        .unwrap();
+        cert.check_well_formed().unwrap();
+        let v = cert.validity().unwrap();
+        assert_eq!(v.not_before, Time::utc(2024, 1, 1, 0, 0, 0));
+        assert!(v.accepts(&Time::utc(2026, 5, 26, 0, 0, 0)));
+        // No SAN extension on a plain self-signed cert.
+        assert!(cert.subject_alt_names().unwrap().is_empty());
+    }
+
+    #[test]
+    fn subject_alt_name_roundtrip() {
+        let key = rsa_test_key_a();
+        let cert = Certificate::self_signed_with_sans(
+            &key,
+            &DistinguishedName::common_name("ignored-cn"),
+            &validity(),
+            1,
+            false,
+            &["example.com", "*.example.com", "localhost"],
+        )
+        .unwrap();
+        cert.check_well_formed().unwrap();
+        assert_eq!(
+            cert.subject_alt_names().unwrap(),
+            ["example.com", "*.example.com", "localhost"]
+        );
     }
 }
