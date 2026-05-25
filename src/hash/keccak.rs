@@ -1,9 +1,11 @@
-//! The Keccak-`f`[1600] permutation and a sponge, shared by SHA-3, SHAKE,
-//! Keccak-256, cSHAKE, and KMAC.
+//! The Keccak-`p`[1600, n] permutation and a sponge, shared by SHA-3, SHAKE,
+//! Keccak-256, cSHAKE, KMAC, and (with 12 rounds) TurboSHAKE/KangarooTwelve.
 //!
-//! The sponge is parameterized by its rate (bytes) and the domain-separation
-//! byte applied at padding (`0x06` SHA-3, `0x1F` SHAKE, `0x01` legacy Keccak,
-//! `0x04` cSHAKE), and supports incremental squeezing for XOF output.
+//! The sponge is parameterized by its rate (bytes), its round count (24 for the
+//! full Keccak-f, 12 for TurboSHAKE), and the domain-separation byte applied at
+//! padding (`0x06` SHA-3, `0x1F` SHAKE, `0x01` legacy Keccak, `0x04` cSHAKE,
+//! `0x07`/`0x0B`/`0x06` KangarooTwelve), and supports incremental squeezing for
+//! XOF output.
 
 use super::XofReader;
 
@@ -45,9 +47,13 @@ const PI: [usize; 24] = [
     10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
 ];
 
-/// The Keccak-f[1600] permutation over a 5×5 array of 64-bit lanes.
-fn keccak_f(a: &mut [u64; 25]) {
-    for &rc in RC.iter() {
+/// The Keccak-p[1600, `rounds`] permutation over a 5×5 array of 64-bit lanes.
+///
+/// `rounds == 24` is the full Keccak-f used by SHA-3, SHAKE, and KMAC; the
+/// reduced-round variant (`rounds == 12`, the last 12 round constants) is used
+/// by TurboSHAKE and KangarooTwelve.
+fn keccak_p(a: &mut [u64; 25], rounds: usize) {
+    for &rc in RC[24 - rounds..].iter() {
         // θ
         let mut c = [0u64; 5];
         for x in 0..5 {
@@ -98,17 +104,26 @@ pub(super) struct Keccak {
     buf: [u8; MAX_RATE],
     buf_len: usize,
     rate: usize,
+    /// Permutation round count: 24 for SHA-3/SHAKE/KMAC, 12 for TurboSHAKE.
+    rounds: usize,
     /// Byte offset within the current rate block during squeezing.
     squeeze_offset: usize,
 }
 
 impl Keccak {
     pub(super) fn new(rate: usize) -> Self {
+        Self::with_rounds(rate, 24)
+    }
+
+    /// A sponge using a reduced-round Keccak-p permutation (e.g. 12 for
+    /// TurboSHAKE).
+    pub(super) fn with_rounds(rate: usize, rounds: usize) -> Self {
         Keccak {
             state: [0u64; 25],
             buf: [0u8; MAX_RATE],
             buf_len: 0,
             rate,
+            rounds,
             squeeze_offset: 0,
         }
     }
@@ -118,7 +133,7 @@ impl Keccak {
         for (i, chunk) in self.buf[..self.rate].chunks_exact(8).enumerate() {
             self.state[i] ^= u64::from_le_bytes(chunk.try_into().unwrap());
         }
-        keccak_f(&mut self.state);
+        keccak_p(&mut self.state, self.rounds);
     }
 
     pub(super) fn update(&mut self, mut data: &[u8]) {
@@ -169,7 +184,7 @@ impl Keccak {
     pub(super) fn squeeze(&mut self, out: &mut [u8]) {
         for b in out.iter_mut() {
             if self.squeeze_offset == self.rate {
-                keccak_f(&mut self.state);
+                keccak_p(&mut self.state, self.rounds);
                 self.squeeze_offset = 0;
             }
             let p = self.squeeze_offset;

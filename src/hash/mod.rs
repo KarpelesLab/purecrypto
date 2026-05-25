@@ -27,6 +27,7 @@ mod blake2;
 mod blake3;
 mod block;
 mod hmac;
+mod k12;
 mod keccak;
 mod kmac;
 mod md4;
@@ -48,6 +49,7 @@ pub use blake3::{Blake3, Blake3Reader, blake3};
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
 };
+pub use k12::{KangarooTwelve, TurboShake128, TurboShake256, k12};
 pub use keccak::KeccakReader;
 pub use kmac::{
     CShake128, CShake256, Kmac128, Kmac256, KmacXof128, KmacXof256, ParallelHash128,
