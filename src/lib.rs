@@ -31,6 +31,9 @@ extern crate std;
 
 pub mod ct;
 
+#[cfg(feature = "bignum")]
+pub mod bignum;
+
 #[cfg(feature = "cipher")]
 pub mod cipher;
 
