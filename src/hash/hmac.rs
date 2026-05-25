@@ -200,6 +200,8 @@ mod tests {
         bad[0] ^= 1;
         assert!(!bool::from(HmacSha256::new(key).chain(msg).verify(&bad)));
         // Wrong length must fail.
-        assert!(!bool::from(HmacSha256::new(key).chain(msg).verify(&tag[..31])));
+        assert!(!bool::from(
+            HmacSha256::new(key).chain(msg).verify(&tag[..31])
+        ));
     }
 }

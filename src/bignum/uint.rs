@@ -1,6 +1,8 @@
 //! Fixed-size unsigned big integers.
 
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess};
+use crate::ct::{
+    Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess,
+};
 
 /// A single limb of a [`Uint`].
 pub type Limb = u64;
@@ -39,9 +41,7 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     pub const LIMBS: usize = LIMBS;
 
     /// The zero value.
-    pub const ZERO: Self = Uint {
-        limbs: [0; LIMBS],
-    };
+    pub const ZERO: Self = Uint { limbs: [0; LIMBS] };
 
     /// The value one.
     pub const ONE: Self = Self::from_u64(1);

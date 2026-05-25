@@ -4,8 +4,8 @@
 //! which cannot be named in a return type on stable Rust. It is therefore
 //! returned as `(low, high)` halves.
 
-use super::uint::Limb;
 use super::Uint;
+use super::uint::Limb;
 
 /// Computes `a + b * c + carry`, returning `(low, carry_out)`.
 ///

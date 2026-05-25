@@ -54,7 +54,9 @@ pub(crate) mod test_util {
         let mut i = 0;
         while i < N {
             let hi = (bytes[2 * i] as char).to_digit(16).expect("invalid hex") as u8;
-            let lo = (bytes[2 * i + 1] as char).to_digit(16).expect("invalid hex") as u8;
+            let lo = (bytes[2 * i + 1] as char)
+                .to_digit(16)
+                .expect("invalid hex") as u8;
             out[i] = (hi << 4) | lo;
             i += 1;
         }

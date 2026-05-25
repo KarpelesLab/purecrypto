@@ -237,10 +237,7 @@ mod tests {
         let cipher = Aes128::new(&key);
         let mut block = from_hex::<16>("00112233445566778899aabbccddeeff");
         cipher.encrypt_block(&mut block);
-        assert_eq!(
-            block,
-            from_hex::<16>("69c4e0d86a7b0430d8cdb78070b4c55a")
-        );
+        assert_eq!(block, from_hex::<16>("69c4e0d86a7b0430d8cdb78070b4c55a"));
         cipher.decrypt_block(&mut block);
         assert_eq!(block, from_hex::<16>("00112233445566778899aabbccddeeff"));
     }
@@ -251,10 +248,7 @@ mod tests {
         let cipher = Aes192::new(&key);
         let mut block = from_hex::<16>("00112233445566778899aabbccddeeff");
         cipher.encrypt_block(&mut block);
-        assert_eq!(
-            block,
-            from_hex::<16>("dda97ca4864cdfe06eaf70a0ec0d7191")
-        );
+        assert_eq!(block, from_hex::<16>("dda97ca4864cdfe06eaf70a0ec0d7191"));
         cipher.decrypt_block(&mut block);
         assert_eq!(block, from_hex::<16>("00112233445566778899aabbccddeeff"));
     }
@@ -266,10 +260,7 @@ mod tests {
         let cipher = Aes256::new(&key);
         let mut block = from_hex::<16>("00112233445566778899aabbccddeeff");
         cipher.encrypt_block(&mut block);
-        assert_eq!(
-            block,
-            from_hex::<16>("8ea2b7ca516745bfeafc49904b496089")
-        );
+        assert_eq!(block, from_hex::<16>("8ea2b7ca516745bfeafc49904b496089"));
         cipher.decrypt_block(&mut block);
         assert_eq!(block, from_hex::<16>("00112233445566778899aabbccddeeff"));
     }

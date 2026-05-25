@@ -253,19 +253,13 @@ mod tests {
         let ciphertext = ct;
         let mut bad_tag = tag;
         bad_tag[0] ^= 1;
-        assert_eq!(
-            g.decrypt(&nonce, &aad, &mut ct, &bad_tag),
-            Err(TagMismatch)
-        );
+        assert_eq!(g.decrypt(&nonce, &aad, &mut ct, &bad_tag), Err(TagMismatch));
         assert_eq!(ct, ciphertext, "buffer must be unchanged on auth failure");
 
         // Tampered AAD is also rejected.
         let mut ct = ciphertext;
         let mut bad_aad = aad;
         bad_aad[0] ^= 1;
-        assert_eq!(
-            g.decrypt(&nonce, &bad_aad, &mut ct, &tag),
-            Err(TagMismatch)
-        );
+        assert_eq!(g.decrypt(&nonce, &bad_aad, &mut ct, &tag), Err(TagMismatch));
     }
 }

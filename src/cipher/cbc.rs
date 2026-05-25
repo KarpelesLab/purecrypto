@@ -19,10 +19,7 @@ impl<C: BlockCipher> Cbc<C> {
     /// Creates a CBC context from `cipher` and a 16-byte IV.
     #[inline]
     pub fn new(cipher: C, iv: &[u8; 16]) -> Self {
-        Cbc {
-            cipher,
-            chain: *iv,
-        }
+        Cbc { cipher, chain: *iv }
     }
 
     /// Encrypts `data` in place. May be called repeatedly to continue the
