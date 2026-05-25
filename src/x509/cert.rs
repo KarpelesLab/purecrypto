@@ -1,0 +1,309 @@
+//! X.509 certificate building, parsing, and verification.
+//!
+//! Signatures use RSA with PKCS#1 v1.5 over SHA-256
+//! (`sha256WithRSAEncryption`).
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use super::{DistinguishedName, Error, Validity, algorithm_identifier, oid};
+use crate::der::{
+    Reader, encode_bit_string, encode_boolean, encode_context, encode_integer, encode_octet_string,
+    encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
+};
+use crate::hash::Sha256;
+use crate::rsa::{RsaPrivateKey, RsaPublicKey};
+
+const PEM_LABEL: &str = "CERTIFICATE";
+
+/// A parsed/owned X.509 certificate, stored as its DER encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Certificate {
+    der: Vec<u8>,
+}
+
+/// The three top-level fields of a `Certificate`.
+struct CertParts<'a> {
+    /// Raw `TBSCertificate` element (tag-length-value), used for signing.
+    tbs: &'a [u8],
+    /// `signatureAlgorithm` OID arcs.
+    sig_alg: Vec<u64>,
+    /// Signature bits.
+    signature: &'a [u8],
+}
+
+/// Encodes an RSA `SubjectPublicKeyInfo`.
+fn rsa_spki<const LIMBS: usize>(pk: &RsaPublicKey<LIMBS>) -> Vec<u8> {
+    let algid = algorithm_identifier(oid::RSA_ENCRYPTION, true);
+    let key = pk.to_pkcs1_der();
+    encode_sequence(&[algid, encode_bit_string(&key)].concat())
+}
+
+/// Encodes the `[3] Extensions` field with a critical `basicConstraints`.
+fn extensions(is_ca: bool) -> Vec<u8> {
+    let bc_value = if is_ca {
+        encode_sequence(&encode_boolean(true))
+    } else {
+        encode_sequence(&[]) // cA defaults to FALSE
+    };
+    let mut ext = oid_tlv(oid::BASIC_CONSTRAINTS);
+    ext.extend_from_slice(&encode_boolean(true)); // critical
+    ext.extend_from_slice(&encode_octet_string(&bc_value));
+    let ext = encode_sequence(&ext);
+    encode_context(3, &encode_sequence(&ext))
+}
+
+/// Builds the DER `TBSCertificate`.
+fn build_tbs<const LIMBS: usize>(
+    serial: u64,
+    issuer: &DistinguishedName,
+    subject: &DistinguishedName,
+    validity: &Validity,
+    subject_key: &RsaPublicKey<LIMBS>,
+    is_ca: bool,
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&encode_context(0, &encode_integer(&[2]))); // version v3
+    body.extend_from_slice(&encode_integer(&serial.to_be_bytes()));
+    body.extend_from_slice(&algorithm_identifier(oid::SHA256_WITH_RSA, true));
+    body.extend_from_slice(&issuer.to_der());
+    body.extend_from_slice(&validity.to_der());
+    body.extend_from_slice(&subject.to_der());
+    body.extend_from_slice(&rsa_spki(subject_key));
+    body.extend_from_slice(&extensions(is_ca));
+    encode_sequence(&body)
+}
+
+impl Certificate {
+    /// Issues a certificate for `subject_key`, signed by `issuer_key` under
+    /// `issuer` (use the same key/name for a self-signed certificate). Uses
+    /// SHA-256 with RSA PKCS#1 v1.5.
+    pub fn issue<const LIMBS: usize>(
+        issuer_key: &RsaPrivateKey<LIMBS>,
+        issuer: &DistinguishedName,
+        subject: &DistinguishedName,
+        subject_key: &RsaPublicKey<LIMBS>,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+    ) -> Result<Certificate, Error> {
+        let tbs = build_tbs(serial, issuer, subject, validity, subject_key, is_ca);
+        let sig = issuer_key.sign_pkcs1v15::<Sha256>(&tbs)?;
+        let der = encode_sequence(
+            &[
+                tbs,
+                algorithm_identifier(oid::SHA256_WITH_RSA, true),
+                encode_bit_string(&sig),
+            ]
+            .concat(),
+        );
+        Ok(Certificate { der })
+    }
+
+    /// Issues a self-signed certificate (issuer == subject, signed by `key`).
+    pub fn self_signed<const LIMBS: usize>(
+        key: &RsaPrivateKey<LIMBS>,
+        subject: &DistinguishedName,
+        validity: &Validity,
+        serial: u64,
+        is_ca: bool,
+    ) -> Result<Certificate, Error> {
+        Self::issue(
+            key,
+            subject,
+            subject,
+            &key.public_key(),
+            validity,
+            serial,
+            is_ca,
+        )
+    }
+
+    /// Wraps existing certificate DER (validating only that it is a SEQUENCE).
+    pub fn from_der(der: Vec<u8>) -> Result<Certificate, Error> {
+        let mut r = Reader::new(&der);
+        r.read_sequence()?;
+        Ok(Certificate { der })
+    }
+
+    /// Parses a PEM `CERTIFICATE` document.
+    pub fn from_pem(pem: &str) -> Result<Certificate, Error> {
+        Ok(Certificate {
+            der: pem_decode(pem, PEM_LABEL)?,
+        })
+    }
+
+    /// The DER encoding.
+    pub fn to_der(&self) -> &[u8] {
+        &self.der
+    }
+
+    /// The PEM encoding.
+    pub fn to_pem(&self) -> String {
+        pem_encode(PEM_LABEL, &self.der)
+    }
+
+    /// Splits the outer certificate into its three top-level parts.
+    fn parts(&self) -> Result<CertParts<'_>, Error> {
+        let mut outer = Reader::new(&self.der);
+        let mut cert = outer.read_sequence()?;
+        let tbs = cert.read_element()?;
+        let mut alg = cert.read_sequence()?;
+        let sig_alg = parse_oid(alg.read_oid()?)?;
+        let signature = cert.read_bit_string()?;
+        Ok(CertParts {
+            tbs,
+            sig_alg,
+            signature,
+        })
+    }
+
+    /// Returns a sub-reader over the `TBSCertificate` contents, positioned at
+    /// the issuer (version, serial, and inner signature algorithm skipped).
+    fn tbs_after_algid(&self) -> Result<Reader<'_>, Error> {
+        let tbs = self.parts()?.tbs;
+        let mut outer = Reader::new(tbs);
+        let mut seq = outer.read_sequence()?;
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_tlv(tag::context(0))?; // version
+        }
+        seq.read_integer_bytes()?; // serialNumber
+        seq.read_sequence()?; // inner signature AlgorithmIdentifier
+        Ok(seq)
+    }
+
+    /// The certificate issuer.
+    pub fn issuer(&self) -> Result<DistinguishedName, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)
+    }
+
+    /// The certificate subject.
+    pub fn subject(&self) -> Result<DistinguishedName, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)?; // validity
+        DistinguishedName::decode(&mut seq)
+    }
+
+    /// The subject's RSA public key. `LIMBS` must match the key's modulus size.
+    pub fn public_key<const LIMBS: usize>(&self) -> Result<RsaPublicKey<LIMBS>, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)?; // validity
+        DistinguishedName::decode(&mut seq)?; // subject
+        let mut spki = seq.read_sequence()?;
+        let alg = parse_oid(spki.read_sequence()?.read_oid()?)?;
+        if alg.as_slice() != oid::RSA_ENCRYPTION {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        let key_der = spki.read_bit_string()?;
+        Ok(RsaPublicKey::from_pkcs1_der(key_der)?)
+    }
+
+    /// Verifies the certificate signature against `issuer_key`. Only
+    /// `sha256WithRSAEncryption` is supported.
+    pub fn verify_signature<const LIMBS: usize>(
+        &self,
+        issuer_key: &RsaPublicKey<LIMBS>,
+    ) -> Result<(), Error> {
+        let parts = self.parts()?;
+        if parts.sig_alg.as_slice() != oid::SHA256_WITH_RSA {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        issuer_key.verify_pkcs1v15::<Sha256>(parts.tbs, parts.signature)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bignum::Uint;
+    use crate::hash::Sha256 as Sha256Hash;
+    use crate::rng::HmacDrbg;
+    use crate::x509::Time;
+
+    fn rng(label: &[u8]) -> HmacDrbg<Sha256Hash> {
+        HmacDrbg::new(label, b"nonce", &[])
+    }
+
+    fn validity() -> Validity {
+        Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        )
+    }
+
+    #[test]
+    fn self_signed_roundtrip_and_verify() {
+        let mut r = rng(b"x509-selfsigned");
+        // RSA-512 fits a SHA-256 signature.
+        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let name =
+            DistinguishedName::common_name("purecrypto test CA").with_organization("Karpelès Lab");
+
+        let cert = Certificate::self_signed(&key, &name, &validity(), 1, true).unwrap();
+
+        // Structure round-trips through PEM.
+        let pem = cert.to_pem();
+        let parsed = Certificate::from_pem(&pem).unwrap();
+        assert_eq!(parsed, cert);
+
+        // Fields parse back.
+        assert_eq!(cert.subject().unwrap(), name);
+        assert_eq!(cert.issuer().unwrap(), name);
+        let parsed_key = cert.public_key::<8>().unwrap();
+        assert_eq!(parsed_key, key.public_key());
+
+        // The self-signature verifies with the embedded key.
+        cert.verify_signature::<8>(&parsed_key).unwrap();
+    }
+
+    #[test]
+    fn ca_signs_leaf() {
+        let mut r = rng(b"x509-ca");
+        let ca_key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let leaf_key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let ca_name = DistinguishedName::common_name("Root CA");
+        let leaf_name = DistinguishedName::common_name("leaf.example");
+
+        let leaf = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &leaf_name,
+            &leaf_key.public_key(),
+            &validity(),
+            2,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(leaf.subject().unwrap(), leaf_name);
+        assert_eq!(leaf.issuer().unwrap(), ca_name);
+        // Verifies under the CA key, not under the leaf's own key.
+        leaf.verify_signature::<8>(&ca_key.public_key()).unwrap();
+        assert!(leaf.verify_signature::<8>(&leaf_key.public_key()).is_err());
+    }
+
+    #[test]
+    fn tampered_cert_fails_verification() {
+        let mut r = rng(b"x509-tamper");
+        let key = RsaPrivateKey::<8>::generate(Uint::from_u64(65537), &mut r, 8);
+        let cert = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("x"),
+            &validity(),
+            1,
+            true,
+        )
+        .unwrap();
+
+        let mut der = cert.to_der().to_vec();
+        // Flip a byte inside the TBS (the subject CN region near the front).
+        let idx = der.len() / 3;
+        der[idx] ^= 1;
+        let bad = Certificate::from_der(der).unwrap();
+        assert!(bad.verify_signature::<8>(&key.public_key()).is_err());
+    }
+}

@@ -52,6 +52,9 @@ pub mod rng;
 #[cfg(feature = "rsa")]
 pub mod rsa;
 
+#[cfg(feature = "x509")]
+pub mod x509;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {
