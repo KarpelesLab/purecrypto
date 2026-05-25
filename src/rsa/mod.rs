@@ -8,6 +8,8 @@
 mod keys;
 mod prime;
 
+#[cfg(all(feature = "der", feature = "alloc"))]
+mod encoding;
 #[cfg(feature = "alloc")]
 mod pkcs1;
 
