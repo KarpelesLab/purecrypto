@@ -40,6 +40,10 @@ pub(crate) struct ConnectionCore {
     /// `Finished`. The role-specific state machines call `close_ccs_window`
     /// once they reach Connected.
     ccs_window_open: bool,
+    /// Peer-advertised `record_size_limit` (RFC 8449), bounding the
+    /// plaintext fragment we may send them. `None` means "unbounded" (default
+    /// TLS 1.3 cap of 2¹⁴).
+    peer_record_size_limit: Option<u16>,
 }
 
 impl ConnectionCore {
@@ -54,7 +58,15 @@ impl ConnectionCore {
             transcript: Transcript::new(),
             sent_close_notify: false,
             ccs_window_open: true,
+            peer_record_size_limit: None,
         }
+    }
+
+    /// Sets the peer-advertised record-size limit (RFC 8449); subsequent
+    /// `send_application_data` calls split into records of at most
+    /// `limit - 1` plaintext bytes (the extra byte is the inner content type).
+    pub(crate) fn set_peer_record_size_limit(&mut self, limit: u16) {
+        self.peer_record_size_limit = Some(limit);
     }
 
     /// Called by the role-specific state machine when the handshake completes.
@@ -111,9 +123,24 @@ impl ConnectionCore {
         );
     }
 
-    /// Sends application data (requires write keys to be installed).
+    /// Sends application data (requires write keys to be installed). If the
+    /// peer has advertised a `record_size_limit` smaller than `data.len()`
+    /// (or the default 2¹⁴), the data is fragmented into multiple records.
     pub(crate) fn send_application_data(&mut self, data: &[u8]) {
-        self.emit_record(ContentType::ApplicationData, data);
+        // Cap = min(peer_limit - 1, 2^14). The `-1` reserves room for the
+        // inner content-type byte per RFC 8449 §4.
+        let cap = self
+            .peer_record_size_limit
+            .map(|l| (l - 1) as usize)
+            .unwrap_or(1 << 14);
+        let cap = cap.min(1 << 14);
+        if data.len() <= cap {
+            self.emit_record(ContentType::ApplicationData, data);
+        } else {
+            for chunk in data.chunks(cap) {
+                self.emit_record(ContentType::ApplicationData, chunk);
+            }
+        }
     }
 
     /// Sends a fatal alert.

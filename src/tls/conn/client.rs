@@ -45,6 +45,10 @@ pub struct ClientConfig {
     /// ALPN protocols to offer (RFC 7301), in preference order. Empty
     /// suppresses the extension. Example: `[b"h2".to_vec(), b"http/1.1".to_vec()]`.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// `record_size_limit` (RFC 8449) we advertise — the largest plaintext
+    /// fragment the server may send us. `None` suppresses the extension; the
+    /// peer is then free to use the TLS 1.3 default of 2¹⁴ bytes.
+    pub record_size_limit: Option<u16>,
 }
 
 impl ClientConfig {
@@ -56,6 +60,7 @@ impl ClientConfig {
             verify_certificates: true,
             verification_time: None,
             alpn_protocols: Vec::new(),
+            record_size_limit: None,
         }
     }
 
@@ -64,6 +69,13 @@ impl ClientConfig {
     /// sends `no_application_protocol`.
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
+        self
+    }
+
+    /// Advertises `record_size_limit = limit` (RFC 8449). Must be in
+    /// `64..=2^14 + 1`.
+    pub fn with_record_size_limit(mut self, limit: u16) -> Self {
+        self.record_size_limit = Some(limit);
         self
     }
 }
@@ -346,6 +358,9 @@ impl ClientConnection {
                 .map(|v| v.as_slice())
                 .collect();
             extensions.push(ext::alpn_protocols(&protos));
+        }
+        if let Some(limit) = self.config.record_size_limit {
+            extensions.push(ext::record_size_limit(limit));
         }
         extensions.extend_from_slice(extra_extensions);
         ClientHello {
@@ -739,6 +754,9 @@ impl ClientConnection {
                         return Err(Error::IllegalParameter);
                     }
                     self.alpn_negotiated = Some(names.into_iter().next().unwrap());
+                } else if ty == crate::tls::codec::ExtensionType::RECORD_SIZE_LIMIT.0 {
+                    let limit = ext::parse_record_size_limit(ext_body)?;
+                    self.core.set_peer_record_size_limit(limit);
                 }
             }
         }

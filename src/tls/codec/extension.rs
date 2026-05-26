@@ -89,6 +89,27 @@ pub(crate) fn parse_alpn(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(out)
 }
 
+/// `record_size_limit` (RFC 8449): a single u16 in `64..=2^14+1` advertising
+/// the maximum plaintext fragment the peer may send us.
+pub(crate) fn record_size_limit(limit: u16) -> RawExtension {
+    let mut body = Vec::new();
+    put_u16(&mut body, limit);
+    (ExtensionType::RECORD_SIZE_LIMIT, body)
+}
+
+/// Parses a `record_size_limit` extension body.
+pub(crate) fn parse_record_size_limit(body: &[u8]) -> Result<u16, Error> {
+    let mut c = ReadCursor::new(body);
+    let v = c.u16()?;
+    c.expect_empty()?;
+    // RFC 8449 §4: limit must be in `64..=2^14+1`. Anything else closes the
+    // connection with `illegal_parameter`.
+    if !(64..=(1u16 << 14) + 1).contains(&v) {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(v)
+}
+
 /// `server_name` (SNI) carrying a single host name.
 pub(crate) fn server_name(host: &str) -> RawExtension {
     let mut body = Vec::new();
