@@ -1,5 +1,5 @@
-//! `purecrypto s_client` — open a TLS 1.3 connection and report the result,
-//! like a minimal `openssl s_client`.
+//! `purecrypto s_client` — open a TLS 1.2 or TLS 1.3 connection and report
+//! the result, like a minimal `openssl s_client`.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::TcpStream;
@@ -9,7 +9,10 @@ use crate::pki::format_dn;
 use crate::util::{Args, die, to_hex};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
-use purecrypto::tls::{ClientCertConfig, ClientConfig, ClientConnection, RootCertStore, Stream};
+use purecrypto::tls::{
+    ClientCertConfig, ClientConfig, ClientConfig12, ClientConnection, ClientConnection12,
+    RootCertStore, Stream,
+};
 use purecrypto::x509::Certificate;
 
 /// Loads trust roots: from `ca_file` if given, else the system bundle.
@@ -39,8 +42,7 @@ fn load_roots(ca_file: Option<&str>) -> RootCertStore {
     store
 }
 
-fn print_chain(conn: &ClientConnection, showcerts: bool) {
-    let chain = conn.peer_certificates();
+fn print_chain(chain: &[Vec<u8>], showcerts: bool) {
     eprintln!("peer certificate chain ({} certs):", chain.len());
     for (i, der) in chain.iter().enumerate() {
         match Certificate::from_der(der.clone()) {
@@ -120,8 +122,8 @@ fn load_client_cert(cert_path: &str, key_path: &str) -> ClientCertConfig {
     }
 }
 
-/// Appends NSS SSLKEYLOGFILE lines for the negotiated secrets.
-fn dump_keylog(conn: &ClientConnection, path: &str) {
+/// Appends NSS SSLKEYLOGFILE lines for a TLS 1.3 connection.
+fn dump_keylog_13(conn: &ClientConnection, path: &str) {
     let cr_hex = to_hex(&conn.client_random());
     let mut lines = String::new();
     if let Some(s) = conn.client_handshake_traffic_secret() {
@@ -155,6 +157,19 @@ fn dump_keylog(conn: &ClientConnection, path: &str) {
     if let Some(s) = conn.exporter_master_secret() {
         lines.push_str(&format!("EXPORTER_SECRET {} {}\n", cr_hex, to_hex(&s)));
     }
+    append_keylog(path, &lines);
+}
+
+/// Appends the NSS SSLKEYLOGFILE `CLIENT_RANDOM` line for a TLS 1.2 connection.
+fn dump_keylog_12(conn: &ClientConnection12, path: &str) {
+    let cr_hex = to_hex(&conn.client_random());
+    if let Some(master) = conn.master_secret() {
+        let line = format!("CLIENT_RANDOM {} {}\n", cr_hex, to_hex(&master));
+        append_keylog(path, &line);
+    }
+}
+
+fn append_keylog(path: &str, lines: &str) {
     if let Err(e) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -170,7 +185,7 @@ pub(crate) fn run(args: Args) {
         .value("-connect")
         .or_else(|| args.positionals(&["-connect", "-servername", "-CAfile", "-alpn", "-keylogfile", "-cert", "-key"]).first().copied())
         .unwrap_or_else(|| {
-            die("usage: purecrypto s_client -connect host:port [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-keylogfile path] [-cert client.pem -key client.key]")
+            die("usage: purecrypto s_client -connect host:port [-tls1_2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-keylogfile path] [-cert client.pem -key client.key]")
         });
     let (host, port) = match connect.rsplit_once(':') {
         Some((h, p)) => (
@@ -184,6 +199,7 @@ pub(crate) fn run(args: Args) {
     let insecure = args.flag("-insecure") || args.flag("--insecure");
     let showcerts = args.flag("-showcerts") || args.flag("--showcerts");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
+    let tls12 = args.flag("-tls1_2") || args.flag("--tls1_2");
     let alpn = args.value("-alpn").map(parse_alpn);
     let keylog = args.value("-keylogfile").map(String::from);
     let client_cert = match (args.value("-cert"), args.value("-key")) {
@@ -192,12 +208,67 @@ pub(crate) fn run(args: Args) {
         _ => None,
     };
 
+    let mut sock = TcpStream::connect((host, port))
+        .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
+
+    if tls12 {
+        run_tls12(RunCtx {
+            sock: &mut sock,
+            server_name,
+            insecure,
+            showcerts,
+            quiet,
+            alpn,
+            keylog,
+            client_cert,
+            ca_file: args.value("-CAfile"),
+        });
+    } else {
+        run_tls13(RunCtx {
+            sock: &mut sock,
+            server_name,
+            insecure,
+            showcerts,
+            quiet,
+            alpn,
+            keylog,
+            client_cert,
+            ca_file: args.value("-CAfile"),
+        });
+    }
+}
+
+struct RunCtx<'a> {
+    sock: &'a mut TcpStream,
+    server_name: &'a str,
+    insecure: bool,
+    showcerts: bool,
+    quiet: bool,
+    alpn: Option<Vec<Vec<u8>>>,
+    keylog: Option<String>,
+    client_cert: Option<ClientCertConfig>,
+    ca_file: Option<&'a str>,
+}
+
+fn run_tls13(ctx: RunCtx<'_>) {
+    let RunCtx {
+        sock,
+        server_name,
+        insecure,
+        showcerts,
+        quiet,
+        alpn,
+        keylog,
+        client_cert,
+        ca_file,
+    } = ctx;
+
     let mut config = if insecure {
         let mut c = ClientConfig::new(RootCertStore::new());
         c.verify_certificates = false;
         c
     } else {
-        ClientConfig::new(load_roots(args.value("-CAfile")))
+        ClientConfig::new(load_roots(ca_file))
     };
     if let Some(a) = alpn {
         config = config.with_alpn(a);
@@ -206,20 +277,17 @@ pub(crate) fn run(args: Args) {
         config = config.with_client_cert(cc);
     }
 
-    let mut sock = TcpStream::connect((host, port))
-        .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
-
     let mut conn = ClientConnection::new(config, server_name, &mut OsRng);
 
     // Handshake.
     {
-        let mut tls = Stream::new(&mut conn, &mut sock);
+        let mut tls = Stream::new(&mut conn, sock);
         tls.complete_handshake()
             .unwrap_or_else(|e| die(format!("TLS handshake failed: {e:?}")));
     }
 
     if let Some(path) = keylog.as_deref() {
-        dump_keylog(&conn, path);
+        dump_keylog_13(&conn, path);
     }
 
     if !quiet {
@@ -236,13 +304,105 @@ pub(crate) fn run(args: Args) {
         if let Some(p) = conn.alpn_protocol() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }
-        print_chain(&conn, showcerts);
+        print_chain(conn.peer_certificates(), showcerts);
     }
 
-    // Data phase: forward stdin (when piped) to the server, server to stdout.
+    // Data phase.
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut tls = Stream::new(&mut conn, &mut sock);
+    let mut tls = Stream::new(&mut conn, sock);
+    drive_data(&mut tls);
+}
 
+fn run_tls12(ctx: RunCtx<'_>) {
+    let RunCtx {
+        sock,
+        server_name,
+        insecure,
+        showcerts,
+        quiet,
+        alpn,
+        keylog,
+        client_cert,
+        ca_file,
+    } = ctx;
+
+    let roots = if insecure {
+        RootCertStore::new()
+    } else {
+        load_roots(ca_file)
+    };
+    let mut config = ClientConfig12::new(roots);
+    config.verify_certificates = !insecure;
+    // The CLI user opted into TLS 1.2 explicitly via `-tls1_2`, so accept the
+    // RFC 8446 §4.1.3 downgrade sentinel without complaint — a modern server
+    // serving a deliberately-downgraded TLS 1.2 connection will set it.
+    config = config.with_accept_downgrade_sentinel(true);
+    if let Some(a) = alpn {
+        config = config.with_alpn(a);
+    }
+    if let Some(cc) = client_cert {
+        config = config.with_client_cert(cc);
+    }
+
+    let mut conn = ClientConnection12::new(config, server_name, &mut OsRng);
+
+    // Handshake.
+    {
+        let mut tls = Stream::new(&mut conn, sock);
+        tls.complete_handshake()
+            .unwrap_or_else(|e| die(format!("TLS handshake failed: {e:?}")));
+    }
+
+    if let Some(path) = keylog.as_deref() {
+        dump_keylog_12(&conn, path);
+    }
+
+    if !quiet {
+        let suite_name = conn
+            .negotiated_cipher_suite()
+            .map(tls12_suite_name)
+            .unwrap_or("?");
+        eprintln!(
+            "connected: {} / {}{}",
+            conn.protocol_version().unwrap_or("?"),
+            suite_name,
+            if insecure {
+                "  (certificate NOT verified)"
+            } else {
+                "  (certificate verified)"
+            }
+        );
+        if let Some(p) = conn.alpn_protocol() {
+            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+        }
+        print_chain(conn.peer_certificates(), showcerts);
+    }
+
+    // Data phase.
+    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut tls = Stream::new(&mut conn, sock);
+    drive_data(&mut tls);
+}
+
+/// Stringifies a TLS 1.2 cipher-suite code for diagnostics.
+fn tls12_suite_name(code: u16) -> &'static str {
+    match code {
+        0xC02B => "ECDHE-ECDSA-AES128-GCM-SHA256",
+        0xC02C => "ECDHE-ECDSA-AES256-GCM-SHA384",
+        0xC02F => "ECDHE-RSA-AES128-GCM-SHA256",
+        0xC030 => "ECDHE-RSA-AES256-GCM-SHA384",
+        0xCCA8 => "ECDHE-RSA-CHACHA20-POLY1305",
+        0xCCA9 => "ECDHE-ECDSA-CHACHA20-POLY1305",
+        _ => "?",
+    }
+}
+
+/// Drives the data phase: stdin → TLS, TLS → stdout, until EOF / timeout.
+fn drive_data<C, T>(tls: &mut Stream<'_, C, T>)
+where
+    C: purecrypto::tls::Connection,
+    T: Read + Write,
+{
     if !std::io::stdin().is_terminal() {
         let mut input = Vec::new();
         if std::io::stdin().read_to_end(&mut input).is_ok() && !input.is_empty() {

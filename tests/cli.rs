@@ -329,6 +329,119 @@ fn s_client_live_cloudflare() {
     assert!(ok);
 }
 
+/// s_client and s_server round-trip over a local TCP port speaking TLS 1.2,
+/// exercising the `-tls1_2` flag on both sides plus the TLS 1.2 keylog
+/// format (`CLIENT_RANDOM ...`).
+#[test]
+fn s_client_s_server_tls12_roundtrip() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    // Pick a free port up front.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let dir = std::env::temp_dir().join(format!("pc_s_server_tls12_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let log_path = dir.join("keylog.txt");
+
+    // Self-signed P-256 ECDSA cert for 127.0.0.1 (TLS 1.2 server requires
+    // an RSA or ECDSA key for the ECDHE-* suite signature).
+    let mut rng = OsRng;
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+
+    // Spawn s_server -tls1_2 in a background process (single-shot, `-www`).
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_server",
+            "-tls1_2",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            &port.to_string(),
+            "-www",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_server");
+
+    // Give the server time to bind.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // s_client -tls1_2 connects, dumps CLIENT_RANDOM line to keylogfile.
+    let (out, ok) = run(
+        &[
+            "s_client",
+            "-tls1_2",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-keylogfile",
+            log_path.to_str().unwrap(),
+            "-quiet",
+        ],
+        b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    assert!(ok, "s_client -tls1_2 failed");
+    assert!(
+        out.contains("hello from purecrypto s_server"),
+        "expected -www body in client stdout, got: {out:?}"
+    );
+
+    // The keylogfile must contain the TLS 1.2 CLIENT_RANDOM line.
+    let log = std::fs::read_to_string(&log_path).expect("read keylog");
+    assert!(
+        log.starts_with("CLIENT_RANDOM "),
+        "expected CLIENT_RANDOM keylog line, got:\n{log}"
+    );
+    // CLIENT_RANDOM <64 hex> <96 hex>\n  (64 = 32 bytes cr, 96 = 48 bytes master)
+    let parts: Vec<&str> = log.trim().split_ascii_whitespace().collect();
+    assert_eq!(parts.len(), 3, "malformed CLIENT_RANDOM line: {log}");
+    assert_eq!(parts[0], "CLIENT_RANDOM");
+    assert_eq!(parts[1].len(), 64, "client_random hex len wrong: {log}");
+    assert_eq!(parts[2].len(), 96, "master_secret hex len wrong: {log}");
+    assert!(parts[1].bytes().all(|b| b.is_ascii_hexdigit()));
+    assert!(parts[2].bytes().all(|b| b.is_ascii_hexdigit()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "requires network access"]
+fn s_client_live_cloudflare_tls12() {
+    let (_out, ok) = run(
+        &["s_client", "-tls1_2", "-connect", "cloudflare.com:443"],
+        b"GET / HTTP/1.1\r\nHost: cloudflare.com\r\nConnection: close\r\n\r\n",
+    );
+    assert!(ok);
+}
+
 #[test]
 fn genpkey_ec_then_inspect() {
     let (key_pem, ok) = run(&["genpkey", "-algorithm", "EC", "-curve", "P-256"], b"");
