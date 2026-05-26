@@ -522,12 +522,16 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
     let mut check = alloc::vec![0u8; p.ctilde];
     h.finalize_into(&mut check);
 
-    // Constant-time comparison of c̃.
-    let mut diff = 0u8;
-    for (a, b) in ctilde.iter().zip(check.iter()) {
-        diff |= a ^ b;
+    // Constant-time comparison of c̃ — both inputs are public, but uniform
+    // with the rest of the codebase. The explicit length check protects
+    // against zip silently truncating to the shorter slice.
+    if ctilde.len() != check.len() {
+        return false;
     }
-    diff == 0
+    bool::from(<[u8] as crate::ct::ConstantTimeEq>::ct_eq(
+        ctilde,
+        check.as_slice(),
+    ))
 }
 
 /// Derives the public key bytes from a parsed private key (FIPS 204 §7.2:

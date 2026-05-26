@@ -968,7 +968,13 @@ impl<R: RngCore> ServerConnection<R> {
                     .try_into()
                     .map_err(|_| Error::Decode)?;
 
-                let (ct, ml_ss) = MlKem768EncapsKey::from_bytes(ek).encapsulate(&mut self.rng);
+                // FIPS 203 §7.2: validate the peer's encapsulation key
+                // before any cryptographic operation on it. An attacker who
+                // supplies off-modulus coefficients can otherwise probe the
+                // encapsulator's noise polynomials.
+                let validated_ek = MlKem768EncapsKey::from_bytes_validated(ek)
+                    .map_err(|_| Error::IllegalParameter)?;
+                let (ct, ml_ss) = validated_ek.encapsulate(&mut self.rng);
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 // RFC 8446 §7.4.2: reject the all-zero X25519 contribution
                 // even though the ML-KEM half is independently secure.
