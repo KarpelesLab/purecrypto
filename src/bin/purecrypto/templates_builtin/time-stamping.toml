@@ -1,0 +1,20 @@
+# RFC 3161 time-stamping authority leaf profile.
+name = "time-stamping"
+default_days = 365
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = true
+digital_signature = true
+non_repudiation = true
+
+[extended_key_usage]
+time_stamping = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true

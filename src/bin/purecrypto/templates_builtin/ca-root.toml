@@ -1,0 +1,19 @@
+# Self-signed root CA profile. No pathLen — root signs anything below it.
+# Authority Key Identifier is omitted (self-issued); subject_key_identifier
+# stays on so subordinates can chain via AKI.
+name = "ca-root"
+default_days = 3650
+
+[basic_constraints]
+ca = true
+
+[key_usage]
+critical = true
+key_cert_sign = true
+crl_sign = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = false

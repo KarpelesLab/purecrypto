@@ -1,0 +1,23 @@
+# S/MIME signing + encryption profile.
+name = "email-protection"
+default_days = 365
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = true
+digital_signature = true
+key_encipherment = true
+
+[extended_key_usage]
+email_protection = true
+
+[subject_alt_name]
+from_csr = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true

@@ -1,0 +1,18 @@
+# Intermediate / sub-CA profile. pathLen=0 means it can sign leaves only.
+name = "ca-intermediate"
+default_days = 1825
+
+[basic_constraints]
+ca = true
+path_len = 0
+
+[key_usage]
+critical = true
+key_cert_sign = true
+crl_sign = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true

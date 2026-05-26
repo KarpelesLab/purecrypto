@@ -1,0 +1,23 @@
+# TLS server leaf profile (RFC 5280 + CA/B Forum BR).
+name = "tls-server"
+default_days = 365
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = true
+digital_signature = true
+key_encipherment = true
+
+[extended_key_usage]
+server_auth = true
+
+[subject_alt_name]
+from_csr = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true
