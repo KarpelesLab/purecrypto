@@ -270,9 +270,21 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
 
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if www {
+        // Decrypt the request before generating the response. The
+        // unified-config refactor accidentally dropped the `feed` call
+        // that the previous `Stream` wrapper performed internally —
+        // without it, the engine never advances past pending records
+        // (e.g., the TLS 1.3 NewSessionTicket that's interleaved with
+        // the first application data), which on slow macOS runners
+        // stalled the reply path long enough to trigger the client's
+        // read timeout.
         let mut buf = [0u8; 4096];
-        let _ = sock.read(&mut buf);
-        let _ = conn.recv();
+        if let Ok(n) = sock.read(&mut buf)
+            && n > 0
+        {
+            let _ = conn.feed(&buf[..n]);
+            let _ = conn.recv();
+        }
         let body = b"hello from purecrypto s_server\n";
         let resp = format!(
             "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
@@ -280,9 +292,17 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
         );
         let _ = conn.send(resp.as_bytes());
         let _ = conn.send(body);
+        // Cleanly close TLS, drain the engine, half-close the socket.
+        // Required because dropping the `TcpStream` races against
+        // macOS's send-buffer-flush behavior and was truncating the
+        // reply on a slow runner.
+        let _ = conn.close();
         let out = conn.pop().unwrap_or_default();
         let _ = sock.write_all(&out);
         let _ = sock.flush();
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+        let mut tail = [0u8; 256];
+        let _ = sock.read(&mut tail);
     } else {
         let mut buf = [0u8; 4096];
         loop {
