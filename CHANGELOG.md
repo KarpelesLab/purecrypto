@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/purecrypto/compare/v0.0.6...v0.0.7) - 2026-05-26
+
+### Added
+
+- *(cli)* -template / -template-file plumbing + ca list-templates + x509 -ext
+- *(cli)* CertTemplate + 8 built-in profile catalog
+- *(cli)* hand-rolled minimal TOML parser
+- *(x509)* extension types + encoders + issue_with_extensions
+- *(cli)* `purecrypto ca` — manage a development CA on disk
+- *(tls)* CRL stapling on the TLS 1.3 Certificate message
+- *(tls)* CrlStore + verify_chain_with_crls
+- *(x509)* CRL types — CertificateRevocationList + CrlBuilder
+
+### Other
+
+- rustfmt sweep + clippy-clean across all targets
+- *(cli)* pass -insecure to DTLS round-trip tests after audit fix
+
+### Security
+
+- residual LOW findings — DER strict tail, IA5 SAN, ct hygiene, drop wipes
+- *(cli)* private-key file modes + DTLS verify required + rand cap + serial cleanup
+
 ## [0.0.6](https://github.com/KarpelesLab/purecrypto/compare/v0.0.5...v0.0.6) - 2026-05-26
 
 ### Added
