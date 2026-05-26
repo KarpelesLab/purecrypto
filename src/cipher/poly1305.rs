@@ -17,6 +17,11 @@ fn le32(b: &[u8]) -> u32 {
 }
 
 /// A Poly1305 authenticator state.
+///
+/// Implements [`Drop`] to wipe the clamped `r`, the precomputed `5·r`, the
+/// accumulator `h`, the additive pad `s`, and the input-side buffer when the
+/// state goes out of scope — these are all derived from the secret one-time
+/// key.
 #[derive(Clone)]
 pub struct Poly1305 {
     /// Clamped evaluation point `r`, in five 26-bit limbs.
@@ -209,6 +214,25 @@ impl Poly1305 {
         tag[8..12].copy_from_slice(&m2.to_le_bytes());
         tag[12..16].copy_from_slice(&m3.to_le_bytes());
         tag
+    }
+}
+
+impl Drop for Poly1305 {
+    fn drop(&mut self) {
+        // Best-effort secret wipe: zero every field that's derived from the
+        // one-time key, then apply the standard `black_box` optimisation
+        // barrier so LLVM doesn't elide the writes as a dead store.
+        self.r = [0; 5];
+        self.s = [0; 4];
+        self.h = [0; 5];
+        self.pad = [0; 4];
+        self.buffer = [0u8; 16];
+        self.leftover = 0;
+        let _ = core::hint::black_box(&self.r);
+        let _ = core::hint::black_box(&self.s);
+        let _ = core::hint::black_box(&self.h);
+        let _ = core::hint::black_box(&self.pad);
+        let _ = core::hint::black_box(&self.buffer);
     }
 }
 

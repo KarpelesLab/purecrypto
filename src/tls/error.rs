@@ -52,6 +52,13 @@ pub enum AlertDescription {
     /// `certificate_required` (116) — RFC 8446 §6: server demanded a client
     /// certificate but the client offered none.
     CertificateRequired,
+    /// `user_canceled` (90) — RFC 5246 §7.2.1: a warning-level peer notice
+    /// indicating no protocol failure, just user-initiated close. In TLS
+    /// 1.2 this is non-fatal; TLS 1.3 §6 elides the warning/fatal split.
+    UserCanceled,
+    /// `no_renegotiation` (100) — RFC 5246 §7.2.1: a warning-level peer
+    /// notice that a renegotiation request was refused. Non-fatal.
+    NoRenegotiation,
     /// An unrecognized alert code.
     Unknown(u8),
 }
@@ -79,6 +86,8 @@ impl AlertDescription {
             AlertDescription::UnrecognizedName => 112,
             AlertDescription::NoApplicationProtocol => 120,
             AlertDescription::CertificateRequired => 116,
+            AlertDescription::UserCanceled => 90,
+            AlertDescription::NoRenegotiation => 100,
             AlertDescription::Unknown(v) => v,
         }
     }
@@ -105,6 +114,8 @@ impl AlertDescription {
             112 => AlertDescription::UnrecognizedName,
             120 => AlertDescription::NoApplicationProtocol,
             116 => AlertDescription::CertificateRequired,
+            90 => AlertDescription::UserCanceled,
+            100 => AlertDescription::NoRenegotiation,
             other => AlertDescription::Unknown(other),
         }
     }

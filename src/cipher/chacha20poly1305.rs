@@ -36,10 +36,15 @@ impl ChaCha20Poly1305 {
     }
 
     /// Derives the one-time Poly1305 key from the keystream block at counter 0.
+    /// The full 64-byte `block0` is zeroized after extracting the first 32
+    /// bytes (RFC 8439 §2.6) so the unused half-block of secret keystream
+    /// doesn't linger on the stack.
     fn poly_key(&self, nonce: &[u8; 12]) -> [u8; 32] {
-        let block0 = self.cipher.block(nonce, 0);
+        let mut block0 = self.cipher.block(nonce, 0);
         let mut otk = [0u8; 32];
         otk.copy_from_slice(&block0[..32]);
+        block0 = [0u8; 64];
+        let _ = core::hint::black_box(&block0);
         otk
     }
 

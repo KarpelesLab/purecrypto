@@ -244,7 +244,14 @@ impl<C: BlockCipher> AesKwp<C> {
             for b in &mut padded[plaintext.len()..padded_len] {
                 *b = 0;
             }
-            wrap_w(&self.cipher, aiv, &padded[..padded_len], out)
+            let result = wrap_w(&self.cipher, aiv, &padded[..padded_len], out);
+            // Best-effort wipe of the scratch buffer regardless of outcome:
+            // it held a copy of the plaintext key material.
+            for b in &mut padded[..padded_len] {
+                *b = 0;
+            }
+            let _ = core::hint::black_box(&padded);
+            result
         }
     }
 

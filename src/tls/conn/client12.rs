@@ -696,11 +696,23 @@ impl ClientConnection12 {
                     }
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
-                    if alert.description == AlertDescription::CloseNotify {
-                        self.state = State::Closed;
-                        return Ok(());
+                    // RFC 5246 §7.2.1: in TLS 1.2 only a subset of alerts are
+                    // fatal. `close_notify` ends the connection cleanly;
+                    // `user_canceled` and `no_renegotiation` are warning-level
+                    // and we accept (logging via the consumer) rather than
+                    // tear the connection down.
+                    match alert.description {
+                        AlertDescription::CloseNotify => {
+                            self.state = State::Closed;
+                            return Ok(());
+                        }
+                        AlertDescription::UserCanceled
+                        | AlertDescription::NoRenegotiation => {
+                            // Non-fatal warning — stay connected.
+                            continue;
+                        }
+                        _ => return Err(Error::AlertReceived(alert.description)),
                     }
-                    return Err(Error::AlertReceived(alert.description));
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => {

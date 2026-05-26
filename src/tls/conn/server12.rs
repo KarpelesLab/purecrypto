@@ -443,11 +443,17 @@ impl<R: RngCore> ServerConnection12<R> {
                     }
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
-                    if alert.description == AlertDescription::CloseNotify {
-                        self.state = State::Closed;
-                        return Ok(());
+                    // RFC 5246 §7.2.1: TLS 1.2 warning alerts other than
+                    // close_notify are non-fatal.
+                    match alert.description {
+                        AlertDescription::CloseNotify => {
+                            self.state = State::Closed;
+                            return Ok(());
+                        }
+                        AlertDescription::UserCanceled
+                        | AlertDescription::NoRenegotiation => continue,
+                        _ => return Err(Error::AlertReceived(alert.description)),
                     }
-                    return Err(Error::AlertReceived(alert.description));
                 }
                 Ok(None) => return Ok(()),
                 Err(e) => {
