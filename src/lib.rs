@@ -52,6 +52,9 @@ pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 
+#[cfg(feature = "mlkem")]
+pub mod mlkem;
+
 #[cfg(feature = "rng")]
 pub mod rng;
 

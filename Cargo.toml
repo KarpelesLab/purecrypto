@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "mlkem", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -30,7 +30,10 @@ rsa = ["bignum", "rng", "hash"]
 der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
 ec = ["bignum", "rng", "hash", "alloc"]
-tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "alloc"]
+tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "alloc"]
+# ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
+# the RNG trait are required.
+mlkem = ["hash", "rng"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509"]

@@ -85,6 +85,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_block_squeeze_crosses_rate() {
+        use crate::test_util::from_hex;
+        // SHAKE128("") past the 168-byte rate (verified against Python hashlib).
+        let x = Shake128::new();
+        let mut r = x.finalize_xof();
+        let mut o = [0u8; 336];
+        r.read(&mut o[..100]);
+        r.read(&mut o[100..170]);
+        r.read(&mut o[170..]);
+        assert_eq!(o[160..176], from_hex::<16>("aee7eef47cb0fca9767be1fda69419df"));
+        assert_eq!(o[330..336], from_hex::<6>("aff268e0b170"));
+
+        // SHAKE256("the quick brown fox") past its 136-byte rate, two boundaries.
+        let mut y = Shake256::new();
+        y.update(b"the quick brown fox");
+        let mut r2 = y.finalize_xof();
+        let mut o2 = [0u8; 300];
+        r2.read(&mut o2);
+        assert_eq!(o2[130..146], from_hex::<16>("86ad97a43bc8a29bc2c78a9e848769e2"));
+        assert_eq!(o2[266..282], from_hex::<16>("9fa475b09da0ad5ce765ae1e2a9edd56"));
+    }
+
     // Incremental reads must concatenate into the same stream as one big read.
     #[test]
     fn incremental_read_matches() {
