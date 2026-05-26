@@ -16,6 +16,11 @@ pub(crate) const MAX_FRAGMENT: usize = (1 << 14) + 256;
 /// One parsed record: its content type, fragment, and total wire length.
 pub(crate) struct ParsedRecord<'a> {
     pub(crate) content_type: ContentType,
+    /// Record-layer `legacy_version`. RFC 5246 §6.2.1 / RFC 8446 §5.1 leave
+    /// this field nominally version-specific but in practice it is always
+    /// 0x0301..=0x0303 on the wire; pre-1.2 codepoints (`0x0300` SSL 3.0 and
+    /// below) are explicit downgrade attempts and are rejected upstream.
+    pub(crate) version: u16,
     pub(crate) fragment: &'a [u8],
     /// Total bytes consumed (header + fragment).
     pub(crate) len: usize,
@@ -23,11 +28,18 @@ pub(crate) struct ParsedRecord<'a> {
 
 /// Attempts to parse one record from the front of `buf`. Returns `Ok(None)` if
 /// more bytes are needed.
+///
+/// The record `legacy_version` field is returned but not validated here so
+/// that this helper stays useful for both TLS 1.2 and TLS 1.3 record paths.
+/// Each protocol path applies its own version filter via
+/// [`is_legal_record_version`] — TLS 1.2 / 1.3 accept `0x0301..=0x0303` and
+/// reject anything else (notably SSL 3.0, `0x0300`).
 pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedRecord<'_>>, Error> {
     if buf.len() < 5 {
         return Ok(None);
     }
     let content_type = ContentType::from_u8(buf[0]);
+    let version = u16::from_be_bytes([buf[1], buf[2]]);
     let len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
     if len > MAX_FRAGMENT {
         return Err(Error::Decode);
@@ -38,9 +50,18 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedRecord<'_>>, Error>
     }
     Ok(Some(ParsedRecord {
         content_type,
+        version,
         fragment: &buf[5..total],
         len: total,
     }))
+}
+
+/// Returns `true` iff `version` is a record-layer `legacy_version` we accept.
+/// RFC 5246 / RFC 8446: TLS 1.2 and 1.3 mandate the record header carry
+/// `0x0301`, `0x0302`, or `0x0303`; SSL 3.0 (`0x0300`) and unknown codepoints
+/// are downgrade attempts and rejected with `protocol_version`.
+pub(crate) fn is_legal_record_version(version: u16) -> bool {
+    matches!(version, 0x0301..=0x0303)
 }
 
 /// Writes a record (header + `fragment`) to `out`.
@@ -75,11 +96,28 @@ mod tests {
 
         let rec = read_record(&out).unwrap().unwrap();
         assert_eq!(rec.content_type, ContentType::Handshake);
+        assert_eq!(rec.version, 0x0303);
         assert_eq!(rec.fragment, b"hello");
         assert_eq!(rec.len, out.len());
 
         // A truncated buffer needs more data.
         assert!(read_record(&out[..4]).unwrap().is_none());
         assert!(read_record(&out[..7]).unwrap().is_none());
+    }
+
+    #[test]
+    fn record_version_filter() {
+        // TLS 1.0 / 1.1 / 1.2 record versions: accept.
+        assert!(is_legal_record_version(0x0301));
+        assert!(is_legal_record_version(0x0302));
+        assert!(is_legal_record_version(0x0303));
+        // SSL 3.0 and earlier: reject (downgrade attempts).
+        assert!(!is_legal_record_version(0x0300));
+        assert!(!is_legal_record_version(0x0200));
+        // TLS 1.3 wire version is 0x0303 in the record header (the real version
+        // lives in `supported_versions`), so 0x0304 should never appear here.
+        assert!(!is_legal_record_version(0x0304));
+        // Garbage.
+        assert!(!is_legal_record_version(0xFFFF));
     }
 }

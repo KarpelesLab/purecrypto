@@ -86,6 +86,11 @@ fn read_random(c: &mut ReadCursor<'_>) -> Result<Random, Error> {
 /// A `ClientHello` handshake message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ClientHello {
+    /// `legacy_version` from the wire (typically `0x0303`). A TLS 1.3 client's
+    /// CH still carries `0x0303` here, with the *real* offered versions in
+    /// `supported_versions`. We expose it so the TLS 1.2 server can reject any
+    /// codepoint below 0x0303 outright (RFC 5246 §E.1: downgrade probes).
+    pub(crate) legacy_version: u16,
     pub(crate) random: Random,
     pub(crate) session_id: Vec<u8>,
     pub(crate) cipher_suites: Vec<CipherSuite>,
@@ -98,7 +103,7 @@ impl ClientHello {
         let mut out = Vec::new();
         put_u8(&mut out, hs_type::CLIENT_HELLO);
         with_len_u24(&mut out, |b| {
-            put_u16(b, 0x0303); // legacy_version = TLS 1.2
+            put_u16(b, self.legacy_version);
             b.extend_from_slice(&self.random);
             with_len_u8(b, |b| b.extend_from_slice(&self.session_id));
             with_len_u16(b, |b| {
@@ -115,7 +120,7 @@ impl ClientHello {
     /// Decodes a `ClientHello` from a handshake message body.
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
         let mut c = ReadCursor::new(body);
-        let _legacy_version = c.u16()?;
+        let legacy_version = c.u16()?;
         let random = read_random(&mut c)?;
         let session_id = c.vec_u8()?.to_vec();
         let cs_bytes = c.vec_u16()?;
@@ -128,6 +133,7 @@ impl ClientHello {
         let extensions = parse_extensions(c.vec_u16()?)?;
         c.expect_empty()?;
         Ok(ClientHello {
+            legacy_version,
             random,
             session_id,
             cipher_suites,
@@ -282,6 +288,7 @@ mod tests {
     #[test]
     fn client_hello_roundtrip() {
         let ch = ClientHello {
+            legacy_version: 0x0303,
             random: [0x11; 32],
             session_id: alloc::vec![0xab; 32],
             cipher_suites: alloc::vec![

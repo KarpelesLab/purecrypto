@@ -8,7 +8,7 @@
 //! role-specific state machines (client/server) drive it by pulling decoded
 //! messages and emitting handshake messages.
 
-use super::super::codec::{ParsedRecord, read_record, write_record};
+use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
 use super::super::crypto::{RecordCrypter, Transcript};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
@@ -188,12 +188,20 @@ impl ConnectionCore {
 
             let Some(ParsedRecord {
                 content_type,
+                version,
                 fragment,
                 len,
             }) = read_record(&self.inbuf)?
             else {
                 return Ok(None);
             };
+            // RFC 8446 §5.1: every record header carries `legacy_version`
+            // 0x0303, but for compatibility with peers that emit 0x0301 on the
+            // initial ClientHello we accept 0x0301..=0x0303. Anything else is
+            // an SSL 3.0 / unknown downgrade attempt.
+            if !is_legal_record_version(version) {
+                return Err(Error::UnsupportedVersion);
+            }
             let fragment = fragment.to_vec();
             self.inbuf.drain(..len);
 

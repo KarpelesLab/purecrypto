@@ -19,7 +19,7 @@ pub(crate) use handshake12::{
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
 #[allow(unused_imports)]
-pub(crate) use record::{ParsedRecord, read_record, write_record};
+pub(crate) use record::{ParsedRecord, is_legal_record_version, read_record, write_record};
 
 use super::Error;
 use alloc::vec::Vec;

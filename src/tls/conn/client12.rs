@@ -30,7 +30,7 @@
 //! [`crate::tls::crypto::aead12::RecordCrypter12`] instances. This isolates
 //! the two protocol paths cleanly.
 
-use super::super::codec::{ParsedRecord, read_record, write_record};
+use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
 use super::client::{ClientCertConfig, ClientKey};
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -93,6 +93,19 @@ pub struct ClientConfig12 {
     /// `session_ticket` extension. `None` advertises ticket support but
     /// presents no ticket (fresh full handshake).
     pub session: Option<StoredSession12>,
+    /// RFC 7507: when `true`, prepend the `TLS_FALLBACK_SCSV` pseudo-suite
+    /// (`0x5600`) to the offered cipher-suite list. Set this **only** when the
+    /// caller is explicitly downgrading from a higher TLS version after a
+    /// previous attempt failed — a fresh TLS 1.2 client must NOT send it, or
+    /// 1.3-aware servers will (correctly) abort with `inappropriate_fallback`.
+    /// Default `false`.
+    pub send_fallback_scsv: bool,
+    /// RFC 8446 §4.1.3 downgrade-sentinel acceptance. When `false` (default),
+    /// the client aborts with `IllegalParameter` if the last 8 bytes of
+    /// `server_random` are the 1.3-↓-1.2 or 1.1-↓-1.0 sentinels. Set to `true`
+    /// **only** in a deliberate-fallback flow where the higher-version probe
+    /// has already failed and the caller has chosen to accept the downgrade.
+    pub accept_downgrade_sentinel: bool,
 }
 
 impl ClientConfig12 {
@@ -108,6 +121,8 @@ impl ClientConfig12 {
             signature_policy: SignaturePolicy::modern(),
             client_cert: None,
             session: None,
+            send_fallback_scsv: false,
+            accept_downgrade_sentinel: false,
         }
     }
 
@@ -151,7 +166,39 @@ impl ClientConfig12 {
         self.session = Some(session);
         self
     }
+
+    /// RFC 7507: enable/disable emitting `TLS_FALLBACK_SCSV` (`0x5600`).
+    /// Default is `false`. Use this only when the caller has deliberately
+    /// downgraded to TLS 1.2 after a prior higher-version attempt failed.
+    pub fn with_fallback_scsv(mut self, enabled: bool) -> Self {
+        self.send_fallback_scsv = enabled;
+        self
+    }
+
+    /// RFC 8446 §4.1.3: when `true`, the client will accept a `server_random`
+    /// whose last 8 bytes match the version-downgrade sentinel instead of
+    /// aborting with `illegal_parameter`. Default is `false`.
+    pub fn with_accept_downgrade_sentinel(mut self, enabled: bool) -> Self {
+        self.accept_downgrade_sentinel = enabled;
+        self
+    }
 }
+
+/// RFC 8446 §4.1.3 downgrade sentinels — the final 8 bytes of `server_random`
+/// a TLS 1.3-aware server sets to flag that it has downgraded the connection.
+///
+/// * `DOWNGRADE_SENTINEL_TLS12` — server downgraded from 1.3 to 1.2.
+/// * `DOWNGRADE_SENTINEL_TLS11_OR_BELOW` — server downgraded from 1.3 to 1.1
+///   / 1.0. We never accept those versions ourselves, but include the value so
+///   the client can still detect and reject a misbehaving peer that returned
+///   such a marker in a 1.2 SH.
+pub(crate) const DOWNGRADE_SENTINEL_TLS12: [u8; 8] =
+    [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
+pub(crate) const DOWNGRADE_SENTINEL_TLS11_OR_BELOW: [u8; 8] =
+    [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00];
+
+/// RFC 7507 §4: the `TLS_FALLBACK_SCSV` pseudo-suite codepoint.
+pub(crate) const TLS_FALLBACK_SCSV: u16 = 0x5600;
 
 /// A resumable session for the TLS 1.2 client (RFC 5077). Persist this
 /// across connections; pass it back via [`ClientConfig12::with_session`] to
@@ -324,6 +371,10 @@ pub struct ClientConnection12 {
     /// `true` while ChangeCipherSpec is allowed (between CH and the server's
     /// Finished). Closed once we transition to `Connected`.
     ccs_window_open: bool,
+    /// Set when the server's ChangeCipherSpec has been processed. A second
+    /// CCS in the same handshake direction is a protocol violation (RFC 5246
+    /// §7.1 allows exactly one).
+    ccs_received: bool,
 
     /// Ephemeral X25519 private key (used when the server picks X25519).
     x25519: X25519PrivateKey,
@@ -427,6 +478,7 @@ impl ClientConnection12 {
             app_in: Vec::new(),
             transcript: Transcript::new(),
             ccs_window_open: true,
+            ccs_received: false,
             x25519,
             p256,
             client_random: random,
@@ -494,10 +546,24 @@ impl ClientConnection12 {
             .unwrap_or(&[]);
         extensions.push(ext::session_ticket(ticket_bytes));
 
+        // RFC 7507 §4: caller opted into emitting `TLS_FALLBACK_SCSV`
+        // (`0x5600`) to flag a deliberate downgrade. Prepend it to the wire
+        // suite list; it never enters `self.offered_suites` (which is the
+        // server-echo whitelist), so a server that mis-echoes 0x5600 in its
+        // SH still gets rejected.
+        let mut cipher_suites_wire: Vec<CipherSuite> = Vec::with_capacity(suites.len() + 1);
+        if self.config.send_fallback_scsv {
+            cipher_suites_wire.push(CipherSuite(TLS_FALLBACK_SCSV));
+        }
+        cipher_suites_wire.extend_from_slice(suites);
+
+        // RFC 5246 §7.4.1.2: TLS 1.2 ClientHello carries `legacy_version =
+        // 0x0303`.
         ClientHello {
+            legacy_version: 0x0303,
             random: self.client_random,
             session_id: Vec::new(),
-            cipher_suites: suites.to_vec(),
+            cipher_suites: cipher_suites_wire,
             extensions,
         }
         .encode()
@@ -681,12 +747,19 @@ impl ClientConnection12 {
 
             let Some(ParsedRecord {
                 content_type,
+                version,
                 fragment,
                 len,
             }) = read_record(&self.inbuf)?
             else {
                 return Ok(None);
             };
+            // RFC 5246 §6.2.1 / RFC 8446 §5.1: the record `legacy_version`
+            // field is `0x0301..=0x0303`. SSL 3.0 (`0x0300`) and unknown
+            // versions are downgrade attempts — reject with `protocol_version`.
+            if !is_legal_record_version(version) {
+                return Err(Error::UnsupportedVersion);
+            }
             // Snapshot the 5-byte header for the decrypt AAD before we drain.
             let mut header = [0u8; 5];
             header.copy_from_slice(&self.inbuf[..5]);
@@ -700,6 +773,11 @@ impl ClientConnection12 {
                     // server's CCS installs the read crypter; subsequent
                     // records on the wire are encrypted.
                     if !self.ccs_window_open || fragment.as_slice() != [0x01] {
+                        return Err(Error::UnexpectedMessage);
+                    }
+                    // RFC 5246 §7.1: exactly one CCS per direction. A second
+                    // CCS here is a protocol violation regardless of state.
+                    if self.ccs_received {
                         return Err(Error::UnexpectedMessage);
                     }
                     // Both fresh and resumed paths park the inbound crypter
@@ -716,6 +794,7 @@ impl ClientConnection12 {
                         }
                         _ => return Err(Error::UnexpectedMessage),
                     }
+                    self.ccs_received = true;
                     continue;
                 }
                 ContentType::Handshake => {
@@ -780,6 +859,15 @@ impl ClientConnection12 {
         let mut c = ReadCursor::new(&msg);
         let (msg_type, body) = read_handshake(&mut c)?;
 
+        // RFC 5246 §7.4.1.1: `HelloRequest` is a renegotiation prompt. We do
+        // not support renegotiation — reject it whatever the current state.
+        // (Both before and after the handshake completes: a server that
+        // emits it mid-flight is misbehaving; one that emits it after we
+        // reach `Connected` is requesting renegotiation, which we refuse.)
+        if msg_type == hs_type::HELLO_REQUEST {
+            return Err(Error::UnexpectedMessage);
+        }
+
         match self.state {
             State::WaitServerHello => self.on_server_hello(msg_type, body, &msg),
             State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
@@ -808,7 +896,22 @@ impl ClientConnection12 {
             return Err(Error::UnsupportedVersion);
         }
 
-        // Selected suite must be one we offered AND one we recognise.
+        // RFC 8446 §4.1.3: a TLS-1.3-aware server that downgraded to TLS 1.2
+        // (or 1.1) sets the last 8 bytes of `server_random` to a sentinel.
+        // Our default 1.2 client never offers TLS 1.3, so seeing a sentinel
+        // here means we're either talking to a misconfigured server or are
+        // part of a fallback chain that hasn't opted in. Reject unless the
+        // caller explicitly enabled `accept_downgrade_sentinel`.
+        let tail: &[u8] = &sh.random[24..];
+        let sentinel_seen =
+            tail == DOWNGRADE_SENTINEL_TLS12 || tail == DOWNGRADE_SENTINEL_TLS11_OR_BELOW;
+        if sentinel_seen && !self.config.accept_downgrade_sentinel {
+            return Err(Error::IllegalParameter);
+        }
+
+        // Selected suite must be one we offered AND one we recognise. (The
+        // SCSV pseudo-suite 0x5600 is never in `offered_suites`, so a server
+        // echoing it as the selected suite gets rejected here.)
         if !self.offered_suites.contains(&sh.cipher_suite) {
             return Err(Error::HandshakeFailure);
         }
