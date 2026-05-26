@@ -14,6 +14,7 @@ pub mod client12;
 mod cookie;
 mod reassembly;
 mod record;
+mod record13;
 mod reliability;
 mod replay;
 pub mod server12;
