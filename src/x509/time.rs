@@ -113,7 +113,6 @@ impl Time {
         encode_string(tag::UTC_TIME, &self.repr)
     }
 
-
     /// Parses the stored ASN.1 time into chronologically sortable components
     /// `(year, month, day, hour, minute, second)`. Handles both `UTCTime`
     /// (`YYMMDDHHMMSSZ`, with the RFC 5280 1950–2049 century rule) and

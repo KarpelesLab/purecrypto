@@ -15,8 +15,8 @@ use std::fmt;
 use crate::toml::{self, TomlError, TomlTable, TomlValue};
 use purecrypto::x509::extension::{
     Extension, GeneralName, KeyUsageBits, authority_key_identifier, basic_constraints,
-    certificate_policies, crl_distribution_points, extended_key_usage, key_usage,
-    name_constraints, subject_alt_name, subject_key_identifier,
+    certificate_policies, crl_distribution_points, extended_key_usage, key_usage, name_constraints,
+    subject_alt_name, subject_key_identifier,
 };
 use purecrypto::x509::oid;
 
@@ -123,11 +123,13 @@ impl CertTemplate {
     /// Loads a template from a TOML string.
     pub(crate) fn from_toml(s: &str) -> Result<Self, TemplateError> {
         let root = toml::parse(s).map_err(TemplateError::Toml)?;
-        let mut t = CertTemplate::default();
         // Default: AKI/SKI on, key_usage_critical = true.
-        t.key_usage_critical = true;
-        t.include_ski = true;
-        t.include_aki = true;
+        let mut t = CertTemplate {
+            key_usage_critical: true,
+            include_ski: true,
+            include_aki: true,
+            ..CertTemplate::default()
+        };
 
         for (key, value) in &root {
             match key.as_str() {
@@ -250,16 +252,20 @@ impl CertTemplate {
             out.push(ext);
         }
         if !self.extended_key_usage.is_empty() {
-            let oid_slices: Vec<&[u64]> = self.extended_key_usage.iter().map(|v| v.as_slice()).collect();
+            let oid_slices: Vec<&[u64]> = self
+                .extended_key_usage
+                .iter()
+                .map(|v| v.as_slice())
+                .collect();
             out.push(extended_key_usage(&oid_slices));
         }
 
         // SAN: from-CSR list (if requested) ⊎ explicit list.
         let mut all_sans: Vec<GeneralName> = Vec::new();
-        if self.san_from_csr {
-            if let Some(extra) = csr_sans {
-                all_sans.extend(extra.iter().cloned());
-            }
+        if self.san_from_csr
+            && let Some(extra) = csr_sans
+        {
+            all_sans.extend(extra.iter().cloned());
         }
         for n in &self.san_explicit {
             if !all_sans.contains(n) {
@@ -276,8 +282,7 @@ impl CertTemplate {
         if self.include_aki && !issuer_ski.is_empty() {
             out.push(authority_key_identifier(issuer_ski));
         }
-        if !self.name_constraints_permitted.is_empty()
-            || !self.name_constraints_excluded.is_empty()
+        if !self.name_constraints_permitted.is_empty() || !self.name_constraints_excluded.is_empty()
         {
             out.push(name_constraints(
                 &self.name_constraints_permitted,
@@ -299,35 +304,31 @@ impl CertTemplate {
 // --- TOML field plumbing ---------------------------------------------------
 
 fn require_string<'a>(v: &'a TomlValue, field: &str) -> Result<&'a str, TemplateError> {
-    v.as_str()
-        .ok_or_else(|| TemplateError::BadValue {
-            field: field.into(),
-            reason: "expected a string".into(),
-        })
+    v.as_str().ok_or_else(|| TemplateError::BadValue {
+        field: field.into(),
+        reason: "expected a string".into(),
+    })
 }
 
 fn require_int(v: &TomlValue, field: &str) -> Result<i64, TemplateError> {
-    v.as_int()
-        .ok_or_else(|| TemplateError::BadValue {
-            field: field.into(),
-            reason: "expected an integer".into(),
-        })
+    v.as_int().ok_or_else(|| TemplateError::BadValue {
+        field: field.into(),
+        reason: "expected an integer".into(),
+    })
 }
 
 fn require_table<'a>(v: &'a TomlValue, field: &str) -> Result<&'a TomlTable, TemplateError> {
-    v.as_table()
-        .ok_or_else(|| TemplateError::BadValue {
-            field: field.into(),
-            reason: "expected a table".into(),
-        })
+    v.as_table().ok_or_else(|| TemplateError::BadValue {
+        field: field.into(),
+        reason: "expected a table".into(),
+    })
 }
 
 fn require_array<'a>(v: &'a TomlValue, field: &str) -> Result<&'a [TomlValue], TemplateError> {
-    v.as_array()
-        .ok_or_else(|| TemplateError::BadValue {
-            field: field.into(),
-            reason: "expected an array".into(),
-        })
+    v.as_array().ok_or_else(|| TemplateError::BadValue {
+        field: field.into(),
+        reason: "expected an array".into(),
+    })
 }
 
 fn bool_field(tbl: &TomlTable, key: &str, default: bool) -> Result<bool, TemplateError> {
@@ -341,10 +342,7 @@ fn bool_field(tbl: &TomlTable, key: &str, default: bool) -> Result<bool, Templat
     }
 }
 
-fn string_array_field(
-    tbl: &TomlTable,
-    key: &str,
-) -> Result<Vec<String>, TemplateError> {
+fn string_array_field(tbl: &TomlTable, key: &str) -> Result<Vec<String>, TemplateError> {
     match tbl.get(key) {
         None => Ok(Vec::new()),
         Some(v) => {
@@ -421,15 +419,12 @@ fn parse_key_usage(tbl: &TomlTable) -> Result<(KeyUsageBits, bool), TemplateErro
             bits |= *b;
         }
     }
-    for (k, _) in tbl {
+    for k in tbl.keys() {
         if k == "critical" {
             continue;
         }
         if !pairs.iter().any(|(known, _)| known == k) {
-            return bad(
-                &format!("key_usage.{k}"),
-                "unknown key_usage flag",
-            );
+            return bad(&format!("key_usage.{k}"), "unknown key_usage flag");
         }
     }
     Ok((bits, critical))
@@ -453,15 +448,12 @@ fn parse_eku(tbl: &TomlTable) -> Result<Vec<Vec<u64>>, TemplateError> {
     for raw in string_array_field(tbl, "additional")? {
         out.push(parse_oid_arcs(&raw, "extended_key_usage.additional")?);
     }
-    for (k, _) in tbl {
+    for k in tbl.keys() {
         if k == "additional" {
             continue;
         }
         if !named.iter().any(|(known, _)| known == k) {
-            return bad(
-                &format!("extended_key_usage.{k}"),
-                "unknown EKU flag",
-            );
+            return bad(&format!("extended_key_usage.{k}"), "unknown EKU flag");
         }
     }
     Ok(out)
@@ -535,9 +527,7 @@ fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
         full.push(u16::from_str_radix(g, 16).ok()?);
     }
     let zeros = 8 - head_groups.len() - tail_groups.len();
-    for _ in 0..zeros {
-        full.push(0);
-    }
+    full.resize(full.len() + zeros, 0);
     for g in &tail_groups {
         full.push(u16::from_str_radix(g, 16).ok()?);
     }
@@ -661,8 +651,9 @@ digital_signature = true
 "#,
         )
         .unwrap();
-        let t =
-            CertTemplate::resolve(Some("tls-server"), Some(tmp.to_str().unwrap())).unwrap().unwrap();
+        let t = CertTemplate::resolve(Some("tls-server"), Some(tmp.to_str().unwrap()))
+            .unwrap()
+            .unwrap();
         assert_eq!(t.default_days, Some(90));
         assert!(!t.key_usage_critical);
         let _ = std::fs::remove_file(&tmp);

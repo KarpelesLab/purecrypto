@@ -99,7 +99,9 @@ fn load_root_cert(ca: &CaDir) -> Certificate {
     Certificate::from_pem(&pem).unwrap_or_else(|e| die(format!("bad root.crt: {e}")))
 }
 
-/// Loads `DIR/root.key` as one of the supported algorithms.
+/// Loads `DIR/root.key` as one of the supported algorithms. One instance
+/// per `ca` invocation, so the variant-size disparity is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum RootKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
@@ -230,10 +232,7 @@ fn run_init(args: Args) {
     let spki_bits = spki_bit_string_contents(&pubkey);
     let exts: Vec<Extension> = root_tmpl.extensions(None, &[], &spki_bits);
     let cert = Certificate::self_signed_with_extensions(
-        &signer,
-        &subject,
-        &validity,
-        1, // CA serial = 1
+        &signer, &subject, &validity, 1, // CA serial = 1
         &exts,
     )
     .unwrap_or_else(|e| die(format!("cannot self-sign CA: {e}")));
@@ -244,7 +243,7 @@ fn run_init(args: Args) {
         key_pem.as_bytes(),
         true,
     );
-    std::fs::write(&ca.root_crt(), cert.to_pem())
+    std::fs::write(ca.root_crt(), cert.to_pem())
         .unwrap_or_else(|e| die(format!("cannot write root.crt: {e}")));
     write_string(&ca.serial(), "2\n");
     // Touch the JSONL files so they exist with valid mode.
@@ -286,12 +285,10 @@ fn run_issue(args: Args) {
     // Template resolution: explicit -template wins; -ca is short-hand for
     // ca-intermediate; otherwise the (per-arg) -days/-sans drive a plain
     // issuance with no v3 extension policy beyond basicConstraints + SAN.
-    let template_name = args.value("-template").or_else(|| {
-        if is_ca_flag {
-            Some("ca-intermediate")
-        } else {
-            None
-        }
+    let template_name = args.value("-template").or(if is_ca_flag {
+        Some("ca-intermediate")
+    } else {
+        None
     });
     let template = CertTemplate::resolve(template_name, args.value("-template-file"))
         .unwrap_or_else(|e| die(format!("template error: {e}")));
@@ -299,7 +296,11 @@ fn run_issue(args: Args) {
     let days_n = args
         .value("-days")
         .map(|d| d.parse::<u64>().unwrap_or_else(|_| die("invalid -days")))
-        .or_else(|| template.as_ref().and_then(|t| t.default_days.map(|d| d as u64)))
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t.default_days.map(|d| d as u64))
+        })
         .unwrap_or(365);
 
     let raw = read_bytes(Path::new(pub_path));
@@ -329,12 +330,8 @@ fn run_issue(args: Args) {
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
         let subj_spki_bits = spki_bit_string_contents(&subject_key);
-        let csr_sans: Vec<GeneralName> = sans
-            .iter()
-            .map(|s| GeneralName::Dns(s.clone()))
-            .collect();
-        let exts: Vec<Extension> =
-            tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
+        let csr_sans: Vec<GeneralName> = sans.iter().map(|s| GeneralName::Dns(s.clone())).collect();
+        let exts: Vec<Extension> = tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
         Certificate::issue_with_extensions(
             &root_key.signer(),
             &issuer_dn,
@@ -393,12 +390,10 @@ fn run_sign_csr(args: Args) {
         .unwrap_or_else(|| die("missing -in <csr.pem>"));
     let is_ca_flag = args.flag("-ca") || args.flag("--ca");
 
-    let template_name = args.value("-template").or_else(|| {
-        if is_ca_flag {
-            Some("ca-intermediate")
-        } else {
-            None
-        }
+    let template_name = args.value("-template").or(if is_ca_flag {
+        Some("ca-intermediate")
+    } else {
+        None
     });
     let template = CertTemplate::resolve(template_name, args.value("-template-file"))
         .unwrap_or_else(|e| die(format!("template error: {e}")));
@@ -406,13 +401,16 @@ fn run_sign_csr(args: Args) {
     let days_n = args
         .value("-days")
         .map(|d| d.parse::<u64>().unwrap_or_else(|_| die("invalid -days")))
-        .or_else(|| template.as_ref().and_then(|t| t.default_days.map(|d| d as u64)))
+        .or_else(|| {
+            template
+                .as_ref()
+                .and_then(|t| t.default_days.map(|d| d as u64))
+        })
         .unwrap_or(365);
 
     let raw = read_bytes(Path::new(csr_path));
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("CSR is not PEM"));
-    let csr =
-        CertificationRequest::from_pem(pem).unwrap_or_else(|e| die(format!("bad CSR: {e}")));
+    let csr = CertificationRequest::from_pem(pem).unwrap_or_else(|e| die(format!("bad CSR: {e}")));
 
     let root_key = load_root_key(&ca);
     let root_cert = load_root_cert(&ca);
@@ -442,8 +440,7 @@ fn run_sign_csr(args: Args) {
             .iter()
             .map(|s| GeneralName::Dns(s.clone()))
             .collect();
-        let exts: Vec<Extension> =
-            tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
+        let exts: Vec<Extension> = tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
         Certificate::issue_with_extensions(
             &root_key.signer(),
             &issuer_dn,
@@ -633,7 +630,11 @@ fn run_crl(args: Args) {
     if let Some(out) = args.value("-out") {
         write_output(Some(out), pem.as_bytes());
     } else {
-        println!("wrote {} ({} revocations)", ca.crl_pem().display(), rows.len());
+        println!(
+            "wrote {} ({} revocations)",
+            ca.crl_pem().display(),
+            rows.len()
+        );
     }
 }
 
@@ -643,7 +644,10 @@ fn run_crl(args: Args) {
 fn run_show(args: Args) {
     let ca = ca_dir(&args);
     if !ca.root_crt().exists() {
-        die(format!("no CA at {}: run `ca init` first", ca.dir.display()));
+        die(format!(
+            "no CA at {}: run `ca init` first",
+            ca.dir.display()
+        ));
     }
     let cert = load_root_cert(&ca);
     let subject = cert
@@ -657,12 +661,12 @@ fn run_show(args: Args) {
     } else {
         "?".into()
     };
-    let issued = std::fs::read_to_string(&ca.issued())
+    let issued = std::fs::read_to_string(ca.issued())
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.trim().is_empty())
         .count();
-    let revoked = std::fs::read_to_string(&ca.revoked())
+    let revoked = std::fs::read_to_string(ca.revoked())
         .unwrap_or_default()
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -695,7 +699,10 @@ fn run_show(args: Args) {
         }
     }
     // The _validity is just to keep compilers happy when unused.
-    let _ = Validity::new(Time::utc(2024, 1, 1, 0, 0, 0), Time::utc(2034, 1, 1, 0, 0, 0));
+    let _ = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
 }
 
 // ---------------------------------------------------------------------------

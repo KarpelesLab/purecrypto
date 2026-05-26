@@ -92,6 +92,13 @@ impl ReplayWindow {
 }
 
 /// The server's signing key, used to sign the `CertificateVerify`.
+///
+/// The PQ variants (`MlDsa*`) carry their full key material inline. Since
+/// this enum exists once per `ServerConfig` (effectively per server
+/// instance), the variant-size disparity flagged by `clippy::
+/// large_enum_variant` is a non-issue — boxing would add a heap
+/// indirection on every signing call without meaningful savings.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ServerKey {
     /// An RSA key; signs with `rsa_pss_rsae_sha256`.
     Rsa(BoxedRsaPrivateKey),
@@ -734,12 +741,11 @@ impl<R: RngCore> ServerConnection<R> {
         // 86 / `inappropriate_fallback` description.
         const TLS_FALLBACK_SCSV: super::super::codec::CipherSuite =
             super::super::codec::CipherSuite(0x5600);
-        if ch.cipher_suites.contains(&TLS_FALLBACK_SCSV) {
-            if let Some(sv_ext) = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
-                && ext::client_offers_tls13(sv_ext).unwrap_or(false)
-            {
-                return Err(Error::IllegalParameter);
-            }
+        if ch.cipher_suites.contains(&TLS_FALLBACK_SCSV)
+            && let Some(sv_ext) = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
+            && ext::client_offers_tls13(sv_ext).unwrap_or(false)
+        {
+            return Err(Error::IllegalParameter);
         }
 
         // PSK resumption: process pre_shared_key + psk_key_exchange_modes

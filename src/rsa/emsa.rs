@@ -170,17 +170,20 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     let bad_choice = crate::ct::Choice::from(fold & 1);
 
     let mut out = Vec::with_capacity(expected_len);
-    for i in 0..expected_len {
+    for (i, &fallback_byte) in fallback.iter().enumerate() {
         // The "real" byte is em[real_start + i] when it exists. Because
         // real_start + i may exceed em.len() if the padding is bad, we clamp
         // to a valid index unconditionally; the resulting byte is suppressed
         // by the conditional select.
         let idx = real_start.saturating_add(i).min(em.len().saturating_sub(1));
         let real_byte = em[idx];
-        let fallback_byte = fallback[i];
         // `conditional_select(a, b, choice)` returns `a` iff `choice`; we want
         // the fallback when padding was bad, otherwise the real byte.
-        out.push(u8::conditional_select(&fallback_byte, &real_byte, bad_choice));
+        out.push(u8::conditional_select(
+            &fallback_byte,
+            &real_byte,
+            bad_choice,
+        ));
     }
     Ok(out)
 }

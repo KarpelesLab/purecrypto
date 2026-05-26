@@ -462,8 +462,9 @@ impl<R: RngCore> ServerConnection12<R> {
                             self.state = State::Closed;
                             return Ok(());
                         }
-                        AlertDescription::UserCanceled
-                        | AlertDescription::NoRenegotiation => continue,
+                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation => {
+                            continue;
+                        }
                         _ => return Err(Error::AlertReceived(alert.description)),
                     }
                 }

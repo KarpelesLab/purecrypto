@@ -752,9 +752,7 @@ mod tests {
         let exts = crate::x509::cert::legacy_extensions(true, &[]);
         let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &algid, &exts);
         let sig = key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
-        let der = encode_sequence(
-            &[tbs.clone(), algid.clone(), encode_bit_string(&sig)].concat(),
-        );
+        let der = encode_sequence(&[tbs.clone(), algid.clone(), encode_bit_string(&sig)].concat());
         let legacy = Certificate::from_der(der).unwrap();
 
         let mut store = RootCertStore::new();
@@ -866,14 +864,8 @@ mod tests {
         crls.add_der(crl.to_der().to_vec()).unwrap();
 
         // The OK leaf still validates.
-        verify_chain_with_crls(
-            &store,
-            &crls,
-            &[leaf_ok.to_der().to_vec()],
-            None,
-            &policy(),
-        )
-        .unwrap();
+        verify_chain_with_crls(&store, &crls, &[leaf_ok.to_der().to_vec()], None, &policy())
+            .unwrap();
         // The revoked leaf is rejected.
         assert!(matches!(
             verify_chain_with_crls(
@@ -994,14 +986,7 @@ mod tests {
         let mut crls = CrlStore::new();
         crls.add_der(crl.to_der().to_vec()).unwrap();
 
-        verify_chain_with_crls(
-            &store,
-            &crls,
-            &[leaf.to_der().to_vec()],
-            None,
-            &policy(),
-        )
-        .unwrap();
+        verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &policy()).unwrap();
     }
 
     /// A chain whose signature algorithm is in the registry but not on the

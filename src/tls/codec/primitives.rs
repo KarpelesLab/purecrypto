@@ -62,12 +62,15 @@ u16_id!(
 u16_id!(
     /// A signature scheme (RFC 8446 §4.2.3).
     SignatureScheme {
-        /// rsa_pkcs1_sha256.
+        /// rsa_pkcs1_sha256 (RFC 8446 §4.4.3 forbids in `CertificateVerify`,
+        /// retained for the wire-level rejection check in [`Self::is_rsa_pkcs1`]).
         RSA_PKCS1_SHA256 = 0x0401,
         /// ecdsa_secp256r1_sha256.
         ECDSA_SECP256R1_SHA256 = 0x0403,
-        /// rsa_pkcs1_sha384.
+        /// rsa_pkcs1_sha384 (same rationale as `RSA_PKCS1_SHA256`).
         RSA_PKCS1_SHA384 = 0x0501,
+        /// rsa_pkcs1_sha512 (same rationale).
+        RSA_PKCS1_SHA512 = 0x0601,
         /// ecdsa_secp384r1_sha384.
         ECDSA_SECP384R1_SHA384 = 0x0503,
         /// ecdsa_secp521r1_sha512.
@@ -95,7 +98,10 @@ impl SignatureScheme {
     /// these schemes in TLS 1.3 `CertificateVerify`; they may appear only
     /// in `signature_algorithms_cert` for chain signatures.
     pub(crate) fn is_rsa_pkcs1(self) -> bool {
-        matches!(self.0, 0x0401 | 0x0501 | 0x0601)
+        matches!(
+            self,
+            Self::RSA_PKCS1_SHA256 | Self::RSA_PKCS1_SHA384 | Self::RSA_PKCS1_SHA512
+        )
     }
 }
 

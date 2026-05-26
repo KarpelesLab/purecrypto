@@ -183,7 +183,6 @@ fn raw_private_blinded<const LIMBS: usize>(
     modulus.mul_mod(&m_blind, &r_inv)
 }
 
-
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// Creates a public key from a modulus and exponent.
     pub fn new(n: Uint<LIMBS>, e: Uint<LIMBS>) -> Self {
@@ -355,11 +354,7 @@ mod tests {
         // blinded `raw` path against an unblinded one we synthesize from
         // `from_components` (which has phi_n_minus_1 == 0 and skips blinding).
         let key = crate::test_util::rsa_test_key_a();
-        let (n, e, d) = (
-            *key.modulus(),
-            *key.exponent(),
-            *key.private_exponent(),
-        );
+        let (n, e, d) = (*key.modulus(), *key.exponent(), *key.private_exponent());
         let unblinded = RsaPrivateKey::<32>::from_components(n, e, d);
 
         // Construct an arbitrary `c < n`.

@@ -67,10 +67,7 @@ pub(crate) fn run(args: Args) {
 
     let csr = if let Some(tmpl) = template {
         // The template owns the extension policy; argv SANs are merged in.
-        let csr_sans: Vec<GeneralName> = sans
-            .iter()
-            .map(|s| GeneralName::Dns(s.clone()))
-            .collect();
+        let csr_sans: Vec<GeneralName> = sans.iter().map(|s| GeneralName::Dns(s.clone())).collect();
         // For a CSR there's no issuer SKI / subject SPKI binding needed yet:
         // the template's extensions() builder will skip SKI/AKI when those
         // inputs are empty.

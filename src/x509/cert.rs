@@ -228,7 +228,15 @@ impl Certificate {
         dns_names: &[&str],
     ) -> Result<Certificate, Error> {
         let exts = legacy_extensions(is_ca, dns_names);
-        Self::issue_with_extensions(signer, issuer, subject, subject_key, validity, serial, &exts)
+        Self::issue_with_extensions(
+            signer,
+            issuer,
+            subject,
+            subject_key,
+            validity,
+            serial,
+            &exts,
+        )
     }
 
     /// Issues a certificate carrying an arbitrary slice of v3 extensions.
@@ -272,9 +280,7 @@ impl Certificate {
         extensions: &[Extension],
     ) -> Result<Certificate, Error> {
         let key = signer.public_key();
-        Self::issue_with_extensions(
-            signer, subject, subject, &key, validity, serial, extensions,
-        )
+        Self::issue_with_extensions(signer, subject, subject, &key, validity, serial, extensions)
     }
 
     /// Issues a self-signed certificate using `signer` for both the key and the
@@ -946,14 +952,8 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
             key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
             extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
         ];
-        let cert = Certificate::self_signed_with_extensions(
-            &signer,
-            &name,
-            &validity(),
-            1,
-            &exts,
-        )
-        .unwrap();
+        let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &exts)
+            .unwrap();
         cert.check_well_formed().unwrap();
 
         // basic_constraints accessor reflects what we encoded.
@@ -961,10 +961,7 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         assert_eq!(bc, (true, Some(0)));
         // key_usage accessor sees the same wire mask.
         let ku = cert.key_usage().unwrap().unwrap();
-        assert_eq!(
-            ku,
-            (KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN).0
-        );
+        assert_eq!(ku, (KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN).0);
         // EKU survives.
         let eku = cert.extended_key_usages().unwrap();
         assert_eq!(eku, vec![oid::ID_KP_SERVER_AUTH.to_vec()]);

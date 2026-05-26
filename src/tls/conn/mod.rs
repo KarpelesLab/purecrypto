@@ -1651,9 +1651,7 @@ mod loopback_tests {
         let leaf_key = Ed25519PrivateKey::generate(&mut rng);
         let leaf_seed = [0u8; 32];
         let leaf = Certificate::issue_general(
-            &CertSigner::Rsa(
-                &BoxedRsaPrivateKey::from_pkcs1_der(&ca_key.to_pkcs1_der()).unwrap(),
-            ),
+            &CertSigner::Rsa(&BoxedRsaPrivateKey::from_pkcs1_der(&ca_key.to_pkcs1_der()).unwrap()),
             &ca_name,
             &DistinguishedName::common_name("loopback.example"),
             &crate::x509::AnyPublicKey::Ed25519(leaf_key.public_key()),
@@ -1666,7 +1664,12 @@ mod loopback_tests {
 
         let chain = alloc::vec![leaf.to_der().to_vec(), root.to_der().to_vec()];
         let cfg = ServerConfig::with_ed25519(chain, leaf_key);
-        (cfg, root.to_der().to_vec(), leaf.to_der().to_vec(), leaf_seed)
+        (
+            cfg,
+            root.to_der().to_vec(),
+            leaf.to_der().to_vec(),
+            leaf_seed,
+        )
     }
 
     /// Server staples a CRL that does NOT revoke the leaf → handshake

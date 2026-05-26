@@ -104,8 +104,7 @@ pub(crate) fn write_output_with_mode(path: Option<&str>, data: &[u8], private: b
             if private {
                 write_private_file(p, data);
             } else {
-                std::fs::write(p, data)
-                    .unwrap_or_else(|e| die(format!("cannot write {p}: {e}")));
+                std::fs::write(p, data).unwrap_or_else(|e| die(format!("cannot write {p}: {e}")));
             }
         }
         _ => {

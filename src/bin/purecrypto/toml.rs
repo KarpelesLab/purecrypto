@@ -224,7 +224,10 @@ impl<'a> Parser<'a> {
             Some(b'-') | Some(b'+') | Some(b'0'..=b'9') => self.parse_integer(),
             Some(b'\'') => self.err("literal strings ('...') are not supported"),
             Some(b'{') => self.err("inline tables are not supported"),
-            Some(c) => self.err(format!("unexpected character '{}' starting value", c as char)),
+            Some(c) => self.err(format!(
+                "unexpected character '{}' starting value",
+                c as char
+            )),
             None => self.err("unexpected end of input"),
         }
     }
@@ -355,12 +358,10 @@ impl<'a> Parser<'a> {
         let cleaned: String = raw_digits.chars().filter(|c| *c != '_').collect();
         let sign = &self.src[start..digits_start];
         let combined = format!("{sign}{cleaned}");
-        let n: i64 = combined
-            .parse()
-            .map_err(|_| TomlError {
-                message: format!("integer overflow or invalid integer: {combined}"),
-                line: self.line,
-            })?;
+        let n: i64 = combined.parse().map_err(|_| TomlError {
+            message: format!("integer overflow or invalid integer: {combined}"),
+            line: self.line,
+        })?;
         Ok(TomlValue::Int(n))
     }
 
@@ -385,9 +386,7 @@ impl<'a> Parser<'a> {
             };
             if let Some(k) = element_kind {
                 if k != kind {
-                    return self.err(format!(
-                        "mixed-type array: expected {k}, found {kind}"
-                    ));
+                    return self.err(format!("mixed-type array: expected {k}, found {kind}"));
                 }
             } else {
                 element_kind = Some(kind);
@@ -581,7 +580,7 @@ critical = true
 "#);
         assert_eq!(r["name"].as_str().unwrap(), "tls-server");
         assert_eq!(r["default_days"].as_int().unwrap(), 365);
-        assert_eq!(r["critical"].as_bool().unwrap(), true);
+        assert!(r["critical"].as_bool().unwrap());
     }
 
     #[test]
@@ -592,7 +591,7 @@ critical = true
 ca = false
 "#);
         let bc = r["basic_constraints"].as_table().unwrap();
-        assert_eq!(bc["ca"].as_bool().unwrap(), false);
+        assert!(!bc["ca"].as_bool().unwrap());
     }
 
     #[test]
@@ -640,9 +639,7 @@ x = 1
 
     #[test]
     fn parses_multiline_array() {
-        let r = t(
-            "v = [\n  \"a\",\n  \"b\",\n  \"c\",\n]\n",
-        );
+        let r = t("v = [\n  \"a\",\n  \"b\",\n  \"c\",\n]\n");
         let v = r["v"].as_array().unwrap();
         assert_eq!(v.len(), 3);
     }

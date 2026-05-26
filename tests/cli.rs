@@ -175,7 +175,14 @@ fn ca_subcommand_full_flow() {
     // CA init.
     assert!(
         run(
-            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Test CLI CA"],
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Test CLI CA"
+            ],
             b""
         )
         .1,
@@ -928,7 +935,14 @@ fn ca_template_tls_server() {
     // Root CA.
     assert!(
         run(
-            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Root CA"],
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Root CA"
+            ],
             b"",
         )
         .1,
@@ -937,7 +951,15 @@ fn ca_template_tls_server() {
     // Leaf key + pub.
     assert!(
         run(
-            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
             b""
         )
         .1
@@ -1006,7 +1028,14 @@ fn ca_template_intermediate_chain() {
     // Root CA.
     assert!(
         run(
-            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Chain Root"],
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Chain Root"
+            ],
             b"",
         )
         .1
@@ -1015,7 +1044,15 @@ fn ca_template_intermediate_chain() {
     // Intermediate keypair + pubkey extracted via pkey -pubout.
     assert!(
         run(
-            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("int.key")],
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("int.key")
+            ],
             b""
         )
         .1
@@ -1071,7 +1108,15 @@ fn req_template_csr() {
 
     assert!(
         run(
-            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
             b""
         )
         .1
@@ -1104,11 +1149,13 @@ fn req_template_csr() {
     let csr = purecrypto::x509::CertificationRequest::from_pem(&csr_pem).unwrap();
     let exts = csr.extension_requests().unwrap();
     assert!(
-        exts.iter().any(|e| e.oid == purecrypto::x509::oid::EXT_KEY_USAGE),
+        exts.iter()
+            .any(|e| e.oid == purecrypto::x509::oid::EXT_KEY_USAGE),
         "CSR should request EKU"
     );
     assert!(
-        exts.iter().any(|e| e.oid == purecrypto::x509::oid::KEY_USAGE),
+        exts.iter()
+            .any(|e| e.oid == purecrypto::x509::oid::KEY_USAGE),
         "CSR should request keyUsage"
     );
     let sans = csr.subject_alt_names().unwrap();
@@ -1126,14 +1173,29 @@ fn template_user_file_overrides_critical() {
 
     assert!(
         run(
-            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "UF Root"],
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "UF Root"
+            ],
             b"",
         )
         .1
     );
     assert!(
         run(
-            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
             b""
         )
         .1

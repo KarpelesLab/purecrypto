@@ -718,8 +718,7 @@ impl ClientConnection12 {
                             self.state = State::Closed;
                             return Ok(());
                         }
-                        AlertDescription::UserCanceled
-                        | AlertDescription::NoRenegotiation => {
+                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation => {
                             // Non-fatal warning — stay connected.
                             continue;
                         }

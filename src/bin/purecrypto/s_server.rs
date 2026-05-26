@@ -126,7 +126,9 @@ fn load_roots_file(path: &str) -> RootCertStore {
     store
 }
 
-/// Holds a private key parsed from PEM, regardless of algorithm.
+/// Holds a private key parsed from PEM, regardless of algorithm. One
+/// instance per server startup, so variant-size disparity is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum AnyKey {
     Rsa(BoxedRsaPrivateKey),
     Ecdsa(BoxedEcdsaPrivateKey),

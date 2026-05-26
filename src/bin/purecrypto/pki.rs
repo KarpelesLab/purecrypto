@@ -10,7 +10,9 @@ use purecrypto::x509::{
     AnyPublicKey, CertSigner, Certificate, DistinguishedName, Time, Validity, oid,
 };
 
-/// A loaded private key (the owner; borrow a [`CertSigner`] from it).
+/// A loaded private key (the owner; borrow a [`CertSigner`] from it). One
+/// instance per CLI invocation, so variant-size disparity is irrelevant.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrivateKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
@@ -141,9 +143,7 @@ pub(crate) fn spki_bit_string_contents(key: &AnyPublicKey) -> Vec<u8> {
     let mut r = Reader::new(&der);
     let mut spki = r.read_sequence().expect("SPKI: outer SEQUENCE");
     spki.read_sequence().expect("SPKI: AlgorithmIdentifier");
-    spki.read_bit_string()
-        .expect("SPKI: BIT STRING")
-        .to_vec()
+    spki.read_bit_string().expect("SPKI: BIT STRING").to_vec()
 }
 
 /// Returns the issuer's subjectKeyIdentifier bytes (the keyIdentifier

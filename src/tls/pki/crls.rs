@@ -72,18 +72,18 @@ impl CrlStore {
         &'a self,
         name_der: &'a [u8],
     ) -> impl Iterator<Item = &'a CertificateRevocationList> + 'a {
-        self.crls.iter().filter(move |crl| {
-            crl.issuer_der()
-                .map(|d| d == name_der)
-                .unwrap_or(false)
-        })
+        self.crls
+            .iter()
+            .filter(move |crl| crl.issuer_der().map(|d| d == name_der).unwrap_or(false))
     }
 
     /// Builds a new store containing every CRL from `self` followed by every
     /// CRL from `other`. Used to unite the connection-config CRLs with
     /// per-connection stapled CRLs at verify time.
     pub(crate) fn merged_with(&self, other: &CrlStore) -> CrlStore {
-        let mut out = CrlStore { crls: Vec::with_capacity(self.crls.len() + other.crls.len()) };
+        let mut out = CrlStore {
+            crls: Vec::with_capacity(self.crls.len() + other.crls.len()),
+        };
         out.crls.extend(self.crls.iter().cloned());
         out.crls.extend(other.crls.iter().cloned());
         out
@@ -94,9 +94,7 @@ impl CrlStore {
 mod tests {
     use super::*;
     use crate::rsa::BoxedRsaPrivateKey;
-    use crate::x509::{
-        CertSigner, CrlBuilder, DistinguishedName, Time,
-    };
+    use crate::x509::{CertSigner, CrlBuilder, DistinguishedName, Time};
 
     fn rsa_a() -> BoxedRsaPrivateKey {
         BoxedRsaPrivateKey::from_pkcs1_pem(include_str!("../../../testdata/rsa2048_test_a.pem"))

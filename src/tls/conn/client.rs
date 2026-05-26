@@ -46,6 +46,11 @@ pub struct ClientCertConfig {
 }
 
 /// The client's signing key, mirrors the server-side variants.
+///
+/// See [`ServerKey`](super::server::ServerKey) for the rationale on
+/// suppressing `clippy::large_enum_variant` — same one-instance-per-config
+/// shape, so boxing would add indirection without savings.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ClientKey {
     /// RSA-PSS. Not yet wired (requires an RNG for the PSS salt); accepted
     /// to keep the public API parallel to the server-side configuration.

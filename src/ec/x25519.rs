@@ -23,9 +23,9 @@ pub enum X25519Error {
 impl core::fmt::Display for X25519Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            X25519Error::SmallOrderPeer => f.write_str(
-                "X25519 peer public key is a small-order / contributory-failure point",
-            ),
+            X25519Error::SmallOrderPeer => {
+                f.write_str("X25519 peer public key is a small-order / contributory-failure point")
+            }
         }
     }
 }

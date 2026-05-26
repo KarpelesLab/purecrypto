@@ -80,10 +80,8 @@ pub(crate) fn run(args: Args) {
                             die("unsupported RSA size (use an even value, 512..=65536 bits)");
                         }
                         if !(args.flag("--allow-weak") || args.flag("-allow-weak")) {
-                            die(
-                                "refusing to generate an RSA key below 2048 bits — pass \
-                                 `--allow-weak` to override (NIST SP 800-57)",
-                            );
+                            die("refusing to generate an RSA key below 2048 bits — pass \
+                                 `--allow-weak` to override (NIST SP 800-57)");
                         }
                     }
                     BoxedRsaPrivateKey::generate(

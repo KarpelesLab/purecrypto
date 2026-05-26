@@ -168,7 +168,11 @@ fn decode_known_extension(e: &Extension) -> Option<String> {
                 a if a == oid::ID_KP_EMAIL_PROTECTION => "emailProtection".into(),
                 a if a == oid::ID_KP_TIME_STAMPING => "timeStamping".into(),
                 a if a == oid::ID_KP_OCSP_SIGNING => "ocspSigning".into(),
-                _ => arcs.iter().map(u64::to_string).collect::<Vec<_>>().join("."),
+                _ => arcs
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join("."),
             });
         }
         return Some(names.join(", "));
