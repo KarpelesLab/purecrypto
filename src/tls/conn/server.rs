@@ -16,6 +16,7 @@ use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
+use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random, ReadCursor,
@@ -142,6 +143,10 @@ pub struct ServerConfig {
     /// Client-certificate authentication policy. `None` (default) skips
     /// `CertificateRequest`: a server does not demand a client cert.
     client_auth: Option<ClientAuthPolicy>,
+    /// Whitelist of signature algorithms accepted in the client certificate
+    /// chain and `CertificateVerify` (under mTLS). Defaults to
+    /// [`SignaturePolicy::modern`].
+    signature_policy: SignaturePolicy,
 }
 
 impl ServerConfig {
@@ -159,6 +164,7 @@ impl ServerConfig {
             #[cfg(feature = "std")]
             replay_window: None,
             client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
         }
     }
 
@@ -176,6 +182,7 @@ impl ServerConfig {
             #[cfg(feature = "std")]
             replay_window: None,
             client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
         }
     }
 
@@ -193,7 +200,16 @@ impl ServerConfig {
             #[cfg(feature = "std")]
             replay_window: None,
             client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
         }
+    }
+
+    /// Replaces the signature-algorithm whitelist used to validate client
+    /// certificate chains and `CertificateVerify` signatures (mTLS).
+    /// Defaults to [`SignaturePolicy::modern`].
+    pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
+        self.signature_policy = policy;
+        self
     }
 
     /// Sets the ALPN protocols this server is willing to negotiate, in
@@ -1007,8 +1023,14 @@ impl<R: RngCore> ServerConnection<R> {
             self.state = State::WaitClientFinished;
             return Ok(());
         }
-        // Validate the chain against the configured roots.
-        let leaf_key = crate::tls::pki::verify_chain(&policy.roots, &chain, None)?;
+        // Validate the chain against the configured roots, applying the
+        // server's signature-algorithm whitelist to every chain signature.
+        let leaf_key = crate::tls::pki::verify_chain(
+            &policy.roots,
+            &chain,
+            None,
+            &self.config.signature_policy,
+        )?;
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);
         self.state = State::WaitClientCertVerify;
@@ -1040,7 +1062,13 @@ impl<R: RngCore> ServerConnection<R> {
             .client_leaf_key
             .as_ref()
             .ok_or(Error::InappropriateState)?;
-        crate::tls::crypto::verify_signature(scheme, leaf_key, &content, &signature)?;
+        crate::tls::crypto::verify_signature(
+            scheme,
+            leaf_key,
+            &content,
+            &signature,
+            &self.config.signature_policy,
+        )?;
 
         self.core.transcript.update(raw);
         self.state = State::WaitClientFinished;
