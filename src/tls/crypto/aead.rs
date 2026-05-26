@@ -22,14 +22,14 @@ use crate::tls::{ContentType, Error};
 use alloc::vec::Vec;
 
 /// The record-protection AEAD, keyed for the negotiated suite.
-enum Aead {
+pub(crate) enum Aead {
     Aes128(Gcm<Aes128>),
     Aes256(Gcm<Aes256>),
     ChaCha20Poly1305(ChaCha20Poly1305),
 }
 
 impl Aead {
-    fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
+    pub(crate) fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         match self {
             Aead::Aes128(g) => g.encrypt(nonce, aad, buf),
             Aead::Aes256(g) => g.encrypt(nonce, aad, buf),
@@ -37,13 +37,42 @@ impl Aead {
         }
     }
 
-    fn decrypt(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8], tag: &[u8; 16]) -> bool {
+    pub(crate) fn decrypt(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; 16],
+    ) -> bool {
         let r = match self {
             Aead::Aes128(g) => g.decrypt(nonce, aad, buf, tag),
             Aead::Aes256(g) => g.decrypt(nonce, aad, buf, tag),
             Aead::ChaCha20Poly1305(c) => c.decrypt(nonce, aad, buf, tag),
         };
         r.is_ok()
+    }
+
+    /// Builds an AEAD for the given algorithm from a raw key. The key length
+    /// must match `alg` (16 for AES-128, 32 for AES-256/ChaCha20).
+    #[allow(dead_code)]
+    pub(crate) fn from_key(alg: AeadAlg, key: &[u8]) -> Self {
+        match alg {
+            AeadAlg::Aes128Gcm => {
+                let mut k = [0u8; 16];
+                k.copy_from_slice(&key[..16]);
+                Aead::Aes128(Gcm::new(Aes128::new(&k)))
+            }
+            AeadAlg::Aes256Gcm => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key[..32]);
+                Aead::Aes256(Gcm::new(Aes256::new(&k)))
+            }
+            AeadAlg::ChaCha20Poly1305 => {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&key[..32]);
+                Aead::ChaCha20Poly1305(ChaCha20Poly1305::new(&k))
+            }
+        }
     }
 }
 
