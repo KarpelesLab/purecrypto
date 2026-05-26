@@ -153,3 +153,49 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
     }
     s
 }
+
+/// Lowercase hex encoding (`to_hex`) terminated by a newline. Convenience
+/// wrapper used by the hashing/MAC/KDF subcommands.
+pub(crate) fn to_hex_line(bytes: &[u8]) -> String {
+    let mut s = to_hex(bytes);
+    s.push('\n');
+    s
+}
+
+/// Decodes a hex string (any case, ASCII whitespace ignored). Returns `None`
+/// on a non-hex character or odd length.
+pub(crate) fn from_hex(s: &str) -> Option<Vec<u8>> {
+    let cleaned: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !cleaned.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(cleaned.len() / 2);
+    let mut i = 0;
+    while i < cleaned.len() {
+        let hi = (cleaned[i] as char).to_digit(16)?;
+        let lo = (cleaned[i + 1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Some(out)
+}
+
+/// Parses a CLI flag value as hex bytes, exiting with an error message
+/// referencing the flag if invalid.
+pub(crate) fn parse_hex_flag(value: &str, flag: &str) -> Vec<u8> {
+    from_hex(value).unwrap_or_else(|| die(format!("invalid hex value for {flag}: {value}")))
+}
+
+/// Parses a positive integer from a CLI flag.
+pub(crate) fn parse_u32_flag(value: &str, flag: &str) -> u32 {
+    value
+        .parse::<u32>()
+        .unwrap_or_else(|_| die(format!("invalid integer for {flag}: {value}")))
+}
+
+/// Parses a positive `usize` from a CLI flag.
+pub(crate) fn parse_usize_flag(value: &str, flag: &str) -> usize {
+    value
+        .parse::<usize>()
+        .unwrap_or_else(|_| die(format!("invalid integer for {flag}: {value}")))
+}

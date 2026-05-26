@@ -4,8 +4,11 @@
 
 mod ca;
 mod dtls_io;
+mod enc;
 mod genpkey;
 mod hash;
+mod kdf;
+mod mac;
 mod pkey;
 mod pki;
 mod rand;
@@ -29,6 +32,9 @@ USAGE:
 
 COMMANDS:
     hash <alg> [file]    Hash a file or stdin (sha256, sha3-256, blake3, …)
+    mac                  Compute an HMAC tag
+    kdf <subcmd>         HKDF / PBKDF2 / scrypt / Argon2 key derivation
+    enc                  AEAD encrypt/decrypt + AES-KW/KWP wrap/unwrap
     rand <nbytes>        Emit cryptographically secure random bytes
     genpkey              Generate an RSA or EC private key
     pkey                 Inspect or convert a private key
@@ -50,6 +56,9 @@ fn main() {
 
     match cmd {
         Some("hash") | Some("dgst") => hash::run(rest),
+        Some("mac") => mac::run(rest),
+        Some("kdf") => kdf::run(rest),
+        Some("enc") => enc::run(rest),
         Some("rand") => rand::run(rest),
         Some("genpkey") => genpkey::run(rest),
         Some("pkey") => pkey::run(rest),

@@ -1275,3 +1275,220 @@ fn ca_list_templates_lists_builtins() {
         assert!(out.contains(name), "missing {name} in {out}");
     }
 }
+
+// ---- MAC / KDF / ENC subcommand tests (Phase 1) ----
+
+#[test]
+fn mac_hmac_sha256_known_answer() {
+    // RFC 4231 §4.2 test case 1: key = 20 × 0x0b, data = "Hi There".
+    let (out, ok) = run(
+        &[
+            "mac",
+            "-alg",
+            "hmac-sha256",
+            "-key",
+            "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        ],
+        b"Hi There",
+    );
+    assert!(ok);
+    assert_eq!(
+        out.trim(),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+    );
+}
+
+#[test]
+fn kdf_hkdf_known_answer() {
+    // RFC 5869 §A.1 (test case 1).
+    let (out, ok) = run(
+        &[
+            "kdf",
+            "hkdf",
+            "-hash",
+            "sha256",
+            "-ikm",
+            "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+            "-salt",
+            "000102030405060708090a0b0c",
+            "-info",
+            "f0f1f2f3f4f5f6f7f8f9",
+            "-len",
+            "42",
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert_eq!(
+        out.trim(),
+        "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865"
+    );
+}
+
+#[test]
+fn kdf_pbkdf2_known_answer() {
+    // RFC 6070 test case 2: password="password", salt="salt", c=2, dkLen=20.
+    // But that's HMAC-SHA1; we use HMAC-SHA256 RFC 7914 §11 vector instead.
+    // password="passwd", salt="salt", c=1, dkLen=64.
+    // Output from libgcrypt / openssl: 55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783
+    let (out, ok) = run(
+        &[
+            "kdf",
+            "pbkdf2",
+            "-hash",
+            "sha256",
+            "-password",
+            "passwd",
+            "-salt",
+            "73616c74",
+            "-iter",
+            "1",
+            "-len",
+            "64",
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert_eq!(
+        out.trim(),
+        "55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc\
+49ca9cccf179b645991664b39d77ef317c71b845b1e30bd509112041d3a19783"
+    );
+}
+
+#[test]
+fn enc_aes_gcm_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("pc_enc_gcm_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), b"hello purecrypto").unwrap();
+
+    // Encrypt.
+    let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let nonce = "010203040506070809101112";
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "AES-256-GCM",
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-in",
+                &p("pt.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // Decrypt.
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "AES-256-GCM",
+                "-d",
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, b"hello purecrypto");
+
+    // Tamper with the tag; decrypt must fail.
+    let mut ct = std::fs::read(dir.join("ct.bin")).unwrap();
+    *ct.last_mut().unwrap() ^= 1;
+    std::fs::write(dir.join("ct_bad.bin"), &ct).unwrap();
+    let (_o, ok) = run(
+        &[
+            "enc",
+            "-alg",
+            "AES-256-GCM",
+            "-d",
+            "-key",
+            key,
+            "-nonce",
+            nonce,
+            "-in",
+            &p("ct_bad.bin"),
+            "-out",
+            &p("rt_bad.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok, "tampered AES-GCM ciphertext must be rejected");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enc_chacha20_poly1305_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("pc_enc_cc20_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), b"chacha20 + poly1305").unwrap();
+
+    let key = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    let nonce = "010203040506070809101112";
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "CHACHA20-POLY1305",
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-aad",
+                "deadbeef",
+                "-in",
+                &p("pt.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "CHACHA20-POLY1305",
+                "-d",
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-aad",
+                "deadbeef",
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, b"chacha20 + poly1305");
+    let _ = std::fs::remove_dir_all(&dir);
+}
