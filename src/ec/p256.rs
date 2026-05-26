@@ -89,6 +89,11 @@ impl P256 {
         fe_from_hex(N_HEX)
     }
 
+    /// The field prime `p`.
+    pub(crate) fn field_modulus() -> Fe {
+        fe_from_hex(P_HEX)
+    }
+
     /// The identity point `(0 : 1 : 0)`.
     pub(crate) fn identity(&self) -> Point {
         Point {

@@ -126,6 +126,14 @@ impl EcdsaPublicKey {
         }
         let x = Fe::from_be_bytes(&bytes[1..33]);
         let y = Fe::from_be_bytes(&bytes[33..65]);
+        // Coordinates MUST be reduced — Montgomery multiplication's invariant
+        // requires `< p` operands, and the curve-membership check downstream
+        // relies on it. Without this guard, an attacker can submit `x` or `y`
+        // in the [p, 2^256) range and bypass on-curve checks.
+        let p = P256::field_modulus();
+        if !bool::from(x.ct_lt(&p)) || !bool::from(y.ct_lt(&p)) {
+            return Err(Error::InvalidInput);
+        }
         let curve = P256::new();
         if !curve.is_on_curve(&x, &y) {
             return Err(Error::InvalidInput);
