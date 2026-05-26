@@ -10,6 +10,7 @@
 use super::common::{ConnectionCore, Incoming};
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
+use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
@@ -91,6 +92,7 @@ pub struct ClientConnection {
 
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
+    mlkem: MlKem768DecapsKey,
 
     suite: Option<SuiteParams>,
     ks: Option<KeySchedule>,
@@ -145,7 +147,11 @@ impl ClientConnection {
                 CipherSuite::AES_256_GCM_SHA384,
                 CipherSuite::CHACHA20_POLY1305_SHA256,
             ],
-            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            &[
+                NamedGroup::X25519MLKEM768,
+                NamedGroup::X25519,
+                NamedGroup::SECP256R1,
+            ],
         )
     }
 
@@ -161,6 +167,7 @@ impl ClientConnection {
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
+        let (mlkem, _) = MlKem768DecapsKey::generate(rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
 
@@ -171,6 +178,7 @@ impl ClientConnection {
             state: State::WaitServerHello,
             x25519,
             p256,
+            mlkem,
             suite: None,
             ks: None,
             client_hs_secret: None,
@@ -198,6 +206,12 @@ impl ClientConnection {
                 }
                 NamedGroup::SECP256R1 => {
                     key_shares.push((NamedGroup::SECP256R1, self.p256.public_key().to_sec1()))
+                }
+                NamedGroup::X25519MLKEM768 => {
+                    // Client share: ML-KEM-768 encapsulation key ‖ X25519 key.
+                    let mut share = self.mlkem.encapsulation_key().to_bytes().to_vec();
+                    share.extend_from_slice(&self.x25519.public_key());
+                    key_shares.push((NamedGroup::X25519MLKEM768, share));
                 }
                 _ => {}
             }
@@ -389,6 +403,24 @@ impl ClientConnection {
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok(Secret::new(&shared))
+            }
+            NamedGroup::X25519MLKEM768 => {
+                // Server share: ML-KEM ciphertext (1088) ‖ X25519 key (32).
+                if server_pub.len() != CIPHERTEXT_BYTES + 32 {
+                    return Err(Error::Decode);
+                }
+                let mut ct = [0u8; CIPHERTEXT_BYTES];
+                ct.copy_from_slice(&server_pub[..CIPHERTEXT_BYTES]);
+                let peer: [u8; 32] = server_pub[CIPHERTEXT_BYTES..]
+                    .try_into()
+                    .map_err(|_| Error::Decode)?;
+                let ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
+                let x_ss = self.x25519.diffie_hellman(&peer);
+                // Combined secret: ML-KEM shared secret first, then X25519.
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&ml_ss);
+                combined[32..].copy_from_slice(&x_ss);
+                Ok(Secret::new(&combined))
             }
             _ => Err(Error::HandshakeFailure),
         }
@@ -586,9 +618,9 @@ mod tests {
         ] {
             assert!(ext::find(&ch.extensions, ty).is_some());
         }
-        // The key_share offers both x25519 and secp256r1.
+        // The key_share offers x25519mlkem768, x25519 and secp256r1.
         let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
-        assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 2);
+        assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 3);
     }
 
     #[test]

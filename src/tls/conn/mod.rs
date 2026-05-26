@@ -148,6 +148,16 @@ mod loopback_tests {
     }
 
     #[test]
+    fn x25519mlkem768_hybrid_kex() {
+        // The post-quantum hybrid group completes a full handshake and agrees on
+        // application data both ways.
+        run(
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519MLKEM768],
+        );
+    }
+
+    #[test]
     fn ed25519_server_certificate() {
         // An Ed25519 server cert exercises Ed25519 chain verification and the
         // Ed25519 CertificateVerify signature end to end.
