@@ -62,7 +62,7 @@ impl Secret {
 
 /// The hash function fixed by the negotiated cipher suite.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum HashAlg {
+pub enum HashAlg {
     /// SHA-256 (for `TLS_AES_128_GCM_SHA256`).
     Sha256,
     /// SHA-384 (for `TLS_AES_256_GCM_SHA384`).
@@ -169,8 +169,6 @@ impl KeySchedule {
 
     /// Starts the schedule with a pre-shared key (`HKDF-Extract(0, psk)`).
     /// Used by both PSK-only and PSK-with-ECDHE resumption flows.
-    // Used by the resumption handshake plumbing (follow-up commits).
-    #[allow(dead_code)]
     pub(crate) fn with_psk(alg: HashAlg, psk: &[u8]) -> Self {
         let early = extract(alg, &[], psk);
         KeySchedule { alg, secret: early }
@@ -185,7 +183,6 @@ impl KeySchedule {
     /// `binder_key = Derive-Secret(Early Secret, label, "")` (RFC 8446
     /// §4.2.11.2). `label` is `"res binder"` for resumption PSKs and
     /// `"ext binder"` for external PSKs.
-    #[allow(dead_code)]
     pub(crate) fn binder_key(&self, label: &[u8]) -> Secret {
         let empty_hash = self.alg.hash(&[]);
         derive_secret(
@@ -198,6 +195,7 @@ impl KeySchedule {
 
     /// `client_early_traffic_secret` from `Hash(ClientHello)` — used by
     /// 0-RTT writes before ServerHello arrives.
+    // Wired in by the 0-RTT commit.
     #[allow(dead_code)]
     pub(crate) fn client_early_traffic_secret(&self, transcript: &[u8]) -> Secret {
         derive_secret(self.alg, self.secret.as_slice(), b"c e traffic", transcript)
@@ -278,21 +276,18 @@ impl KeySchedule {
     /// `resumption_master_secret` from `Hash(CH..client Finished)` — the
     /// seed for future-session PSKs (RFC 8446 §7.1). The actual PSK is
     /// `HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)`.
-    #[allow(dead_code)]
     pub(crate) fn resumption_master_secret(&self, transcript: &[u8]) -> Secret {
         derive_secret(self.alg, self.secret.as_slice(), b"res master", transcript)
     }
 }
 
 /// Derives a PSK from a `resumption_master_secret` and a per-ticket nonce.
-#[allow(dead_code)]
 pub(crate) fn psk_from_resumption(alg: HashAlg, rms: &Secret, ticket_nonce: &[u8], out: &mut [u8]) {
     expand_label_dyn(alg, rms.as_slice(), b"resumption", ticket_nonce, out);
 }
 
 /// Derives the per-binder "finished" key used to MAC the truncated
 /// ClientHello: `HKDF-Expand-Label(binder_key, "finished", "", Hash.length)`.
-#[allow(dead_code)]
 pub(crate) fn binder_finished_key(alg: HashAlg, binder_key: &Secret) -> Secret {
     let mut out = [0u8; MAX_SECRET];
     let n = alg.output_len();

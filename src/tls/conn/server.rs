@@ -7,22 +7,24 @@
 //! application traffic keys.
 
 use super::common::{ConnectionCore, Incoming};
+use crate::cipher::{Aes256, Gcm};
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
 };
-use crate::hash::{Sha256, Sha384, Sha512};
+use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    ClientHello, ExtensionType, KeyUpdate, NamedGroup, Random, ReadCursor, ServerHello,
-    SignatureScheme, hs_type, read_handshake, with_len_u16, with_len_u24,
+    ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random, ReadCursor,
+    ServerHello, SignatureScheme, hs_type, read_handshake, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::{
-    KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, next_traffic_secret, supported_suites, tls_exporter,
+    HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
+    certificate_verify_content, finished_verify_data, next_traffic_secret, psk_from_resumption,
+    supported_suites, tls_exporter,
 };
 use crate::tls::{AlertDescription, Error};
 use alloc::vec::Vec;
@@ -49,6 +51,13 @@ pub struct ServerConfig {
     /// `record_size_limit` (RFC 8449) we advertise to the client. None
     /// suppresses the extension.
     record_size_limit: Option<u16>,
+    /// Symmetric AEAD key used to encrypt/decrypt stateless resumption
+    /// tickets (RFC 8446 §4.6.1, rustls-style). `None` disables NewSessionTicket
+    /// emission, so clients cannot resume against this server.
+    ticket_key: Option<[u8; 32]>,
+    /// Lifetime (seconds) advertised in emitted NewSessionTickets; defaults
+    /// to two hours.
+    ticket_lifetime: u32,
 }
 
 impl ServerConfig {
@@ -60,6 +69,8 @@ impl ServerConfig {
             key: ServerKey::Rsa(key),
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
         }
     }
 
@@ -71,6 +82,8 @@ impl ServerConfig {
             key: ServerKey::Ecdsa(key),
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
         }
     }
 
@@ -82,6 +95,8 @@ impl ServerConfig {
             key: ServerKey::Ed25519(key),
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
         }
     }
 
@@ -96,6 +111,22 @@ impl ServerConfig {
     /// Advertises `record_size_limit = limit` (RFC 8449).
     pub fn with_record_size_limit(mut self, limit: u16) -> Self {
         self.record_size_limit = Some(limit);
+        self
+    }
+
+    /// Enables session resumption: the server emits one NewSessionTicket
+    /// after the handshake, encrypted under this 32-byte AEAD key. Without
+    /// this, the server does not emit tickets and clients cannot resume.
+    pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
+        self.ticket_key = Some(key);
+        self
+    }
+
+    /// Sets the lifetime advertised in NewSessionTickets (seconds). Capped at
+    /// 7 days per RFC 8446 §4.6.1; defaults to two hours.
+    pub fn with_ticket_lifetime(mut self, seconds: u32) -> Self {
+        const MAX: u32 = 7 * 24 * 60 * 60;
+        self.ticket_lifetime = seconds.min(MAX);
         self
     }
 
@@ -139,6 +170,18 @@ pub struct ServerConnection<R: RngCore> {
     exporter_secret: Option<Secret>,
     /// ALPN protocol the server picked from the client's offer.
     alpn_negotiated: Option<Vec<u8>>,
+    /// `true` if the handshake was a PSK resumption.
+    psk_used: bool,
+    /// Set once after the handshake completes to drive one-shot
+    /// NewSessionTicket emission on the next process loop.
+    pending_nst: bool,
+    /// `resumption_master_secret`, computed at the client's Finished. Seed
+    /// for ticket PSKs.
+    rms: Option<Secret>,
+    /// Key schedule retained between `on_client_hello` and `on_client_finished`
+    /// so we can derive `resumption_master_secret` once the client Finished
+    /// transcript hash is known.
+    ks: Option<KeySchedule>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 }
@@ -158,9 +201,19 @@ impl<R: RngCore> ServerConnection<R> {
             server_app_secret: None,
             exporter_secret: None,
             alpn_negotiated: None,
+            psk_used: false,
+            pending_nst: false,
+            rms: None,
+            ks: None,
             #[cfg(test)]
             server_hs_secret: None,
         }
+    }
+
+    /// Whether the just-completed handshake resumed a prior session via PSK
+    /// (RFC 8446 §2.2). Always `false` for fresh handshakes.
+    pub fn psk_used(&self) -> bool {
+        self.psk_used
     }
 
     /// Feeds received TLS bytes.
@@ -346,12 +399,27 @@ impl<R: RngCore> ServerConnection<R> {
         }
         let ch = ClientHello::decode(body)?;
 
-        // Negotiate the cipher suite (our preference order).
-        let suite = supported_suites()
-            .iter()
-            .copied()
-            .find(|s| ch.cipher_suites.contains(&s.suite))
-            .ok_or(Error::HandshakeFailure)?;
+        // PSK resumption: process pre_shared_key + psk_key_exchange_modes
+        // before suite negotiation so we can constrain the suite to the PSK's
+        // hash. Hard-fail on binder mismatch (decrypt_error).
+        let psk_state = self.try_accept_psk(&ch, raw)?;
+
+        // Negotiate the cipher suite. If we accepted a PSK, the suite must
+        // match the PSK's hash; otherwise pick our preferred suite from the
+        // client's offer.
+        let suite = if let Some(ref s) = psk_state {
+            supported_suites()
+                .iter()
+                .copied()
+                .find(|sp| ch.cipher_suites.contains(&sp.suite) && sp.hash == s.hash)
+                .ok_or(Error::HandshakeFailure)?
+        } else {
+            supported_suites()
+                .iter()
+                .copied()
+                .find(|s| ch.cipher_suites.contains(&s.suite))
+                .ok_or(Error::HandshakeFailure)?
+        };
 
         // Require TLS 1.3.
         let sv = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
@@ -360,12 +428,15 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::UnsupportedVersion);
         }
 
-        // The client must accept the signature scheme our certificate uses.
-        let our_scheme = self.config.signature_scheme();
-        let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
-            .ok_or(Error::HandshakeFailure)?;
-        if !ext::parse_signature_algorithms(sig_algs)?.contains(&our_scheme) {
-            return Err(Error::HandshakeFailure);
+        // The client must accept the signature scheme our certificate uses —
+        // unless PSK is being used, in which case we sign nothing.
+        if psk_state.is_none() {
+            let our_scheme = self.config.signature_scheme();
+            let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
+                .ok_or(Error::HandshakeFailure)?;
+            if !ext::parse_signature_algorithms(sig_algs)?.contains(&our_scheme) {
+                return Err(Error::HandshakeFailure);
+            }
         }
 
         // ALPN: pick our first preference that appears in the client's offer.
@@ -412,21 +483,31 @@ impl<R: RngCore> ServerConnection<R> {
         self.rng.fill_bytes(&mut random);
         let (server_pub, shared) = self.key_agreement(*group, client_pub)?;
 
-        // ServerHello with the selected suite and key share.
+        // ServerHello with the selected suite and key share. When PSK is
+        // accepted, also echo `pre_shared_key` with `selected_identity = 0`.
+        let mut sh_extensions = alloc::vec![
+            ext::server_key_share(*group, &server_pub),
+            ext::server_supported_versions(),
+        ];
+        if psk_state.is_some() {
+            sh_extensions.push(ext::server_pre_shared_key(0));
+        }
         let server_hello = ServerHello {
             random,
             session_id: ch.session_id.clone(),
             cipher_suite: suite.suite,
-            extensions: alloc::vec![
-                ext::server_key_share(*group, &server_pub),
-                ext::server_supported_versions(),
-            ],
+            extensions: sh_extensions,
         }
         .encode();
         self.core.emit_handshake(server_hello);
 
-        // Derive handshake traffic secrets over Hash(CH..SH).
-        let mut ks = KeySchedule::new(suite.hash);
+        // Derive handshake traffic secrets over Hash(CH..SH). PSK acceptance
+        // changes the early-secret extract (PSK instead of all-zeros).
+        let mut ks = if let Some(ref s) = psk_state {
+            KeySchedule::with_psk(suite.hash, &s.psk)
+        } else {
+            KeySchedule::new(suite.hash)
+        };
         ks.enter_handshake(shared.as_slice());
         let th = self.core.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
@@ -448,11 +529,15 @@ impl<R: RngCore> ServerConnection<R> {
         ));
         self.core.emit_ccs();
 
-        // Encrypted server flight.
+        // Encrypted server flight. Under PSK resumption we omit Certificate
+        // and CertificateVerify (RFC 8446 §2.2).
         self.send_encrypted_extensions();
-        self.send_certificate();
-        self.send_certificate_verify()?;
+        if psk_state.is_none() {
+            self.send_certificate();
+            self.send_certificate_verify()?;
+        }
         self.send_finished(suite, &shts);
+        self.psk_used = psk_state.is_some();
 
         // Derive application traffic secrets over Hash(CH..server Finished).
         ks.enter_master();
@@ -475,6 +560,9 @@ impl<R: RngCore> ServerConnection<R> {
         self.client_hs_secret = Some(chts);
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
+        // Retain the schedule (now sitting at master) so we can derive RMS
+        // when the client's Finished arrives.
+        self.ks = Some(ks);
         #[cfg(test)]
         {
             self.server_hs_secret = Some(shts);
@@ -619,6 +707,12 @@ impl<R: RngCore> ServerConnection<R> {
         }
         self.core.transcript.update(raw);
 
+        // Derive resumption_master_secret over Hash(CH..client Finished).
+        if let Some(ks) = self.ks.as_ref() {
+            let th_rms = self.core.transcript.current_hash();
+            self.rms = Some(ks.resumption_master_secret(th_rms.as_slice()));
+        }
+
         // The client now talks under its application traffic key.
         let cats = self.client_app_secret.as_ref().expect("client app secret");
         self.core.set_read(RecordCrypter::new(
@@ -630,6 +724,78 @@ impl<R: RngCore> ServerConnection<R> {
         // RFC 8446 §5: ChangeCipherSpec is no longer permitted after this point.
         self.core.close_ccs_window();
         self.state = State::Connected;
+
+        // Issue one NewSessionTicket if a ticket key is configured. We do
+        // this immediately on transition to Connected so the ticket rides
+        // out in the same write_tls() drain as our Finished's responses.
+        if self.config.ticket_key.is_some() {
+            self.pending_nst = true;
+            self.emit_session_ticket()?;
+        }
+        Ok(())
+    }
+
+    /// Emits one NewSessionTicket (RFC 8446 §4.6.1) under the current write
+    /// key. The ticket is a `nonce(12) ‖ AES-256-GCM(ticket_key, nonce, cleartext)`
+    /// blob where `cleartext = creation_unix_time_u64 ‖ psk ‖ alpn_len_u8 ‖ alpn`.
+    fn emit_session_ticket(&mut self) -> Result<(), Error> {
+        if !self.pending_nst {
+            return Ok(());
+        }
+        let key = self.config.ticket_key.expect("ticket key present");
+        let suite = self.suite.expect("suite set");
+
+        // resumption_master_secret over Hash(CH..client Finished); set on
+        // on_client_finished.
+        let rms = *self.rms.as_ref().expect("rms set");
+
+        // ticket_nonce: 4 random bytes is enough (RFC: <1..255>).
+        let mut ticket_nonce = [0u8; 4];
+        self.rng.fill_bytes(&mut ticket_nonce);
+
+        // PSK = HKDF-Expand-Label(rms, "resumption", ticket_nonce).
+        let hash_len = suite.hash.output_len();
+        let mut psk = alloc::vec![0u8; hash_len];
+        psk_from_resumption(suite.hash, &rms, &ticket_nonce, &mut psk);
+
+        // ticket plaintext.
+        let creation = system_now_u64();
+        let alpn = self.alpn_negotiated.as_ref();
+        let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
+        let mut plain = Vec::with_capacity(8 + hash_len + 1 + alpn_len as usize);
+        plain.extend_from_slice(&creation.to_be_bytes());
+        plain.extend_from_slice(&psk);
+        plain.push(alpn_len);
+        if let Some(a) = alpn {
+            plain.extend_from_slice(a);
+        }
+
+        // Encrypt: 12-byte GCM nonce ‖ AES-256-GCM(plain) ‖ 16-byte tag.
+        let mut nonce = [0u8; 12];
+        self.rng.fill_bytes(&mut nonce);
+        let gcm = Gcm::new(Aes256::new(&key));
+        let mut buf = plain;
+        let tag = gcm.encrypt(&nonce, &[], &mut buf);
+
+        let mut ticket = Vec::with_capacity(12 + buf.len() + 16);
+        ticket.extend_from_slice(&nonce);
+        ticket.extend_from_slice(&buf);
+        ticket.extend_from_slice(&tag);
+
+        // ticket_age_add: 4 random bytes.
+        let mut age_add_bytes = [0u8; 4];
+        self.rng.fill_bytes(&mut age_add_bytes);
+        let ticket_age_add = u32::from_be_bytes(age_add_bytes);
+
+        let nst = NewSessionTicket {
+            ticket_lifetime: self.config.ticket_lifetime,
+            ticket_age_add,
+            ticket_nonce: ticket_nonce.to_vec(),
+            ticket,
+            extensions: Vec::new(),
+        };
+        self.core.emit_handshake(nst.encode());
+        self.pending_nst = false;
         Ok(())
     }
 
@@ -641,6 +807,149 @@ impl<R: RngCore> ServerConnection<R> {
             .map(|s| s.as_slice().to_vec())
             .unwrap_or_default()
     }
+}
+
+/// Current wall-clock time as a Unix timestamp, when the `std` feature is
+/// available; otherwise zero (ticket timestamps degrade gracefully but
+/// `with_ticket_key` is typically server-side `std` anyway).
+#[cfg(feature = "std")]
+fn system_now_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "std"))]
+fn system_now_u64() -> u64 {
+    0
+}
+
+/// PSK accepted from the client's ClientHello: the recovered PSK bytes and
+/// the hash function that pinned them.
+struct AcceptedPsk {
+    psk: Vec<u8>,
+    hash: HashAlg,
+}
+
+impl<R: RngCore> ServerConnection<R> {
+    /// Tries to accept a `pre_shared_key` offer from the ClientHello.
+    ///
+    /// Returns:
+    /// * `Ok(Some(AcceptedPsk))` — pick this PSK, run a resumed handshake.
+    /// * `Ok(None)` — no offered PSK we recognize; fall back to 1-RTT.
+    /// * `Err(Error::DecryptError)` — a ticket decrypted but its binder is
+    ///   wrong: an active attacker or a tampered CH. Reject hard.
+    fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Result<Option<AcceptedPsk>, Error> {
+        let Some(ticket_key) = self.config.ticket_key.as_ref() else {
+            return Ok(None);
+        };
+        let Some(modes_body) = ext::find(&ch.extensions, ExtensionType::PSK_KEY_EXCHANGE_MODES)
+        else {
+            return Ok(None);
+        };
+        let modes = ext::parse_psk_key_exchange_modes(modes_body)?;
+        if !modes.contains(&1) {
+            // We only support psk_dhe_ke.
+            return Ok(None);
+        }
+        let Some(psk_body) = ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY) else {
+            return Ok(None);
+        };
+        let (identities, binders) = ext::parse_client_pre_shared_key(psk_body)?;
+
+        // RFC 8446 §4.2.11: pick the first identity whose ticket decrypts
+        // cleanly. Then verify its binder; mismatch is fatal.
+        for (idx, (ticket, _age)) in identities.iter().enumerate() {
+            let Some(decrypted) = decrypt_ticket(ticket_key, ticket) else {
+                continue;
+            };
+            let TicketPlaintext { psk } = decrypted;
+            let hash = match psk.len() {
+                32 => HashAlg::Sha256,
+                48 => HashAlg::Sha384,
+                _ => continue,
+            };
+            let hash_len = hash.output_len();
+
+            // Binder field at the tail of the CH wire bytes.
+            let binders_field_len: usize = 2 + binders.iter().map(|b| 1 + b.len()).sum::<usize>();
+            if raw.len() < binders_field_len {
+                continue;
+            }
+            let truncated = &raw[..raw.len() - binders_field_len];
+
+            let ks = KeySchedule::with_psk(hash, &psk);
+            let res_bk = ks.binder_key(b"res binder");
+            let fk = binder_finished_key(hash, &res_bk);
+            let th = hash.hash(truncated);
+            let expected: Vec<u8> = match hash {
+                HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+                    .as_ref()
+                    .to_vec(),
+                HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
+                    .as_ref()
+                    .to_vec(),
+            };
+            let presented = binders.get(idx).ok_or(Error::DecryptError)?;
+            if presented.len() != hash_len
+                || !bool::from(expected.as_slice().ct_eq(presented.as_slice()))
+            {
+                return Err(Error::DecryptError);
+            }
+            return Ok(Some(AcceptedPsk { psk, hash }));
+        }
+        Ok(None)
+    }
+}
+
+/// Decoded ticket payload: the original PSK and (unused for now) creation
+/// timestamp + ALPN that was negotiated when the ticket was issued.
+struct TicketPlaintext {
+    psk: Vec<u8>,
+}
+
+/// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
+/// ciphertext ‖ tag(16)`, with `cleartext = creation_u64 ‖ psk(hash_len) ‖
+/// alpn_len_u8 ‖ alpn`. Returns `None` on any structural or authentication
+/// failure.
+fn decrypt_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<TicketPlaintext> {
+    if ticket.len() < 12 + 16 {
+        return None;
+    }
+    let nonce: &[u8; 12] = ticket[..12].try_into().ok()?;
+    let body = &ticket[12..];
+    let (ct, tag_slice) = body.split_at(body.len() - 16);
+    let tag: &[u8; 16] = tag_slice.try_into().ok()?;
+    let mut buf = ct.to_vec();
+    let gcm = Gcm::new(Aes256::new(key));
+    if gcm.decrypt(nonce, &[], &mut buf, tag).is_err() {
+        return None;
+    }
+    // Parse plaintext: 8-byte creation timestamp + psk + alpn_len + alpn.
+    if buf.len() < 8 + 1 {
+        return None;
+    }
+    // We don't currently expose ticket expiry from the plaintext; the field
+    // is reserved for future commits.
+    let rest = &buf[8..];
+    // PSK length: derived by total - 8 (creation) - 1 (alpn_len) - alpn_len.
+    // PSK length is either 32 or 48; alpn_len is the last layout field, so:
+    //   psk = rest[..psk_len]; alpn_len = rest[psk_len]; alpn = rest[psk_len+1..].
+    // We try 32 first, then 48. Either is uniquely identified by checking
+    // the length field's plausibility.
+    for &psk_len in &[32usize, 48usize] {
+        if rest.len() < psk_len + 1 {
+            continue;
+        }
+        let alpn_len = rest[psk_len] as usize;
+        if rest.len() == psk_len + 1 + alpn_len {
+            let psk = rest[..psk_len].to_vec();
+            return Some(TicketPlaintext { psk });
+        }
+    }
+    None
 }
 
 /// Maps an internal error to the alert to send the peer.
@@ -656,6 +965,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
+        Error::DecryptError => AlertDescription::DecryptError,
         _ => AlertDescription::HandshakeFailure,
     }
 }

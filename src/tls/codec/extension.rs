@@ -216,3 +216,129 @@ pub(crate) fn client_offers_tls13(body: &[u8]) -> Result<bool, Error> {
     }
     Ok(found)
 }
+
+/// `psk_key_exchange_modes` (RFC 8446 §4.2.9): a `u8`-length list of mode
+/// bytes. We use `1 = psk_dhe_ke` (PSK with ECDHE for forward secrecy).
+pub(crate) fn psk_key_exchange_modes(modes: &[u8]) -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u8(&mut body, |b| b.extend_from_slice(modes));
+    (ExtensionType::PSK_KEY_EXCHANGE_MODES, body)
+}
+
+/// Parses a `psk_key_exchange_modes` body into the list of advertised modes.
+pub(crate) fn parse_psk_key_exchange_modes(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let list = c.vec_u8()?;
+    c.expect_empty()?;
+    if list.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(list.to_vec())
+}
+
+/// `early_data` extension body. In ClientHello / EncryptedExtensions, the body
+/// is empty; in NewSessionTicket it carries a `uint32 max_early_data_size`.
+// Used by 0-RTT plumbing in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn early_data_empty() -> RawExtension {
+    (ExtensionType::EARLY_DATA, Vec::new())
+}
+
+/// `early_data` carrying `max_early_data_size` (for NewSessionTicket).
+// Used by 0-RTT plumbing in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn early_data_with_size(max: u32) -> RawExtension {
+    (ExtensionType::EARLY_DATA, max.to_be_bytes().to_vec())
+}
+
+/// Builds a client-side `pre_shared_key` extension carrying `identities` and
+/// placeholder zero binders. Each identity is `(ticket_bytes,
+/// obfuscated_ticket_age)`. Each binder is `hash_len` bytes of zero.
+///
+/// Returns `(extension, binders_field_len)` where `binders_field_len` is the
+/// number of bytes at the END of the extension body occupied by the binders
+/// field (`u16 outer_len ‖ for each binder: u8 inner_len ‖ binder_bytes`).
+/// The caller can subtract this length from the assembled ClientHello bytes
+/// to obtain the "truncated ClientHello" that the binders are HMAC'd over
+/// (RFC 8446 §4.2.11.2).
+pub(crate) fn client_pre_shared_key_placeholder(
+    identities: &[(Vec<u8>, u32)],
+    hash_len: usize,
+) -> (RawExtension, usize) {
+    let mut body = Vec::new();
+    // identities<7..2^16-1>
+    with_len_u16(&mut body, |list| {
+        for (id, age) in identities {
+            with_len_u16(list, |b| b.extend_from_slice(id));
+            list.extend_from_slice(&age.to_be_bytes());
+        }
+    });
+    // binders<33..2^16-1>: u16 outer length + for each binder: u8 inner length
+    // + `hash_len` zeros.
+    let binders_start = body.len();
+    with_len_u16(&mut body, |list| {
+        for _ in identities {
+            with_len_u8(list, |b| b.extend(core::iter::repeat_n(0u8, hash_len)));
+        }
+    });
+    let binders_len = body.len() - binders_start;
+    ((ExtensionType::PRE_SHARED_KEY, body), binders_len)
+}
+
+/// A parsed `pre_shared_key` extension from a ClientHello: a list of offered
+/// `(ticket_bytes, obfuscated_age)` identities and a parallel list of their
+/// binders.
+pub(crate) type ClientPsk = (Vec<(Vec<u8>, u32)>, Vec<Vec<u8>>);
+
+/// Parses a client-side `pre_shared_key` extension body. Returns
+/// `(identities, binders)`. Each identity is `(ticket_bytes, obfuscated_age)`.
+pub(crate) fn parse_client_pre_shared_key(body: &[u8]) -> Result<ClientPsk, Error> {
+    let mut c = ReadCursor::new(body);
+    let identities_bytes = c.vec_u16()?;
+    let binders_bytes = c.vec_u16()?;
+    c.expect_empty()?;
+
+    let mut id_cur = ReadCursor::new(identities_bytes);
+    let mut identities = Vec::new();
+    while !id_cur.is_empty() {
+        let id = id_cur.vec_u16()?.to_vec();
+        if id.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
+        let age = id_cur.u32()?;
+        identities.push((id, age));
+    }
+    if identities.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
+
+    let mut bin_cur = ReadCursor::new(binders_bytes);
+    let mut binders = Vec::new();
+    while !bin_cur.is_empty() {
+        let b = bin_cur.vec_u8()?.to_vec();
+        if b.len() < 32 {
+            return Err(Error::IllegalParameter);
+        }
+        binders.push(b);
+    }
+    if binders.len() != identities.len() {
+        return Err(Error::IllegalParameter);
+    }
+    Ok((identities, binders))
+}
+
+/// Server-side `pre_shared_key` extension: carries only the selected identity
+/// index (RFC 8446 §4.2.11).
+pub(crate) fn server_pre_shared_key(selected_identity: u16) -> RawExtension {
+    let mut body = Vec::with_capacity(2);
+    body.extend_from_slice(&selected_identity.to_be_bytes());
+    (ExtensionType::PRE_SHARED_KEY, body)
+}
+
+/// Parses the server-side `pre_shared_key` extension body (a single u16).
+pub(crate) fn parse_server_pre_shared_key(body: &[u8]) -> Result<u16, Error> {
+    let mut c = ReadCursor::new(body);
+    let v = c.u16()?;
+    c.expect_empty()?;
+    Ok(v)
+}

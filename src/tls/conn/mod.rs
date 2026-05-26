@@ -7,7 +7,7 @@ mod server;
 mod stream;
 
 #[allow(unused_imports)]
-pub use client::{ClientConfig, ClientConnection, ReceivedSessionTicket};
+pub use client::{ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
 #[allow(unused_imports)]
 pub use server::{ServerConfig, ServerConnection};
 #[cfg(feature = "std")]
@@ -506,6 +506,179 @@ mod loopback_tests {
         assert!(!client.is_handshaking() && !server.is_handshaking());
         assert_eq!(client.alpn_protocol(), Some(&b"h2"[..]));
         assert_eq!(server.alpn_protocol(), Some(&b"h2"[..]));
+    }
+
+    /// PSK session resumption end-to-end.
+    ///
+    /// Phase 1: a fresh handshake completes; the server emits one
+    /// NewSessionTicket; the client takes the resulting `StoredSession`.
+    ///
+    /// Phase 2: a new client connection seeds itself with that session,
+    /// presents `pre_shared_key`, and resumes — bypassing
+    /// Certificate / CertificateVerify in the server flight.
+    #[test]
+    fn psk_resumption_two_phase() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config.with_ticket_key([0xa5u8; 32]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        // Phase 1.
+        let mut crng = HmacDrbg::<Sha256>::new(b"psk-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"psk-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(!server.psk_used(), "first handshake is fresh");
+        assert!(!client.psk_accepted(), "first handshake is fresh");
+
+        let session = client
+            .take_session()
+            .expect("server should have emitted a NewSessionTicket");
+        assert_eq!(session.psk.len(), 32);
+        assert_eq!(session.cipher_suite_hash, crate::tls::HashAlg::Sha256);
+
+        // Phase 2: a new handshake using the stored session.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2.with_ticket_key([0xa5u8; 32]);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"psk-client-2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"psk-server-2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        assert!(
+            server2.psk_used(),
+            "second handshake should be a resumption"
+        );
+        assert!(client2.psk_accepted(), "client should see PSK acceptance");
+
+        // App data still flows in both directions under the resumed keys.
+        client2.send_application_data(b"resumed-ping").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"resumed-ping");
+
+        server2.send_application_data(b"resumed-pong").unwrap();
+        let s = server2.write_tls();
+        client2.read_tls(&s);
+        client2.process_new_packets().unwrap();
+        assert_eq!(client2.take_received_plaintext(), b"resumed-pong");
+    }
+
+    /// A PSK binder that's been tampered with: the server must reject with
+    /// `decrypt_error` (RFC 8446 §4.2.11.2).
+    #[test]
+    fn psk_binder_mismatch_rejected() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config.with_ticket_key([0x77u8; 32]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        // Phase 1: get a real ticket.
+        let mut crng = HmacDrbg::<Sha256>::new(b"badpsk-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"badpsk-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket");
+
+        // Phase 2: build the resumption CH, then tamper with its trailing
+        // binder byte before feeding it to a fresh server.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2.with_ticket_key([0x77u8; 32]);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"badpsk-client-2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"badpsk-server-2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        // Pull the CH bytes, flip the last byte (which is part of the binder)
+        // and feed the tampered record to the server.
+        let ch_record = client2.write_tls();
+        assert!(!ch_record.is_empty());
+        let mut tampered = ch_record.clone();
+        *tampered.last_mut().unwrap() ^= 0x01;
+        server2.read_tls(&tampered);
+        let err = server2.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::DecryptError),
+            "expected DecryptError, got {err:?}"
+        );
     }
 
     /// ALPN: no overlap → server aborts with `no_application_protocol`.
