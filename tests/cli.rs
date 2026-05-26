@@ -263,3 +263,37 @@ fn genpkey_ed25519_then_inspect() {
     assert!(ok);
     assert!(text.contains("Ed25519"));
 }
+
+#[test]
+fn genpkey_ml_dsa_65_roundtrip() {
+    let (pem, ok) = run(&["genpkey", "-algorithm", "ML-DSA-65"], b"");
+    assert!(ok);
+    assert!(pem.contains("BEGIN PRIVATE KEY"));
+    let (text, ok) = run(&["pkey", "-text"], pem.as_bytes());
+    assert!(ok);
+    assert!(text.contains("ML-DSA-65"));
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], pem.as_bytes());
+    assert!(ok);
+    assert!(pub_pem.contains("BEGIN PUBLIC KEY"));
+}
+
+#[test]
+fn genpkey_ml_kem_768_roundtrip() {
+    let (pem, ok) = run(&["genpkey", "-algorithm", "ML-KEM-768"], b"");
+    assert!(ok);
+    let (text, ok) = run(&["pkey", "-text"], pem.as_bytes());
+    assert!(ok);
+    assert!(text.contains("ML-KEM-768"));
+}
+
+#[test]
+fn genpkey_slh_dsa_sha2_128f_roundtrip() {
+    let (pem, ok) = run(&["genpkey", "-algorithm", "SLH-DSA-SHA2-128f"], b"");
+    assert!(ok);
+    let (text, ok) = run(&["pkey", "-text"], pem.as_bytes());
+    assert!(ok);
+    assert!(text.contains("SLH-DSA"));
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], pem.as_bytes());
+    assert!(ok);
+    assert!(pub_pem.contains("BEGIN PUBLIC KEY"));
+}

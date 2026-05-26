@@ -500,6 +500,48 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
     diff == 0
 }
 
+/// Derives the public key bytes from a parsed private key (FIPS 204 §7.2:
+/// `pk = ρ ‖ ByteEncode₁₀(t1)` where `t = A·s₁ + s₂` and `t = t1·2ᵈ + t0`).
+pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
+    sk: &[u8],
+    p: &Params,
+) -> Vec<u8> {
+    let rho = &sk[..32];
+    let mut off = 128;
+    let eb = p.eta_bytes();
+    let mut s1 = [Poly::zero(); L];
+    for s in s1.iter_mut() {
+        *s = unpack_eta(&sk[off..off + eb], p).expect("valid sk");
+        off += eb;
+    }
+    let mut s2 = [Poly::zero(); K];
+    for s in s2.iter_mut() {
+        *s = unpack_eta(&sk[off..off + eb], p).expect("valid sk");
+        off += eb;
+    }
+    let a = matrix::<K, L>(rho);
+    let mut s1_ntt = s1;
+    for s in s1_ntt.iter_mut() {
+        s.ntt();
+    }
+    let mut pk = Vec::with_capacity(p.pubkey);
+    pk.extend_from_slice(rho);
+    for i in 0..K {
+        let mut acc = Poly::zero();
+        for j in 0..L {
+            acc = acc.add(&ntt_mul(&a[i][j], &s1_ntt[j]));
+        }
+        acc.inv_ntt();
+        let t = acc.add(&s2[i]);
+        let mut t1 = Poly::zero();
+        for jj in 0..N {
+            (t1.c[jj], _) = power2_round(t.c[jj]);
+        }
+        pk.extend_from_slice(&pack_t1(&t1));
+    }
+    pk
+}
+
 /// Builds `M' = 0 ‖ len(ctx) ‖ ctx ‖ msg` for the external signing interface.
 fn m_prime(ctx: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(2 + ctx.len() + msg.len());
@@ -563,6 +605,11 @@ macro_rules! ml_dsa_level {
                 Ok(sign_internal::<$k, $l>(&self.0, &[0u8; 32], &m_prime(ctx, msg), &$params))
             }
 
+            /// Derives the matching public key from this private key.
+            pub fn public_key(&self) -> $pk {
+                $pk(derive_public_from_sk::<$k, $l>(&self.0, &$params))
+            }
+
             /// The encoded private key.
             pub fn to_bytes(&self) -> &[u8] {
                 &self.0
@@ -574,6 +621,50 @@ macro_rules! ml_dsa_level {
                     return Err(Error::InvalidLength);
                 }
                 Ok($sk(bytes.to_vec()))
+            }
+
+            /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER. The
+            /// `privateKey` OCTET STRING holds the raw expanded key bytes
+            /// (purecrypto's own format).
+            #[cfg(feature = "der")]
+            pub fn to_pkcs8_der(&self) -> Vec<u8> {
+                use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+                let algid = encode_sequence(&oid_tlv($oid));
+                encode_sequence(
+                    &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
+                )
+            }
+
+            /// Encodes the private key as a PKCS#8 PEM document.
+            #[cfg(feature = "der")]
+            pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+                crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+            }
+
+            /// Parses a PKCS#8 `PrivateKeyInfo` DER, expecting the raw expanded
+            /// key bytes in the `privateKey` OCTET STRING.
+            #[cfg(feature = "der")]
+            pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+                use crate::der::{Reader, parse_oid};
+                let mut r = Reader::new(der);
+                let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
+                seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+                let mut algid = seq.read_sequence().map_err(|_| Error::Malformed)?;
+                let oid = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
+                    .map_err(|_| Error::Malformed)?;
+                if oid.as_slice() != $oid {
+                    return Err(Error::Malformed);
+                }
+                let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+                Self::from_bytes(inner)
+            }
+
+            /// Parses a PKCS#8 PEM private key.
+            #[cfg(feature = "der")]
+            pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
+                let der = crate::der::pem_decode(pem, "PRIVATE KEY")
+                    .map_err(|_| Error::Malformed)?;
+                Self::from_pkcs8_der(&der)
             }
         }
 

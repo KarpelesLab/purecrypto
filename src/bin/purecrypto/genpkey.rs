@@ -3,8 +3,11 @@
 use crate::util::{Args, die, write_output};
 use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
+use purecrypto::mlkem::MlKem768DecapsKey;
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+use purecrypto::slhdsa::{self, ParamSet as SlhDsa};
 
 const E: u64 = 65537;
 const ROUNDS: usize = 20;
@@ -19,12 +22,35 @@ fn curve_from_name(name: &str) -> Option<CurveId> {
     })
 }
 
+/// Recognizes an SLH-DSA parameter-set name.
+fn slhdsa_from_name(name: &str) -> Option<SlhDsa> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "SLH-DSA-SHA2-128S" => SlhDsa::Sha2_128s,
+        "SLH-DSA-SHA2-128F" => SlhDsa::Sha2_128f,
+        "SLH-DSA-SHA2-192S" => SlhDsa::Sha2_192s,
+        "SLH-DSA-SHA2-192F" => SlhDsa::Sha2_192f,
+        "SLH-DSA-SHA2-256S" => SlhDsa::Sha2_256s,
+        "SLH-DSA-SHA2-256F" => SlhDsa::Sha2_256f,
+        "SLH-DSA-SHAKE-128S" => SlhDsa::Shake_128s,
+        "SLH-DSA-SHAKE-128F" => SlhDsa::Shake_128f,
+        "SLH-DSA-SHAKE-192S" => SlhDsa::Shake_192s,
+        "SLH-DSA-SHAKE-192F" => SlhDsa::Shake_192f,
+        "SLH-DSA-SHAKE-256S" => SlhDsa::Shake_256s,
+        "SLH-DSA-SHAKE-256F" => SlhDsa::Shake_256f,
+        _ => return None,
+    })
+}
+
 pub(crate) fn run(args: Args) {
     let algorithm = args
         .value("-algorithm")
         .or_else(|| args.value("--algorithm"))
         .unwrap_or_else(|| {
-            die("usage: purecrypto genpkey -algorithm RSA|EC|ED25519 [-bits N|-curve NAME] [-out file]")
+            die(
+                "usage: purecrypto genpkey -algorithm ALG [-bits N|-curve NAME] [-out file]\n  \
+                 ALG: RSA | EC | ED25519 | ML-DSA-{44,65,87} | ML-KEM-768 | \
+                 SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}",
+            )
         });
     let dest = args.value("-out");
 
@@ -69,7 +95,20 @@ pub(crate) fn run(args: Args) {
             BoxedEcdsaPrivateKey::generate(curve, &mut OsRng).to_sec1_pem()
         }
         "ED25519" => Ed25519PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
-        other => die(format!("unknown algorithm: {other} (use RSA, EC, or ED25519)")),
+        "ML-DSA-44" => MlDsa44PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        "ML-DSA-65" => MlDsa65PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        "ML-DSA-87" => MlDsa87PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        "ML-KEM-768" => MlKem768DecapsKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        other => {
+            if let Some(set) = slhdsa_from_name(other) {
+                slhdsa::PrivateKey::generate(set, &mut OsRng).0.to_pkcs8_pem()
+            } else {
+                die(format!(
+                    "unknown algorithm: {other} (RSA | EC | ED25519 | ML-DSA-44/65/87 | \
+                     ML-KEM-768 | SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
+                ))
+            }
+        }
     };
 
     write_output(dest, pem.as_bytes());

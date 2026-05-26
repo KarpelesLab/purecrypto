@@ -695,6 +695,60 @@ impl PrivateKey {
             bytes: bytes.to_vec(),
         })
     }
+
+    /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER (matches the
+    /// OpenSSL 3.5 SLH-DSA layout: `privateKey` OCTET STRING holds the raw
+    /// `SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root` bytes).
+    #[cfg(feature = "der")]
+    pub fn to_pkcs8_der(&self) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&oid_tlv(self.set.params().oid));
+        encode_sequence(
+            &[encode_integer(&[0]), algid, encode_octet_string(&self.bytes)].concat(),
+        )
+    }
+
+    /// Encodes the private key as a PKCS#8 PEM document.
+    #[cfg(feature = "der")]
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+    }
+
+    /// Parses a PKCS#8 `PrivateKeyInfo` DER, returning `(set, key)`. The set is
+    /// inferred from the embedded OID. Validates the key's root against the
+    /// encoded `PK.root`.
+    #[cfg(feature = "der")]
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+        use crate::der::{Reader, parse_oid};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
+        seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        let mut algid = seq.read_sequence().map_err(|_| Error::Malformed)?;
+        let oid = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?;
+        let set = ParamSet::from_oid(oid.as_slice()).ok_or(Error::Malformed)?;
+        let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        Self::from_bytes(set, inner)
+    }
+
+    /// Parses a PKCS#8 PEM private key.
+    #[cfg(feature = "der")]
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        Self::from_pkcs8_der(&der)
+    }
+}
+
+impl ParamSet {
+    /// Finds the parameter set matching an algorithm OID, if any.
+    pub fn from_oid(oid: &[u64]) -> Option<Self> {
+        use ParamSet::*;
+        const SETS: &[ParamSet] = &[
+            Sha2_128s, Sha2_128f, Sha2_192s, Sha2_192f, Sha2_256s, Sha2_256f, Shake_128s,
+            Shake_128f, Shake_192s, Shake_192f, Shake_256s, Shake_256f,
+        ];
+        SETS.iter().copied().find(|s| s.params().oid == oid)
+    }
 }
 
 impl PublicKey {
