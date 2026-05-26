@@ -9,6 +9,7 @@ mod pki;
 mod rand;
 mod req;
 mod s_client;
+mod s_server;
 mod util;
 mod x509;
 
@@ -28,6 +29,7 @@ COMMANDS:
     req                  Create or inspect a PKCS#10 certificate request
     x509                 Inspect, self-sign, or CA-sign a certificate
     s_client             Open a TLS 1.3 connection and report the result
+    s_server             Run a one-shot TLS 1.3 echo/-www server
     help                 Show this help
 
 Run a command with no/invalid arguments to see its usage.";
@@ -45,6 +47,7 @@ fn main() {
         Some("req") => req::run(rest),
         Some("x509") => x509::run(rest),
         Some("s_client") => s_client::run(rest),
+        Some("s_server") => s_server::run(rest),
         Some("help") | Some("-h") | Some("--help") | None => println!("{USAGE}"),
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }

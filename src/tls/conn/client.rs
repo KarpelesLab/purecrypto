@@ -432,6 +432,41 @@ impl ClientConnection {
         self.alpn_negotiated.as_deref()
     }
 
+    /// The client random sent in the ClientHello. Exposed for keylogfile
+    /// output (NSS SSLKEYLOGFILE format keys each line by client random).
+    pub fn client_random(&self) -> [u8; 32] {
+        self.client_random
+    }
+
+    /// The negotiated client_handshake_traffic_secret, available after
+    /// `ServerHello` is processed. Intended for keylogfile output.
+    pub fn client_handshake_traffic_secret(&self) -> Option<Vec<u8>> {
+        self.client_hs_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// The negotiated server_handshake_traffic_secret. See
+    /// `client_handshake_traffic_secret`.
+    pub fn server_handshake_traffic_secret(&self) -> Option<Vec<u8>> {
+        self.server_hs_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// `client_application_traffic_secret_0`, available after the handshake
+    /// completes.
+    pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
+        self.client_app_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// `server_application_traffic_secret_0`, available after the handshake
+    /// completes.
+    pub fn server_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
+        self.server_app_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// `exporter_master_secret`, available after the handshake completes.
+    pub fn exporter_master_secret(&self) -> Option<Vec<u8>> {
+        self.exporter_secret.map(|s| s.as_slice().to_vec())
+    }
+
     /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705).
     /// Derives `out.len()` bytes from the `exporter_master_secret` under
     /// `(label, context)`. Returns `Err(InappropriateState)` before the
