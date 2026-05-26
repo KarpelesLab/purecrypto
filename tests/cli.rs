@@ -442,6 +442,92 @@ fn s_client_live_cloudflare_tls12() {
     assert!(ok);
 }
 
+/// `s_dtls_client` and `s_dtls_server` round-trip over a local UDP port,
+/// exercising the DTLS 1.2 handshake (with HelloVerifyRequest cookie)
+/// and an app-data echo.
+#[test]
+fn s_dtls_client_s_dtls_server_roundtrip() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    // Pick a free UDP port up front by binding then dropping.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let dir = std::env::temp_dir().join(format!("pc_s_dtls_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+
+    // Self-signed P-256 ECDSA cert for 127.0.0.1. The DTLS 1.2 server we
+    // wrap is ECDSA-only.
+    let mut rng = OsRng;
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+
+    // Spawn s_dtls_server in a background process. Disable the cookie
+    // exchange to keep the round-trip path short — the cookie path is
+    // exercised by the DTLS unit tests.
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_dtls_server",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            &format!("127.0.0.1:{port}"),
+            "-no_cookie",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_dtls_server");
+
+    // Give the server time to bind.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // s_dtls_client connects, sends one line, and expects the echo back.
+    let (out, _ok) = run(
+        &[
+            "s_dtls_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-quiet",
+        ],
+        b"hello\n",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    // The CLI exits when the data-phase idle deadline fires; we don't
+    // assert on the exit code (which is non-deterministic across CI
+    // schedulers) — only that the echo round-tripped.
+    assert!(
+        out.contains("hello"),
+        "expected 'hello' in client stdout, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn genpkey_ec_then_inspect() {
     let (key_pem, ok) = run(&["genpkey", "-algorithm", "EC", "-curve", "P-256"], b"");

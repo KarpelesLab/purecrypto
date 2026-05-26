@@ -9,6 +9,8 @@ mod pki;
 mod rand;
 mod req;
 mod s_client;
+mod s_dtls_client;
+mod s_dtls_server;
 mod s_server;
 mod util;
 mod x509;
@@ -30,6 +32,8 @@ COMMANDS:
     x509                 Inspect, self-sign, or CA-sign a certificate
     s_client             Open a TLS 1.3 connection and report the result
     s_server             Run a one-shot TLS 1.3 echo/-www server
+    s_dtls_client        Open a DTLS 1.2 connection over UDP
+    s_dtls_server        Run a one-shot DTLS 1.2 echo server over UDP
     help                 Show this help
 
 Run a command with no/invalid arguments to see its usage.";
@@ -48,6 +52,8 @@ fn main() {
         Some("x509") => x509::run(rest),
         Some("s_client") => s_client::run(rest),
         Some("s_server") => s_server::run(rest),
+        Some("s_dtls_client") => s_dtls_client::run(rest),
+        Some("s_dtls_server") => s_dtls_server::run(rest),
         Some("help") | Some("-h") | Some("--help") | None => println!("{USAGE}"),
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }
