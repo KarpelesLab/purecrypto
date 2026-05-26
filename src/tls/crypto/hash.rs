@@ -41,6 +41,13 @@ impl Transcript {
         self.buf.extend_from_slice(message);
     }
 
+    /// Returns the buffered handshake-message bytes (in wire order). Used by
+    /// the TLS 1.2 `CertificateVerify` path, which signs the raw transcript
+    /// (RFC 5246 §7.4.8) — the signer hashes the bytes internally.
+    pub(crate) fn buffered_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// `Transcript-Hash` of everything accumulated so far.
     ///
     /// # Panics

@@ -106,6 +106,12 @@ u16_id!(
         ALPN = 0x0010,
         /// record_size_limit (RFC 8449).
         RECORD_SIZE_LIMIT = 0x001c,
+        /// session_ticket (RFC 5077). Empty body in CH advertises ticket
+        /// support; empty body in SH signals the server will issue one (and
+        /// the NewSessionTicket follows in its plaintext flight); a non-empty
+        /// body in CH carries the ticket the client wants to resume.
+        #[allow(dead_code)]
+        SESSION_TICKET = 0x0023,
         /// pre_shared_key (RFC 8446 §4.2.11).
         PRE_SHARED_KEY = 0x0029,
         /// early_data (RFC 8446 §4.2.10). Empty body in CH/EE; carries a

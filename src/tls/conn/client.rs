@@ -113,7 +113,14 @@ impl ClientCertConfig {
     }
 
     fn signature_scheme(&self) -> SignatureScheme {
-        match &self.key {
+        Self::signature_scheme_for(&self.key)
+    }
+
+    /// Internal helper exposed to the TLS 1.2 client: the IANA-blessed
+    /// signature scheme for a given [`ClientKey`]. Same code points as TLS
+    /// 1.3 (the registry is shared).
+    pub(super) fn signature_scheme_for(key: &ClientKey) -> SignatureScheme {
+        match key {
             ClientKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
             ClientKey::Ecdsa(k) => match k.curve() {
                 CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
@@ -126,6 +133,16 @@ impl ClientCertConfig {
             ClientKey::MlDsa65(_) => SignatureScheme::MLDSA65,
             ClientKey::MlDsa87(_) => SignatureScheme::MLDSA87,
         }
+    }
+
+    /// Access for the TLS 1.2 client (uses the same struct for mTLS).
+    pub(super) fn chain(&self) -> &[Vec<u8>] {
+        &self.chain
+    }
+
+    /// Access for the TLS 1.2 client.
+    pub(super) fn key(&self) -> &ClientKey {
+        &self.key
     }
 }
 

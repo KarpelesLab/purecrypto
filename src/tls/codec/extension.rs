@@ -142,6 +142,16 @@ pub(crate) fn parse_renegotiation_info(body: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(inner.to_vec())
 }
 
+/// `session_ticket` (RFC 5077) carrying an opaque ticket. In ClientHello an
+/// empty body advertises support; a non-empty body resumes. In ServerHello an
+/// empty body signals the server will issue a fresh NewSessionTicket (RFC 5077
+/// §3.2).
+// Used by the TLS 1.2 session-ticket plumbing (commit 5).
+#[allow(dead_code)]
+pub(crate) fn session_ticket(ticket: &[u8]) -> RawExtension {
+    (ExtensionType::SESSION_TICKET, ticket.to_vec())
+}
+
 /// `record_size_limit` (RFC 8449): a single u16 in `64..=2^14+1` advertising
 /// the maximum plaintext fragment the peer may send us.
 pub(crate) fn record_size_limit(limit: u16) -> RawExtension {
