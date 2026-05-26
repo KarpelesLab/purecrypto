@@ -58,6 +58,9 @@ pub mod mldsa;
 #[cfg(feature = "mlkem")]
 pub mod mlkem;
 
+#[cfg(feature = "slhdsa")]
+pub mod slhdsa;
+
 #[cfg(feature = "rng")]
 pub mod rng;
 
