@@ -1,6 +1,6 @@
 //! `purecrypto genpkey` — generate an RSA or EC private key (PEM).
 
-use crate::util::{Args, die, write_output};
+use crate::util::{Args, die, write_output_with_mode};
 use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
@@ -72,8 +72,19 @@ pub(crate) fn run(args: Args) {
                 4096 => RsaPrivateKey::<64>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
                     .to_pkcs1_pem(),
                 _ => {
-                    if !(512..=65536).contains(&bits) || !bits.is_multiple_of(2) {
-                        die("unsupported RSA size (use an even value, 512..=65536 bits)");
+                    // RSA below 2048 bits is rejected by default per NIST
+                    // SP 800-57: callers needing legacy interop can opt in
+                    // with `--allow-weak`.
+                    if !(2048..=65536).contains(&bits) || !bits.is_multiple_of(2) {
+                        if !(512..=65536).contains(&bits) || !bits.is_multiple_of(2) {
+                            die("unsupported RSA size (use an even value, 512..=65536 bits)");
+                        }
+                        if !(args.flag("--allow-weak") || args.flag("-allow-weak")) {
+                            die(
+                                "refusing to generate an RSA key below 2048 bits — pass \
+                                 `--allow-weak` to override (NIST SP 800-57)",
+                            );
+                        }
                     }
                     BoxedRsaPrivateKey::generate(
                         bits as usize,
@@ -115,5 +126,5 @@ pub(crate) fn run(args: Args) {
         }
     };
 
-    write_output(dest, pem.as_bytes());
+    write_output_with_mode(dest, pem.as_bytes(), /* private = */ true);
 }
