@@ -10,8 +10,16 @@
 //! epoch, a 48-bit sequence number, anti-replay sliding window, and the
 //! HelloVerifyRequest cookie that gates server resource allocation.
 
+pub mod client12;
 mod cookie;
 mod reassembly;
 mod record;
 mod reliability;
 mod replay;
+pub mod server12;
+
+pub use client12::{DtlsClientConfig12, DtlsClientConnection12};
+pub use server12::{DtlsServerConfig12, DtlsServerConnection12};
+
+#[cfg(test)]
+mod tests;
