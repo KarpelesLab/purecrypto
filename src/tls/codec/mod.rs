@@ -13,8 +13,8 @@ pub(crate) use handshake::{
 };
 #[allow(unused_imports)]
 pub(crate) use handshake12::{
-    CertificateRequest12, ClientKeyExchange, HelloRequest, ServerHelloDone, ServerKeyExchange,
-    signed_message,
+    CertificateRequest12, ClientKeyExchange, HelloRequest, NewSessionTicket12, ServerHelloDone,
+    ServerKeyExchange, signed_message,
 };
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};

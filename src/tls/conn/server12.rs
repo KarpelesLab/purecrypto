@@ -1,13 +1,17 @@
-//! TLS 1.2 server state machine (RFC 5246) — ECDHE-AEAD, server-cert only.
+//! TLS 1.2 server state machine (RFC 5246 + RFC 5077) — ECDHE-AEAD.
 //!
 //! [`ServerConnection12`] is the server-side mirror of
 //! [`super::client12::ClientConnection12`]: it consumes a `ClientHello`, picks
 //! a cipher suite and key-exchange group, emits the server flight
-//! (`ServerHello`, `Certificate`, `ServerKeyExchange`, `ServerHelloDone`), then
-//! processes the client's `ClientKeyExchange` / `ChangeCipherSpec` / `Finished`
-//! and emits its own `ChangeCipherSpec` + `Finished`.
+//! (`ServerHello`, `Certificate`, `ServerKeyExchange`, [`CertificateRequest`],
+//! `ServerHelloDone`), then processes the client's `Certificate` /
+//! `ClientKeyExchange` / [`CertificateVerify`] / `ChangeCipherSpec` /
+//! `Finished` and emits its own [`NewSessionTicket`] / `ChangeCipherSpec` +
+//! `Finished`.
 //!
-//! Client authentication (mTLS) and RFC 5077 session tickets land in commit 5.
+//! Supports mTLS (RFC 5246 §7.4.4 + §7.4.6 + §7.4.8) via
+//! [`ServerConfig12::with_client_auth`] and RFC 5077 stateless session
+//! tickets via [`ServerConfig12::with_ticket_key`].
 //!
 //! # Record-layer note
 //!
@@ -17,18 +21,22 @@
 //! [`super::common::ConnectionCore`].
 
 use super::super::codec::{ParsedRecord, read_record, write_record};
-use super::client12::{SUITES_12, SigKind, SuiteParams12};
+use super::client12::{
+    SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
+};
 use super::server::ServerKey;
+use super::ticket12::{Ticket12Plaintext, open_ticket, seal_ticket};
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
-use crate::signature_registry::SignaturePolicy;
+use crate::signature_registry::{ALGORITHMS, SignaturePolicy};
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::handshake12::{
-    ClientKeyExchange, ServerHelloDone, ServerKeyExchange, signed_message,
+    CertificateRequest12, ClientKeyExchange, NewSessionTicket12, ServerHelloDone,
+    ServerKeyExchange, signed_message,
 };
 use crate::tls::codec::{
     ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
@@ -37,16 +45,20 @@ use crate::tls::codec::{
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
+use crate::tls::crypto::verify_signature;
+use crate::tls::pki::{RootCertStore, verify_chain};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
+use crate::x509::AnyPublicKey;
 use alloc::vec::Vec;
 
 /// Configuration for a TLS 1.2 server connection.
 ///
-/// Parallels [`super::server::ServerConfig`] but trims the TLS-1.3-only knobs
-/// (PSK tickets, 0-RTT, mTLS — those land in later commits). Unlike the TLS
-/// 1.3 server, ML-DSA and Ed25519 server keys are not accepted here: TLS 1.2
-/// has no IANA-assigned `TLS_ECDHE_EDDSA_*` or `TLS_ECDHE_MLDSA_*` cipher
-/// suites, so a non-RSA/non-ECDSA key would have nothing to match.
+/// Parallels [`super::server::ServerConfig`], including mTLS via
+/// [`Self::with_client_auth`] and RFC 5077 session tickets via
+/// [`Self::with_ticket_key`]. Unlike the TLS 1.3 server, ML-DSA and Ed25519
+/// server keys are not accepted here: TLS 1.2 has no IANA-assigned
+/// `TLS_ECDHE_EDDSA_*` or `TLS_ECDHE_MLDSA_*` cipher suites, so a non-RSA /
+/// non-ECDSA key would have nothing to match.
 pub struct ServerConfig12 {
     /// Certificate chain (leaf first) presented to the peer.
     cert_chain: Vec<Vec<u8>>,
@@ -60,8 +72,35 @@ pub struct ServerConfig12 {
     /// fragment the peer may send us.
     record_size_limit: Option<u16>,
     /// Whitelist of signature algorithms the server is willing to use in its
-    /// `ServerKeyExchange` signature. Defaults to [`SignaturePolicy::modern`].
+    /// `ServerKeyExchange` signature, and to accept in client-cert chains /
+    /// `CertificateVerify` under mTLS. Defaults to
+    /// [`SignaturePolicy::modern`].
     signature_policy: SignaturePolicy,
+    /// mTLS policy: when set, the server emits `CertificateRequest` and
+    /// validates the client's chain against `roots`. When `required` is
+    /// `true`, an empty client `Certificate` aborts with
+    /// `certificate_required`. `None` skips mTLS entirely.
+    client_auth: Option<ClientAuthPolicy12>,
+    /// RFC 5077 ticket-encryption key. When set, the server emits a
+    /// `NewSessionTicket` on fresh full handshakes and accepts resumption
+    /// from clients that present a valid ticket. `None` disables tickets.
+    ticket_key: Option<[u8; 32]>,
+    /// Lifetime advertised in NewSessionTickets (seconds) and used to
+    /// expire decrypted tickets server-side. Defaults to 7200 (2 hours).
+    ticket_lifetime: u32,
+}
+
+/// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
+/// §7.4.6 + §7.4.8). Parallels [`super::server::ClientAuthPolicy`] — kept
+/// separate so the TLS 1.2 path is not coupled to the TLS 1.3 server's
+/// config layout.
+pub struct ClientAuthPolicy12 {
+    /// Trust anchors used to validate the client chain.
+    pub roots: RootCertStore,
+    /// When `true`, an empty client `Certificate` aborts the handshake with
+    /// `certificate_required`. When `false`, an empty `Certificate` is
+    /// accepted and no `CertificateVerify` is required.
+    pub required: bool,
 }
 
 impl ServerConfig12 {
@@ -74,6 +113,9 @@ impl ServerConfig12 {
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             signature_policy: SignaturePolicy::modern(),
+            client_auth: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
         }
     }
 
@@ -86,6 +128,9 @@ impl ServerConfig12 {
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             signature_policy: SignaturePolicy::modern(),
+            client_auth: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
         }
     }
 
@@ -104,6 +149,34 @@ impl ServerConfig12 {
     /// Replaces the signature-algorithm whitelist.
     pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
         self.signature_policy = policy;
+        self
+    }
+
+    /// Demand a client certificate from peers (RFC 5246 §7.4.4). When
+    /// `required` is `true`, a peer that presents an empty `Certificate`
+    /// aborts the handshake with `certificate_required`. When `false`, an
+    /// absent client cert is allowed.
+    pub fn with_client_auth(mut self, roots: RootCertStore, required: bool) -> Self {
+        self.client_auth = Some(ClientAuthPolicy12 { roots, required });
+        self
+    }
+
+    /// Enables RFC 5077 session resumption: the server emits one
+    /// `NewSessionTicket` after a fresh handshake (encrypted under this 32-byte
+    /// AES-256-GCM key) and decrypts client-presented tickets to resume.
+    /// Without this, the server does not emit tickets and clients cannot
+    /// resume.
+    pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
+        self.ticket_key = Some(key);
+        self
+    }
+
+    /// Sets the lifetime advertised in `NewSessionTicket` (seconds), also used
+    /// as the server-side expiry cap on decrypted tickets. Capped at 7 days;
+    /// defaults to two hours.
+    pub fn with_ticket_lifetime(mut self, seconds: u32) -> Self {
+        const MAX: u32 = 7 * 24 * 60 * 60;
+        self.ticket_lifetime = seconds.min(MAX);
         self
     }
 
@@ -144,10 +217,20 @@ impl ServerConfig12 {
 #[derive(PartialEq, Eq, Debug)]
 enum State {
     WaitClientHello,
+    /// mTLS only: after our `ServerHelloDone`, the client's first message
+    /// MUST be `Certificate` (RFC 5246 §7.3).
+    WaitClientCertificate,
     WaitClientKeyExchange,
-    /// We've processed CKE and are now expecting the client's CCS record (a
-    /// non-handshake record) followed by their encrypted Finished.
+    /// mTLS only: after `ClientKeyExchange`, expect `CertificateVerify` —
+    /// but only if the client actually sent a non-empty `Certificate`.
+    WaitClientCertVerify,
+    /// We've processed CKE (+ CertVerify under mTLS) and are now expecting
+    /// the client's CCS record followed by their encrypted Finished.
     WaitClientFinished,
+    /// Resumed handshake (RFC 5077 §3.4): we picked up a valid ticket from
+    /// the client's CH; the next message after our SH/CCS/Finished is the
+    /// client's encrypted Finished.
+    WaitResumedClientFinished,
     Connected,
     Closed,
 }
@@ -193,7 +276,8 @@ pub struct ServerConnection12<R: RngCore> {
     /// our own configured value.
     peer_offered_record_size_limit: bool,
 
-    /// 48-byte master secret derived once CKE is processed.
+    /// 48-byte master secret derived once CKE is processed (or recovered
+    /// from a valid ticket on resumed handshakes).
     master: Option<[u8; 48]>,
     /// Record-protection state once `server_crypter` is installed (after we
     /// emit our CCS).
@@ -202,10 +286,25 @@ pub struct ServerConnection12<R: RngCore> {
     /// peer's CCS arrives).
     client_crypter: Option<RecordCrypter12>,
     /// Pre-built crypters held until the matching CCS event installs them.
-    /// `pending_client_crypter` is the read side, `pending_server_crypter` the
-    /// write side; both are populated when we process the CKE.
+    /// Populated when we process the CKE (fresh) or right after parsing the
+    /// CH (resumed).
     pending_client_crypter: Option<RecordCrypter12>,
     pending_server_crypter: Option<RecordCrypter12>,
+
+    /// mTLS: the client's certificate chain (leaf first) after parsing its
+    /// `Certificate` message. Empty if the client offered no cert.
+    client_cert_chain: Vec<Vec<u8>>,
+    /// mTLS: the client's leaf public key, recovered from the chain. `None`
+    /// when the chain is empty.
+    client_leaf_key: Option<AnyPublicKey>,
+    /// RFC 5077: whether the peer advertised the `session_ticket` extension
+    /// in its CH. Drives whether we echo the empty extension in SH and emit
+    /// `NewSessionTicket` after our Finished.
+    peer_offered_session_ticket: bool,
+    /// RFC 5077: true on resumed handshakes (we recovered a master secret
+    /// from a valid ticket presented in the client's CH). Skips Certificate /
+    /// SKE / CertReq / SHDone and changes the post-CH state path.
+    resumed: bool,
 }
 
 impl<R: RngCore> ServerConnection12<R> {
@@ -236,7 +335,24 @@ impl<R: RngCore> ServerConnection12<R> {
             client_crypter: None,
             pending_client_crypter: None,
             pending_server_crypter: None,
+            client_cert_chain: Vec::new(),
+            client_leaf_key: None,
+            peer_offered_session_ticket: false,
+            resumed: false,
         }
+    }
+
+    /// The client's certificate chain in wire order (DER), leaf first. Empty
+    /// when no mTLS was negotiated or the client offered an empty
+    /// `Certificate`.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.client_cert_chain
+    }
+
+    /// `true` if this handshake resumed a prior session via RFC 5077
+    /// session ticket.
+    pub fn did_resume(&self) -> bool {
+        self.resumed
     }
 
     /// The negotiated cipher-suite wire identifier, available once the
@@ -394,13 +510,16 @@ impl<R: RngCore> ServerConnection12<R> {
                 ContentType::ChangeCipherSpec => {
                     // RFC 5246 §7.1: the only legal body is `[0x01]`. We only
                     // accept it in the middlebox-compat window, and only when
-                    // we're waiting for the client's Finished.
+                    // we're waiting for the client's Finished (fresh or
+                    // resumed) — and we have a pending read crypter ready.
                     if !self.ccs_window_open || fragment.as_slice() != [0x01] {
                         return Err(Error::UnexpectedMessage);
                     }
-                    if self.state != State::WaitClientFinished
-                        || self.pending_client_crypter.is_none()
-                    {
+                    let awaiting_finished = matches!(
+                        self.state,
+                        State::WaitClientFinished | State::WaitResumedClientFinished
+                    );
+                    if !awaiting_finished || self.pending_client_crypter.is_none() {
                         return Err(Error::UnexpectedMessage);
                     }
                     // Install the read crypter; the next handshake record
@@ -463,8 +582,13 @@ impl<R: RngCore> ServerConnection12<R> {
 
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
+            State::WaitClientCertificate => self.on_client_certificate(msg_type, body, &msg),
             State::WaitClientKeyExchange => self.on_client_key_exchange(msg_type, body, &msg),
+            State::WaitClientCertVerify => self.on_client_cert_verify(msg_type, body, &msg),
             State::WaitClientFinished => self.on_client_finished(msg_type, body, &msg),
+            State::WaitResumedClientFinished => {
+                self.on_resumed_client_finished(msg_type, body, &msg)
+            }
             State::Connected | State::Closed => Err(Error::UnexpectedMessage),
         }
     }
@@ -475,23 +599,9 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         let ch = ClientHello::decode(body)?;
 
-        // If the client offered TLS 1.3 via `supported_versions`, we still
-        // happily downgrade to TLS 1.2 here — a real TLS 1.3 client picks 1.3,
-        // and downgrade signalling is commit 6's territory. We just process
-        // the CH as the TLS 1.2 message it is.
-
-        // Pick the first cipher suite in OUR preference order that the client
-        // offered, subject to our key's signature family.
-        let sig_kind = self.config.sig_kind();
-        let suite = SUITES_12
-            .iter()
-            .copied()
-            .find(|p| p.sig_kind == sig_kind && ch.cipher_suites.contains(&p.suite))
-            .ok_or(Error::HandshakeFailure)?;
-
         // RFC 5246 §7.4.1.4.1: TLS 1.2 ClientHello MUST carry
-        // `signature_algorithms`. The list must include a scheme our cert key
-        // can produce.
+        // `signature_algorithms`. (Required regardless of resumption: we may
+        // fall back to a fresh handshake if the ticket is bad.)
         let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
             .ok_or(Error::HandshakeFailure)?;
         let offered = ext::parse_signature_algorithms(sig_algs)?;
@@ -500,8 +610,7 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::HandshakeFailure);
         }
 
-        // `supported_groups` must include at least one group we can complete
-        // — we offer X25519 first then SECP256R1.
+        // `supported_groups` must include at least one group we can complete.
         let groups_body = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
         let groups = parse_supported_groups(groups_body)?;
@@ -514,7 +623,6 @@ impl<R: RngCore> ServerConnection12<R> {
         };
 
         // RFC 4492 §5.1.2: `ec_point_formats` must include `uncompressed` (0).
-        // The extension is mandatory for ECDHE peers in TLS 1.2.
         let epf = ext::find(&ch.extensions, ExtensionType::EC_POINT_FORMATS)
             .ok_or(Error::HandshakeFailure)?;
         let fmts = ext::parse_ec_point_formats(epf)?;
@@ -537,9 +645,7 @@ impl<R: RngCore> ServerConnection12<R> {
             }
         }
 
-        // Parse the client's `record_size_limit`, if any (we honour it on the
-        // write side via send_application_data fragmentation — currently
-        // bounded by the protocol cap; honouring this knob is a follow-up).
+        // record_size_limit echo (currently advisory on the write side).
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
             let _limit = ext::parse_record_size_limit(rsl_body)?;
             self.peer_offered_record_size_limit = true;
@@ -547,13 +653,85 @@ impl<R: RngCore> ServerConnection12<R> {
 
         // RFC 5746 §3.6: echo `renegotiation_info` iff the peer sent it.
         if let Some(reneg) = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO) {
-            // The body must be a u8-length-prefixed empty vector (fresh handshake).
             let inner = ext::parse_renegotiation_info(reneg)?;
             if !inner.is_empty() {
                 return Err(Error::HandshakeFailure);
             }
             self.peer_offered_reneg_info = true;
         }
+
+        // RFC 5077 §3.1: the client advertises ticket support via the
+        // `session_ticket` extension. An empty body = "support, no ticket";
+        // non-empty = "please resume this ticket".
+        let ticket_ext = ext::find(&ch.extensions, ExtensionType::SESSION_TICKET);
+        self.peer_offered_session_ticket = ticket_ext.is_some();
+
+        // Attempt resumption only if a ticket key is configured, the client
+        // presented a non-empty ticket, and we can decrypt + parse it into a
+        // suite we still support (matching the client's offered list).
+        let resume = ticket_ext
+            .filter(|t| !t.is_empty())
+            .and_then(|t| self.try_resume(t, &ch.cipher_suites));
+
+        if let Some(rs) = resume {
+            // RESUMED HANDSHAKE PATH (RFC 5077 §3.4).
+            self.transcript.set_alg(rs.suite.hash);
+            self.transcript.update(raw);
+
+            let mut server_random: Random = [0u8; 32];
+            self.rng.fill_bytes(&mut server_random);
+
+            self.suite = Some(rs.suite);
+            self.client_random = Some(ch.random);
+            self.server_random = Some(server_random);
+            self.master = Some(rs.master_secret);
+            self.resumed = true;
+
+            // Derive a fresh key_block from the recovered master_secret and
+            // the new randoms.
+            let cr = ch.random;
+            let sr = server_random;
+            let kb_len = 2 * rs.suite.key_len + 8;
+            let mut kb = alloc::vec![0u8; kb_len];
+            key_block(rs.suite.hash, &rs.master_secret, &sr, &cr, &mut kb);
+            let (c_key, rest) = kb.split_at(rs.suite.key_len);
+            let (s_key, ivs) = rest.split_at(rs.suite.key_len);
+            let mut c_salt = [0u8; 4];
+            c_salt.copy_from_slice(&ivs[..4]);
+            let mut s_salt = [0u8; 4];
+            s_salt.copy_from_slice(&ivs[4..8]);
+            self.pending_client_crypter = Some(RecordCrypter12::new(rs.suite.aead, c_key, c_salt));
+            self.pending_server_crypter = Some(RecordCrypter12::new(rs.suite.aead, s_key, s_salt));
+
+            // SH (without echoing session_ticket — signals resumption to client).
+            self.send_server_hello()?;
+
+            // Our CCS + Finished, encrypted under the new server crypter.
+            self.write_plain_record(ContentType::ChangeCipherSpec, &[0x01]);
+            self.server_crypter = self.pending_server_crypter.take();
+
+            let th = self.transcript.current_hash();
+            let verify_data = finished_verify_data(
+                rs.suite.hash,
+                &rs.master_secret,
+                b"server finished",
+                th.as_slice(),
+            );
+            let finished = build_finished(&verify_data);
+            self.transcript.update(&finished);
+            self.emit_encrypted(ContentType::Handshake, &finished)?;
+
+            self.state = State::WaitResumedClientFinished;
+            return Ok(());
+        }
+
+        // FRESH HANDSHAKE PATH.
+        let sig_kind = self.config.sig_kind();
+        let suite = SUITES_12
+            .iter()
+            .copied()
+            .find(|p| p.sig_kind == sig_kind && ch.cipher_suites.contains(&p.suite))
+            .ok_or(Error::HandshakeFailure)?;
 
         // Pin the transcript hash now that we know the suite.
         self.transcript.set_alg(suite.hash);
@@ -568,14 +746,67 @@ impl<R: RngCore> ServerConnection12<R> {
         self.client_random = Some(ch.random);
         self.server_random = Some(server_random);
 
-        // Emit the server flight: SH, Certificate, SKE, ServerHelloDone.
+        // Emit the server flight: SH, Certificate, SKE, [CertificateRequest],
+        // ServerHelloDone. Per RFC 5246 §7.3, CertificateRequest comes
+        // AFTER ServerKeyExchange and BEFORE ServerHelloDone.
         self.send_server_hello()?;
         self.send_certificate();
         self.send_server_key_exchange()?;
+        if self.config.client_auth.is_some() {
+            self.send_certificate_request();
+        }
         self.send_server_hello_done();
 
-        self.state = State::WaitClientKeyExchange;
+        // mTLS: the client's first message after our SHDone is Certificate.
+        self.state = if self.config.client_auth.is_some() {
+            State::WaitClientCertificate
+        } else {
+            State::WaitClientKeyExchange
+        };
         Ok(())
+    }
+
+    /// RFC 5077 §3.4: try to decrypt the client's ticket, recover its
+    /// `Ticket12Plaintext`, and check it against the client's offered cipher
+    /// suites and our configured lifetime. Returns `None` on any failure —
+    /// the caller falls back to a fresh full handshake.
+    fn try_resume(
+        &mut self,
+        ticket: &[u8],
+        offered: &[crate::tls::codec::CipherSuite],
+    ) -> Option<ResumedState> {
+        let key = self.config.ticket_key.as_ref()?;
+        let plain = open_ticket(key, ticket)?;
+        let parsed = Ticket12Plaintext::decode(&plain)?;
+        let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
+        // The resumed suite MUST be one the client is still offering.
+        if !offered.contains(&suite_code) {
+            return None;
+        }
+        let suite = lookup_suite_12(suite_code)?;
+        // The resumed suite must also match the configured server key's
+        // signature family.
+        if suite.sig_kind != self.config.sig_kind() {
+            return None;
+        }
+        // Expiry: ticket_lifetime seconds from creation.
+        let now = system_now_u64();
+        if now != 0
+            && parsed.creation_time != 0
+            && now.saturating_sub(parsed.creation_time) > self.config.ticket_lifetime as u64
+        {
+            return None;
+        }
+        // ALPN match: keep the recovered ALPN if it's in our config.
+        if let Some(ref alpn) = parsed.alpn
+            && self.config.alpn_protocols.iter().any(|p| p == alpn)
+        {
+            self.alpn_negotiated = Some(alpn.clone());
+        }
+        Some(ResumedState {
+            suite,
+            master_secret: parsed.master_secret,
+        })
     }
 
     fn send_server_hello(&mut self) -> Result<(), Error> {
@@ -596,6 +827,14 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_offered_record_size_limit,
         ) {
             extensions.push(ext::record_size_limit(limit));
+        }
+        // RFC 5077 §3.2: echo an empty `session_ticket` extension iff
+        // (a) the peer advertised support AND (b) we will issue a fresh
+        // ticket. On a successful resume we do NOT issue a new ticket this
+        // round (simplifies the flow); the extension is therefore absent in
+        // SH on resume.
+        if self.peer_offered_session_ticket && !self.resumed && self.config.ticket_key.is_some() {
+            extensions.push(ext::session_ticket(&[]));
         }
 
         let sh = ServerHello {
@@ -623,6 +862,120 @@ impl<R: RngCore> ServerConnection12<R> {
         });
         self.transcript.update(&msg);
         self.write_plain_record(ContentType::Handshake, &msg);
+    }
+
+    /// RFC 5246 §7.4.4: emit a `CertificateRequest` listing the cert types
+    /// (rsa_sign + ecdsa_sign), our `signature_algorithms` (filtered by the
+    /// configured policy), and an empty CA list (we accept any chain that
+    /// validates against the configured `roots`).
+    fn send_certificate_request(&mut self) {
+        let cert_types = alloc::vec![1u8, 64u8]; // rsa_sign, ecdsa_sign
+        // Permitted-by-policy entries with a non-empty TLS scheme list.
+        // We use an empty SPKI as the "no key context" probe — the RSA
+        // entries' `rsa_modulus_bits` returns None on an empty SPKI, so
+        // the min-bits check is skipped; other entries return None
+        // unconditionally.
+        let mut sig_schemes: Vec<SignatureScheme> = Vec::new();
+        for algo in ALGORITHMS {
+            if !self.config.signature_policy.permits(*algo, &[]) {
+                continue;
+            }
+            for &scheme in algo.tls_schemes() {
+                let s = SignatureScheme(scheme);
+                if !sig_schemes.contains(&s) {
+                    sig_schemes.push(s);
+                }
+            }
+        }
+        let cr = CertificateRequest12 {
+            cert_types,
+            sig_schemes,
+            cas: Vec::new(),
+        };
+        let bytes = cr.encode();
+        self.transcript.update(&bytes);
+        self.write_plain_record(ContentType::Handshake, &bytes);
+    }
+
+    /// mTLS: process the client's `Certificate` message. An empty chain is
+    /// allowed only when policy is `required = false`; in that case we skip
+    /// straight past `WaitClientCertVerify` to `WaitClientKeyExchange`
+    /// (CertificateVerify is omitted per RFC 5246 §7.4.8).
+    fn on_client_certificate(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE {
+            return Err(Error::UnexpectedMessage);
+        }
+        let chain = parse_certificate_list_12(body)?;
+        let policy = self
+            .config
+            .client_auth
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        if chain.is_empty() {
+            if policy.required {
+                return Err(Error::CertificateRequired);
+            }
+            self.transcript.update(raw);
+            self.client_cert_chain.clear();
+            self.client_leaf_key = None;
+            self.state = State::WaitClientKeyExchange;
+            return Ok(());
+        }
+        // Validate the chain. We pass `None` for `now`.
+        let leaf_key = verify_chain(&policy.roots, &chain, None, &self.config.signature_policy)?;
+        self.transcript.update(raw);
+        self.client_cert_chain = chain;
+        self.client_leaf_key = Some(leaf_key);
+        self.state = State::WaitClientKeyExchange;
+        Ok(())
+    }
+
+    /// mTLS: verify the client's `CertificateVerify` over the raw transcript
+    /// up to and including `ClientKeyExchange` (RFC 5246 §7.4.8). The signer
+    /// hashes internally, so we pass the unmodified transcript bytes.
+    fn on_client_cert_verify(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE_VERIFY {
+            return Err(Error::UnexpectedMessage);
+        }
+        let mut c = ReadCursor::new(body);
+        let scheme = SignatureScheme(c.u16()?);
+        let signature = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+
+        let leaf_key = self
+            .client_leaf_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        // The signed bytes are exactly the transcript buffer at this point
+        // (CH..CKE inclusive). The registry verifier hashes internally.
+        let message = self.transcript.buffered_bytes().to_vec();
+        verify_signature(
+            scheme,
+            leaf_key,
+            &message,
+            &signature,
+            &self.config.signature_policy,
+        )
+        .map_err(|e| match e {
+            // RFC 5246 §7.4.8 calls a bad signature `decrypt_error`. Map
+            // BadCertificate from the registry to that here.
+            Error::BadCertificate => Error::DecryptError,
+            other => other,
+        })?;
+
+        self.transcript.update(raw);
+        self.state = State::WaitClientFinished;
+        Ok(())
     }
 
     fn send_server_key_exchange(&mut self) -> Result<(), Error> {
@@ -735,7 +1088,14 @@ impl<R: RngCore> ServerConnection12<R> {
         self.master = Some(master);
 
         self.transcript.update(raw);
-        self.state = State::WaitClientFinished;
+        // mTLS: if the client presented a non-empty Certificate, the next
+        // message is CertificateVerify (RFC 5246 §7.4.8). Otherwise skip
+        // straight to expecting their CCS + Finished.
+        self.state = if self.client_leaf_key.is_some() {
+            State::WaitClientCertVerify
+        } else {
+            State::WaitClientFinished
+        };
         Ok(())
     }
 
@@ -754,14 +1114,22 @@ impl<R: RngCore> ServerConnection12<R> {
         let suite = self.suite.expect("suite set");
         let master = self.master.expect("master set");
 
-        // The transcript at this point covers CH..CKE; the client's
-        // verify_data is over exactly that prefix.
+        // The transcript at this point covers CH..CKE (and CertVerify if
+        // mTLS was negotiated); the client's verify_data is over exactly
+        // that prefix.
         let th = self.transcript.current_hash();
         let expected = finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
         self.transcript.update(raw);
+
+        // RFC 5077 §3.3: NewSessionTicket comes AFTER the client's Finished
+        // but BEFORE our CCS. Emit it under the plaintext (pre-CCS) write
+        // path so the wire ordering matches the spec.
+        if self.peer_offered_session_ticket && self.config.ticket_key.is_some() {
+            self.emit_session_ticket(suite, &master)?;
+        }
 
         // Emit our CCS (plaintext, outside the transcript) and install the
         // server write crypter.
@@ -773,7 +1141,6 @@ impl<R: RngCore> ServerConnection12<R> {
         let verify_data =
             finished_verify_data(suite.hash, &master, b"server finished", th2.as_slice());
         let finished = build_finished(&verify_data);
-        // Append to transcript for completeness; nothing reads it after.
         self.transcript.update(&finished);
         self.emit_encrypted(ContentType::Handshake, &finished)?;
 
@@ -781,6 +1148,92 @@ impl<R: RngCore> ServerConnection12<R> {
         self.state = State::Connected;
         Ok(())
     }
+
+    /// On a resumed handshake the client's Finished is the LAST message; we
+    /// then transition straight to `Connected`. The server's CCS+Finished
+    /// were emitted in `on_client_hello`.
+    fn on_resumed_client_finished(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::FINISHED {
+            return Err(Error::UnexpectedMessage);
+        }
+        if body.len() != 12 {
+            return Err(Error::Decode);
+        }
+        if self.client_crypter.is_none() {
+            return Err(Error::UnexpectedMessage);
+        }
+        let suite = self.suite.expect("suite set");
+        let master = self.master.expect("master set");
+
+        let th = self.transcript.current_hash();
+        let expected = finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
+        if !bool::from(expected.as_slice().ct_eq(body)) {
+            return Err(Error::HandshakeFailure);
+        }
+        self.transcript.update(raw);
+        self.ccs_window_open = false;
+        self.state = State::Connected;
+        Ok(())
+    }
+
+    /// RFC 5077 §3.3: emit one `NewSessionTicket` encoding the negotiated
+    /// suite + the freshly derived master secret + creation timestamp.
+    fn emit_session_ticket(
+        &mut self,
+        suite: SuiteParams12,
+        master: &[u8; 48],
+    ) -> Result<(), Error> {
+        let key = self
+            .config
+            .ticket_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let plain = Ticket12Plaintext {
+            cipher_suite: suite.suite.0,
+            master_secret: *master,
+            creation_time: system_now_u64(),
+            alpn: self.alpn_negotiated.clone(),
+        };
+        let ticket = seal_ticket(&mut self.rng, key, &plain.encode());
+        let nst = NewSessionTicket12 {
+            lifetime: self.config.ticket_lifetime,
+            ticket,
+        }
+        .encode();
+        // RFC 5077 §3.3: NST is a regular handshake message — feed it into
+        // the transcript so the server's Finished signs over it (and the
+        // client's expected verify_data matches).
+        self.transcript.update(&nst);
+        self.write_plain_record(ContentType::Handshake, &nst);
+        Ok(())
+    }
+}
+
+/// State recovered from a valid client-presented ticket.
+struct ResumedState {
+    suite: SuiteParams12,
+    master_secret: [u8; 48],
+}
+
+/// Current wall-clock time as a Unix timestamp under `std`; zero otherwise
+/// (used for ticket creation_time + expiry — the AEAD is the real auth).
+#[cfg(feature = "std")]
+fn system_now_u64() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(not(feature = "std"))]
+fn system_now_u64() -> u64 {
+    0
 }
 
 /// One decoded inbound message.

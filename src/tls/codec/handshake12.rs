@@ -241,6 +241,46 @@ impl ServerHelloDone {
     }
 }
 
+/// `NewSessionTicket` for TLS 1.2 (RFC 5077 §3.3). The wire format is much
+/// simpler than the TLS 1.3 message of the same name — just a 32-bit lifetime
+/// hint followed by the opaque ticket bytes.
+///
+/// Wire form:
+/// ```text
+/// struct {
+///     uint32 ticket_lifetime_hint;
+///     opaque ticket<0..2^16-1>;
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NewSessionTicket12 {
+    pub(crate) lifetime: u32,
+    pub(crate) ticket: Vec<u8>,
+}
+
+impl NewSessionTicket12 {
+    /// Encodes the full handshake message (type + u24 length + body).
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::NEW_SESSION_TICKET);
+        with_len_u24(&mut out, |b| {
+            b.extend_from_slice(&self.lifetime.to_be_bytes());
+            with_len_u16(b, |t| t.extend_from_slice(&self.ticket));
+        });
+        out
+    }
+
+    /// Decodes a `NewSessionTicket12` from a handshake-message body.
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+        let mut c = ReadCursor::new(body);
+        let lifetime = c.take(4)?;
+        let lifetime = u32::from_be_bytes([lifetime[0], lifetime[1], lifetime[2], lifetime[3]]);
+        let ticket = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+        Ok(NewSessionTicket12 { lifetime, ticket })
+    }
+}
+
 /// `HelloRequest` (RFC 5246 §7.4.1.1). Empty body. The server uses this to
 /// prompt the client to renegotiate. We provide only an encoder; we never
 /// accept it after the handshake (commit 6 hardens that path).
@@ -402,6 +442,40 @@ mod tests {
     fn hello_request_encode() {
         let bytes = HelloRequest.encode();
         assert_eq!(bytes, alloc::vec![hs_type::HELLO_REQUEST, 0, 0, 0]);
+    }
+
+    #[test]
+    fn new_session_ticket_12_roundtrip() {
+        let nst = NewSessionTicket12 {
+            lifetime: 7200,
+            ticket: alloc::vec![0xab; 64],
+        };
+        let bytes = nst.encode();
+        let body = parse_one(&bytes, hs_type::NEW_SESSION_TICKET);
+        assert_eq!(NewSessionTicket12::decode(&body).unwrap(), nst);
+    }
+
+    #[test]
+    fn new_session_ticket_12_empty_ticket() {
+        // RFC 5077 §3.3: ticket length is `0..2^16-1`; the server MAY send an
+        // empty ticket (clients treat it as "no resumption was issued").
+        let nst = NewSessionTicket12 {
+            lifetime: 0,
+            ticket: Vec::new(),
+        };
+        let bytes = nst.encode();
+        let body = parse_one(&bytes, hs_type::NEW_SESSION_TICKET);
+        assert_eq!(NewSessionTicket12::decode(&body).unwrap(), nst);
+    }
+
+    #[test]
+    fn new_session_ticket_12_truncated() {
+        // Body claims a 4-byte lifetime but only 3 bytes.
+        let body = [0u8, 0, 0];
+        assert!(matches!(
+            NewSessionTicket12::decode(&body),
+            Err(Error::Decode)
+        ));
     }
 
     #[test]
