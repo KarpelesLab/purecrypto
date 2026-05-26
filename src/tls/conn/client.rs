@@ -793,6 +793,9 @@ impl ClientConnection {
         // Retain both directions' app secrets so we can step them on KeyUpdate.
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
+        // RFC 8446 §5: ChangeCipherSpec is no longer expected after the
+        // handshake completes.
+        self.core.close_ccs_window();
         self.state = State::Connected;
         Ok(())
     }
@@ -809,6 +812,8 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
             AlertDescription::IllegalParameter
         }
+        Error::RecordOverflow => AlertDescription::RecordOverflow,
+        Error::TooManyRecords => AlertDescription::InternalError,
         _ => AlertDescription::HandshakeFailure,
     }
 }
