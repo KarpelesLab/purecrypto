@@ -9,14 +9,18 @@
 
 use super::common::{ConnectionCore, Incoming};
 use crate::ec::x25519::X25519PrivateKey;
-use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
-use crate::hash::{Hmac, Sha256, Sha384};
+use crate::ec::{
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
+};
+use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
+use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket as NstWire,
-    Random, ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake,
+    Random, ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake, with_len_u16,
+    with_len_u24,
 };
 use crate::tls::crypto::{
     HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
@@ -30,6 +34,64 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
+
+/// A client certificate + signing key, set on [`ClientConfig`] to satisfy a
+/// server's `CertificateRequest` (mTLS, RFC 8446 §4.3.2).
+pub struct ClientCertConfig {
+    /// Certificate chain (leaf first), DER-encoded.
+    pub(crate) chain: Vec<Vec<u8>>,
+    /// Signing key paired with the leaf certificate.
+    pub(crate) key: ClientKey,
+}
+
+/// The client's signing key, mirrors the server-side variants.
+pub(crate) enum ClientKey {
+    /// RSA-PSS. Not yet wired (requires an RNG for the PSS salt); accepted
+    /// to keep the public API parallel to the server-side configuration.
+    #[allow(dead_code)]
+    Rsa(BoxedRsaPrivateKey),
+    Ecdsa(BoxedEcdsaPrivateKey),
+    Ed25519(Ed25519PrivateKey),
+}
+
+impl ClientCertConfig {
+    /// A client cert + RSA-PSS signing key.
+    pub fn with_rsa(chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::Rsa(key),
+        }
+    }
+
+    /// A client cert + ECDSA signing key.
+    pub fn with_ecdsa(chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::Ecdsa(key),
+        }
+    }
+
+    /// A client cert + Ed25519 signing key.
+    pub fn with_ed25519(chain: Vec<Vec<u8>>, key: Ed25519PrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::Ed25519(key),
+        }
+    }
+
+    fn signature_scheme(&self) -> SignatureScheme {
+        match &self.key {
+            ClientKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+            ClientKey::Ecdsa(k) => match k.curve() {
+                CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+                CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+                CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
+                CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            },
+            ClientKey::Ed25519(_) => SignatureScheme::ED25519,
+        }
+    }
+}
 
 /// Configuration for a TLS client.
 pub struct ClientConfig {
@@ -56,6 +118,10 @@ pub struct ClientConfig {
     /// `psk_key_exchange_modes`; on acceptance the handshake uses the resumed
     /// PSK combined with ECDHE (`psk_dhe_ke`).
     pub session: Option<StoredSession>,
+    /// Client certificate + signing key, used to satisfy a server-issued
+    /// `CertificateRequest` (mTLS). `None` means we won't present a cert; if
+    /// the server requires one we'll abort with `certificate_required`.
+    pub client_cert: Option<ClientCertConfig>,
 }
 
 impl ClientConfig {
@@ -69,6 +135,7 @@ impl ClientConfig {
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             session: None,
+            client_cert: None,
         }
     }
 
@@ -92,6 +159,13 @@ impl ClientConfig {
     /// offered (only suites matching that hash will be sent).
     pub fn with_session(mut self, session: StoredSession) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// Sets the client certificate + signing key for mTLS. The client
+    /// presents this chain whenever the server emits `CertificateRequest`.
+    pub fn with_client_cert(mut self, cert: ClientCertConfig) -> Self {
+        self.client_cert = Some(cert);
         self
     }
 }
@@ -231,6 +305,9 @@ pub struct ClientConnection {
     /// (or right at EE time if 0-RTT was rejected). Otherwise we install it
     /// at SH time.
     deferred_client_hs_secret: Option<Secret>,
+    /// mTLS: set when the server sent a `CertificateRequest` between EE and
+    /// its `Certificate`. Drives client-cert emission after server Finished.
+    cert_request_received: bool,
 }
 
 /// What the client retains across CH emission so it can verify the server's
@@ -453,6 +530,7 @@ impl ClientConnection {
             early_data_accepted: false,
             cets: None,
             deferred_client_hs_secret: None,
+            cert_request_received: false,
         };
         // Remember the offered PSK so we can seed the schedule when the
         // server selects it in SH.
@@ -1130,6 +1208,20 @@ impl ClientConnection {
     }
 
     fn on_certificate(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // mTLS: the server's `CertificateRequest` may precede `Certificate`.
+        if msg_type == hs_type::CERTIFICATE_REQUEST {
+            // RFC 8446 §4.3.2: certificate_request_context is empty in
+            // handshake auth; we ignore the extensions list contents (just
+            // parse for structure) and remember that the server asked.
+            let mut c = ReadCursor::new(body);
+            let _ctx = c.vec_u8()?;
+            let _exts = c.vec_u16()?;
+            c.expect_empty()?;
+            self.cert_request_received = true;
+            self.core.transcript.update(raw);
+            // Stay in WaitCertificate — Certificate is the next message.
+            return Ok(());
+        }
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }
@@ -1203,13 +1295,17 @@ impl ClientConnection {
         // Derive the application traffic secrets over Hash(CH..server
         // Finished). This must happen BEFORE we emit EOED (which would
         // otherwise enter the transcript) so the secret matches the server's
-        // computation.
-        let ks = self.ks.as_mut().expect("key schedule");
-        ks.enter_master();
-        let th_app = self.core.transcript.current_hash();
-        let cats = ks.client_application_traffic_secret(th_app.as_slice());
-        let sats = ks.server_application_traffic_secret(th_app.as_slice());
-        let ems = ks.exporter_master_secret(th_app.as_slice());
+        // computation. Borrow ks just long enough to compute, then drop so
+        // we can call other &mut self methods below.
+        let (cats, sats, ems) = {
+            let ks = self.ks.as_mut().expect("key schedule");
+            ks.enter_master();
+            let th_app = self.core.transcript.current_hash();
+            let cats = ks.client_application_traffic_secret(th_app.as_slice());
+            let sats = ks.server_application_traffic_secret(th_app.as_slice());
+            let ems = ks.exporter_master_secret(th_app.as_slice());
+            (cats, sats, ems)
+        };
         self.exporter_secret = Some(ems);
 
         // 0-RTT acceptance: emit EndOfEarlyData under the early write key
@@ -1231,6 +1327,17 @@ impl ClientConnection {
             ));
         }
 
+        // mTLS: if the server sent CertificateRequest, emit Certificate +
+        // CertificateVerify before our Finished. An empty Certificate is
+        // wire-legal when we have no cert configured; the server may then
+        // close with `certificate_required` if it demanded one.
+        if self.cert_request_received {
+            self.send_client_certificate();
+            if self.config.client_cert.is_some() {
+                self.send_client_certificate_verify()?;
+            }
+        }
+
         // Our Finished, over the handshake context up to (and including, for
         // 0-RTT) EndOfEarlyData — i.e. the current transcript hash here.
         let chts = self.client_hs_secret.as_ref().expect("client hs secret");
@@ -1244,7 +1351,11 @@ impl ClientConnection {
         // nonce)`; we stash RMS now so that any NewSessionTicket that arrives
         // post-handshake can derive its PSK from this final transcript.
         let th_rms = self.core.transcript.current_hash();
-        self.rms = Some(ks.resumption_master_secret(th_rms.as_slice()));
+        let rms = {
+            let ks = self.ks.as_mut().expect("key schedule");
+            ks.resumption_master_secret(th_rms.as_slice())
+        };
+        self.rms = Some(rms);
 
         // Switch to application traffic keys.
         self.core.set_write(RecordCrypter::new(
@@ -1270,6 +1381,65 @@ impl ClientConnection {
     }
 }
 
+impl ClientConnection {
+    /// mTLS: emit a `Certificate` carrying our configured chain (or an empty
+    /// chain if no client cert is configured).
+    fn send_client_certificate(&mut self) {
+        let mut msg = alloc::vec![hs_type::CERTIFICATE];
+        with_len_u24(&mut msg, |b| {
+            b.push(0); // certificate_request_context: empty
+            with_len_u24(b, |list| {
+                if let Some(cc) = self.config.client_cert.as_ref() {
+                    for cert in &cc.chain {
+                        with_len_u24(list, |c| c.extend_from_slice(cert));
+                        with_len_u16(list, |_| {});
+                    }
+                }
+            });
+        });
+        self.core.emit_handshake(msg);
+    }
+
+    /// mTLS: sign the running transcript with the configured client key and
+    /// emit a `CertificateVerify`.
+    fn send_client_certificate_verify(&mut self) -> Result<(), Error> {
+        let cc = self
+            .config
+            .client_cert
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let th = self.core.transcript.current_hash();
+        let content = certificate_verify_content(false, th.as_slice());
+        let scheme = cc.signature_scheme();
+        let signature = match &cc.key {
+            ClientKey::Rsa(_) => {
+                // The CertificateVerify needs an RNG; reuse our handshake one
+                // is impractical here, so derive a deterministic one keyed on
+                // the transcript. For now, return an error if the test ever
+                // uses RSA; ECDSA and Ed25519 are deterministic.
+                return Err(Error::HandshakeFailure);
+            }
+            ClientKey::Ecdsa(k) => {
+                let sig = match k.curve() {
+                    CurveId::P384 => k.sign::<Sha384>(&content),
+                    CurveId::P521 => k.sign::<Sha512>(&content),
+                    _ => k.sign::<Sha256>(&content),
+                }
+                .map_err(|_| Error::HandshakeFailure)?;
+                sig.to_der(k.curve())
+            }
+            ClientKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
+        };
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
+        with_len_u24(&mut msg, |b| {
+            b.extend_from_slice(&scheme.0.to_be_bytes());
+            with_len_u16(b, |s| s.extend_from_slice(&signature));
+        });
+        self.core.emit_handshake(msg);
+        Ok(())
+    }
+}
+
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
     match error {
@@ -1285,6 +1455,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
+        Error::CertificateRequired => AlertDescription::CertificateRequired,
         _ => AlertDescription::HandshakeFailure,
     }
 }

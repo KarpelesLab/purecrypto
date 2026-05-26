@@ -19,6 +19,10 @@ pub(crate) mod hs_type {
     pub(crate) const END_OF_EARLY_DATA: u8 = 5;
     pub(crate) const ENCRYPTED_EXTENSIONS: u8 = 8;
     pub(crate) const CERTIFICATE: u8 = 11;
+    /// `certificate_request` (RFC 8446 §4.3.2). Server-emitted to demand
+    /// a client certificate; client replies with `Certificate` (possibly
+    /// empty) and `CertificateVerify`.
+    pub(crate) const CERTIFICATE_REQUEST: u8 = 13;
     pub(crate) const CERTIFICATE_VERIFY: u8 = 15;
     pub(crate) const FINISHED: u8 = 20;
     pub(crate) const KEY_UPDATE: u8 = 24;
