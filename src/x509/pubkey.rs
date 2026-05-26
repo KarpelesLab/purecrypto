@@ -9,9 +9,19 @@ use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
 use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed25519PublicKey};
+#[cfg(feature = "mldsa")]
+use crate::mldsa::{MlDsa44PublicKey, MlDsa65PublicKey, MlDsa87PublicKey};
 use crate::rsa::BoxedRsaPublicKey;
 
 const SPKI_LABEL: &str = "PUBLIC KEY";
+
+/// Encodes an ML-DSA (FIPS 204) `SubjectPublicKeyInfo`: bare OID
+/// AlgorithmIdentifier (no parameters) wrapping the raw key bytes.
+#[cfg(feature = "mldsa")]
+fn mldsa_spki(oid: &[u64], key: &[u8]) -> Vec<u8> {
+    let algid = encode_sequence(&oid_tlv(oid));
+    encode_sequence(&[algid, encode_bit_string(key)].concat())
+}
 
 /// The X.509 named-curve OID for a curve.
 fn curve_oid(curve: CurveId) -> &'static [u64] {
@@ -48,6 +58,15 @@ pub enum AnyPublicKey {
     Ecdsa(BoxedEcdsaPublicKey),
     /// An Ed25519 public key.
     Ed25519(Ed25519PublicKey),
+    /// An ML-DSA-44 (FIPS 204) public key.
+    #[cfg(feature = "mldsa")]
+    MlDsa44(MlDsa44PublicKey),
+    /// An ML-DSA-65 (FIPS 204) public key.
+    #[cfg(feature = "mldsa")]
+    MlDsa65(MlDsa65PublicKey),
+    /// An ML-DSA-87 (FIPS 204) public key.
+    #[cfg(feature = "mldsa")]
+    MlDsa87(MlDsa87PublicKey),
 }
 
 impl AnyPublicKey {
@@ -69,6 +88,14 @@ impl AnyPublicKey {
                 let algid = encode_sequence(&oid_tlv(oid::ID_ED25519));
                 encode_sequence(&[algid, encode_bit_string(&k.to_bytes())].concat())
             }
+            // ML-DSA (draft-ietf-lamps-dilithium-certificates): bare OID, no
+            // parameters; key bytes are the raw FIPS 204 encoding.
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa44(k) => mldsa_spki(oid::ID_ML_DSA_44, k.to_bytes()),
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa65(k) => mldsa_spki(oid::ID_ML_DSA_65, k.to_bytes()),
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa87(k) => mldsa_spki(oid::ID_ML_DSA_87, k.to_bytes()),
         }
     }
 
@@ -99,6 +126,22 @@ impl AnyPublicKey {
             let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
             Ok(AnyPublicKey::Ed25519(Ed25519PublicKey::from_bytes(bytes)))
         } else {
+            #[cfg(feature = "mldsa")]
+            {
+                if alg.as_slice() == oid::ID_ML_DSA_44 {
+                    return Ok(AnyPublicKey::MlDsa44(
+                        MlDsa44PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
+                    ));
+                } else if alg.as_slice() == oid::ID_ML_DSA_65 {
+                    return Ok(AnyPublicKey::MlDsa65(
+                        MlDsa65PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
+                    ));
+                } else if alg.as_slice() == oid::ID_ML_DSA_87 {
+                    return Ok(AnyPublicKey::MlDsa87(
+                        MlDsa87PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
+                    ));
+                }
+            }
             Err(Error::UnsupportedAlgorithm)
         }
     }

@@ -52,6 +52,14 @@ pub mod oid {
     /// (RFC 8410).
     pub const ID_ED25519: &[u64] = &[1, 3, 101, 112];
 
+    /// `id-ml-dsa-44` (2.16.840.1.101.3.4.3.17) — NIST FIPS 204 ML-DSA-44.
+    /// Used for both the SPKI key OID and the certificate signatureAlgorithm.
+    pub const ID_ML_DSA_44: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 17];
+    /// `id-ml-dsa-65` (2.16.840.1.101.3.4.3.18) — NIST FIPS 204 ML-DSA-65.
+    pub const ID_ML_DSA_65: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 18];
+    /// `id-ml-dsa-87` (2.16.840.1.101.3.4.3.19) — NIST FIPS 204 ML-DSA-87.
+    pub const ID_ML_DSA_87: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 19];
+
     /// `id-at-commonName` (2.5.4.3).
     pub const COMMON_NAME: &[u64] = &[2, 5, 4, 3];
     /// `id-at-countryName` (2.5.4.6).

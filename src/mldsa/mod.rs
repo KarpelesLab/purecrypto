@@ -14,6 +14,8 @@
 mod encode;
 mod field;
 mod reduce;
+#[cfg(feature = "x509")]
+pub(crate) mod registry;
 mod sample;
 
 use alloc::vec::Vec;

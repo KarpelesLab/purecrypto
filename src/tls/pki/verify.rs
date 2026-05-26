@@ -433,6 +433,28 @@ mod tests {
         assert!(verify_hostname(&cn_cert, "wrong.example").is_err());
     }
 
+    /// Issuing and validating a self-signed ML-DSA-65 certificate through
+    /// the full `verify_chain` path. ML-DSA is on the default whitelist as
+    /// of commit 3, so no policy tuning is needed.
+    #[test]
+    fn mldsa_self_signed_chain() {
+        use crate::hash::Sha256;
+        use crate::mldsa::MlDsa65PrivateKey;
+        use crate::rng::HmacDrbg;
+        use crate::x509::CertSigner;
+        let mut rng = HmacDrbg::<Sha256>::new(b"verify-mldsa65", b"n", &[]);
+        let (sk, _pk) = MlDsa65PrivateKey::generate(&mut rng);
+        let signer = CertSigner::MlDsa65(&sk);
+        let name = DistinguishedName::common_name("pqc.example");
+        let cert =
+            Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[]).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(cert.to_der().to_vec()).unwrap();
+        let leaf_key = verify_chain(&store, &[cert.to_der().to_vec()], None, &policy()).unwrap();
+        assert!(matches!(leaf_key, AnyPublicKey::MlDsa65(_)));
+    }
+
     /// A chain whose signature algorithm is in the registry but not on the
     /// whitelist is rejected (with `BadCertificate`), even when the signature
     /// itself would verify.

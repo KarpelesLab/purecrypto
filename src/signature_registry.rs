@@ -90,6 +90,12 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::ec::registry::EcdsaP521Sha512,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::Ed25519,
+    #[cfg(all(feature = "mldsa", feature = "alloc"))]
+    &crate::mldsa::registry::MlDsa44,
+    #[cfg(all(feature = "mldsa", feature = "alloc"))]
+    &crate::mldsa::registry::MlDsa65,
+    #[cfg(all(feature = "mldsa", feature = "alloc"))]
+    &crate::mldsa::registry::MlDsa87,
 ];
 
 /// Looks up a registry entry by X.509 `AlgorithmIdentifier` OID arcs.
@@ -166,6 +172,7 @@ mod policy {
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
         ///     `ecdsa-secp521r1-sha512`
         ///   * `ed25519`
+        ///   * `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` (NIST FIPS 204)
         ///
         /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, secp256k1,
         /// cross-hash ECDSA, SLH-DSA, …) is one-line opt-in via
@@ -181,6 +188,9 @@ mod policy {
                 "ecdsa-secp384r1-sha384",
                 "ecdsa-secp521r1-sha512",
                 "ed25519",
+                "ml-dsa-44",
+                "ml-dsa-65",
+                "ml-dsa-87",
             ];
             let mut permitted = Vec::new();
             for id in permitted_ids {
