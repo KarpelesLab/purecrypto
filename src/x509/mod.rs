@@ -63,6 +63,14 @@ pub mod oid {
 
     /// `id-ce-basicConstraints` (2.5.29.19).
     pub const BASIC_CONSTRAINTS: &[u64] = &[2, 5, 29, 19];
+    /// `id-ce-keyUsage` (2.5.29.15).
+    pub const KEY_USAGE: &[u64] = &[2, 5, 29, 15];
+    /// `id-ce-extKeyUsage` (2.5.29.37).
+    pub const EXT_KEY_USAGE: &[u64] = &[2, 5, 29, 37];
+    /// `id-kp-serverAuth` (1.3.6.1.5.5.7.3.1).
+    pub const ID_KP_SERVER_AUTH: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 1];
+    /// `id-kp-clientAuth` (1.3.6.1.5.5.7.3.2).
+    pub const ID_KP_CLIENT_AUTH: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 2];
     /// `id-ce-subjectAltName` (2.5.29.17).
     pub const SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
     /// `extensionRequest` PKCS#9 attribute (1.2.840.113549.1.9.14).
