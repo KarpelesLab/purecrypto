@@ -28,7 +28,7 @@ use crate::tls::crypto::{
     certificate_verify_content, finished_verify_data, lookup_suite, next_traffic_secret,
     psk_from_resumption, tls_exporter, verify_signature,
 };
-use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
+use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{AlertDescription, Error};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -180,6 +180,10 @@ pub struct ClientConfig {
     /// [`SignaturePolicy::modern`]: the modern IANA-blessed set with
     /// RSA ≥ 2048 bits.
     pub signature_policy: SignaturePolicy,
+    /// CRLs consulted during chain validation. Empty by default: callers
+    /// opt in via [`ClientConfig::with_crls`]. Coverage is advisory — a
+    /// missing CRL never causes a chain to be rejected.
+    pub crls: CrlStore,
 }
 
 impl ClientConfig {
@@ -195,7 +199,16 @@ impl ClientConfig {
             session: None,
             client_cert: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: CrlStore::new(),
         }
+    }
+
+    /// Installs a [`CrlStore`] consulted during chain validation. The
+    /// store is advisory: a covering CRL signed by an issuer in the chain
+    /// rejects the cert; anything else is silently ignored.
+    pub fn with_crls(mut self, crls: CrlStore) -> Self {
+        self.crls = crls;
+        self
     }
 
     /// Replaces the signature-algorithm whitelist. Defaults to
@@ -1397,8 +1410,9 @@ impl ClientConnection {
         // signature policy applies to every chain signature.
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
-            let key = verify_chain(
+            let key = verify_chain_with_crls(
                 &self.config.roots,
+                &self.config.crls,
                 &self.cert_chain,
                 now.as_ref(),
                 &self.config.signature_policy,

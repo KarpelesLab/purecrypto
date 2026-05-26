@@ -153,6 +153,9 @@ pub struct ServerConfig {
     /// chain and `CertificateVerify` (under mTLS). Defaults to
     /// [`SignaturePolicy::modern`].
     signature_policy: SignaturePolicy,
+    /// CRLs consulted when validating client-cert chains under mTLS. Empty
+    /// by default; opt in via [`ServerConfig::with_crls`].
+    crls: crate::tls::pki::CrlStore,
 }
 
 impl ServerConfig {
@@ -171,6 +174,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -189,6 +193,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -207,6 +212,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -225,6 +231,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -243,6 +250,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -261,6 +269,7 @@ impl ServerConfig {
             replay_window: None,
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -269,6 +278,14 @@ impl ServerConfig {
     /// Defaults to [`SignaturePolicy::modern`].
     pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
         self.signature_policy = policy;
+        self
+    }
+
+    /// Installs a [`crate::tls::pki::CrlStore`] consulted during client-cert
+    /// chain validation under mTLS. The store is advisory: covering CRLs
+    /// reject revoked certs, missing CRLs do not fail the chain.
+    pub fn with_crls(mut self, crls: crate::tls::pki::CrlStore) -> Self {
+        self.crls = crls;
         self
     }
 
@@ -1132,8 +1149,9 @@ impl<R: RngCore> ServerConnection<R> {
         // Validate the chain against the configured roots, applying the
         // server's signature-algorithm whitelist to every chain signature.
         // mTLS: leaf is a client cert, so require `id-kp-clientAuth` EKU.
-        let leaf_key = crate::tls::pki::verify_chain_for_purpose(
+        let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
             &policy.roots,
+            &self.config.crls,
             &chain,
             None,
             &self.config.signature_policy,

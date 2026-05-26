@@ -88,6 +88,9 @@ pub struct ServerConfig12 {
     /// Lifetime advertised in NewSessionTickets (seconds) and used to
     /// expire decrypted tickets server-side. Defaults to 7200 (2 hours).
     ticket_lifetime: u32,
+    /// CRLs consulted during client-cert chain validation under mTLS.
+    /// Empty by default; opt in via [`ServerConfig12::with_crls`].
+    crls: crate::tls::pki::CrlStore,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -116,6 +119,7 @@ impl ServerConfig12 {
             client_auth: None,
             ticket_key: None,
             ticket_lifetime: 7200,
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -131,6 +135,7 @@ impl ServerConfig12 {
             client_auth: None,
             ticket_key: None,
             ticket_lifetime: 7200,
+            crls: crate::tls::pki::CrlStore::new(),
         }
     }
 
@@ -149,6 +154,13 @@ impl ServerConfig12 {
     /// Replaces the signature-algorithm whitelist.
     pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
         self.signature_policy = policy;
+        self
+    }
+
+    /// Installs a [`crate::tls::pki::CrlStore`] consulted during client-cert
+    /// chain validation under mTLS.
+    pub fn with_crls(mut self, crls: crate::tls::pki::CrlStore) -> Self {
+        self.crls = crls;
         self
     }
 
@@ -1015,8 +1027,9 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         // Validate the chain. We pass `None` for `now`. mTLS: the leaf is
         // a client cert, so require `id-kp-clientAuth` EKU.
-        let leaf_key = crate::tls::pki::verify_chain_for_purpose(
+        let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
             &policy.roots,
+            &self.config.crls,
             &chain,
             None,
             &self.config.signature_policy,

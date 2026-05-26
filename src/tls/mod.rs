@@ -30,5 +30,5 @@ pub use conn::{
 pub use conn::{Connection, ReplayWindow, Stream};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
-pub use pki::RootCertStore;
+pub use pki::{CrlStore, RootCertStore};
 pub use version::{ContentType, ProtocolVersion};

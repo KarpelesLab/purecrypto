@@ -27,10 +27,11 @@
 //! the expected host name (subjectAltName dNSNames, falling back to the subject
 //! common name).
 
+use super::crls::CrlStore;
 use super::store::RootCertStore;
 use crate::signature_registry::{SignaturePolicy, find_by_oid};
 use crate::tls::Error;
-use crate::x509::{AnyPublicKey, Certificate, Time, oid};
+use crate::x509::{AnyPublicKey, Certificate, Time, Validity, oid};
 use alloc::vec::Vec;
 
 /// `keyUsage` bit-0 `digitalSignature` (RFC 5280 §4.2.1.3).
@@ -61,6 +62,7 @@ const MAX_CHAIN_LEN: usize = 10;
 /// Equivalent to [`verify_chain_for_purpose`] with [`ChainPurpose::Server`]
 /// (the most common case). Use the explicit form for client-cert
 /// verification in mTLS.
+#[allow(dead_code)] // useful for tests / future internal callers
 pub(crate) fn verify_chain(
     store: &RootCertStore,
     chain: &[Vec<u8>],
@@ -68,6 +70,24 @@ pub(crate) fn verify_chain(
     policy: &SignaturePolicy,
 ) -> Result<AnyPublicKey, Error> {
     verify_chain_for_purpose(store, chain, now, policy, ChainPurpose::Server)
+}
+
+/// Like [`verify_chain`], but additionally consults `crls` for revocation
+/// after the regular signature/anchoring checks succeed.
+///
+/// CRL coverage is **opt-in advisory**: a chain is rejected only when a CRL
+/// from `crls` whose issuer matches and whose signature verifies under the
+/// chain issuer's key contains the cert's serial. CRLs signed by an unknown
+/// key, or whose issuer name does not appear in the chain, are silently
+/// ignored.
+pub(crate) fn verify_chain_with_crls(
+    store: &RootCertStore,
+    crls: &CrlStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+) -> Result<AnyPublicKey, Error> {
+    verify_chain_with_crls_for_purpose(store, crls, chain, now, policy, ChainPurpose::Server)
 }
 
 /// Whether the leaf is the *server* (verified by a TLS client) or the
@@ -85,8 +105,21 @@ pub(crate) enum ChainPurpose {
     Client,
 }
 
+#[allow(dead_code)] // useful for tests / future internal callers
 pub(crate) fn verify_chain_for_purpose(
     store: &RootCertStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+    purpose: ChainPurpose,
+) -> Result<AnyPublicKey, Error> {
+    let empty = CrlStore::new();
+    verify_chain_with_crls_for_purpose(store, &empty, chain, now, policy, purpose)
+}
+
+pub(crate) fn verify_chain_with_crls_for_purpose(
+    store: &RootCertStore,
+    crls: &CrlStore,
     chain: &[Vec<u8>],
     now: Option<&Time>,
     policy: &SignaturePolicy,
@@ -129,7 +162,9 @@ pub(crate) fn verify_chain_for_purpose(
         }
     }
 
-    // Each certificate must be signed by the next, with matching names.
+    // Each certificate must be signed by the next, with matching names. We
+    // also consult the CrlStore for revocation: the issuer key just verified
+    // is exactly what we need to validate a candidate CRL.
     for pair in certs.windows(2) {
         let (cert, issuer) = (&pair[0], &pair[1]);
         let issuer_key = issuer
@@ -139,6 +174,7 @@ pub(crate) fn verify_chain_for_purpose(
         if names_differ(cert, issuer)? {
             return Err(Error::BadCertificate);
         }
+        check_revocation(cert, &issuer_key, crls, now)?;
     }
 
     // Anchor the top of the chain to a trusted root sharing its issuer name.
@@ -148,14 +184,20 @@ pub(crate) fn verify_chain_for_purpose(
     let top = certs.last().expect("chain is non-empty");
     let top_issuer = top.issuer_der().map_err(|_| Error::BadCertificate)?;
     let mut anchored = false;
+    let mut anchor_key: Option<&AnyPublicKey> = None;
     for anchor in store.anchors_with_subject(top_issuer) {
         if verify_cert_against_issuer(top, &anchor.key, policy).is_ok() {
             anchored = true;
+            anchor_key = Some(&anchor.key);
             break;
         }
     }
     if !anchored {
         return Err(Error::BadCertificate);
+    }
+    // Top cert may itself be revoked by a CRL signed by the anchor.
+    if let Some(key) = anchor_key {
+        check_revocation(top, key, crls, now)?;
     }
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
@@ -164,6 +206,51 @@ pub(crate) fn verify_chain_for_purpose(
     certs[0]
         .subject_public_key()
         .map_err(|_| Error::BadCertificate)
+}
+
+/// Consults `crls` for any CRL whose issuer name matches `cert.issuer_der()`
+/// and whose signature verifies against `issuer_key`. If a matching CRL
+/// lists `cert.serial_bytes()`, the cert is revoked (returns
+/// [`Error::BadCertificate`]).
+///
+/// A CRL outside its `thisUpdate..=nextUpdate` window (when `now` is given)
+/// is treated as "not covering" — advisory behavior. CRLs that fail their
+/// own signature verification under the issuer key are silently skipped
+/// (an attacker cannot make us reject a chain by injecting a forged CRL).
+fn check_revocation(
+    cert: &Certificate,
+    issuer_key: &AnyPublicKey,
+    crls: &CrlStore,
+    now: Option<&Time>,
+) -> Result<(), Error> {
+    let cert_issuer = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
+    let serial = cert.serial_bytes().map_err(|_| Error::BadCertificate)?;
+    for crl in crls.crls_with_issuer(cert_issuer) {
+        // Skip CRLs not signed by this issuer.
+        if crl.verify_signature_with(issuer_key).is_err() {
+            continue;
+        }
+        // Skip CRLs that are not currently valid (advisory: stale CRL ≈ no CRL).
+        if let Some(n) = now {
+            let this_update = crl.this_update().map_err(|_| Error::BadCertificate)?;
+            let next_update = crl.next_update().map_err(|_| Error::BadCertificate)?;
+            let covers = match next_update {
+                Some(na) => Validity::new(this_update.clone(), na).accepts(n),
+                // No nextUpdate ⇒ treat as not stale (RFC 5280 allows nextUpdate
+                // to be omitted; clients accept indefinite freshness).
+                None => true,
+            };
+            if !covers {
+                continue;
+            }
+        }
+        // A covering, validly-signed CRL gets the deciding vote.
+        let revoked = crl.is_revoked(serial).map_err(|_| Error::BadCertificate)?;
+        if revoked {
+            return Err(Error::BadCertificate);
+        }
+    }
+    Ok(())
 }
 
 /// Verifies the signature on `cert` under `issuer_key`, gating on `policy`.
@@ -725,6 +812,194 @@ mod tests {
             verify_chain(&store, &[mismatched.to_der().to_vec()], None, &with_sha1),
             Err(Error::BadCertificate)
         ));
+    }
+
+    /// A CRL signed by the CA that revokes the leaf serial → chain
+    /// validation refuses the leaf; a sibling leaf with a different serial
+    /// validates normally.
+    #[test]
+    fn crl_revokes_leaf_serial() {
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{CertSigner, CrlBuilder};
+        let ca_key = rsa_test_key_a();
+        let leaf_key = rsa_test_key_b();
+        let ca_name = DistinguishedName::common_name("CRL Test CA");
+
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity(), 1, true).unwrap();
+        let leaf_revoked = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("revoked.example"),
+            &leaf_key.public_key(),
+            &validity(),
+            42,
+            false,
+        )
+        .unwrap();
+        let leaf_ok = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("ok.example"),
+            &leaf_key.public_key(),
+            &validity(),
+            43,
+            false,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        // Build a CRL that revokes serial 42.
+        let signer = CertSigner::Rsa(
+            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+                "../../../testdata/rsa2048_test_a.pem"
+            ))
+            .unwrap(),
+        );
+        let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[42], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&signer).unwrap();
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        // The OK leaf still validates.
+        verify_chain_with_crls(
+            &store,
+            &crls,
+            &[leaf_ok.to_der().to_vec()],
+            None,
+            &policy(),
+        )
+        .unwrap();
+        // The revoked leaf is rejected.
+        assert!(matches!(
+            verify_chain_with_crls(
+                &store,
+                &crls,
+                &[leaf_revoked.to_der().to_vec()],
+                None,
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+        // With an empty CRL store the revoked leaf would have passed (sanity
+        // check that we're testing the CRL path, not a different bug).
+        verify_chain_with_crls(
+            &store,
+            &CrlStore::new(),
+            &[leaf_revoked.to_der().to_vec()],
+            None,
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    /// A CRL outside its `thisUpdate..=nextUpdate` window is advisory:
+    /// the chain validates even though the leaf serial would otherwise
+    /// be revoked.
+    #[test]
+    fn expired_crl_is_advisory() {
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{CertSigner, CrlBuilder};
+        let ca_key = rsa_test_key_a();
+        let leaf_key = rsa_test_key_b();
+        let ca_name = DistinguishedName::common_name("CRL Test CA");
+
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity(), 1, true).unwrap();
+        let leaf = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("leaf.example"),
+            &leaf_key.public_key(),
+            &validity(),
+            7,
+            false,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        let signer = CertSigner::Rsa(
+            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+                "../../../testdata/rsa2048_test_a.pem"
+            ))
+            .unwrap(),
+        );
+        // CRL window: 2024-01-01 .. 2024-12-31. We verify at `now =
+        // 2026-01-01`, which is past nextUpdate ⇒ the CRL is treated as
+        // not covering this point in time.
+        let mut b = CrlBuilder::new(
+            &ca_name,
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Some(Time::utc(2024, 12, 31, 0, 0, 0)),
+        );
+        b.revoke(&[7], Time::utc(2024, 6, 1, 0, 0, 0), None);
+        let crl = b.sign(&signer).unwrap();
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        // Advisory: the expired CRL does not block the chain.
+        verify_chain_with_crls(
+            &store,
+            &crls,
+            &[leaf.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    /// A CRL whose signature does not match the issuer key (e.g. signed by
+    /// a different key) is silently ignored by chain validation.
+    #[test]
+    fn crl_signed_by_wrong_key_is_ignored() {
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{CertSigner, CrlBuilder};
+        let ca_key = rsa_test_key_a();
+        let other_key = rsa_test_key_b();
+        let ca_name = DistinguishedName::common_name("CRL Test CA");
+
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity(), 1, true).unwrap();
+        let leaf = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("leaf.example"),
+            &other_key.public_key(),
+            &validity(),
+            55,
+            false,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        // CRL signed by the OTHER key, not the CA. is_revoked would say
+        // true, but the signature won't verify under the CA, so the CRL is
+        // ignored.
+        let bogus_signer = CertSigner::Rsa(
+            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+                "../../../testdata/rsa2048_test_b.pem"
+            ))
+            .unwrap(),
+        );
+        let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[55], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&bogus_signer).unwrap();
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        verify_chain_with_crls(
+            &store,
+            &crls,
+            &[leaf.to_der().to_vec()],
+            None,
+            &policy(),
+        )
+        .unwrap();
     }
 
     /// A chain whose signature algorithm is in the registry but not on the

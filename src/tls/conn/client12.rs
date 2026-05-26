@@ -51,7 +51,7 @@ use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
-use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
+use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -106,6 +106,9 @@ pub struct ClientConfig12 {
     /// **only** in a deliberate-fallback flow where the higher-version probe
     /// has already failed and the caller has chosen to accept the downgrade.
     pub accept_downgrade_sentinel: bool,
+    /// CRLs consulted during chain validation. Empty by default — opt in via
+    /// [`ClientConfig12::with_crls`].
+    pub crls: CrlStore,
 }
 
 impl ClientConfig12 {
@@ -123,7 +126,16 @@ impl ClientConfig12 {
             session: None,
             send_fallback_scsv: false,
             accept_downgrade_sentinel: false,
+            crls: CrlStore::new(),
         }
+    }
+
+    /// Installs a [`CrlStore`] consulted during chain validation. The
+    /// store is advisory: a covering CRL signed by an issuer in the chain
+    /// rejects the cert; anything else is silently ignored.
+    pub fn with_crls(mut self, crls: CrlStore) -> Self {
+        self.crls = crls;
+        self
     }
 
     /// Offers the given ALPN protocols (preference order).
@@ -1037,8 +1049,9 @@ impl ClientConnection12 {
 
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
-            let key = verify_chain(
+            let key = verify_chain_with_crls(
                 &self.config.roots,
+                &self.config.crls,
                 &chain,
                 now.as_ref(),
                 &self.config.signature_policy,
