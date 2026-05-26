@@ -33,6 +33,12 @@ fn curve_from_id(id: i32) -> Option<CurveId> {
 /// An opaque ECDSA private key.
 pub struct PcEcKey(BoxedEcdsaPrivateKey);
 
+/// Returns a shared borrow of the inner Rust key. Used by sibling FFI
+/// modules (notably `x509.rs::pc_ec_self_signed_pem`).
+pub(super) fn pc_ec_inner_key(handle: &PcEcKey) -> &BoxedEcdsaPrivateKey {
+    &handle.0
+}
+
 /// Generates an ECDSA key on `curve` (see `PcCurve`), or NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_ec_generate(curve_id: i32) -> *mut PcEcKey {

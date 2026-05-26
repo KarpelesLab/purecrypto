@@ -37,6 +37,7 @@ mod mlkem;
 mod rng;
 mod rsa;
 mod slhdsa;
+mod tls;
 mod x25519;
 mod x509;
 

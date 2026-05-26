@@ -20,6 +20,16 @@ pub enum PcStatus {
     Unsupported = -5,
     /// An unexpected internal error (e.g. a caught panic).
     Internal = -6,
+    /// TLS / DTLS engine has nothing to emit and needs more wire bytes.
+    WantRead = -7,
+    /// TLS / DTLS engine has bytes to send; drain via `pc_tls_pop`.
+    WantWrite = -8,
+    /// Application I/O attempted before the handshake completed.
+    WantHandshake = -9,
+    /// Connection closed (peer or local sent close_notify).
+    Closed = -10,
+    /// Fatal TLS alert received from the peer.
+    TlsAlert = -11,
 }
 
 /// Runs `f`, converting any panic into [`PcStatus::Internal`] so unwinding never

@@ -34,7 +34,13 @@ typedef enum {
   PC_BAD_ENCODING = -3,
   PC_VERIFICATION = -4,
   PC_UNSUPPORTED = -5,
-  PC_INTERNAL = -6
+  PC_INTERNAL = -6,
+  /* TLS/DTLS engine status codes. */
+  PC_WANT_READ = -7,       /* engine has nothing to emit; feed more bytes */
+  PC_WANT_WRITE = -8,      /* engine has bytes to send; drain via pc_tls_pop */
+  PC_WANT_HANDSHAKE = -9,  /* application I/O attempted before handshake done */
+  PC_CLOSED = -10,         /* peer or local sent close_notify */
+  PC_TLS_ALERT = -11       /* a fatal TLS alert was received */
 } pc_status;
 
 /* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
@@ -127,6 +133,17 @@ typedef struct PcMlDsa PcMlDsa;
 typedef struct PcSlhDsa PcSlhDsa;
 typedef struct PcCsr PcCsr;
 typedef struct PcCrl PcCrl;
+typedef struct PcTlsCfg PcTlsCfg;
+typedef struct PcTls PcTls;
+
+/* TLS / DTLS role + version selectors. */
+typedef enum { PC_TLS_CLIENT = 0, PC_TLS_SERVER = 1 } pc_tls_role;
+typedef enum {
+  PC_TLS_1_2 = 0x0303,
+  PC_TLS_1_3 = 0x0304,
+  PC_DTLS_1_2 = (int)0xFEFD,
+  PC_DTLS_1_3 = (int)0xFEFC
+} pc_tls_version;
 
 /* ---- Hashing ---- */
 pc_status pc_digest(int32_t alg, const uint8_t *data, size_t data_len,
@@ -264,6 +281,13 @@ pc_status pc_cert_public_key_spki(const PcCert *cert, uint8_t *out,
 pc_status pc_cert_verify(const PcCert *cert, const PcCert *issuer);
 void pc_cert_free(PcCert *cert);
 
+/* Convenience: issue a self-signed ECDSA certificate (DNS SAN = `cn`,
+ * basicConstraints CA = false, validity = `days` days from now). The PEM
+ * is suitable both for pc_tls_cfg_set_certificate's chain and (when reused
+ * by the other endpoint) for pc_tls_cfg_add_root_pem's trust anchor. */
+pc_status pc_ec_self_signed_pem(const PcEcKey *key, const char *cn,
+                                uint32_t days, uint8_t *out, size_t *out_len);
+
 /* ---- RSA-PSS sign / verify ---- */
 pc_status pc_rsa_sign_pss(const PcRsaKey *key, int32_t alg,
                           const uint8_t *msg, size_t msg_len,
@@ -334,6 +358,68 @@ pc_status pc_crl_verify_with(const PcCrl *crl, const PcCert *issuer);
 /* Returns 1 (revoked), 0 (not revoked), or -1 on a CRL parse error. */
 int pc_crl_is_revoked(const PcCrl *crl, const uint8_t *serial_be, size_t len);
 void pc_crl_free(PcCrl *crl);
+
+/* ============================================================================
+ * TLS / DTLS (memory-BIO style — the underlying engine is sans-I/O).
+ *
+ * Usage pattern:
+ *   1. PcTlsCfg *cfg = pc_tls_cfg_new(role, version);
+ *      configure (roots, cert, SNI, ALPN, …);
+ *   2. PcTls *ssl = pc_tls_new(cfg);            // may be called repeatedly
+ *   3. loop:
+ *        pc_tls_handshake(ssl);
+ *        // if WANT_WRITE: pc_tls_pop(ssl, buf, &n); send(buf, n) to peer
+ *        // if WANT_READ:  recv(buf, &n); pc_tls_feed(ssl, buf, n, NULL)
+ *        // if OK:         handshake done
+ *   4. pc_tls_send(ssl, app_in, n);             // post-handshake
+ *      pc_tls_pop(ssl, wire_out, &m);           // drain & transmit
+ *      pc_tls_feed(ssl, wire_in, k, NULL);      // peer's reply
+ *      pc_tls_recv(ssl, app_out, &j);           // decrypted bytes
+ *   5. pc_tls_close(ssl);
+ *      pc_tls_free(ssl);
+ *      pc_tls_cfg_free(cfg);
+ * ========================================================================== */
+
+PcTlsCfg *pc_tls_cfg_new(int32_t role, int32_t version);
+void pc_tls_cfg_free(PcTlsCfg *cfg);
+
+pc_status pc_tls_cfg_add_root_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
+pc_status pc_tls_cfg_set_server_name(PcTlsCfg *cfg, const char *sni);
+pc_status pc_tls_cfg_set_certificate(PcTlsCfg *cfg,
+                                     const uint8_t *chain_pem, size_t chain_len,
+                                     const uint8_t *key_pem, size_t key_pem_len);
+pc_status pc_tls_cfg_set_alpn(PcTlsCfg *cfg, const char *const *protocols, size_t n);
+pc_status pc_tls_cfg_set_verify_certificates(PcTlsCfg *cfg, int32_t verify);
+pc_status pc_tls_cfg_set_client_auth(PcTlsCfg *cfg, int32_t required,
+                                     const uint8_t *roots_pem, size_t roots_pem_len);
+pc_status pc_tls_cfg_add_crl_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
+
+/* DTLS server only: cookie-exchange secret (32 bytes). */
+pc_status pc_dtls_cfg_set_cookie_secret(PcTlsCfg *cfg, const uint8_t *secret_32);
+/* DTLS server only: disable the cookie round-trip (HelloVerifyRequest / HRR
+ * cookie). Recommended only for tests. */
+pc_status pc_dtls_cfg_set_no_cookie(PcTlsCfg *cfg);
+
+PcTls *pc_tls_new(const PcTlsCfg *cfg);
+void pc_tls_free(PcTls *tls);
+
+pc_status pc_tls_feed(PcTls *tls, const uint8_t *wire_in, size_t in_len, size_t *consumed);
+pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
+pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);
+pc_status pc_tls_recv(PcTls *tls, uint8_t *app_out, size_t *out_len);
+pc_status pc_tls_handshake(PcTls *tls);
+pc_status pc_tls_close(PcTls *tls);
+
+int pc_tls_is_handshake_complete(const PcTls *tls);
+pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);
+pc_status pc_tls_alpn_selected(const PcTls *tls, uint8_t *out, size_t *out_len);
+pc_status pc_tls_peer_certificate(const PcTls *tls, uint8_t *out, size_t *out_len);
+
+/* DTLS-only: timeout machinery. */
+pc_status pc_dtls_next_timeout(const PcTls *tls,
+                               uint64_t *seconds_out, uint32_t *nanos_out,
+                               int32_t *has_timeout);
+pc_status pc_dtls_on_timeout(PcTls *tls, uint64_t now_seconds, uint32_t now_nanos);
 
 #ifdef __cplusplus
 }

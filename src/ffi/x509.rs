@@ -122,3 +122,51 @@ pub unsafe extern "C" fn pc_cert_free(cert: *mut PcCert) {
         drop(unsafe { Box::from_raw(cert) });
     }
 }
+
+/// Generates a self-signed ECDSA P-256 certificate using `key` (CN =
+/// `cn`, valid for `days` days from now). Returns the certificate as a
+/// `CERTIFICATE` PEM in `out`.
+///
+/// Convenience entry point used by the TLS/DTLS smoke tests: a single
+/// call materialises both a leaf cert (via `pc_tls_cfg_set_certificate`'s
+/// PEM input) and a usable trust anchor (via `pc_tls_cfg_add_root_pem`).
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ec_self_signed_pem(
+    key: *const super::ec::PcEcKey,
+    cn: *const core::ffi::c_char,
+    days: u32,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    use crate::x509::{CertSigner, DistinguishedName, Time, Validity};
+    guard(|| {
+        if key.is_null() || cn.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let cs = unsafe { core::ffi::CStr::from_ptr(cn) };
+        let Ok(cn) = cs.to_str() else {
+            return PcStatus::BadEncoding;
+        };
+        let sk = super::ec::pc_ec_inner_key(unsafe { &*key });
+        let signer = CertSigner::Ecdsa(sk);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1_700_000_000);
+        let validity = Validity::new(
+            Time::from_unix(now),
+            Time::from_unix(now + (days as u64) * 86_400),
+        );
+        let subject = DistinguishedName::common_name(cn);
+        let cert =
+            match Certificate::self_signed_general(&signer, &subject, &validity, 1, false, &[cn]) {
+                Ok(c) => c,
+                Err(_) => return PcStatus::Internal,
+            };
+        let pem = crate::der::pem_encode("CERTIFICATE", cert.to_der());
+        unsafe { out_write(pem.as_bytes(), out, out_len) }
+    })
+}
