@@ -96,6 +96,10 @@ u16_id!(
         SERVER_NAME = 0x0000,
         /// supported_groups.
         SUPPORTED_GROUPS = 0x000a,
+        /// ec_point_formats (RFC 4492 §5.1.2). TLS 1.2 ECDHE peers require
+        /// this extension; we always offer/answer `uncompressed` (0).
+        #[allow(dead_code)]
+        EC_POINT_FORMATS = 0x000b,
         /// signature_algorithms.
         SIGNATURE_ALGORITHMS = 0x000d,
         /// application_layer_protocol_negotiation (ALPN).

@@ -95,6 +95,27 @@ pub(crate) fn parse_alpn(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(out)
 }
 
+/// `ec_point_formats` (RFC 4492 §5.1.2). Offers/answers `[uncompressed (0)]`,
+/// which is required by some TLS 1.2 peers when ECDHE is in use.
+// Used by the TLS 1.2 client/server in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn ec_point_formats() -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u8(&mut body, |b| b.push(0)); // uncompressed
+    (ExtensionType::EC_POINT_FORMATS, body)
+}
+
+/// Parses an `ec_point_formats` extension body into the list of point-format
+/// bytes the peer supports.
+// Used by the TLS 1.2 client/server in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn parse_ec_point_formats(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let list = c.vec_u8()?;
+    c.expect_empty()?;
+    Ok(list.to_vec())
+}
+
 /// `record_size_limit` (RFC 8449): a single u16 in `64..=2^14+1` advertising
 /// the maximum plaintext fragment the peer may send us.
 pub(crate) fn record_size_limit(limit: u16) -> RawExtension {

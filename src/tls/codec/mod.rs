@@ -3,12 +3,18 @@
 
 pub(crate) mod extension;
 mod handshake;
+pub(crate) mod handshake12;
 mod primitives;
 mod record;
 
 #[allow(unused_imports)]
 pub(crate) use handshake::{
     ClientHello, KeyUpdate, NewSessionTicket, RawExtension, ServerHello, hs_type, read_handshake,
+};
+#[allow(unused_imports)]
+pub(crate) use handshake12::{
+    CertificateRequest12, ClientKeyExchange, HelloRequest, ServerHelloDone, ServerKeyExchange,
+    signed_message,
 };
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
