@@ -19,6 +19,16 @@ impl Args {
         Args { tokens }
     }
 
+    /// Builds a fresh [`Args`] by prepending `prefix` tokens. The shim
+    /// binaries `s_dtls_client` / `s_dtls_server` use this to inject
+    /// `-dtls1_2` ahead of the user's argv before handing off to the
+    /// shared `s_client` / `s_server` logic.
+    pub(crate) fn with_prefix(self, prefix: &[&str]) -> Self {
+        let mut out: Vec<String> = prefix.iter().map(|s| s.to_string()).collect();
+        out.extend(self.tokens);
+        Args { tokens: out }
+    }
+
     /// The value following flag `name` (e.g. `-in file` → `Some("file")`).
     pub(crate) fn value(&self, name: &str) -> Option<&str> {
         let i = self.tokens.iter().position(|t| t == name)?;
@@ -28,6 +38,13 @@ impl Args {
     /// Whether the boolean flag `name` is present.
     pub(crate) fn flag(&self, name: &str) -> bool {
         self.tokens.iter().any(|t| t == name)
+    }
+
+    /// Returns the position (argv index, post-subcommand) of the last
+    /// occurrence of `name`, if any. Useful for last-wins flag semantics
+    /// (e.g. choosing between `-tls1_2` and `-dtls1_3`).
+    pub(crate) fn last_pos(&self, name: &str) -> Option<usize> {
+        self.tokens.iter().rposition(|t| t == name)
     }
 
     /// Positional arguments — tokens that are neither a flag nor the value of a

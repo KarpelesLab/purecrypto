@@ -528,6 +528,162 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Same DTLS 1.2 roundtrip as above, but exercising the unified binaries
+/// `s_client -dtls1_2` ↔ `s_server -dtls1_2`. This proves that the
+/// version-flag dispatch in `s_client` / `s_server` reaches the same
+/// UDP code path as the `s_dtls_*` convenience aliases.
+#[test]
+fn s_client_s_server_dtls12_roundtrip() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let dir = std::env::temp_dir().join(format!("pc_dtls12_unified_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+
+    let mut rng = OsRng;
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+
+    // `s_server -dtls1_2` instead of `s_dtls_server`.
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_server",
+            "-dtls1_2",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            &format!("127.0.0.1:{port}"),
+            "-no_cookie",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_server -dtls1_2");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // `s_client -dtls1_2` instead of `s_dtls_client`.
+    let (out, _ok) = run(
+        &[
+            "s_client",
+            "-dtls1_2",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-quiet",
+        ],
+        b"hello\n",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    assert!(
+        out.contains("hello"),
+        "expected 'hello' in client stdout, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// DTLS 1.3 roundtrip using the unified `s_client -dtls1_3` ↔
+/// `s_server -dtls1_3` flags from commit 14.
+#[test]
+fn s_client_s_server_dtls13_roundtrip() {
+    use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let dir = std::env::temp_dir().join(format!("pc_dtls13_unified_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+
+    let mut rng = OsRng;
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
+
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_server",
+            "-dtls1_3",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            &format!("127.0.0.1:{port}"),
+            "-no_cookie",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_server -dtls1_3");
+
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let (out, _ok) = run(
+        &[
+            "s_client",
+            "-dtls1_3",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-quiet",
+        ],
+        b"hello\n",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    assert!(
+        out.contains("hello"),
+        "expected 'hello' in client stdout, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn genpkey_ec_then_inspect() {
     let (key_pem, ok) = run(&["genpkey", "-algorithm", "EC", "-curve", "P-256"], b"");

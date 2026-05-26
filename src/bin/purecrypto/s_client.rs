@@ -1,12 +1,30 @@
-//! `purecrypto s_client` — open a TLS 1.2 or TLS 1.3 connection and report
-//! the result, like a minimal `openssl s_client`.
+//! `purecrypto s_client` — open a TLS 1.2, TLS 1.3, DTLS 1.2, or DTLS 1.3
+//! connection and report the result, like a minimal `openssl s_client`.
+//!
+//! Version selection is via mutually-exclusive flags:
+//!
+//! | flag          | protocol      | transport |
+//! |---------------|---------------|-----------|
+//! | (default)     | TLS 1.3       | TCP       |
+//! | `-tls1_2`     | TLS 1.2       | TCP       |
+//! | `-dtls1_2`    | DTLS 1.2      | UDP       |
+//! | `-dtls1_3`    | DTLS 1.3      | UDP       |
+//!
+//! If more than one is given, the rightmost (latest on the command line)
+//! wins — matching how `openssl s_client` resolves conflicting protocol
+//! flags. The dedicated `s_dtls_client` binary is a convenience shim
+//! around `s_client -dtls1_2`.
 
 use std::io::{IsTerminal, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, UdpSocket};
 use std::time::Duration;
 
+use crate::dtls_io;
 use crate::pki::format_dn;
 use crate::util::{Args, die, to_hex};
+use purecrypto::dtls::{
+    DtlsClientConfig12, DtlsClientConfig13, DtlsClientConnection12, DtlsClientConnection13,
+};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::tls::{
@@ -14,6 +32,39 @@ use purecrypto::tls::{
     RootCertStore, Stream,
 };
 use purecrypto::x509::Certificate;
+
+/// Which protocol/transport combination the CLI should drive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProtocolVersion {
+    Tls12,
+    Tls13,
+    Dtls12,
+    Dtls13,
+}
+
+/// Resolves the requested protocol from CLI flags. The rightmost protocol
+/// flag wins (matches openssl behaviour); if none are given, defaults to
+/// TLS 1.3.
+fn resolve_version(args: &Args) -> ProtocolVersion {
+    let candidates = [
+        (args.last_pos("-tls1_2"), ProtocolVersion::Tls12),
+        (args.last_pos("--tls1_2"), ProtocolVersion::Tls12),
+        (args.last_pos("-dtls1_2"), ProtocolVersion::Dtls12),
+        (args.last_pos("--dtls1_2"), ProtocolVersion::Dtls12),
+        (args.last_pos("-dtls1_3"), ProtocolVersion::Dtls13),
+        (args.last_pos("--dtls1_3"), ProtocolVersion::Dtls13),
+    ];
+    let mut best: Option<(usize, ProtocolVersion)> = None;
+    for (pos, v) in candidates {
+        if let Some(p) = pos {
+            match best {
+                Some((bp, _)) if bp >= p => {}
+                _ => best = Some((p, v)),
+            }
+        }
+    }
+    best.map(|(_, v)| v).unwrap_or(ProtocolVersion::Tls13)
+}
 
 /// Loads trust roots: from `ca_file` if given, else the system bundle.
 fn load_roots(ca_file: Option<&str>) -> RootCertStore {
@@ -37,6 +88,34 @@ fn load_roots(ca_file: Option<&str>) -> RootCertStore {
         if line.starts_with("-----END CERTIFICATE-----") {
             in_cert = false;
             let _ = store.add_pem(&block); // skip roots with unsupported key types
+        }
+    }
+    store
+}
+
+/// Loads trust roots from a CA file if given, else returns an empty store
+/// (used by the DTLS paths whose default is `-insecure` without a bundle).
+fn load_roots_optional(ca_file: Option<&str>) -> RootCertStore {
+    let mut store = RootCertStore::new();
+    let Some(path) = ca_file else {
+        return store;
+    };
+    let data = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| die(format!("cannot read CA bundle {path}: {e}")));
+    let mut block = String::new();
+    let mut in_cert = false;
+    for line in data.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+            block.clear();
+        }
+        if in_cert {
+            block.push_str(line);
+            block.push('\n');
+        }
+        if line.starts_with("-----END CERTIFICATE-----") {
+            in_cert = false;
+            let _ = store.add_pem(&block);
         }
     }
     store
@@ -181,11 +260,24 @@ fn append_keylog(path: &str, lines: &str) {
 }
 
 pub(crate) fn run(args: Args) {
+    let version = resolve_version(&args);
+    let value_flags = [
+        "-connect",
+        "-servername",
+        "-CAfile",
+        "-alpn",
+        "-keylogfile",
+        "-cert",
+        "-key",
+        "-mtu",
+    ];
     let connect = args
         .value("-connect")
-        .or_else(|| args.positionals(&["-connect", "-servername", "-CAfile", "-alpn", "-keylogfile", "-cert", "-key"]).first().copied())
+        .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
-            die("usage: purecrypto s_client -connect host:port [-tls1_2] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-keylogfile path] [-cert client.pem -key client.key]")
+            die(
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-keylogfile path] [-cert client.pem -key client.key] [-mtu N]",
+            )
         });
     let (host, port) = match connect.rsplit_once(':') {
         Some((h, p)) => (
@@ -199,47 +291,65 @@ pub(crate) fn run(args: Args) {
     let insecure = args.flag("-insecure") || args.flag("--insecure");
     let showcerts = args.flag("-showcerts") || args.flag("--showcerts");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
-    let tls12 = args.flag("-tls1_2") || args.flag("--tls1_2");
     let alpn = args.value("-alpn").map(parse_alpn);
     let keylog = args.value("-keylogfile").map(String::from);
+    let mtu: usize = args
+        .value("-mtu")
+        .unwrap_or("1200")
+        .parse()
+        .unwrap_or_else(|_| die("-mtu expects a number"));
     let client_cert = match (args.value("-cert"), args.value("-key")) {
         (Some(c), Some(k)) => Some(load_client_cert(c, k)),
         (Some(_), None) | (None, Some(_)) => die("both -cert and -key are required for mTLS"),
         _ => None,
     };
 
-    let mut sock = TcpStream::connect((host, port))
-        .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
-
-    if tls12 {
-        run_tls12(RunCtx {
-            sock: &mut sock,
-            server_name,
-            insecure,
-            showcerts,
-            quiet,
-            alpn,
-            keylog,
-            client_cert,
-            ca_file: args.value("-CAfile"),
-        });
-    } else {
-        run_tls13(RunCtx {
-            sock: &mut sock,
-            server_name,
-            insecure,
-            showcerts,
-            quiet,
-            alpn,
-            keylog,
-            client_cert,
-            ca_file: args.value("-CAfile"),
-        });
+    match version {
+        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+            let mut sock = TcpStream::connect((host, port))
+                .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
+            let ctx = RunCtx {
+                server_name,
+                insecure,
+                showcerts,
+                quiet,
+                alpn,
+                keylog,
+                client_cert,
+                ca_file: args.value("-CAfile"),
+            };
+            if version == ProtocolVersion::Tls12 {
+                run_tls12(&mut sock, ctx);
+            } else {
+                run_tls13(&mut sock, ctx);
+            }
+        }
+        ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
+            let socket = UdpSocket::bind("0.0.0.0:0")
+                .unwrap_or_else(|e| die(format!("cannot bind local UDP socket: {e}")));
+            socket
+                .connect((host, port))
+                .unwrap_or_else(|e| die(format!("UDP connect to {host}:{port} failed: {e}")));
+            let ctx = DtlsRunCtx {
+                server_name,
+                insecure,
+                showcerts,
+                quiet,
+                alpn,
+                client_cert,
+                ca_file: args.value("-CAfile"),
+                mtu,
+            };
+            if version == ProtocolVersion::Dtls12 {
+                run_dtls12(socket, ctx);
+            } else {
+                run_dtls13(socket, ctx);
+            }
+        }
     }
 }
 
 struct RunCtx<'a> {
-    sock: &'a mut TcpStream,
     server_name: &'a str,
     insecure: bool,
     showcerts: bool,
@@ -250,9 +360,23 @@ struct RunCtx<'a> {
     ca_file: Option<&'a str>,
 }
 
-fn run_tls13(ctx: RunCtx<'_>) {
+struct DtlsRunCtx<'a> {
+    server_name: &'a str,
+    insecure: bool,
+    showcerts: bool,
+    quiet: bool,
+    alpn: Option<Vec<Vec<u8>>>,
+    /// Accepted-but-unused: see commit 11 — the DTLS state machines do
+    /// not yet implement client auth. We parse the flag so future work
+    /// is a drop-in.
+    #[allow(dead_code)]
+    client_cert: Option<ClientCertConfig>,
+    ca_file: Option<&'a str>,
+    mtu: usize,
+}
+
+fn run_tls13(sock: &mut TcpStream, ctx: RunCtx<'_>) {
     let RunCtx {
-        sock,
         server_name,
         insecure,
         showcerts,
@@ -313,9 +437,8 @@ fn run_tls13(ctx: RunCtx<'_>) {
     drive_data(&mut tls);
 }
 
-fn run_tls12(ctx: RunCtx<'_>) {
+fn run_tls12(sock: &mut TcpStream, ctx: RunCtx<'_>) {
     let RunCtx {
-        sock,
         server_name,
         insecure,
         showcerts,
@@ -382,6 +505,71 @@ fn run_tls12(ctx: RunCtx<'_>) {
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     let mut tls = Stream::new(&mut conn, sock);
     drive_data(&mut tls);
+}
+
+fn run_dtls12(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
+    let DtlsRunCtx {
+        server_name,
+        insecure,
+        showcerts: _,
+        quiet,
+        alpn: _,
+        client_cert: _,
+        ca_file,
+        mtu,
+    } = ctx;
+
+    let roots = load_roots_optional(ca_file);
+    let mut cfg = DtlsClientConfig12::new(roots, server_name);
+    if insecure || ca_file.is_none() {
+        cfg = cfg.without_certificate_verification();
+    }
+
+    let mut conn = DtlsClientConnection12::new(cfg, b"udp-client".to_vec(), &mut OsRng);
+
+    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
+
+    if !quiet {
+        eprintln!("connected: DTLSv1.2");
+    }
+
+    dtls_io::drive_client_data(&mut conn, &socket, mtu, Duration::from_secs(30));
+}
+
+fn run_dtls13(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
+    let DtlsRunCtx {
+        server_name,
+        insecure,
+        showcerts,
+        quiet,
+        alpn,
+        client_cert: _,
+        ca_file,
+        mtu,
+    } = ctx;
+
+    let roots = load_roots_optional(ca_file);
+    let mut cfg = DtlsClientConfig13::new(roots, server_name);
+    if insecure || ca_file.is_none() {
+        cfg = cfg.without_certificate_verification();
+    }
+    if let Some(a) = alpn {
+        cfg.alpn_protocols = a;
+    }
+
+    let mut conn = DtlsClientConnection13::new(cfg, b"udp-client".to_vec(), &mut OsRng);
+
+    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
+
+    if !quiet {
+        eprintln!("connected: DTLSv1.3");
+        if let Some(p) = conn.alpn_protocol() {
+            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+        }
+        print_chain(conn.peer_certificates(), showcerts);
+    }
+
+    dtls_io::drive_client_data(&mut conn, &socket, mtu, Duration::from_secs(30));
 }
 
 /// Stringifies a TLS 1.2 cipher-suite code for diagnostics.
