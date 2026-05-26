@@ -19,7 +19,7 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, lookup_suite, next_traffic_secret, verify_signature,
+    finished_verify_data, lookup_suite, next_traffic_secret, tls_exporter, verify_signature,
 };
 use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
 use crate::tls::{AlertDescription, Error};
@@ -139,6 +139,8 @@ pub struct ClientConnection {
     /// Current read-side (`server_application_traffic_secret_N`) — stepped by
     /// each incoming `KeyUpdate`.
     server_app_secret: Option<Secret>,
+    /// `exporter_master_secret` for [`Self::tls_exporter`] (RFC 8446 §7.5).
+    exporter_secret: Option<Secret>,
 
     cert_chain: Vec<Vec<u8>>,
     leaf_key: Option<AnyPublicKey>,
@@ -240,6 +242,20 @@ impl ClientConnection {
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
     }
+
+    /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705).
+    /// Derives `out.len()` bytes from the `exporter_master_secret` under
+    /// `(label, context)`. Returns `Err(InappropriateState)` before the
+    /// handshake completes.
+    pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        let ems = self
+            .exporter_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        tls_exporter(suite.hash, ems, label, context, out);
+        Ok(())
+    }
 }
 
 impl ClientConnection {
@@ -298,6 +314,7 @@ impl ClientConnection {
             server_hs_secret: None,
             client_app_secret: None,
             server_app_secret: None,
+            exporter_secret: None,
             cert_chain: Vec::new(),
             leaf_key: None,
             last_ticket: None,
@@ -841,6 +858,8 @@ impl ClientConnection {
         let th_app = self.core.transcript.current_hash();
         let cats = ks.client_application_traffic_secret(th_app.as_slice());
         let sats = ks.server_application_traffic_secret(th_app.as_slice());
+        let ems = ks.exporter_master_secret(th_app.as_slice());
+        self.exporter_secret = Some(ems);
 
         // Our Finished, over Hash(CH..server Finished), under the client
         // handshake key.

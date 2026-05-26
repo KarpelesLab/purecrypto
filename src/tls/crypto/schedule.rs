@@ -238,6 +238,38 @@ impl KeySchedule {
             transcript,
         )
     }
+
+    /// `exporter_master_secret` from `Hash(CH..server Finished)` — the seed
+    /// for the application-layer [`tls_exporter`] (RFC 8446 §7.5).
+    pub(crate) fn exporter_master_secret(&self, transcript: &[u8]) -> Secret {
+        derive_secret(self.alg, self.secret.as_slice(), b"exp master", transcript)
+    }
+}
+
+/// RFC 8446 §7.5 TLS-Exporter: derives application-layer keying material
+/// from `exporter_master_secret`. Two-step HKDF: first an intermediate
+/// `Secret_export`, then the caller-controlled output.
+pub(crate) fn tls_exporter(
+    alg: HashAlg,
+    exporter_master_secret: &Secret,
+    label: &[u8],
+    context: &[u8],
+    out: &mut [u8],
+) {
+    let empty_hash = alg.hash(&[]);
+    // Secret_export = HKDF-Expand-Label(EMS, label, Hash(""), Hash.length)
+    let mut export = [0u8; MAX_SECRET];
+    let n = alg.output_len();
+    expand_label_dyn(
+        alg,
+        exporter_master_secret.as_slice(),
+        label,
+        empty_hash.as_slice(),
+        &mut export[..n],
+    );
+    // Output = HKDF-Expand-Label(Secret_export, "exporter", Hash(context), L)
+    let ctx_hash = alg.hash(context);
+    expand_label_dyn(alg, &export[..n], b"exporter", ctx_hash.as_slice(), out);
 }
 
 /// Derives `application_traffic_secret_{N+1}` from the previous-generation
