@@ -221,8 +221,26 @@ impl ConnectionCore {
                         return Ok(Some(msg));
                     }
                 }
-                ContentType::Handshake => self.hs_pending.extend_from_slice(&fragment),
-                ContentType::Alert => return Ok(Some(parse_alert(&fragment)?)),
+                ContentType::Handshake => {
+                    // RFC 8446 §5: once read keys are installed, every
+                    // record except CCS (in the middlebox-compat window)
+                    // MUST be `application_data` (ciphertext). A plaintext
+                    // Handshake record at this point is an injection
+                    // attempt — refuse rather than feed it into the
+                    // reassembly buffer.
+                    if self.read.is_some() {
+                        return Err(Error::UnexpectedMessage);
+                    }
+                    self.hs_pending.extend_from_slice(&fragment);
+                }
+                ContentType::Alert => {
+                    // Same rule as Handshake above: plaintext Alert after
+                    // read keys are active is forbidden (RFC 8446 §5).
+                    if self.read.is_some() {
+                        return Err(Error::UnexpectedMessage);
+                    }
+                    return Ok(Some(parse_alert(&fragment)?));
+                }
                 _ => return Err(Error::UnexpectedMessage),
             }
         }

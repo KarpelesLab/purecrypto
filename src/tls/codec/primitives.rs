@@ -89,6 +89,16 @@ u16_id!(
     }
 );
 
+impl SignatureScheme {
+    /// Whether this scheme is one of the `rsa_pkcs1_*` family (high byte
+    /// `0x04`/`0x05`/`0x06`, low byte `0x01`). RFC 8446 §4.4.3 forbids
+    /// these schemes in TLS 1.3 `CertificateVerify`; they may appear only
+    /// in `signature_algorithms_cert` for chain signatures.
+    pub(crate) fn is_rsa_pkcs1(self) -> bool {
+        matches!(self.0, 0x0401 | 0x0501 | 0x0601)
+    }
+}
+
 u16_id!(
     /// A handshake extension type.
     ExtensionType {

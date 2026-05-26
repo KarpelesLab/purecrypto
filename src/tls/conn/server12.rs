@@ -46,7 +46,7 @@ use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::verify_signature;
-use crate::tls::pki::{RootCertStore, verify_chain};
+use crate::tls::pki::RootCertStore;
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::AnyPublicKey;
 use alloc::vec::Vec;
@@ -1007,8 +1007,15 @@ impl<R: RngCore> ServerConnection12<R> {
             self.state = State::WaitClientKeyExchange;
             return Ok(());
         }
-        // Validate the chain. We pass `None` for `now`.
-        let leaf_key = verify_chain(&policy.roots, &chain, None, &self.config.signature_policy)?;
+        // Validate the chain. We pass `None` for `now`. mTLS: the leaf is
+        // a client cert, so require `id-kp-clientAuth` EKU.
+        let leaf_key = crate::tls::pki::verify_chain_for_purpose(
+            &policy.roots,
+            &chain,
+            None,
+            &self.config.signature_policy,
+            crate::tls::pki::ChainPurpose::Client,
+        )?;
         self.transcript.update(raw);
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);
