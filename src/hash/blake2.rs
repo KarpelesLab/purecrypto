@@ -536,6 +536,16 @@ impl Blake2bMac {
             out_len,
         }
     }
+
+    /// Unkeyed BLAKE2b with variable `out_len` (1..=64). Equivalent to
+    /// `Blake2b<N>` for N ≤ 64 but with `out_len` chosen at runtime — useful
+    /// for variable-length expansion routines like Argon2's `H′`.
+    pub fn new_unkeyed(out_len: usize) -> Self {
+        Blake2bMac {
+            state: Blake2bState::new(out_len),
+            out_len,
+        }
+    }
     /// Feeds message bytes.
     pub fn update(&mut self, data: &[u8]) {
         self.state.update(data);
