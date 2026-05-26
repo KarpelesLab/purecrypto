@@ -99,6 +99,12 @@ pub(crate) enum ServerKey {
     Ecdsa(BoxedEcdsaPrivateKey),
     /// An Ed25519 key; signs with `ed25519`.
     Ed25519(Ed25519PrivateKey),
+    /// An ML-DSA-44 key (FIPS 204, draft-ietf-tls-mldsa).
+    MlDsa44(crate::mldsa::MlDsa44PrivateKey),
+    /// An ML-DSA-65 key.
+    MlDsa65(crate::mldsa::MlDsa65PrivateKey),
+    /// An ML-DSA-87 key.
+    MlDsa87(crate::mldsa::MlDsa87PrivateKey),
 }
 
 /// Client-authentication policy for a server (RFC 8446 §4.3.2): roots to
@@ -204,6 +210,60 @@ impl ServerConfig {
         }
     }
 
+    /// A configuration presenting `cert_chain` (leaf first) and signing with
+    /// an ML-DSA-44 private key (NIST FIPS 204, draft-ietf-tls-mldsa).
+    pub fn with_mldsa44(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa44PrivateKey) -> Self {
+        ServerConfig {
+            cert_chain,
+            key: ServerKey::MlDsa44(key),
+            alpn_protocols: Vec::new(),
+            record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
+            client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
+        }
+    }
+
+    /// A configuration presenting `cert_chain` (leaf first) and signing with
+    /// an ML-DSA-65 private key.
+    pub fn with_mldsa65(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa65PrivateKey) -> Self {
+        ServerConfig {
+            cert_chain,
+            key: ServerKey::MlDsa65(key),
+            alpn_protocols: Vec::new(),
+            record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
+            client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
+        }
+    }
+
+    /// A configuration presenting `cert_chain` (leaf first) and signing with
+    /// an ML-DSA-87 private key.
+    pub fn with_mldsa87(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
+        ServerConfig {
+            cert_chain,
+            key: ServerKey::MlDsa87(key),
+            alpn_protocols: Vec::new(),
+            record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
+            client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
+        }
+    }
+
     /// Replaces the signature-algorithm whitelist used to validate client
     /// certificate chains and `CertificateVerify` signatures (mTLS).
     /// Defaults to [`SignaturePolicy::modern`].
@@ -279,6 +339,9 @@ impl ServerConfig {
                 CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             },
             ServerKey::Ed25519(_) => SignatureScheme::ED25519,
+            ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+            ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+            ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
         }
     }
 }
@@ -976,6 +1039,17 @@ impl<R: RngCore> ServerConnection<R> {
                 sig.to_der(k.curve())
             }
             ServerKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
+            // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
+            // with the server's RNG.
+            ServerKey::MlDsa44(k) => k
+                .sign(&mut self.rng, &content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
+            ServerKey::MlDsa65(k) => k
+                .sign(&mut self.rng, &content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
+            ServerKey::MlDsa87(k) => k
+                .sign(&mut self.rng, &content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
         };
 
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];

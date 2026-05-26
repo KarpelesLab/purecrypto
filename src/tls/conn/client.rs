@@ -53,6 +53,14 @@ pub(crate) enum ClientKey {
     Rsa(BoxedRsaPrivateKey),
     Ecdsa(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    /// An ML-DSA-44 client key (FIPS 204, draft-ietf-tls-mldsa).
+    /// Client-side ML-DSA `CertificateVerify` signing is deterministic —
+    /// the client doesn't thread an RNG through the handshake state machine.
+    MlDsa44(crate::mldsa::MlDsa44PrivateKey),
+    /// An ML-DSA-65 client key.
+    MlDsa65(crate::mldsa::MlDsa65PrivateKey),
+    /// An ML-DSA-87 client key.
+    MlDsa87(crate::mldsa::MlDsa87PrivateKey),
 }
 
 impl ClientCertConfig {
@@ -80,6 +88,30 @@ impl ClientCertConfig {
         }
     }
 
+    /// A client cert + ML-DSA-44 signing key (NIST FIPS 204).
+    pub fn with_mldsa44(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa44PrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::MlDsa44(key),
+        }
+    }
+
+    /// A client cert + ML-DSA-65 signing key.
+    pub fn with_mldsa65(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa65PrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::MlDsa65(key),
+        }
+    }
+
+    /// A client cert + ML-DSA-87 signing key.
+    pub fn with_mldsa87(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::MlDsa87(key),
+        }
+    }
+
     fn signature_scheme(&self) -> SignatureScheme {
         match &self.key {
             ClientKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
@@ -90,6 +122,9 @@ impl ClientCertConfig {
                 CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             },
             ClientKey::Ed25519(_) => SignatureScheme::ED25519,
+            ClientKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+            ClientKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+            ClientKey::MlDsa87(_) => SignatureScheme::MLDSA87,
         }
     }
 }
@@ -1491,6 +1526,19 @@ impl ClientConnection {
                 sig.to_der(k.curve())
             }
             ClientKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
+            // Client-side ML-DSA: sign deterministically (FIPS 204 supports
+            // both deterministic and hedged modes; the client has no RNG
+            // to thread here). The resulting signature still verifies under
+            // the standard ML-DSA verify routine.
+            ClientKey::MlDsa44(k) => k
+                .sign_deterministic(&content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
+            ClientKey::MlDsa65(k) => k
+                .sign_deterministic(&content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
+            ClientKey::MlDsa87(k) => k
+                .sign_deterministic(&content, b"")
+                .map_err(|_| Error::HandshakeFailure)?,
         };
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {
