@@ -45,6 +45,8 @@ Single crate, modules gated by Cargo features:
 | Key derivation   | `kdf`       | 🟡 PBKDF2, HKDF |
 | Elliptic curve   | `ec`        | 🟡 ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032) |
 | Post-quantum KEM | `mlkem`     | 🟡 ML-KEM-768 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop |
+| Post-quantum sig | `mldsa`     | 🟡 ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; ACVP + OpenSSL-interop |
+| Post-quantum sig | `slhdsa`    | 🟡 SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); ACVP + OpenSSL-interop |
 | ASN.1 / DER      | `der`       | 🟡 DER reader/writer, base64, PEM; RSA PKCS#1 key (de)serialization |
 | X.509            | `x509`      | 🟡 self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
 | TLS / DTLS       | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid; AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; RFC 8448 KATs |
