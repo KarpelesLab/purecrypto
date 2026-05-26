@@ -17,7 +17,21 @@
 
 pub(crate) mod indcpa;
 pub(crate) mod kem;
-mod poly;
+pub(crate) mod poly;
+
+/// Returned by [`EncapsKey::from_bytes_validated`] when the supplied
+/// encapsulation-key bytes contain off-modulus coefficients (FIPS 203 §7.2
+/// "Encapsulation key check" failure).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncapsKeyCheckError;
+
+impl core::fmt::Display for EncapsKeyCheckError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("ML-KEM encapsulation key has off-modulus coefficients (FIPS 203 §7.2)")
+    }
+}
+
+impl core::error::Error for EncapsKeyCheckError {}
 
 use crate::rng::RngCore;
 
@@ -152,8 +166,34 @@ macro_rules! ml_kem_set {
             }
 
             /// Restores an encapsulation key from its byte encoding.
+            ///
+            /// **No validation.** Use [`from_bytes_validated`](Self::from_bytes_validated)
+            /// when the bytes come from an untrusted source — FIPS 203 §7.2
+            /// requires verifying that every 12-bit coefficient is in `[0, q)`
+            /// (re-encoding round-trip), otherwise an attacker can supply
+            /// off-modulus EKs as an oracle into the encapsulator's noise.
             pub fn from_bytes(bytes: [u8; $ek_size]) -> Self {
                 $ek_name(bytes)
+            }
+
+            /// FIPS 203 §7.2 "Encapsulation key check": confirms
+            /// `ByteEncode₁₂(ByteDecode₁₂(t)) == t` for the polynomial-vector
+            /// portion of the EK (the trailing 32-byte `rho` is opaque and
+            /// not checked). Returns the validated key on success.
+            pub fn from_bytes_validated(
+                bytes: [u8; $ek_size],
+            ) -> Result<Self, crate::mlkem::EncapsKeyCheckError> {
+                const POLYBYTES_LOCAL: usize = 384;
+                let polyvec = &bytes[..POLYBYTES_LOCAL * $k];
+                for i in 0..$k {
+                    let chunk = &polyvec[i * POLYBYTES_LOCAL..(i + 1) * POLYBYTES_LOCAL];
+                    let p = crate::mlkem::poly::from_bytes(chunk);
+                    let re = crate::mlkem::poly::to_bytes(&p);
+                    if re != chunk {
+                        return Err(crate::mlkem::EncapsKeyCheckError);
+                    }
+                }
+                Ok($ek_name(bytes))
             }
 
             /// The byte encoding.
