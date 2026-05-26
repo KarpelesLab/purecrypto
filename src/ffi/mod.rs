@@ -27,11 +27,16 @@
 
 mod cipher;
 mod common;
+mod crl;
+mod csr;
 mod ec;
 mod hash;
 mod kdf;
+mod mldsa;
+mod mlkem;
 mod rng;
 mod rsa;
+mod slhdsa;
 mod x25519;
 mod x509;
 

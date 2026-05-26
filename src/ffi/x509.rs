@@ -8,6 +8,13 @@ use crate::x509::Certificate;
 /// An opaque parsed X.509 certificate.
 pub struct PcCert(Certificate);
 
+/// Returns a borrow of the underlying [`Certificate`]. Used by sibling FFI
+/// modules (e.g. `crl.rs`) that need to call a method on the certificate
+/// without reparsing.
+pub(super) fn pc_cert_inner(c: &PcCert) -> &Certificate {
+    &c.0
+}
+
 /// Parses a PEM `CERTIFICATE` document into a handle, or NULL on failure.
 ///
 /// # Safety

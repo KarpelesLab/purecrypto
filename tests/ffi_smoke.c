@@ -312,6 +312,221 @@ int main(void) {
 #undef PEM_DECODE
   }
 
+  /* 14. ML-KEM-768 round trip via FFI. */
+  {
+    PcMlKem *k = pc_mlkem_generate(PC_ML_KEM_768);
+    if (!k) return fail("pc_mlkem_generate");
+    uint8_t spki[2048];
+    size_t spki_len = sizeof(spki);
+    if (pc_mlkem_public_to_pem(k, spki, &spki_len) != PC_OK)
+      return fail("pc_mlkem_public_to_pem");
+    uint8_t ct[1200];
+    size_t ct_len = sizeof(ct);
+    uint8_t ss_a[32], ss_b[32];
+    if (pc_mlkem_encaps(PC_ML_KEM_768, spki, spki_len, ct, &ct_len, ss_a) != PC_OK)
+      return fail("pc_mlkem_encaps");
+    if (ct_len != 1088) return fail("mlkem ciphertext length");
+    if (pc_mlkem_decaps(k, ct, ct_len, ss_b) != PC_OK)
+      return fail("pc_mlkem_decaps");
+    if (memcmp(ss_a, ss_b, 32) != 0) return fail("mlkem ss mismatch");
+    pc_mlkem_free(k);
+  }
+
+  /* 15. ML-DSA-65 sign / verify round trip; tamper rejection. */
+  {
+    PcMlDsa *k = pc_mldsa_generate(PC_ML_DSA_65);
+    if (!k) return fail("pc_mldsa_generate");
+    uint8_t spki[3000];
+    size_t spki_len = sizeof(spki);
+    if (pc_mldsa_public_to_pem(k, spki, &spki_len) != PC_OK)
+      return fail("pc_mldsa_public_to_pem");
+
+    /* Strip the PEM armor manually (small inline decoder). */
+    static const char b64chars[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int b64dec[256];
+    for (int i = 0; i < 256; i++) b64dec[i] = -1;
+    for (int i = 0; i < 64; i++) b64dec[(unsigned char)b64chars[i]] = i;
+    uint8_t spki_der[3000];
+    size_t spki_der_len = 0;
+    const char *_b = (const char *)spki, *_e = (const char *)spki + spki_len;
+    while (_b < _e && *_b != '\n') _b++; _b++;
+    const char *_end = _e - 1;
+    while (_end > _b && *_end != '-') _end--;
+    while (_end > _b && *_end != '\n') _end--;
+    int _state = 0; uint32_t _acc = 0;
+    for (const char *_p = _b; _p < _end; _p++) {
+      if (*_p == '\n' || *_p == '\r' || *_p == ' ' || *_p == '=') continue;
+      int v = b64dec[(unsigned char)*_p];
+      if (v < 0) return fail("ml-dsa pem decode");
+      _acc = (_acc << 6) | (uint32_t)v;
+      _state++;
+      if (_state == 4) {
+        spki_der[spki_der_len++] = (uint8_t)(_acc >> 16);
+        spki_der[spki_der_len++] = (uint8_t)((_acc >> 8) & 0xff);
+        spki_der[spki_der_len++] = (uint8_t)(_acc & 0xff);
+        _state = 0; _acc = 0;
+      }
+    }
+    if (_state == 2) spki_der[spki_der_len++] = (uint8_t)(_acc >> 4);
+    else if (_state == 3) {
+      spki_der[spki_der_len++] = (uint8_t)(_acc >> 10);
+      spki_der[spki_der_len++] = (uint8_t)((_acc >> 2) & 0xff);
+    }
+
+    const uint8_t msg[] = "ml-dsa hello";
+    uint8_t sig[5000];
+    size_t sig_len = sizeof(sig);
+    if (pc_mldsa_sign(k, msg, sizeof(msg), sig, &sig_len) != PC_OK)
+      return fail("pc_mldsa_sign");
+    if (pc_mldsa_verify(PC_ML_DSA_65, spki_der, spki_der_len,
+                        msg, sizeof(msg), sig, sig_len) != PC_OK)
+      return fail("pc_mldsa_verify");
+    sig[0] ^= 1;
+    if (pc_mldsa_verify(PC_ML_DSA_65, spki_der, spki_der_len,
+                        msg, sizeof(msg), sig, sig_len) != PC_VERIFICATION)
+      return fail("ml-dsa tampered sig not rejected");
+    pc_mldsa_free(k);
+  }
+
+  /* 16. SLH-DSA SHA2-128f sign/verify round trip. */
+  {
+    PcSlhDsa *k = pc_slhdsa_generate(PC_SLH_DSA_SHA2_128F);
+    if (!k) return fail("pc_slhdsa_generate");
+    uint8_t spki[200];
+    size_t spki_len = sizeof(spki);
+    if (pc_slhdsa_public_to_pem(k, spki, &spki_len) != PC_OK)
+      return fail("pc_slhdsa_public_to_pem");
+    /* Decode the SPKI PEM as in test 15. */
+    static const char b64chars[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int b64dec[256];
+    for (int i = 0; i < 256; i++) b64dec[i] = -1;
+    for (int i = 0; i < 64; i++) b64dec[(unsigned char)b64chars[i]] = i;
+    uint8_t spki_der[200];
+    size_t spki_der_len = 0;
+    const char *_b = (const char *)spki, *_e = (const char *)spki + spki_len;
+    while (_b < _e && *_b != '\n') _b++; _b++;
+    const char *_end = _e - 1;
+    while (_end > _b && *_end != '-') _end--;
+    while (_end > _b && *_end != '\n') _end--;
+    int _state = 0; uint32_t _acc = 0;
+    for (const char *_p = _b; _p < _end; _p++) {
+      if (*_p == '\n' || *_p == '\r' || *_p == ' ' || *_p == '=') continue;
+      int v = b64dec[(unsigned char)*_p];
+      if (v < 0) return fail("slh-dsa pem decode");
+      _acc = (_acc << 6) | (uint32_t)v;
+      _state++;
+      if (_state == 4) {
+        spki_der[spki_der_len++] = (uint8_t)(_acc >> 16);
+        spki_der[spki_der_len++] = (uint8_t)((_acc >> 8) & 0xff);
+        spki_der[spki_der_len++] = (uint8_t)(_acc & 0xff);
+        _state = 0; _acc = 0;
+      }
+    }
+    if (_state == 2) spki_der[spki_der_len++] = (uint8_t)(_acc >> 4);
+    else if (_state == 3) {
+      spki_der[spki_der_len++] = (uint8_t)(_acc >> 10);
+      spki_der[spki_der_len++] = (uint8_t)((_acc >> 2) & 0xff);
+    }
+    const uint8_t msg[] = "slh-dsa hello";
+    /* SLH-DSA-SHA2-128f signatures are 17 088 bytes. */
+    static uint8_t sig[20000];
+    size_t sig_len = sizeof(sig);
+    if (pc_slhdsa_sign(k, msg, sizeof(msg), sig, &sig_len) != PC_OK)
+      return fail("pc_slhdsa_sign");
+    if (pc_slhdsa_verify(spki_der, spki_der_len,
+                         msg, sizeof(msg), sig, sig_len) != PC_OK)
+      return fail("pc_slhdsa_verify");
+    pc_slhdsa_free(k);
+  }
+
+  /* 17. RSA-PSS sign/verify round trip. */
+  {
+    PcRsaKey *rsa = pc_rsa_generate(2048);
+    if (!rsa) return fail("pc_rsa_generate");
+    uint8_t spki_pem[2048];
+    size_t spki_pem_len = sizeof(spki_pem);
+    if (pc_rsa_public_to_pem(rsa, spki_pem, &spki_pem_len) != PC_OK)
+      return fail("pc_rsa_public_to_pem");
+    /* Decode PEM as above. */
+    static const char b64chars[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int b64dec[256];
+    for (int i = 0; i < 256; i++) b64dec[i] = -1;
+    for (int i = 0; i < 64; i++) b64dec[(unsigned char)b64chars[i]] = i;
+    uint8_t spki[2048];
+    size_t spki_len = 0;
+    {
+      const char *_b = (const char *)spki_pem, *_e = (const char *)spki_pem + spki_pem_len;
+      while (_b < _e && *_b != '\n') _b++; _b++;
+      const char *_end = _e - 1;
+      while (_end > _b && *_end != '-') _end--;
+      while (_end > _b && *_end != '\n') _end--;
+      int _state = 0; uint32_t _acc = 0;
+      for (const char *_p = _b; _p < _end; _p++) {
+        if (*_p == '\n' || *_p == '\r' || *_p == ' ' || *_p == '=') continue;
+        int v = b64dec[(unsigned char)*_p];
+        if (v < 0) return fail("rsa pem decode");
+        _acc = (_acc << 6) | (uint32_t)v;
+        _state++;
+        if (_state == 4) {
+          spki[spki_len++] = (uint8_t)(_acc >> 16);
+          spki[spki_len++] = (uint8_t)((_acc >> 8) & 0xff);
+          spki[spki_len++] = (uint8_t)(_acc & 0xff);
+          _state = 0; _acc = 0;
+        }
+      }
+      if (_state == 2) spki[spki_len++] = (uint8_t)(_acc >> 4);
+      else if (_state == 3) {
+        spki[spki_len++] = (uint8_t)(_acc >> 10);
+        spki[spki_len++] = (uint8_t)((_acc >> 2) & 0xff);
+      }
+    }
+    const uint8_t pss_msg[] = "rsa-pss hello";
+    uint8_t sig[512];
+    size_t sig_len = sizeof(sig);
+    if (pc_rsa_sign_pss(rsa, PC_SHA256, pss_msg, sizeof(pss_msg),
+                        sig, &sig_len) != PC_OK)
+      return fail("pc_rsa_sign_pss");
+    if (pc_rsa_verify_pss(spki, spki_len, PC_SHA256,
+                          pss_msg, sizeof(pss_msg), sig, sig_len) != PC_OK)
+      return fail("pc_rsa_verify_pss");
+
+    /* 18. RSA-OAEP encrypt / decrypt round trip with the same key. */
+    const uint8_t oaep_msg[] = "oaep round trip";
+    uint8_t oaep_ct[512];
+    size_t oaep_ct_len = sizeof(oaep_ct);
+    if (pc_rsa_encrypt_oaep(spki, spki_len, PC_SHA256, NULL, 0,
+                            oaep_msg, sizeof(oaep_msg),
+                            oaep_ct, &oaep_ct_len) != PC_OK)
+      return fail("pc_rsa_encrypt_oaep");
+    uint8_t oaep_rt[64];
+    size_t oaep_rt_len = sizeof(oaep_rt);
+    if (pc_rsa_decrypt_oaep(rsa, PC_SHA256, NULL, 0,
+                            oaep_ct, oaep_ct_len,
+                            oaep_rt, &oaep_rt_len) != PC_OK)
+      return fail("pc_rsa_decrypt_oaep");
+    if (oaep_rt_len != sizeof(oaep_msg) ||
+        memcmp(oaep_rt, oaep_msg, sizeof(oaep_msg)) != 0)
+      return fail("oaep round trip");
+
+    /* 19. CSR build → verify_self_signed via the RSA key. */
+    PcCsr *csr = pc_csr_create_rsa(rsa, "ffi.test", NULL, 0);
+    if (!csr) return fail("pc_csr_create_rsa");
+    if (pc_csr_verify_self_signed(csr) != PC_OK)
+      return fail("pc_csr_verify_self_signed");
+    uint8_t cn[64];
+    size_t cn_len = sizeof(cn);
+    if (pc_csr_subject_cn(csr, cn, &cn_len) != PC_OK)
+      return fail("pc_csr_subject_cn");
+    if (cn_len != 8 || memcmp(cn, "ffi.test", 8) != 0)
+      return fail("csr cn mismatch");
+    pc_csr_free(csr);
+
+    pc_rsa_free(rsa);
+  }
+
   printf("ffi_smoke: OK\n");
   return 0;
 }

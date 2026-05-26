@@ -30,6 +30,13 @@ impl PcRsaKey {
     }
 }
 
+/// Returns a shared borrow of the inner Rust key. Used by sibling FFI
+/// modules (notably `csr.rs`) that need to pass a `CertSigner::Rsa(_)` into
+/// the library without re-decoding the PKCS#1 DER.
+pub(super) fn pc_rsa_inner_key(handle: &PcRsaKey) -> &BoxedRsaPrivateKey {
+    &handle.key
+}
+
 /// Generates an RSA private key of `bits` (2048, 3072, or 4096), or NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_rsa_generate(bits: u32) -> *mut PcRsaKey {
@@ -192,4 +199,167 @@ pub unsafe extern "C" fn pc_rsa_free(key: *mut PcRsaKey) {
     if !key.is_null() {
         drop(unsafe { Box::from_raw(key) });
     }
+}
+
+/// Signs `msg` with RSA-PSS using `alg` as the digest and the MGF1 hash,
+/// writing the signature to `out`. Salt length defaults to the hash output.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_rsa_sign_pss(
+    key: *const PcRsaKey,
+    alg: i32,
+    msg: *const u8,
+    msg_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let Some(m) = (unsafe { slice(msg, msg_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let k = &unsafe { &*key }.key;
+        let mut rng = crate::rng::OsRng;
+        let sig = match alg {
+            id::SHA256 => k.sign_pss::<Sha256, _>(m, &mut rng),
+            id::SHA384 => k.sign_pss::<Sha384, _>(m, &mut rng),
+            id::SHA512 => k.sign_pss::<Sha512, _>(m, &mut rng),
+            _ => return PcStatus::Unsupported,
+        };
+        match sig {
+            Ok(s) => unsafe { out_write(&s, out, out_len) },
+            Err(_) => PcStatus::Internal,
+        }
+    })
+}
+
+/// Verifies an RSA-PSS signature `sig` over `msg` under the SPKI DER in
+/// `spki`. Returns [`PcStatus::Ok`] iff valid.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_rsa_verify_pss(
+    spki: *const u8,
+    spki_len: usize,
+    alg: i32,
+    msg: *const u8,
+    msg_len: usize,
+    sig: *const u8,
+    sig_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(spki), Some(m), Some(sig)) = (
+            unsafe { slice(spki, spki_len) },
+            unsafe { slice(msg, msg_len) },
+            unsafe { slice(sig, sig_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        let key = match AnyPublicKey::from_spki_der(spki) {
+            Ok(AnyPublicKey::Rsa(k)) => k,
+            Ok(_) => return PcStatus::Unsupported,
+            Err(_) => return PcStatus::BadEncoding,
+        };
+        let ok = match alg {
+            id::SHA256 => key.verify_pss::<Sha256>(m, sig),
+            id::SHA384 => key.verify_pss::<Sha384>(m, sig),
+            id::SHA512 => key.verify_pss::<Sha512>(m, sig),
+            _ => return PcStatus::Unsupported,
+        };
+        if ok.is_ok() {
+            PcStatus::Ok
+        } else {
+            PcStatus::Verification
+        }
+    })
+}
+
+/// Encrypts `pt` with RSA-OAEP under the public key in `spki`, with the
+/// specified hash (SHA-256/384/512) for both the EME and the MGF1, and the
+/// caller-supplied `label` (may be empty). Writes the ciphertext to `out`.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_rsa_encrypt_oaep(
+    spki: *const u8,
+    spki_len: usize,
+    hash: i32,
+    label: *const u8,
+    label_len: usize,
+    pt: *const u8,
+    pt_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(spki), Some(lbl), Some(pt)) = (
+            unsafe { slice(spki, spki_len) },
+            unsafe { slice(label, label_len) },
+            unsafe { slice(pt, pt_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        let key = match AnyPublicKey::from_spki_der(spki) {
+            Ok(AnyPublicKey::Rsa(k)) => k,
+            Ok(_) => return PcStatus::Unsupported,
+            Err(_) => return PcStatus::BadEncoding,
+        };
+        let mut rng = crate::rng::OsRng;
+        let ct = match hash {
+            id::SHA256 => key.encrypt_oaep::<Sha256, _>(pt, lbl, &mut rng),
+            id::SHA384 => key.encrypt_oaep::<Sha384, _>(pt, lbl, &mut rng),
+            id::SHA512 => key.encrypt_oaep::<Sha512, _>(pt, lbl, &mut rng),
+            _ => return PcStatus::Unsupported,
+        };
+        match ct {
+            Ok(c) => unsafe { out_write(&c, out, out_len) },
+            Err(_) => PcStatus::Internal,
+        }
+    })
+}
+
+/// Decrypts an RSA-OAEP ciphertext under `key`. Constant-time on
+/// decryption-error paths (the library returns the same error variant for
+/// any malformed ciphertext).
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_rsa_decrypt_oaep(
+    key: *const PcRsaKey,
+    hash: i32,
+    label: *const u8,
+    label_len: usize,
+    ct: *const u8,
+    ct_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let (Some(lbl), Some(c)) = (unsafe { slice(label, label_len) }, unsafe {
+            slice(ct, ct_len)
+        }) else {
+            return PcStatus::NullPointer;
+        };
+        let k = &unsafe { &*key }.key;
+        let pt = match hash {
+            id::SHA256 => k.decrypt_oaep::<Sha256>(c, lbl),
+            id::SHA384 => k.decrypt_oaep::<Sha384>(c, lbl),
+            id::SHA512 => k.decrypt_oaep::<Sha512>(c, lbl),
+            _ => return PcStatus::Unsupported,
+        };
+        match pt {
+            Ok(p) => unsafe { out_write(&p, out, out_len) },
+            Err(_) => PcStatus::Verification,
+        }
+    })
 }

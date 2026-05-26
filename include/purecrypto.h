@@ -86,12 +86,47 @@ typedef enum {
   PC_SECP256K1 = 4
 } pc_curve;
 
+/* ML-KEM parameter sets. */
+typedef enum {
+  PC_ML_KEM_512 = 1,
+  PC_ML_KEM_768 = 2,
+  PC_ML_KEM_1024 = 3
+} pc_mlkem_set;
+
+/* ML-DSA parameter sets. */
+typedef enum {
+  PC_ML_DSA_44 = 1,
+  PC_ML_DSA_65 = 2,
+  PC_ML_DSA_87 = 3
+} pc_mldsa_set;
+
+/* SLH-DSA parameter sets (FIPS 205 — 12 sets). */
+typedef enum {
+  PC_SLH_DSA_SHA2_128S = 1,
+  PC_SLH_DSA_SHA2_128F = 2,
+  PC_SLH_DSA_SHA2_192S = 3,
+  PC_SLH_DSA_SHA2_192F = 4,
+  PC_SLH_DSA_SHA2_256S = 5,
+  PC_SLH_DSA_SHA2_256F = 6,
+  PC_SLH_DSA_SHAKE_128S = 7,
+  PC_SLH_DSA_SHAKE_128F = 8,
+  PC_SLH_DSA_SHAKE_192S = 9,
+  PC_SLH_DSA_SHAKE_192F = 10,
+  PC_SLH_DSA_SHAKE_256S = 11,
+  PC_SLH_DSA_SHAKE_256F = 12
+} pc_slhdsa_set;
+
 /* Opaque handles. */
 typedef struct PcHash PcHash;
 typedef struct PcRsaKey PcRsaKey;
 typedef struct PcEcKey PcEcKey;
 typedef struct PcEd25519Key PcEd25519Key;
 typedef struct PcCert PcCert;
+typedef struct PcMlKem PcMlKem;
+typedef struct PcMlDsa PcMlDsa;
+typedef struct PcSlhDsa PcSlhDsa;
+typedef struct PcCsr PcCsr;
+typedef struct PcCrl PcCrl;
 
 /* ---- Hashing ---- */
 pc_status pc_digest(int32_t alg, const uint8_t *data, size_t data_len,
@@ -228,6 +263,77 @@ pc_status pc_cert_public_key_spki(const PcCert *cert, uint8_t *out,
                                   size_t *out_len);
 pc_status pc_cert_verify(const PcCert *cert, const PcCert *issuer);
 void pc_cert_free(PcCert *cert);
+
+/* ---- RSA-PSS sign / verify ---- */
+pc_status pc_rsa_sign_pss(const PcRsaKey *key, int32_t alg,
+                          const uint8_t *msg, size_t msg_len,
+                          uint8_t *out, size_t *out_len);
+pc_status pc_rsa_verify_pss(const uint8_t *spki, size_t spki_len, int32_t alg,
+                            const uint8_t *msg, size_t msg_len,
+                            const uint8_t *sig, size_t sig_len);
+
+/* ---- RSA-OAEP encrypt / decrypt ----
+ * hash selects both EME and MGF1 (SHA-256/384/512).
+ * label may be empty (NULL with label_len == 0). */
+pc_status pc_rsa_encrypt_oaep(const uint8_t *spki, size_t spki_len, int32_t hash,
+                              const uint8_t *label, size_t label_len,
+                              const uint8_t *pt, size_t pt_len,
+                              uint8_t *out, size_t *out_len);
+pc_status pc_rsa_decrypt_oaep(const PcRsaKey *key, int32_t hash,
+                              const uint8_t *label, size_t label_len,
+                              const uint8_t *ct, size_t ct_len,
+                              uint8_t *out, size_t *out_len);
+
+/* ---- ML-KEM (FIPS 203) ---- */
+PcMlKem *pc_mlkem_generate(int32_t set);
+PcMlKem *pc_mlkem_from_pkcs8_pem(const uint8_t *pem, size_t len);
+pc_status pc_mlkem_private_to_pem(const PcMlKem *k, uint8_t *out, size_t *out_len);
+pc_status pc_mlkem_public_to_pem(const PcMlKem *k, uint8_t *out, size_t *out_len);
+pc_status pc_mlkem_encaps(int32_t set, const uint8_t *ek_spki, size_t ek_spki_len,
+                          uint8_t *ct, size_t *ct_len, uint8_t ss[32]);
+pc_status pc_mlkem_decaps(const PcMlKem *k, const uint8_t *ct, size_t ct_len, uint8_t ss[32]);
+void pc_mlkem_free(PcMlKem *k);
+
+/* ---- ML-DSA (FIPS 204) ---- */
+PcMlDsa *pc_mldsa_generate(int32_t set);
+PcMlDsa *pc_mldsa_from_pkcs8_pem(const uint8_t *pem, size_t len);
+pc_status pc_mldsa_private_to_pem(const PcMlDsa *k, uint8_t *out, size_t *out_len);
+pc_status pc_mldsa_public_to_pem(const PcMlDsa *k, uint8_t *out, size_t *out_len);
+pc_status pc_mldsa_sign(const PcMlDsa *k, const uint8_t *msg, size_t msg_len,
+                        uint8_t *out, size_t *out_len);
+pc_status pc_mldsa_verify(int32_t set, const uint8_t *spki, size_t spki_len,
+                          const uint8_t *msg, size_t msg_len,
+                          const uint8_t *sig, size_t sig_len);
+void pc_mldsa_free(PcMlDsa *k);
+
+/* ---- SLH-DSA (FIPS 205) ---- */
+PcSlhDsa *pc_slhdsa_generate(int32_t set);
+PcSlhDsa *pc_slhdsa_from_pkcs8_pem(const uint8_t *pem, size_t len);
+pc_status pc_slhdsa_private_to_pem(const PcSlhDsa *k, uint8_t *out, size_t *out_len);
+pc_status pc_slhdsa_public_to_pem(const PcSlhDsa *k, uint8_t *out, size_t *out_len);
+pc_status pc_slhdsa_sign(const PcSlhDsa *k, const uint8_t *msg, size_t msg_len,
+                         uint8_t *out, size_t *out_len);
+pc_status pc_slhdsa_verify(const uint8_t *spki, size_t spki_len,
+                           const uint8_t *msg, size_t msg_len,
+                           const uint8_t *sig, size_t sig_len);
+void pc_slhdsa_free(PcSlhDsa *k);
+
+/* ---- CSR (PKCS#10) ---- */
+PcCsr *pc_csr_create_rsa(const PcRsaKey *rsa_key, const char *subject_cn,
+                         const char *const *dns_names, size_t dns_count);
+PcCsr *pc_csr_from_pem(const uint8_t *pem, size_t len);
+pc_status pc_csr_to_pem(const PcCsr *csr, uint8_t *out, size_t *out_len);
+pc_status pc_csr_verify_self_signed(const PcCsr *csr);
+pc_status pc_csr_subject_cn(const PcCsr *csr, uint8_t *out, size_t *out_len);
+void pc_csr_free(PcCsr *csr);
+
+/* ---- CRL ---- */
+PcCrl *pc_crl_from_pem(const uint8_t *pem, size_t len);
+PcCrl *pc_crl_from_der(const uint8_t *der, size_t len);
+pc_status pc_crl_verify_with(const PcCrl *crl, const PcCert *issuer);
+/* Returns 1 (revoked), 0 (not revoked), or -1 on a CRL parse error. */
+int pc_crl_is_revoked(const PcCrl *crl, const uint8_t *serial_be, size_t len);
+void pc_crl_free(PcCrl *crl);
 
 #ifdef __cplusplus
 }
