@@ -135,6 +135,104 @@ pub fn random_prime<const LIMBS: usize, R: RngCore>(
     }
 }
 
+// --- runtime-sized (BoxedUint) variants for arbitrary-size RSA keygen ---
+
+/// `n mod p` for a runtime-sized `n`.
+#[cfg(feature = "alloc")]
+fn mod_small_boxed(n: &crate::bignum::BoxedUint, p: u64) -> u64 {
+    let limbs = n.as_limbs();
+    let mut rem: u128 = 0;
+    for i in (0..limbs.len()).rev() {
+        rem = ((rem << 64) | limbs[i] as u128) % p as u128;
+    }
+    rem as u64
+}
+
+/// Miller-Rabin primality test for a [`BoxedUint`](crate::bignum::BoxedUint).
+#[cfg(feature = "alloc")]
+pub(crate) fn is_prime_boxed<R: RngCore>(
+    n: &crate::bignum::BoxedUint,
+    rng: &mut R,
+    rounds: usize,
+) -> bool {
+    use crate::bignum::{BoxedMontModulus, BoxedUint};
+    let one = BoxedUint::from_u64(1);
+    let two = BoxedUint::from_u64(2);
+    if n.is_zero() || *n == one {
+        return false;
+    }
+    if *n == two {
+        return true;
+    }
+    if !n.is_odd() {
+        return false;
+    }
+    for &p in &SMALL_PRIMES {
+        if mod_small_boxed(n, p) == 0 {
+            return *n == BoxedUint::from_u64(p);
+        }
+    }
+
+    let n_minus_1 = n.sub(&one);
+    let mut d = n_minus_1.clone();
+    let mut s = 0u32;
+    while !d.is_odd() {
+        d = d.shr_bits(1);
+        s += 1;
+    }
+
+    let modulus = BoxedMontModulus::new(n);
+    let nlimbs = n.limbs();
+    'rounds: for _ in 0..rounds {
+        let mut limbs = alloc::vec![0u64; nlimbs];
+        for limb in &mut limbs {
+            *limb = rng.next_u64();
+        }
+        let mut a = BoxedUint::from_limbs(limbs).reduce(n);
+        if a.is_zero() || a == one || a == n_minus_1 {
+            a = two.clone();
+        }
+        let mut x = modulus.pow(&a, &d);
+        if x == one || x == n_minus_1 {
+            continue 'rounds;
+        }
+        for _ in 0..s.saturating_sub(1) {
+            x = modulus.mul_mod(&x, &x);
+            if x == n_minus_1 {
+                continue 'rounds;
+            }
+        }
+        return false;
+    }
+    true
+}
+
+/// Generates a random (probable) prime of exactly `bits` bits as a
+/// [`BoxedUint`](crate::bignum::BoxedUint), with the top two bits and bit 0 set.
+#[cfg(feature = "alloc")]
+pub(crate) fn random_prime_boxed<R: RngCore>(
+    rng: &mut R,
+    bits: usize,
+    rounds: usize,
+) -> crate::bignum::BoxedUint {
+    use crate::bignum::BoxedUint;
+    let nlimbs = bits.div_ceil(64);
+    loop {
+        let mut limbs = alloc::vec![0u64; nlimbs];
+        for limb in &mut limbs {
+            *limb = rng.next_u64();
+        }
+        mask_to_bits(&mut limbs, bits);
+        limbs[(bits - 1) / 64] |= 1 << ((bits - 1) % 64);
+        limbs[(bits - 2) / 64] |= 1 << ((bits - 2) % 64);
+        limbs[0] |= 1;
+        let candidate = BoxedUint::from_limbs(limbs);
+        if is_prime_boxed(&candidate, rng, rounds) {
+            return candidate;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

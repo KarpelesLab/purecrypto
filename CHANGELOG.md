@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(rsa)* runtime RSA key generation (`BoxedRsaPrivateKey::generate`) for arbitrary moduli; `genpkey` now accepts any even size up to 65536 bits (e.g. 8192), falling back from the const-generic path
 - *(slhdsa)* SLH-DSA (FIPS 205), all 12 parameter sets; ACVP + OpenSSL-interop validated
 - *(mldsa)* ML-DSA-44/65/87 (FIPS 204); ACVP + OpenSSL-interop validated
 - *(tls,mlkem)* hybrid X25519MLKEM768 (0x11ec) TLS 1.3 key exchange; ML-KEM-768 PKIX SPKI

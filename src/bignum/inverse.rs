@@ -3,6 +3,64 @@
 use super::Uint;
 use crate::ct::ConstantTimeLess;
 
+#[cfg(feature = "alloc")]
+use super::BoxedUint;
+
+/// Runtime-sized counterpart of [`inv_mod`] for [`BoxedUint`]. Same iterative
+/// extended-Euclid algorithm and non-constant-time caveat; used by runtime RSA
+/// key generation.
+#[cfg(feature = "alloc")]
+pub fn inv_mod_boxed(a: &BoxedUint, m: &BoxedUint) -> Option<BoxedUint> {
+    if a.is_zero() || m.is_zero() {
+        return None;
+    }
+    let one = BoxedUint::from_u64(1);
+    let (mut old_r, mut r) = (a.reduce(m), m.clone());
+    let (mut old_s, mut old_neg) = (one.clone(), false);
+    let (mut s, mut s_neg) = (BoxedUint::zero(m.limbs()), false);
+
+    while !r.is_zero() {
+        let (q, rem) = old_r.divrem(&r);
+        old_r = r;
+        r = rem;
+        // new_s = old_s - q*s, in sign-magnitude (the magnitude stays below m).
+        let qs = q.mul(&s);
+        let (new_s, new_neg) = signed_sub_boxed(&old_s, old_neg, &qs, s_neg);
+        old_s = s;
+        old_neg = s_neg;
+        s = new_s;
+        s_neg = new_neg;
+    }
+
+    if old_r != one {
+        return None; // gcd(a, m) != 1
+    }
+    if old_neg {
+        Some(m.sub(&old_s).reduce(m))
+    } else {
+        Some(old_s.reduce(m))
+    }
+}
+
+/// `(±a) − (±b)` in sign-magnitude for [`BoxedUint`].
+#[cfg(feature = "alloc")]
+fn signed_sub_boxed(
+    a: &BoxedUint,
+    a_neg: bool,
+    b: &BoxedUint,
+    b_neg: bool,
+) -> (BoxedUint, bool) {
+    if a_neg == b_neg {
+        if !a.lt(b) {
+            (a.sub(b), a_neg)
+        } else {
+            (b.sub(a), !a_neg)
+        }
+    } else {
+        (a.add(b), a_neg)
+    }
+}
+
 /// Computes `a^-1 mod m`, returning `None` when no inverse exists
 /// (`gcd(a, m) != 1`, or `a`/`m` is zero). Works for any modulus, even or odd.
 ///

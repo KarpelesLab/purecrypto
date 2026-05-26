@@ -25,5 +25,7 @@ pub use boxed::BoxedUint;
 #[cfg(feature = "alloc")]
 pub use boxed_montgomery::BoxedMontModulus;
 pub use inverse::inv_mod;
+#[cfg(feature = "alloc")]
+pub use inverse::inv_mod_boxed;
 pub use montgomery::MontModulus;
 pub use uint::{LIMB_BITS, Limb, Uint};

@@ -1,10 +1,10 @@
 //! `purecrypto genpkey` — generate an RSA or EC private key (PEM).
 
 use crate::util::{Args, die, write_output};
-use purecrypto::bignum::Uint;
+use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
-use purecrypto::rsa::RsaPrivateKey;
+use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
 
 const E: u64 = 65537;
 const ROUNDS: usize = 20;
@@ -36,6 +36,8 @@ pub(crate) fn run(args: Args) {
                 .unwrap_or("2048")
                 .parse()
                 .unwrap_or_else(|_| die("invalid -bits value"));
+            // The common sizes use the fast const-generic path; any other even
+            // size up to 65536 bits falls back to the runtime-sized key.
             match bits {
                 2048 => RsaPrivateKey::<32>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
                     .to_pkcs1_pem(),
@@ -43,7 +45,18 @@ pub(crate) fn run(args: Args) {
                     .to_pkcs1_pem(),
                 4096 => RsaPrivateKey::<64>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
                     .to_pkcs1_pem(),
-                _ => die("unsupported RSA size (use 2048, 3072, or 4096)"),
+                _ => {
+                    if !(512..=65536).contains(&bits) || !bits.is_multiple_of(2) {
+                        die("unsupported RSA size (use an even value, 512..=65536 bits)");
+                    }
+                    BoxedRsaPrivateKey::generate(
+                        bits as usize,
+                        BoxedUint::from_u64(E),
+                        &mut OsRng,
+                        ROUNDS,
+                    )
+                    .to_pkcs1_pem()
+                }
             }
         }
         "EC" | "ECDSA" => {
