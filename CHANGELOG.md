@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/purecrypto/compare/v0.0.4...v0.0.5) - 2026-05-26
+
+### Added
+
+- *(tls)* PSK key-schedule plumbing
+- *(tls)* TLS-Exporter (RFC 5705 / RFC 8446 §7.5)
+- *(tls)* record_size_limit (RFC 8449)
+- *(tls)* ALPN (RFC 7301)
+- *(x509,tls)* chain-validation completeness — basicConstraints, keyUsage, EKU
+- *(tls)* hostile-peer record-layer hardening
+- *(tls)* HelloRetryRequest — transcript rewrite + ClientHello retry
+- *(tls)* KeyUpdate — full bidirectional rekey
+- *(tls)* NewSessionTicket — parse and store post-handshake
+- *(kdf,hash)* Argon2id / Argon2d / Argon2i (RFC 9106)
+- *(cipher,kdf)* Salsa20/8 core + scrypt (RFC 7914)
+- *(mlkem)* add ML-KEM-512 and ML-KEM-1024 (FIPS 203)
+- *(rsa)* OAEP encryption / decryption (RFC 8017 §7.1)
+- *(cipher)* AES-XTS — IEEE 1619-2007 / NIST SP 800-38E
+- *(cipher)* AES-CCM AEAD (RFC 3610 / NIST SP 800-38C)
+- *(cipher)* AES key wrap — RFC 3394 (KW) and RFC 5649 (KWP)
+
+### Other
+
+- cargo fmt --all
+- flip cipher / rsa / kdf / mlkem rows to ✅
+
 ## [0.0.4](https://github.com/KarpelesLab/purecrypto/compare/v0.0.3...v0.0.4) - 2026-05-26
 
 ### Added
