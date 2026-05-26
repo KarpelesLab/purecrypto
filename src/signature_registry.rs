@@ -70,6 +70,9 @@ pub trait SignatureAlgorithm: Sync + 'static {
 /// All signature algorithms purecrypto knows. Lookups are linear; the slice
 /// is small so this is cheap.
 pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
+    // Legacy SHA-1 / RSA — opt-in only.
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::Pkcs1Sha1,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::Pkcs1Sha256,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
@@ -82,6 +85,9 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::rsa::registry::PssRsaeSha384,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssRsaeSha512,
+    // RSA-PSS with a PSS-key-restricted SPKI (`id-RSASSA-PSS`).
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    &crate::rsa::registry::PssPssSha256,
     // OID-keyed ECDSA entries (X.509 chain dispatch).
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaSha256AnyCurve,

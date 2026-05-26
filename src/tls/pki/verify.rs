@@ -519,6 +519,56 @@ mod tests {
         verify_chain(&store, &[cert.to_der().to_vec()], None, &extended).unwrap();
     }
 
+    /// A SHA-1-RSA legacy chain verifies only when the policy explicitly
+    /// opts in via `permit("rsa-pkcs1-sha1")`. The default `modern()`
+    /// policy refuses (SHA-1 is in the registry, not on the whitelist).
+    #[test]
+    fn legacy_sha1_chain_only_under_opt_in() {
+        use crate::der::{encode_bit_string, encode_sequence};
+        use crate::hash::Sha1;
+        use crate::rsa::Pkcs1Digest;
+        use crate::test_util::rsa_test_key_a;
+        use crate::x509::{Certificate, algorithm_identifier};
+
+        // Hand-craft a SHA-1-RSA self-signed cert by taking the TBS of a
+        // SHA-256 self-signed cert and re-signing it under SHA-1 with the
+        // appropriate signatureAlgorithm OID. (The TBS's inner signature
+        // algorithm OID is therefore `sha256WithRSAEncryption`; real legacy
+        // chains have both inner and outer set to SHA-1-RSA. Both forms
+        // exist in the wild and either should trigger the policy gate.)
+        let key = rsa_test_key_a();
+        let base = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("legacy.example"),
+            &validity(),
+            1,
+            true,
+        )
+        .unwrap();
+        // Pull the TBS bytes out and re-sign under SHA-1.
+        let mut r = crate::der::Reader::new(base.to_der());
+        let mut cert = r.read_sequence().unwrap();
+        let tbs = cert.read_element().unwrap();
+        let sig = key.sign_pkcs1v15::<Sha1>(tbs).unwrap();
+        // Sanity-check the DigestInfo prefix length matches the SHA-1 entry.
+        assert_eq!(Sha1::DIGEST_INFO_PREFIX.len(), 15);
+        let algid = algorithm_identifier(oid::SHA1_WITH_RSA, true);
+        let der = encode_sequence(&[tbs.to_vec(), algid, encode_bit_string(&sig)].concat());
+        let legacy = Certificate::from_der(der).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(legacy.to_der().to_vec()).unwrap();
+
+        // Default policy refuses.
+        assert!(matches!(
+            verify_chain(&store, &[legacy.to_der().to_vec()], None, &policy()),
+            Err(Error::BadCertificate)
+        ));
+        // Opt-in permits.
+        let with_sha1 = SignaturePolicy::modern().permit("rsa-pkcs1-sha1");
+        verify_chain(&store, &[legacy.to_der().to_vec()], None, &with_sha1).unwrap();
+    }
+
     /// A chain whose signature algorithm is in the registry but not on the
     /// whitelist is rejected (with `BadCertificate`), even when the signature
     /// itself would verify.

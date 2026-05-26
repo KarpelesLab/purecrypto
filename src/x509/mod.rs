@@ -25,6 +25,13 @@ use alloc::vec::Vec;
 pub mod oid {
     /// `rsaEncryption` (1.2.840.113549.1.1.1).
     pub const RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
+    /// `sha1WithRSAEncryption` (1.2.840.113549.1.1.5). Legacy; in the
+    /// registry for opt-in interop, never on the default whitelist.
+    pub const SHA1_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
+    /// `id-RSASSA-PSS` (1.2.840.113549.1.1.10). Both the key OID (for an
+    /// RSA-PSS-key-restricted SPKI) and the signature OID (with PSS
+    /// parameters living in the AlgorithmIdentifier).
+    pub const ID_RSASSA_PSS: &[u64] = &[1, 2, 840, 113549, 1, 1, 10];
     /// `sha256WithRSAEncryption` (1.2.840.113549.1.1.11).
     pub const SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
     /// `sha384WithRSAEncryption` (1.2.840.113549.1.1.12).
