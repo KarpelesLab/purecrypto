@@ -167,10 +167,40 @@ impl KeySchedule {
         KeySchedule { alg, secret: early }
     }
 
+    /// Starts the schedule with a pre-shared key (`HKDF-Extract(0, psk)`).
+    /// Used by both PSK-only and PSK-with-ECDHE resumption flows.
+    // Used by the resumption handshake plumbing (follow-up commits).
+    #[allow(dead_code)]
+    pub(crate) fn with_psk(alg: HashAlg, psk: &[u8]) -> Self {
+        let early = extract(alg, &[], psk);
+        KeySchedule { alg, secret: early }
+    }
+
     /// The current Early Secret (only meaningful right after `new`).
     #[cfg(test)]
     pub(crate) fn early_secret(&self) -> Secret {
         self.secret
+    }
+
+    /// `binder_key = Derive-Secret(Early Secret, label, "")` (RFC 8446
+    /// §4.2.11.2). `label` is `"res binder"` for resumption PSKs and
+    /// `"ext binder"` for external PSKs.
+    #[allow(dead_code)]
+    pub(crate) fn binder_key(&self, label: &[u8]) -> Secret {
+        let empty_hash = self.alg.hash(&[]);
+        derive_secret(
+            self.alg,
+            self.secret.as_slice(),
+            label,
+            empty_hash.as_slice(),
+        )
+    }
+
+    /// `client_early_traffic_secret` from `Hash(ClientHello)` — used by
+    /// 0-RTT writes before ServerHello arrives.
+    #[allow(dead_code)]
+    pub(crate) fn client_early_traffic_secret(&self, transcript: &[u8]) -> Secret {
+        derive_secret(self.alg, self.secret.as_slice(), b"c e traffic", transcript)
     }
 
     /// Advances Early → Handshake Secret with the (EC)DHE shared secret.
@@ -244,6 +274,30 @@ impl KeySchedule {
     pub(crate) fn exporter_master_secret(&self, transcript: &[u8]) -> Secret {
         derive_secret(self.alg, self.secret.as_slice(), b"exp master", transcript)
     }
+
+    /// `resumption_master_secret` from `Hash(CH..client Finished)` — the
+    /// seed for future-session PSKs (RFC 8446 §7.1). The actual PSK is
+    /// `HKDF-Expand-Label(rms, "resumption", ticket_nonce, Hash.length)`.
+    #[allow(dead_code)]
+    pub(crate) fn resumption_master_secret(&self, transcript: &[u8]) -> Secret {
+        derive_secret(self.alg, self.secret.as_slice(), b"res master", transcript)
+    }
+}
+
+/// Derives a PSK from a `resumption_master_secret` and a per-ticket nonce.
+#[allow(dead_code)]
+pub(crate) fn psk_from_resumption(alg: HashAlg, rms: &Secret, ticket_nonce: &[u8], out: &mut [u8]) {
+    expand_label_dyn(alg, rms.as_slice(), b"resumption", ticket_nonce, out);
+}
+
+/// Derives the per-binder "finished" key used to MAC the truncated
+/// ClientHello: `HKDF-Expand-Label(binder_key, "finished", "", Hash.length)`.
+#[allow(dead_code)]
+pub(crate) fn binder_finished_key(alg: HashAlg, binder_key: &Secret) -> Secret {
+    let mut out = [0u8; MAX_SECRET];
+    let n = alg.output_len();
+    expand_label_dyn(alg, binder_key.as_slice(), b"finished", &[], &mut out[..n]);
+    Secret::new(&out[..n])
 }
 
 /// RFC 8446 §7.5 TLS-Exporter: derives application-layer keying material
@@ -382,5 +436,50 @@ mod tests {
             ks.secret.as_slice(),
             &from_hex::<32>("18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919")[..]
         );
+    }
+
+    /// PSK / resumption plumbing self-consistency: with a fixed PSK and
+    /// transcript, the derived `binder_key`, `client_early_traffic_secret`,
+    /// `resumption_master_secret`, and `psk_from_resumption` are all
+    /// deterministic and distinct.
+    #[test]
+    fn psk_resumption_plumbing_self_consistent() {
+        let alg = HashAlg::Sha256;
+        let psk = [0x42u8; 32];
+        let transcript_ch = [0xa1u8; 32];
+        let transcript_ch_cf = [0xb2u8; 32];
+
+        let mut ks = KeySchedule::with_psk(alg, &psk);
+
+        // Binder keys differ for resumption vs external PSKs.
+        let res_bk = ks.binder_key(b"res binder");
+        let ext_bk = ks.binder_key(b"ext binder");
+        assert_ne!(res_bk.as_slice(), ext_bk.as_slice());
+
+        // `binder_finished_key` derives a different secret again.
+        let bfk = binder_finished_key(alg, &res_bk);
+        assert_ne!(bfk.as_slice(), res_bk.as_slice());
+
+        // client_early_traffic_secret over Hash(CH).
+        let cets = ks.client_early_traffic_secret(&transcript_ch);
+        assert_ne!(cets.as_slice(), res_bk.as_slice());
+
+        // Advance through the normal handshake (ECDHE = zeros for the test).
+        ks.enter_handshake(&[0u8; 32]);
+        ks.enter_master();
+
+        // resumption_master_secret over Hash(CH..client Finished).
+        let rms = ks.resumption_master_secret(&transcript_ch_cf);
+
+        // Derive a per-ticket PSK from RMS with a known nonce.
+        let mut psk_out = [0u8; 32];
+        psk_from_resumption(alg, &rms, &[1, 2, 3, 4], &mut psk_out);
+        // Same nonce -> same PSK; different nonce -> different PSK.
+        let mut psk_out2 = [0u8; 32];
+        psk_from_resumption(alg, &rms, &[1, 2, 3, 4], &mut psk_out2);
+        assert_eq!(psk_out, psk_out2);
+        let mut psk_other = [0u8; 32];
+        psk_from_resumption(alg, &rms, &[1, 2, 3, 5], &mut psk_other);
+        assert_ne!(psk_out, psk_other);
     }
 }
