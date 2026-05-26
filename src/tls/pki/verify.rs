@@ -749,7 +749,8 @@ mod tests {
         );
         let spki = AnyPublicKey::Rsa(boxed_pub).to_spki_der();
         let algid = algorithm_identifier(oid::SHA1_WITH_RSA, true);
-        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &algid, true, &[]);
+        let exts = crate::x509::cert::legacy_extensions(true, &[]);
+        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &algid, &exts);
         let sig = key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
         let der = encode_sequence(
             &[tbs.clone(), algid.clone(), encode_bit_string(&sig)].concat(),
@@ -799,7 +800,8 @@ mod tests {
         // algorithm-substitution attacks.
         let inner = algorithm_identifier(oid::SHA256_WITH_RSA, true);
         let outer = algorithm_identifier(oid::SHA1_WITH_RSA, true);
-        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &inner, true, &[]);
+        let exts = crate::x509::cert::legacy_extensions(true, &[]);
+        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &inner, &exts);
         let sig = key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
         let der = encode_sequence(&[tbs, outer, encode_bit_string(&sig)].concat());
         let mismatched = Certificate::from_der(der).unwrap();

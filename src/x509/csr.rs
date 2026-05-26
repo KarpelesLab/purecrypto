@@ -6,9 +6,11 @@
 //! [`Certificate::issue_from_csr`](super::Certificate::issue_from_csr).
 
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
-use super::cert::{parse_dns_names, subject_alt_name_ext};
+use super::cert::parse_dns_names;
+use super::extension::{self, Extension, GeneralName};
 use super::{AnyPublicKey, CertSigner, DistinguishedName, Error, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_sequence, encode_tlv,
@@ -34,14 +36,18 @@ struct CsrParts<'a> {
 }
 
 /// Encodes the `[0] attributes` field of a `CertificationRequestInfo`: empty, or
-/// a single `extensionRequest` attribute carrying a `subjectAltName`.
-fn attributes(dns_names: &[&str]) -> Vec<u8> {
-    if dns_names.is_empty() {
+/// a single `extensionRequest` attribute carrying the given Extensions.
+fn attributes(exts: &[Extension]) -> Vec<u8> {
+    if exts.is_empty() {
         return encode_context(0, &[]);
     }
     // extensionRequest ::= Extensions ::= SEQUENCE OF Extension.
-    let exts = encode_sequence(&subject_alt_name_ext(dns_names));
-    let values = encode_tlv(tag::SET, &exts); // values SET OF { Extensions }
+    let mut body = Vec::new();
+    for e in exts {
+        body.extend_from_slice(&e.to_der());
+    }
+    let exts_seq = encode_sequence(&body);
+    let values = encode_tlv(tag::SET, &exts_seq); // values SET OF { Extensions }
     let attr = encode_sequence(&[oid_tlv(oid::EXTENSION_REQUEST), values].concat());
     encode_context(0, &attr) // [0] IMPLICIT SET OF Attribute
 }
@@ -55,13 +61,33 @@ impl CertificationRequest {
         subject: &DistinguishedName,
         dns_names: &[&str],
     ) -> Result<Self, Error> {
+        let exts = if dns_names.is_empty() {
+            Vec::new()
+        } else {
+            let names: Vec<GeneralName> = dns_names
+                .iter()
+                .map(|s| GeneralName::Dns((*s).into()))
+                .collect();
+            vec![extension::subject_alt_name(&names)]
+        };
+        Self::create_with_extensions(signer, subject, &exts)
+    }
+
+    /// Creates a CSR for `subject` carrying an arbitrary slice of v3 extensions
+    /// inside an `extensionRequest` PKCS#9 attribute (`SEQUENCE OF Extension`).
+    /// An empty slice yields a CSR with an empty `attributes [0]` field.
+    pub fn create_with_extensions(
+        signer: &CertSigner,
+        subject: &DistinguishedName,
+        extensions: &[Extension],
+    ) -> Result<Self, Error> {
         let spki = signer.public_key().to_spki_der();
         let cri = encode_sequence(
             &[
                 encode_integer(&[0]), // version v1 (0)
                 subject.to_der(),
                 spki,
-                attributes(dns_names),
+                attributes(extensions),
             ]
             .concat(),
         );
@@ -168,6 +194,46 @@ impl CertificationRequest {
         Ok(names)
     }
 
+    /// Returns every v3 extension this CSR requests via its
+    /// `extensionRequest` PKCS#9 attribute, in order. An empty list if the
+    /// CSR has no extension request.
+    pub fn extension_requests(&self) -> Result<Vec<Extension>, Error> {
+        let mut seq = self.cri_after_version()?;
+        DistinguishedName::decode(&mut seq)?; // subject
+        seq.read_element()?; // subjectPublicKeyInfo
+        if seq.peek_tag() != Some(tag::context(0)) {
+            return Ok(Vec::new());
+        }
+        let attrs_der = seq.read_tlv(tag::context(0))?;
+        let mut attrs = Reader::new(attrs_der);
+        let mut out = Vec::new();
+        while !attrs.is_empty() {
+            let mut attr = attrs.read_sequence()?;
+            let id = parse_oid(attr.read_oid()?)?;
+            let values = attr.read_tlv(tag::SET)?;
+            if id.as_slice() == oid::EXTENSION_REQUEST {
+                let mut vreader = Reader::new(values);
+                let mut exts = vreader.read_sequence()?; // Extensions
+                while !exts.is_empty() {
+                    let mut ext = exts.read_sequence()?;
+                    let eid = parse_oid(ext.read_oid()?)?;
+                    let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
+                        ext.read_boolean()?
+                    } else {
+                        false
+                    };
+                    let value = ext.read_octet_string()?;
+                    out.push(Extension {
+                        oid: eid,
+                        critical,
+                        value: value.to_vec(),
+                    });
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Verifies the request's self-signature against its own public key.
     pub fn verify_self_signed(&self) -> Result<(), Error> {
         let parts = self.parts()?;
@@ -228,6 +294,56 @@ mod tests {
         der[idx] ^= 1;
         let bad = CertificationRequest::from_der(der).unwrap();
         assert!(bad.verify_self_signed().is_err());
+    }
+
+    #[test]
+    fn csr_create_with_extensions_round_trip() {
+        use crate::x509::extension::{
+            self as ext, GeneralName, KeyUsageBits, basic_constraints, extended_key_usage,
+            key_usage, subject_alt_name,
+        };
+
+        let key = ec_signer_key();
+        let signer = CertSigner::Ecdsa(&key);
+        let subject = DistinguishedName::common_name("ext-csr.example");
+        let exts = [
+            basic_constraints(false, None),
+            key_usage(KeyUsageBits::DIGITAL_SIGNATURE | KeyUsageBits::KEY_ENCIPHERMENT),
+            extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+            subject_alt_name(&[
+                GeneralName::Dns("ext-csr.example".into()),
+                GeneralName::Dns("alt.example".into()),
+            ]),
+        ];
+        let csr = CertificationRequest::create_with_extensions(&signer, &subject, &exts).unwrap();
+        csr.verify_self_signed().unwrap();
+
+        // SANs still surface via the legacy accessor.
+        assert_eq!(
+            csr.subject_alt_names().unwrap(),
+            ["ext-csr.example", "alt.example"]
+        );
+        // The full extension list comes back, byte-for-byte, in order.
+        let got = csr.extension_requests().unwrap();
+        assert_eq!(got.len(), 4);
+        assert_eq!(got[0].oid, oid::BASIC_CONSTRAINTS);
+        assert_eq!(got[1].oid, oid::KEY_USAGE);
+        assert_eq!(got[2].oid, oid::EXT_KEY_USAGE);
+        assert_eq!(got[3].oid, oid::SUBJECT_ALT_NAME);
+        // The expected bytes match the builder output.
+        assert_eq!(got[0], ext::basic_constraints(false, None));
+    }
+
+    #[test]
+    fn csr_empty_extension_requests() {
+        let key = ec_signer_key();
+        let csr = CertificationRequest::create(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("x"),
+            &[],
+        )
+        .unwrap();
+        assert!(csr.extension_requests().unwrap().is_empty());
     }
 
     #[test]

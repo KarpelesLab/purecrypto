@@ -8,6 +8,7 @@
 pub(crate) mod cert;
 mod crl;
 mod csr;
+pub mod extension;
 mod name;
 mod pubkey;
 mod signer;
@@ -16,6 +17,7 @@ mod time;
 pub use cert::Certificate;
 pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, RevokedCertificate};
 pub use csr::CertificationRequest;
+pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
 pub use pubkey::AnyPublicKey;
 pub use signer::CertSigner;
@@ -90,6 +92,24 @@ pub mod oid {
     pub const ID_KP_CLIENT_AUTH: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 2];
     /// `id-ce-subjectAltName` (2.5.29.17).
     pub const SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
+    /// `id-ce-subjectKeyIdentifier` (2.5.29.14).
+    pub const SUBJECT_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 14];
+    /// `id-ce-authorityKeyIdentifier` (2.5.29.35).
+    pub const AUTHORITY_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 35];
+    /// `id-ce-nameConstraints` (2.5.29.30).
+    pub const NAME_CONSTRAINTS: &[u64] = &[2, 5, 29, 30];
+    /// `id-ce-certificatePolicies` (2.5.29.32).
+    pub const CERTIFICATE_POLICIES: &[u64] = &[2, 5, 29, 32];
+    /// `id-ce-cRLDistributionPoints` (2.5.29.31).
+    pub const CRL_DISTRIBUTION_POINTS: &[u64] = &[2, 5, 29, 31];
+    /// `id-kp-codeSigning` (1.3.6.1.5.5.7.3.3).
+    pub const ID_KP_CODE_SIGNING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 3];
+    /// `id-kp-emailProtection` (1.3.6.1.5.5.7.3.4).
+    pub const ID_KP_EMAIL_PROTECTION: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 4];
+    /// `id-kp-timeStamping` (1.3.6.1.5.5.7.3.8).
+    pub const ID_KP_TIME_STAMPING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 8];
+    /// `id-kp-OCSPSigning` (1.3.6.1.5.5.7.3.9).
+    pub const ID_KP_OCSP_SIGNING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 9];
     /// `extensionRequest` PKCS#9 attribute (1.2.840.113549.1.9.14).
     pub const EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
 
