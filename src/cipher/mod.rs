@@ -14,6 +14,7 @@
 
 mod aes;
 mod cbc;
+mod ccm;
 mod cfb;
 mod chacha20;
 mod chacha20poly1305;
@@ -25,6 +26,7 @@ mod poly1305;
 
 pub use aes::{Aes128, Aes192, Aes256};
 pub use cbc::Cbc;
+pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
 pub use cfb::Cfb;
 pub use chacha20::ChaCha20;
 pub use chacha20poly1305::ChaCha20Poly1305;
