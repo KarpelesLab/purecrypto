@@ -163,19 +163,51 @@ pub(crate) fn poly_basemul(a: &Poly, b: &Poly) -> Poly {
     r
 }
 
-/// Centered binomial sampling with η = 2 from a 128-byte PRF block.
-pub(crate) fn cbd2(buf: &[u8; 128]) -> Poly {
+/// Centered binomial sampling with parameter η, consuming `64·ETA` bytes of
+/// PRF output. Each coefficient is `popcount(a) − popcount(b)` over two
+/// adjacent η-bit groups, so the result lies in `[-ETA, ETA]`.
+///
+/// Implemented branch-free in `ETA`: the loop bound and shift amounts are
+/// `const`s, so monomorphization specializes the entire body per set.
+/// Supported values: η ∈ {2, 3} (FIPS 203). Other ETA still works mechanically
+/// up to ETA = 8 but is not exercised.
+pub(crate) fn cbd<const ETA: usize>(buf: &[u8]) -> Poly {
+    debug_assert_eq!(buf.len(), 64 * ETA);
     let mut p = Poly::zero();
-    for i in 0..N / 8 {
-        let t = u32::from_le_bytes([buf[4 * i], buf[4 * i + 1], buf[4 * i + 2], buf[4 * i + 3]]);
-        let d = (t & 0x5555_5555) + ((t >> 1) & 0x5555_5555);
-        for j in 0..8 {
-            let a = ((d >> (4 * j)) & 0x3) as i16;
-            let b = ((d >> (4 * j + 2)) & 0x3) as i16;
-            p.c[8 * i + j] = a - b;
-        }
+    let mask: u32 = (1u32 << ETA) - 1;
+    let group_bits = 2 * ETA;
+    for k in 0..N {
+        let bit_pos = k * group_bits;
+        let byte_idx = bit_pos / 8;
+        let bit_off = bit_pos & 7;
+        // Read up to 24 bits, which is the most we ever need (η = 3 ⇒ 6
+        // group bits; with an offset of 7 the span crosses two bytes; pad
+        // to 3 bytes to keep the indexing uniform).
+        let b0 = buf[byte_idx] as u32;
+        let b1 = if byte_idx + 1 < buf.len() {
+            buf[byte_idx + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if byte_idx + 2 < buf.len() {
+            buf[byte_idx + 2] as u32
+        } else {
+            0
+        };
+        let raw = b0 | (b1 << 8) | (b2 << 16);
+        let chunk = (raw >> bit_off) & ((1u32 << group_bits) - 1);
+        let a = (chunk & mask).count_ones() as i16;
+        let b = ((chunk >> ETA) & mask).count_ones() as i16;
+        p.c[k] = a - b;
     }
     p
+}
+
+/// Back-compat shim for the η = 2 case (kept for the existing tests; new
+/// callers use `cbd::<ETA>` directly).
+#[allow(dead_code)]
+pub(crate) fn cbd2(buf: &[u8; 128]) -> Poly {
+    cbd::<2>(buf)
 }
 
 /// Forces `x` into `[0, q)` (adds q when the sign bit is set).
@@ -235,77 +267,61 @@ pub(crate) fn to_msg(p: &Poly) -> [u8; 32] {
     msg
 }
 
-/// `ByteEncode₁₀(Compress₁₀(p))`: 320 bytes per polynomial (`d_u = 10`).
-pub(crate) fn compress10(p: &Poly) -> [u8; 320] {
-    let mut r = [0u8; 320];
-    let mut o = 0;
-    for i in 0..N / 4 {
-        let mut t = [0u16; 4];
-        for (k, tk) in t.iter_mut().enumerate() {
-            let x = freeze(p.c[4 * i + k]) as u32;
-            *tk = ((((x << 10) + (Q as u32 / 2)) / Q as u32) & 0x3ff) as u16;
-        }
-        r[o] = t[0] as u8;
-        r[o + 1] = ((t[0] >> 8) | (t[1] << 2)) as u8;
-        r[o + 2] = ((t[1] >> 6) | (t[2] << 4)) as u8;
-        r[o + 3] = ((t[2] >> 4) | (t[3] << 6)) as u8;
-        r[o + 4] = (t[3] >> 2) as u8;
-        o += 5;
+/// `ByteEncode_D(Compress_D(p))`: packs N coefficients into `N·D/8` bytes,
+/// little-endian within the bitstream. Constant time over `p`'s coefficients.
+/// Supported D: 4, 5, 10, 11 (all FIPS 203 values for `du` / `dv`).
+pub(crate) fn compress<const D: usize>(p: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * D / 8);
+    for byte in out.iter_mut() {
+        *byte = 0;
     }
-    r
+    let mask: u32 = (1u32 << D) - 1;
+    let mut bit_pos = 0usize;
+    for i in 0..N {
+        let x = freeze(p.c[i]) as u64;
+        let v = (((x << D) + (Q as u64 / 2)) / Q as u64) as u32 & mask;
+        let mut bits_left = D;
+        let mut value = v;
+        let mut byte_idx = bit_pos / 8;
+        let mut shift = bit_pos & 7;
+        while bits_left > 0 {
+            let space = 8 - shift;
+            let take = bits_left.min(space);
+            let chunk = (value & ((1u32 << take) - 1)) as u8;
+            out[byte_idx] |= chunk << shift;
+            value >>= take;
+            bits_left -= take;
+            byte_idx += 1;
+            shift = 0;
+        }
+        bit_pos += D;
+    }
 }
 
-/// `Decompress₁₀(ByteDecode₁₀(c))`: inverse of [`compress10`].
-pub(crate) fn decompress10(a: &[u8]) -> Poly {
-    let mut p = Poly::zero();
-    let mut o = 0;
-    for i in 0..N / 4 {
-        let b: [u32; 5] = [
-            a[o] as u32,
-            a[o + 1] as u32,
-            a[o + 2] as u32,
-            a[o + 3] as u32,
-            a[o + 4] as u32,
-        ];
-        let t = [
-            (b[0] | (b[1] << 8)) & 0x3ff,
-            ((b[1] >> 2) | (b[2] << 6)) & 0x3ff,
-            ((b[2] >> 4) | (b[3] << 4)) & 0x3ff,
-            ((b[3] >> 6) | (b[4] << 2)) & 0x3ff,
-        ];
-        for (k, &tk) in t.iter().enumerate() {
-            p.c[4 * i + k] = ((tk * Q as u32 + 512) >> 10) as i16;
+/// `Decompress_D(ByteDecode_D(c))`: inverse of [`compress`].
+pub(crate) fn decompress<const D: usize>(input: &[u8], p: &mut Poly) {
+    debug_assert_eq!(input.len(), N * D / 8);
+    let mut bit_pos = 0usize;
+    for i in 0..N {
+        let mut value = 0u32;
+        let mut bits_left = D;
+        let mut byte_idx = bit_pos / 8;
+        let mut shift = bit_pos & 7;
+        let mut out_shift = 0;
+        while bits_left > 0 {
+            let space = 8 - shift;
+            let take = bits_left.min(space);
+            // Use u32 for the mask so `take == 8` doesn't trip a u8 shift overflow.
+            let chunk = (input[byte_idx] as u32 >> shift) & ((1u32 << take) - 1);
+            value |= chunk << out_shift;
+            out_shift += take;
+            bits_left -= take;
+            byte_idx += 1;
+            shift = 0;
         }
-        o += 5;
+        p.c[i] = (((value as u64) * Q as u64 + (1u64 << (D - 1))) >> D) as i16;
+        bit_pos += D;
     }
-    p
-}
-
-/// `ByteEncode₄(Compress₄(p))`: 128 bytes per polynomial (`d_v = 4`).
-pub(crate) fn compress4(p: &Poly) -> [u8; 128] {
-    let mut r = [0u8; 128];
-    for i in 0..N / 8 {
-        let mut t = [0u8; 8];
-        for (k, tk) in t.iter_mut().enumerate() {
-            let x = freeze(p.c[8 * i + k]) as u32;
-            *tk = (((((x << 4) + (Q as u32 / 2)) / Q as u32) & 0xf) as u8) & 0xf;
-        }
-        for j in 0..4 {
-            r[4 * i + j] = t[2 * j] | (t[2 * j + 1] << 4);
-        }
-    }
-    r
-}
-
-/// `Decompress₄(ByteDecode₄(c))`: inverse of [`compress4`].
-pub(crate) fn decompress4(a: &[u8]) -> Poly {
-    let mut p = Poly::zero();
-    for (i, &b) in a.iter().take(N / 2).enumerate() {
-        let byte = b as u32;
-        p.c[2 * i] = (((byte & 0xf) * Q as u32 + 8) >> 4) as i16;
-        p.c[2 * i + 1] = (((byte >> 4) * Q as u32 + 8) >> 4) as i16;
-    }
-    p
 }
 
 /// Rejection sampling of a polynomial in the NTT domain from XOF output
@@ -389,19 +405,35 @@ mod tests {
         for i in 0..N {
             p.c[i] = (i % Q as usize) as i16;
         }
-        // d_u = 10: error must be < q/2^10 ≈ 4.
-        let r10 = decompress10(&compress10(&p));
-        for i in 0..N {
-            let diff = (r10.c[i] - p.c[i]).rem_euclid(Q);
-            let d = diff.min(Q - diff);
-            assert!(d <= 2, "du coeff {i} error {d}");
-        }
-        // d_v = 4: error must be < q/2^4 ≈ 104.
-        let r4 = decompress4(&compress4(&p));
-        for i in 0..N {
-            let diff = (r4.c[i] - p.c[i]).rem_euclid(Q);
-            let d = diff.min(Q - diff);
-            assert!(d <= 120, "dv coeff {i} error {d}");
+        // Validate each FIPS 203-used D against its expected error bound.
+        let cases: &[(usize, i16)] = &[(4, 120), (5, 60), (10, 2), (11, 1)];
+        for &(d, max_err) in cases {
+            let mut buf = alloc::vec![0u8; N * d / 8];
+            let mut r = Poly::zero();
+            match d {
+                4 => {
+                    compress::<4>(&p, &mut buf);
+                    decompress::<4>(&buf, &mut r);
+                }
+                5 => {
+                    compress::<5>(&p, &mut buf);
+                    decompress::<5>(&buf, &mut r);
+                }
+                10 => {
+                    compress::<10>(&p, &mut buf);
+                    decompress::<10>(&buf, &mut r);
+                }
+                11 => {
+                    compress::<11>(&p, &mut buf);
+                    decompress::<11>(&buf, &mut r);
+                }
+                _ => unreachable!(),
+            }
+            for i in 0..N {
+                let diff = (r.c[i] - p.c[i]).rem_euclid(Q);
+                let dist = diff.min(Q - diff);
+                assert!(dist <= max_err, "D={d} coeff {i} err {dist}");
+            }
         }
     }
 

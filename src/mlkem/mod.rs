@@ -1,211 +1,281 @@
-//! ML-KEM-768 — the FIPS 203 module-lattice key-encapsulation mechanism
-//! (the standardized form of Kyber).
+//! ML-KEM — the FIPS 203 module-lattice key-encapsulation mechanism (the
+//! standardized form of Kyber), in all three parameter sets:
+//!
+//!  - [`MlKem512`]  / [`MlKem512DecapsKey`]  / [`MlKem512EncapsKey`]  / [`MlKem512Ciphertext`]
+//!  - [`MlKem768`]  / [`MlKem768DecapsKey`]  / [`MlKem768EncapsKey`]  / [`MlKem768Ciphertext`]
+//!  - [`MlKem1024`] / [`MlKem1024DecapsKey`] / [`MlKem1024EncapsKey`] / [`MlKem1024Ciphertext`]
 //!
 //! This is a `no_std`, allocation-free implementation: keys, ciphertexts and
-//! all intermediate state are fixed-size arrays. Randomness is supplied through
-//! the [`RngCore`](crate::rng::RngCore) trait; deterministic constructors
-//! (`from_seeds`, `encapsulate_deterministic`) expose the FIPS 203 internal
-//! functions for known-answer testing.
+//! all intermediate state live on the stack as fixed-size arrays.
+//! Randomness is supplied through the [`RngCore`](crate::rng::RngCore) trait;
+//! deterministic constructors (`from_seeds`, `encapsulate_deterministic`)
+//! expose the FIPS 203 internal functions for known-answer testing.
 //!
 //! Decapsulation never branches on secret data: the Fujisaki–Okamoto
-//! re-encryption check and the implicit-rejection fallback both run in constant
-//! time (see [`kem`]).
+//! re-encryption check and the implicit-rejection fallback both run in
+//! constant time (see [`kem`]).
 
-mod indcpa;
-mod kem;
+pub(crate) mod indcpa;
+pub(crate) mod kem;
 mod poly;
 
 use crate::rng::RngCore;
 
-/// Size in bytes of an ML-KEM-768 encapsulation (public) key.
-pub const ENCAPS_KEY_BYTES: usize = kem::EK_BYTES;
-/// Size in bytes of an ML-KEM-768 decapsulation (secret) key.
-pub const DECAPS_KEY_BYTES: usize = kem::DK_BYTES;
-/// Size in bytes of an ML-KEM-768 ciphertext.
-pub const CIPHERTEXT_BYTES: usize = kem::CIPHERTEXT_BYTES;
-/// Size in bytes of a shared secret.
+/// Marker for one ML-KEM parameter set; carries no data, only used to choose
+/// among the typed APIs by name.
+pub struct MlKem512;
+/// Marker for ML-KEM-768 (the default and most widely deployed set).
+pub struct MlKem768;
+/// Marker for ML-KEM-1024 (highest security level).
+pub struct MlKem1024;
+
+/// Size in bytes of an ML-KEM-768 encapsulation key (kept for back-compat).
+pub const ENCAPS_KEY_BYTES: usize = kem::ek_bytes(3);
+/// Size in bytes of an ML-KEM-768 decapsulation key (kept for back-compat).
+pub const DECAPS_KEY_BYTES: usize = kem::dk_bytes(3);
+/// Size in bytes of an ML-KEM-768 ciphertext (kept for back-compat).
+pub const CIPHERTEXT_BYTES: usize = kem::ct_bytes(3, 10, 4);
+/// Size in bytes of a shared secret (same across all ML-KEM sets).
 pub const SHARED_SECRET_BYTES: usize = 32;
 
-/// An ML-KEM-768 encapsulation (public) key.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MlKem768EncapsKey([u8; ENCAPS_KEY_BYTES]);
-
-/// An ML-KEM-768 decapsulation (secret) key.
-#[derive(Clone)]
-pub struct MlKem768DecapsKey([u8; DECAPS_KEY_BYTES]);
-
-/// An ML-KEM-768 ciphertext.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MlKem768Ciphertext([u8; CIPHERTEXT_BYTES]);
-
-impl MlKem768DecapsKey {
-    /// Generates a fresh key pair from `rng` (32 bytes each of `d` and `z`).
-    pub fn generate<R: RngCore>(rng: &mut R) -> (MlKem768DecapsKey, MlKem768EncapsKey) {
-        let mut d = [0u8; 32];
-        let mut z = [0u8; 32];
-        rng.fill_bytes(&mut d);
-        rng.fill_bytes(&mut z);
-        Self::from_seeds(&d, &z)
-    }
-
-    /// Deterministically derives a key pair from the seeds `(d, z)`
-    /// (ML-KEM.KeyGen_internal). Intended for testing.
-    pub fn from_seeds(d: &[u8; 32], z: &[u8; 32]) -> (MlKem768DecapsKey, MlKem768EncapsKey) {
-        let (ek, dk) = kem::keygen(d, z);
-        (MlKem768DecapsKey(dk), MlKem768EncapsKey(ek))
-    }
-
-    /// The matching encapsulation key.
-    pub fn encapsulation_key(&self) -> MlKem768EncapsKey {
-        let mut ek = [0u8; ENCAPS_KEY_BYTES];
-        ek.copy_from_slice(&self.0[indcpa::PKE_DK_BYTES..indcpa::PKE_DK_BYTES + ENCAPS_KEY_BYTES]);
-        MlKem768EncapsKey(ek)
-    }
-
-    /// Decapsulates `ct`, returning the 32-byte shared secret. On an invalid
-    /// ciphertext this returns a pseudo-random value (implicit rejection), not
-    /// an error — the difference is unobservable to the sender.
-    pub fn decapsulate(&self, ct: &MlKem768Ciphertext) -> [u8; SHARED_SECRET_BYTES] {
-        kem::decaps(&self.0, &ct.0)
-    }
-
-    /// Restores a decapsulation key from its byte encoding.
-    pub fn from_bytes(bytes: [u8; DECAPS_KEY_BYTES]) -> Self {
-        MlKem768DecapsKey(bytes)
-    }
-
-    /// The byte encoding.
-    pub fn to_bytes(&self) -> [u8; DECAPS_KEY_BYTES] {
-        self.0
-    }
+#[cfg(feature = "der")]
+mod oids {
+    /// `id-alg-ml-kem-512`  — 2.16.840.1.101.3.4.4.1.
+    pub(crate) const ML_KEM_512: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 1];
+    /// `id-alg-ml-kem-768`  — 2.16.840.1.101.3.4.4.2.
+    pub(crate) const ML_KEM_768: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 2];
+    /// `id-alg-ml-kem-1024` — 2.16.840.1.101.3.4.4.3.
+    pub(crate) const ML_KEM_1024: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 3];
 }
 
-/// PKCS#8 private-key serialization for the decapsulation key. The `privateKey`
-/// OCTET STRING carries the raw expanded `dk` bytes (purecrypto's own format —
-/// matches OpenSSL's SLH-DSA layout but is simpler than OpenSSL's ML-KEM PKCS#8,
-/// which embeds a seed + expanded SEQUENCE; it round-trips with purecrypto).
-#[cfg(feature = "der")]
-impl MlKem768DecapsKey {
-    /// Encodes the key as a PKCS#8 `PrivateKeyInfo` DER.
-    pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
-        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
-        let algid = encode_sequence(&oid_tlv(ML_KEM_768_OID));
-        encode_sequence(
-            &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
-        )
-    }
+/// Emits the per-set newtype wrappers and impls for one ML-KEM parameter set.
+///
+/// `$ek_size`, `$dk_size`, `$ct_size` are passed alongside the FIPS 203
+/// (K, η₁, η₂, dᵤ, dᵥ) tuple — Rust const generics can't (yet, stably) compute
+/// array sizes from other const params, so we name them at the macro call site.
+macro_rules! ml_kem_set {
+    (
+        $set_doc:literal,
+        $dk_name:ident, $ek_name:ident, $ct_name:ident,
+        $k:expr, $eta1:expr, $eta2:expr, $du:expr, $dv:expr,
+        $ek_size:expr, $dk_size:expr, $ct_size:expr,
+        $oid:ident
+    ) => {
+        #[doc = concat!("An ", $set_doc, " encapsulation (public) key.")]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub struct $ek_name([u8; $ek_size]);
 
-    /// Encodes the key as a PKCS#8 PEM document.
-    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
-    }
+        #[doc = concat!("An ", $set_doc, " decapsulation (secret) key.")]
+        #[derive(Clone)]
+        pub struct $dk_name([u8; $dk_size]);
 
-    /// Parses a PKCS#8 `PrivateKeyInfo` DER (raw `dk` form).
-    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
-        use crate::der::{Error, Reader, parse_oid};
-        let mut r = Reader::new(der);
-        let mut seq = r.read_sequence()?;
-        seq.read_integer_bytes()?;
-        let mut algid = seq.read_sequence()?;
-        if parse_oid(algid.read_oid()?)?.as_slice() != ML_KEM_768_OID {
-            return Err(Error::Malformed);
+        #[doc = concat!("An ", $set_doc, " ciphertext.")]
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        pub struct $ct_name([u8; $ct_size]);
+
+        impl $dk_name {
+            /// Encapsulation-key size in bytes.
+            pub const ENCAPS_KEY_BYTES: usize = $ek_size;
+            /// Decapsulation-key size in bytes.
+            pub const DECAPS_KEY_BYTES: usize = $dk_size;
+            /// Ciphertext size in bytes.
+            pub const CIPHERTEXT_BYTES: usize = $ct_size;
+
+            /// Generates a fresh key pair from `rng` (32 bytes each of `d` and `z`).
+            pub fn generate<R: RngCore>(rng: &mut R) -> ($dk_name, $ek_name) {
+                let mut d = [0u8; 32];
+                let mut z = [0u8; 32];
+                rng.fill_bytes(&mut d);
+                rng.fill_bytes(&mut z);
+                Self::from_seeds(&d, &z)
+            }
+
+            /// Deterministically derives a key pair from `(d, z)`
+            /// (ML-KEM.KeyGen_internal). Intended for testing.
+            pub fn from_seeds(d: &[u8; 32], z: &[u8; 32]) -> ($dk_name, $ek_name) {
+                let mut ek = [0u8; $ek_size];
+                let mut dk = [0u8; $dk_size];
+                kem::keygen::<$k, $eta1>(d, z, &mut ek, &mut dk);
+                ($dk_name(dk), $ek_name(ek))
+            }
+
+            /// The matching encapsulation key.
+            pub fn encapsulation_key(&self) -> $ek_name {
+                let pke_dk = 384 * $k;
+                let mut ek = [0u8; $ek_size];
+                ek.copy_from_slice(&self.0[pke_dk..pke_dk + $ek_size]);
+                $ek_name(ek)
+            }
+
+            /// Decapsulates `ct`, returning the 32-byte shared secret. On an
+            /// invalid ciphertext this returns a pseudo-random value (implicit
+            /// rejection), not an error — the difference is unobservable to
+            /// the sender.
+            pub fn decapsulate(&self, ct: &$ct_name) -> [u8; SHARED_SECRET_BYTES] {
+                kem::decaps::<$k, $eta1, $eta2, $du, $dv>(&self.0, &ct.0)
+            }
+
+            /// Restores a decapsulation key from its byte encoding.
+            pub fn from_bytes(bytes: [u8; $dk_size]) -> Self {
+                $dk_name(bytes)
+            }
+
+            /// The byte encoding.
+            pub fn to_bytes(&self) -> [u8; $dk_size] {
+                self.0
+            }
         }
-        let inner = seq.read_octet_string()?;
-        let bytes: [u8; DECAPS_KEY_BYTES] =
-            inner.try_into().map_err(|_| Error::Malformed)?;
-        Ok(MlKem768DecapsKey(bytes))
-    }
 
-    /// Parses a PKCS#8 PEM private key.
-    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
-    }
-}
+        impl $ek_name {
+            /// Encapsulation-key size in bytes.
+            pub const BYTES: usize = $ek_size;
 
-impl MlKem768EncapsKey {
-    /// Encapsulates to a fresh shared secret, returning `(ciphertext, secret)`.
-    pub fn encapsulate<R: RngCore>(
-        &self,
-        rng: &mut R,
-    ) -> (MlKem768Ciphertext, [u8; SHARED_SECRET_BYTES]) {
-        let mut m = [0u8; 32];
-        rng.fill_bytes(&mut m);
-        self.encapsulate_deterministic(&m)
-    }
+            /// Encapsulates to a fresh shared secret, returning `(ciphertext, secret)`.
+            pub fn encapsulate<R: RngCore>(
+                &self,
+                rng: &mut R,
+            ) -> ($ct_name, [u8; SHARED_SECRET_BYTES]) {
+                let mut m = [0u8; 32];
+                rng.fill_bytes(&mut m);
+                self.encapsulate_deterministic(&m)
+            }
 
-    /// Encapsulates with an explicit message `m` (ML-KEM.Encaps_internal).
-    /// Intended for testing.
-    pub fn encapsulate_deterministic(
-        &self,
-        m: &[u8; 32],
-    ) -> (MlKem768Ciphertext, [u8; SHARED_SECRET_BYTES]) {
-        let (ct, ss) = kem::encaps(&self.0, m);
-        (MlKem768Ciphertext(ct), ss)
-    }
+            /// Encapsulates with an explicit message `m` (ML-KEM.Encaps_internal).
+            /// Intended for testing.
+            pub fn encapsulate_deterministic(
+                &self,
+                m: &[u8; 32],
+            ) -> ($ct_name, [u8; SHARED_SECRET_BYTES]) {
+                let mut ct = [0u8; $ct_size];
+                let ss = kem::encaps::<$k, $eta1, $eta2, $du, $dv>(&self.0, m, &mut ct);
+                ($ct_name(ct), ss)
+            }
 
-    /// Restores an encapsulation key from its byte encoding.
-    pub fn from_bytes(bytes: [u8; ENCAPS_KEY_BYTES]) -> Self {
-        MlKem768EncapsKey(bytes)
-    }
+            /// Restores an encapsulation key from its byte encoding.
+            pub fn from_bytes(bytes: [u8; $ek_size]) -> Self {
+                $ek_name(bytes)
+            }
 
-    /// The byte encoding.
-    pub fn to_bytes(&self) -> [u8; ENCAPS_KEY_BYTES] {
-        self.0
-    }
-}
-
-/// The `id-alg-ml-kem-768` OID (2.16.840.1.101.3.4.4.2).
-#[cfg(feature = "der")]
-const ML_KEM_768_OID: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 2];
-
-/// PKIX `SubjectPublicKeyInfo` import/export for the encapsulation key
-/// (draft-ietf-lamps-kyber-certificates). The AlgorithmIdentifier carries the
-/// bare OID with no parameters; the BIT STRING is the raw encapsulation key.
-#[cfg(feature = "der")]
-impl MlKem768EncapsKey {
-    /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure.
-    pub fn to_spki_der(&self) -> alloc::vec::Vec<u8> {
-        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
-        let algid = encode_sequence(&oid_tlv(ML_KEM_768_OID));
-        encode_sequence(&[algid, encode_bit_string(&self.0)].concat())
-    }
-
-    /// Encodes the key as a PKIX PEM document (`-----BEGIN PUBLIC KEY-----`).
-    pub fn to_spki_pem(&self) -> alloc::string::String {
-        crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
-    }
-
-    /// Parses a PKIX `SubjectPublicKeyInfo` DER structure.
-    pub fn from_spki_der(der: &[u8]) -> Result<Self, crate::der::Error> {
-        use crate::der::{Error, Reader, parse_oid};
-        let mut reader = Reader::new(der);
-        let mut spki = reader.read_sequence()?;
-        let mut algid = spki.read_sequence()?;
-        if parse_oid(algid.read_oid()?)?.as_slice() != ML_KEM_768_OID {
-            return Err(Error::Malformed);
+            /// The byte encoding.
+            pub fn to_bytes(&self) -> [u8; $ek_size] {
+                self.0
+            }
         }
-        let key_bits = spki.read_bit_string()?;
-        let bytes: [u8; ENCAPS_KEY_BYTES] = key_bits.try_into().map_err(|_| Error::Malformed)?;
-        Ok(MlKem768EncapsKey(bytes))
-    }
 
-    /// Parses a PKIX PEM public key.
-    pub fn from_spki_pem(pem: &str) -> Result<Self, crate::der::Error> {
-        Self::from_spki_der(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
-    }
+        impl $ct_name {
+            /// Ciphertext size in bytes.
+            pub const BYTES: usize = $ct_size;
+
+            /// Restores a ciphertext from its byte encoding.
+            pub fn from_bytes(bytes: [u8; $ct_size]) -> Self {
+                $ct_name(bytes)
+            }
+
+            /// The byte encoding.
+            pub fn to_bytes(&self) -> [u8; $ct_size] {
+                self.0
+            }
+        }
+
+        /// PKCS#8 (raw expanded dk) for the decapsulation key.
+        #[cfg(feature = "der")]
+        impl $dk_name {
+            /// Encodes the key as a PKCS#8 `PrivateKeyInfo` DER.
+            pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
+                use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+                let algid = encode_sequence(&oid_tlv(oids::$oid));
+                encode_sequence(
+                    &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
+                )
+            }
+
+            /// Encodes the key as a PKCS#8 PEM document.
+            pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+                crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+            }
+
+            /// Parses a PKCS#8 `PrivateKeyInfo` DER (raw `dk` form).
+            pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+                use crate::der::{Error, Reader, parse_oid};
+                let mut r = Reader::new(der);
+                let mut seq = r.read_sequence()?;
+                seq.read_integer_bytes()?;
+                let mut algid = seq.read_sequence()?;
+                if parse_oid(algid.read_oid()?)?.as_slice() != oids::$oid {
+                    return Err(Error::Malformed);
+                }
+                let inner = seq.read_octet_string()?;
+                let bytes: [u8; $dk_size] = inner.try_into().map_err(|_| Error::Malformed)?;
+                Ok($dk_name(bytes))
+            }
+
+            /// Parses a PKCS#8 PEM private key.
+            pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
+                Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+            }
+        }
+
+        /// PKIX `SubjectPublicKeyInfo` for the encapsulation key.
+        #[cfg(feature = "der")]
+        impl $ek_name {
+            /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure.
+            pub fn to_spki_der(&self) -> alloc::vec::Vec<u8> {
+                use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+                let algid = encode_sequence(&oid_tlv(oids::$oid));
+                encode_sequence(&[algid, encode_bit_string(&self.0)].concat())
+            }
+
+            /// Encodes the key as a PKIX PEM document (`-----BEGIN PUBLIC KEY-----`).
+            pub fn to_spki_pem(&self) -> alloc::string::String {
+                crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
+            }
+
+            /// Parses a PKIX `SubjectPublicKeyInfo` DER structure.
+            pub fn from_spki_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+                use crate::der::{Error, Reader, parse_oid};
+                let mut reader = Reader::new(der);
+                let mut spki = reader.read_sequence()?;
+                let mut algid = spki.read_sequence()?;
+                if parse_oid(algid.read_oid()?)?.as_slice() != oids::$oid {
+                    return Err(Error::Malformed);
+                }
+                let key_bits = spki.read_bit_string()?;
+                let bytes: [u8; $ek_size] =
+                    key_bits.try_into().map_err(|_| Error::Malformed)?;
+                Ok($ek_name(bytes))
+            }
+
+            /// Parses a PKIX PEM public key.
+            pub fn from_spki_pem(pem: &str) -> Result<Self, crate::der::Error> {
+                Self::from_spki_der(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
+            }
+        }
+    };
 }
 
-impl MlKem768Ciphertext {
-    /// Restores a ciphertext from its byte encoding.
-    pub fn from_bytes(bytes: [u8; CIPHERTEXT_BYTES]) -> Self {
-        MlKem768Ciphertext(bytes)
-    }
+ml_kem_set!(
+    "ML-KEM-512 (FIPS 203, security level 1)",
+    MlKem512DecapsKey, MlKem512EncapsKey, MlKem512Ciphertext,
+    2, 3, 2, 10, 4,
+    /* ek */ 800, /* dk */ 1632, /* ct */ 768,
+    ML_KEM_512
+);
 
-    /// The byte encoding.
-    pub fn to_bytes(&self) -> [u8; CIPHERTEXT_BYTES] {
-        self.0
-    }
-}
+ml_kem_set!(
+    "ML-KEM-768 (FIPS 203, security level 3)",
+    MlKem768DecapsKey, MlKem768EncapsKey, MlKem768Ciphertext,
+    3, 2, 2, 10, 4,
+    /* ek */ 1184, /* dk */ 2400, /* ct */ 1088,
+    ML_KEM_768
+);
+
+ml_kem_set!(
+    "ML-KEM-1024 (FIPS 203, security level 5)",
+    MlKem1024DecapsKey, MlKem1024EncapsKey, MlKem1024Ciphertext,
+    4, 2, 2, 11, 5,
+    /* ek */ 1568, /* dk */ 3168, /* ct */ 1568,
+    ML_KEM_1024
+);
 
 #[cfg(test)]
 mod tests {
@@ -214,15 +284,37 @@ mod tests {
     use crate::rng::HmacDrbg;
 
     #[test]
-    fn sizes_match_fips203() {
-        assert_eq!(ENCAPS_KEY_BYTES, 1184);
-        assert_eq!(DECAPS_KEY_BYTES, 2400);
-        assert_eq!(CIPHERTEXT_BYTES, 1088);
+    fn fips203_sizes() {
+        // FIPS 203 §8.
+        assert_eq!(
+            (
+                MlKem512DecapsKey::ENCAPS_KEY_BYTES,
+                MlKem512DecapsKey::DECAPS_KEY_BYTES,
+                MlKem512DecapsKey::CIPHERTEXT_BYTES,
+            ),
+            (800, 1632, 768)
+        );
+        assert_eq!(
+            (
+                MlKem768DecapsKey::ENCAPS_KEY_BYTES,
+                MlKem768DecapsKey::DECAPS_KEY_BYTES,
+                MlKem768DecapsKey::CIPHERTEXT_BYTES,
+            ),
+            (1184, 2400, 1088)
+        );
+        assert_eq!(
+            (
+                MlKem1024DecapsKey::ENCAPS_KEY_BYTES,
+                MlKem1024DecapsKey::DECAPS_KEY_BYTES,
+                MlKem1024DecapsKey::CIPHERTEXT_BYTES,
+            ),
+            (1568, 3168, 1568)
+        );
     }
 
     #[test]
-    fn encaps_decaps_roundtrip() {
-        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem", b"nonce", &[]);
+    fn roundtrip_768() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-768", b"nonce", &[]);
         let (dk, ek) = MlKem768DecapsKey::generate(&mut rng);
         let (ct, ss_a) = ek.encapsulate(&mut rng);
         let ss_b = dk.decapsulate(&ct);
@@ -230,12 +322,55 @@ mod tests {
     }
 
     #[test]
-    fn openssl_interop_keygen_and_decaps() {
-        // Cross-validated against OpenSSL 3.5's FIPS 203 ML-KEM-768 using the
-        // seed d = z = 0³²: the encapsulation key matches byte-for-byte, and
-        // decapsulating OpenSSL's ciphertext recovers OpenSSL's shared secret.
-        // (Decaps re-encrypts internally, so this also pins K-PKE.Encrypt; and a
-        // separate check confirmed OpenSSL decaps of our encaps agrees.)
+    fn roundtrip_512() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-512", b"nonce", &[]);
+        let (dk, ek) = MlKem512DecapsKey::generate(&mut rng);
+        let (ct, ss_a) = ek.encapsulate(&mut rng);
+        let ss_b = dk.decapsulate(&ct);
+        assert_eq!(ss_a, ss_b);
+    }
+
+    #[test]
+    fn roundtrip_1024() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-1024", b"nonce", &[]);
+        let (dk, ek) = MlKem1024DecapsKey::generate(&mut rng);
+        let (ct, ss_a) = ek.encapsulate(&mut rng);
+        let ss_b = dk.decapsulate(&ct);
+        assert_eq!(ss_a, ss_b);
+    }
+
+    #[test]
+    fn implicit_rejection_512() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"reject-512", b"nonce", &[]);
+        let (dk, ek) = MlKem512DecapsKey::generate(&mut rng);
+        let (ct, ss) = ek.encapsulate(&mut rng);
+        let mut bad = ct.to_bytes();
+        bad[0] ^= 1;
+        let rejected = dk.decapsulate(&MlKem512Ciphertext::from_bytes(bad));
+        assert_ne!(rejected, ss);
+        // Deterministic: same bad ciphertext maps to the same rejection secret.
+        assert_eq!(rejected, dk.decapsulate(&MlKem512Ciphertext::from_bytes(bad)));
+    }
+
+    #[test]
+    fn implicit_rejection_1024() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"reject-1024", b"nonce", &[]);
+        let (dk, ek) = MlKem1024DecapsKey::generate(&mut rng);
+        let (ct, ss) = ek.encapsulate(&mut rng);
+        let mut bad = ct.to_bytes();
+        bad[0] ^= 1;
+        let rejected = dk.decapsulate(&MlKem1024Ciphertext::from_bytes(bad));
+        assert_ne!(rejected, ss);
+        assert_eq!(
+            rejected,
+            dk.decapsulate(&MlKem1024Ciphertext::from_bytes(bad))
+        );
+    }
+
+    /// ML-KEM-768 byte-compat with OpenSSL 3.5 (deterministic keygen with
+    /// `d = z = 0³²`). The refactor must produce identical bytes.
+    #[test]
+    fn openssl_interop_768_unchanged_after_refactor() {
         use crate::test_util::{from_hex, from_hex_vec};
         let (dk, ek) = MlKem768DecapsKey::from_seeds(&[0u8; 32], &[0u8; 32]);
 
@@ -247,7 +382,7 @@ mod tests {
         );
 
         let ct_bytes = from_hex_vec(include_str!("../../testdata/mlkem768_openssl_ct.hex"));
-        let mut ct = [0u8; CIPHERTEXT_BYTES];
+        let mut ct = [0u8; MlKem768DecapsKey::CIPHERTEXT_BYTES];
         ct.copy_from_slice(&ct_bytes);
         let ss = dk.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
         assert_eq!(
@@ -256,35 +391,38 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "der")]
     #[test]
-    fn spki_matches_openssl_and_roundtrips() {
+    fn spki_768_matches_openssl_and_roundtrips() {
         use crate::test_util::from_hex_vec;
         let (_dk, ek) = MlKem768DecapsKey::from_seeds(&[0u8; 32], &[0u8; 32]);
-
-        // Our SPKI DER must match OpenSSL 3.5's byte-for-byte.
         let expected = from_hex_vec(include_str!("../../testdata/mlkem768_openssl_spki.hex"));
         assert_eq!(ek.to_spki_der(), expected);
 
-        // PEM round-trip recovers the same key.
         let pem = ek.to_spki_pem();
         assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
         let parsed = MlKem768EncapsKey::from_spki_pem(&pem).unwrap();
         assert_eq!(parsed, ek);
     }
 
+    #[cfg(feature = "der")]
     #[test]
-    fn implicit_rejection_on_tampered_ciphertext() {
-        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-reject", b"nonce", &[]);
-        let (dk, ek) = MlKem768DecapsKey::generate(&mut rng);
-        let (ct, ss) = ek.encapsulate(&mut rng);
-
-        let mut bad = ct.to_bytes();
-        bad[0] ^= 0x01;
-        let rejected = dk.decapsulate(&MlKem768Ciphertext::from_bytes(bad));
-        // A corrupted ciphertext yields a (deterministic) pseudo-random secret,
-        // not the real one.
-        assert_ne!(rejected, ss);
-        // ...and the same corrupted ciphertext always maps to the same secret.
-        assert_eq!(rejected, dk.decapsulate(&MlKem768Ciphertext::from_bytes(bad)));
+    fn pkcs8_roundtrip_each_set() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"pkcs8", b"nonce", &[]);
+        // 512
+        let (dk, _) = MlKem512DecapsKey::generate(&mut rng);
+        let pem = dk.to_pkcs8_pem();
+        let parsed = MlKem512DecapsKey::from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(parsed.to_bytes(), dk.to_bytes());
+        // 768
+        let (dk, _) = MlKem768DecapsKey::generate(&mut rng);
+        let pem = dk.to_pkcs8_pem();
+        let parsed = MlKem768DecapsKey::from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(parsed.to_bytes(), dk.to_bytes());
+        // 1024
+        let (dk, _) = MlKem1024DecapsKey::generate(&mut rng);
+        let pem = dk.to_pkcs8_pem();
+        let parsed = MlKem1024DecapsKey::from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(parsed.to_bytes(), dk.to_bytes());
     }
 }
