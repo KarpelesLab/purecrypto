@@ -4,6 +4,8 @@
 //!  - [`hkdf`]   — RFC 5869, extract / expand / one-shot.
 //!  - [`scrypt`] — RFC 7914, memory-hard PBKDF (requires `alloc`).
 
+#[cfg(feature = "alloc")]
+pub mod argon2;
 mod hkdf;
 mod pbkdf2;
 #[cfg(feature = "alloc")]
