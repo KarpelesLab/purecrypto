@@ -65,15 +65,33 @@ fn bits2int(data: &[u8], qlen: usize) -> BoxedUint {
     }
 }
 
-/// A uniformly random scalar in `[1, n-1]`.
+/// A uniformly random scalar in `[1, n-1]` via rejection sampling.
+///
+/// Drawing `order_len` bytes and reducing mod `n` is biased when the byte
+/// width exceeds `n.bit_len()`. For P-521 in particular, `order_len = 66`
+/// (528 bits) while `n` is ~521 bits, so naive reduction is biased by
+/// roughly `2^-7` on a band of residues. We instead reject any sample `≥ n`
+/// (and zero) and resample — bias collapses to zero.
 fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> BoxedUint {
     let bytes = curve.order_len();
+    // Mask the high byte to `n.bit_len()` bits so the draw is uniform over
+    // `[0, 2^n.bit_len())` rather than `[0, 2^(8*order_len))` — without this
+    // step P-521's rejection rate would be ~50%.
+    let nbits = n.bit_len();
+    let high_keep_bits = ((nbits - 1) % 8) + 1;
+    let high_mask = if high_keep_bits == 8 {
+        0xff
+    } else {
+        (1u8 << high_keep_bits) - 1
+    };
     loop {
         let mut buf = vec![0u8; bytes];
         rng.fill_bytes(&mut buf);
-        let d = BoxedUint::from_be_bytes(&buf).reduce(n);
-        if !d.is_zero() {
-            return d;
+        buf[0] &= high_mask;
+        let candidate = BoxedUint::from_be_bytes(&buf);
+        // Accept iff 1 ≤ candidate < n.
+        if !candidate.is_zero() && candidate.lt(n) {
+            return candidate;
         }
     }
 }

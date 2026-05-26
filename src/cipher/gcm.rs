@@ -125,9 +125,32 @@ impl<C: BlockCipher> Gcm<C> {
         (u128::from_be_bytes(ej0) ^ s).to_be_bytes()
     }
 
+    /// NIST SP 800-38D §5.2.1.1: |IV| ∈ [1, 2^64−1] bits. We surface the
+    /// upper end as a byte cap; the lower end forbids zero-length nonces.
+    const MAX_NONCE_LEN: usize = (1usize << 61) - 1;
+    /// NIST SP 800-38D §5.2.1.1: |P| ≤ 2^39 − 256 bits, i.e. `(1<<36) − 32`
+    /// bytes. Above this, the 32-bit GCTR counter wraps and reuses keystream.
+    pub const MAX_PLAINTEXT_LEN: u64 = (1u64 << 36) - 32;
+
+    fn validate(nonce: &[u8], buffer: &[u8]) {
+        assert!(
+            !nonce.is_empty() && nonce.len() <= Self::MAX_NONCE_LEN,
+            "AES-GCM nonce must be 1..=2^61-1 bytes (NIST SP 800-38D §5.2.1.1)"
+        );
+        assert!(
+            (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
+            "AES-GCM plaintext exceeds 2^39 − 256 bits (NIST SP 800-38D §5.2.1.1)"
+        );
+    }
+
     /// Encrypts `buffer` in place and returns the 16-byte authentication tag,
     /// binding the optional `aad`.
+    ///
+    /// # Panics
+    /// Panics if `nonce.is_empty()` or `buffer.len()` exceeds the NIST
+    /// SP 800-38D plaintext cap (`2^39 − 256` bits).
     pub fn encrypt(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
+        Self::validate(nonce, buffer);
         let j0 = self.j0(nonce);
         self.gctr(inc32(j0), buffer);
         self.tag(j0, aad, buffer)
@@ -138,6 +161,9 @@ impl<C: BlockCipher> Gcm<C> {
     /// The tag is checked in constant time. On mismatch the ciphertext is
     /// **left untouched** (no unauthenticated plaintext is produced) and
     /// [`TagMismatch`] is returned.
+    ///
+    /// # Panics
+    /// Panics if `nonce.is_empty()` or `buffer.len()` exceeds the NIST cap.
     pub fn decrypt(
         &self,
         nonce: &[u8],
@@ -145,6 +171,7 @@ impl<C: BlockCipher> Gcm<C> {
         buffer: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
+        Self::validate(nonce, buffer);
         let j0 = self.j0(nonce);
         // GHASH is computed over the ciphertext, which is still in `buffer`.
         let expected = self.tag(j0, aad, buffer);
