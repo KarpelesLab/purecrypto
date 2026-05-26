@@ -167,14 +167,22 @@ impl ServerHello {
         out
     }
 
-    /// Decodes a `ServerHello` from a handshake message body.
+    /// Decodes a `ServerHello` from a handshake message body. RFC 8446
+    /// §4.1.3 / RFC 5246 §7.4.1.3: `legacy_version` MUST be `0x0303` (TLS
+    /// 1.2 wire) and `legacy_compression_method` MUST be `0`.
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
         let mut c = ReadCursor::new(body);
-        let _legacy_version = c.u16()?;
+        let legacy_version = c.u16()?;
+        if legacy_version != 0x0303 {
+            return Err(Error::Decode);
+        }
         let random = read_random(&mut c)?;
         let session_id = c.vec_u8()?.to_vec();
         let cipher_suite = CipherSuite(c.u16()?);
-        let _compression = c.u8()?;
+        let compression = c.u8()?;
+        if compression != 0 {
+            return Err(Error::Decode);
+        }
         let extensions = parse_extensions(c.vec_u16()?)?;
         c.expect_empty()?;
         Ok(ServerHello {

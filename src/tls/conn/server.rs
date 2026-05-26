@@ -682,6 +682,25 @@ impl<R: RngCore> ServerConnection<R> {
         }
         let ch = ClientHello::decode(body)?;
 
+        // RFC 7507 §3: TLS_FALLBACK_SCSV (0x5600) in the offered suite list
+        // means the client is intentionally downgrading. Since this is the
+        // TLS-1.3 server (we always top out at the highest version we
+        // support), the only legitimate inclusion is when the client offered
+        // only TLS 1.2 — but if `supported_versions` also offers 1.3, that's
+        // an attacker-driven downgrade and we MUST refuse with
+        // `inappropriate_fallback`. We surface it as `IllegalParameter` here
+        // because the existing alert code set doesn't carry the dedicated
+        // 86 / `inappropriate_fallback` description.
+        const TLS_FALLBACK_SCSV: super::super::codec::CipherSuite =
+            super::super::codec::CipherSuite(0x5600);
+        if ch.cipher_suites.contains(&TLS_FALLBACK_SCSV) {
+            if let Some(sv_ext) = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
+                && ext::client_offers_tls13(sv_ext).unwrap_or(false)
+            {
+                return Err(Error::IllegalParameter);
+            }
+        }
+
         // PSK resumption: process pre_shared_key + psk_key_exchange_modes
         // before suite negotiation so we can constrain the suite to the PSK's
         // hash. Hard-fail on binder mismatch (decrypt_error).
@@ -1106,11 +1125,13 @@ impl<R: RngCore> ServerConnection<R> {
         }
         // Validate the chain against the configured roots, applying the
         // server's signature-algorithm whitelist to every chain signature.
-        let leaf_key = crate::tls::pki::verify_chain(
+        // mTLS: leaf is a client cert, so require `id-kp-clientAuth` EKU.
+        let leaf_key = crate::tls::pki::verify_chain_for_purpose(
             &policy.roots,
             &chain,
             None,
             &self.config.signature_policy,
+            crate::tls::pki::ChainPurpose::Client,
         )?;
         self.client_cert_chain = chain;
         self.client_leaf_key = Some(leaf_key);
@@ -1133,6 +1154,12 @@ impl<R: RngCore> ServerConnection<R> {
         let scheme = SignatureScheme(c.u16()?);
         let signature = c.vec_u16()?.to_vec();
         c.expect_empty()?;
+
+        // RFC 8446 §4.4.3: rsa_pkcs1_* schemes MUST NOT appear in TLS 1.3
+        // CertificateVerify (legacy chain signatures only).
+        if scheme.is_rsa_pkcs1() {
+            return Err(Error::IllegalParameter);
+        }
 
         // The transcript at this point includes everything up to (and not
         // including) this CertificateVerify, which is exactly the input the

@@ -39,7 +39,10 @@ pub(crate) fn supported_groups_list(groups: &[NamedGroup]) -> RawExtension {
     (ExtensionType::SUPPORTED_GROUPS, body)
 }
 
-/// `signature_algorithms` listing the schemes we can verify/produce.
+/// `signature_algorithms` listing the schemes we accept for
+/// `CertificateVerify`. RFC 8446 §4.4.3 forbids `rsa_pkcs1_*` from this
+/// list — those schemes are reserved for chain signatures and must be
+/// offered via `signature_algorithms_cert` (RFC 8446 §4.2.3) if needed.
 pub(crate) fn signature_algorithms() -> RawExtension {
     let schemes = [
         SignatureScheme::ED25519,
@@ -48,8 +51,6 @@ pub(crate) fn signature_algorithms() -> RawExtension {
         SignatureScheme::ECDSA_SECP521R1_SHA512,
         SignatureScheme::RSA_PSS_RSAE_SHA256,
         SignatureScheme::RSA_PSS_RSAE_SHA384,
-        SignatureScheme::RSA_PKCS1_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA384,
         // ML-DSA (draft-ietf-tls-mldsa). The TLS 1.3 wire format carries
         // the raw FIPS 204 signature in the CertificateVerify body, no
         // DER wrapping.

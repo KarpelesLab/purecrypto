@@ -57,11 +57,40 @@ const MAX_CHAIN_LEN: usize = 10;
 /// signatures use an algorithm not on the whitelist is rejected with
 /// `BadCertificate`, regardless of whether the signature would otherwise
 /// verify.
+///
+/// Equivalent to [`verify_chain_for_purpose`] with [`ChainPurpose::Server`]
+/// (the most common case). Use the explicit form for client-cert
+/// verification in mTLS.
 pub(crate) fn verify_chain(
     store: &RootCertStore,
     chain: &[Vec<u8>],
     now: Option<&Time>,
     policy: &SignaturePolicy,
+) -> Result<AnyPublicKey, Error> {
+    verify_chain_for_purpose(store, chain, now, policy, ChainPurpose::Server)
+}
+
+/// Whether the leaf is the *server* (verified by a TLS client) or the
+/// *client* (verified by a TLS server in mTLS). The distinction matters for
+/// the leaf's `extKeyUsage`: server certs need `id-kp-serverAuth`, client
+/// certs need `id-kp-clientAuth` (RFC 5280 §4.2.1.12). Conflating the two
+/// would let a server cert authenticate as a client (or vice versa).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChainPurpose {
+    /// The leaf is a TLS server certificate. Requires `id-kp-serverAuth`
+    /// EKU when an EKU extension is present.
+    Server,
+    /// The leaf is a TLS client certificate (mTLS). Requires
+    /// `id-kp-clientAuth` EKU when an EKU extension is present.
+    Client,
+}
+
+pub(crate) fn verify_chain_for_purpose(
+    store: &RootCertStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+    purpose: ChainPurpose,
 ) -> Result<AnyPublicKey, Error> {
     if chain.is_empty() {
         return Err(Error::BadCertificate);
@@ -130,7 +159,7 @@ pub(crate) fn verify_chain(
     }
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
-    enforce_constraints(&certs)?;
+    enforce_constraints(&certs, purpose)?;
 
     certs[0]
         .subject_public_key()
@@ -167,7 +196,7 @@ fn verify_cert_against_issuer(
 ///     between it and the leaf;
 ///   * if the leaf carries `keyUsage`, `digitalSignature` (bit 0) must be set;
 ///   * if the leaf carries `extKeyUsage`, it must include `id-kp-serverAuth`.
-fn enforce_constraints(certs: &[Certificate]) -> Result<(), Error> {
+fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(), Error> {
     // `certs[0]` is the leaf, `certs[last]` is the topmost supplied
     // certificate (its issuer is the trust anchor in the store).
     for (i, cert) in certs.iter().enumerate().skip(1) {
@@ -210,7 +239,11 @@ fn enforce_constraints(certs: &[Certificate]) -> Result<(), Error> {
     let ekus = leaf
         .extended_key_usages()
         .map_err(|_| Error::BadCertificate)?;
-    if !ekus.is_empty() && !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_SERVER_AUTH) {
+    let required = match purpose {
+        ChainPurpose::Server => oid::ID_KP_SERVER_AUTH,
+        ChainPurpose::Client => oid::ID_KP_CLIENT_AUTH,
+    };
+    if !ekus.is_empty() && !ekus.iter().any(|o| o.as_slice() == required) {
         return Err(Error::BadCertificate);
     }
     Ok(())

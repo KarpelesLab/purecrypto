@@ -1039,6 +1039,20 @@ impl ClientConnection {
             return self.on_hello_retry_request(sh, raw);
         }
 
+        // RFC 8446 §4.1.3: a TLS-1.3 ServerHello carrying the downgrade
+        // sentinel "DOWNGRD\x01" (TLS 1.2) or "...\x00" (TLS 1.1/below) in
+        // the last 8 bytes of `server_random` is a TLS-1.3-aware server
+        // signaling that it intentionally negotiated a lower version.
+        // Because this code path is the TLS-1.3 client (we always offered
+        // 1.3), seeing the sentinel here means an attacker is downgrading
+        // us; abort with `illegal_parameter`.
+        let tail: &[u8] = &sh.random[24..];
+        if tail == super::client12::DOWNGRADE_SENTINEL_TLS12
+            || tail == super::client12::DOWNGRADE_SENTINEL_TLS11_OR_BELOW
+        {
+            return Err(Error::IllegalParameter);
+        }
+
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         // Confirm TLS 1.3 was selected.
         let sv = ext::find(
@@ -1363,6 +1377,14 @@ impl ClientConnection {
         let scheme = SignatureScheme(c.u16()?);
         let signature = c.vec_u16()?.to_vec();
         c.expect_empty()?;
+
+        // RFC 8446 §4.4.3: the rsa_pkcs1_* schemes MUST NOT appear in
+        // `CertificateVerify` (they are reserved for legacy chain signatures
+        // in `signature_algorithms_cert` only). Reject before any
+        // verification work.
+        if scheme.is_rsa_pkcs1() {
+            return Err(Error::IllegalParameter);
+        }
 
         // Always reject a malformed leaf certificate, regardless of policy.
         let leaf =
