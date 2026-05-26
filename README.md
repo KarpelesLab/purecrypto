@@ -55,9 +55,9 @@ Single crate, modules gated by Cargo features:
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
 | X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
-| TLS              | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid; AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; RFC 8448 KATs. _Missing: TLS 1.2, DTLS, session resumption / PSK / 0-RTT, client auth._ |
+| TLS              | `tls`       | ✅ TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid; AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window; mTLS / client certificate authentication; HelloRetryRequest; bidirectional KeyUpdate; RFC 8448 KATs. _Missing: TLS 1.2, DTLS._ |
 | C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA, ECDSA & Ed25519 keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
-| CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client` |
+| CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server` |
 
 ## Cargo features
 
@@ -196,12 +196,43 @@ purecrypto x509 -in leaf.crt -text
 purecrypto s_client -connect example.com:443
 purecrypto s_client -connect 127.0.0.1:8443 -CAfile ca.crt -servername leaf.example
 purecrypto s_client -connect 127.0.0.1:8443 -insecure -quiet      # skip cert verify, stdin → server
+
+# Negotiate HTTP/2 (or fall back to http/1.1) via ALPN
+purecrypto s_client -connect example.com:443 -alpn h2,http/1.1
+
+# Dump the negotiated secrets in NSS SSLKEYLOGFILE format — Wireshark can
+# then decrypt the captured pcap.
+purecrypto s_client -connect example.com:443 -keylogfile sslkeys.log
+
+# Present a client certificate (mTLS). The key may be Ed25519 (PKCS#8) or
+# ECDSA (SEC1).
+purecrypto s_client -connect server:443 -cert client.pem -key client.key
 ```
 
 The client offers `X25519MLKEM768` (post-quantum hybrid) first, then `x25519`
 and `secp256r1`; all three TLS 1.3 cipher suites
 (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
 `TLS_CHACHA20_POLY1305_SHA256`); and Ed25519, ECDSA, and RSA peer signatures.
+
+### `s_server` — TLS 1.3 echo / `-www` server
+
+A one-shot test server: it binds, accepts one connection, performs the
+handshake, exchanges data, and exits.
+
+```sh
+# Plain TLS echo:
+purecrypto s_server -cert server.pem -key server.key -accept 4433
+
+# Serve a fixed HTTP response (text/plain) for one request:
+purecrypto s_server -cert server.pem -key server.key -accept 4433 -www
+
+# Negotiate ALPN, listen on 8443:
+purecrypto s_server -cert server.pem -key server.key -accept 8443 -alpn h2,http/1.1
+
+# mTLS: require + verify a client cert against the bundle in `client-ca.pem`.
+purecrypto s_server -cert server.pem -key server.key -accept 8443 \
+                    -Verify client-ca.pem
+```
 
 ### Cookbook
 
@@ -223,6 +254,30 @@ A post-quantum signature key and its public counterpart:
 purecrypto genpkey -algorithm ML-DSA-65 -out mldsa.pem
 purecrypto pkey -in mldsa.pem -text                       # ML-DSA-65 private key
 purecrypto pkey -in mldsa.pem -pubout > mldsa.pub.pem     # PKIX SPKI
+```
+
+A two-process mTLS handshake on a single host (client cert presented to the
+server, both keys Ed25519):
+
+```sh
+# CA + server cert + client cert
+purecrypto genpkey -algorithm ED25519 -out ca.pem
+purecrypto x509 -new --ca -key ca.pem -subj "/CN=Local CA" -out ca.crt
+purecrypto genpkey -algorithm ED25519 -out server.pem
+purecrypto req -key server.pem -subj "/CN=127.0.0.1" \
+               -addext "subjectAltName=DNS:127.0.0.1" -out server.csr
+purecrypto x509 -req -in server.csr -CA ca.crt -CAkey ca.pem -out server.crt
+purecrypto genpkey -algorithm ED25519 -out client.pem
+purecrypto req -key client.pem -subj "/CN=alice" -out client.csr
+purecrypto x509 -req -in client.csr -CA ca.crt -CAkey ca.pem -out client.crt
+
+# In one terminal — server requires + verifies client certs against ca.crt:
+purecrypto s_server -cert server.crt -key server.pem -accept 8443 -Verify ca.crt -www
+
+# In another terminal — client presents its cert + key:
+purecrypto s_client -connect 127.0.0.1:8443 -CAfile ca.crt \
+                    -cert client.crt -key client.pem -alpn http/1.1 \
+                    -keylogfile keys.log
 ```
 
 ## Library usage
@@ -251,6 +306,71 @@ let (ct, ss_a) = ek.encapsulate(&mut OsRng);
 let ss_b = dk.decapsulate(&ct);
 assert_eq!(ss_a, ss_b);
 ```
+
+### TLS 1.3
+
+The `tls` module is a sans-I/O TLS 1.3 implementation with a thin
+`std::io::Read + Write` adapter for blocking TCP. The full feature surface,
+configured per side:
+
+```text
+ClientConfig::new(roots)
+    .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    .with_record_size_limit(4096)        // RFC 8449
+    .with_session(stored)                // PSK resumption (+ 0-RTT if allowed)
+    .with_client_cert(client_cert_cfg)   // mTLS (Ed25519 / ECDSA)
+
+ServerConfig::with_rsa(chain, key) | with_ecdsa(...) | with_ed25519(...)
+    .with_alpn(...)
+    .with_record_size_limit(...)
+    .with_ticket_key([u8; 32])           // enables NewSessionTicket emission
+    .with_ticket_lifetime(secs)
+    .with_max_early_data(N)              // accept up to N bytes of 0-RTT
+    .with_replay_window(window)          // 0-RTT anti-replay (shared across configs)
+    .with_client_auth(roots, required)   // mTLS
+```
+
+After a handshake completes, both sides expose:
+
+- `connection.alpn_protocol()` — the negotiated ALPN name, if any.
+- `connection.tls_exporter(label, context, out)` — RFC 8446 §7.5 / RFC 5705
+  application-layer keying material.
+- `connection.peer_certificates()` — the validated chain (leaf first).
+- (client) `connection.take_session()` — moves out a `StoredSession`
+  derived from the server's NewSessionTicket; pass it to
+  `ClientConfig::with_session` next time you connect to the same server.
+- (client) `connection.write_early_data(&[u8])` — sends application data
+  under the early-traffic key before `ServerHello` arrives, valid only on a
+  resumed connection whose session enabled 0-RTT.
+
+**0-RTT replay caveat.** RFC 8446 §8: 0-RTT data is replayable by an active
+attacker, since the server cannot bind the early bytes to a unique
+client-server handshake instance. The provided `ReplayWindow` blocks repeated
+binders within a process, but cross-process / cross-server replay defenses
+are application-level. Mark any data sent via `write_early_data` as
+idempotent (a HEAD/GET, an idempotent RPC, …) and never as a state-changing
+write.
+
+```rust,no_run
+use purecrypto::rng::OsRng;
+use purecrypto::tls::{ClientConfig, ClientConnection, RootCertStore, Stream};
+
+let roots = RootCertStore::new();        // populate from a PEM bundle …
+let mut conn = ClientConnection::new(
+    ClientConfig::new(roots).with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    "example.com",
+    &mut OsRng,
+);
+let mut sock = std::net::TcpStream::connect("example.com:443").unwrap();
+let mut tls = Stream::new(&mut conn, &mut sock);
+tls.complete_handshake().unwrap();
+println!("ALPN: {:?}", conn.alpn_protocol());
+```
+
+The keylogfile output from `purecrypto s_client -keylogfile <path>` follows
+the standard NSS SSLKEYLOGFILE format and decrypts captured traffic in
+Wireshark by setting `Edit → Preferences → Protocols → TLS → (Pre)-Master-Secret
+log filename`.
 
 ## C library
 
