@@ -1,8 +1,10 @@
 //! `purecrypto req` — create or inspect a PKCS#10 certificate request.
 
 use crate::pki::{describe_key, format_dn, load_key, parse_sans, parse_subject};
+use crate::template::CertTemplate;
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::CertificationRequest;
+use purecrypto::x509::extension::{Extension, GeneralName};
 
 fn sans_from_args(args: &Args) -> Vec<String> {
     if let Some(ext) = args.value("-addext").or_else(|| args.value("--addext")) {
@@ -50,7 +52,7 @@ pub(crate) fn run(args: Args) {
     let key_path = args
         .value("-key")
         .or_else(|| args.value("--key"))
-        .unwrap_or_else(|| die("usage: purecrypto req -key <key.pem> -subj \"/CN=...\" [-addext subjectAltName=DNS:...] [-out csr.pem]"));
+        .unwrap_or_else(|| die("usage: purecrypto req -key <key.pem> -subj \"/CN=...\" [-addext subjectAltName=DNS:...] [-template tls-server] [-template-file path.toml] [-out csr.pem]"));
     let subj = args
         .value("-subj")
         .or_else(|| args.value("--subj"))
@@ -59,9 +61,26 @@ pub(crate) fn run(args: Args) {
     let key = load_key(key_path);
     let subject = parse_subject(subj);
     let sans = sans_from_args(&args);
-    let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
 
-    let csr = CertificationRequest::create(&key.signer(), &subject, &san_refs)
-        .unwrap_or_else(|e| die(format!("cannot create CSR: {e}")));
+    let template = CertTemplate::resolve(args.value("-template"), args.value("-template-file"))
+        .unwrap_or_else(|e| die(format!("template error: {e}")));
+
+    let csr = if let Some(tmpl) = template {
+        // The template owns the extension policy; argv SANs are merged in.
+        let csr_sans: Vec<GeneralName> = sans
+            .iter()
+            .map(|s| GeneralName::Dns(s.clone()))
+            .collect();
+        // For a CSR there's no issuer SKI / subject SPKI binding needed yet:
+        // the template's extensions() builder will skip SKI/AKI when those
+        // inputs are empty.
+        let exts: Vec<Extension> = tmpl.extensions(Some(&csr_sans), &[], &[]);
+        CertificationRequest::create_with_extensions(&key.signer(), &subject, &exts)
+            .unwrap_or_else(|e| die(format!("cannot create CSR: {e}")))
+    } else {
+        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
+        CertificationRequest::create(&key.signer(), &subject, &san_refs)
+            .unwrap_or_else(|e| die(format!("cannot create CSR: {e}")))
+    };
     write_output(args.value("-out"), csr.to_pem().as_bytes());
 }

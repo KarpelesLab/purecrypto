@@ -915,3 +915,301 @@ fn genpkey_slh_dsa_sha2_128f_roundtrip() {
     assert!(ok);
     assert!(pub_pem.contains("BEGIN PUBLIC KEY"));
 }
+
+// ---------------------------------------------------------------------------
+// Template + extension tests
+
+#[test]
+fn ca_template_tls_server() {
+    let dir = std::env::temp_dir().join(format!("pc_tmpl_srv_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // Root CA.
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Root CA"],
+            b"",
+        )
+        .1,
+        "ca init failed"
+    );
+    // Leaf key + pub.
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+
+    // Issue with -template tls-server.
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-template",
+                "tls-server",
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "host.example",
+                "-sans",
+                "host.example,*.host.example",
+                "-out",
+                &p("leaf.crt"),
+            ],
+            b""
+        )
+        .1,
+        "ca issue with template failed"
+    );
+
+    let (text, ok) = run(&["x509", "-in", &p("leaf.crt"), "-text", "-ext"], b"");
+    assert!(ok, "x509 -text -ext failed: {text}");
+    assert!(text.contains("CA: false"), "basicConstraints: {text}");
+    assert!(
+        text.contains("digitalSignature") && text.contains("keyEncipherment"),
+        "keyUsage: {text}"
+    );
+    assert!(text.contains("serverAuth"), "EKU: {text}");
+    assert!(
+        text.contains("DNS:host.example") && text.contains("DNS:*.host.example"),
+        "SAN: {text}"
+    );
+    assert!(text.contains("subjectKeyIdentifier"), "SKI: {text}");
+    assert!(text.contains("authorityKeyIdentifier"), "AKI: {text}");
+
+    // The leaf verifies against the (now-extended) root CA.
+    let root_pem = std::fs::read_to_string(dir.join("root.crt")).unwrap();
+    let leaf_pem = std::fs::read_to_string(dir.join("leaf.crt")).unwrap();
+    let root = purecrypto::x509::Certificate::from_pem(&root_pem).unwrap();
+    let leaf = purecrypto::x509::Certificate::from_pem(&leaf_pem).unwrap();
+    let root_key = root.subject_public_key().unwrap();
+    leaf.verify_signature_with(&root_key).unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ca_template_intermediate_chain() {
+    let dir = std::env::temp_dir().join(format!("pc_tmpl_chain_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // Root CA.
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Chain Root"],
+            b"",
+        )
+        .1
+    );
+
+    // Intermediate keypair + pubkey extracted via pkey -pubout.
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("int.key")],
+            b""
+        )
+        .1
+    );
+    let (int_pub, ok) = run(&["pkey", "-in", &p("int.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("int.pub"), int_pub).unwrap();
+
+    // Root issues the intermediate with -template ca-intermediate.
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-template",
+                "ca-intermediate",
+                "-pubkey",
+                &p("int.pub"),
+                "-cn",
+                "Chain Intermediate",
+                "-out",
+                &p("int.crt"),
+            ],
+            b""
+        )
+        .1,
+        "intermediate issue failed"
+    );
+
+    // The intermediate cert verifies under the root.
+    let root_pem = std::fs::read_to_string(dir.join("root.crt")).unwrap();
+    let int_pem = std::fs::read_to_string(dir.join("int.crt")).unwrap();
+    let root = purecrypto::x509::Certificate::from_pem(&root_pem).unwrap();
+    let int_cert = purecrypto::x509::Certificate::from_pem(&int_pem).unwrap();
+    int_cert
+        .verify_signature_with(&root.subject_public_key().unwrap())
+        .expect("intermediate must verify under root");
+    // basicConstraints.ca = true, pathLen = 0 on the intermediate.
+    let bc = int_cert.basic_constraints().unwrap().unwrap();
+    assert_eq!(bc, (true, Some(0)), "ca-intermediate path_len");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn req_template_csr() {
+    let dir = std::env::temp_dir().join(format!("pc_tmpl_req_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=tmpl.example",
+                "-template",
+                "tls-server",
+                "-san",
+                "tmpl.example,alt.example",
+                "-out",
+                &p("leaf.csr"),
+            ],
+            b"",
+        )
+        .1,
+        "req -template failed"
+    );
+    let (vout, ok) = run(&["req", "-in", &p("leaf.csr"), "-verify"], b"");
+    assert!(ok && vout.contains("verify OK"));
+
+    // Parse the CSR via the library to inspect its extensionRequest.
+    let csr_pem = std::fs::read_to_string(dir.join("leaf.csr")).unwrap();
+    let csr = purecrypto::x509::CertificationRequest::from_pem(&csr_pem).unwrap();
+    let exts = csr.extension_requests().unwrap();
+    assert!(
+        exts.iter().any(|e| e.oid == purecrypto::x509::oid::EXT_KEY_USAGE),
+        "CSR should request EKU"
+    );
+    assert!(
+        exts.iter().any(|e| e.oid == purecrypto::x509::oid::KEY_USAGE),
+        "CSR should request keyUsage"
+    );
+    let sans = csr.subject_alt_names().unwrap();
+    assert!(sans.contains(&"tmpl.example".to_string()));
+    assert!(sans.contains(&"alt.example".to_string()));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn template_user_file_overrides_critical() {
+    let dir = std::env::temp_dir().join(format!("pc_tmpl_user_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "UF Root"],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "EC", "-curve", "P-256", "-out", &p("leaf.key")],
+            b""
+        )
+        .1
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+
+    // Custom template: key_usage non-critical, just digitalSignature.
+    let tmpl = r#"name = "custom"
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = false
+digital_signature = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true
+"#;
+    let tmpl_path = dir.join("custom.toml");
+    std::fs::write(&tmpl_path, tmpl).unwrap();
+
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-template-file",
+                tmpl_path.to_str().unwrap(),
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "user.example",
+                "-out",
+                &p("leaf.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "user-file override failed"
+    );
+
+    let leaf_pem = std::fs::read_to_string(dir.join("leaf.crt")).unwrap();
+    let leaf = purecrypto::x509::Certificate::from_pem(&leaf_pem).unwrap();
+    // keyUsage extension exists but is NOT marked critical.
+    let exts = leaf.extensions().unwrap();
+    let ku = exts
+        .iter()
+        .find(|e| e.oid == purecrypto::x509::oid::KEY_USAGE)
+        .expect("keyUsage emitted");
+    assert!(!ku.critical, "user override should flip critical bit");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn ca_list_templates_lists_builtins() {
+    let (out, ok) = run(&["ca", "list-templates"], b"");
+    assert!(ok, "ca list-templates failed");
+    for name in [
+        "tls-server",
+        "tls-client",
+        "mtls-client",
+        "ca-root",
+        "ca-intermediate",
+        "code-signing",
+        "email-protection",
+        "time-stamping",
+    ] {
+        assert!(out.contains(name), "missing {name} in {out}");
+    }
+}
