@@ -832,6 +832,117 @@ mod loopback_tests {
         assert!(server.peer_certificates().is_empty());
     }
 
+    /// Server presents an ML-DSA-65 leaf and signs its `CertificateVerify`
+    /// with the same key. Client validates the chain (under the default
+    /// `modern()` policy, which permits ML-DSA) and reaches `Connected`.
+    #[test]
+    fn tls_mldsa_server_cert() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls-mldsa-server-key", b"nonce", &[]);
+        let (sk, _pk) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa65(&sk),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+        let server_config = ServerConfig::with_mldsa65(alloc::vec![cert_der.clone()], sk);
+
+        run_with(
+            (server_config, cert_der),
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    /// mTLS with an ML-DSA-65 client cert: server requires client auth, the
+    /// client presents a self-signed ML-DSA-65 leaf, both sides reach
+    /// `Connected`.
+    #[test]
+    fn tls_mtls_mldsa_client_cert() {
+        use crate::tls::{ClientCertConfig, RootCertStore};
+
+        let (server_config, server_cert_der) = rsa_server();
+
+        // Build the client's ML-DSA-65 key and self-signed cert.
+        let mut crng_seed = HmacDrbg::<Sha256>::new(b"tls-mtls-mldsa-client-key", b"nonce", &[]);
+        let (client_sk, _client_pk) = crate::mldsa::MlDsa65PrivateKey::generate(&mut crng_seed);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa65(&client_sk),
+            &DistinguishedName::common_name("mtls-mldsa-client"),
+            &validity,
+            1,
+            false,
+            &["mtls-mldsa-client"],
+        )
+        .unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+
+        // Server trusts the client's self-signed root (leaf == anchor).
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+
+        // Client trusts the server's cert.
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_mldsa65(alloc::vec![client_cert_der], client_sk);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls-mtls-mldsa-client-rng", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls-mtls-mldsa-server-rng", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(server.peer_certificates().len(), 1);
+
+        // App data both ways to confirm the application secrets work.
+        client.send_application_data(b"mldsa-ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"mldsa-ping");
+
+        server.send_application_data(b"mldsa-pong").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"mldsa-pong");
+    }
+
     /// 0-RTT round-trip: phase 1 establishes a ticket with
     /// `max_early_data_size > 0`; phase 2 writes early data which the server
     /// reads under the early traffic key, before the handshake completes.

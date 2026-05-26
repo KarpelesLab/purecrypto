@@ -50,6 +50,12 @@ pub(crate) fn signature_algorithms() -> RawExtension {
         SignatureScheme::RSA_PSS_RSAE_SHA384,
         SignatureScheme::RSA_PKCS1_SHA256,
         SignatureScheme::RSA_PKCS1_SHA384,
+        // ML-DSA (draft-ietf-tls-mldsa). The TLS 1.3 wire format carries
+        // the raw FIPS 204 signature in the CertificateVerify body, no
+        // DER wrapping.
+        SignatureScheme::MLDSA44,
+        SignatureScheme::MLDSA65,
+        SignatureScheme::MLDSA87,
     ];
     let mut body = Vec::new();
     with_len_u16(&mut body, |b| {

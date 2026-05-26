@@ -23,7 +23,8 @@ fn parse_mldsa_spki<'a>(spki: &'a [u8], expected_oid: &[u64]) -> Result<&'a [u8]
 }
 
 /// `ml-dsa-44` (FIPS 204, security level 2).
-/// X.509 OID `2.16.840.1.101.3.4.3.17`; TLS scheme allocated by commit 5.
+/// X.509 OID `2.16.840.1.101.3.4.3.17`; TLS scheme `0x0904`
+/// (draft-ietf-tls-mldsa).
 pub(crate) struct MlDsa44;
 
 impl SignatureAlgorithm for MlDsa44 {
@@ -34,7 +35,7 @@ impl SignatureAlgorithm for MlDsa44 {
         &[oid::ID_ML_DSA_44]
     }
     fn tls_schemes(&self) -> &'static [u16] {
-        &[]
+        &[0x0904]
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         let key_bits = parse_mldsa_spki(spki, oid::ID_ML_DSA_44)?;
@@ -48,7 +49,7 @@ impl SignatureAlgorithm for MlDsa44 {
 }
 
 /// `ml-dsa-65` (FIPS 204, security level 3).
-/// X.509 OID `2.16.840.1.101.3.4.3.18`.
+/// X.509 OID `2.16.840.1.101.3.4.3.18`; TLS scheme `0x0905`.
 pub(crate) struct MlDsa65;
 
 impl SignatureAlgorithm for MlDsa65 {
@@ -59,7 +60,7 @@ impl SignatureAlgorithm for MlDsa65 {
         &[oid::ID_ML_DSA_65]
     }
     fn tls_schemes(&self) -> &'static [u16] {
-        &[]
+        &[0x0905]
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         let key_bits = parse_mldsa_spki(spki, oid::ID_ML_DSA_65)?;
@@ -73,7 +74,7 @@ impl SignatureAlgorithm for MlDsa65 {
 }
 
 /// `ml-dsa-87` (FIPS 204, security level 5).
-/// X.509 OID `2.16.840.1.101.3.4.3.19`.
+/// X.509 OID `2.16.840.1.101.3.4.3.19`; TLS scheme `0x0906`.
 pub(crate) struct MlDsa87;
 
 impl SignatureAlgorithm for MlDsa87 {
@@ -84,7 +85,7 @@ impl SignatureAlgorithm for MlDsa87 {
         &[oid::ID_ML_DSA_87]
     }
     fn tls_schemes(&self) -> &'static [u16] {
-        &[]
+        &[0x0906]
     }
     fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
         let key_bits = parse_mldsa_spki(spki, oid::ID_ML_DSA_87)?;
@@ -111,8 +112,8 @@ mod tests {
         assert_eq!(algo.id(), "ml-dsa-65");
         let by_oid = find_by_oid(oid::ID_ML_DSA_65).expect("by OID");
         assert_eq!(by_oid.id(), "ml-dsa-65");
-        // No TLS scheme yet (commit 5 adds them).
-        assert!(algo.tls_schemes().is_empty());
+        // TLS scheme 0x0905 (draft-ietf-tls-mldsa).
+        assert_eq!(algo.tls_schemes(), &[0x0905u16]);
     }
 
     #[test]
