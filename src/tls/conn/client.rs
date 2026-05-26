@@ -14,12 +14,12 @@ use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, NamedGroup, NewSessionTicket as NstWire, Random, ReadCursor,
-    ServerHello, SignatureScheme, hs_type, read_handshake,
+    CipherSuite, ClientHello, KeyUpdate, NamedGroup, NewSessionTicket as NstWire, Random,
+    ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake,
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, lookup_suite, verify_signature,
+    finished_verify_data, lookup_suite, next_traffic_secret, verify_signature,
 };
 use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
 use crate::tls::{AlertDescription, Error};
@@ -98,6 +98,13 @@ pub struct ClientConnection {
     ks: Option<KeySchedule>,
     client_hs_secret: Option<Secret>,
     server_hs_secret: Option<Secret>,
+
+    /// Current write-side (`client_application_traffic_secret_N`) — stepped by
+    /// each outgoing `KeyUpdate`.
+    client_app_secret: Option<Secret>,
+    /// Current read-side (`server_application_traffic_secret_N`) — stepped by
+    /// each incoming `KeyUpdate`.
+    server_app_secret: Option<Secret>,
 
     cert_chain: Vec<Vec<u8>>,
     leaf_key: Option<AnyPublicKey>,
@@ -242,6 +249,8 @@ impl ClientConnection {
             ks: None,
             client_hs_secret: None,
             server_hs_secret: None,
+            client_app_secret: None,
+            server_app_secret: None,
             cert_chain: Vec::new(),
             leaf_key: None,
             last_ticket: None,
@@ -389,8 +398,8 @@ impl ClientConnection {
     ///
     /// * `NewSessionTicket` (type 4) is parsed and the most recent one is
     ///   stashed in [`Self::last_ticket`] for later inspection / resumption.
-    /// * `KeyUpdate` (type 24) is currently accepted but not acted on — full
-    ///   rekey support lands in a later commit.
+    /// * `KeyUpdate` (type 24) rolls the read key forward and, if requested,
+    ///   the write key plus an outgoing reply (`update_not_requested`).
     /// * Anything else fails with `unexpected_message`.
     fn on_post_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
         match msg_type {
@@ -399,9 +408,80 @@ impl ClientConnection {
                 self.last_ticket = Some(ReceivedSessionTicket::from_wire(nst)?);
                 Ok(())
             }
-            hs_type::KEY_UPDATE => Ok(()),
+            hs_type::KEY_UPDATE => self.handle_key_update(body),
             _ => Err(Error::UnexpectedMessage),
         }
+    }
+
+    /// Processes an incoming `KeyUpdate`. Re-keys the read side from the
+    /// previous `server_application_traffic_secret_N`. If the peer asked us
+    /// to update too (`update_requested == 1`), emit our own `KeyUpdate`
+    /// (`update_not_requested`) and step the write side as well.
+    fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
+        let ku = KeyUpdate::decode(body)?;
+        let suite = self.suite.ok_or(Error::IllegalParameter)?;
+
+        // Read side: derive next server_app_secret and re-key.
+        let prev = self
+            .server_app_secret
+            .as_ref()
+            .ok_or(Error::IllegalParameter)?;
+        let next = next_traffic_secret(suite.hash, prev);
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &next,
+        ));
+        self.server_app_secret = Some(next);
+
+        if ku.request_update {
+            // Send our own KeyUpdate (not_requested) and step the write side.
+            // RFC 8446 §4.6.3: only one round of request is permitted, so we
+            // reply with `update_not_requested` to avoid an infinite loop.
+            self.send_key_update(false)?;
+        }
+        Ok(())
+    }
+
+    /// Emits a `KeyUpdate` and steps the write side. If `request_peer_update`
+    /// is set, the peer will respond with its own `KeyUpdate(not_requested)`.
+    fn send_key_update(&mut self, request_peer_update: bool) -> Result<(), Error> {
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let ku = KeyUpdate {
+            request_update: request_peer_update,
+        };
+        // Emit the message under the *current* write key (RFC 8446 §4.6.3:
+        // "after sending a KeyUpdate, the sender SHALL send all its traffic
+        // using the next generation of keys").
+        self.core.emit_handshake(ku.encode());
+
+        let prev = self
+            .client_app_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let next = next_traffic_secret(suite.hash, prev);
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &next,
+        ));
+        self.client_app_secret = Some(next);
+        Ok(())
+    }
+
+    /// Requests a key update from the peer. The write side rolls forward
+    /// immediately; the read side rolls forward when the peer replies with
+    /// its own `KeyUpdate(not_requested)`.
+    ///
+    /// Returns `Err(InappropriateState)` if called before the handshake
+    /// completes.
+    pub fn request_key_update(&mut self) -> Result<(), Error> {
+        if self.state != State::Connected {
+            return Err(Error::InappropriateState);
+        }
+        self.send_key_update(true)
     }
 
     fn on_server_hello(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
@@ -610,6 +690,9 @@ impl ClientConnection {
             suite.key_len,
             &sats,
         ));
+        // Retain both directions' app secrets so we can step them on KeyUpdate.
+        self.client_app_secret = Some(cats);
+        self.server_app_secret = Some(sats);
         self.state = State::Connected;
         Ok(())
     }
@@ -623,7 +706,9 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::BadRecordMac => AlertDescription::BadRecordMac,
         Error::BadCertificate => AlertDescription::BadCertificate,
         Error::UnsupportedVersion => AlertDescription::ProtocolVersion,
-        Error::PeerMisbehaved | Error::InappropriateState => AlertDescription::IllegalParameter,
+        Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
+            AlertDescription::IllegalParameter
+        }
         _ => AlertDescription::HandshakeFailure,
     }
 }

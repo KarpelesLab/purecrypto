@@ -286,6 +286,114 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after ticket");
     }
 
+    /// `request_key_update` on the client side rolls the client's write keys
+    /// forward, the server replies with its own `KeyUpdate(not_requested)`,
+    /// and application data continues to flow under the new keys in both
+    /// directions.
+    #[test]
+    fn key_update_client_initiated_round_trip() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ku-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ku-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+
+        // App data under the original keys.
+        client.send_application_data(b"before").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"before");
+
+        // Client requests a key update; flush.
+        client.request_key_update().unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        // Server now responds with its own KeyUpdate(not_requested).
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+
+        // App data under the *new* keys, both directions.
+        client.send_application_data(b"after-client").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"after-client");
+
+        server.send_application_data(b"after-server").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"after-server");
+    }
+
+    /// A `KeyUpdate` body byte that is neither 0 nor 1 is rejected with
+    /// `illegal_parameter` (RFC 8446 §4.6.3).
+    #[test]
+    fn rejects_illegal_key_update_byte() {
+        use crate::tls::codec::hs_type;
+
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ku-bad-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ku-bad-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+
+        // Hand-craft a KeyUpdate with body byte 0x02 (illegal).
+        // Wire: type ‖ u24 length ‖ body.
+        let msg = alloc::vec![hs_type::KEY_UPDATE, 0, 0, 1, 0x02];
+        server.emit_post_handshake(msg);
+        let s = server.write_tls();
+        client.read_tls(&s);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
     /// A malformed `NewSessionTicket` (empty ticket field) is rejected with a
     /// decode error; the client closes the connection rather than papering over
     /// it.

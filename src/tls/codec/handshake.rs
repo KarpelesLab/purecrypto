@@ -155,6 +155,37 @@ impl ServerHello {
     }
 }
 
+/// A `KeyUpdate` handshake message (RFC 8446 §4.6.3). The single body byte is
+/// `0` (update_not_requested) or `1` (update_requested); any other value MUST
+/// be rejected with `illegal_parameter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyUpdate {
+    /// If `true`, the peer wants us to send our own `KeyUpdate` in reply.
+    pub(crate) request_update: bool,
+}
+
+impl KeyUpdate {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::KEY_UPDATE);
+        with_len_u24(&mut out, |b| {
+            put_u8(b, if self.request_update { 1 } else { 0 })
+        });
+        out
+    }
+
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+        let mut c = ReadCursor::new(body);
+        let request_update = match c.u8()? {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::IllegalParameter),
+        };
+        c.expect_empty()?;
+        Ok(KeyUpdate { request_update })
+    }
+}
+
 /// A `NewSessionTicket` handshake message (RFC 8446 §4.6.1).
 ///
 /// Servers may issue one or more of these any time after the handshake to

@@ -17,12 +17,12 @@ use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, read_handshake, with_len_u16, with_len_u24,
+    ClientHello, ExtensionType, KeyUpdate, NamedGroup, Random, ReadCursor, ServerHello,
+    SignatureScheme, hs_type, read_handshake, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, supported_suites,
+    finished_verify_data, next_traffic_secret, supported_suites,
 };
 use crate::tls::{AlertDescription, Error};
 use alloc::vec::Vec;
@@ -106,6 +106,9 @@ pub struct ServerConnection<R: RngCore> {
     suite: Option<SuiteParams>,
     client_hs_secret: Option<Secret>,
     client_app_secret: Option<Secret>,
+    /// Current write-side (`server_application_traffic_secret_N`); stepped
+    /// by each outgoing `KeyUpdate`.
+    server_app_secret: Option<Secret>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 }
@@ -122,6 +125,7 @@ impl<R: RngCore> ServerConnection<R> {
             suite: None,
             client_hs_secret: None,
             client_app_secret: None,
+            server_app_secret: None,
             #[cfg(test)]
             server_hs_secret: None,
         }
@@ -216,8 +220,75 @@ impl<R: RngCore> ServerConnection<R> {
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
             State::WaitClientFinished => self.on_client_finished(msg_type, body, &msg),
+            State::Connected => self.on_post_handshake(msg_type, body),
             _ => Err(Error::UnexpectedMessage),
         }
+    }
+
+    /// Handles post-handshake messages (RFC 8446 §4.6) on the server side.
+    /// Currently only `KeyUpdate` is expected from the client; future commits
+    /// may handle post-handshake `Certificate` / `CertificateVerify` for mTLS.
+    fn on_post_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
+        match msg_type {
+            hs_type::KEY_UPDATE => self.handle_key_update(body),
+            _ => Err(Error::UnexpectedMessage),
+        }
+    }
+
+    /// Symmetric counterpart of the client's `handle_key_update` — derives
+    /// the next `client_application_traffic_secret`, re-keys the read side,
+    /// and replies with our own `KeyUpdate(not_requested)` if the peer
+    /// requested it.
+    fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
+        let ku = KeyUpdate::decode(body)?;
+        let suite = self.suite.ok_or(Error::IllegalParameter)?;
+        let prev = self
+            .client_app_secret
+            .as_ref()
+            .ok_or(Error::IllegalParameter)?;
+        let next = next_traffic_secret(suite.hash, prev);
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &next,
+        ));
+        self.client_app_secret = Some(next);
+        if ku.request_update {
+            self.send_key_update(false)?;
+        }
+        Ok(())
+    }
+
+    /// Emits a `KeyUpdate` and rolls the write side forward.
+    fn send_key_update(&mut self, request_peer_update: bool) -> Result<(), Error> {
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let ku = KeyUpdate {
+            request_update: request_peer_update,
+        };
+        self.core.emit_handshake(ku.encode());
+        let prev = self
+            .server_app_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let next = next_traffic_secret(suite.hash, prev);
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &next,
+        ));
+        self.server_app_secret = Some(next);
+        Ok(())
+    }
+
+    /// Requests a key update from the peer; symmetric to
+    /// [`ClientConnection::request_key_update`](super::ClientConnection::request_key_update).
+    pub fn request_key_update(&mut self) -> Result<(), Error> {
+        if !matches!(self.state, State::Connected) {
+            return Err(Error::InappropriateState);
+        }
+        self.send_key_update(true)
     }
 
     fn on_client_hello(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
@@ -330,6 +401,7 @@ impl<R: RngCore> ServerConnection<R> {
         self.suite = Some(suite);
         self.client_hs_secret = Some(chts);
         self.client_app_secret = Some(cats);
+        self.server_app_secret = Some(sats);
         #[cfg(test)]
         {
             self.server_hs_secret = Some(shts);
@@ -488,7 +560,9 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
         Error::BadRecordMac => AlertDescription::BadRecordMac,
         Error::UnsupportedVersion => AlertDescription::ProtocolVersion,
-        Error::PeerMisbehaved | Error::InappropriateState => AlertDescription::IllegalParameter,
+        Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
+            AlertDescription::IllegalParameter
+        }
         _ => AlertDescription::HandshakeFailure,
     }
 }

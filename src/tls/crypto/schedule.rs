@@ -240,6 +240,16 @@ impl KeySchedule {
     }
 }
 
+/// Derives `application_traffic_secret_{N+1}` from the previous-generation
+/// traffic secret (RFC 8446 §7.2): `HKDF-Expand-Label(prev, "traffic upd",
+/// "", Hash.length)`. Used by `KeyUpdate` re-keying.
+pub(crate) fn next_traffic_secret(alg: HashAlg, prev: &Secret) -> Secret {
+    let mut next = [0u8; MAX_SECRET];
+    let n = alg.output_len();
+    expand_label_dyn(alg, prev.as_slice(), b"traffic upd", &[], &mut next[..n]);
+    Secret::new(&next[..n])
+}
+
 /// Derives the AEAD write key and IV from a traffic secret (RFC 8446 §7.3).
 pub(crate) fn traffic_key_iv(alg: HashAlg, secret: &Secret, key_len: usize) -> (Vec<u8>, [u8; 12]) {
     let mut key = alloc::vec![0u8; key_len];

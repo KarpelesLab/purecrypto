@@ -121,6 +121,10 @@ pub enum Error {
     AlertReceived(AlertDescription),
     /// Misuse of the API (e.g. writing before the handshake completes).
     InappropriateState,
+    /// The peer supplied a syntactically valid value that is forbidden by the
+    /// spec (e.g. an unknown `KeyUpdate` request byte). Maps to
+    /// `illegal_parameter`.
+    IllegalParameter,
 }
 
 impl core::fmt::Display for Error {
@@ -135,6 +139,7 @@ impl core::fmt::Display for Error {
             Error::PeerMisbehaved => f.write_str("peer misbehaved (bad signature)"),
             Error::AlertReceived(a) => write!(f, "received fatal alert: {a:?}"),
             Error::InappropriateState => f.write_str("operation not valid in this state"),
+            Error::IllegalParameter => f.write_str("TLS illegal parameter"),
         }
     }
 }
