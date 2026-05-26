@@ -2888,3 +2888,221 @@ mod tls12_loopback_tests {
         assert!(!client.is_handshaking() && !server.is_handshaking());
     }
 }
+
+#[cfg(test)]
+mod keylog_loopback_tests {
+    //! Loopback tests for the SSLKEYLOGFILE plumbing on TLS 1.2 and TLS 1.3.
+
+    use super::{
+        ClientConfig, ClientConfig12, ClientConnection, ClientConnection12, ServerConfig,
+        ServerConfig12, ServerConnection, ServerConnection12,
+    };
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::rsa::BoxedRsaPrivateKey;
+    use crate::test_util::rsa_test_key_a;
+    use crate::tls::RootCertStore;
+    use crate::tls::codec::{CipherSuite, NamedGroup};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    use alloc::vec::Vec;
+
+    fn rsa_server() -> (ServerConfig, Vec<u8>) {
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
+    }
+
+    /// SSLKEYLOGFILE plumbing for TLS 1.3: a client + server pair share a
+    /// `Vec<u8>`-backed [`crate::tls::WriterKeyLog`] and the buffer ends up
+    /// containing every standard label twice (once from each peer), with
+    /// matching secret bytes on each pair of lines.
+    #[test]
+    fn keylog_tls13_loopback_agrees() {
+        use crate::tls::WriterKeyLog;
+        use alloc::collections::BTreeMap;
+        use alloc::string::ToString;
+        use alloc::sync::Arc;
+
+        let (mut server_config, cert_der) = rsa_server();
+        let buf: Vec<u8> = Vec::new();
+        let sink = Arc::new(WriterKeyLog::new(buf));
+        // Inject the same sink on both sides.
+        server_config.key_log = Some(sink.clone());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"kl-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"kl-server", b"nonce", &[]);
+        let mut client_config = ClientConfig::new(roots);
+        client_config.key_log = Some(sink.clone());
+        let mut client = ClientConnection::new_with_offer(
+            client_config,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Drain the shared buffer. We have to dance with `Arc::try_unwrap`:
+        // both endpoints hold a clone, so two refs remain even after we
+        // drop the connections. Drop them first.
+        drop(client);
+        drop(server);
+        let log_text: alloc::string::String = {
+            // One Arc<WriterKeyLog<Vec<u8>>> remains here (the test owns
+            // it), so we can lock and read.
+            let buf = sink.writer_lock_for_test();
+            core::str::from_utf8(&buf).unwrap().to_string()
+        };
+
+        // We expect each label to appear exactly twice, and the (label,
+        // secret) pair to agree between the two appearances.
+        let want_labels = [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ];
+        let mut per_label: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for line in log_text.lines() {
+            let parts: Vec<&str> = line.split_ascii_whitespace().collect();
+            assert_eq!(parts.len(), 3, "malformed keylog line: {line}");
+            // <label> <cr_hex> <secret_hex>
+            assert_eq!(parts[1].len(), 64, "client_random hex len wrong: {line}");
+            per_label.entry(parts[0]).or_default().push(parts[2]);
+        }
+        for label in want_labels {
+            let entries = per_label
+                .get(label)
+                .unwrap_or_else(|| panic!("missing label {label} in keylog:\n{log_text}"));
+            assert_eq!(
+                entries.len(),
+                2,
+                "expected {label} to appear twice, got {}",
+                entries.len()
+            );
+            assert_eq!(
+                entries[0], entries[1],
+                "client/server disagree on {label}: {} vs {}",
+                entries[0], entries[1]
+            );
+        }
+    }
+
+    /// SSLKEYLOGFILE plumbing for TLS 1.2: client + server pair share a
+    /// sink; the buffer contains exactly two `CLIENT_RANDOM <cr> <master>`
+    /// lines (one per peer) whose master secrets match.
+    #[test]
+    fn keylog_tls12_loopback_agrees() {
+        use crate::tls::WriterKeyLog;
+        use alloc::sync::Arc;
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"kl12-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"kl12-server", b"nonce", &[]);
+
+        // Generate an ECDSA P-256 server cert.
+        let mut keyrng = HmacDrbg::<Sha256>::new(b"kl12-key", b"nonce", &[]);
+        let key = crate::ec::BoxedEcdsaPrivateKey::generate(crate::ec::CurveId::P256, &mut keyrng);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("kl12.example"),
+            &validity,
+            1,
+            false,
+            &["kl12.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let buf: Vec<u8> = Vec::new();
+        let sink = Arc::new(WriterKeyLog::new(buf));
+
+        let mut server_config = ServerConfig12::with_ecdsa(alloc::vec![cert_der.clone()], key);
+        server_config.key_log = Some(sink.clone());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut client_config = ClientConfig12::new(roots);
+        client_config.key_log = Some(sink.clone());
+
+        let mut client = ClientConnection12::new(client_config, "kl12.example", &mut crng);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        drop(client);
+        drop(server);
+        let log_text: alloc::string::String = {
+            let buf = sink.writer_lock_for_test();
+            core::str::from_utf8(&buf).unwrap().into()
+        };
+
+        let lines: Vec<&str> = log_text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected 2 CLIENT_RANDOM lines, got {lines:?}"
+        );
+        for line in &lines {
+            let parts: Vec<&str> = line.split_ascii_whitespace().collect();
+            assert_eq!(parts.len(), 3, "malformed CLIENT_RANDOM line: {line}");
+            assert_eq!(parts[0], "CLIENT_RANDOM");
+            assert_eq!(parts[1].len(), 64);
+            assert_eq!(parts[2].len(), 96); // 48-byte master_secret
+        }
+        // Both peers must report the same master.
+        let secret0 = lines[0].split_ascii_whitespace().nth(2).unwrap();
+        let secret1 = lines[1].split_ascii_whitespace().nth(2).unwrap();
+        assert_eq!(
+            secret0, secret1,
+            "client/server disagree on TLS 1.2 master_secret"
+        );
+    }
+}

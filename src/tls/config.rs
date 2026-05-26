@@ -7,12 +7,14 @@
 //! [`Config::min_version`] / [`Config::max_version`].
 
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
 
+use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
 use super::version::ProtocolVersion;
 use crate::x509::Time;
@@ -132,6 +134,13 @@ pub struct Config {
     pub require_cookie: bool,
     /// Target MTU for emitted DTLS records (default ~1200).
     pub max_record_size: usize,
+
+    // ---- Observability ----
+    /// Optional sink receiving every traffic / master secret as it is
+    /// derived (NSS `SSLKEYLOGFILE` format). When `None`, secrets stay
+    /// internal to the engine. Used to feed Wireshark / NSS-format key
+    /// logs.
+    pub key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl Default for Config {
@@ -157,6 +166,7 @@ impl Default for Config {
             cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
+            key_log: None,
         }
     }
 }
@@ -340,6 +350,15 @@ impl ConfigBuilder {
     /// verification).
     pub fn verification_time(mut self, t: Time) -> Self {
         self.inner.verification_time = Some(t);
+        self
+    }
+
+    /// Registers a [`KeyLog`] sink that receives every traffic / master
+    /// secret as the engine derives it. The format is NSS
+    /// `SSLKEYLOGFILE`. Use [`super::WriterKeyLog`] for a ready-made
+    /// implementation over any `std::io::Write`.
+    pub fn key_log(mut self, sink: Arc<dyn KeyLog>) -> Self {
+        self.inner.key_log = Some(sink);
         self
     }
 

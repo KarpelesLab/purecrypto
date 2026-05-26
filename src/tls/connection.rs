@@ -346,6 +346,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
             cc = cc.with_client_cert(c);
         }
     }
+    cc.key_log = cfg.key_log.clone();
     let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
     Ok(super::conn::ClientConnection::new(
         cc,
@@ -376,6 +377,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
             cc = cc.with_client_cert(c);
         }
     }
+    cc.key_log = cfg.key_log.clone();
     let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
     Ok(super::conn::ClientConnection12::new(
         cc,
@@ -431,6 +433,7 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
         sc = sc.with_stapled_crl(crl);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
 }
 
@@ -457,6 +460,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
         sc = sc.with_ticket_key(tk);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection12::new(sc, OsRng))
 }
 
@@ -473,6 +477,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
         dc = dc.with_verification_time(t);
     }
     dc = dc.with_signature_policy(cfg.signature_policy.clone());
+    dc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
@@ -494,6 +499,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     }
     dc = dc.with_signature_policy(alloc::sync::Arc::new(cfg.signature_policy.clone()));
     dc.max_record_size = cfg.max_record_size;
+    dc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
@@ -516,6 +522,7 @@ fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
     if !cfg.require_cookie {
         sc = sc.require_cookie_exchange(false);
     }
+    sc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),
@@ -534,6 +541,7 @@ fn build_dtls13_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
     if !cfg.require_cookie {
         sc = sc.with_no_cookie();
     }
+    sc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),

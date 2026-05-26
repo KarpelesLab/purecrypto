@@ -33,10 +33,12 @@ use crate::tls::crypto::{
     certificate_verify_content, finished_verify_data, lookup_suite, next_traffic_secret,
     psk_from_resumption, tls_exporter, verify_signature,
 };
+use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{AlertDescription, Error};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
@@ -197,6 +199,10 @@ pub(crate) struct ClientConfig {
     /// opt in via [`ClientConfig::with_crls`]. Coverage is advisory — a
     /// missing CRL never causes a chain to be rejected.
     pub crls: CrlStore,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format). When `Some`,
+    /// the engine logs every derived traffic / master secret as it
+    /// progresses through the handshake.
+    pub key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ClientConfig {
@@ -213,6 +219,7 @@ impl ClientConfig {
             client_cert: None,
             signature_policy: SignaturePolicy::modern(),
             crls: CrlStore::new(),
+            key_log: None,
         }
     }
 
@@ -707,6 +714,13 @@ impl ClientConnection {
             let ks = KeySchedule::with_psk(psk_state.hash, &psk_state.psk);
             let th = conn.core.transcript.current_hash();
             let cets = ks.client_early_traffic_secret(th.as_slice());
+            if let Some(kl) = conn.config.key_log.as_ref() {
+                kl.log(
+                    "CLIENT_EARLY_TRAFFIC_SECRET",
+                    &conn.client_random,
+                    cets.as_slice(),
+                );
+            }
             conn.core.set_write(RecordCrypter::new(
                 suite.hash,
                 suite.aead,
@@ -1129,6 +1143,19 @@ impl ClientConnection {
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
 
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                &self.client_random,
+                chts.as_slice(),
+            );
+            kl.log(
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                &self.client_random,
+                shts.as_slice(),
+            );
+        }
+
         // Server -> client uses the server handshake key. If we offered
         // 0-RTT, keep the current write key (early-traffic) until we send
         // EndOfEarlyData; otherwise install the client-handshake write key
@@ -1504,6 +1531,19 @@ impl ClientConnection {
             let ems = ks.exporter_master_secret(th_app.as_slice());
             (cats, sats, ems)
         };
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log(
+                "CLIENT_TRAFFIC_SECRET_0",
+                &self.client_random,
+                cats.as_slice(),
+            );
+            kl.log(
+                "SERVER_TRAFFIC_SECRET_0",
+                &self.client_random,
+                sats.as_slice(),
+            );
+            kl.log("EXPORTER_SECRET", &self.client_random, ems.as_slice());
+        }
         self.exporter_secret = Some(ems);
 
         // 0-RTT acceptance: emit EndOfEarlyData under the early write key

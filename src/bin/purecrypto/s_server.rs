@@ -21,9 +21,10 @@ use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     ClientAuth, Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore,
-    SigningKey,
+    SigningKey, WriterKeyLog,
 };
 use purecrypto::x509::Certificate;
+use std::sync::Arc;
 
 /// Which protocol/transport combination the CLI should drive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -129,6 +130,22 @@ fn load_roots_file(path: &str) -> RootCertStore {
     store
 }
 
+/// Opens `path` as an NSS `SSLKEYLOGFILE` sink — append + Unix mode 0o600.
+fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let f = opts
+        .open(path)
+        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
+    Arc::new(WriterKeyLog::new(f))
+}
+
 /// Reads a server key from PEM as a unified [`SigningKey`].
 fn load_signing_key(key_path: &str) -> SigningKey {
     let key_pem = std::fs::read_to_string(key_path)
@@ -152,7 +169,7 @@ pub(crate) fn run(args: Args) {
         die(
             "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
              [-tls1_2 | -dtls1_2 | -dtls1_3] [-Verify ca.pem] [-alpn h2,http/1.1] [-www] \
-             [-mtu N] [-no_cookie]",
+             [-mtu N] [-no_cookie] [-keylogfile keys.log]",
         )
     });
     let key_path = args
@@ -168,6 +185,7 @@ pub(crate) fn run(args: Args) {
         .unwrap_or("1200")
         .parse()
         .unwrap_or_else(|_| die("-mtu expects a number"));
+    let keylog = args.value("-keylogfile").map(open_keylog);
 
     let chain = load_cert_chain(cert_path);
     let key = load_signing_key(key_path);
@@ -178,6 +196,9 @@ pub(crate) fn run(args: Args) {
         .max_record_size(mtu);
     if let Some(a) = alpn {
         builder = builder.alpn(a);
+    }
+    if let Some(sink) = keylog {
+        builder = builder.key_log(sink);
     }
     if let Some(p) = verify_ca {
         let roots = load_roots_file(p);

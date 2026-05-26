@@ -390,9 +390,10 @@ fn s_client_loopback() {
 }
 
 /// s_client and s_server round-trip over a local TCP port, exercising
-/// ALPN negotiation.
+/// ALPN negotiation and `-keylogfile` capture (NSS `SSLKEYLOGFILE`
+/// format).
 #[test]
-fn s_client_s_server_roundtrip_alpn() {
+fn s_client_s_server_roundtrip_alpn_keylog() {
     use purecrypto::ec::Ed25519PrivateKey;
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
@@ -406,6 +407,7 @@ fn s_client_s_server_roundtrip_alpn() {
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
     let key_path = dir.join("server.key");
+    let log_path = dir.join("keylog.txt");
 
     // Self-signed Ed25519 cert for 127.0.0.1.
     let key = Ed25519PrivateKey::generate(&mut OsRng);
@@ -448,6 +450,7 @@ fn s_client_s_server_roundtrip_alpn() {
     // Give the server time to bind.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
+    // s_client connects, negotiates ALPN, dumps secrets to keylogfile.
     let (out, ok) = run(
         &[
             "s_client",
@@ -456,6 +459,8 @@ fn s_client_s_server_roundtrip_alpn() {
             "-insecure",
             "-alpn",
             "http/1.1",
+            "-keylogfile",
+            log_path.to_str().unwrap(),
             "-quiet",
         ],
         b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
@@ -468,6 +473,18 @@ fn s_client_s_server_roundtrip_alpn() {
         out.contains("hello from purecrypto s_server"),
         "expected -www body in client stdout, got: {out:?}"
     );
+
+    // The keylogfile must contain the expected TLS 1.3 secret labels.
+    let log = std::fs::read_to_string(&log_path).expect("read keylog");
+    for label in [
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+        "EXPORTER_SECRET",
+    ] {
+        assert!(log.contains(label), "missing {label} in keylog:\n{log}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

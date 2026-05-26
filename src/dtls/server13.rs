@@ -37,6 +37,7 @@ use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, RecordCrypter, Transcript, certificate_verify_content,
     finished_verify_data,
 };
+use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -85,6 +86,8 @@ pub(crate) struct ServerConfig13Internal {
     /// client certificates yet).
     #[allow(dead_code)]
     pub signature_policy: Arc<SignaturePolicy>,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
+    pub key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ServerConfig13Internal {
@@ -98,6 +101,7 @@ impl ServerConfig13Internal {
             cookie_secret: None,
             require_cookie: true,
             signature_policy: Arc::new(SignaturePolicy::modern()),
+            key_log: None,
         }
     }
 
@@ -667,6 +671,18 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let th = self.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                &ch.random,
+                chts.as_slice(),
+            );
+            kl.log(
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                &ch.random,
+                shts.as_slice(),
+            );
+        }
         let w_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &shts);
         let r_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &chts);
         self.write_crypter = Some(w_crypter);
@@ -690,15 +706,21 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         // Derive application traffic secrets (Hash(CH..server Finished))
         // and stash them for installation at client Finished.
-        let (cats, sats) = {
+        let (cats, sats, ems) = {
             let ks = self.ks.as_mut().expect("ks");
             ks.enter_master();
             let th_app = self.transcript.current_hash();
-            (
-                ks.client_application_traffic_secret(th_app.as_slice()),
-                ks.server_application_traffic_secret(th_app.as_slice()),
-            )
+            let cats = ks.client_application_traffic_secret(th_app.as_slice());
+            let sats = ks.server_application_traffic_secret(th_app.as_slice());
+            let ems = ks.exporter_master_secret(th_app.as_slice());
+            (cats, sats, ems)
         };
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_TRAFFIC_SECRET_0", &ch.random, cats.as_slice());
+            kl.log("SERVER_TRAFFIC_SECRET_0", &ch.random, sats.as_slice());
+            kl.log("EXPORTER_SECRET", &ch.random, ems.as_slice());
+        }
+        let _ = ems;
         self.pending_write_app_crypter = Some(RecordCrypter::new(
             HashAlg::Sha256,
             AeadAlg::Aes128Gcm,

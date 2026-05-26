@@ -53,10 +53,12 @@ use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
+use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Configuration for a TLS 1.2 client connection.
@@ -111,6 +113,10 @@ pub(crate) struct ClientConfig12 {
     /// CRLs consulted during chain validation. Empty by default — opt in via
     /// [`ClientConfig12::with_crls`].
     pub crls: CrlStore,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format). When `Some`,
+    /// the engine logs the derived `master_secret` keyed by the
+    /// `client_random` (TLS 1.2 emits a single `CLIENT_RANDOM` line).
+    pub key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ClientConfig12 {
@@ -129,6 +135,7 @@ impl ClientConfig12 {
             send_fallback_scsv: false,
             accept_downgrade_sentinel: false,
             crls: CrlStore::new(),
+            key_log: None,
         }
     }
 
@@ -1016,6 +1023,10 @@ impl ClientConnection12 {
             self.master = Some(stored.master_secret);
             self.resumed = true;
 
+            if let Some(kl) = self.config.key_log.as_ref() {
+                kl.log("CLIENT_RANDOM", &cr, &stored.master_secret);
+            }
+
             let kb_len = 2 * suite.key_len + 8;
             let mut kb = alloc::vec![0u8; kb_len];
             key_block(suite.hash, &stored.master_secret, &sr, &cr, &mut kb);
@@ -1146,6 +1157,10 @@ impl ClientConnection12 {
         let cr = self.client_random;
         let sr = self.server_random.expect("server_random set");
         let master = master_secret(suite.hash, &premaster, &cr, &sr);
+
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_RANDOM", &cr, &master);
+        }
 
         // key_block layout (RFC 5246 §6.3 / RFC 5288 §3): client_key,
         // server_key, client_iv (4-byte salt), server_iv (4-byte salt).

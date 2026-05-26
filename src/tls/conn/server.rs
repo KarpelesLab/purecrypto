@@ -29,8 +29,12 @@ use crate::tls::crypto::{
     certificate_verify_content, finished_verify_data, next_traffic_secret, psk_from_resumption,
     supported_suites, tls_exporter,
 };
+use crate::tls::keylog::KeyLog;
 use crate::tls::{AlertDescription, Error};
 use alloc::vec::Vec;
+
+#[cfg(not(feature = "std"))]
+use alloc::sync::Arc;
 
 use crate::ct::ConstantTimeEq;
 
@@ -175,6 +179,8 @@ pub(crate) struct ServerConfig {
     /// revocation. TLS 1.2 has no per-cert extension list in `Certificate`,
     /// so stapling is silently dropped for TLS 1.2 servers.
     stapled_crl: Option<Vec<u8>>,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
+    pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ServerConfig {
@@ -195,6 +201,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -215,6 +222,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -235,6 +243,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -255,6 +264,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -275,6 +285,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -295,6 +306,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            key_log: None,
         }
     }
 
@@ -848,6 +860,9 @@ impl<R: RngCore> ServerConnection<R> {
             let early_ks = KeySchedule::with_psk(suite.hash, psk);
             let th_ch = self.core.transcript.current_hash();
             let cets = early_ks.client_early_traffic_secret(th_ch.as_slice());
+            if let Some(kl) = self.config.key_log.as_ref() {
+                kl.log("CLIENT_EARLY_TRAFFIC_SECRET", &ch.random, cets.as_slice());
+            }
             self.early_data_accepted = true;
             self.core.set_read(RecordCrypter::new(
                 suite.hash,
@@ -910,6 +925,19 @@ impl<R: RngCore> ServerConnection<R> {
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
 
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log(
+                "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+                &ch.random,
+                chts.as_slice(),
+            );
+            kl.log(
+                "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+                &ch.random,
+                shts.as_slice(),
+            );
+        }
+
         // Server writes with the server handshake key. The read key was set
         // to client_early_traffic_secret above when accepting 0-RTT; in that
         // case we stash chts for installation at EndOfEarlyData. Otherwise
@@ -954,6 +982,11 @@ impl<R: RngCore> ServerConnection<R> {
         let cats = ks.client_application_traffic_secret(th_app.as_slice());
         let sats = ks.server_application_traffic_secret(th_app.as_slice());
         let ems = ks.exporter_master_secret(th_app.as_slice());
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_TRAFFIC_SECRET_0", &ch.random, cats.as_slice());
+            kl.log("SERVER_TRAFFIC_SECRET_0", &ch.random, sats.as_slice());
+            kl.log("EXPORTER_SECRET", &ch.random, ems.as_slice());
+        }
         self.exporter_secret = Some(ems);
 
         // The server's subsequent writes use the application key; it still

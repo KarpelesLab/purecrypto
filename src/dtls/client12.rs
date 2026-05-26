@@ -31,10 +31,12 @@ use crate::tls::codec::{
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::{HashAlg, Transcript, verify_signature};
+use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls};
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -75,6 +77,8 @@ pub(crate) struct ClientConfig12Internal {
     pub signature_policy: SignaturePolicy,
     /// CRLs consulted during chain validation. Empty by default.
     pub crls: CrlStore,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
+    pub key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ClientConfig12Internal {
@@ -88,6 +92,7 @@ impl ClientConfig12Internal {
             server_name: String::from(server_name),
             signature_policy: SignaturePolicy::modern(),
             crls: CrlStore::new(),
+            key_log: None,
         }
     }
 
@@ -627,6 +632,10 @@ impl DtlsClientConnection12 {
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
         let master = master_secret(HashAlg::Sha256, &premaster, &cr, &sr);
+
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_RANDOM", &cr, &master);
+        }
 
         // key_block: c_key(16) || s_key(16) || c_iv(4) || s_iv(4) — total 40 bytes.
         let mut kb = alloc::vec![0u8; 2 * KEY_LEN + 8];

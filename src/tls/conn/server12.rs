@@ -48,9 +48,11 @@ use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::verify_signature;
+use crate::tls::keylog::KeyLog;
 use crate::tls::pki::RootCertStore;
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::AnyPublicKey;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Configuration for a TLS 1.2 server connection.
@@ -93,6 +95,8 @@ pub(crate) struct ServerConfig12 {
     /// CRLs consulted during client-cert chain validation under mTLS.
     /// Empty by default; opt in via [`ServerConfig12::with_crls`].
     crls: crate::tls::pki::CrlStore,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
+    pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -122,6 +126,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            key_log: None,
         }
     }
 
@@ -138,6 +143,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            key_log: None,
         }
     }
 
@@ -783,6 +789,10 @@ impl<R: RngCore> ServerConnection12<R> {
             self.master = Some(rs.master_secret);
             self.resumed = true;
 
+            if let Some(kl) = self.config.key_log.as_ref() {
+                kl.log("CLIENT_RANDOM", &ch.random, &rs.master_secret);
+            }
+
             // Derive a fresh key_block from the recovered master_secret and
             // the new randoms.
             let cr = ch.random;
@@ -1185,6 +1195,9 @@ impl<R: RngCore> ServerConnection12<R> {
         let cr = self.client_random.expect("client_random set");
         let sr = self.server_random.expect("server_random set");
         let master = master_secret(suite.hash, &premaster, &cr, &sr);
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_RANDOM", &cr, &master);
+        }
         let kb_len = 2 * suite.key_len + 8;
         let mut kb = alloc::vec![0u8; kb_len];
         key_block(suite.hash, &master, &sr, &cr, &mut kb);

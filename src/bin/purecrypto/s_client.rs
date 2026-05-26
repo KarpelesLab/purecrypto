@@ -25,8 +25,10 @@ use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
+    WriterKeyLog,
 };
 use purecrypto::x509::Certificate;
+use std::sync::Arc;
 
 /// Which protocol/transport combination the CLI should drive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -208,6 +210,25 @@ fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, Signi
     (chain, key)
 }
 
+/// Opens `path` as the destination for an NSS `SSLKEYLOGFILE` dump.
+/// Unix mode 0o600, append-only — multiple connections in the same
+/// process append to the same file. The returned `Arc` is registered on
+/// the [`Config`] via [`purecrypto::tls::ConfigBuilder::key_log`].
+fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let f = opts
+        .open(path)
+        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
+    Arc::new(WriterKeyLog::new(f))
+}
+
 pub(crate) fn run(args: Args) {
     let version = resolve_version(&args);
     let value_flags = [
@@ -225,7 +246,7 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N] [-keylogfile keys.log]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -251,6 +272,7 @@ pub(crate) fn run(args: Args) {
         (Some(_), None) | (None, Some(_)) => die("both -cert and -key are required for mTLS"),
         _ => None,
     };
+    let keylog = args.value("-keylogfile").map(open_keylog);
 
     // Build the unified config.
     let roots = match version {
@@ -283,6 +305,9 @@ pub(crate) fn run(args: Args) {
     }
     if let Some((chain, key)) = client_id {
         builder = builder.identity(chain, key);
+    }
+    if let Some(sink) = keylog {
+        builder = builder.key_log(sink);
     }
     let cfg = builder.build();
     let mut conn = Connection::client(&cfg)

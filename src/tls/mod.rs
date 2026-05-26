@@ -20,6 +20,7 @@ pub(crate) mod conn;
 mod connection;
 pub(crate) mod crypto;
 mod error;
+pub(crate) mod keylog;
 pub(crate) mod pki;
 mod version;
 
@@ -32,5 +33,8 @@ pub(crate) use conn::ReplayWindow;
 pub use connection::{Connection, HandshakeStatus};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
+pub use keylog::KeyLog;
+#[cfg(feature = "std")]
+pub use keylog::{WriterKeyLog, file_keylog};
 pub use pki::{CrlStore, RootCertStore};
 pub use version::{ContentType, ProtocolVersion};

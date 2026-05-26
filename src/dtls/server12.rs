@@ -22,6 +22,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::{HashAlg, Transcript};
+use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -65,6 +66,8 @@ pub(crate) struct ServerConfig12Internal {
     /// client certificates yet).
     #[allow(dead_code)]
     signature_policy: SignaturePolicy,
+    /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
+    pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
 
 impl ServerConfig12Internal {
@@ -77,6 +80,7 @@ impl ServerConfig12Internal {
             cookie_secret: None,
             require_cookie_exchange: true,
             signature_policy: SignaturePolicy::modern(),
+            key_log: None,
         }
     }
 
@@ -644,6 +648,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let cr = self.client_random.expect("set");
         let sr = self.server_random.expect("set");
         let master = master_secret(HashAlg::Sha256, &premaster, &cr, &sr);
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_RANDOM", &cr, &master);
+        }
         let mut kb = alloc::vec![0u8; 2 * KEY_LEN + 8];
         key_block(HashAlg::Sha256, &master, &sr, &cr, &mut kb);
         let (c_key, rest) = kb.split_at(KEY_LEN);

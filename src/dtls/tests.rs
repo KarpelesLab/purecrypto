@@ -342,6 +342,73 @@ mod dtls13 {
         assert_eq!(client.take_received(), b"pong-ed25519");
     }
 
+    /// SSLKEYLOGFILE plumbing for DTLS 1.3: client + server share a
+    /// `WriterKeyLog<Vec<u8>>` sink; the captured log contains every
+    /// TLS 1.3 label twice (once per peer) with matching secret bytes.
+    /// Confirms DTLS picks up the keylog wiring through the shared
+    /// `tls::Config` plumbing without a separate code path.
+    #[test]
+    fn keylog_loopback_agrees() {
+        use crate::tls::WriterKeyLog;
+        use alloc::collections::BTreeMap;
+        use alloc::string::ToString;
+
+        let buf: Vec<u8> = Vec::new();
+        let sink = Arc::new(WriterKeyLog::new(buf));
+
+        let (mut server_cfg, cert) = make_server13();
+        server_cfg.key_log = Some(sink.clone());
+        let server_cfg = server_cfg.with_no_cookie();
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.key_log = Some(sink.clone());
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-kl-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-kl-server", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        drop(client);
+        drop(server);
+
+        let log_text: alloc::string::String = {
+            let buf = sink.writer_lock_for_test();
+            core::str::from_utf8(&buf).unwrap().to_string()
+        };
+        let want_labels = [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+            "EXPORTER_SECRET",
+        ];
+        let mut per_label: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for line in log_text.lines() {
+            let parts: Vec<&str> = line.split_ascii_whitespace().collect();
+            assert_eq!(parts.len(), 3, "malformed keylog line: {line}");
+            assert_eq!(parts[1].len(), 64);
+            per_label.entry(parts[0]).or_default().push(parts[2]);
+        }
+        for label in want_labels {
+            let entries = per_label
+                .get(label)
+                .unwrap_or_else(|| panic!("missing label {label} in keylog:\n{log_text}"));
+            assert_eq!(
+                entries.len(),
+                2,
+                "expected {label} twice, got {}",
+                entries.len()
+            );
+            assert_eq!(entries[0], entries[1], "client/server disagree on {label}");
+        }
+    }
+
     #[test]
     fn application_data_both_ways() {
         let (server_cfg, cert) = make_server13();
