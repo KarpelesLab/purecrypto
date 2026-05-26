@@ -283,13 +283,21 @@ impl BoxedEcdsaSignature {
         )
     }
 
-    /// Decodes a DER `Ecdsa-Sig-Value`.
+    /// Decodes a DER `Ecdsa-Sig-Value` with strict-DER enforcement (no
+    /// unnecessary leading `0x00`/`0xff`, no empty INTEGER body, no trailing
+    /// data). Closes the ECDSA signature-malleability gap at the bytes
+    /// layer — many byte-distinct encodings of the same `(r, s)` are
+    /// otherwise accepted.
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::Reader;
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence().map_err(|_| Error::Malformed)?;
-        let r = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
-        let s = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        let r = seq
+            .read_unsigned_integer_bytes()
+            .map_err(|_| Error::Malformed)?;
+        let s = seq
+            .read_unsigned_integer_bytes()
+            .map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
         reader.finish().map_err(|_| Error::Malformed)?;
         Ok(BoxedEcdsaSignature {

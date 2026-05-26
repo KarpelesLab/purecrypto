@@ -113,12 +113,21 @@ pub(crate) fn verify_chain(
     }
 
     // Anchor the top of the chain to a trusted root sharing its issuer name.
+    // RFC 5280 §7.1 mandates byte-exact `Name` equality, so we compare the
+    // raw DER. Multiple anchors may share a name (cross-signed renewal); we
+    // accept the first whose key verifies the topmost cert's signature.
     let top = certs.last().expect("chain is non-empty");
-    let top_issuer = top.issuer().map_err(|_| Error::BadCertificate)?;
-    let anchor = store
-        .find_issuer(&top_issuer)
-        .ok_or(Error::BadCertificate)?;
-    verify_cert_against_issuer(top, &anchor.key, policy)?;
+    let top_issuer = top.issuer_der().map_err(|_| Error::BadCertificate)?;
+    let mut anchored = false;
+    for anchor in store.anchors_with_subject(top_issuer) {
+        if verify_cert_against_issuer(top, &anchor.key, policy).is_ok() {
+            anchored = true;
+            break;
+        }
+    }
+    if !anchored {
+        return Err(Error::BadCertificate);
+    }
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
     enforce_constraints(&certs)?;
@@ -230,10 +239,13 @@ fn check_critical_extensions_recognized(cert: &Certificate) -> Result<(), Error>
     Ok(())
 }
 
-/// Whether `cert.issuer != issuer.subject`.
+/// Whether `cert.issuer != issuer.subject`. Compared as raw DER bytes per
+/// RFC 5280 §7.1: any difference in encoding (PrintableString vs UTF8String,
+/// extra attributes, multi-valued RDNs) MUST result in a non-match, which the
+/// parsed-form comparison missed.
 fn names_differ(cert: &Certificate, issuer: &Certificate) -> Result<bool, Error> {
-    let cert_issuer = cert.issuer().map_err(|_| Error::BadCertificate)?;
-    let issuer_subject = issuer.subject().map_err(|_| Error::BadCertificate)?;
+    let cert_issuer = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
+    let issuer_subject = issuer.subject_der().map_err(|_| Error::BadCertificate)?;
     Ok(cert_issuer != issuer_subject)
 }
 
