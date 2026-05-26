@@ -10,12 +10,14 @@
 //! epoch, a 48-bit sequence number, anti-replay sliding window, and the
 //! HelloVerifyRequest cookie that gates server resource allocation.
 
+pub(crate) mod ack;
 pub mod client12;
 mod cookie;
 mod reassembly;
 mod record;
 mod record13;
 mod reliability;
+pub(crate) mod reliability13;
 mod replay;
 pub mod server12;
 
