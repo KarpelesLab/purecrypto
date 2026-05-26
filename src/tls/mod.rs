@@ -14,11 +14,11 @@
 //! and over TCP, and the key schedule, record protection, and signatures are
 //! validated against the RFC 8448 traces. Not audited; APIs may change.
 
-mod codec;
+pub(crate) mod codec;
 mod conn;
-mod crypto;
+pub(crate) mod crypto;
 mod error;
-mod pki;
+pub(crate) mod pki;
 mod version;
 
 pub use conn::{

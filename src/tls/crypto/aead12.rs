@@ -95,6 +95,81 @@ impl RecordCrypter12 {
         aad
     }
 
+    /// Builds the 13-byte AAD for DTLS 1.2 (RFC 6347 §4.1.2.1):
+    /// `epoch(2) ‖ seq(6) ‖ content_type(1) ‖ version(2) ‖ plaintext_length(2)`.
+    /// The `seq_num` slot is interpreted as `epoch ‖ seq` and version is
+    /// `0xfefd`.
+    #[allow(dead_code)]
+    fn aad_dtls(seq_combined: u64, content_type: ContentType, plaintext_len: u16) -> [u8; 13] {
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&seq_combined.to_be_bytes());
+        aad[8] = content_type.as_u8();
+        aad[9] = 0xfe;
+        aad[10] = 0xfd;
+        aad[11..13].copy_from_slice(&plaintext_len.to_be_bytes());
+        aad
+    }
+
+    /// Encrypts one DTLS 1.2 record's payload with a caller-supplied 64-bit
+    /// combined `epoch:16 || seq:48` (RFC 6347 §4.1). Returns the on-wire
+    /// fragment `explicit_nonce(8) || ciphertext || tag(16)`. Does NOT touch
+    /// the internal sequence counter — DTLS sequence numbers are managed by
+    /// the caller because retransmits and out-of-order delivery break a
+    /// monotonic counter.
+    #[allow(dead_code)]
+    pub(crate) fn encrypt_dtls(
+        &self,
+        seq_combined: u64,
+        content_type: ContentType,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if payload.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let explicit_nonce = seq_combined.to_be_bytes();
+        let nonce = self.aead_nonce(&explicit_nonce);
+        let aad = Self::aad_dtls(seq_combined, content_type, payload.len() as u16);
+        let mut buf = payload.to_vec();
+        let tag = self.aead.encrypt(&nonce, &aad, &mut buf);
+        let mut out = Vec::with_capacity(8 + buf.len() + 16);
+        out.extend_from_slice(&explicit_nonce);
+        out.extend_from_slice(&buf);
+        out.extend_from_slice(&tag);
+        Ok(out)
+    }
+
+    /// Decrypts one DTLS 1.2 record's fragment. `seq_combined` is
+    /// `epoch:16 || seq:48` and `content_type` comes from the DTLS record
+    /// header. Returns the plaintext on success.
+    #[allow(dead_code)]
+    pub(crate) fn decrypt_dtls(
+        &self,
+        seq_combined: u64,
+        content_type: ContentType,
+        fragment: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if fragment.len() < 8 + 16 {
+            return Err(Error::Decode);
+        }
+        let mut explicit_nonce = [0u8; 8];
+        explicit_nonce.copy_from_slice(&fragment[..8]);
+        let body = &fragment[8..];
+        let (ct_bytes, tag_bytes) = body.split_at(body.len() - 16);
+        let mut tag = [0u8; 16];
+        tag.copy_from_slice(tag_bytes);
+        let plaintext_len = ct_bytes.len();
+        if plaintext_len > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
+        let aad = Self::aad_dtls(seq_combined, content_type, plaintext_len as u16);
+        let nonce = self.aead_nonce(&explicit_nonce);
+        let mut buf = ct_bytes.to_vec();
+        if !self.aead.decrypt(&nonce, &aad, &mut buf, &tag) {
+            return Err(Error::BadRecordMac);
+        }
+        Ok(buf)
+    }
+
     /// Encrypts one record's payload, returning the on-wire fragment:
     ///
     /// ```text

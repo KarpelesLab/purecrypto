@@ -228,6 +228,23 @@ impl Reassembler {
         }
         None
     }
+
+    /// Pops the next-expected message if it has already been fully
+    /// assembled (e.g. its fragments arrived before earlier messages).
+    /// Returns `None` when the head of the queue is still missing fragments.
+    ///
+    /// Callers typically loop `feed → handle → pop_ready → handle → …`
+    /// until `pop_ready` yields `None`, so that an arbitrary delivery
+    /// order ultimately releases everything in protocol order.
+    pub(crate) fn pop_ready(&mut self) -> Option<(u8, Vec<u8>)> {
+        let entry = self.in_progress.get(&self.expected_msg_seq)?;
+        if entry.received_count != entry.total_length {
+            return None;
+        }
+        let done = self.in_progress.remove(&self.expected_msg_seq)?;
+        self.expected_msg_seq = self.expected_msg_seq.wrapping_add(1);
+        Some((done.msg_type, done.buf))
+    }
 }
 
 // --- helpers ---------------------------------------------------------------
