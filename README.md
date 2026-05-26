@@ -39,15 +39,16 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing) |
 | Randomness       | `rng`       | 🟡 RngCore/CryptoRng, HMAC-DRBG, OsRng (Unix) |
-| Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM (AEAD) |
+| Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM and ChaCha20-Poly1305 (AEAD) |
 | Bignum (CT)      | `bignum`    | 🟡 Uint<LIMBS>, widening mul, Montgomery modular arith, modexp + Fermat inverse |
 | Asymmetric keys  | `rsa`       | 🟡 RSA keygen, raw, PKCS#1 v1.5 enc/sign, PSS sign/verify, PKCS#1 DER/PEM |
 | Key derivation   | `kdf`       | 🟡 PBKDF2, HKDF |
-| Elliptic curve   | `ec`        | 🟡 ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519; Ed25519/ML-KEM planned |
+| Elliptic curve   | `ec`        | 🟡 ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032) |
+| Post-quantum KEM | `mlkem`     | 🟡 ML-KEM-768 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop |
 | ASN.1 / DER      | `der`       | 🟡 DER reader/writer, base64, PEM; RSA PKCS#1 key (de)serialization |
-| X.509            | `x509`      | 🟡 self-signed + CA issuance (RSA & ECDSA), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
-| TLS / DTLS       | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1, AES-GCM; RFC 8448 KATs |
-| C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA & ECDSA keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
+| X.509            | `x509`      | 🟡 self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
+| TLS / DTLS       | `tls`       | 🟡 TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid; AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; RFC 8448 KATs |
+| C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA, ECDSA & Ed25519 keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey`, `pkey`, `req`, `x509` (CA), `s_client` |
 
 ## Building
@@ -95,6 +96,7 @@ purecrypto hash sha256 file.txt            # or pipe via stdin
 purecrypto rand 32                          # hex (or --binary)
 purecrypto genpkey -algorithm EC -curve P-256 -out key.pem
 purecrypto genpkey -algorithm RSA -bits 2048 -out rsa.pem
+purecrypto genpkey -algorithm ED25519 -out ed.pem
 purecrypto pkey -in key.pem -pubout         # emit the public key
 purecrypto req  -key key.pem -subj "/CN=example.com" \
                 -addext "subjectAltName=DNS:example.com" -out req.csr
