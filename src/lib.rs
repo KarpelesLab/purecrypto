@@ -67,6 +67,13 @@ pub mod rng;
 #[cfg(feature = "rsa")]
 pub mod rsa;
 
+/// Re-exported at the crate root: the signature-algorithm registry that
+/// X.509 chain validation and TLS 1.3 `CertificateVerify` both dispatch
+/// through. Gated on the `x509` feature (which pulls in the SPKI parsers and
+/// the underlying primitives).
+#[cfg(feature = "x509")]
+pub mod signature_registry;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 

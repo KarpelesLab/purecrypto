@@ -20,6 +20,8 @@ pub mod ecdh;
 pub mod ecdsa;
 pub mod ed25519;
 mod p256;
+#[cfg(feature = "x509")]
+pub(crate) mod registry;
 mod weierstrass;
 pub mod x25519;
 

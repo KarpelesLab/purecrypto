@@ -8,10 +8,7 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::{
-    BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed25519PublicKey, Ed25519Signature,
-};
-use crate::hash::{Sha256, Sha384, Sha512};
+use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed25519PublicKey};
 use crate::rsa::BoxedRsaPublicKey;
 
 const SPKI_LABEL: &str = "PUBLIC KEY";
@@ -112,43 +109,19 @@ impl AnyPublicKey {
     }
 
     /// Verifies `sig` over `msg` under the signature algorithm identified by
-    /// `sig_alg` OID arcs. RSA signatures are PKCS#1 v1.5; ECDSA signatures are
-    /// DER `Ecdsa-Sig-Value`. The hash is taken from `sig_alg`; the curve from
-    /// the key.
+    /// `sig_alg` OID arcs.
+    ///
+    /// Dispatch goes through [`crate::signature_registry`]: the OID picks an
+    /// entry in [`ALGORITHMS`](crate::signature_registry::ALGORITHMS), which
+    /// then re-parses the SPKI to recover the key and verifies. RSA
+    /// signatures are PKCS#1 v1.5 or RSA-PSS (the OID fixes which);
+    /// ECDSA signatures are DER `Ecdsa-Sig-Value`; Ed25519 is raw 64-byte R‖S.
     pub fn verify(&self, sig_alg: &[u64], msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        match self {
-            AnyPublicKey::Rsa(k) => {
-                if sig_alg == oid::SHA256_WITH_RSA {
-                    k.verify_pkcs1v15::<Sha256>(msg, sig).map_err(Error::Rsa)
-                } else if sig_alg == oid::SHA384_WITH_RSA {
-                    k.verify_pkcs1v15::<Sha384>(msg, sig).map_err(Error::Rsa)
-                } else {
-                    Err(Error::UnsupportedAlgorithm)
-                }
-            }
-            AnyPublicKey::Ecdsa(k) => {
-                let parsed = BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Malformed)?;
-                let ok = if sig_alg == oid::ECDSA_WITH_SHA256 {
-                    k.verify::<Sha256>(msg, &parsed)
-                } else if sig_alg == oid::ECDSA_WITH_SHA384 {
-                    k.verify::<Sha384>(msg, &parsed)
-                } else if sig_alg == oid::ECDSA_WITH_SHA512 {
-                    k.verify::<Sha512>(msg, &parsed)
-                } else {
-                    return Err(Error::UnsupportedAlgorithm);
-                };
-                ok.map_err(|_| Error::Verification)
-            }
-            AnyPublicKey::Ed25519(k) => {
-                if sig_alg != oid::ID_ED25519 {
-                    return Err(Error::UnsupportedAlgorithm);
-                }
-                // Ed25519 signatures are the raw 64-byte R‖S, not DER-wrapped.
-                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Malformed)?;
-                k.verify(msg, &Ed25519Signature::from_bytes(bytes))
-                    .map_err(|_| Error::Verification)
-            }
-        }
+        let algo =
+            crate::signature_registry::find_by_oid(sig_alg).ok_or(Error::UnsupportedAlgorithm)?;
+        // The registry entry's `verify` parses an SPKI; round-trip ours.
+        let spki = self.to_spki_der();
+        algo.verify(&spki, msg, sig)
     }
 }
 
@@ -156,6 +129,7 @@ impl AnyPublicKey {
 mod tests {
     use super::*;
     use crate::ec::BoxedEcdsaPrivateKey;
+    use crate::hash::{Sha256, Sha384, Sha512};
     use crate::rng::HmacDrbg;
     use crate::test_util::rsa_test_key_a;
 

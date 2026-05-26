@@ -2,14 +2,15 @@
 //!
 //! A `CertificateVerify` proves possession of the certified key by signing a
 //! context-bound digest of the handshake transcript. The signature scheme is a
-//! 16-bit `SignatureScheme` code (not an X.509 OID), so verification is
-//! dispatched here on the wire scheme and the peer's [`AnyPublicKey`].
+//! 16-bit `SignatureScheme` code (not an X.509 OID); dispatch goes through
+//! [`crate::signature_registry`]: the scheme code picks a registry entry,
+//! whose `verify(spki, message, signature)` re-parses the SPKI and delegates
+//! to the underlying primitive.
 
-use crate::ec::{BoxedEcdsaSignature, CurveId, Ed25519Signature};
-use crate::hash::{Sha256, Sha384, Sha512};
+use crate::signature_registry::find_by_tls_scheme;
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
-use crate::x509::AnyPublicKey;
+use crate::x509::{AnyPublicKey, Error as X509Error};
 use alloc::vec::Vec;
 
 /// The 64 `0x20` (space) octets that prefix the signed content (RFC 8446
@@ -36,75 +37,35 @@ pub(crate) fn certificate_verify_content(server: bool, transcript_hash: &[u8]) -
 }
 
 /// Verifies a TLS 1.3 handshake signature of `message` under `key`, dispatching
-/// on `scheme`. Returns [`Error::PeerMisbehaved`] if the scheme is unsupported
-/// or does not match the key type, and [`Error::BadCertificate`] if the
-/// signature is invalid.
+/// through [`crate::signature_registry`] on `scheme`. Returns
+/// [`Error::PeerMisbehaved`] if the scheme is unsupported or does not match
+/// the key type, [`Error::Decode`] if the signature wire format is malformed,
+/// and [`Error::BadCertificate`] if the signature is otherwise invalid.
 pub(crate) fn verify_signature(
     scheme: SignatureScheme,
     key: &AnyPublicKey,
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), Error> {
-    match key {
-        AnyPublicKey::Rsa(k) => {
-            let r = if scheme == SignatureScheme::RSA_PSS_RSAE_SHA256 {
-                k.verify_pss::<Sha256>(message, signature)
-            } else if scheme == SignatureScheme::RSA_PSS_RSAE_SHA384 {
-                k.verify_pss::<Sha384>(message, signature)
-            } else if scheme == SignatureScheme::RSA_PKCS1_SHA256 {
-                k.verify_pkcs1v15::<Sha256>(message, signature)
-            } else if scheme == SignatureScheme::RSA_PKCS1_SHA384 {
-                k.verify_pkcs1v15::<Sha384>(message, signature)
-            } else {
-                return Err(Error::PeerMisbehaved);
-            };
-            r.map_err(|_| Error::BadCertificate)
-        }
-        AnyPublicKey::Ecdsa(k) => {
-            // The scheme fixes both the curve and the hash; the key's curve
-            // must match.
-            let (expected_curve, hash) = if scheme == SignatureScheme::ECDSA_SECP256R1_SHA256 {
-                (CurveId::P256, EcdsaHash::Sha256)
-            } else if scheme == SignatureScheme::ECDSA_SECP384R1_SHA384 {
-                (CurveId::P384, EcdsaHash::Sha384)
-            } else if scheme == SignatureScheme::ECDSA_SECP521R1_SHA512 {
-                (CurveId::P521, EcdsaHash::Sha512)
-            } else {
-                return Err(Error::PeerMisbehaved);
-            };
-            if k.curve() != expected_curve {
-                return Err(Error::PeerMisbehaved);
-            }
-            let sig = BoxedEcdsaSignature::from_der(signature).map_err(|_| Error::Decode)?;
-            let r = match hash {
-                EcdsaHash::Sha256 => k.verify::<Sha256>(message, &sig),
-                EcdsaHash::Sha384 => k.verify::<Sha384>(message, &sig),
-                EcdsaHash::Sha512 => k.verify::<Sha512>(message, &sig),
-            };
-            r.map_err(|_| Error::BadCertificate)
-        }
-        AnyPublicKey::Ed25519(k) => {
-            if scheme != SignatureScheme::ED25519 {
-                return Err(Error::PeerMisbehaved);
-            }
-            let bytes: [u8; 64] = signature.try_into().map_err(|_| Error::Decode)?;
-            k.verify(message, &Ed25519Signature::from_bytes(bytes))
-                .map_err(|_| Error::BadCertificate)
-        }
+    let algo = find_by_tls_scheme(scheme.0).ok_or(Error::PeerMisbehaved)?;
+    // The registry verifier needs an SPKI; round-trip the parsed key. (A few
+    // hundred bytes of allocation per CertificateVerify is negligible next to
+    // the asymmetric verify itself.)
+    let spki = key.to_spki_der();
+    match algo.verify(&spki, message, signature) {
+        Ok(()) => Ok(()),
+        // `UnsupportedAlgorithm` here means the SPKI's key type doesn't match
+        // the scheme (e.g. an RSA key against `ecdsa_secp256r1_sha256`).
+        Err(X509Error::UnsupportedAlgorithm) => Err(Error::PeerMisbehaved),
+        Err(X509Error::Malformed) => Err(Error::Decode),
+        Err(_) => Err(Error::BadCertificate),
     }
-}
-
-/// Selects the hash for an ECDSA signature scheme.
-enum EcdsaHash {
-    Sha256,
-    Sha384,
-    Sha512,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::Digest;
+    use crate::hash::{Digest, Sha256};
     use crate::test_util::from_hex_vec;
     use crate::x509::Certificate;
 

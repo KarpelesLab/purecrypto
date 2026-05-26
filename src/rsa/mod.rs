@@ -18,6 +18,8 @@ mod encoding;
 mod pkcs1;
 #[cfg(feature = "alloc")]
 mod pss;
+#[cfg(all(feature = "x509", feature = "alloc"))]
+pub(crate) mod registry;
 
 #[cfg(feature = "alloc")]
 pub use boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
