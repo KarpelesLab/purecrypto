@@ -13,4 +13,5 @@
 mod cookie;
 mod reassembly;
 mod record;
+mod reliability;
 mod replay;
