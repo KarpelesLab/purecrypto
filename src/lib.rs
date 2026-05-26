@@ -7,8 +7,8 @@
 //!    equality, selection and ordering. Everything secret-dependent rests on
 //!    this layer.
 //! 2. Hashing, symmetric ciphers, constant-time bignum arithmetic, asymmetric
-//!    keys (RSA, ECDSA, Ed25519, ML-KEM), ASN.1, X.509, and TLS/DTLS — added
-//!    on top as the project grows.
+//!    keys (RSA, ECDSA, Ed25519), the post-quantum schemes ML-KEM, ML-DSA and
+//!    SLH-DSA, ASN.1, X.509, and TLS/DTLS — added on top as the project grows.
 //!
 //! `purecrypto` is usable as a Rust library, a C library, and a standalone
 //! command-line tool.

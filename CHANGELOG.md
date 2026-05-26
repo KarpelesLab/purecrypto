@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- *(slhdsa)* SLH-DSA (FIPS 205), all 12 parameter sets; ACVP + OpenSSL-interop validated
+- *(mldsa)* ML-DSA-44/65/87 (FIPS 204); ACVP + OpenSSL-interop validated
 - *(tls,mlkem)* hybrid X25519MLKEM768 (0x11ec) TLS 1.3 key exchange; ML-KEM-768 PKIX SPKI
 - *(mlkem)* ML-KEM-768 (FIPS 203), `no_std`/no-alloc; OpenSSL 3.5 interop-validated
 - *(ec)* Ed25519 (EdDSA, RFC 8032) — library, X.509, TLS 1.3, CLI, and C FFI
