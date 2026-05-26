@@ -372,6 +372,86 @@ the standard NSS SSLKEYLOGFILE format and decrypts captured traffic in
 Wireshark by setting `Edit → Preferences → Protocols → TLS → (Pre)-Master-Secret
 log filename`.
 
+### Signature algorithms
+
+X.509 chain validation and TLS 1.3 `CertificateVerify` both dispatch through
+the [`signature_registry`](src/signature_registry.rs) module. Every signature
+primitive purecrypto can do appears as a registry entry; a strict whitelist
+[`SignaturePolicy`] controls which ones a verifier will accept.
+
+#### Registry
+
+| `id` (whitelist key)        | X.509 OID                       | TLS 1.3 scheme | Default `modern()` |
+| --------------------------- | ------------------------------- | -------------- | ------------------ |
+| `rsa-pkcs1-sha1`            | `1.2.840.113549.1.1.5`          | (none)         | opt-in |
+| `rsa-pkcs1-sha256`          | `1.2.840.113549.1.1.11`         | `0x0401`       | ✅ |
+| `rsa-pkcs1-sha384`          | `1.2.840.113549.1.1.12`         | `0x0501`       | ✅ |
+| `rsa-pkcs1-sha512`          | `1.2.840.113549.1.1.13`         | (none)         | opt-in |
+| `rsa-pss-rsae-sha256`       | `1.2.840.113549.1.1.11` (RSAE)  | `0x0804`       | ✅ |
+| `rsa-pss-rsae-sha384`       | `1.2.840.113549.1.1.12` (RSAE)  | `0x0805`       | ✅ |
+| `rsa-pss-rsae-sha512`       | `1.2.840.113549.1.1.13` (RSAE)  | `0x0806`       | ✅ |
+| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (PSS-keys) | (none)      | opt-in |
+| `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | ✅ |
+| `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | ✅ |
+| `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | ✅ |
+| `ecdsa-secp256r1-sha256`    | (TLS-only — strict curve)       | `0x0403`       | ✅ |
+| `ecdsa-secp384r1-sha384`    | (TLS-only — strict curve)       | `0x0503`       | ✅ |
+| `ecdsa-secp521r1-sha512`    | (TLS-only — strict curve)       | `0x0603`       | ✅ |
+| `ecdsa-secp256r1-sha384/512`, `ecdsa-secp384r1-sha256/512`, `ecdsa-secp521r1-sha256/384` | cross-hash, policy-only | (none) | opt-in |
+| `ecdsa-secp256k1-sha256/384/512` | secp256k1, policy-only      | (none)         | opt-in |
+| `ed25519`                   | `1.3.101.112`                   | `0x0807`       | ✅ |
+| `ml-dsa-44` / `-65` / `-87` | `2.16.840.1.101.3.4.3.17/18/19` | `0x0904/05/06` | ✅ (NIST FIPS 204) |
+| `slh-dsa-sha2-128s/128f/192s/192f/256s/256f`, `slh-dsa-shake-128s/128f/192s/192f/256s/256f` | `2.16.840.1.101.3.4.3.20..31` | (none) | opt-in (FIPS 205) |
+
+The matched-curve / matched-hash ECDSA pairs (e.g. P-256 + SHA-256) have IANA
+TLS scheme codes; cross-hash pairs and all secp256k1 entries are reachable for
+chain dispatch via the OID-keyed `ecdsa-with-shaN` entries — which accept any
+supported curve — and as fine-grained policy-keyed entries for TLS opt-in.
+
+ML-DSA is on the default whitelist (the modern PQC future). SLH-DSA's twelve
+parameter sets are registered but never on the default whitelist: signatures
+are 7–50 KB and rarely the right default for X.509 leaves.
+
+#### Configuring the policy
+
+```rust
+use purecrypto::signature_registry::SignaturePolicy;
+use purecrypto::tls::{ClientConfig, RootCertStore};
+
+let roots = RootCertStore::new();
+
+// Default — modern IANA-blessed set, RSA ≥ 2048 bits.
+let cfg = ClientConfig::new(roots);
+
+// Legacy interop: accept SHA-1 RSA and lower the RSA-bit floor to 1024.
+let roots = RootCertStore::new();
+let cfg = ClientConfig::new(roots).with_signature_policy(
+    SignaturePolicy::modern()
+        .permit("rsa-pkcs1-sha1")
+        .with_min_rsa_bits(1024),
+);
+
+// PQC-strict: only ML-DSA + Ed25519, refuse everything classical.
+let roots = RootCertStore::new();
+let cfg = ClientConfig::new(roots).with_signature_policy(
+    SignaturePolicy::empty()
+        .permit("ml-dsa-65")
+        .permit("ml-dsa-87")
+        .permit("ed25519"),
+);
+
+// SLH-DSA chains: opt in to a single set the application expects.
+let roots = RootCertStore::new();
+let cfg = ClientConfig::new(roots).with_signature_policy(
+    SignaturePolicy::modern().permit("slh-dsa-sha2-128f"),
+);
+```
+
+The same `with_signature_policy` builder exists on `ServerConfig` (it gates
+client-certificate validation under mTLS). The policy is a strict whitelist:
+adding an entry to the registry does NOT auto-permit it — the caller has to
+add the id explicitly.
+
 ## C library
 
 Prebuilt archives — the `purecrypto` CLI, the static (`.a`/`.lib`) and shared
