@@ -1,6 +1,6 @@
 //! NIST P-256 (secp256r1) field and group arithmetic.
 
-use crate::bignum::{MontModulus, Uint, inv_mod};
+use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::rng::RngCore;
 
@@ -114,12 +114,19 @@ impl P256 {
 
     /// Converts a point to affine `(x, y)` (plain coordinates), or `None` if it
     /// is the identity.
+    ///
+    /// The inversion is via Fermat's little theorem (`z^{p-2} mod p`) using
+    /// the constant-time Montgomery ladder, NOT the variable-time
+    /// extended-Euclidean `inv_mod` — `z` is derived from the secret scalar
+    /// on every ECDH / ECDSA hot path and a timing leak here would be
+    /// exploitable.
     pub(crate) fn to_affine(&self, point: &Point) -> Option<(Fe, Fe)> {
         if bool::from(point.z.is_zero()) {
             return None;
         }
         let z = self.fp.from_mont(&point.z);
-        let z_inv = inv_mod(&z, self.fp.modulus())?;
+        let p_minus_2 = self.fp.modulus().wrapping_sub(&Fe::from_u64(2));
+        let z_inv = self.fp.pow(&z, &p_minus_2);
         let x = self.fp.mul_mod(&self.fp.from_mont(&point.x), &z_inv);
         let y = self.fp.mul_mod(&self.fp.from_mont(&point.y), &z_inv);
         Some((x, y))

@@ -923,7 +923,10 @@ impl<R: RngCore> ServerConnection<R> {
             NamedGroup::X25519 => {
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 let peer: [u8; 32] = client_pub.try_into().map_err(|_| Error::Decode)?;
-                let shared = sk.diffie_hellman(&peer);
+                // RFC 8446 §7.4.2: reject the all-zero (small-order) DH output.
+                let shared = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
                 Ok((sk.public_key().to_vec(), Secret::new(&shared)))
             }
             NamedGroup::SECP256R1 => {
@@ -948,7 +951,11 @@ impl<R: RngCore> ServerConnection<R> {
 
                 let (ct, ml_ss) = MlKem768EncapsKey::from_bytes(ek).encapsulate(&mut self.rng);
                 let sk = X25519PrivateKey::generate(&mut self.rng);
-                let x_ss = sk.diffie_hellman(&peer);
+                // RFC 8446 §7.4.2: reject the all-zero X25519 contribution
+                // even though the ML-KEM half is independently secure.
+                let x_ss = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
 
                 // Server share: ML-KEM ciphertext ‖ X25519 key.
                 let mut share = ct.to_bytes().to_vec();

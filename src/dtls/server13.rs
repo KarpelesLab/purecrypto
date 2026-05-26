@@ -597,7 +597,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .as_slice()
             .try_into()
             .map_err(|_| Error::Decode)?;
-        let shared = sk.diffie_hellman(&client_peer);
+        // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject the all-zero DH output.
+        let shared = sk
+            .diffie_hellman(&client_peer)
+            .map_err(|_| Error::IllegalParameter)?;
         self.x25519 = Some(sk);
 
         // ServerHello.

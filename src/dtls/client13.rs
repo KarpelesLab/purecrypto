@@ -562,7 +562,11 @@ impl DtlsClientConnection13 {
             .as_slice()
             .try_into()
             .map_err(|_| Error::Decode)?;
-        let shared = self.x25519.diffie_hellman(&peer);
+        // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject the all-zero DH output.
+        let shared = self
+            .x25519
+            .diffie_hellman(&peer)
+            .map_err(|_| Error::IllegalParameter)?;
 
         // Update the transcript with SH.
         self.transcript.update(raw);
