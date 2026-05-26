@@ -4,6 +4,7 @@ mod client;
 mod client12;
 mod common;
 mod server;
+mod server12;
 #[cfg(feature = "std")]
 mod stream;
 
@@ -16,6 +17,7 @@ pub use client12::{ClientConfig12, ClientConnection12};
 pub use server::ReplayWindow;
 #[allow(unused_imports)]
 pub use server::{ClientAuthPolicy, ServerConfig, ServerConnection};
+pub use server12::{ServerConfig12, ServerConnection12};
 #[cfg(feature = "std")]
 pub use stream::{Connection, Stream};
 
@@ -1625,5 +1627,269 @@ mod loopback_tests {
             drive_until_client_error(&mut client, &mut server),
             crate::tls::Error::BadCertificate
         );
+    }
+}
+
+#[cfg(test)]
+mod tls12_loopback_tests {
+    //! End-to-end loopback for the TLS 1.2 client + server: drive a full
+    //! handshake in-process across every AEAD-ECDHE suite × cert combination
+    //! and confirm application data flows in both directions.
+
+    use super::{ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12};
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::rsa::BoxedRsaPrivateKey;
+    use crate::test_util::rsa_test_key_a;
+    use crate::tls::RootCertStore;
+    use crate::tls::codec::{CipherSuite, NamedGroup};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    use alloc::vec::Vec;
+
+    /// An RSA self-signed server config plus its certificate DER (for the
+    /// client's trust store).
+    fn rsa_server12() -> (ServerConfig12, Vec<u8>) {
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        // `self_signed` uses the raw RsaPrivateKey path, which auto-includes a
+        // dNSName matching the CN — exactly what the TLS-1.2 client expects
+        // when verifying "loopback.example".
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        (
+            ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed),
+            der,
+        )
+    }
+
+    /// A P-256 ECDSA self-signed server config plus its certificate DER.
+    fn ecdsa_server12() -> (ServerConfig12, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ec12-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            ServerConfig12::with_ecdsa(alloc::vec![der.clone()], key),
+            der,
+        )
+    }
+
+    /// Runs a full in-process TLS 1.2 handshake against `(server_config, cert)`
+    /// using the given offered suites/groups, then exchanges application data
+    /// in both directions.
+    fn run_with(server: (ServerConfig12, Vec<u8>), suites: &[CipherSuite], groups: &[NamedGroup]) {
+        let (server_config, cert_der) = server;
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-server", b"nonce", &[]);
+
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            suites,
+            groups,
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+
+        // Suite agreement.
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            server.negotiated_cipher_suite(),
+            "client and server disagree on cipher suite",
+        );
+
+        // Application data, client -> server.
+        client.send_application_data(b"ping from client").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping from client");
+
+        // Application data, server -> client.
+        server.send_application_data(b"pong from server").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong from server");
+    }
+
+    #[test]
+    fn tls12_ecdhe_rsa_aes128gcm_x25519() {
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn tls12_ecdhe_rsa_aes256gcm_x25519() {
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn tls12_ecdhe_rsa_chacha20_x25519() {
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn tls12_ecdhe_ecdsa_aes128gcm_secp256r1() {
+        run_with(
+            ecdsa_server12(),
+            &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::SECP256R1],
+        );
+    }
+
+    #[test]
+    fn tls12_ecdhe_ecdsa_chacha20_x25519() {
+        run_with(
+            ecdsa_server12(),
+            &[CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn tls12_secp256r1_with_rsa_cert() {
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::SECP256R1],
+        );
+    }
+
+    /// Larger payload to exercise both record fragmentation (write side) and
+    /// reassembly (read side) of application data.
+    #[test]
+    fn tls12_application_data_both_directions() {
+        let (server_config, cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-app-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-app-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Send two messages each way to exercise sequence-number progression.
+        for msg in [b"hello-1".as_ref(), b"hello-2".as_ref()] {
+            client.send_application_data(msg).unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            assert_eq!(server.take_received_plaintext(), msg);
+        }
+        for msg in [b"world-1".as_ref(), b"world-2".as_ref()] {
+            server.send_application_data(msg).unwrap();
+            let s = server.write_tls();
+            client.read_tls(&s);
+            client.process_new_packets().unwrap();
+            assert_eq!(client.take_received_plaintext(), msg);
+        }
+    }
+
+    /// A client offering only an unknown cipher suite is rejected with
+    /// `HandshakeFailure`.
+    #[test]
+    fn tls12_rejects_client_with_no_overlap_suite() {
+        let (server_config, _cert_der) = rsa_server12();
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-bad-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-bad-s", b"nonce", &[]);
+
+        // The client offers TLS 1.2 suites, but they're all in the ECDSA half
+        // (no RSA match for an RSA-keyed server). The server picks none →
+        // HandshakeFailure.
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(RootCertStore::new()),
+            "loopback.example",
+            &mut crng,
+            &[
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        let c = client.write_tls();
+        server.read_tls(&c);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(crate::tls::Error::HandshakeFailure)
+        ));
     }
 }

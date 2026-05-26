@@ -23,7 +23,8 @@ mod version;
 
 pub use conn::{
     ClientAuthPolicy, ClientCertConfig, ClientConfig, ClientConfig12, ClientConnection,
-    ClientConnection12, ReceivedSessionTicket, ServerConfig, ServerConnection, StoredSession,
+    ClientConnection12, ReceivedSessionTicket, ServerConfig, ServerConfig12, ServerConnection,
+    ServerConnection12, StoredSession,
 };
 #[cfg(feature = "std")]
 pub use conn::{Connection, ReplayWindow, Stream};
