@@ -1629,6 +1629,196 @@ mod loopback_tests {
             crate::tls::Error::BadCertificate
         );
     }
+
+    /// Builds a CA-issued leaf chain (CA -> leaf) and returns
+    /// (`server_config`, `root_der`, `leaf_serial_u64`). The CA is rsa_test_key_a,
+    /// the leaf signed with the same CA key for simplicity (the leaf's key
+    /// itself is irrelevant — TLS 1.3 uses the CA-signed cert + a
+    /// CertificateVerify under the LEAF key, so we use a fresh Ed25519 leaf).
+    #[allow(clippy::type_complexity)]
+    fn ca_signed_ed25519_leaf() -> (ServerConfig, Vec<u8>, Vec<u8>, [u8; 32]) {
+        use crate::x509::DistinguishedName;
+        let ca_key = rsa_test_key_a();
+        let ca_name = DistinguishedName::common_name("Stapling Test CA");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity, 1, true).unwrap();
+
+        // Leaf key (Ed25519) — small SPKI, fast verify.
+        let mut rng = HmacDrbg::<Sha256>::new(b"stapling-leaf", b"nonce", &[]);
+        let leaf_key = Ed25519PrivateKey::generate(&mut rng);
+        let leaf_seed = [0u8; 32];
+        let leaf = Certificate::issue_general(
+            &CertSigner::Rsa(
+                &BoxedRsaPrivateKey::from_pkcs1_der(&ca_key.to_pkcs1_der()).unwrap(),
+            ),
+            &ca_name,
+            &DistinguishedName::common_name("loopback.example"),
+            &crate::x509::AnyPublicKey::Ed25519(leaf_key.public_key()),
+            &validity,
+            7, // leaf serial = 7
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+
+        let chain = alloc::vec![leaf.to_der().to_vec(), root.to_der().to_vec()];
+        let cfg = ServerConfig::with_ed25519(chain, leaf_key);
+        (cfg, root.to_der().to_vec(), leaf.to_der().to_vec(), leaf_seed)
+    }
+
+    /// Server staples a CRL that does NOT revoke the leaf → handshake
+    /// completes (the CRL is consulted but is_revoked returns false).
+    #[test]
+    fn stapled_crl_no_revocation() {
+        use crate::x509::{CrlBuilder, DistinguishedName};
+        let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_name = DistinguishedName::common_name("Stapling Test CA");
+        // Empty CRL.
+        let signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let crl = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .sign(&signer)
+            .unwrap();
+        server_config = server_config.with_stapled_crl(crl.to_der().to_vec());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"staple-ok-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"staple-ok-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+    }
+
+    /// Server staples a CRL that DOES revoke the leaf → client rejects
+    /// the handshake with `BadCertificate`.
+    #[test]
+    fn stapled_crl_revokes_leaf() {
+        use crate::x509::{CrlBuilder, DistinguishedName};
+        let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_name = DistinguishedName::common_name("Stapling Test CA");
+        // Revoke the leaf's serial (7).
+        let signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[7], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&signer).unwrap();
+        server_config = server_config.with_stapled_crl(crl.to_der().to_vec());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"staple-rev-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"staple-rev-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::BadCertificate
+        );
+    }
+
+    /// Without `with_stapled_crl` the server emits no extension and the
+    /// handshake is identical to a non-CRL setup (regression guard).
+    #[test]
+    fn no_staple_handshake_unchanged() {
+        let (server_config, root_der, _leaf, _seed) = ca_signed_ed25519_leaf();
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"staple-none-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"staple-none-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+    }
+
+    /// With `verify_certificates = false` the stapled CRL is ignored
+    /// (no enforcement). Even when the staple would revoke the leaf, the
+    /// handshake completes.
+    #[test]
+    fn stapled_crl_skipped_when_verification_disabled() {
+        use crate::x509::{CrlBuilder, DistinguishedName};
+        let (mut server_config, _root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_name = DistinguishedName::common_name("Stapling Test CA");
+        let signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[7], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&signer).unwrap();
+        server_config = server_config.with_stapled_crl(crl.to_der().to_vec());
+
+        let mut config = ClientConfig::new(RootCertStore::new());
+        config.verify_certificates = false;
+        let mut crng = HmacDrbg::<Sha256>::new(b"staple-noverify-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"staple-noverify-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+    }
 }
 
 #[cfg(test)]

@@ -156,6 +156,13 @@ pub struct ServerConfig {
     /// CRLs consulted when validating client-cert chains under mTLS. Empty
     /// by default; opt in via [`ServerConfig::with_crls`].
     crls: crate::tls::pki::CrlStore,
+    /// Optional DER-encoded CRL to staple as a per-certificate extension
+    /// on the leaf entry of the TLS 1.3 `Certificate` message
+    /// (purecrypto-private extension `0xFE10`). The client validates the
+    /// stapled CRL against the chain it just verified and consults it for
+    /// revocation. TLS 1.2 has no per-cert extension list in `Certificate`,
+    /// so stapling is silently dropped for TLS 1.2 servers.
+    stapled_crl: Option<Vec<u8>>,
 }
 
 impl ServerConfig {
@@ -175,6 +182,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -194,6 +202,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -213,6 +222,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -232,6 +242,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -251,6 +262,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -270,6 +282,7 @@ impl ServerConfig {
             client_auth: None,
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_crl: None,
         }
     }
 
@@ -286,6 +299,17 @@ impl ServerConfig {
     /// reject revoked certs, missing CRLs do not fail the chain.
     pub fn with_crls(mut self, crls: crate::tls::pki::CrlStore) -> Self {
         self.crls = crls;
+        self
+    }
+
+    /// Staples `crl_der` (a DER-encoded RFC 5280 `CertificateList`) on the
+    /// leaf cert in the TLS 1.3 `Certificate` message, via the private
+    /// extension `0xFE10`. The client validates the CRL against the chain
+    /// it received and treats it as a per-connection
+    /// [`crate::tls::pki::CrlStore`]. TLS 1.2 has no per-cert extension
+    /// list in its `Certificate` message; stapling is a TLS-1.3-only feature.
+    pub fn with_stapled_crl(mut self, crl_der: Vec<u8>) -> Self {
+        self.stapled_crl = Some(crl_der);
         self
     }
 
@@ -1045,9 +1069,19 @@ impl<R: RngCore> ServerConnection<R> {
         with_len_u24(&mut msg, |b| {
             b.push(0); // certificate_request_context: empty
             with_len_u24(b, |list| {
-                for cert in &self.config.cert_chain {
+                for (i, cert) in self.config.cert_chain.iter().enumerate() {
                     with_len_u24(list, |c| c.extend_from_slice(cert));
-                    with_len_u16(list, |_| {}); // per-certificate extensions
+                    // Per-certificate extensions: only the leaf (i == 0)
+                    // ever carries any. Today the sole opt-in extension is
+                    // the purecrypto-private CRL_RESPONSE staple.
+                    with_len_u16(list, |b| {
+                        if i == 0
+                            && let Some(crl) = &self.config.stapled_crl
+                        {
+                            crate::tls::codec::put_u16(b, ExtensionType::CRL_RESPONSE.0);
+                            crate::tls::codec::with_len_u16(b, |bb| bb.extend_from_slice(crl));
+                        }
+                    });
                 }
             });
         });

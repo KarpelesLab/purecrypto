@@ -139,5 +139,10 @@ u16_id!(
         /// never actually renegotiate; we only emit/expect the empty form.
         #[allow(dead_code)]
         RENEGOTIATION_INFO = 0xff01,
+        /// CRL stapling, a purecrypto private/experimental extension carried
+        /// as a per-certificate extension in the TLS 1.3 `Certificate` message
+        /// (RFC 8446 §4.4.2). Body: a DER-encoded RFC 5280 `CertificateList`
+        /// (CRL). The unassigned IANA code point `0xFE10` is used.
+        CRL_RESPONSE = 0xfe10,
     }
 );
