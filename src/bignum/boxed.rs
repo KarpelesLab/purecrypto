@@ -6,6 +6,7 @@
 //! certificate, whose modulus size varies. The fixed-size [`Uint`](super::Uint)
 //! remains the choice when the width is known at compile time.
 
+use super::mul::mac;
 use super::uint::{LIMB_BITS, Limb, adc, sbb};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use alloc::vec;
@@ -205,6 +206,66 @@ impl BoxedUint {
             }
         }
         BoxedUint::from_limbs(r)
+    }
+
+    /// Wrapping addition `self + other`, widened by one limb so no carry is
+    /// lost.
+    pub fn add(&self, other: &BoxedUint) -> BoxedUint {
+        let n = self.limbs.len().max(other.limbs.len());
+        let (mut sum, carry) = adc_limbs(&self.limbs_resized(n), &other.limbs_resized(n), 0);
+        sum.push(carry);
+        BoxedUint::from_limbs(sum)
+    }
+
+    /// Widening multiply `self * other` (schoolbook).
+    pub fn mul(&self, other: &BoxedUint) -> BoxedUint {
+        let a = &self.limbs;
+        let b = &other.limbs;
+        let mut out = vec![0 as Limb; a.len() + b.len()];
+        for (i, &ai) in a.iter().enumerate() {
+            let mut carry: Limb = 0;
+            for (j, &bj) in b.iter().enumerate() {
+                let (s, c) = mac(out[i + j], ai, bj, carry);
+                out[i + j] = s;
+                carry = c;
+            }
+            out[i + b.len()] = out[i + b.len()].wrapping_add(carry);
+        }
+        BoxedUint::from_limbs(out)
+    }
+
+    /// Whether `self < other` (not constant time).
+    pub fn lt(&self, other: &BoxedUint) -> bool {
+        let n = self.limbs.len().max(other.limbs.len());
+        let (_, borrow) = sbb_limbs(&self.limbs_resized(n), &other.limbs_resized(n), 0);
+        borrow == 1
+    }
+
+    /// Returns `(quotient, remainder)` for `self / divisor`, via bitwise long
+    /// division. The schedule depends only on the bit widths; `divisor` must be
+    /// nonzero.
+    pub fn divrem(&self, divisor: &BoxedUint) -> (BoxedUint, BoxedUint) {
+        let m = divisor.significant_limbs();
+        let d = divisor.limbs_resized(m);
+        let mut q = vec![0 as Limb; self.limbs.len()];
+        let mut r = vec![0 as Limb; m];
+        for i in (0..self.limbs.len()).rev() {
+            let mut bit = LIMB_BITS;
+            while bit > 0 {
+                bit -= 1;
+                // r = (r << 1) | next bit of self
+                let (mut shifted, carry) = adc_limbs(&r, &r, 0);
+                shifted[0] |= (self.limbs[i] >> bit) & 1;
+                let (diff, borrow) = sbb_limbs(&shifted, &d, 0);
+                let ge = Choice::from((carry | (borrow ^ 1)) as u8);
+                r = select_limbs(&diff, &shifted, ge);
+                // q = (q << 1) | quotient bit
+                let (mut q_shifted, _) = adc_limbs(&q, &q, 0);
+                q_shifted[0] |= ge.unwrap_u8() as Limb;
+                q = q_shifted;
+            }
+        }
+        (BoxedUint::from_limbs(q), BoxedUint::from_limbs(r))
     }
 
     /// Constant-time select: returns `a` if `choice` is true, else `b` (operands
