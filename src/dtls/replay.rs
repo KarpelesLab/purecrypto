@@ -18,11 +18,6 @@
 //! `highest` to whatever value arrives. This matches both the RFC 4303
 //! convention and how OpenSSL initializes its DTLS anti-replay state.
 //!
-//! The consumer (DTLS receive path in commits 10 and 14) is added later, so
-//! the items below are `#[allow(dead_code)]` for now.
-
-#![allow(dead_code)]
-
 /// Width of the sliding window. RFC 4303 §3.4.3 mandates ≥32; 64 is the
 /// canonical choice (one `u64`) and matches OpenSSL.
 pub(crate) const WINDOW_BITS: u64 = 64;

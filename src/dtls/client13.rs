@@ -169,6 +169,9 @@ pub struct DtlsClientConnection13 {
     enc_write_seq: u64,
     /// Highest read seq seen, for sequence-number reconstruction.
     enc_read_seq: u64,
+    /// RFC 9147 §4.5.1 anti-replay window for the current read epoch. Reset
+    /// at every epoch transition.
+    read_replay: crate::dtls::replay::AntiReplayWindow,
 
     /// Random + key material.
     x25519: X25519PrivateKey,
@@ -246,6 +249,7 @@ impl DtlsClientConnection13 {
             enc_write_epoch: 0,
             enc_write_seq: 0,
             enc_read_seq: 0,
+            read_replay: crate::dtls::replay::AntiReplayWindow::new(),
             x25519,
             client_random,
             server_random: None,
@@ -442,6 +446,11 @@ impl DtlsClientConnection13 {
         let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
         let (inner_type, plain) = decrypt_dtls13_record(crypter, read_epoch, seq, &aad, ct_body)?;
 
+        // RFC 9147 §4.5.1: anti-replay window — drop duplicates and stale
+        // sequence numbers even though the AEAD already verified them.
+        if !self.read_replay.accept(seq) {
+            return Ok(consumed);
+        }
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
@@ -588,6 +597,7 @@ impl DtlsClientConnection13 {
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
+        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
 
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
@@ -809,6 +819,7 @@ impl DtlsClientConnection13 {
         self.enc_write_epoch = 3;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
+        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
 
         self.state = State::Connected;
         Ok(())

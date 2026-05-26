@@ -146,6 +146,21 @@ struct PartialMessage {
     received_count: u32,
 }
 
+/// Upper bound on a single handshake message's `total_length`. RFC 6347 /
+/// 9147 don't dictate one, but real-world handshake bodies are well under
+/// 256 KiB even with PQC certificate chains and ML-DSA signatures (~50 KB
+/// SLH-DSA signatures push the high end). Capping prevents a hostile peer
+/// from claiming `total_length = 16 MiB` and triggering a multi-MiB
+/// allocation per message_seq.
+const MAX_MESSAGE_LEN: u32 = 256 * 1024;
+
+/// Upper bound on the number of distinct `message_seq` values held in the
+/// in-progress map. RFC allows up to 65 535; an attacker emitting one
+/// fragment for each would otherwise pin tens of GiB of allocations. Eight
+/// concurrent in-flight messages is more than any legitimate handshake
+/// flight needs.
+const MAX_IN_PROGRESS: usize = 8;
+
 /// Handshake-message reassembler. Tracks one in-flight reassembly per
 /// outstanding `message_seq` and gates dispatch on the next-expected
 /// sequence number.
@@ -177,6 +192,16 @@ impl Reassembler {
         // Drop old fragments outright; they belong to a message we already
         // dispatched.
         if frag.message_seq < self.expected_msg_seq {
+            return None;
+        }
+        // Reject implausibly large messages and out-of-budget concurrency
+        // (memory-DoS protection).
+        if frag.total_length > MAX_MESSAGE_LEN {
+            return None;
+        }
+        if !self.in_progress.contains_key(&frag.message_seq)
+            && self.in_progress.len() >= MAX_IN_PROGRESS
+        {
             return None;
         }
 

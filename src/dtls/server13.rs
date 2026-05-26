@@ -144,6 +144,10 @@ pub struct DtlsServerConnection13<R: RngCore> {
     enc_write_epoch: u16,
     enc_write_seq: u64,
     enc_read_seq: u64,
+    /// RFC 9147 §4.5.1 anti-replay window for the current read epoch.
+    /// Reset at every epoch transition. Required: an attacker who captures
+    /// any encrypted record can otherwise replay it indefinitely.
+    read_replay: crate::dtls::replay::AntiReplayWindow,
 
     /// Ephemeral X25519 key.
     x25519: Option<X25519PrivateKey>,
@@ -196,6 +200,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             enc_write_epoch: 0,
             enc_write_seq: 0,
             enc_read_seq: 0,
+            read_replay: crate::dtls::replay::AntiReplayWindow::new(),
             x25519: None,
             client_random: None,
             server_random: None,
@@ -344,6 +349,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
         let (inner_type, plain) = decrypt_dtls13_record(crypter, read_epoch, seq, &aad, ct_body)?;
+        // RFC 9147 §4.5.1: drop duplicates and too-old records via the
+        // sliding-window filter. The AEAD already verified the record, but
+        // an attacker can replay any verified record indefinitely unless
+        // we filter at this layer.
+        if !self.read_replay.accept(seq) {
+            return Ok(consumed);
+        }
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
@@ -468,7 +480,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 .as_ref()
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
-            let cookie = cg.generate(&self.peer_addr, &ch.random);
+            let now_min = (self.last_now.as_secs() / 60) as u32;
+            let cookie = cg.generate(&self.peer_addr, &ch.random, now_min);
             // Transcript: per RFC 8446 §4.4.1, when HRR is in play, the
             // transcript replaces CH1 with `message_hash(CH1)`. We compute
             // CH1's hash NOW (before transcript update), emit HRR, then
@@ -526,7 +539,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 return Err(Error::Decode);
             }
             let cookie = &cookie_bytes[2..];
-            if !cg.validate(&self.peer_addr, &ch.random, cookie) {
+            let now_min = (self.last_now.as_secs() / 60) as u32;
+            if !cg.validate(&self.peer_addr, &ch.random, now_min, cookie) {
                 return Err(Error::IllegalParameter);
             }
             // CH2 transcript: replace CH1 with message_hash(CH1) (already
@@ -647,6 +661,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
+        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
@@ -799,6 +814,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.enc_write_epoch = 3;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
+        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
         self.state = State::Connected;
         Ok(())
     }
