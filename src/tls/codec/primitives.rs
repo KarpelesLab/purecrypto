@@ -76,8 +76,16 @@ u16_id!(
         ALPN = 0x0010,
         /// record_size_limit (RFC 8449).
         RECORD_SIZE_LIMIT = 0x001c,
+        /// pre_shared_key (RFC 8446 §4.2.11).
+        PRE_SHARED_KEY = 0x0029,
+        /// early_data (RFC 8446 §4.2.10). Empty body in CH/EE; carries a
+        /// `uint32 max_early_data_size` in NewSessionTicket.
+        EARLY_DATA = 0x002a,
         /// supported_versions.
         SUPPORTED_VERSIONS = 0x002b,
+        /// psk_key_exchange_modes (RFC 8446 §4.2.9). Body: a `u8`-length list
+        /// of mode bytes (0 = psk_ke, 1 = psk_dhe_ke).
+        PSK_KEY_EXCHANGE_MODES = 0x002d,
         /// key_share.
         KEY_SHARE = 0x0033,
     }

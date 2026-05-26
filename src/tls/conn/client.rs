@@ -10,16 +10,18 @@
 use super::common::{ConnectionCore, Incoming};
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
+use crate::hash::{Hmac, Sha256, Sha384};
 use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, KeyUpdate, NamedGroup, NewSessionTicket as NstWire, Random,
-    ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake,
+    CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket as NstWire,
+    Random, ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake,
 };
 use crate::tls::crypto::{
-    KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, lookup_suite, next_traffic_secret, tls_exporter, verify_signature,
+    HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
+    certificate_verify_content, finished_verify_data, lookup_suite, next_traffic_secret,
+    psk_from_resumption, tls_exporter, verify_signature,
 };
 use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
 use crate::tls::{AlertDescription, Error};
@@ -49,6 +51,11 @@ pub struct ClientConfig {
     /// fragment the server may send us. `None` suppresses the extension; the
     /// peer is then free to use the TLS 1.3 default of 2¹⁴ bytes.
     pub record_size_limit: Option<u16>,
+    /// A previously stored session for PSK resumption (RFC 8446 §2.2 / §4.2.11).
+    /// When set, the ClientHello carries `pre_shared_key` and
+    /// `psk_key_exchange_modes`; on acceptance the handshake uses the resumed
+    /// PSK combined with ECDHE (`psk_dhe_ke`).
+    pub session: Option<StoredSession>,
 }
 
 impl ClientConfig {
@@ -61,6 +68,7 @@ impl ClientConfig {
             verification_time: None,
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            session: None,
         }
     }
 
@@ -78,6 +86,45 @@ impl ClientConfig {
         self.record_size_limit = Some(limit);
         self
     }
+
+    /// Primes the next handshake to attempt PSK session resumption against
+    /// `session`. The session's cipher-suite hash fixes which suites can be
+    /// offered (only suites matching that hash will be sent).
+    pub fn with_session(mut self, session: StoredSession) -> Self {
+        self.session = Some(session);
+        self
+    }
+}
+
+/// A resumable session, returned by [`ClientConnection::take_session`] after a
+/// completed handshake. Pass it back via [`ClientConfig::with_session`] to
+/// attempt PSK resumption on the next connection to the same server.
+#[derive(Clone, Debug)]
+pub struct StoredSession {
+    /// The server we connected to (used to scope sessions in the caller's
+    /// cache; the wire identity is the ticket bytes alone).
+    pub server_name: String,
+    /// The ticket bytes (`identity` in the wire format), to be re-presented in
+    /// the next ClientHello.
+    pub ticket: Vec<u8>,
+    /// The PSK derived from `resumption_master_secret` and the ticket's nonce.
+    pub psk: Vec<u8>,
+    /// Randomizer the server added; XORed into the reported ticket age to
+    /// avoid linkability across resumptions.
+    pub age_add: u32,
+    /// Lifetime hint, in seconds; the ticket should not be used past this
+    /// many seconds after `received_at`.
+    pub lifetime_seconds: u32,
+    /// Wall-clock time the NewSessionTicket arrived (for age computation).
+    pub received_at: Time,
+    /// `max_early_data_size` from the ticket, when the server advertised
+    /// 0-RTT capability.
+    pub max_early_data_size: Option<u32>,
+    /// ALPN protocol negotiated on the originating connection, if any.
+    pub negotiated_alpn: Option<Vec<u8>>,
+    /// Hash function of the original cipher suite (PSK binders and key
+    /// schedule are tied to it).
+    pub cipher_suite_hash: HashAlg,
 }
 
 /// The current time from the system clock, when available.
@@ -153,6 +200,33 @@ pub struct ClientConnection {
     /// The ALPN protocol the server picked from our advertised list, if any.
     /// Populated from the server's `EncryptedExtensions`.
     alpn_negotiated: Option<Vec<u8>>,
+
+    /// PSK we offered in CH (if `config.session` was set). When the server
+    /// echoes `pre_shared_key` in SH with `selected_identity = 0`, we
+    /// seed the key schedule from this PSK.
+    psk_offered: Option<PskOfferState>,
+    /// Set to `true` if the server accepted our PSK offer. Drives the
+    /// resumption-specific code paths after SH.
+    psk_accepted: bool,
+    /// Wall-clock time at which the handshake started (used as the wall clock
+    /// for the resulting [`StoredSession::received_at`]).
+    handshake_start: Option<Time>,
+    /// The most recent session built from a NewSessionTicket — ready to be
+    /// moved out via [`Self::take_session`].
+    stored_session: Option<StoredSession>,
+    /// `resumption_master_secret`, computed at our Finished. Future
+    /// NewSessionTicket messages derive their PSK from this.
+    rms: Option<Secret>,
+}
+
+/// What the client retains across CH emission so it can verify the server's
+/// PSK selection and seed the key schedule when the PSK is accepted.
+struct PskOfferState {
+    /// The PSK bytes (derived from a prior session's
+    /// `resumption_master_secret`).
+    psk: Vec<u8>,
+    /// The hash function fixed by the original session's cipher suite.
+    hash: HashAlg,
 }
 
 /// A `NewSessionTicket` received from the server, exposed for inspection and
@@ -238,6 +312,24 @@ impl ClientConnection {
         self.last_ticket.as_ref()
     }
 
+    /// Moves out the latest [`StoredSession`] suitable for PSK resumption on
+    /// the next connection to the same server. Returns `None` if no ticket
+    /// was received from the peer (or has already been taken).
+    ///
+    /// Combine with [`ClientConfig::with_session`] to drive resumption:
+    /// store the value in your session cache, then pass it back at the start
+    /// of the next handshake.
+    pub fn take_session(&mut self) -> Option<StoredSession> {
+        self.stored_session.take()
+    }
+
+    /// Whether the server accepted our PSK offer in the just-completed
+    /// handshake. Always `false` for a fresh connection; `true` only when
+    /// `ClientConfig::with_session` was used and the server selected the PSK.
+    pub fn psk_accepted(&self) -> bool {
+        self.psk_accepted
+    }
+
     /// The ALPN protocol the server selected, if any (e.g. `b"h2"`).
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
@@ -296,6 +388,19 @@ impl ClientConnection {
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
 
+        // If resuming, restrict the cipher-suite offer to suites whose hash
+        // matches the session's. The PSK binder and handshake key schedule
+        // are tied to that hash.
+        let session_hash = config.session.as_ref().map(|s| s.cipher_suite_hash);
+        let effective_suites: Vec<CipherSuite> = match session_hash {
+            Some(h) => suites
+                .iter()
+                .copied()
+                .filter(|s| suite_hash(*s) == Some(h))
+                .collect(),
+            None => suites.to_vec(),
+        };
+
         let mut conn = ClientConnection {
             core: ConnectionCore::new(),
             config,
@@ -305,7 +410,7 @@ impl ClientConnection {
             p256,
             mlkem,
             client_random: random,
-            offered_suites: suites.to_vec(),
+            offered_suites: effective_suites.clone(),
             offered_groups: groups.to_vec(),
             hrr_processed: false,
             suite: None,
@@ -319,9 +424,28 @@ impl ClientConnection {
             leaf_key: None,
             last_ticket: None,
             alpn_negotiated: None,
+            psk_offered: None,
+            psk_accepted: false,
+            handshake_start: system_now(),
+            stored_session: None,
+            rms: None,
         };
-        let hello =
-            conn.build_client_hello(random, String::from(server_name), suites, groups, &[], &[]);
+        // Remember the offered PSK so we can seed the schedule when the
+        // server selects it in SH.
+        if let Some(session) = conn.config.session.as_ref() {
+            conn.psk_offered = Some(PskOfferState {
+                psk: session.psk.clone(),
+                hash: session.cipher_suite_hash,
+            });
+        }
+        let hello = conn.build_client_hello(
+            random,
+            String::from(server_name),
+            &effective_suites,
+            groups,
+            &[],
+            &[],
+        );
         conn.core.emit_handshake(hello);
         conn
     }
@@ -330,6 +454,12 @@ impl ClientConnection {
     /// get a `key_share` entry (used for HRR retry, where the server picked a
     /// specific group); if empty, all `groups` get one. `extra_extensions`
     /// (typically the HRR-supplied `cookie`) are appended verbatim.
+    ///
+    /// When `self.config.session` carries a resumption ticket, also adds
+    /// `psk_key_exchange_modes` and a `pre_shared_key` extension whose binder
+    /// is computed over the truncated ClientHello and patched in place. The
+    /// returned bytes are ready to emit to the wire and to feed to the
+    /// transcript.
     fn build_client_hello(
         &self,
         random: Random,
@@ -380,13 +510,53 @@ impl ClientConnection {
             extensions.push(ext::record_size_limit(limit));
         }
         extensions.extend_from_slice(extra_extensions);
-        ClientHello {
+
+        // PSK resumption: psk_key_exchange_modes + pre_shared_key (must be
+        // last). The binder is patched after we know the truncated CH bytes.
+        let mut psk_binder_info: Option<(HashAlg, Vec<u8>, usize)> = None;
+        if let Some(session) = &self.config.session {
+            extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
+
+            let hash = session.cipher_suite_hash;
+            let hash_len = hash.output_len();
+            let age = self.compute_obfuscated_age(session);
+            let (ext_with_zeros, binders_len) =
+                ext::client_pre_shared_key_placeholder(&[(session.ticket.clone(), age)], hash_len);
+            extensions.push(ext_with_zeros);
+            psk_binder_info = Some((hash, session.psk.clone(), binders_len));
+        }
+
+        let mut bytes = ClientHello {
             random,
             session_id: Vec::new(),
             cipher_suites: suites.to_vec(),
             extensions,
         }
-        .encode()
+        .encode();
+
+        // Patch the binder: HMAC(binder_finished_key, Hash(truncated_CH)).
+        if let Some((hash, psk, binders_len)) = psk_binder_info {
+            let truncated_len = bytes.len().saturating_sub(binders_len);
+            patch_psk_binder(&mut bytes, truncated_len, hash, &psk);
+        }
+        bytes
+    }
+
+    /// Computes the obfuscated ticket age (RFC 8446 §4.2.11.1): elapsed
+    /// milliseconds since the ticket was issued, plus `ticket_age_add`,
+    /// modulo 2^32.
+    fn compute_obfuscated_age(&self, session: &StoredSession) -> u32 {
+        let elapsed_ms = self
+            .handshake_start
+            .as_ref()
+            .map(|now| {
+                let now_s = now.to_unix();
+                let then_s = session.received_at.to_unix();
+                now_s.saturating_sub(then_s).saturating_mul(1000)
+            })
+            .unwrap_or(0);
+        let elapsed_ms_u32 = elapsed_ms as u32;
+        elapsed_ms_u32.wrapping_add(session.age_add)
     }
 
     /// Feeds received TLS bytes.
@@ -493,7 +663,31 @@ impl ClientConnection {
         match msg_type {
             hs_type::NEW_SESSION_TICKET => {
                 let nst = NstWire::decode(body)?;
-                self.last_ticket = Some(ReceivedSessionTicket::from_wire(nst)?);
+                let received = ReceivedSessionTicket::from_wire(nst.clone())?;
+                self.last_ticket = Some(received.clone());
+
+                // Derive the PSK and build a StoredSession ready for the next
+                // connection. Requires `resumption_master_secret` (set when our
+                // Finished completed) and the negotiated suite hash.
+                if let (Some(rms), Some(suite)) = (self.rms.as_ref(), self.suite) {
+                    let hash_len = suite.hash.output_len();
+                    let mut psk = alloc::vec![0u8; hash_len];
+                    psk_from_resumption(suite.hash, rms, &nst.ticket_nonce, &mut psk);
+                    let received_at = system_now()
+                        .or_else(|| self.handshake_start.clone())
+                        .unwrap_or_else(|| Time::from_unix(0));
+                    self.stored_session = Some(StoredSession {
+                        server_name: self.server_name.clone(),
+                        ticket: received.ticket.clone(),
+                        psk,
+                        age_add: received.age_add,
+                        lifetime_seconds: received.lifetime_seconds,
+                        received_at,
+                        max_early_data_size: received.max_early_data_size,
+                        negotiated_alpn: self.alpn_negotiated.clone(),
+                        cipher_suite_hash: suite.hash,
+                    });
+                }
                 Ok(())
             }
             hs_type::KEY_UPDATE => self.handle_key_update(body),
@@ -602,8 +796,26 @@ impl ClientConnection {
         let (group, server_pub) = ext::parse_server_key_share(ks_ext)?;
         let shared = self.key_agreement(group, &server_pub)?;
 
-        // Enter the handshake stage and derive the handshake traffic secrets.
-        let mut ks = KeySchedule::new(suite.hash);
+        // PSK acceptance: if the server echoes pre_shared_key in SH with
+        // `selected_identity = 0`, seed the schedule from the offered PSK
+        // instead of all-zeros. Suite hash must match the offered PSK's hash.
+        let mut ks =
+            if let Some(psk_body) = ext::find(&sh.extensions, ExtensionType::PRE_SHARED_KEY) {
+                let idx = ext::parse_server_pre_shared_key(psk_body)?;
+                let offered = self.psk_offered.as_ref().ok_or(Error::IllegalParameter)?;
+                // We only offer one identity; the server must select index 0.
+                if idx != 0 {
+                    return Err(Error::IllegalParameter);
+                }
+                // The hash of the selected suite must match the offered PSK's hash.
+                if suite.hash != offered.hash {
+                    return Err(Error::IllegalParameter);
+                }
+                self.psk_accepted = true;
+                KeySchedule::with_psk(suite.hash, &offered.psk)
+            } else {
+                KeySchedule::new(suite.hash)
+            };
         ks.enter_handshake(shared.as_slice());
         let th = self.core.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
@@ -778,7 +990,14 @@ impl ClientConnection {
             }
         }
         self.core.transcript.update(raw);
-        self.state = State::WaitCertificate;
+        // Under PSK resumption (RFC 8446 §4.6.1) the server skips
+        // Certificate / CertificateVerify and the client jumps straight to
+        // expecting Finished.
+        self.state = if self.psk_accepted {
+            State::WaitFinished
+        } else {
+            State::WaitCertificate
+        };
         Ok(())
     }
 
@@ -868,6 +1087,13 @@ impl ClientConnection {
         let finished = build_finished(verify_data.as_slice());
         self.core.emit_handshake(finished);
 
+        // Derive resumption_master_secret over Hash(CH..client Finished). The
+        // PSK for a future ticket is `HKDF-Expand-Label(rms, "resumption",
+        // nonce)`; we stash RMS now so that any NewSessionTicket that arrives
+        // post-handshake can derive its PSK from this final transcript.
+        let th_rms = self.core.transcript.current_hash();
+        self.rms = Some(ks.resumption_master_secret(th_rms.as_slice()));
+
         // Switch to application traffic keys.
         self.core.set_write(RecordCrypter::new(
             suite.hash,
@@ -906,8 +1132,43 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
+        Error::DecryptError => AlertDescription::DecryptError,
         _ => AlertDescription::HandshakeFailure,
     }
+}
+
+/// Returns the hash function fixed by a cipher suite, if we recognize the
+/// suite identifier.
+fn suite_hash(s: CipherSuite) -> Option<HashAlg> {
+    lookup_suite(s).map(|p| p.hash)
+}
+
+/// Patches a single PSK binder into the ClientHello bytes built by
+/// [`ClientConnection::build_client_hello`].
+///
+/// `ch[..truncated_len]` is the truncated CH (everything before the
+/// `pre_shared_key` binders field). The remaining `ch[truncated_len..]` is
+/// the binders field laid out as `u16 outer_len ‖ u8 inner_len ‖ binder_bytes`,
+/// where `binder_bytes` is currently `hash_len` zeros. The function computes
+/// `binder = HMAC(binder_finished_key(binder_key("res binder")),
+/// Transcript-Hash(truncated_CH))` and overwrites the trailing `hash_len`
+/// bytes of `ch` in place.
+fn patch_psk_binder(ch: &mut [u8], truncated_len: usize, hash: HashAlg, psk: &[u8]) {
+    let hash_len = hash.output_len();
+    let ks = KeySchedule::with_psk(hash, psk);
+    let res_bk = ks.binder_key(b"res binder");
+    let fk = binder_finished_key(hash, &res_bk);
+    let th = hash.hash(&ch[..truncated_len]);
+    let binder: Vec<u8> = match hash {
+        HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec(),
+        HashAlg::Sha384 => Hmac::<Sha384>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec(),
+    };
+    let start = ch.len() - hash_len;
+    ch[start..].copy_from_slice(&binder);
 }
 
 /// The HelloRetryRequest sentinel `ServerHello.random` (RFC 8446 §4.1.3):

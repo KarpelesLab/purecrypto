@@ -42,6 +42,20 @@ impl Time {
         )
     }
 
+    /// Converts the time to a Unix timestamp (seconds since 1970-01-01 UTC).
+    /// Returns 0 if the stored representation is malformed or predates the
+    /// Unix epoch.
+    pub fn to_unix(&self) -> u64 {
+        let Some((y, m, d, hh, mm, ss)) = self.components() else {
+            return 0;
+        };
+        let days = days_from_civil(y as i64, m, d);
+        if days < 0 {
+            return 0;
+        }
+        (days as u64) * 86_400 + (hh as u64) * 3600 + (mm as u64) * 60 + ss as u64
+    }
+
     /// The raw ASN.1 time string (e.g. `"240131120000Z"`).
     pub fn as_str(&self) -> &str {
         &self.repr
@@ -108,6 +122,19 @@ fn two(b: &[u8], i: usize) -> Option<u8> {
 fn push2(s: &mut String, v: u8) {
     s.push((b'0' + (v / 10) % 10) as char);
     s.push((b'0' + v % 10) as char);
+}
+
+/// Converts `(year, month, day)` to a day count since 1970-01-01 using Howard
+/// Hinnant's `days_from_civil` algorithm.
+fn days_from_civil(year: i64, month: u8, day: u8) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = month as i64;
+    let d = day as i64;
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 /// Converts a day count (days since 1970-01-01) to `(year, month, day)` using
@@ -197,6 +224,20 @@ mod tests {
         assert_eq!(Time::from_unix(1_609_459_200).as_str(), "210101000000Z");
         // 2024-02-29 (leap day) 23:59:59 UTC = 1709251199.
         assert_eq!(Time::from_unix(1_709_251_199).as_str(), "240229235959Z");
+    }
+
+    #[test]
+    fn to_unix_roundtrips() {
+        // UTCTime's two-digit year convention pins YY < 50 to 20YY and
+        // YY >= 50 to 19YY, so the round-trip is only well defined inside
+        // 2000-01-01 .. 2049-12-31 UTC.
+        for &s in &[0u64, 1_609_459_200, 1_709_251_199] {
+            assert_eq!(Time::from_unix(s).to_unix(), s, "roundtrip fails for {s}");
+        }
+        // GeneralizedTime path: 4-digit year reaches beyond the UTCTime
+        // window.
+        assert_eq!(Time::from_repr("20210101000000Z").to_unix(), 1_609_459_200);
+        assert_eq!(Time::from_repr("20500101000000Z").to_unix(), 2_524_608_000);
     }
 
     #[test]

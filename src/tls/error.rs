@@ -140,6 +140,9 @@ pub enum Error {
     /// The peer's ALPN list contains nothing acceptable. Maps to
     /// `no_application_protocol` (RFC 7301).
     NoApplicationProtocol,
+    /// A PSK binder failed to verify, or another signed handshake-context
+    /// authenticator was invalid. Maps to `decrypt_error` (RFC 8446 §6).
+    DecryptError,
 }
 
 impl core::fmt::Display for Error {
@@ -158,6 +161,7 @@ impl core::fmt::Display for Error {
             Error::RecordOverflow => f.write_str("TLS record-size limit exceeded"),
             Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
             Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
+            Error::DecryptError => f.write_str("TLS handshake decrypt error (binder/MAC)"),
         }
     }
 }

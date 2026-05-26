@@ -23,9 +23,11 @@ mod version;
 
 pub use conn::{
     ClientConfig, ClientConnection, ReceivedSessionTicket, ServerConfig, ServerConnection,
+    StoredSession,
 };
 #[cfg(feature = "std")]
 pub use conn::{Connection, Stream};
+pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::RootCertStore;
 pub use version::{ContentType, ProtocolVersion};
