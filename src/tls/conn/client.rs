@@ -1,3 +1,8 @@
+// Many methods/fields on the internal `ClientConfig` / `StoredSession` /
+// `ClientCertConfig` builders are reachable only through the unified
+// `tls::Config` façade now; silence the dead-code lint here.
+#![allow(dead_code, unreachable_pub)]
+
 //! The TLS 1.3 client handshake state machine.
 //!
 //! [`ClientConnection`] drives a full 1-RTT client handshake over the sans-I/O
@@ -152,7 +157,10 @@ impl ClientCertConfig {
 }
 
 /// Configuration for a TLS client.
-pub struct ClientConfig {
+///
+/// `pub(crate)`: external users build a [`crate::tls::Config`] and call
+/// [`crate::tls::Connection::client`], which derives this internal config.
+pub(crate) struct ClientConfig {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
     /// When `false`, the certificate chain, validity period, and host name are

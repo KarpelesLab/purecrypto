@@ -9,18 +9,18 @@ mod server12;
 mod stream;
 mod ticket12;
 
+pub(crate) use client::ClientConfig;
 #[allow(unused_imports)]
-pub use client::{
-    ClientCertConfig, ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession,
-};
-pub use client12::{ClientConfig12, ClientConnection12, StoredSession12};
+pub(crate) use client::{ClientCertConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
+pub(crate) use client12::ClientConfig12;
+pub(crate) use client12::ClientConnection12;
 #[cfg(feature = "std")]
-pub use server::ReplayWindow;
+pub(crate) use server::ReplayWindow;
 #[allow(unused_imports)]
-pub use server::{ClientAuthPolicy, ServerConfig, ServerConnection};
-pub use server12::{ClientAuthPolicy12, ServerConfig12, ServerConnection12};
-#[cfg(feature = "std")]
-pub use stream::{Connection, Stream};
+pub(crate) use server::ServerConnection;
+pub(crate) use server::{ServerConfig, ServerKey};
+pub(crate) use server12::ServerConfig12;
+pub(crate) use server12::ServerConnection12;
 
 #[cfg(test)]
 mod loopback_tests {
@@ -30,8 +30,9 @@ mod loopback_tests {
     use crate::rng::HmacDrbg;
     use crate::rsa::BoxedRsaPrivateKey;
     use crate::test_util::rsa_test_key_a;
+    use crate::tls::RootCertStore;
     use crate::tls::codec::{CipherSuite, NamedGroup};
-    use crate::tls::{ClientConfig, RootCertStore};
+    use crate::tls::conn::ClientConfig;
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
     use alloc::vec::Vec;
 

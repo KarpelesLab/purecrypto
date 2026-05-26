@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! DTLS 1.3 client state machine (RFC 9147).
 //!
 //! Mirrors the TLS 1.3 client handshake flow (`TLS_AES_128_GCM_SHA256`,
@@ -70,7 +72,7 @@ const DEFAULT_MAX_FRAGMENT: usize = 1100;
 const DEFAULT_MAX_RECORD_SIZE: usize = 1200;
 
 /// Configuration for a DTLS 1.3 client connection.
-pub struct DtlsClientConfig13 {
+pub(crate) struct ClientConfig13Internal {
     /// Trust anchors for the server's certificate chain.
     pub roots: RootCertStore,
     /// Hostname to verify in the leaf certificate. `None` disables hostname
@@ -93,7 +95,7 @@ pub struct DtlsClientConfig13 {
     pub crls: CrlStore,
 }
 
-impl DtlsClientConfig13 {
+impl ClientConfig13Internal {
     /// New configuration trusting `roots`, verifying certificates against
     /// `server_name`.
     pub fn new(roots: RootCertStore, server_name: &str) -> Self {
@@ -149,7 +151,7 @@ enum State {
 
 /// A DTLS 1.3 client connection.
 pub struct DtlsClientConnection13 {
-    config: DtlsClientConfig13,
+    config: ClientConfig13Internal,
     /// Caller-supplied opaque peer-address bytes — not used by the client
     /// (we just echo cookies the server gives us).
     #[allow(dead_code)]
@@ -240,7 +242,11 @@ pub struct DtlsClientConnection13 {
 impl DtlsClientConnection13 {
     /// Creates a fresh client and emits the first ClientHello. The RNG
     /// supplies the ephemeral X25519 key and client random.
-    pub fn new<R: RngCore>(config: DtlsClientConfig13, peer_addr: Vec<u8>, rng: &mut R) -> Self {
+    pub(crate) fn new<R: RngCore>(
+        config: ClientConfig13Internal,
+        peer_addr: Vec<u8>,
+        rng: &mut R,
+    ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);

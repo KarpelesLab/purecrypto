@@ -23,10 +23,14 @@ pub(crate) mod replay;
 pub mod server12;
 pub mod server13;
 
-pub use client12::{DtlsClientConfig12, DtlsClientConnection12};
-pub use client13::{DtlsClientConfig13, DtlsClientConnection13};
-pub use server12::{DtlsServerConfig12, DtlsServerConnection12};
-pub use server13::{DtlsServerConfig13, DtlsServerConnection13};
+pub(crate) use client12::ClientConfig12Internal;
+pub use client12::DtlsClientConnection12;
+pub(crate) use client13::ClientConfig13Internal;
+pub use client13::DtlsClientConnection13;
+pub use server12::DtlsServerConnection12;
+pub(crate) use server12::ServerConfig12Internal;
+pub use server13::DtlsServerConnection13;
+pub(crate) use server13::ServerConfig13Internal;
 
 #[cfg(test)]
 mod tests;

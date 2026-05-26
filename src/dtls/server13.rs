@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! DTLS 1.3 server state machine (RFC 9147).
 //!
 //! Mirror of [`super::client13::DtlsClientConnection13`]. The server:
@@ -23,7 +25,6 @@
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
-use crate::hash::Sha256;
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
@@ -31,6 +32,7 @@ use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
     SignatureScheme, hs_type, with_len_u16, with_len_u24,
 };
+use crate::tls::crypto::sign::sign_certificate_verify;
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, RecordCrypter, Transcript, certificate_verify_content,
     finished_verify_data,
@@ -61,11 +63,16 @@ const EXT_COOKIE: u16 = 0x002C;
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
 /// Configuration for a DTLS 1.3 server.
-pub struct DtlsServerConfig13 {
+///
+/// `pub(crate)`: external users build a [`crate::tls::Config`] and call
+/// [`crate::tls::Connection::server`], which derives this internal config.
+pub(crate) struct ServerConfig13Internal {
     /// Certificate chain (leaf first).
     pub cert_chain: Vec<Vec<u8>>,
-    /// ECDSA signing key. (Other key types land in follow-up commits.)
-    pub key: BoxedEcdsaPrivateKey,
+    /// Signing key for the leaf certificate. Any of the
+    /// [`crate::tls::conn::ServerKey`] variants are accepted — RSA-PSS,
+    /// ECDSA (any curve), Ed25519, ML-DSA-44/65/87.
+    pub key: crate::tls::conn::ServerKey,
     /// Cookie secret. When `None`, the cookie exchange is skipped (tests
     /// only). A production configuration always sets this.
     pub cookie_secret: Option<[u8; 32]>,
@@ -80,10 +87,11 @@ pub struct DtlsServerConfig13 {
     pub signature_policy: Arc<SignaturePolicy>,
 }
 
-impl DtlsServerConfig13 {
-    /// New ECDSA-backed configuration. Cookie validation is required by
-    /// default; call [`Self::with_no_cookie`] to disable it for tests.
-    pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
+impl ServerConfig13Internal {
+    /// New configuration with an opaque signing key. Cookie validation is
+    /// required by default; call [`Self::with_no_cookie`] to disable it for
+    /// tests.
+    pub fn with_signing_key(cert_chain: Vec<Vec<u8>>, key: crate::tls::conn::ServerKey) -> Self {
         Self {
             cert_chain,
             key,
@@ -91,6 +99,13 @@ impl DtlsServerConfig13 {
             require_cookie: true,
             signature_policy: Arc::new(SignaturePolicy::modern()),
         }
+    }
+
+    /// Back-compat constructor that takes an ECDSA private key. Forwards to
+    /// [`Self::with_signing_key`].
+    #[allow(dead_code)]
+    pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
+        Self::with_signing_key(cert_chain, crate::tls::conn::ServerKey::Ecdsa(key))
     }
 
     /// Sets the long-lived cookie secret. Required when `require_cookie`
@@ -121,7 +136,7 @@ enum State {
 
 /// A DTLS 1.3 server connection.
 pub struct DtlsServerConnection13<R: RngCore> {
-    config: Arc<DtlsServerConfig13>,
+    config: Arc<ServerConfig13Internal>,
     rng: R,
 
     peer_addr: Vec<u8>,
@@ -183,7 +198,7 @@ pub struct DtlsServerConnection13<R: RngCore> {
 impl<R: RngCore> DtlsServerConnection13<R> {
     /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
     /// is the opaque identifier used by the cookie generator.
-    pub fn new(config: Arc<DtlsServerConfig13>, peer_addr: Vec<u8>, rng: R) -> Self {
+    pub(crate) fn new(config: Arc<ServerConfig13Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
         let mut t = Transcript::new();
         t.set_alg(HashAlg::Sha256);
         Self {
@@ -746,15 +761,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     fn send_certificate_verify(&mut self) -> Result<(), Error> {
         let th = self.transcript.current_hash();
         let content = certificate_verify_content(true, th.as_slice());
-        let curve = self.config.key.curve();
-        let scheme = ecdsa_scheme_for(curve);
-        let sig = match curve {
-            CurveId::P384 => self.config.key.sign::<crate::hash::Sha384>(&content),
-            CurveId::P521 => self.config.key.sign::<crate::hash::Sha512>(&content),
-            _ => self.config.key.sign::<Sha256>(&content),
-        }
-        .map_err(|_| Error::HandshakeFailure)?;
-        let sig_der = sig.to_der(curve);
+        let (scheme, sig_der) = sign_certificate_verify(&self.config.key, &content, &mut self.rng)?;
 
         let mut body = Vec::new();
         body.extend_from_slice(&scheme.0.to_be_bytes());

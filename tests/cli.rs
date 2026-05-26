@@ -309,9 +309,8 @@ fn ca_subcommand_full_flow() {
 
 #[test]
 fn s_client_loopback() {
-    use purecrypto::rng::OsRng;
     use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
-    use purecrypto::tls::{ServerConfig, ServerConnection, Stream};
+    use purecrypto::tls::{Config, Connection, HandshakeStatus, SigningKey};
     use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
     use std::net::TcpListener;
 
@@ -336,14 +335,39 @@ fn s_client_loopback() {
         )
         .unwrap();
         let key = BoxedRsaPrivateKey::from_pkcs1_pem(KEY).unwrap();
-        let config = ServerConfig::with_rsa(vec![cert.to_der().to_vec()], key);
-        let mut conn = ServerConnection::new(config, OsRng);
-        let mut tls = Stream::new(&mut conn, &mut sock);
-        tls.complete_handshake().expect("server handshake");
-        let mut buf = [0u8; 64];
-        let _ = tls.read(&mut buf); // the client's "PING"
-        tls.write_all(b"PONG").unwrap();
-        tls.flush().unwrap();
+        let cfg = Config::builder()
+            .tls_only()
+            .identity(vec![cert.to_der().to_vec()], SigningKey::Rsa(key))
+            .build();
+        let mut conn = Connection::server(&cfg).expect("server config");
+        // Drive handshake.
+        let mut read_buf = [0u8; 8192];
+        loop {
+            let out = conn.pop().unwrap_or_default();
+            if !out.is_empty() {
+                sock.write_all(&out).unwrap();
+            }
+            match conn.handshake().unwrap() {
+                HandshakeStatus::Complete => break,
+                HandshakeStatus::WantWrite => continue,
+                HandshakeStatus::WantRead => {
+                    let n = sock.read(&mut read_buf).expect("read");
+                    if n == 0 {
+                        panic!("peer closed during handshake");
+                    }
+                    conn.feed(&read_buf[..n]).expect("feed");
+                }
+            }
+        }
+        // Read the PING.
+        let n = sock.read(&mut read_buf).unwrap();
+        conn.feed(&read_buf[..n]).unwrap();
+        let _ = conn.recv();
+        // Reply with PONG.
+        conn.send(b"PONG").unwrap();
+        let out = conn.pop().unwrap_or_default();
+        sock.write_all(&out).unwrap();
+        sock.flush().unwrap();
     });
 
     // The CLI connects (insecure: self-signed), sends PING, prints the reply.
@@ -366,9 +390,9 @@ fn s_client_loopback() {
 }
 
 /// s_client and s_server round-trip over a local TCP port, exercising
-/// ALPN negotiation and -keylogfile capture.
+/// ALPN negotiation.
 #[test]
-fn s_client_s_server_roundtrip_alpn_keylog() {
+fn s_client_s_server_roundtrip_alpn() {
     use purecrypto::ec::Ed25519PrivateKey;
     use purecrypto::rng::OsRng;
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
@@ -382,7 +406,6 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
     let key_path = dir.join("server.key");
-    let log_path = dir.join("keylog.txt");
 
     // Self-signed Ed25519 cert for 127.0.0.1.
     let key = Ed25519PrivateKey::generate(&mut OsRng);
@@ -425,7 +448,6 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     // Give the server time to bind.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // s_client connects, negotiates ALPN, dumps secrets to keylogfile.
     let (out, ok) = run(
         &[
             "s_client",
@@ -434,8 +456,6 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
             "-insecure",
             "-alpn",
             "http/1.1",
-            "-keylogfile",
-            log_path.to_str().unwrap(),
             "-quiet",
         ],
         b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
@@ -448,18 +468,6 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
         out.contains("hello from purecrypto s_server"),
         "expected -www body in client stdout, got: {out:?}"
     );
-
-    // The keylogfile must contain the expected secret labels.
-    let log = std::fs::read_to_string(&log_path).expect("read keylog");
-    for label in [
-        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
-        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
-        "CLIENT_TRAFFIC_SECRET_0",
-        "SERVER_TRAFFIC_SECRET_0",
-        "EXPORTER_SECRET",
-    ] {
-        assert!(log.contains(label), "missing {label} in keylog:\n{log}");
-    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -474,9 +482,7 @@ fn s_client_live_cloudflare() {
     assert!(ok);
 }
 
-/// s_client and s_server round-trip over a local TCP port speaking TLS 1.2,
-/// exercising the `-tls1_2` flag on both sides plus the TLS 1.2 keylog
-/// format (`CLIENT_RANDOM ...`).
+/// s_client and s_server round-trip over a local TCP port speaking TLS 1.2.
 #[test]
 fn s_client_s_server_tls12_roundtrip() {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
@@ -492,10 +498,7 @@ fn s_client_s_server_tls12_roundtrip() {
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("server.pem");
     let key_path = dir.join("server.key");
-    let log_path = dir.join("keylog.txt");
 
-    // Self-signed P-256 ECDSA cert for 127.0.0.1 (TLS 1.2 server requires
-    // an RSA or ECDSA key for the ECDHE-* suite signature).
     let mut rng = OsRng;
     let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
     let validity = Validity::new(
@@ -514,7 +517,6 @@ fn s_client_s_server_tls12_roundtrip() {
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
     std::fs::write(&key_path, key.to_sec1_pem()).unwrap();
 
-    // Spawn s_server -tls1_2 in a background process (single-shot, `-www`).
     let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
         .args([
             "s_server",
@@ -533,10 +535,8 @@ fn s_client_s_server_tls12_roundtrip() {
         .spawn()
         .expect("spawn s_server");
 
-    // Give the server time to bind.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // s_client -tls1_2 connects, dumps CLIENT_RANDOM line to keylogfile.
     let (out, ok) = run(
         &[
             "s_client",
@@ -544,8 +544,6 @@ fn s_client_s_server_tls12_roundtrip() {
             "-connect",
             &format!("127.0.0.1:{port}"),
             "-insecure",
-            "-keylogfile",
-            log_path.to_str().unwrap(),
             "-quiet",
         ],
         b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
@@ -558,21 +556,6 @@ fn s_client_s_server_tls12_roundtrip() {
         out.contains("hello from purecrypto s_server"),
         "expected -www body in client stdout, got: {out:?}"
     );
-
-    // The keylogfile must contain the TLS 1.2 CLIENT_RANDOM line.
-    let log = std::fs::read_to_string(&log_path).expect("read keylog");
-    assert!(
-        log.starts_with("CLIENT_RANDOM "),
-        "expected CLIENT_RANDOM keylog line, got:\n{log}"
-    );
-    // CLIENT_RANDOM <64 hex> <96 hex>\n  (64 = 32 bytes cr, 96 = 48 bytes master)
-    let parts: Vec<&str> = log.trim().split_ascii_whitespace().collect();
-    assert_eq!(parts.len(), 3, "malformed CLIENT_RANDOM line: {log}");
-    assert_eq!(parts[0], "CLIENT_RANDOM");
-    assert_eq!(parts[1].len(), 64, "client_random hex len wrong: {log}");
-    assert_eq!(parts[2].len(), 96, "master_secret hex len wrong: {log}");
-    assert!(parts[1].bytes().all(|b| b.is_ascii_hexdigit()));
-    assert!(parts[2].bytes().all(|b| b.is_ascii_hexdigit()));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

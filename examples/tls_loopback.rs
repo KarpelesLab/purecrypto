@@ -3,11 +3,8 @@
 //!
 //! Run with: `cargo run --example tls_loopback`
 
-use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
-use purecrypto::tls::{
-    ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection,
-};
+use purecrypto::tls::{Config, Connection, RootCertStore, SigningKey};
 use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
 
 // A fixed RSA-2048 key, so the example needs no (slow) key generation.
@@ -25,49 +22,53 @@ fn main() {
     let cert_der = cert.to_der().to_vec();
 
     let server_key = BoxedRsaPrivateKey::from_pkcs1_pem(SERVER_KEY_PEM).unwrap();
-    let server_config = ServerConfig::with_rsa(vec![cert_der.clone()], server_key);
-    let mut server = ServerConnection::new(server_config, OsRng);
+    let server_cfg = Config::builder()
+        .tls_only()
+        .identity(vec![cert_der.clone()], SigningKey::Rsa(server_key))
+        .build();
+    let mut server = Connection::server(&server_cfg).expect("server config");
 
     // --- Client setup: trust the server's certificate. ---
     let mut roots = RootCertStore::new();
     roots.add_der(cert_der).unwrap();
-    let mut client = ClientConnection::new(ClientConfig::new(roots), "example.test", &mut OsRng);
+    let client_cfg = Config::builder()
+        .tls_only()
+        .roots(roots)
+        .server_name("example.test")
+        .build();
+    let mut client = Connection::client(&client_cfg).expect("client config");
 
     // --- Drive the handshake by shuttling records between the two ends. ---
     for _ in 0..16 {
-        let to_server = client.write_tls();
+        let to_server = client.pop().unwrap_or_default();
         if !to_server.is_empty() {
-            server.read_tls(&to_server);
-            server.process_new_packets().unwrap();
+            server.feed(&to_server).unwrap();
         }
-        let to_client = server.write_tls();
+        let to_client = server.pop().unwrap_or_default();
         if !to_client.is_empty() {
-            client.read_tls(&to_client);
-            client.process_new_packets().unwrap();
+            client.feed(&to_client).unwrap();
         }
         if to_server.is_empty() && to_client.is_empty() {
             break;
         }
     }
-    assert!(!client.is_handshaking() && !server.is_handshaking());
+    assert!(client.is_handshake_complete() && server.is_handshake_complete());
     println!("handshake complete");
 
     // --- Application data: client -> server -> client. ---
-    client.send_application_data(b"GET / HTTP/1.0").unwrap();
-    let req = client.write_tls();
-    server.read_tls(&req);
-    server.process_new_packets().unwrap();
+    client.send(b"GET / HTTP/1.0").unwrap();
+    let req = client.pop().unwrap_or_default();
+    server.feed(&req).unwrap();
     println!(
         "server received: {:?}",
-        String::from_utf8_lossy(&server.take_received_plaintext())
+        String::from_utf8_lossy(&server.recv().unwrap_or_default())
     );
 
-    server.send_application_data(b"HTTP/1.0 200 OK").unwrap();
-    let resp = server.write_tls();
-    client.read_tls(&resp);
-    client.process_new_packets().unwrap();
+    server.send(b"HTTP/1.0 200 OK").unwrap();
+    let resp = server.pop().unwrap_or_default();
+    client.feed(&resp).unwrap();
     println!(
         "client received: {:?}",
-        String::from_utf8_lossy(&client.take_received_plaintext())
+        String::from_utf8_lossy(&client.recv().unwrap_or_default())
     );
 }

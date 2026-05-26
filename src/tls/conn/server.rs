@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! The TLS 1.3 server handshake state machine.
 //!
 //! [`ServerConnection`] consumes a `ClientHello`, selects a cipher suite and
@@ -117,7 +119,7 @@ pub(crate) enum ServerKey {
 /// Client-authentication policy for a server (RFC 8446 §4.3.2): roots to
 /// validate the presented client chain against, and whether a client cert
 /// is required (`certificate_required` alert on absence).
-pub struct ClientAuthPolicy {
+pub(crate) struct ClientAuthPolicy {
     /// Trust anchors for the client chain.
     pub roots: crate::tls::RootCertStore,
     /// When `true`, an empty client certificate (no auth) aborts the
@@ -127,7 +129,10 @@ pub struct ClientAuthPolicy {
 }
 
 /// Configuration for a TLS server: a certificate chain and its signing key.
-pub struct ServerConfig {
+///
+/// `pub(crate)`: external users build a [`crate::tls::Config`] and call
+/// [`crate::tls::Connection::server`], which derives this internal config.
+pub(crate) struct ServerConfig {
     cert_chain: Vec<Vec<u8>>,
     key: ServerKey,
     /// ALPN protocols this server accepts, in preference order. The server

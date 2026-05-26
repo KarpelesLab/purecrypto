@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! TLS 1.2 server state machine (RFC 5246 + RFC 5077) — ECDHE-AEAD.
 //!
 //! [`ServerConnection12`] is the server-side mirror of
@@ -59,7 +61,7 @@ use alloc::vec::Vec;
 /// server keys are not accepted here: TLS 1.2 has no IANA-assigned
 /// `TLS_ECDHE_EDDSA_*` or `TLS_ECDHE_MLDSA_*` cipher suites, so a non-RSA /
 /// non-ECDSA key would have nothing to match.
-pub struct ServerConfig12 {
+pub(crate) struct ServerConfig12 {
     /// Certificate chain (leaf first) presented to the peer.
     cert_chain: Vec<Vec<u8>>,
     /// The server's signing key. Reused from [`super::server::ServerKey`] but
@@ -97,7 +99,7 @@ pub struct ServerConfig12 {
 /// §7.4.6 + §7.4.8). Parallels [`super::server::ClientAuthPolicy`] — kept
 /// separate so the TLS 1.2 path is not coupled to the TLS 1.3 server's
 /// config layout.
-pub struct ClientAuthPolicy12 {
+pub(crate) struct ClientAuthPolicy12 {
     /// Trust anchors used to validate the client chain.
     pub roots: RootCertStore,
     /// When `true`, an empty client `Certificate` aborts the handshake with
@@ -1422,7 +1424,7 @@ fn alert_for(error: &Error) -> AlertDescription {
 }
 
 #[cfg(feature = "std")]
-impl<R: RngCore> super::stream::Connection for ServerConnection12<R> {
+impl<R: RngCore> super::stream::ConnectionIo for ServerConnection12<R> {
     fn read_tls(&mut self, bytes: &[u8]) {
         ServerConnection12::read_tls(self, bytes)
     }

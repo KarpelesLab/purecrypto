@@ -24,7 +24,7 @@ use crate::tls::Error;
 use crate::x509::CertificateRevocationList;
 
 /// A set of CRLs against which peer certificate chains may be checked.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct CrlStore {
     crls: Vec<CertificateRevocationList>,
 }
@@ -65,6 +65,12 @@ impl CrlStore {
     /// Whether the store is empty.
     pub fn is_empty(&self) -> bool {
         self.crls.is_empty()
+    }
+
+    /// Clone the entire store (compatibility shim for the unified
+    /// [`crate::tls::Config`] builder).
+    pub fn clone_store(&self) -> Self {
+        self.clone()
     }
 
     /// Iterates every CRL whose issuer `Name` DER matches `name_der`.

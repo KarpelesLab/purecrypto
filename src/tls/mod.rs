@@ -15,19 +15,21 @@
 //! validated against the RFC 8448 traces. Not audited; APIs may change.
 
 pub(crate) mod codec;
-mod conn;
+mod config;
+pub(crate) mod conn;
+mod connection;
 pub(crate) mod crypto;
 mod error;
 pub(crate) mod pki;
 mod version;
 
-pub use conn::{
-    ClientAuthPolicy, ClientAuthPolicy12, ClientCertConfig, ClientConfig, ClientConfig12,
-    ClientConnection, ClientConnection12, ReceivedSessionTicket, ServerConfig, ServerConfig12,
-    ServerConnection, ServerConnection12, StoredSession, StoredSession12,
-};
+pub use config::{ClientAuth, Config, ConfigBuilder, Identity, SigningKey};
+#[cfg(test)]
+pub(crate) use conn::ClientCertConfig;
+#[cfg(test)]
 #[cfg(feature = "std")]
-pub use conn::{Connection, ReplayWindow, Stream};
+pub(crate) use conn::ReplayWindow;
+pub use connection::{Connection, HandshakeStatus};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::{CrlStore, RootCertStore};

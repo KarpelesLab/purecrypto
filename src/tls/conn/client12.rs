@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! TLS 1.2 client state machine (RFC 5246 + RFC 5077) — ECDHE-AEAD.
 //!
 //! [`ClientConnection12`] drives a full 1-RTT TLS 1.2 client handshake using
@@ -62,7 +64,7 @@ use alloc::vec::Vec;
 /// Parallels [`super::client::ClientConfig`], including mTLS
 /// ([`ClientCertConfig`], shared with the TLS 1.3 path) and RFC 5077
 /// session-ticket resumption ([`StoredSession12`]).
-pub struct ClientConfig12 {
+pub(crate) struct ClientConfig12 {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
     /// When `false`, the certificate chain, validity period, and host name are
@@ -1431,7 +1433,7 @@ fn alert_for(error: &Error) -> AlertDescription {
 }
 
 #[cfg(feature = "std")]
-impl super::stream::Connection for ClientConnection12 {
+impl super::stream::ConnectionIo for ClientConnection12 {
     fn read_tls(&mut self, bytes: &[u8]) {
         ClientConnection12::read_tls(self, bytes)
     }

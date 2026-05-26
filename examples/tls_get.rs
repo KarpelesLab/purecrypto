@@ -9,8 +9,7 @@
 //! implements. Hosts anchored through a P-384 CA (example.org via Cloudflare,
 //! at the time of writing) cannot be verified yet and need `--insecure`.
 
-use purecrypto::rng::OsRng;
-use purecrypto::tls::{ClientConfig, ClientConnection, RootCertStore, Stream};
+use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -20,43 +19,64 @@ const HOST: &str = "example.org";
 fn main() {
     let insecure = std::env::args().any(|a| a == "--insecure");
 
-    let config = if insecure {
-        let mut c = ClientConfig::new(RootCertStore::new());
-        c.verify_certificates = false;
-        c
+    let roots = if insecure {
+        RootCertStore::new()
     } else {
-        ClientConfig::new(load_system_roots())
+        load_system_roots()
     };
+    let cfg = Config::builder()
+        .tls_only()
+        .roots(roots)
+        .server_name(HOST)
+        .verify_certificates(!insecure)
+        .build();
+    let mut conn = Connection::client(&cfg).expect("client config");
 
     let mut sock = TcpStream::connect((HOST, 443)).expect("TCP connect");
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
-    let mut conn = ClientConnection::new(config, HOST, &mut OsRng);
-    let mut tls = Stream::new(&mut conn, &mut sock);
-
-    tls.complete_handshake().expect("TLS handshake");
+    // Drive the handshake to completion.
+    let mut read_buf = [0u8; 8192];
+    loop {
+        let out = conn.pop().unwrap_or_default();
+        if !out.is_empty() {
+            sock.write_all(&out).unwrap();
+        }
+        match conn.handshake().unwrap() {
+            HandshakeStatus::Complete => break,
+            HandshakeStatus::WantWrite => continue,
+            HandshakeStatus::WantRead => {
+                let n = sock.read(&mut read_buf).expect("read");
+                assert!(n > 0, "peer closed during handshake");
+                conn.feed(&read_buf[..n]).expect("feed");
+            }
+        }
+    }
     eprintln!(
         "TLS 1.3 handshake with {HOST} complete (certificate {}verified)",
         if insecure { "NOT " } else { "" }
     );
 
     let request = "GET / HTTP/1.1\r\nHost: example.org\r\n\r\n";
-    tls.write_all(request.as_bytes()).unwrap();
-    tls.flush().unwrap();
+    conn.send(request.as_bytes()).unwrap();
+    let out = conn.pop().unwrap_or_default();
+    sock.write_all(&out).unwrap();
+    sock.flush().unwrap();
 
     let mut response = Vec::new();
-    let mut buf = [0u8; 4096];
     loop {
-        match tls.read(&mut buf) {
-            Ok(0) => break, // clean close
+        match sock.read(&mut read_buf) {
+            Ok(0) => break,
             Ok(n) => {
-                response.extend_from_slice(&buf[..n]);
+                if conn.feed(&read_buf[..n]).is_err() {
+                    break;
+                }
+                let plain = conn.recv().unwrap_or_default();
+                response.extend_from_slice(&plain);
                 if response.len() > 16 * 1024 {
                     break;
                 }
             }
-            // The 5-second read timeout fires once the response is fully read
-            // (HTTP/1.1 keep-alive leaves the connection open).
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>

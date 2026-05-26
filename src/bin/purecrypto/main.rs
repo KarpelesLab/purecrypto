@@ -4,7 +4,6 @@
 
 mod ca;
 mod crl;
-mod dtls_io;
 mod enc;
 mod genpkey;
 mod hash;

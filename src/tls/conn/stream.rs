@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! A blocking [`std::io`] adapter over the sans-I/O connection core.
 //!
 //! [`Stream`] wraps a TLS [`Connection`] together with any
@@ -13,7 +15,7 @@ use std::io::{self, Read, Write};
 
 /// The connection behaviours [`Stream`] drives, implemented by both
 /// [`ClientConnection`] and [`ServerConnection`].
-pub trait Connection {
+pub trait ConnectionIo {
     /// Feeds received TLS bytes.
     fn read_tls(&mut self, bytes: &[u8]);
     /// Removes and returns bytes queued for transmission.
@@ -28,7 +30,7 @@ pub trait Connection {
     fn take_received_plaintext(&mut self) -> Vec<u8>;
 }
 
-impl Connection for ClientConnection {
+impl ConnectionIo for ClientConnection {
     fn read_tls(&mut self, bytes: &[u8]) {
         ClientConnection::read_tls(self, bytes)
     }
@@ -49,7 +51,7 @@ impl Connection for ClientConnection {
     }
 }
 
-impl<R: RngCore> Connection for ServerConnection<R> {
+impl<R: RngCore> ConnectionIo for ServerConnection<R> {
     fn read_tls(&mut self, bytes: &[u8]) {
         ServerConnection::read_tls(self, bytes)
     }
@@ -72,14 +74,14 @@ impl<R: RngCore> Connection for ServerConnection<R> {
 
 /// A blocking TLS stream: a [`Connection`] driven over a `Read + Write`
 /// transport.
-pub struct Stream<'a, C: Connection, T: Read + Write> {
+pub struct Stream<'a, C: ConnectionIo, T: Read + Write> {
     conn: &'a mut C,
     sock: &'a mut T,
     /// Received plaintext not yet handed to the reader.
     pending: Vec<u8>,
 }
 
-impl<'a, C: Connection, T: Read + Write> Stream<'a, C, T> {
+impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
     /// Wraps `conn` and `sock`.
     pub fn new(conn: &'a mut C, sock: &'a mut T) -> Self {
         Stream {
@@ -131,7 +133,7 @@ impl<'a, C: Connection, T: Read + Write> Stream<'a, C, T> {
     }
 }
 
-impl<C: Connection, T: Read + Write> Read for Stream<'_, C, T> {
+impl<C: ConnectionIo, T: Read + Write> Read for Stream<'_, C, T> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.conn.is_handshaking() {
             self.complete_handshake()?;
@@ -148,7 +150,7 @@ impl<C: Connection, T: Read + Write> Read for Stream<'_, C, T> {
     }
 }
 
-impl<C: Connection, T: Read + Write> Write for Stream<'_, C, T> {
+impl<C: ConnectionIo, T: Read + Write> Write for Stream<'_, C, T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.conn.is_handshaking() {
             self.complete_handshake()?;
@@ -170,7 +172,8 @@ mod tests {
     use crate::rng::OsRng;
     use crate::rsa::BoxedRsaPrivateKey;
     use crate::test_util::rsa_test_key_a;
-    use crate::tls::{ClientConfig, RootCertStore, ServerConfig};
+    use crate::tls::RootCertStore;
+    use crate::tls::conn::{ClientConfig, ServerConfig};
     use crate::x509::{Certificate, DistinguishedName, Time, Validity};
     use std::net::{TcpListener, TcpStream};
     use std::thread;

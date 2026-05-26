@@ -9,13 +9,14 @@ use alloc::vec::Vec;
 /// DER of the subject `Name` so chain-building uses RFC 5280 §7.1
 /// byte-exact equality, immune to encoding differences (PrintableString
 /// vs UTF8String, extra attributes, multi-valued RDNs).
+#[derive(Clone)]
 pub(crate) struct TrustAnchor {
     pub(crate) subject_der: Vec<u8>,
     pub(crate) key: AnyPublicKey,
 }
 
 /// A set of trusted root certificates against which peer chains are verified.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RootCertStore {
     anchors: Vec<TrustAnchor>,
 }
@@ -57,6 +58,14 @@ impl RootCertStore {
     /// Whether the store has no trust anchors.
     pub fn is_empty(&self) -> bool {
         self.anchors.is_empty()
+    }
+
+    /// Clone the entire store (compatibility shim for the unified
+    /// [`crate::tls::Config`] builder, which holds a single
+    /// [`RootCertStore`] used to seed both client trust anchors and
+    /// server-side mTLS trust anchors).
+    pub fn clone_store(&self) -> Self {
+        self.clone()
     }
 
     /// Iterates over every trust anchor whose subject `Name` DER matches

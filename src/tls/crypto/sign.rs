@@ -7,9 +7,13 @@
 //! whose `verify(spki, message, signature)` re-parses the SPKI and delegates
 //! to the underlying primitive.
 
+use crate::ec::CurveId;
+use crate::hash::{Sha256, Sha384, Sha512};
+use crate::rng::RngCore;
 use crate::signature_registry::{SignaturePolicy, find_by_tls_scheme};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
+use crate::tls::conn::ServerKey;
 use crate::x509::{AnyPublicKey, Error as X509Error};
 use alloc::vec::Vec;
 
@@ -34,6 +38,63 @@ pub(crate) fn certificate_verify_content(server: bool, transcript_hash: &[u8]) -
     out.push(0);
     out.extend_from_slice(transcript_hash);
     out
+}
+
+/// The IANA-blessed [`SignatureScheme`] code for the given [`ServerKey`].
+pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
+    match key {
+        ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+        ServerKey::Ecdsa(k) => match k.curve() {
+            CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+            CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
+            CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+        },
+        ServerKey::Ed25519(_) => SignatureScheme::ED25519,
+        ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+        ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+        ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
+    }
+}
+
+/// Signs `content` for a TLS 1.3 / DTLS 1.3 `CertificateVerify` using
+/// `key`, returning the (scheme, signature_bytes) tuple. Dispatches over
+/// every supported key type — RSA-PSS, ECDSA (any curve), Ed25519,
+/// ML-DSA-44/65/87.
+pub(crate) fn sign_certificate_verify<R: RngCore>(
+    key: &ServerKey,
+    content: &[u8],
+    rng: &mut R,
+) -> Result<(SignatureScheme, Vec<u8>), Error> {
+    let scheme = signature_scheme_for(key);
+    let signature = match key {
+        ServerKey::Rsa(k) => k
+            .sign_pss::<Sha256, _>(content, rng)
+            .map_err(|_| Error::HandshakeFailure)?,
+        ServerKey::Ecdsa(k) => {
+            let curve = k.curve();
+            let sig = match curve {
+                CurveId::P384 => k.sign::<Sha384>(content),
+                CurveId::P521 => k.sign::<Sha512>(content),
+                _ => k.sign::<Sha256>(content),
+            }
+            .map_err(|_| Error::HandshakeFailure)?;
+            sig.to_der(curve)
+        }
+        ServerKey::Ed25519(k) => k.sign(content).to_bytes().to_vec(),
+        // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
+        // with the supplied RNG.
+        ServerKey::MlDsa44(k) => k
+            .sign(rng, content, b"")
+            .map_err(|_| Error::HandshakeFailure)?,
+        ServerKey::MlDsa65(k) => k
+            .sign(rng, content, b"")
+            .map_err(|_| Error::HandshakeFailure)?,
+        ServerKey::MlDsa87(k) => k
+            .sign(rng, content, b"")
+            .map_err(|_| Error::HandshakeFailure)?,
+    };
+    Ok((scheme, signature))
 }
 
 /// Verifies a TLS 1.3 handshake signature of `message` under `key`, dispatching

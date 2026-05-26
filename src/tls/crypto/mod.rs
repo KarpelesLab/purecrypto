@@ -9,7 +9,7 @@ pub(crate) mod aead12;
 mod hash;
 pub(crate) mod prf;
 mod schedule;
-mod sign;
+pub(crate) mod sign;
 mod suite;
 
 #[allow(unused_imports)]

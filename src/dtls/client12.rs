@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! DTLS 1.2 client state machine (RFC 6347).
 //!
 //! Mirrors the TLS 1.2 client handshake flow (`ECDHE-ECDSA-AES128-GCM-SHA256`,
@@ -59,7 +61,7 @@ const KEY_LEN: usize = 16;
 ///
 /// The shape mirrors [`crate::tls::ClientConfig12`] (TLS 1.2) but is its
 /// own type to keep the DTLS path independent.
-pub struct DtlsClientConfig12 {
+pub(crate) struct ClientConfig12Internal {
     /// Trust anchors used to authenticate the server certificate chain.
     pub roots: RootCertStore,
     /// When `false`, the certificate chain is not validated. Intended for
@@ -75,7 +77,7 @@ pub struct DtlsClientConfig12 {
     pub crls: CrlStore,
 }
 
-impl DtlsClientConfig12 {
+impl ClientConfig12Internal {
     /// New configuration trusting `roots`, verifying certificates against
     /// `server_name`.
     pub fn new(roots: RootCertStore, server_name: &str) -> Self {
@@ -131,7 +133,7 @@ enum State {
 
 /// A DTLS 1.2 client connection.
 pub struct DtlsClientConnection12 {
-    config: DtlsClientConfig12,
+    config: ClientConfig12Internal,
     /// Caller-supplied peer-address bytes — opaque to us, used only by the
     /// server's cookie generator (we just echo the cookie we receive).
     #[allow(dead_code)]
@@ -205,7 +207,11 @@ impl DtlsClientConnection12 {
     /// Creates a fresh client and emits the first ClientHello (with empty
     /// cookie). The RNG supplies the ephemeral key material and client
     /// random.
-    pub fn new<R: RngCore>(config: DtlsClientConfig12, peer_addr: Vec<u8>, rng: &mut R) -> Self {
+    pub(crate) fn new<R: RngCore>(
+        config: ClientConfig12Internal,
+        peer_addr: Vec<u8>,
+        rng: &mut R,
+    ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let mut client_random: Random = [0u8; 32];

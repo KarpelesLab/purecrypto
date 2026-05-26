@@ -16,12 +16,13 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::{
-    DtlsClientConfig12, DtlsClientConnection12, DtlsServerConfig12, DtlsServerConnection12,
+    ClientConfig12Internal as PcClientConfig12, DtlsClientConnection12, DtlsServerConnection12,
+    ServerConfig12Internal as PcServerConfig12,
 };
 
 /// Build an ECDSA P-256 server config + the cert DER suitable for the
 /// client's trust store.
-fn make_server() -> (DtlsServerConfig12, Vec<u8>) {
+fn make_server() -> (PcServerConfig12, Vec<u8>) {
     let mut rng = HmacDrbg::<Sha256>::new(b"dtls12-test-key", b"nonce", &[]);
     let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
     let name = DistinguishedName::common_name("dtls.example");
@@ -40,7 +41,7 @@ fn make_server() -> (DtlsServerConfig12, Vec<u8>) {
     .unwrap();
     let der = cert.to_der().to_vec();
     (
-        DtlsServerConfig12::with_ecdsa(alloc::vec![der.clone()], key),
+        PcServerConfig12::with_ecdsa(alloc::vec![der.clone()], key),
         der,
     )
 }
@@ -48,7 +49,7 @@ fn make_server() -> (DtlsServerConfig12, Vec<u8>) {
 fn make_client(server_cert: &[u8]) -> DtlsClientConnection12 {
     let mut roots = RootCertStore::new();
     roots.add_der(server_cert.to_vec()).unwrap();
-    let cfg = DtlsClientConfig12::new(roots, "dtls.example")
+    let cfg = PcClientConfig12::new(roots, "dtls.example")
         .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
     let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-client", b"nonce", &[]);
     DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
@@ -207,10 +208,11 @@ fn application_data_both_ways_12() {
 mod dtls13 {
     use super::*;
     use crate::dtls::{
-        DtlsClientConfig13, DtlsClientConnection13, DtlsServerConfig13, DtlsServerConnection13,
+        ClientConfig13Internal as PcClientConfig13, DtlsClientConnection13, DtlsServerConnection13,
+        ServerConfig13Internal as PcServerConfig13,
     };
 
-    fn make_server13() -> (DtlsServerConfig13, Vec<u8>) {
+    fn make_server13() -> (PcServerConfig13, Vec<u8>) {
         let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-test-key", b"nonce", &[]);
         let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
         let name = DistinguishedName::common_name("dtls.example");
@@ -229,7 +231,7 @@ mod dtls13 {
         .unwrap();
         let der = cert.to_der().to_vec();
         (
-            DtlsServerConfig13::with_ecdsa(alloc::vec![der.clone()], key),
+            PcServerConfig13::with_ecdsa(alloc::vec![der.clone()], key),
             der,
         )
     }
@@ -237,7 +239,7 @@ mod dtls13 {
     fn make_client13(server_cert: &[u8]) -> DtlsClientConnection13 {
         let mut roots = RootCertStore::new();
         roots.add_der(server_cert.to_vec()).unwrap();
-        let cfg = DtlsClientConfig13::new(roots, "dtls.example")
+        let cfg = PcClientConfig13::new(roots, "dtls.example")
             .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
         let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-client", b"nonce", &[]);
         DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
@@ -283,6 +285,61 @@ mod dtls13 {
         let mut server =
             DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
         assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    /// DTLS 1.3 + Ed25519 server certificate: proves the generalised
+    /// signing path (RFC 8446 §4.4.3 `CertificateVerify` dispatch) works
+    /// for non-ECDSA key types in the DTLS server. Before the
+    /// `unified-tls-config.md` refactor, the DTLS 1.3 server's signing
+    /// site was hard-coded to ECDSA only.
+    #[test]
+    fn loopback_ed25519() {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::tls::conn::ServerKey;
+
+        // Build an Ed25519 self-signed server cert.
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-ed25519-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+
+        let server_cfg =
+            PcServerConfig13::with_signing_key(alloc::vec![der.clone()], ServerKey::Ed25519(key))
+                .with_no_cookie();
+
+        let mut client = make_client13(&der);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-ed25519", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // App-data round-trip under Ed25519-signed CertificateVerify.
+        client.send(b"ping-ed25519").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-ed25519");
+
+        server.send(b"pong-ed25519").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-ed25519");
     }
 
     #[test]

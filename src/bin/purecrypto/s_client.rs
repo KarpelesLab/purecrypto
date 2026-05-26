@@ -17,19 +17,14 @@
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::{TcpStream, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::dtls_io;
 use crate::pki::format_dn;
-use crate::util::{Args, die, to_hex};
-use purecrypto::dtls::{
-    DtlsClientConfig12, DtlsClientConfig13, DtlsClientConnection12, DtlsClientConnection13,
-};
+use crate::util::{Args, die};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use purecrypto::rng::OsRng;
+use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
-    ClientCertConfig, ClientConfig, ClientConfig12, ClientConnection, ClientConnection12,
-    RootCertStore, Stream,
+    Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
 };
 use purecrypto::x509::Certificate;
 
@@ -40,6 +35,17 @@ enum ProtocolVersion {
     Tls13,
     Dtls12,
     Dtls13,
+}
+
+impl ProtocolVersion {
+    fn to_pc_version(self) -> PcVersion {
+        match self {
+            ProtocolVersion::Tls12 => PcVersion::TLSv1_2,
+            ProtocolVersion::Tls13 => PcVersion::TLSv1_3,
+            ProtocolVersion::Dtls12 => PcVersion::DTLSv1_2,
+            ProtocolVersion::Dtls13 => PcVersion::DTLSv1_3,
+        }
+    }
 }
 
 /// Resolves the requested protocol from CLI flags. The rightmost protocol
@@ -87,14 +93,13 @@ fn load_roots(ca_file: Option<&str>) -> RootCertStore {
         }
         if line.starts_with("-----END CERTIFICATE-----") {
             in_cert = false;
-            let _ = store.add_pem(&block); // skip roots with unsupported key types
+            let _ = store.add_pem(&block);
         }
     }
     store
 }
 
-/// Loads trust roots from a CA file if given, else returns an empty store
-/// (used by the DTLS paths whose default is `-insecure` without a bundle).
+/// Loads trust roots from a CA file if given, else returns an empty store.
 fn load_roots_optional(ca_file: Option<&str>) -> RootCertStore {
     let mut store = RootCertStore::new();
     let Some(path) = ca_file else {
@@ -184,79 +189,23 @@ fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
     out
 }
 
-/// Loads a client cert configuration from `-cert` + `-key` paths. Supports
-/// Ed25519 (PKCS#8) and ECDSA (SEC1) keys.
-fn load_client_cert(cert_path: &str, key_path: &str) -> ClientCertConfig {
+/// Loads a client identity (cert chain + key) from `-cert` + `-key` paths.
+fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, SigningKey) {
     let chain = load_cert_chain(cert_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
-    if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {
-        ClientCertConfig::with_ed25519(chain, k)
+    let key = if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {
+        SigningKey::Ed25519(k)
     } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(&key_pem) {
-        ClientCertConfig::with_ecdsa(chain, k)
+        SigningKey::Ecdsa(k)
+    } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(&key_pem) {
+        SigningKey::Rsa(k)
     } else {
         die(format!(
-            "{key_path}: client cert key must be Ed25519 (PKCS#8) or ECDSA (SEC1)"
+            "{key_path}: client cert key must be Ed25519 (PKCS#8), ECDSA (SEC1), or RSA (PKCS#1)"
         ));
-    }
-}
-
-/// Appends NSS SSLKEYLOGFILE lines for a TLS 1.3 connection.
-fn dump_keylog_13(conn: &ClientConnection, path: &str) {
-    let cr_hex = to_hex(&conn.client_random());
-    let mut lines = String::new();
-    if let Some(s) = conn.client_handshake_traffic_secret() {
-        lines.push_str(&format!(
-            "CLIENT_HANDSHAKE_TRAFFIC_SECRET {} {}\n",
-            cr_hex,
-            to_hex(&s)
-        ));
-    }
-    if let Some(s) = conn.server_handshake_traffic_secret() {
-        lines.push_str(&format!(
-            "SERVER_HANDSHAKE_TRAFFIC_SECRET {} {}\n",
-            cr_hex,
-            to_hex(&s)
-        ));
-    }
-    if let Some(s) = conn.client_application_traffic_secret_0() {
-        lines.push_str(&format!(
-            "CLIENT_TRAFFIC_SECRET_0 {} {}\n",
-            cr_hex,
-            to_hex(&s)
-        ));
-    }
-    if let Some(s) = conn.server_application_traffic_secret_0() {
-        lines.push_str(&format!(
-            "SERVER_TRAFFIC_SECRET_0 {} {}\n",
-            cr_hex,
-            to_hex(&s)
-        ));
-    }
-    if let Some(s) = conn.exporter_master_secret() {
-        lines.push_str(&format!("EXPORTER_SECRET {} {}\n", cr_hex, to_hex(&s)));
-    }
-    append_keylog(path, &lines);
-}
-
-/// Appends the NSS SSLKEYLOGFILE `CLIENT_RANDOM` line for a TLS 1.2 connection.
-fn dump_keylog_12(conn: &ClientConnection12, path: &str) {
-    let cr_hex = to_hex(&conn.client_random());
-    if let Some(master) = conn.master_secret() {
-        let line = format!("CLIENT_RANDOM {} {}\n", cr_hex, to_hex(&master));
-        append_keylog(path, &line);
-    }
-}
-
-fn append_keylog(path: &str, lines: &str) {
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut f| f.write_all(lines.as_bytes()))
-    {
-        eprintln!("warning: cannot write keylogfile {path}: {e}");
-    }
+    };
+    (chain, key)
 }
 
 pub(crate) fn run(args: Args) {
@@ -276,7 +225,7 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.positionals(&value_flags).first().copied())
         .unwrap_or_else(|| {
             die(
-                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-keylogfile path] [-cert client.pem -key client.key] [-mtu N]",
+                "usage: purecrypto s_client -connect host:port [-tls1_2 | -dtls1_2 | -dtls1_3] [-servername name] [-CAfile bundle.pem] [-insecure] [-showcerts] [-alpn h2,http/1.1] [-cert client.pem -key client.key] [-mtu N]",
             )
         });
     let (host, port) = match connect.rsplit_once(':') {
@@ -292,37 +241,58 @@ pub(crate) fn run(args: Args) {
     let showcerts = args.flag("-showcerts") || args.flag("--showcerts");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
     let alpn = args.value("-alpn").map(parse_alpn);
-    let keylog = args.value("-keylogfile").map(String::from);
     let mtu: usize = args
         .value("-mtu")
         .unwrap_or("1200")
         .parse()
         .unwrap_or_else(|_| die("-mtu expects a number"));
-    let client_cert = match (args.value("-cert"), args.value("-key")) {
-        (Some(c), Some(k)) => Some(load_client_cert(c, k)),
+    let client_id = match (args.value("-cert"), args.value("-key")) {
+        (Some(c), Some(k)) => Some(load_client_identity(c, k)),
         (Some(_), None) | (None, Some(_)) => die("both -cert and -key are required for mTLS"),
         _ => None,
     };
+
+    // Build the unified config.
+    let roots = match version {
+        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+            if insecure {
+                RootCertStore::new()
+            } else {
+                load_roots(args.value("-CAfile"))
+            }
+        }
+        _ => {
+            if !insecure && args.value("-CAfile").is_none() {
+                die(
+                    "DTLS client requires either -CAfile <bundle> for chain validation, \
+                     or -insecure to explicitly skip verification (see openssl s_client)",
+                );
+            }
+            load_roots_optional(args.value("-CAfile"))
+        }
+    };
+
+    let mut builder = Config::builder()
+        .versions(version.to_pc_version(), version.to_pc_version())
+        .roots(roots)
+        .server_name(server_name)
+        .verify_certificates(!insecure)
+        .max_record_size(mtu);
+    if let Some(a) = alpn {
+        builder = builder.alpn(a);
+    }
+    if let Some((chain, key)) = client_id {
+        builder = builder.identity(chain, key);
+    }
+    let cfg = builder.build();
+    let mut conn = Connection::client(&cfg)
+        .unwrap_or_else(|e| die(format!("client configuration rejected: {e:?}")));
 
     match version {
         ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
             let mut sock = TcpStream::connect((host, port))
                 .unwrap_or_else(|e| die(format!("TCP connect to {host}:{port} failed: {e}")));
-            let ctx = RunCtx {
-                server_name,
-                insecure,
-                showcerts,
-                quiet,
-                alpn,
-                keylog,
-                client_cert,
-                ca_file: args.value("-CAfile"),
-            };
-            if version == ProtocolVersion::Tls12 {
-                run_tls12(&mut sock, ctx);
-            } else {
-                run_tls13(&mut sock, ctx);
-            }
+            run_tcp(&mut conn, &mut sock, version, insecure, showcerts, quiet);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
             let socket = UdpSocket::bind("0.0.0.0:0")
@@ -330,304 +300,130 @@ pub(crate) fn run(args: Args) {
             socket
                 .connect((host, port))
                 .unwrap_or_else(|e| die(format!("UDP connect to {host}:{port} failed: {e}")));
-            let ctx = DtlsRunCtx {
-                server_name,
-                insecure,
-                showcerts,
-                quiet,
-                alpn,
-                client_cert,
-                ca_file: args.value("-CAfile"),
-                mtu,
-            };
-            if version == ProtocolVersion::Dtls12 {
-                run_dtls12(socket, ctx);
-            } else {
-                run_dtls13(socket, ctx);
-            }
+            run_udp(&mut conn, &socket, mtu, version, insecure, showcerts, quiet);
         }
     }
 }
 
-struct RunCtx<'a> {
-    server_name: &'a str,
+fn run_tcp(
+    conn: &mut Connection,
+    sock: &mut TcpStream,
+    version: ProtocolVersion,
     insecure: bool,
     showcerts: bool,
     quiet: bool,
-    alpn: Option<Vec<Vec<u8>>>,
-    keylog: Option<String>,
-    client_cert: Option<ClientCertConfig>,
-    ca_file: Option<&'a str>,
+) {
+    drive_tcp_handshake(conn, sock);
+
+    if !quiet {
+        let v_str = match version {
+            ProtocolVersion::Tls12 => "TLSv1.2",
+            ProtocolVersion::Tls13 => "TLSv1.3",
+            _ => "?",
+        };
+        eprintln!(
+            "connected: {v_str}{}",
+            if insecure {
+                "  (certificate NOT verified)"
+            } else {
+                "  (certificate verified)"
+            }
+        );
+        if let Some(p) = conn.alpn_selected() {
+            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
+        }
+        print_chain(conn.peer_certificates(), showcerts);
+    }
+
+    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    drive_tcp_data(conn, sock);
 }
 
-struct DtlsRunCtx<'a> {
-    server_name: &'a str,
-    insecure: bool,
-    showcerts: bool,
-    quiet: bool,
-    alpn: Option<Vec<Vec<u8>>>,
-    /// Accepted-but-unused: see commit 11 — the DTLS state machines do
-    /// not yet implement client auth. We parse the flag so future work
-    /// is a drop-in.
-    #[allow(dead_code)]
-    client_cert: Option<ClientCertConfig>,
-    ca_file: Option<&'a str>,
+fn run_udp(
+    conn: &mut Connection,
+    socket: &UdpSocket,
     mtu: usize,
-}
-
-fn run_tls13(sock: &mut TcpStream, ctx: RunCtx<'_>) {
-    let RunCtx {
-        server_name,
-        insecure,
-        showcerts,
-        quiet,
-        alpn,
-        keylog,
-        client_cert,
-        ca_file,
-    } = ctx;
-
-    let mut config = if insecure {
-        let mut c = ClientConfig::new(RootCertStore::new());
-        c.verify_certificates = false;
-        c
-    } else {
-        ClientConfig::new(load_roots(ca_file))
-    };
-    if let Some(a) = alpn {
-        config = config.with_alpn(a);
-    }
-    if let Some(cc) = client_cert {
-        config = config.with_client_cert(cc);
-    }
-
-    let mut conn = ClientConnection::new(config, server_name, &mut OsRng);
-
-    // Handshake.
-    {
-        let mut tls = Stream::new(&mut conn, sock);
-        tls.complete_handshake()
-            .unwrap_or_else(|e| die(format!("TLS handshake failed: {e:?}")));
-    }
-
-    if let Some(path) = keylog.as_deref() {
-        dump_keylog_13(&conn, path);
-    }
+    version: ProtocolVersion,
+    insecure: bool,
+    showcerts: bool,
+    quiet: bool,
+) {
+    drive_udp_handshake(conn, socket, mtu, Duration::from_secs(15));
 
     if !quiet {
-        eprintln!(
-            "connected: {} / {}{}",
-            conn.protocol_version().unwrap_or("?"),
-            conn.negotiated_cipher_suite_name().unwrap_or("?"),
-            if insecure {
-                "  (certificate NOT verified)"
-            } else {
-                "  (certificate verified)"
-            }
-        );
-        if let Some(p) = conn.alpn_protocol() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
-        }
-        print_chain(conn.peer_certificates(), showcerts);
-    }
-
-    // Data phase.
-    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut tls = Stream::new(&mut conn, sock);
-    drive_data(&mut tls);
-}
-
-fn run_tls12(sock: &mut TcpStream, ctx: RunCtx<'_>) {
-    let RunCtx {
-        server_name,
-        insecure,
-        showcerts,
-        quiet,
-        alpn,
-        keylog,
-        client_cert,
-        ca_file,
-    } = ctx;
-
-    let roots = if insecure {
-        RootCertStore::new()
-    } else {
-        load_roots(ca_file)
-    };
-    let mut config = ClientConfig12::new(roots);
-    config.verify_certificates = !insecure;
-    // The CLI user opted into TLS 1.2 explicitly via `-tls1_2`, so accept the
-    // RFC 8446 §4.1.3 downgrade sentinel without complaint — a modern server
-    // serving a deliberately-downgraded TLS 1.2 connection will set it.
-    config = config.with_accept_downgrade_sentinel(true);
-    if let Some(a) = alpn {
-        config = config.with_alpn(a);
-    }
-    if let Some(cc) = client_cert {
-        config = config.with_client_cert(cc);
-    }
-
-    let mut conn = ClientConnection12::new(config, server_name, &mut OsRng);
-
-    // Handshake.
-    {
-        let mut tls = Stream::new(&mut conn, sock);
-        tls.complete_handshake()
-            .unwrap_or_else(|e| die(format!("TLS handshake failed: {e:?}")));
-    }
-
-    if let Some(path) = keylog.as_deref() {
-        dump_keylog_12(&conn, path);
-    }
-
-    if !quiet {
-        let suite_name = conn
-            .negotiated_cipher_suite()
-            .map(tls12_suite_name)
-            .unwrap_or("?");
-        eprintln!(
-            "connected: {} / {}{}",
-            conn.protocol_version().unwrap_or("?"),
-            suite_name,
-            if insecure {
-                "  (certificate NOT verified)"
-            } else {
-                "  (certificate verified)"
-            }
-        );
-        if let Some(p) = conn.alpn_protocol() {
-            eprintln!("ALPN: {}", String::from_utf8_lossy(p));
-        }
-        print_chain(conn.peer_certificates(), showcerts);
-    }
-
-    // Data phase.
-    sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    let mut tls = Stream::new(&mut conn, sock);
-    drive_data(&mut tls);
-}
-
-fn run_dtls12(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
-    let DtlsRunCtx {
-        server_name,
-        insecure,
-        showcerts: _,
-        quiet,
-        alpn: _,
-        client_cert: _,
-        ca_file,
-        mtu,
-    } = ctx;
-
-    if ca_file.is_none() && !insecure {
-        die(
-            "DTLS client requires either -CAfile <bundle> for chain validation, \
-             or -insecure to explicitly skip verification (see openssl s_client)",
-        );
-    }
-    let roots = load_roots_optional(ca_file);
-    let mut cfg = DtlsClientConfig12::new(roots, server_name);
-    if insecure {
-        cfg = cfg.without_certificate_verification();
-    }
-
-    let mut conn = DtlsClientConnection12::new(cfg, b"udp-client".to_vec(), &mut OsRng);
-
-    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
-
-    if !quiet {
-        eprintln!("connected: DTLSv1.2");
+        let v_str = match version {
+            ProtocolVersion::Dtls12 => "DTLSv1.2",
+            ProtocolVersion::Dtls13 => "DTLSv1.3",
+            _ => "?",
+        };
+        eprintln!("connected: {v_str}");
         if insecure {
             eprintln!("WARNING: certificate NOT verified (-insecure)");
         } else {
             eprintln!("certificate verified");
         }
-    }
-
-    dtls_io::drive_client_data(&mut conn, &socket, mtu, Duration::from_secs(30));
-}
-
-fn run_dtls13(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
-    let DtlsRunCtx {
-        server_name,
-        insecure,
-        showcerts,
-        quiet,
-        alpn,
-        client_cert: _,
-        ca_file,
-        mtu,
-    } = ctx;
-
-    if ca_file.is_none() && !insecure {
-        die(
-            "DTLS client requires either -CAfile <bundle> for chain validation, \
-             or -insecure to explicitly skip verification (see openssl s_client)",
-        );
-    }
-    let roots = load_roots_optional(ca_file);
-    let mut cfg = DtlsClientConfig13::new(roots, server_name);
-    if insecure {
-        cfg = cfg.without_certificate_verification();
-    }
-    if let Some(a) = alpn {
-        cfg.alpn_protocols = a;
-    }
-
-    let mut conn = DtlsClientConnection13::new(cfg, b"udp-client".to_vec(), &mut OsRng);
-
-    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
-
-    if !quiet {
-        eprintln!("connected: DTLSv1.3");
-        if insecure {
-            eprintln!("WARNING: certificate NOT verified (-insecure)");
-        } else {
-            eprintln!("certificate verified");
-        }
-        if let Some(p) = conn.alpn_protocol() {
+        if let Some(p) = conn.alpn_selected() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }
-        print_chain(conn.peer_certificates(), showcerts);
+        let chain = conn.peer_certificates();
+        if !chain.is_empty() {
+            print_chain(chain, showcerts);
+        }
     }
 
-    dtls_io::drive_client_data(&mut conn, &socket, mtu, Duration::from_secs(30));
+    drive_udp_data(conn, socket, mtu, Duration::from_secs(30));
 }
 
-/// Stringifies a TLS 1.2 cipher-suite code for diagnostics.
-fn tls12_suite_name(code: u16) -> &'static str {
-    match code {
-        0xC02B => "ECDHE-ECDSA-AES128-GCM-SHA256",
-        0xC02C => "ECDHE-ECDSA-AES256-GCM-SHA384",
-        0xC02F => "ECDHE-RSA-AES128-GCM-SHA256",
-        0xC030 => "ECDHE-RSA-AES256-GCM-SHA384",
-        0xCCA8 => "ECDHE-RSA-CHACHA20-POLY1305",
-        0xCCA9 => "ECDHE-ECDSA-CHACHA20-POLY1305",
-        _ => "?",
+fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
+    let mut read_buf = [0u8; 8192];
+    loop {
+        // Push outbound bytes first.
+        let out = conn.pop().unwrap_or_default();
+        if !out.is_empty() {
+            sock.write_all(&out)
+                .unwrap_or_else(|e| die(format!("socket write: {e}")));
+        }
+        match conn.handshake() {
+            Ok(HandshakeStatus::Complete) => return,
+            Ok(HandshakeStatus::WantWrite) => continue,
+            Ok(HandshakeStatus::WantRead) => {
+                let n = sock
+                    .read(&mut read_buf)
+                    .unwrap_or_else(|e| die(format!("socket read: {e}")));
+                if n == 0 {
+                    die("peer closed during handshake");
+                }
+                conn.feed(&read_buf[..n])
+                    .unwrap_or_else(|e| die(format!("TLS feed failed: {e:?}")));
+            }
+            Err(e) => die(format!("TLS handshake failed: {e:?}")),
+        }
     }
 }
 
-/// Drives the data phase: stdin → TLS, TLS → stdout, until EOF / timeout.
-fn drive_data<C, T>(tls: &mut Stream<'_, C, T>)
-where
-    C: purecrypto::tls::Connection,
-    T: Read + Write,
-{
+fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
     if !std::io::stdin().is_terminal() {
         let mut input = Vec::new();
         if std::io::stdin().read_to_end(&mut input).is_ok() && !input.is_empty() {
-            let _ = tls.write_all(&input);
-            let _ = tls.flush();
+            let _ = conn.send(&input);
+            if let Ok(out) = conn.pop() {
+                let _ = sock.write_all(&out);
+                let _ = sock.flush();
+            }
         }
     }
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 4096];
     loop {
-        match tls.read(&mut buf) {
+        match sock.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if stdout.write_all(&buf[..n]).is_err() {
+                if conn.feed(&buf[..n]).is_err() {
+                    break;
+                }
+                let plain = conn.recv().unwrap_or_default();
+                if !plain.is_empty() && stdout.write_all(&plain).is_err() {
                     break;
                 }
             }
@@ -636,6 +432,109 @@ where
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
                 break;
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = stdout.flush();
+}
+
+fn drive_udp_handshake(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadline: Duration) {
+    let start = Instant::now();
+    let mut buf = vec![0u8; mtu.max(1500) + 256];
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
+    while !conn.is_handshake_complete() {
+        if start.elapsed() > deadline {
+            die("DTLS handshake deadline exceeded");
+        }
+        // Drain outbound datagrams.
+        loop {
+            let dg = conn.pop().unwrap_or_default();
+            if dg.is_empty() {
+                break;
+            }
+            socket
+                .send(&dg)
+                .unwrap_or_else(|e| die(format!("UDP send failed: {e}")));
+        }
+        // Try to receive.
+        match socket.recv(&mut buf) {
+            Ok(n) => {
+                let _ = conn.feed(&buf[..n]);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                // Fire any pending timer.
+                if let Some(t) = conn.next_timeout() {
+                    conn.on_timeout(t);
+                }
+            }
+            Err(e) => die(format!("UDP recv failed: {e}")),
+        }
+    }
+    // Drain trailing handshake outputs (acks etc.).
+    loop {
+        let dg = conn.pop().unwrap_or_default();
+        if dg.is_empty() {
+            break;
+        }
+        let _ = socket.send(&dg);
+    }
+}
+
+fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadline: Duration) {
+    if !std::io::stdin().is_terminal() {
+        let mut input = Vec::new();
+        if std::io::stdin().read_to_end(&mut input).is_ok() && !input.is_empty() {
+            let _ = conn.send(&input);
+            loop {
+                let dg = conn.pop().unwrap_or_default();
+                if dg.is_empty() {
+                    break;
+                }
+                let _ = socket.send(&dg);
+            }
+        }
+    }
+
+    let mut stdout = std::io::stdout();
+    let mut buf = vec![0u8; mtu.max(1500) + 256];
+    socket
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .ok();
+    let start = Instant::now();
+    let idle_limit = Duration::from_secs(2);
+    let mut last_inbound = Instant::now();
+    while start.elapsed() < deadline {
+        match socket.recv(&mut buf) {
+            Ok(n) => {
+                last_inbound = Instant::now();
+                let _ = conn.feed(&buf[..n]);
+                let plain = conn.recv().unwrap_or_default();
+                if !plain.is_empty() && stdout.write_all(&plain).is_err() {
+                    return;
+                }
+                let _ = stdout.flush();
+                // Drain any outbound (e.g. ACKs) the engine queued.
+                loop {
+                    let dg = conn.pop().unwrap_or_default();
+                    if dg.is_empty() {
+                        break;
+                    }
+                    let _ = socket.send(&dg);
+                }
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if last_inbound.elapsed() > idle_limit {
+                    break;
+                }
             }
             Err(_) => break,
         }

@@ -386,12 +386,12 @@ assert_eq!(ss_a, ss_b);
 `purecrypto` ships both TLS (TCP) and DTLS (UDP) at two protocol
 versions each:
 
-| Version | Transport | Client                          | Server                          |
-|---------|-----------|---------------------------------|---------------------------------|
-| TLS 1.2 | TCP       | `tls::ClientConnection12`       | `tls::ServerConnection12`       |
-| TLS 1.3 | TCP       | `tls::ClientConnection`         | `tls::ServerConnection`         |
-| DTLS 1.2| UDP       | `dtls::DtlsClientConnection12`  | `dtls::DtlsServerConnection12`  |
-| DTLS 1.3| UDP       | `dtls::DtlsClientConnection13`  | `dtls::DtlsServerConnection13`  |
+All four versions (TLS 1.2, TLS 1.3, DTLS 1.2, DTLS 1.3) and both roles
+(client, server) share **one** public API: [`tls::Config`] +
+[`tls::Connection`]. The version is selected by
+`Config::builder().versions(min, max).build()`; the role is selected at
+connection-construction time via `Connection::client(&cfg)` or
+`Connection::server(&cfg)`.
 
 - **TLS 1.2** is ECDHE-AEAD only (AES-128/256-GCM, ChaCha20-Poly1305) —
   no static RSA, no static DH, no CBC. Forward secrecy by construction.
@@ -417,20 +417,35 @@ The `tls` module is a sans-I/O TLS 1.3 implementation with a thin
 configured per side:
 
 ```text
-ClientConfig::new(roots)
-    .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
-    .with_record_size_limit(4096)        // RFC 8449
-    .with_session(stored)                // PSK resumption (+ 0-RTT if allowed)
-    .with_client_cert(client_cert_cfg)   // mTLS (Ed25519 / ECDSA)
+// Client (TLS or DTLS, any version):
+Config::builder()
+    .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+    .roots(roots)
+    .server_name("example.com")
+    .alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    .record_size_limit(4096)             // RFC 8449
+    .identity(client_chain, client_key)  // mTLS (any SigningKey)
+    .build();
 
-ServerConfig::with_rsa(chain, key) | with_ecdsa(...) | with_ed25519(...)
-    .with_alpn(...)
-    .with_record_size_limit(...)
-    .with_ticket_key([u8; 32])           // enables NewSessionTicket emission
-    .with_ticket_lifetime(secs)
-    .with_max_early_data(N)              // accept up to N bytes of 0-RTT
-    .with_replay_window(window)          // 0-RTT anti-replay (shared across configs)
-    .with_client_auth(roots, required)   // mTLS
+// Server (TLS or DTLS, any version):
+Config::builder()
+    .tls_only()                          // shorthand for versions(TLSv1_2, TLSv1_3)
+    .identity(chain, SigningKey::Rsa(rsa) | SigningKey::Ecdsa(ec) | ...)
+    .alpn(...)
+    .ticket_key([0u8; 32])               // enables NewSessionTicket emission
+    .max_early_data(16384)               // accept up to N bytes of 0-RTT
+    .client_auth(ClientAuth { roots, required: true }) // mTLS
+    .build();
+
+// DTLS variant:
+Config::builder()
+    .dtls()                              // shorthand for versions(DTLSv1_2, DTLSv1_3)
+    .identity(chain, key)
+    .cookie_secret([0u8; 32])            // amplification defense
+    .max_record_size(1200)               // MTU ceiling
+    .build();
+
+let mut conn = Connection::client(&cfg)?;   // or Connection::server(&cfg)
 ```
 
 After a handshake completes, both sides expose:
@@ -455,25 +470,23 @@ idempotent (a HEAD/GET, an idempotent RPC, …) and never as a state-changing
 write.
 
 ```rust,no_run
-use purecrypto::rng::OsRng;
-use purecrypto::tls::{ClientConfig, ClientConnection, RootCertStore, Stream};
+use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
 
 let roots = RootCertStore::new();        // populate from a PEM bundle …
-let mut conn = ClientConnection::new(
-    ClientConfig::new(roots).with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
-    "example.com",
-    &mut OsRng,
-);
-let mut sock = std::net::TcpStream::connect("example.com:443").unwrap();
-let mut tls = Stream::new(&mut conn, &mut sock);
-tls.complete_handshake().unwrap();
-println!("ALPN: {:?}", conn.alpn_protocol());
+let cfg = Config::builder()
+    .tls_only()
+    .roots(roots)
+    .server_name("example.com")
+    .alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    .build();
+let mut conn = Connection::client(&cfg).unwrap();
+
+// Drive the handshake: pop wire bytes from `conn`, send them, recv from
+// the peer, feed them back. The sans-I/O surface is the same for TLS and
+// DTLS — the only difference is "stream" vs "datagram" framing.
+# fn _h(_: Connection) -> std::io::Result<()> { Ok(()) }
 ```
 
-The keylogfile output from `purecrypto s_client -keylogfile <path>` follows
-the standard NSS SSLKEYLOGFILE format and decrypts captured traffic in
-Wireshark by setting `Edit → Preferences → Protocols → TLS → (Pre)-Master-Secret
-log filename`.
 
 ### Signature algorithms
 
@@ -519,39 +532,47 @@ are 7–50 KB and rarely the right default for X.509 leaves.
 
 ```rust
 use purecrypto::signature_registry::SignaturePolicy;
-use purecrypto::tls::{ClientConfig, RootCertStore};
+use purecrypto::tls::{Config, RootCertStore};
 
 let roots = RootCertStore::new();
 
 // Default — modern IANA-blessed set, RSA ≥ 2048 bits.
-let cfg = ClientConfig::new(roots);
+let cfg = Config::builder().roots(roots).build();
 
 // Legacy interop: accept SHA-1 RSA and lower the RSA-bit floor to 1024.
 let roots = RootCertStore::new();
-let cfg = ClientConfig::new(roots).with_signature_policy(
-    SignaturePolicy::modern()
-        .permit("rsa-pkcs1-sha1")
-        .with_min_rsa_bits(1024),
-);
+let cfg = Config::builder()
+    .roots(roots)
+    .signature_policy(
+        SignaturePolicy::modern()
+            .permit("rsa-pkcs1-sha1")
+            .with_min_rsa_bits(1024),
+    )
+    .build();
 
 // PQC-strict: only ML-DSA + Ed25519, refuse everything classical.
 let roots = RootCertStore::new();
-let cfg = ClientConfig::new(roots).with_signature_policy(
-    SignaturePolicy::empty()
-        .permit("ml-dsa-65")
-        .permit("ml-dsa-87")
-        .permit("ed25519"),
-);
+let cfg = Config::builder()
+    .roots(roots)
+    .signature_policy(
+        SignaturePolicy::empty()
+            .permit("ml-dsa-65")
+            .permit("ml-dsa-87")
+            .permit("ed25519"),
+    )
+    .build();
 
 // SLH-DSA chains: opt in to a single set the application expects.
 let roots = RootCertStore::new();
-let cfg = ClientConfig::new(roots).with_signature_policy(
-    SignaturePolicy::modern().permit("slh-dsa-sha2-128f"),
-);
+let cfg = Config::builder()
+    .roots(roots)
+    .signature_policy(SignaturePolicy::modern().permit("slh-dsa-sha2-128f"))
+    .build();
 ```
 
-The same `with_signature_policy` builder exists on `ServerConfig` (it gates
-client-certificate validation under mTLS). The policy is a strict whitelist:
+`signature_policy` on the unified [`Config`] applies to both client and
+server roles — for the server it gates client-certificate validation under
+mTLS. The policy is a strict whitelist:
 adding an entry to the registry does NOT auto-permit it — the caller has to
 add the id explicitly.
 

@@ -12,20 +12,14 @@
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::common::{PcStatus, guard, out_write, slice};
-use crate::dtls::{
-    DtlsClientConfig12, DtlsClientConfig13, DtlsClientConnection12, DtlsClientConnection13,
-    DtlsServerConfig12, DtlsServerConfig13, DtlsServerConnection12, DtlsServerConnection13,
-};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use crate::rng::OsRng;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
-    ClientConfig, ClientConfig12, ClientConnection, ClientConnection12, CrlStore, RootCertStore,
-    ServerConfig, ServerConfig12, ServerConnection, ServerConnection12,
+    ClientAuth, Config, ConfigBuilder, Connection, CrlStore, HandshakeStatus, ProtocolVersion,
+    RootCertStore, SigningKey,
 };
 
 /// TLS / DTLS role.
@@ -69,27 +63,20 @@ impl Version {
             _ => return None,
         })
     }
-}
 
-/// A simple end-of-life-buffered server certificate + key pair, used until
-/// the caller has filled in the rest of the config and `pc_tls_new` materialises
-/// the underlying `ServerConfig{,12}` / `DtlsServerConfig{12,13}`.
-struct CertAndKey {
-    chain_der: Vec<Vec<u8>>,
-    key: ServerKey,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum ServerKey {
-    Rsa(BoxedRsaPrivateKey),
-    Ecdsa(BoxedEcdsaPrivateKey),
-    Ed25519(Ed25519PrivateKey),
+    fn to_protocol_version(self) -> ProtocolVersion {
+        match self {
+            Version::Tls12 => ProtocolVersion::TLSv1_2,
+            Version::Tls13 => ProtocolVersion::TLSv1_3,
+            Version::Dtls12 => ProtocolVersion::DTLSv1_2,
+            Version::Dtls13 => ProtocolVersion::DTLSv1_3,
+        }
+    }
 }
 
 /// Builder accumulating settings for a TLS/DTLS endpoint. Stores PEM blobs
 /// internally so that `pc_tls_new` can be called multiple times (the same
-/// cfg can spawn many connections) — neither `RootCertStore` nor `CrlStore`
-/// are `Clone` in the library, so a fresh store is built per connection.
+/// cfg can spawn many connections).
 pub struct PcTlsCfg {
     role: Role,
     version: Version,
@@ -103,6 +90,28 @@ pub struct PcTlsCfg {
     verify_certs: bool,
     cookie_secret: Option<[u8; 32]>,
     no_cookie: bool,
+}
+
+struct CertAndKey {
+    chain_der: Vec<Vec<u8>>,
+    key: PcKey,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum PcKey {
+    Rsa(BoxedRsaPrivateKey),
+    Ecdsa(BoxedEcdsaPrivateKey),
+    Ed25519(Ed25519PrivateKey),
+}
+
+impl PcKey {
+    fn to_signing_key(&self) -> SigningKey {
+        match self {
+            PcKey::Rsa(k) => SigningKey::Rsa(k.clone()),
+            PcKey::Ecdsa(k) => SigningKey::Ecdsa(k.clone()),
+            PcKey::Ed25519(k) => SigningKey::Ed25519(k.clone()),
+        }
+    }
 }
 
 impl PcTlsCfg {
@@ -145,6 +154,41 @@ impl PcTlsCfg {
             let _ = store.add_pem(pem);
         }
         store
+    }
+
+    fn build_config(&self) -> Option<Config> {
+        let mut b: ConfigBuilder = Config::builder()
+            .versions(
+                self.version.to_protocol_version(),
+                self.version.to_protocol_version(),
+            )
+            .verify_certificates(self.verify_certs)
+            .roots(self.build_roots());
+        if !self.alpn.is_empty() {
+            b = b.alpn(self.alpn.clone());
+        }
+        if !self.crls_pem.is_empty() {
+            b = b.crls(self.build_crls());
+        }
+        if let Some(sni) = &self.server_name {
+            b = b.server_name(sni.clone());
+        }
+        if let Some(secret) = self.cookie_secret {
+            b = b.cookie_secret(secret);
+        }
+        if self.no_cookie {
+            b = b.no_cookie();
+        }
+        if let Some(ck) = &self.cert {
+            b = b.identity(ck.chain_der.clone(), ck.key.to_signing_key());
+        }
+        if !self.client_auth_roots_pem.is_empty() {
+            b = b.client_auth(ClientAuth {
+                roots: self.build_client_auth_roots(),
+                required: self.client_auth_required,
+            });
+        }
+        Some(b.build())
     }
 }
 
@@ -258,11 +302,11 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
             Err(_) => return PcStatus::BadEncoding,
         };
         let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
-            ServerKey::Rsa(k)
+            PcKey::Rsa(k)
         } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
-            ServerKey::Ecdsa(k)
+            PcKey::Ecdsa(k)
         } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
-            ServerKey::Ed25519(k)
+            PcKey::Ed25519(k)
         } else {
             return PcStatus::BadEncoding;
         };
@@ -433,34 +477,9 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_cookie_secret(
     })
 }
 
-/// A TLS or DTLS connection handle. DTLS connections maintain a small queue
-/// of pending outbound datagrams so that `pc_tls_pop` can return them one
-/// at a time (the library's `pop_outbound_datagrams` is a single drain).
-#[allow(clippy::large_enum_variant)]
+/// A TLS or DTLS connection handle, wrapping a [`crate::tls::Connection`].
 pub struct PcTls {
-    inner: PcTlsInner,
-    /// Pending outbound datagrams for DTLS — `pc_tls_pop` drains one per call.
-    dtls_pending: Vec<Vec<u8>>,
-}
-
-#[allow(clippy::large_enum_variant)]
-enum PcTlsInner {
-    /// TLS 1.3 client.
-    ClientTls13(Box<ClientConnection>),
-    /// TLS 1.2 client.
-    ClientTls12(Box<ClientConnection12>),
-    /// TLS 1.3 server.
-    ServerTls13(Box<ServerConnection<OsRng>>),
-    /// TLS 1.2 server.
-    ServerTls12(Box<ServerConnection12<OsRng>>),
-    /// DTLS 1.2 client.
-    ClientDtls12(Box<DtlsClientConnection12>),
-    /// DTLS 1.3 client.
-    ClientDtls13(Box<DtlsClientConnection13>),
-    /// DTLS 1.2 server.
-    ServerDtls12(Box<DtlsServerConnection12<OsRng>>),
-    /// DTLS 1.3 server.
-    ServerDtls13(Box<DtlsServerConnection13<OsRng>>),
+    inner: Connection,
 }
 
 /// Materialises a connection from a finished configuration. Returns NULL on a
@@ -475,44 +494,18 @@ pub unsafe extern "C" fn pc_tls_new(cfg: *const PcTlsCfg) -> *mut PcTls {
         return core::ptr::null_mut();
     }
     let c = unsafe { &*cfg };
-    let inner = match (c.role, c.version) {
-        (Role::Client, Version::Tls13) => match build_tls13_client(c) {
-            Some(v) => PcTlsInner::ClientTls13(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Client, Version::Tls12) => match build_tls12_client(c) {
-            Some(v) => PcTlsInner::ClientTls12(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Server, Version::Tls13) => match build_tls13_server(c) {
-            Some(v) => PcTlsInner::ServerTls13(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Server, Version::Tls12) => match build_tls12_server(c) {
-            Some(v) => PcTlsInner::ServerTls12(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Client, Version::Dtls12) => match build_dtls12_client(c) {
-            Some(v) => PcTlsInner::ClientDtls12(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Client, Version::Dtls13) => match build_dtls13_client(c) {
-            Some(v) => PcTlsInner::ClientDtls13(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Server, Version::Dtls12) => match build_dtls12_server(c) {
-            Some(v) => PcTlsInner::ServerDtls12(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
-        (Role::Server, Version::Dtls13) => match build_dtls13_server(c) {
-            Some(v) => PcTlsInner::ServerDtls13(Box::new(v)),
-            None => return core::ptr::null_mut(),
-        },
+    let config = match c.build_config() {
+        Some(cfg) => cfg,
+        None => return core::ptr::null_mut(),
     };
-    Box::into_raw(Box::new(PcTls {
-        inner,
-        dtls_pending: Vec::new(),
-    }))
+    let conn = match c.role {
+        Role::Client => Connection::client(&config),
+        Role::Server => Connection::server(&config),
+    };
+    let Ok(inner) = conn else {
+        return core::ptr::null_mut();
+    };
+    Box::into_raw(Box::new(PcTls { inner }))
 }
 
 /// Frees a connection. NULL is ignored.
@@ -524,130 +517,6 @@ pub unsafe extern "C" fn pc_tls_free(tls: *mut PcTls) {
     if !tls.is_null() {
         drop(unsafe { Box::from_raw(tls) });
     }
-}
-
-// ---- Engine dispatch ------------------------------------------------------
-
-fn build_tls13_client(cfg: &PcTlsCfg) -> Option<ClientConnection> {
-    let mut cc = ClientConfig::new(cfg.build_roots());
-    cc.verify_certificates = cfg.verify_certs;
-    if !cfg.alpn.is_empty() {
-        cc = cc.with_alpn(cfg.alpn.clone());
-    }
-    if !cfg.crls_pem.is_empty() {
-        cc = cc.with_crls(cfg.build_crls());
-    }
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
-    Some(ClientConnection::new(cc, server_name, &mut OsRng))
-}
-
-fn build_tls12_client(cfg: &PcTlsCfg) -> Option<ClientConnection12> {
-    let mut cc = ClientConfig12::new(cfg.build_roots());
-    cc.verify_certificates = cfg.verify_certs;
-    if !cfg.alpn.is_empty() {
-        cc = cc.with_alpn(cfg.alpn.clone());
-    }
-    if !cfg.crls_pem.is_empty() {
-        cc = cc.with_crls(cfg.build_crls());
-    }
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
-    Some(ClientConnection12::new(cc, server_name, &mut OsRng))
-}
-
-fn build_tls13_server(cfg: &PcTlsCfg) -> Option<ServerConnection<OsRng>> {
-    let ck = cfg.cert.as_ref()?;
-    let chain = ck.chain_der.clone();
-    let mut sc = match &ck.key {
-        ServerKey::Rsa(k) => ServerConfig::with_rsa(chain, k.clone()),
-        ServerKey::Ecdsa(k) => ServerConfig::with_ecdsa(chain, k.clone()),
-        ServerKey::Ed25519(k) => ServerConfig::with_ed25519(chain, k.clone()),
-    };
-    if !cfg.alpn.is_empty() {
-        sc = sc.with_alpn(cfg.alpn.clone());
-    }
-    if !cfg.crls_pem.is_empty() {
-        sc = sc.with_crls(cfg.build_crls());
-    }
-    if !cfg.client_auth_roots_pem.is_empty() {
-        sc = sc.with_client_auth(cfg.build_client_auth_roots(), cfg.client_auth_required);
-    }
-    Some(ServerConnection::new(sc, OsRng))
-}
-
-fn build_tls12_server(cfg: &PcTlsCfg) -> Option<ServerConnection12<OsRng>> {
-    let ck = cfg.cert.as_ref()?;
-    let chain = ck.chain_der.clone();
-    let mut sc = match &ck.key {
-        ServerKey::Rsa(k) => ServerConfig12::with_rsa(chain, k.clone()),
-        ServerKey::Ecdsa(k) => ServerConfig12::with_ecdsa(chain, k.clone()),
-        ServerKey::Ed25519(_) => return None, // TLS 1.2 lacks Ed25519 ciphersuites in the lib
-    };
-    if !cfg.alpn.is_empty() {
-        sc = sc.with_alpn(cfg.alpn.clone());
-    }
-    if !cfg.crls_pem.is_empty() {
-        sc = sc.with_crls(cfg.build_crls());
-    }
-    if !cfg.client_auth_roots_pem.is_empty() {
-        sc = sc.with_client_auth(cfg.build_client_auth_roots(), cfg.client_auth_required);
-    }
-    Some(ServerConnection12::new(sc, OsRng))
-}
-
-fn build_dtls12_client(cfg: &PcTlsCfg) -> Option<DtlsClientConnection12> {
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
-    let mut dc = DtlsClientConfig12::new(cfg.build_roots(), server_name);
-    if !cfg.verify_certs {
-        dc = dc.without_certificate_verification();
-    }
-    if !cfg.crls_pem.is_empty() {
-        dc = dc.with_crls(cfg.build_crls());
-    }
-    Some(DtlsClientConnection12::new(dc, Vec::new(), &mut OsRng))
-}
-
-fn build_dtls13_client(cfg: &PcTlsCfg) -> Option<DtlsClientConnection13> {
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
-    let mut dc = DtlsClientConfig13::new(cfg.build_roots(), server_name);
-    if !cfg.verify_certs {
-        dc = dc.without_certificate_verification();
-    }
-    if !cfg.crls_pem.is_empty() {
-        dc = dc.with_crls(cfg.build_crls());
-    }
-    Some(DtlsClientConnection13::new(dc, Vec::new(), &mut OsRng))
-}
-
-fn build_dtls12_server(cfg: &PcTlsCfg) -> Option<DtlsServerConnection12<OsRng>> {
-    let ck = cfg.cert.as_ref()?;
-    let chain = ck.chain_der.clone();
-    let mut sc = match &ck.key {
-        ServerKey::Ecdsa(k) => DtlsServerConfig12::with_ecdsa(chain, k.clone()),
-        _ => return None, // DTLS 1.2 server in the library only accepts ECDSA today
-    };
-    if let Some(secret) = cfg.cookie_secret {
-        sc = sc.with_cookie_secret(secret);
-    }
-    if cfg.no_cookie {
-        sc = sc.require_cookie_exchange(false);
-    }
-    Some(DtlsServerConnection12::new(Arc::new(sc), Vec::new(), OsRng))
-}
-
-fn build_dtls13_server(cfg: &PcTlsCfg) -> Option<DtlsServerConnection13<OsRng>> {
-    let ck = cfg.cert.as_ref()?;
-    let chain = ck.chain_der.clone();
-    let mut sc = match &ck.key {
-        ServerKey::Ecdsa(k) => DtlsServerConfig13::with_ecdsa(chain, k.clone()),
-        _ => return None,
-    };
-    if let Some(secret) = cfg.cookie_secret {
-        sc = sc.with_cookie_secret(secret);
-    }
-    if cfg.no_cookie {
-        sc = sc.with_no_cookie();
-    }
-    Some(DtlsServerConnection13::new(Arc::new(sc), Vec::new(), OsRng))
 }
 
 // ---- Wire / app I/O -------------------------------------------------------
@@ -671,36 +540,8 @@ pub unsafe extern "C" fn pc_tls_feed(
         let Some(b) = (unsafe { slice(wire_in, in_len) }) else {
             return PcStatus::NullPointer;
         };
-        match unsafe { &mut (*tls).inner } {
-            PcTlsInner::ClientTls13(c) => {
-                c.read_tls(b);
-                let _ = c.process_new_packets();
-            }
-            PcTlsInner::ClientTls12(c) => {
-                c.read_tls(b);
-                let _ = c.process_new_packets();
-            }
-            PcTlsInner::ServerTls13(c) => {
-                c.read_tls(b);
-                let _ = c.process_new_packets();
-            }
-            PcTlsInner::ServerTls12(c) => {
-                c.read_tls(b);
-                let _ = c.process_new_packets();
-            }
-            PcTlsInner::ClientDtls12(c) => {
-                let _ = c.feed_datagram(b);
-            }
-            PcTlsInner::ClientDtls13(c) => {
-                let _ = c.feed_datagram(b);
-            }
-            PcTlsInner::ServerDtls12(c) => {
-                let _ = c.feed_datagram(b);
-            }
-            PcTlsInner::ServerDtls13(c) => {
-                let _ = c.feed_datagram(b);
-            }
-        }
+        let conn = &mut unsafe { &mut *tls }.inner;
+        let _ = conn.feed(b);
         if !consumed.is_null() {
             unsafe { *consumed = in_len };
         }
@@ -726,29 +567,8 @@ pub unsafe extern "C" fn pc_tls_pop(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let tls_ref: &mut PcTls = unsafe { &mut *tls };
-        // For DTLS, drain new datagrams into the pending queue then return one.
-        match &mut tls_ref.inner {
-            PcTlsInner::ClientDtls12(c) => tls_ref.dtls_pending.extend(c.pop_outbound_datagrams()),
-            PcTlsInner::ClientDtls13(c) => tls_ref.dtls_pending.extend(c.pop_outbound_datagrams()),
-            PcTlsInner::ServerDtls12(c) => tls_ref.dtls_pending.extend(c.pop_outbound_datagrams()),
-            PcTlsInner::ServerDtls13(c) => tls_ref.dtls_pending.extend(c.pop_outbound_datagrams()),
-            _ => {}
-        }
-        let bytes: Vec<u8> = match &mut tls_ref.inner {
-            PcTlsInner::ClientTls13(c) => c.write_tls(),
-            PcTlsInner::ClientTls12(c) => c.write_tls(),
-            PcTlsInner::ServerTls13(c) => c.write_tls(),
-            PcTlsInner::ServerTls12(c) => c.write_tls(),
-            // DTLS pops one datagram from the queue.
-            _ => {
-                if tls_ref.dtls_pending.is_empty() {
-                    Vec::new()
-                } else {
-                    tls_ref.dtls_pending.remove(0)
-                }
-            }
-        };
+        let conn = &mut unsafe { &mut *tls }.inner;
+        let bytes = conn.pop().unwrap_or_default();
         unsafe { out_write(&bytes, wire_out, out_len) }
     })
 }
@@ -771,23 +591,13 @@ pub unsafe extern "C" fn pc_tls_send(
         let Some(b) = (unsafe { slice(app_in, in_len) }) else {
             return PcStatus::NullPointer;
         };
-        if !is_complete(unsafe { &*tls }) {
+        let conn = &mut unsafe { &mut *tls }.inner;
+        if !conn.is_handshake_complete() {
             return PcStatus::WantHandshake;
         }
-        let r: Result<(), ()> = match unsafe { &mut (*tls).inner } {
-            PcTlsInner::ClientTls13(c) => c.send_application_data(b).map_err(|_| ()),
-            PcTlsInner::ClientTls12(c) => c.send_application_data(b).map_err(|_| ()),
-            PcTlsInner::ServerTls13(c) => c.send_application_data(b).map_err(|_| ()),
-            PcTlsInner::ServerTls12(c) => c.send_application_data(b).map_err(|_| ()),
-            PcTlsInner::ClientDtls12(c) => c.send(b).map_err(|_| ()),
-            PcTlsInner::ClientDtls13(c) => c.send(b).map_err(|_| ()),
-            PcTlsInner::ServerDtls12(c) => c.send(b).map_err(|_| ()),
-            PcTlsInner::ServerDtls13(c) => c.send(b).map_err(|_| ()),
-        };
-        if r.is_ok() {
-            PcStatus::Ok
-        } else {
-            PcStatus::Internal
+        match conn.send(b) {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Internal,
         }
     })
 }
@@ -807,16 +617,8 @@ pub unsafe extern "C" fn pc_tls_recv(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let bytes: Vec<u8> = match unsafe { &mut (*tls).inner } {
-            PcTlsInner::ClientTls13(c) => c.take_received_plaintext(),
-            PcTlsInner::ClientTls12(c) => c.take_received_plaintext(),
-            PcTlsInner::ServerTls13(c) => c.take_received_plaintext(),
-            PcTlsInner::ServerTls12(c) => c.take_received_plaintext(),
-            PcTlsInner::ClientDtls12(c) => c.take_received(),
-            PcTlsInner::ClientDtls13(c) => c.take_received(),
-            PcTlsInner::ServerDtls12(c) => c.take_received(),
-            PcTlsInner::ServerDtls13(c) => c.take_received(),
-        };
+        let conn = &mut unsafe { &mut *tls }.inner;
+        let bytes = conn.recv().unwrap_or_default();
         unsafe { out_write(&bytes, app_out, out_len) }
     })
 }
@@ -836,14 +638,12 @@ pub unsafe extern "C" fn pc_tls_handshake(tls: *mut PcTls) -> PcStatus {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = unsafe { &mut *tls };
-        if is_complete(conn) {
-            return PcStatus::Ok;
-        }
-        if wants_write(conn) {
-            PcStatus::WantWrite
-        } else {
-            PcStatus::WantRead
+        let conn = &mut unsafe { &mut *tls }.inner;
+        match conn.handshake() {
+            Ok(HandshakeStatus::Complete) => PcStatus::Ok,
+            Ok(HandshakeStatus::WantWrite) => PcStatus::WantWrite,
+            Ok(HandshakeStatus::WantRead) => PcStatus::WantRead,
+            Err(_) => PcStatus::Internal,
         }
     })
 }
@@ -857,7 +657,11 @@ pub unsafe extern "C" fn pc_tls_is_handshake_complete(tls: *const PcTls) -> i32 
     if tls.is_null() {
         return 0;
     }
-    if is_complete(unsafe { &*tls }) { 1 } else { 0 }
+    if unsafe { &*tls }.inner.is_handshake_complete() {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns the negotiated wire version in `out`, e.g. `0x0304` for TLS 1.3.
@@ -870,12 +674,11 @@ pub unsafe extern "C" fn pc_tls_negotiated_version(tls: *const PcTls, out: *mut 
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
-        let v = match unsafe { &(*tls).inner } {
-            PcTlsInner::ClientTls13(_) | PcTlsInner::ServerTls13(_) => 0x0304_u16,
-            PcTlsInner::ClientTls12(_) | PcTlsInner::ServerTls12(_) => 0x0303_u16,
-            PcTlsInner::ClientDtls12(_) | PcTlsInner::ServerDtls12(_) => 0xFEFD_u16,
-            PcTlsInner::ClientDtls13(_) | PcTlsInner::ServerDtls13(_) => 0xFEFC_u16,
-        };
+        let v = unsafe { &*tls }
+            .inner
+            .negotiated_version()
+            .map(|p| p.as_u16())
+            .unwrap_or(0);
         unsafe { *out = v };
         PcStatus::Ok
     })
@@ -896,14 +699,7 @@ pub unsafe extern "C" fn pc_tls_alpn_selected(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let alpn: &[u8] = match unsafe { &(*tls).inner } {
-            PcTlsInner::ClientTls13(c) => c.alpn_protocol().unwrap_or(&[]),
-            PcTlsInner::ClientTls12(c) => c.alpn_protocol().unwrap_or(&[]),
-            PcTlsInner::ServerTls13(c) => c.alpn_protocol().unwrap_or(&[]),
-            PcTlsInner::ServerTls12(c) => c.alpn_protocol().unwrap_or(&[]),
-            PcTlsInner::ClientDtls13(c) => c.alpn_protocol().unwrap_or(&[]),
-            _ => &[],
-        };
+        let alpn: &[u8] = unsafe { &*tls }.inner.alpn_selected().unwrap_or(&[]);
         unsafe { out_write(alpn, out, out_len) }
     })
 }
@@ -923,14 +719,7 @@ pub unsafe extern "C" fn pc_tls_peer_certificate(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let chain: &[Vec<u8>] = match unsafe { &(*tls).inner } {
-            PcTlsInner::ClientTls13(c) => c.peer_certificates(),
-            PcTlsInner::ClientTls12(c) => c.peer_certificates(),
-            PcTlsInner::ServerTls13(c) => c.peer_certificates(),
-            PcTlsInner::ServerTls12(c) => c.peer_certificates(),
-            PcTlsInner::ClientDtls13(c) => c.peer_certificates(),
-            _ => &[],
-        };
+        let chain: &[Vec<u8>] = unsafe { &*tls }.inner.peer_certificates();
         let Some(leaf) = chain.first() else {
             return PcStatus::BadEncoding;
         };
@@ -948,15 +737,8 @@ pub unsafe extern "C" fn pc_tls_close(tls: *mut PcTls) -> PcStatus {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        match unsafe { &mut (*tls).inner } {
-            PcTlsInner::ClientTls13(c) => c.send_close_notify(),
-            PcTlsInner::ClientTls12(c) => c.send_close_notify(),
-            PcTlsInner::ServerTls13(c) => c.send_close_notify(),
-            PcTlsInner::ServerTls12(c) => c.send_close_notify(),
-            // DTLS in this library does not emit an explicit close_notify in
-            // its public API; the connection is closed when freed.
-            _ => {}
-        }
+        let conn = &mut unsafe { &mut *tls }.inner;
+        let _ = conn.close();
         PcStatus::Ok
     })
 }
@@ -978,13 +760,15 @@ pub unsafe extern "C" fn pc_dtls_next_timeout(
         if tls.is_null() || seconds_out.is_null() || nanos_out.is_null() || has_timeout.is_null() {
             return PcStatus::NullPointer;
         }
-        let dur = match unsafe { &(*tls).inner } {
-            PcTlsInner::ClientDtls12(c) => c.next_timeout(),
-            PcTlsInner::ClientDtls13(c) => c.next_timeout(),
-            PcTlsInner::ServerDtls12(c) => c.next_timeout(),
-            PcTlsInner::ServerDtls13(c) => c.next_timeout(),
-            _ => return PcStatus::Unsupported,
-        };
+        let conn = unsafe { &*tls };
+        let v = conn.inner.negotiated_version();
+        if !matches!(
+            v,
+            Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+        ) {
+            return PcStatus::Unsupported;
+        }
+        let dur = conn.inner.next_timeout();
         match dur {
             Some(d) => unsafe {
                 *seconds_out = d.as_secs();
@@ -1016,42 +800,21 @@ pub unsafe extern "C" fn pc_dtls_on_timeout(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let dur = core::time::Duration::new(now_seconds, now_nanos);
-        match unsafe { &mut (*tls).inner } {
-            PcTlsInner::ClientDtls12(c) => c.on_timeout(dur),
-            PcTlsInner::ClientDtls13(c) => c.on_timeout(dur),
-            PcTlsInner::ServerDtls12(c) => c.on_timeout(dur),
-            PcTlsInner::ServerDtls13(c) => c.on_timeout(dur),
-            _ => return PcStatus::Unsupported,
+        let conn = unsafe { &mut *tls };
+        let v = conn.inner.negotiated_version();
+        if !matches!(
+            v,
+            Some(ProtocolVersion::DTLSv1_2) | Some(ProtocolVersion::DTLSv1_3)
+        ) {
+            return PcStatus::Unsupported;
         }
+        let dur = core::time::Duration::new(now_seconds, now_nanos);
+        conn.inner.on_timeout(dur);
         PcStatus::Ok
     })
 }
 
 // ---- Helpers --------------------------------------------------------------
-
-fn is_complete(c: &PcTls) -> bool {
-    match &c.inner {
-        PcTlsInner::ClientTls13(c) => !c.is_handshaking(),
-        PcTlsInner::ClientTls12(c) => !c.is_handshaking(),
-        PcTlsInner::ServerTls13(c) => !c.is_handshaking(),
-        PcTlsInner::ServerTls12(c) => !c.is_handshaking(),
-        PcTlsInner::ClientDtls12(c) => c.is_handshake_complete(),
-        PcTlsInner::ClientDtls13(c) => c.is_handshake_complete(),
-        PcTlsInner::ServerDtls12(c) => c.is_handshake_complete(),
-        PcTlsInner::ServerDtls13(c) => c.is_handshake_complete(),
-    }
-}
-
-fn wants_write(c: &PcTls) -> bool {
-    match &c.inner {
-        PcTlsInner::ClientTls13(c) => c.wants_write(),
-        PcTlsInner::ClientTls12(c) => c.wants_write(),
-        PcTlsInner::ServerTls13(c) => c.wants_write(),
-        PcTlsInner::ServerTls12(c) => c.wants_write(),
-        _ => !c.dtls_pending.is_empty(),
-    }
-}
 
 /// Splits a PEM bundle into individual labeled blocks. Each non-empty
 /// concatenated chunk between matching `-----BEGIN $LABEL-----` /

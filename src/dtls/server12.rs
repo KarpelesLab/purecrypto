@@ -1,3 +1,5 @@
+#![allow(dead_code, unreachable_pub)]
+
 //! DTLS 1.2 server state machine (RFC 6347).
 //!
 //! Mirror of [`super::client12::DtlsClientConnection12`]. The server
@@ -44,7 +46,7 @@ const DEFAULT_MAX_FRAGMENT: usize = 1100;
 const KEY_LEN: usize = 16;
 
 /// Configuration for a DTLS 1.2 server.
-pub struct DtlsServerConfig12 {
+pub(crate) struct ServerConfig12Internal {
     /// Certificate chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
     /// ECDSA signing key. (RSA support is omitted in this subset to keep
@@ -65,7 +67,7 @@ pub struct DtlsServerConfig12 {
     signature_policy: SignaturePolicy,
 }
 
-impl DtlsServerConfig12 {
+impl ServerConfig12Internal {
     /// New configuration presenting `cert_chain` and signing with the
     /// ECDSA `key`. Cookie exchange is required by default.
     pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
@@ -110,7 +112,7 @@ enum State {
 
 /// A DTLS 1.2 server connection.
 pub struct DtlsServerConnection12<R: RngCore> {
-    config: Arc<DtlsServerConfig12>,
+    config: Arc<ServerConfig12Internal>,
     rng: R,
 
     /// Peer address bytes — opaque, used by the cookie generator.
@@ -167,7 +169,7 @@ pub struct DtlsServerConnection12<R: RngCore> {
 impl<R: RngCore> DtlsServerConnection12<R> {
     /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
     /// is the opaque identifier used by the cookie generator.
-    pub fn new(config: Arc<DtlsServerConfig12>, peer_addr: Vec<u8>, rng: R) -> Self {
+    pub(crate) fn new(config: Arc<ServerConfig12Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
         let mut t = Transcript::new();
         t.set_alg(HashAlg::Sha256);
         Self {
