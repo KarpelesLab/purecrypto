@@ -12,6 +12,11 @@ use alloc::vec::Vec;
 
 /// Handshake message type codes.
 pub(crate) mod hs_type {
+    /// `hello_request` (RFC 5246 §7.4.1.1). TLS 1.2 only; body is empty. The
+    /// server uses this to prompt renegotiation — we emit it for legacy peers
+    /// only, and never accept it after the handshake.
+    #[allow(dead_code)]
+    pub(crate) const HELLO_REQUEST: u8 = 0;
     pub(crate) const CLIENT_HELLO: u8 = 1;
     pub(crate) const SERVER_HELLO: u8 = 2;
     pub(crate) const NEW_SESSION_TICKET: u8 = 4;
@@ -19,11 +24,20 @@ pub(crate) mod hs_type {
     pub(crate) const END_OF_EARLY_DATA: u8 = 5;
     pub(crate) const ENCRYPTED_EXTENSIONS: u8 = 8;
     pub(crate) const CERTIFICATE: u8 = 11;
-    /// `certificate_request` (RFC 8446 §4.3.2). Server-emitted to demand
-    /// a client certificate; client replies with `Certificate` (possibly
-    /// empty) and `CertificateVerify`.
+    /// `server_key_exchange` (RFC 5246 §7.4.3). TLS 1.2 only.
+    #[allow(dead_code)]
+    pub(crate) const SERVER_KEY_EXCHANGE: u8 = 12;
+    /// `certificate_request` (RFC 8446 §4.3.2 / RFC 5246 §7.4.4). Server-emitted
+    /// to demand a client certificate; client replies with `Certificate`
+    /// (possibly empty) and `CertificateVerify`.
     pub(crate) const CERTIFICATE_REQUEST: u8 = 13;
+    /// `server_hello_done` (RFC 5246 §7.4.5). TLS 1.2 only; body is empty.
+    #[allow(dead_code)]
+    pub(crate) const SERVER_HELLO_DONE: u8 = 14;
     pub(crate) const CERTIFICATE_VERIFY: u8 = 15;
+    /// `client_key_exchange` (RFC 5246 §7.4.7). TLS 1.2 only.
+    #[allow(dead_code)]
+    pub(crate) const CLIENT_KEY_EXCHANGE: u8 = 16;
     pub(crate) const FINISHED: u8 = 20;
     pub(crate) const KEY_UPDATE: u8 = 24;
 }
