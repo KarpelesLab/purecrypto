@@ -505,11 +505,15 @@ fn s_dtls_client_s_dtls_server_roundtrip() {
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     // s_dtls_client connects, sends one line, and expects the echo back.
+    // `-insecure` skips peer-cert validation (the test fixture's cert isn't
+    // anchored to a trusted root); since the audit fix the DTLS client
+    // refuses to start without either `-CAfile` or this explicit opt-in.
     let (out, _ok) = run(
         &[
             "s_dtls_client",
             "-connect",
             &format!("127.0.0.1:{port}"),
+            "-insecure",
             "-quiet",
         ],
         b"hello\n",
@@ -593,6 +597,7 @@ fn s_client_s_server_dtls12_roundtrip() {
             "-dtls1_2",
             "-connect",
             &format!("127.0.0.1:{port}"),
+            "-insecure",
             "-quiet",
         ],
         b"hello\n",
@@ -669,6 +674,7 @@ fn s_client_s_server_dtls13_roundtrip() {
             "-dtls1_3",
             "-connect",
             &format!("127.0.0.1:{port}"),
+            "-insecure",
             "-quiet",
         ],
         b"hello\n",
