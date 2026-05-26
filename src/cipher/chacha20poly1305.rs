@@ -57,8 +57,22 @@ impl ChaCha20Poly1305 {
         mac.finish()
     }
 
+    /// RFC 8439 §2.8 caps a single ChaCha20-Poly1305 message at
+    /// `(2^32 − 1) × 64` bytes (≈ 256 GiB minus 64) because counter 0 is the
+    /// Poly1305 OTK and counters 1..=2^32-1 are the keystream. Above this,
+    /// the counter wraps to 0 and reuses the OTK block as keystream —
+    /// catastrophic.
+    pub const MAX_PLAINTEXT_LEN: u64 = (u32::MAX as u64) * 64;
+
     /// Encrypts `buffer` in place and returns the 16-byte tag, binding `aad`.
+    ///
+    /// # Panics
+    /// Panics if `buffer.len()` exceeds [`MAX_PLAINTEXT_LEN`].
     pub fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
+        assert!(
+            (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
+            "ChaCha20-Poly1305 plaintext exceeds 2^32 − 1 blocks (RFC 8439 §2.8)"
+        );
         let otk = self.poly_key(nonce);
         self.cipher.apply_keystream(nonce, 1, buffer);
         self.tag(&otk, aad, buffer)
@@ -68,6 +82,9 @@ impl ChaCha20Poly1305 {
     ///
     /// The tag is checked in constant time; on mismatch the buffer is left as
     /// ciphertext and [`TagMismatch`] is returned.
+    ///
+    /// # Panics
+    /// Panics if `buffer.len()` exceeds [`MAX_PLAINTEXT_LEN`].
     pub fn decrypt(
         &self,
         nonce: &[u8; 12],
@@ -75,6 +92,10 @@ impl ChaCha20Poly1305 {
         buffer: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
+        assert!(
+            (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
+            "ChaCha20-Poly1305 ciphertext exceeds 2^32 − 1 blocks (RFC 8439 §2.8)"
+        );
         let otk = self.poly_key(nonce);
         let expected = self.tag(&otk, aad, buffer);
         if !bool::from(expected.ct_eq(tag)) {

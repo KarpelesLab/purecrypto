@@ -80,7 +80,21 @@ impl ChaCha20 {
 
     /// XORs the keystream into `buf` in place, starting at block `counter`
     /// (RFC 8439 §2.4). The counter increments per 64-byte block.
+    ///
+    /// # Panics
+    /// Panics if the requested operation would wrap the 32-bit block counter.
+    /// RFC 8439 §2.4 caps a single ChaCha20 invocation at `2^32` blocks
+    /// (256 GiB), and the AEAD wrapper at `2^32 − 1` (because counter 0 is
+    /// reserved for the Poly1305 OTK). Wrapping would reuse keystream and
+    /// catastrophically break confidentiality — fail loud rather than
+    /// silently produce a two-time pad.
     pub fn apply_keystream(&self, nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+        let blocks_needed = buf.len().div_ceil(64) as u64;
+        let counter_end = (counter as u64) + blocks_needed;
+        assert!(
+            counter_end <= u64::from(u32::MAX) + 1,
+            "ChaCha20 counter would overflow 2^32 (buf too large for a single invocation)"
+        );
         let mut block_counter = counter;
         for block in buf.chunks_mut(64) {
             let ks = self.block(nonce, block_counter);
