@@ -71,6 +71,49 @@ impl Time {
         encode_string(tag::UTC_TIME, &self.repr)
     }
 
+    /// Encodes the time using the RFC 5280 §5.1.2.4 `Time` CHOICE: `UTCTime`
+    /// for years 1950–2049 (two-digit year, `YYMMDDHHMMSSZ`), otherwise
+    /// `GeneralizedTime` (four-digit year, `YYYYMMDDHHMMSSZ`).
+    ///
+    /// The internal representation is either the 13-byte UTCTime form (as
+    /// produced by [`Time::utc`]) or the 15-byte GeneralizedTime form (as
+    /// produced by [`Time::from_repr`] for 4-digit-year strings). The tag is
+    /// chosen by inspecting which form is stored, with the documented
+    /// fall-back rule for years 2050+ — i.e. a Time built via
+    /// [`Time::from_repr("20500101000000Z")`] is emitted with the
+    /// GeneralizedTime tag (0x18).
+    pub(crate) fn to_der_choice(&self) -> Vec<u8> {
+        let b = self.repr.as_bytes();
+        // GeneralizedTime form: 15 bytes, 4-digit year.
+        if b.len() == 15 {
+            // Inspect the parsed year to follow RFC 5280: even if stored as
+            // 4-digit-year form, prefer UTCTime when the year fits 1950–2049.
+            if let Some((y, _m, _d, _h, _mi, _s)) = self.components()
+                && (1950..=2049).contains(&y)
+            {
+                // Build the UTCTime variant by stripping the leading century.
+                let yy = y % 100;
+                let mut s = alloc::string::String::with_capacity(13);
+                s.push(((yy / 10) as u8 + b'0') as char);
+                s.push(((yy % 10) as u8 + b'0') as char);
+                // Bytes 4..14 hold MMDDHHMMSS, byte 14 is 'Z'.
+                s.push_str(core::str::from_utf8(&b[4..15]).unwrap_or(""));
+                return encode_string(tag::UTC_TIME, &s);
+            }
+            return encode_string(tag::GENERALIZED_TIME, &self.repr);
+        }
+        // UTCTime form: 13 bytes, 2-digit year.
+        if b.len() == 13 {
+            // Year is in 1950–2049 by the YY < 50 ⇒ 20YY rule; emit UTCTime.
+            return encode_string(tag::UTC_TIME, &self.repr);
+        }
+        // Malformed length: fall back to UTCTime — round-trip will fail at
+        // parse time, surfacing the malformedness rather than silently
+        // emitting a structurally valid-but-wrong encoding.
+        encode_string(tag::UTC_TIME, &self.repr)
+    }
+
+
     /// Parses the stored ASN.1 time into chronologically sortable components
     /// `(year, month, day, hour, minute, second)`. Handles both `UTCTime`
     /// (`YYMMDDHHMMSSZ`, with the RFC 5280 1950–2049 century rule) and
@@ -251,6 +294,23 @@ mod tests {
         assert!(v.accepts(&Time::utc(2034, 1, 1, 0, 0, 0))); // boundary
         assert!(!v.accepts(&Time::utc(2023, 12, 31, 23, 59, 59))); // too early
         assert!(!v.accepts(&Time::utc(2034, 1, 1, 0, 0, 1))); // expired
+    }
+
+    #[test]
+    fn to_der_choice_picks_utctime_or_generalized() {
+        // 1950–2049 ⇒ UTCTime (tag 0x17). 13-byte body.
+        let utc = Time::utc(2024, 1, 1, 0, 0, 0).to_der_choice();
+        assert_eq!(utc[0], tag::UTC_TIME);
+        assert_eq!(utc[1] as usize, 13);
+        // 2050+ ⇒ GeneralizedTime (tag 0x18). 15-byte body.
+        let g = Time::from_repr("20500101000000Z").to_der_choice();
+        assert_eq!(g[0], tag::GENERALIZED_TIME);
+        assert_eq!(g[1] as usize, 15);
+        // A Time built as a 4-digit-year string but inside the UTCTime window
+        // emits UTCTime per RFC 5280 §5.1.2.4.
+        let utc2 = Time::from_repr("20240101000000Z").to_der_choice();
+        assert_eq!(utc2[0], tag::UTC_TIME);
+        assert_eq!(utc2[1] as usize, 13);
     }
 
     #[test]

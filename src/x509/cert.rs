@@ -361,6 +361,21 @@ impl Certificate {
         Ok(seq)
     }
 
+    /// Returns the raw DER body of the certificate's `serialNumber` INTEGER
+    /// (big-endian, strict-DER-canonical: at most one leading `0x00` to keep
+    /// the value non-negative). Used to compare against CRL `userCertificate`
+    /// entries during revocation checks.
+    #[allow(dead_code)]
+    pub(crate) fn serial_bytes(&self) -> Result<&[u8], Error> {
+        let tbs = self.parts()?.tbs;
+        let mut outer = Reader::new(tbs);
+        let mut seq = outer.read_sequence()?;
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_tlv(tag::context(0))?; // version
+        }
+        Ok(seq.read_unsigned_integer_bytes()?)
+    }
+
     /// Returns the DER bytes of the inner `signature` AlgorithmIdentifier
     /// inside `TBSCertificate` (RFC 5280 §4.1.2.3). The outer
     /// `signatureAlgorithm` MUST match these bytes byte-for-byte; a
