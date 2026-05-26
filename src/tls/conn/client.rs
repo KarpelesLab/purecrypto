@@ -16,6 +16,7 @@ use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
+use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket as NstWire,
@@ -122,6 +123,11 @@ pub struct ClientConfig {
     /// `CertificateRequest` (mTLS). `None` means we won't present a cert; if
     /// the server requires one we'll abort with `certificate_required`.
     pub client_cert: Option<ClientCertConfig>,
+    /// Whitelist of signature algorithms the client accepts in chain
+    /// signatures and in the server's `CertificateVerify`. Defaults to
+    /// [`SignaturePolicy::modern`]: the modern IANA-blessed set with
+    /// RSA ≥ 2048 bits.
+    pub signature_policy: SignaturePolicy,
 }
 
 impl ClientConfig {
@@ -136,7 +142,16 @@ impl ClientConfig {
             record_size_limit: None,
             session: None,
             client_cert: None,
+            signature_policy: SignaturePolicy::modern(),
         }
+    }
+
+    /// Replaces the signature-algorithm whitelist. Defaults to
+    /// [`SignaturePolicy::modern`]; tighten or widen it for legacy interop,
+    /// PQC-only deployments, etc.
+    pub fn with_signature_policy(mut self, policy: SignaturePolicy) -> Self {
+        self.signature_policy = policy;
+        self
     }
 
     /// Offers the given ALPN protocols. The first match in the server's
@@ -1290,10 +1305,16 @@ impl ClientConnection {
             .map_err(|_| Error::BadCertificate)?;
 
         // Recover the leaf key, verifying the chain, validity, and host name
-        // unless the configuration disables certificate verification.
+        // unless the configuration disables certificate verification. The
+        // signature policy applies to every chain signature.
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
-            let key = verify_chain(&self.config.roots, &self.cert_chain, now.as_ref())?;
+            let key = verify_chain(
+                &self.config.roots,
+                &self.cert_chain,
+                now.as_ref(),
+                &self.config.signature_policy,
+            )?;
             verify_hostname(&leaf, &self.server_name)?;
             key
         } else {
@@ -1303,7 +1324,13 @@ impl ClientConnection {
 
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(true, th.as_slice());
-        verify_signature(scheme, &leaf_key, &content, &signature)?;
+        verify_signature(
+            scheme,
+            &leaf_key,
+            &content,
+            &signature,
+            &self.config.signature_policy,
+        )?;
 
         self.leaf_key = Some(leaf_key);
         self.core.transcript.update(raw);

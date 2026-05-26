@@ -7,7 +7,7 @@
 //! whose `verify(spki, message, signature)` re-parses the SPKI and delegates
 //! to the underlying primitive.
 
-use crate::signature_registry::find_by_tls_scheme;
+use crate::signature_registry::{SignaturePolicy, find_by_tls_scheme};
 use crate::tls::Error;
 use crate::tls::codec::SignatureScheme;
 use crate::x509::{AnyPublicKey, Error as X509Error};
@@ -37,21 +37,30 @@ pub(crate) fn certificate_verify_content(server: bool, transcript_hash: &[u8]) -
 }
 
 /// Verifies a TLS 1.3 handshake signature of `message` under `key`, dispatching
-/// through [`crate::signature_registry`] on `scheme`. Returns
-/// [`Error::PeerMisbehaved`] if the scheme is unsupported or does not match
-/// the key type, [`Error::Decode`] if the signature wire format is malformed,
-/// and [`Error::BadCertificate`] if the signature is otherwise invalid.
+/// through [`crate::signature_registry`] on `scheme`.
+///
+/// `policy` gates the scheme: a scheme not on its whitelist (even one in the
+/// registry) is rejected with [`Error::BadCertificate`].
+///
+/// Returns [`Error::PeerMisbehaved`] if the scheme is unsupported by the
+/// registry or does not match the key type, [`Error::Decode`] if the
+/// signature wire format is malformed, and [`Error::BadCertificate`] if the
+/// signature is otherwise invalid (or policy-rejected).
 pub(crate) fn verify_signature(
     scheme: SignatureScheme,
     key: &AnyPublicKey,
     message: &[u8],
     signature: &[u8],
+    policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let algo = find_by_tls_scheme(scheme.0).ok_or(Error::PeerMisbehaved)?;
     // The registry verifier needs an SPKI; round-trip the parsed key. (A few
     // hundred bytes of allocation per CertificateVerify is negligible next to
     // the asymmetric verify itself.)
     let spki = key.to_spki_der();
+    if !policy.permits(algo, &spki) {
+        return Err(Error::BadCertificate);
+    }
     match algo.verify(&spki, message, signature) {
         Ok(()) => Ok(()),
         // `UnsupportedAlgorithm` here means the SPKI's key type doesn't match
@@ -99,19 +108,28 @@ mod tests {
         assert_eq!(scheme, SignatureScheme::RSA_PSS_RSAE_SHA256);
         let sig = &flight[493..621];
 
-        verify_signature(scheme, &key, &content, sig).unwrap();
+        // RFC 8448 uses an RSA-1024 server key; the modern default policy
+        // floors RSA at 2048. Loosen for this single legacy fixture.
+        let policy = SignaturePolicy::modern().with_min_rsa_bits(1024);
+        verify_signature(scheme, &key, &content, sig, &policy).unwrap();
 
         // A tampered transcript must not verify.
         let mut bad = content.clone();
         *bad.last_mut().unwrap() ^= 0x01;
         assert!(matches!(
-            verify_signature(scheme, &key, &bad, sig),
+            verify_signature(scheme, &key, &bad, sig, &policy),
             Err(Error::BadCertificate)
         ));
 
         // Wrong scheme for an RSA key (ECDSA) is a misbehavior, not a bad sig.
         assert!(matches!(
-            verify_signature(SignatureScheme::ECDSA_SECP256R1_SHA256, &key, &content, sig),
+            verify_signature(
+                SignatureScheme::ECDSA_SECP256R1_SHA256,
+                &key,
+                &content,
+                sig,
+                &policy,
+            ),
             Err(Error::PeerMisbehaved)
         ));
     }

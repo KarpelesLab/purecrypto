@@ -418,6 +418,13 @@ impl Certificate {
         issuer.verify(&parts.sig_alg, parts.tbs, parts.signature)
     }
 
+    /// The OID arcs of the certificate's outer `signatureAlgorithm` field.
+    /// Useful for routing the verify through the signature-algorithm registry
+    /// or for inspection (e.g. CLI tooling printing a chain).
+    pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
+        Ok(self.parts()?.sig_alg)
+    }
+
     /// The certificate's validity period (`notBefore` / `notAfter`).
     pub fn validity(&self) -> Result<Validity, Error> {
         let mut seq = self.tbs_after_algid()?;

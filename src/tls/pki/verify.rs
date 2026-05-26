@@ -21,6 +21,7 @@
 //! common name).
 
 use super::store::RootCertStore;
+use crate::signature_registry::{SignaturePolicy, find_by_oid};
 use crate::tls::Error;
 use crate::x509::{AnyPublicKey, Certificate, Time, oid};
 use alloc::vec::Vec;
@@ -34,10 +35,17 @@ const KU_DIGITAL_SIGNATURE: u16 = 0x80; // bit 0 in BIT STRING wire order = MSB 
 ///
 /// When `now` is `Some`, every certificate in the chain must be within its
 /// validity period at that time; pass `None` to skip the expiry check.
+///
+/// `policy` is consulted for every signature in the chain (including the
+/// anchor signature on the topmost certificate). A chain whose certificate
+/// signatures use an algorithm not on the whitelist is rejected with
+/// `BadCertificate`, regardless of whether the signature would otherwise
+/// verify.
 pub(crate) fn verify_chain(
     store: &RootCertStore,
     chain: &[Vec<u8>],
     now: Option<&Time>,
+    policy: &SignaturePolicy,
 ) -> Result<AnyPublicKey, Error> {
     if chain.is_empty() {
         return Err(Error::BadCertificate);
@@ -65,8 +73,7 @@ pub(crate) fn verify_chain(
         let issuer_key = issuer
             .subject_public_key()
             .map_err(|_| Error::BadCertificate)?;
-        cert.verify_signature_with(&issuer_key)
-            .map_err(|_| Error::BadCertificate)?;
+        verify_cert_against_issuer(cert, &issuer_key, policy)?;
         if names_differ(cert, issuer)? {
             return Err(Error::BadCertificate);
         }
@@ -78,14 +85,35 @@ pub(crate) fn verify_chain(
     let anchor = store
         .find_issuer(&top_issuer)
         .ok_or(Error::BadCertificate)?;
-    top.verify_signature_with(&anchor.key)
-        .map_err(|_| Error::BadCertificate)?;
+    verify_cert_against_issuer(top, &anchor.key, policy)?;
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
     enforce_constraints(&certs)?;
 
     certs[0]
         .subject_public_key()
+        .map_err(|_| Error::BadCertificate)
+}
+
+/// Verifies the signature on `cert` under `issuer_key`, gating on `policy`.
+///
+/// Looks up the certificate's `signatureAlgorithm` OID in the registry,
+/// rejects any algorithm not on the whitelist (with `BadCertificate`), and
+/// only then delegates to the issuer key's verifier.
+fn verify_cert_against_issuer(
+    cert: &Certificate,
+    issuer_key: &AnyPublicKey,
+    policy: &SignaturePolicy,
+) -> Result<(), Error> {
+    let sig_alg = cert
+        .signature_algorithm_oid()
+        .map_err(|_| Error::BadCertificate)?;
+    let algo = find_by_oid(&sig_alg).ok_or(Error::BadCertificate)?;
+    let issuer_spki = issuer_key.to_spki_der();
+    if !policy.permits(algo, &issuer_spki) {
+        return Err(Error::BadCertificate);
+    }
+    cert.verify_signature_with(issuer_key)
         .map_err(|_| Error::BadCertificate)
 }
 
@@ -197,9 +225,16 @@ mod tests {
         )
     }
 
+    /// The shipped default policy.
+    fn policy() -> SignaturePolicy {
+        SignaturePolicy::modern()
+    }
+
     #[test]
     fn rfc8448_self_signed_anchor() {
-        // The RFC 8448 server certificate is self-signed ("rsa" -> "rsa").
+        // The RFC 8448 server certificate is self-signed ("rsa" -> "rsa"); its
+        // key is RSA-1024, so a default-policy verify would refuse it on the
+        // min_rsa_bits check. Lower the floor for this single legacy fixture.
         let flight = from_hex_vec(include_str!(
             "../../../testdata/rfc8448_server_flight_payload.hex"
         ));
@@ -208,7 +243,8 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(cert_der.clone()).unwrap();
 
-        let leaf_key = verify_chain(&store, &[cert_der], None).unwrap();
+        let relaxed = SignaturePolicy::modern().with_min_rsa_bits(1024);
+        let leaf_key = verify_chain(&store, &[cert_der], None, &relaxed).unwrap();
         assert!(matches!(leaf_key, AnyPublicKey::Rsa(_)));
     }
 
@@ -236,13 +272,15 @@ mod tests {
 
         // Within the validity window (exercises the expiry check positively).
         let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let policy = policy();
         // Chain with the leaf alone (root supplied by the store).
-        verify_chain(&store, &[leaf.to_der().to_vec()], Some(&now)).unwrap();
+        verify_chain(&store, &[leaf.to_der().to_vec()], Some(&now), &policy).unwrap();
         // Chain that also carries the root certificate.
         verify_chain(
             &store,
             &[leaf.to_der().to_vec(), root.to_der().to_vec()],
             Some(&now),
+            &policy,
         )
         .unwrap();
     }
@@ -255,14 +293,15 @@ mod tests {
 
         // Empty store -> no anchor.
         let empty = RootCertStore::new();
+        let policy = policy();
         assert!(matches!(
-            verify_chain(&empty, &[root.to_der().to_vec()], None),
+            verify_chain(&empty, &[root.to_der().to_vec()], None, &policy),
             Err(Error::BadCertificate)
         ));
 
         // Empty chain.
         assert!(matches!(
-            verify_chain(&empty, &[], None),
+            verify_chain(&empty, &[], None, &policy),
             Err(Error::BadCertificate)
         ));
     }
@@ -290,7 +329,7 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
         assert!(matches!(
-            verify_chain(&store, &[bogus.to_der().to_vec()], None),
+            verify_chain(&store, &[bogus.to_der().to_vec()], None, &policy()),
             Err(Error::BadCertificate)
         ));
     }
@@ -332,7 +371,7 @@ mod tests {
         store.add_der(root.to_der().to_vec()).unwrap();
         let chain = alloc::vec![leaf.to_der().to_vec(), bad_int.to_der().to_vec()];
         assert!(matches!(
-            verify_chain(&store, &chain, None),
+            verify_chain(&store, &chain, None, &policy()),
             Err(Error::BadCertificate)
         ));
     }
@@ -351,13 +390,14 @@ mod tests {
         store.add_der(cert.to_der().to_vec()).unwrap();
 
         let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let policy = policy();
         // Expired at `now`.
         assert!(matches!(
-            verify_chain(&store, &[cert.to_der().to_vec()], Some(&now)),
+            verify_chain(&store, &[cert.to_der().to_vec()], Some(&now), &policy),
             Err(Error::BadCertificate)
         ));
         // Accepted when no clock is supplied (expiry skipped).
-        verify_chain(&store, &[cert.to_der().to_vec()], None).unwrap();
+        verify_chain(&store, &[cert.to_der().to_vec()], None, &policy).unwrap();
     }
 
     #[test]
@@ -391,5 +431,33 @@ mod tests {
         .unwrap();
         verify_hostname(&cn_cert, "HOST.example").unwrap(); // case-insensitive
         assert!(verify_hostname(&cn_cert, "wrong.example").is_err());
+    }
+
+    /// A chain whose signature algorithm is in the registry but not on the
+    /// whitelist is rejected (with `BadCertificate`), even when the signature
+    /// itself would verify.
+    #[test]
+    fn rejects_unpermitted_algorithm() {
+        let key = rsa_test_key_a();
+        let cert = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("rsa.example"),
+            &validity(),
+            1,
+            true,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(cert.to_der().to_vec()).unwrap();
+
+        // The cert is `sha256WithRSAEncryption`. A policy that permits only
+        // ed25519 must reject it; the default policy must accept it.
+        let ed_only = SignaturePolicy::empty().permit("ed25519");
+        assert!(matches!(
+            verify_chain(&store, &[cert.to_der().to_vec()], None, &ed_only),
+            Err(Error::BadCertificate)
+        ));
+        verify_chain(&store, &[cert.to_der().to_vec()], None, &policy()).unwrap();
     }
 }

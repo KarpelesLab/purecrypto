@@ -1,4 +1,5 @@
-//! A registry of digital-signature algorithms.
+//! A registry of digital-signature algorithms, and a whitelist policy
+//! controlling which algorithms a verifier accepts.
 //!
 //! `purecrypto`'s X.509 chain validation and TLS 1.3 `CertificateVerify` paths
 //! used to each carry a hand-rolled `match` on the algorithm identifier (an
@@ -20,10 +21,15 @@
 //! `OnceLock`, no init order: the registry is `&'static` and works in
 //! `no_std`.
 //!
-//! A future commit layers a whitelist [`SignaturePolicy`](unspecified) on top.
-//! Today this module is only the dispatch surface; the default acceptance set
-//! is preserved by the call sites that route through it (today, exactly the
-//! pre-registry set).
+//! # Whitelist policy
+//!
+//! [`SignaturePolicy`] (requires `alloc`) enforces a strict **whitelist**:
+//! adding an algorithm to [`ALGORITHMS`] does NOT auto-permit it; the caller
+//! has to add the id explicitly. The shipped default
+//! [`SignaturePolicy::modern`] permits exactly the modern IANA-blessed set —
+//! RSA-PSS-RSAE / RSA-PKCS1 with SHA-256/384, ECDSA with matched-curve /
+//! matched-hash pairs over P-256/P-384/P-521, and Ed25519 — with RSA keys
+//! ≥ 2048 bits.
 
 use crate::x509::Error;
 
@@ -120,6 +126,125 @@ pub fn find_by_id(id: &str) -> Option<&'static dyn SignatureAlgorithm> {
     None
 }
 
+#[cfg(feature = "alloc")]
+mod policy {
+    use super::{SignatureAlgorithm, find_by_id};
+    use alloc::vec::Vec;
+
+    /// Compares two `&dyn SignatureAlgorithm` references for logical equality.
+    /// Pointer-identity is unreliable here: every registry entry is a
+    /// zero-sized type, and Rust does not guarantee distinct ZSTs have
+    /// distinct data-pointers. Using `id()` (a stable, unique string) is
+    /// both portable and matches the user-visible whitelist key.
+    fn algo_eq(a: &dyn SignatureAlgorithm, b: &dyn SignatureAlgorithm) -> bool {
+        a.id() == b.id()
+    }
+
+    /// Whitelist policy controlling which signature algorithms a verifier
+    /// accepts. Adding an algorithm to [`super::ALGORITHMS`] does NOT
+    /// auto-permit it; the caller must explicitly add it here with
+    /// [`Self::permit`].
+    ///
+    /// The shipped default — [`SignaturePolicy::modern`] — accepts exactly the
+    /// modern IANA-blessed set: RSA-PKCS1 / RSA-PSS-RSAE with SHA-256/384/512,
+    /// ECDSA with matched curve/hash pairs over P-256/P-384/P-521, and
+    /// Ed25519. RSA keys must be at least 2048 bits.
+    #[derive(Clone)]
+    pub struct SignaturePolicy {
+        permitted: Vec<&'static dyn SignatureAlgorithm>,
+        /// Minimum acceptable RSA modulus length, in bits.
+        pub min_rsa_bits: u32,
+    }
+
+    impl SignaturePolicy {
+        /// The shipped default whitelist: modern IANA-blessed signature
+        /// algorithms, RSA ≥ 2048 bits.
+        ///
+        /// Permitted ids:
+        ///   * `rsa-pkcs1-sha256`, `rsa-pkcs1-sha384`
+        ///   * `rsa-pss-rsae-sha256`, `rsa-pss-rsae-sha384`, `rsa-pss-rsae-sha512`
+        ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
+        ///     `ecdsa-secp521r1-sha512`
+        ///   * `ed25519`
+        ///
+        /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, secp256k1,
+        /// cross-hash ECDSA, SLH-DSA, …) is one-line opt-in via
+        /// [`Self::permit`].
+        pub fn modern() -> Self {
+            let permitted_ids = [
+                "rsa-pkcs1-sha256",
+                "rsa-pkcs1-sha384",
+                "rsa-pss-rsae-sha256",
+                "rsa-pss-rsae-sha384",
+                "rsa-pss-rsae-sha512",
+                "ecdsa-secp256r1-sha256",
+                "ecdsa-secp384r1-sha384",
+                "ecdsa-secp521r1-sha512",
+                "ed25519",
+            ];
+            let mut permitted = Vec::new();
+            for id in permitted_ids {
+                if let Some(algo) = find_by_id(id) {
+                    permitted.push(algo);
+                }
+            }
+            SignaturePolicy {
+                permitted,
+                min_rsa_bits: 2048,
+            }
+        }
+
+        /// An empty policy — accepts nothing. Build it up by chaining
+        /// [`SignaturePolicy::permit`].
+        pub fn empty() -> Self {
+            SignaturePolicy {
+                permitted: Vec::new(),
+                min_rsa_bits: 2048,
+            }
+        }
+
+        /// Adds an algorithm by id, looking it up in [`super::ALGORITHMS`].
+        /// Ignores unknown ids and duplicates.
+        pub fn permit(mut self, id: &str) -> Self {
+            if let Some(algo) = find_by_id(id)
+                && !self.permitted.iter().any(|a| algo_eq(*a, algo))
+            {
+                self.permitted.push(algo);
+            }
+            self
+        }
+
+        /// Overrides the RSA-modulus-bit floor.
+        pub fn with_min_rsa_bits(mut self, bits: u32) -> Self {
+            self.min_rsa_bits = bits;
+            self
+        }
+
+        /// `true` if `algo` is on the whitelist and `spki`'s parameters meet
+        /// any extra constraints (today only the `min_rsa_bits` check).
+        pub fn permits(&self, algo: &dyn SignatureAlgorithm, spki: &[u8]) -> bool {
+            if !self.permitted.iter().any(|a| algo_eq(*a, algo)) {
+                return false;
+            }
+            if let Some(bits) = algo.rsa_modulus_bits(spki)
+                && bits < self.min_rsa_bits
+            {
+                return false;
+            }
+            true
+        }
+    }
+
+    impl Default for SignaturePolicy {
+        fn default() -> Self {
+            Self::modern()
+        }
+    }
+}
+
+#[cfg(feature = "alloc")]
+pub use policy::SignaturePolicy;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +269,59 @@ mod tests {
         // TLS scheme for rsa_pss_rsae_sha256.
         let algo = find_by_tls_scheme(0x0804).expect("rsa_pss_rsae_sha256");
         assert_eq!(algo.id(), "rsa-pss-rsae-sha256");
+    }
+
+    #[cfg(all(feature = "rsa", feature = "ec", feature = "alloc"))]
+    #[test]
+    fn modern_policy_permits_default_set() {
+        let policy = SignaturePolicy::modern();
+        for id in [
+            "rsa-pkcs1-sha256",
+            "rsa-pkcs1-sha384",
+            "rsa-pss-rsae-sha256",
+            "rsa-pss-rsae-sha384",
+            "rsa-pss-rsae-sha512",
+            "ecdsa-secp256r1-sha256",
+            "ecdsa-secp384r1-sha384",
+            "ecdsa-secp521r1-sha512",
+            "ed25519",
+        ] {
+            let algo = find_by_id(id).unwrap();
+            assert!(policy.permits(algo, &[]), "modern() should permit {id}");
+        }
+    }
+
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    #[test]
+    fn empty_policy_permits_nothing_until_opt_in() {
+        let algo = find_by_id("ed25519").unwrap();
+        let policy = SignaturePolicy::empty();
+        assert!(!policy.permits(algo, &[]));
+        let policy = policy.permit("ed25519");
+        assert!(policy.permits(algo, &[]));
+    }
+
+    #[cfg(all(feature = "rsa", feature = "alloc"))]
+    #[test]
+    fn min_rsa_bits_floor_rejects_small_keys() {
+        use crate::x509::AnyPublicKey;
+        let key = crate::test_util::rsa_test_key_a();
+        let pk = key.public_key();
+        let mut n = [0u8; 256];
+        pk.modulus().write_be_bytes(&mut n);
+        let mut e = [0u8; 256];
+        pk.exponent().write_be_bytes(&mut e);
+        let boxed = crate::rsa::BoxedRsaPublicKey::new(
+            crate::bignum::BoxedUint::from_be_bytes(&n),
+            crate::bignum::BoxedUint::from_be_bytes(&e),
+        );
+        let spki = AnyPublicKey::Rsa(boxed).to_spki_der();
+
+        let algo = find_by_id("rsa-pkcs1-sha256").unwrap();
+        // 2048-bit key permitted under default min.
+        assert!(SignaturePolicy::modern().permits(algo, &spki));
+        // Asking for ≥ 4096 bits rejects a 2048-bit key.
+        let strict = SignaturePolicy::modern().with_min_rsa_bits(4096);
+        assert!(!strict.permits(algo, &spki));
     }
 }
