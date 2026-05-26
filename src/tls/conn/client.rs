@@ -94,6 +94,16 @@ pub struct ClientConnection {
     p256: BoxedEcdhPrivateKey,
     mlkem: MlKem768DecapsKey,
 
+    /// CH1 state retained for HelloRetryRequest replay (RFC 8446 §4.1.2):
+    /// CH2 must reuse the same client_random and offered_groups, narrowed to
+    /// the HRR-selected group.
+    client_random: Random,
+    offered_suites: Vec<CipherSuite>,
+    offered_groups: Vec<NamedGroup>,
+    /// Set to `true` after a single HelloRetryRequest has been processed; a
+    /// second one is rejected (RFC 8446 §4.1.4).
+    hrr_processed: bool,
+
     suite: Option<SuiteParams>,
     ks: Option<KeySchedule>,
     client_hs_secret: Option<Secret>,
@@ -245,6 +255,10 @@ impl ClientConnection {
             x25519,
             p256,
             mlkem,
+            client_random: random,
+            offered_suites: suites.to_vec(),
+            offered_groups: groups.to_vec(),
+            hrr_processed: false,
             suite: None,
             ks: None,
             client_hs_secret: None,
@@ -255,20 +269,30 @@ impl ClientConnection {
             leaf_key: None,
             last_ticket: None,
         };
-        let hello = conn.build_client_hello(random, String::from(server_name), suites, groups);
+        let hello =
+            conn.build_client_hello(random, String::from(server_name), suites, groups, &[], &[]);
         conn.core.emit_handshake(hello);
         conn
     }
 
+    /// Builds a ClientHello. If `share_only` is non-empty, only those groups
+    /// get a `key_share` entry (used for HRR retry, where the server picked a
+    /// specific group); if empty, all `groups` get one. `extra_extensions`
+    /// (typically the HRR-supplied `cookie`) are appended verbatim.
     fn build_client_hello(
         &self,
         random: Random,
         server_name: String,
         suites: &[CipherSuite],
         groups: &[NamedGroup],
+        share_only: &[NamedGroup],
+        extra_extensions: &[crate::tls::codec::RawExtension],
     ) -> Vec<u8> {
         let mut key_shares = Vec::new();
         for &g in groups {
+            if !share_only.is_empty() && !share_only.contains(&g) {
+                continue;
+            }
             match g {
                 NamedGroup::X25519 => {
                     key_shares.push((NamedGroup::X25519, self.x25519.public_key().to_vec()))
@@ -285,13 +309,14 @@ impl ClientConnection {
                 _ => {}
             }
         }
-        let extensions = alloc::vec![
+        let mut extensions = alloc::vec![
             ext::server_name(&server_name),
             ext::supported_groups_list(groups),
             ext::signature_algorithms(),
             ext::client_supported_versions(),
             ext::client_key_shares(&key_shares),
         ];
+        extensions.extend_from_slice(extra_extensions);
         ClientHello {
             random,
             session_id: Vec::new(),
@@ -490,8 +515,7 @@ impl ClientConnection {
         }
         let sh = ServerHello::decode(body)?;
         if is_hello_retry_request(&sh.random) {
-            // HelloRetryRequest is not yet supported.
-            return Err(Error::HandshakeFailure);
+            return self.on_hello_retry_request(sh, raw);
         }
 
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
@@ -543,6 +567,82 @@ impl ClientConnection {
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
         self.state = State::WaitEncryptedExtensions;
+        Ok(())
+    }
+
+    /// Handles a HelloRetryRequest (RFC 8446 §4.1.4): rewrites the transcript
+    /// with the synthetic `message_hash`, validates the selected group is one
+    /// we offered, and re-emits ClientHello2 narrowed to that group (echoing
+    /// any cookie). Stays in `WaitServerHello` for the real ServerHello.
+    fn on_hello_retry_request(&mut self, hrr: ServerHello, raw: &[u8]) -> Result<(), Error> {
+        // Only one HRR per handshake (RFC §4.1.4: the client MUST abort with
+        // unexpected_message if a second one arrives).
+        if self.hrr_processed {
+            return Err(Error::UnexpectedMessage);
+        }
+
+        // The HRR's cipher_suite must be one we offered.
+        if !self.offered_suites.contains(&hrr.cipher_suite) {
+            return Err(Error::IllegalParameter);
+        }
+        let suite = lookup_suite(hrr.cipher_suite).ok_or(Error::HandshakeFailure)?;
+
+        // Validate selected version is TLS 1.3.
+        let sv = ext::find(
+            &hrr.extensions,
+            crate::tls::codec::ExtensionType::SUPPORTED_VERSIONS,
+        )
+        .ok_or(Error::UnsupportedVersion)?;
+        if ext::parse_selected_version(sv)? != crate::tls::ProtocolVersion::TLSv1_3 {
+            return Err(Error::UnsupportedVersion);
+        }
+
+        // The HRR carries either a `key_share(selected_group)` or a `cookie`
+        // (or both). The selected group, if present, must be in our offer.
+        let selected_group =
+            match ext::find(&hrr.extensions, crate::tls::codec::ExtensionType::KEY_SHARE) {
+                Some(body) => {
+                    let g = ext::parse_hrr_key_share(body)?;
+                    if !self.offered_groups.contains(&g) {
+                        return Err(Error::IllegalParameter);
+                    }
+                    Some(g)
+                }
+                None => None,
+            };
+        // If neither a new group nor a cookie is present, the HRR makes no
+        // change and per RFC §4.1.4 the client MUST abort with
+        // illegal_parameter (otherwise we'd loop).
+        let cookie_ext = hrr
+            .extensions
+            .iter()
+            .find(|(t, _)| t.0 == 0x002c) // cookie
+            .cloned();
+        if selected_group.is_none() && cookie_ext.is_none() {
+            return Err(Error::IllegalParameter);
+        }
+
+        // Pin the negotiated hash and rewrite the transcript per §4.4.1.
+        self.core.transcript.set_alg(suite.hash);
+        self.core.transcript.replace_with_message_hash();
+        self.core.transcript.update(raw);
+
+        // Build CH2: same client_random, same offered_suites/groups, narrow
+        // the key_share list to the selected group, echo the cookie verbatim.
+        let share_only: alloc::vec::Vec<NamedGroup> = selected_group.into_iter().collect();
+        let extras: alloc::vec::Vec<crate::tls::codec::RawExtension> =
+            cookie_ext.into_iter().collect();
+        let ch2 = self.build_client_hello(
+            self.client_random,
+            self.server_name.clone(),
+            &self.offered_suites.clone(),
+            &self.offered_groups.clone(),
+            &share_only,
+            &extras,
+        );
+        self.core.emit_handshake(ch2);
+        self.hrr_processed = true;
+        // Stay in WaitServerHello for the real ServerHello.
         Ok(())
     }
 
