@@ -15,11 +15,16 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::pki::{describe_key, format_dn, parse_sans, parse_subject, validity_days};
+use crate::pki::{
+    describe_key, format_dn, issuer_ski_bytes, parse_sans, parse_subject, spki_bit_string_contents,
+    validity_days,
+};
+use crate::template::{CertTemplate, builtin_names};
 use crate::util::{Args, die, write_output, write_output_with_mode};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+use purecrypto::x509::extension::{Extension, GeneralName};
 use purecrypto::x509::{
     AnyPublicKey, CertSigner, Certificate, CertificateRevocationList, CertificationRequest,
     CrlBuilder, CrlReason, DistinguishedName, Time, Validity,
@@ -213,16 +218,23 @@ fn run_init(args: Args) {
         )),
     };
 
-    // Build the self-signed CA cert.
+    // Build the self-signed CA cert using the built-in `ca-root` template.
+    // The template adds subjectKeyIdentifier + keyUsage (keyCertSign | cRLSign)
+    // + basicConstraints.ca=true on top of the legacy cert-only fields.
     let subject = DistinguishedName::common_name(cn);
     let validity = validity_days(days_n);
-    let cert = Certificate::self_signed_general(
-        &key_for_signer.signer(),
+    let signer = key_for_signer.signer();
+    let root_tmpl =
+        CertTemplate::builtin("ca-root").unwrap_or_else(|| die("missing ca-root template"));
+    let pubkey = signer.public_key();
+    let spki_bits = spki_bit_string_contents(&pubkey);
+    let exts: Vec<Extension> = root_tmpl.extensions(None, &[], &spki_bits);
+    let cert = Certificate::self_signed_with_extensions(
+        &signer,
         &subject,
         &validity,
         1, // CA serial = 1
-        true,
-        &[],
+        &exts,
     )
     .unwrap_or_else(|e| die(format!("cannot self-sign CA: {e}")));
 
@@ -269,8 +281,26 @@ fn run_issue(args: Args) {
         .value("-cn")
         .or_else(|| args.value("-subj"))
         .unwrap_or_else(|| die("missing -cn <NAME>"));
-    let is_ca = args.flag("-ca") || args.flag("--ca");
-    let days_n = days(&args);
+    let is_ca_flag = args.flag("-ca") || args.flag("--ca");
+
+    // Template resolution: explicit -template wins; -ca is short-hand for
+    // ca-intermediate; otherwise the (per-arg) -days/-sans drive a plain
+    // issuance with no v3 extension policy beyond basicConstraints + SAN.
+    let template_name = args.value("-template").or_else(|| {
+        if is_ca_flag {
+            Some("ca-intermediate")
+        } else {
+            None
+        }
+    });
+    let template = CertTemplate::resolve(template_name, args.value("-template-file"))
+        .unwrap_or_else(|e| die(format!("template error: {e}")));
+
+    let days_n = args
+        .value("-days")
+        .map(|d| d.parse::<u64>().unwrap_or_else(|_| die("invalid -days")))
+        .or_else(|| template.as_ref().and_then(|t| t.default_days.map(|d| d as u64)))
+        .unwrap_or(365);
 
     let raw = read_bytes(Path::new(pub_path));
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("pubkey is not PEM"));
@@ -295,17 +325,39 @@ fn run_issue(args: Args) {
 
     let serial = next_serial(&ca);
     let validity = validity_days(days_n);
-    let cert = Certificate::issue_general(
-        &root_key.signer(),
-        &issuer_dn,
-        &subject,
-        &subject_key,
-        &validity,
-        serial,
-        is_ca,
-        &san_refs,
-    )
-    .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")));
+
+    let cert = if let Some(tmpl) = template {
+        let issuer_ski = issuer_ski_bytes(&root_cert);
+        let subj_spki_bits = spki_bit_string_contents(&subject_key);
+        let csr_sans: Vec<GeneralName> = sans
+            .iter()
+            .map(|s| GeneralName::Dns(s.clone()))
+            .collect();
+        let exts: Vec<Extension> =
+            tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
+        Certificate::issue_with_extensions(
+            &root_key.signer(),
+            &issuer_dn,
+            &subject,
+            &subject_key,
+            &validity,
+            serial,
+            &exts,
+        )
+        .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
+    } else {
+        Certificate::issue_general(
+            &root_key.signer(),
+            &issuer_dn,
+            &subject,
+            &subject_key,
+            &validity,
+            serial,
+            is_ca_flag,
+            &san_refs,
+        )
+        .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
+    };
     bump_serial(&ca, serial);
 
     // Record in issued.jsonl.
@@ -339,8 +391,23 @@ fn run_sign_csr(args: Args) {
     let csr_path = args
         .value("-in")
         .unwrap_or_else(|| die("missing -in <csr.pem>"));
-    let is_ca = args.flag("-ca") || args.flag("--ca");
-    let days_n = days(&args);
+    let is_ca_flag = args.flag("-ca") || args.flag("--ca");
+
+    let template_name = args.value("-template").or_else(|| {
+        if is_ca_flag {
+            Some("ca-intermediate")
+        } else {
+            None
+        }
+    });
+    let template = CertTemplate::resolve(template_name, args.value("-template-file"))
+        .unwrap_or_else(|e| die(format!("template error: {e}")));
+
+    let days_n = args
+        .value("-days")
+        .map(|d| d.parse::<u64>().unwrap_or_else(|_| die("invalid -days")))
+        .or_else(|| template.as_ref().and_then(|t| t.default_days.map(|d| d as u64)))
+        .unwrap_or(365);
 
     let raw = read_bytes(Path::new(csr_path));
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("CSR is not PEM"));
@@ -355,20 +422,52 @@ fn run_sign_csr(args: Args) {
 
     let serial = next_serial(&ca);
     let validity = validity_days(days_n);
-    let cert = Certificate::issue_from_csr(
-        &root_key.signer(),
-        &issuer_dn,
-        &csr,
-        &validity,
-        serial,
-        is_ca,
-    )
-    .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")));
-    bump_serial(&ca, serial);
 
-    let subject = csr
+    // The CSR's self-signature MUST verify before we trust its subject/key.
+    csr.verify_self_signed()
+        .unwrap_or_else(|e| die(format!("CSR signature invalid: {e}")));
+    let subject_from_csr = csr
         .subject()
         .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
+    let subject_key = csr
+        .public_key()
+        .unwrap_or_else(|e| die(format!("bad CSR key: {e}")));
+
+    let cert = if let Some(tmpl) = template {
+        let issuer_ski = issuer_ski_bytes(&root_cert);
+        let subj_spki_bits = spki_bit_string_contents(&subject_key);
+        // CSR-supplied SANs honored only when the template asks for them.
+        let csr_dns = csr.subject_alt_names().unwrap_or_default();
+        let csr_sans: Vec<GeneralName> = csr_dns
+            .iter()
+            .map(|s| GeneralName::Dns(s.clone()))
+            .collect();
+        let exts: Vec<Extension> =
+            tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
+        Certificate::issue_with_extensions(
+            &root_key.signer(),
+            &issuer_dn,
+            &subject_from_csr,
+            &subject_key,
+            &validity,
+            serial,
+            &exts,
+        )
+        .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
+    } else {
+        Certificate::issue_from_csr(
+            &root_key.signer(),
+            &issuer_dn,
+            &csr,
+            &validity,
+            serial,
+            is_ca_flag,
+        )
+        .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
+    };
+    bump_serial(&ca, serial);
+
+    let subject = subject_from_csr;
     let sans = csr.subject_alt_names().unwrap_or_default();
     let sans_json = sans
         .iter()
@@ -600,6 +699,21 @@ fn run_show(args: Args) {
 }
 
 // ---------------------------------------------------------------------------
+// list-templates
+
+fn run_list_templates(_args: Args) {
+    println!("Built-in certificate templates:");
+    for n in builtin_names() {
+        let t = CertTemplate::builtin(n).expect("missing built-in");
+        let days = t
+            .default_days
+            .map(|d| format!("{d}d"))
+            .unwrap_or_else(|| "?".into());
+        println!("    {:<18} default_days={days}", n);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // dispatch
 
 const USAGE: &str = "\
@@ -607,17 +721,32 @@ purecrypto ca — manage a development CA
 
 USAGE:
     purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519] [-curve P-256] [-days N]
-    purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca]
-    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca]
+    purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH]
+    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-template NAME] [-template-file PATH]
     purecrypto ca revoke  -dir DIR -serial 7|0x7 [-reason key-compromise|superseded|...]
     purecrypto ca crl     -dir DIR [-out crl.pem] [-days N]
     purecrypto ca show    -dir DIR
+    purecrypto ca list-templates
 ";
 
 pub(crate) fn run(args: Args) {
     let positionals = args.positionals(&[
-        "-dir", "-cn", "-algorithm", "-curve", "-days", "-pubkey", "-in", "-out", "-sans",
-        "-addext", "-san", "-subj", "-serial", "-reason",
+        "-dir",
+        "-cn",
+        "-algorithm",
+        "-curve",
+        "-days",
+        "-pubkey",
+        "-in",
+        "-out",
+        "-sans",
+        "-addext",
+        "-san",
+        "-subj",
+        "-serial",
+        "-reason",
+        "-template",
+        "-template-file",
     ]);
     let sub = positionals.first().copied().unwrap_or("");
 
@@ -628,6 +757,7 @@ pub(crate) fn run(args: Args) {
         "revoke" => run_revoke(args),
         "crl" => run_crl(args),
         "show" => run_show(args),
+        "list-templates" => run_list_templates(args),
         "" | "help" | "-h" | "--help" => println!("{USAGE}"),
         other => die(format!(
             "unknown ca subcommand '{other}' (try `purecrypto ca help`)"

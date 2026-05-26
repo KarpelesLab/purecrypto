@@ -6,7 +6,9 @@ use crate::util::die;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::rng::{OsRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
-use purecrypto::x509::{AnyPublicKey, CertSigner, DistinguishedName, Time, Validity};
+use purecrypto::x509::{
+    AnyPublicKey, CertSigner, Certificate, DistinguishedName, Time, Validity, oid,
+};
 
 /// A loaded private key (the owner; borrow a [`CertSigner`] from it).
 pub(crate) enum PrivateKey {
@@ -125,6 +127,42 @@ pub(crate) fn random_serial() -> u64 {
     // 0x00 padding byte the high-bit-set case would parse negative), and set
     // the low bit so the value is non-zero.
     (u64::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff) | 1
+}
+
+/// Extracts the `BIT STRING` *contents* of an `AnyPublicKey`'s SPKI — the
+/// raw key-bits payload, without the outer `SubjectPublicKeyInfo` SEQUENCE
+/// or the BIT STRING's unused-bits prefix byte. This is the input to method
+/// 1 of RFC 5280 §4.2.1.2 for computing a subjectKeyIdentifier.
+pub(crate) fn spki_bit_string_contents(key: &AnyPublicKey) -> Vec<u8> {
+    let der = key.to_spki_der();
+    // SPKI ::= SEQUENCE { AlgorithmIdentifier, BIT STRING }.
+    // Walk the outer SEQUENCE → AlgorithmIdentifier → BIT STRING.
+    use purecrypto::der::Reader;
+    let mut r = Reader::new(&der);
+    let mut spki = r.read_sequence().expect("SPKI: outer SEQUENCE");
+    spki.read_sequence().expect("SPKI: AlgorithmIdentifier");
+    spki.read_bit_string()
+        .expect("SPKI: BIT STRING")
+        .to_vec()
+}
+
+/// Returns the issuer's subjectKeyIdentifier bytes (the keyIdentifier
+/// OCTET STRING inside the SKI extension), or an empty vec if the
+/// certificate has no SKI extension. Used by templates that emit an
+/// authorityKeyIdentifier on the issued leaf.
+pub(crate) fn issuer_ski_bytes(cert: &Certificate) -> Vec<u8> {
+    let exts = cert.extensions().unwrap_or_default();
+    for e in exts {
+        if e.oid == oid::SUBJECT_KEY_IDENTIFIER {
+            // Value is OCTET STRING { keyIdentifier }.
+            use purecrypto::der::Reader;
+            let mut r = Reader::new(&e.value);
+            if let Ok(ki) = r.read_octet_string() {
+                return ki.to_vec();
+            }
+        }
+    }
+    Vec::new()
 }
 
 /// Parses dNSName entries from `-addext "subjectAltName=DNS:a,DNS:b"` or a plain
