@@ -477,8 +477,16 @@ impl Ed25519PublicKey {
         self.0
     }
 
-    /// Verifies `signature` over `message` (RFC 8032 §5.1.7). Returns
-    /// [`Error::Verification`] on any failure (malformed inputs included).
+    /// Verifies `signature` over `message`. Uses the *cofactored* group
+    /// equation `[8S]B == [8R] + [8k]A` (ZIP-215 / FIPS-186-5 best practice),
+    /// which rejects any small-subgroup `A` or `R`: multiplying by the
+    /// cofactor 8 sends every 8-torsion point to the identity, so an
+    /// attacker can't smuggle in identity-encoded `A` (which would make
+    /// `[k]A == identity` for every `k` and let any `(R, S)` with
+    /// `R == [S]B` verify on every message — a universal forgery).
+    ///
+    /// Returns [`Error::Verification`] on any failure (malformed inputs
+    /// included).
     pub fn verify(&self, message: &[u8], signature: &Ed25519Signature) -> Result<(), Error> {
         let f = Field::new();
 
@@ -504,11 +512,14 @@ impl Ed25519PublicKey {
         let mut k_bytes = [0u8; 32];
         k.write_le_bytes(&mut k_bytes);
 
-        // Accept iff [S]B = R + [k]A.
+        // Cofactored verify: accept iff [8S]B == [8R] + [8k]A. We multiply
+        // each side of the cofactor-less equation by 8 = [2][2][2].
         let lhs = scalar_mult(&f, &s_bytes, &f.base());
         let ka = scalar_mult(&f, &k_bytes, &a_point);
         let rhs = point_add(&f, &r_point, &ka);
-        if f.encode(&lhs) == f.encode(&rhs) {
+        let lhs8 = point_double(&f, &point_double(&f, &point_double(&f, &lhs)));
+        let rhs8 = point_double(&f, &point_double(&f, &point_double(&f, &rhs)));
+        if f.encode(&lhs8) == f.encode(&rhs8) {
             Ok(())
         } else {
             Err(Error::Verification)
