@@ -82,12 +82,40 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::rsa::registry::PssRsaeSha384,
     #[cfg(all(feature = "rsa", feature = "alloc"))]
     &crate::rsa::registry::PssRsaeSha512,
+    // OID-keyed ECDSA entries (X.509 chain dispatch).
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSha256AnyCurve,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSha384AnyCurve,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSha512AnyCurve,
+    // Strict curve/hash-pair ECDSA entries (TLS scheme dispatch, fine-grained
+    // policy whitelisting). Matched-pair entries carry an IANA TLS scheme;
+    // cross-hash and secp256k1 entries have none and are policy-only.
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaP256Sha256,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaP384Sha384,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaP521Sha512,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP256Sha384,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP256Sha512,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP384Sha256,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP384Sha512,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP521Sha256,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaP521Sha384,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSecp256k1Sha256,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSecp256k1Sha384,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaSecp256k1Sha512,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::Ed25519,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]
@@ -96,6 +124,32 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::mldsa::registry::MlDsa65,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]
     &crate::mldsa::registry::MlDsa87,
+    // SLH-DSA (FIPS 205) × 12 parameter sets. None are on `modern()`;
+    // explicit opt-in (signatures are 7–50 KB).
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2128s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2128f,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2192s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2192f,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2256s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaSha2256f,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake128s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake128f,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake192s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake192f,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake256s,
+    #[cfg(all(feature = "slhdsa", feature = "alloc"))]
+    &crate::slhdsa::registry::SlhDsaShake256f,
 ];
 
 /// Looks up a registry entry by X.509 `AlgorithmIdentifier` OID arcs.
@@ -184,6 +238,12 @@ mod policy {
                 "rsa-pss-rsae-sha256",
                 "rsa-pss-rsae-sha384",
                 "rsa-pss-rsae-sha512",
+                // X.509-chain dispatch entries (OID-keyed; any supported curve).
+                // The matched-pair entries below pin the curve for TLS 1.3
+                // CertificateVerify (one per IANA scheme code point).
+                "ecdsa-with-sha256",
+                "ecdsa-with-sha384",
+                "ecdsa-with-sha512",
                 "ecdsa-secp256r1-sha256",
                 "ecdsa-secp384r1-sha384",
                 "ecdsa-secp521r1-sha512",
@@ -273,8 +333,13 @@ mod tests {
     #[cfg(all(feature = "rsa", feature = "ec", feature = "alloc"))]
     #[test]
     fn lookup_by_oid_and_scheme() {
-        // X.509 OID for ecdsa-with-SHA256.
+        // X.509 OID for ecdsa-with-SHA256 dispatches through the OID-keyed
+        // any-curve entry (the strict pair entries have no X.509 OIDs).
         let algo = find_by_oid(&[1, 2, 840, 10045, 4, 3, 2]).expect("ecdsa-with-SHA256");
+        assert_eq!(algo.id(), "ecdsa-with-sha256");
+        // TLS scheme for ecdsa_secp256r1_sha256 dispatches through the strict
+        // pair entry.
+        let algo = find_by_tls_scheme(0x0403).expect("ecdsa_secp256r1_sha256");
         assert_eq!(algo.id(), "ecdsa-secp256r1-sha256");
         // TLS scheme for rsa_pss_rsae_sha256.
         let algo = find_by_tls_scheme(0x0804).expect("rsa_pss_rsae_sha256");

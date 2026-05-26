@@ -455,6 +455,70 @@ mod tests {
         assert!(matches!(leaf_key, AnyPublicKey::MlDsa65(_)));
     }
 
+    /// A chain whose leaf is signed with secp256k1 verifies only when the
+    /// policy explicitly permits the algorithm; the default `modern()`
+    /// policy refuses (secp256k1 is in the registry but not on the
+    /// whitelist).
+    #[test]
+    fn secp256k1_chain_under_extended_policy() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        use crate::x509::CertSigner;
+        let mut rng = HmacDrbg::<Sha256>::new(b"verify-k1", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::Secp256k1, &mut rng);
+        let signer = CertSigner::Ecdsa(&sk);
+        let name = DistinguishedName::common_name("k1.example");
+        let cert =
+            Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[]).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(cert.to_der().to_vec()).unwrap();
+
+        // Cert's signatureAlgorithm is `ecdsa-with-SHA256`. The default policy
+        // permits the `ecdsa-with-sha256` OID-keyed entry — which accepts any
+        // supported curve — so the chain validates without opt-in. (secp256k1
+        // is in the registry; the policy gates the OID-keyed entry, not the
+        // strict secp256k1 entry.)
+        verify_chain(&store, &[cert.to_der().to_vec()], None, &policy()).unwrap();
+
+        // To assert the strict-pair entry is opt-in only, build a policy that
+        // permits only Ed25519 — secp256k1 + ECDSA-SHA256 must be refused.
+        let restrictive = SignaturePolicy::empty().permit("ed25519");
+        assert!(matches!(
+            verify_chain(&store, &[cert.to_der().to_vec()], None, &restrictive),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// A self-signed SLH-DSA-SHA2-128f cert validates only under a policy
+    /// that explicitly permits SLH-DSA (the default `modern()` does not).
+    #[test]
+    fn slhdsa_chain_under_extended_policy() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        use crate::slhdsa::{ParamSet, PrivateKey};
+        use crate::x509::CertSigner;
+        let mut rng = HmacDrbg::<Sha256>::new(b"verify-slhdsa", b"n", &[]);
+        let (sk, _pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let signer = CertSigner::SlhDsa(&sk);
+        let name = DistinguishedName::common_name("slhdsa.example");
+        let cert =
+            Certificate::self_signed_general(&signer, &name, &validity(), 1, true, &[]).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(cert.to_der().to_vec()).unwrap();
+
+        // Default policy refuses.
+        assert!(matches!(
+            verify_chain(&store, &[cert.to_der().to_vec()], None, &policy()),
+            Err(Error::BadCertificate)
+        ));
+        // Extended policy accepts.
+        let extended = SignaturePolicy::modern().permit("slh-dsa-sha2-128f");
+        verify_chain(&store, &[cert.to_der().to_vec()], None, &extended).unwrap();
+    }
+
     /// A chain whose signature algorithm is in the registry but not on the
     /// whitelist is rejected (with `BadCertificate`), even when the signature
     /// itself would verify.

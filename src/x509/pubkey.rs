@@ -12,6 +12,8 @@ use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed25519PublicKey};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PublicKey, MlDsa65PublicKey, MlDsa87PublicKey};
 use crate::rsa::BoxedRsaPublicKey;
+#[cfg(feature = "slhdsa")]
+use crate::slhdsa;
 
 const SPKI_LABEL: &str = "PUBLIC KEY";
 
@@ -67,6 +69,11 @@ pub enum AnyPublicKey {
     /// An ML-DSA-87 (FIPS 204) public key.
     #[cfg(feature = "mldsa")]
     MlDsa87(MlDsa87PublicKey),
+    /// An SLH-DSA (FIPS 205) public key. The variant carries the parameter
+    /// set inside the [`slhdsa::PublicKey`] (so a single enum arm covers all
+    /// twelve standardized sets).
+    #[cfg(feature = "slhdsa")]
+    SlhDsa(slhdsa::PublicKey),
 }
 
 impl AnyPublicKey {
@@ -96,6 +103,8 @@ impl AnyPublicKey {
             AnyPublicKey::MlDsa65(k) => mldsa_spki(oid::ID_ML_DSA_65, k.to_bytes()),
             #[cfg(feature = "mldsa")]
             AnyPublicKey::MlDsa87(k) => mldsa_spki(oid::ID_ML_DSA_87, k.to_bytes()),
+            #[cfg(feature = "slhdsa")]
+            AnyPublicKey::SlhDsa(k) => k.to_spki_der(),
         }
     }
 
@@ -140,6 +149,14 @@ impl AnyPublicKey {
                     return Ok(AnyPublicKey::MlDsa87(
                         MlDsa87PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
                     ));
+                }
+            }
+            #[cfg(feature = "slhdsa")]
+            {
+                if let Some(set) = slhdsa::ParamSet::from_oid(alg.as_slice()) {
+                    let pk = slhdsa::PublicKey::from_bytes(set, key_bits)
+                        .map_err(|_| Error::Malformed)?;
+                    return Ok(AnyPublicKey::SlhDsa(pk));
                 }
             }
             Err(Error::UnsupportedAlgorithm)

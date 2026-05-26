@@ -99,6 +99,7 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
         AnyPublicKey::MlDsa44(_) => "ML-DSA-44".to_string(),
         AnyPublicKey::MlDsa65(_) => "ML-DSA-65".to_string(),
         AnyPublicKey::MlDsa87(_) => "ML-DSA-87".to_string(),
+        AnyPublicKey::SlhDsa(k) => format!("SLH-DSA ({:?})", k.parameter_set()),
     }
 }
 

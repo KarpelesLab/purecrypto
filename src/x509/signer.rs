@@ -9,9 +9,11 @@ use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use crate::hash::{Sha256, Sha384, Sha512};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
-#[cfg(feature = "mldsa")]
+#[cfg(any(feature = "mldsa", feature = "slhdsa"))]
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
+#[cfg(feature = "slhdsa")]
+use crate::slhdsa;
 
 /// A certificate/CSR signing key.
 ///
@@ -40,6 +42,10 @@ pub enum CertSigner<'a> {
     /// An ML-DSA-87 signing key (FIPS 204).
     #[cfg(feature = "mldsa")]
     MlDsa87(&'a MlDsa87PrivateKey),
+    /// An SLH-DSA signing key (FIPS 205). The parameter set lives inside
+    /// the key.
+    #[cfg(feature = "slhdsa")]
+    SlhDsa(&'a slhdsa::PrivateKey),
 }
 
 impl CertSigner<'_> {
@@ -59,6 +65,8 @@ impl CertSigner<'_> {
             CertSigner::MlDsa65(_) => oid::ID_ML_DSA_65,
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa87(_) => oid::ID_ML_DSA_87,
+            #[cfg(feature = "slhdsa")]
+            CertSigner::SlhDsa(k) => k.parameter_set().oid(),
         }
     }
 
@@ -104,14 +112,18 @@ impl CertSigner<'_> {
             CertSigner::MlDsa87(k) => k
                 .sign_deterministic(tbs, b"")
                 .map_err(|_| Error::Verification),
+            #[cfg(feature = "slhdsa")]
+            CertSigner::SlhDsa(k) => k
+                .sign_deterministic(tbs, b"")
+                .map_err(|_| Error::Verification),
         }
     }
 
-    /// Like [`Self::sign`] but uses `rng` to hedge ML-DSA signatures.
-    /// RSA / ECDSA / Ed25519 paths ignore the RNG (their signing is
-    /// deterministic or, in the case of RSA-PKCS1, takes no fresh randomness
-    /// in this code path).
-    #[cfg(feature = "mldsa")]
+    /// Like [`Self::sign`] but uses `rng` to hedge ML-DSA / SLH-DSA
+    /// signatures. RSA / ECDSA / Ed25519 paths ignore the RNG (their signing
+    /// is deterministic, or in the case of RSA-PKCS1 takes no fresh
+    /// randomness in this code path).
+    #[cfg(any(feature = "mldsa", feature = "slhdsa"))]
     #[allow(dead_code)]
     pub(crate) fn sign_with_rng<R: RngCore>(
         &self,
@@ -119,9 +131,14 @@ impl CertSigner<'_> {
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
         match self {
+            #[cfg(feature = "mldsa")]
             CertSigner::MlDsa44(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            #[cfg(feature = "mldsa")]
             CertSigner::MlDsa65(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            #[cfg(feature = "mldsa")]
             CertSigner::MlDsa87(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            #[cfg(feature = "slhdsa")]
+            CertSigner::SlhDsa(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
             other => other.sign(tbs),
         }
     }
@@ -138,6 +155,8 @@ impl CertSigner<'_> {
             CertSigner::MlDsa65(k) => AnyPublicKey::MlDsa65(k.public_key()),
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa87(k) => AnyPublicKey::MlDsa87(k.public_key()),
+            #[cfg(feature = "slhdsa")]
+            CertSigner::SlhDsa(k) => AnyPublicKey::SlhDsa(k.public_key()),
         }
     }
 }
