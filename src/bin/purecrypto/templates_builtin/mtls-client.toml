@@ -1,0 +1,22 @@
+# Short-lived mutual-TLS client leaf — same as tls-client with 30-day validity.
+name = "mtls-client"
+default_days = 30
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = true
+digital_signature = true
+
+[extended_key_usage]
+client_auth = true
+
+[subject_alt_name]
+from_csr = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true

@@ -1,0 +1,22 @@
+# TLS client authentication leaf profile.
+name = "tls-client"
+default_days = 365
+
+[basic_constraints]
+ca = false
+
+[key_usage]
+critical = true
+digital_signature = true
+
+[extended_key_usage]
+client_auth = true
+
+[subject_alt_name]
+from_csr = true
+
+[subject_key_identifier]
+include = true
+
+[authority_key_identifier]
+include = true
