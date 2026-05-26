@@ -74,6 +74,8 @@ u16_id!(
         SIGNATURE_ALGORITHMS = 0x000d,
         /// application_layer_protocol_negotiation (ALPN).
         ALPN = 0x0010,
+        /// record_size_limit (RFC 8449).
+        RECORD_SIZE_LIMIT = 0x001c,
         /// supported_versions.
         SUPPORTED_VERSIONS = 0x002b,
         /// key_share.

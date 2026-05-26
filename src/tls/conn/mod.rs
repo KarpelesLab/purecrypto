@@ -351,6 +351,75 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after-server");
     }
 
+    /// The client advertises `record_size_limit = 64`; the server's writes
+    /// of a 500-byte payload fragment into multiple records (each ciphertext
+    /// payload at most `64 + 16` bytes — content + tag).
+    #[test]
+    fn record_size_limit_fragments_writes() {
+        use crate::tls::codec::{ParsedRecord, read_record};
+
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rsl-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rsl-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(
+            ClientConfig::new(roots).with_record_size_limit(64),
+            "loopback.example",
+            &mut crng,
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Server writes 500 bytes; the client's record_size_limit caps each
+        // server record's plaintext fragment at 63 (64 minus one byte for the
+        // inner content type), so we should see ⌈500/63⌉ = 8 records.
+        let payload: alloc::vec::Vec<u8> = (0..500u16).map(|i| i as u8).collect();
+        server.send_application_data(&payload).unwrap();
+        let s = server.write_tls();
+
+        let mut consumed = 0;
+        let mut records = 0;
+        while consumed < s.len() {
+            if let Some(ParsedRecord { fragment, len, .. }) = read_record(&s[consumed..]).unwrap() {
+                // Ciphertext = content + 1 (type) + 16 (tag). Cap on content
+                // is `limit - 1 = 63`, so fragment ≤ 80.
+                assert!(
+                    fragment.len() <= 64 + 16,
+                    "fragment too large: {}",
+                    fragment.len()
+                );
+                consumed += len;
+                records += 1;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(records, 8, "expected 8 fragmented records, got {records}");
+
+        // The client should still reassemble and receive the full payload.
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), payload);
+    }
+
     /// ALPN: both sides negotiate `h2` when the server's preference also
     /// includes it.
     #[test]

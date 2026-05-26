@@ -46,6 +46,9 @@ pub struct ServerConfig {
     /// ALPN protocols this server accepts, in preference order. The server
     /// picks its first entry that also appears in the client's offer.
     alpn_protocols: Vec<Vec<u8>>,
+    /// `record_size_limit` (RFC 8449) we advertise to the client. None
+    /// suppresses the extension.
+    record_size_limit: Option<u16>,
 }
 
 impl ServerConfig {
@@ -56,6 +59,7 @@ impl ServerConfig {
             cert_chain,
             key: ServerKey::Rsa(key),
             alpn_protocols: Vec::new(),
+            record_size_limit: None,
         }
     }
 
@@ -66,6 +70,7 @@ impl ServerConfig {
             cert_chain,
             key: ServerKey::Ecdsa(key),
             alpn_protocols: Vec::new(),
+            record_size_limit: None,
         }
     }
 
@@ -76,6 +81,7 @@ impl ServerConfig {
             cert_chain,
             key: ServerKey::Ed25519(key),
             alpn_protocols: Vec::new(),
+            record_size_limit: None,
         }
     }
 
@@ -84,6 +90,12 @@ impl ServerConfig {
     /// handshake fails with `no_application_protocol`.
     pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
+        self
+    }
+
+    /// Advertises `record_size_limit = limit` (RFC 8449).
+    pub fn with_record_size_limit(mut self, limit: u16) -> Self {
+        self.record_size_limit = Some(limit);
         self
     }
 
@@ -357,6 +369,12 @@ impl<R: RngCore> ServerConnection<R> {
             }
         }
 
+        // record_size_limit: parse the peer's advertisement.
+        if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
+            let limit = ext::parse_record_size_limit(rsl_body)?;
+            self.core.set_peer_record_size_limit(limit);
+        }
+
         self.core.transcript.set_alg(suite.hash);
         self.core.transcript.update(raw);
 
@@ -505,6 +523,12 @@ impl<R: RngCore> ServerConnection<R> {
                 // of one entry per RFC 7301.
                 if let Some(p) = self.alpn_negotiated.as_ref() {
                     let (ty, body) = ext::alpn_protocols(&[p.as_slice()]);
+                    crate::tls::codec::put_u16(exts, ty.0);
+                    crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
+                }
+                // record_size_limit, when configured.
+                if let Some(limit) = self.config.record_size_limit {
+                    let (ty, body) = ext::record_size_limit(limit);
                     crate::tls::codec::put_u16(exts, ty.0);
                     crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
                 }
