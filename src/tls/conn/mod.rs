@@ -7,11 +7,13 @@ mod server;
 mod stream;
 
 #[allow(unused_imports)]
-pub use client::{ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
+pub use client::{
+    ClientCertConfig, ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession,
+};
 #[cfg(feature = "std")]
 pub use server::ReplayWindow;
 #[allow(unused_imports)]
-pub use server::{ServerConfig, ServerConnection};
+pub use server::{ClientAuthPolicy, ServerConfig, ServerConnection};
 #[cfg(feature = "std")]
 pub use stream::{Connection, Stream};
 
@@ -613,6 +615,221 @@ mod loopback_tests {
         client2.read_tls(&s);
         client2.process_new_packets().unwrap();
         assert_eq!(client2.take_received_plaintext(), b"resumed-pong");
+    }
+
+    /// mTLS happy path: server requires a client cert, client presents an
+    /// Ed25519 chain signed by a root the server trusts, both sides reach
+    /// `Connected` and exchange app data.
+    #[test]
+    fn mtls_required_round_trip() {
+        use crate::tls::{ClientCertConfig, RootCertStore};
+
+        let (server_config, server_cert_der) = rsa_server();
+
+        // Build an Ed25519 client cert + the root that signed it (here the
+        // leaf is self-signed, so the leaf IS the trust anchor).
+        let mut crng_seed = HmacDrbg::<Sha256>::new(b"mtls-client-key", b"nonce", &[]);
+        let client_key = Ed25519PrivateKey::generate(&mut crng_seed);
+        let client_name = DistinguishedName::common_name("mtls-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&client_key),
+            &client_name,
+            &validity,
+            1,
+            false,
+            &["mtls-client"],
+        )
+        .unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+
+        // Server trusts the client's root (self-signed: leaf == root).
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+
+        // Client trusts the server's cert.
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der], client_key);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls-client-rng", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"mtls-server-rng", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // The server has the client's leaf cert in its peer-certificates view.
+        assert_eq!(server.peer_certificates().len(), 1);
+
+        // App data flows both ways.
+        client.send_application_data(b"mtls-ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"mtls-ping");
+
+        server.send_application_data(b"mtls-pong").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"mtls-pong");
+    }
+
+    /// mTLS rejection: server requires a client cert from a SPECIFIC root,
+    /// client presents one from a DIFFERENT root → server rejects with
+    /// `BadCertificate`.
+    #[test]
+    fn mtls_rejects_untrusted_client() {
+        use crate::tls::{ClientCertConfig, RootCertStore};
+
+        let (server_config, server_cert_der) = rsa_server();
+
+        // Trusted client root and an unrelated client cert.
+        let mut tk = HmacDrbg::<Sha256>::new(b"mtls-trusted-root", b"nonce", &[]);
+        let trusted_key = Ed25519PrivateKey::generate(&mut tk);
+        let trusted_cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&trusted_key),
+            &DistinguishedName::common_name("trusted-root"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["trusted-root"],
+        )
+        .unwrap();
+        let trusted_der = trusted_cert.to_der().to_vec();
+
+        let mut uk = HmacDrbg::<Sha256>::new(b"mtls-untrusted", b"nonce", &[]);
+        let untrusted_key = Ed25519PrivateKey::generate(&mut uk);
+        let untrusted_cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&untrusted_key),
+            &DistinguishedName::common_name("untrusted"),
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["untrusted"],
+        )
+        .unwrap();
+        let untrusted_der = untrusted_cert.to_der().to_vec();
+
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(trusted_der).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_ed25519(alloc::vec![untrusted_der], untrusted_key);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls-bad-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"mtls-bad-server", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        let mut server_err: Option<crate::tls::Error> = None;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                if let Err(e) = server.process_new_packets() {
+                    server_err = Some(e);
+                    break;
+                }
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                let _ = client.process_new_packets();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            matches!(server_err, Some(crate::tls::Error::BadCertificate)),
+            "expected BadCertificate from server, got {server_err:?}"
+        );
+    }
+
+    /// mTLS optional: server's policy allows an empty client Certificate
+    /// (no CertificateVerify required), the handshake still completes.
+    #[test]
+    fn mtls_optional_no_cert() {
+        use crate::tls::RootCertStore;
+
+        let (server_config, server_cert_der) = rsa_server();
+
+        // Empty trust store; required = false.
+        let server_roots = RootCertStore::new();
+        let server_config = server_config.with_client_auth(server_roots, false);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls-opt-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"mtls-opt-server", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(server.peer_certificates().is_empty());
     }
 
     /// 0-RTT round-trip: phase 1 establishes a ticket with

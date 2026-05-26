@@ -91,13 +91,25 @@ impl ReplayWindow {
 }
 
 /// The server's signing key, used to sign the `CertificateVerify`.
-enum ServerKey {
+pub(crate) enum ServerKey {
     /// An RSA key; signs with `rsa_pss_rsae_sha256`.
     Rsa(BoxedRsaPrivateKey),
     /// An ECDSA key; signs with the scheme matching its curve.
     Ecdsa(BoxedEcdsaPrivateKey),
     /// An Ed25519 key; signs with `ed25519`.
     Ed25519(Ed25519PrivateKey),
+}
+
+/// Client-authentication policy for a server (RFC 8446 §4.3.2): roots to
+/// validate the presented client chain against, and whether a client cert
+/// is required (`certificate_required` alert on absence).
+pub struct ClientAuthPolicy {
+    /// Trust anchors for the client chain.
+    pub roots: crate::tls::RootCertStore,
+    /// When `true`, an empty client certificate (no auth) aborts the
+    /// handshake with `certificate_required`. When `false`, an empty
+    /// Certificate is accepted and no `CertificateVerify` is required.
+    pub required: bool,
 }
 
 /// Configuration for a TLS server: a certificate chain and its signing key.
@@ -127,6 +139,9 @@ pub struct ServerConfig {
     /// should be shared across all `ServerConfig`s in the same process.
     #[cfg(feature = "std")]
     replay_window: Option<ReplayWindow>,
+    /// Client-certificate authentication policy. `None` (default) skips
+    /// `CertificateRequest`: a server does not demand a client cert.
+    client_auth: Option<ClientAuthPolicy>,
 }
 
 impl ServerConfig {
@@ -143,6 +158,7 @@ impl ServerConfig {
             max_early_data_size: 0,
             #[cfg(feature = "std")]
             replay_window: None,
+            client_auth: None,
         }
     }
 
@@ -159,6 +175,7 @@ impl ServerConfig {
             max_early_data_size: 0,
             #[cfg(feature = "std")]
             replay_window: None,
+            client_auth: None,
         }
     }
 
@@ -175,6 +192,7 @@ impl ServerConfig {
             max_early_data_size: 0,
             #[cfg(feature = "std")]
             replay_window: None,
+            client_auth: None,
         }
     }
 
@@ -226,6 +244,15 @@ impl ServerConfig {
         self
     }
 
+    /// Demand a client certificate from peers. When `required` is true,
+    /// a peer that sends an empty `Certificate` aborts the handshake with
+    /// `certificate_required`. When `required` is false, an absent client
+    /// cert is allowed.
+    pub fn with_client_auth(mut self, roots: crate::tls::RootCertStore, required: bool) -> Self {
+        self.client_auth = Some(ClientAuthPolicy { roots, required });
+        self
+    }
+
     fn signature_scheme(&self) -> SignatureScheme {
         match &self.key {
             ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
@@ -244,6 +271,12 @@ impl ServerConfig {
 #[derive(PartialEq, Eq)]
 enum State {
     WaitClientHello,
+    /// mTLS: after our Finished, expect the client's `Certificate` next.
+    WaitClientCertificate,
+    /// mTLS: after the client's `Certificate`, expect `CertificateVerify`.
+    /// Skipped if the client presented an empty Certificate (and our policy
+    /// is non-required).
+    WaitClientCertVerify,
     WaitClientFinished,
     Connected,
     Closed,
@@ -285,6 +318,11 @@ pub struct ServerConnection<R: RngCore> {
     /// When 0-RTT is accepted, the client-handshake-traffic secret is stashed
     /// here and installed as the read key only after EndOfEarlyData arrives.
     deferred_chts: Option<Secret>,
+    /// mTLS: the client's certificate chain (leaf first) after parsing its
+    /// `Certificate` message. Empty if the client offered no cert.
+    client_cert_chain: Vec<Vec<u8>>,
+    /// mTLS: the client's leaf public key, recovered from the chain.
+    client_leaf_key: Option<crate::x509::AnyPublicKey>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 }
@@ -310,9 +348,18 @@ impl<R: RngCore> ServerConnection<R> {
             ks: None,
             early_data_accepted: false,
             deferred_chts: None,
+            client_cert_chain: Vec::new(),
+            client_leaf_key: None,
             #[cfg(test)]
             server_hs_secret: None,
         }
+    }
+
+    /// The peer's certificate chain in wire order (DER), leaf first. Empty
+    /// before the client's `Certificate` message arrives (and on connections
+    /// where the server did not request client authentication).
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.client_cert_chain
     }
 
     /// Whether the just-completed handshake accepted 0-RTT data from the
@@ -435,6 +482,8 @@ impl<R: RngCore> ServerConnection<R> {
         let (msg_type, body) = read_handshake(&mut c)?;
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
+            State::WaitClientCertificate => self.on_client_certificate(msg_type, body, &msg),
+            State::WaitClientCertVerify => self.on_client_cert_verify(msg_type, body, &msg),
             State::WaitClientFinished => {
                 // Under 0-RTT acceptance the client sends EndOfEarlyData
                 // (under the early key) before its Finished. Receiving it
@@ -718,9 +767,15 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.emit_ccs();
 
         // Encrypted server flight. Under PSK resumption we omit Certificate
-        // and CertificateVerify (RFC 8446 §2.2).
+        // and CertificateVerify (RFC 8446 §2.2). With mTLS we also emit
+        // CertificateRequest after EE (RFC 8446 §4.3.2). PSK + mTLS is not
+        // useful (resumption already authenticates the client), so the two
+        // are mutually exclusive here.
         self.send_encrypted_extensions();
         if psk_state.is_none() {
+            if self.config.client_auth.is_some() {
+                self.send_certificate_request();
+            }
             self.send_certificate();
             self.send_certificate_verify()?;
         }
@@ -755,7 +810,12 @@ impl<R: RngCore> ServerConnection<R> {
         {
             self.server_hs_secret = Some(shts);
         }
-        self.state = State::WaitClientFinished;
+        // mTLS: expect Certificate next instead of Finished.
+        self.state = if self.config.client_auth.is_some() && !self.psk_used {
+            State::WaitClientCertificate
+        } else {
+            State::WaitClientFinished
+        };
         Ok(())
     }
 
@@ -850,6 +910,22 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.emit_handshake(msg);
     }
 
+    /// RFC 8446 §4.3.2: emit a `CertificateRequest` with the signature
+    /// algorithms we accept. `certificate_request_context` is empty for
+    /// handshake (non-post-handshake) authentication.
+    fn send_certificate_request(&mut self) {
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_REQUEST];
+        with_len_u24(&mut msg, |b| {
+            b.push(0); // certificate_request_context = empty
+            with_len_u16(b, |exts| {
+                let (ty, body) = ext::signature_algorithms();
+                crate::tls::codec::put_u16(exts, ty.0);
+                crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
+            });
+        });
+        self.core.emit_handshake(msg);
+    }
+
     fn send_certificate_verify(&mut self) -> Result<(), Error> {
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(true, th.as_slice());
@@ -885,6 +961,74 @@ impl<R: RngCore> ServerConnection<R> {
         let mut msg = alloc::vec![hs_type::FINISHED];
         with_len_u24(&mut msg, |b| b.extend_from_slice(verify_data.as_slice()));
         self.core.emit_handshake(msg);
+    }
+
+    /// mTLS: process the client's `Certificate` message. Empty chain is
+    /// allowed only when policy is `required = false`.
+    fn on_client_certificate(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE {
+            return Err(Error::UnexpectedMessage);
+        }
+        let chain = parse_certificate_list(body)?;
+        self.core.transcript.update(raw);
+        let policy = self
+            .config
+            .client_auth
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        if chain.is_empty() {
+            if policy.required {
+                return Err(Error::CertificateRequired);
+            }
+            // Allowed: skip CertificateVerify, head straight to client Finished.
+            self.client_cert_chain.clear();
+            self.client_leaf_key = None;
+            self.state = State::WaitClientFinished;
+            return Ok(());
+        }
+        // Validate the chain against the configured roots.
+        let leaf_key = crate::tls::pki::verify_chain(&policy.roots, &chain, None)?;
+        self.client_cert_chain = chain;
+        self.client_leaf_key = Some(leaf_key);
+        self.state = State::WaitClientCertVerify;
+        Ok(())
+    }
+
+    /// mTLS: process the client's `CertificateVerify` message and verify the
+    /// signature against the leaf key recovered in `on_client_certificate`.
+    fn on_client_cert_verify(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE_VERIFY {
+            return Err(Error::UnexpectedMessage);
+        }
+        let mut c = ReadCursor::new(body);
+        let scheme = SignatureScheme(c.u16()?);
+        let signature = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+
+        // The transcript at this point includes everything up to (and not
+        // including) this CertificateVerify, which is exactly the input the
+        // client signed.
+        let th = self.core.transcript.current_hash();
+        let content = certificate_verify_content(false, th.as_slice());
+        let leaf_key = self
+            .client_leaf_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        crate::tls::crypto::verify_signature(scheme, leaf_key, &content, &signature)?;
+
+        self.core.transcript.update(raw);
+        self.state = State::WaitClientFinished;
+        Ok(())
     }
 
     fn on_client_finished(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
@@ -1005,6 +1149,24 @@ impl<R: RngCore> ServerConnection<R> {
             .map(|s| s.as_slice().to_vec())
             .unwrap_or_default()
     }
+}
+
+/// Parses a TLS 1.3 `Certificate` message body into a list of DER
+/// certificates (end-entity first). Mirrors the client-side helper.
+fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let mut c = ReadCursor::new(body);
+    let _context = c.vec_u8()?; // certificate_request_context
+    let list = c.vec_u24()?;
+    c.expect_empty()?;
+
+    let mut entries = ReadCursor::new(list);
+    let mut certs = Vec::new();
+    while !entries.is_empty() {
+        let cert = entries.vec_u24()?.to_vec();
+        let _exts = entries.vec_u16()?; // per-certificate extensions
+        certs.push(cert);
+    }
+    Ok(certs)
 }
 
 /// Current wall-clock time as a Unix timestamp, when the `std` feature is
@@ -1164,6 +1326,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
+        Error::CertificateRequired => AlertDescription::CertificateRequired,
         _ => AlertDescription::HandshakeFailure,
     }
 }

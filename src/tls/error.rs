@@ -49,6 +49,9 @@ pub enum AlertDescription {
     UnrecognizedName,
     /// `no_application_protocol` (120).
     NoApplicationProtocol,
+    /// `certificate_required` (116) — RFC 8446 §6: server demanded a client
+    /// certificate but the client offered none.
+    CertificateRequired,
     /// An unrecognized alert code.
     Unknown(u8),
 }
@@ -75,6 +78,7 @@ impl AlertDescription {
             AlertDescription::UnsupportedExtension => 110,
             AlertDescription::UnrecognizedName => 112,
             AlertDescription::NoApplicationProtocol => 120,
+            AlertDescription::CertificateRequired => 116,
             AlertDescription::Unknown(v) => v,
         }
     }
@@ -100,6 +104,7 @@ impl AlertDescription {
             110 => AlertDescription::UnsupportedExtension,
             112 => AlertDescription::UnrecognizedName,
             120 => AlertDescription::NoApplicationProtocol,
+            116 => AlertDescription::CertificateRequired,
             other => AlertDescription::Unknown(other),
         }
     }
@@ -143,6 +148,9 @@ pub enum Error {
     /// A PSK binder failed to verify, or another signed handshake-context
     /// authenticator was invalid. Maps to `decrypt_error` (RFC 8446 §6).
     DecryptError,
+    /// Server required a client certificate but the client did not present
+    /// one. Maps to `certificate_required`.
+    CertificateRequired,
 }
 
 impl core::fmt::Display for Error {
@@ -162,6 +170,7 @@ impl core::fmt::Display for Error {
             Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
             Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
             Error::DecryptError => f.write_str("TLS handshake decrypt error (binder/MAC)"),
+            Error::CertificateRequired => f.write_str("server required a client certificate"),
         }
     }
 }
