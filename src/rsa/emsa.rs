@@ -7,7 +7,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::{Error, Pkcs1Digest};
-use crate::ct::ConstantTimeEq;
+use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::Digest;
 use crate::rng::RngCore;
 
@@ -59,20 +59,130 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<
         return Err(Error::InvalidLength);
     }
     let em = key.raw_private(ct);
-    if em[0] != 0x00 || em[1] != 0x02 {
+
+    // RFC 8017 §7.2.2 constant-time padding validation. Every branch on plaintext
+    // bytes is folded into a single `bad` accumulator so the running time of a
+    // failed unwrap is indistinguishable from a successful one (Bleichenbacher's
+    // padding oracle is the canonical attack — see also Manger / ROBOT). The
+    // resulting Vec length still leaks across success/failure boundaries — for
+    // protocol-level implicit rejection that hides even that, see
+    // [`decrypt_pkcs1v15_session`].
+    let mut bad: u8 = em[0]; // must be 0x00
+    bad |= em[1] ^ 0x02; //   must be 0x02
+
+    // Scan em[2..] for the first 0x00 separator. We unconditionally walk every
+    // byte; the only state that depends on the value is the captured `sep_idx`
+    // (the position of the first zero) and the `found` flag.
+    let mut found: u8 = 0;
+    let mut sep_idx: u32 = 0;
+    for (i, &b) in em.iter().enumerate().skip(2) {
+        let is_zero = ct_eq_u8(b, 0x00) & !found;
+        sep_idx |= (i as u32) & (is_zero as u32);
+        found |= is_zero;
+    }
+    bad |= !found; // no separator found ⇒ invalid
+
+    // PS must be at least 8 bytes ⇒ sep_idx >= 10 (positions 2..10 are PS).
+    // ct_lt yields a Choice that is true when sep_idx < 10.
+    let too_small = sep_idx.ct_lt(&10u32).unwrap_u8();
+    bad |= 0u8.wrapping_sub(too_small);
+
+    if bad != 0 {
         return Err(Error::Decryption);
     }
-    let mut sep = None;
+    Ok(em[(sep_idx as usize) + 1..].to_vec())
+}
+
+/// Constant-time PKCS#1 v1.5 decryption with implicit rejection (RFC 8017
+/// §7.2.2 Note, the "Marvin" / TLS 1.2-style construction): on padding failure
+/// the function returns a deterministic pseudorandom buffer of length
+/// `expected_len` derived from the ciphertext and a key-bound secret, instead
+/// of an error. The caller therefore sees no observable difference between a
+/// successful decryption with the wrong content and a padding-malformed
+/// ciphertext — this is the only way to defeat a Bleichenbacher oracle when
+/// the caller's subsequent processing might leak the outcome via timing,
+/// length, or behavior.
+///
+/// The `key_secret` must be a stable per-key secret (e.g. derived from the
+/// private exponent at key construction); the same `key_secret` must be used
+/// for every decryption.
+///
+/// # Errors
+/// Only [`Error::InvalidLength`] when the ciphertext length is wrong (this is
+/// public, not secret-dependent). All padding outcomes return `Ok` — either
+/// the real plaintext or the synthetic fallback.
+#[allow(dead_code)]
+pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
+    key: &K,
+    ct: &[u8],
+    expected_len: usize,
+    key_secret: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use crate::ct::ConditionallySelectable;
+    use crate::hash::HmacSha256;
+
+    let k = key.key_size();
+    if ct.len() != k {
+        return Err(Error::InvalidLength);
+    }
+    let em = key.raw_private(ct);
+
+    // Same constant-time padding check as decrypt_pkcs1v15.
+    let mut bad: u8 = em[0];
+    bad |= em[1] ^ 0x02;
+    let mut found: u8 = 0;
+    let mut sep_idx: u32 = 0;
     for (i, &b) in em.iter().enumerate().skip(2) {
-        if b == 0x00 {
-            sep = Some(i);
-            break;
-        }
+        let is_zero = ct_eq_u8(b, 0x00) & !found;
+        sep_idx |= (i as u32) & (is_zero as u32);
+        found |= is_zero;
     }
-    match sep {
-        Some(i) if i >= 10 => Ok(em[i + 1..].to_vec()), // PS is >= 8 bytes
-        _ => Err(Error::Decryption),
+    bad |= !found;
+    let too_small = sep_idx.ct_lt(&10u32).unwrap_u8();
+    bad |= 0u8.wrapping_sub(too_small);
+
+    // Derive the synthetic fallback: HMAC(key_secret, ct) expanded to expected_len.
+    // The derivation is keyed by the long-term private value so the attacker
+    // cannot predict the fallback. Pseudorandomness is provided by HMAC-SHA256.
+    let mut fallback = Vec::with_capacity(expected_len);
+    let mut counter: u32 = 0;
+    while fallback.len() < expected_len {
+        let mut h = HmacSha256::new(key_secret);
+        h.update(b"purecrypto-rsa-pkcs1v15-implicit-reject-v1");
+        h.update(ct);
+        h.update(&counter.to_be_bytes());
+        let tag = h.finalize();
+        fallback.extend_from_slice(tag.as_ref());
+        counter += 1;
     }
+    fallback.truncate(expected_len);
+
+    // Constant-time merge: when bad == 0, take the real plaintext bytes; else
+    // take the fallback. The real-plaintext length is variable (depends on
+    // sep_idx) but the OUTPUT length is always `expected_len`, so the timing /
+    // size of the return value reveals nothing.
+    let real_start = (sep_idx as usize).saturating_add(1);
+    // Fold any nonzero bit of `bad` down into bit 0 so we can build a Choice.
+    let mut fold = bad;
+    fold |= fold >> 4;
+    fold |= fold >> 2;
+    fold |= fold >> 1;
+    let bad_choice = crate::ct::Choice::from(fold & 1);
+
+    let mut out = Vec::with_capacity(expected_len);
+    for i in 0..expected_len {
+        // The "real" byte is em[real_start + i] when it exists. Because
+        // real_start + i may exceed em.len() if the padding is bad, we clamp
+        // to a valid index unconditionally; the resulting byte is suppressed
+        // by the conditional select.
+        let idx = real_start.saturating_add(i).min(em.len().saturating_sub(1));
+        let real_byte = em[idx];
+        let fallback_byte = fallback[i];
+        // `conditional_select(a, b, choice)` returns `a` iff `choice`; we want
+        // the fallback when padding was bad, otherwise the real byte.
+        out.push(u8::conditional_select(&fallback_byte, &real_byte, bad_choice));
+    }
+    Ok(out)
 }
 
 pub(crate) fn sign_pkcs1v15<D: Pkcs1Digest, K: RawPrivate>(
@@ -379,7 +489,9 @@ fn emsa_pss_verify<D: Digest>(msg: &[u8], em: &[u8], em_bits: usize) -> Result<(
     m_prime.extend_from_slice(salt);
     let h_prime = D::digest(&m_prime);
 
-    if h_prime.as_ref() == h {
+    // Both inputs are derived from public values, but the codebase uses
+    // constant-time comparison throughout for hygiene.
+    if bool::from(h_prime.as_ref().ct_eq(h)) {
         Ok(())
     } else {
         Err(Error::Verification)
