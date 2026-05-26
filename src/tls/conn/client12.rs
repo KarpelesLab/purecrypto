@@ -123,22 +123,22 @@ impl ClientConfig12 {
 /// Whether the cipher-suite's signature half is RSA or ECDSA — drives which
 /// server-cert key types are acceptable.
 #[derive(Copy, Clone, PartialEq, Eq)]
-enum SigKind {
+pub(super) enum SigKind {
     Rsa,
     Ecdsa,
 }
 
 /// Parameters of a single TLS 1.2 AEAD-ECDHE cipher suite.
 #[derive(Copy, Clone)]
-struct SuiteParams12 {
-    suite: CipherSuite,
-    hash: HashAlg,
-    aead: AeadAlg,
+pub(super) struct SuiteParams12 {
+    pub(super) suite: CipherSuite,
+    pub(super) hash: HashAlg,
+    pub(super) aead: AeadAlg,
     /// AEAD key length in bytes (16 for AES-128, 32 for AES-256/ChaCha20).
-    key_len: usize,
+    pub(super) key_len: usize,
     /// Which signature family the server's cert key must belong to (`Rsa` for
     /// `TLS_ECDHE_RSA_*`, `Ecdsa` for `TLS_ECDHE_ECDSA_*`).
-    sig_kind: SigKind,
+    pub(super) sig_kind: SigKind,
 }
 
 /// The TLS 1.2 AEAD-ECDHE suites we offer, in descending preference order.
@@ -151,7 +151,7 @@ struct SuiteParams12 {
 ///   is the dominant choice in modern stacks, ChaCha20 is the no-AES-NI
 ///   fallback, and AES-256 is rarely preferred when AES-128 satisfies the
 ///   security target.
-const SUITES_12: [SuiteParams12; 6] = [
+pub(super) const SUITES_12: [SuiteParams12; 6] = [
     SuiteParams12 {
         suite: CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         hash: HashAlg::Sha256,
@@ -197,7 +197,7 @@ const SUITES_12: [SuiteParams12; 6] = [
 ];
 
 /// Looks up the parameters for a wire suite, if it's one we offer.
-fn lookup_suite_12(s: CipherSuite) -> Option<SuiteParams12> {
+pub(super) fn lookup_suite_12(s: CipherSuite) -> Option<SuiteParams12> {
     SUITES_12.iter().copied().find(|p| p.suite == s)
 }
 
