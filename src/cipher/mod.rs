@@ -23,6 +23,7 @@ mod gcm;
 mod kw;
 mod ofb;
 mod poly1305;
+mod xts;
 
 pub use aes::{Aes128, Aes192, Aes256};
 pub use cbc::Cbc;
@@ -38,6 +39,7 @@ pub use kw::{
 };
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
+pub use xts::{Aes128Xts, Aes256Xts, Xts};
 
 /// A block cipher: a keyed, invertible permutation on fixed-size blocks.
 pub trait BlockCipher {
