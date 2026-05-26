@@ -240,8 +240,7 @@ macro_rules! ml_kem_set {
                     return Err(Error::Malformed);
                 }
                 let key_bits = spki.read_bit_string()?;
-                let bytes: [u8; $ek_size] =
-                    key_bits.try_into().map_err(|_| Error::Malformed)?;
+                let bytes: [u8; $ek_size] = key_bits.try_into().map_err(|_| Error::Malformed)?;
                 Ok($ek_name(bytes))
             }
 
@@ -255,25 +254,49 @@ macro_rules! ml_kem_set {
 
 ml_kem_set!(
     "ML-KEM-512 (FIPS 203, security level 1)",
-    MlKem512DecapsKey, MlKem512EncapsKey, MlKem512Ciphertext,
-    2, 3, 2, 10, 4,
-    /* ek */ 800, /* dk */ 1632, /* ct */ 768,
+    MlKem512DecapsKey,
+    MlKem512EncapsKey,
+    MlKem512Ciphertext,
+    2,
+    3,
+    2,
+    10,
+    4,
+    /* ek */ 800,
+    /* dk */ 1632,
+    /* ct */ 768,
     ML_KEM_512
 );
 
 ml_kem_set!(
     "ML-KEM-768 (FIPS 203, security level 3)",
-    MlKem768DecapsKey, MlKem768EncapsKey, MlKem768Ciphertext,
-    3, 2, 2, 10, 4,
-    /* ek */ 1184, /* dk */ 2400, /* ct */ 1088,
+    MlKem768DecapsKey,
+    MlKem768EncapsKey,
+    MlKem768Ciphertext,
+    3,
+    2,
+    2,
+    10,
+    4,
+    /* ek */ 1184,
+    /* dk */ 2400,
+    /* ct */ 1088,
     ML_KEM_768
 );
 
 ml_kem_set!(
     "ML-KEM-1024 (FIPS 203, security level 5)",
-    MlKem1024DecapsKey, MlKem1024EncapsKey, MlKem1024Ciphertext,
-    4, 2, 2, 11, 5,
-    /* ek */ 1568, /* dk */ 3168, /* ct */ 1568,
+    MlKem1024DecapsKey,
+    MlKem1024EncapsKey,
+    MlKem1024Ciphertext,
+    4,
+    2,
+    2,
+    11,
+    5,
+    /* ek */ 1568,
+    /* dk */ 3168,
+    /* ct */ 1568,
     ML_KEM_1024
 );
 
@@ -349,7 +372,10 @@ mod tests {
         let rejected = dk.decapsulate(&MlKem512Ciphertext::from_bytes(bad));
         assert_ne!(rejected, ss);
         // Deterministic: same bad ciphertext maps to the same rejection secret.
-        assert_eq!(rejected, dk.decapsulate(&MlKem512Ciphertext::from_bytes(bad)));
+        assert_eq!(
+            rejected,
+            dk.decapsulate(&MlKem512Ciphertext::from_bytes(bad))
+        );
     }
 
     #[test]

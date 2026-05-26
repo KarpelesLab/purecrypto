@@ -74,11 +74,7 @@ mod loopback_tests {
 
     /// Runs a full in-process handshake against `(server_config, cert_der)`,
     /// then exchanges application data in both directions.
-    fn run_with(
-        server: (ServerConfig, Vec<u8>),
-        suites: &[CipherSuite],
-        groups: &[NamedGroup],
-    ) {
+    fn run_with(server: (ServerConfig, Vec<u8>), suites: &[CipherSuite], groups: &[NamedGroup]) {
         let (server_config, cert_der) = server;
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();

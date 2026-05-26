@@ -44,12 +44,7 @@ pub fn inv_mod_boxed(a: &BoxedUint, m: &BoxedUint) -> Option<BoxedUint> {
 
 /// `(±a) − (±b)` in sign-magnitude for [`BoxedUint`].
 #[cfg(feature = "alloc")]
-fn signed_sub_boxed(
-    a: &BoxedUint,
-    a_neg: bool,
-    b: &BoxedUint,
-    b_neg: bool,
-) -> (BoxedUint, bool) {
+fn signed_sub_boxed(a: &BoxedUint, a_neg: bool, b: &BoxedUint, b_neg: bool) -> (BoxedUint, bool) {
     if a_neg == b_neg {
         if !a.lt(b) {
             (a.sub(b), a_neg)

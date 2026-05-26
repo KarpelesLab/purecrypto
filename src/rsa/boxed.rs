@@ -118,7 +118,15 @@ impl BoxedRsaPrivateKey {
             if let Some(d) = inv_mod_boxed(&e, &phi) {
                 let k = n.bit_len().div_ceil(8);
                 let mont = BoxedMontModulus::new(&n);
-                return BoxedRsaPrivateKey { n, e, d, p, q, mont, k };
+                return BoxedRsaPrivateKey {
+                    n,
+                    e,
+                    d,
+                    p,
+                    q,
+                    mont,
+                    k,
+                };
             }
         }
     }
@@ -344,7 +352,8 @@ mod tests {
 
         let sig = key.sign_pkcs1v15::<Sha256>(b"runtime keygen").unwrap();
         let pk = key.public_key();
-        pk.verify_pkcs1v15::<Sha256>(b"runtime keygen", &sig).unwrap();
+        pk.verify_pkcs1v15::<Sha256>(b"runtime keygen", &sig)
+            .unwrap();
         assert!(pk.verify_pkcs1v15::<Sha256>(b"other", &sig).is_err());
 
         // PKCS#1 export (with CRT params) round-trips through the parser.

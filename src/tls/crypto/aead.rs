@@ -175,7 +175,8 @@ mod tests {
             "../../../testdata/rfc8448_server_flight_record.hex"
         ));
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
+        let mut c =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let out = c.encrypt(ContentType::Handshake, &payload);
         assert_eq!(out, record);
     }
@@ -189,7 +190,8 @@ mod tests {
             "../../../testdata/rfc8448_server_flight_record.hex"
         ));
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
+        let mut c =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let mut header = [0u8; 5];
         header.copy_from_slice(&record[..5]);
         let (ct, content) = c.decrypt(&header, &record[5..]).unwrap();
@@ -205,7 +207,8 @@ mod tests {
         let mut bad = record.clone();
         *bad.last_mut().unwrap() ^= 0x01;
 
-        let mut c = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
+        let mut c =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
         let mut header = [0u8; 5];
         header.copy_from_slice(&bad[..5]);
         assert!(matches!(

@@ -180,16 +180,7 @@ pub fn argon2(
     for pass in 0..params.t_cost as usize {
         for slice in 0..4 {
             for lane in 0..p {
-                fill_segment(
-                    &mut mem,
-                    pass,
-                    slice,
-                    lane,
-                    p,
-                    q,
-                    seg_len,
-                    params,
-                );
+                fill_segment(&mut mem, pass, slice, lane, p, q, seg_len, params);
             }
         }
     }
@@ -273,7 +264,12 @@ fn fill_segment(
         ref_buf.copy_from_slice(&mem[ref_off..ref_off + 1024]);
 
         let xor_into = pass > 0 && params.version == 0x13;
-        g_compress(&prev_buf, &ref_buf, &mut mem[dst_off..dst_off + 1024], xor_into);
+        g_compress(
+            &prev_buf,
+            &ref_buf,
+            &mut mem[dst_off..dst_off + 1024],
+            xor_into,
+        );
     }
 }
 
@@ -434,9 +430,7 @@ fn h_prime(input: &[u8], out: &mut [u8]) {
 /// BLAKE2b-style mixing function `GB` used by Argon2.
 #[inline]
 fn gb(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize) {
-    let f = |x: u64, y: u64| {
-        2u64.wrapping_mul((x & 0xffff_ffff).wrapping_mul(y & 0xffff_ffff))
-    };
+    let f = |x: u64, y: u64| 2u64.wrapping_mul((x & 0xffff_ffff).wrapping_mul(y & 0xffff_ffff));
     v[a] = v[a].wrapping_add(v[b]).wrapping_add(f(v[a], v[b]));
     v[d] = (v[d] ^ v[a]).rotate_right(32);
     v[c] = v[c].wrapping_add(v[d]).wrapping_add(f(v[c], v[d]));
@@ -592,7 +586,10 @@ mod tests {
             variant: Argon2Type::Argon2id,
             version: 0x13,
         };
-        assert_eq!(argon2(&bad_t, b"p", b"saltsalt", b"", b"", &mut out), Err(Error::InvalidParam));
+        assert_eq!(
+            argon2(&bad_t, b"p", b"saltsalt", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
         let bad_p = Argon2Params {
             t_cost: 1,
             m_cost_kib: 32,
@@ -600,7 +597,10 @@ mod tests {
             variant: Argon2Type::Argon2id,
             version: 0x13,
         };
-        assert_eq!(argon2(&bad_p, b"p", b"saltsalt", b"", b"", &mut out), Err(Error::InvalidParam));
+        assert_eq!(
+            argon2(&bad_p, b"p", b"saltsalt", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
         let bad_m = Argon2Params {
             t_cost: 1,
             m_cost_kib: 16, // < 8·p = 32
@@ -608,7 +608,10 @@ mod tests {
             variant: Argon2Type::Argon2id,
             version: 0x13,
         };
-        assert_eq!(argon2(&bad_m, b"p", b"saltsalt", b"", b"", &mut out), Err(Error::InvalidParam));
+        assert_eq!(
+            argon2(&bad_m, b"p", b"saltsalt", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
         let bad_v = Argon2Params {
             t_cost: 1,
             m_cost_kib: 32,
@@ -616,6 +619,9 @@ mod tests {
             variant: Argon2Type::Argon2id,
             version: 0x42,
         };
-        assert_eq!(argon2(&bad_v, b"p", b"saltsalt", b"", b"", &mut out), Err(Error::InvalidParam));
+        assert_eq!(
+            argon2(&bad_v, b"p", b"saltsalt", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
     }
 }

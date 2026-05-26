@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use crate::rng::RngCore;
 use encode::*;
 use field::{D, N, Poly, ntt_mul, sub};
-use reduce::{GAMMA2_32, GAMMA2_88, decompose, high_bits, inf_norm, make_hint, power2_round, use_hint};
+use reduce::{
+    GAMMA2_32, GAMMA2_88, decompose, high_bits, inf_norm, make_hint, power2_round, use_hint,
+};
 use sample::{expand_mask, sample_bounded_poly, sample_challenge, sample_ntt_poly};
 
 /// Size of the key-generation seed.
@@ -63,7 +65,11 @@ impl Params {
         if self.eta == 2 { N * 3 / 8 } else { N * 4 / 8 }
     }
     const fn z_bytes(&self) -> usize {
-        if self.gamma1_bits == 17 { N * 18 / 8 } else { N * 20 / 8 }
+        if self.gamma1_bits == 17 {
+            N * 18 / 8
+        } else {
+            N * 20 / 8
+        }
     }
 }
 
@@ -115,20 +121,40 @@ pub(crate) const P87: Params = Params {
 // --- encoding dispatch helpers ---
 
 fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
-    if p.eta == 2 { pack_eta2(f) } else { pack_eta4(f) }
+    if p.eta == 2 {
+        pack_eta2(f)
+    } else {
+        pack_eta4(f)
+    }
 }
 fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, Error> {
-    let r = if p.eta == 2 { unpack_eta2(b) } else { unpack_eta4(b) };
+    let r = if p.eta == 2 {
+        unpack_eta2(b)
+    } else {
+        unpack_eta4(b)
+    };
     r.map_err(|_| Error::Malformed)
 }
 fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
-    if p.gamma1_bits == 17 { pack_z17(f) } else { pack_z19(f) }
+    if p.gamma1_bits == 17 {
+        pack_z17(f)
+    } else {
+        pack_z19(f)
+    }
 }
 fn unpack_z(b: &[u8], p: &Params) -> Poly {
-    if p.gamma1_bits == 17 { unpack_z17(b) } else { unpack_z19(b) }
+    if p.gamma1_bits == 17 {
+        unpack_z17(b)
+    } else {
+        unpack_z19(b)
+    }
 }
 fn pack_w1(f: &Poly, p: &Params) -> Vec<u8> {
-    if p.gamma2 == GAMMA2_88 { pack_w1_6(f) } else { pack_w1_4(f) }
+    if p.gamma2 == GAMMA2_88 {
+        pack_w1_6(f)
+    } else {
+        pack_w1_4(f)
+    }
 }
 
 fn shake256(parts: &[&[u8]], out: &mut [u8]) {
@@ -167,7 +193,9 @@ fn vec_inf_norm_signed<const K: usize>(v: &[[i32; N]; K]) -> i32 {
 }
 
 fn count_ones(v: &[Poly]) -> usize {
-    v.iter().map(|p| p.c.iter().filter(|&&c| c != 0).count()).sum()
+    v.iter()
+        .map(|p| p.c.iter().filter(|&&c| c != 0).count())
+        .sum()
 }
 
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
@@ -826,19 +854,34 @@ mod tests {
     }
 
     acvp_tests!(
-        acvp_keygen_44, acvp_siggen_44, acvp_sigver_44, 4, 4, P44,
+        acvp_keygen_44,
+        acvp_siggen_44,
+        acvp_sigver_44,
+        4,
+        4,
+        P44,
         "../../testdata/mldsa44_keygen.kat",
         "../../testdata/mldsa44_siggen.kat",
         "../../testdata/mldsa44_sigver.kat"
     );
     acvp_tests!(
-        acvp_keygen_65, acvp_siggen_65, acvp_sigver_65, 6, 5, P65,
+        acvp_keygen_65,
+        acvp_siggen_65,
+        acvp_sigver_65,
+        6,
+        5,
+        P65,
         "../../testdata/mldsa65_keygen.kat",
         "../../testdata/mldsa65_siggen.kat",
         "../../testdata/mldsa65_sigver.kat"
     );
     acvp_tests!(
-        acvp_keygen_87, acvp_siggen_87, acvp_sigver_87, 8, 7, P87,
+        acvp_keygen_87,
+        acvp_siggen_87,
+        acvp_sigver_87,
+        8,
+        7,
+        P87,
         "../../testdata/mldsa87_keygen.kat",
         "../../testdata/mldsa87_siggen.kat",
         "../../testdata/mldsa87_sigver.kat"

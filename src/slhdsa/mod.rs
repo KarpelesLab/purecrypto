@@ -139,7 +139,13 @@ fn wots_pk_gen(
     sk_addr.copy_key_pair(addr);
     for i in 0..p.len {
         sk_addr.set_chain(i);
-        hash::prf(p, pk_seed, sk_seed, sk_addr.bytes(), &mut tmp[i as usize * n..]);
+        hash::prf(
+            p,
+            pk_seed,
+            sk_seed,
+            sk_addr.bytes(),
+            &mut tmp[i as usize * n..],
+        );
         addr.set_chain(i);
         let lo = i as usize * n;
         wots_chain(p, pk_seed, &mut tmp[lo..lo + n], 0, 15, addr);
@@ -168,7 +174,14 @@ fn wots_msg_csum(p: &Params, msg: &[u8]) -> [u8; MAX_WOTS_LEN] {
 }
 
 /// WOTS+ sign (Algorithm 7): writes `len·n` bytes into `sig`.
-fn wots_sign(p: &Params, pk_seed: &[u8], sk_seed: &[u8], msg: &[u8], addr: &mut Adrs, sig: &mut [u8]) {
+fn wots_sign(
+    p: &Params,
+    pk_seed: &[u8],
+    sk_seed: &[u8],
+    msg: &[u8],
+    addr: &mut Adrs,
+    sig: &mut [u8],
+) {
     let n = p.n as usize;
     let mc = wots_msg_csum(p, msg);
     let mut sk_addr = *addr;
@@ -253,7 +266,16 @@ fn xmss_sign(
     let mut idx = leaf_idx;
     for j in 0..p.h_prime {
         let off = auth_start + j as usize * n;
-        xmss_node(p, pk_seed, sk_seed, &mut sig[off..off + n], tmp, idx ^ 1, j, addr);
+        xmss_node(
+            p,
+            pk_seed,
+            sk_seed,
+            &mut sig[off..off + n],
+            tmp,
+            idx ^ 1,
+            j,
+            addr,
+        );
         idx >>= 1;
     }
     addr.set_type_and_clear(AdrsType::WotsHash);
@@ -321,11 +343,27 @@ fn ht_sign(
     for j in 0..p.d {
         addr.set_layer(j);
         addr.set_tree(tree_idx);
-        xmss_sign(p, pk_seed, sk_seed, &root[..n], &mut tmp, leaf_idx, &mut addr, &mut sig[off..]);
+        xmss_sign(
+            p,
+            pk_seed,
+            sk_seed,
+            &root[..n],
+            &mut tmp,
+            leaf_idx,
+            &mut addr,
+            &mut sig[off..],
+        );
         if j < p.d - 1 {
             let mut new_root = [0u8; MAX_N];
             xmss_pk_from_sig(
-                p, pk_seed, leaf_idx, &sig[off..], &root[..n], &mut tmp, &mut addr, &mut new_root,
+                p,
+                pk_seed,
+                leaf_idx,
+                &sig[off..],
+                &root[..n],
+                &mut tmp,
+                &mut addr,
+                &mut new_root,
             );
             root[..n].copy_from_slice(&new_root[..n]);
             leaf_idx = (tree_idx & mask) as u32;
@@ -359,7 +397,14 @@ fn ht_verify(
         addr.set_tree(tree_idx);
         let mut new_root = [0u8; MAX_N];
         xmss_pk_from_sig(
-            p, pk_seed, leaf_idx, &sig[off..], &root[..n], &mut tmp, &mut addr, &mut new_root,
+            p,
+            pk_seed,
+            leaf_idx,
+            &sig[off..],
+            &root[..n],
+            &mut tmp,
+            &mut addr,
+            &mut new_root,
         );
         root[..n].copy_from_slice(&new_root[..n]);
         leaf_idx = (tree_idx & mask) as u32;
@@ -398,8 +443,24 @@ fn fors_node(
     } else {
         let mut lnode = [0u8; MAX_N];
         let mut rnode = [0u8; MAX_N];
-        fors_node(p, pk_seed, sk_seed, node_id * 2, layer - 1, addr, &mut lnode);
-        fors_node(p, pk_seed, sk_seed, node_id * 2 + 1, layer - 1, addr, &mut rnode);
+        fors_node(
+            p,
+            pk_seed,
+            sk_seed,
+            node_id * 2,
+            layer - 1,
+            addr,
+            &mut lnode,
+        );
+        fors_node(
+            p,
+            pk_seed,
+            sk_seed,
+            node_id * 2 + 1,
+            layer - 1,
+            addr,
+            &mut rnode,
+        );
         addr.set_tree_height(layer);
         addr.set_tree_index(node_id);
         hash::h(p, pk_seed, addr.bytes(), &lnode[..n], &rnode[..n], out);
@@ -407,7 +468,14 @@ fn fors_node(
 }
 
 /// FORS sign (Algorithm 16).
-fn fors_sign(p: &Params, pk_seed: &[u8], sk_seed: &[u8], md: &[u8], addr: &mut Adrs, sig: &mut [u8]) {
+fn fors_sign(
+    p: &Params,
+    pk_seed: &[u8],
+    sk_seed: &[u8],
+    md: &[u8],
+    addr: &mut Adrs,
+    sig: &mut [u8],
+) {
     let n = p.n as usize;
     let mut indices = [0u32; MAX_K];
     base_2b(md, p.a, &mut indices[..p.k as usize]);
@@ -416,11 +484,26 @@ fn fors_sign(p: &Params, pk_seed: &[u8], sk_seed: &[u8], md: &[u8], addr: &mut A
     let mut off = 0;
     for tree_id in 0..p.k {
         let mut node_id = indices[tree_id as usize];
-        fors_gen_sk(p, pk_seed, sk_seed, node_id + tree_base, addr, &mut sig[off..]);
+        fors_gen_sk(
+            p,
+            pk_seed,
+            sk_seed,
+            node_id + tree_base,
+            addr,
+            &mut sig[off..],
+        );
         off += n;
         let mut tree_off = tree_base;
         for j in 0..p.a {
-            fors_node(p, pk_seed, sk_seed, (node_id ^ 1) + tree_off, j, addr, &mut sig[off..]);
+            fors_node(
+                p,
+                pk_seed,
+                sk_seed,
+                (node_id ^ 1) + tree_off,
+                j,
+                addr,
+                &mut sig[off..],
+            );
             node_id >>= 1;
             tree_off >>= 1;
             off += n;
@@ -451,7 +534,13 @@ fn fors_pk_from_sig(
         let mut tree_idx = node_id + tree_base;
         addr.set_tree_height(0);
         addr.set_tree_index(tree_idx);
-        hash::f(p, pk_seed, addr.bytes(), &sig[off..off + n], &mut roots[rp..]);
+        hash::f(
+            p,
+            pk_seed,
+            addr.bytes(),
+            &sig[off..off + n],
+            &mut roots[rp..],
+        );
         off += n;
         for layer in 0..p.a {
             addr.set_tree_height(layer + 1);
@@ -460,11 +549,25 @@ fn fors_pk_from_sig(
             if node_id & 1 == 0 {
                 tree_idx >>= 1;
                 addr.set_tree_index(tree_idx);
-                hash::h(p, pk_seed, addr.bytes(), &roots[rp..rp + n], node, &mut tmp_out);
+                hash::h(
+                    p,
+                    pk_seed,
+                    addr.bytes(),
+                    &roots[rp..rp + n],
+                    node,
+                    &mut tmp_out,
+                );
             } else {
                 tree_idx = (tree_idx - 1) >> 1;
                 addr.set_tree_index(tree_idx);
-                hash::h(p, pk_seed, addr.bytes(), node, &roots[rp..rp + n], &mut tmp_out);
+                hash::h(
+                    p,
+                    pk_seed,
+                    addr.bytes(),
+                    node,
+                    &roots[rp..rp + n],
+                    &mut tmp_out,
+                );
             }
             roots[rp..rp + n].copy_from_slice(&tmp_out[..n]);
             off += n;
@@ -534,7 +637,15 @@ fn sign_internal(
     let mut pk_fors = [0u8; MAX_N];
     let consumed = fors_pk_from_sig(p, pk_seed, md, &sig[n..], &mut addr, &mut pk_fors);
     let ht_off = n + consumed;
-    ht_sign(p, pk_seed, sk_seed, &pk_fors[..n], tree_idx, leaf_idx, &mut sig[ht_off..]);
+    ht_sign(
+        p,
+        pk_seed,
+        sk_seed,
+        &pk_fors[..n],
+        tree_idx,
+        leaf_idx,
+        &mut sig[ht_off..],
+    );
     sig
 }
 
@@ -563,7 +674,15 @@ fn verify_internal(
     let mut pk_fors = [0u8; MAX_N];
     let consumed = fors_pk_from_sig(p, pk_seed, md, &sig[n..], &mut addr, &mut pk_fors);
     let ht_sig = &sig[n + consumed..];
-    ht_verify(p, pk_seed, pk_root, &pk_fors[..n], ht_sig, tree_idx, leaf_idx)
+    ht_verify(
+        p,
+        pk_seed,
+        pk_root,
+        &pk_fors[..n],
+        ht_sig,
+        tree_idx,
+        leaf_idx,
+    )
 }
 
 /// Builds `0x00 ‖ |ctx| ‖ ctx`.
@@ -593,7 +712,12 @@ pub struct PublicKey {
 
 impl PrivateKey {
     /// Deterministically derives a key pair from the three n-byte seeds.
-    pub fn from_seeds(set: ParamSet, sk_seed: &[u8], sk_prf: &[u8], pk_seed: &[u8]) -> (PrivateKey, PublicKey) {
+    pub fn from_seeds(
+        set: ParamSet,
+        sk_seed: &[u8],
+        sk_prf: &[u8],
+        pk_seed: &[u8],
+    ) -> (PrivateKey, PublicKey) {
         let p = set.params();
         let n = p.n as usize;
         let mut root = [0u8; MAX_N];
@@ -704,7 +828,12 @@ impl PrivateKey {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
         let algid = encode_sequence(&oid_tlv(self.set.params().oid));
         encode_sequence(
-            &[encode_integer(&[0]), algid, encode_octet_string(&self.bytes)].concat(),
+            &[
+                encode_integer(&[0]),
+                algid,
+                encode_octet_string(&self.bytes),
+            ]
+            .concat(),
         )
     }
 

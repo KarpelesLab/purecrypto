@@ -99,13 +99,7 @@ impl Poly1305 {
         let nh4 = (d4 as u32) & 0x03ff_ffff;
         let nh0 = nh0 as u64 + c * 5;
         let carry = (nh0 >> 26) as u32;
-        self.h = [
-            (nh0 as u32) & 0x03ff_ffff,
-            nh1 + carry,
-            nh2,
-            nh3,
-            nh4,
-        ];
+        self.h = [(nh0 as u32) & 0x03ff_ffff, nh1 + carry, nh2, nh3, nh4];
     }
 
     /// Absorbs `data` into the authenticator.
@@ -226,25 +220,29 @@ mod tests {
     #[test]
     fn rfc8439_tag() {
         // RFC 8439 §2.5.2.
-        let key = from_hex::<32>(
-            "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
-        );
+        let key =
+            from_hex::<32>("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b");
         let msg = b"Cryptographic Forum Research Group";
         let mut p = Poly1305::new(&key);
         p.update(msg);
-        assert_eq!(p.finish(), from_hex::<16>("a8061dc1305136c6c22b8baf0c0127a9"));
+        assert_eq!(
+            p.finish(),
+            from_hex::<16>("a8061dc1305136c6c22b8baf0c0127a9")
+        );
     }
 
     #[test]
     fn streaming_matches_one_shot() {
-        let key = from_hex::<32>(
-            "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b",
-        );
+        let key =
+            from_hex::<32>("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b");
         let msg = b"Cryptographic Forum Research Group";
         let mut split = Poly1305::new(&key);
         split.update(&msg[..7]);
         split.update(&msg[7..16]);
         split.update(&msg[16..]);
-        assert_eq!(split.finish(), from_hex::<16>("a8061dc1305136c6c22b8baf0c0127a9"));
+        assert_eq!(
+            split.finish(),
+            from_hex::<16>("a8061dc1305136c6c22b8baf0c0127a9")
+        );
     }
 }

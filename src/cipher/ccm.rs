@@ -279,8 +279,7 @@ mod tests {
         let aad = from_hex::<8>("0001020304050607");
         let pt = from_hex::<23>("08090A0B0C0D0E0F101112131415161718191A1B1C1D1E");
         // RFC 3610's reported output is ciphertext ‖ tag where M = 8.
-        let expected_ct =
-            from_hex::<23>("588C979A61C663D2F066D0C2C0F989806D5F6B61DAC384");
+        let expected_ct = from_hex::<23>("588C979A61C663D2F066D0C2C0F989806D5F6B61DAC384");
         let expected_tag = from_hex::<8>("17E8D12CFDF926E0");
 
         let ccm: Ccm<Aes128, 8> = Ccm::new(Aes128::new(&key));
@@ -301,8 +300,7 @@ mod tests {
         let nonce = from_hex::<13>("00000004030201A0A1A2A3A4A5");
         let aad = from_hex::<8>("0001020304050607");
         let pt = from_hex::<24>("08090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
-        let expected_ct =
-            from_hex::<24>("72C91A36E135F8CF291CA894085C87E3CC15C439C9E43A3B");
+        let expected_ct = from_hex::<24>("72C91A36E135F8CF291CA894085C87E3CC15C439C9E43A3B");
         let expected_tag = from_hex::<8>("A091D56E10400916");
 
         let ccm: Ccm<Aes128, 8> = Ccm::new(Aes128::new(&key));
@@ -359,8 +357,7 @@ mod tests {
         let nonce = from_hex::<12>("101112131415161718191a1b");
         let aad = from_hex::<20>("000102030405060708090a0b0c0d0e0f10111213");
         let pt = from_hex::<24>("202122232425262728292a2b2c2d2e2f3031323334353637");
-        let expected_ct =
-            from_hex::<24>("e3b201a9f5b71a7a9b1ceaeccd97e70b6176aad9a4428aa5");
+        let expected_ct = from_hex::<24>("e3b201a9f5b71a7a9b1ceaeccd97e70b6176aad9a4428aa5");
         let expected_tag = from_hex::<8>("484392fbc1b09951");
 
         let ccm: Ccm<Aes128, 8> = Ccm::new(Aes128::new(&key));

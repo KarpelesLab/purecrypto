@@ -103,7 +103,9 @@ pub(crate) fn run(args: Args) {
         "ML-KEM-1024" => MlKem1024DecapsKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         other => {
             if let Some(set) = slhdsa_from_name(other) {
-                slhdsa::PrivateKey::generate(set, &mut OsRng).0.to_pkcs8_pem()
+                slhdsa::PrivateKey::generate(set, &mut OsRng)
+                    .0
+                    .to_pkcs8_pem()
             } else {
                 die(format!(
                     "unknown algorithm: {other} (RSA | EC | ED25519 | ML-DSA-44/65/87 | \
