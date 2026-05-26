@@ -31,6 +31,65 @@ use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
 
+#[cfg(feature = "std")]
+use std::sync::{Arc, Mutex};
+
+/// A shared anti-replay set for 0-RTT (RFC 8446 §8). Each connection that
+/// accepts a PSK binder records it here; a binder already in the set is
+/// refused for 0-RTT (the handshake proceeds with 1-RTT instead).
+///
+/// The set is bounded; oldest entries are evicted in insertion order to keep
+/// memory bounded. This is a best-effort defense: the spec acknowledges that
+/// 0-RTT is inherently replayable across servers that do not share state.
+#[cfg(feature = "std")]
+#[derive(Clone, Default)]
+pub struct ReplayWindow {
+    inner: Arc<Mutex<ReplayWindowInner>>,
+}
+
+#[cfg(feature = "std")]
+struct ReplayWindowInner {
+    seen: std::collections::HashSet<Vec<u8>>,
+    order: std::collections::VecDeque<Vec<u8>>,
+    cap: usize,
+}
+
+#[cfg(feature = "std")]
+impl Default for ReplayWindowInner {
+    fn default() -> Self {
+        ReplayWindowInner {
+            seen: Default::default(),
+            order: Default::default(),
+            cap: 1024,
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl ReplayWindow {
+    /// A fresh anti-replay set with a default capacity of 1024 entries.
+    pub fn new() -> Self {
+        ReplayWindow::default()
+    }
+
+    /// Records `binder` and returns whether it was a new entry. `true` means
+    /// the connection may accept 0-RTT; `false` indicates a replay.
+    fn check_and_insert(&self, binder: &[u8]) -> bool {
+        let mut inner = self.inner.lock().expect("replay window poisoned");
+        if inner.seen.contains(binder) {
+            return false;
+        }
+        if inner.order.len() >= inner.cap
+            && let Some(old) = inner.order.pop_front()
+        {
+            inner.seen.remove(&old);
+        }
+        inner.seen.insert(binder.to_vec());
+        inner.order.push_back(binder.to_vec());
+        true
+    }
+}
+
 /// The server's signing key, used to sign the `CertificateVerify`.
 enum ServerKey {
     /// An RSA key; signs with `rsa_pss_rsae_sha256`.
@@ -58,6 +117,16 @@ pub struct ServerConfig {
     /// Lifetime (seconds) advertised in emitted NewSessionTickets; defaults
     /// to two hours.
     ticket_lifetime: u32,
+    /// Maximum 0-RTT payload (`max_early_data_size`) the server accepts on a
+    /// resumed connection. `0` (default) disables 0-RTT: the server does
+    /// not advertise it in NewSessionTickets and does not accept early
+    /// data even if offered.
+    max_early_data_size: u32,
+    /// Optional anti-replay set: a binder presented twice (within this
+    /// process's lifetime) is refused for 0-RTT. The same `ReplayWindow`
+    /// should be shared across all `ServerConfig`s in the same process.
+    #[cfg(feature = "std")]
+    replay_window: Option<ReplayWindow>,
 }
 
 impl ServerConfig {
@@ -71,6 +140,9 @@ impl ServerConfig {
             record_size_limit: None,
             ticket_key: None,
             ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
         }
     }
 
@@ -84,6 +156,9 @@ impl ServerConfig {
             record_size_limit: None,
             ticket_key: None,
             ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
         }
     }
 
@@ -97,6 +172,9 @@ impl ServerConfig {
             record_size_limit: None,
             ticket_key: None,
             ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
         }
     }
 
@@ -127,6 +205,24 @@ impl ServerConfig {
     pub fn with_ticket_lifetime(mut self, seconds: u32) -> Self {
         const MAX: u32 = 7 * 24 * 60 * 60;
         self.ticket_lifetime = seconds.min(MAX);
+        self
+    }
+
+    /// Enables 0-RTT: accept up to `max` bytes of early data on resumed
+    /// connections, and advertise that budget in emitted NewSessionTickets.
+    /// 0-RTT data is replayable by an active attacker; callers should
+    /// treat any data received under `take_early_data` as idempotent.
+    pub fn with_max_early_data(mut self, max: u32) -> Self {
+        self.max_early_data_size = max;
+        self
+    }
+
+    /// Installs a [`ReplayWindow`] for 0-RTT anti-replay. The same window
+    /// should be shared across all `ServerConfig`s in the process so that a
+    /// binder seen in one connection blocks it in the next.
+    #[cfg(feature = "std")]
+    pub fn with_replay_window(mut self, window: ReplayWindow) -> Self {
+        self.replay_window = Some(window);
         self
     }
 
@@ -182,6 +278,13 @@ pub struct ServerConnection<R: RngCore> {
     /// so we can derive `resumption_master_secret` once the client Finished
     /// transcript hash is known.
     ks: Option<KeySchedule>,
+    /// True if we accepted 0-RTT on this handshake (peer offered early_data
+    /// in CH AND policy allows). Drives the early-read-key install and EOED
+    /// expectation.
+    early_data_accepted: bool,
+    /// When 0-RTT is accepted, the client-handshake-traffic secret is stashed
+    /// here and installed as the read key only after EndOfEarlyData arrives.
+    deferred_chts: Option<Secret>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 }
@@ -205,9 +308,17 @@ impl<R: RngCore> ServerConnection<R> {
             pending_nst: false,
             rms: None,
             ks: None,
+            early_data_accepted: false,
+            deferred_chts: None,
             #[cfg(test)]
             server_hs_secret: None,
         }
+    }
+
+    /// Whether the just-completed handshake accepted 0-RTT data from the
+    /// client. Always `false` on fresh handshakes.
+    pub fn early_data_accepted(&self) -> bool {
+        self.early_data_accepted
     }
 
     /// Whether the just-completed handshake resumed a prior session via PSK
@@ -295,7 +406,10 @@ impl<R: RngCore> ServerConnection<R> {
                     }
                 }
                 Ok(Some(Incoming::ApplicationData)) => {
-                    if self.state != State::Connected {
+                    // Accept early-data records before the handshake completes
+                    // when 0-RTT was accepted; otherwise app data is invalid
+                    // until Connected.
+                    if self.state != State::Connected && !self.early_data_accepted {
                         return Err(Error::UnexpectedMessage);
                     }
                 }
@@ -321,7 +435,32 @@ impl<R: RngCore> ServerConnection<R> {
         let (msg_type, body) = read_handshake(&mut c)?;
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
-            State::WaitClientFinished => self.on_client_finished(msg_type, body, &msg),
+            State::WaitClientFinished => {
+                // Under 0-RTT acceptance the client sends EndOfEarlyData
+                // (under the early key) before its Finished. Receiving it
+                // installs the client-handshake read key.
+                if msg_type == hs_type::END_OF_EARLY_DATA
+                    && self.early_data_accepted
+                    && self.deferred_chts.is_some()
+                {
+                    if !body.is_empty() {
+                        return Err(Error::IllegalParameter);
+                    }
+                    let suite = self.suite.expect("suite set");
+                    let chts = self.deferred_chts.take().expect("deferred chts");
+                    self.core.set_read(RecordCrypter::new(
+                        suite.hash,
+                        suite.aead,
+                        suite.key_len,
+                        &chts,
+                    ));
+                    // Feed EOED into the transcript so client-Finished MAC
+                    // matches the client's view.
+                    self.core.transcript.update(&msg);
+                    return Ok(());
+                }
+                self.on_client_finished(msg_type, body, &msg)
+            }
             State::Connected => self.on_post_handshake(msg_type, body),
             _ => Err(Error::UnexpectedMessage),
         }
@@ -404,6 +543,26 @@ impl<R: RngCore> ServerConnection<R> {
         // hash. Hard-fail on binder mismatch (decrypt_error).
         let psk_state = self.try_accept_psk(&ch, raw)?;
 
+        // 0-RTT acceptance precondition: PSK was selected, the client
+        // offered early_data, and our policy is non-zero. Anti-replay: if a
+        // ReplayWindow is configured and this binder was seen, reject 0-RTT
+        // (proceed with 1-RTT, the spec-compliant fallback).
+        let client_offered_early = ext::find(&ch.extensions, ExtensionType::EARLY_DATA).is_some();
+        let mut accept_early =
+            psk_state.is_some() && client_offered_early && self.config.max_early_data_size > 0;
+        #[cfg(feature = "std")]
+        if accept_early
+            && let Some(window) = self.config.replay_window.as_ref()
+            && let Some(psk_body) = ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY)
+            && let Ok((_ids, binders)) = ext::parse_client_pre_shared_key(psk_body)
+            && let Some(b0) = binders.first()
+            && !window.check_and_insert(b0)
+        {
+            // Use the presented binder (first identity's) as the replay-key.
+            // A repeat refuses 0-RTT but still allows 1-RTT resumption.
+            accept_early = false;
+        }
+
         // Negotiate the cipher suite. If we accepted a PSK, the suite must
         // match the PSK's hash; otherwise pick our preferred suite from the
         // client's offer.
@@ -464,6 +623,29 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.transcript.set_alg(suite.hash);
         self.core.transcript.update(raw);
 
+        // 0-RTT: if accepting, derive client_early_traffic_secret from
+        // Hash(ClientHello) NOW (before SH lands in the transcript) and
+        // install it as the read key so subsequent 0-RTT application data
+        // records decrypt under the early key. This must happen before SH
+        // is emitted so the early secret is bound to CH alone.
+        let cets_for_read: Option<Secret> = if accept_early {
+            let psk = &psk_state.as_ref().expect("psk_state set").psk;
+            let early_ks = KeySchedule::with_psk(suite.hash, psk);
+            let th_ch = self.core.transcript.current_hash();
+            let cets = early_ks.client_early_traffic_secret(th_ch.as_slice());
+            self.early_data_accepted = true;
+            self.core.set_read(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &cets,
+            ));
+            Some(cets)
+        } else {
+            None
+        };
+        let _ = cets_for_read;
+
         // Pick a key-exchange group offered by the client.
         let ks_ext =
             ext::find(&ch.extensions, ExtensionType::KEY_SHARE).ok_or(Error::HandshakeFailure)?;
@@ -513,20 +695,26 @@ impl<R: RngCore> ServerConnection<R> {
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
 
-        // Server writes with the server handshake key; reads (client Finished)
-        // with the client handshake key.
+        // Server writes with the server handshake key. The read key was set
+        // to client_early_traffic_secret above when accepting 0-RTT; in that
+        // case we stash chts for installation at EndOfEarlyData. Otherwise
+        // install chts now.
         self.core.set_write(RecordCrypter::new(
             suite.hash,
             suite.aead,
             suite.key_len,
             &shts,
         ));
-        self.core.set_read(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &chts,
-        ));
+        if self.early_data_accepted {
+            self.deferred_chts = Some(chts);
+        } else {
+            self.core.set_read(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &chts,
+            ));
+        }
         self.core.emit_ccs();
 
         // Encrypted server flight. Under PSK resumption we omit Certificate
@@ -636,6 +824,12 @@ impl<R: RngCore> ServerConnection<R> {
                     let (ty, body) = ext::record_size_limit(limit);
                     crate::tls::codec::put_u16(exts, ty.0);
                     crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
+                }
+                // early_data acknowledgement (empty body) when accepting 0-RTT.
+                if self.early_data_accepted {
+                    let (ty, _) = ext::early_data_empty();
+                    crate::tls::codec::put_u16(exts, ty.0);
+                    crate::tls::codec::with_len_u16(exts, |_| {});
                 }
             });
         });
@@ -787,12 +981,16 @@ impl<R: RngCore> ServerConnection<R> {
         self.rng.fill_bytes(&mut age_add_bytes);
         let ticket_age_add = u32::from_be_bytes(age_add_bytes);
 
+        let mut extensions = Vec::new();
+        if self.config.max_early_data_size > 0 {
+            extensions.push(ext::early_data_with_size(self.config.max_early_data_size));
+        }
         let nst = NewSessionTicket {
             ticket_lifetime: self.config.ticket_lifetime,
             ticket_age_add,
             ticket_nonce: ticket_nonce.to_vec(),
             ticket,
-            extensions: Vec::new(),
+            extensions,
         };
         self.core.emit_handshake(nst.encode());
         self.pending_nst = false;

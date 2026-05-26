@@ -26,7 +26,7 @@ pub use conn::{
     StoredSession,
 };
 #[cfg(feature = "std")]
-pub use conn::{Connection, Stream};
+pub use conn::{Connection, ReplayWindow, Stream};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use pki::RootCertStore;
