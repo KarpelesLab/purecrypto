@@ -20,7 +20,7 @@
 //! instances rather than reuse the TLS-1.3-shaped
 //! [`super::common::ConnectionCore`].
 
-use super::super::codec::{ParsedRecord, read_record, write_record};
+use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
 use super::client12::{
     SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
 };
@@ -254,6 +254,10 @@ pub struct ServerConnection12<R: RngCore> {
     /// `true` while ChangeCipherSpec is allowed (between CH and our Finished).
     /// Closed once we transition to `Connected`.
     ccs_window_open: bool,
+    /// Set when the client's ChangeCipherSpec has been processed. A second
+    /// CCS in the same handshake direction is a protocol violation (RFC 5246
+    /// §7.1 allows exactly one per direction).
+    ccs_received: bool,
 
     /// Negotiated suite parameters (set on CH).
     suite: Option<SuiteParams12>,
@@ -321,6 +325,7 @@ impl<R: RngCore> ServerConnection12<R> {
             app_in: Vec::new(),
             transcript: Transcript::new(),
             ccs_window_open: true,
+            ccs_received: false,
             suite: None,
             x25519: None,
             p256: None,
@@ -475,6 +480,19 @@ impl<R: RngCore> ServerConnection12<R> {
         Ok(())
     }
 
+    /// Test-only: encrypt and emit an attacker-shaped record (any content
+    /// type, any payload) under the server's outbound crypter. Used to drive
+    /// hostile-peer hardening tests that need to inject post-handshake
+    /// renegotiation prompts or other forbidden messages.
+    #[cfg(test)]
+    pub(super) fn test_emit_encrypted(
+        &mut self,
+        ct: ContentType,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        self.emit_encrypted(ct, payload)
+    }
+
     /// Queues an alert (plaintext or encrypted depending on whether write keys
     /// are installed).
     fn emit_alert(&mut self, body: &[u8; 2]) -> Result<(), Error> {
@@ -495,12 +513,20 @@ impl<R: RngCore> ServerConnection12<R> {
 
             let Some(ParsedRecord {
                 content_type,
+                version,
                 fragment,
                 len,
             }) = read_record(&self.inbuf)?
             else {
                 return Ok(None);
             };
+            // RFC 5246 §6.2.1: record `legacy_version` must be in
+            // `0x0301..=0x0303`. Pre-TLS-1.0 codepoints (SSL 3.0 and below)
+            // are downgrade attempts; unknown future codepoints are also
+            // rejected.
+            if !is_legal_record_version(version) {
+                return Err(Error::UnsupportedVersion);
+            }
             let mut header = [0u8; 5];
             header.copy_from_slice(&self.inbuf[..5]);
             let fragment = fragment.to_vec();
@@ -515,16 +541,26 @@ impl<R: RngCore> ServerConnection12<R> {
                     if !self.ccs_window_open || fragment.as_slice() != [0x01] {
                         return Err(Error::UnexpectedMessage);
                     }
+                    // RFC 5246 §7.1: exactly one CCS per direction.
+                    if self.ccs_received {
+                        return Err(Error::UnexpectedMessage);
+                    }
                     let awaiting_finished = matches!(
                         self.state,
                         State::WaitClientFinished | State::WaitResumedClientFinished
                     );
+                    // The pending read crypter is installed only after
+                    // ClientKeyExchange (fresh) or right after CH (resumed).
+                    // Receiving a CCS before that — e.g. while still in
+                    // `WaitClientKeyExchange` or `WaitClientCertVerify` — is
+                    // an out-of-order CCS and a protocol violation.
                     if !awaiting_finished || self.pending_client_crypter.is_none() {
                         return Err(Error::UnexpectedMessage);
                     }
                     // Install the read crypter; the next handshake record
                     // (Finished) will be encrypted under it.
                     self.client_crypter = self.pending_client_crypter.take();
+                    self.ccs_received = true;
                     continue;
                 }
                 ContentType::Handshake => {
@@ -580,6 +616,12 @@ impl<R: RngCore> ServerConnection12<R> {
         let mut c = ReadCursor::new(&msg);
         let (msg_type, body) = read_handshake(&mut c)?;
 
+        // RFC 5246 §7.4.1.1: `HelloRequest` is server-emitted only. A client
+        // that sends one to us is misbehaving — reject in every state.
+        if msg_type == hs_type::HELLO_REQUEST {
+            return Err(Error::UnexpectedMessage);
+        }
+
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
             State::WaitClientCertificate => self.on_client_certificate(msg_type, body, &msg),
@@ -589,6 +631,8 @@ impl<R: RngCore> ServerConnection12<R> {
             State::WaitResumedClientFinished => {
                 self.on_resumed_client_finished(msg_type, body, &msg)
             }
+            // RFC 5246 §7.4.1: a `ClientHello` post-Connected is a
+            // renegotiation attempt. We do not support renegotiation.
             State::Connected | State::Closed => Err(Error::UnexpectedMessage),
         }
     }
@@ -598,6 +642,34 @@ impl<R: RngCore> ServerConnection12<R> {
             return Err(Error::UnexpectedMessage);
         }
         let ch = ClientHello::decode(body)?;
+
+        // RFC 5246 §E.1: a TLS 1.2 server rejects any `ClientHello` whose
+        // `legacy_version` is below 0x0303. A TLS 1.3 client keeps
+        // `legacy_version = 0x0303` and advertises real versions via
+        // `supported_versions`, so this only fails on a genuine pre-1.2
+        // peer (or a misbehaving stack), in which case `protocol_version`
+        // is the right alert.
+        if ch.legacy_version < 0x0303 {
+            return Err(Error::UnsupportedVersion);
+        }
+
+        // RFC 7507 §4 / RFC 8446 §4.1.3: `TLS_FALLBACK_SCSV` (0x5600) signals
+        // a deliberate downgrade. Our server tops out at TLS 1.2, so we are
+        // always at our maximum supported version and MUST NOT abort with
+        // `inappropriate_fallback`; the codepoint is simply ignored. (A
+        // hypothetical future server that also speaks TLS 1.3 would, when
+        // seeing 0x5600 here while still able to negotiate 1.3, abort with
+        // `IllegalParameter`.)
+
+        // RFC 8446 §4.1.3: if the client offered TLS 1.3 via
+        // `supported_versions` but we negotiated 1.2, the server MUST embed
+        // the downgrade sentinel `DOWNGRD\x01` in the last 8 bytes of
+        // `server_random`. Capture the bit here; the sentinel itself is
+        // applied once we emit `server_random`.
+        let client_offered_tls13 = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
+            .map(ext::client_offers_tls13)
+            .transpose()?
+            .unwrap_or(false);
 
         // RFC 5246 §7.4.1.4.1: TLS 1.2 ClientHello MUST carry
         // `signature_algorithms`. (Required regardless of resumption: we may
@@ -680,6 +752,9 @@ impl<R: RngCore> ServerConnection12<R> {
 
             let mut server_random: Random = [0u8; 32];
             self.rng.fill_bytes(&mut server_random);
+            if client_offered_tls13 {
+                apply_downgrade_sentinel(&mut server_random);
+            }
 
             self.suite = Some(rs.suite);
             self.client_random = Some(ch.random);
@@ -737,9 +812,15 @@ impl<R: RngCore> ServerConnection12<R> {
         self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
 
-        // Server random.
+        // Server random. RFC 8446 §4.1.3: if the client offered TLS 1.3 in
+        // `supported_versions` but we're returning a TLS 1.2 SH (we top out
+        // at 1.2), embed the downgrade sentinel in the trailing 8 bytes so
+        // a 1.3-aware client can detect the downgrade.
         let mut server_random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut server_random);
+        if client_offered_tls13 {
+            apply_downgrade_sentinel(&mut server_random);
+        }
 
         self.suite = Some(suite);
         self.group = Some(group);
@@ -1280,6 +1361,16 @@ fn build_finished(verify_data: &[u8; 12]) -> Vec<u8> {
     out
 }
 
+/// RFC 8446 §4.1.3 downgrade sentinel: overwrite the last 8 bytes of
+/// `server_random` with `44 4F 57 4E 47 52 44 01` ("DOWNGRD\x01") so a
+/// TLS 1.3-aware client can detect that we downgraded the connection from
+/// 1.3 to 1.2.
+fn apply_downgrade_sentinel(sr: &mut [u8; 32]) {
+    // "DOWNGRD\x01"
+    const SENTINEL: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
+    sr[24..].copy_from_slice(&SENTINEL);
+}
+
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
     match error {
@@ -1356,6 +1447,7 @@ mod tests {
         let mut random = [0u8; 32];
         crng.fill_bytes(&mut random);
         let ch = ClientHello {
+            legacy_version: 0x0303,
             random,
             session_id: Vec::new(),
             cipher_suites: alloc::vec![CipherSuite(0x0000)],
@@ -1391,6 +1483,7 @@ mod tests {
         let mut random = [0u8; 32];
         crng.fill_bytes(&mut random);
         let ch = ClientHello {
+            legacy_version: 0x0303,
             random,
             session_id: Vec::new(),
             cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -1426,6 +1519,7 @@ mod tests {
         let mut random = [0u8; 32];
         crng.fill_bytes(&mut random);
         let ch = ClientHello {
+            legacy_version: 0x0303,
             random,
             session_id: Vec::new(),
             cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],

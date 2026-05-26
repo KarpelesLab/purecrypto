@@ -2304,4 +2304,393 @@ mod tls12_loopback_tests {
         );
         assert!(!client2.did_resume(), "client must see a fresh handshake");
     }
+
+    // -------- Commit 6: hostile-peer hardening --------
+
+    use crate::rng::RngCore;
+    use crate::tls::codec::extension as ext;
+    use crate::tls::codec::handshake12::HelloRequest;
+    use crate::tls::codec::{
+        ClientHello, ReadCursor, ServerHello, hs_type, read_handshake, read_record,
+    };
+    use crate::tls::{ContentType, Error, ProtocolVersion};
+
+    /// A TLS 1.2 server presented with a CH that carries `supported_versions`
+    /// listing TLS 1.3 MUST overwrite the last 8 bytes of `server_random`
+    /// with the RFC 8446 §4.1.3 downgrade sentinel.
+    #[test]
+    fn tls12_server_writes_downgrade_sentinel() {
+        let (server_config, _cert_der) = rsa_server12();
+        let srng = HmacDrbg::<Sha256>::new(b"dg-sentinel-s", b"nonce", &[]);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        // Hand-craft a CH that also carries `supported_versions = [0x0304]`
+        // (mimicking a TLS 1.3-capable client that fell back to 1.2 on the
+        // record-version field).
+        let mut crng = HmacDrbg::<Sha256>::new(b"dg-sentinel-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::server_name("loopback.example"),
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+                ext::renegotiation_info_empty(),
+                ext::client_supported_versions(),
+            ],
+        }
+        .encode();
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        );
+        server.read_tls(&rec);
+        server.process_new_packets().unwrap();
+
+        // Parse the first emitted record — it should be the SH. Its body's
+        // `random` last 8 bytes must equal `DOWNGRD\x01`.
+        let out = server.write_tls();
+        let parsed = read_record(&out).unwrap().unwrap();
+        let mut cur = ReadCursor::new(parsed.fragment);
+        let (ty, body) = read_handshake(&mut cur).unwrap();
+        assert_eq!(ty, hs_type::SERVER_HELLO);
+        let sh = ServerHello::decode(body).unwrap();
+        assert_eq!(
+            &sh.random[24..],
+            &[0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01],
+            "server must embed the RFC 8446 §4.1.3 downgrade sentinel",
+        );
+    }
+
+    /// A TLS 1.2 client that receives an SH whose `server_random` tail is the
+    /// downgrade sentinel MUST abort with `IllegalParameter` unless it has
+    /// opted in via `with_accept_downgrade_sentinel(true)`.
+    #[test]
+    fn tls12_client_rejects_downgrade_sentinel() {
+        let (server_config, server_cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"sentinel-rej-c", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng);
+        // Drain the CH so the client is in `WaitServerHello`.
+        let _ch_bytes = client.write_tls();
+
+        // Hand-craft an SH whose server_random ends with the 1.3-↓-1.2
+        // sentinel. We don't need to drive a real server: the sentinel check
+        // fires before suite/extension validation paths that would touch
+        // crypto state.
+        let mut sr = [0xAAu8; 32];
+        sr[24..].copy_from_slice(&[0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01]);
+        let sh = ServerHello {
+            random: sr,
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            extensions: alloc::vec![ext::renegotiation_info_empty()],
+        }
+        .encode();
+        let _ = server_config; // suppress unused warning; we just needed the cert.
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &sh,
+        );
+        client.read_tls(&rec);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
+    /// A `HelloRequest` (RFC 5246 §7.4.1.1) is a renegotiation prompt. The
+    /// TLS 1.2 client refuses renegotiation entirely; receiving one — at any
+    /// state, but particularly after Connected — yields `UnexpectedMessage`.
+    #[test]
+    fn tls12_client_rejects_hello_request_post_handshake() {
+        // ---- Phase 1: mid-handshake plaintext HR ----
+        let (server_config1, server_cert_der1) = rsa_server12();
+        let mut roots1 = RootCertStore::new();
+        roots1.add_der(server_cert_der1).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"hr-mid-c", b"nonce", &[]);
+        let mut client1 = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots1),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let _ = server_config1; // we don't drive the server in this phase
+        let _ = client1.write_tls(); // drain CH
+        let hr = HelloRequest.encode();
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &hr,
+        );
+        client1.read_tls(&rec);
+        assert!(matches!(
+            client1.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+
+        // ---- Phase 2: post-Connected encrypted HR ----
+        let (server_config2, server_cert_der2) = rsa_server12();
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(server_cert_der2).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"hr-post-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"hr-post-s", b"nonce", &[]);
+        let mut client2 = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots2),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection12::new(server_config2, srng);
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        // Have the server emit an AEAD-encrypted HelloRequest under its
+        // outbound crypter. The client must reject as `UnexpectedMessage`.
+        let hr = HelloRequest.encode();
+        server2
+            .test_emit_encrypted(ContentType::Handshake, &hr)
+            .unwrap();
+        let s = server2.write_tls();
+        client2.read_tls(&s);
+        assert!(matches!(
+            client2.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
+    /// Records whose `legacy_version` field is below 0x0301 (SSL 3.0 or
+    /// earlier) MUST be rejected at the record layer by both client and
+    /// server.
+    #[test]
+    fn tls12_rejects_pre_tls12_record_version() {
+        // ---- Server side ----
+        let (server_config, _cert) = rsa_server12();
+        let srng = HmacDrbg::<Sha256>::new(b"badver-s", b"nonce", &[]);
+        let mut server = ServerConnection12::new(server_config, srng);
+        // Feed a record with legacy_version = 0x0300 (SSL 3.0).
+        let body = [0u8; 8];
+        let mut rec: Vec<u8> = Vec::new();
+        rec.push(ContentType::Handshake.as_u8());
+        rec.extend_from_slice(&[0x03, 0x00]); // SSL 3.0
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&body);
+        server.read_tls(&rec);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::UnsupportedVersion)
+        ));
+
+        // ---- Client side ----
+        let mut roots = RootCertStore::new();
+        let (_cfg, der) = rsa_server12();
+        roots.add_der(der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"badver-c", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng);
+        let _ = client.write_tls(); // drain CH
+        let mut rec: Vec<u8> = Vec::new();
+        rec.push(ContentType::Handshake.as_u8());
+        rec.extend_from_slice(&[0x03, 0x00]); // SSL 3.0
+        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&body);
+        client.read_tls(&rec);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::UnsupportedVersion)
+        ));
+    }
+
+    /// RFC 5246 §7.1: exactly one ChangeCipherSpec per direction. A second
+    /// one — even with the legal `[0x01]` body — must be rejected with
+    /// `UnexpectedMessage`.
+    #[test]
+    fn tls12_rejects_duplicate_ccs() {
+        // Complete a handshake first.
+        let (server_config, server_cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"dupccs-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"dupccs-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+
+        // Post-Connected, the CCS window is closed — any CCS arriving now
+        // (legitimate or duplicate) is rejected. This covers the
+        // "second CCS" case.
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::ChangeCipherSpec,
+            ProtocolVersion::TLSv1_2,
+            &[0x01],
+        );
+        client.read_tls(&rec);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
+    /// RFC 5246 §7.1: a ChangeCipherSpec arriving BEFORE
+    /// `ClientKeyExchange` (i.e. before the pending read crypter has been
+    /// built) is out-of-order and must be rejected with `UnexpectedMessage`.
+    #[test]
+    fn tls12_rejects_ccs_before_cke() {
+        let (server_config, _cert_der) = rsa_server12();
+        let srng = HmacDrbg::<Sha256>::new(b"earlyccs-s", b"nonce", &[]);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        // Drive a normal CH so the server emits the server flight and is
+        // now in `WaitClientKeyExchange`.
+        let mut crng = HmacDrbg::<Sha256>::new(b"earlyccs-c", b"nonce", &[]);
+        let mut roots = RootCertStore::new();
+        let (_cfg, der) = rsa_server12();
+        roots.add_der(der).unwrap();
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        // Drain the server's flight so the next inbound record is processed
+        // afresh.
+        let _ = server.write_tls();
+
+        // Now inject a stray CCS — before the client's CKE arrives.
+        let mut rec: Vec<u8> = Vec::new();
+        super::super::codec::write_record(
+            &mut rec,
+            ContentType::ChangeCipherSpec,
+            ProtocolVersion::TLSv1_2,
+            &[0x01],
+        );
+        server.read_tls(&rec);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
+    /// RFC 7507 §4: a fresh TLS 1.2 client does NOT emit `TLS_FALLBACK_SCSV`
+    /// (`0x5600`) by default. Opting in via `with_fallback_scsv(true)`
+    /// prepends it to the offered suite list. Our 1.2-only server ignores it
+    /// (it would only matter to a server that also speaks 1.3).
+    #[test]
+    fn tls12_fallback_scsv_default_off_and_opt_in() {
+        // Default: SCSV is absent from the CH suite list.
+        let mut crng = HmacDrbg::<Sha256>::new(b"scsv-off", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new());
+        let mut client = ClientConnection12::new(cfg, "example.com", &mut crng);
+        let bytes = client.write_tls();
+        let rec = read_record(&bytes).unwrap().unwrap();
+        let mut cur = ReadCursor::new(rec.fragment);
+        let (_ty, body) = read_handshake(&mut cur).unwrap();
+        let ch = ClientHello::decode(body).unwrap();
+        assert!(
+            !ch.cipher_suites.iter().any(|s| s.0 == 0x5600),
+            "default client must NOT advertise TLS_FALLBACK_SCSV",
+        );
+
+        // Opted in: 0x5600 is the FIRST suite on the wire.
+        let mut crng = HmacDrbg::<Sha256>::new(b"scsv-on", b"nonce", &[]);
+        let cfg = ClientConfig12::new(RootCertStore::new()).with_fallback_scsv(true);
+        let mut client = ClientConnection12::new(cfg, "example.com", &mut crng);
+        let bytes = client.write_tls();
+        let rec = read_record(&bytes).unwrap().unwrap();
+        let mut cur = ReadCursor::new(rec.fragment);
+        let (_ty, body) = read_handshake(&mut cur).unwrap();
+        let ch = ClientHello::decode(body).unwrap();
+        assert_eq!(
+            ch.cipher_suites.first().map(|s| s.0),
+            Some(0x5600),
+            "with_fallback_scsv(true) must prepend TLS_FALLBACK_SCSV",
+        );
+
+        // The server still accepts an SCSV-bearing CH (we are at our cap).
+        let (server_config, server_cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"scsv-full-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"scsv-full-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new(
+            ClientConfig12::new(roots).with_fallback_scsv(true),
+            "loopback.example",
+            &mut crng,
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+    }
 }

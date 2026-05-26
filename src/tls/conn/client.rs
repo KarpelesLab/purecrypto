@@ -768,6 +768,9 @@ impl ClientConnection {
         }
 
         let mut bytes = ClientHello {
+            // RFC 8446 §4.1.2: TLS 1.3 keeps `legacy_version = 0x0303` and
+            // signals the real version via `supported_versions`.
+            legacy_version: 0x0303,
             random,
             session_id: Vec::new(),
             cipher_suites: suites.to_vec(),
