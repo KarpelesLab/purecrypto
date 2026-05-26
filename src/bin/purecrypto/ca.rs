@@ -1,0 +1,636 @@
+//! `purecrypto ca` — manage a development CA on disk.
+//!
+//! Layout (`DIR/`):
+//!
+//! ```text
+//! root.key       (0600)  — PEM private key (algorithm-dependent format)
+//! root.crt       (0644)  — PEM self-signed CA certificate (serial = 1)
+//! serial         (0644)  — next-to-issue serial, single decimal u64
+//! issued.jsonl   (0644)  — JSON Lines, one record per issued cert
+//! revoked.jsonl  (0644)  — JSON Lines, one record per revocation
+//! crl.pem        (0644)  — last emitted CRL (re-written by `ca crl`)
+//! ```
+//!
+//! Subcommands: `init`, `sign-csr`, `issue`, `revoke`, `crl`, `show`.
+
+use std::path::{Path, PathBuf};
+
+use crate::pki::{describe_key, format_dn, parse_sans, parse_subject, validity_days};
+use crate::util::{Args, die, write_output, write_output_with_mode};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::rng::OsRng;
+use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+use purecrypto::x509::{
+    AnyPublicKey, CertSigner, Certificate, CertificateRevocationList, CertificationRequest,
+    CrlBuilder, CrlReason, DistinguishedName, Time, Validity,
+};
+
+/// CA directory layout helpers.
+struct CaDir {
+    dir: PathBuf,
+}
+
+impl CaDir {
+    fn new(dir: &str) -> Self {
+        CaDir {
+            dir: PathBuf::from(dir),
+        }
+    }
+    fn root_key(&self) -> PathBuf {
+        self.dir.join("root.key")
+    }
+    fn root_crt(&self) -> PathBuf {
+        self.dir.join("root.crt")
+    }
+    fn serial(&self) -> PathBuf {
+        self.dir.join("serial")
+    }
+    fn issued(&self) -> PathBuf {
+        self.dir.join("issued.jsonl")
+    }
+    fn revoked(&self) -> PathBuf {
+        self.dir.join("revoked.jsonl")
+    }
+    fn crl_pem(&self) -> PathBuf {
+        self.dir.join("crl.pem")
+    }
+}
+
+fn now_unix() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_string(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| die(format!("cannot read {}: {e}", path.display())))
+}
+
+fn read_bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {}: {e}", path.display())))
+}
+
+fn write_string(path: &Path, data: &str) {
+    std::fs::write(path, data)
+        .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())))
+}
+
+fn append_line(path: &Path, line: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap_or_else(|e| die(format!("cannot open {}: {e}", path.display())));
+    writeln!(f, "{line}").unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+}
+
+/// Loads `DIR/root.crt`.
+fn load_root_cert(ca: &CaDir) -> Certificate {
+    let pem = read_string(&ca.root_crt());
+    Certificate::from_pem(&pem).unwrap_or_else(|e| die(format!("bad root.crt: {e}")))
+}
+
+/// Loads `DIR/root.key` as one of the supported algorithms.
+enum RootKey {
+    Rsa(BoxedRsaPrivateKey),
+    Ec(BoxedEcdsaPrivateKey),
+    Ed25519(Ed25519PrivateKey),
+}
+
+impl RootKey {
+    fn signer(&self) -> CertSigner<'_> {
+        match self {
+            RootKey::Rsa(k) => CertSigner::Rsa(k),
+            RootKey::Ec(k) => CertSigner::Ecdsa(k),
+            RootKey::Ed25519(k) => CertSigner::Ed25519(k),
+        }
+    }
+}
+
+fn load_root_key(ca: &CaDir) -> RootKey {
+    let raw = read_bytes(&ca.root_key());
+    let pem = core::str::from_utf8(&raw)
+        .unwrap_or_else(|_| die(format!("{} is not PEM", ca.root_key().display())));
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
+        return RootKey::Rsa(k);
+    }
+    if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
+        return RootKey::Ec(k);
+    }
+    if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
+        return RootKey::Ed25519(k);
+    }
+    die(format!("cannot parse {}", ca.root_key().display()))
+}
+
+fn next_serial(ca: &CaDir) -> u64 {
+    let s = read_string(&ca.serial());
+    s.trim()
+        .parse::<u64>()
+        .unwrap_or_else(|_| die(format!("bad serial in {}", ca.serial().display())))
+}
+
+fn bump_serial(ca: &CaDir, current: u64) {
+    write_string(&ca.serial(), &format!("{}\n", current + 1));
+}
+
+fn serial_to_be_bytes(serial: u64) -> Vec<u8> {
+    let b = serial.to_be_bytes();
+    let mut i = 0;
+    while i + 1 < b.len() && b[i] == 0 {
+        i += 1;
+    }
+    b[i..].to_vec()
+}
+
+/// Days from `-days` (default 365).
+fn days(args: &Args) -> u64 {
+    args.value("-days")
+        .map(|d| {
+            d.parse::<u64>()
+                .unwrap_or_else(|_| die("invalid -days value"))
+        })
+        .unwrap_or(365)
+}
+
+fn ca_dir(args: &Args) -> CaDir {
+    let dir = args
+        .value("-dir")
+        .unwrap_or_else(|| die("missing -dir <DIR>"));
+    CaDir::new(dir)
+}
+
+// ---------------------------------------------------------------------------
+// init
+
+fn run_init(args: Args) {
+    let ca = ca_dir(&args);
+    if ca.root_key().exists() {
+        die(format!(
+            "{} already exists — refusing to overwrite a CA",
+            ca.root_key().display()
+        ));
+    }
+    std::fs::create_dir_all(&ca.dir)
+        .unwrap_or_else(|e| die(format!("cannot mkdir {}: {e}", ca.dir.display())));
+
+    let cn = args.value("-cn").unwrap_or("purecrypto Development CA");
+    let algorithm = args.value("-algorithm").unwrap_or("EC");
+    let curve = args.value("-curve").unwrap_or("P-256");
+    let days_n = days(&args);
+
+    // Generate the key.
+    let (key_pem, key_for_signer) = match algorithm.to_ascii_uppercase().as_str() {
+        "EC" | "ECDSA" => {
+            let curve_id = match curve.to_ascii_lowercase().as_str() {
+                "p-256" | "p256" | "prime256v1" | "secp256r1" => CurveId::P256,
+                "p-384" | "p384" | "secp384r1" => CurveId::P384,
+                "p-521" | "p521" | "secp521r1" => CurveId::P521,
+                other => die(format!("unknown curve: {other}")),
+            };
+            let k = BoxedEcdsaPrivateKey::generate(curve_id, &mut OsRng);
+            (k.to_sec1_pem(), RootKey::Ec(k))
+        }
+        "RSA" => {
+            use purecrypto::bignum::Uint;
+            let k = RsaPrivateKey::<32>::generate(Uint::from_u64(65537), &mut OsRng, 20);
+            let pem = k.to_pkcs1_pem();
+            (
+                pem,
+                RootKey::Rsa(BoxedRsaPrivateKey::from_pkcs1_der(&k.to_pkcs1_der()).unwrap()),
+            )
+        }
+        "ED25519" => {
+            let k = Ed25519PrivateKey::generate(&mut OsRng);
+            (k.to_pkcs8_pem(), RootKey::Ed25519(k))
+        }
+        other => die(format!(
+            "unsupported -algorithm {other} (try EC, RSA, ED25519)"
+        )),
+    };
+
+    // Build the self-signed CA cert.
+    let subject = DistinguishedName::common_name(cn);
+    let validity = validity_days(days_n);
+    let cert = Certificate::self_signed_general(
+        &key_for_signer.signer(),
+        &subject,
+        &validity,
+        1, // CA serial = 1
+        true,
+        &[],
+    )
+    .unwrap_or_else(|e| die(format!("cannot self-sign CA: {e}")));
+
+    // Persist.
+    write_output_with_mode(
+        Some(ca.root_key().to_str().unwrap()),
+        key_pem.as_bytes(),
+        true,
+    );
+    std::fs::write(&ca.root_crt(), cert.to_pem())
+        .unwrap_or_else(|e| die(format!("cannot write root.crt: {e}")));
+    write_string(&ca.serial(), "2\n");
+    // Touch the JSONL files so they exist with valid mode.
+    write_string(&ca.issued(), "");
+    write_string(&ca.revoked(), "");
+
+    println!(
+        "Initialized CA at {} (subject: {}, algorithm: {})",
+        ca.dir.display(),
+        format_dn(&subject),
+        algorithm
+    );
+}
+
+// ---------------------------------------------------------------------------
+// issue — sign a bare public key (no CSR roundtrip).
+
+fn parse_sans_arg(args: &Args) -> Vec<String> {
+    if let Some(ext) = args.value("-addext").or_else(|| args.value("-san")) {
+        parse_sans(ext)
+    } else if let Some(sans) = args.value("-sans") {
+        parse_sans(sans)
+    } else {
+        Vec::new()
+    }
+}
+
+fn run_issue(args: Args) {
+    let ca = ca_dir(&args);
+    let pub_path = args
+        .value("-pubkey")
+        .unwrap_or_else(|| die("missing -pubkey <pub.pem>"));
+    let cn = args
+        .value("-cn")
+        .or_else(|| args.value("-subj"))
+        .unwrap_or_else(|| die("missing -cn <NAME>"));
+    let is_ca = args.flag("-ca") || args.flag("--ca");
+    let days_n = days(&args);
+
+    let raw = read_bytes(Path::new(pub_path));
+    let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("pubkey is not PEM"));
+    let subject_key =
+        AnyPublicKey::from_spki_pem(pem).unwrap_or_else(|e| die(format!("bad pubkey: {e}")));
+
+    // CN can be either a plain string or an OpenSSL-style /CN=foo/O=bar subject.
+    let subject = if cn.starts_with('/') {
+        parse_subject(cn)
+    } else {
+        DistinguishedName::common_name(cn)
+    };
+
+    let sans = parse_sans_arg(&args);
+    let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
+
+    let root_key = load_root_key(&ca);
+    let root_cert = load_root_cert(&ca);
+    let issuer_dn = root_cert
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
+
+    let serial = next_serial(&ca);
+    let validity = validity_days(days_n);
+    let cert = Certificate::issue_general(
+        &root_key.signer(),
+        &issuer_dn,
+        &subject,
+        &subject_key,
+        &validity,
+        serial,
+        is_ca,
+        &san_refs,
+    )
+    .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")));
+    bump_serial(&ca, serial);
+
+    // Record in issued.jsonl.
+    let sans_json = sans
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let record = format!(
+        "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        serial,
+        format_dn(&subject).replace('"', "\\\""),
+        sans_json,
+        validity.not_after.as_str(),
+        now_unix()
+    );
+    append_line(&ca.issued(), &record);
+
+    write_output(args.value("-out"), cert.to_pem().as_bytes());
+    if args.value("-out").is_none() {
+        // The PEM was written to stdout; emit a parenthetical to stderr.
+        eprintln!("issued serial {serial}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sign-csr — sign an existing CSR
+
+fn run_sign_csr(args: Args) {
+    let ca = ca_dir(&args);
+    let csr_path = args
+        .value("-in")
+        .unwrap_or_else(|| die("missing -in <csr.pem>"));
+    let is_ca = args.flag("-ca") || args.flag("--ca");
+    let days_n = days(&args);
+
+    let raw = read_bytes(Path::new(csr_path));
+    let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("CSR is not PEM"));
+    let csr =
+        CertificationRequest::from_pem(pem).unwrap_or_else(|e| die(format!("bad CSR: {e}")));
+
+    let root_key = load_root_key(&ca);
+    let root_cert = load_root_cert(&ca);
+    let issuer_dn = root_cert
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
+
+    let serial = next_serial(&ca);
+    let validity = validity_days(days_n);
+    let cert = Certificate::issue_from_csr(
+        &root_key.signer(),
+        &issuer_dn,
+        &csr,
+        &validity,
+        serial,
+        is_ca,
+    )
+    .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")));
+    bump_serial(&ca, serial);
+
+    let subject = csr
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
+    let sans = csr.subject_alt_names().unwrap_or_default();
+    let sans_json = sans
+        .iter()
+        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let record = format!(
+        "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        serial,
+        format_dn(&subject).replace('"', "\\\""),
+        sans_json,
+        validity.not_after.as_str(),
+        now_unix()
+    );
+    append_line(&ca.issued(), &record);
+
+    write_output(args.value("-out"), cert.to_pem().as_bytes());
+}
+
+// ---------------------------------------------------------------------------
+// revoke — append a revocation record (no CRL refresh)
+
+fn parse_reason(s: &str) -> CrlReason {
+    match s.to_ascii_lowercase().replace('_', "-").as_str() {
+        "unspecified" | "" => CrlReason::Unspecified,
+        "key-compromise" => CrlReason::KeyCompromise,
+        "ca-compromise" => CrlReason::CACompromise,
+        "affiliation-changed" => CrlReason::AffiliationChanged,
+        "superseded" => CrlReason::Superseded,
+        "cessation-of-operation" => CrlReason::CessationOfOperation,
+        "certificate-hold" => CrlReason::CertificateHold,
+        "remove-from-crl" => CrlReason::RemoveFromCRL,
+        "privilege-withdrawn" => CrlReason::PrivilegeWithdrawn,
+        "aa-compromise" => CrlReason::AaCompromise,
+        other => die(format!("unknown -reason: {other}")),
+    }
+}
+
+fn parse_serial_arg(raw: &str) -> u64 {
+    // Accept `123` or `0x7B`.
+    if let Some(hex) = raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).unwrap_or_else(|_| die(format!("bad -serial hex: {raw}")))
+    } else {
+        raw.parse::<u64>()
+            .unwrap_or_else(|_| die(format!("bad -serial: {raw}")))
+    }
+}
+
+fn run_revoke(args: Args) {
+    let ca = ca_dir(&args);
+    let serial = args
+        .value("-serial")
+        .map(parse_serial_arg)
+        .unwrap_or_else(|| die("missing -serial <N>"));
+    let reason = args
+        .value("-reason")
+        .map(parse_reason)
+        .unwrap_or(CrlReason::Unspecified);
+
+    let record = format!(
+        "{{\"serial\":{},\"revoked_at\":{},\"reason\":\"{:?}\"}}",
+        serial,
+        now_unix(),
+        reason
+    );
+    append_line(&ca.revoked(), &record);
+    println!("revoked serial {serial}");
+}
+
+// ---------------------------------------------------------------------------
+// crl — sign the current revoked.jsonl as a fresh CRL
+
+#[derive(Debug)]
+struct RevokedRow {
+    serial: u64,
+    revoked_at: u64,
+    reason: CrlReason,
+}
+
+fn parse_revoked_jsonl(path: &Path) -> Vec<RevokedRow> {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Tiny hand parser: {"serial":N,"revoked_at":T,"reason":"Word"}.
+        let serial = extract_u64(line, "\"serial\":")
+            .unwrap_or_else(|| die(format!("bad revoked.jsonl row: {line}")));
+        let revoked_at = extract_u64(line, "\"revoked_at\":").unwrap_or(0);
+        let reason_str = extract_str(line, "\"reason\":\"").unwrap_or_else(|| "Unspecified".into());
+        let reason = match reason_str.as_str() {
+            "Unspecified" => CrlReason::Unspecified,
+            "KeyCompromise" => CrlReason::KeyCompromise,
+            "CACompromise" => CrlReason::CACompromise,
+            "AffiliationChanged" => CrlReason::AffiliationChanged,
+            "Superseded" => CrlReason::Superseded,
+            "CessationOfOperation" => CrlReason::CessationOfOperation,
+            "CertificateHold" => CrlReason::CertificateHold,
+            "RemoveFromCRL" => CrlReason::RemoveFromCRL,
+            "PrivilegeWithdrawn" => CrlReason::PrivilegeWithdrawn,
+            "AaCompromise" => CrlReason::AaCompromise,
+            _ => CrlReason::Unspecified,
+        };
+        out.push(RevokedRow {
+            serial,
+            revoked_at,
+            reason,
+        });
+    }
+    out
+}
+
+fn extract_u64(line: &str, prefix: &str) -> Option<u64> {
+    let i = line.find(prefix)?;
+    let rest = &line[i + prefix.len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn extract_str(line: &str, prefix: &str) -> Option<String> {
+    let i = line.find(prefix)?;
+    let rest = &line[i + prefix.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+fn run_crl(args: Args) {
+    let ca = ca_dir(&args);
+    let days_n = days(&args);
+    let now = now_unix();
+
+    let root_key = load_root_key(&ca);
+    let root_cert = load_root_cert(&ca);
+    let issuer_dn = root_cert
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
+
+    let this_update = Time::from_unix(now);
+    let next_update = Time::from_unix(now + days_n * 86_400);
+    let mut b = CrlBuilder::new(&issuer_dn, this_update, Some(next_update));
+
+    let rows = parse_revoked_jsonl(&ca.revoked());
+    for r in &rows {
+        b.revoke(
+            &serial_to_be_bytes(r.serial),
+            Time::from_unix(r.revoked_at),
+            if matches!(r.reason, CrlReason::Unspecified) {
+                None
+            } else {
+                Some(r.reason)
+            },
+        );
+    }
+    let crl = b
+        .sign(&root_key.signer())
+        .unwrap_or_else(|e| die(format!("cannot sign CRL: {e}")));
+    let pem = crl.to_pem();
+    write_string(&ca.crl_pem(), &pem);
+    if let Some(out) = args.value("-out") {
+        write_output(Some(out), pem.as_bytes());
+    } else {
+        println!("wrote {} ({} revocations)", ca.crl_pem().display(), rows.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// show
+
+fn run_show(args: Args) {
+    let ca = ca_dir(&args);
+    if !ca.root_crt().exists() {
+        die(format!("no CA at {}: run `ca init` first", ca.dir.display()));
+    }
+    let cert = load_root_cert(&ca);
+    let subject = cert
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad subject: {e}")));
+    let key = cert
+        .subject_public_key()
+        .unwrap_or_else(|e| die(format!("bad key: {e}")));
+    let next_serial = if ca.serial().exists() {
+        read_string(&ca.serial()).trim().to_string()
+    } else {
+        "?".into()
+    };
+    let issued = std::fs::read_to_string(&ca.issued())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let revoked = std::fs::read_to_string(&ca.revoked())
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count();
+    let crl_present = ca.crl_pem().exists();
+
+    println!("CA at {}", ca.dir.display());
+    println!("    Subject:    {}", format_dn(&subject));
+    println!("    Key:        {}", describe_key(&key));
+    println!("    Next serial: {next_serial}");
+    println!("    Issued:     {issued}");
+    println!("    Revoked:    {revoked}");
+    println!(
+        "    CRL:        {}",
+        if crl_present { "present" } else { "(none)" }
+    );
+    // Try to parse the CRL if present and print its dates.
+    if crl_present {
+        let pem = read_string(&ca.crl_pem());
+        if let Ok(crl) = CertificateRevocationList::from_pem(&pem) {
+            if let Ok(t) = crl.this_update() {
+                println!("    thisUpdate: {}", t.as_str());
+            }
+            if let Ok(Some(t)) = crl.next_update() {
+                println!("    nextUpdate: {}", t.as_str());
+            }
+            if let Ok(entries) = crl.entries() {
+                println!("    CRL entries: {}", entries.len());
+            }
+        }
+    }
+    // The _validity is just to keep compilers happy when unused.
+    let _ = Validity::new(Time::utc(2024, 1, 1, 0, 0, 0), Time::utc(2034, 1, 1, 0, 0, 0));
+}
+
+// ---------------------------------------------------------------------------
+// dispatch
+
+const USAGE: &str = "\
+purecrypto ca — manage a development CA
+
+USAGE:
+    purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519] [-curve P-256] [-days N]
+    purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca]
+    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca]
+    purecrypto ca revoke  -dir DIR -serial 7|0x7 [-reason key-compromise|superseded|...]
+    purecrypto ca crl     -dir DIR [-out crl.pem] [-days N]
+    purecrypto ca show    -dir DIR
+";
+
+pub(crate) fn run(args: Args) {
+    let positionals = args.positionals(&[
+        "-dir", "-cn", "-algorithm", "-curve", "-days", "-pubkey", "-in", "-out", "-sans",
+        "-addext", "-san", "-subj", "-serial", "-reason",
+    ]);
+    let sub = positionals.first().copied().unwrap_or("");
+
+    match sub {
+        "init" => run_init(args),
+        "issue" => run_issue(args),
+        "sign-csr" => run_sign_csr(args),
+        "revoke" => run_revoke(args),
+        "crl" => run_crl(args),
+        "show" => run_show(args),
+        "" | "help" | "-h" | "--help" => println!("{USAGE}"),
+        other => die(format!(
+            "unknown ca subcommand '{other}' (try `purecrypto ca help`)"
+        )),
+    }
+}
