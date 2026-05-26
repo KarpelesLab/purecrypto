@@ -25,11 +25,14 @@
 #![allow(unsafe_code)]
 #![allow(unreachable_pub)]
 
+mod cipher;
 mod common;
 mod ec;
 mod hash;
+mod kdf;
 mod rng;
 mod rsa;
+mod x25519;
 mod x509;
 
 pub use common::PcStatus;

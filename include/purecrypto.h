@@ -37,6 +37,24 @@ typedef enum {
   PC_INTERNAL = -6
 } pc_status;
 
+/* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
+typedef enum {
+  PC_AEAD_AES128_GCM = 1,
+  PC_AEAD_AES256_GCM = 2,
+  PC_AEAD_CHACHA20_POLY1305 = 3,
+  PC_AEAD_AES128_CCM = 4,
+  PC_AEAD_AES256_CCM = 5,
+  PC_AEAD_AES128_CCM8 = 6,
+  PC_AEAD_AES256_CCM8 = 7
+} pc_aead_id;
+
+/* Argon2 variant (for pc_argon2). */
+typedef enum {
+  PC_ARGON2D = 4,
+  PC_ARGON2I = 5,
+  PC_ARGON2ID = 6
+} pc_argon2_variant;
+
 /* Hash algorithm identifiers (for pc_digest, pc_hash_new, pc_hmac, RSA sign). */
 typedef enum {
   PC_SHA224 = 1,
@@ -83,10 +101,65 @@ pc_status pc_hash_update(PcHash *h, const uint8_t *data, size_t len);
 pc_status pc_hash_finish(PcHash *h, uint8_t *out, size_t *out_len);
 void pc_hash_free(PcHash *h);
 
-/* ---- HMAC (SHA-224/256/384/512) ---- */
+/* ---- HMAC (SHA-1, SHA-2, SHA-3, SM3, RIPEMD-160) ---- */
 pc_status pc_hmac(int32_t alg, const uint8_t *key, size_t key_len,
                   const uint8_t *msg, size_t msg_len, uint8_t *out,
                   size_t *out_len);
+
+/* ---- AEAD ciphers (AES-GCM/CCM, ChaCha20-Poly1305) ----
+ *
+ * pc_aead_encrypt writes ciphertext+tag in one buffer (tag appended). On
+ * success *ct_and_tag_len = pt_len + tag_len (16 by default, 8 for CCM8).
+ * pc_aead_decrypt verifies the tag before any plaintext is written and returns
+ * PC_VERIFICATION on mismatch (CCM additionally wipes the working buffer).
+ */
+pc_status pc_aead_encrypt(int32_t alg, const uint8_t *key, size_t key_len,
+                          const uint8_t *nonce, size_t nonce_len,
+                          const uint8_t *aad, size_t aad_len,
+                          const uint8_t *pt, size_t pt_len,
+                          uint8_t *ct_and_tag, size_t *ct_and_tag_len);
+pc_status pc_aead_decrypt(int32_t alg, const uint8_t *key, size_t key_len,
+                          const uint8_t *nonce, size_t nonce_len,
+                          const uint8_t *aad, size_t aad_len,
+                          const uint8_t *ct_and_tag, size_t ct_and_tag_len,
+                          uint8_t *pt, size_t *pt_len);
+
+/* ---- AES key wrap (RFC 3394) and key wrap with padding (RFC 5649) ----
+ * kek_len = 16 or 32 selects AES-128 or AES-256.
+ */
+pc_status pc_aes_kw_wrap(const uint8_t *kek, size_t kek_len,
+                         const uint8_t *key, size_t key_len,
+                         uint8_t *out, size_t *out_len);
+pc_status pc_aes_kw_unwrap(const uint8_t *kek, size_t kek_len,
+                           const uint8_t *ct, size_t ct_len,
+                           uint8_t *out, size_t *out_len);
+pc_status pc_aes_kwp_wrap(const uint8_t *kek, size_t kek_len,
+                          const uint8_t *key, size_t key_len,
+                          uint8_t *out, size_t *out_len);
+pc_status pc_aes_kwp_unwrap(const uint8_t *kek, size_t kek_len,
+                            const uint8_t *ct, size_t ct_len,
+                            uint8_t *out, size_t *out_len);
+
+/* ---- KDFs ---- */
+pc_status pc_hkdf(int32_t hash,
+                  const uint8_t *salt, size_t salt_len,
+                  const uint8_t *ikm, size_t ikm_len,
+                  const uint8_t *info, size_t info_len,
+                  uint8_t *out, size_t out_len);
+pc_status pc_pbkdf2(int32_t hash,
+                    const uint8_t *pw, size_t pw_len,
+                    const uint8_t *salt, size_t salt_len,
+                    uint32_t iterations,
+                    uint8_t *out, size_t out_len);
+pc_status pc_scrypt(const uint8_t *pw, size_t pw_len,
+                    const uint8_t *salt, size_t salt_len,
+                    uint32_t n, uint32_t r, uint32_t p,
+                    uint8_t *out, size_t out_len);
+pc_status pc_argon2(int32_t variant,
+                    const uint8_t *pw, size_t pw_len,
+                    const uint8_t *salt, size_t salt_len,
+                    uint32_t t_cost, uint32_t m_cost, uint32_t parallelism,
+                    uint8_t *out, size_t out_len);
 
 /* ---- Randomness ---- */
 pc_status pc_rand_bytes(uint8_t *out, size_t len);
@@ -117,6 +190,21 @@ pc_status pc_ec_sign(const PcEcKey *key, const uint8_t *msg, size_t msg_len,
 pc_status pc_ec_verify(const uint8_t *spki, size_t spki_len, const uint8_t *msg,
                        size_t msg_len, const uint8_t *sig, size_t sig_len);
 void pc_ec_free(PcEcKey *key);
+
+/* ---- ECDH (NIST P-256/P-384/P-521/secp256k1) ----
+ * `priv_be` is the big-endian private scalar (field_len bytes for the curve).
+ * `peer_spki` is the peer's SPKI DER.
+ * Output is the affine x-coordinate of the shared point, big-endian.
+ */
+pc_status pc_ecdh(int32_t curve, const uint8_t *priv_be, size_t priv_len,
+                  const uint8_t *peer_spki, size_t peer_spki_len,
+                  uint8_t *out, size_t *out_len);
+
+/* ---- X25519 (RFC 7748) ----
+ * Returns PC_VERIFICATION when `peer` is a small-order point.
+ */
+pc_status pc_x25519(const uint8_t *scalar, const uint8_t *peer, uint8_t *out);
+pc_status pc_x25519_public(const uint8_t *scalar, uint8_t *out);
 
 /* ---- Ed25519 ---- */
 PcEd25519Key *pc_ed25519_generate(void);

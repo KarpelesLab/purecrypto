@@ -5,9 +5,9 @@ use alloc::vec::Vec;
 
 use super::common::{PcStatus, guard, out_write, slice};
 use crate::hash::{
-    Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, HmacSha224, HmacSha256, HmacSha384,
-    HmacSha512, Keccak256, Md5, Ripemd160, Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224,
-    Sha256, Sha384, Sha512, Sha512_224, Sha512_256, Sm3,
+    Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, Hmac, HmacSha224, HmacSha256, HmacSha384,
+    HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md5, Ripemd160, Sha1, Sha3_224,
+    Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256, Sm3,
 };
 
 /// Hash algorithm identifiers (mirror `PcHashId` in `purecrypto.h`).
@@ -232,8 +232,9 @@ pub unsafe extern "C" fn pc_hash_free(h: *mut PcHash) {
     }
 }
 
-/// Computes HMAC of `msg` under `key`, with the hash selected by `alg`
-/// (SHA-224/256/384/512 only), writing the tag to `out`.
+/// Computes HMAC of `msg` under `key`, with the hash selected by `alg`,
+/// writing the tag to `out`. Supports every hash supplied by
+/// [`pc_digest`] (SHA-1, SHA-2 family, SHA-3 family, SM3, RIPEMD-160).
 ///
 /// # Safety
 /// All pointers must be valid for their lengths; `out_len` non-NULL.
@@ -254,10 +255,19 @@ pub unsafe extern "C" fn pc_hmac(
             return PcStatus::NullPointer;
         };
         let tag = match alg {
+            id::SHA1 => Hmac::<Sha1>::mac(k, m).as_ref().to_vec(),
             id::SHA224 => HmacSha224::mac(k, m).as_ref().to_vec(),
             id::SHA256 => HmacSha256::mac(k, m).as_ref().to_vec(),
             id::SHA384 => HmacSha384::mac(k, m).as_ref().to_vec(),
             id::SHA512 => HmacSha512::mac(k, m).as_ref().to_vec(),
+            id::SHA512_224 => HmacSha512_224::mac(k, m).as_ref().to_vec(),
+            id::SHA512_256 => HmacSha512_256::mac(k, m).as_ref().to_vec(),
+            id::SHA3_224 => Hmac::<Sha3_224>::mac(k, m).as_ref().to_vec(),
+            id::SHA3_256 => Hmac::<Sha3_256>::mac(k, m).as_ref().to_vec(),
+            id::SHA3_384 => Hmac::<Sha3_384>::mac(k, m).as_ref().to_vec(),
+            id::SHA3_512 => Hmac::<Sha3_512>::mac(k, m).as_ref().to_vec(),
+            id::SM3 => Hmac::<Sm3>::mac(k, m).as_ref().to_vec(),
+            id::RIPEMD160 => Hmac::<Ripemd160>::mac(k, m).as_ref().to_vec(),
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }

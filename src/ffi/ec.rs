@@ -4,7 +4,8 @@ use alloc::boxed::Box;
 
 use super::common::{PcStatus, guard, out_write, slice};
 use crate::ec::{
-    BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed25519PrivateKey, Ed25519Signature,
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId,
+    Ed25519PrivateKey, Ed25519Signature,
 };
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::OsRng;
@@ -326,4 +327,46 @@ pub unsafe extern "C" fn pc_ed25519_free(key: *mut PcEd25519Key) {
     if !key.is_null() {
         drop(unsafe { Box::from_raw(key) });
     }
+}
+
+/// Derives an ECDH shared secret using the SEC1-encoded private scalar `priv_be`
+/// (big-endian, `field_len(curve)` bytes) and the peer's SPKI DER. Writes the
+/// raw shared secret (the affine x-coordinate, `field_len` bytes) to `out`.
+///
+/// # Safety
+/// All pointers valid for their declared lengths; `out_len` non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ecdh(
+    curve_id: i32,
+    priv_be: *const u8,
+    priv_len: usize,
+    peer_spki: *const u8,
+    peer_spki_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        let Some(curve) = curve_from_id(curve_id) else {
+            return PcStatus::Unsupported;
+        };
+        let (Some(d), Some(spki)) = (unsafe { slice(priv_be, priv_len) }, unsafe {
+            slice(peer_spki, peer_spki_len)
+        }) else {
+            return PcStatus::NullPointer;
+        };
+        let sk = match BoxedEcdhPrivateKey::from_bytes(curve, d) {
+            Ok(s) => s,
+            Err(_) => return PcStatus::BadEncoding,
+        };
+        let peer: BoxedEcdsaPublicKey = match AnyPublicKey::from_spki_der(spki) {
+            Ok(AnyPublicKey::Ecdsa(k)) if k.curve() == curve => k,
+            Ok(AnyPublicKey::Ecdsa(_)) => return PcStatus::Unsupported,
+            Ok(_) => return PcStatus::Unsupported,
+            Err(_) => return PcStatus::BadEncoding,
+        };
+        match sk.diffie_hellman(&peer) {
+            Ok(secret) => unsafe { out_write(&secret, out, out_len) },
+            Err(_) => PcStatus::Verification,
+        }
+    })
 }
