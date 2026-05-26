@@ -403,12 +403,31 @@ impl Certificate {
         DistinguishedName::decode(&mut seq)
     }
 
+    /// The raw DER bytes of the certificate's `issuer` field — the full
+    /// `Name` TLV (`30 LL …`). Used for byte-exact chain-building matches
+    /// (RFC 5280 §7.1 requires byte equality for issuer/subject linking).
+    pub(crate) fn issuer_der(&self) -> Result<&[u8], Error> {
+        let mut seq = self.tbs_after_algid()?;
+        let bytes = seq.read_element()?;
+        Ok(bytes)
+    }
+
     /// The certificate subject.
     pub fn subject(&self) -> Result<DistinguishedName, Error> {
         let mut seq = self.tbs_after_algid()?;
         DistinguishedName::decode(&mut seq)?; // issuer
         Validity::decode(&mut seq)?; // validity
         DistinguishedName::decode(&mut seq)
+    }
+
+    /// The raw DER bytes of the certificate's `subject` field — the full
+    /// `Name` TLV. Used for byte-exact chain-building matches.
+    pub(crate) fn subject_der(&self) -> Result<&[u8], Error> {
+        let mut seq = self.tbs_after_algid()?;
+        seq.read_element()?; // issuer
+        seq.read_element()?; // validity
+        let bytes = seq.read_element()?;
+        Ok(bytes)
     }
 
     /// The subject's RSA public key. `LIMBS` must match the key's modulus size.
@@ -500,11 +519,25 @@ impl Certificate {
                     false
                 };
                 let path_len = if !seq.is_empty() {
-                    let bytes = seq.read_integer_bytes()?;
+                    // Strict-DER unsigned INTEGER: no leading sign byte
+                    // unnecessarily, no negative encodings, no empty body.
+                    // `pathLenConstraint` must fit in u32 — reject ≥ 5 bytes
+                    // (after the at-most-one permitted leading 0x00) before
+                    // accumulation rather than relying on `checked_shl`,
+                    // which doesn't detect value overflow (RFC 5280 §4.2.1.9).
+                    let bytes = seq.read_unsigned_integer_bytes()?;
+                    // Strip the at-most-one permitted leading 0x00.
+                    let mag = if bytes.len() > 1 && bytes[0] == 0x00 {
+                        &bytes[1..]
+                    } else {
+                        bytes
+                    };
+                    if mag.len() > 4 {
+                        return Err(Error::Malformed);
+                    }
                     let mut v: u32 = 0;
-                    for &b in bytes {
-                        v = v.checked_shl(8).ok_or(Error::Malformed)?;
-                        v |= b as u32;
+                    for &b in mag {
+                        v = (v << 8) | b as u32;
                     }
                     Some(v)
                 } else {

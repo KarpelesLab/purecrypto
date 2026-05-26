@@ -181,6 +181,51 @@ impl<'a> Reader<'a> {
         self.read_tlv(tag::INTEGER)
     }
 
+    /// Reads an `INTEGER`, enforcing the DER canonical-encoding rules from
+    /// X.690 §8.3:
+    ///   * length ≥ 1 (empty INTEGER is invalid),
+    ///   * no unnecessary leading 0x00 (`02 02 00 7f` ⇒ rejected in favour of
+    ///     `02 01 7f`),
+    ///   * no unnecessary leading 0xff (catches negative encodings that
+    ///     should have used a shorter representation),
+    ///   * the value must be non-negative (high bit of the first byte
+    ///     must be clear, unless a leading 0x00 was needed to keep it
+    ///     non-negative).
+    ///
+    /// This is the form to use for any unsigned INTEGER on the wire — ECDSA
+    /// `r`/`s`, RSA `n`/`e`/`d`, serial numbers, etc. — where strict-DER
+    /// matters for signature non-malleability and cross-implementation
+    /// equality.
+    pub fn read_unsigned_integer_bytes(&mut self) -> Result<&'a [u8], Error> {
+        let body = self.read_tlv(tag::INTEGER)?;
+        if body.is_empty() {
+            return Err(Error::Malformed);
+        }
+        // Strict-DER canonical encoding: rejects non-minimal encodings and
+        // negative two's-complement values.
+        match body {
+            [0x00] => Ok(body), // value zero (canonical)
+            [0x00, second, ..] => {
+                // Leading 0x00 only allowed if the next byte's high bit is set
+                // (otherwise the leading 0x00 is unnecessary).
+                if second & 0x80 == 0 {
+                    return Err(Error::Malformed);
+                }
+                Ok(body)
+            }
+            [first, ..] => {
+                // No leading 0x00. The high bit must be clear (i.e., positive
+                // representation); a set high bit would mean a negative value
+                // that should have been prefixed with 0x00.
+                if first & 0x80 != 0 {
+                    return Err(Error::Malformed);
+                }
+                Ok(body)
+            }
+            [] => Err(Error::Malformed), // unreachable: caught by the is_empty check above
+        }
+    }
+
     /// Reads an `OCTET STRING`.
     pub fn read_octet_string(&mut self) -> Result<&'a [u8], Error> {
         self.read_tlv(tag::OCTET_STRING)

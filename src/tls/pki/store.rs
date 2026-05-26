@@ -1,13 +1,16 @@
 //! A store of trusted root certificates (trust anchors).
 
 use crate::tls::Error;
-use crate::x509::{AnyPublicKey, Certificate, DistinguishedName};
+use crate::x509::{AnyPublicKey, Certificate};
 use alloc::vec::Vec;
 
-/// A trust anchor: a root certificate's subject name and its public key, the
-/// minimum needed to terminate a chain.
+/// A trust anchor: a root certificate's subject name (raw DER) and its
+/// public key, the minimum needed to terminate a chain. We store the raw
+/// DER of the subject `Name` so chain-building uses RFC 5280 §7.1
+/// byte-exact equality, immune to encoding differences (PrintableString
+/// vs UTF8String, extra attributes, multi-valued RDNs).
 pub(crate) struct TrustAnchor {
-    pub(crate) subject: DistinguishedName,
+    pub(crate) subject_der: Vec<u8>,
     pub(crate) key: AnyPublicKey,
 }
 
@@ -29,11 +32,14 @@ impl RootCertStore {
     /// subject name and public key.
     pub fn add_der(&mut self, der: Vec<u8>) -> Result<(), Error> {
         let cert = Certificate::from_der(der).map_err(|_| Error::BadCertificate)?;
-        let subject = cert.subject().map_err(|_| Error::BadCertificate)?;
+        let subject_der = cert
+            .subject_der()
+            .map_err(|_| Error::BadCertificate)?
+            .to_vec();
         let key = cert
             .subject_public_key()
             .map_err(|_| Error::BadCertificate)?;
-        self.anchors.push(TrustAnchor { subject, key });
+        self.anchors.push(TrustAnchor { subject_der, key });
         Ok(())
     }
 
@@ -53,9 +59,16 @@ impl RootCertStore {
         self.anchors.is_empty()
     }
 
-    /// Finds a trust anchor whose subject name matches `name` (a chain top's
-    /// issuer).
-    pub(crate) fn find_issuer(&self, name: &DistinguishedName) -> Option<&TrustAnchor> {
-        self.anchors.iter().find(|a| &a.subject == name)
+    /// Iterates over every trust anchor whose subject `Name` DER matches
+    /// `name_der`. Multiple anchors may share a name (cross-signed renewal
+    /// scenarios), so callers should try them all rather than stopping at
+    /// the first hit.
+    pub(crate) fn anchors_with_subject<'a>(
+        &'a self,
+        name_der: &'a [u8],
+    ) -> impl Iterator<Item = &'a TrustAnchor> + 'a {
+        self.anchors
+            .iter()
+            .filter(move |a| a.subject_der.as_slice() == name_der)
     }
 }

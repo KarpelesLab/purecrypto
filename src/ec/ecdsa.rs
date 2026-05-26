@@ -209,6 +209,34 @@ impl Signature {
         self.s.write_be_bytes(&mut out[32..]);
         out
     }
+
+    /// Whether `s` is in the lower half of the group order — i.e. the
+    /// "low-S" form required by signature-non-malleability conventions
+    /// (Bitcoin BIP-62, EVM, anti-replay caches that key on signature
+    /// bytes). For any valid ECDSA signature `(r, s)`, the pair
+    /// `(r, n − s)` also verifies, so callers needing unique signature
+    /// bytes must require `is_low_s()`.
+    pub fn is_low_s(&self) -> bool {
+        // half_n = (n + 1) / 2 — the smallest "high-S" boundary.
+        let n = P256::order();
+        let half_n = n.shr1().wrapping_add(&Fe::ONE);
+        bool::from(self.s.ct_lt(&half_n))
+    }
+
+    /// Returns the canonical low-S representative for this signature: if
+    /// `s` is already in the lower half, returns `self`; otherwise returns
+    /// `(r, n − s)`, which is equally valid and bytewise unique.
+    pub fn to_low_s(&self) -> Signature {
+        if self.is_low_s() {
+            self.clone()
+        } else {
+            let n = P256::order();
+            Signature {
+                r: self.r,
+                s: n.wrapping_sub(&self.s),
+            }
+        }
+    }
 }
 
 /// DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` codec — the
@@ -223,14 +251,22 @@ impl Signature {
         encode_sequence(&[encode_integer(&raw[..32]), encode_integer(&raw[32..])].concat())
     }
 
-    /// Decodes a DER `Ecdsa-Sig-Value` into a signature, left-padding `r`/`s`
-    /// to 32 bytes.
+    /// Decodes a DER `Ecdsa-Sig-Value` into a signature, with strict-DER
+    /// enforcement on the inner `r` / `s` INTEGERs (no unnecessary leading
+    /// `0x00`, no leading-`0xff`, no empty body, no trailing bytes inside
+    /// the SEQUENCE or after it). Strict DER is what closes the ECDSA
+    /// signature-malleability gap at the bytes level — many distinct
+    /// encodings of the same `(r, s)` are otherwise accepted.
     pub fn from_der(der: &[u8]) -> Result<Signature, Error> {
         use crate::der::Reader;
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence().map_err(|_| Error::Malformed)?;
-        let r = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
-        let s = seq.read_integer_bytes().map_err(|_| Error::Malformed)?;
+        let r = seq
+            .read_unsigned_integer_bytes()
+            .map_err(|_| Error::Malformed)?;
+        let s = seq
+            .read_unsigned_integer_bytes()
+            .map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
         reader.finish().map_err(|_| Error::Malformed)?;
 
@@ -241,12 +277,19 @@ impl Signature {
     }
 }
 
-/// Right-aligns a DER `INTEGER`'s magnitude (stripping a leading sign byte)
-/// into a 32-byte slot.
+/// Right-aligns a strict-DER unsigned INTEGER's magnitude (stripping the
+/// single permitted leading `0x00`, if any) into a 32-byte slot.
 #[cfg(all(feature = "der", feature = "alloc"))]
 fn left_pad_32(int: &[u8], out: &mut [u8]) -> Result<(), Error> {
-    let start = int.iter().position(|&b| b != 0).unwrap_or(int.len());
-    let mag = &int[start..];
+    // After `read_unsigned_integer_bytes` strict-DER validation, `int` is
+    // either `[0x00]` (value zero), `[0x00, b, ...]` with `b & 0x80 != 0`,
+    // or `[b, ...]` with `b & 0x80 == 0`. Strip the at-most-one leading
+    // 0x00 to recover the magnitude bytes.
+    let mag = if int.len() > 1 && int[0] == 0x00 {
+        &int[1..]
+    } else {
+        int
+    };
     if mag.len() > 32 {
         return Err(Error::Malformed);
     }
