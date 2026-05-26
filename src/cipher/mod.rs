@@ -19,6 +19,7 @@ mod chacha20;
 mod chacha20poly1305;
 mod ctr;
 mod gcm;
+mod kw;
 mod ofb;
 mod poly1305;
 
@@ -29,6 +30,10 @@ pub use chacha20::ChaCha20;
 pub use chacha20poly1305::ChaCha20Poly1305;
 pub use ctr::Ctr;
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
+pub use kw::{
+    Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
+    kw_ciphertext_len, kwp_ciphertext_len,
+};
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
 
