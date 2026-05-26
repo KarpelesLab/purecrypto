@@ -23,7 +23,7 @@ alloc = []
 # --- module gates (added as each layer lands) ---
 hash = []
 cipher = []
-kdf = ["hash"]
+kdf = ["hash", "cipher"]
 bignum = []
 rng = ["hash"]
 rsa = ["bignum", "rng", "hash"]
