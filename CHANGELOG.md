@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/purecrypto/compare/v0.0.3...v0.0.4) - 2026-05-26
+
+### Added
+
+- *(cli,pq)* PKCS#8 + CLI for ML-DSA, ML-KEM-768, and SLH-DSA
+- *(rsa)* runtime key generation for arbitrary modulus sizes
+- *(slhdsa)* add SLH-DSA (FIPS 205) hash-based signatures — all 12 sets
+- *(mldsa)* add ML-DSA (FIPS 204) signatures — 44/65/87
+- *(tls,mlkem)* add hybrid X25519MLKEM768 key exchange + ML-KEM SPKI
+- *(mlkem)* add ML-KEM-768 (FIPS 203), no_std and no-alloc
+- *(ec)* add Ed25519 (EdDSA, RFC 8032) across the full stack
+- *(cipher)* add ChaCha20-Poly1305 AEAD + TLS 1.3 suite
+- *(rng)* add Windows OsRng via ProcessPrng (fixes Windows release builds)
+
+### Fixed
+
+- *(rng)* link bcryptprimitives via raw-dylib for Windows OsRng
+
+### Other
+
+- honest status table — flip completed rows to ✅, name the gaps
+- comprehensive README — current state and CLI usage
+- document ML-DSA and SLH-DSA
+- document ChaCha20-Poly1305, Ed25519, ML-KEM-768 and hybrid TLS
+- run tests and clippy on Windows and macOS
+
 ### Added
 
 - *(rsa)* runtime RSA key generation (`BoxedRsaPrivateKey::generate`) for arbitrary moduli; `genpkey` now accepts any even size up to 65536 bits (e.g. 8192), falling back from the const-generic path
