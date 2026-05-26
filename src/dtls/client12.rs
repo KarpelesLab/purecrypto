@@ -717,7 +717,11 @@ impl DtlsClientConnection12 {
         match group {
             NamedGroup::X25519 => {
                 let peer: [u8; 32] = peer_point.try_into().map_err(|_| Error::Decode)?;
-                let ss = self.x25519.diffie_hellman(&peer);
+                // RFC 7748 §6.1: reject the all-zero (small-order) DH output.
+                let ss = self
+                    .x25519
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
                 Ok((ss.to_vec(), self.x25519.public_key().to_vec()))
             }
             NamedGroup::SECP256R1 => {

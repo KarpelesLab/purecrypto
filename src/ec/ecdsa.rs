@@ -2,7 +2,7 @@
 
 use super::Error;
 use super::p256::{Fe, P256, random_scalar};
-use crate::bignum::{MontModulus, inv_mod};
+use crate::bignum::MontModulus;
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
 use crate::rng::RngCore;
@@ -98,8 +98,16 @@ impl EcdsaPrivateKey {
             return Err(Error::InvalidInput);
         }
 
-        // s = k^-1 (z + r*d) mod n
-        let k_inv = inv_mod(&k, &n).ok_or(Error::InvalidInput)?;
+        // s = k^-1 (z + r*d) mod n.
+        //
+        // The nonce `k` is secret, so the inversion MUST be constant time. We
+        // use Fermat's little theorem (`k^{n-2} mod n`, where `n` is the prime
+        // order of the base point) via the constant-time Montgomery ladder,
+        // NOT the variable-time extended-Euclidean `inv_mod` — leaking `k`
+        // through timing would let an attacker recover the long-term key
+        // `d = (s·k − z)·r^{-1} mod n` (Brumley–Tuveri, "Remote Timing Attacks
+        // Are Still Practical").
+        let k_inv = fq.inv_prime(&k);
         let z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
         let s = fq.mul_mod(&k_inv, &z_rd);
         if bool::from(s.is_zero()) {
@@ -157,7 +165,10 @@ impl EcdsaPublicKey {
 
         let hash = D::digest(msg);
         let z = bits2int(hash.as_ref()).reduce(&n);
-        let w = inv_mod(&sig.s, &n).ok_or(Error::Verification)?;
+        // Public-side inversion: `sig.s` is in [1, n-1] (checked above), so
+        // Fermat works and is consistent with the constant-time discipline
+        // used elsewhere (no leakage matters here, since `sig.s` is public).
+        let w = fq.inv_prime(&sig.s);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
 

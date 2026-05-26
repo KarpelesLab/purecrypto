@@ -1196,7 +1196,12 @@ impl ClientConnection {
         match group {
             NamedGroup::X25519 => {
                 let peer: [u8; 32] = server_pub.try_into().map_err(|_| Error::Decode)?;
-                Ok(Secret::new(&self.x25519.diffie_hellman(&peer)))
+                // RFC 8446 §7.4.2: reject the all-zero (small-order) DH output.
+                let shared = self
+                    .x25519
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
+                Ok(Secret::new(&shared))
             }
             NamedGroup::SECP256R1 => {
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, server_pub)
@@ -1218,7 +1223,13 @@ impl ClientConnection {
                     .try_into()
                     .map_err(|_| Error::Decode)?;
                 let ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
-                let x_ss = self.x25519.diffie_hellman(&peer);
+                // RFC 8446 §7.4.2: reject the all-zero X25519 contribution.
+                // The ML-KEM contribution remains pristine even if X25519 is
+                // small-order, but TLS 1.3 mandates aborting either way.
+                let x_ss = self
+                    .x25519
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
                 // Combined secret: ML-KEM shared secret first, then X25519.
                 let mut combined = [0u8; 64];
                 combined[..32].copy_from_slice(&ml_ss);

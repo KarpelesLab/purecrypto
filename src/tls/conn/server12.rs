@@ -1137,7 +1137,10 @@ impl<R: RngCore> ServerConnection12<R> {
             NamedGroup::X25519 => {
                 let sk = self.x25519.as_ref().ok_or(Error::InappropriateState)?;
                 let peer: [u8; 32] = cke.point.as_slice().try_into().map_err(|_| Error::Decode)?;
-                sk.diffie_hellman(&peer).to_vec()
+                // RFC 7748 §6.1: reject the all-zero (small-order) DH output.
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?
+                    .to_vec()
             }
             NamedGroup::SECP256R1 => {
                 let sk = self.p256.as_ref().ok_or(Error::InappropriateState)?;

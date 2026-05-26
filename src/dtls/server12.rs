@@ -632,7 +632,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let sk = self.x25519.as_ref().ok_or(Error::InappropriateState)?;
         // Group is X25519.
         let peer: [u8; 32] = cke.point.as_slice().try_into().map_err(|_| Error::Decode)?;
-        let ss = sk.diffie_hellman(&peer);
+        // RFC 7748 §6.1: reject the all-zero (small-order) DH output.
+        let ss = sk
+            .diffie_hellman(&peer)
+            .map_err(|_| Error::IllegalParameter)?;
         let premaster = ss.to_vec();
         let cr = self.client_random.expect("set");
         let sr = self.server_random.expect("set");
