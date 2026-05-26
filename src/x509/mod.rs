@@ -6,6 +6,7 @@
 //! RSA with PKCS#1 v1.5 signatures.
 
 pub(crate) mod cert;
+mod crl;
 mod csr;
 mod name;
 mod pubkey;
@@ -13,6 +14,7 @@ mod signer;
 mod time;
 
 pub use cert::Certificate;
+pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, RevokedCertificate};
 pub use csr::CertificationRequest;
 pub use name::DistinguishedName;
 pub use pubkey::AnyPublicKey;
@@ -90,6 +92,10 @@ pub mod oid {
     pub const SUBJECT_ALT_NAME: &[u64] = &[2, 5, 29, 17];
     /// `extensionRequest` PKCS#9 attribute (1.2.840.113549.1.9.14).
     pub const EXTENSION_REQUEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 14];
+
+    /// `id-ce-cRLReason` (2.5.29.21) — per-entry CRL extension carrying a
+    /// `CRLReason ::= ENUMERATED` (RFC 5280 §5.3.1).
+    pub const CRL_REASON_CODE: &[u64] = &[2, 5, 29, 21];
 }
 
 /// Errors from X.509 encoding, parsing, and verification.
