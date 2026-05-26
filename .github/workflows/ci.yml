@@ -77,8 +77,14 @@ jobs:
           cargo rustc --lib --release --features ffi --crate-type staticlib
           cargo rustc --lib --release --features ffi --crate-type cdylib
 
-      - name: Compile and run the C smoke test
+      - name: Compile and run the C smoke tests
         run: |
           cc tests/ffi_smoke.c -I include target/release/libpurecrypto.a \
              -lpthread -ldl -lm -o ffi_smoke
           ./ffi_smoke
+          cc tests/ffi_tls_smoke.c -I include target/release/libpurecrypto.a \
+             -lpthread -ldl -lm -o ffi_tls_smoke
+          ./ffi_tls_smoke
+          cc tests/ffi_dtls_smoke.c -I include target/release/libpurecrypto.a \
+             -lpthread -ldl -lm -o ffi_dtls_smoke
+          ./ffi_dtls_smoke

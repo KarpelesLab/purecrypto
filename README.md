@@ -59,6 +59,39 @@ Single crate, modules gated by Cargo features:
 | C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA, ECDSA & Ed25519 keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 
+## CLI + C-API coverage matrix
+
+Each functional area below is callable from the Rust library, the
+`purecrypto` CLI, and the C ABI (`include/purecrypto.h`).
+
+| Area                                  | CLI                                  | C API                                                              |
+| ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
+| Hashing (SHA-2/3, BLAKE2/3, SM3, …)   | `hash`                               | `pc_digest`, `pc_hash_*`                                           |
+| HMAC (SHA-1, SHA-2, SHA-3, SM3, …)    | `mac`                                | `pc_hmac`                                                          |
+| KDFs (HKDF, PBKDF2, scrypt, Argon2)   | `kdf hkdf\|pbkdf2\|scrypt\|argon2`   | `pc_hkdf`, `pc_pbkdf2`, `pc_scrypt`, `pc_argon2`                   |
+| AEAD (AES-GCM/CCM, ChaCha20-Poly1305) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
+| AES key wrap (RFC 3394/5649)          | `enc -alg AES-KW\|AES-KWP`           | `pc_aes_kw_wrap/unwrap`, `pc_aes_kwp_wrap/unwrap`                  |
+| Randomness                            | `rand`                               | `pc_rand_bytes`                                                    |
+| RSA keygen + PKCS#1 sign/verify       | `genpkey`, `req`, `x509`, `pkeyutl`  | `pc_rsa_generate`, `pc_rsa_sign_pkcs1`, `pc_rsa_verify_pkcs1`      |
+| RSA-PSS sign/verify                   | `pkeyutl sign/verify -pkeyopt pss`   | `pc_rsa_sign_pss`, `pc_rsa_verify_pss`                             |
+| RSA-OAEP encrypt/decrypt              | `pkeyutl encrypt/decrypt -pkeyopt oaep` | `pc_rsa_encrypt_oaep`, `pc_rsa_decrypt_oaep`                    |
+| ECDSA keygen + sign/verify            | `genpkey -alg EC`, `pkeyutl`         | `pc_ec_generate`, `pc_ec_sign`, `pc_ec_verify`                     |
+| Ed25519 sign/verify                   | `genpkey -alg ED25519`, `pkeyutl`    | `pc_ed25519_*`                                                     |
+| ECDH on NIST curves                   | `kex -alg ECDH-P{256,384,521}`       | `pc_ecdh`                                                          |
+| X25519                                | `kex -alg X25519`                    | `pc_x25519`, `pc_x25519_public`                                    |
+| ML-KEM (FIPS 203)                     | `kem keygen\|encaps\|decaps`         | `pc_mlkem_*`                                                       |
+| ML-DSA (FIPS 204)                     | `pkeyutl sign/verify` (ML-DSA keys)  | `pc_mldsa_*`                                                       |
+| SLH-DSA (FIPS 205)                    | `pkeyutl sign/verify` (SLH-DSA keys) | `pc_slhdsa_*`                                                      |
+| CSR (PKCS#10)                         | `req`                                | `pc_csr_create_rsa`, `pc_csr_from_pem`, `pc_csr_verify_self_signed`|
+| X.509 certificate parse + verify      | `x509`, `ca`                         | `pc_cert_*`, `pc_ec_self_signed_pem`                               |
+| CRL parse + verify                    | `crl`                                | `pc_crl_*`                                                         |
+| TLS 1.2 / 1.3 client + server         | `s_client`, `s_server`               | `pc_tls_cfg_*`, `pc_tls_*` (memory-BIO style)                      |
+| DTLS 1.2 / 1.3 client + server        | `s_dtls_client`, `s_dtls_server`     | `pc_tls_cfg_*` (`PC_DTLS_1_*` selector), `pc_dtls_next_timeout/on_timeout` |
+
+The C ABI is sans-I/O for TLS/DTLS: the caller pumps wire bytes through
+`pc_tls_feed` / `pc_tls_pop` and application bytes through `pc_tls_send` /
+`pc_tls_recv` (mirrors OpenSSL's `BIO_s_mem`).
+
 ## Cargo features
 
 Default is `std + cli` with every module on. Disable defaults for a `no_std`

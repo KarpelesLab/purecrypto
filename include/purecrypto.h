@@ -5,6 +5,24 @@
  *   cargo rustc --release --features ffi --crate-type staticlib   (-> libpurecrypto.a)
  *   cargo rustc --release --features ffi --crate-type cdylib      (-> libpurecrypto.so)
  *
+ * Functional areas exposed by this header:
+ *   - Hashing      — SHA-2/3, BLAKE2/3, Keccak, SM3, SHA-1, MD5, RIPEMD-160
+ *                    (pc_digest, pc_hash_*, pc_hmac)
+ *   - KDFs         — HKDF, PBKDF2, scrypt, Argon2 (pc_hkdf/pc_pbkdf2/...)
+ *   - AEAD         — AES-GCM/CCM, ChaCha20-Poly1305 (pc_aead_*)
+ *   - AES key wrap — RFC 3394 / 5649 (pc_aes_kw_*, pc_aes_kwp_*)
+ *   - Randomness   — pc_rand_bytes
+ *   - RSA          — keygen, PKCS#1 v1.5 + PSS sign/verify, OAEP enc/dec
+ *   - ECDSA / Ed25519 — keygen + sign/verify
+ *   - ECDH / X25519   — pc_ecdh, pc_x25519
+ *   - ML-KEM       — FIPS 203 keygen, encaps, decaps (pc_mlkem_*)
+ *   - ML-DSA       — FIPS 204 keygen, sign, verify (pc_mldsa_*)
+ *   - SLH-DSA      — FIPS 205 keygen, sign, verify (pc_slhdsa_*)
+ *   - CSR          — PKCS#10 build / parse / self-sig verify (pc_csr_*)
+ *   - X.509        — pc_cert_*
+ *   - CRL          — pc_crl_*
+ *   - TLS/DTLS     — 1.2/1.3 client + server, memory-BIO style (pc_tls_*)
+ *
  * Conventions:
  *  - Functions return pc_status (0 = PC_OK, negative = error). Constructors
  *    instead return an opaque pointer that is NULL on failure.
