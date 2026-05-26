@@ -4,8 +4,8 @@
 //! construction/parsing of individual extensions lives in the handshake logic.
 
 use super::{
-    CipherSuite, ExtensionType, Random, ReadCursor, put_u8, put_u16, with_len_u8, with_len_u16,
-    with_len_u24,
+    CipherSuite, ExtensionType, Random, ReadCursor, put_u8, put_u16, put_u32, with_len_u8,
+    with_len_u16, with_len_u24,
 };
 use crate::tls::Error;
 use alloc::vec::Vec;
@@ -155,6 +155,70 @@ impl ServerHello {
     }
 }
 
+/// A `NewSessionTicket` handshake message (RFC 8446 §4.6.1).
+///
+/// Servers may issue one or more of these any time after the handshake to
+/// enable PSK resumption on subsequent connections. The `extensions` field
+/// most commonly carries the `early_data` extension with the server's
+/// maximum-early-data budget.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct NewSessionTicket {
+    /// Hint, in seconds, for how long the ticket may be reused (max 7 days).
+    pub(crate) ticket_lifetime: u32,
+    /// Randomizer added to the client's reported ticket-age before sending,
+    /// so age values do not link the same ticket across resumptions.
+    pub(crate) ticket_age_add: u32,
+    /// Per-ticket nonce, used in `HKDF-Expand-Label(rms, "resumption", nonce)`
+    /// to derive the PSK.
+    pub(crate) ticket_nonce: Vec<u8>,
+    /// Opaque ticket bytes — the client presents these unchanged on resume.
+    pub(crate) ticket: Vec<u8>,
+    /// Per-ticket extensions (typically `early_data` only).
+    pub(crate) extensions: Vec<RawExtension>,
+}
+
+impl NewSessionTicket {
+    /// Encodes the full handshake message (type + length + body).
+    // Used by the server-side NST emission (lands in a follow-up commit) and
+    // by codec tests; keep available.
+    #[allow(dead_code)]
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::NEW_SESSION_TICKET);
+        with_len_u24(&mut out, |b| {
+            put_u32(b, self.ticket_lifetime);
+            put_u32(b, self.ticket_age_add);
+            with_len_u8(b, |b| b.extend_from_slice(&self.ticket_nonce));
+            with_len_u16(b, |b| b.extend_from_slice(&self.ticket));
+            encode_extensions(b, &self.extensions);
+        });
+        out
+    }
+
+    /// Decodes a `NewSessionTicket` from a handshake message body.
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+        let mut c = ReadCursor::new(body);
+        let ticket_lifetime = c.u32()?;
+        let ticket_age_add = c.u32()?;
+        let ticket_nonce = c.vec_u8()?.to_vec();
+        let ticket = c.vec_u16()?.to_vec();
+        // RFC 8446 §4.6.1: ticket length is `1..2^16-1`; zero-length tickets
+        // are not permitted.
+        if ticket.is_empty() {
+            return Err(Error::Decode);
+        }
+        let extensions = parse_extensions(c.vec_u16()?)?;
+        c.expect_empty()?;
+        Ok(NewSessionTicket {
+            ticket_lifetime,
+            ticket_age_add,
+            ticket_nonce,
+            ticket,
+            extensions,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,5 +268,48 @@ mod tests {
     fn rejects_truncated() {
         let mut c = ReadCursor::new(&[1, 0, 0, 5, 0x03]); // claims 5 body bytes, has 1
         assert!(read_handshake(&mut c).is_err());
+    }
+
+    #[test]
+    fn new_session_ticket_roundtrip() {
+        let nst = NewSessionTicket {
+            ticket_lifetime: 7200,
+            ticket_age_add: 0x12345678,
+            ticket_nonce: alloc::vec![0xa1, 0xa2],
+            ticket: alloc::vec![0xb0; 48],
+            // No extensions for the standard case.
+            extensions: Vec::new(),
+        };
+        let bytes = nst.encode();
+        assert_eq!(bytes[0], hs_type::NEW_SESSION_TICKET);
+        let mut c = ReadCursor::new(&bytes);
+        let (ty, body) = read_handshake(&mut c).unwrap();
+        assert_eq!(ty, hs_type::NEW_SESSION_TICKET);
+        assert_eq!(NewSessionTicket::decode(body).unwrap(), nst);
+    }
+
+    #[test]
+    fn new_session_ticket_rejects_empty_ticket() {
+        // ticket_lifetime=0, ticket_age_add=0, nonce=[], ticket=[], extensions=[]
+        let body = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(NewSessionTicket::decode(&body).is_err());
+    }
+
+    #[test]
+    fn new_session_ticket_with_early_data_ext() {
+        // RFC 8446 §4.6.1: NST extensions may contain `early_data` carrying
+        // a u32 max_early_data_size.
+        let nst = NewSessionTicket {
+            ticket_lifetime: 3600,
+            ticket_age_add: 0xdeadbeef,
+            ticket_nonce: alloc::vec![1, 2, 3, 4],
+            ticket: alloc::vec![0xcc; 100],
+            extensions: alloc::vec![(
+                ExtensionType(0x002a),               // early_data
+                alloc::vec![0x00, 0x00, 0x40, 0x00], // max_early_data_size = 16384
+            )],
+        };
+        let body = &nst.encode()[4..]; // skip type + 3-byte length
+        assert_eq!(NewSessionTicket::decode(body).unwrap(), nst);
     }
 }

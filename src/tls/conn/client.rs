@@ -14,8 +14,8 @@ use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
 use crate::rng::RngCore;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, read_handshake,
+    CipherSuite, ClientHello, NamedGroup, NewSessionTicket as NstWire, Random, ReadCursor,
+    ServerHello, SignatureScheme, hs_type, read_handshake,
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
@@ -101,6 +101,58 @@ pub struct ClientConnection {
 
     cert_chain: Vec<Vec<u8>>,
     leaf_key: Option<AnyPublicKey>,
+
+    /// Most recent `NewSessionTicket` from the peer (RFC 8446 §4.6.1). Real
+    /// servers (Cloudflare, Google, …) commonly send one immediately after
+    /// `Finished`; we accept and stash it. Used by future PSK resumption.
+    last_ticket: Option<ReceivedSessionTicket>,
+}
+
+/// A `NewSessionTicket` received from the server, exposed for inspection and
+/// (eventually) PSK-based resumption.
+#[derive(Clone, Debug)]
+pub struct ReceivedSessionTicket {
+    /// Lifetime hint in seconds (RFC 8446 §4.6.1 caps at 7 days = 604800).
+    pub lifetime_seconds: u32,
+    /// Randomizer added to the obfuscated ticket age.
+    pub age_add: u32,
+    /// Per-ticket nonce used by `HKDF-Expand-Label(rms, "resumption", nonce)`
+    /// to derive the PSK.
+    pub nonce: Vec<u8>,
+    /// Opaque ticket bytes — re-presented unchanged on resume.
+    pub ticket: Vec<u8>,
+    /// `max_early_data_size` from the `early_data` extension, when present.
+    /// Cap on bytes the client may send under the 0-RTT key on a resumed
+    /// connection.
+    pub max_early_data_size: Option<u32>,
+}
+
+impl ReceivedSessionTicket {
+    fn from_wire(nst: NstWire) -> Result<Self, Error> {
+        // RFC 8446 §4.6.1 caps the lifetime at 7 days.
+        const MAX_LIFETIME: u32 = 7 * 24 * 60 * 60;
+        if nst.ticket_lifetime > MAX_LIFETIME {
+            return Err(Error::Decode);
+        }
+        // Look up an optional early_data extension (type 0x002a).
+        let mut max_early_data_size = None;
+        for (ty, body) in &nst.extensions {
+            if ty.0 == 0x002a {
+                if body.len() != 4 {
+                    return Err(Error::Decode);
+                }
+                let v = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+                max_early_data_size = Some(v);
+            }
+        }
+        Ok(ReceivedSessionTicket {
+            lifetime_seconds: nst.ticket_lifetime,
+            age_add: nst.ticket_age_add,
+            nonce: nst.ticket_nonce,
+            ticket: nst.ticket,
+            max_early_data_size,
+        })
+    }
 }
 
 impl ClientConnection {
@@ -130,6 +182,13 @@ impl ClientConnection {
     /// the server's `Certificate` message has been received.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// The most recent `NewSessionTicket` received from the server, if any.
+    /// Real-world servers (Cloudflare, Google, …) commonly send one or more
+    /// post-handshake; the most recent is retained.
+    pub fn last_session_ticket(&self) -> Option<&ReceivedSessionTicket> {
+        self.last_ticket.as_ref()
     }
 }
 
@@ -185,6 +244,7 @@ impl ClientConnection {
             server_hs_secret: None,
             cert_chain: Vec::new(),
             leaf_key: None,
+            last_ticket: None,
         };
         let hello = conn.build_client_hello(random, String::from(server_name), suites, groups);
         conn.core.emit_handshake(hello);
@@ -320,17 +380,26 @@ impl ClientConnection {
             State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
             State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &msg),
             State::WaitFinished => self.on_finished(msg_type, body, &msg),
-            State::Connected => self.on_post_handshake(msg_type),
+            State::Connected => self.on_post_handshake(msg_type, body),
             State::Closed => Err(Error::UnexpectedMessage),
         }
     }
 
-    /// Handles post-handshake messages (RFC 8446 §4.6). NewSessionTicket is
-    /// ignored (resumption is unsupported); KeyUpdate is accepted but not yet
-    /// acted on.
-    fn on_post_handshake(&mut self, msg_type: u8) -> Result<(), Error> {
+    /// Handles post-handshake messages (RFC 8446 §4.6).
+    ///
+    /// * `NewSessionTicket` (type 4) is parsed and the most recent one is
+    ///   stashed in [`Self::last_ticket`] for later inspection / resumption.
+    /// * `KeyUpdate` (type 24) is currently accepted but not acted on — full
+    ///   rekey support lands in a later commit.
+    /// * Anything else fails with `unexpected_message`.
+    fn on_post_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
         match msg_type {
-            hs_type::NEW_SESSION_TICKET | hs_type::KEY_UPDATE => Ok(()),
+            hs_type::NEW_SESSION_TICKET => {
+                let nst = NstWire::decode(body)?;
+                self.last_ticket = Some(ReceivedSessionTicket::from_wire(nst)?);
+                Ok(())
+            }
+            hs_type::KEY_UPDATE => Ok(()),
             _ => Err(Error::UnexpectedMessage),
         }
     }

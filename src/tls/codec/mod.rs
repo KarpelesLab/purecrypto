@@ -7,7 +7,9 @@ mod primitives;
 mod record;
 
 #[allow(unused_imports)]
-pub(crate) use handshake::{ClientHello, RawExtension, ServerHello, hs_type, read_handshake};
+pub(crate) use handshake::{
+    ClientHello, NewSessionTicket, RawExtension, ServerHello, hs_type, read_handshake,
+};
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
 #[allow(unused_imports)]
@@ -51,6 +53,11 @@ impl<'a> ReadCursor<'a> {
         Ok(u16::from_be_bytes([b[0], b[1]]))
     }
 
+    pub(crate) fn u32(&mut self) -> Result<u32, Error> {
+        let b = self.take(4)?;
+        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
     pub(crate) fn u24(&mut self) -> Result<usize, Error> {
         let b = self.take(3)?;
         Ok(((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize)
@@ -91,6 +98,14 @@ pub(crate) fn put_u8(out: &mut Vec<u8>, v: u8) {
 
 #[inline]
 pub(crate) fn put_u16(out: &mut Vec<u8>, v: u16) {
+    out.extend_from_slice(&v.to_be_bytes());
+}
+
+// Used by NewSessionTicket emission (server side, lands in a follow-up commit)
+// and currently only exercised by the codec tests; keep around.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 

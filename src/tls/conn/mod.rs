@@ -7,7 +7,7 @@ mod server;
 mod stream;
 
 #[allow(unused_imports)]
-pub use client::{ClientConfig, ClientConnection};
+pub use client::{ClientConfig, ClientConnection, ReceivedSessionTicket};
 #[allow(unused_imports)]
 pub use server::{ServerConfig, ServerConnection};
 #[cfg(feature = "std")]
@@ -218,6 +218,130 @@ mod loopback_tests {
             drive_until_client_error(&mut client, &mut server),
             crate::tls::Error::BadCertificate
         );
+    }
+
+    /// A server-emitted `NewSessionTicket` post-handshake is parsed and
+    /// stashed in `ClientConnection::last_session_ticket()`. This mirrors the
+    /// Cloudflare / real-world case where the peer sends one or more NSTs
+    /// immediately after `Finished`.
+    #[test]
+    fn accepts_post_handshake_new_session_ticket() {
+        use crate::tls::codec::ExtensionType;
+        use crate::tls::codec::NewSessionTicket;
+
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"nst-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"nst-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Complete the handshake.
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+
+        // Server emits a NewSessionTicket carrying an early_data extension.
+        let nst = NewSessionTicket {
+            ticket_lifetime: 3600,
+            ticket_age_add: 0xdeadbeef,
+            ticket_nonce: alloc::vec![1, 2, 3, 4],
+            ticket: alloc::vec![0xab; 32],
+            extensions: alloc::vec![(ExtensionType(0x002a), alloc::vec![0x00, 0x00, 0x40, 0x00],)],
+        };
+        server.emit_post_handshake(nst.encode());
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+
+        let got = client.last_session_ticket().expect("ticket stored");
+        assert_eq!(got.lifetime_seconds, 3600);
+        assert_eq!(got.age_add, 0xdeadbeef);
+        assert_eq!(got.nonce, alloc::vec![1u8, 2, 3, 4]);
+        assert_eq!(got.ticket, alloc::vec![0xab; 32]);
+        assert_eq!(got.max_early_data_size, Some(16384));
+
+        // The handshake state is unaffected; we can still exchange app data.
+        server.send_application_data(b"after ticket").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"after ticket");
+    }
+
+    /// A malformed `NewSessionTicket` (empty ticket field) is rejected with a
+    /// decode error; the client closes the connection rather than papering over
+    /// it.
+    #[test]
+    fn rejects_malformed_new_session_ticket() {
+        use crate::tls::codec::hs_type;
+
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"badnst-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"badnst-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+
+        // Manually craft a NewSessionTicket message body with ticket length = 0,
+        // which RFC 8446 §4.6.1 forbids (`ticket<1..2^16-1>`).
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&3600u32.to_be_bytes()); // ticket_lifetime
+        body.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
+        body.push(0); // ticket_nonce<0..255> = empty
+        body.extend_from_slice(&[0, 0]); // ticket<...> length = 0  (illegal)
+        body.extend_from_slice(&[0, 0]); // extensions<...> length = 0
+
+        // Wrap as a Handshake message: type ‖ u24 length ‖ body.
+        let mut msg = alloc::vec::Vec::new();
+        msg.push(hs_type::NEW_SESSION_TICKET);
+        let blen = body.len() as u32;
+        msg.extend_from_slice(&blen.to_be_bytes()[1..]);
+        msg.extend_from_slice(&body);
+
+        server.emit_post_handshake(msg);
+        let s = server.write_tls();
+        client.read_tls(&s);
+        // The client must error out (no stored ticket).
+        assert!(client.process_new_packets().is_err());
+        assert!(client.last_session_ticket().is_none());
     }
 
     #[test]
