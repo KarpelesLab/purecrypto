@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/purecrypto/compare/v0.0.5...v0.0.6) - 2026-05-26
+
+### Added
+
+- *(cli)* unified -tls / -dtls version flags
+- *(dtls)* DTLS 1.3 client + server + cookie
+- *(dtls)* DTLS 1.3 ACK + reliability
+- *(dtls)* DTLS 1.3 record framing
+- *(cli)* s_dtls_client / s_dtls_server binaries
+- *(dtls)* DTLS 1.2 client + server
+- *(dtls)* DTLS 1.2 retransmission
+- *(dtls)* record layer + replay window + reassembly + cookie
+- *(cli,tls)* -tls1_2 flag + live interop
+- *(tls)* TLS 1.2 hostile-peer hardening
+- *(tls)* TLS 1.2 mTLS + RFC 5077 session tickets
+- *(tls)* TLS 1.2 server (ECDHE-AEAD)
+- *(tls)* TLS 1.2 client (ECDHE-AEAD, server-cert-only)
+- *(tls)* TLS 1.2 handshake-message codec
+- *(tls)* TLS 1.2 cipher-suite codes, PRF, explicit-nonce AEAD
+- *(signature_registry)* optional SHA-1-RSA + RSA-PSS-PSS keys
+- *(tls)* ML-DSA in TLS 1.3 CertificateVerify
+- *(x509)* SLH-DSA chain + secp256k1 + cross-hash ECDSA
+- *(x509,signature_registry)* ML-DSA chain + issuance support
+- *(x509,tls)* policy whitelist — SignaturePolicy
+- SignatureAlgorithm registry — refactor verify dispatch
+- *(cli)* keylogfile, ALPN, mTLS flags; new s_server binary
+- *(tls)* mTLS / client certificate authentication
+- *(tls)* 0-RTT (early_data)
+- *(tls)* PSK session resumption (server + client)
+
+### Other
+
+- README — TLS 1.2, DTLS 1.2, DTLS 1.3
+- README — signature registry, policy, supported algorithms
+- README — TLS row to ✅, document the new features
+
+### Security
+
+- *(pqc)* ML-KEM EK input validation + ML-DSA ct_eq
+- *(cipher,ec,rng)* ChaCha20/GCM length caps + P-521 rejection + DRBG reseed
+- *(dtls)* replay window + cookie expiry + reassembly cap
+- *(tls)* downgrade defenses + RSA-PKCS1 ban + plaintext-after-keys + mTLS purpose
+- *(ec,der)* Ed25519 cofactored verify + OID canonicalization + PEM strictness
+- *(x509,der)* DN raw-DER + strict-INTEGER + pathLen overflow + ECDSA strict DER + low-S
+- *(x509)* inner/outer algid + critical-ext rejection + keyCertSign + EC coord reduction + chain cap
+- *(ec,tls)* Fermat inverse on secret z + X25519 zero rejection
+- *(rsa)* base blinding + constant-time PKCS#1 v1.5 + PSS ct_eq
+
 ## [0.0.5](https://github.com/KarpelesLab/purecrypto/compare/v0.0.4...v0.0.5) - 2026-05-26
 
 ### Added
