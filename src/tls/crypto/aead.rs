@@ -47,6 +47,12 @@ impl Aead {
     }
 }
 
+/// Per-key record-sequence cap. RFC 8446 §5.5 mandates that implementations
+/// initiate a `KeyUpdate` before the AEAD's safe-record limit is reached:
+/// AES-GCM ≈ 2²⁴·⁵, AES-CCM_8 ≈ 2²³, ChaCha20-Poly1305 ≈ 2⁴⁸. We pick the
+/// most conservative bound that still leaves room for normal traffic.
+const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
+
 /// One direction's record protection: an AEAD keyed from a traffic secret,
 /// plus the static IV and a record sequence counter.
 pub(crate) struct RecordCrypter {
@@ -82,21 +88,37 @@ impl RecordCrypter {
     }
 
     /// The per-record nonce: static IV XOR the 64-bit big-endian sequence
-    /// number (right-aligned), then increments the counter.
-    fn next_nonce(&mut self) -> [u8; 12] {
+    /// number (right-aligned), then increments the counter. Returns
+    /// `Err(TooManyRecords)` if the per-key cap (RFC 8446 §5.5) has been
+    /// reached; callers should `KeyUpdate` first.
+    fn next_nonce(&mut self) -> Result<[u8; 12], Error> {
+        if self.seq >= MAX_RECORDS_PER_KEY {
+            return Err(Error::TooManyRecords);
+        }
         let mut nonce = self.iv;
         let seq = self.seq.to_be_bytes();
         for i in 0..8 {
             nonce[4 + i] ^= seq[i];
         }
         self.seq += 1;
-        nonce
+        Ok(nonce)
     }
 
     /// Encrypts one record, returning the complete wire `TLSCiphertext`
     /// (5-byte header included). `content_type` is the true inner content type;
     /// no padding is added.
-    pub(crate) fn encrypt(&mut self, content_type: ContentType, content: &[u8]) -> Vec<u8> {
+    ///
+    /// Returns `Err(TooManyRecords)` once the per-key record cap is hit and
+    /// `Err(RecordOverflow)` if `content` would exceed the `2^14` plaintext
+    /// fragment limit (RFC 8446 §5.1).
+    pub(crate) fn encrypt(
+        &mut self,
+        content_type: ContentType,
+        content: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        if content.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
         let fragment_len = content.len() + 1 + 16; // inner + type byte + tag
         let mut header = [0u8; 5];
         header[0] = ContentType::ApplicationData.as_u8();
@@ -108,14 +130,14 @@ impl RecordCrypter {
         inner.extend_from_slice(content);
         inner.push(content_type.as_u8());
 
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         let tag = self.aead.encrypt(&nonce, &header, &mut inner);
 
         let mut out = Vec::with_capacity(5 + fragment_len);
         out.extend_from_slice(&header);
         out.extend_from_slice(&inner);
         out.extend_from_slice(&tag);
-        out
+        Ok(out)
     }
 
     /// Decrypts one record. `header` is the 5-byte `TLSCiphertext` header
@@ -135,7 +157,7 @@ impl RecordCrypter {
         tag.copy_from_slice(tag_bytes);
 
         let mut buf = ct.to_vec();
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         if !self.aead.decrypt(&nonce, header, &mut buf, &tag) {
             return Err(Error::BadRecordMac);
         }
@@ -148,6 +170,11 @@ impl RecordCrypter {
         };
         let content_type = ContentType::from_u8(buf[end]);
         buf.truncate(end);
+        // RFC 8446 §5.2: the recovered TLSPlaintext.fragment must not exceed
+        // 2^14 bytes (the type byte and padding are already stripped).
+        if buf.len() > (1usize << 14) {
+            return Err(Error::RecordOverflow);
+        }
         Ok((content_type, buf))
     }
 }
@@ -177,7 +204,7 @@ mod tests {
 
         let mut c =
             RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &server_hs_secret());
-        let out = c.encrypt(ContentType::Handshake, &payload);
+        let out = c.encrypt(ContentType::Handshake, &payload).unwrap();
         assert_eq!(out, record);
     }
 

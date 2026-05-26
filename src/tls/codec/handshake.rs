@@ -43,10 +43,15 @@ fn encode_extensions(out: &mut Vec<u8>, extensions: &[RawExtension]) {
 
 fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
     let mut c = ReadCursor::new(bytes);
-    let mut out = Vec::new();
+    let mut out: Vec<RawExtension> = Vec::new();
     while !c.is_empty() {
         let ty = ExtensionType(c.u16()?);
         let data = c.vec_u16()?;
+        // RFC 8446 §4.2: every extension type may appear at most once in a
+        // single handshake message.
+        if out.iter().any(|(t, _)| *t == ty) {
+            return Err(Error::IllegalParameter);
+        }
         out.push((ty, data.to_vec()));
     }
     Ok(out)

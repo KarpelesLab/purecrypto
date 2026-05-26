@@ -35,6 +35,11 @@ pub(crate) struct ConnectionCore {
     write: Option<RecordCrypter>,
     pub(crate) transcript: Transcript,
     sent_close_notify: bool,
+    /// RFC 8446 §5: ChangeCipherSpec records are only valid in the
+    /// middlebox-compat window between the first ClientHello and the peer's
+    /// `Finished`. The role-specific state machines call `close_ccs_window`
+    /// once they reach Connected.
+    ccs_window_open: bool,
 }
 
 impl ConnectionCore {
@@ -48,7 +53,15 @@ impl ConnectionCore {
             write: None,
             transcript: Transcript::new(),
             sent_close_notify: false,
+            ccs_window_open: true,
         }
+    }
+
+    /// Called by the role-specific state machine when the handshake completes.
+    /// After this, any further `ChangeCipherSpec` from the peer is treated as
+    /// a protocol violation.
+    pub(crate) fn close_ccs_window(&mut self) {
+        self.ccs_window_open = false;
     }
 
     /// Feeds received TLS bytes into the input buffer.
@@ -120,10 +133,16 @@ impl ConnectionCore {
 
     fn emit_record(&mut self, ct: ContentType, payload: &[u8]) {
         match &mut self.write {
-            Some(crypter) => {
-                let rec = crypter.encrypt(ct, payload);
-                self.outbuf.extend_from_slice(&rec);
-            }
+            Some(crypter) => match crypter.encrypt(ct, payload) {
+                Ok(rec) => self.outbuf.extend_from_slice(&rec),
+                Err(_) => {
+                    // The only failures here are `TooManyRecords` (callers
+                    // should `request_key_update` first) and `RecordOverflow`
+                    // (callers must fragment). Both are programmer errors;
+                    // drop the record so the connection visibly stops making
+                    // progress rather than emitting garbage.
+                }
+            },
             None => write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload),
         }
     }
@@ -152,7 +171,15 @@ impl ConnectionCore {
             self.inbuf.drain(..len);
 
             match content_type {
-                ContentType::ChangeCipherSpec => continue, // middlebox compat
+                ContentType::ChangeCipherSpec => {
+                    // RFC 8446 §5: must be exactly `[0x01]`, and only inside
+                    // the middlebox-compat window. Reject anything else as
+                    // `unexpected_message`.
+                    if !self.ccs_window_open || fragment.as_slice() != [0x01] {
+                        return Err(Error::UnexpectedMessage);
+                    }
+                    continue;
+                }
                 ContentType::ApplicationData if self.read.is_some() => {
                     let (inner_ct, content) = self.decrypt(&fragment)?;
                     if let Some(msg) = self.dispatch_inner(inner_ct, content)? {
@@ -178,7 +205,9 @@ impl ConnectionCore {
         crypter.decrypt(&header, fragment)
     }
 
-    /// Routes the plaintext recovered from a protected record.
+    /// Routes the plaintext recovered from a protected record. RFC 8446 §5.4
+    /// forbids zero-length inner `Handshake` and `Alert` records (only empty
+    /// `ApplicationData` is permitted, as a traffic-analysis countermeasure).
     fn dispatch_inner(
         &mut self,
         inner_ct: ContentType,
@@ -186,6 +215,9 @@ impl ConnectionCore {
     ) -> Result<Option<Incoming>, Error> {
         match inner_ct {
             ContentType::Handshake => {
+                if content.is_empty() {
+                    return Err(Error::UnexpectedMessage);
+                }
                 self.hs_pending.extend_from_slice(&content);
                 Ok(None)
             }
@@ -193,7 +225,12 @@ impl ConnectionCore {
                 self.app_in.extend_from_slice(&content);
                 Ok(Some(Incoming::ApplicationData))
             }
-            ContentType::Alert => Ok(Some(parse_alert(&content)?)),
+            ContentType::Alert => {
+                if content.is_empty() {
+                    return Err(Error::UnexpectedMessage);
+                }
+                Ok(Some(parse_alert(&content)?))
+            }
             _ => Err(Error::UnexpectedMessage),
         }
     }

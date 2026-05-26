@@ -539,6 +539,8 @@ impl<R: RngCore> ServerConnection<R> {
             suite.key_len,
             cats,
         ));
+        // RFC 8446 §5: ChangeCipherSpec is no longer permitted after this point.
+        self.core.close_ccs_window();
         self.state = State::Connected;
         Ok(())
     }
@@ -563,6 +565,8 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
             AlertDescription::IllegalParameter
         }
+        Error::RecordOverflow => AlertDescription::RecordOverflow,
+        Error::TooManyRecords => AlertDescription::InternalError,
         _ => AlertDescription::HandshakeFailure,
     }
 }

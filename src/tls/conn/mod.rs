@@ -541,6 +541,124 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
     }
 
+    /// Duplicate extensions in a ServerHello are rejected per RFC 8446 §4.2.
+    /// Inject a hand-crafted ServerHello with two `supported_versions` blocks
+    /// and verify the client rejects with `illegal_parameter`.
+    #[test]
+    fn rejects_duplicate_extensions_in_server_hello() {
+        use crate::tls::codec::{ExtensionType, ServerHello, put_u16, write_record};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"dup-ext-client", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let _ch1 = client.write_tls();
+
+        // Build a ServerHello with two supported_versions extensions.
+        let sv_body = alloc::vec![0x03, 0x04];
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, NamedGroup::X25519.0);
+        let key_body: Vec<u8> = alloc::vec![0u8; 32];
+        crate::tls::codec::with_len_u16(&mut ks_body, |b| b.extend_from_slice(&key_body));
+        let sh = ServerHello {
+            random: [0x77; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, sv_body.clone()),
+                (ExtensionType::SUPPORTED_VERSIONS, sv_body),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        );
+        client.read_tls(&out);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
+    /// A `ChangeCipherSpec` record after the handshake completes is rejected
+    /// with `unexpected_message` per RFC 8446 §5.
+    #[test]
+    fn rejects_ccs_after_handshake() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ccs-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ccs-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+
+        // Inject a CCS record after the handshake.
+        let mut bad = Vec::new();
+        crate::tls::codec::write_record(
+            &mut bad,
+            crate::tls::ContentType::ChangeCipherSpec,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &[0x01],
+        );
+        client.read_tls(&bad);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
+    }
+
+    /// A `ChangeCipherSpec` record carrying anything other than `[0x01]` is
+    /// rejected with `unexpected_message`.
+    #[test]
+    fn rejects_ccs_with_bad_body() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"badccs-client", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let _ch1 = client.write_tls();
+
+        let mut bad = Vec::new();
+        crate::tls::codec::write_record(
+            &mut bad,
+            crate::tls::ContentType::ChangeCipherSpec,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &[0x01, 0x02],
+        );
+        client.read_tls(&bad);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
+    }
+
     /// A malformed `NewSessionTicket` (empty ticket field) is rejected with a
     /// decode error; the client closes the connection rather than papering over
     /// it.

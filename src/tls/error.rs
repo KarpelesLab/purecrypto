@@ -18,6 +18,9 @@ pub enum AlertDescription {
     UnexpectedMessage,
     /// `bad_record_mac` (20).
     BadRecordMac,
+    /// `record_overflow` (22) — RFC 8446 §6: ciphertext > `2^14 + 256` or
+    /// post-decrypt plaintext > `2^14` bytes.
+    RecordOverflow,
     /// `handshake_failure` (40).
     HandshakeFailure,
     /// `bad_certificate` (42).
@@ -57,6 +60,7 @@ impl AlertDescription {
             AlertDescription::CloseNotify => 0,
             AlertDescription::UnexpectedMessage => 10,
             AlertDescription::BadRecordMac => 20,
+            AlertDescription::RecordOverflow => 22,
             AlertDescription::HandshakeFailure => 40,
             AlertDescription::BadCertificate => 42,
             AlertDescription::UnsupportedCertificate => 43,
@@ -81,6 +85,7 @@ impl AlertDescription {
             0 => AlertDescription::CloseNotify,
             10 => AlertDescription::UnexpectedMessage,
             20 => AlertDescription::BadRecordMac,
+            22 => AlertDescription::RecordOverflow,
             40 => AlertDescription::HandshakeFailure,
             42 => AlertDescription::BadCertificate,
             43 => AlertDescription::UnsupportedCertificate,
@@ -125,6 +130,13 @@ pub enum Error {
     /// spec (e.g. an unknown `KeyUpdate` request byte). Maps to
     /// `illegal_parameter`.
     IllegalParameter,
+    /// A record's plaintext exceeded `2^14` bytes (RFC 8446 §5.1) or its
+    /// ciphertext exceeded `2^14 + 256` bytes (RFC 8446 §5.2). Maps to
+    /// `record_overflow`.
+    RecordOverflow,
+    /// The per-key record-sequence cap has been reached without a `KeyUpdate`.
+    /// Maps to `internal_error`; the connection should rekey before continuing.
+    TooManyRecords,
 }
 
 impl core::fmt::Display for Error {
@@ -140,6 +152,8 @@ impl core::fmt::Display for Error {
             Error::AlertReceived(a) => write!(f, "received fatal alert: {a:?}"),
             Error::InappropriateState => f.write_str("operation not valid in this state"),
             Error::IllegalParameter => f.write_str("TLS illegal parameter"),
+            Error::RecordOverflow => f.write_str("TLS record-size limit exceeded"),
+            Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
         }
     }
 }
