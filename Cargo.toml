@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "mlkem", "mldsa", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "mlkem", "mldsa", "slhdsa", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -37,6 +37,9 @@ mlkem = ["hash", "rng"]
 # ML-DSA (FIPS 204) signatures. Needs alloc for the variable-width signature
 # encoding; the polynomial arithmetic itself is on the stack.
 mldsa = ["hash", "rng", "alloc"]
+# SLH-DSA (FIPS 205) hash-based signatures. Needs alloc for the large
+# signatures (up to ~50 KB); built purely from the hash primitives.
+slhdsa = ["hash", "rng", "alloc"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509"]
