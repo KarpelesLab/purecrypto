@@ -29,6 +29,13 @@ impl Args {
         Args { tokens: out }
     }
 
+    /// Iterator over the raw argv tokens (post-subcommand). Used by callers
+    /// that need to collect every occurrence of a repeated flag (e.g.
+    /// `pkeyutl -pkeyopt a:b -pkeyopt c:d` — `value` only returns the first).
+    pub(crate) fn tokens_iter(&self) -> std::slice::Iter<'_, String> {
+        self.tokens.iter()
+    }
+
     /// The value following flag `name` (e.g. `-in file` → `Some("file")`).
     pub(crate) fn value(&self, name: &str) -> Option<&str> {
         let i = self.tokens.iter().position(|t| t == name)?;

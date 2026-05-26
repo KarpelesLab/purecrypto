@@ -3,13 +3,17 @@
 //! library.
 
 mod ca;
+mod crl;
 mod dtls_io;
 mod enc;
 mod genpkey;
 mod hash;
 mod kdf;
+mod kem;
+mod kex;
 mod mac;
 mod pkey;
+mod pkeyutl;
 mod pki;
 mod rand;
 mod req;
@@ -35,12 +39,16 @@ COMMANDS:
     mac                  Compute an HMAC tag
     kdf <subcmd>         HKDF / PBKDF2 / scrypt / Argon2 key derivation
     enc                  AEAD encrypt/decrypt + AES-KW/KWP wrap/unwrap
+    kem <subcmd>         ML-KEM keygen / encaps / decaps
+    kex                  X25519 / ECDH key exchange (shared secret)
+    pkeyutl <subcmd>     Generic asymmetric encrypt/decrypt/sign/verify
     rand <nbytes>        Emit cryptographically secure random bytes
     genpkey              Generate an RSA or EC private key
     pkey                 Inspect or convert a private key
     req                  Create or inspect a PKCS#10 certificate request
     x509                 Inspect, self-sign, or CA-sign a certificate
     ca                   Manage a development CA on disk (init, issue, crl, ...)
+    crl                  Inspect or verify a CRL (-text, -CAfile -verify, -is-revoked)
     s_client             Open a TLS 1.3 connection and report the result
     s_server             Run a one-shot TLS 1.3 echo/-www server
     s_dtls_client        Open a DTLS 1.2 connection over UDP
@@ -59,6 +67,10 @@ fn main() {
         Some("mac") => mac::run(rest),
         Some("kdf") => kdf::run(rest),
         Some("enc") => enc::run(rest),
+        Some("kem") => kem::run(rest),
+        Some("kex") => kex::run(rest),
+        Some("pkeyutl") => pkeyutl::run(rest),
+        Some("crl") => crl::run(rest),
         Some("rand") => rand::run(rest),
         Some("genpkey") => genpkey::run(rest),
         Some("pkey") => pkey::run(rest),

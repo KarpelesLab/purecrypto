@@ -1492,3 +1492,598 @@ fn enc_chacha20_poly1305_roundtrip() {
     assert_eq!(rt, b"chacha20 + poly1305");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- KEM / KEX / pkeyutl / CRL subcommand tests (Phase 2) ----
+
+#[test]
+fn kem_mlkem768_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_kem_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "kem",
+                "keygen",
+                "-alg",
+                "ML-KEM-768",
+                "-out-secret",
+                &p("sk.pem"),
+                "-out-public",
+                &p("pk.pem"),
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "kem",
+                "encaps",
+                "-peer",
+                &p("pk.pem"),
+                "-out-ct",
+                &p("ct.bin"),
+                "-out-ss",
+                &p("ss1.bin"),
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "kem",
+                "decaps",
+                "-key",
+                &p("sk.pem"),
+                "-ct",
+                &p("ct.bin"),
+                "-out-ss",
+                &p("ss2.bin"),
+            ],
+            b""
+        )
+        .1
+    );
+    let s1 = std::fs::read(dir.join("ss1.bin")).unwrap();
+    let s2 = std::fs::read(dir.join("ss2.bin")).unwrap();
+    assert_eq!(s1, s2, "ML-KEM shared secrets must match");
+    assert_eq!(s1.len(), 32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kex_x25519_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_kex_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // Use the library to derive Alice and Bob's public keys from fixed
+    // private scalars, then verify that the CLI's `kex` agrees on a single
+    // shared secret in both directions.
+    use purecrypto::ec::x25519::X25519PrivateKey;
+    let a_priv = "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a";
+    let b_priv = "5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb";
+
+    let priv_bytes = |s: &str| {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    };
+    let a_pub = X25519PrivateKey::from_bytes(priv_bytes(a_priv)).public_key();
+    let b_pub = X25519PrivateKey::from_bytes(priv_bytes(b_priv)).public_key();
+    let a_pub_hex = a_pub.iter().fold(String::new(), |mut s, b| {
+        s.push_str(&format!("{b:02x}"));
+        s
+    });
+    let b_pub_hex = b_pub.iter().fold(String::new(), |mut s, b| {
+        s.push_str(&format!("{b:02x}"));
+        s
+    });
+
+    use std::io::Write;
+    std::fs::File::create(dir.join("a_priv.hex"))
+        .unwrap()
+        .write_all(a_priv.as_bytes())
+        .unwrap();
+    std::fs::File::create(dir.join("b_priv.hex"))
+        .unwrap()
+        .write_all(b_priv.as_bytes())
+        .unwrap();
+    std::fs::File::create(dir.join("a_pub.hex"))
+        .unwrap()
+        .write_all(a_pub_hex.as_bytes())
+        .unwrap();
+    std::fs::File::create(dir.join("b_pub.hex"))
+        .unwrap()
+        .write_all(b_pub_hex.as_bytes())
+        .unwrap();
+
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "X25519",
+                "-key",
+                &p("a_priv.hex"),
+                "-peer",
+                &p("b_pub.hex"),
+                "-out",
+                &p("ss_a.bin")
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "X25519",
+                "-key",
+                &p("b_priv.hex"),
+                "-peer",
+                &p("a_pub.hex"),
+                "-out",
+                &p("ss_b.bin")
+            ],
+            b""
+        )
+        .1
+    );
+
+    let s1 = std::fs::read(dir.join("ss_a.bin")).unwrap();
+    let s2 = std::fs::read(dir.join("ss_b.bin")).unwrap();
+    assert_eq!(s1, s2, "X25519 shared secrets must match");
+    assert_eq!(s1.len(), 32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kex_ecdh_p256_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_ecdh_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // Two EC keys + their SPKIs.
+    for name in &["a", "b"] {
+        assert!(
+            run(
+                &[
+                    "genpkey",
+                    "-algorithm",
+                    "EC",
+                    "-curve",
+                    "P-256",
+                    "-out",
+                    &p(&format!("{name}.key")),
+                ],
+                b""
+            )
+            .1
+        );
+        let (pub_pem, ok) = run(&["pkey", "-in", &p(&format!("{name}.key")), "-pubout"], b"");
+        assert!(ok);
+        std::fs::write(dir.join(format!("{name}.pub")), pub_pem).unwrap();
+    }
+
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "ECDH-P256",
+                "-key",
+                &p("a.key"),
+                "-peer",
+                &p("b.pub"),
+                "-out",
+                &p("ss_a.bin"),
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "ECDH-P256",
+                "-key",
+                &p("b.key"),
+                "-peer",
+                &p("a.pub"),
+                "-out",
+                &p("ss_b.bin"),
+            ],
+            b""
+        )
+        .1
+    );
+    let s1 = std::fs::read(dir.join("ss_a.bin")).unwrap();
+    let s2 = std::fs::read(dir.join("ss_b.bin")).unwrap();
+    assert_eq!(s1, s2);
+    assert_eq!(s1.len(), 32);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkeyutl_rsa_oaep_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_oaep_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // RSA key + extracted SPKI.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-bits",
+                "2048",
+                "-out",
+                &p("rsa.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("rsa.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("rsa.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"oaep round trip").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "encrypt",
+                "-inkey",
+                &p("rsa.pub"),
+                "-pubin",
+                "-pkeyopt",
+                "rsa_padding_mode:oaep",
+                "-pkeyopt",
+                "rsa_oaep_md:sha256",
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "decrypt",
+                "-inkey",
+                &p("rsa.key"),
+                "-pkeyopt",
+                "rsa_padding_mode:oaep",
+                "-pkeyopt",
+                "rsa_oaep_md:sha256",
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, b"oaep round trip");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkeyutl_rsa_pss_sign_verify() {
+    let dir = std::env::temp_dir().join(format!("pc_pss_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-bits",
+                "2048",
+                "-out",
+                &p("rsa.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("rsa.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("rsa.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"pss message").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("rsa.key"),
+                "-pkeyopt",
+                "rsa_padding_mode:pss",
+                "-pkeyopt",
+                "digest:sha256",
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (vout, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("rsa.pub"),
+            "-pkeyopt",
+            "rsa_padding_mode:pss",
+            "-pkeyopt",
+            "digest:sha256",
+            "-sigfile",
+            &p("sig.bin"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{vout}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkeyutl_ed25519_sign_verify() {
+    let dir = std::env::temp_dir().join(format!("pc_ed_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED25519", "-out", &p("ed.key")],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("ed.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("ed.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"ed25519 message").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("ed.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (_vout, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.pub"),
+            "-sigfile",
+            &p("sig.bin"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkeyutl_mldsa65_sign_verify() {
+    let dir = std::env::temp_dir().join(format!("pc_mldsa_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "ML-DSA-65",
+                "-out",
+                &p("mldsa.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("mldsa.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("mldsa.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"hello ml-dsa").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("mldsa.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (_vout, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("mldsa.pub"),
+            "-sigfile",
+            &p("sig.bin"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn crl_inspect_verify_serial() {
+    let dir = std::env::temp_dir().join(format!("pc_crl_cli_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // Init CA, issue a leaf, revoke it.
+    assert!(
+        run(
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Test CRL CA"
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("leaf.pub"), pub_pem).unwrap();
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "leaf.test",
+                "-out",
+                &p("leaf.crt"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "ca",
+                "revoke",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-serial",
+                "2",
+                "-reason",
+                "key-compromise",
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "ca",
+                "crl",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-out",
+                &p("ca.crl")
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // -text
+    let (text, ok) = run(&["crl", "-in", &p("ca.crl"), "-text"], b"");
+    assert!(ok);
+    assert!(text.contains("Test CRL CA"), "{text}");
+    assert!(text.contains("Revoked entries"), "{text}");
+
+    // -verify
+    let (vout, ok) = run(
+        &[
+            "crl",
+            "-in",
+            &p("ca.crl"),
+            "-CAfile",
+            &p("root.crt"),
+            "-verify",
+        ],
+        b"",
+    );
+    assert!(ok, "{vout}");
+    assert!(vout.contains("verify OK"), "{vout}");
+
+    // -is-revoked: serial 2 → revoked, serial 999 → not.
+    let (_o, ok) = run(
+        &["crl", "-in", &p("ca.crl"), "-serial", "2", "-is-revoked"],
+        b"",
+    );
+    assert!(ok);
+    let (_o, ok) = run(
+        &["crl", "-in", &p("ca.crl"), "-serial", "999", "-is-revoked"],
+        b"",
+    );
+    assert!(!ok);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
