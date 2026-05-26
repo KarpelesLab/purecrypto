@@ -1,39 +1,37 @@
 //! K-PKE — the IND-CPA public-key scheme underlying ML-KEM (FIPS 203 §5).
 //!
-//! All key, ciphertext and intermediate buffers are fixed-size, so this layer
-//! is `no_std` and allocation-free. Operations are constant time in the secret
-//! key and message; the only data-dependent branching is the rejection sampling
-//! of the public matrix `Â`, which depends solely on the public seed `ρ`.
+//! This layer is parameterized over the FIPS 203 set constants
+//! (`K`, `ETA1`, `ETA2`, `DU`, `DV`) as const generics; the macro in
+//! [`super`] instantiates one monomorphization per ML-KEM set. All keys,
+//! ciphertexts and intermediate buffers are passed as slices sized at
+//! the call site by the per-set wrapper — `no_std`, allocation-free.
+//!
+//! Operations are constant time in the secret key and message; the only
+//! data-dependent branching is the rejection sampling of the public matrix
+//! `Â`, which depends solely on the public seed `ρ`.
 
 use super::poly::{self, N, Poly};
 use crate::hash::{ExtendableOutput, Shake128, XofReader, shake256};
 
-/// Module rank.
-pub(crate) const K: usize = 3;
-/// CBD parameter (η₁ = η₂ = 2 for ML-KEM-768).
-const ETA: usize = 2;
 /// Bytes per `ByteEncode₁₂` polynomial.
-const POLYBYTES: usize = 384;
-/// `d_u` compressed polynomial size (320 = 256·10/8).
-const DU_BYTES: usize = 320;
-/// `d_v` compressed polynomial size (128 = 256·4/8).
-const DV_BYTES: usize = 128;
+pub(crate) const POLYBYTES: usize = 384;
 /// SHAKE128 rate, the matrix-XOF squeeze block (divisible by 3).
 const XOF_BLOCK: usize = 168;
 
-/// K-PKE encryption-key bytes (`t̂ ‖ ρ`).
-pub(crate) const PKE_EK_BYTES: usize = POLYBYTES * K + 32;
-/// K-PKE decryption-key bytes (`ŝ`).
-pub(crate) const PKE_DK_BYTES: usize = POLYBYTES * K;
-/// K-PKE ciphertext bytes (`c₁ ‖ c₂`).
-pub(crate) const CT_BYTES: usize = DU_BYTES * K + DV_BYTES;
+/// Bytes per compressed `u` polynomial: `32·DU`.
+pub(crate) const fn du_bytes(du: usize) -> usize {
+    32 * du
+}
+/// Bytes per compressed `v` polynomial: `32·DV`.
+pub(crate) const fn dv_bytes(dv: usize) -> usize {
+    32 * dv
+}
 
 /// Generates the public matrix `Â` (or its transpose) by rejection sampling a
 /// SHAKE128 stream per entry. `Â[i][j]` absorbs `ρ ‖ j ‖ i` (or `ρ ‖ i ‖ j`
 /// when transposed), matching the FIPS 203 / pq-crystals ordering.
-fn gen_matrix(seed: &[u8; 32], transposed: bool) -> [[Poly; K]; K] {
+fn gen_matrix<const K: usize>(seed: &[u8; 32], transposed: bool) -> [[Poly; K]; K] {
     let mut a = [[Poly::zero(); K]; K];
-    // i and j are both the matrix indices and the XOF domain-separation bytes.
     #[allow(clippy::needless_range_loop)]
     for i in 0..K {
         for j in 0..K {
@@ -58,31 +56,34 @@ fn gen_matrix(seed: &[u8; 32], transposed: bool) -> [[Poly; K]; K] {
 }
 
 /// Samples a CBD noise polynomial: `PRF_η(seed, nonce)` then `SamplePolyCBD_η`.
-fn getnoise(seed: &[u8; 32], nonce: u8) -> Poly {
+/// The PRF output buffer is sized to `64·ETA` bytes; we use a worst-case
+/// `[u8; 192]` stack buffer (η ≤ 3) and slice it down.
+fn getnoise<const ETA: usize>(seed: &[u8; 32], nonce: u8) -> Poly {
     let mut input = [0u8; 33];
     input[..32].copy_from_slice(seed);
     input[32] = nonce;
-    let mut buf = [0u8; 64 * ETA];
-    shake256(&input, &mut buf);
-    poly::cbd2(&buf)
+    let mut buf = [0u8; 192];
+    let need = 64 * ETA;
+    shake256(&input, &mut buf[..need]);
+    poly::cbd::<ETA>(&buf[..need])
 }
 
 /// Forward NTT on every component of a module vector.
-fn vec_ntt(v: &mut [Poly; K]) {
+fn vec_ntt<const K: usize>(v: &mut [Poly; K]) {
     for p in v.iter_mut() {
         p.ntt();
     }
 }
 
 /// Inverse NTT on every component of a module vector.
-fn vec_inv_ntt(v: &mut [Poly; K]) {
+fn vec_inv_ntt<const K: usize>(v: &mut [Poly; K]) {
     for p in v.iter_mut() {
         p.inv_ntt();
     }
 }
 
 /// Accumulated pointwise product `Σ a[i] ∘ b[i]`, Barrett-reduced.
-fn basemul_acc(a: &[Poly; K], b: &[Poly; K]) -> Poly {
+fn basemul_acc<const K: usize>(a: &[Poly; K], b: &[Poly; K]) -> Poly {
     let mut r = poly::poly_basemul(&a[0], &b[0]);
     for i in 1..K {
         let t = poly::poly_basemul(&a[i], &b[i]);
@@ -92,8 +93,16 @@ fn basemul_acc(a: &[Poly; K], b: &[Poly; K]) -> Poly {
     r
 }
 
-/// K-PKE.KeyGen (FIPS 203 Algorithm 13). Returns `(ek_PKE, dk_PKE)`.
-pub(crate) fn keygen(d: &[u8; 32]) -> ([u8; PKE_EK_BYTES], [u8; PKE_DK_BYTES]) {
+/// K-PKE.KeyGen (FIPS 203 Algorithm 13). Writes `ek_PKE` to `ek` and
+/// `dk_PKE` to `dk`; sizes must be `POLYBYTES·K + 32` and `POLYBYTES·K`.
+pub(crate) fn keygen<const K: usize, const ETA1: usize>(
+    d: &[u8; 32],
+    ek: &mut [u8],
+    dk: &mut [u8],
+) {
+    debug_assert_eq!(ek.len(), POLYBYTES * K + 32);
+    debug_assert_eq!(dk.len(), POLYBYTES * K);
+
     // (ρ, σ) ← G(d ‖ k).
     let mut g_in = [0u8; 33];
     g_in[..32].copy_from_slice(d);
@@ -101,51 +110,62 @@ pub(crate) fn keygen(d: &[u8; 32]) -> ([u8; PKE_EK_BYTES], [u8; PKE_DK_BYTES]) {
     let g = crate::hash::sha3_512(&g_in);
     let mut rho = [0u8; 32];
     rho.copy_from_slice(&g[..32]);
-    let sigma = &g[32..];
     let mut sigma32 = [0u8; 32];
-    sigma32.copy_from_slice(sigma);
+    sigma32.copy_from_slice(&g[32..]);
 
-    let a = gen_matrix(&rho, false);
+    let a = gen_matrix::<K>(&rho, false);
 
     let mut nonce = 0u8;
-    let mut s = [Poly::zero(); K];
+    let mut s: [Poly; K] = [Poly::zero(); K];
     for p in s.iter_mut() {
-        *p = getnoise(&sigma32, nonce);
+        *p = getnoise::<ETA1>(&sigma32, nonce);
         nonce += 1;
     }
-    let mut e = [Poly::zero(); K];
+    let mut e: [Poly; K] = [Poly::zero(); K];
     for p in e.iter_mut() {
-        *p = getnoise(&sigma32, nonce);
+        *p = getnoise::<ETA1>(&sigma32, nonce);
         nonce += 1;
     }
-    vec_ntt(&mut s);
-    vec_ntt(&mut e);
+    vec_ntt::<K>(&mut s);
+    vec_ntt::<K>(&mut e);
 
     // t̂ = Â ∘ ŝ + ê.
-    let mut t = [Poly::zero(); K];
+    let mut t: [Poly; K] = [Poly::zero(); K];
     for i in 0..K {
-        t[i] = basemul_acc(&a[i], &s);
+        t[i] = basemul_acc::<K>(&a[i], &s);
         t[i].to_mont();
         t[i].add(&e[i]);
         t[i].reduce();
     }
 
-    let mut ek = [0u8; PKE_EK_BYTES];
     for i in 0..K {
         ek[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&poly::to_bytes(&t[i]));
     }
     ek[POLYBYTES * K..].copy_from_slice(&rho);
 
-    let mut dk = [0u8; PKE_DK_BYTES];
     for i in 0..K {
         dk[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&poly::to_bytes(&s[i]));
     }
-    (ek, dk)
 }
 
-/// K-PKE.Encrypt (FIPS 203 Algorithm 14). `coins` is the encryption randomness.
-pub(crate) fn encrypt(ek: &[u8; PKE_EK_BYTES], m: &[u8; 32], coins: &[u8; 32]) -> [u8; CT_BYTES] {
-    let mut t = [Poly::zero(); K];
+/// K-PKE.Encrypt (FIPS 203 Algorithm 14). Writes the ciphertext into `ct`.
+/// Sizes: `ek.len() = POLYBYTES·K + 32`; `ct.len() = du_bytes(DU)·K + dv_bytes(DV)`.
+pub(crate) fn encrypt<
+    const K: usize,
+    const ETA1: usize,
+    const ETA2: usize,
+    const DU: usize,
+    const DV: usize,
+>(
+    ek: &[u8],
+    m: &[u8; 32],
+    coins: &[u8; 32],
+    ct: &mut [u8],
+) {
+    debug_assert_eq!(ek.len(), POLYBYTES * K + 32);
+    debug_assert_eq!(ct.len(), du_bytes(DU) * K + dv_bytes(DV));
+
+    let mut t: [Poly; K] = [Poly::zero(); K];
     for i in 0..K {
         t[i] = poly::from_bytes(&ek[i * POLYBYTES..(i + 1) * POLYBYTES]);
     }
@@ -153,64 +173,75 @@ pub(crate) fn encrypt(ek: &[u8; PKE_EK_BYTES], m: &[u8; 32], coins: &[u8; 32]) -
     rho.copy_from_slice(&ek[POLYBYTES * K..]);
 
     let mu = poly::from_msg(m);
-    let at = gen_matrix(&rho, true);
+    let at = gen_matrix::<K>(&rho, true);
 
     let mut nonce = 0u8;
-    let mut sp = [Poly::zero(); K];
+    let mut sp: [Poly; K] = [Poly::zero(); K];
     for p in sp.iter_mut() {
-        *p = getnoise(coins, nonce);
+        *p = getnoise::<ETA1>(coins, nonce);
         nonce += 1;
     }
-    let mut ep = [Poly::zero(); K];
+    let mut ep: [Poly; K] = [Poly::zero(); K];
     for p in ep.iter_mut() {
-        *p = getnoise(coins, nonce);
+        *p = getnoise::<ETA2>(coins, nonce);
         nonce += 1;
     }
-    let epp = getnoise(coins, nonce);
+    let epp = getnoise::<ETA2>(coins, nonce);
 
-    vec_ntt(&mut sp);
+    vec_ntt::<K>(&mut sp);
 
     // u = NTT⁻¹(Âᵀ ∘ r̂) + e₁.
-    let mut u = [Poly::zero(); K];
+    let mut u: [Poly; K] = [Poly::zero(); K];
     for i in 0..K {
-        u[i] = basemul_acc(&at[i], &sp);
+        u[i] = basemul_acc::<K>(&at[i], &sp);
     }
-    vec_inv_ntt(&mut u);
+    vec_inv_ntt::<K>(&mut u);
     for i in 0..K {
         u[i].add(&ep[i]);
         u[i].reduce();
     }
 
     // v = NTT⁻¹(t̂ᵀ ∘ r̂) + e₂ + μ.
-    let mut v = basemul_acc(&t, &sp);
+    let mut v = basemul_acc::<K>(&t, &sp);
     v.inv_ntt();
     v.add(&epp);
     v.add(&mu);
     v.reduce();
 
-    let mut ct = [0u8; CT_BYTES];
+    let du_b = du_bytes(DU);
+    let dv_b = dv_bytes(DV);
     for i in 0..K {
-        ct[i * DU_BYTES..(i + 1) * DU_BYTES].copy_from_slice(&poly::compress10(&u[i]));
+        poly::compress::<DU>(&u[i], &mut ct[i * du_b..(i + 1) * du_b]);
     }
-    ct[DU_BYTES * K..].copy_from_slice(&poly::compress4(&v));
-    ct
+    poly::compress::<DV>(&v, &mut ct[du_b * K..du_b * K + dv_b]);
 }
 
 /// K-PKE.Decrypt (FIPS 203 Algorithm 15). Returns the recovered message.
-pub(crate) fn decrypt(dk: &[u8; PKE_DK_BYTES], ct: &[u8; CT_BYTES]) -> [u8; 32] {
-    let mut u = [Poly::zero(); K];
-    for i in 0..K {
-        u[i] = poly::decompress10(&ct[i * DU_BYTES..(i + 1) * DU_BYTES]);
-    }
-    let v = poly::decompress4(&ct[DU_BYTES * K..]);
+/// Sizes: `dk.len() = POLYBYTES·K`; `ct.len() = du_bytes(DU)·K + dv_bytes(DV)`.
+pub(crate) fn decrypt<const K: usize, const DU: usize, const DV: usize>(
+    dk: &[u8],
+    ct: &[u8],
+) -> [u8; 32] {
+    debug_assert_eq!(dk.len(), POLYBYTES * K);
+    debug_assert_eq!(ct.len(), du_bytes(DU) * K + dv_bytes(DV));
 
-    let mut s = [Poly::zero(); K];
+    let du_b = du_bytes(DU);
+    let dv_b = dv_bytes(DV);
+
+    let mut u: [Poly; K] = [Poly::zero(); K];
+    for i in 0..K {
+        poly::decompress::<DU>(&ct[i * du_b..(i + 1) * du_b], &mut u[i]);
+    }
+    let mut v = Poly::zero();
+    poly::decompress::<DV>(&ct[du_b * K..du_b * K + dv_b], &mut v);
+
+    let mut s: [Poly; K] = [Poly::zero(); K];
     for i in 0..K {
         s[i] = poly::from_bytes(&dk[i * POLYBYTES..(i + 1) * POLYBYTES]);
     }
 
-    vec_ntt(&mut u);
-    let mut w = basemul_acc(&s, &u);
+    vec_ntt::<K>(&mut u);
+    let mut w = basemul_acc::<K>(&s, &u);
     w.inv_ntt();
 
     let mut m_poly = Poly::zero();
@@ -222,6 +253,13 @@ pub(crate) fn decrypt(dk: &[u8; PKE_DK_BYTES], ct: &[u8; CT_BYTES]) -> [u8; 32] 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const K_TEST: usize = 3;
+    const ETA1_TEST: usize = 2;
+    const ETA2_TEST: usize = 2;
+    const DU_TEST: usize = 10;
+    const DV_TEST: usize = 4;
+    const POLY: usize = POLYBYTES; // alias
 
     #[test]
     fn minimal_cancellation() {
@@ -239,11 +277,9 @@ mod tests {
         ns.ntt();
         nsp.ntt();
 
-        // t̂ = to_mont(Â ∘ ŝ)
         let mut t = poly::poly_basemul(&na, &ns);
         t.reduce();
         t.to_mont();
-        // b̂ = Â ∘ ŝp (then to normal, then re-ntt to mimic decrypt)
         let mut b = poly::poly_basemul(&na, &nsp);
         b.inv_ntt();
         b.reduce();
@@ -262,14 +298,14 @@ mod tests {
 
     #[test]
     fn cancellation_leaves_only_small_noise() {
-        // Noise-free: t = A∘ŝ, b = Aᵀ∘ŝp ⇒ t·sp − s·b = 0 exactly.
+        // ML-KEM-768 K = 3.
         let rho = [5u8; 32];
-        let a = gen_matrix(&rho, false);
-        let at = gen_matrix(&rho, true);
+        let a = gen_matrix::<K_TEST>(&rho, false);
+        let at = gen_matrix::<K_TEST>(&rho, true);
 
-        let mut s = [Poly::zero(); K];
-        let mut sp = [Poly::zero(); K];
-        for i in 0..K {
+        let mut s = [Poly::zero(); K_TEST];
+        let mut sp = [Poly::zero(); K_TEST];
+        for i in 0..K_TEST {
             for k in 0..N {
                 s[i].c[k] = (((i + k) % 5) as i16) - 2;
                 sp[i].c[k] = (((i + k + 2) % 5) as i16) - 2;
@@ -278,22 +314,22 @@ mod tests {
             sp[i].ntt();
         }
 
-        let mut t = [Poly::zero(); K];
-        for i in 0..K {
-            t[i] = basemul_acc(&a[i], &s);
+        let mut t = [Poly::zero(); K_TEST];
+        for i in 0..K_TEST {
+            t[i] = basemul_acc::<K_TEST>(&a[i], &s);
             t[i].to_mont();
         }
-        let mut v = basemul_acc(&t, &sp);
+        let mut v = basemul_acc::<K_TEST>(&t, &sp);
         v.inv_ntt();
 
-        let mut b = [Poly::zero(); K];
-        for i in 0..K {
-            b[i] = basemul_acc(&at[i], &sp);
+        let mut b = [Poly::zero(); K_TEST];
+        for i in 0..K_TEST {
+            b[i] = basemul_acc::<K_TEST>(&at[i], &sp);
             b[i].inv_ntt();
             b[i].reduce();
             b[i].ntt();
         }
-        let mut w = basemul_acc(&s, &b);
+        let mut w = basemul_acc::<K_TEST>(&s, &b);
         w.inv_ntt();
 
         let mut diff = Poly::zero();
@@ -306,10 +342,10 @@ mod tests {
     #[test]
     fn matrix_transpose_consistency() {
         let seed = [3u8; 32];
-        let a = gen_matrix(&seed, false);
-        let at = gen_matrix(&seed, true);
-        for i in 0..K {
-            for j in 0..K {
+        let a = gen_matrix::<K_TEST>(&seed, false);
+        let at = gen_matrix::<K_TEST>(&seed, true);
+        for i in 0..K_TEST {
+            for j in 0..K_TEST {
                 assert_eq!(a[i][j].c, at[j][i].c, "a[{i}][{j}] != at[{j}][{i}]");
             }
         }
@@ -320,8 +356,11 @@ mod tests {
         let d = [7u8; 32];
         let m = [0x42u8; 32];
         let coins = [0x11u8; 32];
-        let (ek, dk) = keygen(&d);
-        let ct = encrypt(&ek, &m, &coins);
-        assert_eq!(decrypt(&dk, &ct), m);
+        let mut ek = [0u8; POLY * K_TEST + 32];
+        let mut dk = [0u8; POLY * K_TEST];
+        keygen::<K_TEST, ETA1_TEST>(&d, &mut ek, &mut dk);
+        let mut ct = [0u8; du_bytes(DU_TEST) * K_TEST + dv_bytes(DV_TEST)];
+        encrypt::<K_TEST, ETA1_TEST, ETA2_TEST, DU_TEST, DV_TEST>(&ek, &m, &coins, &mut ct);
+        assert_eq!(decrypt::<K_TEST, DU_TEST, DV_TEST>(&dk, &ct), m);
     }
 }

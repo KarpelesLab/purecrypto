@@ -3,13 +3,14 @@
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
-use purecrypto::mlkem::MlKem768DecapsKey;
+use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::slhdsa;
 use purecrypto::x509::AnyPublicKey;
 
-// The ML-KEM variant carries a 2400-byte fixed array inline; the enum is
-// short-lived in the CLI so boxing would be ceremony for no real benefit.
+// The ML-KEM variants carry up to 3168-byte fixed arrays inline (ML-KEM-1024);
+// the enum is short-lived in the CLI so boxing would be ceremony for no real
+// benefit.
 #[allow(clippy::large_enum_variant)]
 enum Key {
     Rsa(BoxedRsaPrivateKey),
@@ -18,7 +19,9 @@ enum Key {
     MlDsa44(MlDsa44PrivateKey),
     MlDsa65(MlDsa65PrivateKey),
     MlDsa87(MlDsa87PrivateKey),
+    MlKem512(MlKem512DecapsKey),
     MlKem768(MlKem768DecapsKey),
+    MlKem1024(MlKem1024DecapsKey),
     SlhDsa(slhdsa::PrivateKey),
 }
 
@@ -48,6 +51,12 @@ fn parse_pkcs8(pem: &str) -> Option<Key> {
     if let Ok(k) = MlKem768DecapsKey::from_pkcs8_pem(pem) {
         return Some(Key::MlKem768(k));
     }
+    if let Ok(k) = MlKem512DecapsKey::from_pkcs8_pem(pem) {
+        return Some(Key::MlKem512(k));
+    }
+    if let Ok(k) = MlKem1024DecapsKey::from_pkcs8_pem(pem) {
+        return Some(Key::MlKem1024(k));
+    }
     if let Ok(k) = slhdsa::PrivateKey::from_pkcs8_pem(pem) {
         return Some(Key::SlhDsa(k));
     }
@@ -68,7 +77,7 @@ pub(crate) fn run(args: Args) {
     } else {
         die(
             "could not parse key (expected RSA PKCS#1, EC SEC1, or a PKCS#8 \
-             Ed25519/ML-DSA/ML-KEM-768/SLH-DSA PEM)",
+             Ed25519/ML-DSA/ML-KEM/SLH-DSA PEM)",
         );
     };
 
@@ -85,7 +94,9 @@ pub(crate) fn run(args: Args) {
             Key::MlDsa44(_) => "ML-DSA-44 private key\n".to_string(),
             Key::MlDsa65(_) => "ML-DSA-65 private key\n".to_string(),
             Key::MlDsa87(_) => "ML-DSA-87 private key\n".to_string(),
+            Key::MlKem512(_) => "ML-KEM-512 decapsulation key\n".to_string(),
             Key::MlKem768(_) => "ML-KEM-768 decapsulation key\n".to_string(),
+            Key::MlKem1024(_) => "ML-KEM-1024 decapsulation key\n".to_string(),
             Key::SlhDsa(_) => "SLH-DSA private key\n".to_string(),
         };
         write_output(dest, text.as_bytes());
@@ -100,7 +111,9 @@ pub(crate) fn run(args: Args) {
             Key::MlDsa44(k) => k.public_key().to_spki_pem(),
             Key::MlDsa65(k) => k.public_key().to_spki_pem(),
             Key::MlDsa87(k) => k.public_key().to_spki_pem(),
+            Key::MlKem512(k) => k.encapsulation_key().to_spki_pem(),
             Key::MlKem768(k) => k.encapsulation_key().to_spki_pem(),
+            Key::MlKem1024(k) => k.encapsulation_key().to_spki_pem(),
             Key::SlhDsa(k) => k.public_key().to_spki_pem(),
         };
         write_output(dest, spki.as_bytes());
@@ -115,7 +128,9 @@ pub(crate) fn run(args: Args) {
         Key::MlDsa44(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
         Key::MlDsa65(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
         Key::MlDsa87(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
+        Key::MlKem512(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
         Key::MlKem768(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
+        Key::MlKem1024(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
         Key::SlhDsa(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
     }
 }

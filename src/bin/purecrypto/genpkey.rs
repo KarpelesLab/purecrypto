@@ -4,7 +4,7 @@ use crate::util::{Args, die, write_output};
 use purecrypto::bignum::{BoxedUint, Uint};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
-use purecrypto::mlkem::MlKem768DecapsKey;
+use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
 use purecrypto::slhdsa::{self, ParamSet as SlhDsa};
@@ -48,7 +48,7 @@ pub(crate) fn run(args: Args) {
         .unwrap_or_else(|| {
             die(
                 "usage: purecrypto genpkey -algorithm ALG [-bits N|-curve NAME] [-out file]\n  \
-                 ALG: RSA | EC | ED25519 | ML-DSA-{44,65,87} | ML-KEM-768 | \
+                 ALG: RSA | EC | ED25519 | ML-DSA-{44,65,87} | ML-KEM-{512,768,1024} | \
                  SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}",
             )
         });
@@ -98,14 +98,16 @@ pub(crate) fn run(args: Args) {
         "ML-DSA-44" => MlDsa44PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         "ML-DSA-65" => MlDsa65PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         "ML-DSA-87" => MlDsa87PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        "ML-KEM-512" => MlKem512DecapsKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         "ML-KEM-768" => MlKem768DecapsKey::generate(&mut OsRng).0.to_pkcs8_pem(),
+        "ML-KEM-1024" => MlKem1024DecapsKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         other => {
             if let Some(set) = slhdsa_from_name(other) {
                 slhdsa::PrivateKey::generate(set, &mut OsRng).0.to_pkcs8_pem()
             } else {
                 die(format!(
                     "unknown algorithm: {other} (RSA | EC | ED25519 | ML-DSA-44/65/87 | \
-                     ML-KEM-768 | SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
+                     ML-KEM-512/768/1024 | SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
                 ))
             }
         }

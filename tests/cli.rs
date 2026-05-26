@@ -287,6 +287,26 @@ fn genpkey_ml_kem_768_roundtrip() {
 }
 
 #[test]
+fn genpkey_ml_kem_512_roundtrip() {
+    let (pem, ok) = run(&["genpkey", "-algorithm", "ML-KEM-512"], b"");
+    assert!(ok);
+    let (text, ok) = run(&["pkey", "-text"], pem.as_bytes());
+    assert!(ok && text.contains("ML-KEM-512"));
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], pem.as_bytes());
+    assert!(ok && pub_pem.contains("BEGIN PUBLIC KEY"));
+}
+
+#[test]
+fn genpkey_ml_kem_1024_roundtrip() {
+    let (pem, ok) = run(&["genpkey", "-algorithm", "ML-KEM-1024"], b"");
+    assert!(ok);
+    let (text, ok) = run(&["pkey", "-text"], pem.as_bytes());
+    assert!(ok && text.contains("ML-KEM-1024"));
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], pem.as_bytes());
+    assert!(ok && pub_pem.contains("BEGIN PUBLIC KEY"));
+}
+
+#[test]
 fn genpkey_slh_dsa_sha2_128f_roundtrip() {
     let (pem, ok) = run(&["genpkey", "-algorithm", "SLH-DSA-SHA2-128f"], b"");
     assert!(ok);
