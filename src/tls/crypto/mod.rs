@@ -17,7 +17,7 @@ pub(crate) use hash::Transcript;
 #[allow(unused_imports)]
 pub(crate) use schedule::{
     HashAlg, KeySchedule, Secret, derive_secret, expand_label_dyn, finished_key,
-    finished_verify_data, next_traffic_secret, traffic_key_iv,
+    finished_verify_data, next_traffic_secret, tls_exporter, traffic_key_iv,
 };
 #[allow(unused_imports)]
 pub(crate) use sign::{certificate_verify_content, verify_signature};

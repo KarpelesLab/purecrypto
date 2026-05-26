@@ -22,7 +22,7 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::{
     KeySchedule, RecordCrypter, Secret, SuiteParams, certificate_verify_content,
-    finished_verify_data, next_traffic_secret, supported_suites,
+    finished_verify_data, next_traffic_secret, supported_suites, tls_exporter,
 };
 use crate::tls::{AlertDescription, Error};
 use alloc::vec::Vec;
@@ -135,6 +135,8 @@ pub struct ServerConnection<R: RngCore> {
     /// Current write-side (`server_application_traffic_secret_N`); stepped
     /// by each outgoing `KeyUpdate`.
     server_app_secret: Option<Secret>,
+    /// `exporter_master_secret` for the application-layer Exporter API.
+    exporter_secret: Option<Secret>,
     /// ALPN protocol the server picked from the client's offer.
     alpn_negotiated: Option<Vec<u8>>,
     #[cfg(test)]
@@ -154,6 +156,7 @@ impl<R: RngCore> ServerConnection<R> {
             client_hs_secret: None,
             client_app_secret: None,
             server_app_secret: None,
+            exporter_secret: None,
             alpn_negotiated: None,
             #[cfg(test)]
             server_hs_secret: None,
@@ -183,6 +186,18 @@ impl<R: RngCore> ServerConnection<R> {
     /// The ALPN protocol picked from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705) —
+    /// symmetric to `ClientConnection::tls_exporter`.
+    pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        let ems = self
+            .exporter_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        tls_exporter(suite.hash, ems, label, context, out);
+        Ok(())
     }
 
     /// Sends application data (only valid once the handshake completes).
@@ -444,6 +459,8 @@ impl<R: RngCore> ServerConnection<R> {
         let th_app = self.core.transcript.current_hash();
         let cats = ks.client_application_traffic_secret(th_app.as_slice());
         let sats = ks.server_application_traffic_secret(th_app.as_slice());
+        let ems = ks.exporter_master_secret(th_app.as_slice());
+        self.exporter_secret = Some(ems);
 
         // The server's subsequent writes use the application key; it still
         // reads the client Finished with the client handshake key.

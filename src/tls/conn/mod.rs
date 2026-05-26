@@ -351,6 +351,55 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after-server");
     }
 
+    /// After a successful handshake, both sides derive identical
+    /// application-layer keying material for the same `(label, context)`.
+    #[test]
+    fn tls_exporter_agrees_both_sides() {
+        let (server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"exp-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"exp-server", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(roots), "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        let mut c_out = [0u8; 64];
+        let mut s_out = [0u8; 64];
+        client
+            .tls_exporter(b"EXPORTER-test", b"some context", &mut c_out)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPORTER-test", b"some context", &mut s_out)
+            .unwrap();
+        assert_eq!(c_out, s_out);
+
+        // A different context yields a different output (sanity).
+        let mut c_out2 = [0u8; 64];
+        client
+            .tls_exporter(b"EXPORTER-test", b"other context", &mut c_out2)
+            .unwrap();
+        assert_ne!(c_out, c_out2);
+    }
+
     /// The client advertises `record_size_limit = 64`; the server's writes
     /// of a 500-byte payload fragment into multiple records (each ciphertext
     /// payload at most `64 + 16` bytes — content + tag).
