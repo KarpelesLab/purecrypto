@@ -162,6 +162,144 @@ fn ca_workflow_genpkey_req_sign() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// End-to-end exercise of `purecrypto ca`: init → genpkey leaf → ca issue →
+/// x509 inspect → ca revoke → ca crl → verify the CRL revokes the leaf.
+#[test]
+fn ca_subcommand_full_flow() {
+    use purecrypto::x509::{Certificate, CertificateRevocationList};
+
+    let dir = std::env::temp_dir().join(format!("pc_cli_ca_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // CA init.
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "Test CLI CA"],
+            b""
+        )
+        .1,
+        "ca init failed"
+    );
+
+    // Leaf key + extracted public key.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key"),
+            ],
+            b""
+        )
+        .1,
+        "genpkey failed"
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok, "pkey -pubout failed");
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+
+    // CA issues a leaf.
+    assert!(
+        run(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "host.example",
+                "-sans",
+                "host.example",
+                "-out",
+                &p("leaf.crt"),
+            ],
+            b""
+        )
+        .1,
+        "ca issue failed"
+    );
+
+    // x509 inspect: the issued cert has the right subject + issuer.
+    let (text, ok) = run(&["x509", "-in", &p("leaf.crt"), "-text"], b"");
+    assert!(ok, "x509 inspect failed: {text}");
+    assert!(text.contains("CN=host.example"), "subject missing: {text}");
+    assert!(text.contains("CN=Test CLI CA"), "issuer missing: {text}");
+
+    // The leaf is signed by the CA: verify via the library.
+    let root_pem = std::fs::read_to_string(dir.join("root.crt")).unwrap();
+    let leaf_pem = std::fs::read_to_string(dir.join("leaf.crt")).unwrap();
+    let root = Certificate::from_pem(&root_pem).unwrap();
+    let leaf = Certificate::from_pem(&leaf_pem).unwrap();
+    let root_key = root.subject_public_key().unwrap();
+    leaf.verify_signature_with(&root_key)
+        .expect("leaf should verify under the CA key");
+
+    // Revoke the leaf (CA serial starts at 2).
+    assert!(
+        run(
+            &[
+                "ca",
+                "revoke",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-serial",
+                "2",
+                "-reason",
+                "key-compromise",
+            ],
+            b""
+        )
+        .1,
+        "ca revoke failed"
+    );
+
+    // Refresh the CRL.
+    assert!(
+        run(
+            &[
+                "ca",
+                "crl",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-out",
+                &p("crl.pem"),
+            ],
+            b""
+        )
+        .1,
+        "ca crl failed"
+    );
+
+    // Load the CRL and verify it revokes the leaf serial, and that its
+    // signature is valid under the CA key.
+    let crl_pem = std::fs::read_to_string(dir.join("crl.pem")).unwrap();
+    let crl = CertificateRevocationList::from_pem(&crl_pem).unwrap();
+    assert!(
+        crl.is_revoked(&[2]).unwrap(),
+        "CRL should list serial 2 as revoked"
+    );
+    crl.verify_signature_with(&root_key)
+        .expect("CRL signature should verify under the CA key");
+    crl.check_signature_algid_consistent()
+        .expect("CRL inner/outer algid should agree");
+
+    // `ca show` produces a usable summary.
+    let (show, ok) = run(&["ca", "show", "-dir", dir.to_str().unwrap()], b"");
+    assert!(ok, "ca show failed");
+    assert!(show.contains("CN=Test CLI CA"), "show output: {show}");
+    assert!(show.contains("Revoked:    1"), "show output: {show}");
+    assert!(show.contains("CRL:        present"), "show output: {show}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn s_client_loopback() {
     use purecrypto::rng::OsRng;

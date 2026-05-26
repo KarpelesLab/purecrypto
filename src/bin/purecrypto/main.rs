@@ -2,6 +2,7 @@
 //! and a TLS test client (`s_client`), built entirely on the `purecrypto`
 //! library.
 
+mod ca;
 mod dtls_io;
 mod genpkey;
 mod hash;
@@ -31,6 +32,7 @@ COMMANDS:
     pkey                 Inspect or convert a private key
     req                  Create or inspect a PKCS#10 certificate request
     x509                 Inspect, self-sign, or CA-sign a certificate
+    ca                   Manage a development CA on disk (init, issue, crl, ...)
     s_client             Open a TLS 1.3 connection and report the result
     s_server             Run a one-shot TLS 1.3 echo/-www server
     s_dtls_client        Open a DTLS 1.2 connection over UDP
@@ -51,6 +53,7 @@ fn main() {
         Some("pkey") => pkey::run(rest),
         Some("req") => req::run(rest),
         Some("x509") => x509::run(rest),
+        Some("ca") => ca::run(rest),
         Some("s_client") => s_client::run(rest),
         Some("s_server") => s_server::run(rest),
         Some("s_dtls_client") => s_dtls_client::run(rest),
