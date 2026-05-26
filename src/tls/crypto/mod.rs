@@ -5,13 +5,15 @@
 //! at the runtime cipher-suite boundary.
 
 mod aead;
+pub(crate) mod aead12;
 mod hash;
+pub(crate) mod prf;
 mod schedule;
 mod sign;
 mod suite;
 
 #[allow(unused_imports)]
-pub(crate) use aead::RecordCrypter;
+pub(crate) use aead::{Aead, RecordCrypter};
 #[allow(unused_imports)]
 pub(crate) use hash::Transcript;
 // `HashAlg` is exposed publicly so callers can store it in resumption sessions.
