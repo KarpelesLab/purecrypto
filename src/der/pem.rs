@@ -42,21 +42,59 @@ fn decode_char(c: u8) -> Option<u8> {
     }
 }
 
-/// Base64-decodes `s`, ignoring ASCII whitespace and treating `=` as padding.
+/// Base64-decodes `s`, treating ASCII whitespace as transparent and `=` only
+/// as trailing padding (RFC 4648 §3.2). Enforces:
+///   * the total non-whitespace character count is a multiple of 4 (canonical
+///     padded form),
+///   * `=` characters appear only at the end of the stream, in a count of
+///     0, 1, or 2,
+///   * the dropped low bits of the final non-padding group are all zero
+///     (no spurious bits riding inside a padded final group).
+///
+/// These checks make the decoder strict-DER-friendly: an encoder that
+/// emits a slightly different but technically valid Base64 form (e.g. no
+/// padding) is rejected, so two parsers reading the same PEM document
+/// agree on byte boundaries.
 pub fn base64_decode(s: &str) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(s.len() / 4 * 3);
     let mut acc = 0u32;
     let mut bits = 0u32;
+    let mut total_data: usize = 0;
+    let mut padding: u32 = 0;
     for &c in s.as_bytes() {
-        if c == b'=' || c.is_ascii_whitespace() {
+        if c.is_ascii_whitespace() {
             continue;
         }
+        if c == b'=' {
+            padding += 1;
+            // No data after padding.
+            total_data += 1;
+            continue;
+        }
+        if padding > 0 {
+            return Err(Error::Pem); // data byte after padding
+        }
         let v = decode_char(c).ok_or(Error::Pem)?;
+        total_data += 1;
         acc = (acc << 6) | v as u32;
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             out.push((acc >> bits) as u8);
+        }
+    }
+    if !total_data.is_multiple_of(4) {
+        return Err(Error::Pem); // not aligned to a Base64 quartet
+    }
+    if padding > 2 {
+        return Err(Error::Pem);
+    }
+    // Strict trailing-bit check: the remaining `bits` (always 4 if padding == 1
+    // or 2, and 0 if padding == 0) must be zero in `acc`.
+    if bits > 0 {
+        let mask = (1u32 << bits) - 1;
+        if acc & mask != 0 {
+            return Err(Error::Pem);
         }
     }
     Ok(out)
@@ -86,7 +124,10 @@ pub fn pem_encode(label: &str, der: &[u8]) -> String {
 }
 
 /// Decodes a PEM document, verifying the `expected_label`, and returns the
-/// inner DER bytes.
+/// inner DER bytes. Rejects documents containing more than one `BEGIN
+/// <expected_label>` marker (so CA bundles with multiple entries of the same
+/// label can't silently be truncated to the first) and validates the trailer
+/// matches the leader.
 pub fn pem_decode(pem: &str, expected_label: &str) -> Result<Vec<u8>, Error> {
     let begin = {
         let mut s = String::from("-----BEGIN ");
@@ -102,6 +143,11 @@ pub fn pem_decode(pem: &str, expected_label: &str) -> Result<Vec<u8>, Error> {
     };
 
     let start = pem.find(&begin).ok_or(Error::Pem)? + begin.len();
+    // Reject a second BEGIN of the same label — otherwise multi-block bundles
+    // are silently truncated to the first entry.
+    if pem[start..].contains(&begin) {
+        return Err(Error::Pem);
+    }
     let stop = pem[start..].find(&end).ok_or(Error::Pem)? + start;
     base64_decode(&pem[start..stop])
 }

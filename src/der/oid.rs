@@ -38,7 +38,9 @@ pub fn encode_oid_arcs(arcs: &[u64]) -> Vec<u8> {
     body
 }
 
-/// Parses a DER OID body into its arcs.
+/// Parses a DER OID body into its arcs. Enforces X.690 §8.19 canonical
+/// encoding: no leading 0x80 (would be a redundant continuation byte), and
+/// rejects arcs that don't fit in `u64`.
 pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
     if body.is_empty() {
         return Err(Error::Malformed);
@@ -46,9 +48,24 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
     let mut arcs = Vec::new();
     let mut acc: u64 = 0;
     let mut started = false;
-    for &b in body {
+    let mut arc_first_byte_idx: Option<usize> = None;
+    for (i, &b) in body.iter().enumerate() {
+        // Canonical encoding: the first byte of a multi-byte arc must not
+        // be 0x80 (that would be a redundant leading-zero continuation).
+        if !started && b == 0x80 {
+            return Err(Error::Malformed);
+        }
+        // Detect arc overflow: shifting `acc` left by 7 must not lose bits.
+        // `acc` is at most `(2^64 − 1) >> 7` before the shift, so any high
+        // 7 bits indicate a value too wide for `u64`.
+        if (acc >> 57) != 0 {
+            return Err(Error::Malformed);
+        }
+        if !started {
+            arc_first_byte_idx = Some(i);
+            started = true;
+        }
         acc = (acc << 7) | (b & 0x7f) as u64;
-        started = true;
         if b & 0x80 == 0 {
             if arcs.is_empty() {
                 arcs.push(acc / 40);
@@ -58,11 +75,13 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
             }
             acc = 0;
             started = false;
+            arc_first_byte_idx = None;
         }
     }
     if started {
         return Err(Error::Malformed); // truncated multi-byte arc
     }
+    let _ = arc_first_byte_idx;
     Ok(arcs)
 }
 
