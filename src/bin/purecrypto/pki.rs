@@ -112,11 +112,19 @@ pub(crate) fn validity_days(days: u64) -> Validity {
     Validity::new(Time::from_unix(now), Time::from_unix(now + days * 86_400))
 }
 
-/// A random positive 63-bit serial number.
+/// A random 63-bit serial number with the high bit clear (positive DER) and
+/// the low bit set (non-zero). The 63 bits of entropy are below the CA/B
+/// Forum's 64-bit recommendation but match the `u64` shape consumed by
+/// [`Certificate::issue_general`] / [`Certificate::self_signed_general`].
+/// For production CAs use the X.509 issuer APIs directly with a 16-byte
+/// BoxedUint serial.
 pub(crate) fn random_serial() -> u64 {
     let mut b = [0u8; 8];
     OsRng.fill_bytes(&mut b);
-    (u64::from_be_bytes(b) >> 1) | 1
+    // Clear the top bit to keep the DER INTEGER positive (without a leading
+    // 0x00 padding byte the high-bit-set case would parse negative), and set
+    // the low bit so the value is non-zero.
+    (u64::from_be_bytes(b) & 0x7fff_ffff_ffff_ffff) | 1
 }
 
 /// Parses dNSName entries from `-addext "subjectAltName=DNS:a,DNS:b"` or a plain

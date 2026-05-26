@@ -519,9 +519,15 @@ fn run_dtls12(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
         mtu,
     } = ctx;
 
+    if ca_file.is_none() && !insecure {
+        die(
+            "DTLS client requires either -CAfile <bundle> for chain validation, \
+             or -insecure to explicitly skip verification (see openssl s_client)",
+        );
+    }
     let roots = load_roots_optional(ca_file);
     let mut cfg = DtlsClientConfig12::new(roots, server_name);
-    if insecure || ca_file.is_none() {
+    if insecure {
         cfg = cfg.without_certificate_verification();
     }
 
@@ -531,6 +537,11 @@ fn run_dtls12(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
 
     if !quiet {
         eprintln!("connected: DTLSv1.2");
+        if insecure {
+            eprintln!("WARNING: certificate NOT verified (-insecure)");
+        } else {
+            eprintln!("certificate verified");
+        }
     }
 
     dtls_io::drive_client_data(&mut conn, &socket, mtu, Duration::from_secs(30));
@@ -548,9 +559,15 @@ fn run_dtls13(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
         mtu,
     } = ctx;
 
+    if ca_file.is_none() && !insecure {
+        die(
+            "DTLS client requires either -CAfile <bundle> for chain validation, \
+             or -insecure to explicitly skip verification (see openssl s_client)",
+        );
+    }
     let roots = load_roots_optional(ca_file);
     let mut cfg = DtlsClientConfig13::new(roots, server_name);
-    if insecure || ca_file.is_none() {
+    if insecure {
         cfg = cfg.without_certificate_verification();
     }
     if let Some(a) = alpn {
@@ -563,6 +580,11 @@ fn run_dtls13(socket: UdpSocket, ctx: DtlsRunCtx<'_>) {
 
     if !quiet {
         eprintln!("connected: DTLSv1.3");
+        if insecure {
+            eprintln!("WARNING: certificate NOT verified (-insecure)");
+        } else {
+            eprintln!("certificate verified");
+        }
         if let Some(p) = conn.alpn_protocol() {
             eprintln!("ALPN: {}", String::from_utf8_lossy(p));
         }

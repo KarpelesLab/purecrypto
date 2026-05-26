@@ -88,14 +88,61 @@ pub(crate) fn read_input(path: Option<&str>) -> Vec<u8> {
 
 /// Writes `data` to `path` if `Some` and not `"-"`, otherwise to stdout.
 pub(crate) fn write_output(path: Option<&str>, data: &[u8]) {
+    write_output_with_mode(path, data, /* private = */ false)
+}
+
+/// Like [`write_output`] but with explicit secrecy hinting:
+///   * `private = true` → on Unix, opens with mode `0o600` and `create_new`
+///     so an existing file at `path` is NOT silently overwritten (a typo
+///     would otherwise destroy a CA key). Pass `--force` upstream to allow
+///     overwrite (the caller deletes the file first).
+///   * `private = false` → behaves like `std::fs::write` (mode 0o644 with
+///     the usual umask, truncate-on-overwrite).
+pub(crate) fn write_output_with_mode(path: Option<&str>, data: &[u8], private: bool) {
     match path {
         Some(p) if p != "-" => {
-            std::fs::write(p, data).unwrap_or_else(|e| die(format!("cannot write {p}: {e}")))
+            if private {
+                write_private_file(p, data);
+            } else {
+                std::fs::write(p, data)
+                    .unwrap_or_else(|e| die(format!("cannot write {p}: {e}")));
+            }
         }
-        _ => std::io::stdout()
-            .write_all(data)
-            .unwrap_or_else(|e| die(format!("cannot write stdout: {e}"))),
+        _ => {
+            if private && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+                die(
+                    "refusing to write private key bytes to a terminal — pass `-out PATH` \
+                     to a file or `-out -` to confirm",
+                );
+            }
+            std::io::stdout()
+                .write_all(data)
+                .unwrap_or_else(|e| die(format!("cannot write stdout: {e}")));
+        }
     }
+}
+
+/// Opens `path` with `create_new` (refuses to overwrite) and Unix mode 0o600,
+/// then writes `data`. Used for any file that holds a private key.
+fn write_private_file(path: &str, data: &[u8]) {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts.open(path).unwrap_or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            die(format!(
+                "refusing to overwrite existing file {path} (delete it first to issue a new private key)"
+            ));
+        }
+        die(format!("cannot create {path}: {e}"));
+    });
+    f.write_all(data)
+        .unwrap_or_else(|e| die(format!("cannot write {path}: {e}")));
 }
 
 /// Lowercase hex encoding.
