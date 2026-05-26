@@ -77,6 +77,9 @@ pub mod signature_registry;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+#[cfg(feature = "dtls")]
+pub mod dtls;
+
 #[cfg(feature = "x509")]
 pub mod x509;
 
