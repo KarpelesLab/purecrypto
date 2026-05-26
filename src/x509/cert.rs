@@ -304,10 +304,14 @@ impl Certificate {
         )
     }
 
-    /// Wraps existing certificate DER (validating only that it is a SEQUENCE).
+    /// Wraps existing certificate DER (validating only that it is a single
+    /// SEQUENCE with no trailing bytes). Rejecting trailing junk is
+    /// important so `to_der()` returns the same bytes a hash of the cert
+    /// would commit to — two implementations parsing the same blob agree.
     pub fn from_der(der: Vec<u8>) -> Result<Certificate, Error> {
         let mut r = Reader::new(&der);
         r.read_sequence()?;
+        r.finish()?;
         Ok(Certificate { der })
     }
 
@@ -671,13 +675,19 @@ impl Certificate {
 }
 
 /// Parses a `SubjectAltName` value (`SEQUENCE OF GeneralName`), collecting the
-/// dNSName (`[2] IA5String`, tag 0x82) entries.
+/// dNSName (`[2] IA5String`, tag 0x82) entries. RFC 5280 §4.2.1.6 requires
+/// dNSName entries to be IA5 (ASCII): non-ASCII bytes are rejected so the
+/// hostname matcher (which only lowercases ASCII) doesn't accidentally
+/// compare a UTF-8 SAN to a punycoded hostname and miss a mismatch.
 pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
     while !seq.is_empty() {
         let (t, value) = seq.read_any()?;
         if t == 0x82 {
+            if value.iter().any(|&b| b >= 0x80) {
+                return Err(Error::Malformed);
+            }
             let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
             out.push(String::from(s));
         }

@@ -38,8 +38,13 @@ pub fn encode_sequence(content: &[u8]) -> Vec<u8> {
 }
 
 /// Encodes an unsigned big-endian integer as a DER `INTEGER`, trimming leading
-/// zeros and prepending `0x00` when needed to keep the value positive.
+/// zeros and prepending `0x00` when needed to keep the value positive. The
+/// empty slice is encoded as the canonical zero (`02 01 00`).
 pub fn encode_integer(unsigned_be: &[u8]) -> Vec<u8> {
+    if unsigned_be.is_empty() {
+        // Canonical zero encoding rather than panicking on `trimmed[0]`.
+        return encode_tlv(tag::INTEGER, &[0u8]);
+    }
     // Strip leading zero bytes, keeping at least one byte.
     let mut start = 0;
     while start + 1 < unsigned_be.len() && unsigned_be[start] == 0 {

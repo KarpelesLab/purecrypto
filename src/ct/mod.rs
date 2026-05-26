@@ -52,15 +52,15 @@ impl Choice {
 impl From<u8> for Choice {
     /// Wraps a `0`/`1` byte as a [`Choice`].
     ///
-    /// # Panics
-    ///
-    /// Debug builds assert the input is `0` or `1`. In release builds any
-    /// other value silently violates the invariant, so only pass values you
-    /// know are boolean.
+    /// Debug builds assert the input is `0` or `1`. Release builds mask
+    /// `value & 1` so an out-of-domain byte is silently coerced to a valid
+    /// `Choice` rather than corrupting downstream constant-time selects.
+    /// (Internal callers should still keep the bit clean — the mask is a
+    /// safety net, not a license to pass arbitrary bytes.)
     #[inline]
     fn from(value: u8) -> Self {
         debug_assert!(value == 0 || value == 1, "Choice must be 0 or 1");
-        Choice(value)
+        Choice(value & 1)
     }
 }
 
