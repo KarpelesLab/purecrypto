@@ -12,17 +12,21 @@
 
 pub(crate) mod ack;
 pub mod client12;
-mod cookie;
-mod reassembly;
-mod record;
-mod record13;
-mod reliability;
+pub mod client13;
+pub(crate) mod cookie;
+pub(crate) mod reassembly;
+pub(crate) mod record;
+pub(crate) mod record13;
+pub(crate) mod reliability;
 pub(crate) mod reliability13;
-mod replay;
+pub(crate) mod replay;
 pub mod server12;
+pub mod server13;
 
 pub use client12::{DtlsClientConfig12, DtlsClientConnection12};
+pub use client13::{DtlsClientConfig13, DtlsClientConnection13};
 pub use server12::{DtlsServerConfig12, DtlsServerConnection12};
+pub use server13::{DtlsServerConfig13, DtlsServerConnection13};
 
 #[cfg(test)]
 mod tests;
