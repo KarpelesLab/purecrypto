@@ -1,11 +1,29 @@
-//! `purecrypto s_server` — minimal TLS 1.2 or TLS 1.3 echo / `-www` server,
-//! like a pared-down `openssl s_server`. Single-shot: accepts one connection,
-//! completes the handshake, exchanges data, closes.
+//! `purecrypto s_server` — minimal TLS 1.2, TLS 1.3, DTLS 1.2, or DTLS 1.3
+//! echo / `-www` server, like a pared-down `openssl s_server`. Single-shot:
+//! accepts one connection, completes the handshake, exchanges data, closes.
+//!
+//! Version selection mirrors `s_client`:
+//!
+//! | flag         | protocol | transport |
+//! |--------------|----------|-----------|
+//! | (default)    | TLS 1.3  | TCP       |
+//! | `-tls1_2`    | TLS 1.2  | TCP       |
+//! | `-dtls1_2`   | DTLS 1.2 | UDP       |
+//! | `-dtls1_3`   | DTLS 1.3 | UDP       |
+//!
+//! The dedicated `s_dtls_server` binary is a convenience shim around
+//! `s_server -dtls1_2`.
 
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::Arc;
+use std::time::Duration;
 
+use crate::dtls_io;
 use crate::util::{Args, die};
+use purecrypto::dtls::{
+    DtlsServerConfig12, DtlsServerConfig13, DtlsServerConnection12, DtlsServerConnection13,
+};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
@@ -14,6 +32,37 @@ use purecrypto::tls::{
     Stream,
 };
 use purecrypto::x509::Certificate;
+
+/// Which protocol/transport combination the CLI should drive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProtocolVersion {
+    Tls12,
+    Tls13,
+    Dtls12,
+    Dtls13,
+}
+
+/// Resolves the requested protocol from CLI flags. Right-most wins.
+fn resolve_version(args: &Args) -> ProtocolVersion {
+    let candidates = [
+        (args.last_pos("-tls1_2"), ProtocolVersion::Tls12),
+        (args.last_pos("--tls1_2"), ProtocolVersion::Tls12),
+        (args.last_pos("-dtls1_2"), ProtocolVersion::Dtls12),
+        (args.last_pos("--dtls1_2"), ProtocolVersion::Dtls12),
+        (args.last_pos("-dtls1_3"), ProtocolVersion::Dtls13),
+        (args.last_pos("--dtls1_3"), ProtocolVersion::Dtls13),
+    ];
+    let mut best: Option<(usize, ProtocolVersion)> = None;
+    for (pos, v) in candidates {
+        if let Some(p) = pos {
+            match best {
+                Some((bp, _)) if bp >= p => {}
+                _ => best = Some((p, v)),
+            }
+        }
+    }
+    best.map(|(_, v)| v).unwrap_or(ProtocolVersion::Tls13)
+}
 
 /// Parses a comma-separated ALPN list.
 fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
@@ -124,58 +173,100 @@ fn build_server_config_12(cert_path: &str, key_path: &str) -> ServerConfig12 {
     }
 }
 
+/// Loads an ECDSA P-256 key from a SEC1 PEM file. (The DTLS 1.2 / 1.3
+/// server only supports ECDSA — RSA / Ed25519 keys would need suite codes
+/// we don't yet enable.)
+fn load_ecdsa_key(path: &str) -> BoxedEcdsaPrivateKey {
+    let key_pem = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| die(format!("cannot read key file {path}: {e}")));
+    BoxedEcdsaPrivateKey::from_sec1_pem(&key_pem)
+        .unwrap_or_else(|_| die(format!("{path}: DTLS server key must be ECDSA (SEC1)")))
+}
+
 pub(crate) fn run(args: Args) {
-    let cert_path = args
-        .value("-cert")
-        .unwrap_or_else(|| die("usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT [-tls1_2] [-Verify ca.pem] [-alpn h2,http/1.1] [-www]"));
+    let version = resolve_version(&args);
+    let cert_path = args.value("-cert").unwrap_or_else(|| {
+        die(
+            "usage: purecrypto s_server -cert cert.pem -key key.pem -accept PORT \
+             [-tls1_2 | -dtls1_2 | -dtls1_3] [-Verify ca.pem] [-alpn h2,http/1.1] [-www] \
+             [-mtu N] [-no_cookie]",
+        )
+    });
     let key_path = args
         .value("-key")
         .unwrap_or_else(|| die("-key is required"));
-    let port: u16 = args
-        .value("-accept")
-        .unwrap_or("4433")
-        .parse()
-        .unwrap_or_else(|_| die("-accept expects a port number"));
     let verify_ca = args.value("-Verify");
     let alpn = args.value("-alpn").map(parse_alpn);
     let www = args.flag("-www") || args.flag("--www");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
-    let tls12 = args.flag("-tls1_2") || args.flag("--tls1_2");
+    let no_cookie = args.flag("-no_cookie") || args.flag("--no_cookie");
+    let mtu: usize = args
+        .value("-mtu")
+        .unwrap_or("1200")
+        .parse()
+        .unwrap_or_else(|_| die("-mtu expects a number"));
 
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .unwrap_or_else(|e| die(format!("cannot bind 127.0.0.1:{port}: {e}")));
-    if !quiet {
-        eprintln!("listening on 127.0.0.1:{port}");
-    }
-    let (mut sock, peer) = listener
-        .accept()
-        .unwrap_or_else(|e| die(format!("accept failed: {e}")));
-    if !quiet {
-        eprintln!("accepted connection from {peer}");
-    }
+    match version {
+        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
+            let port: u16 = args
+                .value("-accept")
+                .unwrap_or("4433")
+                .parse()
+                .unwrap_or_else(|_| die("-accept expects a port number"));
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .unwrap_or_else(|e| die(format!("cannot bind 127.0.0.1:{port}: {e}")));
+            if !quiet {
+                eprintln!("listening on 127.0.0.1:{port}");
+            }
+            let (mut sock, peer) = listener
+                .accept()
+                .unwrap_or_else(|e| die(format!("accept failed: {e}")));
+            if !quiet {
+                eprintln!("accepted connection from {peer}");
+            }
 
-    if tls12 {
-        let mut config = build_server_config_12(cert_path, key_path);
-        if let Some(a) = alpn {
-            config = config.with_alpn(a);
+            if version == ProtocolVersion::Tls12 {
+                let mut config = build_server_config_12(cert_path, key_path);
+                if let Some(a) = alpn {
+                    config = config.with_alpn(a);
+                }
+                if let Some(p) = verify_ca {
+                    let roots = load_roots_file(p);
+                    config = config.with_client_auth(roots, true);
+                }
+                let mut conn = ServerConnection12::new(config, OsRng);
+                serve(&mut conn, &mut sock, www, quiet);
+            } else {
+                let mut config = build_server_config(cert_path, key_path);
+                if let Some(a) = alpn {
+                    config = config.with_alpn(a);
+                }
+                if let Some(p) = verify_ca {
+                    let roots = load_roots_file(p);
+                    config = config.with_client_auth(roots, true);
+                }
+                let mut conn = ServerConnection::new(config, OsRng);
+                serve(&mut conn, &mut sock, www, quiet);
+            }
         }
-        if let Some(p) = verify_ca {
-            let roots = load_roots_file(p);
-            config = config.with_client_auth(roots, true);
+        ProtocolVersion::Dtls12 => {
+            if verify_ca.is_some() {
+                die(
+                    "DTLS 1.2 server does not yet implement client authentication (-Verify unsupported)",
+                );
+            }
+            let accept = args.value("-accept").unwrap_or("127.0.0.1:4434");
+            run_dtls12(cert_path, key_path, accept, mtu, no_cookie, quiet);
         }
-        let mut conn = ServerConnection12::new(config, OsRng);
-        serve(&mut conn, &mut sock, www, quiet);
-    } else {
-        let mut config = build_server_config(cert_path, key_path);
-        if let Some(a) = alpn {
-            config = config.with_alpn(a);
+        ProtocolVersion::Dtls13 => {
+            if verify_ca.is_some() {
+                die(
+                    "DTLS 1.3 server does not yet implement client authentication (-Verify unsupported)",
+                );
+            }
+            let accept = args.value("-accept").unwrap_or("127.0.0.1:4434");
+            run_dtls13(cert_path, key_path, accept, mtu, no_cookie, quiet);
         }
-        if let Some(p) = verify_ca {
-            let roots = load_roots_file(p);
-            config = config.with_client_auth(roots, true);
-        }
-        let mut conn = ServerConnection::new(config, OsRng);
-        serve(&mut conn, &mut sock, www, quiet);
     }
 }
 
@@ -253,4 +344,141 @@ fn serve<C: Connection + ServerInfo>(conn: &mut C, sock: &mut TcpStream, www: bo
             }
         }
     }
+}
+
+fn run_dtls12(
+    cert_path: &str,
+    key_path: &str,
+    accept: &str,
+    mtu: usize,
+    no_cookie: bool,
+    quiet: bool,
+) {
+    let chain = load_cert_chain(cert_path);
+    let key = load_ecdsa_key(key_path);
+
+    let mut config = DtlsServerConfig12::with_ecdsa(chain, key);
+    if no_cookie {
+        config = config.require_cookie_exchange(false);
+    } else {
+        let mut secret = [0u8; 32];
+        purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
+        config = config
+            .with_cookie_secret(secret)
+            .require_cookie_exchange(true);
+    }
+    let config = Arc::new(config);
+
+    let (socket, peer) = bind_and_wait_initial(accept, mtu, quiet, "DTLS 1.2");
+
+    socket
+        .connect(peer)
+        .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
+
+    let peer_bytes = peer_addr_bytes(&peer);
+    let mut conn = DtlsServerConnection12::new(config, peer_bytes, OsRng);
+    // The initial datagram was just used to identify the peer; replay it.
+    let initial = INITIAL_BUFFER.with(|c| c.borrow_mut().take()).unwrap();
+    conn.feed_datagram(&initial)
+        .unwrap_or_else(|e| die(format!("DTLS error on initial datagram: {e:?}")));
+
+    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
+
+    if !quiet {
+        eprintln!("DTLS 1.2 handshake complete");
+    }
+
+    dtls_io::drive_server_echo(&mut conn, &socket, mtu, Duration::from_secs(5));
+}
+
+fn run_dtls13(
+    cert_path: &str,
+    key_path: &str,
+    accept: &str,
+    mtu: usize,
+    no_cookie: bool,
+    quiet: bool,
+) {
+    let chain = load_cert_chain(cert_path);
+    let key = load_ecdsa_key(key_path);
+
+    let mut config = DtlsServerConfig13::with_ecdsa(chain, key);
+    if no_cookie {
+        config = config.with_no_cookie();
+    } else {
+        let mut secret = [0u8; 32];
+        purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
+        config = config.with_cookie_secret(secret);
+    }
+    let config = Arc::new(config);
+
+    let (socket, peer) = bind_and_wait_initial(accept, mtu, quiet, "DTLS 1.3");
+
+    socket
+        .connect(peer)
+        .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
+
+    let peer_bytes = peer_addr_bytes(&peer);
+    let mut conn = DtlsServerConnection13::new(config, peer_bytes, OsRng);
+    let initial = INITIAL_BUFFER.with(|c| c.borrow_mut().take()).unwrap();
+    conn.feed_datagram(&initial)
+        .unwrap_or_else(|e| die(format!("DTLS error on initial datagram: {e:?}")));
+
+    dtls_io::drive_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));
+
+    if !quiet {
+        eprintln!("DTLS 1.3 handshake complete");
+    }
+
+    dtls_io::drive_server_echo(&mut conn, &socket, mtu, Duration::from_secs(5));
+}
+
+thread_local! {
+    /// Holds the first datagram that arrived from the peer, so it can be
+    /// replayed into the connection state machine after we've bound the
+    /// socket to that peer.
+    static INITIAL_BUFFER: core::cell::RefCell<Option<Vec<u8>>> = const { core::cell::RefCell::new(None) };
+}
+
+/// Binds to `accept`, waits for the first datagram (up to 60 s), and
+/// returns the socket plus the peer that sent it. The first datagram is
+/// stashed in [`INITIAL_BUFFER`] for the caller to feed into the
+/// just-constructed connection state machine.
+fn bind_and_wait_initial(
+    accept: &str,
+    mtu: usize,
+    quiet: bool,
+    label: &str,
+) -> (UdpSocket, SocketAddr) {
+    let socket =
+        UdpSocket::bind(accept).unwrap_or_else(|e| die(format!("cannot bind UDP {accept}: {e}")));
+    let bound = socket.local_addr().ok();
+    if !quiet {
+        match bound {
+            Some(addr) => eprintln!("listening on {addr} ({label} / UDP)"),
+            None => eprintln!("listening on {accept} ({label} / UDP)"),
+        }
+    }
+    let mut buf = vec![0u8; mtu.max(1500) + 256];
+    socket.set_read_timeout(Some(Duration::from_secs(60))).ok();
+    let (n, peer) = socket
+        .recv_from(&mut buf)
+        .unwrap_or_else(|e| die(format!("UDP recv (initial) failed: {e}")));
+    if !quiet {
+        eprintln!("accepted handshake start from {peer}");
+    }
+    buf.truncate(n);
+    INITIAL_BUFFER.with(|c| *c.borrow_mut() = Some(buf));
+    (socket, peer)
+}
+
+/// Produces opaque address bytes from a [`SocketAddr`] for the cookie
+/// generator. Format is "IP|port"; the generator only needs stability
+/// per peer for the duration of a handshake.
+fn peer_addr_bytes(addr: &SocketAddr) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(addr.ip().to_string().as_bytes());
+    bytes.push(b'|');
+    bytes.extend_from_slice(addr.port().to_string().as_bytes());
+    bytes
 }

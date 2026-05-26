@@ -2,6 +2,7 @@
 //! and a TLS test client (`s_client`), built entirely on the `purecrypto`
 //! library.
 
+mod dtls_io;
 mod genpkey;
 mod hash;
 mod pkey;
