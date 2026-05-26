@@ -399,6 +399,22 @@ impl<R: RngCore> ServerConnection<R> {
         self.alpn_negotiated.as_deref()
     }
 
+    /// `client_application_traffic_secret_0`, exposed for keylogfile output
+    /// in the server CLI. Available once the handshake completes.
+    pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
+        self.client_app_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// `server_application_traffic_secret_0`. See above.
+    pub fn server_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
+        self.server_app_secret.map(|s| s.as_slice().to_vec())
+    }
+
+    /// `exporter_master_secret`. See above.
+    pub fn exporter_master_secret(&self) -> Option<Vec<u8>> {
+        self.exporter_secret.map(|s| s.as_slice().to_vec())
+    }
+
     /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705) —
     /// symmetric to `ClientConnection::tls_exporter`.
     pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {

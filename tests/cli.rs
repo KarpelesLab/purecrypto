@@ -220,6 +220,105 @@ fn s_client_loopback() {
     );
 }
 
+/// s_client and s_server round-trip over a local TCP port, exercising
+/// ALPN negotiation and -keylogfile capture.
+#[test]
+fn s_client_s_server_roundtrip_alpn_keylog() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    // Pick a free port up front.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let dir = std::env::temp_dir().join(format!("pc_s_server_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+    let log_path = dir.join("keylog.txt");
+
+    // Self-signed Ed25519 cert for 127.0.0.1.
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+
+    // Spawn s_server in a background process (single-shot, `-www`).
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "s_server",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-accept",
+            &port.to_string(),
+            "-alpn",
+            "h2,http/1.1",
+            "-www",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn s_server");
+
+    // Give the server time to bind.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // s_client connects, negotiates ALPN, dumps secrets to keylogfile.
+    let (out, ok) = run(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-alpn",
+            "http/1.1",
+            "-keylogfile",
+            log_path.to_str().unwrap(),
+            "-quiet",
+        ],
+        b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    assert!(ok, "s_client failed");
+    assert!(
+        out.contains("hello from purecrypto s_server"),
+        "expected -www body in client stdout, got: {out:?}"
+    );
+
+    // The keylogfile must contain the expected secret labels.
+    let log = std::fs::read_to_string(&log_path).expect("read keylog");
+    for label in [
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        "CLIENT_TRAFFIC_SECRET_0",
+        "SERVER_TRAFFIC_SECRET_0",
+        "EXPORTER_SECRET",
+    ] {
+        assert!(log.contains(label), "missing {label} in keylog:\n{log}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "requires network access"]
 fn s_client_live_cloudflare() {
