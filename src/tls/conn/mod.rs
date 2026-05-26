@@ -1,6 +1,7 @@
 //! Connection state machines over the sans-I/O [`ConnectionCore`].
 
 mod client;
+mod client12;
 mod common;
 mod server;
 #[cfg(feature = "std")]
@@ -10,6 +11,7 @@ mod stream;
 pub use client::{
     ClientCertConfig, ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession,
 };
+pub use client12::{ClientConfig12, ClientConnection12};
 #[cfg(feature = "std")]
 pub use server::ReplayWindow;
 #[allow(unused_imports)]

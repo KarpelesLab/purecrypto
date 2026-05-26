@@ -22,8 +22,8 @@ mod pki;
 mod version;
 
 pub use conn::{
-    ClientAuthPolicy, ClientCertConfig, ClientConfig, ClientConnection, ReceivedSessionTicket,
-    ServerConfig, ServerConnection, StoredSession,
+    ClientAuthPolicy, ClientCertConfig, ClientConfig, ClientConfig12, ClientConnection,
+    ClientConnection12, ReceivedSessionTicket, ServerConfig, ServerConnection, StoredSession,
 };
 #[cfg(feature = "std")]
 pub use conn::{Connection, ReplayWindow, Stream};

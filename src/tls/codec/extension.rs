@@ -116,6 +116,32 @@ pub(crate) fn parse_ec_point_formats(body: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(list.to_vec())
 }
 
+/// `renegotiation_info` (RFC 5746 §3.2). In TLS 1.2 a fresh handshake carries
+/// an empty `renegotiated_connection` field (one u8 zero), which advertises
+/// support for secure renegotiation. This crate never actually renegotiates;
+/// we emit the empty form to keep modern servers from rejecting us, and we
+/// expect the server's echo to also be empty.
+// Used by the TLS 1.2 client/server in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn renegotiation_info_empty() -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u8(&mut body, |_| {});
+    (ExtensionType::RENEGOTIATION_INFO, body)
+}
+
+/// Parses a `renegotiation_info` body, returning the embedded
+/// `renegotiated_connection` bytes. For a fresh handshake (the only case this
+/// crate handles), the inner vector must be empty — non-empty inputs come
+/// from an actual renegotiation, which we never initiate.
+// Used by the TLS 1.2 client/server in a follow-up commit.
+#[allow(dead_code)]
+pub(crate) fn parse_renegotiation_info(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let inner = c.vec_u8()?;
+    c.expect_empty()?;
+    Ok(inner.to_vec())
+}
+
 /// `record_size_limit` (RFC 8449): a single u16 in `64..=2^14+1` advertising
 /// the maximum plaintext fragment the peer may send us.
 pub(crate) fn record_size_limit(limit: u16) -> RawExtension {

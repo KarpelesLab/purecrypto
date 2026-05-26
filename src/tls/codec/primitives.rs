@@ -118,5 +118,10 @@ u16_id!(
         PSK_KEY_EXCHANGE_MODES = 0x002d,
         /// key_share.
         KEY_SHARE = 0x0033,
+        /// renegotiation_info (RFC 5746). In TLS 1.2 ClientHello/ServerHello,
+        /// an empty body advertises support for secure renegotiation. We
+        /// never actually renegotiate; we only emit/expect the empty form.
+        #[allow(dead_code)]
+        RENEGOTIATION_INFO = 0xff01,
     }
 );
