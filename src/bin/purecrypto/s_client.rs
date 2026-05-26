@@ -427,6 +427,19 @@ fn drive_tcp_handshake(conn: &mut Connection, sock: &mut TcpStream) {
 }
 
 fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
+    let mut stdout = std::io::stdout();
+
+    // Drain any plaintext the engine already decoded during the
+    // handshake — the server may have piggy-backed the
+    // CCS/Finished/AppData/close_notify into one TCP segment, in which
+    // case the handshake loop's last `feed` already gave us the
+    // response (and possibly the EOF too) before we ever entered this
+    // function. Print it before we touch the socket.
+    let pre = conn.recv().unwrap_or_default();
+    if !pre.is_empty() {
+        let _ = stdout.write_all(&pre);
+    }
+
     if !std::io::stdin().is_terminal() {
         let mut input = Vec::new();
         if std::io::stdin().read_to_end(&mut input).is_ok() && !input.is_empty() {
@@ -438,7 +451,6 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
         }
     }
 
-    let mut stdout = std::io::stdout();
     let mut buf = [0u8; 4096];
     loop {
         match sock.read(&mut buf) {
