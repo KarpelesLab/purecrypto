@@ -6,13 +6,14 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::extension::{self, Extension, GeneralName};
 use super::{
     AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error, Validity,
     algorithm_identifier, oid,
 };
 use crate::der::{
-    Reader, encode_bit_string, encode_boolean, encode_context, encode_integer, encode_octet_string,
-    encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
+    Reader, encode_bit_string, encode_context, encode_integer, encode_sequence, parse_oid,
+    pem_decode, pem_encode, tag,
 };
 use crate::hash::Sha256;
 use crate::rsa::{RsaPrivateKey, RsaPublicKey};
@@ -42,45 +43,30 @@ fn rsa_spki<const LIMBS: usize>(pk: &RsaPublicKey<LIMBS>) -> Vec<u8> {
     encode_sequence(&[algid, encode_bit_string(&key)].concat())
 }
 
-/// Encodes the critical `basicConstraints` extension as one `Extension`.
-fn basic_constraints_ext(is_ca: bool) -> Vec<u8> {
-    let bc_value = if is_ca {
-        encode_sequence(&encode_boolean(true))
-    } else {
-        encode_sequence(&[]) // cA defaults to FALSE
-    };
-    let mut ext = oid_tlv(oid::BASIC_CONSTRAINTS);
-    ext.extend_from_slice(&encode_boolean(true)); // critical
-    ext.extend_from_slice(&encode_octet_string(&bc_value));
-    encode_sequence(&ext)
-}
-
-/// Encodes a `subjectAltName` extension (dNSName entries) as one `Extension`.
-pub(super) fn subject_alt_name_ext(dns_names: &[&str]) -> Vec<u8> {
-    // GeneralNames ::= SEQUENCE OF GeneralName; dNSName is [2] IA5String,
-    // an IMPLICIT primitive context tag (0x82).
-    let mut names = Vec::new();
-    for name in dns_names {
-        names.extend_from_slice(&encode_tlv(0x82, name.as_bytes()));
-    }
-    let san = encode_sequence(&names);
-    let mut ext = oid_tlv(oid::SUBJECT_ALT_NAME);
-    ext.extend_from_slice(&encode_octet_string(&san));
-    encode_sequence(&ext)
-}
-
-/// Encodes the `[3] Extensions` field (basicConstraints, plus subjectAltName
-/// when `dns_names` is non-empty).
-fn extensions(is_ca: bool, dns_names: &[&str]) -> Vec<u8> {
-    let mut list = basic_constraints_ext(is_ca);
+/// Translates the legacy `(is_ca, dns_names)` shape into a fresh
+/// [`Extension`] vector: critical basicConstraints + (when non-empty)
+/// non-critical subjectAltName with dNSName entries.
+pub(crate) fn legacy_extensions(is_ca: bool, dns_names: &[&str]) -> Vec<Extension> {
+    let mut v = Vec::new();
+    v.push(extension::basic_constraints(is_ca, None));
     if !dns_names.is_empty() {
-        list.extend_from_slice(&subject_alt_name_ext(dns_names));
+        let names: Vec<GeneralName> = dns_names
+            .iter()
+            .map(|s| GeneralName::Dns((*s).into()))
+            .collect();
+        v.push(extension::subject_alt_name(&names));
     }
-    encode_context(3, &encode_sequence(&list))
+    v
+}
+
+/// Encodes the `[3] Extensions` field for an arbitrary slice of extensions.
+fn extensions_explicit(exts: &[Extension]) -> Vec<u8> {
+    extension::encode_extensions_field(exts)
 }
 
 /// Builds the DER `TBSCertificate` from a pre-encoded subject
-/// `SubjectPublicKeyInfo` and inner `signature` AlgorithmIdentifier.
+/// `SubjectPublicKeyInfo`, inner `signature` AlgorithmIdentifier, and an
+/// arbitrary slice of v3 extensions.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_tbs_raw(
     serial: u64,
@@ -89,8 +75,7 @@ pub(crate) fn build_tbs_raw(
     validity: &Validity,
     spki_der: &[u8],
     sig_algid: &[u8],
-    is_ca: bool,
-    dns_names: &[&str],
+    extensions: &[Extension],
 ) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&encode_context(0, &encode_integer(&[2]))); // version v3
@@ -100,7 +85,7 @@ pub(crate) fn build_tbs_raw(
     body.extend_from_slice(&validity.to_der());
     body.extend_from_slice(&subject.to_der());
     body.extend_from_slice(spki_der);
-    body.extend_from_slice(&extensions(is_ca, dns_names));
+    body.extend_from_slice(&extensions_explicit(extensions));
     encode_sequence(&body)
 }
 
@@ -115,6 +100,7 @@ fn build_tbs<const LIMBS: usize>(
     is_ca: bool,
     dns_names: &[&str],
 ) -> Vec<u8> {
+    let exts = legacy_extensions(is_ca, dns_names);
     build_tbs_raw(
         serial,
         issuer,
@@ -122,8 +108,7 @@ fn build_tbs<const LIMBS: usize>(
         validity,
         &rsa_spki(subject_key),
         &algorithm_identifier(oid::SHA256_WITH_RSA, true),
-        is_ca,
-        dns_names,
+        &exts,
     )
 }
 
@@ -242,6 +227,26 @@ impl Certificate {
         is_ca: bool,
         dns_names: &[&str],
     ) -> Result<Certificate, Error> {
+        let exts = legacy_extensions(is_ca, dns_names);
+        Self::issue_with_extensions(signer, issuer, subject, subject_key, validity, serial, &exts)
+    }
+
+    /// Issues a certificate carrying an arbitrary slice of v3 extensions.
+    ///
+    /// This is the broadest entry point — every other `issue_*` helper is
+    /// either a wrapper around it ([`issue_general`](Self::issue_general)
+    /// translates `is_ca`/`dns_names` into a default extension vector and
+    /// calls into here) or a thin RSA-only convenience.
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue_with_extensions(
+        signer: &CertSigner,
+        issuer: &DistinguishedName,
+        subject: &DistinguishedName,
+        subject_key: &AnyPublicKey,
+        validity: &Validity,
+        serial: u64,
+        extensions: &[Extension],
+    ) -> Result<Certificate, Error> {
         let algid = signer.algorithm_identifier();
         let tbs = build_tbs_raw(
             serial,
@@ -250,12 +255,26 @@ impl Certificate {
             validity,
             &subject_key.to_spki_der(),
             &algid,
-            is_ca,
-            dns_names,
+            extensions,
         );
         let sig = signer.sign(&tbs)?;
         let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
         Ok(Certificate { der })
+    }
+
+    /// Issues a self-signed certificate (issuer == subject, signed by `signer`)
+    /// carrying an arbitrary slice of v3 extensions.
+    pub fn self_signed_with_extensions(
+        signer: &CertSigner,
+        subject: &DistinguishedName,
+        validity: &Validity,
+        serial: u64,
+        extensions: &[Extension],
+    ) -> Result<Certificate, Error> {
+        let key = signer.public_key();
+        Self::issue_with_extensions(
+            signer, subject, subject, &key, validity, serial, extensions,
+        )
     }
 
     /// Issues a self-signed certificate using `signer` for both the key and the
@@ -620,6 +639,22 @@ impl Certificate {
         Ok(out)
     }
 
+    /// Returns every v3 extension carried by this certificate, in order.
+    /// Used by the CLI's `x509 -text -ext` dump and the chain validator
+    /// for unknown-critical detection.
+    pub fn extensions(&self) -> Result<Vec<Extension>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, critical, value| {
+            out.push(Extension {
+                oid: id.to_vec(),
+                critical,
+                value: value.to_vec(),
+            });
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Walks the certificate's extensions and returns the OIDs of every entry
     /// marked `critical = true`. Used by chain validation to enforce RFC 5280
     /// §4.2: any critical extension the verifier doesn't understand must
@@ -715,6 +750,7 @@ mod tests {
     use super::*;
     use crate::test_util::{rsa_test_key_a, rsa_test_key_b};
     use crate::x509::Time;
+    use alloc::vec;
 
     fn validity() -> Validity {
         Validity::new(
@@ -891,6 +927,57 @@ A1UdEwEB/wQFMAMBAf8wCgYIKoZIzj0EAwMDaAAwZQIxANhANplvbyG3UYpPKRBw\n\
 zonaqEOgq726vkmse4rPtI3e2qssKRgyBnJ7eK3aw/QtZAIwN67oHB6vv9uYce3C\n\
 ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
 -----END CERTIFICATE-----\n";
+
+    #[test]
+    fn issue_with_extensions_round_trip() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::extension::{
+            KeyUsageBits, basic_constraints, extended_key_usage, key_usage,
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ext-test", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("ext-cert");
+
+        let exts = [
+            basic_constraints(true, Some(0)),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+        ];
+        let cert = Certificate::self_signed_with_extensions(
+            &signer,
+            &name,
+            &validity(),
+            1,
+            &exts,
+        )
+        .unwrap();
+        cert.check_well_formed().unwrap();
+
+        // basic_constraints accessor reflects what we encoded.
+        let bc = cert.basic_constraints().unwrap().unwrap();
+        assert_eq!(bc, (true, Some(0)));
+        // key_usage accessor sees the same wire mask.
+        let ku = cert.key_usage().unwrap().unwrap();
+        assert_eq!(
+            ku,
+            (KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN).0
+        );
+        // EKU survives.
+        let eku = cert.extended_key_usages().unwrap();
+        assert_eq!(eku, vec![oid::ID_KP_SERVER_AUTH.to_vec()]);
+        // extensions() lists all three.
+        let all = cert.extensions().unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].oid, oid::BASIC_CONSTRAINTS);
+        assert_eq!(all[1].oid, oid::KEY_USAGE);
+        assert_eq!(all[2].oid, oid::EXT_KEY_USAGE);
+        // Self-signature still verifies under the embedded key.
+        let pk = cert.subject_public_key().unwrap();
+        cert.verify_signature_with(&pk).unwrap();
+    }
 
     #[test]
     fn parse_and_verify_openssl_p384_cert() {
