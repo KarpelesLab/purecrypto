@@ -8,7 +8,7 @@ mod record;
 
 #[allow(unused_imports)]
 pub(crate) use handshake::{
-    ClientHello, NewSessionTicket, RawExtension, ServerHello, hs_type, read_handshake,
+    ClientHello, KeyUpdate, NewSessionTicket, RawExtension, ServerHello, hs_type, read_handshake,
 };
 #[allow(unused_imports)]
 pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
