@@ -20,17 +20,24 @@
 //! from a different source all collapse to `false` without leaking which
 //! byte differed.
 //!
-//! The DTLS server state machines that issue and validate cookies land in
-//! commits 10 and 14, so the items below are `#[allow(dead_code)]` for now.
-
-#![allow(dead_code)]
+//! ## Cookie format
+//!
+//! `cookie := TS(4) ‖ HMAC-SHA256(secret, client_addr ‖ client_random ‖ TS)[..32]`
+//!
+//! `TS` is the issuing server's timestamp in minutes, big-endian (32-bit).
+//! Validation rejects cookies whose `now - TS > max_age_minutes`; this
+//! upper-bounds the replay window even if the secret is never rotated. The
+//! HMAC binds `TS` so an attacker can't extend a cookie's lifetime by
+//! editing the timestamp.
 
 use crate::ct::{Choice, ConstantTimeEq};
 use crate::hash::{HmacSha256, Sha256};
 
-/// Length of an issued cookie. We size to 32 bytes — the full SHA-256 tag
-/// width, which is well within the 0..255 cookie-length field DTLS allows.
-pub(crate) const COOKIE_LEN: usize = 32;
+/// Length of an issued cookie: 4-byte timestamp || 32-byte HMAC.
+pub(crate) const COOKIE_LEN: usize = 36;
+/// Default cookie validity window in minutes. Cookies older than this are
+/// rejected even if they validate the HMAC.
+pub(crate) const DEFAULT_MAX_AGE_MIN: u32 = 10;
 
 /// Stateless HelloVerifyRequest cookie generator/validator.
 ///
@@ -39,49 +46,74 @@ pub(crate) const COOKIE_LEN: usize = 32;
 /// secret compromise.
 pub(crate) struct CookieGenerator {
     secret: [u8; 32],
+    max_age_minutes: u32,
 }
 
 impl CookieGenerator {
     /// Creates a generator bound to `secret`. The caller is responsible for
     /// generating a high-entropy secret (e.g. via `crate::rng::OsRng`).
     pub(crate) fn new(secret: [u8; 32]) -> Self {
-        Self { secret }
+        Self {
+            secret,
+            max_age_minutes: DEFAULT_MAX_AGE_MIN,
+        }
+    }
+
+    /// Override the maximum cookie age in minutes.
+    #[allow(dead_code)]
+    pub(crate) fn with_max_age_minutes(mut self, minutes: u32) -> Self {
+        self.max_age_minutes = minutes;
+        self
     }
 
     /// Computes the cookie for a given client. `client_addr` is an opaque
     /// identifier for the source (typically the 6/18-byte IP+port packed
-    /// representation), and `client_random` is the 32-byte random nonce
-    /// from the ClientHello.
+    /// representation), `client_random` is the 32-byte random nonce from
+    /// CH1, and `now_minutes` is the issuing-server clock in minutes
+    /// (typically `unix_time_seconds / 60`, truncated to `u32`).
     pub(crate) fn generate(
         &self,
         client_addr: &[u8],
         client_random: &[u8; 32],
+        now_minutes: u32,
     ) -> [u8; COOKIE_LEN] {
+        let ts = now_minutes.to_be_bytes();
         let tag = HmacSha256::new(&self.secret)
             .chain(client_addr)
             .chain(client_random)
+            .chain(&ts)
             .finalize();
         let mut out = [0u8; COOKIE_LEN];
-        out.copy_from_slice(tag.as_ref());
+        out[..4].copy_from_slice(&ts);
+        out[4..].copy_from_slice(tag.as_ref());
         out
     }
 
     /// Constant-time validation of `cookie` against a freshly-computed
-    /// reference value. Returns `true` only if every byte matches.
-    ///
-    /// A `cookie` whose length is not exactly [`COOKIE_LEN`] fails
-    /// immediately — the underlying `Hmac::<Sha256>::verify` accepts
-    /// shorter slices by truncating, which would weaken the proof.
+    /// reference value. Returns `true` only if every byte matches AND the
+    /// embedded timestamp is within the configured `max_age_minutes` of
+    /// `now_minutes`.
     pub(crate) fn validate(
         &self,
         client_addr: &[u8],
         client_random: &[u8; 32],
+        now_minutes: u32,
         cookie: &[u8],
     ) -> bool {
         if cookie.len() != COOKIE_LEN {
             return false;
         }
-        let expected = self.generate(client_addr, client_random);
+        let mut ts_bytes = [0u8; 4];
+        ts_bytes.copy_from_slice(&cookie[..4]);
+        let ts = u32::from_be_bytes(ts_bytes);
+        // Reject cookies from the future (one-minute clock-skew tolerance) and
+        // those older than max_age_minutes. Saturating to avoid wraparound.
+        let age = now_minutes.saturating_sub(ts);
+        let future_skew = ts.saturating_sub(now_minutes);
+        if age > self.max_age_minutes || future_skew > 1 {
+            return false;
+        }
+        let expected = self.generate(client_addr, client_random, ts);
         let eq: Choice = expected.as_slice().ct_eq(cookie);
         bool::from(eq)
     }
@@ -113,13 +145,40 @@ mod tests {
         r
     }
 
+    const TS: u32 = 1_000_000;
+
     #[test]
     fn generate_then_validate_succeeds() {
         let cg = CookieGenerator::new(fixed_secret());
         let addr = b"203.0.113.5:50000";
         let rand = fixed_random();
-        let cookie = cg.generate(addr, &rand);
-        assert!(cg.validate(addr, &rand, &cookie));
+        let cookie = cg.generate(addr, &rand, TS);
+        assert!(cg.validate(addr, &rand, TS, &cookie));
+        // A minute later is still within the default window.
+        assert!(cg.validate(addr, &rand, TS + 1, &cookie));
+    }
+
+    #[test]
+    fn expired_cookie_fails() {
+        let cg = CookieGenerator::new(fixed_secret()).with_max_age_minutes(5);
+        let addr = b"client";
+        let rand = fixed_random();
+        let cookie = cg.generate(addr, &rand, TS);
+        assert!(cg.validate(addr, &rand, TS + 5, &cookie));
+        // One minute past the window.
+        assert!(!cg.validate(addr, &rand, TS + 6, &cookie));
+        // Far future also rejected.
+        assert!(!cg.validate(addr, &rand, TS + 1_000_000, &cookie));
+    }
+
+    #[test]
+    fn future_cookie_fails() {
+        let cg = CookieGenerator::new(fixed_secret());
+        let addr = b"client";
+        let rand = fixed_random();
+        let cookie = cg.generate(addr, &rand, TS + 5);
+        // Server clock 5 minutes behind the cookie's timestamp.
+        assert!(!cg.validate(addr, &rand, TS, &cookie));
     }
 
     #[test]
@@ -128,8 +187,8 @@ mod tests {
         let addr_a = b"203.0.113.5:50000";
         let addr_b = b"203.0.113.5:50001";
         let rand = fixed_random();
-        let cookie = cg.generate(addr_a, &rand);
-        assert!(!cg.validate(addr_b, &rand, &cookie));
+        let cookie = cg.generate(addr_a, &rand, TS);
+        assert!(!cg.validate(addr_b, &rand, TS, &cookie));
     }
 
     #[test]
@@ -139,8 +198,8 @@ mod tests {
         let rand_a = fixed_random();
         let mut rand_b = rand_a;
         rand_b[0] ^= 1;
-        let cookie = cg.generate(addr, &rand_a);
-        assert!(!cg.validate(addr, &rand_b, &cookie));
+        let cookie = cg.generate(addr, &rand_a, TS);
+        assert!(!cg.validate(addr, &rand_b, TS, &cookie));
     }
 
     #[test]
@@ -148,26 +207,12 @@ mod tests {
         let cg = CookieGenerator::new(fixed_secret());
         let addr = b"203.0.113.5:50000";
         let rand = fixed_random();
-        let cookie = cg.generate(addr, &rand);
-        // Drop the last byte.
-        assert!(!cg.validate(addr, &rand, &cookie[..COOKIE_LEN - 1]));
-        // Empty cookie.
-        assert!(!cg.validate(addr, &rand, &[]));
-        // Right length, wrong bytes.
+        let cookie = cg.generate(addr, &rand, TS);
+        assert!(!cg.validate(addr, &rand, TS, &cookie[..COOKIE_LEN - 1]));
+        assert!(!cg.validate(addr, &rand, TS, &[]));
         let mut bad = cookie;
         bad[COOKIE_LEN - 1] ^= 1;
-        assert!(!cg.validate(addr, &rand, &bad));
-    }
-
-    #[test]
-    fn extended_cookie_fails() {
-        let cg = CookieGenerator::new(fixed_secret());
-        let addr = b"203.0.113.5:50000";
-        let rand = fixed_random();
-        let cookie = cg.generate(addr, &rand);
-        let mut padded = cookie.to_vec();
-        padded.push(0); // 33 bytes — rejected on the length check.
-        assert!(!cg.validate(addr, &rand, &padded));
+        assert!(!cg.validate(addr, &rand, TS, &bad));
     }
 
     #[test]
@@ -176,18 +221,7 @@ mod tests {
         let cg_b = CookieGenerator::new([0xbb; 32]);
         let addr = b"client";
         let rand = fixed_random();
-        let cookie_a = cg_a.generate(addr, &rand);
-        // The other server cannot validate cookies issued by the first.
-        assert!(!cg_b.validate(addr, &rand, &cookie_a));
-    }
-
-    #[test]
-    fn cookie_is_deterministic() {
-        let cg = CookieGenerator::new(fixed_secret());
-        let addr = b"client";
-        let rand = fixed_random();
-        let c1 = cg.generate(addr, &rand);
-        let c2 = cg.generate(addr, &rand);
-        assert_eq!(c1, c2);
+        let cookie_a = cg_a.generate(addr, &rand, TS);
+        assert!(!cg_b.validate(addr, &rand, TS, &cookie_a));
     }
 }

@@ -404,7 +404,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .as_ref()
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
-            let cookie = cg.generate(&self.peer_addr, &parsed.random);
+            let now_min = (self.last_now.as_secs() / 60) as u32;
+            let cookie = cg.generate(&self.peer_addr, &parsed.random, now_min);
             self.emit_hello_verify_request(&cookie)?;
             self.state = State::WaitSecondClientHello;
             // We deliberately do NOT add this CH or HVR to a transcript
@@ -421,7 +422,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .as_ref()
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
-            if !cg.validate(&self.peer_addr, &parsed.random, &parsed.cookie) {
+            let now_min = (self.last_now.as_secs() / 60) as u32;
+            if !cg.validate(&self.peer_addr, &parsed.random, now_min, &parsed.cookie) {
                 return Err(Error::IllegalParameter);
             }
         }
