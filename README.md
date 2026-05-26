@@ -45,12 +45,12 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing) |
 | Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | 🟡 AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM and ChaCha20-Poly1305 (AEAD). _Missing: CCM, XTS, AES-key-wrap._ |
+| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM and ChaCha20-Poly1305 (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649) |
 | Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
-| Asymmetric keys  | `rsa`       | 🟡 RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, PSS sign/verify, PKCS#1 DER/PEM. _Missing: OAEP encryption._ |
-| Key derivation   | `kdf`       | 🟡 PBKDF2, HKDF. _Missing: password hashing (Argon2, scrypt, bcrypt)._ |
+| Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
+| Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106) |
 | Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032) |
-| Post-quantum KEM | `mlkem`     | 🟡 ML-KEM-768 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop. _Missing: ML-KEM-512 and ML-KEM-1024._ |
+| Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
 | Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
@@ -134,8 +134,10 @@ purecrypto genpkey -algorithm ML-DSA-87               -out mldsa87.pem
 purecrypto genpkey -algorithm SLH-DSA-SHA2-128f       -out slh128f.pem
 purecrypto genpkey -algorithm SLH-DSA-SHAKE-256s      -out slh256s.pem
 
-# Post-quantum KEM (FIPS 203)
-purecrypto genpkey -algorithm ML-KEM-768              -out mlkem.pem
+# Post-quantum KEM (FIPS 203) — all three security levels
+purecrypto genpkey -algorithm ML-KEM-512              -out mlkem512.pem
+purecrypto genpkey -algorithm ML-KEM-768              -out mlkem768.pem
+purecrypto genpkey -algorithm ML-KEM-1024             -out mlkem1024.pem
 ```
 
 The full SLH-DSA matrix is supported:
