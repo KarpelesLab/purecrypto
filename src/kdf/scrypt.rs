@@ -63,8 +63,12 @@ pub fn scrypt(
         return Err(Error::InvalidParam);
     }
     // p · (128 · r) must fit in usize for the buffer.
-    let block_size = 128usize.checked_mul(r as usize).ok_or(Error::InvalidParam)?;
-    let b_len = block_size.checked_mul(p as usize).ok_or(Error::InvalidParam)?;
+    let block_size = 128usize
+        .checked_mul(r as usize)
+        .ok_or(Error::InvalidParam)?;
+    let b_len = block_size
+        .checked_mul(p as usize)
+        .ok_or(Error::InvalidParam)?;
     if out.is_empty() {
         return Err(Error::InvalidParam);
     }
@@ -132,8 +136,7 @@ fn block_mix(b: &mut [u8], r: usize) {
     // Reorder: Y_0, Y_2, ..., Y_{2r-2}, Y_1, Y_3, ..., Y_{2r-1}.
     for i in 0..r {
         b[i * 64..(i + 1) * 64].copy_from_slice(&y[(2 * i) * 64..(2 * i + 1) * 64]);
-        b[(r + i) * 64..(r + i + 1) * 64]
-            .copy_from_slice(&y[(2 * i + 1) * 64..(2 * i + 2) * 64]);
+        b[(r + i) * 64..(r + i + 1) * 64].copy_from_slice(&y[(2 * i + 1) * 64..(2 * i + 2) * 64]);
     }
 }
 
@@ -207,7 +210,10 @@ mod tests {
             scrypt(b"p", b"s", 4, 1, 0, &mut out),
             Err(Error::InvalidParam)
         );
-        assert_eq!(scrypt(b"p", b"s", 4, 1, 1, &mut []), Err(Error::InvalidParam));
+        assert_eq!(
+            scrypt(b"p", b"s", 4, 1, 1, &mut []),
+            Err(Error::InvalidParam)
+        );
         // r·N ≥ 2³⁰ → reject.
         assert_eq!(
             scrypt(b"p", b"s", 30, 1, 1, &mut out),

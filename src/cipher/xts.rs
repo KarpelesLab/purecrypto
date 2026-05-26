@@ -67,11 +67,7 @@ impl<C: BlockCipher> Xts<C> {
     /// Encrypts a sector in place. Sectors must be at least 16 bytes; lengths
     /// that are not a multiple of 16 use ciphertext stealing on the trailing
     /// blocks.
-    pub fn encrypt_sector(
-        &self,
-        sector_index: u128,
-        buf: &mut [u8],
-    ) -> Result<(), InvalidLength> {
+    pub fn encrypt_sector(&self, sector_index: u128, buf: &mut [u8]) -> Result<(), InvalidLength> {
         if buf.len() < 16 {
             return Err(InvalidLength);
         }
@@ -131,11 +127,7 @@ impl<C: BlockCipher> Xts<C> {
     }
 
     /// Decrypts a sector in place. Mirrors [`encrypt_sector`].
-    pub fn decrypt_sector(
-        &self,
-        sector_index: u128,
-        buf: &mut [u8],
-    ) -> Result<(), InvalidLength> {
+    pub fn decrypt_sector(&self, sector_index: u128, buf: &mut [u8]) -> Result<(), InvalidLength> {
         if buf.len() < 16 {
             return Err(InvalidLength);
         }
@@ -224,12 +216,9 @@ mod tests {
     fn ieee_1619_vector_1() {
         let k1 = from_hex::<16>("00000000000000000000000000000000");
         let k2 = from_hex::<16>("00000000000000000000000000000000");
-        let pt = from_hex::<32>(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        );
-        let expected = from_hex::<32>(
-            "917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e",
-        );
+        let pt = from_hex::<32>("0000000000000000000000000000000000000000000000000000000000000000");
+        let expected =
+            from_hex::<32>("917cf69ebd68b2ec9b9fe9a3eadda692cd43d2f59598ed858c02c2652fbf922e");
 
         let xts = Aes128Xts::new(Aes128::new(&k1), Aes128::new(&k2));
         let mut buf = pt;
@@ -244,12 +233,9 @@ mod tests {
     fn ieee_1619_vector_2() {
         let k1 = from_hex::<16>("11111111111111111111111111111111");
         let k2 = from_hex::<16>("22222222222222222222222222222222");
-        let pt = from_hex::<32>(
-            "4444444444444444444444444444444444444444444444444444444444444444",
-        );
-        let expected = from_hex::<32>(
-            "c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0",
-        );
+        let pt = from_hex::<32>("4444444444444444444444444444444444444444444444444444444444444444");
+        let expected =
+            from_hex::<32>("c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0");
 
         let xts = Aes128Xts::new(Aes128::new(&k1), Aes128::new(&k2));
         let mut buf = pt;
@@ -263,18 +249,11 @@ mod tests {
     /// Verifies the AES-256 path.
     #[test]
     fn ieee_1619_vector_10_aes256() {
-        let k1 = from_hex::<32>(
-            "2718281828459045235360287471352662497757247093699959574966967627",
-        );
-        let k2 = from_hex::<32>(
-            "3141592653589793238462643383279502884197169399375105820974944592",
-        );
-        let pt = from_hex::<32>(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
-        let expected = from_hex::<32>(
-            "1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b",
-        );
+        let k1 = from_hex::<32>("2718281828459045235360287471352662497757247093699959574966967627");
+        let k2 = from_hex::<32>("3141592653589793238462643383279502884197169399375105820974944592");
+        let pt = from_hex::<32>("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let expected =
+            from_hex::<32>("1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b");
 
         let xts = Aes256Xts::new(Aes256::new(&k1), Aes256::new(&k2));
         let mut buf = pt;

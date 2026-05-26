@@ -8,7 +8,9 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::{BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed25519PublicKey, Ed25519Signature};
+use crate::ec::{
+    BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed25519PublicKey, Ed25519Signature,
+};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rsa::BoxedRsaPublicKey;
 

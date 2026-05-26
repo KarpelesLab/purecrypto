@@ -595,10 +595,7 @@ mod tests {
         assert!(bool::from(f.mul(three, inv3).ct_eq(&f.one)), "inv broken");
         // sqrt(-1)^2 == -1
         let neg1 = f.neg(f.one);
-        assert!(
-            bool::from(f.sq(f.sqrtm1).ct_eq(&neg1)),
-            "sqrtm1 broken"
-        );
+        assert!(bool::from(f.sq(f.sqrtm1).ct_eq(&neg1)), "sqrtm1 broken");
         // base point decodes
         assert!(f.decode(&BASE_ENC).is_some(), "base decode failed");
     }
@@ -654,8 +651,11 @@ mod tests {
         let mut sig_bytes = sig.to_bytes();
         sig_bytes[63] |= 0x80;
         assert!(
-            pk.verify(b"purecrypto ed25519", &Ed25519Signature::from_bytes(sig_bytes))
-                .is_err()
+            pk.verify(
+                b"purecrypto ed25519",
+                &Ed25519Signature::from_bytes(sig_bytes)
+            )
+            .is_err()
         );
     }
 }

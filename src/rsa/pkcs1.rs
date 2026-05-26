@@ -250,10 +250,7 @@ mod tests {
             .encrypt_oaep::<Sha256, _>(b"to be tampered", b"", &mut r)
             .unwrap();
         ct[42] ^= 1;
-        assert_eq!(
-            key.decrypt_oaep::<Sha256>(&ct, b""),
-            Err(Error::Decryption)
-        );
+        assert_eq!(key.decrypt_oaep::<Sha256>(&ct, b""), Err(Error::Decryption));
     }
 
     #[test]

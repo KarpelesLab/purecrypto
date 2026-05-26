@@ -11,8 +11,8 @@ use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
 };
-use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::hash::{Sha256, Sha384, Sha512};
+use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::codec::extension as ext;
@@ -281,10 +281,18 @@ impl<R: RngCore> ServerConnection<R> {
 
         // Server writes with the server handshake key; reads (client Finished)
         // with the client handshake key.
-        self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts));
-        self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts));
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &shts,
+        ));
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &chts,
+        ));
         self.core.emit_ccs();
 
         // Encrypted server flight.
@@ -301,8 +309,12 @@ impl<R: RngCore> ServerConnection<R> {
 
         // The server's subsequent writes use the application key; it still
         // reads the client Finished with the client handshake key.
-        self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &sats));
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &sats,
+        ));
 
         self.suite = Some(suite);
         self.client_hs_secret = Some(chts);
@@ -347,8 +359,7 @@ impl<R: RngCore> ServerConnection<R> {
                     .try_into()
                     .map_err(|_| Error::Decode)?;
 
-                let (ct, ml_ss) =
-                    MlKem768EncapsKey::from_bytes(ek).encapsulate(&mut self.rng);
+                let (ct, ml_ss) = MlKem768EncapsKey::from_bytes(ek).encapsulate(&mut self.rng);
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 let x_ss = sk.diffie_hellman(&peer);
 
@@ -439,8 +450,12 @@ impl<R: RngCore> ServerConnection<R> {
 
         // The client now talks under its application traffic key.
         let cats = self.client_app_secret.as_ref().expect("client app secret");
-        self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, cats));
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            cats,
+        ));
         self.state = State::Connected;
         Ok(())
     }

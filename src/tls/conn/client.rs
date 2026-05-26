@@ -375,10 +375,18 @@ impl ClientConnection {
 
         // Server -> client uses the server handshake key; client -> server
         // (our Finished) uses the client handshake key.
-        self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts));
-        self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts));
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &shts,
+        ));
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &chts,
+        ));
         self.core.emit_ccs(); // middlebox compatibility
 
         self.suite = Some(suite);
@@ -521,10 +529,18 @@ impl ClientConnection {
         self.core.emit_handshake(finished);
 
         // Switch to application traffic keys.
-        self.core
-            .set_write(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &cats));
-        self.core
-            .set_read(RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &sats));
+        self.core.set_write(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &cats,
+        ));
+        self.core.set_read(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &sats,
+        ));
         self.state = State::Connected;
         Ok(())
     }

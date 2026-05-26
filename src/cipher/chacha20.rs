@@ -100,9 +100,8 @@ mod tests {
     #[test]
     fn rfc8439_block_function() {
         // RFC 8439 §2.3.2.
-        let key = from_hex::<32>(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key =
+            from_hex::<32>("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let nonce = from_hex::<12>("000000090000004a00000000");
         let c = ChaCha20::new(&key);
         let block = c.block(&nonce, 1);
@@ -118,9 +117,8 @@ mod tests {
     #[test]
     fn rfc8439_encryption() {
         // RFC 8439 §2.4.2: encrypt the sunscreen plaintext at initial counter 1.
-        let key = from_hex::<32>(
-            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        );
+        let key =
+            from_hex::<32>("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let nonce = from_hex::<12>("000000000000004a00000000");
         let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you \
 only one tip for the future, sunscreen would be it.";

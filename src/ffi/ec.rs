@@ -309,10 +309,7 @@ pub unsafe extern "C" fn pc_ed25519_verify(
         let Ok(bytes) = <[u8; 64]>::try_from(sig) else {
             return PcStatus::BadEncoding;
         };
-        if key
-            .verify(m, &Ed25519Signature::from_bytes(bytes))
-            .is_ok()
-        {
+        if key.verify(m, &Ed25519Signature::from_bytes(bytes)).is_ok() {
             PcStatus::Ok
         } else {
             PcStatus::Verification

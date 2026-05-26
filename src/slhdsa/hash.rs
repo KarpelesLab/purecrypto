@@ -17,7 +17,13 @@ fn shake(parts: &[&[u8]], out: &mut [u8]) {
 }
 
 /// `D(pk_seed[..n] ‖ 0^(block−n) ‖ addr ‖ parts...)[..n]`.
-fn sha2_compress<D: Digest>(pk_seed: &[u8], n: usize, addr: &[u8], parts: &[&[u8]], out: &mut [u8]) {
+fn sha2_compress<D: Digest>(
+    pk_seed: &[u8],
+    n: usize,
+    addr: &[u8],
+    parts: &[&[u8]],
+    out: &mut [u8],
+) {
     let mut h = D::new();
     h.update(&pk_seed[..n]);
     h.update(&ZEROS[..D::BLOCK_LEN - n]);

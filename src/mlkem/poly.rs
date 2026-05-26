@@ -158,7 +158,12 @@ pub(crate) fn poly_basemul(a: &Poly, b: &Poly) -> Poly {
     for i in 0..N / 4 {
         let z = ZETAS[64 + i];
         basemul(&mut r.c[4 * i..], &a.c[4 * i..], &b.c[4 * i..], z);
-        basemul(&mut r.c[4 * i + 2..], &a.c[4 * i + 2..], &b.c[4 * i + 2..], -z);
+        basemul(
+            &mut r.c[4 * i + 2..],
+            &a.c[4 * i + 2..],
+            &b.c[4 * i + 2..],
+            -z,
+        );
     }
     r
 }

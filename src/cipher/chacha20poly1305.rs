@@ -92,9 +92,8 @@ mod tests {
 
     // RFC 8439 §2.8.2.
     fn vector() -> ([u8; 32], [u8; 12], [u8; 12], [u8; 114]) {
-        let key = from_hex::<32>(
-            "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
-        );
+        let key =
+            from_hex::<32>("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f");
         let nonce = from_hex::<12>("070000004041424344454647");
         let aad = from_hex::<12>("50515253c0c1c2c3c4c5c6c7");
         let mut plaintext = [0u8; 114];

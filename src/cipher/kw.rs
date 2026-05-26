@@ -165,11 +165,7 @@ fn wrap_w<C: BlockCipher>(
 /// RFC 3394 W⁻¹: unwraps `ciphertext`, leaving the candidate plaintext in
 /// `out` and returning the recovered integrity register A. The caller is
 /// responsible for verifying A against the expected IV (constant time).
-fn unwrap_w<C: BlockCipher>(
-    cipher: &C,
-    ciphertext: &[u8],
-    out: &mut [u8],
-) -> Result<u64, KwError> {
+fn unwrap_w<C: BlockCipher>(cipher: &C, ciphertext: &[u8], out: &mut [u8]) -> Result<u64, KwError> {
     if ciphertext.len() < 16 || !ciphertext.len().is_multiple_of(8) {
         return Err(KwError::InvalidLength);
     }
@@ -427,8 +423,7 @@ mod tests {
     fn rfc3394_256_kek_256_data() {
         let kek =
             from_hex::<32>("000102030405060708090A0B0C0D0E0F101112131415161718191A1B1C1D1E1F");
-        let pt =
-            from_hex::<32>("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F");
+        let pt = from_hex::<32>("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F");
         let expected = from_hex::<40>(
             "28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21",
         );
