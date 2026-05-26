@@ -162,8 +162,131 @@ pub(crate) fn verify_pss<D: Digest, K: RawPublic>(
     emsa_pss_verify::<D>(msg, &m[k - em_len..], em_bits)
 }
 
+// --------------------------------------------------------------------------
+// OAEP (RFC 8017 §7.1)
+// --------------------------------------------------------------------------
+
+pub(crate) fn encrypt_oaep<D: Digest, K: RawPublic, R: RngCore>(
+    key: &K,
+    msg: &[u8],
+    label: &[u8],
+    rng: &mut R,
+) -> Result<Vec<u8>, Error> {
+    let k = key.key_size();
+    let h_len = D::OUTPUT_LEN;
+    if k < 2 * h_len + 2 || msg.len() > k - 2 * h_len - 2 {
+        return Err(Error::MessageTooLong);
+    }
+
+    // DB = lHash ‖ PS ‖ 0x01 ‖ M
+    let mut db = vec![0u8; k - h_len - 1];
+    db[..h_len].copy_from_slice(D::digest(label).as_ref());
+    let one_off = k - msg.len() - h_len - 2; // index of the 0x01 separator
+    db[one_off] = 0x01;
+    db[one_off + 1..].copy_from_slice(msg);
+
+    // seed = h_len random bytes, freshly drawn for every encryption.
+    let mut seed = vec![0u8; h_len];
+    rng.fill_bytes(&mut seed);
+
+    let db_mask = mgf1::<D>(&seed, k - h_len - 1);
+    for (b, m) in db.iter_mut().zip(db_mask.iter()) {
+        *b ^= m;
+    }
+    let seed_mask = mgf1::<D>(&db, h_len);
+    for (s, m) in seed.iter_mut().zip(seed_mask.iter()) {
+        *s ^= m;
+    }
+
+    // EM = 0x00 ‖ maskedSeed ‖ maskedDB
+    let mut em = vec![0u8; k];
+    em[1..1 + h_len].copy_from_slice(&seed);
+    em[1 + h_len..].copy_from_slice(&db);
+
+    Ok(key.raw_public(&em))
+}
+
+pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
+    key: &K,
+    ciphertext: &[u8],
+    label: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let k = key.key_size();
+    let h_len = D::OUTPUT_LEN;
+    if ciphertext.len() != k || k < 2 * h_len + 2 {
+        return Err(Error::Decryption);
+    }
+    let em = key.raw_private(ciphertext);
+
+    // Split EM = Y ‖ maskedSeed ‖ maskedDB.
+    let y = em[0];
+    let masked_seed = &em[1..1 + h_len];
+    let masked_db = &em[1 + h_len..];
+
+    let seed_mask = mgf1::<D>(masked_db, h_len);
+    let mut seed = vec![0u8; h_len];
+    for i in 0..h_len {
+        seed[i] = masked_seed[i] ^ seed_mask[i];
+    }
+
+    let db_mask = mgf1::<D>(&seed, k - h_len - 1);
+    let mut db = vec![0u8; k - h_len - 1];
+    for i in 0..db.len() {
+        db[i] = masked_db[i] ^ db_mask[i];
+    }
+
+    // Constant-time padding validation. Accumulate a single u8 that is 0 iff
+    // every check passed; only branch on it at the very end.
+    //
+    //   Y must be 0x00.
+    //   db[..h_len] must equal Hash(label).
+    //   db[h_len..] must be (zero-padding) ‖ 0x01 ‖ M; find the 0x01 separator
+    //     CT, ensuring no non-{0,1} byte precedes it.
+    let l_hash = D::digest(label);
+    let mut bad: u8 = y; // any non-zero Y is bad
+
+    // CT compare lHash.
+    let mut diff: u8 = 0;
+    for (b, h) in db.iter().take(h_len).zip(l_hash.as_ref().iter()) {
+        diff |= b ^ h;
+    }
+    bad |= diff;
+
+    // Find the 0x01 separator without leaking its position via early-exit.
+    // `found = 0` until we hit the first 0x01; once set, any subsequent
+    // non-{0,1} byte is irrelevant. Before the separator, any non-zero byte
+    // is bad.
+    let ps_region = &db[h_len..];
+    let mut found: u8 = 0;
+    let mut sep_idx: usize = 0;
+    let mut pre_bad: u8 = 0;
+    for (i, &b) in ps_region.iter().enumerate() {
+        // is_one = 0xff iff b == 0x01 and not yet found.
+        let is_one = ct_eq_u8(b, 0x01) & !found;
+        sep_idx |= i & (is_one as usize); // captures the first matching index
+        found |= is_one;
+        // Before separator (!found), byte must be 0x00.
+        pre_bad |= b & !found;
+    }
+    bad |= !found;
+    bad |= pre_bad;
+
+    if bad != 0 {
+        return Err(Error::Decryption);
+    }
+
+    Ok(ps_region[sep_idx + 1..].to_vec())
+}
+
+/// Returns `0xff` if `a == b`, else `0x00`. Wraps the crate's constant-time
+/// byte equality and broadcasts the boolean to a full-byte mask.
+#[inline]
+fn ct_eq_u8(a: u8, b: u8) -> u8 {
+    0u8.wrapping_sub(a.ct_eq(&b).unwrap_u8())
+}
+
 /// MGF1 (RFC 8017 B.2.1) using hash `D`.
-fn mgf1<D: Digest>(seed: &[u8], mask_len: usize) -> Vec<u8> {
+pub(crate) fn mgf1<D: Digest>(seed: &[u8], mask_len: usize) -> Vec<u8> {
     let mut mask = Vec::with_capacity(mask_len);
     let mut counter: u32 = 0;
     while mask.len() < mask_len {

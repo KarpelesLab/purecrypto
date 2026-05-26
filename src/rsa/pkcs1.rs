@@ -94,6 +94,21 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         emsa::encrypt_pkcs1v15(self, msg, rng)
     }
 
+    /// Encrypts `msg` with RSAES-OAEP (RFC 8017 §7.1.1), using hash `D` for both
+    /// the label hash and MGF1, and the empty label by default — pass `label`
+    /// to bind context. Returns the `LIMBS*8`-byte ciphertext.
+    ///
+    /// # Errors
+    /// [`Error::MessageTooLong`] if `msg.len() > k - 2·hLen - 2`.
+    pub fn encrypt_oaep<D: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        label: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng)
+    }
+
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.
     ///
     /// # Errors
@@ -114,6 +129,15 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// See the module note: this is padding-oracle sensitive.
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         emsa::decrypt_pkcs1v15(self, ct)
+    }
+
+    /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` must match
+    /// the one used at encryption; `label` must match the encryptor's label
+    /// (empty by default). The padding-check path is constant-time over the
+    /// decrypted EM so that a bad ciphertext is not distinguishable in timing
+    /// from a bad label.
+    pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
+        emsa::decrypt_oaep::<D, _>(self, ct, label)
     }
 
     /// Produces a PKCS#1 v1.5 signature over `msg`, hashing with `D`
@@ -155,6 +179,80 @@ mod tests {
         assert_eq!(
             pk.encrypt_pkcs1v15(&[0u8; 246], &mut r),
             Err(Error::MessageTooLong)
+        );
+    }
+
+    #[test]
+    fn oaep_roundtrip_sha256() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep", b"nonce", &[]);
+
+        // RSA-2048 + SHA-256: k - 2*hLen - 2 = 256 - 64 - 2 = 190 max message bytes.
+        let msg = b"OAEP round-trip with the default empty label";
+        let ct = pk.encrypt_oaep::<Sha256, _>(msg, b"", &mut r).unwrap();
+        assert_eq!(ct.len(), 256);
+        assert_ne!(&ct[..msg.len()], msg);
+        let pt = key.decrypt_oaep::<Sha256>(&ct, b"").unwrap();
+        assert_eq!(&pt[..], msg);
+    }
+
+    #[test]
+    fn oaep_distinct_ciphertexts() {
+        // OAEP draws a fresh random seed per encryption, so two encryptions of
+        // the same message produce distinct ciphertexts.
+        let pk = rsa_test_key_a().public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep-rand", b"nonce", &[]);
+        let msg = b"x";
+        let c1 = pk.encrypt_oaep::<Sha256, _>(msg, b"", &mut r).unwrap();
+        let c2 = pk.encrypt_oaep::<Sha256, _>(msg, b"", &mut r).unwrap();
+        assert_ne!(c1, c2);
+    }
+
+    #[test]
+    fn oaep_label_binds() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep-label", b"nonce", &[]);
+        let msg = b"context-bound";
+        let ct = pk
+            .encrypt_oaep::<Sha256, _>(msg, b"label-A", &mut r)
+            .unwrap();
+        // Same ciphertext, different label => decryption rejects.
+        assert_eq!(
+            key.decrypt_oaep::<Sha256>(&ct, b"label-B"),
+            Err(Error::Decryption)
+        );
+        // Matching label succeeds.
+        assert_eq!(
+            &key.decrypt_oaep::<Sha256>(&ct, b"label-A").unwrap()[..],
+            msg
+        );
+    }
+
+    #[test]
+    fn oaep_rejects_overlong() {
+        let pk = rsa_test_key_a().public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep-long", b"nonce", &[]);
+        // RSA-2048 + SHA-256: max message = 190 bytes; 191 must be rejected.
+        assert_eq!(
+            pk.encrypt_oaep::<Sha256, _>(&[0u8; 191], b"", &mut r),
+            Err(Error::MessageTooLong)
+        );
+    }
+
+    #[test]
+    fn oaep_rejects_tampered() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-oaep-tamper", b"nonce", &[]);
+        let mut ct = pk
+            .encrypt_oaep::<Sha256, _>(b"to be tampered", b"", &mut r)
+            .unwrap();
+        ct[42] ^= 1;
+        assert_eq!(
+            key.decrypt_oaep::<Sha256>(&ct, b""),
+            Err(Error::Decryption)
         );
     }
 

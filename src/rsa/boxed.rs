@@ -65,6 +65,17 @@ impl BoxedRsaPublicKey {
     pub fn encrypt_pkcs1v15<R: RngCore>(&self, msg: &[u8], rng: &mut R) -> Result<Vec<u8>, Error> {
         emsa::encrypt_pkcs1v15(self, msg, rng)
     }
+
+    /// Encrypts `msg` with RSAES-OAEP (RFC 8017 §7.1.1), hashing with `D` and
+    /// binding the optional `label`.
+    pub fn encrypt_oaep<D: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        label: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng)
+    }
 }
 
 impl BoxedRsaPrivateKey {
@@ -139,6 +150,12 @@ impl BoxedRsaPrivateKey {
     /// Decrypts a PKCS#1 v1.5 ciphertext.
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         emsa::decrypt_pkcs1v15(self, ct)
+    }
+
+    /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` and
+    /// `label` must match those used at encryption.
+    pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
+        emsa::decrypt_oaep::<D, _>(self, ct, label)
     }
 }
 
@@ -279,6 +296,18 @@ mod tests {
         let boxed =
             BoxedRsaPublicKey::new(BoxedUint::from_be_bytes(&n), BoxedUint::from_be_bytes(&e));
         (key, boxed)
+    }
+
+    #[test]
+    fn boxed_oaep_encrypts_const_generic_decrypts() {
+        let (key, boxed) = boxed_pub();
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-oaep", b"nonce", &[]);
+        let msg = b"OAEP from a runtime-sized public key";
+        let ct = boxed
+            .encrypt_oaep::<Sha256, _>(msg, b"label", &mut r)
+            .unwrap();
+        // The const-generic private key decrypts.
+        assert_eq!(&key.decrypt_oaep::<Sha256>(&ct, b"label").unwrap()[..], msg);
     }
 
     #[test]
