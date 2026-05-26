@@ -16,6 +16,8 @@
 mod adrs;
 mod hash;
 mod params;
+#[cfg(feature = "x509")]
+pub(crate) mod registry;
 
 use adrs::{Adrs, AdrsType};
 use alloc::vec;
@@ -78,6 +80,12 @@ impl ParamSet {
     /// The signature size for this set, in bytes.
     pub fn signature_size(self) -> usize {
         self.params().sig_size
+    }
+
+    /// The PKIX algorithm OID arcs for this parameter set (FIPS 205 / NIST).
+    /// Used for both SPKI and the X.509 certificate signatureAlgorithm.
+    pub fn oid(self) -> &'static [u64] {
+        self.params().oid
     }
 }
 
@@ -711,6 +719,11 @@ pub struct PublicKey {
 }
 
 impl PrivateKey {
+    /// The parameter set this key was generated for.
+    pub fn parameter_set(&self) -> ParamSet {
+        self.set
+    }
+
     /// Deterministically derives a key pair from the three n-byte seeds.
     pub fn from_seeds(
         set: ParamSet,
@@ -881,6 +894,11 @@ impl ParamSet {
 }
 
 impl PublicKey {
+    /// The parameter set this key was generated for.
+    pub fn parameter_set(&self) -> ParamSet {
+        self.set
+    }
+
     /// Verifies `sig` over `msg` with optional `ctx`.
     pub fn verify(&self, sig: &[u8], msg: &[u8], ctx: &[u8]) -> bool {
         let p = self.set.params();
