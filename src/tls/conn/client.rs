@@ -344,6 +344,9 @@ pub struct ClientConnection {
     exporter_secret: Option<Secret>,
 
     cert_chain: Vec<Vec<u8>>,
+    /// Per-connection CRL store populated from the leaf's stapled
+    /// `CRL_RESPONSE` extension. Empty when the server doesn't staple.
+    stapled_crls: crate::tls::pki::CrlStore,
     leaf_key: Option<AnyPublicKey>,
 
     /// Most recent `NewSessionTicket` from the peer (RFC 8446 §4.6.1). Real
@@ -633,6 +636,7 @@ impl ClientConnection {
             server_app_secret: None,
             exporter_secret: None,
             cert_chain: Vec::new(),
+            stapled_crls: crate::tls::pki::CrlStore::new(),
             leaf_key: None,
             last_ticket: None,
             alpn_negotiated: None,
@@ -1368,10 +1372,26 @@ impl ClientConnection {
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }
-        self.cert_chain = parse_certificate_list(body)?;
-        if self.cert_chain.is_empty() {
+        let entries = parse_certificate_list(body)?;
+        if entries.is_empty() {
             return Err(Error::BadCertificate);
         }
+        // The TLS 1.3 `Certificate` message carries per-cert extensions
+        // (RFC 8446 §4.4.2). The only one we recognize is the
+        // purecrypto-private CRL_RESPONSE staple on the leaf entry.
+        let mut stapled = crate::tls::pki::CrlStore::new();
+        if let Some((_leaf, exts)) = entries.first()
+            && let Some((_, data)) = exts
+                .iter()
+                .find(|(ty, _)| *ty == crate::tls::codec::ExtensionType::CRL_RESPONSE)
+        {
+            // Best-effort: add_der enforces wire-format well-formedness;
+            // a malformed staple is dropped silently rather than failing
+            // the handshake, since stapling is purely advisory.
+            let _ = stapled.add_der(data.clone());
+        }
+        self.stapled_crls = stapled;
+        self.cert_chain = entries.into_iter().map(|(c, _)| c).collect();
         self.core.transcript.update(raw);
         self.state = State::WaitCertificateVerify;
         Ok(())
@@ -1410,9 +1430,10 @@ impl ClientConnection {
         // signature policy applies to every chain signature.
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone().or_else(system_now);
+            let crls = self.config.crls.merged_with(&self.stapled_crls);
             let key = verify_chain_with_crls(
                 &self.config.roots,
-                &self.config.crls,
+                &crls,
                 &self.cert_chain,
                 now.as_ref(),
                 &self.config.signature_policy,
@@ -1682,22 +1703,39 @@ fn is_hello_retry_request(random: &Random) -> bool {
     random == &HRR_RANDOM
 }
 
-/// Parses a TLS 1.3 `Certificate` message body into a list of DER certificates
-/// (end-entity first).
-fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+/// One entry in the TLS 1.3 `Certificate` message: the cert DER and the
+/// parsed per-cert extension list (RFC 8446 §4.4.2).
+type CertificateEntry = (Vec<u8>, Vec<crate::tls::codec::RawExtension>);
+
+/// Parses a TLS 1.3 `Certificate` message body into the per-entry
+/// `(cert_der, extensions)` tuples (end-entity first).
+fn parse_certificate_list(body: &[u8]) -> Result<Vec<CertificateEntry>, Error> {
     let mut c = ReadCursor::new(body);
     let _context = c.vec_u8()?; // certificate_request_context
     let list = c.vec_u24()?;
     c.expect_empty()?;
 
     let mut entries = ReadCursor::new(list);
-    let mut certs = Vec::new();
+    let mut out: Vec<CertificateEntry> = Vec::new();
     while !entries.is_empty() {
         let cert = entries.vec_u24()?.to_vec();
-        let _exts = entries.vec_u16()?; // per-certificate extensions
-        certs.push(cert);
+        let exts_bytes = entries.vec_u16()?;
+        // Parse the per-cert extensions into RawExtension tuples. The
+        // RFC 8446 §4.2 rule that an extension type appears at most once
+        // applies here too.
+        let mut ext_c = ReadCursor::new(exts_bytes);
+        let mut exts: Vec<crate::tls::codec::RawExtension> = Vec::new();
+        while !ext_c.is_empty() {
+            let ty = crate::tls::codec::ExtensionType(ext_c.u16()?);
+            let data = ext_c.vec_u16()?.to_vec();
+            if exts.iter().any(|(t, _)| *t == ty) {
+                return Err(Error::IllegalParameter);
+            }
+            exts.push((ty, data));
+        }
+        out.push((cert, exts));
     }
-    Ok(certs)
+    Ok(out)
 }
 
 /// Builds a `Finished` handshake message from its `verify_data`.

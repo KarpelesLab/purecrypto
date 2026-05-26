@@ -78,6 +78,16 @@ impl CrlStore {
                 .unwrap_or(false)
         })
     }
+
+    /// Builds a new store containing every CRL from `self` followed by every
+    /// CRL from `other`. Used to unite the connection-config CRLs with
+    /// per-connection stapled CRLs at verify time.
+    pub(crate) fn merged_with(&self, other: &CrlStore) -> CrlStore {
+        let mut out = CrlStore { crls: Vec::with_capacity(self.crls.len() + other.crls.len()) };
+        out.crls.extend(self.crls.iter().cloned());
+        out.crls.extend(other.crls.iter().cloned());
+        out
+    }
 }
 
 #[cfg(test)]
