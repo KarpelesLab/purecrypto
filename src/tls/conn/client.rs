@@ -217,6 +217,20 @@ pub struct ClientConnection {
     /// `resumption_master_secret`, computed at our Finished. Future
     /// NewSessionTicket messages derive their PSK from this.
     rms: Option<Secret>,
+
+    /// True if we offered 0-RTT (`early_data` extension in CH); set when the
+    /// session ticket carried a non-zero `max_early_data_size`.
+    early_data_offered: bool,
+    /// True if the server's EncryptedExtensions confirmed 0-RTT acceptance.
+    early_data_accepted: bool,
+    /// `client_early_traffic_secret`, computed at CH emission. The write
+    /// side is keyed from this for the early-data records and the trailing
+    /// `EndOfEarlyData` message.
+    cets: Option<Secret>,
+    /// Cached client-handshake-traffic-secret to install after we send EOED
+    /// (or right at EE time if 0-RTT was rejected). Otherwise we install it
+    /// at SH time.
+    deferred_client_hs_secret: Option<Secret>,
 }
 
 /// What the client retains across CH emission so it can verify the server's
@@ -330,6 +344,12 @@ impl ClientConnection {
         self.psk_accepted
     }
 
+    /// Whether the server accepted our 0-RTT offer (`early_data` extension
+    /// in EncryptedExtensions). Always `false` before the handshake.
+    pub fn early_data_accepted(&self) -> bool {
+        self.early_data_accepted
+    }
+
     /// The ALPN protocol the server selected, if any (e.g. `b"h2"`).
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
@@ -429,6 +449,10 @@ impl ClientConnection {
             handshake_start: system_now(),
             stored_session: None,
             rms: None,
+            early_data_offered: false,
+            early_data_accepted: false,
+            cets: None,
+            deferred_client_hs_secret: None,
         };
         // Remember the offered PSK so we can seed the schedule when the
         // server selects it in SH.
@@ -437,6 +461,9 @@ impl ClientConnection {
                 psk: session.psk.clone(),
                 hash: session.cipher_suite_hash,
             });
+            if matches!(session.max_early_data_size, Some(n) if n > 0) {
+                conn.early_data_offered = true;
+            }
         }
         let hello = conn.build_client_hello(
             random,
@@ -446,7 +473,38 @@ impl ClientConnection {
             &[],
             &[],
         );
+
+        // Pre-set the transcript alg so the CH update settles the
+        // ClientEarlyTrafficSecret derivation below at the right hash.
+        if conn.early_data_offered
+            && let Some(session) = conn.config.session.as_ref()
+        {
+            conn.core.transcript.set_alg(session.cipher_suite_hash);
+        }
         conn.core.emit_handshake(hello);
+
+        // 0-RTT: install the client-early-traffic write key so the caller
+        // can stream early data right after this constructor returns. The
+        // secret is derived from `EarlySecret = HKDF-Extract(0, PSK)` and
+        // `Hash(ClientHello)`. The cipher suite is the one we offered (a
+        // single hash-matched suite is in effective_suites when the session
+        // is set).
+        if conn.early_data_offered
+            && let (Some(psk_state), Some(first_suite)) =
+                (conn.psk_offered.as_ref(), effective_suites.first())
+            && let Some(suite) = lookup_suite(*first_suite)
+        {
+            let ks = KeySchedule::with_psk(psk_state.hash, &psk_state.psk);
+            let th = conn.core.transcript.current_hash();
+            let cets = ks.client_early_traffic_secret(th.as_slice());
+            conn.core.set_write(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &cets,
+            ));
+            conn.cets = Some(cets);
+        }
         conn
     }
 
@@ -511,12 +569,15 @@ impl ClientConnection {
         }
         extensions.extend_from_slice(extra_extensions);
 
-        // PSK resumption: psk_key_exchange_modes + pre_shared_key (must be
-        // last). The binder is patched after we know the truncated CH bytes.
+        // PSK resumption: psk_key_exchange_modes, optional early_data,
+        // pre_shared_key (must be LAST per RFC 8446 §4.2.11). The binder is
+        // patched after we know the truncated CH bytes.
         let mut psk_binder_info: Option<(HashAlg, Vec<u8>, usize)> = None;
         if let Some(session) = &self.config.session {
             extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
-
+            if matches!(session.max_early_data_size, Some(n) if n > 0) {
+                extensions.push(ext::early_data_empty());
+            }
             let hash = session.cipher_suite_hash;
             let hash_len = hash.output_len();
             let age = self.compute_obfuscated_age(session);
@@ -582,6 +643,26 @@ impl ClientConnection {
     /// Sends application data (only valid once the handshake completes).
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
+            return Err(Error::InappropriateState);
+        }
+        self.core.send_application_data(data);
+        Ok(())
+    }
+
+    /// Sends `data` as 0-RTT (early) application data under
+    /// `client_early_traffic_secret`. Valid only between
+    /// `ClientConnection::new`/`new_with_offer` and the arrival of
+    /// `ServerHello`, and only when the active session enabled early data
+    /// (`StoredSession::max_early_data_size > 0`).
+    ///
+    /// **Replay risk**: the server-side anti-replay window is best-effort.
+    /// Application protocols that send 0-RTT data should treat it as
+    /// idempotent (e.g. GET requests without side effects).
+    pub fn write_early_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        if !self.early_data_offered {
+            return Err(Error::InappropriateState);
+        }
+        if self.state != State::WaitServerHello || self.cets.is_none() {
             return Err(Error::InappropriateState);
         }
         self.core.send_application_data(data);
@@ -821,20 +902,27 @@ impl ClientConnection {
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
 
-        // Server -> client uses the server handshake key; client -> server
-        // (our Finished) uses the client handshake key.
+        // Server -> client uses the server handshake key. If we offered
+        // 0-RTT, keep the current write key (early-traffic) until we send
+        // EndOfEarlyData; otherwise install the client-handshake write key
+        // now. The handshake secret is always stashed so it can be installed
+        // later.
         self.core.set_read(RecordCrypter::new(
             suite.hash,
             suite.aead,
             suite.key_len,
             &shts,
         ));
-        self.core.set_write(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &chts,
-        ));
+        if self.early_data_offered {
+            self.deferred_client_hs_secret = Some(chts);
+        } else {
+            self.core.set_write(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &chts,
+            ));
+        }
         self.core.emit_ccs(); // middlebox compatibility
 
         self.suite = Some(suite);
@@ -962,8 +1050,9 @@ impl ClientConnection {
         if msg_type != hs_type::ENCRYPTED_EXTENSIONS {
             return Err(Error::UnexpectedMessage);
         }
-        // Parse the EE body to extract ALPN, ignoring others.
+        // Parse the EE body to extract ALPN and early_data, ignoring others.
         // The handshake body lives in raw[4..] (4-byte header).
+        let mut early_data_in_ee = false;
         if raw.len() >= 4 {
             let body = &raw[4..];
             let mut c = ReadCursor::new(body);
@@ -986,10 +1075,49 @@ impl ClientConnection {
                 } else if ty == crate::tls::codec::ExtensionType::RECORD_SIZE_LIMIT.0 {
                     let limit = ext::parse_record_size_limit(ext_body)?;
                     self.core.set_peer_record_size_limit(limit);
+                } else if ty == crate::tls::codec::ExtensionType::EARLY_DATA.0 {
+                    // In EE, early_data is empty and signals acceptance of
+                    // the client's 0-RTT offer.
+                    if !ext_body.is_empty() {
+                        return Err(Error::IllegalParameter);
+                    }
+                    if !self.early_data_offered {
+                        // Server cannot accept what we didn't offer.
+                        return Err(Error::IllegalParameter);
+                    }
+                    early_data_in_ee = true;
                 }
             }
         }
         self.core.transcript.update(raw);
+
+        // 0-RTT key transition (RFC 8446 §4.6.1) is split between here and
+        // on_finished:
+        //   - If REJECTED: install the client-handshake write key now and
+        //     discard the queued early data (the server will skip it).
+        //   - If ACCEPTED: keep the early write key until AFTER we verify
+        //     the server's Finished (because the server's Finished MAC is
+        //     over CH..SH..EE, which does NOT include EOED yet). Then emit
+        //     EOED under the early key and install the handshake write key.
+        if self.early_data_offered {
+            let suite = self.suite.expect("suite set");
+            if early_data_in_ee {
+                self.early_data_accepted = true;
+                // Defer EOED + handshake-key install until on_finished.
+            } else {
+                let chts = self
+                    .deferred_client_hs_secret
+                    .take()
+                    .ok_or(Error::InappropriateState)?;
+                self.core.set_write(RecordCrypter::new(
+                    suite.hash,
+                    suite.aead,
+                    suite.key_len,
+                    &chts,
+                ));
+            }
+        }
+
         // Under PSK resumption (RFC 8446 §4.6.1) the server skips
         // Certificate / CertificateVerify and the client jumps straight to
         // expecting Finished.
@@ -1063,7 +1191,8 @@ impl ClientConnection {
         let suite = self.suite.expect("suite set");
         let shts = self.server_hs_secret.as_ref().expect("server hs secret");
 
-        // Verify the server Finished over Hash(CH..CertificateVerify).
+        // Verify the server Finished over Hash(CH..CertificateVerify) — or,
+        // under PSK, Hash(CH..EE).
         let th = self.core.transcript.current_hash();
         let expected = finished_verify_data(suite.hash, shts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
@@ -1071,7 +1200,10 @@ impl ClientConnection {
         }
         self.core.transcript.update(raw);
 
-        // Derive the application traffic secrets over Hash(CH..server Finished).
+        // Derive the application traffic secrets over Hash(CH..server
+        // Finished). This must happen BEFORE we emit EOED (which would
+        // otherwise enter the transcript) so the secret matches the server's
+        // computation.
         let ks = self.ks.as_mut().expect("key schedule");
         ks.enter_master();
         let th_app = self.core.transcript.current_hash();
@@ -1080,10 +1212,30 @@ impl ClientConnection {
         let ems = ks.exporter_master_secret(th_app.as_slice());
         self.exporter_secret = Some(ems);
 
-        // Our Finished, over Hash(CH..server Finished), under the client
-        // handshake key.
+        // 0-RTT acceptance: emit EndOfEarlyData under the early write key
+        // (still installed), then switch to the client-handshake write key
+        // before sending our Finished.
+        if self.early_data_accepted {
+            let mut eoed = alloc::vec![hs_type::END_OF_EARLY_DATA];
+            eoed.extend_from_slice(&[0u8, 0, 0]); // u24 length = 0
+            self.core.emit_handshake(eoed);
+            let chts = self
+                .deferred_client_hs_secret
+                .take()
+                .ok_or(Error::InappropriateState)?;
+            self.core.set_write(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &chts,
+            ));
+        }
+
+        // Our Finished, over the handshake context up to (and including, for
+        // 0-RTT) EndOfEarlyData — i.e. the current transcript hash here.
         let chts = self.client_hs_secret.as_ref().expect("client hs secret");
-        let verify_data = finished_verify_data(suite.hash, chts, th_app.as_slice());
+        let th_for_cfin = self.core.transcript.current_hash();
+        let verify_data = finished_verify_data(suite.hash, chts, th_for_cfin.as_slice());
         let finished = build_finished(verify_data.as_slice());
         self.core.emit_handshake(finished);
 

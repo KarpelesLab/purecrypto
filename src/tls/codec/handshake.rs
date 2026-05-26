@@ -15,6 +15,8 @@ pub(crate) mod hs_type {
     pub(crate) const CLIENT_HELLO: u8 = 1;
     pub(crate) const SERVER_HELLO: u8 = 2;
     pub(crate) const NEW_SESSION_TICKET: u8 = 4;
+    /// `end_of_early_data` (RFC 8446 §4.5). Body is empty.
+    pub(crate) const END_OF_EARLY_DATA: u8 = 5;
     pub(crate) const ENCRYPTED_EXTENSIONS: u8 = 8;
     pub(crate) const CERTIFICATE: u8 = 11;
     pub(crate) const CERTIFICATE_VERIFY: u8 = 15;

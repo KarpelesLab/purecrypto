@@ -8,6 +8,8 @@ mod stream;
 
 #[allow(unused_imports)]
 pub use client::{ClientConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
+#[cfg(feature = "std")]
+pub use server::ReplayWindow;
 #[allow(unused_imports)]
 pub use server::{ServerConfig, ServerConnection};
 #[cfg(feature = "std")]
@@ -611,6 +613,193 @@ mod loopback_tests {
         client2.read_tls(&s);
         client2.process_new_packets().unwrap();
         assert_eq!(client2.take_received_plaintext(), b"resumed-pong");
+    }
+
+    /// 0-RTT round-trip: phase 1 establishes a ticket with
+    /// `max_early_data_size > 0`; phase 2 writes early data which the server
+    /// reads under the early traffic key, before the handshake completes.
+    #[test]
+    fn zero_rtt_echo() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x33u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        // Phase 1.
+        let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"0rtt-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let session = client.take_session().expect("ticket");
+        assert_eq!(session.max_early_data_size, Some(16384));
+
+        // Phase 2: send 0-RTT data right after CH.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0x33u8; 32])
+            .with_max_early_data(16384);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-client-2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-server-2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        // Write early data immediately.
+        client2.write_early_data(b"hello-0rtt").unwrap();
+
+        // Drive the handshake.
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        assert!(server2.early_data_accepted(), "server accepted 0-RTT");
+        assert!(client2.early_data_accepted(), "client saw 0-RTT acceptance");
+
+        let received = server2.take_received_plaintext();
+        assert_eq!(received, b"hello-0rtt", "server received 0-RTT data");
+    }
+
+    /// 0-RTT replay detection: when a ReplayWindow is shared across two
+    /// servers, a second connection presenting the same binder is refused
+    /// 0-RTT (the handshake still completes via the regular PSK path, so
+    /// the replayed early data is silently dropped).
+    #[test]
+    fn zero_rtt_replay_detected() {
+        use crate::tls::ReplayWindow;
+
+        // Phase 1: establish a ticket with 0-RTT capability.
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0xb2u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rep-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rep-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket");
+
+        // The shared replay window across the two phase-2 servers.
+        let window = ReplayWindow::new();
+
+        // Phase 2a: first resumption with 0-RTT — accepted.
+        let mut server_a = {
+            let (server_config_a, cert_der_a) = rsa_server();
+            let _ = cert_der_a;
+            let server_config_a = server_config_a
+                .with_ticket_key([0xb2u8; 32])
+                .with_max_early_data(16384)
+                .with_replay_window(window.clone());
+            let srng_a = HmacDrbg::<Sha256>::new(b"rep-server-2a", b"nonce", &[]);
+            ServerConnection::new(server_config_a, srng_a)
+        };
+        let mut crng_a = HmacDrbg::<Sha256>::new(b"rep-client-2a", b"nonce", &[]);
+        let mut client_a = ClientConnection::new_with_offer(
+            ClientConfig::new(RootCertStore::new()).with_session(session.clone()),
+            "loopback.example",
+            &mut crng_a,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        client_a.write_early_data(b"replay-bait").unwrap();
+        let ch_records_a = client_a.write_tls();
+        server_a.read_tls(&ch_records_a);
+        server_a.process_new_packets().unwrap();
+        assert!(
+            server_a.early_data_accepted(),
+            "first attempt accepts 0-RTT"
+        );
+
+        // Phase 2b: replay the SAME ClientHello + early-data records to a
+        // fresh server that shares the replay window. The window blocks
+        // the binder; 0-RTT is refused and the early data is dropped.
+        let mut server_b = {
+            let (server_config_b, cert_der_b) = rsa_server();
+            let _ = cert_der_b;
+            let server_config_b = server_config_b
+                .with_ticket_key([0xb2u8; 32])
+                .with_max_early_data(16384)
+                .with_replay_window(window.clone());
+            let srng_b = HmacDrbg::<Sha256>::new(b"rep-server-2b", b"nonce", &[]);
+            ServerConnection::new(server_config_b, srng_b)
+        };
+        server_b.read_tls(&ch_records_a);
+        // The server will fail to decrypt the early-data records (because
+        // it never installed the early-read key) or — more cleanly — it
+        // will continue without accepting them. Either way, 0-RTT is NOT
+        // accepted.
+        let _ = server_b.process_new_packets();
+        assert!(
+            !server_b.early_data_accepted(),
+            "replayed binder must NOT accept 0-RTT"
+        );
     }
 
     /// A PSK binder that's been tampered with: the server must reject with
