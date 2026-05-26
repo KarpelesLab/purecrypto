@@ -596,6 +596,15 @@ impl ClientConnection12 {
         self.client_random
     }
 
+    /// The TLS 1.2 master secret derived during the handshake. Returns `None`
+    /// until the master secret has been computed (i.e. after the
+    /// `ServerHelloDone`/`ClientKeyExchange` exchange or after a resumed
+    /// session is accepted). Useful for writing the NSS `SSLKEYLOGFILE`
+    /// `CLIENT_RANDOM <client_random_hex> <master_secret_hex>` line.
+    pub fn master_secret(&self) -> Option<[u8; 48]> {
+        self.master
+    }
+
     /// Returns the latest stored session suitable for RFC 5077 resumption
     /// on the next connection. `None` if the server never sent a NST. Combine
     /// with [`ClientConfig12::with_session`].
