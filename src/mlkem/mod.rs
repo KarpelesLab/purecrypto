@@ -112,6 +112,47 @@ impl MlKem768EncapsKey {
     }
 }
 
+/// The `id-alg-ml-kem-768` OID (2.16.840.1.101.3.4.4.2).
+#[cfg(feature = "der")]
+const ML_KEM_768_OID: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 2];
+
+/// PKIX `SubjectPublicKeyInfo` import/export for the encapsulation key
+/// (draft-ietf-lamps-kyber-certificates). The AlgorithmIdentifier carries the
+/// bare OID with no parameters; the BIT STRING is the raw encapsulation key.
+#[cfg(feature = "der")]
+impl MlKem768EncapsKey {
+    /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure.
+    pub fn to_spki_der(&self) -> alloc::vec::Vec<u8> {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&oid_tlv(ML_KEM_768_OID));
+        encode_sequence(&[algid, encode_bit_string(&self.0)].concat())
+    }
+
+    /// Encodes the key as a PKIX PEM document (`-----BEGIN PUBLIC KEY-----`).
+    pub fn to_spki_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
+    }
+
+    /// Parses a PKIX `SubjectPublicKeyInfo` DER structure.
+    pub fn from_spki_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        use crate::der::{Error, Reader, parse_oid};
+        let mut reader = Reader::new(der);
+        let mut spki = reader.read_sequence()?;
+        let mut algid = spki.read_sequence()?;
+        if parse_oid(algid.read_oid()?)?.as_slice() != ML_KEM_768_OID {
+            return Err(Error::Malformed);
+        }
+        let key_bits = spki.read_bit_string()?;
+        let bytes: [u8; ENCAPS_KEY_BYTES] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+        Ok(MlKem768EncapsKey(bytes))
+    }
+
+    /// Parses a PKIX PEM public key.
+    pub fn from_spki_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_spki_der(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
+    }
+}
+
 impl MlKem768Ciphertext {
     /// Restores a ciphertext from its byte encoding.
     pub fn from_bytes(bytes: [u8; CIPHERTEXT_BYTES]) -> Self {
@@ -171,6 +212,22 @@ mod tests {
             ss,
             from_hex::<32>("2b59302b878ffc5eae9e4f5d4ddc8a73cea97ef10af90d7945b331d288683066")
         );
+    }
+
+    #[test]
+    fn spki_matches_openssl_and_roundtrips() {
+        use crate::test_util::from_hex_vec;
+        let (_dk, ek) = MlKem768DecapsKey::from_seeds(&[0u8; 32], &[0u8; 32]);
+
+        // Our SPKI DER must match OpenSSL 3.5's byte-for-byte.
+        let expected = from_hex_vec(include_str!("../../testdata/mlkem768_openssl_spki.hex"));
+        assert_eq!(ek.to_spki_der(), expected);
+
+        // PEM round-trip recovers the same key.
+        let pem = ek.to_spki_pem();
+        assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----"));
+        let parsed = MlKem768EncapsKey::from_spki_pem(&pem).unwrap();
+        assert_eq!(parsed, ek);
     }
 
     #[test]

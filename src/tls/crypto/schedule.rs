@@ -28,12 +28,14 @@ use crate::hash::{Digest, Hmac, Sha256, Sha384};
 use crate::kdf::{hkdf_expand, hkdf_extract};
 use alloc::vec::Vec;
 
-/// The largest secret/hash the schedule holds (SHA-384 output).
-const MAX_SECRET: usize = 48;
+/// The largest secret the schedule holds: the 64-byte concatenated shared
+/// secret of the X25519MLKEM768 hybrid (32 + 32). Hash outputs and traffic
+/// secrets are at most a SHA-384 (48-byte) value.
+const MAX_SECRET: usize = 64;
 
-/// A short byte string held inline: a key-schedule secret or a transcript hash
-/// (≤ 48 bytes). Avoids heap allocation and lets one type carry either a
-/// SHA-256 (32-byte) or SHA-384 (48-byte) value.
+/// A short byte string held inline: a key-schedule secret, a transcript hash,
+/// or a (possibly hybrid) (EC)DHE shared secret (≤ 64 bytes). Avoids heap
+/// allocation.
 #[derive(Clone, Copy)]
 pub(crate) struct Secret {
     buf: [u8; MAX_SECRET],

@@ -35,6 +35,9 @@ u16_id!(
         SECP256R1 = 0x0017,
         /// x25519.
         X25519 = 0x001d,
+        /// X25519MLKEM768 hybrid (draft-ietf-tls-ecdhe-mlkem): ML-KEM-768
+        /// combined with X25519.
+        X25519MLKEM768 = 0x11ec,
     }
 );
 

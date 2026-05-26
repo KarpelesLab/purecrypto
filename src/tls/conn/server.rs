@@ -11,6 +11,7 @@ use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
 };
+use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
@@ -245,7 +246,12 @@ impl<R: RngCore> ServerConnection<R> {
         let shares = ext::parse_client_key_shares(ks_ext)?;
         let (group, client_pub) = shares
             .iter()
-            .find(|(g, _)| matches!(*g, NamedGroup::X25519 | NamedGroup::SECP256R1))
+            .find(|(g, _)| {
+                matches!(
+                    *g,
+                    NamedGroup::X25519MLKEM768 | NamedGroup::X25519 | NamedGroup::SECP256R1
+                )
+            })
             .ok_or(Error::HandshakeFailure)?;
 
         // Server random and ephemeral key share.
@@ -329,6 +335,31 @@ impl<R: RngCore> ServerConnection<R> {
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok((sk.public_key().to_sec1(), Secret::new(&shared)))
+            }
+            NamedGroup::X25519MLKEM768 => {
+                // Client share: ML-KEM-768 encapsulation key (1184) ‖ X25519 (32).
+                if client_pub.len() != ENCAPS_KEY_BYTES + 32 {
+                    return Err(Error::Decode);
+                }
+                let mut ek = [0u8; ENCAPS_KEY_BYTES];
+                ek.copy_from_slice(&client_pub[..ENCAPS_KEY_BYTES]);
+                let peer: [u8; 32] = client_pub[ENCAPS_KEY_BYTES..]
+                    .try_into()
+                    .map_err(|_| Error::Decode)?;
+
+                let (ct, ml_ss) =
+                    MlKem768EncapsKey::from_bytes(ek).encapsulate(&mut self.rng);
+                let sk = X25519PrivateKey::generate(&mut self.rng);
+                let x_ss = sk.diffie_hellman(&peer);
+
+                // Server share: ML-KEM ciphertext ‖ X25519 key.
+                let mut share = ct.to_bytes().to_vec();
+                share.extend_from_slice(&sk.public_key());
+                // Combined secret: ML-KEM shared secret first, then X25519.
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&ml_ss);
+                combined[32..].copy_from_slice(&x_ss);
+                Ok((share, Secret::new(&combined)))
             }
             _ => Err(Error::HandshakeFailure),
         }
