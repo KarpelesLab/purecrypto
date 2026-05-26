@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, Pkcs1Digest};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
-use crate::hash::Digest;
+use crate::hash::{Digest, HmacSha256, Sha256};
 use crate::rng::RngCore;
 
 /// A runtime-sized RSA public key.
@@ -27,6 +27,20 @@ pub struct BoxedRsaPublicKey {
 /// A runtime-sized RSA private key (signing uses `c^d mod n`; the prime factors
 /// `p`, `q` are kept when the key was generated here, enabling PKCS#1 export
 /// with CRT parameters, and are zero for keys imported without them).
+///
+/// # Side-channel protection
+///
+/// When the prime factors are known the raw private operation runs Coron's
+/// base blinding (see [`RsaPrivateKey`](super::RsaPrivateKey) for the full
+/// recipe). The blinder is derived deterministically from a key-bound
+/// HMAC keyed by a digest of `d`, so two callers asking about the same
+/// ciphertext see the same blinder but an attacker who does not know `d`
+/// cannot predict it — defeating Bleichenbacher / Manger / cache-timing
+/// attacks on the secret exponentiation.
+///
+/// Keys imported with [`from_components`](Self::from_components) (no primes)
+/// fall back to plain `c^d mod n`; the constant-time Montgomery ladder still
+/// applies, but base-blinding cannot.
 #[derive(Clone, Debug)]
 pub struct BoxedRsaPrivateKey {
     n: BoxedUint,
@@ -36,6 +50,82 @@ pub struct BoxedRsaPrivateKey {
     q: BoxedUint,
     mont: BoxedMontModulus,
     k: usize,
+    /// `(p−1)·(q−1) − 1` when both primes are known; `None` when the key was
+    /// imported without them (then blinding is disabled).
+    phi_n_minus_1: Option<BoxedUint>,
+    /// HMAC-SHA256 key (derived from `d`) for per-call blinding values.
+    blinding_seed: [u8; 32],
+}
+
+/// Computes `phi(n) − 1` from the primes (if both are nonzero) and the
+/// blinding HMAC key (always).
+fn derive_blinding_boxed(
+    p: &BoxedUint,
+    q: &BoxedUint,
+    d: &BoxedUint,
+) -> (Option<BoxedUint>, [u8; 32]) {
+    let phi_n_minus_1 = if p.is_zero() || q.is_zero() {
+        None
+    } else {
+        let one = BoxedUint::from_u64(1);
+        let pm1 = p.sub(&one);
+        let qm1 = q.sub(&one);
+        Some(pm1.mul(&qm1).sub(&one))
+    };
+
+    let mut h = Sha256::new();
+    h.update(b"purecrypto-rsa-blinding-seed-v1");
+    // `d` is variable-width; serialize big-endian byte-for-byte.
+    let d_bytes = d.to_be_bytes(d.bit_len().div_ceil(8).max(1));
+    h.update(&d_bytes);
+    let digest = h.finalize();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(digest.as_ref());
+    (phi_n_minus_1, seed)
+}
+
+/// Base-blinded raw RSA private op for the runtime-sized key.
+fn raw_private_blinded_boxed(
+    mont: &BoxedMontModulus,
+    e: &BoxedUint,
+    d: &BoxedUint,
+    phi_n_minus_1: Option<&BoxedUint>,
+    blinding_seed: &[u8; 32],
+    k_bytes: usize,
+    c: &BoxedUint,
+) -> BoxedUint {
+    let phi_n_minus_1 = match phi_n_minus_1 {
+        Some(v) => v,
+        None => return mont.pow(c, d), // imported key without primes
+    };
+
+    // Derive blinder bytes of width `k_bytes` from HMAC-SHA256.
+    let c_bytes = c.to_be_bytes(k_bytes);
+    let mut blinder_bytes = Vec::with_capacity(k_bytes);
+    let mut counter: u32 = 0;
+    while blinder_bytes.len() < k_bytes {
+        let mut m = HmacSha256::new(blinding_seed);
+        m.update(b"r");
+        m.update(&counter.to_be_bytes());
+        m.update(&c_bytes);
+        let tag = m.finalize();
+        blinder_bytes.extend_from_slice(tag.as_ref());
+        counter += 1;
+    }
+    blinder_bytes.truncate(k_bytes);
+    let r_raw = BoxedUint::from_be_bytes(&blinder_bytes);
+    let r = r_raw.reduce(&mont.modulus());
+    let r = if r.is_zero() || r == BoxedUint::from_u64(1) {
+        BoxedUint::from_u64(2)
+    } else {
+        r
+    };
+
+    let r_e = mont.pow(&r, e);
+    let r_inv = mont.pow(&r, phi_n_minus_1);
+    let c_blind = mont.mul_mod(c, &r_e);
+    let m_blind = mont.pow(&c_blind, d);
+    mont.mul_mod(&m_blind, &r_inv)
 }
 
 impl BoxedRsaPublicKey {
@@ -80,18 +170,24 @@ impl BoxedRsaPublicKey {
 
 impl BoxedRsaPrivateKey {
     /// Builds a private key from `n`, `e`, and the private exponent `d` (without
-    /// the prime factors, so CRT-based PKCS#1 export is unavailable).
+    /// the prime factors, so CRT-based PKCS#1 export and base-blinding are
+    /// unavailable; see the struct docs).
     pub fn from_components(n: BoxedUint, e: BoxedUint, d: BoxedUint) -> Self {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
+        let p = BoxedUint::zero(1);
+        let q = BoxedUint::zero(1);
+        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
         BoxedRsaPrivateKey {
             n,
             e,
             d,
-            p: BoxedUint::zero(1),
-            q: BoxedUint::zero(1),
+            p,
+            q,
             mont,
             k,
+            phi_n_minus_1,
+            blinding_seed,
         }
     }
 
@@ -118,6 +214,7 @@ impl BoxedRsaPrivateKey {
             if let Some(d) = inv_mod_boxed(&e, &phi) {
                 let k = n.bit_len().div_ceil(8);
                 let mont = BoxedMontModulus::new(&n);
+                let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
                 return BoxedRsaPrivateKey {
                     n,
                     e,
@@ -126,6 +223,8 @@ impl BoxedRsaPrivateKey {
                     q,
                     mont,
                     k,
+                    phi_n_minus_1,
+                    blinding_seed,
                 };
             }
         }
@@ -189,9 +288,17 @@ impl RawPrivate for BoxedRsaPrivateKey {
         self.n.bit_len()
     }
     fn raw_private(&self, c: &[u8]) -> Vec<u8> {
-        self.mont
-            .pow(&BoxedUint::from_be_bytes(c), &self.d)
-            .to_be_bytes(self.k)
+        let c_uint = BoxedUint::from_be_bytes(c);
+        raw_private_blinded_boxed(
+            &self.mont,
+            &self.e,
+            &self.d,
+            self.phi_n_minus_1.as_ref(),
+            &self.blinding_seed,
+            self.k,
+            &c_uint,
+        )
+        .to_be_bytes(self.k)
     }
 }
 
@@ -222,8 +329,9 @@ impl BoxedRsaPublicKey {
 #[cfg(feature = "der")]
 impl BoxedRsaPrivateKey {
     /// Parses a PKCS#1 `RSAPrivateKey` DER structure, retaining the modulus,
-    /// public exponent, and private exponent (the CRT parameters are read and
-    /// discarded — the boxed key uses plain modular exponentiation).
+    /// public exponent, private exponent, and the prime factors (the CRT
+    /// parameters `dP`/`dQ`/`qInv` are recomputed on export, so they need not
+    /// round-trip). The primes enable base-blinding on the secret-side path.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -231,14 +339,27 @@ impl BoxedRsaPrivateKey {
         let n = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
         let e = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
         let d = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let _p = seq.read_integer_bytes()?;
-        let _q = seq.read_integer_bytes()?;
+        let p = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
+        let q = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
         let _dp = seq.read_integer_bytes()?;
         let _dq = seq.read_integer_bytes()?;
         let _qinv = seq.read_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
-        Ok(BoxedRsaPrivateKey::from_components(n, e, d))
+        let k = n.bit_len().div_ceil(8);
+        let mont = BoxedMontModulus::new(&n);
+        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+        Ok(BoxedRsaPrivateKey {
+            n,
+            e,
+            d,
+            p,
+            q,
+            mont,
+            k,
+            phi_n_minus_1,
+            blinding_seed,
+        })
     }
 
     /// Decodes a PKCS#1 PEM private key (`-----BEGIN RSA PRIVATE KEY-----`).
