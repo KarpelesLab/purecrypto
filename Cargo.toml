@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "mlkem", "mldsa", "slhdsa", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -31,6 +31,10 @@ der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
 ec = ["bignum", "rng", "hash", "alloc"]
 tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "alloc"]
+# DTLS (RFC 6347 + RFC 9147). Builds on the `tls` stack — the record / replay /
+# reassembly / cookie chassis lives in `src/dtls/`, with version-specific
+# client and server state machines layered on top in later commits.
+dtls = ["tls"]
 # ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
 # the RNG trait are required.
 mlkem = ["hash", "rng"]

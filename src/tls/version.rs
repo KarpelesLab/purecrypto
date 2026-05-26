@@ -17,6 +17,12 @@ pub enum ProtocolVersion {
     TLSv1_2,
     /// TLS 1.3 (0x0304).
     TLSv1_3,
+    /// DTLS 1.0 (0xfeff). Listed for completeness; not implemented.
+    DTLSv1_0,
+    /// DTLS 1.2 (0xfefd). RFC 6347.
+    DTLSv1_2,
+    /// DTLS 1.3 (0xfefc). RFC 9147.
+    DTLSv1_3,
     /// An unrecognized version code.
     Unknown(u16),
 }
@@ -30,6 +36,9 @@ impl ProtocolVersion {
             ProtocolVersion::TLSv1_1 => 0x0302,
             ProtocolVersion::TLSv1_2 => 0x0303,
             ProtocolVersion::TLSv1_3 => 0x0304,
+            ProtocolVersion::DTLSv1_0 => 0xfeff,
+            ProtocolVersion::DTLSv1_2 => 0xfefd,
+            ProtocolVersion::DTLSv1_3 => 0xfefc,
             ProtocolVersion::Unknown(v) => v,
         }
     }
@@ -42,6 +51,9 @@ impl ProtocolVersion {
             0x0302 => ProtocolVersion::TLSv1_1,
             0x0303 => ProtocolVersion::TLSv1_2,
             0x0304 => ProtocolVersion::TLSv1_3,
+            0xfeff => ProtocolVersion::DTLSv1_0,
+            0xfefd => ProtocolVersion::DTLSv1_2,
+            0xfefc => ProtocolVersion::DTLSv1_3,
             other => ProtocolVersion::Unknown(other),
         }
     }
