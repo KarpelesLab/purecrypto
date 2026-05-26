@@ -23,6 +23,7 @@ mod gcm;
 mod kw;
 mod ofb;
 mod poly1305;
+pub(crate) mod salsa20;
 mod xts;
 
 pub use aes::{Aes128, Aes192, Aes256};
