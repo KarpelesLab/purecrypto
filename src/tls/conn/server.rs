@@ -166,6 +166,17 @@ impl<R: RngCore> ServerConnection<R> {
         self.core.send_close_notify();
     }
 
+    /// Test/internal hook: emit an arbitrary post-handshake handshake message
+    /// (e.g. a `NewSessionTicket`) under the application traffic key.
+    ///
+    /// Only valid once the handshake completes; the caller is responsible for
+    /// building a syntactically valid handshake message body.
+    #[cfg(test)]
+    pub(crate) fn emit_post_handshake(&mut self, message: alloc::vec::Vec<u8>) {
+        debug_assert!(matches!(self.state, State::Connected));
+        self.core.emit_handshake(message);
+    }
+
     /// Processes all buffered records, advancing the handshake.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
         loop {

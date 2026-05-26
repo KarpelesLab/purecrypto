@@ -21,7 +21,9 @@ mod error;
 mod pki;
 mod version;
 
-pub use conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+pub use conn::{
+    ClientConfig, ClientConnection, ReceivedSessionTicket, ServerConfig, ServerConnection,
+};
 #[cfg(feature = "std")]
 pub use conn::{Connection, Stream};
 pub use error::{Alert, AlertDescription, Error};
