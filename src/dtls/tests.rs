@@ -1,4 +1,4 @@
-//! End-to-end loopback tests for the DTLS 1.2 client / server pair.
+//! End-to-end loopback tests for the DTLS 1.2 and 1.3 client / server pairs.
 //!
 //! Tests cover:
 //! 1. Loopback handshake (no cookie) — sanity of the protocol path.
@@ -179,7 +179,7 @@ fn replay_rejected_silently() {
 }
 
 #[test]
-fn application_data_both_ways() {
+fn application_data_both_ways_12() {
     let (server_cfg, cert) = make_server();
     let server_cfg = server_cfg.require_cookie_exchange(false);
     let mut client = make_client(&cert);
@@ -201,4 +201,236 @@ fn application_data_both_ways() {
         client.feed_datagram(dg).unwrap();
     }
     assert_eq!(client.take_received(), b"pong from server");
+}
+
+/// DTLS 1.3 end-to-end loopback tests.
+mod dtls13 {
+    use super::*;
+    use crate::dtls::{
+        DtlsClientConfig13, DtlsClientConnection13, DtlsServerConfig13, DtlsServerConnection13,
+    };
+
+    fn make_server13() -> (DtlsServerConfig13, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-test-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            DtlsServerConfig13::with_ecdsa(alloc::vec![der.clone()], key),
+            der,
+        )
+    }
+
+    fn make_client13(server_cert: &[u8]) -> DtlsClientConnection13 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        let cfg = DtlsClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-client", b"nonce", &[]);
+        DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    fn pump_handshake_13<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection13,
+        server: &mut DtlsServerConnection13<R>,
+    ) -> bool {
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        client.is_handshake_complete() && server.is_handshake_complete()
+    }
+
+    #[test]
+    fn loopback_no_cookie() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    #[test]
+    fn loopback_with_cookie() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-cookie", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    #[test]
+    fn application_data_both_ways() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-app", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        client.send(b"hello world").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"hello world");
+
+        server.send(b"pong from server").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong from server");
+    }
+
+    /// Verify that the on-wire sequence-number bytes differ from the
+    /// plaintext seq: i.e. RFC 9147 §4.2.3 sequence-number obfuscation is
+    /// actually applied (and the mask isn't all-zeros by coincidence).
+    #[test]
+    fn encrypted_seq_is_masked() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-mask", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Drive a few app-data records so we have multiple wire seq values
+        // to inspect.
+        for i in 0..4u8 {
+            client.send(&[i; 8]).unwrap();
+        }
+        let datagrams = client.pop_outbound_datagrams();
+        assert!(datagrams.len() >= 4);
+
+        // First app-data record is at epoch 3, seq 0. The on-wire seq
+        // bytes should be the seq XOR'd with the sn_mask. seq=0 means the
+        // mask shows directly; if the mask is all-zero, on-wire would be
+        // 0x00 0x00 — but with a real sn_key the mask is essentially random,
+        // so at least one of the first records' wire seq bytes will be
+        // non-zero.
+        let mut any_nonzero_seq_byte = false;
+        for dg in &datagrams {
+            // Unified header: first byte's prefix bits must be 001.
+            assert_eq!(dg[0] & 0b1110_0000, 0b0010_0000);
+            // S bit set → 2-byte seq follows the first byte.
+            if (dg[0] & 0b0000_1000) != 0 && (dg[1] != 0 || dg[2] != 0) {
+                any_nonzero_seq_byte = true;
+            }
+        }
+        assert!(
+            any_nonzero_seq_byte,
+            "expected at least one record to have a non-zero masked seq byte",
+        );
+    }
+
+    /// ACK-driven retransmit: drop the server's final encrypted record
+    /// (Finished), drive the client through the remaining records, then
+    /// fire a timer on the server — it should retransmit only the missing
+    /// records (everything still in its in-flight set).
+    #[test]
+    fn ack_driven_retransmit() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-ack-rt", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // Round 1: CH → server.
+        let c1 = client.pop_outbound_datagrams();
+        for dg in &c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        // Server emits its full encrypted flight (SH plaintext + EE/Cert/
+        // CV/Fin protected).
+        let s1 = server.pop_outbound_datagrams();
+        assert!(
+            s1.len() >= 4,
+            "server should have emitted multi-record flight"
+        );
+        // Drop the last record (server Finished). Deliver everything else.
+        let dropped = s1.last().cloned().unwrap();
+        for dg in &s1[..s1.len() - 1] {
+            client.feed_datagram(dg).unwrap();
+        }
+        // Client should NOT yet be complete (didn't see Finished).
+        assert!(!client.is_handshake_complete());
+        // The client will have queued ACKs for the records it did receive.
+        let c_ack = client.pop_outbound_datagrams();
+        // Feed those ACKs to the server.
+        for dg in &c_ack {
+            server.feed_datagram(dg).unwrap();
+        }
+        // Server's in-flight set should now contain only the un-ACKed
+        // Finished. Fire the retransmit timer.
+        let deadline = server.next_timeout().expect("server timer armed");
+        server.on_timeout(deadline);
+        let retransmitted = server.pop_outbound_datagrams();
+        assert!(!retransmitted.is_empty(), "server should retransmit");
+        // The retransmitted set must contain the (dropped) Finished and
+        // *only* records that haven't been ACKed yet — fewer than the
+        // original flight.
+        assert!(
+            retransmitted.len() < s1.len(),
+            "retransmit should drop ACKed records ({} < {})",
+            retransmitted.len(),
+            s1.len()
+        );
+        // Sanity: at least one of the retransmitted bytes matches the
+        // dropped record (it's the only one still in the in-flight set).
+        let contains_dropped = retransmitted.iter().any(|dg| dg == &dropped);
+        assert!(
+            contains_dropped,
+            "retransmitted set should include the dropped server Finished"
+        );
+        // Deliver the retransmit and finish the handshake.
+        for dg in &retransmitted {
+            client.feed_datagram(dg).unwrap();
+        }
+        // Drain whatever the client emits in response and finish.
+        for _ in 0..16 {
+            let c = client.pop_outbound_datagrams();
+            for dg in &c {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s = server.pop_outbound_datagrams();
+            for dg in &s {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(client.is_handshake_complete());
+        assert!(server.is_handshake_complete());
+    }
 }

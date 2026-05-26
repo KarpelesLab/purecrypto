@@ -169,6 +169,52 @@ impl RecordCrypter {
         Ok(out)
     }
 
+    /// Per-record nonce for an externally-supplied sequence number. Mirrors
+    /// [`Self::next_nonce`] but does not advance the internal counter — used
+    /// by DTLS where seq is record-layer state, not crypter state.
+    fn nonce_for(&self, seq: u64) -> [u8; 12] {
+        let mut nonce = self.iv;
+        let s = seq.to_be_bytes();
+        for i in 0..8 {
+            nonce[4 + i] ^= s[i];
+        }
+        nonce
+    }
+
+    /// Raw-AEAD encrypt: nonce derived from `seq`, AAD supplied verbatim,
+    /// plaintext in `buf` (encrypted in place), returns the 16-byte tag.
+    ///
+    /// Intended for DTLS 1.3 (RFC 9147 §4.2.1), where the AAD is the
+    /// caller-supplied unified-header bytes and the per-record sequence
+    /// number is tracked by the record layer instead of the crypter.
+    pub(crate) fn encrypt_raw(
+        &mut self,
+        seq: u64,
+        aad: &[u8],
+        buf: &mut [u8],
+    ) -> Result<[u8; 16], Error> {
+        let nonce = self.nonce_for(seq);
+        Ok(self.aead.encrypt(&nonce, aad, buf))
+    }
+
+    /// Raw-AEAD decrypt mirroring [`Self::encrypt_raw`]. The seq is supplied
+    /// by the caller (DTLS reconstructs it from the masked wire value);
+    /// `aad` is the unified-header bytes; `buf` carries the ciphertext and
+    /// is decrypted in place.
+    pub(crate) fn decrypt_raw(
+        &mut self,
+        seq: u64,
+        aad: &[u8],
+        buf: &mut [u8],
+        tag: &[u8; 16],
+    ) -> Result<(), Error> {
+        let nonce = self.nonce_for(seq);
+        if !self.aead.decrypt(&nonce, aad, buf, tag) {
+            return Err(Error::BadRecordMac);
+        }
+        Ok(())
+    }
+
     /// Decrypts one record. `header` is the 5-byte `TLSCiphertext` header
     /// (used as AEAD additional data) and `fragment` is the encrypted record
     /// (ciphertext followed by the 16-byte tag). Returns the true content type
