@@ -43,6 +43,9 @@ enum ServerKey {
 pub struct ServerConfig {
     cert_chain: Vec<Vec<u8>>,
     key: ServerKey,
+    /// ALPN protocols this server accepts, in preference order. The server
+    /// picks its first entry that also appears in the client's offer.
+    alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl ServerConfig {
@@ -52,6 +55,7 @@ impl ServerConfig {
         ServerConfig {
             cert_chain,
             key: ServerKey::Rsa(key),
+            alpn_protocols: Vec::new(),
         }
     }
 
@@ -61,6 +65,7 @@ impl ServerConfig {
         ServerConfig {
             cert_chain,
             key: ServerKey::Ecdsa(key),
+            alpn_protocols: Vec::new(),
         }
     }
 
@@ -70,7 +75,16 @@ impl ServerConfig {
         ServerConfig {
             cert_chain,
             key: ServerKey::Ed25519(key),
+            alpn_protocols: Vec::new(),
         }
+    }
+
+    /// Sets the ALPN protocols this server is willing to negotiate, in
+    /// preference order. If the client offers ALPN with no overlap, the
+    /// handshake fails with `no_application_protocol`.
+    pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = protocols;
+        self
     }
 
     fn signature_scheme(&self) -> SignatureScheme {
@@ -109,6 +123,8 @@ pub struct ServerConnection<R: RngCore> {
     /// Current write-side (`server_application_traffic_secret_N`); stepped
     /// by each outgoing `KeyUpdate`.
     server_app_secret: Option<Secret>,
+    /// ALPN protocol the server picked from the client's offer.
+    alpn_negotiated: Option<Vec<u8>>,
     #[cfg(test)]
     server_hs_secret: Option<Secret>,
 }
@@ -126,6 +142,7 @@ impl<R: RngCore> ServerConnection<R> {
             client_hs_secret: None,
             client_app_secret: None,
             server_app_secret: None,
+            alpn_negotiated: None,
             #[cfg(test)]
             server_hs_secret: None,
         }
@@ -149,6 +166,11 @@ impl<R: RngCore> ServerConnection<R> {
     /// Whether the handshake is still in progress.
     pub fn is_handshaking(&self) -> bool {
         !matches!(self.state, State::Connected | State::Closed)
+    }
+
+    /// The ALPN protocol picked from the client's offer, if any.
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_negotiated.as_deref()
     }
 
     /// Sends application data (only valid once the handshake completes).
@@ -319,6 +341,22 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::HandshakeFailure);
         }
 
+        // ALPN: pick our first preference that appears in the client's offer.
+        // If the client offered ALPN but there's no overlap *and* we have any
+        // protocols configured, fail with `no_application_protocol`.
+        if let Some(client_alpn_body) = ext::find(&ch.extensions, ExtensionType::ALPN) {
+            let offered = ext::parse_alpn(client_alpn_body)?;
+            if !self.config.alpn_protocols.is_empty() {
+                let pick = self
+                    .config
+                    .alpn_protocols
+                    .iter()
+                    .find(|p| offered.iter().any(|o| o == *p))
+                    .ok_or(Error::NoApplicationProtocol)?;
+                self.alpn_negotiated = Some(pick.clone());
+            }
+        }
+
         self.core.transcript.set_alg(suite.hash);
         self.core.transcript.update(raw);
 
@@ -460,9 +498,18 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     fn send_encrypted_extensions(&mut self) {
-        // No extensions negotiated.
         let mut msg = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS];
-        with_len_u24(&mut msg, |b| with_len_u16(b, |_| {}));
+        with_len_u24(&mut msg, |b| {
+            with_len_u16(b, |exts| {
+                // ALPN, when negotiated, echoes the chosen protocol as a list
+                // of one entry per RFC 7301.
+                if let Some(p) = self.alpn_negotiated.as_ref() {
+                    let (ty, body) = ext::alpn_protocols(&[p.as_slice()]);
+                    crate::tls::codec::put_u16(exts, ty.0);
+                    crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
+                }
+            });
+        });
         self.core.emit_handshake(msg);
     }
 
@@ -567,6 +614,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         }
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
+        Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         _ => AlertDescription::HandshakeFailure,
     }
 }

@@ -351,6 +351,84 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after-server");
     }
 
+    /// ALPN: both sides negotiate `h2` when the server's preference also
+    /// includes it.
+    #[test]
+    fn alpn_negotiates_h2() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config =
+            server_config.with_alpn(alloc::vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"alpn-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"alpn-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(
+            ClientConfig::new(roots).with_alpn(alloc::vec![b"http/1.1".to_vec(), b"h2".to_vec()]),
+            "loopback.example",
+            &mut crng,
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(client.alpn_protocol(), Some(&b"h2"[..]));
+        assert_eq!(server.alpn_protocol(), Some(&b"h2"[..]));
+    }
+
+    /// ALPN: no overlap → server aborts with `no_application_protocol`.
+    #[test]
+    fn alpn_no_overlap_rejected() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config.with_alpn(alloc::vec![b"h3".to_vec()]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"alpn-bad-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"alpn-bad-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(
+            ClientConfig::new(roots).with_alpn(alloc::vec![b"http/1.1".to_vec()]),
+            "loopback.example",
+            &mut crng,
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                let r = server.process_new_packets();
+                if let Err(e) = r {
+                    assert!(matches!(e, crate::tls::Error::NoApplicationProtocol));
+                    return;
+                }
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        panic!("server should have rejected with NoApplicationProtocol");
+    }
+
     /// Builds a synthetic HelloRetryRequest record (handshake content type,
     /// plaintext): a `ServerHello` whose random is the HRR sentinel, carrying
     /// the given `selected_group` and the standard `supported_versions(TLS1.3)`.

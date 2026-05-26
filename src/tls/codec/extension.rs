@@ -60,6 +60,35 @@ pub(crate) fn signature_algorithms() -> RawExtension {
     (ExtensionType::SIGNATURE_ALGORITHMS, body)
 }
 
+/// `application_layer_protocol_negotiation` (RFC 7301): a list of
+/// `ProtocolName` byte strings (e.g. `b"h2"`, `b"http/1.1"`).
+pub(crate) fn alpn_protocols(protocols: &[&[u8]]) -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u16(&mut body, |list| {
+        for proto in protocols {
+            with_len_u8(list, |b| b.extend_from_slice(proto));
+        }
+    });
+    (ExtensionType::ALPN, body)
+}
+
+/// Parses an ALPN extension body. Returns the list of protocol names.
+pub(crate) fn parse_alpn(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
+    let mut outer = ReadCursor::new(body);
+    let list = outer.vec_u16()?;
+    outer.expect_empty()?;
+    let mut c = ReadCursor::new(list);
+    let mut out = Vec::new();
+    while !c.is_empty() {
+        let p = c.vec_u8()?;
+        if p.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
+        out.push(p.to_vec());
+    }
+    Ok(out)
+}
+
 /// `server_name` (SNI) carrying a single host name.
 pub(crate) fn server_name(host: &str) -> RawExtension {
     let mut body = Vec::new();

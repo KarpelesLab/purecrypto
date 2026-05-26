@@ -72,6 +72,8 @@ u16_id!(
         SUPPORTED_GROUPS = 0x000a,
         /// signature_algorithms.
         SIGNATURE_ALGORITHMS = 0x000d,
+        /// application_layer_protocol_negotiation (ALPN).
+        ALPN = 0x0010,
         /// supported_versions.
         SUPPORTED_VERSIONS = 0x002b,
         /// key_share.

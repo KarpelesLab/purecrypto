@@ -137,6 +137,9 @@ pub enum Error {
     /// The per-key record-sequence cap has been reached without a `KeyUpdate`.
     /// Maps to `internal_error`; the connection should rekey before continuing.
     TooManyRecords,
+    /// The peer's ALPN list contains nothing acceptable. Maps to
+    /// `no_application_protocol` (RFC 7301).
+    NoApplicationProtocol,
 }
 
 impl core::fmt::Display for Error {
@@ -154,6 +157,7 @@ impl core::fmt::Display for Error {
             Error::IllegalParameter => f.write_str("TLS illegal parameter"),
             Error::RecordOverflow => f.write_str("TLS record-size limit exceeded"),
             Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
+            Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
         }
     }
 }

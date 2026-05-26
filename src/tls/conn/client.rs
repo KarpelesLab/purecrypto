@@ -42,6 +42,9 @@ pub struct ClientConfig {
     /// system clock under the `std` feature; set it explicitly for `no_std`
     /// targets or for reproducible verification.
     pub verification_time: Option<Time>,
+    /// ALPN protocols to offer (RFC 7301), in preference order. Empty
+    /// suppresses the extension. Example: `[b"h2".to_vec(), b"http/1.1".to_vec()]`.
+    pub alpn_protocols: Vec<Vec<u8>>,
 }
 
 impl ClientConfig {
@@ -52,7 +55,16 @@ impl ClientConfig {
             roots,
             verify_certificates: true,
             verification_time: None,
+            alpn_protocols: Vec::new(),
         }
+    }
+
+    /// Offers the given ALPN protocols. The first match in the server's
+    /// preference order is selected; if there's no overlap, the server
+    /// sends `no_application_protocol`.
+    pub fn with_alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = protocols;
+        self
     }
 }
 
@@ -123,6 +135,10 @@ pub struct ClientConnection {
     /// servers (Cloudflare, Google, …) commonly send one immediately after
     /// `Finished`; we accept and stash it. Used by future PSK resumption.
     last_ticket: Option<ReceivedSessionTicket>,
+
+    /// The ALPN protocol the server picked from our advertised list, if any.
+    /// Populated from the server's `EncryptedExtensions`.
+    alpn_negotiated: Option<Vec<u8>>,
 }
 
 /// A `NewSessionTicket` received from the server, exposed for inspection and
@@ -207,6 +223,11 @@ impl ClientConnection {
     pub fn last_session_ticket(&self) -> Option<&ReceivedSessionTicket> {
         self.last_ticket.as_ref()
     }
+
+    /// The ALPN protocol the server selected, if any (e.g. `b"h2"`).
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_negotiated.as_deref()
+    }
 }
 
 impl ClientConnection {
@@ -268,6 +289,7 @@ impl ClientConnection {
             cert_chain: Vec::new(),
             leaf_key: None,
             last_ticket: None,
+            alpn_negotiated: None,
         };
         let hello =
             conn.build_client_hello(random, String::from(server_name), suites, groups, &[], &[]);
@@ -316,6 +338,15 @@ impl ClientConnection {
             ext::client_supported_versions(),
             ext::client_key_shares(&key_shares),
         ];
+        if !self.config.alpn_protocols.is_empty() {
+            let protos: alloc::vec::Vec<&[u8]> = self
+                .config
+                .alpn_protocols
+                .iter()
+                .map(|v| v.as_slice())
+                .collect();
+            extensions.push(ext::alpn_protocols(&protos));
+        }
         extensions.extend_from_slice(extra_extensions);
         ClientHello {
             random,
@@ -687,7 +718,30 @@ impl ClientConnection {
         if msg_type != hs_type::ENCRYPTED_EXTENSIONS {
             return Err(Error::UnexpectedMessage);
         }
-        // The contents (ALPN, server-name ack, etc.) are not acted on yet.
+        // Parse the EE body to extract ALPN, ignoring others.
+        // The handshake body lives in raw[4..] (4-byte header).
+        if raw.len() >= 4 {
+            let body = &raw[4..];
+            let mut c = ReadCursor::new(body);
+            let exts_bytes = c.vec_u16()?;
+            let mut ec = ReadCursor::new(exts_bytes);
+            while !ec.is_empty() {
+                let ty = ec.u16()?;
+                let ext_body = ec.vec_u16()?;
+                if ty == crate::tls::codec::ExtensionType::ALPN.0 {
+                    let names = ext::parse_alpn(ext_body)?;
+                    if names.len() != 1 {
+                        // RFC 7301: server MUST select exactly one protocol.
+                        return Err(Error::IllegalParameter);
+                    }
+                    // The picked protocol must have been in our offer.
+                    if !self.config.alpn_protocols.iter().any(|p| p == &names[0]) {
+                        return Err(Error::IllegalParameter);
+                    }
+                    self.alpn_negotiated = Some(names.into_iter().next().unwrap());
+                }
+            }
+        }
         self.core.transcript.update(raw);
         self.state = State::WaitCertificate;
         Ok(())
@@ -814,6 +868,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         }
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
+        Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         _ => AlertDescription::HandshakeFailure,
     }
 }
