@@ -82,7 +82,7 @@ fn extensions(is_ca: bool, dns_names: &[&str]) -> Vec<u8> {
 /// Builds the DER `TBSCertificate` from a pre-encoded subject
 /// `SubjectPublicKeyInfo` and inner `signature` AlgorithmIdentifier.
 #[allow(clippy::too_many_arguments)]
-fn build_tbs_raw(
+pub(crate) fn build_tbs_raw(
     serial: u64,
     issuer: &DistinguishedName,
     subject: &DistinguishedName,
@@ -357,6 +357,46 @@ impl Certificate {
         Ok(seq)
     }
 
+    /// Returns the DER bytes of the inner `signature` AlgorithmIdentifier
+    /// inside `TBSCertificate` (RFC 5280 §4.1.2.3). The outer
+    /// `signatureAlgorithm` MUST match these bytes byte-for-byte; a
+    /// difference indicates an algorithm-substitution attempt and triggers
+    /// rejection in [`check_signature_algid_consistent`].
+    pub(crate) fn inner_signature_algid_der(&self) -> Result<&[u8], Error> {
+        let tbs = self.parts()?.tbs;
+        let mut outer = Reader::new(tbs);
+        let mut seq = outer.read_sequence()?;
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_tlv(tag::context(0))?;
+        }
+        seq.read_integer_bytes()?;
+        let bytes = seq.read_element()?;
+        Ok(bytes)
+    }
+
+    /// Returns the DER bytes of the outer `signatureAlgorithm`
+    /// AlgorithmIdentifier (RFC 5280 §4.1.1.2).
+    pub(crate) fn outer_signature_algid_der(&self) -> Result<&[u8], Error> {
+        let mut outer = Reader::new(&self.der);
+        let mut cert = outer.read_sequence()?;
+        cert.read_element()?; // skip TBSCertificate
+        let bytes = cert.read_element()?;
+        Ok(bytes)
+    }
+
+    /// RFC 5280 §4.1.1.2: the inner and outer signature AlgorithmIdentifier
+    /// fields MUST be identical. We compare the raw DER (parameters
+    /// included), which catches both OID and parameter mismatches.
+    pub(crate) fn check_signature_algid_consistent(&self) -> Result<(), Error> {
+        let inner = self.inner_signature_algid_der()?;
+        let outer = self.outer_signature_algid_der()?;
+        if inner == outer {
+            Ok(())
+        } else {
+            Err(Error::Malformed)
+        }
+    }
+
     /// The certificate issuer.
     pub fn issuer(&self) -> Result<DistinguishedName, Error> {
         let mut seq = self.tbs_after_algid()?;
@@ -522,6 +562,21 @@ impl Certificate {
                     let raw = seq.read_oid()?;
                     out.push(parse_oid(raw)?);
                 }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walks the certificate's extensions and returns the OIDs of every entry
+    /// marked `critical = true`. Used by chain validation to enforce RFC 5280
+    /// §4.2: any critical extension the verifier doesn't understand must
+    /// cause the certificate to be rejected.
+    pub(crate) fn critical_extension_oids(&self) -> Result<Vec<Vec<u64>>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, critical, _value| {
+            if critical {
+                out.push(id.to_vec());
             }
             Ok(())
         })?;

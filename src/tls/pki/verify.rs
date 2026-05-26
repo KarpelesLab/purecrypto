@@ -11,6 +11,13 @@
 //!     (or it cannot issue subordinates),
 //!   * `pathLenConstraint`, when present on a non-leaf, bounds the number
 //!     of intermediates that may follow it,
+//!   * the inner `signature` AlgorithmIdentifier inside `TBSCertificate`
+//!     MUST equal the outer `signatureAlgorithm` (RFC 5280 §4.1.1.2 /
+//!     §4.1.2.3),
+//!   * any `critical` extension we don't understand MUST cause rejection
+//!     (RFC 5280 §4.2),
+//!   * every non-leaf MUST have `keyUsage.keyCertSign` when it carries a
+//!     `keyUsage` extension (RFC 5280 §4.2.1.3),
 //!   * if the leaf carries a `keyUsage` extension it must include
 //!     `digitalSignature` (TLS 1.3 servers authenticate with a signature),
 //!   * if the leaf carries an `extKeyUsage` extension it must include
@@ -28,6 +35,15 @@ use alloc::vec::Vec;
 
 /// `keyUsage` bit-0 `digitalSignature` (RFC 5280 §4.2.1.3).
 const KU_DIGITAL_SIGNATURE: u16 = 0x80; // bit 0 in BIT STRING wire order = MSB of byte 0
+/// `keyUsage` bit-5 `keyCertSign`.
+const KU_KEY_CERT_SIGN: u16 = 0x04;
+
+/// Upper bound on the length of a peer-supplied certificate chain. Each cert
+/// triggers a signature verification (RSA / ECDSA / PQ) plus repeated DN
+/// parsing; an unbounded chain is a DoS vector during TLS handshake. The
+/// value is generous — production CAs rarely exceed 4 — but caps the worst
+/// case at a few milliseconds of verification work.
+const MAX_CHAIN_LEN: usize = 10;
 
 /// Verifies a certificate `chain` (end-entity first) against `store` and, on
 /// success, returns the end-entity (leaf) public key — the key whose possession
@@ -50,12 +66,29 @@ pub(crate) fn verify_chain(
     if chain.is_empty() {
         return Err(Error::BadCertificate);
     }
+    // Cap the chain length to bound verification cost (DoS protection).
+    if chain.len() > MAX_CHAIN_LEN {
+        return Err(Error::BadCertificate);
+    }
 
     let certs: Vec<Certificate> = chain
         .iter()
         .map(|der| Certificate::from_der(der.clone()))
         .collect::<Result<_, _>>()
         .map_err(|_| Error::BadCertificate)?;
+
+    // RFC 5280 §4.1.1.2 / §4.1.2.3: inner `signature` AlgorithmIdentifier in
+    // TBSCertificate MUST equal outer `signatureAlgorithm`.
+    for cert in &certs {
+        cert.check_signature_algid_consistent()
+            .map_err(|_| Error::BadCertificate)?;
+    }
+
+    // RFC 5280 §4.2: any extension marked `critical` whose OID we do not
+    // understand requires rejection.
+    for cert in &certs {
+        check_critical_extensions_recognized(cert)?;
+    }
 
     // Each certificate must currently be within its validity period.
     if let Some(now) = now {
@@ -119,6 +152,8 @@ fn verify_cert_against_issuer(
 
 /// Per-position chain constraints:
 ///   * every non-leaf must have `basicConstraints.cA = true`;
+///   * every non-leaf with a `keyUsage` extension must include `keyCertSign`
+///     (RFC 5280 §4.2.1.3);
 ///   * `pathLenConstraint` on a non-leaf bounds the number of intermediates
 ///     between it and the leaf;
 ///   * if the leaf carries `keyUsage`, `digitalSignature` (bit 0) must be set;
@@ -134,6 +169,13 @@ fn enforce_constraints(certs: &[Certificate]) -> Result<(), Error> {
             .map_err(|_| Error::BadCertificate)?
             .ok_or(Error::BadCertificate)?;
         if !bc.0 {
+            return Err(Error::BadCertificate);
+        }
+        // If a `keyUsage` extension is present, `keyCertSign` (bit 5) MUST
+        // be set for this CA to sign certificates (RFC 5280 §4.2.1.3).
+        if let Some(mask) = cert.key_usage().map_err(|_| Error::BadCertificate)?
+            && (mask & KU_KEY_CERT_SIGN) == 0
+        {
             return Err(Error::BadCertificate);
         }
         // `pathLenConstraint = N` permits at most N intermediate certificates
@@ -160,6 +202,29 @@ fn enforce_constraints(certs: &[Certificate]) -> Result<(), Error> {
         .extended_key_usages()
         .map_err(|_| Error::BadCertificate)?;
     if !ekus.is_empty() && !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_SERVER_AUTH) {
+        return Err(Error::BadCertificate);
+    }
+    Ok(())
+}
+
+/// RFC 5280 §4.2: reject the certificate if it carries any critical extension
+/// whose OID we don't recognize. The handler set (basicConstraints, keyUsage,
+/// extKeyUsage, subjectAltName) is intentionally narrow — every critical
+/// extension outside this set is treated as "we cannot enforce this
+/// constraint", which must result in rejection.
+fn check_critical_extensions_recognized(cert: &Certificate) -> Result<(), Error> {
+    let critical = cert
+        .critical_extension_oids()
+        .map_err(|_| Error::BadCertificate)?;
+    for o in critical {
+        let bytes = o.as_slice();
+        if bytes == oid::BASIC_CONSTRAINTS
+            || bytes == oid::KEY_USAGE
+            || bytes == oid::EXT_KEY_USAGE
+            || bytes == oid::SUBJECT_ALT_NAME
+        {
+            continue;
+        }
         return Err(Error::BadCertificate);
     }
     Ok(())
@@ -528,32 +593,35 @@ mod tests {
         use crate::hash::Sha1;
         use crate::rsa::Pkcs1Digest;
         use crate::test_util::rsa_test_key_a;
-        use crate::x509::{Certificate, algorithm_identifier};
+        use crate::x509::cert::build_tbs_raw;
+        use crate::x509::{AnyPublicKey, Certificate, algorithm_identifier};
 
-        // Hand-craft a SHA-1-RSA self-signed cert by taking the TBS of a
-        // SHA-256 self-signed cert and re-signing it under SHA-1 with the
-        // appropriate signatureAlgorithm OID. (The TBS's inner signature
-        // algorithm OID is therefore `sha256WithRSAEncryption`; real legacy
-        // chains have both inner and outer set to SHA-1-RSA. Both forms
-        // exist in the wild and either should trigger the policy gate.)
-        let key = rsa_test_key_a();
-        let base = Certificate::self_signed(
-            &key,
-            &DistinguishedName::common_name("legacy.example"),
-            &validity(),
-            1,
-            true,
-        )
-        .unwrap();
-        // Pull the TBS bytes out and re-sign under SHA-1.
-        let mut r = crate::der::Reader::new(base.to_der());
-        let mut cert = r.read_sequence().unwrap();
-        let tbs = cert.read_element().unwrap();
-        let sig = key.sign_pkcs1v15::<Sha1>(tbs).unwrap();
-        // Sanity-check the DigestInfo prefix length matches the SHA-1 entry.
+        // Build a fully-consistent SHA-1-RSA self-signed cert: inner and
+        // outer signature AlgorithmIdentifiers are BOTH `sha1WithRSAEncryption`
+        // (RFC 5280 §4.1.1.2 requires equality, and chain validation enforces
+        // it). The earlier version of this test crafted a mismatch on purpose
+        // and is now rejected at the algid-consistency check before ever
+        // reaching the policy whitelist — that's the desired behavior.
         assert_eq!(Sha1::DIGEST_INFO_PREFIX.len(), 15);
+        let key = rsa_test_key_a();
+        let subj = DistinguishedName::common_name("legacy.example");
+        // Wrap the const-generic public key into a BoxedRsaPublicKey so we
+        // can use the AnyPublicKey SPKI encoder.
+        let mut n_bytes = alloc::vec![0u8; 256];
+        key.public_key().modulus().write_be_bytes(&mut n_bytes);
+        let mut e_bytes = alloc::vec![0u8; 256];
+        key.public_key().exponent().write_be_bytes(&mut e_bytes);
+        let boxed_pub = crate::rsa::BoxedRsaPublicKey::new(
+            crate::bignum::BoxedUint::from_be_bytes(&n_bytes),
+            crate::bignum::BoxedUint::from_be_bytes(&e_bytes),
+        );
+        let spki = AnyPublicKey::Rsa(boxed_pub).to_spki_der();
         let algid = algorithm_identifier(oid::SHA1_WITH_RSA, true);
-        let der = encode_sequence(&[tbs.to_vec(), algid, encode_bit_string(&sig)].concat());
+        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &algid, true, &[]);
+        let sig = key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
+        let der = encode_sequence(
+            &[tbs.clone(), algid.clone(), encode_bit_string(&sig)].concat(),
+        );
         let legacy = Certificate::from_der(der).unwrap();
 
         let mut store = RootCertStore::new();
@@ -567,6 +635,51 @@ mod tests {
         // Opt-in permits.
         let with_sha1 = SignaturePolicy::modern().permit("rsa-pkcs1-sha1");
         verify_chain(&store, &[legacy.to_der().to_vec()], None, &with_sha1).unwrap();
+    }
+
+    /// A certificate whose inner `signature` AlgorithmIdentifier differs from
+    /// its outer `signatureAlgorithm` is rejected at the consistency check,
+    /// even when the signature itself would verify (RFC 5280 §4.1.1.2 /
+    /// §4.1.2.3).
+    #[test]
+    fn rejects_inner_outer_algid_mismatch() {
+        use crate::der::{encode_bit_string, encode_sequence};
+        use crate::hash::Sha1;
+        use crate::rsa::Pkcs1Digest;
+        use crate::test_util::rsa_test_key_a;
+        use crate::x509::cert::build_tbs_raw;
+        use crate::x509::{AnyPublicKey, Certificate, algorithm_identifier};
+        assert_eq!(Sha1::DIGEST_INFO_PREFIX.len(), 15);
+        let key = rsa_test_key_a();
+        let subj = DistinguishedName::common_name("mismatch.example");
+        // Wrap the const-generic public key into a BoxedRsaPublicKey so we
+        // can use the AnyPublicKey SPKI encoder.
+        let mut n_bytes = alloc::vec![0u8; 256];
+        key.public_key().modulus().write_be_bytes(&mut n_bytes);
+        let mut e_bytes = alloc::vec![0u8; 256];
+        key.public_key().exponent().write_be_bytes(&mut e_bytes);
+        let boxed_pub = crate::rsa::BoxedRsaPublicKey::new(
+            crate::bignum::BoxedUint::from_be_bytes(&n_bytes),
+            crate::bignum::BoxedUint::from_be_bytes(&e_bytes),
+        );
+        let spki = AnyPublicKey::Rsa(boxed_pub).to_spki_der();
+        // Inner = SHA-256, outer = SHA-1 — historically common in attempted
+        // algorithm-substitution attacks.
+        let inner = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let outer = algorithm_identifier(oid::SHA1_WITH_RSA, true);
+        let tbs = build_tbs_raw(1, &subj, &subj, &validity(), &spki, &inner, true, &[]);
+        let sig = key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, outer, encode_bit_string(&sig)].concat());
+        let mismatched = Certificate::from_der(der).unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(mismatched.to_der().to_vec()).unwrap();
+
+        let with_sha1 = SignaturePolicy::modern().permit("rsa-pkcs1-sha1");
+        assert!(matches!(
+            verify_chain(&store, &[mismatched.to_der().to_vec()], None, &with_sha1),
+            Err(Error::BadCertificate)
+        ));
     }
 
     /// A chain whose signature algorithm is in the registry but not on the

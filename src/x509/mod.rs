@@ -5,7 +5,7 @@
 //! certificates from a CA key, and parsing + signature verification, using
 //! RSA with PKCS#1 v1.5 signatures.
 
-mod cert;
+pub(crate) mod cert;
 mod csr;
 mod name;
 mod pubkey;
