@@ -102,6 +102,14 @@ pub(crate) fn parse_server_key_share(body: &[u8]) -> Result<(NamedGroup, Vec<u8>
     Ok((group, key))
 }
 
+/// Parses a HelloRetryRequest `key_share` (just a `selected_group` u16).
+pub(crate) fn parse_hrr_key_share(body: &[u8]) -> Result<NamedGroup, Error> {
+    let mut c = ReadCursor::new(body);
+    let group = NamedGroup(c.u16()?);
+    c.expect_empty()?;
+    Ok(group)
+}
+
 /// Parses a ClientHello `key_share` (a list of `KeyShareEntry`).
 pub(crate) fn parse_client_key_shares(body: &[u8]) -> Result<Vec<(NamedGroup, Vec<u8>)>, Error> {
     let mut outer = ReadCursor::new(body);

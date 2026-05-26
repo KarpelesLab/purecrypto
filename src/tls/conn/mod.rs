@@ -351,6 +351,153 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"after-server");
     }
 
+    /// Builds a synthetic HelloRetryRequest record (handshake content type,
+    /// plaintext): a `ServerHello` whose random is the HRR sentinel, carrying
+    /// the given `selected_group` and the standard `supported_versions(TLS1.3)`.
+    fn synthetic_hrr_record(suite: CipherSuite, selected_group: NamedGroup) -> Vec<u8> {
+        use crate::tls::codec::{ExtensionType, ServerHello, hs_type, put_u16};
+        // HRR magic random from RFC 8446 §4.1.3.
+        let hrr_random: [u8; 32] = [
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ];
+
+        // key_share extension body: selected_group u16.
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, selected_group.0);
+
+        // supported_versions extension body: 0x0304.
+        let sv_body = alloc::vec![0x03, 0x04];
+
+        let sh = ServerHello {
+            random: hrr_random,
+            session_id: Vec::new(),
+            cipher_suite: suite,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, sv_body),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let body = sh.encode();
+        assert_eq!(body[0], hs_type::SERVER_HELLO);
+
+        // Wrap as a handshake-type plaintext record.
+        let mut out = Vec::new();
+        crate::tls::codec::write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &body,
+        );
+        out
+    }
+
+    /// The client processes a HelloRetryRequest: it rewrites its transcript,
+    /// re-emits a ClientHello narrowed to the HRR-selected group, and is
+    /// willing to continue.
+    #[test]
+    fn accepts_hello_retry_request_and_resends() {
+        use crate::tls::codec::{ClientHello, ExtensionType, ReadCursor, read_handshake};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-client", b"nonce", &[]);
+        // Offer X25519 and SECP256R1; the server will "demand" SECP256R1.
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+
+        // Drop the initial ClientHello so we can inspect the retry independently.
+        let _ch1 = client.write_tls();
+
+        // Feed the synthetic HRR forcing SECP256R1.
+        let hrr = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
+        client.read_tls(&hrr);
+        client.process_new_packets().unwrap();
+
+        // The client must have emitted CH2. Pull it out and verify it carries
+        // exactly one key_share entry for SECP256R1.
+        let ch2_record = client.write_tls();
+        assert!(!ch2_record.is_empty(), "client must emit CH2 after HRR");
+        // The record is plaintext handshake; skip the 5-byte record header.
+        let body = &ch2_record[5..];
+        let mut c = ReadCursor::new(body);
+        let (ty, hsbody) = read_handshake(&mut c).unwrap();
+        assert_eq!(ty, crate::tls::codec::hs_type::CLIENT_HELLO);
+        let ch2 = ClientHello::decode(hsbody).unwrap();
+        // Locate the key_share extension and confirm its single entry is SECP256R1.
+        let ks_ext = ch2
+            .extensions
+            .iter()
+            .find(|(t, _)| *t == ExtensionType::KEY_SHARE)
+            .expect("CH2 has key_share");
+        let shares = crate::tls::codec::extension::parse_client_key_shares(&ks_ext.1).unwrap();
+        assert_eq!(shares.len(), 1, "exactly one share in CH2");
+        assert_eq!(shares[0].0, NamedGroup::SECP256R1);
+    }
+
+    /// A second HelloRetryRequest is rejected with `unexpected_message`
+    /// (RFC 8446 §4.1.4).
+    #[test]
+    fn rejects_second_hello_retry_request() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr2-client", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+        let _ch1 = client.write_tls();
+
+        // First HRR — accepted.
+        let hrr1 = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
+        client.read_tls(&hrr1);
+        client.process_new_packets().unwrap();
+        let _ch2 = client.write_tls();
+
+        // Second HRR — must be rejected.
+        let hrr2 = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::X25519);
+        client.read_tls(&hrr2);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
+    }
+
+    /// A HRR pointing at a group we did NOT offer is rejected with
+    /// `illegal_parameter`.
+    #[test]
+    fn rejects_hrr_unoffered_group() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-bad-client", b"nonce", &[]);
+        // Offer only X25519. The HRR will ask for SECP256R1.
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let _ch1 = client.write_tls();
+        let hrr = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
+        client.read_tls(&hrr);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
     /// A `KeyUpdate` body byte that is neither 0 nor 1 is rejected with
     /// `illegal_parameter` (RFC 8446 §4.6.3).
     #[test]
