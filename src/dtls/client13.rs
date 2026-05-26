@@ -39,7 +39,7 @@ use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, Transcript, certificate_verify_content,
     expand_label_dyn, finished_verify_data, verify_signature,
 };
-use crate::tls::pki::{RootCertStore, verify_chain, verify_hostname};
+use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -89,6 +89,8 @@ pub struct DtlsClientConfig13 {
     /// Wall-clock used to evaluate certificate validity. `None` uses the
     /// system clock under `std`.
     pub verification_time: Option<Time>,
+    /// CRLs consulted during chain validation. Empty by default.
+    pub crls: CrlStore,
 }
 
 impl DtlsClientConfig13 {
@@ -103,7 +105,14 @@ impl DtlsClientConfig13 {
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
             verify_certificates: true,
             verification_time: None,
+            crls: CrlStore::new(),
         }
+    }
+
+    /// Installs a [`CrlStore`] consulted during chain validation.
+    pub fn with_crls(mut self, crls: CrlStore) -> Self {
+        self.crls = crls;
+        self
     }
 
     /// Sets the verification clock (use on `no_std` targets).
@@ -708,8 +717,9 @@ impl DtlsClientConnection13 {
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone();
-            let key = verify_chain(
+            let key = verify_chain_with_crls(
                 &self.config.roots,
+                &self.config.crls,
                 &self.cert_chain,
                 now.as_ref(),
                 &self.config.signature_policy,

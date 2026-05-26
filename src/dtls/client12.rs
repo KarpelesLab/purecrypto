@@ -29,7 +29,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
 use crate::tls::crypto::{HashAlg, Transcript, verify_signature};
-use crate::tls::pki::{RootCertStore, verify_chain};
+use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls};
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -71,6 +71,8 @@ pub struct DtlsClientConfig12 {
     pub server_name: String,
     /// Allowed signature algorithms in the chain + SKE signature.
     pub signature_policy: SignaturePolicy,
+    /// CRLs consulted during chain validation. Empty by default.
+    pub crls: CrlStore,
 }
 
 impl DtlsClientConfig12 {
@@ -83,7 +85,14 @@ impl DtlsClientConfig12 {
             verification_time: None,
             server_name: String::from(server_name),
             signature_policy: SignaturePolicy::modern(),
+            crls: CrlStore::new(),
         }
+    }
+
+    /// Installs a [`CrlStore`] consulted during chain validation.
+    pub fn with_crls(mut self, crls: CrlStore) -> Self {
+        self.crls = crls;
+        self
     }
 
     /// Sets the verification clock (use on `no_std` targets).
@@ -542,8 +551,9 @@ impl DtlsClientConnection12 {
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone();
-            verify_chain(
+            verify_chain_with_crls(
                 &self.config.roots,
+                &self.config.crls,
                 &chain,
                 now.as_ref(),
                 &self.config.signature_policy,
