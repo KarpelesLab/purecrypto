@@ -55,9 +55,9 @@ Single crate, modules gated by Cargo features:
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
 | X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
-| TLS              | `tls`       | ✅ TLS 1.3 client + server (sans-I/O core + blocking TCP `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid; AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window; mTLS / client certificate authentication; HelloRetryRequest; bidirectional KeyUpdate; RFC 8448 KATs. _Missing: TLS 1.2, DTLS._ |
+| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest; bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
 | C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA, ECDSA & Ed25519 keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
-| CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server` |
+| CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 
 ## Cargo features
 
@@ -234,6 +234,47 @@ purecrypto s_server -cert server.pem -key server.key -accept 8443 \
                     -Verify client-ca.pem
 ```
 
+### TLS 1.2
+
+`s_client` / `s_server` default to TLS 1.3. Pass `-tls1_2` on either side
+to force TLS 1.2. The TLS 1.2 path is ECDHE-AEAD only (AES-GCM and
+ChaCha20-Poly1305) and supports mTLS plus RFC 5077 session tickets.
+
+```sh
+# Server (TLS 1.2)
+purecrypto s_server -tls1_2 -accept 0.0.0.0:4443 -cert cert.pem -key key.pem
+
+# Client (TLS 1.2)
+purecrypto s_client -tls1_2 -connect example.com:443 -CAfile roots.pem
+```
+
+### DTLS — `s_dtls_client` / `s_dtls_server`
+
+DTLS runs the TLS handshake over UDP. Either use the dedicated
+`s_dtls_client` / `s_dtls_server` binaries, or pass `-dtls1_2` / `-dtls1_3`
+to `s_client` / `s_server`. The two forms are equivalent.
+
+```sh
+# DTLS 1.2 echo
+purecrypto s_dtls_server -dtls1_2 -accept 0.0.0.0:5684 -cert cert.pem -key key.pem
+purecrypto s_dtls_client -dtls1_2 -connect localhost:5684
+
+# DTLS 1.3 echo
+purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.pem
+purecrypto s_dtls_client -dtls1_3 -connect localhost:5685
+
+# Equivalent via s_client / s_server with version flags
+purecrypto s_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.pem
+purecrypto s_client -dtls1_3 -connect localhost:5685
+```
+
+The DTLS server stands up a HelloVerifyRequest cookie exchange (1.2) or
+HelloRetryRequest cookie (1.3) before allocating any per-connection
+state, and both directions install a 64-bit sliding-window replay
+filter once the handshake-protected keys are in place. The default
+record size is 1200 bytes to stay below common path MTUs; override with
+`-mtu`.
+
 ### Cookbook
 
 End-to-end CA + leaf with EC keys:
@@ -306,6 +347,35 @@ let (ct, ss_a) = ek.encapsulate(&mut OsRng);
 let ss_b = dk.decapsulate(&ct);
 assert_eq!(ss_a, ss_b);
 ```
+
+### Versions and transports
+
+`purecrypto` ships both TLS (TCP) and DTLS (UDP) at two protocol
+versions each:
+
+| Version | Transport | Client                          | Server                          |
+|---------|-----------|---------------------------------|---------------------------------|
+| TLS 1.2 | TCP       | `tls::ClientConnection12`       | `tls::ServerConnection12`       |
+| TLS 1.3 | TCP       | `tls::ClientConnection`         | `tls::ServerConnection`         |
+| DTLS 1.2| UDP       | `dtls::DtlsClientConnection12`  | `dtls::DtlsServerConnection12`  |
+| DTLS 1.3| UDP       | `dtls::DtlsClientConnection13`  | `dtls::DtlsServerConnection13`  |
+
+- **TLS 1.2** is ECDHE-AEAD only (AES-128/256-GCM, ChaCha20-Poly1305) —
+  no static RSA, no static DH, no CBC. Forward secrecy by construction.
+  Includes mTLS and RFC 5077 stateless session tickets.
+- **TLS 1.3** is the full RFC 8446 with PSK resumption, 0-RTT,
+  exporter, ALPN, mTLS, and downgrade-detection.
+- **DTLS 1.2** (RFC 6347) carries the TLS 1.2 handshake over UDP with
+  HelloVerifyRequest cookies, handshake fragmentation/reassembly,
+  replay protection, and retransmission. Currently restricted to the
+  `ECDHE-ECDSA-AES128-GCM-SHA256` suite + X25519 + ECDSA server certs.
+- **DTLS 1.3** (RFC 9147) carries the TLS 1.3 handshake over UDP with
+  selective ACK reliability, encrypted sequence numbers, and a
+  HelloRetryRequest cookie. Currently restricted to
+  `AES-128-GCM-SHA256` + X25519 + ECDSA server certs.
+- Both DTLS variants accept additional cipher suites / groups /
+  signature schemes as follow-up commits — the underlying primitives
+  and the chassis are already present.
 
 ### TLS 1.3
 
