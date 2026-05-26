@@ -5,17 +5,28 @@
 //! next, names are matched issuer-to-subject, the topmost certificate is
 //! anchored to a trusted root, and (when a verification time is supplied) every
 //! certificate is checked to be within its validity period.
+//!
+//! Per RFC 5280:
+//!   * every non-leaf certificate must carry `basicConstraints.cA = true`
+//!     (or it cannot issue subordinates),
+//!   * `pathLenConstraint`, when present on a non-leaf, bounds the number
+//!     of intermediates that may follow it,
+//!   * if the leaf carries a `keyUsage` extension it must include
+//!     `digitalSignature` (TLS 1.3 servers authenticate with a signature),
+//!   * if the leaf carries an `extKeyUsage` extension it must include
+//!     `id-kp-serverAuth`.
+//!
 //! [`verify_hostname`] separately matches the end-entity certificate against
 //! the expected host name (subjectAltName dNSNames, falling back to the subject
 //! common name).
-//!
-//! **Not yet performed:** basicConstraints path-length, key-usage/EKU, and
-//! name-constraint checks.
 
 use super::store::RootCertStore;
 use crate::tls::Error;
-use crate::x509::{AnyPublicKey, Certificate, Time};
+use crate::x509::{AnyPublicKey, Certificate, Time, oid};
 use alloc::vec::Vec;
+
+/// `keyUsage` bit-0 `digitalSignature` (RFC 5280 §4.2.1.3).
+const KU_DIGITAL_SIGNATURE: u16 = 0x80; // bit 0 in BIT STRING wire order = MSB of byte 0
 
 /// Verifies a certificate `chain` (end-entity first) against `store` and, on
 /// success, returns the end-entity (leaf) public key — the key whose possession
@@ -70,9 +81,60 @@ pub(crate) fn verify_chain(
     top.verify_signature_with(&anchor.key)
         .map_err(|_| Error::BadCertificate)?;
 
+    // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
+    enforce_constraints(&certs)?;
+
     certs[0]
         .subject_public_key()
         .map_err(|_| Error::BadCertificate)
+}
+
+/// Per-position chain constraints:
+///   * every non-leaf must have `basicConstraints.cA = true`;
+///   * `pathLenConstraint` on a non-leaf bounds the number of intermediates
+///     between it and the leaf;
+///   * if the leaf carries `keyUsage`, `digitalSignature` (bit 0) must be set;
+///   * if the leaf carries `extKeyUsage`, it must include `id-kp-serverAuth`.
+fn enforce_constraints(certs: &[Certificate]) -> Result<(), Error> {
+    // `certs[0]` is the leaf, `certs[last]` is the topmost supplied
+    // certificate (its issuer is the trust anchor in the store).
+    for (i, cert) in certs.iter().enumerate().skip(1) {
+        // Every non-leaf in the supplied chain signs the cert below it, so it
+        // MUST be a CA per RFC 5280 §4.2.1.9.
+        let bc = cert
+            .basic_constraints()
+            .map_err(|_| Error::BadCertificate)?
+            .ok_or(Error::BadCertificate)?;
+        if !bc.0 {
+            return Err(Error::BadCertificate);
+        }
+        // `pathLenConstraint = N` permits at most N intermediate certificates
+        // between this CA and any leaf. For the cert at position `i` (i > 0),
+        // intermediates between it and the leaf live at positions 1..=i-1,
+        // i.e. `i - 1` certs. So require `path_len >= i - 1`.
+        if let Some(plc) = bc.1 {
+            let intermediates_below = i.saturating_sub(1);
+            if (plc as usize) < intermediates_below {
+                return Err(Error::BadCertificate);
+            }
+        }
+    }
+
+    // Leaf: keyUsage (if present) must include digitalSignature; EKU (if
+    // present) must include id-kp-serverAuth.
+    let leaf = &certs[0];
+    if let Some(mask) = leaf.key_usage().map_err(|_| Error::BadCertificate)?
+        && (mask & KU_DIGITAL_SIGNATURE) == 0
+    {
+        return Err(Error::BadCertificate);
+    }
+    let ekus = leaf
+        .extended_key_usages()
+        .map_err(|_| Error::BadCertificate)?;
+    if !ekus.is_empty() && !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_SERVER_AUTH) {
+        return Err(Error::BadCertificate);
+    }
+    Ok(())
 }
 
 /// Whether `cert.issuer != issuer.subject`.
@@ -229,6 +291,48 @@ mod tests {
         store.add_der(root.to_der().to_vec()).unwrap();
         assert!(matches!(
             verify_chain(&store, &[bogus.to_der().to_vec()], None),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// An "intermediate" that lacks `basicConstraints.cA = true` cannot sign
+    /// the leaf — chain validation rejects.
+    #[test]
+    fn rejects_non_ca_as_intermediate() {
+        let ca_key = rsa_test_key_a();
+        let leaf_key = rsa_test_key_b();
+        let ca_name = DistinguishedName::common_name("purecrypto Root");
+        let leaf_name = DistinguishedName::common_name("leaf.example");
+
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity(), 1, true).unwrap();
+        // The "intermediate" is signed by the root but is itself marked as
+        // a non-CA (is_ca = false). It still issues a leaf — a forged path.
+        let bad_int = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("fake-intermediate"),
+            &leaf_key.public_key(),
+            &validity(),
+            2,
+            false,
+        )
+        .unwrap();
+        let leaf = Certificate::issue(
+            &leaf_key,
+            &DistinguishedName::common_name("fake-intermediate"),
+            &leaf_name,
+            &leaf_key.public_key(),
+            &validity(),
+            3,
+            false,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), bad_int.to_der().to_vec()];
+        assert!(matches!(
+            verify_chain(&store, &chain, None),
             Err(Error::BadCertificate)
         ));
     }

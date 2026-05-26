@@ -428,6 +428,106 @@ impl Certificate {
     /// The dNSName entries of the `subjectAltName` extension, or an empty list
     /// if the certificate has no such extension.
     pub fn subject_alt_names(&self) -> Result<Vec<String>, Error> {
+        let mut names = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                parse_dns_names(value, &mut names)?;
+            }
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
+    /// Returns `(is_ca, path_len_constraint)` from the `basicConstraints`
+    /// extension, or `None` if the certificate has none. `path_len_constraint`
+    /// is `None` when omitted (i.e. unlimited).
+    pub fn basic_constraints(&self) -> Result<Option<(bool, Option<u32>)>, Error> {
+        let mut out = None;
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::BASIC_CONSTRAINTS {
+                let mut r = Reader::new(value);
+                let mut seq = r.read_sequence()?;
+                let is_ca = if seq.peek_tag() == Some(tag::BOOLEAN) {
+                    seq.read_boolean()?
+                } else {
+                    false
+                };
+                let path_len = if !seq.is_empty() {
+                    let bytes = seq.read_integer_bytes()?;
+                    let mut v: u32 = 0;
+                    for &b in bytes {
+                        v = v.checked_shl(8).ok_or(Error::Malformed)?;
+                        v |= b as u32;
+                    }
+                    Some(v)
+                } else {
+                    None
+                };
+                out = Some((is_ca, path_len));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the `keyUsage` bit-mask, or `None` if the certificate has no
+    /// such extension. The mask is read MSB-first per BIT STRING wire order:
+    /// `keyUsage` bit 0 (`digitalSignature`) appears in `mask & 0x80`,
+    /// bit 5 (`keyCertSign`) in `mask & 0x04`, etc.
+    pub fn key_usage(&self) -> Result<Option<u16>, Error> {
+        let mut out = None;
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::KEY_USAGE {
+                // Parse the BIT STRING manually so we accept non-zero unused-
+                // bits prefixes (the `Reader::read_bit_string` helper only
+                // handles `unused_bits == 0`, which is fine for SPKI keys but
+                // not for `keyUsage`).
+                let mut r = Reader::new(value);
+                let raw = r.read_tlv(tag::BIT_STRING)?;
+                if raw.is_empty() {
+                    return Err(Error::Malformed);
+                }
+                let _unused = raw[0];
+                let bytes = &raw[1..];
+                let mut mask: u16 = 0;
+                if !bytes.is_empty() {
+                    mask |= bytes[0] as u16;
+                }
+                if bytes.len() > 1 {
+                    mask |= (bytes[1] as u16) << 8;
+                }
+                out = Some(mask);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the OIDs in the `extKeyUsage` extension, or an empty list if
+    /// absent.
+    pub fn extended_key_usages(&self) -> Result<Vec<Vec<u64>>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::EXT_KEY_USAGE {
+                let mut r = Reader::new(value);
+                let mut seq = r.read_sequence()?;
+                while !seq.is_empty() {
+                    let raw = seq.read_oid()?;
+                    out.push(parse_oid(raw)?);
+                }
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Walks the certificate's `extensions` field, calling `f(oid, critical,
+    /// value)` for each entry. Returns `Ok(())` if the certificate has no
+    /// extensions block at all.
+    fn walk_extensions(
+        &self,
+        mut f: impl FnMut(&[u64], bool, &[u8]) -> Result<(), Error>,
+    ) -> Result<(), Error> {
         let mut seq = self.tbs_after_algid()?;
         DistinguishedName::decode(&mut seq)?; // issuer
         Validity::decode(&mut seq)?; // validity
@@ -441,25 +541,24 @@ impl Certificate {
         }
         // The [3] EXPLICIT extensions wrapper (constructed context tag 0xA3).
         if seq.peek_tag() != Some(tag::context(3)) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let wrapper = seq.read_tlv(tag::context(3))?;
         let mut outer = Reader::new(wrapper);
         let mut exts = outer.read_sequence()?;
 
-        let mut names = Vec::new();
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
-            if ext.peek_tag() == Some(tag::BOOLEAN) {
-                ext.read_boolean()?; // critical
-            }
+            let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
+                ext.read_boolean()?
+            } else {
+                false
+            };
             let value = ext.read_octet_string()?;
-            if id.as_slice() == oid::SUBJECT_ALT_NAME {
-                parse_dns_names(value, &mut names)?;
-            }
+            f(&id, critical, value)?;
         }
-        Ok(names)
+        Ok(())
     }
 
     /// Checks that the certificate is structurally well-formed: the outer
