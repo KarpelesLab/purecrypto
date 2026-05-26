@@ -80,6 +80,48 @@ impl MlKem768DecapsKey {
     }
 }
 
+/// PKCS#8 private-key serialization for the decapsulation key. The `privateKey`
+/// OCTET STRING carries the raw expanded `dk` bytes (purecrypto's own format —
+/// matches OpenSSL's SLH-DSA layout but is simpler than OpenSSL's ML-KEM PKCS#8,
+/// which embeds a seed + expanded SEQUENCE; it round-trips with purecrypto).
+#[cfg(feature = "der")]
+impl MlKem768DecapsKey {
+    /// Encodes the key as a PKCS#8 `PrivateKeyInfo` DER.
+    pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&oid_tlv(ML_KEM_768_OID));
+        encode_sequence(
+            &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
+        )
+    }
+
+    /// Encodes the key as a PKCS#8 PEM document.
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+    }
+
+    /// Parses a PKCS#8 `PrivateKeyInfo` DER (raw `dk` form).
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        use crate::der::{Error, Reader, parse_oid};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence()?;
+        seq.read_integer_bytes()?;
+        let mut algid = seq.read_sequence()?;
+        if parse_oid(algid.read_oid()?)?.as_slice() != ML_KEM_768_OID {
+            return Err(Error::Malformed);
+        }
+        let inner = seq.read_octet_string()?;
+        let bytes: [u8; DECAPS_KEY_BYTES] =
+            inner.try_into().map_err(|_| Error::Malformed)?;
+        Ok(MlKem768DecapsKey(bytes))
+    }
+
+    /// Parses a PKCS#8 PEM private key.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+    }
+}
+
 impl MlKem768EncapsKey {
     /// Encapsulates to a fresh shared secret, returning `(ciphertext, secret)`.
     pub fn encapsulate<R: RngCore>(
