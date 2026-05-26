@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(tls,mlkem)* hybrid X25519MLKEM768 (0x11ec) TLS 1.3 key exchange; ML-KEM-768 PKIX SPKI
+- *(mlkem)* ML-KEM-768 (FIPS 203), `no_std`/no-alloc; OpenSSL 3.5 interop-validated
+- *(ec)* Ed25519 (EdDSA, RFC 8032) — library, X.509, TLS 1.3, CLI, and C FFI
+- *(cipher)* ChaCha20-Poly1305 AEAD (RFC 8439) + TLS_CHACHA20_POLY1305_SHA256
+
 ## [0.0.3](https://github.com/KarpelesLab/purecrypto/compare/v0.0.2...v0.0.3) - 2026-05-25
 
 ### Added
