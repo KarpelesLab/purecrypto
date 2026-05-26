@@ -270,21 +270,19 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
 
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
     if www {
-        // Decrypt the request before generating the response. The
-        // unified-config refactor accidentally dropped the `feed` call
-        // that the previous `Stream` wrapper performed internally —
-        // without it, the engine never advances past pending records
-        // (e.g., the TLS 1.3 NewSessionTicket that's interleaved with
-        // the first application data), which on slow macOS runners
-        // stalled the reply path long enough to trigger the client's
-        // read timeout.
-        let mut buf = [0u8; 4096];
-        if let Ok(n) = sock.read(&mut buf)
-            && n > 0
-        {
-            let _ = conn.feed(&buf[..n]);
-            let _ = conn.recv();
-        }
+        // For `-www` the response is canned, so we send it immediately
+        // and only optionally drain the request afterwards. This avoids
+        // a deadlock when both peers race their own 5-second read
+        // timeout: the client (with nothing to send) sits in `sock.read`
+        // waiting for the response while the server (waiting for the
+        // request) sits in its own `sock.read` waiting for the request.
+        //
+        // We do still drain any pre-buffered plaintext that the engine
+        // may have decoded during the handshake — the client's
+        // ClientFinished and first app-data record commonly arrive in
+        // the same TCP segment on macOS (Nagle coalescing), and the
+        // handshake loop's last `feed` will have decrypted both.
+        let _ = conn.recv();
         let body = b"hello from purecrypto s_server\n";
         let resp = format!(
             "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
@@ -292,10 +290,10 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
         );
         let _ = conn.send(resp.as_bytes());
         let _ = conn.send(body);
-        // Cleanly close TLS, drain the engine, half-close the socket.
-        // Required because dropping the `TcpStream` races against
-        // macOS's send-buffer-flush behavior and was truncating the
-        // reply on a slow runner.
+        // Send a TLS-level close_notify, drain the engine, then
+        // half-close the TCP socket. Without the half-close, dropping
+        // the `TcpStream` raced against macOS's send-buffer-flush
+        // behavior and was truncating the reply on a slow runner.
         let _ = conn.close();
         let out = conn.pop().unwrap_or_default();
         let _ = sock.write_all(&out);
@@ -304,6 +302,16 @@ fn run_tcp(conn: &mut Connection, sock: &mut TcpStream, www: bool, quiet: bool) 
         let mut tail = [0u8; 256];
         let _ = sock.read(&mut tail);
     } else {
+        // Echo mode: same `recv` pre-drain reason as above.
+        let plain = conn.recv().unwrap_or_default();
+        if !plain.is_empty()
+            && let Ok(()) = conn.send(&plain)
+        {
+            let out = conn.pop().unwrap_or_default();
+            if !out.is_empty() {
+                let _ = sock.write_all(&out);
+            }
+        }
         let mut buf = [0u8; 4096];
         loop {
             match sock.read(&mut buf) {

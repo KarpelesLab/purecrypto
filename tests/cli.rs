@@ -359,15 +359,25 @@ fn s_client_loopback() {
                 }
             }
         }
-        // Read the PING.
-        let n = sock.read(&mut read_buf).unwrap();
-        conn.feed(&read_buf[..n]).unwrap();
-        let _ = conn.recv();
-        // Reply with PONG.
+        // Read the PING. It may already be buffered if the client's
+        // ClientFinished + first app-data record arrived in one TCP
+        // segment (Nagle coalescing — common on macOS loopback).
+        let mut got = conn.recv().unwrap_or_default();
+        while got.is_empty() {
+            let n = sock.read(&mut read_buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            conn.feed(&read_buf[..n]).unwrap();
+            got = conn.recv().unwrap_or_default();
+        }
+        // Reply with PONG, then cleanly close so the client sees EOF.
         conn.send(b"PONG").unwrap();
+        let _ = conn.close();
         let out = conn.pop().unwrap_or_default();
         sock.write_all(&out).unwrap();
         sock.flush().unwrap();
+        let _ = sock.shutdown(std::net::Shutdown::Write);
     });
 
     // The CLI connects (insecure: self-signed), sends PING, prints the reply.
