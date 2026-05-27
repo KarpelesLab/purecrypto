@@ -315,7 +315,15 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
         };
+        // Try formats in roughly best-known-first order: PKCS#1 RSA (the
+        // OpenSSL legacy `-----BEGIN RSA PRIVATE KEY-----`), PKCS#8 RSA
+        // (the modern `-----BEGIN PRIVATE KEY-----` envelope around an RSA
+        // key — what `openssl pkey` and `openssl genpkey` emit by default
+        // since 1.0.2), SEC1 EC, then PKCS#8 Ed25519. PKCS#8 with an EC key
+        // is not (yet) split out here; SEC1 covers the EC PEM path.
         let key = if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(key_str) {
+            PcKey::Rsa(k)
+        } else if let Ok(k) = BoxedRsaPrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Rsa(k)
         } else if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(key_str) {
             PcKey::Ecdsa(k)
