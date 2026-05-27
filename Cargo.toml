@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -24,6 +24,9 @@ alloc = []
 hash = []
 cipher = []
 kdf = ["hash", "cipher"]
+# Standalone MACs that aren't covered by `hash`/`kdf` (which already ship HMAC).
+# Currently provides UMAC-64 / UMAC-128 (RFC 4418).
+mac = ["cipher"]
 bignum = []
 rng = ["hash"]
 # Opt-in: on Linux, draw OsRng bytes via getrandom(2) instead of reading from

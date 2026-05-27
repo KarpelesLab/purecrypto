@@ -55,6 +55,9 @@ pub mod hash;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 
+#[cfg(feature = "mac")]
+pub mod mac;
+
 #[cfg(feature = "mldsa")]
 pub mod mldsa;
 
