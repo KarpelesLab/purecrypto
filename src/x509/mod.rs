@@ -14,7 +14,7 @@ mod pubkey;
 mod signer;
 mod time;
 
-pub use cert::Certificate;
+pub use cert::{Certificate, SanIp};
 pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, RevokedCertificate};
 pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};

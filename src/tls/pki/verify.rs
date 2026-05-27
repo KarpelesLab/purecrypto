@@ -388,6 +388,23 @@ fn names_differ(cert: &Certificate, issuer: &Certificate) -> Result<bool, Error>
 /// `subjectAltName` dNSName entries (RFC 6125); if there are none, falls back
 /// to the subject common name.
 pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Error> {
+    // If the caller asked for an IP-literal host, the only spec-correct
+    // SAN slot that can authorise it is iPAddress ([7]). Dispatch
+    // accordingly; dNSName entries and the CN fallback are not consulted
+    // for IP-literal reference identifiers (RFC 6125 §6.5.2).
+    if let Some(host_bytes) = parse_host_ip(host) {
+        let ips = cert.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
+        let matched = ips.iter().any(|san| match (san, &host_bytes) {
+            (crate::x509::SanIp::V4(a), HostIp::V4(b)) => a == b,
+            (crate::x509::SanIp::V6(a), HostIp::V6(b)) => a == b,
+            _ => false,
+        });
+        return if matched {
+            Ok(())
+        } else {
+            Err(Error::BadCertificate)
+        };
+    }
     let sans = cert
         .subject_alt_names()
         .map_err(|_| Error::BadCertificate)?;
@@ -408,11 +425,106 @@ pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Erro
     }
 }
 
+/// Parsed IP-literal host. `None` means the host is not an IP literal
+/// (so dNSName matching is the right path).
+enum HostIp {
+    V4([u8; 4]),
+    V6([u8; 16]),
+}
+
+/// Parses an IP-literal host (IPv4 dotted-quad, or any colon-bearing
+/// string for IPv6). Returns `None` if the host is not an IP literal.
+fn parse_host_ip(host: &str) -> Option<HostIp> {
+    if !host.bytes().any(|b| b == b':') {
+        // Pure dotted-quad IPv4.
+        return crate::x509::cert::parse_ipv4(host).map(HostIp::V4);
+    }
+    parse_ipv6(host).map(HostIp::V6)
+}
+
+/// Parses an IPv6 literal in the canonical full or compressed forms
+/// (RFC 4291 §2.2). Embedded-IPv4 form (`::ffff:192.0.2.1`) is
+/// recognised on input — host machines accept it — and is returned as
+/// its 16-byte IPv6 representation. The SAN-side matcher then refuses
+/// to match it against a 16-byte iPAddress entry because
+/// [`Certificate::subject_alt_ips`] never surfaces IPv4-mapped-IPv6
+/// SAN entries. So a leaf claiming `::ffff:10.0.0.1` in iPAddress can
+/// match neither `10.0.0.1` (the 4-byte SAN that would have been
+/// correct) nor `::ffff:10.0.0.1` (rejected at parse).
+fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
+    // Split on "::" to handle compression.
+    let (head, tail) = if let Some(idx) = s.find("::") {
+        let head = &s[..idx];
+        let tail = &s[idx + 2..];
+        if head.contains("::") || tail.contains("::") {
+            return None;
+        }
+        (head, tail)
+    } else {
+        (s, "")
+    };
+    let mut head_groups: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    let mut tail_groups: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
+    for (target, src) in [(&mut head_groups, head), (&mut tail_groups, tail)] {
+        if src.is_empty() {
+            continue;
+        }
+        for group in src.split(':') {
+            // Embedded-IPv4 in the last group (e.g. "::ffff:10.0.0.1") —
+            // expand to two 16-bit groups.
+            if group.contains('.') {
+                let v4 = crate::x509::cert::parse_ipv4(group)?;
+                target.push(((v4[0] as u16) << 8) | v4[1] as u16);
+                target.push(((v4[2] as u16) << 8) | v4[3] as u16);
+                continue;
+            }
+            if group.is_empty() || group.len() > 4 {
+                return None;
+            }
+            let g = u16::from_str_radix(group, 16).ok()?;
+            target.push(g);
+        }
+    }
+    let total = head_groups.len() + tail_groups.len();
+    if total > 8 {
+        return None;
+    }
+    let zero_groups = 8 - total;
+    // Compression `::` is required when total < 8 unless the original
+    // string contained one explicit `::`.
+    if zero_groups > 0 && !s.contains("::") {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    let mut i = 0;
+    for g in head_groups
+        .into_iter()
+        .chain(core::iter::repeat_n(0, zero_groups))
+        .chain(tail_groups)
+    {
+        out[i] = (g >> 8) as u8;
+        out[i + 1] = (g & 0xff) as u8;
+        i += 2;
+    }
+    Some(out)
+}
+
 /// Matches a certificate dNSName `pattern` against `host`, case-insensitively,
 /// allowing a single leftmost-label `*` wildcard (`*.example.com` matches
 /// `a.example.com` but not `example.com` or `a.b.example.com`).
 fn dns_name_matches(pattern: &str, host: &str) -> bool {
+    // RFC 6125 §6.5.2: dNSName / CN-fallback matching MUST NOT be used
+    // for IP-literal hosts. If either side looks IP-shaped, refuse the
+    // match — IPs belong in the iPAddress SAN slot and have a separate
+    // matcher.
+    if looks_like_ip(pattern) || looks_like_ip(host) {
+        return false;
+    }
     if let Some(suffix) = pattern.strip_prefix("*.") {
+        // RFC 6125 §6.4.3: wildcard is the leftmost label only, must
+        // cover exactly one label, and the wildcard label MUST NOT be
+        // partial (`f*.example.com` is forbidden — already prevented by
+        // requiring the prefix `*.`).
         match host.split_once('.') {
             Some((label, rest)) => {
                 !label.is_empty() && !rest.is_empty() && rest.eq_ignore_ascii_case(suffix)
@@ -422,6 +534,29 @@ fn dns_name_matches(pattern: &str, host: &str) -> bool {
     } else {
         !pattern.is_empty() && pattern.eq_ignore_ascii_case(host)
     }
+}
+
+/// Coarse IP-literal heuristic; defense-in-depth against bytes that
+/// slipped past [`parse_dns_names`] (e.g. via CN-fallback). Matches the
+/// same shape: any colon, or an IPv4 dotted-quad of 1-3-digit labels.
+fn looks_like_ip(s: &str) -> bool {
+    if s.bytes().any(|b| b == b':') {
+        return true;
+    }
+    let mut count = 0usize;
+    for label in s.split('.') {
+        count += 1;
+        if count > 4 {
+            return false;
+        }
+        if label.is_empty() || label.len() > 3 {
+            return false;
+        }
+        if !label.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    count == 4
 }
 
 #[cfg(test)]
@@ -1100,6 +1235,39 @@ mod tests {
         assert!(matches!(
             verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &with_sha1,),
             Err(Error::BadCertificate)
+        ));
+    }
+
+    /// dns_name_matches must refuse IP-literal patterns and IP-literal
+    /// hosts (RFC 6125 §6.5.2 — IPs belong in iPAddress SAN, not dNSName /
+    /// CN). The unit test asserts the refusal at both the pattern and
+    /// host slots, including the IPv4-mapped-IPv6 form.
+    #[test]
+    fn dns_matcher_refuses_ip_pattern_or_host() {
+        // Pattern is IPv4 → no match, even when host equals pattern byte-for-byte.
+        assert!(!super::dns_name_matches("10.0.0.1", "10.0.0.1"));
+        // Host is IPv4 → no match against any pattern.
+        assert!(!super::dns_name_matches("example.com", "10.0.0.1"));
+        assert!(!super::dns_name_matches("*.example.com", "10.0.0.1"));
+        // IPv6 either side → no match.
+        assert!(!super::dns_name_matches("::1", "::1"));
+        assert!(!super::dns_name_matches("2001:db8::1", "2001:db8::1"));
+        assert!(!super::dns_name_matches(
+            "::ffff:10.0.0.1",
+            "::ffff:10.0.0.1"
+        ));
+        // Sanity: normal hostnames still match.
+        assert!(super::dns_name_matches("example.com", "example.com"));
+        assert!(super::dns_name_matches("*.example.com", "host.example.com"));
+        // Wildcard refuses a deeper host.
+        assert!(!super::dns_name_matches("*.example.com", "a.b.example.com"));
+        // Wildcard refuses the bare apex.
+        assert!(!super::dns_name_matches("*.example.com", "example.com"));
+        // Partial wildcard (`f*.example.com`) is not stripped → literal
+        // compare → no match against `foo.example.com`.
+        assert!(!super::dns_name_matches(
+            "f*.example.com",
+            "foo.example.com"
         ));
     }
 }

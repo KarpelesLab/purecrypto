@@ -43,16 +43,27 @@ fn rsa_spki<const LIMBS: usize>(pk: &RsaPublicKey<LIMBS>) -> Vec<u8> {
     encode_sequence(&[algid, encode_bit_string(&key)].concat())
 }
 
-/// Translates the legacy `(is_ca, dns_names)` shape into a fresh
-/// [`Extension`] vector: critical basicConstraints + (when non-empty)
-/// non-critical subjectAltName with dNSName entries.
-pub(crate) fn legacy_extensions(is_ca: bool, dns_names: &[&str]) -> Vec<Extension> {
+/// Translates the legacy `(is_ca, sans)` shape into a fresh [`Extension`]
+/// vector: critical basicConstraints + (when non-empty) non-critical
+/// subjectAltName. Each `sans` string is auto-routed to the correct
+/// GeneralName variant by shape: an IPv4 dotted-quad becomes iPAddress
+/// (`[7]` 4-byte form); any other string goes into dNSName (`[2]`). IPv6
+/// strings require the explicit `GeneralName::IpV6` form via a caller
+/// that builds extensions directly — this helper handles only IPv4 and
+/// hostnames because that's what the existing `&[&str]` callers use.
+pub(crate) fn legacy_extensions(is_ca: bool, sans: &[&str]) -> Vec<Extension> {
     let mut v = Vec::new();
     v.push(extension::basic_constraints(is_ca, None));
-    if !dns_names.is_empty() {
-        let names: Vec<GeneralName> = dns_names
+    if !sans.is_empty() {
+        let names: Vec<GeneralName> = sans
             .iter()
-            .map(|s| GeneralName::Dns((*s).into()))
+            .map(|s| {
+                if let Some(v4) = parse_ipv4(s) {
+                    GeneralName::IpV4(v4)
+                } else {
+                    GeneralName::Dns((*s).into())
+                }
+            })
             .collect();
         v.push(extension::subject_alt_name(&names));
     }
@@ -553,6 +564,29 @@ impl Certificate {
         Ok(names)
     }
 
+    /// The iPAddress entries of the `subjectAltName` extension, returned as
+    /// the canonical 4-byte (IPv4) or 16-byte (IPv6) octet strings per
+    /// RFC 5280 §4.2.1.6.
+    ///
+    /// IPv4-mapped-IPv6 addresses (`::ffff:0.0.0.0/96` — 16-byte entries
+    /// whose first 10 bytes are zero and bytes 10..12 are `0xff 0xff`)
+    /// are rejected: the host-level TCP/IP stack treats them as the
+    /// embedded IPv4, but a name-constraints checker comparing 16-byte
+    /// blobs would not. To avoid that scope confusion this accessor
+    /// refuses to surface them at all; senders that genuinely mean to
+    /// bind the IPv4 address should put it in a 4-byte iPAddress entry
+    /// instead.
+    pub fn subject_alt_ips(&self) -> Result<Vec<SanIp>, Error> {
+        let mut out = Vec::new();
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                parse_ip_addresses(value, &mut out)?;
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Returns `(is_ca, path_len_constraint)` from the `basicConstraints`
     /// extension, or `None` if the certificate has none. `path_len_constraint`
     /// is `None` when omitted (i.e. unlimited).
@@ -735,25 +769,143 @@ impl Certificate {
     }
 }
 
-/// Parses a `SubjectAltName` value (`SEQUENCE OF GeneralName`), collecting the
-/// dNSName (`[2] IA5String`, tag 0x82) entries. RFC 5280 §4.2.1.6 requires
-/// dNSName entries to be IA5 (ASCII): non-ASCII bytes are rejected so the
-/// hostname matcher (which only lowercases ASCII) doesn't accidentally
-/// compare a UTF-8 SAN to a punycoded hostname and miss a mismatch.
+/// Parses a `SubjectAltName` value (`SEQUENCE OF GeneralName`), collecting
+/// the dNSName (`[2] IA5String`, tag 0x82) entries.
+///
+/// The validation here is intentionally strict beyond a literal reading of
+/// RFC 5280 §4.2.1.6 (which only requires IA5). Each entry must additionally:
+///
+/// * be non-empty (zero-length dNSName entries are nonsense and exist only
+///   to confuse downstream matchers);
+/// * contain only printable ASCII (`0x20..=0x7E`) — control characters
+///   (including NUL) are rejected to defeat embedded-NUL host confusion in
+///   any consumer that forwards the parsed `String` across an FFI boundary
+///   or into a log line that splits on `\n`;
+/// * NOT be an IP literal in disguise. RFC 6125 §6.5.2: implementations
+///   "MUST NOT seek a match for a reference identifier of CN-ID or DNS-ID
+///   if the presented identifiers include an IP address". The cheapest way
+///   to enforce that is at parse time: dNSName entries shaped like an IPv4
+///   dotted-quad or containing a colon (any IPv6 form) are rejected here
+///   so they can never reach the hostname matcher. IPs belong in the
+///   iPAddress (`[7]`) slot — see [`Certificate::subject_alt_ips`].
 pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
     while !seq.is_empty() {
         let (t, value) = seq.read_any()?;
         if t == 0x82 {
-            if value.iter().any(|&b| b >= 0x80) {
+            if value.is_empty() {
                 return Err(Error::Malformed);
             }
+            for &b in value {
+                // Reject non-ASCII, control characters (incl. NUL), and DEL.
+                if !(0x20..=0x7E).contains(&b) {
+                    return Err(Error::Malformed);
+                }
+            }
+            // SAFETY of unwrap: every byte is 0x20..=0x7E, which is valid UTF-8.
             let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
+            if looks_like_ip_literal(s) {
+                return Err(Error::Malformed);
+            }
             out.push(String::from(s));
         }
     }
     Ok(())
+}
+
+/// An iPAddress SAN entry surfaced from a parsed cert.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SanIp {
+    /// 4-byte IPv4 address as stored in the SAN.
+    V4([u8; 4]),
+    /// 16-byte IPv6 address (an IPv4-mapped form is rejected at parse
+    /// time and never appears here).
+    V6([u8; 16]),
+}
+
+/// Parses iPAddress (`[7] OCTET STRING`, tag 0x87) entries from a SAN
+/// extension body. 4-byte entries are returned as `V4`; 16-byte entries
+/// as `V6`, with IPv4-mapped-IPv6 (`::ffff:0.0.0.0/96`) rejected as
+/// Malformed.
+fn parse_ip_addresses(der: &[u8], out: &mut Vec<SanIp>) -> Result<(), Error> {
+    let mut reader = Reader::new(der);
+    let mut seq = reader.read_sequence()?;
+    while !seq.is_empty() {
+        let (t, value) = seq.read_any()?;
+        if t == 0x87 {
+            match value.len() {
+                4 => {
+                    let mut v = [0u8; 4];
+                    v.copy_from_slice(value);
+                    out.push(SanIp::V4(v));
+                }
+                16 => {
+                    // RFC 4291 §2.5.5.2 IPv4-mapped-IPv6 form
+                    // `::ffff:0.0.0.0/96`: first 10 bytes zero, bytes
+                    // 10..12 = 0xff 0xff. The host stack treats it as
+                    // the IPv4 in bytes 12..16, but a 16-byte
+                    // comparator does not — so we refuse to surface it.
+                    if value[..10].iter().all(|&b| b == 0) && value[10] == 0xff && value[11] == 0xff
+                    {
+                        return Err(Error::Malformed);
+                    }
+                    let mut v = [0u8; 16];
+                    v.copy_from_slice(value);
+                    out.push(SanIp::V6(v));
+                }
+                _ => return Err(Error::Malformed),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// True if `s` is shaped like an IP literal — either an IPv4 dotted-quad
+/// of 1-3-digit labels, or any string containing a colon (IPv6 in any
+/// form). Used at both parse time (defense-in-depth: dNSName entries that
+/// look like IPs are rejected outright) and at SAN-build time (route a
+/// caller-supplied IP-shaped string into the iPAddress slot).
+pub(crate) fn looks_like_ip_literal(s: &str) -> bool {
+    if s.bytes().any(|b| b == b':') {
+        return true;
+    }
+    let mut count = 0usize;
+    for label in s.split('.') {
+        count += 1;
+        if count > 4 {
+            return false;
+        }
+        if label.is_empty() || label.len() > 3 {
+            return false;
+        }
+        if !label.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    count == 4
+}
+
+/// Parses an IPv4 dotted-quad string into 4 bytes. Returns `None` for
+/// anything that is not exactly four decimal labels in `0..=255`.
+pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let mut out = [0u8; 4];
+    let mut count = 0usize;
+    for label in s.split('.') {
+        if count >= 4 {
+            return None;
+        }
+        let n: u32 = label.parse().ok()?;
+        if n > 255 {
+            return None;
+        }
+        out[count] = n as u8;
+        count += 1;
+    }
+    if count != 4 {
+        return None;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -1039,5 +1191,160 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let tampered = Certificate::from_der(tampered_der).unwrap();
         assert!(tampered.subject().is_err());
         assert!(tampered.signature_algorithm_oid().is_err());
+    }
+
+    /// Builds a synthetic `SubjectAltName` extension body (the bytes that
+    /// would sit inside the OCTET STRING wrapper of the v3 extension)
+    /// containing a single dNSName entry with the supplied raw bytes.
+    fn san_with_dns(value: &[u8]) -> alloc::vec::Vec<u8> {
+        // GeneralName CHOICE [2] IMPLICIT IA5String  →  context tag 0x82.
+        let mut entry = alloc::vec![0x82u8];
+        // single-byte length (every test value is short).
+        assert!(value.len() < 128, "test helper assumes short value");
+        entry.push(value.len() as u8);
+        entry.extend_from_slice(value);
+        // Wrap in SEQUENCE.
+        let mut seq = alloc::vec![0x30u8, entry.len() as u8];
+        seq.extend_from_slice(&entry);
+        seq
+    }
+
+    #[test]
+    fn san_dns_parser_rejects_embedded_nul() {
+        let der = san_with_dns(b"victim.example\x00attacker.example");
+        let mut out = alloc::vec::Vec::new();
+        assert!(super::parse_dns_names(&der, &mut out).is_err());
+    }
+
+    #[test]
+    fn san_dns_parser_rejects_control_characters() {
+        for bad in [
+            b"victim.example\nattacker.example".as_slice(),
+            b"victim.example\rinjection".as_slice(),
+            b"victim.example\x01ctrl".as_slice(),
+            b"victim.example\x7fdel".as_slice(),
+        ] {
+            let der = san_with_dns(bad);
+            let mut out = alloc::vec::Vec::new();
+            assert!(
+                super::parse_dns_names(&der, &mut out).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn san_dns_parser_rejects_empty_entry() {
+        let der = san_with_dns(b"");
+        let mut out = alloc::vec::Vec::new();
+        assert!(super::parse_dns_names(&der, &mut out).is_err());
+    }
+
+    #[test]
+    fn san_dns_parser_rejects_ipv4_literal() {
+        for bad in [
+            b"10.0.0.1".as_slice(),
+            b"127.0.0.1".as_slice(),
+            b"255.255.255.255".as_slice(),
+            b"0.0.0.0".as_slice(),
+        ] {
+            let der = san_with_dns(bad);
+            let mut out = alloc::vec::Vec::new();
+            assert!(
+                super::parse_dns_names(&der, &mut out).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn san_dns_parser_rejects_ipv6_literal() {
+        for bad in [
+            b"::1".as_slice(),
+            b"2001:db8::1".as_slice(),
+            b"::ffff:10.0.0.1".as_slice(),
+            b"fe80::1".as_slice(),
+        ] {
+            let der = san_with_dns(bad);
+            let mut out = alloc::vec::Vec::new();
+            assert!(
+                super::parse_dns_names(&der, &mut out).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn san_dns_parser_accepts_normal_names() {
+        for ok in [
+            b"example.com".as_slice(),
+            b"www.example.com".as_slice(),
+            b"*.example.com".as_slice(),
+            b"xn--bcher-kva.example.de".as_slice(), // IDN A-label
+            // Numeric-looking labels are fine as long as they're not a full
+            // IPv4 dotted-quad (e.g. AS-number-style labels).
+            b"v6.example.com".as_slice(),
+            b"10.example".as_slice(), // not 4 dotted labels → not IP
+        ] {
+            let der = san_with_dns(ok);
+            let mut out = alloc::vec::Vec::new();
+            super::parse_dns_names(&der, &mut out).expect("should accept");
+            assert_eq!(
+                out.last().map(String::as_str),
+                Some(core::str::from_utf8(ok).unwrap())
+            );
+        }
+    }
+
+    /// Builds a synthetic `SubjectAltName` body containing a single
+    /// iPAddress (tag 0x87) entry of the supplied length.
+    fn san_with_ip(bytes: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut entry = alloc::vec![0x87u8, bytes.len() as u8];
+        entry.extend_from_slice(bytes);
+        let mut seq = alloc::vec![0x30u8, entry.len() as u8];
+        seq.extend_from_slice(&entry);
+        seq
+    }
+
+    #[test]
+    fn san_ip_parser_accepts_v4_and_v6() {
+        let v4_der = san_with_ip(&[10, 0, 0, 1]);
+        let mut out = alloc::vec::Vec::new();
+        super::parse_ip_addresses(&v4_der, &mut out).unwrap();
+        assert_eq!(out, alloc::vec![super::SanIp::V4([10, 0, 0, 1])]);
+
+        let mut v6 = [0u8; 16];
+        v6[..2].copy_from_slice(&[0x20, 0x01]); // 2001:db8::1
+        v6[2..4].copy_from_slice(&[0x0d, 0xb8]);
+        v6[15] = 1;
+        let v6_der = san_with_ip(&v6);
+        let mut out = alloc::vec::Vec::new();
+        super::parse_ip_addresses(&v6_der, &mut out).unwrap();
+        assert_eq!(out, alloc::vec![super::SanIp::V6(v6)]);
+    }
+
+    #[test]
+    fn san_ip_parser_rejects_ipv4_mapped_ipv6() {
+        // ::ffff:10.0.0.1 — first 10 bytes zero, bytes 10-11 = 0xff 0xff,
+        // bytes 12..16 = the IPv4. The host stack treats this as the
+        // IPv4 address, but the SAN matcher compares 16 bytes — refuse.
+        let mut bytes = [0u8; 16];
+        bytes[10] = 0xff;
+        bytes[11] = 0xff;
+        bytes[12] = 10;
+        bytes[13] = 0;
+        bytes[14] = 0;
+        bytes[15] = 1;
+        let der = san_with_ip(&bytes);
+        let mut out = alloc::vec::Vec::new();
+        assert!(super::parse_ip_addresses(&der, &mut out).is_err());
+    }
+
+    #[test]
+    fn san_ip_parser_rejects_wrong_length() {
+        // 5 bytes is neither IPv4 nor IPv6.
+        let der = san_with_ip(&[10, 0, 0, 1, 99]);
+        let mut out = alloc::vec::Vec::new();
+        assert!(super::parse_ip_addresses(&der, &mut out).is_err());
     }
 }
