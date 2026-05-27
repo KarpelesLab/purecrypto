@@ -195,13 +195,15 @@ impl PcTlsCfg {
 /// Allocates a new TLS configuration handle.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_tls_cfg_new(role: i32, version: i32) -> *mut PcTlsCfg {
-    let Some(r) = Role::from_i32(role) else {
-        return core::ptr::null_mut();
-    };
-    let Some(v) = Version::from_i32(version) else {
-        return core::ptr::null_mut();
-    };
-    Box::into_raw(Box::new(PcTlsCfg::new(r, v)))
+    crate::ffi::common::guard_ptr(|| {
+        let Some(r) = Role::from_i32(role) else {
+            return core::ptr::null_mut();
+        };
+        let Some(v) = Version::from_i32(version) else {
+            return core::ptr::null_mut();
+        };
+        Box::into_raw(Box::new(PcTlsCfg::new(r, v)))
+    })
 }
 
 /// Frees a TLS configuration. NULL is ignored.
@@ -490,22 +492,24 @@ pub struct PcTls {
 /// `cfg` valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_tls_new(cfg: *const PcTlsCfg) -> *mut PcTls {
-    if cfg.is_null() {
-        return core::ptr::null_mut();
-    }
-    let c = unsafe { &*cfg };
-    let config = match c.build_config() {
-        Some(cfg) => cfg,
-        None => return core::ptr::null_mut(),
-    };
-    let conn = match c.role {
-        Role::Client => Connection::client(&config),
-        Role::Server => Connection::server(&config),
-    };
-    let Ok(inner) = conn else {
-        return core::ptr::null_mut();
-    };
-    Box::into_raw(Box::new(PcTls { inner }))
+    crate::ffi::common::guard_ptr(|| {
+        if cfg.is_null() {
+            return core::ptr::null_mut();
+        }
+        let c = unsafe { &*cfg };
+        let config = match c.build_config() {
+            Some(cfg) => cfg,
+            None => return core::ptr::null_mut(),
+        };
+        let conn = match c.role {
+            Role::Client => Connection::client(&config),
+            Role::Server => Connection::server(&config),
+        };
+        let Ok(inner) = conn else {
+            return core::ptr::null_mut();
+        };
+        Box::into_raw(Box::new(PcTls { inner }))
+    })
 }
 
 /// Frees a connection. NULL is ignored.
@@ -654,14 +658,16 @@ pub unsafe extern "C" fn pc_tls_handshake(tls: *mut PcTls) -> PcStatus {
 /// `tls` valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_tls_is_handshake_complete(tls: *const PcTls) -> i32 {
-    if tls.is_null() {
-        return 0;
-    }
-    if unsafe { &*tls }.inner.is_handshake_complete() {
-        1
-    } else {
-        0
-    }
+    crate::ffi::common::guard_i32(0, || {
+        if tls.is_null() {
+            return 0;
+        }
+        if unsafe { &*tls }.inner.is_handshake_complete() {
+            1
+        } else {
+            0
+        }
+    })
 }
 
 /// Returns the negotiated wire version in `out`, e.g. `0x0304` for TLS 1.3.

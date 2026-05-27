@@ -25,40 +25,42 @@ pub unsafe extern "C" fn pc_csr_create_rsa(
     dns_names: *const *const core::ffi::c_char,
     dns_count: usize,
 ) -> *mut PcCsr {
-    if rsa_key.is_null() || subject_cn.is_null() {
-        return core::ptr::null_mut();
-    }
-    let cn = unsafe { core::ffi::CStr::from_ptr(subject_cn) };
-    let Ok(cn) = cn.to_str() else {
-        return core::ptr::null_mut();
-    };
-    let mut dns: Vec<&str> = Vec::with_capacity(dns_count);
-    if dns_count > 0 {
-        if dns_names.is_null() {
+    crate::ffi::common::guard_ptr(|| {
+        if rsa_key.is_null() || subject_cn.is_null() {
             return core::ptr::null_mut();
         }
-        for i in 0..dns_count {
-            let p = unsafe { *dns_names.add(i) };
-            if p.is_null() {
+        let cn = unsafe { core::ffi::CStr::from_ptr(subject_cn) };
+        let Ok(cn) = cn.to_str() else {
+            return core::ptr::null_mut();
+        };
+        let mut dns: Vec<&str> = Vec::with_capacity(dns_count);
+        if dns_count > 0 {
+            if dns_names.is_null() {
                 return core::ptr::null_mut();
             }
-            let s = unsafe { core::ffi::CStr::from_ptr(p) };
-            let Ok(s) = s.to_str() else {
-                return core::ptr::null_mut();
-            };
-            dns.push(s);
+            for i in 0..dns_count {
+                let p = unsafe { *dns_names.add(i) };
+                if p.is_null() {
+                    return core::ptr::null_mut();
+                }
+                let s = unsafe { core::ffi::CStr::from_ptr(p) };
+                let Ok(s) = s.to_str() else {
+                    return core::ptr::null_mut();
+                };
+                dns.push(s);
+            }
         }
-    }
-    let subject = DistinguishedName::common_name(cn);
-    // SAFETY: PcRsaKey is allocated by Box::into_raw, so we can borrow the
-    // inner key through a shared reference. The internal field `key` is
-    // private; expose it via a small accessor.
-    let key_ref = unsafe { rsa_key_inner(&*rsa_key) };
-    let signer = CertSigner::Rsa(key_ref);
-    match CertificationRequest::create(&signer, &subject, &dns) {
-        Ok(csr) => Box::into_raw(Box::new(PcCsr(csr))),
-        Err(_) => core::ptr::null_mut(),
-    }
+        let subject = DistinguishedName::common_name(cn);
+        // SAFETY: PcRsaKey is allocated by Box::into_raw, so we can borrow
+        // the inner key through a shared reference. The internal field
+        // `key` is private; expose it via a small accessor.
+        let key_ref = unsafe { rsa_key_inner(&*rsa_key) };
+        let signer = CertSigner::Rsa(key_ref);
+        match CertificationRequest::create(&signer, &subject, &dns) {
+            Ok(csr) => Box::into_raw(Box::new(PcCsr(csr))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Helper that exposes the borrow of the inner BoxedRsaPrivateKey. Defined
@@ -87,16 +89,18 @@ impl PcRsaKeyAccess for PcRsaKey {
 /// `pem` valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_csr_from_pem(pem: *const u8, len: usize) -> *mut PcCsr {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match CertificationRequest::from_pem(s) {
-        Ok(csr) => Box::into_raw(Box::new(PcCsr(csr))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match CertificationRequest::from_pem(s) {
+            Ok(csr) => Box::into_raw(Box::new(PcCsr(csr))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Writes the CSR as a `CERTIFICATE REQUEST` PEM to `out`.

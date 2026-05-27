@@ -49,11 +49,13 @@ pub struct PcSlhDsa(Box<PrivateKey>);
 /// Generates an SLH-DSA signing key for the parameter set.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_slhdsa_generate(set: i32) -> *mut PcSlhDsa {
-    let Some(ps) = set_from_id(set) else {
-        return core::ptr::null_mut();
-    };
-    let (sk, _) = PrivateKey::generate(ps, &mut OsRng);
-    Box::into_raw(Box::new(PcSlhDsa(Box::new(sk))))
+    crate::ffi::common::guard_ptr(|| {
+        let Some(ps) = set_from_id(set) else {
+            return core::ptr::null_mut();
+        };
+        let (sk, _) = PrivateKey::generate(ps, &mut OsRng);
+        Box::into_raw(Box::new(PcSlhDsa(Box::new(sk))))
+    })
 }
 
 /// Parses a PKCS#8 PEM SLH-DSA private key.
@@ -62,16 +64,18 @@ pub extern "C" fn pc_slhdsa_generate(set: i32) -> *mut PcSlhDsa {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_slhdsa_from_pkcs8_pem(pem: *const u8, len: usize) -> *mut PcSlhDsa {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match PrivateKey::from_pkcs8_pem(s) {
-        Ok(k) => Box::into_raw(Box::new(PcSlhDsa(Box::new(k)))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match PrivateKey::from_pkcs8_pem(s) {
+            Ok(k) => Box::into_raw(Box::new(PcSlhDsa(Box::new(k)))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// PKCS#8 PEM for the private key.

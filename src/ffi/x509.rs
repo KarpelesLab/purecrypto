@@ -21,16 +21,18 @@ pub(super) fn pc_cert_inner(c: &PcCert) -> &Certificate {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_cert_from_pem(pem: *const u8, len: usize) -> *mut PcCert {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match Certificate::from_pem(s) {
-        Ok(c) => Box::into_raw(Box::new(PcCert(c))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match Certificate::from_pem(s) {
+            Ok(c) => Box::into_raw(Box::new(PcCert(c))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Parses a DER certificate into a handle, or NULL on failure.
@@ -39,13 +41,15 @@ pub unsafe extern "C" fn pc_cert_from_pem(pem: *const u8, len: usize) -> *mut Pc
 /// `der` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_cert_from_der(der: *const u8, len: usize) -> *mut PcCert {
-    let Some(bytes) = (unsafe { slice(der, len) }) else {
-        return core::ptr::null_mut();
-    };
-    match Certificate::from_der(bytes.to_vec()) {
-        Ok(c) => Box::into_raw(Box::new(PcCert(c))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(der, len) }) else {
+            return core::ptr::null_mut();
+        };
+        match Certificate::from_der(bytes.to_vec()) {
+            Ok(c) => Box::into_raw(Box::new(PcCert(c))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Writes the certificate's DER encoding to `out`.

@@ -42,11 +42,13 @@ pub(super) fn pc_ec_inner_key(handle: &PcEcKey) -> &BoxedEcdsaPrivateKey {
 /// Generates an ECDSA key on `curve` (see `PcCurve`), or NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_ec_generate(curve_id: i32) -> *mut PcEcKey {
-    let Some(curve) = curve_from_id(curve_id) else {
-        return core::ptr::null_mut();
-    };
-    let key = BoxedEcdsaPrivateKey::generate(curve, &mut OsRng);
-    Box::into_raw(Box::new(PcEcKey(key)))
+    crate::ffi::common::guard_ptr(|| {
+        let Some(curve) = curve_from_id(curve_id) else {
+            return core::ptr::null_mut();
+        };
+        let key = BoxedEcdsaPrivateKey::generate(curve, &mut OsRng);
+        Box::into_raw(Box::new(PcEcKey(key)))
+    })
 }
 
 /// Parses a SEC1 `EC PRIVATE KEY` PEM into a key handle, or NULL on failure.
@@ -55,16 +57,18 @@ pub extern "C" fn pc_ec_generate(curve_id: i32) -> *mut PcEcKey {
 /// `pem` must be valid UTF-8 for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_ec_from_pem(pem: *const u8, len: usize) -> *mut PcEcKey {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match BoxedEcdsaPrivateKey::from_sec1_pem(s) {
-        Ok(k) => Box::into_raw(Box::new(PcEcKey(k))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match BoxedEcdsaPrivateKey::from_sec1_pem(s) {
+            Ok(k) => Box::into_raw(Box::new(PcEcKey(k))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Writes the key as a SEC1 `EC PRIVATE KEY` PEM string to `out`.
@@ -201,9 +205,11 @@ pub struct PcEd25519Key(Ed25519PrivateKey);
 /// Generates an Ed25519 key, or NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_ed25519_generate() -> *mut PcEd25519Key {
-    Box::into_raw(Box::new(PcEd25519Key(Ed25519PrivateKey::generate(
-        &mut OsRng,
-    ))))
+    crate::ffi::common::guard_ptr(|| {
+        Box::into_raw(Box::new(PcEd25519Key(Ed25519PrivateKey::generate(
+            &mut OsRng,
+        ))))
+    })
 }
 
 /// Parses a PKCS#8 `PRIVATE KEY` PEM into an Ed25519 key handle, or NULL.
@@ -212,16 +218,18 @@ pub extern "C" fn pc_ed25519_generate() -> *mut PcEd25519Key {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_ed25519_from_pem(pem: *const u8, len: usize) -> *mut PcEd25519Key {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match Ed25519PrivateKey::from_pkcs8_pem(s) {
-        Ok(k) => Box::into_raw(Box::new(PcEd25519Key(k))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match Ed25519PrivateKey::from_pkcs8_pem(s) {
+            Ok(k) => Box::into_raw(Box::new(PcEd25519Key(k))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Writes the key as a PKCS#8 `PRIVATE KEY` PEM string to `out`.

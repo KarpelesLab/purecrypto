@@ -40,16 +40,22 @@ pub(super) fn pc_rsa_inner_key(handle: &PcRsaKey) -> &BoxedRsaPrivateKey {
 /// Generates an RSA private key of `bits` (2048, 3072, or 4096), or NULL.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_rsa_generate(bits: u32) -> *mut PcRsaKey {
-    let der = match bits {
-        2048 => RsaPrivateKey::<32>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS).to_pkcs1_der(),
-        3072 => RsaPrivateKey::<48>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS).to_pkcs1_der(),
-        4096 => RsaPrivateKey::<64>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS).to_pkcs1_der(),
-        _ => return core::ptr::null_mut(),
-    };
-    match PcRsaKey::from_pkcs1_der(der) {
-        Some(k) => Box::into_raw(Box::new(k)),
-        None => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let der =
+            match bits {
+                2048 => RsaPrivateKey::<32>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
+                    .to_pkcs1_der(),
+                3072 => RsaPrivateKey::<48>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
+                    .to_pkcs1_der(),
+                4096 => RsaPrivateKey::<64>::generate(Uint::from_u64(E), &mut OsRng, ROUNDS)
+                    .to_pkcs1_der(),
+                _ => return core::ptr::null_mut(),
+            };
+        match PcRsaKey::from_pkcs1_der(der) {
+            Some(k) => Box::into_raw(Box::new(k)),
+            None => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Parses a PKCS#1 `RSA PRIVATE KEY` PEM into a key handle, or NULL on failure.
@@ -58,19 +64,21 @@ pub extern "C" fn pc_rsa_generate(bits: u32) -> *mut PcRsaKey {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_rsa_from_pem(pem: *const u8, len: usize) -> *mut PcRsaKey {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(der) = pem_decode(s, PEM_LABEL) else {
-        return core::ptr::null_mut();
-    };
-    match PcRsaKey::from_pkcs1_der(der) {
-        Some(k) => Box::into_raw(Box::new(k)),
-        None => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(der) = pem_decode(s, PEM_LABEL) else {
+            return core::ptr::null_mut();
+        };
+        match PcRsaKey::from_pkcs1_der(der) {
+            Some(k) => Box::into_raw(Box::new(k)),
+            None => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Writes the key as a PKCS#1 `RSA PRIVATE KEY` PEM to `out`.

@@ -177,10 +177,10 @@ pub unsafe extern "C" fn pc_digest(
 /// Free it with [`pc_hash_free`].
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_hash_new(alg: i32) -> *mut PcHash {
-    match AnyHasher::new(alg) {
+    crate::ffi::common::guard_ptr(|| match AnyHasher::new(alg) {
         Some(h) => Box::into_raw(Box::new(PcHash(h))),
         None => core::ptr::null_mut(),
-    }
+    })
 }
 
 /// Feeds `len` bytes into the hash context.

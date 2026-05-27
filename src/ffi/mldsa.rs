@@ -32,22 +32,24 @@ pub enum PcMlDsa {
 /// Generates an ML-DSA signing key for the given parameter set.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_mldsa_generate(set: i32) -> *mut PcMlDsa {
-    let k = match set {
-        set_id::ML_DSA_44 => {
-            let (sk, _) = MlDsa44PrivateKey::generate(&mut OsRng);
-            PcMlDsa::L44(Box::new(sk))
-        }
-        set_id::ML_DSA_65 => {
-            let (sk, _) = MlDsa65PrivateKey::generate(&mut OsRng);
-            PcMlDsa::L65(Box::new(sk))
-        }
-        set_id::ML_DSA_87 => {
-            let (sk, _) = MlDsa87PrivateKey::generate(&mut OsRng);
-            PcMlDsa::L87(Box::new(sk))
-        }
-        _ => return core::ptr::null_mut(),
-    };
-    Box::into_raw(Box::new(k))
+    crate::ffi::common::guard_ptr(|| {
+        let k = match set {
+            set_id::ML_DSA_44 => {
+                let (sk, _) = MlDsa44PrivateKey::generate(&mut OsRng);
+                PcMlDsa::L44(Box::new(sk))
+            }
+            set_id::ML_DSA_65 => {
+                let (sk, _) = MlDsa65PrivateKey::generate(&mut OsRng);
+                PcMlDsa::L65(Box::new(sk))
+            }
+            set_id::ML_DSA_87 => {
+                let (sk, _) = MlDsa87PrivateKey::generate(&mut OsRng);
+                PcMlDsa::L87(Box::new(sk))
+            }
+            _ => return core::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(k))
+    })
 }
 
 /// Parses a PKCS#8 PEM ML-DSA private key into a handle. NULL on failure.
@@ -56,22 +58,24 @@ pub extern "C" fn pc_mldsa_generate(set: i32) -> *mut PcMlDsa {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_mldsa_from_pkcs8_pem(pem: *const u8, len: usize) -> *mut PcMlDsa {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlDsa::L65(Box::new(k))));
-    }
-    if let Ok(k) = MlDsa44PrivateKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlDsa::L44(Box::new(k))));
-    }
-    if let Ok(k) = MlDsa87PrivateKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlDsa::L87(Box::new(k))));
-    }
-    core::ptr::null_mut()
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlDsa::L65(Box::new(k))));
+        }
+        if let Ok(k) = MlDsa44PrivateKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlDsa::L44(Box::new(k))));
+        }
+        if let Ok(k) = MlDsa87PrivateKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlDsa::L87(Box::new(k))));
+        }
+        core::ptr::null_mut()
+    })
 }
 
 /// PKCS#8 PEM for the private key.

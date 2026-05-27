@@ -33,22 +33,24 @@ pub enum PcMlKem {
 /// Returns NULL on an unknown set.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_mlkem_generate(set: i32) -> *mut PcMlKem {
-    let k = match set {
-        set_id::ML_KEM_512 => {
-            let (sk, _) = MlKem512DecapsKey::generate(&mut OsRng);
-            PcMlKem::K512(Box::new(sk))
-        }
-        set_id::ML_KEM_768 => {
-            let (sk, _) = MlKem768DecapsKey::generate(&mut OsRng);
-            PcMlKem::K768(Box::new(sk))
-        }
-        set_id::ML_KEM_1024 => {
-            let (sk, _) = MlKem1024DecapsKey::generate(&mut OsRng);
-            PcMlKem::K1024(Box::new(sk))
-        }
-        _ => return core::ptr::null_mut(),
-    };
-    Box::into_raw(Box::new(k))
+    crate::ffi::common::guard_ptr(|| {
+        let k = match set {
+            set_id::ML_KEM_512 => {
+                let (sk, _) = MlKem512DecapsKey::generate(&mut OsRng);
+                PcMlKem::K512(Box::new(sk))
+            }
+            set_id::ML_KEM_768 => {
+                let (sk, _) = MlKem768DecapsKey::generate(&mut OsRng);
+                PcMlKem::K768(Box::new(sk))
+            }
+            set_id::ML_KEM_1024 => {
+                let (sk, _) = MlKem1024DecapsKey::generate(&mut OsRng);
+                PcMlKem::K1024(Box::new(sk))
+            }
+            _ => return core::ptr::null_mut(),
+        };
+        Box::into_raw(Box::new(k))
+    })
 }
 
 /// Parses a PKCS#8 PEM ML-KEM private key into a handle, returning NULL on
@@ -58,22 +60,24 @@ pub extern "C" fn pc_mlkem_generate(set: i32) -> *mut PcMlKem {
 /// `pem` must be valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_mlkem_from_pkcs8_pem(pem: *const u8, len: usize) -> *mut PcMlKem {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    if let Ok(k) = MlKem768DecapsKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlKem::K768(Box::new(k))));
-    }
-    if let Ok(k) = MlKem512DecapsKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlKem::K512(Box::new(k))));
-    }
-    if let Ok(k) = MlKem1024DecapsKey::from_pkcs8_pem(s) {
-        return Box::into_raw(Box::new(PcMlKem::K1024(Box::new(k))));
-    }
-    core::ptr::null_mut()
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        if let Ok(k) = MlKem768DecapsKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlKem::K768(Box::new(k))));
+        }
+        if let Ok(k) = MlKem512DecapsKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlKem::K512(Box::new(k))));
+        }
+        if let Ok(k) = MlKem1024DecapsKey::from_pkcs8_pem(s) {
+            return Box::into_raw(Box::new(PcMlKem::K1024(Box::new(k))));
+        }
+        core::ptr::null_mut()
+    })
 }
 
 /// Writes the key as a PKCS#8 `PRIVATE KEY` PEM to `out`.

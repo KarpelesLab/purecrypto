@@ -145,10 +145,12 @@ impl PcQuicCfg {
 /// `PC_TLS_CLIENT` (0) or `PC_TLS_SERVER` (1).
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_quic_cfg_new(role: i32) -> *mut PcQuicCfg {
-    let Some(r) = role_from_i32(role) else {
-        return core::ptr::null_mut();
-    };
-    Box::into_raw(Box::new(PcQuicCfg::new(r)))
+    crate::ffi::common::guard_ptr(|| {
+        let Some(r) = role_from_i32(role) else {
+            return core::ptr::null_mut();
+        };
+        Box::into_raw(Box::new(PcQuicCfg::new(r)))
+    })
 }
 
 /// Frees a QUIC configuration. NULL is ignored.
@@ -423,43 +425,45 @@ pub struct PcQuic {
 /// `cfg` valid.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
-    if cfg.is_null() {
-        return core::ptr::null_mut();
-    }
-    let c = unsafe { &*cfg };
-    let tls_cfg = match c.build_tls_config() {
-        Some(t) => t,
-        None => return core::ptr::null_mut(),
-    };
-    let mut qcfg = QuicConfig {
-        tls: tls_cfg,
-        transport_params: c.tp.clone(),
-        ..QuicConfig::default()
-    };
-    if c.role == QuicRole::Server && c.require_retry {
-        // Mint a fresh random retry secret per connection. The C API
-        // takes no key — production callers that want a long-lived key
-        // should manage the retry token externally. This default
-        // matches the CLI's `-retry` flag behaviour in Phase 9.
-        let mut secret = [0u8; 32];
-        crate::rng::RngCore::fill_bytes(&mut crate::rng::OsRng, &mut secret);
-        qcfg.require_retry = true;
-        qcfg.retry_secret = Some(secret);
-    }
-    let conn = match c.role {
-        QuicRole::Client => {
-            let sni = match c.server_name.as_deref() {
-                Some(s) => s,
-                None => return core::ptr::null_mut(),
-            };
-            QuicConnection::client(qcfg, sni)
+    crate::ffi::common::guard_ptr(|| {
+        if cfg.is_null() {
+            return core::ptr::null_mut();
         }
-        QuicRole::Server => QuicConnection::server(qcfg),
-    };
-    let Ok(inner) = conn else {
-        return core::ptr::null_mut();
-    };
-    Box::into_raw(Box::new(PcQuic { inner }))
+        let c = unsafe { &*cfg };
+        let tls_cfg = match c.build_tls_config() {
+            Some(t) => t,
+            None => return core::ptr::null_mut(),
+        };
+        let mut qcfg = QuicConfig {
+            tls: tls_cfg,
+            transport_params: c.tp.clone(),
+            ..QuicConfig::default()
+        };
+        if c.role == QuicRole::Server && c.require_retry {
+            // Mint a fresh random retry secret per connection. The C API
+            // takes no key — production callers that want a long-lived
+            // key should manage the retry token externally. This default
+            // matches the CLI's `-retry` flag behaviour in Phase 9.
+            let mut secret = [0u8; 32];
+            crate::rng::RngCore::fill_bytes(&mut crate::rng::OsRng, &mut secret);
+            qcfg.require_retry = true;
+            qcfg.retry_secret = Some(secret);
+        }
+        let conn = match c.role {
+            QuicRole::Client => {
+                let sni = match c.server_name.as_deref() {
+                    Some(s) => s,
+                    None => return core::ptr::null_mut(),
+                };
+                QuicConnection::client(qcfg, sni)
+            }
+            QuicRole::Server => QuicConnection::server(qcfg),
+        };
+        let Ok(inner) = conn else {
+            return core::ptr::null_mut();
+        };
+        Box::into_raw(Box::new(PcQuic { inner }))
+    })
 }
 
 /// Frees a QUIC connection. NULL is ignored.

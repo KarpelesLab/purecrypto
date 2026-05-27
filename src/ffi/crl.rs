@@ -15,16 +15,18 @@ pub struct PcCrl(CertificateRevocationList);
 /// `pem` valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_crl_from_pem(pem: *const u8, len: usize) -> *mut PcCrl {
-    let Some(bytes) = (unsafe { slice(pem, len) }) else {
-        return core::ptr::null_mut();
-    };
-    let Ok(s) = core::str::from_utf8(bytes) else {
-        return core::ptr::null_mut();
-    };
-    match CertificateRevocationList::from_pem(s) {
-        Ok(crl) => Box::into_raw(Box::new(PcCrl(crl))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(pem, len) }) else {
+            return core::ptr::null_mut();
+        };
+        let Ok(s) = core::str::from_utf8(bytes) else {
+            return core::ptr::null_mut();
+        };
+        match CertificateRevocationList::from_pem(s) {
+            Ok(crl) => Box::into_raw(Box::new(PcCrl(crl))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Parses a CRL from DER.
@@ -33,13 +35,15 @@ pub unsafe extern "C" fn pc_crl_from_pem(pem: *const u8, len: usize) -> *mut PcC
 /// `der` valid for `len` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_crl_from_der(der: *const u8, len: usize) -> *mut PcCrl {
-    let Some(bytes) = (unsafe { slice(der, len) }) else {
-        return core::ptr::null_mut();
-    };
-    match CertificateRevocationList::from_der(bytes.to_vec()) {
-        Ok(crl) => Box::into_raw(Box::new(PcCrl(crl))),
-        Err(_) => core::ptr::null_mut(),
-    }
+    crate::ffi::common::guard_ptr(|| {
+        let Some(bytes) = (unsafe { slice(der, len) }) else {
+            return core::ptr::null_mut();
+        };
+        match CertificateRevocationList::from_der(bytes.to_vec()) {
+            Ok(crl) => Box::into_raw(Box::new(PcCrl(crl))),
+            Err(_) => core::ptr::null_mut(),
+        }
+    })
 }
 
 /// Verifies that the CRL's outer signature was produced by the subject
@@ -77,17 +81,19 @@ pub unsafe extern "C" fn pc_crl_is_revoked(
     serial_be: *const u8,
     len: usize,
 ) -> i32 {
-    if crl.is_null() {
-        return -1;
-    }
-    let Some(s) = (unsafe { slice(serial_be, len) }) else {
-        return -1;
-    };
-    match unsafe { &*crl }.0.is_revoked(s) {
-        Ok(true) => 1,
-        Ok(false) => 0,
-        Err(_) => -1,
-    }
+    crate::ffi::common::guard_i32(-1, || {
+        if crl.is_null() {
+            return -1;
+        }
+        let Some(s) = (unsafe { slice(serial_be, len) }) else {
+            return -1;
+        };
+        match unsafe { &*crl }.0.is_revoked(s) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(_) => -1,
+        }
+    })
 }
 
 /// Frees a CRL handle. NULL is ignored.

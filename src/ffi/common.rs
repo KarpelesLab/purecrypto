@@ -38,6 +38,20 @@ pub(super) fn guard(f: impl FnOnce() -> PcStatus) -> PcStatus {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(PcStatus::Internal)
 }
 
+/// Wraps an `extern "C" fn` body that returns a `*mut T` so that any panic is
+/// caught and converted to a NULL return. Required because unwinding across
+/// the C ABI is undefined behaviour.
+pub(super) fn guard_ptr<T>(f: impl FnOnce() -> *mut T) -> *mut T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(core::ptr::null_mut())
+}
+
+/// Wraps an `extern "C" fn` body that returns an `i32` so that any panic is
+/// caught and converted to `sentinel` (typically `0` for a boolean query or
+/// `-1` for a query-with-error).
+pub(super) fn guard_i32(sentinel: i32, f: impl FnOnce() -> i32) -> i32 {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or(sentinel)
+}
+
 /// Borrows `len` bytes at `ptr` as a slice. A zero length yields an empty slice
 /// (even if `ptr` is NULL); a NULL pointer with non-zero length yields `None`.
 ///
@@ -77,4 +91,38 @@ pub(super) unsafe fn out_write(data: &[u8], out: *mut u8, out_len: *mut usize) -
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), out, data.len()) };
     }
     PcStatus::Ok
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn guard_catches_panic_returns_internal() {
+        let s = super::guard(|| panic!("test panic"));
+        assert_eq!(s, super::PcStatus::Internal);
+    }
+
+    #[test]
+    fn guard_ptr_catches_panic_and_returns_null() {
+        let p: *mut u8 = super::guard_ptr(|| panic!("test panic"));
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn guard_ptr_passes_value_through() {
+        let mut x = 7u8;
+        let p: *mut u8 = super::guard_ptr(|| &mut x as *mut u8);
+        assert!(!p.is_null());
+    }
+
+    #[test]
+    fn guard_i32_catches_panic_and_returns_sentinel() {
+        let v = super::guard_i32(-42, || panic!("test panic"));
+        assert_eq!(v, -42);
+    }
+
+    #[test]
+    fn guard_i32_passes_value_through() {
+        let v = super::guard_i32(-1, || 5);
+        assert_eq!(v, 5);
+    }
 }
