@@ -268,6 +268,31 @@ enum EngineSide {
     Server(Box<ServerConnection<OsRng>>),
 }
 
+/// Rejects locally-advertised transport parameters that QUIC v1 forbids.
+///
+/// RFC 9000 §18.2: `active_connection_id_limit` MUST be at least 2
+/// (values 0 and 1 are spec violations). We refuse to *send* such a
+/// value rather than discover the problem during the peer's TP
+/// validation — that produces a clear error at construction time.
+fn validate_local_transport_params(tp: &TransportParameters) -> Result<(), Error> {
+    if let Some(limit) = tp.active_connection_id_limit
+        && limit < 2
+    {
+        // RFC 9000 §18.2: "Values below 2 are invalid."
+        return Err(Error::IllegalParameter);
+    }
+    Ok(())
+}
+
+/// Resolves the locally-advertised `active_connection_id_limit` into the
+/// numeric limit we apply to `cid_remote` (the pool of CIDs the peer
+/// issues for us to use). The RFC default is 2; values below 2 are
+/// clamped here defensively (they're already rejected by
+/// [`validate_local_transport_params`] at construction).
+fn our_active_cid_limit(tp: &TransportParameters) -> u64 {
+    tp.active_connection_id_limit.unwrap_or(2).max(2)
+}
+
 impl QuicConnection {
     /// Builds a client. `server_name` is the SNI to embed in the
     /// ClientHello. Picks a random 8-byte DCID + random 8-byte SCID;
@@ -285,6 +310,9 @@ impl QuicConnection {
         server_name: &str,
         dcid: ConnectionId,
     ) -> Result<Self, Error> {
+        // RFC 9000 §18.2 — reject locally-advertised TP values that are
+        // protocol violations (e.g. `active_connection_id_limit < 2`).
+        validate_local_transport_params(&cfg.transport_params)?;
         let scid = random_default_cid();
         let endpoint = build_initial_endpoint(dcid, scid);
         // RFC 9000 §7.3 — both endpoints MUST include their
@@ -351,6 +379,9 @@ impl QuicConnection {
     /// every fresh client Initial that doesn't already carry a valid
     /// token (RFC 9000 §8.1.2). Production servers should set both.
     pub fn server(cfg: QuicConfig) -> Result<Self, Error> {
+        // RFC 9000 §18.2 — reject locally-advertised TP values that are
+        // protocol violations (e.g. `active_connection_id_limit < 2`).
+        validate_local_transport_params(&cfg.transport_params)?;
         let endpoint = build_pending_endpoint();
         let require_retry = cfg.require_retry && cfg.retry_secret.is_some();
         let retry_secret = cfg.retry_secret;
@@ -1865,9 +1896,15 @@ impl QuicConnection {
             if self.cid_local.is_none() {
                 self.cid_local = Some(CidPool::new(our_scid, None));
             }
-            // Seed the remote CID pool with the peer's SCID at sequence 0.
+            // Seed the remote CID pool with the peer's SCID at sequence
+            // 0, and propagate OUR advertised
+            // `active_connection_id_limit` (RFC 9000 §5.1.1 / §18.2 —
+            // the cap applies to CIDs *the peer issues for us*, so it
+            // must match what we advertised, not the pool's default).
             if self.cid_remote.is_none() {
-                self.cid_remote = Some(CidPool::new(peer_scid, None));
+                let mut pool = CidPool::new(peer_scid, None);
+                pool.set_limit(our_active_cid_limit(&self.our_params));
+                self.cid_remote = Some(pool);
             }
             // Populate the ODCID + RetrySCID + ISCID transport params we
             // advertise to the client. RFC 9000 §7.3: these are server-
@@ -1889,7 +1926,14 @@ impl QuicConnection {
             // outbound; on first inbound we sync to the server's
             // chosen SCID).
             self.endpoint.cids.peer = peer_cid;
-            self.cid_remote = Some(CidPool::new(peer_cid, None));
+            // Propagate OUR `active_connection_id_limit` to the pool
+            // bound (RFC 9000 §5.1.1). Without this, the pool's
+            // default of 2 would reject any third NEW_CONNECTION_ID
+            // the server emits per the limit we advertised, tearing
+            // down the connection with `IllegalParameter`.
+            let mut pool = CidPool::new(peer_cid, None);
+            pool.set_limit(our_active_cid_limit(&self.our_params));
+            self.cid_remote = Some(pool);
         }
 
         // Compute the *total* packet length on the wire. For Initial /
@@ -2141,7 +2185,14 @@ impl QuicConnection {
                 }
                 Frame::Crypto { offset, data } => {
                     ack_eliciting = true;
-                    let new_bytes = self.endpoint.bufs.at_mut(level).on_crypto(offset, data);
+                    // RFC 9000 §7.5 — on_crypto enforces the per-level
+                    // CRYPTO reassembly cap (defends against the
+                    // pre-handshake CRYPTO-flood DoS that's trivial for
+                    // an on-path attacker, since Initial AEAD keys are
+                    // derived from the publicly-visible DCID per RFC
+                    // 9001 §5.2). The `?` here is what turns a hostile
+                    // flood into a fatal connection close.
+                    let new_bytes = self.endpoint.bufs.at_mut(level).on_crypto(offset, data)?;
                     if !new_bytes.is_empty() {
                         self.feed_handshake_bytes(level, &new_bytes)?;
                     }
@@ -3083,10 +3134,10 @@ mod tests {
     fn crypto_reassembly_handles_out_of_order_fragments() {
         use crate::quic::crypto_buf::CryptoBuf;
         let mut b = CryptoBuf::new();
-        let out = b.on_crypto(100, b"part-B");
+        let out = b.on_crypto(100, b"part-B").expect("ok");
         assert!(out.is_empty());
         let filler = alloc::vec![0u8; 100];
-        let out = b.on_crypto(0, &filler);
+        let out = b.on_crypto(0, &filler).expect("ok");
         assert_eq!(out.len(), 106);
         assert_eq!(&out[..100], &filler[..]);
         assert_eq!(&out[100..], b"part-B");
@@ -3895,6 +3946,144 @@ mod tests {
             client_pool_len >= 2,
             "server expected at least 2 client-issued CIDs; got {client_pool_len}"
         );
+    }
+
+    /// Regression — RFC 9000 §5.1.1 / §18.2: when both sides advertise
+    /// `active_connection_id_limit = 4`, the post-handshake
+    /// NEW_CONNECTION_ID issuance MUST succeed in installing 3 extra
+    /// CIDs on each side (total 4 = 1 handshake + 3 issued). Before the
+    /// `cid_remote.limit` propagation fix, the receiving side's
+    /// `cid_remote` kept its default cap of 2 and rejected the third
+    /// frame with `IllegalParameter`, tearing the connection down.
+    #[test]
+    fn active_connection_id_limit_above_2_accepts_more_cids() {
+        // Build a loopback pair with the higher CID limit on both sides.
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_tls = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let params = TransportParameters {
+            max_idle_timeout_ms: Some(30_000),
+            max_udp_payload_size: Some(1500),
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            ack_delay_exponent: Some(3),
+            max_ack_delay_ms: Some(25),
+            active_connection_id_limit: Some(4),
+            ..TransportParameters::default()
+        };
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_tls,
+                transport_params: params.clone(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: params,
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+
+        // Drive the handshake plus enough extra rounds for the
+        // post-handshake NEW_CONNECTION_ID frames (3 per side) to make
+        // the round-trip in both directions.
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        for _ in 0..8 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Both `cid_remote` pools should have their limit raised to 4.
+        let client_remote = c.cid_remote.as_ref().expect("client cid_remote");
+        let server_remote = s.cid_remote.as_ref().expect("server cid_remote");
+        assert_eq!(
+            client_remote.limit, 4,
+            "client cid_remote.limit should mirror our_params.active_connection_id_limit"
+        );
+        assert_eq!(
+            server_remote.limit, 4,
+            "server cid_remote.limit should mirror our_params.active_connection_id_limit"
+        );
+
+        // And each side should have accepted ALL of the peer's
+        // NEW_CONNECTION_ID frames (4 total: handshake seq 0 + 3
+        // issued). Before the fix the 3rd issued frame would have
+        // failed `add()` with `IllegalParameter` and torn the
+        // connection down.
+        assert_eq!(
+            client_remote.entries.len(),
+            4,
+            "client should have 4 server-issued CIDs (handshake + 3 NEW_CID)"
+        );
+        assert_eq!(
+            server_remote.entries.len(),
+            4,
+            "server should have 4 client-issued CIDs (handshake + 3 NEW_CID)"
+        );
+        // Neither side should be in a closed/error state.
+        assert!(!c.is_closed());
+        assert!(!s.is_closed());
+    }
+
+    /// RFC 9000 §18.2 — locally-advertising
+    /// `active_connection_id_limit < 2` is forbidden; QuicConnection's
+    /// constructors must reject it rather than silently sending an
+    /// invalid TP that the peer will reject anyway. The validation
+    /// short-circuits at the very top of the constructor so we don't
+    /// need a working TLS config; a default one suffices.
+    #[test]
+    fn active_connection_id_limit_below_2_rejected_at_construction() {
+        for bad in [0u64, 1u64] {
+            let params = TransportParameters {
+                active_connection_id_limit: Some(bad),
+                ..TransportParameters::default()
+            };
+            // Server side.
+            let (server_tls, _cert_der) = ed25519_server();
+            let r = QuicConnection::server(QuicConfig {
+                tls: server_tls,
+                transport_params: params.clone(),
+                ..QuicConfig::default()
+            });
+            let r_is_illegal = matches!(r, Err(Error::IllegalParameter));
+            assert!(
+                r_is_illegal,
+                "server with limit={bad} should be rejected, got Ok=ok"
+            );
+            // Client side. Validation runs before any TLS-engine
+            // construction, so a default TLS config is fine.
+            let client_tls = Config {
+                max_version: crate::tls::ProtocolVersion::TLSv1_3,
+                min_version: crate::tls::ProtocolVersion::TLSv1_3,
+                ..Config::default()
+            };
+            let r = QuicConnection::client(
+                QuicConfig {
+                    tls: client_tls,
+                    transport_params: params,
+                    ..QuicConfig::default()
+                },
+                "loopback.example",
+            );
+            let r_is_illegal = matches!(r, Err(Error::IllegalParameter));
+            assert!(
+                r_is_illegal,
+                "client with limit={bad} should be rejected, got Ok=ok"
+            );
+        }
     }
 
     /// Test 12 — advancing the `retire_prior_to` watermark on the

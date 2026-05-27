@@ -30,6 +30,32 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
+use crate::tls::Error;
+
+/// Per-level cap on out-of-order CRYPTO frame pending bytes. RFC 9000 §7.5
+/// motivates an implementation-defined limit; this value is large enough to
+/// accommodate a typical TLS 1.3 server flight (cert chain + CV + Finished
+/// often ~20 KiB) while bounded enough to defeat the trivial pre-handshake
+/// DoS class.
+///
+/// Background — pre-handshake CRYPTO-flood DoS: Initial-level AEAD keys
+/// are derived from the publicly-visible DCID via the v1 salt (RFC 9001
+/// §5.2), so any on-path attacker can synthesize AEAD-valid Initial
+/// packets carrying CRYPTO frames at attacker-chosen offsets. Without a
+/// cap, those out-of-order fragments accumulate in
+/// [`CryptoBuf::pending`] without bound; this cap is what makes
+/// [`on_crypto`](CryptoBuf::on_crypto) return [`Error::Decode`] before
+/// memory grows past a small fixed budget. The QUIC connection layer
+/// maps that error to a fatal connection close.
+pub(crate) const MAX_PENDING_CRYPTO_BYTES: usize = 64 * 1024;
+
+/// Per-level cap on the number of disjoint pending fragments. Prevents
+/// fragment-count amplification of small-fragment floods (a stream of
+/// 1-byte fragments at distinct offsets would otherwise grow `pending`'s
+/// `BTreeMap` node count unboundedly without coming anywhere near
+/// `MAX_PENDING_CRYPTO_BYTES`).
+pub(crate) const MAX_PENDING_FRAGMENTS: usize = 32;
+
 /// Per-encryption-level CRYPTO byte stream.
 ///
 /// Inbound side: [`on_crypto`](Self::on_crypto) inserts a fragment and
@@ -80,24 +106,34 @@ impl CryptoBuf {
     /// Duplicate / fully-overlapping fragments return an empty vector.
     /// The caller forwards the returned bytes to
     /// `process_quic_handshake_bytes(level, &bytes)`.
-    pub(crate) fn on_crypto(&mut self, mut offset: u64, mut data: &[u8]) -> Vec<u8> {
+    ///
+    /// Returns `Err(Error::Decode)` (RFC 9000 §7.5 — the
+    /// `CRYPTO_BUFFER_EXCEEDED` class) if accepting this fragment would
+    /// push the out-of-order pending budget above
+    /// [`MAX_PENDING_CRYPTO_BYTES`] or [`MAX_PENDING_FRAGMENTS`]. The
+    /// connection layer maps that error to a fatal close, which is the
+    /// correct response to a pre-handshake CRYPTO-flood DoS attempt.
+    pub(crate) fn on_crypto(&mut self, mut offset: u64, mut data: &[u8]) -> Result<Vec<u8>, Error> {
         // Trim any bytes already delivered.
         if offset < self.next_offset {
             let skip = (self.next_offset - offset) as usize;
             if skip >= data.len() {
                 // Entirely already delivered.
-                return Vec::new();
+                return Ok(Vec::new());
             }
             data = &data[skip..];
             offset = self.next_offset;
         }
         // Empty fragment — nothing to do.
         if data.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // If this fragment is the exact in-order continuation, fast-path
-        // append and then absorb any consecutive pending fragments.
+        // append and then absorb any consecutive pending fragments. This
+        // path only shrinks `pending` (it never grows it), so no cap
+        // check is needed here — by definition the in-order bytes leave
+        // the out-of-order budget.
         if offset == self.next_offset {
             let mut released = data.to_vec();
             self.next_offset += data.len() as u64;
@@ -116,7 +152,7 @@ impl CryptoBuf {
                 released.extend_from_slice(new_bytes);
                 self.next_offset = end;
             }
-            return released;
+            return Ok(released);
         }
 
         // Out-of-order. Coalesce with adjacent pending entries to avoid
@@ -129,19 +165,41 @@ impl CryptoBuf {
             let prev_end = prev_off + prev_data.len() as u64;
             if prev_end >= end {
                 // New fragment fully covered; drop.
-                return Vec::new();
+                return Ok(Vec::new());
             }
         }
-        // Insert / replace.
-        let existing_len = self
-            .pending
-            .get(&offset)
-            .map(|v| v.len() as u64)
-            .unwrap_or(0);
-        if data.len() as u64 > existing_len {
-            self.pending.insert(offset, data.to_vec());
+        // Determine whether the insert grows `pending` (a fresh offset)
+        // or replaces an existing shorter entry at the same offset. Only
+        // the net delta matters for the byte cap; the fragment-count cap
+        // is checked when we'd be allocating a new key.
+        let existing_len = self.pending.get(&offset).map(|v| v.len()).unwrap_or(0);
+        if data.len() <= existing_len {
+            // New fragment is not larger than what we already have at
+            // this offset — silently drop (the predecessor-overlap check
+            // above only catches strict prefixes).
+            return Ok(Vec::new());
         }
-        Vec::new()
+        let new_total_bytes = self
+            .total_pending_bytes()
+            .saturating_add(data.len() - existing_len);
+        if new_total_bytes > MAX_PENDING_CRYPTO_BYTES {
+            // RFC 9000 §7.5 — out-of-order reassembly budget exhausted.
+            return Err(Error::Decode);
+        }
+        if existing_len == 0 && self.pending.len() >= MAX_PENDING_FRAGMENTS {
+            // Fragment-count cap. Only checked on a fresh offset (a same-
+            // offset replace doesn't add a node).
+            return Err(Error::Decode);
+        }
+        self.pending.insert(offset, data.to_vec());
+        Ok(Vec::new())
+    }
+
+    /// Total size of out-of-order pending bytes across all fragments.
+    /// Used by the RFC 9000 §7.5 cap check in [`on_crypto`] and by the
+    /// tests that exercise it.
+    fn total_pending_bytes(&self) -> usize {
+        self.pending.values().map(Vec::len).sum()
     }
 
     // ---- Outbound side --------------------------------------------------
@@ -214,12 +272,12 @@ mod tests {
     #[test]
     fn in_order_pass_through() {
         let mut b = CryptoBuf::new();
-        let out = b.on_crypto(0, b"hello");
+        let out = b.on_crypto(0, b"hello").expect("ok");
         assert_eq!(out, b"hello");
         assert_eq!(b.next_offset(), 5);
         assert!(b.is_pending_empty());
 
-        let out = b.on_crypto(5, b" world");
+        let out = b.on_crypto(5, b" world").expect("ok");
         assert_eq!(out, b" world");
         assert_eq!(b.next_offset(), 11);
     }
@@ -229,14 +287,14 @@ mod tests {
         // Insert offset=100 (out of order), then offset=0 (in order); the
         // delivered_so_far should merge.
         let mut b = CryptoBuf::new();
-        let out = b.on_crypto(100, b"second-block");
+        let out = b.on_crypto(100, b"second-block").expect("ok");
         assert!(out.is_empty());
         assert_eq!(b.next_offset(), 0);
         assert!(!b.is_pending_empty());
 
         // Now fill the gap [0..100):
         let filler = alloc::vec![b'a'; 100];
-        let out = b.on_crypto(0, &filler);
+        let out = b.on_crypto(0, &filler).expect("ok");
         // We expect the filler PLUS the previously-pending block.
         assert_eq!(out.len(), 100 + 12);
         assert_eq!(&out[..100], &filler[..]);
@@ -248,12 +306,12 @@ mod tests {
     #[test]
     fn duplicate_fragment_is_swallowed() {
         let mut b = CryptoBuf::new();
-        let _ = b.on_crypto(0, b"hello world");
+        let _ = b.on_crypto(0, b"hello world").expect("ok");
         // Resend offset 0 — already delivered.
-        let out = b.on_crypto(0, b"hello world");
+        let out = b.on_crypto(0, b"hello world").expect("ok");
         assert!(out.is_empty());
         // Resend a strict subset.
-        let out = b.on_crypto(2, b"llo");
+        let out = b.on_crypto(2, b"llo").expect("ok");
         assert!(out.is_empty());
         assert_eq!(b.next_offset(), 11);
     }
@@ -261,10 +319,10 @@ mod tests {
     #[test]
     fn fragment_straddles_boundary() {
         let mut b = CryptoBuf::new();
-        let _ = b.on_crypto(0, b"hello");
+        let _ = b.on_crypto(0, b"hello").expect("ok");
         // Fragment at offset 3 ("lo world") — first two bytes already
         // delivered, last six are new.
-        let out = b.on_crypto(3, b"lo world");
+        let out = b.on_crypto(3, b"lo world").expect("ok");
         assert_eq!(out, b" world");
         assert_eq!(b.next_offset(), 11);
     }
@@ -330,13 +388,118 @@ mod tests {
     #[test]
     fn pending_smaller_fragment_does_not_overwrite_larger() {
         let mut b = CryptoBuf::new();
-        let _ = b.on_crypto(10, b"longer-fragment");
+        let _ = b.on_crypto(10, b"longer-fragment").expect("ok");
         // Insert a shorter fragment at the same offset — must NOT shrink
         // the pending entry.
-        let _ = b.on_crypto(10, b"long");
+        let _ = b.on_crypto(10, b"long").expect("ok");
         // Fill the gap and assert we still get the long fragment.
         let filler = alloc::vec![b'X'; 10];
-        let out = b.on_crypto(0, &filler);
+        let out = b.on_crypto(0, &filler).expect("ok");
         assert_eq!(&out[10..], b"longer-fragment");
+    }
+
+    /// RFC 9000 §7.5 — CRYPTO_BUFFER_EXCEEDED. Feeding out-of-order
+    /// fragments past [`MAX_PENDING_CRYPTO_BYTES`] must surface an
+    /// error rather than growing `pending` unboundedly.
+    #[test]
+    fn crypto_buf_rejects_oversize_pending() {
+        let mut b = CryptoBuf::new();
+        // 8 KiB chunks at distinct out-of-order offsets, starting far
+        // past zero so they all live in `pending`. 8 chunks = 64 KiB =
+        // exactly MAX_PENDING_CRYPTO_BYTES; the 9th overflows the cap.
+        let chunk_size = 8 * 1024;
+        let chunk = alloc::vec![b'A'; chunk_size];
+        // Use a starting offset well above zero so the in-order
+        // fast-path is never hit.
+        let base = 1u64 << 20;
+        let max_chunks = MAX_PENDING_CRYPTO_BYTES / chunk_size;
+        for i in 0..max_chunks {
+            let off = base + (i as u64) * (chunk_size as u64);
+            b.on_crypto(off, &chunk).expect("under cap");
+        }
+        // One more byte at a fresh offset should fail.
+        let extra_off = base + (max_chunks as u64) * (chunk_size as u64);
+        let res = b.on_crypto(extra_off, b"X");
+        assert!(matches!(res, Err(Error::Decode)));
+        // And `pending` is bounded — total stays at the cap.
+        assert_eq!(b.total_pending_bytes(), MAX_PENDING_CRYPTO_BYTES);
+    }
+
+    /// Fragment-count amplification: small-fragment floods are bounded
+    /// by [`MAX_PENDING_FRAGMENTS`].
+    #[test]
+    fn crypto_buf_rejects_too_many_fragments() {
+        let mut b = CryptoBuf::new();
+        // 32 single-byte fragments at distinct offsets above zero —
+        // fill `pending` to MAX_PENDING_FRAGMENTS without coming
+        // anywhere near MAX_PENDING_CRYPTO_BYTES.
+        let base = 1u64 << 20;
+        for i in 0..MAX_PENDING_FRAGMENTS {
+            let off = base + (i as u64) * 1024; // strided so no overlap
+            b.on_crypto(off, b"X").expect("under cap");
+        }
+        // The 33rd disjoint fragment fails.
+        let extra_off = base + (MAX_PENDING_FRAGMENTS as u64) * 1024;
+        let res = b.on_crypto(extra_off, b"X");
+        assert!(matches!(res, Err(Error::Decode)));
+        assert_eq!(b.pending.len(), MAX_PENDING_FRAGMENTS);
+    }
+
+    /// Once buffered fragments are delivered (by filling the gap), the
+    /// budget relaxes — the cap is on currently-pending bytes, not
+    /// lifetime CRYPTO bytes.
+    #[test]
+    fn crypto_buf_capacity_relaxes_after_delivery() {
+        let mut b = CryptoBuf::new();
+        // Stage 1: 32 KiB out-of-order at offset 32 KiB. Under cap.
+        let half = MAX_PENDING_CRYPTO_BYTES / 2; // 32 KiB
+        let block_a = alloc::vec![b'A'; half];
+        b.on_crypto(half as u64, &block_a).expect("under cap");
+        assert_eq!(b.total_pending_bytes(), half);
+
+        // Stage 2: fill the gap [0..32 KiB) — delivery drains `pending`.
+        let filler = alloc::vec![b'F'; half];
+        let out = b.on_crypto(0, &filler).expect("delivery");
+        assert_eq!(out.len(), half + half); // filler + previously-pending
+        assert_eq!(b.next_offset(), (half * 2) as u64);
+        assert_eq!(b.total_pending_bytes(), 0);
+
+        // Stage 3: another 32 KiB at offset 96 KiB is in-order
+        // continuation if we first fill [64 KiB..96 KiB); pre-fill
+        // that gap so the second 32 KiB lands in-order without
+        // tripping the cap (the cap is on out-of-order pending).
+        let bridge = alloc::vec![b'B'; half];
+        let _ = b.on_crypto((half * 2) as u64, &bridge).expect("in-order");
+        let block_c = alloc::vec![b'C'; half];
+        let _ = b
+            .on_crypto((half * 3) as u64, &block_c)
+            .expect("still in-order");
+        assert_eq!(b.next_offset(), (half * 4) as u64);
+        assert_eq!(b.total_pending_bytes(), 0);
+    }
+
+    /// Inserting a strictly-longer fragment at an offset that already
+    /// has a shorter entry only counts the delta against the cap —
+    /// it must NOT double-count the replaced bytes.
+    #[test]
+    fn crypto_buf_replace_at_offset_counts_delta_only() {
+        let mut b = CryptoBuf::new();
+        let base = 1u64 << 20;
+        // Fill to (cap - 1024) bytes via 8 KiB strided fragments.
+        let chunk_size = 8 * 1024;
+        let chunk_short = alloc::vec![b'S'; chunk_size - 128];
+        let chunk_full = alloc::vec![b'F'; chunk_size];
+        // 7 short fragments + 1 full = 7*(8192-128) + 8192 = 64 KiB - 896.
+        for i in 0..7 {
+            let off = base + (i as u64) * (chunk_size as u64);
+            b.on_crypto(off, &chunk_short).expect("under cap");
+        }
+        let last_off = base + 7 * (chunk_size as u64);
+        b.on_crypto(last_off, &chunk_full).expect("under cap");
+        // Now upgrade fragment 0 from short to full — that's a +128
+        // delta; cap is 64 KiB and we're at 64 KiB - 7*128 + 0 = some
+        // value well under. Just confirm the replace succeeds.
+        let replaced = b.on_crypto(base, &chunk_full);
+        assert!(replaced.is_ok());
     }
 }

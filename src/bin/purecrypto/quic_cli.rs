@@ -15,10 +15,9 @@
 //! * `initial_max_data = 1 MiB`, `initial_max_stream_data_* = 256 KiB`.
 //! * `initial_max_streams_bidi = 16`, `initial_max_streams_uni = 16`.
 //! * `ack_delay_exponent = 3`, `max_ack_delay_ms = 25`.
-//! * `active_connection_id_limit = 2` (RFC 9000 §18.2 minimum — Phase 8
-//!   engine seeds `cid_remote.limit` from its default of 2 rather than
-//!   from the local TP; raising the limit triggers
-//!   `IllegalParameter` on NEW_CONNECTION_ID processing).
+//! * `active_connection_id_limit = 4` — the engine now propagates the
+//!   locally-advertised limit into `cid_remote.limit` at construction,
+//!   so values above the RFC 9000 §18.2 minimum of 2 are honored.
 //! * `max_datagram_frame_size = 1200` (RFC 9221).
 
 use std::io::{IsTerminal, Read, Write};
@@ -145,7 +144,7 @@ fn default_transport_params() -> TransportParameters {
         initial_max_streams_uni: Some(16),
         ack_delay_exponent: Some(3),
         max_ack_delay_ms: Some(25),
-        active_connection_id_limit: Some(2),
+        active_connection_id_limit: Some(4),
         max_datagram_frame_size: Some(1200),
         ..TransportParameters::default()
     }
