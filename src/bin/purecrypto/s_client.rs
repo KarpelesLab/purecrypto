@@ -74,6 +74,34 @@ fn resolve_version(args: &Args) -> ProtocolVersion {
     best.map(|(_, v)| v).unwrap_or(ProtocolVersion::Tls13)
 }
 
+/// `true` iff the rightmost protocol flag on the command line is `-quic`
+/// (or `--quic`). Used to decide whether to dispatch to the QUIC driver
+/// instead of the TLS / DTLS code path below. Mirrors the right-most-wins
+/// semantics of [`resolve_version`].
+fn has_latest_quic(args: &Args) -> bool {
+    let quic_pos = args.last_pos("-quic").max(args.last_pos("--quic"));
+    let Some(qp) = quic_pos else {
+        return false;
+    };
+    for name in [
+        "-tls1_2",
+        "--tls1_2",
+        "-tls1_3",
+        "--tls1_3",
+        "-dtls1_2",
+        "--dtls1_2",
+        "-dtls1_3",
+        "--dtls1_3",
+    ] {
+        if let Some(op) = args.last_pos(name)
+            && op > qp
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Loads trust roots: from `ca_file` if given, else the system bundle.
 fn load_roots(ca_file: Option<&str>) -> RootCertStore {
     const SYSTEM_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
@@ -230,6 +258,14 @@ fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
 }
 
 pub(crate) fn run(args: Args) {
+    // -quic dispatches to the QUIC-specific UDP driver. We treat -quic
+    // as the highest-priority protocol flag — if any other version flag
+    // appears later on the command line it takes precedence (right-most
+    // wins), so `q_client -tls1_3 ...` still demotes to TLS-over-TCP.
+    if has_latest_quic(&args) {
+        crate::quic_cli::run_client(args);
+        return;
+    }
     let version = resolve_version(&args);
     let value_flags = [
         "-connect",

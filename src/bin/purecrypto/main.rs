@@ -14,6 +14,9 @@ mod mac;
 mod pkey;
 mod pkeyutl;
 mod pki;
+mod q_client;
+mod q_server;
+mod quic_cli;
 mod rand;
 mod req;
 mod s_client;
@@ -52,6 +55,8 @@ COMMANDS:
     s_server             Run a one-shot TLS 1.3 echo/-www server
     s_dtls_client        Open a DTLS 1.2 connection over UDP
     s_dtls_server        Run a one-shot DTLS 1.2 echo server over UDP
+    q_client             Open a QUIC v1 connection over UDP
+    q_server             Run a one-shot QUIC v1 echo/-www server over UDP
     help                 Show this help
 
 Run a command with no/invalid arguments to see its usage.";
@@ -80,6 +85,8 @@ fn main() {
         Some("s_server") => s_server::run(rest),
         Some("s_dtls_client") => s_dtls_client::run(rest),
         Some("s_dtls_server") => s_dtls_server::run(rest),
+        Some("q_client") => q_client::run(rest),
+        Some("q_server") => q_server::run(rest),
         Some("help") | Some("-h") | Some("--help") | None => println!("{USAGE}"),
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }

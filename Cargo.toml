@@ -54,7 +54,7 @@ slhdsa = ["hash", "rng", "alloc"]
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509"]
 # The `purecrypto` command-line tool (gates the binary target below).
-cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "kdf", "cipher"]
+cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher"]
 
 [[bin]]
 name = "purecrypto"

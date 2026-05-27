@@ -2098,6 +2098,94 @@ fn crl_inspect_verify_serial() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// QUIC v1 (RFC 9000) round-trip: `q_server -www` sends a canned
+/// payload over the peer-initiated bidi stream; `q_client` reads it and
+/// prints it to stdout. End-to-end exercise of the UDP loopback,
+/// Initial / Handshake / 1-RTT key derivation, stream open + write +
+/// finish + close.
+///
+/// This is the first time the QUIC engine runs over a real `UdpSocket`
+/// (Phase 1-8 used an in-process loopback in `connection.rs` tests).
+#[test]
+fn q_client_q_server_roundtrip() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    // Pick a free UDP port up front by binding then dropping.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind probe");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    // Self-signed Ed25519 cert for 127.0.0.1.
+    let dir = std::env::temp_dir().join(format!("pc_quic_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("cert.pem");
+    let key_path = dir.join("key.pem");
+    let mut rng = OsRng;
+    let key = Ed25519PrivateKey::generate(&mut rng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+
+    let server_proc = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args([
+            "q_server",
+            "-accept",
+            &format!("127.0.0.1:{port}"),
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            key_path.to_str().unwrap(),
+            "-alpn",
+            "h3",
+            "-www",
+            "-quiet",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn q_server");
+
+    // Give the server time to bind the UDP socket. 300ms matches the
+    // DTLS tests' guard for the same kind of bind race.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let (out, _ok) = run(
+        &[
+            "q_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-alpn",
+            "h3",
+            "-quiet",
+        ],
+        b"",
+    );
+
+    let _ = server_proc.wait_with_output();
+
+    assert!(
+        out.contains("hello from purecrypto q_server"),
+        "expected -www body in q_client stdout, got: {out:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn cli_subcommand_table_help() {
     // Every CLI subcommand should print a recognizable usage hint and exit
@@ -2122,6 +2210,8 @@ fn cli_subcommand_table_help() {
         "s_server",
         "s_dtls_client",
         "s_dtls_server",
+        "q_client",
+        "q_server",
     ] {
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_purecrypto"))
             .arg(sub)

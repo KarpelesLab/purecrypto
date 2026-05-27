@@ -68,6 +68,34 @@ fn resolve_version(args: &Args) -> ProtocolVersion {
     best.map(|(_, v)| v).unwrap_or(ProtocolVersion::Tls13)
 }
 
+/// `true` iff the rightmost protocol flag on the command line is `-quic`
+/// (or `--quic`). Used to decide whether to dispatch to the QUIC driver
+/// instead of the TLS / DTLS code path below. Mirrors the right-most-wins
+/// semantics of [`resolve_version`].
+fn has_latest_quic(args: &Args) -> bool {
+    let quic_pos = args.last_pos("-quic").max(args.last_pos("--quic"));
+    let Some(qp) = quic_pos else {
+        return false;
+    };
+    for name in [
+        "-tls1_2",
+        "--tls1_2",
+        "-tls1_3",
+        "--tls1_3",
+        "-dtls1_2",
+        "--dtls1_2",
+        "-dtls1_3",
+        "--dtls1_3",
+    ] {
+        if let Some(op) = args.last_pos(name)
+            && op > qp
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Parses a comma-separated ALPN list.
 fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
     s.split(',')
@@ -164,6 +192,12 @@ fn load_signing_key(key_path: &str) -> SigningKey {
 }
 
 pub(crate) fn run(args: Args) {
+    // -quic dispatches to the QUIC-specific UDP driver. Right-most
+    // wins between -quic / -tls1_* / -dtls1_*.
+    if has_latest_quic(&args) {
+        crate::quic_cli::run_server(args);
+        return;
+    }
     let version = resolve_version(&args);
     let cert_path = args.value("-cert").unwrap_or_else(|| {
         die(
