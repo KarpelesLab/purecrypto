@@ -437,7 +437,27 @@ impl RecvStream {
         if end > self.max_data {
             return Err(crate::tls::Error::Decode);
         }
-        // FIN final-size consistency (RFC 9000 §4.5, §19.8).
+        // G-2: RFC 9000 §4.5 — once the final size is known (a FIN was
+        // observed), any STREAM frame whose payload extends at or beyond
+        // that final size MUST be treated as FINAL_SIZE_ERROR. This
+        // catches non-FIN bytes claiming to live past the FIN, and also
+        // a contradictory FIN at a different offset (the explicit
+        // `prev != fin_off` branch below would otherwise catch the
+        // latter, but only when `fin == true`).
+        if let Some(prev_fin) = self.fin_offset {
+            // A frame whose extent exceeds the known final size is
+            // illegal regardless of whether it carries FIN.
+            if end > prev_fin {
+                return Err(crate::tls::Error::Decode);
+            }
+            // A FIN-bearing frame whose end disagrees with the recorded
+            // final size is also illegal.
+            if fin && end != prev_fin {
+                return Err(crate::tls::Error::Decode);
+            }
+        }
+        // FIN final-size consistency (RFC 9000 §4.5, §19.8) — record the
+        // final size on the first FIN we see.
         if fin {
             let fin_off = end;
             match self.fin_offset {
@@ -547,9 +567,24 @@ impl RecvStream {
     /// (or stays in a terminal state).
     pub(crate) fn on_reset(&mut self, code: u64, final_size: u64) -> Result<(), crate::tls::Error> {
         // §3.4.1 / §4.5: final_size must be ≥ any previously-observed
-        // offset and consistent with a prior FIN.
+        // offset and consistent with a prior FIN. The "previously-
+        // observed offset" includes out-of-order pending fragments —
+        // the contiguous-prefix `next_offset` alone undercounts when
+        // we've buffered a later fragment.
         if final_size < self.next_offset {
             return Err(crate::tls::Error::Decode);
+        }
+        // G-2: tighten — pending out-of-order fragments may already
+        // extend past `next_offset`. RESET_STREAM cannot declare a
+        // final size that is below any byte the peer has *already*
+        // committed to (RFC 9000 §4.5). Scan all pending entries —
+        // overlap suppression is not strict enough to guarantee the
+        // last-key entry has the maximal end.
+        for (&p_off, p_data) in self.pending.iter() {
+            let p_end = p_off + p_data.len() as u64;
+            if final_size < p_end {
+                return Err(crate::tls::Error::Decode);
+            }
         }
         if let Some(fin) = self.fin_offset
             && final_size != fin
@@ -838,5 +873,48 @@ mod tests {
         assert!(r.pending.is_empty());
         assert_eq!(r.reset_code, Some(42));
         assert_eq!(r.state, RecvState::ResetRecvd);
+    }
+
+    /// G-2: STREAM frame with FIN at offset 0 declares final_size=100.
+    /// A subsequent non-FIN frame at offset 150 must error
+    /// (FINAL_SIZE_ERROR — RFC 9000 §4.5).
+    #[test]
+    fn recv_data_past_fin_offset_errors() {
+        let mut r = RecvStream::new(1024);
+        // FIN frame establishing final_size = 100.
+        let n = r.on_data(0, &[b'A'; 100], true).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(r.fin_offset, Some(100));
+        // Non-FIN frame whose extent (160) exceeds the recorded final
+        // size — MUST be rejected.
+        let err = r.on_data(150, &[b'B'; 10], false);
+        assert!(err.is_err(), "data past fin_offset must error");
+        // A FIN frame at the same final size is fine (idempotent).
+        let _ = r.on_data(99, &[b'A'; 1], true); // already delivered, idempotent
+    }
+
+    /// G-2: FIN at offset 0..100; another FIN at 0..120 is contradictory.
+    #[test]
+    fn recv_contradictory_fin_errors() {
+        let mut r = RecvStream::new(1024);
+        let _ = r.on_data(0, &[b'A'; 100], true).unwrap();
+        // FIN at a different final size must error.
+        let err = r.on_data(0, &[b'A'; 120], true);
+        assert!(err.is_err(), "contradictory FIN must error");
+    }
+
+    /// G-2: on_reset rejects final_size below the highest pending end.
+    #[test]
+    fn reset_below_pending_end_errors() {
+        let mut r = RecvStream::new(1024);
+        // Out-of-order: stash [100..150] pending; next_offset stays 0.
+        let _ = r.on_data(100, &[b'C'; 50], false).unwrap();
+        // RESET_STREAM declaring final_size=80 — below the 150 we've
+        // already committed to via pending.
+        let err = r.on_reset(0, 80);
+        assert!(err.is_err(), "reset below pending end must error");
+        // final_size >= 150 is fine.
+        let ok = r.on_reset(0, 200);
+        assert!(ok.is_ok());
     }
 }

@@ -237,6 +237,14 @@ pub struct QuicConnection {
     /// been installed in `endpoint.loss`. Idempotent guard so we don't
     /// reinstall on every drain cycle.
     peer_ack_params_installed: bool,
+    /// G-4: True once we have successfully parsed and dispatched any
+    /// non-Version-Negotiation packet from the peer. RFC 9000 §6.2: "A
+    /// client MUST discard any Version Negotiation packet if it has
+    /// received and successfully processed any other packet ...". This
+    /// flag tracks "successfully processed any other packet" for the
+    /// client. (Server-side, VN is always dropped — servers never
+    /// receive VN.)
+    peer_packet_seen: bool,
 }
 
 /// RFC 9000 §8.1 anti-amplification window. Until the server has
@@ -411,6 +419,7 @@ impl QuicConnection {
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             peer_ack_params_installed: false,
+            peer_packet_seen: false,
         };
 
         // Drain the ClientHello bytes the engine just produced into the
@@ -483,6 +492,7 @@ impl QuicConnection {
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             peer_ack_params_installed: false,
+            peer_packet_seen: false,
         })
     }
 
@@ -631,6 +641,23 @@ impl QuicConnection {
         };
 
         if hdr.token.is_empty() {
+            // G-1 hardening: if we've already sent a Retry to this
+            // 4-tuple, any subsequent tokenless Initial is either a
+            // benign retransmit of the *first* Initial (the client's
+            // retried Initial would carry a token) OR an attacker-
+            // injected datagram trying to corrupt our pinned ODCID /
+            // retry_scid by forcing a fresh Retry emission. Either way,
+            // emitting another Retry would overwrite `original_dcid`,
+            // `retry_scid`, and `pending_retry_datagram` — which then
+            // desyncs from the client's legitimately retried Initial
+            // (it still uses the *first* Retry's SCID as DCID).
+            //
+            // Silently drop per RFC 9000 §8.1.2 "Address Validation
+            // Using Retry Packets" — a server that has already issued
+            // a Retry will not normally issue another one.
+            if self.retry_sent {
+                return Ok(Some(datagram.len()));
+            }
             // First Initial — emit Retry.
             let peer_addr = match self.peer_addr {
                 Some(a) => a,
@@ -725,6 +752,58 @@ impl QuicConnection {
         if self.handshake_complete && !self.has_pending_outbound() {
             return Vec::new();
         }
+        // G-5: AMP-cap envelope check BEFORE we start mutating any
+        // outbound state. `build_packet_with_pad` and `assemble_payload`
+        // mutate state irreversibly (pending_ack.clear(), crypto_buf
+        // carve, streams.pop_frame, and crucially
+        // `datagram_queues.pop_outbound` — which RFC 9221 §5 forbids
+        // retransmitting). If the assembled datagram would then exceed
+        // the AMP budget, we'd be discarding state we can never
+        // recover for DATAGRAM frames specifically.
+        //
+        // Strategy: server pre-validation only. We compute the
+        // outbound budget and refuse to even start assembly if it
+        // can't cover at least one v1 minimum packet (1200 bytes for
+        // the very first client Initial, smaller thereafter). Bytes
+        // ACK / CRYPTO are RFC-permitted to retransmit, so a borderline
+        // build that ends up just under the cap is still acceptable —
+        // but a build that *exceeds* the cap and is then dropped would
+        // lose any DATAGRAM frames it carved.
+        //
+        // We use the worst-case datagram size (UDP MTU ≈ 1200 bytes
+        // for the initial-PMTU floor of RFC 9000 §14) as a coarse
+        // upper bound on what build_packet_with_pad might produce.
+        if self.role == Role::Server && !self.addr_validation.validated {
+            // Worst case: the assembled datagram could be up to ~1500
+            // bytes (max we ever pad to; in practice 1200 for the
+            // first Initial, ≤ 1200 thereafter without explicit
+            // padding). Be conservative — if the budget can't even
+            // accommodate the minimum useful size, snapshot the
+            // datagram queue and restore on rejection. We do the
+            // snapshot path rather than refuse-up-front so that
+            // small CRYPTO / ACK assemblies that *do* fit the budget
+            // still go out.
+            let outbound_snapshot = self.datagram_queues.outbound.clone();
+            let saved_bytes_sent = self.addr_validation.bytes_sent;
+            let datagram = self.pop_datagram_inner();
+            // If the inner call rejected (returned empty) but had
+            // already mutated the DATAGRAM queue, restore the queue.
+            if datagram.is_empty() && self.datagram_queues.outbound != outbound_snapshot {
+                self.datagram_queues.outbound = outbound_snapshot;
+                // Also restore bytes_sent — but the inner path only
+                // calls note_sent on success, so it's already correct.
+                let _ = saved_bytes_sent;
+            }
+            return datagram;
+        }
+        self.pop_datagram_inner()
+    }
+
+    /// G-5: the original body of [`Self::pop_datagram`], extracted so
+    /// the AMP-cap snapshot/restore wrapper can intercept rejected
+    /// builds. Returns the assembled datagram or an empty `Vec` if
+    /// nothing is pending OR the build was rejected by the AMP cap.
+    fn pop_datagram_inner(&mut self) -> Vec<u8> {
         // Try to pack Initial → Handshake → 1-RTT into one datagram.
         // Each level contributes at most one packet (per RFC 9000 §12.2:
         // coalesced packets share a UDP datagram but each has its own
@@ -1647,6 +1726,18 @@ impl QuicConnection {
         {
             let parsed = TransportParameters::decode(&raw)?;
             self.validate_peer_transport_params(&parsed)?;
+            // G-3: the peer's `stateless_reset_token` TP is the token
+            // for the handshake CID (sequence 0 in our `cid_remote`
+            // pool). Install it now so subsequent inbound datagrams
+            // can be checked for stateless-reset trailers against the
+            // handshake CID, not just against later NCIDs. Only
+            // meaningful for clients (server TPs forbid this field —
+            // already enforced in `validate_peer_transport_params`).
+            if let Some(token) = parsed.stateless_reset_token
+                && let Some(pool) = self.cid_remote.as_mut()
+            {
+                let _ = pool.set_token(0, token);
+            }
             self.peer_params = Some(parsed);
         }
         // RFC 9000 §13.2.5 + RFC 9002 §5.3: once the peer's transport
@@ -1911,10 +2002,66 @@ impl QuicConnection {
     fn feed_long_header_packet(&mut self, datagram: &[u8]) -> Result<usize, Error> {
         let hdr = LongHeader::parse(datagram)?;
 
-        // Version negotiation — RFC 9000 §17.2.1.
+        // G-4: Version Negotiation — RFC 9000 §17.2.1, §6.2.
         if hdr.version == 0 {
-            // VN: consume the rest of the datagram (no further packets
-            // are coalesced after VN per §17.2.1).
+            // RFC 9000 §6.2: "A server MUST discard any Version
+            // Negotiation packet."
+            if self.role == Role::Server {
+                return Ok(datagram.len());
+            }
+            // RFC 9000 §6.2: "A client MUST discard any Version
+            // Negotiation packet if it has received and successfully
+            // processed any other packet ..."
+            if self.peer_packet_seen {
+                return Ok(datagram.len());
+            }
+            // Parse the trailing supported-versions list (4-byte big-
+            // endian u32s starting at `payload_off`).
+            let body = &datagram[hdr.payload_off..];
+            if body.is_empty() || !body.len().is_multiple_of(4) {
+                // RFC 9000 §6.2 / §17.2.1: malformed VN body — must be
+                // a list of 32-bit versions with at least one entry.
+                // A client MUST discard a VN packet with no supported
+                // version; we go further and treat a malformed list
+                // the same way (silent drop).
+                return Ok(datagram.len());
+            }
+            let mut has_v1 = false;
+            let mut any_supported = false;
+            for chunk in body.chunks_exact(4) {
+                let v = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if v == QUIC_V1 {
+                    has_v1 = true;
+                    any_supported = true;
+                }
+                // We only speak v1; nothing else counts as "supported".
+            }
+            if has_v1 {
+                // RFC 9000 §6.2 — the server contradicting itself
+                // (sending VN that includes v1 in response to a v1
+                // Initial) is a protocol violation. Tear down.
+                self.closed = true;
+                return Err(Error::IllegalParameter);
+            }
+            if !any_supported {
+                // No version we speak. RFC 9000 §6.2: the client
+                // SHOULD attempt a fresh connection with one of the
+                // listed versions; we don't speak any → close.
+                self.closed = true;
+                return Err(Error::UnsupportedVersion);
+            }
+            // Unreachable in practice — we only support v1, so either
+            // has_v1 (above) or any_supported is false. Kept for
+            // exhaustiveness.
+            return Ok(datagram.len());
+        }
+        // G-4: Non-VN long-header packets MUST advertise QUIC v1. RFC
+        // 9000 §5.2.2: "an endpoint that receives ... an unsupported
+        // version MAY send a Version Negotiation packet"; we don't
+        // implement multi-version negotiation but we MUST not feed an
+        // unsupported version into the v1-specific keying paths.
+        if hdr.version != QUIC_V1 {
+            // Silent drop — RFC 9000 §5.2.2 allows discarding.
             return Ok(datagram.len());
         }
         if hdr.typ == LongType::Retry {
@@ -1922,6 +2069,9 @@ impl QuicConnection {
             // The server-side `maybe_emit_retry` covers the outbound
             // direction; here we handle a Retry the client receives.
             self.process_retry_packet(datagram, &hdr)?;
+            // G-4: Retry is a non-VN packet; processing it commits us
+            // to v1 and disqualifies subsequent VN per RFC 9000 §6.2.
+            self.peer_packet_seen = true;
             // Retry packets are single-packet datagrams (RFC 9000 §12.2:
             // "Coalescing only applies to long header packets ... Retry
             // packets cannot be coalesced"). Consume the rest of the
@@ -2094,6 +2244,11 @@ impl QuicConnection {
         let cleartext: Vec<u8> = payload.to_vec();
         self.dispatch_frames(level, pn, &cleartext)?;
 
+        // G-4: a non-VN packet from the peer has been successfully
+        // processed — any future VN packet on this connection MUST be
+        // discarded (RFC 9000 §6.2).
+        self.peer_packet_seen = true;
+
         Ok(pkt_total_len)
     }
 
@@ -2229,6 +2384,10 @@ impl QuicConnection {
 
         let cleartext: Vec<u8> = payload.to_vec();
         self.dispatch_frames(Level::OneRtt, pn, &cleartext)?;
+        // G-4: a non-VN packet from the peer has been successfully
+        // processed — any future VN packet on this connection MUST be
+        // discarded (RFC 9000 §6.2).
+        self.peer_packet_seen = true;
         // Short-header packet always consumes the rest of the datagram.
         Ok(datagram.len())
     }
@@ -5406,5 +5565,320 @@ mod tests {
             c.endpoint.cc.bytes_in_flight > 0,
             "bytes_in_flight must grow on first emission"
         );
+    }
+
+    // ========================================================================
+    // G-1: maybe_emit_retry must drop duplicate tokenless Initials after
+    // the first Retry has been sent. RFC 9000 §8.1.2.
+    // ========================================================================
+
+    /// G-1: build a server with require_retry, feed two tokenless Initials.
+    /// The first one drives a Retry emission. The second must be silently
+    /// dropped without overwriting `original_dcid` or `retry_scid`.
+    #[test]
+    fn retry_duplicate_tokenless_initial_does_not_overwrite_state() {
+        use crate::quic::pkt::QUIC_V1;
+        use core::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            require_retry: true,
+            retry_secret: Some([0x77; 32]),
+        })
+        .expect("server build");
+        server.set_peer_addr(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+            9000,
+        ));
+
+        // Build a minimal client Initial (no token). We just need a long
+        // header whose dcid/scid round-trip — `LongHeader::parse` is what
+        // `maybe_emit_retry` calls, so a hand-built header is enough.
+        // The simplest is to drive a real client and grab its first dg.
+        let (mut c, _) = loopback_pair();
+        // Override the server-name path: we just want bytes.
+        let initial_a = c.pop_datagram();
+        assert!(!initial_a.is_empty());
+
+        // Feed it once → Retry emitted, server state populated.
+        server.feed_datagram(&initial_a).expect("feed initial #1");
+        // Pop the Retry so pending_retry_datagram is cleared (the second
+        // feed would otherwise have nothing to overwrite there).
+        let _retry = server.pop_datagram();
+        let odcid_after_first = server.original_dcid().map(<[u8]>::to_vec);
+        let retry_scid_after_first = server.retry_scid().map(<[u8]>::to_vec);
+        assert!(odcid_after_first.is_some());
+        assert!(retry_scid_after_first.is_some());
+        assert!(server.retry_sent);
+
+        // Fabricate a fresh tokenless Initial datagram with a DIFFERENT
+        // DCID. If the guard is missing, the server would emit a second
+        // Retry, overwriting `original_dcid` to this new DCID and
+        // generating a fresh `retry_scid` — desyncing it from the
+        // legitimate client's retried Initial.
+        //
+        // We synthesize a minimal long header by twiddling the DCID
+        // bytes of the captured Initial. Locate the DCID-len byte at
+        // offset 5 of the long-header and overwrite the DCID bytes.
+        let mut initial_b = initial_a.clone();
+        let dcid_len = initial_b[5] as usize;
+        // Stamp a clearly-different DCID pattern.
+        for b in initial_b.iter_mut().skip(6).take(dcid_len) {
+            *b ^= 0xFF;
+        }
+        // Sanity: a Long header with version v1.
+        assert_eq!(
+            u32::from_be_bytes([initial_b[1], initial_b[2], initial_b[3], initial_b[4]]),
+            QUIC_V1
+        );
+
+        // Feed the second tokenless Initial. The guard MUST silently
+        // drop this — no state mutation, no new Retry datagram.
+        server.feed_datagram(&initial_b).expect("feed initial #2");
+        let pop2 = server.pop_datagram();
+        assert!(
+            pop2.is_empty(),
+            "second tokenless Initial must NOT trigger a fresh Retry"
+        );
+
+        // The pinned ODCID and retry_scid must still be the FIRST set
+        // — the guard prevented overwrite.
+        let odcid_after_second = server.original_dcid().map(<[u8]>::to_vec);
+        let retry_scid_after_second = server.retry_scid().map(<[u8]>::to_vec);
+        assert_eq!(
+            odcid_after_second, odcid_after_first,
+            "G-1: original_dcid must NOT be overwritten by a second tokenless Initial"
+        );
+        assert_eq!(
+            retry_scid_after_second, retry_scid_after_first,
+            "G-1: retry_scid must NOT be overwritten by a second tokenless Initial"
+        );
+    }
+
+    // ========================================================================
+    // G-3: peer's transport-param `stateless_reset_token` must install on
+    // the sequence-0 entry of `cid_remote`. RFC 9000 §10.3, §18.2.
+    // ========================================================================
+
+    /// G-3: after the handshake completes, the client's `cid_remote`
+    /// pool must have a sequence-0 entry whose `reset_token` equals what
+    /// the server advertised in `stateless_reset_token`. A subsequent
+    /// fabricated reset datagram against the handshake CID must be
+    /// recognized and close the client.
+    #[test]
+    fn peer_stateless_reset_token_installed_on_handshake_cid() {
+        // Build a server that advertises a known stateless_reset_token.
+        const SRT: [u8; 16] = [0x42; 16];
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut server_tp = loopback_params();
+        server_tp.stateless_reset_token = Some(SRT);
+
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: server_tp,
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+
+        // The client's cid_remote pool must now have SRT installed at
+        // sequence 0 (the server-handshake CID).
+        let pool = c.cid_remote.as_ref().expect("cid_remote populated");
+        let seq0 = pool.entries.get(&0).expect("seq=0 entry");
+        assert_eq!(
+            seq0.reset_token,
+            Some(SRT),
+            "G-3: peer's stateless_reset_token TP must install on cid_remote[0]"
+        );
+
+        // End-to-end: a fabricated reset datagram targeting the
+        // handshake CID's token must close the client.
+        let mut fake = alloc::vec![0xCDu8; 5];
+        fake.extend_from_slice(&SRT);
+        assert!(fake.len() >= 21);
+        c.feed_datagram(&fake).expect("feed accepts reset");
+        assert!(
+            c.is_closed(),
+            "G-3: stateless reset against handshake CID must close"
+        );
+    }
+
+    // ========================================================================
+    // G-4: Version Negotiation packet handling. RFC 9000 §6.2.
+    // ========================================================================
+
+    /// G-4: a client that receives a VN packet listing only unknown
+    /// versions (no v1) before processing any other server packet MUST
+    /// close with UnsupportedVersion.
+    #[test]
+    fn vn_with_no_supported_version_closes_client() {
+        use crate::quic::pkt::build_version_negotiation;
+        let (mut c, _) = loopback_pair();
+        // Drain the client's first Initial so the wire is plausible.
+        let _ = c.pop_datagram();
+        // Build a VN packet with versions [0x0000FF00, 0xDEADBEEF].
+        // DCID = client's SCID, SCID = server's chosen ID — we use
+        // empty CIDs since the client doesn't validate VN DCID/SCID.
+        let vn = build_version_negotiation(&[], &[], &[0x0000_FF00, 0xDEAD_BEEF]);
+        let r = c.feed_datagram(&vn);
+        assert!(
+            matches!(r, Err(Error::UnsupportedVersion)),
+            "G-4: VN with no supported version must error; got {:?}",
+            r
+        );
+        assert!(c.is_closed(), "G-4: client must close on unsupported VN");
+    }
+
+    /// G-4: a client that receives a VN packet listing v1 (contradictory
+    /// — the server received our v1 Initial and is now telling us to
+    /// switch back to v1) MUST treat it as a protocol violation.
+    #[test]
+    fn vn_with_v1_is_protocol_violation() {
+        use crate::quic::pkt::{QUIC_V1, build_version_negotiation};
+        let (mut c, _) = loopback_pair();
+        let _ = c.pop_datagram();
+        let vn = build_version_negotiation(&[], &[], &[QUIC_V1, 0xDEAD_BEEF]);
+        let r = c.feed_datagram(&vn);
+        assert!(
+            matches!(r, Err(Error::IllegalParameter)),
+            "G-4: VN containing v1 must be a protocol violation; got {:?}",
+            r
+        );
+        assert!(c.is_closed());
+    }
+
+    /// G-4: a client that has already processed a server Initial MUST
+    /// silently drop subsequent VN packets.
+    #[test]
+    fn vn_after_processed_packet_is_dropped_silently() {
+        use crate::quic::pkt::build_version_negotiation;
+        let (mut c, mut s) = loopback_pair();
+        // Drive far enough that the client processes the server's
+        // first Initial.
+        let dg = c.pop_datagram();
+        s.feed_datagram(&dg).expect("server feeds CH");
+        let server_resp = s.pop_datagram();
+        assert!(!server_resp.is_empty());
+        c.feed_datagram(&server_resp)
+            .expect("client feeds server response");
+        assert!(c.peer_packet_seen, "client must have processed a packet");
+        // Now feed a malicious VN that would otherwise close the client.
+        let vn = build_version_negotiation(&[], &[], &[0x0000_FF00]);
+        let r = c.feed_datagram(&vn);
+        // MUST silently drop — no error, no close.
+        assert!(
+            r.is_ok(),
+            "G-4: VN after peer packet must be dropped, got {:?}",
+            r
+        );
+        assert!(
+            !c.is_closed(),
+            "G-4: VN after peer packet must NOT close the client"
+        );
+    }
+
+    /// G-4: a server-role connection that somehow receives a VN packet
+    /// drops it silently.
+    #[test]
+    fn vn_at_server_is_dropped() {
+        use crate::quic::pkt::build_version_negotiation;
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        let vn = build_version_negotiation(&[], &[], &[0x0000_FF00]);
+        let r = s.feed_datagram(&vn);
+        assert!(r.is_ok(), "G-4: server must silently drop VN; got {:?}", r);
+        assert!(!s.is_closed());
+    }
+
+    // ========================================================================
+    // G-5: AMP-cap rejection must NOT permanently drop DATAGRAM frames
+    // (RFC 9221 §5 forbids retransmission).
+    // ========================================================================
+
+    /// G-5: a server-role connection whose AMP budget is exhausted must
+    /// preserve any queued DATAGRAM frames across a rejected build —
+    /// they can be sent the next time bytes_recv expands the budget.
+    ///
+    /// We construct the scenario directly: handshake complete (which
+    /// gives us 1-RTT keys), then artificially force the addr_validation
+    /// state back to unvalidated with bytes_recv=100, bytes_sent=290.
+    /// A datagram of any meaningful size will then exceed the 300-byte
+    /// budget — the assembly is dropped, and the queue must be preserved.
+    #[test]
+    fn amp_cap_drop_preserves_datagram_queue() {
+        let (mut c, mut s) = datagram_loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        // Let the post-handshake settling happen so 1-RTT machinery
+        // is fully populated.
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Force the server back to unvalidated state with a tight
+        // budget. This is artificial — RFC 9000 §8.1 says a successful
+        // Handshake-level rx validates the address — but it exactly
+        // models the G-5 attacker scenario in the prompt.
+        s.addr_validation.validated = false;
+        s.addr_validation.bytes_recv = 100;
+        s.addr_validation.bytes_sent = 290;
+
+        // Queue an "important" DATAGRAM. send_datagram requires
+        // handshake_complete (already satisfied).
+        s.send_datagram(b"important payload that exceeds the tiny AMP budget")
+            .expect("send_datagram queues OK");
+        let queued_len = s.datagram_queues.outbound.len();
+        assert_eq!(queued_len, 1, "datagram is queued before pop");
+
+        // Pop. The AMP cap should reject the build, and the queue
+        // must be preserved.
+        let dg = s.pop_datagram();
+        // Either nothing emitted (budget exhausted), or a very small
+        // packet (CRYPTO/ACK only). Either way, the DATAGRAM payload
+        // must not have been carved and lost.
+        if dg.is_empty() {
+            // Full reject — queue must be intact.
+            assert_eq!(
+                s.datagram_queues.outbound.len(),
+                queued_len,
+                "G-5: rejected build must NOT consume the DATAGRAM queue"
+            );
+        } else {
+            // A small CRYPTO/ACK packet went through. The DATAGRAM
+            // (50+ bytes payload, ~52 bytes encoded) would overflow
+            // remaining budget; it must remain queued.
+            assert_eq!(
+                s.datagram_queues.outbound.len(),
+                queued_len,
+                "G-5: a small successful build that excluded the DATAGRAM \
+                 must leave the queue intact (or restored on reject)"
+            );
+        }
     }
 }

@@ -322,6 +322,25 @@ impl CidPool {
     pub(crate) fn max_sequence(&self) -> u64 {
         self.entries.keys().next_back().copied().unwrap_or(0)
     }
+
+    /// Installs / replaces the `reset_token` on the entry at the given
+    /// sequence. Returns `true` if an entry was found and updated.
+    ///
+    /// G-3: the peer's `stateless_reset_token` transport parameter is
+    /// bound to the *handshake* CID (sequence 0), which is constructed
+    /// at pool-seed time with `initial_reset_token = None` because the
+    /// token only arrives later in the TLS handshake's transport params.
+    /// Without this hook, [`super::connection::QuicConnection::detect_stateless_reset`]
+    /// would never recognize a stateless reset targeted at the
+    /// handshake CID.
+    pub(crate) fn set_token(&mut self, sequence: u64, token: [u8; 16]) -> bool {
+        if let Some(e) = self.entries.get_mut(&sequence) {
+            e.reset_token = Some(token);
+            true
+        } else {
+            false
+        }
+    }
 }
 
 #[cfg(test)]
