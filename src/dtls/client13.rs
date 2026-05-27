@@ -2,8 +2,7 @@
 
 //! DTLS 1.3 client state machine (RFC 9147).
 //!
-//! Mirrors the TLS 1.3 client handshake flow (`TLS_AES_128_GCM_SHA256`,
-//! X25519 group only — focused subset for this commit), wrapped in:
+//! Mirrors the TLS 1.3 client handshake flow, wrapped in:
 //!
 //! - DTLS 1.3 unified record framing (`super::record13`) for protected
 //!   records, including encrypted sequence numbers (RFC 9147 §4.2.3).
@@ -18,15 +17,15 @@
 //!   `cookie` extension (RFC 9147 §5.1, extension type 44 per RFC 8446
 //!   §4.2.2). The client echoes the cookie in a new ClientHello.
 //!
-//! Scope of this commit (mirroring commit 10 / DTLS 1.2):
+//! Negotiation surface (matches the TLS 1.3 layer):
 //!
-//! - One cipher suite: `TLS_AES_128_GCM_SHA256` (0x1301).
-//! - One key-exchange group: X25519.
-//! - Server cert: ECDSA P-256.
-//! - No mTLS, no PSK, no 0-RTT, no Connection ID (RFC 9146).
-//!
-//! These restrictions are enforced at config time; broader suite / group
-//! coverage lands in follow-up commits.
+//! - Cipher suites: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
+//!   `TLS_CHACHA20_POLY1305_SHA256`.
+//! - Groups: X25519, P-256, X25519+ML-KEM-768
+//!   (draft-ietf-tls-ecdhe-mlkem).
+//! - Server certificate signatures: RSA-PSS, ECDSA (any curve), Ed25519,
+//!   ML-DSA-44/65/87 (draft-ietf-tls-mldsa).
+//! - Out of scope: mTLS, PSK, 0-RTT, Connection ID (RFC 9146).
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;

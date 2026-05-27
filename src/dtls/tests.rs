@@ -342,6 +342,99 @@ mod dtls13 {
         assert_eq!(client.take_received(), b"pong-ed25519");
     }
 
+    /// DTLS 1.3 + RSA-2048 server certificate: the server signs its
+    /// `CertificateVerify` with RSA-PSS-RSAE-SHA256 (RFC 8446 §4.2.3).
+    /// Confirms the generalised signing dispatch handles the RSA path
+    /// end-to-end, including chain validation under
+    /// [`SignaturePolicy::modern`] (which permits RSA-PSS).
+    #[test]
+    fn loopback_rsa_cert() {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::test_util::rsa_test_key_a;
+        use crate::tls::conn::ServerKey;
+        use crate::x509::CertSigner;
+
+        let rsa_key = rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Rsa(&boxed),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+
+        let server_cfg =
+            PcServerConfig13::with_signing_key(alloc::vec![der.clone()], ServerKey::Rsa(boxed))
+                .with_no_cookie();
+
+        let mut client = make_client13(&der);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-rsa", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // App-data round-trip under RSA-PSS-signed CertificateVerify.
+        client.send(b"ping-rsa").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-rsa");
+    }
+
+    /// DTLS 1.3 + ML-DSA-65 server certificate (draft-ietf-tls-mldsa):
+    /// covers the post-quantum signing path in DTLS, mirroring the TLS
+    /// `tls_mldsa_server_cert` test.
+    #[test]
+    fn loopback_mldsa65_cert() {
+        use crate::tls::conn::ServerKey;
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-mldsa-key", b"nonce", &[]);
+        let (sk, _pk) = crate::mldsa::MlDsa65PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::MlDsa65(&sk),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+
+        let server_cfg =
+            PcServerConfig13::with_signing_key(alloc::vec![der.clone()], ServerKey::MlDsa65(sk))
+                .with_no_cookie();
+
+        let mut client = make_client13(&der);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-mldsa", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // App-data round-trip under ML-DSA-signed CertificateVerify.
+        client.send(b"ping-mldsa").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-mldsa");
+    }
+
     /// SSLKEYLOGFILE plumbing for DTLS 1.3: client + server share a
     /// `WriterKeyLog<Vec<u8>>` sink; the captured log contains every
     /// TLS 1.3 label twice (once per peer) with matching secret bytes.

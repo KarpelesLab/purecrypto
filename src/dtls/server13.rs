@@ -15,12 +15,15 @@
 //!    CertificateVerify / Finished).
 //! 4. On the client's Finished, transitions to the application epoch.
 //!
-//! Scope of this commit (mirroring commit 10 / DTLS 1.2):
+//! Negotiation surface (matches the TLS 1.3 layer):
 //!
-//! - One cipher suite: `TLS_AES_128_GCM_SHA256` (0x1301).
-//! - One key-exchange group: X25519.
-//! - Server cert: ECDSA P-256.
-//! - No mTLS, no PSK, no 0-RTT, no Connection ID.
+//! - Cipher suites: `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
+//!   `TLS_CHACHA20_POLY1305_SHA256`.
+//! - Groups: X25519, P-256, X25519+ML-KEM-768
+//!   (draft-ietf-tls-ecdhe-mlkem).
+//! - Server certificate signatures: RSA-PSS, ECDSA (any curve), Ed25519,
+//!   ML-DSA-44/65/87 (draft-ietf-tls-mldsa).
+//! - Out of scope: mTLS, PSK, 0-RTT, Connection ID.
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
@@ -30,8 +33,8 @@ use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, put_u16, with_len_u16, with_len_u24,
+    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, hs_type, put_u16,
+    with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::sign::sign_certificate_verify;
 use crate::tls::crypto::{
@@ -1256,12 +1259,4 @@ fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Error> {
         out.push(NamedGroup(c.u16()?));
     }
     Ok(out)
-}
-
-fn ecdsa_scheme_for(curve: CurveId) -> SignatureScheme {
-    match curve {
-        CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-        CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-        _ => SignatureScheme::ECDSA_SECP256R1_SHA256,
-    }
 }
