@@ -115,29 +115,46 @@ pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-/// Writes a block produced by `f`, prefixed by its `u8` length.
+/// Writes a block produced by `f`, prefixed by its `u8` length. The
+/// produced block must fit a single byte; in release builds an overflowing
+/// length silently truncates, but `debug_assertions` make the bug visible.
 pub(crate) fn with_len_u8(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.push(0);
     f(out);
     let len = out.len() - pos - 1;
+    debug_assert!(len <= 0xFF, "with_len_u8: block of {len} bytes exceeds 255");
     out[pos] = len as u8;
 }
 
-/// Writes a block produced by `f`, prefixed by its `u16` length.
+/// Writes a block produced by `f`, prefixed by its `u16` length. The
+/// produced block must fit two bytes; in release builds an overflowing
+/// length silently truncates, but `debug_assertions` make the bug visible.
 pub(crate) fn with_len_u16(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.extend_from_slice(&[0, 0]);
     f(out);
-    let len = (out.len() - pos - 2) as u16;
+    let inner = out.len() - pos - 2;
+    debug_assert!(
+        inner <= 0xFFFF,
+        "with_len_u16: block of {inner} bytes exceeds 65535",
+    );
+    let len = inner as u16;
     out[pos..pos + 2].copy_from_slice(&len.to_be_bytes());
 }
 
-/// Writes a block produced by `f`, prefixed by its `u24` length.
+/// Writes a block produced by `f`, prefixed by its `u24` length. The
+/// produced block must fit three bytes; in release builds an overflowing
+/// length silently truncates, but `debug_assertions` make the bug visible.
 pub(crate) fn with_len_u24(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.extend_from_slice(&[0, 0, 0]);
     f(out);
-    let len = (out.len() - pos - 3) as u32;
+    let inner = out.len() - pos - 3;
+    debug_assert!(
+        inner <= 0xFF_FFFF,
+        "with_len_u24: block of {inner} bytes exceeds 16_777_215",
+    );
+    let len = inner as u32;
     out[pos..pos + 3].copy_from_slice(&len.to_be_bytes()[1..]);
 }

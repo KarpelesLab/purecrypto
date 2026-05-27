@@ -463,7 +463,7 @@ impl DtlsClientConnection13 {
             aad[1] ^= mask[0];
         }
         let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
-        let (inner_type, plain) = decrypt_dtls13_record(crypter, read_epoch, seq, &aad, ct_body)?;
+        let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
 
         // RFC 9147 §4.5.1: anti-replay window — drop duplicates and stale
         // sequence numbers even though the AEAD already verified them.
@@ -989,7 +989,7 @@ impl DtlsClientConnection13 {
         let hdr_len = aad.len() - ct_len;
         aad.truncate(hdr_len);
 
-        encrypt_dtls13_record(crypter, epoch, seq, &aad, &mut inner)?;
+        encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
 
         // Compute sn_mask over the first 16 bytes of ciphertext+tag and
         // emit the on-wire record with the masked seq.
@@ -1113,20 +1113,15 @@ pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret) -> [u8; 16] {
 ///
 /// This bypasses `RecordCrypter::encrypt` because we need the AAD to be the
 /// caller-supplied unified-header bytes (not the TLS-1.3 5-byte header
-/// the standard wrapper produces). The `epoch` / `seq` form the nonce
-/// (static IV XOR 64-bit big-endian seq, ignoring the epoch, per RFC 9147
-/// §4.2.2).
+/// the standard wrapper produces). `seq` alone forms the nonce
+/// (static IV XOR 64-bit big-endian seq, per RFC 9147 §4.2.2); the epoch
+/// is implicit in `crypter`, which is keyed per-epoch.
 pub(crate) fn encrypt_dtls13_record(
     crypter: &mut RecordCrypter,
-    epoch: u16,
     seq: u64,
     aad: &[u8],
     inner: &mut Vec<u8>,
 ) -> Result<(), Error> {
-    // The TLS 1.3 RecordCrypter API hides the AEAD; we add a thin
-    // `encrypt_raw` method via a trait extension in `crypto::aead`. For
-    // this commit we reach into the crypter via a new helper.
-    let _ = epoch;
     let tag = crypter.encrypt_raw(seq, aad, inner)?;
     inner.extend_from_slice(&tag);
     Ok(())
@@ -1135,12 +1130,10 @@ pub(crate) fn encrypt_dtls13_record(
 /// Decrypts one DTLS 1.3 protected record.
 pub(crate) fn decrypt_dtls13_record(
     crypter: &mut RecordCrypter,
-    epoch: u16,
     seq: u64,
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<(ContentType, Vec<u8>), Error> {
-    let _ = epoch;
     if ciphertext.len() < 16 {
         return Err(Error::Decode);
     }

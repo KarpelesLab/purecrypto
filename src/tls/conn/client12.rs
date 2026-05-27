@@ -106,11 +106,14 @@ pub(crate) struct ClientConfig12 {
     /// 1.3-aware servers will (correctly) abort with `inappropriate_fallback`.
     /// Default `false`.
     pub send_fallback_scsv: bool,
-    /// RFC 8446 §4.1.3 downgrade-sentinel acceptance. When `false` (default),
-    /// the client aborts with `IllegalParameter` if the last 8 bytes of
-    /// `server_random` are the 1.3-↓-1.2 or 1.1-↓-1.0 sentinels. Set to `true`
-    /// **only** in a deliberate-fallback flow where the higher-version probe
-    /// has already failed and the caller has chosen to accept the downgrade.
+    /// RFC 8446 §4.1.3 downgrade-sentinel acceptance. Defaults to `true`:
+    /// the sentinel is meaningful only for a TLS-1.3-aware client that
+    /// negotiated 1.2, and *this* implementation is a pure TLS 1.2 client
+    /// that never offers `supported_versions = 1.3` — so the sentinel is
+    /// informational rather than evidence of an attack. Set to `false`
+    /// only if you wrap this client in a higher-layer fallback chain that
+    /// also probes TLS 1.3, in which case a sentinel here would indicate a
+    /// downgrade past the 1.3 attempt.
     pub accept_downgrade_sentinel: bool,
     /// CRLs consulted during chain validation. Empty by default — opt in via
     /// [`ClientConfig12::with_crls`].
@@ -135,7 +138,7 @@ impl ClientConfig12 {
             client_cert: None,
             session: None,
             send_fallback_scsv: false,
-            accept_downgrade_sentinel: false,
+            accept_downgrade_sentinel: true,
             crls: CrlStore::new(),
             key_log: None,
         }
@@ -198,9 +201,12 @@ impl ClientConfig12 {
         self
     }
 
-    /// RFC 8446 §4.1.3: when `true`, the client will accept a `server_random`
-    /// whose last 8 bytes match the version-downgrade sentinel instead of
-    /// aborting with `illegal_parameter`. Default is `false`.
+    /// RFC 8446 §4.1.3: when `true`, the client accepts a `server_random`
+    /// whose last 8 bytes match the version-downgrade sentinel; when
+    /// `false`, the client aborts with `illegal_parameter`. Default is
+    /// `true` because this code only ever negotiates TLS 1.2 and the
+    /// sentinel is informational; flip to `false` only when wrapping the
+    /// client in a TLS-1.3 fallback chain.
     pub fn with_accept_downgrade_sentinel(mut self, enabled: bool) -> Self {
         self.accept_downgrade_sentinel = enabled;
         self

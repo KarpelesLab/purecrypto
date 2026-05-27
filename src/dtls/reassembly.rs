@@ -140,10 +140,42 @@ struct PartialMessage {
     total_length: u32,
     /// Dense buffer of all message bytes (zero-initialised; sparse writes).
     buf: Vec<u8>,
-    /// Per-byte arrival bitmap; we trade space for unambiguous correctness.
-    received: Vec<bool>,
-    /// Count of `true` entries in `received`.
+    /// Per-byte arrival bitmap, packed 64 bits per word. One bit per message
+    /// byte (8× smaller than the prior `Vec<bool>`). Mutated only through
+    /// [`set_received`] / [`is_received`].
+    received: Vec<u64>,
+    /// Count of set bits in `received`.
     received_count: u32,
+}
+
+impl PartialMessage {
+    #[inline]
+    fn is_received(&self, byte_idx: usize) -> bool {
+        let word = byte_idx >> 6;
+        let bit = byte_idx & 0x3f;
+        match self.received.get(word) {
+            Some(w) => (*w >> bit) & 1 != 0,
+            None => false,
+        }
+    }
+
+    /// Returns `true` if this call flipped the bit from 0 to 1 (i.e. it's a
+    /// genuinely new byte). Out-of-range indices are no-ops returning `false`.
+    #[inline]
+    fn set_received(&mut self, byte_idx: usize) -> bool {
+        let word = byte_idx >> 6;
+        let bit = byte_idx & 0x3f;
+        let Some(w) = self.received.get_mut(word) else {
+            return false;
+        };
+        let mask = 1u64 << bit;
+        if *w & mask != 0 {
+            false
+        } else {
+            *w |= mask;
+            true
+        }
+    }
 }
 
 /// Upper bound on a single handshake message's `total_length`. RFC 6347 /
@@ -213,7 +245,7 @@ impl Reassembler {
                 msg_type: frag.msg_type,
                 total_length,
                 buf: vec_zeroed(total_length as usize),
-                received: vec_false(total_length as usize),
+                received: vec_bitmap_words(total_length as usize),
                 received_count: 0,
             });
 
@@ -229,11 +261,10 @@ impl Reassembler {
             let idx = off + i;
             // `read_fragment` already verified the offset + length is in
             // bounds against total_length; this is belt-and-braces.
-            if idx >= entry.received.len() {
+            if idx >= entry.buf.len() {
                 return None;
             }
-            if !entry.received[idx] {
-                entry.received[idx] = true;
+            if entry.set_received(idx) {
                 entry.buf[idx] = b;
                 entry.received_count += 1;
             }
@@ -304,8 +335,10 @@ fn vec_zeroed(n: usize) -> Vec<u8> {
     alloc::vec![0u8; n]
 }
 
-fn vec_false(n: usize) -> Vec<bool> {
-    alloc::vec![false; n]
+/// Allocates a zeroed bitmap large enough to hold `bits` bits, packed into
+/// 64-bit words. `bits = 0` yields an empty vector.
+fn vec_bitmap_words(bits: usize) -> Vec<u64> {
+    alloc::vec![0u64; bits.div_ceil(64)]
 }
 
 #[cfg(test)]
@@ -488,6 +521,50 @@ mod tests {
         assert_eq!(f3.fragment_offset, 20);
         assert_eq!(f3.fragment.len(), 5);
         assert_eq!(f1.len + f2.len + f3.len, out.len());
+    }
+
+    #[test]
+    fn fragmented_reassembly_with_bitmap_transitions() {
+        // Drive 1024 bytes through 4-byte chunks delivered in a shuffled
+        // order; the bitmap must complete the message exactly once and
+        // produce the same body bytes regardless of arrival order.
+        let body: Vec<u8> = (0..1024).map(|i| (i & 0xff) as u8).collect();
+        let total = body.len() as u32;
+
+        // Build 256 fragments of 4 bytes each, then shuffle deterministically.
+        let mut frags: Vec<Vec<u8>> = (0..256)
+            .map(|i| {
+                let off = i * 4;
+                let mut f = Vec::new();
+                write_fragment_header(&mut f, 11, total, 0, off as u32, 4);
+                f.extend_from_slice(&body[off..off + 4]);
+                f
+            })
+            .collect();
+        // Pseudo-shuffle: pair up halves.
+        let mid = frags.len() / 2;
+        let mut shuffled = Vec::new();
+        for i in 0..mid {
+            shuffled.push(frags.swap_remove(0));
+            if !frags.is_empty() {
+                shuffled.push(frags.remove(mid - i - 1));
+            }
+        }
+        shuffled.extend(frags);
+
+        let mut r = Reassembler::new();
+        let mut completion = None;
+        for f in &shuffled {
+            let frag = read_fragment(f).unwrap();
+            if let Some(out) = r.feed(frag) {
+                assert!(completion.is_none(), "completed twice!");
+                completion = Some(out);
+            }
+        }
+        let (ty, got) = completion.expect("message must complete");
+        assert_eq!(ty, 11);
+        assert_eq!(got, body);
+        assert_eq!(r.expected_msg_seq(), 1);
     }
 
     #[test]

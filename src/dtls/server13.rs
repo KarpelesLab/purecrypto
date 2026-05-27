@@ -367,7 +367,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             aad[1] ^= mask[0];
         }
         let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
-        let (inner_type, plain) = decrypt_dtls13_record(crypter, read_epoch, seq, &aad, ct_body)?;
+        let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
         // RFC 9147 §4.5.1: drop duplicates and too-old records via the
         // sliding-window filter. The AEAD already verified the record, but
         // an attacker can replay any verified record indefinitely unless
@@ -944,7 +944,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let hdr_len = aad.len() - ct_len;
         aad.truncate(hdr_len);
 
-        encrypt_dtls13_record(crypter, epoch, seq, &aad, &mut inner)?;
+        encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
 
         let mask_full = sn_mask_aes128(&sn_key, &inner);
         let mask: &[u8] = if seq_is_16bit {

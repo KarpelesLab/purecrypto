@@ -722,15 +722,15 @@ impl<R: RngCore> ServerConnection12<R> {
         // seeing 0x5600 here while still able to negotiate 1.3, abort with
         // `IllegalParameter`.)
 
-        // RFC 8446 §4.1.3: if the client offered TLS 1.3 via
-        // `supported_versions` but we negotiated 1.2, the server MUST embed
-        // the downgrade sentinel `DOWNGRD\x01` in the last 8 bytes of
-        // `server_random`. Capture the bit here; the sentinel itself is
-        // applied once we emit `server_random`.
-        let client_offered_tls13 = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
-            .map(ext::client_offers_tls13)
-            .transpose()?
-            .unwrap_or(false);
+        // RFC 8446 §4.1.3: validate the structure of `supported_versions`
+        // if present (the parser rejects malformed encodings), then ignore
+        // its content — we always embed the downgrade sentinel in
+        // `server_random` regardless of whether the client advertised
+        // TLS 1.3, so an in-path attacker that strips the extension cannot
+        // hide the downgrade from a 1.3-aware client.
+        if let Some(body) = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS) {
+            let _ = ext::client_offers_tls13(body)?;
+        }
 
         // RFC 5246 §7.4.1.4.1: TLS 1.2 ClientHello MUST carry
         // `signature_algorithms`. (Required regardless of resumption: we may
@@ -838,9 +838,14 @@ impl<R: RngCore> ServerConnection12<R> {
 
             let mut server_random: Random = [0u8; 32];
             self.rng.fill_bytes(&mut server_random);
-            if client_offered_tls13 {
-                apply_downgrade_sentinel(&mut server_random);
-            }
+            // RFC 8446 §4.1.3: a TLS 1.2 server SHOULD always embed the
+            // downgrade sentinel in the last 8 bytes of `server_random`,
+            // not only when the client advertised TLS 1.3 via
+            // `supported_versions`. A 1.3-aware client checks this
+            // unconditionally and aborts on mismatch, which protects
+            // legacy clients that did not advertise 1.3 but were forced
+            // down by an in-path attacker.
+            apply_downgrade_sentinel(&mut server_random);
 
             self.suite = Some(rs.suite);
             self.client_random = Some(ch.random);
@@ -902,15 +907,13 @@ impl<R: RngCore> ServerConnection12<R> {
         self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
 
-        // Server random. RFC 8446 §4.1.3: if the client offered TLS 1.3 in
-        // `supported_versions` but we're returning a TLS 1.2 SH (we top out
-        // at 1.2), embed the downgrade sentinel in the trailing 8 bytes so
-        // a 1.3-aware client can detect the downgrade.
+        // Server random. RFC 8446 §4.1.3: a TLS 1.2 server SHOULD embed the
+        // downgrade sentinel in the trailing 8 bytes of `server_random`
+        // regardless of whether the client advertised TLS 1.3, so a 1.3-
+        // aware client can detect an attacker that stripped supported_versions.
         let mut server_random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut server_random);
-        if client_offered_tls13 {
-            apply_downgrade_sentinel(&mut server_random);
-        }
+        apply_downgrade_sentinel(&mut server_random);
 
         self.suite = Some(suite);
         self.group = Some(group);
@@ -1546,7 +1549,7 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
-    use crate::tls::codec::{CipherSuite, ClientHello, hs_type, read_record};
+    use crate::tls::codec::{CipherSuite, ClientHello, ServerHello, hs_type, read_record};
 
     fn test_rsa_server_config() -> ServerConfig12 {
         use crate::test_util::rsa_test_key_a;
@@ -1633,6 +1636,57 @@ mod tests {
             s.process_new_packets(),
             Err(Error::HandshakeFailure)
         ));
+    }
+
+    /// RFC 8446 §4.1.3 — a TLS 1.2 server embeds the `DOWNGRD\x01`
+    /// sentinel in `server_random` regardless of whether the client offered
+    /// TLS 1.3 in `supported_versions`. This guards a legacy 1.2 client
+    /// against an in-path attacker stripping the extension to hide the
+    /// downgrade.
+    #[test]
+    fn server12_embeds_downgrade_sentinel_without_supported_versions() {
+        const DOWNGRD_13: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
+
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-dgrd", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+
+        // Synthesise a legacy TLS 1.2 ClientHello — no supported_versions.
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-dgrd-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+                ext::renegotiation_info_empty(),
+            ],
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        );
+        s.read_tls(&rec);
+        s.process_new_packets().unwrap();
+
+        // Find the ServerHello in the emitted records and decode it.
+        let out = s.write_tls();
+        let parsed = read_record(&out).unwrap().unwrap();
+        assert_eq!(parsed.content_type, ContentType::Handshake);
+        // First handshake byte is the message type; the rest is type+len+body.
+        assert_eq!(parsed.fragment[0], hs_type::SERVER_HELLO);
+        // The handshake body starts after the 4-byte type+length header.
+        let sh = ServerHello::decode(&parsed.fragment[4..]).unwrap();
+        assert_eq!(&sh.random[24..], &DOWNGRD_13);
     }
 
     /// A normal CH yields a complete server flight: SH || Certificate ||

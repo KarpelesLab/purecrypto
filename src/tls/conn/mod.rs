@@ -3215,9 +3215,12 @@ mod tls12_loopback_tests {
         );
     }
 
-    /// A TLS 1.2 client that receives an SH whose `server_random` tail is the
-    /// downgrade sentinel MUST abort with `IllegalParameter` unless it has
-    /// opted in via `with_accept_downgrade_sentinel(true)`.
+    /// A TLS 1.2 client opted into the strict policy (via
+    /// `with_accept_downgrade_sentinel(false)`) MUST abort with
+    /// `IllegalParameter` when the `server_random` tail is the RFC 8446
+    /// §4.1.3 downgrade sentinel. (The default policy here is permissive
+    /// because this is a pure TLS 1.2 client and the sentinel is only
+    /// meaningful inside a higher-version fallback chain.)
     #[test]
     fn tls12_client_rejects_downgrade_sentinel() {
         let (server_config, server_cert_der) = rsa_server12();
@@ -3225,8 +3228,8 @@ mod tls12_loopback_tests {
         roots.add_der(server_cert_der).unwrap();
 
         let mut crng = HmacDrbg::<Sha256>::new(b"sentinel-rej-c", b"nonce", &[]);
-        let mut client =
-            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng);
+        let cfg = ClientConfig12::new(roots).with_accept_downgrade_sentinel(false);
+        let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng);
         // Drain the CH so the client is in `WaitServerHello`.
         let _ch_bytes = client.write_tls();
 
