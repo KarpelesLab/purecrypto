@@ -12,6 +12,7 @@ use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
+use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::handshake12::{ClientKeyExchange, ServerKeyExchange, signed_message};
@@ -19,7 +20,7 @@ use crate::tls::codec::{
     CipherSuite, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
     hs_type, with_len_u8, with_len_u24,
 };
-use crate::tls::conn::{SUITES_12, SigKind, SuiteParams12};
+use crate::tls::conn::{SUITES_12, ServerKey, SigKind, SuiteParams12};
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
@@ -50,9 +51,10 @@ const DEFAULT_MAX_FRAGMENT: usize = 1100;
 pub(crate) struct ServerConfig12Internal {
     /// Certificate chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
-    /// ECDSA signing key. (RSA support is omitted in this subset to keep
-    /// the implementation focused.)
-    key: BoxedEcdsaPrivateKey,
+    /// Signing key. Matches TLS 1.2's scope: RSA-PSS or ECDSA. Other
+    /// variants of [`ServerKey`] can be plumbed in but will fail at
+    /// handshake time because no suite in `SUITES_12` matches them.
+    key: ServerKey,
     /// Cookie generator secret. When `None`, the server skips
     /// HelloVerifyRequest entirely (useful for tests; a production
     /// configuration always sets this).
@@ -76,7 +78,22 @@ impl ServerConfig12Internal {
     pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
         Self {
             cert_chain,
-            key,
+            key: ServerKey::Ecdsa(key),
+            cookie_secret: None,
+            require_cookie_exchange: true,
+            signature_policy: SignaturePolicy::modern(),
+            key_log: None,
+        }
+    }
+
+    /// New configuration presenting `cert_chain` and signing with the RSA
+    /// `key`. Drives the three `ECDHE-RSA-*` entries of `SUITES_12`; the
+    /// signature scheme is `rsa_pss_rsae_sha256`. Mirrors the TLS 1.2
+    /// server's `ServerConfig12::with_rsa`.
+    pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+        Self {
+            cert_chain,
+            key: ServerKey::Rsa(key),
             cookie_secret: None,
             require_cookie_exchange: true,
             signature_policy: SignaturePolicy::modern(),
@@ -231,9 +248,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
     /// until the cookie-validated ClientHello has pinned a suite from the
     /// 6-entry `SUITES_12` matrix (ECDHE-{ECDSA,RSA} × {AES-128-GCM,
-    /// ChaCha20-Poly1305, AES-256-GCM-SHA384}). Phase 4 only ships ECDSA
-    /// signing, so an RSA-keyed server can be configured at build time but
-    /// will fail to find a compatible suite at handshake time.
+    /// ChaCha20-Poly1305, AES-256-GCM-SHA384}). Both ECDSA and RSA-PSS
+    /// signing keys are supported; matches the TLS 1.2 server's scope.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.suite.map(|s| s.suite.0)
     }
@@ -481,8 +497,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Suite selection — mirror the TLS 1.2 server (`src/tls/conn/server12.rs`):
         // walk SUITES_12 in OUR preference order, picking the first entry the
         // client offered whose signature half matches the configured key's
-        // family. Phase 4 only ships ECDSA signing, so an RSA leaf can be
-        // configured but no suite will match.
+        // family. RSA and ECDSA keys are both supported; an Ed25519 / ML-DSA
+        // server key can be plumbed in but will not match any suite.
         let sig_kind = sig_kind_for_key(&self.config.key);
         let suite = SUITES_12
             .iter()
@@ -593,20 +609,36 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         flight.push(cert_dgram);
 
         // ServerKeyExchange. The SKE signature hash tracks the key's curve
-        // (RFC 5246 §7.4.1.4.1 lets the server pick any acceptable scheme
-        // independent of the PRF / suite hash). This mirrors
-        // `src/tls/conn/server12.rs::send_server_key_exchange`. Phase 4 ships
-        // ECDSA-only signing — Phase 6 will add RSA.
+        // for ECDSA (RFC 5246 §7.4.1.4.1 lets the server pick any acceptable
+        // scheme independent of the PRF / suite hash); RSA-PSS uses
+        // `rsa_pss_rsae_sha256` regardless of the suite hash. Mirrors
+        // `src/tls/conn/server12.rs::send_server_key_exchange`.
         let cr = self.client_random.expect("set above");
         let to_sign = signed_message(&cr, &sr, group, &our_point);
-        let curve = self.config.key.curve();
-        let scheme = ecdsa_scheme_for(curve);
-        let sig_der = sign_ecdsa(&self.config.key, &to_sign)?.to_der(curve);
+        let scheme = signature_scheme(&self.config.key);
+        let signature: Vec<u8> = match &self.config.key {
+            ServerKey::Rsa(k) => k
+                .sign_pss::<Sha256, _>(&to_sign, &mut self.rng)
+                .map_err(|_| Error::HandshakeFailure)?,
+            ServerKey::Ecdsa(k) => {
+                let sig = match k.curve() {
+                    CurveId::P384 => k.sign::<Sha384>(&to_sign),
+                    CurveId::P521 => k.sign::<Sha512>(&to_sign),
+                    _ => k.sign::<Sha256>(&to_sign),
+                }
+                .map_err(|_| Error::HandshakeFailure)?;
+                sig.to_der(k.curve())
+            }
+            // The public DTLS-1.2 server constructors (`with_ecdsa`,
+            // `with_rsa`) only build RSA / ECDSA server keys, so other
+            // variants are unreachable. Be explicit.
+            _ => return Err(Error::HandshakeFailure),
+        };
         let ske = ServerKeyExchange {
             group,
             point: our_point,
             scheme,
-            signature: sig_der,
+            signature,
         }
         .encode();
         self.transcript.update(&ske);
@@ -901,43 +933,40 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
     msg
 }
 
-/// Maps the configured ECDSA key's curve to the IANA `SignatureScheme` we
-/// advertise in `ServerKeyExchange.signature_algorithm`. Mirrors the
-/// curve→scheme dispatch in `src/tls/conn/server12.rs::signature_scheme`.
+/// Maps the configured server key to the IANA `SignatureScheme` we
+/// advertise in `ServerKeyExchange.signature_algorithm`. Mirrors
+/// `src/tls/conn/server12.rs::signature_scheme`.
 ///
 /// TLS 1.2 (RFC 5246 §7.4.1.4.1) allows an independent (hash, signature)
 /// pair on the SKE — separate from the PRF / transcript hash fixed by the
-/// suite. We pick the canonical IANA `SignatureScheme` for each curve;
-/// the codec only knows those three codepoints (RFC 8446 §4.2.3 / RFC 8447
-/// IANA registry).
-fn ecdsa_scheme_for(curve: CurveId) -> SignatureScheme {
-    match curve {
-        CurveId::P256 | CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
-        CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
-        CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
+/// suite. For ECDSA the scheme tracks the curve (RFC 8446 §4.2.3 / RFC 8447
+/// IANA registry); for RSA we use `rsa_pss_rsae_sha256`, the modern default
+/// for TLS 1.2 + 1.3 interop.
+fn signature_scheme(key: &ServerKey) -> SignatureScheme {
+    match key {
+        ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
+        ServerKey::Ecdsa(k) => match k.curve() {
+            CurveId::P256 | CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+            CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
+        },
+        // Unreachable through the public constructors but the compiler
+        // requires the match to be total.
+        _ => SignatureScheme::RSA_PSS_RSAE_SHA256,
     }
 }
 
-/// Signs the SKE message. Mirrors the curve→hash dispatch in
-/// `src/tls/conn/server12.rs::send_server_key_exchange` — the hash tracks
-/// the curve (P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512). The
-/// suite's PRF hash (used for the transcript, master, key block, and
-/// Finished) is independent of the SKE signature hash at TLS 1.2.
-fn sign_ecdsa(
-    key: &BoxedEcdsaPrivateKey,
-    to_sign: &[u8],
-) -> Result<crate::ec::BoxedEcdsaSignature, Error> {
-    match key.curve() {
-        CurveId::P384 => key.sign::<Sha384>(to_sign),
-        CurveId::P521 => key.sign::<Sha512>(to_sign),
-        CurveId::P256 | CurveId::Secp256k1 => key.sign::<Sha256>(to_sign),
+/// Which signature family the configured server key belongs to. Drives suite
+/// negotiation: an RSA key only matches the three `ECDHE-RSA-*` entries of
+/// `SUITES_12`; an ECDSA key only matches the three `ECDHE-ECDSA-*` entries.
+/// Mirrors `src/tls/conn/server12.rs::sig_kind`.
+fn sig_kind_for_key(key: &ServerKey) -> SigKind {
+    match key {
+        ServerKey::Rsa(_) => SigKind::Rsa,
+        ServerKey::Ecdsa(_) => SigKind::Ecdsa,
+        // Other variants are inhabited by the shared `ServerKey` enum but
+        // are unreachable through the public DTLS-1.2 constructors. Default
+        // to a kind that will fail to match any of our suites.
+        _ => SigKind::Rsa,
     }
-    .map_err(|_| Error::HandshakeFailure)
-}
-
-/// Which signature family the configured ECDSA server key belongs to. Phase 4
-/// only ships ECDSA signing; the public `with_ecdsa` constructor guarantees
-/// this, but we keep the helper symmetric with the TLS 1.2 server.
-fn sig_kind_for_key(_key: &BoxedEcdsaPrivateKey) -> SigKind {
-    SigKind::Ecdsa
 }

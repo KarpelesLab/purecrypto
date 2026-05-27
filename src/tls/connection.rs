@@ -582,7 +582,12 @@ fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
         super::config::SigningKey::Ecdsa(k) => {
             crate::dtls::ServerConfig12Internal::with_ecdsa(chain, k.clone())
         }
-        _ => return Err(Error::UnsupportedVersion), // DTLS 1.2 server: ECDSA-only today
+        super::config::SigningKey::Rsa(k) => {
+            crate::dtls::ServerConfig12Internal::with_rsa(chain, k.clone())
+        }
+        // DTLS 1.2 mirrors TLS 1.2's scope: RSA + ECDSA only. Ed25519 and
+        // ML-DSA are not common in TLS 1.2 practice.
+        _ => return Err(Error::UnsupportedVersion),
     };
     if let Some(secret) = cfg.cookie_secret {
         sc = sc.with_cookie_secret(secret);

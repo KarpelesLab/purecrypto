@@ -1049,4 +1049,104 @@ mod dtls12 {
         }
         assert_eq!(client.take_received(), b"pong-p256");
     }
+
+    /// Build a DTLS 1.2 server fixture with an RSA-2048 signing key. The
+    /// fixture issues a self-signed RSA leaf, advertises it to the
+    /// `PcServerConfig12`, and returns both the config and the DER cert
+    /// (the latter is used to seed the client's trust store).
+    fn make_server_rsa() -> (PcServerConfig12, Vec<u8>) {
+        use crate::rsa::BoxedRsaPrivateKey;
+        use crate::test_util::rsa_test_key_a;
+
+        let rsa_key = rsa_test_key_a();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&rsa_key.to_pkcs1_der()).unwrap();
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Rsa(&boxed),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            PcServerConfig12::with_rsa(alloc::vec![der.clone()], boxed),
+            der,
+        )
+    }
+
+    /// DTLS 1.2 + RSA-2048 server certificate: the server signs its
+    /// `ServerKeyExchange` under `rsa_pss_rsae_sha256` (RFC 8446 §4.2.3 /
+    /// RFC 8447 IANA registry). With the client offering all six entries
+    /// of `SUITES_12`, the RSA-keyed server must pick an `ECDHE-RSA-*`
+    /// suite — driving the multi-sig dispatch in
+    /// `send_server_key_exchange`.
+    #[test]
+    fn loopback_rsa_cert() {
+        let (server_cfg, cert) = make_server_rsa();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-rsa", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+
+        // The server's RSA key forces an ECDHE-RSA-* suite. Verify the
+        // negotiated id is one of the three RSA entries of `SUITES_12`.
+        let suite = client.negotiated_cipher_suite().expect("negotiated");
+        assert!(
+            suite == CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.0
+                || suite == CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0
+                || suite == CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.0,
+            "unexpected suite 0x{suite:04x}"
+        );
+        assert_eq!(server.negotiated_cipher_suite(), Some(suite));
+
+        // App-data round-trip under the RSA-signed handshake.
+        client.send(b"ping-rsa").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-rsa");
+
+        server.send(b"pong-rsa").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-rsa");
+    }
+
+    /// Multi-sig × multi-suite intersection: the client pins
+    /// `TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256` and the RSA-keyed
+    /// server must select it — exercising the RSA-PSS signature path
+    /// together with ChaCha20-Poly1305 record protection.
+    #[test]
+    fn loopback_ecdhe_rsa_chacha() {
+        let (server_cfg, cert) = make_server_rsa();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = client_with_suites(
+            &cert,
+            alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256],
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-rsa-chacha", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+        assert_eq!(
+            server.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+    }
 }
