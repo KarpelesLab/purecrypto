@@ -319,7 +319,7 @@ impl CertificateRevocationList {
 
     /// RFC 5280 §5.1.1.2: the inner and outer signature AlgorithmIdentifier
     /// fields MUST be identical. Compares raw DER (parameters included),
-    /// mirroring [`super::Certificate::check_signature_algid_consistent`].
+    /// mirroring `super::Certificate::check_signature_algid_consistent`.
     pub fn check_signature_algid_consistent(&self) -> Result<(), Error> {
         let inner = self.inner_signature_algid_der()?;
         let outer = self.outer_signature_algid_der()?;

@@ -263,7 +263,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
     }
 
-    /// PEM-wrapped variant of [`to_pkcs8_der_encrypted`]
+    /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
     /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`, RFC 7468 §11).
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn to_pkcs8_pem_encrypted(
@@ -283,7 +283,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         Self::from_pkcs8_der(&inner)
     }
 
-    /// PEM-wrapped variant of [`from_pkcs8_der_encrypted`].
+    /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
         let inner = crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?;

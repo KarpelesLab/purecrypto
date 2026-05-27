@@ -1,7 +1,7 @@
 //! X25519 Diffie-Hellman over Curve25519 (RFC 7748).
 //!
 //! The field is GF(2²⁵⁵−19); arithmetic reuses the constant-time
-//! [`MontModulus`](crate::bignum::MontModulus). The scalar multiplication is
+//! [`MontModulus`]. The scalar multiplication is
 //! the Montgomery ladder with constant-time conditional swaps.
 
 use crate::bignum::{MontModulus, Uint};

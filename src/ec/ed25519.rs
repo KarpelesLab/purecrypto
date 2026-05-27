@@ -1,14 +1,14 @@
 //! Ed25519 signatures (EdDSA over edwards25519, RFC 8032).
 //!
 //! The field is GF(2²⁵⁵−19) — the same prime as X25519 — so the arithmetic
-//! reuses the constant-time [`MontModulus`](crate::bignum::MontModulus). Curve
+//! reuses the constant-time [`MontModulus`]. Curve
 //! points use the twisted Edwards curve `−x² + y² = 1 + d·x²·y²` in extended
 //! homogeneous coordinates `(X:Y:Z:T)`, with complete addition formulas
 //! (Hisil–Wong–Carter–Dawson 2008), so there are no exceptional cases. Scalar
 //! multiplication is a fixed-window-free constant-time double-and-add: every
 //! step doubles and conditionally selects the sum, independent of the secret
 //! scalar bits. Reduction of scalars modulo the group order `L` rides on the
-//! constant-time [`Uint`](crate::bignum::Uint) long division.
+//! constant-time [`Uint`] long division.
 
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
@@ -478,7 +478,7 @@ impl Ed25519PrivateKey {
         crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
     }
 
-    /// PEM-wrapped variant of [`to_pkcs8_der_encrypted`]
+    /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
     /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`, RFC 7468 §11).
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn to_pkcs8_pem_encrypted(
@@ -502,7 +502,7 @@ impl Ed25519PrivateKey {
         Self::from_pkcs8_der(&inner)
     }
 
-    /// PEM-wrapped variant of [`from_pkcs8_der_encrypted`].
+    /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
     #[cfg(all(feature = "kdf", feature = "der"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
         let inner = crate::kdf::pbes2::decrypt_pem(pem, password)

@@ -126,7 +126,7 @@ impl<C: BlockCipher> Xts<C> {
         Ok(())
     }
 
-    /// Decrypts a sector in place. Mirrors [`encrypt_sector`].
+    /// Decrypts a sector in place. Mirrors [`Self::encrypt_sector`].
     pub fn decrypt_sector(&self, sector_index: u128, buf: &mut [u8]) -> Result<(), InvalidLength> {
         if buf.len() < 16 {
             return Err(InvalidLength);

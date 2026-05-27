@@ -5,13 +5,13 @@
 //! Mirrors the TLS 1.3 client handshake flow (`TLS_AES_128_GCM_SHA256`,
 //! X25519 group only — focused subset for this commit), wrapped in:
 //!
-//! - DTLS 1.3 unified record framing ([`super::record13`]) for protected
+//! - DTLS 1.3 unified record framing (`super::record13`) for protected
 //!   records, including encrypted sequence numbers (RFC 9147 §4.2.3).
-//! - Plaintext DTLS records ([`super::record`]) for the initial flight
+//! - Plaintext DTLS records (`super::record`) for the initial flight
 //!   (ClientHello / HelloRetryRequest), per RFC 9147 §4.1.
 //! - DTLS handshake header (`Type ‖ Length ‖ MessageSeq ‖ FragmentOffset ‖
 //!   FragmentLength`) for handshake messages.
-//! - ACK-driven retransmission ([`super::reliability13`]) — every received
+//! - ACK-driven retransmission (`super::reliability13`) — every received
 //!   protected handshake record is ACKed back; unACKed records are
 //!   retransmitted on timer fire (RFC 9147 §7).
 //! - Server-initiated cookie exchange via HelloRetryRequest carrying a

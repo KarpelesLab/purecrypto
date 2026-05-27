@@ -15,7 +15,7 @@ pub trait RngCore {
     /// Fills `dest` entirely with random bytes.
     fn fill_bytes(&mut self, dest: &mut [u8]);
 
-    /// Returns the next random `u32` (little-endian from [`fill_bytes`]).
+    /// Returns the next random `u32` (little-endian from [`Self::fill_bytes`]).
     #[inline]
     fn next_u32(&mut self) -> u32 {
         let mut b = [0u8; 4];
@@ -23,7 +23,7 @@ pub trait RngCore {
         u32::from_le_bytes(b)
     }
 
-    /// Returns the next random `u64` (little-endian from [`fill_bytes`]).
+    /// Returns the next random `u64` (little-endian from [`Self::fill_bytes`]).
     #[inline]
     fn next_u64(&mut self) -> u64 {
         let mut b = [0u8; 8];

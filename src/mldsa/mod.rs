@@ -2,7 +2,7 @@
 //! standardized form of Dilithium.
 //!
 //! Three security levels are provided — ML-DSA-44, -65, and -87 — built on a
-//! single const-generic core (`K`, `L`) plus a per-level [`Params`] bundle. The
+//! single const-generic core (`K`, `L`) plus a per-level `Params` bundle. The
 //! module needs `alloc`: keys and signatures are returned as `Vec<u8>` (their
 //! sizes are fixed per level), while the heavy polynomial arithmetic stays on
 //! the stack.

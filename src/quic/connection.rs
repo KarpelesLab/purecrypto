@@ -137,7 +137,7 @@ pub struct QuicConfig {
 /// a server (responds).
 ///
 /// Internally holds the TLS engine in QUIC mode, an
-/// [`Endpoint`] with per-level keys + buffers, and a hook handle to drain
+/// `Endpoint` with per-level keys + buffers, and a hook handle to drain
 /// engine events. The struct is `Send` (the Phase-3 `QuicHooks: Send`
 /// bound forces `Arc<Mutex<…>>` rather than `Rc<RefCell<…>>`) but not
 /// `Sync`.
@@ -1145,7 +1145,7 @@ impl QuicConnection {
 
     /// Queues an outbound PATH_CHALLENGE (RFC 9000 §8.2). The peer will
     /// echo the 8-byte challenge in a PATH_RESPONSE; matching it via
-    /// the [`PathChallengeState`] confirms path reachability. Phase 7
+    /// the `PathChallengeState` confirms path reachability. Phase 7
     /// ships only the frame round-trip; path migration itself is Phase 8+.
     ///
     /// Returns [`Error::InappropriateState`] if the handshake isn't
@@ -1217,7 +1217,7 @@ impl QuicConnection {
     ///
     /// Receiver-initiated updates (i.e. observing the peer flip the
     /// phase bit) commit both sides synchronously via
-    /// [`Self::commit_rx_key_phase_flip`] — no application call is
+    /// `Self::commit_rx_key_phase_flip` — no application call is
     /// needed for that direction.
     pub fn initiate_key_update(&mut self) -> Result<(), Error> {
         if self.closed || !self.handshake_complete {

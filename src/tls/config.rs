@@ -27,7 +27,7 @@ use super::conn::ReplayWindow;
 ///
 /// Renamed from `ServerKey` (which used to be misleadingly named for what is
 /// also the client mTLS key). The old name remains as a
-/// [`pub type ServerKey = SigningKey;`](super::ServerKey) alias for one
+/// `pub type ServerKey = SigningKey;` alias for one
 /// release.
 ///
 /// The PQ variants (`MlDsa*`) carry their full key material inline. Since

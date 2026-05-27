@@ -6,8 +6,8 @@
 //! OID for X.509, a `SignatureScheme` code point for TLS). The two switches
 //! duplicated dispatch logic and only handled the subset they were wired for.
 //!
-//! This module replaces both with a single static table — [`ALGORITHMS`] — of
-//! [`SignatureAlgorithm`] trait objects. Each entry knows
+//! This module replaces both with a single static table — `ALGORITHMS` — of
+//! `SignatureAlgorithm` trait objects. Each entry knows
 //!   * a stable string id (e.g. `"ecdsa-secp256r1-sha256"`) for policy
 //!     whitelisting,
 //!   * the X.509 `AlgorithmIdentifier` OIDs it matches (a single algorithm
@@ -23,10 +23,10 @@
 //!
 //! # Whitelist policy
 //!
-//! [`SignaturePolicy`] (requires `alloc`) enforces a strict **whitelist**:
-//! adding an algorithm to [`ALGORITHMS`] does NOT auto-permit it; the caller
+//! `SignaturePolicy` (requires `alloc`) enforces a strict **whitelist**:
+//! adding an algorithm to `ALGORITHMS` does NOT auto-permit it; the caller
 //! has to add the id explicitly. The shipped default
-//! [`SignaturePolicy::modern`] permits exactly the modern IANA-blessed set —
+//! `SignaturePolicy::modern` permits exactly the modern IANA-blessed set —
 //! RSA-PSS-RSAE / RSA-PKCS1 with SHA-256/384, ECDSA with matched-curve /
 //! matched-hash pairs over P-256/P-384/P-521, and Ed25519 — with RSA keys
 //! ≥ 2048 bits.

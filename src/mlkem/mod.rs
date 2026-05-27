@@ -7,13 +7,13 @@
 //!
 //! This is a `no_std`, allocation-free implementation: keys, ciphertexts and
 //! all intermediate state live on the stack as fixed-size arrays.
-//! Randomness is supplied through the [`RngCore`](crate::rng::RngCore) trait;
+//! Randomness is supplied through the [`RngCore`] trait;
 //! deterministic constructors (`from_seeds`, `encapsulate_deterministic`)
 //! expose the FIPS 203 internal functions for known-answer testing.
 //!
 //! Decapsulation never branches on secret data: the Fujisaki–Okamoto
 //! re-encryption check and the implicit-rejection fallback both run in
-//! constant time (see [`kem`]).
+//! constant time (see the `kem` submodule).
 //!
 //! # Test-vector coverage — known gap
 //!
@@ -30,9 +30,9 @@ pub(crate) mod indcpa;
 pub(crate) mod kem;
 pub(crate) mod poly;
 
-/// Returned by [`EncapsKey::from_bytes_validated`] when the supplied
-/// encapsulation-key bytes contain off-modulus coefficients (FIPS 203 §7.2
-/// "Encapsulation key check" failure).
+/// Returned by the per-variant `EncapsKey::from_bytes_validated` constructor
+/// when the supplied encapsulation-key bytes contain off-modulus coefficients
+/// (FIPS 203 §7.2 "Encapsulation key check" failure).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct EncapsKeyCheckError;
 

@@ -72,7 +72,7 @@ impl ChaCha20Poly1305 {
     /// Encrypts `buffer` in place and returns the 16-byte tag, binding `aad`.
     ///
     /// # Panics
-    /// Panics if `buffer.len()` exceeds [`MAX_PLAINTEXT_LEN`].
+    /// Panics if `buffer.len()` exceeds [`Self::MAX_PLAINTEXT_LEN`].
     pub fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
         assert!(
             (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
@@ -89,7 +89,7 @@ impl ChaCha20Poly1305 {
     /// ciphertext and [`TagMismatch`] is returned.
     ///
     /// # Panics
-    /// Panics if `buffer.len()` exceeds [`MAX_PLAINTEXT_LEN`].
+    /// Panics if `buffer.len()` exceeds [`Self::MAX_PLAINTEXT_LEN`].
     pub fn decrypt(
         &self,
         nonce: &[u8; 12],
