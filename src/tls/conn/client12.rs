@@ -258,23 +258,29 @@ pub struct StoredSession12 {
 
 /// Whether the cipher-suite's signature half is RSA or ECDSA — drives which
 /// server-cert key types are acceptable.
+///
+/// Exposed at `pub(crate)` so the DTLS 1.2 client/server (`src/dtls/`) can
+/// reuse the same suite-selection surface as the TLS 1.2 layer.
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub(super) enum SigKind {
+pub(crate) enum SigKind {
     Rsa,
     Ecdsa,
 }
 
 /// Parameters of a single TLS 1.2 AEAD-ECDHE cipher suite.
+///
+/// Exposed at `pub(crate)` so the DTLS 1.2 client/server can drive the same
+/// 6-suite negotiation matrix without re-declaring the table.
 #[derive(Copy, Clone)]
-pub(super) struct SuiteParams12 {
-    pub(super) suite: CipherSuite,
-    pub(super) hash: HashAlg,
-    pub(super) aead: AeadAlg,
+pub(crate) struct SuiteParams12 {
+    pub(crate) suite: CipherSuite,
+    pub(crate) hash: HashAlg,
+    pub(crate) aead: AeadAlg,
     /// AEAD key length in bytes (16 for AES-128, 32 for AES-256/ChaCha20).
-    pub(super) key_len: usize,
+    pub(crate) key_len: usize,
     /// Which signature family the server's cert key must belong to (`Rsa` for
     /// `TLS_ECDHE_RSA_*`, `Ecdsa` for `TLS_ECDHE_ECDSA_*`).
-    pub(super) sig_kind: SigKind,
+    pub(crate) sig_kind: SigKind,
 }
 
 /// The TLS 1.2 AEAD-ECDHE suites we offer, in descending preference order.
@@ -287,7 +293,9 @@ pub(super) struct SuiteParams12 {
 ///   is the dominant choice in modern stacks, ChaCha20 is the no-AES-NI
 ///   fallback, and AES-256 is rarely preferred when AES-128 satisfies the
 ///   security target.
-pub(super) const SUITES_12: [SuiteParams12; 6] = [
+///
+/// Exposed at `pub(crate)` so the DTLS 1.2 client/server share this table.
+pub(crate) const SUITES_12: [SuiteParams12; 6] = [
     SuiteParams12 {
         suite: CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         hash: HashAlg::Sha256,
@@ -333,7 +341,10 @@ pub(super) const SUITES_12: [SuiteParams12; 6] = [
 ];
 
 /// Looks up the parameters for a wire suite, if it's one we offer.
-pub(super) fn lookup_suite_12(s: CipherSuite) -> Option<SuiteParams12> {
+///
+/// Exposed at `pub(crate)` so the DTLS 1.2 client/server can pin a suite
+/// from the peer's ServerHello / ClientHello using the same table.
+pub(crate) fn lookup_suite_12(s: CipherSuite) -> Option<SuiteParams12> {
     SUITES_12.iter().copied().find(|p| p.suite == s)
 }
 

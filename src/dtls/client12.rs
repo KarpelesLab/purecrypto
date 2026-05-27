@@ -28,11 +28,12 @@ use crate::tls::codec::handshake12::{ClientKeyExchange, ServerKeyExchange, signe
 use crate::tls::codec::{
     CipherSuite, NamedGroup, Random, ReadCursor, ServerHello, hs_type, with_len_u8, with_len_u16,
 };
+use crate::tls::conn::{SUITES_12, SuiteParams12, lookup_suite_12};
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret,
 };
-use crate::tls::crypto::{HashAlg, Transcript, verify_signature};
+use crate::tls::crypto::{Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls};
 use crate::tls::{ContentType, Error, ProtocolVersion};
@@ -58,9 +59,6 @@ const HS_HELLO_VERIFY_REQUEST: u8 = 3;
 /// header + fragment body) stays well under 1500 byte MTU.
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
-/// AEAD key length (AES-128 = 16 bytes for our single supported suite).
-const KEY_LEN: usize = 16;
-
 /// Configuration for a DTLS 1.2 client connection.
 ///
 /// The shape mirrors [`crate::tls::ClientConfig12`] (TLS 1.2) but is its
@@ -81,6 +79,14 @@ pub(crate) struct ClientConfig12Internal {
     pub crls: CrlStore,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// Cipher suites advertised in the ClientHello, in descending preference
+    /// order. Defaults to all six entries of `SUITES_12` (in
+    /// `crate::tls::conn`) — the same surface the TLS 1.2 client offers
+    /// (ECDHE-{ECDSA,RSA} × {AES-128-GCM, ChaCha20-Poly1305,
+    /// AES-256-GCM-SHA384}). Callers may narrow this list (e.g. to force a
+    /// specific suite for tests). Unknown codepoints are accepted on the
+    /// wire but the server's echo is validated against `lookup_suite_12`.
+    pub cipher_suites: Vec<CipherSuite>,
 }
 
 impl ClientConfig12Internal {
@@ -95,6 +101,7 @@ impl ClientConfig12Internal {
             signature_policy: SignaturePolicy::modern(),
             crls: CrlStore::new(),
             key_log: None,
+            cipher_suites: SUITES_12.iter().map(|p| p.suite).collect(),
         }
     }
 
@@ -181,8 +188,13 @@ pub struct DtlsClientConnection12 {
 
     /// Transcript: per RFC 6347 §4.2.1, only the second CH (with cookie) and
     /// onward are in the transcript. We use a single Transcript object;
-    /// we reset it on HVR.
+    /// we reset it on HVR. The hash isn't pinned until ServerHello (the
+    /// negotiated suite picks SHA-256 or SHA-384); `Transcript` buffers raw
+    /// bytes until then.
     transcript: Transcript,
+
+    /// Negotiated cipher-suite parameters, pinned on ServerHello.
+    suite: Option<SuiteParams12>,
 
     /// Peer cert chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
@@ -249,6 +261,7 @@ impl DtlsClientConnection12 {
             server_random: None,
             cookie: Vec::new(),
             transcript: Transcript::new(),
+            suite: None,
             cert_chain: Vec::new(),
             leaf_key: None,
             peer_group: None,
@@ -266,8 +279,9 @@ impl DtlsClientConnection12 {
         // "the initial ClientHello and HelloVerifyRequest are not included in
         // the calculation of the handshake_messages". We'll reset and update on
         // the second CH (which is exactly the same encoder path, plus the
-        // cookie field).
-        conn.transcript.set_alg(HashAlg::Sha256);
+        // cookie field). The transcript hash isn't pinned yet — the negotiated
+        // suite (received in ServerHello) decides between SHA-256 and SHA-384,
+        // so we buffer raw bytes and call `set_alg` later.
         let flight = conn.build_client_hello_flight();
         conn.send_flight(flight);
         conn
@@ -279,10 +293,11 @@ impl DtlsClientConnection12 {
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
-    /// until the handshake completes. DTLS 1.2 in this crate is locked
-    /// to `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (0xC02B).
+    /// until ServerHello has been processed. Drawn from the 6-entry
+    /// `SUITES_12` matrix (ECDHE-{ECDSA,RSA} × {AES-128-GCM,
+    /// ChaCha20-Poly1305, AES-256-GCM-SHA384}).
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
-        self.is_handshake_complete().then_some(0xC02B)
+        self.suite.map(|s| s.suite.0)
     }
 
     /// Drains pending UDP datagrams to send.
@@ -540,9 +555,9 @@ impl DtlsClientConnection12 {
         // continues, NOT resets. Our `write_seq_in_epoch` is correct as-is.
 
         // RFC 6347 §4.2.1: the initial CH + HVR are not in the transcript.
-        // The transcript starts fresh with the second CH.
+        // The transcript starts fresh with the second CH. The hash stays
+        // unpinned until ServerHello selects the suite.
         self.transcript = Transcript::new();
-        self.transcript.set_alg(HashAlg::Sha256);
 
         let flight = self.build_client_hello_flight();
         self.send_flight(flight);
@@ -554,10 +569,19 @@ impl DtlsClientConnection12 {
             return Err(Error::UnexpectedMessage);
         }
         let sh = ServerHello::decode(body)?;
-        // For this subset we require the single suite we offer.
-        if sh.cipher_suite != CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 {
+        // RFC 5246 §7.4.1.3: the SH's `cipher_suite` MUST be one of those the
+        // client offered. We additionally require it to be a member of our
+        // SUITES_12 table; an unknown / non-offered codepoint is a fatal
+        // handshake_failure.
+        let suite = lookup_suite_12(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
+        if !self.config.cipher_suites.contains(&sh.cipher_suite) {
             return Err(Error::HandshakeFailure);
         }
+        // Pin the transcript hash now that the suite is known. The buffered
+        // bytes (CH-with-cookie and onward) will be hashed on demand under
+        // this algorithm.
+        self.transcript.set_alg(suite.hash);
+        self.suite = Some(suite);
         // RFC 7627 §5.1: detect the EMS echo. Body MUST be empty; a
         // non-empty body fails parsing → decode_error.
         if let Some(ems_body) = ext::find(
@@ -684,31 +708,33 @@ impl DtlsClientConnection12 {
 
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let master = if self.ems_negotiated {
             // RFC 7627 §4: session_hash = Hash(CH..CKE).
             let sh = self.transcript.current_hash();
-            extended_master_secret(HashAlg::Sha256, &premaster, sh.as_slice())
+            extended_master_secret(suite.hash, &premaster, sh.as_slice())
         } else {
-            master_secret(HashAlg::Sha256, &premaster, &cr, &sr)
+            master_secret(suite.hash, &premaster, &cr, &sr)
         };
 
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
 
-        // key_block: c_key(16) || s_key(16) || c_iv(4) || s_iv(4) — total 40 bytes.
-        let mut kb = alloc::vec![0u8; 2 * KEY_LEN + 8];
-        key_block(HashAlg::Sha256, &master, &sr, &cr, &mut kb);
-        let (c_key, rest) = kb.split_at(KEY_LEN);
-        let (s_key, rest) = rest.split_at(KEY_LEN);
+        // key_block: c_key || s_key || c_iv(4) || s_iv(4). Total size
+        // depends on the negotiated AEAD's key length: 40 bytes for AES-128,
+        // 72 bytes for AES-256 / ChaCha20-Poly1305 (the +8 stays — two
+        // 4-byte salts for the GCM/ChaCha IV).
+        let mut kb = alloc::vec![0u8; 2 * suite.key_len + 8];
+        key_block(suite.hash, &master, &sr, &cr, &mut kb);
+        let (c_key, rest) = kb.split_at(suite.key_len);
+        let (s_key, rest) = rest.split_at(suite.key_len);
         let mut c_salt = [0u8; 4];
         c_salt.copy_from_slice(&rest[..4]);
         let mut s_salt = [0u8; 4];
         s_salt.copy_from_slice(&rest[4..8]);
-        let write_crypter =
-            RecordCrypter12::new(crate::tls::crypto::AeadAlg::Aes128Gcm, c_key, c_salt);
-        let read_crypter =
-            RecordCrypter12::new(crate::tls::crypto::AeadAlg::Aes128Gcm, s_key, s_salt);
+        let write_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
+        let read_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
         self.master = Some(master);
         self.write_crypter = Some(write_crypter);
         self.read_crypter = Some(read_crypter);
@@ -725,7 +751,7 @@ impl DtlsClientConnection12 {
         // Finished: 12-byte verify_data over transcript hash.
         let th = self.transcript.current_hash();
         let verify_data =
-            finished_verify_data(HashAlg::Sha256, &master, b"client finished", th.as_slice());
+            finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
         // Build the Finished body (just 12 bytes — verify_data).
         let fin_body: Vec<u8> = verify_data.to_vec();
         // Transcript: TLS-shaped finished.
@@ -761,9 +787,9 @@ impl DtlsClientConnection12 {
             return Err(Error::Decode);
         }
         let master = self.master.ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected =
-            finished_verify_data(HashAlg::Sha256, &master, b"server finished", th.as_slice());
+        let expected = finished_verify_data(suite.hash, &master, b"server finished", th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
@@ -798,9 +824,11 @@ impl DtlsClientConnection12 {
     }
 
     /// Builds the current ClientHello as a one-element flight. The body uses
-    /// the current `cookie` (empty for the first attempt).
+    /// the current `cookie` (empty for the first attempt). Cipher suites come
+    /// from [`ClientConfig12Internal::cipher_suites`] (default: all six
+    /// entries of [`SUITES_12`]).
     fn build_client_hello_flight(&mut self) -> Flight {
-        let suites = alloc::vec![CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256];
+        let suites: Vec<CipherSuite> = self.config.cipher_suites.clone();
         let groups = alloc::vec![NamedGroup::X25519];
 
         let extensions = alloc::vec![

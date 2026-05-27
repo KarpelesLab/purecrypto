@@ -867,3 +867,143 @@ mod dtls13 {
         assert_eq!(server.take_received(), b"ping-hrr");
     }
 }
+
+/// DTLS 1.2 multi-suite negotiation tests (Phase 4). The server has an
+/// ECDSA P-256 key, so only the three ECDSA entries of `SUITES_12` are
+/// selectable end-to-end; the client may advertise all six.
+mod dtls12 {
+    use super::*;
+    use crate::tls::codec::CipherSuite;
+
+    /// Drive a client/server pair to completion. Returns whether both sides
+    /// reported a complete handshake within the iteration cap.
+    fn pump<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection12,
+        server: &mut DtlsServerConnection12<R>,
+    ) -> bool {
+        super::pump_handshake(client, server)
+    }
+
+    /// Build a client whose ClientHello advertises only `suites`.
+    fn client_with_suites(server_cert: &[u8], suites: Vec<CipherSuite>) -> DtlsClientConnection12 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        let mut cfg = PcClientConfig12::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        cfg.cipher_suites = suites;
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-multi-suite-cli", b"nonce", &[]);
+        DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    /// Multi-suite negotiation (RFC 5246 §7.4.1.3 + RFC 6347 §4.2.1): when
+    /// the client advertises only `TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`,
+    /// the server must pick that suite. Exercises ChaCha20-Poly1305 record
+    /// protection on the DTLS path.
+    #[test]
+    fn negotiates_chacha20() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = client_with_suites(
+            &cert,
+            alloc::vec![CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256],
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-chacha", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+        assert_eq!(
+            server.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256.0)
+        );
+
+        // App-data round-trip under ChaCha20-Poly1305.
+        client.send(b"ping-chacha").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-chacha");
+
+        server.send(b"pong-chacha").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-chacha");
+    }
+
+    /// Multi-suite negotiation: when the client advertises only
+    /// `TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`, the server must pick that
+    /// suite — exercising the SHA-384 transcript / PRF path along with
+    /// AES-256-GCM record protection.
+    #[test]
+    fn negotiates_aes256_sha384() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = client_with_suites(
+            &cert,
+            alloc::vec![CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384],
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-aes256", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.0)
+        );
+        assert_eq!(
+            server.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384.0)
+        );
+
+        // App-data round-trip under AES-256-GCM record protection +
+        // SHA-384-derived keys.
+        client.send(b"ping-sha384").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-sha384");
+
+        server.send(b"pong-sha384").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-sha384");
+    }
+
+    /// Server preference order: when the client offers all three ECDSA
+    /// entries of `SUITES_12`, the server picks `TLS_ECDHE_ECDSA_*_AES_128_GCM_SHA256`
+    /// — the top of our preference table.
+    #[test]
+    fn prefers_aes128_when_offered() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = client_with_suites(
+            &cert,
+            alloc::vec![
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ],
+        );
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-pref", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.0)
+        );
+        assert_eq!(
+            server.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.0)
+        );
+    }
+}

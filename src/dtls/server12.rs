@@ -10,7 +10,7 @@
 
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, CurveId};
-use crate::hash::Sha256;
+use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
@@ -19,11 +19,12 @@ use crate::tls::codec::{
     CipherSuite, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
     hs_type, with_len_u8, with_len_u24,
 };
+use crate::tls::conn::{SUITES_12, SigKind, SuiteParams12};
+use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret,
 };
-use crate::tls::crypto::{HashAlg, Transcript};
 use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::sync::Arc;
@@ -44,9 +45,6 @@ const HS_HELLO_VERIFY_REQUEST: u8 = 3;
 
 /// Default per-fragment payload size for outbound handshake messages.
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
-
-/// AEAD key length for AES-128-GCM.
-const KEY_LEN: usize = 16;
 
 /// Configuration for a DTLS 1.2 server.
 pub(crate) struct ServerConfig12Internal {
@@ -154,6 +152,10 @@ pub struct DtlsServerConnection12<R: RngCore> {
     client_random: Option<Random>,
     server_random: Option<Random>,
 
+    /// Negotiated cipher-suite parameters, pinned on the cookie-validated
+    /// ClientHello (or the only CH when cookies are disabled).
+    suite: Option<SuiteParams12>,
+
     transcript: Transcript,
 
     master: Option<[u8; 48]>,
@@ -180,8 +182,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
     /// is the opaque identifier used by the cookie generator.
     pub(crate) fn new(config: Arc<ServerConfig12Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
-        let mut t = Transcript::new();
-        t.set_alg(HashAlg::Sha256);
+        // Don't pin the transcript hash yet: the negotiated suite (SHA-256
+        // or SHA-384) is unknown until we parse the cookie-validated CH and
+        // select from SUITES_12. `Transcript` buffers raw bytes; we call
+        // `set_alg` once the suite is pinned.
         Self {
             config,
             rng,
@@ -199,7 +203,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             p256: None,
             client_random: None,
             server_random: None,
-            transcript: t,
+            suite: None,
+            transcript: Transcript::new(),
             master: None,
             read_crypter: None,
             write_crypter: None,
@@ -218,10 +223,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
-    /// until the handshake completes. DTLS 1.2 in this crate is locked
-    /// to `TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256` (0xC02B).
+    /// until the cookie-validated ClientHello has pinned a suite from the
+    /// 6-entry `SUITES_12` matrix (ECDHE-{ECDSA,RSA} × {AES-128-GCM,
+    /// ChaCha20-Poly1305, AES-256-GCM-SHA384}). Phase 4 only ships ECDSA
+    /// signing, so an RSA-keyed server can be configured at build time but
+    /// will fail to find a compatible suite at handshake time.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
-        self.is_handshake_complete().then_some(0xC02B)
+        self.suite.map(|s| s.suite.0)
     }
 
     /// Drains pending UDP datagrams to send.
@@ -449,10 +457,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         }
 
         // Cookie validated (or skipped): proceed with the handshake. The
-        // transcript starts with this CH per RFC 6347 §4.2.1.
+        // transcript starts with this CH per RFC 6347 §4.2.1. Buffer the
+        // CH bytes BEFORE pinning the transcript hash — `Transcript`
+        // accumulates raw bytes and applies the hash on demand once
+        // `set_alg` is called, so the order of update / set_alg here is
+        // irrelevant as long as set_alg happens before `current_hash`.
         self.client_random = Some(parsed.random);
-        // Pin the transcript hash (SHA256 — the only suite we support).
-        // Already done at construction; update with the TLS-shaped CH.
         let mut tls_ch = Vec::with_capacity(4 + body.len());
         tls_ch.push(hs_type::CLIENT_HELLO);
         let n = body.len() as u32;
@@ -462,11 +472,20 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         tls_ch.extend_from_slice(body);
         self.transcript.update(&tls_ch);
 
-        // Sanity-check the suites: we require AES-128-GCM-SHA256-ECDSA.
-        let want = CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256;
-        if !parsed.cipher_suites.contains(&want) {
-            return Err(Error::HandshakeFailure);
-        }
+        // Suite selection — mirror the TLS 1.2 server (`src/tls/conn/server12.rs`):
+        // walk SUITES_12 in OUR preference order, picking the first entry the
+        // client offered whose signature half matches the configured key's
+        // family. Phase 4 only ships ECDSA signing, so an RSA leaf can be
+        // configured but no suite will match.
+        let sig_kind = sig_kind_for_key(&self.config.key);
+        let suite = SUITES_12
+            .iter()
+            .copied()
+            .find(|p| parsed.cipher_suites.contains(&p.suite) && p.sig_kind == sig_kind)
+            .ok_or(Error::HandshakeFailure)?;
+        // Pin the transcript hash now that the suite is known.
+        self.transcript.set_alg(suite.hash);
+        self.suite = Some(suite);
         // Require X25519 in supported_groups.
         let groups_body = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
@@ -529,7 +548,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let sh = ServerHello {
             random: sr,
             session_id: Vec::new(),
-            cipher_suite: want,
+            cipher_suite: suite.suite,
             extensions: sh_exts,
         }
         .encode();
@@ -549,19 +568,20 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let cert_dgram = self.wrap_handshake(hs_type::CERTIFICATE, cert_body);
         flight.push(cert_dgram);
 
-        // ServerKeyExchange.
+        // ServerKeyExchange. The SKE signature hash tracks the key's curve
+        // (RFC 5246 §7.4.1.4.1 lets the server pick any acceptable scheme
+        // independent of the PRF / suite hash). This mirrors
+        // `src/tls/conn/server12.rs::send_server_key_exchange`. Phase 4 ships
+        // ECDSA-only signing — Phase 6 will add RSA.
         let cr = self.client_random.expect("set above");
         let to_sign = signed_message(&cr, &sr, NamedGroup::X25519, &our_point);
-        let sig_der = self
-            .config
-            .key
-            .sign::<Sha256>(&to_sign)
-            .map_err(|_| Error::HandshakeFailure)?
-            .to_der(self.config.key.curve());
+        let curve = self.config.key.curve();
+        let scheme = ecdsa_scheme_for(curve);
+        let sig_der = sign_ecdsa(&self.config.key, &to_sign)?.to_der(curve);
         let ske = ServerKeyExchange {
             group: NamedGroup::X25519,
             point: our_point,
-            scheme: ecdsa_scheme_for(self.config.key.curve()),
+            scheme,
             signature: sig_der,
         }
         .encode();
@@ -679,33 +699,29 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // EMS session_hash (RFC 7627 §4) spans CH..CKE inclusive.
         self.transcript.update(raw);
 
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let master = if self.ems_negotiated {
             let sh = self.transcript.current_hash();
-            extended_master_secret(HashAlg::Sha256, &premaster, sh.as_slice())
+            extended_master_secret(suite.hash, &premaster, sh.as_slice())
         } else {
-            master_secret(HashAlg::Sha256, &premaster, &cr, &sr)
+            master_secret(suite.hash, &premaster, &cr, &sr)
         };
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
-        let mut kb = alloc::vec![0u8; 2 * KEY_LEN + 8];
-        key_block(HashAlg::Sha256, &master, &sr, &cr, &mut kb);
-        let (c_key, rest) = kb.split_at(KEY_LEN);
-        let (s_key, rest) = rest.split_at(KEY_LEN);
+        // key_block: c_key || s_key || c_iv(4) || s_iv(4). The +8 is two
+        // 4-byte salts for the GCM/ChaCha IV; the key half scales with
+        // suite.key_len (16 bytes for AES-128, 32 for AES-256/ChaCha20).
+        let mut kb = alloc::vec![0u8; 2 * suite.key_len + 8];
+        key_block(suite.hash, &master, &sr, &cr, &mut kb);
+        let (c_key, rest) = kb.split_at(suite.key_len);
+        let (s_key, rest) = rest.split_at(suite.key_len);
         let mut c_salt = [0u8; 4];
         c_salt.copy_from_slice(&rest[..4]);
         let mut s_salt = [0u8; 4];
         s_salt.copy_from_slice(&rest[4..8]);
-        self.pending_read_crypter = Some(RecordCrypter12::new(
-            crate::tls::crypto::AeadAlg::Aes128Gcm,
-            c_key,
-            c_salt,
-        ));
-        self.pending_write_crypter = Some(RecordCrypter12::new(
-            crate::tls::crypto::AeadAlg::Aes128Gcm,
-            s_key,
-            s_salt,
-        ));
+        self.pending_read_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt));
+        self.pending_write_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt));
         self.master = Some(master);
         Ok(())
     }
@@ -719,9 +735,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             return Err(Error::UnexpectedMessage);
         }
         let master = self.master.ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected =
-            finished_verify_data(HashAlg::Sha256, &master, b"client finished", th.as_slice());
+        let expected = finished_verify_data(suite.hash, &master, b"client finished", th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
@@ -738,7 +754,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
 
         let th2 = self.transcript.current_hash();
         let verify_data =
-            finished_verify_data(HashAlg::Sha256, &master, b"server finished", th2.as_slice());
+            finished_verify_data(suite.hash, &master, b"server finished", th2.as_slice());
         let fin_body: Vec<u8> = verify_data.to_vec();
         // Transcript update with TLS-shaped Finished.
         let mut fin_tls = Vec::with_capacity(16);
@@ -848,10 +864,43 @@ fn build_certificate_msg(chain: &[Vec<u8>]) -> Vec<u8> {
     msg
 }
 
+/// Maps the configured ECDSA key's curve to the IANA `SignatureScheme` we
+/// advertise in `ServerKeyExchange.signature_algorithm`. Mirrors the
+/// curve→scheme dispatch in `src/tls/conn/server12.rs::signature_scheme`.
+///
+/// TLS 1.2 (RFC 5246 §7.4.1.4.1) allows an independent (hash, signature)
+/// pair on the SKE — separate from the PRF / transcript hash fixed by the
+/// suite. We pick the canonical IANA `SignatureScheme` for each curve;
+/// the codec only knows those three codepoints (RFC 8446 §4.2.3 / RFC 8447
+/// IANA registry).
 fn ecdsa_scheme_for(curve: CurveId) -> SignatureScheme {
     match curve {
+        CurveId::P256 | CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
         CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
         CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-        _ => SignatureScheme::ECDSA_SECP256R1_SHA256,
     }
+}
+
+/// Signs the SKE message. Mirrors the curve→hash dispatch in
+/// `src/tls/conn/server12.rs::send_server_key_exchange` — the hash tracks
+/// the curve (P-256 → SHA-256, P-384 → SHA-384, P-521 → SHA-512). The
+/// suite's PRF hash (used for the transcript, master, key block, and
+/// Finished) is independent of the SKE signature hash at TLS 1.2.
+fn sign_ecdsa(
+    key: &BoxedEcdsaPrivateKey,
+    to_sign: &[u8],
+) -> Result<crate::ec::BoxedEcdsaSignature, Error> {
+    match key.curve() {
+        CurveId::P384 => key.sign::<Sha384>(to_sign),
+        CurveId::P521 => key.sign::<Sha512>(to_sign),
+        CurveId::P256 | CurveId::Secp256k1 => key.sign::<Sha256>(to_sign),
+    }
+    .map_err(|_| Error::HandshakeFailure)
+}
+
+/// Which signature family the configured ECDSA server key belongs to. Phase 4
+/// only ships ECDSA signing; the public `with_ecdsa` constructor guarantees
+/// this, but we keep the helper symmetric with the TLS 1.2 server.
+fn sig_kind_for_key(_key: &BoxedEcdsaPrivateKey) -> SigKind {
+    SigKind::Ecdsa
 }
