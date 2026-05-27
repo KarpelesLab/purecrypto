@@ -136,25 +136,8 @@ fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
 
 /// Loads a PEM CA bundle into a RootCertStore.
 fn load_roots_file(path: &str) -> RootCertStore {
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read CA bundle {path}: {e}")));
     let mut store = RootCertStore::new();
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let _ = store.add_pem(&block);
-        }
-    }
+    crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
     store
 }
 

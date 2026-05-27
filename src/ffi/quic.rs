@@ -114,10 +114,15 @@ impl PcQuicCfg {
         }
     }
 
+    // `roots_pem` strings are validated at add-time by `pc_quic_cfg_add_root_pem`
+    // (against a throwaway store). A failure here would mean a parser regression,
+    // not user input — `expect` instead of silently dropping certificates.
     fn build_roots(&self) -> RootCertStore {
         let mut store = RootCertStore::new();
         for pem in &self.roots_pem {
-            let _ = store.add_pem(pem);
+            store
+                .add_pem(pem)
+                .expect("build_roots: pre-validated PEM failed to re-parse");
         }
         store
     }

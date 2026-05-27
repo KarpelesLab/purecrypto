@@ -106,52 +106,16 @@ fn has_latest_quic(args: &Args) -> bool {
 fn load_roots(ca_file: Option<&str>) -> RootCertStore {
     const SYSTEM_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
     let path = ca_file.unwrap_or(SYSTEM_BUNDLE);
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read CA bundle {path}: {e}")));
-
     let mut store = RootCertStore::new();
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let _ = store.add_pem(&block);
-        }
-    }
+    crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
     store
 }
 
 /// Loads trust roots from a CA file if given, else returns an empty store.
 fn load_roots_optional(ca_file: Option<&str>) -> RootCertStore {
     let mut store = RootCertStore::new();
-    let Some(path) = ca_file else {
-        return store;
-    };
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read CA bundle {path}: {e}")));
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let _ = store.add_pem(&block);
-        }
+    if let Some(path) = ca_file {
+        crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
     }
     store
 }

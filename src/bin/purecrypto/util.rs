@@ -108,6 +108,48 @@ pub(crate) fn warn_if_world_readable_key(path: &str) {
     }
 }
 
+/// Loads `-----BEGIN CERTIFICATE-----` blocks from `path` and adds each one to
+/// `store` via `add_pem`. Dies on file-read failure, on a parse failure inside
+/// any one block (no silent truncation of the trust store), and if `path`
+/// yields zero blocks. Returns the number of certificates loaded.
+///
+/// `path` is included in error messages so the user sees which bundle was bad.
+pub(crate) fn load_pem_certs_into<F, E>(path: &str, mut add_pem: F) -> usize
+where
+    F: FnMut(&str) -> Result<(), E>,
+    E: core::fmt::Display,
+{
+    let data =
+        std::fs::read_to_string(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
+    let mut block = String::new();
+    let mut in_cert = false;
+    let mut loaded = 0usize;
+    for line in data.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+            block.clear();
+        }
+        if in_cert {
+            block.push_str(line);
+            block.push('\n');
+        }
+        if line.starts_with("-----END CERTIFICATE-----") {
+            in_cert = false;
+            if let Err(e) = add_pem(&block) {
+                die(format!(
+                    "{path}: certificate #{} failed to parse: {e}",
+                    loaded + 1
+                ));
+            }
+            loaded += 1;
+        }
+    }
+    if loaded == 0 {
+        die(format!("{path}: no certificates found"));
+    }
+    loaded
+}
+
 /// Reads all input: from `path` if `Some` and not `"-"`, otherwise from stdin.
 pub(crate) fn read_input(path: Option<&str>) -> Vec<u8> {
     match path {

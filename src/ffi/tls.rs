@@ -132,10 +132,18 @@ impl PcTlsCfg {
         }
     }
 
+    // The three `build_*` helpers re-parse PEM strings that were already
+    // validated by their `pc_tls_cfg_add_*_pem` entry points (each adds to a
+    // throwaway store and rejects on failure before persisting). A failure
+    // here therefore indicates a parser regression, not user input — we use
+    // `expect` instead of silently dropping certificates from the trust store.
+
     fn build_roots(&self) -> RootCertStore {
         let mut store = RootCertStore::new();
         for pem in &self.roots_pem {
-            let _ = store.add_pem(pem);
+            store
+                .add_pem(pem)
+                .expect("build_roots: pre-validated PEM failed to re-parse");
         }
         store
     }
@@ -143,7 +151,9 @@ impl PcTlsCfg {
     fn build_crls(&self) -> CrlStore {
         let mut store = CrlStore::new();
         for pem in &self.crls_pem {
-            let _ = store.add_pem(pem);
+            store
+                .add_pem(pem)
+                .expect("build_crls: pre-validated PEM failed to re-parse");
         }
         store
     }
@@ -151,7 +161,9 @@ impl PcTlsCfg {
     fn build_client_auth_roots(&self) -> RootCertStore {
         let mut store = RootCertStore::new();
         for pem in &self.client_auth_roots_pem {
-            let _ = store.add_pem(pem);
+            store
+                .add_pem(pem)
+                .expect("build_client_auth_roots: pre-validated PEM failed to re-parse");
         }
         store
     }
