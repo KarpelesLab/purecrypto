@@ -6,18 +6,33 @@
 //! and produces wire datagrams via `pop`. The host wires it to a
 //! `UdpSocket`.
 //!
-//! Phase 1 (this module) ships the pure data-structure foundations:
-//! the variable-length integer codec, packet-number bookkeeping plus the
-//! truncation/expansion algorithm, the [`frame`] codec for all standard
-//! frame types, and the transport-parameter list used inside the TLS
-//! `quic_transport_parameters` extension. No keys, no packet protection,
-//! no TLS plumbing — those land in later phases.
+//! Phase 1 shipped the pure data-structure foundations: varint, packet
+//! numbers, the frame codec, and the transport parameters. Phase 2 added
+//! per-direction Initial + handshake keys plus the long/short header
+//! codec and header-protection wrappers (RFC 9001 §5). Phase 3 added the
+//! TLS-QUIC seam (`QuicHooks` trait, `EngineMode::Quic`).
+//!
+//! Phase 4 (this module) glues the previous three phases into the
+//! [`QuicConnection`] state machine: per-level CRYPTO reassembly, ACK
+//! emission, PADDING on the client's first datagram, PTO-driven Initial /
+//! Handshake retransmission, in-process loopback handshake to completion.
+//! Streams, full RFC 9002, Retry, key update, and DATAGRAM are deferred
+//! to later phases per the master plan.
 
+pub(crate) mod cid;
+pub(crate) mod client;
+pub(crate) mod connection;
 pub(crate) mod crypto;
+pub(crate) mod crypto_buf;
+pub(crate) mod endpoint;
 pub(crate) mod frame;
+pub(crate) mod loss;
 pub(crate) mod pkt;
 pub(crate) mod pn;
+pub(crate) mod server;
+pub(crate) mod tls_glue;
 pub mod transport_params;
 pub(crate) mod varint;
 
+pub use connection::{QuicConfig, QuicConnection, Role};
 pub use transport_params::TransportParameters;
