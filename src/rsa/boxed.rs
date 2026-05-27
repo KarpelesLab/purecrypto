@@ -161,9 +161,16 @@ impl BoxedRsaPublicKey {
         Ok(Self::new(n, e))
     }
 
-    /// The modulus.
+    /// The modulus `n`.
     pub fn modulus(&self) -> &BoxedUint {
         &self.n
+    }
+
+    /// The public exponent `e`. Downstream protocols (SSH `ssh-rsa` key
+    /// blobs, JWK `RSAPublicKey`) need to re-emit `(n, e)` byte-for-byte
+    /// from a parsed key.
+    pub fn exponent(&self) -> &BoxedUint {
+        &self.e
     }
 
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.

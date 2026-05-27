@@ -8,8 +8,12 @@
 
 #[cfg(feature = "alloc")]
 pub mod argon2;
+// The bcrypt_pbkdf module is kept private so the natural `kdf::bcrypt_pbkdf`
+// path resolves to the function below rather than the module (otherwise the
+// module name shadows the fn at call sites). Error type re-exported as
+// BcryptPbkdfError.
 #[cfg(feature = "alloc")]
-pub mod bcrypt_pbkdf;
+mod bcrypt_pbkdf;
 mod hkdf;
 #[cfg(all(feature = "alloc", feature = "der"))]
 pub mod pbes2;
@@ -19,3 +23,5 @@ pub mod scrypt;
 
 pub use hkdf::{hkdf, hkdf_expand, hkdf_extract};
 pub use pbkdf2::pbkdf2;
+#[cfg(feature = "alloc")]
+pub use bcrypt_pbkdf::{Error as BcryptPbkdfError, bcrypt_pbkdf};
