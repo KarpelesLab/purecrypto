@@ -65,6 +65,19 @@ impl DhGroup {
         self.priv_bits
     }
 
+    /// Minimum bit length accepted by [`from_custom`](Self::from_custom).
+    ///
+    /// RFC 4419 §3 states implementations SHOULD NOT accept group-exchange
+    /// primes shorter than 1024 bits; modern guidance (RFC 8270 §2, NIST
+    /// SP 800-56A Rev 3 §5.5.1.1) raises that floor to 2048. Anything below
+    /// 2048 has fewer than ~112 bits of security against the General Number
+    /// Field Sieve and falls under the precomputation attacks demonstrated
+    /// by the LogJam paper. Callers with a documented legacy interop need
+    /// can sidestep this floor by using [`from_custom_unchecked`].
+    ///
+    /// [`from_custom_unchecked`]: Self::from_custom_unchecked
+    pub const MIN_CUSTOM_GROUP_BITS: usize = 2048;
+
     /// Builds a custom group from a caller-supplied `(p, g)` pair. Used for
     /// RFC 4419 SSH group-exchange where the server transmits the prime and
     /// generator.
@@ -72,8 +85,10 @@ impl DhGroup {
     /// This constructor sanity-checks:
     /// * `p` is odd (Montgomery arithmetic requires an odd modulus, and any
     ///   safe prime is odd anyway);
-    /// * `p ≥ 5` (a degenerate small `p` would let the subgroup-confinement
-    ///   check below accept nothing);
+    /// * `p.bit_len() ≥ MIN_CUSTOM_GROUP_BITS` (default 2048) — below that
+    ///   threshold the DLP is broken in practice, see RFC 4419 §3 and the
+    ///   LogJam precomputation results. Pinned legacy interop can bypass
+    ///   via [`from_custom_unchecked`](Self::from_custom_unchecked);
     /// * `g ∈ [2, p - 2]` (the only excluded values are 0, 1, and `p - 1`,
     ///   which are tiny-order elements).
     ///
@@ -83,6 +98,23 @@ impl DhGroup {
     /// expensive to run on every handshake. Callers that need stronger
     /// validation should test those properties externally.
     pub fn from_custom(p: BoxedUint, g: BoxedUint, priv_bits: usize) -> Result<Self, Error> {
+        if p.bit_len() < Self::MIN_CUSTOM_GROUP_BITS {
+            return Err(Error::InvalidGroup);
+        }
+        Self::from_custom_unchecked(p, g, priv_bits)
+    }
+
+    /// Like [`from_custom`](Self::from_custom) but without the
+    /// [`MIN_CUSTOM_GROUP_BITS`](Self::MIN_CUSTOM_GROUP_BITS) floor —
+    /// intended only for tests and pinned legacy interop where the caller
+    /// has documented why a sub-2048-bit prime is acceptable. The structural
+    /// checks (odd modulus, generator in range, sane private-exponent bit
+    /// budget) still apply.
+    pub fn from_custom_unchecked(
+        p: BoxedUint,
+        g: BoxedUint,
+        priv_bits: usize,
+    ) -> Result<Self, Error> {
         if !p.is_odd() || p.bit_len() < 3 {
             return Err(Error::InvalidGroup);
         }
@@ -449,7 +481,28 @@ mod tests {
 
     #[test]
     fn from_custom_rejects_even_p() {
+        // Probe the even-`p` check via the unchecked variant — `from_custom`
+        // would reject the toy 4-bit modulus on size first.
         let even = BoxedUint::from_u64(10);
-        assert!(DhGroup::from_custom(even, BoxedUint::from_u64(2), 256).is_err());
+        assert!(DhGroup::from_custom_unchecked(even, BoxedUint::from_u64(2), 256).is_err());
+    }
+
+    /// `from_custom` enforces `MIN_CUSTOM_GROUP_BITS` (2048). A 2047-bit `p`
+    /// is rejected; the unchecked variant accepts the same input subject only
+    /// to the structural checks. group14 (2048 bits exactly) is the threshold.
+    #[test]
+    fn from_custom_enforces_min_bits() {
+        // Build a 2047-bit odd `p` by clearing the top bit of group14's
+        // 2048-bit prime and OR'ing in 1 to keep it odd. We don't care about
+        // primality here — only that the bit-length gate fires.
+        let mut p_bytes = group14().p().to_be_bytes(256);
+        p_bytes[0] &= 0x7f; // clear MSB → now ≤ 2047 bits
+        p_bytes[255] |= 0x01; // keep it odd
+        let p_2047 = BoxedUint::from_be_bytes(&p_bytes);
+        assert!(p_2047.bit_len() <= 2047);
+        assert!(DhGroup::from_custom(p_2047.clone(), BoxedUint::from_u64(2), 256).is_err());
+        assert!(DhGroup::from_custom_unchecked(p_2047, BoxedUint::from_u64(2), 256).is_ok());
+        // group14 (2048 bits exactly) is accepted.
+        assert!(DhGroup::from_custom(group14().p().clone(), BoxedUint::from_u64(2), 256).is_ok());
     }
 }

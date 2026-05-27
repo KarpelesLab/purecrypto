@@ -404,7 +404,10 @@ mod tests {
         // Use priv_bits = 4 so the random exponent is in [1, 15].
         let p = BoxedUint::from_u64(23);
         let g = BoxedUint::from_u64(5);
-        let group = DhGroup::from_custom(p.clone(), g.clone(), 4).unwrap();
+        // Bypass the MIN_CUSTOM_GROUP_BITS gate — this toy group only exists
+        // to exercise the maths against hand-computable values; production
+        // callers always go through `from_custom`.
+        let group = DhGroup::from_custom_unchecked(p.clone(), g.clone(), 4).unwrap();
 
         // x_alice = 6, y_alice = 5^6 mod 23 = 15625 mod 23 = 8.
         let mut a_buf = vec![0u8];
