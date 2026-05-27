@@ -157,6 +157,11 @@ pub(crate) struct PnSpace {
     pub(crate) pending_ack: AckRanges,
     /// Whether at least one ack-eliciting packet is awaiting acknowledgement.
     pub(crate) ack_eliciting_pending: bool,
+    /// Arrival time (microseconds since connection start) of the most
+    /// recent ack-eliciting packet still pending ACK. Used to compute the
+    /// `ack_delay` field on the outbound ACK frame (RFC 9000 §13.2.5).
+    /// `None` whenever `ack_eliciting_pending == false`.
+    pub(crate) largest_eliciting_arrival_us: Option<u64>,
 }
 
 /// Decodes a truncated packet number per RFC 9000 §17.1 (reference
