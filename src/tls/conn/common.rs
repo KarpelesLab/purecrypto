@@ -13,6 +13,19 @@ use super::super::crypto::{RecordCrypter, Transcript};
 use crate::tls::{Alert, AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;
 
+/// Maximum bytes the handshake-message reassembly buffer is allowed to hold
+/// at once. The TLS record layer caps a single record's plaintext at
+/// 2¹⁴ + 256 bytes, but a handshake message may legally span many records —
+/// its own 3-byte length field allows up to 2²⁴ − 1 ≈ 16 MiB. Without a
+/// ceiling, a peer that streams a giant length-claim or a slow drip of
+/// fragments can grow `hs_pending` without bound and pin memory.
+///
+/// 128 KiB comfortably covers a real-world chain (4–5 X.509 certs of a few
+/// kilobytes each, an ML-DSA-87 signature at ~4.6 KiB, a hybrid ML-KEM
+/// keyshare blob) with margin to spare, and is far below what an oversized
+/// handshake message could justify.
+pub(crate) const MAX_HANDSHAKE_REASSEMBLY: usize = 128 * 1024;
+
 /// A decoded inbound message handed to the state machine.
 pub(crate) enum Incoming {
     /// A complete handshake message, including its 4-byte header.
@@ -138,8 +151,20 @@ impl ConnectionCore {
     // Used by the QUIC engine path (engines call this in `EngineMode::Quic`);
     // unreferenced in TLS / DTLS builds today.
     #[allow(dead_code)]
-    pub(crate) fn quic_feed_handshake(&mut self, bytes: &[u8]) {
+    pub(crate) fn quic_feed_handshake(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        self.append_handshake_bytes(bytes)
+    }
+
+    /// Appends handshake-message bytes to the reassembly buffer, enforcing
+    /// [`MAX_HANDSHAKE_REASSEMBLY`]. A peer that streams a giant length-claim
+    /// or fragments without ever completing a message would otherwise grow
+    /// `hs_pending` without bound; reject with `RecordOverflow` instead.
+    fn append_handshake_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.hs_pending.len().saturating_add(bytes.len()) > MAX_HANDSHAKE_REASSEMBLY {
+            return Err(Error::RecordOverflow);
+        }
         self.hs_pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Sends a (plaintext) ChangeCipherSpec for middlebox compatibility.
@@ -260,7 +285,7 @@ impl ConnectionCore {
                     if self.read.is_some() {
                         return Err(Error::UnexpectedMessage);
                     }
-                    self.hs_pending.extend_from_slice(&fragment);
+                    self.append_handshake_bytes(&fragment)?;
                 }
                 ContentType::Alert => {
                     // Same rule as Handshake above: plaintext Alert after
@@ -300,7 +325,7 @@ impl ConnectionCore {
                 if content.is_empty() {
                     return Err(Error::UnexpectedMessage);
                 }
-                self.hs_pending.extend_from_slice(&content);
+                self.append_handshake_bytes(&content)?;
                 Ok(None)
             }
             ContentType::ApplicationData => {
@@ -319,7 +344,11 @@ impl ConnectionCore {
     }
 
     /// Removes one complete handshake message (header + body) from the
-    /// reassembly buffer, if present.
+    /// reassembly buffer, if present. A length-claim larger than the
+    /// reassembly cap is still observed here (the buffer's
+    /// `append_handshake_bytes` ceiling stops growth long before the
+    /// length-claim can be honored), but we return `None` so the caller
+    /// keeps draining records until the bounded extend bails for us.
     fn pop_handshake(&mut self) -> Option<Vec<u8>> {
         if self.hs_pending.len() < 4 {
             return None;
@@ -344,4 +373,41 @@ fn parse_alert(body: &[u8]) -> Result<Incoming, Error> {
         fatal: body[0] == 2,
         description: AlertDescription::from_u8(body[1]),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `quic_feed_handshake` (and the record path it shares with) caps the
+    /// reassembly buffer at `MAX_HANDSHAKE_REASSEMBLY`. A peer dripping
+    /// fragments without ever completing a message can't grow it past that
+    /// ceiling — the bounded extend returns `RecordOverflow`.
+    #[test]
+    fn handshake_reassembly_bound_enforces_ceiling() {
+        let mut core = ConnectionCore::new();
+        // Plausible chunk size matching a TLS record payload (~16 KiB).
+        let chunk = alloc::vec![0u8; 16 * 1024];
+        let chunks_to_fill = MAX_HANDSHAKE_REASSEMBLY / chunk.len();
+        for _ in 0..chunks_to_fill {
+            core.quic_feed_handshake(&chunk).unwrap();
+        }
+        // One more chunk pushes us past the cap → RecordOverflow.
+        assert!(matches!(
+            core.quic_feed_handshake(&chunk),
+            Err(Error::RecordOverflow)
+        ));
+    }
+
+    /// A single fragment claiming to be larger than the cap is rejected
+    /// outright (we never start accumulating it).
+    #[test]
+    fn handshake_reassembly_bound_rejects_oversize_fragment() {
+        let mut core = ConnectionCore::new();
+        let too_big = alloc::vec![0u8; MAX_HANDSHAKE_REASSEMBLY + 1];
+        assert!(matches!(
+            core.quic_feed_handshake(&too_big),
+            Err(Error::RecordOverflow)
+        ));
+    }
 }

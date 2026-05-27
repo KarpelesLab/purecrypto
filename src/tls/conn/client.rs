@@ -676,7 +676,7 @@ impl ClientConnection {
             super::super::quic_hooks::EngineMode::Quic,
             "process_quic_handshake_bytes called outside QUIC mode"
         );
-        self.core.quic_feed_handshake(bytes);
+        self.core.quic_feed_handshake(bytes)?;
         self.process_new_packets()
     }
 
