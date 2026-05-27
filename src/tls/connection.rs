@@ -509,6 +509,14 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 
 fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection12<OsRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
+    // RFC 6347 §4.2.1: the cookie exchange defeats blind amplification
+    // attacks. We refuse to construct a server that claims to require the
+    // exchange but cannot mint cookies — silently disabling cookies under a
+    // misconfiguration is the 50-100x DoS amplification vector. Fail-closed
+    // so the operator makes a deliberate choice.
+    if cfg.require_cookie && cfg.cookie_secret.is_none() {
+        return Err(Error::InappropriateState);
+    }
     let chain = id.cert_chain.clone();
     let mut sc = match &id.key {
         super::config::SigningKey::Ecdsa(k) => {
@@ -532,6 +540,12 @@ fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
 
 fn build_dtls13_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection13<OsRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
+    // RFC 9147 §5.1: DTLS 1.3 retains the cookie-based stateless rejection
+    // for the same DoS-amplification reason. Mirror the fail-closed posture
+    // of `build_dtls12_server`.
+    if cfg.require_cookie && cfg.cookie_secret.is_none() {
+        return Err(Error::InappropriateState);
+    }
     let chain = id.cert_chain.clone();
     let server_key = id.key.to_server_key_13();
     let mut sc = crate::dtls::ServerConfig13Internal::with_signing_key(chain, server_key);
@@ -570,4 +584,77 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
             super::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    /// Build a minimal DTLS server [`Config`] (P-256 ECDSA leaf, self-signed)
+    /// with `require_cookie` defaulted to true and `cookie_secret = None`.
+    fn dtls_server_cfg_without_cookie_secret(max_version: ProtocolVersion) -> Config {
+        let mut rng = HmacDrbg::<Sha256>::new(b"h3-dtls-cookie", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        Config::builder()
+            .versions(max_version, max_version)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+            .build()
+    }
+
+    // RFC 6347 §4.2.1 / RFC 9147 §5.1: the cookie exchange is the DoS-
+    // amplification mitigation. A server that intends to require it but
+    // forgot to wire a cookie secret used to silently downgrade to "no
+    // cookies" — the AND-combine of `require_cookie && cookie_secret`.
+    // Fail-closed: refuse to construct the engine.
+    #[test]
+    fn dtls_server_refuses_construction_without_cookie_secret() {
+        // DTLS 1.2 path.
+        let cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_2);
+        assert!(cfg.require_cookie);
+        assert!(cfg.cookie_secret.is_none());
+        match Connection::server(&cfg) {
+            Err(Error::InappropriateState) => {}
+            Err(e) => panic!("expected InappropriateState, got {e:?}"),
+            Ok(_) => panic!("DTLS 1.2 server must refuse construction"),
+        }
+
+        // DTLS 1.3 path.
+        let cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
+        match Connection::server(&cfg) {
+            Err(Error::InappropriateState) => {}
+            Err(e) => panic!("expected InappropriateState, got {e:?}"),
+            Ok(_) => panic!("DTLS 1.3 server must refuse construction"),
+        }
+
+        // Explicit secret -> allowed.
+        let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
+        cfg.cookie_secret = Some([0x42u8; 32]);
+        assert!(Connection::server(&cfg).is_ok());
+
+        // Explicit opt-out (require_cookie = false) -> allowed.
+        let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
+        cfg.require_cookie = false;
+        assert!(Connection::server(&cfg).is_ok());
+    }
 }

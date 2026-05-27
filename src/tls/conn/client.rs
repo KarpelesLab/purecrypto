@@ -1538,9 +1538,17 @@ impl ClientConnection {
             let mut c = ReadCursor::new(body);
             let exts_bytes = c.vec_u16()?;
             let mut ec = ReadCursor::new(exts_bytes);
+            // RFC 8446 §4.2: every extension type may appear at most once
+            // in a single handshake message. Track types we've seen and
+            // reject duplicates with `illegal_parameter`.
+            let mut seen: alloc::vec::Vec<u16> = alloc::vec::Vec::new();
             while !ec.is_empty() {
                 let ty = ec.u16()?;
                 let ext_body = ec.vec_u16()?;
+                if seen.contains(&ty) {
+                    return Err(Error::IllegalParameter);
+                }
+                seen.push(ty);
                 if ty == crate::tls::codec::ExtensionType::ALPN.0 {
                     let names = ext::parse_alpn(ext_body)?;
                     if names.len() != 1 {
@@ -2106,5 +2114,50 @@ mod tests {
         // A handshake record claiming to be a (truncated) ServerHello.
         client.read_tls(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00]);
         assert!(client.process_new_packets().is_err());
+    }
+
+    // RFC 8446 §4.2: a TLS 1.3 handshake message must not contain two
+    // extensions with the same type. The EE walker rejects duplicates
+    // with `illegal_parameter`.
+    #[test]
+    fn client_rejects_duplicate_ee_extension() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"h1-ee-dup", b"nonce", &[]);
+        let mut config = ClientConfig::new(RootCertStore::new());
+        // Offer "h2" so the ALPN extension survives the offer-match gate
+        // and we actually exercise the duplicate-detection path. (Without
+        // this, the second `alpn` is fine on its own but the test would
+        // be checking the wrong code path.)
+        config.alpn_protocols.push(b"h2".to_vec());
+        let mut client = ClientConnection::new(config, "h", &mut rng);
+        // One ALPN extension carrying a single protocol "h2".
+        // ProtocolNameList: u16 length, then one entry (u8 length || bytes).
+        let alpn_body: alloc::vec::Vec<u8> = alloc::vec![
+            0x00, 0x03, // protocol_name_list length = 3
+            0x02, // entry length 2
+            b'h', b'2',
+        ];
+        // Wire bytes for one extension: type(2) || length(2) || body.
+        let mut ext = alloc::vec::Vec::new();
+        ext.extend_from_slice(&(ExtensionType::ALPN.0).to_be_bytes());
+        ext.extend_from_slice(&(alpn_body.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&alpn_body);
+        // Duplicate it.
+        let mut all_exts = ext.clone();
+        all_exts.extend_from_slice(&ext);
+        // EE body = extensions_block_len(2) || all_exts.
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&(all_exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&all_exts);
+        // Handshake header: msg_type(1=EE)=8 || length_u24 || body.
+        let mut raw = alloc::vec::Vec::new();
+        raw.push(hs_type::ENCRYPTED_EXTENSIONS);
+        raw.push(0x00);
+        raw.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&body);
+
+        let err = client
+            .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
+            .unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
     }
 }

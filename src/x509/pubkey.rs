@@ -114,38 +114,75 @@ impl AnyPublicKey {
     }
 
     /// Parses a PKIX `SubjectPublicKeyInfo` DER structure.
+    ///
+    /// The `AlgorithmIdentifier.parameters` field is validated per
+    /// algorithm (RFC 5280 §4.1.1.2 / §4.1.2.7, RFC 4055 §2.1, RFC 8410):
+    ///
+    /// * `rsaEncryption` — explicit NULL required.
+    /// * `id-ecPublicKey` — named-curve OID, then no trailing junk.
+    /// * `id-Ed25519` — no parameters.
+    /// * `id-RSASSA-PSS` — parameter block accepted as-is; the verifier
+    ///   hard-codes the SHA-256 / MGF1-SHA-256 / salt=32 set, so trailing
+    ///   junk after that block is rejected.
+    /// * `id-ml-dsa-*` / SLH-DSA — bare OID, no parameters.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut spki = reader.read_sequence()?;
         let mut algid = spki.read_sequence()?;
         let alg = parse_oid(algid.read_oid()?)?;
-        let key_bits = spki.read_bit_string()?;
 
         if alg.as_slice() == oid::RSA_ENCRYPTION {
+            // RFC 3279 §2.3.1: parameters MUST be NULL for rsaEncryption.
+            algid.read_null()?;
+            algid.finish()?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
             Ok(AnyPublicKey::Rsa(BoxedRsaPublicKey::from_pkcs1_der(
                 key_bits,
             )?))
         } else if alg.as_slice() == oid::EC_PUBLIC_KEY {
             let curve_arcs = parse_oid(algid.read_oid()?)?;
+            // RFC 5480 §2.1.1: the only parameters we accept after the OID
+            // are the namedCurve. Reject ECParameters trailers, implicitCA,
+            // or any junk.
+            algid.finish()?;
             let curve = curve_from_oid(curve_arcs.as_slice()).ok_or(Error::UnsupportedAlgorithm)?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
             Ok(AnyPublicKey::Ecdsa(
                 BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?,
             ))
         } else if alg.as_slice() == oid::ID_ED25519 {
+            // RFC 8410 §3: AlgorithmIdentifier MUST be the bare OID — no
+            // parameters at all.
+            algid.finish()?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
             let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
             Ok(AnyPublicKey::Ed25519(Ed25519PublicKey::from_bytes(bytes)))
         } else {
             #[cfg(feature = "mldsa")]
             {
                 if alg.as_slice() == oid::ID_ML_DSA_44 {
+                    // FIPS 204 / draft-ietf-lamps-dilithium-certificates:
+                    // bare OID, no parameters.
+                    algid.finish()?;
+                    let key_bits = spki.read_bit_string()?;
+                    spki.finish()?;
                     return Ok(AnyPublicKey::MlDsa44(
                         MlDsa44PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
                     ));
                 } else if alg.as_slice() == oid::ID_ML_DSA_65 {
+                    algid.finish()?;
+                    let key_bits = spki.read_bit_string()?;
+                    spki.finish()?;
                     return Ok(AnyPublicKey::MlDsa65(
                         MlDsa65PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
                     ));
                 } else if alg.as_slice() == oid::ID_ML_DSA_87 {
+                    algid.finish()?;
+                    let key_bits = spki.read_bit_string()?;
+                    spki.finish()?;
                     return Ok(AnyPublicKey::MlDsa87(
                         MlDsa87PublicKey::from_bytes(key_bits).map_err(|_| Error::Malformed)?,
                     ));
@@ -154,6 +191,10 @@ impl AnyPublicKey {
             #[cfg(feature = "slhdsa")]
             {
                 if let Some(set) = slhdsa::ParamSet::from_oid(alg.as_slice()) {
+                    // SLH-DSA: bare OID, no parameters.
+                    algid.finish()?;
+                    let key_bits = spki.read_bit_string()?;
+                    spki.finish()?;
                     let pk = slhdsa::PublicKey::from_bytes(set, key_bits)
                         .map_err(|_| Error::Malformed)?;
                     return Ok(AnyPublicKey::SlhDsa(pk));
@@ -264,5 +305,60 @@ mod tests {
         let sig = sk.sign(b"hello").to_bytes();
         parsed.verify(oid::ID_ED25519, b"hello", &sig).unwrap();
         assert!(parsed.verify(oid::ID_ED25519, b"other", &sig).is_err());
+    }
+
+    // H-7: RFC 3279 §2.3.1 — rsaEncryption REQUIRES explicit NULL
+    // parameters in the AlgorithmIdentifier. An SPKI that places an
+    // ECParameters OID (or any other tag) where NULL belongs must be
+    // rejected. id-Ed25519 likewise requires NO parameters; id-ecPublicKey
+    // requires exactly the namedCurve OID and nothing trailing.
+    #[test]
+    fn spki_rsa_requires_null_params() {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+
+        // Build a real RSA public-key BIT STRING from the test key.
+        let pk = rsa_test_key_a().public_key();
+        let mut n_bytes = [0u8; 256];
+        pk.modulus().write_be_bytes(&mut n_bytes);
+        let mut e_bytes = [0u8; 256];
+        pk.exponent().write_be_bytes(&mut e_bytes);
+        let boxed = BoxedRsaPublicKey::new(
+            crate::bignum::BoxedUint::from_be_bytes(&n_bytes),
+            crate::bignum::BoxedUint::from_be_bytes(&e_bytes),
+        );
+        let pkcs1 = boxed.to_pkcs1_der();
+        let key_bits = encode_bit_string(&pkcs1);
+
+        // (a) rsaEncryption with NULL params — sanity: parses fine.
+        let algid_ok =
+            encode_sequence(&[oid_tlv(oid::RSA_ENCRYPTION), crate::der::encode_null()].concat());
+        let spki_ok = encode_sequence(&[algid_ok, key_bits.clone()].concat());
+        assert!(AnyPublicKey::from_spki_der(&spki_ok).is_ok());
+
+        // (b) rsaEncryption with a non-NULL parameter (e.g. an OID where
+        //     NULL belongs). Must be rejected.
+        let algid_bad =
+            encode_sequence(&[oid_tlv(oid::RSA_ENCRYPTION), oid_tlv(oid::PRIME256V1)].concat());
+        let spki_bad = encode_sequence(&[algid_bad, key_bits.clone()].concat());
+        assert!(AnyPublicKey::from_spki_der(&spki_bad).is_err());
+
+        // (c) rsaEncryption with NO parameter at all (bare OID). Must be
+        //     rejected — the NULL is mandatory.
+        let algid_missing = encode_sequence(&oid_tlv(oid::RSA_ENCRYPTION));
+        let spki_missing = encode_sequence(&[algid_missing, key_bits.clone()].concat());
+        assert!(AnyPublicKey::from_spki_der(&spki_missing).is_err());
+
+        // (d) rsaEncryption with NULL params followed by trailing junk
+        //     inside the AlgorithmIdentifier SEQUENCE. Must be rejected.
+        let algid_trailing = encode_sequence(
+            &[
+                oid_tlv(oid::RSA_ENCRYPTION),
+                crate::der::encode_null(),
+                crate::der::encode_tlv(0x01, &[0x00]), // BOOLEAN false
+            ]
+            .concat(),
+        );
+        let spki_trailing = encode_sequence(&[algid_trailing, key_bits].concat());
+        assert!(AnyPublicKey::from_spki_der(&spki_trailing).is_err());
     }
 }

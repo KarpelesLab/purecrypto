@@ -14,18 +14,36 @@ use crate::x509::{Error, oid};
 
 /// Parses the SPKI to extract an RSA public key. Accepts both the common
 /// `rsaEncryption` OID and the PSS-key-restricted `id-RSASSA-PSS` OID
-/// (RFC 4055 §1.2). PSS parameters in the AlgorithmIdentifier are not
-/// enforced here — the verifier knows its own hash and the canonical
-/// salt-length / MGF1 parameters.
+/// (RFC 4055 §1.2).
+///
+/// For `rsaEncryption` the explicit `NULL` parameters are required
+/// (RFC 3279 §2.3.1). For `id-RSASSA-PSS` the parameter block is
+/// consumed if present, but its contents are not checked here — the
+/// verifier hard-codes the SHA-256 / MGF1-SHA-256 / salt=32 set.
+/// Trailing junk inside the AlgorithmIdentifier SEQUENCE or after the
+/// BIT STRING is rejected (strict DER).
 fn parse_rsa_spki(spki: &[u8]) -> Result<BoxedRsaPublicKey, Error> {
     let mut reader = Reader::new(spki);
     let mut outer = reader.read_sequence()?;
     let mut algid = outer.read_sequence()?;
     let alg = parse_oid(algid.read_oid()?)?;
-    if alg.as_slice() != oid::RSA_ENCRYPTION && alg.as_slice() != oid::ID_RSASSA_PSS {
+    if alg.as_slice() == oid::RSA_ENCRYPTION {
+        algid.read_null()?;
+        algid.finish()?;
+    } else if alg.as_slice() == oid::ID_RSASSA_PSS {
+        // RFC 4055 §1.2: parameters are absent or an `RSASSA-PSS-params`
+        // SEQUENCE. We don't enforce the hash/salt here (the verifier
+        // pins SHA-256 / MGF1-SHA-256 / salt=32 anyway), but we DO
+        // consume anything that's present so trailing bytes inside the
+        // AlgorithmIdentifier are rejected.
+        while !algid.is_empty() {
+            algid.read_element()?;
+        }
+    } else {
         return Err(Error::UnsupportedAlgorithm);
     }
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?)
 }
 

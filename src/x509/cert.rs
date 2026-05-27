@@ -365,6 +365,11 @@ impl Certificate {
         let mut alg = cert.read_sequence()?;
         let sig_alg = parse_oid(alg.read_oid()?)?;
         let signature = cert.read_bit_string()?;
+        // Strict DER (X.690 §11): no trailing bytes inside the outer
+        // SEQUENCE. Two parsers must agree on what was signed; trailing
+        // junk inside the wrapper is both a covert channel and a
+        // fingerprint-collision risk.
+        cert.finish()?;
         Ok(CertParts {
             tbs,
             sig_alg,
@@ -989,5 +994,50 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         }
         // Self-signed: the ecdsa-with-SHA384 signature verifies under its key.
         cert.verify_signature_with(&key).unwrap();
+    }
+
+    // H-6: strict DER (X.690 §11) — no trailing bytes inside the outer
+    // SEQUENCE of a Certificate. Hand-build a cert wrapper that adds a
+    // stray byte between the BIT STRING (signature) and the SEQUENCE
+    // close; `from_der` lets it through (outer-only check) but `parts`,
+    // which is what every accessor goes through, now rejects it.
+    #[test]
+    fn cert_rejects_intra_sequence_trailing_bytes() {
+        use crate::der::{encode_sequence, encode_tlv};
+
+        let key = rsa_test_key_a();
+        let good = Certificate::self_signed(
+            &key,
+            &DistinguishedName::common_name("trail.example"),
+            &validity(),
+            1,
+            false,
+        )
+        .unwrap();
+
+        // Decompose the good cert's outer SEQUENCE into its three parts,
+        // then re-encode with one extra (BOOLEAN false) TLV spliced in
+        // before the close.
+        let mut outer = Reader::new(good.to_der());
+        let mut seq = outer.read_sequence().unwrap();
+        let tbs = seq.read_element().unwrap();
+        let algid = seq.read_element().unwrap();
+        let sig_bit = seq.read_element().unwrap();
+        // Stray trailer: a BOOLEAN(false). 0x01 / 0x01 / 0x00.
+        let trailer = encode_tlv(0x01, &[0x00]);
+
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(tbs);
+        body.extend_from_slice(algid);
+        body.extend_from_slice(sig_bit);
+        body.extend_from_slice(&trailer);
+        let tampered_der = encode_sequence(&body);
+
+        // The outer SEQUENCE wrapper is well-formed, so from_der accepts —
+        // but ANY accessor that goes through `parts()` now fails because
+        // it calls `cert.finish()`.
+        let tampered = Certificate::from_der(tampered_der).unwrap();
+        assert!(tampered.subject().is_err());
+        assert!(tampered.signature_algorithm_oid().is_err());
     }
 }

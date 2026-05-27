@@ -97,10 +97,15 @@ impl CertificationRequest {
         Ok(CertificationRequest { der })
     }
 
-    /// Wraps existing CSR DER (validating only that it is a SEQUENCE).
+    /// Wraps existing CSR DER (validating that it is a single SEQUENCE with
+    /// no trailing bytes — matches the strict-DER posture of
+    /// [`super::Certificate::from_der`] and
+    /// [`super::CertificateRevocationList::from_der`]). Two implementations
+    /// parsing the same blob then agree on what was signed.
     pub fn from_der(der: Vec<u8>) -> Result<Self, Error> {
         let mut r = Reader::new(&der);
         r.read_sequence()?;
+        r.finish()?;
         Ok(CertificationRequest { der })
     }
 
@@ -129,6 +134,9 @@ impl CertificationRequest {
         let mut alg = csr.read_sequence()?;
         let sig_alg = parse_oid(alg.read_oid()?)?;
         let signature = csr.read_bit_string()?;
+        // Strict DER (X.690 §11): no trailing bytes inside the outer
+        // SEQUENCE.
+        csr.finish()?;
         Ok(CsrParts {
             cri,
             sig_alg,
@@ -377,5 +385,23 @@ mod tests {
         assert_eq!(cert.subject_alt_names().unwrap(), ["leaf.example"]);
         // The cert verifies under the CA's public key.
         cert.verify_signature_with(&ca_signer.public_key()).unwrap();
+    }
+
+    // H-5: CertificationRequest::from_der rejects trailing bytes after the
+    // outer SEQUENCE — matches the strict-DER behavior of
+    // Certificate::from_der and CertificateRevocationList::from_der.
+    #[test]
+    fn csr_rejects_trailing_data_after_sequence() {
+        let key = ec_signer_key();
+        let signer = CertSigner::Ecdsa(&key);
+        let subject = DistinguishedName::common_name("trail.example");
+        let csr = CertificationRequest::create(&signer, &subject, &["trail.example"]).unwrap();
+
+        let mut der = csr.to_der().to_vec();
+        // Append a stray byte; self-signature still verifies if the
+        // body is taken to be the original SEQUENCE — so this is exactly
+        // the covert-channel / parser-mismatch case the check defends.
+        der.push(0x00);
+        assert!(CertificationRequest::from_der(der).is_err());
     }
 }

@@ -174,7 +174,7 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
         if names_differ(cert, issuer)? {
             return Err(Error::BadCertificate);
         }
-        check_revocation(cert, &issuer_key, crls, now)?;
+        check_revocation(cert, &issuer_key, crls, now, policy)?;
     }
 
     // Anchor the top of the chain to a trusted root sharing its issuer name.
@@ -197,7 +197,7 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     }
     // Top cert may itself be revoked by a CRL signed by the anchor.
     if let Some(key) = anchor_key {
-        check_revocation(top, key, crls, now)?;
+        check_revocation(top, key, crls, now, policy)?;
     }
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
@@ -222,10 +222,25 @@ fn check_revocation(
     issuer_key: &AnyPublicKey,
     crls: &CrlStore,
     now: Option<&Time>,
+    policy: &SignaturePolicy,
 ) -> Result<(), Error> {
     let cert_issuer = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
     let serial = cert.serial_bytes().map_err(|_| Error::BadCertificate)?;
+    let issuer_spki = issuer_key.to_spki_der();
     for crl in crls.crls_with_issuer(cert_issuer) {
+        // RFC 5280 §5.1.1.2: the CRL's `signatureAlgorithm` must be one we
+        // accept under `policy` — the same whitelist that gates cert-chain
+        // signatures. A CRL signed with e.g. SHA-1-RSA is silently ignored
+        // (treated as "not consulted") under `SignaturePolicy::modern()`.
+        let Ok(crl_sig_alg) = crl.signature_algorithm_oid() else {
+            continue;
+        };
+        let Some(crl_algo) = find_by_oid(&crl_sig_alg) else {
+            continue;
+        };
+        if !policy.permits(crl_algo, &issuer_spki) {
+            continue;
+        }
         // Skip CRLs not signed by this issuer.
         if crl.verify_signature_with(issuer_key).is_err() {
             continue;
@@ -1015,5 +1030,76 @@ mod tests {
             Err(Error::BadCertificate)
         ));
         verify_chain(&store, &[cert.to_der().to_vec()], None, &policy()).unwrap();
+    }
+
+    /// H-4 — RFC 5280 §5.1.1.2: weak CRL signature algorithms must be
+    /// gated by the same `SignaturePolicy` that gates the certificate
+    /// path. A CRL signed with SHA-1-RSA under `SignaturePolicy::modern()`
+    /// must be silently dropped — the chain still validates the cert as
+    /// not revoked. Under an explicit `permit("rsa-pkcs1-sha1")` opt-in,
+    /// the same CRL is consulted and revokes the leaf.
+    #[test]
+    fn crl_signed_with_sha1_rejected_under_modern_policy() {
+        use crate::der::{encode_bit_string, encode_sequence};
+        use crate::hash::Sha1;
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{CertificateRevocationList, algorithm_identifier};
+
+        let ca_key = rsa_test_key_a();
+        let leaf_key = rsa_test_key_b();
+        let ca_name = DistinguishedName::common_name("CRL SHA-1 Test CA");
+
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity(), 1, true).unwrap();
+        let leaf = Certificate::issue(
+            &ca_key,
+            &ca_name,
+            &DistinguishedName::common_name("sha1crl.example"),
+            &leaf_key.public_key(),
+            &validity(),
+            99,
+            false,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        // Hand-build a SHA-1-RSA-signed CRL that revokes serial 99. The
+        // inner and outer AlgorithmIdentifiers both carry
+        // sha1WithRSAEncryption; the signature is computed under SHA-1
+        // so it would verify under the issuer key — except `policy()`
+        // refuses SHA-1, so the CRL is silently dropped.
+        let algid_sha1 = algorithm_identifier(oid::SHA1_WITH_RSA, true);
+        // Revoked-certificates SEQUENCE: one entry { serial=99, revoked_at }.
+        let serial = crate::der::encode_integer(&[99]);
+        let revoked_at = Time::utc(2026, 1, 2, 0, 0, 0).to_der_choice();
+        let entry = encode_sequence(&[serial, revoked_at].concat());
+        // Build the TBS body manually so we can splice in a revoked entry
+        // (the in-tree `CrlBuilder` always uses the signer's chosen algid,
+        // which for `BoxedRsaPrivateKey` is SHA-256-RSA — we need SHA-1
+        // here).
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&crate::der::encode_integer(&[1])); // version v2
+        body.extend_from_slice(&algid_sha1);
+        body.extend_from_slice(&ca_name.to_der());
+        body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
+        body.extend_from_slice(&encode_sequence(&entry));
+        let tbs = encode_sequence(&body);
+        let sig = ca_key.sign_pkcs1v15::<Sha1>(&tbs).unwrap();
+        let crl_der = encode_sequence(&[tbs, algid_sha1, encode_bit_string(&sig)].concat());
+        let crl = CertificateRevocationList::from_der(crl_der).unwrap();
+
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        // Under modern policy: CRL is ignored, leaf validates as not revoked.
+        verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &policy()).unwrap();
+
+        // Sanity: under an explicit SHA-1 opt-in, the same CRL revokes the leaf.
+        let with_sha1 = SignaturePolicy::modern().permit("rsa-pkcs1-sha1");
+        assert!(matches!(
+            verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &with_sha1,),
+            Err(Error::BadCertificate)
+        ));
     }
 }

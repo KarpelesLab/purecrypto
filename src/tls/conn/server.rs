@@ -924,6 +924,17 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::IllegalParameter);
         }
 
+        // RFC 8446 §4.2.11: when pre_shared_key is present, it MUST be the
+        // last extension in the ClientHello (the binders trailer is at the
+        // tail of the wire CH for transcript-binding). Reject CHs where the
+        // PSK extension appears earlier — the truncated-prefix computed in
+        // `try_accept_psk` would otherwise include unrelated extension bytes.
+        if ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY).is_some()
+            && ch.extensions.last().map(|(t, _)| *t) != Some(ExtensionType::PRE_SHARED_KEY)
+        {
+            return Err(Error::IllegalParameter);
+        }
+
         // PSK resumption: process pre_shared_key + psk_key_exchange_modes
         // before suite negotiation so we can constrain the suite to the PSK's
         // hash. Hard-fail on binder mismatch (decrypt_error).
@@ -2008,5 +2019,48 @@ mod tests {
 
         // ticket_lifetime == 0 disables the age check (debugging escape hatch).
         assert!(super::decrypt_ticket(&key, &wire, now, 0).is_some());
+    }
+
+    // RFC 8446 §4.2.11: pre_shared_key MUST be the last extension in the
+    // ClientHello. The server's binder-truncation uses the binders trailer
+    // at the wire tail and is only correct under that placement.
+    #[test]
+    fn server_rejects_psk_not_last_in_clienthello() {
+        use crate::tls::codec::{CipherSuite, ClientHello, ExtensionType};
+
+        let rng = ScriptedRng {
+            data: alloc::vec![0u8; 256],
+            pos: 0,
+        };
+        // Configure a ticket key so `try_accept_psk` is even reachable —
+        // we want to exercise the "must be last" check, which runs BEFORE
+        // `try_accept_psk`, but we want a ServerConnection wired enough
+        // to call `on_client_hello`.
+        let mut cfg = test_server_config();
+        cfg.ticket_key = Some([0xAAu8; 32]);
+        let mut server = ServerConnection::new(cfg, rng);
+
+        // A CH whose extension list is `[PRE_SHARED_KEY, KEY_SHARE]` — PSK
+        // is NOT the last extension. The body of PRE_SHARED_KEY is bogus;
+        // it doesn't matter because the placement check fires first.
+        let psk_body: alloc::vec::Vec<u8> = alloc::vec![0u8; 4];
+        let ks_body: alloc::vec::Vec<u8> = alloc::vec![0u8; 2];
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random: [0x11; 32],
+            session_id: alloc::vec::Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                (ExtensionType::PRE_SHARED_KEY, psk_body),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let raw = ch.encode();
+        // raw = msg_type(1) || length(3) || body. Body is raw[4..].
+        let body = &raw[4..];
+        let err = server
+            .on_client_hello(hs_type::CLIENT_HELLO, body, &raw)
+            .unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
     }
 }

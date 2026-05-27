@@ -260,6 +260,9 @@ impl CertificateRevocationList {
         let mut alg = crl.read_sequence()?;
         let sig_alg = parse_oid(alg.read_oid()?)?;
         let signature = crl.read_bit_string()?;
+        // Strict DER (X.690 §11): no trailing bytes inside the outer
+        // SEQUENCE.
+        crl.finish()?;
         Ok(CrlParts {
             tbs,
             sig_alg,
