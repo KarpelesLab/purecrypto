@@ -13,7 +13,9 @@
 //! `quic_transport_parameters` extension. No keys, no packet protection,
 //! no TLS plumbing — those land in later phases.
 
+pub(crate) mod crypto;
 pub(crate) mod frame;
+pub(crate) mod pkt;
 pub(crate) mod pn;
 pub mod transport_params;
 pub(crate) mod varint;
