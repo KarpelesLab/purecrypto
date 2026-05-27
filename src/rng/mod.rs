@@ -81,9 +81,16 @@ std::thread_local! {
 // function is documented to always succeed (failure aborts the
 // process); the kernel seeds the underlying CSPRNG before any user
 // process runs, so there's no early-boot caveat to worry about.
+//
+// The extern declaration is wrapped in a submodule so the
+// `#![allow(unsafe_code)]` scope is local — the rest of mod.rs stays
+// under the crate-wide `unsafe_code = "deny"` policy.
 #[cfg(all(feature = "std", unix, target_vendor = "apple"))]
-unsafe extern "C" {
-    fn arc4random_buf(buf: *mut core::ffi::c_void, len: usize);
+mod os_apple {
+    #![allow(unsafe_code)]
+    unsafe extern "C" {
+        pub(super) fn arc4random_buf(buf: *mut core::ffi::c_void, len: usize);
+    }
 }
 
 #[cfg(all(feature = "std", unix))]
@@ -103,7 +110,7 @@ impl RngCore for OsRng {
             // aborts the process on internal CSPRNG failure).
             #[allow(unsafe_code)]
             unsafe {
-                arc4random_buf(dest.as_mut_ptr() as *mut core::ffi::c_void, dest.len());
+                os_apple::arc4random_buf(dest.as_mut_ptr() as *mut core::ffi::c_void, dest.len());
             }
         }
 
