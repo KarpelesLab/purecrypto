@@ -9,7 +9,7 @@
 //! TLS 1.2 ECDHE-ECDSA handshake under the DTLS record layer.
 
 use crate::ec::x25519::X25519PrivateKey;
-use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, CurveId};
+use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
@@ -143,10 +143,11 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// Anti-replay window for the current encrypted read epoch.
     replay: AntiReplayWindow,
 
-    /// Ephemeral X25519 ECDHE key (generated on second CH).
+    /// Ephemeral X25519 ECDHE key, populated when [`Self::group`] is
+    /// `X25519`.
     x25519: Option<X25519PrivateKey>,
-    /// Ephemeral P-256 key (unused in this subset; reserved for future).
-    #[allow(dead_code)]
+    /// Ephemeral P-256 ECDHE key, populated when [`Self::group`] is
+    /// `SECP256R1`.
     p256: Option<BoxedEcdhPrivateKey>,
 
     client_random: Option<Random>,
@@ -155,6 +156,10 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// Negotiated cipher-suite parameters, pinned on the cookie-validated
     /// ClientHello (or the only CH when cookies are disabled).
     suite: Option<SuiteParams12>,
+    /// Negotiated ECDHE group, pinned at suite-selection time. Preference
+    /// order is X25519 > P-256 (mirrors the TLS 1.2 server in
+    /// `src/tls/conn/server12.rs`).
+    group: Option<NamedGroup>,
 
     transcript: Transcript,
 
@@ -204,6 +209,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             client_random: None,
             server_random: None,
             suite: None,
+            group: None,
             transcript: Transcript::new(),
             master: None,
             read_crypter: None,
@@ -486,13 +492,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Pin the transcript hash now that the suite is known.
         self.transcript.set_alg(suite.hash);
         self.suite = Some(suite);
-        // Require X25519 in supported_groups.
+        // Pick the negotiated ECDHE group. Preference is X25519 > P-256,
+        // mirroring `src/tls/conn/server12.rs::on_client_hello_initial`.
         let groups_body = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
         let groups = parse_supported_groups(groups_body)?;
-        if !groups.contains(&NamedGroup::X25519) {
+        let group = if groups.contains(&NamedGroup::X25519) {
+            NamedGroup::X25519
+        } else if groups.contains(&NamedGroup::SECP256R1) {
+            NamedGroup::SECP256R1
+        } else {
             return Err(Error::HandshakeFailure);
-        }
+        };
+        self.group = Some(group);
 
         // RFC 7627 §5.1: detect the client's EMS offer (DTLS 1.2 inherits
         // the rules from TLS 1.2). Body MUST be empty.
@@ -520,10 +532,22 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.rng.fill_bytes(&mut sr);
         self.server_random = Some(sr);
 
-        // Generate the ECDHE key share.
-        let sk = X25519PrivateKey::generate(&mut self.rng);
-        let our_point = sk.public_key().to_vec();
-        self.x25519 = Some(sk);
+        // Generate the ECDHE key share for the negotiated group.
+        let our_point: Vec<u8> = match group {
+            NamedGroup::X25519 => {
+                let sk = X25519PrivateKey::generate(&mut self.rng);
+                let pk = sk.public_key().to_vec();
+                self.x25519 = Some(sk);
+                pk
+            }
+            NamedGroup::SECP256R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
+                let pk = sk.public_key().to_sec1();
+                self.p256 = Some(sk);
+                pk
+            }
+            _ => return Err(Error::HandshakeFailure),
+        };
 
         // After HVR, the server's message_seq continues from 1 (HVR was 0);
         // without HVR, message_seq starts at 0. Cookie-disabled path: HVR
@@ -574,12 +598,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // `src/tls/conn/server12.rs::send_server_key_exchange`. Phase 4 ships
         // ECDSA-only signing — Phase 6 will add RSA.
         let cr = self.client_random.expect("set above");
-        let to_sign = signed_message(&cr, &sr, NamedGroup::X25519, &our_point);
+        let to_sign = signed_message(&cr, &sr, group, &our_point);
         let curve = self.config.key.curve();
         let scheme = ecdsa_scheme_for(curve);
         let sig_der = sign_ecdsa(&self.config.key, &to_sign)?.to_der(curve);
         let ske = ServerKeyExchange {
-            group: NamedGroup::X25519,
+            group,
             point: our_point,
             scheme,
             signature: sig_der,
@@ -684,14 +708,27 @@ impl<R: RngCore> DtlsServerConnection12<R> {
 
     fn on_client_key_exchange(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
         let cke = ClientKeyExchange::decode(body)?;
-        let sk = self.x25519.as_ref().ok_or(Error::InappropriateState)?;
-        // Group is X25519.
-        let peer: [u8; 32] = cke.point.as_slice().try_into().map_err(|_| Error::Decode)?;
-        // RFC 7748 §6.1: reject the all-zero (small-order) DH output.
-        let ss = sk
-            .diffie_hellman(&peer)
-            .map_err(|_| Error::IllegalParameter)?;
-        let premaster = ss.to_vec();
+        let group = self.group.ok_or(Error::InappropriateState)?;
+        // Complete ECDHE on the negotiated group and derive the premaster.
+        // Mirrors `src/tls/conn/server12.rs::on_client_key_exchange`.
+        let premaster: Vec<u8> = match group {
+            NamedGroup::X25519 => {
+                let sk = self.x25519.as_ref().ok_or(Error::InappropriateState)?;
+                let peer: [u8; 32] = cke.point.as_slice().try_into().map_err(|_| Error::Decode)?;
+                // RFC 7748 §6.1: reject the all-zero (small-order) DH output.
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?
+                    .to_vec()
+            }
+            NamedGroup::SECP256R1 => {
+                let sk = self.p256.as_ref().ok_or(Error::InappropriateState)?;
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, &cke.point)
+                    .map_err(|_| Error::Decode)?;
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?
+            }
+            _ => return Err(Error::HandshakeFailure),
+        };
         let cr = self.client_random.expect("set");
         let sr = self.server_random.expect("set");
 

@@ -2,9 +2,9 @@
 
 //! DTLS 1.2 client state machine (RFC 6347).
 //!
-//! Mirrors the TLS 1.2 client handshake flow (`ECDHE-ECDSA-AES128-GCM-SHA256`,
-//! X25519 group only — focused subset for now), wrapped in a DTLS-aware
-//! record layer with:
+//! Mirrors the TLS 1.2 client handshake flow over the six AEAD-ECDHE suites
+//! (ECDHE-{ECDSA,RSA} × {AES-128-GCM, ChaCha20-Poly1305, AES-256-GCM-SHA384})
+//! and the X25519 / P-256 groups, wrapped in a DTLS-aware record layer with:
 //!
 //! - 13-byte DTLS record header (`epoch ‖ 48-bit seq`)
 //! - 12-byte DTLS handshake header (`type ‖ length ‖ message_seq ‖
@@ -87,6 +87,12 @@ pub(crate) struct ClientConfig12Internal {
     /// specific suite for tests). Unknown codepoints are accepted on the
     /// wire but the server's echo is validated against `lookup_suite_12`.
     pub cipher_suites: Vec<CipherSuite>,
+    /// ECDHE groups advertised in the `supported_groups` extension, in
+    /// descending preference order. Defaults to `[X25519, SECP256R1]`. The
+    /// server picks the first match against its own preference; the client
+    /// derives a key share for whichever group the server selected in its
+    /// `ServerKeyExchange`.
+    pub groups: Vec<NamedGroup>,
 }
 
 impl ClientConfig12Internal {
@@ -102,6 +108,7 @@ impl ClientConfig12Internal {
             crls: CrlStore::new(),
             key_log: None,
             cipher_suites: SUITES_12.iter().map(|p| p.suite).collect(),
+            groups: alloc::vec![NamedGroup::X25519, NamedGroup::SECP256R1],
         }
     }
 
@@ -174,7 +181,8 @@ pub struct DtlsClientConnection12 {
     /// Anti-replay window for the current encrypted read epoch.
     replay: AntiReplayWindow,
 
-    /// Ephemeral X25519 key (we support only X25519 in this subset).
+    /// Ephemeral X25519 key share. Pre-generated regardless of which group
+    /// the server picks; unused when the server selects P-256.
     x25519: X25519PrivateKey,
     /// Ephemeral P-256 key, generated in advance to keep RNG out of the
     /// hot-path handlers.
@@ -829,7 +837,7 @@ impl DtlsClientConnection12 {
     /// entries of [`SUITES_12`]).
     fn build_client_hello_flight(&mut self) -> Flight {
         let suites: Vec<CipherSuite> = self.config.cipher_suites.clone();
-        let groups = alloc::vec![NamedGroup::X25519];
+        let groups: Vec<NamedGroup> = self.config.groups.clone();
 
         let extensions = alloc::vec![
             ext::server_name(&self.config.server_name),

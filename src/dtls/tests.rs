@@ -1006,4 +1006,47 @@ mod dtls12 {
             Some(CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256.0)
         );
     }
+
+    /// Multi-group negotiation on DTLS 1.2: when the client advertises only
+    /// `SECP256R1`, the server must complete the handshake by generating a
+    /// P-256 ECDHE share and signing it in the ServerKeyExchange. Exercises
+    /// the per-group dispatch in `on_client_hello_after_cookie` (key share
+    /// generation), `signed_message` (SKE signing with `group = P-256`),
+    /// and `on_client_key_exchange` (ECDH completion under P-256).
+    #[test]
+    fn negotiates_p256() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig12::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![NamedGroup::SECP256R1];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-p256-cli", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection12::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-srv-p256", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump(&mut client, &mut server));
+
+        // App-data round-trip on a P-256-derived master secret.
+        client.send(b"ping-p256").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-p256");
+
+        server.send(b"pong-p256").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-p256");
+    }
 }
