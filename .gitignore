@@ -2,3 +2,6 @@
 **/*.rs.bk
 *.pdb
 .*.swp
+# Cargo.lock intentionally not committed for this library crate
+# (removed in 4a39a57 alongside the v0.1.0 release-plz publish).
+/Cargo.lock
