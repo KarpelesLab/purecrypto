@@ -557,4 +557,112 @@ mod dtls13 {
         assert!(client.is_handshake_complete());
         assert!(server.is_handshake_complete());
     }
+
+    /// Multi-suite negotiation (RFC 8446 §4.1.1 / RFC 9147 §5): when the
+    /// client advertises only `TLS_CHACHA20_POLY1305_SHA256`, the server
+    /// must pick that suite. Confirms the sequence-number obfuscation
+    /// (RFC 9147 §4.2.3) and record protection both work under ChaCha20.
+    #[test]
+    fn loopback_negotiates_chacha20() {
+        use crate::tls::codec::CipherSuite;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.cipher_suites = alloc::vec![CipherSuite::CHACHA20_POLY1305_SHA256];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-chacha", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-chacha", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_eq!(client.negotiated_cipher_suite(), Some(0x1303));
+
+        // App-data round-trip under ChaCha20-Poly1305 record protection.
+        client.send(b"ping-chacha").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-chacha");
+
+        server.send(b"pong-chacha").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-chacha");
+    }
+
+    /// Multi-suite negotiation: when the client advertises only
+    /// `TLS_AES_256_GCM_SHA384`, the server must pick that suite, and
+    /// the handshake transcript switches to SHA-384.
+    #[test]
+    fn loopback_negotiates_aes256_gcm() {
+        use crate::tls::codec::CipherSuite;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.cipher_suites = alloc::vec![CipherSuite::AES_256_GCM_SHA384];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-aes256", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-aes256", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_eq!(client.negotiated_cipher_suite(), Some(0x1302));
+
+        // App-data round-trip under AES-256-GCM record protection.
+        client.send(b"ping-aes256").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-aes256");
+
+        server.send(b"pong-aes256").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-aes256");
+    }
+
+    /// Server preference order: when the client offers all three suites
+    /// (the default), the server picks `TLS_AES_128_GCM_SHA256` — the
+    /// first entry in the server's `SUPPORTED` table.
+    #[test]
+    fn loopback_prefers_aes128_when_offered() {
+        use crate::tls::codec::CipherSuite;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        // Explicit default order: all three, AES-128 first.
+        client_cfg.cipher_suites = alloc::vec![
+            CipherSuite::AES_128_GCM_SHA256,
+            CipherSuite::AES_256_GCM_SHA384,
+            CipherSuite::CHACHA20_POLY1305_SHA256,
+        ];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-all", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-all", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+        assert_eq!(client.negotiated_cipher_suite(), Some(0x1301));
+    }
 }

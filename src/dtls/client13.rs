@@ -38,8 +38,9 @@ use crate::tls::codec::{
     SignatureScheme, hs_type,
 };
 use crate::tls::crypto::{
-    AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, Transcript, certificate_verify_content,
-    expand_label_dyn, finished_verify_data, verify_signature,
+    AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, Transcript,
+    certificate_verify_content, expand_label_dyn, finished_verify_data, lookup_suite,
+    supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -53,7 +54,7 @@ use core::time::Duration;
 use super::ack::{ACK_CONTENT_TYPE, RecordNumber, decode as decode_ack, encode as encode_ack};
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, ParsedDtlsRecord};
-use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_aes128};
+use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
@@ -96,6 +97,10 @@ pub(crate) struct ClientConfig13Internal {
     pub crls: CrlStore,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// Cipher suites advertised in ClientHello, in descending preference
+    /// order. Defaults to all suites the crate supports (RFC 8446 §B.4 —
+    /// AES-128-GCM > AES-256-GCM > ChaCha20-Poly1305).
+    pub cipher_suites: Vec<CipherSuite>,
 }
 
 impl ClientConfig13Internal {
@@ -112,6 +117,7 @@ impl ClientConfig13Internal {
             verification_time: None,
             crls: CrlStore::new(),
             key_log: None,
+            cipher_suites: supported_suites().iter().map(|s| s.suite).collect(),
         }
     }
 
@@ -213,19 +219,22 @@ pub struct DtlsClientConnection13 {
     write_crypter: Option<RecordCrypter>,
     /// Active read-side RecordCrypter.
     read_crypter: Option<RecordCrypter>,
-    /// Sequence-number protection key for outgoing records (16-byte AES key
-    /// derived from the same traffic secret).
-    write_sn_key: Option<[u8; 16]>,
+    /// Sequence-number protection key for outgoing records (key length
+    /// matches the AEAD key length: 16 for AES-128-GCM, 32 for AES-256-GCM
+    /// and ChaCha20-Poly1305, per RFC 9147 §4.2.3).
+    write_sn_key: Option<Vec<u8>>,
     /// Sequence-number protection key for incoming records.
-    read_sn_key: Option<[u8; 16]>,
+    read_sn_key: Option<Vec<u8>>,
     /// Application read-side `sn_key`, ready to swap in at our Finished.
-    read_app_sn_key: Option<[u8; 16]>,
+    read_app_sn_key: Option<Vec<u8>>,
     /// Application write-side `sn_key`, ready to swap in at our Finished.
-    write_app_sn_key: Option<[u8; 16]>,
+    write_app_sn_key: Option<Vec<u8>>,
     /// Application-secret read crypter, parked until our Finished.
     pending_read_app_crypter: Option<RecordCrypter>,
     /// Application-secret write crypter, parked until our Finished.
     pending_write_app_crypter: Option<RecordCrypter>,
+    /// Negotiated cipher suite parameters (set when ServerHello arrives).
+    suite: Option<SuiteParams>,
 
     /// Peer cert chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
@@ -288,6 +297,7 @@ impl DtlsClientConnection13 {
             write_app_sn_key: None,
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
+            suite: None,
             cert_chain: Vec::new(),
             leaf_key: None,
             alpn_negotiated: None,
@@ -295,8 +305,9 @@ impl DtlsClientConnection13 {
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
         };
-        // Transcript hash is SHA-256 (fixed by the only suite we offer).
-        conn.transcript.set_alg(HashAlg::Sha256);
+        // Transcript hash is pinned later once ServerHello arrives — TLS 1.3
+        // (and DTLS 1.3) buffer the handshake bytes and only commit to a hash
+        // after suite selection.
         let dgram = conn.build_client_hello();
         conn.emit_plaintext(dgram);
         conn
@@ -308,10 +319,13 @@ impl DtlsClientConnection13 {
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
-    /// until the handshake completes. DTLS 1.3 in this crate is locked
-    /// to `TLS_AES_128_GCM_SHA256` (0x1301).
+    /// until the handshake completes.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
-        self.is_handshake_complete().then_some(0x1301)
+        if self.is_handshake_complete() {
+            self.suite.map(|s| s.suite.0)
+        } else {
+            None
+        }
     }
 
     /// Drains pending UDP datagrams to send. Also drains any pending ACKs
@@ -434,8 +448,9 @@ impl DtlsClientConnection13 {
         }
 
         // Compute the sn_mask from the read sn_key.
-        let sn_key = self.read_sn_key.ok_or(Error::UnexpectedMessage)?;
-        let mask_full = sn_mask_aes128(&sn_key, body);
+        let suite = self.suite.ok_or(Error::UnexpectedMessage)?;
+        let sn_key = self.read_sn_key.as_ref().ok_or(Error::UnexpectedMessage)?;
+        let mask_full = sn_mask_for(suite, sn_key, body)?;
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
             &mask_full[..2]
         } else {
@@ -574,8 +589,9 @@ impl DtlsClientConnection13 {
         if sh.random == HRR_RANDOM {
             return self.on_hello_retry_request(sh, raw);
         }
-        // The single suite we offer.
-        if sh.cipher_suite != CipherSuite::AES_128_GCM_SHA256 {
+        // The server must have picked one of the suites we offered.
+        let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
+        if !supported_suites().iter().any(|s| s.suite == suite.suite) {
             return Err(Error::HandshakeFailure);
         }
         // Confirm supported_versions = TLS 1.3.
@@ -585,6 +601,7 @@ impl DtlsClientConnection13 {
             return Err(Error::UnsupportedVersion);
         }
         self.server_random = Some(sh.random);
+        self.suite = Some(suite);
 
         // ECDHE from the server's key share.
         let ks_ext =
@@ -603,11 +620,13 @@ impl DtlsClientConnection13 {
             .diffie_hellman(&peer)
             .map_err(|_| Error::IllegalParameter)?;
 
-        // Update the transcript with SH.
+        // Commit the transcript to the negotiated hash (suite hash is fixed
+        // by the ServerHello, RFC 8446 §4.4.1) and append SH.
+        self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
 
         // Derive handshake traffic secrets.
-        let mut ks = KeySchedule::new(HashAlg::Sha256);
+        let mut ks = KeySchedule::new(suite.hash);
         ks.enter_handshake(&shared);
         let th = self.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
@@ -627,12 +646,13 @@ impl DtlsClientConnection13 {
         }
 
         // Install protected crypters (epoch 2 for handshake).
-        let w_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &chts);
-        let r_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &shts);
+        let w_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts);
+        let r_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts);
         self.write_crypter = Some(w_crypter);
         self.read_crypter = Some(r_crypter);
-        self.write_sn_key = Some(derive_sn_key(HashAlg::Sha256, &chts));
-        self.read_sn_key = Some(derive_sn_key(HashAlg::Sha256, &shts));
+        let sn_len = sn_key_len_for(suite.aead);
+        self.write_sn_key = Some(derive_sn_key(suite.hash, &chts, sn_len));
+        self.read_sn_key = Some(derive_sn_key(suite.hash, &shts, sn_len));
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
@@ -649,7 +669,10 @@ impl DtlsClientConnection13 {
         if self.hrr_processed {
             return Err(Error::UnexpectedMessage);
         }
-        if hrr.cipher_suite != CipherSuite::AES_128_GCM_SHA256 {
+        // HRR carries the same suite the eventual ServerHello will use
+        // (RFC 8446 §4.1.4). Accept any suite we offered.
+        let suite = lookup_suite(hrr.cipher_suite).ok_or(Error::IllegalParameter)?;
+        if !supported_suites().iter().any(|s| s.suite == suite.suite) {
             return Err(Error::IllegalParameter);
         }
         let sv = ext::find(&hrr.extensions, ExtensionType::SUPPORTED_VERSIONS)
@@ -668,8 +691,11 @@ impl DtlsClientConnection13 {
             .clone();
         self.cookie_extension = Some(cookie_body);
 
-        // Rewrite the transcript per RFC 8446 §4.4.1 (synthetic message_hash).
-        self.transcript.set_alg(HashAlg::Sha256);
+        // Pin the suite now so the post-HRR transcript hashes with the
+        // server-selected hash, and rewrite the transcript per RFC 8446
+        // §4.4.1 (synthetic message_hash).
+        self.suite = Some(suite);
+        self.transcript.set_alg(suite.hash);
         self.transcript.replace_with_message_hash();
         self.transcript.update(raw);
 
@@ -782,12 +808,13 @@ impl DtlsClientConnection13 {
         if msg_type != hs_type::FINISHED {
             return Err(Error::UnexpectedMessage);
         }
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let shts = self
             .server_hs_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected = finished_verify_data(HashAlg::Sha256, shts, th.as_slice());
+        let expected = finished_verify_data(suite.hash, shts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
@@ -819,19 +846,20 @@ impl DtlsClientConnection13 {
         let _ = ems;
         // Stash the app keys; they're installed atomically below.
         self.pending_write_app_crypter = Some(RecordCrypter::new(
-            HashAlg::Sha256,
-            AeadAlg::Aes128Gcm,
-            16,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
             &cats,
         ));
         self.pending_read_app_crypter = Some(RecordCrypter::new(
-            HashAlg::Sha256,
-            AeadAlg::Aes128Gcm,
-            16,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
             &sats,
         ));
-        self.write_app_sn_key = Some(derive_sn_key(HashAlg::Sha256, &cats));
-        self.read_app_sn_key = Some(derive_sn_key(HashAlg::Sha256, &sats));
+        let sn_len = sn_key_len_for(suite.aead);
+        self.write_app_sn_key = Some(derive_sn_key(suite.hash, &cats, sn_len));
+        self.read_app_sn_key = Some(derive_sn_key(suite.hash, &sats, sn_len));
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
@@ -841,7 +869,7 @@ impl DtlsClientConnection13 {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th_for_cfin = self.transcript.current_hash();
-        let verify_data = finished_verify_data(HashAlg::Sha256, chts, th_for_cfin.as_slice());
+        let verify_data = finished_verify_data(suite.hash, chts, th_for_cfin.as_slice());
         let fin_body = verify_data.as_slice().to_vec();
         // Update transcript with Finished.
         let mut fin_tls = Vec::with_capacity(4 + fin_body.len());
@@ -913,7 +941,8 @@ impl DtlsClientConnection13 {
             legacy_version: 0x0303,
             random: self.client_random,
             session_id: Vec::new(),
-            cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+            // Offer the configured suites in descending preference order.
+            cipher_suites: self.config.cipher_suites.clone(),
             extensions,
         }
         .encode();
@@ -961,11 +990,15 @@ impl DtlsClientConnection13 {
         // RFC 9147 §4.2.3: the additional data is the unified-header bytes
         // PRIOR to sequence-number masking. Build the header, compute the
         // AEAD with that AAD, then compute and apply the sn_mask.
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let crypter = self
             .write_crypter
             .as_mut()
             .ok_or(Error::InappropriateState)?;
-        let sn_key = self.write_sn_key.ok_or(Error::InappropriateState)?;
+        let sn_key = self
+            .write_sn_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
         let epoch = self.enc_write_epoch;
         let seq = self.enc_write_seq;
         self.enc_write_seq += 1;
@@ -1000,7 +1033,7 @@ impl DtlsClientConnection13 {
 
         // Compute sn_mask over the first 16 bytes of ciphertext+tag and
         // emit the on-wire record with the masked seq.
-        let mask_full = sn_mask_aes128(&sn_key, &inner);
+        let mask_full = sn_mask_for(suite, sn_key, &inner)?;
         let mask: &[u8] = if seq_is_16bit {
             &mask_full[..2]
         } else {
@@ -1107,13 +1140,24 @@ fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(certs)
 }
 
-/// Derives a 16-byte DTLS 1.3 sequence-number protection key from a TLS 1.3
-/// traffic secret (RFC 9147 §4.2.3, `sn = HKDF-Expand-Label(secret, "sn",
-/// "", key_length)`).
-pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret) -> [u8; 16] {
-    let mut out = [0u8; 16];
+/// Derives a DTLS 1.3 sequence-number protection key of `len` bytes from a
+/// TLS 1.3 traffic secret (RFC 9147 §4.2.3, `sn = HKDF-Expand-Label(secret,
+/// "sn", "", key_length)`). The key length matches the negotiated AEAD's
+/// key length (16 for AES-128-GCM, 32 for AES-256-GCM and
+/// ChaCha20-Poly1305).
+pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Vec<u8> {
+    let mut out = alloc::vec![0u8; len];
     expand_label_dyn(hash, secret.as_slice(), b"sn", &[], &mut out);
     out
+}
+
+/// Sequence-number key length for the given AEAD, per RFC 9147 §4.2.3:
+/// the `sn_key` length equals the AEAD key length.
+pub(crate) fn sn_key_len_for(aead: AeadAlg) -> usize {
+    match aead {
+        AeadAlg::Aes128Gcm => 16,
+        AeadAlg::Aes256Gcm | AeadAlg::ChaCha20Poly1305 => 32,
+    }
 }
 
 /// Encrypts `inner` in-place under `crypter` with the DTLS-style AAD.

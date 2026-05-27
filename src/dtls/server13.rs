@@ -29,13 +29,13 @@ use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
-    SignatureScheme, hs_type, with_len_u16, with_len_u24,
+    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
+    hs_type, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::sign::sign_certificate_verify;
 use crate::tls::crypto::{
-    AeadAlg, HashAlg, KeySchedule, RecordCrypter, Transcript, certificate_verify_content,
-    finished_verify_data,
+    KeySchedule, RecordCrypter, SuiteParams, Transcript, certificate_verify_content,
+    finished_verify_data, supported_suites,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
@@ -44,11 +44,13 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use super::ack::{ACK_CONTENT_TYPE, RecordNumber, decode as decode_ack, encode as encode_ack};
-use super::client13::{decrypt_dtls13_record, derive_sn_key, encrypt_dtls13_record};
+use super::client13::{
+    decrypt_dtls13_record, derive_sn_key, encrypt_dtls13_record, sn_key_len_for,
+};
 use super::cookie::CookieGenerator;
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, ParsedDtlsRecord};
-use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_aes128};
+use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
@@ -185,12 +187,18 @@ pub struct DtlsServerConnection13<R: RngCore> {
     write_crypter: Option<RecordCrypter>,
     /// Active read-side RecordCrypter.
     read_crypter: Option<RecordCrypter>,
-    write_sn_key: Option<[u8; 16]>,
-    read_sn_key: Option<[u8; 16]>,
-    read_app_sn_key: Option<[u8; 16]>,
-    write_app_sn_key: Option<[u8; 16]>,
+    /// Sequence-number protection keys (length matches the AEAD key length:
+    /// 16 for AES-128-GCM, 32 for AES-256-GCM and ChaCha20-Poly1305, per
+    /// RFC 9147 §4.2.3).
+    write_sn_key: Option<Vec<u8>>,
+    read_sn_key: Option<Vec<u8>>,
+    read_app_sn_key: Option<Vec<u8>>,
+    write_app_sn_key: Option<Vec<u8>>,
     pending_read_app_crypter: Option<RecordCrypter>,
     pending_write_app_crypter: Option<RecordCrypter>,
+    /// Negotiated cipher suite parameters (set once we pick a suite from
+    /// the cookie-validated CH).
+    suite: Option<SuiteParams>,
 
     /// Pending ACKs to emit.
     pending_acks: Vec<RecordNumber>,
@@ -203,8 +211,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
     /// is the opaque identifier used by the cookie generator.
     pub(crate) fn new(config: Arc<ServerConfig13Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
-        let mut t = Transcript::new();
-        t.set_alg(HashAlg::Sha256);
+        // Transcript hash is pinned later once we select a cipher suite from
+        // the (cookie-validated) ClientHello — the buffer-everything design
+        // lets us defer the hash choice until then.
+        let t = Transcript::new();
         Self {
             config,
             rng,
@@ -237,6 +247,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             write_app_sn_key: None,
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
+            suite: None,
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
@@ -249,10 +260,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
-    /// until the handshake completes. DTLS 1.3 in this crate is locked
-    /// to `TLS_AES_128_GCM_SHA256` (0x1301).
+    /// until the handshake completes.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
-        self.is_handshake_complete().then_some(0x1301)
+        if self.is_handshake_complete() {
+            self.suite.map(|s| s.suite.0)
+        } else {
+            None
+        }
     }
 
     /// Drains pending UDP datagrams. Also drains any pending ACKs.
@@ -345,8 +359,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if body.len() < 16 {
             return Err(Error::Decode);
         }
-        let sn_key = self.read_sn_key.ok_or(Error::UnexpectedMessage)?;
-        let mask_full = sn_mask_aes128(&sn_key, body);
+        let suite = self.suite.ok_or(Error::UnexpectedMessage)?;
+        let sn_key = self.read_sn_key.as_ref().ok_or(Error::UnexpectedMessage)?;
+        let mask_full = sn_mask_for(suite, sn_key, body)?;
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
             &mask_full[..2]
         } else {
@@ -498,6 +513,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .find(|(t, _)| t.0 == EXT_COOKIE)
             .map(|(_, b)| b.clone());
 
+        // Pick the cipher suite from the client's offer, in our preference
+        // order. We need this both for HRR (which must carry the chosen
+        // suite per RFC 8446 §4.1.4) and for committing the transcript hash.
+        let suite = supported_suites()
+            .iter()
+            .copied()
+            .find(|s| ch.cipher_suites.contains(&s.suite))
+            .ok_or(Error::HandshakeFailure)?;
+
         if cookie_required && presented_cookie.is_none() {
             // First CH: emit HRR with a freshly-minted cookie.
             let secret = self
@@ -508,21 +532,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let cg = CookieGenerator::new(*secret);
             let now_min = (self.last_now.as_secs() / 60) as u32;
             let cookie = cg.generate(&self.peer_addr, &ch.random, now_min);
+            // Pin the suite chosen from CH1 so HRR can carry it.
+            self.suite = Some(suite);
             // Transcript: per RFC 8446 §4.4.1, when HRR is in play, the
-            // transcript replaces CH1 with `message_hash(CH1)`. We compute
-            // CH1's hash NOW (before transcript update), emit HRR, then
-            // continue with the normal transcript update from CH2.
-            // We don't actually need the transcript-replacement step here
-            // because we discard *all* server state on HRR; the CH2 path
-            // will rebuild the transcript from scratch using
+            // transcript replaces CH1 with `message_hash(CH1)`. We commit
+            // the transcript hash now that the suite is selected, then
+            // park the CH1 bytes; the CH2 path replays them through
             // `replace_with_message_hash`.
             self.emit_hello_retry_request(&cookie)?;
             self.state = State::WaitSecondClientHello;
-            // Stash CH1's transcript-hash so we can rebuild a proper
-            // post-HRR transcript on CH2. We feed CH1 into a separate
-            // transcript pass to compute message_hash(CH1).
             let mut t = Transcript::new();
-            t.set_alg(HashAlg::Sha256);
+            t.set_alg(suite.hash);
             // CH1 in TLS-shape:
             let mut tls_ch = Vec::with_capacity(4 + body.len());
             tls_ch.push(hs_type::CLIENT_HELLO);
@@ -569,6 +589,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             if !cg.validate(&self.peer_addr, &ch.random, now_min, cookie) {
                 return Err(Error::IllegalParameter);
             }
+            // CH2 must still offer the suite we pinned in HRR (RFC 8446
+            // §4.1.4: the suite the server picks on HRR is the one it
+            // commits to).
+            let pinned = self.suite.ok_or(Error::InappropriateState)?;
+            if !ch.cipher_suites.contains(&pinned.suite) {
+                return Err(Error::IllegalParameter);
+            }
             // CH2 transcript: replace CH1 with message_hash(CH1) (already
             // in self.transcript from the pre-state path above), then
             // append the HRR and CH2.
@@ -576,10 +603,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             // Re-derive the HRR bytes so we can update the transcript.
             let hrr_bytes = self.build_hrr_bytes(cookie);
             self.transcript.update(&hrr_bytes);
-        }
-        // Sanity checks: suites + groups.
-        if !ch.cipher_suites.contains(&CipherSuite::AES_128_GCM_SHA256) {
-            return Err(Error::HandshakeFailure);
+        } else {
+            // Cookie-off path: this is the only CH; pin the suite now.
+            self.suite = Some(suite);
         }
         let groups_ext = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
             .ok_or(Error::HandshakeFailure)?;
@@ -599,6 +625,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         let client_pub = client_pub.clone();
 
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         self.client_random = Some(ch.random);
         // CH2 (or first-and-only CH when cookies are off) into the
         // transcript (TLS-shaped).
@@ -610,9 +637,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         tls_ch.push((n & 0xff) as u8);
         tls_ch.extend_from_slice(body);
         if !cookie_required {
-            // Cookie-off path: this is CH1, transcript starts fresh.
+            // Cookie-off path: this is CH1, transcript starts fresh under
+            // the just-picked suite's hash.
             self.transcript = Transcript::new();
-            self.transcript.set_alg(HashAlg::Sha256);
+            self.transcript.set_alg(suite.hash);
         }
         self.transcript.update(&tls_ch);
 
@@ -651,7 +679,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let sh_bytes = ServerHello {
             random: sr,
             session_id: ch.session_id.clone(),
-            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            cipher_suite: suite.suite,
             extensions: sh_extensions,
         }
         .encode();
@@ -673,7 +701,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.emit_plaintext(sh_dgram);
 
         // Derive handshake traffic secrets and install protected crypters.
-        let mut ks = KeySchedule::new(HashAlg::Sha256);
+        let mut ks = KeySchedule::new(suite.hash);
         ks.enter_handshake(&shared);
         let th = self.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
@@ -690,12 +718,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 shts.as_slice(),
             );
         }
-        let w_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &shts);
-        let r_crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &chts);
+        let w_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts);
+        let r_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts);
         self.write_crypter = Some(w_crypter);
         self.read_crypter = Some(r_crypter);
-        self.write_sn_key = Some(derive_sn_key(HashAlg::Sha256, &shts));
-        self.read_sn_key = Some(derive_sn_key(HashAlg::Sha256, &chts));
+        let sn_len = sn_key_len_for(suite.aead);
+        self.write_sn_key = Some(derive_sn_key(suite.hash, &shts, sn_len));
+        self.read_sn_key = Some(derive_sn_key(suite.hash, &chts, sn_len));
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
@@ -729,19 +758,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         let _ = ems;
         self.pending_write_app_crypter = Some(RecordCrypter::new(
-            HashAlg::Sha256,
-            AeadAlg::Aes128Gcm,
-            16,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
             &sats,
         ));
         self.pending_read_app_crypter = Some(RecordCrypter::new(
-            HashAlg::Sha256,
-            AeadAlg::Aes128Gcm,
-            16,
+            suite.hash,
+            suite.aead,
+            suite.key_len,
             &cats,
         ));
-        self.write_app_sn_key = Some(derive_sn_key(HashAlg::Sha256, &sats));
-        self.read_app_sn_key = Some(derive_sn_key(HashAlg::Sha256, &cats));
+        self.write_app_sn_key = Some(derive_sn_key(suite.hash, &sats, sn_len));
+        self.read_app_sn_key = Some(derive_sn_key(suite.hash, &cats, sn_len));
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
@@ -808,12 +837,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     fn send_finished(&mut self) -> Result<(), Error> {
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let shts = self
             .server_hs_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let verify_data = finished_verify_data(HashAlg::Sha256, shts, th.as_slice());
+        let verify_data = finished_verify_data(suite.hash, shts, th.as_slice());
         let body = verify_data.as_slice().to_vec();
         let mut tls_msg = Vec::with_capacity(4 + body.len());
         tls_msg.push(hs_type::FINISHED);
@@ -831,12 +861,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if msg_type != hs_type::FINISHED {
             return Err(Error::UnexpectedMessage);
         }
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let chts = self
             .client_hs_secret
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let th = self.transcript.current_hash();
-        let expected = finished_verify_data(HashAlg::Sha256, chts, th.as_slice());
+        let expected = finished_verify_data(suite.hash, chts, th.as_slice());
         if !bool::from(expected.as_slice().ct_eq(body)) {
             return Err(Error::HandshakeFailure);
         }
@@ -856,7 +887,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     /// Builds the on-wire HRR bytes (4-byte TLS handshake header + body).
-    /// `cookie` is the raw cookie payload (no length prefix).
+    /// `cookie` is the raw cookie payload (no length prefix). Uses the
+    /// suite pinned during CH1 processing — HRR commits to a single suite
+    /// (RFC 8446 §4.1.4).
     fn build_hrr_bytes(&self, cookie: &[u8]) -> Vec<u8> {
         let extensions = alloc::vec![
             ext::server_supported_versions(),
@@ -872,10 +905,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 }
             ),
         ];
+        // HRR is only emitted after `self.suite` is pinned during CH1
+        // processing; fall back to the highest-preference suite if (somehow)
+        // not set — this keeps the call total without taking a Result.
+        let suite_id = self
+            .suite
+            .map(|s| s.suite)
+            .unwrap_or_else(|| supported_suites()[0].suite);
         ServerHello {
             random: HRR_RANDOM,
             session_id: Vec::new(),
-            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            cipher_suite: suite_id,
             extensions,
         }
         .encode()
@@ -920,11 +960,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         ct: ContentType,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
         let crypter = self
             .write_crypter
             .as_mut()
             .ok_or(Error::InappropriateState)?;
-        let sn_key = self.write_sn_key.ok_or(Error::InappropriateState)?;
+        let sn_key = self
+            .write_sn_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
         let epoch = self.enc_write_epoch;
         let seq = self.enc_write_seq;
         self.enc_write_seq += 1;
@@ -953,7 +997,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
 
-        let mask_full = sn_mask_aes128(&sn_key, &inner);
+        let mask_full = sn_mask_for(suite, sn_key, &inner)?;
         let mask: &[u8] = if seq_is_16bit {
             &mask_full[..2]
         } else {

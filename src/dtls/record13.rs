@@ -34,8 +34,9 @@
 
 #![allow(dead_code)]
 
-use crate::cipher::{Aes128, Aes256, BlockCipher};
+use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20};
 use crate::tls::Error;
+use crate::tls::crypto::{AeadAlg, SuiteParams};
 use alloc::vec::Vec;
 
 /// Fixed top 3 bits of every DTLS 1.3 protected record's first byte: `001`.
@@ -337,12 +338,56 @@ fn sn_mask_block<C: BlockCipher>(cipher: &C, ciphertext: &[u8]) -> [u8; 2] {
     [block[0], block[1]]
 }
 
-// TODO: ChaCha20-derived sn_mask for the ChaCha20-Poly1305 cipher suite
-//       (RFC 9147 §4.2.3). The DTLS subset shipped today doesn't yet
-//       advertise the ChaCha suite, so this is intentionally omitted —
-//       the masking call sites in `encode_record` / `decode_record` are
-//       cipher-agnostic and a `sn_mask_chacha20(...)` helper can be
-//       added without touching the framing code.
+/// Derives the 2-byte DTLS 1.3 sequence-number protection mask for the
+/// ChaCha20-Poly1305 AEAD (RFC 9147 §4.2.3).
+///
+/// The first 16 bytes of `ciphertext` form the sample: the low 32 bits
+/// are the ChaCha20 block counter (little-endian, sample[0..4]), and the
+/// high 96 bits are the nonce (sample[4..16]). The mask is the first 2
+/// bytes of the resulting 64-byte keystream block. If `ciphertext` is
+/// shorter than 16 bytes it is right-padded with zeros (matching the
+/// AES helpers in this file). The counter / nonce split mirrors the
+/// QUIC header-protection construction in [`crate::quic::crypto`]
+/// (RFC 9001 §5.4.4), which the TLS working group adopted as the
+/// reference for the DTLS ChaCha mask.
+pub(crate) fn sn_mask_chacha20(sn_key: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] {
+    let mut sample = [0u8; 16];
+    let take = ciphertext.len().min(16);
+    sample[..take].copy_from_slice(&ciphertext[..take]);
+    let counter = u32::from_le_bytes([sample[0], sample[1], sample[2], sample[3]]);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&sample[4..16]);
+    let mut block = [0u8; 64];
+    ChaCha20::new(sn_key).apply_keystream(&nonce, counter, &mut block);
+    [block[0], block[1]]
+}
+
+/// Dispatches the DTLS 1.3 sequence-number mask computation on the
+/// negotiated cipher suite's AEAD (RFC 9147 §4.2.3). The `sn_key` length
+/// is determined by the suite at derivation time and must match the AEAD
+/// key length (16 for AES-128-GCM, 32 for AES-256-GCM and
+/// ChaCha20-Poly1305). A size mismatch is a crate-internal invariant
+/// violation and is reported as [`Error::InappropriateState`].
+pub(crate) fn sn_mask_for(
+    suite: SuiteParams,
+    sn_key: &[u8],
+    ciphertext: &[u8],
+) -> Result<[u8; 2], Error> {
+    match suite.aead {
+        AeadAlg::Aes128Gcm => {
+            let k: &[u8; 16] = sn_key.try_into().map_err(|_| Error::InappropriateState)?;
+            Ok(sn_mask_aes128(k, ciphertext))
+        }
+        AeadAlg::Aes256Gcm => {
+            let k: &[u8; 32] = sn_key.try_into().map_err(|_| Error::InappropriateState)?;
+            Ok(sn_mask_aes256(k, ciphertext))
+        }
+        AeadAlg::ChaCha20Poly1305 => {
+            let k: &[u8; 32] = sn_key.try_into().map_err(|_| Error::InappropriateState)?;
+            Ok(sn_mask_chacha20(k, ciphertext))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -532,6 +577,33 @@ mod tests {
         let ct = [0u8; 16];
         let mask = sn_mask_aes256(&key, &ct);
         assert_eq!(mask, [0xdc, 0x95]);
+    }
+
+    #[test]
+    fn sn_mask_chacha20_known_vector() {
+        // RFC 8439 §2.3.2 reference: ChaCha20(key=0..0, nonce=0..0, counter=0)
+        // produces the keystream block
+        //     76 b8 e0 ad a0 f1 3d 90 40 5d 6a e5 53 86 bd 28 ...
+        // With a zero sample, the counter (sample[0..4] LE) and the nonce
+        // (sample[4..16]) are both zero, so the mask is the first 2 bytes
+        // of that block.
+        let key = [0u8; 32];
+        let ct = [0u8; 16];
+        let mask = sn_mask_chacha20(&key, &ct);
+        assert_eq!(mask, [0x76, 0xb8]);
+    }
+
+    #[test]
+    fn sn_mask_chacha20_short_ciphertext_zero_padded() {
+        // Matches the AES helpers' padding policy: a sub-16-byte sample is
+        // zero-padded so the mask is well-defined. Real call sites never
+        // hit this because the AEAD tag alone is 16 bytes.
+        let key = [0u8; 32];
+        let short = [0u8; 4];
+        let mask_short = sn_mask_chacha20(&key, &short);
+        let zero = [0u8; 16];
+        let mask_zero = sn_mask_chacha20(&key, &zero);
+        assert_eq!(mask_short, mask_zero);
     }
 
     #[test]
