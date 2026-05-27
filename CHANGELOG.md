@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/KarpelesLab/purecrypto/compare/v0.1.0...v0.1.1) - 2026-05-27
+
+### Added
+
+- *(rsa)* SPKI + PKCS#8 + PEM round-trip helpers
+- *(ec)* r/s component accessors on ECDSA + Ed25519 signatures
+
+### Other
+
+- ignore Cargo.lock (regression of 4a39a57)
+
 ## [0.1.0](https://github.com/KarpelesLab/purecrypto/compare/v0.0.7...v0.1.0) - 2026-05-27
 
 ### Added
