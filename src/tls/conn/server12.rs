@@ -47,7 +47,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret,
+    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 use crate::tls::crypto::verify_signature;
 use crate::tls::keylog::KeyLog;
@@ -440,6 +440,27 @@ impl<R: RngCore> ServerConnection12<R> {
     /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
     pub fn ems_negotiated(&self) -> bool {
         self.ems_negotiated
+    }
+
+    /// RFC 5705 §4 — TLS 1.2 application-layer Exporter. Derives `out.len()`
+    /// bytes of keying material from the negotiated `master_secret` under
+    /// `(label, context)`. See the [`ClientConnection12::tls_exporter`]
+    /// counterpart for the formula and the no-context vs empty-context
+    /// distinction.
+    ///
+    /// [`ClientConnection12::tls_exporter`]: super::client12::ClientConnection12::tls_exporter
+    pub fn tls_exporter(
+        &self,
+        label: &[u8],
+        context: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let cr = self.client_random.ok_or(Error::InappropriateState)?;
+        let sr = self.server_random.ok_or(Error::InappropriateState)?;
+        tls12_exporter(suite.hash, master, label, &cr, &sr, context, out);
+        Ok(())
     }
 
     /// Feeds received TLS bytes.

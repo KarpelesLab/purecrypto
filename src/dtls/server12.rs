@@ -24,7 +24,7 @@ use crate::tls::conn::{SUITES_12, ServerKey, SigKind, SuiteParams12};
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret,
+    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
@@ -252,6 +252,27 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// signing keys are supported; matches the TLS 1.2 server's scope.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.suite.map(|s| s.suite.0)
+    }
+
+    /// RFC 5705 §4 — DTLS 1.2 application-layer Exporter. Computes
+    /// `PRF(master_secret, label, client_random ‖ server_random
+    /// [‖ uint16(len(context)) ‖ context])`, matching TLS 1.2's exporter.
+    /// `context = None` omits the length-prefixed context block;
+    /// `context = Some(&[])` emits a zero-length context — the two outputs
+    /// MUST differ per RFC 5705 §4. Returns `Err(InappropriateState)`
+    /// before the handshake derives the master secret.
+    pub fn tls_exporter(
+        &self,
+        label: &[u8],
+        context: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let cr = self.client_random.ok_or(Error::InappropriateState)?;
+        let sr = self.server_random.ok_or(Error::InappropriateState)?;
+        tls12_exporter(suite.hash, master, label, &cr, &sr, context, out);
+        Ok(())
     }
 
     /// Drains pending UDP datagrams to send.

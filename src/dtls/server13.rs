@@ -212,6 +212,10 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Negotiated cipher suite parameters (set once we pick a suite from
     /// the cookie-validated CH).
     suite: Option<SuiteParams>,
+    /// `exporter_master_secret` (RFC 8446 §7.5), retained after the
+    /// server-Finished derivation so [`Self::tls_exporter`] can be called
+    /// any number of times once the handshake completes.
+    exporter_secret: Option<crate::tls::crypto::Secret>,
     /// Group selected for HelloRetryRequest, if any. When set, CH2 must
     /// carry a `key_share` for this group (RFC 8446 §4.1.4 / §4.2.8).
     hrr_selected_group: Option<NamedGroup>,
@@ -265,6 +269,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
             suite: None,
+            exporter_secret: None,
             hrr_selected_group: None,
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
@@ -285,6 +290,21 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         } else {
             None
         }
+    }
+
+    /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 application-layer Exporter.
+    /// Derives `out.len()` bytes from the `exporter_master_secret` under
+    /// `(label, context)`. The derivation matches TLS 1.3's exporter —
+    /// DTLS 1.3 explicitly reuses the TLS 1.3 key schedule. Returns
+    /// `Err(InappropriateState)` until the handshake completes.
+    pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        let ems = self
+            .exporter_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out);
+        Ok(())
     }
 
     /// Drains pending UDP datagrams. Also drains any pending ACKs.
@@ -853,7 +873,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             kl.log("SERVER_TRAFFIC_SECRET_0", &ch.random, sats.as_slice());
             kl.log("EXPORTER_SECRET", &ch.random, ems.as_slice());
         }
-        let _ = ems;
+        self.exporter_secret = Some(ems);
         self.pending_write_app_crypter = Some(RecordCrypter::new(
             suite.hash,
             suite.aead,

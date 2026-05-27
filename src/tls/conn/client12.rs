@@ -52,7 +52,7 @@ use crate::tls::codec::{
 use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
-    extended_master_secret, finished_verify_data, key_block, master_secret,
+    extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
@@ -702,6 +702,42 @@ impl ClientConnection12 {
     /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
     pub fn ems_negotiated(&self) -> bool {
         self.ems_negotiated
+    }
+
+    /// RFC 5705 §4 — TLS 1.2 application-layer Exporter. Derives `out.len()`
+    /// bytes of keying material from the negotiated `master_secret` under
+    /// `(label, context)`:
+    ///
+    /// ```text
+    ///   PRF(master_secret, label,
+    ///       client_random ‖ server_random
+    ///       [‖ uint16(len(context)) ‖ context])
+    /// ```
+    ///
+    /// `context = None` matches openssl's `SSL_export_keying_material` with
+    /// `use_context = 0`; `context = Some(_)` matches `use_context = 1`. An
+    /// empty `Some(&[])` is *not* equivalent to `None`. Returns
+    /// `Err(InappropriateState)` before the handshake completes (i.e. before
+    /// the master secret has been derived).
+    pub fn tls_exporter(
+        &self,
+        label: &[u8],
+        context: Option<&[u8]>,
+        out: &mut [u8],
+    ) -> Result<(), Error> {
+        let master = self.master.as_ref().ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let sr = self.server_random.ok_or(Error::InappropriateState)?;
+        tls12_exporter(
+            suite.hash,
+            master,
+            label,
+            &self.client_random,
+            &sr,
+            context,
+            out,
+        );
+        Ok(())
     }
 
     /// Feeds received TLS bytes into the input buffer.

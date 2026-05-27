@@ -151,6 +151,51 @@ pub(crate) fn key_block(
     prf(hash, master, b"key expansion", &seed, out);
 }
 
+/// RFC 5705 §4 — TLS 1.2 exporter: derives application-layer keying material
+/// from the negotiated master secret.
+///
+/// ```text
+///   without context: PRF(master_secret, label, client_random ‖ server_random)
+///   with    context: PRF(master_secret, label, client_random ‖ server_random ‖
+///                        uint16(len(context)) ‖ context)
+/// ```
+///
+/// The two branches produce different outputs even when `context = Some(&[])`
+/// — supplying an empty context is *not* equivalent to omitting it (RFC 5705
+/// §4). `context = None` matches openssl's `SSL_export_keying_material` with
+/// `use_context = 0`; `context = Some(_)` matches `use_context = 1`. Modern
+/// over-TLS protocols (DTLS-SRTP, EAP-TLS, IEEE 802.1AR, …) use the
+/// with-context form.
+///
+/// Label validation is left to the caller; RFC 5705 §6 forbids the
+/// handshake-internal labels (`"client finished"`, `"server finished"`,
+/// `"master secret"`, `"key expansion"`, `"extended master secret"`).
+#[allow(dead_code)]
+pub(crate) fn tls12_exporter(
+    hash: HashAlg,
+    master: &[u8; 48],
+    label: &[u8],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+    context: Option<&[u8]>,
+    out: &mut [u8],
+) {
+    // seed = client_random ‖ server_random [‖ uint16(len(context)) ‖ context]
+    let extra = match context {
+        Some(c) => 2 + c.len(),
+        None => 0,
+    };
+    let mut seed = alloc::vec::Vec::with_capacity(64 + extra);
+    seed.extend_from_slice(client_random);
+    seed.extend_from_slice(server_random);
+    if let Some(c) = context {
+        let len = c.len() as u16;
+        seed.extend_from_slice(&len.to_be_bytes());
+        seed.extend_from_slice(c);
+    }
+    prf(hash, master, label, &seed, out);
+}
+
 /// Computes a TLS 1.2 Finished `verify_data` (RFC 5246 §7.4.9):
 ///
 /// ```text
@@ -295,6 +340,127 @@ mod tests {
         let mut kb_sha384 = [0u8; 40];
         key_block(HashAlg::Sha384, &master, &sr, &cr, &mut kb_sha384);
         assert_ne!(kb1, kb_sha384);
+    }
+
+    /// RFC 5705 §4 — exporter output is deterministic, length-flexible, and
+    /// the with-context / without-context branches produce distinct streams
+    /// even for an empty context.
+    #[test]
+    fn tls12_exporter_branches_and_determinism() {
+        let master = [0x42u8; 48];
+        let cr = [0x11u8; 32];
+        let sr = [0x22u8; 32];
+
+        // Determinism + length flexibility.
+        let mut a = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            None,
+            &mut a,
+        );
+        let mut b = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            None,
+            &mut b,
+        );
+        assert_eq!(a, b);
+        let mut long = [0u8; 80];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            None,
+            &mut long,
+        );
+        // Prefix-extension property of P_hash.
+        assert_eq!(&long[..32], &a[..]);
+
+        // Different labels diverge.
+        let mut other_label = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-other",
+            &cr,
+            &sr,
+            None,
+            &mut other_label,
+        );
+        assert_ne!(a, other_label);
+
+        // RFC 5705 §4: `None` vs `Some(&[])` MUST differ (the latter adds the
+        // 2-byte zero length to the seed).
+        let mut no_ctx = [0u8; 32];
+        let mut empty_ctx = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            None,
+            &mut no_ctx,
+        );
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            Some(&[]),
+            &mut empty_ctx,
+        );
+        assert_ne!(
+            no_ctx, empty_ctx,
+            "empty-context branch must differ from no-context branch"
+        );
+
+        // Distinct contexts diverge.
+        let mut ctx1 = [0u8; 32];
+        let mut ctx2 = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            Some(b"alpha"),
+            &mut ctx1,
+        );
+        tls12_exporter(
+            HashAlg::Sha256,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            Some(b"beta"),
+            &mut ctx2,
+        );
+        assert_ne!(ctx1, ctx2);
+
+        // Hash dispatch covers SHA-384.
+        let mut sha384 = [0u8; 32];
+        tls12_exporter(
+            HashAlg::Sha384,
+            &master,
+            b"EXPERIMENTAL-test",
+            &cr,
+            &sr,
+            None,
+            &mut sha384,
+        );
+        assert_ne!(a, sha384);
     }
 
     /// `P_hash` self-consistency: two calls with the same inputs match, and

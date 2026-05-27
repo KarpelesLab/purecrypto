@@ -2711,6 +2711,73 @@ mod tls12_loopback_tests {
         }
     }
 
+    /// RFC 5705 §4 — TLS 1.2 client and server derive identical keying
+    /// material for the same `(label, context)` after a fresh handshake,
+    /// and the `None` vs `Some(&[])` branches diverge as the RFC requires.
+    #[test]
+    fn tls12_exporter_agrees_both_sides() {
+        let (server_config, cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-exp-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-exp-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // Both sides agree on the no-context branch.
+        let mut c_out = [0u8; 48];
+        let mut s_out = [0u8; 48];
+        client
+            .tls_exporter(b"EXPERIMENTAL-test", None, &mut c_out)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPERIMENTAL-test", None, &mut s_out)
+            .unwrap();
+        assert_eq!(c_out, s_out);
+
+        // Both sides agree on the with-context branch.
+        let mut c_ctx = [0u8; 48];
+        let mut s_ctx = [0u8; 48];
+        client
+            .tls_exporter(b"EXPERIMENTAL-test", Some(b"binding"), &mut c_ctx)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPERIMENTAL-test", Some(b"binding"), &mut s_ctx)
+            .unwrap();
+        assert_eq!(c_ctx, s_ctx);
+
+        // RFC 5705 §4 — `None` vs `Some(&[])` MUST differ.
+        let mut c_empty = [0u8; 48];
+        client
+            .tls_exporter(b"EXPERIMENTAL-test", Some(&[]), &mut c_empty)
+            .unwrap();
+        assert_ne!(c_out, c_empty);
+    }
+
     /// A client offering only an unknown cipher suite is rejected with
     /// `HandshakeFailure`.
     #[test]

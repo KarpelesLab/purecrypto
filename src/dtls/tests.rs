@@ -204,6 +204,46 @@ fn application_data_both_ways_12() {
     assert_eq!(client.take_received(), b"pong from server");
 }
 
+/// RFC 5705 §4 — DTLS 1.2 exporter agrees on both sides for a given
+/// `(label, context)`, and the no-context vs empty-context branches differ.
+#[test]
+fn exporter_agrees_both_sides_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-exporter", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert!(pump_handshake(&mut client, &mut server));
+
+    let mut c_out = [0u8; 48];
+    let mut s_out = [0u8; 48];
+    client
+        .tls_exporter(b"EXPERIMENTAL-dtls", None, &mut c_out)
+        .unwrap();
+    server
+        .tls_exporter(b"EXPERIMENTAL-dtls", None, &mut s_out)
+        .unwrap();
+    assert_eq!(c_out, s_out);
+
+    let mut c_ctx = [0u8; 48];
+    let mut s_ctx = [0u8; 48];
+    client
+        .tls_exporter(b"EXPERIMENTAL-dtls", Some(b"binding"), &mut c_ctx)
+        .unwrap();
+    server
+        .tls_exporter(b"EXPERIMENTAL-dtls", Some(b"binding"), &mut s_ctx)
+        .unwrap();
+    assert_eq!(c_ctx, s_ctx);
+
+    // RFC 5705 §4 — `None` vs `Some(&[])` MUST differ.
+    let mut c_empty = [0u8; 48];
+    client
+        .tls_exporter(b"EXPERIMENTAL-dtls", Some(&[]), &mut c_empty)
+        .unwrap();
+    assert_ne!(c_out, c_empty);
+}
+
 /// DTLS 1.3 end-to-end loopback tests.
 mod dtls13 {
     use super::*;
@@ -285,6 +325,36 @@ mod dtls13 {
         let mut server =
             DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
         assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 exporter agrees on both sides
+    /// for a given `(label, context)`, and distinct contexts diverge.
+    #[test]
+    fn exporter_agrees_both_sides_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-exporter", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        let mut c_out = [0u8; 64];
+        let mut s_out = [0u8; 64];
+        client
+            .tls_exporter(b"EXPORTER-dtls-test", b"some context", &mut c_out)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPORTER-dtls-test", b"some context", &mut s_out)
+            .unwrap();
+        assert_eq!(c_out, s_out);
+
+        // Distinct contexts must yield distinct streams.
+        let mut c_other = [0u8; 64];
+        client
+            .tls_exporter(b"EXPORTER-dtls-test", b"other context", &mut c_other)
+            .unwrap();
+        assert_ne!(c_out, c_other);
     }
 
     /// DTLS 1.3 + Ed25519 server certificate: proves the generalised

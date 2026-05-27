@@ -261,6 +261,10 @@ pub struct DtlsClientConnection13 {
     pending_write_app_crypter: Option<RecordCrypter>,
     /// Negotiated cipher suite parameters (set when ServerHello arrives).
     suite: Option<SuiteParams>,
+    /// `exporter_master_secret` (RFC 8446 §7.5), retained after the
+    /// server-Finished derivation so [`Self::tls_exporter`] can be called
+    /// any number of times once the handshake completes.
+    exporter_secret: Option<Secret>,
 
     /// Peer cert chain (leaf first).
     cert_chain: Vec<Vec<u8>>,
@@ -329,6 +333,7 @@ impl DtlsClientConnection13 {
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
             suite: None,
+            exporter_secret: None,
             cert_chain: Vec::new(),
             leaf_key: None,
             alpn_negotiated: None,
@@ -357,6 +362,21 @@ impl DtlsClientConnection13 {
         } else {
             None
         }
+    }
+
+    /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 application-layer Exporter.
+    /// Derives `out.len()` bytes from the `exporter_master_secret` under
+    /// `(label, context)`. The derivation matches TLS 1.3's exporter —
+    /// DTLS 1.3 explicitly reuses the TLS 1.3 key schedule. Returns
+    /// `Err(InappropriateState)` until the handshake completes.
+    pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        let ems = self
+            .exporter_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out);
+        Ok(())
     }
 
     /// Drains pending UDP datagrams to send. Also drains any pending ACKs
@@ -929,7 +949,7 @@ impl DtlsClientConnection13 {
             );
             kl.log("EXPORTER_SECRET", &self.client_random, ems.as_slice());
         }
-        let _ = ems;
+        self.exporter_secret = Some(ems);
         // Stash the app keys; they're installed atomically below.
         self.pending_write_app_crypter = Some(RecordCrypter::new(
             suite.hash,
