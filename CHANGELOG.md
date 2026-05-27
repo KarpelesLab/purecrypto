@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/purecrypto/compare/v0.0.7...v0.0.8) - 2026-05-27
+
+### Added
+
+- *(tls)* RFC 7627 Extended Master Secret for TLS 1.2 + DTLS 1.2
+- *(quic,ffi)* C ABI surface (PcQuicCfg / PcQuic) + smoke test
+- *(quic,cli)* q_client / q_server subcommands over UDP loopback
+- *(quic)* key update + DATAGRAM frames + stateless reset recognition
+- *(quic)* Retry + address validation + path challenge + CID rotation
+- *(quic)* streams + flow control (RFC 9000 §2-§4)
+- *(quic)* RFC 9002 loss recovery + NewReno + ACK frame builder
+- *(quic)* QuicConnection — handshake-only client + server (RFC 9000 §17, §12)
+- *(tls)* QuicHooks seam — engine_mode + per-level hooks for QUIC
+- *(quic)* RFC 9001 §5 packet protection — crypto + pkt
+- *(quic)* RFC 9000 foundations — varint, PN, frames, transport params
+- *(tls)* SSLKEYLOGFILE support via Config::key_log
+- *(ffi)* memory-BIO TLS 1.2/1.3 + DTLS 1.2/1.3 (sans-I/O C ABI)
+- *(ffi)* ML-KEM, ML-DSA, SLH-DSA, RSA-PSS, RSA-OAEP, CSR, CRL
+- *(ffi)* AEAD, KW, KDF, HMAC widening, ECDH, X25519
+- *(cli)* kem, kex, pkeyutl, crl subcommands
+- *(cli)* mac, kdf, enc subcommands for HMAC + HKDF/PBKDF2/scrypt/Argon2 + AEAD encryption
+
+### Fixed
+
+- *(tests)* gate run_capture with #[cfg(unix)]
+- *(crypto,pqc,ffi,cli)* 10 MEDIUM hardening items
+- *(tls,x509)* 7 MEDIUM hardening items
+- *(quic)* 5 MEDIUM hardening items (Retry state, final_size, reset token,
+- *(tls)* enforce 0-RTT byte budget + TLS 1.3 ticket expiry
+- *(quic)* wire RFC 9002 loss recovery + NewReno into connection
+- *(quic)* cap CRYPTO reassembly + propagate active_connection_id_limit
+- *(ffi)* catch panics in pointer/i32-returning extern "C" functions
+- *(quic)* verify peer's TP CID echoes (RFC 9000 §7.3) — CRITICAL
+- *(cli)* s_client must drain pre-buffered plaintext before sock.read
+- *(cli)* drain pre-buffered plaintext after handshake; non-blocking -www
+- *(cli)* s_server -www must feed received bytes into TLS engine
+
+### Other
+
+- *(tls)* unified `tls::Config` for TLS+DTLS, client+server
+- full CLI + C-API coverage table; tests/ffi_smoke ties to public surface
+
 ## [0.0.7](https://github.com/KarpelesLab/purecrypto/compare/v0.0.6...v0.0.7) - 2026-05-26
 
 ### Added
