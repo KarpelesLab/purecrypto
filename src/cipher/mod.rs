@@ -13,6 +13,7 @@
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 
 mod aes;
+pub(crate) mod blowfish;
 mod cbc;
 mod ccm;
 mod cfb;
