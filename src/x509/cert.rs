@@ -988,6 +988,36 @@ fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
     Ok(out)
 }
 
+/// True if `mask` is a valid CIDR (contiguous) subnet mask: zero or more
+/// high-order 1-bits followed by zero or more low-order 0-bits, big-endian.
+/// `0.0.0.0`, `255.255.255.255`, and every `/n` in between (0..=len*8) pass;
+/// `0xff00ff00`, `0x80800000`, or any inverted / interleaved pattern fails.
+fn is_contiguous_cidr_mask(mask: &[u8]) -> bool {
+    // Treat the mask as a big-endian unsigned integer m. Then m is contiguous
+    // iff `m & (m + 1) == 0` after byte-wise NOT-folding into a u128, which we
+    // do per-octet to stay length-agnostic.
+    let mut seen_zero = false;
+    for &b in mask {
+        if seen_zero && b != 0 {
+            return false;
+        }
+        match b {
+            0x00 => seen_zero = true,
+            0xff => {}
+            // Within a single byte the bits must be a high-run of 1s, so
+            // !b + 1 must be a power of two (or zero).
+            other => {
+                seen_zero = true;
+                let inv = !other;
+                if inv & (inv.wrapping_add(1)) != 0 {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Parses a `GeneralSubtrees` (`SEQUENCE OF GeneralSubtree`) body.
 /// `GeneralSubtree ::= SEQUENCE { base GeneralName, minimum [0] DEFAULT 0,
 /// maximum [1] OPTIONAL }`. RFC 5280 §4.2.1.10 forbids both `minimum` (when
@@ -1010,11 +1040,22 @@ fn parse_subtrees(
             }
             // iPAddress [7] IMPLICIT OCTET STRING → primitive context 0x87.
             // RFC 5280 §4.2.1.10: constraint is `address || mask`,
-            // 8 bytes for IPv4 (4+4) or 32 bytes for IPv6 (16+16).
+            // 8 bytes for IPv4 (4+4) or 32 bytes for IPv6 (16+16). The mask
+            // MUST be in CIDR form — contiguous high-order 1-bits followed
+            // by contiguous low-order 0-bits (RFC 5280 §4.2.1.10 cites
+            // RFC 4632 for the CIDR notation). A non-contiguous mask such
+            // as 0xff00ff00 is rejected; otherwise an issuing CA could
+            // smuggle a constraint that matches in mask-space but rules
+            // out hosts the operator never intended to forbid (or vice
+            // versa).
             0x87 => match value.len() {
                 8 | 32 => {
                     let half = value.len() / 2;
-                    ip_out.push((value[..half].to_vec(), value[half..].to_vec()));
+                    let mask = &value[half..];
+                    if !is_contiguous_cidr_mask(mask) {
+                        return Err(Error::Malformed);
+                    }
+                    ip_out.push((value[..half].to_vec(), mask.to_vec()));
                 }
                 _ => return Err(Error::Malformed),
             },
@@ -1500,5 +1541,52 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let der = san_with_ip(&[10, 0, 0, 1, 99]);
         let mut out = alloc::vec::Vec::new();
         assert!(super::parse_ip_addresses(&der, &mut out).is_err());
+    }
+
+    #[test]
+    fn cidr_mask_accepts_canonical_and_rejects_non_contiguous() {
+        // Every valid /n prefix length for IPv4 passes.
+        for n in 0..=32u32 {
+            let mut mask = [0u8; 4];
+            let mut bits = n;
+            for byte in mask.iter_mut() {
+                let take = bits.min(8);
+                *byte = if take == 0 { 0 } else { 0xffu8 << (8 - take) };
+                bits -= take;
+            }
+            assert!(
+                super::is_contiguous_cidr_mask(&mask),
+                "rejected canonical /{n}: {mask:02x?}"
+            );
+        }
+        // Classic non-CIDR shapes are rejected.
+        assert!(!super::is_contiguous_cidr_mask(&[0xff, 0x00, 0xff, 0x00]));
+        assert!(!super::is_contiguous_cidr_mask(&[0x80, 0x80, 0x00, 0x00]));
+        assert!(!super::is_contiguous_cidr_mask(&[0xfe, 0xff, 0xff, 0xff])); // gap in MSB byte
+        // A byte that is itself non-contiguous (0x0f, 0xa5, ...) fails.
+        assert!(!super::is_contiguous_cidr_mask(&[0xff, 0xff, 0x0f, 0x00]));
+    }
+
+    #[test]
+    fn name_constraints_rejects_non_contiguous_ip_mask() {
+        use crate::der::encode_sequence;
+        // Forge a permittedSubtrees containing a single GeneralSubtree whose
+        // base is iPAddress [7] = addr (4) || mask (4), with the mask set to
+        // a non-CIDR shape (0xff00ff00). The parser must reject this rather
+        // than store it as a usable subtree.
+        let bad = [10u8, 0, 0, 0, 0xff, 0x00, 0xff, 0x00];
+        // iPAddress [7] IMPLICIT OCTET STRING — primitive context-specific 7.
+        let mut ip_tlv = alloc::vec::Vec::new();
+        ip_tlv.push(0x87);
+        ip_tlv.push(bad.len() as u8);
+        ip_tlv.extend_from_slice(&bad);
+        let subtree = encode_sequence(&ip_tlv);
+        // permittedSubtrees [0] IMPLICIT SEQUENCE OF GeneralSubtree
+        let mut perm = alloc::vec::Vec::new();
+        perm.push(0xA0); // context 0, constructed
+        perm.push(subtree.len() as u8);
+        perm.extend_from_slice(&subtree);
+        let body = encode_sequence(&perm);
+        assert!(super::parse_name_constraints(&body).is_err());
     }
 }

@@ -388,6 +388,18 @@ fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
         .map_err(|_| Error::BadCertificate)?;
     let leaf_ips = leaf.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
 
+    // Close the CN-fallback bypass: `verify_hostname` falls back to the
+    // subject commonName when the leaf has no SAN. The constraint loop
+    // below only iterates SAN entries, so a leaf with no SAN slips past
+    // every dNSName / iPAddress constraint trivially. When a CA in this
+    // chain declared name constraints, demand the leaf actually carry a
+    // SAN so the constraints can apply. Modern PKI (CA/B Forum BR
+    // §7.1.4.2) already requires SAN on server certs; this just refuses
+    // to validate constraint-bearing chains against a SAN-less leaf.
+    if leaf_dns.is_empty() && leaf_ips.is_empty() {
+        return Err(Error::BadCertificate);
+    }
+
     for nc in &cas_constraints {
         // Excluded subtrees: any match in any CA is fatal.
         for name in &leaf_dns {
@@ -1589,6 +1601,36 @@ mod tests {
             &[GeneralName::Dns(".bad.example".into())],
         );
         let leaf_sans = [GeneralName::Dns("host.bad.example".into())];
+        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn name_constraints_chain_rejects_san_less_leaf() {
+        // CN-fallback bypass: when any CA declares name constraints, a leaf
+        // without SAN slips past the constraint loop trivially (nothing to
+        // iterate over) and then `verify_hostname` would happily fall back
+        // to commonName matching. Refuse the chain instead.
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns(".good.example".into())],
+            &[],
+        );
+        // No SAN on the leaf — only a CN, which the bypass would route
+        // around constraints with.
+        let leaf_sans: [GeneralName; 0] = [];
         let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
 
         let mut store = RootCertStore::new();
