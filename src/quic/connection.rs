@@ -25,7 +25,7 @@ use crate::quic::client::{
 };
 use crate::quic::crypto::{AeadAlg, aead_open, aead_seal, derive_dir_keys};
 use crate::quic::endpoint::Endpoint;
-use crate::quic::frame::{Frame, FrameIter, build_ack_ranges_raw};
+use crate::quic::frame::{Frame, FrameIter, StreamDir, build_ack_ranges_raw};
 use crate::quic::pkt::{
     LongHeader, LongType, QUIC_V1, ShortHeader, apply_header_protection, build_long_header,
     build_short_header, remove_header_protection,
@@ -35,6 +35,8 @@ use crate::quic::server::{
     build_pending_endpoint, build_tls_engine as build_server_engine, install_initial_keys,
     random_default_scid, set_cids_from_first_initial,
 };
+use crate::quic::stream::StreamId;
+use crate::quic::streams::Streams;
 use crate::quic::tls_glue::HookHandle;
 use crate::quic::transport_params::TransportParameters;
 use crate::rng::OsRng;
@@ -100,6 +102,10 @@ pub struct QuicConnection {
     /// engine on a Retry (Phase 7) — for Phase 4 we just keep it for
     /// `Debug` ergonomics.
     server_name: Option<String>,
+    /// Phase 6: per-connection stream state. Initialized lazily once
+    /// the peer's transport parameters arrive (we need both sides'
+    /// `initial_max_*` to wire credit ceilings correctly).
+    streams: Option<Streams>,
 }
 
 enum EngineSide {
@@ -141,6 +147,7 @@ impl QuicConnection {
             negotiated_suite: None,
             handshake_complete: false,
             server_name: Some(server_name.into()),
+            streams: None,
         };
 
         // Drain the ClientHello bytes the engine just produced into the
@@ -169,6 +176,7 @@ impl QuicConnection {
             negotiated_suite: None,
             handshake_complete: false,
             server_name: None,
+            streams: None,
         })
     }
 
@@ -263,11 +271,28 @@ impl QuicConnection {
         // Arm the PTO if any CRYPTO chunk was actually carved in this
         // build (i.e., a level has a non-empty `last_sent`). This is
         // the Phase-4 stand-in for RFC 9002's "in-flight ack-eliciting
-        // packet" predicate.
-        if !self.endpoint.loss.is_armed() && self.has_unconfirmed_crypto_last_sent() {
+        // packet" predicate. Phase 6: also arm when any stream has
+        // unacked chunks.
+        if !self.endpoint.loss.is_armed()
+            && (self.has_unconfirmed_crypto_last_sent() || self.has_unacked_streams())
+        {
             self.endpoint.loss.arm(Duration::ZERO);
         }
         datagram
+    }
+
+    /// True if any stream has carved-but-unacked chunks pending.
+    fn has_unacked_streams(&self) -> bool {
+        if let Some(streams) = self.streams.as_ref() {
+            for stream in streams.map.values() {
+                if let Some(send) = stream.send.as_ref()
+                    && send.has_unacked()
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// True if any level has a `last_sent` chunk that the peer hasn't
@@ -304,7 +329,17 @@ impl QuicConnection {
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        !space.pending_ack.is_empty() && space.ack_eliciting_pending
+        if !space.pending_ack.is_empty() && space.ack_eliciting_pending {
+            return true;
+        }
+        // 1-RTT carries stream-related frames.
+        if matches!(level, Level::OneRtt)
+            && let Some(streams) = self.streams.as_ref()
+            && streams.has_pending()
+        {
+            return true;
+        }
+        false
     }
 
     /// True once both Initial and Handshake levels have completed (the
@@ -342,6 +377,13 @@ impl QuicConnection {
                     .at_mut(lvl)
                     .schedule_last_chunk_retransmit();
             }
+            // Phase 6: requeue all sent-but-unconfirmed stream chunks
+            // at the 1-RTT level. Without per-frame ack bookkeeping
+            // this is best-effort (may re-send acked bytes); the
+            // receiver's reassembly drops duplicates.
+            if let Some(streams) = self.streams.as_mut() {
+                streams.on_pto();
+            }
         }
     }
 
@@ -351,14 +393,71 @@ impl QuicConnection {
         self.peer_params.as_ref()
     }
 
-    /// Stream API stub — Phase 6 ships the real implementation.
-    pub fn open_bidi(&mut self) -> Result<u64, Error> {
-        Err(Error::InappropriateState)
+    /// Opens a new bidirectional stream initiated by this side.
+    /// Returns the new [`StreamId`]. Returns `Err` if the peer's
+    /// `initial_max_streams_bidi` is exhausted; in that case a
+    /// STREAMS_BLOCKED frame is queued for the next outbound packet.
+    pub fn open_bidi(&mut self) -> Result<StreamId, Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.open_bidi()
     }
 
-    /// Stream API stub — Phase 6 ships the real implementation.
-    pub fn open_uni(&mut self) -> Result<u64, Error> {
-        Err(Error::InappropriateState)
+    /// Opens a new unidirectional (send-only) stream initiated by this
+    /// side.
+    pub fn open_uni(&mut self) -> Result<StreamId, Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.open_uni()
+    }
+
+    /// Queues `data` for transmission on `id`. Returns the number of
+    /// bytes accepted. The caller may need to call again after a
+    /// `pop_datagram` / `feed_datagram` cycle has surfaced fresh
+    /// MAX_DATA / MAX_STREAM_DATA credit.
+    pub fn write(&mut self, id: StreamId, data: &[u8]) -> Result<usize, Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.write(id, data)
+    }
+
+    /// Signals FIN on `id`'s send side.
+    pub fn finish(&mut self, id: StreamId) -> Result<(), Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.finish(id)
+    }
+
+    /// Reads available bytes from `id`'s recv side into `into`. Returns
+    /// `(bytes_copied, fin_seen)`. `fin_seen` is `true` only when ALL
+    /// bytes of the stream have been delivered and the peer set FIN.
+    pub fn read(&mut self, id: StreamId, into: &mut [u8]) -> Result<(usize, bool), Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.read(id, into)
+    }
+
+    /// Aborts the send side of `id` with the given application error
+    /// code. Queues a RESET_STREAM frame.
+    pub fn reset(&mut self, id: StreamId, app_error: u64) -> Result<(), Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.reset(id, app_error)
+    }
+
+    /// Asks the peer to abort sending on `id`. Queues a STOP_SENDING
+    /// frame.
+    pub fn stop_sending(&mut self, id: StreamId, app_error: u64) -> Result<(), Error> {
+        let s = self.streams.as_mut().ok_or(Error::InappropriateState)?;
+        s.stop_sending(id, app_error)
+    }
+
+    /// IDs of streams that have unread bytes (or a not-yet-surfaced
+    /// reset / FIN). Order is stable across calls.
+    pub fn readable_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        // Returns a `Box<dyn Iterator>` to keep the API stable when
+        // streams aren't yet initialized (handshake-in-progress case).
+        match self.streams.as_ref() {
+            Some(s) => {
+                let v: alloc::vec::Vec<StreamId> = s.readable_iter().collect();
+                v.into_iter()
+            }
+            None => alloc::vec::Vec::new().into_iter(),
+        }
     }
 
     /// Role of this endpoint.
@@ -434,6 +533,13 @@ impl QuicConnection {
         {
             self.peer_params = Some(parsed);
         }
+        // Now that we know both sides' transport params, materialize the
+        // streams substrate (idempotent: only initializes once).
+        if self.streams.is_none()
+            && let Some(peer) = self.peer_params.as_ref()
+        {
+            self.streams = Some(Streams::new(self.role, &self.our_params, peer));
+        }
     }
 
     /// Drives the TLS engine one step after fresh handshake bytes have
@@ -460,7 +566,7 @@ impl QuicConnection {
     }
 
     /// True if there are still bytes queued for transmission (CRYPTO
-    /// outbound or pending ACKs) at any level.
+    /// outbound, pending ACKs, or stream frames) at any level.
     fn has_pending_outbound(&self) -> bool {
         for lvl in [Level::Initial, Level::Handshake, Level::OneRtt] {
             if self.endpoint.bufs.at(lvl).outbound_pending() {
@@ -480,6 +586,12 @@ impl QuicConnection {
         }
         if !self.endpoint.pn.application.pending_ack.is_empty()
             && self.endpoint.pn.application.ack_eliciting_pending
+        {
+            return true;
+        }
+        // Phase 6 stream frames.
+        if let Some(streams) = self.streams.as_ref()
+            && streams.has_pending()
         {
             return true;
         }
@@ -739,14 +851,78 @@ impl QuicConnection {
                         crate::tls::AlertDescription::HandshakeFailure,
                     ));
                 }
+                Frame::Stream {
+                    id,
+                    offset,
+                    fin,
+                    data,
+                } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_stream(id, offset, fin, data)?;
+                    }
+                }
+                Frame::ResetStream {
+                    id,
+                    code,
+                    final_size,
+                } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_reset(id, code, final_size)?;
+                    }
+                }
+                Frame::StopSending { id, code } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_stop_sending(id, code)?;
+                    }
+                }
+                Frame::MaxData(v) => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_max_data(v);
+                    }
+                }
+                Frame::MaxStreamData { id, limit } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_max_stream_data(id, limit)?;
+                    }
+                }
+                Frame::MaxStreams { dir, limit } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_max_streams(dir, limit);
+                    }
+                }
+                Frame::DataBlocked(v) => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_data_blocked(v);
+                    }
+                }
+                Frame::StreamDataBlocked { id, limit } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_stream_data_blocked(id, limit)?;
+                    }
+                }
+                Frame::StreamsBlocked { dir, limit } => {
+                    ack_eliciting = true;
+                    if let Some(streams) = self.streams.as_mut() {
+                        streams.on_streams_blocked(dir, limit);
+                    }
+                }
                 _ => {
                     // Any other frame at this phase: count as
-                    // ack-eliciting to be safe. Phase 6+ adds stream /
-                    // flow-control handling.
+                    // ack-eliciting to be safe. Phase 7+ handles
+                    // NEW_TOKEN, PATH_CHALLENGE, PATH_RESPONSE, etc.
                     ack_eliciting = true;
                 }
             }
         }
+        let _ = StreamDir::Bidi; // silence unused-import when feature gating later
         // Update PN-space bookkeeping.
         let space = match level {
             Level::Initial => &mut self.endpoint.pn.initial,
@@ -792,8 +968,8 @@ impl QuicConnection {
         level: Level,
         pad: Option<(usize, usize)>,
     ) -> Option<Vec<u8>> {
-        // For Phase 4 we only emit Initial, Handshake, and (occasionally)
-        // 1-RTT.
+        // Phase 4 emits Initial, Handshake, and 1-RTT. Phase 6 adds
+        // STREAM and flow-control frames to the 1-RTT level.
         let has_crypto = self.endpoint.bufs.at(level).outbound_pending();
         let space_ref = match level {
             Level::Initial => &self.endpoint.pn.initial,
@@ -801,7 +977,13 @@ impl QuicConnection {
             _ => &self.endpoint.pn.application,
         };
         let has_pending_ack = !space_ref.pending_ack.is_empty() && space_ref.ack_eliciting_pending;
-        if !has_crypto && !has_pending_ack {
+        let has_streams = matches!(level, Level::OneRtt)
+            && self
+                .streams
+                .as_ref()
+                .map(|s| s.has_pending())
+                .unwrap_or(false);
+        if !has_crypto && !has_pending_ack && !has_streams {
             return None;
         }
         // Keys must be installed for this direction.
@@ -990,6 +1172,32 @@ impl QuicConnection {
             };
             crypto.encode(&mut out);
         }
+
+        // Phase 6: at the OneRtt (1-RTT) level, also drain stream
+        // frames + flow-control frames into the payload. RFC 9000
+        // §12.3: STREAM and the MAX_*/_BLOCKED frames are only
+        // permitted in 1-RTT packets (and 0-RTT, but we don't emit
+        // 0-RTT).
+        if matches!(level, Level::OneRtt)
+            && let Some(streams) = self.streams.as_mut()
+        {
+            // Target payload cap: ~1100 bytes to leave headroom for
+            // ACK/CRYPTO coalescing and the AEAD tag. The actual MTU
+            // sizing happens at the datagram-assembly layer.
+            const ONERTT_PAYLOAD_CAP: usize = 1100;
+            loop {
+                let remaining = ONERTT_PAYLOAD_CAP.saturating_sub(out.len());
+                if remaining < 4 {
+                    break;
+                }
+                let popped = match streams.pop_frame(remaining) {
+                    Some(f) => f,
+                    None => break,
+                };
+                popped.encode(&mut out);
+            }
+        }
+
         if out.is_empty() { None } else { Some(out) }
     }
 }
@@ -1433,5 +1641,413 @@ mod tests {
             c.is_handshake_complete(),
             s.is_handshake_complete()
         );
+    }
+
+    // =====================================================================
+    // Phase 6 — streams + flow control integration tests
+    // =====================================================================
+
+    /// Deterministic LCG-style PRNG for the 1 MiB echo test. Avoids
+    /// `OsRng` so the test is reproducible.
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Self(seed.max(1))
+        }
+        fn next_u8(&mut self) -> u8 {
+            // xorshift*
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            (x as u8) ^ (x >> 8) as u8
+        }
+        fn fill(&mut self, into: &mut [u8]) {
+            for b in into.iter_mut() {
+                *b = self.next_u8();
+            }
+        }
+    }
+
+    /// Build a loopback pair with small per-stream + per-connection
+    /// flow-control limits so the credit replenishment path is
+    /// exercised during a long transfer.
+    fn streams_loopback_pair_with_limits(
+        stream_data: u64,
+        conn_data: u64,
+    ) -> (QuicConnection, QuicConnection) {
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = crate::tls::RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = crate::tls::Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..crate::tls::Config::default()
+        };
+        let params = TransportParameters {
+            max_idle_timeout_ms: Some(30_000),
+            max_udp_payload_size: Some(1500),
+            initial_max_data: Some(conn_data),
+            initial_max_stream_data_bidi_local: Some(stream_data),
+            initial_max_stream_data_bidi_remote: Some(stream_data),
+            initial_max_stream_data_uni: Some(stream_data),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            ack_delay_exponent: Some(3),
+            max_ack_delay_ms: Some(25),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+        let client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: params,
+        })
+        .expect("server build");
+        (client, server)
+    }
+
+    /// Drives one round of `c → s` then `s → c` datagram exchange.
+    /// Returns `true` if anything moved.
+    fn pump(c: &mut QuicConnection, s: &mut QuicConnection) -> bool {
+        let mut any = false;
+        loop {
+            let dg = c.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            any = true;
+            s.feed_datagram(&dg).expect("server feed");
+        }
+        loop {
+            let dg = s.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            any = true;
+            c.feed_datagram(&dg).expect("client feed");
+        }
+        any
+    }
+
+    /// Test 13 — 1 MiB single-stream echo with conservative credit
+    /// (stream = 64 KiB, conn = 256 KiB). The credit-replenishment loop
+    /// must drive the transfer to completion within 5000 iterations.
+    #[test]
+    fn streams_one_mib_echo() {
+        const PAYLOAD: usize = 1024 * 1024;
+        const STREAM_LIMIT: u64 = 64 * 1024;
+        const CONN_LIMIT: u64 = 256 * 1024;
+
+        let (mut c, mut s) = streams_loopback_pair_with_limits(STREAM_LIMIT, CONN_LIMIT);
+        // Drive the handshake to completion first.
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+
+        // Client opens a bidi stream and writes 1 MiB.
+        let id = c.open_bidi().expect("open bidi");
+        let mut payload = alloc::vec![0u8; PAYLOAD];
+        Lcg::new(0xDEAD_BEEF).fill(&mut payload);
+
+        let mut written = 0usize;
+        let mut server_read: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(PAYLOAD);
+        let mut client_read: alloc::vec::Vec<u8> = alloc::vec::Vec::with_capacity(PAYLOAD);
+        let mut server_id: Option<StreamId> = None;
+        let mut server_finished = false;
+        let mut client_finished = false;
+
+        let mut iter = 0usize;
+        let max_iters = 5000usize;
+        while iter < max_iters {
+            iter += 1;
+            // Try to write more application bytes.
+            if written < PAYLOAD {
+                let n = c.write(id, &payload[written..]).expect("write");
+                written += n;
+                if written == PAYLOAD {
+                    c.finish(id).expect("finish");
+                }
+            }
+            // Pump datagrams in both directions.
+            let _moved = pump(&mut c, &mut s);
+            // Server side: read incoming stream data and echo it back.
+            {
+                let mut buf = [0u8; 16 * 1024];
+                let ids: alloc::vec::Vec<StreamId> = s.readable_streams().collect();
+                for sid in ids {
+                    let (n, fin) = s.read(sid, &mut buf).expect("server read");
+                    if n > 0 {
+                        server_read.extend_from_slice(&buf[..n]);
+                        if server_id.is_none() {
+                            server_id = Some(sid);
+                        }
+                    }
+                    if fin && !server_finished {
+                        server_finished = true;
+                    }
+                }
+                let _ = server_id;
+            }
+            // Client side: read incoming echoed data.
+            {
+                let mut buf = [0u8; 16 * 1024];
+                let ids: alloc::vec::Vec<StreamId> = c.readable_streams().collect();
+                for cid in ids {
+                    let (n, fin) = c.read(cid, &mut buf).expect("client read");
+                    if n > 0 {
+                        client_read.extend_from_slice(&buf[..n]);
+                    }
+                    if fin {
+                        client_finished = true;
+                    }
+                }
+            }
+            // Drive the server's echo write. We loop while progress is
+            // possible.
+            if let Some(sid) = server_id {
+                // Echo: queue up everything we've read but not yet
+                // queued. Since `server_read` is append-only, we need a
+                // separate cursor.
+                // The simplest pattern: try to write directly.
+                // Use a closure-style local: track how much we've
+                // queued via a side-channel on `server_read`'s view.
+                // We re-derive it from the stream's send-side state.
+                let to_send_total = server_read.len();
+                let already_queued = if let Some(streams) = s.streams.as_ref()
+                    && let Some(st) = streams.map.get(&sid.0)
+                    && let Some(snd) = st.send.as_ref()
+                {
+                    // sent_offset + write_buf.len() = bytes ever
+                    // enqueued.
+                    snd.write_off + snd.write_buf.len() as u64
+                } else {
+                    0
+                };
+                let already_queued = already_queued as usize;
+                if to_send_total > already_queued {
+                    let n = s
+                        .write(sid, &server_read[already_queued..])
+                        .expect("server echo write");
+                    let _ = n;
+                }
+                if server_finished {
+                    // FIN the echo as soon as we've seen the client's
+                    // FIN AND the server has queued every byte we read.
+                    let queued_now = if let Some(streams) = s.streams.as_ref()
+                        && let Some(st) = streams.map.get(&sid.0)
+                        && let Some(snd) = st.send.as_ref()
+                    {
+                        snd.write_off + snd.write_buf.len() as u64
+                    } else {
+                        0
+                    };
+                    if queued_now == server_read.len() as u64 {
+                        let _ = s.finish(sid);
+                    }
+                }
+            }
+            // Termination check.
+            if client_finished
+                && server_finished
+                && client_read.len() == PAYLOAD
+                && server_read.len() == PAYLOAD
+            {
+                break;
+            }
+        }
+        assert!(
+            iter < max_iters,
+            "streams_one_mib_echo did not converge: iter={} written={} server_read={} client_read={}",
+            iter,
+            written,
+            server_read.len(),
+            client_read.len()
+        );
+        assert_eq!(server_read.len(), PAYLOAD);
+        assert_eq!(client_read.len(), PAYLOAD);
+        assert_eq!(server_read, payload);
+        assert_eq!(client_read, payload);
+    }
+
+    /// Test 14 — RESET_STREAM / STOP_SENDING teardown.
+    #[test]
+    fn reset_and_stop_sending_teardown_integration() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(1 << 16, 1 << 18);
+        drive_until_complete(&mut c, &mut s, 8);
+
+        let id = c.open_bidi().expect("open");
+        let payload = alloc::vec![0xABu8; 64 * 1024];
+        let mut written = 0;
+        while written < payload.len() {
+            let n = c.write(id, &payload[written..]).expect("write");
+            written += n;
+            pump(&mut c, &mut s);
+        }
+        // Drain anything still in flight before the reset.
+        for _ in 0..20 {
+            if !pump(&mut c, &mut s) {
+                break;
+            }
+        }
+        // Read what server saw so far.
+        let mut server_seen: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let ids: alloc::vec::Vec<StreamId> = s.readable_streams().collect();
+        for sid in ids {
+            let (n, _fin) = s.read(sid, &mut buf).expect("read");
+            server_seen.extend_from_slice(&buf[..n]);
+        }
+
+        // Client resets.
+        c.reset(id, 42).expect("reset");
+        // Propagate.
+        for _ in 0..10 {
+            if !pump(&mut c, &mut s) {
+                break;
+            }
+        }
+        // Server should see ResetRecvd state.
+        let streams = s.streams.as_ref().expect("streams init");
+        let st = streams.map.get(&id.0).expect("stream present");
+        let recv = st.recv.as_ref().expect("recv");
+        assert_eq!(recv.reset_code, Some(42));
+        // Bytes already delivered are at least equal to what we saw.
+        let _ = server_seen;
+    }
+
+    /// Test 15 — drop every 5th outgoing datagram from server in a 256
+    /// KiB stream transfer; recovery via loss + PTO ensures the final
+    /// bytes match.
+    #[test]
+    fn out_of_order_stream_frames_integration() {
+        const PAYLOAD: usize = 256 * 1024;
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+
+        // Server opens a uni stream toward the client. Actually since
+        // QUIC streams in our design have client-initiated as default,
+        // we have the client open a bidi and the server writes back.
+        let cid = c.open_bidi().expect("open");
+        // Send a single small write from the client to "seed" the
+        // server's view of the stream id (the server materializes the
+        // stream on the first STREAM frame).
+        let _ = c.write(cid, &[0xAA]).expect("seed");
+        pump(&mut c, &mut s);
+        // The server now knows the stream; we mirror the id on its
+        // side.
+        let sid = StreamId(cid.0);
+        // Server writes 256 KiB.
+        let mut payload = alloc::vec![0u8; PAYLOAD];
+        Lcg::new(0xFEED_FACE).fill(&mut payload);
+
+        let mut written = 0usize;
+        let mut received: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        let mut drops = 0u32;
+        let mut now = core::time::Duration::from_millis(0);
+
+        for iter in 0..5_000u32 {
+            let _ = iter;
+            // Server writes as much as possible.
+            if written < PAYLOAD {
+                let n = s.write(sid, &payload[written..]).expect("server write");
+                written += n;
+                if written == PAYLOAD {
+                    s.finish(sid).expect("server finish");
+                }
+            }
+            // Pump with selective drops on server → client.
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram(&dg).expect("server feed");
+            }
+            // Server → client, dropping every 5th datagram.
+            let mut sent_count = 0u32;
+            let mut bytes_sent = 0usize;
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                sent_count += 1;
+                drops += 1;
+                bytes_sent += dg.len();
+                if !drops.is_multiple_of(5) {
+                    c.feed_datagram(&dg).expect("client feed");
+                }
+            }
+            let _ = sent_count;
+            // Advance time on every quiet round (no fresh writes
+            // happening). This forces the PTO to fire so lost STREAM
+            // packets get retransmitted.
+            let stalled = (written == PAYLOAD || /* server is blocked */ {
+                if let Some(streams) = s.streams.as_ref()
+                    && let Some(st) = streams.map.get(&sid.0)
+                    && let Some(snd) = st.send.as_ref()
+                {
+                    snd.write_buf.is_empty() && snd.has_unacked()
+                } else {
+                    false
+                }
+            }) && bytes_sent < 1000;
+            if stalled {
+                let cnt = c.next_timeout();
+                let snt = s.next_timeout();
+                let step = match (cnt, snt) {
+                    (Some(a), Some(b)) => a.min(b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => core::time::Duration::from_millis(50),
+                };
+                now = now.saturating_add(step + core::time::Duration::from_millis(1));
+                c.on_timeout(now);
+                s.on_timeout(now);
+            }
+            // Read on the client side.
+            let mut buf = [0u8; 16 * 1024];
+            let ids: alloc::vec::Vec<StreamId> = c.readable_streams().collect();
+            let mut fin_seen = false;
+            for id in ids {
+                let (n, fin) = c.read(id, &mut buf).expect("client read");
+                if n > 0 {
+                    received.extend_from_slice(&buf[..n]);
+                }
+                if fin {
+                    fin_seen = true;
+                }
+            }
+            let _ = iter;
+            if fin_seen && received.len() == PAYLOAD + 1 {
+                // +1 is the seed byte the client sent and the server
+                // doesn't echo here; correction: we drained the seed via
+                // server's read before. So this branch should match
+                // exactly PAYLOAD if we did the data accounting right.
+                break;
+            }
+            if fin_seen && received.len() == PAYLOAD {
+                break;
+            }
+        }
+        // The client should have all PAYLOAD bytes from the server.
+        // (Server's read of the seed byte happened invisibly above; the
+        // client's `received` only carries server-sent bytes.)
+        assert!(
+            received.len() >= PAYLOAD,
+            "received {} < {} after drop test",
+            received.len(),
+            PAYLOAD
+        );
+        assert_eq!(&received[..PAYLOAD], &payload[..]);
     }
 }

@@ -32,9 +32,12 @@ pub(crate) mod loss;
 pub(crate) mod pkt;
 pub(crate) mod pn;
 pub(crate) mod server;
+pub(crate) mod stream;
+pub(crate) mod streams;
 pub(crate) mod tls_glue;
 pub mod transport_params;
 pub(crate) mod varint;
 
 pub use connection::{QuicConfig, QuicConnection, Role};
+pub use stream::StreamId;
 pub use transport_params::TransportParameters;
