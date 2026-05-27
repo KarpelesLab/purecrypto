@@ -579,6 +579,51 @@ impl BoxedRsaPrivateKey {
     pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
         Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
     }
+
+    /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
+    /// §6.2) with caller-supplied parameters, returning the DER-encoded
+    /// `EncryptedPrivateKeyInfo`.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn to_pkcs8_der_encrypted(
+        &self,
+        password: &[u8],
+        params: &crate::kdf::pbes2::Pbes2Params,
+        rng: &mut impl crate::rng::RngCore,
+    ) -> Vec<u8> {
+        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+    }
+
+    /// PEM-wrapped variant of [`to_pkcs8_der_encrypted`]
+    /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`, RFC 7468 §11).
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn to_pkcs8_pem_encrypted(
+        &self,
+        password: &[u8],
+        params: &crate::kdf::pbes2::Pbes2Params,
+        rng: &mut impl crate::rng::RngCore,
+    ) -> alloc::string::String {
+        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+    }
+
+    /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
+    /// PKCS#8 RSA private key.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_der_encrypted(
+        der: &[u8],
+        password: &[u8],
+    ) -> Result<Self, crate::der::Error> {
+        let inner =
+            crate::kdf::pbes2::decrypt(der, password).map_err(|_| crate::der::Error::Malformed)?;
+        Self::from_pkcs8_der(&inner)
+    }
+
+    /// PEM-wrapped variant of [`from_pkcs8_der_encrypted`].
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
+        let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
+            .map_err(|_| crate::der::Error::Malformed)?;
+        Self::from_pkcs8_der(&inner)
+    }
 }
 
 #[cfg(test)]
@@ -771,6 +816,59 @@ mod tests {
         assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
         assert!(pem.trim_end().ends_with("-----END PRIVATE KEY-----"));
         let parsed = BoxedRsaPrivateKey::from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), sk.to_pkcs1_der());
+    }
+
+    /// Full encrypted-PKCS#8 round trip on a real RSA key: encrypt to PEM
+    /// with PBES2 (AES-256-GCM + PBKDF2-HMAC-SHA256), parse back, and
+    /// verify the recovered key signs identically.
+    #[test]
+    fn rsa_encrypted_pkcs8_pem_roundtrip() {
+        let sk = gen_small_key(b"rsa-pkcs8-pem-enc");
+        let mut rng = HmacDrbg::<Sha256>::new(b"pbes2-enc", b"nonce", &[]);
+        let params = crate::kdf::pbes2::Pbes2Params {
+            // Tests run with a tiny iteration count for speed.
+            kdf: crate::kdf::pbes2::KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+            cipher: crate::kdf::pbes2::CipherChoice::Aes256Gcm,
+            salt_len: 16,
+        };
+        let pem = sk.to_pkcs8_pem_encrypted(b"swordfish", &params, &mut rng);
+        assert!(pem.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----\n"));
+        assert!(
+            pem.trim_end()
+                .ends_with("-----END ENCRYPTED PRIVATE KEY-----")
+        );
+
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_pem_encrypted(&pem, b"swordfish").unwrap();
+        // PKCS#1 export is byte-deterministic, so the re-serialized keys
+        // must match exactly.
+        assert_eq!(parsed.to_pkcs1_der(), sk.to_pkcs1_der());
+
+        // Wrong password is rejected.
+        assert!(BoxedRsaPrivateKey::from_pkcs8_pem_encrypted(&pem, b"wrong").is_err());
+
+        // Functional: the round-tripped key still signs and verifies.
+        let sig = parsed
+            .sign_pkcs1v15::<Sha256>(b"via encrypted pkcs8")
+            .unwrap();
+        sk.public_key()
+            .verify_pkcs1v15::<Sha256>(b"via encrypted pkcs8", &sig)
+            .unwrap();
+    }
+
+    /// Same round trip via AES-256-CBC (PKCS#7 padded), the other PBES2
+    /// cipher we support.
+    #[test]
+    fn rsa_encrypted_pkcs8_der_roundtrip_cbc() {
+        let sk = gen_small_key(b"rsa-pkcs8-der-cbc");
+        let mut rng = HmacDrbg::<Sha256>::new(b"pbes2-cbc", b"nonce", &[]);
+        let params = crate::kdf::pbes2::Pbes2Params {
+            kdf: crate::kdf::pbes2::KdfChoice::Pbkdf2HmacSha512 { iterations: 10_000 },
+            cipher: crate::kdf::pbes2::CipherChoice::Aes256Cbc,
+            salt_len: 16,
+        };
+        let der = sk.to_pkcs8_der_encrypted(b"pass", &params, &mut rng);
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_der_encrypted(&der, b"pass").unwrap();
         assert_eq!(parsed.to_pkcs1_der(), sk.to_pkcs1_der());
     }
 

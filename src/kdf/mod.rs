@@ -11,6 +11,8 @@ pub mod argon2;
 #[cfg(feature = "alloc")]
 pub mod bcrypt_pbkdf;
 mod hkdf;
+#[cfg(all(feature = "alloc", feature = "der"))]
+pub mod pbes2;
 mod pbkdf2;
 #[cfg(feature = "alloc")]
 pub mod scrypt;

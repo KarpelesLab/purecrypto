@@ -700,6 +700,47 @@ macro_rules! ml_dsa_level {
                     .map_err(|_| Error::Malformed)?;
                 Self::from_pkcs8_der(&der)
             }
+
+            /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 +
+            /// RFC 8018 §6.2), returning the DER-encoded
+            /// `EncryptedPrivateKeyInfo`.
+            #[cfg(all(feature = "der", feature = "kdf"))]
+            pub fn to_pkcs8_der_encrypted(
+                &self,
+                password: &[u8],
+                params: &crate::kdf::pbes2::Pbes2Params,
+                rng: &mut impl crate::rng::RngCore,
+            ) -> Vec<u8> {
+                crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+            }
+
+            /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`].
+            #[cfg(all(feature = "der", feature = "kdf"))]
+            pub fn to_pkcs8_pem_encrypted(
+                &self,
+                password: &[u8],
+                params: &crate::kdf::pbes2::Pbes2Params,
+                rng: &mut impl crate::rng::RngCore,
+            ) -> alloc::string::String {
+                crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+            }
+
+            /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it
+            /// back to a PKCS#8 ML-DSA private key.
+            #[cfg(all(feature = "der", feature = "kdf"))]
+            pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
+                let inner = crate::kdf::pbes2::decrypt(der, password)
+                    .map_err(|_| Error::Malformed)?;
+                Self::from_pkcs8_der(&inner)
+            }
+
+            /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
+            #[cfg(all(feature = "der", feature = "kdf"))]
+            pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
+                let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
+                    .map_err(|_| Error::Malformed)?;
+                Self::from_pkcs8_der(&inner)
+            }
         }
 
         impl $pk {
