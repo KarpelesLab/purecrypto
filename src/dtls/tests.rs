@@ -665,4 +665,112 @@ mod dtls13 {
         assert!(pump_handshake_13(&mut client, &mut server));
         assert_eq!(client.negotiated_cipher_suite(), Some(0x1301));
     }
+
+    /// Multi-group negotiation (RFC 8446 §4.2.7-8): when the client offers
+    /// only P-256, the server must derive the ECDHE shared secret over
+    /// P-256 and the handshake must complete with an app-data round trip.
+    #[test]
+    fn negotiates_p256() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![NamedGroup::SECP256R1];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-p256", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-p256", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        client.send(b"ping-p256").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-p256");
+    }
+
+    /// Multi-group negotiation: the X25519+ML-KEM-768 hybrid
+    /// (draft-ietf-tls-ecdhe-mlkem). Client offers only the hybrid; the
+    /// server encapsulates against the client's ML-KEM key and the
+    /// handshake completes with an app-data round trip.
+    #[test]
+    fn negotiates_mlkem768() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![NamedGroup::X25519MLKEM768];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-mlkem", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-mlkem", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        client.send(b"ping-mlkem").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-mlkem");
+
+        server.send(b"pong-mlkem").unwrap();
+        let s = server.pop_outbound_datagrams();
+        for dg in &s {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong-mlkem");
+    }
+
+    /// HRR-driven group upgrade (RFC 8446 §4.1.4): client offers all three
+    /// groups in `supported_groups` but only sends a `key_share` for
+    /// P-256. The server prefers X25519MLKEM768 and issues an HRR
+    /// requesting that group; the client retries with the hybrid share
+    /// and the handshake completes. With cookies disabled, the only HRR
+    /// sent is the group-upgrade one.
+    #[test]
+    fn hrr_upgrades_group() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        // Advertise all three groups; ship only a P-256 key_share so the
+        // server has to HRR for its preferred (X25519MLKEM768) group.
+        client_cfg.groups = alloc::vec![
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::X25519,
+            NamedGroup::SECP256R1,
+        ];
+        client_cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-hrr", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-hrr", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        client.send(b"ping-hrr").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-hrr");
+    }
 }

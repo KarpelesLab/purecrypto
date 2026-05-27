@@ -24,13 +24,14 @@
 
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
-use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
+use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, SignatureScheme,
-    hs_type, with_len_u16, with_len_u24,
+    hs_type, put_u16, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::sign::sign_certificate_verify;
 use crate::tls::crypto::{
@@ -153,6 +154,11 @@ pub struct DtlsServerConnection13<R: RngCore> {
     out_msg_seq: u16,
     /// Reassembler for inbound handshake messages.
     reassembler: Option<Reassembler>,
+    /// Pre-handshake reassembler for the (possibly fragmented) initial
+    /// ClientHello and post-HRR CH2. A multi-group offer (X25519 + P-256 +
+    /// ML-KEM-768) overflows the per-record fragment budget, so CH may arrive
+    /// in multiple records before we've allocated `reassembler`.
+    pre_state_reasm: Option<Reassembler>,
 
     out_dgrams: Vec<Vec<u8>>,
     app_in: Vec<u8>,
@@ -170,7 +176,11 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// any encrypted record can otherwise replay it indefinitely.
     read_replay: crate::dtls::replay::AntiReplayWindow,
 
-    /// Ephemeral X25519 key.
+    /// Ephemeral X25519 key (kept across the handshake for keylog
+    /// correlation; the shared secret is derived inline). Unused once we
+    /// pick a non-X25519 group, but retained for symmetry with the wider
+    /// connection state.
+    #[allow(dead_code)]
     x25519: Option<X25519PrivateKey>,
 
     client_random: Option<Random>,
@@ -199,6 +209,9 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Negotiated cipher suite parameters (set once we pick a suite from
     /// the cookie-validated CH).
     suite: Option<SuiteParams>,
+    /// Group selected for HelloRetryRequest, if any. When set, CH2 must
+    /// carry a `key_share` for this group (RFC 8446 §4.1.4 / §4.2.8).
+    hrr_selected_group: Option<NamedGroup>,
 
     /// Pending ACKs to emit.
     pending_acks: Vec<RecordNumber>,
@@ -222,6 +235,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             state: State::WaitFirstClientHello,
             out_msg_seq: 0,
             reassembler: None,
+            pre_state_reasm: None,
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
             plain_write_epoch: 0,
@@ -248,6 +262,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
             suite: None,
+            hrr_selected_group: None,
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
@@ -443,17 +458,42 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let frag = read_fragment(&plain[off..])?;
             let consumed = frag.len;
             if self.reassembler.is_none() {
-                // Pre-state cookie path: only ClientHello allowed.
+                // Pre-state path: only ClientHello allowed. A multi-group
+                // offer overflows the per-record fragment budget, so CH may
+                // arrive in several records — feed them through a temporary
+                // reassembler (RFC 9147 §5.5) and only dispatch once the
+                // full body is in hand.
                 if frag.msg_type != hs_type::CLIENT_HELLO {
                     return Err(Error::UnexpectedMessage);
                 }
-                if frag.fragment_offset != 0 || (frag.fragment.len() as u32) != frag.total_length {
-                    return Err(Error::Decode);
-                }
-                let body = frag.fragment.to_vec();
                 let msg_seq = frag.message_seq;
+                let f = HandshakeFragment {
+                    msg_type: frag.msg_type,
+                    total_length: frag.total_length,
+                    message_seq: frag.message_seq,
+                    fragment_offset: frag.fragment_offset,
+                    fragment: frag.fragment,
+                    len: frag.len,
+                };
                 off += consumed;
-                self.handle_pre_state_client_hello(msg_seq, &body)?;
+                let reasm = self.pre_state_reasm.get_or_insert_with(|| {
+                    // Catch up to whatever message_seq the client used
+                    // (CH2 after a group-HRR is msg_seq=1, after a
+                    // cookie-HRR is also msg_seq=1).
+                    let mut r = Reassembler::new();
+                    for s in 0..msg_seq {
+                        let mut buf = Vec::new();
+                        write_message(&mut buf, hs_type::CLIENT_HELLO, s, b"", 0);
+                        if let Ok(empty) = read_fragment(&buf) {
+                            let _ = r.feed(empty);
+                        }
+                    }
+                    r
+                });
+                if let Some((_mt, body)) = reasm.feed(f) {
+                    self.pre_state_reasm = None;
+                    self.handle_pre_state_client_hello(msg_seq, &body)?;
+                }
                 continue;
             }
             let frag = HandshakeFragment {
@@ -522,8 +562,38 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .find(|s| ch.cipher_suites.contains(&s.suite))
             .ok_or(Error::HandshakeFailure)?;
 
+        // Parse offered groups + offered shares. We need them both to
+        // detect "send HRR-for-group-change" and to pick a share.
+        let groups_ext = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
+            .ok_or(Error::HandshakeFailure)?;
+        let offered_groups = parse_supported_groups(groups_ext)?;
+        let ks_ext =
+            ext::find(&ch.extensions, ExtensionType::KEY_SHARE).ok_or(Error::HandshakeFailure)?;
+        let client_shares = ext::parse_client_key_shares(ks_ext)?;
+
+        // Preferred group from `supported_groups`, in this server's order
+        // (RFC 8446 §4.2.7 — server picks the first mutually-acceptable
+        // entry). Mirrors the TLS layer's preference at
+        // `src/tls/conn/server.rs:1106-1118`.
+        let preferred_group = supported_server_groups()
+            .iter()
+            .copied()
+            .find(|g| offered_groups.contains(g));
+
+        // Share for the preferred group, if any.
+        let preferred_share =
+            preferred_group.and_then(|g| client_shares.iter().find(|(sg, _)| *sg == g).cloned());
+
         if cookie_required && presented_cookie.is_none() {
-            // First CH: emit HRR with a freshly-minted cookie.
+            // First CH: emit HRR with a freshly-minted cookie. Also embed a
+            // `key_share(selected_group)` if the client didn't already
+            // present a share for our preferred group — RFC 8446 §4.1.4
+            // forbids a second HRR, so we combine cookie + group here.
+            let group_needed = if preferred_share.is_none() {
+                preferred_group.ok_or(Error::HandshakeFailure)?.into()
+            } else {
+                None
+            };
             let secret = self
                 .config
                 .cookie_secret
@@ -532,14 +602,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let cg = CookieGenerator::new(*secret);
             let now_min = (self.last_now.as_secs() / 60) as u32;
             let cookie = cg.generate(&self.peer_addr, &ch.random, now_min);
-            // Pin the suite chosen from CH1 so HRR can carry it.
+            // Pin the suite and (optionally) the requested group.
             self.suite = Some(suite);
+            self.hrr_selected_group = group_needed;
             // Transcript: per RFC 8446 §4.4.1, when HRR is in play, the
             // transcript replaces CH1 with `message_hash(CH1)`. We commit
             // the transcript hash now that the suite is selected, then
             // park the CH1 bytes; the CH2 path replays them through
             // `replace_with_message_hash`.
-            self.emit_hello_retry_request(&cookie)?;
+            self.emit_hello_retry_request(Some(&cookie))?;
             self.state = State::WaitSecondClientHello;
             let mut t = Transcript::new();
             t.set_alg(suite.hash);
@@ -601,29 +672,62 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             // append the HRR and CH2.
             self.transcript.replace_with_message_hash();
             // Re-derive the HRR bytes so we can update the transcript.
-            let hrr_bytes = self.build_hrr_bytes(cookie);
+            let hrr_bytes = self.build_hrr_bytes(Some(cookie), self.hrr_selected_group);
             self.transcript.update(&hrr_bytes);
         } else {
-            // Cookie-off path: this is the only CH; pin the suite now.
-            self.suite = Some(suite);
+            // Cookie-off path: this is CH1 — but we may still need to send a
+            // group-change HRR. Detect that here. If we already sent a
+            // group-change HRR, this is CH2 and we expect `hrr_selected_group`
+            // to be set.
+            if self.hrr_selected_group.is_none() {
+                // Brand-new CH: decide whether to HRR for group.
+                if preferred_share.is_none() {
+                    let group_needed = preferred_group.ok_or(Error::HandshakeFailure)?;
+                    self.suite = Some(suite);
+                    self.hrr_selected_group = Some(group_needed);
+                    // Transcript: stash CH1 hash, then we'll replay via
+                    // message_hash on CH2.
+                    let mut t = Transcript::new();
+                    t.set_alg(suite.hash);
+                    let mut tls_ch = Vec::with_capacity(4 + body.len());
+                    tls_ch.push(hs_type::CLIENT_HELLO);
+                    let n = body.len() as u32;
+                    tls_ch.push(((n >> 16) & 0xff) as u8);
+                    tls_ch.push(((n >> 8) & 0xff) as u8);
+                    tls_ch.push((n & 0xff) as u8);
+                    tls_ch.extend_from_slice(body);
+                    t.update(&tls_ch);
+                    self.transcript = t;
+                    self.emit_hello_retry_request(None)?;
+                    self.state = State::WaitSecondClientHello;
+                    self.out_msg_seq = 1;
+                    let _ = msg_seq;
+                    return Ok(());
+                }
+                // No HRR needed: pin the suite for the CH1 path below.
+                self.suite = Some(suite);
+            } else {
+                // Cookie-off CH2 (post group-HRR). Replay the synthetic
+                // message_hash + HRR into the transcript.
+                self.transcript.replace_with_message_hash();
+                let hrr_bytes = self.build_hrr_bytes(None, self.hrr_selected_group);
+                self.transcript.update(&hrr_bytes);
+            }
         }
-        let groups_ext = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS)
-            .ok_or(Error::HandshakeFailure)?;
-        let groups = parse_supported_groups(groups_ext)?;
-        if !groups.contains(&NamedGroup::X25519) {
-            return Err(Error::HandshakeFailure);
-        }
-        let ks_ext =
-            ext::find(&ch.extensions, ExtensionType::KEY_SHARE).ok_or(Error::HandshakeFailure)?;
-        let client_shares = ext::parse_client_key_shares(ks_ext)?;
-        let (g, client_pub) = client_shares
-            .iter()
-            .find(|(g, _)| *g == NamedGroup::X25519)
-            .ok_or(Error::HandshakeFailure)?;
-        if *g != NamedGroup::X25519 {
-            return Err(Error::HandshakeFailure);
-        }
-        let client_pub = client_pub.clone();
+
+        // Pick the actual group + share to use this round.
+        let (selected_group, client_pub) = if let Some(g) = self.hrr_selected_group {
+            // CH2 path: must carry exactly the share we requested.
+            let share = client_shares
+                .iter()
+                .find(|(sg, _)| *sg == g)
+                .ok_or(Error::IllegalParameter)?;
+            (g, share.1.clone())
+        } else {
+            // No HRR: use the preferred share we found earlier.
+            let (g, k) = preferred_share.ok_or(Error::HandshakeFailure)?;
+            (g, k)
+        };
 
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         self.client_random = Some(ch.random);
@@ -636,9 +740,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         tls_ch.push(((n >> 8) & 0xff) as u8);
         tls_ch.push((n & 0xff) as u8);
         tls_ch.extend_from_slice(body);
-        if !cookie_required {
-            // Cookie-off path: this is CH1, transcript starts fresh under
-            // the just-picked suite's hash.
+        if !cookie_required && self.hrr_selected_group.is_none() {
+            // Cookie-off, no-HRR path: this is CH1, transcript starts fresh
+            // under the just-picked suite's hash.
             self.transcript = Transcript::new();
             self.transcript.set_alg(suite.hash);
         }
@@ -654,26 +758,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         self.reassembler = Some(reasm);
 
-        // Generate server random + ephemeral X25519.
+        // Generate server random + ephemeral key share for the selected
+        // group, derive the shared secret.
         let mut sr: Random = [0u8; 32];
         self.rng.fill_bytes(&mut sr);
         self.server_random = Some(sr);
-        let sk = X25519PrivateKey::generate(&mut self.rng);
-        let server_pub = sk.public_key().to_vec();
-        // ECDHE.
-        let client_peer: [u8; 32] = client_pub
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Decode)?;
-        // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject the all-zero DH output.
-        let shared = sk
-            .diffie_hellman(&client_peer)
-            .map_err(|_| Error::IllegalParameter)?;
-        self.x25519 = Some(sk);
+        let (server_pub, shared) = self.key_agreement(selected_group, &client_pub)?;
 
-        // ServerHello.
+        // ServerHello with the negotiated group's `key_share`.
         let sh_extensions = alloc::vec![
-            ext::server_key_share(NamedGroup::X25519, &server_pub),
+            ext::server_key_share(selected_group, &server_pub),
             ext::server_supported_versions(),
         ];
         let sh_bytes = ServerHello {
@@ -887,24 +981,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     }
 
     /// Builds the on-wire HRR bytes (4-byte TLS handshake header + body).
-    /// `cookie` is the raw cookie payload (no length prefix). Uses the
+    /// When present, `cookie` is the raw cookie payload (no length prefix)
+    /// and emits the `cookie` extension; when present, `group` emits the
+    /// `key_share(selected_group)` extension (RFC 8446 §4.2.8.1). Uses the
     /// suite pinned during CH1 processing — HRR commits to a single suite
     /// (RFC 8446 §4.1.4).
-    fn build_hrr_bytes(&self, cookie: &[u8]) -> Vec<u8> {
-        let extensions = alloc::vec![
-            ext::server_supported_versions(),
-            (
-                ExtensionType(EXT_COOKIE),
-                // cookie extension body: `opaque cookie<1..2^16-1>` →
-                // 2-byte u16 length prefix.
-                {
-                    let mut v = Vec::with_capacity(2 + cookie.len());
-                    v.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
-                    v.extend_from_slice(cookie);
-                    v
-                }
-            ),
-        ];
+    fn build_hrr_bytes(&self, cookie: Option<&[u8]>, group: Option<NamedGroup>) -> Vec<u8> {
+        let mut extensions = alloc::vec![ext::server_supported_versions(),];
+        if let Some(g) = group {
+            // HRR `key_share` body is just a u16 selected_group.
+            let mut body = Vec::with_capacity(2);
+            put_u16(&mut body, g.0);
+            extensions.push((ExtensionType::KEY_SHARE, body));
+        }
+        if let Some(c) = cookie {
+            // `opaque cookie<1..2^16-1>` → 2-byte u16 length prefix.
+            let mut v = Vec::with_capacity(2 + c.len());
+            v.extend_from_slice(&(c.len() as u16).to_be_bytes());
+            v.extend_from_slice(c);
+            extensions.push((ExtensionType(EXT_COOKIE), v));
+        }
         // HRR is only emitted after `self.suite` is pinned during CH1
         // processing; fall back to the highest-preference suite if (somehow)
         // not set — this keeps the call total without taking a Result.
@@ -921,8 +1017,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         .encode()
     }
 
-    fn emit_hello_retry_request(&mut self, cookie: &[u8]) -> Result<(), Error> {
-        let bytes = self.build_hrr_bytes(cookie);
+    fn emit_hello_retry_request(&mut self, cookie: Option<&[u8]>) -> Result<(), Error> {
+        let bytes = self.build_hrr_bytes(cookie, self.hrr_selected_group);
         let body = &bytes[4..];
         // HRR is a ServerHello with the magic random; msg_seq=0 (this is
         // the server's first outbound handshake message).
@@ -1072,6 +1168,79 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             self.out_dgrams.push(dg);
         }
     }
+
+    /// Generates the server-side ephemeral share and derives the
+    /// ECDHE/KEM shared secret for the negotiated group. Returns
+    /// `(server_public_key, shared_secret_bytes)` in the wire shapes used
+    /// by RFC 8446 §4.2.8 / draft-ietf-tls-ecdhe-mlkem §3.
+    fn key_agreement(
+        &mut self,
+        group: NamedGroup,
+        client_pub: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        match group {
+            NamedGroup::X25519 => {
+                let sk = X25519PrivateKey::generate(&mut self.rng);
+                let peer: [u8; 32] = client_pub.try_into().map_err(|_| Error::Decode)?;
+                // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject all-zero output.
+                let ss = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
+                let pk = sk.public_key().to_vec();
+                self.x25519 = Some(sk);
+                Ok((pk, ss.to_vec()))
+            }
+            NamedGroup::SECP256R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, client_pub)
+                    .map_err(|_| Error::Decode)?;
+                let ss = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((sk.public_key().to_sec1(), ss))
+            }
+            NamedGroup::X25519MLKEM768 => {
+                // Client share: ML-KEM-768 encapsulation key (1184) ‖ X25519 (32).
+                if client_pub.len() != ENCAPS_KEY_BYTES + 32 {
+                    return Err(Error::Decode);
+                }
+                let mut ek = [0u8; ENCAPS_KEY_BYTES];
+                ek.copy_from_slice(&client_pub[..ENCAPS_KEY_BYTES]);
+                let peer: [u8; 32] = client_pub[ENCAPS_KEY_BYTES..]
+                    .try_into()
+                    .map_err(|_| Error::Decode)?;
+                // FIPS 203 §7.2: validate the peer's encapsulation key
+                // before any cryptographic operation on it.
+                let validated_ek = MlKem768EncapsKey::from_bytes_validated(ek)
+                    .map_err(|_| Error::IllegalParameter)?;
+                let (ct, ml_ss) = validated_ek.encapsulate(&mut self.rng);
+                let sk = X25519PrivateKey::generate(&mut self.rng);
+                // RFC 8446 §7.4.2: reject all-zero X25519 contribution.
+                let x_ss = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::IllegalParameter)?;
+                // Server share: ML-KEM ciphertext ‖ X25519 key.
+                let mut share = ct.to_bytes().to_vec();
+                share.extend_from_slice(&sk.public_key());
+                // Combined secret: ML-KEM shared secret first, then X25519.
+                let mut combined = Vec::with_capacity(64);
+                combined.extend_from_slice(&ml_ss);
+                combined.extend_from_slice(&x_ss);
+                Ok((share, combined))
+            }
+            _ => Err(Error::HandshakeFailure),
+        }
+    }
+}
+
+/// Server-side group preference order, in descending preference. Mirrors
+/// the TLS layer's preference at `src/tls/conn/server.rs:1106-1118`.
+fn supported_server_groups() -> [NamedGroup; 3] {
+    [
+        NamedGroup::X25519MLKEM768,
+        NamedGroup::X25519,
+        NamedGroup::SECP256R1,
+    ]
 }
 
 fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Error> {
