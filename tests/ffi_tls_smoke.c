@@ -105,6 +105,32 @@ int main(void) {
   if (pc_tls_negotiated_version(client, &ver) != PC_OK || ver != 0x0304)
     return fail("negotiated version");
 
+  /* 7a. Cipher suite must be a TLS 1.3 code (0x1301 / 0x1302 / 0x1303). */
+  uint16_t cs = 0;
+  if (pc_tls_negotiated_cipher_suite(client, &cs) != PC_OK)
+    return fail("pc_tls_negotiated_cipher_suite");
+  if (cs != 0x1301 && cs != 0x1302 && cs != 0x1303)
+    return fail("unexpected cipher suite");
+  uint8_t cs_name[64];
+  size_t cs_name_len = sizeof(cs_name);
+  if (pc_tls_negotiated_cipher_suite_name(client, cs_name, &cs_name_len) != PC_OK)
+    return fail("pc_tls_negotiated_cipher_suite_name");
+  if (cs_name_len == 0) return fail("cipher suite name empty");
+
+  /* 7b. Server-side SNI: the client set "ffi-tls.test"; the server should see it. */
+  uint8_t sni[64];
+  size_t sni_len = sizeof(sni);
+  if (pc_tls_peer_server_name(server, sni, &sni_len) != PC_OK)
+    return fail("pc_tls_peer_server_name");
+  if (sni_len != strlen("ffi-tls.test")
+      || memcmp(sni, "ffi-tls.test", sni_len) != 0)
+    return fail("server didn't see expected SNI");
+  /* Client-side: no SNI to surface (only servers see peer SNI). */
+  sni_len = sizeof(sni);
+  if (pc_tls_peer_server_name(client, sni, &sni_len) != PC_OK)
+    return fail("pc_tls_peer_server_name client");
+  if (sni_len != 0) return fail("client should not surface SNI");
+
   /* 8. Application data: client -> server. */
   const uint8_t hello[] = "hello from ffi-tls C";
   if (pc_tls_send(client, hello, sizeof(hello) - 1) != PC_OK)

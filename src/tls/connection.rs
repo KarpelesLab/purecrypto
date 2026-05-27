@@ -290,6 +290,18 @@ impl Connection {
         }
     }
 
+    /// Server-side: the SNI host_name the client offered in the ClientHello
+    /// `server_name` extension (RFC 6066 §3). `None` for client engines,
+    /// for DTLS engines (no SNI plumbing yet), or when the peer omitted the
+    /// extension. Available once the ClientHello has been processed.
+    pub fn peer_server_name(&self) -> Option<&str> {
+        match &self.inner {
+            Engine::ServerTls13(c) => c.peer_server_name(),
+            Engine::ServerTls12(c) => c.peer_server_name(),
+            _ => None,
+        }
+    }
+
     /// The peer's certificate chain (leaf first, DER).
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         match &self.inner {

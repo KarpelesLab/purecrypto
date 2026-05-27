@@ -205,6 +205,41 @@ pub(crate) fn server_name(host: &str) -> RawExtension {
     (ExtensionType::SERVER_NAME, body)
 }
 
+/// Parses an incoming `server_name` (SNI) extension and returns the first
+/// `host_name` entry as a UTF-8 string. RFC 6066 §3 defines the list as
+/// `ServerName ServerNameList<1..2^16-1>` with name_type 0 = host_name (no
+/// other types are currently defined). Non-UTF-8 host names are rejected
+/// per the implicit ASCII restriction.
+///
+/// Returns `Ok(None)` only for the (RFC-forbidden) empty list case; any
+/// structural malformation returns `Err(Error::Decode)`. A non-host_name
+/// entry is skipped — RFC 6066 §3 says implementations SHOULD silently
+/// ignore unknown name_type values, so we keep the first host_name we find.
+pub(crate) fn parse_server_name(body: &[u8]) -> Result<Option<alloc::string::String>, Error> {
+    let mut outer = ReadCursor::new(body);
+    let list = outer.vec_u16()?;
+    outer.expect_empty()?;
+    if list.is_empty() {
+        // RFC 6066 forbids the empty list; reject explicitly rather than
+        // silently returning None.
+        return Err(Error::Decode);
+    }
+    let mut c = ReadCursor::new(list);
+    while !c.is_empty() {
+        let name_type = c.u8()?;
+        let name = c.vec_u16()?;
+        if name_type == 0 {
+            // host_name. RFC 6066 §3 says trailing-dot and IP literals are
+            // invalid here — leave that policy to higher layers; we only
+            // confirm the bytes form a valid UTF-8 string.
+            let s = core::str::from_utf8(name).map_err(|_| Error::Decode)?;
+            return Ok(Some(s.into()));
+        }
+        // Unknown name_type — skip per RFC 6066 §3.
+    }
+    Ok(None)
+}
+
 /// `key_share` for a ClientHello: a list of offered group/public-key entries.
 pub(crate) fn client_key_shares(shares: &[(NamedGroup, Vec<u8>)]) -> RawExtension {
     let mut body = Vec::new();
@@ -445,4 +480,53 @@ pub(crate) fn parse_server_pre_shared_key(body: &[u8]) -> Result<u16, Error> {
     let v = c.u16()?;
     c.expect_empty()?;
     Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Round-trip a single host_name through `server_name` ↔ `parse_server_name`.
+    #[test]
+    fn server_name_roundtrip() {
+        let (_, body) = server_name("example.test");
+        assert_eq!(
+            parse_server_name(&body).unwrap().as_deref(),
+            Some("example.test")
+        );
+    }
+
+    /// Empty ServerNameList is forbidden by RFC 6066 §3.
+    #[test]
+    fn parse_server_name_rejects_empty_list() {
+        // Outer list-length u16 = 0.
+        let body = [0u8, 0];
+        assert!(parse_server_name(&body).is_err());
+    }
+
+    /// Unknown name_type entries are silently skipped per RFC 6066 §3; if
+    /// no host_name follows, we surface `None` without erroring.
+    #[test]
+    fn parse_server_name_skips_unknown_name_type() {
+        // ServerNameList { name_type=99 (unknown), data=2 bytes "hi" }
+        // length: u16=5 (=1 + 2 + 2)
+        let mut body = Vec::new();
+        body.extend_from_slice(&5u16.to_be_bytes());
+        body.push(99); // unknown name_type
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(b"hi");
+        assert_eq!(parse_server_name(&body).unwrap(), None);
+    }
+
+    /// Non-UTF-8 host_name bytes are a malformed SNI extension.
+    #[test]
+    fn parse_server_name_rejects_non_utf8() {
+        // host_name with a lone 0xFF byte (invalid UTF-8).
+        let mut body = Vec::new();
+        body.extend_from_slice(&4u16.to_be_bytes()); // list length
+        body.push(0); // host_name
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.push(0xFF);
+        assert!(parse_server_name(&body).is_err());
+    }
 }

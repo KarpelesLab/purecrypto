@@ -443,6 +443,11 @@ pub struct ServerConnection<R: RngCore> {
     exporter_secret: Option<Secret>,
     /// ALPN protocol the server picked from the client's offer.
     alpn_negotiated: Option<Vec<u8>>,
+    /// SNI host_name parsed from the ClientHello `server_name` extension
+    /// (RFC 6066 §3). `None` if the client did not send the extension.
+    /// Surfaced via [`peer_server_name`](Self::peer_server_name) so the
+    /// caller can route on the requested hostname.
+    peer_server_name: Option<alloc::string::String>,
     /// `true` if the handshake was a PSK resumption.
     psk_used: bool,
     /// Set once after the handshake completes to drive one-shot
@@ -544,6 +549,7 @@ impl<R: RngCore> ServerConnection<R> {
             server_app_secret: None,
             exporter_secret: None,
             alpn_negotiated: None,
+            peer_server_name: None,
             psk_used: false,
             pending_nst: false,
             rms: None,
@@ -669,6 +675,13 @@ impl<R: RngCore> ServerConnection<R> {
     /// The ALPN protocol picked from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// SNI host_name the client offered in the `server_name` extension
+    /// (RFC 6066 §3). `None` if the client did not send the extension.
+    /// Available once the ClientHello has been processed.
+    pub fn peer_server_name(&self) -> Option<&str> {
+        self.peer_server_name.as_deref()
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, available
@@ -999,6 +1012,14 @@ impl<R: RngCore> ServerConnection<R> {
             if !ext::parse_signature_algorithms(sig_algs)?.contains(&our_scheme) {
                 return Err(Error::HandshakeFailure);
             }
+        }
+
+        // SNI: stash the client's offered host_name so multi-tenant servers can
+        // route on it. RFC 6066 §3 — silently ignore unknown name_type entries
+        // and surface the first host_name. A malformed extension body kills
+        // the handshake (Error::Decode maps to `decode_error`).
+        if let Some(sni_body) = ext::find(&ch.extensions, ExtensionType::SERVER_NAME) {
+            self.peer_server_name = ext::parse_server_name(sni_body)?;
         }
 
         // ALPN: pick our first preference that appears in the client's offer.

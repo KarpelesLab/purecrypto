@@ -710,6 +710,89 @@ pub unsafe extern "C" fn pc_tls_negotiated_version(tls: *const PcTls, out: *mut 
     })
 }
 
+/// Writes the IANA cipher-suite identifier of the negotiated suite to `*out`,
+/// or `0` if no suite has been selected yet (handshake not started / not yet
+/// past ServerHello). Always returns `Ok` once the pointer check passes.
+///
+/// Codes follow the IANA TLS Cipher Suite Registry:
+///   0x1301 TLS_AES_128_GCM_SHA256, 0x1302 TLS_AES_256_GCM_SHA384,
+///   0x1303 TLS_CHACHA20_POLY1305_SHA256, and the TLS 1.2 ECDHE-AEAD set
+///   (0xC02B/C02C/C02F/C030, 0xCCA8/CCA9).
+///
+/// # Safety
+/// `tls`, `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite(
+    tls: *const PcTls,
+    out: *mut u16,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let v = unsafe { &*tls }
+            .inner
+            .negotiated_cipher_suite()
+            .unwrap_or(0);
+        unsafe { *out = v };
+        PcStatus::Ok
+    })
+}
+
+/// Writes the IANA name of the negotiated cipher suite (e.g.
+/// `"TLS_AES_128_GCM_SHA256"`) into `out` as raw UTF-8 bytes (no trailing
+/// NUL — `*out_len` is the exact byte count, matching the convention used
+/// by [`pc_tls_alpn_selected`] / [`pc_tls_peer_server_name`]). When no suite
+/// is selected yet, `*out_len = 0` and `Ok` is returned.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite_name(
+    tls: *const PcTls,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let name: &[u8] = unsafe { &*tls }
+            .inner
+            .negotiated_cipher_suite_name()
+            .map(str::as_bytes)
+            .unwrap_or(&[]);
+        unsafe { out_write(name, out, out_len) }
+    })
+}
+
+/// Server-side: writes the SNI host_name the client offered in its
+/// ClientHello to `out` as raw UTF-8 bytes (no trailing NUL — `*out_len`
+/// is the exact byte count). If the client omitted the extension, or this
+/// is a client engine, or no ClientHello has been processed yet,
+/// `*out_len = 0` and `Ok` is returned.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_peer_server_name(
+    tls: *const PcTls,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if tls.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let name: &[u8] = unsafe { &*tls }
+            .inner
+            .peer_server_name()
+            .map(str::as_bytes)
+            .unwrap_or(&[]);
+        unsafe { out_write(name, out, out_len) }
+    })
+}
+
 /// Writes the negotiated ALPN protocol bytes (if any) to `out`. With no ALPN
 /// selected, `*out_len = 0` and `Ok` is returned.
 ///

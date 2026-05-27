@@ -446,7 +446,11 @@ pc_status pc_tls_close(PcTls *tls);
 
 int pc_tls_is_handshake_complete(const PcTls *tls);
 pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);
+pc_status pc_tls_negotiated_cipher_suite(const PcTls *tls, uint16_t *out);
+pc_status pc_tls_negotiated_cipher_suite_name(const PcTls *tls,
+                                              uint8_t *out, size_t *out_len);
 pc_status pc_tls_alpn_selected(const PcTls *tls, uint8_t *out, size_t *out_len);
+pc_status pc_tls_peer_server_name(const PcTls *tls, uint8_t *out, size_t *out_len);
 pc_status pc_tls_peer_certificate(const PcTls *tls, uint8_t *out, size_t *out_len);
 
 /* DTLS-only: timeout machinery. */

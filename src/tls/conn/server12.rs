@@ -295,6 +295,9 @@ pub struct ServerConnection12<R: RngCore> {
     server_random: Option<Random>,
     /// Negotiated ALPN, if any.
     alpn_negotiated: Option<Vec<u8>>,
+    /// SNI host_name parsed from the ClientHello `server_name` extension
+    /// (RFC 6066 §3); surfaced via [`peer_server_name`](Self::peer_server_name).
+    peer_server_name: Option<alloc::string::String>,
     /// Whether the peer sent a `renegotiation_info` extension — drives whether
     /// we echo our own per RFC 5746 §3.6.
     peer_offered_reneg_info: bool,
@@ -370,6 +373,7 @@ impl<R: RngCore> ServerConnection12<R> {
             client_random: None,
             server_random: None,
             alpn_negotiated: None,
+            peer_server_name: None,
             peer_offered_reneg_info: false,
             peer_offered_record_size_limit: false,
             master: None,
@@ -416,6 +420,13 @@ impl<R: RngCore> ServerConnection12<R> {
     /// The ALPN protocol the server selected, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// SNI host_name the client offered in the `server_name` extension
+    /// (RFC 6066 §3). `None` if the client did not send the extension.
+    /// Available once the ClientHello has been processed.
+    pub fn peer_server_name(&self) -> Option<&str> {
+        self.peer_server_name.as_deref()
     }
 
     /// The TLS 1.2 master secret derived during the handshake. `None` until
@@ -761,6 +772,13 @@ impl<R: RngCore> ServerConnection12<R> {
         let fmts = ext::parse_ec_point_formats(epf)?;
         if !fmts.contains(&0u8) {
             return Err(Error::HandshakeFailure);
+        }
+
+        // SNI: stash the host_name the client offered (RFC 6066 §3) so multi-
+        // tenant servers can route on it. Mirrors the TLS 1.3 path in
+        // server.rs::on_client_hello.
+        if let Some(sni_body) = ext::find(&ch.extensions, ExtensionType::SERVER_NAME) {
+            self.peer_server_name = ext::parse_server_name(sni_body)?;
         }
 
         // ALPN: if both sides have a non-empty offer, pick the first of OUR
