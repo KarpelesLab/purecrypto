@@ -33,6 +33,7 @@ pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A scalar or coordinate was out of range, or a point was invalid / the
     /// identity where it must not be.

@@ -31,6 +31,7 @@ pub use pkcs1::Pkcs1Digest;
 
 /// Errors produced by RSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The message (or encoded digest) is too long for the modulus.
     MessageTooLong,

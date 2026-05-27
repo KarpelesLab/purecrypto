@@ -123,6 +123,7 @@ impl AlertDescription {
 
 /// Errors produced by the TLS state machine.
 #[derive(Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// A message could not be decoded (maps to `decode_error`).
     Decode,

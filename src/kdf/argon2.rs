@@ -77,6 +77,7 @@ impl Argon2Params {
 
 /// Argon2 parameter-validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// One of the cost parameters is outside RFC 9106's permitted range, or
     /// the output buffer is too small / large.

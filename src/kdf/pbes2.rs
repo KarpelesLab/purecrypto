@@ -85,6 +85,7 @@ impl Default for Pbes2Params {
 
 /// Errors returned by [`decrypt`] / [`decrypt_pem`].
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Outer DER didn't parse as `EncryptedPrivateKeyInfo`, or the PEM
     /// label / Base64 body was malformed.

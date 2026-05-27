@@ -120,6 +120,7 @@ pub mod oid {
 
 /// Errors from X.509 encoding, parsing, and verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A DER/PEM decoding error.
     Der(crate::der::Error),

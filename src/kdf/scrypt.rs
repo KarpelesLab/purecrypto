@@ -27,6 +27,7 @@ use crate::kdf::pbkdf2;
 
 /// scrypt parameter-validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// One of `log_n`, `r`, `p`, or `dkLen` is outside RFC 7914 §1's range:
     /// `log_n` must be in `1..64`, `r ≥ 1`, `p ≥ 1`, `r·N < 2³⁰`, and

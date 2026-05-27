@@ -33,6 +33,7 @@ pub const SEED_SIZE: usize = 32;
 
 /// Errors from ML-DSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A key or signature had the wrong length.
     InvalidLength,

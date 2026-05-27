@@ -35,6 +35,7 @@ const BCRYPT_HASHSIZE: usize = 32;
 
 /// Parameter-validation errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// One of: `rounds == 0`, `keylen == 0`, or `keylen > 1024`.
     InvalidParameters,

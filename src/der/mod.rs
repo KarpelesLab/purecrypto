@@ -59,6 +59,7 @@ pub mod tag {
 
 /// An error encountered while decoding DER.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// Ran out of input before a structure was complete.
     Truncated,

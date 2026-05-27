@@ -29,6 +29,7 @@ use crate::rng::RngCore;
 
 /// Errors from SLH-DSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// A key had the wrong length or its root did not check out.
     InvalidKey,

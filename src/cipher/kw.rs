@@ -28,6 +28,7 @@ use crate::ct::ConstantTimeEq;
 
 /// Errors returned by AES key wrap operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KwError {
     /// Plaintext or ciphertext length is invalid for the chosen scheme,
     /// or the caller-supplied output buffer is the wrong size.

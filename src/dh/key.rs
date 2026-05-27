@@ -18,6 +18,7 @@ use alloc::vec::Vec;
 
 /// Errors from a finite-field DH operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Error {
     /// The peer's public value was outside `[2, p - 2]` — i.e. one of
     /// `0`, `1`, `p - 1`, or `≥ p`. These are tiny-order or invalid elements
