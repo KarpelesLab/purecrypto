@@ -128,12 +128,37 @@ fn raw_private_blinded_boxed(
     mont.mul_mod(&m_blind, &r_inv)
 }
 
+/// Lower bound for `BoxedRsaPublicKey` parsing entry points. Anything smaller
+/// is rejected as an unsigned-floor sanity check; per-protocol policy (e.g.
+/// 2048-bit minimum for TLS signatures) is enforced separately by callers.
+/// Set to 1024 to (a) keep `decrypt_pkcs1v15` safe from the
+/// `k < 11` indexing-panic class, and (b) refuse the obviously-broken
+/// modulus sizes an attacker might inject via a malicious SPKI.
+pub(crate) const MIN_RSA_BITS: usize = 1024;
+
+/// Upper bound to prevent CPU-exhaustion on parsing huge SPKI moduli.
+/// `BoxedMontModulus::new` runs `2 * 64 * limbs` `add_mod` iterations for the
+/// R² precomp, and every subsequent `mont_mul` is O(limbs²). 16384 bits is
+/// well above any legitimate use.
+pub(crate) const MAX_RSA_BITS: usize = 16384;
+
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
     pub fn new(n: BoxedUint, e: BoxedUint) -> Self {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         BoxedRsaPublicKey { n, e, mont, k }
+    }
+
+    /// Builds a public key from modulus `n` and exponent `e`, rejecting
+    /// modulus sizes outside `[MIN_RSA_BITS, MAX_RSA_BITS]`. Used by the
+    /// attacker-controlled parse paths (SPKI / certificates).
+    pub fn try_new(n: BoxedUint, e: BoxedUint) -> Result<Self, Error> {
+        let bits = n.bit_len();
+        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+            return Err(Error::InvalidLength);
+        }
+        Ok(Self::new(n, e))
     }
 
     /// The modulus.
@@ -313,6 +338,10 @@ impl BoxedRsaPublicKey {
         let e = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
         seq.finish()?;
         reader.finish()?;
+        let bits = n.bit_len();
+        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+            return Err(crate::der::Error::Malformed);
+        }
         Ok(BoxedRsaPublicKey::new(n, e))
     }
 
@@ -346,6 +375,10 @@ impl BoxedRsaPrivateKey {
         let _qinv = seq.read_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
+        let bits = n.bit_len();
+        if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
+            return Err(crate::der::Error::Malformed);
+        }
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
@@ -481,6 +514,34 @@ mod tests {
         let parsed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
         let sig2 = parsed.sign_pkcs1v15::<Sha256>(b"via der").unwrap();
         pk.verify_pkcs1v15::<Sha256>(b"via der", &sig2).unwrap();
+    }
+
+    /// I-1: a tiny SPKI/PKCS#1 modulus must be rejected at parse time so the
+    /// downstream `decrypt_pkcs1v15` indexing path (which assumes `k >= 11`)
+    /// is never reached on attacker input.
+    #[test]
+    fn rsa_decrypt_pkcs1v15_rejects_tiny_modulus() {
+        use crate::der::{encode_integer, encode_sequence};
+        // Synthesize a PKCS#1 RSAPublicKey with an 8-bit modulus (n=255, e=3).
+        let n = [0xff];
+        let e = [0x03];
+        let der = encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat());
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
+    }
+
+    /// I-2: a 32768-bit SPKI/PKCS#1 modulus must be rejected at parse time so
+    /// `BoxedMontModulus::new` doesn't run a quadratic R² precomputation on
+    /// attacker-supplied huge keys.
+    #[test]
+    fn rsa_rejects_modulus_above_16384_bits() {
+        use crate::der::{encode_integer, encode_sequence};
+        // 32768-bit modulus = 4096 bytes. The leading byte must be < 0x80 so
+        // the DER INTEGER is unambiguously positive without a leading zero.
+        let mut n = alloc::vec![0xffu8; 4096];
+        n[0] = 0x7f;
+        let e = [0x01, 0x00, 0x01];
+        let der = encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat());
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
     }
 
     #[test]

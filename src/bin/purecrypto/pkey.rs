@@ -1,6 +1,6 @@
 //! `purecrypto pkey -in key.pem [-pubout] [-text]` — inspect or convert a key.
 
-use crate::util::{Args, die, read_input, write_output};
+use crate::util::{Args, die, read_input, write_output, write_output_with_mode};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
@@ -121,16 +121,21 @@ pub(crate) fn run(args: Args) {
     }
 
     // Default: re-emit the private key PEM (PKCS#8 for the modern types).
+    // The earlier audit hardened `genpkey`, `kex`, `kem`, `ca init` to write
+    // private-key bytes through `write_output_with_mode(..., private=true)`
+    // — mode 0o600, refuse-overwrite, refuse a TTY stdout. The `pkey`
+    // re-emit path was missed; restore symmetry here (I-7).
+    let private = true;
     match &key {
-        Key::Rsa(_) => write_output(dest, raw.as_slice()), // round-trips the input
-        Key::Ec(k) => write_output(dest, k.to_sec1_pem().as_bytes()),
-        Key::Ed25519(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlDsa44(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlDsa65(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlDsa87(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlKem512(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlKem768(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::MlKem1024(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
-        Key::SlhDsa(k) => write_output(dest, k.to_pkcs8_pem().as_bytes()),
+        Key::Rsa(_) => write_output_with_mode(dest, raw.as_slice(), private),
+        Key::Ec(k) => write_output_with_mode(dest, k.to_sec1_pem().as_bytes(), private),
+        Key::Ed25519(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlDsa44(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlDsa65(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlDsa87(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlKem512(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlKem768(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::MlKem1024(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::SlhDsa(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
     }
 }

@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, rsa, x509};
+use super::{ec, hash, mlkem, rsa, x509};
 use crate::der::pem_decode;
 
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
@@ -189,6 +189,37 @@ fn cert_parse_and_verify() {
     // Self-signed: verifies against itself.
     assert_eq!(unsafe { x509::pc_cert_verify(cert, cert) }, PcStatus::Ok);
     unsafe { x509::pc_cert_free(cert) };
+}
+
+/// I-6: `pc_mlkem_encaps`'s C ABI is "raw SPKI DER bytes" — the body must
+/// accept DER (not require UTF-8 PEM framing as the original implementation
+/// did).
+#[test]
+fn pc_mlkem_encaps_accepts_der() {
+    let k = mlkem::pc_mlkem_generate(mlkem::set_id::ML_KEM_768);
+    assert!(!k.is_null());
+
+    // Export as DER. The new exporter pairs with the DER-expecting encaps.
+    let der = read_out(|o, l| unsafe { mlkem::pc_mlkem_public_to_der(k, o, l) });
+    assert!(!der.is_empty());
+
+    let mut ct = vec![0u8; 1500];
+    let mut ct_len = ct.len();
+    let mut ss = [0u8; 32];
+    let st = unsafe {
+        mlkem::pc_mlkem_encaps(
+            mlkem::set_id::ML_KEM_768,
+            der.as_ptr(),
+            der.len(),
+            ct.as_mut_ptr(),
+            &mut ct_len,
+            ss.as_mut_ptr(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(ct_len, 1088);
+
+    unsafe { mlkem::pc_mlkem_free(k) };
 }
 
 #[test]

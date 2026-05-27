@@ -1,6 +1,6 @@
 //! Rounding, decomposition, and hint helpers (FIPS 204 §7.4).
 
-use super::field::{Q, Q_MINUS_1_DIV2, add, sub};
+use super::field::{Q, Q_MINUS_1_DIV2, add};
 
 /// `γ₂ = (q − 1) / 32` (ML-DSA-65 / ML-DSA-87).
 pub(crate) const GAMMA2_32: u32 = (Q - 1) / 32;
@@ -11,15 +11,32 @@ const D: u32 = super::field::D;
 
 /// Power2Round (Algorithm 35): `r = r1·2ᵈ + r0` with centered `r0`. Both halves
 /// are returned in field (`[0, q)`) form.
+///
+/// The conditional centering branch (`if r0 > HALF`) is rewritten as
+/// arithmetic so the per-coefficient running time does not depend on the
+/// low bits of `r`. `r = A·s₁ + s₂` is secret-derived during signing, so a
+/// data-dependent branch here is a per-coefficient timing channel into
+/// `s₁`/`s₂`. The branchless form below matches the reference output
+/// bit-for-bit (verified by the ML-DSA KAT suite); on each `r ∈ [0, q)`
+/// the values produced are identical.
 pub(crate) fn power2_round(r: u32) -> (u32, u32) {
-    let mut r1 = r >> D;
-    let mut r0 = r - (r1 << D);
     const HALF: u32 = 1 << (D - 1);
-    if r0 > HALF {
-        r0 = sub(r0, 1 << D);
-        r1 += 1;
-    }
-    (r1, r0)
+    const POW_D: u32 = 1 << D;
+    let r1 = r >> D;
+    let r0 = r - (r1 << D); // r0 in [0, 2^D)
+
+    // gt is all-ones (0xFFFF_FFFF) when r0 > HALF, else 0. Computed without
+    // a branch: (HALF - r0) wraps negative iff r0 > HALF; its sign bit
+    // (i32 >> 31) propagates 1s.
+    let gt = ((HALF as i32).wrapping_sub(r0 as i32) >> 31) as u32;
+
+    // When gt = -1: r1' = r1 + 1; r0' = r0 - 2^D mod q = r0 + (q - 2^D)
+    //   (the existing branch did `sub(r0, 1<<D)` = `reduce_once(r0 + q - 2^D)`;
+    //    r0 < 2^D ≤ q so r0 + q - 2^D < q, i.e. reduce_once is a no-op).
+    // When gt = 0: both halves are unchanged.
+    let r1_adj = r1.wrapping_add(gt & 1);
+    let r0_adj = r0.wrapping_add(gt & (Q - POW_D));
+    (r1_adj, r0_adj)
 }
 
 /// HighBits (Algorithm 37).

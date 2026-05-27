@@ -519,7 +519,13 @@ impl Ed25519PublicKey {
         let rhs = point_add(&f, &r_point, &ka);
         let lhs8 = point_double(&f, &point_double(&f, &point_double(&f, &lhs)));
         let rhs8 = point_double(&f, &point_double(&f, &point_double(&f, &rhs)));
-        if f.encode(&lhs8) == f.encode(&rhs8) {
+        // Operands are public, but the rest of the crate uses constant-time
+        // equality for encoded-point comparison; staying consistent here keeps
+        // a future refactor from accidentally folding secret bytes through `==`
+        // (which has early-exit semantics on `[u8; N]`).
+        let lhs_enc = f.encode(&lhs8);
+        let rhs_enc = f.encode(&rhs8);
+        if bool::from(lhs_enc.ct_eq(&rhs_enc)) {
             Ok(())
         } else {
             Err(Error::Verification)

@@ -26,6 +26,30 @@ fn run(args: &[&str], stdin: &[u8]) -> (String, bool) {
     )
 }
 
+/// Like [`run`] but also returns stderr. Used by tests that need to assert
+/// on warnings written to stderr (e.g. I-8's permission warning).
+fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn purecrypto");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin)
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+        out.status.success(),
+    )
+}
+
 #[test]
 fn hash_sha256_stdin() {
     let (out, ok) = run(&["hash", "sha256"], b"abc");
@@ -159,6 +183,157 @@ fn ca_workflow_genpkey_req_sign() {
     );
     assert!(text.contains("leaf.test"), "{text}");
 
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I-8: any CLI tool that reads a private-key file should warn on stderr
+/// when that file's Unix mode is group- or world-readable. Tested through
+/// `req -key X -subj /CN=foo` because `req` calls `pki::load_key` (which
+/// goes through the new `warn_if_world_readable_key` guard).
+#[cfg(unix)]
+#[test]
+fn req_warns_on_world_readable_key() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_cli_warn_perm_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // Mint a key (lands at 0o600); chmod it to 0o644 to trigger the warning.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("loose.key"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey failed"
+    );
+    let mut perms = std::fs::metadata(p("loose.key")).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(p("loose.key"), perms).unwrap();
+
+    // Build a CSR with the loose key — the operation succeeds but stderr
+    // carries the permission warning.
+    let (_, err, ok) = run_capture(
+        &[
+            "req",
+            "-key",
+            &p("loose.key"),
+            "-subj",
+            "/CN=test",
+            "-out",
+            &p("test.csr"),
+        ],
+        b"",
+    );
+    assert!(ok, "req should still succeed despite the warning");
+    assert!(
+        err.contains("group/other-readable"),
+        "missing permission warning in stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I-7: `purecrypto pkey -in priv -out out` re-emits a private key. The
+/// output file must land at mode 0o600 (matching `genpkey` / `kex` / `kem` /
+/// `ca init`) so a default umask doesn't leave a world-readable private key.
+#[cfg(unix)]
+#[test]
+fn pkey_writes_private_key_with_0600_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_cli_pkey_mode_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // Mint a key first.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("priv.key"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey failed"
+    );
+
+    // Re-emit through `pkey` (no -pubout / -text — the private-key branch).
+    assert!(
+        run(
+            &["pkey", "-in", &p("priv.key"), "-out", &p("priv2.key")],
+            b"",
+        )
+        .1,
+        "pkey re-emit failed"
+    );
+    let mode = std::fs::metadata(p("priv2.key"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0o600, got {mode:o}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// I-5: a `/CN=...` subject containing a control character (here `\n`) must
+/// be rejected at parse time so the issued.jsonl/revoked.jsonl ledgers
+/// cannot be corrupted by attacker-supplied DN fields. Exercised via
+/// `req -subj`, which routes through `parse_subject`.
+#[test]
+fn req_rejects_subject_with_newline() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_subj_nl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    // Mint any private key so the early -key check passes.
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("k.pem"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey failed"
+    );
+
+    let (_, ok) = run(
+        &[
+            "req",
+            "-key",
+            &p("k.pem"),
+            "-subj",
+            "/CN=evil\nbob",
+            "-out",
+            &p("evil.csr"),
+        ],
+        b"",
+    );
+    assert!(!ok, "req should fail on subject with control char");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -333,6 +333,8 @@ PcMlKem *pc_mlkem_generate(int32_t set);
 PcMlKem *pc_mlkem_from_pkcs8_pem(const uint8_t *pem, size_t len);
 pc_status pc_mlkem_private_to_pem(const PcMlKem *k, uint8_t *out, size_t *out_len);
 pc_status pc_mlkem_public_to_pem(const PcMlKem *k, uint8_t *out, size_t *out_len);
+pc_status pc_mlkem_public_to_der(const PcMlKem *k, uint8_t *out, size_t *out_len);
+/* pc_mlkem_encaps expects ek_spki to be a raw SPKI DER blob (not PEM). */
 pc_status pc_mlkem_encaps(int32_t set, const uint8_t *ek_spki, size_t ek_spki_len,
                           uint8_t *ct, size_t *ct_len, uint8_t ss[32]);
 pc_status pc_mlkem_decaps(const PcMlKem *k, const uint8_t *ct, size_t ct_len, uint8_t ss[32]);

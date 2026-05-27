@@ -222,6 +222,7 @@ fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
 /// Loads a client identity (cert chain + key) from `-cert` + `-key` paths.
 fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, SigningKey) {
     let chain = load_cert_chain(cert_path);
+    crate::util::warn_if_world_readable_key(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
     let key = if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(&key_pem) {

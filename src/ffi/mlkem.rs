@@ -126,6 +126,30 @@ pub unsafe extern "C" fn pc_mlkem_public_to_pem(
     })
 }
 
+/// Writes the matching encapsulation key as a PKIX SPKI DER blob to `out`.
+/// Pair with [`pc_mlkem_encaps`], which (since I-6) expects DER bytes.
+///
+/// # Safety
+/// `k` from a generator/`*_from_pem`; buffer rules.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_mlkem_public_to_der(
+    k: *const PcMlKem,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if k.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let der = match unsafe { &*k } {
+            PcMlKem::K512(sk) => sk.encapsulation_key().to_spki_der(),
+            PcMlKem::K768(sk) => sk.encapsulation_key().to_spki_der(),
+            PcMlKem::K1024(sk) => sk.encapsulation_key().to_spki_der(),
+        };
+        unsafe { out_write(&der, out, out_len) }
+    })
+}
+
 /// Encapsulates against an encapsulation key supplied as a PKIX SPKI DER,
 /// writing the ciphertext to `ct` and the 32-byte shared secret to `ss`. The
 /// EK is validated per FIPS 203 §7.2 (re-encoded round trip) before encaps,
@@ -149,12 +173,13 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
         if ss.is_null() {
             return PcStatus::NullPointer;
         }
-        let Ok(spki_str) = core::str::from_utf8(spki) else {
-            return PcStatus::BadEncoding;
-        };
+        // The C ABI contract is "PKIX SPKI DER". Earlier this branch
+        // accepted PEM (UTF-8 BEGIN/END framing) instead, so a caller
+        // passing raw DER got a `from_utf8` failure rather than a
+        // successful encapsulation. Switch to the DER parser.
         let (ct_bytes, secret): (alloc::vec::Vec<u8>, [u8; 32]) = match set {
             set_id::ML_KEM_512 => {
-                let k = match MlKem512EncapsKey::from_spki_pem(spki_str) {
+                let k = match MlKem512EncapsKey::from_spki_der(spki) {
                     Ok(k) => k,
                     Err(_) => return PcStatus::BadEncoding,
                 };
@@ -166,7 +191,7 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
                 (c.to_bytes().to_vec(), s)
             }
             set_id::ML_KEM_768 => {
-                let k = match MlKem768EncapsKey::from_spki_pem(spki_str) {
+                let k = match MlKem768EncapsKey::from_spki_der(spki) {
                     Ok(k) => k,
                     Err(_) => return PcStatus::BadEncoding,
                 };
@@ -178,7 +203,7 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
                 (c.to_bytes().to_vec(), s)
             }
             set_id::ML_KEM_1024 => {
-                let k = match MlKem1024EncapsKey::from_spki_pem(spki_str) {
+                let k = match MlKem1024EncapsKey::from_spki_der(spki) {
                     Ok(k) => k,
                     Err(_) => return PcStatus::BadEncoding,
                 };

@@ -16,8 +16,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::pki::{
-    describe_key, format_dn, issuer_ski_bytes, parse_sans, parse_subject, spki_bit_string_contents,
-    validity_days,
+    describe_key, format_dn, issuer_ski_bytes, json_escape, parse_sans, parse_subject,
+    spki_bit_string_contents, validity_days,
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{Args, die, write_output, write_output_with_mode};
@@ -119,6 +119,9 @@ impl RootKey {
 }
 
 fn load_root_key(ca: &CaDir) -> RootKey {
+    if let Some(s) = ca.root_key().to_str() {
+        crate::util::warn_if_world_readable_key(s);
+    }
     let raw = read_bytes(&ca.root_key());
     let pem = core::str::from_utf8(&raw)
         .unwrap_or_else(|_| die(format!("{} is not PEM", ca.root_key().display())));
@@ -357,18 +360,20 @@ fn run_issue(args: Args) {
     };
     bump_serial(&ca, serial);
 
-    // Record in issued.jsonl.
+    // Record in issued.jsonl. Every string field goes through `json_escape`
+    // so a control character or `"` in a SAN / subject cannot corrupt the
+    // one-record-per-line invariant the parser depends on.
     let sans_json = sans
         .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .map(|s| format!("\"{}\"", json_escape(s)))
         .collect::<Vec<_>>()
         .join(",");
     let record = format!(
         "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
         serial,
-        format_dn(&subject).replace('"', "\\\""),
+        json_escape(&format_dn(&subject)),
         sans_json,
-        validity.not_after.as_str(),
+        json_escape(validity.not_after.as_str()),
         now_unix()
     );
     append_line(&ca.issued(), &record);
@@ -468,15 +473,15 @@ fn run_sign_csr(args: Args) {
     let sans = csr.subject_alt_names().unwrap_or_default();
     let sans_json = sans
         .iter()
-        .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+        .map(|s| format!("\"{}\"", json_escape(s)))
         .collect::<Vec<_>>()
         .join(",");
     let record = format!(
         "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
         serial,
-        format_dn(&subject).replace('"', "\\\""),
+        json_escape(&format_dn(&subject)),
         sans_json,
-        validity.not_after.as_str(),
+        json_escape(validity.not_after.as_str()),
         now_unix()
     );
     append_line(&ca.issued(), &record);

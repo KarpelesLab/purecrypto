@@ -58,6 +58,13 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<
     if ct.len() != k {
         return Err(Error::InvalidLength);
     }
+    // RFC 8017 §7.2.2 step 1: `k` must be at least 11 octets so the PS field
+    // (>= 8 bytes) plus the three framing bytes (0x00 0x02 ... 0x00) can fit.
+    // A smaller modulus could otherwise drive the `em[0]` / `em[1]` indexing
+    // below into a panic on attacker-controlled tiny keys.
+    if k < 11 {
+        return Err(Error::InvalidLength);
+    }
     let em = key.raw_private(ct);
 
     // RFC 8017 §7.2.2 constant-time padding validation. Every branch on plaintext
@@ -123,6 +130,10 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
 
     let k = key.key_size();
     if ct.len() != k {
+        return Err(Error::InvalidLength);
+    }
+    // RFC 8017 §7.2.2 step 1: see [`decrypt_pkcs1v15`].
+    if k < 11 {
         return Err(Error::InvalidLength);
     }
     let em = key.raw_private(ct);

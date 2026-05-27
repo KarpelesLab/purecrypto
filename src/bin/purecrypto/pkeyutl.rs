@@ -81,6 +81,7 @@ enum PrivKey {
 }
 
 fn load_priv(path: &str) -> PrivKey {
+    crate::util::warn_if_world_readable_key(path);
     let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("key file is not UTF-8 PEM"));
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {

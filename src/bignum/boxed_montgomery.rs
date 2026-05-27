@@ -190,13 +190,23 @@ impl BoxedMontModulus {
 
     /// Computes `base^exp mod n` in constant time (square-and-multiply-always
     /// over all bits of `exp`).
+    ///
+    /// The exponent is zero-padded to `self.limbs` 64-bit limbs before the
+    /// loop. Iteration count is therefore a function of the modulus width
+    /// alone — two secret exponents of the same modulus cannot produce
+    /// different running times even if one was parsed from a DER blob with
+    /// the leading zero limbs of `d` stripped.
     pub fn pow(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
         let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
         let mut one = vec![0 as Limb; self.limbs];
         one[0] = 1;
         let mut acc = self.to_mont_limbs(&one); // R mod N
 
-        let exp_limbs = exp.as_limbs();
+        // Pad the exponent to `self.limbs` 64-bit words. `limbs_resized`
+        // zero-pads when the exponent is shorter (the common case for
+        // imported `d` values whose high-zero limbs were stripped by the
+        // ASN.1 unsigned-integer encoder).
+        let exp_limbs = exp.limbs_resized(self.limbs);
         let mut i = exp_limbs.len();
         while i > 0 {
             i -= 1;

@@ -45,18 +45,31 @@ impl PrivateKey {
 
 /// Loads a private key from `path`, dying on any error.
 pub(crate) fn load_key(path: &str) -> PrivateKey {
+    crate::util::warn_if_world_readable_key(path);
     let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die(format!("{path} is not PEM")));
     PrivateKey::from_pem(pem).unwrap_or_else(|| die(format!("cannot parse key in {path}")))
 }
 
 /// Parses an OpenSSL-style subject string such as `/CN=example.com/O=Acme`.
+///
+/// Each attribute value is screened for ASCII control characters (`< 0x20`)
+/// and rejected if any are present. The CA records issued/revoked rows as
+/// one JSON object per line in `issued.jsonl` / `revoked.jsonl`; a stray
+/// `\n` in a CN would corrupt subsequent records, and `parse_revoked_jsonl`
+/// can be tricked into reading the wrong field if `\\"` appears unescaped.
 pub(crate) fn parse_subject(subj: &str) -> DistinguishedName {
     let mut dn = DistinguishedName::new();
     for part in subj.split('/').filter(|s| !s.is_empty()) {
         let Some((k, v)) = part.split_once('=') else {
             die(format!("malformed subject component: {part}"));
         };
+        if v.bytes().any(|b| b < 0x20) {
+            die(format!(
+                "subject attribute {} contains a control character",
+                k.trim()
+            ));
+        }
         match k.trim().to_ascii_uppercase().as_str() {
             "CN" => dn.common_name = Some(v.into()),
             "O" => dn.organization = Some(v.into()),
@@ -66,6 +79,33 @@ pub(crate) fn parse_subject(subj: &str) -> DistinguishedName {
         }
     }
     dn
+}
+
+/// Escapes `s` for safe embedding inside a JSON string literal (used by the
+/// `issued.jsonl` / `revoked.jsonl` ledgers). Handles the six control-character
+/// escapes called out in RFC 8259 §7 plus the generic `\u{XXXX}` form for the
+/// remaining `0x00..0x1F` range; non-control bytes pass through verbatim
+/// (we already rejected `\` paths in [`parse_subject`], but explicit `\\` and
+/// `\"` escapes are emitted for defense in depth).
+pub(crate) fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use core::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// Renders a distinguished name like `CN=example.com, O=Acme`.

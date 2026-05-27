@@ -77,6 +77,37 @@ impl Args {
     }
 }
 
+/// Symmetric read-side counterpart to [`write_output_with_mode(.., private=true)`].
+///
+/// On Unix, checks that the file at `path` is not group- or world-accessible
+/// (any of the lower 6 mode bits set is suspicious for a private key). If so,
+/// emits a warning to stderr and proceeds — the warn-only default keeps
+/// existing setups working; a future `--strict-key-perms` knob can promote
+/// this to a hard refusal. On non-Unix targets the function is a no-op.
+///
+/// Call this before `std::fs::read` / `read_to_string` on any path that
+/// contains private-key bytes (RSA PKCS#1, EC SEC1, Ed25519/ML-DSA/ML-KEM
+/// PKCS#8, CA `root.key`, etc.).
+pub(crate) fn warn_if_world_readable_key(path: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let mode = md.mode() & 0o777;
+            if mode & 0o077 != 0 {
+                eprintln!(
+                    "purecrypto: warning: {path} is group/other-readable (mode {mode:o}); \
+                     run `chmod 600 {path}` to restrict to owner-only"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 /// Reads all input: from `path` if `Some` and not `"-"`, otherwise from stdin.
 pub(crate) fn read_input(path: Option<&str>) -> Vec<u8> {
     match path {

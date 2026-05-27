@@ -100,6 +100,7 @@ fn load_roots_file(path: &str) -> RootCertStore {
 
 /// Reads a PEM-encoded server key as a unified [`SigningKey`].
 fn load_signing_key(key_path: &str) -> SigningKey {
+    crate::util::warn_if_world_readable_key(key_path);
     let key_pem = std::fs::read_to_string(key_path)
         .unwrap_or_else(|e| die(format!("cannot read key file {key_path}: {e}")));
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(&key_pem) {

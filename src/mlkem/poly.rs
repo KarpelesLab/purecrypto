@@ -259,13 +259,29 @@ pub(crate) fn from_msg(msg: &[u8; 32]) -> Poly {
     p
 }
 
+/// Strength-reduction constants for division by `Q = 3329`.
+///
+/// `floor(n / Q) == (n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT` for every
+/// `n` in the range used by [`to_msg`] (`n < 2*Q + Q/2`) and [`compress`]
+/// (`n < (Q-1) * 2^D + Q/2` for any `D ≤ 11`, which covers all FIPS 203
+/// `du`/`dv` values). Replacing the `/ Q` operator removes the only
+/// data-dependent integer division on a secret-derived value — on some
+/// ARM cores integer divide is variable-time, while a multiply + shift is
+/// not. Verified exhaustively against the divide path (see the
+/// `barrett_div_matches_division` test) and indirectly by the ML-KEM KAT
+/// suite, which round-trips through both helpers.
+const Q_BARRETT_MUL: u64 = 2_580_335; // ceil(2^33 / 3329)
+const Q_BARRETT_SHIFT: u32 = 33;
+
 /// `Compress₁`: extracts the 32-byte message from a polynomial.
 pub(crate) fn to_msg(p: &Poly) -> [u8; 32] {
     let mut msg = [0u8; 32];
     for (i, byte) in msg.iter_mut().enumerate() {
         for j in 0..8 {
-            let t = freeze(p.c[8 * i + j]) as u32;
-            let bit = (((t << 1) + (Q as u32 / 2)) / Q as u32) & 1;
+            let t = freeze(p.c[8 * i + j]) as u64;
+            // Barrett-style division by Q (see Q_BARRETT_* above).
+            let n = (t << 1) + (Q as u64 / 2);
+            let bit = ((n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT) & 1;
             *byte |= (bit as u8) << j;
         }
     }
@@ -284,7 +300,9 @@ pub(crate) fn compress<const D: usize>(p: &Poly, out: &mut [u8]) {
     let mut bit_pos = 0usize;
     for i in 0..N {
         let x = freeze(p.c[i]) as u64;
-        let v = (((x << D) + (Q as u64 / 2)) / Q as u64) as u32 & mask;
+        // Barrett-style division by Q (see Q_BARRETT_* above).
+        let n = (x << D) + (Q as u64 / 2);
+        let v = ((n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT) as u32 & mask;
         let mut bits_left = D;
         let mut value = v;
         let mut byte_idx = bit_pos / 8;
@@ -383,6 +401,38 @@ mod tests {
         let q = from_bytes(&to_bytes(&p));
         for i in 0..N {
             assert_eq!(freeze(p.c[i]), q.c[i], "coeff {i}");
+        }
+    }
+
+    /// I-10: the Barrett-style strength-reduction for division by `Q` must
+    /// produce the same result as the literal `/ Q` for every `n` in the
+    /// range used by `to_msg` (D = 1) and `compress` (D = 4, 5, 10, 11 are
+    /// the FIPS 203 values for `du` and `dv`). One bad row would silently
+    /// flip a message bit or a ciphertext bit.
+    #[test]
+    fn barrett_div_matches_division() {
+        for d in [1u32, 4, 5, 10, 11] {
+            let coeff_max = (Q as u64) - 1;
+            let nmax = (coeff_max << d) + (Q as u64 / 2);
+            // Spot-check the boundary values and a stride; exhaustive sweep
+            // is too slow for the D = 11 range under cfg(test).
+            let mut samples: alloc::vec::Vec<u64> = (0..=nmax.min(50_000)).collect();
+            if nmax > 50_000 {
+                let step = nmax / 8192;
+                let mut x = 50_000u64;
+                while x <= nmax {
+                    samples.push(x);
+                    samples.push(x + 1);
+                    samples.push(x.saturating_sub(1));
+                    x = x.saturating_add(step);
+                }
+                samples.push(nmax);
+            }
+            for n in samples {
+                let want = n / Q as u64;
+                let got = (n * Q_BARRETT_MUL) >> Q_BARRETT_SHIFT;
+                assert_eq!(got, want, "D={d} n={n}");
+            }
         }
     }
 

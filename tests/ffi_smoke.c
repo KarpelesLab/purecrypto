@@ -312,14 +312,15 @@ int main(void) {
 #undef PEM_DECODE
   }
 
-  /* 14. ML-KEM-768 round trip via FFI. */
+  /* 14. ML-KEM-768 round trip via FFI. Since I-6, pc_mlkem_encaps expects
+   * the SPKI as raw DER bytes (matching its declared C ABI), not PEM. */
   {
     PcMlKem *k = pc_mlkem_generate(PC_ML_KEM_768);
     if (!k) return fail("pc_mlkem_generate");
     uint8_t spki[2048];
     size_t spki_len = sizeof(spki);
-    if (pc_mlkem_public_to_pem(k, spki, &spki_len) != PC_OK)
-      return fail("pc_mlkem_public_to_pem");
+    if (pc_mlkem_public_to_der(k, spki, &spki_len) != PC_OK)
+      return fail("pc_mlkem_public_to_der");
     uint8_t ct[1200];
     size_t ct_len = sizeof(ct);
     uint8_t ss_a[32], ss_b[32];
