@@ -5,8 +5,17 @@
 //! SP 800-90A generator built on our HMAC, and (with `std`) [`OsRng`] draws
 //! directly from the operating system's entropy pool — `/dev/urandom` on Unix,
 //! `ProcessPrng` on Windows.
+//!
+//! Enabling the `linux-getrandom` feature switches the Linux path to
+//! `getrandom(2)` via raw syscalls (no `libc` dependency). Recommended for
+//! processes that may start before the kernel CSPRNG is initialised —
+//! `getrandom(2)` blocks until seeding completes, while `/dev/urandom` does
+//! not. Supported on x86_64, aarch64, armv7, riscv64; other Linux arches
+//! transparently fall through to `/dev/urandom`.
 
 mod hmac_drbg;
+#[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
+mod linux_getrandom;
 
 pub use hmac_drbg::HmacDrbg;
 
@@ -63,20 +72,43 @@ std::thread_local! {
 #[cfg(all(feature = "std", unix))]
 impl RngCore for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        use std::io::Read;
+        if dest.is_empty() {
+            return;
+        }
 
-        URANDOM.with(|cell| {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot =
-                    Some(std::fs::File::open("/dev/urandom").expect("failed to open /dev/urandom"));
+        // When the `linux-getrandom` feature is on AND we're on Linux,
+        // try the syscall first. On Linux < 3.17 (ENOSYS) or unsupported
+        // arches the helper returns NotImplemented and we fall back to
+        // /dev/urandom; on other errors the helper returns Other and
+        // we panic — a kernel that refuses to give us entropy must not
+        // silently degrade to a possibly-unseeded /dev/urandom.
+        #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
+        match linux_getrandom::try_getrandom(dest) {
+            Ok(()) => return,
+            Err(linux_getrandom::Error::NotImplemented) => {} // fall through
+            Err(linux_getrandom::Error::Other(e)) => {
+                panic!("getrandom(2) failed with errno {e}");
             }
-            slot.as_mut()
-                .unwrap()
-                .read_exact(dest)
-                .expect("failed to read entropy from /dev/urandom");
-        });
+        }
+
+        urandom_fill(dest);
     }
+}
+
+#[cfg(all(feature = "std", unix))]
+fn urandom_fill(dest: &mut [u8]) {
+    use std::io::Read;
+
+    URANDOM.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(std::fs::File::open("/dev/urandom").expect("failed to open /dev/urandom"));
+        }
+        slot.as_mut()
+            .unwrap()
+            .read_exact(dest)
+            .expect("failed to read entropy from /dev/urandom");
+    });
 }
 
 #[cfg(all(feature = "std", unix))]

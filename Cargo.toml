@@ -26,6 +26,13 @@ cipher = []
 kdf = ["hash", "cipher"]
 bignum = []
 rng = ["hash"]
+# Opt-in: on Linux, draw OsRng bytes via getrandom(2) instead of reading from
+# /dev/urandom. Hardens the early-boot path (getrandom(2) blocks until the
+# kernel CSPRNG is initialised; /dev/urandom historically did not). Uses raw
+# syscall instructions per arch — currently x86_64, aarch64, armv7, riscv64.
+# On other Linux arches the feature is a no-op and OsRng falls back to
+# /dev/urandom.
+linux-getrandom = ["rng", "std"]
 rsa = ["bignum", "rng", "hash"]
 # Finite-field Diffie-Hellman over RFC 3526 MODP groups (group14..group18)
 # plus RFC 4419 group-exchange. For SSH and legacy TLS / IKE interop;
