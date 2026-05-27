@@ -33,6 +33,11 @@ pub(crate) struct CryptoState {
     /// construction time; the others fill in as the TLS engine surfaces
     /// secrets via the hook.
     pub(crate) levels: [LevelKeys; 4],
+    /// RFC 9001 §6 — the current 1-RTT Key Phase bit (0 or 1). Outbound
+    /// short-header packets carry this in bit 2 of the first byte;
+    /// inbound packets are opened with the rx slot whose phase matches
+    /// the masked-off bit.
+    pub(crate) one_rtt_phase: u8,
 }
 
 impl CryptoState {
@@ -45,6 +50,7 @@ impl CryptoState {
                 LevelKeys::empty(),
                 LevelKeys::empty(),
             ],
+            one_rtt_phase: 0,
         }
     }
 

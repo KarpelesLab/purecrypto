@@ -72,6 +72,7 @@ impl AeadAlg {
 /// encryption level. Holds the derived AEAD key, IV, header-protection
 /// state, and the traffic secret that produced them (kept so the key
 /// update path can call [`derive_next_application_secret`]).
+#[derive(Clone)]
 pub(crate) struct DirKeys {
     pub(crate) alg: AeadAlg,
     /// AEAD key — exactly [`AeadAlg::key_len`] bytes long.
@@ -92,6 +93,7 @@ pub(crate) struct DirKeys {
 /// Wraps the three permitted primitives behind a single type so the
 /// packet layer can apply protection without branching on the negotiated
 /// suite.
+#[derive(Clone)]
 pub(crate) enum HeaderProt {
     /// AES-128-ECB applied to the 16-byte sample (RFC 9001 §5.4.3).
     Aes128(Aes128),
@@ -150,15 +152,81 @@ impl HeaderProt {
 /// halves. A level has a `tx` half once we have derived keys to encrypt
 /// outbound packets at that level, and an `rx` half once we have keys to
 /// decrypt inbound packets.
+///
+/// For the 1-RTT level (Phase 8 key update, RFC 9001 §6) the keys are
+/// additionally indexed by the Key Phase bit: `tx_by_phase[p]` and
+/// `rx_by_phase[p]` carry the keys derived for phase `p ∈ {0, 1}`. The
+/// "current" phase is held on the parent [`CryptoState::one_rtt_phase`].
+/// Both phase slots are pre-derived from the current and the
+/// next-generation traffic secrets so that an out-of-order packet
+/// carrying the flipped phase bit can be opened without stalling
+/// (RFC 9001 §6.2).
+///
+/// The legacy `tx`/`rx` fields stay populated for non-1-RTT levels and
+/// for the *current* phase at the 1-RTT level; the rest of the crate
+/// reads these fields unchanged. The phase-aware lookup is opt-in via
+/// [`Self::rx_for_phase`] / [`Self::tx_for_phase`].
 pub(crate) struct LevelKeys {
     pub(crate) tx: Option<DirKeys>,
     pub(crate) rx: Option<DirKeys>,
+
+    // ---- Phase 8 (1-RTT only) ----
+    /// Per-phase tx keys, indexed by the Key Phase bit (0 or 1). Populated
+    /// once 1-RTT secrets land; both slots are kept current so the
+    /// upcoming flip is a no-op.
+    pub(crate) tx_by_phase: [Option<DirKeys>; 2],
+    /// Per-phase rx keys, indexed by the Key Phase bit. The slot whose
+    /// bit equals [`CryptoState::one_rtt_phase`] is the "current" rx;
+    /// the other slot is the "next" rx that opens an out-of-order
+    /// post-flip packet (RFC 9001 §6.2).
+    pub(crate) rx_by_phase: [Option<DirKeys>; 2],
+    /// RFC 9001 §6.2 — the *previous* phase's rx keys, kept across one
+    /// commit so a delayed old-phase packet that arrives *after* we've
+    /// flipped can still decrypt. Holds the keys we just rotated out
+    /// of `rx_by_phase[old_phase]`. Cleared on the next flip.
+    pub(crate) prev_rx_keys: Option<DirKeys>,
+    /// True once we initiated a tx-side key update but haven't yet
+    /// observed the peer use the new phase (which RFC 9001 §6.1
+    /// requires before a second update can start).
+    pub(crate) tx_phase_pending_confirm: bool,
+    /// RFC 9001 §6 — the "quic hp" key bytes captured from the very
+    /// first 1-RTT tx secret; reused unchanged across all subsequent
+    /// key updates. RFC 9001 §6: "The same header protection key is
+    /// used for the duration of the connection." Empty until 1-RTT
+    /// secrets land.
+    pub(crate) tx_hp_key_bytes: Vec<u8>,
+    /// Counterpart for the rx direction.
+    pub(crate) rx_hp_key_bytes: Vec<u8>,
 }
 
 impl LevelKeys {
     /// An empty pair (neither direction yet keyed).
     pub(crate) const fn empty() -> Self {
-        Self { tx: None, rx: None }
+        Self {
+            tx: None,
+            rx: None,
+            tx_by_phase: [None, None],
+            rx_by_phase: [None, None],
+            prev_rx_keys: None,
+            tx_phase_pending_confirm: false,
+            tx_hp_key_bytes: Vec::new(),
+            rx_hp_key_bytes: Vec::new(),
+        }
+    }
+
+    /// Phase-aware tx key lookup. `phase` is 0 or 1. Falls back to the
+    /// legacy `tx` slot when the per-phase table hasn't been populated
+    /// (i.e. for non-1-RTT levels, or before the first 1-RTT key
+    /// install).
+    pub(crate) fn tx_for_phase(&self, phase: u8) -> Option<&DirKeys> {
+        let p = (phase & 1) as usize;
+        self.tx_by_phase[p].as_ref().or(self.tx.as_ref())
+    }
+
+    /// Phase-aware rx key lookup. See [`Self::tx_for_phase`].
+    pub(crate) fn rx_for_phase(&self, phase: u8) -> Option<&DirKeys> {
+        let p = (phase & 1) as usize;
+        self.rx_by_phase[p].as_ref().or(self.rx.as_ref())
     }
 }
 
@@ -247,6 +315,67 @@ pub(crate) fn derive_next_application_secret(alg: AeadAlg, current: &[u8]) -> Ve
     let mut next = alloc::vec![0u8; current.len()];
     expand_label_dyn(alg.hash(), current, b"quic ku", &[], &mut next);
     next
+}
+
+/// RFC 9001 §6 — derive *only* the new AEAD `(key, iv)` from a
+/// next-generation secret, keeping a previously-derived HP cipher
+/// untouched.
+///
+/// The header-protection key MUST NOT change across key updates (RFC
+/// 9001 §6 second paragraph: "The same header protection key is used
+/// for the duration of the connection"). Cloning the existing hp
+/// state out of an old `DirKeys` lets us produce the next phase's
+/// `DirKeys` while preserving HP behavior.
+///
+/// Implementation note: [`HeaderProt`] embeds the block cipher state
+/// (key-scheduled keys), not the raw bytes, so the only safe way to
+/// "preserve" it across a key update is to re-derive it from the
+/// secret that the original HP came from. We do that at install time
+/// by recording the original hp key bytes alongside the secret, and
+/// re-deriving the HP from those bytes; alternatively, the caller
+/// can pass in the original "quic hp" key bytes via
+/// [`derive_dir_keys_preserve_hp`].
+pub(crate) fn derive_dir_keys_preserve_hp(
+    alg: AeadAlg,
+    secret: &[u8],
+    hp_key_bytes: &[u8],
+) -> DirKeys {
+    let hash = alg.hash();
+    let kl = alg.key_len();
+    let mut key = alloc::vec![0u8; kl];
+    let mut iv = [0u8; 12];
+    expand_label_dyn(hash, secret, b"quic key", &[], &mut key);
+    expand_label_dyn(hash, secret, b"quic iv", &[], &mut iv);
+
+    let hp = match alg {
+        AeadAlg::Aes128Gcm => {
+            HeaderProt::Aes128(Aes128::new(hp_key_bytes[..16].try_into().expect("16")))
+        }
+        AeadAlg::Aes256Gcm => {
+            HeaderProt::Aes256(Aes256::new(hp_key_bytes[..32].try_into().expect("32")))
+        }
+        AeadAlg::ChaCha20Poly1305 => {
+            HeaderProt::ChaCha20(ChaCha20::new(hp_key_bytes[..32].try_into().expect("32")))
+        }
+    };
+
+    DirKeys {
+        alg,
+        key,
+        iv,
+        hp,
+        secret: secret.to_vec(),
+    }
+}
+
+/// Compute the raw "quic hp" key bytes for a secret. The output length
+/// equals [`AeadAlg::key_len`].
+pub(crate) fn derive_hp_key_bytes(alg: AeadAlg, secret: &[u8]) -> Vec<u8> {
+    let hash = alg.hash();
+    let kl = alg.key_len();
+    let mut hp_key = alloc::vec![0u8; kl];
+    expand_label_dyn(hash, secret, b"quic hp", &[], &mut hp_key);
+    hp_key
 }
 
 /// RFC 9001 §5.3 — construct the AEAD nonce.
@@ -662,6 +791,81 @@ mod tests {
         assert!(matches!(dk.hp.mask(&[0u8; 15]), Err(Error::Decode)));
         assert!(matches!(dk.hp.mask(&[0u8; 17]), Err(Error::Decode)));
         assert!(matches!(dk.hp.mask(&[]), Err(Error::Decode)));
+    }
+
+    /// Phase 8 — RFC 9001 §6.1: each application of
+    /// `derive_next_application_secret` yields a fresh secret, and each
+    /// secret expands to a distinct (key, iv, hp_key) triple. We chain
+    /// S₀ → S₁ → S₂ and assert pairwise inequality on all three
+    /// outputs.
+    #[test]
+    fn crypto_key_update_chain() {
+        // Synthetic 32-byte initial secret. Hash output for SHA-256 ⇒
+        // each Si is also 32 bytes.
+        let s0: alloc::vec::Vec<u8> = (0..32u8).map(|i| i ^ 0x5a).collect();
+        let s1 = derive_next_application_secret(AeadAlg::Aes128Gcm, &s0);
+        let s2 = derive_next_application_secret(AeadAlg::Aes128Gcm, &s1);
+
+        assert_ne!(s0, s1, "S0 vs S1 must differ");
+        assert_ne!(s1, s2, "S1 vs S2 must differ");
+        assert_ne!(s0, s2, "S0 vs S2 must differ");
+        assert_eq!(s0.len(), s1.len());
+        assert_eq!(s1.len(), s2.len());
+
+        let dk0 = derive_dir_keys(AeadAlg::Aes128Gcm, &s0);
+        let dk1 = derive_dir_keys(AeadAlg::Aes128Gcm, &s1);
+        let dk2 = derive_dir_keys(AeadAlg::Aes128Gcm, &s2);
+
+        // Pairwise: keys distinct, IVs distinct.
+        assert_ne!(dk0.key, dk1.key);
+        assert_ne!(dk1.key, dk2.key);
+        assert_ne!(dk0.key, dk2.key);
+        assert_ne!(dk0.iv, dk1.iv);
+        assert_ne!(dk1.iv, dk2.iv);
+        assert_ne!(dk0.iv, dk2.iv);
+
+        // hp keys are stored only inside HeaderProt. Re-derive
+        // independently for comparison.
+        let mut hp0 = [0u8; 16];
+        let mut hp1 = [0u8; 16];
+        let mut hp2 = [0u8; 16];
+        expand_label_dyn(HashAlg::Sha256, &s0, b"quic hp", &[], &mut hp0);
+        expand_label_dyn(HashAlg::Sha256, &s1, b"quic hp", &[], &mut hp1);
+        expand_label_dyn(HashAlg::Sha256, &s2, b"quic hp", &[], &mut hp2);
+        assert_ne!(hp0, hp1);
+        assert_ne!(hp1, hp2);
+        assert_ne!(hp0, hp2);
+    }
+
+    #[test]
+    fn level_keys_phase_lookup_falls_back_to_legacy() {
+        let dk = derive_dir_keys(AeadAlg::Aes128Gcm, &alloc::vec![0u8; 32]);
+        // Legacy fields populated, phase table empty: phase lookup
+        // falls back.
+        let lk = LevelKeys {
+            tx: Some(DirKeys {
+                alg: dk.alg,
+                key: dk.key.clone(),
+                iv: dk.iv,
+                hp: match dk.alg {
+                    AeadAlg::Aes128Gcm => {
+                        HeaderProt::Aes128(Aes128::new(dk.key[..16].try_into().unwrap()))
+                    }
+                    _ => unreachable!(),
+                },
+                secret: dk.secret.clone(),
+            }),
+            rx: None,
+            tx_by_phase: [None, None],
+            rx_by_phase: [None, None],
+            prev_rx_keys: None,
+            tx_phase_pending_confirm: false,
+            tx_hp_key_bytes: Vec::new(),
+            rx_hp_key_bytes: Vec::new(),
+        };
+        assert!(lk.tx_for_phase(0).is_some());
+        assert!(lk.tx_for_phase(1).is_some());
+        assert!(lk.rx_for_phase(0).is_none());
     }
 
     #[test]

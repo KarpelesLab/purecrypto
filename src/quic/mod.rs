@@ -26,6 +26,7 @@ pub(crate) mod congestion;
 pub(crate) mod connection;
 pub(crate) mod crypto;
 pub(crate) mod crypto_buf;
+pub(crate) mod datagram;
 pub(crate) mod endpoint;
 pub(crate) mod frame;
 pub(crate) mod loss;

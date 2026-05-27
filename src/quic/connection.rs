@@ -24,7 +24,11 @@ use crate::quic::cid::{CidEntry, CidPool, ConnectionId};
 use crate::quic::client::{
     build_initial_endpoint, build_tls_engine as build_client_engine, random_default_cid,
 };
-use crate::quic::crypto::{AeadAlg, aead_open, aead_seal, derive_dir_keys};
+use crate::quic::crypto::{
+    AeadAlg, aead_open, aead_seal, derive_dir_keys, derive_dir_keys_preserve_hp,
+    derive_hp_key_bytes, derive_next_application_secret,
+};
+use crate::quic::datagram::DatagramQueues;
 use crate::quic::endpoint::Endpoint;
 use crate::quic::frame::{Frame, FrameIter, StreamDir, build_ack_ranges_raw};
 use crate::quic::path::PathChallengeState;
@@ -188,6 +192,22 @@ pub struct QuicConnection {
     /// fresh CIDs via NEW_CONNECTION_ID. Suppresses re-issuing on every
     /// outbound packet.
     new_cids_issued: bool,
+
+    // -------- Phase 8: key update + datagrams + stateless reset --------
+    /// RFC 9221 DATAGRAM frame queues. Populated with peer +
+    /// our `max_datagram_frame_size` transport parameter once the
+    /// handshake surfaces them. Before that, both limits are 0 and
+    /// `send_datagram` rejects.
+    pub(crate) datagram_queues: DatagramQueues,
+    /// True once the connection has detected an incoming stateless reset
+    /// (RFC 9000 §10.3.1) or otherwise transitioned to a fully-closed
+    /// state. After this flips on every public API call is a no-op /
+    /// short-circuit; the application drains via [`Self::is_closed`].
+    pub(crate) closed: bool,
+    /// True once we've pre-derived 1-RTT next-phase keys for the very
+    /// first time. Used to defend against repeating the derivation on
+    /// every drain cycle.
+    pub(crate) one_rtt_phase_initialized: bool,
 }
 
 /// RFC 9000 §8.1 anti-amplification window. Until the server has
@@ -278,6 +298,7 @@ impl QuicConnection {
         // §5.1.1: the handshake CID is implicitly sequence 0).
         let cid_local = CidPool::new(scid, None);
 
+        let our_dg = cfg.transport_params.max_datagram_frame_size;
         let mut conn = QuicConnection {
             role: Role::Client,
             endpoint,
@@ -304,6 +325,9 @@ impl QuicConnection {
             cid_remote: None,
             now_secs: 0,
             new_cids_issued: false,
+            datagram_queues: DatagramQueues::new(None, our_dg),
+            closed: false,
+            one_rtt_phase_initialized: false,
         };
 
         // Drain the ClientHello bytes the engine just produced into the
@@ -338,6 +362,7 @@ impl QuicConnection {
         let tls_cfg = build_server_tls_config(&cfg)?;
         let (engine, hooks) = build_server_engine(tls_cfg, tp_bytes)?;
 
+        let our_dg = cfg.transport_params.max_datagram_frame_size;
         Ok(QuicConnection {
             role: Role::Server,
             endpoint,
@@ -364,6 +389,9 @@ impl QuicConnection {
             cid_remote: None,
             now_secs: 0,
             new_cids_issued: false,
+            datagram_queues: DatagramQueues::new(None, our_dg),
+            closed: false,
+            one_rtt_phase_initialized: false,
         })
     }
 
@@ -403,6 +431,22 @@ impl QuicConnection {
     /// returned error means the engine state was *not* updated by that
     /// packet; previously-applied progress remains).
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
+        // RFC 9000 §10.3.1: once the connection has observed a
+        // stateless reset, further datagrams are silently dropped.
+        if self.closed {
+            return Ok(());
+        }
+        // Phase 8 — RFC 9000 §10.3.1 stateless-reset detection. Any
+        // datagram whose last 16 bytes match a stateless_reset_token
+        // we previously received (via NEW_CONNECTION_ID on the remote
+        // CID pool) triggers an immediate close. We check up-front so
+        // a reset received in lieu of a valid packet still triggers
+        // the close even if it would have failed parsing further down.
+        if self.detect_stateless_reset(datagram) {
+            self.closed = true;
+            return Ok(());
+        }
+
         // RFC 9000 §8.1 — every byte received from an unvalidated peer
         // expands the server's outbound AMP budget by 3×. Bytes that
         // turn out to belong to a non-decryptable packet still count
@@ -563,6 +607,10 @@ impl QuicConnection {
     /// Drains one outbound UDP datagram. Returns an empty `Vec` when
     /// nothing is pending. Each call returns at most one datagram.
     pub fn pop_datagram(&mut self) -> Vec<u8> {
+        // Phase 8 — closed connections never emit.
+        if self.closed {
+            return Vec::new();
+        }
         // Server-side: if a Retry packet is pending, emit it first
         // (and only it — Retry is its own datagram per RFC 9000 §17.2.5,
         // not coalesced with anything else).
@@ -730,6 +778,10 @@ impl QuicConnection {
             if self.handshake_complete && !self.new_cids_issued {
                 return true;
             }
+            // Phase 8 — DATAGRAM frames awaiting transmission.
+            if !self.datagram_queues.outbound.is_empty() {
+                return true;
+            }
         }
         false
     }
@@ -889,6 +941,342 @@ impl QuicConnection {
         // 3×PTO timing is a Phase-8 concern.
         let data = self.path.issue(&mut rng, Duration::ZERO);
         Ok(data)
+    }
+
+    // ============================================================
+    // Phase 8 — public API: key update / DATAGRAM / closed state
+    // ============================================================
+
+    /// True once the connection has detected an incoming stateless reset
+    /// (RFC 9000 §10.3.1) or otherwise transitioned to a fully-closed
+    /// state. Subsequent calls to [`Self::feed_datagram`] and
+    /// [`Self::pop_datagram`] become no-ops.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Queues `data` for transmission as an unreliable DATAGRAM frame
+    /// (RFC 9221). Returns:
+    /// * [`Error::InappropriateState`] if the handshake hasn't completed
+    ///   or the peer didn't advertise `max_datagram_frame_size`.
+    /// * [`Error::IllegalParameter`] if the resulting frame size would
+    ///   exceed the peer's advertised maximum.
+    ///
+    /// DATAGRAM frames are sent on the 1-RTT level; they are
+    /// ack-eliciting but NOT retransmitted on loss.
+    pub fn send_datagram(&mut self, data: &[u8]) -> Result<(), Error> {
+        if self.closed {
+            return Err(Error::InappropriateState);
+        }
+        if !self.handshake_complete {
+            // RFC 9221 §5: DATAGRAM frames only travel in 0-RTT and
+            // 1-RTT packets. Phase 8 doesn't ship 0-RTT, so we gate on
+            // handshake completion.
+            return Err(Error::InappropriateState);
+        }
+        self.datagram_queues.send(data)
+    }
+
+    /// Drains the next received DATAGRAM payload in arrival order,
+    /// or `None` if the inbound queue is empty.
+    pub fn recv_datagram(&mut self) -> Option<Vec<u8>> {
+        if self.closed {
+            return None;
+        }
+        self.datagram_queues.recv()
+    }
+
+    /// Initiates a 1-RTT key update (RFC 9001 §6.1).
+    ///
+    /// On success the next outbound short-header packet carries the
+    /// flipped Key Phase bit (RFC 9001 §6.1). Returns
+    /// [`Error::InappropriateState`] if:
+    /// * the handshake hasn't completed yet,
+    /// * a previously-initiated update is still unconfirmed (RFC 9001
+    ///   §6.1 forbids back-to-back updates), or
+    /// * the connection has been closed.
+    ///
+    /// Receiver-initiated updates (i.e. observing the peer flip the
+    /// phase bit) commit both sides synchronously via
+    /// [`Self::commit_rx_key_phase_flip`] — no application call is
+    /// needed for that direction.
+    pub fn initiate_key_update(&mut self) -> Result<(), Error> {
+        if self.closed || !self.handshake_complete {
+            return Err(Error::InappropriateState);
+        }
+        let lk = self.endpoint.crypto.at(Level::OneRtt);
+        if lk.tx_phase_pending_confirm {
+            // RFC 9001 §6.1: an endpoint MUST NOT initiate a subsequent
+            // key update until it has received an acknowledgment for a
+            // packet sent at the current key phase.
+            return Err(Error::InappropriateState);
+        }
+        if lk.tx_by_phase[0].is_none() && lk.tx.is_none() {
+            // No 1-RTT tx keys at all → handshake didn't really finish.
+            return Err(Error::InappropriateState);
+        }
+        // Commit tx to the next phase.
+        let new_phase = self.endpoint.crypto.one_rtt_phase ^ 1;
+        self.flip_tx_key_phase(new_phase);
+        self.endpoint
+            .crypto
+            .at_mut(Level::OneRtt)
+            .tx_phase_pending_confirm = true;
+        Ok(())
+    }
+
+    // ============================================================
+    // Phase 8 — internal helpers (key update + stateless reset)
+    // ============================================================
+
+    /// Pre-derive the per-phase 1-RTT keys (both tx and rx) once the
+    /// engine has surfaced the initial 1-RTT traffic secrets. Called
+    /// from [`Self::drain_engine_outputs`] after a fresh OneRtt secret
+    /// lands. Idempotent via `one_rtt_phase_initialized`.
+    ///
+    /// RFC 9001 §6: the header-protection key is *not* updated during
+    /// a key update. We capture the original `quic hp` key bytes here
+    /// and reuse them across all subsequent phase flips via
+    /// [`derive_dir_keys_preserve_hp`].
+    fn maybe_initialize_one_rtt_phases(&mut self) {
+        if self.one_rtt_phase_initialized {
+            return;
+        }
+        let alg = match self.negotiated_suite.and_then(suite_to_aead) {
+            Some(a) => a,
+            None => return,
+        };
+        let lk = self.endpoint.crypto.at_mut(Level::OneRtt);
+        if let (Some(tx), Some(rx)) = (lk.tx.as_ref(), lk.rx.as_ref()) {
+            let tx0_secret = tx.secret.clone();
+            let rx0_secret = rx.secret.clone();
+            // Cache the HP key bytes for the lifetime of the connection.
+            lk.tx_hp_key_bytes = derive_hp_key_bytes(alg, &tx0_secret);
+            lk.rx_hp_key_bytes = derive_hp_key_bytes(alg, &rx0_secret);
+            // Seed phase 0 with the just-derived legacy keys. (The
+            // hp slot in DirKeys was built from the same hp bytes;
+            // it doesn't matter whether we cloned them here or not —
+            // they're equivalent.)
+            lk.tx_by_phase[0] = Some(derive_dir_keys_preserve_hp(
+                alg,
+                &tx0_secret,
+                &lk.tx_hp_key_bytes,
+            ));
+            lk.rx_by_phase[0] = Some(derive_dir_keys_preserve_hp(
+                alg,
+                &rx0_secret,
+                &lk.rx_hp_key_bytes,
+            ));
+            // Pre-derive phase-1 keys from the next-generation secrets
+            // (RFC 9001 §6.1, label "quic ku"). HP key stays the same.
+            let tx1_secret = derive_next_application_secret(alg, &tx0_secret);
+            let rx1_secret = derive_next_application_secret(alg, &rx0_secret);
+            lk.tx_by_phase[1] = Some(derive_dir_keys_preserve_hp(
+                alg,
+                &tx1_secret,
+                &lk.tx_hp_key_bytes,
+            ));
+            lk.rx_by_phase[1] = Some(derive_dir_keys_preserve_hp(
+                alg,
+                &rx1_secret,
+                &lk.rx_hp_key_bytes,
+            ));
+            self.endpoint.crypto.one_rtt_phase = 0;
+            self.one_rtt_phase_initialized = true;
+        }
+    }
+
+    /// Commit a sender-initiated phase flip (tx only). Updates the
+    /// legacy `tx` slot to mirror `tx_by_phase[new_phase]` so existing
+    /// build paths keep working unchanged (RFC 9001 §6.1).
+    ///
+    /// The HP key bytes are reused from
+    /// [`crate::quic::crypto::LevelKeys::tx_hp_key_bytes`] — RFC 9001
+    /// §6 mandates that the header-protection key stay constant for
+    /// the lifetime of the connection.
+    fn flip_tx_key_phase(&mut self, new_phase: u8) {
+        let new_phase = new_phase & 1;
+        let alg = match self.negotiated_suite.and_then(suite_to_aead) {
+            Some(a) => a,
+            None => return,
+        };
+        let hp_bytes = self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx_hp_key_bytes
+            .clone();
+        if hp_bytes.is_empty() {
+            return;
+        }
+        // Mirror the per-phase slot into the legacy `tx`.
+        let new_secret_opt = self.endpoint.crypto.at(Level::OneRtt).tx_by_phase[new_phase as usize]
+            .as_ref()
+            .map(|k| k.secret.clone());
+        if let Some(secret) = new_secret_opt {
+            let new_keys = derive_dir_keys_preserve_hp(alg, &secret, &hp_bytes);
+            self.endpoint.crypto.at_mut(Level::OneRtt).tx = Some(new_keys);
+            // Pre-derive the *next-next* tx (the one we'd flip to on
+            // the next update) and store it in the now-vacated slot.
+            let next_secret = derive_next_application_secret(alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
+            self.endpoint.crypto.at_mut(Level::OneRtt).tx_by_phase[(new_phase ^ 1) as usize] =
+                Some(next_keys);
+        }
+        self.endpoint.crypto.one_rtt_phase = new_phase;
+    }
+
+    /// Commit a receiver-observed phase flip (RFC 9001 §6.2): we just
+    /// successfully opened a packet whose Key Phase bit differs from
+    /// our current phase. Update the rx legacy slot, refresh the
+    /// next-generation rx chain, AND — per RFC 9001 §6.2 — if we
+    /// hadn't already initiated a tx-side update, flip tx too.
+    ///
+    /// The just-rotated-out OLD phase's rx keys are stashed into
+    /// `prev_rx_keys` so a delayed old-phase packet (re-ordered behind
+    /// the new-phase one) can still decrypt — RFC 9001 §6.2: "An
+    /// endpoint MUST retain old keys until it has successfully
+    /// unprotected a packet sent using the new keys." We retain across
+    /// exactly one commit (the next commit discards `prev_rx_keys`).
+    fn commit_rx_key_phase_flip(&mut self, new_phase: u8) {
+        let new_phase = new_phase & 1;
+        let old_phase = new_phase ^ 1;
+        let alg = match self.negotiated_suite.and_then(suite_to_aead) {
+            Some(a) => a,
+            None => return,
+        };
+        let hp_bytes = self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .rx_hp_key_bytes
+            .clone();
+        if hp_bytes.is_empty() {
+            return;
+        }
+        // Stash the old-phase rx keys as the "previous" before
+        // overwriting them with next-next.
+        {
+            let lk = self.endpoint.crypto.at_mut(Level::OneRtt);
+            lk.prev_rx_keys = lk.rx_by_phase[old_phase as usize].take();
+        }
+        // Sync the legacy `rx` slot to the new phase's keys + roll the
+        // next-next rx chain into the slot we just vacated.
+        let new_rx_secret = self.endpoint.crypto.at(Level::OneRtt).rx_by_phase[new_phase as usize]
+            .as_ref()
+            .map(|k| k.secret.clone());
+        if let Some(secret) = new_rx_secret {
+            let new_rx = derive_dir_keys_preserve_hp(alg, &secret, &hp_bytes);
+            self.endpoint.crypto.at_mut(Level::OneRtt).rx = Some(new_rx);
+            let next_secret = derive_next_application_secret(alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
+            self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[old_phase as usize] =
+                Some(next_keys);
+        }
+        let tx_pending = self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx_phase_pending_confirm;
+        if !tx_pending {
+            // Receiver-initiated update: also flip tx so the peer sees
+            // our reply under the new phase. The local `tx_by_phase`
+            // already holds the right keys (pre-derived at install /
+            // a previous flip).
+            self.flip_tx_key_phase(new_phase);
+        } else {
+            // tx was already flipped by initiate_key_update — the
+            // peer's matching reply confirms our update.
+            self.endpoint
+                .crypto
+                .at_mut(Level::OneRtt)
+                .tx_phase_pending_confirm = false;
+        }
+        self.endpoint.crypto.one_rtt_phase = new_phase;
+    }
+
+    /// Refresh the per-phase tx + rx chains so the slot opposite
+    /// `current_phase` holds the *next-next* keys, ready for a future
+    /// peer-initiated update.
+    ///
+    /// Called once we've confirmed a sender-initiated update: at that
+    /// point both sides are at `current_phase` and the OLD slots can
+    /// safely be rolled to the next-next generation (RFC 9001 §6.1 /
+    /// §6.2: old keys can be discarded once a packet has been
+    /// successfully authenticated under the new keys).
+    fn refresh_phase_chains_post_confirm(&mut self, current_phase: u8) {
+        let alg = match self.negotiated_suite.and_then(suite_to_aead) {
+            Some(a) => a,
+            None => return,
+        };
+        let tx_hp = self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx_hp_key_bytes
+            .clone();
+        let rx_hp = self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .rx_hp_key_bytes
+            .clone();
+        if tx_hp.is_empty() || rx_hp.is_empty() {
+            return;
+        }
+        // Roll rx[old_phase] = ku(rx[current_phase].secret)
+        let cur_rx_secret = self.endpoint.crypto.at(Level::OneRtt).rx_by_phase
+            [current_phase as usize]
+            .as_ref()
+            .map(|k| k.secret.clone());
+        if let Some(secret) = cur_rx_secret {
+            let next_secret = derive_next_application_secret(alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &rx_hp);
+            self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[(current_phase ^ 1) as usize] =
+                Some(next_keys);
+        }
+        // Roll tx[old_phase] = ku(tx[current_phase].secret)
+        let cur_tx_secret = self.endpoint.crypto.at(Level::OneRtt).tx_by_phase
+            [current_phase as usize]
+            .as_ref()
+            .map(|k| k.secret.clone());
+        if let Some(secret) = cur_tx_secret {
+            let next_secret = derive_next_application_secret(alg, &secret);
+            let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &tx_hp);
+            self.endpoint.crypto.at_mut(Level::OneRtt).tx_by_phase[(current_phase ^ 1) as usize] =
+                Some(next_keys);
+        }
+    }
+
+    /// RFC 9000 §10.3.1 — detect an incoming stateless reset.
+    ///
+    /// A stateless reset is a UDP datagram whose last 16 bytes equal a
+    /// stateless_reset_token the peer previously issued us. We scan
+    /// `cid_remote` for any token match. The leading bytes are
+    /// random / unrelated; we don't validate header structure.
+    fn detect_stateless_reset(&self, datagram: &[u8]) -> bool {
+        if datagram.len() < 21 {
+            // RFC 9000 §10.3: a stateless reset MUST be at least
+            // 21 bytes (a few header-disguise bytes plus the 16-byte
+            // token).
+            return false;
+        }
+        let tail: [u8; 16] = datagram[datagram.len() - 16..]
+            .try_into()
+            .expect("16-byte tail slice");
+        let pool = match self.cid_remote.as_ref() {
+            Some(p) => p,
+            None => return false,
+        };
+        use crate::ct::ConstantTimeEq;
+        for entry in pool.entries.values() {
+            if let Some(tok) = entry.reset_token.as_ref()
+                && bool::from(tok.ct_eq(&tail))
+            {
+                return true;
+            }
+        }
+        false
     }
 
     // ============================================================
@@ -1143,6 +1531,18 @@ impl QuicConnection {
         {
             self.streams = Some(Streams::new(self.role, &self.our_params, peer));
         }
+        // Phase 8 — once the peer's transport params arrive, configure
+        // the DATAGRAM peer limit. The our-side limit was set at
+        // connection-build time.
+        if let Some(peer) = self.peer_params.as_ref() {
+            let peer_dg = peer.max_datagram_frame_size.unwrap_or(0);
+            if self.datagram_queues.peer_max_frame_size != peer_dg {
+                self.datagram_queues.peer_max_frame_size = peer_dg;
+            }
+        }
+        // Phase 8 — initialize per-phase 1-RTT keys once both tx + rx
+        // 1-RTT slots are populated. Idempotent.
+        self.maybe_initialize_one_rtt_phases();
     }
 
     /// Drives the TLS engine one step after fresh handshake bytes have
@@ -1212,6 +1612,10 @@ impl QuicConnection {
         }
         // Pending Retry datagram (server-side, before pop drains it).
         if self.pending_retry_datagram.is_some() {
+            return true;
+        }
+        // Phase 8 — DATAGRAM frames awaiting transmission.
+        if !self.datagram_queues.outbound.is_empty() {
             return true;
         }
         false
@@ -1440,14 +1844,19 @@ impl QuicConnection {
         if sample_end > datagram.len() {
             return Err(Error::Decode);
         }
-        let dir_keys_ref = match self.endpoint.crypto.at(Level::OneRtt).rx.as_ref() {
+        // For header protection the legacy `rx` slot works fine: the
+        // hp key is derived from the per-phase secret but only the
+        // 1-RTT keys are guaranteed to differ on a phase flip — and
+        // RFC 9001 §5.4 has the hp key SAME across phases (only the
+        // AEAD key + IV change). We use `rx` as the HP key source.
+        let dir_keys_for_hp = match self.endpoint.crypto.at(Level::OneRtt).rx.as_ref() {
             Some(k) => k,
             None => return Ok(datagram.len()),
         };
         let sample_arr: [u8; 16] = datagram[sample_start..sample_end]
             .try_into()
             .expect("16-byte slice");
-        let mask = dir_keys_ref.hp.mask(&sample_arr)?;
+        let mask = dir_keys_for_hp.hp.mask(&sample_arr)?;
         // Short header: 1-RTT packet runs to end of datagram (no length
         // field). We work on the whole remaining datagram.
         let mut pkt = datagram.to_vec();
@@ -1460,6 +1869,11 @@ impl QuicConnection {
         let largest_rx = self.endpoint.pn.application.largest_rx;
         let pn = decode_packet_number(largest_rx.unwrap_or(0), truncated_pn, pn_nbits);
 
+        // RFC 9001 §6 — read the now-unprotected Key Phase bit. The
+        // first byte's bit 2 carries the phase (0 or 1).
+        let pkt_phase: u8 = (pkt[0] >> 2) & 1;
+        let current_phase = self.endpoint.crypto.one_rtt_phase;
+
         let aad_end = hdr.pn_offset + pn_len as usize;
         let aad: Vec<u8> = pkt[..aad_end].to_vec();
         let ct_with_tag = &mut pkt[aad_end..];
@@ -1471,7 +1885,86 @@ impl QuicConnection {
             .try_into()
             .expect("16-byte tag slice");
         let payload = &mut ct_with_tag[..tag_start];
-        aead_open(dir_keys_ref, pn, &aad, payload, &tag)?;
+
+        // Pick rx keys for the packet's advertised phase. RFC 9001
+        // §6.2: the pre-derived next-phase keys are always ready so
+        // an out-of-order phase-flipped packet decrypts without
+        // stalling.
+        let rx_keys_for_phase = if self.one_rtt_phase_initialized {
+            self.endpoint
+                .crypto
+                .at(Level::OneRtt)
+                .rx_for_phase(pkt_phase)
+                .cloned()
+        } else {
+            self.endpoint.crypto.at(Level::OneRtt).rx.clone()
+        };
+        let rx_keys = match rx_keys_for_phase {
+            Some(k) => k,
+            None => return Ok(datagram.len()),
+        };
+        // First attempt with the primary slot for this phase.
+        let primary_result = aead_open(&rx_keys, pn, &aad, payload, &tag);
+        let opened_with_prev = if primary_result.is_err() {
+            // Fallback: a delayed packet at the *previous* phase (RFC
+            // 9001 §6.2) — if `prev_rx_keys` is populated AND the
+            // packet's phase matches the just-rotated-out slot, try
+            // it before giving up.
+            if self.one_rtt_phase_initialized
+                && pkt_phase != self.endpoint.crypto.one_rtt_phase
+                && self
+                    .endpoint
+                    .crypto
+                    .at(Level::OneRtt)
+                    .prev_rx_keys
+                    .is_some()
+            {
+                let prev = self
+                    .endpoint
+                    .crypto
+                    .at(Level::OneRtt)
+                    .prev_rx_keys
+                    .clone()
+                    .expect("checked");
+                aead_open(&prev, pn, &aad, payload, &tag)?;
+                true
+            } else {
+                primary_result?;
+                false
+            }
+        } else {
+            false
+        };
+        let _ = opened_with_prev;
+
+        // RFC 9001 §6.2: a successfully-opened phase-flipped packet
+        // commits the rx phase (and, if we haven't already initiated a
+        // tx-side update, also commits the tx side).
+        if self.one_rtt_phase_initialized && pkt_phase != current_phase {
+            self.commit_rx_key_phase_flip(pkt_phase);
+        } else if self.one_rtt_phase_initialized
+            && pkt_phase == current_phase
+            && self
+                .endpoint
+                .crypto
+                .at(Level::OneRtt)
+                .tx_phase_pending_confirm
+        {
+            // RFC 9001 §6.1: receiving a packet at the new phase
+            // (matching our tx) confirms the peer has switched too —
+            // we may now initiate another update if desired.
+            self.endpoint
+                .crypto
+                .at_mut(Level::OneRtt)
+                .tx_phase_pending_confirm = false;
+            // Refresh the rx + tx phase chains so the just-vacated
+            // slots hold the next-next keys, ready for a future
+            // *peer*-initiated update. Without this, the OLD slot
+            // would still hold the original-generation rx keys and
+            // the next peer-initiated update would fail to decrypt.
+            self.refresh_phase_chains_post_confirm(current_phase);
+        }
+
         let cleartext: Vec<u8> = payload.to_vec();
         self.dispatch_frames(Level::OneRtt, pn, &cleartext)?;
         // Short-header packet always consumes the rest of the datagram.
@@ -1655,10 +2148,14 @@ impl QuicConnection {
                     // store; just count as ack-eliciting and drop.
                     ack_eliciting = true;
                 }
-                _ => {
-                    // Any other frame at this phase: count as
-                    // ack-eliciting to be safe.
+                Frame::Datagram { data } => {
+                    // RFC 9221 §5: DATAGRAM frames are ack-eliciting
+                    // but NOT retransmitted on loss. Push to the
+                    // inbound queue for application draining.
                     ack_eliciting = true;
+                    if matches!(level, Level::OneRtt) {
+                        self.datagram_queues.enqueue_inbound(data.to_vec());
+                    }
                 }
             }
         }
@@ -1733,7 +2230,10 @@ impl QuicConnection {
                     .map(|p| !p.pending_retire.is_empty())
                     .unwrap_or(false)
                 || (self.handshake_complete && !self.new_cids_issued));
-        if !has_crypto && !has_pending_ack && !has_streams && !has_path_or_cid {
+        // Phase 8 — DATAGRAM frames live only at the 1-RTT level.
+        let has_datagrams =
+            matches!(level, Level::OneRtt) && !self.datagram_queues.outbound.is_empty();
+        if !has_crypto && !has_pending_ack && !has_streams && !has_path_or_cid && !has_datagrams {
             return None;
         }
         // Keys must be installed for this direction.
@@ -1876,7 +2376,17 @@ impl QuicConnection {
                 )
             }
             Level::OneRtt => {
-                build_short_header(self.endpoint.cids.peer.as_slice(), false, false, pn, pn_len)
+                // RFC 9001 §6 — embed the current Key Phase bit into
+                // the short-header first byte. The bit is covered by
+                // header protection.
+                let key_phase = self.endpoint.crypto.one_rtt_phase != 0;
+                build_short_header(
+                    self.endpoint.cids.peer.as_slice(),
+                    false,
+                    key_phase,
+                    pn,
+                    pn_len,
+                )
             }
             Level::EarlyData => {
                 // Phase 4 doesn't emit 0-RTT.
@@ -2028,6 +2538,24 @@ impl QuicConnection {
                     };
                     popped.encode(&mut out);
                 }
+            }
+
+            // RFC 9221 — DATAGRAM frames (one per pop, FIFO). Drain
+            // until the payload cap is hit or the outbound queue is
+            // empty. Each frame is encoded via the standard codec which
+            // emits the length-prefixed 0x31 form (so frames can be
+            // followed by other frames without ambiguity).
+            const ONERTT_PAYLOAD_CAP_DG: usize = 1100;
+            loop {
+                let remaining = ONERTT_PAYLOAD_CAP_DG.saturating_sub(out.len());
+                if remaining < 2 {
+                    break;
+                }
+                let popped = match self.datagram_queues.pop_outbound(remaining) {
+                    Some(d) => d,
+                    None => break,
+                };
+                Frame::Datagram { data: &popped }.encode(&mut out);
             }
         }
 
@@ -3290,5 +3818,428 @@ mod tests {
             !c.path.has_outstanding(),
             "PATH_RESPONSE should have cleared the outstanding challenge"
         );
+    }
+
+    // =====================================================================
+    // Phase 8 — Key Update + DATAGRAM + Stateless Reset integration tests
+    // =====================================================================
+
+    /// Pair-helper that opts into DATAGRAM by advertising
+    /// `max_datagram_frame_size = 1200` on both sides. Mirrors
+    /// [`loopback_pair`] otherwise.
+    fn datagram_loopback_pair() -> (QuicConnection, QuicConnection) {
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut params = loopback_params();
+        params.max_datagram_frame_size = Some(1200);
+
+        let client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: params,
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        (client, server)
+    }
+
+    /// Test — `initiate_key_update` flips the wire Key Phase bit, the
+    /// peer commits, both sides exchange data under the new keys, and
+    /// the *server* can initiate the next update to flip back.
+    ///
+    /// RFC 9001 §6.1 / §6.2 — sender + receiver paths.
+    #[test]
+    fn key_update_bidirectional_integration() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+
+        // Drain post-handshake NEW_CID exchange.
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Initially both sides at phase 0.
+        assert_eq!(c.endpoint.crypto.one_rtt_phase, 0);
+        assert_eq!(s.endpoint.crypto.one_rtt_phase, 0);
+
+        // Client initiates the update.
+        c.initiate_key_update().expect("client initiates");
+        assert_eq!(c.endpoint.crypto.one_rtt_phase, 1);
+        assert!(c.endpoint.crypto.at(Level::OneRtt).tx_phase_pending_confirm);
+
+        // Force a client→server 1-RTT packet: open a stream and write
+        // some bytes (the STREAM frame goes in a phase-1 packet).
+        let cid = c.open_bidi().expect("open bidi");
+        c.write(cid, b"hello-after-update").expect("write");
+
+        // Server processes the phase-1 packet → commits.
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(s.endpoint.crypto.one_rtt_phase, 1, "server commits phase 1");
+        // Client's confirm: as soon as the server's reply (at phase 1)
+        // arrives, tx_phase_pending_confirm flips to false.
+        assert!(
+            !c.endpoint.crypto.at(Level::OneRtt).tx_phase_pending_confirm,
+            "client confirms after seeing server's phase-1 reply"
+        );
+
+        // Round-trip more data — should all flow under phase 1.
+        let mut buf = [0u8; 64];
+        let (n, _fin) = s.read(StreamId(cid.0), &mut buf).expect("server read");
+        assert_eq!(&buf[..n], b"hello-after-update");
+        // Server writes back at phase 1.
+        let _ = s
+            .write(StreamId(cid.0), b"reply-phase-1")
+            .expect("server write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let mut buf2 = [0u8; 64];
+        let (n2, _fin) = c.read(cid, &mut buf2).expect("client read");
+        assert_eq!(&buf2[..n2], b"reply-phase-1");
+
+        // Now SERVER initiates the next update (back to phase 0).
+        s.initiate_key_update().expect("server initiates");
+        assert_eq!(
+            s.endpoint.crypto.one_rtt_phase, 0,
+            "server flipped to phase 0"
+        );
+
+        // Server writes again so the phase-0 packet actually goes on
+        // the wire.
+        s.write(StreamId(cid.0), b"phase-0-again")
+            .expect("server write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(
+            c.endpoint.crypto.one_rtt_phase, 0,
+            "client commits server-initiated phase 0"
+        );
+        let mut buf3 = [0u8; 64];
+        let (n3, _fin) = c.read(cid, &mut buf3).expect("client read 2");
+        assert!(n3 > 0, "client must see phase-0 reply");
+        assert_eq!(&buf3[..n3], b"phase-0-again");
+    }
+
+    /// Test — calling `initiate_key_update` twice without a peer
+    /// confirm returns `InappropriateState` (RFC 9001 §6.1).
+    #[test]
+    fn key_update_cannot_initiate_unconfirmed() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        c.initiate_key_update().expect("first ok");
+        let r = c.initiate_key_update();
+        assert!(
+            matches!(r, Err(Error::InappropriateState)),
+            "second initiate must fail until confirmed"
+        );
+    }
+
+    /// Test — RFC 9221 round-trip via the public API. Both forms
+    /// (0x30 / 0x31) decode through the codec; the integration test
+    /// drives the length-prefixed 0x31 form end-to-end.
+    #[test]
+    fn datagram_roundtrip_integration() {
+        let (mut c, mut s) = datagram_loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Both sides see the peer advertised 1200.
+        assert_eq!(c.datagram_queues.peer_max_frame_size, 1200);
+        assert_eq!(s.datagram_queues.peer_max_frame_size, 1200);
+
+        c.send_datagram(b"hello-server").expect("client send");
+        s.send_datagram(b"hello-client").expect("server send");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(s.recv_datagram().as_deref(), Some(&b"hello-server"[..]));
+        assert_eq!(c.recv_datagram().as_deref(), Some(&b"hello-client"[..]));
+    }
+
+    /// Test — `send_datagram` is rejected when the peer didn't
+    /// advertise `max_datagram_frame_size` (RFC 9221 §3).
+    #[test]
+    fn datagram_refused_if_peer_didnt_advertise() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let r = c.send_datagram(b"hi");
+        assert!(matches!(r, Err(Error::InappropriateState)));
+        let r2 = s.send_datagram(b"hi");
+        assert!(matches!(r2, Err(Error::InappropriateState)));
+    }
+
+    /// Test — `send_datagram` is rejected when the payload would
+    /// exceed the peer's advertised maximum frame size.
+    #[test]
+    fn datagram_exceeds_peer_max_frame_size_rejected() {
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut params = loopback_params();
+        params.max_datagram_frame_size = Some(100);
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client");
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: params,
+            ..QuicConfig::default()
+        })
+        .expect("server");
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Peer advertises 100; a 200-byte payload would yield a frame
+        // larger than 100 → rejected.
+        let big = alloc::vec![0u8; 200];
+        let r = c.send_datagram(&big);
+        assert!(matches!(r, Err(Error::IllegalParameter)));
+        // Small payload fits.
+        assert!(c.send_datagram(b"ok").is_ok());
+    }
+
+    /// Test — a DATAGRAM frame in a dropped packet is NOT retransmitted
+    /// (RFC 9221 §5). The receiver never sees that datagram, but
+    /// subsequent datagrams still flow.
+    #[test]
+    fn datagram_not_retransmitted_on_loss() {
+        let (mut c, mut s) = datagram_loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Queue a datagram and capture its packet — but DROP it.
+        c.send_datagram(b"lost-datagram").expect("queue");
+        let dropped = c.pop_datagram();
+        assert!(
+            !dropped.is_empty(),
+            "client emitted packet for lost datagram"
+        );
+        // Server doesn't get it.
+        // Queue a second datagram and deliver normally.
+        c.send_datagram(b"survives").expect("queue 2");
+        // Flush both directions.
+        loop {
+            let dg = c.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            s.feed_datagram(&dg).expect("server feed");
+        }
+        loop {
+            let dg = s.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            c.feed_datagram(&dg).expect("client feed");
+        }
+        // Server received only the surviving payload.
+        let first = s.recv_datagram();
+        assert_eq!(first.as_deref(), Some(&b"survives"[..]));
+        let second = s.recv_datagram();
+        assert!(
+            second.is_none(),
+            "lost datagram must NOT be retransmitted by the QUIC layer"
+        );
+    }
+
+    /// Test — fabricated stateless-reset datagram closes the connection.
+    /// RFC 9000 §10.3.1.
+    #[test]
+    fn stateless_reset_recognized_closes_connection() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        // Drive a few extra rounds so post-handshake NEW_CID exchange
+        // populates the cid_remote pool with peer-issued reset tokens.
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Pull a reset token the server issued to the client (a token
+        // sitting on the client's cid_remote pool).
+        let token = {
+            let pool = c.cid_remote.as_ref().expect("cid_remote");
+            let entry = pool
+                .entries
+                .values()
+                .find(|e| e.reset_token.is_some())
+                .expect("at least one entry with a token");
+            entry.reset_token.unwrap()
+        };
+        // Build a fabricated reset datagram: random leading bytes +
+        // the known reset token as the trailing 16 bytes. RFC 9000
+        // §10.3: minimum 21 bytes total.
+        let mut fake = alloc::vec![0xCDu8; 5];
+        fake.extend_from_slice(&token);
+        assert!(fake.len() >= 21);
+
+        c.feed_datagram(&fake).expect("feed accepts reset");
+        assert!(c.is_closed(), "client must close on stateless reset");
+        // Subsequent operations are no-ops.
+        c.feed_datagram(b"ignored").expect("post-close feed");
+        assert!(c.pop_datagram().is_empty());
+        assert!(c.recv_datagram().is_none());
+        let r = c.send_datagram(b"nope");
+        assert!(matches!(r, Err(Error::InappropriateState)));
+    }
+
+    /// Test — out-of-order phase delivery (RFC 9001 §6.2). Server
+    /// sends two 1-RTT packets: one at phase 0, then one at phase 1
+    /// (after server initiates). Client receives the **new-phase**
+    /// packet first (which forces the rx-phase commit on the client
+    /// via the pre-derived `rx_by_phase[1]`); then the delayed
+    /// old-phase packet arrives — and decrypts via `prev_rx_keys`.
+    ///
+    /// This exercises the §6.2 invariant that an endpoint MUST retain
+    /// old keys until a new-keys packet has been authenticated.
+    #[test]
+    fn key_update_out_of_order_packet() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(c.endpoint.crypto.one_rtt_phase, 0);
+        assert_eq!(s.endpoint.crypto.one_rtt_phase, 0);
+
+        // Open a stream and write at phase 0 (small bytes — first 1-RTT
+        // packet from the server's perspective will carry this back).
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"abc").expect("write");
+        // Deliver to the server only.
+        for _ in 0..4 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram(&dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+        }
+        // Server has the stream id materialized now. Server writes a
+        // phase-0 packet, captures it (BUFFERED, not delivered yet).
+        let sid = StreamId(cid.0);
+        s.write(sid, b"PHASE0").expect("server write phase 0");
+        let phase0_dg = s.pop_datagram();
+        assert!(!phase0_dg.is_empty(), "phase-0 packet captured");
+        // Server initiates an update; now writes a phase-1 packet.
+        s.initiate_key_update().expect("server initiates");
+        s.write(sid, b"PHASE1").expect("server write phase 1");
+        let phase1_dg = s.pop_datagram();
+        assert!(!phase1_dg.is_empty(), "phase-1 packet captured");
+        // Confirm the two datagrams have different Key Phase bits.
+        // Bit 2 of the unprotected first byte is the phase, but on
+        // wire it's masked. We DO know the first packet was emitted
+        // before the flip and the second after, so this is a
+        // semantic check, not a byte-level one.
+
+        // Deliver phase-1 FIRST (out-of-order arrival).
+        c.feed_datagram(&phase1_dg).expect("client feed phase 1");
+        assert_eq!(
+            c.endpoint.crypto.one_rtt_phase, 1,
+            "client must commit phase 1 on receiving new-phase packet"
+        );
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).prev_rx_keys.is_some(),
+            "prev_rx_keys must hold the just-rotated-out phase-0 keys"
+        );
+
+        // Now deliver the delayed phase-0 packet.
+        c.feed_datagram(&phase0_dg)
+            .expect("client feed delayed phase 0 must still decrypt");
+
+        // Both messages should be readable by the client.
+        let mut buf = [0u8; 64];
+        let mut accumulated: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        loop {
+            let ids: alloc::vec::Vec<StreamId> = c.readable_streams().collect();
+            if ids.is_empty() {
+                break;
+            }
+            for id in ids {
+                let (n, _fin) = c.read(id, &mut buf).expect("read");
+                if n == 0 {
+                    return;
+                }
+                accumulated.extend_from_slice(&buf[..n]);
+            }
+            if accumulated.len() >= 12 {
+                break;
+            }
+        }
+        // Stream payload arrives in stream-offset order: PHASE0 came
+        // first on the wire, so the reassembly delivers it first.
+        assert!(
+            accumulated.starts_with(b"PHASE0"),
+            "stream reassembly preserves offset order, not arrival order"
+        );
+        assert!(
+            accumulated.windows(b"PHASE1".len()).any(|w| w == b"PHASE1"),
+            "phase-1 bytes must also be delivered"
+        );
+    }
+
+    /// Test — a datagram whose last 16 bytes are random (not a known
+    /// reset token) does NOT close the connection. The datagram is
+    /// dropped silently (parse failure on the long/short header path).
+    #[test]
+    fn stateless_reset_random_bytes_dont_close() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // 25 bytes of random data, last 16 bytes do NOT match any
+        // known reset token.
+        let fake = alloc::vec![0x7Eu8; 25];
+        // feed_datagram either fails parsing (which we treat as an
+        // Err) or drops silently. Neither outcome flips `closed`.
+        let _ = c.feed_datagram(&fake);
+        assert!(!c.is_closed(), "random bytes must not close connection");
     }
 }
