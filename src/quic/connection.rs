@@ -166,7 +166,10 @@ pub struct QuicConnection {
     /// * server — what we observed on the first Initial *before* any Retry
     ///
     /// RFC 9000 §7.3 mandates that the server echo this exact value in
-    /// `original_destination_connection_id`; the client verifies the echo.
+    /// `original_destination_connection_id`; the client verifies the
+    /// echo in [`Self::validate_peer_transport_params`] — without that
+    /// check the forgeable Retry path (RFC 9001 §5.8 publicly-known
+    /// integrity-tag key) would silently redirect the handshake.
     /// **This is the value that mustn't drift after Retry re-keying** —
     /// see master plan risk-surface #5.
     original_dcid: Option<ConnectionId>,
@@ -331,8 +334,11 @@ impl QuicConnection {
         };
 
         // Drain the ClientHello bytes the engine just produced into the
-        // Initial-level outbound CRYPTO queue.
-        conn.drain_engine_outputs();
+        // Initial-level outbound CRYPTO queue. The peer hasn't sent
+        // anything yet, so the validation branch inside
+        // `drain_engine_outputs` is a no-op here — but the signature
+        // still returns `Result`, so propagate.
+        conn.drain_engine_outputs()?;
         Ok(conn)
     }
 
@@ -490,7 +496,17 @@ impl QuicConnection {
             // Handshake(EE/Cert/CV/Fin); the Handshake-level keys come
             // from the ServerHello, so we have to install them between
             // those two packets, not after both.
-            self.drain_engine_outputs();
+            //
+            // RFC 9000 §7.3 — if the peer's transport-parameters fail
+            // the CID-echo validation (forged-Retry attack signature)
+            // or the role-restricted field check, the connection MUST
+            // be closed with a TRANSPORT_PARAMETER_ERROR. We mark
+            // `closed = true` so subsequent `pop_datagram` returns
+            // nothing, and propagate the error to the caller.
+            if let Err(e) = self.drain_engine_outputs() {
+                self.closed = true;
+                return Err(e);
+            }
             rest = &rest[consumed..];
         }
         self.check_handshake_complete();
@@ -1463,7 +1479,15 @@ impl QuicConnection {
     /// Drains the engine's outbound CRYPTO bytes into the per-level
     /// outbound queues. Drains secret events into the CryptoState.
     /// Captures peer transport params on the first sighting.
-    fn drain_engine_outputs(&mut self) {
+    ///
+    /// Returns `Err(Error::IllegalParameter)` if the peer's transport
+    /// parameters fail the RFC 9000 §7.3 / §18.2 validation (CID-echo
+    /// mismatch or role-restricted server-only field set by a client).
+    /// Returns `Err(Error::Decode)` if the peer's TP blob is malformed.
+    /// On any error, the caller should mark the connection closed (we do
+    /// this in [`Self::feed_datagram`]) — by the time control returns
+    /// here, the peer's params have NOT been stored.
+    fn drain_engine_outputs(&mut self) -> Result<(), Error> {
         // Handshake bytes per level.
         for lvl in [
             Level::Initial,
@@ -1517,11 +1541,18 @@ impl QuicConnection {
                 }
             }
         }
-        // Peer transport params.
+        // Peer transport params. Surface decode errors instead of
+        // swallowing them (RFC 9000 §18 — a malformed TP blob is a
+        // protocol violation). Validate the CID-echo fields BEFORE we
+        // store the parsed value: an attacker-forged Retry would carry
+        // a mismatching `original_destination_connection_id`, and the
+        // only thing standing between a redirected handshake and a
+        // silent compromise is this check (RFC 9000 §7.3).
         if self.peer_params.is_none()
             && let Some(raw) = self.hooks.take_peer_params()
-            && let Ok(parsed) = TransportParameters::decode(&raw)
         {
+            let parsed = TransportParameters::decode(&raw)?;
+            self.validate_peer_transport_params(&parsed)?;
             self.peer_params = Some(parsed);
         }
         // Now that we know both sides' transport params, materialize the
@@ -1543,6 +1574,116 @@ impl QuicConnection {
         // Phase 8 — initialize per-phase 1-RTT keys once both tx + rx
         // 1-RTT slots are populated. Idempotent.
         self.maybe_initialize_one_rtt_phases();
+        Ok(())
+    }
+
+    /// Verifies that the peer's transport parameters obey the CID-echo
+    /// and role-based restrictions mandated by RFC 9000 §7.3 + §18.2.
+    ///
+    /// For the **client receiving the server's TP**:
+    /// * `original_destination_connection_id` MUST equal the very first
+    ///   DCID the client wrote on the wire — captured in
+    ///   [`Self::original_dcid`] at construction. This is the only
+    ///   thing that binds the QUIC handshake to the client's chosen
+    ///   DCID; without it, the Retry path is forgeable (the Retry
+    ///   integrity tag uses a publicly-known fixed AES-128-GCM key —
+    ///   RFC 9001 §5.8 — so an on-path attacker who observes the
+    ///   client's first Initial can mint a Retry redirecting the
+    ///   handshake to a server of their choice).
+    /// * `initial_source_connection_id` MUST equal the server's first
+    ///   SCID we observed. `endpoint.cids.peer` tracks exactly this:
+    ///   it's overwritten in [`Self::feed_long_header_packet`] on the
+    ///   first inbound server packet (the SCID field of that packet),
+    ///   and in [`Self::process_retry_packet`] when a Retry happens
+    ///   (to the Retry's SCID — which is then ALSO the post-Retry
+    ///   server's first SCID since the server keys off it).
+    /// * `retry_source_connection_id` MUST be `Some(self.retry_scid)`
+    ///   iff a Retry was processed, else MUST be absent.
+    ///
+    /// For the **server receiving the client's TP**:
+    /// * `initial_source_connection_id` MUST equal the client's first
+    ///   SCID we observed (`endpoint.cids.peer`, set by
+    ///   [`set_cids_from_first_initial`] on the first Initial).
+    /// * `original_destination_connection_id`, `retry_source_connection_id`,
+    ///   `stateless_reset_token`, and `preferred_address` MUST all be
+    ///   absent — RFC 9000 §18.2 marks them server-only and forbids the
+    ///   client from advertising them.
+    ///
+    /// Any mismatch is a fatal protocol violation; the caller maps the
+    /// returned `Err(Error::IllegalParameter)` to a connection close.
+    fn validate_peer_transport_params(&self, parsed: &TransportParameters) -> Result<(), Error> {
+        match self.role {
+            Role::Client => {
+                // RFC 9000 §7.3 — the server MUST echo the client's
+                // very first DCID in original_destination_connection_id.
+                let expected_odcid = self.original_dcid.as_ref().ok_or(Error::IllegalParameter)?;
+                let got_odcid = parsed
+                    .original_destination_connection_id
+                    .as_deref()
+                    .ok_or(Error::IllegalParameter)?;
+                if got_odcid != expected_odcid.as_slice() {
+                    return Err(Error::IllegalParameter);
+                }
+
+                // RFC 9000 §7.3 — initial_source_connection_id MUST
+                // equal the SCID the server put on its first long-
+                // header packet. `endpoint.cids.peer` was overwritten
+                // by feed_long_header_packet (or process_retry_packet)
+                // to exactly that value.
+                let expected_iscid = self.endpoint.cids.peer.as_slice();
+                let got_iscid = parsed
+                    .initial_source_connection_id
+                    .as_deref()
+                    .ok_or(Error::IllegalParameter)?;
+                if got_iscid != expected_iscid {
+                    return Err(Error::IllegalParameter);
+                }
+
+                // RFC 9000 §7.3 — retry_source_connection_id MUST be
+                // present iff a Retry happened on this handshake. If
+                // present, it MUST equal the SCID of the Retry packet
+                // (captured in self.retry_scid by process_retry_packet).
+                match (
+                    self.retry_processed,
+                    parsed.retry_source_connection_id.as_deref(),
+                ) {
+                    (false, None) => {}
+                    (true, Some(got)) => {
+                        let expected = self.retry_scid.as_ref().ok_or(Error::IllegalParameter)?;
+                        if got != expected.as_slice() {
+                            return Err(Error::IllegalParameter);
+                        }
+                    }
+                    _ => return Err(Error::IllegalParameter),
+                }
+            }
+            Role::Server => {
+                // RFC 9000 §7.3 — the client MUST advertise its
+                // initial_source_connection_id, and it MUST match the
+                // SCID the client put on its first Initial (which the
+                // server captured into `endpoint.cids.peer` via
+                // set_cids_from_first_initial).
+                let expected_iscid = self.endpoint.cids.peer.as_slice();
+                let got_iscid = parsed
+                    .initial_source_connection_id
+                    .as_deref()
+                    .ok_or(Error::IllegalParameter)?;
+                if got_iscid != expected_iscid {
+                    return Err(Error::IllegalParameter);
+                }
+
+                // RFC 9000 §18.2 — server-only fields a CLIENT MUST NOT
+                // advertise. Any presence is a protocol violation.
+                if parsed.original_destination_connection_id.is_some()
+                    || parsed.retry_source_connection_id.is_some()
+                    || parsed.stateless_reset_token.is_some()
+                    || parsed.preferred_address.is_some()
+                {
+                    return Err(Error::IllegalParameter);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drives the TLS engine one step after fresh handshake bytes have
@@ -4241,5 +4382,353 @@ mod tests {
         // Err) or drops silently. Neither outcome flips `closed`.
         let _ = c.feed_datagram(&fake);
         assert!(!c.is_closed(), "random bytes must not close connection");
+    }
+
+    /// CRITICAL regression — RFC 9000 §7.3 forged-Retry attack rejected.
+    ///
+    /// Scenario: an on-path attacker who observes the client's first
+    /// Initial can mint a syntactically-valid Retry packet (the Retry
+    /// integrity tag uses a publicly-known fixed AES-128-GCM key — RFC
+    /// 9001 §5.8 — that anyone can compute). The attacker redirects the
+    /// client at a server of their choice; that server completes the
+    /// handshake and delivers its own transport parameters via
+    /// EncryptedExtensions. Without the CID-echo verification, the
+    /// client silently accepts the redirected handshake.
+    ///
+    /// This test simulates the post-Retry / no-Retry mismatch by
+    /// injecting bytes representing a server-supplied
+    /// `original_destination_connection_id` that DOES NOT match the
+    /// DCID the client put on its first Initial. The validator MUST
+    /// reject and the connection MUST close.
+    #[test]
+    fn tp_echo_forged_retry_attack_rejected() {
+        // Build a fresh client so we know its true `original_dcid`.
+        let (server_cfg_tls, cert_der) = ed25519_server();
+        let _ = server_cfg_tls;
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+
+        // The client's true ODCID (what an honest server is required to
+        // echo). The attacker's tampered TP blob will carry DIFFERENT
+        // bytes here — exactly the smoking gun the validator hunts for.
+        let true_odcid = c
+            .original_dcid()
+            .expect("client always has an ODCID at construction")
+            .to_vec();
+        // Pick a wrong-but-well-formed value (16 bytes ≠ true_odcid).
+        let mut attacker_odcid = alloc::vec![0xFFu8; true_odcid.len().max(8)];
+        if attacker_odcid == true_odcid {
+            attacker_odcid[0] ^= 0x01;
+        }
+        assert_ne!(attacker_odcid, true_odcid, "test setup: must differ");
+
+        // We also need a plausible ISCID — the validator compares it
+        // against the server's first SCID we observed. Before any
+        // server packet has been processed, `endpoint.cids.peer` still
+        // holds the client's chosen DCID (initial seeding). The
+        // injected ISCID matching that value pushes the test cleanly
+        // past the ISCID check; the ODCID check is what we want to
+        // fail.
+        let injected_iscid = c.endpoint.cids.peer.as_slice().to_vec();
+
+        // Build a tampered TP blob with WRONG ODCID + matching ISCID.
+        let bad_tp = TransportParameters {
+            original_destination_connection_id: Some(attacker_odcid),
+            initial_source_connection_id: Some(injected_iscid),
+            max_idle_timeout_ms: Some(30_000),
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+        let mut bad_bytes = Vec::new();
+        bad_tp.encode(&mut bad_bytes);
+
+        // Inject the bad bytes directly into the hook state — this is
+        // the same path the engine would use after processing
+        // EncryptedExtensions, except we control the bytes. The next
+        // call into `drain_engine_outputs` (e.g. via any
+        // `feed_datagram` call, even with an empty payload) will pop
+        // them through the validator.
+        {
+            let mut g = c.hooks.state.lock().expect("hook state mutex poisoned");
+            g.peer_params = Some(bad_bytes);
+        }
+
+        // Trigger a drain. We use the direct method to keep the assert
+        // surface tight — but feed_datagram routes through the same
+        // path (see the explicit feed_datagram test below).
+        let res = c.drain_engine_outputs();
+        assert!(
+            matches!(res, Err(Error::IllegalParameter)),
+            "tampered ODCID must trip the validator: got {:?}",
+            res
+        );
+        // And peer_params must remain unset (the validator runs BEFORE
+        // storage, so a rejected blob never lands on the connection).
+        assert!(
+            c.peer_transport_params().is_none(),
+            "rejected TP must not be stored as peer_params"
+        );
+    }
+
+    /// Companion to [`tp_echo_forged_retry_attack_rejected`] — the
+    /// integration form: feed_datagram on a real handshake sequence
+    /// must return Err and mark the connection closed when the server's
+    /// transport parameters fail the CID-echo check.
+    #[test]
+    fn tp_echo_mismatch_via_feed_datagram_closes_connection() {
+        let (mut c, mut s) = loopback_pair();
+        // Stash the client's true ODCID before anything happens.
+        let true_odcid = c
+            .original_dcid()
+            .expect("client always has an ODCID")
+            .to_vec();
+
+        // Drive the client → server side until the server has produced
+        // its first response (which carries EE + Cert + CV + Fin and
+        // — critically — the server's transport parameters in EE).
+        // We DON'T deliver any server packets to the client yet.
+        let initial_cli = c.pop_datagram();
+        assert!(!initial_cli.is_empty());
+        s.feed_datagram(&initial_cli).expect("server feed CH");
+
+        // Collect the server's flight but don't deliver it to the client.
+        let mut server_flight: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let dg = s.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            server_flight.push(dg);
+        }
+        assert!(!server_flight.is_empty());
+
+        // Build a tampered TP blob (wrong ODCID, otherwise consistent
+        // with the loopback params). The ISCID we inject is the
+        // server's first SCID — the long-header SCID from the FIRST
+        // server datagram, which the client will set into
+        // `endpoint.cids.peer` once it parses that packet.
+        // We need the server's first SCID — extract it from the
+        // long header.
+        let first_pkt = &server_flight[0];
+        let hdr = LongHeader::parse(first_pkt).expect("server long header");
+        let server_first_scid = hdr.scid.to_vec();
+        // Pick a wrong ODCID.
+        let mut attacker_odcid = alloc::vec![0xAAu8; true_odcid.len().max(8)];
+        if attacker_odcid == true_odcid {
+            attacker_odcid[0] ^= 0x55;
+        }
+        assert_ne!(attacker_odcid, true_odcid);
+        let bad_tp = TransportParameters {
+            original_destination_connection_id: Some(attacker_odcid),
+            initial_source_connection_id: Some(server_first_scid),
+            max_idle_timeout_ms: Some(30_000),
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+        let mut bad_bytes = Vec::new();
+        bad_tp.encode(&mut bad_bytes);
+
+        // Feed the first server datagram so that `endpoint.cids.peer`
+        // gets set to the server's first SCID (validator needs this).
+        // Capture the result — this call shouldn't fail YET (the engine
+        // hasn't yet emitted peer_params from EE because we may not be
+        // through EE at this point). On success the client may or may
+        // not have processed EE; if it did, peer_params is already set
+        // legitimately and we can't test the attack. To make the test
+        // deterministic, we PRE-INJECT the bad bytes into the hook
+        // state BEFORE feeding, so they win the race against the
+        // engine's legitimate TP emission.
+        {
+            let mut g = c.hooks.state.lock().expect("hook state mutex poisoned");
+            g.peer_params = Some(bad_bytes);
+        }
+        let res = c.feed_datagram(first_pkt);
+        assert!(
+            matches!(res, Err(Error::IllegalParameter)),
+            "feed_datagram must surface the TP-echo violation: got {:?}",
+            res
+        );
+        assert!(
+            c.is_closed(),
+            "client must mark connection closed after TP violation"
+        );
+        assert!(
+            !c.is_handshake_complete(),
+            "handshake must NOT complete after TP violation"
+        );
+        // A subsequent pop_datagram on a closed connection returns
+        // nothing.
+        assert!(c.pop_datagram().is_empty());
+    }
+
+    /// A CLIENT that advertises a server-only TP (RFC 9000 §18.2) must
+    /// be rejected by the receiving SERVER. Tests
+    /// `original_destination_connection_id`, `retry_source_connection_id`,
+    /// `stateless_reset_token`, and `preferred_address`.
+    ///
+    /// We exercise the validator directly here — the legitimate CH path
+    /// would otherwise win the race and store a clean peer_params
+    /// before our tampered bytes arrive. The validator is what enforces
+    /// the rule; this test pins its behaviour against every server-only
+    /// codepoint at once.
+    #[test]
+    fn tp_server_rejects_client_advertising_server_only_field() {
+        type Mutator = fn(&mut TransportParameters);
+        let cases: &[(&str, Mutator)] = &[
+            ("ODCID", |tp| {
+                tp.original_destination_connection_id = Some(alloc::vec![0xAB; 8]);
+            }),
+            ("RetrySCID", |tp| {
+                tp.retry_source_connection_id = Some(alloc::vec![0xCD; 8]);
+            }),
+            ("StatelessResetToken", |tp| {
+                tp.stateless_reset_token = Some([0xEF; 16]);
+            }),
+            ("PreferredAddress", |tp| {
+                tp.preferred_address = Some(alloc::vec![0u8; 41]);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let (mut c, mut s) = loopback_pair();
+
+            // Drive the client → server first Initial so that the
+            // server's `endpoint.cids.peer` is set (validator needs the
+            // ISCID to compare against). After this call, the
+            // legitimate client TP has already been validated + stored
+            // — we test the validator directly with a tampered struct.
+            let initial = c.pop_datagram();
+            assert!(!initial.is_empty(), "{name}: client emitted CH");
+            s.feed_datagram(&initial)
+                .unwrap_or_else(|_| panic!("{name}: server feeds CH"));
+            assert!(
+                s.peer_transport_params().is_some(),
+                "{name}: legitimate client TP arrived"
+            );
+
+            // Build a tampered struct with a CORRECT ISCID but a
+            // forbidden server-only field set.
+            let client_first_scid = s.endpoint.cids.peer.as_slice().to_vec();
+            let mut bad_tp = TransportParameters {
+                initial_source_connection_id: Some(client_first_scid),
+                max_idle_timeout_ms: Some(30_000),
+                initial_max_data: Some(1 << 20),
+                initial_max_stream_data_bidi_local: Some(1 << 16),
+                initial_max_stream_data_bidi_remote: Some(1 << 16),
+                initial_max_stream_data_uni: Some(1 << 16),
+                initial_max_streams_bidi: Some(100),
+                initial_max_streams_uni: Some(3),
+                active_connection_id_limit: Some(2),
+                ..TransportParameters::default()
+            };
+            mutate(&mut bad_tp);
+            // Directly invoke the validator — this is the function the
+            // attacker would need to bypass to land the redirect.
+            let r = s.validate_peer_transport_params(&bad_tp);
+            assert!(
+                matches!(r, Err(Error::IllegalParameter)),
+                "{name}: server must reject client TP carrying a server-only field; got {:?}",
+                r
+            );
+        }
+    }
+
+    /// The validator must reject a server's TP whose
+    /// `initial_source_connection_id` doesn't match the SCID the client
+    /// observed on the server's first long-header packet (RFC 9000 §7.3).
+    #[test]
+    fn tp_client_rejects_server_iscid_mismatch() {
+        let (mut c, _) = loopback_pair();
+        // The client's `endpoint.cids.peer` still holds the seeded
+        // DCID at this point (no server packet received yet). For the
+        // ISCID check, we craft bytes that DON'T match that value.
+        let observed_server_scid = c.endpoint.cids.peer.as_slice().to_vec();
+        let mut wrong_iscid = observed_server_scid.clone();
+        wrong_iscid[0] ^= 0x01;
+        assert_ne!(wrong_iscid, observed_server_scid);
+        let true_odcid = c.original_dcid().expect("ODCID").to_vec();
+        let bad_tp = TransportParameters {
+            original_destination_connection_id: Some(true_odcid),
+            initial_source_connection_id: Some(wrong_iscid),
+            max_idle_timeout_ms: Some(30_000),
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+        let mut bad_bytes = Vec::new();
+        bad_tp.encode(&mut bad_bytes);
+        {
+            let mut g = c.hooks.state.lock().expect("hook state mutex");
+            g.peer_params = Some(bad_bytes);
+        }
+        let r = c.drain_engine_outputs();
+        assert!(
+            matches!(r, Err(Error::IllegalParameter)),
+            "client must reject server TP with mismatched ISCID; got {:?}",
+            r
+        );
+    }
+
+    /// The validator must reject a server's TP that omits
+    /// `retry_source_connection_id` when a Retry was processed, AND
+    /// must reject a server's TP that INCLUDES it when no Retry was
+    /// processed (RFC 9000 §7.3).
+    #[test]
+    fn tp_client_rejects_unexpected_retry_scid_presence() {
+        let (mut c, _) = loopback_pair();
+        let true_odcid = c.original_dcid().expect("ODCID").to_vec();
+        let iscid = c.endpoint.cids.peer.as_slice().to_vec();
+        // No Retry happened; injecting `retry_source_connection_id`
+        // must trip the validator.
+        let bad_tp = TransportParameters {
+            original_destination_connection_id: Some(true_odcid),
+            initial_source_connection_id: Some(iscid),
+            retry_source_connection_id: Some(alloc::vec![0xCC; 8]),
+            max_idle_timeout_ms: Some(30_000),
+            ..TransportParameters::default()
+        };
+        let mut bad_bytes = Vec::new();
+        bad_tp.encode(&mut bad_bytes);
+        {
+            let mut g = c.hooks.state.lock().expect("hook state mutex");
+            g.peer_params = Some(bad_bytes);
+        }
+        let r = c.drain_engine_outputs();
+        assert!(
+            matches!(r, Err(Error::IllegalParameter)),
+            "client must reject server TP with unexpected retry_source_connection_id; got {:?}",
+            r
+        );
     }
 }
