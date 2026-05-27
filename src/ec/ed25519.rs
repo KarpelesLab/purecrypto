@@ -539,6 +539,31 @@ impl Ed25519Signature {
         Ed25519Signature(bytes)
     }
 
+    /// Creates a signature from its `R` (32-byte compressed point) and
+    /// `S` (32-byte scalar) halves per RFC 8032 §3.3.
+    pub fn from_components(r: &[u8; 32], s: &[u8; 32]) -> Self {
+        let mut out = [0u8; 64];
+        out[..32].copy_from_slice(r);
+        out[32..].copy_from_slice(s);
+        Ed25519Signature(out)
+    }
+
+    /// The 32-byte compressed-point `R` half (the first 32 bytes of the
+    /// `R ‖ S` encoding).
+    pub fn r_bytes(&self) -> [u8; 32] {
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&self.0[..32]);
+        r
+    }
+
+    /// The 32-byte scalar `S` half (the last 32 bytes of the `R ‖ S`
+    /// encoding).
+    pub fn s_bytes(&self) -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&self.0[32..]);
+        s
+    }
+
     /// The 64-byte encoding (`R ‖ S`).
     pub fn to_bytes(&self) -> [u8; 64] {
         self.0
@@ -674,5 +699,23 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn signature_r_s_accessors_roundtrip() {
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed25519-rs", b"n", &[]);
+        let sk = Ed25519PrivateKey::generate(&mut rng);
+        let sig = sk.sign(b"rs-accessor test");
+
+        let r = sig.r_bytes();
+        let s = sig.s_bytes();
+        let rebuilt = Ed25519Signature::from_components(&r, &s);
+        assert_eq!(rebuilt.to_bytes(), sig.to_bytes());
+
+        // r ‖ s equals to_bytes().
+        let mut concat = [0u8; 64];
+        concat[..32].copy_from_slice(&r);
+        concat[32..].copy_from_slice(&s);
+        assert_eq!(concat, sig.to_bytes());
     }
 }

@@ -202,6 +202,29 @@ impl Signature {
         }
     }
 
+    /// Builds a signature from explicit `(r, s)` 32-byte big-endian
+    /// components. The byte order matches the SEC1 fixed encoding.
+    pub fn from_components(r: &[u8; 32], s: &[u8; 32]) -> Signature {
+        Signature {
+            r: Fe::from_be_bytes(r),
+            s: Fe::from_be_bytes(s),
+        }
+    }
+
+    /// The 32-byte big-endian encoding of the `r` component.
+    pub fn r_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.r.write_be_bytes(&mut out);
+        out
+    }
+
+    /// The 32-byte big-endian encoding of the `s` component.
+    pub fn s_bytes(&self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        self.s.write_be_bytes(&mut out);
+        out
+    }
+
     /// Returns the fixed 64-byte `r || s` encoding.
     pub fn to_bytes(&self) -> [u8; 64] {
         let mut out = [0u8; 64];
@@ -447,5 +470,23 @@ mod tests {
         let mut sec1 = priv_key().public_key().to_sec1();
         sec1[64] ^= 1; // perturb Y
         assert_eq!(EcdsaPublicKey::from_sec1(&sec1), Err(Error::InvalidInput));
+    }
+
+    #[test]
+    fn signature_r_s_accessors_roundtrip() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"ecdsa-rs", b"nonce", &[]);
+        let sk = EcdsaPrivateKey::generate(&mut rng);
+        let sig = sk.sign::<Sha256>(b"hello").unwrap();
+
+        let r = sig.r_bytes();
+        let s = sig.s_bytes();
+        let rebuilt = Signature::from_components(&r, &s);
+        assert_eq!(rebuilt, sig);
+
+        // r_bytes ‖ s_bytes equals to_bytes().
+        let mut concat = [0u8; 64];
+        concat[..32].copy_from_slice(&r);
+        concat[32..].copy_from_slice(&s);
+        assert_eq!(concat, sig.to_bytes());
     }
 }

@@ -275,6 +275,29 @@ impl BoxedEcdsaSignature {
         BoxedEcdsaSignature { r, s }
     }
 
+    /// The `r` component as a `BoxedUint`. Use [`Self::r_bytes`] for the
+    /// fixed-width big-endian byte encoding.
+    pub fn r(&self) -> &BoxedUint {
+        &self.r
+    }
+
+    /// The `s` component as a `BoxedUint`. See [`Self::r`].
+    pub fn s(&self) -> &BoxedUint {
+        &self.s
+    }
+
+    /// The `r` component encoded big-endian, left-padded to
+    /// `curve.order_len()` bytes (the SEC1 fixed-width encoding).
+    pub fn r_bytes(&self, curve: CurveId) -> Vec<u8> {
+        self.r.to_be_bytes(curve.order_len())
+    }
+
+    /// The `s` component encoded big-endian, left-padded to
+    /// `curve.order_len()` bytes.
+    pub fn s_bytes(&self, curve: CurveId) -> Vec<u8> {
+        self.s.to_be_bytes(curve.order_len())
+    }
+
     /// The fixed `r ‖ s` encoding, each half `curve.order_len()` bytes.
     pub fn to_bytes(&self, curve: CurveId) -> Vec<u8> {
         let len = curve.order_len();
@@ -552,5 +575,29 @@ mod tests {
         let ab = a.diffie_hellman(&b.public_key()).unwrap();
         let ba = b.diffie_hellman(&a.public_key()).unwrap();
         assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn boxed_signature_r_s_accessors_roundtrip() {
+        // Generate a real signature, then deconstruct/reconstruct via r/s.
+        let mut rng = HmacDrbg::<Sha256>::new(b"sig-rs", b"n", &[]);
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+        ] {
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let sig = sk.sign::<Sha256>(b"hello").unwrap();
+
+            // r/s as integers round-trip via from_components.
+            let rebuilt = BoxedEcdsaSignature::from_components(sig.r().clone(), sig.s().clone());
+            assert_eq!(rebuilt, sig);
+
+            // r_bytes/s_bytes concatenate to to_bytes(curve).
+            let mut concat = sig.r_bytes(curve);
+            concat.extend_from_slice(&sig.s_bytes(curve));
+            assert_eq!(concat, sig.to_bytes(curve));
+        }
     }
 }
