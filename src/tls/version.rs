@@ -1,8 +1,11 @@
 //! TLS protocol version and record content type.
 //!
-//! These two enums are the seam for future version support: the record and
-//! handshake layers carry a [`ProtocolVersion`] and branch on it where needed
-//! (currently only TLS 1.3 is implemented).
+//! [`ProtocolVersion`] is the wire-level discriminant the record and
+//! handshake layers branch on. Versions implemented in this crate:
+//! TLS 1.2 (RFC 5246, AEAD-only suites per RFC 7905), TLS 1.3
+//! (RFC 8446), DTLS 1.2 (RFC 6347), DTLS 1.3 (RFC 9147). QUIC v1
+//! (RFC 9000 / 9001) lives in `crate::quic` and reuses the TLS 1.3
+//! engine through `tls::quic_hooks`.
 
 /// A TLS protocol version, as carried on the wire (a `u16`).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
