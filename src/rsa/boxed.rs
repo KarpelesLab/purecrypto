@@ -156,6 +156,27 @@ fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
     Ok(())
 }
 
+/// Validates that the parsed PKCS#1 / PKCS#8 private-key components are
+/// internally consistent: each prime is `> 1`, `p ≠ q`, and `p · q = n`
+/// (RFC 8017 §3.2). Without this check a corrupted (or maliciously crafted)
+/// key file with mismatched primes silently slips through and produces wrong
+/// signatures, leaks information through the CRT recombination path, and
+/// in the worst case enables a Bleichenbacher-style fault on the secret
+/// exponent. We reject before the key is constructed.
+fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> Result<(), Error> {
+    let one = BoxedUint::from_u64(1);
+    if !one.lt(p) || !one.lt(q) {
+        return Err(Error::InvalidKey);
+    }
+    if p == q {
+        return Err(Error::InvalidKey);
+    }
+    if &p.mul(q) != n {
+        return Err(Error::InvalidKey);
+    }
+    Ok(())
+}
+
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
     pub fn new(n: BoxedUint, e: BoxedUint) -> Self {
@@ -464,6 +485,7 @@ impl BoxedRsaPrivateKey {
             return Err(crate::der::Error::Malformed);
         }
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
+        validate_private_components(&n, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
@@ -1032,5 +1054,74 @@ mod tests {
         // e = 4 (even, < 3 false but evenness gate fires).
         let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[4])].concat());
         assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
+    }
+
+    /// PKCS#1 private-key DER whose modulus doesn't match `p · q` is rejected.
+    /// Forge a key by taking a real key and swapping in a foreign `n` (the
+    /// public key's modulus) while keeping the original primes — `p · q`
+    /// no longer equals the surface `n`. This is the file-corruption /
+    /// fault-injection signature that
+    /// [`validate_private_components`] catches.
+    #[test]
+    fn from_pkcs1_der_rejects_mismatched_modulus() {
+        use crate::der::{encode_integer, encode_sequence};
+        let sk_a = gen_small_key(b"rsa-pkcs1-pq-a");
+        let sk_b = gen_small_key(b"rsa-pkcs1-pq-b");
+        let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
+        // Take sk_a's everything but graft sk_b's modulus on top.
+        let one = BoxedUint::from_u64(1);
+        let dp = sk_a.d.reduce(&sk_a.p.sub(&one));
+        let dq = sk_a.d.reduce(&sk_a.q.sub(&one));
+        let qinv = crate::bignum::inv_mod_boxed(&sk_a.q, &sk_a.p).unwrap();
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&be(sk_b.modulus())), // mismatched n
+                encode_integer(&be(&sk_a.e)),
+                encode_integer(&be(&sk_a.d)),
+                encode_integer(&be(&sk_a.p)),
+                encode_integer(&be(&sk_a.q)),
+                encode_integer(&be(&dp)),
+                encode_integer(&be(&dq)),
+                encode_integer(&be(&qinv)),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&der),
+            Err(crate::der::Error::Malformed)
+        ));
+    }
+
+    /// `p == q` is rejected — the resulting `n = p²` shares only one prime
+    /// factor and the CRT path collapses (qInv is undefined since
+    /// `gcd(q, p) = p ≠ 1`).
+    #[test]
+    fn from_pkcs1_der_rejects_equal_primes() {
+        use crate::der::{encode_integer, encode_sequence};
+        let sk = gen_small_key(b"rsa-pkcs1-eq-primes");
+        let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
+        // Forge a key with p = q = sk.p. Then n = p² is the modulus we present.
+        let p_sq = sk.p.mul(&sk.p);
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&be(&p_sq)),
+                encode_integer(&be(&sk.e)),
+                encode_integer(&be(&sk.d)),
+                encode_integer(&be(&sk.p)),
+                encode_integer(&be(&sk.p)), // q := p
+                // Padding for the three CRT params — parser doesn't validate
+                // them, so any nonzero value works.
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&der),
+            Err(crate::der::Error::Malformed)
+        ));
     }
 }
