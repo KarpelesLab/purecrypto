@@ -27,7 +27,10 @@ fn run(args: &[&str], stdin: &[u8]) -> (String, bool) {
 }
 
 /// Like [`run`] but also returns stderr. Used by tests that need to assert
-/// on warnings written to stderr (e.g. I-8's permission warning).
+/// on warnings written to stderr (e.g. I-8's permission warning). Today the
+/// only caller is `#[cfg(unix)]`-gated so this is unix-only too; relax when
+/// a Windows test needs it.
+#[cfg(unix)]
 fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
         .args(args)
