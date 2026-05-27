@@ -26,12 +26,22 @@ fn push_base128(out: &mut Vec<u8>, value: u64) {
 /// Encodes OID arcs (e.g. `[1, 2, 840, 113549, 1, 1, 1]`) into the DER OID
 /// body. Requires at least two arcs.
 ///
+/// The first sub-identifier carries `arc0` and `arc1` jointly: for
+/// `arc0 ∈ {0, 1}`, X.690 §8.19.4 mandates `arc1 < 40`, and the encoded
+/// value is `40·arc0 + arc1`. For `arc0 = 2`, `arc1` is unbounded, and the
+/// encoded value is `80 + arc1`. The decoder in [`parse_oid`] mirrors this.
+///
 /// # Panics
 /// Panics if fewer than two arcs are given.
 pub fn encode_oid_arcs(arcs: &[u64]) -> Vec<u8> {
     assert!(arcs.len() >= 2, "OID needs at least two arcs");
     let mut body = Vec::new();
-    push_base128(&mut body, 40 * arcs[0] + arcs[1]);
+    let first = if arcs[0] < 2 {
+        40 * arcs[0] + arcs[1]
+    } else {
+        80 + arcs[1]
+    };
+    push_base128(&mut body, first);
     for &arc in &arcs[2..] {
         push_base128(&mut body, arc);
     }
@@ -68,8 +78,17 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
         acc = (acc << 7) | (b & 0x7f) as u64;
         if b & 0x80 == 0 {
             if arcs.is_empty() {
-                arcs.push(acc / 40);
-                arcs.push(acc % 40);
+                // Per X.690 §8.19.4 the first sub-identifier encodes the
+                // joint value `40·arc0 + arc1` for `arc0 ∈ {0, 1}` (with
+                // `arc1 < 40`). For `arc0 = 2`, `arc1` may be ≥ 40, and the
+                // encoded value is `80 + arc1`.
+                if acc < 80 {
+                    arcs.push(acc / 40);
+                    arcs.push(acc % 40);
+                } else {
+                    arcs.push(2);
+                    arcs.push(acc - 80);
+                }
             } else {
                 arcs.push(acc);
             }
@@ -150,5 +169,31 @@ mod tests {
         // Trailing high-bit byte with no terminator.
         assert_eq!(parse_oid(&[0x2a, 0x86]), Err(Error::Malformed));
         assert_eq!(parse_oid(&[]), Err(Error::Malformed));
+    }
+
+    #[test]
+    fn joint_iso_itu_t_arc1_at_or_above_40() {
+        // X.690 §8.19.4: for arc0 = 2, arc1 may be ≥ 40, encoded as
+        // `80 + arc1`. The classic "arcs[0] = X/40; arcs[1] = X%40" split
+        // mis-decodes `2.40` (joint value 120) as `3.0`.
+        for arcs in [
+            alloc::vec![2u64, 40, 5],
+            alloc::vec![2, 100, 7],
+            alloc::vec![2, 999],
+            alloc::vec![2, 48, 1, 7],
+        ] {
+            let body = encode_oid_arcs(&arcs);
+            assert_eq!(parse_oid(&body).unwrap(), arcs);
+        }
+
+        // Sanity-check a couple of PKIX OIDs that fall in the standard
+        // `arc0 < 2` or `arc0 = 2, arc1 < 40` range — they're unaffected.
+        for arcs in [
+            alloc::vec![1u64, 2, 840, 113549, 1, 1, 1],
+            alloc::vec![2, 5, 29, 17],
+        ] {
+            let body = encode_oid_arcs(&arcs);
+            assert_eq!(parse_oid(&body).unwrap(), arcs);
+        }
     }
 }

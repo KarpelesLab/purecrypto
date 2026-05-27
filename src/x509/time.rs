@@ -116,7 +116,9 @@ impl Time {
     /// Parses the stored ASN.1 time into chronologically sortable components
     /// `(year, month, day, hour, minute, second)`. Handles both `UTCTime`
     /// (`YYMMDDHHMMSSZ`, with the RFC 5280 1950–2049 century rule) and
-    /// `GeneralizedTime` (`YYYYMMDDHHMMSSZ`). Returns `None` if malformed.
+    /// `GeneralizedTime` (`YYYYMMDDHHMMSSZ`). Returns `None` if malformed —
+    /// including calendar-range violations such as month 13, day 32, or a
+    /// non-leap-year Feb 29.
     fn components(&self) -> Option<(u16, u8, u8, u8, u8, u8)> {
         let b = self.repr.as_bytes();
         if b.last() != Some(&b'Z') {
@@ -141,14 +143,46 @@ impl Time {
             }
             _ => return None,
         };
-        Some((
-            year,
-            two(b, off)?,
-            two(b, off + 2)?,
-            two(b, off + 4)?,
-            two(b, off + 6)?,
-            two(b, off + 8)?,
-        ))
+        let month = two(b, off)?;
+        let day = two(b, off + 2)?;
+        let hour = two(b, off + 4)?;
+        let minute = two(b, off + 6)?;
+        let second = two(b, off + 8)?;
+        // Calendar-range validation. RFC 5280 §4.1.2.5 inherits the X.509
+        // restriction that hour ∈ 0..=23, minute/second ∈ 0..=59, and the
+        // year/month/day triple is a real Gregorian date (Feb 29 only on
+        // leap years).
+        if !(1..=12).contains(&month) {
+            return None;
+        }
+        if !(1..=days_in_month(year, month)).contains(&day) {
+            return None;
+        }
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some((year, month, day, hour, minute, second))
+    }
+}
+
+/// Whether `year` is a leap year on the proleptic Gregorian calendar.
+fn is_leap_year(year: u16) -> bool {
+    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+}
+
+/// Days in `month` (1..=12) of `year`. Returns 0 for an out-of-range month.
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
     }
 }
 
@@ -310,6 +344,35 @@ mod tests {
         let utc2 = Time::from_repr("20240101000000Z").to_der_choice();
         assert_eq!(utc2[0], tag::UTC_TIME);
         assert_eq!(utc2[1] as usize, 13);
+    }
+
+    #[test]
+    fn components_rejects_out_of_range_fields() {
+        // Month 13 is impossible.
+        assert!(Time::from_repr("240001000000Z").components().is_none());
+        assert!(Time::from_repr("241301000000Z").components().is_none());
+        // Day 32 is impossible.
+        assert!(Time::from_repr("240132000000Z").components().is_none());
+        // Hour 25, minute 60, second 60 are all out of range.
+        assert!(Time::from_repr("240101250000Z").components().is_none());
+        assert!(Time::from_repr("240101006000Z").components().is_none());
+        assert!(Time::from_repr("240101000060Z").components().is_none());
+        // April has 30 days, not 31.
+        assert!(Time::from_repr("240431000000Z").components().is_none());
+        // Feb 29 is valid in leap years, invalid otherwise.
+        assert!(Time::from_repr("240229000000Z").components().is_some()); // 2024 leap
+        assert!(Time::from_repr("250229000000Z").components().is_none()); // 2025 not leap
+        // GeneralizedTime form: 1900 is not a leap year (century not /400).
+        assert!(Time::from_repr("20240229000000Z").components().is_some());
+        assert!(Time::from_repr("19000229000000Z").components().is_none());
+        // 2000 is a leap year (divisible by 400).
+        assert!(Time::from_repr("20000229000000Z").components().is_some());
+        // A validity built from an invalid not-after time fail-closes.
+        let v = Validity::new(
+            Time::from_repr("240101000000Z"),
+            Time::from_repr("241301000000Z"), // month 13
+        );
+        assert!(!v.accepts(&Time::utc(2026, 5, 26, 12, 0, 0)));
     }
 
     #[test]

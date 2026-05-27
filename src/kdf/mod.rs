@@ -21,7 +21,7 @@ mod pbkdf2;
 #[cfg(feature = "alloc")]
 pub mod scrypt;
 
-pub use hkdf::{hkdf, hkdf_expand, hkdf_extract};
-pub use pbkdf2::pbkdf2;
 #[cfg(feature = "alloc")]
 pub use bcrypt_pbkdf::{Error as BcryptPbkdfError, bcrypt_pbkdf};
+pub use hkdf::{hkdf, hkdf_expand, hkdf_extract};
+pub use pbkdf2::pbkdf2;

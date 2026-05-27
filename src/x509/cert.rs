@@ -650,6 +650,10 @@ impl Certificate {
                 if raw.is_empty() {
                     return Err(Error::Malformed);
                 }
+                // X.690 §8.6.2.2: `unused_bits` is in the range 0..=7.
+                if raw[0] > 7 {
+                    return Err(Error::Malformed);
+                }
                 let _unused = raw[0];
                 let bytes = &raw[1..];
                 let mut mask: u16 = 0;
@@ -1131,6 +1135,34 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         // Self-signature still verifies under the embedded key.
         let pk = cert.subject_public_key().unwrap();
         cert.verify_signature_with(&pk).unwrap();
+    }
+
+    #[test]
+    fn key_usage_rejects_invalid_unused_bits() {
+        // BIT STRING `unused_bits` is in 0..=7 (X.690 §8.6.2.2). Forge a
+        // keyUsage extension with unused = 0xFF and confirm the accessor
+        // refuses it.
+        use crate::der::{encode_tlv, tag};
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::extension::Extension;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ku-bad", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("ku-bad");
+
+        // BIT STRING { unused=0xFF, bits=0x80 }: structurally a BIT STRING
+        // (the parser reads the TLV), but `unused > 7` is illegal.
+        let bad_bs = encode_tlv(tag::BIT_STRING, &[0xff, 0x80]);
+        let ext = Extension {
+            oid: oid::KEY_USAGE.to_vec(),
+            critical: true,
+            value: bad_bs,
+        };
+        let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
+            .unwrap();
+        assert!(matches!(cert.key_usage(), Err(Error::Malformed)));
     }
 
     #[test]

@@ -71,20 +71,24 @@ pub enum CrlReason {
 }
 
 impl CrlReason {
-    /// Parses a single-byte ENUMERATED value into a `CrlReason`. Unknown
-    /// values map to [`CrlReason::Unspecified`].
-    pub fn from_u8(v: u8) -> Self {
+    /// Parses a single-byte ENUMERATED value into a `CrlReason`. Returns
+    /// `Err(Error::Malformed)` for values outside the set defined in
+    /// RFC 5280 §5.3.1 (value 7 is reserved; values ≥ 11 are unassigned).
+    /// Callers that want a permissive mapping can `.unwrap_or(Unspecified)`
+    /// explicitly.
+    pub fn from_u8(v: u8) -> Result<Self, Error> {
         match v {
-            1 => CrlReason::KeyCompromise,
-            2 => CrlReason::CACompromise,
-            3 => CrlReason::AffiliationChanged,
-            4 => CrlReason::Superseded,
-            5 => CrlReason::CessationOfOperation,
-            6 => CrlReason::CertificateHold,
-            8 => CrlReason::RemoveFromCRL,
-            9 => CrlReason::PrivilegeWithdrawn,
-            10 => CrlReason::AaCompromise,
-            _ => CrlReason::Unspecified,
+            0 => Ok(CrlReason::Unspecified),
+            1 => Ok(CrlReason::KeyCompromise),
+            2 => Ok(CrlReason::CACompromise),
+            3 => Ok(CrlReason::AffiliationChanged),
+            4 => Ok(CrlReason::Superseded),
+            5 => Ok(CrlReason::CessationOfOperation),
+            6 => Ok(CrlReason::CertificateHold),
+            8 => Ok(CrlReason::RemoveFromCRL),
+            9 => Ok(CrlReason::PrivilegeWithdrawn),
+            10 => Ok(CrlReason::AaCompromise),
+            _ => Err(Error::Malformed),
         }
     }
 }
@@ -276,10 +280,14 @@ impl CertificateRevocationList {
         let tbs = self.parts()?.tbs;
         let mut outer = Reader::new(tbs);
         let mut seq = outer.read_sequence()?;
-        // Optional INTEGER version; v2 = 1. RFC 5280 says it MUST be present
-        // when the CRL is v2, but tolerate its absence (legacy v1 CRLs).
+        // Optional INTEGER version; v2 = 1. RFC 5280 §5.1 defines only v1
+        // (absent) and v2 (1) — anything else is malformed.
         if seq.peek_tag() == Some(tag::INTEGER) {
-            seq.read_integer_bytes()?;
+            let v = seq.read_integer_bytes()?;
+            // Single-byte 0 (v1) or 1 (v2); reject everything else.
+            if v.len() != 1 || (v[0] != 0 && v[0] != 1) {
+                return Err(Error::Malformed);
+            }
         }
         seq.read_sequence()?; // inner signature AlgorithmIdentifier
         Ok(seq)
@@ -292,7 +300,10 @@ impl CertificateRevocationList {
         let mut outer = Reader::new(tbs);
         let mut seq = outer.read_sequence()?;
         if seq.peek_tag() == Some(tag::INTEGER) {
-            seq.read_integer_bytes()?;
+            let v = seq.read_integer_bytes()?;
+            if v.len() != 1 || (v[0] != 0 && v[0] != 1) {
+                return Err(Error::Malformed);
+            }
         }
         Ok(seq.read_element()?)
     }
@@ -408,10 +419,13 @@ impl CertificateRevocationList {
                             let mut vr = Reader::new(value);
                             let enum_body = vr.read_tlv(0x0a)?;
                             // ENUMERATED is single-byte in practice for the
-                            // values defined by RFC 5280 §5.3.1.
-                            if enum_body.len() == 1 {
-                                reason = Some(CrlReason::from_u8(enum_body[0]));
+                            // values defined by RFC 5280 §5.3.1; reject out-
+                            // of-range codes (including the reserved value 7
+                            // and any unassigned value ≥ 11).
+                            if enum_body.len() != 1 {
+                                return Err(Error::Malformed);
                             }
+                            reason = Some(CrlReason::from_u8(enum_body[0])?);
                         }
                     }
                 }
@@ -620,6 +634,68 @@ mod tests {
             mismatched.check_signature_algid_consistent(),
             Err(Error::Malformed)
         ));
+    }
+
+    #[test]
+    fn rejects_unknown_version() {
+        // Forge a TBSCertList carrying version=99. RFC 5280 §5.1 only
+        // defines v1 (absent) and v2 (1); anything else is malformed.
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&encode_integer(&[99])); // bogus version
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&dn.to_der());
+        body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
+        let tbs = encode_sequence(&body);
+        let sig = signer.sign(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+
+        let crl = CertificateRevocationList::from_der(der).unwrap();
+        // Any accessor that walks past the version field surfaces the error.
+        assert!(matches!(crl.issuer(), Err(Error::Malformed)));
+        assert!(matches!(crl.entries(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn rejects_unknown_revocation_reason() {
+        // Forge a CRL entry with reason ENUMERATED = 255 — outside the
+        // {0..=6, 8..=10} set defined by RFC 5280 §5.3.1.
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+
+        // Build a revoked-cert entry by hand.
+        let serial = encode_integer(&[0x07]);
+        let rdate = Time::utc(2026, 1, 2, 0, 0, 0).to_der_choice();
+        let enumerated = encode_tlv(0x0a, &[0xff]);
+        let mut ext_body = oid_tlv(oid::CRL_REASON_CODE);
+        ext_body.extend_from_slice(&encode_octet_string(&enumerated));
+        let ext = encode_sequence(&ext_body);
+        let exts = encode_sequence(&ext);
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&serial);
+        entry.extend_from_slice(&rdate);
+        entry.extend_from_slice(&exts);
+        let revoked = encode_sequence(&entry);
+        let revoked_seq = encode_sequence(&revoked);
+
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&encode_integer(&[1]));
+        tbs_body.extend_from_slice(&algid);
+        tbs_body.extend_from_slice(&dn.to_der());
+        tbs_body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
+        tbs_body.extend_from_slice(&revoked_seq);
+        let tbs = encode_sequence(&tbs_body);
+        let sig = signer.sign(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+
+        let crl = CertificateRevocationList::from_der(der).unwrap();
+        assert!(matches!(crl.entries(), Err(Error::Malformed)));
     }
 
     #[test]
