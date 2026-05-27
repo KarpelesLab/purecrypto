@@ -142,6 +142,20 @@ pub(crate) const MIN_RSA_BITS: usize = 1024;
 /// well above any legitimate use.
 pub(crate) const MAX_RSA_BITS: usize = 16384;
 
+/// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
+/// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
+/// enforce the structural shape: `e ≥ 3`, `e` odd, and `e < n`. These three
+/// together rule out the degenerate values (`0`, `1`, even, oversized) that a
+/// malicious SPKI / certificate could otherwise smuggle through and break
+/// downstream sign / verify / encrypt math.
+fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
+    let three = BoxedUint::from_u64(3);
+    if e.lt(&three) || !e.is_odd() || !e.lt(n) {
+        return Err(Error::InvalidKey);
+    }
+    Ok(())
+}
+
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
     pub fn new(n: BoxedUint, e: BoxedUint) -> Self {
@@ -151,13 +165,16 @@ impl BoxedRsaPublicKey {
     }
 
     /// Builds a public key from modulus `n` and exponent `e`, rejecting
-    /// modulus sizes outside `[MIN_RSA_BITS, MAX_RSA_BITS]`. Used by the
-    /// attacker-controlled parse paths (SPKI / certificates).
+    /// modulus sizes outside `[MIN_RSA_BITS, MAX_RSA_BITS]` and exponents
+    /// that fail the public-exponent shape check (i.e. `e < 3`, `e` even,
+    /// or `e ≥ n`). Used by the attacker-controlled parse paths
+    /// (SPKI / certificates).
     pub fn try_new(n: BoxedUint, e: BoxedUint) -> Result<Self, Error> {
         let bits = n.bit_len();
         if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
             return Err(Error::InvalidLength);
         }
+        validate_public_exponent(&n, &e)?;
         Ok(Self::new(n, e))
     }
 
@@ -349,6 +366,7 @@ impl BoxedRsaPublicKey {
         if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
             return Err(crate::der::Error::Malformed);
         }
+        validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
         Ok(BoxedRsaPublicKey::new(n, e))
     }
 
@@ -445,6 +463,7 @@ impl BoxedRsaPrivateKey {
         if !(MIN_RSA_BITS..=MAX_RSA_BITS).contains(&bits) {
             return Err(crate::der::Error::Malformed);
         }
+        validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
@@ -472,6 +491,10 @@ impl BoxedRsaPrivateKey {
     /// # Panics
     /// Panics if the prime factors are not retained (i.e. the key was built via
     /// [`from_components`](Self::from_components) or imported, not generated).
+    /// Panics if `gcd(q, p) ≠ 1` — `q⁻¹ mod p` (`qInv`) cannot exist for a
+    /// well-formed two-prime RSA key, so reaching this branch means the key
+    /// is structurally broken and re-exporting would emit a CRT parameter
+    /// silently set to zero. We refuse to round-trip a corrupted key.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
         use crate::bignum::inv_mod_boxed;
         use crate::der::{encode_integer, encode_sequence};
@@ -482,7 +505,8 @@ impl BoxedRsaPrivateKey {
         let one = BoxedUint::from_u64(1);
         let dp = self.d.reduce(&self.p.sub(&one));
         let dq = self.d.reduce(&self.q.sub(&one));
-        let qinv = inv_mod_boxed(&self.q, &self.p).unwrap_or_else(|| BoxedUint::zero(1));
+        let qinv = inv_mod_boxed(&self.q, &self.p)
+            .expect("to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime");
         let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
         encode_sequence(
             &[
@@ -970,5 +994,43 @@ mod tests {
             .concat(),
         );
         assert!(BoxedRsaPrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    /// Exhaustive `try_new` exponent shape rejection: 0, 1, 2 (even), `n`, `n+1`
+    /// all fail, while a legitimate 65537 against a real modulus passes.
+    #[test]
+    fn try_new_rejects_degenerate_exponents() {
+        let (_, boxed) = boxed_pub();
+        let n = boxed.modulus().clone();
+        let cases: [(BoxedUint, &'static str); 5] = [
+            (BoxedUint::from_u64(0), "e=0"),
+            (BoxedUint::from_u64(1), "e=1"),
+            (BoxedUint::from_u64(2), "e=2 (even)"),
+            (n.clone(), "e=n"),
+            (n.add(&BoxedUint::from_u64(1)), "e=n+1"),
+        ];
+        for (e, why) in cases {
+            assert!(
+                matches!(
+                    BoxedRsaPublicKey::try_new(n.clone(), e),
+                    Err(Error::InvalidKey)
+                ),
+                "{why} should be rejected as InvalidKey"
+            );
+        }
+        // Sanity: 65537 against a real 2048-bit modulus is accepted.
+        assert!(BoxedRsaPublicKey::try_new(n, BoxedUint::from_u64(65537)).is_ok());
+    }
+
+    /// PKCS#1 DER carrying a degenerate `e` is rejected as Malformed (the
+    /// validate_public_exponent failure surfaces through the DER layer).
+    #[test]
+    fn from_pkcs1_der_rejects_even_exponent() {
+        use crate::der::{encode_integer, encode_sequence};
+        let (_, boxed) = boxed_pub();
+        let n_bytes = boxed.modulus().to_be_bytes(256);
+        // e = 4 (even, < 3 false but evenness gate fires).
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[4])].concat());
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
     }
 }

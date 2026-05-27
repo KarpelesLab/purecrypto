@@ -40,6 +40,9 @@ pub enum Error {
     Decryption,
     /// Signature verification failed.
     Verification,
+    /// The key's component values are not a well-formed RSA public/private key
+    /// (e.g. `e = 0`, `e` even, `e ≥ n`).
+    InvalidKey,
 }
 
 impl core::fmt::Display for Error {
@@ -49,6 +52,7 @@ impl core::fmt::Display for Error {
             Error::InvalidLength => "ciphertext/signature length mismatch",
             Error::Decryption => "RSA decryption error",
             Error::Verification => "RSA signature verification failed",
+            Error::InvalidKey => "RSA key components are malformed",
         };
         f.write_str(msg)
     }
