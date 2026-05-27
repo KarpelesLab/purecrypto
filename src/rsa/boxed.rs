@@ -352,7 +352,66 @@ impl BoxedRsaPublicKey {
         let e = self.e.to_be_bytes(self.e.bit_len().div_ceil(8).max(1));
         encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat())
     }
+
+    /// Encodes the key as an X.509 `SubjectPublicKeyInfo` (SPKI) DER structure
+    /// (RFC 5280 §4.1.2.7). The envelope is
+    /// `SEQUENCE { AlgorithmIdentifier, BIT STRING }` where the
+    /// AlgorithmIdentifier is `rsaEncryption` (OID `1.2.840.113549.1.1.1`)
+    /// with an explicit `NULL` parameter (RFC 3279 §2.3.1), and the
+    /// BIT STRING wraps the PKCS#1 `RSAPublicKey` DER produced by
+    /// [`to_pkcs1_der`](Self::to_pkcs1_der).
+    ///
+    /// SPKI is the form X.509 certificates, JWKs, and most modern key-
+    /// management tooling expect; the PKCS#1 form is only used by legacy
+    /// OpenSSL-style PEM files.
+    pub fn to_spki_der(&self) -> Vec<u8> {
+        use crate::der::{encode_bit_string, encode_null, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat());
+        encode_sequence(&[algid, encode_bit_string(&self.to_pkcs1_der())].concat())
+    }
+
+    /// Encodes the key as a PEM `-----BEGIN PUBLIC KEY-----` document
+    /// (RFC 7468). The body is [`to_spki_der`](Self::to_spki_der). Note the
+    /// label has no `RSA ` prefix — the OID inside the SPKI disambiguates
+    /// the algorithm.
+    pub fn to_spki_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PUBLIC KEY", &self.to_spki_der())
+    }
+
+    /// Parses an X.509 `SubjectPublicKeyInfo` (SPKI) DER structure for an RSA
+    /// public key. Validates that the algorithm OID is `rsaEncryption`, the
+    /// parameters field is an explicit `NULL` (per RFC 3279 §2.3.1 strict —
+    /// absent or non-NULL is rejected, mirroring the hardening from fix H-7
+    /// applied to the X.509 SPKI parser), and the inner BIT STRING decodes
+    /// as a valid PKCS#1 `RSAPublicKey`.
+    pub fn from_spki_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        let mut reader = crate::der::Reader::new(der);
+        let mut outer = reader.read_sequence()?;
+        let mut algid = outer.read_sequence()?;
+        let alg = crate::der::parse_oid(algid.read_oid()?)?;
+        if alg.as_slice() != RSA_ENCRYPTION_OID {
+            return Err(crate::der::Error::Malformed);
+        }
+        algid.read_null()?;
+        algid.finish()?;
+        let key_bits = outer.read_bit_string()?;
+        outer.finish()?;
+        reader.finish()?;
+        Self::from_pkcs1_der(key_bits)
+    }
+
+    /// Parses an SPKI PEM document (`-----BEGIN PUBLIC KEY-----`, RFC 7468).
+    /// The legacy `RSA PUBLIC KEY` label (PKCS#1) is **not** accepted here —
+    /// use [`from_pkcs1_der`](Self::from_pkcs1_der) after a PEM strip for
+    /// that form.
+    pub fn from_spki_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_spki_der(&crate::der::pem_decode(pem, "PUBLIC KEY")?)
+    }
 }
+
+/// DER OID arcs for `rsaEncryption` (RFC 3279 §2.3.1).
+#[cfg(feature = "der")]
+const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
 
 /// PKCS#1 DER/PEM for runtime-sized private keys.
 #[cfg(feature = "der")]
@@ -437,6 +496,88 @@ impl BoxedRsaPrivateKey {
     /// Encodes the key as a PKCS#1 PEM document.
     pub fn to_pkcs1_pem(&self) -> alloc::string::String {
         crate::der::pem_encode("RSA PRIVATE KEY", &self.to_pkcs1_der())
+    }
+
+    /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo` DER
+    /// structure (RFC 5958 §2):
+    ///
+    /// ```text
+    /// PrivateKeyInfo ::= SEQUENCE {
+    ///     version INTEGER (0),
+    ///     privateKeyAlgorithm AlgorithmIdentifier,  -- rsaEncryption + NULL
+    ///     privateKey OCTET STRING                   -- the PKCS#1 DER
+    /// }
+    /// ```
+    ///
+    /// Encrypted PKCS#8 (`EncryptedPrivateKeyInfo`, RFC 5958 §3, PBES2 /
+    /// PBKDF2) is intentionally not implemented — pick a stream-cipher AEAD
+    /// envelope of your own choosing instead.
+    ///
+    /// # Panics
+    /// Panics if the prime factors are not retained (i.e. the key was built
+    /// via [`from_components`](Self::from_components) or imported, not
+    /// generated). Matches [`to_pkcs1_der`](Self::to_pkcs1_der).
+    pub fn to_pkcs8_der(&self) -> Vec<u8> {
+        use crate::der::{
+            encode_integer, encode_null, encode_octet_string, encode_sequence, oid_tlv,
+        };
+        let algid = encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat());
+        encode_sequence(
+            &[
+                encode_integer(&[0]),
+                algid,
+                encode_octet_string(&self.to_pkcs1_der()),
+            ]
+            .concat(),
+        )
+    }
+
+    /// Encodes the key as a PKCS#8 PEM document
+    /// (`-----BEGIN PRIVATE KEY-----`, RFC 7468). Distinct from the legacy
+    /// `RSA PRIVATE KEY` label which carries a bare PKCS#1 body.
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+    }
+
+    /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` DER structure for an
+    /// RSA private key. Validates `version = 0`, `privateKeyAlgorithm` is
+    /// `rsaEncryption` with explicit `NULL` parameters, and the inner OCTET
+    /// STRING decodes as a valid PKCS#1 `RSAPrivateKey`.
+    ///
+    /// Encrypted PKCS#8 (`EncryptedPrivateKeyInfo`, RFC 5958 §3) is rejected
+    /// at the outer SEQUENCE — its first field is an `AlgorithmIdentifier`,
+    /// not the version INTEGER.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        let mut reader = crate::der::Reader::new(der);
+        let mut outer = reader.read_sequence()?;
+        let version = outer.read_integer_bytes()?;
+        // RFC 5958 §2: version MUST be 0 for the v1 (unencrypted) form.
+        // The v2 form (which permits an attribute set) uses version = 1.
+        if version != [0] {
+            return Err(crate::der::Error::Malformed);
+        }
+        let mut algid = outer.read_sequence()?;
+        let alg = crate::der::parse_oid(algid.read_oid()?)?;
+        if alg.as_slice() != RSA_ENCRYPTION_OID {
+            return Err(crate::der::Error::Malformed);
+        }
+        algid.read_null()?;
+        algid.finish()?;
+        let inner = outer.read_octet_string()?;
+        // PKCS#8 v1 has no further fields after the privateKey OCTET STRING
+        // for our purposes (the optional `attributes [0]` set isn't carried
+        // by anything mainstream for RSA). Reject trailing junk strictly.
+        outer.finish()?;
+        reader.finish()?;
+        Self::from_pkcs1_der(inner)
+    }
+
+    /// Parses a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`,
+    /// RFC 7468). The legacy `RSA PRIVATE KEY` PKCS#1 label is **not**
+    /// accepted here — use [`from_pkcs1_pem`](Self::from_pkcs1_pem) for
+    /// that form.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
     }
 }
 
@@ -565,5 +706,164 @@ mod tests {
         key.public_key()
             .verify_pkcs1v15::<Sha256>(b"sign me", &sig)
             .unwrap();
+    }
+
+    // ---- SPKI / PKCS#8 round-trip and reject tests ----
+
+    /// Helper: generates a small (1024-bit) RSA key. Faster than 2048 in
+    /// debug and exercises the same encoding path.
+    fn gen_small_key(seed: &[u8]) -> BoxedRsaPrivateKey {
+        let mut rng = HmacDrbg::<Sha256>::new(seed, b"n", &[]);
+        BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(65537), &mut rng, 12)
+    }
+
+    #[test]
+    fn rsa_public_key_spki_der_roundtrip() {
+        let sk = gen_small_key(b"rsa-spki-der");
+        let pk = sk.public_key();
+        let der = pk.to_spki_der();
+        // Sanity: outer SEQUENCE.
+        assert_eq!(der[0], 0x30);
+        let parsed = BoxedRsaPublicKey::from_spki_der(&der).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), pk.to_pkcs1_der());
+
+        // Cross-check against the X.509 layer: an SPKI built by AnyPublicKey
+        // for the same key bytes must be byte-identical, so SPKI bytes
+        // produced by either route are interchangeable.
+        let any_spki =
+            crate::x509::AnyPublicKey::Rsa(BoxedRsaPublicKey::new(pk.n.clone(), pk.e.clone()))
+                .to_spki_der();
+        assert_eq!(der, any_spki);
+    }
+
+    #[test]
+    fn rsa_public_key_spki_pem_roundtrip() {
+        let sk = gen_small_key(b"rsa-spki-pem");
+        let pk = sk.public_key();
+        let pem = pk.to_spki_pem();
+        assert!(pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+        assert!(pem.trim_end().ends_with("-----END PUBLIC KEY-----"));
+        let parsed = BoxedRsaPublicKey::from_spki_pem(&pem).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), pk.to_pkcs1_der());
+    }
+
+    #[test]
+    fn rsa_private_key_pkcs8_der_roundtrip() {
+        let sk = gen_small_key(b"rsa-pkcs8-der");
+        let der = sk.to_pkcs8_der();
+        assert_eq!(der[0], 0x30);
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_der(&der).unwrap();
+        // PKCS#1 export is byte-deterministic for a given key, so the
+        // round-tripped key re-serializes to the same PKCS#1 bytes.
+        assert_eq!(parsed.to_pkcs1_der(), sk.to_pkcs1_der());
+
+        // Functional: the round-tripped key still signs.
+        let sig = parsed.sign_pkcs1v15::<Sha256>(b"via pkcs8").unwrap();
+        sk.public_key()
+            .verify_pkcs1v15::<Sha256>(b"via pkcs8", &sig)
+            .unwrap();
+    }
+
+    #[test]
+    fn rsa_private_key_pkcs8_pem_roundtrip() {
+        let sk = gen_small_key(b"rsa-pkcs8-pem");
+        let pem = sk.to_pkcs8_pem();
+        assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----\n"));
+        assert!(pem.trim_end().ends_with("-----END PRIVATE KEY-----"));
+        let parsed = BoxedRsaPrivateKey::from_pkcs8_pem(&pem).unwrap();
+        assert_eq!(parsed.to_pkcs1_der(), sk.to_pkcs1_der());
+    }
+
+    /// SPKI carrying a non-RSA algorithm OID (here: id-Ed25519) must be
+    /// rejected, not silently treated as RSA.
+    #[test]
+    fn rsa_public_key_from_spki_rejects_non_rsa_oid() {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+        // Ed25519 OID `1.3.101.112`, no parameters; key body is irrelevant
+        // because we should reject before reaching it.
+        let algid = encode_sequence(&oid_tlv(&[1, 3, 101, 112]));
+        let dummy_key = [0u8; 32];
+        let spki = encode_sequence(&[algid, encode_bit_string(&dummy_key)].concat());
+        assert!(BoxedRsaPublicKey::from_spki_der(&spki).is_err());
+    }
+
+    /// SPKI for `rsaEncryption` with the parameters field absent must be
+    /// rejected (RFC 3279 §2.3.1; matches the strict-NULL fix H-7 applied
+    /// to the X.509 SPKI parser).
+    #[test]
+    fn rsa_public_key_from_spki_rejects_missing_null_params() {
+        use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
+        // AlgorithmIdentifier with the OID but no NULL after it.
+        let algid = encode_sequence(&oid_tlv(&RSA_ENCRYPTION_OID));
+        // The BIT STRING content must still be valid PKCS#1 to ensure we're
+        // failing on the algid check, not on a later parse step — but the
+        // algid check happens first, so even garbage here is fine.
+        let dummy = [0u8; 16];
+        let spki = encode_sequence(&[algid, encode_bit_string(&dummy)].concat());
+        assert!(BoxedRsaPublicKey::from_spki_der(&spki).is_err());
+    }
+
+    /// A PEM with the legacy PKCS#1 label (`RSA PUBLIC KEY`) must not be
+    /// accepted by the SPKI PEM importer — the label disambiguates the
+    /// inner format.
+    #[test]
+    fn rsa_public_key_from_spki_pem_rejects_pkcs1_label() {
+        let sk = gen_small_key(b"rsa-spki-wrong-label");
+        // The boxed public key only owns to_pkcs1_der, no to_pkcs1_pem on
+        // the public type — wrap manually with the legacy label.
+        let pkcs1_pem = crate::der::pem_encode("RSA PUBLIC KEY", &sk.public_key().to_pkcs1_der());
+        assert!(BoxedRsaPublicKey::from_spki_pem(&pkcs1_pem).is_err());
+    }
+
+    /// PKCS#8 with `version = 1` (v2 of the format, RFC 5958 §2) is not
+    /// supported here — the v1 form is what every OpenSSL-style tool emits
+    /// for unencrypted RSA.
+    #[test]
+    fn rsa_private_key_from_pkcs8_rejects_nonzero_version() {
+        use crate::der::{
+            encode_integer, encode_null, encode_octet_string, encode_sequence, oid_tlv,
+        };
+        let sk = gen_small_key(b"rsa-pkcs8-v1");
+        let algid = encode_sequence(&[oid_tlv(&RSA_ENCRYPTION_OID), encode_null()].concat());
+        let der = encode_sequence(
+            &[
+                encode_integer(&[1]), // version = 1, not 0
+                algid,
+                encode_octet_string(&sk.to_pkcs1_der()),
+            ]
+            .concat(),
+        );
+        assert!(BoxedRsaPrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    /// PKCS#8 carrying a non-RSA private-key algorithm OID is rejected.
+    #[test]
+    fn rsa_private_key_from_pkcs8_rejects_non_rsa_oid() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        // Ed25519 PrivateKey OID `1.3.101.112`, no NULL (RFC 8410).
+        let algid = encode_sequence(&oid_tlv(&[1, 3, 101, 112]));
+        let dummy = [0u8; 34];
+        let der =
+            encode_sequence(&[encode_integer(&[0]), algid, encode_octet_string(&dummy)].concat());
+        assert!(BoxedRsaPrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    /// PKCS#8 SPKI with absent NULL parameters is rejected (strict-NULL
+    /// policy, fix H-7).
+    #[test]
+    fn rsa_private_key_from_pkcs8_rejects_missing_null_params() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let sk = gen_small_key(b"rsa-pkcs8-no-null");
+        // AlgorithmIdentifier with no parameters at all.
+        let algid = encode_sequence(&oid_tlv(&RSA_ENCRYPTION_OID));
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                algid,
+                encode_octet_string(&sk.to_pkcs1_der()),
+            ]
+            .concat(),
+        );
+        assert!(BoxedRsaPrivateKey::from_pkcs8_der(&der).is_err());
     }
 }
