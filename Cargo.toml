@@ -35,6 +35,10 @@ tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "all
 # reassembly / cookie chassis lives in `src/dtls/`, with version-specific
 # client and server state machines layered on top in later commits.
 dtls = ["tls"]
+# QUIC v1 (RFC 9000) — transport-layer protocol over UDP, secured by TLS 1.3
+# keys (RFC 9001), with loss recovery + congestion control (RFC 9002) and the
+# unreliable DATAGRAM extension (RFC 9221). Builds on the `tls` stack; sans-I/O.
+quic = ["tls"]
 # ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
 # the RNG trait are required.
 mlkem = ["hash", "rng"]
