@@ -19,8 +19,10 @@
 //! Streams, full RFC 9002, Retry, key update, and DATAGRAM are deferred
 //! to later phases per the master plan.
 
+pub(crate) mod ack;
 pub(crate) mod cid;
 pub(crate) mod client;
+pub(crate) mod congestion;
 pub(crate) mod connection;
 pub(crate) mod crypto;
 pub(crate) mod crypto_buf;

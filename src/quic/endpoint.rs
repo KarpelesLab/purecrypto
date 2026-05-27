@@ -19,9 +19,10 @@
 #![allow(dead_code)]
 
 use crate::quic::cid::CidPair;
+use crate::quic::congestion::NewReno;
 use crate::quic::crypto::LevelKeys;
 use crate::quic::crypto_buf::CryptoBuf;
-use crate::quic::loss::PtoState;
+use crate::quic::loss::LossState;
 use crate::quic::pn::PnSpace;
 use crate::tls::quic_hooks::Level;
 
@@ -127,8 +128,11 @@ pub(crate) struct Endpoint {
     pub(crate) bufs: LevelBufs,
     /// Per-PN-space packet-number bookkeeping (3 spaces).
     pub(crate) pn: PnSpaces,
-    /// Single PTO timer covering all unacked CRYPTO at all levels.
-    pub(crate) pto: PtoState,
+    /// Full RFC 9002 loss-recovery state (in-flight tracking, RTT
+    /// estimator, PTO timer, time-threshold loss).
+    pub(crate) loss: LossState,
+    /// RFC 9002 §7 NewReno congestion controller.
+    pub(crate) cc: NewReno,
     /// The two CIDs pinning this connection.
     pub(crate) cids: CidPair,
     /// True once `pop_datagram` has emitted the very first outbound
@@ -148,7 +152,8 @@ impl Endpoint {
             crypto: CryptoState::empty(),
             bufs: LevelBufs::new(),
             pn: PnSpaces::new(),
-            pto: PtoState::new(),
+            loss: LossState::new(),
+            cc: NewReno::new(),
             cids,
             sent_first_datagram: false,
             handshake_complete: false,

@@ -264,8 +264,8 @@ impl QuicConnection {
         // build (i.e., a level has a non-empty `last_sent`). This is
         // the Phase-4 stand-in for RFC 9002's "in-flight ack-eliciting
         // packet" predicate.
-        if !self.endpoint.pto.is_armed() && self.has_unconfirmed_crypto_last_sent() {
-            self.endpoint.pto.arm(Duration::ZERO);
+        if !self.endpoint.loss.is_armed() && self.has_unconfirmed_crypto_last_sent() {
+            self.endpoint.loss.arm(Duration::ZERO);
         }
         datagram
     }
@@ -319,14 +319,14 @@ impl QuicConnection {
     pub fn next_timeout(&self) -> Option<Duration> {
         // Phase 4: only the PTO is implemented; idle timeout lands in
         // Phase 5+.
-        self.endpoint.pto.next_deadline(Duration::ZERO)
+        self.endpoint.loss.next_deadline(Duration::ZERO)
     }
 
     /// Signals that `now_since_start` elapsed since this connection was
     /// constructed. Caller passes a monotonic clock reading. Engine
     /// re-evaluates timers and may queue retransmissions.
     pub fn on_timeout(&mut self, now_since_start: Duration) {
-        if self.endpoint.pto.has_fired(now_since_start) {
+        if self.endpoint.loss.has_fired(now_since_start) {
             // RFC 9002 §6.2.4: on PTO, send a probe — Phase 4 implements
             // this as "retransmit the last CRYPTO chunk at *every* level
             // that has one." That means a server whose Initial+Handshake
@@ -334,7 +334,7 @@ impl QuicConnection {
             // the client's peer needs both to derive Handshake-level
             // keys (from the ServerHello) and then read the rest of the
             // server's Finished.
-            self.endpoint.pto.on_fire(now_since_start);
+            self.endpoint.loss.on_fire(now_since_start);
             for lvl in [Level::Initial, Level::Handshake] {
                 let _ = self
                     .endpoint
@@ -455,7 +455,7 @@ impl QuicConnection {
             self.handshake_complete = true;
             self.endpoint.handshake_complete = true;
             // Disarm the PTO: handshake is done, nothing to retransmit.
-            self.endpoint.pto.disarm();
+            self.endpoint.loss.disarm();
         }
     }
 
@@ -709,7 +709,7 @@ impl QuicConnection {
                         None => largest,
                     });
                     // Reset PTO: progress.
-                    self.endpoint.pto.on_handshake_progress(Duration::ZERO);
+                    self.endpoint.loss.on_handshake_progress(Duration::ZERO);
                     // Not ack-eliciting.
                 }
                 Frame::Crypto { offset, data } => {
@@ -1350,5 +1350,88 @@ mod tests {
         // datagram still works.
         let r2 = s.feed_datagram(&dg);
         assert!(r2.is_ok(), "untampered datagram must succeed");
+    }
+
+    /// Test 13 — drop every third datagram in each direction. The
+    /// Phase-4 PTO retransmits the lost flight; the handshake still
+    /// completes within a defensive bound of 50 PTO events.
+    #[test]
+    fn drop_every_third_packet() {
+        let (mut c, mut s) = loopback_pair();
+        let mut now = Duration::from_millis(0);
+        // Counter increments per *attempted* datagram (regardless of
+        // direction). Every 3rd attempt is dropped.
+        let mut attempt = 0u32;
+        let mut pto_events = 0u32;
+        let max_pto = 50u32;
+        let mut idle_rounds = 0u32;
+
+        for _ in 0..500 {
+            // Drain client → server.
+            let mut any_progress = false;
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                attempt += 1;
+                any_progress = true;
+                if !attempt.is_multiple_of(3) {
+                    s.feed_datagram(&dg).expect("server feed");
+                }
+            }
+            // Drain server → client.
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                attempt += 1;
+                any_progress = true;
+                if !attempt.is_multiple_of(3) {
+                    c.feed_datagram(&dg).expect("client feed");
+                }
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                return;
+            }
+            if !any_progress {
+                // No new packets emitted this round — advance time to
+                // the smaller of the two next PTOs and tick both sides.
+                let cnt = c.next_timeout();
+                let snt = s.next_timeout();
+                let step = match (cnt, snt) {
+                    (Some(a), Some(b)) => a.min(b),
+                    (Some(a), None) => a,
+                    (None, Some(b)) => b,
+                    (None, None) => {
+                        idle_rounds += 1;
+                        if idle_rounds > 10 {
+                            panic!(
+                                "no progress and no timer: client_done={} server_done={}",
+                                c.is_handshake_complete(),
+                                s.is_handshake_complete()
+                            );
+                        }
+                        continue;
+                    }
+                };
+                idle_rounds = 0;
+                now = now.saturating_add(step + Duration::from_millis(1));
+                c.on_timeout(now);
+                s.on_timeout(now);
+                pto_events += 1;
+                if pto_events > max_pto {
+                    panic!("exceeded {max_pto} PTO events");
+                }
+            } else {
+                idle_rounds = 0;
+            }
+        }
+        panic!(
+            "handshake never completed: client_done={} server_done={} after {pto_events} PTOs",
+            c.is_handshake_complete(),
+            s.is_handshake_complete()
+        );
     }
 }
