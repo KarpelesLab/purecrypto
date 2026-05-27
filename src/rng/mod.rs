@@ -3,15 +3,20 @@
 //! [`RngCore`] is the byte-source interface; [`CryptoRng`] marks generators
 //! that are cryptographically secure. [`HmacDrbg`] is a deterministic
 //! SP 800-90A generator built on our HMAC, and (with `std`) [`OsRng`] draws
-//! directly from the operating system's entropy pool — `/dev/urandom` on Unix,
-//! `ProcessPrng` on Windows.
+//! directly from the operating system's entropy pool. The OS-side source
+//! varies by target:
 //!
-//! Enabling the `linux-getrandom` feature switches the Linux path to
-//! `getrandom(2)` via raw syscalls (no `libc` dependency). Recommended for
-//! processes that may start before the kernel CSPRNG is initialised —
-//! `getrandom(2)` blocks until seeding completes, while `/dev/urandom` does
-//! not. Supported on x86_64, aarch64, armv7, riscv64; other Linux arches
-//! transparently fall through to `/dev/urandom`.
+//! * **Apple** (macOS, iOS, tvOS, watchOS, visionOS): `arc4random_buf(3)`
+//!   from `libSystem`. Always seeded by the kernel before userspace runs;
+//!   no early-boot caveat.
+//! * **Windows**: `ProcessPrng` from `bcryptprimitives.dll`.
+//! * **Linux** (default): `/dev/urandom` (per-thread cached fd).
+//! * **Linux with `linux-getrandom` feature**: `getrandom(2)` via raw
+//!   syscalls (no `libc` dep). Blocks until the kernel CSPRNG is seeded —
+//!   recommended for processes that may start very early in boot.
+//!   Supported arches: x86_64, aarch64, armv7, riscv64; other Linux arches
+//!   transparently fall through to `/dev/urandom`.
+//! * **Other Unix** (FreeBSD, OpenBSD, NetBSD, etc.): `/dev/urandom`.
 
 mod hmac_drbg;
 #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
@@ -63,10 +68,22 @@ pub struct OsRng;
 // `borrow_mut` and unborrow would poison the cell, but the only
 // operation inside the borrow is `read_exact`, whose panic path would
 // terminate the thread anyway via the `expect` below.
-#[cfg(all(feature = "std", unix))]
+//
+// Skipped on Apple targets: arc4random_buf is always used there.
+#[cfg(all(feature = "std", unix, not(target_vendor = "apple")))]
 std::thread_local! {
     static URANDOM: core::cell::RefCell<Option<std::fs::File>> =
         const { core::cell::RefCell::new(None) };
+}
+
+// Apple platforms (macOS, iOS, tvOS, watchOS, visionOS) expose
+// `arc4random_buf(3)` from libSystem, which is always linked. The
+// function is documented to always succeed (failure aborts the
+// process); the kernel seeds the underlying CSPRNG before any user
+// process runs, so there's no early-boot caveat to worry about.
+#[cfg(all(feature = "std", unix, target_vendor = "apple"))]
+unsafe extern "C" {
+    fn arc4random_buf(buf: *mut core::ffi::c_void, len: usize);
 }
 
 #[cfg(all(feature = "std", unix))]
@@ -76,26 +93,40 @@ impl RngCore for OsRng {
             return;
         }
 
-        // When the `linux-getrandom` feature is on AND we're on Linux,
-        // try the syscall first. On Linux < 3.17 (ENOSYS) or unsupported
-        // arches the helper returns NotImplemented and we fall back to
-        // /dev/urandom; on other errors the helper returns Other and
-        // we panic — a kernel that refuses to give us entropy must not
-        // silently degrade to a possibly-unseeded /dev/urandom.
-        #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
-        match linux_getrandom::try_getrandom(dest) {
-            Ok(()) => return,
-            Err(linux_getrandom::Error::NotImplemented) => {} // fall through
-            Err(linux_getrandom::Error::Other(e)) => {
-                panic!("getrandom(2) failed with errno {e}");
+        // Apple platforms — always use arc4random_buf. The two
+        // mutually-exclusive cfg blocks below ensure each target sees
+        // exactly one branch, so there's no `unreachable_code` lint.
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: arc4random_buf writes exactly `len` bytes into a
+            // caller-supplied buffer and has no failure mode (it
+            // aborts the process on internal CSPRNG failure).
+            #[allow(unsafe_code)]
+            unsafe {
+                arc4random_buf(dest.as_mut_ptr() as *mut core::ffi::c_void, dest.len());
             }
         }
 
-        urandom_fill(dest);
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            // Linux with the `linux-getrandom` feature: try the syscall
+            // first; fall back to /dev/urandom on ENOSYS or unsupported
+            // arch, panic on any other errno.
+            #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
+            match linux_getrandom::try_getrandom(dest) {
+                Ok(()) => return,
+                Err(linux_getrandom::Error::NotImplemented) => {} // fall through
+                Err(linux_getrandom::Error::Other(e)) => {
+                    panic!("getrandom(2) failed with errno {e}");
+                }
+            }
+
+            urandom_fill(dest);
+        }
     }
 }
 
-#[cfg(all(feature = "std", unix))]
+#[cfg(all(feature = "std", unix, not(target_vendor = "apple")))]
 fn urandom_fill(dest: &mut [u8]) {
     use std::io::Read;
 
