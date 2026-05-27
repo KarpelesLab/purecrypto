@@ -1,0 +1,187 @@
+# cargo-fuzz workspace for purecrypto.
+#
+# Runs under nightly Rust with libFuzzer instrumentation. The main crate's
+# stable-Rust PR CI does not touch this directory; the dedicated
+# `.github/workflows/fuzz.yml` workflow runs the targets here on a weekly
+# schedule and on manual dispatch.
+#
+# Local use:
+#   cargo +nightly fuzz run <target> -- -max_total_time=60
+#
+# See `fuzz/README.md` for triage and corpus conventions.
+
+[package]
+name = "purecrypto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# Pull in every gated module the targets exercise. Matches the all-features
+# CI configuration so a feature gate added upstream can't silently bitrot
+# a target here.
+purecrypto = { path = "..", features = [
+    "std", "alloc", "hash", "cipher", "kdf", "mac", "bignum", "rng",
+    "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
+    "mlkem", "mldsa", "slhdsa",
+] }
+
+# Optimised debug info so libFuzzer's stack traces and `cargo fuzz fmt`
+# pretty-prints stay useful even at release-opt levels.
+[profile.release]
+debug = 1
+
+# --- one entry per fuzz target. cargo-fuzz also auto-discovers
+# fuzz_targets/*.rs, but listing them explicitly keeps `cargo fuzz list`
+# stable and avoids surprises from stray scratch files.
+
+# --- File-format parsers (direct public entry points)
+
+[[bin]]
+name = "der_reader"
+path = "fuzz_targets/der_reader.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pem_decode"
+path = "fuzz_targets/pem_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509_certificate"
+path = "fuzz_targets/x509_certificate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509_crl"
+path = "fuzz_targets/x509_crl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509_csr"
+path = "fuzz_targets/x509_csr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spki_pubkey"
+path = "fuzz_targets/spki_pubkey.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs8_rsa"
+path = "fuzz_targets/pkcs8_rsa.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs8_ed25519"
+path = "fuzz_targets/pkcs8_ed25519.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs8_mldsa"
+path = "fuzz_targets/pkcs8_mldsa.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pkcs8_slhdsa"
+path = "fuzz_targets/pkcs8_slhdsa.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pbes2_decrypt"
+path = "fuzz_targets/pbes2_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ecdsa_sig_der"
+path = "fuzz_targets/ecdsa_sig_der.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mlkem_pkcs8"
+path = "fuzz_targets/mlkem_pkcs8.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dh_share"
+path = "fuzz_targets/dh_share.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_transport_params"
+path = "fuzz_targets/quic_transport_params.rs"
+test = false
+doc = false
+bench = false
+
+# --- Network targets (via the public Connection::feed / feed_datagram API).
+# Each target stands up a fresh Connection per iteration and feeds fuzz
+# bytes as if they came from the wire. Exercises record layer + codec +
+# handshake state machine end-to-end.
+
+[[bin]]
+name = "tls_server_feed"
+path = "fuzz_targets/tls_server_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_client_feed"
+path = "fuzz_targets/tls_client_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_server_feed"
+path = "fuzz_targets/dtls_server_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls_client_feed"
+path = "fuzz_targets/dtls_client_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_server_feed"
+path = "fuzz_targets/quic_server_feed.rs"
+test = false
+doc = false
+bench = false

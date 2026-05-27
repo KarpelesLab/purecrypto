@@ -1,0 +1,23 @@
+# cargo-fuzz build artefacts and runtime state.
+target/
+artifacts/
+coverage/
+
+# libFuzzer creates these in the corpus dir when it discovers an interesting
+# input; we keep manually-curated seeds checked in (corpus/<target>/<name>)
+# but not the auto-generated ones (which have hex-digest filenames).
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+
+# Crash inputs that haven't been triaged yet. Once a crash is fixed, the
+# input gets moved into the corpus to act as a regression fixture and
+# checked in with a descriptive name.
+**/crash-*
+**/leak-*
+**/oom-*
+**/timeout-*
+**/slow-unit-*
+
+# Cargo lockfile for the fuzz workspace — pinning the libfuzzer-sys version
+# is useful but not strictly required; keep it tracked so reproducible
+# triage is possible. (No-op directive: kept here as a comment so it's
+# clear the lockfile is intentionally NOT ignored.)

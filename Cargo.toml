@@ -1,3 +1,10 @@
+# Exclude the cargo-fuzz workspace at `fuzz/` from the implicit single-crate
+# workspace this package would otherwise form. The fuzz crate uses
+# `libfuzzer-sys` (nightly + libFuzzer) and is built separately via
+# `cargo +nightly fuzz run <target>` — see `fuzz/README.md`.
+[workspace]
+exclude = ["fuzz"]
+
 [package]
 name = "purecrypto"
 version = "0.2.0"
