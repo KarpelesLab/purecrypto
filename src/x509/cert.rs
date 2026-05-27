@@ -633,6 +633,23 @@ impl Certificate {
         Ok(out)
     }
 
+    /// Returns the parsed `nameConstraints` extension (RFC 5280 §4.2.1.10),
+    /// or `None` if the certificate has none. Only the dNSName and iPAddress
+    /// variants are surfaced — any other GeneralName variant inside the
+    /// constraint causes [`NameConstraints::has_unenforceable_permitted`]
+    /// (or the excluded counterpart) to be set so the chain validator can
+    /// fail closed on critical constraints it can't fully evaluate.
+    pub fn name_constraints(&self) -> Result<Option<NameConstraints>, Error> {
+        let mut out: Option<NameConstraints> = None;
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::NAME_CONSTRAINTS {
+                out = Some(parse_name_constraints(value)?);
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
     /// Returns the `keyUsage` bit-mask, or `None` if the certificate has no
     /// such extension. The mask is read MSB-first per BIT STRING wire order:
     /// `keyUsage` bit 0 (`digitalSignature`) appears in `mask & 0x80`,
@@ -910,6 +927,111 @@ pub(crate) fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
         return None;
     }
     Some(out)
+}
+
+/// Parsed `nameConstraints` extension (RFC 5280 §4.2.1.10).
+///
+/// The validator surfaces only the dNSName and iPAddress subtree types it
+/// can evaluate; if any constraint mentions a different GeneralName variant
+/// (otherName, directoryName, rfc822Name, uniformResourceIdentifier, …)
+/// the corresponding `has_unenforceable_*` flag is set so the chain
+/// validator can fail closed when the extension is critical.
+#[derive(Clone, Debug, Default)]
+pub struct NameConstraints {
+    /// Permitted dNSName subtrees. An entry of `".example.com"` permits
+    /// any host ending with `.example.com`; `"example.com"` permits that
+    /// exact name plus any subdomain.
+    pub permitted_dns: Vec<String>,
+    /// Excluded dNSName subtrees, same shape.
+    pub excluded_dns: Vec<String>,
+    /// Permitted iPAddress subtrees as `(address_octets, mask_octets)`.
+    /// IPv4 subtrees use 4-byte addr + 4-byte mask; IPv6 uses 16+16.
+    pub permitted_ip: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Excluded iPAddress subtrees, same shape.
+    pub excluded_ip: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Set if a permitted subtree references a GeneralName variant other
+    /// than dNSName / iPAddress — the chain validator MUST reject the
+    /// certificate when this is true and the extension is critical
+    /// (RFC 5280 §4.2 fail-closed).
+    pub has_unenforceable_permitted: bool,
+    /// Same, for excluded subtrees.
+    pub has_unenforceable_excluded: bool,
+}
+
+/// Parses a `nameConstraints` extension body (the inner SEQUENCE of
+/// `permittedSubtrees [0] OPTIONAL` and `excludedSubtrees [1] OPTIONAL`).
+fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
+    let mut out = NameConstraints::default();
+    let mut r = Reader::new(value);
+    let mut seq = r.read_sequence()?;
+    // permittedSubtrees [0] IMPLICIT GeneralSubtrees → constructed tag 0xA0.
+    if seq.peek_tag() == Some(tag::context(0)) {
+        let body = seq.read_tlv(tag::context(0))?;
+        parse_subtrees(
+            body,
+            &mut out.permitted_dns,
+            &mut out.permitted_ip,
+            &mut out.has_unenforceable_permitted,
+        )?;
+    }
+    if seq.peek_tag() == Some(tag::context(1)) {
+        let body = seq.read_tlv(tag::context(1))?;
+        parse_subtrees(
+            body,
+            &mut out.excluded_dns,
+            &mut out.excluded_ip,
+            &mut out.has_unenforceable_excluded,
+        )?;
+    }
+    seq.finish()?;
+    r.finish()?;
+    Ok(out)
+}
+
+/// Parses a `GeneralSubtrees` (`SEQUENCE OF GeneralSubtree`) body.
+/// `GeneralSubtree ::= SEQUENCE { base GeneralName, minimum [0] DEFAULT 0,
+/// maximum [1] OPTIONAL }`. RFC 5280 §4.2.1.10 forbids both `minimum` (when
+/// not zero) and `maximum` — we refuse anything non-default.
+fn parse_subtrees(
+    body: &[u8],
+    dns_out: &mut Vec<String>,
+    ip_out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+    unenforceable: &mut bool,
+) -> Result<(), Error> {
+    let mut r = Reader::new(body);
+    while !r.is_empty() {
+        let mut subtree = r.read_sequence()?;
+        let (t, value) = subtree.read_any()?;
+        match t {
+            // dNSName [2] IMPLICIT IA5String → primitive context 0x82.
+            0x82 => {
+                let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
+                dns_out.push(String::from(s));
+            }
+            // iPAddress [7] IMPLICIT OCTET STRING → primitive context 0x87.
+            // RFC 5280 §4.2.1.10: constraint is `address || mask`,
+            // 8 bytes for IPv4 (4+4) or 32 bytes for IPv6 (16+16).
+            0x87 => match value.len() {
+                8 | 32 => {
+                    let half = value.len() / 2;
+                    ip_out.push((value[..half].to_vec(), value[half..].to_vec()));
+                }
+                _ => return Err(Error::Malformed),
+            },
+            // Any other GeneralName variant is something we can't evaluate.
+            // RFC 5280 §4.2 fail-closed: signal it so the validator can
+            // reject the chain when the extension is critical.
+            _ => {
+                *unenforceable = true;
+            }
+        }
+        // RFC 5280 §4.2.1.10: minimum MUST be 0 (the DEFAULT); maximum MUST be
+        // absent. Anything else is non-conformant.
+        if !subtree.is_empty() {
+            return Err(Error::Malformed);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
