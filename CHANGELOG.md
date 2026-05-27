@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/purecrypto/compare/v0.1.1...v0.2.0) - 2026-05-27
+
+### Added
+
+- *(kdf)* encrypted PKCS#8 (RFC 5958 §3 / RFC 8018 PBES2)
+
+### Fixed
+
+- *(tls,dtls)* TLS / DTLS robustness hardening
+- *(x509,der)* X.509 / DER strictness hardening
+
+### Other
+
+- BoxedRsaPublicKey::exponent + kdf::bcrypt_pbkdf path cleanup
+- strict SAN parsing + iPAddress accessor + IP-aware host matcher
+
 ## [0.1.1](https://github.com/KarpelesLab/purecrypto/compare/v0.1.0...v0.1.1) - 2026-05-27
 
 ### Added
