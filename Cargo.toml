@@ -16,7 +16,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -27,6 +27,10 @@ kdf = ["hash", "cipher"]
 bignum = []
 rng = ["hash"]
 rsa = ["bignum", "rng", "hash"]
+# Finite-field Diffie-Hellman over RFC 3526 MODP groups (group14..group18)
+# plus RFC 4419 group-exchange. For SSH and legacy TLS / IKE interop;
+# ECDH (in the `ec` module) is preferred for new code.
+dh = ["bignum", "rng", "alloc"]
 der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
 ec = ["bignum", "rng", "hash", "alloc"]

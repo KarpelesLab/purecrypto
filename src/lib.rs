@@ -40,6 +40,9 @@ pub mod cipher;
 #[cfg(feature = "der")]
 pub mod der;
 
+#[cfg(feature = "dh")]
+pub mod dh;
+
 #[cfg(feature = "ec")]
 pub mod ec;
 
