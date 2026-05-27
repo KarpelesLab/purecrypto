@@ -743,6 +743,20 @@ pub unsafe extern "C" fn pc_quic_stream_read(
             return PcStatus::NullPointer;
         }
         let cap = unsafe { *out_len };
+        // Cap the caller-controlled capacity to defend against a
+        // pathological / hostile `*out_len`. 1 MiB matches the largest
+        // legitimate single QUIC stream-read flow-control window
+        // realistic callers configure. Larger requests are answered
+        // with `BufferTooSmall` (the standard signal that the caller
+        // should retry with the documented maximum), not by silently
+        // attempting a multi-GiB allocation. We check this BEFORE the
+        // out-pointer null-check so an oversized `*out_len` is rejected
+        // even when paired with a null buffer.
+        const PC_QUIC_STREAM_READ_MAX: usize = 1 << 20; // 1 MiB
+        if cap > PC_QUIC_STREAM_READ_MAX {
+            unsafe { *out_len = PC_QUIC_STREAM_READ_MAX };
+            return PcStatus::BufferTooSmall;
+        }
         if cap > 0 && out.is_null() {
             return PcStatus::NullPointer;
         }

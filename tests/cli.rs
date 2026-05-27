@@ -26,11 +26,7 @@ fn run(args: &[&str], stdin: &[u8]) -> (String, bool) {
     )
 }
 
-/// Like [`run`] but also returns stderr. Used by tests that need to assert
-/// on warnings written to stderr (e.g. I-8's permission warning). Today the
-/// only caller is `#[cfg(unix)]`-gated so this is unix-only too; relax when
-/// a Windows test needs it.
-#[cfg(unix)]
+/// Like [`run`] but also returns stderr.
 fn run_capture(args: &[&str], stdin: &[u8]) -> (String, String, bool) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_purecrypto"))
         .args(args)
@@ -559,7 +555,9 @@ fn s_client_loopback() {
     });
 
     // The CLI connects (insecure: self-signed), sends PING, prints the reply.
-    let (out, ok) = run(
+    // `-quiet` MUST NOT suppress the "certificate NOT verified" warning —
+    // it's security-relevant and goes to stderr regardless.
+    let (out, err, ok) = run_capture(
         &[
             "s_client",
             "-connect",
@@ -574,6 +572,10 @@ fn s_client_loopback() {
     assert!(
         out.contains("PONG"),
         "expected PONG in stdout, got: {out:?}"
+    );
+    assert!(
+        err.contains("certificate NOT verified"),
+        "expected -insecure warning on stderr, got: {err:?}"
     );
 }
 

@@ -46,13 +46,38 @@ pub trait CryptoRng {}
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsRng;
 
+// Per-thread cached `/dev/urandom` file handle. Keep one open file per
+// thread to avoid the open/close overhead that dominates the cost of a
+// small entropy draw. `/dev/urandom` survives indefinitely under POSIX,
+// so a cached handle stays valid for the thread's lifetime. RefCell is
+// fine here: the borrow is uncontended (one thread); a panic between
+// `borrow_mut` and unborrow would poison the cell, but the only
+// operation inside the borrow is `read_exact`, whose panic path would
+// terminate the thread anyway via the `expect` below.
+#[cfg(all(feature = "std", unix))]
+std::thread_local! {
+    static URANDOM: core::cell::RefCell<Option<std::fs::File>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 #[cfg(all(feature = "std", unix))]
 impl RngCore for OsRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         use std::io::Read;
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(dest))
-            .expect("failed to read entropy from /dev/urandom");
+
+        URANDOM.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(
+                    std::fs::File::open("/dev/urandom")
+                        .expect("failed to open /dev/urandom"),
+                );
+            }
+            slot.as_mut()
+                .unwrap()
+                .read_exact(dest)
+                .expect("failed to read entropy from /dev/urandom");
+        });
     }
 }
 

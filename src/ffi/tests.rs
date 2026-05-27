@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, mlkem, rsa, x509};
+use super::{ec, hash, mlkem, quic, rsa, x509};
 use crate::der::pem_decode;
 
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
@@ -220,6 +220,39 @@ fn pc_mlkem_encaps_accepts_der() {
     assert_eq!(ct_len, 1088);
 
     unsafe { mlkem::pc_mlkem_free(k) };
+}
+
+/// `pc_quic_stream_read` caps the caller-controlled `*out_len` so a
+/// hostile / pathological value (e.g. `SIZE_MAX`) cannot trigger a
+/// multi-GiB allocation inside the FFI. Above the cap, the call
+/// returns `BufferTooSmall` and rewrites `*out_len` to the documented
+/// maximum.
+#[test]
+fn quic_stream_read_rejects_oversized_out_len() {
+    use core::ffi::c_char;
+    // QuicRole::Client == 0 per the enum.
+    let cfg = quic::pc_quic_cfg_new(0);
+    assert!(!cfg.is_null());
+    // SNI required for client-mode pc_quic_new.
+    let sni = b"loopback.example\0";
+    let st = unsafe { quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const c_char) };
+    assert_eq!(st, PcStatus::Ok);
+    // Disable certificate verification so the client builds without a
+    // trust store (we never actually run the handshake — we just need
+    // a valid PcQuic to call stream_read on).
+    let _ = unsafe { quic::pc_quic_cfg_set_verify_certificates(cfg, 0) };
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    assert!(!q.is_null(), "expected a constructible client");
+
+    let mut out_len: usize = usize::MAX;
+    let mut fin: i32 = 0;
+    let st =
+        unsafe { quic::pc_quic_stream_read(q, 0, core::ptr::null_mut(), &mut out_len, &mut fin) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(out_len, 1 << 20, "out_len must report the 1 MiB cap");
+
+    unsafe { quic::pc_quic_free(q) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
 }
 
 #[test]

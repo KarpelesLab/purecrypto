@@ -377,6 +377,16 @@ fn run_tcp(
 ) {
     drive_tcp_handshake(conn, sock);
 
+    // The "certificate NOT verified" warning is security-relevant: it
+    // tells the operator that this connection's peer identity was not
+    // checked. We print it to stderr *regardless* of -quiet so an
+    // unattended pipeline using `-quiet -insecure` cannot accidentally
+    // hide the fact. Match the DTLS path so the two transports speak
+    // the same warning string.
+    if insecure {
+        eprintln!("WARNING: certificate NOT verified (-insecure)");
+    }
+
     if !quiet {
         let v_str = match version {
             ProtocolVersion::Tls12 => "TLSv1.2",
@@ -412,6 +422,11 @@ fn run_udp(
 ) {
     drive_udp_handshake(conn, socket, mtu, Duration::from_secs(15));
 
+    // Unconditional security warning — see the TCP path for the rationale.
+    if insecure {
+        eprintln!("WARNING: certificate NOT verified (-insecure)");
+    }
+
     if !quiet {
         let v_str = match version {
             ProtocolVersion::Dtls12 => "DTLSv1.2",
@@ -419,9 +434,9 @@ fn run_udp(
             _ => "?",
         };
         eprintln!("connected: {v_str}");
-        if insecure {
-            eprintln!("WARNING: certificate NOT verified (-insecure)");
-        } else {
+        if !insecure {
+            // The "-insecure" warning is already emitted unconditionally
+            // above; only print the positive "verified" line here.
             eprintln!("certificate verified");
         }
         if let Some(p) = conn.alpn_selected() {

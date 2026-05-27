@@ -16,6 +16,34 @@ use crate::hash::{Digest, Hmac};
 /// reached, [`generate`](Self::generate) panics until [`reseed`](Self::reseed)
 /// is called. Per SP 800-90A the panic-vs-error choice is implementation
 /// defined; panic is the conservative behaviour for a CSPRNG.
+///
+/// # Production use — fork safety and reseeding
+///
+/// `HmacDrbg` is a *deterministic* generator: given the same seed it
+/// produces the same output forever. That is desirable for known-answer
+/// tests, for protocols that require deterministic nonces (e.g. RFC 6979
+/// ECDSA signatures), and for replay debugging, but it makes the type
+/// **unsafe for naive production use**. In particular:
+///
+/// * **Fork safety.** A `HmacDrbg` cloned across `fork(2)` (whether by an
+///   explicit `Clone` or by virtue of being captured in a parent's heap
+///   that the child inherits) generates the *same* output stream on
+///   both sides of the fork. The two processes will then produce
+///   colliding nonces, blinding factors, or session secrets. Either
+///   re-seed in the child via [`OsRng`](super::OsRng) before any draw,
+///   or use [`OsRng`](super::OsRng) directly in fork-prone code paths.
+/// * **Initial entropy.** Seeding from a low-entropy source (e.g. a
+///   constant or a millisecond timestamp) leaks the entire stream to
+///   anyone who can guess the seed. Production callers MUST seed from
+///   the operating system CSPRNG, typically [`OsRng`](super::OsRng).
+/// * **Long-running processes.** Per SP 800-90A §10.1.2.4 the DRBG must
+///   be reseeded before the counter exceeds `2^48` draws; this type
+///   panics on overflow but the caller is responsible for *invoking*
+///   [`reseed`](Self::reseed) with fresh entropy before that point.
+///
+/// For one-shot key generation, signatures, and other transient secrets
+/// in a single-process context, [`OsRng`](super::OsRng) is the simpler
+/// choice. Reach for `HmacDrbg` when you specifically need determinism.
 #[derive(Clone)]
 pub struct HmacDrbg<D: Digest> {
     /// HMAC key.
