@@ -14,6 +14,7 @@
 //! cipher_suite      u16
 //! master_secret     48 bytes
 //! creation_time     u64        // unix seconds (server clock at issuance)
+//! ems_used          u8         // 1 if EMS was negotiated, 0 otherwise (RFC 7627 §5.3)
 //! alpn_len          u8         // 0 if no ALPN negotiated
 //! alpn_bytes        alpn_len bytes
 //! ```
@@ -22,6 +23,11 @@
 //! `(now - creation_time) > lifetime` (server-side, with the server's
 //! current clock). This keeps the format simple — the client never needs to
 //! understand the plaintext layout.
+//!
+//! The `ems_used` byte (RFC 7627 §5.3) records whether the originating
+//! session derived its master secret via Extended Master Secret; resumption
+//! MUST keep the same status (EMS↔EMS or legacy↔legacy). A cross-EMS
+//! resumption attempt is rejected with `IllegalParameter`.
 
 use crate::cipher::{Aes256, Gcm};
 use crate::rng::RngCore;
@@ -31,8 +37,9 @@ use alloc::vec::Vec;
 const NONCE_LEN: usize = 12;
 /// AES-256-GCM authentication tag length.
 const TAG_LEN: usize = 16;
-/// Minimum plaintext: 2 (suite) + 48 (master) + 8 (creation) + 1 (alpn_len).
-const MIN_PLAIN_LEN: usize = 2 + 48 + 8 + 1;
+/// Minimum plaintext: 2 (suite) + 48 (master) + 8 (creation) + 1 (ems_used)
+/// + 1 (alpn_len).
+const MIN_PLAIN_LEN: usize = 2 + 48 + 8 + 1 + 1;
 
 /// The TLS 1.2 ticket payload — what the server learns when it decrypts a
 /// returning client's ticket.
@@ -48,6 +55,11 @@ pub(crate) struct Ticket12Plaintext {
     /// against the server's `now` and the configured lifetime to detect
     /// expired tickets.
     pub(crate) creation_time: u64,
+    /// RFC 7627 §5.3 — whether the originating session derived its master
+    /// secret via Extended Master Secret. Resumption MUST keep the same
+    /// status (EMS↔EMS or legacy↔legacy); the engine compares this bit
+    /// against the resumed handshake's EMS negotiation result.
+    pub(crate) ems_used: bool,
     /// The ALPN protocol negotiated on the originating connection. Empty if
     /// none; we don't currently use this for the abbreviated handshake (the
     /// client re-offers ALPN in its CH and the server re-picks), but we keep
@@ -63,6 +75,7 @@ impl Ticket12Plaintext {
         out.extend_from_slice(&self.cipher_suite.to_be_bytes());
         out.extend_from_slice(&self.master_secret);
         out.extend_from_slice(&self.creation_time.to_be_bytes());
+        out.push(if self.ems_used { 1 } else { 0 });
         out.push(alpn.len() as u8);
         out.extend_from_slice(alpn);
         out
@@ -80,19 +93,26 @@ impl Ticket12Plaintext {
         let creation_time = u64::from_be_bytes([
             buf[50], buf[51], buf[52], buf[53], buf[54], buf[55], buf[56], buf[57],
         ]);
-        let alpn_len = buf[58] as usize;
+        let ems_used = match buf[58] {
+            0 => false,
+            1 => true,
+            // Reject other values; ems_used is a strict bool on the wire.
+            _ => return None,
+        };
+        let alpn_len = buf[59] as usize;
         if buf.len() != MIN_PLAIN_LEN + alpn_len {
             return None;
         }
         let alpn = if alpn_len == 0 {
             None
         } else {
-            Some(buf[59..59 + alpn_len].to_vec())
+            Some(buf[60..60 + alpn_len].to_vec())
         };
         Some(Ticket12Plaintext {
             cipher_suite,
             master_secret,
             creation_time,
+            ems_used,
             alpn,
         })
     }
@@ -141,6 +161,7 @@ mod tests {
             cipher_suite: 0xC02F,
             master_secret: [0xa5; 48],
             creation_time: 0x1122334455667788,
+            ems_used: true,
             alpn: None,
         };
         let buf = p.encode();
@@ -148,6 +169,7 @@ mod tests {
         assert_eq!(dec.cipher_suite, p.cipher_suite);
         assert_eq!(dec.master_secret, p.master_secret);
         assert_eq!(dec.creation_time, p.creation_time);
+        assert!(dec.ems_used);
         assert!(dec.alpn.is_none());
     }
 
@@ -157,11 +179,13 @@ mod tests {
             cipher_suite: 0xCCA9,
             master_secret: [0x3c; 48],
             creation_time: 1_700_000_000,
+            ems_used: false,
             alpn: Some(b"h2".to_vec()),
         };
         let buf = p.encode();
         let dec = Ticket12Plaintext::decode(&buf).unwrap();
         assert_eq!(dec.cipher_suite, p.cipher_suite);
+        assert!(!dec.ems_used);
         assert_eq!(dec.alpn.as_deref(), Some(b"h2".as_ref()));
     }
 
@@ -169,6 +193,21 @@ mod tests {
     fn plaintext_rejects_truncated() {
         assert!(Ticket12Plaintext::decode(&[]).is_none());
         assert!(Ticket12Plaintext::decode(&[0u8; 58]).is_none());
+    }
+
+    #[test]
+    fn plaintext_rejects_bad_ems_flag() {
+        // Hand-craft a buffer where the ems_used byte is neither 0 nor 1.
+        let p = Ticket12Plaintext {
+            cipher_suite: 0xC02F,
+            master_secret: [0x11; 48],
+            creation_time: 1,
+            ems_used: false,
+            alpn: None,
+        };
+        let mut buf = p.encode();
+        buf[58] = 2; // illegal ems_used value
+        assert!(Ticket12Plaintext::decode(&buf).is_none());
     }
 
     #[test]

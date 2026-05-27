@@ -29,7 +29,9 @@ use crate::tls::codec::{
     CipherSuite, NamedGroup, Random, ReadCursor, ServerHello, hs_type, with_len_u8, with_len_u16,
 };
 use crate::tls::crypto::aead12::RecordCrypter12;
-use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
+use crate::tls::crypto::prf::{
+    extended_master_secret, finished_verify_data, key_block, master_secret,
+};
 use crate::tls::crypto::{HashAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls};
@@ -206,6 +208,13 @@ pub struct DtlsClientConnection12 {
     /// Current logical time as the caller has reported via `on_timeout`. We
     /// only need this to seed `set_flight` after building each flight.
     last_now: Duration,
+
+    /// RFC 7627 §3 — we always offer `extended_master_secret` in the DTLS
+    /// 1.2 ClientHello.
+    #[allow(dead_code)]
+    ems_offered: bool,
+    /// RFC 7627 §3 — set when the server echoed EMS in its ServerHello.
+    ems_negotiated: bool,
 }
 
 impl DtlsClientConnection12 {
@@ -250,6 +259,8 @@ impl DtlsClientConnection12 {
             ccs_received: false,
             retransmit: Retransmit::new(),
             last_now: Duration::from_secs(0),
+            ems_offered: true,
+            ems_negotiated: false,
         };
         // We don't include the first CH in the transcript: per RFC 6347 §4.2.1,
         // "the initial ClientHello and HelloVerifyRequest are not included in
@@ -540,6 +551,15 @@ impl DtlsClientConnection12 {
         if sh.cipher_suite != CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 {
             return Err(Error::HandshakeFailure);
         }
+        // RFC 7627 §5.1: detect the EMS echo. Body MUST be empty; a
+        // non-empty body fails parsing → decode_error.
+        if let Some(ems_body) = ext::find(
+            &sh.extensions,
+            crate::tls::codec::ExtensionType::EXTENDED_MASTER_SECRET,
+        ) {
+            ext::parse_extended_master_secret(ems_body)?;
+            self.ems_negotiated = true;
+        }
         self.server_random = Some(sh.random);
         self.transcript.update(raw);
         self.state = State::WaitCertificate;
@@ -629,9 +649,41 @@ impl DtlsClientConnection12 {
         let peer_point = self.peer_point.clone().ok_or(Error::InappropriateState)?;
         let (premaster, our_point) = self.ecdhe(group, &peer_point)?;
 
+        // Build the client's final flight: CKE, CCS, Finished.
+        let mut flight = Flight::new();
+
+        // ClientKeyExchange — DTLS handshake msg_seq advances; record at epoch 0.
+        // We must feed CKE into the transcript BEFORE deriving the master
+        // secret so the EMS session_hash covers it (RFC 7627 §4).
+        let cke = ClientKeyExchange { point: our_point }.encode();
+        // `cke` already has the 4-byte TLS handshake header; we strip it for
+        // transcript+DTLS fragmentation, then re-add for the transcript.
+        // Strip header: [type(1) | length(3) | body].
+        let cke_body = &cke[4..];
+        let cke_msg_seq = self.out_msg_seq;
+        self.out_msg_seq += 1;
+        let mut cke_frag_buf = Vec::new();
+        write_message(
+            &mut cke_frag_buf,
+            hs_type::CLIENT_KEY_EXCHANGE,
+            cke_msg_seq,
+            cke_body,
+            DEFAULT_MAX_FRAGMENT,
+        );
+        // Transcript: TLS-shaped (no DTLS headers).
+        self.transcript.update(&cke);
+        let cke_dgram = self.wrap_plain_record(ContentType::Handshake, &cke_frag_buf);
+        flight.push(cke_dgram);
+
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
-        let master = master_secret(HashAlg::Sha256, &premaster, &cr, &sr);
+        let master = if self.ems_negotiated {
+            // RFC 7627 §4: session_hash = Hash(CH..CKE).
+            let sh = self.transcript.current_hash();
+            extended_master_secret(HashAlg::Sha256, &premaster, sh.as_slice())
+        } else {
+            master_secret(HashAlg::Sha256, &premaster, &cr, &sr)
+        };
 
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
@@ -653,30 +705,6 @@ impl DtlsClientConnection12 {
         self.master = Some(master);
         self.write_crypter = Some(write_crypter);
         self.read_crypter = Some(read_crypter);
-
-        // Build the client's final flight: CKE, CCS, Finished.
-        let mut flight = Flight::new();
-
-        // ClientKeyExchange — DTLS handshake msg_seq advances; record at epoch 0.
-        let cke = ClientKeyExchange { point: our_point }.encode();
-        // `cke` already has the 4-byte TLS handshake header; we strip it for
-        // transcript+DTLS fragmentation, then re-add for the transcript.
-        // Strip header: [type(1) | length(3) | body].
-        let cke_body = &cke[4..];
-        let cke_msg_seq = self.out_msg_seq;
-        self.out_msg_seq += 1;
-        let mut cke_frag_buf = Vec::new();
-        write_message(
-            &mut cke_frag_buf,
-            hs_type::CLIENT_KEY_EXCHANGE,
-            cke_msg_seq,
-            cke_body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        // Transcript: TLS-shaped (no DTLS headers).
-        self.transcript.update(&cke);
-        let cke_dgram = self.wrap_plain_record(ContentType::Handshake, &cke_frag_buf);
-        flight.push(cke_dgram);
 
         // ChangeCipherSpec — its own DTLS record, plaintext, epoch 0, content_type 20.
         let ccs_dgram = self.wrap_plain_record(ContentType::ChangeCipherSpec, &[0x01]);
@@ -773,6 +801,9 @@ impl DtlsClientConnection12 {
             ext::supported_groups_list(&groups),
             ext::signature_algorithms(),
             ext::ec_point_formats(),
+            // RFC 7627 §5.1: DTLS 1.2 inherits the EMS rules from TLS 1.2.
+            // Always offer; the server echoes only when it also supports EMS.
+            ext::extended_master_secret_empty(),
         ];
 
         // Encode the DTLS ClientHello body. Wire layout (RFC 6347 §4.2.1):

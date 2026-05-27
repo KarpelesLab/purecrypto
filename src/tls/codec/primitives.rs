@@ -122,6 +122,12 @@ u16_id!(
         ALPN = 0x0010,
         /// record_size_limit (RFC 8449).
         RECORD_SIZE_LIMIT = 0x001c,
+        /// extended_master_secret (RFC 7627). Empty-body extension that, when
+        /// echoed by both peers in CH/SH, switches the TLS 1.2 master-secret
+        /// derivation to `PRF(premaster, "extended master secret",
+        /// session_hash)` (RFC 7627 §4) — closing the Triple Handshake
+        /// attack class.
+        EXTENDED_MASTER_SECRET = 0x0017,
         /// session_ticket (RFC 5077). Empty body in CH advertises ticket
         /// support; empty body in SH signals the server will issue one (and
         /// the NewSessionTicket follows in its plaintext flight); a non-empty

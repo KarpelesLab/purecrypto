@@ -143,6 +143,27 @@ pub(crate) fn parse_renegotiation_info(body: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(inner.to_vec())
 }
 
+/// RFC 7627 §5.1 — `extended_master_secret` extension (codepoint `0x0017`)
+/// with an empty body. The client always offers it; the server echoes it
+/// only when it also offers EMS. When both peers send the extension, the
+/// TLS 1.2 master-secret derivation switches to use the session transcript
+/// hash through `ClientKeyExchange` instead of the bare client/server
+/// randoms, binding the master secret to the full handshake context and
+/// closing the Triple Handshake attack class.
+pub(crate) fn extended_master_secret_empty() -> RawExtension {
+    (ExtensionType::EXTENDED_MASTER_SECRET, Vec::new())
+}
+
+/// RFC 7627 §5.1 — the body of `extended_master_secret` MUST be empty.
+/// A non-empty body is a protocol violation; reject with `Decode` so the
+/// caller maps it to a `decode_error` alert.
+pub(crate) fn parse_extended_master_secret(body: &[u8]) -> Result<(), Error> {
+    if !body.is_empty() {
+        return Err(Error::Decode);
+    }
+    Ok(())
+}
+
 /// `session_ticket` (RFC 5077) carrying an opaque ticket. In ClientHello an
 /// empty body advertises support; a non-empty body resumes. In ServerHello an
 /// empty body signals the server will issue a fresh NewSessionTicket (RFC 5077

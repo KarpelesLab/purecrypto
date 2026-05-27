@@ -98,6 +98,34 @@ pub(crate) fn master_secret(
     out
 }
 
+/// RFC 7627 §4 — Extended Master Secret derivation.
+///
+/// ```text
+/// master_secret = PRF(pre_master_secret, "extended master secret",
+///                     session_hash)[0..48]
+/// ```
+///
+/// where `session_hash = Hash(handshake_messages from ClientHello up to and
+/// including ClientKeyExchange)` using the negotiated PRF hash. This binds
+/// the master secret to the full handshake transcript, closing the Triple
+/// Handshake attack class.
+#[allow(dead_code)]
+pub(crate) fn extended_master_secret(
+    hash: HashAlg,
+    premaster: &[u8],
+    session_hash: &[u8],
+) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    prf(
+        hash,
+        premaster,
+        b"extended master secret",
+        session_hash,
+        &mut out,
+    );
+    out
+}
+
 /// Derives the `key_block` (RFC 5246 §6.3):
 ///
 /// ```text
@@ -176,6 +204,37 @@ mod tests {
         // SHA-384 dispatch gives a different (still 48-byte) value.
         let ms_sha384 = master_secret(HashAlg::Sha384, &premaster, &cr, &sr);
         assert_ne!(ms1, ms_sha384);
+    }
+
+    /// `extended_master_secret` is deterministic, 48 bytes, and differs from
+    /// the legacy `master_secret` for the same premaster (RFC 7627 §4).
+    #[test]
+    fn extended_master_secret_differs_from_legacy() {
+        let premaster = [0x42u8; 48];
+        // 32-byte SHA-256 session hash.
+        let session_hash = [0xa5u8; 32];
+
+        let ems1 = extended_master_secret(HashAlg::Sha256, &premaster, &session_hash);
+        let ems2 = extended_master_secret(HashAlg::Sha256, &premaster, &session_hash);
+        assert_eq!(ems1, ems2, "EMS must be deterministic");
+        assert_eq!(ems1.len(), 48);
+
+        // A different session_hash flips the output.
+        let mut other = session_hash;
+        other[0] ^= 1;
+        let ems3 = extended_master_secret(HashAlg::Sha256, &premaster, &other);
+        assert_ne!(ems1, ems3);
+
+        // Legacy and EMS derivations must differ for the same inputs that
+        // happen to map onto each other (cr||sr = 64B; we just compare label
+        // separation — the labels are different so the PRF streams diverge).
+        let cr = [0x11u8; 32];
+        let sr = [0x22u8; 32];
+        let legacy = master_secret(HashAlg::Sha256, &premaster, &cr, &sr);
+        // Use a 48-byte SHA-384 session hash for a sanity check across hashes.
+        let ems_sha384 = extended_master_secret(HashAlg::Sha384, &premaster, &[0xa5u8; 48]);
+        assert_ne!(ems1, legacy);
+        assert_ne!(ems1, ems_sha384);
     }
 
     /// `finished_verify_data` is exactly 12 bytes and depends on its inputs.

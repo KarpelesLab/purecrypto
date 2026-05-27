@@ -51,7 +51,9 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
-use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
+use crate::tls::crypto::prf::{
+    extended_master_secret, finished_verify_data, key_block, master_secret,
+};
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -240,6 +242,12 @@ pub struct StoredSession12 {
     /// Wall-clock time the NST arrived (for caller-side expiry). The server
     /// has its own expiry policy; both are advisory.
     pub received_at: Option<Time>,
+    /// RFC 7627 §5.3 — whether the originating session used Extended Master
+    /// Secret. Resumption MUST preserve this status: if `true`, the resumed
+    /// handshake's `extended_master_secret` MUST be negotiated; if `false`,
+    /// it MUST NOT. Cross-EMS resumption is rejected with
+    /// `IllegalParameter`.
+    pub ems_used: bool,
 }
 
 /// Whether the cipher-suite's signature half is RSA or ECDSA — drives which
@@ -452,6 +460,19 @@ pub struct ClientConnection12 {
     /// detected by the server's `session_ticket` extension being absent in
     /// the SH).
     resumed: bool,
+
+    /// RFC 7627 §3 — we always offer `extended_master_secret` in our
+    /// ClientHello; this flag stays `true` for the connection lifetime
+    /// once the CH is built.
+    pub(crate) ems_offered: bool,
+    /// RFC 7627 §3 — set when the server echoed `extended_master_secret`
+    /// in its ServerHello. Drives the master-secret derivation choice
+    /// (EMS vs legacy) and the resumption-gating check.
+    pub(crate) ems_negotiated: bool,
+    /// RFC 7627 §4 — snapshot of `Hash(CH ‖ SH ‖ … ‖ CKE)` captured the
+    /// instant the ClientKeyExchange is fed into the transcript. Used as
+    /// the `session_hash` input to `extended_master_secret`.
+    ems_session_hash: Option<Vec<u8>>,
 }
 
 impl ClientConnection12 {
@@ -519,6 +540,12 @@ impl ClientConnection12 {
             received_ticket: None,
             received_ticket_lifetime: 0,
             resumed: false,
+            // We always offer EMS (RFC 7627 §3); the flag captures that on
+            // both the fresh and resumed paths so resumption-gating can
+            // compare it against the stored session's `ems_used`.
+            ems_offered: true,
+            ems_negotiated: false,
+            ems_session_hash: None,
         };
         let hello = conn.build_client_hello(&offered_suites, groups);
         // Update the transcript even though the hash isn't selected yet —
@@ -542,6 +569,13 @@ impl ClientConnection12 {
             // strict server doesn't reject us for failing to advertise
             // secure-renegotiation support. We never actually renegotiate.
             ext::renegotiation_info_empty(),
+            // RFC 7627 §5.1: always offer `extended_master_secret`. A
+            // server that supports it echoes back the empty-body extension
+            // and both sides switch to the session-hash-bound derivation;
+            // a server that doesn't echo it falls back to the legacy
+            // randoms-only derivation. Modern peers (rustls, BoringSSL,
+            // OpenSSL, NSS) require EMS by default.
+            ext::extended_master_secret_empty(),
         ];
         if !self.config.alpn_protocols.is_empty() {
             let protos: Vec<&[u8]> = self
@@ -639,12 +673,18 @@ impl ClientConnection12 {
             cipher_suite: suite.suite.0,
             alpn: self.alpn_negotiated.clone(),
             received_at: self.config.verification_time.clone().or_else(system_now),
+            ems_used: self.ems_negotiated,
         })
     }
 
     /// `true` if this handshake resumed a prior session via RFC 5077.
     pub fn did_resume(&self) -> bool {
         self.resumed
+    }
+
+    /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
+    pub fn ems_negotiated(&self) -> bool {
+        self.ems_negotiated
     }
 
     /// Feeds received TLS bytes into the input buffer.
@@ -995,6 +1035,23 @@ impl ClientConnection12 {
         let server_will_issue_ticket =
             ext::find(&sh.extensions, ExtensionType::SESSION_TICKET).is_some();
 
+        // RFC 7627 §5.1: server echoes `extended_master_secret` iff it
+        // supports EMS. A server that echoes it MUST also have seen our
+        // offer (which we always send) — if not, that's a server bug and
+        // we reject with `IllegalParameter`. Empty body is mandatory; a
+        // non-empty body is a protocol violation (`Decode` → decode_error).
+        if let Some(ems_body) = ext::find(&sh.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+            ext::parse_extended_master_secret(ems_body)?;
+            if !self.ems_offered {
+                // We always offer; this branch is defensive in case a
+                // future caller suppresses the offer.
+                return Err(Error::IllegalParameter);
+            }
+            self.ems_negotiated = true;
+        } else {
+            self.ems_negotiated = false;
+        }
+
         // Pin the negotiated hash on the transcript now that we know it.
         self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
@@ -1014,6 +1071,15 @@ impl ClientConnection12 {
             .filter(|_| !server_will_issue_ticket)
             .cloned();
         if let Some(stored) = resume {
+            // RFC 7627 §5.3: a session that used EMS MUST resume with EMS,
+            // and a session that did NOT use EMS MUST NOT resume with EMS.
+            // Cross-EMS resumption is forbidden — abort the handshake with
+            // `IllegalParameter` to keep an active downgrader from
+            // recombining a non-EMS handshake with an EMS-bound ticket.
+            if stored.ems_used != self.ems_negotiated {
+                return Err(Error::IllegalParameter);
+            }
+
             // Resumed path: master_secret recovered from the ticket; derive a
             // fresh key block from the new randoms and wait for the server's
             // [NewSessionTicket] / CCS / Finished. We do NOT touch ECDHE — no
@@ -1152,11 +1218,41 @@ impl ClientConnection12 {
             .ok_or(Error::InappropriateState)?;
         let (premaster, our_point) = self.ecdhe(group, &peer_point)?;
 
-        // Derive master_secret and the key_block.
+        // RFC 5246 §7.4.7.1 — the CKE goes into the transcript next. We need
+        // its hash captured BEFORE we feed any further messages so the EMS
+        // `session_hash` exactly matches `Hash(CH..CKE)` (RFC 7627 §4).
+        // mTLS: if the server asked for a client cert, we MUST emit our
+        // Certificate FIRST (RFC 5246 §7.3) — feed it into the transcript
+        // before the CKE so the EMS session_hash includes it.
         let suite = self.suite.expect("suite set");
+        if self.cert_request_received {
+            self.send_client_certificate();
+        }
+
+        // Emit ClientKeyExchange.
+        let cke = ClientKeyExchange { point: our_point }.encode();
+        self.transcript.update(&cke);
+        // Snapshot the EMS session_hash AFTER feeding CKE (and any earlier
+        // client `Certificate`) into the transcript; this is exactly
+        // `Hash(CH..CKE)`.
+        if self.ems_negotiated {
+            self.ems_session_hash = Some(self.transcript.current_hash().as_slice().to_vec());
+        }
+        self.write_plain_record(ContentType::Handshake, &cke);
+
+        // Derive master_secret. RFC 7627 §4 vs RFC 5246 §8.1 — the choice
+        // depends on whether both peers offered/echoed EMS.
         let cr = self.client_random;
         let sr = self.server_random.expect("server_random set");
-        let master = master_secret(suite.hash, &premaster, &cr, &sr);
+        let master = if self.ems_negotiated {
+            let session_hash = self
+                .ems_session_hash
+                .as_ref()
+                .expect("EMS session_hash snapshot taken just above");
+            extended_master_secret(suite.hash, &premaster, session_hash)
+        } else {
+            master_secret(suite.hash, &premaster, &cr, &sr)
+        };
 
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
@@ -1176,20 +1272,10 @@ impl ClientConnection12 {
         let client_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
         let server_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
 
-        // mTLS: if the server asked for a client cert, we MUST emit a
-        // `Certificate` message FIRST (RFC 5246 §7.3) — possibly empty if we
-        // have no cert configured.
-        if self.cert_request_received {
-            self.send_client_certificate();
-        }
-
-        // Emit ClientKeyExchange.
-        let cke = ClientKeyExchange { point: our_point }.encode();
-        self.transcript.update(&cke);
-        self.write_plain_record(ContentType::Handshake, &cke);
-
-        // mTLS: if we sent a non-empty Certificate, follow up with
-        // `CertificateVerify` over the raw transcript so far (CH..CKE).
+        // The client Certificate (under mTLS) and ClientKeyExchange were
+        // emitted ABOVE so the EMS session_hash snapshot covers them
+        // exactly. CertificateVerify follows next because it is signed over
+        // the transcript through CKE.
         if self.cert_request_received && self.config.client_cert.is_some() {
             self.send_client_certificate_verify()?;
         }
@@ -1500,19 +1586,24 @@ mod tests {
         assert!(ch.session_id.is_empty());
 
         // The required extension set: SNI, supported_groups,
-        // signature_algorithms, ec_point_formats, renegotiation_info.
+        // signature_algorithms, ec_point_formats, renegotiation_info,
+        // and extended_master_secret (RFC 7627 §5.1 — always offered).
         for ty in [
             ExtensionType::SERVER_NAME,
             ExtensionType::SUPPORTED_GROUPS,
             ExtensionType::SIGNATURE_ALGORITHMS,
             ExtensionType::EC_POINT_FORMATS,
             ExtensionType::RENEGOTIATION_INFO,
+            ExtensionType::EXTENDED_MASTER_SECRET,
         ] {
             assert!(
                 ext::find(&ch.extensions, ty).is_some(),
                 "missing extension {ty:?}",
             );
         }
+        // EMS must have an empty body (RFC 7627 §5.1).
+        let ems_body = ext::find(&ch.extensions, ExtensionType::EXTENDED_MASTER_SECRET).unwrap();
+        assert!(ems_body.is_empty(), "EMS body must be empty");
         // We must NOT send `supported_versions` from a TLS 1.2 client.
         assert!(ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS).is_none());
 

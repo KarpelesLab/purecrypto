@@ -20,7 +20,9 @@ use crate::tls::codec::{
     hs_type, with_len_u8, with_len_u24,
 };
 use crate::tls::crypto::aead12::RecordCrypter12;
-use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
+use crate::tls::crypto::prf::{
+    extended_master_secret, finished_verify_data, key_block, master_secret,
+};
 use crate::tls::crypto::{HashAlg, Transcript};
 use crate::tls::keylog::KeyLog;
 use crate::tls::{ContentType, Error, ProtocolVersion};
@@ -168,6 +170,10 @@ pub struct DtlsServerConnection12<R: RngCore> {
     retransmit: Retransmit,
     /// Current logical time the caller has reported.
     last_now: Duration,
+
+    /// RFC 7627 §5.1 — set when the client offered `extended_master_secret`
+    /// and we echoed it. Drives the master-secret derivation choice.
+    ems_negotiated: bool,
 }
 
 impl<R: RngCore> DtlsServerConnection12<R> {
@@ -202,6 +208,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             ccs_received: false,
             retransmit: Retransmit::new(),
             last_now: Duration::from_secs(0),
+            ems_negotiated: false,
         }
     }
 
@@ -460,6 +467,14 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         if !groups.contains(&NamedGroup::X25519) {
             return Err(Error::HandshakeFailure);
         }
+
+        // RFC 7627 §5.1: detect the client's EMS offer (DTLS 1.2 inherits
+        // the rules from TLS 1.2). Body MUST be empty.
+        if let Some(ems_body) = ext::find(&parsed.extensions, ExtensionType::EXTENDED_MASTER_SECRET)
+        {
+            ext::parse_extended_master_secret(ems_body)?;
+            self.ems_negotiated = true;
+        }
         // Initialise the reassembler at expected_msg_seq = msg_seq + 1
         // (the client's next handshake msg after CH).
         let mut reasm = Reassembler::new();
@@ -498,12 +513,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Build the server flight.
         let mut flight = Flight::new();
 
-        // ServerHello.
+        // ServerHello. Always include ec_point_formats; echo EMS when
+        // negotiated (RFC 7627 §5.1).
+        let mut sh_exts: Vec<(ExtensionType, Vec<u8>)> = alloc::vec![ext::ec_point_formats()];
+        if self.ems_negotiated {
+            sh_exts.push(ext::extended_master_secret_empty());
+        }
         let sh = ServerHello {
             random: sr,
             session_id: Vec::new(),
             cipher_suite: want,
-            extensions: alloc::vec![ext::ec_point_formats()],
+            extensions: sh_exts,
         }
         .encode();
         // sh has leading 4-byte TLS header — strip for transcript not
@@ -647,7 +667,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let premaster = ss.to_vec();
         let cr = self.client_random.expect("set");
         let sr = self.server_random.expect("set");
-        let master = master_secret(HashAlg::Sha256, &premaster, &cr, &sr);
+
+        // Feed CKE into the transcript BEFORE deriving the master so the
+        // EMS session_hash (RFC 7627 §4) spans CH..CKE inclusive.
+        self.transcript.update(raw);
+
+        let master = if self.ems_negotiated {
+            let sh = self.transcript.current_hash();
+            extended_master_secret(HashAlg::Sha256, &premaster, sh.as_slice())
+        } else {
+            master_secret(HashAlg::Sha256, &premaster, &cr, &sr)
+        };
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -670,7 +700,6 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             s_salt,
         ));
         self.master = Some(master);
-        self.transcript.update(raw);
         Ok(())
     }
 

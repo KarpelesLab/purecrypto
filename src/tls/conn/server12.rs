@@ -46,7 +46,9 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::Transcript;
 use crate::tls::crypto::aead12::RecordCrypter12;
-use crate::tls::crypto::prf::{finished_verify_data, key_block, master_secret};
+use crate::tls::crypto::prf::{
+    extended_master_secret, finished_verify_data, key_block, master_secret,
+};
 use crate::tls::crypto::verify_signature;
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::RootCertStore;
@@ -329,6 +331,21 @@ pub struct ServerConnection12<R: RngCore> {
     /// from a valid ticket presented in the client's CH). Skips Certificate /
     /// SKE / CertReq / SHDone and changes the post-CH state path.
     resumed: bool,
+
+    /// RFC 7627 §5.1 — set when the client offered
+    /// `extended_master_secret` and we elected to echo it. Drives the
+    /// master-secret derivation (EMS vs legacy) and resumption gating.
+    pub(crate) ems_negotiated: bool,
+    /// Test-only: when `true`, the server pretends it does NOT support
+    /// EMS — it ignores the client's offer and never echoes the
+    /// extension. Lets the loopback tests drive the legacy fallback
+    /// derivation against an EMS-offering client.
+    #[cfg(test)]
+    pub(crate) test_force_no_ems: bool,
+    /// RFC 7627 §4 — snapshot of `Hash(CH ‖ SH ‖ … ‖ CKE)` captured the
+    /// instant the ClientKeyExchange is fed into the transcript. Used as
+    /// the `session_hash` input to `extended_master_secret`.
+    ems_session_hash: Option<Vec<u8>>,
 }
 
 impl<R: RngCore> ServerConnection12<R> {
@@ -364,6 +381,10 @@ impl<R: RngCore> ServerConnection12<R> {
             client_leaf_key: None,
             peer_offered_session_ticket: false,
             resumed: false,
+            ems_negotiated: false,
+            ems_session_hash: None,
+            #[cfg(test)]
+            test_force_no_ems: false,
         }
     }
 
@@ -395,6 +416,19 @@ impl<R: RngCore> ServerConnection12<R> {
     /// The ALPN protocol the server selected, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
+    }
+
+    /// The TLS 1.2 master secret derived during the handshake. `None` until
+    /// the CKE has been processed. Useful for cross-peer agreement checks
+    /// and for writing the NSS `SSLKEYLOGFILE` `CLIENT_RANDOM` line from
+    /// the server side.
+    pub fn master_secret(&self) -> Option<[u8; 48]> {
+        self.master
+    }
+
+    /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
+    pub fn ems_negotiated(&self) -> bool {
+        self.ems_negotiated
     }
 
     /// Feeds received TLS bytes.
@@ -759,6 +793,21 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_offered_reneg_info = true;
         }
 
+        // RFC 7627 §5.1: client may offer `extended_master_secret`
+        // (empty body). When present and well-formed we elect to echo it,
+        // switching the master-secret derivation. Modern clients (rustls,
+        // BoringSSL, OpenSSL, NSS) require EMS by default.
+        #[cfg(test)]
+        let echo_ems = !self.test_force_no_ems;
+        #[cfg(not(test))]
+        let echo_ems = true;
+        if let Some(ems_body) = ext::find(&ch.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+            ext::parse_extended_master_secret(ems_body)?;
+            if echo_ems {
+                self.ems_negotiated = true;
+            }
+        }
+
         // RFC 5077 §3.1: the client advertises ticket support via the
         // `session_ticket` extension. An empty body = "support, no ticket";
         // non-empty = "please resume this ticket".
@@ -773,6 +822,16 @@ impl<R: RngCore> ServerConnection12<R> {
             .and_then(|t| self.try_resume(t, &ch.cipher_suites));
 
         if let Some(rs) = resume {
+            // RFC 7627 §5.3: a session that used EMS MUST resume with EMS,
+            // and a session that did NOT use EMS MUST NOT resume with EMS.
+            // The current handshake's EMS status (`self.ems_negotiated`)
+            // is set by the client's CH extension and the server's
+            // willingness to echo; mismatch is a downgrade attempt and
+            // we abort.
+            if rs.ems_used != self.ems_negotiated {
+                return Err(Error::IllegalParameter);
+            }
+
             // RESUMED HANDSHAKE PATH (RFC 5077 §3.4).
             self.transcript.set_alg(rs.suite.hash);
             self.transcript.update(raw);
@@ -918,6 +977,7 @@ impl<R: RngCore> ServerConnection12<R> {
         Some(ResumedState {
             suite,
             master_secret: parsed.master_secret,
+            ems_used: parsed.ems_used,
         })
     }
 
@@ -931,6 +991,12 @@ impl<R: RngCore> ServerConnection12<R> {
         }
         if let Some(p) = self.alpn_negotiated.as_ref() {
             extensions.push(ext::alpn_protocols(&[p.as_slice()]));
+        }
+        // RFC 7627 §5.1: echo `extended_master_secret` when negotiated. We
+        // do this for both fresh and resumed handshakes — RFC 7627 §5.3
+        // explicitly requires resumption to preserve the EMS bit.
+        if self.ems_negotiated {
+            extensions.push(ext::extended_master_secret_empty());
         }
         // ec_point_formats: we always advertise uncompressed.
         extensions.push(ext::ec_point_formats());
@@ -1191,10 +1257,21 @@ impl<R: RngCore> ServerConnection12<R> {
             _ => return Err(Error::HandshakeFailure),
         };
 
-        // master_secret + key_block.
+        // master_secret + key_block. The transcript at this point covers
+        // CH .. SH .. Cert .. SKE .. (CertReq?) .. SHDone, and we are
+        // about to feed CKE. EMS (RFC 7627 §4) requires the session_hash
+        // to span CH..CKE inclusive — so we update the transcript with
+        // `raw` (the CKE) BEFORE deriving and snapshot the hash here.
+        self.transcript.update(raw);
         let cr = self.client_random.expect("client_random set");
         let sr = self.server_random.expect("server_random set");
-        let master = master_secret(suite.hash, &premaster, &cr, &sr);
+        let master = if self.ems_negotiated {
+            let sh = self.transcript.current_hash();
+            self.ems_session_hash = Some(sh.as_slice().to_vec());
+            extended_master_secret(suite.hash, &premaster, sh.as_slice())
+        } else {
+            master_secret(suite.hash, &premaster, &cr, &sr)
+        };
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -1213,7 +1290,7 @@ impl<R: RngCore> ServerConnection12<R> {
         self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt));
         self.master = Some(master);
 
-        self.transcript.update(raw);
+        // CKE was already added to the transcript above for the EMS path.
         // mTLS: if the client presented a non-empty Certificate, the next
         // message is CertificateVerify (RFC 5246 §7.4.8). Otherwise skip
         // straight to expecting their CCS + Finished.
@@ -1323,6 +1400,9 @@ impl<R: RngCore> ServerConnection12<R> {
             cipher_suite: suite.suite.0,
             master_secret: *master,
             creation_time: system_now_u64(),
+            // RFC 7627 §5.3: record the EMS status so resumption can
+            // enforce that EMS↔EMS and legacy↔legacy.
+            ems_used: self.ems_negotiated,
             alpn: self.alpn_negotiated.clone(),
         };
         let ticket = seal_ticket(&mut self.rng, key, &plain.encode());
@@ -1344,6 +1424,9 @@ impl<R: RngCore> ServerConnection12<R> {
 struct ResumedState {
     suite: SuiteParams12,
     master_secret: [u8; 48],
+    /// RFC 7627 §5.3 — whether the originating session used Extended
+    /// Master Secret. The resumed handshake's EMS negotiation MUST match.
+    ems_used: bool,
 }
 
 /// Current wall-clock time as a Unix timestamp under `std`; zero otherwise
