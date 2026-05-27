@@ -530,7 +530,17 @@ pub struct Blake2bMac {
 
 impl Blake2bMac {
     /// A keyed BLAKE2b producing `out_len` bytes (1..=64); `key` ≤ 64 bytes.
+    ///
+    /// # Panics
+    /// Panics if `out_len` is 0 or > 64. RFC 7693 §2.5 restricts the
+    /// digest length to that range; an out-of-range value would otherwise
+    /// be silently truncated by the BLAKE2 parameter block and surface
+    /// later as a buffer overflow in `finalize_into` / `verify`.
     pub fn new(key: &[u8], out_len: usize) -> Self {
+        assert!(
+            (1..=64).contains(&out_len),
+            "Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)",
+        );
         Blake2bMac {
             state: Blake2bState::with_key(out_len, key),
             out_len,
@@ -540,7 +550,14 @@ impl Blake2bMac {
     /// Unkeyed BLAKE2b with variable `out_len` (1..=64). Equivalent to
     /// `Blake2b<N>` for N ≤ 64 but with `out_len` chosen at runtime — useful
     /// for variable-length expansion routines like Argon2's `H′`.
+    ///
+    /// # Panics
+    /// Panics if `out_len` is 0 or > 64.
     pub fn new_unkeyed(out_len: usize) -> Self {
+        assert!(
+            (1..=64).contains(&out_len),
+            "Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)",
+        );
         Blake2bMac {
             state: Blake2bState::new(out_len),
             out_len,
@@ -595,7 +612,15 @@ pub struct Blake2sMac {
 
 impl Blake2sMac {
     /// A keyed BLAKE2s producing `out_len` bytes (1..=32); `key` ≤ 32 bytes.
+    ///
+    /// # Panics
+    /// Panics if `out_len` is 0 or > 32. RFC 7693 §2.5 restricts the
+    /// digest length to that range.
     pub fn new(key: &[u8], out_len: usize) -> Self {
+        assert!(
+            (1..=32).contains(&out_len),
+            "Blake2sMac out_len must be in 1..=32 (RFC 7693 §2.5)",
+        );
         Blake2sMac {
             state: Blake2sState::with_key(out_len, key),
             out_len,

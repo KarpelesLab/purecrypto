@@ -919,6 +919,20 @@ impl PrivateKey {
     }
 }
 
+// FIPS 205 expects the SLH-DSA private key (`SK.seed ‖ SK.prf ‖
+// PK.seed ‖ PK.root`) to be wiped before deallocation. Overwrite the
+// bytes and pass them through `core::hint::black_box` so LLVM cannot
+// eliminate the writes as dead stores. We avoid adding the `zeroize`
+// crate as a dependency.
+impl Drop for PrivateKey {
+    fn drop(&mut self) {
+        for b in self.bytes.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.bytes);
+    }
+}
+
 impl ParamSet {
     /// Finds the parameter set matching an algorithm OID, if any.
     pub fn from_oid(oid: &[u64]) -> Option<Self> {

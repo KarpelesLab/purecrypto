@@ -10,7 +10,13 @@ use crate::hash::{Digest, Hmac};
 ///
 /// # Panics
 ///
-/// Panics if `iterations` is zero.
+/// Panics if `iterations` is zero, or if `out.len()` would require more than
+/// `2^32 - 1` blocks (RFC 8018 §5.2 caps the block counter at a 32-bit
+/// integer). The block-count limit is `(2^32 - 1) * hlen` bytes — i.e.
+/// hundreds of GiB even for SHA-256 — and is unreachable in practice;
+/// enforcing it makes a future caller's bug fail loudly rather than wrap
+/// the counter into `block_index = 1` and silently re-derive the first
+/// blocks.
 ///
 /// ```
 /// use purecrypto::hash::Sha256;
@@ -23,10 +29,22 @@ pub fn pbkdf2<D: Digest>(password: &[u8], salt: &[u8], iterations: u32, out: &mu
     assert!(iterations >= 1, "PBKDF2 requires at least one iteration");
 
     let hlen = D::OUTPUT_LEN;
+    // RFC 8018 §5.2 step 1: derived-key length must fit within the
+    // 32-bit block counter. The maximum is (2^32 - 1) * hlen bytes.
+    let max_len = (u32::MAX as usize).saturating_mul(hlen);
+    assert!(
+        out.len() <= max_len,
+        "PBKDF2 output length exceeds RFC 8018 §5.2 limit (2^32 - 1 blocks)",
+    );
+
     let mut block_index: u32 = 1;
     for chunk in out.chunks_mut(hlen) {
         derive_block::<D>(password, salt, iterations, block_index, chunk);
-        block_index = block_index.wrapping_add(1);
+        // Use checked_add so an off-by-one bug would trip the assert
+        // above on entry rather than silently wrap to 1.
+        block_index = block_index
+            .checked_add(1)
+            .expect("PBKDF2 block counter overflowed 2^32");
     }
 }
 

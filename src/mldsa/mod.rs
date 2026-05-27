@@ -743,6 +743,20 @@ macro_rules! ml_dsa_level {
             }
         }
 
+        // FIPS 204 expects the ML-DSA expanded private key to be wiped
+        // before deallocation. Overwrite the bytes and route them through
+        // `core::hint::black_box` so LLVM cannot eliminate the writes as
+        // dead stores (the alternative is the `zeroize` crate, which
+        // would add a runtime dependency the crate otherwise avoids).
+        impl Drop for $sk {
+            fn drop(&mut self) {
+                for b in self.0.iter_mut() {
+                    *b = 0;
+                }
+                let _ = core::hint::black_box(&self.0);
+            }
+        }
+
         impl $pk {
             /// Verifies `sig` over `msg` with optional `ctx`.
             pub fn verify(&self, sig: &[u8], msg: &[u8], ctx: &[u8]) -> bool {

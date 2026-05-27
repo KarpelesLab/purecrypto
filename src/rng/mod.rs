@@ -68,10 +68,8 @@ impl RngCore for OsRng {
         URANDOM.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.is_none() {
-                *slot = Some(
-                    std::fs::File::open("/dev/urandom")
-                        .expect("failed to open /dev/urandom"),
-                );
+                *slot =
+                    Some(std::fs::File::open("/dev/urandom").expect("failed to open /dev/urandom"));
             }
             slot.as_mut()
                 .unwrap()

@@ -14,6 +14,17 @@
 //! Decapsulation never branches on secret data: the Fujisaki–Okamoto
 //! re-encryption check and the implicit-rejection fallback both run in
 //! constant time (see [`kem`]).
+//!
+//! # Test-vector coverage — known gap
+//!
+//! Unit tests cover the FIPS 203 reference flow at all three parameter
+//! sets, but the crate does **not** ship the full NIST ACVP test set for
+//! ML-KEM (`testdata/` carries ACVP for ML-DSA and SLH-DSA, but not yet
+//! for ML-KEM). The ACVP corpus is multi-megabyte and out of scope for
+//! the audit hardening batch; landing it is tracked as future work.
+//! In the meantime the existing per-set fixed vectors plus deterministic
+//! constructors (`from_seeds`, `encapsulate_deterministic`) make the
+//! algorithm fully testable against external implementations.
 
 pub(crate) mod indcpa;
 pub(crate) mod kem;
@@ -130,13 +141,61 @@ macro_rules! ml_kem_set {
             }
 
             /// Restores a decapsulation key from its byte encoding.
+            /// **No validation.** Use
+            /// [`from_bytes_validated`](Self::from_bytes_validated) when
+            /// the bytes come from an untrusted source.
             pub fn from_bytes(bytes: [u8; $dk_size]) -> Self {
                 $dk_name(bytes)
+            }
+
+            /// FIPS 203 §7.3 "Decapsulation key check": confirms that the
+            /// SHA3-256 hash of the embedded encapsulation key matches
+            /// the H(ek) field stored at offset `pke_dk + ek_size` of the
+            /// decapsulation key. This guards against a corrupted /
+            /// adversarially-modified key file that would otherwise
+            /// produce wrong shared secrets at decapsulation time.
+            pub fn from_bytes_validated(
+                bytes: [u8; $dk_size],
+            ) -> Result<Self, crate::mlkem::EncapsKeyCheckError> {
+                use crate::hash::Digest;
+                let pke_dk = 384 * $k;
+                let ek_start = pke_dk;
+                let ek_end = ek_start + $ek_size;
+                // H(ek) is the 32-byte SHA3-256 hash placed right after
+                // the embedded encapsulation key, per FIPS 203 §7.3.
+                let h_start = ek_end;
+                let h_end = h_start + 32;
+                // Defensive: a malformed bytes slice short of these
+                // bounds is structurally impossible (the array length is
+                // fixed at $dk_size), but assert anyway so a future
+                // size mistake fails loudly rather than silently passing.
+                assert!(h_end <= $dk_size);
+                let mut hasher = crate::hash::Sha3_256::new();
+                hasher.update(&bytes[ek_start..ek_end]);
+                let h = hasher.finalize();
+                if h.as_ref() != &bytes[h_start..h_end] {
+                    return Err(crate::mlkem::EncapsKeyCheckError);
+                }
+                Ok($dk_name(bytes))
             }
 
             /// The byte encoding.
             pub fn to_bytes(&self) -> [u8; $dk_size] {
                 self.0
+            }
+        }
+
+        // FIPS 203 §3.3 mandates that decapsulation-key material be
+        // zeroed before deallocation. We avoid pulling in the `zeroize`
+        // crate by overwriting the bytes and routing them through
+        // `core::hint::black_box`, which prevents LLVM from eliminating
+        // the writes as dead stores.
+        impl Drop for $dk_name {
+            fn drop(&mut self) {
+                for b in self.0.iter_mut() {
+                    *b = 0;
+                }
+                let _ = core::hint::black_box(&self.0);
             }
         }
 
@@ -537,5 +596,36 @@ mod tests {
         let pem = dk.to_pkcs8_pem();
         let parsed = MlKem1024DecapsKey::from_pkcs8_pem(&pem).unwrap();
         assert_eq!(parsed.to_bytes(), dk.to_bytes());
+    }
+
+    /// FIPS 203 §7.3 — the decapsulation key embeds `H(ek)` so a future
+    /// decap can short-circuit a key that's been corrupted on disk. The
+    /// trusted-input fast path `from_bytes` accepts anything; the strict
+    /// path `from_bytes_validated` rejects a byte-flipped key.
+    #[test]
+    fn decaps_key_from_bytes_validated_catches_corruption() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"validated", b"nonce", &[]);
+        // ML-KEM-512.
+        let (dk, _) = MlKem512DecapsKey::generate(&mut rng);
+        let good = dk.to_bytes();
+        assert!(MlKem512DecapsKey::from_bytes_validated(good).is_ok());
+        let mut bad = good;
+        // Flip a byte inside the H(ek) digest field. Offset:
+        // pke_dk = 384 * k = 768; ek_size = 800 → H starts at 1568,
+        // 32 bytes long.
+        bad[1570] ^= 1;
+        // Trusted-input fast path: no check.
+        let _trusted = MlKem512DecapsKey::from_bytes(bad);
+        // Strict path: must reject.
+        assert!(MlKem512DecapsKey::from_bytes_validated(bad).is_err());
+
+        // ML-KEM-1024.
+        let (dk, _) = MlKem1024DecapsKey::generate(&mut rng);
+        let good = dk.to_bytes();
+        assert!(MlKem1024DecapsKey::from_bytes_validated(good).is_ok());
+        let mut bad = good;
+        // pke_dk = 384 * 4 = 1536; ek_size = 1568 → H starts at 3104.
+        bad[3105] ^= 1;
+        assert!(MlKem1024DecapsKey::from_bytes_validated(bad).is_err());
     }
 }
