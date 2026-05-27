@@ -248,6 +248,36 @@ impl Connection {
         })
     }
 
+    /// IANA cipher-suite identifier of the negotiated suite. `None`
+    /// until the handshake has advanced far enough to fix the suite
+    /// (ServerHello processed on the client, ClientHello processed on
+    /// the server).
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        match &self.inner {
+            Engine::ClientTls13(c) => c.negotiated_cipher_suite(),
+            Engine::ClientTls12(c) => c.negotiated_cipher_suite(),
+            Engine::ServerTls13(c) => {
+                // The TLS 1.3 server tracks its suite internally; the
+                // existing public surface is `negotiated_suite()`-shaped
+                // (Option<CipherSuite>). Defer to the same accessor.
+                c.negotiated_cipher_suite()
+            }
+            Engine::ServerTls12(c) => c.negotiated_cipher_suite(),
+            Engine::ClientDtls13(c) => c.negotiated_cipher_suite(),
+            Engine::ServerDtls13(c) => c.negotiated_cipher_suite(),
+            Engine::ClientDtls12(c) => c.negotiated_cipher_suite(),
+            Engine::ServerDtls12(c) => c.negotiated_cipher_suite(),
+        }
+    }
+
+    /// The IANA name of the negotiated cipher suite, or `None` until the
+    /// suite is fixed. Returns the well-known strings for the suites
+    /// purecrypto negotiates (TLS 1.3 trio + the TLS 1.2 ECDHE-AEAD
+    /// set); unknown codes resolve to `"UNKNOWN"`.
+    pub fn negotiated_cipher_suite_name(&self) -> Option<&'static str> {
+        self.negotiated_cipher_suite().map(cipher_suite_name)
+    }
+
     /// The negotiated ALPN protocol, if any.
     pub fn alpn_selected(&self) -> Option<&[u8]> {
         match &self.inner {
@@ -319,6 +349,24 @@ impl Connection {
         for dg in drained {
             self.pending_dtls.push_back(dg);
         }
+    }
+}
+
+/// Maps an IANA cipher-suite wire code to its registered name. Covers
+/// every suite this crate negotiates; unknown codes resolve to
+/// `"UNKNOWN"` so the function is total.
+fn cipher_suite_name(id: u16) -> &'static str {
+    match id {
+        0x1301 => "TLS_AES_128_GCM_SHA256",
+        0x1302 => "TLS_AES_256_GCM_SHA384",
+        0x1303 => "TLS_CHACHA20_POLY1305_SHA256",
+        0xC02B => "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+        0xC02C => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+        0xC02F => "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+        0xC030 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        0xCCA8 => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+        0xCCA9 => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        _ => "UNKNOWN",
     }
 }
 
@@ -656,5 +704,83 @@ mod tests {
         let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
         cfg.require_cookie = false;
         assert!(Connection::server(&cfg).is_ok());
+    }
+
+    /// `cipher_suite_name` covers every suite the negotiator can pick,
+    /// plus the unknown-fallback case.
+    #[test]
+    fn cipher_suite_name_table() {
+        assert_eq!(cipher_suite_name(0x1301), "TLS_AES_128_GCM_SHA256");
+        assert_eq!(cipher_suite_name(0x1302), "TLS_AES_256_GCM_SHA384");
+        assert_eq!(cipher_suite_name(0x1303), "TLS_CHACHA20_POLY1305_SHA256");
+        assert_eq!(
+            cipher_suite_name(0xC02B),
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            cipher_suite_name(0xC02C),
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            cipher_suite_name(0xC02F),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        );
+        assert_eq!(
+            cipher_suite_name(0xC030),
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            cipher_suite_name(0xCCA8),
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+        );
+        assert_eq!(
+            cipher_suite_name(0xCCA9),
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+        );
+        assert_eq!(cipher_suite_name(0xFFFF), "UNKNOWN");
+    }
+
+    /// Before any wire bytes are exchanged the suite is undetermined on
+    /// every engine variant. (Once the handshake progresses far enough
+    /// the existing per-engine loopback tests in `tls::conn::mod` /
+    /// `dtls::*` verify the positive case.)
+    #[test]
+    fn negotiated_cipher_suite_is_none_before_handshake() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"suite-none", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &DistinguishedName::common_name("suite.example"),
+            &validity,
+            1,
+            false,
+            &["suite.example"],
+        )
+        .unwrap();
+
+        // TLS 1.3 client (cipher selected from ServerHello — None
+        // before any bytes flow in).
+        let cfg = Config::builder()
+            .tls_only()
+            .server_name("suite.example")
+            .build();
+        let client = Connection::client(&cfg).unwrap();
+        assert!(client.negotiated_cipher_suite().is_none());
+        assert!(client.negotiated_cipher_suite_name().is_none());
+
+        // TLS 1.3 server (cipher selected during ClientHello dispatch).
+        let cfg = Config::builder()
+            .tls_only()
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+            .build();
+        let server = Connection::server(&cfg).unwrap();
+        assert!(server.negotiated_cipher_suite().is_none());
     }
 }

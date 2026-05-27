@@ -671,6 +671,12 @@ impl<R: RngCore> ServerConnection<R> {
         self.alpn_negotiated.as_deref()
     }
 
+    /// IANA cipher-suite identifier of the negotiated suite, available
+    /// once `ServerHello` has been emitted (i.e. `self.suite` is set).
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.suite.map(|s| s.suite.0)
+    }
+
     /// `client_application_traffic_secret_0`, exposed for keylogfile output
     /// in the server CLI. Available once the handshake completes.
     pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {

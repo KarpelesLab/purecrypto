@@ -248,6 +248,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.state == State::Connected
     }
 
+    /// IANA cipher-suite identifier of the negotiated suite, or `None`
+    /// until the handshake completes. DTLS 1.3 in this crate is locked
+    /// to `TLS_AES_128_GCM_SHA256` (0x1301).
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.is_handshake_complete().then_some(0x1301)
+    }
+
     /// Drains pending UDP datagrams. Also drains any pending ACKs.
     pub fn pop_outbound_datagrams(&mut self) -> Vec<Vec<u8>> {
         self.flush_pending_acks();
