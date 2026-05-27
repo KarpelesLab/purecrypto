@@ -18,7 +18,10 @@
 
 #![allow(dead_code)]
 
+use alloc::collections::BTreeMap;
+
 use crate::rng::RngCore;
+use crate::tls::Error;
 
 /// Maximum QUIC v1 connection-ID length, RFC 9000 §17.2.
 const MAX_CID_LEN: usize = 20;
@@ -126,6 +129,201 @@ impl CidPair {
     }
 }
 
+// =========================================================================
+// Phase 7 — CidPool: NEW_CONNECTION_ID / RETIRE_CONNECTION_ID housekeeping
+// =========================================================================
+
+/// One CID in a [`CidPool`]: the connection-ID bytes, its sequence number
+/// (RFC 9000 §5.1.1), and the stateless-reset token bound to it (16 bytes
+/// per RFC 9000 §10.3). Phase 7 *stores* the reset token but does not
+/// yet act on it — stateless reset emission lands in Phase 8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CidEntry {
+    /// The actual connection-ID bytes (≤ 20 in QUIC v1).
+    pub(crate) cid: ConnectionId,
+    /// Sequence number assigned by the issuing endpoint (RFC 9000 §5.1.1).
+    /// Sequence 0 is the CID established during the handshake; subsequent
+    /// CIDs come via NEW_CONNECTION_ID frames.
+    pub(crate) sequence: u64,
+    /// Stateless-reset token: 16 bytes (RFC 9000 §10.3). `None` for CIDs
+    /// where no token was supplied (e.g. a zero-length CID, or a
+    /// pre-handshake placeholder).
+    pub(crate) reset_token: Option<[u8; 16]>,
+}
+
+/// A bounded pool of connection-IDs in one direction. The local pool
+/// tracks CIDs *we* issued for the peer to use as DCIDs on inbound
+/// packets; the remote pool tracks CIDs the peer issued for *us* to use
+/// as DCIDs on outbound packets.
+///
+/// RFC 9000 §5.1.1: an endpoint MUST limit the number of unretired CIDs
+/// it accepts from a peer to `active_connection_id_limit` (default 2,
+/// minimum 2). Phase 7 enforces this on insertion.
+///
+/// RFC 9000 §5.1.2: when the peer's `retire_prior_to` advances, all
+/// sequences strictly below it are retired automatically; the retiring
+/// side emits a RETIRE_CONNECTION_ID frame per dropped sequence.
+pub(crate) struct CidPool {
+    /// All CIDs in this pool, keyed by sequence. Always non-empty after
+    /// construction (the handshake CID is at sequence 0).
+    pub(crate) entries: BTreeMap<u64, CidEntry>,
+    /// Sequence of the CID currently in use. Phase 7 keeps this fixed at
+    /// 0 (CID migration is a Phase 8+ concern); future phases will
+    /// advance it when migrating to a new CID.
+    pub(crate) active_seq: u64,
+    /// The largest `retire_prior_to` value the peer has signalled. Any
+    /// stored entry with `sequence < retire_prior_to` should be removed
+    /// from this pool and a RETIRE_CONNECTION_ID emitted (per §5.1.2).
+    pub(crate) retire_prior_to: u64,
+    /// Bound from the peer's `active_connection_id_limit` transport
+    /// parameter. We refuse to store more than `limit` non-retired entries
+    /// per §5.1.1.
+    pub(crate) limit: u64,
+    /// Sequences this side has been asked to RETIRE but hasn't yet
+    /// emitted a RETIRE_CONNECTION_ID frame for. (Remote pool only:
+    /// when the peer tells us `retire_prior_to = N`, we owe the peer
+    /// a RETIRE_CONNECTION_ID for every sequence we previously stored
+    /// below N.)
+    pub(crate) pending_retire: alloc::vec::Vec<u64>,
+}
+
+impl CidPool {
+    /// Constructs a pool seeded with a single entry at sequence 0 — the
+    /// handshake CID. The `active_connection_id_limit` defaults to 2
+    /// (RFC 9000 §18.2 default); the caller updates `limit` once it
+    /// learns the peer's actual value.
+    pub(crate) fn new(initial: ConnectionId, initial_reset_token: Option<[u8; 16]>) -> Self {
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            0,
+            CidEntry {
+                cid: initial,
+                sequence: 0,
+                reset_token: initial_reset_token,
+            },
+        );
+        Self {
+            entries,
+            active_seq: 0,
+            retire_prior_to: 0,
+            limit: 2,
+            pending_retire: alloc::vec::Vec::new(),
+        }
+    }
+
+    /// Sets the peer-advertised `active_connection_id_limit` (RFC 9000
+    /// §18.2). Per §5.1.1, the value MUST be at least 2; we clamp here
+    /// for robustness rather than rejecting the peer outright.
+    pub(crate) fn set_limit(&mut self, limit: u64) {
+        self.limit = limit.max(2);
+    }
+
+    /// Inserts `entry`. Returns [`Error::IllegalParameter`] if the
+    /// sequence already exists with different content (RFC 9000 §19.15:
+    /// "the same sequence number MAY appear in multiple frames, but the
+    /// content MUST be identical"). Returns [`Error::IllegalParameter`]
+    /// if accepting this entry would exceed `limit` non-retired entries.
+    pub(crate) fn add(&mut self, entry: CidEntry) -> Result<(), Error> {
+        if let Some(existing) = self.entries.get(&entry.sequence) {
+            if existing != &entry {
+                return Err(Error::IllegalParameter);
+            }
+            return Ok(());
+        }
+        if entry.sequence < self.retire_prior_to {
+            // RFC 9000 §5.1.2: a newly-received CID with sequence below
+            // the retire_prior_to we already announced is immediately
+            // retired. We emit the RETIRE for it but don't keep it.
+            self.pending_retire.push(entry.sequence);
+            return Ok(());
+        }
+        let live = self
+            .entries
+            .iter()
+            .filter(|(seq, _)| **seq >= self.retire_prior_to)
+            .count() as u64;
+        if live >= self.limit {
+            // Exceeded active_connection_id_limit.
+            return Err(Error::IllegalParameter);
+        }
+        self.entries.insert(entry.sequence, entry);
+        Ok(())
+    }
+
+    /// Retires the CID at `sequence`. Returns the removed entry, or
+    /// `Ok(None)` if no such sequence was present. Returns
+    /// [`Error::IllegalParameter`] if the caller is trying to retire the
+    /// CID that is currently in use (RFC 9000 §19.16: "Receipt of a
+    /// RETIRE_CONNECTION_ID frame that retires the same connection ID
+    /// the endpoint used to send the frame ... MUST be treated as a
+    /// connection error"). Phase 7 conservatively checks this whether
+    /// this side or the peer is retiring.
+    pub(crate) fn retire(&mut self, sequence: u64) -> Result<Option<CidEntry>, Error> {
+        if sequence == self.active_seq && self.entries.contains_key(&sequence) {
+            // Phase 7 doesn't migrate; if asked to retire the active CID
+            // we treat it as a protocol violation.
+            return Err(Error::IllegalParameter);
+        }
+        Ok(self.entries.remove(&sequence))
+    }
+
+    /// Records a peer-advertised `retire_prior_to` value (from a
+    /// NEW_CONNECTION_ID frame, RFC 9000 §19.15). All entries with
+    /// `sequence < new` are removed; their sequences are added to
+    /// `pending_retire` so the caller can emit RETIRE_CONNECTION_ID
+    /// frames in the next outbound packet.
+    pub(crate) fn note_retire_prior_to(&mut self, new: u64) {
+        if new <= self.retire_prior_to {
+            return;
+        }
+        self.retire_prior_to = new;
+        let dropped: alloc::vec::Vec<u64> =
+            self.entries.keys().copied().filter(|s| *s < new).collect();
+        for s in dropped {
+            self.entries.remove(&s);
+            self.pending_retire.push(s);
+        }
+    }
+
+    /// Currently-active CID entry (the one whose CID we write into the
+    /// DCID of every outbound packet, for the remote pool; the one we
+    /// expect in DCID on inbound packets, for the local pool). `None`
+    /// only in pathological cases — the active entry should always be
+    /// present.
+    pub(crate) fn active(&self) -> Option<&CidEntry> {
+        self.entries.get(&self.active_seq)
+    }
+
+    /// How many more fresh CIDs we should issue to the peer so the peer
+    /// has `limit` unretired CIDs available. Returns 0 if we already
+    /// have at least `limit` live entries.
+    pub(crate) fn how_many_to_issue(&self) -> u64 {
+        let live = self
+            .entries
+            .iter()
+            .filter(|(seq, _)| **seq >= self.retire_prior_to)
+            .count() as u64;
+        self.limit.saturating_sub(live)
+    }
+
+    /// Pops the next pending RETIRE_CONNECTION_ID sequence to emit, or
+    /// `None` if none are queued.
+    pub(crate) fn pop_pending_retire(&mut self) -> Option<u64> {
+        if self.pending_retire.is_empty() {
+            None
+        } else {
+            Some(self.pending_retire.remove(0))
+        }
+    }
+
+    /// Highest sequence number currently stored. Used by the issuing
+    /// side to pick the next sequence number for a NEW_CONNECTION_ID
+    /// emission.
+    pub(crate) fn max_sequence(&self) -> u64 {
+        self.entries.keys().next_back().copied().unwrap_or(0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,5 +361,136 @@ mod tests {
         let cid = ConnectionId::from_slice(&[0x83, 0x94]).unwrap();
         let s = alloc::format!("{cid:?}");
         assert!(s.contains("8394"));
+    }
+
+    // ============================================================
+    // Phase 7 — CidPool tests
+    // ============================================================
+
+    fn cid_n(n: u8) -> ConnectionId {
+        ConnectionId::from_slice(&[n; 8]).expect("8-byte cid")
+    }
+
+    #[test]
+    fn cidpool_seeded_with_handshake_entry() {
+        let pool = CidPool::new(cid_n(0), Some([0u8; 16]));
+        assert_eq!(pool.active_seq, 0);
+        assert!(pool.active().is_some());
+        assert_eq!(pool.active().unwrap().cid, cid_n(0));
+        assert_eq!(pool.limit, 2);
+        // Default limit is 2 active CIDs; we already have 1 → can issue 1 more.
+        assert_eq!(pool.how_many_to_issue(), 1);
+    }
+
+    #[test]
+    fn cidpool_add_respects_limit() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(2);
+        let e1 = CidEntry {
+            cid: cid_n(1),
+            sequence: 1,
+            reset_token: Some([1u8; 16]),
+        };
+        assert!(pool.add(e1).is_ok());
+        // Now 2 live entries → can't add another while limit = 2.
+        let e2 = CidEntry {
+            cid: cid_n(2),
+            sequence: 2,
+            reset_token: Some([2u8; 16]),
+        };
+        assert!(matches!(pool.add(e2), Err(Error::IllegalParameter)));
+        // Lift the limit; add now succeeds.
+        pool.set_limit(3);
+        let e2 = CidEntry {
+            cid: cid_n(2),
+            sequence: 2,
+            reset_token: Some([2u8; 16]),
+        };
+        assert!(pool.add(e2).is_ok());
+        assert_eq!(pool.max_sequence(), 2);
+    }
+
+    #[test]
+    fn cidpool_add_rejects_inconsistent_duplicate() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        let e1 = CidEntry {
+            cid: cid_n(1),
+            sequence: 1,
+            reset_token: Some([7u8; 16]),
+        };
+        assert!(pool.add(e1.clone()).is_ok());
+        // Identical re-add: fine.
+        assert!(pool.add(e1.clone()).is_ok());
+        // Mismatched re-add: error per RFC 9000 §19.15.
+        let e1_bad = CidEntry {
+            cid: cid_n(0xff),
+            sequence: 1,
+            reset_token: Some([7u8; 16]),
+        };
+        assert!(matches!(pool.add(e1_bad), Err(Error::IllegalParameter)));
+    }
+
+    #[test]
+    fn cidpool_retire_prior_to_pulls_retires_and_queues() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(4);
+        for s in 1..=3 {
+            pool.add(CidEntry {
+                cid: cid_n(s as u8),
+                sequence: s,
+                reset_token: Some([s as u8; 16]),
+            })
+            .unwrap();
+        }
+        // Now there are 4 entries (sequences 0..=3). Move active to 2 so
+        // retire of 0/1 doesn't trip the "active retired" check.
+        pool.active_seq = 2;
+        // The peer says "retire prior to 2" → 0 and 1 drop.
+        pool.note_retire_prior_to(2);
+        assert_eq!(pool.retire_prior_to, 2);
+        assert!(!pool.entries.contains_key(&0));
+        assert!(!pool.entries.contains_key(&1));
+        // Pending-retire frames are queued for 0 and 1.
+        let mut got = alloc::vec::Vec::new();
+        while let Some(s) = pool.pop_pending_retire() {
+            got.push(s);
+        }
+        got.sort();
+        assert_eq!(got, alloc::vec![0u64, 1]);
+    }
+
+    #[test]
+    fn cidpool_retire_active_is_protocol_error() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        assert!(matches!(pool.retire(0), Err(Error::IllegalParameter)));
+    }
+
+    #[test]
+    fn cidpool_retire_unknown_sequence_returns_none() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        // Sequence 42 was never added; retire returns Ok(None).
+        let r = pool.retire(42).expect("ok");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn cidpool_add_below_retire_prior_to_immediately_retires() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(4);
+        pool.active_seq = 5;
+        pool.note_retire_prior_to(3);
+        // Now an entry at sequence 2 should be auto-retired.
+        let e = CidEntry {
+            cid: cid_n(0xab),
+            sequence: 2,
+            reset_token: None,
+        };
+        assert!(pool.add(e).is_ok());
+        assert!(!pool.entries.contains_key(&2));
+        let mut got = alloc::vec::Vec::new();
+        while let Some(s) = pool.pop_pending_retire() {
+            got.push(s);
+        }
+        assert!(got.contains(&2));
     }
 }

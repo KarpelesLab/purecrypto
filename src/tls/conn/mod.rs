@@ -133,8 +133,8 @@ mod quic_mode_tests {
                 .secrets
                 .push((level, dir, secret.to_vec()));
         }
-        fn our_transport_params(&self) -> &[u8] {
-            self.our_params.as_slice()
+        fn our_transport_params(&self) -> Vec<u8> {
+            self.our_params.as_slice().to_vec()
         }
         fn on_peer_transport_params(&mut self, raw: &[u8]) {
             let mut s = self.state.lock().unwrap();

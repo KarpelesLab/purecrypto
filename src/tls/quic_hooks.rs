@@ -26,6 +26,7 @@
 //! behaves byte-for-byte as before this refactor.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 
 /// Encryption levels exposed to QUIC (RFC 9001 §4.1.1).
 ///
@@ -93,10 +94,16 @@ pub(crate) trait QuicHooks: Send {
 
     /// The caller-supplied `transport_parameters` body to embed in our
     /// outgoing `ClientHello` (client) or `EncryptedExtensions` (server).
-    /// Returning an empty slice causes the engine to omit the extension
+    /// Returning an empty `Vec` causes the engine to omit the extension
     /// entirely; QUIC handshakes are required to carry it but enforcement
     /// is the QUIC layer's job, not the TLS engine's.
-    fn our_transport_params(&self) -> &[u8];
+    ///
+    /// Returns by value rather than borrow so the QUIC layer can mutate
+    /// the encoded bytes between the connection's construction and the
+    /// engine actually reading them (Phase 7: server-only transport
+    /// params like `original_destination_connection_id` aren't known at
+    /// construction time).
+    fn our_transport_params(&self) -> Vec<u8>;
 
     /// The peer's `quic_transport_parameters` body, extracted from their
     /// `ClientHello` (server side) or `EncryptedExtensions` (client side).
@@ -117,8 +124,8 @@ pub(crate) struct NoHooks;
 impl QuicHooks for NoHooks {
     fn on_handshake_data(&mut self, _level: Level, _data: &[u8]) {}
     fn on_traffic_secret(&mut self, _level: Level, _dir: Direction, _secret: &[u8]) {}
-    fn our_transport_params(&self) -> &[u8] {
-        &[]
+    fn our_transport_params(&self) -> alloc::vec::Vec<u8> {
+        alloc::vec::Vec::new()
     }
     fn on_peer_transport_params(&mut self, _raw: &[u8]) {}
 }
@@ -168,8 +175,8 @@ pub(crate) mod tests {
         fn on_traffic_secret(&mut self, level: Level, dir: Direction, secret: &[u8]) {
             self.secrets.push((level, dir, secret.to_vec()));
         }
-        fn our_transport_params(&self) -> &[u8] {
-            &self.our_params
+        fn our_transport_params(&self) -> Vec<u8> {
+            self.our_params.clone()
         }
         fn on_peer_transport_params(&mut self, raw: &[u8]) {
             self.peer_params = raw.to_vec();

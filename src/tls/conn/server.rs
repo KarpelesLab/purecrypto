@@ -1277,11 +1277,7 @@ impl<R: RngCore> ServerConnection<R> {
             if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
                 self.hooks.as_ref().and_then(|h| {
                     let body = h.our_transport_params();
-                    if body.is_empty() {
-                        None
-                    } else {
-                        Some(body.to_vec())
-                    }
+                    if body.is_empty() { None } else { Some(body) }
                 })
             } else {
                 None

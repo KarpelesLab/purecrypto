@@ -976,7 +976,7 @@ impl ClientConnection {
         {
             let body = h.our_transport_params();
             if !body.is_empty() {
-                extensions.push(ext::quic_transport_parameters(body));
+                extensions.push(ext::quic_transport_parameters(&body));
             }
         }
 

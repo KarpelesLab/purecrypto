@@ -14,9 +14,13 @@
 //!
 //! Plus one *outbound* call site:
 //!
-//! 4. `our_transport_params() -> &[u8]` — the engine reads this at
-//!    construction time and embeds the bytes verbatim in the outgoing
-//!    `ClientHello` / `EncryptedExtensions`.
+//! 4. `our_transport_params() -> Vec<u8>` — the engine reads this when
+//!    building the `ClientHello` / `EncryptedExtensions` extension body.
+//!    Phase 7 made this owned (rather than borrowed) so the QUIC layer
+//!    can mutate the bytes between construction and the engine read
+//!    (server-only transport params like
+//!    `original_destination_connection_id` aren't known until the first
+//!    Initial arrives).
 //!
 //! ## Ownership pattern
 //!
@@ -29,12 +33,6 @@
 //! a single-thread fast path — but it has to be there to satisfy the
 //! trait bound. RFC-wise this is irrelevant: QUIC state machines are
 //! single-threaded by design.
-//!
-//! The transport-params bytes never change after construction, so we
-//! keep them in a separate `Arc<Vec<u8>>` (not behind the `Mutex`) so
-//! [`QuicHooks::our_transport_params`] can return `&[u8]` directly,
-//! without a `MutexGuard` borrow that the trait signature wouldn't allow.
-//! Same idiom as the Phase-3 `SharedHooks` test impl.
 
 #![allow(dead_code)]
 
@@ -63,14 +61,19 @@ pub(crate) struct QuicHookState {
 }
 
 /// The engine-side hook implementation. Stores `Arc<Mutex<state>>` for
-/// mutable callbacks, plus a separate `Arc<Vec<u8>>` for the immutable
-/// `our_transport_params` accessor (the trait returns `&[u8]` with the
-/// `&self` lifetime, which a `MutexGuard` cannot satisfy).
+/// mutable callbacks, plus a separate `Arc<Mutex<Vec<u8>>>` for the
+/// `our_transport_params` accessor.
+///
+/// Phase 7: `our_params` is mutable so the QUIC layer can update it between
+/// the engine's construction and its first read (server-only transport
+/// parameters like `original_destination_connection_id` aren't known until
+/// the first Initial arrives — see [`crate::quic::connection::QuicConnection::populate_server_only_tp`]).
 pub(crate) struct QuicTlsHooks {
     pub(crate) state: Arc<Mutex<QuicHookState>>,
-    /// Caller-supplied transport-parameters bytes. Read-only at this
-    /// layer; returned verbatim from [`QuicHooks::our_transport_params`].
-    pub(crate) our_params: Arc<Vec<u8>>,
+    /// Caller-supplied transport-parameters bytes. Mutated by the QUIC
+    /// layer through the shared [`HookHandle`] when post-construction
+    /// updates are needed (Retry path).
+    pub(crate) our_params: Arc<Mutex<Vec<u8>>>,
 }
 
 impl QuicHooks for QuicTlsHooks {
@@ -84,10 +87,13 @@ impl QuicHooks for QuicTlsHooks {
         g.secret_events.push((level, dir, secret.to_vec()));
     }
 
-    fn our_transport_params(&self) -> &[u8] {
-        // Borrowed straight from the immutable `Arc<Vec<u8>>` — no Mutex
-        // involvement, so the returned slice's lifetime is `&self`.
-        self.our_params.as_slice()
+    fn our_transport_params(&self) -> Vec<u8> {
+        // Clone the current bytes under the mutex so the caller receives
+        // an owned `Vec`. The mutex is single-threaded in practice.
+        self.our_params
+            .lock()
+            .expect("our_params mutex poisoned")
+            .clone()
     }
 
     fn on_peer_transport_params(&mut self, raw: &[u8]) {
@@ -101,7 +107,7 @@ impl QuicHooks for QuicTlsHooks {
 /// trait object.
 pub(crate) fn build_hooks(our_params: Vec<u8>) -> (Box<QuicTlsHooks>, HookHandle) {
     let state = Arc::new(Mutex::new(QuicHookState::default()));
-    let our_params = Arc::new(our_params);
+    let our_params = Arc::new(Mutex::new(our_params));
     let handle = HookHandle {
         state: state.clone(),
         our_params: our_params.clone(),
@@ -116,7 +122,7 @@ pub(crate) fn build_hooks(our_params: Vec<u8>) -> (Box<QuicTlsHooks>, HookHandle
 #[derive(Clone)]
 pub(crate) struct HookHandle {
     pub(crate) state: Arc<Mutex<QuicHookState>>,
-    pub(crate) our_params: Arc<Vec<u8>>,
+    pub(crate) our_params: Arc<Mutex<Vec<u8>>>,
 }
 
 impl HookHandle {
@@ -140,6 +146,16 @@ impl HookHandle {
     pub(crate) fn take_peer_params(&self) -> Option<Vec<u8>> {
         let mut g = self.state.lock().expect("hooks mutex poisoned");
         g.peer_params.take()
+    }
+
+    /// Overwrites the bytes the engine will read from
+    /// [`QuicHooks::our_transport_params`]. Phase 7 calls this on the
+    /// server when transport parameters become known mid-handshake
+    /// (e.g. `original_destination_connection_id` after the first
+    /// Initial). Idempotent and cheap.
+    pub(crate) fn set_our_params(&self, bytes: Vec<u8>) {
+        let mut g = self.our_params.lock().expect("our_params mutex poisoned");
+        *g = bytes;
     }
 }
 
@@ -192,10 +208,11 @@ mod tests {
     }
 
     #[test]
-    fn hooks_return_immutable_our_params() {
+    fn hooks_return_our_params() {
         let (boxed, handle) = build_hooks(alloc::vec![1, 2, 3, 4]);
-        assert_eq!(boxed.our_transport_params(), &[1, 2, 3, 4]);
-        // Both views point at the same underlying allocation.
-        assert_eq!(handle.our_params.as_slice(), &[1, 2, 3, 4]);
+        assert_eq!(boxed.our_transport_params(), alloc::vec![1u8, 2, 3, 4]);
+        // The driver can update the bytes the engine reads later.
+        handle.set_our_params(alloc::vec![5, 6]);
+        assert_eq!(boxed.our_transport_params(), alloc::vec![5u8, 6]);
     }
 }
