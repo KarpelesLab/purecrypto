@@ -391,6 +391,25 @@ pub(crate) fn parse_client_pre_shared_key(body: &[u8]) -> Result<ClientPsk, Erro
     Ok((identities, binders))
 }
 
+/// RFC 9001 §8.2 — `quic_transport_parameters` extension (codepoint 0x0039).
+///
+/// The body is opaque to the TLS engine: the QUIC layer (Phase 4+) encodes
+/// and decodes the actual RFC 9000 §18 transport-parameter list. The TLS
+/// engine merely carries the bytes through.
+// Used by the QUIC engine path (lands in Phase 4); silent otherwise.
+#[allow(dead_code)]
+pub(crate) fn quic_transport_parameters(body: &[u8]) -> RawExtension {
+    (ExtensionType::QUIC_TRANSPORT_PARAMETERS, body.to_vec())
+}
+
+/// Returns the body of a `quic_transport_parameters` extension verbatim.
+/// The TLS engine does not interpret it — the QUIC layer does.
+// Used by the QUIC engine path (lands in Phase 4); silent otherwise.
+#[allow(dead_code)]
+pub(crate) fn parse_quic_transport_parameters(body: &[u8]) -> &[u8] {
+    body
+}
+
 /// Server-side `pre_shared_key` extension: carries only the selected identity
 /// index (RFC 8446 §4.2.11).
 pub(crate) fn server_pre_shared_key(selected_identity: u16) -> RawExtension {

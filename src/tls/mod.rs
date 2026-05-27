@@ -22,6 +22,7 @@ pub(crate) mod crypto;
 mod error;
 pub(crate) mod keylog;
 pub(crate) mod pki;
+pub(crate) mod quic_hooks;
 mod version;
 
 pub use config::{ClientAuth, Config, ConfigBuilder, Identity, SigningKey};

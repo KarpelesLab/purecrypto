@@ -113,6 +113,32 @@ impl ConnectionCore {
         self.emit_record(ContentType::Handshake, &message);
     }
 
+    /// QUIC mode (RFC 9001): updates the transcript with the bytes that would
+    /// otherwise be passed to [`Self::emit_handshake`], but does NOT emit a
+    /// record. The QUIC layer carries the message in CRYPTO frames instead;
+    /// the engine only needs the transcript fed for `Finished` MAC agreement.
+    // Used by the QUIC engine path (engines call this in `EngineMode::Quic`);
+    // unreferenced in TLS / DTLS builds today.
+    #[allow(dead_code)]
+    pub(crate) fn transcript_only(&mut self, message: &[u8]) {
+        self.transcript.update(message);
+    }
+
+    /// QUIC mode: feed reassembled CRYPTO-frame handshake bytes into the
+    /// engine's inbound handshake-message reassembly buffer.
+    ///
+    /// In QUIC mode the record path is bypassed entirely — the QUIC layer
+    /// hands the engine raw handshake bytes (already decrypted and
+    /// reassembled across packets) and the engine pops complete handshake
+    /// messages from `hs_pending` exactly the same way it would after a
+    /// record-layer decrypt in TLS mode.
+    // Used by the QUIC engine path (engines call this in `EngineMode::Quic`);
+    // unreferenced in TLS / DTLS builds today.
+    #[allow(dead_code)]
+    pub(crate) fn quic_feed_handshake(&mut self, bytes: &[u8]) {
+        self.hs_pending.extend_from_slice(bytes);
+    }
+
     /// Sends a (plaintext) ChangeCipherSpec for middlebox compatibility.
     pub(crate) fn emit_ccs(&mut self) {
         write_record(

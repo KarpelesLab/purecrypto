@@ -140,6 +140,11 @@ u16_id!(
         PSK_KEY_EXCHANGE_MODES = 0x002d,
         /// key_share.
         KEY_SHARE = 0x0033,
+        /// quic_transport_parameters (RFC 9001 §8.2 + §18 codepoint registry).
+        /// Body: the opaque transport-parameter list defined by RFC 9000 §18,
+        /// carried verbatim in TLS — the TLS engine treats it as a byte blob
+        /// and delegates encoding/decoding to the QUIC layer via `QuicHooks`.
+        QUIC_TRANSPORT_PARAMETERS = 0x0039,
         /// renegotiation_info (RFC 5746). In TLS 1.2 ClientHello/ServerHello,
         /// an empty body advertises support for secure renegotiation. We
         /// never actually renegotiate; we only emit/expect the empty form.

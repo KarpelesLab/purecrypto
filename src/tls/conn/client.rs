@@ -411,6 +411,22 @@ pub struct ClientConnection {
     /// mTLS: set when the server sent a `CertificateRequest` between EE and
     /// its `Certificate`. Drives client-cert emission after server Finished.
     cert_request_received: bool,
+
+    /// Which framing mode this engine runs in (TLS / DTLS / QUIC).
+    ///
+    /// In `Tls` mode (the default) the engine emits TLS records and behaves
+    /// identically to pre-Phase-3 builds. In `Quic` mode the engine bypasses
+    /// the record layer entirely: every handshake message is surfaced to
+    /// the QUIC layer through `hooks`, no `ChangeCipherSpec` is emitted,
+    /// and the record crypter is never installed (RFC 9001 §4–§5, §8.4).
+    engine_mode: super::super::quic_hooks::EngineMode,
+    /// QUIC-layer callback set (Phase 4+). `Some` only in `EngineMode::Quic`.
+    hooks: Option<super::super::quic_hooks::BoxedHooks>,
+    /// Whether we have already seen the server's `quic_transport_parameters`
+    /// extension and dispatched it via [`QuicHooks::on_peer_transport_params`].
+    /// Used to enforce the RFC 9001 §8.2 "at most once" rule on top of the
+    /// existing TLS extension-uniqueness check.
+    peer_quic_params_seen: bool,
 }
 
 /// What the client retains across CH emission so it can verify the server's
@@ -586,6 +602,84 @@ impl ClientConnection {
 }
 
 impl ClientConnection {
+    /// Emits a handshake message at the right encryption level for the
+    /// current [`EngineMode`].
+    ///
+    /// In TLS / DTLS mode this is the legacy
+    /// `self.core.emit_handshake(msg)` — the transcript is updated and the
+    /// bytes are framed into a record.
+    ///
+    /// In QUIC mode the bytes are surfaced to the QUIC layer via
+    /// [`QuicHooks::on_handshake_data`] tagged with `level`, and the
+    /// transcript is fed with the same bytes — but no record is produced
+    /// (RFC 9001 §4.1.1). The transcript update MUST happen on both paths
+    /// or the `Finished` MAC will not agree between peers.
+    #[inline]
+    fn emit_handshake_at(
+        &mut self,
+        level: super::super::quic_hooks::Level,
+        msg: alloc::vec::Vec<u8>,
+    ) {
+        use super::super::quic_hooks::EngineMode;
+        if self.engine_mode == EngineMode::Quic {
+            if let Some(h) = self.hooks.as_mut() {
+                h.on_handshake_data(level, &msg);
+            }
+            // QUIC carries the bytes in CRYPTO frames; we only need to feed
+            // the transcript here.
+            self.core.transcript_only(&msg);
+        } else {
+            self.core.emit_handshake(msg);
+        }
+    }
+
+    /// Surfaces a freshly derived TLS 1.3 traffic secret to the QUIC layer.
+    /// No-op in TLS / DTLS mode.
+    #[inline]
+    fn notify_traffic_secret(
+        &mut self,
+        level: super::super::quic_hooks::Level,
+        dir: super::super::quic_hooks::Direction,
+        secret: &[u8],
+    ) {
+        use super::super::quic_hooks::EngineMode;
+        if self.engine_mode == EngineMode::Quic
+            && let Some(h) = self.hooks.as_mut()
+        {
+            h.on_traffic_secret(level, dir, secret);
+        }
+    }
+
+    /// Whether record-layer key installation should be skipped (QUIC mode).
+    #[inline]
+    fn skip_record_keys(&self) -> bool {
+        self.engine_mode == super::super::quic_hooks::EngineMode::Quic
+    }
+
+    /// QUIC mode (RFC 9001): hand the engine reassembled CRYPTO-frame
+    /// handshake bytes at the given encryption level, then drive the
+    /// state machine. Mirrors `read_tls` + `process_new_packets` on the
+    /// TLS side.
+    ///
+    /// `level` is accepted into the signature so that Phase 4+ can plug in
+    /// per-level validation (RFC 9001 §4.1.4 mandates that the receiver
+    /// reject handshake messages at unexpected levels). Phase 3 ignores it.
+    // Used by the QUIC engine path (lands in Phase 4); silent otherwise.
+    #[allow(dead_code)]
+    pub(crate) fn process_quic_handshake_bytes(
+        &mut self,
+        _level: super::super::quic_hooks::Level,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        debug_assert_eq!(
+            self.engine_mode,
+            super::super::quic_hooks::EngineMode::Quic,
+            "process_quic_handshake_bytes called outside QUIC mode"
+        );
+        self.core.quic_feed_handshake(bytes);
+        self.process_new_packets()
+    }
+
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
     /// `rng` supplies the ephemeral key shares and the client random. Offers all
     /// supported cipher suites and both key-exchange groups.
@@ -616,6 +710,70 @@ impl ClientConnection {
         rng: &mut R,
         suites: &[CipherSuite],
         groups: &[NamedGroup],
+    ) -> Self {
+        Self::new_with_offer_inner(
+            config,
+            server_name,
+            rng,
+            suites,
+            groups,
+            super::super::quic_hooks::EngineMode::Tls,
+            None,
+        )
+    }
+
+    /// QUIC-mode constructor (RFC 9001). The engine runs the same TLS 1.3
+    /// state machine but:
+    ///
+    /// * surfaces every handshake message to `hooks` tagged by encryption
+    ///   level (`Initial` for `ClientHello`, `Handshake` for `Finished` /
+    ///   mTLS `Certificate` / `CertificateVerify`);
+    /// * surfaces every traffic-secret derivation to `hooks`;
+    /// * never emits a `ChangeCipherSpec` record (RFC 9001 §8.4);
+    /// * never installs a record-layer crypter — the QUIC layer holds the
+    ///   AEAD state per encryption level instead;
+    /// * emits a `quic_transport_parameters` (0x0039, RFC 9001 §8.2)
+    ///   extension in the outgoing ClientHello carrying
+    ///   `hooks.our_transport_params()`.
+    ///
+    /// Phase 4+ wires this into [`crate::quic::QuicConnection`]; the engine
+    /// itself never holds onto network state.
+    // Used by the QUIC engine path (lands in Phase 4); silent otherwise.
+    #[allow(dead_code)]
+    pub(crate) fn new_for_quic<R: RngCore>(
+        config: ClientConfig,
+        server_name: &str,
+        rng: &mut R,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+        hooks: super::super::quic_hooks::BoxedHooks,
+    ) -> Self {
+        Self::new_with_offer_inner(
+            config,
+            server_name,
+            rng,
+            suites,
+            groups,
+            super::super::quic_hooks::EngineMode::Quic,
+            Some(hooks),
+        )
+    }
+
+    /// Inner constructor shared by [`new_with_offer`] (TLS / DTLS mode) and
+    /// [`new_for_quic`] (QUIC mode). The only differences observable from
+    /// the body below are:
+    ///
+    /// * the seeded `engine_mode` and `hooks` fields, and
+    /// * a `quic_transport_parameters` extension is appended to the
+    ///   outgoing ClientHello whenever `engine_mode == Quic`.
+    fn new_with_offer_inner<R: RngCore>(
+        config: ClientConfig,
+        server_name: &str,
+        rng: &mut R,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+        engine_mode: super::super::quic_hooks::EngineMode,
+        hooks: Option<super::super::quic_hooks::BoxedHooks>,
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
@@ -670,6 +828,9 @@ impl ClientConnection {
             cets: None,
             deferred_client_hs_secret: None,
             cert_request_received: false,
+            engine_mode,
+            hooks,
+            peer_quic_params_seen: false,
         };
         // Remember the offered PSK so we can seed the schedule when the
         // server selects it in SH.
@@ -698,7 +859,9 @@ impl ClientConnection {
         {
             conn.core.transcript.set_alg(session.cipher_suite_hash);
         }
-        conn.core.emit_handshake(hello);
+        // RFC 9001 §4.1.4: ClientHello rides at the Initial encryption level
+        // in QUIC; in TLS / DTLS mode this just goes into the record stream.
+        conn.emit_handshake_at(super::super::quic_hooks::Level::Initial, hello);
 
         // 0-RTT: install the client-early-traffic write key so the caller
         // can stream early data right after this constructor returns. The
@@ -721,12 +884,21 @@ impl ClientConnection {
                     cets.as_slice(),
                 );
             }
-            conn.core.set_write(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &cets,
-            ));
+            // RFC 9001 §4.1.1: the client-early-traffic secret keys 0-RTT
+            // packets in QUIC's Application PN space at the EarlyData level.
+            conn.notify_traffic_secret(
+                super::super::quic_hooks::Level::EarlyData,
+                super::super::quic_hooks::Direction::Tx,
+                cets.as_slice(),
+            );
+            if !conn.skip_record_keys() {
+                conn.core.set_write(RecordCrypter::new(
+                    suite.hash,
+                    suite.aead,
+                    suite.key_len,
+                    &cets,
+                ));
+            }
             conn.cets = Some(cets);
         }
         conn
@@ -792,6 +964,21 @@ impl ClientConnection {
             extensions.push(ext::record_size_limit(limit));
         }
         extensions.extend_from_slice(extra_extensions);
+
+        // RFC 9001 §8.2: in QUIC mode the ClientHello carries
+        // `quic_transport_parameters` (0x0039) holding the QUIC layer's
+        // opaque transport-parameter blob. We add it before the PSK
+        // extension (PSK must remain last per RFC 8446 §4.2.11). An empty
+        // blob suppresses the extension; the QUIC layer enforces that
+        // QUIC handshakes actually carry one.
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic
+            && let Some(h) = self.hooks.as_ref()
+        {
+            let body = h.our_transport_params();
+            if !body.is_empty() {
+                extensions.push(ext::quic_transport_parameters(body));
+            }
+        }
 
         // PSK resumption: psk_key_exchange_modes, optional early_data,
         // pre_shared_key (must be LAST per RFC 8446 §4.2.11). The binder is
@@ -1037,6 +1224,14 @@ impl ClientConnection {
     /// Emits a `KeyUpdate` and steps the write side. If `request_peer_update`
     /// is set, the peer will respond with its own `KeyUpdate(not_requested)`.
     fn send_key_update(&mut self, request_peer_update: bool) -> Result<(), Error> {
+        // RFC 9001 §6: TLS 1.3 `KeyUpdate` is not used in QUIC — QUIC has
+        // its own key-update mechanism via the Key Phase bit in the
+        // 1-RTT short-header. Refuse to emit one in QUIC mode rather than
+        // produce a malformed flight.
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
+            debug_assert!(false, "RFC 9001 §6 forbids TLS KeyUpdate in QUIC mode");
+            return Err(Error::InappropriateState);
+        }
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let ku = KeyUpdate {
             request_update: request_peer_update,
@@ -1156,28 +1351,47 @@ impl ClientConnection {
             );
         }
 
+        // QUIC layer hooks (RFC 9001 §5.1): once for each direction at
+        // Handshake level. Client writes with `chts`, reads with `shts`.
+        self.notify_traffic_secret(
+            super::super::quic_hooks::Level::Handshake,
+            super::super::quic_hooks::Direction::Tx,
+            chts.as_slice(),
+        );
+        self.notify_traffic_secret(
+            super::super::quic_hooks::Level::Handshake,
+            super::super::quic_hooks::Direction::Rx,
+            shts.as_slice(),
+        );
+
         // Server -> client uses the server handshake key. If we offered
         // 0-RTT, keep the current write key (early-traffic) until we send
         // EndOfEarlyData; otherwise install the client-handshake write key
         // now. The handshake secret is always stashed so it can be installed
-        // later.
-        self.core.set_read(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &shts,
-        ));
-        if self.early_data_offered {
-            self.deferred_client_hs_secret = Some(chts);
-        } else {
-            self.core.set_write(RecordCrypter::new(
+        // later. In QUIC mode the record crypter is never installed (the
+        // QUIC layer holds the AEAD state per encryption level).
+        if !self.skip_record_keys() {
+            self.core.set_read(RecordCrypter::new(
                 suite.hash,
                 suite.aead,
                 suite.key_len,
-                &chts,
+                &shts,
             ));
+            if self.early_data_offered {
+                self.deferred_client_hs_secret = Some(chts);
+            } else {
+                self.core.set_write(RecordCrypter::new(
+                    suite.hash,
+                    suite.aead,
+                    suite.key_len,
+                    &chts,
+                ));
+            }
+            // RFC 9001 §8.4: ChangeCipherSpec MUST NOT appear in QUIC.
+            self.core.emit_ccs(); // middlebox compatibility
+        } else if self.early_data_offered {
+            self.deferred_client_hs_secret = Some(chts);
         }
-        self.core.emit_ccs(); // middlebox compatibility
 
         self.suite = Some(suite);
         self.ks = Some(ks);
@@ -1257,7 +1471,8 @@ impl ClientConnection {
             &share_only,
             &extras,
         );
-        self.core.emit_handshake(ch2);
+        // RFC 9001 §4.1.4: like CH1, CH2 rides at Initial in QUIC mode.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Initial, ch2);
         self.hrr_processed = true;
         // Stay in WaitServerHello for the real ServerHello.
         Ok(())
@@ -1351,6 +1566,20 @@ impl ClientConnection {
                         return Err(Error::IllegalParameter);
                     }
                     early_data_in_ee = true;
+                } else if ty == crate::tls::codec::ExtensionType::QUIC_TRANSPORT_PARAMETERS.0
+                    && self.engine_mode == super::super::quic_hooks::EngineMode::Quic
+                {
+                    // RFC 9001 §8.2: the server's transport parameters are
+                    // delivered to the QUIC layer verbatim. The extension
+                    // appears at most once per handshake; reject duplicates
+                    // here rather than rely on the QUIC layer to notice.
+                    if self.peer_quic_params_seen {
+                        return Err(Error::IllegalParameter);
+                    }
+                    self.peer_quic_params_seen = true;
+                    if let Some(h) = self.hooks.as_mut() {
+                        h.on_peer_transport_params(ext_body);
+                    }
                 }
             }
         }
@@ -1369,7 +1598,9 @@ impl ClientConnection {
             if early_data_in_ee {
                 self.early_data_accepted = true;
                 // Defer EOED + handshake-key install until on_finished.
-            } else {
+            } else if !self.skip_record_keys() {
+                // QUIC mode doesn't install record crypters; the QUIC
+                // layer keeps the per-level AEAD state itself.
                 let chts = self
                     .deferred_client_hs_secret
                     .take()
@@ -1544,12 +1775,30 @@ impl ClientConnection {
             );
             kl.log("EXPORTER_SECRET", &self.client_random, ems.as_slice());
         }
+        // QUIC layer hooks: 1-RTT (application) traffic secrets. Client
+        // writes with `cats`, reads with `sats`.
+        self.notify_traffic_secret(
+            super::super::quic_hooks::Level::OneRtt,
+            super::super::quic_hooks::Direction::Tx,
+            cats.as_slice(),
+        );
+        self.notify_traffic_secret(
+            super::super::quic_hooks::Level::OneRtt,
+            super::super::quic_hooks::Direction::Rx,
+            sats.as_slice(),
+        );
         self.exporter_secret = Some(ems);
 
         // 0-RTT acceptance: emit EndOfEarlyData under the early write key
         // (still installed), then switch to the client-handshake write key
-        // before sending our Finished.
+        // before sending our Finished. RFC 9001 §8.3 forbids
+        // EndOfEarlyData in QUIC — 0-RTT termination is signalled by the
+        // packet-number space rather than by a handshake message.
         if self.early_data_accepted {
+            if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
+                debug_assert!(false, "RFC 9001 §8.3 forbids EndOfEarlyData in QUIC mode");
+                return Err(Error::InappropriateState);
+            }
             let mut eoed = alloc::vec![hs_type::END_OF_EARLY_DATA];
             eoed.extend_from_slice(&[0u8, 0, 0]); // u24 length = 0
             self.core.emit_handshake(eoed);
@@ -1582,7 +1831,8 @@ impl ClientConnection {
         let th_for_cfin = self.core.transcript.current_hash();
         let verify_data = finished_verify_data(suite.hash, chts, th_for_cfin.as_slice());
         let finished = build_finished(verify_data.as_slice());
-        self.core.emit_handshake(finished);
+        // RFC 9001 §4.1.4: client Finished rides at Handshake level.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, finished);
 
         // Derive resumption_master_secret over Hash(CH..client Finished). The
         // PSK for a future ticket is `HKDF-Expand-Label(rms, "resumption",
@@ -1595,19 +1845,22 @@ impl ClientConnection {
         };
         self.rms = Some(rms);
 
-        // Switch to application traffic keys.
-        self.core.set_write(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &cats,
-        ));
-        self.core.set_read(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &sats,
-        ));
+        // Switch to application traffic keys (TLS / DTLS only; the QUIC
+        // layer holds 1-RTT AEAD state in its own crypto module).
+        if !self.skip_record_keys() {
+            self.core.set_write(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &cats,
+            ));
+            self.core.set_read(RecordCrypter::new(
+                suite.hash,
+                suite.aead,
+                suite.key_len,
+                &sats,
+            ));
+        }
         // Retain both directions' app secrets so we can step them on KeyUpdate.
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
@@ -1635,7 +1888,8 @@ impl ClientConnection {
                 }
             });
         });
-        self.core.emit_handshake(msg);
+        // RFC 9001 §4.1.4: mTLS client Certificate rides at Handshake level.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
     }
 
     /// mTLS: sign the running transcript with the configured client key and
@@ -1686,7 +1940,8 @@ impl ClientConnection {
             b.extend_from_slice(&scheme.0.to_be_bytes());
             with_len_u16(b, |s| s.extend_from_slice(&signature));
         });
-        self.core.emit_handshake(msg);
+        // RFC 9001 §4.1.4: mTLS client CertificateVerify rides at Handshake.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
         Ok(())
     }
 }
