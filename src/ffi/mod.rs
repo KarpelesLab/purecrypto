@@ -34,6 +34,7 @@ mod hash;
 mod kdf;
 mod mldsa;
 mod mlkem;
+mod quic;
 mod rng;
 mod rsa;
 mod slhdsa;

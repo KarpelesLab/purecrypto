@@ -88,3 +88,6 @@ jobs:
           cc tests/ffi_dtls_smoke.c -I include target/release/libpurecrypto.a \
              -lpthread -ldl -lm -o ffi_dtls_smoke
           ./ffi_dtls_smoke
+          cc tests/ffi_quic_smoke.c -I include target/release/libpurecrypto.a \
+             -lpthread -ldl -lm -o ffi_quic_smoke
+          ./ffi_quic_smoke

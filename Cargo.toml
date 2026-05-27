@@ -52,7 +52,7 @@ mldsa = ["hash", "rng", "alloc"]
 slhdsa = ["hash", "rng", "alloc"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
-ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509"]
+ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher"]
 # The `purecrypto` command-line tool (gates the binary target below).
 cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher"]
 

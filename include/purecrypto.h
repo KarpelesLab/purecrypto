@@ -153,6 +153,8 @@ typedef struct PcCsr PcCsr;
 typedef struct PcCrl PcCrl;
 typedef struct PcTlsCfg PcTlsCfg;
 typedef struct PcTls PcTls;
+typedef struct PcQuicCfg PcQuicCfg;
+typedef struct PcQuic PcQuic;
 
 /* TLS / DTLS role + version selectors. */
 typedef enum { PC_TLS_CLIENT = 0, PC_TLS_SERVER = 1 } pc_tls_role;
@@ -438,6 +440,88 @@ pc_status pc_dtls_next_timeout(const PcTls *tls,
                                uint64_t *seconds_out, uint32_t *nanos_out,
                                int32_t *has_timeout);
 pc_status pc_dtls_on_timeout(PcTls *tls, uint64_t now_seconds, uint32_t now_nanos);
+
+/* ============================================================================
+ * QUIC v1 (RFC 9000 / 9001 / 9002 / 9221) — memory-BIO style. The underlying
+ * engine is sans-I/O; the host wires it to a `UdpSocket`.
+ *
+ * Usage pattern:
+ *   1. PcQuicCfg *cfg = pc_quic_cfg_new(role);
+ *      configure (roots, cert, server_name, ALPN, transport params, ...);
+ *   2. PcQuic *q = pc_quic_new(cfg);
+ *      pc_quic_set_peer_addr(q, peer_ipv6_16, peer_port);  // server: from recvfrom
+ *   3. loop:
+ *        pc_quic_handshake(q);
+ *        // drain outbound:
+ *        while (pc_quic_pop_datagram(q, buf, &n), n > 0) sendto(peer, buf, n);
+ *        // recv:  recvfrom(...);  pc_quic_feed_datagram(q, buf, n);
+ *        // tick:  pc_quic_on_timeout(q, secs, nanos);
+ *   4. pc_quic_open_bidi(q, &id);
+ *      pc_quic_stream_write(q, id, data, len, &written);
+ *      pc_quic_stream_finish(q, id);
+ *      pc_quic_stream_read(q, id, app, &m, &fin);
+ *   5. pc_quic_free(q); pc_quic_cfg_free(cfg);
+ *
+ * Only QUIC v1 (RFC 9000) is supported; PC_QUIC_V1 is provided for
+ * future-proofing.
+ * ========================================================================== */
+
+/* QUIC wire version. */
+#define PC_QUIC_V1 0x00000001
+
+PcQuicCfg *pc_quic_cfg_new(int32_t role);     /* PC_TLS_CLIENT | PC_TLS_SERVER */
+void       pc_quic_cfg_free(PcQuicCfg *cfg);
+
+pc_status pc_quic_cfg_add_root_pem(PcQuicCfg *cfg, const uint8_t *pem, size_t len);
+pc_status pc_quic_cfg_set_server_name(PcQuicCfg *cfg, const char *sni);
+pc_status pc_quic_cfg_set_certificate(PcQuicCfg *cfg,
+                                      const uint8_t *chain_pem, size_t chain_len,
+                                      const uint8_t *key_pem,  size_t key_len);
+pc_status pc_quic_cfg_set_alpn(PcQuicCfg *cfg, const char *const *protocols, size_t n);
+pc_status pc_quic_cfg_set_verify_certificates(PcQuicCfg *cfg, int32_t verify);
+
+pc_status pc_quic_cfg_set_max_idle_timeout_ms(PcQuicCfg *cfg, uint64_t ms);
+pc_status pc_quic_cfg_set_initial_max_data(PcQuicCfg *cfg, uint64_t bytes);
+pc_status pc_quic_cfg_set_initial_max_streams_bidi(PcQuicCfg *cfg, uint64_t streams);
+pc_status pc_quic_cfg_set_max_datagram_frame_size(PcQuicCfg *cfg, uint64_t bytes);
+pc_status pc_quic_cfg_set_require_retry(PcQuicCfg *cfg, int32_t require);   /* server-only */
+
+PcQuic *pc_quic_new(const PcQuicCfg *cfg);
+void    pc_quic_free(PcQuic *q);
+
+pc_status pc_quic_feed_datagram(PcQuic *q, const uint8_t *dg, size_t len);
+pc_status pc_quic_pop_datagram(PcQuic *q, uint8_t *out, size_t *out_len);
+pc_status pc_quic_handshake(PcQuic *q);
+pc_status pc_quic_is_handshake_complete(const PcQuic *q, int32_t *out);
+
+pc_status pc_quic_next_timeout(const PcQuic *q,
+                               uint64_t *seconds_out, uint32_t *nanos_out,
+                               int32_t  *has_timeout);
+pc_status pc_quic_on_timeout(PcQuic *q,
+                             uint64_t since_start_secs, uint32_t since_start_nanos);
+
+pc_status pc_quic_open_bidi(PcQuic *q, uint64_t *id_out);
+pc_status pc_quic_open_uni(PcQuic *q, uint64_t *id_out);
+pc_status pc_quic_stream_write(PcQuic *q, uint64_t id,
+                               const uint8_t *data, size_t len,
+                               size_t *written_out);
+pc_status pc_quic_stream_finish(PcQuic *q, uint64_t id);
+pc_status pc_quic_stream_read(PcQuic *q, uint64_t id,
+                              uint8_t *out, size_t *out_len,
+                              int32_t *fin_seen);
+pc_status pc_quic_stream_reset(PcQuic *q, uint64_t id, uint64_t app_error);
+pc_status pc_quic_stream_stop_sending(PcQuic *q, uint64_t id, uint64_t app_error);
+
+pc_status pc_quic_send_datagram(PcQuic *q, const uint8_t *data, size_t len);
+pc_status pc_quic_recv_datagram(PcQuic *q, uint8_t *out, size_t *out_len);
+
+pc_status pc_quic_initiate_key_update(PcQuic *q);
+
+pc_status pc_quic_set_peer_addr(PcQuic *q,
+                                const uint8_t *ipv6_bytes_16, uint16_t port);
+
+pc_status pc_quic_negotiated_alpn(const PcQuic *q, uint8_t *out, size_t *out_len);
+pc_status pc_quic_peer_certificate(const PcQuic *q, uint8_t *out, size_t *out_len);
 
 #ifdef __cplusplus
 }
