@@ -459,6 +459,15 @@ pub struct ServerConnection<R: RngCore> {
     /// in CH AND policy allows). Drives the early-read-key install and EOED
     /// expectation.
     early_data_accepted: bool,
+    /// RFC 8446 §4.2.10: when 0-RTT is accepted, this tracks the remaining
+    /// plaintext byte budget the client may consume under the early-data
+    /// key. Initialized to `config.max_early_data_size` on 0-RTT acceptance;
+    /// decremented for each application-data record decrypted under the
+    /// early-data crypter; on underflow we emit `unexpected_message` and
+    /// fail the handshake. `None` means 0-RTT was not accepted (so no
+    /// budget tracking is needed) or the budget has already been retired
+    /// (EndOfEarlyData has been received).
+    early_data_remaining: Option<u32>,
     /// When 0-RTT is accepted, the client-handshake-traffic secret is stashed
     /// here and installed as the read key only after EndOfEarlyData arrives.
     deferred_chts: Option<Secret>,
@@ -540,6 +549,7 @@ impl<R: RngCore> ServerConnection<R> {
             rms: None,
             ks: None,
             early_data_accepted: false,
+            early_data_remaining: None,
             deferred_chts: None,
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
@@ -730,12 +740,28 @@ impl<R: RngCore> ServerConnection<R> {
                         return Err(e);
                     }
                 }
-                Ok(Some(Incoming::ApplicationData)) => {
+                Ok(Some(Incoming::ApplicationData(plaintext_len))) => {
                     // Accept early-data records before the handshake completes
                     // when 0-RTT was accepted; otherwise app data is invalid
                     // until Connected.
                     if self.state != State::Connected && !self.early_data_accepted {
                         return Err(Error::UnexpectedMessage);
+                    }
+                    // RFC 8446 §4.2.10: enforce `max_early_data_size`. A
+                    // record arriving under the early-data read key (before
+                    // EndOfEarlyData has rotated us onto the client-handshake
+                    // key) is debited from `early_data_remaining`. Underflow
+                    // is a `unexpected_message` violation.
+                    if self.state != State::Connected
+                        && let Some(remaining) = self.early_data_remaining.as_mut()
+                    {
+                        let consumed = plaintext_len as u64;
+                        if consumed > *remaining as u64 {
+                            self.core.send_alert(AlertDescription::UnexpectedMessage);
+                            self.state = State::Closed;
+                            return Err(Error::UnexpectedMessage);
+                        }
+                        *remaining -= consumed as u32;
                     }
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
@@ -785,6 +811,11 @@ impl<R: RngCore> ServerConnection<R> {
                         suite.key_len,
                         &chts,
                     ));
+                    // RFC 8446 §4.2.10: client signaled end of early data.
+                    // The early-data byte budget is no longer relevant —
+                    // subsequent application records arrive under the
+                    // client-handshake / -application keys.
+                    self.early_data_remaining = None;
                     // Feed EOED into the transcript so client-Finished MAC
                     // matches the client's view.
                     self.core.transcript.update(&msg);
@@ -1009,6 +1040,11 @@ impl<R: RngCore> ServerConnection<R> {
                 kl.log("CLIENT_EARLY_TRAFFIC_SECRET", &ch.random, cets.as_slice());
             }
             self.early_data_accepted = true;
+            // RFC 8446 §4.2.10: arm the receive-side byte budget. Records
+            // decrypted under the early-data key in `process_new_packets`
+            // decrement this; underflow tears the connection down with
+            // `unexpected_message`.
+            self.early_data_remaining = Some(self.config.max_early_data_size);
             // QUIC layer hook: the server reads 0-RTT under `cets`.
             self.notify_traffic_secret(
                 super::super::quic_hooks::Level::EarlyData,
@@ -1689,10 +1725,18 @@ impl<R: RngCore> ServerConnection<R> {
         };
         let (identities, binders) = ext::parse_client_pre_shared_key(psk_body)?;
 
+        // RFC 8446 §4.6.1 + §8.1: enforce ticket expiry on decrypt. We pass
+        // the configured `ticket_lifetime` and the system clock through;
+        // `decrypt_ticket` treats `now_secs == 0` as "no clock — skip the
+        // age check", mirroring the TLS 1.2 `try_resume` behavior so the
+        // no_std build degrades gracefully.
+        let now = system_now_u64();
+        let ticket_lifetime = self.config.ticket_lifetime;
+
         // RFC 8446 §4.2.11: pick the first identity whose ticket decrypts
         // cleanly. Then verify its binder; mismatch is fatal.
         for (idx, (ticket, _age)) in identities.iter().enumerate() {
-            let Some(decrypted) = decrypt_ticket(ticket_key, ticket) else {
+            let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
             let TicketPlaintext { psk } = decrypted;
@@ -1744,7 +1788,21 @@ struct TicketPlaintext {
 /// ciphertext ‖ tag(16)`, with `cleartext = creation_u64 ‖ psk(hash_len) ‖
 /// alpn_len_u8 ‖ alpn`. Returns `None` on any structural or authentication
 /// failure.
-fn decrypt_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<TicketPlaintext> {
+///
+/// RFC 8446 §4.6.1 + §8.1: when `now_secs > 0`, the embedded
+/// `creation_unix_time_u64` is enforced against `ticket_lifetime_secs`
+/// (with a ±60 s clock-skew tolerance). A ticket older than
+/// `ticket_lifetime_secs + 60` or minted more than 60 s in the future is
+/// rejected — silent fallback to a fresh 1-RTT handshake, matching the
+/// TLS 1.2 `try_resume` policy. `now_secs == 0` (no clock configured) or
+/// `ticket_lifetime_secs == 0` (lifetime enforcement disabled) skips the
+/// age check.
+fn decrypt_ticket(
+    key: &[u8; 32],
+    ticket: &[u8],
+    now_secs: u64,
+    ticket_lifetime_secs: u32,
+) -> Option<TicketPlaintext> {
     if ticket.len() < 12 + 16 {
         return None;
     }
@@ -1761,8 +1819,24 @@ fn decrypt_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<TicketPlaintext> {
     if buf.len() < 8 + 1 {
         return None;
     }
-    // We don't currently expose ticket expiry from the plaintext; the field
-    // is reserved for future commits.
+    let creation_secs = u64::from_be_bytes(buf[..8].try_into().ok()?);
+    // RFC 8446 §4.6.1 + §8.1: enforce ticket age. Skip the check when the
+    // server has no wall clock (`now_secs == 0`, matching the TLS 1.2
+    // fallback in `server12.rs::try_resume`) or when the lifetime is
+    // explicitly zeroed.
+    if now_secs != 0 && ticket_lifetime_secs != 0 {
+        const SKEW_SECS: u64 = 60;
+        // Past: now - creation must not exceed lifetime + skew.
+        if now_secs.saturating_sub(creation_secs) > ticket_lifetime_secs as u64 + SKEW_SECS {
+            return None;
+        }
+        // Future: a ticket minted more than `SKEW_SECS` ahead of our clock
+        // is implausible (clock smear or attacker-forged plaintext under a
+        // compromised ticket key).
+        if creation_secs > now_secs.saturating_add(SKEW_SECS) {
+            return None;
+        }
+    }
     let rest = &buf[8..];
     // PSK length: derived by total - 8 (creation) - 1 (alpn_len) - alpn_len.
     // PSK length is either 32 or 48; alpn_len is the last layout field, so:
@@ -1878,5 +1952,61 @@ mod tests {
             server.server_hs_secret_bytes(),
             from_hex_vec("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
         );
+    }
+
+    /// Build a synthetic ticket whose plaintext header carries `creation_secs`
+    /// and a 32-byte PSK; matches the layout emitted by `emit_session_ticket`.
+    fn synth_ticket(key: &[u8; 32], creation_secs: u64, alpn: &[u8]) -> Vec<u8> {
+        use crate::cipher::{Aes256, Gcm};
+        let mut plain = Vec::with_capacity(8 + 32 + 1 + alpn.len());
+        plain.extend_from_slice(&creation_secs.to_be_bytes());
+        plain.extend_from_slice(&[0xABu8; 32]); // 32-byte PSK
+        plain.push(alpn.len() as u8);
+        plain.extend_from_slice(alpn);
+        let nonce = [0x42u8; 12];
+        let gcm = Gcm::new(Aes256::new(key));
+        let mut buf = plain;
+        let tag = gcm.encrypt(&nonce, &[], &mut buf);
+        let mut wire = Vec::with_capacity(12 + buf.len() + 16);
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&buf);
+        wire.extend_from_slice(&tag);
+        wire
+    }
+
+    /// E-2 (HIGH #7) — RFC 8446 §4.6.1 + §8.1: `decrypt_ticket` MUST reject
+    /// a ticket whose embedded `creation_unix_time_u64` is older than
+    /// `ticket_lifetime` (plus the small clock-skew tolerance). A year-old
+    /// ticket that still authenticates under the ticket key is silently
+    /// dropped — matching the TLS 1.2 `try_resume` fallback.
+    #[test]
+    fn decrypt_ticket_rejects_expired() {
+        let key = [0x5au8; 32];
+        let creation: u64 = 1_700_000_000; // arbitrary past anchor
+        let now: u64 = creation + 365 * 24 * 3600; // one year later
+
+        let wire = synth_ticket(&key, creation, b"");
+
+        // Fresh decode (no clock): accepted.
+        assert!(super::decrypt_ticket(&key, &wire, 0, 7200).is_some());
+
+        // Within lifetime: accepted.
+        assert!(super::decrypt_ticket(&key, &wire, creation + 30, 7200).is_some());
+
+        // Lifetime exceeded by far: rejected.
+        assert!(super::decrypt_ticket(&key, &wire, now, 7200).is_none());
+
+        // Lifetime exceeded by 1 s past the 60 s skew window: rejected.
+        assert!(super::decrypt_ticket(&key, &wire, creation + 7200 + 61, 7200).is_none());
+
+        // Within the skew window: still accepted.
+        assert!(super::decrypt_ticket(&key, &wire, creation + 7200 + 30, 7200).is_some());
+
+        // Future ticket (clock smear) beyond skew: rejected.
+        let wire_future = synth_ticket(&key, creation + 3600, b"");
+        assert!(super::decrypt_ticket(&key, &wire_future, creation, 7200).is_none());
+
+        // ticket_lifetime == 0 disables the age check (debugging escape hatch).
+        assert!(super::decrypt_ticket(&key, &wire, now, 0).is_some());
     }
 }

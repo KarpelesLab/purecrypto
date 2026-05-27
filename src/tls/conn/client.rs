@@ -1104,7 +1104,7 @@ impl ClientConnection {
                         return Err(e);
                     }
                 }
-                Ok(Some(Incoming::ApplicationData)) => {
+                Ok(Some(Incoming::ApplicationData(_))) => {
                     if self.state != State::Connected {
                         let e = Error::UnexpectedMessage;
                         self.fail(&e);

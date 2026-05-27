@@ -1624,6 +1624,169 @@ mod loopback_tests {
         );
     }
 
+    /// E-1 (HIGH #5) — RFC 8446 §4.2.10: a 0-RTT client that pushes more
+    /// plaintext under the early-data key than the server's
+    /// `max_early_data_size` budget MUST be terminated with
+    /// `unexpected_message`. Regression guard for the byte-budget enforcement
+    /// that lives in `process_new_packets`.
+    #[test]
+    fn server_rejects_excess_early_data() {
+        // Phase 1: establish a session with a tight 0-RTT budget.
+        const BUDGET: u32 = 100;
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x5au8; 32])
+            .with_max_early_data(BUDGET);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-budget-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"0rtt-budget-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let session = client.take_session().expect("ticket");
+        assert_eq!(session.max_early_data_size, Some(BUDGET));
+
+        // Phase 2: client offers 0-RTT and sends 200 bytes — over the
+        // server's 100-byte limit. The server must terminate the
+        // handshake with `unexpected_message`.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0x5au8; 32])
+            .with_max_early_data(BUDGET);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-budget-c2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-budget-s2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        // 200 bytes of 0-RTT data — 2x the server's budget. The client
+        // packs this into a single ApplicationData record under the
+        // early-data key (fits well below the 2^14 record cap).
+        let payload = alloc::vec![0xCDu8; (BUDGET as usize) * 2];
+        client2.write_early_data(&payload).unwrap();
+
+        let bytes = client2.write_tls();
+        server2.read_tls(&bytes);
+        let err = server2.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::UnexpectedMessage),
+            "expected UnexpectedMessage on early-data budget overflow, got {err:?}"
+        );
+        // The server must have emitted a fatal alert.
+        let alert_bytes = server2.write_tls();
+        assert!(!alert_bytes.is_empty(), "server should emit a fatal alert");
+    }
+
+    /// E-1 negative control: when 0-RTT data is split into multiple records
+    /// whose plaintexts sum to exactly the budget, the server still accepts
+    /// them (boundary case — `consumed == remaining`).
+    #[test]
+    fn server_accepts_early_data_exactly_at_budget() {
+        const BUDGET: u32 = 64;
+        // Phase 1.
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x77u8; 32])
+            .with_max_early_data(BUDGET);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"0rtt-exact-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"0rtt-exact-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket");
+
+        // Phase 2: send exactly BUDGET bytes.
+        let (server_config2, cert_der2) = rsa_server();
+        let _ = cert_der2;
+        let server_config2 = server_config2
+            .with_ticket_key([0x77u8; 32])
+            .with_max_early_data(BUDGET);
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"0rtt-exact-c2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"0rtt-exact-s2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(RootCertStore::new()).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        let payload = alloc::vec![0x11u8; BUDGET as usize];
+        client2.write_early_data(&payload).unwrap();
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client2.is_handshaking() && !server2.is_handshaking());
+        assert!(server2.early_data_accepted());
+        assert_eq!(server2.take_received_plaintext(), payload);
+    }
+
     /// A PSK binder that's been tampered with: the server must reject with
     /// `decrypt_error` (RFC 8446 §4.2.11.2).
     #[test]

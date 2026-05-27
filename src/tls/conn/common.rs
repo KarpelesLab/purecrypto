@@ -18,7 +18,10 @@ pub(crate) enum Incoming {
     /// A complete handshake message, including its 4-byte header.
     Handshake(Vec<u8>),
     /// Application data arrived (the bytes are buffered for the reader).
-    ApplicationData,
+    /// The payload is the plaintext length the peer just consumed under the
+    /// current read key; the state machine uses this to enforce the
+    /// `max_early_data_size` budget on 0-RTT records (RFC 8446 §4.2.10).
+    ApplicationData(usize),
     /// An alert from the peer.
     Alert(Alert),
 }
@@ -301,8 +304,9 @@ impl ConnectionCore {
                 Ok(None)
             }
             ContentType::ApplicationData => {
+                let plaintext_len = content.len();
                 self.app_in.extend_from_slice(&content);
-                Ok(Some(Incoming::ApplicationData))
+                Ok(Some(Incoming::ApplicationData(plaintext_len)))
             }
             ContentType::Alert => {
                 if content.is_empty() {
