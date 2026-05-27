@@ -671,6 +671,17 @@ pub(crate) struct AckRangeIter<'a> {
     buf: &'a [u8],
 }
 
+impl<'a> AckRangeIter<'a> {
+    /// Constructs an iterator directly over the `ranges_raw` byte slice
+    /// that follows the `(largest, ack_delay, range_count, first_range)`
+    /// header of an ACK frame. Used by the connection-level ACK
+    /// ingestion code which needs to walk the ranges to feed RFC 9002
+    /// loss detection.
+    pub(crate) fn from_raw(buf: &'a [u8]) -> Self {
+        Self { buf }
+    }
+}
+
 impl<'a> Iterator for AckRangeIter<'a> {
     type Item = Result<(u64, u64), Error>;
 

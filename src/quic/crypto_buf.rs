@@ -82,6 +82,15 @@ pub(crate) struct CryptoBuf {
     /// The most recent chunk we carved, retained for PTO retransmit. Tuple
     /// is `(offset, bytes)`. `None` until the first carve.
     last_sent: Option<(u64, Vec<u8>)>,
+    /// History of every CRYPTO chunk we have ever carved at this level,
+    /// keyed by start offset. RFC 9002 loss detection (`requeue_range`)
+    /// looks up the exact bytes for a previously-sent CRYPTO range and
+    /// re-prepends them to the outbound queue. The TLS engine reads
+    /// each handshake byte exactly once on output, so this map is the
+    /// only source-of-truth for retransmittable CRYPTO bytes at this
+    /// level. Bounded in practice by the handshake size (typically a few
+    /// KiB per level; tens of KiB with a full cert chain).
+    sent_history: BTreeMap<u64, Vec<u8>>,
 }
 
 impl CryptoBuf {
@@ -239,7 +248,65 @@ impl CryptoBuf {
         let offset = self.outbound_offset;
         self.outbound_offset += chunk.len() as u64;
         self.last_sent = Some((offset, chunk.clone()));
+        // Record in sent-history for RFC 9002 retransmit-on-loss.
+        // The same offset may be carved more than once (PTO retransmit
+        // via `schedule_last_chunk_retransmit`); we overwrite with the
+        // freshest copy, which is byte-identical.
+        self.sent_history.insert(offset, chunk.clone());
         Some((offset, chunk))
+    }
+
+    /// Re-prepends a previously-carved CRYPTO range back to the front of
+    /// the outbound queue, so the next [`carve`](Self::carve) call hands
+    /// it back to the packet assembler. Used by the RFC 9002 packet-
+    /// threshold / time-threshold loss path: when the connection
+    /// determines that a packet carrying CRYPTO at `[offset, offset+length)`
+    /// was lost, it calls this method to schedule retransmission.
+    ///
+    /// The retransmitted bytes are looked up in [`Self::sent_history`].
+    /// If the exact range cannot be reconstructed (e.g. the history
+    /// entry is missing — never happens in practice because every carve
+    /// records an entry), the call is a no-op.
+    ///
+    /// Returns `true` if any byte was re-queued.
+    pub(crate) fn requeue_range(&mut self, offset: u64, length: u64) -> bool {
+        if length == 0 {
+            return false;
+        }
+        // Find the history entry whose start is ≤ offset and which
+        // covers `length` bytes starting at `offset`. In practice every
+        // call corresponds to a chunk we carved with the exact same
+        // start offset, so an exact lookup succeeds.
+        let mut bytes_to_requeue: Vec<u8> = Vec::new();
+        let mut cursor = offset;
+        let end = offset.saturating_add(length);
+        while cursor < end {
+            // Find the history entry whose start is the largest value
+            // ≤ cursor.
+            let entry = self.sent_history.range(..=cursor).next_back();
+            let (entry_off, entry_bytes) = match entry {
+                Some((k, v)) => (*k, v.clone()),
+                None => return false,
+            };
+            let entry_end = entry_off + entry_bytes.len() as u64;
+            if entry_end <= cursor {
+                // Gap — no history covers this range. Bail.
+                return false;
+            }
+            let local_skip = (cursor - entry_off) as usize;
+            let local_take =
+                core::cmp::min((end - cursor) as usize, entry_bytes.len() - local_skip);
+            bytes_to_requeue.extend_from_slice(&entry_bytes[local_skip..local_skip + local_take]);
+            cursor += local_take as u64;
+        }
+        // Splice at the front so the next carve hands them out first.
+        // We also rewind `outbound_offset` so the re-carved chunk gets
+        // its original offset stamped on the CRYPTO frame.
+        let mut new_buf = bytes_to_requeue;
+        new_buf.append(&mut self.outbound);
+        self.outbound = new_buf;
+        self.outbound_offset = offset;
+        true
     }
 
     /// Re-queue the most recent chunk at the *front* of `outbound` so it
