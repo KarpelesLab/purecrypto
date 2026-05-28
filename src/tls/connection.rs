@@ -492,6 +492,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
     if let Some(crl) = cfg.stapled_crl.clone() {
         sc = sc.with_stapled_crl(crl);
     }
+    if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
+        sc = sc.with_stapled_ocsp_response(ocsp);
+    }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
@@ -518,6 +521,9 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
     }
     if let Some(tk) = cfg.ticket_key {
         sc = sc.with_ticket_key(tk);
+    }
+    if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
+        sc = sc.with_stapled_ocsp_response(ocsp);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
     sc.key_log = cfg.key_log.clone();

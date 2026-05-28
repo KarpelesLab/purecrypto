@@ -163,6 +163,14 @@ pub enum Error {
     /// Server required a client certificate but the client did not present
     /// one. Maps to `certificate_required`.
     CertificateRequired,
+    /// A stapled OCSP response (RFC 6066 + RFC 6960) reports the peer's
+    /// certificate as `revoked`. Maps to `bad_certificate`.
+    CertificateRevoked,
+    /// A stapled OCSP response is malformed, signed by an unrecognised
+    /// authority, outside its validity window, or reports `unknown` for the
+    /// leaf certificate. Maps to `bad_certificate` — the staple cannot be
+    /// trusted, so the chain cannot be admitted under stapling.
+    OcspResponseInvalid,
 }
 
 impl core::fmt::Display for Error {
@@ -183,6 +191,8 @@ impl core::fmt::Display for Error {
             Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
             Error::DecryptError => f.write_str("TLS handshake decrypt error (binder/MAC)"),
             Error::CertificateRequired => f.write_str("server required a client certificate"),
+            Error::CertificateRevoked => f.write_str("peer certificate revoked (stapled OCSP)"),
+            Error::OcspResponseInvalid => f.write_str("stapled OCSP response invalid"),
         }
     }
 }

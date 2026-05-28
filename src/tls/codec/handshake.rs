@@ -27,6 +27,14 @@ pub(crate) mod hs_type {
     /// `server_key_exchange` (RFC 5246 §7.4.3). TLS 1.2 only.
     #[allow(dead_code)]
     pub(crate) const SERVER_KEY_EXCHANGE: u8 = 12;
+    /// `certificate_status` (RFC 6066 §8). TLS 1.2 / DTLS 1.2 only — emitted
+    /// by the server immediately after `Certificate` when the client offered
+    /// `status_request` and the server has an OCSP staple. Body:
+    /// `CertificateStatus = { status_type u8 ‖ response<u24> }`
+    /// where `status_type = 1` (ocsp) and `response` is the DER-encoded
+    /// `OCSPResponse`. In TLS 1.3 the staple rides as a per-cert extension
+    /// rather than as its own handshake message.
+    pub(crate) const CERTIFICATE_STATUS: u8 = 22;
     /// `certificate_request` (RFC 8446 §4.3.2 / RFC 5246 §7.4.4). Server-emitted
     /// to demand a client certificate; client replies with `Certificate`
     /// (possibly empty) and `CertificateVerify`.

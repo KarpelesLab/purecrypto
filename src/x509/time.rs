@@ -71,6 +71,38 @@ impl Time {
         encode_string(tag::UTC_TIME, &self.repr)
     }
 
+    /// Encodes the time as an ASN.1 `GeneralizedTime`
+    /// (`YYYYMMDDHHMMSSZ`, four-digit year), regardless of the year range.
+    ///
+    /// Used by parts of the OCSP wire format that mandate `GeneralizedTime`
+    /// even for dates inside the UTCTime range (RFC 6960's
+    /// `producedAt`, `thisUpdate`, `nextUpdate`, and
+    /// `RevokedInfo.revocationTime` are all `GeneralizedTime`).
+    ///
+    /// A [`Time::utc`]-built repr is the 13-byte `YYMMDDHHMMSSZ` form, which
+    /// this widens to the 15-byte form using the RFC 5280 century rule
+    /// (`YY < 50 ⇒ 2000 + YY` else `1900 + YY`). A repr already in
+    /// the 15-byte form is emitted unchanged.
+    pub(crate) fn to_generalized_time(&self) -> Vec<u8> {
+        let b = self.repr.as_bytes();
+        if b.len() == 15 {
+            return encode_string(tag::GENERALIZED_TIME, &self.repr);
+        }
+        if b.len() == 13 {
+            // Widen the two-digit year.
+            let yy = (b[0] - b'0') * 10 + (b[1] - b'0');
+            let prefix = if yy < 50 { "20" } else { "19" };
+            let mut s = String::with_capacity(15);
+            s.push_str(prefix);
+            // The remaining 13 bytes (`YYMMDDHHMMSSZ`) carry over verbatim.
+            s.push_str(core::str::from_utf8(b).unwrap_or(""));
+            return encode_string(tag::GENERALIZED_TIME, &s);
+        }
+        // Malformed length: fall through with whatever's stored; parsers
+        // will surface the malformedness on round-trip.
+        encode_string(tag::GENERALIZED_TIME, &self.repr)
+    }
+
     /// Encodes the time using the RFC 5280 §5.1.2.4 `Time` CHOICE: `UTCTime`
     /// for years 1950–2049 (two-digit year, `YYMMDDHHMMSSZ`), otherwise
     /// `GeneralizedTime` (four-digit year, `YYYYMMDDHHMMSSZ`).

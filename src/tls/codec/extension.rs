@@ -6,7 +6,7 @@
 
 use super::{
     ExtensionType, NamedGroup, RawExtension, ReadCursor, SignatureScheme, put_u8, put_u16,
-    with_len_u8, with_len_u16,
+    with_len_u8, with_len_u16, with_len_u24,
 };
 use crate::tls::{Error, ProtocolVersion};
 use alloc::vec::Vec;
@@ -193,6 +193,93 @@ pub(crate) fn parse_record_size_limit(body: &[u8]) -> Result<u16, Error> {
         return Err(Error::IllegalParameter);
     }
     Ok(v)
+}
+
+/// `status_request` for a ClientHello opting into OCSP stapling
+/// (RFC 6066 §8). Body: `CertificateStatusRequest = { status_type = 1 (ocsp),
+/// responder_id_list<0..2^16-1> = [], request_extensions<0..2^16-1> = [] }`.
+/// We never name specific responders or extensions — the empty form is the
+/// universal "I'll accept whatever OCSP response you have for the leaf" opt-in.
+pub(crate) fn status_request_ocsp() -> RawExtension {
+    let mut body = Vec::new();
+    put_u8(&mut body, 1); // status_type = ocsp
+    with_len_u16(&mut body, |_| {}); // responder_id_list = []
+    with_len_u16(&mut body, |_| {}); // request_extensions = []
+    (ExtensionType::STATUS_REQUEST, body)
+}
+
+/// Parses an incoming ClientHello `status_request` body. Returns `Ok(())` if
+/// the body advertises stapling support that we can honour (i.e.
+/// `status_type = ocsp`; nested lists may be empty or non-empty — we ignore
+/// their contents since we always staple the single leaf response we have).
+/// Returns `Err(Error::Decode)` on any structural malformation.
+///
+/// RFC 6066 §8 says the server MAY ignore the responder_id_list /
+/// request_extensions; we always do.
+pub(crate) fn parse_status_request(body: &[u8]) -> Result<(), Error> {
+    let mut c = ReadCursor::new(body);
+    let status_type = c.u8()?;
+    let _responder_id_list = c.vec_u16()?;
+    let _request_extensions = c.vec_u16()?;
+    c.expect_empty()?;
+    // status_type 1 = ocsp. Any other value (currently none are assigned)
+    // is unsupported.
+    if status_type != 1 {
+        return Err(Error::Decode);
+    }
+    Ok(())
+}
+
+/// `status_request` for a TLS 1.2 ServerHello (RFC 6066 §8): an empty body
+/// signals that the server will follow with a `CertificateStatus` handshake
+/// message after `Certificate`.
+pub(crate) fn status_request_sh_ack() -> RawExtension {
+    (ExtensionType::STATUS_REQUEST, Vec::new())
+}
+
+/// Parses a TLS 1.2 ServerHello-side `status_request` extension. RFC 6066
+/// §8: the body MUST be empty.
+pub(crate) fn parse_status_request_sh_ack(body: &[u8]) -> Result<(), Error> {
+    if body.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Decode)
+    }
+}
+
+/// Encodes a `CertificateStatus` body (RFC 6066 §8). Used in two places:
+///
+///   - As the body of the TLS 1.2 `CertificateStatus` handshake message
+///     (`hs_type::CERTIFICATE_STATUS = 22`).
+///   - As the body of the TLS 1.3 per-CertificateEntry `status_request`
+///     extension (RFC 8446 §4.4.2.1).
+///
+/// Wire format: `status_type u8 (=1 for ocsp) ‖ OCSPResponse<u24>` where
+/// the `OCSPResponse` length-prefix is a 24-bit big-endian field carrying the
+/// length of the DER blob that follows.
+pub(crate) fn certificate_status_ocsp(ocsp_der: &[u8]) -> Vec<u8> {
+    let mut body = Vec::new();
+    put_u8(&mut body, 1); // status_type = ocsp
+    with_len_u24(&mut body, |b| b.extend_from_slice(ocsp_der));
+    body
+}
+
+/// Parses a `CertificateStatus` body (RFC 6066 §8). Returns the inner OCSP
+/// DER bytes on success. Rejects any `status_type` other than `1 (ocsp)`.
+pub(crate) fn parse_certificate_status(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let status_type = c.u8()?;
+    if status_type != 1 {
+        return Err(Error::Decode);
+    }
+    let ocsp = c.vec_u24()?.to_vec();
+    c.expect_empty()?;
+    // Per RFC 6066 §8 the OCSPResponse field is `<1..2^24-1>`; a zero-length
+    // staple is a protocol violation we reject outright.
+    if ocsp.is_empty() {
+        return Err(Error::Decode);
+    }
+    Ok(ocsp)
 }
 
 /// `server_name` (SNI) carrying a single host name.

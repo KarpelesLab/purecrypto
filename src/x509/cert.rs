@@ -530,6 +530,25 @@ impl Certificate {
         super::AnyPublicKey::from_spki_der(spki)
     }
 
+    /// The raw value of the `subjectPublicKey` BIT STRING (the key bits,
+    /// with the leading unused-bits octet stripped, exactly as the wire
+    /// carried them). Used to compute the `issuerKeyHash` field of an OCSP
+    /// `CertID` (RFC 6960 §4.1.1): the hash MUST be over the SubjectPublicKey
+    /// BIT STRING's value content excluding the tag, length, and number-of-
+    /// unused-bits octets.
+    #[allow(dead_code)]
+    pub(crate) fn subject_public_key_bits(&self) -> Result<&[u8], Error> {
+        let mut seq = self.tbs_after_algid()?;
+        DistinguishedName::decode(&mut seq)?; // issuer
+        Validity::decode(&mut seq)?; // validity
+        DistinguishedName::decode(&mut seq)?; // subject
+        let spki = seq.read_element()?; // full SubjectPublicKeyInfo TLV
+        let mut spki_r = Reader::new(spki);
+        let mut spki_seq = spki_r.read_sequence()?;
+        spki_seq.read_sequence()?; // algid
+        Ok(spki_seq.read_bit_string()?)
+    }
+
     /// Verifies the certificate signature against `issuer`, dispatching on the
     /// certificate's `signatureAlgorithm` (RSA-PKCS#1 or ECDSA over SHA-256/384).
     pub fn verify_signature_with(&self, issuer: &super::AnyPublicKey) -> Result<(), Error> {

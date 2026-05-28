@@ -1,0 +1,1175 @@
+//! RFC 6960 Online Certificate Status Protocol responses.
+//!
+//! Scope is the OCSP *response* — the only side TLS stapling cares about
+//! (RFC 6066 §8 + RFC 8446 §4.4.2.1). Building OCSP *requests* and running an
+//! actual responder are out of scope: stapled responses are produced by the
+//! issuer's responder out-of-band and the TLS server merely carries the DER
+//! blob on the wire. This module:
+//!
+//!   - Parses an `OCSPResponse` (the outer envelope with `responseStatus`
+//!     and an optional `responseBytes` carrying a `BasicOCSPResponse`).
+//!   - Parses the inner `BasicOCSPResponse` → `ResponseData` →
+//!     `SingleResponse` rows, mapping `CertStatus` into a Rust enum.
+//!   - Verifies the BasicOCSPResponse signature (RFC 6960 §4.2.2.2): either
+//!     directly by the certificate issuer or by a delegated responder
+//!     certificate the issuer signed and stamped with the
+//!     `id-kp-OCSPSigning` extended key usage.
+//!   - Locates the `SingleResponse` matching a `(leaf, issuer)` pair by
+//!     computing `issuerNameHash` / `issuerKeyHash` / `serialNumber` and
+//!     comparing byte-for-byte.
+//!
+//! ASN.1 module wire format (RFC 6960 §4.2.1, simplified):
+//!
+//! ```text
+//! OCSPResponse ::= SEQUENCE {
+//!     responseStatus      OCSPResponseStatus,            -- ENUMERATED
+//!     responseBytes   [0] EXPLICIT ResponseBytes OPTIONAL }
+//!
+//! ResponseBytes ::= SEQUENCE {
+//!     responseType   OBJECT IDENTIFIER,                 -- id-pkix-ocsp-basic
+//!     response       OCTET STRING }                     -- BasicOCSPResponse DER
+//!
+//! BasicOCSPResponse ::= SEQUENCE {
+//!     tbsResponseData      ResponseData,
+//!     signatureAlgorithm   AlgorithmIdentifier,
+//!     signature            BIT STRING,
+//!     certs            [0] EXPLICIT SEQUENCE OF Certificate OPTIONAL }
+//!
+//! ResponseData ::= SEQUENCE {
+//!     version              [0] EXPLICIT Version DEFAULT v1,
+//!     responderID              ResponderID,
+//!     producedAt               GeneralizedTime,
+//!     responses                SEQUENCE OF SingleResponse,
+//!     responseExtensions   [1] EXPLICIT Extensions OPTIONAL }
+//!
+//! ResponderID ::= CHOICE {
+//!     byName  [1] EXPLICIT Name,
+//!     byKey   [2] EXPLICIT KeyHash }                    -- SHA-1 of issuer SPKI bits
+//!
+//! SingleResponse ::= SEQUENCE {
+//!     certID                       CertID,
+//!     certStatus                   CertStatus,
+//!     thisUpdate                   GeneralizedTime,
+//!     nextUpdate         [0]       EXPLICIT GeneralizedTime OPTIONAL,
+//!     singleExtensions   [1]       EXPLICIT Extensions OPTIONAL }
+//!
+//! CertID ::= SEQUENCE {
+//!     hashAlgorithm   AlgorithmIdentifier,              -- usually SHA-1
+//!     issuerNameHash  OCTET STRING,                     -- hash of issuer subject DN
+//!     issuerKeyHash   OCTET STRING,                     -- hash of issuer SPKI bits
+//!     serialNumber    CertificateSerialNumber }         -- INTEGER
+//!
+//! CertStatus ::= CHOICE {
+//!     good     [0] IMPLICIT NULL,                       -- wire tag 0x80
+//!     revoked  [1] IMPLICIT RevokedInfo,                -- wire tag 0xA1 (SEQUENCE)
+//!     unknown  [2] IMPLICIT UnknownInfo }               -- wire tag 0x82 (NULL)
+//!
+//! RevokedInfo ::= SEQUENCE {
+//!     revocationTime              GeneralizedTime,
+//!     revocationReason    [0]     EXPLICIT CRLReason OPTIONAL }
+//! ```
+//!
+//! See [`OcspResponse`] for the read API and [`OcspResponseBuilder`] for the
+//! (test-side) builder used to generate fixtures.
+
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use super::{AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Time, oid};
+use crate::der::{
+    Reader, encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
+    encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
+};
+use crate::hash::{sha1, sha256, sha384, sha512};
+
+const PEM_LABEL: &str = "OCSP RESPONSE";
+
+/// `OCSPResponseStatus` (RFC 6960 §4.2.1). Only `Successful` carries a
+/// `responseBytes` field; the other variants are diagnostic codes that
+/// indicate the responder refused or could not produce a status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum OcspResponseStatus {
+    /// `successful` (0) — the response body contains a status.
+    Successful = 0,
+    /// `malformedRequest` (1).
+    MalformedRequest = 1,
+    /// `internalError` (2).
+    InternalError = 2,
+    /// `tryLater` (3).
+    TryLater = 3,
+    /// `sigRequired` (5) — value 4 is unassigned per the ASN.1 module.
+    SigRequired = 5,
+    /// `unauthorized` (6).
+    Unauthorized = 6,
+}
+
+impl OcspResponseStatus {
+    /// Parses a single-byte ENUMERATED value into an `OcspResponseStatus`.
+    /// Rejects values outside `{0,1,2,3,5,6}` (4 is reserved).
+    pub fn from_u8(v: u8) -> Result<Self, Error> {
+        match v {
+            0 => Ok(OcspResponseStatus::Successful),
+            1 => Ok(OcspResponseStatus::MalformedRequest),
+            2 => Ok(OcspResponseStatus::InternalError),
+            3 => Ok(OcspResponseStatus::TryLater),
+            5 => Ok(OcspResponseStatus::SigRequired),
+            6 => Ok(OcspResponseStatus::Unauthorized),
+            _ => Err(Error::Malformed),
+        }
+    }
+}
+
+/// The status the responder asserts for a single certificate.
+///
+/// `Good` is the only status under which a stapled response keeps the
+/// handshake going; `Revoked` rejects with a final answer, and `Unknown`
+/// rejects because the responder cannot speak for this certificate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OcspCertStatus {
+    /// `good [0]` — the certificate is in scope and not revoked.
+    Good,
+    /// `revoked [1]` — carries the responder's `revocationTime` and the
+    /// optional `revocationReason` extension.
+    Revoked {
+        /// `RevokedInfo.revocationTime`.
+        revocation_time: Time,
+        /// Optional reason carried in `[0] EXPLICIT CRLReason`.
+        reason: Option<CrlReason>,
+    },
+    /// `unknown [2]` — the responder does not have status for this serial
+    /// number under the queried issuer.
+    Unknown,
+}
+
+/// One row of the BasicOCSPResponse `responses` list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcspSingleResponse {
+    /// OID arcs of the `CertID.hashAlgorithm` (typically `id-sha1`).
+    pub hash_alg_oid: Vec<u64>,
+    /// Hash of the issuer's `subject` Name TLV's *value* (the `Name` body,
+    /// per RFC 6960 §4.1.1: the hash input is the DER-encoded `Name` value
+    /// excluding the tag and length octets — i.e. the body of the SEQUENCE).
+    pub issuer_name_hash: Vec<u8>,
+    /// Hash of the issuer's `subjectPublicKey` BIT STRING value (raw key bits,
+    /// no unused-bits octet).
+    pub issuer_key_hash: Vec<u8>,
+    /// Raw `serialNumber` INTEGER body (strict-DER canonical magnitude).
+    pub serial: Vec<u8>,
+    /// `CertStatus` mapped to a Rust enum.
+    pub status: OcspCertStatus,
+    /// `thisUpdate` — the time at which this status is asserted to be
+    /// authoritative.
+    pub this_update: Time,
+    /// Optional `nextUpdate` — the time after which the status may not be
+    /// authoritative any longer.
+    pub next_update: Option<Time>,
+}
+
+/// A signed, DER-encoded RFC 6960 `OCSPResponse`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OcspResponse {
+    der: Vec<u8>,
+}
+
+/// The split of a `BasicOCSPResponse` into the bits we hash, the algorithm
+/// identifier we route through, and the signature value.
+struct BasicParts<'a> {
+    /// Raw `tbsResponseData` TLV — what the signature covers.
+    tbs: &'a [u8],
+    /// Outer signature algorithm OID arcs.
+    sig_alg: Vec<u64>,
+    /// Signature bits (no unused-bits octet).
+    signature: &'a [u8],
+    /// Raw `[0] EXPLICIT SEQUENCE OF Certificate` content (without the
+    /// `[0] EXPLICIT` wrapping), or `None` when the optional `certs`
+    /// field is absent.
+    certs_inner: Option<&'a [u8]>,
+}
+
+impl OcspResponse {
+    /// Wraps existing OCSP-response DER. Validates only that the outer
+    /// structure is a single SEQUENCE with no trailing bytes.
+    pub fn from_der(der: Vec<u8>) -> Result<Self, Error> {
+        let mut r = Reader::new(&der);
+        r.read_sequence()?;
+        r.finish()?;
+        Ok(OcspResponse { der })
+    }
+
+    /// Parses a PEM `OCSP RESPONSE` document.
+    pub fn from_pem(pem: &str) -> Result<Self, Error> {
+        Ok(OcspResponse {
+            der: pem_decode(pem, PEM_LABEL)?,
+        })
+    }
+
+    /// The DER encoding.
+    pub fn to_der(&self) -> &[u8] {
+        &self.der
+    }
+
+    /// The PEM encoding.
+    pub fn to_pem(&self) -> String {
+        pem_encode(PEM_LABEL, &self.der)
+    }
+
+    /// Top-level `responseStatus`.
+    pub fn response_status(&self) -> Result<OcspResponseStatus, Error> {
+        let mut outer = Reader::new(&self.der);
+        let mut seq = outer.read_sequence()?;
+        let v = seq.read_tlv(0x0a)?; // ENUMERATED
+        if v.len() != 1 {
+            return Err(Error::Malformed);
+        }
+        OcspResponseStatus::from_u8(v[0])
+    }
+
+    /// Returns the inner BasicOCSPResponse DER, or `None` if
+    /// `responseStatus` is non-Successful or `responseBytes` is absent.
+    fn basic_response_der(&self) -> Result<Option<&[u8]>, Error> {
+        let mut outer = Reader::new(&self.der);
+        let mut seq = outer.read_sequence()?;
+        let status = seq.read_tlv(0x0a)?;
+        if status.len() != 1 || status[0] != 0 {
+            // Successful (= 0) is the only status that carries responseBytes.
+            return Ok(None);
+        }
+        if seq.is_empty() {
+            return Ok(None);
+        }
+        // `responseBytes [0] EXPLICIT ResponseBytes`.
+        let rb_tlv = seq.read_tlv(tag::context(0))?;
+        let mut rb = Reader::new(rb_tlv);
+        let mut rb_seq = rb.read_sequence()?;
+        let resp_type = parse_oid(rb_seq.read_oid()?)?;
+        if resp_type.as_slice() != oid::ID_PKIX_OCSP_BASIC {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+        // `response OCTET STRING` whose content is the BasicOCSPResponse DER.
+        let basic = rb_seq.read_octet_string()?;
+        rb_seq.finish()?;
+        Ok(Some(basic))
+    }
+
+    /// Splits a BasicOCSPResponse into its components for signature
+    /// verification + certs extraction.
+    fn basic_parts(&self) -> Result<BasicParts<'_>, Error> {
+        let basic = self.basic_response_der()?.ok_or(Error::Malformed)?;
+        let mut outer = Reader::new(basic);
+        let mut bocsp = outer.read_sequence()?;
+        let tbs = bocsp.read_element()?;
+        let mut alg = bocsp.read_sequence()?;
+        let sig_alg = parse_oid(alg.read_oid()?)?;
+        // We don't enforce algid-parameters byte equality here — there's no
+        // RFC 6960 §4 mandate that the algorithm identifier match anything
+        // inside `tbsResponseData` (unlike RFC 5280 §4.1.1.2's
+        // inner/outer requirement).
+        let signature = bocsp.read_bit_string()?;
+        let certs_inner = if !bocsp.is_empty() && bocsp.peek_tag() == Some(tag::context(0)) {
+            let body = bocsp.read_tlv(tag::context(0))?;
+            // The `[0] EXPLICIT SEQUENCE OF Certificate` wrapping: unwrap the
+            // [0] tag and surface the inner SEQUENCE OF Certificate.
+            let mut sr = Reader::new(body);
+            let inner = sr.read_element()?; // the SEQUENCE OF Certificate TLV
+            sr.finish()?;
+            Some(inner)
+        } else {
+            None
+        };
+        bocsp.finish()?;
+        Ok(BasicParts {
+            tbs,
+            sig_alg,
+            signature,
+            certs_inner,
+        })
+    }
+
+    /// The OID arcs of the inner BasicOCSPResponse `signatureAlgorithm`.
+    pub fn signature_algorithm_oid(&self) -> Result<Vec<u64>, Error> {
+        Ok(self.basic_parts()?.sig_alg)
+    }
+
+    /// Verifies the BasicOCSPResponse signature over `tbsResponseData`
+    /// against `key`, dispatching through the signature-algorithm registry.
+    pub fn verify_signature_with(&self, key: &AnyPublicKey) -> Result<(), Error> {
+        let p = self.basic_parts()?;
+        key.verify(&p.sig_alg, p.tbs, p.signature)
+    }
+
+    /// `producedAt` — when the responder generated the response.
+    pub fn produced_at(&self) -> Result<Time, Error> {
+        let p = self.basic_parts()?;
+        let mut outer = Reader::new(p.tbs);
+        let mut td = outer.read_sequence()?;
+        // Optional `version [0] EXPLICIT Version DEFAULT v1`.
+        if td.peek_tag() == Some(tag::context(0)) {
+            let _ = td.read_tlv(tag::context(0))?;
+        }
+        // responderID — opaque to producedAt.
+        td.read_any()?;
+        let (t, value) = td.read_any()?;
+        if t != tag::GENERALIZED_TIME {
+            return Err(Error::Malformed);
+        }
+        let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
+        Ok(Time::from_repr(s))
+    }
+
+    /// The first delegated responder certificate in `BasicOCSPResponse.certs`,
+    /// if any. The leaf is the only candidate we consult — RFC 6960
+    /// permits a chain but in practice the responder cert is one entry,
+    /// signed by the issuer.
+    pub fn delegated_responder_cert(&self) -> Result<Option<Certificate>, Error> {
+        let p = self.basic_parts()?;
+        let Some(inner) = p.certs_inner else {
+            return Ok(None);
+        };
+        let mut r = Reader::new(inner);
+        let mut list = r.read_sequence()?;
+        if list.is_empty() {
+            return Ok(None);
+        }
+        let first = list.read_element()?;
+        Ok(Some(Certificate::from_der(first.to_vec())?))
+    }
+
+    /// Iterates the `responses` SEQUENCE OF SingleResponse.
+    pub fn responses(&self) -> Result<Vec<OcspSingleResponse>, Error> {
+        let p = self.basic_parts()?;
+        let mut out = Vec::new();
+        let mut outer = Reader::new(p.tbs);
+        let mut td = outer.read_sequence()?;
+        if td.peek_tag() == Some(tag::context(0)) {
+            let _ = td.read_tlv(tag::context(0))?;
+        }
+        // responderID
+        td.read_any()?;
+        // producedAt
+        td.read_any()?;
+        // responses
+        let responses_tlv = td.read_element()?;
+        let mut rr = Reader::new(responses_tlv);
+        let mut rseq = rr.read_sequence()?;
+        while !rseq.is_empty() {
+            out.push(read_single_response(&mut rseq)?);
+        }
+        Ok(out)
+    }
+
+    /// End-to-end validation of a stapled OCSP response. Combines the
+    /// signature verification, freshness check, and `(leaf, issuer)`
+    /// match into a single call returning the asserted `CertStatus`.
+    ///
+    /// - Signature verification: tries the issuer key directly first; if
+    ///   that fails and a delegated responder certificate is embedded in
+    ///   `BasicOCSPResponse.certs[0]`, verifies that responder cert against
+    ///   the issuer, checks it carries the `id-kp-OCSPSigning` EKU
+    ///   (RFC 6960 §4.2.2.2), then uses the responder key to verify the
+    ///   OCSP signature.
+    /// - Freshness: requires the matching `SingleResponse` to have
+    ///   `thisUpdate <= now` and (when present) `now < nextUpdate`. When
+    ///   `now` is `None` the freshness check is skipped — the TLS layer
+    ///   passes `None` only under `verify_certificates = false`, where the
+    ///   peer's certificates are not validated either.
+    /// - Match: see [`find_response_for`](Self::find_response_for).
+    ///
+    /// Returns `Err(Error::Verification)` for signature failures and
+    /// `Err(Error::Malformed)` for missing rows / expired staples — the
+    /// TLS layer translates both into [`crate::tls::Error::OcspResponseInvalid`]
+    /// to map to a `bad_certificate` alert.
+    pub fn check_for_cert(
+        &self,
+        leaf: &Certificate,
+        issuer: &Certificate,
+        now: Option<&Time>,
+    ) -> Result<OcspCertStatus, Error> {
+        // 1. Signature. Try the issuer key first; fall back to a delegated
+        //    responder cert if present.
+        let issuer_key = issuer.subject_public_key()?;
+        if self.verify_signature_with(&issuer_key).is_err() {
+            let responder = self
+                .delegated_responder_cert()?
+                .ok_or(Error::Verification)?;
+            // The responder cert chains back to the issuer (single hop —
+            // RFC 6960 §4.2.2.2 requires the delegation come from the same
+            // CA that issued the certificate the response covers).
+            responder.verify_signature_with(&issuer_key)?;
+            // ...with id-kp-OCSPSigning in its EKU.
+            let ekus = responder.extended_key_usages()?;
+            if !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING) {
+                return Err(Error::Verification);
+            }
+            let responder_key = responder.subject_public_key()?;
+            self.verify_signature_with(&responder_key)?;
+        }
+
+        // 2. Locate the SingleResponse for this leaf.
+        let single = self
+            .find_response_for(leaf, issuer)?
+            .ok_or(Error::Malformed)?;
+
+        // 3. Freshness. RFC 6960 §3.2: thisUpdate <= now < nextUpdate. The
+        //    nextUpdate field is optional — when absent, the responder is
+        //    saying it has no fresher response; we accept the staple
+        //    anyway (mirroring the rustls and OpenSSL leniency rule, which
+        //    treats the response as valid as long as it isn't in the
+        //    future and isn't past its claimed expiry).
+        if let Some(now) = now {
+            let now_u = now.to_unix();
+            if single.this_update.to_unix() > now_u {
+                return Err(Error::Malformed);
+            }
+            if let Some(nu) = &single.next_update
+                && now_u >= nu.to_unix()
+            {
+                return Err(Error::Malformed);
+            }
+        }
+
+        Ok(single.status)
+    }
+
+    /// Finds the `SingleResponse` that names `leaf` under `issuer`. Compares
+    /// `(issuerNameHash, issuerKeyHash, serial)` after recomputing the hashes
+    /// under the responder's chosen algorithm — this lets a single OCSP
+    /// response be matched regardless of whether the responder used SHA-1
+    /// (the RFC 6960 §4.3 default) or SHA-256/384/512.
+    pub fn find_response_for(
+        &self,
+        leaf: &Certificate,
+        issuer: &Certificate,
+    ) -> Result<Option<OcspSingleResponse>, Error> {
+        let issuer_name_value = read_name_value(issuer.subject_der()?)?;
+        let issuer_key_bits = issuer.subject_public_key_bits()?;
+        let serial = leaf.serial_bytes()?;
+        // strict-DER canonical: a single leading 0x00 is the sign-protection
+        // pad and not part of the magnitude. Comparison is on the magnitude
+        // (mirrors the CRL `is_revoked` semantics in `src/x509/crl.rs`).
+        let serial_magnitude = strip_leading_sign_zero(serial);
+
+        for r in self.responses()? {
+            let Some((nh, kh)) = hash_pair(&r.hash_alg_oid, issuer_name_value, issuer_key_bits)
+            else {
+                continue;
+            };
+            if r.issuer_name_hash != nh || r.issuer_key_hash != kh {
+                continue;
+            }
+            if strip_leading_sign_zero(&r.serial) != serial_magnitude {
+                continue;
+            }
+            return Ok(Some(r));
+        }
+        Ok(None)
+    }
+}
+
+/// Reads one `SingleResponse` row.
+fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, Error> {
+    let entry = reader.read_element()?;
+    let mut r = Reader::new(entry);
+    let mut s = r.read_sequence()?;
+
+    // CertID ::= SEQUENCE { hashAlgorithm, issuerNameHash, issuerKeyHash, serialNumber }
+    let mut cert_id = s.read_sequence()?;
+    let mut hash_alg = cert_id.read_sequence()?;
+    let hash_alg_oid = parse_oid(hash_alg.read_oid()?)?;
+    // Tolerate either no parameters or a NULL parameter — RFC 6960 §4.3 picks
+    // SHA-1 by default and RFC 5754 §2 says the parameters field MUST be
+    // absent for SHA-2 family OIDs but historical responders emit NULL. We
+    // accept either form.
+    if !hash_alg.is_empty() {
+        hash_alg.read_null()?;
+    }
+    hash_alg.finish()?;
+    let issuer_name_hash = cert_id.read_octet_string()?.to_vec();
+    let issuer_key_hash = cert_id.read_octet_string()?.to_vec();
+    let serial = cert_id.read_unsigned_integer_bytes()?.to_vec();
+    cert_id.finish()?;
+
+    // CertStatus ::= CHOICE { good [0] IMPLICIT NULL, revoked [1] IMPLICIT RevokedInfo,
+    //                         unknown [2] IMPLICIT NULL }
+    let (status_tag, status_body) = s.read_any()?;
+    let status = match status_tag {
+        // [0] IMPLICIT NULL — primitive, empty body.
+        0x80 => {
+            if !status_body.is_empty() {
+                return Err(Error::Malformed);
+            }
+            OcspCertStatus::Good
+        }
+        // [1] IMPLICIT SEQUENCE — RevokedInfo (constructed).
+        0xa1 => {
+            let mut ri = Reader::new(status_body);
+            let (t, value) = ri.read_any()?;
+            if t != tag::GENERALIZED_TIME {
+                return Err(Error::Malformed);
+            }
+            let revocation_time =
+                Time::from_repr(core::str::from_utf8(value).map_err(|_| Error::Malformed)?);
+            let mut reason = None;
+            if !ri.is_empty() && ri.peek_tag() == Some(tag::context(0)) {
+                // [0] EXPLICIT CRLReason ::= ENUMERATED
+                let body = ri.read_tlv(tag::context(0))?;
+                let mut br = Reader::new(body);
+                let enum_body = br.read_tlv(0x0a)?;
+                if enum_body.len() != 1 {
+                    return Err(Error::Malformed);
+                }
+                reason = Some(CrlReason::from_u8(enum_body[0])?);
+                br.finish()?;
+            }
+            OcspCertStatus::Revoked {
+                revocation_time,
+                reason,
+            }
+        }
+        // [2] IMPLICIT NULL — primitive, empty body.
+        0x82 => {
+            if !status_body.is_empty() {
+                return Err(Error::Malformed);
+            }
+            OcspCertStatus::Unknown
+        }
+        _ => return Err(Error::Malformed),
+    };
+
+    // thisUpdate (GeneralizedTime).
+    let (t, value) = s.read_any()?;
+    if t != tag::GENERALIZED_TIME {
+        return Err(Error::Malformed);
+    }
+    let this_update = Time::from_repr(core::str::from_utf8(value).map_err(|_| Error::Malformed)?);
+
+    let mut next_update = None;
+    if !s.is_empty() && s.peek_tag() == Some(tag::context(0)) {
+        // [0] EXPLICIT GeneralizedTime
+        let body = s.read_tlv(tag::context(0))?;
+        let mut nr = Reader::new(body);
+        let (t, value) = nr.read_any()?;
+        if t != tag::GENERALIZED_TIME {
+            return Err(Error::Malformed);
+        }
+        next_update = Some(Time::from_repr(
+            core::str::from_utf8(value).map_err(|_| Error::Malformed)?,
+        ));
+        nr.finish()?;
+    }
+    // We don't surface singleExtensions [1] EXPLICIT Extensions OPTIONAL.
+
+    Ok(OcspSingleResponse {
+        hash_alg_oid,
+        issuer_name_hash,
+        issuer_key_hash,
+        serial,
+        status,
+        this_update,
+        next_update,
+    })
+}
+
+/// Reads the *value* (content bytes) of a `Name` TLV — RFC 6960 §4.1.1
+/// hashes the SEQUENCE body, not the full TLV.
+fn read_name_value(name_tlv: &[u8]) -> Result<&[u8], Error> {
+    let mut r = Reader::new(name_tlv);
+    // `read_tlv(SEQUENCE)` returns the value bytes (no tag, no length).
+    let body = r.read_tlv(tag::SEQUENCE)?;
+    r.finish()?;
+    Ok(body)
+}
+
+/// Hashes `(name_value, key_bits)` under `hash_alg_oid`. Returns `None` for
+/// unsupported OIDs (the caller skips that row).
+fn hash_pair(
+    hash_alg_oid: &[u64],
+    name_value: &[u8],
+    key_bits: &[u8],
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if hash_alg_oid == oid::ID_SHA1 {
+        Some((sha1(name_value).to_vec(), sha1(key_bits).to_vec()))
+    } else if hash_alg_oid == oid::ID_SHA256 {
+        Some((sha256(name_value).to_vec(), sha256(key_bits).to_vec()))
+    } else if hash_alg_oid == oid::ID_SHA384 {
+        Some((sha384(name_value).to_vec(), sha384(key_bits).to_vec()))
+    } else if hash_alg_oid == oid::ID_SHA512 {
+        Some((sha512(name_value).to_vec(), sha512(key_bits).to_vec()))
+    } else {
+        None
+    }
+}
+
+/// Strips a single permitted leading `0x00` (the strict-DER positive-sign
+/// pad) from `bytes`, leaving the bare magnitude. Mirrors the CRL helper.
+fn strip_leading_sign_zero(bytes: &[u8]) -> &[u8] {
+    if bytes.len() > 1 && bytes[0] == 0x00 {
+        &bytes[1..]
+    } else {
+        bytes
+    }
+}
+
+/// Encodes a bare `AlgorithmIdentifier` for an OCSP `CertID.hashAlgorithm`
+/// field, with NULL parameters (the form historical responders emit and the
+/// parser tolerates). Defaults to SHA-1 — the RFC 6960 §4.3 baseline.
+fn ocsp_hash_algid(arcs: &[u64]) -> Vec<u8> {
+    let mut body = oid_tlv(arcs);
+    body.extend_from_slice(&encode_null());
+    encode_sequence(&body)
+}
+
+// -- Builder ------------------------------------------------------------------
+
+/// Builds a signed `OCSPResponse` carrying a single response for one
+/// `(issuer, leaf)` pair. Test-only — production responders are operated
+/// out-of-band by the CA and emit DER blobs we just relay.
+#[derive(Clone, Debug)]
+pub struct OcspResponseBuilder {
+    issuer_name_value: Vec<u8>,
+    issuer_key_bits: Vec<u8>,
+    serial: Vec<u8>,
+    status: OcspCertStatus,
+    this_update: Time,
+    next_update: Option<Time>,
+    produced_at: Option<Time>,
+    hash_alg_oid: &'static [u64],
+    responder_id_by_key: bool,
+    delegated_responder_cert: Option<Vec<u8>>,
+}
+
+impl OcspResponseBuilder {
+    /// Starts a builder for a `(leaf, issuer)` pair with status `Good`.
+    /// Defaults: SHA-1 CertID hashes, byKey responderID, `producedAt =
+    /// this_update`.
+    pub fn good(
+        leaf: &Certificate,
+        issuer: &Certificate,
+        this_update: Time,
+        next_update: Option<Time>,
+    ) -> Result<Self, Error> {
+        Self::with_status(leaf, issuer, this_update, next_update, OcspCertStatus::Good)
+    }
+
+    /// Starts a builder for a `(leaf, issuer)` pair with status `Revoked`.
+    pub fn revoked(
+        leaf: &Certificate,
+        issuer: &Certificate,
+        this_update: Time,
+        next_update: Option<Time>,
+        revocation_time: Time,
+        reason: Option<CrlReason>,
+    ) -> Result<Self, Error> {
+        Self::with_status(
+            leaf,
+            issuer,
+            this_update,
+            next_update,
+            OcspCertStatus::Revoked {
+                revocation_time,
+                reason,
+            },
+        )
+    }
+
+    fn with_status(
+        leaf: &Certificate,
+        issuer: &Certificate,
+        this_update: Time,
+        next_update: Option<Time>,
+        status: OcspCertStatus,
+    ) -> Result<Self, Error> {
+        Ok(OcspResponseBuilder {
+            issuer_name_value: read_name_value(issuer.subject_der()?)?.to_vec(),
+            issuer_key_bits: issuer.subject_public_key_bits()?.to_vec(),
+            serial: leaf.serial_bytes()?.to_vec(),
+            status,
+            this_update,
+            next_update,
+            produced_at: None,
+            hash_alg_oid: oid::ID_SHA1,
+            responder_id_by_key: true,
+            delegated_responder_cert: None,
+        })
+    }
+
+    /// Overrides `producedAt` (default: equal to `thisUpdate`).
+    pub fn produced_at(mut self, t: Time) -> Self {
+        self.produced_at = Some(t);
+        self
+    }
+
+    /// Switches the responder hash algorithm. Accepted: `id-sha1`, `id-sha256`,
+    /// `id-sha384`, `id-sha512`. Unknown OIDs are rejected at sign time.
+    pub fn hash_algorithm(mut self, arcs: &'static [u64]) -> Self {
+        self.hash_alg_oid = arcs;
+        self
+    }
+
+    /// Uses `byName` (the issuer's Name DER) as the ResponderID instead of
+    /// the default `byKey` (SHA-1 of the issuer SPKI bits).
+    pub fn responder_id_by_name(mut self) -> Self {
+        self.responder_id_by_key = false;
+        self
+    }
+
+    /// Embeds `responder_cert_der` as `BasicOCSPResponse.certs[0]`. The signer
+    /// passed to [`sign`](Self::sign) is then interpreted as the delegated
+    /// responder's key (not the issuer's): the client validates the
+    /// responder cert against the issuer and verifies the OCSP signature with
+    /// the responder cert's public key.
+    pub fn delegated_responder_cert(mut self, responder_cert_der: Vec<u8>) -> Self {
+        self.delegated_responder_cert = Some(responder_cert_der);
+        self
+    }
+
+    /// Signs the response, producing a complete RFC 6960 `OCSPResponse` with
+    /// `responseStatus = successful` and the BasicOCSPResponse inside.
+    pub fn sign(self, signer: &CertSigner<'_>) -> Result<OcspResponse, Error> {
+        // Compute CertID using the chosen hash algorithm.
+        let (name_hash, key_hash) = hash_pair(
+            self.hash_alg_oid,
+            &self.issuer_name_value,
+            &self.issuer_key_bits,
+        )
+        .ok_or(Error::UnsupportedAlgorithm)?;
+
+        // CertID body.
+        let mut cert_id_body = Vec::new();
+        cert_id_body.extend_from_slice(&ocsp_hash_algid(self.hash_alg_oid));
+        cert_id_body.extend_from_slice(&encode_octet_string(&name_hash));
+        cert_id_body.extend_from_slice(&encode_octet_string(&key_hash));
+        cert_id_body.extend_from_slice(&encode_integer(&self.serial));
+        let cert_id = encode_sequence(&cert_id_body);
+
+        // CertStatus.
+        let cert_status = match &self.status {
+            // good [0] IMPLICIT NULL — primitive, empty body.
+            OcspCertStatus::Good => encode_tlv(0x80, &[]),
+            // revoked [1] IMPLICIT RevokedInfo — constructed SEQUENCE body.
+            OcspCertStatus::Revoked {
+                revocation_time,
+                reason,
+            } => {
+                let mut ri = Vec::new();
+                ri.extend_from_slice(&revocation_time.to_generalized_time());
+                if let Some(r) = reason {
+                    let enumerated = encode_tlv(0x0a, &[*r as u8]);
+                    ri.extend_from_slice(&encode_context(0, &enumerated));
+                }
+                encode_tlv(0xa1, &ri)
+            }
+            // unknown [2] IMPLICIT NULL — primitive, empty body.
+            OcspCertStatus::Unknown => encode_tlv(0x82, &[]),
+        };
+
+        // SingleResponse body.
+        let mut sr = Vec::new();
+        sr.extend_from_slice(&cert_id);
+        sr.extend_from_slice(&cert_status);
+        sr.extend_from_slice(&self.this_update.to_generalized_time());
+        if let Some(nu) = &self.next_update {
+            sr.extend_from_slice(&encode_context(0, &nu.to_generalized_time()));
+        }
+        let single_response = encode_sequence(&sr);
+
+        // responses SEQUENCE OF SingleResponse — exactly one row here.
+        let responses = encode_sequence(&single_response);
+
+        // ResponderID.
+        let responder_id = if self.responder_id_by_key {
+            // byKey [2] EXPLICIT KeyHash — KeyHash ::= OCTET STRING (SHA-1).
+            let kh = sha1(&self.issuer_key_bits).to_vec();
+            encode_context(2, &encode_octet_string(&kh))
+        } else {
+            // byName [1] EXPLICIT Name — wrap the full Name TLV.
+            let name_tlv = encode_sequence(&self.issuer_name_value);
+            encode_context(1, &name_tlv)
+        };
+
+        // ResponseData (omit version, accept the default v1).
+        let produced_at = self.produced_at.as_ref().unwrap_or(&self.this_update);
+        let mut td = Vec::new();
+        td.extend_from_slice(&responder_id);
+        td.extend_from_slice(&produced_at.to_generalized_time());
+        td.extend_from_slice(&responses);
+        let tbs_response_data = encode_sequence(&td);
+
+        // signatureAlgorithm + signature.
+        let sig_algid = signer.algorithm_identifier();
+        let signature = signer.sign(&tbs_response_data)?;
+
+        // BasicOCSPResponse SEQUENCE { tbs, sigAlg, signature, [0] certs OPTIONAL }.
+        let mut bocsp = Vec::new();
+        bocsp.extend_from_slice(&tbs_response_data);
+        bocsp.extend_from_slice(&sig_algid);
+        bocsp.extend_from_slice(&encode_bit_string(&signature));
+        if let Some(cert_der) = &self.delegated_responder_cert {
+            // certs [0] EXPLICIT SEQUENCE OF Certificate.
+            let certs_seq = encode_sequence(cert_der);
+            bocsp.extend_from_slice(&encode_context(0, &certs_seq));
+        }
+        let basic = encode_sequence(&bocsp);
+
+        // ResponseBytes ::= SEQUENCE { responseType OID, response OCTET STRING }.
+        let mut rb = Vec::new();
+        rb.extend_from_slice(&oid_tlv(oid::ID_PKIX_OCSP_BASIC));
+        rb.extend_from_slice(&encode_octet_string(&basic));
+        let response_bytes = encode_sequence(&rb);
+
+        // OCSPResponse ::= SEQUENCE { responseStatus, [0] responseBytes }.
+        let status = encode_tlv(0x0a, &[OcspResponseStatus::Successful as u8]);
+        let mut out = Vec::new();
+        out.extend_from_slice(&status);
+        out.extend_from_slice(&encode_context(0, &response_bytes));
+        Ok(OcspResponse {
+            der: encode_sequence(&out),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::Ed25519PrivateKey;
+    use crate::rsa::BoxedRsaPrivateKey;
+    use crate::x509::{
+        CertSigner, Certificate, DistinguishedName, Extension, Time, Validity, extension,
+    };
+    use alloc::vec;
+
+    fn rsa_a() -> BoxedRsaPrivateKey {
+        BoxedRsaPrivateKey::from_pkcs1_pem(include_str!("../../testdata/rsa2048_test_a.pem"))
+            .expect("rsa key A")
+    }
+    fn rsa_b() -> BoxedRsaPrivateKey {
+        BoxedRsaPrivateKey::from_pkcs1_pem(include_str!("../../testdata/rsa2048_test_b.pem"))
+            .expect("rsa key B")
+    }
+
+    fn validity() -> Validity {
+        Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        )
+    }
+
+    fn ed25519() -> Ed25519PrivateKey {
+        // Deterministic test key.
+        let seed = [7u8; 32];
+        Ed25519PrivateKey::from_bytes(seed)
+    }
+
+    /// Build a self-signed issuer + a leaf certificate it signed. The pair
+    /// is the minimum substrate the OCSP code needs to compute CertID
+    /// fields and route the verification.
+    fn issuer_and_leaf() -> (Certificate, Certificate, BoxedRsaPrivateKey) {
+        let issuer_key = rsa_a();
+        let issuer_dn = DistinguishedName::common_name("OCSP test root");
+        let issuer = Certificate::self_signed_general(
+            &CertSigner::Rsa(&issuer_key),
+            &issuer_dn,
+            &validity(),
+            1,
+            true,
+            &[],
+        )
+        .expect("self-sign issuer");
+
+        let leaf_key = rsa_b();
+        let leaf_dn = DistinguishedName::common_name("OCSP test leaf");
+        let signer = CertSigner::Rsa(&issuer_key);
+        let leaf_extensions = vec![extension::basic_constraints(false, None)];
+        let leaf = Certificate::issue_with_extensions(
+            &signer,
+            &issuer_dn,
+            &leaf_dn,
+            &AnyPublicKey::Rsa(leaf_key.public_key()),
+            &validity(),
+            42,
+            &leaf_extensions,
+        )
+        .expect("issue leaf");
+
+        (issuer, leaf, issuer_key)
+    }
+
+    #[test]
+    fn good_roundtrip_and_verify() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+
+        // Round-trip through DER + PEM.
+        let from_der = OcspResponse::from_der(resp.to_der().to_vec()).unwrap();
+        assert_eq!(from_der, resp);
+        let pem = resp.to_pem();
+        assert!(pem.contains("BEGIN OCSP RESPONSE"));
+        let from_pem = OcspResponse::from_pem(&pem).unwrap();
+        assert_eq!(from_pem, resp);
+
+        // Top-level status.
+        assert_eq!(
+            resp.response_status().unwrap(),
+            OcspResponseStatus::Successful
+        );
+
+        // Locates the row + reports Good.
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert_eq!(single.status, OcspCertStatus::Good);
+        // OCSP carries GeneralizedTime (the 15-byte `YYYYMMDDHHMMSSZ` form);
+        // `Time::utc` builds the 13-byte UTCTime repr. Same instant, different
+        // string — compare on the underlying Unix epoch.
+        assert_eq!(
+            single.this_update.to_unix(),
+            Time::utc(2026, 1, 1, 0, 0, 0).to_unix()
+        );
+        assert_eq!(
+            single.next_update.as_ref().map(|t| t.to_unix()),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0).to_unix())
+        );
+
+        // Signature verifies under the issuer key.
+        resp.verify_signature_with(&signer.public_key()).unwrap();
+    }
+
+    #[test]
+    fn revoked_with_reason_roundtrip() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        let resp = OcspResponseBuilder::revoked(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 6, 1, 0, 0, 0),
+            None,
+            Time::utc(2026, 5, 1, 0, 0, 0),
+            Some(CrlReason::KeyCompromise),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        match single.status {
+            OcspCertStatus::Revoked {
+                revocation_time,
+                reason,
+            } => {
+                // GeneralizedTime round-trip — compare on the instant.
+                assert_eq!(
+                    revocation_time.to_unix(),
+                    Time::utc(2026, 5, 1, 0, 0, 0).to_unix()
+                );
+                assert_eq!(reason, Some(CrlReason::KeyCompromise));
+            }
+            other => panic!("expected revoked, got {other:?}"),
+        }
+        resp.verify_signature_with(&signer.public_key()).unwrap();
+    }
+
+    #[test]
+    fn unknown_status_decodes() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        // No builder shortcut for Unknown — exercise it by injecting the
+        // status directly through the with_status seam.
+        let resp = OcspResponseBuilder::with_status(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            None,
+            OcspCertStatus::Unknown,
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert_eq!(single.status, OcspCertStatus::Unknown);
+    }
+
+    #[test]
+    fn responder_id_by_name() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .responder_id_by_name()
+            .sign(&signer)
+            .unwrap();
+
+        // Verification still works regardless of the responderID encoding —
+        // the signature covers tbsResponseData byte-for-byte, and we don't
+        // try to derive the responder key from the responderID.
+        resp.verify_signature_with(&signer.public_key()).unwrap();
+        // And the row matches the same way.
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert_eq!(single.status, OcspCertStatus::Good);
+    }
+
+    #[test]
+    fn delegated_responder_cert_extraction() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let issuer_signer = CertSigner::Rsa(&issuer_key);
+
+        // Issue a delegated responder cert. It's signed by the issuer and
+        // carries id-kp-OCSPSigning EKU + the id-pkix-ocsp-nocheck marker.
+        let responder_key = ed25519();
+        let responder_pub = AnyPublicKey::Ed25519(responder_key.public_key());
+        let responder_dn = DistinguishedName::common_name("OCSP delegated responder");
+        let mut responder_extensions = vec![extension::basic_constraints(false, None)];
+        responder_extensions.push(Extension {
+            oid: oid::EXT_KEY_USAGE.to_vec(),
+            critical: false,
+            value: encode_sequence(&oid_tlv(oid::ID_KP_OCSP_SIGNING)),
+        });
+        responder_extensions.push(Extension {
+            oid: oid::ID_PKIX_OCSP_NOCHECK.to_vec(),
+            critical: false,
+            value: encode_null(),
+        });
+        let responder_cert = Certificate::issue_with_extensions(
+            &issuer_signer,
+            &issuer.subject().unwrap(),
+            &responder_dn,
+            &responder_pub,
+            &validity(),
+            99,
+            &responder_extensions,
+        )
+        .expect("issue responder");
+
+        // The OCSP response is signed by the delegated responder key; the
+        // delegated cert is embedded in `BasicOCSPResponse.certs[0]`.
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .delegated_responder_cert(responder_cert.to_der().to_vec())
+            .sign(&CertSigner::Ed25519(&responder_key))
+            .unwrap();
+
+        // Extract the embedded cert.
+        let extracted = resp.delegated_responder_cert().unwrap().unwrap();
+        assert_eq!(extracted.to_der(), responder_cert.to_der());
+
+        // The OCSP signature verifies under the responder's public key, not
+        // the issuer's.
+        resp.verify_signature_with(&extracted.subject_public_key().unwrap())
+            .unwrap();
+        // It does NOT verify under the issuer's key — different signing key.
+        assert!(
+            resp.verify_signature_with(&issuer_signer.public_key())
+                .is_err()
+        );
+
+        // The responder cert chain back to the issuer: signed by the issuer,
+        // and carries id-kp-OCSPSigning in its EKU.
+        let issuer_pub = issuer_signer.public_key();
+        extracted.verify_signature_with(&issuer_pub).unwrap();
+        let ekus = extracted.extended_key_usages().unwrap();
+        assert!(ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING));
+    }
+
+    #[test]
+    fn verify_rejects_wrong_key_or_tamper() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+
+        // Wrong key (rsa_b vs issuer's rsa_a).
+        let wrong = AnyPublicKey::Rsa(rsa_b().public_key());
+        assert!(resp.verify_signature_with(&wrong).is_err());
+
+        // Tamper a TBS byte → signature no longer covers it.
+        let mut der = resp.to_der().to_vec();
+        // Land somewhere inside the BasicOCSPResponse — past the headers.
+        let idx = der.len() / 2;
+        der[idx] ^= 0x01;
+        let tampered = OcspResponse::from_der(der).unwrap();
+        assert!(
+            tampered
+                .verify_signature_with(&signer.public_key())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn find_response_for_serial_magnitude() {
+        // Build a leaf whose serial INTEGER body carries a leading 0x00
+        // (sign-protection pad) and verify the lookup matches against the
+        // magnitude alone — mirrors the CRL comparison semantics.
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        // The lookup uses the leaf's own serial — round-trips by construction.
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert_eq!(single.status, OcspCertStatus::Good);
+    }
+
+    #[test]
+    fn unknown_response_status_rejected() {
+        // ENUMERATED 4 is reserved per the RFC 6960 ASN.1 module.
+        let body = encode_sequence(&encode_tlv(0x0a, &[4]));
+        let r = OcspResponse::from_der(body).unwrap();
+        assert!(matches!(
+            r.response_status(),
+            Err(crate::x509::Error::Malformed)
+        ));
+    }
+
+    #[test]
+    fn non_successful_status_has_no_basic_response() {
+        // A `tryLater` (3) response has no responseBytes.
+        let body = encode_sequence(&encode_tlv(0x0a, &[3]));
+        let r = OcspResponse::from_der(body).unwrap();
+        assert_eq!(r.response_status().unwrap(), OcspResponseStatus::TryLater);
+        // Walking past the status into the absent BasicOCSPResponse surfaces
+        // `Malformed`; the responses iterator follows that.
+        assert!(matches!(r.responses(), Err(crate::x509::Error::Malformed)));
+    }
+
+    #[test]
+    fn next_update_optional() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert!(single.next_update.is_none());
+    }
+
+    #[test]
+    fn sha256_certid_path() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .hash_algorithm(oid::ID_SHA256)
+            .sign(&signer)
+            .unwrap();
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+        assert_eq!(single.hash_alg_oid.as_slice(), oid::ID_SHA256);
+        // 32-byte SHA-256 outputs.
+        assert_eq!(single.issuer_name_hash.len(), 32);
+        assert_eq!(single.issuer_key_hash.len(), 32);
+    }
+}

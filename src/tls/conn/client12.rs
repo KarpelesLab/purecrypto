@@ -367,6 +367,9 @@ fn key_matches_sig_kind(key: &AnyPublicKey, kind: SigKind) -> bool {
 enum State {
     WaitServerHello,
     WaitCertificate,
+    /// RFC 6066 §8: after `Certificate`, the server emits a
+    /// `CertificateStatus` (type 22) iff it echoed `status_request` in SH.
+    WaitCertificateStatus,
     WaitServerKeyExchange,
     WaitServerHelloDone,
     /// We've sent our ClientKeyExchange / ChangeCipherSpec / Finished;
@@ -492,6 +495,15 @@ pub struct ClientConnection12 {
     /// instant the ClientKeyExchange is fed into the transcript. Used as
     /// the `session_hash` input to `extended_master_secret`.
     ems_session_hash: Option<Vec<u8>>,
+    /// RFC 6066 §8: server echoed an empty `status_request` in SH. We then
+    /// expect a `CertificateStatus` handshake message (type 22) right after
+    /// `Certificate`. If the SH echo is absent the server is not stapling,
+    /// and the `WaitCertificateStatus` transition is skipped.
+    server_echoed_ocsp_staple: bool,
+    /// RFC 6066 §8: the OCSP response DER carried in `CertificateStatus`,
+    /// captured for caller inspection via [`Self::peer_ocsp_response`] and
+    /// for chain-bound verification once the leaf's issuer is known.
+    peer_ocsp_response: Option<Vec<u8>>,
 }
 
 impl ClientConnection12 {
@@ -571,6 +583,8 @@ impl ClientConnection12 {
             ems_offered: true,
             ems_negotiated: false,
             ems_session_hash: None,
+            server_echoed_ocsp_staple: false,
+            peer_ocsp_response: None,
         };
         let hello = conn.build_client_hello(&offered_suites, groups);
         // Update the transcript even though the hash isn't selected yet —
@@ -614,6 +628,10 @@ impl ClientConnection12 {
         if let Some(limit) = self.config.record_size_limit {
             extensions.push(ext::record_size_limit(limit));
         }
+        // RFC 6066 §8: advertise OCSP stapling. The server echoes an empty
+        // `status_request` in ServerHello and then sends a
+        // `CertificateStatus` handshake message right after `Certificate`.
+        extensions.push(ext::status_request_ocsp());
         // RFC 5077 §3.1: present a `session_ticket` extension. Empty body =
         // "I support tickets but have none to resume"; non-empty body =
         // "please resume this ticket". We always advertise support so the
@@ -705,6 +723,15 @@ impl ClientConnection12 {
     /// `true` if this handshake resumed a prior session via RFC 5077.
     pub fn did_resume(&self) -> bool {
         self.resumed
+    }
+
+    /// DER bytes of the OCSP response stapled by the peer (RFC 6066 §8),
+    /// when the server emitted a `CertificateStatus` handshake message. The
+    /// response has already been validated against the certificate chain
+    /// when `verify_certificates` was enabled — `None` here means the server
+    /// did not staple.
+    pub fn peer_ocsp_response(&self) -> Option<&[u8]> {
+        self.peer_ocsp_response.as_deref()
     }
 
     /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
@@ -1013,6 +1040,7 @@ impl ClientConnection12 {
         match self.state {
             State::WaitServerHello => self.on_server_hello(msg_type, body, &msg),
             State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
+            State::WaitCertificateStatus => self.on_certificate_status(msg_type, body, &msg),
             State::WaitServerKeyExchange => self.on_server_key_exchange(msg_type, body, &msg),
             State::WaitServerHelloDone => self.on_server_hello_done(msg_type, body, &msg),
             State::WaitServerFinished | State::WaitResumedServerFinished => {
@@ -1086,6 +1114,13 @@ impl ClientConnection12 {
         if let Some(rsl) = ext::find(&sh.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
             let _limit = ext::parse_record_size_limit(rsl)?;
             // Not currently honoured on the write side (see send_application_data).
+        }
+        // RFC 6066 §8: server commits to sending a `CertificateStatus`
+        // handshake message right after `Certificate` iff it echoes an empty
+        // `status_request` here.
+        if let Some(sr_body) = ext::find(&sh.extensions, ExtensionType::STATUS_REQUEST) {
+            ext::parse_status_request_sh_ack(sr_body)?;
+            self.server_echoed_ocsp_staple = true;
         }
 
         // RFC 5077 §3.2 + §3.4: a server that intends to issue a NEW ticket
@@ -1210,6 +1245,56 @@ impl ClientConnection12 {
 
         self.cert_chain = chain;
         self.leaf_key = Some(leaf_key);
+        self.transcript.update(raw);
+        // RFC 6066 §8: when the server echoed `status_request` in SH it owes
+        // us a `CertificateStatus` message next; otherwise jump straight to
+        // ServerKeyExchange.
+        self.state = if self.server_echoed_ocsp_staple {
+            State::WaitCertificateStatus
+        } else {
+            State::WaitServerKeyExchange
+        };
+        Ok(())
+    }
+
+    /// RFC 6066 §8: a `CertificateStatus` carries the server's stapled OCSP
+    /// response. We capture the bytes for caller inspection and defer
+    /// signature/freshness validation against the chain to a higher layer
+    /// (the OCSP response is only meaningful relative to an issuer cert,
+    /// which the caller already validated as part of the chain).
+    fn on_certificate_status(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::CERTIFICATE_STATUS {
+            return Err(Error::UnexpectedMessage);
+        }
+        let ocsp = ext::parse_certificate_status(body)?;
+        // Validate the staple against the chain. With `verify_certificates`
+        // off (pinned-key flows), skip the check entirely — the caller has
+        // opted out of PKI altogether.
+        if self.config.verify_certificates && self.cert_chain.len() >= 2 {
+            let leaf = crate::x509::Certificate::from_der(self.cert_chain[0].clone())
+                .map_err(|_| Error::BadCertificate)?;
+            let issuer = crate::x509::Certificate::from_der(self.cert_chain[1].clone())
+                .map_err(|_| Error::BadCertificate)?;
+            let now = self.config.verification_time.clone().or_else(system_now);
+            let resp = crate::x509::OcspResponse::from_der(ocsp.clone())
+                .map_err(|_| Error::OcspResponseInvalid)?;
+            match resp
+                .check_for_cert(&leaf, &issuer, now.as_ref())
+                .map_err(|_| Error::OcspResponseInvalid)?
+            {
+                crate::x509::OcspCertStatus::Good => {}
+                crate::x509::OcspCertStatus::Revoked { .. } => {
+                    return Err(Error::CertificateRevoked);
+                }
+                crate::x509::OcspCertStatus::Unknown => return Err(Error::OcspResponseInvalid),
+            }
+        }
+        self.peer_ocsp_response = Some(ocsp);
         self.transcript.update(raw);
         self.state = State::WaitServerKeyExchange;
         Ok(())
@@ -1599,6 +1684,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
+        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }

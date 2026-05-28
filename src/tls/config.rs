@@ -109,6 +109,13 @@ pub struct Config {
     /// DER bytes of a CRL to staple in the TLS 1.3 `Certificate` message
     /// (TLS 1.2 has no per-cert extension slot).
     pub stapled_crl: Option<Vec<u8>>,
+    /// DER bytes of an OCSP `OCSPResponse` to staple (RFC 6066 §8 + RFC
+    /// 6960). On TLS 1.2 the server emits it as the body of a
+    /// `CertificateStatus` handshake message; on TLS 1.3 it is carried in
+    /// the leaf `CertificateEntry`'s per-cert `status_request` extension.
+    /// Honoured only when the client advertised `status_request` in its
+    /// `ClientHello`.
+    pub stapled_ocsp_response: Option<Vec<u8>>,
     /// TLS 1.2 / TLS 1.3 session-ticket key. `None` = no tickets issued.
     pub ticket_key: Option<[u8; 32]>,
     /// Cap on bytes the server accepts as 0-RTT early data. `0` = no 0-RTT.
@@ -157,6 +164,7 @@ impl Default for Config {
             verification_time: None,
             client_auth: None,
             stapled_crl: None,
+            stapled_ocsp_response: None,
             ticket_key: None,
             max_early_data_size: 0,
             #[cfg(feature = "std")]
@@ -323,6 +331,13 @@ impl ConfigBuilder {
     /// TLS 1.3 server: DER bytes of a CRL to staple to the leaf cert.
     pub fn stapled_crl(mut self, der: Vec<u8>) -> Self {
         self.inner.stapled_crl = Some(der);
+        self
+    }
+    /// TLS 1.2 / 1.3 server: DER bytes of an OCSP response to staple to
+    /// the leaf cert (RFC 6066 §8). The server only emits it when the
+    /// client opted in by sending `status_request` in its ClientHello.
+    pub fn stapled_ocsp_response(mut self, der: Vec<u8>) -> Self {
+        self.inner.stapled_ocsp_response = Some(der);
         self
     }
     /// TLS 1.2 / 1.3 server: session-ticket / NewSessionTicket key.

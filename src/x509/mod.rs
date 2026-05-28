@@ -10,6 +10,7 @@ mod crl;
 mod csr;
 pub mod extension;
 mod name;
+pub mod ocsp;
 mod pubkey;
 mod signer;
 mod time;
@@ -19,6 +20,9 @@ pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, RevokedCertifica
 pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
+pub use ocsp::{
+    OcspCertStatus, OcspResponse, OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse,
+};
 pub use pubkey::AnyPublicKey;
 pub use signer::CertSigner;
 pub use time::{Time, Validity};
@@ -116,6 +120,27 @@ pub mod oid {
     /// `id-ce-cRLReason` (2.5.29.21) — per-entry CRL extension carrying a
     /// `CRLReason ::= ENUMERATED` (RFC 5280 §5.3.1).
     pub const CRL_REASON_CODE: &[u64] = &[2, 5, 29, 21];
+
+    /// `id-pkix-ocsp-basic` (1.3.6.1.5.5.7.48.1.1) — the `responseType` OID
+    /// nested inside an `OCSPResponse.responseBytes` field carrying a
+    /// `BasicOCSPResponse` (RFC 6960 §4.2.1).
+    pub const ID_PKIX_OCSP_BASIC: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 1];
+    /// `id-pkix-ocsp-nocheck` (1.3.6.1.5.5.7.48.1.5) — extension on a
+    /// delegated OCSP responder cert telling relying parties not to attempt
+    /// revocation status checks on the responder itself (RFC 6960 §4.2.2.2.1).
+    pub const ID_PKIX_OCSP_NOCHECK: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 5];
+
+    /// `id-sha1` (1.3.14.3.2.26) — the AlgorithmIdentifier OID used in OCSP
+    /// `CertID.hashAlgorithm` for SHA-1-based identification. Default per
+    /// RFC 6960 §4.3 (the OCSP profile mandates SHA-1 support for interop
+    /// even when modern responders prefer SHA-256).
+    pub const ID_SHA1: &[u64] = &[1, 3, 14, 3, 2, 26];
+    /// `id-sha256` (2.16.840.1.101.3.4.2.1).
+    pub const ID_SHA256: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 1];
+    /// `id-sha384` (2.16.840.1.101.3.4.2.2).
+    pub const ID_SHA384: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 2];
+    /// `id-sha512` (2.16.840.1.101.3.4.2.3).
+    pub const ID_SHA512: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 3];
 }
 
 /// Errors from X.509 encoding, parsing, and verification.

@@ -97,6 +97,11 @@ pub(crate) struct ServerConfig12 {
     /// CRLs consulted during client-cert chain validation under mTLS.
     /// Empty by default; opt in via [`ServerConfig12::with_crls`].
     crls: crate::tls::pki::CrlStore,
+    /// Optional DER-encoded OCSP response stapled when the client opted
+    /// into OCSP stapling via the `status_request` extension. On TLS 1.2
+    /// the bytes are emitted as the body of a `CertificateStatus`
+    /// handshake message (RFC 6066 §8) sent right after `Certificate`.
+    stapled_ocsp_response: Option<Vec<u8>>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
@@ -128,6 +133,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -145,6 +151,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -171,6 +178,16 @@ impl ServerConfig12 {
     /// chain validation under mTLS.
     pub fn with_crls(mut self, crls: crate::tls::pki::CrlStore) -> Self {
         self.crls = crls;
+        self
+    }
+
+    /// Staples `ocsp_der` (a DER-encoded RFC 6960 `OCSPResponse`) to the
+    /// leaf cert via a `CertificateStatus` handshake message (RFC 6066
+    /// §8). Emitted only when the client advertised `status_request` in
+    /// its `ClientHello`; the bytes themselves are passed through
+    /// unparsed by this layer.
+    pub fn with_stapled_ocsp_response(mut self, ocsp_der: Vec<u8>) -> Self {
+        self.stapled_ocsp_response = Some(ocsp_der);
         self
     }
 
@@ -332,6 +349,11 @@ pub struct ServerConnection12<R: RngCore> {
     /// in its CH. Drives whether we echo the empty extension in SH and emit
     /// `NewSessionTicket` after our Finished.
     peer_offered_session_ticket: bool,
+    /// RFC 6066 §8: whether the peer offered `status_request` in its CH.
+    /// Drives whether we echo the empty extension in SH and emit a
+    /// `CertificateStatus` handshake message after `Certificate`. Effective
+    /// only when [`ServerConfig12::with_stapled_ocsp_response`] is set.
+    peer_offered_ocsp_staple: bool,
     /// RFC 5077: true on resumed handshakes (we recovered a master secret
     /// from a valid ticket presented in the client's CH). Skips Certificate /
     /// SKE / CertReq / SHDone and changes the post-CH state path.
@@ -387,6 +409,7 @@ impl<R: RngCore> ServerConnection12<R> {
             client_cert_chain: Vec::new(),
             client_leaf_key: None,
             peer_offered_session_ticket: false,
+            peer_offered_ocsp_staple: false,
             resumed: false,
             ems_negotiated: false,
             ems_session_hash: None,
@@ -828,6 +851,15 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_offered_record_size_limit = true;
         }
 
+        // RFC 6066 §8: detect OCSP-stapling opt-in. We accept the body
+        // shape unconditionally and remember the offer; the SH echo and the
+        // `CertificateStatus` emission below are both gated on this flag and
+        // on `config.stapled_ocsp_response` being set.
+        if let Some(sr_body) = ext::find(&ch.extensions, ExtensionType::STATUS_REQUEST) {
+            ext::parse_status_request(sr_body)?;
+            self.peer_offered_ocsp_staple = true;
+        }
+
         // RFC 5746 §3.6: echo `renegotiation_info` iff the peer sent it.
         if let Some(reneg) = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO) {
             let inner = ext::parse_renegotiation_info(reneg)?;
@@ -969,6 +1001,13 @@ impl<R: RngCore> ServerConnection12<R> {
         // AFTER ServerKeyExchange and BEFORE ServerHelloDone.
         self.send_server_hello()?;
         self.send_certificate();
+        // RFC 6066 §8: `CertificateStatus` (type 22) is sent right after
+        // `Certificate`, before `ServerKeyExchange`. We only get here when
+        // we echoed `status_request` in SH (gated on both peer offer and
+        // configured staple), so emit the staple unconditionally now.
+        if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
+            self.send_certificate_status();
+        }
         self.send_server_key_exchange()?;
         if self.config.client_auth.is_some() {
             self.send_certificate_request();
@@ -1061,6 +1100,12 @@ impl<R: RngCore> ServerConnection12<R> {
         if self.peer_offered_session_ticket && !self.resumed && self.config.ticket_key.is_some() {
             extensions.push(ext::session_ticket(&[]));
         }
+        // RFC 6066 §8: echo an empty `status_request` in SH only when the
+        // client offered it AND we have a staple to emit, since the echo
+        // commits us to follow with a `CertificateStatus` handshake message.
+        if self.peer_offered_ocsp_staple && self.config.stapled_ocsp_response.is_some() {
+            extensions.push(ext::status_request_sh_ack());
+        }
 
         let sh = ServerHello {
             random: sr,
@@ -1085,6 +1130,24 @@ impl<R: RngCore> ServerConnection12<R> {
                 }
             });
         });
+        self.transcript.update(&msg);
+        self.write_plain_record(ContentType::Handshake, &msg);
+    }
+
+    /// RFC 6066 §8: emit a `CertificateStatus` handshake message carrying the
+    /// stapled OCSP response. Called right after `send_certificate`. The
+    /// caller is expected to have echoed an empty `status_request` in SH and
+    /// ensured `peer_offered_ocsp_staple && config.stapled_ocsp_response`
+    /// holds.
+    fn send_certificate_status(&mut self) {
+        let ocsp = self
+            .config
+            .stapled_ocsp_response
+            .as_ref()
+            .expect("stapled OCSP response must be set");
+        let body = ext::certificate_status_ocsp(ocsp);
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_STATUS];
+        with_len_u24(&mut msg, |b| b.extend_from_slice(&body));
         self.transcript.update(&msg);
         self.write_plain_record(ContentType::Handshake, &msg);
     }
@@ -1575,6 +1638,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
+        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }

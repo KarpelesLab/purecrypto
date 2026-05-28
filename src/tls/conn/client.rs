@@ -368,6 +368,11 @@ pub struct ClientConnection {
     /// Per-connection CRL store populated from the leaf's stapled
     /// `CRL_RESPONSE` extension. Empty when the server doesn't staple.
     stapled_crls: crate::tls::pki::CrlStore,
+    /// RFC 6066 §8 + RFC 8446 §4.4.2.1: the OCSP response stapled on the
+    /// leaf's per-cert `status_request` extension. Validated against the
+    /// chain in `on_certificate_verify`; `None` when the server didn't
+    /// staple.
+    peer_ocsp_response: Option<Vec<u8>>,
     leaf_key: Option<AnyPublicKey>,
 
     /// Most recent `NewSessionTicket` from the peer (RFC 8446 §4.6.1). Real
@@ -514,6 +519,15 @@ impl ClientConnection {
     /// the server's `Certificate` message has been received.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
+    }
+
+    /// DER bytes of the OCSP response stapled by the peer on the leaf
+    /// `CertificateEntry`'s per-cert `status_request` extension (RFC 6066
+    /// §8 + RFC 8446 §4.4.2.1). Already validated against the chain when
+    /// `verify_certificates` was enabled. `None` when the server did not
+    /// staple.
+    pub fn peer_ocsp_response(&self) -> Option<&[u8]> {
+        self.peer_ocsp_response.as_deref()
     }
 
     /// The most recent `NewSessionTicket` received from the server, if any.
@@ -819,6 +833,7 @@ impl ClientConnection {
             exporter_secret: None,
             cert_chain: Vec::new(),
             stapled_crls: crate::tls::pki::CrlStore::new(),
+            peer_ocsp_response: None,
             leaf_key: None,
             last_ticket: None,
             alpn_negotiated: None,
@@ -970,6 +985,11 @@ impl ClientConnection {
         if let Some(limit) = self.config.record_size_limit {
             extensions.push(ext::record_size_limit(limit));
         }
+        // RFC 6066 §8: opt into OCSP stapling. We advertise unconditionally;
+        // the server stapes only if it has a response provisioned, and on
+        // TLS 1.3 the staple rides in the leaf `CertificateEntry`'s per-cert
+        // `status_request` extension (RFC 8446 §4.4.2.1).
+        extensions.push(ext::status_request_ocsp());
         extensions.extend_from_slice(extra_extensions);
 
         // RFC 9001 §8.2: in QUIC mode the ClientHello carries
@@ -1672,20 +1692,31 @@ impl ClientConnection {
             return Err(Error::BadCertificate);
         }
         // The TLS 1.3 `Certificate` message carries per-cert extensions
-        // (RFC 8446 §4.4.2). The only one we recognize is the
-        // purecrypto-private CRL_RESPONSE staple on the leaf entry.
+        // (RFC 8446 §4.4.2). We recognise two on the leaf entry: the
+        // RFC 6066 §8 `status_request` (stapled OCSP response) and the
+        // purecrypto-private `CRL_RESPONSE` staple.
         let mut stapled = crate::tls::pki::CrlStore::new();
-        if let Some((_leaf, exts)) = entries.first()
-            && let Some((_, data)) = exts
-                .iter()
-                .find(|(ty, _)| *ty == crate::tls::codec::ExtensionType::CRL_RESPONSE)
-        {
-            // Best-effort: add_der enforces wire-format well-formedness;
-            // a malformed staple is dropped silently rather than failing
-            // the handshake, since stapling is purely advisory.
-            let _ = stapled.add_der(data.clone());
+        let mut stapled_ocsp: Option<Vec<u8>> = None;
+        if let Some((_leaf, exts)) = entries.first() {
+            for (ty, data) in exts.iter() {
+                if *ty == crate::tls::codec::ExtensionType::CRL_RESPONSE {
+                    // Best-effort: `add_der` enforces wire-format
+                    // well-formedness; a malformed staple is dropped silently
+                    // since stapling is purely advisory.
+                    let _ = stapled.add_der(data.clone());
+                } else if *ty == crate::tls::codec::ExtensionType::STATUS_REQUEST {
+                    // RFC 8446 §4.4.2.1: the leaf's `status_request`
+                    // extension body is the RFC 6066 `CertificateStatus`
+                    // shape (u8 status_type ‖ u24-len response). Decode lazily;
+                    // a malformed body fails the handshake.
+                    let ocsp = ext::parse_certificate_status(data)
+                        .map_err(|_| Error::OcspResponseInvalid)?;
+                    stapled_ocsp = Some(ocsp);
+                }
+            }
         }
         self.stapled_crls = stapled;
+        self.peer_ocsp_response = stapled_ocsp;
         self.cert_chain = entries.into_iter().map(|(c, _)| c).collect();
         self.core.transcript.update(raw);
         self.state = State::WaitCertificateVerify;
@@ -1734,6 +1765,29 @@ impl ClientConnection {
                 &self.config.signature_policy,
             )?;
             verify_hostname(&leaf, &self.server_name)?;
+            // RFC 6066 §8 / RFC 6960: a stapled OCSP response is only
+            // meaningful once the chain is trusted. Validate now against the
+            // issuer; reject `revoked` or `unknown` outright.
+            if let Some(ocsp) = self.peer_ocsp_response.as_deref()
+                && self.cert_chain.len() >= 2
+            {
+                let issuer = Certificate::from_der(self.cert_chain[1].clone())
+                    .map_err(|_| Error::BadCertificate)?;
+                let resp = crate::x509::OcspResponse::from_der(ocsp.to_vec())
+                    .map_err(|_| Error::OcspResponseInvalid)?;
+                match resp
+                    .check_for_cert(&leaf, &issuer, now.as_ref())
+                    .map_err(|_| Error::OcspResponseInvalid)?
+                {
+                    crate::x509::OcspCertStatus::Good => {}
+                    crate::x509::OcspCertStatus::Revoked { .. } => {
+                        return Err(Error::CertificateRevoked);
+                    }
+                    crate::x509::OcspCertStatus::Unknown => {
+                        return Err(Error::OcspResponseInvalid);
+                    }
+                }
+            }
             key
         } else {
             leaf.subject_public_key()
@@ -1986,6 +2040,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
+        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }

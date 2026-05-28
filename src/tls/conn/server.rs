@@ -179,6 +179,14 @@ pub(crate) struct ServerConfig {
     /// revocation. TLS 1.2 has no per-cert extension list in `Certificate`,
     /// so stapling is silently dropped for TLS 1.2 servers.
     stapled_crl: Option<Vec<u8>>,
+    /// Optional DER-encoded OCSP response stapled to the leaf cert. On
+    /// TLS 1.3 this rides in the leaf `CertificateEntry`'s per-cert
+    /// `status_request` extension (RFC 8446 §4.4.2.1); on TLS 1.2 the
+    /// equivalent `ServerConfig12` field is emitted as a stand-alone
+    /// `CertificateStatus` handshake message (RFC 6066 §8). Honoured
+    /// only when the client advertised `status_request` in its
+    /// `ClientHello`.
+    stapled_ocsp_response: Option<Vec<u8>>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
@@ -201,6 +209,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -222,6 +231,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -243,6 +253,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -264,6 +275,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -285,6 +297,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -306,6 +319,7 @@ impl ServerConfig {
             signature_policy: SignaturePolicy::modern(),
             crls: crate::tls::pki::CrlStore::new(),
             stapled_crl: None,
+            stapled_ocsp_response: None,
             key_log: None,
         }
     }
@@ -334,6 +348,17 @@ impl ServerConfig {
     /// list in its `Certificate` message; stapling is a TLS-1.3-only feature.
     pub fn with_stapled_crl(mut self, crl_der: Vec<u8>) -> Self {
         self.stapled_crl = Some(crl_der);
+        self
+    }
+
+    /// Staples `ocsp_der` (a DER-encoded RFC 6960 `OCSPResponse`) to the
+    /// leaf cert. On TLS 1.3 it rides in the leaf `CertificateEntry`'s
+    /// per-cert `status_request` extension (RFC 8446 §4.4.2.1). Emitted
+    /// only when the client advertised `status_request` in its
+    /// `ClientHello` (RFC 6066 §8); the bytes themselves are passed
+    /// through unparsed by this layer.
+    pub fn with_stapled_ocsp_response(mut self, ocsp_der: Vec<u8>) -> Self {
+        self.stapled_ocsp_response = Some(ocsp_der);
         self
     }
 
@@ -499,6 +524,12 @@ pub struct ServerConnection<R: RngCore> {
     /// Used to enforce the RFC 9001 §8.2 "at most once" rule on top of the
     /// existing TLS extension-uniqueness check.
     peer_quic_params_seen: bool,
+    /// Whether the client advertised `status_request` (OCSP stapling, RFC
+    /// 6066 §8) in its `ClientHello`. Gates emission of the per-cert
+    /// `status_request` extension on the leaf `CertificateEntry`
+    /// (RFC 8446 §4.4.2.1); takes effect only when `config.stapled_ocsp_response`
+    /// is also set.
+    peer_offered_ocsp_staple: bool,
 }
 
 impl<R: RngCore> ServerConnection<R> {
@@ -564,6 +595,7 @@ impl<R: RngCore> ServerConnection<R> {
             engine_mode,
             hooks,
             peer_quic_params_seen: false,
+            peer_offered_ocsp_staple: false,
         }
     }
 
@@ -1044,6 +1076,14 @@ impl<R: RngCore> ServerConnection<R> {
             self.core.set_peer_record_size_limit(limit);
         }
 
+        // RFC 6066 §8: detect OCSP-stapling opt-in. We accept the body
+        // shape unconditionally and remember the offer; emission of the
+        // staple is gated on `config.stapled_ocsp_response` being set.
+        if let Some(sr_body) = ext::find(&ch.extensions, ExtensionType::STATUS_REQUEST) {
+            ext::parse_status_request(sr_body)?;
+            self.peer_offered_ocsp_staple = true;
+        }
+
         // RFC 9001 §8.2: in QUIC mode the client's transport parameters
         // ride in the ClientHello as extension 0x0039. Hand the opaque
         // body to the QUIC layer verbatim; reject duplicates per the
@@ -1410,9 +1450,20 @@ impl<R: RngCore> ServerConnection<R> {
                 for (i, cert) in self.config.cert_chain.iter().enumerate() {
                     with_len_u24(list, |c| c.extend_from_slice(cert));
                     // Per-certificate extensions: only the leaf (i == 0)
-                    // ever carries any. Today the sole opt-in extension is
-                    // the purecrypto-private CRL_RESPONSE staple.
+                    // ever carries any. Two opt-in extensions today: the
+                    // RFC 6066 §8 `status_request` carrying a stapled OCSP
+                    // response (emitted only when the client offered the
+                    // extension), and the purecrypto-private CRL_RESPONSE
+                    // staple.
                     with_len_u16(list, |b| {
+                        if i == 0
+                            && self.peer_offered_ocsp_staple
+                            && let Some(ocsp) = &self.config.stapled_ocsp_response
+                        {
+                            let body = ext::certificate_status_ocsp(ocsp);
+                            crate::tls::codec::put_u16(b, ExtensionType::STATUS_REQUEST.0);
+                            crate::tls::codec::with_len_u16(b, |bb| bb.extend_from_slice(&body));
+                        }
                         if i == 0
                             && let Some(crl) = &self.config.stapled_crl
                         {
@@ -1921,6 +1972,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
+        Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }

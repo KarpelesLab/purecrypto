@@ -113,6 +113,15 @@ u16_id!(
     ExtensionType {
         /// server_name (SNI).
         SERVER_NAME = 0x0000,
+        /// status_request (OCSP stapling — RFC 6066 §8). In ClientHello, an
+        /// empty-ish body (`status_type=1, responder_id_list=[], request_extensions=[]`)
+        /// opts the client into stapling. In TLS 1.2 ServerHello, an empty
+        /// body signals the server will staple via a subsequent
+        /// `CertificateStatus` handshake message (RFC 6066). In TLS 1.3, the
+        /// staple is carried as a per-certificate extension on the leaf
+        /// CertificateEntry with body equal to the RFC 6066
+        /// `CertificateStatus` struct (RFC 8446 §4.4.2.1).
+        STATUS_REQUEST = 0x0005,
         /// supported_groups.
         SUPPORTED_GROUPS = 0x000a,
         /// ec_point_formats (RFC 4492 §5.1.2). TLS 1.2 ECDHE peers require

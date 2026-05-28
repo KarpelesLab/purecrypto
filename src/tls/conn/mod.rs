@@ -2485,6 +2485,138 @@ mod loopback_tests {
         assert!(!client.is_handshaking());
         assert!(!server.is_handshaking());
     }
+
+    /// Server staples a `good` OCSP response for the leaf's serial → handshake
+    /// completes and the client surfaces the response via
+    /// [`ClientConnection::peer_ocsp_response`].
+    #[test]
+    fn stapled_ocsp_good() {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &root,
+            Time::utc(2026, 4, 1, 0, 0, 0),
+            Some(Time::utc(2026, 6, 1, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&ca_signer)
+        .unwrap();
+        let der = resp.to_der().to_vec();
+        server_config = server_config.with_stapled_ocsp_response(der.clone());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-good-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ocsp-good-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(client.peer_ocsp_response().map(|v| v.to_vec()), Some(der));
+    }
+
+    /// Server staples a `revoked` OCSP response → client rejects with
+    /// `CertificateRevoked`.
+    #[test]
+    fn stapled_ocsp_revoked() {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        let resp = OcspResponseBuilder::revoked(
+            &leaf,
+            &root,
+            Time::utc(2026, 4, 1, 0, 0, 0),
+            Some(Time::utc(2026, 6, 1, 0, 0, 0)),
+            Time::utc(2026, 3, 15, 0, 0, 0),
+            None,
+        )
+        .unwrap()
+        .sign(&ca_signer)
+        .unwrap();
+        server_config = server_config.with_stapled_ocsp_response(resp.to_der().to_vec());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-rev-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ocsp-rev-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::CertificateRevoked
+        );
+    }
+
+    /// Server staples an OCSP response whose `nextUpdate` is in the past →
+    /// client rejects with `OcspResponseInvalid`.
+    #[test]
+    fn stapled_ocsp_expired_rejected() {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
+        let ca_signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        // thisUpdate / nextUpdate well in the past relative to the client's
+        // verification clock at 2026-05-01.
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &root,
+            Time::utc(2025, 1, 1, 0, 0, 0),
+            Some(Time::utc(2025, 2, 1, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&ca_signer)
+        .unwrap();
+        server_config = server_config.with_stapled_ocsp_response(resp.to_der().to_vec());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots);
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ocsp-exp-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ocsp-exp-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::OcspResponseInvalid
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3989,6 +4121,154 @@ mod tls12_loopback_tests {
         assert!(!client2.is_handshaking() && !server2.is_handshaking());
         assert!(client2.did_resume() && server2.did_resume());
         assert!(!client2.ems_negotiated() && !server2.ems_negotiated());
+    }
+
+    /// An RSA-CA-signed P-256 leaf, returning the server config (chain
+    /// already installed), the root DER (for the client's trust store), and
+    /// the leaf DER. Used to drive the OCSP-staple tests below, which
+    /// require a real two-cert chain so the validator has a separate issuer
+    /// to recover.
+    #[allow(clippy::type_complexity)]
+    fn ca_signed_ecdsa_leaf_12() -> (ServerConfig12, Vec<u8>, Vec<u8>) {
+        let ca_key = rsa_test_key_a();
+        let ca_name = DistinguishedName::common_name("Stapling12 Test CA");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let root = Certificate::self_signed(&ca_key, &ca_name, &validity, 1, true).unwrap();
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"stapling12-leaf", b"nonce", &[]);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf = Certificate::issue_general(
+            &CertSigner::Rsa(&BoxedRsaPrivateKey::from_pkcs1_der(&ca_key.to_pkcs1_der()).unwrap()),
+            &ca_name,
+            &DistinguishedName::common_name("loopback.example"),
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity,
+            7,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), root.to_der().to_vec()];
+        let cfg = ServerConfig12::with_ecdsa(chain, leaf_key);
+        (cfg, root.to_der().to_vec(), leaf.to_der().to_vec())
+    }
+
+    fn drive_until_client_error_12(
+        client: &mut ClientConnection12,
+        server: &mut ServerConnection12<HmacDrbg<Sha256>>,
+    ) -> crate::tls::Error {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                let _ = server.process_new_packets();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                if let Err(e) = client.process_new_packets() {
+                    return e;
+                }
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        panic!("client did not error");
+    }
+
+    /// TLS 1.2: server staples a `good` OCSP response — handshake completes
+    /// and the client surfaces the response via `peer_ocsp_response`.
+    #[test]
+    fn tls12_stapled_ocsp_good() {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der) = ca_signed_ecdsa_leaf_12();
+        let ca_signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &root,
+            Time::utc(2026, 4, 1, 0, 0, 0),
+            Some(Time::utc(2026, 6, 1, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&ca_signer)
+        .unwrap();
+        let der = resp.to_der().to_vec();
+        server_config = server_config.with_stapled_ocsp_response(der.clone());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut cfg = ClientConfig12::new(roots);
+        cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-good-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-good-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(client.peer_ocsp_response().map(|v| v.to_vec()), Some(der));
+    }
+
+    /// TLS 1.2: server staples a `revoked` OCSP response → client rejects
+    /// with `CertificateRevoked`.
+    #[test]
+    fn tls12_stapled_ocsp_revoked() {
+        use crate::x509::OcspResponseBuilder;
+        let (mut server_config, root_der, leaf_der) = ca_signed_ecdsa_leaf_12();
+        let ca_signer = CertSigner::Rsa(
+            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
+        );
+        let leaf = Certificate::from_der(leaf_der).unwrap();
+        let root = Certificate::from_der(root_der.clone()).unwrap();
+        let resp = OcspResponseBuilder::revoked(
+            &leaf,
+            &root,
+            Time::utc(2026, 4, 1, 0, 0, 0),
+            Some(Time::utc(2026, 6, 1, 0, 0, 0)),
+            Time::utc(2026, 3, 15, 0, 0, 0),
+            None,
+        )
+        .unwrap()
+        .sign(&ca_signer)
+        .unwrap();
+        server_config = server_config.with_stapled_ocsp_response(resp.to_der().to_vec());
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut cfg = ClientConfig12::new(roots);
+        cfg.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-rev-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"tls12-ocsp-rev-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection12::new(server_config, srng);
+        assert_eq!(
+            drive_until_client_error_12(&mut client, &mut server),
+            crate::tls::Error::CertificateRevoked
+        );
     }
 }
 
