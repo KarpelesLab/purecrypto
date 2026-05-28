@@ -1139,3 +1139,104 @@ fn decap_rejects_aad_mutation_outside_payload() {
         Err(Error::EchDecryptionFailed)
     ));
 }
+
+#[test]
+fn full_ech_round_trip_seal_decap_and_accept_signal() {
+    // This integration test exercises the seal + decap pipeline in
+    // wave 3a together with the accept-signal helpers from wave 1 —
+    // i.e. everything Phase 5 needs at the cryptographic layer,
+    // wired in the order the connection state machines will use.
+    //
+    // Mocks (not yet covered): the handshake_secret (here a fixed
+    // test value, in reality the inner-transcript handshake secret),
+    // the inner CH carrying real extensions (here we use the
+    // marker-only inner from `build_inner_ch_marker`).
+    let mut rng = drbg(b"phase5-e2e");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+    // === Client side: build inner CH, seal into outer CH ===
+    let inner_ch = build_inner_ch_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&config, sym, &inner_ch, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    // === Server side: decap to recover the inner CH ===
+    let recovered_inner = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
+    assert_eq!(recovered_inner, inner_ch);
+
+    // === Server side: build an SH with the accept signal patched in ===
+    // The "inner transcript" up to this point is just the inner CH bytes.
+    // The SH gets its random's tail zeroed before signal computation, then
+    // the signal is patched in.
+    let sh_random = [0x77u8; 32];
+    let sh_with_zero_tail_random = random_with_zero_tail(&sh_random);
+    // Compute transcript_hash over `(inner_ch || zero_tail_SH_bytes)`. We
+    // approximate the "zero-tail SH bytes" by just including the random:
+    // for a real handshake the transcript would include the SH wire
+    // bytes; this test uses the random alone since the rest is fixed.
+    let alg = HashAlg::Sha256;
+    let mut to_hash = inner_ch.clone();
+    to_hash.extend_from_slice(&sh_with_zero_tail_random);
+    let th = alg.hash(&to_hash);
+    let mock_handshake_secret = [0xABu8; 32];
+    let signal = server_hello_signal(alg, &mock_handshake_secret, th.as_slice());
+    let patched_random = patch_random_tail(&sh_random, &signal);
+    assert_eq!(random_tail(&patched_random), signal);
+
+    // === Client side: recompute the expected signal and compare ===
+    // Same inputs in the inner transcript → same signal expected.
+    let mut client_hash_input = inner_ch.clone();
+    client_hash_input.extend_from_slice(&random_with_zero_tail(&patched_random));
+    let client_th = alg.hash(&client_hash_input);
+    let expected = server_hello_signal(alg, &mock_handshake_secret, client_th.as_slice());
+    let received = random_tail(&patched_random);
+    assert!(signals_eq_ct(&expected, &received));
+
+    // === Negative: wrong handshake_secret → mismatch ===
+    let wrong_secret = [0xCDu8; 32];
+    let wrong_expected = server_hello_signal(alg, &wrong_secret, client_th.as_slice());
+    assert!(!signals_eq_ct(&wrong_expected, &received));
+}
+
+#[test]
+fn ech_rejected_retry_configs_round_trip_in_ee_body() {
+    // On ECH reject, the server's EE carries an `encrypted_client_hello`
+    // extension whose body is the wire ECHConfigList. The client surfaces
+    // those bytes via `Error::EchRejected(...)` for the caller to retry.
+    let list = EchConfigList::new(alloc::vec![sample_config()]);
+    let encoded = encode_retry_configs(&list);
+    let decoded = decode_retry_configs(&encoded).expect("decode");
+    assert_eq!(list.encode(), decoded.encode());
+
+    // The carrier path: the EE extension body is the encoded list
+    // verbatim; an `Error::EchRejected(bytes)` is constructed from
+    // those bytes and re-decoded on the other side of the API.
+    let err = Error::EchRejected(encoded.clone());
+    match err {
+        Error::EchRejected(bytes) => {
+            let again = decode_retry_configs(&bytes).expect("re-decode");
+            assert_eq!(again.encode(), list.encode());
+        }
+        _ => panic!("wrong variant"),
+    }
+}
