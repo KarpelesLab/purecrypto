@@ -337,6 +337,7 @@ pub struct ClientConnection {
 
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
+    p384: BoxedEcdhPrivateKey,
     mlkem: MlKem768DecapsKey,
 
     /// CH1 state retained for HelloRetryRequest replay (RFC 8446 §4.1.2):
@@ -697,6 +698,7 @@ impl ClientConnection {
                 NamedGroup::X25519MLKEM768,
                 NamedGroup::X25519,
                 NamedGroup::SECP256R1,
+                NamedGroup::SECP384R1,
             ],
         )
     }
@@ -777,6 +779,7 @@ impl ClientConnection {
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
+        let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
@@ -801,6 +804,7 @@ impl ClientConnection {
             state: State::WaitServerHello,
             x25519,
             p256,
+            p384,
             mlkem,
             client_random: random,
             offered_suites: effective_suites.clone(),
@@ -934,6 +938,9 @@ impl ClientConnection {
                 }
                 NamedGroup::SECP256R1 => {
                     key_shares.push((NamedGroup::SECP256R1, self.p256.public_key().to_sec1()))
+                }
+                NamedGroup::SECP384R1 => {
+                    key_shares.push((NamedGroup::SECP384R1, self.p384.public_key().to_sec1()))
                 }
                 NamedGroup::X25519MLKEM768 => {
                     // Client share: ML-KEM-768 encapsulation key ‖ X25519 key.
@@ -1494,6 +1501,15 @@ impl ClientConnection {
                     .map_err(|_| Error::Decode)?;
                 let shared = self
                     .p256
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok(Secret::new(&shared))
+            }
+            NamedGroup::SECP384R1 => {
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, server_pub)
+                    .map_err(|_| Error::Decode)?;
+                let shared = self
+                    .p384
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok(Secret::new(&shared))
@@ -2100,9 +2116,9 @@ mod tests {
         ] {
             assert!(ext::find(&ch.extensions, ty).is_some());
         }
-        // The key_share offers x25519mlkem768, x25519 and secp256r1.
+        // The key_share offers x25519mlkem768, x25519, secp256r1 and secp384r1.
         let ks = ext::find(&ch.extensions, ExtensionType::KEY_SHARE).unwrap();
-        assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 3);
+        assert_eq!(ext::parse_client_key_shares(ks).unwrap().len(), 4);
     }
 
     #[test]

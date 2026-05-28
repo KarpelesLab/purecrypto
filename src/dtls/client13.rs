@@ -135,6 +135,7 @@ impl ClientConfig13Internal {
                 NamedGroup::X25519MLKEM768,
                 NamedGroup::X25519,
                 NamedGroup::SECP256R1,
+                NamedGroup::SECP384R1,
             ],
             key_share_groups: None,
         }
@@ -213,11 +214,12 @@ pub struct DtlsClientConnection13 {
     /// at every epoch transition.
     read_replay: crate::dtls::replay::AntiReplayWindow,
 
-    /// Random + key material. All three keypairs are pre-generated so the
+    /// Random + key material. All four keypairs are pre-generated so the
     /// matching `key_share` is ready regardless of which group the server
     /// picks (or selects via HelloRetryRequest).
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
+    p384: BoxedEcdhPrivateKey,
     mlkem: MlKem768DecapsKey,
     client_random: Random,
     server_random: Option<Random>,
@@ -292,6 +294,7 @@ impl DtlsClientConnection13 {
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
+        let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
         let mut client_random: Random = [0u8; 32];
         rng.fill_bytes(&mut client_random);
@@ -312,6 +315,7 @@ impl DtlsClientConnection13 {
             read_replay: crate::dtls::replay::AntiReplayWindow::new(),
             x25519,
             p256,
+            p384,
             mlkem,
             client_random,
             server_random: None,
@@ -790,6 +794,15 @@ impl DtlsClientConnection13 {
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok(ss)
             }
+            NamedGroup::SECP384R1 => {
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, server_pub)
+                    .map_err(|_| Error::Decode)?;
+                let ss = self
+                    .p384
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok(ss)
+            }
             NamedGroup::X25519MLKEM768 => {
                 // Server share: ML-KEM ciphertext (1088) ‖ X25519 (32).
                 if server_pub.len() != CIPHERTEXT_BYTES + 32 {
@@ -1042,6 +1055,9 @@ impl DtlsClientConnection13 {
                 }
                 NamedGroup::SECP256R1 => {
                     key_shares.push((NamedGroup::SECP256R1, self.p256.public_key().to_sec1()))
+                }
+                NamedGroup::SECP384R1 => {
+                    key_shares.push((NamedGroup::SECP384R1, self.p384.public_key().to_sec1()))
                 }
                 NamedGroup::X25519MLKEM768 => {
                     // Client share: ML-KEM-768 encapsulation key ‖ X25519 key

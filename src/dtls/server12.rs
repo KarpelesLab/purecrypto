@@ -166,6 +166,9 @@ pub struct DtlsServerConnection12<R: RngCore> {
     /// Ephemeral P-256 ECDHE key, populated when [`Self::group`] is
     /// `SECP256R1`.
     p256: Option<BoxedEcdhPrivateKey>,
+    /// Ephemeral P-384 ECDHE key, populated when [`Self::group`] is
+    /// `SECP384R1`.
+    p384: Option<BoxedEcdhPrivateKey>,
 
     client_random: Option<Random>,
     server_random: Option<Random>,
@@ -223,6 +226,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             replay: AntiReplayWindow::new(),
             x25519: None,
             p256: None,
+            p384: None,
             client_random: None,
             server_random: None,
             suite: None,
@@ -538,6 +542,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             NamedGroup::X25519
         } else if groups.contains(&NamedGroup::SECP256R1) {
             NamedGroup::SECP256R1
+        } else if groups.contains(&NamedGroup::SECP384R1) {
+            NamedGroup::SECP384R1
         } else {
             return Err(Error::HandshakeFailure);
         };
@@ -581,6 +587,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
                 let pk = sk.public_key().to_sec1();
                 self.p256 = Some(sk);
+                pk
+            }
+            NamedGroup::SECP384R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P384, &mut self.rng);
+                let pk = sk.public_key().to_sec1();
+                self.p384 = Some(sk);
                 pk
             }
             _ => return Err(Error::HandshakeFailure),
@@ -776,6 +788,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             NamedGroup::SECP256R1 => {
                 let sk = self.p256.as_ref().ok_or(Error::InappropriateState)?;
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, &cke.point)
+                    .map_err(|_| Error::Decode)?;
+                sk.diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?
+            }
+            NamedGroup::SECP384R1 => {
+                let sk = self.p384.as_ref().ok_or(Error::InappropriateState)?;
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, &cke.point)
                     .map_err(|_| Error::Decode)?;
                 sk.diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?

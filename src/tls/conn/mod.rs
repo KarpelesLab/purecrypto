@@ -638,6 +638,13 @@ mod loopback_tests {
     }
 
     #[test]
+    fn secp384r1_aes128_sha256() {
+        // Pin SECP384R1 so the server is forced down the P-384 ECDHE arm
+        // and the client's `key_agreement` resolves the P-384 share.
+        run(&[CipherSuite::AES_128_GCM_SHA256], &[NamedGroup::SECP384R1]);
+    }
+
+    #[test]
     fn x25519_chacha20poly1305_sha256() {
         run(
             &[CipherSuite::CHACHA20_POLY1305_SHA256],
@@ -2655,6 +2662,17 @@ mod tls12_loopback_tests {
             rsa_server12(),
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
             &[NamedGroup::SECP256R1],
+        );
+    }
+
+    #[test]
+    fn tls12_secp384r1_with_rsa_cert() {
+        // Pin SECP384R1: both sides resolve to the P-384 arm of `ecdhe`
+        // and `send_server_key_exchange` end-to-end.
+        run_with(
+            rsa_server12(),
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::SECP384R1],
         );
     }
 

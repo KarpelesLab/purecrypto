@@ -859,6 +859,35 @@ mod dtls13 {
         assert_eq!(server.take_received(), b"ping-p256");
     }
 
+    /// Multi-group negotiation: the client offers only SECP384R1, so
+    /// both sides resolve to the P-384 ECDHE arm in DTLS 1.3.
+    #[test]
+    fn negotiates_p384() {
+        use crate::tls::codec::NamedGroup;
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert.clone()).unwrap();
+        let mut client_cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        client_cfg.groups = alloc::vec![NamedGroup::SECP384R1];
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-cl-p384", b"nonce", &[]);
+        let mut client =
+            DtlsClientConnection13::new(client_cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-srv-p384", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        client.send(b"ping-p384").unwrap();
+        let c = client.pop_outbound_datagrams();
+        for dg in &c {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping-p384");
+    }
+
     /// Multi-group negotiation: the X25519+ML-KEM-768 hybrid
     /// (draft-ietf-tls-ecdhe-mlkem). Client offers only the hybrid; the
     /// server encapsulates against the client's ML-KEM key and the

@@ -1222,6 +1222,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok((sk.public_key().to_sec1(), ss))
             }
+            NamedGroup::SECP384R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P384, &mut self.rng);
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, client_pub)
+                    .map_err(|_| Error::Decode)?;
+                let ss = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((sk.public_key().to_sec1(), ss))
+            }
             NamedGroup::X25519MLKEM768 => {
                 // Client share: ML-KEM-768 encapsulation key (1184) ‖ X25519 (32).
                 if client_pub.len() != ENCAPS_KEY_BYTES + 32 {
@@ -1258,11 +1267,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
 /// Server-side group preference order, in descending preference. Mirrors
 /// the TLS layer's preference at `src/tls/conn/server.rs:1106-1118`.
-fn supported_server_groups() -> [NamedGroup; 3] {
+fn supported_server_groups() -> [NamedGroup; 4] {
     [
         NamedGroup::X25519MLKEM768,
         NamedGroup::X25519,
         NamedGroup::SECP256R1,
+        NamedGroup::SECP384R1,
     ]
 }
 

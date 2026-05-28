@@ -1112,7 +1112,10 @@ impl<R: RngCore> ServerConnection<R> {
             .find(|(g, _)| {
                 matches!(
                     *g,
-                    NamedGroup::X25519MLKEM768 | NamedGroup::X25519 | NamedGroup::SECP256R1
+                    NamedGroup::X25519MLKEM768
+                        | NamedGroup::X25519
+                        | NamedGroup::SECP256R1
+                        | NamedGroup::SECP384R1
                 )
             })
             .ok_or(Error::HandshakeFailure)?;
@@ -1299,6 +1302,15 @@ impl<R: RngCore> ServerConnection<R> {
             NamedGroup::SECP256R1 => {
                 let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, client_pub)
+                    .map_err(|_| Error::Decode)?;
+                let shared = sk
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((sk.public_key().to_sec1(), Secret::new(&shared)))
+            }
+            NamedGroup::SECP384R1 => {
+                let sk = BoxedEcdhPrivateKey::generate(CurveId::P384, &mut self.rng);
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, client_pub)
                     .map_err(|_| Error::Decode)?;
                 let shared = sk
                     .diffie_hellman(&peer)

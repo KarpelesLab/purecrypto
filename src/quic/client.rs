@@ -70,7 +70,11 @@ pub(crate) fn build_tls_engine(
         CipherSuite::AES_256_GCM_SHA384,
         CipherSuite::CHACHA20_POLY1305_SHA256,
     ];
-    let groups = [NamedGroup::X25519, NamedGroup::SECP256R1];
+    let groups = [
+        NamedGroup::X25519,
+        NamedGroup::SECP256R1,
+        NamedGroup::SECP384R1,
+    ];
 
     let mut rng = OsRng;
     let engine = ClientConnection::new_for_quic(

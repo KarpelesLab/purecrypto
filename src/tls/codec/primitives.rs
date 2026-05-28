@@ -51,6 +51,9 @@ u16_id!(
     NamedGroup {
         /// secp256r1 (NIST P-256).
         SECP256R1 = 0x0017,
+        /// secp384r1 (NIST P-384). Slower than the other curves we
+        /// support, so offered after X25519 and SECP256R1 by default.
+        SECP384R1 = 0x0018,
         /// x25519.
         X25519 = 0x001d,
         /// X25519MLKEM768 hybrid (draft-ietf-tls-ecdhe-mlkem): ML-KEM-768

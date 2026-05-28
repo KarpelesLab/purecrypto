@@ -426,6 +426,8 @@ pub struct ClientConnection12 {
     x25519: X25519PrivateKey,
     /// Ephemeral P-256 ECDH private key (used when the server picks SECP256R1).
     p256: BoxedEcdhPrivateKey,
+    /// Ephemeral P-384 ECDH private key (used when the server picks SECP384R1).
+    p384: BoxedEcdhPrivateKey,
 
     /// Our handshake randoms (sent in CH, echoed by SH).
     client_random: Random,
@@ -502,7 +504,11 @@ impl ClientConnection12 {
             server_name,
             rng,
             &SUITES_12.iter().map(|p| p.suite).collect::<Vec<_>>(),
-            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            &[
+                NamedGroup::X25519,
+                NamedGroup::SECP256R1,
+                NamedGroup::SECP384R1,
+            ],
         )
     }
 
@@ -518,6 +524,7 @@ impl ClientConnection12 {
     ) -> Self {
         let x25519 = X25519PrivateKey::generate(rng);
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
+        let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
 
@@ -540,6 +547,7 @@ impl ClientConnection12 {
             ccs_received: false,
             x25519,
             p256,
+            p384,
             client_random: random,
             server_random: None,
             offered_suites: offered_suites.clone(),
@@ -1515,6 +1523,15 @@ impl ClientConnection12 {
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
                 Ok((ss, self.p256.public_key().to_sec1()))
+            }
+            NamedGroup::SECP384R1 => {
+                let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, peer_point)
+                    .map_err(|_| Error::Decode)?;
+                let ss = self
+                    .p384
+                    .diffie_hellman(&peer)
+                    .map_err(|_| Error::PeerMisbehaved)?;
+                Ok((ss, self.p384.public_key().to_sec1()))
             }
             _ => Err(Error::HandshakeFailure),
         }

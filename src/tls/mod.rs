@@ -14,7 +14,8 @@
 //! **Cipher suites** — TLS 1.3: `TLS_AES_128_GCM_SHA256`,
 //! `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`. TLS 1.2:
 //! ECDHE with the same three AEAD suites per RFC 7905 (no CBC, no RC4).
-//! **Key exchange** — X25519, secp256r1, secp384r1, secp521r1.
+//! **Key exchange** — X25519, secp256r1, secp384r1, plus the
+//! X25519MLKEM768 PQ-hybrid group (draft-ietf-tls-ecdhe-mlkem).
 //! **Signature schemes** — ECDSA (P-256/P-384/P-521), Ed25519, RSA-PSS,
 //! RSA-PKCS1 (TLS 1.2 only), plus ML-DSA in TLS 1.3.
 //!
