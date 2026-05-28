@@ -16,12 +16,16 @@ use super::config::{
 use super::extension::{EchExtension, zero_payload};
 use super::grease::{GreaseConfigIdStrategy, GreaseParams};
 use super::hpke_setup::{ech_info, map_kem, map_sym_suite};
-use super::inner::inner_extension_body;
+use super::inner::{
+    compress_extensions, decode_outer_extensions, decompress_extensions, encode_outer_extensions,
+    inner_extension_body,
+};
 use super::keys::{EchKeyPair, EchKeyRing};
 use super::retry::{decode_retry_configs, encode_retry_configs};
 use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
 use crate::rng::HmacDrbg;
 use crate::tls::Error;
+use crate::tls::codec::ExtensionType;
 use crate::tls::crypto::HashAlg;
 use alloc::vec::Vec;
 
@@ -558,4 +562,254 @@ fn ech_config_list_supports_first_supported_when_first_is_unknown() {
     let list = EchConfigList::new(alloc::vec![unknown, supported]);
     let first = list.first_supported().expect("a supported entry");
     assert_eq!(first.version, ECH_VERSION_DRAFT_22);
+}
+
+// ---------------------------------------------------------------------
+// ech_outer_extensions codec (inner.rs) — compression / decompression
+// round-trips plus the draft §5.1 fatal-decompression-error matrix.
+// ---------------------------------------------------------------------
+
+fn ext(t: ExtensionType, body: &[u8]) -> (ExtensionType, Vec<u8>) {
+    (t, body.to_vec())
+}
+
+#[test]
+fn outer_extensions_body_roundtrip() {
+    let types = [
+        ExtensionType::SUPPORTED_GROUPS,
+        ExtensionType::KEY_SHARE,
+        ExtensionType::SUPPORTED_VERSIONS,
+    ];
+    let body = encode_outer_extensions(&types);
+    let decoded = decode_outer_extensions(&body).expect("decode");
+    assert_eq!(decoded, types);
+    // Wire shape: 1-byte length prefix of len = N*2, followed by N u16s.
+    assert_eq!(body[0] as usize, types.len() * 2);
+    assert_eq!(body.len(), 1 + types.len() * 2);
+}
+
+#[test]
+fn outer_extensions_body_rejects_malformed() {
+    // Empty body.
+    assert!(matches!(
+        decode_outer_extensions(&[]),
+        Err(Error::EchDecodeError)
+    ));
+    // Length byte mismatch.
+    assert!(matches!(
+        decode_outer_extensions(&[0x04, 0x00, 0x0a]),
+        Err(Error::EchDecodeError)
+    ));
+    // Odd length not divisible by 2.
+    assert!(matches!(
+        decode_outer_extensions(&[0x03, 0x00, 0x0a, 0x00]),
+        Err(Error::EchDecodeError)
+    ));
+    // Empty list (length 0) — must reference at least one type per draft.
+    assert!(matches!(
+        decode_outer_extensions(&[0x00]),
+        Err(Error::EchDecodeError)
+    ));
+    // Trailing bytes after declared length.
+    assert!(matches!(
+        decode_outer_extensions(&[0x02, 0x00, 0x0a, 0xff]),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn compress_then_decompress_yields_canonical() {
+    let outer = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"public.example"),
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d]),
+        ext(
+            ExtensionType::SIGNATURE_ALGORITHMS,
+            &[0x00, 0x02, 0x08, 0x07]
+        ),
+        ext(ExtensionType::KEY_SHARE, &[0x00, 0x00]),
+        ext(ExtensionType::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]),
+    ];
+    let canonical_inner = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"secret.example"),
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x02, 0x00, 0x1d]),
+        ext(
+            ExtensionType::SIGNATURE_ALGORITHMS,
+            &[0x00, 0x02, 0x08, 0x07]
+        ),
+        ext(ExtensionType::KEY_SHARE, &[0x00, 0x00]),
+        ext(ExtensionType::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]),
+        (
+            ExtensionType::ENCRYPTED_CLIENT_HELLO,
+            inner_extension_body()
+        ),
+    ];
+    let share = [
+        ExtensionType::SUPPORTED_GROUPS,
+        ExtensionType::SIGNATURE_ALGORITHMS,
+        ExtensionType::KEY_SHARE,
+        ExtensionType::SUPPORTED_VERSIONS,
+    ];
+    let compressed = compress_extensions(&canonical_inner, &outer, &share).expect("compress");
+    // The compressed list keeps the SNI (unique to inner), then the
+    // single placeholder, then the inner ECH marker.
+    assert_eq!(compressed.len(), 3);
+    assert_eq!(compressed[0].0, ExtensionType::SERVER_NAME);
+    assert_eq!(compressed[1].0, ExtensionType::ECH_OUTER_EXTENSIONS);
+    assert_eq!(compressed[2].0, ExtensionType::ENCRYPTED_CLIENT_HELLO);
+    let decompressed = decompress_extensions(&compressed, &outer).expect("decompress");
+    assert_eq!(decompressed, canonical_inner);
+}
+
+#[test]
+fn compress_empty_share_is_identity() {
+    let outer = alloc::vec![ext(ExtensionType::SERVER_NAME, b"public.example")];
+    let canonical = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"secret.example"),
+        (
+            ExtensionType::ENCRYPTED_CLIENT_HELLO,
+            inner_extension_body()
+        ),
+    ];
+    let out = compress_extensions(&canonical, &outer, &[]).expect("identity");
+    assert_eq!(out, canonical);
+}
+
+#[test]
+fn compress_rejects_duplicate_share_types() {
+    let outer = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00]),
+        ext(ExtensionType::KEY_SHARE, &[0x00]),
+    ];
+    let canonical = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00]),
+        ext(ExtensionType::KEY_SHARE, &[0x00]),
+    ];
+    let share = [
+        ExtensionType::SUPPORTED_GROUPS,
+        ExtensionType::KEY_SHARE,
+        ExtensionType::SUPPORTED_GROUPS,
+    ];
+    assert!(matches!(
+        compress_extensions(&canonical, &outer, &share),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn compress_rejects_reserved_share_types() {
+    let outer = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    let canonical = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    let share_a = [ExtensionType::ECH_OUTER_EXTENSIONS];
+    let share_b = [ExtensionType::ENCRYPTED_CLIENT_HELLO];
+    assert!(matches!(
+        compress_extensions(&canonical, &outer, &share_a),
+        Err(Error::EchDecodeError)
+    ));
+    assert!(matches!(
+        compress_extensions(&canonical, &outer, &share_b),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn compress_rejects_when_share_block_not_contiguous_in_inner() {
+    let outer = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00]),
+        ext(ExtensionType::KEY_SHARE, &[0x00]),
+    ];
+    let canonical = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00]),
+        ext(ExtensionType::SERVER_NAME, b"x"),
+        ext(ExtensionType::KEY_SHARE, &[0x00]),
+    ];
+    // The share types appear in `canonical` but separated by SERVER_NAME,
+    // so no contiguous slice matches.
+    let share = [ExtensionType::SUPPORTED_GROUPS, ExtensionType::KEY_SHARE];
+    assert!(matches!(
+        compress_extensions(&canonical, &outer, &share),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn decompress_rejects_unknown_type_referenced() {
+    let outer = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    let compressed = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"x"),
+        (
+            ExtensionType::ECH_OUTER_EXTENSIONS,
+            encode_outer_extensions(&[ExtensionType::KEY_SHARE]),
+        ),
+    ];
+    assert!(matches!(
+        decompress_extensions(&compressed, &outer),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn decompress_rejects_wrong_order_in_outer() {
+    // Outer has KEY_SHARE then SUPPORTED_GROUPS; the placeholder asks
+    // for them in the opposite order. Per draft §5.1 the referenced
+    // outer extensions MUST appear in the order indicated.
+    let outer = alloc::vec![
+        ext(ExtensionType::KEY_SHARE, &[0x00]),
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00]),
+    ];
+    let compressed = alloc::vec![(
+        ExtensionType::ECH_OUTER_EXTENSIONS,
+        encode_outer_extensions(&[ExtensionType::SUPPORTED_GROUPS, ExtensionType::KEY_SHARE,]),
+    )];
+    assert!(matches!(
+        decompress_extensions(&compressed, &outer),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn decompress_rejects_multiple_placeholders() {
+    let outer = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    let compressed = alloc::vec![
+        (
+            ExtensionType::ECH_OUTER_EXTENSIONS,
+            encode_outer_extensions(&[ExtensionType::SUPPORTED_GROUPS]),
+        ),
+        (
+            ExtensionType::ECH_OUTER_EXTENSIONS,
+            encode_outer_extensions(&[ExtensionType::SUPPORTED_GROUPS]),
+        ),
+    ];
+    assert!(matches!(
+        decompress_extensions(&compressed, &outer),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn decompress_rejects_reserved_in_list() {
+    let outer = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    // Inner asks to substitute `encrypted_client_hello` from outer
+    // (which is not allowed). Encode the body by hand because the
+    // helper's validation would refuse to produce it.
+    let mut body = alloc::vec![2u8];
+    body.extend_from_slice(&ExtensionType::ENCRYPTED_CLIENT_HELLO.0.to_be_bytes());
+    let compressed = alloc::vec![(ExtensionType::ECH_OUTER_EXTENSIONS, body)];
+    assert!(matches!(
+        decompress_extensions(&compressed, &outer),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn decompress_passes_through_when_no_placeholder() {
+    let outer = alloc::vec![ext(ExtensionType::SUPPORTED_GROUPS, &[0x00])];
+    let compressed = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"secret.example"),
+        (
+            ExtensionType::ENCRYPTED_CLIENT_HELLO,
+            inner_extension_body()
+        ),
+    ];
+    let out = decompress_extensions(&compressed, &outer).expect("passthrough");
+    assert_eq!(out, compressed);
 }
