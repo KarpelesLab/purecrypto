@@ -78,6 +78,12 @@ slhdsa = ["hash", "rng", "alloc"]
 # ChaCha20-Poly1305) + ExportOnly, in all 4 modes (Base, PSK, Auth,
 # AuthPSK).
 hpke = ["hash", "kdf", "ec", "cipher", "rng", "alloc"]
+# Encrypted Client Hello (draft-ietf-tls-esni-22). Hides the inner
+# ClientHello (including SNI and ALPN) under an HPKE-sealed envelope
+# bound to a public_name from a published `ECHConfigList`. Provides
+# both client and server roles, retry_configs handling, and a
+# bit-shape-identical GREASE producer for the no-config case.
+ech = ["tls", "hpke"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher"]

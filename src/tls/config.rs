@@ -160,6 +160,26 @@ pub struct Config {
     /// RawPublicKey.
     pub expected_raw_public_keys: Vec<Vec<u8>>,
 
+    // ---- Encrypted Client Hello (draft-ietf-tls-esni-22) ----
+    /// Client-side ECH configuration. `None` (default) = no ECH and no
+    /// GREASE — the CH carries no `encrypted_client_hello` extension at
+    /// all. `Some(EchClient::default_grease())` emits a bit-shape
+    /// identical GREASE extension so the wire image is constant across
+    /// users. `Some(EchClient::from_config_list(list))` will, in a
+    /// follow-up, actually seal the inner CH against the published
+    /// `ECHConfigList` — for now this is stored but treated as GREASE
+    /// at the wire layer.
+    #[cfg(feature = "ech")]
+    pub ech: Option<super::ech::EchClient>,
+    /// Server-side ECH configuration. `None` (default) = no ECH. When
+    /// set, in a follow-up the server will attempt HPKE-decap on the
+    /// outer-CH `encrypted_client_hello` extension and, on success,
+    /// continue the handshake against the decrypted inner CH; on
+    /// failure it completes the outer handshake and emits
+    /// `retry_configs` in `EncryptedExtensions`.
+    #[cfg(feature = "ech")]
+    pub ech_server: Option<super::ech::EchServer>,
+
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
     /// the DTLS server = cookie exchange is skipped (test-only).
@@ -204,6 +224,10 @@ impl Default for Config {
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
             expected_raw_public_keys: Vec::new(),
+            #[cfg(feature = "ech")]
+            ech: None,
+            #[cfg(feature = "ech")]
+            ech_server: None,
             cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
@@ -440,6 +464,31 @@ impl ConfigBuilder {
     /// verification).
     pub fn verification_time(mut self, t: Time) -> Self {
         self.inner.verification_time = Some(t);
+        self
+    }
+
+    /// Client: install an Encrypted Client Hello configuration
+    /// (draft-ietf-tls-esni-22). Pass [`super::ech::EchClient::default_grease`]
+    /// for GREASE — a wire-shape-identical `encrypted_client_hello`
+    /// that hides whether the client speaks ECH from passive
+    /// observers. Pass
+    /// [`super::ech::EchClient::from_config_list`] to seal against a
+    /// published `ECHConfigList`. The full real-ECH client lands in a
+    /// follow-up commit; for now this stores the choice and emits
+    /// GREASE on the wire either way.
+    #[cfg(feature = "ech")]
+    pub fn ech(mut self, ech: super::ech::EchClient) -> Self {
+        self.inner.ech = Some(ech);
+        self
+    }
+    /// Server: install Encrypted Client Hello key material
+    /// (draft-ietf-tls-esni-22) — the active key ring and the
+    /// `retry_configs` list to ship on rejection. Stored now; the
+    /// outer-CH HPKE decap + inner-CH dispatch + retry_configs
+    /// emission land in a follow-up under the same Phase 5 banner.
+    #[cfg(feature = "ech")]
+    pub fn ech_server(mut self, ech: super::ech::EchServer) -> Self {
+        self.inner.ech_server = Some(ech);
         self
     }
 

@@ -201,5 +201,19 @@ u16_id!(
         /// (RFC 8446 §4.4.2). Body: a DER-encoded RFC 5280 `CertificateList`
         /// (CRL). The unassigned IANA code point `0xFE10` is used.
         CRL_RESPONSE = 0xfe10,
+        /// encrypted_client_hello (draft-ietf-tls-esni-22 §5).
+        /// Carries the HPKE-sealed inner ClientHello (in the outer CH) or
+        /// the empty marker that signals "this is the inner CH"
+        /// (in the inner CH). On the server side, EncryptedExtensions
+        /// carries the `retry_configs` form when the server rejects ECH.
+        #[cfg_attr(not(feature = "ech"), allow(dead_code))]
+        ENCRYPTED_CLIENT_HELLO = 0xfe0d,
+        /// ech_outer_extensions (draft-ietf-tls-esni-22 §5.1). In the
+        /// inner CH only, lists outer-CH extension types that the inner
+        /// CH wants to inherit verbatim; the server's decompression step
+        /// substitutes the named outer extensions for this entry to
+        /// reconstruct the canonical inner CH.
+        #[allow(dead_code)]
+        ECH_OUTER_EXTENSIONS = 0xfd00,
     }
 );

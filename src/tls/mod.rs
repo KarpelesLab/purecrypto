@@ -31,6 +31,8 @@ mod config;
 pub(crate) mod conn;
 mod connection;
 pub(crate) mod crypto;
+#[cfg(feature = "ech")]
+pub mod ech;
 mod error;
 pub(crate) mod keylog;
 pub(crate) mod pki;

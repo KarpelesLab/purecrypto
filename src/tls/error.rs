@@ -171,6 +171,24 @@ pub enum Error {
     /// leaf certificate. Maps to `bad_certificate` — the staple cannot be
     /// trusted, so the chain cannot be admitted under stapling.
     OcspResponseInvalid,
+    /// The server rejected Encrypted Client Hello: the inner CH was not
+    /// accepted, the outer-CH handshake completed with the public-name
+    /// certificate, and `EncryptedExtensions` carries an
+    /// `ECHConfigList` whose contents are returned here for the
+    /// caller to retry with. Maps to `ech_required` (draft §11.2).
+    #[cfg(feature = "ech")]
+    EchRejected(alloc::vec::Vec<u8>),
+    /// An ECH wire structure (extension body, ECHConfig list, retry
+    /// configs, inner CH) is malformed or violates a draft constraint
+    /// (unknown version, payload longer than HpkeSymmetricCipherSuite
+    /// limits, etc.). Maps to `illegal_parameter`.
+    #[cfg(feature = "ech")]
+    EchDecodeError,
+    /// HPKE seal/open in the ECH envelope failed, or the inner CH that
+    /// emerged from decryption did not parse as a ClientHello, or its
+    /// HRR confirmation signal was wrong. Maps to `decrypt_error`.
+    #[cfg(feature = "ech")]
+    EchDecryptionFailed,
 }
 
 impl core::fmt::Display for Error {
@@ -193,6 +211,12 @@ impl core::fmt::Display for Error {
             Error::CertificateRequired => f.write_str("server required a client certificate"),
             Error::CertificateRevoked => f.write_str("peer certificate revoked (stapled OCSP)"),
             Error::OcspResponseInvalid => f.write_str("stapled OCSP response invalid"),
+            #[cfg(feature = "ech")]
+            Error::EchRejected(_) => f.write_str("ECH rejected; retry_configs available"),
+            #[cfg(feature = "ech")]
+            Error::EchDecodeError => f.write_str("ECH wire structure malformed"),
+            #[cfg(feature = "ech")]
+            Error::EchDecryptionFailed => f.write_str("ECH HPKE seal/open failed"),
         }
     }
 }

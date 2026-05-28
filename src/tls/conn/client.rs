@@ -216,6 +216,14 @@ pub(crate) struct ClientConfig {
     /// the engine logs every derived traffic / master secret as it
     /// progresses through the handshake.
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// ECH client configuration (draft-ietf-tls-esni-22). `None` (the
+    /// default) emits no `encrypted_client_hello` extension. `Some` —
+    /// either GREASE or a real `ECHConfigList` — emits a bit-shape-identical
+    /// outer-form extension. The real-ECH inner/outer split + state
+    /// machine integration lands in a follow-up under the same Phase 5
+    /// banner; today the wire shape is GREASE in either case.
+    #[cfg(feature = "ech")]
+    pub ech: Option<crate::tls::ech::EchClient>,
 }
 
 impl ClientConfig {
@@ -236,6 +244,8 @@ impl ClientConfig {
             client_cert_type_preference: alloc::vec![0u8],
             expected_raw_public_keys: Vec::new(),
             key_log: None,
+            #[cfg(feature = "ech")]
+            ech: None,
         }
     }
 
@@ -1085,6 +1095,27 @@ impl ClientConnection {
             ));
         }
         extensions.extend_from_slice(extra_extensions);
+
+        // draft-ietf-tls-esni-22 §6: `encrypted_client_hello`. When the
+        // client is configured for ECH (real or GREASE), emit an
+        // outer-form extension here, before PSK (which must remain
+        // last). For now both real and GREASE paths take the GREASE
+        // branch; the real-ECH inner/outer split + state-machine
+        // dispatch lands in a follow-up under the same Phase 5 banner.
+        #[cfg(feature = "ech")]
+        if let Some(ech) = self.config.ech.as_ref() {
+            let params = match &ech.mode {
+                crate::tls::ech::EchClientMode::Grease(p) => p,
+                crate::tls::ech::EchClientMode::Real(_) => {
+                    &crate::tls::ech::GreaseParams::default()
+                }
+            };
+            let body = params.build_extension_from_random(&random);
+            extensions.push((
+                crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO,
+                body,
+            ));
+        }
 
         // RFC 9001 §8.2: in QUIC mode the ClientHello carries
         // `quic_transport_parameters` (0x0039) holding the QUIC layer's

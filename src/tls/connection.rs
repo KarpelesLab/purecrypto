@@ -412,6 +412,10 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
         cc = cc.add_expected_raw_public_key(spki.clone());
     }
     cc.key_log = cfg.key_log.clone();
+    #[cfg(feature = "ech")]
+    {
+        cc.ech = cfg.ech.clone();
+    }
     let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
     Ok(super::conn::ClientConnection::new(
         cc,

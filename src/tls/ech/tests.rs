@@ -1,0 +1,561 @@
+//! Tests for the ECH codec, key material, and GREASE producer.
+//!
+//! Covers wire round-trips for ECHConfig / ECHConfigList /
+//! HpkeKeyConfig / encrypted_client_hello, error-path negatives,
+//! retry_configs encoding, GREASE bit-shape invariants, and the
+//! accept-signal helpers.
+
+use super::accept_signal::{
+    hello_retry_request_signal, patch_random_tail, random_tail, random_with_zero_tail,
+    server_hello_signal, signals_eq_ct,
+};
+use super::config::{
+    ECH_VERSION_DRAFT_22, EchConfig, EchConfigContents, EchConfigList, HpkeKeyConfig,
+    HpkeSymCipherSuite,
+};
+use super::extension::{EchExtension, zero_payload};
+use super::grease::{GreaseConfigIdStrategy, GreaseParams};
+use super::hpke_setup::{ech_info, map_kem, map_sym_suite};
+use super::inner::inner_extension_body;
+use super::keys::{EchKeyPair, EchKeyRing};
+use super::retry::{decode_retry_configs, encode_retry_configs};
+use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+use crate::rng::HmacDrbg;
+use crate::tls::Error;
+use crate::tls::crypto::HashAlg;
+use alloc::vec::Vec;
+
+/// A small deterministic RNG for codec tests: HmacDrbg-SHA-256
+/// re-keyed per test so cross-test interference can't muddy KAT
+/// reasoning.
+fn drbg(seed: &[u8]) -> HmacDrbg<crate::hash::Sha256> {
+    HmacDrbg::<crate::hash::Sha256>::new(seed, b"ech test seed", b"")
+}
+
+fn sample_sym_suites() -> Vec<HpkeSymCipherSuite> {
+    alloc::vec![
+        HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0001,
+        },
+        HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0003,
+        },
+    ]
+}
+
+fn sample_config() -> EchConfig {
+    let contents = EchConfigContents {
+        key_config: HpkeKeyConfig {
+            config_id: 7,
+            kem_id: HpkeKem::DhkemX25519HkdfSha256.id(),
+            public_key: alloc::vec![0x11u8; 32],
+            cipher_suites: sample_sym_suites(),
+        },
+        maximum_name_length: 64,
+        public_name: b"public.example".to_vec(),
+        extensions: Vec::new(),
+    };
+    EchConfig::new(contents)
+}
+
+#[test]
+fn hpke_sym_cipher_suite_roundtrip() {
+    let s = HpkeSymCipherSuite {
+        kdf_id: 0x0002,
+        aead_id: 0x0003,
+    };
+    let mut buf = Vec::new();
+    s.encode_into(&mut buf);
+    assert_eq!(buf, alloc::vec![0x00, 0x02, 0x00, 0x03]);
+    let back = HpkeSymCipherSuite::decode(&buf).unwrap();
+    assert_eq!(back, s);
+}
+
+#[test]
+fn hpke_sym_cipher_suite_wrong_length_rejected() {
+    assert!(matches!(
+        HpkeSymCipherSuite::decode(&[0u8; 3]),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ech_config_list_roundtrip() {
+    let cfg = sample_config();
+    let list = EchConfigList::new(alloc::vec![cfg.clone()]);
+    let bytes = list.encode();
+    let parsed = EchConfigList::decode(&bytes).unwrap();
+    assert_eq!(parsed.configs.len(), 1);
+    let first = parsed.first_supported().unwrap();
+    assert_eq!(first.version, ECH_VERSION_DRAFT_22);
+    let c = first.contents.as_ref().unwrap();
+    assert_eq!(c.key_config.config_id, 7);
+    assert_eq!(c.key_config.kem_id, HpkeKem::DhkemX25519HkdfSha256.id());
+    assert_eq!(c.public_name, b"public.example");
+}
+
+#[test]
+fn ech_config_list_unknown_version_preserved_but_unsupported() {
+    // Build a list with one entry at version 0xFEEE (unknown) plus
+    // one at the supported version.
+    let supported = sample_config();
+    let unknown = EchConfig {
+        version: 0xFEEE,
+        contents: None,
+        raw_contents: alloc::vec![0xde, 0xad, 0xbe, 0xef],
+    };
+    let list = EchConfigList::new(alloc::vec![unknown.clone(), supported.clone()]);
+    let bytes = list.encode();
+    let parsed = EchConfigList::decode(&bytes).unwrap();
+    assert_eq!(parsed.configs.len(), 2);
+    assert!(!parsed.configs[0].is_supported());
+    assert!(parsed.configs[1].is_supported());
+    // The first supported entry must be the second one.
+    let first = parsed.first_supported().unwrap();
+    assert_eq!(first.version, ECH_VERSION_DRAFT_22);
+}
+
+#[test]
+fn ech_config_list_empty_rejected() {
+    let bytes = alloc::vec![0x00, 0x00];
+    assert!(matches!(
+        EchConfigList::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ech_config_list_trailing_bytes_rejected() {
+    let cfg = sample_config();
+    let list = EchConfigList::new(alloc::vec![cfg]);
+    let mut bytes = list.encode();
+    bytes.push(0x99);
+    assert!(matches!(
+        EchConfigList::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ech_config_truncated_rejected() {
+    let cfg = sample_config();
+    let list = EchConfigList::new(alloc::vec![cfg]);
+    let bytes = list.encode();
+    // Decapitate the last byte.
+    let truncated = &bytes[..bytes.len() - 1];
+    assert!(matches!(
+        EchConfigList::decode(truncated),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ech_config_public_name_must_be_non_empty() {
+    let mut contents = EchConfigContents {
+        key_config: HpkeKeyConfig {
+            config_id: 1,
+            kem_id: HpkeKem::DhkemX25519HkdfSha256.id(),
+            public_key: alloc::vec![0u8; 32],
+            cipher_suites: sample_sym_suites(),
+        },
+        maximum_name_length: 32,
+        public_name: Vec::new(), // empty — should fail decode
+        extensions: Vec::new(),
+    };
+    let mut raw = Vec::new();
+    contents.key_config.encode_into(&mut raw);
+    raw.push(contents.maximum_name_length);
+    raw.push(0); // public_name length = 0 (illegal)
+    raw.extend_from_slice(&[0x00, 0x00]); // ext_len = 0
+    let cfg = EchConfig {
+        version: ECH_VERSION_DRAFT_22,
+        contents: None,
+        raw_contents: raw,
+    };
+    let list = EchConfigList::new(alloc::vec![cfg]);
+    let bytes = list.encode();
+    assert!(matches!(
+        EchConfigList::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+    // Touch the field so the linter doesn't complain.
+    contents.public_name = b"x".to_vec();
+}
+
+#[test]
+fn mandatory_unknown_extension_rejected() {
+    // Build ECHConfigContents.extensions with one mandatory (high
+    // bit set) unknown extension type. Decode must reject.
+    let key_config = HpkeKeyConfig {
+        config_id: 1,
+        kem_id: HpkeKem::DhkemX25519HkdfSha256.id(),
+        public_key: alloc::vec![0u8; 32],
+        cipher_suites: sample_sym_suites(),
+    };
+    let mut raw = Vec::new();
+    key_config.encode_into(&mut raw);
+    raw.push(64);
+    raw.push(7);
+    raw.extend_from_slice(b"example");
+    // extensions: one (mandatory) extension of type 0x8001, empty data
+    let mut ext_bytes = Vec::new();
+    ext_bytes.extend_from_slice(&0x8001u16.to_be_bytes());
+    ext_bytes.extend_from_slice(&0u16.to_be_bytes());
+    raw.extend_from_slice(&(ext_bytes.len() as u16).to_be_bytes());
+    raw.extend_from_slice(&ext_bytes);
+    let cfg = EchConfig {
+        version: ECH_VERSION_DRAFT_22,
+        contents: None,
+        raw_contents: raw,
+    };
+    let list = EchConfigList::new(alloc::vec![cfg]);
+    let bytes = list.encode();
+    assert!(matches!(
+        EchConfigList::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ext_outer_roundtrip() {
+    let ext = EchExtension::Outer {
+        cipher_suite: HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0003,
+        },
+        config_id: 0x42,
+        enc: alloc::vec![0xAA; 32],
+        payload: alloc::vec![0xBB; 144],
+    };
+    let bytes = ext.encode();
+    // 1 type + 4 cs + 1 cid + 2 enc_len + 32 enc + 2 pl_len + 144 pl = 186
+    assert_eq!(bytes.len(), 186);
+    let back = EchExtension::decode(&bytes).unwrap();
+    assert_eq!(back, ext);
+}
+
+#[test]
+fn ext_inner_roundtrip() {
+    let ext = EchExtension::Inner;
+    let bytes = ext.encode();
+    assert_eq!(bytes, alloc::vec![0x01]);
+    let back = EchExtension::decode(&bytes).unwrap();
+    assert_eq!(back, ext);
+}
+
+#[test]
+fn ext_inner_extra_bytes_rejected() {
+    assert!(matches!(
+        EchExtension::decode(&[0x01, 0x00]),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ext_outer_empty_payload_rejected() {
+    let bytes = alloc::vec![
+        0x00, // type=outer
+        0x00, 0x01, 0x00, 0x01, // cipher_suite
+        0x07, // config_id
+        0x00, 0x01, 0xAA, // enc<1>
+        0x00, 0x00, // payload<0> — illegal
+    ];
+    assert!(matches!(
+        EchExtension::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn ext_outer_unknown_type_rejected() {
+    let bytes = alloc::vec![0x02, 0x00, 0x00];
+    assert!(matches!(
+        EchExtension::decode(&bytes),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn zero_payload_keeps_other_fields() {
+    let ext = EchExtension::Outer {
+        cipher_suite: HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0003,
+        },
+        config_id: 0x42,
+        enc: alloc::vec![0xAA; 16],
+        payload: alloc::vec![0xBB; 32],
+    };
+    let bytes = ext.encode();
+    let zeroed = zero_payload(&bytes).unwrap();
+    assert_eq!(zeroed.len(), bytes.len());
+    // The header (type + cs + config_id + enc_len + enc + pl_len) is
+    // 1 + 4 + 1 + 2 + 16 + 2 = 26 bytes; the next 32 bytes should
+    // be zero, prefix should match.
+    assert_eq!(&zeroed[..26], &bytes[..26]);
+    assert!(zeroed[26..].iter().all(|&b| b == 0));
+    // The original is unchanged.
+    let parsed = EchExtension::decode(&bytes).unwrap();
+    match parsed {
+        EchExtension::Outer { payload, .. } => assert!(payload.iter().all(|&b| b == 0xBB)),
+        _ => panic!("expected outer"),
+    }
+}
+
+#[test]
+fn zero_payload_rejects_inner_form() {
+    assert!(matches!(zero_payload(&[0x01]), Err(Error::EchDecodeError)));
+}
+
+#[test]
+fn retry_configs_roundtrip() {
+    let list = EchConfigList::new(alloc::vec![sample_config()]);
+    let bytes = encode_retry_configs(&list);
+    let back = decode_retry_configs(&bytes).unwrap();
+    assert_eq!(back.configs.len(), 1);
+    assert!(back.configs[0].is_supported());
+}
+
+#[test]
+fn key_pair_generate_produces_published_pubkey() {
+    let mut rng = drbg(b"keygen-pubkey-roundtrip");
+    let kp = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        17,
+        b"public.example.com",
+        64,
+        sample_sym_suites(),
+    )
+    .expect("generate");
+    assert_eq!(kp.config_id(), 17);
+    let contents = kp.config().contents.as_ref().unwrap();
+    assert_eq!(
+        contents.key_config.kem_id,
+        HpkeKem::DhkemX25519HkdfSha256.id()
+    );
+    assert_eq!(contents.key_config.public_key.len(), 32);
+    assert_eq!(contents.public_name, b"public.example.com");
+    // The pair must accept the cipher suites it published.
+    assert!(kp.accepts(HpkeKdf::HkdfSha256, HpkeAead::Aes128Gcm));
+    assert!(kp.accepts(HpkeKdf::HkdfSha256, HpkeAead::ChaCha20Poly1305));
+    assert!(!kp.accepts(HpkeKdf::HkdfSha384, HpkeAead::Aes128Gcm));
+}
+
+#[test]
+fn key_pair_rejects_empty_public_name() {
+    let mut rng = drbg(b"keygen-empty-name");
+    let res = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0,
+        b"",
+        64,
+        sample_sym_suites(),
+    );
+    assert!(matches!(res, Err(Error::EchDecodeError)));
+}
+
+#[test]
+fn key_pair_rejects_empty_suite_list() {
+    let mut rng = drbg(b"keygen-empty-suites");
+    let res = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0,
+        b"x",
+        64,
+        Vec::new(),
+    );
+    assert!(matches!(res, Err(Error::EchDecodeError)));
+}
+
+#[test]
+fn key_ring_lookup_by_config_id() {
+    let mut rng = drbg(b"ring");
+    let kp1 = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        1,
+        b"a",
+        32,
+        sample_sym_suites(),
+    )
+    .unwrap();
+    let kp2 = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        2,
+        b"b",
+        32,
+        sample_sym_suites(),
+    )
+    .unwrap();
+    let ring = EchKeyRing::from_pairs(alloc::vec![kp1, kp2]);
+    assert!(ring.find_by_config_id(1).is_some());
+    assert!(ring.find_by_config_id(2).is_some());
+    assert!(ring.find_by_config_id(99).is_none());
+    let list = ring.to_config_list();
+    assert_eq!(list.configs.len(), 2);
+}
+
+#[test]
+fn grease_extension_has_expected_shape() {
+    let mut rng = drbg(b"grease-shape");
+    let params = GreaseParams {
+        cipher_suite: HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0001,
+        },
+        enc_len: 32,
+        payload_len: 144,
+        config_id_strategy: GreaseConfigIdStrategy::Fixed(0xab),
+    };
+    let body = params.build_extension_bytes(&mut rng);
+    let ext = EchExtension::decode(&body).unwrap();
+    match ext {
+        EchExtension::Outer {
+            cipher_suite,
+            config_id,
+            enc,
+            payload,
+        } => {
+            assert_eq!(cipher_suite.kdf_id, 0x0001);
+            assert_eq!(cipher_suite.aead_id, 0x0001);
+            assert_eq!(config_id, 0xab);
+            assert_eq!(enc.len(), 32);
+            assert_eq!(payload.len(), 144);
+        }
+        _ => panic!("expected Outer"),
+    }
+    // 1 type + 4 cs + 1 cid + 2 enc_len + 32 enc + 2 pl_len + 144 pl = 186
+    assert_eq!(body.len(), 186);
+}
+
+#[test]
+fn grease_default_is_well_formed() {
+    let mut rng = drbg(b"grease-default");
+    let body = GreaseParams::default().build_extension_bytes(&mut rng);
+    let ext = EchExtension::decode(&body).unwrap();
+    assert!(matches!(ext, EchExtension::Outer { .. }));
+}
+
+#[test]
+fn map_sym_suite_resolves_supported_pairs() {
+    let kdfs: &[(u16, HpkeKdf)] = &[
+        (0x0001, HpkeKdf::HkdfSha256),
+        (0x0002, HpkeKdf::HkdfSha384),
+        (0x0003, HpkeKdf::HkdfSha512),
+    ];
+    let aeads: &[(u16, HpkeAead)] = &[
+        (0x0001, HpkeAead::Aes128Gcm),
+        (0x0002, HpkeAead::Aes256Gcm),
+        (0x0003, HpkeAead::ChaCha20Poly1305),
+    ];
+    for &(kid, kexp) in kdfs {
+        for &(aid, aexp) in aeads {
+            let s = HpkeSymCipherSuite {
+                kdf_id: kid,
+                aead_id: aid,
+            };
+            let (k, a) = map_sym_suite(s).unwrap();
+            assert_eq!(k, kexp);
+            assert_eq!(a, aexp);
+        }
+    }
+}
+
+#[test]
+fn map_sym_suite_rejects_export_only_and_unknowns() {
+    // ExportOnly is 0xFFFF.
+    let s = HpkeSymCipherSuite {
+        kdf_id: 0x0001,
+        aead_id: 0xFFFF,
+    };
+    assert!(matches!(map_sym_suite(s), Err(Error::EchDecodeError)));
+    // Unknown KDF.
+    let s = HpkeSymCipherSuite {
+        kdf_id: 0xABCD,
+        aead_id: 0x0001,
+    };
+    assert!(matches!(map_sym_suite(s), Err(Error::EchDecodeError)));
+}
+
+#[test]
+fn map_kem_resolves_all_supported() {
+    assert_eq!(map_kem(0x0010).unwrap(), HpkeKem::DhkemP256HkdfSha256);
+    assert_eq!(map_kem(0x0011).unwrap(), HpkeKem::DhkemP384HkdfSha384);
+    assert_eq!(map_kem(0x0012).unwrap(), HpkeKem::DhkemP521HkdfSha512);
+    assert_eq!(map_kem(0x0020).unwrap(), HpkeKem::DhkemX25519HkdfSha256);
+    assert!(matches!(map_kem(0xDEAD), Err(Error::EchDecodeError)));
+}
+
+#[test]
+fn ech_info_prefix_and_shape() {
+    let cfg = sample_config();
+    let info = ech_info(&cfg);
+    // Must begin with "tls ech\0" then the 4-byte (version || length) header.
+    assert!(info.starts_with(b"tls ech\0"));
+    let after_prefix = &info[8..];
+    assert_eq!(&after_prefix[..2], &ECH_VERSION_DRAFT_22.to_be_bytes());
+    let len = u16::from_be_bytes([after_prefix[2], after_prefix[3]]) as usize;
+    assert_eq!(len, cfg.raw_contents.len());
+    assert_eq!(&after_prefix[4..], &cfg.raw_contents[..]);
+}
+
+#[test]
+fn inner_extension_body_matches_marker() {
+    assert_eq!(inner_extension_body(), alloc::vec![0x01]);
+}
+
+#[test]
+fn accept_signal_deterministic_and_label_separated() {
+    let secret = [0x42u8; 32];
+    let th = [0x33u8; 32];
+    let sh = server_hello_signal(HashAlg::Sha256, &secret, &th);
+    let sh2 = server_hello_signal(HashAlg::Sha256, &secret, &th);
+    assert_eq!(sh, sh2);
+    let hrr = hello_retry_request_signal(HashAlg::Sha256, &secret, &th);
+    // Distinct labels MUST yield distinct outputs.
+    assert_ne!(sh, hrr);
+}
+
+#[test]
+fn accept_signal_constant_time_eq_matches_plain_eq() {
+    let mut a = [0u8; 8];
+    let mut b = [0u8; 8];
+    assert!(signals_eq_ct(&a, &b));
+    a[3] = 1;
+    assert!(!signals_eq_ct(&a, &b));
+    b[3] = 1;
+    assert!(signals_eq_ct(&a, &b));
+}
+
+#[test]
+fn random_tail_helpers_invert_each_other() {
+    let r = [0xAAu8; 32];
+    let signal = [0xBBu8; 8];
+    let patched = patch_random_tail(&r, &signal);
+    assert_eq!(&patched[..24], &r[..24]);
+    assert_eq!(random_tail(&patched), signal);
+    let zeroed = random_with_zero_tail(&r);
+    assert_eq!(&zeroed[..24], &r[..24]);
+    assert_eq!(&zeroed[24..], &[0u8; 8]);
+}
+
+#[test]
+fn ech_config_list_supports_first_supported_when_first_is_unknown() {
+    // Putting an unknown-version config first must not break selection
+    // of the second supported one (draft §6.1).
+    let unknown = EchConfig {
+        version: 0xFFFF,
+        contents: None,
+        raw_contents: alloc::vec![0xCA, 0xFE],
+    };
+    let supported = sample_config();
+    let list = EchConfigList::new(alloc::vec![unknown, supported]);
+    let first = list.first_supported().expect("a supported entry");
+    assert_eq!(first.version, ECH_VERSION_DRAFT_22);
+}
