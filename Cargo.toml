@@ -71,6 +71,13 @@ mldsa = ["hash", "rng", "alloc"]
 # SLH-DSA (FIPS 205) hash-based signatures. Needs alloc for the large
 # signatures (up to ~50 KB); built purely from the hash primitives.
 slhdsa = ["hash", "rng", "alloc"]
+# HPKE (RFC 9180) hybrid public key encryption. Provides the DHKEM /
+# HKDF / AEAD matrix used by OHTTP, MLS, and the ECH client-hello
+# encryption. The full matrix: 4 KEMs (P-256, P-384, P-521, X25519) ×
+# 3 KDFs (HKDF-SHA-{256,384,512}) × 3 AEADs (AES-128/256-GCM,
+# ChaCha20-Poly1305) + ExportOnly, in all 4 modes (Base, PSK, Auth,
+# AuthPSK).
+hpke = ["hash", "kdf", "ec", "cipher", "rng", "alloc"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher"]

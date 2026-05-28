@@ -52,6 +52,9 @@ pub mod ffi;
 #[cfg(feature = "hash")]
 pub mod hash;
 
+#[cfg(feature = "hpke")]
+pub mod hpke;
+
 #[cfg(feature = "kdf")]
 pub mod kdf;
 
