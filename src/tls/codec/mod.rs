@@ -17,7 +17,9 @@ pub(crate) use handshake12::{
     ServerKeyExchange, signed_message,
 };
 #[allow(unused_imports)]
-pub(crate) use primitives::{CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme};
+pub(crate) use primitives::{
+    CipherSuite, ExtensionType, NamedGroup, Random, SignatureScheme, cert_type,
+};
 #[allow(unused_imports)]
 pub(crate) use record::{ParsedRecord, is_legal_record_version, read_record, write_record};
 

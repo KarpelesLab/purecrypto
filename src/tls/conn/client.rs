@@ -199,6 +199,19 @@ pub(crate) struct ClientConfig {
     /// opt in via [`ClientConfig::with_crls`]. Coverage is advisory — a
     /// missing CRL never causes a chain to be rejected.
     pub crls: CrlStore,
+    /// RFC 7250 §3 `server_certificate_type` preference list offered in the
+    /// ClientHello. `vec![0]` (X.509 only) is the default and suppresses the
+    /// extension altogether. Set to e.g. `vec![2, 0]` to prefer raw public
+    /// keys with X.509 fallback.
+    pub server_cert_type_preference: Vec<u8>,
+    /// Same as `server_cert_type_preference` but for the mTLS path: which
+    /// certificate types the client is willing to SEND.
+    pub client_cert_type_preference: Vec<u8>,
+    /// Allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted as the
+    /// server's identity when RawPublicKey is the negotiated server-cert
+    /// type. Empty disables the path even if the extension list advertises
+    /// it (so the server's RawPublicKey would be rejected at receive time).
+    pub expected_raw_public_keys: Vec<Vec<u8>>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format). When `Some`,
     /// the engine logs every derived traffic / master secret as it
     /// progresses through the handshake.
@@ -219,8 +232,51 @@ impl ClientConfig {
             client_cert: None,
             signature_policy: SignaturePolicy::modern(),
             crls: CrlStore::new(),
+            server_cert_type_preference: alloc::vec![0u8],
+            client_cert_type_preference: alloc::vec![0u8],
+            expected_raw_public_keys: Vec::new(),
             key_log: None,
         }
+    }
+
+    /// Sets the RFC 7250 `server_certificate_type` preference list offered
+    /// in the ClientHello. `[0]` (the default) means X.509 only; the
+    /// extension is suppressed entirely on the wire so non-7250-aware peers
+    /// don't trip over it. To opt into raw public keys use `[2]`
+    /// (RawPublicKey only) or `[2, 0]` (prefer RawPublicKey, accept X.509).
+    pub fn with_server_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.server_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![0u8]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Sets the RFC 7250 `client_certificate_type` preference list (mTLS).
+    /// Same semantics as
+    /// [`with_server_cert_type_preference`](Self::with_server_cert_type_preference).
+    ///
+    /// Note: the client side currently only emits X.509 `Certificate`
+    /// messages; offering `RawPublicKey` here is wired through negotiation
+    /// but the client's `send_client_certificate` path does not yet derive
+    /// an SPKI from the configured private key. Production mTLS deployments
+    /// should leave this at the default `[0]`.
+    pub fn with_client_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.client_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![0u8]
+        } else {
+            prefs
+        };
+        self
+    }
+
+    /// Appends a bare `SubjectPublicKeyInfo` DER to the allowlist of
+    /// raw-public-key SPKIs accepted from the server (RFC 7250 §4.2). Only
+    /// consulted when `RawPublicKey` is the negotiated server-cert type.
+    pub fn add_expected_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.expected_raw_public_keys.push(spki_der);
+        self
     }
 
     /// Installs a [`CrlStore`] consulted during chain validation. The
@@ -373,6 +429,15 @@ pub struct ClientConnection {
     /// chain in `on_certificate_verify`; `None` when the server didn't
     /// staple.
     peer_ocsp_response: Option<Vec<u8>>,
+    /// RFC 7250 §4.2: the server's selected cert type (echoed in EE).
+    /// Defaults to `X509 = 0`; flipped to `RAW_PUBLIC_KEY = 2` only when
+    /// the server's EncryptedExtensions actually carries
+    /// `server_certificate_type` with that value.
+    negotiated_server_cert_type: u8,
+    /// RFC 7250 §4.2: the server's selected mTLS cert type (the type the
+    /// CLIENT must send if `CertificateRequest` arrives). Defaults to
+    /// `X509 = 0`.
+    negotiated_client_cert_type: u8,
     leaf_key: Option<AnyPublicKey>,
 
     /// Most recent `NewSessionTicket` from the peer (RFC 8446 §4.6.1). Real
@@ -834,6 +899,8 @@ impl ClientConnection {
             cert_chain: Vec::new(),
             stapled_crls: crate::tls::pki::CrlStore::new(),
             peer_ocsp_response: None,
+            negotiated_server_cert_type: 0, // X.509 default per RFC 7250.
+            negotiated_client_cert_type: 0,
             leaf_key: None,
             last_ticket: None,
             alpn_negotiated: None,
@@ -990,6 +1057,33 @@ impl ClientConnection {
         // TLS 1.3 the staple rides in the leaf `CertificateEntry`'s per-cert
         // `status_request` extension (RFC 8446 §4.4.2.1).
         extensions.push(ext::status_request_ocsp());
+        // RFC 7250 §3 server_certificate_type / client_certificate_type.
+        // Default-X.509 clients omit both extensions: emit them only when
+        // the preference list contains anything other than just X.509 (a
+        // non-7250-aware server otherwise has to ignore the extension, but
+        // we'd rather minimize wire-format surface for the default flow).
+        if self
+            .config
+            .server_cert_type_preference
+            .iter()
+            .any(|t| *t != 0)
+        {
+            extensions.push(ext::cert_type_list(
+                crate::tls::codec::ExtensionType::SERVER_CERTIFICATE_TYPE,
+                &self.config.server_cert_type_preference,
+            ));
+        }
+        if self
+            .config
+            .client_cert_type_preference
+            .iter()
+            .any(|t| *t != 0)
+        {
+            extensions.push(ext::cert_type_list(
+                crate::tls::codec::ExtensionType::CLIENT_CERTIFICATE_TYPE,
+                &self.config.client_cert_type_preference,
+            ));
+        }
         extensions.extend_from_slice(extra_extensions);
 
         // RFC 9001 §8.2: in QUIC mode the ClientHello carries
@@ -1610,6 +1704,22 @@ impl ClientConnection {
                         return Err(Error::IllegalParameter);
                     }
                     early_data_in_ee = true;
+                } else if ty == crate::tls::codec::ExtensionType::SERVER_CERTIFICATE_TYPE.0 {
+                    // RFC 7250 §4.2 server reply: a single byte picking the
+                    // cert type for the server's leaf. Must be in our offer.
+                    let selected = ext::parse_cert_type_selection(ext_body)?;
+                    if !self.config.server_cert_type_preference.contains(&selected) {
+                        return Err(Error::IllegalParameter);
+                    }
+                    self.negotiated_server_cert_type = selected;
+                } else if ty == crate::tls::codec::ExtensionType::CLIENT_CERTIFICATE_TYPE.0 {
+                    // RFC 7250 §4.2 server reply for the mTLS leaf. Must be
+                    // in our offer.
+                    let selected = ext::parse_cert_type_selection(ext_body)?;
+                    if !self.config.client_cert_type_preference.contains(&selected) {
+                        return Err(Error::IllegalParameter);
+                    }
+                    self.negotiated_client_cert_type = selected;
                 } else if ty == crate::tls::codec::ExtensionType::QUIC_TRANSPORT_PARAMETERS.0
                     && self.engine_mode == super::super::quic_hooks::EngineMode::Quic
                 {
@@ -1691,6 +1801,23 @@ impl ClientConnection {
         if entries.is_empty() {
             return Err(Error::BadCertificate);
         }
+        // RFC 7250 §4.2: when RawPublicKey is the negotiated server-cert
+        // type, the CertificateEntry list MUST have exactly one entry and
+        // its body is the bare `SubjectPublicKeyInfo` DER (no X.509
+        // wrapping, no chain, and stapled OCSP/CRL extensions don't apply
+        // — we ignore any that might be present rather than treat them
+        // as authoritative).
+        if self.negotiated_server_cert_type == crate::tls::codec::cert_type::RAW_PUBLIC_KEY {
+            if entries.len() != 1 {
+                return Err(Error::BadCertificate);
+            }
+            self.stapled_crls = crate::tls::pki::CrlStore::new();
+            self.peer_ocsp_response = None;
+            self.cert_chain = entries.into_iter().map(|(c, _)| c).collect();
+            self.core.transcript.update(raw);
+            self.state = State::WaitCertificateVerify;
+            return Ok(());
+        }
         // The TLS 1.3 `Certificate` message carries per-cert extensions
         // (RFC 8446 §4.4.2). We recognise two on the leaf entry: the
         // RFC 6066 §8 `status_request` (stapled OCSP response) and the
@@ -1743,6 +1870,48 @@ impl ClientConnection {
         // verification work.
         if scheme.is_rsa_pkcs1() {
             return Err(Error::IllegalParameter);
+        }
+
+        // RFC 7250 §4.2: when RawPublicKey is the negotiated server-cert
+        // type, the leaf "Certificate" body is a bare `SubjectPublicKeyInfo`
+        // DER. There is no X.509 chain to validate; trust is established by
+        // matching the SPKI against the operator-configured allowlist
+        // (constant-time compare). Hostname and OCSP/CRL checks don't
+        // apply.
+        if self.negotiated_server_cert_type == crate::tls::codec::cert_type::RAW_PUBLIC_KEY {
+            let spki = self.cert_chain.first().ok_or(Error::BadCertificate)?;
+            let leaf_key = AnyPublicKey::from_spki_der(spki).map_err(|_| Error::BadCertificate)?;
+            if self.config.verify_certificates {
+                if self.config.expected_raw_public_keys.is_empty() {
+                    // No allowlist configured but verification is on — there
+                    // is no way to establish trust, so refuse.
+                    return Err(Error::BadCertificate);
+                }
+                // Constant-time membership check: walk every entry so the
+                // match position doesn't leak via timing.
+                let mut matched = crate::ct::Choice::from(0u8);
+                for accepted in &self.config.expected_raw_public_keys {
+                    if accepted.len() == spki.len() {
+                        matched |= accepted.as_slice().ct_eq(spki.as_slice());
+                    }
+                }
+                if !bool::from(matched) {
+                    return Err(Error::BadCertificate);
+                }
+            }
+            let th = self.core.transcript.current_hash();
+            let content = certificate_verify_content(true, th.as_slice());
+            verify_signature(
+                scheme,
+                &leaf_key,
+                &content,
+                &signature,
+                &self.config.signature_policy,
+            )?;
+            self.leaf_key = Some(leaf_key);
+            self.core.transcript.update(raw);
+            self.state = State::WaitFinished;
+            return Ok(());
         }
 
         // Always reject a malformed leaf certificate, regardless of policy.

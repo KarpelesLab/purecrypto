@@ -131,6 +131,35 @@ pub struct Config {
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
 
+    // ---- RFC 7250 raw public keys (TLS 1.3 only) ----
+    /// Server-cert-type preference list offered in the `server_certificate_type`
+    /// extension (RFC 7250 §3). Default `[0]` (X.509 only) leaves the extension
+    /// off the wire. Set to e.g. `[2]` (RawPublicKey only) or `[2, 0]`
+    /// (prefer RawPublicKey, accept X.509) to negotiate raw public keys.
+    ///
+    /// On the client side: the order is the client's preference. On the
+    /// server side: this is the server's accept-set; selection picks the
+    /// highest-priority client offer that the server also accepts. Empty
+    /// is rejected at `build()` time.
+    pub server_cert_type_preference: Vec<u8>,
+    /// Client-cert-type preference list for `client_certificate_type` (mTLS).
+    /// Wire encoding and defaults mirror `server_cert_type_preference`.
+    pub client_cert_type_preference: Vec<u8>,
+    /// Server: bare `SubjectPublicKeyInfo` DER to send as the single
+    /// `CertificateEntry` body when `RawPublicKey` is the negotiated
+    /// server-cert type (RFC 7250 §4.2). MUST be set if
+    /// `server_cert_type_preference` advertises `RawPublicKey`; the server
+    /// otherwise falls back to its X.509 chain (and may have to refuse the
+    /// handshake if the client only offered RawPublicKey).
+    pub raw_public_key_spki: Option<Vec<u8>>,
+    /// Client: allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted
+    /// as the server's raw public key. When `RawPublicKey` is negotiated,
+    /// the server's CertificateEntry body must constant-time match one of
+    /// these entries — there is no X.509 PKI to fall back on, so trust must
+    /// be established out-of-band. Hostname verification is skipped under
+    /// RawPublicKey.
+    pub expected_raw_public_keys: Vec<Vec<u8>>,
+
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
     /// the DTLS server = cookie exchange is skipped (test-only).
@@ -171,6 +200,10 @@ impl Default for Config {
             replay_window: None,
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            server_cert_type_preference: alloc::vec![0u8], // X.509 only.
+            client_cert_type_preference: alloc::vec![0u8],
+            raw_public_key_spki: None,
+            expected_raw_public_keys: Vec::new(),
             cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
@@ -359,6 +392,48 @@ impl ConfigBuilder {
     /// `record_size_limit` (RFC 8449) advertised on the wire.
     pub fn record_size_limit(mut self, n: u16) -> Self {
         self.inner.record_size_limit = Some(n);
+        self
+    }
+    /// Sets the `server_certificate_type` preference list (RFC 7250). On the
+    /// client side this is the ordered list offered; on the server it is the
+    /// accept-set. Values: `0 = X509` (the default), `2 = RawPublicKey`.
+    /// Empty lists are silently coerced to `[0]`. To switch a server to
+    /// raw public keys, combine with [`raw_public_key_spki`](Self::raw_public_key_spki).
+    pub fn server_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.inner.server_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![0u8]
+        } else {
+            prefs
+        };
+        self
+    }
+    /// Sets the `client_certificate_type` preference list (RFC 7250) for
+    /// mTLS scenarios. Same semantics as
+    /// [`server_cert_type_preference`](Self::server_cert_type_preference).
+    pub fn client_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
+        self.inner.client_cert_type_preference = if prefs.is_empty() {
+            alloc::vec![0u8]
+        } else {
+            prefs
+        };
+        self
+    }
+    /// Server: sets the bare `SubjectPublicKeyInfo` DER to send as the
+    /// `CertificateEntry` body when `RawPublicKey` is the negotiated
+    /// server-cert type (RFC 7250 §4.2). Combine with
+    /// `server_cert_type_preference([2])` (or `[2, 0]` for a hybrid) and an
+    /// [`identity`](Self::identity) whose signing key matches this SPKI.
+    pub fn raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
+        self.inner.raw_public_key_spki = Some(spki_der);
+        self
+    }
+    /// Client: appends an accepted bare `SubjectPublicKeyInfo` DER to the
+    /// allowlist (RFC 7250 §4.2). When `RawPublicKey` is negotiated, the
+    /// server's CertificateEntry body must constant-time match one of these
+    /// entries. There is no PKI fallback under RawPublicKey, so this list
+    /// is the entire trust root.
+    pub fn add_expected_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.inner.expected_raw_public_keys.push(spki_der);
         self
     }
     /// Verification clock (use this on `no_std` targets or for reproducible

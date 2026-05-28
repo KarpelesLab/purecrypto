@@ -406,6 +406,11 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
             cc = cc.with_client_cert(c);
         }
     }
+    cc = cc.with_server_cert_type_preference(cfg.server_cert_type_preference.clone());
+    cc = cc.with_client_cert_type_preference(cfg.client_cert_type_preference.clone());
+    for spki in &cfg.expected_raw_public_keys {
+        cc = cc.add_expected_raw_public_key(spki.clone());
+    }
     cc.key_log = cfg.key_log.clone();
     let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
     Ok(super::conn::ClientConnection::new(
@@ -494,6 +499,11 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
     }
     if let Some(ocsp) = cfg.stapled_ocsp_response.clone() {
         sc = sc.with_stapled_ocsp_response(ocsp);
+    }
+    sc = sc.with_server_cert_type_preference(cfg.server_cert_type_preference.clone());
+    sc = sc.with_client_cert_type_preference(cfg.client_cert_type_preference.clone());
+    if let Some(spki) = cfg.raw_public_key_spki.clone() {
+        sc = sc.with_raw_public_key_spki(spki);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
     sc.key_log = cfg.key_log.clone();

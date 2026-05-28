@@ -282,6 +282,46 @@ pub(crate) fn parse_certificate_status(body: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(ocsp)
 }
 
+/// Builds a `client_certificate_type` / `server_certificate_type` extension
+/// (RFC 7250 §3) for ClientHello. `ty` selects which of the two codepoints
+/// to use; `types` is the ordered preference list of certificate-type IDs
+/// (`0 = X509`, `2 = RawPublicKey`). The wire encoding is a `u8`-length list
+/// of `u8`s — the RFC 7250 §3 "CertificateTypeList" struct.
+pub(crate) fn cert_type_list(ty: ExtensionType, types: &[u8]) -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u8(&mut body, |b| b.extend_from_slice(types));
+    (ty, body)
+}
+
+/// Parses a ClientHello `client_certificate_type` / `server_certificate_type`
+/// body into the offered preference list. The list MUST be non-empty
+/// (RFC 7250 §3 — `CertificateType cert_types<1..2^8-1>`).
+pub(crate) fn parse_cert_type_list(body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut c = ReadCursor::new(body);
+    let list = c.vec_u8()?;
+    c.expect_empty()?;
+    if list.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(list.to_vec())
+}
+
+/// Builds a `client_certificate_type` / `server_certificate_type` extension
+/// for an EncryptedExtensions reply (RFC 7250 §3): the bare selected byte.
+pub(crate) fn cert_type_selection(ty: ExtensionType, selected: u8) -> RawExtension {
+    let body = alloc::vec![selected];
+    (ty, body)
+}
+
+/// Parses an EncryptedExtensions `client_certificate_type` /
+/// `server_certificate_type` body: a single `u8` (RFC 7250 §3).
+pub(crate) fn parse_cert_type_selection(body: &[u8]) -> Result<u8, Error> {
+    let mut c = ReadCursor::new(body);
+    let v = c.u8()?;
+    c.expect_empty()?;
+    Ok(v)
+}
+
 /// `server_name` (SNI) carrying a single host name.
 pub(crate) fn server_name(host: &str) -> RawExtension {
     let mut body = Vec::new();

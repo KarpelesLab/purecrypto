@@ -710,6 +710,202 @@ mod loopback_tests {
         panic!("expected the client to reject the certificate");
     }
 
+    /// RFC 7250 server-side raw public key: the server advertises an SPKI
+    /// directly in its `Certificate` message and the client accepts it via
+    /// an SPKI allowlist (no PKI). The handshake completes and application
+    /// data round-trips, demonstrating that the negotiation, echo, send,
+    /// and verify paths all line up.
+    #[test]
+    fn server_raw_public_key_loopback() {
+        use crate::tls::codec::cert_type;
+        use crate::x509::AnyPublicKey;
+
+        // Generate an Ed25519 server identity. The SPKI is the public key
+        // wrapped in a PKIX SubjectPublicKeyInfo (RFC 8410); that's the
+        // exact byte string the server will hand back as its
+        // CertificateEntry body when RawPublicKey is negotiated.
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"rpk-server-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut keygen_rng);
+        let spki = AnyPublicKey::Ed25519(key.public_key()).to_spki_der();
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec::Vec::new(), key)
+            .with_raw_public_key_spki(spki.clone())
+            .with_server_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ]);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk-server", b"nonce", &[]);
+
+        // The client offers RawPublicKey ahead of X.509 and pins the
+        // server's SPKI on an allowlist. `RootCertStore` stays empty —
+        // there's no PKI to consult when RPK is in use.
+        let client_cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ])
+            .add_expected_raw_public_key(spki.clone());
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking(),
+            "client did not finish RPK handshake"
+        );
+        assert!(
+            !server.is_handshaking(),
+            "server did not finish RPK handshake"
+        );
+
+        // App data round-trips both ways under the RPK-authenticated
+        // session.
+        client.send_application_data(b"ping rpk").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping rpk");
+
+        server.send_application_data(b"pong rpk").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong rpk");
+    }
+
+    /// RFC 7250 SPKI allowlist mismatch: the client offers RawPublicKey and
+    /// the server agrees, but the client's expected SPKI doesn't match
+    /// what the server actually sends. The handshake aborts at
+    /// `CertificateVerify` time with `BadCertificate`.
+    #[test]
+    fn server_raw_public_key_allowlist_mismatch() {
+        use crate::tls::codec::cert_type;
+        use crate::x509::AnyPublicKey;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"rpk-server-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut keygen_rng);
+        let real_spki = AnyPublicKey::Ed25519(key.public_key()).to_spki_der();
+
+        // A different key — its SPKI is what the client pins, so the
+        // server's SPKI will not match the allowlist.
+        let mut other_rng = HmacDrbg::<Sha256>::new(b"rpk-other-key", b"nonce", &[]);
+        let other_key = Ed25519PrivateKey::generate(&mut other_rng);
+        let pinned_spki = AnyPublicKey::Ed25519(other_key.public_key()).to_spki_der();
+        assert_ne!(real_spki, pinned_spki);
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec::Vec::new(), key)
+            .with_raw_public_key_spki(real_spki)
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk-mismatch-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk-mismatch-server", b"nonce", &[]);
+
+        let client_cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY])
+            .add_expected_raw_public_key(pinned_spki);
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::BadCertificate
+        );
+    }
+
+    /// When the client opts into RPK but never adds anything to the SPKI
+    /// allowlist, verification must refuse — there is no way to establish
+    /// trust over a bare key without an out-of-band identity policy.
+    #[test]
+    fn server_raw_public_key_empty_allowlist_rejects() {
+        use crate::tls::codec::cert_type;
+        use crate::x509::AnyPublicKey;
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"rpk-server-key", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut keygen_rng);
+        let spki = AnyPublicKey::Ed25519(key.public_key()).to_spki_der();
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec::Vec::new(), key)
+            .with_raw_public_key_spki(spki)
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk-empty-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk-empty-server", b"nonce", &[]);
+
+        let client_cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+        // No add_expected_raw_public_key — allowlist intentionally empty.
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        assert_eq!(
+            drive_until_client_error(&mut client, &mut server),
+            crate::tls::Error::BadCertificate
+        );
+    }
+
+    /// If the client only offers RawPublicKey but the server has no SPKI
+    /// configured, negotiation cannot pick a usable type and the server
+    /// terminates with `handshake_failure`.
+    #[test]
+    fn server_raw_public_key_no_overlap_fails() {
+        use crate::tls::codec::cert_type;
+
+        // Server configured with X.509 only (no raw_public_key_spki).
+        let (server_config, _cert_der) = ed25519_server();
+        let server_config =
+            server_config.with_server_cert_type_preference(alloc::vec![cert_type::X509]);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"rpk-noov-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"rpk-noov-server", b"nonce", &[]);
+
+        // Client offers RPK only, so no overlap with the server's
+        // accept-set.
+        let client_cfg = ClientConfig::new(RootCertStore::new())
+            .with_server_cert_type_preference(alloc::vec![cert_type::RAW_PUBLIC_KEY]);
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // The server fails the CH; the client sees the resulting alert.
+        let mut last_err: Option<crate::tls::Error> = None;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty()
+                && let Err(e) = {
+                    server.read_tls(&c);
+                    server.process_new_packets()
+                }
+            {
+                last_err = Some(e);
+                break;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                let _ = client.process_new_packets();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(last_err, Some(crate::tls::Error::HandshakeFailure));
+    }
+
     #[test]
     fn rejects_wrong_hostname() {
         let (server_config, cert_der) = rsa_server();

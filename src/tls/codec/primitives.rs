@@ -108,6 +108,22 @@ impl SignatureScheme {
     }
 }
 
+/// IANA `TLS Certificate Types` (RFC 7250 §3). The value is the single byte
+/// carried in the `client_certificate_type` / `server_certificate_type`
+/// extension lists and, on the server's reply in EncryptedExtensions, as
+/// the bare selected byte.
+pub(crate) mod cert_type {
+    /// `X509 = 0` (RFC 7250 §3) — the default. The TLS 1.3 `Certificate`
+    /// message carries DER-encoded X.509 certificates, as in RFC 8446 §4.4.2.
+    pub(crate) const X509: u8 = 0;
+    /// `RawPublicKey = 2` (RFC 7250 §3). The TLS 1.3 `Certificate` message
+    /// carries a single CertificateEntry whose body is the bare
+    /// `SubjectPublicKeyInfo` DER, with no surrounding X.509 cert and no
+    /// chain. Trust is established out-of-band (a pre-provisioned key, an
+    /// allowlist of accepted SPKIs, or DANE).
+    pub(crate) const RAW_PUBLIC_KEY: u8 = 2;
+}
+
 u16_id!(
     /// A handshake extension type.
     ExtensionType {
@@ -156,6 +172,18 @@ u16_id!(
         /// psk_key_exchange_modes (RFC 8446 §4.2.9). Body: a `u8`-length list
         /// of mode bytes (0 = psk_ke, 1 = psk_dhe_ke).
         PSK_KEY_EXCHANGE_MODES = 0x002d,
+        /// client_certificate_type (RFC 7250 §3). Negotiates the type of
+        /// certificate the client will send for mTLS. In ClientHello, a
+        /// `u8`-length list of certificate-type IDs the client supports;
+        /// in EncryptedExtensions, the server echoes the single byte it
+        /// picked. Values: `0 = X509` (the default), `2 = RawPublicKey`.
+        CLIENT_CERTIFICATE_TYPE = 0x0013,
+        /// server_certificate_type (RFC 7250 §3). Same wire shape as
+        /// `client_certificate_type`, but negotiates the type of certificate
+        /// the SERVER will send (the common case for raw public keys, e.g.
+        /// IoT devices presenting a bare SPKI to clients pre-provisioned
+        /// with the device's key).
+        SERVER_CERTIFICATE_TYPE = 0x0014,
         /// key_share.
         KEY_SHARE = 0x0033,
         /// quic_transport_parameters (RFC 9001 §8.2 + §18 codepoint registry).
