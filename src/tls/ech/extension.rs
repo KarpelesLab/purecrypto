@@ -148,6 +148,28 @@ pub(crate) fn zero_payload(ext_body: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(out)
 }
 
+/// Locate the `payload` field inside an outer-form ECH extension
+/// body. Returns `(offset, length)` measured from the start of the
+/// extension body (i.e. `body[offset..offset + length]` are the
+/// payload bytes). Errors on inner-form bodies or malformed bytes.
+pub(crate) fn decode_outer_position(ext_body: &[u8]) -> Result<(usize, usize), Error> {
+    let mut rd = Reader::new(ext_body);
+    let ty = rd.read_u8()?;
+    if ty != TYPE_OUTER {
+        return Err(Error::EchDecodeError);
+    }
+    rd.read(4)?; // cipher_suite
+    rd.read_u8()?; // config_id
+    let enc_len = rd.read_u16()? as usize;
+    rd.read(enc_len)?;
+    let pl_len = rd.read_u16()? as usize;
+    let pl_off = rd.pos;
+    if pl_len == 0 || ext_body.len() < pl_off + pl_len {
+        return Err(Error::EchDecodeError);
+    }
+    Ok((pl_off, pl_len))
+}
+
 /// Tiny reader; private to this module. Same shape as the one in
 /// [`super::config`] but with [`Self::pos`] exposed so
 /// [`zero_payload`] can compute the payload offset.

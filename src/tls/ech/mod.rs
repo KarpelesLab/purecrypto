@@ -43,6 +43,7 @@ pub mod grease;
 pub mod hpke_setup;
 pub mod inner;
 pub mod keys;
+pub mod outer;
 pub mod retry;
 
 #[cfg(test)]

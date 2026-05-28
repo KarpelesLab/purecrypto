@@ -1,0 +1,411 @@
+//! Outer ClientHello derivation and HPKE seal pipeline
+//! (draft-ietf-tls-esni-22 §6.1).
+//!
+//! The client builds the **inner** ClientHello first (real SNI, real
+//! ALPN, all the rendezvous bits the network shouldn't see), pads it
+//! to round out its length, then HPKE-seals it into the **outer**
+//! ClientHello under the `encrypted_client_hello` extension. The
+//! outer CH's SNI is the `ECHConfig.public_name`; everything else on
+//! the outer side is bit-shape-identical to a GREASE CH so the wire
+//! image of a real-ECH client and a GREASE client is visually the
+//! same to an on-path observer.
+//!
+//! The seal pipeline:
+//!
+//! 1. Build the inner CH bytes (caller).
+//! 2. Pad to a small constant length policy (`encoded_inner_padded`).
+//! 3. Compute `info = "tls ech\0" || ECHConfig` (caller-provided).
+//! 4. HPKE setup_sender → `enc` + `SenderContext`.
+//! 5. Build the outer CH containing an `encrypted_client_hello`
+//!    extension whose `payload` field is zeroes of the same length the
+//!    sealed ciphertext will occupy (= `len(padded_inner) +
+//!    aead_tag_len`).
+//! 6. The `ClientHelloOuterAAD` is exactly the outer CH bytes above —
+//!    the spec says the `payload` field is treated as zeroes for the
+//!    AAD computation, which is what we just built.
+//! 7. `sender_ctx.seal(aad, padded_inner)` → ciphertext.
+//! 8. Patch the ciphertext into the payload bytes in the outer CH.
+//!
+//! The functions here implement steps 2 and 7–8 as pure operations on
+//! byte slices; the connection-state-machine wave hands the inner CH
+//! bytes and outer CH skeleton in and reads the sealed outer CH bytes
+//! back out.
+
+use super::config::{EchConfig, HpkeSymCipherSuite};
+use super::extension::{EchExtension, decode_outer_position};
+use super::hpke_setup::{setup_receiver, setup_sender};
+use crate::hpke::SenderContext;
+use crate::rng::RngCore;
+use crate::tls::Error;
+use alloc::vec::Vec;
+
+/// AEAD tag length for the HPKE suites we map to: GCM and
+/// ChaCha20-Poly1305 both use a 16-byte tag (the only AEADs supported
+/// by `map_sym_suite`; ExportOnly is rejected before we get here).
+pub(crate) const HPKE_TAG_LEN: usize = 16;
+
+/// Padding policy for the encoded inner CH. The draft (§6.1.3)
+/// recommends padding to a multiple of 32 and topping up with extra
+/// blocks if the inner CH's host name is shorter than the published
+/// `maximum_name_length` so the leaked length doesn't reveal whether
+/// the inner SNI is shorter than the public one.
+///
+/// Given a fully-encoded ClientHelloInner of length `L_in` and a
+/// published `maximum_name_length` (the cap the server advertises),
+/// the padded plaintext length is:
+///
+/// ```text
+///   L_pad = max(L_in, L_in + (maximum_name_length - L_sni)) rounded up to 32
+/// ```
+///
+/// where `L_sni` is the byte length of the inner SNI host name. If
+/// `L_sni >= maximum_name_length` the second term collapses to
+/// `L_in`. We then round `L_pad` up to the next multiple of 32 with a
+/// minimum of 32 to keep tiny CHs from leaking through the floor.
+pub(crate) fn pad_inner(
+    encoded_inner: &[u8],
+    inner_sni_len: usize,
+    maximum_name_length: u8,
+) -> Vec<u8> {
+    let max_len = maximum_name_length as usize;
+    let extra = max_len.saturating_sub(inner_sni_len);
+    let target = encoded_inner.len() + extra;
+    let target = target.next_multiple_of(32).max(32);
+    let mut out = encoded_inner.to_vec();
+    out.resize(target, 0);
+    out
+}
+
+/// Result of [`seal_with`]: the outer CH bytes with the
+/// `encrypted_client_hello` payload sealed in place, plus the HPKE
+/// sender context (held by the client for any future export steps).
+pub(crate) struct SealedOuter {
+    /// The outer CH wire bytes with the `encrypted_client_hello`
+    /// payload populated with the HPKE ciphertext.
+    pub outer_ch: Vec<u8>,
+    /// The HPKE sender context, retained by the caller for any later
+    /// export-secret derivations the protocol may need.
+    pub sender: SenderContext,
+}
+
+/// Splices an HPKE-sealed payload into an already-built outer CH
+/// skeleton, using a pre-existing [`SenderContext`].
+///
+/// `outer_ch_skeleton` is the outer CH wire bytes carrying an
+/// `encrypted_client_hello` extension whose `payload` field is zeroes
+/// of length exactly `padded_inner.len() + HPKE_TAG_LEN`. The
+/// function fails with [`Error::EchDecodeError`] if no such extension
+/// is present, if there are multiple of them, or if the payload
+/// length doesn't match what HPKE will produce. AEAD failure maps to
+/// [`Error::EchDecryptionFailed`].
+///
+/// The seal proceeds with:
+/// - `aad = outer_ch_skeleton` (which already has the payload field
+///   zeroed and so equals `ClientHelloOuterAAD` per draft §6.1.2)
+/// - `plaintext = padded_inner`
+fn seal_into_skeleton(
+    sender: &mut SenderContext,
+    outer_ch_skeleton: Vec<u8>,
+    padded_inner: &[u8],
+) -> Result<Vec<u8>, Error> {
+    let (start, len) = locate_payload_in_handshake(&outer_ch_skeleton)?;
+    if len != padded_inner.len() + HPKE_TAG_LEN {
+        return Err(Error::EchDecodeError);
+    }
+    // ClientHelloOuterAAD is the outer CH with the payload field
+    // zeroed — and the skeleton already has zeros there. So AAD = the
+    // skeleton bytes verbatim.
+    let aad = outer_ch_skeleton.clone();
+    let ciphertext = sender
+        .seal(&aad, padded_inner)
+        .map_err(|_| Error::EchDecryptionFailed)?;
+    if ciphertext.len() != len {
+        return Err(Error::EchDecryptionFailed);
+    }
+    let mut outer_ch = outer_ch_skeleton;
+    outer_ch[start..start + len].copy_from_slice(&ciphertext);
+    Ok(outer_ch)
+}
+
+/// Locates the `encrypted_client_hello` payload byte range within a
+/// CH handshake message (header + body) for in-place ciphertext
+/// substitution.
+///
+/// Returns `(offset, length)` where `offset` is the absolute index
+/// into the handshake message at which the payload bytes start, and
+/// `length` is the number of bytes they occupy. Fails with
+/// [`Error::EchDecodeError`] if the message is not a syntactically
+/// valid CH, if no outer-form `encrypted_client_hello` extension is
+/// present, or if more than one is present (the second case would
+/// make the AAD construction ambiguous).
+pub(crate) fn locate_payload_in_handshake(handshake_msg: &[u8]) -> Result<(usize, usize), Error> {
+    // Handshake msg: u8 msg_type (1=ClientHello) ++ u24 length ++ body.
+    if handshake_msg.len() < 4 || handshake_msg[0] != crate::tls::codec::hs_type::CLIENT_HELLO {
+        return Err(Error::EchDecodeError);
+    }
+    let body_len = ((handshake_msg[1] as usize) << 16)
+        | ((handshake_msg[2] as usize) << 8)
+        | (handshake_msg[3] as usize);
+    if 4 + body_len != handshake_msg.len() {
+        return Err(Error::EchDecodeError);
+    }
+    let body = &handshake_msg[4..];
+    // ClientHello body: version(2) || random(32) || session_id(u8) ||
+    // cipher_suites(u16) || compression_methods(u8) || extensions(u16).
+    let mut idx = 0usize;
+    let need = |idx: usize, n: usize| -> Result<(), Error> {
+        if idx + n > body.len() {
+            Err(Error::EchDecodeError)
+        } else {
+            Ok(())
+        }
+    };
+    need(idx, 2)?;
+    idx += 2;
+    need(idx, 32)?;
+    idx += 32;
+    need(idx, 1)?;
+    let sid_len = body[idx] as usize;
+    idx += 1;
+    need(idx, sid_len)?;
+    idx += sid_len;
+    need(idx, 2)?;
+    let cs_len = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    need(idx, cs_len)?;
+    idx += cs_len;
+    need(idx, 1)?;
+    let cm_len = body[idx] as usize;
+    idx += 1;
+    need(idx, cm_len)?;
+    idx += cm_len;
+    need(idx, 2)?;
+    let ext_total = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    let ext_start_in_body = idx;
+    need(idx, ext_total)?;
+    let ext_end_in_body = idx + ext_total;
+
+    // Walk extensions; find the unique encrypted_client_hello.
+    let mut p = ext_start_in_body;
+    let mut found: Option<(usize, usize)> = None;
+    while p < ext_end_in_body {
+        if p + 4 > ext_end_in_body {
+            return Err(Error::EchDecodeError);
+        }
+        let ty = ((body[p] as u16) << 8) | (body[p + 1] as u16);
+        let bl = ((body[p + 2] as usize) << 8) | (body[p + 3] as usize);
+        let body_start = p + 4;
+        let body_end = body_start + bl;
+        if body_end > ext_end_in_body {
+            return Err(Error::EchDecodeError);
+        }
+        if ty == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO.0 {
+            if found.is_some() {
+                return Err(Error::EchDecodeError);
+            }
+            // Within an outer-form ECH extension body, locate the
+            // payload bytes. The extension body has a precomputable
+            // header layout: u8 type=0 || u16 kdf || u16 aead || u8
+            // config_id || u16 enc_len || enc || u16 payload_len ||
+            // payload. We delegate to the codec helper to find
+            // (payload_offset_in_body, payload_len).
+            let ext_body = &body[body_start..body_end];
+            let (pay_off_in_body, pay_len) = decode_outer_position(ext_body)?;
+            // Convert to absolute offset into the handshake msg.
+            let abs = 4 + body_start + pay_off_in_body;
+            found = Some((abs, pay_len));
+        }
+        p = body_end;
+    }
+    found.ok_or(Error::EchDecodeError)
+}
+
+/// Builds the outer-form `encrypted_client_hello` extension *body* a
+/// real-ECH client emits, with the payload field still zeroed (the
+/// caller patches in the HPKE ciphertext later). Returned shape:
+///
+/// ```text
+///   u8 type = 0
+///   u16 kdf_id
+///   u16 aead_id
+///   u8 config_id
+///   u16 enc_len || enc
+///   u16 payload_len || zeroes(payload_len)
+/// ```
+///
+/// `payload_len` is the AEAD output size = padded inner CH length +
+/// 16 (AES-GCM / ChaCha20-Poly1305 tag).
+pub(crate) fn build_outer_ext_body(
+    sym: HpkeSymCipherSuite,
+    config_id: u8,
+    enc: &[u8],
+    padded_inner_len: usize,
+) -> Vec<u8> {
+    let payload_len = padded_inner_len + HPKE_TAG_LEN;
+    let ext = EchExtension::Outer {
+        cipher_suite: sym,
+        config_id,
+        enc: enc.to_vec(),
+        payload: alloc::vec![0u8; payload_len],
+    };
+    ext.encode()
+}
+
+/// Combines [`pad_inner`], encoding the outer skeleton, and the HPKE
+/// seal into a single client-side operation.
+///
+/// `caller_build_outer_skeleton` produces the wire bytes of the outer
+/// CH including an `encrypted_client_hello` extension whose payload is
+/// already zeroed of length `padded_inner.len() + HPKE_TAG_LEN`. The
+/// HPKE setup_sender output is fed back to the caller via the closure
+/// so it can compose the correct outer ext body before producing the
+/// skeleton.
+///
+/// This indirection keeps the CH skeleton building (extension order,
+/// length-prefix accounting) in the client where the rest of the CH
+/// builder lives, while the seal pipeline stays here.
+pub(crate) fn seal_with<R, F>(
+    config: &EchConfig,
+    sym: HpkeSymCipherSuite,
+    encoded_inner: &[u8],
+    inner_sni_len: usize,
+    rng: &mut R,
+    caller_build_outer_skeleton: F,
+) -> Result<SealedOuter, Error>
+where
+    R: RngCore,
+    F: FnOnce(&[u8], usize) -> Vec<u8>,
+{
+    let contents = config.contents.as_ref().ok_or(Error::EchDecodeError)?;
+    let padded = pad_inner(encoded_inner, inner_sni_len, contents.maximum_name_length);
+    let (enc, mut sender, _suite) = setup_sender(rng, config, sym)?;
+    let skeleton = caller_build_outer_skeleton(&enc, padded.len());
+    let outer_ch = seal_into_skeleton(&mut sender, skeleton, &padded)?;
+    Ok(SealedOuter { outer_ch, sender })
+}
+
+/// Server-side: given the outer CH handshake bytes and a configured
+/// `EchKeyRing`, try every step of HPKE decap and return the
+/// decrypted, padding-stripped inner CH bytes on success.
+///
+/// Failure modes (all map to "continue under outer CH, signal reject
+/// via retry_configs"): no ECH extension in the outer CH, unknown
+/// `config_id`, AEAD tag rejection, malformed plaintext, or the
+/// expected inner-marker `encrypted_client_hello` extension missing
+/// from the decrypted CH.
+pub(crate) fn try_decap_inner(
+    handshake_msg: &[u8],
+    keys: &super::keys::EchKeyRing,
+) -> Result<Vec<u8>, Error> {
+    // Walk the outer CH to find the encrypted_client_hello body and
+    // its payload byte range; the AAD computation needs the byte
+    // image with the payload zeroed.
+    let (payload_off, payload_len) = locate_payload_in_handshake(handshake_msg)?;
+    let mut aad = handshake_msg.to_vec();
+    for b in aad[payload_off..payload_off + payload_len].iter_mut() {
+        *b = 0;
+    }
+    let ciphertext = handshake_msg[payload_off..payload_off + payload_len].to_vec();
+
+    // Locate and parse the extension body so we recover (sym, config_id, enc).
+    let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
+
+    let pair = keys
+        .find_by_config_id(config_id)
+        .ok_or(Error::EchDecryptionFailed)?;
+    let (mut receiver, _suite) =
+        setup_receiver(pair.config(), pair.private_key_bytes(), &enc, sym)?;
+    let plaintext = receiver
+        .open(&aad, &ciphertext)
+        .map_err(|_| Error::EchDecryptionFailed)?;
+    // Strip trailing zero padding to recover the encoded inner CH.
+    // Padding consists of an arbitrary number of trailing zero bytes;
+    // since a ClientHello body is length-prefixed, anything past the
+    // declared length is padding.
+    let unpadded = strip_trailing_padding(&plaintext)?;
+    Ok(unpadded)
+}
+
+/// Walks the outer CH to find the `encrypted_client_hello` extension
+/// and returns `(sym, config_id, enc_bytes)` parsed from its outer
+/// form.
+fn extract_outer_meta(handshake_msg: &[u8]) -> Result<(HpkeSymCipherSuite, u8, Vec<u8>), Error> {
+    // Walk to the extensions block.
+    let body = handshake_msg.get(4..).ok_or(Error::EchDecodeError)?;
+    let mut idx = 0usize;
+    let need = |idx: usize, n: usize| -> Result<(), Error> {
+        if idx + n > body.len() {
+            Err(Error::EchDecodeError)
+        } else {
+            Ok(())
+        }
+    };
+    need(idx, 2 + 32 + 1)?;
+    idx += 2 + 32;
+    let sid_len = body[idx] as usize;
+    idx += 1;
+    need(idx, sid_len + 2)?;
+    idx += sid_len;
+    let cs_len = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    need(idx, cs_len + 1)?;
+    idx += cs_len;
+    let cm_len = body[idx] as usize;
+    idx += 1;
+    need(idx, cm_len + 2)?;
+    idx += cm_len;
+    let ext_total = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    need(idx, ext_total)?;
+    let ext_start = idx;
+    let ext_end = idx + ext_total;
+    let mut p = ext_start;
+    while p < ext_end {
+        if p + 4 > ext_end {
+            return Err(Error::EchDecodeError);
+        }
+        let ty = ((body[p] as u16) << 8) | (body[p + 1] as u16);
+        let bl = ((body[p + 2] as usize) << 8) | (body[p + 3] as usize);
+        let body_start = p + 4;
+        let body_end = body_start + bl;
+        if body_end > ext_end {
+            return Err(Error::EchDecodeError);
+        }
+        if ty == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO.0 {
+            let ext_body = &body[body_start..body_end];
+            let ext = EchExtension::decode(ext_body)?;
+            match ext {
+                EchExtension::Outer {
+                    cipher_suite,
+                    config_id,
+                    enc,
+                    ..
+                } => return Ok((cipher_suite, config_id, enc)),
+                EchExtension::Inner => return Err(Error::EchDecodeError),
+            }
+        }
+        p = body_end;
+    }
+    Err(Error::EchDecodeError)
+}
+
+/// Strips trailing zero padding from a decrypted padded inner CH and
+/// returns the inner CH wire bytes. The inner CH is a complete
+/// handshake message with header + length, so anything past the
+/// declared length is padding (must all be zero).
+fn strip_trailing_padding(padded: &[u8]) -> Result<Vec<u8>, Error> {
+    if padded.len() < 4 || padded[0] != crate::tls::codec::hs_type::CLIENT_HELLO {
+        return Err(Error::EchDecodeError);
+    }
+    let body_len =
+        ((padded[1] as usize) << 16) | ((padded[2] as usize) << 8) | (padded[3] as usize);
+    let total = 4 + body_len;
+    if total > padded.len() {
+        return Err(Error::EchDecodeError);
+    }
+    if padded[total..].iter().any(|b| *b != 0) {
+        return Err(Error::EchDecodeError);
+    }
+    Ok(padded[..total].to_vec())
+}

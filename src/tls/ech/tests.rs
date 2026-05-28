@@ -813,3 +813,329 @@ fn decompress_passes_through_when_no_placeholder() {
     let out = decompress_extensions(&compressed, &outer).expect("passthrough");
     assert_eq!(out, compressed);
 }
+
+// ============================================================================
+// Outer-CH HPKE seal pipeline (outer.rs)
+// ============================================================================
+
+use super::outer::{
+    HPKE_TAG_LEN, build_outer_ext_body, locate_payload_in_handshake, pad_inner, seal_with,
+    try_decap_inner,
+};
+
+/// Build a minimal but syntactically-valid ClientHello handshake message
+/// containing exactly one extension: an outer-form `encrypted_client_hello`
+/// with the given body.
+fn build_outer_ch_with_ech(ech_ext_body: &[u8]) -> Vec<u8> {
+    // CH body: version(2) + random(32) + sid_len(1)+sid + cs_len(2)+cs +
+    // cm_len(1)+cm + ext_len(2)+ext.
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes()); // legacy_version
+    body.extend_from_slice(&[0x42u8; 32]); // random
+    body.push(0); // sid_len = 0
+    body.extend_from_slice(&2u16.to_be_bytes()); // cs_len
+    body.extend_from_slice(&0x1301u16.to_be_bytes()); // AES-128-GCM-SHA256
+    body.push(1); // cm_len
+    body.push(0); // null compression
+    let mut exts: Vec<u8> = Vec::new();
+    let ty = ExtensionType::ENCRYPTED_CLIENT_HELLO.0;
+    exts.extend_from_slice(&ty.to_be_bytes());
+    let bl: u16 = u16::try_from(ech_ext_body.len()).unwrap();
+    exts.extend_from_slice(&bl.to_be_bytes());
+    exts.extend_from_slice(ech_ext_body);
+    let el: u16 = u16::try_from(exts.len()).unwrap();
+    body.extend_from_slice(&el.to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let mut msg: Vec<u8> = Vec::new();
+    msg.push(crate::tls::codec::hs_type::CLIENT_HELLO);
+    let bl_u32 = u32::try_from(body.len()).unwrap();
+    msg.push(((bl_u32 >> 16) & 0xff) as u8);
+    msg.push(((bl_u32 >> 8) & 0xff) as u8);
+    msg.push((bl_u32 & 0xff) as u8);
+    msg.extend_from_slice(&body);
+    msg
+}
+
+/// Build a minimal encoded inner CH for the round-trip test: an
+/// otherwise-empty CH carrying just the inner-form ECH marker so the
+/// server can confirm what it decrypted is an ECH inner.
+fn build_inner_ch_marker() -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&[0x55u8; 32]);
+    body.push(0); // sid_len
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1);
+    body.push(0);
+    let mut exts: Vec<u8> = Vec::new();
+    let ech_inner = inner_extension_body();
+    exts.extend_from_slice(&ExtensionType::ENCRYPTED_CLIENT_HELLO.0.to_be_bytes());
+    let bl: u16 = u16::try_from(ech_inner.len()).unwrap();
+    exts.extend_from_slice(&bl.to_be_bytes());
+    exts.extend_from_slice(&ech_inner);
+    let el: u16 = u16::try_from(exts.len()).unwrap();
+    body.extend_from_slice(&el.to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let mut msg: Vec<u8> = Vec::new();
+    msg.push(crate::tls::codec::hs_type::CLIENT_HELLO);
+    let bl_u32 = u32::try_from(body.len()).unwrap();
+    msg.push(((bl_u32 >> 16) & 0xff) as u8);
+    msg.push(((bl_u32 >> 8) & 0xff) as u8);
+    msg.push((bl_u32 & 0xff) as u8);
+    msg.extend_from_slice(&body);
+    msg
+}
+
+#[test]
+fn pad_inner_rounds_up_to_multiple_of_32_with_min_32() {
+    // Tiny CH → bumped to 32.
+    let p = pad_inner(&[0x11u8; 5], 0, 0);
+    assert_eq!(p.len(), 32);
+    assert_eq!(&p[..5], &[0x11; 5]);
+    assert!(p[5..].iter().all(|b| *b == 0));
+}
+
+#[test]
+fn pad_inner_extra_for_sni_shorter_than_maximum_name_length() {
+    const L_IN: usize = 40;
+    let l_sni = 5usize;
+    let l_max = 64u8;
+    let p = pad_inner(&[0xAAu8; L_IN], l_sni, l_max);
+    // extra = 64 - 5 = 59; target = 40 + 59 = 99; rounded up to 128.
+    assert_eq!(p.len(), 128);
+    assert!(p[L_IN..].iter().all(|b| *b == 0));
+}
+
+#[test]
+fn pad_inner_no_extra_when_sni_at_least_max() {
+    let p = pad_inner(&[0xBBu8; 50], 200, 64);
+    // extra collapses to 0; target = 50 rounded up to 64.
+    assert_eq!(p.len(), 64);
+}
+
+#[test]
+fn locate_payload_finds_ech_payload_offset_and_length() {
+    let ext_body = build_outer_ext_body(
+        HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0001,
+        },
+        0xab,
+        &[0x77u8; 32],
+        48,
+    );
+    let msg = build_outer_ch_with_ech(&ext_body);
+    let (off, len) = locate_payload_in_handshake(&msg).expect("locate");
+    assert_eq!(len, 48 + HPKE_TAG_LEN);
+    // Verify the bytes at the located range are zero (skeleton).
+    assert!(msg[off..off + len].iter().all(|b| *b == 0));
+}
+
+#[test]
+fn locate_payload_rejects_wrong_handshake_type() {
+    let mut msg = build_outer_ch_with_ech(&build_outer_ext_body(
+        HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0001,
+        },
+        1,
+        &[0x00u8; 8],
+        32,
+    ));
+    msg[0] = crate::tls::codec::hs_type::SERVER_HELLO;
+    assert!(matches!(
+        locate_payload_in_handshake(&msg),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn locate_payload_rejects_no_ech_extension() {
+    // Build a CH with only one non-ECH extension.
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(0);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1);
+    body.push(0);
+    let mut exts: Vec<u8> = Vec::new();
+    exts.extend_from_slice(&ExtensionType::SERVER_NAME.0.to_be_bytes());
+    exts.extend_from_slice(&0u16.to_be_bytes());
+    let el: u16 = u16::try_from(exts.len()).unwrap();
+    body.extend_from_slice(&el.to_be_bytes());
+    body.extend_from_slice(&exts);
+    let mut msg: Vec<u8> = Vec::new();
+    msg.push(crate::tls::codec::hs_type::CLIENT_HELLO);
+    let bl = u32::try_from(body.len()).unwrap();
+    msg.extend_from_slice(&[
+        ((bl >> 16) & 0xff) as u8,
+        ((bl >> 8) & 0xff) as u8,
+        (bl & 0xff) as u8,
+    ]);
+    msg.extend_from_slice(&body);
+    assert!(matches!(
+        locate_payload_in_handshake(&msg),
+        Err(Error::EchDecodeError)
+    ));
+}
+
+#[test]
+fn seal_and_decap_round_trip_x25519_aes128gcm() {
+    // Mint a server-side X25519 ECH key.
+    let mut rng = drbg(b"seal-x25519");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+    // Build a plain inner CH carrying the inner-form ECH marker.
+    let inner = build_inner_ch_marker();
+
+    // Seal it into an outer skeleton. The closure produces the outer
+    // CH bytes whose ECH extension payload is zeroed.
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    // Decap on the server side and recover the inner CH.
+    let recovered = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
+    assert_eq!(recovered, inner);
+}
+
+#[test]
+fn decap_rejects_unknown_config_id() {
+    let mut rng = drbg(b"decap-cfg-id");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+    let inner = build_inner_ch_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    // Seal under config_id = 0x99 (not in ring).
+    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x99, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+    assert!(matches!(
+        try_decap_inner(&sealed.outer_ch, &ring),
+        Err(Error::EchDecryptionFailed)
+    ));
+}
+
+#[test]
+fn decap_rejects_aead_corruption() {
+    let mut rng = drbg(b"decap-corrupt");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x07,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+    let inner = build_inner_ch_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x07, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    // Flip a byte in the ciphertext.
+    let (off, len) = locate_payload_in_handshake(&sealed.outer_ch).expect("locate");
+    let mut corrupted = sealed.outer_ch.clone();
+    let _ = len;
+    corrupted[off] ^= 0x01;
+    assert!(matches!(
+        try_decap_inner(&corrupted, &ring),
+        Err(Error::EchDecryptionFailed)
+    ));
+}
+
+#[test]
+fn decap_rejects_aad_mutation_outside_payload() {
+    // Mutate a byte in the outer CH outside the payload (e.g. a byte
+    // in the random) — AEAD should reject because the AAD differs.
+    let mut rng = drbg(b"decap-aad");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x11,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+    let inner = build_inner_ch_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x11, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    // Tamper with a random byte (well outside the payload).
+    let mut tampered = sealed.outer_ch.clone();
+    tampered[10] ^= 0xff;
+    assert!(matches!(
+        try_decap_inner(&tampered, &ring),
+        Err(Error::EchDecryptionFailed)
+    ));
+}
