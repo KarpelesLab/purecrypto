@@ -27,7 +27,8 @@
 //! evolve before 1.0.
 
 #[cfg(feature = "cert-compression")]
-pub(crate) mod cert_compression;
+#[doc(hidden)]
+pub mod cert_compression;
 pub(crate) mod codec;
 mod config;
 pub(crate) mod conn;

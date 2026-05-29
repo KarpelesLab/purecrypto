@@ -27,7 +27,7 @@ libfuzzer-sys = "0.4"
 purecrypto = { path = "..", features = [
     "std", "alloc", "hash", "cipher", "kdf", "mac", "bignum", "rng",
     "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
-    "mlkem", "mldsa", "slhdsa",
+    "mlkem", "mldsa", "slhdsa", "hpke", "ech", "cert-compression",
 ] }
 
 # Optimised debug info so libFuzzer's stack traces and `cargo fuzz fmt`
@@ -182,6 +182,40 @@ bench = false
 [[bin]]
 name = "quic_server_feed"
 path = "fuzz_targets/quic_server_feed.rs"
+test = false
+doc = false
+bench = false
+
+# --- ECH + cert compression: untrusted wire-format parsers introduced
+# in the Phase 5 / Phase 7 TLS-parity work. The handshake-state-machine
+# feed targets above also reach these once `hpke` / `ech` /
+# `cert-compression` are in the main crate's feature set; these are the
+# direct entry points.
+
+[[bin]]
+name = "ech_config_list"
+path = "fuzz_targets/ech_config_list.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ech_retry_configs"
+path = "fuzz_targets/ech_retry_configs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ech_extension"
+path = "fuzz_targets/ech_extension.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cert_decompress"
+path = "fuzz_targets/cert_decompress.rs"
 test = false
 doc = false
 bench = false

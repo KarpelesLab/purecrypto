@@ -27,6 +27,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
+name = "compcol"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "634054fc964361521d49c03664c7524d2e1d7bd55978fab57cf6c3712e4771d5"
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -73,6 +79,9 @@ dependencies = [
 [[package]]
 name = "purecrypto"
 version = "0.2.0"
+dependencies = [
+ "compcol",
+]
 
 [[package]]
 name = "purecrypto-fuzz"

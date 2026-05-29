@@ -54,7 +54,8 @@ use alloc::vec::Vec;
 /// classic decompression-bomb defence per RFC 8879 §5. The TLS framing
 /// itself caps `Certificate` at `2^24 - 1` bytes, so this is purely a
 /// per-deployment policy knob we have chosen.
-pub(crate) const MAX_UNCOMPRESSED_BYTES: u32 = 256 * 1024;
+#[doc(hidden)]
+pub const MAX_UNCOMPRESSED_BYTES: u32 = 256 * 1024;
 
 /// IANA `CertificateCompressionAlgorithm` codepoints (RFC 8879 §7).
 pub(crate) mod algorithm {
@@ -114,7 +115,8 @@ pub(crate) fn encode_extension(algorithms: &[u16]) -> Vec<u8> {
 /// algorithm IDs the peer can DECOMPRESS, in their preference order. Per
 /// RFC 8879 §3 the inner list length is 2..=254 bytes (1..=127 IDs); we
 /// reject a zero-length list and any odd byte count.
-pub(crate) fn decode_extension(body: &[u8]) -> Result<Vec<u16>, Error> {
+#[doc(hidden)]
+pub fn decode_extension(body: &[u8]) -> Result<Vec<u16>, Error> {
     let mut c = ReadCursor::new(body);
     let list = c.vec_u8()?;
     c.expect_empty()?;
@@ -173,7 +175,8 @@ pub(crate) fn encode_compressed_certificate(
 /// failure (unsupported algorithm, malformed framing, decompression
 /// rejected, length mismatch, declared length over cap), this returns
 /// [`Error::CertDecompressionFailed`].
-pub(crate) fn decode_compressed_certificate(body: &[u8]) -> Result<Vec<u8>, Error> {
+#[doc(hidden)]
+pub fn decode_compressed_certificate(body: &[u8]) -> Result<Vec<u8>, Error> {
     let mut c = ReadCursor::new(body);
     let algorithm = c.u16().map_err(|_| Error::CertDecompressionFailed)?;
     let uncompressed_length_u32 = c.u24().map_err(|_| Error::CertDecompressionFailed)? as u32;

@@ -6,7 +6,7 @@ name: Fuzz
 # workflow artifacts so they can be added to the per-target seed corpus
 # as regression fixtures.
 #
-# The 20 targets and the `fuzz/` workspace they live in are intentionally
+# The 24 targets and the `fuzz/` workspace they live in are intentionally
 # excluded from the main Cargo workspace, so nothing here affects the
 # day-to-day stable build.
 
@@ -55,6 +55,10 @@ jobs:
           - dtls_server_feed
           - dtls_client_feed
           - quic_server_feed
+          - ech_config_list
+          - ech_retry_configs
+          - ech_extension
+          - cert_decompress
     steps:
       - uses: actions/checkout@v6
 
