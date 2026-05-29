@@ -527,6 +527,29 @@ pub struct ClientConnection {
     /// Used to enforce the RFC 9001 §8.2 "at most once" rule on top of the
     /// existing TLS extension-uniqueness check.
     peer_quic_params_seen: bool,
+
+    /// Per-handshake ECH state retained across CH emission (so SH
+    /// processing can verify the accept signal over `Hash(inner_CH ||
+    /// zero-tail SH)`) and EE processing (so a rejection can be
+    /// surfaced with the server's `retry_configs`). `None` outside of
+    /// the real-ECH attempt path. See [`ClientEchState`].
+    #[cfg(feature = "ech")]
+    ech_state: Option<ClientEchState>,
+}
+
+/// Client-side per-handshake ECH state, populated when emitting a CH
+/// under [`crate::tls::ech::EchClientMode::Real`] and consumed when
+/// processing the server's ServerHello (to verify the accept signal
+/// and swap the transcript from outer to inner) and
+/// EncryptedExtensions (to surface a rejection with `retry_configs`).
+#[cfg(feature = "ech")]
+#[derive(Clone, Debug)]
+pub(crate) struct ClientEchState {
+    /// The encoded **inner** CH handshake message bytes (header
+    /// included), the bytes the server processes after HPKE-decap.
+    /// Retained so we can recompute the accept signal and so we can
+    /// swap them into the transcript when the server confirms accept.
+    pub(crate) inner_ch_bytes: Vec<u8>,
 }
 
 /// What the client retains across CH emission so it can verify the server's
@@ -946,6 +969,8 @@ impl ClientConnection {
             engine_mode,
             hooks,
             peer_quic_params_seen: false,
+            #[cfg(feature = "ech")]
+            ech_state: None,
         };
         // Remember the offered PSK so we can seed the schedule when the
         // server selects it in SH.
@@ -958,6 +983,33 @@ impl ClientConnection {
                 conn.early_data_offered = true;
             }
         }
+        // draft-ietf-tls-esni-22 §6: if the client is configured for
+        // Real ECH (Some(EchClient { mode: Real(list) })) and there's
+        // no PSK in play (real ECH + PSK is a wave-later combo), try
+        // to seal an inner CH under HPKE and emit the outer CH as the
+        // wire ClientHello. Otherwise build the plain (possibly GREASE)
+        // ClientHello via build_client_hello with `ech_override = None`.
+        #[cfg(feature = "ech")]
+        let ech_sealed: Option<(Vec<u8>, Vec<u8>)> =
+            seal_real_ech_on_ch1(&conn, random, &effective_suites, groups, server_name, rng);
+
+        #[cfg(feature = "ech")]
+        let hello = match ech_sealed {
+            Some((outer_ch, inner_ch_bytes)) => {
+                conn.ech_state = Some(ClientEchState { inner_ch_bytes });
+                outer_ch
+            }
+            None => conn.build_client_hello(
+                random,
+                String::from(server_name),
+                &effective_suites,
+                groups,
+                &[],
+                &[],
+                None,
+            ),
+        };
+        #[cfg(not(feature = "ech"))]
         let hello = conn.build_client_hello(
             random,
             String::from(server_name),
@@ -965,6 +1017,7 @@ impl ClientConnection {
             groups,
             &[],
             &[],
+            None,
         );
 
         // Pre-set the transcript alg so the CH update settles the
@@ -1029,6 +1082,7 @@ impl ClientConnection {
     /// is computed over the truncated ClientHello and patched in place. The
     /// returned bytes are ready to emit to the wire and to feed to the
     /// transcript.
+    #[allow(clippy::too_many_arguments)]
     fn build_client_hello(
         &self,
         random: Random,
@@ -1037,7 +1091,13 @@ impl ClientConnection {
         groups: &[NamedGroup],
         share_only: &[NamedGroup],
         extra_extensions: &[crate::tls::codec::RawExtension],
+        ech_override: Option<&[u8]>,
     ) -> Vec<u8> {
+        // Without the `ech` feature there's no place where we'd consult
+        // `ech_override`; mark it as deliberately unused so the rest of
+        // this function is identical across feature combinations.
+        #[cfg(not(feature = "ech"))]
+        let _ = ech_override;
         let mut key_shares = Vec::new();
         for &g in groups {
             if !share_only.is_empty() && !share_only.contains(&g) {
@@ -1129,13 +1189,20 @@ impl ClientConnection {
         extensions.extend_from_slice(extra_extensions);
 
         // draft-ietf-tls-esni-22 §6: `encrypted_client_hello`. When the
-        // client is configured for ECH (real or GREASE), emit an
-        // outer-form extension here, before PSK (which must remain
-        // last). For now both real and GREASE paths take the GREASE
-        // branch; the real-ECH inner/outer split + state-machine
-        // dispatch lands in a follow-up under the same Phase 5 banner.
+        // caller supplied an explicit body (`ech_override`) — the real-
+        // ECH inner-marker for the inner CH, or the outer-form body
+        // for the outer CH skeleton during the seal — emit that
+        // verbatim. Otherwise fall through to the GREASE path if the
+        // config asks for one (a Real-ECH config without a usable
+        // seal — e.g. no supported config in the list — also gets a
+        // GREASE-shape extension so it doesn't downgrade to no ECH).
         #[cfg(feature = "ech")]
-        if let Some(ech) = self.config.ech.as_ref() {
+        if let Some(body) = ech_override {
+            extensions.push((
+                crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO,
+                body.to_vec(),
+            ));
+        } else if let Some(ech) = self.config.ech.as_ref() {
             let params = match &ech.mode {
                 crate::tls::ech::EchClientMode::Grease(p) => p,
                 crate::tls::ech::EchClientMode::Real(_) => {
@@ -1654,6 +1721,8 @@ impl ClientConnection {
             &self.offered_groups.clone(),
             &share_only,
             &extras,
+            // HRR retry path does not yet re-seal real ECH (wave-later).
+            None,
         );
         // RFC 9001 §4.1.4: like CH1, CH2 rides at Initial in QUIC mode.
         self.emit_handshake_at(super::super::quic_hooks::Level::Initial, ch2);
@@ -2279,6 +2348,92 @@ impl ClientConnection {
     }
 }
 
+/// Attempts the real-ECH seal pipeline for an initial ClientHello, per
+/// draft-ietf-tls-esni-22 §6. Returns `Some((outer_ch_bytes,
+/// inner_ch_bytes))` if a sealed pair was successfully produced;
+/// returns `None` otherwise (the caller falls back to the GREASE-path
+/// CH built without `ech_override`).
+///
+/// `None` covers every "no real-ECH today" condition uniformly so the
+/// caller doesn't fork:
+///
+/// - `config.ech` is `None` or `Grease`
+/// - the configured `ECHConfigList` has no supported (draft-22) entry
+/// - the first supported entry has no usable HPKE symmetric suite
+/// - `public_name` isn't valid UTF-8 (we need a `String` for the outer SNI)
+/// - PSK resumption is offered (Real ECH + PSK lands in a wave-later)
+/// - HPKE setup_sender or AEAD seal fail (unlikely; treated as falling
+///   back to GREASE rather than aborting the handshake)
+///
+/// On success the caller pins `inner_ch_bytes` into
+/// [`ClientConnection::ech_state`] so the SH processing can verify the
+/// accept signal over `Hash(inner_CH || zero-tail SH)` and swap the
+/// transcript on accept.
+#[cfg(feature = "ech")]
+fn seal_real_ech_on_ch1<R: RngCore>(
+    conn: &ClientConnection,
+    random: Random,
+    effective_suites: &[CipherSuite],
+    groups: &[NamedGroup],
+    server_name: &str,
+    rng: &mut R,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    // Real ECH + PSK is a separate wave: defer.
+    if conn.psk_offered.is_some() {
+        return None;
+    }
+    let ech_client = conn.config.ech.as_ref()?;
+    let list = match &ech_client.mode {
+        crate::tls::ech::EchClientMode::Real(l) => l,
+        crate::tls::ech::EchClientMode::Grease(_) => return None,
+    };
+    // Clone the first supported ECHConfig so we don't hold a long
+    // borrow of `conn.config` across the seal closure (which itself
+    // calls back into `conn.build_client_hello`).
+    let echcfg = list.first_supported()?.clone();
+    let contents = echcfg.contents.as_ref()?;
+    let sym = *contents.key_config.cipher_suites.first()?;
+    let config_id = contents.key_config.config_id;
+    let public_name_str = String::from(core::str::from_utf8(&contents.public_name).ok()?);
+    let inner_marker = crate::tls::ech::inner::inner_extension_body();
+    let inner_ch = conn.build_client_hello(
+        random,
+        String::from(server_name),
+        effective_suites,
+        groups,
+        &[],
+        &[],
+        Some(&inner_marker),
+    );
+    let inner_sni_len = server_name.len();
+    let suites_owned = effective_suites.to_vec();
+    let groups_owned = groups.to_vec();
+    let public_name_closure = public_name_str.clone();
+    let conn_for_closure = conn;
+    let sealed = crate::tls::ech::outer::seal_with(
+        &echcfg,
+        sym,
+        &inner_ch,
+        inner_sni_len,
+        rng,
+        |enc, padded_len| {
+            let outer_body =
+                crate::tls::ech::outer::build_outer_ext_body(sym, config_id, enc, padded_len);
+            conn_for_closure.build_client_hello(
+                random,
+                public_name_closure.clone(),
+                &suites_owned,
+                &groups_owned,
+                &[],
+                &[],
+                Some(&outer_body),
+            )
+        },
+    )
+    .ok()?;
+    Some((sealed.outer_ch, inner_ch))
+}
+
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
     match error {
@@ -2485,5 +2640,89 @@ mod tests {
             .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// Wave 3b.2: when [`ClientConfig::ech`] is set to a Real
+    /// `ECHConfigList`, the client's first `ClientHello` on the wire is
+    /// the **outer** CH — its SNI carries the `public_name` from the
+    /// `ECHConfig` rather than the application-level `server_name`.
+    /// Round-tripping the outer CH through `try_decap_inner` with the
+    /// matching server key ring recovers the **inner** CH, whose SNI
+    /// is the original `server_name`.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_client_seals_outer_with_public_name() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::outer::try_decap_inner;
+
+        // Fresh server-side ECH key with public_name = "public.example".
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-3b2-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x42,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let config = pair.config().clone();
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![config.clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        // Build a client config that wants real ECH against `list`.
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+
+        // Drive the client. The inner SNI is "secret.example"; the
+        // outer SNI must be "public.example".
+        let inner_sni = "secret.example";
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-3b2-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, inner_sni, &mut rng);
+
+        // First emitted record is the outer CH as a plaintext handshake
+        // record. Extract the handshake message bytes (header + body).
+        let out = client.write_tls();
+        let rec = read_record(&out).unwrap().unwrap();
+        assert_eq!(rec.content_type, ContentType::Handshake);
+        let outer_msg = rec.fragment.to_vec();
+
+        // Outer CH SNI must be the public_name.
+        let mut c = ReadCursor::new(&outer_msg);
+        assert_eq!(c.u8().unwrap(), hs_type::CLIENT_HELLO);
+        let body = c.vec_u24().unwrap();
+        let outer_ch = ClientHello::decode(body).unwrap();
+        let outer_sni_body = ext::find(&outer_ch.extensions, ExtensionType::SERVER_NAME)
+            .expect("outer CH has SNI extension");
+        let outer_sni = crate::tls::codec::extension::parse_server_name(outer_sni_body)
+            .unwrap()
+            .expect("outer SNI present");
+        assert_eq!(outer_sni, "public.example");
+
+        // The outer CH must carry an encrypted_client_hello extension.
+        assert!(
+            ext::find(&outer_ch.extensions, ExtensionType::ENCRYPTED_CLIENT_HELLO).is_some(),
+            "outer CH missing encrypted_client_hello"
+        );
+
+        // HPKE-decap → recover the inner CH bytes; its SNI must be the
+        // application-level inner SNI.
+        let inner_msg = try_decap_inner(&outer_msg, &ring).expect("server-side decap");
+        let mut ic = ReadCursor::new(&inner_msg);
+        assert_eq!(ic.u8().unwrap(), hs_type::CLIENT_HELLO);
+        let inner_body = ic.vec_u24().unwrap();
+        let inner_ch = ClientHello::decode(inner_body).unwrap();
+        let inner_sni_body = ext::find(&inner_ch.extensions, ExtensionType::SERVER_NAME)
+            .expect("inner CH has SNI extension");
+        let inner_sni_parsed = crate::tls::codec::extension::parse_server_name(inner_sni_body)
+            .unwrap()
+            .expect("inner SNI present");
+        assert_eq!(inner_sni_parsed, inner_sni);
     }
 }
