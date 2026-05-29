@@ -23,7 +23,7 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cli"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cert-compression", "cli"]
 std = ["alloc"]
 alloc = []
 
@@ -84,11 +84,30 @@ hpke = ["hash", "kdf", "ec", "cipher", "rng", "alloc"]
 # both client and server roles, retry_configs handling, and a
 # bit-shape-identical GREASE producer for the no-config case.
 ech = ["tls", "hpke"]
+# RFC 8879 certificate compression (TLS 1.3 only). Pulls in the
+# Karpeles-Lab `compcol` crate for the zlib (RFC 1950 over RFC 1951
+# DEFLATE) codec — the sole vendored dependency, carved out from the
+# crate's "no foreign code" charter because compcol is a sibling
+# pure-Rust no_std project under the same maintainership. Algorithm 1
+# (zlib) is the only codepoint wired today; brotli (2) and zstd (3)
+# remain unimplemented.
+cert-compression = ["tls", "dep:compcol"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher"]
 # The `purecrypto` command-line tool (gates the binary target below).
 cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher"]
+
+# --- dependencies ---
+# This crate's design principle is to ship no foreign code, primarily so the
+# cryptographic critical path stays in-house and auditable. The single exception
+# is `compcol` (also a Karpeles Lab project, MIT, pure-safe no_std + alloc),
+# pulled in only under the `cert-compression` feature for RFC 8879 zlib certificate
+# compression — re-implementing DEFLATE in-house just to satisfy the letter of
+# the policy would burn ~2-3 kLoC of review surface for no security gain, since
+# compcol sits outside the cryptographic trust boundary.
+[dependencies]
+compcol = { version = "0.4", default-features = false, features = ["zlib"], optional = true }
 
 [[bin]]
 name = "purecrypto"

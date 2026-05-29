@@ -199,6 +199,13 @@ pub(crate) struct ServerConfig {
     /// server-cert type. MUST encode the public key matching this server's
     /// signing key, or the client's `CertificateVerify` check will fail.
     raw_public_key_spki: Option<Vec<u8>>,
+    /// RFC 8879 `CertificateCompressionAlgorithm` IDs the server can
+    /// DECOMPRESS (for mTLS client certs) and is willing to USE when
+    /// compressing the server `Certificate` it sends. Default `[1]`
+    /// (zlib). Empty disables the path entirely. See
+    /// [`crate::tls::cert_compression`].
+    #[cfg(feature = "cert-compression")]
+    pub(crate) cert_compression_algorithms: Vec<u16>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
@@ -225,6 +232,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -250,6 +259,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -275,6 +286,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -300,6 +313,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -325,6 +340,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -350,6 +367,8 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             key_log: None,
         }
     }
@@ -426,6 +445,17 @@ impl ServerConfig {
     /// `CertificateVerify` check will fail.
     pub fn with_raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
         self.raw_public_key_spki = Some(spki_der);
+        self
+    }
+
+    /// Sets the RFC 8879 `compress_certificate` algorithm list — IDs the
+    /// server can DECOMPRESS (mTLS client cert path) and is itself willing
+    /// to USE when compressing its own `Certificate`. Default `[1]` (zlib).
+    /// Empty disables the path: the server neither advertises the extension
+    /// nor accepts a `CompressedCertificate` from the client.
+    #[cfg(feature = "cert-compression")]
+    pub fn with_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.cert_compression_algorithms = algorithms;
         self
     }
 
@@ -611,6 +641,13 @@ pub struct ServerConnection<R: RngCore> {
     /// The certificate type selected for any client `Certificate` message.
     /// Default `X509`. Independent of the server-side type per RFC 7250 §3.
     negotiated_client_cert_type: u8,
+    /// RFC 8879 §3: the algorithm IDs the client advertised in its
+    /// `compress_certificate` extension. Empty means the client did not
+    /// opt in. Server-cert compression is gated on the intersection of
+    /// this list with `config.cert_compression_algorithms` being
+    /// non-empty.
+    #[cfg(feature = "cert-compression")]
+    peer_cert_compression_algorithms: Vec<u16>,
 }
 
 impl<R: RngCore> ServerConnection<R> {
@@ -681,6 +718,8 @@ impl<R: RngCore> ServerConnection<R> {
             peer_offered_client_cert_type: false,
             negotiated_server_cert_type: crate::tls::codec::cert_type::X509,
             negotiated_client_cert_type: crate::tls::codec::cert_type::X509,
+            #[cfg(feature = "cert-compression")]
+            peer_cert_compression_algorithms: Vec::new(),
         }
     }
 
@@ -852,6 +891,15 @@ impl<R: RngCore> ServerConnection<R> {
     /// Queues a `close_notify`.
     pub fn send_close_notify(&mut self) {
         self.core.send_close_notify();
+    }
+
+    /// Test hook: the algorithm IDs the client advertised in its
+    /// `compress_certificate` extension (RFC 8879). Empty when the
+    /// client did not offer the extension. Used by the cert-compression
+    /// loopback test to confirm the server saw the offer.
+    #[cfg(all(test, feature = "cert-compression"))]
+    pub(crate) fn peer_cert_compression_algorithms(&self) -> &[u16] {
+        &self.peer_cert_compression_algorithms
     }
 
     /// Test/internal hook: emit an arbitrary post-handshake handshake message
@@ -1167,6 +1215,17 @@ impl<R: RngCore> ServerConnection<R> {
         if let Some(sr_body) = ext::find(&ch.extensions, ExtensionType::STATUS_REQUEST) {
             ext::parse_status_request(sr_body)?;
             self.peer_offered_ocsp_staple = true;
+        }
+
+        // RFC 8879 §3: the client advertises compress_certificate to
+        // indicate which algorithms it can decompress the server's
+        // Certificate under. Remember the offer; emission of
+        // CompressedCertificate is gated on the intersection with our
+        // own `config.cert_compression_algorithms` being non-empty.
+        #[cfg(feature = "cert-compression")]
+        if let Some(cc_body) = ext::find(&ch.extensions, ExtensionType::COMPRESS_CERTIFICATE) {
+            self.peer_cert_compression_algorithms =
+                crate::tls::cert_compression::decode_extension(cc_body)?;
         }
 
         // RFC 7250 §4.2: detect server_certificate_type / client_certificate_type
@@ -1645,6 +1704,35 @@ impl<R: RngCore> ServerConnection<R> {
                 }
             });
         });
+        // RFC 8879 §4: if both sides advertised cert-compression and our
+        // preferred algorithm appears in the client's offer, wrap the
+        // Certificate body into a CompressedCertificate. The transcript
+        // sees the compressed wire bytes; this matches the BoringSSL /
+        // rustls convention. The plaintext `msg` is `[hs_type::CERTIFICATE
+        // || u24 len || body]`; we strip the 4-byte header and recompose
+        // a `[hs_type::COMPRESSED_CERTIFICATE || u24 len || ...]` message.
+        #[cfg(feature = "cert-compression")]
+        if !self.peer_cert_compression_algorithms.is_empty()
+            && let Some(alg) = crate::tls::cert_compression::pick_from_lists(
+                &self.peer_cert_compression_algorithms,
+                &self.config.cert_compression_algorithms,
+            )
+        {
+            // `msg` = [u8 type || u24 len || body]; the body is what we
+            // compress, so strip the 4-byte header before handing to the
+            // wrapper.
+            debug_assert_eq!(msg[0], hs_type::CERTIFICATE);
+            let cert_body = &msg[4..];
+            if let Ok(compressed) =
+                crate::tls::cert_compression::encode_compressed_certificate(alg, cert_body)
+            {
+                self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, compressed);
+                return;
+            }
+            // Compression failure (compcol error) is silently downgraded
+            // to plain Certificate: it is always a valid fallback and
+            // does not break the handshake.
+        }
         // RFC 9001 §4.1.4: Certificate rides at Handshake level.
         self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
     }

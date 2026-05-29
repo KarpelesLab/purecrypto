@@ -180,6 +180,21 @@ pub struct Config {
     #[cfg(feature = "ech")]
     pub ech_server: Option<super::ech::EchServer>,
 
+    // ---- RFC 8879 certificate compression (TLS 1.3 only) ----
+    /// IANA `CertificateCompressionAlgorithm` codepoints the endpoint
+    /// will advertise in the `compress_certificate` extension and is
+    /// itself willing to DECOMPRESS, in preference order. Only `1` (zlib)
+    /// is wired today; entries for unsupported algorithms (`2 = brotli`,
+    /// `3 = zstd`) are allowed on the advertisement but ignored when
+    /// selecting on the receive path. Empty `Vec` disables the
+    /// extension entirely on the wire — neither advertise nor accept.
+    /// The default is `[1]` (advertise zlib). Applies bidirectionally:
+    /// clients advertise in their `ClientHello` (covering the server's
+    /// `Certificate`), servers advertise in `CertificateRequest`
+    /// (covering the client's mTLS `Certificate`).
+    #[cfg(feature = "cert-compression")]
+    pub cert_compression_algorithms: Vec<u16>,
+
     // ---- DTLS-only (inert when version is TLS) ----
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
     /// the DTLS server = cookie exchange is skipped (test-only).
@@ -228,6 +243,8 @@ impl Default for Config {
             ech: None,
             #[cfg(feature = "ech")]
             ech_server: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: super::cert_compression::default_algorithms(),
             cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
@@ -489,6 +506,19 @@ impl ConfigBuilder {
     #[cfg(feature = "ech")]
     pub fn ech_server(mut self, ech: super::ech::EchServer) -> Self {
         self.inner.ech_server = Some(ech);
+        self
+    }
+
+    /// Sets the `compress_certificate` (RFC 8879) advertisement —
+    /// `CertificateCompressionAlgorithm` IDs the endpoint can decompress,
+    /// in preference order. The default is `[1]` (zlib only). Pass an
+    /// empty `Vec` to turn the extension off entirely (no advertisement;
+    /// `CompressedCertificate` replies are also refused). Only zlib is
+    /// implemented today; entries for brotli (`2`) or zstd (`3`) are
+    /// allowed on the wire but ignored when selecting.
+    #[cfg(feature = "cert-compression")]
+    pub fn cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.inner.cert_compression_algorithms = algorithms;
         self
     }
 

@@ -416,6 +416,10 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
     {
         cc.ech = cfg.ech.clone();
     }
+    #[cfg(feature = "cert-compression")]
+    {
+        cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
+    }
     let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
     Ok(super::conn::ClientConnection::new(
         cc,
@@ -510,6 +514,10 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
         sc = sc.with_raw_public_key_spki(spki);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    #[cfg(feature = "cert-compression")]
+    {
+        sc = sc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
+    }
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
 }

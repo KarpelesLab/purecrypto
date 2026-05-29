@@ -2641,6 +2641,103 @@ mod loopback_tests {
         assert!(!server.is_handshaking());
     }
 
+    /// RFC 8879 §4: both ends opt into cert-compression with algorithm
+    /// `zlib`. The handshake must complete, the server must record the
+    /// client's offer, and application data must flow both ways. This
+    /// is the wiring smoke for the `CompressedCertificate` emission/
+    /// reception path; the codec round-trips are covered by
+    /// `tls::cert_compression::tests` and need not be re-asserted here.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn cert_compression_zlib_loopback() {
+        use crate::tls::cert_compression;
+        let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+        server_config =
+            server_config.with_cert_compression_algorithms(cert_compression::default_algorithms());
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots)
+            .with_cert_compression_algorithms(cert_compression::default_algorithms());
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"cc-zlib-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"cc-zlib-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+        // Server saw the client's compress_certificate offer with zlib.
+        assert_eq!(
+            server.peer_cert_compression_algorithms(),
+            &[cert_compression::algorithm::ZLIB]
+        );
+        // App data round-trips both ways.
+        client.send_application_data(b"ping cc").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping cc");
+        server.send_application_data(b"pong cc").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong cc");
+    }
+
+    /// RFC 8879: when the server's configured algorithm set is disjoint
+    /// from the client's offer (or vice-versa), the server falls back to
+    /// emitting plain `Certificate`. The handshake still completes.
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn cert_compression_falls_back_on_no_overlap() {
+        // Server advertises an unsupported algorithm only (e.g. brotli);
+        // client offers zlib. Server picks neither — falls back to plain.
+        use crate::tls::cert_compression;
+        let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
+        server_config = server_config
+            .with_cert_compression_algorithms(alloc::vec![cert_compression::algorithm::BROTLI]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(root_der).unwrap();
+        let mut config = ClientConfig::new(roots)
+            .with_cert_compression_algorithms(cert_compression::default_algorithms());
+        config.verification_time = Some(Time::utc(2026, 5, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"cc-fb-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"cc-fb-s", b"nonce", &[]);
+        let mut client = ClientConnection::new(config, "loopback.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert!(!server.is_handshaking());
+    }
+
     /// With `verify_certificates = false` the stapled CRL is ignored
     /// (no enforcement). Even when the staple would revoke the leaf, the
     /// handshake completes.

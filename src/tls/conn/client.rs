@@ -224,6 +224,13 @@ pub(crate) struct ClientConfig {
     /// banner; today the wire shape is GREASE in either case.
     #[cfg(feature = "ech")]
     pub ech: Option<crate::tls::ech::EchClient>,
+    /// RFC 8879 `CertificateCompressionAlgorithm` IDs the client can
+    /// DECOMPRESS (covering the server's `Certificate`) and is willing
+    /// to USE when sending its own mTLS `Certificate`. Default `[1]`
+    /// (zlib). Empty disables the path entirely (no extension on the
+    /// wire; any `CompressedCertificate` received is rejected).
+    #[cfg(feature = "cert-compression")]
+    pub cert_compression_algorithms: Vec<u16>,
 }
 
 impl ClientConfig {
@@ -246,6 +253,8 @@ impl ClientConfig {
             key_log: None,
             #[cfg(feature = "ech")]
             ech: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
         }
     }
 
@@ -332,6 +341,16 @@ impl ClientConfig {
     /// presents this chain whenever the server emits `CertificateRequest`.
     pub fn with_client_cert(mut self, cert: ClientCertConfig) -> Self {
         self.client_cert = Some(cert);
+        self
+    }
+
+    /// Sets the RFC 8879 `compress_certificate` algorithm list — IDs the
+    /// client can DECOMPRESS (covering the server's `Certificate`) and is
+    /// itself willing to USE when sending its own mTLS `Certificate`.
+    /// Default `[1]` (zlib). Empty disables the path entirely on the wire.
+    #[cfg(feature = "cert-compression")]
+    pub fn with_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
+        self.cert_compression_algorithms = algorithms;
         self
     }
 }
@@ -1094,6 +1113,19 @@ impl ClientConnection {
                 &self.config.client_cert_type_preference,
             ));
         }
+        // RFC 8879 §3: `compress_certificate`. Advertise the algorithms we
+        // can decompress, in our preference order. Suppressed when the
+        // configured list is empty (caller opted out).
+        #[cfg(feature = "cert-compression")]
+        if !self.config.cert_compression_algorithms.is_empty() {
+            extensions.push((
+                crate::tls::codec::ExtensionType::COMPRESS_CERTIFICATE,
+                crate::tls::cert_compression::encode_extension(
+                    &self.config.cert_compression_algorithms,
+                ),
+            ));
+        }
+
         extensions.extend_from_slice(extra_extensions);
 
         // draft-ietf-tls-esni-22 §6: `encrypted_client_hello`. When the
@@ -1825,6 +1857,29 @@ impl ClientConnection {
             // Stay in WaitCertificate — Certificate is the next message.
             return Ok(());
         }
+        // RFC 8879: a peer may compress its `Certificate` and send it as
+        // `CompressedCertificate` (type 25) instead. Decompress in place;
+        // the rest of this handler then runs on the recovered Certificate
+        // body. The wire bytes that go into the transcript are the
+        // compressed message (`raw`) — matching the BoringSSL / rustls
+        // convention since both peers can reproduce that consistently.
+        #[cfg(feature = "cert-compression")]
+        let _decompressed: Vec<u8>;
+        #[cfg(feature = "cert-compression")]
+        let body: &[u8] = if msg_type == hs_type::COMPRESSED_CERTIFICATE {
+            // Refuse if the client never advertised the extension —
+            // a peer must not invent compression we did not consent to.
+            if self.config.cert_compression_algorithms.is_empty() {
+                return Err(Error::UnexpectedMessage);
+            }
+            _decompressed = crate::tls::cert_compression::decode_compressed_certificate(body)?;
+            &_decompressed
+        } else if msg_type == hs_type::CERTIFICATE {
+            body
+        } else {
+            return Err(Error::UnexpectedMessage);
+        };
+        #[cfg(not(feature = "cert-compression"))]
         if msg_type != hs_type::CERTIFICATE {
             return Err(Error::UnexpectedMessage);
         }

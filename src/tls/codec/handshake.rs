@@ -48,6 +48,18 @@ pub(crate) mod hs_type {
     pub(crate) const CLIENT_KEY_EXCHANGE: u8 = 16;
     pub(crate) const FINISHED: u8 = 20;
     pub(crate) const KEY_UPDATE: u8 = 24;
+    /// `compressed_certificate` (RFC 8879 §4). TLS 1.3+ only. Replaces a
+    /// regular `Certificate` (type 11) on the wire when both peers have
+    /// negotiated certificate compression. Body:
+    /// `algorithm u16 ‖ uncompressed_length u24 ‖ compressed_certificate_message<u24>`.
+    /// The decompressed body must be exactly `uncompressed_length` bytes and
+    /// is then processed as if it were the original `Certificate`. The
+    /// transcript hash is computed over the `CompressedCertificate` wire
+    /// bytes (matching the BoringSSL / rustls convention; RFC 8879 leaves it
+    /// unstated but the wire-bytes interpretation is what peers can both
+    /// reproduce).
+    #[cfg_attr(not(feature = "cert-compression"), allow(dead_code))]
+    pub(crate) const COMPRESSED_CERTIFICATE: u8 = 25;
 }
 
 /// A raw extension: its type and opaque body.

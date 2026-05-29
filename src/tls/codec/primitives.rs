@@ -150,6 +150,15 @@ u16_id!(
         ALPN = 0x0010,
         /// record_size_limit (RFC 8449).
         RECORD_SIZE_LIMIT = 0x001c,
+        /// compress_certificate (RFC 8879 §3, IANA 27 = 0x001b). TLS 1.3 only.
+        /// Body: a `u8`-length list of `u16` algorithm IDs the sender can
+        /// DECOMPRESS. Direction is unidirectional: in `ClientHello` it covers
+        /// the SERVER's `Certificate` message; in `CertificateRequest` it
+        /// covers the CLIENT's mTLS `Certificate`. When a peer chooses one of
+        /// the offered algorithms, it sends a `CompressedCertificate`
+        /// handshake message (type 25) in place of `Certificate`.
+        #[cfg_attr(not(feature = "cert-compression"), allow(dead_code))]
+        COMPRESS_CERTIFICATE = 0x001b,
         /// extended_master_secret (RFC 7627). Empty-body extension that, when
         /// echoed by both peers in CH/SH, switches the TLS 1.2 master-secret
         /// derivation to `PRF(premaster, "extended master secret",

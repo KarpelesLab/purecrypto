@@ -189,6 +189,15 @@ pub enum Error {
     /// HRR confirmation signal was wrong. Maps to `decrypt_error`.
     #[cfg(feature = "ech")]
     EchDecryptionFailed,
+    /// A `CompressedCertificate` handshake message (RFC 8879 §4) could not
+    /// be expanded: the declared `algorithm` is one the receiver does not
+    /// support, the compressed body is malformed, decompression aborted
+    /// mid-stream, or the produced byte count does not match the declared
+    /// `uncompressed_length`. Maps to `bad_certificate` per §4 ("If the
+    /// received CompressedCertificate message cannot be decompressed, the
+    /// connection MUST be terminated with the bad_certificate alert").
+    #[cfg(feature = "cert-compression")]
+    CertDecompressionFailed,
 }
 
 impl core::fmt::Display for Error {
@@ -217,6 +226,10 @@ impl core::fmt::Display for Error {
             Error::EchDecodeError => f.write_str("ECH wire structure malformed"),
             #[cfg(feature = "ech")]
             Error::EchDecryptionFailed => f.write_str("ECH HPKE seal/open failed"),
+            #[cfg(feature = "cert-compression")]
+            Error::CertDecompressionFailed => {
+                f.write_str("RFC 8879 CompressedCertificate could not be decompressed")
+            }
         }
     }
 }
