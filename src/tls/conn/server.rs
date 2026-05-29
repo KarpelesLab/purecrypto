@@ -1798,6 +1798,23 @@ impl<R: RngCore> ServerConnection<R> {
                     crate::tls::codec::put_u16(exts, ty.0);
                     crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
                 }
+                // ECH rejection: draft-ietf-tls-esni-22 §7 has the server
+                // ship its current `ECHConfigList` as `retry_configs` in
+                // an EE `encrypted_client_hello` extension. The state was
+                // set in `on_client_hello` whenever the client offered an
+                // outer-form ECH extension but our HPKE decap failed
+                // (unknown `config_id`, AEAD tag rejection, ...). Without
+                // that state we either had no ECH server configured or
+                // the client never offered ECH at all, and the extension
+                // is omitted entirely.
+                #[cfg(feature = "ech")]
+                if matches!(self.ech_state, Some(EchServerHandshakeState::Rejected))
+                    && let Some(ref ech) = self.config.ech_server
+                {
+                    let body = ech.retry_configs_bytes();
+                    crate::tls::codec::put_u16(exts, ExtensionType::ENCRYPTED_CLIENT_HELLO.0);
+                    crate::tls::codec::with_len_u16(exts, |b| b.extend_from_slice(&body));
+                }
             });
         });
         // RFC 9001 §4.1.4: EncryptedExtensions rides at Handshake level.

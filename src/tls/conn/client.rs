@@ -1883,6 +1883,13 @@ impl ClientConnection {
         // Parse the EE body to extract ALPN and early_data, ignoring others.
         // The handshake body lives in raw[4..] (4-byte header).
         let mut early_data_in_ee = false;
+        // ECH (draft §7): on reject, the server may ship `retry_configs`
+        // here. Capture the body and surface it as `Error::EchRejected`
+        // *after* the EE walk has run its uniqueness/format checks (a
+        // malformed neighbour extension still aborts the handshake — we
+        // don't want the rejection to mask a protocol violation).
+        #[cfg(feature = "ech")]
+        let mut ech_retry_configs: Option<alloc::vec::Vec<u8>> = None;
         if raw.len() >= 4 {
             let body = &raw[4..];
             let mut c = ReadCursor::new(body);
@@ -1940,6 +1947,21 @@ impl ClientConnection {
                         return Err(Error::IllegalParameter);
                     }
                     self.negotiated_client_cert_type = selected;
+                } else if ty == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO.0 {
+                    // ECH (draft §7): the body is an `ECHConfigList` the
+                    // client should retry against. Validate it now so a
+                    // malformed list still trips `IllegalParameter`
+                    // rather than being silently surfaced through
+                    // `EchRejected`. Capture the raw bytes; the
+                    // decision to surface as a rejection happens after
+                    // the EE walk, predicated on our own ECH attempt
+                    // having flagged the SH as rejected.
+                    #[cfg(feature = "ech")]
+                    {
+                        let _ = crate::tls::ech::retry::decode_retry_configs(ext_body)
+                            .map_err(|_| Error::IllegalParameter)?;
+                        ech_retry_configs = Some(ext_body.to_vec());
+                    }
                 } else if ty == crate::tls::codec::ExtensionType::QUIC_TRANSPORT_PARAMETERS.0
                     && self.engine_mode == super::super::quic_hooks::EngineMode::Quic
                 {
@@ -1957,6 +1979,24 @@ impl ClientConnection {
                 }
             }
         }
+
+        // ECH rejection (draft §7.1): the client attempted real ECH
+        // (we have `ech_state`), the SH did not signal accept
+        // (`outcome == Some(Rejected)`), and the EE carried an
+        // `encrypted_client_hello` extension whose body is a usable
+        // `ECHConfigList` of retry_configs. Surface the bytes through
+        // `Error::EchRejected` so the caller can retry against the
+        // refreshed configuration. We do this *before* the transcript
+        // update so the failed handshake doesn't leave the engine in
+        // a state expecting subsequent records — the outer alert path
+        // (driven by `process_new_packets`) handles teardown.
+        #[cfg(feature = "ech")]
+        if let Some(retry_bytes) = ech_retry_configs
+            && matches!(self.ech_outcome(), Some(EchOutcome::Rejected))
+        {
+            return Err(Error::EchRejected(retry_bytes));
+        }
+
         self.core.transcript.update(raw);
 
         // 0-RTT key transition (RFC 8446 §4.6.1) is split between here and

@@ -3020,6 +3020,142 @@ mod loopback_tests {
         client.process_new_packets().unwrap();
         assert_eq!(client.take_received_plaintext(), b"pong ech");
     }
+
+    /// Wave 3b.4: when the server cannot decap the inner CH (here:
+    /// the client sealed against `config_id = 0x33` but the server's
+    /// keyring only holds `config_id = 0x44`), the server completes
+    /// the outer handshake under the `public_name` certificate and
+    /// EE carries `encrypted_client_hello` with the server's fresh
+    /// `retry_configs`. The client surfaces `Error::EchRejected`
+    /// with the wire-form `ECHConfigList` bytes so the application
+    /// can retry against the published configuration.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_loopback_rejects_with_retry_configs() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        // Self-signed Ed25519 server cert covering BOTH the public_name
+        // (so the outer handshake on rejection authenticates the
+        // server-presented cert) AND the inner SNI (not strictly
+        // needed in the rejection flow, but harmless).
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-3b4-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let name = DistinguishedName::common_name("public.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["public.example", "secret.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+
+        // Client-side ECH key (the one the client seals against).
+        let mut client_keygen_rng = HmacDrbg::<Sha256>::new(b"ech-3b4-client-key", b"nonce", &[]);
+        let client_side_pair = EchKeyPair::generate(
+            &mut client_keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x33,
+            b"public.example",
+            64,
+            suites.clone(),
+        )
+        .expect("client-side ech keygen");
+        let client_list = EchConfigList::new(alloc::vec![client_side_pair.config().clone()]);
+
+        // Server-side ECH key with a DIFFERENT `config_id` so the
+        // server's keyring lookup misses on the seal's identifier.
+        let mut server_keygen_rng = HmacDrbg::<Sha256>::new(b"ech-3b4-server-key", b"nonce", &[]);
+        let server_side_pair = EchKeyPair::generate(
+            &mut server_keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x44,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("server-side ech keygen");
+        let server_list = EchConfigList::new(alloc::vec![server_side_pair.config().clone()]);
+        let server_ring = EchKeyRing::from_pairs(alloc::vec![server_side_pair]);
+
+        // Server config: real Ed25519 cert + ECH server with the
+        // FRESH server-side `ECHConfigList` to publish on rejection.
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(server_ring, server_list.clone()));
+
+        // Client config: trust the server cert; seal against the
+        // STALE client-side `ECHConfigList` (config_id 0x33).
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(client_list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-3b4-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-3b4-server", b"nonce", &[]);
+
+        // Inner SNI ("secret.example") is also covered by the cert so
+        // the outer-CH `public.example` handshake completes without
+        // hostname-verification noise.
+        let mut client = ClientConnection::new(client_cfg, "public.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Drive: expect the client to surface `EchRejected` once EE
+        // arrives. (The server completes the outer handshake under
+        // the `public_name` cert; the EE walk catches the rejection
+        // before the client validates the rest of the flight.)
+        let mut surfaced: Option<crate::tls::Error> = None;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                if let Err(e) = client.process_new_packets() {
+                    surfaced = Some(e);
+                    break;
+                }
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let err = surfaced.expect("client must surface EchRejected");
+        let bytes = match err {
+            crate::tls::Error::EchRejected(b) => b,
+            other => panic!("unexpected error: {other:?}"),
+        };
+
+        // The surfaced bytes must round-trip back through
+        // `EchConfigList::decode` and yield the SAME list the server
+        // installed as `retry_configs` — i.e. config_id 0x44.
+        let parsed = crate::tls::ech::EchConfigList::decode(&bytes).expect("decode retry_configs");
+        let first = parsed
+            .first_supported()
+            .expect("retry_configs has a supported entry");
+        let contents = first
+            .contents
+            .as_ref()
+            .expect("retry_configs entry has contents");
+        assert_eq!(contents.key_config.config_id, 0x44);
+        assert_eq!(contents.public_name, b"public.example");
+    }
 }
 
 #[cfg(test)]
