@@ -207,6 +207,16 @@ impl KeySchedule {
         self.secret = extract(self.alg, derived.as_slice(), ecdhe);
     }
 
+    /// Exposes the current chaining secret as a raw byte slice. Used by
+    /// ECH (draft-ietf-tls-esni-22 §7) to compute the
+    /// `accept_confirmation` signal from the **handshake** secret. Do not
+    /// use elsewhere — the proper TLS 1.3 schedule transitions go through
+    /// the `*_traffic_secret` helpers above.
+    #[cfg(feature = "ech")]
+    pub(crate) fn current_secret_bytes(&self) -> &[u8] {
+        self.secret.as_slice()
+    }
+
     /// Advances Handshake → Master Secret (extract with a zero IKM).
     pub(crate) fn enter_master(&mut self) {
         let derived = self.derive_for_next();

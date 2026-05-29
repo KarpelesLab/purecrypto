@@ -518,6 +518,10 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
     {
         sc = sc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
+    #[cfg(feature = "ech")]
+    if let Some(ech) = cfg.ech_server.clone() {
+        sc = sc.with_ech_server(ech);
+    }
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
 }

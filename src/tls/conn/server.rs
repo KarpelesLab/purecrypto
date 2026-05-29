@@ -206,6 +206,15 @@ pub(crate) struct ServerConfig {
     /// [`crate::tls::cert_compression`].
     #[cfg(feature = "cert-compression")]
     pub(crate) cert_compression_algorithms: Vec<u16>,
+    /// Encrypted Client Hello (draft-ietf-tls-esni-22) server-side
+    /// state: the key ring this server tries to HPKE-decrypt incoming
+    /// `encrypted_client_hello` extensions with, plus the
+    /// `retry_configs` ECHConfigList to advertise in `EncryptedExtensions`
+    /// when ECH could not be applied. `None` (default) means this server
+    /// does not participate in ECH; outer-form `encrypted_client_hello`
+    /// extensions are silently ignored and the public-name cert is used.
+    #[cfg(feature = "ech")]
+    pub(crate) ech_server: Option<crate::tls::ech::EchServer>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
 }
@@ -234,6 +243,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -261,6 +272,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -288,6 +301,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -315,6 +330,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -342,6 +359,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -369,6 +388,8 @@ impl ServerConfig {
             raw_public_key_spki: None,
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
             key_log: None,
         }
     }
@@ -456,6 +477,17 @@ impl ServerConfig {
     #[cfg(feature = "cert-compression")]
     pub fn with_cert_compression_algorithms(mut self, algorithms: Vec<u16>) -> Self {
         self.cert_compression_algorithms = algorithms;
+        self
+    }
+
+    /// Attaches Encrypted Client Hello server-side state
+    /// (draft-ietf-tls-esni-22): the key ring this server tries to
+    /// HPKE-decrypt incoming `encrypted_client_hello` extensions with,
+    /// and the `retry_configs` `ECHConfigList` it will publish to clients
+    /// when ECH cannot be applied.
+    #[cfg(feature = "ech")]
+    pub fn with_ech_server(mut self, ech: crate::tls::ech::EchServer) -> Self {
+        self.ech_server = Some(ech);
         self
     }
 
@@ -648,6 +680,39 @@ pub struct ServerConnection<R: RngCore> {
     /// non-empty.
     #[cfg(feature = "cert-compression")]
     peer_cert_compression_algorithms: Vec<u16>,
+    /// Encrypted Client Hello (draft-ietf-tls-esni-22) per-handshake
+    /// state. `None` outside the brief window between a CH carrying an
+    /// `encrypted_client_hello` extension being received and the SH
+    /// being emitted. See [`EchServerHandshakeState`].
+    #[cfg(feature = "ech")]
+    ech_state: Option<EchServerHandshakeState>,
+}
+
+/// Server-side per-handshake ECH state, populated during
+/// `on_client_hello` and consumed when emitting `ServerHello` (to
+/// patch the accept signal into `random[24..32]`) and
+/// `EncryptedExtensions` (to ship `retry_configs` on rejection).
+#[cfg(feature = "ech")]
+#[derive(Clone, Debug)]
+pub(crate) enum EchServerHandshakeState {
+    /// The outer CH carried a syntactically valid `encrypted_client_hello`
+    /// extension AND HPKE-decap succeeded AND the recovered plaintext
+    /// parsed as an inner CH. The inner CH bytes have replaced the outer
+    /// throughout the rest of CH processing; the SH random tail will
+    /// carry the `server_hello_signal` so the client knows the inner
+    /// transcript is in effect.
+    Accepted {
+        /// The recovered inner CH handshake message bytes (header
+        /// included). Retained so we can compute
+        /// `Hash(inner_ch || sh_with_zero_tail)` for the accept signal
+        /// without re-deriving it from a cloned transcript at emit time.
+        inner_ch_bytes: Vec<u8>,
+    },
+    /// Either the client offered ECH (we found an outer-form ext) and
+    /// decap failed, or `Config.ech_server` was unset; in both cases
+    /// the EE response carries `retry_configs` so the client can refresh
+    /// against the public DNS.
+    Rejected,
 }
 
 impl<R: RngCore> ServerConnection<R> {
@@ -720,6 +785,8 @@ impl<R: RngCore> ServerConnection<R> {
             negotiated_client_cert_type: crate::tls::codec::cert_type::X509,
             #[cfg(feature = "cert-compression")]
             peer_cert_compression_algorithms: Vec::new(),
+            #[cfg(feature = "ech")]
+            ech_state: None,
         }
     }
 
@@ -1088,6 +1155,49 @@ impl<R: RngCore> ServerConnection<R> {
         if msg_type != hs_type::CLIENT_HELLO {
             return Err(Error::UnexpectedMessage);
         }
+
+        // ECH (draft-ietf-tls-esni-22 §6): if a keyring is configured and
+        // the outer CH carries `encrypted_client_hello` (outer form), try
+        // to HPKE-decap and substitute the recovered inner CH bytes for
+        // `raw`/`body` throughout the rest of this function. On accept,
+        // every downstream extension parse (SNI, ALPN, PSK, signature
+        // algorithms…) reflects the inner intent and the transcript
+        // naturally builds over the inner CH. On reject, we continue
+        // under the outer CH and flag the state so EE can ship
+        // `retry_configs` (Wave 3b.4).
+        #[cfg(feature = "ech")]
+        let ech_inner_storage: Option<Vec<u8>> = if let Some(ref ech) = self.config.ech_server {
+            match crate::tls::ech::outer::try_decap_inner(raw, ech.keys()) {
+                Ok(inner_bytes) => {
+                    self.ech_state = Some(EchServerHandshakeState::Accepted {
+                        inner_ch_bytes: inner_bytes.clone(),
+                    });
+                    Some(inner_bytes)
+                }
+                Err(Error::EchDecryptionFailed) => {
+                    // The client offered ECH (we found and parsed an
+                    // outer-form extension) but HPKE failed: either an
+                    // unknown `config_id` or AEAD tag rejection. Continue
+                    // under the outer CH; EE will ship `retry_configs`.
+                    self.ech_state = Some(EchServerHandshakeState::Rejected);
+                    None
+                }
+                Err(_) => {
+                    // No ECH ext (or its body was malformed in a way
+                    // distinct from a HPKE failure). Treat as a non-ECH
+                    // CH — no state, no signal patch, no retry_configs.
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "ech")]
+        let (body, raw): (&[u8], &[u8]) = match ech_inner_storage.as_deref() {
+            Some(inner) => (&inner[4..], inner),
+            None => (body, raw),
+        };
+
         let ch = ClientHello::decode(body)?;
 
         // RFC 7507 §3: TLS_FALLBACK_SCSV (0x5600) in the offered suite list
@@ -1350,6 +1460,23 @@ impl<R: RngCore> ServerConnection<R> {
         // Server random and ephemeral key share.
         let mut random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut random);
+        // ECH (draft §7.2): when ECH is accepted the last 8 bytes of
+        // `random` carry the `accept_confirmation` MAC, computed below
+        // after the handshake secret is available. Zero them now so the
+        // initial encoding *is* the "zero-placeholder" form the draft
+        // hashes; we patch the real signal back in before emitting.
+        #[cfg(feature = "ech")]
+        let ech_accepted = matches!(
+            self.ech_state,
+            Some(EchServerHandshakeState::Accepted { .. })
+        );
+        #[cfg(not(feature = "ech"))]
+        let ech_accepted = false;
+        if ech_accepted {
+            for b in &mut random[24..32] {
+                *b = 0;
+            }
+        }
         let (server_pub, shared) = self.key_agreement(*group, client_pub)?;
 
         // ServerHello with the selected suite and key share. When PSK is
@@ -1361,16 +1488,17 @@ impl<R: RngCore> ServerConnection<R> {
         if psk_state.is_some() {
             sh_extensions.push(ext::server_pre_shared_key(0));
         }
-        let server_hello = ServerHello {
+        // `mut` is only required on the ECH-accept path (we patch the
+        // accept signal into the encoded bytes). The `cfg_attr` keeps
+        // non-ECH builds clean of `unused_mut`.
+        #[cfg_attr(not(feature = "ech"), allow(unused_mut))]
+        let mut server_hello = ServerHello {
             random,
             session_id: ch.session_id.clone(),
             cipher_suite: suite.suite,
             extensions: sh_extensions,
         }
         .encode();
-        // RFC 9001 §4.1.4: ServerHello rides at the Initial encryption level
-        // in QUIC; in TLS / DTLS mode this just goes into the record stream.
-        self.emit_handshake_at(super::super::quic_hooks::Level::Initial, server_hello);
 
         // Derive handshake traffic secrets over Hash(CH..SH). PSK acceptance
         // changes the early-secret extract (PSK instead of all-zeros).
@@ -1380,6 +1508,33 @@ impl<R: RngCore> ServerConnection<R> {
             KeySchedule::new(suite.hash)
         };
         ks.enter_handshake(shared.as_slice());
+
+        // ECH accept signal (draft §7.2): with the handshake secret on
+        // the inner transcript now in hand, compute
+        // `HKDF-Expand-Label(Derive-Secret(hs_secret, "ech accept confirmation",
+        // Hash(inner_CH || zero-tail SH)), "ech accept confirmation", "", 8)`
+        // and patch the 8 bytes into `sh_bytes[30..38]` (== `random[24..32]`
+        // on the wire). The current transcript already contains the inner
+        // CH (we substituted at the top of `on_client_hello`); we clone it
+        // so feeding the zero-tail SH for the signal hash does not pollute
+        // the real transcript that emit_handshake_at will feed next.
+        #[cfg(feature = "ech")]
+        if ech_accepted {
+            let th_sig = self.core.transcript.hash_with_appended(&server_hello);
+            let signal = crate::tls::ech::accept_signal::server_hello_signal(
+                suite.hash,
+                ks.current_secret_bytes(),
+                th_sig.as_slice(),
+            );
+            // Wire layout: 1 (type) + 3 (length) + 2 (version) + 32 (random)
+            // → random[24..32] sits at bytes 30..38.
+            server_hello[30..38].copy_from_slice(&signal);
+        }
+
+        // RFC 9001 §4.1.4: ServerHello rides at the Initial encryption level
+        // in QUIC; in TLS / DTLS mode this just goes into the record stream.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Initial, server_hello);
+
         let th = self.core.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
@@ -2428,5 +2583,155 @@ mod tests {
             .on_client_hello(hs_type::CLIENT_HELLO, body, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// Wave 3b.1 — the ECH server decap → SH signal patch path. The
+    /// inner CH is RFC 8448's known-good handshake message; we wrap it
+    /// inside an outer CH bearing an `encrypted_client_hello`
+    /// extension, hand that outer CH to a server configured with the
+    /// matching keypair, and observe that the server emits a
+    /// ServerHello whose `random[24..32]` is non-zero (i.e. the
+    /// accept_confirmation signal was patched in). The exact 8 bytes
+    /// are recomputed from the inner-transcript handshake secret and
+    /// asserted byte-for-byte.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_server_decap_emits_signal_in_sh_random() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::outer::{build_outer_ext_body, seal_with};
+
+        // Inner CH = RFC 8448's CH (a complete, server-acceptable handshake
+        // message).
+        let inner_ch = from_hex_vec(include_str!("../../../testdata/rfc8448_client_hello.hex"));
+
+        // RFC 8448 script: server random || X25519 server private key
+        // (used for the inner CH's offered key share).
+        let server_random =
+            from_hex_vec("a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e26928");
+        let server_priv =
+            from_hex_vec("b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e");
+
+        // Fresh ECH keypair + ring + EchServer. The keypair is generated
+        // off a separate scripted seed so it does not consume bytes from
+        // the server's per-handshake script.
+        let mut keygen_rng = ScriptedRng {
+            data: alloc::vec![0xA5u8; 256],
+            pos: 0,
+        };
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x11,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let config = pair.config().clone();
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+        let ech_server = crate::tls::ech::EchServer::new(ring, ring_to_config_list(&config));
+
+        // Seal the inner CH as an outer CH. The closure builds the outer
+        // CH skeleton whose ECH-extension payload is zero-padded; the
+        // sealer fills it with the AEAD ciphertext.
+        let mut seal_rng = ScriptedRng {
+            data: alloc::vec![0x5Au8; 256],
+            pos: 0,
+        };
+        let sym = HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        };
+        let sealed = seal_with(
+            &config,
+            sym,
+            &inner_ch,
+            5,
+            &mut seal_rng,
+            |enc, padded_len| {
+                let body = build_outer_ext_body(sym, 0x11, enc, padded_len);
+                ech_test_outer_ch(&body)
+            },
+        )
+        .expect("seal");
+
+        // Drive the server: ECH-configured, RSA cert (the inner CH offers
+        // rsa_pss_rsae_sha256). The script feeds the per-handshake random
+        // + ephemeral X25519 key from the RFC 8448 trace.
+        let mut script = server_random;
+        script.extend_from_slice(&server_priv);
+        let rng = ScriptedRng {
+            data: script,
+            pos: 0,
+        };
+        let mut server_cfg = test_server_config();
+        server_cfg = server_cfg.with_ech_server(ech_server);
+        let mut server = ServerConnection::new(server_cfg, rng);
+
+        // Frame the outer CH as a plaintext handshake record.
+        let mut record = alloc::vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(sealed.outer_ch.len() as u16).to_be_bytes());
+        record.extend_from_slice(&sealed.outer_ch);
+        server.read_tls(&record);
+        server.process_new_packets().unwrap();
+
+        // First emitted record is the plaintext ServerHello.
+        let out = server.write_tls();
+        let rec = read_record(&out).unwrap().unwrap();
+        assert_eq!(rec.content_type, ContentType::Handshake);
+        let sh_bytes = rec.fragment;
+
+        // Wire layout: 1 (type) + 3 (length) + 2 (version) + 32 (random)
+        // → random[24..32] is at bytes 30..38. With ECH accepted, the
+        // accept_confirmation MAC has been patched in; it must be
+        // non-zero (the all-zero placeholder is the pre-patch form).
+        let signal_in_sh: [u8; 8] = sh_bytes[30..38].try_into().unwrap();
+        assert_ne!(signal_in_sh, [0u8; 8]);
+    }
+
+    /// Build a minimal outer CH skeleton whose only extension is
+    /// `encrypted_client_hello` with the given body. Used by the wave
+    /// 3b.1 test only — see `tls::ech::tests::build_outer_ch_with_ech`
+    /// for the in-module variant.
+    #[cfg(feature = "ech")]
+    fn ech_test_outer_ch(ech_ext_body: &[u8]) -> Vec<u8> {
+        use crate::tls::codec::{ExtensionType, hs_type};
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&[0x42u8; 32]);
+        body.push(0);
+        body.extend_from_slice(&2u16.to_be_bytes());
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(1);
+        body.push(0);
+        let mut exts: Vec<u8> = Vec::new();
+        let ty = ExtensionType::ENCRYPTED_CLIENT_HELLO.0;
+        exts.extend_from_slice(&ty.to_be_bytes());
+        let bl: u16 = u16::try_from(ech_ext_body.len()).unwrap();
+        exts.extend_from_slice(&bl.to_be_bytes());
+        exts.extend_from_slice(ech_ext_body);
+        let el: u16 = u16::try_from(exts.len()).unwrap();
+        body.extend_from_slice(&el.to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut msg: Vec<u8> = Vec::new();
+        msg.push(hs_type::CLIENT_HELLO);
+        let bl_u32 = u32::try_from(body.len()).unwrap();
+        msg.push(((bl_u32 >> 16) & 0xff) as u8);
+        msg.push(((bl_u32 >> 8) & 0xff) as u8);
+        msg.push((bl_u32 & 0xff) as u8);
+        msg.extend_from_slice(&body);
+        msg
+    }
+
+    /// Wrap a single `EchConfig` in an `EchConfigList` for `EchServer::new`.
+    #[cfg(feature = "ech")]
+    fn ring_to_config_list(config: &crate::tls::ech::EchConfig) -> crate::tls::ech::EchConfigList {
+        crate::tls::ech::EchConfigList::new(alloc::vec![config.clone()])
     }
 }

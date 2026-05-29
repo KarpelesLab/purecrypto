@@ -59,6 +59,26 @@ impl Transcript {
         alg.hash(&self.buf)
     }
 
+    /// `Transcript-Hash` over the accumulated bytes followed by `extra`,
+    /// without altering the transcript state. Used by ECH (draft-ietf-tls-
+    /// esni-22 §7) to compute `Hash(inner_CH || zero-tail SH)` for the
+    /// `accept_confirmation` signal, where feeding the zero-tail SH into
+    /// the real transcript would clash with the patched SH that
+    /// `emit_handshake` adds moments later.
+    ///
+    /// # Panics
+    /// Panics if the hash has not been selected with [`set_alg`].
+    #[cfg(feature = "ech")]
+    pub(crate) fn hash_with_appended(&self, extra: &[u8]) -> Secret {
+        let alg = self
+            .alg
+            .expect("transcript hash used before suite negotiated");
+        let mut tmp = Vec::with_capacity(self.buf.len() + extra.len());
+        tmp.extend_from_slice(&self.buf);
+        tmp.extend_from_slice(extra);
+        alg.hash(&tmp)
+    }
+
     /// Rewrites the transcript for HelloRetryRequest: the buffered
     /// `ClientHello1` is replaced by a synthetic `message_hash` handshake
     /// message `[254, 0, 0, Hash.length] || Hash(ClientHello1)` (RFC 8446
