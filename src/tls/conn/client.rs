@@ -550,6 +550,23 @@ pub(crate) struct ClientEchState {
     /// Retained so we can recompute the accept signal and so we can
     /// swap them into the transcript when the server confirms accept.
     pub(crate) inner_ch_bytes: Vec<u8>,
+    /// Set once the ServerHello has been processed and we know
+    /// whether the server accepted ECH (the accept-confirmation
+    /// signal in `random[24..32]` matched our recomputed signal) or
+    /// rejected it. `None` between CH emission and SH receipt.
+    pub(crate) outcome: Option<EchOutcome>,
+}
+
+/// What the client learnt about ECH from the server's ServerHello.
+/// `Accepted` means the SH accept-confirmation signal matched (the
+/// real-ECH transcript is in use); `Rejected` means it didn't (the
+/// handshake continues under the outer transcript and the EE may
+/// carry `retry_configs`).
+#[cfg(feature = "ech")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EchOutcome {
+    Accepted,
+    Rejected,
 }
 
 /// What the client retains across CH emission so it can verify the server's
@@ -996,7 +1013,10 @@ impl ClientConnection {
         #[cfg(feature = "ech")]
         let hello = match ech_sealed {
             Some((outer_ch, inner_ch_bytes)) => {
-                conn.ech_state = Some(ClientEchState { inner_ch_bytes });
+                conn.ech_state = Some(ClientEchState {
+                    inner_ch_bytes,
+                    outcome: None,
+                });
                 outer_ch
             }
             None => conn.build_client_hello(
@@ -1305,6 +1325,20 @@ impl ClientConnection {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// What the client learnt about ECH from the server's ServerHello,
+    /// or `None` if real-ECH was not attempted (no `ech` configured, or
+    /// only GREASE), or the SH has not yet been processed. Useful after
+    /// `process_new_packets` has driven the handshake past the SH —
+    /// `Some(EchOutcome::Accepted)` confirms the inner CH won, the
+    /// transcript was swapped, and the live handshake is on the inner
+    /// path; `Some(EchOutcome::Rejected)` means the SH carried no valid
+    /// accept signal and the handshake is continuing on the outer
+    /// transcript (the EE may still carry `retry_configs`).
+    #[cfg(feature = "ech")]
+    pub(crate) fn ech_outcome(&self) -> Option<EchOutcome> {
+        self.ech_state.as_ref().and_then(|s| s.outcome)
+    }
+
     /// Sends application data (only valid once the handshake completes).
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
@@ -1554,9 +1588,14 @@ impl ClientConnection {
             return Err(Error::UnsupportedVersion);
         }
 
-        // The transcript hash now needs the negotiated hash.
+        // The transcript hash now needs the negotiated hash. We
+        // *defer* feeding `raw` into the transcript past the ECH
+        // accept-signal verification below, because on a real-ECH
+        // accept the live transcript still tracks the OUTER CH bytes
+        // and we need to swap them for the INNER CH bytes before the
+        // SH lands. On reject (or no ECH at all), this is purely a
+        // reordering — the transcript update happens a few lines down.
         self.core.transcript.set_alg(suite.hash);
-        self.core.transcript.update(raw);
 
         // ECDHE from the server's key share.
         let ks_ext = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::KEY_SHARE)
@@ -1585,6 +1624,55 @@ impl ClientConnection {
                 KeySchedule::new(suite.hash)
             };
         ks.enter_handshake(shared.as_slice());
+
+        // draft-ietf-tls-esni-22 §7: if real-ECH was attempted, the
+        // server tells us whether it accepted by writing 8 bytes into
+        // `sh.random[24..32]`. We recompute the expected signal over
+        // `Hash(inner_CH || sh_with_zero_tail)` using the *inner*
+        // transcript's handshake_secret (which equals the live
+        // schedule's `current_secret_bytes()` regardless of
+        // accept/reject — same ECDHE + same PSK selection). On match,
+        // swap the in-transcript outer CH for the inner CH bytes so
+        // every subsequent message ends up on the inner transcript.
+        // On mismatch, leave the transcript alone (outer prevails)
+        // and let EE processing surface a rejection via retry_configs
+        // in wave 3b.4.
+        #[cfg(feature = "ech")]
+        if let Some(state) = self.ech_state.as_mut() {
+            let mut sh_zero_tail: Vec<u8> = raw.to_vec();
+            // Handshake wire: 1 (type) + 3 (length) + 2 (version) + 32
+            // (random) → random[24..32] is at bytes 30..38.
+            if sh_zero_tail.len() >= 38 {
+                for b in &mut sh_zero_tail[30..38] {
+                    *b = 0;
+                }
+                let mut tbuf: Vec<u8> =
+                    Vec::with_capacity(state.inner_ch_bytes.len() + sh_zero_tail.len());
+                tbuf.extend_from_slice(&state.inner_ch_bytes);
+                tbuf.extend_from_slice(&sh_zero_tail);
+                let th_sig = suite.hash.hash(&tbuf);
+                let expected = crate::tls::ech::accept_signal::server_hello_signal(
+                    suite.hash,
+                    ks.current_secret_bytes(),
+                    th_sig.as_slice(),
+                );
+                let sh_tail = crate::tls::ech::accept_signal::random_tail(&sh.random);
+                if crate::tls::ech::accept_signal::signals_eq_ct(&expected, &sh_tail) {
+                    // ECH accepted: swap the live transcript from outer
+                    // CH bytes to inner CH bytes. The patched-form SH
+                    // will be appended just below.
+                    self.core
+                        .transcript
+                        .replace_buf(state.inner_ch_bytes.clone());
+                    state.outcome = Some(EchOutcome::Accepted);
+                } else {
+                    state.outcome = Some(EchOutcome::Rejected);
+                }
+            } else {
+                state.outcome = Some(EchOutcome::Rejected);
+            }
+        }
+        self.core.transcript.update(raw);
         let th = self.core.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());

@@ -79,6 +79,18 @@ impl Transcript {
         alg.hash(&tmp)
     }
 
+    /// Replaces the accumulated handshake bytes with `new_buf`. Used by
+    /// ECH (draft-ietf-tls-esni-22 §6.1) on the client when an
+    /// in-progress handshake confirms ECH was accepted: the live
+    /// transcript was tracking the OUTER ClientHello, and we need to
+    /// swap it for the INNER ClientHello before the rest of the
+    /// handshake messages get appended. The hash algorithm selection
+    /// (set via [`set_alg`]) is preserved.
+    #[cfg(feature = "ech")]
+    pub(crate) fn replace_buf(&mut self, new_buf: Vec<u8>) {
+        self.buf = new_buf;
+    }
+
     /// Rewrites the transcript for HelloRetryRequest: the buffered
     /// `ClientHello1` is replaced by a synthetic `message_hash` handshake
     /// message `[254, 0, 0, Hash.length] || Hash(ClientHello1)` (RFC 8446

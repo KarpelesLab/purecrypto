@@ -2910,6 +2910,116 @@ mod loopback_tests {
             crate::tls::Error::OcspResponseInvalid
         );
     }
+
+    /// Wave 3b.3 end-to-end: a client with a real
+    /// [`EchClient::from_config_list`] and a server with a matching
+    /// [`EchServer`] complete a full handshake. After the SH lands,
+    /// [`ClientConnection::ech_outcome`] must report
+    /// [`EchOutcome::Accepted`] — proving the SH accept-confirmation
+    /// signal verified and the client swapped its transcript from the
+    /// outer CH to the inner CH. Application data also round-trips
+    /// (the swap didn't destabilise the rest of the schedule).
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_loopback_accepts_and_round_trips() {
+        use super::client::EchOutcome;
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        // Server identity. The cert covers the *inner* SNI the client
+        // really targets — that's the name the client verifies against
+        // after ECH is accepted. (The outer `public_name` is on the
+        // wire but never drives client-side cert selection here.)
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-3b3-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let name = DistinguishedName::common_name("secret.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["secret.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        // Fresh ECH key. `public_name = "public.example"` is the SNI
+        // the *outer* CH carries on the wire; the server's `ech_server`
+        // ring will HPKE-decap the inner CH using this key.
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-3b3-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x33,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        // Server config: Ed25519 cert + ECH server keyring.
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(ring, list.clone()));
+
+        // Client config: trusts the server cert, opts into real ECH
+        // against the same `ECHConfigList`.
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-3b3-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-3b3-server", b"nonce", &[]);
+
+        let mut client = ClientConnection::new(client_cfg, "secret.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(client.ech_outcome(), Some(EchOutcome::Accepted));
+
+        // Both directions of app data flow under the inner-transcript
+        // session keys.
+        client.send_application_data(b"ping ech").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping ech");
+
+        server.send_application_data(b"pong ech").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong ech");
+    }
 }
 
 #[cfg(test)]
