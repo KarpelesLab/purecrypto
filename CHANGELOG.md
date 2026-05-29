@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/purecrypto/compare/v0.2.0...v0.3.0) - 2026-05-29
+
+### Added
+
+- *(tls,ech)* end-to-end ECH loopback example (wave 3b.5)
+- *(tls,ech)* server EE retry_configs + client Error::EchRejected (wave 3b.4)
+- *(tls,ech)* client SH accept-signal verification + transcript swap (wave 3b.3)
+- *(tls,ech)* client real-ECH emission via seal_with (wave 3b.2)
+- *(tls,ech)* server-side decap + accept-signal patching (wave 3b.1)
+- *(tls)* RFC 8879 certificate compression (zlib via compcol)
+- *(tls,ech)* HPKE seal pipeline for outer/inner ClientHello
+- *(tls,ech)* ech_outer_extensions compressor and decompressor
+- *(tls,ech)* ECH codec foundations + GREASE producer
+- *(hpke)* RFC 9180 hybrid public key encryption
+- *(tls)* RFC 7250 raw public keys for TLS 1.3
+- *(tls,x509)* OCSP stapling (RFC 6066 + 6960)
+- *(tls)* add P-384 ECDHE key exchange
+- *(tls,dtls)* add RFC 5705 exporter for TLS 1.2 / DTLS 1.2 + DTLS 1.3
+- *(mac)* add UMAC-64 and UMAC-128 (RFC 4418)
+- *(dtls)* multi-sig signing for DTLS 1.2
+- *(dtls)* multi-group ECDHE for DTLS 1.2
+- *(dtls)* multi-suite negotiation for DTLS 1.2
+- *(dtls)* clean up DTLS 1.3 signing path + add multi-sig coverage
+- *(dtls)* multi-group key agreement for DTLS 1.3
+- *(dtls)* multi-suite negotiation for DTLS 1.3
+- *(x509)* enforce RFC 5280 nameConstraints across the chain
+- *(tls,ffi)* expose peer SNI + cipher-suite accessors over the C ABI
+- *(tls)* Connection::negotiated_cipher_suite[_name]
+- *(rng)* use arc4random_buf on Apple targets
+- *(rng)* linux-getrandom feature — getrandom(2) via raw syscall asm
+
+### Fixed
+
+- *(tls)* bound the handshake-message reassembly buffer
+- *(x509,pki)* tighten nameConstraints IP mask + close SAN-less leaf bypass
+- *(rsa)* validate p·q == n on PKCS#1 / PKCS#8 private-key import
+- *(ffi)* accept PKCS#8-wrapped RSA private keys in pc_tls_cfg_set_certificate
+- *(dh)* enforce MIN_CUSTOM_GROUP_BITS = 2048 in from_custom
+- *(ffi,cli)* propagate PEM-trust-store parse failures
+- *(rsa)* validate public exponent + harden PKCS#1 export
+- *(rng)* scope arc4random_buf extern in a submodule
+- *(crypto,pqc)* hygiene hardening — PBKDF2, BLAKE2 MAC, FIPS 203/204/205
+- *(ffi,rng,cli)* FFI / RNG / CLI hygiene
+- *(quic)* RFC 9000 §12.4 per-level frame restrictions + §13.2.5 ack_delay
+
+### Other
+
+- *(fuzz)* add ECH + cert-compression wire-parser targets
+- *(tls,ech)* end-to-end Phase 5 cryptographic round-trip
+- *(fuzz)* add cargo-fuzz workspace with 20 targets
+- mark all public error enums #[non_exhaustive]
+- *(docs)* add rustdoc-warnings-denied job + fix pre-existing links
+- *(tls)* update module docs to reflect TLS 1.2/1.3 + DTLS + QUIC scope
+
 ## [0.2.0](https://github.com/KarpelesLab/purecrypto/compare/v0.1.1...v0.2.0) - 2026-05-27
 
 ### Added
