@@ -7,6 +7,11 @@
 //! [`Uint`](crate::bignum::Uint) long division.
 
 use crate::bignum::Uint;
+// `Choice` / `ConditionallySelectable` are only used by the order-`L` scalar
+// helpers below, which are gated to the optional hazmat/ristretto consumers;
+// gate the import with the same cfg so the Ed25519-only build has no unused
+// import.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 use crate::ct::{Choice, ConditionallySelectable};
 
 use super::field::Fe;
@@ -43,12 +48,20 @@ pub(crate) fn scalar_muladd(r: &Fe, k: &Fe, a: &Fe, l8: &Uint<8>) -> Fe {
 }
 
 /// Computes `(a · b) mod L` for `a, b < L`.
+// The order-`L` field arithmetic below (mul/add/sub/negate/invert) is exercised
+// only by the optional `edwards25519::hazmat` group API (which also backs
+// `ristretto255`); the RFC 8032 Ed25519 path uses `scalar_reduce_wide` /
+// `scalar_muladd` instead. Gate to silence dead-code warnings on the default
+// (Ed25519-only) build. `scalar_mul` additionally feeds `scalar_invert`, which
+// shares the same gate, so the internal call vanishes together with the export.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_mul(a: &Fe, b: &Fe, l8: &Uint<8>) -> Fe {
     let (lo, hi) = a.mul_wide(b);
     narrow(&join(&lo, &hi).reduce(l8))
 }
 
 /// Computes `(a + b) mod L` for `a, b < L`.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_add(a: &Fe, b: &Fe, l: &Fe) -> Fe {
     // a, b < L < 2²⁵³, so the sum fits in 256 bits with no carry out; one
     // conditional subtraction of L canonicalises it.
@@ -58,6 +71,7 @@ pub(crate) fn scalar_add(a: &Fe, b: &Fe, l: &Fe) -> Fe {
 }
 
 /// Computes `(a − b) mod L` for `a, b < L`.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_sub(a: &Fe, b: &Fe, l: &Fe) -> Fe {
     let (diff, borrow) = a.sbb(b, 0);
     let (wrapped, _) = diff.adc(l, 0);
@@ -65,6 +79,7 @@ pub(crate) fn scalar_sub(a: &Fe, b: &Fe, l: &Fe) -> Fe {
 }
 
 /// Computes `(−a) mod L` for `a < L`.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_negate(a: &Fe, l: &Fe) -> Fe {
     scalar_sub(&Fe::ZERO, a, l)
 }
@@ -72,6 +87,7 @@ pub(crate) fn scalar_negate(a: &Fe, l: &Fe) -> Fe {
 /// Computes the modular inverse `a⁻¹ mod L` for `a < L` via Fermat's little
 /// theorem (`a^(L−2) mod L`), constant time in the value of `a`. `L` is prime,
 /// so this is well-defined for every nonzero `a`; the inverse of `0` is `0`.
+#[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) fn scalar_invert(a: &Fe, l: &Fe, l8: &Uint<8>) -> Fe {
     // exponent = L − 2
     let exp = l.wrapping_sub(&Fe::from_u64(2));

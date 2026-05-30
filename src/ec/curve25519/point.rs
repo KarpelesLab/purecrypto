@@ -126,6 +126,10 @@ impl Field {
     }
 
     /// Negates a point: `−(X:Y:Z:T) = (−X:Y:Z:−T)`.
+    // Used only by the optional edwards25519::hazmat and ristretto255 group
+    // APIs; the RFC 8032 Ed25519 path negates via scalars, not points. Gate to
+    // silence a dead-code warning on the default (Ed25519-only) build.
+    #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
     pub(crate) fn point_negate(&self, p: &Point) -> Point {
         Point {
             x: self.neg(p.x),
@@ -154,6 +158,10 @@ impl Field {
     /// representatives via cross-multiplication (so distinct projective
     /// representatives of the same point compare equal): `X₁·Z₂ == X₂·Z₁` and
     /// `Y₁·Z₂ == Y₂·Z₁`.
+    // Used only by the edwards25519::hazmat group API (point equality /
+    // identity / order checks); gate to silence a dead-code warning on the
+    // default build.
+    #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
     pub(crate) fn point_ct_eq(&self, p: &Point, q: &Point) -> Choice {
         let x1z2 = self.mul(p.x, q.z);
         let x2z1 = self.mul(q.x, p.z);

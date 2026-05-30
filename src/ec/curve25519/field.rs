@@ -153,6 +153,10 @@ impl Field {
     }
 
     /// Tests (constant-time) whether the Montgomery-form element is zero.
+    // Only the ristretto255 encode/decode path calls this; the always-on
+    // Ed25519 signing path does not, so gate it to avoid a dead-code warning on
+    // the default build.
+    #[cfg(feature = "ristretto255")]
     #[inline]
     pub(crate) fn is_zero(&self, a: Fe) -> Choice {
         self.fp.from_mont(&a).ct_eq(&Fe::ZERO)
