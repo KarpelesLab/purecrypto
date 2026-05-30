@@ -238,6 +238,21 @@ impl BoxedRsaPublicKey {
     }
 }
 
+// Best-effort zeroize on drop: the BoxedUint fields scrub themselves via
+// their own Drop impl, but `blinding_seed` is a fixed-size byte array that
+// would otherwise be returned to the allocator with the HMAC-key bytes
+// intact. Overwrite it and route the read through `core::hint::black_box`
+// so LLVM cannot eliminate the writes as dead stores (same pattern as
+// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+impl Drop for BoxedRsaPrivateKey {
+    fn drop(&mut self) {
+        for b in self.blinding_seed.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.blinding_seed);
+    }
+}
+
 impl BoxedRsaPrivateKey {
     /// Builds a private key from `n`, `e`, and the private exponent `d` (without
     /// the prime factors, so CRT-based PKCS#1 export and base-blinding are

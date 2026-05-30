@@ -151,6 +151,20 @@ pub struct X25519PrivateKey {
     scalar: [u8; 32],
 }
 
+// Best-effort zeroize on drop: the 32-byte scalar is full secret material
+// and would otherwise be returned to the allocator/stack frame intact.
+// Overwrite the bytes and route the read through `core::hint::black_box`
+// so LLVM cannot eliminate the writes as dead stores (same pattern as
+// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+impl Drop for X25519PrivateKey {
+    fn drop(&mut self) {
+        for b in self.scalar.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.scalar);
+    }
+}
+
 impl X25519PrivateKey {
     /// Generates a new private key from `rng`.
     pub fn generate<R: RngCore>(rng: &mut R) -> Self {

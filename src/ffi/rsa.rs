@@ -366,8 +366,30 @@ pub unsafe extern "C" fn pc_rsa_decrypt_oaep(
             _ => return PcStatus::Unsupported,
         };
         match pt {
-            Ok(p) => unsafe { out_write(&p, out, out_len) },
+            Ok(mut p) => {
+                let st = unsafe { out_write(&p, out, out_len) };
+                // The plaintext Vec is dropped here; wipe it first so the
+                // bytes don't sit in a free-list chunk for the next
+                // allocation to observe. `out_write` failures (e.g.
+                // BufferTooSmall) follow the same path — the caller did
+                // not get the plaintext, but we still scrub.
+                wipe_vec(&mut p);
+                st
+            }
             Err(_) => PcStatus::Verification,
         }
     })
+}
+
+/// Overwrites `buf` with zeros and routes the read through
+/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
+/// stores. Used to scrub plaintext / shared-secret intermediates before
+/// their backing storage is returned to the allocator (same in-house
+/// pattern used by ML-DSA/ML-KEM in `src/mldsa/mod.rs` and
+/// `src/mlkem/mod.rs`).
+fn wipe_vec(buf: &mut Vec<u8>) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&buf);
 }

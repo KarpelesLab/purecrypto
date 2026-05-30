@@ -208,6 +208,30 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 }
 
+// Best-effort zeroize on drop: the private exponent `d`, primes `p`/`q`,
+// blinding `phi_n_minus_1`, and the HMAC seed all live in fixed-size
+// stack arrays that would otherwise be returned to the allocator (or the
+// stack frame, for stack-allocated keys) with the secret bytes intact.
+// Overwrite the limbs and route the read through `core::hint::black_box`
+// so LLVM cannot eliminate the writes as dead stores (same pattern as
+// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+impl<const LIMBS: usize> Drop for RsaPrivateKey<LIMBS> {
+    fn drop(&mut self) {
+        self.d = Uint::ZERO;
+        self.p = Uint::ZERO;
+        self.q = Uint::ZERO;
+        self.phi_n_minus_1 = Uint::ZERO;
+        for b in self.blinding_seed.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.d);
+        let _ = core::hint::black_box(&self.p);
+        let _ = core::hint::black_box(&self.q);
+        let _ = core::hint::black_box(&self.phi_n_minus_1);
+        let _ = core::hint::black_box(&self.blinding_seed);
+    }
+}
+
 impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Generates an RSA key pair with an `LIMBS * 64`-bit modulus and the given
     /// public exponent `e` (commonly 65537).

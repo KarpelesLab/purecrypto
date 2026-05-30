@@ -479,21 +479,32 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_no_cookie(cfg: *mut PcTlsCfg) -> PcStat
     })
 }
 
-/// DTLS server-only: sets the 32-byte HelloVerifyRequest cookie secret.
+/// DTLS server-only: sets the HelloVerifyRequest cookie secret. `secret_len`
+/// MUST be 32; any other length is rejected with [`PcStatus::Unsupported`].
+/// Taking an explicit length (rather than the silently-32-only earlier
+/// signature) keeps the wire-format mismatch visible to the caller and rules
+/// out an out-of-bounds read from a short buffer.
 ///
 /// # Safety
-/// `cfg` valid; `secret` non-NULL, 32 readable bytes.
+/// `cfg` valid; `secret` non-NULL and points to at least `secret_len` readable
+/// bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_dtls_cfg_set_cookie_secret(
     cfg: *mut PcTlsCfg,
     secret: *const u8,
+    secret_len: usize,
 ) -> PcStatus {
     guard(|| {
-        if cfg.is_null() || secret.is_null() {
+        if cfg.is_null() {
             return PcStatus::NullPointer;
         }
-        let mut buf = [0u8; 32];
-        unsafe { core::ptr::copy_nonoverlapping(secret, buf.as_mut_ptr(), 32) };
+        let Some(bytes) = (unsafe { slice(secret, secret_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let buf: [u8; 32] = match bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return PcStatus::Unsupported,
+        };
         unsafe { &mut *cfg }.cookie_secret = Some(buf);
         PcStatus::Ok
     })

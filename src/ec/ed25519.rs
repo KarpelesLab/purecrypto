@@ -354,6 +354,20 @@ pub struct Ed25519PublicKey([u8; 32]);
 #[derive(Clone, Copy)]
 pub struct Ed25519Signature([u8; 64]);
 
+// Best-effort zeroize on drop: the 32-byte seed is full secret entropy
+// and would otherwise be returned to the allocator/stack frame intact.
+// Overwrite the bytes and route the read through `core::hint::black_box`
+// so LLVM cannot eliminate the writes as dead stores (same pattern as
+// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+impl Drop for Ed25519PrivateKey {
+    fn drop(&mut self) {
+        for b in self.seed.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.seed);
+    }
+}
+
 impl Ed25519PrivateKey {
     /// Generates a new private key from `rng`.
     pub fn generate<R: RngCore>(rng: &mut R) -> Self {

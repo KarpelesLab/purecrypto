@@ -337,6 +337,21 @@ impl PartialEq for BoxedUint {
 
 impl Eq for BoxedUint {}
 
+// Best-effort zeroize on drop: every BoxedUint may carry secret material
+// (RSA `d`/`p`/`q`, ECDSA/ECDH scalars, blinding intermediates, …) and the
+// limb Vec is returned to the allocator otherwise unchanged. Overwrite the
+// limbs and route the read through `core::hint::black_box` so LLVM cannot
+// eliminate the writes as dead stores (same pattern as ML-DSA/ML-KEM in
+// `src/mldsa/mod.rs` and `src/mlkem/mod.rs`, avoiding a `zeroize` dep).
+impl Drop for BoxedUint {
+    fn drop(&mut self) {
+        for l in self.limbs.iter_mut() {
+            *l = 0;
+        }
+        let _ = core::hint::black_box(&self.limbs);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

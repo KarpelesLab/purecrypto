@@ -428,8 +428,13 @@ pc_status pc_tls_cfg_set_client_auth(PcTlsCfg *cfg, int32_t required,
                                      const uint8_t *roots_pem, size_t roots_pem_len);
 pc_status pc_tls_cfg_add_crl_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
 
-/* DTLS server only: cookie-exchange secret (32 bytes). */
-pc_status pc_dtls_cfg_set_cookie_secret(PcTlsCfg *cfg, const uint8_t *secret_32);
+/* DTLS server only: cookie-exchange secret. `secret_len` MUST be 32; any
+ * other length is rejected with PC_UNSUPPORTED. The explicit-length form
+ * replaces an earlier null-terminator-less 32-byte fixed signature so the
+ * size mismatch is visible at the C ABI rather than silently reading past
+ * the end of a short caller buffer. */
+pc_status pc_dtls_cfg_set_cookie_secret(PcTlsCfg *cfg,
+                                        const uint8_t *secret, size_t secret_len);
 /* DTLS server only: disable the cookie round-trip (HelloVerifyRequest / HRR
  * cookie). Recommended only for tests. */
 pc_status pc_dtls_cfg_set_no_cookie(PcTlsCfg *cfg);
@@ -473,7 +478,7 @@ pc_status pc_dtls_on_timeout(PcTls *tls, uint64_t now_seconds, uint32_t now_nano
  *   1. PcQuicCfg *cfg = pc_quic_cfg_new(role);
  *      configure (roots, cert, server_name, ALPN, transport params, ...);
  *   2. PcQuic *q = pc_quic_new(cfg);
- *      pc_quic_set_peer_addr(q, peer_ipv6_16, peer_port);  // server: from recvfrom
+ *      pc_quic_set_peer_addr(q, peer_ipv6_16, 16, peer_port);  // server: from recvfrom
  *   3. loop:
  *        pc_quic_handshake(q);
  *        // drain outbound:
@@ -541,8 +546,13 @@ pc_status pc_quic_recv_datagram(PcQuic *q, uint8_t *out, size_t *out_len);
 
 pc_status pc_quic_initiate_key_update(PcQuic *q);
 
+/* `ipv6_bytes_len` MUST be 16 (an IPv6 representation; IPv4-mapped
+ * `::ffff:a.b.c.d` is fine). Any other length is rejected with
+ * PC_UNSUPPORTED. The explicit-length form replaces the earlier 16-byte
+ * fixed signature for the same reason as pc_dtls_cfg_set_cookie_secret. */
 pc_status pc_quic_set_peer_addr(PcQuic *q,
-                                const uint8_t *ipv6_bytes_16, uint16_t port);
+                                const uint8_t *ipv6_bytes, size_t ipv6_bytes_len,
+                                uint16_t port);
 
 pc_status pc_quic_negotiated_alpn(const PcQuic *q, uint8_t *out, size_t *out_len);
 pc_status pc_quic_peer_certificate(const PcQuic *q, uint8_t *out, size_t *out_len);

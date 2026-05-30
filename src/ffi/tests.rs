@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, mlkem, quic, rsa, x509};
+use super::{ec, hash, mlkem, quic, rsa, tls, x509};
 use crate::der::pem_decode;
 
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
@@ -250,6 +250,76 @@ fn quic_stream_read_rejects_oversized_out_len() {
         unsafe { quic::pc_quic_stream_read(q, 0, core::ptr::null_mut(), &mut out_len, &mut fin) };
     assert_eq!(st, PcStatus::BufferTooSmall);
     assert_eq!(out_len, 1 << 20, "out_len must report the 1 MiB cap");
+
+    unsafe { quic::pc_quic_free(q) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+}
+
+/// `pc_dtls_cfg_set_cookie_secret` now takes an explicit length; any width
+/// other than 32 is rejected up front instead of silently reading past the
+/// end of a short caller buffer.
+#[test]
+fn dtls_cookie_secret_rejects_wrong_length() {
+    // PC_TLS_SERVER == 1, PC_DTLS_1_2 == 0xFEFD (kept in sync with the
+    // C header at `include/purecrypto.h`).
+    let cfg = tls::pc_tls_cfg_new(1, 0xFEFD_u32 as i32);
+    assert!(!cfg.is_null());
+
+    // The 32-byte happy path.
+    let ok_secret = [0xa5u8; 32];
+    let st =
+        unsafe { tls::pc_dtls_cfg_set_cookie_secret(cfg, ok_secret.as_ptr(), ok_secret.len()) };
+    assert_eq!(st, PcStatus::Ok);
+
+    // 31 bytes — too short; must be rejected without reading past the end.
+    let short = [0u8; 31];
+    let st = unsafe { tls::pc_dtls_cfg_set_cookie_secret(cfg, short.as_ptr(), short.len()) };
+    assert_eq!(st, PcStatus::Unsupported);
+
+    // 33 bytes — too long; same rejection.
+    let long = [0u8; 33];
+    let st = unsafe { tls::pc_dtls_cfg_set_cookie_secret(cfg, long.as_ptr(), long.len()) };
+    assert_eq!(st, PcStatus::Unsupported);
+
+    // NULL secret with non-zero length → NullPointer.
+    let st = unsafe { tls::pc_dtls_cfg_set_cookie_secret(cfg, core::ptr::null(), 32) };
+    assert_eq!(st, PcStatus::NullPointer);
+
+    unsafe { tls::pc_tls_cfg_free(cfg) };
+}
+
+/// `pc_quic_set_peer_addr` now takes an explicit length; any width other
+/// than 16 is rejected up front. Tests both the IPv4-mapped happy path and
+/// the rejection paths.
+#[test]
+fn quic_set_peer_addr_rejects_wrong_length() {
+    use core::ffi::c_char;
+    let cfg = quic::pc_quic_cfg_new(0);
+    assert!(!cfg.is_null());
+    let sni = b"loopback.example\0";
+    let st = unsafe { quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const c_char) };
+    assert_eq!(st, PcStatus::Ok);
+    let _ = unsafe { quic::pc_quic_cfg_set_verify_certificates(cfg, 0) };
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    assert!(!q.is_null());
+
+    // IPv4-mapped 127.0.0.1, 16 bytes — accepted.
+    let v4mapped: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1];
+    let st = unsafe { quic::pc_quic_set_peer_addr(q, v4mapped.as_ptr(), 16, 4433) };
+    assert_eq!(st, PcStatus::Ok);
+
+    // 4 bytes (a raw IPv4 address) — rejected; IPv6 form required.
+    let v4: [u8; 4] = [127, 0, 0, 1];
+    let st = unsafe { quic::pc_quic_set_peer_addr(q, v4.as_ptr(), 4, 4433) };
+    assert_eq!(st, PcStatus::Unsupported);
+
+    // 0 length is treated as an empty slice → can't fit into [u8; 16].
+    let st = unsafe { quic::pc_quic_set_peer_addr(q, core::ptr::null(), 0, 4433) };
+    assert_eq!(st, PcStatus::Unsupported);
+
+    // NULL pointer with non-zero length → NullPointer.
+    let st = unsafe { quic::pc_quic_set_peer_addr(q, core::ptr::null(), 16, 4433) };
+    assert_eq!(st, PcStatus::NullPointer);
 
     unsafe { quic::pc_quic_free(q) };
     unsafe { quic::pc_quic_cfg_free(cfg) };

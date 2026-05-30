@@ -216,13 +216,32 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
             }
             _ => return PcStatus::Unsupported,
         };
+        // Hold the shared-secret in a scoped binding so a later early-return
+        // wipes it. Ciphertext is public, but the secret must not linger.
+        let mut secret = secret;
         let st = unsafe { out_write(&ct_bytes, ct, ct_len) };
         if st != PcStatus::Ok {
+            // `out_write` failed (e.g. BufferTooSmall) — wipe the shared
+            // secret before propagating so the dropped array does not
+            // return secret bytes to the allocator.
+            wipe_array(&mut secret);
             return st;
         }
         unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), ss, 32) };
+        wipe_array(&mut secret);
         PcStatus::Ok
     })
+}
+
+/// Overwrites `buf` with zeros and routes the read through
+/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
+/// stores (same pattern as ML-DSA/ML-KEM in `src/mldsa/mod.rs` and
+/// `src/mlkem/mod.rs`, avoiding a `zeroize` dep).
+fn wipe_array(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&buf);
 }
 
 /// Decapsulates `ct` under `k`, writing the 32-byte shared secret to `ss`.
@@ -249,7 +268,7 @@ pub unsafe extern "C" fn pc_mlkem_decaps(
         if ss.is_null() {
             return PcStatus::NullPointer;
         }
-        let secret = match unsafe { &*k } {
+        let mut secret = match unsafe { &*k } {
             PcMlKem::K512(sk) => {
                 let arr: [u8; 768] = match c.try_into() {
                     Ok(a) => a,
@@ -273,6 +292,10 @@ pub unsafe extern "C" fn pc_mlkem_decaps(
             }
         };
         unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), ss, 32) };
+        // Wipe the local copy of the shared secret before its array is
+        // returned to the stack frame / allocator. The caller already
+        // holds an authoritative copy at `ss`.
+        wipe_array(&mut secret);
         PcStatus::Ok
     })
 }

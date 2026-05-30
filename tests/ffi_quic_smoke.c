@@ -102,9 +102,9 @@ int main(void) {
   static const uint8_t v4mapped_loopback[16] = {
       0,0,0,0, 0,0,0,0, 0,0,0xff,0xff, 127,0,0,1
   };
-  if (pc_quic_set_peer_addr(server, v4mapped_loopback, 4433) != PC_OK)
+  if (pc_quic_set_peer_addr(server, v4mapped_loopback, 16, 4433) != PC_OK)
     return fail("set_peer_addr server");
-  if (pc_quic_set_peer_addr(client, v4mapped_loopback, 4433) != PC_OK)
+  if (pc_quic_set_peer_addr(client, v4mapped_loopback, 16, 4433) != PC_OK)
     return fail("set_peer_addr client");
 
   /* 6. Drive the handshake: pump datagrams in both directions until

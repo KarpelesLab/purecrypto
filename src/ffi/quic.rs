@@ -905,25 +905,35 @@ pub unsafe extern "C" fn pc_quic_initiate_key_update(q: *mut PcQuic) -> PcStatus
 
 // ---- Address binding ------------------------------------------------------
 
-/// Records the peer's UDP address. `ipv6_bytes_16` is the IPv6
-/// representation (IPv4-mapped is fine: `::ffff:a.b.c.d`); `port` is
-/// host-byte-order. Mandatory before the first `feed_datagram` on a
-/// server that uses `pc_quic_cfg_set_require_retry`.
+/// Records the peer's UDP address. `ipv6_bytes` is the IPv6 representation
+/// (IPv4-mapped is fine: `::ffff:a.b.c.d`); `ipv6_bytes_len` MUST be 16 —
+/// any other length is rejected with [`PcStatus::Unsupported`]. `port` is
+/// host-byte-order. Mandatory before the first `feed_datagram` on a server
+/// that uses `pc_quic_cfg_set_require_retry`. Taking an explicit length
+/// rules out an out-of-bounds read from a short buffer (previously the
+/// 16-byte width was implicit in the signature).
 ///
 /// # Safety
-/// `q`, `ipv6_bytes_16` valid; `ipv6_bytes_16` must point to 16 bytes.
+/// `q` valid; `ipv6_bytes` non-NULL and points to at least `ipv6_bytes_len`
+/// readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_set_peer_addr(
     q: *mut PcQuic,
-    ipv6_bytes_16: *const u8,
+    ipv6_bytes: *const u8,
+    ipv6_bytes_len: usize,
     port: u16,
 ) -> PcStatus {
     guard(|| {
-        if q.is_null() || ipv6_bytes_16.is_null() {
+        if q.is_null() {
             return PcStatus::NullPointer;
         }
-        let mut octets = [0u8; 16];
-        unsafe { core::ptr::copy_nonoverlapping(ipv6_bytes_16, octets.as_mut_ptr(), 16) };
+        let Some(bytes) = (unsafe { slice(ipv6_bytes, ipv6_bytes_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let octets: [u8; 16] = match bytes.try_into() {
+            Ok(a) => a,
+            Err(_) => return PcStatus::Unsupported,
+        };
         // Recognize IPv4-mapped (::ffff:0:0/96) and surface as a V4 addr.
         let addr =
             if octets[..10].iter().all(|b| *b == 0) && octets[10] == 0xff && octets[11] == 0xff {

@@ -7,6 +7,19 @@ use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
 use crate::kdf::scrypt::scrypt;
 use crate::kdf::{hkdf, pbkdf2};
 
+/// Overwrites `buf` with zeros and routes the read through
+/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
+/// stores. Used to wipe a partially-written caller buffer on an error
+/// return path so the half-derived key material does not surface
+/// (same in-house pattern used by ML-DSA/ML-KEM in `src/mldsa/mod.rs`
+/// and `src/mlkem/mod.rs`).
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&buf);
+}
+
 /// Argon2 variant identifiers.
 pub mod argon2_id {
     #![allow(missing_docs)]
@@ -136,7 +149,13 @@ pub unsafe extern "C" fn pc_scrypt(
         };
         match scrypt(pw, s, log_n, r, p, buf) {
             Ok(()) => PcStatus::Ok,
-            Err(_) => PcStatus::Unsupported,
+            Err(_) => {
+                // The implementation may have written partial state into
+                // `buf` before erroring; wipe so the caller does not see
+                // a half-derived key in their output buffer.
+                wipe(buf);
+                PcStatus::Unsupported
+            }
         }
     })
 }
@@ -187,7 +206,12 @@ pub unsafe extern "C" fn pc_argon2(
         };
         match argon2(&params, pw, s, &[], &[], buf) {
             Ok(()) => PcStatus::Ok,
-            Err(_) => PcStatus::Unsupported,
+            Err(_) => {
+                // See the scrypt error path for rationale: wipe any
+                // partial output before propagating.
+                wipe(buf);
+                PcStatus::Unsupported
+            }
         }
     })
 }
