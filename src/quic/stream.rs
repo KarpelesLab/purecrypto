@@ -543,9 +543,26 @@ impl RecvStream {
                     if !self.pending.contains_key(&offset)
                         && self.pending.len() >= MAX_PENDING_FRAGMENTS
                     {
-                        // Map fragment-count overflow to
-                        // FLOW_CONTROL_ERROR (RFC 9000 §11.2).
-                        return Err(crate::tls::Error::Decode);
+                        // The out-of-order reassembly buffer is full. This is
+                        // NOT a protocol violation: it happens legitimately
+                        // under heavy loss/reordering when a low-offset gap
+                        // stays unfilled while the peer keeps sending (and
+                        // PTO-retransmitting) higher-offset fragments — e.g. a
+                        // bulk transfer over a link that drops every Nth packet.
+                        //
+                        // Per-stream flow control (`end <= max_data`, enforced
+                        // above) already bounds how far ahead of the contiguous
+                        // point the peer can be, so the buffered byte volume is
+                        // bounded; this fragment *count* cap is only a secondary
+                        // guard against a flood of tiny fragments. The correct,
+                        // loss-tolerant response is to drop this fragment rather
+                        // than tear the connection down with FLOW_CONTROL_ERROR
+                        // (the previous `Err(Decode)`): the sender still holds it
+                        // as unacked and will retransmit once the contiguity gap
+                        // fills and frees a buffer slot. RFC 9000 §2.2 permits a
+                        // receiver to discard out-of-order data it cannot buffer.
+                        // `newly_contig` is 0 on this out-of-order path.
+                        return Ok(newly_contig);
                     }
                     self.pending.insert(offset, data.to_vec());
                 }

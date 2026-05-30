@@ -1945,11 +1945,66 @@ impl QuicConnection {
         };
         let keys_done = self.endpoint.crypto.at(Level::OneRtt).tx.is_some()
             && self.endpoint.crypto.at(Level::OneRtt).rx.is_some();
-        if engine_done && keys_done {
+        if engine_done && keys_done && !self.handshake_complete {
             self.handshake_complete = true;
             self.endpoint.handshake_complete = true;
             // Disarm the PTO: handshake is done, nothing to retransmit.
             self.endpoint.loss.disarm();
+            // RFC 9001 §4.9 — discard finished encryption levels now that the
+            // handshake is complete. Without this, a peer whose PTO is still
+            // armed (its own handshake flight was lost) keeps retransmitting
+            // the last Initial/Handshake CRYPTO chunk via `on_timeout`; the
+            // now-1-RTT peer re-feeds that stale ServerHello/Finished into its
+            // TLS engine and rejects it as `UnexpectedMessage`. Discarding the
+            // keys both stops the sender emitting those packets and makes the
+            // receiver drop any already-in-flight ones (the rx-key `None`
+            // branch in `feed_long_header_packet` silently discards them).
+            self.discard_handshake_levels();
+        }
+    }
+
+    /// RFC 9001 §4.9 — discard finished encryption levels on handshake
+    /// completion: drop both directions' keys, wipe the per-level CRYPTO byte
+    /// streams (so `schedule_last_chunk_retransmit` / `on_timeout` can no
+    /// longer requeue them), and clear the matching loss-recovery / PN-space
+    /// bookkeeping.
+    ///
+    /// Which levels are safe to discard is role-dependent, because this engine
+    /// does not implement the HANDSHAKE_DONE *confirmation* signal (RFC 9001
+    /// §4.9.2):
+    ///
+    /// * **Server** — completion means it has received the client's Finished,
+    ///   so the Initial and Handshake levels are both finished for good.
+    ///   Discard both. (This is the level that caused the bug: a server whose
+    ///   PTO stayed armed kept retransmitting its Initial/Handshake CRYPTO,
+    ///   which the now-1-RTT client re-fed into TLS and rejected.)
+    /// * **Client** — completion means its TLS engine processed the server's
+    ///   Finished, but the handshake is not yet *confirmed*: the client's own
+    ///   Finished (a Handshake-level CRYPTO) may still be in flight and need
+    ///   PTO retransmission until the server acknowledges it. Discarding the
+    ///   Handshake keys here would strand a lost client Finished and hang the
+    ///   server, so the client discards only the Initial level. Discarding
+    ///   Initial is always safe once Handshake keys exist (RFC 9001 §4.9.1)
+    ///   and makes the client drop any stale retransmitted server Initial via
+    ///   the rx-key `None` branch in `feed_long_header_packet`.
+    fn discard_handshake_levels(&mut self) {
+        let levels: &[Level] = match self.role {
+            Role::Server => &[Level::Initial, Level::Handshake],
+            Role::Client => &[Level::Initial],
+        };
+        for &lvl in levels {
+            let lk = self.endpoint.crypto.at_mut(lvl);
+            lk.tx = None;
+            lk.rx = None;
+            // Reset the per-level CRYPTO buffer so no outbound chunk remains to
+            // be (re)transmitted and no inbound reassembly state lingers.
+            *self.endpoint.bufs.at_mut(lvl) = crate::quic::crypto_buf::CryptoBuf::new();
+            // Clear loss-recovery state for the matching PN space (also drops
+            // any still-in-flight packets from `bytes_in_flight`).
+            self.endpoint.loss.discard_keys(pn_space_of_level(lvl));
+            // Reset the PN space's pending-ACK / largest-rx bookkeeping so a
+            // late duplicate can't resurrect an ACK at a discarded level.
+            *self.endpoint.pn.for_level(lvl) = crate::quic::pn::PnSpace::default();
         }
     }
 
