@@ -75,12 +75,13 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Time, oid};
+use super::{AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Extension, Time, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
     encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
 };
 use crate::hash::{sha1, sha256, sha384, sha512};
+use crate::rng::RngCore;
 
 const PEM_LABEL: &str = "OCSP RESPONSE";
 
@@ -358,6 +359,56 @@ impl OcspResponse {
         Ok(out)
     }
 
+    /// Returns the value of the `id-pkix-ocsp-nonce` extension (RFC 6960
+    /// §4.4.1) carried in `ResponseData.responseExtensions`, if present. The
+    /// returned bytes are the inner nonce — the OCTET STRING content nested
+    /// inside the extension's `extnValue` OCTET STRING, matching the encoding
+    /// emitted by [`OcspResponseBuilder::nonce`] and by RFC 8954-conformant
+    /// CAs (OpenSSL, Let's Encrypt, …).
+    ///
+    /// A response with no nonce extension returns `Ok(None)`. Callers that
+    /// requested a nonce in their `OCSPRequest` MUST refuse such a response
+    /// — see [`Self::check_for_cert_with_nonce`].
+    pub fn nonce(&self) -> Result<Option<Vec<u8>>, Error> {
+        let p = self.basic_parts()?;
+        let mut outer = Reader::new(p.tbs);
+        let mut td = outer.read_sequence()?;
+        if td.peek_tag() == Some(tag::context(0)) {
+            let _ = td.read_tlv(tag::context(0))?; // version
+        }
+        td.read_any()?; // responderID
+        td.read_any()?; // producedAt
+        td.read_any()?; // responses
+        // responseExtensions [1] EXPLICIT Extensions OPTIONAL
+        if td.is_empty() || td.peek_tag() != Some(tag::context(1)) {
+            return Ok(None);
+        }
+        let wrapper = td.read_tlv(tag::context(1))?;
+        let mut outer_ext = Reader::new(wrapper);
+        let mut exts = outer_ext.read_sequence()?;
+        while !exts.is_empty() {
+            let mut ext = exts.read_sequence()?;
+            let id = parse_oid(ext.read_oid()?)?;
+            // critical BOOLEAN DEFAULT FALSE — skip if present.
+            if ext.peek_tag() == Some(tag::BOOLEAN) {
+                ext.read_boolean()?;
+            }
+            let value = ext.read_octet_string()?;
+            if id.as_slice() == oid::ID_PKIX_OCSP_NONCE {
+                // RFC 8954 §2.1: the extnValue OCTET STRING wraps an inner
+                // DER OCTET STRING that holds the actual nonce bytes. Parse
+                // the inner OCTET STRING; reject any other shape so a
+                // responder cannot smuggle arbitrary DER through the nonce
+                // slot.
+                let mut nr = Reader::new(value);
+                let inner = nr.read_octet_string()?;
+                nr.finish()?;
+                return Ok(Some(inner.to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
     /// End-to-end validation of a stapled OCSP response. Combines the
     /// signature verification, freshness check, and `(leaf, issuer)`
     /// match into a single call returning the asserted `CertStatus`.
@@ -429,6 +480,43 @@ impl OcspResponse {
         }
 
         Ok(single.status)
+    }
+
+    /// Like [`check_for_cert`](Self::check_for_cert), but additionally
+    /// requires the response to echo the `expected_nonce` that the client
+    /// embedded in its `OCSPRequest`. Use this when a fresh OCSPRequest is
+    /// dispatched over a network (RFC 6960 §4.4.1): without nonce binding a
+    /// captured stapled response can be replayed against a fresh request,
+    /// defeating freshness even when `nextUpdate` is short.
+    ///
+    /// `expected_nonce` is the raw nonce value the client placed in the
+    /// request (see [`OcspRequestBuilder::nonce`]). It must be:
+    /// - present in the response;
+    /// - byte-equal to `expected_nonce`.
+    ///
+    /// Either condition failing returns [`Error::Verification`]. Callers that
+    /// retrieve OCSP via stapling (RFC 6066 §8 / RFC 8446 §4.4.2.1) should
+    /// stick with [`check_for_cert`](Self::check_for_cert) — the TLS layer
+    /// has no fresh nonce to compare against — and rely on `nextUpdate`
+    /// freshness instead.
+    pub fn check_for_cert_with_nonce(
+        &self,
+        leaf: &Certificate,
+        issuer: &Certificate,
+        now: Option<&Time>,
+        expected_nonce: &[u8],
+    ) -> Result<OcspCertStatus, Error> {
+        let status = self.check_for_cert(leaf, issuer, now)?;
+        match self.nonce()? {
+            Some(got) if got.as_slice() == expected_nonce => Ok(status),
+            // A missing nonce when one was requested is just as much a
+            // replay-window vulnerability as a mismatched one: the responder
+            // can ignore the request nonce and return a fresh-looking cached
+            // staple. RFC 6960 §4.4.1 frames this as the client's choice
+            // (the responder MAY omit), but a caller who reached this method
+            // explicitly opted in, so we fail-closed.
+            _ => Err(Error::Verification),
+        }
     }
 
     /// Finds the `SingleResponse` that names `leaf` under `issuer`. Compares
@@ -636,6 +724,7 @@ pub struct OcspResponseBuilder {
     hash_alg_oid: &'static [u64],
     responder_id_by_key: bool,
     delegated_responder_cert: Option<Vec<u8>>,
+    nonce: Option<Vec<u8>>,
 }
 
 impl OcspResponseBuilder {
@@ -690,6 +779,7 @@ impl OcspResponseBuilder {
             hash_alg_oid: oid::ID_SHA1,
             responder_id_by_key: true,
             delegated_responder_cert: None,
+            nonce: None,
         })
     }
 
@@ -720,6 +810,19 @@ impl OcspResponseBuilder {
     /// the responder cert's public key.
     pub fn delegated_responder_cert(mut self, responder_cert_der: Vec<u8>) -> Self {
         self.delegated_responder_cert = Some(responder_cert_der);
+        self
+    }
+
+    /// Echoes the client-supplied `nonce` back to the client via the
+    /// `id-pkix-ocsp-nonce` extension in `ResponseData.responseExtensions`
+    /// (RFC 6960 §4.4.1, RFC 8954 §2.1). `nonce` is the raw nonce body — the
+    /// builder wraps it in the required inner-OCTET-STRING / outer-extnValue
+    /// shape.
+    ///
+    /// Per RFC 8954 §2.1 the nonce body must be 1–32 octets; anything else is
+    /// rejected at sign time.
+    pub fn nonce(mut self, nonce: &[u8]) -> Self {
+        self.nonce = Some(nonce.to_vec());
         self
     }
 
@@ -793,6 +896,23 @@ impl OcspResponseBuilder {
         td.extend_from_slice(&responder_id);
         td.extend_from_slice(&produced_at.to_generalized_time());
         td.extend_from_slice(&responses);
+        if let Some(nonce_bytes) = &self.nonce {
+            // RFC 8954 §2.1: nonce body is 1–32 octets; the extnValue OCTET
+            // STRING wraps an inner OCTET STRING that carries the nonce.
+            if nonce_bytes.is_empty() || nonce_bytes.len() > 32 {
+                return Err(Error::Malformed);
+            }
+            let inner = encode_octet_string(nonce_bytes);
+            let nonce_ext = Extension {
+                oid: oid::ID_PKIX_OCSP_NONCE.to_vec(),
+                critical: false,
+                value: inner,
+            }
+            .to_der();
+            // responseExtensions [1] EXPLICIT SEQUENCE OF Extension.
+            let exts_seq = encode_sequence(&nonce_ext);
+            td.extend_from_slice(&encode_context(1, &exts_seq));
+        }
         let tbs_response_data = encode_sequence(&td);
 
         // signatureAlgorithm + signature.
@@ -825,6 +945,163 @@ impl OcspResponseBuilder {
         Ok(OcspResponse {
             der: encode_sequence(&out),
         })
+    }
+}
+
+// -- OCSP request -------------------------------------------------------------
+
+/// An unsigned RFC 6960 §4.1 `OCSPRequest` covering a single
+/// `(leaf, issuer)` pair, optionally carrying a client-chosen nonce.
+///
+/// Only the unsigned form (no `optionalSignature`) is emitted: it is what
+/// the great majority of responders accept and what the OCSP-over-HTTP
+/// profile (RFC 6960 §A.1) defines. Once built, the wire DER is exposed via
+/// [`to_der`](Self::to_der) and the nonce, if any, via
+/// [`nonce`](Self::nonce) so the caller can later pass it to
+/// [`OcspResponse::check_for_cert_with_nonce`].
+///
+/// ASN.1 (RFC 6960 §4.1.1):
+///
+/// ```text
+/// OCSPRequest ::= SEQUENCE {
+///     tbsRequest                  TBSRequest,
+///     optionalSignature   [0]     EXPLICIT Signature OPTIONAL }
+///
+/// TBSRequest ::= SEQUENCE {
+///     version             [0]     EXPLICIT Version DEFAULT v1,
+///     requestorName       [1]     EXPLICIT GeneralName OPTIONAL,
+///     requestList                 SEQUENCE OF Request,
+///     requestExtensions   [2]     EXPLICIT Extensions OPTIONAL }
+///
+/// Request ::= SEQUENCE {
+///     reqCert                     CertID,
+///     singleRequestExtensions [0] EXPLICIT Extensions OPTIONAL }
+/// ```
+#[derive(Clone, Debug)]
+pub struct OcspRequest {
+    der: Vec<u8>,
+    nonce: Option<Vec<u8>>,
+}
+
+/// Builder for an [`OcspRequest`]. Configure the hash algorithm and the
+/// nonce (if any), then call [`build`](Self::build).
+#[derive(Clone, Debug)]
+pub struct OcspRequestBuilder {
+    issuer_name_value: Vec<u8>,
+    issuer_key_bits: Vec<u8>,
+    serial: Vec<u8>,
+    hash_alg_oid: &'static [u64],
+    nonce: Option<Vec<u8>>,
+}
+
+impl OcspRequestBuilder {
+    /// Starts a builder for a `(leaf, issuer)` pair. Defaults to SHA-1 for
+    /// the CertID hash (the RFC 6960 §4.3 baseline; most responders accept
+    /// SHA-256 too but SHA-1 maximises interop).
+    pub fn new(leaf: &Certificate, issuer: &Certificate) -> Result<Self, Error> {
+        Ok(OcspRequestBuilder {
+            issuer_name_value: read_name_value(issuer.subject_der()?)?.to_vec(),
+            issuer_key_bits: issuer.subject_public_key_bits()?.to_vec(),
+            serial: leaf.serial_bytes()?.to_vec(),
+            hash_alg_oid: oid::ID_SHA1,
+            nonce: None,
+        })
+    }
+
+    /// Switches the CertID hash algorithm. Accepted: `id-sha1`, `id-sha256`,
+    /// `id-sha384`, `id-sha512`. Unknown OIDs are rejected at build time.
+    pub fn hash_algorithm(mut self, arcs: &'static [u64]) -> Self {
+        self.hash_alg_oid = arcs;
+        self
+    }
+
+    /// Embeds `nonce` verbatim as the `id-pkix-ocsp-nonce` extension
+    /// (RFC 6960 §4.4.1, RFC 8954 §2.1). The nonce body must be 1–32 octets;
+    /// other lengths are rejected at build time.
+    ///
+    /// The same nonce is later passed to
+    /// [`OcspResponse::check_for_cert_with_nonce`] to bind request and
+    /// response, preventing replay of a stale-but-still-fresh-looking
+    /// stapled response.
+    pub fn nonce(mut self, nonce: &[u8]) -> Self {
+        self.nonce = Some(nonce.to_vec());
+        self
+    }
+
+    /// Generates a 16-byte nonce from `rng` and installs it. Convenience for
+    /// callers that already have a CSPRNG handy.
+    pub fn random_nonce<R: RngCore>(mut self, rng: &mut R) -> Self {
+        let mut buf = [0u8; 16];
+        rng.fill_bytes(&mut buf);
+        self.nonce = Some(buf.to_vec());
+        self
+    }
+
+    /// Encodes the `OCSPRequest` DER. Performs no signature — the request
+    /// is unsigned (RFC 6960 §4.1.2 leaves `optionalSignature` truly
+    /// optional, and real-world responders accept the unsigned form).
+    pub fn build(self) -> Result<OcspRequest, Error> {
+        let (name_hash, key_hash) = hash_pair(
+            self.hash_alg_oid,
+            &self.issuer_name_value,
+            &self.issuer_key_bits,
+        )
+        .ok_or(Error::UnsupportedAlgorithm)?;
+
+        // CertID body — same shape used in the response.
+        let mut cert_id_body = Vec::new();
+        cert_id_body.extend_from_slice(&ocsp_hash_algid(self.hash_alg_oid));
+        cert_id_body.extend_from_slice(&encode_octet_string(&name_hash));
+        cert_id_body.extend_from_slice(&encode_octet_string(&key_hash));
+        cert_id_body.extend_from_slice(&encode_integer(&self.serial));
+        let cert_id = encode_sequence(&cert_id_body);
+
+        // Request ::= SEQUENCE { reqCert CertID, singleRequestExtensions? }
+        let request_one = encode_sequence(&cert_id);
+        // requestList SEQUENCE OF Request — exactly one entry here.
+        let request_list = encode_sequence(&request_one);
+
+        // requestExtensions [2] EXPLICIT Extensions OPTIONAL.
+        let mut tbs = Vec::new();
+        tbs.extend_from_slice(&request_list);
+        if let Some(nonce_bytes) = &self.nonce {
+            if nonce_bytes.is_empty() || nonce_bytes.len() > 32 {
+                return Err(Error::Malformed);
+            }
+            let inner = encode_octet_string(nonce_bytes);
+            let nonce_ext = Extension {
+                oid: oid::ID_PKIX_OCSP_NONCE.to_vec(),
+                critical: false,
+                value: inner,
+            }
+            .to_der();
+            let exts_seq = encode_sequence(&nonce_ext);
+            tbs.extend_from_slice(&encode_context(2, &exts_seq));
+        }
+        let tbs_request = encode_sequence(&tbs);
+
+        // OCSPRequest ::= SEQUENCE { tbsRequest, optionalSignature? } — we
+        // omit the signature.
+        let der = encode_sequence(&tbs_request);
+        Ok(OcspRequest {
+            der,
+            nonce: self.nonce,
+        })
+    }
+}
+
+impl OcspRequest {
+    /// The DER encoding ready to POST to the responder
+    /// (`application/ocsp-request`, RFC 6960 §A.1).
+    pub fn to_der(&self) -> &[u8] {
+        &self.der
+    }
+
+    /// Returns the nonce body the builder embedded, if any. Pass this to
+    /// [`OcspResponse::check_for_cert_with_nonce`] when validating the
+    /// matching response.
+    pub fn nonce(&self) -> Option<&[u8]> {
+        self.nonce.as_deref()
     }
 }
 
@@ -1171,5 +1448,177 @@ mod tests {
         // 32-byte SHA-256 outputs.
         assert_eq!(single.issuer_name_hash.len(), 32);
         assert_eq!(single.issuer_key_hash.len(), 32);
+    }
+
+    // X509-4: RFC 6960 §4.4.1 — nonce extension binds an OCSP response to the
+    // request that asked for it. A client that requested a nonce and gets back
+    // a response with no nonce (or a different one) must reject; otherwise an
+    // attacker who captured a still-fresh response can replay it indefinitely
+    // until its `nextUpdate` lapses.
+    #[test]
+    fn nonce_round_trips_through_builder_and_response() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let nonce = [0x42u8; 16];
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .nonce(&nonce)
+            .sign(&signer)
+            .unwrap();
+        // The accessor returns exactly the bytes the builder embedded.
+        let got = resp.nonce().unwrap().unwrap();
+        assert_eq!(got, nonce);
+        // Signature still verifies — the nonce extension is part of tbsResponseData.
+        resp.verify_signature_with(&signer.public_key()).unwrap();
+    }
+
+    #[test]
+    fn response_without_nonce_returns_none() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        assert!(resp.nonce().unwrap().is_none());
+    }
+
+    #[test]
+    fn check_with_nonce_accepts_matching_nonce() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let nonce = b"client-nonce-aaaa";
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .nonce(nonce)
+        .sign(&signer)
+        .unwrap();
+        let status = resp
+            .check_for_cert_with_nonce(&leaf, &issuer, Some(&now), nonce)
+            .unwrap();
+        assert_eq!(status, OcspCertStatus::Good);
+    }
+
+    #[test]
+    fn check_with_nonce_rejects_missing_nonce() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        // No nonce embedded.
+        .sign(&signer)
+        .unwrap();
+        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"expected");
+        assert!(matches!(result, Err(Error::Verification)));
+    }
+
+    #[test]
+    fn check_with_nonce_rejects_mismatched_nonce() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .nonce(b"responder-chose-different")
+        .sign(&signer)
+        .unwrap();
+        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"client-asked");
+        assert!(matches!(result, Err(Error::Verification)));
+    }
+
+    #[test]
+    fn request_builder_round_trips_nonce() {
+        let (issuer, leaf, _) = issuer_and_leaf();
+        let nonce = b"req-nonce-1234567890";
+        let req = OcspRequestBuilder::new(&leaf, &issuer)
+            .unwrap()
+            .nonce(nonce)
+            .build()
+            .unwrap();
+        assert_eq!(req.nonce(), Some(nonce.as_slice()));
+
+        // The DER decodes as a well-formed OCSPRequest carrying our nonce in
+        // requestExtensions [2] EXPLICIT Extensions.
+        let mut r = Reader::new(req.to_der());
+        let mut outer = r.read_sequence().unwrap();
+        let mut tbs = outer.read_sequence().unwrap();
+        // requestList SEQUENCE OF Request — skip it.
+        let _req_list = tbs.read_element().unwrap();
+        // requestExtensions [2] EXPLICIT
+        let exts_wrapper = tbs.read_tlv(tag::context(2)).unwrap();
+        let mut exts_outer = Reader::new(exts_wrapper);
+        let mut exts = exts_outer.read_sequence().unwrap();
+        let mut ext = exts.read_sequence().unwrap();
+        let id = parse_oid(ext.read_oid().unwrap()).unwrap();
+        assert_eq!(id.as_slice(), oid::ID_PKIX_OCSP_NONCE);
+        let value = ext.read_octet_string().unwrap();
+        // RFC 8954 §2.1: extnValue OCTET STRING wraps an inner OCTET STRING.
+        let mut nr = Reader::new(value);
+        let inner = nr.read_octet_string().unwrap();
+        assert_eq!(inner, nonce);
+    }
+
+    #[test]
+    fn request_builder_rejects_oversize_nonce() {
+        let (issuer, leaf, _) = issuer_and_leaf();
+        // RFC 8954 §2.1 caps the nonce at 32 octets.
+        let too_long = [0u8; 33];
+        let r = OcspRequestBuilder::new(&leaf, &issuer)
+            .unwrap()
+            .nonce(&too_long)
+            .build();
+        assert!(matches!(r, Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn request_builder_rejects_empty_nonce() {
+        let (issuer, leaf, _) = issuer_and_leaf();
+        let r = OcspRequestBuilder::new(&leaf, &issuer)
+            .unwrap()
+            .nonce(&[])
+            .build();
+        assert!(matches!(r, Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn response_builder_rejects_oversize_nonce() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let too_long = [0u8; 33];
+        let r = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .nonce(&too_long)
+            .sign(&signer);
+        assert!(matches!(r, Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn random_nonce_is_present_and_correct_length() {
+        let (issuer, leaf, _) = issuer_and_leaf();
+        let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ocsp-nonce", b"n", &[]);
+        let req = OcspRequestBuilder::new(&leaf, &issuer)
+            .unwrap()
+            .random_nonce(&mut rng)
+            .build()
+            .unwrap();
+        let n = req.nonce().unwrap();
+        assert_eq!(n.len(), 16);
     }
 }

@@ -46,6 +46,9 @@ impl<const LIMBS: usize> RawPrivate for RsaPrivateKey<LIMBS> {
     fn raw_private(&self, c: &[u8]) -> Vec<u8> {
         uint_to_k_bytes(&self.raw(&Uint::<LIMBS>::from_be_bytes(c)))
     }
+    fn secret_seed(&self) -> [u8; 32] {
+        self.secret_seed_bytes()
+    }
 }
 
 /// A hash usable with PKCS#1 v1.5 signatures: it carries the DER-encoded
@@ -127,15 +130,60 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
 }
 
 impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
-    /// Decrypts a PKCS#1 v1.5 ciphertext (RFC 8017 §7.2.2).
+    /// Decrypts a PKCS#1 v1.5 ciphertext (RFC 8017 §7.2.2) and returns the
+    /// recovered message bytes.
     ///
     /// # Errors
     /// [`Error::InvalidLength`] if `ct` is not `LIMBS*8` bytes;
     /// [`Error::Decryption`] if the recovered padding is malformed.
     ///
-    /// See the module note: this is padding-oracle sensitive.
+    /// # Security
+    ///
+    /// The padding check itself is constant-time, but the returned `Vec`'s
+    /// **length** (and the success / [`Error::Decryption`] distinction)
+    /// reveals the position of the PKCS#1 v1.5 separator byte. An adaptive
+    /// chosen-ciphertext attacker who observes the protocol response can
+    /// mount a Bleichenbacher / Marvin / ROBOT-class oracle.
+    ///
+    /// For TLS 1.0–1.2 RSA key transport, CMS / PKCS#7, JOSE RSA1_5, and
+    /// other contexts where the plaintext length is known at the protocol
+    /// layer, use [`decrypt_pkcs1v15_session`](Self::decrypt_pkcs1v15_session)
+    /// instead. It returns a fixed-width, key-bound synthetic plaintext on
+    /// padding failure so the failure mode is indistinguishable from
+    /// success.
+    ///
+    /// For new code, prefer OAEP via [`decrypt_oaep`](Self::decrypt_oaep).
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         emsa::decrypt_pkcs1v15(self, ct)
+    }
+
+    /// Decrypts a PKCS#1 v1.5 ciphertext with implicit rejection (RFC 8017
+    /// §7.2.2 Note, the "Marvin" / TLS 1.2-style mitigation against
+    /// Bleichenbacher's attack).
+    ///
+    /// On padding failure, returns a deterministic pseudorandom buffer of
+    /// length `expected_len` derived from the ciphertext bytes and a
+    /// per-key secret. The caller (and any external observer) cannot
+    /// distinguish a real decryption from a synthetic one in timing, error
+    /// path, or output length — the only way to defeat a Bleichenbacher
+    /// oracle when the caller's downstream behavior would otherwise leak
+    /// the padding outcome.
+    ///
+    /// On success the returned `Vec` is **truncated or padded** to
+    /// `expected_len`: PKCS#1 v1.5 padding alone cannot recover the
+    /// intended plaintext length, so the protocol must agree on it (e.g.
+    /// TLS RSA key transport: `expected_len = 48` for the 48-byte
+    /// pre-master secret).
+    ///
+    /// # Errors
+    /// Only [`Error::InvalidLength`] when `ct.len() != LIMBS*8`. All other
+    /// failure modes are folded into the synthetic plaintext.
+    pub fn decrypt_pkcs1v15_session(
+        &self,
+        ct: &[u8],
+        expected_len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        emsa::decrypt_pkcs1v15_session(self, ct, expected_len)
     }
 
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` must match
@@ -286,6 +334,61 @@ mod tests {
         assert_eq!(
             pk.verify_pkcs1v15::<Sha224>(msg, &sig),
             Err(Error::Verification)
+        );
+    }
+
+    // ---- RSA-2: implicit-rejection (decrypt_pkcs1v15_session) ----
+
+    /// Round-trip: a real PKCS#1 v1.5 ciphertext decrypts to its original
+    /// plaintext when `expected_len` matches.
+    #[test]
+    fn session_decrypt_recovers_message_on_valid_ct() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-session-ok", b"nonce", &[]);
+        let msg = [0xa5u8; 48]; // 48-byte premaster-secret-shaped message.
+        let ct = pk.encrypt_pkcs1v15(&msg, &mut r).unwrap();
+        let out = key.decrypt_pkcs1v15_session(&ct, msg.len()).unwrap();
+        assert_eq!(out, msg);
+    }
+
+    /// A ciphertext whose decryption yields malformed padding must not
+    /// surface an error: the session API returns an `expected_len`-byte
+    /// pseudorandom plaintext instead, indistinguishable in shape from
+    /// success. This is the core anti-Bleichenbacher property.
+    #[test]
+    fn session_decrypt_returns_synthetic_on_bad_padding() {
+        let key = rsa_test_key_a();
+        // Any 256-byte buffer that decrypts under `key` to something
+        // not starting with 0x00 0x02. The all-ones ciphertext below
+        // overwhelmingly fits.
+        let bogus_ct = [0x7eu8; 256];
+        let out = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        assert_eq!(out.len(), 48);
+    }
+
+    /// The synthetic plaintext is deterministic for a given (key, ct,
+    /// expected_len) triple, so repeated calls under the same long-term
+    /// secret produce identical output. This is what lets a protocol layer
+    /// treat the failure path as "as if decryption succeeded".
+    #[test]
+    fn session_decrypt_is_deterministic_under_same_key() {
+        let key = rsa_test_key_a();
+        let bogus_ct = [0x3cu8; 256];
+        let a = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        let b = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// `Error::InvalidLength` is the only failure surfaced (ciphertext
+    /// length mismatch is public, not a padding-dependent secret).
+    #[test]
+    fn session_decrypt_rejects_wrong_length_ct() {
+        let key = rsa_test_key_a();
+        let short = [0u8; 255];
+        assert_eq!(
+            key.decrypt_pkcs1v15_session(&short, 48),
+            Err(Error::InvalidLength)
         );
     }
 }

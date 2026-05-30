@@ -334,6 +334,13 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             c,
         )
     }
+
+    /// Per-key 32-byte secret used to seed PKCS#1 v1.5 implicit-rejection
+    /// fallbacks. Same value as the blinding HMAC key (derived once at key
+    /// construction from `d`).
+    pub(crate) fn secret_seed_bytes(&self) -> [u8; 32] {
+        self.blinding_seed
+    }
 }
 
 #[cfg(test)]

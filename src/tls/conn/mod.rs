@@ -4321,6 +4321,7 @@ mod tls12_loopback_tests {
                 ext::signature_algorithms(),
                 ext::supported_groups_list(&[NamedGroup::X25519]),
                 ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
                 ext::renegotiation_info_empty(),
                 ext::client_supported_versions(),
             ],
@@ -4759,13 +4760,16 @@ mod tls12_loopback_tests {
         roots.add_der(cert_der).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"ems-fallback-c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ems-fallback-s", b"nonce", &[]);
+        // Both peers opt out of the EMS requirement so the legacy
+        // randoms-only PRF path can complete (test documents that path).
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            ClientConfig12::new(roots).with_require_ems(false),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
             &[NamedGroup::X25519],
         );
+        let server_config = server_config.with_require_ems(false);
         let mut server = ServerConnection12::new(server_config, srng);
         // Server pretends it doesn't support EMS — silently skips the echo.
         server.test_force_no_ems = true;
@@ -4966,16 +4970,19 @@ mod tls12_loopback_tests {
     fn tls12_resumption_legacy_to_legacy() {
         let ticket_key = [0x77u8; 32];
 
-        // Phase 1: server forces NO EMS so the fresh handshake stays
-        // legacy. The client still offers EMS, but the server doesn't echo.
+        // Phase 1: both peers opt out of the EMS requirement; server
+        // also forces NO EMS so the fresh handshake stays legacy. The
+        // client still offers EMS, but the server doesn't echo.
         let (server_config, cert_der) = rsa_server12();
-        let server_config = server_config.with_ticket_key(ticket_key);
+        let server_config = server_config
+            .with_ticket_key(ticket_key)
+            .with_require_ems(false);
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der.clone()).unwrap();
         let mut crng = HmacDrbg::<Sha256>::new(b"legacy-rt-1c", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"legacy-rt-1s", b"nonce", &[]);
         let mut client = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots),
+            ClientConfig12::new(roots).with_require_ems(false),
             "loopback.example",
             &mut crng,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
@@ -5002,15 +5009,20 @@ mod tls12_loopback_tests {
         let session = client.take_session().expect("ticket");
         assert!(!session.ems_used, "legacy session ticket records ems=false");
 
-        // Phase 2: again forcing no EMS — legacy resume.
+        // Phase 2: again forcing no EMS — legacy resume. Both peers
+        // again opt out of the EMS requirement.
         let (server_config2, _) = rsa_server12();
-        let server_config2 = server_config2.with_ticket_key(ticket_key);
+        let server_config2 = server_config2
+            .with_ticket_key(ticket_key)
+            .with_require_ems(false);
         let mut roots2 = RootCertStore::new();
         roots2.add_der(cert_der).unwrap();
         let mut crng2 = HmacDrbg::<Sha256>::new(b"legacy-rt-2c", b"nonce", &[]);
         let srng2 = HmacDrbg::<Sha256>::new(b"legacy-rt-2s", b"nonce", &[]);
         let mut client2 = ClientConnection12::new_with_offer(
-            ClientConfig12::new(roots2).with_session(session),
+            ClientConfig12::new(roots2)
+                .with_session(session)
+                .with_require_ems(false),
             "loopback.example",
             &mut crng2,
             &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],

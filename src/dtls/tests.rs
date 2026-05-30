@@ -179,6 +179,87 @@ fn replay_rejected_silently() {
     assert_eq!(client.take_received(), b"second");
 }
 
+/// DTLS-1 (DTLS 1.2 read path): forged record with a fresh seq number that
+/// fails AEAD must NOT burn the replay window. See dtls13 counterpart for
+/// the rationale.
+#[test]
+fn forged_record_does_not_burn_replay_slot_dtls12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-fwd", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert!(pump_handshake(&mut client, &mut server));
+
+    server.send(b"one").unwrap();
+    let s1 = server.pop_outbound_datagrams();
+    assert_eq!(s1.len(), 1);
+
+    server.send(b"two").unwrap();
+    let s2 = server.pop_outbound_datagrams();
+    assert_eq!(s2.len(), 1);
+    // Tamper the ciphertext.
+    let mut tampered = s2[0].clone();
+    let mid = tampered.len() / 2;
+    tampered[mid] ^= 1;
+
+    client.feed_datagram(&s1[0]).unwrap();
+    assert_eq!(client.take_received(), b"one");
+    // Tampered: AEAD fails. The window must NOT mark the slot.
+    let _ = client.feed_datagram(&tampered);
+    assert!(client.take_received().is_empty());
+    // Legit #2 still accepted — its slot wasn't burnt by the forgery.
+    client.feed_datagram(&s2[0]).unwrap();
+    assert_eq!(client.take_received(), b"two");
+}
+
+/// DTLS-3 (DTLS 1.2): `set_now` advances the cookie generator's clock.
+/// Without this hook, a server with no firing timeouts would issue cookies
+/// with a stale timestamp forever, defeating the embedded-TS age check.
+#[test]
+fn set_now_advances_cookie_clock_dtls12() {
+    use core::time::Duration;
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg
+        .with_cookie_secret([0xa5; 32])
+        .require_cookie_exchange(true);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-set-now", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // CH1 → HVR(cookie) at t=0.
+    let c1 = client.pop_outbound_datagrams();
+    for dg in &c1 {
+        server.feed_datagram(dg).unwrap();
+    }
+    let hvr_at_zero = server.pop_outbound_datagrams();
+    assert!(!hvr_at_zero.is_empty());
+
+    // Advance clock by 5 minutes — cookie TS field (in minutes) changes.
+    server.set_now(Duration::from_secs(60 * 5));
+
+    let mut other_client = make_client(&cert);
+    let other_c1 = other_client.pop_outbound_datagrams();
+    for dg in &other_c1 {
+        server.feed_datagram(dg).unwrap();
+    }
+    let hvr_at_five = server.pop_outbound_datagrams();
+    assert!(!hvr_at_five.is_empty());
+    assert_ne!(hvr_at_zero, hvr_at_five);
+
+    // Rewind is a no-op.
+    server.set_now(Duration::from_secs(0));
+    let mut third_client = make_client(&cert);
+    let third_c1 = third_client.pop_outbound_datagrams();
+    for dg in &third_c1 {
+        server.feed_datagram(dg).unwrap();
+    }
+    let hvr_rewound = server.pop_outbound_datagrams();
+    assert!(!hvr_rewound.is_empty());
+}
+
 #[test]
 fn application_data_both_ways_12() {
     let (server_cfg, cert) = make_server();
@@ -964,6 +1045,198 @@ mod dtls13 {
             server.feed_datagram(dg).unwrap();
         }
         assert_eq!(server.take_received(), b"ping-hrr");
+    }
+
+    /// DTLS-2 / DTLS-4: the cookie-required CH1 path must NOT pin
+    /// per-connection handshake state (suite, group, transcript). All such
+    /// state must be derived from the cookie's `aux` payload on CH2.
+    ///
+    /// We exercise this by:
+    ///   1. Driving CH1 → HRR(cookie) end-to-end so the server is in
+    ///      `WaitSecondClientHello`.
+    ///   2. Re-creating a fresh client (different random, different shape)
+    ///      and feeding its CH1 to the server again. Because the server is
+    ///      stateless across HRR, this second CH1 should also trigger HRR
+    ///      with its own cookie, not error out due to stale state.
+    ///   3. The originally-issued cookie carries (suite, group, Hash(CH1))
+    ///      so the original client's CH2 still completes the handshake.
+    #[test]
+    fn cookie_round_does_not_pin_state() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-no-pin", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // CH1 → HRR(cookie).
+        let c1 = client.pop_outbound_datagrams();
+        assert!(!c1.is_empty(), "client should have emitted CH1");
+        for dg in &c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert!(!hrr.is_empty(), "server should emit HRR with cookie");
+
+        // Inject a *different* CH1 from a freshly-built client. If the
+        // server pinned state on the first CH1, this would either error or
+        // silently keep the old pinned suite/group; with the stateless
+        // aux-cookie design, the server simply re-issues a cookie.
+        let mut other_client = make_client13(&cert);
+        let other_c1 = other_client.pop_outbound_datagrams();
+        for dg in &other_c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr2 = server.pop_outbound_datagrams();
+        assert!(
+            !hrr2.is_empty(),
+            "server must re-issue HRR for the second client's CH1, not silently drop"
+        );
+
+        // Now deliver the original HRR to the original client and finish
+        // the handshake. This proves the original cookie still works after
+        // the server processed an interloper CH1.
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    /// DTLS-5: the cookie binds the CH content fingerprint (cipher_suites,
+    /// supported_groups, supported_versions, key_share groups). A CH2 with
+    /// rewritten cipher_suites fails cookie validation.
+    ///
+    /// We can't easily produce a CH2 with the right cookie but different
+    /// suites from outside the layer, so we instead drive a real
+    /// CH1→HRR(cookie) exchange and verify that the issued cookie's HMAC
+    /// covers the CH content via the cookie generator directly.
+    #[test]
+    fn cookie_binds_ch_content_fingerprint() {
+        use crate::dtls::cookie::{CookieGenerator, build_ch_fingerprint};
+
+        // Use a fixed secret + addr + random so the cookie is deterministic.
+        let cg = CookieGenerator::new([0x11; 32]);
+        let addr = b"client";
+        let rand = [0x77; 32];
+        let fp1 = build_ch_fingerprint(b"\x13\x01\x13\x02", None, None, b"\x00\x1d");
+        let fp2 = build_ch_fingerprint(b"\x13\x01", None, None, b"\x00\x1d");
+        let ts = 12_345_u32;
+        let cookie = cg.generate(addr, &rand, &fp1, ts);
+        assert!(cg.validate(addr, &rand, &fp1, ts, &cookie));
+        // A CH2 advertising a weaker suite list — same address, same
+        // random, same TS, only `cipher_suites` differs — fails validation.
+        assert!(!cg.validate(addr, &rand, &fp2, ts, &cookie));
+    }
+
+    /// DTLS-3: the cookie generator's `now_minutes` must advance even when
+    /// no timeouts fire. `set_now` provides that hook.
+    #[test]
+    fn set_now_advances_cookie_clock() {
+        use core::time::Duration;
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-set-now", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // Drive CH1 → HRR(cookie) at t=0.
+        let c1 = client.pop_outbound_datagrams();
+        for dg in &c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr_at_zero = server.pop_outbound_datagrams();
+        assert!(!hrr_at_zero.is_empty());
+
+        // Advance the server's clock far enough that a cookie issued NOW
+        // would have a different TS field than the one above. (Cookie TS
+        // is in minutes, so we need at least a minute.)
+        server.set_now(Duration::from_secs(60 * 5));
+
+        // Drive CH1 from a fresh client. The server must use the new clock.
+        let mut other_client = make_client13(&cert);
+        let other_c1 = other_client.pop_outbound_datagrams();
+        for dg in &other_c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr_at_five = server.pop_outbound_datagrams();
+        assert!(!hrr_at_five.is_empty());
+        // The two cookies (with different TS) must differ.
+        // We compare the raw HRR datagrams — the cookie extension is the
+        // only varying field given fixed random/addr (and the random does
+        // differ here, so the test is "at least different"). Strict
+        // equality would only hold if we could pin the client randoms.
+        assert_ne!(hrr_at_zero, hrr_at_five);
+
+        // set_now is monotonic: rewinding is a no-op.
+        server.set_now(Duration::from_secs(0));
+        let mut third_client = make_client13(&cert);
+        let third_c1 = third_client.pop_outbound_datagrams();
+        for dg in &third_c1 {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr_after_rewind = server.pop_outbound_datagrams();
+        assert!(!hrr_after_rewind.is_empty(), "clock rewind is a no-op");
+    }
+
+    /// DTLS-1 (DTLS 1.3 read path): a forged record with a fresh seq number
+    /// that fails AEAD verification must NOT burn slots in the anti-replay
+    /// window. After the forgery is rejected, legitimate records around the
+    /// forged seq must still be accepted.
+    ///
+    /// This is enforced at the replay-window layer (see
+    /// `replay::tests::forged_seq_does_not_burn_slots`); the server-level
+    /// regression is that the `check`-then-AEAD-then-`mark` ordering is in
+    /// place rather than the old `accept` (which marked unconditionally).
+    /// We verify by completing a handshake, then sending a deliberately
+    /// corrupted record from the server (tampered ciphertext = AEAD fail),
+    /// and checking that a subsequent good record at a smaller seq still
+    /// arrives. Without the fix, the bad record's seq would burn the slot
+    /// and the good record would be dropped as a duplicate.
+    #[test]
+    fn forged_record_does_not_burn_replay_slot_dtls13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-fwd", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Send legit record #1.
+        server.send(b"one").unwrap();
+        let s1 = server.pop_outbound_datagrams();
+        assert_eq!(s1.len(), 1);
+
+        // Now build a tampered version of a future record. We send #2 first
+        // to get a baseline ciphertext, tamper it, deliver the tampered
+        // version, and observe that the tampering is silently dropped
+        // without recording the seq.
+        server.send(b"two").unwrap();
+        let s2 = server.pop_outbound_datagrams();
+        assert_eq!(s2.len(), 1);
+        let mut tampered = s2[0].clone();
+        // Flip a byte deep inside the ciphertext payload (avoid the header
+        // so the record parses).
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 1;
+
+        // Deliver legit #1, then tampered #2, then legit #1 again as a
+        // "replay" to confirm the window state.
+        client.feed_datagram(&s1[0]).unwrap();
+        assert_eq!(client.take_received(), b"one");
+
+        // Tampered record: AEAD fails. The connection should ignore it
+        // without erroring. We don't assert here on the exact behaviour
+        // (some impls return Err, some Ok-with-drop); the key property is
+        // that the slot is NOT marked.
+        let _ = client.feed_datagram(&tampered);
+        assert!(client.take_received().is_empty());
+
+        // Deliver legit #2 (untampered): must be accepted, confirming the
+        // tampered attempt didn't burn the slot for seq=#2.
+        client.feed_datagram(&s2[0]).unwrap();
+        assert_eq!(client.take_received(), b"two");
     }
 }
 

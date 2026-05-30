@@ -539,14 +539,18 @@ impl DtlsClientConnection13 {
         } else {
             aad[1] ^= mask[0];
         }
+        // Pre-AEAD anti-replay check: cheap rejection of duplicate /
+        // too-old seq numbers without touching window state. The window
+        // is `mark`-ed only after AEAD verification succeeds so a forged
+        // packet that fails AEAD cannot burn a slot.
+        if !self.read_replay.check(seq) {
+            return Ok(consumed);
+        }
         let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
         let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
 
-        // RFC 9147 §4.5.1: anti-replay window — drop duplicates and stale
-        // sequence numbers even though the AEAD already verified them.
-        if !self.read_replay.accept(seq) {
-            return Ok(consumed);
-        }
+        // RFC 9147 §4.5.1: AEAD verified — commit to the window now.
+        self.read_replay.mark(seq);
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }

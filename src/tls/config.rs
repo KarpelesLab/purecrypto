@@ -131,6 +131,14 @@ pub struct Config {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
+    /// RFC 7627 §5.3 — when `true` (the default), a TLS 1.2 handshake
+    /// MUST negotiate Extended Master Secret; if the peer doesn't echo
+    /// the extension the connection aborts with `handshake_failure`.
+    /// This blocks the triple-handshake family of cross-protocol attacks
+    /// the EMS extension exists to prevent. Set to `false` only to
+    /// interoperate with very old peers that predate RFC 7627. Inert
+    /// outside TLS 1.2 (TLS 1.3 derives all secrets transcript-bound).
+    pub require_extended_master_secret: bool,
 
     // ---- RFC 7250 raw public keys (TLS 1.3 only) ----
     /// Server-cert-type preference list offered in the `server_certificate_type`
@@ -253,6 +261,7 @@ impl Default for Config {
             replay_window: None,
             alpn_protocols: Vec::new(),
             record_size_limit: None,
+            require_extended_master_secret: true,
             server_cert_type_preference: alloc::vec![0u8], // X.509 only.
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
@@ -452,6 +461,14 @@ impl ConfigBuilder {
     /// `record_size_limit` (RFC 8449) advertised on the wire.
     pub fn record_size_limit(mut self, n: u16) -> Self {
         self.inner.record_size_limit = Some(n);
+        self
+    }
+    /// RFC 7627 §5.3 — require the TLS 1.2 peer to negotiate Extended
+    /// Master Secret. Default is `true`; flip to `false` only to
+    /// interoperate with peers that predate RFC 7627 (most modern
+    /// stacks already mandate EMS).
+    pub fn require_extended_master_secret(mut self, required: bool) -> Self {
+        self.inner.require_extended_master_secret = required;
         self
     }
     /// Sets the `server_certificate_type` preference list (RFC 7250). On the

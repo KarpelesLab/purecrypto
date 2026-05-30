@@ -150,11 +150,21 @@ impl DhPrivateKey {
     /// Computes the shared secret `peer.y ^ x mod p`.
     ///
     /// Rejects:
-    /// * `peer.y < 2` or `peer.y ≥ p - 1` — subgroup-confinement check:
-    ///   the only values in this range are 0, 1, and `p - 1`, all of which
-    ///   are tiny-order elements that would leak `x`;
-    /// * a resulting shared secret of 0 or 1 — contributory-failure rejection
-    ///   per NIST SP 800-56A §5.6.2.3.
+    /// * `peer.y < 2` or `peer.y ≥ p - 1` — coarse range check: the
+    ///   only values in this range are 0, 1, and `p - 1`, all of which
+    ///   are tiny-order elements;
+    /// * `peer.y ^ q mod p ≠ 1` where `q = (p - 1) / 2` — subgroup-
+    ///   confinement (NIST SP 800-56A §5.6.2.3.2 "Full Public-Key
+    ///   Validation"). Without this check an attacker can submit a peer
+    ///   value lying in a small subgroup of size `t | (p - 1)` and recover
+    ///   `x mod t` by exhaustive search of the resulting shared secret. For
+    ///   the RFC 3526 / RFC 7919 safe-prime groups (`p = 2q + 1`, `q`
+    ///   prime), the order-`q` subgroup is the only large subgroup and this
+    ///   test confines `peer.y` to it. For custom non-safe-prime groups the
+    ///   check still rejects every public value outside the order-`q`
+    ///   half-quotient subgroup;
+    /// * a resulting shared secret of 0 or 1 — contributory-failure
+    ///   rejection per NIST SP 800-56A §5.6.2.3.
     pub fn shared_secret(&self, peer: &DhPublicKey) -> Result<SharedSecret, Error> {
         let p = self.group.p();
         // [2, p - 2]  ⇔  y ≥ 2 AND y < p - 1.
@@ -165,13 +175,29 @@ impl DhPrivateKey {
         }
 
         let m = BoxedMontModulus::new(p);
+
+        // Subgroup-confinement: peer.y ^ q mod p must equal 1, where
+        // q = (p - 1) / 2. For a safe prime `p = 2q + 1` (RFC 3526, RFC
+        // 7919, every safe-prime SSH group-exchange responder), `q` is
+        // the order of the prime subgroup; any element of order > 1
+        // outside that subgroup has order 2 (i.e. is `p - 1`), already
+        // ruled out by the coarse range check above. Performing this
+        // modexp also makes a small-subgroup attack on a maliciously
+        // crafted non-safe-prime peer fail closed.
+        let q = p_minus_one.shr_bits(1);
+        let one = BoxedUint::from_u64(1);
+        let y_to_q = m.pow(&peer.y, &q);
+        if !bool::from(y_to_q.ct_eq(&one)) {
+            return Err(Error::InvalidPublicKey);
+        }
+
         let z = m.pow(&peer.y, &self.x);
 
         // Contributory-failure rejection: z != 0 and z != 1. Use ct_eq for
         // consistency with the rest of the codebase even though z is no
         // longer secret-input by the time it gets here.
         let zero_eq = z.ct_eq(&BoxedUint::from_u64(0));
-        let one_eq = z.ct_eq(&BoxedUint::from_u64(1));
+        let one_eq = z.ct_eq(&one);
         if bool::from(zero_eq | one_eq) {
             return Err(Error::ContributoryFailure);
         }
@@ -397,38 +423,96 @@ mod tests {
         assert_eq!(s.as_bytes().len(), group14().p().bit_len().div_ceil(8));
     }
 
+    /// DH-1 (subgroup confinement): a peer public value of order 2 — the
+    /// canonical value `p - 1` would be caught by the coarse `[2, p - 2]`
+    /// range check, so we use a custom *non*-safe prime whose group order
+    /// has a small factor, and submit the small-order element. The
+    /// `Y^q mod p == 1` check must reject it.
+    ///
+    /// `p = 11`, `q = (p - 1) / 2 = 5`. The element `10 = p - 1` has order
+    /// 2 (and is filtered by the range check); the element `3` has order 5
+    /// (since `3^5 mod 11 = 243 mod 11 = 1`), so it lies *inside* the
+    /// order-q subgroup and would pass `Y^q == 1`. To get something that
+    /// passes the range check but fails subgroup confinement we use a
+    /// non-safe prime: `p = 7`, `(p - 1)/2 = 3`. The cyclic group has order
+    /// 6 = 2·3. Element `6 = p - 1` has order 2 — filtered out. Element
+    /// `2` has order 3 (`2^3 mod 7 = 1`), lies in the order-3 subgroup.
+    /// Element `5` has order 6 (generator); `5^3 mod 7 = 6 ≠ 1`, so `5`
+    /// would be rejected by the subgroup-confinement check.
+    #[test]
+    fn shared_secret_rejects_non_subgroup_element() {
+        let p = BoxedUint::from_u64(7);
+        let g = BoxedUint::from_u64(3); // 3 generates the order-3 subgroup.
+        let group = DhGroup::from_custom_unchecked(p, g, 2).unwrap();
+        let alice = DhPrivateKey::from_bytes(group.clone(), &[2u8]).unwrap();
+        // Build a peer public key holding `5` — order-6 generator,
+        // outside the order-q subgroup since `5^3 mod 7 = 6 ≠ 1`.
+        let peer = DhPublicKey {
+            group: group.clone(),
+            y: BoxedUint::from_u64(5),
+        };
+        assert!(
+            matches!(alice.shared_secret(&peer), Err(Error::InvalidPublicKey)),
+            "subgroup-confinement check must reject Y with Y^q mod p != 1"
+        );
+        // Sanity: the same peer expressed as a subgroup element (`2`,
+        // order 3, in the q-subgroup) must succeed.
+        let in_subgroup = DhPublicKey {
+            group,
+            y: BoxedUint::from_u64(2),
+        };
+        alice
+            .shared_secret(&in_subgroup)
+            .expect("y=2 is in the order-q subgroup, must succeed");
+    }
+
+    /// All five RFC 3526 named groups are safe primes, so every well-formed
+    /// peer-generated public value lies inside the order-`q` subgroup and
+    /// the new confinement check is invisible to honest exchanges.
+    #[test]
+    fn shared_secret_subgroup_check_passes_on_named_group14() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-subgroup-honest", b"nonce", &[]);
+        let alice = DhPrivateKey::generate(group14(), &mut rng);
+        let bob = DhPrivateKey::generate(group14(), &mut rng);
+        let a = alice.shared_secret(&bob.public_key()).unwrap();
+        let b = bob.shared_secret(&alice.public_key()).unwrap();
+        assert_eq!(a.as_bytes(), b.as_bytes());
+    }
+
     #[test]
     fn known_small_dh_via_custom_group() {
         // A tiny safe-prime group exercises the full pipeline against
-        // hand-computable values. p = 23 = 2 * 11 + 1 (11 is prime), g = 5
-        // generates the order-11 subgroup (since 5^11 mod 23 = 1).
-        // Use priv_bits = 4 so the random exponent is in [1, 15].
+        // hand-computable values. p = 23 = 2 * 11 + 1 (11 is prime), g = 2
+        // is a quadratic residue mod 23 and so generates the order-11
+        // subgroup. Use priv_bits = 4 so the random exponent fits in
+        // [1, 15].
         let p = BoxedUint::from_u64(23);
-        let g = BoxedUint::from_u64(5);
+        let g = BoxedUint::from_u64(2);
         // Bypass the MIN_CUSTOM_GROUP_BITS gate — this toy group only exists
         // to exercise the maths against hand-computable values; production
         // callers always go through `from_custom`.
         let group = DhGroup::from_custom_unchecked(p.clone(), g.clone(), 4).unwrap();
 
-        // x_alice = 6, y_alice = 5^6 mod 23 = 15625 mod 23 = 8.
+        // x_alice = 6, y_alice = 2^6 mod 23 = 64 mod 23 = 18.
         let mut a_buf = vec![0u8];
         a_buf[0] = 6;
         let alice = DhPrivateKey::from_bytes(group.clone(), &a_buf).unwrap();
         let a_pub = alice.public_key();
-        assert_eq!(a_pub.y(), &BoxedUint::from_u64(8));
+        assert_eq!(a_pub.y(), &BoxedUint::from_u64(18));
 
-        // x_bob = 15, y_bob = 5^15 mod 23 = 19.
+        // x_bob = 9, y_bob = 2^9 mod 23 = 512 mod 23 = 6.
         let mut b_buf = vec![0u8];
-        b_buf[0] = 15;
+        b_buf[0] = 9;
         let bob = DhPrivateKey::from_bytes(group, &b_buf).unwrap();
         let b_pub = bob.public_key();
-        assert_eq!(b_pub.y(), &BoxedUint::from_u64(19));
+        assert_eq!(b_pub.y(), &BoxedUint::from_u64(6));
 
-        // Shared = 8^15 mod 23 = 19^6 mod 23 = 2.
+        // Shared = 2^(6*9) mod 23 = 2^54 mod 23. Since 2^11 ≡ 1 mod 23,
+        // 2^54 = 2^(4*11 + 10) = 2^10 = 1024 mod 23 = 1024 - 44*23 = 12.
         let a_shared = alice.shared_secret(&b_pub).unwrap();
         let b_shared = bob.shared_secret(&a_pub).unwrap();
         assert_eq!(a_shared.as_bytes(), b_shared.as_bytes());
         // p byte-length is 1.
-        assert_eq!(a_shared.as_bytes(), &[2u8]);
+        assert_eq!(a_shared.as_bytes(), &[12u8]);
     }
 }

@@ -48,15 +48,39 @@ impl AntiReplayWindow {
         }
     }
 
-    /// Tests `seq` against the window and, if it should be processed,
-    /// updates the window to remember it. Returns `true` to accept, `false`
-    /// to silently drop.
-    pub(crate) fn accept(&mut self, seq: u64) -> bool {
+    /// Tests `seq` against the window without mutating it. Returns `true`
+    /// if the record would be accepted by [`Self::mark`], `false` if it is
+    /// a duplicate or too old.
+    ///
+    /// Use this as a *pre-check* before invoking the AEAD: an attacker who
+    /// can observe / guess the wire sequence number could otherwise burn
+    /// slots in the window by sending records that pass the cheap seq
+    /// filter and fail AEAD verification. Pair every accepting `check` with
+    /// a [`Self::mark`] call *after* the AEAD tag has been verified.
+    pub(crate) fn check(&self, seq: u64) -> bool {
+        if !self.seeded {
+            return true;
+        }
+        if seq > self.highest {
+            return true;
+        }
+        let delta = self.highest - seq;
+        if delta >= WINDOW_BITS {
+            return false;
+        }
+        let bit = 1u64 << delta;
+        self.bitmap & bit == 0
+    }
+
+    /// Records `seq` as accepted, advancing the window if needed. Must only
+    /// be called after the corresponding record has been AEAD-verified.
+    /// Idempotent on duplicates (a repeat call is a no-op).
+    pub(crate) fn mark(&mut self, seq: u64) {
         if !self.seeded {
             self.highest = seq;
             self.bitmap = 1; // bit 0 = the highest itself.
             self.seeded = true;
-            return true;
+            return;
         }
 
         if seq > self.highest {
@@ -70,23 +94,28 @@ impl AntiReplayWindow {
                 (self.bitmap << delta) | 1
             };
             self.highest = seq;
-            true
         } else {
-            // seq <= highest. Either inside the window (maybe seen, maybe
-            // not), or older than the window can track.
             let delta = self.highest - seq;
             if delta >= WINDOW_BITS {
-                // Too old: outside the window. Silently drop.
-                return false;
+                // Too old: outside the window. Caller should have honoured
+                // `check` first; treat as a no-op rather than panic.
+                return;
             }
             let bit = 1u64 << delta;
-            if self.bitmap & bit != 0 {
-                // Duplicate.
-                return false;
-            }
             self.bitmap |= bit;
-            true
         }
+    }
+
+    /// Convenience: combines [`Self::check`] and [`Self::mark`]. Use this
+    /// only when AEAD verification has already succeeded — for the
+    /// pre-AEAD path call `check` alone and `mark` after the tag verifies.
+    #[cfg(test)]
+    pub(crate) fn accept(&mut self, seq: u64) -> bool {
+        if !self.check(seq) {
+            return false;
+        }
+        self.mark(seq);
+        true
     }
 }
 
@@ -170,6 +199,66 @@ mod tests {
         assert!(w.accept(64));
         // Replay 0 (delta=64, just outside the window): rejected.
         assert!(!w.accept(0));
+    }
+
+    #[test]
+    fn check_is_read_only() {
+        // `check` must not advance the window: any number of failing AEAD
+        // verifications on a fresh seq must not burn slots.
+        let mut w = AntiReplayWindow::new();
+        assert!(w.accept(10));
+        // A future seq looks acceptable from `check`'s perspective —
+        // repeating `check` keeps reporting that without mutating state.
+        assert!(w.check(20));
+        assert!(w.check(20));
+        assert!(w.check(20));
+        // After all those checks, we should still be able to mark 20 and
+        // then 19 (which is older but inside the window from 10's vantage)
+        // — the window's `highest` must still be 10 at this point.
+        // Marking 20 now advances `highest` to 20.
+        w.mark(20);
+        // 19 is delta=1 below the new highest — still unseen, must accept.
+        assert!(w.check(19));
+        w.mark(19);
+        // And 19 is now a duplicate.
+        assert!(!w.check(19));
+    }
+
+    #[test]
+    fn mark_after_check_pattern() {
+        // Mirror of the AEAD path: check -> AEAD -> mark.
+        let mut w = AntiReplayWindow::new();
+        for seq in [5u64, 10, 7, 6, 11] {
+            assert!(w.check(seq), "seq {seq} should be acceptable on check");
+            w.mark(seq);
+        }
+        // Replays of any of those are rejected.
+        for seq in [5u64, 10, 7, 6, 11] {
+            assert!(!w.check(seq), "seq {seq} should now be a duplicate");
+        }
+    }
+
+    #[test]
+    fn forged_seq_does_not_burn_slots() {
+        // An off-path attacker who can guess seq numbers should NOT be able
+        // to mark slots in the window with packets that the AEAD rejects.
+        let mut w = AntiReplayWindow::new();
+        assert!(w.accept(5));
+        // Attacker forges packets at seq=6 and seq=7. Both pass `check`,
+        // both fail AEAD verification (we don't call `mark`). The window
+        // state must not change — when the legitimate retransmit arrives,
+        // it must still be accepted.
+        assert!(w.check(6));
+        assert!(w.check(7));
+        assert!(w.check(6)); // still acceptable
+        // Legitimate record at seq=6 arrives, AEAD verifies, we mark.
+        assert!(w.check(6));
+        w.mark(6);
+        assert!(!w.check(6)); // now a dup
+        // And seq=7 is still markable.
+        assert!(w.check(7));
+        w.mark(7);
+        assert!(!w.check(7));
     }
 
     #[test]

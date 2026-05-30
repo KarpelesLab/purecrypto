@@ -99,19 +99,30 @@ impl GreaseParams {
         self.build_extension(rng).encode()
     }
 
-    /// Derive GREASE bytes deterministically from the ClientHello
-    /// random (HKDF-SHA-256 expanded into `enc_len + payload_len + 1`
-    /// bytes). Lets a non-RNG-holding CH builder produce GREASE that
-    /// is still effectively random per-CH (since the CH random is
-    /// random) and that doesn't reveal whether the client speaks ECH.
+    /// Derive GREASE bytes from a connection-private 32-byte seed plus
+    /// the ClientHello random. The seed is fed in as IKM and the
+    /// ClientHello random as the salt; the `"ech grease"` label
+    /// separates this expansion from any other HKDF use.
     ///
-    /// The CH random is fed in as IKM and `"ech grease"` as the label.
-    pub(crate) fn build_extension_from_random(&self, ch_random: &[u8; 32]) -> Vec<u8> {
+    /// The seed MUST be unobservable to a passive on-path attacker —
+    /// callers should source it from their RNG once at construction
+    /// time (see [`crate::tls::ClientConnection`]). Deriving GREASE
+    /// from the public ClientHello random alone is a fingerprint: an
+    /// observer who sees the CH random can recompute the "encrypted"
+    /// payload and detect a non-ECH client. Mixing in the private seed
+    /// breaks that correlation while keeping the per-CH output fresh
+    /// (the CH random is already fresh per handshake).
+    pub(crate) fn build_extension_from_seed(
+        &self,
+        seed: &[u8; 32],
+        ch_random: &[u8; 32],
+    ) -> Vec<u8> {
         use crate::hash::Sha256;
         use crate::kdf::hkdf;
         // Output: 1 byte (config_id selector) + enc_len + payload_len.
         let mut out = alloc::vec![0u8; 1 + self.enc_len + self.payload_len];
-        hkdf::<Sha256>(b"", ch_random, b"ech grease", &mut out);
+        // IKM = private seed; salt = CH random; info = label.
+        hkdf::<Sha256>(ch_random, seed, b"ech grease", &mut out);
 
         let config_id = match self.config_id_strategy {
             GreaseConfigIdStrategy::Fixed(v) => v,

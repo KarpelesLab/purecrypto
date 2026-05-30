@@ -104,6 +104,12 @@ pub(crate) struct ServerConfig12 {
     stapled_ocsp_response: Option<Vec<u8>>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
+    /// RFC 7627 §5.3 — when `true` (the default), the server aborts a
+    /// handshake whose client did not offer `extended_master_secret`.
+    /// This prevents triple-handshake-style downgrades against clients
+    /// that would happily speak legacy TLS 1.2. Set to `false` only to
+    /// interoperate with very old clients that predate RFC 7627.
+    pub(crate) require_ems: bool,
 }
 
 /// Client-authentication policy for a TLS 1.2 server (RFC 5246 §7.4.4 +
@@ -135,6 +141,7 @@ impl ServerConfig12 {
             crls: crate::tls::pki::CrlStore::new(),
             stapled_ocsp_response: None,
             key_log: None,
+            require_ems: true,
         }
     }
 
@@ -153,6 +160,7 @@ impl ServerConfig12 {
             crls: crate::tls::pki::CrlStore::new(),
             stapled_ocsp_response: None,
             key_log: None,
+            require_ems: true,
         }
     }
 
@@ -165,6 +173,14 @@ impl ServerConfig12 {
     /// Advertises `record_size_limit = limit` (RFC 8449).
     pub fn with_record_size_limit(mut self, limit: u16) -> Self {
         self.record_size_limit = Some(limit);
+        self
+    }
+
+    /// RFC 7627 §5.3 — require the client to offer Extended Master
+    /// Secret. Default is `true`. Disable only for legacy interop with
+    /// clients that predate RFC 7627.
+    pub fn with_require_ems(mut self, required: bool) -> Self {
+        self.require_ems = required;
         self
     }
 
@@ -877,11 +893,24 @@ impl<R: RngCore> ServerConnection12<R> {
         let echo_ems = !self.test_force_no_ems;
         #[cfg(not(test))]
         let echo_ems = true;
-        if let Some(ems_body) = ext::find(&ch.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+        let client_offered_ems = if let Some(ems_body) =
+            ext::find(&ch.extensions, ExtensionType::EXTENDED_MASTER_SECRET)
+        {
             ext::parse_extended_master_secret(ems_body)?;
             if echo_ems {
                 self.ems_negotiated = true;
             }
+            true
+        } else {
+            false
+        };
+        // RFC 7627 §5.3: when EMS is required (the default) and the
+        // client failed to offer it, abort. Without EMS the master
+        // secret isn't bound to the handshake transcript, enabling the
+        // triple-handshake family of cross-protocol attacks (TLS-3
+        // audit finding).
+        if self.config.require_ems && !client_offered_ems {
+            return Err(Error::HandshakeFailure);
         }
 
         // RFC 5077 §3.1: the client advertises ticket support via the
@@ -1639,6 +1668,12 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        #[cfg(feature = "ech")]
+        Error::EchDecryptionFailed => AlertDescription::DecryptError,
+        #[cfg(feature = "ech")]
+        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        #[cfg(feature = "cert-compression")]
+        Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }
@@ -1707,6 +1742,7 @@ mod tests {
                 ext::signature_algorithms(),
                 ext::supported_groups_list(&[NamedGroup::X25519]),
                 ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
             ],
         }
         .encode();
@@ -1742,6 +1778,7 @@ mod tests {
             extensions: alloc::vec![
                 ext::supported_groups_list(&[NamedGroup::X25519]),
                 ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
             ],
         }
         .encode();
@@ -1757,6 +1794,86 @@ mod tests {
             s.process_new_packets(),
             Err(Error::HandshakeFailure)
         ));
+    }
+
+    /// TLS-3 regression: the server defaults to
+    /// `require_extended_master_secret = true` and rejects any CH that
+    /// doesn't offer the EMS extension. Without EMS the master secret
+    /// is not bound to the handshake transcript, opening the
+    /// triple-handshake family of cross-protocol attacks (RFC 7627
+    /// §5.3). Configuring the server out of strict mode lets the
+    /// handshake proceed for legacy clients.
+    #[test]
+    fn server12_rejects_client_without_extended_master_secret_by_default() {
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-noems", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-noems-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+                // (no extended_master_secret)
+            ],
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        );
+        s.read_tls(&rec);
+        assert!(matches!(
+            s.process_new_packets(),
+            Err(Error::HandshakeFailure)
+        ));
+    }
+
+    /// TLS-3 follow-up: `with_require_ems(false)` opts the server out
+    /// of the EMS requirement and a CH lacking the extension is
+    /// accepted (the handshake then proceeds to the SH).
+    #[test]
+    fn server12_accepts_no_ems_when_requirement_disabled() {
+        let cfg = test_rsa_server_config().with_require_ems(false);
+        let rng = HmacDrbg::<Sha256>::new(b"s12-noems-ok", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-noems-ok-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0303,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            extensions: alloc::vec![
+                ext::signature_algorithms(),
+                ext::supported_groups_list(&[NamedGroup::X25519]),
+                ext::ec_point_formats(),
+            ],
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &ch,
+        );
+        s.read_tls(&rec);
+        // The CH is now accepted; the handshake reached the SH-emit
+        // step without erroring out.
+        assert!(s.process_new_packets().is_ok());
     }
 
     /// RFC 8446 §4.1.3 — a TLS 1.2 server embeds the `DOWNGRD\x01`
@@ -1785,6 +1902,7 @@ mod tests {
                 ext::signature_algorithms(),
                 ext::supported_groups_list(&[NamedGroup::X25519]),
                 ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
                 ext::renegotiation_info_empty(),
             ],
         }
@@ -1830,6 +1948,7 @@ mod tests {
                 ext::signature_algorithms(),
                 ext::supported_groups_list(&[NamedGroup::X25519]),
                 ext::ec_point_formats(),
+                ext::extended_master_secret_empty(),
                 ext::renegotiation_info_empty(),
             ],
         }

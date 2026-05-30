@@ -252,6 +252,17 @@ pub(crate) struct Streams {
     /// per-stream `next_offset` advances).
     pub(crate) conn_recv_used: u64,
 
+    /// RFC 9000 §4.1 — per-stream maximum offset *ever observed* on any
+    /// inbound STREAM frame. Used to compute the connection-level
+    /// flow-control charge for a frame independently of whether the
+    /// stream has been admitted into [`Self::map`] yet, and
+    /// independently of whether the bytes have become contiguous (which
+    /// is what `RecvStream::on_data` tracks).
+    ///
+    /// Persists across stream close so a late retransmit of an
+    /// already-closed stream's tail never re-charges conn-level credit.
+    pub(crate) stream_high_offset: BTreeMap<u64, u64>,
+
     /// True if a DATA_BLOCKED frame at level `conn_send_max` is queued.
     pub(crate) data_blocked_at: Option<u64>,
     /// True if a MAX_DATA frame is queued.
@@ -330,6 +341,7 @@ impl Streams {
             conn_recv_max: our_params.initial_max_data.unwrap_or(0),
             conn_recv_max_announced: our_params.initial_max_data.unwrap_or(0),
             conn_recv_used: 0,
+            stream_high_offset: BTreeMap::new(),
             data_blocked_at: None,
             max_data_pending: false,
             streams_blocked_bidi_at: None,
@@ -519,17 +531,41 @@ impl Streams {
         fin: bool,
         data: &[u8],
     ) -> Result<(), Error> {
-        // Connection-level flow-control check (we don't account for
-        // duplicates here; conn_recv_used only ever counts new bytes).
+        // RFC 9000 §4.1 — connection-level flow control is charged
+        // against the highest byte offset *ever observed* on each
+        // stream, not against contiguous progress. Charge it here
+        // BEFORE we admit the stream into `map`: a peer that probes
+        // unknown stream IDs to leak conn-level credit
+        // (QUIC-3 audit finding) is caught at this point.
+        //
+        // `new_high = max(0, end - prev_high)` is the count of "newly
+        // seen high-water bytes" for this stream. Retransmits of
+        // already-seen ranges contribute 0.
+        let end = offset.saturating_add(data.len() as u64);
+        let prev_high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
+        let new_high = end.saturating_sub(prev_high);
+        if new_high > 0 {
+            // Cap-check FIRST so that a frame that would overflow the
+            // peer's MAX_DATA is rejected before we mutate any state.
+            let projected = self.conn_recv_used.saturating_add(new_high);
+            if projected > self.conn_recv_max {
+                // FLOW_CONTROL_ERROR equivalent (RFC 9000 §11.2).
+                return Err(Error::Decode);
+            }
+            self.conn_recv_used = projected;
+            self.stream_high_offset.insert(id, end);
+        }
+
+        // Only after the conn-level charge does the per-stream
+        // admission step run.
         self.ensure_remote_stream_exists(id)?;
         let stream = self.map.get_mut(&id).expect("just-ensured");
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
-        let new_contig = recv.on_data(offset, data, fin)?;
-        self.conn_recv_used += new_contig;
-        if self.conn_recv_used > self.conn_recv_max {
-            // FLOW_CONTROL_ERROR equivalent.
-            return Err(Error::Decode);
-        }
+        // We no longer use the contig-progress return value at the
+        // connection level — the QUIC-3 fix above already charged
+        // conn-level credit against the high-water mark. The per-stream
+        // FC check inside `on_data` is still required.
+        recv.on_data(offset, data, fin)?;
         // Replenishment hysteresis at the connection level.
         let window = self.conn_recv_max_announced.saturating_sub(0);
         let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
@@ -1264,5 +1300,96 @@ mod tests {
             }
         }
         assert!(saw_max_data, "MAX_DATA must be queued for replenishment");
+    }
+
+    // QUIC-3 — RFC 9000 §4.1: conn-level FC must be charged on receipt
+    // of every STREAM frame's high-water-mark advance, regardless of
+    // whether the per-stream admission step succeeds.
+
+    /// A STREAM frame for a peer-initiated id that's *within* limits but
+    /// whose high-water-mark advances must charge `conn_recv_used`
+    /// proportionally to the frame's high-water rather than to the
+    /// stream's contiguous progress.
+    #[test]
+    fn quic3_conn_fc_charges_on_high_offset_not_contig() {
+        let our = TransportParameters {
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 16, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Client-initiated bidi id=0. Send an *out-of-order* fragment
+        // [1000, 1100). Contiguous progress is still 0 (the [0, 1000)
+        // gap hasn't filled), but conn-level FC must reflect 1100 bytes
+        // of high-water reservation.
+        s.on_stream(0, 1000, false, &[0u8; 100]).expect("recv");
+        assert_eq!(
+            s.conn_recv_used, 1100,
+            "conn_recv_used must reflect high-water mark"
+        );
+        assert_eq!(s.stream_high_offset.get(&0).copied(), Some(1100));
+    }
+
+    /// A STREAM frame for a stream id that exceeds the negotiated
+    /// stream limit (would fail `ensure_remote_stream_exists`) must NOT
+    /// have already silently charged conn-level credit. The FC charge
+    /// runs first, then admission; if admission fails we propagate
+    /// the error but the credit IS charged (so the peer cannot probe
+    /// gaps).
+    ///
+    /// More importantly: a duplicate frame on a never-admitted stream
+    /// must not charge twice. We verify the high-water-mark dedup.
+    #[test]
+    fn quic3_conn_fc_charge_is_idempotent_on_retransmit() {
+        let our = TransportParameters {
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 16, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Two non-overlapping in-order chunks.
+        s.on_stream(0, 0, false, &[0u8; 100]).expect("r1");
+        s.on_stream(0, 100, false, &[0u8; 50]).expect("r2");
+        assert_eq!(s.conn_recv_used, 150);
+        // Replay the FIRST chunk. Conn-level credit must not bump.
+        let before = s.conn_recv_used;
+        s.on_stream(0, 0, false, &[0u8; 100]).expect("replay");
+        assert_eq!(s.conn_recv_used, before, "replay must not re-charge");
+    }
+
+    /// If a STREAM frame's high-water advance would push
+    /// `conn_recv_used` above `conn_recv_max`, the frame must be
+    /// rejected with a FLOW_CONTROL_ERROR-mapping `Error::Decode`.
+    #[test]
+    fn quic3_conn_fc_overflow_rejects_frame() {
+        let our = TransportParameters {
+            // Connection-level cap of 50 bytes.
+            initial_max_data: Some(50),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 16, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let before = s.conn_recv_used;
+        let err = s.on_stream(0, 0, false, &[0u8; 100]);
+        assert!(err.is_err(), "must reject frame that overflows MAX_DATA");
+        // No partial-state mutation: the high-water map and the credit
+        // counter must remain at the pre-frame snapshot.
+        assert_eq!(s.conn_recv_used, before);
+        assert!(s.stream_high_offset.is_empty());
     }
 }

@@ -424,8 +424,13 @@ impl DtlsClientConnection12 {
             return Ok(());
         }
 
-        // Anti-replay (post-handshake) — only meaningful at epoch ≥ 1.
-        if self.read_epoch >= 1 && !self.replay.accept(rec.seq) {
+        // Anti-replay pre-check — only meaningful at epoch ≥ 1. We
+        // deliberately DO NOT advance the window here: an off-path attacker
+        // who can guess wire seq numbers could otherwise burn slots with
+        // packets that pass the cheap seq filter but fail AEAD, which would
+        // drop legitimate retransmits. The window is `mark`-ed only after
+        // AEAD verification succeeds (below).
+        if self.read_epoch >= 1 && !self.replay.check(rec.seq) {
             return Ok(());
         }
 
@@ -452,7 +457,10 @@ impl DtlsClientConnection12 {
                 let plain: Vec<u8> = if self.read_epoch >= 1 {
                     let combined = ((self.read_epoch as u64) << 48) | rec.seq;
                     let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
-                    c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)?
+                    let p = c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)?;
+                    // AEAD verified: commit to the window only now.
+                    self.replay.mark(rec.seq);
+                    p
                 } else {
                     rec.fragment.to_vec()
                 };
@@ -465,6 +473,8 @@ impl DtlsClientConnection12 {
                 let combined = ((self.read_epoch as u64) << 48) | rec.seq;
                 let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
                 let plain = c.decrypt_dtls(combined, ContentType::ApplicationData, rec.fragment)?;
+                // AEAD verified: commit to the window only now.
+                self.replay.mark(rec.seq);
                 self.app_in.extend_from_slice(&plain);
                 Ok(())
             }

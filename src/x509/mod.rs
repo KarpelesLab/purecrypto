@@ -21,7 +21,8 @@ pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
 pub use ocsp::{
-    OcspCertStatus, OcspResponse, OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse,
+    OcspCertStatus, OcspRequest, OcspRequestBuilder, OcspResponse, OcspResponseBuilder,
+    OcspResponseStatus, OcspSingleResponse,
 };
 pub use pubkey::AnyPublicKey;
 pub use signer::CertSigner;
@@ -129,6 +130,12 @@ pub mod oid {
     /// delegated OCSP responder cert telling relying parties not to attempt
     /// revocation status checks on the responder itself (RFC 6960 §4.2.2.2.1).
     pub const ID_PKIX_OCSP_NOCHECK: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 5];
+    /// `id-pkix-ocsp-nonce` (1.3.6.1.5.5.7.48.1.2) — request/response
+    /// extension carrying a client-chosen random value that the responder
+    /// must echo verbatim. Used to defeat replay of stapled responses; the
+    /// client rejects a response whose nonce differs from (or omits) the
+    /// one in its request (RFC 6960 §4.4.1, §4.4.7).
+    pub const ID_PKIX_OCSP_NONCE: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 2];
 
     /// `id-sha1` (1.3.14.3.2.26) — the AlgorithmIdentifier OID used in OCSP
     /// `CertID.hashAlgorithm` for SHA-1-based identification. Default per

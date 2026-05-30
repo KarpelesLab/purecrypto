@@ -32,7 +32,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::cookie::CookieGenerator;
+use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, Retransmit};
@@ -305,6 +305,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.retransmit.next_timeout()
     }
 
+    /// Advances the connection's monotonic clock to `now`. Callers SHOULD
+    /// invoke this (or [`Self::on_timeout`]) regularly so the cookie
+    /// generator sees a current time — otherwise a server with no
+    /// timeouts firing would reuse a stale cookie-issue timestamp and
+    /// the embedded-`TS` age check (RFC 6347 §4.2.1) would be effectively
+    /// disabled. Idempotent in the rewind direction (older times are
+    /// ignored).
+    pub fn set_now(&mut self, now: Duration) {
+        if now > self.last_now {
+            self.last_now = now;
+        }
+    }
+
     /// Drives the retransmit machine. Any retransmitted datagrams land in
     /// `pop_outbound_datagrams`.
     pub fn on_timeout(&mut self, now: Duration) {
@@ -340,7 +353,14 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         if rec.epoch != self.read_epoch {
             return Ok(());
         }
-        if self.read_epoch >= 1 && !self.replay.accept(rec.seq) {
+        // Anti-replay pre-check: cheap rejection of duplicate / too-old
+        // seq numbers. We deliberately DO NOT advance the window here —
+        // an off-path attacker who can guess wire seq numbers could
+        // otherwise burn slots in the window with packets that pass the
+        // seq filter but fail AEAD verification, dropping legitimate
+        // retransmits. The window is `mark`-ed only after the AEAD tag
+        // verifies (below).
+        if self.read_epoch >= 1 && !self.replay.check(rec.seq) {
             return Ok(());
         }
         match rec.content_type {
@@ -365,7 +385,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 let plain: Vec<u8> = if self.read_epoch >= 1 {
                     let combined = ((self.read_epoch as u64) << 48) | rec.seq;
                     let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
-                    c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)?
+                    let p = c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)?;
+                    // AEAD verified: now it's safe to commit to the window.
+                    self.replay.mark(rec.seq);
+                    p
                 } else {
                     rec.fragment.to_vec()
                 };
@@ -378,6 +401,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 let combined = ((self.read_epoch as u64) << 48) | rec.seq;
                 let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
                 let plain = c.decrypt_dtls(combined, ContentType::ApplicationData, rec.fragment)?;
+                // AEAD verified: commit to the window only now.
+                self.replay.mark(rec.seq);
                 self.app_in.extend_from_slice(&plain);
                 Ok(())
             }
@@ -471,8 +496,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             self.config.require_cookie_exchange && self.config.cookie_secret.is_some();
         let first_attempt = parsed.cookie.is_empty();
 
+        // Bind the cookie MAC to the security-critical CH fields. An on-path
+        // attacker that mutates CH2's cipher_suites / supported_groups /
+        // supported_versions between HVR and the second flight will fail
+        // cookie validation — closing the downgrade primitive described in
+        // RFC 9147 §5.1 (and equivalent for DTLS 1.2's HVR cookie).
+        let fp = ch_fingerprint_dtls12(&parsed);
+
         if cookie_required && first_attempt {
-            // Emit HelloVerifyRequest with a freshly computed cookie.
+            // Emit HelloVerifyRequest with a freshly computed cookie. The
+            // cookie binds (peer_addr, client_random, ch_fingerprint, TS) —
+            // *no* per-connection state is allocated here; we rely on the
+            // client echoing the cookie in CH2 to commit to the same CH
+            // content.
             let secret = self
                 .config
                 .cookie_secret
@@ -480,17 +516,21 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
             let now_min = (self.last_now.as_secs() / 60) as u32;
-            let cookie = cg.generate(&self.peer_addr, &parsed.random, now_min);
+            let cookie = cg.generate(&self.peer_addr, &parsed.random, &fp, now_min);
             self.emit_hello_verify_request(&cookie)?;
             self.state = State::WaitSecondClientHello;
             // We deliberately do NOT add this CH or HVR to a transcript
             // and we keep `reassembler` None so the next CH also enters
-            // this pre-state path (RFC 6347 §4.2.1).
+            // this pre-state path (RFC 6347 §4.2.1). The msg_seq of this
+            // pre-cookie CH is intentionally NOT stored — see DTLS-4.
+            let _ = msg_seq;
             return Ok(());
         }
 
         if cookie_required && !first_attempt {
-            // Validate the cookie.
+            // Validate the cookie. The CH fingerprint must match the one
+            // that was bound when the cookie was issued, otherwise the
+            // server treats this as if the cookie were forged.
             let secret = self
                 .config
                 .cookie_secret
@@ -498,7 +538,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
             let now_min = (self.last_now.as_secs() / 60) as u32;
-            if !cg.validate(&self.peer_addr, &parsed.random, now_min, &parsed.cookie) {
+            if !cg.validate(
+                &self.peer_addr,
+                &parsed.random,
+                &fp,
+                now_min,
+                &parsed.cookie,
+            ) {
                 return Err(Error::IllegalParameter);
             }
         }
@@ -933,6 +979,20 @@ fn parse_dtls_client_hello(body: &[u8]) -> Result<ParsedDtlsClientHello, Error> 
         cipher_suites,
         extensions,
     })
+}
+
+/// Builds a cookie-binding fingerprint from a parsed DTLS 1.2 CH. Covers
+/// the negotiation-deciding wire fields so a CH2 with rewritten cipher
+/// suites / supported_groups / supported_versions fails cookie validation.
+fn ch_fingerprint_dtls12(parsed: &ParsedDtlsClientHello) -> Vec<u8> {
+    let mut cs_be = Vec::with_capacity(parsed.cipher_suites.len() * 2);
+    for cs in &parsed.cipher_suites {
+        cs_be.extend_from_slice(&cs.0.to_be_bytes());
+    }
+    let groups = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_GROUPS);
+    let versions = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_VERSIONS);
+    // DTLS 1.2 cookie path doesn't carry `key_share`; pass an empty slot.
+    build_ch_fingerprint(&cs_be, groups, versions, &[])
 }
 
 fn parse_extensions(body: &[u8]) -> Result<Vec<(ExtensionType, Vec<u8>)>, Error> {

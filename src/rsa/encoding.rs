@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use super::{RsaPrivateKey, RsaPublicKey};
 use crate::bignum::{Uint, inv_mod};
+use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::der::{
     Error, Reader, encode_bit_string, encode_integer, encode_null, encode_octet_string,
     encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
@@ -48,6 +49,60 @@ fn int_to_uint<const LIMBS: usize>(content: &[u8]) -> Result<Uint<LIMBS>, Error>
     Ok(Uint::from_be_bytes(trimmed))
 }
 
+/// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
+/// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
+/// enforce the structural shape: `e ≥ 3`, `e` odd, and `e < n`. These three
+/// together rule out the degenerate values (`0`, `1`, even, oversized) that a
+/// malicious PKCS#1 / SPKI / certificate could otherwise smuggle through and
+/// break downstream sign / verify / encrypt math. Mirrors the boxed-key
+/// validator in [`super::boxed`].
+fn validate_public_exponent<const LIMBS: usize>(
+    n: &Uint<LIMBS>,
+    e: &Uint<LIMBS>,
+) -> Result<(), Error> {
+    let three = Uint::<LIMBS>::from_u64(3);
+    let e_ge_3 = !bool::from(e.ct_lt(&three));
+    let e_odd = bool::from(e.is_odd());
+    let e_lt_n = bool::from(e.ct_lt(n));
+    if !(e_ge_3 && e_odd && e_lt_n) {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
+/// Validates that the parsed PKCS#1 / PKCS#8 private-key components are
+/// internally consistent: each prime is `> 1`, `p ≠ q`, and `p · q = n`
+/// (RFC 8017 §3.2). Without this check a corrupted (or maliciously crafted)
+/// key file with mismatched primes silently slips through and produces wrong
+/// signatures, leaks information through the CRT recombination path, and
+/// in the worst case enables a Bleichenbacher-style fault on the secret
+/// exponent. We reject before the key is constructed. Mirrors the boxed-key
+/// validator in [`super::boxed`].
+fn validate_private_components<const LIMBS: usize>(
+    n: &Uint<LIMBS>,
+    p: &Uint<LIMBS>,
+    q: &Uint<LIMBS>,
+) -> Result<(), Error> {
+    let one = Uint::<LIMBS>::ONE;
+    let p_gt_1 = !bool::from(p.ct_lt(&one)) && !bool::from(p.ct_eq(&one));
+    let q_gt_1 = !bool::from(q.ct_lt(&one)) && !bool::from(q.ct_eq(&one));
+    if !(p_gt_1 && q_gt_1) {
+        return Err(Error::Malformed);
+    }
+    if bool::from(p.ct_eq(q)) {
+        return Err(Error::Malformed);
+    }
+    // `p · q == n` requires the full 2·LIMBS-wide product: the low half must
+    // equal `n` and the high half must be zero. Using `mul_wide` keeps the
+    // check sound even when `p`/`q` straddle the `LIMBS` boundary, which
+    // would otherwise silently wrap.
+    let (lo, hi) = p.mul_wide(q);
+    if !bool::from(hi.ct_eq(&Uint::<LIMBS>::ZERO)) || !bool::from(lo.ct_eq(n)) {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// Encodes the key as a PKCS#1 `RSAPublicKey` DER structure.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
@@ -59,7 +114,9 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         encode_sequence(&body)
     }
 
-    /// Decodes a PKCS#1 `RSAPublicKey` DER structure.
+    /// Decodes a PKCS#1 `RSAPublicKey` DER structure. Rejects degenerate
+    /// public exponents (`e < 3`, `e` even, `e ≥ n`) per the structural
+    /// shape check derived from RFC 8017 §3.1.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -67,6 +124,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         let e = int_to_uint(seq.read_integer_bytes()?)?;
         seq.finish()?;
         reader.finish()?;
+        validate_public_exponent(&n, &e)?;
         Ok(RsaPublicKey::new(n, e))
     }
 
@@ -159,7 +217,13 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     }
 
     /// Decodes a PKCS#1 `RSAPrivateKey` DER structure. The CRT parameters are
-    /// read but not retained.
+    /// read but not retained. Rejects:
+    /// - degenerate public exponents (`e < 3`, `e` even, `e ≥ n`),
+    /// - primes `≤ 1`,
+    /// - `p = q` (resulting in a non-coprime `qInv`),
+    /// - `p · q ≠ n` (corruption / fault injection — without this check, the
+    ///   CRT recombination path silently produces wrong signatures and can
+    ///   leak `d` mod one factor).
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -174,6 +238,8 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         let _qinv = seq.read_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
+        validate_public_exponent(&n, &e)?;
+        validate_private_components(&n, &p, &q)?;
         Ok(RsaPrivateKey::from_raw_parts(n, e, d, p, q))
     }
 
@@ -430,5 +496,154 @@ mod tests {
         let pk = rsa_test_key_a().public_key();
         let pkcs1_pem = pem_encode(PUBLIC_LABEL, &pk.to_pkcs1_der());
         assert!(RsaPublicKey::<32>::from_spki_pem(&pkcs1_pem).is_err());
+    }
+
+    // ---- RSA-1: component-level validation on const-generic parse paths ----
+
+    /// PKCS#1 public-key DER carrying an even public exponent must be
+    /// rejected (the `is_odd` gate of `validate_public_exponent`).
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_even_exponent() {
+        let pk = rsa_test_key_a().public_key();
+        let n_bytes = uint_be(pk.modulus());
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[4])].concat());
+        assert!(RsaPublicKey::<32>::from_pkcs1_der(&der).is_err());
+    }
+
+    /// `e = 1` is the canonical degenerate exponent (encryption is the
+    /// identity); rejected at parse time.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_unit_exponent() {
+        let pk = rsa_test_key_a().public_key();
+        let n_bytes = uint_be(pk.modulus());
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[1])].concat());
+        assert!(RsaPublicKey::<32>::from_pkcs1_der(&der).is_err());
+    }
+
+    /// PKCS#1 private-key DER whose modulus does not equal `p · q` must be
+    /// rejected. Construct a key by taking a real key A and grafting key B's
+    /// modulus over A's primes — the `p · q == n` check then fires.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_mismatched_modulus() {
+        let key_a = rsa_test_key_a();
+        let (p, q) = key_a.primes();
+        // Modulus from key A's public key, then perturb the low byte to
+        // ensure `p · q != n` while keeping the length identical.
+        let mut n_bytes = uint_be(key_a.modulus());
+        // Flip the low byte; if it's already an odd value, this still moves
+        // n outside `p·q`.
+        let last = n_bytes.len() - 1;
+        n_bytes[last] ^= 0xff;
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&n_bytes),
+                encode_integer(&uint_be(key_a.exponent())),
+                encode_integer(&uint_be(key_a.private_exponent())),
+                encode_integer(&uint_be(p)),
+                encode_integer(&uint_be(q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// `p = q` is rejected: the resulting `n = p²` has only one prime
+    /// factor, `qInv = q⁻¹ mod p` is undefined (gcd is `p`, not `1`), and
+    /// every CRT-using path silently produces wrong output.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_equal_primes() {
+        let key = rsa_test_key_a();
+        let (p, _q) = key.primes();
+        // `n = p · p` lives in `Uint<32>` because `p` is ~1024 bits, so the
+        // squared product is ~2048 bits and fits.
+        let (n_sq_lo, _hi) = p.mul_wide(p);
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&uint_be(&n_sq_lo)),
+                encode_integer(&uint_be(key.exponent())),
+                encode_integer(&uint_be(key.private_exponent())),
+                encode_integer(&uint_be(p)),
+                encode_integer(&uint_be(p)), // q := p
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// `p ≤ 1` (here `p = 1`) is rejected — the boundary value that would
+    /// otherwise compute `qInv = 0` silently.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_unit_prime() {
+        let key = rsa_test_key_a();
+        let (_p, q) = key.primes();
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&uint_be(key.modulus())),
+                encode_integer(&uint_be(key.exponent())),
+                encode_integer(&uint_be(key.private_exponent())),
+                encode_integer(&[1]), // p = 1
+                encode_integer(&uint_be(q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// PKCS#8 wraps PKCS#1 — degenerate components must be rejected after
+    /// the outer envelope unwraps cleanly.
+    #[test]
+    fn const_generic_from_pkcs8_der_rejects_mismatched_modulus() {
+        let key_a = rsa_test_key_a();
+        let (p, q) = key_a.primes();
+        let mut n_bytes = uint_be(key_a.modulus());
+        let last = n_bytes.len() - 1;
+        n_bytes[last] ^= 0xff;
+        let pkcs1 = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&n_bytes),
+                encode_integer(&uint_be(key_a.exponent())),
+                encode_integer(&uint_be(key_a.private_exponent())),
+                encode_integer(&uint_be(p)),
+                encode_integer(&uint_be(q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                rsa_encryption_algid(),
+                encode_octet_string(&pkcs1),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs8_der(&der),
+            Err(Error::Malformed)
+        ));
     }
 }

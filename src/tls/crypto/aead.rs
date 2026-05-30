@@ -18,6 +18,7 @@
 use super::schedule::{HashAlg, Secret, traffic_key_iv};
 use super::suite::AeadAlg;
 use crate::cipher::{Aes128, Aes256, ChaCha20Poly1305, Gcm};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::tls::{ContentType, Error};
 use alloc::vec::Vec;
 
@@ -237,13 +238,15 @@ impl RecordCrypter {
             return Err(Error::BadRecordMac);
         }
 
-        // TLSInnerPlaintext: content || true_type || zeros*. Strip trailing
-        // zero padding; the last non-zero byte is the true content type.
-        let end = match buf.iter().rposition(|&b| b != 0) {
-            Some(p) => p,
-            None => return Err(Error::PeerMisbehaved), // all-zero / empty inner
-        };
-        let content_type = ContentType::from_u8(buf[end]);
+        // TLSInnerPlaintext: content || true_type || zeros*. The true
+        // content type is the last non-zero byte. A naive backward
+        // search leaks the padding length via timing — a CDN co-tenant
+        // or on-path attacker can build a decryption oracle from that
+        // (TLS-2 audit finding). Walk the buffer ONCE front-to-back,
+        // tracking the most recent non-zero position and value in
+        // constant time.
+        let (content_type_byte, end) = ct_find_last_nonzero(&buf)?;
+        let content_type = ContentType::from_u8(content_type_byte);
         buf.truncate(end);
         // RFC 8446 §5.2: the recovered TLSPlaintext.fragment must not exceed
         // 2^14 bytes (the type byte and padding are already stripped).
@@ -252,6 +255,47 @@ impl RecordCrypter {
         }
         Ok((content_type, buf))
     }
+}
+
+/// Scans `buf` front-to-back in constant time and returns
+/// `(value, index)` of the last non-zero byte — the true content type
+/// of a TLS 1.3 `TLSInnerPlaintext` and the position the buffer
+/// truncates to once the type and trailing zero padding are stripped.
+///
+/// Constant-time properties (RFC 8446 §5.4 traffic-analysis note):
+///
+/// - Every byte of `buf` is visited exactly once.
+/// - The per-byte branch decides which of `(0, 0)` and `(byte, idx+1)`
+///   to keep using [`u8::conditional_select`], which is data-flow only.
+/// - No early exit; the running candidate is updated on every iteration
+///   regardless of value.
+///
+/// The all-zero / empty-buffer case still produces a public error —
+/// such records are protocol violations (RFC 8446 §5.4: every inner
+/// plaintext carries at least the content-type byte). Surfacing the
+/// error is itself a public signal, so the early `if` here is fine.
+fn ct_find_last_nonzero(buf: &[u8]) -> Result<(u8, usize), Error> {
+    if buf.is_empty() {
+        return Err(Error::PeerMisbehaved);
+    }
+    let mut found_any = Choice::from(0);
+    let mut cur_byte: u8 = 0;
+    let mut cur_end: usize = 0;
+    for (i, &b) in buf.iter().enumerate() {
+        let nonzero = !b.ct_eq(&0u8);
+        // Conditionally promote (b, i+1) as the new "last non-zero"
+        // candidate. `i+1` is the truncation index (one past the
+        // content-type byte position).
+        cur_byte = u8::conditional_select(&b, &cur_byte, nonzero);
+        cur_end = usize::conditional_select(&(i + 1), &cur_end, nonzero);
+        found_any |= nonzero;
+    }
+    if !bool::from(found_any) {
+        return Err(Error::PeerMisbehaved);
+    }
+    // `cur_end` is the index immediately after the content-type byte;
+    // truncating to `cur_end - 1` drops the type byte and the padding.
+    Ok((cur_byte, cur_end - 1))
 }
 
 #[cfg(test)]
@@ -317,5 +361,67 @@ mod tests {
             c.decrypt(&header, &bad[5..]),
             Err(Error::BadRecordMac)
         ));
+    }
+
+    // ----- TLS-2 ct padding strip regression tests -----
+    //
+    // We can't measure timing here; what we can pin is functional
+    // correctness across the corner cases the constant-time helper
+    // must handle. The helper walks the buffer ONCE front-to-back,
+    // updating its running `(byte, idx)` candidate via
+    // `ConditionallySelectable` — so a regression that re-introduces
+    // a backward / short-circuit scan would break either (a) the
+    // mid-buffer-zero case (last non-zero, not first) or (b) the
+    // all-zero malformed-record case.
+
+    #[test]
+    fn ct_padding_strip_no_padding() {
+        // content (3 bytes) || type=Handshake(22) || no padding.
+        let buf = alloc::vec![0xAA, 0xBB, 0xCC, 22u8];
+        let (ty, end) = super::ct_find_last_nonzero(&buf).expect("nonzero present");
+        assert_eq!(ty, 22);
+        assert_eq!(end, 3);
+    }
+
+    #[test]
+    fn ct_padding_strip_with_padding() {
+        // content (2 bytes) || type=ApplicationData(23) || 10 zero pad.
+        let mut buf = alloc::vec![0x11, 0x22, 23u8];
+        buf.extend(core::iter::repeat_n(0u8, 10));
+        let (ty, end) = super::ct_find_last_nonzero(&buf).expect("nonzero present");
+        assert_eq!(ty, 23);
+        assert_eq!(end, 2);
+    }
+
+    #[test]
+    fn ct_padding_strip_all_zero_signals_error() {
+        // All-zero plaintext (no type byte) — protocol violation per
+        // RFC 8446 §5.4. The helper returns PeerMisbehaved.
+        let buf = alloc::vec![0u8; 32];
+        assert!(matches!(
+            super::ct_find_last_nonzero(&buf),
+            Err(Error::PeerMisbehaved)
+        ));
+    }
+
+    #[test]
+    fn ct_padding_strip_empty_signals_error() {
+        // Empty buffer: same protocol violation. Helper rejects early.
+        let buf: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        assert!(matches!(
+            super::ct_find_last_nonzero(&buf),
+            Err(Error::PeerMisbehaved)
+        ));
+    }
+
+    #[test]
+    fn ct_padding_strip_zero_byte_in_content_still_finds_last_nonzero() {
+        // Content has an internal zero — the helper MUST identify
+        // the LAST non-zero byte (the type), not the first. This is
+        // the regression a forward-scan with early-exit could break.
+        let buf = alloc::vec![0xAA, 0u8, 0xBB, 0u8, 23u8, 0u8, 0u8];
+        let (ty, end) = super::ct_find_last_nonzero(&buf).expect("nonzero present");
+        assert_eq!(ty, 23);
+        assert_eq!(end, 4);
     }
 }

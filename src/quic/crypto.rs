@@ -66,6 +66,37 @@ impl AeadAlg {
             Self::ChaCha20Poly1305 => HashAlg::Sha256,
         }
     }
+
+    /// RFC 9001 §B.1 / §6.6 — per-key AEAD *usage* limit (maximum number
+    /// of packets that may be encrypted with the same key before the key
+    /// MUST be retired). Exceeding this MUST close the connection with
+    /// AEAD_LIMIT_REACHED (transport error 0x0e, RFC 9000 §20).
+    ///
+    /// Per RFC 9001 §B.1:
+    /// * AEAD_AES_128_GCM, AEAD_AES_256_GCM:   2^23 packets.
+    /// * AEAD_CHACHA20_POLY1305:               2^62 packets (effectively
+    ///   unreachable in practice).
+    pub(crate) const fn usage_limit(self) -> u64 {
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm => 1u64 << 23,
+            Self::ChaCha20Poly1305 => 1u64 << 62,
+        }
+    }
+
+    /// RFC 9001 §B.2 / §6.6 — per-key AEAD *integrity* limit (maximum
+    /// number of AEAD authentication failures before the receive key
+    /// MUST be retired). Exceeding this MUST close the connection with
+    /// AEAD_LIMIT_REACHED (transport error 0x0e, RFC 9000 §20).
+    ///
+    /// Per RFC 9001 §B.2:
+    /// * AEAD_AES_128_GCM, AEAD_AES_256_GCM:   2^52 failures.
+    /// * AEAD_CHACHA20_POLY1305:               2^36 failures.
+    pub(crate) const fn integrity_limit(self) -> u64 {
+        match self {
+            Self::Aes128Gcm | Self::Aes256Gcm => 1u64 << 52,
+            Self::ChaCha20Poly1305 => 1u64 << 36,
+        }
+    }
 }
 
 /// One direction (transmit or receive) of packet protection for one
@@ -86,6 +117,87 @@ pub(crate) struct DirKeys {
     /// [`derive_next_application_secret`] can compute the next-generation
     /// secret without the caller threading state around.
     pub(crate) secret: Vec<u8>,
+}
+
+/// RFC 9001 §9.5 — per-key receive packet-number replay window.
+///
+/// QUIC requires that "each PN can only be used once per key" (RFC 9001
+/// §9.5). The receiver MUST reject any PN that has already been opened
+/// under the current rx key.
+///
+/// We track a 128-bit sliding window anchored at the largest PN ever
+/// successfully decrypted with this key. The bit at position `i` records
+/// "PN `top - i` already accepted" (bit 0 is the top itself). A PN that
+/// falls below the window — i.e. its distance from `top` exceeds 128 —
+/// is also rejected (it cannot be proved fresh).
+///
+/// This shape mirrors the DTLS replay window (`src/tls/dtls/replay.rs`).
+#[derive(Default, Clone, Copy)]
+pub(crate) struct PnReplayWindow {
+    /// Largest PN ever accepted under this key (the bit-0 anchor).
+    top: u64,
+    /// Bitmask: bit `i` ⇒ PN `top - i` already accepted.
+    bits: u128,
+    /// True once `top` is meaningful (i.e. at least one PN accepted).
+    seeded: bool,
+}
+
+impl PnReplayWindow {
+    /// Returns an empty window.
+    pub(crate) const fn new() -> Self {
+        Self {
+            top: 0,
+            bits: 0,
+            seeded: false,
+        }
+    }
+
+    /// True if `pn` is fresh (has not previously been accepted, and lies
+    /// within the 128-bit window above the floor).
+    pub(crate) fn is_fresh(&self, pn: u64) -> bool {
+        if !self.seeded {
+            return true;
+        }
+        if pn > self.top {
+            return true;
+        }
+        let dist = self.top - pn;
+        if dist >= 128 {
+            // Below the window — cannot prove freshness.
+            return false;
+        }
+        (self.bits >> dist) & 1 == 0
+    }
+
+    /// Records `pn` as accepted. Caller MUST have already checked
+    /// [`Self::is_fresh`] returned `true`; otherwise the call is a
+    /// no-op (the bit was already set).
+    pub(crate) fn record(&mut self, pn: u64) {
+        if !self.seeded {
+            self.top = pn;
+            self.bits = 1; // bit 0 = top accepted.
+            self.seeded = true;
+            return;
+        }
+        if pn > self.top {
+            let shift = pn - self.top;
+            // Slide the window up; new bit 0 is `pn`, the *old* top is
+            // at distance `shift`.
+            if shift >= 128 {
+                self.bits = 1;
+            } else {
+                self.bits = (self.bits << shift) | 1;
+            }
+            self.top = pn;
+        } else {
+            let dist = self.top - pn;
+            if dist < 128 {
+                self.bits |= 1u128 << dist;
+            }
+            // Else: below the window — record() is a no-op (caller
+            // should not reach here after is_fresh()=false).
+        }
+    }
 }
 
 /// Header-protection mask producer (RFC 9001 §5.4.3 / §5.4.4).
@@ -197,6 +309,32 @@ pub(crate) struct LevelKeys {
     pub(crate) tx_hp_key_bytes: Vec<u8>,
     /// Counterpart for the rx direction.
     pub(crate) rx_hp_key_bytes: Vec<u8>,
+
+    // ---- RFC 9001 §6.6 — AEAD usage / integrity limits ----
+    /// Number of packets successfully encrypted with the *current* tx key.
+    /// For non-1-RTT levels this is the only tx key; for 1-RTT it is reset
+    /// on each tx-side key update (the per-key limit is per *key*, not per
+    /// connection).
+    pub(crate) tx_packets: u64,
+    /// Number of AEAD authentication failures observed on the rx side for
+    /// the current rx key. RFC 9001 §6.6: on reaching the integrity limit
+    /// the connection MUST be closed.
+    pub(crate) rx_aead_failures: u64,
+    /// Test-only override of the usage limit. `None` ⇒ use
+    /// `AeadAlg::usage_limit()`. Lets the test suite trip the close path
+    /// without sending 2^23 packets.
+    pub(crate) usage_limit_override: Option<u64>,
+    /// Test-only override of the integrity limit. `None` ⇒ use
+    /// `AeadAlg::integrity_limit()`.
+    pub(crate) integrity_limit_override: Option<u64>,
+
+    // ---- RFC 9001 §9.5 — per-key receive packet-number replay window ----
+    /// Sliding 128-bit replay window over PNs decrypted under the
+    /// current rx key. Reset whenever the rx key is replaced (key
+    /// update, level switch). Note that QUIC packet numbers are
+    /// per-PN-space (not per-key), but the *replay* constraint is
+    /// per-key: once a key is retired, the next key's window restarts.
+    pub(crate) rx_pn_window: PnReplayWindow,
 }
 
 impl LevelKeys {
@@ -211,6 +349,50 @@ impl LevelKeys {
             tx_phase_pending_confirm: false,
             tx_hp_key_bytes: Vec::new(),
             rx_hp_key_bytes: Vec::new(),
+            tx_packets: 0,
+            rx_aead_failures: 0,
+            usage_limit_override: None,
+            integrity_limit_override: None,
+            rx_pn_window: PnReplayWindow::new(),
+        }
+    }
+
+    /// Returns the effective tx usage limit for this level's current
+    /// suite, honoring any test-only override. Callers compare
+    /// `tx_packets` against this value (RFC 9001 §6.6).
+    pub(crate) fn effective_usage_limit(&self) -> u64 {
+        if let Some(v) = self.usage_limit_override {
+            return v;
+        }
+        // Use the legacy tx slot's alg if present; otherwise pick from
+        // the phase table. If no tx key is installed, the limit is
+        // irrelevant (we won't encrypt) — fall back to a huge value.
+        let alg = self
+            .tx
+            .as_ref()
+            .map(|k| k.alg)
+            .or_else(|| self.tx_by_phase[0].as_ref().map(|k| k.alg))
+            .or_else(|| self.tx_by_phase[1].as_ref().map(|k| k.alg));
+        match alg {
+            Some(a) => a.usage_limit(),
+            None => u64::MAX,
+        }
+    }
+
+    /// Returns the effective rx integrity limit (RFC 9001 §6.6).
+    pub(crate) fn effective_integrity_limit(&self) -> u64 {
+        if let Some(v) = self.integrity_limit_override {
+            return v;
+        }
+        let alg = self
+            .rx
+            .as_ref()
+            .map(|k| k.alg)
+            .or_else(|| self.rx_by_phase[0].as_ref().map(|k| k.alg))
+            .or_else(|| self.rx_by_phase[1].as_ref().map(|k| k.alg));
+        match alg {
+            Some(a) => a.integrity_limit(),
+            None => u64::MAX,
         }
     }
 
@@ -862,6 +1044,11 @@ mod tests {
             tx_phase_pending_confirm: false,
             tx_hp_key_bytes: Vec::new(),
             rx_hp_key_bytes: Vec::new(),
+            tx_packets: 0,
+            rx_aead_failures: 0,
+            usage_limit_override: None,
+            integrity_limit_override: None,
+            rx_pn_window: PnReplayWindow::new(),
         };
         assert!(lk.tx_for_phase(0).is_some());
         assert!(lk.tx_for_phase(1).is_some());
@@ -898,5 +1085,102 @@ mod tests {
             let _ = aead_seal(&dk, 7, &aad, &mut buf2);
             assert!(aead_open(&dk, 7, &aad, &mut buf2, &bad_tag).is_err());
         }
+    }
+
+    // QUIC-1 — RFC 9001 §B per-key AEAD limits.
+    #[test]
+    fn aead_alg_usage_limits_match_rfc_9001_appendix_b1() {
+        assert_eq!(AeadAlg::Aes128Gcm.usage_limit(), 1u64 << 23);
+        assert_eq!(AeadAlg::Aes256Gcm.usage_limit(), 1u64 << 23);
+        assert_eq!(AeadAlg::ChaCha20Poly1305.usage_limit(), 1u64 << 62);
+    }
+
+    #[test]
+    fn aead_alg_integrity_limits_match_rfc_9001_appendix_b2() {
+        assert_eq!(AeadAlg::Aes128Gcm.integrity_limit(), 1u64 << 52);
+        assert_eq!(AeadAlg::Aes256Gcm.integrity_limit(), 1u64 << 52);
+        assert_eq!(AeadAlg::ChaCha20Poly1305.integrity_limit(), 1u64 << 36);
+    }
+
+    #[test]
+    fn level_keys_effective_limit_falls_back_when_no_keys() {
+        // No tx/rx installed → effective limit should fall back to
+        // u64::MAX (i.e. unreachable), not 0.
+        let lk = LevelKeys::empty();
+        assert_eq!(lk.effective_usage_limit(), u64::MAX);
+        assert_eq!(lk.effective_integrity_limit(), u64::MAX);
+    }
+
+    #[test]
+    fn level_keys_effective_limit_uses_override_when_set() {
+        let mut lk = LevelKeys::empty();
+        lk.usage_limit_override = Some(7);
+        lk.integrity_limit_override = Some(11);
+        assert_eq!(lk.effective_usage_limit(), 7);
+        assert_eq!(lk.effective_integrity_limit(), 11);
+    }
+
+    // QUIC-2 — RFC 9001 §9.5 per-key PN replay window.
+    #[test]
+    fn pn_replay_window_accepts_fresh_pns() {
+        let mut w = PnReplayWindow::new();
+        // Empty window: anything is fresh.
+        assert!(w.is_fresh(0));
+        assert!(w.is_fresh(42));
+        assert!(w.is_fresh(u64::MAX));
+        // Record 5.
+        w.record(5);
+        // 5 must now be considered a duplicate.
+        assert!(!w.is_fresh(5));
+        // Higher PNs are fresh.
+        assert!(w.is_fresh(6));
+        assert!(w.is_fresh(100));
+        // PNs *just below* the anchor (within window) are fresh until
+        // recorded, but they're below the bit-0 anchor — they should
+        // be accepted as fresh-by-window if their bit is unset.
+        assert!(w.is_fresh(4));
+    }
+
+    #[test]
+    fn pn_replay_window_rejects_duplicates() {
+        let mut w = PnReplayWindow::new();
+        w.record(10);
+        w.record(20);
+        w.record(15);
+        // All recorded PNs must now be considered duplicates.
+        assert!(!w.is_fresh(10));
+        assert!(!w.is_fresh(15));
+        assert!(!w.is_fresh(20));
+        // Unrecorded ones in the window remain fresh.
+        assert!(w.is_fresh(11));
+        assert!(w.is_fresh(16));
+        assert!(w.is_fresh(21));
+    }
+
+    #[test]
+    fn pn_replay_window_rejects_below_window() {
+        let mut w = PnReplayWindow::new();
+        w.record(500);
+        // 500 - 128 = 372 is the floor; anything ≤ 372 is below the
+        // 128-bit window and must be rejected as un-provable.
+        assert!(!w.is_fresh(372));
+        assert!(!w.is_fresh(0));
+        // 373 sits exactly at the window's bottom and is still fresh
+        // (the bit hasn't been set).
+        assert!(w.is_fresh(373));
+    }
+
+    #[test]
+    fn pn_replay_window_slides_up_on_higher_pn() {
+        let mut w = PnReplayWindow::new();
+        w.record(10);
+        w.record(1000);
+        // Old PN 10 is now far below the window — must be rejected.
+        assert!(!w.is_fresh(10));
+        // 1000 was just recorded.
+        assert!(!w.is_fresh(1000));
+        // Window now spans 873..=1000.
+        assert!(w.is_fresh(873));
+        assert!(!w.is_fresh(872));
     }
 }

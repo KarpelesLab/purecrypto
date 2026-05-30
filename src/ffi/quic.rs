@@ -246,10 +246,10 @@ pub unsafe extern "C" fn pc_quic_cfg_set_certificate(
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
         };
-        let chain_der = pem_split_cert_chain(chain_str);
-        if chain_der.is_empty() {
-            return PcStatus::BadEncoding;
-        }
+        let chain_der = match pem_split_cert_chain(chain_str) {
+            Ok(v) => v,
+            Err(e) => return e.to_status(),
+        };
         let key_str = match core::str::from_utf8(kp) {
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
@@ -1002,10 +1002,41 @@ pub unsafe extern "C" fn pc_quic_peer_certificate(
 
 // ---- Helpers --------------------------------------------------------------
 
+/// Distinct PEM-parsing failure modes the FFI callers want to surface as
+/// distinct [`PcStatus`] codes (per the FFI-4 audit finding). Without this,
+/// every PEM-related failure collapsed into `BadEncoding` and the C caller
+/// could not tell "you passed me empty bytes" from "you passed me a real but
+/// broken PEM block".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PemSplitError {
+    /// The input is well-formed at the framing layer but contains no blocks
+    /// of the requested `LABEL`.
+    NoBlocks,
+    /// A `-----BEGIN LABEL-----` marker was found with no matching
+    /// `-----END LABEL-----` trailer, or a block's base64 body failed to decode.
+    Malformed,
+}
+
+impl PemSplitError {
+    /// Maps to the FFI status code surfaced to the C caller. Today both
+    /// variants are `BadEncoding`; the enum lives so the call sites can
+    /// log the precise reason and a future ABI revision can split them.
+    fn to_status(self) -> PcStatus {
+        match self {
+            PemSplitError::NoBlocks | PemSplitError::Malformed => PcStatus::BadEncoding,
+        }
+    }
+}
+
 /// Splits a PEM bundle into individual labeled blocks. Each non-empty
 /// concatenated chunk between matching `-----BEGIN $LABEL-----` /
 /// `-----END $LABEL-----` markers is returned as a separate string.
-fn pem_split(pem: &str, label: &str) -> Vec<String> {
+///
+/// Errors:
+///   * [`PemSplitError::NoBlocks`]  — no `-----BEGIN $LABEL-----` found at all.
+///   * [`PemSplitError::Malformed`] — at least one `-----BEGIN-----` is not
+///     paired with a matching `-----END-----`.
+fn pem_split(pem: &str, label: &str) -> Result<Vec<String>, PemSplitError> {
     let begin = alloc::format!("-----BEGIN {label}-----");
     let end = alloc::format!("-----END {label}-----");
     let mut out = Vec::new();
@@ -1017,19 +1048,29 @@ fn pem_split(pem: &str, label: &str) -> Vec<String> {
             out.push(rest[after_b..abs_end].to_string());
             rest = &rest[abs_end..];
         } else {
-            break;
+            return Err(PemSplitError::Malformed);
         }
     }
-    out
+    if out.is_empty() {
+        return Err(PemSplitError::NoBlocks);
+    }
+    Ok(out)
 }
 
 /// Splits a PEM bundle of `CERTIFICATE` blocks into DER chunks, leaf first.
-fn pem_split_cert_chain(pem: &str) -> Vec<Vec<u8>> {
-    let mut chain = Vec::new();
-    for block in pem_split(pem, "CERTIFICATE") {
-        if let Ok(der) = crate::der::pem_decode(&block, "CERTIFICATE") {
-            chain.push(der);
-        }
+///
+/// Errors mirror [`pem_split`] plus [`PemSplitError::Malformed`] when a
+/// well-framed block's base64 body fails to decode.
+fn pem_split_cert_chain(pem: &str) -> Result<Vec<Vec<u8>>, PemSplitError> {
+    let blocks = pem_split(pem, "CERTIFICATE")?;
+    let mut chain = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let der =
+            crate::der::pem_decode(&block, "CERTIFICATE").map_err(|_| PemSplitError::Malformed)?;
+        chain.push(der);
     }
-    chain
+    if chain.is_empty() {
+        return Err(PemSplitError::NoBlocks);
+    }
+    Ok(chain)
 }

@@ -325,8 +325,52 @@ impl BoxedRsaPrivateKey {
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext.
+    ///
+    /// # Security
+    ///
+    /// The padding check itself is constant-time, but the returned `Vec`'s
+    /// **length** (and the success / [`Error::Decryption`] distinction)
+    /// reveals the position of the PKCS#1 v1.5 separator byte. An adaptive
+    /// chosen-ciphertext attacker who observes the protocol response can
+    /// mount a Bleichenbacher / Marvin / ROBOT-class oracle.
+    ///
+    /// For TLS 1.0–1.2 RSA key transport, CMS / PKCS#7, JOSE RSA1_5, and
+    /// other contexts where the plaintext length is known at the protocol
+    /// layer, use [`decrypt_pkcs1v15_session`](Self::decrypt_pkcs1v15_session)
+    /// instead. For new code, prefer OAEP via
+    /// [`decrypt_oaep`](Self::decrypt_oaep).
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         emsa::decrypt_pkcs1v15(self, ct)
+    }
+
+    /// Decrypts a PKCS#1 v1.5 ciphertext with implicit rejection (RFC 8017
+    /// §7.2.2 Note, the "Marvin" / TLS 1.2-style mitigation against
+    /// Bleichenbacher's attack).
+    ///
+    /// On padding failure, returns a deterministic pseudorandom buffer of
+    /// length `expected_len` derived from the ciphertext bytes and a
+    /// per-key secret. The caller (and any external observer) cannot
+    /// distinguish a real decryption from a synthetic one in timing, error
+    /// path, or output length — the only way to defeat a Bleichenbacher
+    /// oracle when the caller's downstream behavior would otherwise leak
+    /// the padding outcome.
+    ///
+    /// On success the returned `Vec` is **truncated or padded** to
+    /// `expected_len`: PKCS#1 v1.5 padding alone cannot recover the
+    /// intended plaintext length, so the protocol must agree on it (e.g.
+    /// TLS RSA key transport: `expected_len = 48` for the 48-byte
+    /// pre-master secret).
+    ///
+    /// # Errors
+    /// Only [`Error::InvalidLength`] when `ct.len()` does not equal the
+    /// modulus octet length. All other failure modes are folded into the
+    /// synthetic plaintext.
+    pub fn decrypt_pkcs1v15_session(
+        &self,
+        ct: &[u8],
+        expected_len: usize,
+    ) -> Result<Vec<u8>, Error> {
+        emsa::decrypt_pkcs1v15_session(self, ct, expected_len)
     }
 
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` and
@@ -369,6 +413,9 @@ impl RawPrivate for BoxedRsaPrivateKey {
             &c_uint,
         )
         .to_be_bytes(self.k)
+    }
+    fn secret_seed(&self) -> [u8; 32] {
+        self.blinding_seed
     }
 }
 
@@ -1123,5 +1170,73 @@ mod tests {
             BoxedRsaPrivateKey::from_pkcs1_der(&der),
             Err(crate::der::Error::Malformed)
         ));
+    }
+
+    // ---- RSA-2: implicit-rejection (decrypt_pkcs1v15_session) ----
+
+    /// Round-trips a real PKCS#1 v1.5 ciphertext through the boxed
+    /// session-decrypt path. The implementation must recover the original
+    /// plaintext when `expected_len` matches.
+    #[test]
+    fn boxed_session_decrypt_recovers_message_on_valid_ct() {
+        let key = rsa_test_key_a();
+        // Build a runtime-sized clone of `key` so we exercise the boxed
+        // `decrypt_pkcs1v15_session` path end-to-end.
+        let mut nb = [0u8; 256];
+        key.modulus().write_be_bytes(&mut nb);
+        let mut eb = [0u8; 256];
+        key.exponent().write_be_bytes(&mut eb);
+        let mut db = [0u8; 256];
+        key.private_exponent().write_be_bytes(&mut db);
+        let boxed_sk = BoxedRsaPrivateKey::from_components(
+            BoxedUint::from_be_bytes(&nb),
+            BoxedUint::from_be_bytes(&eb),
+            BoxedUint::from_be_bytes(&db),
+        );
+
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-session-ok", b"nonce", &[]);
+        let msg = [0x5au8; 48];
+        let ct = pk.encrypt_pkcs1v15(&msg, &mut r).unwrap();
+        let out = boxed_sk.decrypt_pkcs1v15_session(&ct, msg.len()).unwrap();
+        assert_eq!(out, msg);
+    }
+
+    /// A ciphertext whose RSA decryption yields malformed padding must
+    /// surface a `Ok`-shaped synthetic plaintext of length `expected_len`,
+    /// not an error. This is the core Bleichenbacher / Marvin / ROBOT
+    /// defense.
+    #[test]
+    fn boxed_session_decrypt_returns_synthetic_on_bad_padding() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-session-syn", b"nonce", &[]);
+        let key = BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(65537), &mut r, 12);
+        let bogus_ct = [0x42u8; 128];
+        let out = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        assert_eq!(out.len(), 48);
+    }
+
+    /// The synthetic plaintext is deterministic: repeated calls on the
+    /// same key with the same ciphertext yield the same bytes.
+    #[test]
+    fn boxed_session_decrypt_is_deterministic_under_same_key() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-session-det", b"nonce", &[]);
+        let key = BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(65537), &mut r, 12);
+        let bogus_ct = [0xa9u8; 128];
+        let a = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        let b = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
+        assert_eq!(a, b);
+    }
+
+    /// `InvalidLength` is the only externally observable error: ciphertext
+    /// length is public.
+    #[test]
+    fn boxed_session_decrypt_rejects_wrong_length_ct() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-session-len", b"nonce", &[]);
+        let key = BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(65537), &mut r, 12);
+        let short = [0u8; 127];
+        assert_eq!(
+            key.decrypt_pkcs1v15_session(&short, 48),
+            Err(Error::InvalidLength)
+        );
     }
 }

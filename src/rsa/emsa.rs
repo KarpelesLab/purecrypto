@@ -29,6 +29,11 @@ pub(crate) trait RawPrivate {
     fn modulus_bits(&self) -> usize;
     /// `c^d mod n`: `c` is big-endian and `< n`; returns the `k`-byte result.
     fn raw_private(&self, c: &[u8]) -> Vec<u8>;
+    /// A stable per-key 32-byte secret used to derive the synthetic
+    /// plaintext for PKCS#1 v1.5 implicit rejection (RFC 8017 §7.2.2 Note).
+    /// Must be the same value for every call on a given key, and unknown to
+    /// anyone without the private key.
+    fn secret_seed(&self) -> [u8; 32];
 }
 
 // --------------------------------------------------------------------------
@@ -53,6 +58,18 @@ pub(crate) fn encrypt_pkcs1v15<K: RawPublic, R: RngCore>(
     Ok(key.raw_public(&em))
 }
 
+/// Decrypts a PKCS#1 v1.5 ciphertext and returns the recovered message bytes.
+///
+/// The padding check itself is constant-time, but the **length** of the
+/// returned `Vec` (and the success / `Error::Decryption` distinction) reveals
+/// where the 0x00 separator was found — i.e. a classic Bleichenbacher
+/// length / padding oracle when the caller's downstream behavior is
+/// observable to an attacker (timing, error visibility, response length).
+///
+/// Use [`decrypt_pkcs1v15_session`] for protocols where the plaintext length
+/// is known a priori (TLS 1.0–1.2 RSA key transport, CMS): it produces a
+/// fixed-width, key-bound synthetic plaintext on padding failure that the
+/// attacker cannot distinguish from a real one.
 pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<u8>, Error> {
     let k = key.key_size();
     if ct.len() != k {
@@ -110,20 +127,18 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<
 /// the caller's subsequent processing might leak the outcome via timing,
 /// length, or behavior.
 ///
-/// The `key_secret` must be a stable per-key secret (e.g. derived from the
-/// private exponent at key construction); the same `key_secret` must be used
-/// for every decryption.
+/// The per-key secret is obtained from the [`RawPrivate::secret_seed`] hook so
+/// that every call on the same key sees the same fallback seed but an
+/// attacker without the private key cannot predict it.
 ///
 /// # Errors
 /// Only [`Error::InvalidLength`] when the ciphertext length is wrong (this is
 /// public, not secret-dependent). All padding outcomes return `Ok` — either
 /// the real plaintext or the synthetic fallback.
-#[allow(dead_code)]
 pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     key: &K,
     ct: &[u8],
     expected_len: usize,
-    key_secret: &[u8],
 ) -> Result<Vec<u8>, Error> {
     use crate::ct::ConditionallySelectable;
     use crate::hash::HmacSha256;
@@ -155,10 +170,11 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     // Derive the synthetic fallback: HMAC(key_secret, ct) expanded to expected_len.
     // The derivation is keyed by the long-term private value so the attacker
     // cannot predict the fallback. Pseudorandomness is provided by HMAC-SHA256.
+    let key_secret = key.secret_seed();
     let mut fallback = Vec::with_capacity(expected_len);
     let mut counter: u32 = 0;
     while fallback.len() < expected_len {
-        let mut h = HmacSha256::new(key_secret);
+        let mut h = HmacSha256::new(&key_secret);
         h.update(b"purecrypto-rsa-pkcs1v15-implicit-reject-v1");
         h.update(ct);
         h.update(&counter.to_be_bytes());

@@ -27,7 +27,7 @@ use crate::quic::client::{
     build_initial_endpoint, build_tls_engine as build_client_engine, random_default_cid,
 };
 use crate::quic::crypto::{
-    AeadAlg, aead_open, aead_seal, derive_dir_keys, derive_dir_keys_preserve_hp,
+    AeadAlg, PnReplayWindow, aead_open, aead_seal, derive_dir_keys, derive_dir_keys_preserve_hp,
     derive_hp_key_bytes, derive_next_application_secret,
 };
 use crate::quic::datagram::DatagramQueues;
@@ -1341,6 +1341,9 @@ impl QuicConnection {
             let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).tx_by_phase[(new_phase ^ 1) as usize] =
                 Some(next_keys);
+            // RFC 9001 §6.6 — per-key tx usage limit is per *key*. The
+            // tx key just changed, so reset the counter.
+            self.endpoint.crypto.at_mut(Level::OneRtt).tx_packets = 0;
         }
         self.endpoint.crypto.one_rtt_phase = new_phase;
     }
@@ -1391,6 +1394,12 @@ impl QuicConnection {
             let next_keys = derive_dir_keys_preserve_hp(alg, &next_secret, &hp_bytes);
             self.endpoint.crypto.at_mut(Level::OneRtt).rx_by_phase[old_phase as usize] =
                 Some(next_keys);
+            // RFC 9001 §6.6 — per-key rx integrity counter is per
+            // *key*. The rx key just rotated, so reset the failure
+            // counter. Likewise the replay window (RFC 9001 §9.5) is
+            // per-key: restart it for the new key.
+            self.endpoint.crypto.at_mut(Level::OneRtt).rx_aead_failures = 0;
+            self.endpoint.crypto.at_mut(Level::OneRtt).rx_pn_window = PnReplayWindow::new();
         }
         let tx_pending = self
             .endpoint
@@ -2029,6 +2038,29 @@ impl QuicConnection {
         }
     }
 
+    /// RFC 9001 §6.6 — record an AEAD authentication failure on the rx
+    /// side of `level`. Returns `Ok(true)` if this failure just crossed
+    /// the integrity limit (the connection is now closed; the caller
+    /// should treat the packet as silently dropped). Returns `Ok(false)`
+    /// for a sub-threshold failure (the caller should propagate the
+    /// AEAD error so the bad bytes are discarded but the connection
+    /// stays up).
+    fn bump_rx_aead_failure(&mut self, level: Level) -> Result<bool, Error> {
+        let lk = self.endpoint.crypto.at_mut(level);
+        lk.rx_aead_failures = lk.rx_aead_failures.saturating_add(1);
+        let failed = lk.rx_aead_failures;
+        let limit = lk.effective_integrity_limit();
+        if failed >= limit {
+            // RFC 9000 §10.3 / RFC 9001 §6.6 — close with
+            // AEAD_LIMIT_REACHED (transport error 0x0e). The existing
+            // shutdown style is flag-driven (`self.closed = true`) and
+            // pop_datagram becomes a no-op; we mirror that.
+            self.closed = true;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn feed_long_header_packet(&mut self, datagram: &[u8]) -> Result<usize, Error> {
         let hdr = LongHeader::parse(datagram)?;
 
@@ -2258,8 +2290,32 @@ impl QuicConnection {
             .expect("16-byte tag slice");
         let payload = &mut ct_with_tag[..tag_start];
 
-        // Open. Authentication failure → propagate.
-        aead_open(dir_keys_ref, pn, &aad, payload, &tag)?;
+        // Open. Authentication failure → bump the per-key integrity
+        // counter (RFC 9001 §6.6) and, on crossing the integrity limit,
+        // close with AEAD_LIMIT_REACHED. Otherwise propagate the AEAD
+        // error and continue dropping the packet.
+        if let Err(e) = aead_open(dir_keys_ref, pn, &aad, payload, &tag) {
+            if self.bump_rx_aead_failure(level)? {
+                // Counter just crossed the integrity limit — the close
+                // path is already triggered; surface as a clean drop
+                // (the connection is now closed, so subsequent feeds
+                // are no-ops anyway).
+                return Ok(pkt_total_len);
+            }
+            return Err(e);
+        }
+
+        // RFC 9001 §9.5 — per-key PN replay. A successfully-AEAD'd
+        // packet with a PN we've already accepted under the same key
+        // MUST be rejected. Check the per-key receive window AFTER
+        // AEAD success (the PN is only authentic once the tag verifies).
+        if !self.endpoint.crypto.at(level).rx_pn_window.is_fresh(pn) {
+            // Silent drop. RFC 9001 §9.5: replays are dropped without
+            // closing the connection (only repeated AEAD failures hit
+            // the integrity limit).
+            return Ok(pkt_total_len);
+        }
+        self.endpoint.crypto.at_mut(level).rx_pn_window.record(pn);
 
         // RFC 9000 §8.1: receiving a successfully-authenticated
         // Handshake-level packet from the peer validates the address.
@@ -2373,9 +2429,19 @@ impl QuicConnection {
                     .prev_rx_keys
                     .clone()
                     .expect("checked");
-                aead_open(&prev, pn, &aad, payload, &tag)?;
+                if let Err(e) = aead_open(&prev, pn, &aad, payload, &tag) {
+                    if self.bump_rx_aead_failure(Level::OneRtt)? {
+                        return Ok(datagram.len());
+                    }
+                    return Err(e);
+                }
                 true
             } else {
+                // No prev-phase fallback available: count this as a
+                // genuine integrity failure (RFC 9001 §6.6).
+                if self.bump_rx_aead_failure(Level::OneRtt)? {
+                    return Ok(datagram.len());
+                }
                 primary_result?;
                 false
             }
@@ -2383,6 +2449,25 @@ impl QuicConnection {
             false
         };
         let _ = opened_with_prev;
+
+        // RFC 9001 §9.5 — per-key PN replay check. The Application PN
+        // space's replay window lives on the OneRtt level (1-RTT rx
+        // keys are what verified `pn`). Like the long-header path,
+        // we check freshness *after* AEAD success.
+        if !self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .rx_pn_window
+            .is_fresh(pn)
+        {
+            return Ok(datagram.len());
+        }
+        self.endpoint
+            .crypto
+            .at_mut(Level::OneRtt)
+            .rx_pn_window
+            .record(pn);
 
         // RFC 9001 §6.2: a successfully-opened phase-flipped packet
         // commits the rx phase (and, if we haven't already initiated a
@@ -2831,6 +2916,25 @@ impl QuicConnection {
         }
         // Keys must be installed for this direction.
         self.endpoint.crypto.at(level).tx.as_ref()?;
+        // RFC 9001 §6.6 — per-key AEAD usage limit. If encrypting one
+        // more packet under the current tx key would cross the limit,
+        // close the connection with AEAD_LIMIT_REACHED. (Key update is
+        // the well-behaved escape hatch; the close path is the
+        // mandatory fallback when no update is initiated in time.)
+        {
+            let lk = self.endpoint.crypto.at(level);
+            if lk.tx_packets >= lk.effective_usage_limit() {
+                // Trigger close. RFC 9000 §10.3 says we SHOULD emit a
+                // CONNECTION_CLOSE, but the existing connection
+                // shutdown style here is to flip `closed` (no further
+                // pop_datagram output) and let the error surface to
+                // the caller through the next inbound feed. Returning
+                // None from build_packet_with_pad mirrors the existing
+                // "nothing to emit" shape.
+                self.closed = true;
+                return None;
+            }
+        }
         // RFC 9002 §7.2 — enforce cwnd at the 1-RTT level. Initial and
         // Handshake bypass cwnd because the initial window (10 packets
         // × 1200 bytes = 12 KiB) is generous enough for the handshake
@@ -3006,7 +3110,9 @@ impl QuicConnection {
         let tag = aead_seal(dir_keys, pn, &aad, pt);
         wire.extend_from_slice(&tag);
 
-        // Header protection.
+        // Header protection (last use of `dir_keys` — its immutable
+        // borrow ends here so we can re-borrow crypto state mutably
+        // below for the §6.6 tx counter increment).
         let sample_start = pn_offset + 4;
         let sample_end = sample_start + 16;
         debug_assert!(sample_end <= wire.len());
@@ -3016,6 +3122,15 @@ impl QuicConnection {
         let mask = dir_keys.hp.mask(&sample_arr).ok()?;
         let long_header = !matches!(level, Level::OneRtt);
         apply_header_protection(&mut wire, pn_offset, pn_len, &mask, long_header);
+
+        // RFC 9001 §6.6 — count this packet against the per-key tx
+        // usage limit. The pre-encrypt check above ensured we were
+        // below the limit; the post-increment is the source of truth
+        // for the next iteration.
+        {
+            let lk = self.endpoint.crypto.at_mut(level);
+            lk.tx_packets = lk.tx_packets.saturating_add(1);
+        }
 
         // ACK has been emitted (if it was queued) — clear the
         // ack-eliciting flag and pending list for this space.
@@ -6092,5 +6207,94 @@ mod tests {
                 .is_none()
                 || !s.endpoint.pn.application.ack_eliciting_pending
         );
+    }
+
+    // QUIC-1 — RFC 9001 §6.6: per-key tx usage limit. We drop the
+    // override to a small number and verify the connection closes
+    // after the corresponding number of 1-RTT packets have been
+    // emitted.
+    #[test]
+    fn quic1_tx_usage_limit_closes_connection() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+
+        // Force a tiny override on the client's 1-RTT tx key. Capture
+        // the current `tx_packets` value first — after a handshake
+        // there will already have been some 1-RTT packets emitted
+        // (NEW_CID, etc), so we set the override at `current + 2` and
+        // then push two more packets to trip the limit.
+        let baseline = c.endpoint.crypto.at(Level::OneRtt).tx_packets;
+        c.endpoint.crypto.at_mut(Level::OneRtt).usage_limit_override = Some(baseline + 2);
+        assert!(!c.closed, "precondition: connection still open");
+
+        // Open a stream and write some bytes. The packer should emit
+        // up to 2 packets before tripping the limit and refusing.
+        let sid = c.open_bidi().expect("open bidi");
+        c.write(sid, &[0xCDu8; 4096]).expect("write");
+        // Pump until either the limit closes the client or the server
+        // sees the data.
+        for _ in 0..16 {
+            let _ = pump(&mut c, &mut s);
+            if c.closed {
+                break;
+            }
+        }
+        assert!(
+            c.closed,
+            "client must close after tx_packets crosses the usage limit override"
+        );
+    }
+
+    /// QUIC-2 — RFC 9001 §9.5: duplicate PNs under the same rx key
+    /// must be silently dropped (no further state changes). We hijack
+    /// the client's rx PN window directly: pre-record the next PN the
+    /// server is about to send, then verify the feed becomes a silent
+    /// drop (`Ok(_)`) and the client never observes the data.
+    #[test]
+    fn quic2_pn_replay_silently_dropped() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Set up a stream so the server has something to send.
+        let sid = c.open_bidi().expect("open bidi");
+        c.write(sid, b"first-payload").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        // Now server replies.
+        let mut buf = [0u8; 64];
+        let (n, _fin) = s.read(StreamId(sid.0), &mut buf).expect("server read");
+        assert!(n > 0);
+        s.write(StreamId(sid.0), b"server-reply")
+            .expect("server write");
+
+        // Capture the very next datagram from the server so we can
+        // replay it.
+        let dg = s.pop_datagram();
+        assert!(!dg.is_empty(), "server must emit a datagram");
+        // Feed it once — accepted.
+        c.feed_datagram(&dg).expect("first feed ok");
+        // Feed the very same datagram again. The PN inside is now in
+        // the replay window so the AEAD-authenticated PN must be
+        // dropped silently (Ok, no state effect on stream data).
+        let r = c.feed_datagram(&dg);
+        assert!(
+            r.is_ok(),
+            "replay must be silently accepted-then-dropped, got {r:?}"
+        );
+        // Verify the client side hasn't double-counted the reply.
+        let mut b2 = [0u8; 64];
+        let (n2, _fin) = c.read(sid, &mut b2).expect("client read");
+        assert_eq!(&b2[..n2], b"server-reply");
+        // A second read returns 0 bytes (nothing replayed into the
+        // delivered queue).
+        let (n3, _) = c.read(sid, &mut b2).expect("client read 2");
+        assert_eq!(n3, 0, "PN replay must not deliver duplicate bytes");
     }
 }

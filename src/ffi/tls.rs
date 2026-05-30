@@ -307,10 +307,10 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
         };
-        let chain_der = pem_split_cert_chain(chain_str);
-        if chain_der.is_empty() {
-            return PcStatus::BadEncoding;
-        }
+        let chain_der = match pem_split_cert_chain(chain_str) {
+            Ok(v) => v,
+            Err(e) => return e.to_status(),
+        };
         let key_str = match core::str::from_utf8(kp) {
             Ok(s) => s,
             Err(_) => return PcStatus::BadEncoding,
@@ -416,10 +416,10 @@ pub unsafe extern "C" fn pc_tls_cfg_set_client_auth(
             return PcStatus::BadEncoding;
         };
         // Validate that each cert parses, then save the PEMs.
-        let blocks = pem_split(s, "CERTIFICATE");
-        if blocks.is_empty() {
-            return PcStatus::BadEncoding;
-        }
+        let blocks = match pem_split(s, "CERTIFICATE") {
+            Ok(v) => v,
+            Err(e) => return e.to_status(),
+        };
         let mut tmp = RootCertStore::new();
         for cert in &blocks {
             if tmp.add_pem(cert).is_err() {
@@ -548,6 +548,22 @@ pub unsafe extern "C" fn pc_tls_free(tls: *mut PcTls) {
 /// Push `len` wire bytes received from the peer into the engine. For DTLS
 /// the input is one datagram; for TLS it is any contiguous stream slice.
 ///
+/// If `consumed` is non-NULL, the number of bytes the engine accepted into
+/// its input buffer is written before this call returns — including on the
+/// error paths. Callers MUST consult `*consumed` after a non-`Ok` return so
+/// they neither re-feed already-buffered bytes nor lose the still-unbuffered
+/// tail.
+///
+/// Returns:
+///   * `Ok` — bytes accepted; the engine may need more (call `feed` again)
+///     or be ready to make progress (call `handshake` / `pop` / `recv`).
+///   * `Internal` — the engine produced a fatal error while processing the
+///     bytes that were already buffered. `*consumed` reflects what was
+///     accepted before the failure (today: the whole slice — `read_tls`
+///     buffers eagerly, the diagnostic is raised by post-buffer processing).
+///   * `NullPointer` — `tls` is NULL, or `wire_in` is NULL with non-zero
+///     `in_len`.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -558,18 +574,39 @@ pub unsafe extern "C" fn pc_tls_feed(
     consumed: *mut usize,
 ) -> PcStatus {
     guard(|| {
+        // Helper: report how many bytes the engine took into its buffer
+        // before returning to the caller. Done as an inline closure so the
+        // error and success paths share the same write — easy to keep them
+        // in sync if `feed` ever stops buffering eagerly.
+        let write_consumed = |n: usize| {
+            if !consumed.is_null() {
+                unsafe { *consumed = n };
+            }
+        };
         if tls.is_null() {
+            write_consumed(0);
             return PcStatus::NullPointer;
         }
         let Some(b) = (unsafe { slice(wire_in, in_len) }) else {
+            write_consumed(0);
             return PcStatus::NullPointer;
         };
         let conn = &mut unsafe { &mut *tls }.inner;
-        let _ = conn.feed(b);
-        if !consumed.is_null() {
-            unsafe { *consumed = in_len };
+        match conn.feed(b) {
+            Ok(n) => {
+                write_consumed(n);
+                PcStatus::Ok
+            }
+            Err(_) => {
+                // The TLS engines `read_tls(wire_in)` before
+                // `process_new_packets()` errors, so every byte the caller
+                // handed in is already inside the engine's input buffer.
+                // Reporting that lets the caller advance its read cursor
+                // and avoid double-feeding the tail.
+                write_consumed(in_len);
+                PcStatus::Internal
+            }
         }
-        PcStatus::Ok
     })
 }
 
@@ -925,34 +962,265 @@ pub unsafe extern "C" fn pc_dtls_on_timeout(
 
 // ---- Helpers --------------------------------------------------------------
 
+/// Distinct PEM-parsing failure modes the FFI callers want to surface as
+/// distinct [`PcStatus`] codes (per the FFI-4 audit finding). Without this,
+/// every PEM-related failure collapsed into `BadEncoding` and the C caller
+/// could not tell "you passed me empty bytes" from "you passed me a real but
+/// broken PEM block".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PemSplitError {
+    /// The input is well-formed at the framing layer but contains no blocks
+    /// of the requested `LABEL`. Maps to [`PcStatus::BadEncoding`] today; a
+    /// future header revision may promote it to a dedicated code.
+    NoBlocks,
+    /// A `-----BEGIN LABEL-----` marker was found with no matching
+    /// `-----END LABEL-----` trailer. Maps to [`PcStatus::BadEncoding`] but
+    /// kept distinct so the caller can log the precise reason and we don't
+    /// pretend the input was simply empty.
+    Malformed,
+}
+
+impl PemSplitError {
+    /// Maps to the FFI status code surfaced to the C caller. Today both
+    /// variants are `BadEncoding`; the enum lives so the call sites can
+    /// log the precise reason and a future ABI revision can split them.
+    pub(crate) fn to_status(self) -> PcStatus {
+        match self {
+            PemSplitError::NoBlocks | PemSplitError::Malformed => PcStatus::BadEncoding,
+        }
+    }
+}
+
 /// Splits a PEM bundle into individual labeled blocks. Each non-empty
 /// concatenated chunk between matching `-----BEGIN $LABEL-----` /
 /// `-----END $LABEL-----` markers is returned as a separate string.
-fn pem_split(pem: &str, label: &str) -> Vec<String> {
+///
+/// Errors:
+///   * [`PemSplitError::NoBlocks`]  — no `-----BEGIN $LABEL-----` found at all.
+///   * [`PemSplitError::Malformed`] — at least one `-----BEGIN-----` is not
+///     paired with a matching `-----END-----`.
+fn pem_split(pem: &str, label: &str) -> Result<Vec<String>, PemSplitError> {
     let begin = alloc::format!("-----BEGIN {label}-----");
     let end = alloc::format!("-----END {label}-----");
     let mut out = Vec::new();
     let mut rest = pem;
+    let mut saw_begin = false;
     while let Some(b_off) = rest.find(&begin) {
+        saw_begin = true;
         let after_b = b_off;
         if let Some(e_off) = rest[after_b..].find(&end) {
             let abs_end = after_b + e_off + end.len();
             out.push(rest[after_b..abs_end].to_string());
             rest = &rest[abs_end..];
         } else {
-            break;
+            // BEGIN with no matching END — this is "malformed", not "empty".
+            return Err(PemSplitError::Malformed);
         }
     }
-    out
+    if out.is_empty() {
+        // Distinguish "I found nothing at all" (NoBlocks) from "I tried and
+        // gave up because the framing was wrong" (Malformed, returned above).
+        if saw_begin {
+            // Unreachable: a BEGIN without END returns Malformed above.
+            return Err(PemSplitError::Malformed);
+        }
+        return Err(PemSplitError::NoBlocks);
+    }
+    Ok(out)
 }
 
 /// Splits a PEM bundle of `CERTIFICATE` blocks into DER chunks, leaf first.
-fn pem_split_cert_chain(pem: &str) -> Vec<Vec<u8>> {
-    let mut chain = Vec::new();
-    for block in pem_split(pem, "CERTIFICATE") {
-        if let Ok(der) = crate::der::pem_decode(&block, "CERTIFICATE") {
-            chain.push(der);
-        }
+///
+/// Errors mirror [`pem_split`] plus [`PemSplitError::Malformed`] when a
+/// well-framed block's base64 body fails to decode.
+fn pem_split_cert_chain(pem: &str) -> Result<Vec<Vec<u8>>, PemSplitError> {
+    let blocks = pem_split(pem, "CERTIFICATE")?;
+    let mut chain = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        // A block with framing but unparseable base64 / DER is *malformed*;
+        // the old code silently dropped it, masking the bug from the C caller.
+        let der =
+            crate::der::pem_decode(&block, "CERTIFICATE").map_err(|_| PemSplitError::Malformed)?;
+        chain.push(der);
     }
-    chain
+    if chain.is_empty() {
+        // Shouldn't reach here (pem_split returns NoBlocks for empty input),
+        // but stay defensive — surfacing NoBlocks is the truthful answer.
+        return Err(PemSplitError::NoBlocks);
+    }
+    Ok(chain)
+}
+
+#[cfg(test)]
+mod tls_ffi_tests {
+    //! FFI-3 and FFI-4 regression coverage:
+    //!   * FFI-3 — [`pc_tls_feed`] writes the consumed byte count even on
+    //!     the error path so the C caller can advance its read cursor.
+    //!   * FFI-4 — [`pem_split`] / [`pem_split_cert_chain`] distinguish
+    //!     "no blocks" from "malformed framing" from "well-framed but
+    //!     undecodable body".
+    use super::*;
+    use crate::ffi::common::PcStatus;
+
+    // ---- FFI-4 -----------------------------------------------------------
+
+    #[test]
+    fn pem_split_no_blocks_returns_no_blocks() {
+        let err = pem_split("no PEM here, just chatter", "CERTIFICATE").unwrap_err();
+        assert_eq!(err, PemSplitError::NoBlocks);
+        assert_eq!(err.to_status(), PcStatus::BadEncoding);
+    }
+
+    #[test]
+    fn pem_split_empty_input_returns_no_blocks() {
+        let err = pem_split("", "CERTIFICATE").unwrap_err();
+        assert_eq!(err, PemSplitError::NoBlocks);
+    }
+
+    #[test]
+    fn pem_split_begin_without_end_returns_malformed() {
+        let bad = "-----BEGIN CERTIFICATE-----\nAAAA\n(missing END)\n";
+        let err = pem_split(bad, "CERTIFICATE").unwrap_err();
+        assert_eq!(err, PemSplitError::Malformed);
+        assert_eq!(err.to_status(), PcStatus::BadEncoding);
+    }
+
+    #[test]
+    fn pem_split_label_mismatch_treated_as_no_blocks() {
+        // A PUBLIC KEY block doesn't satisfy a request for CERTIFICATE
+        // blocks, and the call must say "no blocks of that label" rather
+        // than silently succeeding with an empty Vec.
+        let p = "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----\n";
+        let err = pem_split(p, "CERTIFICATE").unwrap_err();
+        assert_eq!(err, PemSplitError::NoBlocks);
+    }
+
+    #[test]
+    fn pem_split_two_valid_blocks_returns_both() {
+        let two = "\
+-----BEGIN CERTIFICATE-----
+AAAA
+-----END CERTIFICATE-----
+-----BEGIN CERTIFICATE-----
+BBBB
+-----END CERTIFICATE-----
+";
+        let blocks = pem_split(two, "CERTIFICATE").unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("AAAA"));
+        assert!(blocks[1].contains("BBBB"));
+    }
+
+    #[test]
+    fn pem_split_cert_chain_undecodable_block_is_malformed() {
+        // Framing is fine, but the base64 body is garbage; the old code
+        // silently dropped this and returned an empty chain (looking
+        // identical to "no blocks"). The new code distinguishes them.
+        let bad = "\
+-----BEGIN CERTIFICATE-----
+!!! not base64 !!!
+-----END CERTIFICATE-----
+";
+        let err = pem_split_cert_chain(bad).unwrap_err();
+        assert_eq!(err, PemSplitError::Malformed);
+    }
+
+    #[test]
+    fn pem_split_cert_chain_no_blocks_is_no_blocks() {
+        let err = pem_split_cert_chain("not pem at all").unwrap_err();
+        assert_eq!(err, PemSplitError::NoBlocks);
+    }
+
+    // ---- FFI-3 -----------------------------------------------------------
+
+    /// Builds a minimal client `PcTls` that accepts any cert (no roots
+    /// configured). We never run the handshake — we only need a real
+    /// engine sitting in the "expecting ServerHello" state.
+    fn client_tls() -> *mut PcTls {
+        // `pc_tls_cfg_new` is `extern "C" fn` (not `unsafe extern "C" fn`).
+        let cfg = pc_tls_cfg_new(Role::Client as i32, Version::Tls13 as i32);
+        assert!(!cfg.is_null());
+        // Disable verification so no roots are required.
+        let st = unsafe { pc_tls_cfg_set_verify_certificates(cfg, 0) };
+        assert_eq!(st, PcStatus::Ok);
+        // SNI is required for a TLS 1.3 client config to build.
+        let sni = b"loopback.example\0";
+        let st =
+            unsafe { pc_tls_cfg_set_server_name(cfg, sni.as_ptr() as *const core::ffi::c_char) };
+        assert_eq!(st, PcStatus::Ok);
+        let tls = unsafe { pc_tls_new(cfg) };
+        unsafe { pc_tls_cfg_free(cfg) };
+        assert!(!tls.is_null());
+        tls
+    }
+
+    /// `pc_tls_feed` with a valid (zero-byte) slice must report 0 consumed,
+    /// not leave `*consumed` undefined.
+    #[test]
+    fn feed_empty_reports_zero_consumed() {
+        let tls = client_tls();
+        let mut consumed: usize = 0xdead_beef;
+        let st = unsafe { pc_tls_feed(tls, core::ptr::null(), 0, &mut consumed) };
+        assert_eq!(st, PcStatus::Ok);
+        assert_eq!(consumed, 0);
+        unsafe { pc_tls_free(tls) };
+    }
+
+    /// FFI-3 — feed bytes that the engine will reject during processing.
+    /// `*consumed` MUST be written before the error code is returned so
+    /// the caller can advance its read cursor past the rejected bytes
+    /// (otherwise the next feed re-delivers them, looping forever or
+    /// silently dropping the unbuffered tail).
+    #[test]
+    fn feed_writes_consumed_on_error_path() {
+        let tls = client_tls();
+        // Garbage at the record layer: a TLS record header claiming
+        // version 0x0000 / length 0xFFFF and zero payload — the engine
+        // rejects the first record, not after coalescing more bytes.
+        let bad: [u8; 12] = [0x17, 0x03, 0x03, 0x00, 0xff, 0xee, 0xdd, 0, 0, 0, 0, 0];
+        let mut consumed: usize = 0xdead_beef;
+        let st = unsafe { pc_tls_feed(tls, bad.as_ptr(), bad.len(), &mut consumed) };
+        // Either the engine swallows it (Ok) — in which case all bytes
+        // were buffered — or it errors. EITHER WAY, `consumed` must have
+        // been overwritten from its sentinel.
+        assert_ne!(
+            consumed, 0xdead_beef,
+            "pc_tls_feed must write *consumed before returning",
+        );
+        // On the error path today, `read_tls` buffers all of `in_len`
+        // before `process_new_packets` errors, so we expect a full
+        // consumed count when feeding fails.
+        if st != PcStatus::Ok {
+            assert_eq!(
+                consumed,
+                bad.len(),
+                "engine buffered all bytes before erroring",
+            );
+        }
+        unsafe { pc_tls_free(tls) };
+    }
+
+    /// NULL `consumed` is allowed (the C caller may opt out of the
+    /// count). The function must not crash when passed NULL there.
+    #[test]
+    fn feed_with_null_consumed_does_not_crash() {
+        let tls = client_tls();
+        let bytes = [0u8; 4];
+        let st = unsafe { pc_tls_feed(tls, bytes.as_ptr(), bytes.len(), core::ptr::null_mut()) };
+        // Either Ok (buffered) or an error — the precise status is
+        // not the point; the point is that we didn't deref the NULL.
+        let _ = st;
+        unsafe { pc_tls_free(tls) };
+    }
+
+    /// `pc_tls_feed(NULL, ...)` must write `*consumed = 0` so the C
+    /// caller can rely on `*consumed` being initialised across every
+    /// error path.
+    #[test]
+    fn feed_null_handle_reports_zero_consumed() {
+        let mut consumed: usize = 99;
+        let st = unsafe { pc_tls_feed(core::ptr::null_mut(), core::ptr::null(), 0, &mut consumed) };
+        assert_eq!(st, PcStatus::NullPointer);
+        assert_eq!(consumed, 0);
+    }
 }

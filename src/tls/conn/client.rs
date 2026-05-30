@@ -539,6 +539,15 @@ pub struct ClientConnection {
     /// the real-ECH attempt path. See [`ClientEchState`].
     #[cfg(feature = "ech")]
     ech_state: Option<ClientEchState>,
+
+    /// Per-connection private seed mixed into the ECH GREASE expansion
+    /// so the resulting payload is uncorrelated with anything a passive
+    /// observer can see. Drawn from the RNG once at construction; never
+    /// emitted on the wire. Without this seed the GREASE bytes would be
+    /// recomputable by an observer who saw the public ClientHello
+    /// random — defeating GREASE's only job.
+    #[cfg(feature = "ech")]
+    ech_grease_seed: [u8; 32],
 }
 
 /// Client-side per-handshake ECH state, populated when emitting a CH
@@ -991,6 +1000,14 @@ impl ClientConnection {
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
+        // Private seed for the ECH GREASE HKDF expansion (see the
+        // `ech_grease_seed` field). Drawn alongside the CH random so
+        // both share the same RNG provenance but the seed is never
+        // exposed on the wire.
+        #[cfg(feature = "ech")]
+        let mut ech_grease_seed = [0u8; 32];
+        #[cfg(feature = "ech")]
+        rng.fill_bytes(&mut ech_grease_seed);
 
         // If resuming, restrict the cipher-suite offer to suites whose hash
         // matches the session's. The PSK binder and handshake key schedule
@@ -1048,6 +1065,8 @@ impl ClientConnection {
             peer_quic_params_seen: false,
             #[cfg(feature = "ech")]
             ech_state: None,
+            #[cfg(feature = "ech")]
+            ech_grease_seed,
         };
         // Remember the offered PSK so we can seed the schedule when the
         // server selects it in SH.
@@ -1310,7 +1329,10 @@ impl ClientConnection {
                     &crate::tls::ech::GreaseParams::default()
                 }
             };
-            let body = params.build_extension_from_random(&random);
+            // Mix the per-connection private seed in — the public CH
+            // random alone would let a passive observer recompute the
+            // "encrypted" GREASE payload (TLS-1 audit finding).
+            let body = params.build_extension_from_seed(&self.ech_grease_seed, &random);
             extensions.push((
                 crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO,
                 body,
@@ -2937,6 +2959,12 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        #[cfg(feature = "ech")]
+        Error::EchDecryptionFailed => AlertDescription::DecryptError,
+        #[cfg(feature = "ech")]
+        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        #[cfg(feature = "cert-compression")]
+        Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }

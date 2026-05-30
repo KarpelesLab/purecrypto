@@ -346,6 +346,11 @@ pub(crate) fn try_decap_inner(
     // since a ClientHello body is length-prefixed, anything past the
     // declared length is padding.
     let unpadded = strip_trailing_padding(&plaintext)?;
+    // Per draft §7.1, the recovered inner CH MUST carry an
+    // `encrypted_client_hello` extension with the inner-form body
+    // (`[0x01]`). Reject as malformed otherwise (maps to
+    // illegal_parameter at the alert layer).
+    require_inner_marker(&unpadded)?;
     Ok(DecappedInner {
         inner_ch_bytes: unpadded,
         receiver,
@@ -384,6 +389,8 @@ pub(crate) fn try_decap_inner_retry(
         .open(&aad, &ciphertext)
         .map_err(|_| Error::EchDecryptionFailed)?;
     let unpadded = strip_trailing_padding(&plaintext)?;
+    // Same inner-marker requirement as on the CH1 path (draft §7.1).
+    require_inner_marker(&unpadded)?;
     Ok(unpadded)
 }
 
@@ -448,6 +455,88 @@ fn extract_outer_meta(handshake_msg: &[u8]) -> Result<(HpkeSymCipherSuite, u8, V
         p = body_end;
     }
     Err(Error::EchDecodeError)
+}
+
+/// Walks the inner CH extensions and requires exactly one
+/// `encrypted_client_hello` extension carrying the inner-form body
+/// (`type = inner`). The inner-marker is mandatory per
+/// draft-ietf-tls-esni-22 §7.1 — without it the decrypted CH is
+/// indistinguishable from a non-ECH CH and a network attacker could
+/// have crafted the ciphertext from a plain CH the client never
+/// intended to be ECH-inner. Returns [`Error::EchDecodeError`] if the
+/// marker is missing, malformed, or duplicated; that error maps to
+/// the `illegal_parameter(47)` alert at the alert layer.
+fn require_inner_marker(inner_ch: &[u8]) -> Result<(), Error> {
+    // inner_ch = u8 msg_type ++ u24 length ++ body. We already
+    // verified the framing in strip_trailing_padding so the indices
+    // below are guaranteed in-bounds, but keep the bounds checks
+    // defensive in case the helper is called in isolation.
+    if inner_ch.len() < 4 || inner_ch[0] != crate::tls::codec::hs_type::CLIENT_HELLO {
+        return Err(Error::EchDecodeError);
+    }
+    let body_len =
+        ((inner_ch[1] as usize) << 16) | ((inner_ch[2] as usize) << 8) | (inner_ch[3] as usize);
+    if 4 + body_len != inner_ch.len() {
+        return Err(Error::EchDecodeError);
+    }
+    let body = &inner_ch[4..];
+    let mut idx = 0usize;
+    let need = |idx: usize, n: usize| -> Result<(), Error> {
+        if idx + n > body.len() {
+            Err(Error::EchDecodeError)
+        } else {
+            Ok(())
+        }
+    };
+    need(idx, 2 + 32 + 1)?;
+    idx += 2 + 32;
+    let sid_len = body[idx] as usize;
+    idx += 1;
+    need(idx, sid_len + 2)?;
+    idx += sid_len;
+    let cs_len = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    need(idx, cs_len + 1)?;
+    idx += cs_len;
+    let cm_len = body[idx] as usize;
+    idx += 1;
+    need(idx, cm_len + 2)?;
+    idx += cm_len;
+    let ext_total = ((body[idx] as usize) << 8) | (body[idx + 1] as usize);
+    idx += 2;
+    need(idx, ext_total)?;
+    let ext_start = idx;
+    let ext_end = idx + ext_total;
+    let mut p = ext_start;
+    let mut found = false;
+    while p < ext_end {
+        if p + 4 > ext_end {
+            return Err(Error::EchDecodeError);
+        }
+        let ty = ((body[p] as u16) << 8) | (body[p + 1] as u16);
+        let bl = ((body[p + 2] as usize) << 8) | (body[p + 3] as usize);
+        let body_start = p + 4;
+        let body_end = body_start + bl;
+        if body_end > ext_end {
+            return Err(Error::EchDecodeError);
+        }
+        if ty == crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO.0 {
+            if found {
+                return Err(Error::EchDecodeError);
+            }
+            let ext_body = &body[body_start..body_end];
+            match EchExtension::decode(ext_body)? {
+                EchExtension::Inner => {}
+                EchExtension::Outer { .. } => return Err(Error::EchDecodeError),
+            }
+            found = true;
+        }
+        p = body_end;
+    }
+    if !found {
+        return Err(Error::EchDecodeError);
+    }
+    Ok(())
 }
 
 /// Strips trailing zero padding from a decrypted padded inner CH and

@@ -348,6 +348,21 @@ impl SendStream {
     }
 }
 
+/// RFC 9000 §4 (QUIC-4 audit finding) — hard cap on the number of
+/// out-of-order STREAM fragments we will buffer per receive stream.
+/// A peer that gaps + flexes its offsets can otherwise force us to
+/// hold an unbounded `BTreeMap` of pending fragments without ever
+/// completing a contiguous prefix, since per-stream flow control only
+/// constrains *byte count*, not *fragment count*. Once we reach the
+/// cap, the next out-of-order insert is rejected and the connection
+/// is closed with FLOW_CONTROL_ERROR (Error::Decode maps to that in
+/// the current shutdown path).
+///
+/// Cap value: 128 fragments is generous (typical retransmit /
+/// reorder scenarios produce at most a handful of gaps) while still
+/// hard-bounding the memory footprint of one stream.
+pub(crate) const MAX_PENDING_FRAGMENTS: usize = 128;
+
 /// Receive half of one stream.
 pub(crate) struct RecvStream {
     pub(crate) state: RecvState,
@@ -521,6 +536,17 @@ impl RecvStream {
                 // replace it.
                 let existing = self.pending.get(&offset).map(|v| v.len()).unwrap_or(0);
                 if data.len() > existing {
+                    // QUIC-4: bound the per-stream fragment count.
+                    // A replacement at the same offset doesn't grow
+                    // the map, so it's always allowed; a new key
+                    // would only be allowed if we're below the cap.
+                    if !self.pending.contains_key(&offset)
+                        && self.pending.len() >= MAX_PENDING_FRAGMENTS
+                    {
+                        // Map fragment-count overflow to
+                        // FLOW_CONTROL_ERROR (RFC 9000 §11.2).
+                        return Err(crate::tls::Error::Decode);
+                    }
                     self.pending.insert(offset, data.to_vec());
                 }
             }
@@ -916,5 +942,53 @@ mod tests {
         // final_size >= 150 is fine.
         let ok = r.on_reset(0, 200);
         assert!(ok.is_ok());
+    }
+
+    // QUIC-4 — RFC 9000 §4: per-stream pending-fragment count must be
+    // bounded. A peer that drips out-of-order one-byte fragments at
+    // strictly-increasing offsets (with the [0, n) prefix never
+    // arriving) would otherwise force unbounded BTreeMap growth.
+    //
+    // We verify the cap by sending MAX_PENDING_FRAGMENTS non-touching
+    // fragments and then asserting that the (MAX+1)th errors out.
+    #[test]
+    fn recv_pending_fragments_are_bounded() {
+        // Allow plenty of byte-level credit so the per-stream FC check
+        // doesn't fire first.
+        let mut r = RecvStream::new(1u64 << 30);
+        // Fragments live at offsets 1, 3, 5, ... (gaps of 1 so they
+        // never coalesce). MAX_PENDING_FRAGMENTS such frags fit; the
+        // next one must error.
+        for i in 0..MAX_PENDING_FRAGMENTS {
+            let off = 1 + (i as u64) * 2;
+            r.on_data(off, &[0xABu8; 1], false)
+                .expect("fragment within cap");
+        }
+        assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
+        // The next non-touching fragment must error.
+        let off = 1 + (MAX_PENDING_FRAGMENTS as u64) * 2;
+        let err = r.on_data(off, &[0xABu8; 1], false);
+        assert!(err.is_err(), "fragment beyond cap must be rejected");
+        // The cap must hold — no silent admission.
+        assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
+    }
+
+    /// A replacement insertion at an *existing* offset must NOT count
+    /// against the cap (it doesn't grow the map). This is important so
+    /// a peer that legitimately resends a longer fragment of an
+    /// already-buffered offset isn't penalized.
+    #[test]
+    fn recv_pending_replacement_does_not_grow_map() {
+        let mut r = RecvStream::new(1u64 << 30);
+        // Fill the cap.
+        for i in 0..MAX_PENDING_FRAGMENTS {
+            let off = 1 + (i as u64) * 4;
+            r.on_data(off, &[0xCDu8; 1], false).expect("fragment");
+        }
+        assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
+        // A longer payload at offset 1 (an existing key) must succeed:
+        // it's a same-key replacement, not a new entry.
+        r.on_data(1, &[0xCDu8; 2], false).expect("replacement");
+        assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
     }
 }

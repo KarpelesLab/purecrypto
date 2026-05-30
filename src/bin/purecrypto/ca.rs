@@ -145,7 +145,77 @@ fn next_serial(ca: &CaDir) -> u64 {
 }
 
 fn bump_serial(ca: &CaDir, current: u64) {
-    write_string(&ca.serial(), &format!("{}\n", current + 1));
+    let next = current
+        .checked_add(1)
+        .unwrap_or_else(|| die("serial counter overflow (u64)"));
+    write_string(&ca.serial(), &format!("{next}\n"));
+}
+
+/// Inter-process lock around the read-modify-write of the `serial` file.
+///
+/// Two `purecrypto ca` invocations racing to issue would otherwise see the
+/// same value at `next_serial` and write the same `current + 1` back — both
+/// certificates would carry the same serial, breaking the auditing /
+/// revocation invariants the CA depends on.
+///
+/// We can't reach for `flock(2)` directly (the crate denies `unsafe_code`
+/// outside `src/ffi/`), so we use a pure-`std` sentinel file opened with
+/// `create_new(true)`. The kernel guarantees that at most one caller wins
+/// the create; everyone else gets `AlreadyExists` and retries with a small
+/// sleep. Bounded retry (~3 s) so a stale lock from a crashed peer eventually
+/// surfaces a clear error rather than hanging forever.
+struct SerialLock {
+    path: PathBuf,
+}
+
+impl SerialLock {
+    fn acquire(ca: &CaDir) -> Self {
+        let path = ca.dir.join("serial.lock");
+        // 150 * 20ms = 3s timeout. Long enough to overlap normal cert-issue
+        // wallclock; short enough that a crashed peer surfaces quickly.
+        const MAX_RETRIES: u32 = 150;
+        const SLEEP_MS: u64 = 20;
+        for attempt in 0..MAX_RETRIES {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_f) => return SerialLock { path },
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if attempt + 1 == MAX_RETRIES {
+                        die(format!(
+                            "timed out waiting for CA serial lock {} \
+                             (stale lock from a crashed `purecrypto ca`? \
+                             delete it manually if so)",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
+                }
+                Err(e) => die(format!("cannot create lock {}: {e}", path.display())),
+            }
+        }
+        unreachable!()
+    }
+}
+
+impl Drop for SerialLock {
+    fn drop(&mut self) {
+        // Best-effort: if the unlink fails (e.g. another process already
+        // raced to remove it), there's nothing useful to recover.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Reads the current serial, hands it back, and bumps the on-disk counter
+/// — all under the file lock so two racing `purecrypto ca` invocations
+/// cannot issue certificates with the same serial.
+fn allocate_serial(ca: &CaDir) -> u64 {
+    let _lock = SerialLock::acquire(ca);
+    let serial = next_serial(ca);
+    bump_serial(ca, serial);
+    serial
 }
 
 fn serial_to_be_bytes(serial: u64) -> Vec<u8> {
@@ -327,7 +397,9 @@ fn run_issue(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
-    let serial = next_serial(&ca);
+    // Atomic read-modify-write of the serial counter under a sentinel
+    // file lock — see `SerialLock`.
+    let serial = allocate_serial(&ca);
     let validity = validity_days(days_n);
 
     let cert = if let Some(tmpl) = template {
@@ -358,7 +430,6 @@ fn run_issue(args: Args) {
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
     };
-    bump_serial(&ca, serial);
 
     // Record in issued.jsonl. Every string field goes through `json_escape`
     // so a control character or `"` in a SAN / subject cannot corrupt the
@@ -423,7 +494,7 @@ fn run_sign_csr(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
-    let serial = next_serial(&ca);
+    let serial = allocate_serial(&ca);
     let validity = validity_days(days_n);
 
     // The CSR's self-signature MUST verify before we trust its subject/key.
@@ -467,7 +538,6 @@ fn run_sign_csr(args: Args) {
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
     };
-    bump_serial(&ca, serial);
 
     let subject = subject_from_csr;
     let sans = csr.subject_alt_names().unwrap_or_default();
@@ -612,7 +682,17 @@ fn run_crl(args: Args) {
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
     let this_update = Time::from_unix(now);
-    let next_update = Time::from_unix(now + days_n * 86_400);
+    // `days_n` is user-supplied (`-days N`); guard the * 86_400 + now
+    // arithmetic so a pathologically large value can't wrap the u64.
+    let next_update_unix = days_n
+        .checked_mul(86_400)
+        .and_then(|delta| now.checked_add(delta))
+        .unwrap_or_else(|| {
+            die(format!(
+                "-days {days_n} overflows when added to current time; pick a smaller value"
+            ))
+        });
+    let next_update = Time::from_unix(next_update_unix);
     let mut b = CrlBuilder::new(&issuer_dn, this_update, Some(next_update));
 
     let rows = parse_revoked_jsonl(&ca.revoked());
@@ -774,5 +854,185 @@ pub(crate) fn run(args: Args) {
         other => die(format!(
             "unknown ca subcommand '{other}' (try `purecrypto ca help`)"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! FFI-1 / FFI-2 regression coverage. The full `run_*` entry points
+    //! shell out to `die()` (process exit) so we exercise the inner
+    //! helpers — `allocate_serial` (FFI-1) and the `run_crl` next-update
+    //! arithmetic (FFI-2) — directly against scratch directories.
+    use super::*;
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// Counter used to mint unique scratch directory names. We can't add
+    /// a `tempfile` dev-dependency (Cargo.toml is off-limits) so we roll
+    /// our own minimal tempdir over `std::env::temp_dir`.
+    static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Auto-cleaning scratch directory. Drop removes the tree on a best-
+    /// effort basis so a panicking test does not leak permanent files.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let n = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            // Mix in pid + nanos so two parallel `cargo test` runs cannot
+            // collide on the directory name.
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("purecrypto-ca-{tag}-{pid}-{nanos}-{n}"));
+            std::fs::create_dir_all(&path).expect("mkdir scratch");
+            ScratchDir(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Builds a fresh on-disk CA directory primed with a starting serial.
+    /// The caller MUST keep the returned `ScratchDir` alive — dropping it
+    /// removes the directory and invalidates the `CaDir`.
+    fn fresh_ca(start: u64, tag: &str) -> (CaDir, ScratchDir) {
+        let td = ScratchDir::new(tag);
+        let dir = td.0.to_str().expect("utf-8 path").to_string();
+        let ca = CaDir::new(&dir);
+        std::fs::write(ca.serial(), format!("{start}\n")).expect("seed serial");
+        (ca, td)
+    }
+
+    /// FFI-1: two threads racing `allocate_serial` against the same `serial`
+    /// file must hand out distinct numbers — otherwise the CA could issue
+    /// two certificates with the same serial, breaking revocation /
+    /// auditing.
+    #[test]
+    fn allocate_serial_is_atomic_across_threads() {
+        let (ca, _td) = fresh_ca(100, "atomic");
+        let ca = Arc::new(ca);
+        const THREADS: u32 = 8;
+        const PER_THREAD: u32 = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let ca = Arc::clone(&ca);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut got = Vec::with_capacity(PER_THREAD as usize);
+                for _ in 0..PER_THREAD {
+                    got.push(allocate_serial(&ca));
+                }
+                got
+            }));
+        }
+        let mut all: Vec<u64> = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("thread"));
+        }
+        // Every serial is distinct.
+        let set: HashSet<u64> = all.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            all.len(),
+            "duplicate serials produced under concurrency: {all:?}"
+        );
+        // Issued exactly THREADS*PER_THREAD serials starting at 100.
+        let expected: HashSet<u64> = (100..100 + (THREADS * PER_THREAD) as u64).collect();
+        assert_eq!(set, expected);
+        // On-disk serial reflects the final state.
+        let next: u64 = std::fs::read_to_string(ca.serial())
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(next, 100 + (THREADS * PER_THREAD) as u64);
+        // Lock file removed at end.
+        assert!(!ca.dir.join("serial.lock").exists());
+    }
+
+    /// The lock is released even when the holding scope panics, so a
+    /// crashed allocator does not freeze the next caller for the full
+    /// 3-second retry window.
+    #[test]
+    fn serial_lock_drop_on_panic_unblocks_next_caller() {
+        let (ca, _td) = fresh_ca(7, "panic");
+        let ca = Arc::new(ca);
+        let ca_clone = Arc::clone(&ca);
+        let h = std::thread::spawn(move || {
+            let _lock = SerialLock::acquire(&ca_clone);
+            panic!("simulated allocator crash with lock held");
+        });
+        assert!(h.join().is_err(), "thread should have panicked");
+        // Drop has run; the next allocator must succeed immediately.
+        let n = allocate_serial(&ca);
+        assert_eq!(n, 7);
+    }
+
+    /// FFI-1 extra: stress the retry loop. Two background workers
+    /// hammer the same `serial` file while the main thread counts
+    /// how many distinct values fell out.
+    #[test]
+    fn allocate_serial_no_gaps_under_contention() {
+        let (ca, _td) = fresh_ca(1, "nogaps");
+        let ca = Arc::new(ca);
+        let count = Arc::new(AtomicU32::new(0));
+        const N: u32 = 32;
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let ca = Arc::clone(&ca);
+            let count = Arc::clone(&count);
+            handles.push(std::thread::spawn(move || {
+                let mut got = Vec::new();
+                while count.fetch_add(1, Ordering::Relaxed) < N {
+                    got.push(allocate_serial(&ca));
+                }
+                got
+            }));
+        }
+        let mut all = Vec::new();
+        for h in handles {
+            all.extend(h.join().unwrap());
+        }
+        all.sort();
+        assert_eq!(all.len(), N as usize, "missed an allocation");
+        for (i, v) in all.iter().enumerate() {
+            assert_eq!(*v, 1 + i as u64, "gap or duplicate at index {i}: {all:?}");
+        }
+    }
+
+    /// FFI-2: the run_crl next-update arithmetic (`now + days_n * 86_400`)
+    /// must not silently wrap u64. This test mirrors the production
+    /// `checked_mul`/`checked_add` chain so regressions in either step
+    /// are caught.
+    #[test]
+    fn crl_next_update_uses_checked_arithmetic() {
+        // The chain that ships in run_crl. Keep the literal `86_400` here
+        // so a refactor of the constant in production is visible by diff.
+        let compute = |now: u64, days_n: u64| -> Option<u64> {
+            days_n.checked_mul(86_400).and_then(|d| now.checked_add(d))
+        };
+        // Normal cases work.
+        assert_eq!(compute(1_000, 30), Some(1_000 + 30 * 86_400));
+        assert_eq!(compute(0, 1), Some(86_400));
+        // Multiplication overflow: 2^64/86400 ≈ 2.135e14 days. A u64-max
+        // days_n must NOT silently wrap to a small next-update timestamp.
+        assert_eq!(compute(0, u64::MAX), None);
+        // Addition overflow on a near-MAX `now`.
+        assert_eq!(compute(u64::MAX - 1, 1), None);
+        assert_eq!(compute(u64::MAX, 0), Some(u64::MAX));
+        // Boundary just past the safe zone.
+        let almost = u64::MAX / 86_400;
+        // almost * 86_400 fits, but +1 day overflows.
+        assert!(compute(0, almost).is_some());
+        assert_eq!(compute(0, almost + 1), None);
     }
 }

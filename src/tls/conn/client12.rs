@@ -122,6 +122,13 @@ pub(crate) struct ClientConfig12 {
     /// the engine logs the derived `master_secret` keyed by the
     /// `client_random` (TLS 1.2 emits a single `CLIENT_RANDOM` line).
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// RFC 7627 §5.3 — when `true` (the default), the client requires
+    /// the server to echo `extended_master_secret`. A server that omits
+    /// the echo will cause the handshake to abort with
+    /// `handshake_failure`, preventing the triple-handshake family of
+    /// cross-protocol attacks. Set to `false` only to interoperate with
+    /// servers that predate RFC 7627.
+    pub require_ems: bool,
 }
 
 impl ClientConfig12 {
@@ -141,7 +148,16 @@ impl ClientConfig12 {
             accept_downgrade_sentinel: true,
             crls: CrlStore::new(),
             key_log: None,
+            require_ems: true,
         }
+    }
+
+    /// RFC 7627 §5.3 — require the server to negotiate Extended Master
+    /// Secret. Default is `true`. Disable only for legacy interop with
+    /// servers that predate RFC 7627.
+    pub fn with_require_ems(mut self, required: bool) -> Self {
+        self.require_ems = required;
+        self
     }
 
     /// Installs a [`CrlStore`] consulted during chain validation. The
@@ -1146,6 +1162,14 @@ impl ClientConnection12 {
             self.ems_negotiated = true;
         } else {
             self.ems_negotiated = false;
+            // RFC 7627 §5.3: when the server doesn't echo our offer,
+            // the connection MUST abort if EMS is required (the
+            // default). Without EMS the master secret is not bound to
+            // the handshake transcript, opening the triple-handshake
+            // family of cross-protocol attacks (TLS-3 audit finding).
+            if self.config.require_ems && self.ems_offered {
+                return Err(Error::HandshakeFailure);
+            }
         }
 
         // Pin the negotiated hash on the transcript now that we know it.
@@ -1685,6 +1709,12 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        #[cfg(feature = "ech")]
+        Error::EchDecryptionFailed => AlertDescription::DecryptError,
+        #[cfg(feature = "ech")]
+        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        #[cfg(feature = "cert-compression")]
+        Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }
@@ -1836,6 +1866,61 @@ mod tests {
             c.process_new_packets(),
             Err(Error::HandshakeFailure)
         ));
+    }
+
+    /// TLS-3 regression (RFC 7627 §5.3): when `require_ems = true` (the
+    /// default) and the client offered EMS (always, per RFC 7627 §5.1),
+    /// a ServerHello that omits the `extended_master_secret` echo is
+    /// rejected with `HandshakeFailure`. Without EMS the master secret
+    /// is not bound to the handshake transcript, opening the
+    /// triple-handshake family of cross-protocol attacks.
+    #[test]
+    fn client12_rejects_server_omitting_extended_master_secret_by_default() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-noems", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        );
+        let _ = c.write_tls();
+
+        // SH carries renegotiation_info (passes RFC 5746) but no
+        // extended_master_secret echo — must abort.
+        let exts = alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])];
+        let sh = synth_sh_record(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, exts);
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::HandshakeFailure)
+        ));
+    }
+
+    /// TLS-3 follow-up: with `with_require_ems(false)` the client accepts
+    /// a legacy server that doesn't echo EMS — the SH parses past the
+    /// EMS check and fails later for unrelated reasons (no Certificate
+    /// emitted, etc.). We assert only that the SH itself is accepted by
+    /// not returning `HandshakeFailure` at the SH-processing stage.
+    #[test]
+    fn client12_accepts_no_ems_when_requirement_disabled() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-noems-opt", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()).with_require_ems(false),
+            "example.com",
+            &mut rng,
+        );
+        let _ = c.write_tls();
+
+        let exts = alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])];
+        let sh = synth_sh_record(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, exts);
+        c.read_tls(&sh);
+        // process_new_packets may return Ok (waiting for more) or any
+        // non-EMS error — but NOT HandshakeFailure on the EMS path.
+        let r = c.process_new_packets();
+        assert!(
+            !matches!(r, Err(Error::HandshakeFailure)),
+            "EMS opt-out should not trigger HandshakeFailure, got {:?}",
+            r
+        );
     }
 
     /// A ServerHello selecting TLS 1.3 via `supported_versions` from a 1.2

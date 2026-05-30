@@ -33,12 +33,12 @@ use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, hs_type, put_u16,
-    with_len_u16, with_len_u24,
+    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, hs_type,
+    put_u16, with_len_u16, with_len_u24,
 };
 use crate::tls::crypto::sign::sign_certificate_verify;
 use crate::tls::crypto::{
-    KeySchedule, RecordCrypter, SuiteParams, Transcript, certificate_verify_content,
+    HashAlg, KeySchedule, RecordCrypter, SuiteParams, Transcript, certificate_verify_content,
     finished_verify_data, supported_suites,
 };
 use crate::tls::keylog::KeyLog;
@@ -51,7 +51,7 @@ use super::ack::{ACK_CONTENT_TYPE, RecordNumber, decode as decode_ack, encode as
 use super::client13::{
     decrypt_dtls13_record, derive_sn_key, encrypt_dtls13_record, sn_key_len_for,
 };
-use super::cookie::CookieGenerator;
+use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
@@ -334,6 +334,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.retransmit.next_timeout()
     }
 
+    /// Advances the connection's monotonic clock to `now`. Callers SHOULD
+    /// invoke this (or [`Self::on_timeout`]) regularly so the cookie
+    /// generator sees a current time — otherwise a server with no
+    /// timeouts firing would reuse a stale cookie-issue timestamp and the
+    /// embedded-`TS` age check (RFC 9147 §5.1) would be effectively
+    /// disabled. Idempotent in the rewind direction (older times are
+    /// ignored).
+    pub fn set_now(&mut self, now: Duration) {
+        if now > self.last_now {
+            self.last_now = now;
+        }
+    }
+
     /// Drives the retransmit machine.
     pub fn on_timeout(&mut self, now: Duration) {
         self.last_now = now;
@@ -426,15 +439,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         } else {
             aad[1] ^= mask[0];
         }
-        let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
-        let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
-        // RFC 9147 §4.5.1: drop duplicates and too-old records via the
-        // sliding-window filter. The AEAD already verified the record, but
-        // an attacker can replay any verified record indefinitely unless
-        // we filter at this layer.
-        if !self.read_replay.accept(seq) {
+        // Pre-AEAD anti-replay check: cheap rejection of duplicate /
+        // too-old seq numbers without touching window state. The window
+        // is only `mark`-ed after AEAD verification succeeds so a forged
+        // packet that fails AEAD does not burn a slot.
+        if !self.read_replay.check(seq) {
             return Ok(consumed);
         }
+        let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
+        let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
+        // RFC 9147 §4.5.1: AEAD verified — now commit to the window.
+        self.read_replay.mark(seq);
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
@@ -607,16 +622,52 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let preferred_share =
             preferred_group.and_then(|g| client_shares.iter().find(|(sg, _)| *sg == g).cloned());
 
+        // CH content fingerprint binds the cookie to the security-critical
+        // CH fields. An attacker who grabbed a cookie issued for a
+        // strong-cipher CH1 cannot replay it with a weak-cipher CH2 — the
+        // cookie HMAC mismatches (DTLS-5).
+        let ch_fp = ch_fingerprint_dtls13(&ch);
+
         if cookie_required && presented_cookie.is_none() {
-            // First CH: emit HRR with a freshly-minted cookie. Also embed a
-            // `key_share(selected_group)` if the client didn't already
-            // present a share for our preferred group — RFC 8446 §4.1.4
-            // forbids a second HRR, so we combine cookie + group here.
+            // First CH (cookie required, no cookie yet): emit HRR with a
+            // freshly-minted cookie. The cookie's `aux` payload carries the
+            // (suite, selected_group, Hash(CH1)) tuple we'd otherwise have
+            // to pin on `self` — keeping the server fully stateless across
+            // the HRR roundtrip (DTLS-2 / DTLS-4: no per-connection state
+            // before cookie validates).
+            //
+            // Also embed a `key_share(selected_group)` if the client didn't
+            // already present a share for our preferred group — RFC 8446
+            // §4.1.4 forbids a second HRR, so we combine cookie + group here.
             let group_needed = if preferred_share.is_none() {
-                preferred_group.ok_or(Error::HandshakeFailure)?.into()
+                Some(preferred_group.ok_or(Error::HandshakeFailure)?)
             } else {
                 None
             };
+
+            // Compute Hash(CH1) using the picked suite's hash, so the CH2
+            // path can rebuild the `message_hash(CH1)` transcript synthetic
+            // from the cookie's aux payload (RFC 8446 §4.4.1).
+            let mut tls_ch1 = Vec::with_capacity(4 + body.len());
+            tls_ch1.push(hs_type::CLIENT_HELLO);
+            let n = body.len() as u32;
+            tls_ch1.push(((n >> 16) & 0xff) as u8);
+            tls_ch1.push(((n >> 8) & 0xff) as u8);
+            tls_ch1.push((n & 0xff) as u8);
+            tls_ch1.extend_from_slice(body);
+            let h_ch1 = suite.hash.hash(&tls_ch1);
+
+            // Aux layout:
+            //   suite_id : u16 BE
+            //   sel_grp  : u16 BE (0x0000 sentinel = no group HRR)
+            //   hash_alg : u8 (0=Sha256, 1=Sha384)
+            //   hash_ch1 : hash_alg.output_len() bytes
+            let mut aux = Vec::with_capacity(5 + suite.hash.output_len());
+            aux.extend_from_slice(&suite.suite.0.to_be_bytes());
+            aux.extend_from_slice(&group_needed.map(|g| g.0).unwrap_or(0).to_be_bytes());
+            aux.push(hash_alg_to_byte(suite.hash));
+            aux.extend_from_slice(h_ch1.as_slice());
+
             let secret = self
                 .config
                 .cookie_secret
@@ -624,35 +675,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
             let now_min = (self.last_now.as_secs() / 60) as u32;
-            let cookie = cg.generate(&self.peer_addr, &ch.random, now_min);
-            // Pin the suite and (optionally) the requested group.
-            self.suite = Some(suite);
-            self.hrr_selected_group = group_needed;
-            // Transcript: per RFC 8446 §4.4.1, when HRR is in play, the
-            // transcript replaces CH1 with `message_hash(CH1)`. We commit
-            // the transcript hash now that the suite is selected, then
-            // park the CH1 bytes; the CH2 path replays them through
-            // `replace_with_message_hash`.
-            self.emit_hello_retry_request(Some(&cookie))?;
+            let cookie = cg.generate_with_aux(&self.peer_addr, &ch.random, &ch_fp, &aux, now_min);
+
+            // Emit HRR using the local (suite, group_needed) — we do NOT
+            // pin them on `self`. CH2 will re-enter this path with the
+            // cookie, at which point we'll recover (suite, group, Hash(CH1))
+            // from `aux` and bootstrap the real handshake state.
+            self.emit_hrr_stateless(suite.suite, &cookie, group_needed)?;
             self.state = State::WaitSecondClientHello;
-            let mut t = Transcript::new();
-            t.set_alg(suite.hash);
-            // CH1 in TLS-shape:
-            let mut tls_ch = Vec::with_capacity(4 + body.len());
-            tls_ch.push(hs_type::CLIENT_HELLO);
-            let n = body.len() as u32;
-            tls_ch.push(((n >> 16) & 0xff) as u8);
-            tls_ch.push(((n >> 8) & 0xff) as u8);
-            tls_ch.push((n & 0xff) as u8);
-            tls_ch.extend_from_slice(body);
-            t.update(&tls_ch);
-            // We park `t` inside `self.transcript`; on CH2 we'll call
-            // replace_with_message_hash on it before continuing.
-            self.transcript = t;
-            // Don't allocate a reassembler — the next CH must also enter
-            // this pre-state path.
-            // out_msg_seq is now 1 (HRR consumed msg_seq=0).
-            self.out_msg_seq = 1;
+            // Deliberately DO NOT mutate: self.suite, self.hrr_selected_group,
+            // self.transcript, self.out_msg_seq. The CH2 path picks them up
+            // from the cookie's aux payload only after the cookie HMAC has
+            // verified. msg_seq from this unauthenticated CH is also
+            // ignored — the reassembler is not allocated yet (DTLS-4).
             let _ = msg_seq;
             return Ok(());
         }
@@ -662,7 +697,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 .as_ref()
                 .ok_or(Error::IllegalParameter)?
                 .clone();
-            // Validate cookie before any further work.
+            // Validate cookie before any further work — and recover the
+            // suite/group/Hash(CH1) tuple the CH1 path parked in `aux`.
             let secret = self
                 .config
                 .cookie_secret
@@ -680,22 +716,79 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             }
             let cookie = &cookie_bytes[2..];
             let now_min = (self.last_now.as_secs() / 60) as u32;
-            if !cg.validate(&self.peer_addr, &ch.random, now_min, cookie) {
+            let aux = cg
+                .validate_with_aux(&self.peer_addr, &ch.random, &ch_fp, now_min, cookie)
+                .ok_or(Error::IllegalParameter)?;
+
+            // Decode the aux payload: (suite_id, sel_group, hash_alg, Hash(CH1)).
+            if aux.len() < 5 {
                 return Err(Error::IllegalParameter);
             }
-            // CH2 must still offer the suite we pinned in HRR (RFC 8446
-            // §4.1.4: the suite the server picks on HRR is the one it
-            // commits to).
-            let pinned = self.suite.ok_or(Error::InappropriateState)?;
-            if !ch.cipher_suites.contains(&pinned.suite) {
+            let parked_suite_id = CipherSuite(u16::from_be_bytes([aux[0], aux[1]]));
+            let parked_sel_group_id = u16::from_be_bytes([aux[2], aux[3]]);
+            let parked_hash_alg = hash_alg_from_byte(aux[4]).ok_or(Error::IllegalParameter)?;
+            let parked_hash_ch1 = &aux[5..];
+            if parked_hash_ch1.len() != parked_hash_alg.output_len() {
                 return Err(Error::IllegalParameter);
             }
-            // CH2 transcript: replace CH1 with message_hash(CH1) (already
-            // in self.transcript from the pre-state path above), then
-            // append the HRR and CH2.
-            self.transcript.replace_with_message_hash();
-            // Re-derive the HRR bytes so we can update the transcript.
-            let hrr_bytes = self.build_hrr_bytes(Some(cookie), self.hrr_selected_group);
+            // Look up the SuiteParams for the parked suite.
+            let parked_suite = supported_suites()
+                .iter()
+                .copied()
+                .find(|s| s.suite == parked_suite_id)
+                .ok_or(Error::IllegalParameter)?;
+            if parked_suite.hash != parked_hash_alg {
+                return Err(Error::IllegalParameter);
+            }
+            // CH2 must still offer the suite we picked in HRR — the cookie
+            // fingerprint check already guarantees this transitively
+            // (cipher_suites are part of `ch_fp`), but check explicitly so
+            // a malformed cookie payload can't confuse the suite
+            // selection.
+            if !ch.cipher_suites.contains(&parked_suite.suite) {
+                return Err(Error::IllegalParameter);
+            }
+            let parked_sel_group = if parked_sel_group_id == 0 {
+                None
+            } else {
+                Some(NamedGroup(parked_sel_group_id))
+            };
+
+            // Now bootstrap the per-connection handshake state we
+            // deliberately deferred at CH1 time.
+            self.suite = Some(parked_suite);
+            self.hrr_selected_group = parked_sel_group;
+
+            // Transcript: build `message_hash(CH1) || HRR` synthetically
+            // from the cookie's `Hash(CH1)`. This matches what the
+            // pin-then-replace flow does at CH2, but without ever buffering
+            // CH1 bytes on the server. RFC 8446 §4.4.1 says the post-HRR
+            // transcript starts with the 4-byte message_hash header (type
+            // 254, length = hash output length) followed by Hash(CH1);
+            // `Transcript::update` accepts arbitrary bytes so we feed the
+            // synthetic prefix directly.
+            let mut t = Transcript::new();
+            t.set_alg(parked_suite.hash);
+            let h_len = parked_suite.hash.output_len();
+            let mut synthetic = Vec::with_capacity(4 + h_len);
+            synthetic.push(254); // message_hash
+            synthetic.extend_from_slice(&[0, 0]);
+            synthetic.push(h_len as u8);
+            synthetic.extend_from_slice(parked_hash_ch1);
+            t.update(&synthetic);
+            self.transcript = t;
+
+            // The HRR consumed our msg_seq=0 — bring out_msg_seq up to 1 so
+            // ServerHello goes out at msg_seq=1 below.
+            self.out_msg_seq = 1;
+
+            // Re-derive the HRR bytes (the same bytes we sent at CH1 time)
+            // so we can update the transcript. We use the *explicit*
+            // builder rather than the `self.suite`-reading helper to make
+            // it explicit that the bytes are reconstructed from cookie aux,
+            // not from `self`.
+            let hrr_bytes =
+                Self::build_hrr_bytes_explicit(parked_suite.suite, Some(cookie), parked_sel_group);
             self.transcript.update(&hrr_bytes);
         } else {
             // Cookie-off path: this is CH1 — but we may still need to send a
@@ -1010,6 +1103,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// suite pinned during CH1 processing — HRR commits to a single suite
     /// (RFC 8446 §4.1.4).
     fn build_hrr_bytes(&self, cookie: Option<&[u8]>, group: Option<NamedGroup>) -> Vec<u8> {
+        // HRR is only emitted after `self.suite` is pinned during CH1
+        // processing; fall back to the highest-preference suite if (somehow)
+        // not set — this keeps the call total without taking a Result.
+        let suite_id = self
+            .suite
+            .map(|s| s.suite)
+            .unwrap_or_else(|| supported_suites()[0].suite);
+        Self::build_hrr_bytes_explicit(suite_id, cookie, group)
+    }
+
+    /// Variant of [`Self::build_hrr_bytes`] that takes the suite explicitly,
+    /// without reading `self.suite`. Used by the cookie-required CH1 path,
+    /// which has not yet pinned `self.suite` and instead carries the suite
+    /// inside the cookie's aux payload (DTLS-2: no per-connection state
+    /// pinned before cookie validates).
+    fn build_hrr_bytes_explicit(
+        suite_id: CipherSuite,
+        cookie: Option<&[u8]>,
+        group: Option<NamedGroup>,
+    ) -> Vec<u8> {
         let mut extensions = alloc::vec![ext::server_supported_versions(),];
         if let Some(g) = group {
             // HRR `key_share` body is just a u16 selected_group.
@@ -1024,13 +1137,6 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             v.extend_from_slice(c);
             extensions.push((ExtensionType(EXT_COOKIE), v));
         }
-        // HRR is only emitted after `self.suite` is pinned during CH1
-        // processing; fall back to the highest-preference suite if (somehow)
-        // not set — this keeps the call total without taking a Result.
-        let suite_id = self
-            .suite
-            .map(|s| s.suite)
-            .unwrap_or_else(|| supported_suites()[0].suite);
         ServerHello {
             random: HRR_RANDOM,
             session_id: Vec::new(),
@@ -1056,6 +1162,34 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
         // HRR is plaintext — push directly. We don't track it in the
         // retransmit machine since we'll drop all state if no CH2 arrives.
+        self.out_dgrams.push(dgram);
+        Ok(())
+    }
+
+    /// Stateless variant of [`Self::emit_hello_retry_request`] used by the
+    /// cookie-required CH1 path. Builds the HRR from the explicit
+    /// (`suite_id`, `group`) so we don't have to pin them on `self`
+    /// pre-validation, and emits as DTLS plaintext at message_seq=0. Does
+    /// not advance `self.out_msg_seq`: the next CH (CH2) will re-enter the
+    /// pre-state path, at which point cookie validation succeeds and the
+    /// real handshake state is bootstrapped from the cookie's aux payload.
+    fn emit_hrr_stateless(
+        &mut self,
+        suite_id: CipherSuite,
+        cookie: &[u8],
+        group: Option<NamedGroup>,
+    ) -> Result<(), Error> {
+        let bytes = Self::build_hrr_bytes_explicit(suite_id, Some(cookie), group);
+        let body = &bytes[4..];
+        let mut frag_buf = Vec::new();
+        write_message(
+            &mut frag_buf,
+            hs_type::SERVER_HELLO,
+            0,
+            body,
+            DEFAULT_MAX_FRAGMENT,
+        );
+        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
         self.out_dgrams.push(dgram);
         Ok(())
     }
@@ -1262,6 +1396,55 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             }
             _ => Err(Error::HandshakeFailure),
         }
+    }
+}
+
+/// Builds the canonical CH-content fingerprint that the cookie HMAC binds
+/// to. Covers (cipher_suites, supported_groups, supported_versions,
+/// key_share groups) — every CH field that drives algorithm choice. CH2
+/// must reproduce these byte-for-byte, otherwise cookie validation fails
+/// and the handshake aborts (DTLS-5: cookie binds CH content).
+fn ch_fingerprint_dtls13(ch: &ClientHello) -> Vec<u8> {
+    let mut cs_be = Vec::with_capacity(ch.cipher_suites.len() * 2);
+    for cs in &ch.cipher_suites {
+        cs_be.extend_from_slice(&cs.0.to_be_bytes());
+    }
+    let groups = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS);
+    let versions = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS);
+    // For `key_share`, we only fingerprint the offered groups (the u16
+    // NamedGroup IDs) — the ephemeral key payload legitimately changes
+    // between CH1 and CH2 when the server requests a different group via
+    // HRR, so it must not be in the fingerprint. The offered groups
+    // themselves, however, must stay constant.
+    let ks_groups = ext::find(&ch.extensions, ExtensionType::KEY_SHARE)
+        .and_then(|body| ext::parse_client_key_shares(body).ok())
+        .map(|shares| {
+            let mut out = Vec::with_capacity(shares.len() * 2);
+            for (g, _) in shares {
+                out.extend_from_slice(&g.0.to_be_bytes());
+            }
+            out
+        })
+        .unwrap_or_default();
+    build_ch_fingerprint(&cs_be, groups, versions, &ks_groups)
+}
+
+/// Map [`HashAlg`] to its 1-byte aux tag. Compact, fixed, and reversible
+/// via [`hash_alg_from_byte`].
+fn hash_alg_to_byte(h: HashAlg) -> u8 {
+    match h {
+        HashAlg::Sha256 => 0,
+        HashAlg::Sha384 => 1,
+    }
+}
+
+/// Inverse of [`hash_alg_to_byte`]. `None` indicates a malformed cookie
+/// payload — caller should reject as `IllegalParameter`.
+fn hash_alg_from_byte(b: u8) -> Option<HashAlg> {
+    match b {
+        0 => Some(HashAlg::Sha256),
+        1 => Some(HashAlg::Sha384),
+        _ => None,
     }
 }
 

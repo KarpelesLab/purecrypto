@@ -2816,6 +2816,12 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::DecryptError => AlertDescription::DecryptError,
         Error::CertificateRequired => AlertDescription::CertificateRequired,
         Error::CertificateRevoked | Error::OcspResponseInvalid => AlertDescription::BadCertificate,
+        #[cfg(feature = "ech")]
+        Error::EchDecryptionFailed => AlertDescription::DecryptError,
+        #[cfg(feature = "ech")]
+        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        #[cfg(feature = "cert-compression")]
+        Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
     }
 }
@@ -3016,8 +3022,23 @@ mod tests {
         use crate::tls::ech::outer::{build_outer_ext_body, seal_with};
 
         // Inner CH = RFC 8448's CH (a complete, server-acceptable handshake
-        // message).
-        let inner_ch = from_hex_vec(include_str!("../../../testdata/rfc8448_client_hello.hex"));
+        // message). Splice in the inner-form `encrypted_client_hello`
+        // marker — `require_inner_marker` (TLS-4 hardening) rejects any
+        // decapped inner CH that lacks it.
+        let raw_inner_ch = from_hex_vec(include_str!("../../../testdata/rfc8448_client_hello.hex"));
+        let inner_ch = {
+            use crate::tls::codec::{ClientHello, ExtensionType, hs_type};
+            // Skip the 4-byte handshake header (type + 24-bit length).
+            assert_eq!(raw_inner_ch[0], hs_type::CLIENT_HELLO);
+            let body = &raw_inner_ch[4..];
+            let mut ch = ClientHello::decode(body).expect("decode rfc8448 CH");
+            // Append inner-form ECH extension (ECHClientHelloType inner = 0x01).
+            ch.extensions.push((
+                ExtensionType::ENCRYPTED_CLIENT_HELLO,
+                crate::tls::ech::inner::inner_extension_body(),
+            ));
+            ch.encode()
+        };
 
         // RFC 8448 script: server random || X25519 server private key
         // (used for the inner CH's offered key share).
@@ -3146,5 +3167,33 @@ mod tests {
     #[cfg(feature = "ech")]
     fn ring_to_config_list(config: &crate::tls::ech::EchConfig) -> crate::tls::ech::EchConfigList {
         crate::tls::ech::EchConfigList::new(alloc::vec![config.clone()])
+    }
+
+    /// TLS-4 / TLS-5 regression: confirm that ECH and cert-decompression
+    /// errors map to the alert codes the audit requires —
+    /// `decrypt_error(51)` for crypto failures and
+    /// `illegal_parameter(47)` for structural ECH failures
+    /// (draft-ietf-tls-esni-22 §7.1), and `bad_certificate(42)` for
+    /// failed RFC 8879 cert decompression.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn alert_for_ech_errors_map_to_audit_required_codes() {
+        assert_eq!(
+            alert_for(&Error::EchDecryptionFailed),
+            AlertDescription::DecryptError
+        );
+        assert_eq!(
+            alert_for(&Error::EchDecodeError),
+            AlertDescription::IllegalParameter
+        );
+    }
+
+    #[cfg(feature = "cert-compression")]
+    #[test]
+    fn alert_for_cert_decompression_failure_maps_to_bad_certificate() {
+        assert_eq!(
+            alert_for(&Error::CertDecompressionFailed),
+            AlertDescription::BadCertificate
+        );
     }
 }

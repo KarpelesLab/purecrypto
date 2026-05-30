@@ -437,6 +437,12 @@ pc_status pc_dtls_cfg_set_no_cookie(PcTlsCfg *cfg);
 PcTls *pc_tls_new(const PcTlsCfg *cfg);
 void pc_tls_free(PcTls *tls);
 
+/* Feed wire bytes from the peer into the engine. If `consumed` is non-NULL,
+ * the count of bytes accepted into the engine's input buffer is written
+ * before this call returns — including on the error path (today the engines
+ * buffer eagerly, so on error `*consumed == in_len`). Callers MUST consult
+ * `*consumed` after a non-`Ok` return so they neither re-feed already-
+ * buffered bytes nor lose the still-unbuffered tail. */
 pc_status pc_tls_feed(PcTls *tls, const uint8_t *wire_in, size_t in_len, size_t *consumed);
 pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
 pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);

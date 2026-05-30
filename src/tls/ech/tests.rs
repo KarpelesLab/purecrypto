@@ -446,6 +446,51 @@ fn grease_default_is_well_formed() {
     assert!(matches!(ext, EchExtension::Outer { .. }));
 }
 
+/// TLS-1 regression: distinct per-connection seeds with the same
+/// public CH random MUST produce distinct GREASE payloads. The old
+/// implementation HKDF-expanded only `ch_random` and so let any
+/// observer reconstruct the GREASE bytes byte-for-byte from the
+/// wire CH — defeating the only purpose of GREASE. With a private
+/// seed mixed in as IKM and `ch_random` as salt, two clients on the
+/// same `ch_random` (which an attacker might force in a replay-style
+/// experiment) get completely different GREASE bytes.
+#[test]
+fn grease_from_seed_differs_per_seed_for_same_ch_random() {
+    let params = GreaseParams {
+        cipher_suite: HpkeSymCipherSuite {
+            kdf_id: 0x0001,
+            aead_id: 0x0001,
+        },
+        enc_len: 32,
+        payload_len: 144,
+        config_id_strategy: GreaseConfigIdStrategy::Random,
+    };
+    let ch_random = [0x42u8; 32];
+    let seed_a = [0x01u8; 32];
+    let seed_b = [0x02u8; 32];
+    let a = params.build_extension_from_seed(&seed_a, &ch_random);
+    let b = params.build_extension_from_seed(&seed_b, &ch_random);
+    assert_ne!(a, b, "GREASE must differ across distinct private seeds");
+    // Same seed + same CH random must of course reproduce.
+    let a2 = params.build_extension_from_seed(&seed_a, &ch_random);
+    assert_eq!(a, a2);
+}
+
+/// TLS-1 secondary check: keeping the seed fixed but varying the
+/// CH random still produces uncorrelated GREASE. This is the
+/// expected behaviour anyway (HKDF on different salts), but the
+/// test pins the contract.
+#[test]
+fn grease_from_seed_differs_per_ch_random_for_same_seed() {
+    let params = GreaseParams::default();
+    let seed = [0x77u8; 32];
+    let r1 = [0x11u8; 32];
+    let r2 = [0x99u8; 32];
+    let a = params.build_extension_from_seed(&seed, &r1);
+    let b = params.build_extension_from_seed(&seed, &r2);
+    assert_ne!(a, b);
+}
+
 #[test]
 fn map_sym_suite_resolves_supported_pairs() {
     let kdfs: &[(u16, HpkeKdf)] = &[
@@ -857,6 +902,40 @@ fn build_outer_ch_with_ech(ech_ext_body: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Variant of [`build_inner_ch_marker`] used for negative tests: the
+/// inner CH is otherwise well-formed but does NOT carry the
+/// `encrypted_client_hello` inner-form marker. The decap code MUST
+/// reject this with `EchDecodeError` (which the connection layer maps
+/// to `illegal_parameter(47)`, per draft-ietf-tls-esni-22 §7.1).
+fn build_inner_ch_without_marker() -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.extend_from_slice(&0x0303u16.to_be_bytes());
+    body.extend_from_slice(&[0x55u8; 32]);
+    body.push(0); // sid_len
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&0x1301u16.to_be_bytes());
+    body.push(1);
+    body.push(0);
+    // Empty extensions list — no ECH inner marker. We add an unrelated
+    // benign extension (`server_name` with empty body) so the
+    // extension area parses as a list rather than appearing absent.
+    let mut exts: Vec<u8> = Vec::new();
+    exts.extend_from_slice(&ExtensionType::SERVER_NAME.0.to_be_bytes());
+    exts.extend_from_slice(&0u16.to_be_bytes());
+    let el: u16 = u16::try_from(exts.len()).unwrap();
+    body.extend_from_slice(&el.to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let mut msg: Vec<u8> = Vec::new();
+    msg.push(crate::tls::codec::hs_type::CLIENT_HELLO);
+    let bl_u32 = u32::try_from(body.len()).unwrap();
+    msg.push(((bl_u32 >> 16) & 0xff) as u8);
+    msg.push(((bl_u32 >> 8) & 0xff) as u8);
+    msg.push((bl_u32 & 0xff) as u8);
+    msg.extend_from_slice(&body);
+    msg
+}
+
 /// Build a minimal encoded inner CH for the round-trip test: an
 /// otherwise-empty CH carrying just the inner-form ECH marker so the
 /// server can confirm what it decrypted is an ECH inner.
@@ -1022,6 +1101,52 @@ fn seal_and_decap_round_trip_x25519_aes128gcm() {
     // Decap on the server side and recover the inner CH.
     let recovered = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
     assert_eq!(recovered.inner_ch_bytes, inner);
+}
+
+/// TLS-4 regression: the server-side decap path MUST verify that the
+/// decrypted inner CH carries the inner-form
+/// `encrypted_client_hello` marker (draft-ietf-tls-esni-22 §6.1.1
+/// step 8 — "the client_hello MUST contain an ECH inner extension").
+/// Without this check, a peer who can decap (e.g. via a leaked
+/// private key) could feed back an ECH-shaped outer CH and trick the
+/// server into treating it as inner. We require the marker and
+/// surface `EchDecodeError` (mapped to `illegal_parameter(47)` at the
+/// alert layer).
+#[test]
+fn decap_rejects_inner_ch_without_marker() {
+    let mut rng = drbg(b"decap-no-marker");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+    // Seal an inner CH that omits the inner-form ECH marker.
+    let inner = build_inner_ch_without_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    assert!(matches!(
+        try_decap_inner(&sealed.outer_ch, &ring),
+        Err(Error::EchDecodeError)
+    ));
 }
 
 #[test]

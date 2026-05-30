@@ -406,6 +406,16 @@ impl Certificate {
     /// (big-endian, strict-DER-canonical: at most one leading `0x00` to keep
     /// the value non-negative). Used to compare against CRL `userCertificate`
     /// entries during revocation checks.
+    ///
+    /// RFC 5280 §4.1.2.2 enforcement:
+    /// * the value must be non-negative (handled by
+    ///   [`Reader::read_unsigned_integer_bytes`], which rejects two's-
+    ///   complement negatives at the DER layer);
+    /// * the magnitude must fit in 20 octets — i.e. at most 20 value bytes,
+    ///   plus an optional leading `0x00` sign byte when the high bit of the
+    ///   first magnitude byte is set. CAs that issue 21+ octet serials are
+    ///   non-conformant and have been used in past trust-store confusion
+    ///   attacks to collide with shorter serials in CRL/OCSP comparisons.
     #[allow(dead_code)]
     pub(crate) fn serial_bytes(&self) -> Result<&[u8], Error> {
         let tbs = self.parts()?.tbs;
@@ -414,7 +424,18 @@ impl Certificate {
         if seq.peek_tag() == Some(tag::context(0)) {
             seq.read_tlv(tag::context(0))?; // version
         }
-        Ok(seq.read_unsigned_integer_bytes()?)
+        let body = seq.read_unsigned_integer_bytes()?;
+        // Strip an optional leading 0x00 sign byte (present iff the next
+        // byte's high bit is set; strict-DER guarantees no other leading
+        // 0x00). The remaining "magnitude" bytes must be ≤ 20.
+        let magnitude_len = match body {
+            [0x00, rest @ ..] if !rest.is_empty() => rest.len(),
+            other => other.len(),
+        };
+        if magnitude_len > 20 {
+            return Err(Error::Malformed);
+        }
+        Ok(body)
     }
 
     /// Returns the DER bytes of the inner `signature` AlgorithmIdentifier
@@ -762,6 +783,32 @@ impl Certificate {
         &self,
         mut f: impl FnMut(&[u64], bool, &[u8]) -> Result<(), Error>,
     ) -> Result<(), Error> {
+        // RFC 5280 §4.1.2.1: the extensions field MUST only be present when
+        // version is v3 (`INTEGER 2`). Re-parse the version field from the
+        // raw TBSCertificate so we can enforce this constraint regardless
+        // of what `tbs_after_algid` chose to skip.
+        let tbs_bytes = self.parts()?.tbs;
+        let version = {
+            let mut outer = Reader::new(tbs_bytes);
+            let mut seq = outer.read_sequence()?;
+            if seq.peek_tag() == Some(tag::context(0)) {
+                let body = seq.read_tlv(tag::context(0))?;
+                let mut vr = Reader::new(body);
+                let v = vr.read_integer_bytes()?;
+                vr.finish()?;
+                // INTEGER 0 ⇒ v1, INTEGER 1 ⇒ v2, INTEGER 2 ⇒ v3.
+                match v {
+                    [0] => 1u8,
+                    [1] => 2u8,
+                    [2] => 3u8,
+                    _ => return Err(Error::Malformed),
+                }
+            } else {
+                // Default is v1 when the version field is absent.
+                1u8
+            }
+        };
+
         let mut seq = self.tbs_after_algid()?;
         DistinguishedName::decode(&mut seq)?; // issuer
         Validity::decode(&mut seq)?; // validity
@@ -769,7 +816,10 @@ impl Certificate {
         seq.read_element()?; // subjectPublicKeyInfo
 
         // Skip the optional issuerUniqueID [1] and subjectUniqueID [2]
-        // (IMPLICIT primitive context tags 0x81 / 0x82).
+        // (IMPLICIT primitive context tags 0x81 / 0x82). RFC 5280 §4.1.2.8
+        // permits these in v2 / v3 only — a v1 cert carrying them is
+        // malformed, and we will reject any v1/v2 cert that exposes an
+        // extensions block below anyway.
         while matches!(seq.peek_tag(), Some(0x81) | Some(0x82)) {
             seq.read_element()?;
         }
@@ -777,13 +827,33 @@ impl Certificate {
         if seq.peek_tag() != Some(tag::context(3)) {
             return Ok(());
         }
+        // RFC 5280 §4.1.2.1: extensions MUST only appear in v3 certificates.
+        // Reject any v1 / v2 certificate that carries an `[3] extensions`
+        // block — historically a downgrade vector when a verifier was
+        // lulled into reading critical extensions (basicConstraints,
+        // keyUsage, …) from a cert it then treated as pre-v3 and so
+        // exempted from extension-driven policy.
+        if version < 3 {
+            return Err(Error::Malformed);
+        }
         let wrapper = seq.read_tlv(tag::context(3))?;
         let mut outer = Reader::new(wrapper);
         let mut exts = outer.read_sequence()?;
 
+        // RFC 5280 §4.2: "A certificate MUST NOT include more than one
+        // instance of a particular extension." Track seen OIDs and reject
+        // a duplicate at the first repetition. Without this check, two
+        // parsers that disagree on which copy wins (the first or the last)
+        // can be steered to opposite policy decisions on the same cert —
+        // the classic CVE-2014-1568 / CVE-2020-0601 shape.
+        let mut seen: Vec<Vec<u64>> = Vec::new();
         while !exts.is_empty() {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
+            if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+                return Err(Error::Malformed);
+            }
+            seen.push(id.clone());
             let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
                 ext.read_boolean()?
             } else {
@@ -1607,5 +1677,204 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         perm.extend_from_slice(&subtree);
         let body = encode_sequence(&perm);
         assert!(super::parse_name_constraints(&body).is_err());
+    }
+
+    /// Forges a TBSCertificate with a caller-controlled `version` tag and an
+    /// `[3] EXPLICIT extensions` block, signs it with the issuer key, and
+    /// returns the resulting [`Certificate`]. Used by the v1/v2-extensions
+    /// regression tests below.
+    fn forge_cert_with_version_and_exts(version: u8, exts: &[Extension]) -> Certificate {
+        use crate::der::{encode_bit_string, encode_context, encode_integer, encode_sequence};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("forged");
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let spki = rsa_spki(&key.public_key());
+        let mut body = alloc::vec::Vec::new();
+        // version [0] EXPLICIT INTEGER. Only emit when caller asks for a non-default
+        // version; a missing version tag means v1 per RFC 5280.
+        body.extend_from_slice(&encode_context(0, &encode_integer(&[version])));
+        body.extend_from_slice(&encode_integer(&1u64.to_be_bytes()));
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        // Bypass the legitimate v3-only builder: encode the `[3] extensions`
+        // block directly so the cert can carry extensions regardless of the
+        // version field. This is the exact non-conformant shape the parser
+        // must reject.
+        body.extend_from_slice(&extension::encode_extensions_field(exts));
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        Certificate { der }
+    }
+
+    // X509-1: RFC 5280 §4.1.2.1 forbids the `[3] extensions` field on v1
+    // (version INTEGER 0) and v2 (version INTEGER 1) certificates. Two parsers
+    // that disagree on whether to read those extensions for policy can be
+    // steered to opposite trust decisions; reject the malformed shape outright.
+    #[test]
+    fn v1_cert_with_extensions_is_rejected() {
+        let ext = extension::basic_constraints(true, None);
+        let cert = forge_cert_with_version_and_exts(0, &[ext]);
+        // Every accessor that goes through `walk_extensions` must reject.
+        assert!(matches!(cert.subject_alt_names(), Err(Error::Malformed)));
+        assert!(matches!(cert.basic_constraints(), Err(Error::Malformed)));
+        assert!(matches!(cert.extensions(), Err(Error::Malformed)));
+        assert!(matches!(cert.check_well_formed(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn v2_cert_with_extensions_is_rejected() {
+        let ext = extension::basic_constraints(false, None);
+        let cert = forge_cert_with_version_and_exts(1, &[ext]);
+        assert!(matches!(cert.subject_alt_names(), Err(Error::Malformed)));
+        assert!(matches!(cert.basic_constraints(), Err(Error::Malformed)));
+        assert!(matches!(cert.extensions(), Err(Error::Malformed)));
+        assert!(matches!(cert.check_well_formed(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn v3_cert_with_extensions_is_accepted() {
+        // Same forge path, but with the version tag set to 2 (v3); this must
+        // succeed so the prior two tests are not spuriously passing because
+        // of an unrelated parse failure.
+        let ext = extension::basic_constraints(true, None);
+        let cert = forge_cert_with_version_and_exts(2, &[ext]);
+        cert.check_well_formed().unwrap();
+        let bc = cert.basic_constraints().unwrap().unwrap();
+        assert_eq!(bc, (true, None));
+    }
+
+    // X509-2: RFC 5280 §4.1.2.2 — serial magnitude must fit in 20 octets.
+    // Build a TBSCertificate with a 21-octet INTEGER body and confirm
+    // `serial_bytes` rejects it. Negative serials are already rejected at the
+    // DER layer by `Reader::read_unsigned_integer_bytes`, but exercise that
+    // path here too so the check stays exercised.
+    #[test]
+    fn serial_with_21_octet_magnitude_is_rejected() {
+        use crate::der::{encode_bit_string, encode_context, encode_integer, encode_sequence};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("serial-test");
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let spki = rsa_spki(&key.public_key());
+
+        // 21 magnitude bytes all = 0x01: high bit clear so no sign-byte pad
+        // is added by encode_integer; the INTEGER body itself is 21 bytes.
+        let serial_body = [0x01u8; 21];
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&encode_context(0, &encode_integer(&[2])));
+        body.extend_from_slice(&encode_integer(&serial_body));
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        body.extend_from_slice(&extension::encode_extensions_field(&[
+            extension::basic_constraints(false, None),
+        ]));
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        let cert = Certificate { der };
+        assert!(matches!(cert.serial_bytes(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn serial_with_20_octet_magnitude_and_leading_zero_is_accepted() {
+        use crate::der::{encode_bit_string, encode_context, encode_integer, encode_sequence};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("serial-test");
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let spki = rsa_spki(&key.public_key());
+
+        // 20 magnitude bytes with the high bit set on the first; encode_integer
+        // will prepend a 0x00 sign byte → 21-byte INTEGER body, of which 20 are
+        // magnitude. RFC 5280 permits this.
+        let mut serial_body = [0xCCu8; 20];
+        serial_body[0] = 0x80;
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&encode_context(0, &encode_integer(&[2])));
+        body.extend_from_slice(&encode_integer(&serial_body));
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        body.extend_from_slice(&extension::encode_extensions_field(&[
+            extension::basic_constraints(false, None),
+        ]));
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        let cert = Certificate { der };
+        let bytes = cert.serial_bytes().unwrap();
+        // The returned body still includes the leading 0x00 sign byte.
+        assert_eq!(bytes.len(), 21);
+        assert_eq!(bytes[0], 0x00);
+        assert_eq!(bytes[1], 0x80);
+    }
+
+    #[test]
+    fn negative_serial_is_rejected() {
+        use crate::der::{encode_bit_string, encode_context, encode_sequence, encode_tlv, tag};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("neg-serial");
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let spki = rsa_spki(&key.public_key());
+
+        // Forge a negative INTEGER serial (high bit set, no leading 0x00).
+        // `Reader::read_unsigned_integer_bytes` (called from `serial_bytes`)
+        // must reject this as malformed per X.690.
+        let neg = encode_tlv(tag::INTEGER, &[0xFF, 0x42]);
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&encode_context(0, &crate::der::encode_integer(&[2])));
+        body.extend_from_slice(&neg);
+        body.extend_from_slice(&algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        body.extend_from_slice(&extension::encode_extensions_field(&[
+            extension::basic_constraints(false, None),
+        ]));
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+        let cert = Certificate { der };
+        assert!(cert.serial_bytes().is_err());
+    }
+
+    // X509-3: RFC 5280 §4.2 — at most one occurrence of any extension OID.
+    // Forge a TBSCertificate carrying two basicConstraints extensions and
+    // confirm every extension-walking accessor returns `Error::Malformed`.
+    #[test]
+    fn duplicate_extension_oid_is_rejected() {
+        let dup_a = extension::basic_constraints(true, Some(0));
+        let dup_b = extension::basic_constraints(false, None);
+        // Version 2 (=v3) so the version check is satisfied and the duplicate
+        // detection (not the version gate) is what fires.
+        let cert = forge_cert_with_version_and_exts(2, &[dup_a, dup_b]);
+        assert!(matches!(cert.basic_constraints(), Err(Error::Malformed)));
+        assert!(matches!(cert.subject_alt_names(), Err(Error::Malformed)));
+        assert!(matches!(cert.extensions(), Err(Error::Malformed)));
+        assert!(matches!(cert.check_well_formed(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn distinct_extensions_are_accepted() {
+        use crate::x509::extension::KeyUsageBits;
+        let exts = [
+            extension::basic_constraints(true, Some(0)),
+            extension::key_usage(KeyUsageBits::KEY_CERT_SIGN),
+        ];
+        let cert = forge_cert_with_version_and_exts(2, &exts);
+        cert.check_well_formed().unwrap();
+        assert_eq!(cert.extensions().unwrap().len(), 2);
     }
 }
