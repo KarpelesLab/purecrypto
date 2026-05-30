@@ -225,18 +225,26 @@ impl LossState {
 
         // Collect newly-acked packets (drained out of sent_packets) per
         // §A.7 "DetectAndRemoveAckedPackets".
+        //
+        // Iterate sparsely over only the packet numbers actually in flight
+        // that fall within each acknowledged range, rather than walking the
+        // range densely. The peer-controlled ranges can span up to the full
+        // 62-bit packet-number space, so a dense `pn..=end` walk would let a
+        // single forged ACK pin the CPU for an unbounded time (a
+        // CPU-exhaustion DoS). `BTreeMap::range` bounds the work by the number
+        // of packets we are tracking, not by the width of the range, and is
+        // behaviourally identical for legitimate ACKs.
         let ps = &mut self.per_space[space as usize];
         for r in acked_ranges {
-            let mut pn = *r.start();
-            let end = *r.end();
-            while pn <= end {
+            let pns: Vec<u64> = ps
+                .sent_packets
+                .range(*r.start()..=*r.end())
+                .map(|(k, _)| *k)
+                .collect();
+            for pn in pns {
                 if let Some(p) = ps.sent_packets.remove(&pn) {
                     newly_acked.push(p);
                 }
-                if pn == u64::MAX {
-                    break;
-                }
-                pn += 1;
             }
         }
 

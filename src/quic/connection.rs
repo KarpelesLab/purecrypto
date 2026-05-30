@@ -2580,6 +2580,30 @@ impl QuicConnection {
                     let ack_delay_us = ack_delay.checked_shl(exp).unwrap_or(u64::MAX);
                     let ack_delay_dur = Duration::from_micros(ack_delay_us);
 
+                    // RFC 9000 §13.1: a peer MUST NOT acknowledge a packet
+                    // number we never sent. The reconstructed `acked_ranges`
+                    // are derived entirely from the peer-controlled `largest`
+                    // / `first_range` / gap fields, so without this bound an
+                    // attacker who gets a single packet decrypted can claim an
+                    // enormous `largest` (up to 2^62-1) and force the loss
+                    // detector to attempt to acknowledge packet numbers far
+                    // above anything we transmitted. We reject any ACK whose
+                    // largest acknowledged PN exceeds the highest PN we have
+                    // sent in this space (or any ACK at all if we have sent
+                    // nothing in it). `next_tx` is the next PN to be assigned,
+                    // so the highest sent is `next_tx - 1`. The
+                    // IllegalParameter mapping surfaces as PROTOCOL_VIOLATION
+                    // on the wire.
+                    let next_tx = match level {
+                        Level::Initial => self.endpoint.pn.initial.next_tx,
+                        Level::Handshake => self.endpoint.pn.handshake.next_tx,
+                        _ => self.endpoint.pn.application.next_tx,
+                    };
+                    match next_tx.checked_sub(1) {
+                        Some(highest_sent) if largest <= highest_sent => {}
+                        _ => return Err(Error::IllegalParameter),
+                    }
+
                     let now = self.now_since_start();
                     let space_id = pn_space_of_level(level);
                     // 3. Feed to loss state.
