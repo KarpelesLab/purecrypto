@@ -525,6 +525,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
     if let Some(g) = cfg.preferred_key_exchange_group {
         sc = sc.with_preferred_key_exchange_group(g);
     }
+    if let Some(t) = cfg.verification_time.clone() {
+        sc = sc.with_verification_time(t);
+    }
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
 }
@@ -555,6 +558,9 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
         sc = sc.with_stapled_ocsp_response(ocsp);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    if let Some(t) = cfg.verification_time.clone() {
+        sc = sc.with_verification_time(t);
+    }
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection12::new(sc, OsRng))
 }
