@@ -33,7 +33,9 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
+use super::reassembly::{
+    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_message,
+};
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, Retransmit};
 use super::replay::AntiReplayWindow;
@@ -489,6 +491,15 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// Parses one ClientHello body (DTLS wire format) and either issues
     /// HelloVerifyRequest or transitions to the server-flight path.
     fn handle_pre_state_client_hello(&mut self, msg_seq: u16, body: &[u8]) -> Result<(), Error> {
+        // F3: bound the client-supplied `message_seq` before the reassembler
+        // seeding loop below (`for s in 0..=msg_seq`). `message_seq` is not
+        // covered by the cookie fingerprint, so even a client that completes
+        // the HelloVerifyRequest roundtrip can drive this loop; an oversized
+        // value would otherwise mean tens of thousands of synthetic-message
+        // allocate/serialize/parse/feed cycles.
+        if msg_seq > MAX_HS_MSG_SEQ {
+            return Err(Error::IllegalParameter);
+        }
         // Decode the DTLS-flavoured ClientHello body.
         let parsed = parse_dtls_client_hello(body)?;
 
@@ -1075,5 +1086,116 @@ fn sig_kind_for_key(key: &ServerKey) -> SigKind {
         // are unreachable through the public DTLS-1.2 constructors. Default
         // to a kind that will fail to match any of our suites.
         _ => SigKind::Rsa,
+    }
+}
+
+#[cfg(test)]
+mod f3_msg_seq_tests {
+    //! F3 regression: the DTLS 1.2 server must reject a ClientHello whose
+    //! `message_seq` is implausibly large before the reassembler-seeding loop
+    //! (`for s in 0..=msg_seq`). `message_seq` is not bound by the cookie
+    //! fingerprint, so a client that completed the HelloVerifyRequest
+    //! roundtrip could otherwise still drive tens of thousands of cycles.
+    use super::*;
+    use crate::dtls::{ClientConfig12Internal, DtlsClientConnection12, DtlsServerConnection12};
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::tls::pki::RootCertStore;
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    fn make_server_cfg() -> (ServerConfig12Internal, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"f3-dtls12-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            ServerConfig12Internal::with_ecdsa(alloc::vec![der.clone()], key)
+                .require_cookie_exchange(false),
+            der,
+        )
+    }
+
+    fn make_client(server_cert: &[u8]) -> DtlsClientConnection12 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        let cfg = ClientConfig12Internal::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"f3-dtls12-client", b"nonce", &[]);
+        DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    fn client_hello_datagram() -> Vec<u8> {
+        let (_, cert) = make_server_cfg();
+        let mut client = make_client(&cert);
+        let mut out = client.pop_outbound_datagrams();
+        out.remove(0)
+    }
+
+    fn new_server() -> DtlsServerConnection12<HmacDrbg<Sha256>> {
+        let (cfg, _) = make_server_cfg();
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls12-server", b"nonce", &[]);
+        DtlsServerConnection12::new(Arc::new(cfg), b"client-addr".to_vec(), srng)
+    }
+
+    /// Patch the 16-bit `message_seq` of the first handshake fragment. Record
+    /// header is 13 bytes; `message_seq` sits 4 bytes into the fragment.
+    fn patch_message_seq(dgram: &mut [u8], seq: u16) {
+        const MSG_SEQ_OFF: usize = 13 + 4;
+        dgram[MSG_SEQ_OFF] = (seq >> 8) as u8;
+        dgram[MSG_SEQ_OFF + 1] = seq as u8;
+    }
+
+    #[test]
+    fn oversized_message_seq_is_rejected_without_giant_loop() {
+        let mut dgram = client_hello_datagram();
+        patch_message_seq(&mut dgram, 0xFFFF);
+        let mut server = new_server();
+        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+        assert!(server.pop_outbound_datagrams().is_empty());
+    }
+
+    #[test]
+    fn message_seq_just_above_cap_is_rejected() {
+        let mut dgram = client_hello_datagram();
+        patch_message_seq(&mut dgram, MAX_HS_MSG_SEQ + 1);
+        let mut server = new_server();
+        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+    }
+
+    #[test]
+    fn legitimate_message_seq_zero_is_accepted() {
+        let (cfg, cert) = make_server_cfg();
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls12-ok", b"nonce", &[]);
+        let mut server = DtlsServerConnection12::new(Arc::new(cfg), b"client-addr".to_vec(), srng);
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        assert!(server.is_handshake_complete());
+        assert!(client.is_handshake_complete());
     }
 }

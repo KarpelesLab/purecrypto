@@ -36,6 +36,17 @@ use alloc::vec::Vec;
 /// Fixed DTLS handshake header length: 12 bytes.
 pub(crate) const HEADER_LEN: usize = 12;
 
+/// Upper bound on a peer-supplied `message_seq` the server is willing to
+/// "catch up" to when seeding a reassembler from a ClientHello. The DTLS
+/// `message_seq` field is 16-bit, but a legitimate first/second ClientHello
+/// only ever uses seq 0 (no HRR) or 1 (after a cookie-HRR or group-HRR).
+/// Allowing an arbitrary value lets an attacker — even on the pre-cookie,
+/// epoch-0, unauthenticated path — force up to 65 535 allocate/serialize/
+/// parse/feed cycles per record (a CPU/allocation DoS). Cap it well above
+/// any legitimate value but far below the 16-bit ceiling. Mirrors the spirit
+/// of `MAX_IN_PROGRESS`.
+pub(crate) const MAX_HS_MSG_SEQ: u16 = 8;
+
 /// One incoming handshake fragment, borrowed from the record fragment.
 pub(crate) struct HandshakeFragment<'a> {
     pub(crate) msg_type: u8,

@@ -52,7 +52,9 @@ use super::client13::{
     decrypt_dtls13_record, derive_sn_key, encrypt_dtls13_record, sn_key_len_for,
 };
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
+use super::reassembly::{
+    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_message,
+};
 use super::record::{self, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
@@ -505,6 +507,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     return Err(Error::UnexpectedMessage);
                 }
                 let msg_seq = frag.message_seq;
+                // F3: reject an implausibly large `message_seq` BEFORE seeding
+                // the reassembler. This is the pre-cookie, epoch-0,
+                // unauthenticated path — a hostile ClientHello with
+                // message_seq=0xFFFF would otherwise force up to 65 535
+                // allocate/serialize/parse/feed cycles below.
+                if msg_seq > MAX_HS_MSG_SEQ {
+                    return Err(Error::IllegalParameter);
+                }
                 let f = HandshakeFragment {
                     msg_type: frag.msg_type,
                     total_length: frag.total_length,
@@ -582,6 +592,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
     /// Handle a fresh CH (no reassembler state).
     fn handle_pre_state_client_hello(&mut self, msg_seq: u16, body: &[u8]) -> Result<(), Error> {
+        // F3: bound the client-supplied `message_seq` before the reassembler
+        // seeding loop below (`for s in 0..=msg_seq`). `message_seq` is not
+        // covered by the cookie fingerprint, so even a client that completes
+        // the address-ownership roundtrip can drive this loop; an oversized
+        // value would otherwise mean tens of thousands of synthetic-message
+        // allocate/serialize/parse/feed cycles.
+        if msg_seq > MAX_HS_MSG_SEQ {
+            return Err(Error::IllegalParameter);
+        }
         let ch = ClientHello::decode(body)?;
         // Fail closed: a server that asks for cookie enforcement but never
         // supplied a `cookie_secret` MUST NOT silently degrade to the
@@ -1480,4 +1499,124 @@ fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Error> {
         out.push(NamedGroup(c.u16()?));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod f3_msg_seq_tests {
+    //! F3 regression: the DTLS 1.3 server must reject a ClientHello whose
+    //! plaintext, epoch-0 `message_seq` is implausibly large BEFORE seeding a
+    //! reassembler from it. An attacker setting `message_seq = 0xFFFF` would
+    //! otherwise force up to 65 535 allocate/serialize/parse/feed cycles on
+    //! the unauthenticated, pre-cookie path.
+    use super::*;
+    use crate::dtls::{DtlsClientConnection13, DtlsServerConnection13};
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::tls::pki::RootCertStore;
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    fn make_server_cfg() -> (ServerConfig13Internal, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"f3-dtls13-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            ServerConfig13Internal::with_ecdsa(alloc::vec![der.clone()], key).with_no_cookie(),
+            der,
+        )
+    }
+
+    fn make_client(server_cert: &[u8]) -> DtlsClientConnection13 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        let cfg = crate::dtls::ClientConfig13Internal::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"f3-dtls13-client", b"nonce", &[]);
+        DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    /// Capture a genuine first-flight ClientHello datagram from the real
+    /// client. The first plaintext handshake record carries the CH.
+    fn client_hello_datagram() -> Vec<u8> {
+        let (_, cert) = make_server_cfg();
+        let mut client = make_client(&cert);
+        let mut out = client.pop_outbound_datagrams();
+        out.remove(0)
+    }
+
+    fn new_server() -> DtlsServerConnection13<HmacDrbg<Sha256>> {
+        let (cfg, _) = make_server_cfg();
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls13-server", b"nonce", &[]);
+        DtlsServerConnection13::new(alloc::sync::Arc::new(cfg), b"client-addr".to_vec(), srng)
+    }
+
+    /// Patch the 16-bit `message_seq` of the first handshake fragment inside a
+    /// plaintext DTLS record. Record header is 13 bytes; the handshake header
+    /// `message_seq` field sits 4 bytes into the fragment (after msg_type[1] +
+    /// length[3]).
+    fn patch_message_seq(dgram: &mut [u8], seq: u16) {
+        const MSG_SEQ_OFF: usize = 13 + 4;
+        dgram[MSG_SEQ_OFF] = (seq >> 8) as u8;
+        dgram[MSG_SEQ_OFF + 1] = seq as u8;
+    }
+
+    #[test]
+    fn oversized_message_seq_is_rejected_without_giant_loop() {
+        let mut dgram = client_hello_datagram();
+        // A legitimate first CH uses message_seq 0; force the maximum.
+        patch_message_seq(&mut dgram, 0xFFFF);
+        let mut server = new_server();
+        let res = server.feed_datagram(&dgram);
+        assert_eq!(res, Err(Error::IllegalParameter));
+        // No server flight may have been emitted for the rejected CH.
+        assert!(server.pop_outbound_datagrams().is_empty());
+    }
+
+    #[test]
+    fn message_seq_just_above_cap_is_rejected() {
+        let mut dgram = client_hello_datagram();
+        patch_message_seq(&mut dgram, MAX_HS_MSG_SEQ + 1);
+        let mut server = new_server();
+        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+    }
+
+    #[test]
+    fn legitimate_message_seq_zero_is_accepted() {
+        // Unmodified CH (message_seq = 0) must NOT trip the F3 guard; it
+        // drives a normal handshake to completion.
+        let (cfg, cert) = make_server_cfg();
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls13-ok", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(alloc::sync::Arc::new(cfg), b"client-addr".to_vec(), srng);
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        assert!(server.is_handshake_complete());
+        assert!(client.is_handshake_complete());
+    }
 }
