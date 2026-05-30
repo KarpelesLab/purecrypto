@@ -266,6 +266,30 @@ pub(crate) fn parse_hex_flag(value: &str, flag: &str) -> Vec<u8> {
     from_hex(value).unwrap_or_else(|| die(format!("invalid hex value for {flag}: {value}")))
 }
 
+/// Best-effort overwrite of `buf` with zeros, mirroring
+/// `src/hash/zeroize.rs::zero_bytes`. Used after parsing a hex-encoded secret
+/// off argv (or out of a file) into a `Vec<u8>` we no longer need — the
+/// `Vec`'s heap allocation is dropped immediately after, but at least the
+/// bytes are wiped before the allocator can hand the chunk back out.
+pub(crate) fn zero_buf(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
+}
+
+/// Reads raw bytes from `path` (no hex decoding). Use this for `-*file`
+/// flags that carry secret material — the caller is responsible for
+/// [`zero_buf`]-ing the result once it's no longer needed.
+///
+/// Also runs the same group/world-readable warning that
+/// [`warn_if_world_readable_key`] does, since key/AAD files are exactly the
+/// kind of thing that should not be `0o644`.
+pub(crate) fn read_secret_file(path: &str) -> Vec<u8> {
+    warn_if_world_readable_key(path);
+    std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")))
+}
+
 /// Parses a positive integer from a CLI flag.
 pub(crate) fn parse_u32_flag(value: &str, flag: &str) -> u32 {
     value

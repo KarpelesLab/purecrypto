@@ -1683,6 +1683,180 @@ fn enc_chacha20_poly1305_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `-keyfile` reads raw key bytes from disk (no hex decoding) and is the
+/// argv-safe alternative to `-key HEX`. `-aadfile` is the matching form
+/// for AAD. Both must round-trip an AEAD ciphertext just like the argv
+/// forms do.
+#[test]
+fn enc_keyfile_and_aadfile_roundtrip() {
+    let dir = std::env::temp_dir().join(format!("pc_enc_keyfile_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), b"keyfile + aadfile").unwrap();
+
+    // 32-byte raw key + 4-byte raw AAD — written as binary, NOT hex.
+    let key_bytes: Vec<u8> = (0..32u8).collect();
+    let aad_bytes: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
+    std::fs::write(dir.join("key.bin"), &key_bytes).unwrap();
+    std::fs::write(dir.join("aad.bin"), &aad_bytes).unwrap();
+    let nonce = "010203040506070809101112";
+
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "CHACHA20-POLY1305",
+                "-keyfile",
+                &p("key.bin"),
+                "-nonce",
+                nonce,
+                "-aadfile",
+                &p("aad.bin"),
+                "-in",
+                &p("pt.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                "CHACHA20-POLY1305",
+                "-d",
+                "-keyfile",
+                &p("key.bin"),
+                "-nonce",
+                nonce,
+                "-aadfile",
+                &p("aad.bin"),
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, b"keyfile + aadfile");
+
+    // Cross-decrypt: encrypted with -keyfile, decrypted with the equivalent
+    // -key HEX (and vice-versa for -aad). Confirms file bytes are interpreted
+    // raw, not as a hex string.
+    let key_hex: String = key_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let aad_hex: String = aad_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let (_o, _e, ok) = run_capture(
+        &[
+            "enc",
+            "-alg",
+            "CHACHA20-POLY1305",
+            "-d",
+            "-key",
+            &key_hex,
+            "-nonce",
+            nonce,
+            "-aad",
+            &aad_hex,
+            "-in",
+            &p("ct.bin"),
+            "-out",
+            &p("rt2.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert_eq!(
+        std::fs::read(dir.join("rt2.bin")).unwrap(),
+        b"keyfile + aadfile"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Using `-key HEX` or `-aad HEX` must emit a stderr deprecation warning,
+/// pointing the caller at the argv-safe `-keyfile` / `-aadfile` flags.
+#[test]
+fn enc_key_and_aad_argv_warn() {
+    let dir = std::env::temp_dir().join(format!("pc_enc_warn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), b"argv warning").unwrap();
+
+    let key = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    let nonce = "010203040506070809101112";
+    let (_out, err, ok) = run_capture(
+        &[
+            "enc",
+            "-alg",
+            "CHACHA20-POLY1305",
+            "-key",
+            key,
+            "-nonce",
+            nonce,
+            "-aad",
+            "deadbeef",
+            "-in",
+            &p("pt.bin"),
+            "-out",
+            &p("ct.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert!(
+        err.contains("-key HEX exposes"),
+        "expected -key argv warning, got stderr: {err}"
+    );
+    assert!(
+        err.contains("-aad HEX exposes"),
+        "expected -aad argv warning, got stderr: {err}"
+    );
+
+    // And -keyfile / -aadfile must NOT emit the warning.
+    let key_bytes: Vec<u8> = (0..32u8).collect();
+    std::fs::write(dir.join("key.bin"), &key_bytes).unwrap();
+    // 0o600 so warn_if_world_readable_key stays quiet.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(dir.join("key.bin"))
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(dir.join("key.bin"), perms).unwrap();
+    }
+    let (_out, err2, ok2) = run_capture(
+        &[
+            "enc",
+            "-alg",
+            "CHACHA20-POLY1305",
+            "-keyfile",
+            &p("key.bin"),
+            "-nonce",
+            nonce,
+            "-in",
+            &p("pt.bin"),
+            "-out",
+            &p("ct2.bin"),
+        ],
+        b"",
+    );
+    assert!(ok2);
+    assert!(
+        !err2.contains("exposes"),
+        "expected no argv warning when using -keyfile, got stderr: {err2}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 // ---- KEM / KEX / pkeyutl / CRL subcommand tests (Phase 2) ----
 
 #[test]

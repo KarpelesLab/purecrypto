@@ -1,6 +1,13 @@
 //! `purecrypto enc` — AEAD encryption / decryption and AES-KW/KWP key wrapping.
+//!
+//! Key/AAD material can be supplied either as hex on argv (`-key HEX`,
+//! `-aad HEX`) or as the raw contents of a file (`-keyfile FILE`,
+//! `-aadfile FILE`). The argv forms still work for backwards compatibility
+//! but emit a warning to stderr, since they leak to `/proc/<pid>/cmdline`.
 
-use crate::util::{Args, die, parse_hex_flag, read_input, write_output};
+use crate::util::{
+    Args, die, parse_hex_flag, read_input, read_secret_file, write_output, zero_buf,
+};
 use purecrypto::cipher::{
     Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256, Aes256Ccm, Aes256Ccm8,
     Aes256Gcm, Aes256Kw, Aes256Kwp, ChaCha20Poly1305,
@@ -263,11 +270,21 @@ pub(crate) fn run(args: Args) {
         .unwrap_or_else(|| die("missing -alg (e.g. AES-256-GCM, CHACHA20-POLY1305, AES-256-KW)"));
     let alg = parse_alg(alg_name).unwrap_or_else(|| die(format!("unknown -alg: {alg_name}")));
 
-    let key = args
-        .value("-key")
-        .map(|h| parse_hex_flag(h, "-key"))
-        .unwrap_or_else(|| die("missing -key HEX"));
+    // Key: prefer `-keyfile FILE` (raw bytes), fall back to `-key HEX` with a
+    // deprecation warning since argv is world-readable via /proc/<pid>/cmdline.
+    let mut key = if let Some(hex) = args.value("-key").or_else(|| args.value("--key")) {
+        eprintln!(
+            "purecrypto: warning: -key HEX exposes the key via /proc/<pid>/cmdline; \
+             prefer -keyfile FILE (raw bytes)"
+        );
+        parse_hex_flag(hex, "-key")
+    } else if let Some(path) = args.value("-keyfile").or_else(|| args.value("--keyfile")) {
+        read_secret_file(path)
+    } else {
+        die("missing -key HEX or -keyfile FILE (raw bytes)");
+    };
     if key.len() != key_size(alg) {
+        zero_buf(&mut key);
         die(format!(
             "wrong key length for {alg_name}: expected {} bytes, got {}",
             key_size(alg),
@@ -279,10 +296,19 @@ pub(crate) fn run(args: Args) {
     let input = read_input(in_path);
     let dest = args.value("-out").or_else(|| args.value("--out"));
     let decrypt = args.flag("-d") || args.flag("--decrypt");
-    let aad = args
-        .value("-aad")
-        .map(|h| parse_hex_flag(h, "-aad"))
-        .unwrap_or_default();
+    // AAD: same convention as the key — `-aadfile FILE` is preferred over the
+    // argv `-aad HEX` form.
+    let aad = if let Some(hex) = args.value("-aad").or_else(|| args.value("--aad")) {
+        eprintln!(
+            "purecrypto: warning: -aad HEX exposes the AAD via /proc/<pid>/cmdline; \
+             prefer -aadfile FILE (raw bytes)"
+        );
+        parse_hex_flag(hex, "-aad")
+    } else if let Some(path) = args.value("-aadfile").or_else(|| args.value("--aadfile")) {
+        read_secret_file(path)
+    } else {
+        Vec::new()
+    };
 
     let result = match alg {
         Algo::Aes128Kw | Algo::Aes256Kw | Algo::Aes128Kwp | Algo::Aes256Kwp => {
@@ -297,7 +323,10 @@ pub(crate) fn run(args: Args) {
                 .value("-nonce")
                 .or_else(|| args.value("--iv"))
                 .map(|h| parse_hex_flag(h, "-nonce"))
-                .unwrap_or_else(|| die("missing -nonce HEX (12 bytes for GCM/ChaCha20-Poly1305)"));
+                .unwrap_or_else(|| {
+                    zero_buf(&mut key);
+                    die("missing -nonce HEX (12 bytes for GCM/ChaCha20-Poly1305)")
+                });
             if decrypt {
                 aead_decrypt(alg, &key, &nonce, &aad, &input)
             } else {
@@ -308,5 +337,6 @@ pub(crate) fn run(args: Args) {
         }
     };
 
+    zero_buf(&mut key);
     write_output(dest, &result);
 }
