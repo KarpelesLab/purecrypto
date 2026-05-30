@@ -101,7 +101,13 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<
     let mut sep_idx: u32 = 0;
     for (i, &b) in em.iter().enumerate().skip(2) {
         let is_zero = ct_eq_u8(b, 0x00) & !found;
-        sep_idx |= (i as u32) & (is_zero as u32);
+        // Broadcast the per-byte mask (0x00/0xff) to the full index width before
+        // AND-ing. A bare `is_zero as u32` zero-extends to 0x000000ff, which would
+        // keep only the low 8 bits of `i` and truncate any separator at index
+        // >= 256 (keys > 2048-bit). The wrapping_sub turns the boolean low bit
+        // into an all-ones / all-zeros u32 mask.
+        let mask = 0u32.wrapping_sub((is_zero & 1) as u32);
+        sep_idx |= (i as u32) & mask;
         found |= is_zero;
     }
     bad |= !found; // no separator found ⇒ invalid
@@ -160,7 +166,10 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     let mut sep_idx: u32 = 0;
     for (i, &b) in em.iter().enumerate().skip(2) {
         let is_zero = ct_eq_u8(b, 0x00) & !found;
-        sep_idx |= (i as u32) & (is_zero as u32);
+        // See decrypt_pkcs1v15: broadcast to full index width so separators at
+        // index >= 256 (keys > 2048-bit) are not truncated to `i & 0xff`.
+        let mask = 0u32.wrapping_sub((is_zero & 1) as u32);
+        sep_idx |= (i as u32) & mask;
         found |= is_zero;
     }
     bad |= !found;
@@ -403,7 +412,11 @@ pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
     for (i, &b) in ps_region.iter().enumerate() {
         // is_one = 0xff iff b == 0x01 and not yet found.
         let is_one = ct_eq_u8(b, 0x01) & !found;
-        sep_idx |= i & (is_one as usize); // captures the first matching index
+        // Broadcast the per-byte mask to usize width before AND-ing; a bare
+        // `is_one as usize` zero-extends to 0xff and truncates separators at
+        // index >= 256 (keys > 2048-bit) to `i & 0xff`.
+        let mask = 0usize.wrapping_sub((is_one & 1) as usize);
+        sep_idx |= i & mask; // captures the first matching index
         found |= is_one;
         // Before separator (!found), byte must be 0x00.
         pre_bad |= b & !found;
