@@ -52,6 +52,7 @@ pub enum SigningKey {
 }
 
 /// A certificate chain (leaf first) paired with its signing key.
+#[non_exhaustive]
 pub struct Identity {
     /// DER-encoded certificate chain, leaf first.
     pub cert_chain: Vec<Vec<u8>>,
@@ -59,7 +60,17 @@ pub struct Identity {
     pub key: SigningKey,
 }
 
+impl Identity {
+    /// Construct an [`Identity`] from a cert chain (leaf first) and its
+    /// signing key. Cross-crate-friendly alternative to literal construction,
+    /// which is forbidden by `#[non_exhaustive]`.
+    pub fn new(cert_chain: Vec<Vec<u8>>, key: SigningKey) -> Self {
+        Self { cert_chain, key }
+    }
+}
+
 /// Client-authentication policy for a server (mTLS).
+#[non_exhaustive]
 pub struct ClientAuth {
     /// Trust anchors for verifying the peer's chain.
     pub roots: RootCertStore,
@@ -68,12 +79,28 @@ pub struct ClientAuth {
     pub required: bool,
 }
 
+impl ClientAuth {
+    /// Construct a [`ClientAuth`] policy from a trust store and a
+    /// `required` flag (see the field for semantics). Cross-crate-friendly
+    /// alternative to literal construction, which is forbidden by
+    /// `#[non_exhaustive]`.
+    pub fn new(roots: RootCertStore, required: bool) -> Self {
+        Self { roots, required }
+    }
+}
+
 /// Unified configuration for a TLS or DTLS endpoint, client or server.
 ///
 /// Fields are arranged in five blocks: protocol versions, identity / trust
 /// anchors / signing-algorithm policy, client-side knobs, server-side
 /// knobs, and DTLS-specific knobs (inert when the negotiated version is
 /// TLS).
+///
+/// `#[non_exhaustive]` because TLS evolves continuously (PQ-hybrid groups,
+/// ECH, RFC 8879 cert compression, future RFCs) — every new knob would
+/// otherwise be a source-breaking change. Construct via [`Config::default`]
+/// or [`Config::builder`].
+#[non_exhaustive]
 pub struct Config {
     // ---- Protocol versions ----
     /// Lowest version this endpoint is willing to negotiate.

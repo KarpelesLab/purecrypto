@@ -110,7 +110,13 @@ pub enum Role {
 /// Phase 7 added `require_retry` + `retry_secret` for server-side
 /// stateless-retry address validation (RFC 9000 §8.1.2). Clients ignore
 /// both fields.
+///
+/// `#[non_exhaustive]` so future QUIC features (datagram extension,
+/// additional transport parameters, QUIC v2 negotiation) can be added
+/// as new fields without breaking downstream literal construction.
+/// Construct via `QuicConfig::default()` + field assignment.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct QuicConfig {
     /// The TLS 1.3 client / server config to drive. The QUIC layer adds
     /// QUIC-mode wrapping on top — `tls.max_version` is ignored (QUIC v1

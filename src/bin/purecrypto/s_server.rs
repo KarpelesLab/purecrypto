@@ -220,10 +220,7 @@ pub(crate) fn run(args: Args) {
     }
     if let Some(p) = verify_ca {
         let roots = load_roots_file(p);
-        builder = builder.client_auth(ClientAuth {
-            roots,
-            required: true,
-        });
+        builder = builder.client_auth(ClientAuth::new(roots, true));
     }
     if matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13) {
         if no_cookie {

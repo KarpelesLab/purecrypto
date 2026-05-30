@@ -196,11 +196,9 @@ pub(crate) fn run_client(args: Args) {
     }
     let tls_cfg = builder.build();
 
-    let qcfg = QuicConfig {
-        tls: tls_cfg,
-        transport_params: default_transport_params(),
-        ..QuicConfig::default()
-    };
+    let mut qcfg = QuicConfig::default();
+    qcfg.tls = tls_cfg;
+    qcfg.transport_params = default_transport_params();
 
     let socket = UdpSocket::bind("0.0.0.0:0")
         .unwrap_or_else(|e| die(format!("cannot bind local UDP socket: {e}")));
@@ -269,11 +267,9 @@ pub(crate) fn run_server(args: Args) {
         format!("127.0.0.1:{accept_arg}")
     };
 
-    let mut qcfg = QuicConfig {
-        tls: tls_cfg,
-        transport_params: default_transport_params(),
-        ..QuicConfig::default()
-    };
+    let mut qcfg = QuicConfig::default();
+    qcfg.tls = tls_cfg;
+    qcfg.transport_params = default_transport_params();
     if retry {
         let mut secret = [0u8; 32];
         purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
