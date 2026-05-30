@@ -22,10 +22,13 @@
 //!
 //! The point formulas are generic over a
 //! [`FieldBackend`](field_backend::FieldBackend); the public API is wired to
-//! the generic Montgomery backend ([`GenericMont`](field_backend::GenericMont)),
-//! which reuses the same audited `MontModulus<4>` core P-256 uses. A native
-//! pseudo-Mersenne reduction can be slotted in behind the same trait later by
-//! changing one type alias.
+//! the native pseudo-Mersenne backend
+//! ([`Secp256k1Field`](field_backend::Secp256k1Field)), a reduction specialised
+//! to secp256k1's prime (`2²⁵⁶ ≡ c (mod p)`). It is validated byte-for-byte
+//! against the generic Montgomery reference
+//! ([`GenericMont`](field_backend::GenericMont), the same audited
+//! `MontModulus<4>` core P-256 uses) by the differential tests in
+//! `field_backend`; `GenericMont` remains as that oracle and a fallback.
 
 mod field_backend;
 mod group;
@@ -34,7 +37,7 @@ use crate::bignum::MontModulus;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;
 
-use field_backend::{Fe, FieldBackend, GenericMont, fe_from_hex};
+use field_backend::{Fe, FieldBackend, Secp256k1Field, fe_from_hex};
 use group::Point;
 
 // --- curve constants (big-endian hex) ---
@@ -46,14 +49,19 @@ const GY_HEX: &str = "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb
 /// Group order `n`.
 const N_HEX: &str = "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141";
 
-/// The base field backend the public API is wired to: the generic Montgomery
-/// [`GenericMont`](field_backend::GenericMont) backend.
-type Backend = GenericMont;
+/// The base field backend the public API is wired to: the native
+/// pseudo-Mersenne [`Secp256k1Field`](field_backend::Secp256k1Field) backend.
+///
+/// This native reduction is active and validated byte-for-byte against the
+/// generic Montgomery reference [`GenericMont`](field_backend::GenericMont) by
+/// the differential tests in `field_backend`. `GenericMont` is retained as that
+/// oracle and a `pub(crate)` fallback.
+type Backend = Secp256k1Field;
 
 /// Constructs the active field backend.
 #[inline]
 fn field() -> Backend {
-    GenericMont::new()
+    Secp256k1Field::new()
 }
 
 // =====================================================================
