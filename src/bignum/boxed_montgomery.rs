@@ -83,6 +83,14 @@ impl BoxedMontModulus {
     /// # Panics
     /// Panics if `modulus` is even or zero.
     pub fn new(modulus: &BoxedUint) -> Self {
+        // Zero is even, so the odd-modulus assertion below also catches it;
+        // we check explicitly first to give a precise diagnostic and to
+        // document that a zero modulus is rejected rather than silently
+        // producing a meaningless parameter set.
+        assert!(
+            !modulus.is_zero(),
+            "BoxedMontModulus::new: modulus must be nonzero"
+        );
         let limbs = modulus.significant_limbs();
         let n = modulus.limbs_resized(limbs);
         assert!(n[0] & 1 == 1, "Montgomery modulus must be odd");
@@ -191,22 +199,31 @@ impl BoxedMontModulus {
     /// Computes `base^exp mod n` in constant time (square-and-multiply-always
     /// over all bits of `exp`).
     ///
-    /// The exponent is zero-padded to `self.limbs` 64-bit limbs before the
-    /// loop. Iteration count is therefore a function of the modulus width
-    /// alone — two secret exponents of the same modulus cannot produce
-    /// different running times even if one was parsed from a DER blob with
-    /// the leading zero limbs of `d` stripped.
+    /// The exponent is zero-padded to at least `self.limbs` 64-bit limbs
+    /// before the loop. The RSA case (`d < n`) hits this branch directly;
+    /// callers that need a wider exponent (e.g. Diffie-Hellman with a
+    /// secret exponent unrelated to the modulus width) get a loop sized to
+    /// the larger of the two, never the silent truncation that an
+    /// unconditional `limbs_resized(self.limbs)` would impose.
+    ///
+    /// Iteration count is a function of `max(self.limbs, exp.limbs())` —
+    /// both public quantities (the modulus width is public, and a caller
+    /// passing an exponent wider than the modulus is exposing the width by
+    /// construction). Two secret exponents of the same width through the
+    /// same modulus therefore still take the same time.
     pub fn pow(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
         let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
         let mut one = vec![0 as Limb; self.limbs];
         one[0] = 1;
         let mut acc = self.to_mont_limbs(&one); // R mod N
 
-        // Pad the exponent to `self.limbs` 64-bit words. `limbs_resized`
-        // zero-pads when the exponent is shorter (the common case for
-        // imported `d` values whose high-zero limbs were stripped by the
-        // ASN.1 unsigned-integer encoder).
-        let exp_limbs = exp.limbs_resized(self.limbs);
+        // Pad the exponent to at least `self.limbs` 64-bit words; if the
+        // caller hands in a wider exponent we keep every bit. `limbs_resized`
+        // would silently truncate the high limbs of an over-wide exponent,
+        // turning the computation into `base^(exp mod 2^(64·self.limbs))` —
+        // the precise foot-gun called out in the foundations audit.
+        let exp_width = exp.significant_limbs().max(self.limbs);
+        let exp_limbs = exp.limbs_resized(exp_width);
         let mut i = exp_limbs.len();
         while i > 0 {
             i -= 1;
@@ -287,6 +304,39 @@ mod tests {
         let ct = m.pow(&msg, &BoxedUint::from_u64(17));
         assert_eq!(ct, BoxedUint::from_u64(2790));
         assert_eq!(m.pow(&ct, &BoxedUint::from_u64(2753)), msg);
+    }
+
+    #[test]
+    #[should_panic(expected = "modulus must be nonzero")]
+    fn new_zero_modulus_panics() {
+        // Zero is also even, but the explicit nonzero check fires first
+        // and gives the diagnostic that matches the documented contract.
+        let _ = BoxedMontModulus::new(&BoxedUint::zero(2));
+    }
+
+    #[test]
+    fn pow_does_not_truncate_overwide_exponent() {
+        // Modulus is a single 64-bit limb but the exponent spans two limbs:
+        // the silent-truncation bug would reduce `exp mod 2^64`, dropping
+        // the bottom 64 bits to zero and computing `base^0 = 1`. With the
+        // fix the full exponent is honoured.
+        let n: u64 = 0xFFFF_FFFF_FFFF_FFC5; // small odd prime-like
+        let m = BoxedMontModulus::new(&BoxedUint::from_u64(n));
+        // exp = 2^64 (only the high limb is set). `base^(2^64) mod n` for
+        // base=3 must equal the iterated 64-square of 3 mod n.
+        let exp = BoxedUint::from_limbs(vec![0, 1]);
+        let got = m.pow(&BoxedUint::from_u64(3), &exp).to_be_bytes(8);
+
+        // Reference: square 3 sixty-four times mod n via u128.
+        let mut r: u128 = 3;
+        for _ in 0..64 {
+            r = (r * r) % n as u128;
+        }
+        let expected = (r as u64).to_be_bytes();
+        assert_eq!(got, expected);
+
+        // Sanity: the truncation bug would have produced 1.
+        assert_ne!(got, [0, 0, 0, 0, 0, 0, 0, 1]);
     }
 
     #[test]

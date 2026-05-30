@@ -216,7 +216,17 @@ impl<const LIMBS: usize> Uint<LIMBS> {
     ///
     /// Constant time in the values (the schedule depends only on the bit
     /// width). `modulus` must be nonzero.
+    ///
+    /// # Panics
+    /// Panics if `modulus` is zero. (Long division by zero would silently
+    /// produce a meaningless result — every iteration "subtracts" because
+    /// the borrow never fires — so the precondition is checked rather than
+    /// returning garbage.)
     pub fn reduce(&self, modulus: &Self) -> Self {
+        assert!(
+            !bool::from(modulus.is_zero()),
+            "Uint::reduce: modulus must be nonzero"
+        );
         let mut r = Self::ZERO;
         let mut i = LIMBS;
         while i > 0 {
@@ -238,7 +248,15 @@ impl<const LIMBS: usize> Uint<LIMBS> {
 
     /// Returns `(quotient, remainder)` for `self / divisor` via bitwise long
     /// division. Constant time in the values; `divisor` must be nonzero.
+    ///
+    /// # Panics
+    /// Panics if `divisor` is zero. (See [`Uint::reduce`] for why this is
+    /// checked rather than returning a meaningless result.)
     pub fn divrem(&self, divisor: &Self) -> (Self, Self) {
+        assert!(
+            !bool::from(divisor.is_zero()),
+            "Uint::divrem: divisor must be nonzero"
+        );
         let mut q = Self::ZERO;
         let mut r = Self::ZERO;
         let mut i = LIMBS;
@@ -387,5 +405,19 @@ mod tests {
         a = a.wrapping_add(&Uint::<64>::ONE);
         assert_eq!(a.as_limbs()[0], 2);
         assert!(bool::from(Uint::<64>::default().is_zero()));
+    }
+
+    #[test]
+    #[should_panic(expected = "modulus must be nonzero")]
+    fn reduce_zero_modulus_panics() {
+        // Long division by zero would silently "subtract" forever; the
+        // precondition is now checked instead of returning garbage.
+        let _ = Uint::<2>::from_u64(7).reduce(&Uint::<2>::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "divisor must be nonzero")]
+    fn divrem_zero_divisor_panics() {
+        let _ = Uint::<2>::from_u64(7).divrem(&Uint::<2>::ZERO);
     }
 }

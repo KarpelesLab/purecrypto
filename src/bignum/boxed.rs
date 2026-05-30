@@ -91,9 +91,28 @@ impl BoxedUint {
         BoxedUint { limbs }
     }
 
-    /// Serializes this integer big-endian into a `len`-byte vector (the value
-    /// must fit).
+    /// Serializes this integer big-endian into a `len`-byte vector. The value
+    /// must fit; otherwise this would silently drop the high bytes.
+    ///
+    /// # Panics
+    /// Panics if `self` has any significant byte beyond position `len`
+    /// (i.e. the encoded value would not round-trip via [`Self::from_be_bytes`]).
     pub fn to_be_bytes(&self, len: usize) -> Vec<u8> {
+        // Refuse to silently truncate: every limb byte at position >= len
+        // must be zero. Equivalently, `bit_len <= len * 8`. The check runs
+        // in O(limbs) and is unconditional on input size (no secret-dependent
+        // branch), matching the rest of this module's panic style for
+        // misuse (see `from_be_bytes` width assertion in `Uint`).
+        for (i, &limb) in self.limbs.iter().enumerate() {
+            let le = limb.to_le_bytes();
+            for (b, &byte) in le.iter().enumerate() {
+                let pos = i * 8 + b;
+                assert!(
+                    pos < len || byte == 0,
+                    "BoxedUint::to_be_bytes: value does not fit in {len} bytes"
+                );
+            }
+        }
         let mut out = vec![0u8; len];
         for (i, &limb) in self.limbs.iter().enumerate() {
             let le = limb.to_le_bytes();
@@ -188,7 +207,17 @@ impl BoxedUint {
     /// Reduces `self` modulo `modulus` via constant-time bitwise long division.
     /// The schedule depends only on the bit widths, not the values. `modulus`
     /// must be nonzero.
+    ///
+    /// # Panics
+    /// Panics if `modulus` is zero. (Long division by zero would silently
+    /// produce a meaningless result — every iteration "subtracts" because
+    /// the borrow never fires — so the precondition is checked rather than
+    /// returning garbage.)
     pub fn reduce(&self, modulus: &BoxedUint) -> BoxedUint {
+        assert!(
+            !modulus.is_zero(),
+            "BoxedUint::reduce: modulus must be nonzero"
+        );
         let m = modulus.significant_limbs();
         let n = modulus.limbs_resized(m);
         let mut r = vec![0 as Limb; m];
@@ -244,7 +273,15 @@ impl BoxedUint {
     /// Returns `(quotient, remainder)` for `self / divisor`, via bitwise long
     /// division. The schedule depends only on the bit widths; `divisor` must be
     /// nonzero.
+    ///
+    /// # Panics
+    /// Panics if `divisor` is zero. (See [`BoxedUint::reduce`] for why this
+    /// is checked rather than returning a meaningless result.)
     pub fn divrem(&self, divisor: &BoxedUint) -> (BoxedUint, BoxedUint) {
+        assert!(
+            !divisor.is_zero(),
+            "BoxedUint::divrem: divisor must be nonzero"
+        );
         let m = divisor.significant_limbs();
         let d = divisor.limbs_resized(m);
         let mut q = vec![0 as Limb; self.limbs.len()];
@@ -379,5 +416,40 @@ mod tests {
 
         assert!(bool::from(a.ct_eq(&BoxedUint::from_limbs(vec![0xAAAA, 0]))));
         assert!(!bool::from(a.ct_eq(&b)));
+    }
+
+    #[test]
+    #[should_panic(expected = "modulus must be nonzero")]
+    fn reduce_zero_modulus_panics() {
+        // A zero divisor used to silently produce a meaningless result;
+        // now it must panic so the caller cannot consume garbage data.
+        let _ = BoxedUint::from_u64(5).reduce(&BoxedUint::zero(2));
+    }
+
+    #[test]
+    #[should_panic(expected = "divisor must be nonzero")]
+    fn divrem_zero_divisor_panics() {
+        let _ = BoxedUint::from_u64(5).divrem(&BoxedUint::zero(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit in 2 bytes")]
+    fn to_be_bytes_truncation_panics() {
+        // 0x1_0000 = 65536 needs 3 bytes; encoding into 2 must reject.
+        let _ = BoxedUint::from_u64(0x1_0000).to_be_bytes(2);
+    }
+
+    #[test]
+    fn to_be_bytes_exact_fit_succeeds() {
+        // The boundary case: the value uses exactly the supplied byte count.
+        assert_eq!(BoxedUint::from_u64(0xff).to_be_bytes(1), vec![0xff]);
+        // Larger buffers still zero-pad.
+        assert_eq!(
+            BoxedUint::from_u64(0xff).to_be_bytes(4),
+            vec![0, 0, 0, 0xff]
+        );
+        // High zero limbs do not trigger the truncation panic.
+        let u = BoxedUint::from_limbs(vec![0x42, 0, 0]);
+        assert_eq!(u.to_be_bytes(1), vec![0x42]);
     }
 }
