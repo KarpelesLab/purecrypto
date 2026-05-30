@@ -41,6 +41,12 @@ pub enum Error {
     ContextTooLong,
     /// A key encoding was structurally invalid.
     Malformed,
+    /// A decoded coefficient was outside its permitted range (e.g. `s1`/`s2`
+    /// outside `[-η, η]` in a private-key blob). FIPS 204 §6.3 requires
+    /// `skDecode` to be paired with a coefficient-range check before use;
+    /// returning this error keeps subsequent `sign` calls from panicking on
+    /// an attacker-supplied byte string.
+    InvalidCoefficient,
 }
 
 /// Per-level ML-DSA parameters.
@@ -169,36 +175,74 @@ fn shake256(parts: &[&[u8]], out: &mut [u8]) {
     h.finalize_into(out);
 }
 
+/// Branch-free `max` over `u32`. Same bit-trick template as `power2_round` in
+/// `reduce.rs`: the sign bit of `(a - b) as i32` is `-1` iff `a < b`, so
+/// `mask` selects `b` when `b > a` and `a` otherwise.
+#[inline]
+fn max_u32_ct(a: u32, b: u32) -> u32 {
+    let mask = ((a as i32).wrapping_sub(b as i32) >> 31) as u32;
+    (a & !mask) | (b & mask)
+}
+
+/// Branch-free `max` over `i32` (used on `r0`, which is signed-centered).
+#[inline]
+fn max_i32_ct(a: i32, b: i32) -> i32 {
+    // a - b underflows on a < b; cast through u64 to compare via sign bit
+    // without relying on `i32::abs` (which itself is branch-free on every
+    // host LLVM targets, but spelling out the trick makes the intent
+    // self-documenting and matches the rest of the file).
+    let diff = (a as i64).wrapping_sub(b as i64);
+    let mask = (diff >> 63) as i32; // -1 iff a < b
+    (a & !mask) | (b & mask)
+}
+
+/// Branch-free `|c|` for an `i32` (avoids the implicit `cmovl` LLVM emits for
+/// `i32::abs`, which on some microarchitectures still leaks the sign through
+/// dispatch timing).
+#[inline]
+fn abs_i32_ct(c: i32) -> i32 {
+    let m = c >> 31; // -1 iff c < 0, else 0
+    (c ^ m).wrapping_sub(m)
+}
+
 fn vec_inf_norm(v: &[Poly]) -> u32 {
-    let mut m = 0;
+    // Single accumulator, no early-exit. The bound check at the call site
+    // (`>= gamma1 - beta`, `>= gamma2`) compares against the final max so the
+    // *per-coefficient* timing is uniform; only the *total* timing depends
+    // on K · N, which is public.
+    let mut m: u32 = 0;
     for p in v {
         for &c in &p.c {
-            let n = inf_norm(c);
-            if n > m {
-                m = n;
-            }
+            m = max_u32_ct(m, inf_norm(c));
         }
     }
     m
 }
 
 fn vec_inf_norm_signed<const K: usize>(v: &[[i32; N]; K]) -> i32 {
-    let mut m = 0;
+    let mut m: i32 = 0;
     for row in v {
         for &c in row {
-            let a = c.abs();
-            if a > m {
-                m = a;
-            }
+            m = max_i32_ct(m, abs_i32_ct(c));
         }
     }
     m
 }
 
 fn count_ones(v: &[Poly]) -> usize {
-    v.iter()
-        .map(|p| p.c.iter().filter(|&&c| c != 0).count())
-        .sum()
+    // Unconditional sum: add `(c != 0) as usize` for every coefficient,
+    // never short-circuit on the `<= omega` bound (the bound check on the
+    // total happens at the call site). `(c | -c) >> 31 & 1` is 1 iff
+    // `c != 0` for any non-zero `u32`, matching `subtle::Choice` semantics
+    // without the dependency.
+    let mut total: usize = 0;
+    for p in v {
+        for &c in &p.c {
+            let nz = ((c | c.wrapping_neg()) >> 31) as usize;
+            total = total.wrapping_add(nz);
+        }
+    }
+    total
 }
 
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
@@ -577,6 +621,30 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
     pk
 }
 
+/// Validates the `s1` and `s2` byte ranges inside a packed ML-DSA private
+/// key. `unpack_eta` rejects any 3-/4-bit group that decodes to a value
+/// outside `[-η, η]`; rejecting those bytes here turns a downstream
+/// `expect("valid sk")` panic in `sign_internal` into a clean
+/// [`Error::InvalidCoefficient`]. The `t0` portion uses the full 13-bit
+/// encoding range and is therefore always decodable into a valid centered
+/// coefficient — no separate range check is needed for it.
+fn validate_sk_ranges<const K: usize, const L: usize>(sk: &[u8], p: &Params) -> Result<(), Error> {
+    if sk.len() != p.privkey {
+        return Err(Error::InvalidLength);
+    }
+    let mut off = 128;
+    let eb = p.eta_bytes();
+    for _ in 0..L {
+        unpack_eta(&sk[off..off + eb], p).map_err(|_| Error::InvalidCoefficient)?;
+        off += eb;
+    }
+    for _ in 0..K {
+        unpack_eta(&sk[off..off + eb], p).map_err(|_| Error::InvalidCoefficient)?;
+        off += eb;
+    }
+    Ok(())
+}
+
 /// Builds `M' = 0 ‖ len(ctx) ‖ ctx ‖ msg` for the external signing interface.
 fn m_prime(ctx: &[u8], msg: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(2 + ctx.len() + msg.len());
@@ -650,11 +718,12 @@ macro_rules! ml_dsa_level {
                 &self.0
             }
 
-            /// Restores a private key from its encoding.
+            /// Restores a private key from its encoding. Validates both the
+            /// length and the `s1` / `s2` coefficient ranges; returns
+            /// [`Error::InvalidCoefficient`] for the latter so a subsequent
+            /// `sign` call cannot panic on a malformed buffer.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-                if bytes.len() != $params.privkey {
-                    return Err(Error::InvalidLength);
-                }
+                validate_sk_ranges::<$k, $l>(bytes, &$params)?;
                 Ok($sk(bytes.to_vec()))
             }
 
@@ -979,5 +1048,126 @@ mod tests {
         let d2 = sk.sign_deterministic(b"abc", b"").unwrap();
         assert_eq!(d1, d2);
         assert!(pk.verify(&d1, b"abc", b""));
+    }
+
+    /// `from_bytes` must reject a buffer whose length is correct but whose
+    /// `s1` group decodes to an out-of-range coefficient (would otherwise
+    /// trigger a panic on the first `sign` via `expect("valid sk")`).
+    #[test]
+    fn from_bytes_rejects_out_of_range_coefficient() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-fb", b"nonce", &[]);
+        let (sk, _pk) = MlDsa65PrivateKey::generate(&mut rng);
+        let mut bad = sk.to_bytes().to_vec();
+        // For ML-DSA-65, eta = 4, so the η byte region starts at offset 128
+        // and uses 4 bits per coefficient. Stuffing the first eta nibble
+        // with 0xFF makes both 4-bit groups decode to 15 — outside [-4, 4]
+        // — so unpack_eta4's MSB-mask check rejects it.
+        bad[128] = 0xFF;
+        match MlDsa65PrivateKey::from_bytes(&bad) {
+            Err(Error::InvalidCoefficient) => {}
+            other => panic!("expected InvalidCoefficient, got {:?}", other.err()),
+        }
+        // And the eta-2 path (ML-DSA-44, 3 bits per coefficient): a 3-bit
+        // group of 0b101 = 5 is outside [-2, 2] and must be rejected.
+        let (sk44, _) = MlDsa44PrivateKey::generate(&mut rng);
+        let mut bad44 = sk44.to_bytes().to_vec();
+        bad44[128] = 0xFF; // every 3-bit group in the first byte ≥ 5
+        match MlDsa44PrivateKey::from_bytes(&bad44) {
+            Err(Error::InvalidCoefficient) => {}
+            other => panic!("expected InvalidCoefficient, got {:?}", other.err()),
+        }
+        // Length check still triggers when the buffer is truncated.
+        let short = sk.to_bytes()[..sk.to_bytes().len() - 1].to_vec();
+        match MlDsa65PrivateKey::from_bytes(&short) {
+            Err(Error::InvalidLength) => {}
+            other => panic!("expected InvalidLength, got {:?}", other.err()),
+        }
+    }
+
+    /// Branch-free `vec_inf_norm` must scan the whole vector and pick up the
+    /// global max regardless of where it sits. Includes a coefficient near
+    /// `Q` (whose centered inf-norm is *small*) followed by a numerically
+    /// larger value later — a fold that stopped after the first "big" raw
+    /// coefficient would miss the real maximum.
+    #[test]
+    fn vec_inf_norm_correct_across_array() {
+        use super::field::{Poly, Q};
+        let mut p = Poly::zero();
+        // Raw value near Q has inf_norm = 5 (the small side).
+        p.c[0] = Q - 5;
+        // Middle holds the true max under inf_norm semantics.
+        p.c[100] = 1000;
+        // Trailing decoy with a smaller inf-norm.
+        p.c[N - 1] = 7;
+        assert_eq!(super::vec_inf_norm(&[p]), 1000);
+
+        // True max strictly at the end of the vector.
+        let mut q = Poly::zero();
+        q.c[0] = 500;
+        q.c[N - 1] = Q / 2;
+        let got = super::vec_inf_norm(&[q]);
+        // inf_norm(Q/2) = min(Q/2, Q - Q/2) = Q/2 (since Q is odd, Q-Q/2 = Q/2+1)
+        assert_eq!(got, Q / 2);
+        assert!(got > 500);
+    }
+
+    /// `count_ones` over a polynomial where the only non-zero coefficient is
+    /// at the very end exercises the no-early-exit accumulator: a branch-free
+    /// rewrite that mistakenly stopped on the first match would miss it.
+    #[test]
+    fn count_ones_visits_full_polynomial() {
+        use super::field::Poly;
+        let mut p = Poly::zero();
+        p.c[N - 1] = 1;
+        p.c[0] = 1;
+        let v = [p];
+        assert_eq!(super::count_ones(&v), 2);
+
+        // Zero polynomial: zero.
+        let z = [Poly::zero()];
+        assert_eq!(super::count_ones(&z), 0);
+
+        // Mixed across multiple polynomials.
+        let mut a = Poly::zero();
+        let mut b = Poly::zero();
+        for i in 0..5 {
+            a.c[i] = 1;
+        }
+        for i in 0..3 {
+            b.c[N - 1 - i] = 7;
+        }
+        assert_eq!(super::count_ones(&[a, b]), 5 + 3);
+    }
+
+    /// `vec_inf_norm_signed` over an `[i32; N]` row where the absolute peak
+    /// is at the end (and a small but earlier value would have set `m`
+    /// under the old early-exit).
+    #[test]
+    fn vec_inf_norm_signed_no_early_exit() {
+        let mut row = [0i32; N];
+        row[10] = -5;
+        row[N - 1] = -12345;
+        let v = [row];
+        assert_eq!(super::vec_inf_norm_signed(&v), 12345);
+    }
+
+    /// `inf_norm` agreement: branch-free path must match the spec
+    /// (`min(a, q-a)`) on a sweep of edge cases.
+    #[test]
+    fn inf_norm_branch_free_matches_spec() {
+        use super::field::{Q, Q_MINUS_1_DIV2};
+        use super::reduce::inf_norm;
+        for a in [
+            0u32,
+            1,
+            Q_MINUS_1_DIV2 - 1,
+            Q_MINUS_1_DIV2,
+            Q_MINUS_1_DIV2 + 1,
+            Q - 2,
+            Q - 1,
+        ] {
+            let want = if a <= Q_MINUS_1_DIV2 { a } else { Q - a };
+            assert_eq!(inf_norm(a), want, "inf_norm({})", a);
+        }
     }
 }

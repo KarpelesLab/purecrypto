@@ -88,6 +88,15 @@ pub(crate) fn use_hint(hint: u32, r: u32, gamma2: u32) -> u32 {
 }
 
 /// Infinity norm of a single coefficient: `min(a, q − a)`.
+///
+/// Computed branch-free so the per-coefficient running time does not depend
+/// on `a` — `a` is derived from secret intermediates (`z = y + c·s₁`,
+/// `r0 = LowBits(w − c·s₂)`, `c·t₀`) during signing. Same pattern as
+/// `power2_round` above: the sign bit of `(Q_MINUS_1_DIV2 - a) as i32` is
+/// `-1` iff `a > Q_MINUS_1_DIV2`; mask the two candidates with it.
 pub(crate) fn inf_norm(a: u32) -> u32 {
-    if a <= Q_MINUS_1_DIV2 { a } else { Q - a }
+    // gt = 0xFFFF_FFFF when a > Q_MINUS_1_DIV2, else 0.
+    let gt = ((Q_MINUS_1_DIV2 as i32).wrapping_sub(a as i32) >> 31) as u32;
+    // select Q - a when gt = -1, a otherwise.
+    (a & !gt) | (Q.wrapping_sub(a) & gt)
 }
