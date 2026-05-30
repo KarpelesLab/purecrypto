@@ -1,0 +1,103 @@
+//! Arithmetic modulo the edwards25519 group order
+//! `L = 2²⁵² + 27742317777372353535851937790883648493`.
+//!
+//! These are the low-level scalar helpers shared by Ed25519 and the public
+//! `Scalar` newtype in [`crate::ec::edwards25519::hazmat`] /
+//! [`crate::ec::ristretto255`]. Reduction rides on the constant-time
+//! [`Uint`](crate::bignum::Uint) long division.
+
+use crate::bignum::Uint;
+use crate::ct::{Choice, ConditionallySelectable};
+
+use super::field::Fe;
+
+/// Joins low/high 256-bit halves into a 512-bit integer.
+fn join(lo: &Fe, hi: &Fe) -> Uint<8> {
+    let a = lo.as_limbs();
+    let b = hi.as_limbs();
+    Uint::from_limbs([a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]])
+}
+
+/// Zero-extends a 256-bit integer to 512 bits.
+fn widen(a: &Fe) -> Uint<8> {
+    let l = a.as_limbs();
+    Uint::from_limbs([l[0], l[1], l[2], l[3], 0, 0, 0, 0])
+}
+
+/// Truncates a 512-bit integer to its low 256 bits.
+fn narrow(a: &Uint<8>) -> Fe {
+    let l = a.as_limbs();
+    Uint::from_limbs([l[0], l[1], l[2], l[3]])
+}
+
+/// Reduces a 64-byte little-endian integer modulo `L`.
+pub(crate) fn scalar_reduce_wide(bytes: &[u8; 64], l8: &Uint<8>) -> Fe {
+    narrow(&Uint::<8>::from_le_bytes(bytes).reduce(l8))
+}
+
+/// Computes `(r + k·a) mod L`.
+pub(crate) fn scalar_muladd(r: &Fe, k: &Fe, a: &Fe, l8: &Uint<8>) -> Fe {
+    let (lo, hi) = k.mul_wide(a);
+    let (sum, _) = join(&lo, &hi).adc(&widen(r), 0);
+    narrow(&sum.reduce(l8))
+}
+
+/// Computes `(a · b) mod L` for `a, b < L`.
+pub(crate) fn scalar_mul(a: &Fe, b: &Fe, l8: &Uint<8>) -> Fe {
+    let (lo, hi) = a.mul_wide(b);
+    narrow(&join(&lo, &hi).reduce(l8))
+}
+
+/// Computes `(a + b) mod L` for `a, b < L`.
+pub(crate) fn scalar_add(a: &Fe, b: &Fe, l: &Fe) -> Fe {
+    // a, b < L < 2²⁵³, so the sum fits in 256 bits with no carry out; one
+    // conditional subtraction of L canonicalises it.
+    let (sum, _) = a.adc(b, 0);
+    let (reduced, borrow) = sum.sbb(l, 0);
+    Fe::conditional_select(&reduced, &sum, Choice::from((borrow ^ 1) as u8))
+}
+
+/// Computes `(a − b) mod L` for `a, b < L`.
+pub(crate) fn scalar_sub(a: &Fe, b: &Fe, l: &Fe) -> Fe {
+    let (diff, borrow) = a.sbb(b, 0);
+    let (wrapped, _) = diff.adc(l, 0);
+    Fe::conditional_select(&wrapped, &diff, Choice::from(borrow as u8))
+}
+
+/// Computes `(−a) mod L` for `a < L`.
+pub(crate) fn scalar_negate(a: &Fe, l: &Fe) -> Fe {
+    scalar_sub(&Fe::ZERO, a, l)
+}
+
+/// Reduces a single 256-bit little-endian integer modulo `L`, returning `None`
+/// (via the `Choice`) flag semantics is left to the caller; here it always
+/// reduces. Used for canonical-checking decoders that first test `< L`.
+pub(crate) fn scalar_reduce(a: &Fe, l: &Fe) -> Fe {
+    a.reduce(l)
+}
+
+/// Computes the modular inverse `a⁻¹ mod L` for `a < L` via Fermat's little
+/// theorem (`a^(L−2) mod L`), constant time in the value of `a`. `L` is prime,
+/// so this is well-defined for every nonzero `a`; the inverse of `0` is `0`.
+pub(crate) fn scalar_invert(a: &Fe, l: &Fe, l8: &Uint<8>) -> Fe {
+    // exponent = L − 2
+    let exp = l.wrapping_sub(&Fe::from_u64(2));
+    let mut r = Fe::ONE;
+    let limbs = exp.as_limbs();
+    let mut i = 256;
+    while i > 0 {
+        i -= 1;
+        r = scalar_mul(&r, &r, l8);
+        let bit = ((limbs[i / 64] >> (i % 64)) & 1) as u8;
+        let prod = scalar_mul(&r, a, l8);
+        r = Fe::conditional_select(&prod, &r, Choice::from(bit));
+    }
+    r
+}
+
+/// Clamps the lower half of the seed hash into the secret scalar (RFC 8032).
+pub(crate) fn clamp(b: &mut [u8; 32]) {
+    b[0] &= 248;
+    b[31] &= 127;
+    b[31] |= 64;
+}

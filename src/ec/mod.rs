@@ -19,6 +19,7 @@ pub mod curves;
 pub mod ecdh;
 pub mod ecdsa;
 pub mod ed25519;
+mod curve25519;
 mod p256;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;
