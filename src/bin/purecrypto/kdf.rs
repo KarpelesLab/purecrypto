@@ -12,6 +12,10 @@ use purecrypto::kdf::{hkdf, pbkdf2};
 /// `-password-file -` reads stdin's first line.
 fn read_password(args: &Args) -> Vec<u8> {
     if let Some(p) = args.value("-password").or_else(|| args.value("--password")) {
+        eprintln!(
+            "purecrypto: warning: -password STR exposes the passphrase via /proc/<pid>/cmdline; \
+             prefer -password-file FILE (or -password-file - to read stdin)"
+        );
         return p.as_bytes().to_vec();
     }
     if let Some(p) = args
