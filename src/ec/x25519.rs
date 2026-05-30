@@ -167,6 +167,12 @@ impl Drop for X25519PrivateKey {
 
 impl X25519PrivateKey {
     /// Generates a new private key from `rng`.
+    ///
+    /// `rng` SHOULD be a cryptographically secure CSPRNG (see
+    /// [`CryptoRng`](crate::rng::CryptoRng)). The bound is left at [`RngCore`]
+    /// only so the TLS / DTLS handshake layers can thread a single shared RNG
+    /// type through ephemeral key-share generation; production callers should
+    /// pass `OsRng` or an HMAC-DRBG seeded from one.
     pub fn generate<R: RngCore>(rng: &mut R) -> Self {
         let mut scalar = [0u8; 32];
         rng.fill_bytes(&mut scalar);

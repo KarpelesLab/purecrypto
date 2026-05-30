@@ -12,7 +12,7 @@ use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, Pkcs1Digest};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::hash::{Digest, HmacSha256, Sha256};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// A runtime-sized RSA public key.
 #[derive(Clone, Debug)]
@@ -242,13 +242,23 @@ impl BoxedRsaPublicKey {
     }
 
     /// Encrypts `msg` with PKCS#1 v1.5.
-    pub fn encrypt_pkcs1v15<R: RngCore>(&self, msg: &[u8], rng: &mut R) -> Result<Vec<u8>, Error> {
+    ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]) —
+    /// the random padding bytes are part of the security argument.
+    pub fn encrypt_pkcs1v15<R: RngCore + CryptoRng>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         emsa::encrypt_pkcs1v15(self, msg, rng)
     }
 
     /// Encrypts `msg` with RSAES-OAEP (RFC 8017 §7.1.1), hashing with `D` and
     /// binding the optional `label`.
-    pub fn encrypt_oaep<D: Digest, R: RngCore>(
+    ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]) —
+    /// OAEP's security reduction depends on the seed being unpredictable.
+    pub fn encrypt_oaep<D: Digest, R: RngCore + CryptoRng>(
         &self,
         msg: &[u8],
         label: &[u8],
@@ -288,7 +298,14 @@ impl BoxedRsaPrivateKey {
     /// Key generation uses non-constant-time modular inverse and primality
     /// testing (see [`inv_mod_boxed`](crate::bignum::inv_mod_boxed)); this is a
     /// one-time operation, not a per-message secret path.
-    pub fn generate<R: RngCore>(bits: usize, e: BoxedUint, rng: &mut R, rounds: usize) -> Self {
+    ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(
+        bits: usize,
+        e: BoxedUint,
+        rng: &mut R,
+        rounds: usize,
+    ) -> Self {
         use crate::bignum::inv_mod_boxed;
         let one = BoxedUint::from_u64(1);
         let half = bits / 2;

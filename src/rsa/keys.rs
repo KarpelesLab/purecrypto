@@ -10,7 +10,7 @@ use super::random_prime;
 use crate::bignum::{MontModulus, Uint, inv_mod};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Sha256};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// An RSA public key `(n, e)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -239,7 +239,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// `rounds` is the number of Miller-Rabin rounds per prime candidate. Key
     /// generation uses a non-constant-time modular inverse (see
     /// [`inv_mod`](crate::bignum::inv_mod)).
-    pub fn generate<R: RngCore>(e: Uint<LIMBS>, rng: &mut R, rounds: usize) -> Self {
+    ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(e: Uint<LIMBS>, rng: &mut R, rounds: usize) -> Self {
         let half_bits = LIMBS * 32;
         loop {
             let p = random_prime::<LIMBS, R>(rng, half_bits, rounds);

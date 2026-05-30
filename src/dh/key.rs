@@ -12,7 +12,7 @@
 use super::groups::DhGroup;
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -105,7 +105,9 @@ impl DhPrivateKey {
     /// `priv_bits - 1` bits wide — this prevents a freshly generated value
     /// from coincidentally being 0 or 1 and keeps the modexp running time
     /// stable across keys on the same group.
-    pub fn generate<R: RngCore>(group: DhGroup, rng: &mut R) -> Self {
+    ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(group: DhGroup, rng: &mut R) -> Self {
         let priv_bits = group.priv_bits;
         let nbytes = priv_bits.div_ceil(8);
         let mut bytes = vec![0u8; nbytes];

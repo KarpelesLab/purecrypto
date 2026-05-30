@@ -20,7 +20,7 @@ mod sample;
 
 use alloc::vec::Vec;
 
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 use encode::*;
 use field::{D, N, Poly, ntt_mul, sub};
 use reduce::{
@@ -677,8 +677,9 @@ macro_rules! ml_dsa_level {
                 ($sk(sk), $pk(pk))
             }
 
-            /// Generates a fresh key pair from `rng`.
-            pub fn generate<R: RngCore>(rng: &mut R) -> ($sk, $pk) {
+            /// Generates a fresh key pair from `rng`. The RNG must be a
+            /// cryptographically secure CSPRNG (see [`CryptoRng`]).
+            pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> ($sk, $pk) {
                 let mut seed = [0u8; SEED_SIZE];
                 rng.fill_bytes(&mut seed);
                 Self::from_seed(&seed)
@@ -686,6 +687,13 @@ macro_rules! ml_dsa_level {
 
             /// Signs `msg` with an optional `ctx` string (≤ 255 bytes), hedged
             /// with randomness from `rng`.
+            ///
+            /// `rng` SHOULD be a cryptographically secure CSPRNG (see
+            /// [`CryptoRng`]) — a predictable nonce degrades the hedged
+            /// signing to its deterministic-only mode (still safe per FIPS 204,
+            /// but loses hedging). The bound is left at [`RngCore`] only so
+            /// the TLS / DTLS handshake layers can dispatch through a single
+            /// shared RNG type.
             pub fn sign<R: RngCore>(
                 &self,
                 rng: &mut R,

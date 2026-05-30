@@ -14,7 +14,7 @@ use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;
 use crate::hash::{Digest, Sha512};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// A field element, four 64-bit limbs (256 bits).
 type Fe = Uint<4>;
@@ -368,8 +368,9 @@ pub struct Ed25519PublicKey([u8; 32]);
 pub struct Ed25519Signature([u8; 64]);
 
 impl Ed25519PrivateKey {
-    /// Generates a new private key from `rng`.
-    pub fn generate<R: RngCore>(rng: &mut R) -> Self {
+    /// Generates a new private key from `rng`. The RNG must be a cryptographically
+    /// secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let mut seed = [0u8; 32];
         rng.fill_bytes(&mut seed);
         Ed25519PrivateKey { seed }

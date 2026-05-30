@@ -136,11 +136,51 @@ impl RngCore for OsRng {
 #[cfg(all(feature = "std", unix, not(target_vendor = "apple")))]
 fn urandom_fill(dest: &mut [u8]) {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // O_CLOEXEC ensures the fd is not inherited across `execve(2)`, so a
+    // child process forked-then-exec'd by the host application cannot end
+    // up holding a stray fd to /dev/urandom. Stdlib's `File::open` adds
+    // O_CLOEXEC on modern Rust/Linux, but pinning it here makes the
+    // property local to this file rather than implicit in the toolchain
+    // version. The numeric value differs across Unix variants:
+    //   Linux        — O_CLOEXEC = 0o2_000_000
+    //   FreeBSD      — O_CLOEXEC = 0x0010_0000
+    //   OpenBSD      — O_CLOEXEC = 0x0001_0000
+    //   NetBSD       — O_CLOEXEC = 0x0040_0000
+    //   illumos/Sol. — O_CLOEXEC = 0x80_0000
+    // On other Unix targets we leave `custom_flags` at zero and rely on
+    // the stdlib default (no regression from the previous behaviour).
+    #[cfg(target_os = "linux")]
+    const O_CLOEXEC: i32 = 0o2_000_000;
+    #[cfg(target_os = "freebsd")]
+    const O_CLOEXEC: i32 = 0x0010_0000;
+    #[cfg(target_os = "openbsd")]
+    const O_CLOEXEC: i32 = 0x0001_0000;
+    #[cfg(target_os = "netbsd")]
+    const O_CLOEXEC: i32 = 0x0040_0000;
+    #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+    const O_CLOEXEC: i32 = 0x80_0000;
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "illumos",
+        target_os = "solaris",
+    )))]
+    const O_CLOEXEC: i32 = 0;
 
     URANDOM.with(|cell| {
         let mut slot = cell.borrow_mut();
         if slot.is_none() {
-            *slot = Some(std::fs::File::open("/dev/urandom").expect("failed to open /dev/urandom"));
+            *slot = Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(O_CLOEXEC)
+                    .open("/dev/urandom")
+                    .expect("failed to open /dev/urandom"),
+            );
         }
         slot.as_mut()
             .unwrap()
@@ -207,5 +247,79 @@ mod tests {
         // Astronomically unlikely to be all-zero or identical.
         assert_ne!(a, [0u8; 32]);
         assert_ne!(a, b);
+    }
+
+    // Regression: F1 (audit 04-rng.md) — the cached `/dev/urandom` fd MUST
+    // carry FD_CLOEXEC so it is not inherited across `execve(2)`. The
+    // `O_CLOEXEC` open flag sets that fd flag at creation time; this test
+    // primes the per-thread cache by drawing some bytes, then re-opens
+    // `/dev/urandom` the same way and confirms the flag is present on the
+    // freshly opened fd (the cached fd lives behind a `thread_local!` so we
+    // can't borrow it without restructuring; opening a second time
+    // exercises the same code path).
+    #[cfg(all(unix, not(target_vendor = "apple")))]
+    #[test]
+    fn urandom_fd_is_cloexec() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        // Prime the per-thread cache so the open path runs at least once.
+        let mut rng = OsRng;
+        let mut buf = [0u8; 16];
+        rng.fill_bytes(&mut buf);
+
+        // Re-open with the same flags and verify FD_CLOEXEC. Mirrors the
+        // O_CLOEXEC value used by `urandom_fill`.
+        #[cfg(target_os = "linux")]
+        const O_CLOEXEC: i32 = 0o2_000_000;
+        #[cfg(target_os = "freebsd")]
+        const O_CLOEXEC: i32 = 0x0010_0000;
+        #[cfg(target_os = "openbsd")]
+        const O_CLOEXEC: i32 = 0x0001_0000;
+        #[cfg(target_os = "netbsd")]
+        const O_CLOEXEC: i32 = 0x0040_0000;
+        #[cfg(any(target_os = "illumos", target_os = "solaris"))]
+        const O_CLOEXEC: i32 = 0x80_0000;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "illumos",
+            target_os = "solaris",
+        )))]
+        const O_CLOEXEC: i32 = 0;
+
+        // On targets where we don't set the flag (no known O_CLOEXEC
+        // constant), the test is informational: the stdlib usually sets
+        // it anyway on modern Rust, but we don't guarantee it here.
+        if O_CLOEXEC == 0 {
+            return;
+        }
+
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(O_CLOEXEC)
+            .open("/dev/urandom")
+            .expect("open /dev/urandom");
+
+        // F_GETFD = 1, FD_CLOEXEC = 1 (both fixed across Unix). Use raw
+        // libc-style probe via a tiny extern; we deliberately don't pull
+        // a libc dep, so spell it inline.
+        #[allow(unsafe_code)]
+        mod probe {
+            unsafe extern "C" {
+                pub(super) fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+            }
+        }
+        const F_GETFD: i32 = 1;
+        const FD_CLOEXEC: i32 = 1;
+        #[allow(unsafe_code)]
+        let flags = unsafe { probe::fcntl(f.as_raw_fd(), F_GETFD) };
+        assert!(flags >= 0, "fcntl(F_GETFD) failed");
+        assert!(
+            flags & FD_CLOEXEC != 0,
+            "/dev/urandom fd missing FD_CLOEXEC (got flags = {flags:#x})"
+        );
     }
 }

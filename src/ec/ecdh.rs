@@ -3,7 +3,7 @@
 use super::Error;
 use super::ecdsa::EcdsaPublicKey;
 use super::p256::{Fe, P256, random_scalar};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// An ephemeral ECDH private value (a scalar in `[1, n-1]`).
 ///
@@ -16,8 +16,9 @@ pub struct EcdhPrivateKey {
 }
 
 impl EcdhPrivateKey {
-    /// Generates a fresh ephemeral key from `rng`.
-    pub fn generate<R: RngCore>(rng: &mut R) -> Self {
+    /// Generates a fresh ephemeral key from `rng`. The RNG must be a
+    /// cryptographically secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         EcdhPrivateKey {
             d: random_scalar(rng),
         }

@@ -11,7 +11,7 @@ use super::curves::CurveId;
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Hmac};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -213,8 +213,9 @@ impl BoxedEcdsaPrivateKey {
         }
     }
 
-    /// Generates a new private key on `curve` from `rng`.
-    pub fn generate<R: RngCore>(curve: CurveId, rng: &mut R) -> Self {
+    /// Generates a new private key on `curve` from `rng`. The RNG must be a
+    /// cryptographically secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(curve: CurveId, rng: &mut R) -> Self {
         let n = curve.curve().order().clone();
         BoxedEcdsaPrivateKey {
             curve,
@@ -449,6 +450,12 @@ impl BoxedEcdsaPrivateKey {
 
 impl BoxedEcdhPrivateKey {
     /// Generates a new ECDH private key on `curve` from `rng`.
+    ///
+    /// `rng` SHOULD be a cryptographically secure CSPRNG (see [`CryptoRng`]).
+    /// The bound is left at [`RngCore`] only so the TLS / DTLS handshake
+    /// layers can thread a single shared RNG type through ephemeral
+    /// key-share generation; production callers should pass `OsRng` or an
+    /// HMAC-DRBG seeded from one.
     pub fn generate<R: RngCore>(curve: CurveId, rng: &mut R) -> Self {
         let n = curve.curve().order().clone();
         BoxedEcdhPrivateKey {

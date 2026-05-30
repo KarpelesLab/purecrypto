@@ -5,7 +5,7 @@ use super::p256::{Fe, P256, random_scalar};
 use crate::bignum::MontModulus;
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// A P-256 ECDSA private key (a scalar in `[1, n-1]`).
 #[derive(Clone)]
@@ -61,8 +61,9 @@ impl EcdsaPrivateKey {
         out
     }
 
-    /// Generates a new private key from `rng`.
-    pub fn generate<R: RngCore>(rng: &mut R) -> EcdsaPrivateKey {
+    /// Generates a new private key from `rng`. The RNG must be a cryptographically
+    /// secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> EcdsaPrivateKey {
         EcdsaPrivateKey {
             d: random_scalar(rng),
         }

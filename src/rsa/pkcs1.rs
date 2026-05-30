@@ -15,7 +15,7 @@ use super::emsa::{self, RawPrivate, RawPublic};
 use super::{Error, RsaPrivateKey, RsaPublicKey};
 use crate::bignum::Uint;
 use crate::hash::Digest;
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// Big-endian `k`-byte serialization of a fixed-width `Uint`.
 fn uint_to_k_bytes<const LIMBS: usize>(value: &Uint<LIMBS>) -> Vec<u8> {
@@ -100,7 +100,11 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     ///
     /// # Errors
     /// [`Error::MessageTooLong`] if `msg.len() > k - 11`, where `k = LIMBS*8`.
-    pub fn encrypt_pkcs1v15<R: RngCore>(&self, msg: &[u8], rng: &mut R) -> Result<Vec<u8>, Error> {
+    pub fn encrypt_pkcs1v15<R: RngCore + CryptoRng>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         emsa::encrypt_pkcs1v15(self, msg, rng)
     }
 
@@ -108,9 +112,12 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// the label hash and MGF1, and the empty label by default — pass `label`
     /// to bind context. Returns the `LIMBS*8`-byte ciphertext.
     ///
+    /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]) —
+    /// OAEP's security reduction depends on the seed being unpredictable.
+    ///
     /// # Errors
     /// [`Error::MessageTooLong`] if `msg.len() > k - 2·hLen - 2`.
-    pub fn encrypt_oaep<D: Digest, R: RngCore>(
+    pub fn encrypt_oaep<D: Digest, R: RngCore + CryptoRng>(
         &self,
         msg: &[u8],
         label: &[u8],

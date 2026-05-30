@@ -107,6 +107,12 @@ macro_rules! ml_kem_set {
             pub const CIPHERTEXT_BYTES: usize = $ct_size;
 
             /// Generates a fresh key pair from `rng` (32 bytes each of `d` and `z`).
+            ///
+            /// `rng` SHOULD be a cryptographically secure CSPRNG (see
+            /// [`CryptoRng`]). The bound is left at [`RngCore`] only so the
+            /// TLS / DTLS handshake layers can thread a single shared RNG
+            /// type through hybrid key-share generation; production callers
+            /// should pass `OsRng` or an HMAC-DRBG seeded from one.
             pub fn generate<R: RngCore>(rng: &mut R) -> ($dk_name, $ek_name) {
                 let mut d = [0u8; 32];
                 let mut z = [0u8; 32];
@@ -204,6 +210,13 @@ macro_rules! ml_kem_set {
             pub const BYTES: usize = $ek_size;
 
             /// Encapsulates to a fresh shared secret, returning `(ciphertext, secret)`.
+            ///
+            /// `rng` SHOULD be a cryptographically secure CSPRNG (see
+            /// [`CryptoRng`]) — the shared secret derives from `m`, so a
+            /// predictable `rng` directly compromises the secret. The bound
+            /// is left at [`RngCore`] only so the TLS / DTLS handshake layers
+            /// can thread a single shared RNG type; production callers should
+            /// pass `OsRng` or an HMAC-DRBG seeded from one.
             pub fn encapsulate<R: RngCore>(
                 &self,
                 rng: &mut R,

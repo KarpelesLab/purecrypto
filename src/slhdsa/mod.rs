@@ -25,7 +25,7 @@ use alloc::vec::Vec;
 use params::{MAX_CONTEXT, MAX_K, MAX_M, MAX_N, MAX_WOTS_LEN, Params, SETS};
 
 use crate::ct::ConstantTimeEq;
-use crate::rng::RngCore;
+use crate::rng::{CryptoRng, RngCore};
 
 /// Errors from SLH-DSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -749,8 +749,9 @@ impl PrivateKey {
         (PrivateKey { set, bytes }, PublicKey { set, bytes: pk })
     }
 
-    /// Generates a fresh key pair from `rng`.
-    pub fn generate<R: RngCore>(set: ParamSet, rng: &mut R) -> (PrivateKey, PublicKey) {
+    /// Generates a fresh key pair from `rng`. The RNG must be a cryptographically
+    /// secure CSPRNG (see [`CryptoRng`]).
+    pub fn generate<R: RngCore + CryptoRng>(set: ParamSet, rng: &mut R) -> (PrivateKey, PublicKey) {
         let n = set.params().n as usize;
         let mut seeds = [0u8; 3 * MAX_N];
         rng.fill_bytes(&mut seeds[..3 * n]);
@@ -770,6 +771,12 @@ impl PrivateKey {
     }
 
     /// Signs `msg` with optional `ctx` (≤ 255 bytes), hedged with `rng`.
+    ///
+    /// `rng` SHOULD be a cryptographically secure CSPRNG (see [`CryptoRng`])
+    /// — a predictable nonce degrades SLH-DSA's hedged mode to deterministic-
+    /// equivalent signing (still safe per FIPS 205, but loses hedging). The
+    /// bound is left at [`RngCore`] only so the X.509 / TLS dispatch layers
+    /// can thread a single shared RNG type.
     pub fn sign<R: RngCore>(&self, rng: &mut R, msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, Error> {
         if msg.is_empty() {
             return Err(Error::EmptyMessage);
