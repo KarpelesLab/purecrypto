@@ -69,6 +69,17 @@ impl<C: BlockCipher> Cfb<C> {
     }
 }
 
+impl<C: BlockCipher> Drop for Cfb<C> {
+    fn drop(&mut self) {
+        // Best-effort wipe of the residual key-stream block. Same
+        // `core::hint::black_box`-guarded zeroing as `cipher/aes/mod.rs`.
+        for b in self.keystream.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.keystream);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -58,6 +58,18 @@ impl<C: BlockCipher> Ctr<C> {
     }
 }
 
+impl<C: BlockCipher> Drop for Ctr<C> {
+    fn drop(&mut self) {
+        // Best-effort wipe of the residual key-stream block. Uses the same
+        // `core::hint::black_box`-guarded zeroing as the AES round-key drop
+        // (`cipher/aes/mod.rs`) so LLVM cannot elide the writes as dead stores.
+        for b in self.keystream.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.keystream);
+    }
+}
+
 /// Increments a 16-byte big-endian counter in place, wrapping at 2¹²⁸.
 #[inline]
 fn increment(counter: &mut [u8; 16]) {

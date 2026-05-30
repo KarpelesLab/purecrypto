@@ -183,6 +183,17 @@ impl<C: BlockCipher> Gcm<C> {
     }
 }
 
+impl<C: BlockCipher> Drop for Gcm<C> {
+    fn drop(&mut self) {
+        // Best-effort wipe of the GHASH subkey `H = E_K(0¹²⁸)`, which is
+        // secret-equivalent (it lets an attacker forge tags, and nonce reuse
+        // already leaks it). Same `core::hint::black_box`-guarded zeroing as
+        // the AES round-key drop in `cipher/aes/mod.rs`.
+        self.h = 0;
+        let _ = core::hint::black_box(&self.h);
+    }
+}
+
 /// AES-128 in GCM mode.
 pub type Aes128Gcm = Gcm<super::Aes128>;
 /// AES-256 in GCM mode.

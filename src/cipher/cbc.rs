@@ -66,6 +66,17 @@ impl<C: BlockCipher> Cbc<C> {
     }
 }
 
+impl<C: BlockCipher> Drop for Cbc<C> {
+    fn drop(&mut self) {
+        // Best-effort wipe of the residual chaining block. Same
+        // `core::hint::black_box`-guarded zeroing as `cipher/aes/mod.rs`.
+        for b in self.chain.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.chain);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
