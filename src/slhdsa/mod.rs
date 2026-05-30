@@ -726,6 +726,13 @@ impl PrivateKey {
     }
 
     /// Deterministically derives a key pair from the three n-byte seeds.
+    ///
+    /// # Panics
+    ///
+    /// Each of `sk_seed`, `sk_prf`, and `pk_seed` must be at least
+    /// `set.params().n` bytes long (16, 24, or 32 depending on the parameter
+    /// set); this panics otherwise. The seeds are caller-supplied local key
+    /// material, never attacker-controlled wire data.
     pub fn from_seeds(
         set: ParamSet,
         sk_seed: &[u8],
@@ -734,6 +741,10 @@ impl PrivateKey {
     ) -> (PrivateKey, PublicKey) {
         let p = set.params();
         let n = p.n as usize;
+        assert!(
+            sk_seed.len() >= n && sk_prf.len() >= n && pk_seed.len() >= n,
+            "SLH-DSA from_seeds: each seed must be at least n bytes"
+        );
         let mut root = [0u8; MAX_N];
         compute_root(p, &pk_seed[..n], &sk_seed[..n], &mut root);
 
