@@ -982,12 +982,23 @@ mod tests {
                 .expect("fragment within cap");
         }
         assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
-        // The next non-touching fragment must error.
+        // The next non-touching fragment must be DROPPED — not treated as a
+        // protocol error. Tearing the connection down here would break
+        // legitimate heavy reordering (a low-offset gap stays unfilled while
+        // higher-offset fragments pile up); per-stream flow control already
+        // bounds the buffered byte volume, so dropping the over-cap fragment
+        // (the sender retransmits it once the gap frees a slot) is the correct
+        // RFC 9000 §2.2 response. `on_data` returns Ok(0): no new contiguous
+        // bytes, fragment not buffered.
         let off = 1 + (MAX_PENDING_FRAGMENTS as u64) * 2;
-        let err = r.on_data(off, &[0xABu8; 1], false);
-        assert!(err.is_err(), "fragment beyond cap must be rejected");
-        // The cap must hold — no silent admission.
+        let res = r.on_data(off, &[0xABu8; 1], false);
+        assert!(
+            matches!(res, Ok(0)),
+            "fragment beyond cap must be dropped (Ok(0)), not fatal: {res:?}"
+        );
+        // The cap must hold — the dropped fragment was not admitted.
         assert_eq!(r.pending.len(), MAX_PENDING_FRAGMENTS);
+        assert!(!r.pending.contains_key(&off));
     }
 
     /// A replacement insertion at an *existing* offset must NOT count
