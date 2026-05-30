@@ -221,6 +221,17 @@ impl DhPrivateKey {
     }
 }
 
+impl Drop for DhPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the secret exponent `x` before its heap-backing
+        // `Vec` is freed. `BoxedUint` already zeroizes on its own `Drop`, so
+        // this is belt-and-suspenders, but it mirrors the explicit convention
+        // used by every EC private-key type (e.g. `BoxedEcdsaPrivateKey`,
+        // `BoxedEcdhPrivateKey` in `ec/boxed.rs`).
+        self.x.zeroize();
+    }
+}
+
 impl DhPublicKey {
     /// `y` as big-endian bytes, left-padded to the group's prime byte width.
     pub fn to_bytes(&self) -> Vec<u8> {
