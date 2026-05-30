@@ -961,6 +961,65 @@ mod tests {
         assert_eq!(s.min_rtt, Duration::from_millis(50));
     }
 
+    /// Regression test for the QUIC ACK-range CPU-exhaustion DoS.
+    ///
+    /// A forged ACK whose range spans nearly the entire 62-bit packet-number
+    /// space used to drive `on_ack_received` into a dense `pn..=end` walk of
+    /// ~2^62 iterations, hanging the connection forever. The fix iterates
+    /// sparsely over only the packets actually in flight (via
+    /// `BTreeMap::range`), so processing such an ACK is bounded by the (tiny)
+    /// number of tracked packets and returns essentially instantly. The
+    /// connection layer additionally rejects an ACK whose `largest` exceeds
+    /// the highest PN ever sent (RFC 9000 §13.1) before reaching here; this
+    /// test exercises the loss layer's own DoS resistance directly.
+    #[test]
+    fn enormous_ack_range_iterates_sparsely() {
+        let mut s = LossState::new();
+        for pn in 0..3u64 {
+            s.on_packet_sent(
+                PnSpaceId::Application,
+                mk_packet(pn, true, true, Duration::from_millis(10)),
+            );
+        }
+
+        let start = std::time::Instant::now();
+        // Attacker-controlled range covering essentially the whole PN space.
+        let acked = s.on_ack_received(
+            PnSpaceId::Application,
+            &[0..=(u64::MAX - 1)],
+            Duration::ZERO,
+            Duration::from_millis(60),
+        );
+        let elapsed = start.elapsed();
+
+        // Only the three in-flight packets are reported, and the call returns
+        // quickly rather than looping ~2^64 times.
+        assert_eq!(acked.len(), 3);
+        assert!(s.per_space[2].sent_packets.is_empty());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "sparse ACK iteration took too long: {elapsed:?}"
+        );
+
+        // A subsequent legitimate ACK over a real sub-range still behaves
+        // exactly as before: only the packets inside the range are acked.
+        let mut s = LossState::new();
+        for pn in 0..4u64 {
+            s.on_packet_sent(
+                PnSpaceId::Application,
+                mk_packet(pn, true, true, Duration::from_millis(10)),
+            );
+        }
+        let acked = s.on_ack_received(
+            PnSpaceId::Application,
+            &[1..=2],
+            Duration::ZERO,
+            Duration::from_millis(60),
+        );
+        assert_eq!(acked.len(), 2);
+        assert_eq!(s.per_space[2].sent_packets.len(), 2);
+    }
+
     #[test]
     fn discard_keys_wipes_space() {
         let mut s = LossState::new();
