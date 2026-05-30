@@ -147,6 +147,7 @@ impl Field {
 
     /// Converts a Montgomery-form element back to a plain residue.
     #[inline]
+    #[allow(clippy::wrong_self_convention)]
     pub(crate) fn from_mont(&self, x: &Fe) -> Fe {
         self.fp.from_mont(x)
     }
@@ -183,38 +184,56 @@ impl Field {
         fe_pow(&self.fp, &self.one, base, exp)
     }
 
-    /// The named RFC 9496 / ed25519 "square root of `u/v`" routine.
+    /// The named RFC 9496 §3.1.3 "square root of `u/v`" routine.
     ///
-    /// Given Montgomery-form `u`, `v`, computes a candidate `r = (u/v)^((p+3)/8)`
-    /// (implemented as `u·v³·(u·v⁷)^((p−5)/8)`) and corrects it by `√−1` when
-    /// needed. Returns `(was_square, r)` where:
+    /// Given Montgomery-form `u`, `v`, computes a candidate
+    /// `r = (u/v)^((p+3)/8)` (as `u·v³·(u·v⁷)^((p−5)/8)`) and corrects it by
+    /// `√−1` when needed. Returns `(was_square, r)` exactly per the RFC:
     ///
-    /// - if `u/v` is a nonzero square, `was_square` is true and `r² = u/v`;
-    /// - if `u/v` is a non-square, `was_square` is false and `r² = −u/v` (more
-    ///   precisely `r² = i·u/v` with `i = √−1`, matching RFC 9496 §3.1.3);
-    /// - if `u = 0` (with any `v`), `was_square` is true and `r = 0`.
+    /// - if `v` is nonzero and `u/v` is square, `was_square` is true and
+    ///   `r = +√(u/v)` (the non-negative root);
+    /// - if `v` is nonzero and `u/v` is not square, `was_square` is false and
+    ///   `r = +√(i·u/v)` with `i = √−1` (the non-negative root);
+    /// - if `u = 0`, `was_square` is true and `r = 0`;
+    /// - if `v = 0` (and `u ≠ 0`), `was_square` is false and `r = 0`.
     ///
-    /// The returned `r` always has an even (non-negative) least-significant bit
-    /// per the RFC's "use the non-negative root" rule is **not** applied here —
-    /// callers that need a fixed sign apply it themselves. This mirrors the
-    /// historical inlined logic in Ed25519 point decompression exactly.
+    /// The returned `r` is always non-negative (even least-significant bit).
+    /// ristretto255 (encode/decode/one-way map) relies on these exact
+    /// semantics; Ed25519 point decompression also calls it and re-imposes its
+    /// own sign bit afterwards, so the normalization here is harmless there.
     pub(crate) fn sqrt_ratio_i(&self, u: Fe, v: Fe) -> (Choice, Fe) {
-        // candidate = u·v³·(u·v⁷)^((p−5)/8)
+        // candidate r = u·v³·(u·v⁷)^((p−5)/8)
         let v3 = self.mul(self.sq(v), v);
         let v7 = self.mul(self.sq(v3), v);
         let pw = self.pow(self.mul(u, v7), &self.p_minus_5_div_8);
         let r = self.mul(self.mul(u, v3), pw);
 
-        // check = v·r²
+        // check = v·r²; compare against ±u and ±i·u.
         let check = self.mul(v, self.sq(r));
         let neg_u = self.neg(u);
+        let i_u = self.mul(self.sqrtm1, u);
+        let neg_i_u = self.neg(i_u);
+
         let correct_sign = self.ct_eq(check, u);
         let flipped_sign = self.ct_eq(check, neg_u);
-        let r_prime = self.mul(r, self.sqrtm1);
-        // Use r·√−1 when v·r² == −u (the non-square branch).
-        let r = Fe::conditional_select(&r_prime, &r, flipped_sign);
+        let flipped_sign_i = self.ct_eq(check, neg_i_u);
+
+        // r·√−1 is used in the non-square (or i-flipped) branch.
+        let r_prime = self.mul(self.sqrtm1, r);
+        let use_r_prime = flipped_sign | flipped_sign_i;
+        let r = Fe::conditional_select(&r_prime, &r, use_r_prime);
+
+        // Normalize to the non-negative root.
+        let r = self.abs(r);
 
         let was_square = correct_sign | flipped_sign;
         (was_square, r)
+    }
+
+    /// The non-negative representative `|a|`: negates `a` iff its canonical
+    /// residue is odd. Constant-time. (RFC 9496 `CT_ABS`.)
+    #[inline]
+    pub(crate) fn abs(&self, a: Fe) -> Fe {
+        self.conditional_negate(a, self.is_negative(a))
     }
 }

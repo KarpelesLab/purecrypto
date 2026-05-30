@@ -69,13 +69,6 @@ pub(crate) fn scalar_negate(a: &Fe, l: &Fe) -> Fe {
     scalar_sub(&Fe::ZERO, a, l)
 }
 
-/// Reduces a single 256-bit little-endian integer modulo `L`, returning `None`
-/// (via the `Choice`) flag semantics is left to the caller; here it always
-/// reduces. Used for canonical-checking decoders that first test `< L`.
-pub(crate) fn scalar_reduce(a: &Fe, l: &Fe) -> Fe {
-    a.reduce(l)
-}
-
 /// Computes the modular inverse `a⁻¹ mod L` for `a < L` via Fermat's little
 /// theorem (`a^(L−2) mod L`), constant time in the value of `a`. `L` is prime,
 /// so this is well-defined for every nonzero `a`; the inverse of `0` is `0`.
