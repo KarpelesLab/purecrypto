@@ -23,7 +23,14 @@ name = "purecrypto"
 # `std` is the convenient default; it implies `alloc`. Disable default
 # features for a `no_std` build (`--no-default-features`), optionally
 # re-enabling `alloc` for heap-backed types.
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cert-compression", "cli"]
+#
+# `linux-getrandom` is in the default set so that, on Linux, entropy is drawn
+# via getrandom(2) (which blocks until the kernel CSPRNG is seeded) rather than
+# /dev/urandom (which does not), hardening the early-boot key-generation path.
+# The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
+# by default is inert on every non-Linux target and on unsupported Linux arches
+# (where it transparently falls back to /dev/urandom).
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cert-compression", "cli", "linux-getrandom"]
 std = ["alloc"]
 alloc = []
 
