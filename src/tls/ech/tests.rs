@@ -1196,6 +1196,81 @@ fn decap_rejects_unknown_config_id() {
     ));
 }
 
+/// F6 regression: the server MUST reject an ECH whose HPKE symmetric
+/// suite `(kdf, aead)` is not among those published in the matching
+/// ECHConfig's `cipher_suites`, treating it as a rejection (fall back
+/// to the outer CH / retry_configs) per draft-ietf-tls-esni-22 §7.1.
+/// Here the key publishes only HKDF-SHA256/AES-128-GCM; a client that
+/// seals under HKDF-SHA256/AES-256-GCM (a valid suite, just not
+/// announced for this config) must be rejected before decap, while a
+/// published suite still decaps normally.
+#[test]
+fn decap_rejects_unpublished_hpke_suite() {
+    let mut rng = drbg(b"decap-unpublished-suite");
+    // Published suites: only AES-128-GCM with HKDF-SHA256.
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let config = pair.config().clone();
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+    let inner = build_inner_ch_marker();
+
+    // Seal under AES-256-GCM — a supported suite, but NOT published for
+    // this config. Sealing succeeds (it depends only on the public key
+    // and the chosen suite), but the server must reject it at decap.
+    let unpublished = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes256Gcm.id(),
+    };
+    let sealed = seal_with(
+        &config,
+        unpublished,
+        &inner,
+        5,
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(unpublished, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
+    .expect("seal");
+    assert!(matches!(
+        try_decap_inner(&sealed.outer_ch, &ring),
+        Err(Error::EchDecryptionFailed)
+    ));
+
+    // Control: the published suite still decaps and recovers the inner.
+    let published = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let ok = seal_with(
+        &config,
+        published,
+        &inner,
+        5,
+        &mut rng,
+        |enc, padded_len| {
+            let body = build_outer_ext_body(published, 0x42, enc, padded_len);
+            build_outer_ch_with_ech(&body)
+        },
+    )
+    .expect("seal");
+    let recovered = try_decap_inner(&ok.outer_ch, &ring).expect("decap");
+    assert_eq!(recovered.inner_ch_bytes, inner);
+}
+
 #[test]
 fn decap_rejects_aead_corruption() {
     let mut rng = drbg(b"decap-corrupt");

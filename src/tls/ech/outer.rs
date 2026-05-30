@@ -33,7 +33,7 @@
 
 use super::config::{EchConfig, HpkeSymCipherSuite};
 use super::extension::{EchExtension, decode_outer_position};
-use super::hpke_setup::{setup_receiver, setup_sender};
+use super::hpke_setup::{map_sym_suite, setup_receiver, setup_sender};
 use crate::hpke::{ReceiverContext, SenderContext};
 use crate::rng::RngCore;
 use crate::tls::Error;
@@ -336,6 +336,15 @@ pub(crate) fn try_decap_inner(
     let pair = keys
         .find_by_config_id(config_id)
         .ok_or(Error::EchDecryptionFailed)?;
+    // Per draft-ietf-tls-esni-22 §7.1, the client's chosen HPKE
+    // symmetric suite MUST be one the server published in this
+    // ECHConfig's `cipher_suites`. If it isn't, treat the ECH as a
+    // rejection (fall back to the outer ClientHello / retry_configs)
+    // rather than attempting decap with an unannounced suite.
+    let (kdf, aead) = map_sym_suite(sym)?;
+    if !pair.accepts(kdf, aead) {
+        return Err(Error::EchDecryptionFailed);
+    }
     let (mut receiver, _suite) =
         setup_receiver(pair.config(), pair.private_key_bytes(), &enc, sym)?;
     let plaintext = receiver
