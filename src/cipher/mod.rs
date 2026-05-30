@@ -20,6 +20,7 @@ mod cfb;
 mod chacha20;
 mod chacha20poly1305;
 mod ctr;
+mod des;
 mod gcm;
 mod kw;
 mod ofb;
@@ -34,6 +35,7 @@ pub use cfb::Cfb;
 pub use chacha20::ChaCha20;
 pub use chacha20poly1305::ChaCha20Poly1305;
 pub use ctr::Ctr;
+pub use des::{Cbc64, Des, TdesEde2, TdesEde3};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
@@ -55,6 +57,21 @@ pub trait BlockCipher {
 
     /// Decrypts one block in place.
     fn decrypt_block(&self, block: &mut [u8; 16]);
+}
+
+/// A 64-bit-block cipher: parallel to [`BlockCipher`] but for legacy
+/// 8-byte-block primitives (DES, 3-DES). Wire this up via [`Cbc64`] for
+/// CBC-mode interop; new code should use the 128-bit `BlockCipher` and
+/// `Cbc` instead.
+pub trait BlockCipher64 {
+    /// Key size in bytes.
+    const KEY_SIZE: usize;
+
+    /// Encrypts one 8-byte block in place.
+    fn encrypt_block(&self, block: &mut [u8; 8]);
+
+    /// Decrypts one 8-byte block in place.
+    fn decrypt_block(&self, block: &mut [u8; 8]);
 }
 
 /// Error returned by block-oriented modes (e.g. CBC) when the input length is
