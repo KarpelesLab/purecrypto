@@ -527,3 +527,61 @@ fn emsa_pss_verify<D: Digest>(msg: &[u8], em: &[u8], em_bits: usize) -> Result<(
         Err(Error::Verification)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::bignum::BoxedUint;
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::rsa::BoxedRsaPrivateKey;
+
+    // Regression test for the separator-index truncation bug: the padding
+    // scanners captured the first-separator position by AND-ing the byte index
+    // `i` with a per-byte mask returned by `ct_eq_u8` (0x00 / 0xff). Casting
+    // that one-octet mask to `u32` / `usize` zero-extended it to 0x..00ff, so
+    // only the low 8 bits of `i` survived. Any separator at absolute index
+    // >= 256 — i.e. on keys larger than 2048-bit — was captured as `i & 0xff`,
+    // and because `found`/`bad` were still computed correctly the function
+    // returned `Ok(...)` sliced at the wrong, smaller offset → silently wrong
+    // plaintext. A 3072-bit key (k = 384 octets) with a short message places
+    // the separator well past index 255, so it exercises the fixed code path;
+    // these tests fail against the pre-fix scanners and pass after the fix.
+    //
+    // Generating a 3072-bit key is fast in release but slow in an unoptimized
+    // debug build, so (like `keygen_roundtrip_rsa2048` in `keys.rs`) these are
+    // ignored by default. Run them with:
+    //   cargo test --release -- --ignored separator_index_above_255
+
+    fn sk_3072() -> BoxedRsaPrivateKey {
+        // Deterministic CSPRNG so the test is reproducible; 3072-bit ⇒ k = 384,
+        // guaranteeing the 0x00 (PKCS#1) / 0x01 (OAEP) separator lands at an
+        // index > 255 for a short message.
+        let mut rng = HmacDrbg::<Sha256>::new(b"emsa-sep-idx-regression", b"nonce", &[]);
+        BoxedRsaPrivateKey::generate(3072, BoxedUint::from_u64(65537), &mut rng, 16)
+    }
+
+    #[test]
+    #[ignore = "slow in debug; run with --release --ignored"]
+    fn pkcs1v15_roundtrip_separator_index_above_255() {
+        let key = sk_3072();
+        let pk = key.public_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"emsa-pkcs1-ct", b"nonce", &[]);
+        let msg = b"hello"; // separator at index k - 5 - 1 = 378 > 255
+        let ct = pk.encrypt_pkcs1v15(msg, &mut rng).unwrap();
+        let pt = key.decrypt_pkcs1v15(&ct).unwrap();
+        assert_eq!(pt.as_slice(), msg);
+    }
+
+    #[test]
+    #[ignore = "slow in debug; run with --release --ignored"]
+    fn oaep_roundtrip_separator_index_above_255() {
+        let key = sk_3072();
+        let pk = key.public_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"emsa-oaep-ct", b"nonce", &[]);
+        let label = b"";
+        let msg = b"hi";
+        let ct = pk.encrypt_oaep::<Sha256, _>(msg, label, &mut rng).unwrap();
+        let pt = key.decrypt_oaep::<Sha256>(&ct, label).unwrap();
+        assert_eq!(pt.as_slice(), msg);
+    }
+}
