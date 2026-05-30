@@ -110,6 +110,23 @@ pub(super) struct Keccak {
     squeeze_offset: usize,
 }
 
+impl Default for Keccak {
+    /// A zeroed placeholder sponge. Used as the `core::mem::take` filler when
+    /// finalize-style methods move the real sponge into a [`KeccakReader`];
+    /// the original wrapper's `Drop` then wipes this all-zero stand-in,
+    /// avoiding the "cannot move out of type that implements `Drop`" error.
+    fn default() -> Self {
+        Keccak {
+            state: [0u64; 25],
+            buf: [0u8; MAX_RATE],
+            buf_len: 0,
+            rate: 0,
+            rounds: 0,
+            squeeze_offset: 0,
+        }
+    }
+}
+
 impl Keccak {
     pub(super) fn new(rate: usize) -> Self {
         Self::with_rounds(rate, 24)
@@ -212,5 +229,11 @@ impl KeccakReader {
 impl XofReader for KeccakReader {
     fn read(&mut self, out: &mut [u8]) {
         self.keccak.squeeze(out);
+    }
+}
+
+impl Drop for KeccakReader {
+    fn drop(&mut self) {
+        self.keccak.zeroize();
     }
 }

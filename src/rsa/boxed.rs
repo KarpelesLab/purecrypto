@@ -57,6 +57,26 @@ pub struct BoxedRsaPrivateKey {
     blinding_seed: [u8; 32],
 }
 
+impl Drop for BoxedRsaPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of every secret-bearing field. `n`, `e`, `mont`,
+        // and `k` are public; `d`, `p`, `q`, `phi_n_minus_1`, and the
+        // HMAC-SHA256 blinding seed all leak information about the secret
+        // key and must be cleared. The `black_box` barrier inside
+        // `BoxedUint::zeroize` keeps LLVM from eliding the writes.
+        self.d.zeroize();
+        self.p.zeroize();
+        self.q.zeroize();
+        if let Some(phi) = self.phi_n_minus_1.as_mut() {
+            phi.zeroize();
+        }
+        for b in self.blinding_seed.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.blinding_seed);
+    }
+}
+
 /// Computes `phi(n) − 1` from the primes (if both are nonzero) and the
 /// blinding HMAC key (always).
 fn derive_blinding_boxed(
@@ -235,21 +255,6 @@ impl BoxedRsaPublicKey {
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
         emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng)
-    }
-}
-
-// Best-effort zeroize on drop: the BoxedUint fields scrub themselves via
-// their own Drop impl, but `blinding_seed` is a fixed-size byte array that
-// would otherwise be returned to the allocator with the HMAC-key bytes
-// intact. Overwrite it and route the read through `core::hint::black_box`
-// so LLVM cannot eliminate the writes as dead stores (same pattern as
-// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
-impl Drop for BoxedRsaPrivateKey {
-    fn drop(&mut self) {
-        for b in self.blinding_seed.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.blinding_seed);
     }
 }
 

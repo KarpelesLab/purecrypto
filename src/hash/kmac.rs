@@ -220,12 +220,23 @@ macro_rules! kmac_xof {
                 let mut b = [0u8; 9];
                 let n = right_encode(&mut b, 0);
                 self.keccak.update(&b[..n]);
-                KeccakReader::new(self.keccak, 0x04)
+                // Move the keyed sponge into the reader, leaving a zeroed
+                // placeholder behind so `Drop` (which wipes `self.keccak`)
+                // doesn't trip the "cannot move out of `Drop`-impl type"
+                // check. The placeholder is already all-zero, so the
+                // wipe-on-drop is a no-op.
+                let keccak = core::mem::take(&mut self.keccak);
+                KeccakReader::new(keccak, 0x04)
             }
             /// Finalizes and squeezes `out.len()` bytes.
             pub fn finalize_into(self, out: &mut [u8]) {
                 use super::XofReader;
                 self.finalize_xof().read(out);
+            }
+        }
+        impl Drop for $name {
+            fn drop(&mut self) {
+                self.keccak.zeroize();
             }
         }
     };

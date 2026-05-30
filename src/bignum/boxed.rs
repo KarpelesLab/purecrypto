@@ -138,6 +138,19 @@ impl BoxedUint {
         &self.limbs
     }
 
+    /// Best-effort wipe of the limb storage, for use in `Drop` impls that
+    /// hold secret material (e.g. RSA private exponents and prime factors).
+    /// Mirrors the `core::hint::black_box` pattern used by [`Aes128`] /
+    /// [`Poly1305`] and the in-crate [`hash::zeroize`] helpers so LLVM does
+    /// not elide the writes as a dead store.
+    #[inline]
+    pub(crate) fn zeroize(&mut self) {
+        for limb in self.limbs.iter_mut() {
+            *limb = 0;
+        }
+        let _ = core::hint::black_box(&self.limbs);
+    }
+
     /// The bit length (most-significant set bit + 1); zero for zero.
     pub fn bit_len(&self) -> usize {
         for i in (0..self.limbs.len()).rev() {

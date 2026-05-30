@@ -578,6 +578,61 @@ impl<const ITER: usize> UmacInner<ITER> {
     }
 }
 
+impl<const ITER: usize> Drop for UmacInner<ITER> {
+    fn drop(&mut self) {
+        // Best-effort wipe of all key-derived state. `pdf_aes` zeros its
+        // expanded round keys in its own `Drop`. The remaining fields hold
+        // L1/L2/L3 keys derived from the master via the AES-CTR KDF, the
+        // streaming chunk buffer (plaintext), and the per-iteration POLY
+        // accumulators — all of which leak information about the secret keys
+        // or the message. Use the same `black_box` barrier the rest of the
+        // crate relies on so LLVM cannot elide the writes as dead stores.
+        for b in self.l1_key.iter_mut() {
+            *b = 0;
+        }
+        for w in self.l2_k64.iter_mut() {
+            *w = 0;
+        }
+        for w in self.l2_k128.iter_mut() {
+            *w = 0;
+        }
+        for row in self.l3_k1.iter_mut() {
+            for w in row.iter_mut() {
+                *w = 0;
+            }
+        }
+        for row in self.l3_k2.iter_mut() {
+            for b in row.iter_mut() {
+                *b = 0;
+            }
+        }
+        for b in self.chunk.iter_mut() {
+            *b = 0;
+        }
+        self.chunk_off = 0;
+        self.total_bytes = 0;
+        for it in self.iter_state.iter_mut() {
+            it.poly64_acc = 0;
+            it.poly128_acc = 0;
+            it.l1_outputs = 0;
+            it.pending_first = 0;
+            it.transitioned = false;
+            it.poly128_half = [0; 8];
+            it.half_pending = false;
+            let _ = core::hint::black_box(&it.poly64_acc);
+            let _ = core::hint::black_box(&it.poly128_acc);
+            let _ = core::hint::black_box(&it.pending_first);
+            let _ = core::hint::black_box(&it.poly128_half);
+        }
+        let _ = core::hint::black_box(&self.l1_key);
+        let _ = core::hint::black_box(&self.l2_k64);
+        let _ = core::hint::black_box(&self.l2_k128);
+        let _ = core::hint::black_box(&self.l3_k1);
+        let _ = core::hint::black_box(&self.l3_k2);
+        let _ = core::hint::black_box(&self.chunk);
+    }
+}
+
 /// UMAC-AES-128 with an 8-byte tag (RFC 4418, 2 internal iterations).
 ///
 /// Construct with [`Umac64::new`], absorb input via [`Umac64::update`], and
