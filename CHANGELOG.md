@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/KarpelesLab/purecrypto/compare/v0.4.0...v0.5.0) - 2026-05-30
+
+### Other
+
+- mark Config/Identity/ClientAuth/QuicConfig non_exhaustive
+- *(mlkem)* qualify CryptoRng intra-doc link inside ml_kem_set! macro
+- O_CLOEXEC on /dev/urandom + tighten CryptoRng bound on keygen
+- zeroize BoxedEc/Ed25519 private keys; P-256 random_scalar rejection; BoxedEcdsa low-S
+- wipe KMAC XOF / UMAC / BoxedRsa secrets on drop
+- zeroize key handles on free; explicit length params for DTLS cookie + QUIC peer-addr
+- reject zero divisor + guard truncating ops
+- fix tree_idx_mask shift overflow + add KAT roundtrips
+- validate from_bytes coefficients; branch-free inf_norm/vec_inf_norm/count_ones
+- add -keyfile / -aadfile to avoid argv secret leak
+- error on missing SNI; checked u16 length casts
+- enforce role on HANDSHAKE_DONE and NEW_TOKEN (RFC 9000 §19.20/§19.7)
+- *(kw)* constant-time KWP unwrap validation
+
+### Security
+
+- fix issues from parallel audit (DTLS/QUIC/TLS/RSA/X.509/FFI)
+
 ## [0.4.0](https://github.com/KarpelesLab/purecrypto/compare/v0.3.0...v0.4.0) - 2026-05-30
 
 ### Added
