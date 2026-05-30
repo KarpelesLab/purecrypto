@@ -5,6 +5,14 @@
 //! so the NTT keeps values in the ordinary domain (the `R⁻¹` from each
 //! `field_mul` cancels the `R` baked into the zeta), exactly as the reference.
 
+// `Poly` and its inherent methods are `pub` (not `pub(crate)`) so the
+// `hazmat-mldsa` surface can re-export them — a re-export cannot widen a
+// `pub(crate)` item to `pub`, so the items themselves must be `pub`. When the
+// `hazmat-mldsa` feature is off, this private `field` module is not reachable
+// through any public path, so those items are (correctly) unreachable from
+// outside the crate; suppress the otherwise-spurious lint in that config only.
+#![cfg_attr(not(feature = "hazmat-mldsa"), allow(unreachable_pub))]
+
 /// Number of coefficients in a polynomial.
 pub(crate) const N: usize = 256;
 /// The modulus `q = 2²³ − 2¹³ + 1`.

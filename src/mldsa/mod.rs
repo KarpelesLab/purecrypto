@@ -921,11 +921,19 @@ const OID_65: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 18];
 #[cfg(feature = "der")]
 const OID_87: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 19];
 
+// Without `der` the `ml_dsa_level!` macro never references these (the SPKI
+// methods that use the OID are themselves `#[cfg(feature = "der")]`), but the
+// macro's positional `$oid` argument is always required, so empty placeholders
+// keep the invocations well-formed. They are intentionally unused in this
+// config — e.g. under `hazmat-mldsa` without `der`.
 #[cfg(not(feature = "der"))]
+#[allow(dead_code)]
 const OID_44: &[u64] = &[];
 #[cfg(not(feature = "der"))]
+#[allow(dead_code)]
 const OID_65: &[u64] = &[];
 #[cfg(not(feature = "der"))]
+#[allow(dead_code)]
 const OID_87: &[u64] = &[];
 
 ml_dsa_level!(
