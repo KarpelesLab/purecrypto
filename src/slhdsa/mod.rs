@@ -1162,4 +1162,88 @@ mod tests {
     fn acvp_siggen_all() {
         check_siggen(false);
     }
+
+    /// Deterministic keygen + sign + verify roundtrip on every fast
+    /// (`f`-flavored) parameter set. Regression guard for the
+    /// `tree_idx_mask` shift overflow (audit C-1): `Sha2_256f` and
+    /// `Shake_256f` panic in a debug build before the fix because
+    /// `h - h_prime = 64`.
+    #[test]
+    fn roundtrip_all_fast_param_sets() {
+        use ParamSet::*;
+        let fast = [
+            Sha2_128f, Sha2_192f, Sha2_256f, Shake_128f, Shake_192f, Shake_256f,
+        ];
+        for set in fast {
+            let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-roundtrip", set.oid_label(), &[]);
+            let (sk, pk) = PrivateKey::generate(set, &mut rng);
+
+            // Hedged sign + verify.
+            let sig = sk.sign(&mut rng, b"purecrypto-kat", b"ctx").unwrap();
+            assert!(pk.verify(&sig, b"purecrypto-kat", b"ctx"), "verify {set:?}");
+            assert!(
+                !pk.verify(&sig, b"other-msg", b"ctx"),
+                "wrong msg verifies {set:?}"
+            );
+            assert!(
+                !pk.verify(&sig, b"purecrypto-kat", b"x"),
+                "wrong ctx verifies {set:?}"
+            );
+            let mut tampered = sig.clone();
+            *tampered.last_mut().unwrap() ^= 1;
+            assert!(
+                !pk.verify(&tampered, b"purecrypto-kat", b"ctx"),
+                "tampered sig verifies {set:?}"
+            );
+
+            // Deterministic sign is reproducible and self-consistent.
+            let d1 = sk.sign_deterministic(b"abc", b"").unwrap();
+            let d2 = sk.sign_deterministic(b"abc", b"").unwrap();
+            assert_eq!(d1, d2, "deterministic mismatch {set:?}");
+            assert!(pk.verify(&d1, b"abc", b""), "det verify {set:?}");
+
+            // Signature length matches the spec.
+            assert_eq!(sig.len(), set.signature_size(), "sig size {set:?}");
+        }
+    }
+
+    /// Roundtrip across every parameter set including the slow `s`-flavored
+    /// ones. Ignored by default because signing for the `s` sets takes
+    /// minutes in debug builds.
+    #[test]
+    #[ignore = "slow in debug; run with --release --ignored"]
+    fn roundtrip_all_param_sets() {
+        use ParamSet::*;
+        let all = [
+            Sha2_128s, Sha2_128f, Sha2_192s, Sha2_192f, Sha2_256s, Sha2_256f, Shake_128s,
+            Shake_128f, Shake_192s, Shake_192f, Shake_256s, Shake_256f,
+        ];
+        for set in all {
+            let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-roundtrip-all", set.oid_label(), &[]);
+            let (sk, pk) = PrivateKey::generate(set, &mut rng);
+            let sig = sk.sign_deterministic(b"purecrypto-kat", b"ctx").unwrap();
+            assert!(pk.verify(&sig, b"purecrypto-kat", b"ctx"), "verify {set:?}");
+            assert_eq!(sig.len(), set.signature_size(), "sig size {set:?}");
+        }
+    }
+
+    impl ParamSet {
+        /// Stable byte label used to personalize the test DRBG per set.
+        fn oid_label(self) -> &'static [u8] {
+            match self {
+                ParamSet::Sha2_128s => b"sha2-128s",
+                ParamSet::Sha2_128f => b"sha2-128f",
+                ParamSet::Sha2_192s => b"sha2-192s",
+                ParamSet::Sha2_192f => b"sha2-192f",
+                ParamSet::Sha2_256s => b"sha2-256s",
+                ParamSet::Sha2_256f => b"sha2-256f",
+                ParamSet::Shake_128s => b"shake-128s",
+                ParamSet::Shake_128f => b"shake-128f",
+                ParamSet::Shake_192s => b"shake-192s",
+                ParamSet::Shake_192f => b"shake-192f",
+                ParamSet::Shake_256s => b"shake-256s",
+                ParamSet::Shake_256f => b"shake-256f",
+            }
+        }
+    }
 }

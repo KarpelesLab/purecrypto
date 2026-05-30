@@ -52,16 +52,35 @@ impl Params {
         ((self.h - self.h_prime + 7) >> 3) as usize
     }
     /// Bit mask for the tree index.
+    ///
+    /// `h - h_prime` reaches 64 for the SHA2-256f and SHAKE-256f sets
+    /// (`h = 68`, `h_prime = 4`); a plain `1u64 << 64` is undefined in
+    /// Rust (debug panic; release wraps the shift count to 0, producing
+    /// mask `0` and a single reused XMSS subtree per signature). FIPS 205
+    /// §9.1 specifies that all 64 bits of the tree-index field are used in
+    /// that case, so return `u64::MAX`.
     pub(crate) fn tree_idx_mask(&self) -> u64 {
-        (1u64 << (self.h - self.h_prime)) - 1
+        let shift = self.h - self.h_prime;
+        if shift >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << shift) - 1
+        }
     }
     /// Byte length of the leaf index.
     pub(crate) fn leaf_idx_len(&self) -> usize {
         ((self.h_prime + 7) >> 3) as usize
     }
     /// Bit mask for the leaf index.
+    ///
+    /// `h_prime` is at most 22 (SHA2-128f), so `1u64 << h_prime` never
+    /// overflows; the same defensive branch is included for symmetry.
     pub(crate) fn leaf_idx_mask(&self) -> u64 {
-        (1u64 << self.h_prime) - 1
+        if self.h_prime >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << self.h_prime) - 1
+        }
     }
 }
 
