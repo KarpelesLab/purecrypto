@@ -101,6 +101,40 @@ fn loopback_with_cookie() {
     assert!(pump_handshake(&mut client, &mut server));
 }
 
+/// Regression (DTLS-cookie fail-closed): a server that requires the cookie
+/// exchange but was never given a `cookie_secret` MUST reject the first
+/// ClientHello and emit NO server flight, rather than silently degrading to
+/// the no-cookie path and serving an unverified, spoofable source.
+#[test]
+fn require_cookie_without_secret_fails_closed_12() {
+    let (server_cfg, cert) = make_server();
+    // `with_ecdsa` already defaults require_cookie_exchange = true; do NOT
+    // call with_cookie_secret, so cookie_secret stays None.
+    let server_cfg = server_cfg.require_cookie_exchange(true);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-failclosed", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    let c1 = client.pop_outbound_datagrams();
+    assert!(!c1.is_empty(), "client should emit CH1");
+    let mut saw_err = false;
+    for dg in &c1 {
+        if server.feed_datagram(dg).is_err() {
+            saw_err = true;
+        }
+    }
+    assert!(
+        saw_err,
+        "cookie-required server with no secret must error on CH1"
+    );
+    // And it must NOT have produced any server flight.
+    assert!(
+        server.pop_outbound_datagrams().is_empty(),
+        "no server flight may be emitted to an unverified source"
+    );
+}
+
 #[test]
 fn reordered_server_flight() {
     // Drive a handshake but deliver the server's first flight in reverse
@@ -406,6 +440,36 @@ mod dtls13 {
         let mut server =
             DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
         assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    /// Regression (DTLS-cookie fail-closed): DTLS 1.3 server with the cookie
+    /// exchange required but no `cookie_secret` must reject the first
+    /// ClientHello and emit no HRR / server flight to a spoofable source.
+    #[test]
+    fn require_cookie_without_secret_fails_closed_13() {
+        let (server_cfg, cert) = make_server13();
+        // require_cookie defaults to true; do NOT set a cookie_secret.
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-failclosed", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        let c1 = client.pop_outbound_datagrams();
+        assert!(!c1.is_empty(), "client should emit CH1");
+        let mut saw_err = false;
+        for dg in &c1 {
+            if server.feed_datagram(dg).is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(
+            saw_err,
+            "cookie-required server with no secret must error on CH1"
+        );
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "no server flight may be emitted to an unverified source"
+        );
     }
 
     /// RFC 8446 §7.5 / RFC 5705 — DTLS 1.3 exporter agrees on both sides
