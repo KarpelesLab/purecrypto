@@ -431,6 +431,15 @@ impl RawPublic for BoxedRsaPublicKey {
     }
 }
 
+impl emsa::PublicModulus for BoxedRsaPublicKey {
+    fn modulus_be_bytes(&self) -> Vec<u8> {
+        // `k`-wide big-endian `n`, matching the width of a validated signature
+        // so the RSAVP1 `s < n` comparison in `emsa::verify_*` is over equal
+        // lengths.
+        self.n.to_be_bytes(self.k)
+    }
+}
+
 impl RawPrivate for BoxedRsaPrivateKey {
     fn key_size(&self) -> usize {
         self.k

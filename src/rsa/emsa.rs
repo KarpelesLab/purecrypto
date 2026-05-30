@@ -21,6 +21,52 @@ pub(crate) trait RawPublic {
     fn raw_public(&self, m: &[u8]) -> Vec<u8>;
 }
 
+/// Exposes the modulus `n` as a `k`-byte big-endian buffer so signature
+/// verification can enforce RFC 8017 §5.2.2 RSAVP1 step 1 (`0 <= s < n`)
+/// before applying the public op. Without this check, the Montgomery `pow`
+/// implicitly reduces the base mod `n`, so `s + t·n` would verify identically
+/// to `s` — a signature-malleability gap.
+///
+/// This is a separate trait from [`RawPublic`] so that the two public-key
+/// backends (const-generic `RsaPublicKey` and runtime-sized
+/// `BoxedRsaPublicKey`) each supply it from the module that owns their
+/// modulus, without routing `n` through the raw primitive (which would also
+/// affect the signing / encryption callers that legitimately operate on
+/// values already reduced mod `n`).
+pub(crate) trait PublicModulus {
+    /// The modulus `n` as exactly `key_size()` big-endian octets.
+    fn modulus_be_bytes(&self) -> Vec<u8>;
+}
+
+/// Constant-time `a < b` for two equal-length big-endian byte slices.
+///
+/// Walks every byte; the running time depends only on the (public) length,
+/// not on where the slices first differ. Used to reject signature
+/// representatives `s >= n` (RFC 8017 §5.2.2 step 1) without an early-exit
+/// that would leak the magnitude of `s` relative to `n`.
+fn ct_lt_be(a: &[u8], b: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), b.len());
+    // `lt` is set (low bit 1) once a strictly-smaller higher-order byte has
+    // been seen, `gt` likewise for strictly-greater. Only the first differing
+    // position (scanning MSB -> LSB) may flip a flag, since each update is
+    // gated on neither flag being set yet; the final `lt` is therefore the
+    // big-integer comparison. No data-dependent branches.
+    let mut lt: u8 = 0;
+    let mut gt: u8 = 0;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let undecided = !(lt | gt);
+        lt |= undecided & ct_lt_u8(x, y);
+        gt |= undecided & ct_lt_u8(y, x);
+    }
+    (lt & 1) == 1
+}
+
+/// Returns `0xff` if `a < b`, else `0x00`, in constant time.
+#[inline]
+fn ct_lt_u8(a: u8, b: u8) -> u8 {
+    0u8.wrapping_sub(a.ct_lt(&b).unwrap_u8())
+}
+
 /// The raw RSA private operation (`c^d mod n`) plus modulus metadata.
 pub(crate) trait RawPrivate {
     /// Modulus length in octets (`k`).
@@ -232,7 +278,7 @@ pub(crate) fn sign_pkcs1v15<D: Pkcs1Digest, K: RawPrivate>(
     Ok(key.raw_private(&em))
 }
 
-pub(crate) fn verify_pkcs1v15<D: Pkcs1Digest, K: RawPublic>(
+pub(crate) fn verify_pkcs1v15<D: Pkcs1Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
@@ -240,6 +286,14 @@ pub(crate) fn verify_pkcs1v15<D: Pkcs1Digest, K: RawPublic>(
     let k = key.key_size();
     if sig.len() != k {
         return Err(Error::InvalidLength);
+    }
+    // RFC 8017 §5.2.2 RSAVP1 step 1: reject the signature representative unless
+    // `0 <= s < n`. The Montgomery `pow` would otherwise reduce `s` mod `n`
+    // implicitly, so `s + t·n` would verify identically to `s` (signature
+    // malleability). `sig` is already exactly `k` bytes (length checked above)
+    // and `n`'s buffer is `k` bytes, so the comparison is over equal widths.
+    if !ct_lt_be(sig, &key.modulus_be_bytes()) {
+        return Err(Error::Verification);
     }
     let em = key.raw_public(sig);
     let expected = encode_pkcs1v15::<D>(msg, k)?;
@@ -296,7 +350,7 @@ pub(crate) fn sign_pss<D: Digest, K: RawPrivate, R: RngCore>(
     Ok(key.raw_private(&em))
 }
 
-pub(crate) fn verify_pss<D: Digest, K: RawPublic>(
+pub(crate) fn verify_pss<D: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
@@ -305,9 +359,24 @@ pub(crate) fn verify_pss<D: Digest, K: RawPublic>(
     if sig.len() != k {
         return Err(Error::InvalidLength);
     }
+    // RFC 8017 §5.2.2 RSAVP1 step 1: reject `s >= n` (see verify_pkcs1v15 for
+    // why the implicit Montgomery reduction makes this a malleability gap).
+    if !ct_lt_be(sig, &key.modulus_be_bytes()) {
+        return Err(Error::Verification);
+    }
     let m = key.raw_public(sig);
     let em_bits = key.modulus_bits() - 1;
     let em_len = em_bits.div_ceil(8);
+    // RFC 8017 §9.1.2 EMSA-PSS-VERIFY step 5 (read as the inverse of EME-PSS
+    // step 12 in §8.1.1): when `em_len < k` (modulus top byte < 0x80) the
+    // leading `k - em_len` octets of `m` are not part of the encoded message
+    // and MUST be zero. Slicing them away silently — as the previous code did
+    // — would accept a representative whose high octets are nonzero. With the
+    // `s < n` check above this is already implied, but RFC 8017 requires the
+    // explicit check, so we keep it.
+    if m[..k - em_len].iter().any(|&b| b != 0) {
+        return Err(Error::Verification);
+    }
     emsa_pss_verify::<D>(msg, &m[k - em_len..], em_bits)
 }
 
@@ -596,5 +665,205 @@ mod tests {
         let ct = pk.encrypt_oaep::<Sha256, _>(msg, label, &mut rng).unwrap();
         let pt = key.decrypt_oaep::<Sha256>(&ct, label).unwrap();
         assert_eq!(pt.as_slice(), msg);
+    }
+
+    // ----------------------------------------------------------------------
+    // F4: RSAVP1 step 1 (`s < n`) + strict PSS leading-octet check.
+    // ----------------------------------------------------------------------
+
+    use crate::bignum::Uint;
+    use crate::rsa::{Error, RsaPrivateKey};
+    use crate::test_util::rsa_test_key_a;
+
+    /// A const-generic private key holding the embedded 2048-bit test key but
+    /// carried in **33 limbs** (`k = 264` octets) instead of the minimal 32.
+    ///
+    /// Because the modulus only occupies ~2048 of the 2112 available bits, its
+    /// top 8 octets are zero (`n < 2^(8·k)` with margin). This buys two things
+    /// the minimal-width boxed keys cannot give a test:
+    ///  * `s + n < 2^2048 + 2^2048 < 2^2112`, so the malleable representative
+    ///    `s + n` fits in `k = 264` octets and round-trips as a value `>= n` —
+    ///    the exact thing RSAVP1 step 1 must reject. With a full-width modulus
+    ///    `s + n` would overflow `k` octets and not be expressible.
+    ///  * `em_len = ceil(2047/8) = 256 < k`, so `k - em_len = 8` leading octets
+    ///    are dropped by `verify_pss` — exercising the strict leading-octet
+    ///    zero-check (RFC 8017 §9.1.2, F4 part 2).
+    ///
+    /// Built via `from_components` (no primes → unblinded path), which is fine:
+    /// signing correctness only needs `d`.
+    fn widened_test_key_33() -> RsaPrivateKey<33> {
+        let key = rsa_test_key_a();
+        let widen = |v: &Uint<32>| -> Uint<33> {
+            let mut be = [0u8; 33 * 8];
+            // Right-align the 32-limb big-endian bytes into the 33-limb buffer.
+            v.write_be_bytes(&mut be[8..]);
+            Uint::<33>::from_be_bytes(&be)
+        };
+        RsaPrivateKey::<33>::from_components(
+            widen(key.modulus()),
+            widen(key.exponent()),
+            widen(key.private_exponent()),
+        )
+    }
+
+    /// Re-serializes `s + n` to exactly `k` big-endian octets. Asserts the sum
+    /// still fits in `k` octets (requires a non-full-width modulus).
+    fn sig_plus_modulus(sig: &[u8], n: &Uint<33>) -> alloc::vec::Vec<u8> {
+        let k = sig.len();
+        let s = BoxedUint::from_be_bytes(sig);
+        let n_boxed = BoxedUint::from_be_bytes(&{
+            let mut b = alloc::vec![0u8; k];
+            n.write_be_bytes(&mut b);
+            b
+        });
+        let sum = s.add(&n_boxed);
+        assert!(
+            sum.bit_len() <= 8 * k,
+            "s + n overflowed k octets — test needs a non-full-width modulus"
+        );
+        sum.to_be_bytes(k)
+    }
+
+    /// (a) A genuine signature still verifies, and (b) `s + n` (re-serialized to
+    /// the `k`-octet key width) is rejected, for PKCS#1 v1.5 on the
+    /// **const-generic** verify path.
+    ///
+    /// PKCS#1 v1.5 sizes the encoded message to `k = LIMBS·8` octets, so the
+    /// widened (over-provisioned-limb) key cannot be used here — its EM would
+    /// exceed the modulus and signing would not round-trip. We instead use the
+    /// natural 32-limb 2048-bit key (full width) and, like the boxed sibling
+    /// test, scan messages for one whose `s + n` still fits in `k` octets.
+    #[test]
+    fn pkcs1v15_rejects_s_plus_n() {
+        let sk = rsa_test_key_a();
+        let pk = sk.public_key();
+        let n = {
+            let mut nb = [0u8; 256];
+            sk.modulus().write_be_bytes(&mut nb);
+            BoxedUint::from_be_bytes(&nb)
+        };
+        let k = 256;
+
+        for i in 0u32..256 {
+            let mut msg = *b"f4-cg-s-plus-n-0000";
+            msg[15..].copy_from_slice(&i.to_be_bytes());
+            let sig = sk.sign_pkcs1v15::<Sha256>(&msg).unwrap();
+            // (a) the honest signature verifies on the const-generic path.
+            pk.verify_pkcs1v15::<Sha256>(&msg, &sig).unwrap();
+
+            let s = BoxedUint::from_be_bytes(&sig);
+            let sum = s.add(&n);
+            if sum.bit_len() > 8 * k {
+                continue; // s + n overflows k octets — not representable.
+            }
+            // (b) s + n is the malleable representative — must be rejected.
+            let mal = sum.to_be_bytes(k);
+            assert_ne!(mal, sig, "s + n must differ from s");
+            assert_eq!(
+                pk.verify_pkcs1v15::<Sha256>(&msg, &mal),
+                Err(Error::Verification),
+                "const-generic: s + n must be rejected (RSAVP1 step 1)"
+            );
+            return;
+        }
+        panic!("no message yielded a representable s + n in 256 tries");
+    }
+
+    /// (a) A genuine PSS signature still verifies, and (b) `s + n` is rejected.
+    /// The widened modulus also drives `verify_pss` through the leading-octet
+    /// drop (`k - em_len = 8 > 0`), so part (a) doubles as the strict
+    /// leading-zero-octet path (F4 part 2): a correct zero-check accepts a
+    /// legitimately zero-padded `m`.
+    #[test]
+    fn pss_rejects_s_plus_n_and_exercises_leading_octet() {
+        let sk = widened_test_key_33();
+        let pk = sk.public_key();
+
+        // Confirm the leading-octet path is exercised: k - em_len > 0.
+        let k = 33 * 8;
+        let em_len = (pk.modulus().bit_len() - 1).div_ceil(8);
+        assert!(
+            k - em_len > 0,
+            "expected a non-full-width modulus (k - em_len = {})",
+            k - em_len
+        );
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"f4-pss", b"nonce", &[]);
+        let msg = b"f4 pss";
+        let sig = sk.sign_pss::<Sha256, _>(msg, &mut rng).unwrap();
+
+        // (a) valid signature verifies through the leading-octet drop path.
+        pk.verify_pss::<Sha256>(msg, &sig).unwrap();
+
+        // (b) s + n must be rejected.
+        let mal = sig_plus_modulus(&sig, pk.modulus());
+        assert_ne!(mal, sig, "s + n must differ from s");
+        assert_eq!(
+            pk.verify_pss::<Sha256>(msg, &mal),
+            Err(Error::Verification),
+            "PSS s + n must be rejected (RSAVP1 step 1)"
+        );
+    }
+
+    /// The boxed verify path (minimal-width modulus) also rejects `s + n`.
+    /// A full-width 2048-bit modulus has the top bit set, so `s + n` overflows
+    /// `k` octets for roughly half of all signatures; we scan messages until we
+    /// find one whose `s + n` still fits in `k` octets (and is therefore a
+    /// representable value `>= n`), then assert it is rejected.
+    #[test]
+    fn boxed_pkcs1v15_rejects_s_plus_n() {
+        let key = rsa_test_key_a();
+        let mut nb = [0u8; 256];
+        key.modulus().write_be_bytes(&mut nb);
+        let mut eb = [0u8; 256];
+        key.exponent().write_be_bytes(&mut eb);
+        let boxed_pk = crate::rsa::BoxedRsaPublicKey::new(
+            BoxedUint::from_be_bytes(&nb),
+            BoxedUint::from_be_bytes(&eb),
+        );
+        let n = BoxedUint::from_be_bytes(&nb);
+        let k = 256;
+
+        for i in 0u32..256 {
+            let mut msg = *b"f4-boxed-s-plus-n-0000";
+            msg[18..].copy_from_slice(&i.to_be_bytes());
+            let sig = key.sign_pkcs1v15::<Sha256>(&msg).unwrap();
+            // Sanity: the honest signature verifies on the boxed path.
+            boxed_pk.verify_pkcs1v15::<Sha256>(&msg, &sig).unwrap();
+
+            let s = BoxedUint::from_be_bytes(&sig);
+            let sum = s.add(&n);
+            if sum.bit_len() > 8 * k {
+                continue; // s + n overflows k octets — not representable here.
+            }
+            let mal = sum.to_be_bytes(k);
+            assert_ne!(mal, sig);
+            assert_eq!(
+                boxed_pk.verify_pkcs1v15::<Sha256>(&msg, &mal),
+                Err(Error::Verification),
+                "boxed: s + n must be rejected (RSAVP1 step 1)"
+            );
+            return; // found a representable s + n and asserted rejection.
+        }
+        panic!("no message yielded a representable s + n in 256 tries");
+    }
+
+    /// Direct unit test for the constant-time big-endian comparator used by the
+    /// RSAVP1 check, covering equal / less / greater across byte positions.
+    #[test]
+    fn ct_lt_be_matches_integer_order() {
+        let cases: &[(&[u8], &[u8], bool)] = &[
+            (&[0, 0, 0], &[0, 0, 0], false), // equal
+            (&[0, 0, 1], &[0, 0, 2], true),  // differ in LSB
+            (&[0, 1, 0], &[0, 2, 0], true),  // differ in middle
+            (&[1, 0, 0], &[2, 0, 0], true),  // differ in MSB
+            (&[2, 0, 0], &[1, 0, 0], false), // greater in MSB
+            (&[0, 2, 0], &[1, 0, 0], true),  // MSB dominates over middle
+            (&[0xff, 0xff], &[0xff, 0xff], false),
+            (&[0x7f, 0xff], &[0x80, 0x00], true),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(super::ct_lt_be(a, b), *want, "ct_lt_be({a:?}, {b:?})");
+        }
     }
 }

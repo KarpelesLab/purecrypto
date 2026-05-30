@@ -208,6 +208,17 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 }
 
+impl<const LIMBS: usize> super::emsa::PublicModulus for RsaPublicKey<LIMBS> {
+    fn modulus_be_bytes(&self) -> alloc::vec::Vec<u8> {
+        // `key_size() == LIMBS * 8` big-endian octets of `n`, matching the
+        // width of a validated signature so the RSAVP1 `s < n` comparison in
+        // `emsa::verify_*` is over equal lengths.
+        let mut buf = alloc::vec![0u8; LIMBS * 8];
+        self.n.write_be_bytes(&mut buf);
+        buf
+    }
+}
+
 // Best-effort zeroize on drop: the private exponent `d`, primes `p`/`q`,
 // blinding `phi_n_minus_1`, and the HMAC seed all live in fixed-size
 // stack arrays that would otherwise be returned to the allocator (or the
