@@ -2340,6 +2340,106 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
     }
 
+    /// RFC 8446 §4.1.3: a ServerHello selecting a cipher_suite the client did
+    /// NOT offer MUST be aborted with `illegal_parameter`. Offer only
+    /// AES_128_GCM_SHA256 but have the server pick AES_256_GCM_SHA384. The
+    /// key_share names the offered group, so the cipher_suite is the only
+    /// un-offered parameter.
+    #[test]
+    fn rejects_unoffered_cipher_suite_in_server_hello() {
+        use crate::tls::codec::{ExtensionType, ServerHello, put_u16, write_record};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"unoffered-suite-client", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let _ch1 = client.write_tls();
+
+        let sv_body = alloc::vec![0x03, 0x04];
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, NamedGroup::X25519.0);
+        let key_body: Vec<u8> = alloc::vec![0u8; 32];
+        crate::tls::codec::with_len_u16(&mut ks_body, |b| b.extend_from_slice(&key_body));
+        let sh = ServerHello {
+            random: [0x22; 32],
+            session_id: Vec::new(),
+            // AES_256_GCM_SHA384 is supported by the library but was NOT offered.
+            cipher_suite: CipherSuite::AES_256_GCM_SHA384,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, sv_body),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        );
+        client.read_tls(&out);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
+    /// RFC 8446 §4.1.3: a ServerHello whose key_share names a group the client
+    /// did NOT offer MUST be aborted with `illegal_parameter`. Offer only
+    /// X25519 but have the server's key_share name SECP256R1. The cipher_suite
+    /// is offered, so the key_share group is the only un-offered parameter.
+    #[test]
+    fn rejects_unoffered_key_share_group_in_server_hello() {
+        use crate::tls::codec::{ExtensionType, ServerHello, put_u16, write_record};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"unoffered-group-client", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let _ch1 = client.write_tls();
+
+        let sv_body = alloc::vec![0x03, 0x04];
+        // key_share for SECP256R1 (un-offered). The group is rejected before
+        // the public key is ever used, so a placeholder body suffices.
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, NamedGroup::SECP256R1.0);
+        let key_body: Vec<u8> = alloc::vec![0u8; 65];
+        crate::tls::codec::with_len_u16(&mut ks_body, |b| b.extend_from_slice(&key_body));
+        let sh = ServerHello {
+            random: [0x33; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, sv_body),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let mut out = Vec::new();
+        write_record(
+            &mut out,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &sh.encode(),
+        );
+        client.read_tls(&out);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
     /// A `ChangeCipherSpec` record after the handshake completes is rejected
     /// with `unexpected_message` per RFC 8446 §5.
     #[test]

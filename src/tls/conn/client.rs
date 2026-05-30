@@ -1680,6 +1680,12 @@ impl ClientConnection {
             return Err(Error::IllegalParameter);
         }
 
+        // RFC 8446 §4.1.3: the server MUST select a cipher_suite the client
+        // offered in this ClientHello. Reject any other suite with
+        // illegal_parameter (mirrors the HRR path's offered-suite check).
+        if !self.offered_suites.contains(&sh.cipher_suite) {
+            return Err(Error::IllegalParameter);
+        }
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         // Confirm TLS 1.3 was selected.
         let sv = ext::find(
@@ -1704,6 +1710,12 @@ impl ClientConnection {
         let ks_ext = ext::find(&sh.extensions, crate::tls::codec::ExtensionType::KEY_SHARE)
             .ok_or(Error::HandshakeFailure)?;
         let (group, server_pub) = ext::parse_server_key_share(ks_ext)?;
+        // RFC 8446 §4.1.3: the server's key_share group MUST be one the client
+        // offered (and for which we therefore hold a private key). Reject any
+        // other group with illegal_parameter (mirrors the HRR path's check).
+        if !self.offered_groups.contains(&group) {
+            return Err(Error::IllegalParameter);
+        }
         let shared = self.key_agreement(group, &server_pub)?;
 
         // PSK acceptance: if the server echoes pre_shared_key in SH with
