@@ -15,16 +15,22 @@
 //! Also exposes X25519 ([`x25519`]) and Ed25519 ([`ed25519`]).
 
 pub mod boxed;
+mod curve25519;
 pub mod curves;
 pub mod ecdh;
 pub mod ecdsa;
 pub mod ed25519;
-mod curve25519;
+pub mod edwards25519;
 mod p256;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;
+<<<<<<< HEAD
 #[cfg(feature = "hazmat-secp256k1")]
 pub mod secp256k1;
+=======
+#[cfg(feature = "ristretto255")]
+pub mod ristretto255;
+>>>>>>> c001460 (ec: add edwards25519::hazmat low-level group/scalar API (Stage 5, Items 1+2))
 mod weierstrass;
 pub mod x25519;
 

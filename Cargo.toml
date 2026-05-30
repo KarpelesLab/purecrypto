@@ -66,6 +66,15 @@ dtls = ["tls"]
 # Requires `std` for `std::sync::Mutex` used in the TLS-engine ⇄ QuicConnection
 # hook bridge (the trait `QuicHooks: Send` forbids `Rc<RefCell<…>>`).
 quic = ["tls", "std"]
+# hazmat: low-level arithmetic exposures with NO semver-stability guarantee;
+# the caller owns correctness and constant-time discipline. Off by default.
+# `edwards25519::hazmat` exposes the order-L `Scalar` and the `EdwardsPoint`
+# group over the shared curve25519 backend (for FROST / threshold callers).
+hazmat-edwards25519 = ["ec"]
+# ristretto255 (RFC 9496) — a STABLE public prime-order group module (not
+# hazmat), the natural FROST dependency. Shares the order-L `Scalar` with
+# `edwards25519::hazmat`.
+ristretto255 = ["ec", "hash", "rng"]
 # ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
 # the RNG trait are required.
 mlkem = ["hash", "rng"]

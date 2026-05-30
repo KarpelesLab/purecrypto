@@ -11,7 +11,7 @@ use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLes
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`, all in
 /// Montgomery form.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct Point {
     pub(crate) x: Fe,
     pub(crate) y: Fe,
