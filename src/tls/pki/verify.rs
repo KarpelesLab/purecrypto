@@ -357,59 +357,131 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
     Ok(())
 }
 
-/// RFC 5280 §6.1.4 — name-constraints enforcement.
+/// RFC 5280 §6.1.4 — name-constraints propagation.
 ///
-/// Each CA above the leaf may declare permitted/excluded subtrees of
-/// GeneralNames. The leaf's SAN entries must satisfy:
-///   * for every CA that declares **any** permitted dNSName subtree, the
-///     leaf's DNS SANs must each match at least one such entry (intersection
-///     across CAs); same for iPAddress.
-///   * for every excluded subtree (union across CAs), the leaf must NOT
-///     match (any match is fatal).
+/// A CA's `nameConstraints` extension applies to **every** certificate that
+/// appears below it in the path — each subordinate intermediate CA *and* the
+/// end-entity leaf — not only the leaf. The earlier implementation collected
+/// every CA's permitted/excluded subtrees and applied them solely to the
+/// leaf's SAN entries, so a constrained CA could issue an out-of-constraint
+/// sub-CA that then issued an in-constraint leaf and the chain wrongly
+/// validated (the intermediate's own names were never checked).
 ///
-/// Constraints referencing GeneralName variants other than dNSName /
-/// iPAddress are skipped here — `check_critical_extensions_recognized`
-/// has already rejected the chain if any such constraint was critical.
+/// This walks the presented chain from the topmost supplied CA downward: as
+/// each CA's constraints come into scope, they are enforced against the names
+/// of every certificate beneath it (intermediates and leaf), using the same
+/// `dns_in_subtree` / `ip_in_subtree` matchers. For each such certificate its
+/// dNSName / iPAddress SAN entries must satisfy, for every in-scope CA
+/// constraint:
+///   * the cert must NOT match any excluded subtree (any match is fatal);
+///   * when a CA declares ANY permitted dNSName subtree, each of the cert's
+///     DNS SANs must match at least one such entry; same for iPAddress.
+///
+/// Scope / limitations:
+///   * The matched trust anchor lives in the [`RootCertStore`], which retains
+///     only the anchor's subject name + public key — not the anchor's full
+///     certificate. A `nameConstraints` extension on the anchor (root) cert
+///     itself therefore cannot be brought into scope here; only constraints
+///     declared by CAs that appear in the presented chain (i.e.
+///     intermediates) are enforced. In practice constrained CAs are deployed
+///     as intermediates, which ARE in the chain. Enforcing anchor-resident
+///     constraints would require the store to retain the anchor DER —
+///     flagged-for-review, out of scope for this change.
+///   * directoryName (subject DN) subtree constraints are NOT evaluated: the
+///     parsed [`crate::x509::NameConstraints`] surfaces only dNSName and
+///     iPAddress subtrees, and any constraint referencing another
+///     GeneralName variant (including directoryName) sets a
+///     `has_unenforceable_*` flag that causes
+///     `check_critical_extensions_recognized` to reject the chain when the
+///     constraint is critical. directoryName-subtree matching is therefore
+///     flagged-for-review rather than implemented (possibly-wrong) here.
+///   * Constraints referencing GeneralName variants other than dNSName /
+///     iPAddress are skipped — a critical such constraint has already been
+///     rejected upstream.
 fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
-    // Collect each CA's constraints in chain order (leaf-adjacent first).
-    let mut cas_constraints: Vec<crate::x509::NameConstraints> = Vec::new();
+    // Pre-parse each certificate's own constraints (only CAs, indices
+    // 1..=last, can declare governing constraints; index 0 is the leaf). The
+    // owned values live here so the `&` borrows accumulated in `in_scope`
+    // remain valid for the whole walk.
+    let mut ca_constraints: Vec<Option<crate::x509::NameConstraints>> =
+        Vec::with_capacity(certs.len());
+    ca_constraints.push(None); // leaf
     for cert in certs.iter().skip(1) {
-        if let Some(nc) = cert.name_constraints().map_err(|_| Error::BadCertificate)? {
-            cas_constraints.push(nc);
+        ca_constraints.push(cert.name_constraints().map_err(|_| Error::BadCertificate)?);
+    }
+
+    // Walk from the topmost supplied CA (`certs[last]`) down to the leaf
+    // (`certs[0]`). The CA at index `i` issues the certificate at index
+    // `i - 1`, so a CA's constraints govern every certificate at a strictly
+    // lower index. We accumulate constraints as they come into scope (higher
+    // CAs first) and, for each subordinate certificate, enforce all in-scope
+    // CAs' constraints against that certificate's own SAN names.
+    let mut in_scope: Vec<&crate::x509::NameConstraints> = Vec::new();
+    for idx in (0..certs.len()).rev() {
+        // Constraints declared by CAs above this position must hold for the
+        // certificate at `idx`. Only meaningful once at least one such
+        // constraint is in scope, i.e. for certificates that have a
+        // constraint-declaring CA above them.
+        if !in_scope.is_empty() {
+            enforce_constraints_on_cert(&certs[idx], &in_scope)?;
+        }
+        // This certificate's own constraints (if it is a CA that declared
+        // any) now come into scope for every certificate below it.
+        if let Some(nc) = &ca_constraints[idx] {
+            in_scope.push(nc);
         }
     }
-    if cas_constraints.is_empty() {
+    Ok(())
+}
+
+/// Enforces the accumulated, in-scope name constraints (`active`) against a
+/// single subordinate certificate's dNSName and iPAddress SAN entries.
+///
+/// Each constraint in `active` is checked independently (intersection
+/// semantics across CAs): an excluded match in any CA is fatal, and a CA that
+/// declares any permitted dNSName / iPAddress subtree requires every
+/// corresponding SAN of `cert` to fall within one of its entries.
+fn enforce_constraints_on_cert(
+    cert: &Certificate,
+    active: &[&crate::x509::NameConstraints],
+) -> Result<(), Error> {
+    let dns = cert
+        .subject_alt_names()
+        .map_err(|_| Error::BadCertificate)?;
+    let ips = cert.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
+
+    // Close the CN-fallback bypass and refuse SAN-less certificates that are
+    // governed by an active *permitted* constraint: the dNSName / iPAddress
+    // checks below only iterate SAN entries, so a certificate with no SAN
+    // would slip past every permitted-subtree constraint trivially (and for
+    // the leaf, `verify_hostname` would then fall back to commonName). When
+    // some active CA declared a permitted dNSName / iPAddress subtree, require
+    // the certificate to carry a SAN so those constraints can apply. (Modern
+    // PKI — CA/B Forum BR §7.1.4.2 — already requires SAN on server certs.)
+    // A CA that declared ONLY excluded subtrees does not by itself force a
+    // SAN to exist (RFC 5280: a name absent from the cert cannot violate an
+    // exclusion). This preserves the original leaf behavior while extending
+    // it to every governed subordinate certificate.
+    if dns.is_empty() && ips.is_empty() {
+        let any_permitted = active
+            .iter()
+            .any(|nc| !nc.permitted_dns.is_empty() || !nc.permitted_ip.is_empty());
+        if any_permitted {
+            return Err(Error::BadCertificate);
+        }
         return Ok(());
     }
 
-    let leaf = &certs[0];
-    let leaf_dns = leaf
-        .subject_alt_names()
-        .map_err(|_| Error::BadCertificate)?;
-    let leaf_ips = leaf.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
-
-    // Close the CN-fallback bypass: `verify_hostname` falls back to the
-    // subject commonName when the leaf has no SAN. The constraint loop
-    // below only iterates SAN entries, so a leaf with no SAN slips past
-    // every dNSName / iPAddress constraint trivially. When a CA in this
-    // chain declared name constraints, demand the leaf actually carry a
-    // SAN so the constraints can apply. Modern PKI (CA/B Forum BR
-    // §7.1.4.2) already requires SAN on server certs; this just refuses
-    // to validate constraint-bearing chains against a SAN-less leaf.
-    if leaf_dns.is_empty() && leaf_ips.is_empty() {
-        return Err(Error::BadCertificate);
-    }
-
-    for nc in &cas_constraints {
-        // Excluded subtrees: any match in any CA is fatal.
-        for name in &leaf_dns {
+    for nc in active {
+        // Excluded subtrees: any match in any in-scope CA is fatal.
+        for name in &dns {
             for base in &nc.excluded_dns {
                 if dns_in_subtree(name, base) {
                     return Err(Error::BadCertificate);
                 }
             }
         }
-        for ip in &leaf_ips {
+        for ip in &ips {
             let bytes = match ip {
                 crate::x509::SanIp::V4(b) => &b[..],
                 crate::x509::SanIp::V6(b) => &b[..],
@@ -421,9 +493,9 @@ fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
             }
         }
         // Permitted subtrees: when this CA declares ANY permitted dNSName
-        // subtree, every leaf DNS SAN must match at least one of them.
+        // subtree, every DNS SAN of `cert` must match at least one of them.
         if !nc.permitted_dns.is_empty() {
-            for name in &leaf_dns {
+            for name in &dns {
                 if !nc
                     .permitted_dns
                     .iter()
@@ -434,7 +506,7 @@ fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
             }
         }
         if !nc.permitted_ip.is_empty() {
-            for ip in &leaf_ips {
+            for ip in &ips {
                 let bytes = match ip {
                     crate::x509::SanIp::V4(b) => &b[..],
                     crate::x509::SanIp::V6(b) => &b[..],
@@ -1671,6 +1743,179 @@ mod tests {
                 Some(&now),
                 &policy(),
             ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    // ----------------------------------------------------------------------
+    // RFC 5280 §6.1.4 propagation regression tests: a CA's nameConstraints
+    // must apply to EVERY subordinate certificate (intermediates + leaf), not
+    // only the end-entity leaf. The constraint is declared on the topmost
+    // in-chain intermediate (`sub1`) — the trust anchor (root) lives in the
+    // store, which retains only its name + key, so a root-resident constraint
+    // could not be enforced; `sub1` IS part of the presented chain.
+    // ----------------------------------------------------------------------
+
+    /// Builds `root → sub1 → sub2 → leaf`. `sub1` (topmost in-chain
+    /// intermediate) declares `nameConstraints` permitting only
+    /// `.example.com`. `sub2_san` is sub-CA-2's dNSName SAN; `leaf_san` is the
+    /// leaf's. The root is unconstrained. Returns `(root, sub1, sub2, leaf)`.
+    #[allow(clippy::type_complexity)]
+    fn build_propagation_chain(
+        sub2_san: &str,
+        leaf_san: &str,
+    ) -> (Certificate, Certificate, Certificate, Certificate) {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, GeneralName, KeyUsageBits,
+            extension::{
+                basic_constraints, extended_key_usage, key_usage, name_constraints,
+                subject_alt_name,
+            },
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"nc-propagate", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let sub1_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let sub2_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let sub1_signer = CertSigner::Ecdsa(&sub1_key);
+        let sub2_signer = CertSigner::Ecdsa(&sub2_key);
+
+        let root_name = DistinguishedName::common_name("prop-root");
+        let sub1_name = DistinguishedName::common_name("prop-sub1");
+        let sub2_name = DistinguishedName::common_name("prop-sub2");
+        let leaf_name = DistinguishedName::common_name("prop-leaf");
+
+        // Unconstrained root (anchor; its own constraints could not be
+        // enforced from the store anyway).
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+
+        // Topmost in-chain intermediate constrains the subtree below it to
+        // `.example.com`. It declares no SAN of its own (the constraint it
+        // declares governs its subordinates, not itself).
+        let sub1_pub = crate::x509::AnyPublicKey::Ecdsa(sub1_key.public_key());
+        let sub1 = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &sub1_name,
+            &sub1_pub,
+            &validity(),
+            2,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+                name_constraints(&[GeneralName::Dns(".example.com".into())], &[]),
+            ],
+        )
+        .unwrap();
+
+        // Sub-CA-2: a subordinate CA governed by sub1's constraint. Its own
+        // SAN is `sub2_san`.
+        let sub2_pub = crate::x509::AnyPublicKey::Ecdsa(sub2_key.public_key());
+        let sub2 = Certificate::issue_with_extensions(
+            &sub1_signer,
+            &sub1_name,
+            &sub2_name,
+            &sub2_pub,
+            &validity(),
+            3,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+                subject_alt_name(&[GeneralName::Dns(sub2_san.into())]),
+            ],
+        )
+        .unwrap();
+
+        // Leaf signed by sub2, with SAN `leaf_san`.
+        let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+        let leaf = Certificate::issue_with_extensions(
+            &sub2_signer,
+            &sub2_name,
+            &leaf_name,
+            &leaf_pub,
+            &validity(),
+            4,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[GeneralName::Dns(leaf_san.into())]),
+            ],
+        )
+        .unwrap();
+        (root, sub1, sub2, leaf)
+    }
+
+    /// Case a: a constraint-declaring intermediate (`sub1` permits
+    /// `.example.com`) plus an out-of-constraint sub-CA (`sub2`'s own SAN is
+    /// `evil.com`) plus an in-constraint leaf MUST be rejected — the sub-CA
+    /// violates `sub1`'s constraint even though the leaf is in-scope. The old
+    /// leaf-only check wrongly accepted this; it never looked at the
+    /// intermediate's names.
+    #[test]
+    fn name_constraints_reject_out_of_scope_intermediate() {
+        let (root, sub1, sub2, leaf) = build_propagation_chain("evil.com", "host.example.com");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            sub2.to_der().to_vec(),
+            sub1.to_der().to_vec(),
+        ];
+        assert!(matches!(
+            verify_chain(&store, &chain, Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// Case b: a fully in-constraint chain (the sub-CA below the constraint
+    /// and the leaf both within `.example.com`) still validates.
+    #[test]
+    fn name_constraints_accept_fully_in_scope_chain() {
+        let (root, sub1, sub2, leaf) =
+            build_propagation_chain("ca2.example.com", "host.example.com");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            sub2.to_der().to_vec(),
+            sub1.to_der().to_vec(),
+        ];
+        verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+    }
+
+    /// Variant of (a): the sub-CA is in-scope but the LEAF is out-of-scope —
+    /// still rejected (the leaf check was already correct, and propagation
+    /// must not regress it).
+    #[test]
+    fn name_constraints_reject_out_of_scope_leaf_below_in_scope_intermediate() {
+        let (root, sub1, sub2, leaf) = build_propagation_chain("ca2.example.com", "host.evil.com");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            sub2.to_der().to_vec(),
+            sub1.to_der().to_vec(),
+        ];
+        assert!(matches!(
+            verify_chain(&store, &chain, Some(&now), &policy()),
             Err(Error::BadCertificate)
         ));
     }
