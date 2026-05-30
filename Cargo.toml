@@ -68,6 +68,10 @@ mlkem = ["hash", "rng"]
 # ML-DSA (FIPS 204) signatures. Needs alloc for the variable-width signature
 # encoding; the polynomial arithmetic itself is on the stack.
 mldsa = ["hash", "rng", "alloc"]
+# Unstable low-level ML-DSA access (`mldsa::hazmat`): raw NTT / field / sampling
+# / packing / rounding primitives for threshold signing. NO semver guarantee;
+# the caller owns correctness and constant-time discipline. Off by default.
+hazmat-mldsa = ["mldsa"]
 # SLH-DSA (FIPS 205) hash-based signatures. Needs alloc for the large
 # signatures (up to ~50 KB); built purely from the hash primitives.
 slhdsa = ["hash", "rng", "alloc"]

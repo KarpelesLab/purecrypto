@@ -53,18 +53,20 @@ pub(crate) fn mul(a: u32, b: u32) -> u32 {
 }
 
 /// A degree-255 polynomial (ring or NTT element; same representation).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Poly {
-    pub(crate) c: [u32; N],
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Poly {
+    /// The 256 coefficients, each a field element in `[0, q)`.
+    pub c: [u32; N],
 }
 
 impl Poly {
-    pub(crate) fn zero() -> Self {
+    /// The zero polynomial.
+    pub fn zero() -> Self {
         Poly { c: [0; N] }
     }
 
     /// Coefficient-wise `self + other`.
-    pub(crate) fn add(&self, other: &Poly) -> Poly {
+    pub fn add(&self, other: &Poly) -> Poly {
         let mut r = Poly::zero();
         for i in 0..N {
             r.c[i] = add(self.c[i], other.c[i]);
@@ -73,7 +75,7 @@ impl Poly {
     }
 
     /// Coefficient-wise `self − other`.
-    pub(crate) fn sub(&self, other: &Poly) -> Poly {
+    pub fn sub(&self, other: &Poly) -> Poly {
         let mut r = Poly::zero();
         for i in 0..N {
             r.c[i] = sub(self.c[i], other.c[i]);
@@ -82,7 +84,7 @@ impl Poly {
     }
 
     /// Forward NTT (FIPS 204 Algorithm 41), in place.
-    pub(crate) fn ntt(&mut self) {
+    pub fn ntt(&mut self) {
         let f = &mut self.c;
         let mut k = 1;
         let mut len = 128;
@@ -103,7 +105,7 @@ impl Poly {
     }
 
     /// Inverse NTT (FIPS 204 Algorithm 42), in place.
-    pub(crate) fn inv_ntt(&mut self) {
+    pub fn inv_ntt(&mut self) {
         let f = &mut self.c;
         let mut k = 255;
         let mut len = 1;
@@ -134,6 +136,13 @@ pub(crate) fn ntt_mul(a: &Poly, b: &Poly) -> Poly {
         c.c[i] = mul(a.c[i], b.c[i]);
     }
     c
+}
+
+/// Read-only accessor for the `i`-th twiddle factor (Montgomery form), for
+/// hazmat callers doing manual NTT-domain work. Panics if `i >= N`.
+#[cfg(feature = "hazmat-mldsa")]
+pub(crate) fn zeta(i: usize) -> u32 {
+    ZETAS[i]
 }
 
 /// Twiddle factors `1753^bitrev(k) · R mod q`, in Montgomery form.

@@ -13,6 +13,8 @@
 
 mod encode;
 mod field;
+#[cfg(feature = "hazmat-mldsa")]
+pub mod hazmat;
 mod reduce;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;
@@ -51,19 +53,30 @@ pub enum Error {
 
 /// Per-level ML-DSA parameters.
 #[derive(Clone, Copy)]
-pub(crate) struct Params {
-    eta: u32,
-    tau: usize,
-    gamma1_bits: u32,
-    gamma1: u32,
-    gamma2: u32,
-    omega: usize,
-    beta: u32,
+pub struct Params {
+    /// `η`, the secret-key coefficient bound (`s1`/`s2` in `[-η, η]`).
+    pub eta: u32,
+    /// `τ`, the number of `±1` coefficients in the challenge polynomial.
+    pub tau: usize,
+    /// Bit width of the `γ₁` mask coefficients (17 or 19).
+    pub gamma1_bits: u32,
+    /// `γ₁`, the masking-vector coefficient range.
+    pub gamma1: u32,
+    /// `γ₂`, the low-order rounding range (one of [`reduce::GAMMA2_32`] /
+    /// [`reduce::GAMMA2_88`]).
+    pub gamma2: u32,
+    /// `ω`, the maximum number of `1` bits in the hint.
+    pub omega: usize,
+    /// `β = τ·η`, the rejection bound offset.
+    pub beta: u32,
     /// Length of the commitment hash `c̃` (= λ/4).
-    ctilde: usize,
-    pubkey: usize,
-    privkey: usize,
-    sig: usize,
+    pub ctilde: usize,
+    /// Encoded public-key length in bytes.
+    pub pubkey: usize,
+    /// Encoded private-key length in bytes.
+    pub privkey: usize,
+    /// Encoded signature length in bytes.
+    pub sig: usize,
 }
 
 const POLY_T1: usize = N * 10 / 8; // 320
