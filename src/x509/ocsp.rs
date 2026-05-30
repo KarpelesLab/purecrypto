@@ -469,13 +469,24 @@ impl OcspResponse {
         //    future and isn't past its claimed expiry).
         if let Some(now) = now {
             let now_u = now.to_unix();
-            if single.this_update.to_unix() > now_u {
+            // Fail closed on an unparsable thisUpdate: `to_unix` would coerce a
+            // malformed time to 0 (the Unix epoch), making it look perpetually
+            // "in the past" and silently passing this freshness gate. A
+            // response we cannot date is not a response we can trust.
+            let this_update = single
+                .this_update
+                .to_unix_checked()
+                .ok_or(Error::Malformed)?;
+            if this_update > now_u {
                 return Err(Error::Malformed);
             }
-            if let Some(nu) = &single.next_update
-                && now_u >= nu.to_unix()
-            {
-                return Err(Error::Malformed);
+            if let Some(nu) = &single.next_update {
+                // Likewise: a present-but-malformed nextUpdate must reject,
+                // not be treated as "no expiry".
+                let next_update = nu.to_unix_checked().ok_or(Error::Malformed)?;
+                if now_u >= next_update {
+                    return Err(Error::Malformed);
+                }
             }
         }
 
@@ -1620,5 +1631,73 @@ mod tests {
             .unwrap();
         let n = req.nonce().unwrap();
         assert_eq!(n.len(), 16);
+    }
+
+    #[test]
+    fn check_for_cert_accepts_fresh_response() {
+        // Baseline: a well-formed response with now inside
+        // [thisUpdate, nextUpdate) is accepted.
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+        assert_eq!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            OcspCertStatus::Good
+        );
+    }
+
+    #[test]
+    fn check_for_cert_fails_closed_on_malformed_this_update() {
+        // A malformed thisUpdate must not be coerced to the Unix epoch (which
+        // would look perpetually in the past and pass freshness). It must
+        // fail closed instead.
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            // Unparsable repr: serialized verbatim, rejected on re-parse.
+            Time::from_repr("not-a-time"),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            Err(Error::Malformed)
+        ));
+    }
+
+    #[test]
+    fn check_for_cert_fails_closed_on_malformed_next_update() {
+        // A present-but-malformed nextUpdate must reject, not be treated as
+        // "no expiry".
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::from_repr("not-a-time")),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            Err(Error::Malformed)
+        ));
     }
 }

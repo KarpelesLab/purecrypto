@@ -45,15 +45,27 @@ impl Time {
     /// Converts the time to a Unix timestamp (seconds since 1970-01-01 UTC).
     /// Returns 0 if the stored representation is malformed or predates the
     /// Unix epoch.
+    ///
+    /// This collapses "malformed" and "epoch / pre-epoch" into the same `0`,
+    /// so a security check that must distinguish a parse failure from a real
+    /// 1970 timestamp (e.g. OCSP freshness, which would otherwise treat a
+    /// malformed `thisUpdate` as forever-in-the-past) should use
+    /// [`Time::to_unix_checked`] instead.
     pub fn to_unix(&self) -> u64 {
-        let Some((y, m, d, hh, mm, ss)) = self.components() else {
-            return 0;
-        };
+        self.to_unix_checked().unwrap_or(0)
+    }
+
+    /// Like [`Time::to_unix`], but returns `None` when the stored
+    /// representation is malformed (rather than coercing it to `0`). A valid
+    /// pre-epoch time also yields `None`, since a Unix timestamp is unsigned.
+    /// Callers that must fail closed on unparsable times use this.
+    pub fn to_unix_checked(&self) -> Option<u64> {
+        let (y, m, d, hh, mm, ss) = self.components()?;
         let days = days_from_civil(y as i64, m, d);
         if days < 0 {
-            return 0;
+            return None;
         }
-        (days as u64) * 86_400 + (hh as u64) * 3600 + (mm as u64) * 60 + ss as u64
+        Some((days as u64) * 86_400 + (hh as u64) * 3600 + (mm as u64) * 60 + ss as u64)
     }
 
     /// The raw ASN.1 time string (e.g. `"240131120000Z"`).
@@ -88,9 +100,13 @@ impl Time {
         if b.len() == 15 {
             return encode_string(tag::GENERALIZED_TIME, &self.repr);
         }
-        if b.len() == 13 {
-            // Widen the two-digit year.
-            let yy = (b[0] - b'0') * 10 + (b[1] - b'0');
+        // Widen the two-digit year, but only when the first two bytes are
+        // actually digits. `two` returns `None` on a non-digit, in which case
+        // we fall through to the malformed branch below rather than computing
+        // `(b[0] - b'0')` directly (which would underflow on, e.g., `b'-'`).
+        if b.len() == 13
+            && let Some(yy) = two(b, 0)
+        {
             let prefix = if yy < 50 { "20" } else { "19" };
             let mut s = String::with_capacity(15);
             s.push_str(prefix);
@@ -220,7 +236,11 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 
 fn digit(b: &[u8], i: usize) -> Option<u8> {
     let c = *b.get(i)?;
-    c.is_ascii_digit().then_some(c - b'0')
+    // Use `then` (lazy) rather than `then_some` (eager): `c - b'0'` would
+    // underflow for a non-digit byte (debug panic / release wrap) if computed
+    // unconditionally. This guards every caller, including `two` and the
+    // `to_generalized_time` two-digit-year widening.
+    c.is_ascii_digit().then(|| c - b'0')
 }
 
 fn two(b: &[u8], i: usize) -> Option<u8> {
@@ -418,5 +438,29 @@ mod tests {
         // A GeneralizedTime instant compares correctly against UTCTime bounds.
         assert!(v.accepts(&Time::from_repr("20300601000000Z")));
         assert!(!v.accepts(&Time::from_repr("20500101000000Z")));
+    }
+
+    #[test]
+    fn to_generalized_time_no_panic_on_non_digit_year() {
+        // A 13-byte repr whose year field is non-numeric must not underflow the
+        // `b - b'0'` widening (debug panic / release wrap). It falls through to
+        // the verbatim GeneralizedTime branch.
+        let g = Time::from_repr("--0101000000Z").to_generalized_time();
+        assert_eq!(g[0], tag::GENERALIZED_TIME);
+        // No 4-digit-year widening happened — the body is the original 13 bytes.
+        assert_eq!(g[1] as usize, 13);
+    }
+
+    #[test]
+    fn to_unix_checked_distinguishes_malformed_from_epoch() {
+        // Malformed → None, not 0.
+        assert_eq!(Time::from_repr("garbage").to_unix_checked(), None);
+        assert_eq!(Time::from_repr("241301000000Z").to_unix_checked(), None); // month 13
+        // But `to_unix` still coerces malformed to 0 for back-compat.
+        assert_eq!(Time::from_repr("garbage").to_unix(), 0);
+        // A real time agrees between the two accessors.
+        let t = Time::from_repr("20210101000000Z");
+        assert_eq!(t.to_unix_checked(), Some(1_609_459_200));
+        assert_eq!(t.to_unix(), 1_609_459_200);
     }
 }
