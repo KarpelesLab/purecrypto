@@ -492,8 +492,15 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // Decode the DTLS-flavoured ClientHello body.
         let parsed = parse_dtls_client_hello(body)?;
 
-        let cookie_required =
-            self.config.require_cookie_exchange && self.config.cookie_secret.is_some();
+        // Fail closed: a server that asks for cookie enforcement but never
+        // supplied a `cookie_secret` MUST NOT silently degrade to the
+        // no-cookie path (which would emit the full, expensive server flight
+        // to an unverified, possibly-spoofed source — an amplification +
+        // asymmetric-signature DoS). Reject before any flight is generated.
+        if self.config.require_cookie_exchange && self.config.cookie_secret.is_none() {
+            return Err(Error::InappropriateState);
+        }
+        let cookie_required = self.config.require_cookie_exchange;
         let first_attempt = parsed.cookie.is_empty();
 
         // Bind the cookie MAC to the security-critical CH fields. An on-path

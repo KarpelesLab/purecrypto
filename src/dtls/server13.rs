@@ -583,7 +583,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// Handle a fresh CH (no reassembler state).
     fn handle_pre_state_client_hello(&mut self, msg_seq: u16, body: &[u8]) -> Result<(), Error> {
         let ch = ClientHello::decode(body)?;
-        let cookie_required = self.config.require_cookie && self.config.cookie_secret.is_some();
+        // Fail closed: a server that asks for cookie enforcement but never
+        // supplied a `cookie_secret` MUST NOT silently degrade to the
+        // no-cookie path (which would emit the full, expensive server flight
+        // to an unverified, possibly-spoofed source — an amplification +
+        // asymmetric-signature DoS). Reject before any flight is generated.
+        if self.config.require_cookie && self.config.cookie_secret.is_none() {
+            return Err(Error::InappropriateState);
+        }
+        let cookie_required = self.config.require_cookie;
         // Look for an existing cookie extension in CH.
         let presented_cookie = ch
             .extensions
