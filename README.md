@@ -105,13 +105,13 @@ build and re-enable only what you need:
 
 ```toml
 # Bare no_std, no allocator: just `ct` and primitives that fit.
-purecrypto = { version = "0.2", default-features = false }
+purecrypto = { version = "0.3", default-features = false }
 
 # no_std core + ML-KEM-768 (no alloc):
-purecrypto = { version = "0.2", default-features = false, features = ["mlkem"] }
+purecrypto = { version = "0.3", default-features = false, features = ["mlkem"] }
 
 # Library with PQ signing only:
-purecrypto = { version = "0.2", default-features = false, features = ["mldsa", "slhdsa"] }
+purecrypto = { version = "0.3", default-features = false, features = ["mldsa", "slhdsa"] }
 ```
 
 Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
