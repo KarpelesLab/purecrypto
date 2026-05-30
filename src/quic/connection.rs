@@ -2845,6 +2845,17 @@ impl QuicConnection {
                     // advances our knowledge, we owe the peer RETIRE
                     // frames for the dropped sequences.
                     ack_eliciting = true;
+                    // RFC 9000 §19.15: "Receiving a value in the
+                    // Retire Prior To field that is greater than that in
+                    // the Sequence Number field MUST be treated as a
+                    // connection error of type FRAME_ENCODING_ERROR."
+                    // We map frame/protocol violations to
+                    // IllegalParameter throughout this handler. Reject
+                    // before touching the pool so the malformed frame
+                    // can never mutate CID state.
+                    if retire_prior_to > seq {
+                        return Err(Error::IllegalParameter);
+                    }
                     let entry = match ConnectionId::from_slice(cid) {
                         Some(c) => CidEntry {
                             cid: c,
@@ -2856,8 +2867,9 @@ impl QuicConnection {
                     if let Some(pool) = self.cid_remote.as_mut() {
                         // Advance retire_prior_to first (it may evict
                         // older entries and queue RETIRE frames), then
-                        // try to add this entry.
-                        pool.note_retire_prior_to(retire_prior_to);
+                        // try to add this entry. Both can reject a peer
+                        // that floods CID state (F2).
+                        pool.note_retire_prior_to(retire_prior_to)?;
                         pool.add(entry)?;
                     }
                 }
@@ -4815,7 +4827,7 @@ mod tests {
         assert!(pool.entries.contains_key(&0), "handshake CID at seq 0");
         // Pretend we migrated to sequence 1 and advance retire_prior_to.
         pool.active_seq = 1;
-        pool.note_retire_prior_to(1);
+        pool.note_retire_prior_to(1).expect("retire ok");
         assert!(!pool.entries.contains_key(&0), "seq 0 retired");
         let pending: Vec<u64> = {
             let mut v = Vec::new();
@@ -4825,6 +4837,92 @@ mod tests {
             v
         };
         assert_eq!(pending, alloc::vec![0u64], "RETIRE_CID queued for seq 0");
+    }
+
+    /// F2 — RFC 9000 §19.15: a NEW_CONNECTION_ID frame whose
+    /// `retire_prior_to` exceeds its `seq` MUST be rejected as a
+    /// connection error (FRAME_ENCODING_ERROR, surfaced here as
+    /// IllegalParameter) before it can touch the CID pool.
+    #[test]
+    fn new_connection_id_retire_prior_to_gt_seq_is_rejected() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Craft a NEW_CONNECTION_ID with retire_prior_to (5) > seq (3).
+        let mut payload = Vec::new();
+        Frame::NewConnectionId {
+            seq: 3,
+            retire_prior_to: 5,
+            cid: &[0xAAu8; 8],
+            reset_token: [0u8; 16],
+        }
+        .encode(&mut payload);
+
+        let r = c.dispatch_frames(Level::OneRtt, 1, &payload);
+        assert!(
+            matches!(r, Err(Error::IllegalParameter)),
+            "retire_prior_to > seq must be a connection error, got {r:?}",
+        );
+    }
+
+    /// F2 — a flood of NEW_CONNECTION_ID frames with a large
+    /// `retire_prior_to` and distinct low sequences must be bounded: the
+    /// pool's `pending_retire` queue cannot grow without limit; once the
+    /// cap is reached the frame loop returns a connection error.
+    #[test]
+    fn new_connection_id_flood_is_bounded() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        let cap = {
+            let pool = c.cid_remote.as_ref().expect("cid_remote initialized");
+            pool.pending_retire_cap()
+        };
+
+        // Step 1: one well-formed frame (retire_prior_to == seq) that
+        // pushes the retirement watermark very high.
+        let mut hi = Vec::new();
+        Frame::NewConnectionId {
+            seq: 1_000_000,
+            retire_prior_to: 1_000_000,
+            cid: &[0xBBu8; 8],
+            reset_token: [0u8; 16],
+        }
+        .encode(&mut hi);
+        c.dispatch_frames(Level::OneRtt, 1, &hi)
+            .expect("watermark-raising frame accepted");
+
+        // Step 2: flood distinct low sequences, each well-formed
+        // (retire_prior_to == seq, both below the watermark) so every one
+        // is auto-retired into pending_retire. The cap must stop this.
+        let mut rejected = false;
+        for seq in 0..100_000u64 {
+            let mut payload = Vec::new();
+            Frame::NewConnectionId {
+                seq,
+                retire_prior_to: seq,
+                cid: &[(seq % 256) as u8; 8],
+                reset_token: [0u8; 16],
+            }
+            .encode(&mut payload);
+            if c.dispatch_frames(Level::OneRtt, seq + 2, &payload).is_err() {
+                rejected = true;
+                break;
+            }
+        }
+        assert!(rejected, "CID flood must eventually be rejected");
+        let pool = c.cid_remote.as_ref().expect("cid_remote initialized");
+        assert!(
+            pool.pending_retire.len() <= cap,
+            "pending_retire ({}) must stay within cap ({cap})",
+            pool.pending_retire.len(),
+        );
     }
 
     /// Test 13b — PATH_CHALLENGE / PATH_RESPONSE round-trip.

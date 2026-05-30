@@ -26,6 +26,19 @@ use crate::tls::Error;
 /// Maximum QUIC v1 connection-ID length, RFC 9000 §17.2.
 const MAX_CID_LEN: usize = 20;
 
+/// Hard upper bound on the number of sequences queued in
+/// [`CidPool::pending_retire`] at once, expressed as a slack added on top
+/// of the active-CID `limit`. A well-behaved peer never owes us more
+/// outstanding RETIRE_CONNECTION_ID frames than the CIDs it has issued,
+/// which is itself bounded by `limit`; the slack absorbs the brief window
+/// between queueing a RETIRE and the caller draining it. A malicious peer
+/// that floods NEW_CONNECTION_ID frames with large `retire_prior_to` and
+/// distinct sequences is capped here, turning the would-be unbounded
+/// growth into a connection error instead of memory exhaustion
+/// (RFC 9000 §5.1.1 / §19.15). Kept small and constant so the bound is
+/// independent of how large a `limit` the peer advertises.
+const PENDING_RETIRE_SLACK: u64 = 8;
+
 /// QUIC connection ID — opaque byte string of length 0..=20.
 ///
 /// Stored inline (no heap allocation) to keep `QuicConnection` `Send`
@@ -218,6 +231,33 @@ impl CidPool {
         self.limit = limit.max(2);
     }
 
+    /// Maximum number of sequences we will hold in `pending_retire`
+    /// before treating further growth as a connection error. Derived from
+    /// the active-CID `limit` plus a small constant slack so legitimate
+    /// peers (which never owe more than `limit` outstanding RETIREs) are
+    /// unaffected, while a flood is bounded (RFC 9000 §5.1.1).
+    pub(crate) fn pending_retire_cap(&self) -> usize {
+        self.limit.saturating_add(PENDING_RETIRE_SLACK) as usize
+    }
+
+    /// Queues `sequence` for a RETIRE_CONNECTION_ID emission, deduping
+    /// against already-queued sequences and enforcing the
+    /// `pending_retire` cap. Returns [`Error::IllegalParameter`] when the
+    /// cap would be exceeded, so the connection closes rather than letting
+    /// a peer grow `pending_retire` without bound (F2).
+    fn queue_pending_retire(&mut self, sequence: u64) -> Result<(), Error> {
+        if self.pending_retire.contains(&sequence) {
+            // Already owed; dedup so a peer can't inflate the queue by
+            // re-announcing the same retired sequence.
+            return Ok(());
+        }
+        if self.pending_retire.len() >= self.pending_retire_cap() {
+            return Err(Error::IllegalParameter);
+        }
+        self.pending_retire.push(sequence);
+        Ok(())
+    }
+
     /// Inserts `entry`. Returns [`Error::IllegalParameter`] if the
     /// sequence already exists with different content (RFC 9000 §19.15:
     /// "the same sequence number MAY appear in multiple frames, but the
@@ -234,8 +274,9 @@ impl CidPool {
             // RFC 9000 §5.1.2: a newly-received CID with sequence below
             // the retire_prior_to we already announced is immediately
             // retired. We emit the RETIRE for it but don't keep it.
-            self.pending_retire.push(entry.sequence);
-            return Ok(());
+            // `queue_pending_retire` dedups and caps growth so a peer
+            // cannot flood distinct low sequences to exhaust memory (F2).
+            return self.queue_pending_retire(entry.sequence);
         }
         let live = self
             .entries
@@ -272,17 +313,24 @@ impl CidPool {
     /// `sequence < new` are removed; their sequences are added to
     /// `pending_retire` so the caller can emit RETIRE_CONNECTION_ID
     /// frames in the next outbound packet.
-    pub(crate) fn note_retire_prior_to(&mut self, new: u64) {
+    ///
+    /// Returns [`Error::IllegalParameter`] if queueing the dropped
+    /// sequences would exceed the `pending_retire` cap — only reachable
+    /// when a peer drives growth far beyond the active-CID `limit`, which
+    /// is itself a protocol violation (F2 / RFC 9000 §5.1.1). Sequences
+    /// are deduped against what is already queued.
+    pub(crate) fn note_retire_prior_to(&mut self, new: u64) -> Result<(), Error> {
         if new <= self.retire_prior_to {
-            return;
+            return Ok(());
         }
         self.retire_prior_to = new;
         let dropped: alloc::vec::Vec<u64> =
             self.entries.keys().copied().filter(|s| *s < new).collect();
         for s in dropped {
             self.entries.remove(&s);
-            self.pending_retire.push(s);
+            self.queue_pending_retire(s)?;
         }
+        Ok(())
     }
 
     /// Currently-active CID entry (the one whose CID we write into the
@@ -465,7 +513,7 @@ mod tests {
         // retire of 0/1 doesn't trip the "active retired" check.
         pool.active_seq = 2;
         // The peer says "retire prior to 2" → 0 and 1 drop.
-        pool.note_retire_prior_to(2);
+        pool.note_retire_prior_to(2).expect("retire ok");
         assert_eq!(pool.retire_prior_to, 2);
         assert!(!pool.entries.contains_key(&0));
         assert!(!pool.entries.contains_key(&1));
@@ -497,7 +545,7 @@ mod tests {
         let mut pool = CidPool::new(cid_n(0), None);
         pool.set_limit(4);
         pool.active_seq = 5;
-        pool.note_retire_prior_to(3);
+        pool.note_retire_prior_to(3).expect("retire ok");
         // Now an entry at sequence 2 should be auto-retired.
         let e = CidEntry {
             cid: cid_n(0xab),
@@ -511,5 +559,67 @@ mod tests {
             got.push(s);
         }
         assert!(got.contains(&2));
+    }
+
+    // F2: a peer that floods NEW_CONNECTION_ID-style entries with a large
+    // retire_prior_to and distinct small sequences must not be able to
+    // grow `pending_retire` without bound. The pool either dedups the
+    // sequence away or errors once the cap is hit; it never grows
+    // unboundedly.
+    #[test]
+    fn cidpool_pending_retire_is_bounded_under_flood() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(2);
+        // Announce a high retire_prior_to so every fresh low sequence is
+        // immediately auto-retired (the unbounded-growth branch in `add`).
+        pool.note_retire_prior_to(1_000_000).expect("retire ok");
+        let cap = pool.pending_retire_cap();
+
+        let mut hit_error = false;
+        for s in 0..100_000u64 {
+            let e = CidEntry {
+                cid: cid_n((s % 256) as u8),
+                sequence: s,
+                reset_token: None,
+            };
+            // Every distinct sequence is below retire_prior_to → routed
+            // through `queue_pending_retire`. Once the cap is reached the
+            // pool returns an error rather than appending forever.
+            if pool.add(e).is_err() {
+                hit_error = true;
+                break;
+            }
+        }
+        assert!(hit_error, "flood must eventually be rejected");
+        assert!(
+            pool.pending_retire.len() <= cap,
+            "pending_retire ({}) must stay within cap ({cap})",
+            pool.pending_retire.len(),
+        );
+    }
+
+    // F2: re-announcing an already-queued retire sequence is deduped and
+    // does not consume cap budget, so a peer cannot inflate the queue by
+    // repeating the same sequence.
+    #[test]
+    fn cidpool_pending_retire_dedups() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(2);
+        pool.note_retire_prior_to(10).expect("retire ok");
+        // Add the same below-threshold sequence many times.
+        for _ in 0..1000 {
+            let e = CidEntry {
+                cid: cid_n(7),
+                sequence: 5,
+                reset_token: None,
+            };
+            pool.add(e).expect("dedup keeps this within cap");
+        }
+        assert_eq!(
+            pool.pending_retire.iter().filter(|&&s| s == 5).count(),
+            1,
+            "sequence 5 must be queued at most once",
+        );
+        assert!(pool.pending_retire.len() <= pool.pending_retire_cap());
     }
 }
