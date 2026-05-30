@@ -45,7 +45,8 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing) |
 | Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM and ChaCha20-Poly1305 (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649) |
+| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM and ChaCha20-Poly1305 (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop |
+| MAC              | `mac`       | ✅ UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
 | Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
 | Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
 | Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106) |
@@ -53,10 +54,15 @@ Single crate, modules gated by Cargo features:
 | Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
 | Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
+| Diffie-Hellman   | `dh`        | ✅ Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
-| X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; OpenSSL-interop |
-| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest; bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
-| C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, RSA, ECDSA & Ed25519 keys/signatures, X.509; opaque handles + caller buffers; `include/purecrypto.h` |
+| X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
+| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
+| HPKE             | `hpke`     | ✅ RFC 9180 hybrid public-key encryption — 4 KEMs × 3 KDFs × 3 AEADs + ExportOnly, all four modes (Base/PSK/Auth/AuthPSK) |
+| ECH              | `ech`      | ✅ draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
+| QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
+| Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
+| C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, AEAD + AES-KW, RSA, ECDSA, Ed25519, ML-KEM, ML-DSA, SLH-DSA, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 
 ## CLI + C-API coverage matrix
@@ -99,19 +105,21 @@ build and re-enable only what you need:
 
 ```toml
 # Bare no_std, no allocator: just `ct` and primitives that fit.
-purecrypto = { version = "0.0.3", default-features = false }
+purecrypto = { version = "0.2", default-features = false }
 
 # no_std core + ML-KEM-768 (no alloc):
-purecrypto = { version = "0.0.3", default-features = false, features = ["mlkem"] }
+purecrypto = { version = "0.2", default-features = false, features = ["mlkem"] }
 
 # Library with PQ signing only:
-purecrypto = { version = "0.0.3", default-features = false, features = ["mldsa", "slhdsa"] }
+purecrypto = { version = "0.2", default-features = false, features = ["mldsa", "slhdsa"] }
 ```
 
-Module gates: `hash`, `cipher`, `kdf`, `bignum`, `rng`, `rsa`, `der`, `ec`,
-`x509`, `tls`, `mlkem`, `mldsa`, `slhdsa`, `ffi`, `cli`. Each pulls in only its
-own dependencies. `alloc` is required by anything that needs heap (most things
-except `ct`, `hash`, `cipher`, and the no-alloc `mlkem` core).
+Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
+`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `x509`, `tls`, `dtls`, `quic`,
+`mlkem`, `mldsa`, `slhdsa`, `hpke`, `ech`, `cert-compression`, `ffi`, `cli`.
+Each pulls in only its own dependencies. `alloc` is required by anything that
+needs heap (most things except `ct`, `hash`, `cipher`, and the no-alloc
+`mlkem` core).
 
 ## Building
 
@@ -400,15 +408,14 @@ connection-construction time via `Connection::client(&cfg)` or
   exporter, ALPN, mTLS, and downgrade-detection.
 - **DTLS 1.2** (RFC 6347) carries the TLS 1.2 handshake over UDP with
   HelloVerifyRequest cookies, handshake fragmentation/reassembly,
-  replay protection, and retransmission. Currently restricted to the
-  `ECDHE-ECDSA-AES128-GCM-SHA256` suite + X25519 + ECDSA server certs.
+  replay protection, and retransmission. Negotiates the same
+  ECDHE-AEAD suites × groups × signature schemes the TLS 1.2 path
+  supports.
 - **DTLS 1.3** (RFC 9147) carries the TLS 1.3 handshake over UDP with
   selective ACK reliability, encrypted sequence numbers, and a
-  HelloRetryRequest cookie. Currently restricted to
-  `AES-128-GCM-SHA256` + X25519 + ECDSA server certs.
-- Both DTLS variants accept additional cipher suites / groups /
-  signature schemes as follow-up commits — the underlying primitives
-  and the chassis are already present.
+  HelloRetryRequest cookie. Negotiates the same TLS 1.3 suites,
+  groups (including `X25519MLKEM768`), and signature schemes as the
+  TLS 1.3 path.
 
 ### TLS 1.3
 
@@ -597,11 +604,13 @@ cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
 
 The API is declared in [`include/purecrypto.h`](include/purecrypto.h): one-shot
 and streaming hashing, HMAC, OS randomness, RSA/ECDSA/Ed25519 key generation,
-signing, verification and PEM I/O, and X.509 parsing/verification. Functions
-return a `pc_status` code; variable-length output uses an in/out length buffer;
-stateful objects are opaque handles freed by the library; panics never cross
-the boundary. The C ABI currently covers the classical asymmetric stack;
-post-quantum keys are reached via the Rust library or the CLI.
+signing, verification and PEM I/O, ML-KEM (FIPS 203) / ML-DSA (FIPS 204) /
+SLH-DSA (FIPS 205) keys, X.509 parsing/verification, and a sans-I/O TLS /
+DTLS surface (`pc_tls_cfg_*`, `pc_tls_*`) including post-handshake
+accessors for the negotiated cipher suite and peer SNI. Functions return a
+`pc_status` code; variable-length output uses an in/out length buffer;
+stateful objects are opaque handles freed by the library; panics never
+cross the boundary.
 
 ## License
 
