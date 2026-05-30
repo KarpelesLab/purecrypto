@@ -24,7 +24,7 @@
 //! in constant time against the expected IV.
 
 use super::{BlockCipher, TagMismatch};
-use crate::ct::ConstantTimeEq;
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
 
 /// Errors returned by AES key wrap operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,31 +289,67 @@ impl<C: BlockCipher> AesKwp<C> {
             (recovered, &scratch[..padded_len])
         };
 
-        // Validate AIV: high 32 bits == 0xA659_59A6; MLI is in (padded_len-8, padded_len].
+        // Validate AIV in constant time, accumulating every failure condition
+        // into a single Choice. The three checks RFC 5649 §3 requires are:
+        //   (1) high 32 bits of AIV == 0xA659_59A6
+        //   (2) MLI is in (padded_len - 8, padded_len]
+        //   (3) padded[mli..padded_len] is all zero
+        // The original implementation short-circuited on (1) and used `mli` as
+        // a slice bound for (3), so the loop length leaked which check failed.
+        // Here every check is folded into `ok` and (3) always scans the full
+        // padded buffer using a per-byte mask derived from `mli`.
         let high = (aiv >> 32) as u32;
-        let mli = aiv as u32 as usize;
-        let mut ok = high == RFC5649_AIV_TAG;
-        ok &= mli != 0 && mli <= padded_len && padded_len - mli < 8;
+        let mli_u32 = aiv as u32;
+        // Cast padded_len to u32; padded_len <= 4096 (scratch cap) so this is
+        // lossless and a public value.
+        let padded_len_u32 = padded_len as u32;
 
-        // Validate trailing zero padding (mli..padded_len must all be zero).
-        if ok {
-            // Constant-time-ish: the bound itself is secret-independent (derived
-            // from validated AIV), and we OR-fold the pad bytes.
-            let mut pad_xor = 0u8;
-            for &b in &padded[mli..] {
-                pad_xor |= b;
-            }
-            ok &= pad_xor == 0;
+        let tag_ok = high.ct_eq(&RFC5649_AIV_TAG);
+        // (2a) mli != 0
+        let mli_nonzero = !mli_u32.ct_eq(&0u32);
+        // (2b) mli <= padded_len  <=>  !(mli > padded_len)
+        let mli_in_range = !mli_u32.ct_gt(&padded_len_u32);
+        // (2c) padded_len - mli < 8. Compute wrapping_sub; when (2b) fails the
+        // wrap is unbounded, but `mli_in_range` will already be 0 so the AND
+        // below discards this term's contribution.
+        let diff = padded_len_u32.wrapping_sub(mli_u32);
+        let pad_short = 8u32.ct_gt(&diff);
+
+        // (3) Walk the entire padded buffer; OR in each byte iff i >= mli.
+        // `mli` may be out-of-range here (e.g. wildly large) — we use a
+        // constant-time clamp purely to derive the per-byte mask and the
+        // post-validation index, never as a control-flow input. The loop
+        // length is padded_len (public).
+        // mli_clamped = min(mli_u32, padded_len_u32), branchlessly via
+        // ConditionallySelectable.
+        let mli_clamped =
+            u32::conditional_select(&padded_len_u32, &mli_u32, mli_u32.ct_gt(&padded_len_u32));
+        let mut pad_acc = 0u8;
+        for (i, &b) in padded.iter().enumerate() {
+            // mask = 0xFF when i >= mli_clamped, else 0x00.
+            let in_pad: Choice = !mli_clamped.ct_gt(&(i as u32));
+            let mask = 0u8.wrapping_sub(in_pad.unwrap_u8());
+            pad_acc |= b & mask;
         }
+        let pad_ok = pad_acc.ct_eq(&0u8);
 
-        if !ok {
-            // Wipe scratch before returning the error.
+        let ok: Choice = tag_ok & mli_nonzero & mli_in_range & pad_short & pad_ok;
+
+        if !bool::from(ok) {
+            // Wipe scratch before returning the error. Returning a single
+            // generic error variant deliberately does not distinguish prefix /
+            // length / padding failure to the caller.
             for b in scratch.iter_mut() {
                 *b = 0;
             }
+            let _ = core::hint::black_box(&scratch);
             return Err(KwError::IntegrityCheck);
         }
 
+        // Validation succeeded — `mli` is now public (it lives in the
+        // authenticated AIV). Bounds (2a/2b/2c) guarantee mli ∈ (padded_len-8,
+        // padded_len], so mli_clamped == mli_u32 and the indexing below is safe.
+        let mli = mli_clamped as usize;
         out[..mli].copy_from_slice(&padded[..mli]);
         for b in &mut out[mli..] {
             *b = 0;
@@ -321,6 +357,7 @@ impl<C: BlockCipher> AesKwp<C> {
         for b in scratch.iter_mut() {
             *b = 0;
         }
+        let _ = core::hint::black_box(&scratch);
         Ok(mli)
     }
 }
@@ -510,5 +547,82 @@ mod tests {
         ct[5] ^= 1;
         let mut rec = [0u8; 24];
         assert_eq!(kwp.unwrap(&ct, &mut rec), Err(KwError::IntegrityCheck));
+    }
+
+    /// KWP unwrap returns the same generic `IntegrityCheck` error for every
+    /// kind of AIV malformation — corrupted prefix tag, mli==0, mli too large,
+    /// mli too small (padded_len - mli >= 8), and non-zero trailing padding —
+    /// and only the well-formed AIV unwraps successfully. The test exercises
+    /// each branch by crafting a ciphertext through the raw `wrap_w` with a
+    /// hand-picked AIV / padding pattern, then verifies unwrap rejects with
+    /// the *same* error variant in every failure mode.
+    #[test]
+    fn rfc5649_unwrap_validation_branches() {
+        let kek = from_hex::<24>("5840df6e29b02af1ab493b705bf16ea1ae8338f4dcc176a8");
+        let aes = Aes192::new(&kek);
+        let kwp = Aes192Kwp::new(aes.clone());
+        // 20-byte plaintext → padded_len = 24, total ct = 32.
+        let pt = from_hex::<20>("c37b7e6492584340bed12207808941155068f738");
+        let good_mli: u32 = 20;
+        let good_aiv: u64 = (u64::from(RFC5649_AIV_TAG) << 32) | u64::from(good_mli);
+
+        // Helper: build a wrap_w ciphertext from an AIV and a padded plaintext.
+        let build = |aiv: u64, padded: &[u8]| -> [u8; 32] {
+            let mut out = [0u8; 32];
+            wrap_w(&aes, aiv, padded, &mut out).unwrap();
+            out
+        };
+
+        // Valid input — sanity check that the happy path still works.
+        let mut padded_ok = [0u8; 24];
+        padded_ok[..pt.len()].copy_from_slice(&pt);
+        let ct_valid = build(good_aiv, &padded_ok);
+        let mut rec = [0u8; 24];
+        let n = kwp
+            .unwrap(&ct_valid, &mut rec)
+            .expect("valid input unwraps");
+        assert_eq!(n, good_mli as usize);
+        assert_eq!(&rec[..n], &pt[..]);
+
+        // (1) Corrupted AIV prefix — high 32 bits != 0xA659_59A6.
+        let bad_prefix_aiv: u64 = (0xDEAD_BEEFu64 << 32) | u64::from(good_mli);
+        let ct_bad_prefix = build(bad_prefix_aiv, &padded_ok);
+
+        // (2a) MLI = 0.
+        let bad_mli_zero_aiv: u64 = u64::from(RFC5649_AIV_TAG) << 32;
+        let ct_mli_zero = build(bad_mli_zero_aiv, &padded_ok);
+
+        // (2b) MLI > padded_len.
+        let bad_mli_big_aiv: u64 = (u64::from(RFC5649_AIV_TAG) << 32) | 0x0000_0100u64;
+        let ct_mli_big = build(bad_mli_big_aiv, &padded_ok);
+
+        // (2c) padded_len - mli >= 8 (mli too small for the chosen padding).
+        let bad_mli_small_aiv: u64 = (u64::from(RFC5649_AIV_TAG) << 32) | u64::from(12u32);
+        // Padding bytes 12..24 are still zero, so only check (2c) trips.
+        let ct_mli_small = build(bad_mli_small_aiv, &padded_ok);
+
+        // (3) Non-zero padding byte (mli=20, but padded[20] = 0xFF).
+        let mut padded_badpad = [0u8; 24];
+        padded_badpad[..pt.len()].copy_from_slice(&pt);
+        padded_badpad[20] = 0xFF;
+        let ct_bad_pad = build(good_aiv, &padded_badpad);
+
+        // Every failure must return the same generic error variant, distinct
+        // from success. No path is allowed to return `InvalidLength` or panic.
+        for (name, ct) in [
+            ("bad_prefix", &ct_bad_prefix),
+            ("mli_zero", &ct_mli_zero),
+            ("mli_big", &ct_mli_big),
+            ("mli_small", &ct_mli_small),
+            ("bad_pad", &ct_bad_pad),
+        ] {
+            let mut buf = [0u8; 24];
+            let err = kwp.unwrap(ct, &mut buf);
+            assert_eq!(
+                err,
+                Err(KwError::IntegrityCheck),
+                "case {name}: expected IntegrityCheck, got {err:?}",
+            );
+        }
     }
 }
