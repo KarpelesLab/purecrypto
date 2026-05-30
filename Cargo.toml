@@ -44,6 +44,10 @@ rng = ["hash"]
 # /dev/urandom.
 linux-getrandom = ["rng", "std"]
 rsa = ["bignum", "rng", "hash"]
+# hazmat: low-level secp256k1 scalar / point arithmetic + compressed SEC1 codec.
+# NO semver-stability guarantee; off by default. Caller owns correctness and
+# constant-time discipline. See `ec::secp256k1`.
+hazmat-secp256k1 = ["ec"]
 # Finite-field Diffie-Hellman over RFC 3526 MODP groups (group14..group18)
 # plus RFC 4419 group-exchange. For SSH and legacy TLS / IKE interop;
 # ECDH (in the `ec` module) is preferred for new code.
