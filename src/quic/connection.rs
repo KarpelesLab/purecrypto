@@ -2647,6 +2647,14 @@ impl QuicConnection {
                     ack_eliciting = true;
                 }
                 Frame::HandshakeDone => {
+                    // RFC 9000 §19.20: HANDSHAKE_DONE is server→client
+                    // only; a server that receives one MUST treat it as
+                    // a PROTOCOL_VIOLATION. The IllegalParameter mapping
+                    // surfaces as PROTOCOL_VIOLATION on the wire (see
+                    // §12.4 Table 3 reject path above).
+                    if self.role == Role::Server {
+                        return Err(Error::IllegalParameter);
+                    }
                     // Server → client only, RFC 9000 §7.3. We treat it
                     // as a confirmation that the server has installed
                     // 1-RTT keys; the TLS engine independently signals
@@ -2781,6 +2789,13 @@ impl QuicConnection {
                     }
                 }
                 Frame::NewToken { .. } => {
+                    // RFC 9000 §19.7: NEW_TOKEN is server→client only;
+                    // a server that receives one MUST treat it as a
+                    // PROTOCOL_VIOLATION. The IllegalParameter mapping
+                    // surfaces as PROTOCOL_VIOLATION on the wire.
+                    if self.role == Role::Server {
+                        return Err(Error::IllegalParameter);
+                    }
                     // RFC 9000 §19.7: server-only frame for future-use
                     // tokens (NOT retry tokens). Phase 7 has no token
                     // store; just count as ack-eliciting and drop.
@@ -6131,6 +6146,45 @@ mod tests {
         let pad = [0u8; 1];
         c.dispatch_frames(Level::OneRtt, 1, &pad)
             .expect("PADDING-only packet must be accepted");
+    }
+
+    /// RFC 9000 §19.20: HANDSHAKE_DONE is server→client only. A server
+    /// that receives a HANDSHAKE_DONE frame MUST close the connection
+    /// with PROTOCOL_VIOLATION (surfaced here as `IllegalParameter`).
+    /// The legitimate direction (client receiving HANDSHAKE_DONE) keeps
+    /// working.
+    #[test]
+    fn dispatch_rejects_handshake_done_on_server() {
+        let (mut c, mut s) = loopback_pair();
+        let mut payload = Vec::new();
+        Frame::HandshakeDone.encode(&mut payload);
+
+        // Server side: MUST reject — Role::Server cannot receive it.
+        let err = s.dispatch_frames(Level::OneRtt, 0, &payload).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
+
+        // Client side: legitimate direction, MUST accept.
+        c.dispatch_frames(Level::OneRtt, 0, &payload)
+            .expect("client must accept HANDSHAKE_DONE from server");
+    }
+
+    /// RFC 9000 §19.7: NEW_TOKEN is server→client only. A server that
+    /// receives a NEW_TOKEN frame MUST close the connection with
+    /// PROTOCOL_VIOLATION (surfaced here as `IllegalParameter`). The
+    /// legitimate direction (client receiving NEW_TOKEN) keeps working.
+    #[test]
+    fn dispatch_rejects_new_token_on_server() {
+        let (mut c, mut s) = loopback_pair();
+        let mut payload = Vec::new();
+        Frame::NewToken { token: b"tok" }.encode(&mut payload);
+
+        // Server side: MUST reject — Role::Server cannot receive it.
+        let err = s.dispatch_frames(Level::OneRtt, 0, &payload).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
+
+        // Client side: legitimate direction, MUST accept.
+        c.dispatch_frames(Level::OneRtt, 0, &payload)
+            .expect("client must accept NEW_TOKEN from server");
     }
 
     /// RFC 9000 §13.2.5: an outbound ACK frame's `ack_delay` field MUST
