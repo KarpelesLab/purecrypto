@@ -140,7 +140,7 @@ pub(crate) fn derive_secret(
 }
 
 /// `HKDF-Extract(salt, ikm)` dispatched on the negotiated hash.
-fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Secret {
+pub(crate) fn extract(alg: HashAlg, salt: &[u8], ikm: &[u8]) -> Secret {
     match alg {
         HashAlg::Sha256 => Secret::new(hkdf_extract::<Sha256>(salt, ikm).as_ref()),
         HashAlg::Sha384 => Secret::new(hkdf_extract::<Sha384>(salt, ikm).as_ref()),

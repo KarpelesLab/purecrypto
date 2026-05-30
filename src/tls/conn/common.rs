@@ -212,7 +212,7 @@ impl ConnectionCore {
         }
     }
 
-    fn emit_record(&mut self, ct: ContentType, payload: &[u8]) {
+    pub(crate) fn emit_record(&mut self, ct: ContentType, payload: &[u8]) {
         match &mut self.write {
             Some(crypter) => match crypter.encrypt(ct, payload) {
                 Ok(rec) => self.outbuf.extend_from_slice(&rec),

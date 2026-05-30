@@ -114,6 +114,10 @@ name = "purecrypto"
 path = "src/bin/purecrypto/main.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "tls_ech_loopback"
+required-features = ["ech"]
+
 [lints.rust]
 # Constant-time correctness depends on disciplined arithmetic; keep the
 # foundation honest.

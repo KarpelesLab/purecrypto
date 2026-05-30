@@ -20,8 +20,9 @@ pub(crate) use hash::Transcript;
 pub use schedule::HashAlg;
 #[allow(unused_imports)]
 pub(crate) use schedule::{
-    KeySchedule, Secret, binder_finished_key, derive_secret, expand_label_dyn, finished_key,
-    finished_verify_data, next_traffic_secret, psk_from_resumption, tls_exporter, traffic_key_iv,
+    KeySchedule, Secret, binder_finished_key, derive_secret, expand_label_dyn, extract,
+    finished_key, finished_verify_data, next_traffic_secret, psk_from_resumption, tls_exporter,
+    traffic_key_iv,
 };
 #[allow(unused_imports)]
 pub(crate) use sign::{certificate_verify_content, verify_signature};

@@ -3156,6 +3156,382 @@ mod loopback_tests {
         assert_eq!(contents.key_config.config_id, 0x44);
         assert_eq!(contents.public_name, b"public.example");
     }
+
+    /// End-to-end HelloRetryRequest combined with real ECH
+    /// (draft-ietf-tls-esni-22 §7.2.1): server has both
+    /// `preferred_key_exchange_group = SECP384R1` and an ECH key, the
+    /// client both ships only an X25519 share AND configures real ECH.
+    /// The server emits an HRR carrying the `hrr_accept_confirmation`
+    /// signal in the trailing `encrypted_client_hello` extension; the
+    /// client verifies it, re-seals CH2-inner under the retained
+    /// `SenderContext` (HPKE `seq` advances to 1), and the inner-SNI
+    /// handshake completes. `ech_outcome()` reports
+    /// [`EchOutcome::Accepted`] across the round-trip and application
+    /// data flows in both directions.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_hrr_loopback_accepts_and_round_trips() {
+        use super::client::EchOutcome;
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        // Self-signed Ed25519 cert covering the inner SNI the client
+        // really targets ("secret.example") — that's the name the
+        // client verifies against after the ECH accept swap. We do not
+        // cover the outer `public_name` here: on accept, the outer
+        // certificate is never validated against, only the inner.
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let name = DistinguishedName::common_name("secret.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["secret.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        // One ECH key shared by both sides (the "happy" path: client's
+        // configured list matches the server's published one).
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x55,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        // Server: Ed25519 cert + ECH server + a preferred group that
+        // forces HRR (client below ships only X25519 share).
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(ring, list.clone()))
+            .with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp384r1);
+
+        // Client: trusts the server cert; configures real ECH against
+        // the matching list; advertises both X25519 and SECP384R1 but
+        // ships a key_share only for X25519 — exactly the deployment
+        // shape the preferred-group HRR pre-check exists for.
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-hrr-server", b"nonce", &[]);
+
+        let mut client = ClientConnection::new_with_offer_partial_shares(
+            client_cfg,
+            "secret.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP384R1],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // HRR adds one extra CH/SH round-trip; cap at 24.
+        for _ in 0..24 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking(),
+            "client did not finish after HRR+ECH"
+        );
+        assert!(
+            !server.is_handshaking(),
+            "server did not finish after HRR+ECH"
+        );
+        assert_eq!(
+            client.ech_outcome(),
+            Some(EchOutcome::Accepted),
+            "ECH must remain accepted across HRR",
+        );
+
+        // Inner-transcript app data round-trips after the HRR retry.
+        client.send_application_data(b"hrr+ech ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"hrr+ech ping");
+
+        server.send_application_data(b"hrr+ech pong").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"hrr+ech pong");
+    }
+
+    /// Negative ECH HRR signal: a man-in-the-middle (modeled here by
+    /// flipping a byte of the HRR's `encrypted_client_hello` payload
+    /// on the wire between server and client) breaks the
+    /// `hrr_accept_confirmation` HKDF chain. The client MUST surface
+    /// [`Error::EchRejected`] rather than silently retry under a
+    /// tampered HPKE schedule.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_real_hrr_signal_corruption_rejected() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-tamper-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let name = DistinguishedName::common_name("secret.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["secret.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-tamper-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x66,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = EchConfigList::new(alloc::vec![pair.config().clone()]);
+        let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(ring, list.clone()))
+            .with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp384r1);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-hrr-tamper-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-hrr-tamper-s", b"nonce", &[]);
+
+        let mut client = ClientConnection::new_with_offer_partial_shares(
+            client_cfg,
+            "secret.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP384R1],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Drive CH1 → HRR.
+        let ch1 = client.write_tls();
+        server.read_tls(&ch1);
+        server.process_new_packets().unwrap();
+        let mut hrr_record = server.write_tls();
+        assert!(!hrr_record.is_empty(), "server must emit HRR");
+
+        // The server typically emits the HRR record together with a
+        // CCS record (TLS 1.3 middlebox compat); pick out the
+        // handshake-content-type record that carries the HRR.
+        // TLS record header: ContentType(1) ‖ ProtocolVersion(2) ‖ Length(2).
+        let (hrr_rec_start, hrr_rec_end) = {
+            let mut p = 0;
+            let mut found = None;
+            while p + 5 <= hrr_record.len() {
+                let ct = hrr_record[p];
+                let frag_len = ((hrr_record[p + 3] as usize) << 8) | (hrr_record[p + 4] as usize);
+                let end = p + 5 + frag_len;
+                assert!(end <= hrr_record.len(), "truncated record");
+                if ct == 0x16 /* Handshake */ && frag_len > 4 && hrr_record[p + 5] == 0x02 {
+                    found = Some((p, end));
+                    break;
+                }
+                p = end;
+            }
+            found.expect("no HRR handshake record found")
+        };
+        let off_in_hs = crate::tls::ech::accept_signal::locate_hrr_ech_signal_payload(
+            &hrr_record[hrr_rec_start + 5..hrr_rec_end],
+        )
+        .expect("HRR carries the HRR signal extension");
+        // Flip a bit inside the wire HRR record, in place.
+        hrr_record[hrr_rec_start + 5 + off_in_hs] ^= 0x01;
+
+        // Hand the tampered HRR to the client; it must reject ECH.
+        client.read_tls(&hrr_record);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::EchRejected(_)),
+            "tampered HRR signal must surface EchRejected, got {err:?}",
+        );
+    }
+
+    /// End-to-end HelloRetryRequest: server with
+    /// `preferred_key_exchange_group = SECP384R1` and client advertising
+    /// `[X25519, SECP384R1]` but only shipping a share for X25519. The
+    /// server should send HRR, the client should retry with a SECP384R1
+    /// share, and the handshake should complete with bidirectional app
+    /// data flowing.
+    #[test]
+    fn hello_retry_request_preferred_group_loopback() {
+        let (mut server_config, cert_der) = rsa_server();
+        server_config =
+            server_config.with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp384r1);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-loop-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"hrr-loop-server", b"nonce", &[]);
+
+        // Advertise X25519 and SECP384R1, ship a key_share only for X25519.
+        let mut client = ClientConnection::new_with_offer_partial_shares(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP384R1],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Drive the I/O loop. A successful HRR exchange adds an extra
+        // CH/SH round-trip, so 24 iterations is the practical ceiling.
+        for _ in 0..24 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+
+        assert!(!client.is_handshaking(), "client did not finish after HRR");
+        assert!(!server.is_handshaking(), "server did not finish after HRR");
+
+        client.send_application_data(b"hrr ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"hrr ping");
+
+        server.send_application_data(b"hrr pong").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"hrr pong");
+    }
+
+    /// Negative: a CH2 that flips its `signature_algorithms` is rejected
+    /// with `illegal_parameter` (RFC 8446 §4.1.4 immutability).
+    #[test]
+    fn hello_retry_request_immutability_violation() {
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ClientHello, ExtensionType, ReadCursor, read_handshake};
+
+        let (mut server_config, _cert_der) = rsa_server();
+        server_config =
+            server_config.with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp384r1);
+        let srng = HmacDrbg::<Sha256>::new(b"hrr-imm-server", b"nonce", &[]);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        // Build an honest client just to harvest a valid CH1.
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-imm-client", b"nonce", &[]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(_cert_der).unwrap();
+        let mut client = ClientConnection::new_with_offer_partial_shares(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP384R1],
+            &[NamedGroup::X25519],
+        );
+
+        // Hand CH1 to the server; pull HRR back.
+        let ch1 = client.write_tls();
+        server.read_tls(&ch1);
+        server.process_new_packets().unwrap();
+        let hrr = server.write_tls();
+        assert!(!hrr.is_empty(), "server must emit HRR");
+
+        // Deliver HRR to the client so it builds CH2 honestly.
+        client.read_tls(&hrr);
+        client.process_new_packets().unwrap();
+        let ch2_record = client.write_tls();
+        assert!(!ch2_record.is_empty(), "client must emit CH2");
+
+        // Surgery on CH2: rewrite the `signature_algorithms` body to a
+        // single ED25519 entry so it differs from CH1 (which advertises
+        // the default broader set). u16 list_len(2) ‖ u16 ED25519(0x0807).
+        let body = &ch2_record[5..];
+        let mut c = ReadCursor::new(body);
+        let (_ty, hsbody) = read_handshake(&mut c).unwrap();
+        let mut ch2 = ClientHello::decode(hsbody).unwrap();
+        let _ = ext::find; // keep import live across cfg combos
+        for (t, b) in ch2.extensions.iter_mut() {
+            if *t == ExtensionType::SIGNATURE_ALGORITHMS {
+                *b = alloc::vec![0x00, 0x02, 0x08, 0x07];
+            }
+        }
+        let new_body = ch2.encode();
+        let mut new_record = Vec::new();
+        crate::tls::codec::write_record(
+            &mut new_record,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &new_body,
+        );
+
+        server.read_tls(&new_record);
+        let err = server.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
 }
 
 #[cfg(test)]

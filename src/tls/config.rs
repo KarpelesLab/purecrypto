@@ -14,6 +14,7 @@ use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
 
+use super::groups::NamedGroup;
 use super::keylog::KeyLog;
 use super::pki::{CrlStore, RootCertStore};
 use super::version::ProtocolVersion;
@@ -160,6 +161,23 @@ pub struct Config {
     /// RawPublicKey.
     pub expected_raw_public_keys: Vec<Vec<u8>>,
 
+    // ---- TLS 1.3 key exchange (RFC 8446 §4.1.4) ----
+    /// Server preference for the (EC)DHE group used in key exchange.
+    /// When `Some(g)` and the client's `ClientHello` advertised `g` in
+    /// `supported_groups` but did NOT include a `key_share` entry for
+    /// it, the server emits a HelloRetryRequest (RFC 8446 §4.1.4)
+    /// asking the client to retry with a share for `g`. When `None`
+    /// (the default), the server takes the first group it accepts from
+    /// the client's `key_share` and never emits HRR.
+    ///
+    /// Typical use is to bias clients toward a PQ-hybrid group
+    /// (e.g. [`NamedGroup::X25519MlKem768`]) without giving up the
+    /// freedom to negotiate non-PQ groups when the client truly cannot
+    /// offer one.
+    ///
+    /// Inert on the client side and outside TLS 1.3.
+    pub preferred_key_exchange_group: Option<NamedGroup>,
+
     // ---- Encrypted Client Hello (draft-ietf-tls-esni-22) ----
     /// Client-side ECH configuration. `None` (default) = no ECH and no
     /// GREASE — the CH carries no `encrypted_client_hello` extension at
@@ -239,6 +257,7 @@ impl Default for Config {
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
             expected_raw_public_keys: Vec::new(),
+            preferred_key_exchange_group: None,
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "ech")]
@@ -481,6 +500,22 @@ impl ConfigBuilder {
     /// verification).
     pub fn verification_time(mut self, t: Time) -> Self {
         self.inner.verification_time = Some(t);
+        self
+    }
+
+    /// Server: prefer this (EC)DHE group when the client advertises it
+    /// in `supported_groups` but did not pre-share a key for it. The
+    /// server emits a HelloRetryRequest (RFC 8446 §4.1.4) asking the
+    /// client to retry with a share for `group`. When the preferred
+    /// group is not in the client's `supported_groups`, the server
+    /// falls back silently to its normal first-match selection.
+    ///
+    /// Example: prefer the PQ-hybrid `X25519MLKEM768` but accept
+    /// classic groups when the client is unable to offer it.
+    ///
+    /// Inert on the client side and outside TLS 1.3.
+    pub fn preferred_key_exchange_group(mut self, group: NamedGroup) -> Self {
+        self.inner.preferred_key_exchange_group = Some(group);
         self
     }
 

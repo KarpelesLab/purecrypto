@@ -522,6 +522,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
     if let Some(ech) = cfg.ech_server.clone() {
         sc = sc.with_ech_server(ech);
     }
+    if let Some(g) = cfg.preferred_key_exchange_group {
+        sc = sc.with_preferred_key_exchange_group(g);
+    }
     sc.key_log = cfg.key_log.clone();
     Ok(super::conn::ServerConnection::new(sc, OsRng))
 }

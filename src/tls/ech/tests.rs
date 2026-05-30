@@ -1021,7 +1021,7 @@ fn seal_and_decap_round_trip_x25519_aes128gcm() {
 
     // Decap on the server side and recover the inner CH.
     let recovered = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
-    assert_eq!(recovered, inner);
+    assert_eq!(recovered.inner_ch_bytes, inner);
 }
 
 #[test]
@@ -1182,7 +1182,7 @@ fn full_ech_round_trip_seal_decap_and_accept_signal() {
 
     // === Server side: decap to recover the inner CH ===
     let recovered_inner = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
-    assert_eq!(recovered_inner, inner_ch);
+    assert_eq!(recovered_inner.inner_ch_bytes, inner_ch);
 
     // === Server side: build an SH with the accept signal patched in ===
     // The "inner transcript" up to this point is just the inner CH bytes.

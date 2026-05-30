@@ -39,6 +39,20 @@ pub(crate) fn supported_groups_list(groups: &[NamedGroup]) -> RawExtension {
     (ExtensionType::SUPPORTED_GROUPS, body)
 }
 
+/// Parses a `supported_groups` body into the advertised group list.
+/// Unknown codepoints are preserved (the caller filters by membership).
+pub(crate) fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Error> {
+    let mut outer = ReadCursor::new(body);
+    let list = outer.vec_u16()?;
+    outer.expect_empty()?;
+    let mut c = ReadCursor::new(list);
+    let mut out = Vec::new();
+    while !c.is_empty() {
+        out.push(NamedGroup(c.u16()?));
+    }
+    Ok(out)
+}
+
 /// `signature_algorithms` listing the schemes we accept for
 /// `CertificateVerify`. RFC 8446 §4.4.3 forbids `rsa_pkcs1_*` from this
 /// list — those schemes are reserved for chain signatures and must be
@@ -383,6 +397,25 @@ pub(crate) fn server_key_share(group: NamedGroup, public_key: &[u8]) -> RawExten
     let mut body = Vec::new();
     encode_key_share_entry(&mut body, group, public_key);
     (ExtensionType::KEY_SHARE, body)
+}
+
+/// `key_share` for a HelloRetryRequest: just the `selected_group` u16
+/// (RFC 8446 §4.2.8), no public key. The client is being asked to redo
+/// CH with a share for this group.
+pub(crate) fn hrr_key_share(group: NamedGroup) -> RawExtension {
+    let mut body = Vec::new();
+    put_u16(&mut body, group.0);
+    (ExtensionType::KEY_SHARE, body)
+}
+
+/// `encrypted_client_hello` on a HelloRetryRequest carries an 8-byte
+/// `hrr_accept_confirmation` payload — no `ECHClientHelloType` byte, no
+/// `enc`, no `payload_len` prefix (draft-ietf-tls-esni-22 §7.2.1). The
+/// caller seeds this with zeros at HRR-build time, then patches the
+/// real signal bytes in after computing the transcript hash.
+#[cfg(feature = "ech")]
+pub(crate) fn hrr_ech_confirmation(payload: [u8; 8]) -> RawExtension {
+    (ExtensionType::ENCRYPTED_CLIENT_HELLO, payload.to_vec())
 }
 
 fn encode_key_share_entry(out: &mut Vec<u8>, group: NamedGroup, public_key: &[u8]) {

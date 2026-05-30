@@ -21,8 +21,9 @@ use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random, ReadCursor,
-    ServerHello, SignatureScheme, hs_type, read_handshake, with_len_u16, with_len_u24,
+    CipherSuite, ClientHello, ExtensionType, HRR_RANDOM, KeyUpdate, NamedGroup, NewSessionTicket,
+    Random, ReadCursor, ServerHello, SignatureScheme, hs_type, read_handshake, with_len_u16,
+    with_len_u24,
 };
 use crate::tls::crypto::{
     HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
@@ -217,6 +218,12 @@ pub(crate) struct ServerConfig {
     pub(crate) ech_server: Option<crate::tls::ech::EchServer>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub(crate) key_log: Option<Arc<dyn KeyLog>>,
+    /// Deployment-shaped HelloRetryRequest knob (RFC 8446 §4.1.4). When
+    /// `Some(g)` and the client advertises `g` in `supported_groups` but did
+    /// not include a `key_share` for it, the server emits a HelloRetryRequest
+    /// asking the client to redo CH with a share for `g`. `None` (default)
+    /// preserves the prior first-acceptable-share-wins behaviour.
+    pub(crate) preferred_key_exchange_group: Option<crate::tls::NamedGroup>,
 }
 
 impl ServerConfig {
@@ -246,6 +253,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -275,6 +283,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -304,6 +313,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -333,6 +343,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -362,6 +373,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -391,6 +403,7 @@ impl ServerConfig {
             #[cfg(feature = "ech")]
             ech_server: None,
             key_log: None,
+            preferred_key_exchange_group: None,
         }
     }
 
@@ -499,6 +512,15 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the preferred key-exchange group (RFC 8446 §4.1.4). When the
+    /// client advertises the group in `supported_groups` but did not include
+    /// a `key_share` for it, the server emits a HelloRetryRequest asking the
+    /// client to redo CH with a share for this group.
+    pub fn with_preferred_key_exchange_group(mut self, g: crate::tls::NamedGroup) -> Self {
+        self.preferred_key_exchange_group = Some(g);
+        self
+    }
+
     /// Advertises `record_size_limit = limit` (RFC 8449).
     pub fn with_record_size_limit(mut self, limit: u16) -> Self {
         self.record_size_limit = Some(limit);
@@ -569,6 +591,12 @@ impl ServerConfig {
 #[derive(PartialEq, Eq)]
 enum State {
     WaitClientHello,
+    /// After emitting HelloRetryRequest in response to CH1; expect CH2.
+    /// On entry the transcript holds `message_hash(Hash(CH1)) || HRR`
+    /// (RFC 8446 §4.4.1) and a snapshot of CH1's immutable fields is
+    /// stashed in `hrr_ch1_immutable` for the CH2 vs CH1 comparison
+    /// mandated by RFC 8446 §4.1.4.
+    WaitClientHelloRetry,
     /// mTLS: after our Finished, expect the client's `Certificate` next.
     WaitClientCertificate,
     /// mTLS: after the client's `Certificate`, expect `CertificateVerify`.
@@ -578,6 +606,93 @@ enum State {
     WaitClientFinished,
     Connected,
     Closed,
+}
+
+/// Snapshot of CH1 extensions that RFC 8446 §4.1.4 requires CH2 to echo
+/// unchanged after a HelloRetryRequest. `None`-valued slots in CH1 must
+/// stay `None` in CH2; present slots must compare byte-equal. The PSK
+/// path is intentionally omitted here — the binders MUST be recomputed
+/// against the new transcript, so a byte-equality test would falsely
+/// reject every PSK retry; PSK + HRR is left to a follow-up.
+#[derive(Clone)]
+struct Ch1Immutable {
+    random: Random,
+    cipher_suites: Vec<CipherSuite>,
+    legacy_session_id: Vec<u8>,
+    supported_versions: Vec<u8>,
+    signature_algorithms: Vec<u8>,
+    supported_groups: Vec<u8>,
+    server_name: Option<Vec<u8>>,
+    alpn: Option<Vec<u8>>,
+    psk_key_exchange_modes: Option<Vec<u8>>,
+    /// Pre-share modes parity matters even before PSK is supported under
+    /// HRR — the client must not flip this on the retry.
+    cert_compression: Option<Vec<u8>>,
+}
+
+impl Ch1Immutable {
+    /// Snapshot the CH1 fields that RFC 8446 §4.1.4 binds across the retry.
+    fn from_ch(ch: &ClientHello) -> Self {
+        let dup_owned = |t: ExtensionType| ext::find(&ch.extensions, t).map(|b| b.to_vec());
+        Self {
+            random: ch.random,
+            cipher_suites: ch.cipher_suites.clone(),
+            legacy_session_id: ch.session_id.clone(),
+            supported_versions: dup_owned(ExtensionType::SUPPORTED_VERSIONS).unwrap_or_default(),
+            signature_algorithms: dup_owned(ExtensionType::SIGNATURE_ALGORITHMS)
+                .unwrap_or_default(),
+            supported_groups: dup_owned(ExtensionType::SUPPORTED_GROUPS).unwrap_or_default(),
+            server_name: dup_owned(ExtensionType::SERVER_NAME),
+            alpn: dup_owned(ExtensionType::ALPN),
+            psk_key_exchange_modes: dup_owned(ExtensionType::PSK_KEY_EXCHANGE_MODES),
+            cert_compression: dup_owned(ExtensionType::COMPRESS_CERTIFICATE),
+        }
+    }
+
+    /// Verify CH2 echoes every binding from CH1, returning
+    /// `Error::IllegalParameter` on any drift.
+    fn verify_ch2_matches(&self, ch2: &ClientHello) -> Result<(), Error> {
+        if ch2.random != self.random
+            || ch2.cipher_suites != self.cipher_suites
+            || ch2.session_id != self.legacy_session_id
+        {
+            return Err(Error::IllegalParameter);
+        }
+        let ext_eq = |t: ExtensionType, want: &[u8]| -> bool {
+            match ext::find(&ch2.extensions, t) {
+                Some(b) => b == want,
+                None => want.is_empty(),
+            }
+        };
+        let opt_ext_eq = |t: ExtensionType, want: &Option<Vec<u8>>| -> bool {
+            match (ext::find(&ch2.extensions, t), want) {
+                (Some(b), Some(w)) => b == w.as_slice(),
+                (None, None) => true,
+                _ => false,
+            }
+        };
+        if !ext_eq(ExtensionType::SUPPORTED_VERSIONS, &self.supported_versions)
+            || !ext_eq(
+                ExtensionType::SIGNATURE_ALGORITHMS,
+                &self.signature_algorithms,
+            )
+            || !ext_eq(ExtensionType::SUPPORTED_GROUPS, &self.supported_groups)
+            || !opt_ext_eq(ExtensionType::SERVER_NAME, &self.server_name)
+            || !opt_ext_eq(ExtensionType::ALPN, &self.alpn)
+            || !opt_ext_eq(
+                ExtensionType::PSK_KEY_EXCHANGE_MODES,
+                &self.psk_key_exchange_modes,
+            )
+            || !opt_ext_eq(ExtensionType::COMPRESS_CERTIFICATE, &self.cert_compression)
+        {
+            return Err(Error::IllegalParameter);
+        }
+        // RFC 8446 §4.2.10: 0-RTT MUST NOT appear after HRR.
+        if ext::find(&ch2.extensions, ExtensionType::EARLY_DATA).is_some() {
+            return Err(Error::IllegalParameter);
+        }
+        Ok(())
+    }
 }
 
 /// A TLS 1.3 server connection.
@@ -686,6 +801,13 @@ pub struct ServerConnection<R: RngCore> {
     /// being emitted. See [`EchServerHandshakeState`].
     #[cfg(feature = "ech")]
     ech_state: Option<EchServerHandshakeState>,
+    /// HelloRetryRequest snapshot. `Some` after we emit HRR; consumed
+    /// in `on_client_hello_retry` to validate CH2 against CH1 per
+    /// RFC 8446 §4.1.4.
+    hrr_ch1_immutable: Option<Ch1Immutable>,
+    /// The (EC)DHE group asked for in the HRR `key_share` and required
+    /// in CH2. `Some` only between HRR emission and CH2 acceptance.
+    hrr_selected_group: Option<NamedGroup>,
 }
 
 /// Server-side per-handshake ECH state, populated during
@@ -693,7 +815,6 @@ pub struct ServerConnection<R: RngCore> {
 /// patch the accept signal into `random[24..32]`) and
 /// `EncryptedExtensions` (to ship `retry_configs` on rejection).
 #[cfg(feature = "ech")]
-#[derive(Clone, Debug)]
 pub(crate) enum EchServerHandshakeState {
     /// The outer CH carried a syntactically valid `encrypted_client_hello`
     /// extension AND HPKE-decap succeeded AND the recovered plaintext
@@ -707,6 +828,14 @@ pub(crate) enum EchServerHandshakeState {
         /// `Hash(inner_ch || sh_with_zero_tail)` for the accept signal
         /// without re-deriving it from a cloned transcript at emit time.
         inner_ch_bytes: Vec<u8>,
+        /// HPKE receiver context retained for the HRR retry path. CH1's
+        /// `open` advanced `seq` to 1; CH2-outer's open consumes it at
+        /// `seq = 1` (draft §7.2.2). `None` once consumed by CH2 to keep
+        /// the receiver from accidentally being reused after the retry.
+        receiver: Option<crate::tls::ech::outer::DecappedInner>,
+        /// CH1-inner's `random`, used as the IKM for the HRR ECH
+        /// confirmation signal (draft §7.2.1).
+        inner_ch1_random: [u8; 32],
     },
     /// Either the client offered ECH (we found an outer-form ext) and
     /// decap failed, or `Config.ech_server` was unset; in both cases
@@ -787,6 +916,8 @@ impl<R: RngCore> ServerConnection<R> {
             peer_cert_compression_algorithms: Vec::new(),
             #[cfg(feature = "ech")]
             ech_state: None,
+            hrr_ch1_immutable: None,
+            hrr_selected_group: None,
         }
     }
 
@@ -809,6 +940,114 @@ impl<R: RngCore> ServerConnection<R> {
         } else {
             self.core.emit_handshake(msg);
         }
+    }
+
+    /// Emit a HelloRetryRequest (RFC 8446 §4.1.4) asking the client to retry
+    /// CH with a `key_share` for `selected_group`. The current transcript
+    /// already contains CH1 (the caller appended it before invoking this
+    /// helper); we rewrite that to `message_hash(Hash(CH1))` per §4.4.1 and
+    /// then feed the HRR bytes. The connection is left in
+    /// `State::WaitClientHelloRetry` with `hrr_ch1_immutable` snapshotted for
+    /// CH2 validation.
+    ///
+    /// When CH1 accepted ECH the HRR carries an `encrypted_client_hello`
+    /// extension whose 8-byte payload is the `hrr_accept_confirmation`
+    /// signal (draft-ietf-tls-esni-22 §7.2.1). The signal is built by
+    /// (1) emitting HRR with the extension payload zeroed, (2) computing
+    /// `Transcript-Hash(message_hash(Hash(inner_CH1)) || HRR_zero)`,
+    /// (3) feeding that hash into `hello_retry_request_signal` with the
+    /// inner CH1's random as IKM, and (4) patching the resulting 8 bytes
+    /// into the wire HRR before it goes on the transcript and the record
+    /// stream.
+    fn emit_hello_retry_request(
+        &mut self,
+        ch: &ClientHello,
+        suite: SuiteParams,
+        selected_group: NamedGroup,
+    ) -> Result<(), Error> {
+        debug_assert!(
+            !matches!(self.state, State::WaitClientHelloRetry),
+            "second HelloRetryRequest attempted — preferred-group bug",
+        );
+        if matches!(self.state, State::WaitClientHelloRetry) {
+            return Err(Error::HandshakeFailure);
+        }
+
+        // The transcript already had `set_alg(suite.hash)` called and CH1's
+        // raw bytes appended by `process_client_hello` immediately before
+        // it ran the HRR pre-check, so the rewrite below sees a
+        // well-formed `Hash(CH1)`.
+        // RFC 8446 §4.4.1: rewrite the transcript so that subsequent hashes
+        // see `message_hash(Hash(CH1)) || HRR || ...`. This MUST happen
+        // before we feed HRR bytes.
+        self.core.transcript.replace_with_message_hash();
+
+        // Build the HRR extension list. On an ECH-accepted CH1 we
+        // append an `encrypted_client_hello` extension carrying 8 zero
+        // bytes as the placeholder for the HRR signal (draft §7.2.1).
+        #[cfg_attr(not(feature = "ech"), allow(unused_mut))]
+        let mut hrr_extensions = alloc::vec![
+            ext::hrr_key_share(selected_group),
+            ext::server_supported_versions(),
+        ];
+        #[cfg(feature = "ech")]
+        let ech_accepted_for_hrr = matches!(
+            self.ech_state,
+            Some(EchServerHandshakeState::Accepted { .. })
+        );
+        #[cfg(feature = "ech")]
+        if ech_accepted_for_hrr {
+            hrr_extensions.push(ext::hrr_ech_confirmation([0u8; 8]));
+        }
+
+        #[cfg_attr(not(feature = "ech"), allow(unused_mut))]
+        let mut hrr = ServerHello {
+            random: HRR_RANDOM,
+            session_id: ch.session_id.clone(),
+            cipher_suite: suite.suite,
+            extensions: hrr_extensions,
+        }
+        .encode();
+
+        // ECH HRR signal: compute over `(message_hash || HRR_with_zero_payload)`
+        // and patch the 8 signal bytes into the wire HRR. The transcript
+        // currently holds `message_hash(Hash(inner_CH1))` (we already
+        // called `replace_with_message_hash` above); we use
+        // `hash_with_appended` so the HRR-with-zeros doesn't pollute the
+        // real transcript before we patch.
+        #[cfg(feature = "ech")]
+        if ech_accepted_for_hrr {
+            let inner_ch1_random = match self.ech_state {
+                Some(EchServerHandshakeState::Accepted {
+                    inner_ch1_random, ..
+                }) => inner_ch1_random,
+                _ => unreachable!("checked Accepted above"),
+            };
+            let th = self.core.transcript.hash_with_appended(&hrr);
+            let signal = crate::tls::ech::accept_signal::hello_retry_request_signal(
+                suite.hash,
+                &inner_ch1_random,
+                th.as_slice(),
+            );
+            // Locate the 8-byte payload of the trailing
+            // `encrypted_client_hello` extension and patch the signal in.
+            let off = crate::tls::ech::accept_signal::locate_hrr_ech_signal_payload(&hrr)
+                .ok_or(Error::HandshakeFailure)?;
+            hrr[off..off + 8].copy_from_slice(&signal);
+        }
+
+        // Feed HRR to the transcript and ship it on the wire. HRR rides at
+        // the same encryption level as the initial ServerHello (Initial in
+        // QUIC, plaintext record in TLS / DTLS).
+        self.emit_handshake_at(super::super::quic_hooks::Level::Initial, hrr);
+
+        // Stash CH1's binding so we can validate CH2 against it, the suite
+        // we picked, and the group we asked for.
+        self.hrr_ch1_immutable = Some(Ch1Immutable::from_ch(ch));
+        self.hrr_selected_group = Some(selected_group);
+        self.suite = Some(suite);
+        self.state = State::WaitClientHelloRetry;
+        Ok(())
     }
 
     /// Surfaces a freshly derived TLS 1.3 traffic secret to the QUIC layer.
@@ -1037,6 +1276,7 @@ impl<R: RngCore> ServerConnection<R> {
         let (msg_type, body) = read_handshake(&mut c)?;
         match self.state {
             State::WaitClientHello => self.on_client_hello(msg_type, body, &msg),
+            State::WaitClientHelloRetry => self.on_client_hello_retry(msg_type, body, &msg),
             State::WaitClientCertificate => self.on_client_certificate(msg_type, body, &msg),
             State::WaitClientCertVerify => self.on_client_cert_verify(msg_type, body, &msg),
             State::WaitClientFinished => {
@@ -1151,7 +1391,30 @@ impl<R: RngCore> ServerConnection<R> {
         self.send_key_update(true)
     }
 
+    /// Initial CH dispatcher: handles the very first ClientHello on a
+    /// connection (state `WaitClientHello`).
     fn on_client_hello(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        self.process_client_hello(msg_type, body, raw, false)
+    }
+
+    /// Post-HelloRetryRequest CH2 dispatcher: handles the retry ClientHello
+    /// (state `WaitClientHelloRetry`).
+    fn on_client_hello_retry(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        self.process_client_hello(msg_type, body, raw, true)
+    }
+
+    fn process_client_hello(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+        is_retry: bool,
+    ) -> Result<(), Error> {
         if msg_type != hs_type::CLIENT_HELLO {
             return Err(Error::UnexpectedMessage);
         }
@@ -1165,12 +1428,67 @@ impl<R: RngCore> ServerConnection<R> {
         // naturally builds over the inner CH. On reject, we continue
         // under the outer CH and flag the state so EE can ship
         // `retry_configs` (Wave 3b.4).
+        //
+        // CH1 path (`is_retry = false`): the HPKE decap runs at seq=0 and
+        // we retain the live `ReceiverContext` inside
+        // `EchServerHandshakeState::Accepted` so a subsequent HRR retry
+        // can decap CH2-outer with the same context at seq=1 per
+        // draft §7.2.2.
+        //
+        // CH2 path (`is_retry = true`): we reach here on the HRR retry,
+        // re-use the retained receiver via `try_decap_inner_retry`, and
+        // hand the recovered inner CH2 bytes back through the same
+        // `body`/`raw` substitution as CH1.
         #[cfg(feature = "ech")]
-        let ech_inner_storage: Option<Vec<u8>> = if let Some(ref ech) = self.config.ech_server {
+        let ech_inner_storage: Option<Vec<u8>> = if is_retry {
+            // Retry path: if CH1 accepted ECH, the receiver is still
+            // alive in `ech_state`. Pull it out, decap CH2-outer at
+            // seq=1, and stash CH2-inner.
+            if let Some(EchServerHandshakeState::Accepted {
+                receiver: Some(_), ..
+            }) = self.ech_state
+            {
+                // Take ownership of the receiver to call &mut open on it,
+                // then put the state back without the receiver (it's
+                // single-use across CH2).
+                let mut state_taken = self.ech_state.take().expect("checked Some above");
+                let inner_ch2_bytes = if let EchServerHandshakeState::Accepted {
+                    ref mut receiver,
+                    ref mut inner_ch_bytes,
+                    ..
+                } = state_taken
+                {
+                    let mut recv = receiver.take().expect("checked Some above");
+                    let result = crate::tls::ech::outer::try_decap_inner_retry(raw, &mut recv);
+                    let ich2 = result?;
+                    // Replace CH1-inner with CH2-inner for downstream
+                    // transcript/extension processing.
+                    *inner_ch_bytes = ich2.clone();
+                    ich2
+                } else {
+                    return Err(Error::HandshakeFailure);
+                };
+                self.ech_state = Some(state_taken);
+                Some(inner_ch2_bytes)
+            } else {
+                None
+            }
+        } else if let Some(ref ech) = self.config.ech_server {
             match crate::tls::ech::outer::try_decap_inner(raw, ech.keys()) {
-                Ok(inner_bytes) => {
+                Ok(decapped) => {
+                    // Snapshot CH1-inner's `random` (offset 6..38 in the
+                    // handshake-message bytes: 1-byte type + 3-byte length
+                    // + 2-byte legacy_version) for the HRR signal IKM.
+                    let mut inner_ch1_random = [0u8; 32];
+                    if decapped.inner_ch_bytes.len() < 38 {
+                        return Err(Error::HandshakeFailure);
+                    }
+                    inner_ch1_random.copy_from_slice(&decapped.inner_ch_bytes[6..38]);
+                    let inner_bytes = decapped.inner_ch_bytes.clone();
                     self.ech_state = Some(EchServerHandshakeState::Accepted {
                         inner_ch_bytes: inner_bytes.clone(),
+                        receiver: Some(decapped),
+                        inner_ch1_random,
                     });
                     Some(inner_bytes)
                 }
@@ -1199,6 +1517,21 @@ impl<R: RngCore> ServerConnection<R> {
         };
 
         let ch = ClientHello::decode(body)?;
+
+        // RFC 8446 §4.1.4: CH2 after HRR must echo CH1 unmodified except for
+        // the narrow list of permitted edits (key_share narrowed to the
+        // requested group, early_data removed, PSK binders recomputed,
+        // optional cookie/padding). Compare the snapshot we stashed at
+        // HRR-emit time; any drift kills the handshake with
+        // `illegal_parameter`.
+        if is_retry {
+            let snap = self
+                .hrr_ch1_immutable
+                .as_ref()
+                .ok_or(Error::HandshakeFailure)?
+                .clone();
+            snap.verify_ch2_matches(&ch)?;
+        }
 
         // RFC 7507 §3: TLS_FALLBACK_SCSV (0x5600) in the offered suite list
         // means the client is intentionally downgrading. Since this is the
@@ -1231,16 +1564,26 @@ impl<R: RngCore> ServerConnection<R> {
 
         // PSK resumption: process pre_shared_key + psk_key_exchange_modes
         // before suite negotiation so we can constrain the suite to the PSK's
-        // hash. Hard-fail on binder mismatch (decrypt_error).
-        let psk_state = self.try_accept_psk(&ch, raw)?;
+        // hash. Hard-fail on binder mismatch (decrypt_error). Skipped on
+        // retry: PSK + HRR requires binders recomputed against the new
+        // transcript, which is left to a follow-up commit (the HRR
+        // pre-check below refuses to emit HRR when PSK is being negotiated).
+        let psk_state = if is_retry {
+            None
+        } else {
+            self.try_accept_psk(&ch, raw)?
+        };
 
         // 0-RTT acceptance precondition: PSK was selected, the client
         // offered early_data, and our policy is non-zero. Anti-replay: if a
         // ReplayWindow is configured and this binder was seen, reject 0-RTT
-        // (proceed with 1-RTT, the spec-compliant fallback).
+        // (proceed with 1-RTT, the spec-compliant fallback). RFC 8446
+        // §4.2.10 forbids 0-RTT after HRR, so on retry we hard-disable it.
         let client_offered_early = ext::find(&ch.extensions, ExtensionType::EARLY_DATA).is_some();
-        let mut accept_early =
-            psk_state.is_some() && client_offered_early && self.config.max_early_data_size > 0;
+        let mut accept_early = !is_retry
+            && psk_state.is_some()
+            && client_offered_early
+            && self.config.max_early_data_size > 0;
         #[cfg(feature = "std")]
         if accept_early
             && let Some(window) = self.config.replay_window.as_ref()
@@ -1256,8 +1599,13 @@ impl<R: RngCore> ServerConnection<R> {
 
         // Negotiate the cipher suite. If we accepted a PSK, the suite must
         // match the PSK's hash; otherwise pick our preferred suite from the
-        // client's offer.
-        let suite = if let Some(ref s) = psk_state {
+        // client's offer. On retry, we reuse the suite picked at CH1 — the
+        // §4.1.4 immutability check guarantees CH2's `cipher_suites` is
+        // byte-identical to CH1's, so re-negotiation would produce the same
+        // result, but using the cached value avoids any risk of drift.
+        let suite = if is_retry {
+            self.suite.ok_or(Error::HandshakeFailure)?
+        } else if let Some(ref s) = psk_state {
             supported_suites()
                 .iter()
                 .copied()
@@ -1398,8 +1746,45 @@ impl<R: RngCore> ServerConnection<R> {
             }
         }
 
-        self.core.transcript.set_alg(suite.hash);
+        // On retry, `set_alg` was already called at CH1 time and the
+        // transcript already holds `message_hash(Hash(CH1)) || HRR`; we just
+        // append CH2 here. RFC 8446 §4.4.1 fixes this ordering.
+        if !is_retry {
+            self.core.transcript.set_alg(suite.hash);
+        }
         self.core.transcript.update(raw);
+
+        // RFC 8446 §4.1.4 HRR pre-check: if the deployment named a preferred
+        // key-exchange group, the client advertised it in
+        // `supported_groups`, and the client did NOT include a share for
+        // that group, ask the client to retry. PSK + HRR is intentionally
+        // declined here (HRR binder recomputation is handled in a follow-up
+        // commit); ECH + HRR is *supported* (draft §7.2.1 / §7.2.2), and
+        // `emit_hello_retry_request` patches the
+        // `hrr_accept_confirmation` signal into the HRR
+        // `encrypted_client_hello` extension when CH1 accepted ECH.
+        if !is_retry
+            && psk_state.is_none()
+            && let Some(preferred_pub) = self.config.preferred_key_exchange_group
+        {
+            let preferred = preferred_pub.to_wire();
+            let supported = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS) {
+                Some(sg_body) => ext::parse_supported_groups(sg_body)?,
+                None => Vec::new(),
+            };
+            let shared_groups: Vec<NamedGroup> =
+                match ext::find(&ch.extensions, ExtensionType::KEY_SHARE) {
+                    Some(ks_body) => ext::parse_client_key_shares(ks_body)?
+                        .into_iter()
+                        .map(|(g, _)| g)
+                        .collect(),
+                    None => Vec::new(),
+                };
+            if supported.contains(&preferred) && !shared_groups.contains(&preferred) {
+                self.emit_hello_retry_request(&ch, suite, preferred)?;
+                return Ok(());
+            }
+        }
 
         // 0-RTT: if accepting, derive client_early_traffic_secret from
         // Hash(ClientHello) NOW (before SH lands in the transcript) and
@@ -1440,22 +1825,33 @@ impl<R: RngCore> ServerConnection<R> {
         };
         let _ = cets_for_read;
 
-        // Pick a key-exchange group offered by the client.
+        // Pick a key-exchange group offered by the client. On retry CH2
+        // MUST carry exactly one share, for the group we asked for in HRR
+        // (RFC 8446 §4.2.8); anything else is `illegal_parameter`.
         let ks_ext =
             ext::find(&ch.extensions, ExtensionType::KEY_SHARE).ok_or(Error::HandshakeFailure)?;
         let shares = ext::parse_client_key_shares(ks_ext)?;
-        let (group, client_pub) = shares
-            .iter()
-            .find(|(g, _)| {
-                matches!(
-                    *g,
-                    NamedGroup::X25519MLKEM768
-                        | NamedGroup::X25519
-                        | NamedGroup::SECP256R1
-                        | NamedGroup::SECP384R1
-                )
-            })
-            .ok_or(Error::HandshakeFailure)?;
+        let (group, client_pub) = if is_retry {
+            let want = self.hrr_selected_group.ok_or(Error::HandshakeFailure)?;
+            if shares.len() != 1 || shares[0].0 != want {
+                return Err(Error::IllegalParameter);
+            }
+            (&shares[0].0, shares[0].1.as_slice())
+        } else {
+            let (g, k) = shares
+                .iter()
+                .find(|(g, _)| {
+                    matches!(
+                        *g,
+                        NamedGroup::X25519MLKEM768
+                            | NamedGroup::X25519
+                            | NamedGroup::SECP256R1
+                            | NamedGroup::SECP384R1
+                    )
+                })
+                .ok_or(Error::HandshakeFailure)?;
+            (g, k.as_slice())
+        };
 
         // Server random and ephemeral key share.
         let mut random: Random = [0u8; 32];

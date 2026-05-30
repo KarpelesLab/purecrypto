@@ -42,6 +42,10 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
+#[cfg(feature = "ech")]
+use crate::hpke::SenderContext;
+#[cfg(feature = "ech")]
+use crate::tls::ech::HpkeSymCipherSuite;
 
 /// A client certificate + signing key, set on [`ClientConfig`] to satisfy a
 /// server's `CertificateRequest` (mTLS, RFC 8446 §4.3.2).
@@ -543,7 +547,6 @@ pub struct ClientConnection {
 /// and swap the transcript from outer to inner) and
 /// EncryptedExtensions (to surface a rejection with `retry_configs`).
 #[cfg(feature = "ech")]
-#[derive(Clone, Debug)]
 pub(crate) struct ClientEchState {
     /// The encoded **inner** CH handshake message bytes (header
     /// included), the bytes the server processes after HPKE-decap.
@@ -555,6 +558,32 @@ pub(crate) struct ClientEchState {
     /// signal in `random[24..32]` matched our recomputed signal) or
     /// rejected it. `None` between CH emission and SH receipt.
     pub(crate) outcome: Option<EchOutcome>,
+    /// HPKE sender context retained for the HRR retry path. CH1's
+    /// `seal` advanced `seq` to 1; CH2-outer's seal consumes it at
+    /// `seq = 1` per draft §7.2.2. `None` on GREASE-only ECH.
+    pub(crate) sender: Option<SenderContext>,
+    /// Symmetric suite advertised in CH1-outer's
+    /// `encrypted_client_hello`. CH2-outer MUST echo the same. `None`
+    /// on GREASE-only ECH.
+    pub(crate) sym: Option<HpkeSymCipherSuite>,
+    /// `config_id` selected for CH1's HPKE setup. CH2-outer echoes it.
+    pub(crate) config_id: Option<u8>,
+    /// CH1-inner's `random`, used both as the IKM for verifying the
+    /// HRR ECH confirmation signal (draft §7.2.1) and for the SH
+    /// signal (§7.2). `None` on GREASE-only ECH.
+    pub(crate) inner_ch1_random: Option<[u8; 32]>,
+    /// `maximum_name_length` from the selected `ECHConfig.contents`,
+    /// needed to re-pad CH2-inner identically on the HRR retry path.
+    /// `None` on GREASE-only ECH.
+    pub(crate) maximum_name_length: Option<u8>,
+    /// `true` once the live transcript has been swapped from CH1-outer
+    /// to the inner sequence. Set by the HRR retry path when the HRR's
+    /// `encrypted_client_hello` confirmation signal validates; the SH
+    /// processing then knows to hash the SH-with-zero-tail against the
+    /// live transcript via `hash_with_appended` instead of recomputing
+    /// from `inner_ch_bytes` (which alone wouldn't include the HRR or
+    /// CH2-inner messages the SH binds to).
+    pub(crate) inner_transcript_swapped: bool,
 }
 
 /// What the client learnt about ECH from the server's ServerHello.
@@ -867,6 +896,34 @@ impl ClientConnection {
             rng,
             suites,
             groups,
+            &[],
+            super::super::quic_hooks::EngineMode::Tls,
+            None,
+        )
+    }
+
+    /// Like [`new_with_offer`] but only includes `key_share` entries for the
+    /// groups listed in `share_groups` (a subset of `groups`). Lets a test
+    /// drive a deployment where the client advertises more groups in
+    /// `supported_groups` than it ships shares for — the configuration HRR
+    /// exists to fix. Empty `share_groups` is equivalent to
+    /// [`new_with_offer`] (share for every offered group).
+    #[cfg(test)]
+    pub(crate) fn new_with_offer_partial_shares<R: RngCore>(
+        config: ClientConfig,
+        server_name: &str,
+        rng: &mut R,
+        suites: &[CipherSuite],
+        groups: &[NamedGroup],
+        share_groups: &[NamedGroup],
+    ) -> Self {
+        Self::new_with_offer_inner(
+            config,
+            server_name,
+            rng,
+            suites,
+            groups,
+            share_groups,
             super::super::quic_hooks::EngineMode::Tls,
             None,
         )
@@ -904,6 +961,7 @@ impl ClientConnection {
             rng,
             suites,
             groups,
+            &[],
             super::super::quic_hooks::EngineMode::Quic,
             Some(hooks),
         )
@@ -916,12 +974,14 @@ impl ClientConnection {
     /// * the seeded `engine_mode` and `hooks` fields, and
     /// * a `quic_transport_parameters` extension is appended to the
     ///   outgoing ClientHello whenever `engine_mode == Quic`.
+    #[allow(clippy::too_many_arguments)] // 8 small args, splitting the seam adds no clarity
     fn new_with_offer_inner<R: RngCore>(
         config: ClientConfig,
         server_name: &str,
         rng: &mut R,
         suites: &[CipherSuite],
         groups: &[NamedGroup],
+        share_groups: &[NamedGroup],
         engine_mode: super::super::quic_hooks::EngineMode,
         hooks: Option<super::super::quic_hooks::BoxedHooks>,
     ) -> Self {
@@ -1007,15 +1067,36 @@ impl ClientConnection {
         // wire ClientHello. Otherwise build the plain (possibly GREASE)
         // ClientHello via build_client_hello with `ech_override = None`.
         #[cfg(feature = "ech")]
-        let ech_sealed: Option<(Vec<u8>, Vec<u8>)> =
-            seal_real_ech_on_ch1(&conn, random, &effective_suites, groups, server_name, rng);
+        let ech_sealed: Option<EchSealOutput> = seal_real_ech_on_ch1(
+            &conn,
+            random,
+            &effective_suites,
+            groups,
+            share_groups,
+            server_name,
+            rng,
+        );
 
         #[cfg(feature = "ech")]
         let hello = match ech_sealed {
-            Some((outer_ch, inner_ch_bytes)) => {
+            Some(EchSealOutput {
+                outer_ch,
+                inner_ch_bytes,
+                sender,
+                sym,
+                config_id,
+                inner_ch1_random,
+                maximum_name_length,
+            }) => {
                 conn.ech_state = Some(ClientEchState {
                     inner_ch_bytes,
                     outcome: None,
+                    sender: Some(sender),
+                    sym: Some(sym),
+                    config_id: Some(config_id),
+                    inner_ch1_random: Some(inner_ch1_random),
+                    maximum_name_length: Some(maximum_name_length),
+                    inner_transcript_swapped: false,
                 });
                 outer_ch
             }
@@ -1024,7 +1105,7 @@ impl ClientConnection {
                 String::from(server_name),
                 &effective_suites,
                 groups,
-                &[],
+                share_groups,
                 &[],
                 None,
             ),
@@ -1035,7 +1116,7 @@ impl ClientConnection {
             String::from(server_name),
             &effective_suites,
             groups,
-            &[],
+            share_groups,
             &[],
             None,
         );
@@ -1646,11 +1727,22 @@ impl ClientConnection {
                 for b in &mut sh_zero_tail[30..38] {
                     *b = 0;
                 }
-                let mut tbuf: Vec<u8> =
-                    Vec::with_capacity(state.inner_ch_bytes.len() + sh_zero_tail.len());
-                tbuf.extend_from_slice(&state.inner_ch_bytes);
-                tbuf.extend_from_slice(&sh_zero_tail);
-                let th_sig = suite.hash.hash(&tbuf);
+                // On the HRR retry path the live transcript already
+                // holds `message_hash(Hash(inner_CH1)) || HRR || inner_CH2`
+                // (HRR processing swapped it in), so the SH signal hash
+                // is `Hash(live_transcript || sh_zero_tail)`. On the
+                // non-HRR path the live transcript still holds the
+                // outer CH and we recompute `Hash(inner_CH || sh_zero_tail)`
+                // from scratch.
+                let th_sig = if state.inner_transcript_swapped {
+                    self.core.transcript.hash_with_appended(&sh_zero_tail)
+                } else {
+                    let mut tbuf: Vec<u8> =
+                        Vec::with_capacity(state.inner_ch_bytes.len() + sh_zero_tail.len());
+                    tbuf.extend_from_slice(&state.inner_ch_bytes);
+                    tbuf.extend_from_slice(&sh_zero_tail);
+                    suite.hash.hash(&tbuf)
+                };
                 let expected = crate::tls::ech::accept_signal::server_hello_signal(
                     suite.hash,
                     ks.current_secret_bytes(),
@@ -1658,12 +1750,15 @@ impl ClientConnection {
                 );
                 let sh_tail = crate::tls::ech::accept_signal::random_tail(&sh.random);
                 if crate::tls::ech::accept_signal::signals_eq_ct(&expected, &sh_tail) {
-                    // ECH accepted: swap the live transcript from outer
-                    // CH bytes to inner CH bytes. The patched-form SH
-                    // will be appended just below.
-                    self.core
-                        .transcript
-                        .replace_buf(state.inner_ch_bytes.clone());
+                    // ECH accepted. On the non-HRR path swap the live
+                    // transcript from outer to inner now; on the HRR
+                    // retry path the swap already happened during HRR
+                    // processing, so leave the transcript alone.
+                    if !state.inner_transcript_swapped {
+                        self.core
+                            .transcript
+                            .replace_buf(state.inner_ch_bytes.clone());
+                    }
                     state.outcome = Some(EchOutcome::Accepted);
                 } else {
                     state.outcome = Some(EchOutcome::Rejected);
@@ -1792,8 +1887,88 @@ impl ClientConnection {
             return Err(Error::IllegalParameter);
         }
 
-        // Pin the negotiated hash and rewrite the transcript per §4.4.1.
+        // Pin the negotiated hash so the transcript helpers below can
+        // run (HRR is the first message after CH1 where we know it).
         self.core.transcript.set_alg(suite.hash);
+
+        // draft-ietf-tls-esni-22 §7.2.1: if the HRR carries an
+        // `encrypted_client_hello` extension, it MUST be exactly 8
+        // bytes (the `hrr_accept_confirmation` signal). The server
+        // emits it only when it accepted CH1's real ECH; receiving one
+        // when we didn't actually do real ECH is a protocol violation.
+        // Verification happens *before* the §4.4.1 transcript rewrite
+        // so the live transcript still holds the raw CH1-outer bytes
+        // and we can build the inner-transcript signal input on a
+        // throwaway buffer.
+        #[cfg(feature = "ech")]
+        let mut ech_signal_accepted = false;
+        #[cfg(feature = "ech")]
+        if let Some(ech_body) = ext::find(
+            &hrr.extensions,
+            crate::tls::codec::ExtensionType::ENCRYPTED_CLIENT_HELLO,
+        ) {
+            if ech_body.len() != 8 {
+                return Err(Error::IllegalParameter);
+            }
+            let mut received = [0u8; 8];
+            received.copy_from_slice(ech_body);
+            // Real-ECH state must be in play; sender retention from
+            // CH1 is the marker.
+            let state = self
+                .ech_state
+                .as_ref()
+                .filter(|s| s.sender.is_some())
+                .ok_or(Error::IllegalParameter)?;
+            let inner_ch1_random = state.inner_ch1_random.ok_or(Error::IllegalParameter)?;
+            let inner_ch_bytes = state.inner_ch_bytes.clone();
+            // Zero the 8 signal bytes in a copy of the HRR wire image
+            // to recover the "placeholder" form the spec hashes.
+            let mut hrr_zero = raw.to_vec();
+            let off = crate::tls::ech::accept_signal::locate_hrr_ech_signal_payload(&hrr_zero)
+                .ok_or(Error::IllegalParameter)?;
+            for b in &mut hrr_zero[off..off + 8] {
+                *b = 0;
+            }
+            // Build the inner-transcript input:
+            //   message_hash(Hash(inner_CH1)) || HRR_with_zero_payload
+            let inner_hash = suite.hash.hash(&inner_ch_bytes);
+            let hash_len = suite.hash.output_len();
+            let mut tbuf = Vec::with_capacity(4 + hash_len + hrr_zero.len());
+            tbuf.push(254); // synthetic message_hash type
+            tbuf.extend_from_slice(&[0, 0]);
+            tbuf.push(hash_len as u8);
+            tbuf.extend_from_slice(inner_hash.as_slice());
+            tbuf.extend_from_slice(&hrr_zero);
+            let th = suite.hash.hash(&tbuf);
+            let expected = crate::tls::ech::accept_signal::hello_retry_request_signal(
+                suite.hash,
+                &inner_ch1_random,
+                th.as_slice(),
+            );
+            if !crate::tls::ech::accept_signal::signals_eq_ct(&expected, &received) {
+                // Signal mismatch: HRR claims ECH accept but the bits
+                // don't match. Aborting with `EchRejected` (no
+                // retry_configs in flight yet) reads cleaner than
+                // illegal_parameter — wave 4 lifts the actual configs
+                // from a subsequent EE on the rejected outer path.
+                return Err(Error::EchRejected(Vec::new()));
+            }
+            ech_signal_accepted = true;
+        }
+
+        // RFC 8446 §4.4.1 transcript rewrite. On real-ECH accept, the
+        // transcript first swaps from CH1-outer to CH1-inner so the
+        // rewrite produces `message_hash(Hash(inner_CH1))` rather than
+        // `message_hash(Hash(outer_CH1))` — every subsequent message
+        // (HRR included) is then bound to the inner transcript.
+        #[cfg(feature = "ech")]
+        if ech_signal_accepted && let Some(state) = self.ech_state.as_mut() {
+            self.core
+                .transcript
+                .replace_buf(state.inner_ch_bytes.clone());
+            state.inner_transcript_swapped = true;
+            state.outcome = Some(EchOutcome::Accepted);
+        }
         self.core.transcript.replace_with_message_hash();
         self.core.transcript.update(raw);
 
@@ -1802,21 +1977,165 @@ impl ClientConnection {
         let share_only: alloc::vec::Vec<NamedGroup> = selected_group.into_iter().collect();
         let extras: alloc::vec::Vec<crate::tls::codec::RawExtension> =
             cookie_ext.into_iter().collect();
-        let ch2 = self.build_client_hello(
-            self.client_random,
-            self.server_name.clone(),
-            &self.offered_suites.clone(),
-            &self.offered_groups.clone(),
-            &share_only,
-            &extras,
-            // HRR retry path does not yet re-seal real ECH (wave-later).
+
+        #[cfg(feature = "ech")]
+        let (ch2_wire, ch2_transcript) = if ech_signal_accepted {
+            // Real-ECH retry: build CH2-inner, then build CH2-outer
+            // skeleton with the same `(sym, config_id)` as CH1 and an
+            // empty `enc` field (draft §6.1.5), and seal CH2-inner
+            // under the retained `SenderContext` (its `seq` is 1, the
+            // schedule position the server's receiver is at after
+            // CH1's `open` call). The transcript is bound to CH2-inner
+            // (the server unwraps CH2-outer to CH2-inner before
+            // appending to its own transcript), so wire ≠ transcript
+            // bytes here.
+            let (outer, inner) = self.seal_real_ech_on_ch2(&share_only, &extras)?;
+            (outer, Some(inner))
+        } else {
+            let ch = self.build_client_hello(
+                self.client_random,
+                self.server_name.clone(),
+                &self.offered_suites.clone(),
+                &self.offered_groups.clone(),
+                &share_only,
+                &extras,
+                None,
+            );
+            (ch, None)
+        };
+
+        #[cfg(not(feature = "ech"))]
+        let (ch2_wire, ch2_transcript): (Vec<u8>, Option<Vec<u8>>) = (
+            self.build_client_hello(
+                self.client_random,
+                self.server_name.clone(),
+                &self.offered_suites.clone(),
+                &self.offered_groups.clone(),
+                &share_only,
+                &extras,
+                None,
+            ),
             None,
         );
+
         // RFC 9001 §4.1.4: like CH1, CH2 rides at Initial in QUIC mode.
-        self.emit_handshake_at(super::super::quic_hooks::Level::Initial, ch2);
+        // ECH-real retry: send the outer to the wire and feed the inner
+        // to the transcript separately. Non-ECH retry: wire and
+        // transcript are the same bytes.
+        match ch2_transcript {
+            #[cfg(feature = "ech")]
+            Some(inner) => {
+                self.core
+                    .emit_record(crate::tls::ContentType::Handshake, &ch2_wire);
+                if let Some(h) = self.hooks.as_mut() {
+                    h.on_handshake_data(super::super::quic_hooks::Level::Initial, &ch2_wire);
+                }
+                self.core.transcript_only(&inner);
+            }
+            _ => {
+                self.emit_handshake_at(super::super::quic_hooks::Level::Initial, ch2_wire);
+            }
+        }
         self.hrr_processed = true;
         // Stay in WaitServerHello for the real ServerHello.
         Ok(())
+    }
+
+    /// Re-seals CH2-inner into a CH2-outer skeleton under the
+    /// `SenderContext` retained from CH1's seal (draft-ietf-tls-esni-22
+    /// §6.1.5 / §7.2.2). CH2-outer's `encrypted_client_hello` extension
+    /// MUST echo CH1's `(sym, config_id)` and carry an empty `enc`
+    /// field; the AEAD seq increments to 1 by virtue of reusing the
+    /// same HPKE schedule rather than spinning up a fresh sender.
+    ///
+    /// On real-ECH GREASE / config-mismatch / non-ECH paths the caller
+    /// builds CH2 directly via `build_client_hello`; this function is
+    /// only reached when CH1's HRR carried a validated ECH signal.
+    ///
+    /// Returns `(outer_ch2, inner_ch2)`: the outer goes on the wire (so
+    /// the server can HPKE-decap CH2-outer under the retained sender),
+    /// the inner goes into the transcript (the handshake hash is bound
+    /// to the inner CH on both ends per draft §6.1).
+    #[cfg(feature = "ech")]
+    fn seal_real_ech_on_ch2(
+        &mut self,
+        share_only: &[NamedGroup],
+        extras: &[crate::tls::codec::RawExtension],
+    ) -> Result<(Vec<u8>, Vec<u8>), Error> {
+        // Look up the same ECHConfig CH1 picked. `first_supported` is
+        // deterministic on the configured list so we land on the same
+        // entry CH1 sealed under (and we cross-check via `config_id`).
+        let ech_client = self.config.ech.as_ref().ok_or(Error::EchDecryptionFailed)?;
+        let list = match &ech_client.mode {
+            crate::tls::ech::EchClientMode::Real(l) => l,
+            _ => return Err(Error::EchDecryptionFailed),
+        };
+        let echcfg = list
+            .first_supported()
+            .ok_or(Error::EchDecryptionFailed)?
+            .clone();
+        let contents = echcfg.contents.as_ref().ok_or(Error::EchDecryptionFailed)?;
+        let public_name_str = String::from(
+            core::str::from_utf8(&contents.public_name).map_err(|_| Error::EchDecodeError)?,
+        );
+
+        // Snapshot the per-CH1 ECH state without holding a borrow of
+        // `self` across `build_client_hello`/`seal_into_skeleton`.
+        let (sym, config_id, maximum_name_length) = {
+            let state = self.ech_state.as_ref().ok_or(Error::EchDecryptionFailed)?;
+            (
+                state.sym.ok_or(Error::EchDecryptionFailed)?,
+                state.config_id.ok_or(Error::EchDecryptionFailed)?,
+                state
+                    .maximum_name_length
+                    .ok_or(Error::EchDecryptionFailed)?,
+            )
+        };
+
+        let inner_marker = crate::tls::ech::inner::inner_extension_body();
+        let server_name = self.server_name.clone();
+        let suites = self.offered_suites.clone();
+        let groups = self.offered_groups.clone();
+        let random = self.client_random;
+        let inner_ch2 = self.build_client_hello(
+            random,
+            server_name.clone(),
+            &suites,
+            &groups,
+            share_only,
+            extras,
+            Some(&inner_marker),
+        );
+        let inner_sni_len = server_name.len();
+        let padded =
+            crate::tls::ech::outer::pad_inner(&inner_ch2, inner_sni_len, maximum_name_length);
+        // CH2-outer's encrypted_client_hello extension carries an empty
+        // `enc` field per draft §6.1.5; the receiver pulls `enc` from
+        // its own retained CH1 setup, not the wire.
+        let outer_body =
+            crate::tls::ech::outer::build_outer_ext_body(sym, config_id, &[][..], padded.len());
+        let skeleton = self.build_client_hello(
+            random,
+            public_name_str,
+            &suites,
+            &groups,
+            share_only,
+            extras,
+            Some(&outer_body),
+        );
+
+        // Take the retained sender (it never goes back into state —
+        // after CH2 no more CH-level HPKE seals happen) and seal.
+        let state = self.ech_state.as_mut().ok_or(Error::EchDecryptionFailed)?;
+        let mut sender = state.sender.take().ok_or(Error::EchDecryptionFailed)?;
+        let outer_ch = crate::tls::ech::outer::seal_into_skeleton(&mut sender, skeleton, &padded)?;
+        // Update `inner_ch_bytes` to CH2-inner; the SH signal
+        // verification path reads the live transcript via
+        // `hash_with_appended` after we feed CH2-INNER into it below,
+        // but a few diagnostics and the `peer_inner_sni`-equivalent
+        // surfaces still read this field.
+        state.inner_ch_bytes = inner_ch2.clone();
+        Ok((outer_ch, inner_ch2))
     }
 
     fn key_agreement(&self, group: NamedGroup, server_pub: &[u8]) -> Result<Secret, Error> {
@@ -2477,10 +2796,24 @@ impl ClientConnection {
 }
 
 /// Attempts the real-ECH seal pipeline for an initial ClientHello, per
-/// draft-ietf-tls-esni-22 §6. Returns `Some((outer_ch_bytes,
-/// inner_ch_bytes))` if a sealed pair was successfully produced;
-/// returns `None` otherwise (the caller falls back to the GREASE-path
-/// CH built without `ech_override`).
+/// Bundle returned by [`seal_real_ech_on_ch1`] — the outer + inner CH
+/// wire bytes plus the HPKE state the connection needs to retain
+/// across an HRR retry (draft-ietf-tls-esni-22 §6.1.5 / §7.2.2).
+#[cfg(feature = "ech")]
+pub(crate) struct EchSealOutput {
+    pub outer_ch: Vec<u8>,
+    pub inner_ch_bytes: Vec<u8>,
+    pub sender: SenderContext,
+    pub sym: HpkeSymCipherSuite,
+    pub config_id: u8,
+    pub inner_ch1_random: [u8; 32],
+    pub maximum_name_length: u8,
+}
+
+/// draft-ietf-tls-esni-22 §6. Returns `Some(EchSealOutput)` if a
+/// sealed pair was successfully produced; returns `None` otherwise
+/// (the caller falls back to the GREASE-path CH built without
+/// `ech_override`).
 ///
 /// `None` covers every "no real-ECH today" condition uniformly so the
 /// caller doesn't fork:
@@ -2493,19 +2826,21 @@ impl ClientConnection {
 /// - HPKE setup_sender or AEAD seal fail (unlikely; treated as falling
 ///   back to GREASE rather than aborting the handshake)
 ///
-/// On success the caller pins `inner_ch_bytes` into
+/// On success the caller pins the `EchSealOutput` into
 /// [`ClientConnection::ech_state`] so the SH processing can verify the
-/// accept signal over `Hash(inner_CH || zero-tail SH)` and swap the
-/// transcript on accept.
+/// accept signal over `Hash(inner_CH || zero-tail SH)`, swap the
+/// transcript on accept, and re-seal CH2-inner under the retained
+/// `SenderContext` on the HRR retry path.
 #[cfg(feature = "ech")]
 fn seal_real_ech_on_ch1<R: RngCore>(
     conn: &ClientConnection,
     random: Random,
     effective_suites: &[CipherSuite],
     groups: &[NamedGroup],
+    share_groups: &[NamedGroup],
     server_name: &str,
     rng: &mut R,
-) -> Option<(Vec<u8>, Vec<u8>)> {
+) -> Option<EchSealOutput> {
     // Real ECH + PSK is a separate wave: defer.
     if conn.psk_offered.is_some() {
         return None;
@@ -2522,20 +2857,26 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     let contents = echcfg.contents.as_ref()?;
     let sym = *contents.key_config.cipher_suites.first()?;
     let config_id = contents.key_config.config_id;
+    let maximum_name_length = contents.maximum_name_length;
     let public_name_str = String::from(core::str::from_utf8(&contents.public_name).ok()?);
     let inner_marker = crate::tls::ech::inner::inner_extension_body();
+    // draft-ietf-tls-esni-22 §6.1: `key_share` is one of the
+    // outer-extensions that gets compressed across the seam, so the
+    // inner and outer CHs MUST present the same `key_share` bytes —
+    // route `share_groups` into both build calls.
     let inner_ch = conn.build_client_hello(
         random,
         String::from(server_name),
         effective_suites,
         groups,
-        &[],
+        share_groups,
         &[],
         Some(&inner_marker),
     );
     let inner_sni_len = server_name.len();
     let suites_owned = effective_suites.to_vec();
     let groups_owned = groups.to_vec();
+    let share_groups_owned = share_groups.to_vec();
     let public_name_closure = public_name_str.clone();
     let conn_for_closure = conn;
     let sealed = crate::tls::ech::outer::seal_with(
@@ -2552,14 +2893,31 @@ fn seal_real_ech_on_ch1<R: RngCore>(
                 public_name_closure.clone(),
                 &suites_owned,
                 &groups_owned,
-                &[],
+                &share_groups_owned,
                 &[],
                 Some(&outer_body),
             )
         },
     )
     .ok()?;
-    Some((sealed.outer_ch, inner_ch))
+    // Extract CH1-inner's `random` from the encoded inner CH. The
+    // ClientHello body opens with version(2) + random(32); the
+    // handshake header (type=1 + 24-bit length) precedes it, so the
+    // random sits at offset 4 + 2 = 6.
+    if inner_ch.len() < 38 {
+        return None;
+    }
+    let mut inner_ch1_random = [0u8; 32];
+    inner_ch1_random.copy_from_slice(&inner_ch[6..38]);
+    Some(EchSealOutput {
+        outer_ch: sealed.outer_ch,
+        inner_ch_bytes: inner_ch,
+        sender: sealed.sender,
+        sym,
+        config_id,
+        inner_ch1_random,
+        maximum_name_length,
+    })
 }
 
 /// Maps an internal error to the alert to send the peer.
@@ -2617,15 +2975,8 @@ fn patch_psk_binder(ch: &mut [u8], truncated_len: usize, hash: HashAlg, psk: &[u
     ch[start..].copy_from_slice(&binder);
 }
 
-/// The HelloRetryRequest sentinel `ServerHello.random` (RFC 8446 §4.1.3):
-/// `SHA-256("HelloRetryRequest")`.
-const HRR_RANDOM: [u8; 32] = [
-    0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
-    0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
-];
-
 fn is_hello_retry_request(random: &Random) -> bool {
-    random == &HRR_RANDOM
+    random == &crate::tls::codec::HRR_RANDOM
 }
 
 /// One entry in the TLS 1.3 `Certificate` message: the cert DER and the
@@ -2841,7 +3192,9 @@ mod tests {
 
         // HPKE-decap → recover the inner CH bytes; its SNI must be the
         // application-level inner SNI.
-        let inner_msg = try_decap_inner(&outer_msg, &ring).expect("server-side decap");
+        let inner_msg = try_decap_inner(&outer_msg, &ring)
+            .expect("server-side decap")
+            .inner_ch_bytes;
         let mut ic = ReadCursor::new(&inner_msg);
         assert_eq!(ic.u8().unwrap(), hs_type::CLIENT_HELLO);
         let inner_body = ic.vec_u24().unwrap();

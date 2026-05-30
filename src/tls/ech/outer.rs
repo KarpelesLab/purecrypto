@@ -34,7 +34,7 @@
 use super::config::{EchConfig, HpkeSymCipherSuite};
 use super::extension::{EchExtension, decode_outer_position};
 use super::hpke_setup::{setup_receiver, setup_sender};
-use crate::hpke::SenderContext;
+use crate::hpke::{ReceiverContext, SenderContext};
 use crate::rng::RngCore;
 use crate::tls::Error;
 use alloc::vec::Vec;
@@ -103,7 +103,7 @@ pub(crate) struct SealedOuter {
 /// - `aad = outer_ch_skeleton` (which already has the payload field
 ///   zeroed and so equals `ClientHelloOuterAAD` per draft §6.1.2)
 /// - `plaintext = padded_inner`
-fn seal_into_skeleton(
+pub(crate) fn seal_into_skeleton(
     sender: &mut SenderContext,
     outer_ch_skeleton: Vec<u8>,
     padded_inner: &[u8],
@@ -285,9 +285,31 @@ where
     Ok(SealedOuter { outer_ch, sender })
 }
 
+/// Result of [`try_decap_inner`]: the recovered inner CH plus all the
+/// state needed to (a) compute the HRR ECH confirmation signal at HRR
+/// emit time and (b) re-decap CH2-outer on the HRR retry path with the
+/// same HPKE context advanced to `seq = 1`.
+pub(crate) struct DecappedInner {
+    /// Recovered inner CH handshake-message bytes (header included).
+    pub inner_ch_bytes: Vec<u8>,
+    /// HPKE receiver context from CH1's setup_receiver, with its
+    /// sequence counter already advanced to 1 by the CH1 `open` call.
+    /// Retained across HRR so the CH2 outer-form decap reuses the
+    /// same context per draft §7.2.2.
+    pub receiver: ReceiverContext,
+    /// Symmetric suite advertised in CH1-outer's `encrypted_client_hello`.
+    /// CH2-outer MUST advertise the same suite (draft §6.1.5); we
+    /// keep a copy here to validate this on the HRR retry path.
+    pub sym: HpkeSymCipherSuite,
+    /// `config_id` that selected the keypair for CH1. CH2-outer MUST
+    /// echo this; keep for the same reason as `sym`.
+    pub config_id: u8,
+}
+
 /// Server-side: given the outer CH handshake bytes and a configured
 /// `EchKeyRing`, try every step of HPKE decap and return the
-/// decrypted, padding-stripped inner CH bytes on success.
+/// decrypted, padding-stripped inner CH bytes plus the live HPKE
+/// receiver context (retained for the HRR retry path).
 ///
 /// Failure modes (all map to "continue under outer CH, signal reject
 /// via retry_configs"): no ECH extension in the outer CH, unknown
@@ -297,7 +319,7 @@ where
 pub(crate) fn try_decap_inner(
     handshake_msg: &[u8],
     keys: &super::keys::EchKeyRing,
-) -> Result<Vec<u8>, Error> {
+) -> Result<DecappedInner, Error> {
     // Walk the outer CH to find the encrypted_client_hello body and
     // its payload byte range; the AAD computation needs the byte
     // image with the payload zeroed.
@@ -323,6 +345,44 @@ pub(crate) fn try_decap_inner(
     // Padding consists of an arbitrary number of trailing zero bytes;
     // since a ClientHello body is length-prefixed, anything past the
     // declared length is padding.
+    let unpadded = strip_trailing_padding(&plaintext)?;
+    Ok(DecappedInner {
+        inner_ch_bytes: unpadded,
+        receiver,
+        sym,
+        config_id,
+    })
+}
+
+/// Server-side CH2-outer decap on the HRR retry path. Uses the
+/// `receiver` retained from CH1's [`try_decap_inner`] (its `seq` is
+/// already 1) so the AEAD nonces sit at the right HPKE schedule
+/// position per draft §7.2.2. The CH2-outer-AAD is the same shape
+/// as CH1's: the full CH2-outer handshake bytes with the
+/// `encrypted_client_hello` payload field zeroed.
+///
+/// CH2-outer's `enc` field MUST be empty per draft §6.1.5; the
+/// `sym`/`config_id` must equal CH1's. Both checks happen here.
+pub(crate) fn try_decap_inner_retry(
+    handshake_msg: &[u8],
+    state: &mut DecappedInner,
+) -> Result<Vec<u8>, Error> {
+    let (payload_off, payload_len) = locate_payload_in_handshake(handshake_msg)?;
+    let mut aad = handshake_msg.to_vec();
+    for b in aad[payload_off..payload_off + payload_len].iter_mut() {
+        *b = 0;
+    }
+    let ciphertext = handshake_msg[payload_off..payload_off + payload_len].to_vec();
+
+    let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
+    if sym != state.sym || config_id != state.config_id || !enc.is_empty() {
+        return Err(Error::EchDecryptionFailed);
+    }
+
+    let plaintext = state
+        .receiver
+        .open(&aad, &ciphertext)
+        .map_err(|_| Error::EchDecryptionFailed)?;
     let unpadded = strip_trailing_padding(&plaintext)?;
     Ok(unpadded)
 }

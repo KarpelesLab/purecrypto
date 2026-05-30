@@ -37,6 +37,7 @@ pub(crate) mod crypto;
 #[cfg(feature = "ech")]
 pub mod ech;
 mod error;
+mod groups;
 pub(crate) mod keylog;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
@@ -51,6 +52,7 @@ pub(crate) use conn::ReplayWindow;
 pub use connection::{Connection, HandshakeStatus};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
+pub use groups::NamedGroup;
 pub use keylog::KeyLog;
 #[cfg(feature = "std")]
 pub use keylog::{WriterKeyLog, file_keylog};
