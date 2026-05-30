@@ -24,13 +24,10 @@ pub mod edwards25519;
 mod p256;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;
-<<<<<<< HEAD
-#[cfg(feature = "hazmat-secp256k1")]
-pub mod secp256k1;
-=======
 #[cfg(feature = "ristretto255")]
 pub mod ristretto255;
->>>>>>> c001460 (ec: add edwards25519::hazmat low-level group/scalar API (Stage 5, Items 1+2))
+#[cfg(feature = "hazmat-secp256k1")]
+pub mod secp256k1;
 mod weierstrass;
 pub mod x25519;
 
