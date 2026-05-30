@@ -1,13 +1,21 @@
 //! NIST P-256 (secp256r1) field and group arithmetic.
 
 use crate::bignum::{MontModulus, Uint};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 
 /// Field elements and scalars are four 64-bit limbs (256 bits).
 pub(crate) type Fe = Uint<4>;
 
 /// Generates a uniformly random scalar in `[1, n-1]`.
+///
+/// Rejection sampling: draw 256 uniform bits and accept only if the value
+/// lies in `[1, n)`. Reducing a 256-bit draw mod `n` would introduce a
+/// modulo-bias of magnitude `2^256 - n ≈ 2^128` extra preimages on a small
+/// residue band — vanishingly small for P-256 but a nonzero asymmetry with
+/// the boxed path (`src/ec/boxed.rs`), which already rejects. Mirroring the
+/// rejection collapses the bias to zero. P-256's `n` is so close to `2^256`
+/// that the per-iteration acceptance probability is effectively 1.
 pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
     let n = P256::order();
     loop {
@@ -15,8 +23,9 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
         for limb in &mut limbs {
             *limb = rng.next_u64();
         }
-        let d = Uint::from_limbs(limbs).reduce(&n);
-        if !bool::from(d.is_zero()) {
+        let d = Uint::from_limbs(limbs);
+        // Accept iff 1 ≤ d < n.
+        if !bool::from(d.is_zero()) && bool::from(d.ct_lt(&n)) {
             return d;
         }
     }
@@ -312,5 +321,23 @@ mod tests {
             curve.to_affine(&result).is_none(),
             "n*G must be the identity"
         );
+    }
+
+    #[test]
+    fn random_scalar_in_range() {
+        // Every sampled scalar must be in `[1, n)`. The new rejection
+        // sampler returns only values that satisfy `d != 0 && d < n`;
+        // a draw of 256 random bits has acceptance probability extremely
+        // close to 1 for P-256, so a few hundred iterations exercise the
+        // happy path without flake risk.
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-random-scalar", b"nonce", &[]);
+        let n = P256::order();
+        for _ in 0..256 {
+            let d = random_scalar(&mut rng);
+            assert!(!bool::from(d.is_zero()), "scalar must be nonzero");
+            assert!(bool::from(d.ct_lt(&n)), "scalar must be < n");
+        }
     }
 }

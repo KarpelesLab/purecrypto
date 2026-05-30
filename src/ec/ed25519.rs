@@ -346,6 +346,19 @@ pub struct Ed25519PrivateKey {
     seed: [u8; 32],
 }
 
+impl Drop for Ed25519PrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the seed before it leaves the stack. The
+        // `black_box` barrier prevents LLVM from eliding the writes as a
+        // dead store. Mirrors the manual-wipe convention used elsewhere
+        // in the crate (e.g. `cipher/poly1305.rs`, `cipher/aes/mod.rs`).
+        for b in self.seed.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.seed);
+    }
+}
+
 /// An Ed25519 public key — a 32-byte compressed point.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Ed25519PublicKey([u8; 32]);
@@ -353,20 +366,6 @@ pub struct Ed25519PublicKey([u8; 32]);
 /// An Ed25519 signature — 64 bytes (`R ‖ S`).
 #[derive(Clone, Copy)]
 pub struct Ed25519Signature([u8; 64]);
-
-// Best-effort zeroize on drop: the 32-byte seed is full secret entropy
-// and would otherwise be returned to the allocator/stack frame intact.
-// Overwrite the bytes and route the read through `core::hint::black_box`
-// so LLVM cannot eliminate the writes as dead stores (same pattern as
-// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
-impl Drop for Ed25519PrivateKey {
-    fn drop(&mut self) {
-        for b in self.seed.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.seed);
-    }
-}
 
 impl Ed25519PrivateKey {
     /// Generates a new private key from `rng`.

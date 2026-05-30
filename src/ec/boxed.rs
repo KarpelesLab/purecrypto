@@ -305,6 +305,52 @@ impl BoxedEcdsaSignature {
         out.extend_from_slice(&self.s.to_be_bytes(len));
         out
     }
+
+    /// Whether `s` is in the lower half of `curve`'s group order — the
+    /// "low-S" form required by signature-non-malleability conventions
+    /// (Bitcoin BIP-62, EVM, anti-replay caches that key on signature
+    /// bytes). For any valid ECDSA signature `(r, s)`, the pair
+    /// `(r, n − s)` also verifies, so callers needing bytewise unique
+    /// signatures must require `is_low_s()`. Mirrors the const-generic
+    /// helper in [`super::ecdsa::Signature::is_low_s`].
+    pub fn is_low_s(&self, curve: CurveId) -> bool {
+        // half_n = (n + 1) / 2 — the smallest "high-S" boundary.
+        let n = curve.curve().order().clone();
+        let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
+        self.s.lt(&half_n)
+    }
+
+    /// Returns the canonical low-S representative for this signature on
+    /// `curve`: if `s` is already in the lower half, returns a clone;
+    /// otherwise returns `(r, n − s)`, which is equally valid and bytewise
+    /// unique. Mirrors [`super::ecdsa::Signature::to_low_s`].
+    pub fn to_low_s(&self, curve: CurveId) -> Self {
+        if self.is_low_s(curve) {
+            self.clone()
+        } else {
+            let n = curve.curve().order().clone();
+            BoxedEcdsaSignature {
+                r: self.r.clone(),
+                s: n.sub(&self.s),
+            }
+        }
+    }
+}
+
+impl Drop for BoxedEcdsaPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the scalar `d` before its heap-backing `Vec`
+        // is freed. Mirrors the manual-wipe convention used elsewhere in
+        // the crate (e.g. `cipher/poly1305.rs`, `cipher/aes/mod.rs`).
+        self.d.zeroize();
+    }
+}
+
+impl Drop for BoxedEcdhPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the ECDH scalar `d`. See `BoxedEcdsaPrivateKey`.
+        self.d.zeroize();
+    }
 }
 
 /// DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` — the form used
@@ -599,5 +645,50 @@ mod tests {
             concat.extend_from_slice(&sig.s_bytes(curve));
             assert_eq!(concat, sig.to_bytes(curve));
         }
+    }
+
+    #[test]
+    fn boxed_signature_low_s_idempotent_and_verifies() {
+        // For every supported curve, `to_low_s` must produce a low-S
+        // signature that still verifies, and applying it a second time
+        // must be a no-op (idempotence).
+        let mut rng = HmacDrbg::<Sha256>::new(b"low-s", b"n", &[]);
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+        ] {
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let pk = sk.public_key();
+            let sig = sk.sign::<Sha256>(b"low-s message").unwrap();
+
+            let low = sig.to_low_s(curve);
+            assert!(low.is_low_s(curve), "to_low_s must produce a low-S sig");
+            assert_eq!(low.to_low_s(curve), low, "to_low_s must be idempotent");
+            // The canonicalised signature must still verify against the
+            // public key — flipping `s` to `n − s` is a valid ECDSA
+            // signature for the same `(pk, msg)`.
+            pk.verify::<Sha256>(b"low-s message", &low).unwrap();
+        }
+    }
+
+    #[test]
+    fn boxed_signature_high_s_flip_round_trip() {
+        // Construct a synthetic high-S signature (s' = n − s with original
+        // s low) and confirm `to_low_s` recovers the original.
+        let mut rng = HmacDrbg::<Sha256>::new(b"high-s", b"n", &[]);
+        let curve = CurveId::P256;
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+        let sig = sk.sign::<Sha256>(b"flip me").unwrap();
+        let low = sig.to_low_s(curve);
+        assert!(low.is_low_s(curve));
+
+        // Build the high-S form `(r, n − s)` by hand and verify the
+        // helper canonicalises it back.
+        let n = curve.curve().order().clone();
+        let high = BoxedEcdsaSignature::from_components(low.r().clone(), n.sub(low.s()));
+        assert!(!high.is_low_s(curve));
+        assert_eq!(high.to_low_s(curve), low);
     }
 }

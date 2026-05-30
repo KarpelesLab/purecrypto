@@ -139,10 +139,10 @@ impl BoxedUint {
     }
 
     /// Best-effort wipe of the limb storage, for use in `Drop` impls that
-    /// hold secret material (e.g. RSA private exponents and prime factors).
-    /// Mirrors the `core::hint::black_box` pattern used by [`Aes128`] /
-    /// [`Poly1305`] and the in-crate [`hash::zeroize`] helpers so LLVM does
-    /// not elide the writes as a dead store.
+    /// hold secret material (e.g. RSA private exponents and prime factors,
+    /// EC private scalars). Mirrors the `core::hint::black_box` pattern used
+    /// by [`Aes128`] / [`Poly1305`] and the in-crate [`hash::zeroize`]
+    /// helpers so LLVM does not elide the writes as a dead store.
     #[inline]
     pub(crate) fn zeroize(&mut self) {
         for limb in self.limbs.iter_mut() {
@@ -385,6 +385,20 @@ mod tests {
         assert!(BoxedUint::from_u64(3).is_odd());
         assert!(!BoxedUint::from_u64(4).is_odd());
         assert!(BoxedUint::zero(4).is_zero());
+    }
+
+    #[test]
+    fn zeroize_clears_all_limbs() {
+        // `zeroize` is used by `Drop` impls on secret-holding wrappers
+        // (e.g. `BoxedEcdsaPrivateKey`) to wipe the scalar in place
+        // before the backing `Vec` is freed.
+        let mut u = BoxedUint::from_be_bytes(&[0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe]);
+        assert!(!u.is_zero());
+        u.zeroize();
+        assert!(u.is_zero());
+        for &limb in u.as_limbs() {
+            assert_eq!(limb, 0);
+        }
     }
 
     #[test]
