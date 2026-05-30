@@ -1124,6 +1124,20 @@ fn parse_subtrees(
         match t {
             // dNSName [2] IMPLICIT IA5String → primitive context 0x82.
             0x82 => {
+                // Mirror the SAN dNSName validation in `parse_dns_names`:
+                // reject empty entries and any byte outside printable ASCII
+                // (control chars, NUL, DEL). An embedded NUL or newline in a
+                // constraint string can confuse a downstream name matcher or
+                // log sink just as it can in a SAN.
+                if value.is_empty() {
+                    return Err(Error::Malformed);
+                }
+                for &b in value {
+                    if !(0x20..=0x7E).contains(&b) {
+                        return Err(Error::Malformed);
+                    }
+                }
+                // SAFETY of unwrap: every byte is 0x20..=0x7E, valid UTF-8.
                 let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
                 dns_out.push(String::from(s));
             }
@@ -1876,5 +1890,48 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let cert = forge_cert_with_version_and_exts(2, &exts);
         cert.check_well_formed().unwrap();
         assert_eq!(cert.extensions().unwrap().len(), 2);
+    }
+
+    /// Wraps a dNSName byte string into a single `GeneralSubtree` SEQUENCE
+    /// (`base` = dNSName `[2]`, tag 0x82), the unit `parse_subtrees` consumes.
+    fn dns_subtree(name: &[u8]) -> alloc::vec::Vec<u8> {
+        let mut base = alloc::vec![0x82u8, name.len() as u8];
+        base.extend_from_slice(name);
+        let mut seq = alloc::vec![0x30u8, base.len() as u8];
+        seq.extend_from_slice(&base);
+        seq
+    }
+
+    #[test]
+    fn name_constraint_dns_subtree_rejects_control_chars() {
+        // A nameConstraints dNSName subtree carrying an embedded NUL (or other
+        // control char) must be rejected, mirroring the SAN dNSName parser.
+        for bad in [
+            b"evil\x00.example".as_slice(),
+            b"evil\n.example".as_slice(),
+            b"".as_slice(),
+        ] {
+            let body = dns_subtree(bad);
+            let mut dns = alloc::vec::Vec::new();
+            let mut ip = alloc::vec::Vec::new();
+            let mut unenforceable = false;
+            assert!(
+                super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn name_constraint_dns_subtree_accepts_normal_name() {
+        let body = dns_subtree(b".example.com");
+        let mut dns = alloc::vec::Vec::new();
+        let mut ip = alloc::vec::Vec::new();
+        let mut unenforceable = false;
+        super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).unwrap();
+        assert_eq!(
+            dns,
+            alloc::vec![alloc::string::String::from(".example.com")]
+        );
     }
 }
