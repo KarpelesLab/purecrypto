@@ -97,6 +97,13 @@ pub(crate) struct ServerConfig12 {
     /// CRLs consulted during client-cert chain validation under mTLS.
     /// Empty by default; opt in via [`ServerConfig12::with_crls`].
     crls: crate::tls::pki::CrlStore,
+    /// Clock used to enforce the `notBefore`/`notAfter` validity period of
+    /// client certificates under mTLS. `None` (the default) falls back to the
+    /// system clock under the `std` feature; under `no_std` with no configured
+    /// time the validity period is not checked. Set explicitly for `no_std`
+    /// targets or for reproducible verification via
+    /// [`ServerConfig12::with_verification_time`].
+    verification_time: Option<crate::x509::Time>,
     /// Optional DER-encoded OCSP response stapled when the client opted
     /// into OCSP stapling via the `status_request` extension. On TLS 1.2
     /// the bytes are emitted as the body of a `CertificateStatus`
@@ -139,6 +146,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            verification_time: None,
             stapled_ocsp_response: None,
             key_log: None,
             require_ems: true,
@@ -158,6 +166,7 @@ impl ServerConfig12 {
             ticket_key: None,
             ticket_lifetime: 7200,
             crls: crate::tls::pki::CrlStore::new(),
+            verification_time: None,
             stapled_ocsp_response: None,
             key_log: None,
             require_ems: true,
@@ -194,6 +203,15 @@ impl ServerConfig12 {
     /// chain validation under mTLS.
     pub fn with_crls(mut self, crls: crate::tls::pki::CrlStore) -> Self {
         self.crls = crls;
+        self
+    }
+
+    /// Sets the verification clock used to enforce the `notBefore`/`notAfter`
+    /// validity period of client certificates under mTLS. Set this on `no_std`
+    /// targets (where the system clock is unavailable) or for reproducible
+    /// verification; under `std` the system clock is used when this is unset.
+    pub fn with_verification_time(mut self, t: crate::x509::Time) -> Self {
+        self.verification_time = Some(t);
         self
     }
 
@@ -1243,13 +1261,16 @@ impl<R: RngCore> ServerConnection12<R> {
             self.state = State::WaitClientKeyExchange;
             return Ok(());
         }
-        // Validate the chain. We pass `None` for `now`. mTLS: the leaf is
-        // a client cert, so require `id-kp-clientAuth` EKU.
+        // Validate the chain, enforcing the client cert's notBefore/notAfter
+        // validity period: use the configured verification time, falling back
+        // to the system clock under `std` (F1). mTLS: the leaf is a client
+        // cert, so require `id-kp-clientAuth` EKU.
+        let now = self.config.verification_time.clone().or_else(system_now);
         let leaf_key = crate::tls::pki::verify_chain_with_crls_for_purpose(
             &policy.roots,
             &self.config.crls,
             &chain,
-            None,
+            now.as_ref(),
             &self.config.signature_policy,
             crate::tls::pki::ChainPurpose::Client,
         )?;
@@ -1595,6 +1616,23 @@ fn system_now_u64() -> u64 {
 #[cfg(not(feature = "std"))]
 fn system_now_u64() -> u64 {
     0
+}
+
+/// The system clock as an [`crate::x509::Time`] when available; `None` for
+/// `no_std`. Used as the default verification time for client-cert validity
+/// checks under mTLS.
+#[cfg(feature = "std")]
+fn system_now() -> Option<crate::x509::Time> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| crate::x509::Time::from_unix(d.as_secs()))
+}
+
+#[cfg(not(feature = "std"))]
+fn system_now() -> Option<crate::x509::Time> {
+    None
 }
 
 /// One decoded inbound message.
@@ -1988,5 +2026,119 @@ mod tests {
                 hs_type::SERVER_HELLO_DONE,
             ],
         );
+    }
+
+    /// Builds a TLS 1.2 `Certificate` handshake message (header + body) and
+    /// returns `(body, raw)` from a single-cert chain.
+    fn encode_client_certificate_12(cert_der: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        // CertificateList: u24 outer length wrapping u24-prefixed entries.
+        let mut entries = Vec::new();
+        let len = cert_der.len();
+        entries.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+        entries.extend_from_slice(cert_der);
+        let mut body = Vec::new();
+        let outer = entries.len();
+        body.extend_from_slice(&[(outer >> 16) as u8, (outer >> 8) as u8, outer as u8]);
+        body.extend_from_slice(&entries);
+        let mut raw = Vec::with_capacity(4 + body.len());
+        raw.push(hs_type::CERTIFICATE);
+        let bl = body.len();
+        raw.extend_from_slice(&[(bl >> 16) as u8, (bl >> 8) as u8, bl as u8]);
+        raw.extend_from_slice(&body);
+        (body, raw)
+    }
+
+    /// F1 regression: a TLS 1.2 mTLS server enforces the client certificate's
+    /// `notBefore`/`notAfter` validity period. With a pinned verification time,
+    /// an expired client cert is rejected and an in-window one is accepted.
+    /// (The leaf is self-signed, so it is also its own trust anchor.)
+    #[test]
+    fn tls12_mtls_rejects_expired_client_cert() {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::tls::pki::RootCertStore;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+        // A client cert valid only during 2020 — long expired relative to the
+        // 2026 verification time we pin below.
+        let mut seed = HmacDrbg::<Sha256>::new(b"f1-expired-client", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        let name = DistinguishedName::common_name("expired-client");
+        let validity = Validity::new(
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2020, 12, 31, 23, 59, 59),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["expired-client"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+
+        // Pin the verification clock to 2026, well after the cert expired.
+        let server_cfg = test_rsa_server_config()
+            .with_client_auth(roots, true)
+            .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0));
+        let rng = HmacDrbg::<Sha256>::new(b"f1-s12", b"nonce", &[]);
+        let mut s = ServerConnection12::new(server_cfg, rng);
+        s.state = State::WaitClientCertificate;
+
+        let (body, raw) = encode_client_certificate_12(&cert_der);
+        // Expired cert must be rejected now that `now` is enforced (F1).
+        assert!(matches!(
+            s.on_client_certificate(hs_type::CERTIFICATE, &body, &raw),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// F1 companion: an in-window client cert is still accepted under the same
+    /// enforced verification time, confirming the time check did not break the
+    /// happy path.
+    #[test]
+    fn tls12_mtls_accepts_valid_client_cert() {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::tls::pki::RootCertStore;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+        let mut seed = HmacDrbg::<Sha256>::new(b"f1-valid-client", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        let name = DistinguishedName::common_name("valid-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["valid-client"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+
+        let server_cfg = test_rsa_server_config()
+            .with_client_auth(roots, true)
+            .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0));
+        let rng = HmacDrbg::<Sha256>::new(b"f1-s12-ok", b"nonce", &[]);
+        let mut s = ServerConnection12::new(server_cfg, rng);
+        s.state = State::WaitClientCertificate;
+
+        let (body, raw) = encode_client_certificate_12(&cert_der);
+        s.on_client_certificate(hs_type::CERTIFICATE, &body, &raw)
+            .expect("in-window client cert should be accepted");
+        assert_eq!(s.client_cert_chain.len(), 1);
+        assert!(s.client_leaf_key.is_some());
+        assert_eq!(s.state, State::WaitClientKeyExchange);
     }
 }

@@ -128,7 +128,9 @@ pub struct Config {
     pub server_name: Option<String>,
     /// Validate the peer's chain. Set `false` for pinned-key flows.
     pub verify_certificates: bool,
-    /// Clock used for cert validity. `None` = system clock under `std`.
+    /// Clock used for cert validity (`notBefore`/`notAfter`). Applies to the
+    /// server certificate the client verifies AND to the client certificate a
+    /// server verifies under mTLS. `None` = system clock under `std`.
     pub verification_time: Option<Time>,
 
     // ---- Server-side ----
