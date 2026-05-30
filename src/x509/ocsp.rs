@@ -417,8 +417,9 @@ impl OcspResponse {
     ///   that fails and a delegated responder certificate is embedded in
     ///   `BasicOCSPResponse.certs[0]`, verifies that responder cert against
     ///   the issuer, checks it carries the `id-kp-OCSPSigning` EKU
-    ///   (RFC 6960 §4.2.2.2), then uses the responder key to verify the
-    ///   OCSP signature.
+    ///   (RFC 6960 §4.2.2.2) and — when `now` is `Some` — that the responder
+    ///   cert is still inside its own validity period, then uses the responder
+    ///   key to verify the OCSP signature.
     /// - Freshness: requires the matching `SingleResponse` to have
     ///   `thisUpdate <= now` and (when present) `now < nextUpdate`. When
     ///   `now` is `None` the freshness check is skipped — the TLS layer
@@ -450,6 +451,18 @@ impl OcspResponse {
             // ...with id-kp-OCSPSigning in its EKU.
             let ekus = responder.extended_key_usages()?;
             if !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING) {
+                return Err(Error::Verification);
+            }
+            // ...and (when a clock is supplied) still inside its own
+            // notBefore/notAfter window. Without this, the private key of an
+            // expired-but-once-valid OCSPSigning cert could forge a "good"
+            // status indefinitely: expiry is precisely what should retire that
+            // key. The `now` is None only under `verify_certificates = false`,
+            // where the peer chain isn't validated either — so mirror the
+            // freshness gate below and skip the check in that mode.
+            if let Some(now) = now
+                && !responder.validity()?.accepts(now)
+            {
                 return Err(Error::Verification);
             }
             let responder_key = responder.subject_public_key()?;
@@ -1367,6 +1380,85 @@ mod tests {
         extracted.verify_signature_with(&issuer_pub).unwrap();
         let ekus = extracted.extended_key_usages().unwrap();
         assert!(ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING));
+    }
+
+    /// Build a delegated OCSP responder cert (signed by `issuer_key`, carrying
+    /// the `id-kp-OCSPSigning` EKU) whose own validity window is `validity`,
+    /// plus a `good` OCSP response signed by that responder and embedding the
+    /// cert in `BasicOCSPResponse.certs[0]`.
+    fn delegated_good_response(
+        issuer: &Certificate,
+        leaf: &Certificate,
+        issuer_key: &BoxedRsaPrivateKey,
+        responder_validity: &Validity,
+    ) -> OcspResponse {
+        let issuer_signer = CertSigner::Rsa(issuer_key);
+        let responder_key = ed25519();
+        let responder_pub = AnyPublicKey::Ed25519(responder_key.public_key());
+        let responder_dn = DistinguishedName::common_name("OCSP delegated responder");
+        let responder_extensions = vec![
+            extension::basic_constraints(false, None),
+            Extension {
+                oid: oid::EXT_KEY_USAGE.to_vec(),
+                critical: false,
+                value: encode_sequence(&oid_tlv(oid::ID_KP_OCSP_SIGNING)),
+            },
+        ];
+        let responder_cert = Certificate::issue_with_extensions(
+            &issuer_signer,
+            &issuer.subject().unwrap(),
+            &responder_dn,
+            &responder_pub,
+            responder_validity,
+            99,
+            &responder_extensions,
+        )
+        .expect("issue responder");
+
+        OcspResponseBuilder::good(leaf, issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .delegated_responder_cert(responder_cert.to_der().to_vec())
+            .sign(&CertSigner::Ed25519(&responder_key))
+            .unwrap()
+    }
+
+    // F5: a delegated responder cert must be inside its own validity window at
+    // `now`. An attacker holding the key of an expired-but-once-valid
+    // OCSPSigning cert could otherwise mint a forged "good" status forever.
+    #[test]
+    fn check_for_cert_rejects_expired_delegated_responder() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+
+        // Responder cert expired well before `now` (2026-06-01).
+        let expired = Validity::new(
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2021, 1, 1, 0, 0, 0),
+        );
+        let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
+        let now = Time::utc(2026, 6, 1, 0, 0, 0);
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            Err(Error::Verification)
+        ));
+
+        // A responder cert valid at `now` is accepted through the same path.
+        let valid = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &valid);
+        assert_eq!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            OcspCertStatus::Good
+        );
+
+        // With `now == None` (verify_certificates = false), the expired
+        // responder is NOT enforced — matching the freshness gate's behavior.
+        let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
+        assert_eq!(
+            resp.check_for_cert(&leaf, &issuer, None).unwrap(),
+            OcspCertStatus::Good
+        );
     }
 
     #[test]
