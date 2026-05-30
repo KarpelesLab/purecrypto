@@ -22,14 +22,23 @@ const INFO_PREFIX: &[u8] = b"tls ech\0";
 /// Build the HPKE `info` string for an ECH seal/open: `INFO_PREFIX
 /// || ECHConfig` (with `ECHConfig` being the full single-config wire
 /// form: version || u16 length || contents).
-pub(crate) fn ech_info(config: &EchConfig) -> Vec<u8> {
+///
+/// Returns [`Error::EchDecodeError`] if `config.raw_contents` is longer
+/// than `u16::MAX` bytes — the draft-22 wire length is a `u16`, and
+/// silently clamping at 65535 would produce an `info` string that does
+/// not match the receiver's reconstruction (the HPKE seal then "fails"
+/// with no diagnostic). In practice ECH configs are a few hundred bytes
+/// (HPKE public key + cipher suites + public_name<1..255> + a small
+/// extension list), so this is unreachable for any well-formed local
+/// config.
+pub(crate) fn ech_info(config: &EchConfig) -> Result<Vec<u8>, Error> {
+    let len = u16::try_from(config.raw_contents.len()).map_err(|_| Error::EchDecodeError)?;
     let mut out = Vec::with_capacity(INFO_PREFIX.len() + 4 + config.raw_contents.len());
     out.extend_from_slice(INFO_PREFIX);
     out.extend_from_slice(&config.version.to_be_bytes());
-    let len: u16 = u16::try_from(config.raw_contents.len()).unwrap_or(u16::MAX);
     out.extend_from_slice(&len.to_be_bytes());
     out.extend_from_slice(&config.raw_contents);
-    out
+    Ok(out)
 }
 
 /// Map an [`HpkeSymCipherSuite`] to typed `(HpkeKdf, HpkeAead)`,
@@ -74,7 +83,7 @@ pub(crate) fn setup_sender<R: RngCore>(
     let kem = map_kem(contents.key_config.kem_id)?;
     let (kdf, aead) = map_sym_suite(sym)?;
     let suite = HpkeCipherSuite::new(kem, kdf, aead);
-    let info = ech_info(config);
+    let info = ech_info(config)?;
     let (enc, ctx) = hpke::setup_sender(rng, suite, &contents.key_config.public_key, &info)
         .map_err(|_| Error::EchDecryptionFailed)?;
     Ok((enc, ctx, suite))
@@ -91,7 +100,7 @@ pub(crate) fn setup_receiver(
     let kem = map_kem(contents.key_config.kem_id)?;
     let (kdf, aead) = map_sym_suite(sym)?;
     let suite = HpkeCipherSuite::new(kem, kdf, aead);
-    let info = ech_info(config);
+    let info = ech_info(config)?;
     let ctx =
         hpke::setup_receiver(suite, enc, sk_r, &info).map_err(|_| Error::EchDecryptionFailed)?;
     Ok((ctx, suite))

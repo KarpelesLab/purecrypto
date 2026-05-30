@@ -97,8 +97,18 @@ impl HashAlg {
 /// } HkdfLabel;
 /// ```
 fn expand_label<D: Digest>(secret: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) {
+    // RFC 8446 §7.1: HkdfLabel.length is a u16. Every in-tree caller of
+    // `expand_label{,_dyn}` allocates `out` into a buffer bounded by a hash
+    // output (≤ 48 bytes) or a fixed array (≤ MAX_SECRET = 64 bytes), so
+    // this conversion is structurally infallible. Use a checked conversion
+    // so a future caller wiring a longer keystream gets a loud panic at the
+    // boundary rather than a silent on-wire length truncation that would
+    // produce an HKDF stream disagreeing with the peer's (tag-mismatch
+    // failure modes that are very hard to debug).
+    let label_length = u16::try_from(out.len())
+        .expect("HKDF output length must fit in u16 (RFC 8446 §7.1 HkdfLabel.length)");
     let mut info = Vec::with_capacity(4 + 6 + label.len() + context.len());
-    info.extend_from_slice(&(out.len() as u16).to_be_bytes());
+    info.extend_from_slice(&label_length.to_be_bytes());
     info.push((6 + label.len()) as u8);
     info.extend_from_slice(b"tls13 ");
     info.extend_from_slice(label);

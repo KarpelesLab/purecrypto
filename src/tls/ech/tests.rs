@@ -544,7 +544,7 @@ fn map_kem_resolves_all_supported() {
 #[test]
 fn ech_info_prefix_and_shape() {
     let cfg = sample_config();
-    let info = ech_info(&cfg);
+    let info = ech_info(&cfg).expect("sample config raw_contents fits in u16");
     // Must begin with "tls ech\0" then the 4-byte (version || length) header.
     assert!(info.starts_with(b"tls ech\0"));
     let after_prefix = &info[8..];
@@ -552,6 +552,17 @@ fn ech_info_prefix_and_shape() {
     let len = u16::from_be_bytes([after_prefix[2], after_prefix[3]]) as usize;
     assert_eq!(len, cfg.raw_contents.len());
     assert_eq!(&after_prefix[4..], &cfg.raw_contents[..]);
+}
+
+/// An `ech_info` for a config whose `raw_contents` exceeds `u16::MAX`
+/// returns [`Error::EchDecodeError`] rather than silently clamping the
+/// length field (audit F4 / draft-ietf-tls-esni-22 §4 — ECHConfig length
+/// is a `u16`).
+#[test]
+fn ech_info_rejects_oversize_raw_contents() {
+    let mut cfg = sample_config();
+    cfg.raw_contents = alloc::vec![0u8; (u16::MAX as usize) + 1];
+    assert!(matches!(ech_info(&cfg), Err(Error::EchDecodeError)));
 }
 
 #[test]

@@ -198,6 +198,14 @@ pub enum Error {
     /// connection MUST be terminated with the bad_certificate alert").
     #[cfg(feature = "cert-compression")]
     CertDecompressionFailed,
+    /// A client `Config` was passed to [`crate::tls::Connection::client`]
+    /// without a `server_name`. The reference identifier is required both
+    /// for the outbound SNI extension (RFC 6066 §3) and as the verification
+    /// reference for the peer certificate's SANs (RFC 6125 §6.4), so we
+    /// fail-closed at construction rather than silently substituting a
+    /// default like `"localhost"` (which would misdirect hostname
+    /// verification and surface as an opaque `BadCertificate` later).
+    MissingServerName,
 }
 
 impl core::fmt::Display for Error {
@@ -229,6 +237,9 @@ impl core::fmt::Display for Error {
             #[cfg(feature = "cert-compression")]
             Error::CertDecompressionFailed => {
                 f.write_str("RFC 8879 CompressedCertificate could not be decompressed")
+            }
+            Error::MissingServerName => {
+                f.write_str("client Config has no server_name (SNI / verify reference)")
             }
         }
     }

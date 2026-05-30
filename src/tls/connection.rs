@@ -420,7 +420,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
     {
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
+    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
     Ok(super::conn::ClientConnection::new(
         cc,
         server_name,
@@ -451,7 +451,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     cc.key_log = cfg.key_log.clone();
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
+    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
     Ok(super::conn::ClientConnection12::new(
         cc,
         server_name,
@@ -560,7 +560,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
 }
 
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
+    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
     let mut dc = crate::dtls::ClientConfig12Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
         dc = dc.without_certificate_verification();
@@ -581,7 +581,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 }
 
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
-    let server_name = cfg.server_name.as_deref().unwrap_or("localhost");
+    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
     let mut dc = crate::dtls::ClientConfig13Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
         dc = dc.without_certificate_verification();
@@ -756,6 +756,44 @@ mod tests {
         let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
         cfg.require_cookie = false;
         assert!(Connection::server(&cfg).is_ok());
+    }
+
+    /// A client `Config` with no `server_name` must be rejected at
+    /// [`Connection::client`] construction across every TLS/DTLS engine
+    /// path (audit F1). The previous behaviour silently substituted
+    /// `"localhost"` both into SNI and into the hostname-verification
+    /// reference identifier, which is a footgun: any local cert that
+    /// happened to list `localhost` as a SAN would satisfy verification
+    /// for an unintended peer, and forgotten-SNI callers got an opaque
+    /// `BadCertificate` downstream instead of an actionable config-time
+    /// error.
+    #[test]
+    fn client_refuses_construction_without_server_name() {
+        for v in [
+            ProtocolVersion::TLSv1_3,
+            ProtocolVersion::TLSv1_2,
+            ProtocolVersion::DTLSv1_3,
+            ProtocolVersion::DTLSv1_2,
+        ] {
+            let cfg = Config::builder()
+                .versions(v, v)
+                .verify_certificates(false)
+                .build();
+            assert!(cfg.server_name.is_none());
+            match Connection::client(&cfg) {
+                Err(Error::MissingServerName) => {}
+                Err(e) => panic!("{v:?}: expected MissingServerName, got {e:?}"),
+                Ok(_) => panic!("{v:?}: client must refuse construction without server_name"),
+            }
+
+            // With an explicit server_name, construction succeeds.
+            let cfg = Config::builder()
+                .versions(v, v)
+                .verify_certificates(false)
+                .server_name("example.test")
+                .build();
+            assert!(Connection::client(&cfg).is_ok(), "{v:?}: explicit SNI ok");
+        }
     }
 
     /// `cipher_suite_name` covers every suite the negotiator can pick,

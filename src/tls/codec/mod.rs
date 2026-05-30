@@ -118,27 +118,37 @@ pub(crate) fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
-/// Writes a block produced by `f`, prefixed by its `u8` length. The
-/// produced block must fit a single byte; in release builds an overflowing
-/// length silently truncates, but `debug_assertions` make the bug visible.
+/// Writes a block produced by `f`, prefixed by its `u8` length.
+///
+/// The produced block must fit in 255 bytes. Today every caller controls
+/// the payload (local config, our own randomness, or AEAD-bounded
+/// ciphertext) so the upper bound is structurally enforced; the runtime
+/// check below guards against future callers letting an unchecked length
+/// flow in and silently corrupting the wire image via a truncated length
+/// field. We `assert!` (not `debug_assert!`) so release builds also fail
+/// loudly rather than producing malformed output a peer would reject as
+/// a `decode_error` alert with no diagnostic.
 pub(crate) fn with_len_u8(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.push(0);
     f(out);
     let len = out.len() - pos - 1;
-    debug_assert!(len <= 0xFF, "with_len_u8: block of {len} bytes exceeds 255");
+    assert!(len <= 0xFF, "with_len_u8: block of {len} bytes exceeds 255");
     out[pos] = len as u8;
 }
 
-/// Writes a block produced by `f`, prefixed by its `u16` length. The
-/// produced block must fit two bytes; in release builds an overflowing
-/// length silently truncates, but `debug_assertions` make the bug visible.
+/// Writes a block produced by `f`, prefixed by its `u16` length.
+///
+/// See [`with_len_u8`] for the rationale on the runtime check: a release
+/// build that silently truncates a 16-bit length would emit a frame the
+/// peer rejects, and we would rather panic loudly at the encoder than
+/// debug a tag-mismatch / decode-error post-mortem.
 pub(crate) fn with_len_u16(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.extend_from_slice(&[0, 0]);
     f(out);
     let inner = out.len() - pos - 2;
-    debug_assert!(
+    assert!(
         inner <= 0xFFFF,
         "with_len_u16: block of {inner} bytes exceeds 65535",
     );
@@ -146,15 +156,15 @@ pub(crate) fn with_len_u16(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     out[pos..pos + 2].copy_from_slice(&len.to_be_bytes());
 }
 
-/// Writes a block produced by `f`, prefixed by its `u24` length. The
-/// produced block must fit three bytes; in release builds an overflowing
-/// length silently truncates, but `debug_assertions` make the bug visible.
+/// Writes a block produced by `f`, prefixed by its `u24` length.
+///
+/// See [`with_len_u8`] for the rationale on the runtime check.
 pub(crate) fn with_len_u24(out: &mut Vec<u8>, f: impl FnOnce(&mut Vec<u8>)) {
     let pos = out.len();
     out.extend_from_slice(&[0, 0, 0]);
     f(out);
     let inner = out.len() - pos - 3;
-    debug_assert!(
+    assert!(
         inner <= 0xFF_FFFF,
         "with_len_u24: block of {inner} bytes exceeds 16_777_215",
     );
