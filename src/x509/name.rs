@@ -76,9 +76,18 @@ impl DistinguishedName {
             let mut atv = set_reader.read_sequence()?;
             let oid_body = atv.read_oid()?;
             let (_, value) = atv.read_any()?;
-            let s = core::str::from_utf8(value)
+            let s: String = core::str::from_utf8(value)
                 .map_err(|_| Error::Malformed)?
                 .into();
+            // Reject embedded NUL and other control characters in attribute
+            // values. They have no legitimate place in a printable name and
+            // enable display spoofing or log injection when the decoded DN is
+            // later rendered. The byte-exact issuer/subject comparison used
+            // for chain building works on raw TLV bytes elsewhere and is
+            // unaffected by this check.
+            if s.chars().any(|c| c.is_control()) {
+                return Err(Error::Malformed);
+            }
             let arcs = parse_oid(oid_body)?;
             let arcs = arcs.as_slice();
             if arcs == oid::COMMON_NAME {
@@ -100,4 +109,48 @@ impl DistinguishedName {
 fn rdn(attr_oid: &[u64], value_tag: u8, value: &str) -> Vec<u8> {
     let atv = encode_sequence(&[oid_tlv(attr_oid), encode_string(value_tag, value)].concat());
     encode_tlv(tag::SET, &atv)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds a one-attribute `Name` (RDNSequence) DER whose single
+    /// commonName carries `value` as a UTF8String body (verbatim bytes, so a
+    /// NUL or control char survives into the encoding).
+    fn name_with_cn(value: &[u8]) -> Vec<u8> {
+        // commonName OID 2.5.4.3.
+        let mut atv = alloc::vec![0x06u8, 0x03, 0x55, 0x04, 0x03];
+        // value: UTF8String (0x0c) wrapping the raw bytes.
+        atv.push(0x0c);
+        atv.push(value.len() as u8);
+        atv.extend_from_slice(value);
+        let atv = encode_sequence(&atv); // AttributeTypeAndValue SEQUENCE
+        let set = encode_tlv(tag::SET, &atv); // RelativeDistinguishedName SET
+        encode_sequence(&set) // Name SEQUENCE OF RDN
+    }
+
+    #[test]
+    fn decode_accepts_clean_common_name() {
+        let der = name_with_cn(b"example.com");
+        let mut r = Reader::new(&der);
+        let dn = DistinguishedName::decode(&mut r).unwrap();
+        assert_eq!(dn.common_name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn decode_rejects_control_chars_in_value() {
+        for bad in [
+            b"evil\x00name".as_slice(),
+            b"line1\nline2".as_slice(),
+            b"tab\there".as_slice(),
+        ] {
+            let der = name_with_cn(bad);
+            let mut r = Reader::new(&der);
+            assert!(
+                DistinguishedName::decode(&mut r).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
 }
