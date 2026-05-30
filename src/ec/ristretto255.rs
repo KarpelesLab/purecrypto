@@ -7,9 +7,9 @@
 //! is a stable specification) — unlike the `hazmat-*` exposures it carries the
 //! usual stability expectations.
 //!
-//! The implementation is built on the in-house, constant-time
-//! [`curve25519`](crate::ec::curve25519) backend (the same field/point
-//! arithmetic behind [`Ed25519`](crate::ec::ed25519)) plus the named
+//! The implementation is built on the in-house, constant-time `curve25519`
+//! backend (the same field/point arithmetic behind
+//! [`ed25519`](crate::ec::ed25519)) plus the named
 //! `sqrt_ratio_i` routine. Group elements are [`RistrettoPoint`]; their
 //! canonical wire form is [`CompressedRistretto`]. The scalar field is the
 //! shared [`Scalar`] (integers modulo the group order `L`), re-exported from

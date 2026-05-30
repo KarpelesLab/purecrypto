@@ -10,10 +10,9 @@
 //! scalar bits. Reduction of scalars modulo the group order `L` rides on the
 //! constant-time [`Uint`](crate::bignum::Uint) long division.
 //!
-//! The field, point, and scalar arithmetic live in the shared
-//! [`curve25519`](crate::ec::curve25519) backend, which this module consumes;
-//! the same backend powers the `edwards25519::hazmat` and `ristretto255`
-//! exposures.
+//! The field, point, and scalar arithmetic live in the shared `curve25519`
+//! backend, which this module consumes; the same backend powers the
+//! `edwards25519::hazmat` and `ristretto255` exposures.
 
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::ec::Error;

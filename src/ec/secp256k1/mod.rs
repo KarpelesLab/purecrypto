@@ -20,14 +20,11 @@
 //!
 //! ## Backend
 //!
-//! The point formulas are generic over a
-//! [`FieldBackend`](field_backend::FieldBackend); the public API is wired to
-//! the native pseudo-Mersenne backend
-//! ([`Secp256k1Field`](field_backend::Secp256k1Field)), a reduction specialised
-//! to secp256k1's prime (`2²⁵⁶ ≡ c (mod p)`). It is validated byte-for-byte
-//! against the generic Montgomery reference
-//! ([`GenericMont`](field_backend::GenericMont), the same audited
-//! `MontModulus<4>` core P-256 uses) by the differential tests in
+//! The point formulas are generic over a `FieldBackend`; the public API is
+//! wired to the native pseudo-Mersenne backend `Secp256k1Field`, a reduction
+//! specialised to secp256k1's prime (`2²⁵⁶ ≡ c (mod p)`). It is validated
+//! byte-for-byte against the generic Montgomery reference `GenericMont` (the
+//! same audited `MontModulus<4>` core P-256 uses) by the differential tests in
 //! `field_backend`; `GenericMont` remains as that oracle and a fallback.
 
 mod field_backend;

@@ -12,7 +12,7 @@
 //! genuinely needs group access.
 //!
 //! The arithmetic itself is constant-time (it is the same constant-time
-//! [`curve25519`](crate::ec::curve25519) backend the signing path uses):
+//! `curve25519` backend the signing path uses):
 //! scalar multiplication is a fixed-schedule double-and-add, field/scalar ops
 //! are branch-free. Variable-time helpers, where offered, are suffixed
 //! `_vartime` and documented as such.

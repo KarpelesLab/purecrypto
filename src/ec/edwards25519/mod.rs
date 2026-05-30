@@ -4,7 +4,7 @@
 //! module instead exposes the raw edwards25519 group and order-`L` scalar
 //! arithmetic for callers building higher-level protocols (threshold
 //! signatures, verifiable secret sharing, FROST, …) on top of the same
-//! constant-time [`curve25519`](crate::ec::curve25519) backend.
+//! constant-time `curve25519` backend.
 //!
 //! The exposure is gated behind the `hazmat-edwards25519` feature and lives in
 //! the [`hazmat`] submodule; see its module documentation for the stability

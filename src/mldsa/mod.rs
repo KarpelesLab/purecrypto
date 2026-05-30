@@ -62,8 +62,8 @@ pub struct Params {
     pub gamma1_bits: u32,
     /// `γ₁`, the masking-vector coefficient range.
     pub gamma1: u32,
-    /// `γ₂`, the low-order rounding range (one of [`reduce::GAMMA2_32`] /
-    /// [`reduce::GAMMA2_88`]).
+    /// `γ₂`, the low-order rounding range (one of `GAMMA2_32` / `GAMMA2_88`,
+    /// re-exported in `mldsa::hazmat`).
     pub gamma2: u32,
     /// `ω`, the maximum number of `1` bits in the hint.
     pub omega: usize,
