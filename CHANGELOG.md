@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/KarpelesLab/purecrypto/compare/v0.5.0...v0.5.1) - 2026-06-01
+
+### Other
+
+- expose affine coordinates on EdwardsPoint
+- guard from_seeds against short seeds with a clear panic
+- forward Config.verification_time to server engines
+- enable linux-getrandom by default
+- warn when kdf passphrase is passed on argv (F7)
+- reject ECH whose HPKE suite isn't in the published ECHConfig (F6)
+- enforce delegated OCSP responder certificate validity period (F5)
+- reject signature representative s>=n and strict PSS leading-octet check (F4)
+- bound handshake message_seq to prevent pre-cookie DoS (F3)
+- bound pending_retire and validate retire_prior_to (F2)
+- enforce client certificate validity period in mTLS (F1)
+- fix private-intra-doc-link errors in ec/mldsa module docs
+- *(test)* update recv_pending_fragments_are_bounded for drop-on-overflow
+- fix two bugs behind the flaky out-of-order stream test
+- switch base field to the native Secp256k1Field backend
+- add native pseudo-Mersenne field backend + differential tests
+- *(release-plz)* use RELEASE_PLZ_TOKEN; restore workflow clobbered in 77e4b4a
+- *(release-plz)* authenticate with RELEASE_PLZ_TOKEN PAT
+- silence feature-gated lints exposed by hazmat-mldsa build combo
+- *(curve25519)* fix feature-gated dead_code warnings on default build
+- resolve merge conflict markers in mod.rs module declarations
+- add ristretto255 (RFC 9496) stable prime-order group (Stage 6, Items 1+2)
+- add edwards25519::hazmat low-level group/scalar API (Stage 5, Items 1+2)
+- extract shared curve25519 backend from ed25519 (Stage 4, Items 1+2)
+- *(secp256k1)* public scalar/point arithmetic + compressed SEC1 (Stage 2/3, Item 3)
+- expose low-level primitives via mldsa::hazmat (Stage 1 / Item 5)
+- *(design)* threshold/low-level primitives plan (hazmat, secp256k1 native, ristretto255)
+- propagate nameConstraints to intermediates (RFC 5280 §6.1.4)
+- explicit Drop wiping DhPrivateKey secret exponent
+- wipe residual key-stream/subkey in cipher mode wrappers on drop
+- *(client)* reject un-offered cipher suite / key-share group in ServerHello
+- reject NUL/control chars in DistinguishedName attribute values
+- reject NUL/control chars in nameConstraints dNSName subtrees
+- harden ASN.1 time parsing and fail OCSP freshness closed on bad time
+- regression tests for cookie fail-closed without secret
+- fail closed when cookie exchange is required but no secret is set
+- apply the emsa separator-index truncation fix to the scanners
+- fix PKCS#1 v1.5 / OAEP separator-index truncation for keys > 2048-bit
+- add regression test for ACK-range CPU-exhaustion DoS
+- bound ACK-range processing — reject PNs never sent, iterate sparsely
+
 ## [0.5.0](https://github.com/KarpelesLab/purecrypto/compare/v0.4.0...v0.5.0) - 2026-05-30
 
 ### Other
