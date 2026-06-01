@@ -212,6 +212,31 @@ impl EdwardsPoint {
         Field::new().decode(bytes).map(EdwardsPoint)
     }
 
+    /// The affine coordinates `(x, y) = (X/Z, Y/Z)` of this point, each as a
+    /// 32-byte little-endian canonical encoding of a field residue in `[0, p)`,
+    /// where `p = 2²⁵⁵ − 19`.
+    ///
+    /// Unlike [`compress`](Self::compress) (which keeps only `y` plus the sign
+    /// bit of `x`), this exposes the full, un-folded `x` and `y`. The single
+    /// field inversion needed to de-projectivize is shared between the two
+    /// coordinates; prefer this over calling [`x_bytes`](Self::x_bytes) and
+    /// [`y_bytes`](Self::y_bytes) separately when you need both.
+    pub fn to_affine(&self) -> ([u8; 32], [u8; 32]) {
+        Field::new().to_affine_bytes(&self.0)
+    }
+
+    /// The affine `x` coordinate, as a 32-byte little-endian canonical encoding
+    /// in `[0, p)`. See [`to_affine`](Self::to_affine).
+    pub fn x_bytes(&self) -> [u8; 32] {
+        self.to_affine().0
+    }
+
+    /// The affine `y` coordinate, as a 32-byte little-endian canonical encoding
+    /// in `[0, p)`. See [`to_affine`](Self::to_affine).
+    pub fn y_bytes(&self) -> [u8; 32] {
+        self.to_affine().1
+    }
+
     /// Whether `self` is a point of small order (in the 8-torsion subgroup):
     /// `[8]self == identity`. Constant-time.
     pub fn is_small_order(&self) -> Choice {
@@ -324,6 +349,42 @@ mod tests {
             assert_eq!(dec, p);
             assert_eq!(dec.compress(), enc);
         }
+    }
+
+    #[test]
+    fn affine_coords_match_compression() {
+        // `compress()` keeps `y` plus the sign bit of `x`, so it is the
+        // well-tested oracle for the affine accessors: rebuilding the
+        // compressed encoding from (x_bytes, y_bytes) must reproduce it.
+        for k in 1u64..12 {
+            let s = Scalar::from_bytes_mod_order(&{
+                let mut b = [0u8; 64];
+                b[..8].copy_from_slice(&k.to_le_bytes());
+                b
+            });
+            let p = EdwardsPoint::mul_base(&s);
+            let (x, y) = p.to_affine();
+            // x_bytes/y_bytes agree with the combined accessor.
+            assert_eq!(p.x_bytes(), x);
+            assert_eq!(p.y_bytes(), y);
+            // y is canonical (high bit unused) and x's parity is the sign bit.
+            assert_eq!(y[31] & 0x80, 0, "[{k}]B: y must be < 2^255");
+            let mut rebuilt = y;
+            rebuilt[31] |= (x[0] & 1) << 7;
+            assert_eq!(rebuilt, p.compress(), "[{k}]B affine vs compress");
+            // Decompressing the rebuilt encoding returns the same point.
+            assert_eq!(EdwardsPoint::decompress(&rebuilt).unwrap(), p);
+        }
+    }
+
+    #[test]
+    fn affine_identity() {
+        // Identity is affine (0, 1): x all-zero, y == 1.
+        let (x, y) = EdwardsPoint::identity().to_affine();
+        assert_eq!(x, [0u8; 32]);
+        let mut one = [0u8; 32];
+        one[0] = 1;
+        assert_eq!(y, one);
     }
 
     #[test]

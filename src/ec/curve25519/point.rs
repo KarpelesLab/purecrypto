@@ -78,6 +78,28 @@ impl Field {
         out
     }
 
+    /// The affine coordinates `(x, y) = (X/Z, Y/Z)` of `p`, each written as a
+    /// 32-byte little-endian canonical encoding of a residue in `[0, p)`.
+    ///
+    /// Unlike [`encode`](Self::encode) this returns the full `x` coordinate
+    /// rather than folding its sign into a bit of `y`. Group points always have
+    /// an invertible `Z`, so the inversion is well defined (the identity is
+    /// `(0:1:1:0)`, giving affine `(0, 1)`).
+    // Used by the edwards25519::hazmat affine-coordinate accessors; gate to the
+    // same features as that surface to avoid a dead-code warning on the default
+    // (Ed25519-only) build.
+    #[cfg(any(feature = "hazmat-edwards25519", feature = "ristretto255"))]
+    pub(crate) fn to_affine_bytes(&self, p: &Point) -> ([u8; 32], [u8; 32]) {
+        let zinv = self.inv(p.z);
+        let x = self.from_mont(&self.mul(p.x, zinv));
+        let y = self.from_mont(&self.mul(p.y, zinv));
+        let mut xb = [0u8; 32];
+        let mut yb = [0u8; 32];
+        x.write_le_bytes(&mut xb);
+        y.write_le_bytes(&mut yb);
+        (xb, yb)
+    }
+
     /// The neutral element `(0:1:1:0)`.
     pub(crate) fn identity(&self) -> Point {
         Point {
