@@ -73,6 +73,15 @@ pub mod quic;
 #[cfg(feature = "slhdsa")]
 pub mod slhdsa;
 
+#[cfg(feature = "ascon")]
+pub mod ascon;
+
+#[cfg(feature = "lms")]
+pub mod lms;
+
+#[cfg(feature = "xmss")]
+pub mod xmss;
+
 #[cfg(feature = "rng")]
 pub mod rng;
 

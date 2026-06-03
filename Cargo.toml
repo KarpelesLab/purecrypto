@@ -95,6 +95,17 @@ hazmat-mldsa = ["mldsa"]
 # SLH-DSA (FIPS 205) hash-based signatures. Needs alloc for the large
 # signatures (up to ~50 KB); built purely from the hash primitives.
 slhdsa = ["hash", "rng", "alloc"]
+# Ascon (NIST SP 800-232 lightweight cryptography): Ascon-AEAD128 plus
+# Ascon-Hash256 / Ascon-XOF128 / Ascon-CXOF128, all from one 320-bit
+# permutation.
+ascon = ["hash", "cipher"]
+# LMS / HSS stateful hash-based signatures (RFC 8554, NIST SP 800-208).
+# Stateful: the private key advances a one-time-key index on every signature
+# and MUST be re-persisted after each sign — reuse is catastrophic.
+lms = ["hash", "rng", "alloc"]
+# XMSS / XMSS^MT stateful hash-based signatures (RFC 8391, NIST SP 800-208).
+# Same stateful-key discipline as `lms`.
+xmss = ["hash", "rng", "alloc"]
 # HPKE (RFC 9180) hybrid public key encryption. Provides the DHKEM /
 # HKDF / AEAD matrix used by OHTTP, MLS, and the ECH client-hello
 # encryption. The full matrix: 4 KEMs (P-256, P-384, P-521, X25519) ×
