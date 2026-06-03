@@ -48,7 +48,9 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
             CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
             CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            // secp256k1 / SM2 have no IANA TLS signature scheme; fall back to
+            // the P-256 code point (they are never negotiated over TLS).
+            CurveId::Secp256k1 | CurveId::Sm2p256v1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
         },
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         ServerKey::Ed448(_) => SignatureScheme::ED448,

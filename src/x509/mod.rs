@@ -58,6 +58,12 @@ pub mod oid {
     pub const SECP521R1: &[u64] = &[1, 3, 132, 0, 35];
     /// `secp256k1` (1.3.132.0.10).
     pub const SECP256K1: &[u64] = &[1, 3, 132, 0, 10];
+    /// `sm2p256v1` / `id-sm2` (1.2.156.10197.1.301) — the SM2 named curve
+    /// (GB/T 32918, RFC 8998).
+    pub const SM2_P256V1: &[u64] = &[1, 2, 156, 10197, 1, 301];
+    /// `SM2-with-SM3` (1.2.156.10197.1.501) — the SM2 signature algorithm
+    /// over SM3 (GB/T 32918.2, RFC 8998).
+    pub const SM2_WITH_SM3: &[u64] = &[1, 2, 156, 10197, 1, 501];
     /// `ecdsa-with-SHA256` (1.2.840.10045.4.3.2).
     pub const ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
     /// `ecdsa-with-SHA384` (1.2.840.10045.4.3.3).

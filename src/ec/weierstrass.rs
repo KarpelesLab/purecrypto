@@ -77,6 +77,12 @@ impl Curve {
         &self.n
     }
 
+    /// The curve coefficients `(a, b)` in plain (non-Montgomery) form. Used by
+    /// SM2's `ZA` computation, which hashes the 32-byte big-endian `a`/`b`.
+    pub(crate) fn coefficients(&self) -> (BoxedUint, BoxedUint) {
+        (self.a_plain.clone(), self.b_plain.clone())
+    }
+
     /// The identity point `(0 : 1 : 0)`.
     pub(crate) fn identity(&self) -> Point {
         Point {

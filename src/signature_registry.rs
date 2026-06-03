@@ -126,6 +126,9 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::ec::registry::Ed25519,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::Ed448,
+    // SM2 (GB/T 32918.2, RFC 8998) — not on modern(); explicit opt-in.
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::Sm2WithSm3,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]
     &crate::mldsa::registry::MlDsa44,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]

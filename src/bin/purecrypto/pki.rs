@@ -137,6 +137,7 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
                 CurveId::P384 => "P-384",
                 CurveId::P521 => "P-521",
                 CurveId::Secp256k1 => "secp256k1",
+                CurveId::Sm2p256v1 => "sm2p256v1",
             }
         ),
         AnyPublicKey::Ed25519(_) => "Ed25519".to_string(),

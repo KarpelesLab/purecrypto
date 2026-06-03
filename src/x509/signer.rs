@@ -56,7 +56,7 @@ impl CertSigner<'_> {
         match self {
             CertSigner::Rsa(_) => oid::SHA256_WITH_RSA,
             CertSigner::Ecdsa(k) => match k.curve() {
-                CurveId::P256 | CurveId::Secp256k1 => oid::ECDSA_WITH_SHA256,
+                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => oid::ECDSA_WITH_SHA256,
                 CurveId::P384 => oid::ECDSA_WITH_SHA384,
                 CurveId::P521 => oid::ECDSA_WITH_SHA512,
             },
@@ -94,7 +94,9 @@ impl CertSigner<'_> {
             CertSigner::Ecdsa(k) => {
                 let curve = k.curve();
                 let sig = match curve {
-                    CurveId::P256 | CurveId::Secp256k1 => k.sign::<Sha256>(tbs),
+                    CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => {
+                        k.sign::<Sha256>(tbs)
+                    }
                     CurveId::P384 => k.sign::<Sha384>(tbs),
                     CurveId::P521 => k.sign::<Sha512>(tbs),
                 }

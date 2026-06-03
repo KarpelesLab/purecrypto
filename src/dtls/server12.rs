@@ -1064,7 +1064,9 @@ fn signature_scheme(key: &ServerKey) -> SignatureScheme {
     match key {
         ServerKey::Rsa(_) => SignatureScheme::RSA_PSS_RSAE_SHA256,
         ServerKey::Ecdsa(k) => match k.curve() {
-            CurveId::P256 | CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => {
+                SignatureScheme::ECDSA_SECP256R1_SHA256
+            }
             CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
             CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
         },

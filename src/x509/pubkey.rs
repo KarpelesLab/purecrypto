@@ -32,6 +32,7 @@ fn curve_oid(curve: CurveId) -> &'static [u64] {
         CurveId::P384 => oid::SECP384R1,
         CurveId::P521 => oid::SECP521R1,
         CurveId::Secp256k1 => oid::SECP256K1,
+        CurveId::Sm2p256v1 => oid::SM2_P256V1,
     }
 }
 
@@ -45,6 +46,8 @@ fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
         Some(CurveId::P521)
     } else if arcs == oid::SECP256K1 {
         Some(CurveId::Secp256k1)
+    } else if arcs == oid::SM2_P256V1 {
+        Some(CurveId::Sm2p256v1)
     } else {
         None
     }

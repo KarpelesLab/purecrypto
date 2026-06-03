@@ -14,6 +14,9 @@ pub enum CurveId {
     P521,
     /// secp256k1 (`a = 0`, SHA-256) — the Bitcoin/Ethereum curve.
     Secp256k1,
+    /// sm2p256v1 (`a = -3`, SM3) — the Chinese SM2 curve (GB/T 32918,
+    /// RFC 8998). Same field/scalar size as P-256 but distinct parameters.
+    Sm2p256v1,
 }
 
 /// Big-endian hex parameters for a curve.
@@ -89,6 +92,16 @@ impl CurveId {
                 field_len: 32,
                 order_len: 32,
             },
+            CurveId::Sm2p256v1 => Params {
+                p: "fffffffeffffffffffffffffffffffffffffffff00000000ffffffffffffffff",
+                a: "fffffffeffffffffffffffffffffffffffffffff00000000fffffffffffffffc",
+                b: "28e9fa9e9d9f5e344d5a9e4bcf6509a7f39789f515ab8f92ddbcbd414d940e93",
+                gx: "32c4ae2c1f1981195f9904466a39c9948fe30bbff2660be1715a4589334c74c7",
+                gy: "bc3736a2f4f6779c59bdcee36b692153d0a9877cc62a474002df32e52139f0a0",
+                n: "fffffffeffffffffffffffffffffffff7203df6b21c6052b53bbf40939d54123",
+                field_len: 32,
+                order_len: 32,
+            },
         }
     }
 
@@ -116,6 +129,8 @@ impl CurveId {
             CurveId::P384 => &[1, 3, 132, 0, 34],
             CurveId::P521 => &[1, 3, 132, 0, 35],
             CurveId::Secp256k1 => &[1, 3, 132, 0, 10],
+            // id-sm2 / sm2p256v1 (GB/T 32918, RFC 8998).
+            CurveId::Sm2p256v1 => &[1, 2, 156, 10197, 1, 301],
         }
     }
 
@@ -127,6 +142,7 @@ impl CurveId {
             CurveId::P384,
             CurveId::P521,
             CurveId::Secp256k1,
+            CurveId::Sm2p256v1,
         ]
         .into_iter()
         .find(|id| id.named_curve_oid() == arcs)
@@ -183,6 +199,7 @@ mod tests {
         check(CurveId::P384);
         check(CurveId::P521);
         check(CurveId::Secp256k1);
+        check(CurveId::Sm2p256v1);
     }
 
     #[test]

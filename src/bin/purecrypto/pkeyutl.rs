@@ -268,7 +268,7 @@ fn run_sign(args: Args) {
         PrivKey::Ec(k) => {
             let curve = k.curve();
             let sig = match curve {
-                CurveId::P256 | CurveId::Secp256k1 => k.sign::<Sha256>(&msg),
+                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => k.sign::<Sha256>(&msg),
                 CurveId::P384 => k.sign::<Sha384>(&msg),
                 CurveId::P521 => k.sign::<Sha512>(&msg),
             }
@@ -348,7 +348,9 @@ fn run_verify(args: Args) {
                 }
             };
             match k.curve() {
-                CurveId::P256 | CurveId::Secp256k1 => k.verify::<Sha256>(&msg, &parsed),
+                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => {
+                    k.verify::<Sha256>(&msg, &parsed)
+                }
                 CurveId::P384 => k.verify::<Sha384>(&msg, &parsed),
                 CurveId::P521 => k.verify::<Sha512>(&msg, &parsed),
             }

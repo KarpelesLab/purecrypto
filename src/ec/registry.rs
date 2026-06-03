@@ -22,7 +22,7 @@
 use crate::der::{Reader, parse_oid};
 use crate::ec::{
     BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed448PublicKey, Ed448Signature,
-    Ed25519PublicKey, Ed25519Signature,
+    Ed25519PublicKey, Ed25519Signature, Sm2PublicKey, Sm2Signature,
 };
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::signature_registry::SignatureAlgorithm;
@@ -250,6 +250,53 @@ strict_ecdsa_entry!(
     EcdsaSecp256k1Sha512, "ecdsa-secp256k1-sha512", CurveId::Secp256k1, Sha512, &[]
 );
 
+/// Parses an SM2 SPKI (`id-ecPublicKey` + the `sm2p256v1` named curve) and
+/// returns the public key. The SM2 SPKI shares the EC SPKI shape; it differs
+/// only in the named-curve OID.
+fn parse_sm2_spki(spki: &[u8]) -> Result<Sm2PublicKey, Error> {
+    let mut reader = Reader::new(spki);
+    let mut outer = reader.read_sequence()?;
+    let mut algid = outer.read_sequence()?;
+    let alg = parse_oid(algid.read_oid()?)?;
+    if alg.as_slice() != oid::EC_PUBLIC_KEY {
+        return Err(Error::UnsupportedAlgorithm);
+    }
+    let curve_arcs = parse_oid(algid.read_oid()?)?;
+    if curve_arcs.as_slice() != oid::SM2_P256V1 {
+        return Err(Error::UnsupportedAlgorithm);
+    }
+    let key_bits = outer.read_bit_string()?;
+    Sm2PublicKey::from_sec1(key_bits).map_err(|_| Error::Malformed)
+}
+
+/// `SM2-with-SM3` — the SM2 signature algorithm over SM3 (GB/T 32918.2,
+/// RFC 8998). X.509 OID `1.2.156.10197.1.501`. No TLS scheme.
+///
+/// SM2 verification is *not* ECDSA: it computes `ZA` (binding the signer's
+/// identity and public key into the hash) and applies the SM2 verification
+/// equation. X.509 certificates carry no signer identity, so the default
+/// `"1234567812345678"` id is used (RFC 8998 §2). The signature value is a DER
+/// `Ecdsa-Sig-Value`.
+pub(crate) struct Sm2WithSm3;
+
+impl SignatureAlgorithm for Sm2WithSm3 {
+    fn id(&self) -> &'static str {
+        "sm2-with-sm3"
+    }
+    fn x509_oids(&self) -> &'static [&'static [u64]] {
+        &[oid::SM2_WITH_SM3]
+    }
+    fn tls_schemes(&self) -> &'static [u16] {
+        &[]
+    }
+    fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
+        let key = parse_sm2_spki(spki)?;
+        let sig = Sm2Signature::from_der(signature).map_err(|_| Error::Malformed)?;
+        key.verify(message, &sig, crate::ec::sm2::DEFAULT_ID)
+            .map_err(|_| Error::Verification)
+    }
+}
+
 /// `ed25519` — pure Ed25519 (RFC 8032 / RFC 8410).
 /// X.509 OID `1.3.101.112`; TLS scheme `0x0807`.
 pub(crate) struct Ed25519;
@@ -352,6 +399,23 @@ mod tests {
         // path: chains signed with secp256k1 carry `ecdsa-with-SHA256`).
         let any = find_by_id("ecdsa-with-sha256").unwrap();
         any.verify(&spki, b"hi", &sig).unwrap();
+    }
+
+    #[test]
+    fn sm2_verify_via_registry() {
+        use crate::ec::Sm2PrivateKey;
+        use crate::ec::sm2::DEFAULT_ID;
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-sm2", b"n", &[]);
+        let sk = Sm2PrivateKey::generate(&mut rng);
+        let spki = sk.public_key().to_spki_der();
+        let sig = sk.sign(b"hi", DEFAULT_ID, &mut rng).unwrap().to_der();
+
+        let algo = find_by_id("sm2-with-sm3").unwrap();
+        algo.verify(&spki, b"hi", &sig).unwrap();
+        assert!(algo.verify(&spki, b"other", &sig).is_err());
+
+        // X.509 OID (1.2.156.10197.1.501) resolves to this entry; no TLS scheme.
+        assert_eq!(find_by_oid(oid::SM2_WITH_SM3).unwrap().id(), "sm2-with-sm3");
     }
 
     #[test]

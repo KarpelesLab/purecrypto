@@ -31,6 +31,7 @@ pub(crate) mod registry;
 pub mod ristretto255;
 #[cfg(feature = "hazmat-secp256k1")]
 pub mod secp256k1;
+pub mod sm2;
 mod weierstrass;
 pub mod x25519;
 pub mod x448;
@@ -41,6 +42,7 @@ pub use boxed::{
 pub use curves::CurveId;
 pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
+pub use sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
