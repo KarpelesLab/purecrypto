@@ -139,6 +139,22 @@ impl<D: Digest> HmacDrbg<D> {
     }
 }
 
+impl<D: Digest> Drop for HmacDrbg<D> {
+    fn drop(&mut self) {
+        // Wipe the secret HMAC key and chaining value so they do not linger
+        // in freed memory. Mirrors the `black_box`-fenced overwrite used by
+        // `HmacPrf` in `kdf::kbkdf`.
+        for b in self.k.as_mut() {
+            *b = 0;
+        }
+        for b in self.v.as_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(self.k.as_ref());
+        let _ = core::hint::black_box(self.v.as_ref());
+    }
+}
+
 impl<D: Digest> RngCore for HmacDrbg<D> {
     #[inline]
     fn fill_bytes(&mut self, dest: &mut [u8]) {
@@ -212,5 +228,17 @@ mod tests {
         a.fill_bytes(&mut x);
         b.fill_bytes(&mut y);
         assert_ne!(x, y);
+    }
+
+    #[test]
+    fn drops_cleanly_after_use() {
+        // The Drop impl zeroizes the secret key and chaining value; this
+        // exercises that path (no use-after-free / panic) and documents that
+        // an instantiated, used DRBG can be dropped. Correctness of the wipe
+        // itself cannot be observed once the memory is freed.
+        let mut d = HmacDrbg::<Sha256>::new(b"entropy", b"nonce", b"pers");
+        let mut o = [0u8; 32];
+        d.fill_bytes(&mut o);
+        drop(d);
     }
 }
