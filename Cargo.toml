@@ -30,7 +30,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "mac", "cert-compression", "cli", "linux-getrandom"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "lms", "xmss", "mac", "cert-compression", "cli", "linux-getrandom"]
 std = ["alloc"]
 alloc = []
 
@@ -129,9 +129,9 @@ ech = ["tls", "hpke"]
 cert-compression = ["tls", "dep:compcol"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
-ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher"]
+ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher", "ascon", "lms", "xmss"]
 # The `purecrypto` command-line tool (gates the binary target below).
-cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher"]
+cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss"]
 
 # --- dependencies ---
 # This crate's design principle is to ship no foreign code, primarily so the
