@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(cipher)* AES-CMAC (RFC 4493) — generic over the block cipher, also exposed as a `Mac`
+- *(cipher)* AES-SIV (RFC 5297) and AES-GCM-SIV (RFC 8452) nonce-misuse-resistant AEADs
+- *(cipher)* XChaCha20-Poly1305 (extended 24-byte nonce, draft-irtf-cfrg-xchacha-03)
+- *(ec)* X448 key agreement (RFC 7748) and Ed448 signatures (RFC 8032), with PKCS#8 DER/PEM
+- *(x509,ec)* Ed448 SPKI parsing, signature-registry + cert-chain verify, self-signed/CA issuance (id-Ed448 1.3.101.113)
+- *(tls)* Ed448 certificate authentication (TLS 1.3 SignatureScheme ed448 = 0x0808)
+- *(ffi,cli)* expose the new AEADs (`enc`, `pc_aead_*`), AES-CMAC (`mac -alg cmac`, `pc_cmac`), Ed448 (`genpkey -alg ED448`, `pkeyutl`, `pc_ed448_*`) and X448 (`kex -alg X448`, `pc_x448`)
+
 ## [0.5.1](https://github.com/KarpelesLab/purecrypto/compare/v0.5.0...v0.5.1) - 2026-06-01
 
 ### Other

@@ -45,24 +45,24 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing) |
 | Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM and ChaCha20-Poly1305 (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop |
-| MAC              | `mac`       | ✅ UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
+| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop |
+| MAC              | `mac`       | ✅ AES-CMAC (RFC 4493); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
 | Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
 | Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
 | Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106) |
-| Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032) |
+| Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032) |
 | Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
 | Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
 | Diffie-Hellman   | `dh`        | ✅ Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
-| X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA & Ed25519), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
-| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
+| X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
+| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/Ed448/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
 | HPKE             | `hpke`     | ✅ RFC 9180 hybrid public-key encryption — 4 KEMs × 3 KDFs × 3 AEADs + ExportOnly, all four modes (Base/PSK/Auth/AuthPSK) |
 | ECH              | `ech`      | ✅ draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
 | QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
 | Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
-| C ABI            | `ffi`       | ✅ hashing/HMAC, RNG, AEAD + AES-KW, RSA, ECDSA, Ed25519, ML-KEM, ML-DSA, SLH-DSA, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
+| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC, RNG, AEAD + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, ML-KEM, ML-DSA, SLH-DSA, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 
 ## CLI + C-API coverage matrix
@@ -74,8 +74,9 @@ Each functional area below is callable from the Rust library, the
 | ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
 | Hashing (SHA-2/3, BLAKE2/3, SM3, …)   | `hash`                               | `pc_digest`, `pc_hash_*`                                           |
 | HMAC (SHA-1, SHA-2, SHA-3, SM3, …)    | `mac`                                | `pc_hmac`                                                          |
+| AES-CMAC (RFC 4493)                   | `mac -alg cmac`                      | `pc_cmac`                                                          |
 | KDFs (HKDF, PBKDF2, scrypt, Argon2)   | `kdf hkdf\|pbkdf2\|scrypt\|argon2`   | `pc_hkdf`, `pc_pbkdf2`, `pc_scrypt`, `pc_argon2`                   |
-| AEAD (AES-GCM/CCM, ChaCha20-Poly1305) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
+| AEAD (AES-GCM/CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
 | AES key wrap (RFC 3394/5649)          | `enc -alg AES-KW\|AES-KWP`           | `pc_aes_kw_wrap/unwrap`, `pc_aes_kwp_wrap/unwrap`                  |
 | Randomness                            | `rand`                               | `pc_rand_bytes`                                                    |
 | RSA keygen + PKCS#1 sign/verify       | `genpkey`, `req`, `x509`, `pkeyutl`  | `pc_rsa_generate`, `pc_rsa_sign_pkcs1`, `pc_rsa_verify_pkcs1`      |
@@ -83,8 +84,10 @@ Each functional area below is callable from the Rust library, the
 | RSA-OAEP encrypt/decrypt              | `pkeyutl encrypt/decrypt -pkeyopt oaep` | `pc_rsa_encrypt_oaep`, `pc_rsa_decrypt_oaep`                    |
 | ECDSA keygen + sign/verify            | `genpkey -alg EC`, `pkeyutl`         | `pc_ec_generate`, `pc_ec_sign`, `pc_ec_verify`                     |
 | Ed25519 sign/verify                   | `genpkey -alg ED25519`, `pkeyutl`    | `pc_ed25519_*`                                                     |
+| Ed448 sign/verify                     | `genpkey -alg ED448`, `pkeyutl`      | `pc_ed448_*`                                                       |
 | ECDH on NIST curves                   | `kex -alg ECDH-P{256,384,521}`       | `pc_ecdh`                                                          |
 | X25519                                | `kex -alg X25519`                    | `pc_x25519`, `pc_x25519_public`                                    |
+| X448                                  | `kex -alg X448`                      | `pc_x448`, `pc_x448_public`                                        |
 | ML-KEM (FIPS 203)                     | `kem keygen\|encaps\|decaps`         | `pc_mlkem_*`                                                       |
 | ML-DSA (FIPS 204)                     | `pkeyutl sign/verify` (ML-DSA keys)  | `pc_mldsa_*`                                                       |
 | SLH-DSA (FIPS 205)                    | `pkeyutl sign/verify` (SLH-DSA keys) | `pc_slhdsa_*`                                                      |
@@ -253,7 +256,7 @@ purecrypto s_client -connect server:443 -cert client.pem -key client.key
 The client offers `X25519MLKEM768` (post-quantum hybrid) first, then `x25519`
 and `secp256r1`; all three TLS 1.3 cipher suites
 (`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
-`TLS_CHACHA20_POLY1305_SHA256`); and Ed25519, ECDSA, and RSA peer signatures.
+`TLS_CHACHA20_POLY1305_SHA256`); and Ed25519, Ed448, ECDSA, and RSA peer signatures.
 
 ### `s_server` — TLS 1.3 echo / `-www` server
 
