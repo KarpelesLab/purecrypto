@@ -110,18 +110,22 @@ impl<D: Digest> Prf for HmacPrf<D> {
     const OUTPUT_LEN: usize = D::OUTPUT_LEN;
 
     fn init(ki: &[u8]) -> Self {
-        assert!(
-            ki.len() <= MAX_HMAC_BLOCK,
-            "KBKDF HMAC key longer than 128 bytes"
-        );
+        // `Hmac::new` reduces an over-long key (> one hash block) to
+        // `D::digest(key)` before use. To re-key identically between blocks we
+        // must stash that *reduced* key rather than asserting on length; the
+        // digest is `OUTPUT_LEN <= MAX_HMAC_BLOCK` bytes, so it always fits.
         let mut key = [0u8; MAX_HMAC_BLOCK];
-        key[..ki.len()].copy_from_slice(ki);
+        let key_len = if ki.len() > MAX_HMAC_BLOCK {
+            let hashed = D::digest(ki);
+            let h = hashed.as_ref();
+            key[..h.len()].copy_from_slice(h);
+            h.len()
+        } else {
+            key[..ki.len()].copy_from_slice(ki);
+            ki.len()
+        };
         let mac = Hmac::<D>::new(ki);
-        HmacPrf {
-            key,
-            key_len: ki.len(),
-            mac,
-        }
+        HmacPrf { key, key_len, mac }
     }
 
     fn update(&mut self, data: &[u8]) {
@@ -615,5 +619,22 @@ mod tests {
             kbkdf_feedback::<HmacSha256Prf>(b"k", b"iv", b"l", b"c", &mut empty),
             Err(Error::ZeroLength)
         );
+    }
+
+    // An over-long HMAC key (> one hash block, 128B for SHA-256's 64B block via
+    // the 128B stash) must not panic, and must match the pre-hashed key, because
+    // HMAC itself reduces an over-long key to `D::digest(key)`.
+    #[test]
+    fn overlong_hmac_key_matches_prehashed() {
+        use crate::hash::{Digest, Sha256};
+        let long_key = [0xABu8; 200]; // > MAX_HMAC_BLOCK (128)
+        let reduced = Sha256::digest(&long_key);
+        let fixed = b"fixed input";
+
+        let mut a = [0u8; 64]; // two blocks, exercises the re-key path
+        let mut b = [0u8; 64];
+        kbkdf_counter_fixed::<HmacSha256Prf>(&long_key, fixed, &mut a).unwrap();
+        kbkdf_counter_fixed::<HmacSha256Prf>(reduced.as_ref(), fixed, &mut b).unwrap();
+        assert_eq!(a, b, "over-long key must behave as its digest");
     }
 }
