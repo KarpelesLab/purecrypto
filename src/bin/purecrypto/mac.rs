@@ -2,19 +2,41 @@
 //! — emit an HMAC tag (mirrors `openssl dgst -mac hmac`).
 
 use crate::util::{Args, die, parse_hex_flag, read_input, to_hex_line, write_output};
+use purecrypto::cipher::{Aes128, Aes256, AesCmac128, AesCmac256};
 use purecrypto::hash::{Hmac, HmacSha256, HmacSha384, HmacSha512, Sha1};
 
 type HmacSha1 = Hmac<Sha1>;
 
-/// Returns the HMAC tag (raw bytes) of `msg` under `key` for the named
+/// Computes the AES-CMAC tag (RFC 4493), selecting AES-128 or AES-256 by key
+/// length. Exits with an error if the key is not 16 or 32 bytes.
+fn cmac_tag(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    match key.len() {
+        16 => {
+            let k: [u8; 16] = key.try_into().unwrap();
+            let mut c = AesCmac128::new(Aes128::new(&k));
+            c.update(msg);
+            c.finalize().to_vec()
+        }
+        32 => {
+            let k: [u8; 32] = key.try_into().unwrap();
+            let mut c = AesCmac256::new(Aes256::new(&k));
+            c.update(msg);
+            c.finalize().to_vec()
+        }
+        _ => die("AES-CMAC key must be 16 bytes (AES-128) or 32 bytes (AES-256)"),
+    }
+}
+
+/// Returns the MAC tag (raw bytes) of `msg` under `key` for the named
 /// algorithm. Supported: `hmac-sha1`, `hmac-sha256`, `hmac-sha384`,
-/// `hmac-sha512`.
+/// `hmac-sha512`, and `cmac` / `aes-cmac` (AES-CMAC, RFC 4493).
 fn mac_tag(alg: &str, key: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
     let tag = match alg.to_ascii_lowercase().as_str() {
         "hmac-sha1" | "sha1" => HmacSha1::mac(key, msg).as_ref().to_vec(),
         "hmac-sha256" | "sha256" => HmacSha256::mac(key, msg).as_ref().to_vec(),
         "hmac-sha384" | "sha384" => HmacSha384::mac(key, msg).as_ref().to_vec(),
         "hmac-sha512" | "sha512" => HmacSha512::mac(key, msg).as_ref().to_vec(),
+        "cmac" | "aes-cmac" => cmac_tag(key, msg),
         _ => return None,
     };
     Some(tag)

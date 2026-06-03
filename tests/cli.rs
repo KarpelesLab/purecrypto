@@ -1683,6 +1683,116 @@ fn enc_chacha20_poly1305_roundtrip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Helper: encrypt `pt` then decrypt under the same `-alg`/`-key`/`-nonce`,
+/// asserting the plaintext round-trips through the `enc` verb.
+fn enc_roundtrip(tag: &str, alg: &str, key: &str, nonce: &str, pt: &[u8]) {
+    let dir = std::env::temp_dir().join(format!("pc_enc_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), pt).unwrap();
+
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                alg,
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-aad",
+                "deadbeef",
+                "-in",
+                &p("pt.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "enc",
+                "-alg",
+                alg,
+                "-d",
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-aad",
+                "deadbeef",
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, pt);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn enc_aes_gcm_siv_roundtrip() {
+    enc_roundtrip(
+        "gcmsiv",
+        "AES-256-GCM-SIV",
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+        "010203040506070809101112",
+        b"GCM-SIV via the enc verb",
+    );
+}
+
+#[test]
+fn enc_xchacha20_poly1305_roundtrip() {
+    enc_roundtrip(
+        "xchacha",
+        "XCHACHA20-POLY1305",
+        "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+        "0102030405060708090a0b0c0d0e0f101112131415161718",
+        b"XChaCha20 via the enc verb",
+    );
+}
+
+#[test]
+fn enc_aes_siv_roundtrip() {
+    // AES-128-SIV (32-byte key); the nonce is consumed as the single AD header.
+    enc_roundtrip(
+        "siv",
+        "AES-128-SIV",
+        "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        "101112131415161718191a1b1c1d1e1f2021222324252627",
+        b"AES-SIV deterministic AEAD via enc",
+    );
+}
+
+#[test]
+fn mac_aes_cmac_known_answer() {
+    // RFC 4493 §4 Example 2: key 2b7e..4f3c, one full 16-byte block.
+    let (out, ok) = run(
+        &[
+            "mac",
+            "-alg",
+            "cmac",
+            "-key",
+            "2b7e151628aed2a6abf7158809cf4f3c",
+        ],
+        &[
+            0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96, 0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93,
+            0x17, 0x2a,
+        ],
+    );
+    assert!(ok);
+    assert_eq!(out.trim(), "070a16b46b4d4144f79bdd9dd04a287c");
+}
+
 /// `-keyfile` reads raw key bytes from disk (no hex decoding) and is the
 /// argv-safe alternative to `-key HEX`. `-aadfile` is the matching form
 /// for AAD. Both must round-trip an AEAD ciphertext just like the argv

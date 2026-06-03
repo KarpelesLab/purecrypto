@@ -10,7 +10,7 @@ use crate::util::{
 };
 use purecrypto::cipher::{
     Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256, Aes256Ccm, Aes256Ccm8,
-    Aes256Gcm, Aes256Kw, Aes256Kwp, ChaCha20Poly1305,
+    Aes256Gcm, Aes256Kw, Aes256Kwp, AesGcmSiv, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
 };
 
 #[derive(Clone, Copy)]
@@ -22,6 +22,11 @@ enum Algo {
     Aes256Ccm,
     Aes128Ccm8,
     Aes256Ccm8,
+    Aes128GcmSiv,
+    Aes256GcmSiv,
+    XChaCha20P1305,
+    Aes128Siv,
+    Aes256Siv,
     Aes128Kw,
     Aes256Kw,
     Aes128Kwp,
@@ -39,6 +44,11 @@ fn parse_alg(name: &str) -> Option<Algo> {
         "AES-256-CCM" => Algo::Aes256Ccm,
         "AES-128-CCM8" => Algo::Aes128Ccm8,
         "AES-256-CCM8" => Algo::Aes256Ccm8,
+        "AES-128-GCM-SIV" => Algo::Aes128GcmSiv,
+        "AES-256-GCM-SIV" => Algo::Aes256GcmSiv,
+        "XCHACHA20-POLY1305" => Algo::XChaCha20P1305,
+        "AES-128-SIV" => Algo::Aes128Siv,
+        "AES-256-SIV" => Algo::Aes256Siv,
         "AES-128-KW" | "AES-KW-128" => Algo::Aes128Kw,
         "AES-256-KW" | "AES-KW-256" => Algo::Aes256Kw,
         "AES-128-KWP" | "AES-KWP-128" => Algo::Aes128Kwp,
@@ -49,15 +59,23 @@ fn parse_alg(name: &str) -> Option<Algo> {
 
 fn key_size(alg: Algo) -> usize {
     match alg {
-        Algo::Aes128Gcm | Algo::Aes128Ccm | Algo::Aes128Ccm8 | Algo::Aes128Kw | Algo::Aes128Kwp => {
-            16
-        }
+        Algo::Aes128Gcm
+        | Algo::Aes128Ccm
+        | Algo::Aes128Ccm8
+        | Algo::Aes128GcmSiv
+        | Algo::Aes128Kw
+        | Algo::Aes128Kwp => 16,
         Algo::ChaCha20P1305
+        | Algo::XChaCha20P1305
         | Algo::Aes256Gcm
         | Algo::Aes256Ccm
         | Algo::Aes256Ccm8
+        | Algo::Aes256GcmSiv
+        | Algo::Aes128Siv
         | Algo::Aes256Kw
         | Algo::Aes256Kwp => 32,
+        // AES-SIV uses a double-length key: 64 bytes selects AES-256-SIV.
+        Algo::Aes256Siv => 64,
     }
 }
 
@@ -101,12 +119,39 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
             buf.extend_from_slice(&t);
             return;
         }
+        Algo::Aes128GcmSiv | Algo::Aes256GcmSiv => {
+            let n: [u8; 12] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 12 bytes for AES-GCM-SIV"));
+            AesGcmSiv::new(key).encrypt(&n, aad, buf.as_mut_slice())
+        }
+        Algo::XChaCha20P1305 => {
+            let k: [u8; 32] = key.try_into().expect("xchacha20-poly1305 key length");
+            let n: [u8; 24] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 24 bytes for XChaCha20-Poly1305"));
+            XChaCha20Poly1305::new(&k).encrypt(&n, aad, buf.as_mut_slice())
+        }
+        Algo::Aes128Siv | Algo::Aes256Siv => {
+            // AES-SIV is deterministic: the nonce is supplied as the single
+            // associated-data header and the output is `V ‖ ciphertext`.
+            let out = AesSiv::new(key).seal(&[nonce], buf.as_slice());
+            *buf = out;
+            return;
+        }
         _ => unreachable!("aead_encrypt only called for AEAD algs"),
     };
     buf.extend_from_slice(&tag);
 }
 
 fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u8]) -> Vec<u8> {
+    // AES-SIV's output is `V ‖ ciphertext` (V prepended), with the nonce passed
+    // as the single associated-data header; handle it before the append-tag path.
+    if let Algo::Aes128Siv | Algo::Aes256Siv = alg {
+        return AesSiv::new(key)
+            .open(&[nonce], ct_and_tag)
+            .unwrap_or_else(|_| die("authentication tag verification failed"));
+    }
     let tag_len = match alg {
         Algo::Aes128Ccm8 | Algo::Aes256Ccm8 => 8,
         _ => 16,
@@ -167,6 +212,23 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
             let t: [u8; 8] = tag.try_into().unwrap();
             Aes256Ccm8::new(Aes256::new(&k))
                 .decrypt(nonce, aad, &mut buf, &t)
+                .is_ok()
+        }
+        Algo::Aes128GcmSiv | Algo::Aes256GcmSiv => {
+            let n: [u8; 12] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 12 bytes for AES-GCM-SIV"));
+            let t: [u8; 16] = tag.try_into().unwrap();
+            AesGcmSiv::new(key).decrypt(&n, aad, &mut buf, &t).is_ok()
+        }
+        Algo::XChaCha20P1305 => {
+            let k: [u8; 32] = key.try_into().expect("xchacha20 key length");
+            let n: [u8; 24] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 24 bytes for XChaCha20-Poly1305"));
+            let t: [u8; 16] = tag.try_into().unwrap();
+            XChaCha20Poly1305::new(&k)
+                .decrypt(&n, aad, &mut buf, &t)
                 .is_ok()
         }
         _ => unreachable!("aead_decrypt only called for AEAD algs"),

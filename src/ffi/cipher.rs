@@ -7,7 +7,8 @@ use alloc::vec::Vec;
 use super::common::{PcStatus, guard, out_write, slice};
 use crate::cipher::{
     Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256, Aes256Ccm, Aes256Ccm8,
-    Aes256Gcm, Aes256Kw, Aes256Kwp, ChaCha20Poly1305,
+    Aes256Gcm, Aes256Kw, Aes256Kwp, AesCmac128, AesCmac256, AesGcmSiv, AesSiv, ChaCha20Poly1305,
+    XChaCha20Poly1305,
 };
 
 /// AEAD algorithm identifiers (mirror `PcAead` in `purecrypto.h`).
@@ -20,17 +21,38 @@ pub mod aead_id {
     pub const AES256_CCM: i32 = 5;
     pub const AES128_CCM8: i32 = 6;
     pub const AES256_CCM8: i32 = 7;
+    pub const AES128_GCM_SIV: i32 = 8;
+    pub const AES256_GCM_SIV: i32 = 9;
+    pub const XCHACHA20_POLY1305: i32 = 10;
+    /// AES-128-SIV (RFC 5297). Single-AD form: the `nonce` argument is passed
+    /// as the (one) associated-data header; the output is `V ‖ ciphertext`.
+    pub const AES128_SIV: i32 = 11;
+    /// AES-256-SIV (RFC 5297), 64-byte key, single-AD form.
+    pub const AES256_SIV: i32 = 12;
 }
 
 fn aead_key_size(alg: i32) -> Option<usize> {
     Some(match alg {
-        aead_id::AES128_GCM | aead_id::AES128_CCM | aead_id::AES128_CCM8 => 16,
+        aead_id::AES128_GCM
+        | aead_id::AES128_CCM
+        | aead_id::AES128_CCM8
+        | aead_id::AES128_GCM_SIV => 16,
         aead_id::AES256_GCM
         | aead_id::CHACHA20_POLY1305
         | aead_id::AES256_CCM
-        | aead_id::AES256_CCM8 => 32,
+        | aead_id::AES256_CCM8
+        | aead_id::AES256_GCM_SIV
+        | aead_id::XCHACHA20_POLY1305 => 32,
+        aead_id::AES128_SIV => 32,
+        aead_id::AES256_SIV => 64,
         _ => return None,
     })
+}
+
+/// Whether `alg` is one of the SIV constructions, whose tag (synthetic IV) is
+/// *prepended* to the output as `V ‖ ciphertext` rather than appended.
+fn is_siv(alg: i32) -> bool {
+    matches!(alg, aead_id::AES128_SIV | aead_id::AES256_SIV)
 }
 
 fn aead_tag_size(alg: i32) -> usize {
@@ -74,6 +96,15 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         };
         if k.len() != expected_key {
             return PcStatus::Unsupported;
+        }
+        // AES-SIV uses a single-AD form (the `nonce` argument is the AD header)
+        // and emits `V ‖ ciphertext`, so it does not fit the append-tag shape.
+        if is_siv(alg) {
+            let out = match alg {
+                aead_id::AES128_SIV | aead_id::AES256_SIV => AesSiv::new(k).seal(&[n], p),
+                _ => unreachable!(),
+            };
+            return unsafe { out_write(&out, ct_and_tag, ct_and_tag_len) };
         }
         let tag_size = aead_tag_size(alg);
         let mut buf: Vec<u8> = p.to_vec();
@@ -124,6 +155,23 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
+            aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => {
+                let nonce: [u8; 12] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                AesGcmSiv::new(k).encrypt(&nonce, a, &mut buf).to_vec()
+            }
+            aead_id::XCHACHA20_POLY1305 => {
+                let key: [u8; 32] = k.try_into().unwrap();
+                let nonce: [u8; 24] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                XChaCha20Poly1305::new(&key)
+                    .encrypt(&nonce, a, &mut buf)
+                    .to_vec()
+            }
             _ => return PcStatus::Unsupported,
         };
         debug_assert_eq!(tag.len(), tag_size);
@@ -167,6 +215,17 @@ pub unsafe extern "C" fn pc_aead_decrypt(
         };
         if k.len() != expected_key {
             return PcStatus::Unsupported;
+        }
+        // AES-SIV: input is `V ‖ ciphertext`; the `nonce` argument is the AD.
+        if is_siv(alg) {
+            let res = match alg {
+                aead_id::AES128_SIV | aead_id::AES256_SIV => AesSiv::new(k).open(&[n], blob),
+                _ => unreachable!(),
+            };
+            return match res {
+                Ok(pt_bytes) => unsafe { out_write(&pt_bytes, pt, pt_len) },
+                Err(_) => PcStatus::Verification,
+            };
         }
         let tag_size = aead_tag_size(alg);
         if blob.len() < tag_size {
@@ -226,6 +285,25 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 let t: [u8; 8] = tag.try_into().unwrap();
                 Aes256Ccm8::new(Aes256::new(&key))
                     .decrypt(n, a, &mut buf, &t)
+                    .is_ok()
+            }
+            aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => {
+                let nonce: [u8; 12] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                let t: [u8; 16] = tag.try_into().unwrap();
+                AesGcmSiv::new(k).decrypt(&nonce, a, &mut buf, &t).is_ok()
+            }
+            aead_id::XCHACHA20_POLY1305 => {
+                let key: [u8; 32] = k.try_into().unwrap();
+                let nonce: [u8; 24] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                let t: [u8; 16] = tag.try_into().unwrap();
+                XChaCha20Poly1305::new(&key)
+                    .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
             _ => return PcStatus::Unsupported,
@@ -396,5 +474,45 @@ pub unsafe extern "C" fn pc_aes_kwp_unwrap(
         };
         plain.truncate(n);
         unsafe { out_write(&plain, out, out_len) }
+    })
+}
+
+/// Computes the AES-CMAC tag (RFC 4493 / NIST SP 800-38B) of `msg` under `key`,
+/// writing the 16-byte tag to `out`. A 16-byte key selects AES-128-CMAC; a
+/// 32-byte key selects AES-256-CMAC.
+///
+/// # Safety
+/// All pointers must be valid for their lengths; `out_len` non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_cmac(
+    key: *const u8,
+    key_len: usize,
+    msg: *const u8,
+    msg_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(k), Some(m)) = (unsafe { slice(key, key_len) }, unsafe {
+            slice(msg, msg_len)
+        }) else {
+            return PcStatus::NullPointer;
+        };
+        let tag = match k.len() {
+            16 => {
+                let kk: [u8; 16] = k.try_into().unwrap();
+                let mut c = AesCmac128::new(Aes128::new(&kk));
+                c.update(m);
+                c.finalize()
+            }
+            32 => {
+                let kk: [u8; 32] = k.try_into().unwrap();
+                let mut c = AesCmac256::new(Aes256::new(&kk));
+                c.update(m);
+                c.finalize()
+            }
+            _ => return PcStatus::Unsupported,
+        };
+        unsafe { out_write(&tag, out, out_len) }
     })
 }
