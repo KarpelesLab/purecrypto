@@ -80,7 +80,12 @@ pub fn scrypt(
 
     // --- ROMix on each p block in turn, reusing one V scratch ---
     let n_us = n as usize;
-    let mut v: Vec<u8> = vec![0u8; n_us * block_size];
+    // Guard the V-buffer size: on 32-bit targets n_us · block_size can wrap
+    // usize for attacker-influenced (but per-RFC "valid") params, which would
+    // under-allocate and lead to an OOB write panic. Match the checked_mul
+    // discipline of the sibling allocations above.
+    let v_len = n_us.checked_mul(block_size).ok_or(Error::InvalidParam)?;
+    let mut v: Vec<u8> = vec![0u8; v_len];
     let mut x: Vec<u8> = vec![0u8; block_size];
 
     for i in 0..p as usize {
@@ -218,6 +223,19 @@ mod tests {
         // r·N ≥ 2³⁰ → reject.
         assert_eq!(
             scrypt(b"p", b"s", 30, 1, 1, &mut out),
+            Err(Error::InvalidParam)
+        );
+    }
+
+    #[test]
+    fn large_params_reject_without_panic() {
+        // Regression for the V-buffer size guard: large-but-"shaped" params
+        // that on a 32-bit target could wrap `n_us * block_size` must return
+        // InvalidParam (caught by the r·N bound), never panic via an
+        // under-allocated buffer. log_n=31, r=64 gives r·N = 64·2^31 ≥ 2^30.
+        let mut out = [0u8; 32];
+        assert_eq!(
+            scrypt(b"p", b"s", 31, 64, 1, &mut out),
             Err(Error::InvalidParam)
         );
     }
