@@ -243,6 +243,16 @@ impl CertificationRequest {
     }
 
     /// Verifies the request's self-signature against its own public key.
+    ///
+    /// A PKCS#10 `CertificationRequestInfo` carries no inner signature
+    /// AlgorithmIdentifier, so there is no RFC 5280 §4.1.1.2-style inner/outer
+    /// consistency check to perform here (unlike certificates and CRLs).
+    ///
+    /// SECURITY: this performs **no** signature-algorithm-strength or key-size
+    /// policy. A SHA-1- or MD5-based signature, or an undersized RSA key, will
+    /// verify **successfully** here. Callers MUST apply their own policy (e.g.
+    /// `SignaturePolicy::permits`, as the TLS path does in
+    /// [`crate::tls::pki::verify`]) before trusting the result.
     pub fn verify_self_signed(&self) -> Result<(), Error> {
         let parts = self.parts()?;
         let key = self.public_key()?;

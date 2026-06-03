@@ -237,6 +237,17 @@ impl AnyPublicKey {
     /// then re-parses the SPKI to recover the key and verifies. RSA
     /// signatures are PKCS#1 v1.5 or RSA-PSS (the OID fixes which);
     /// ECDSA signatures are DER `Ecdsa-Sig-Value`; Ed25519 is raw 64-byte R‖S.
+    ///
+    /// SECURITY: this performs **no** signature-algorithm-strength or key-size
+    /// policy. A SHA-1- or MD5-based RSA signature, or an undersized RSA key,
+    /// will verify **successfully** here as long as the math checks out. This
+    /// is the low-level primitive every x509 verify entry point routes through
+    /// ([`Certificate::verify_signature_with`](crate::x509::Certificate::verify_signature_with),
+    /// the CRL/CSR/OCSP verifiers); none of them impose a strength whitelist.
+    /// Callers MUST apply their own policy — the TLS path gates every signature
+    /// through `SignaturePolicy::permits` in [`crate::tls::pki::verify`] before
+    /// trusting it. Do not treat a successful return as evidence the algorithm
+    /// is acceptable.
     pub fn verify(&self, sig_alg: &[u64], msg: &[u8], sig: &[u8]) -> Result<(), Error> {
         let algo =
             crate::signature_registry::find_by_oid(sig_alg).ok_or(Error::UnsupportedAlgorithm)?;
