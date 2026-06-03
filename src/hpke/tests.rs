@@ -133,8 +133,8 @@ fn base_mode_roundtrip_full_matrix() {
             }
         }
 
-        let exp_s = sender.export(b"exporter ctx", 32);
-        let exp_r = receiver.export(b"exporter ctx", 32);
+        let exp_s = sender.export(b"exporter ctx", 32).unwrap();
+        let exp_r = receiver.export(b"exporter ctx", 32).unwrap();
         assert_eq!(exp_s, exp_r);
     }
 }
@@ -349,19 +349,19 @@ fn rfc9180_appendix_a1_base_x25519_aes128() {
     //     2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5
     //   exporter_context=54657374436f6e74657874, L=32 ->
     //     e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931
-    let exp0 = sender.export(b"", 32);
+    let exp0 = sender.export(b"", 32).unwrap();
     assert_eq!(
         exp0,
         hex("3853fe2b4035195a573ffc53856e77058e15d9ea064de3e59f4961d0095250ee"),
         "Exporter[empty,32]"
     );
-    let exp1 = sender.export(&[0x00u8], 32);
+    let exp1 = sender.export(&[0x00u8], 32).unwrap();
     assert_eq!(
         exp1,
         hex("2e8f0b54673c7029649d4eb9d5e33bf1872cf76d623ff164ac185da9e88c21a5"),
         "Exporter[00,32]"
     );
-    let exp2 = sender.export(&hex("54657374436f6e74657874"), 32);
+    let exp2 = sender.export(&hex("54657374436f6e74657874"), 32).unwrap();
     assert_eq!(
         exp2,
         hex("e9e43065102c3836401bed8c3c3c75ae46be1639869391d62c61f1ec7af54931"),

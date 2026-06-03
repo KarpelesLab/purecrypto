@@ -146,6 +146,11 @@ pub struct SenderContext {
     key: Vec<u8>,
     base_nonce: Vec<u8>,
     seq: u64,
+    /// Sticky poison flag: set once the per-suite message limit is reached.
+    /// Once set, all further `seal` calls fail without recomputing or using
+    /// a nonce, preventing catastrophic AEAD nonce reuse if a caller ignores
+    /// the first [`Error::MessageLimitReached`].
+    exhausted: bool,
     exporter_secret: Vec<u8>,
 }
 
@@ -157,6 +162,8 @@ pub struct ReceiverContext {
     key: Vec<u8>,
     base_nonce: Vec<u8>,
     seq: u64,
+    /// Sticky poison flag — see [`SenderContext::exhausted`].
+    exhausted: bool,
     exporter_secret: Vec<u8>,
 }
 
@@ -176,6 +183,7 @@ impl SenderContext {
             key,
             base_nonce,
             seq: 0,
+            exhausted: false,
             exporter_secret,
         })
     }
@@ -186,15 +194,28 @@ impl SenderContext {
         if self.suite.aead.is_export_only() {
             return Err(Error::ExportOnly);
         }
+        // Once the message limit has been reached, refuse *without* deriving
+        // or using a nonce. This makes the limit sticky so a caller that
+        // ignored the first error cannot trigger nonce reuse.
+        if self.exhausted {
+            return Err(Error::MessageLimitReached);
+        }
         let nonce = compute_nonce(&self.base_nonce, self.seq);
         let ct = self.suite.aead.seal(&self.key, &nonce, aad, pt)?;
-        increment_seq(&mut self.seq, self.suite.aead)?;
+        if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
+            self.exhausted = true;
+            return Err(e);
+        }
         Ok(ct)
     }
 
     /// `Export(exporter_context, L)` (RFC 9180 §5.3): derives `L` bytes
     /// of secret material from this context's exporter key.
-    pub fn export(&self, exporter_context: &[u8], length: usize) -> Vec<u8> {
+    ///
+    /// Returns [`Error::ExportLengthExceeded`] when `length` is larger than
+    /// the underlying KDF can produce (`255·Nh`), per RFC 9180 §5.3, rather
+    /// than panicking in the HKDF-Expand layer.
+    pub fn export(&self, exporter_context: &[u8], length: usize) -> Result<Vec<u8>, Error> {
         export(self.suite, &self.exporter_secret, exporter_context, length)
     }
 }
@@ -215,6 +236,7 @@ impl ReceiverContext {
             key,
             base_nonce,
             seq: 0,
+            exhausted: false,
             exporter_secret,
         })
     }
@@ -225,15 +247,22 @@ impl ReceiverContext {
         if self.suite.aead.is_export_only() {
             return Err(Error::ExportOnly);
         }
+        // Sticky limit — symmetric to [`SenderContext::seal`].
+        if self.exhausted {
+            return Err(Error::MessageLimitReached);
+        }
         let nonce = compute_nonce(&self.base_nonce, self.seq);
         let pt = self.suite.aead.open(&self.key, &nonce, aad, ct)?;
-        increment_seq(&mut self.seq, self.suite.aead)?;
+        if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
+            self.exhausted = true;
+            return Err(e);
+        }
         Ok(pt)
     }
 
     /// `Export(exporter_context, L)` — symmetric to
     /// [`SenderContext::export`].
-    pub fn export(&self, exporter_context: &[u8], length: usize) -> Vec<u8> {
+    pub fn export(&self, exporter_context: &[u8], length: usize) -> Result<Vec<u8>, Error> {
         export(self.suite, &self.exporter_secret, exporter_context, length)
     }
 }
@@ -245,7 +274,18 @@ fn export(
     exporter_secret: &[u8],
     exporter_context: &[u8],
     length: usize,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, Error> {
+    // HKDF-Expand can emit at most 255·Nh bytes; LabeledExpand additionally
+    // encodes L as I2OSP(L, 2), so L must also fit in u16. Reject over-long
+    // requests cleanly (RFC 9180 §5.3) instead of letting hkdf_expand panic.
+    let max = suite
+        .kdf
+        .output_len()
+        .saturating_mul(255)
+        .min(u16::MAX as usize);
+    if length > max {
+        return Err(Error::ExportLengthExceeded);
+    }
     let suite_id = suite.suite_id();
     let mut out = alloc::vec![0u8; length];
     labeled_expand(
@@ -256,7 +296,7 @@ fn export(
         exporter_context,
         &mut out,
     );
-    out
+    Ok(out)
 }
 
 /// `IncrementSeq()` (RFC 9180 §5.2): bumps `seq`, with overflow at
@@ -280,4 +320,74 @@ fn increment_seq(seq: &mut u64, aead: HpkeAead) -> Result<(), Error> {
     }
     *seq += 1;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+
+    fn aes128_suite() -> CipherSuite {
+        CipherSuite::new(
+            HpkeKem::DhkemX25519HkdfSha256,
+            HpkeKdf::HkdfSha256,
+            HpkeAead::Aes128Gcm,
+        )
+    }
+
+    fn sender_at(suite: CipherSuite, seq: u64) -> SenderContext {
+        SenderContext {
+            suite,
+            key: alloc::vec![0u8; suite.aead.key_len()],
+            base_nonce: alloc::vec![0u8; suite.aead.nonce_len()],
+            seq,
+            exhausted: false,
+            exporter_secret: alloc::vec![0u8; suite.kdf.output_len()],
+        }
+    }
+
+    /// Once the message limit is hit, the context is poisoned: every
+    /// subsequent `seal` fails *without* recomputing/using a nonce, so the
+    /// final nonce can never be reused (catastrophic AEAD nonce reuse).
+    #[test]
+    fn seal_poisons_after_limit_no_nonce_reuse() {
+        let suite = aes128_suite();
+        let mut ctx = sender_at(suite, u64::MAX);
+
+        // First seal at seq == u64::MAX: increment_seq detects the limit and
+        // returns the error; the context is now poisoned.
+        let first = ctx.seal(b"aad", b"pt");
+        assert_eq!(first, Err(Error::MessageLimitReached));
+        assert!(ctx.exhausted, "context must be poisoned after limit");
+        // seq must be unchanged at the saturation point.
+        assert_eq!(ctx.seq, u64::MAX);
+
+        // A caller that ignored the error and tries again must still fail,
+        // again without using a nonce.
+        let second = ctx.seal(b"aad", b"pt");
+        assert_eq!(second, Err(Error::MessageLimitReached));
+        assert_eq!(ctx.seq, u64::MAX);
+    }
+
+    /// `Export` rejects over-long lengths (RFC 9180 §5.3) instead of
+    /// panicking inside HKDF-Expand.
+    #[test]
+    fn export_rejects_overlong_length() {
+        let suite = aes128_suite();
+        let ctx = sender_at(suite, 0);
+        let max = suite.kdf.output_len() * 255;
+
+        // At the boundary it succeeds.
+        assert!(ctx.export(b"ctx", max).is_ok());
+        // One byte over the KDF maximum is rejected cleanly.
+        assert_eq!(
+            ctx.export(b"ctx", max + 1),
+            Err(Error::ExportLengthExceeded)
+        );
+        // A huge request is also rejected (and never panics).
+        assert_eq!(
+            ctx.export(b"ctx", usize::MAX),
+            Err(Error::ExportLengthExceeded)
+        );
+    }
 }
