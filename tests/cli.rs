@@ -1060,6 +1060,23 @@ fn genpkey_ed25519_then_inspect() {
 }
 
 #[test]
+fn genpkey_ed448_then_inspect() {
+    let (key_pem, ok) = run(&["genpkey", "-algorithm", "ED448"], b"");
+    assert!(ok);
+    assert!(key_pem.contains("BEGIN PRIVATE KEY"));
+
+    // Public key extraction (PKIX SPKI).
+    let (pub_pem, ok) = run(&["pkey", "-pubout"], key_pem.as_bytes());
+    assert!(ok);
+    assert!(pub_pem.contains("BEGIN PUBLIC KEY"));
+
+    // Text inspection names the algorithm.
+    let (text, ok) = run(&["pkey", "-text"], key_pem.as_bytes());
+    assert!(ok);
+    assert!(text.contains("Ed448"));
+}
+
+#[test]
 fn genpkey_ml_dsa_65_roundtrip() {
     let (pem, ok) = run(&["genpkey", "-algorithm", "ML-DSA-65"], b"");
     assert!(ok);
@@ -2122,6 +2139,93 @@ fn kex_x25519_round_trip() {
 }
 
 #[test]
+fn kex_x448_round_trip() {
+    let dir = std::env::temp_dir().join(format!("pc_kex448_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // RFC 7748 §6.2 X448 private scalars; derive the public keys via the
+    // library and confirm the CLI's `kex` agrees on one shared secret both
+    // ways.
+    use purecrypto::ec::x448::X448PrivateKey;
+    let a_priv = "9a8f4925d1519f5775cf46b04b5800d4ee9ee8bae8bc5565d498c28d\
+                  d9c9baf574a9419744897391006382a6f127ab1d9ac2d8c0a598726b";
+    let b_priv = "1c306a7ac2a0e2e0990b294470cba339e6453772b075811d8fad0d1d\
+                  6927c120bb5ee8972b0d3e21374c9c921b09d1b0366f10b65173992d";
+    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+
+    let priv_bytes = |s: &str| {
+        let s = strip(s);
+        let mut out = [0u8; 56];
+        for i in 0..56 {
+            out[i] = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).unwrap();
+        }
+        out
+    };
+    let hex = |b: &[u8]| {
+        b.iter().fold(String::new(), |mut s, x| {
+            s.push_str(&format!("{x:02x}"));
+            s
+        })
+    };
+    let a_pub_hex = hex(&X448PrivateKey::from_bytes(priv_bytes(a_priv)).public_key());
+    let b_pub_hex = hex(&X448PrivateKey::from_bytes(priv_bytes(b_priv)).public_key());
+
+    use std::io::Write;
+    let write = |name: &str, data: &str| {
+        std::fs::File::create(dir.join(name))
+            .unwrap()
+            .write_all(data.as_bytes())
+            .unwrap();
+    };
+    write("a_priv.hex", &strip(a_priv));
+    write("b_priv.hex", &strip(b_priv));
+    write("a_pub.hex", &a_pub_hex);
+    write("b_pub.hex", &b_pub_hex);
+
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "X448",
+                "-key",
+                &p("a_priv.hex"),
+                "-peer",
+                &p("b_pub.hex"),
+                "-out",
+                &p("ss_a.bin")
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "kex",
+                "-alg",
+                "X448",
+                "-key",
+                &p("b_priv.hex"),
+                "-peer",
+                &p("a_pub.hex"),
+                "-out",
+                &p("ss_b.bin")
+            ],
+            b""
+        )
+        .1
+    );
+
+    let s1 = std::fs::read(dir.join("ss_a.bin")).unwrap();
+    let s2 = std::fs::read(dir.join("ss_b.bin")).unwrap();
+    assert_eq!(s1, s2, "X448 shared secrets must match");
+    assert_eq!(s1.len(), 56);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn kex_ecdh_p256_round_trip() {
     let dir = std::env::temp_dir().join(format!("pc_ecdh_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -2347,6 +2451,57 @@ fn pkeyutl_ed25519_sign_verify() {
     assert!(ok);
     std::fs::write(dir.join("ed.pub"), pub_pem).unwrap();
     std::fs::write(dir.join("msg.bin"), b"ed25519 message").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("ed.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (_vout, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("ed.pub"),
+            "-sigfile",
+            &p("sig.bin"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pkeyutl_ed448_sign_verify() {
+    let dir = std::env::temp_dir().join(format!("pc_ed448_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "ED448", "-out", &p("ed.key")],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("ed.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("ed.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"ed448 message").unwrap();
 
     assert!(
         run(

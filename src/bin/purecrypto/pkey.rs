@@ -1,7 +1,7 @@
 //! `purecrypto pkey -in key.pem [-pubout] [-text]` — inspect or convert a key.
 
 use crate::util::{Args, die, read_input, write_output, write_output_with_mode};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
 use purecrypto::rsa::BoxedRsaPrivateKey;
@@ -16,6 +16,7 @@ enum Key {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    Ed448(Ed448PrivateKey),
     MlDsa44(MlDsa44PrivateKey),
     MlDsa65(MlDsa65PrivateKey),
     MlDsa87(MlDsa87PrivateKey),
@@ -38,6 +39,9 @@ fn curve_name(c: CurveId) -> &'static str {
 fn parse_pkcs8(pem: &str) -> Option<Key> {
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
         return Some(Key::Ed25519(k));
+    }
+    if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(pem) {
+        return Some(Key::Ed448(k));
     }
     if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(pem) {
         return Some(Key::MlDsa65(k));
@@ -91,6 +95,7 @@ pub(crate) fn run(args: Args) {
             ),
             Key::Ec(k) => format!("EC private key, curve {}\n", curve_name(k.curve())),
             Key::Ed25519(_) => "Ed25519 private key\n".to_string(),
+            Key::Ed448(_) => "Ed448 private key\n".to_string(),
             Key::MlDsa44(_) => "ML-DSA-44 private key\n".to_string(),
             Key::MlDsa65(_) => "ML-DSA-65 private key\n".to_string(),
             Key::MlDsa87(_) => "ML-DSA-87 private key\n".to_string(),
@@ -108,6 +113,7 @@ pub(crate) fn run(args: Args) {
             Key::Rsa(k) => AnyPublicKey::Rsa(k.public_key()).to_spki_pem(),
             Key::Ec(k) => AnyPublicKey::Ecdsa(k.public_key()).to_spki_pem(),
             Key::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()).to_spki_pem(),
+            Key::Ed448(k) => AnyPublicKey::Ed448(k.public_key()).to_spki_pem(),
             Key::MlDsa44(k) => k.public_key().to_spki_pem(),
             Key::MlDsa65(k) => k.public_key().to_spki_pem(),
             Key::MlDsa87(k) => k.public_key().to_spki_pem(),
@@ -130,6 +136,7 @@ pub(crate) fn run(args: Args) {
         Key::Rsa(_) => write_output_with_mode(dest, raw.as_slice(), private),
         Key::Ec(k) => write_output_with_mode(dest, k.to_sec1_pem().as_bytes(), private),
         Key::Ed25519(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
+        Key::Ed448(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
         Key::MlDsa44(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
         Key::MlDsa65(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
         Key::MlDsa87(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),

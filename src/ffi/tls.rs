@@ -15,7 +15,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::common::{PcStatus, guard, out_write, slice};
-use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
+use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
     ClientAuth, Config, ConfigBuilder, Connection, CrlStore, HandshakeStatus, ProtocolVersion,
@@ -102,6 +102,7 @@ enum PcKey {
     Rsa(BoxedRsaPrivateKey),
     Ecdsa(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    Ed448(Ed448PrivateKey),
 }
 
 impl PcKey {
@@ -110,6 +111,7 @@ impl PcKey {
             PcKey::Rsa(k) => SigningKey::Rsa(k.clone()),
             PcKey::Ecdsa(k) => SigningKey::Ecdsa(k.clone()),
             PcKey::Ed25519(k) => SigningKey::Ed25519(k.clone()),
+            PcKey::Ed448(k) => SigningKey::Ed448(k.clone()),
         }
     }
 }
@@ -282,7 +284,7 @@ pub unsafe extern "C" fn pc_tls_cfg_set_server_name(
 }
 
 /// Installs a certificate chain (concatenated PEM, leaf first) plus a private
-/// key (PEM). Detects RSA / EC / Ed25519 from the key PEM.
+/// key (PEM). Detects RSA / EC / Ed25519 / Ed448 from the key PEM.
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -329,6 +331,8 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
             PcKey::Ecdsa(k)
         } else if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(key_str) {
             PcKey::Ed25519(k)
+        } else if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(key_str) {
+            PcKey::Ed448(k)
         } else {
             return PcStatus::BadEncoding;
         };

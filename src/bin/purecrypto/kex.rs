@@ -1,9 +1,12 @@
-//! `purecrypto kex -alg X25519|ECDH-P256|ECDH-P384|ECDH-P521 -key FILE -peer FILE -out FILE`
+//! `purecrypto kex -alg X25519|X448|ECDH-P256|ECDH-P384|ECDH-P521 -key FILE -peer FILE -out FILE`
 //! — derive a Diffie-Hellman shared secret.
 
 use crate::util::{Args, die, write_output_with_mode};
 use purecrypto::der::{Reader, pem_decode, tag};
-use purecrypto::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId, x25519::X25519PrivateKey};
+use purecrypto::ec::{
+    BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId, x448::X448PrivateKey,
+    x25519::X25519PrivateKey,
+};
 use purecrypto::x509::AnyPublicKey;
 
 /// Parses the private scalar `d` (big-endian) out of a SEC1 `EC PRIVATE KEY`
@@ -47,7 +50,7 @@ pub(crate) fn run(args: Args) {
     let alg = args
         .value("-alg")
         .or_else(|| args.value("--alg"))
-        .unwrap_or_else(|| die("missing -alg X25519|ECDH-P256|ECDH-P384|ECDH-P521"));
+        .unwrap_or_else(|| die("missing -alg X25519|X448|ECDH-P256|ECDH-P384|ECDH-P521"));
     let key_path = args
         .value("-key")
         .or_else(|| args.value("--key"))
@@ -79,6 +82,19 @@ pub(crate) fn run(args: Args) {
             let sk = X25519PrivateKey::from_bytes(scalar);
             sk.diffie_hellman(&peer)
                 .unwrap_or_else(|e| die(format!("X25519: {e}")))
+                .to_vec()
+        }
+        "X448" => {
+            // X448 likewise has no PKCS#8 plumbing yet — accept either a
+            // 56-byte binary scalar or a 112-character hex scalar for both
+            // `-key` and `-peer`.
+            let scalar = parse_raw_or_hex_56(&key_bytes)
+                .unwrap_or_else(|| die("-key must be a 56-byte X448 scalar (raw or hex)"));
+            let peer = parse_raw_or_hex_56(&peer_bytes)
+                .unwrap_or_else(|| die("-peer must be a 56-byte X448 public key (raw or hex)"));
+            let sk = X448PrivateKey::from_bytes(scalar);
+            sk.diffie_hellman(&peer)
+                .unwrap_or_else(|e| die(format!("X448: {e}")))
                 .to_vec()
         }
         a if a.starts_with("ECDH-") => {
@@ -134,6 +150,24 @@ fn parse_raw_or_hex_32(bytes: &[u8]) -> Option<[u8; 32]> {
     let dec = crate::util::from_hex(s)?;
     if dec.len() == 32 {
         let mut out = [0u8; 32];
+        out.copy_from_slice(&dec);
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn parse_raw_or_hex_56(bytes: &[u8]) -> Option<[u8; 56]> {
+    if bytes.len() == 56 {
+        let mut out = [0u8; 56];
+        out.copy_from_slice(bytes);
+        return Some(out);
+    }
+    // Treat as hex (ignoring whitespace).
+    let s = core::str::from_utf8(bytes).ok()?;
+    let dec = crate::util::from_hex(s)?;
+    if dec.len() == 56 {
+        let mut out = [0u8; 56];
         out.copy_from_slice(&dec);
         Some(out)
     } else {

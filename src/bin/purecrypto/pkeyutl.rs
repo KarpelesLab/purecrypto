@@ -1,7 +1,9 @@
 //! `purecrypto pkeyutl` — generic asymmetric encrypt/decrypt/sign/verify.
 
 use crate::util::{Args, die, read_input, write_output};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed25519PrivateKey};
+use purecrypto::ec::{
+    BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed448PrivateKey, Ed25519PrivateKey,
+};
 use purecrypto::hash::{Sha1, Sha256, Sha384, Sha512};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::rng::OsRng;
@@ -74,6 +76,7 @@ enum PrivKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    Ed448(Ed448PrivateKey),
     MlDsa44(MlDsa44PrivateKey),
     MlDsa65(MlDsa65PrivateKey),
     MlDsa87(MlDsa87PrivateKey),
@@ -92,6 +95,9 @@ fn load_priv(path: &str) -> PrivKey {
     }
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
         return PrivKey::Ed25519(k);
+    }
+    if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(pem) {
+        return PrivKey::Ed448(k);
     }
     if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(pem) {
         return PrivKey::MlDsa65(k);
@@ -270,6 +276,7 @@ fn run_sign(args: Args) {
             sig.to_der(curve)
         }
         PrivKey::Ed25519(k) => k.sign(&msg).to_bytes().to_vec(),
+        PrivKey::Ed448(k) => k.sign(&msg).to_bytes().to_vec(),
         PrivKey::MlDsa44(k) => k
             .sign(&mut OsRng, &msg, b"")
             .unwrap_or_else(|e| die(format!("ML-DSA-44 sign failed: {e:?}"))),
@@ -351,6 +358,13 @@ fn run_verify(args: Args) {
             use purecrypto::ec::Ed25519Signature;
             match <[u8; 64]>::try_from(sig.as_slice()) {
                 Ok(b) => k.verify(&msg, &Ed25519Signature::from_bytes(b)).is_ok(),
+                Err(_) => false,
+            }
+        }
+        AnyPublicKey::Ed448(k) => {
+            use purecrypto::ec::Ed448Signature;
+            match <[u8; 114]>::try_from(sig.as_slice()) {
+                Ok(b) => k.verify(&msg, &Ed448Signature::from_bytes(b)).is_ok(),
                 Err(_) => false,
             }
         }

@@ -13,8 +13,8 @@
  *   - AES key wrap — RFC 3394 / 5649 (pc_aes_kw_*, pc_aes_kwp_*)
  *   - Randomness   — pc_rand_bytes
  *   - RSA          — keygen, PKCS#1 v1.5 + PSS sign/verify, OAEP enc/dec
- *   - ECDSA / Ed25519 — keygen + sign/verify
- *   - ECDH / X25519   — pc_ecdh, pc_x25519
+ *   - ECDSA / Ed25519 / Ed448 — keygen + sign/verify
+ *   - ECDH / X25519 / X448 — pc_ecdh, pc_x25519, pc_x448
  *   - ML-KEM       — FIPS 203 keygen, encaps, decaps (pc_mlkem_*)
  *   - ML-DSA       — FIPS 204 keygen, sign, verify (pc_mldsa_*)
  *   - SLH-DSA      — FIPS 205 keygen, sign, verify (pc_slhdsa_*)
@@ -157,6 +157,7 @@ typedef struct PcHash PcHash;
 typedef struct PcRsaKey PcRsaKey;
 typedef struct PcEcKey PcEcKey;
 typedef struct PcEd25519Key PcEd25519Key;
+typedef struct PcEd448Key PcEd448Key;
 typedef struct PcCert PcCert;
 typedef struct PcMlKem PcMlKem;
 typedef struct PcMlDsa PcMlDsa;
@@ -290,6 +291,13 @@ pc_status pc_ecdh(int32_t curve, const uint8_t *priv_be, size_t priv_len,
 pc_status pc_x25519(const uint8_t *scalar, const uint8_t *peer, uint8_t *out);
 pc_status pc_x25519_public(const uint8_t *scalar, uint8_t *out);
 
+/* ---- X448 (RFC 7748) ----
+ * 56-byte scalar / peer / output. Returns PC_VERIFICATION when `peer` is a
+ * small-order point.
+ */
+pc_status pc_x448(const uint8_t *scalar, const uint8_t *peer, uint8_t *out);
+pc_status pc_x448_public(const uint8_t *scalar, uint8_t *out);
+
 /* ---- Ed25519 ---- */
 PcEd25519Key *pc_ed25519_generate(void);
 PcEd25519Key *pc_ed25519_from_pem(const uint8_t *pem, size_t len);
@@ -303,6 +311,23 @@ pc_status pc_ed25519_verify(const uint8_t *spki, size_t spki_len,
                             const uint8_t *msg, size_t msg_len,
                             const uint8_t *sig, size_t sig_len);
 void pc_ed25519_free(PcEd25519Key *key);
+
+/* ---- Ed448 ----
+ * Signatures are the raw 114-byte R||S; the empty context is used (pure
+ * Ed448, RFC 8032 section 5.2).
+ */
+PcEd448Key *pc_ed448_generate(void);
+PcEd448Key *pc_ed448_from_pem(const uint8_t *pem, size_t len);
+pc_status pc_ed448_private_to_pem(const PcEd448Key *key, uint8_t *out,
+                                  size_t *out_len);
+pc_status pc_ed448_public_to_pem(const PcEd448Key *key, uint8_t *out,
+                                 size_t *out_len);
+pc_status pc_ed448_sign(const PcEd448Key *key, const uint8_t *msg,
+                        size_t msg_len, uint8_t *out, size_t *out_len);
+pc_status pc_ed448_verify(const uint8_t *spki, size_t spki_len,
+                          const uint8_t *msg, size_t msg_len,
+                          const uint8_t *sig, size_t sig_len);
+void pc_ed448_free(PcEd448Key *key);
 
 /* ---- X.509 ---- */
 PcCert *pc_cert_from_pem(const uint8_t *pem, size_t len);

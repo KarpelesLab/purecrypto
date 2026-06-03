@@ -21,7 +21,7 @@ use crate::pki::{
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{Args, die, write_output, write_output_with_mode};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
 use purecrypto::x509::extension::{Extension, GeneralName};
@@ -106,6 +106,7 @@ enum RootKey {
     Rsa(BoxedRsaPrivateKey),
     Ec(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    Ed448(Ed448PrivateKey),
 }
 
 impl RootKey {
@@ -114,6 +115,7 @@ impl RootKey {
             RootKey::Rsa(k) => CertSigner::Rsa(k),
             RootKey::Ec(k) => CertSigner::Ecdsa(k),
             RootKey::Ed25519(k) => CertSigner::Ed25519(k),
+            RootKey::Ed448(k) => CertSigner::Ed448(k),
         }
     }
 }
@@ -133,6 +135,9 @@ fn load_root_key(ca: &CaDir) -> RootKey {
     }
     if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
         return RootKey::Ed25519(k);
+    }
+    if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(pem) {
+        return RootKey::Ed448(k);
     }
     die(format!("cannot parse {}", ca.root_key().display()))
 }
@@ -288,8 +293,12 @@ fn run_init(args: Args) {
             let k = Ed25519PrivateKey::generate(&mut OsRng);
             (k.to_pkcs8_pem(), RootKey::Ed25519(k))
         }
+        "ED448" => {
+            let k = Ed448PrivateKey::generate(&mut OsRng);
+            (k.to_pkcs8_pem(), RootKey::Ed448(k))
+        }
         other => die(format!(
-            "unsupported -algorithm {other} (try EC, RSA, ED25519)"
+            "unsupported -algorithm {other} (try EC, RSA, ED25519, ED448)"
         )),
     };
 
@@ -812,7 +821,7 @@ const USAGE: &str = "\
 purecrypto ca — manage a development CA
 
 USAGE:
-    purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519] [-curve P-256] [-days N]
+    purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519|ED448] [-curve P-256] [-days N]
     purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH]
     purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-template NAME] [-template-file PATH]
     purecrypto ca revoke  -dir DIR -serial 7|0x7 [-reason key-compromise|superseded|...]

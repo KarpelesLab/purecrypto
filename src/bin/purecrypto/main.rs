@@ -42,7 +42,7 @@ COMMANDS:
     kdf <subcmd>         HKDF / PBKDF2 / scrypt / Argon2 key derivation
     enc                  AEAD encrypt/decrypt + AES-KW/KWP wrap/unwrap
     kem <subcmd>         ML-KEM keygen / encaps / decaps
-    kex                  X25519 / ECDH key exchange (shared secret)
+    kex                  X25519 / X448 / ECDH key exchange (shared secret)
     pkeyutl <subcmd>     Generic asymmetric encrypt/decrypt/sign/verify
     rand <nbytes>        Emit cryptographically secure random bytes
     genpkey              Generate an RSA or EC private key

@@ -1,8 +1,9 @@
-//! `purecrypto genpkey` — generate an RSA or EC private key (PEM).
+//! `purecrypto genpkey` — generate an RSA, EC, Ed25519/Ed448, ML-DSA, ML-KEM,
+//! or SLH-DSA private key (PEM).
 
 use crate::util::{Args, die, write_output_with_mode};
 use purecrypto::bignum::{BoxedUint, Uint};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
 use purecrypto::rng::OsRng;
@@ -48,7 +49,7 @@ pub(crate) fn run(args: Args) {
         .unwrap_or_else(|| {
             die(
                 "usage: purecrypto genpkey -algorithm ALG [-bits N|-curve NAME] [-out file]\n  \
-                 ALG: RSA | EC | ED25519 | ML-DSA-{44,65,87} | ML-KEM-{512,768,1024} | \
+                 ALG: RSA | EC | ED25519 | ED448 | ML-DSA-{44,65,87} | ML-KEM-{512,768,1024} | \
                  SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}",
             )
         });
@@ -104,6 +105,7 @@ pub(crate) fn run(args: Args) {
             BoxedEcdsaPrivateKey::generate(curve, &mut OsRng).to_sec1_pem()
         }
         "ED25519" => Ed25519PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
+        "ED448" => Ed448PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
         "ML-DSA-44" => MlDsa44PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         "ML-DSA-65" => MlDsa65PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
         "ML-DSA-87" => MlDsa87PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
@@ -117,7 +119,7 @@ pub(crate) fn run(args: Args) {
                     .to_pkcs8_pem()
             } else {
                 die(format!(
-                    "unknown algorithm: {other} (RSA | EC | ED25519 | ML-DSA-44/65/87 | \
+                    "unknown algorithm: {other} (RSA | EC | ED25519 | ED448 | ML-DSA-44/65/87 | \
                      ML-KEM-512/768/1024 | SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
                 ))
             }
