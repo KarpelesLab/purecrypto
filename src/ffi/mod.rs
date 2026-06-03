@@ -32,15 +32,18 @@ mod csr;
 mod ec;
 mod hash;
 mod kdf;
+mod lms;
 mod mldsa;
 mod mlkem;
 mod quic;
 mod rng;
 mod rsa;
 mod slhdsa;
+mod sm2;
 mod tls;
 mod x25519;
 mod x509;
+mod xmss;
 
 pub use common::PcStatus;
 

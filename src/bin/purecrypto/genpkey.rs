@@ -3,12 +3,16 @@
 
 use crate::util::{Args, die, write_output_with_mode};
 use purecrypto::bignum::{BoxedUint, Uint};
-use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
+use purecrypto::ec::{
+    BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey, Sm2PrivateKey,
+};
+use purecrypto::lms::{HssPrivateKey, LmotsType, LmsPrivateKey, LmsType};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
 use purecrypto::slhdsa::{self, ParamSet as SlhDsa};
+use purecrypto::xmss::{XmssMtParamSet, XmssMtPrivateKey, XmssParamSet, XmssPrivateKey};
 
 const E: u64 = 65537;
 const ROUNDS: usize = 20;
@@ -42,6 +46,137 @@ fn slhdsa_from_name(name: &str) -> Option<SlhDsa> {
     })
 }
 
+/// Maps an LMS tree-height token (`H5`..`H25`) to an [`LmsType`].
+fn lms_height(tok: &str) -> Option<LmsType> {
+    Some(match tok {
+        "H5" => LmsType::Sha256M32H5,
+        "H10" => LmsType::Sha256M32H10,
+        "H15" => LmsType::Sha256M32H15,
+        "H20" => LmsType::Sha256M32H20,
+        "H25" => LmsType::Sha256M32H25,
+        _ => return None,
+    })
+}
+
+/// Maps an LM-OTS Winternitz token (`W1`/`W2`/`W4`/`W8`) to an [`LmotsType`].
+fn lmots_w(tok: &str) -> Option<LmotsType> {
+    Some(match tok {
+        "W1" => LmotsType::Sha256N32W1,
+        "W2" => LmotsType::Sha256N32W2,
+        "W4" => LmotsType::Sha256N32W4,
+        "W8" => LmotsType::Sha256N32W8,
+        _ => return None,
+    })
+}
+
+/// Parses an LMS algorithm name `LMS-SHA256-H{5,10,15,20,25}[-W{1,2,4,8}]`
+/// (default `W8`) into a single-tree parameter pair.
+fn lms_from_name(name: &str) -> Option<(LmsType, LmotsType)> {
+    let parts: Vec<&str> = name.split('-').collect();
+    // LMS - SHA256 - Hx [ - Wy ]
+    if parts.len() < 3 || parts[0] != "LMS" || parts[1] != "SHA256" {
+        return None;
+    }
+    let lms = lms_height(parts[2])?;
+    let ots = match parts.get(3) {
+        Some(w) => lmots_w(w)?,
+        None => LmotsType::Sha256N32W8,
+    };
+    Some((lms, ots))
+}
+
+/// Parses an HSS algorithm name `HSS-L{1..8}-SHA256-H{..}[-W{..}]` into `L`
+/// identical levels of the given single-tree parameters.
+fn hss_from_name(name: &str) -> Option<Vec<(LmsType, LmotsType)>> {
+    let parts: Vec<&str> = name.split('-').collect();
+    // HSS - Ln - SHA256 - Hx [ - Wy ]
+    if parts.len() < 4 || parts[0] != "HSS" {
+        return None;
+    }
+    let levels: usize = parts[1].strip_prefix('L')?.parse().ok()?;
+    if !(1..=8).contains(&levels) {
+        return None;
+    }
+    if parts[2] != "SHA256" {
+        return None;
+    }
+    let lms = lms_height(parts[3])?;
+    let ots = match parts.get(4) {
+        Some(w) => lmots_w(w)?,
+        None => LmotsType::Sha256N32W8,
+    };
+    Some(vec![(lms, ots); levels])
+}
+
+/// Recognizes an XMSS parameter-set name, e.g. `XMSS-SHA2_10_256`,
+/// `XMSS-SHAKE_16_256`, `XMSS-SHA2_20_192` (the RFC 8391 / SP 800-208 names,
+/// hyphen- or underscore-separated).
+fn xmss_from_name(name: &str) -> Option<XmssParamSet> {
+    let n = name.strip_prefix("XMSS-")?.replace('-', "_");
+    Some(match n.as_str() {
+        "SHA2_10_256" => XmssParamSet::Sha2_10_256,
+        "SHA2_16_256" => XmssParamSet::Sha2_16_256,
+        "SHA2_20_256" => XmssParamSet::Sha2_20_256,
+        "SHAKE_10_256" => XmssParamSet::Shake_10_256,
+        "SHAKE_16_256" => XmssParamSet::Shake_16_256,
+        "SHAKE_20_256" => XmssParamSet::Shake_20_256,
+        "SHA2_10_192" => XmssParamSet::Sha2_10_192,
+        "SHA2_16_192" => XmssParamSet::Sha2_16_192,
+        "SHA2_20_192" => XmssParamSet::Sha2_20_192,
+        "SHAKE256_10_256" => XmssParamSet::Shake256_10_256,
+        "SHAKE256_16_256" => XmssParamSet::Shake256_16_256,
+        "SHAKE256_20_256" => XmssParamSet::Shake256_20_256,
+        _ => return None,
+    })
+}
+
+/// Recognizes an XMSS^MT parameter-set name, e.g. `XMSSMT-SHA2_20/2_256`.
+fn xmssmt_from_name(name: &str) -> Option<XmssMtParamSet> {
+    let n = name.strip_prefix("XMSSMT-")?.replace(['-', '/'], "_");
+    Some(match n.as_str() {
+        "SHA2_20_2_256" => XmssMtParamSet::Sha2_20_2_256,
+        "SHA2_20_4_256" => XmssMtParamSet::Sha2_20_4_256,
+        "SHA2_40_2_256" => XmssMtParamSet::Sha2_40_2_256,
+        "SHA2_40_4_256" => XmssMtParamSet::Sha2_40_4_256,
+        "SHA2_40_8_256" => XmssMtParamSet::Sha2_40_8_256,
+        "SHA2_60_3_256" => XmssMtParamSet::Sha2_60_3_256,
+        "SHA2_60_6_256" => XmssMtParamSet::Sha2_60_6_256,
+        "SHA2_60_12_256" => XmssMtParamSet::Sha2_60_12_256,
+        "SHAKE_20_2_256" => XmssMtParamSet::Shake_20_2_256,
+        "SHAKE_20_4_256" => XmssMtParamSet::Shake_20_4_256,
+        _ => return None,
+    })
+}
+
+/// Generates a stateful hash-based signing key (LMS/HSS/XMSS/XMSS^MT) and
+/// returns its raw serialized private-key bytes (`to_bytes`), or `None` if
+/// `algorithm` is not a stateful algorithm name.
+///
+/// The bytes embed the live one-time-key index; the CLI writes them verbatim
+/// and `pkeyutl sign` rewrites the file after every signature (see `pkeyutl`).
+fn stateful_key_bytes(algorithm: &str) -> Option<Vec<u8>> {
+    let up = algorithm.to_ascii_uppercase();
+    if let Some((lms, ots)) = lms_from_name(&up) {
+        return Some(LmsPrivateKey::generate(lms, ots, &mut OsRng).to_bytes());
+    }
+    if let Some(levels) = hss_from_name(&up) {
+        let sk = HssPrivateKey::generate(&levels, &mut OsRng)
+            .unwrap_or_else(|e| die(format!("HSS keygen failed: {e:?}")));
+        return Some(sk.to_bytes());
+    }
+    if up.starts_with("XMSSMT-") {
+        let set = xmssmt_from_name(&up)
+            .unwrap_or_else(|| die(format!("unknown XMSS^MT parameter set: {algorithm}")));
+        return Some(XmssMtPrivateKey::generate(set, &mut OsRng).to_bytes());
+    }
+    if up.starts_with("XMSS-") {
+        let set = xmss_from_name(&up)
+            .unwrap_or_else(|| die(format!("unknown XMSS parameter set: {algorithm}")));
+        return Some(XmssPrivateKey::generate(set, &mut OsRng).to_bytes());
+    }
+    None
+}
+
 pub(crate) fn run(args: Args) {
     let algorithm = args
         .value("-algorithm")
@@ -49,11 +184,21 @@ pub(crate) fn run(args: Args) {
         .unwrap_or_else(|| {
             die(
                 "usage: purecrypto genpkey -algorithm ALG [-bits N|-curve NAME] [-out file]\n  \
-                 ALG: RSA | EC | ED25519 | ED448 | ML-DSA-{44,65,87} | ML-KEM-{512,768,1024} | \
-                 SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}",
+                 ALG: RSA | EC | SM2 | ED25519 | ED448 | ML-DSA-{44,65,87} | \
+                 ML-KEM-{512,768,1024} | SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f} | \
+                 LMS-SHA256-H{5,10,15,20,25}[-W{1,2,4,8}] | HSS-L{1..8}-SHA256-H..[-W..] | \
+                 XMSS-{SHA2,SHAKE,SHAKE256}_{10,16,20}_{192,256} | XMSSMT-SHA2_{20,40,60}/L_256",
             )
         });
     let dest = args.value("-out");
+
+    // Stateful hash-based signatures (LMS/HSS/XMSS/XMSS^MT) are serialized as
+    // RAW private-key bytes (not PEM): the bytes embed the live one-time-key
+    // index that `pkeyutl sign` must rewrite after each signature.
+    if let Some(bytes) = stateful_key_bytes(algorithm) {
+        write_output_with_mode(dest, &bytes, /* private = */ true);
+        return;
+    }
 
     let pem = match algorithm.to_ascii_uppercase().as_str() {
         "RSA" => {
@@ -104,6 +249,7 @@ pub(crate) fn run(args: Args) {
                 curve_from_name(name).unwrap_or_else(|| die(format!("unknown curve: {name}")));
             BoxedEcdsaPrivateKey::generate(curve, &mut OsRng).to_sec1_pem()
         }
+        "SM2" => Sm2PrivateKey::generate(&mut OsRng).to_sec1_pem(),
         "ED25519" => Ed25519PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
         "ED448" => Ed448PrivateKey::generate(&mut OsRng).to_pkcs8_pem(),
         "ML-DSA-44" => MlDsa44PrivateKey::generate(&mut OsRng).0.to_pkcs8_pem(),
@@ -119,8 +265,9 @@ pub(crate) fn run(args: Args) {
                     .to_pkcs8_pem()
             } else {
                 die(format!(
-                    "unknown algorithm: {other} (RSA | EC | ED25519 | ED448 | ML-DSA-44/65/87 | \
-                     ML-KEM-512/768/1024 | SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
+                    "unknown algorithm: {other} (RSA | EC | SM2 | ED25519 | ED448 | \
+                     ML-DSA-44/65/87 | ML-KEM-512/768/1024 | \
+                     SLH-DSA-{{SHA2,SHAKE}}-{{128,192,256}}{{s,f}})"
                 ))
             }
         }
