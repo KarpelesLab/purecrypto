@@ -26,6 +26,40 @@ fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
     s[b] = (s[b] ^ s[c]).rotate_left(7);
 }
 
+/// HChaCha20 (draft-irtf-cfrg-xchacha §2.2): a keyed hash producing a 256-bit
+/// subkey from a 256-bit key and a 128-bit nonce. It runs the 20-round ChaCha20
+/// permutation over `constants ‖ key ‖ nonce16` and returns the first and last
+/// four state words **without** the final feed-forward addition. Used to derive
+/// the per-message subkey in XChaCha20-Poly1305.
+pub(crate) fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
+    let mut s = [0u32; 16];
+    s[0..4].copy_from_slice(&CONSTANTS);
+    for (word, chunk) in s[4..12].iter_mut().zip(key.chunks_exact(4)) {
+        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    for (word, chunk) in s[12..16].iter_mut().zip(nonce16.chunks_exact(4)) {
+        *word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+
+    for _ in 0..10 {
+        quarter_round(&mut s, 0, 4, 8, 12);
+        quarter_round(&mut s, 1, 5, 9, 13);
+        quarter_round(&mut s, 2, 6, 10, 14);
+        quarter_round(&mut s, 3, 7, 11, 15);
+        quarter_round(&mut s, 0, 5, 10, 15);
+        quarter_round(&mut s, 1, 6, 11, 12);
+        quarter_round(&mut s, 2, 7, 8, 13);
+        quarter_round(&mut s, 3, 4, 9, 14);
+    }
+
+    let mut out = [0u8; 32];
+    // Output words 0..=3 followed by 12..=15 (no final add).
+    for (i, &idx) in [0usize, 1, 2, 3, 12, 13, 14, 15].iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&s[idx].to_le_bytes());
+    }
+    out
+}
+
 /// A ChaCha20 cipher keyed with a 256-bit key.
 #[derive(Clone)]
 pub struct ChaCha20 {
@@ -125,6 +159,19 @@ mod tests {
                 "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e\
                  d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e"
             )
+        );
+    }
+
+    #[test]
+    fn xchacha_draft_hchacha20() {
+        // draft-irtf-cfrg-xchacha §2.2.1 test vector.
+        let key =
+            from_hex::<32>("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        let nonce = from_hex::<16>("000000090000004a0000000031415927");
+        let out = hchacha20(&key, &nonce);
+        assert_eq!(
+            out,
+            from_hex::<32>("82413b4227b27bfed30e42508a877d73a0f9e4d58a74a853c12ec41326d3ecdc")
         );
     }
 
