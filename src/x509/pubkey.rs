@@ -245,7 +245,7 @@ impl AnyPublicKey {
     /// ([`Certificate::verify_signature_with`](crate::x509::Certificate::verify_signature_with),
     /// the CRL/CSR/OCSP verifiers); none of them impose a strength whitelist.
     /// Callers MUST apply their own policy — the TLS path gates every signature
-    /// through `SignaturePolicy::permits` in [`crate::tls::pki::verify`] before
+    /// through `SignaturePolicy::permits` in `tls::pki::verify` before
     /// trusting it. Do not treat a successful return as evidence the algorithm
     /// is acceptable.
     pub fn verify(&self, sig_alg: &[u64], msg: &[u8], sig: &[u8]) -> Result<(), Error> {

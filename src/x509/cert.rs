@@ -580,13 +580,13 @@ impl Certificate {
     /// confusion gap where an attacker pairs a strong inner algid with a weak
     /// (attacker-controlled) outer one. The check is idempotent, so callers
     /// such as the TLS path that already invoke
-    /// [`check_signature_algid_consistent`](Self::check_signature_algid_consistent)
+    /// `check_signature_algid_consistent`
     /// separately remain correct.
     ///
     /// SECURITY: this method applies **no** signature-algorithm-strength or
     /// key-size policy. A SHA-1- or MD5-based signature, or an undersized RSA
     /// key, will verify **successfully** here. Callers MUST enforce their own
-    /// policy (e.g. [`crate::tls::pki::verify`] gates each signature through
+    /// policy (e.g. `tls::pki::verify` gates each signature through
     /// `SignaturePolicy::permits` before trusting it). Do not treat a
     /// successful return as evidence the algorithm is acceptable.
     pub fn verify_signature_with(&self, issuer: &super::AnyPublicKey) -> Result<(), Error> {

@@ -402,7 +402,7 @@ impl HssPrivateKey {
     /// leaves of the one tree.
     ///
     /// For a multi-level key (`L >= 2`) it is `2^h_bottom - q_bottom`, the unused
-    /// leaves of the *bottom* tree only. See [`advance`](Self::advance) for why
+    /// leaves of the *bottom* tree only. See `advance` for why
     /// the higher levels are deliberately pinned at leaf 0: advancing a higher
     /// level would re-use the bottom tree's fixed LM-OTS keys, which is a
     /// catastrophic key reuse. This conservative cap (one bottom tree's worth of

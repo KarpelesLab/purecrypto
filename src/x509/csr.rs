@@ -252,7 +252,7 @@ impl CertificationRequest {
     /// policy. A SHA-1- or MD5-based signature, or an undersized RSA key, will
     /// verify **successfully** here. Callers MUST apply their own policy (e.g.
     /// `SignaturePolicy::permits`, as the TLS path does in
-    /// [`crate::tls::pki::verify`]) before trusting the result.
+    /// `tls::pki::verify`) before trusting the result.
     pub fn verify_self_signed(&self) -> Result<(), Error> {
         let parts = self.parts()?;
         let key = self.public_key()?;

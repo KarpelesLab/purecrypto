@@ -383,7 +383,7 @@ impl CertificateRevocationList {
     /// key-size policy. A SHA-1- or MD5-based signature, or an undersized RSA
     /// key, will verify **successfully** here. Callers MUST enforce their own
     /// policy (e.g. via `SignaturePolicy::permits`, as the TLS path does in
-    /// [`crate::tls::pki::verify`]). Do not treat a successful return as
+    /// `tls::pki::verify`). Do not treat a successful return as
     /// evidence the algorithm is acceptable.
     pub fn verify_signature_with(&self, issuer_key: &AnyPublicKey) -> Result<(), Error> {
         self.check_signature_algid_consistent()?;

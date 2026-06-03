@@ -303,7 +303,7 @@ impl OcspResponse {
     /// policy. A SHA-1- or MD5-based signature, or an undersized RSA key, will
     /// verify **successfully** here. Callers MUST apply their own policy (e.g.
     /// `SignaturePolicy::permits`, as the TLS path does in
-    /// [`crate::tls::pki::verify`]) before trusting the result.
+    /// `tls::pki::verify`) before trusting the result.
     pub fn verify_signature_with(&self, key: &AnyPublicKey) -> Result<(), Error> {
         let p = self.basic_parts()?;
         key.verify(&p.sig_alg, p.tbs, p.signature)
@@ -446,7 +446,7 @@ impl OcspResponse {
     /// or key-size policy — a response signed with SHA-1/MD5-RSA or under an
     /// undersized key will verify **successfully**. Callers MUST apply their
     /// own policy (e.g. `SignaturePolicy::permits`, as the TLS path does in
-    /// [`crate::tls::pki::verify`]) before trusting the returned status.
+    /// `tls::pki::verify`) before trusting the returned status.
     pub fn check_for_cert(
         &self,
         leaf: &Certificate,
