@@ -1309,6 +1309,58 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
     }
 
     #[test]
+    fn ed448_self_signed_and_chain() {
+        use crate::ec::Ed448PrivateKey;
+        use crate::rng::HmacDrbg;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-ca", b"n", &[]);
+
+        // 1) An Ed448 self-signed CA root.
+        let ca_key = Ed448PrivateKey::generate(&mut rng);
+        let ca_signer = crate::x509::CertSigner::Ed448(&ca_key);
+        let ca_name = DistinguishedName::common_name("ed448 root ca");
+        let ca_cert =
+            Certificate::self_signed_general(&ca_signer, &ca_name, &validity(), 1, true, &[])
+                .unwrap();
+
+        // The id-Ed448 self-signature verifies under the embedded key.
+        let ca_pub = ca_cert.subject_public_key().unwrap();
+        assert!(matches!(ca_pub, crate::x509::AnyPublicKey::Ed448(_)));
+        ca_cert.verify_signature_with(&ca_pub).unwrap();
+        ca_cert.check_well_formed().unwrap();
+        // The outer signatureAlgorithm carries id-Ed448 (1.3.101.113).
+        assert_eq!(
+            ca_cert.signature_algorithm_oid().unwrap().as_slice(),
+            oid::ID_ED448
+        );
+
+        // 2) An Ed448 leaf issued (signed) by the CA.
+        let leaf_key = Ed448PrivateKey::generate(&mut rng);
+        let leaf_name = DistinguishedName::common_name("ed448 leaf");
+        let leaf_pub = crate::x509::AnyPublicKey::Ed448(leaf_key.public_key());
+        let leaf_cert = Certificate::issue_general(
+            &ca_signer,
+            &ca_name,
+            &leaf_name,
+            &leaf_pub,
+            &validity(),
+            2,
+            false,
+            &["ed448.example"],
+        )
+        .unwrap();
+
+        // The leaf chains to the CA: its signature verifies under the CA key.
+        leaf_cert.verify_signature_with(&ca_pub).unwrap();
+        leaf_cert.check_well_formed().unwrap();
+        assert_eq!(leaf_cert.issuer().unwrap(), ca_name);
+        assert_eq!(leaf_cert.subject().unwrap(), leaf_name);
+
+        // A leaf signed by the CA must NOT verify under the leaf's own key.
+        assert!(leaf_cert.verify_signature_with(&leaf_pub).is_err());
+    }
+
+    #[test]
     fn validity_and_well_formed() {
         let key = rsa_test_key_a();
         let cert = Certificate::self_signed(

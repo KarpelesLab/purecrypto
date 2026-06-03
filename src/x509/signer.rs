@@ -5,7 +5,7 @@
 use alloc::vec::Vec;
 
 use super::{AnyPublicKey, Error, algorithm_identifier, oid};
-use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
+use crate::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::hash::{Sha256, Sha384, Sha512};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
@@ -33,6 +33,8 @@ pub enum CertSigner<'a> {
     Ecdsa(&'a BoxedEcdsaPrivateKey),
     /// An Ed25519 signing key.
     Ed25519(&'a Ed25519PrivateKey),
+    /// An Ed448 signing key.
+    Ed448(&'a Ed448PrivateKey),
     /// An ML-DSA-44 signing key (FIPS 204).
     #[cfg(feature = "mldsa")]
     MlDsa44(&'a MlDsa44PrivateKey),
@@ -59,6 +61,7 @@ impl CertSigner<'_> {
                 CurveId::P521 => oid::ECDSA_WITH_SHA512,
             },
             CertSigner::Ed25519(_) => oid::ID_ED25519,
+            CertSigner::Ed448(_) => oid::ID_ED448,
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa44(_) => oid::ID_ML_DSA_44,
             #[cfg(feature = "mldsa")]
@@ -100,6 +103,8 @@ impl CertSigner<'_> {
             }
             // Ed25519 is PureEdDSA: the raw 64-byte R‖S over the message itself.
             CertSigner::Ed25519(k) => Ok(k.sign(tbs).to_bytes().to_vec()),
+            // Ed448 is PureEdDSA with the empty context: the raw 114-byte R‖S.
+            CertSigner::Ed448(k) => Ok(k.sign(tbs).to_bytes().to_vec()),
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa44(k) => k
                 .sign_deterministic(tbs, b"")
@@ -149,6 +154,7 @@ impl CertSigner<'_> {
             CertSigner::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
             CertSigner::Ecdsa(k) => AnyPublicKey::Ecdsa(k.public_key()),
             CertSigner::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
+            CertSigner::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa44(k) => AnyPublicKey::MlDsa44(k.public_key()),
             #[cfg(feature = "mldsa")]

@@ -21,7 +21,8 @@
 
 use crate::der::{Reader, parse_oid};
 use crate::ec::{
-    BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed25519PublicKey, Ed25519Signature,
+    BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId, Ed448PublicKey, Ed448Signature,
+    Ed25519PublicKey, Ed25519Signature,
 };
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::signature_registry::SignatureAlgorithm;
@@ -66,6 +67,20 @@ fn parse_ed25519_spki(spki: &[u8]) -> Result<Ed25519PublicKey, Error> {
     let key_bits = outer.read_bit_string()?;
     let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
     Ok(Ed25519PublicKey::from_bytes(bytes))
+}
+
+/// Parses an Ed448 SPKI and returns the 57-byte key.
+fn parse_ed448_spki(spki: &[u8]) -> Result<Ed448PublicKey, Error> {
+    let mut reader = Reader::new(spki);
+    let mut outer = reader.read_sequence()?;
+    let mut algid = outer.read_sequence()?;
+    let alg = parse_oid(algid.read_oid()?)?;
+    if alg.as_slice() != oid::ID_ED448 {
+        return Err(Error::UnsupportedAlgorithm);
+    }
+    let key_bits = outer.read_bit_string()?;
+    let bytes: [u8; 57] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+    Ok(Ed448PublicKey::from_bytes(bytes))
 }
 
 /// Shared ECDSA strict verify: the curve in the SPKI must equal
@@ -258,6 +273,30 @@ impl SignatureAlgorithm for Ed25519 {
     }
 }
 
+/// `ed448` — pure Ed448 (RFC 8032 / RFC 8410).
+/// X.509 OID `1.3.101.113`; TLS scheme `0x0808`.
+pub(crate) struct Ed448;
+
+impl SignatureAlgorithm for Ed448 {
+    fn id(&self) -> &'static str {
+        "ed448"
+    }
+    fn x509_oids(&self) -> &'static [&'static [u64]] {
+        &[oid::ID_ED448]
+    }
+    fn tls_schemes(&self) -> &'static [u16] {
+        &[0x0808]
+    }
+    fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
+        let key = parse_ed448_spki(spki)?;
+        // Ed448 signatures are the raw 114-byte R‖S; X.509 / TLS use the empty
+        // context (pure Ed448, RFC 8032 §5.2).
+        let bytes: [u8; 114] = signature.try_into().map_err(|_| Error::Malformed)?;
+        key.verify(message, &Ed448Signature::from_bytes(bytes))
+            .map_err(|_| Error::Verification)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,5 +366,25 @@ mod tests {
         let algo = find_by_id("ed25519").unwrap();
         algo.verify(&spki, b"hi", &sig).unwrap();
         assert!(algo.verify(&spki, b"other", &sig).is_err());
+    }
+
+    #[test]
+    fn ed448_verify_via_registry() {
+        use crate::ec::Ed448PrivateKey;
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-ed448", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let pk = AnyPublicKey::Ed448(sk.public_key());
+        let spki = pk.to_spki_der();
+        // X.509 / TLS Ed448 signatures use the empty context.
+        let sig = sk.sign(b"hi").to_bytes().to_vec();
+
+        let algo = find_by_id("ed448").unwrap();
+        algo.verify(&spki, b"hi", &sig).unwrap();
+        assert!(algo.verify(&spki, b"other", &sig).is_err());
+
+        // The X.509 OID (1.3.101.113) and the TLS scheme (0x0808) both resolve
+        // to this entry.
+        assert_eq!(find_by_oid(oid::ID_ED448).unwrap().id(), "ed448");
+        assert_eq!(find_by_tls_scheme(0x0808).unwrap().id(), "ed448");
     }
 }

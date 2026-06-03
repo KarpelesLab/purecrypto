@@ -67,6 +67,9 @@ pub mod oid {
     /// `id-Ed25519` (1.3.101.112) — both the key and signature algorithm
     /// (RFC 8410).
     pub const ID_ED25519: &[u64] = &[1, 3, 101, 112];
+    /// `id-Ed448` (1.3.101.113) — both the key and signature algorithm
+    /// (RFC 8410).
+    pub const ID_ED448: &[u64] = &[1, 3, 101, 113];
 
     /// `id-ml-dsa-44` (2.16.840.1.101.3.4.3.17) — NIST FIPS 204 ML-DSA-44.
     /// Used for both the SPKI key OID and the certificate signatureAlgorithm.

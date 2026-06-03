@@ -124,6 +124,8 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::ec::registry::EcdsaSecp256k1Sha512,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::Ed25519,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::Ed448,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]
     &crate::mldsa::registry::MlDsa44,
     #[cfg(all(feature = "mldsa", feature = "alloc"))]
@@ -213,8 +215,8 @@ mod policy {
     ///
     /// The shipped default — [`SignaturePolicy::modern`] — accepts exactly the
     /// modern IANA-blessed set: RSA-PKCS1 / RSA-PSS-RSAE with SHA-256/384/512,
-    /// ECDSA with matched curve/hash pairs over P-256/P-384/P-521, and
-    /// Ed25519. RSA keys must be at least 2048 bits.
+    /// ECDSA with matched curve/hash pairs over P-256/P-384/P-521, Ed25519,
+    /// and Ed448. RSA keys must be at least 2048 bits.
     #[derive(Clone)]
     pub struct SignaturePolicy {
         permitted: Vec<&'static dyn SignatureAlgorithm>,
@@ -231,7 +233,7 @@ mod policy {
         ///   * `rsa-pss-rsae-sha256`, `rsa-pss-rsae-sha384`, `rsa-pss-rsae-sha512`
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
         ///     `ecdsa-secp521r1-sha512`
-        ///   * `ed25519`
+        ///   * `ed25519`, `ed448`
         ///   * `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` (NIST FIPS 204)
         ///
         /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, secp256k1,
@@ -254,6 +256,7 @@ mod policy {
                 "ecdsa-secp384r1-sha384",
                 "ecdsa-secp521r1-sha512",
                 "ed25519",
+                "ed448",
                 "ml-dsa-44",
                 "ml-dsa-65",
                 "ml-dsa-87",

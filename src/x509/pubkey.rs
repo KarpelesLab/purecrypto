@@ -8,7 +8,7 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed25519PublicKey};
+use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed448PublicKey, Ed25519PublicKey};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PublicKey, MlDsa65PublicKey, MlDsa87PublicKey};
 use crate::rsa::BoxedRsaPublicKey;
@@ -60,6 +60,8 @@ pub enum AnyPublicKey {
     Ecdsa(BoxedEcdsaPublicKey),
     /// An Ed25519 public key.
     Ed25519(Ed25519PublicKey),
+    /// An Ed448 public key.
+    Ed448(Ed448PublicKey),
     /// An ML-DSA-44 (FIPS 204) public key.
     #[cfg(feature = "mldsa")]
     MlDsa44(MlDsa44PublicKey),
@@ -95,6 +97,11 @@ impl AnyPublicKey {
                 let algid = encode_sequence(&oid_tlv(oid::ID_ED25519));
                 encode_sequence(&[algid, encode_bit_string(&k.to_bytes())].concat())
             }
+            AnyPublicKey::Ed448(k) => {
+                // RFC 8410: AlgorithmIdentifier is the bare OID (no parameters).
+                let algid = encode_sequence(&oid_tlv(oid::ID_ED448));
+                encode_sequence(&[algid, encode_bit_string(&k.to_bytes())].concat())
+            }
             // ML-DSA (draft-ietf-lamps-dilithium-certificates): bare OID, no
             // parameters; key bytes are the raw FIPS 204 encoding.
             #[cfg(feature = "mldsa")]
@@ -121,6 +128,7 @@ impl AnyPublicKey {
     /// * `rsaEncryption` — explicit NULL required.
     /// * `id-ecPublicKey` — named-curve OID, then no trailing junk.
     /// * `id-Ed25519` — no parameters.
+    /// * `id-Ed448` — no parameters.
     /// * `id-RSASSA-PSS` — parameter block accepted as-is; the verifier
     ///   hard-codes the SHA-256 / MGF1-SHA-256 / salt=32 set, so trailing
     ///   junk after that block is rejected.
@@ -160,6 +168,14 @@ impl AnyPublicKey {
             spki.finish()?;
             let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
             Ok(AnyPublicKey::Ed25519(Ed25519PublicKey::from_bytes(bytes)))
+        } else if alg.as_slice() == oid::ID_ED448 {
+            // RFC 8410 §3: AlgorithmIdentifier MUST be the bare OID — no
+            // parameters at all.
+            algid.finish()?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
+            let bytes: [u8; 57] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+            Ok(AnyPublicKey::Ed448(Ed448PublicKey::from_bytes(bytes)))
         } else {
             #[cfg(feature = "mldsa")]
             {
@@ -305,6 +321,24 @@ mod tests {
         let sig = sk.sign(b"hello").to_bytes();
         parsed.verify(oid::ID_ED25519, b"hello", &sig).unwrap();
         assert!(parsed.verify(oid::ID_ED25519, b"other", &sig).is_err());
+    }
+
+    #[test]
+    fn ed448_spki_roundtrip_and_verify() {
+        use crate::ec::Ed448PrivateKey;
+        let mut rng = HmacDrbg::<Sha256>::new(b"spki-ed448", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let any = AnyPublicKey::Ed448(sk.public_key());
+
+        let pem = any.to_spki_pem();
+        let parsed = AnyPublicKey::from_spki_pem(&pem).unwrap();
+        assert!(matches!(parsed, AnyPublicKey::Ed448(_)));
+
+        // Ed448 signatures are raw 114-byte R‖S (empty context), verified
+        // under id-Ed448.
+        let sig = sk.sign(b"hello").to_bytes();
+        parsed.verify(oid::ID_ED448, b"hello", &sig).unwrap();
+        assert!(parsed.verify(oid::ID_ED448, b"other", &sig).is_err());
     }
 
     // H-7: RFC 3279 §2.3.1 — rsaEncryption REQUIRES explicit NULL
