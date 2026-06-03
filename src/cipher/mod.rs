@@ -12,6 +12,7 @@
 //! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
 
+mod aegis;
 mod aes;
 pub(crate) mod blowfish;
 mod cbc;
@@ -24,16 +25,19 @@ mod ctr;
 mod des;
 mod gcm;
 mod gcm_siv;
+mod gmac;
 mod kw;
 mod ofb;
 mod poly1305;
 pub(crate) mod salsa20;
+mod sm4;
 // AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.
 #[cfg(feature = "alloc")]
 mod siv;
 mod xchacha20poly1305;
 mod xts;
 
+pub use aegis::{Aegis128L, Aegis256};
 pub use aes::{Aes128, Aes192, Aes256};
 pub use cbc::Cbc;
 pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
@@ -45,6 +49,7 @@ pub use ctr::Ctr;
 pub use des::{Cbc64, Des, TdesEde2, TdesEde3};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
 pub use gcm_siv::{Aes128GcmSiv, Aes256GcmSiv, AesGcmSiv};
+pub use gmac::{AesGmac128, AesGmac256, Gmac};
 pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
     kw_ciphertext_len, kwp_ciphertext_len,
@@ -53,6 +58,7 @@ pub use ofb::Ofb;
 pub use poly1305::Poly1305;
 #[cfg(feature = "alloc")]
 pub use siv::AesSiv;
+pub use sm4::Sm4;
 pub use xchacha20poly1305::XChaCha20Poly1305;
 pub use xts::{Aes128Xts, Aes256Xts, Xts};
 

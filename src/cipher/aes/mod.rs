@@ -166,6 +166,21 @@ fn decrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
     add_round_key(block, &rk[0..16]);
 }
 
+/// Applies one full AES round to `state`: `MixColumns(ShiftRows(SubBytes(state)))`
+/// XOR'd with `round_key`. This is the AESENC primitive (the per-round transform
+/// of the FIPS-197 cipher, sans the key schedule), exposed for constructions —
+/// such as AEGIS — that build on the bare round function rather than on a keyed
+/// AES instance. Constant-time: it reuses the same branchless, table-free step
+/// functions as the block cipher.
+pub(crate) fn aes_round(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
+    let mut s = state;
+    sub_bytes(&mut s);
+    shift_rows(&mut s);
+    mix_columns(&mut s);
+    add_round_key(&mut s, &round_key);
+    s
+}
+
 /// Defines an AES variant with a given key size, key-word count, round count,
 /// and round-key buffer length.
 macro_rules! aes_variant {
