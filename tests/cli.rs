@@ -74,6 +74,28 @@ fn rand_emits_hex() {
 }
 
 #[test]
+fn enc_kwp_short_ciphertext_dies_cleanly() {
+    // RFC 5649 AES-KWP ciphertext is at least 16 bytes; a shorter input must be
+    // rejected with a clean error rather than triggering a usize underflow on
+    // `ciphertext.len() - 8` (debug panic / release capacity-overflow abort).
+    let key = "00112233445566778899aabbccddeeff"; // 16-byte AES-128 KEK (hex).
+    for alg in ["AES-128-KWP", "AES-256-KWP"] {
+        let kek = if alg == "AES-256-KWP" {
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        } else {
+            key
+        };
+        // 8-byte ciphertext (< 16): must fail without a panic/abort.
+        let (_out, err, ok) = run_capture(&["enc", "-alg", alg, "-d", "-key", kek], &[0u8; 8]);
+        assert!(!ok, "{alg}: short KWP ciphertext should fail");
+        assert!(
+            err.contains("AES-KWP ciphertext too short"),
+            "{alg}: expected too-short diagnostic, got stderr: {err}"
+        );
+    }
+}
+
+#[test]
 fn ca_workflow_genpkey_req_sign() {
     // Unique scratch dir for this test process.
     let dir = std::env::temp_dir().join(format!("pc_cli_{}", std::process::id()));

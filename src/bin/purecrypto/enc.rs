@@ -360,6 +360,9 @@ fn kw_unwrap(alg: Algo, kek: &[u8], ciphertext: &[u8]) -> Vec<u8> {
             out
         }
         Algo::Aes128Kwp => {
+            if ciphertext.len() < 16 {
+                die("AES-KWP ciphertext too short");
+            }
             let k: [u8; 16] = kek.try_into().expect("aes-128 kek length");
             let mut out = vec![0u8; ciphertext.len() - 8];
             let n = Aes128Kwp::new(Aes128::new(&k))
@@ -369,6 +372,9 @@ fn kw_unwrap(alg: Algo, kek: &[u8], ciphertext: &[u8]) -> Vec<u8> {
             out
         }
         Algo::Aes256Kwp => {
+            if ciphertext.len() < 16 {
+                die("AES-KWP ciphertext too short");
+            }
             let k: [u8; 32] = kek.try_into().expect("aes-256 kek length");
             let mut out = vec![0u8; ciphertext.len() - 8];
             let n = Aes256Kwp::new(Aes256::new(&k))
