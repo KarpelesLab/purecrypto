@@ -8,7 +8,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ec::sm2::{DEFAULT_ID, Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 use crate::rng::OsRng;
 
@@ -219,11 +219,17 @@ pub unsafe extern "C" fn pc_sm2_decrypt(
         let Some(c) = (unsafe { slice(ct, ct_len) }) else {
             return PcStatus::NullPointer;
         };
-        let pt = match unsafe { &*k }.0.decrypt(c) {
+        let mut pt = match unsafe { &*k }.0.decrypt(c) {
             Ok(p) => p,
             Err(_) => return PcStatus::Verification,
         };
-        unsafe { out_write(&pt, out, out_len) }
+        // Capture the status, then wipe the recovered plaintext before its Vec
+        // is dropped so the bytes don't linger in a freed allocation. The
+        // `out_write` failure path (e.g. BufferTooSmall) scrubs too. Mirrors
+        // `pc_rsa_decrypt_oaep`.
+        let st = unsafe { out_write(&pt, out, out_len) };
+        wipe_vec(&mut pt);
+        st
     })
 }
 

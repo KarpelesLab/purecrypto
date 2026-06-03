@@ -93,6 +93,18 @@ pub(super) unsafe fn out_write(data: &[u8], out: *mut u8, out_len: *mut usize) -
     PcStatus::Ok
 }
 
+/// Overwrites `buf` with zeros and routes the read through
+/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead stores.
+/// Used to scrub recovered plaintext / shared secrets before their backing
+/// storage is returned to the allocator (mirrors the in-house pattern in
+/// `src/ffi/rsa.rs` and `src/mlkem/mod.rs`).
+pub(super) fn wipe_vec(buf: &mut alloc::vec::Vec<u8>) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&buf);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
