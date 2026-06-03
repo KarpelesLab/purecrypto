@@ -294,6 +294,16 @@ impl OcspResponse {
 
     /// Verifies the BasicOCSPResponse signature over `tbsResponseData`
     /// against `key`, dispatching through the signature-algorithm registry.
+    ///
+    /// Unlike certificates and CRLs, an OCSP `BasicOCSPResponse` has a single
+    /// `signatureAlgorithm` field with no inner counterpart, so there is no
+    /// RFC 5280 §4.1.1.2-style inner/outer consistency requirement to enforce.
+    ///
+    /// SECURITY: this performs **no** signature-algorithm-strength or key-size
+    /// policy. A SHA-1- or MD5-based signature, or an undersized RSA key, will
+    /// verify **successfully** here. Callers MUST apply their own policy (e.g.
+    /// `SignaturePolicy::permits`, as the TLS path does in
+    /// [`crate::tls::pki::verify`]) before trusting the result.
     pub fn verify_signature_with(&self, key: &AnyPublicKey) -> Result<(), Error> {
         let p = self.basic_parts()?;
         key.verify(&p.sig_alg, p.tbs, p.signature)
@@ -431,6 +441,12 @@ impl OcspResponse {
     /// `Err(Error::Malformed)` for missing rows / expired staples — the
     /// TLS layer translates both into [`crate::tls::Error::OcspResponseInvalid`]
     /// to map to a `bad_certificate` alert.
+    ///
+    /// SECURITY: the signature step applies **no** signature-algorithm-strength
+    /// or key-size policy — a response signed with SHA-1/MD5-RSA or under an
+    /// undersized key will verify **successfully**. Callers MUST apply their
+    /// own policy (e.g. `SignaturePolicy::permits`, as the TLS path does in
+    /// [`crate::tls::pki::verify`]) before trusting the returned status.
     pub fn check_for_cert(
         &self,
         leaf: &Certificate,
@@ -451,6 +467,16 @@ impl OcspResponse {
             // ...with id-kp-OCSPSigning in its EKU.
             let ekus = responder.extended_key_usages()?;
             if !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING) {
+                return Err(Error::Verification);
+            }
+            // ...and that is an end-entity, not a CA. A delegated OCSP
+            // responder is an end-entity cert issued by the CA solely to sign
+            // status responses (RFC 6960 §4.2.2.2); a cert with
+            // basicConstraints CA:TRUE is a sub-CA and must not double as a
+            // responder. The id-kp-OCSPSigning EKU is the load-bearing gate,
+            // but rejecting a CA:TRUE cert here closes the door on a sub-CA
+            // (which can already mint certs) additionally forging status.
+            if let Some((true, _)) = responder.basic_constraints()? {
                 return Err(Error::Verification);
             }
             // ...and (when a clock is supplied) still inside its own
@@ -553,7 +579,11 @@ impl OcspResponse {
         leaf: &Certificate,
         issuer: &Certificate,
     ) -> Result<Option<OcspSingleResponse>, Error> {
-        let issuer_name_value = read_name_value(issuer.subject_der()?)?;
+        // RFC 6960 §4.1.1: issuerNameHash is the hash of the *full* DER `Name`
+        // TLV (tag + length + content), exactly as conformant responders
+        // (OpenSSL, Let's Encrypt) compute it. `subject_der()` returns that
+        // complete `Name` TLV.
+        let issuer_name_tlv = issuer.subject_der()?;
         let issuer_key_bits = issuer.subject_public_key_bits()?;
         let serial = leaf.serial_bytes()?;
         // strict-DER canonical: a single leading 0x00 is the sign-protection
@@ -562,7 +592,7 @@ impl OcspResponse {
         let serial_magnitude = strip_leading_sign_zero(serial);
 
         for r in self.responses()? {
-            let Some((nh, kh)) = hash_pair(&r.hash_alg_oid, issuer_name_value, issuer_key_bits)
+            let Some((nh, kh)) = hash_pair(&r.hash_alg_oid, issuer_name_tlv, issuer_key_bits)
             else {
                 continue;
             };
@@ -682,31 +712,20 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
     })
 }
 
-/// Reads the *value* (content bytes) of a `Name` TLV — RFC 6960 §4.1.1
-/// hashes the SEQUENCE body, not the full TLV.
-fn read_name_value(name_tlv: &[u8]) -> Result<&[u8], Error> {
-    let mut r = Reader::new(name_tlv);
-    // `read_tlv(SEQUENCE)` returns the value bytes (no tag, no length).
-    let body = r.read_tlv(tag::SEQUENCE)?;
-    r.finish()?;
-    Ok(body)
-}
-
-/// Hashes `(name_value, key_bits)` under `hash_alg_oid`. Returns `None` for
+/// Hashes `(name_tlv, key_bits)` under `hash_alg_oid`. `name_tlv` MUST be the
+/// full DER `Name` TLV (tag + length + content) — RFC 6960 §4.1.1 specifies
+/// `issuerNameHash` as the hash of the complete `Name`, which is what every
+/// conformant responder (OpenSSL, Let's Encrypt) computes. Returns `None` for
 /// unsupported OIDs (the caller skips that row).
-fn hash_pair(
-    hash_alg_oid: &[u64],
-    name_value: &[u8],
-    key_bits: &[u8],
-) -> Option<(Vec<u8>, Vec<u8>)> {
+fn hash_pair(hash_alg_oid: &[u64], name_tlv: &[u8], key_bits: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     if hash_alg_oid == oid::ID_SHA1 {
-        Some((sha1(name_value).to_vec(), sha1(key_bits).to_vec()))
+        Some((sha1(name_tlv).to_vec(), sha1(key_bits).to_vec()))
     } else if hash_alg_oid == oid::ID_SHA256 {
-        Some((sha256(name_value).to_vec(), sha256(key_bits).to_vec()))
+        Some((sha256(name_tlv).to_vec(), sha256(key_bits).to_vec()))
     } else if hash_alg_oid == oid::ID_SHA384 {
-        Some((sha384(name_value).to_vec(), sha384(key_bits).to_vec()))
+        Some((sha384(name_tlv).to_vec(), sha384(key_bits).to_vec()))
     } else if hash_alg_oid == oid::ID_SHA512 {
-        Some((sha512(name_value).to_vec(), sha512(key_bits).to_vec()))
+        Some((sha512(name_tlv).to_vec(), sha512(key_bits).to_vec()))
     } else {
         None
     }
@@ -738,7 +757,9 @@ fn ocsp_hash_algid(arcs: &[u64]) -> Vec<u8> {
 /// out-of-band by the CA and emit DER blobs we just relay.
 #[derive(Clone, Debug)]
 pub struct OcspResponseBuilder {
-    issuer_name_value: Vec<u8>,
+    /// The full DER `Name` TLV of the issuer subject (RFC 6960 §4.1.1 hashes
+    /// the complete TLV, not just the SEQUENCE body).
+    issuer_name_tlv: Vec<u8>,
     issuer_key_bits: Vec<u8>,
     serial: Vec<u8>,
     status: OcspCertStatus,
@@ -793,7 +814,7 @@ impl OcspResponseBuilder {
         status: OcspCertStatus,
     ) -> Result<Self, Error> {
         Ok(OcspResponseBuilder {
-            issuer_name_value: read_name_value(issuer.subject_der()?)?.to_vec(),
+            issuer_name_tlv: issuer.subject_der()?.to_vec(),
             issuer_key_bits: issuer.subject_public_key_bits()?.to_vec(),
             serial: leaf.serial_bytes()?.to_vec(),
             status,
@@ -856,7 +877,7 @@ impl OcspResponseBuilder {
         // Compute CertID using the chosen hash algorithm.
         let (name_hash, key_hash) = hash_pair(
             self.hash_alg_oid,
-            &self.issuer_name_value,
+            &self.issuer_name_tlv,
             &self.issuer_key_bits,
         )
         .ok_or(Error::UnsupportedAlgorithm)?;
@@ -909,9 +930,9 @@ impl OcspResponseBuilder {
             let kh = sha1(&self.issuer_key_bits).to_vec();
             encode_context(2, &encode_octet_string(&kh))
         } else {
-            // byName [1] EXPLICIT Name — wrap the full Name TLV.
-            let name_tlv = encode_sequence(&self.issuer_name_value);
-            encode_context(1, &name_tlv)
+            // byName [1] EXPLICIT Name — the stored value is already the full
+            // Name TLV.
+            encode_context(1, &self.issuer_name_tlv)
         };
 
         // ResponseData (omit version, accept the default v1).
@@ -1011,7 +1032,9 @@ pub struct OcspRequest {
 /// nonce (if any), then call [`build`](Self::build).
 #[derive(Clone, Debug)]
 pub struct OcspRequestBuilder {
-    issuer_name_value: Vec<u8>,
+    /// The full DER `Name` TLV of the issuer subject (RFC 6960 §4.1.1 hashes
+    /// the complete TLV, not just the SEQUENCE body).
+    issuer_name_tlv: Vec<u8>,
     issuer_key_bits: Vec<u8>,
     serial: Vec<u8>,
     hash_alg_oid: &'static [u64],
@@ -1024,7 +1047,7 @@ impl OcspRequestBuilder {
     /// SHA-256 too but SHA-1 maximises interop).
     pub fn new(leaf: &Certificate, issuer: &Certificate) -> Result<Self, Error> {
         Ok(OcspRequestBuilder {
-            issuer_name_value: read_name_value(issuer.subject_der()?)?.to_vec(),
+            issuer_name_tlv: issuer.subject_der()?.to_vec(),
             issuer_key_bits: issuer.subject_public_key_bits()?.to_vec(),
             serial: leaf.serial_bytes()?.to_vec(),
             hash_alg_oid: oid::ID_SHA1,
@@ -1067,7 +1090,7 @@ impl OcspRequestBuilder {
     pub fn build(self) -> Result<OcspRequest, Error> {
         let (name_hash, key_hash) = hash_pair(
             self.hash_alg_oid,
-            &self.issuer_name_value,
+            &self.issuer_name_tlv,
             &self.issuer_key_bits,
         )
         .ok_or(Error::UnsupportedAlgorithm)?;
@@ -1241,6 +1264,37 @@ mod tests {
 
         // Signature verifies under the issuer key.
         resp.verify_signature_with(&signer.public_key()).unwrap();
+    }
+
+    // Finding 2 (RFC 6960 §4.1.1): issuerNameHash must be the hash of the FULL
+    // DER `Name` TLV (tag + length + content), matching what OpenSSL / Let's
+    // Encrypt emit — NOT the hash of just the SEQUENCE content. This pins the
+    // emitted hash to the conformant value so a regression back to hashing the
+    // stripped body is caught.
+    #[test]
+    fn issuer_name_hash_is_over_full_name_tlv() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+        let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
+
+        // The full Name TLV (what subject_der returns) is the conformant input.
+        let full_name_tlv = issuer.subject_der().unwrap();
+        let expected = sha1(full_name_tlv).to_vec();
+        assert_eq!(single.issuer_name_hash, expected);
+
+        // And it must NOT equal the hash over the stripped SEQUENCE content —
+        // the old (self-consistent but non-interoperable) behavior.
+        let mut r = Reader::new(full_name_tlv);
+        let content = r.read_tlv(tag::SEQUENCE).unwrap();
+        assert_ne!(single.issuer_name_hash, sha1(content).to_vec());
+
+        // Matching still works end-to-end with the corrected hashing.
+        assert_eq!(single.status, OcspCertStatus::Good);
     }
 
     #[test]
@@ -1420,6 +1474,70 @@ mod tests {
             .delegated_responder_cert(responder_cert.to_der().to_vec())
             .sign(&CertSigner::Ed25519(&responder_key))
             .unwrap()
+    }
+
+    // Finding 3: a delegated OCSP responder must be an end-entity, not a CA. A
+    // cert with basicConstraints CA:TRUE that also carries id-kp-OCSPSigning
+    // must be rejected as a delegated responder — a sub-CA must not double as a
+    // status responder.
+    #[test]
+    fn check_for_cert_rejects_ca_true_delegated_responder() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let issuer_signer = CertSigner::Rsa(&issuer_key);
+        let responder_key = ed25519();
+        let responder_pub = AnyPublicKey::Ed25519(responder_key.public_key());
+        let responder_dn = DistinguishedName::common_name("OCSP CA responder");
+        // CA:TRUE — the only difference from the accepted-responder shape — plus
+        // the load-bearing id-kp-OCSPSigning EKU.
+        let responder_extensions = vec![
+            extension::basic_constraints(true, None),
+            Extension {
+                oid: oid::EXT_KEY_USAGE.to_vec(),
+                critical: false,
+                value: encode_sequence(&oid_tlv(oid::ID_KP_OCSP_SIGNING)),
+            },
+        ];
+        let responder_cert = Certificate::issue_with_extensions(
+            &issuer_signer,
+            &issuer.subject().unwrap(),
+            &responder_dn,
+            &responder_pub,
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            100,
+            &responder_extensions,
+        )
+        .expect("issue responder");
+
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .delegated_responder_cert(responder_cert.to_der().to_vec())
+            .sign(&CertSigner::Ed25519(&responder_key))
+            .unwrap();
+
+        let now = Time::utc(2026, 6, 1, 0, 0, 0);
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            Err(Error::Verification)
+        ));
+
+        // Sanity: an otherwise-identical CA:FALSE responder IS accepted, so the
+        // rejection above is attributable to basicConstraints alone.
+        let ok = delegated_good_response(
+            &issuer,
+            &leaf,
+            &issuer_key,
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+        );
+        assert_eq!(
+            ok.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            OcspCertStatus::Good
+        );
     }
 
     // F5: a delegated responder cert must be inside its own validity window at
