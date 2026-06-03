@@ -8,9 +8,11 @@
 use crate::util::{
     Args, die, parse_hex_flag, read_input, read_secret_file, write_output, zero_buf,
 };
+use purecrypto::ascon::AsconAead128;
 use purecrypto::cipher::{
-    Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256, Aes256Ccm, Aes256Ccm8,
-    Aes256Gcm, Aes256Kw, Aes256Kwp, AesGcmSiv, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
+    Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256,
+    Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesGcmSiv, AesSiv, ChaCha20Poly1305,
+    XChaCha20Poly1305,
 };
 
 #[derive(Clone, Copy)]
@@ -27,6 +29,9 @@ enum Algo {
     XChaCha20P1305,
     Aes128Siv,
     Aes256Siv,
+    Aegis128L,
+    Aegis256,
+    AsconAead128,
     Aes128Kw,
     Aes256Kw,
     Aes128Kwp,
@@ -49,6 +54,9 @@ fn parse_alg(name: &str) -> Option<Algo> {
         "XCHACHA20-POLY1305" => Algo::XChaCha20P1305,
         "AES-128-SIV" => Algo::Aes128Siv,
         "AES-256-SIV" => Algo::Aes256Siv,
+        "AEGIS-128L" => Algo::Aegis128L,
+        "AEGIS-256" => Algo::Aegis256,
+        "ASCON-AEAD128" => Algo::AsconAead128,
         "AES-128-KW" | "AES-KW-128" => Algo::Aes128Kw,
         "AES-256-KW" | "AES-KW-256" => Algo::Aes256Kw,
         "AES-128-KWP" | "AES-KWP-128" => Algo::Aes128Kwp,
@@ -63,6 +71,8 @@ fn key_size(alg: Algo) -> usize {
         | Algo::Aes128Ccm
         | Algo::Aes128Ccm8
         | Algo::Aes128GcmSiv
+        | Algo::Aegis128L
+        | Algo::AsconAead128
         | Algo::Aes128Kw
         | Algo::Aes128Kwp => 16,
         Algo::ChaCha20P1305
@@ -72,6 +82,7 @@ fn key_size(alg: Algo) -> usize {
         | Algo::Aes256Ccm8
         | Algo::Aes256GcmSiv
         | Algo::Aes128Siv
+        | Algo::Aegis256
         | Algo::Aes256Kw
         | Algo::Aes256Kwp => 32,
         // AES-SIV uses a double-length key: 64 bytes selects AES-256-SIV.
@@ -138,6 +149,27 @@ fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u
             let out = AesSiv::new(key).seal(&[nonce], buf.as_slice());
             *buf = out;
             return;
+        }
+        Algo::Aegis128L => {
+            let k: [u8; 16] = key.try_into().expect("aegis-128l key length");
+            let n: [u8; 16] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 16 bytes for AEGIS-128L"));
+            Aegis128L::new(&k).encrypt(&n, aad, buf.as_mut_slice())
+        }
+        Algo::Aegis256 => {
+            let k: [u8; 32] = key.try_into().expect("aegis-256 key length");
+            let n: [u8; 32] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 32 bytes for AEGIS-256"));
+            Aegis256::new(&k).encrypt(&n, aad, buf.as_mut_slice())
+        }
+        Algo::AsconAead128 => {
+            let k: [u8; 16] = key.try_into().expect("ascon-aead128 key length");
+            let n: [u8; 16] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 16 bytes for ASCON-AEAD128"));
+            AsconAead128::new(&k).encrypt(&n, aad, buf.as_mut_slice())
         }
         _ => unreachable!("aead_encrypt only called for AEAD algs"),
     };
@@ -230,6 +262,30 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
             XChaCha20Poly1305::new(&k)
                 .decrypt(&n, aad, &mut buf, &t)
                 .is_ok()
+        }
+        Algo::Aegis128L => {
+            let k: [u8; 16] = key.try_into().expect("aegis-128l key length");
+            let n: [u8; 16] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 16 bytes for AEGIS-128L"));
+            let t: [u8; 16] = tag.try_into().unwrap();
+            Aegis128L::new(&k).decrypt(&n, aad, &mut buf, &t).is_ok()
+        }
+        Algo::Aegis256 => {
+            let k: [u8; 32] = key.try_into().expect("aegis-256 key length");
+            let n: [u8; 32] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 32 bytes for AEGIS-256"));
+            let t: [u8; 16] = tag.try_into().unwrap();
+            Aegis256::new(&k).decrypt(&n, aad, &mut buf, &t).is_ok()
+        }
+        Algo::AsconAead128 => {
+            let k: [u8; 16] = key.try_into().expect("ascon-aead128 key length");
+            let n: [u8; 16] = nonce
+                .try_into()
+                .unwrap_or_else(|_| die("nonce must be 16 bytes for ASCON-AEAD128"));
+            let t: [u8; 16] = tag.try_into().unwrap();
+            AsconAead128::new(&k).decrypt(&n, aad, &mut buf, &t).is_ok()
         }
         _ => unreachable!("aead_decrypt only called for AEAD algs"),
     };

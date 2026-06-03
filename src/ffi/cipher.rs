@@ -5,10 +5,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::{PcStatus, guard, out_write, slice};
+use crate::ascon::AsconAead128;
 use crate::cipher::{
-    Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256, Aes256Ccm, Aes256Ccm8,
-    Aes256Gcm, Aes256Kw, Aes256Kwp, AesCmac128, AesCmac256, AesGcmSiv, AesSiv, ChaCha20Poly1305,
-    XChaCha20Poly1305,
+    Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256,
+    Aes256Ccm, Aes256Ccm8, Aes256Gcm, Aes256Kw, Aes256Kwp, AesCmac128, AesCmac256, AesGcmSiv,
+    AesGmac128, AesGmac256, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
 };
 
 /// AEAD algorithm identifiers (mirror `PcAead` in `purecrypto.h`).
@@ -29,6 +30,12 @@ pub mod aead_id {
     pub const AES128_SIV: i32 = 11;
     /// AES-256-SIV (RFC 5297), 64-byte key, single-AD form.
     pub const AES256_SIV: i32 = 12;
+    /// AEGIS-128L (draft-irtf-cfrg-aegis-aead). 16-byte key, 16-byte nonce.
+    pub const AEGIS128L: i32 = 13;
+    /// AEGIS-256 (draft-irtf-cfrg-aegis-aead). 32-byte key, 32-byte nonce.
+    pub const AEGIS256: i32 = 14;
+    /// Ascon-AEAD128 (NIST SP 800-232). 16-byte key, 16-byte nonce.
+    pub const ASCON_AEAD128: i32 = 15;
 }
 
 fn aead_key_size(alg: i32) -> Option<usize> {
@@ -36,12 +43,15 @@ fn aead_key_size(alg: i32) -> Option<usize> {
         aead_id::AES128_GCM
         | aead_id::AES128_CCM
         | aead_id::AES128_CCM8
-        | aead_id::AES128_GCM_SIV => 16,
+        | aead_id::AES128_GCM_SIV
+        | aead_id::AEGIS128L
+        | aead_id::ASCON_AEAD128 => 16,
         aead_id::AES256_GCM
         | aead_id::CHACHA20_POLY1305
         | aead_id::AES256_CCM
         | aead_id::AES256_CCM8
         | aead_id::AES256_GCM_SIV
+        | aead_id::AEGIS256
         | aead_id::XCHACHA20_POLY1305 => 32,
         aead_id::AES128_SIV => 32,
         aead_id::AES256_SIV => 64,
@@ -169,6 +179,32 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Err(_) => return PcStatus::Unsupported,
                 };
                 XChaCha20Poly1305::new(&key)
+                    .encrypt(&nonce, a, &mut buf)
+                    .to_vec()
+            }
+            aead_id::AEGIS128L => {
+                let key: [u8; 16] = k.try_into().unwrap();
+                let nonce: [u8; 16] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                Aegis128L::new(&key).encrypt(&nonce, a, &mut buf).to_vec()
+            }
+            aead_id::AEGIS256 => {
+                let key: [u8; 32] = k.try_into().unwrap();
+                let nonce: [u8; 32] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                Aegis256::new(&key).encrypt(&nonce, a, &mut buf).to_vec()
+            }
+            aead_id::ASCON_AEAD128 => {
+                let key: [u8; 16] = k.try_into().unwrap();
+                let nonce: [u8; 16] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                AsconAead128::new(&key)
                     .encrypt(&nonce, a, &mut buf)
                     .to_vec()
             }
@@ -303,6 +339,37 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
                 XChaCha20Poly1305::new(&key)
+                    .decrypt(&nonce, a, &mut buf, &t)
+                    .is_ok()
+            }
+            aead_id::AEGIS128L => {
+                let key: [u8; 16] = k.try_into().unwrap();
+                let nonce: [u8; 16] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                let t: [u8; 16] = tag.try_into().unwrap();
+                Aegis128L::new(&key)
+                    .decrypt(&nonce, a, &mut buf, &t)
+                    .is_ok()
+            }
+            aead_id::AEGIS256 => {
+                let key: [u8; 32] = k.try_into().unwrap();
+                let nonce: [u8; 32] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                let t: [u8; 16] = tag.try_into().unwrap();
+                Aegis256::new(&key).decrypt(&nonce, a, &mut buf, &t).is_ok()
+            }
+            aead_id::ASCON_AEAD128 => {
+                let key: [u8; 16] = k.try_into().unwrap();
+                let nonce: [u8; 16] = match n.try_into() {
+                    Ok(v) => v,
+                    Err(_) => return PcStatus::Unsupported,
+                };
+                let t: [u8; 16] = tag.try_into().unwrap();
+                AsconAead128::new(&key)
                     .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
@@ -510,6 +577,55 @@ pub unsafe extern "C" fn pc_cmac(
                 let mut c = AesCmac256::new(Aes256::new(&kk));
                 c.update(m);
                 c.finalize()
+            }
+            _ => return PcStatus::Unsupported,
+        };
+        unsafe { out_write(&tag, out, out_len) }
+    })
+}
+
+/// Computes the GMAC tag (NIST SP 800-38D) of `data` under `key` with the
+/// 12-byte `nonce`, writing the 16-byte tag to `out`. A 16-byte key selects
+/// AES-128-GMAC; a 32-byte key selects AES-256-GMAC. The `nonce` MUST be unique
+/// per (key, message); reuse is catastrophic.
+///
+/// # Safety
+/// All pointers must be valid for their lengths; `out_len` non-NULL.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_gmac(
+    key: *const u8,
+    key_len: usize,
+    nonce: *const u8,
+    nonce_len: usize,
+    data: *const u8,
+    data_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(k), Some(n), Some(m)) = (
+            unsafe { slice(key, key_len) },
+            unsafe { slice(nonce, nonce_len) },
+            unsafe { slice(data, data_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        let nonce: [u8; 12] = match n.try_into() {
+            Ok(v) => v,
+            Err(_) => return PcStatus::Unsupported,
+        };
+        let tag = match k.len() {
+            16 => {
+                let kk: [u8; 16] = k.try_into().unwrap();
+                let mut g = AesGmac128::new(Aes128::new(&kk), &nonce);
+                g.update(m);
+                g.finalize()
+            }
+            32 => {
+                let kk: [u8; 32] = k.try_into().unwrap();
+                let mut g = AesGmac256::new(Aes256::new(&kk), &nonce);
+                g.update(m);
+                g.finalize()
             }
             _ => return PcStatus::Unsupported,
         };
