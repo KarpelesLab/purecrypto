@@ -1,7 +1,7 @@
 //! SM2 — the Chinese commercial public-key algorithm (GB/T 32918, RFC 8998).
 //!
 //! SM2 is an elliptic-curve scheme over the [`sm2p256v1`](super::CurveId::Sm2p256v1)
-//! curve, paired with the [`Sm3`](crate::hash::Sm3) hash. This module implements
+//! curve, paired with the [`Sm3`] hash. This module implements
 //! the two SM2 sub-algorithms purecrypto needs:
 //!
 //! * **Digital signatures** (GB/T 32918.2 / RFC 8998 §2): `(r, s)` over the
@@ -12,7 +12,7 @@
 //!
 //! The secret scalar is held in a [`BoxedUint`] and wiped on drop; all scalar
 //! arithmetic reuses the crate's constant-time field/scalar primitives
-//! ([`BoxedMontModulus`], [`super::weierstrass::Curve::scalar_mul`]).
+//! ([`BoxedMontModulus`], `weierstrass::Curve::scalar_mul`).
 //!
 //! Keys serialize as standard SEC1 / PKIX structures carrying the SM2 named
 //! curve OID (`1.2.156.10197.1.301`), so PKCS#8 / PEM round-trips work through

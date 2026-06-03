@@ -320,12 +320,7 @@ type SubtreeNodes = Vec<Vec<u8>>;
 /// message or the leaf index — so a signer builds it once and reads every
 /// authentication path out of it in `O(h)` (see [`SubtreeCache`]) rather than
 /// re-hashing all `2^h` leaves per signature.
-fn build_subtree(
-    p: &Params,
-    sk_seed: &[u8],
-    pub_seed: &[u8],
-    subtree_addr: &Adrs,
-) -> SubtreeNodes {
+fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adrs) -> SubtreeNodes {
     let n = p.n;
     let th = p.tree_height as usize;
 
