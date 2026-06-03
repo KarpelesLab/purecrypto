@@ -43,17 +43,20 @@ Single crate, modules gated by Cargo features:
 | Layer            | Module      | Status |
 | ---------------- | ----------- | ------ |
 | Constant-time    | `ct`        | ✅ implemented |
-| Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing) |
+| Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
 | Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop |
-| MAC              | `mac`       | ✅ AES-CMAC (RFC 4493); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
+| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon` |
+| MAC              | `mac`       | ✅ AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
 | Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
 | Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
-| Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106) |
-| Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032) |
+| Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106), SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF) |
+| Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032), SM2 signature + encryption (GB/T 32918 / RFC 8998) |
 | Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
 | Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
+| Stateful HBS     | `lms`       | ✅ LMS / HSS (RFC 8554, NIST SP 800-208); LM-OTS W{1,2,4,8} × LMS H{5,10,15,20,25}; **stateful** advancing key; RFC 8554 KATs |
+| Stateful HBS     | `xmss`      | ✅ XMSS / XMSS^MT (RFC 8391, NIST SP 800-208); **stateful** advancing key; RFC 8391 / reference KATs |
+| Lightweight      | `ascon`     | ✅ Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / XOF128 / CXOF128 from one 320-bit permutation |
 | Diffie-Hellman   | `dh`        | ✅ Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
 | X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
@@ -62,7 +65,7 @@ Single crate, modules gated by Cargo features:
 | ECH              | `ech`      | ✅ draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
 | QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
 | Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
-| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC, RNG, AEAD + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, ML-KEM, ML-DSA, SLH-DSA, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
+| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 
 ## CLI + C-API coverage matrix
@@ -72,11 +75,13 @@ Each functional area below is callable from the Rust library, the
 
 | Area                                  | CLI                                  | C API                                                              |
 | ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
-| Hashing (SHA-2/3, BLAKE2/3, SM3, …)   | `hash`                               | `pc_digest`, `pc_hash_*`                                           |
+| Hashing (SHA-2/3, BLAKE2/3, SM3, Ascon, …) | `hash`                          | `pc_digest`, `pc_hash_*`, `pc_ascon_xof`/`pc_ascon_cxof`          |
 | HMAC (SHA-1, SHA-2, SHA-3, SM3, …)    | `mac`                                | `pc_hmac`                                                          |
 | AES-CMAC (RFC 4493)                   | `mac -alg cmac`                      | `pc_cmac`                                                          |
+| GMAC (NIST SP 800-38D)                | `mac -alg gmac -nonce …`             | `pc_gmac`                                                         |
 | KDFs (HKDF, PBKDF2, scrypt, Argon2)   | `kdf hkdf\|pbkdf2\|scrypt\|argon2`   | `pc_hkdf`, `pc_pbkdf2`, `pc_scrypt`, `pc_argon2`                   |
-| AEAD (AES-GCM/CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
+| KBKDF (SP 800-108, counter/feedback)  | `kdf kbkdf`                          | `pc_kbkdf_counter`, `pc_kbkdf_feedback`                            |
+| AEAD (AES-GCM/CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256, Ascon-AEAD128) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
 | AES key wrap (RFC 3394/5649)          | `enc -alg AES-KW\|AES-KWP`           | `pc_aes_kw_wrap/unwrap`, `pc_aes_kwp_wrap/unwrap`                  |
 | Randomness                            | `rand`                               | `pc_rand_bytes`                                                    |
 | RSA keygen + PKCS#1 sign/verify       | `genpkey`, `req`, `x509`, `pkeyutl`  | `pc_rsa_generate`, `pc_rsa_sign_pkcs1`, `pc_rsa_verify_pkcs1`      |
@@ -85,12 +90,15 @@ Each functional area below is callable from the Rust library, the
 | ECDSA keygen + sign/verify            | `genpkey -alg EC`, `pkeyutl`         | `pc_ec_generate`, `pc_ec_sign`, `pc_ec_verify`                     |
 | Ed25519 sign/verify                   | `genpkey -alg ED25519`, `pkeyutl`    | `pc_ed25519_*`                                                     |
 | Ed448 sign/verify                     | `genpkey -alg ED448`, `pkeyutl`      | `pc_ed448_*`                                                       |
+| SM2 sign/verify + encrypt/decrypt     | `genpkey -alg SM2`, `pkeyutl`        | `pc_sm2_*`                                                         |
 | ECDH on NIST curves                   | `kex -alg ECDH-P{256,384,521}`       | `pc_ecdh`                                                          |
 | X25519                                | `kex -alg X25519`                    | `pc_x25519`, `pc_x25519_public`                                    |
 | X448                                  | `kex -alg X448`                      | `pc_x448`, `pc_x448_public`                                        |
 | ML-KEM (FIPS 203)                     | `kem keygen\|encaps\|decaps`         | `pc_mlkem_*`                                                       |
 | ML-DSA (FIPS 204)                     | `pkeyutl sign/verify` (ML-DSA keys)  | `pc_mldsa_*`                                                       |
 | SLH-DSA (FIPS 205)                    | `pkeyutl sign/verify` (SLH-DSA keys) | `pc_slhdsa_*`                                                      |
+| LMS / HSS (RFC 8554, stateful)        | `genpkey -alg LMS-…\|HSS-…`, `pkeyutl` | `pc_lms_*`, `pc_hss_*`                                          |
+| XMSS / XMSS^MT (RFC 8391, stateful)   | `genpkey -alg XMSS-…\|XMSSMT-…`, `pkeyutl` | `pc_xmss_*`, `pc_xmssmt_*`                                  |
 | CSR (PKCS#10)                         | `req`                                | `pc_csr_create_rsa`, `pc_csr_from_pem`, `pc_csr_verify_self_signed`|
 | X.509 certificate parse + verify      | `x509`, `ca`                         | `pc_cert_*`, `pc_ec_self_signed_pem`                               |
 | CRL parse + verify                    | `crl`                                | `pc_crl_*`                                                         |

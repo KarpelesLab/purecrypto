@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(x509,ec)* Ed448 SPKI parsing, signature-registry + cert-chain verify, self-signed/CA issuance (id-Ed448 1.3.101.113)
 - *(tls)* Ed448 certificate authentication (TLS 1.3 SignatureScheme ed448 = 0x0808)
 - *(ffi,cli)* expose the new AEADs (`enc`, `pc_aead_*`), AES-CMAC (`mac -alg cmac`, `pc_cmac`), Ed448 (`genpkey -alg ED448`, `pkeyutl`, `pc_ed448_*`) and X448 (`kex -alg X448`, `pc_x448`)
+- *(cipher)* AEGIS-128L / AEGIS-256 (draft-irtf-cfrg-aegis-aead) and SM4 block cipher (GB/T 32907 / RFC 8998)
+- *(cipher)* GMAC (NIST SP 800-38D)
+- *(ascon)* Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / Ascon-XOF128 / Ascon-CXOF128 — on by default
+- *(kdf)* SP 800-108 KBKDF in counter and feedback modes, with HMAC and AES-CMAC PRFs
+- *(ec)* SM2 signature (SM2DSA over SM3) + public-key encryption (GB/T 32918 / RFC 8998); sm2p256v1 curve, SPKI/cert-chain verify (id-sm2 1.2.156.10197.1.301, sm2sign-with-sm3 1.2.156.10197.1.501)
+- *(lms)* LMS / HSS stateful hash-based signatures (RFC 8554, NIST SP 800-208) — on by default
+- *(xmss)* XMSS / XMSS^MT stateful hash-based signatures (RFC 8391, NIST SP 800-208) — on by default
+- *(ffi,cli)* expose AEGIS / Ascon-AEAD / SM4 (`enc`), GMAC (`mac -alg gmac`, `pc_gmac`), KBKDF (`kdf kbkdf`, `pc_kbkdf_*`), Ascon hashes (`hash`, `pc_ascon_xof/cxof`), SM2 (`genpkey -alg SM2`, `pkeyutl`, `pc_sm2_*`), and LMS/XMSS (`genpkey`, `pkeyutl` with persist-after-sign, `pc_lms_*`/`pc_xmss_*`)
 
 ## [0.5.1](https://github.com/KarpelesLab/purecrypto/compare/v0.5.0...v0.5.1) - 2026-06-01
 
