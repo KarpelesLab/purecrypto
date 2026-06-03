@@ -120,12 +120,18 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         let mut buf: Vec<u8> = p.to_vec();
         let tag: Vec<u8> = match alg {
             aead_id::AES128_GCM => {
+                if n.is_empty() {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 Aes128Gcm::new(Aes128::new(&key))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
             aead_id::AES256_GCM => {
+                if n.is_empty() {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 Aes256Gcm::new(Aes256::new(&key))
                     .encrypt(n, a, &mut buf)
@@ -142,24 +148,36 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     .to_vec()
             }
             aead_id::AES128_CCM => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 Aes128Ccm::new(Aes128::new(&key))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
             aead_id::AES256_CCM => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 Aes256Ccm::new(Aes256::new(&key))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
             aead_id::AES128_CCM8 => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 Aes128Ccm8::new(Aes128::new(&key))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
             aead_id::AES256_CCM8 => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 Aes256Ccm8::new(Aes256::new(&key))
                     .encrypt(n, a, &mut buf)
@@ -271,6 +289,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
         let mut buf: Vec<u8> = ct.to_vec();
         let ok = match alg {
             aead_id::AES128_GCM => {
+                if n.is_empty() {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 let t: [u8; 16] = tag.try_into().unwrap();
                 Aes128Gcm::new(Aes128::new(&key))
@@ -278,6 +299,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES256_GCM => {
+                if n.is_empty() {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 let t: [u8; 16] = tag.try_into().unwrap();
                 Aes256Gcm::new(Aes256::new(&key))
@@ -296,6 +320,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES128_CCM => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 let t: [u8; 16] = tag.try_into().unwrap();
                 Aes128Ccm::new(Aes128::new(&key))
@@ -303,6 +330,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES256_CCM => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 let t: [u8; 16] = tag.try_into().unwrap();
                 Aes256Ccm::new(Aes256::new(&key))
@@ -310,6 +340,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES128_CCM8 => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 16] = k.try_into().unwrap();
                 let t: [u8; 8] = tag.try_into().unwrap();
                 Aes128Ccm8::new(Aes128::new(&key))
@@ -317,6 +350,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                     .is_ok()
             }
             aead_id::AES256_CCM8 => {
+                if !(7..=13).contains(&n.len()) {
+                    return PcStatus::Unsupported;
+                }
                 let key: [u8; 32] = k.try_into().unwrap();
                 let t: [u8; 8] = tag.try_into().unwrap();
                 Aes256Ccm8::new(Aes256::new(&key))
