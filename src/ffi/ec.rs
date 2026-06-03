@@ -136,6 +136,8 @@ pub unsafe extern "C" fn pc_ec_sign(
             CurveId::P256 | CurveId::Secp256k1 => sk.sign::<Sha256>(m),
             CurveId::P384 => sk.sign::<Sha384>(m),
             CurveId::P521 => sk.sign::<Sha512>(m),
+            // SM2 is not ECDSA; it has its own signature scheme (use the SM2 API).
+            CurveId::Sm2p256v1 => return PcStatus::Unsupported,
         };
         match sig {
             Ok(s) => unsafe { out_write(&s.to_der(curve), out, out_len) },
@@ -179,6 +181,8 @@ pub unsafe extern "C" fn pc_ec_verify(
             CurveId::P256 | CurveId::Secp256k1 => key.verify::<Sha256>(m, &parsed),
             CurveId::P384 => key.verify::<Sha384>(m, &parsed),
             CurveId::P521 => key.verify::<Sha512>(m, &parsed),
+            // SM2 is not ECDSA; it has its own signature scheme (use the SM2 API).
+            CurveId::Sm2p256v1 => return PcStatus::Unsupported,
         };
         if ok.is_ok() {
             PcStatus::Ok
