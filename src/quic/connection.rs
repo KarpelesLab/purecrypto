@@ -2353,17 +2353,18 @@ impl QuicConnection {
 
         // Open. Authentication failure → bump the per-key integrity
         // counter (RFC 9001 §6.6) and, on crossing the integrity limit,
-        // close with AEAD_LIMIT_REACHED. Otherwise propagate the AEAD
-        // error and continue dropping the packet.
-        if let Err(e) = aead_open(dir_keys_ref, pn, &aad, payload, &tag) {
-            if self.bump_rx_aead_failure(level)? {
-                // Counter just crossed the integrity limit — the close
-                // path is already triggered; surface as a clean drop
-                // (the connection is now closed, so subsequent feeds
-                // are no-ops anyway).
-                return Ok(pkt_total_len);
-            }
-            return Err(e);
+        // close with AEAD_LIMIT_REACHED. Either way the packet is a
+        // SILENT per-packet drop (RFC 9000 §12.2): we consume this
+        // packet's bytes and return Ok so `feed_datagram` keeps
+        // processing any coalesced packets that follow. A forged or
+        // bit-flipped coalesced packet MUST NOT cause valid packets in
+        // the same datagram to be dropped or tear the connection down.
+        if let Err(_e) = aead_open(dir_keys_ref, pn, &aad, payload, &tag) {
+            // `bump_rx_aead_failure` flips `self.closed` when the
+            // integrity limit is reached; we don't need its return value
+            // since both outcomes consume `pkt_total_len` and continue.
+            let _ = self.bump_rx_aead_failure(level)?;
+            return Ok(pkt_total_len);
         }
 
         // RFC 9001 §9.5 — per-key PN replay. A successfully-AEAD'd
@@ -2490,21 +2491,23 @@ impl QuicConnection {
                     .prev_rx_keys
                     .clone()
                     .expect("checked");
-                if let Err(e) = aead_open(&prev, pn, &aad, payload, &tag) {
-                    if self.bump_rx_aead_failure(Level::OneRtt)? {
-                        return Ok(datagram.len());
-                    }
-                    return Err(e);
+                if let Err(_e) = aead_open(&prev, pn, &aad, payload, &tag) {
+                    // SILENT per-packet drop (RFC 9000 §12.2). A 1-RTT
+                    // packet is the last packet in a datagram (no packets
+                    // may be coalesced after a short-header packet), so
+                    // consuming the rest of the datagram is correct.
+                    // `bump_rx_aead_failure` flips `self.closed` on
+                    // crossing the integrity limit (RFC 9001 §6.6).
+                    let _ = self.bump_rx_aead_failure(Level::OneRtt)?;
+                    return Ok(datagram.len());
                 }
                 true
             } else {
                 // No prev-phase fallback available: count this as a
-                // genuine integrity failure (RFC 9001 §6.6).
-                if self.bump_rx_aead_failure(Level::OneRtt)? {
-                    return Ok(datagram.len());
-                }
-                primary_result?;
-                false
+                // genuine integrity failure (RFC 9001 §6.6) and drop the
+                // packet silently per RFC 9000 §12.2.
+                let _ = self.bump_rx_aead_failure(Level::OneRtt)?;
+                return Ok(datagram.len());
             }
         } else {
             false
@@ -3870,11 +3873,15 @@ mod tests {
         assert!(b.is_pending_empty());
     }
 
-    /// Test 5 — feeding an AEAD-tampered datagram returns an error and
-    /// the server state is unchanged. We tamper with the byte at offset
-    /// 50 (well past the unprotected header bytes).
+    /// Test 5 — feeding an AEAD-tampered datagram is a SILENT per-packet
+    /// drop (RFC 9000 §12.2): `feed_datagram` returns `Ok(())`, the
+    /// connection is NOT torn down, and a subsequently-fed un-tampered
+    /// datagram still drives the handshake. We tamper with the byte at
+    /// offset 60 (well past the unprotected header bytes). An on-path
+    /// attacker flipping a ciphertext byte MUST NOT be able to induce a
+    /// connection error.
     #[test]
-    fn feed_datagram_rejects_aead_tampering() {
+    fn feed_datagram_drops_aead_tampering_silently() {
         let (mut c, mut s) = loopback_pair();
         // Capture the client's first Initial datagram.
         let dg = c.pop_datagram();
@@ -3884,13 +3891,93 @@ mod tests {
         // Pick byte at index 60 — well into the AEAD-protected payload.
         let idx = 60.min(tampered.len() - 1);
         tampered[idx] ^= 0x01;
-        // Server rejects.
+        // Server silently drops the packet — RFC 9000 §12.2: an AEAD
+        // failure is a per-packet drop, never a connection error.
         let r = s.feed_datagram(&tampered);
-        assert!(r.is_err(), "tampered datagram must fail");
+        assert!(
+            r.is_ok(),
+            "tampered datagram must be silently dropped, not error"
+        );
+        assert!(!s.closed, "a single AEAD failure must not close the conn");
         // And subsequent handshake completion with the un-tampered
         // datagram still works.
         let r2 = s.feed_datagram(&dg);
         assert!(r2.is_ok(), "untampered datagram must succeed");
+    }
+
+    /// RFC 9000 §12.2 regression — a junk/undecryptable packet coalesced
+    /// AFTER a valid packet in the same datagram must NOT prevent the
+    /// leading valid packet from being processed, and must NOT cause
+    /// `feed_datagram` to return a fatal error. This is the exact
+    /// on-path-attacker scenario: an adversary appends one bit-flipped
+    /// coalesced packet to a legitimate datagram to drop the real packet
+    /// and/or induce a connection error.
+    ///
+    /// The server's first reply to the client's Initial is a coalesced
+    /// datagram: Initial(ServerHello) || Handshake(EE/Cert/CV/Fin). We
+    /// flip a byte inside the SECOND coalesced packet's ciphertext
+    /// (leaving its unprotected Length field intact) and assert that the
+    /// client still fully processes the FIRST (Initial) packet — i.e. it
+    /// records the Initial PN as received and derives Handshake keys from
+    /// the ServerHello — and that the connection is not closed.
+    #[test]
+    fn feed_datagram_coalesced_trailing_aead_fail_keeps_leading() {
+        let (mut c, mut s) = loopback_pair();
+
+        // Client → server: first Initial.
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram(&dg).expect("server feed initial");
+
+        // Server → client: the coalesced Initial || Handshake reply.
+        let reply = s.pop_datagram();
+        assert!(!reply.is_empty(), "server must emit a coalesced reply");
+
+        // Parse the first (Initial) long-header packet to find its end.
+        let hdr = LongHeader::parse(&reply).expect("parse first packet");
+        assert_eq!(hdr.typ, LongType::Initial, "first packet is Initial");
+        let first_len = hdr.payload_off + hdr.length as usize;
+        assert!(
+            reply.len() > first_len,
+            "reply must coalesce a second packet after the Initial \
+             (first_len={first_len}, total={})",
+            reply.len()
+        );
+
+        // Parse the SECOND coalesced packet and flip a byte inside its
+        // ciphertext (its payload_off is relative to its own start).
+        let second_hdr = LongHeader::parse(&reply[first_len..]).expect("parse second packet");
+        let flip = first_len + second_hdr.payload_off + 4;
+        assert!(flip < reply.len(), "flip index inside second packet");
+        let mut tampered = reply.clone();
+        tampered[flip] ^= 0x01;
+
+        // Before: client has seen nothing.
+        assert!(c.endpoint.pn.initial.largest_rx.is_none());
+
+        // Feed the tampered coalesced datagram. The leading Initial
+        // packet MUST be processed; the trailing junk packet MUST be a
+        // silent drop, not a connection error (RFC 9000 §12.2).
+        let r = c.feed_datagram(&tampered);
+        assert!(
+            r.is_ok(),
+            "a bad trailing coalesced packet must not error the datagram"
+        );
+        assert!(!c.closed, "a trailing AEAD failure must not close the conn");
+        assert!(
+            c.endpoint.pn.initial.largest_rx.is_some(),
+            "the leading valid Initial packet MUST be processed despite \
+             the trailing packet failing AEAD (RFC 9000 §12.2)"
+        );
+        // Processing the leading Initial's ServerHello also installed the
+        // client's Handshake-level keys — further proof the first packet
+        // ran to completion rather than being short-circuited by the
+        // trailing packet's failure.
+        assert!(
+            c.endpoint.crypto.at(Level::Handshake).rx.is_some(),
+            "ServerHello in the leading Initial must have installed \
+             Handshake rx keys"
+        );
     }
 
     /// Test 13 — drop every third datagram in each direction. The
