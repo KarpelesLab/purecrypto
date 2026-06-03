@@ -572,7 +572,25 @@ impl Certificate {
 
     /// Verifies the certificate signature against `issuer`, dispatching on the
     /// certificate's `signatureAlgorithm` (RSA-PKCS#1 or ECDSA over SHA-256/384).
+    ///
+    /// As mandated by RFC 5280 §4.1.1.2, this first confirms the outer
+    /// `signatureAlgorithm` is byte-identical to the inner
+    /// `TBSCertificate.signature` AlgorithmIdentifier (returning
+    /// [`Error::Malformed`] otherwise), closing the signature-algorithm-
+    /// confusion gap where an attacker pairs a strong inner algid with a weak
+    /// (attacker-controlled) outer one. The check is idempotent, so callers
+    /// such as the TLS path that already invoke
+    /// [`check_signature_algid_consistent`](Self::check_signature_algid_consistent)
+    /// separately remain correct.
+    ///
+    /// SECURITY: this method applies **no** signature-algorithm-strength or
+    /// key-size policy. A SHA-1- or MD5-based signature, or an undersized RSA
+    /// key, will verify **successfully** here. Callers MUST enforce their own
+    /// policy (e.g. [`crate::tls::pki::verify`] gates each signature through
+    /// `SignaturePolicy::permits` before trusting it). Do not treat a
+    /// successful return as evidence the algorithm is acceptable.
     pub fn verify_signature_with(&self, issuer: &super::AnyPublicKey) -> Result<(), Error> {
+        self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
         issuer.verify(&parts.sig_alg, parts.tbs, parts.signature)
     }
@@ -1306,6 +1324,50 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
         assert!(matches!(key, crate::x509::AnyPublicKey::Ecdsa(_)));
         cert.verify_signature_with(&key).unwrap();
         cert.check_well_formed().unwrap();
+    }
+
+    // Finding 1 (RFC 5280 §4.1.1.2): the public verify entry point must reject
+    // a certificate whose outer signatureAlgorithm differs from the inner
+    // TBSCertificate.signature, even though the raw signature is valid over the
+    // TBS. Previously the comparator existed but was only called by the TLS
+    // orchestrator and tests; verify_signature_with now enforces it directly.
+    #[test]
+    fn verify_signature_with_rejects_inner_outer_algid_mismatch() {
+        use crate::der::{encode_bit_string, encode_integer, encode_sequence};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("algid mismatch");
+        let spki = rsa_spki(&key.public_key());
+
+        // Inner algid = sha256WithRSAEncryption (what we actually sign with).
+        let inner_algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&encode_integer(&1u64.to_be_bytes())); // serial
+        body.extend_from_slice(&inner_algid);
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&validity().to_der());
+        body.extend_from_slice(&name.to_der());
+        body.extend_from_slice(&spki);
+        let tbs = encode_sequence(&body);
+        let sig = key.sign_pkcs1v15::<Sha256>(&tbs).unwrap();
+
+        // Outer algid = sha1WithRSAEncryption — a *different* OID. The
+        // signature itself still validates over the TBS bytes.
+        let outer_algid = algorithm_identifier(oid::SHA1_WITH_RSA, true);
+        let der = encode_sequence(&[tbs, outer_algid, encode_bit_string(&sig)].concat());
+        let cert = Certificate::from_der(der).unwrap();
+
+        // The cert embeds its own (signing) key, so verify against that.
+        let pub_key = cert.subject_public_key().unwrap();
+
+        assert!(matches!(
+            cert.check_signature_algid_consistent(),
+            Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            cert.verify_signature_with(&pub_key),
+            Err(Error::Malformed)
+        ));
     }
 
     #[test]

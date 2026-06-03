@@ -372,7 +372,21 @@ impl CertificateRevocationList {
 
     /// Verifies the CRL signature against `issuer_key`, dispatching on the
     /// CRL's `signatureAlgorithm` through the signature registry.
+    ///
+    /// As mandated by RFC 5280 §5.1.1.2, this first confirms the outer
+    /// `signatureAlgorithm` is byte-identical to the inner
+    /// `TBSCertList.signature` AlgorithmIdentifier (returning
+    /// [`Error::Malformed`] otherwise), closing the signature-algorithm-
+    /// confusion gap. The check is idempotent.
+    ///
+    /// SECURITY: this method applies **no** signature-algorithm-strength or
+    /// key-size policy. A SHA-1- or MD5-based signature, or an undersized RSA
+    /// key, will verify **successfully** here. Callers MUST enforce their own
+    /// policy (e.g. via `SignaturePolicy::permits`, as the TLS path does in
+    /// [`crate::tls::pki::verify`]). Do not treat a successful return as
+    /// evidence the algorithm is acceptable.
     pub fn verify_signature_with(&self, issuer_key: &AnyPublicKey) -> Result<(), Error> {
+        self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
         issuer_key.verify(&parts.sig_alg, parts.tbs, parts.signature)
     }
@@ -632,6 +646,14 @@ mod tests {
         let mismatched = CertificateRevocationList::from_der(der).unwrap();
         assert!(matches!(
             mismatched.check_signature_algid_consistent(),
+            Err(Error::Malformed)
+        ));
+        // The public verify entry point must also refuse the mismatch
+        // (RFC 5280 §5.1.1.2), even though the raw signature is valid over the
+        // TBS. Finding 1: the algid-consistency check is now enforced inside
+        // verify_signature_with, not just the standalone comparator.
+        assert!(matches!(
+            mismatched.verify_signature_with(&signer.public_key()),
             Err(Error::Malformed)
         ));
     }
