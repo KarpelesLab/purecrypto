@@ -30,6 +30,14 @@ use alloc::vec::Vec;
 /// The SM2 curve identifier (`sm2p256v1`).
 const CURVE: CurveId = CurveId::Sm2p256v1;
 
+/// `id-ecPublicKey` (`1.2.840.10045.2.1`) — the SubjectPublicKeyInfo
+/// algorithm OID for EC keys. Defined locally (mirroring the per-curve
+/// OID constants in `ed25519`) so the `der`-gated SPKI codecs below stay
+/// self-contained and do not pull in the `x509` feature: RFC 8998 reuses
+/// the standard PKIX EC SPKI shape, only swapping in the SM2 named curve.
+#[cfg(feature = "der")]
+const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
+
 /// The default user identity `"1234567812345678"` (GB/T 32918.2 §A,
 /// RFC 8998 §2).
 pub const DEFAULT_ID: &[u8] = b"1234567812345678";
@@ -553,13 +561,8 @@ impl Sm2PublicKey {
     /// (`id-ecPublicKey` + the SM2 named curve, RFC 8998 §1).
     pub fn to_spki_der(&self) -> Vec<u8> {
         use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
-        use crate::x509::oid;
         let algid = encode_sequence(
-            &[
-                oid_tlv(oid::EC_PUBLIC_KEY),
-                oid_tlv(CURVE.named_curve_oid()),
-            ]
-            .concat(),
+            &[oid_tlv(EC_PUBLIC_KEY_OID), oid_tlv(CURVE.named_curve_oid())].concat(),
         );
         encode_sequence(&[algid, encode_bit_string(&self.to_sec1())].concat())
     }
@@ -572,13 +575,12 @@ impl Sm2PublicKey {
     /// Parses a PKIX `SubjectPublicKeyInfo` for an SM2 key.
     pub fn from_spki_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::{Reader, parse_oid};
-        use crate::x509::oid;
         let mut reader = Reader::new(der);
         let mut spki = reader.read_sequence().map_err(|_| Error::Malformed)?;
         let mut algid = spki.read_sequence().map_err(|_| Error::Malformed)?;
         let alg = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
-        if alg.as_slice() != oid::EC_PUBLIC_KEY {
+        if alg.as_slice() != EC_PUBLIC_KEY_OID {
             return Err(Error::Malformed);
         }
         let arcs = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)

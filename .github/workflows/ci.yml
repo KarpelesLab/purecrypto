@@ -60,6 +60,11 @@ jobs:
       - name: Build no_std with all module features
         run: cargo build --no-default-features --features bignum,hash,cipher,kdf
 
+      # `ec` + `der` without `x509`: regression guard for the SM2 SPKI codecs,
+      # which must not reach into the `x509`-gated `oid` module.
+      - name: Build ec + der without x509
+        run: cargo build --no-default-features --features ec,der
+
   c_abi:
     name: C ABI smoke test
     runs-on: ubuntu-latest
