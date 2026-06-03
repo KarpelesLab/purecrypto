@@ -107,15 +107,18 @@ fn wots_chain(
 ) {
     let n = p.n;
     let end = (start + steps).min(p.wots_w);
+    // PUB_SEED is fixed across the whole chain, so precompute the PRF midstate
+    // once and clone it per call (see `hash::prf_base`).
+    let base = hash::prf_base(p, pub_seed);
     for i in start..end {
         addr.set_hash(i);
         // KEY = PRF(PUB_SEED, ADRS@keyAndMask=0); BM = PRF(.. keyAndMask=1).
         let mut key = [0u8; MAX_N];
         let mut bm = [0u8; MAX_N];
         addr.set_key_and_mask(0);
-        hash::prf(p, pub_seed, &addr.to_bytes(), &mut key);
+        hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut key);
         addr.set_key_and_mask(1);
-        hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm);
+        hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut bm);
         let mut masked = [0u8; MAX_N];
         for j in 0..n {
             masked[j] = inout[j] ^ bm[j];
@@ -243,12 +246,13 @@ fn rand_hash(
     let n = p.n;
     let mut key = [0u8; MAX_N];
     let mut bm = [0u8; 2 * MAX_N];
+    let base = hash::prf_base(p, pub_seed);
     addr.set_key_and_mask(0);
-    hash::prf(p, pub_seed, &addr.to_bytes(), &mut key);
+    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut key);
     addr.set_key_and_mask(1);
-    hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm[..n]);
+    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut bm[..n]);
     addr.set_key_and_mask(2);
-    hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm[n..2 * n]);
+    hash::prf_with(p, &base, pub_seed, &addr.to_bytes(), &mut bm[n..2 * n]);
 
     let mut masked = [0u8; 2 * MAX_N];
     for i in 0..n {
@@ -305,23 +309,25 @@ fn gen_leaf(
     l_tree(p, &mut pk, pub_seed, ltree_addr, leaf);
 }
 
-/// Merkle treeHash (RFC 8391 §4.1.6, BDS-stack form): computes the subtree root
-/// and the authentication path for `leaf_idx`. `subtree_addr` must carry the
-/// layer and tree fields of the target subtree.
-fn treehash(
+/// All nodes of a subtree, returned level-by-level.
+type SubtreeNodes = Vec<Vec<u8>>;
+
+/// Builds **all** nodes of the subtree addressed by `subtree_addr` (its layer +
+/// tree fields), level-by-level: `levels[0]` holds the `2^h` leaves, `levels[L]`
+/// the `2^{h-L}` nodes at height `L`, and `levels[h]` the single subtree root.
+///
+/// A subtree depends only on `(sk_seed, pub_seed, layer, tree)` — never on the
+/// message or the leaf index — so a signer builds it once and reads every
+/// authentication path out of it in `O(h)` (see [`SubtreeCache`]) rather than
+/// re-hashing all `2^h` leaves per signature.
+fn build_subtree(
     p: &Params,
     sk_seed: &[u8],
     pub_seed: &[u8],
-    leaf_idx: u32,
     subtree_addr: &Adrs,
-    root: &mut [u8],
-    auth_path: &mut [u8],
-) {
+) -> SubtreeNodes {
     let n = p.n;
     let th = p.tree_height as usize;
-    let mut stack = vec![0u8; (th + 1) * n];
-    let mut heights = vec![0u32; th + 1];
-    let mut offset = 0usize;
 
     let mut ots_addr = Adrs::new();
     let mut ltree_addr = Adrs::new();
@@ -333,53 +339,112 @@ fn treehash(
     ltree_addr.set_type(AdrsType::Ltree);
     node_addr.set_type(AdrsType::HashTree);
 
-    for idx in 0u32..(1u32 << p.tree_height) {
-        ltree_addr.set_ltree(idx);
-        ots_addr.set_ots(idx);
+    // Level 0: the 2^h WOTS+ leaves.
+    let leaf_count = 1usize << th;
+    let mut leaves = vec![0u8; leaf_count * n];
+    for idx in 0..leaf_count {
+        ltree_addr.set_ltree(idx as u32);
+        ots_addr.set_ots(idx as u32);
         gen_leaf(
             p,
             sk_seed,
             pub_seed,
             &mut ltree_addr,
             &mut ots_addr,
-            &mut stack[offset * n..offset * n + n],
+            &mut leaves[idx * n..idx * n + n],
         );
-        offset += 1;
-        heights[offset - 1] = 0;
+    }
+    let mut levels: SubtreeNodes = Vec::with_capacity(th + 1);
+    levels.push(leaves);
 
-        if (leaf_idx ^ 0x1) == idx {
-            auth_path[..n].copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
-        }
-
-        while offset >= 2 && heights[offset - 1] == heights[offset - 2] {
-            let tree_idx = idx >> (heights[offset - 1] + 1);
-            node_addr.set_tree_height(heights[offset - 1]);
-            node_addr.set_tree_index(tree_idx);
+    // Internal levels: node `i` at height `L` hashes children `2i`, `2i+1` at
+    // height `L-1` under ADRS{tree_height = L-1, tree_index = i} — the same
+    // addressing `root_from_sig` (the verifier) uses.
+    for level in 1..=th {
+        let count = 1usize << (th - level);
+        let mut nodes = vec![0u8; count * n];
+        let child = &levels[level - 1];
+        for i in 0..count {
+            node_addr.set_tree_height((level - 1) as u32);
+            node_addr.set_tree_index(i as u32);
             let mut parent = [0u8; MAX_N];
-            let mut left = [0u8; MAX_N];
-            let mut right = [0u8; MAX_N];
-            left[..n].copy_from_slice(&stack[(offset - 2) * n..(offset - 2) * n + n]);
-            right[..n].copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
             rand_hash(
                 p,
-                &left[..n],
-                &right[..n],
+                &child[2 * i * n..2 * i * n + n],
+                &child[(2 * i + 1) * n..(2 * i + 1) * n + n],
                 pub_seed,
                 &mut node_addr,
                 &mut parent,
             );
-            stack[(offset - 2) * n..(offset - 2) * n + n].copy_from_slice(&parent[..n]);
-            offset -= 1;
-            heights[offset - 1] += 1;
+            nodes[i * n..i * n + n].copy_from_slice(&parent[..n]);
+        }
+        levels.push(nodes);
+    }
+    levels
+}
 
-            if ((leaf_idx >> heights[offset - 1]) ^ 0x1) == tree_idx {
-                let h = heights[offset - 1] as usize;
-                auth_path[h * n..h * n + n]
-                    .copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
-            }
+/// Writes the height-`h` authentication path for `idx_leaf` out of a subtree
+/// built by [`build_subtree`]: `auth_path[j]` is the sibling of the path node at
+/// height `j`, i.e. node `(idx_leaf >> j) ^ 1` of `levels[j]`.
+fn auth_path_from_subtree(p: &Params, levels: &[Vec<u8>], idx_leaf: u32, auth_path: &mut [u8]) {
+    let n = p.n;
+    for j in 0..p.tree_height as usize {
+        let sib = ((idx_leaf >> j) ^ 1) as usize;
+        auth_path[j * n..j * n + n].copy_from_slice(&levels[j][sib * n..sib * n + n]);
+    }
+}
+
+/// A signer-side cache of fully-built subtrees, keyed by `(layer, tree)`.
+///
+/// XMSS / XMSS^MT consume leaves sequentially, so at any moment only the `d`
+/// subtrees on the current index path are live; this keeps at most one entry per
+/// layer (signing into a new tree at a layer evicts the old one), bounding the
+/// cache to `d` subtrees. Cached nodes are public Merkle hashes — the cache holds
+/// no secret material and is never serialized; it is rebuilt lazily from the
+/// seeds after [`XmssPrivateKey::from_bytes`].
+#[derive(Default)]
+struct SubtreeCache {
+    entries: Vec<(u32, u64, SubtreeNodes)>,
+}
+
+impl SubtreeCache {
+    /// A cache pre-populated with one already-built subtree (used to hand the
+    /// top subtree built during key generation straight to the signer, so the
+    /// first signature doesn't rebuild it).
+    fn seeded(layer: u32, tree: u64, nodes: SubtreeNodes) -> Self {
+        SubtreeCache {
+            entries: alloc::vec![(layer, tree, nodes)],
         }
     }
-    root[..n].copy_from_slice(&stack[..n]);
+
+    /// Returns the cached subtree for `(layer, tree)`, building it on first use.
+    fn get_or_build(
+        &mut self,
+        p: &Params,
+        sk_seed: &[u8],
+        pub_seed: &[u8],
+        layer: u32,
+        tree: u64,
+    ) -> &[Vec<u8>] {
+        let pos = match self
+            .entries
+            .iter()
+            .position(|(l, t, _)| *l == layer && *t == tree)
+        {
+            Some(pos) => pos,
+            None => {
+                // Only one active subtree per layer; drop any stale sibling.
+                self.entries.retain(|(l, _, _)| *l != layer);
+                let mut subtree_addr = Adrs::new();
+                subtree_addr.set_layer(layer);
+                subtree_addr.set_tree(tree);
+                let nodes = build_subtree(p, sk_seed, pub_seed, &subtree_addr);
+                self.entries.push((layer, tree, nodes));
+                self.entries.len() - 1
+            }
+        };
+        &self.entries[pos].2
+    }
 }
 
 /// Computes a subtree root from a leaf and an authentication path
@@ -479,7 +544,7 @@ fn idx_to_bytes(idx: u64, out: &mut [u8]) {
 
 /// Produces a full XMSS / XMSS^MT signature for leaf `idx` over `msg`. The
 /// signature buffer layout is `idx ‖ R ‖ (WOTS_sig ‖ auth_path)^d`.
-fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8]) -> Vec<u8> {
+fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8], cache: &mut SubtreeCache) -> Vec<u8> {
     let n = p.n;
     let mut sig = vec![0u8; p.sig_bytes()];
 
@@ -531,23 +596,15 @@ fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8]) -> Vec<u8> {
         );
         off += p.wots_sig_bytes();
 
-        // Authentication path + new (upper) root via treeHash.
-        let mut subtree_addr = Adrs::new();
-        subtree_addr.set_layer(layer);
-        subtree_addr.set_tree(tree);
-        let mut new_root = [0u8; MAX_N];
-        treehash(
-            p,
-            sk.sk_seed(),
-            sk.pub_seed(),
-            idx_leaf,
-            &subtree_addr,
-            &mut new_root,
-            &mut sig[off..off + p.tree_height as usize * n],
-        );
-        off += p.tree_height as usize * n;
+        // Authentication path + new (upper) root, read from the cached subtree
+        // (built once per (layer, tree) instead of rebuilt every signature).
+        let th = p.tree_height as usize;
+        let nodes = cache.get_or_build(p, sk.sk_seed(), sk.pub_seed(), layer, tree);
+        auth_path_from_subtree(p, nodes, idx_leaf, &mut sig[off..off + th * n]);
+        // The subtree root becomes the message signed at the next layer up.
+        root[..n].copy_from_slice(&nodes[th][..n]);
+        off += th * n;
 
-        root[..n].copy_from_slice(&new_root[..n]);
         cur_idx = tree;
     }
     sig
@@ -625,8 +682,10 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
 }
 
 /// Generates the raw secret/public key payloads from a `3n`-byte seed
-/// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). Returns `(sk_bytes, pk_bytes)`.
-fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+/// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). Returns `(sk_bytes, pk_bytes, top_subtree)`,
+/// where `top_subtree` is the fully-built layer-`(d-1)` tree (for seeding the
+/// signer's [`SubtreeCache`]).
+fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
     let n = p.n;
     let mut sk = vec![0u8; p.sk_bytes()];
     // idx = 0 (already zero).
@@ -638,15 +697,17 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let pub_seed = seed[2 * n..3 * n].to_vec();
     let mut top_addr = Adrs::new();
     top_addr.set_layer(p.d - 1);
-    let mut root = vec![0u8; n];
-    let mut auth = vec![0u8; p.tree_height as usize * n];
-    treehash(p, &sk_seed, &pub_seed, 0, &top_addr, &mut root, &mut auth);
-    sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&root);
+    let levels = build_subtree(p, &sk_seed, &pub_seed, &top_addr);
+    let th = p.tree_height as usize;
+    sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&levels[th][..n]);
 
     let mut pk = vec![0u8; p.pk_bytes()];
-    pk[..n].copy_from_slice(&root);
+    pk[..n].copy_from_slice(&levels[th][..n]);
     pk[n..2 * n].copy_from_slice(&pub_seed);
-    (sk, pk)
+    // Hand the just-built top subtree to the caller so it can seed the signer's
+    // cache (the top layer's tree is always tree 0, so this is reused on every
+    // signature; for single-tree XMSS it means signing never rebuilds the tree).
+    (sk, pk, levels)
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +737,9 @@ pub struct XmssPrivateKey {
     set: XmssParamSet,
     /// `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
     bytes: Vec<u8>,
+    /// In-memory, non-serialized cache of built subtrees (public node hashes),
+    /// so each signature reads its authentication path in `O(h)`.
+    cache: SubtreeCache,
 }
 
 /// An XMSS verification key (`root ‖ PUB_SEED`).
@@ -704,8 +768,12 @@ impl XmssPrivateKey {
             seed.len() >= 3 * p.n,
             "XMSS from_seed: seed must be 3n bytes"
         );
-        let (bytes, _pk) = core_keygen(&p, &seed[..3 * p.n]);
-        XmssPrivateKey { set, bytes }
+        let (bytes, _pk, top) = core_keygen(&p, &seed[..3 * p.n]);
+        XmssPrivateKey {
+            set,
+            bytes,
+            cache: SubtreeCache::seeded(p.d - 1, 0, top),
+        }
     }
 
     /// Generates a fresh key pair from a cryptographically secure `rng`.
@@ -761,7 +829,7 @@ impl XmssPrivateKey {
                 p: &p,
                 bytes: &self.bytes,
             };
-            core_sign(&p, &view, idx, msg)
+            core_sign(&p, &view, idx, msg, &mut self.cache)
         };
         // Advance the stored index only after the signature is produced.
         idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
@@ -795,6 +863,7 @@ impl XmssPrivateKey {
         Ok(XmssPrivateKey {
             set,
             bytes: raw.to_vec(),
+            cache: SubtreeCache::default(),
         })
     }
 }
@@ -846,6 +915,9 @@ impl XmssPublicKey {
 pub struct XmssMtPrivateKey {
     set: XmssMtParamSet,
     bytes: Vec<u8>,
+    /// In-memory, non-serialized cache of built subtrees (public node hashes);
+    /// holds at most one subtree per layer along the current index path.
+    cache: SubtreeCache,
 }
 
 /// An XMSS^MT verification key (`root ‖ PUB_SEED`).
@@ -873,8 +945,12 @@ impl XmssMtPrivateKey {
             seed.len() >= 3 * p.n,
             "XMSS^MT from_seed: seed must be 3n bytes"
         );
-        let (bytes, _pk) = core_keygen(&p, &seed[..3 * p.n]);
-        XmssMtPrivateKey { set, bytes }
+        let (bytes, _pk, top) = core_keygen(&p, &seed[..3 * p.n]);
+        XmssMtPrivateKey {
+            set,
+            bytes,
+            cache: SubtreeCache::seeded(p.d - 1, 0, top),
+        }
     }
 
     /// Generates a fresh key pair from a cryptographically secure `rng`.
@@ -937,7 +1013,7 @@ impl XmssMtPrivateKey {
                 p: &p,
                 bytes: &self.bytes,
             };
-            core_sign(&p, &view, idx, msg)
+            core_sign(&p, &view, idx, msg, &mut self.cache)
         };
         idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
         Ok(sig)
@@ -968,6 +1044,7 @@ impl XmssMtPrivateKey {
         Ok(XmssMtPrivateKey {
             set,
             bytes: raw.to_vec(),
+            cache: SubtreeCache::default(),
         })
     }
 }

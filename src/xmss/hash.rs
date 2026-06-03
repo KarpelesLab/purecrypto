@@ -75,6 +75,48 @@ pub(crate) fn prf_keygen(p: &Params, key: &[u8], input: &[u8], out: &mut [u8]) {
     core_hash(p, &[&pad[..p.padding_len], &key[..p.n], input], out);
 }
 
+/// A reusable SHA-2 PRF base: a [`Sha256`] already fed `toByte(3, pad) ‖ key`.
+///
+/// Returns `Some` only for the SHA-256 family with `padding_len + n == 64` (the
+/// `n = 32` sets), where `pad ‖ key` is exactly one 64-byte block and is thus
+/// already compressed into the returned state. Each [`prf_with`] is then a clone
+/// plus a single extra block, instead of compressing `pad ‖ key` afresh every
+/// call — and within a subtree `key = PUB_SEED` is constant across the millions
+/// of WOTS+/tree `prf` calls. SHAKE and the `n = 24` sets return `None`, and the
+/// caller falls back to [`prf`] (a sponge has no comparably cheap midstate).
+pub(crate) fn prf_base(p: &Params, key: &[u8]) -> Option<Sha256> {
+    if matches!(p.family, HashFamily::Sha2_256) && p.padding_len + p.n == 64 {
+        let mut pad = [0u8; MAX_PAD];
+        to_byte(PAD_PRF, p.padding_len, &mut pad);
+        let mut h = Sha256::new();
+        h.update(&pad[..p.padding_len]);
+        h.update(&key[..p.n]);
+        Some(h)
+    } else {
+        None
+    }
+}
+
+/// `PRF(key, input)` using a [`prf_base`] when present (one block cheaper), else
+/// the full [`prf`] path. `base`, when `Some`, MUST have been built from `key`.
+pub(crate) fn prf_with(
+    p: &Params,
+    base: &Option<Sha256>,
+    key: &[u8],
+    input: &[u8; 32],
+    out: &mut [u8],
+) {
+    match base {
+        Some(b) => {
+            let mut h = b.clone();
+            h.update(input);
+            let d = h.finalize();
+            out[..p.n].copy_from_slice(&d[..p.n]);
+        }
+        None => prf(p, key, input, out),
+    }
+}
+
 /// Tweakable hash `F` (RFC 8391): `hash(toByte(0, pad) ‖ key ‖ (m XOR mask))`.
 pub(crate) fn f(p: &Params, key: &[u8], masked: &[u8], out: &mut [u8]) {
     let mut pad = [0u8; MAX_PAD];
