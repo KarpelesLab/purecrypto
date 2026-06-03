@@ -23,6 +23,7 @@ mod cmac;
 mod ctr;
 mod des;
 mod gcm;
+mod gcm_siv;
 mod kw;
 mod ofb;
 mod poly1305;
@@ -40,6 +41,7 @@ pub use cmac::{AesCmac128, AesCmac256, Cmac};
 pub use ctr::Ctr;
 pub use des::{Cbc64, Des, TdesEde2, TdesEde3};
 pub use gcm::{Aes128Gcm, Aes256Gcm, Gcm};
+pub use gcm_siv::{Aes128GcmSiv, Aes256GcmSiv, AesGcmSiv};
 pub use kw::{
     Aes128Kw, Aes128Kwp, Aes192Kw, Aes192Kwp, Aes256Kw, Aes256Kwp, AesKw, AesKwp, KwError,
     kw_ciphertext_len, kwp_ciphertext_len,
