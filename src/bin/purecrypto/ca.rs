@@ -187,7 +187,17 @@ impl SerialLock {
                 .open(&path)
             {
                 Ok(_f) => return SerialLock { path },
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // `AlreadyExists`: another caller currently holds the lock.
+                // `PermissionDenied`: on Windows, a lock file that a peer is
+                // concurrently unlinking enters a "delete-pending" state in
+                // which `create_new` fails with ERROR_ACCESS_DENIED (os error
+                // 5) until the last handle closes — a transient race, not a
+                // hard error. Treat both as "retry", so a contended lock never
+                // spuriously aborts the process.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
                     if attempt + 1 == MAX_RETRIES {
                         die(format!(
                             "timed out waiting for CA serial lock {} \
