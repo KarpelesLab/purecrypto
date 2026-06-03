@@ -184,6 +184,19 @@ impl State256 {
     }
 }
 
+/// `u32` right-rotation as an explicit shift-or rather than
+/// [`u32::rotate_right`]. In debug builds `rotate_right` lowers to a real
+/// (non-inlined) `core::intrinsics::rotate_right` call, and SHA-256 issues ~440
+/// of them per 64-byte block — profiling showed that intrinsic alone at ~11% of
+/// XMSS keygen time. The shift-or inlines in debug; release codegen is identical.
+// Intentionally NOT `x.rotate_right(n)`: that lowers to a non-inlined
+// `core::intrinsics::rotate_right` call in debug builds (the whole point here).
+#[inline(always)]
+#[allow(clippy::manual_rotate)]
+const fn rotr(x: u32, n: u32) -> u32 {
+    (x >> n) | (x << (32 - n))
+}
+
 /// SHA-256 compression function: folds a 64-byte block into the state.
 #[inline]
 fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
@@ -192,8 +205,8 @@ fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
         *word = u32::from_be_bytes(chunk.try_into().unwrap());
     }
     for i in 16..64 {
-        let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-        let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+        let s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+        let s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
         w[i] = w[i - 16]
             .wrapping_add(s0)
             .wrapping_add(w[i - 7])
@@ -203,14 +216,14 @@ fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
 
     for i in 0..64 {
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
         let ch = (e & f) ^ ((!e) & g);
         let t1 = hh
             .wrapping_add(s1)
             .wrapping_add(ch)
             .wrapping_add(K256[i])
             .wrapping_add(w[i]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
         let maj = (a & b) ^ (a & c) ^ (b & c);
         let t2 = s0.wrapping_add(maj);
 

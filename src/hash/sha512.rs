@@ -221,6 +221,17 @@ impl State512 {
     }
 }
 
+/// `u64` right-rotation as an explicit shift-or rather than
+/// [`u64::rotate_right`]. In debug builds `rotate_right` lowers to a real
+/// (non-inlined) `core::intrinsics::rotate_right` call; the shift-or inlines,
+/// and release codegen is identical. (See the SHA-256 `rotr` for the profile.)
+// Intentionally NOT `x.rotate_right(n)` — see the SHA-256 `rotr`.
+#[inline(always)]
+#[allow(clippy::manual_rotate)]
+const fn rotr(x: u64, n: u32) -> u64 {
+    (x >> n) | (x << (64 - n))
+}
+
 /// SHA-512 compression function: folds a 128-byte block into the state.
 #[inline]
 fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
@@ -229,8 +240,8 @@ fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
         *word = u64::from_be_bytes(chunk.try_into().unwrap());
     }
     for i in 16..80 {
-        let s0 = w[i - 15].rotate_right(1) ^ w[i - 15].rotate_right(8) ^ (w[i - 15] >> 7);
-        let s1 = w[i - 2].rotate_right(19) ^ w[i - 2].rotate_right(61) ^ (w[i - 2] >> 6);
+        let s0 = rotr(w[i - 15], 1) ^ rotr(w[i - 15], 8) ^ (w[i - 15] >> 7);
+        let s1 = rotr(w[i - 2], 19) ^ rotr(w[i - 2], 61) ^ (w[i - 2] >> 6);
         w[i] = w[i - 16]
             .wrapping_add(s0)
             .wrapping_add(w[i - 7])
@@ -240,14 +251,14 @@ fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = *h;
 
     for i in 0..80 {
-        let s1 = e.rotate_right(14) ^ e.rotate_right(18) ^ e.rotate_right(41);
+        let s1 = rotr(e, 14) ^ rotr(e, 18) ^ rotr(e, 41);
         let ch = (e & f) ^ ((!e) & g);
         let t1 = hh
             .wrapping_add(s1)
             .wrapping_add(ch)
             .wrapping_add(K512[i])
             .wrapping_add(w[i]);
-        let s0 = a.rotate_right(28) ^ a.rotate_right(34) ^ a.rotate_right(39);
+        let s0 = rotr(a, 28) ^ rotr(a, 34) ^ rotr(a, 39);
         let maj = (a & b) ^ (a & c) ^ (b & c);
         let t2 = s0.wrapping_add(maj);
 
