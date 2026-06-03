@@ -36,6 +36,7 @@ use super::conn::ReplayWindow;
 /// variant-size disparity flagged by `clippy::large_enum_variant` is a
 /// non-issue.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum SigningKey {
     /// RSA key; signs with `rsa_pss_rsae_sha256`.
     Rsa(BoxedRsaPrivateKey),

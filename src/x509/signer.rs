@@ -26,6 +26,7 @@ use crate::slhdsa;
 /// supplied RNG; the public APIs that take a `CertSigner` thread the RNG
 /// through via the `*_general_with_rng` helpers, falling back to a
 /// transcript-keyed HMAC-DRBG when no RNG is supplied.
+#[non_exhaustive]
 pub enum CertSigner<'a> {
     /// An RSA signing key.
     Rsa(&'a BoxedRsaPrivateKey),

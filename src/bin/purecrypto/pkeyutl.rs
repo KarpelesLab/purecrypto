@@ -488,6 +488,7 @@ fn run_sign(args: Args) {
                 CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => k.sign::<Sha256>(&msg),
                 CurveId::P384 => k.sign::<Sha384>(&msg),
                 CurveId::P521 => k.sign::<Sha512>(&msg),
+                _ => die("unsupported EC curve"),
             }
             .unwrap_or_else(|e| die(format!("ECDSA sign failed: {e}")));
             sig.to_der(curve)
@@ -608,6 +609,7 @@ fn run_verify(args: Args) {
                 }
                 CurveId::P384 => k.verify::<Sha384>(&msg, &parsed),
                 CurveId::P521 => k.verify::<Sha512>(&msg, &parsed),
+                _ => die("unsupported EC curve"),
             }
             .is_ok()
         }
@@ -629,6 +631,7 @@ fn run_verify(args: Args) {
         AnyPublicKey::MlDsa65(k) => k.verify(&sig, &msg, b""),
         AnyPublicKey::MlDsa87(k) => k.verify(&sig, &msg, b""),
         AnyPublicKey::SlhDsa(k) => k.verify(&sig, &msg, b""),
+        _ => die("unsupported public key type for verify"),
     };
     report_verify(ok);
 }

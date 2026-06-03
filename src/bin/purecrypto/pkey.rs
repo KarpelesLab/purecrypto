@@ -33,6 +33,7 @@ fn curve_name(c: CurveId) -> &'static str {
         CurveId::P521 => "P-521",
         CurveId::Secp256k1 => "secp256k1",
         CurveId::Sm2p256v1 => "sm2p256v1",
+        _ => "unknown",
     }
 }
 

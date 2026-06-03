@@ -56,6 +56,7 @@ fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
 /// A public key whose algorithm is determined at runtime — the form recovered
 /// from a certificate or a PKIX SPKI document.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum AnyPublicKey {
     /// An RSA public key (runtime-sized).
     Rsa(BoxedRsaPublicKey),

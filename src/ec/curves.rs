@@ -5,6 +5,7 @@ use crate::bignum::BoxedUint;
 
 /// A supported prime-order curve.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[non_exhaustive]
 pub enum CurveId {
     /// NIST P-256 / secp256r1 / prime256v1 (`a = -3`, SHA-256).
     P256,

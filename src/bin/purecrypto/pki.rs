@@ -138,6 +138,7 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
                 CurveId::P521 => "P-521",
                 CurveId::Secp256k1 => "secp256k1",
                 CurveId::Sm2p256v1 => "sm2p256v1",
+                _ => "unknown",
             }
         ),
         AnyPublicKey::Ed25519(_) => "Ed25519".to_string(),
@@ -146,6 +147,7 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
         AnyPublicKey::MlDsa65(_) => "ML-DSA-65".to_string(),
         AnyPublicKey::MlDsa87(_) => "ML-DSA-87".to_string(),
         AnyPublicKey::SlhDsa(k) => format!("SLH-DSA ({:?})", k.parameter_set()),
+        _ => "unknown".to_string(),
     }
 }
 
