@@ -1,7 +1,1012 @@
 //! XMSS / XMSS^MT stateful hash-based signatures (RFC 8391, NIST SP 800-208).
 //!
-//! **Stateful:** the private key advances a one-time-key index on every
-//! signature and must be re-persisted after each sign; reuse of an index is
-//! catastrophic.
+//! XMSS is a stateful hash-based signature scheme: each signature consumes one
+//! WOTS+ one-time key, indexed by a leaf counter `idx` carried *inside* the
+//! private key. The scheme is built entirely from this crate's hash primitives
+//! (SHA-256 / SHAKE) and needs `alloc` only for the multi-kilobyte signatures.
 //!
-//! Placeholder module — the implementation lands in a follow-up commit.
+//! # Statefulness — read this before using the signing API
+//!
+//! **The private key is single-use per index, and reusing an index destroys
+//! all security.** Two distinct messages signed from the same `idx` let an
+//! attacker forge signatures. To use XMSS safely you MUST:
+//!
+//! - **Persist the serialized key after *every* [`sign`](XmssPrivateKey::sign)**
+//!   — `sign` takes `&mut self`, advances `idx`, and the new `idx` must reach
+//!   stable storage *before* the produced signature is released. Serialize with
+//!   [`to_bytes`](XmssPrivateKey::to_bytes) and write it out on each signature.
+//! - **Never sign twice from the same `idx`.** Do not roll the index back, do
+//!   not restore an old serialized copy and keep signing, and do not run two
+//!   signers from the same key file.
+//! - **Never clone a key and sign from both copies.** This type is deliberately
+//!   *not* [`Clone`]; copying the secret material and signing from each copy
+//!   reuses indices. Keep exactly one live signer per key.
+//! - **Handle exhaustion.** After `2^h` signatures the key is spent;
+//!   [`sign`](XmssPrivateKey::sign) returns [`Error::KeyExhausted`] rather than
+//!   reusing the final index. Check [`remaining`](XmssPrivateKey::remaining).
+//!
+//! Secret material is wiped on drop.
+//!
+//! # Example
+//!
+//! ```
+//! # #[cfg(feature = "xmss")] {
+//! use purecrypto::xmss::{XmssParamSet, XmssPrivateKey};
+//! use purecrypto::rng::HmacDrbg;
+//! use purecrypto::hash::Sha256;
+//!
+//! let mut rng = HmacDrbg::<Sha256>::new(b"seed", b"nonce", &[]);
+//! let mut sk = XmssPrivateKey::generate(XmssParamSet::Sha2_10_256, &mut rng);
+//! let pk = sk.public_key();
+//!
+//! let sig = sk.sign(b"hello").unwrap();
+//! // Persist sk.to_bytes() here, before using `sig`.
+//! assert!(pk.verify(b"hello", &sig));
+//! # }
+//! ```
+
+// The tree routines thread params, seeds, addresses, and several buffers
+// explicitly, as faithful ports of the reference C.
+#![allow(clippy::too_many_arguments)]
+
+mod adrs;
+mod hash;
+mod params;
+
+use adrs::{Adrs, AdrsType};
+use alloc::vec;
+use alloc::vec::Vec;
+use params::{MAX_N, MAX_WOTS_LEN, Params};
+
+pub use params::{XmssMtParamSet, XmssParamSet};
+
+use crate::ct::ConstantTimeEq;
+use crate::rng::{CryptoRng, RngCore};
+
+/// Errors from XMSS / XMSS^MT operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// A key or signature had the wrong length, or a serialized key was for a
+    /// different parameter set.
+    InvalidKey,
+    /// The signing key has no one-time keys left (`idx` reached `2^h`). The key
+    /// MUST NOT be used again; signing was refused rather than reuse an index.
+    KeyExhausted,
+}
+
+// ---------------------------------------------------------------------------
+// WOTS+ (RFC 8391 §3)
+// ---------------------------------------------------------------------------
+
+/// Derives the `len` WOTS+ secret chain starts from `SK_SEED` via `PRF_keygen`
+/// (SP 800-208), writing `len·n` bytes into `out`. Mirrors `expand_seed`.
+fn wots_expand_seed(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, out: &mut [u8]) {
+    let n = p.n;
+    addr.set_hash(0);
+    addr.set_key_and_mask(0);
+    // Input to PRF_keygen is PUB_SEED ‖ ADRS (n + 32 bytes).
+    let mut buf = [0u8; MAX_N + 32];
+    buf[..n].copy_from_slice(&pub_seed[..n]);
+    for i in 0..p.wots_len {
+        addr.set_chain(i as u32);
+        buf[n..n + 32].copy_from_slice(&addr.to_bytes());
+        hash::prf_keygen(p, sk_seed, &buf[..n + 32], &mut out[i * n..i * n + n]);
+    }
+}
+
+/// WOTS+ chaining function (RFC 8391 §3.1.2): apply `F` `steps` times starting
+/// from chain position `start`, keying `F` and its bitmask from `PUB_SEED`.
+fn wots_chain(
+    p: &Params,
+    pub_seed: &[u8],
+    inout: &mut [u8],
+    start: u32,
+    steps: u32,
+    addr: &mut Adrs,
+) {
+    let n = p.n;
+    let end = (start + steps).min(p.wots_w);
+    for i in start..end {
+        addr.set_hash(i);
+        // KEY = PRF(PUB_SEED, ADRS@keyAndMask=0); BM = PRF(.. keyAndMask=1).
+        let mut key = [0u8; MAX_N];
+        let mut bm = [0u8; MAX_N];
+        addr.set_key_and_mask(0);
+        hash::prf(p, pub_seed, &addr.to_bytes(), &mut key);
+        addr.set_key_and_mask(1);
+        hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm);
+        let mut masked = [0u8; MAX_N];
+        for j in 0..n {
+            masked[j] = inout[j] ^ bm[j];
+        }
+        hash::f(p, &key, &masked, inout);
+    }
+}
+
+/// WOTS+ public key generation (RFC 8391 §3.1.4): full chains over the secret.
+fn wots_pkgen(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, pk: &mut [u8]) {
+    let n = p.n;
+    wots_expand_seed(p, sk_seed, pub_seed, addr, pk);
+    for i in 0..p.wots_len {
+        addr.set_chain(i as u32);
+        wots_chain(
+            p,
+            pub_seed,
+            &mut pk[i * n..i * n + n],
+            0,
+            p.wots_w - 1,
+            addr,
+        );
+    }
+}
+
+/// `base_w` (RFC 8391 §2.6): decompose `input` into `out.len()` base-`w` digits.
+fn base_w(p: &Params, input: &[u8], out: &mut [u32]) {
+    let mut total = 0u8;
+    let mut bits = 0i32;
+    let mut in_idx = 0usize;
+    for o in out.iter_mut() {
+        if bits == 0 {
+            total = input[in_idx];
+            in_idx += 1;
+            bits = 8;
+        }
+        bits -= p.wots_log_w as i32;
+        *o = ((total >> bits) as u32) & (p.wots_w - 1);
+    }
+}
+
+/// Computes the `len` WOTS+ chain lengths for an `n`-byte message digest:
+/// `base_w(msg)` followed by the base-`w` checksum (RFC 8391 §3.1.5).
+fn chain_lengths(p: &Params, msg: &[u8]) -> [u32; MAX_WOTS_LEN] {
+    let mut lengths = [0u32; MAX_WOTS_LEN];
+    base_w(p, msg, &mut lengths[..p.wots_len1]);
+
+    let mut csum: u32 = 0;
+    for &l in &lengths[..p.wots_len1] {
+        csum += p.wots_w - 1 - l;
+    }
+    // Left-shift so the meaningful bits are MSB-aligned in the byte string.
+    let shift = (8 - ((p.wots_len2 * p.wots_log_w as usize) % 8)) % 8;
+    csum <<= shift;
+    let csum_bytes_len = (p.wots_len2 * p.wots_log_w as usize).div_ceil(8);
+    let mut csum_bytes = [0u8; 4];
+    for (i, b) in csum_bytes.iter_mut().enumerate().take(csum_bytes_len) {
+        *b = (csum >> (8 * (csum_bytes_len - 1 - i))) as u8;
+    }
+    base_w(
+        p,
+        &csum_bytes[..csum_bytes_len],
+        &mut lengths[p.wots_len1..p.wots_len1 + p.wots_len2],
+    );
+    lengths
+}
+
+/// WOTS+ sign (RFC 8391 §3.1.5): partial chains to the message lengths.
+fn wots_sign(
+    p: &Params,
+    msg: &[u8],
+    sk_seed: &[u8],
+    pub_seed: &[u8],
+    addr: &mut Adrs,
+    sig: &mut [u8],
+) {
+    let n = p.n;
+    let lengths = chain_lengths(p, msg);
+    wots_expand_seed(p, sk_seed, pub_seed, addr, sig);
+    for i in 0..p.wots_len {
+        addr.set_chain(i as u32);
+        wots_chain(p, pub_seed, &mut sig[i * n..i * n + n], 0, lengths[i], addr);
+    }
+}
+
+/// WOTS+ public key from a signature (RFC 8391 §3.1.6).
+fn wots_pk_from_sig(
+    p: &Params,
+    sig: &[u8],
+    msg: &[u8],
+    pub_seed: &[u8],
+    addr: &mut Adrs,
+    pk: &mut [u8],
+) {
+    let n = p.n;
+    let lengths = chain_lengths(p, msg);
+    for i in 0..p.wots_len {
+        addr.set_chain(i as u32);
+        pk[i * n..i * n + n].copy_from_slice(&sig[i * n..i * n + n]);
+        wots_chain(
+            p,
+            pub_seed,
+            &mut pk[i * n..i * n + n],
+            lengths[i],
+            p.wots_w - 1 - lengths[i],
+            addr,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Randomized tree hashing (RFC 8391 §4.1.4 RAND_HASH)
+// ---------------------------------------------------------------------------
+
+/// `RAND_HASH(left, right, PUB_SEED, ADRS)` = `H(KEY, (L⊕BM0)‖(R⊕BM1))` with
+/// KEY/BM0/BM1 derived from `PUB_SEED` and the address via PRF.
+fn rand_hash(
+    p: &Params,
+    left: &[u8],
+    right: &[u8],
+    pub_seed: &[u8],
+    addr: &mut Adrs,
+    out: &mut [u8],
+) {
+    let n = p.n;
+    let mut key = [0u8; MAX_N];
+    let mut bm = [0u8; 2 * MAX_N];
+    addr.set_key_and_mask(0);
+    hash::prf(p, pub_seed, &addr.to_bytes(), &mut key);
+    addr.set_key_and_mask(1);
+    hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm[..n]);
+    addr.set_key_and_mask(2);
+    hash::prf(p, pub_seed, &addr.to_bytes(), &mut bm[n..2 * n]);
+
+    let mut masked = [0u8; 2 * MAX_N];
+    for i in 0..n {
+        masked[i] = left[i] ^ bm[i];
+        masked[n + i] = right[i] ^ bm[n + i];
+    }
+    hash::h(p, &key, &masked, out);
+}
+
+/// L-tree (RFC 8391 §4.1.5): compresses a WOTS+ public key to a single leaf.
+/// Operates in place over `wots_pk` (which it consumes).
+fn l_tree(p: &Params, wots_pk: &mut [u8], pub_seed: &[u8], addr: &mut Adrs, leaf: &mut [u8]) {
+    let n = p.n;
+    let mut l = p.wots_len;
+    let mut height = 0u32;
+    addr.set_tree_height(0);
+    while l > 1 {
+        let parents = l / 2;
+        for i in 0..parents {
+            addr.set_tree_index(i as u32);
+            let mut node = [0u8; MAX_N];
+            let mut left = [0u8; MAX_N];
+            let mut right = [0u8; MAX_N];
+            left[..n].copy_from_slice(&wots_pk[2 * i * n..2 * i * n + n]);
+            right[..n].copy_from_slice(&wots_pk[(2 * i + 1) * n..(2 * i + 1) * n + n]);
+            rand_hash(p, &left[..n], &right[..n], pub_seed, addr, &mut node);
+            wots_pk[i * n..i * n + n].copy_from_slice(&node[..n]);
+        }
+        if l & 1 == 1 {
+            let (lo, hi) = ((l / 2) * n, (l - 1) * n);
+            wots_pk.copy_within(hi..hi + n, lo);
+            l = l / 2 + 1;
+        } else {
+            l /= 2;
+        }
+        height += 1;
+        addr.set_tree_height(height);
+    }
+    leaf[..n].copy_from_slice(&wots_pk[..n]);
+}
+
+/// Computes the leaf (L-tree root) for the WOTS+ key pair addressed by
+/// `ltree_addr` / `ots_addr` (RFC 8391 §4.1.6).
+fn gen_leaf(
+    p: &Params,
+    sk_seed: &[u8],
+    pub_seed: &[u8],
+    ltree_addr: &mut Adrs,
+    ots_addr: &mut Adrs,
+    leaf: &mut [u8],
+) {
+    let mut pk = vec![0u8; p.wots_sig_bytes()];
+    wots_pkgen(p, sk_seed, pub_seed, ots_addr, &mut pk);
+    l_tree(p, &mut pk, pub_seed, ltree_addr, leaf);
+}
+
+/// Merkle treeHash (RFC 8391 §4.1.6, BDS-stack form): computes the subtree root
+/// and the authentication path for `leaf_idx`. `subtree_addr` must carry the
+/// layer and tree fields of the target subtree.
+fn treehash(
+    p: &Params,
+    sk_seed: &[u8],
+    pub_seed: &[u8],
+    leaf_idx: u32,
+    subtree_addr: &Adrs,
+    root: &mut [u8],
+    auth_path: &mut [u8],
+) {
+    let n = p.n;
+    let th = p.tree_height as usize;
+    let mut stack = vec![0u8; (th + 1) * n];
+    let mut heights = vec![0u32; th + 1];
+    let mut offset = 0usize;
+
+    let mut ots_addr = Adrs::new();
+    let mut ltree_addr = Adrs::new();
+    let mut node_addr = Adrs::new();
+    ots_addr.copy_subtree(subtree_addr);
+    ltree_addr.copy_subtree(subtree_addr);
+    node_addr.copy_subtree(subtree_addr);
+    ots_addr.set_type(AdrsType::Ots);
+    ltree_addr.set_type(AdrsType::Ltree);
+    node_addr.set_type(AdrsType::HashTree);
+
+    for idx in 0u32..(1u32 << p.tree_height) {
+        ltree_addr.set_ltree(idx);
+        ots_addr.set_ots(idx);
+        gen_leaf(
+            p,
+            sk_seed,
+            pub_seed,
+            &mut ltree_addr,
+            &mut ots_addr,
+            &mut stack[offset * n..offset * n + n],
+        );
+        offset += 1;
+        heights[offset - 1] = 0;
+
+        if (leaf_idx ^ 0x1) == idx {
+            auth_path[..n].copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
+        }
+
+        while offset >= 2 && heights[offset - 1] == heights[offset - 2] {
+            let tree_idx = idx >> (heights[offset - 1] + 1);
+            node_addr.set_tree_height(heights[offset - 1]);
+            node_addr.set_tree_index(tree_idx);
+            let mut parent = [0u8; MAX_N];
+            let mut left = [0u8; MAX_N];
+            let mut right = [0u8; MAX_N];
+            left[..n].copy_from_slice(&stack[(offset - 2) * n..(offset - 2) * n + n]);
+            right[..n].copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
+            rand_hash(
+                p,
+                &left[..n],
+                &right[..n],
+                pub_seed,
+                &mut node_addr,
+                &mut parent,
+            );
+            stack[(offset - 2) * n..(offset - 2) * n + n].copy_from_slice(&parent[..n]);
+            offset -= 1;
+            heights[offset - 1] += 1;
+
+            if ((leaf_idx >> heights[offset - 1]) ^ 0x1) == tree_idx {
+                let h = heights[offset - 1] as usize;
+                auth_path[h * n..h * n + n]
+                    .copy_from_slice(&stack[(offset - 1) * n..(offset - 1) * n + n]);
+            }
+        }
+    }
+    root[..n].copy_from_slice(&stack[..n]);
+}
+
+/// Computes a subtree root from a leaf and an authentication path
+/// (RFC 8391 §4.1.10, XMSS_rootFromSig inner loop).
+fn root_from_sig(
+    p: &Params,
+    mut leaf_idx: u32,
+    leaf: &[u8],
+    auth_path: &[u8],
+    pub_seed: &[u8],
+    node_addr: &mut Adrs,
+    root: &mut [u8],
+) {
+    let n = p.n;
+    let th = p.tree_height;
+    let mut buffer = [0u8; 2 * MAX_N];
+    if leaf_idx & 1 == 1 {
+        buffer[..n].copy_from_slice(&auth_path[..n]);
+        buffer[n..2 * n].copy_from_slice(&leaf[..n]);
+    } else {
+        buffer[..n].copy_from_slice(&leaf[..n]);
+        buffer[n..2 * n].copy_from_slice(&auth_path[..n]);
+    }
+    let mut ap = &auth_path[n..];
+
+    for i in 0..th - 1 {
+        node_addr.set_tree_height(i);
+        leaf_idx >>= 1;
+        node_addr.set_tree_index(leaf_idx);
+        let mut out = [0u8; MAX_N];
+        let mut left = [0u8; MAX_N];
+        let mut right = [0u8; MAX_N];
+        left[..n].copy_from_slice(&buffer[..n]);
+        right[..n].copy_from_slice(&buffer[n..2 * n]);
+        rand_hash(p, &left[..n], &right[..n], pub_seed, node_addr, &mut out);
+        if leaf_idx & 1 == 1 {
+            buffer[n..2 * n].copy_from_slice(&out[..n]);
+            buffer[..n].copy_from_slice(&ap[..n]);
+        } else {
+            buffer[..n].copy_from_slice(&out[..n]);
+            buffer[n..2 * n].copy_from_slice(&ap[..n]);
+        }
+        ap = &ap[n..];
+    }
+    node_addr.set_tree_height(th - 1);
+    leaf_idx >>= 1;
+    node_addr.set_tree_index(leaf_idx);
+    let mut left = [0u8; MAX_N];
+    let mut right = [0u8; MAX_N];
+    left[..n].copy_from_slice(&buffer[..n]);
+    right[..n].copy_from_slice(&buffer[n..2 * n]);
+    rand_hash(p, &left[..n], &right[..n], pub_seed, node_addr, root);
+}
+
+// ---------------------------------------------------------------------------
+// Core sign / verify (XMSS^MT, with d=1 covering plain XMSS)
+// ---------------------------------------------------------------------------
+
+/// Raw secret-key view: `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
+struct SkView<'a> {
+    p: &'a Params,
+    bytes: &'a [u8],
+}
+
+impl SkView<'_> {
+    fn sk_seed(&self) -> &[u8] {
+        &self.bytes[self.p.index_bytes..self.p.index_bytes + self.p.n]
+    }
+    fn sk_prf(&self) -> &[u8] {
+        let o = self.p.index_bytes + self.p.n;
+        &self.bytes[o..o + self.p.n]
+    }
+    fn root(&self) -> &[u8] {
+        let o = self.p.index_bytes + 2 * self.p.n;
+        &self.bytes[o..o + self.p.n]
+    }
+    fn pub_seed(&self) -> &[u8] {
+        let o = self.p.index_bytes + 3 * self.p.n;
+        &self.bytes[o..o + self.p.n]
+    }
+}
+
+/// Big-endian decode of `len` index bytes.
+fn bytes_to_idx(b: &[u8]) -> u64 {
+    b.iter().fold(0u64, |acc, &v| (acc << 8) | v as u64)
+}
+
+/// Big-endian encode an index into `out` (length `out.len()`).
+fn idx_to_bytes(idx: u64, out: &mut [u8]) {
+    let len = out.len();
+    let mut v = idx;
+    for i in (0..len).rev() {
+        out[i] = (v & 0xff) as u8;
+        v >>= 8;
+    }
+}
+
+/// Produces a full XMSS / XMSS^MT signature for leaf `idx` over `msg`. The
+/// signature buffer layout is `idx ‖ R ‖ (WOTS_sig ‖ auth_path)^d`.
+fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8]) -> Vec<u8> {
+    let n = p.n;
+    let mut sig = vec![0u8; p.sig_bytes()];
+
+    // idx
+    idx_to_bytes(idx, &mut sig[..p.index_bytes]);
+
+    // R = PRF(SK_PRF, toByte(idx, 32)).
+    let mut idx32 = [0u8; 32];
+    idx32[24..32].copy_from_slice(&idx.to_be_bytes());
+    hash::prf(
+        p,
+        sk.sk_prf(),
+        &idx32,
+        &mut sig[p.index_bytes..p.index_bytes + n],
+    );
+
+    // mhash = H_msg(R, root, idx, msg).
+    let mut mhash = [0u8; MAX_N];
+    {
+        let r = sig[p.index_bytes..p.index_bytes + n].to_vec();
+        hash::h_msg(p, &r, sk.root(), idx, msg, &mut mhash);
+    }
+
+    let mut off = p.index_bytes + n;
+    let leaf_mask = (1u64 << p.tree_height) - 1;
+    let mut cur_idx = idx;
+    let mut root = [0u8; MAX_N];
+    root[..n].copy_from_slice(&mhash[..n]);
+
+    let mut ots_addr = Adrs::new();
+    ots_addr.set_type(AdrsType::Ots);
+
+    for layer in 0..p.d {
+        let idx_leaf = (cur_idx & leaf_mask) as u32;
+        let tree = cur_idx >> p.tree_height;
+
+        ots_addr.set_layer(layer);
+        ots_addr.set_tree(tree);
+        ots_addr.set_ots(idx_leaf);
+
+        // WOTS+ signature over the current root (mhash for layer 0).
+        wots_sign(
+            p,
+            &root[..n],
+            sk.sk_seed(),
+            sk.pub_seed(),
+            &mut ots_addr,
+            &mut sig[off..off + p.wots_sig_bytes()],
+        );
+        off += p.wots_sig_bytes();
+
+        // Authentication path + new (upper) root via treeHash.
+        let mut subtree_addr = Adrs::new();
+        subtree_addr.set_layer(layer);
+        subtree_addr.set_tree(tree);
+        let mut new_root = [0u8; MAX_N];
+        treehash(
+            p,
+            sk.sk_seed(),
+            sk.pub_seed(),
+            idx_leaf,
+            &subtree_addr,
+            &mut new_root,
+            &mut sig[off..off + p.tree_height as usize * n],
+        );
+        off += p.tree_height as usize * n;
+
+        root[..n].copy_from_slice(&new_root[..n]);
+        cur_idx = tree;
+    }
+    sig
+}
+
+/// Verifies a full XMSS / XMSS^MT signature against `pub_root ‖ pub_seed`.
+fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[u8]) -> bool {
+    let n = p.n;
+    if sig.len() != p.sig_bytes() {
+        return false;
+    }
+    let idx = bytes_to_idx(&sig[..p.index_bytes]);
+    let r = &sig[p.index_bytes..p.index_bytes + n];
+
+    let mut mhash = [0u8; MAX_N];
+    hash::h_msg(p, r, pub_root, idx, msg, &mut mhash);
+
+    let mut off = p.index_bytes + n;
+    let leaf_mask = (1u64 << p.tree_height) - 1;
+    let mut cur_idx = idx;
+    let mut root = [0u8; MAX_N];
+    root[..n].copy_from_slice(&mhash[..n]);
+
+    let mut ots_addr = Adrs::new();
+    let mut ltree_addr = Adrs::new();
+    let mut node_addr = Adrs::new();
+    ots_addr.set_type(AdrsType::Ots);
+    ltree_addr.set_type(AdrsType::Ltree);
+    node_addr.set_type(AdrsType::HashTree);
+
+    for layer in 0..p.d {
+        let idx_leaf = (cur_idx & leaf_mask) as u32;
+        let tree = cur_idx >> p.tree_height;
+
+        ots_addr.set_layer(layer);
+        ltree_addr.set_layer(layer);
+        node_addr.set_layer(layer);
+        ots_addr.set_tree(tree);
+        ltree_addr.set_tree(tree);
+        node_addr.set_tree(tree);
+        ots_addr.set_ots(idx_leaf);
+
+        // Recover the WOTS+ public key, then the leaf via L-tree.
+        let mut wots_pk = vec![0u8; p.wots_sig_bytes()];
+        wots_pk_from_sig(
+            p,
+            &sig[off..off + p.wots_sig_bytes()],
+            &root[..n],
+            pub_seed,
+            &mut ots_addr,
+            &mut wots_pk,
+        );
+        off += p.wots_sig_bytes();
+
+        ltree_addr.set_ltree(idx_leaf);
+        let mut leaf = [0u8; MAX_N];
+        l_tree(p, &mut wots_pk, pub_seed, &mut ltree_addr, &mut leaf);
+
+        let auth_path = &sig[off..off + p.tree_height as usize * n];
+        off += p.tree_height as usize * n;
+        let mut new_root = [0u8; MAX_N];
+        root_from_sig(
+            p,
+            idx_leaf,
+            &leaf[..n],
+            auth_path,
+            pub_seed,
+            &mut node_addr,
+            &mut new_root,
+        );
+        root[..n].copy_from_slice(&new_root[..n]);
+        cur_idx = tree;
+    }
+    bool::from(root[..n].ct_eq(&pub_root[..n]))
+}
+
+/// Generates the raw secret/public key payloads from a `3n`-byte seed
+/// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). Returns `(sk_bytes, pk_bytes)`.
+fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let n = p.n;
+    let mut sk = vec![0u8; p.sk_bytes()];
+    // idx = 0 (already zero).
+    sk[p.index_bytes..p.index_bytes + 2 * n].copy_from_slice(&seed[..2 * n]); // SK_SEED ‖ SK_PRF
+    sk[p.index_bytes + 3 * n..p.index_bytes + 4 * n].copy_from_slice(&seed[2 * n..3 * n]); // PUB_SEED
+
+    // Compute the top-most subtree root.
+    let sk_seed = seed[..n].to_vec();
+    let pub_seed = seed[2 * n..3 * n].to_vec();
+    let mut top_addr = Adrs::new();
+    top_addr.set_layer(p.d - 1);
+    let mut root = vec![0u8; n];
+    let mut auth = vec![0u8; p.tree_height as usize * n];
+    treehash(p, &sk_seed, &pub_seed, 0, &top_addr, &mut root, &mut auth);
+    sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&root);
+
+    let mut pk = vec![0u8; p.pk_bytes()];
+    pk[..n].copy_from_slice(&root);
+    pk[n..2 * n].copy_from_slice(&pub_seed);
+    (sk, pk)
+}
+
+// ---------------------------------------------------------------------------
+// Serialization helpers (raw, self-describing format)
+// ---------------------------------------------------------------------------
+
+const SK_MAGIC: &[u8; 4] = b"XMSk";
+const MTSK_MAGIC: &[u8; 4] = b"XMTk";
+
+fn wipe(v: &mut [u8]) {
+    for b in v.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&v);
+}
+
+// ---------------------------------------------------------------------------
+// Public XMSS key API
+// ---------------------------------------------------------------------------
+
+/// A stateful XMSS signing key (RFC 8391 §4.1).
+///
+/// Holds the secret seeds and the next leaf index. See the [module
+/// docs](self) for the mandatory persist-after-every-sign discipline; this type
+/// is intentionally not [`Clone`].
+pub struct XmssPrivateKey {
+    set: XmssParamSet,
+    /// `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
+    bytes: Vec<u8>,
+}
+
+/// An XMSS verification key (`root ‖ PUB_SEED`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct XmssPublicKey {
+    set: XmssParamSet,
+    bytes: Vec<u8>,
+}
+
+impl XmssPrivateKey {
+    /// The parameter set this key was generated for.
+    pub fn parameter_set(&self) -> XmssParamSet {
+        self.set
+    }
+
+    /// Deterministically derives a key pair from a `3n`-byte seed
+    /// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). The seed is caller-supplied local key
+    /// material.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seed` is shorter than `3n` bytes.
+    pub fn from_seed(set: XmssParamSet, seed: &[u8]) -> Self {
+        let p = set.params();
+        assert!(
+            seed.len() >= 3 * p.n,
+            "XMSS from_seed: seed must be 3n bytes"
+        );
+        let (bytes, _pk) = core_keygen(&p, &seed[..3 * p.n]);
+        XmssPrivateKey { set, bytes }
+    }
+
+    /// Generates a fresh key pair from a cryptographically secure `rng`.
+    pub fn generate<R: RngCore + CryptoRng>(set: XmssParamSet, rng: &mut R) -> Self {
+        let p = set.params();
+        let mut seed = vec![0u8; 3 * p.n];
+        rng.fill_bytes(&mut seed);
+        let sk = Self::from_seed(set, &seed);
+        wipe(&mut seed);
+        sk
+    }
+
+    /// The matching public key (`root ‖ PUB_SEED`).
+    pub fn public_key(&self) -> XmssPublicKey {
+        let p = self.set.params();
+        let n = p.n;
+        let mut bytes = vec![0u8; 2 * n];
+        bytes[..n].copy_from_slice(&self.bytes[p.index_bytes + 2 * n..p.index_bytes + 3 * n]);
+        bytes[n..2 * n].copy_from_slice(&self.bytes[p.index_bytes + 3 * n..p.index_bytes + 4 * n]);
+        XmssPublicKey {
+            set: self.set,
+            bytes,
+        }
+    }
+
+    /// The next leaf index that will be consumed by [`sign`](Self::sign).
+    pub fn index(&self) -> u64 {
+        let p = self.set.params();
+        bytes_to_idx(&self.bytes[..p.index_bytes])
+    }
+
+    /// The number of one-time keys still available (`2^h − idx`).
+    pub fn remaining(&self) -> u64 {
+        let p = self.set.params();
+        let total = 1u64 << p.full_height;
+        total.saturating_sub(self.index())
+    }
+
+    /// Signs `msg`, consuming the current one-time key and advancing the index.
+    ///
+    /// **Persist `self.to_bytes()` to durable storage before releasing the
+    /// returned signature**, and never sign twice from the same index — see the
+    /// [module docs](self). Returns [`Error::KeyExhausted`] when no one-time
+    /// keys remain (the key MUST NOT be reused after that).
+    pub fn sign(&mut self, msg: &[u8]) -> Result<Vec<u8>, Error> {
+        let p = self.set.params();
+        let idx = self.index();
+        if idx >= (1u64 << p.full_height) {
+            return Err(Error::KeyExhausted);
+        }
+        let sig = {
+            let view = SkView {
+                p: &p,
+                bytes: &self.bytes,
+            };
+            core_sign(&p, &view, idx, msg)
+        };
+        // Advance the stored index only after the signature is produced.
+        idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
+        Ok(sig)
+    }
+
+    /// The serialized signing key: `magic ‖ oid ‖ raw_sk`, where `raw_sk` is
+    /// `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`. The embedded `idx` is what
+    /// makes the state recoverable — persist this after every sign.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.bytes.len());
+        out.extend_from_slice(SK_MAGIC);
+        out.extend_from_slice(&self.set.oid().to_be_bytes());
+        out.extend_from_slice(&self.bytes);
+        out
+    }
+
+    /// Parses a signing key previously produced by [`to_bytes`](Self::to_bytes),
+    /// resuming from its stored index.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < 8 || &bytes[..4] != SK_MAGIC {
+            return Err(Error::InvalidKey);
+        }
+        let oid = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let set = XmssParamSet::from_oid(oid).ok_or(Error::InvalidKey)?;
+        let p = set.params();
+        let raw = &bytes[8..];
+        if raw.len() != p.sk_bytes() {
+            return Err(Error::InvalidKey);
+        }
+        Ok(XmssPrivateKey {
+            set,
+            bytes: raw.to_vec(),
+        })
+    }
+}
+
+impl Drop for XmssPrivateKey {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
+impl XmssPublicKey {
+    /// The parameter set this key belongs to.
+    pub fn parameter_set(&self) -> XmssParamSet {
+        self.set
+    }
+
+    /// Verifies `sig` over `msg`.
+    pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+        let p = self.set.params();
+        let n = p.n;
+        core_verify(&p, &self.bytes[..n], &self.bytes[n..2 * n], sig, msg)
+    }
+
+    /// The raw public key bytes (`root ‖ PUB_SEED`).
+    pub fn to_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Parses a raw public key (`root ‖ PUB_SEED`) for parameter `set`.
+    pub fn from_bytes(set: XmssParamSet, bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != set.params().pk_bytes() {
+            return Err(Error::InvalidKey);
+        }
+        Ok(XmssPublicKey {
+            set,
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public XMSS^MT key API
+// ---------------------------------------------------------------------------
+
+/// A stateful XMSS^MT signing key (RFC 8391 §4.2).
+///
+/// Same single-use-per-index discipline as [`XmssPrivateKey`]; see the [module
+/// docs](self). Not [`Clone`].
+pub struct XmssMtPrivateKey {
+    set: XmssMtParamSet,
+    bytes: Vec<u8>,
+}
+
+/// An XMSS^MT verification key (`root ‖ PUB_SEED`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct XmssMtPublicKey {
+    set: XmssMtParamSet,
+    bytes: Vec<u8>,
+}
+
+impl XmssMtPrivateKey {
+    /// The parameter set this key was generated for.
+    pub fn parameter_set(&self) -> XmssMtParamSet {
+        self.set
+    }
+
+    /// Deterministically derives a key pair from a `3n`-byte seed
+    /// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seed` is shorter than `3n` bytes.
+    pub fn from_seed(set: XmssMtParamSet, seed: &[u8]) -> Self {
+        let p = set.params();
+        assert!(
+            seed.len() >= 3 * p.n,
+            "XMSS^MT from_seed: seed must be 3n bytes"
+        );
+        let (bytes, _pk) = core_keygen(&p, &seed[..3 * p.n]);
+        XmssMtPrivateKey { set, bytes }
+    }
+
+    /// Generates a fresh key pair from a cryptographically secure `rng`.
+    pub fn generate<R: RngCore + CryptoRng>(set: XmssMtParamSet, rng: &mut R) -> Self {
+        let p = set.params();
+        let mut seed = vec![0u8; 3 * p.n];
+        rng.fill_bytes(&mut seed);
+        let sk = Self::from_seed(set, &seed);
+        wipe(&mut seed);
+        sk
+    }
+
+    /// The matching public key.
+    pub fn public_key(&self) -> XmssMtPublicKey {
+        let p = self.set.params();
+        let n = p.n;
+        let mut bytes = vec![0u8; 2 * n];
+        bytes[..n].copy_from_slice(&self.bytes[p.index_bytes + 2 * n..p.index_bytes + 3 * n]);
+        bytes[n..2 * n].copy_from_slice(&self.bytes[p.index_bytes + 3 * n..p.index_bytes + 4 * n]);
+        XmssMtPublicKey {
+            set: self.set,
+            bytes,
+        }
+    }
+
+    /// The next leaf index that will be consumed by [`sign`](Self::sign).
+    pub fn index(&self) -> u64 {
+        let p = self.set.params();
+        bytes_to_idx(&self.bytes[..p.index_bytes])
+    }
+
+    /// The number of one-time keys still available (`2^h − idx`).
+    pub fn remaining(&self) -> u64 {
+        let p = self.set.params();
+        let total = if p.full_height >= 64 {
+            u64::MAX
+        } else {
+            1u64 << p.full_height
+        };
+        total.saturating_sub(self.index())
+    }
+
+    /// Signs `msg`, consuming the current one-time key and advancing the index.
+    ///
+    /// **Persist `self.to_bytes()` before releasing the returned signature.**
+    /// Returns [`Error::KeyExhausted`] when no one-time keys remain.
+    pub fn sign(&mut self, msg: &[u8]) -> Result<Vec<u8>, Error> {
+        let p = self.set.params();
+        let idx = self.index();
+        let exhausted = if p.full_height >= 64 {
+            false
+        } else {
+            idx >= (1u64 << p.full_height)
+        };
+        if exhausted {
+            return Err(Error::KeyExhausted);
+        }
+        let sig = {
+            let view = SkView {
+                p: &p,
+                bytes: &self.bytes,
+            };
+            core_sign(&p, &view, idx, msg)
+        };
+        idx_to_bytes(idx + 1, &mut self.bytes[..p.index_bytes]);
+        Ok(sig)
+    }
+
+    /// The serialized signing key: `magic ‖ oid ‖ raw_sk`. Persist after every
+    /// sign; the embedded index makes the state recoverable.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + self.bytes.len());
+        out.extend_from_slice(MTSK_MAGIC);
+        out.extend_from_slice(&self.set.oid().to_be_bytes());
+        out.extend_from_slice(&self.bytes);
+        out
+    }
+
+    /// Parses a signing key previously produced by [`to_bytes`](Self::to_bytes).
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() < 8 || &bytes[..4] != MTSK_MAGIC {
+            return Err(Error::InvalidKey);
+        }
+        let oid = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let set = XmssMtParamSet::from_oid(oid).ok_or(Error::InvalidKey)?;
+        let p = set.params();
+        let raw = &bytes[8..];
+        if raw.len() != p.sk_bytes() {
+            return Err(Error::InvalidKey);
+        }
+        Ok(XmssMtPrivateKey {
+            set,
+            bytes: raw.to_vec(),
+        })
+    }
+}
+
+impl Drop for XmssMtPrivateKey {
+    fn drop(&mut self) {
+        wipe(&mut self.bytes);
+    }
+}
+
+impl XmssMtPublicKey {
+    /// The parameter set this key belongs to.
+    pub fn parameter_set(&self) -> XmssMtParamSet {
+        self.set
+    }
+
+    /// Verifies `sig` over `msg`.
+    pub fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+        let p = self.set.params();
+        let n = p.n;
+        core_verify(&p, &self.bytes[..n], &self.bytes[n..2 * n], sig, msg)
+    }
+
+    /// The raw public key bytes (`root ‖ PUB_SEED`).
+    pub fn to_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Parses a raw public key for parameter `set`.
+    pub fn from_bytes(set: XmssMtParamSet, bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != set.params().pk_bytes() {
+            return Err(Error::InvalidKey);
+        }
+        Ok(XmssMtPublicKey {
+            set,
+            bytes: bytes.to_vec(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
