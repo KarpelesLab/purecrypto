@@ -35,7 +35,7 @@ use crate::tls::crypto::prf::{
 };
 use crate::tls::crypto::{Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
-use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls};
+use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
@@ -668,13 +668,19 @@ impl DtlsClientConnection12 {
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
             let now = self.config.verification_time.clone();
-            verify_chain_with_crls(
+            let key = verify_chain_with_crls(
                 &self.config.roots,
                 &self.config.crls,
                 &chain,
                 now.as_ref(),
                 &self.config.signature_policy,
-            )?
+            )?;
+            // RFC 6125: confirm the validated leaf is actually issued for the
+            // host we intended to reach. Without this, any cert chaining to a
+            // trusted CA (e.g. a legit cert for attacker.com) would be accepted
+            // for any target host — a server-authentication bypass.
+            verify_hostname(&leaf, &self.config.server_name)?;
+            key
         } else {
             leaf.subject_public_key()
                 .map_err(|_| Error::BadCertificate)?

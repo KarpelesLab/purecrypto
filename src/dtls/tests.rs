@@ -47,9 +47,15 @@ fn make_server() -> (PcServerConfig12, Vec<u8>) {
 }
 
 fn make_client(server_cert: &[u8]) -> DtlsClientConnection12 {
+    make_client_named(server_cert, "dtls.example")
+}
+
+/// Like `make_client` but lets the test pick the SNI / hostname that the
+/// client will require the server certificate to match.
+fn make_client_named(server_cert: &[u8], server_name: &str) -> DtlsClientConnection12 {
     let mut roots = RootCertStore::new();
     roots.add_der(server_cert.to_vec()).unwrap();
-    let cfg = PcClientConfig12::new(roots, "dtls.example")
+    let cfg = PcClientConfig12::new(roots, server_name)
         .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
     let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-client", b"nonce", &[]);
     DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng)
@@ -133,6 +139,60 @@ fn require_cookie_without_secret_fails_closed_12() {
         server.pop_outbound_datagrams().is_empty(),
         "no server flight may be emitted to an unverified source"
     );
+}
+
+/// Server-authentication: the DTLS 1.2 client MUST reject a certificate whose
+/// SAN/CN does not cover the requested `server_name`, even when the chain is
+/// otherwise trusted. Without the hostname check a MITM presenting any cert
+/// chaining to a trusted CA (e.g. a legit cert for `attacker.example`) would be
+/// accepted for any target host.
+#[test]
+fn rejects_certificate_with_mismatched_hostname_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    // Trust the server's (self-signed) cert as a root, but ask the client to
+    // connect to a DIFFERENT name than the cert is issued for ("dtls.example").
+    let mut client = make_client_named(&cert, "wrong.example");
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-badname", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // CH → server.
+    let c1 = client.pop_outbound_datagrams();
+    for dg in &c1 {
+        server.feed_datagram(dg).unwrap();
+    }
+    // Server flight (SH/Cert/SKE/SHDone). Feeding the Certificate must make the
+    // client fail closed because the leaf does not match "wrong.example".
+    let s1 = server.pop_outbound_datagrams();
+    assert!(!s1.is_empty(), "server should have emitted flight");
+    let mut saw_err = false;
+    for dg in &s1 {
+        if client.feed_datagram(dg).is_err() {
+            saw_err = true;
+        }
+    }
+    assert!(
+        saw_err,
+        "client must reject a certificate that does not match the requested host"
+    );
+    assert!(
+        !client.is_handshake_complete(),
+        "handshake must not complete with a mismatched server certificate"
+    );
+}
+
+/// Sanity counterpart to the rejection test: when the requested `server_name`
+/// matches a SAN on the leaf, the handshake completes as normal.
+#[test]
+fn accepts_certificate_with_matching_hostname_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client_named(&cert, "dtls.example");
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-goodname", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert!(pump_handshake(&mut client, &mut server));
 }
 
 #[test]
