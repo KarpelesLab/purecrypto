@@ -28,6 +28,8 @@ mod kw;
 mod ofb;
 mod poly1305;
 pub(crate) mod salsa20;
+// AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.
+#[cfg(feature = "alloc")]
 mod siv;
 mod xchacha20poly1305;
 mod xts;
@@ -49,6 +51,7 @@ pub use kw::{
 };
 pub use ofb::Ofb;
 pub use poly1305::Poly1305;
+#[cfg(feature = "alloc")]
 pub use siv::AesSiv;
 pub use xchacha20poly1305::XChaCha20Poly1305;
 pub use xts::{Aes128Xts, Aes256Xts, Xts};

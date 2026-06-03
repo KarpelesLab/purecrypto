@@ -162,6 +162,9 @@ impl<C: BlockCipher> Drop for Cmac<C> {
     }
 }
 
+// The `Mac` trait lives in the `hash` module, so this impl is only available
+// when that module is compiled in.
+#[cfg(feature = "hash")]
 impl<C: BlockCipher + Clone> crate::hash::Mac for Cmac<C> {
     fn update(&mut self, data: &[u8]) {
         Cmac::update(self, data);
