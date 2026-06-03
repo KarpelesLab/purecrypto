@@ -2853,3 +2853,365 @@ fn cli_subcommand_table_help() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// New-primitive CLI tests: AEGIS / Ascon-AEAD enc, GMAC, KBKDF, Ascon-Hash256,
+// SM2 (genpkey+sign+verify+encrypt+decrypt), and stateful LMS / XMSS.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn enc_aegis128l_roundtrip() {
+    enc_roundtrip(
+        "aegis128l",
+        "AEGIS-128L",
+        "000102030405060708090a0b0c0d0e0f",
+        "0f0e0d0c0b0a09080706050403020100", // 16-byte nonce
+        b"AEGIS-128L via the enc verb",
+    );
+}
+
+#[test]
+fn enc_aegis256_roundtrip() {
+    enc_roundtrip(
+        "aegis256",
+        "AEGIS-256",
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", // 32-byte nonce
+        b"AEGIS-256 via the enc verb",
+    );
+}
+
+#[test]
+fn enc_ascon_aead128_roundtrip() {
+    enc_roundtrip(
+        "ascon",
+        "ASCON-AEAD128",
+        "000102030405060708090a0b0c0d0e0f",
+        "0f0e0d0c0b0a09080706050403020100", // 16-byte nonce
+        b"Ascon-AEAD128 via the enc verb",
+    );
+}
+
+#[test]
+fn mac_gmac_roundtrip() {
+    // GMAC (AES-128) is deterministic for a fixed (key, nonce, data); assert it
+    // is stable and that changing the nonce changes the tag.
+    let key = "00112233445566778899aabbccddeeff";
+    let nonce = "0102030405060708090a0b0c";
+    let (t1, ok) = run(
+        &["mac", "-alg", "gmac", "-key", key, "-nonce", nonce],
+        b"GMAC message",
+    );
+    assert!(ok);
+    let tag = t1.trim();
+    assert_eq!(tag.len(), 32); // 16-byte tag -> 32 hex chars
+    assert!(tag.bytes().all(|b| b.is_ascii_hexdigit()));
+    // Deterministic: same inputs -> same tag.
+    let (t2, ok) = run(
+        &["mac", "-alg", "gmac", "-key", key, "-nonce", nonce],
+        b"GMAC message",
+    );
+    assert!(ok);
+    assert_eq!(t1, t2);
+    // Different nonce -> different tag.
+    let (t3, ok) = run(
+        &[
+            "mac",
+            "-alg",
+            "gmac",
+            "-key",
+            key,
+            "-nonce",
+            "0c0b0a090807060504030201",
+        ],
+        b"GMAC message",
+    );
+    assert!(ok);
+    assert_ne!(t1, t3);
+}
+
+#[test]
+fn kdf_kbkdf_counter_deterministic() {
+    // SP 800-108 counter mode is deterministic; assert stability and that the
+    // label is bound into the derivation.
+    let args = |label: &str| {
+        vec![
+            "kdf".to_string(),
+            "kbkdf".to_string(),
+            "-mode".to_string(),
+            "counter".to_string(),
+            "-prf".to_string(),
+            "hmac-sha256".to_string(),
+            "-ki".to_string(),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f".to_string(),
+            "-label".to_string(),
+            label.to_string(),
+            "-context".to_string(),
+            "cafe".to_string(),
+            "-len".to_string(),
+            "32".to_string(),
+        ]
+    };
+    fn to_refs(v: &[String]) -> Vec<&str> {
+        v.iter().map(String::as_str).collect()
+    }
+    let a = args("6c6162656c");
+    let (o1, ok) = run(&to_refs(&a), b"");
+    assert!(ok);
+    assert_eq!(o1.trim().len(), 64);
+    let (o2, ok) = run(&to_refs(&a), b"");
+    assert!(ok);
+    assert_eq!(o1, o2);
+    let b = args("6c6162656d"); // different label
+    let (o3, ok) = run(&to_refs(&b), b"");
+    assert!(ok);
+    assert_ne!(o1, o3);
+}
+
+#[test]
+fn hash_ascon_hash256_known_answer() {
+    // Ascon-Hash256 of the empty message (NIST SP 800-232 reference value;
+    // matches the `hash256_kat` Count-1 vector in src/ascon/hash.rs).
+    let (out, ok) = run(&["hash", "ascon-hash256"], b"");
+    assert!(ok);
+    assert_eq!(
+        out.trim(),
+        "0b3be5850f2f6b98caf29f8fdea89b64a1fa70aa249b8f839bd53baa304d92b2"
+    );
+}
+
+#[test]
+fn sm2_genpkey_sign_verify_encrypt_decrypt() {
+    let dir = std::env::temp_dir().join(format!("pc_sm2_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    // Generate an SM2 private key (SEC1 PEM).
+    assert!(
+        run(
+            &["genpkey", "-algorithm", "SM2", "-out", &p("sm2.key")],
+            b""
+        )
+        .1
+    );
+    let key = std::fs::read_to_string(dir.join("sm2.key")).unwrap();
+    assert!(key.contains("BEGIN EC PRIVATE KEY"));
+
+    std::fs::write(dir.join("msg.bin"), b"SM2 message over the pkeyutl verb").unwrap();
+
+    // Sign (SM2-DSA, default id) with the private key.
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("sm2.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let sig = std::fs::read(dir.join("sig.bin")).unwrap();
+    assert!(!sig.is_empty() && sig[0] == 0x30); // DER Ecdsa-Sig-Value SEQUENCE
+
+    // Verify: the pkeyutl verify path derives the SM2 public key from the SEC1
+    // private key file (deriving the public point reveals no secret).
+    let (vout, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("sm2.key"),
+            "-in",
+            &p("msg.bin"),
+            "-sigfile",
+            &p("sig.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "SM2 verify failed: {vout}");
+    assert!(vout.contains("verified"));
+
+    // A tampered message must fail to verify.
+    std::fs::write(dir.join("bad.bin"), b"SM2 message over the pkeyutl verB").unwrap();
+    let (_, bad_ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("sm2.key"),
+            "-in",
+            &p("bad.bin"),
+            "-sigfile",
+            &p("sig.bin"),
+        ],
+        b"",
+    );
+    assert!(!bad_ok, "SM2 verify should reject a tampered message");
+
+    // Encrypt to the SM2 public key (derived from the private key file) and
+    // decrypt back.
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "encrypt",
+                "-inkey",
+                &p("sm2.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("ct.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "decrypt",
+                "-inkey",
+                &p("sm2.key"),
+                "-in",
+                &p("ct.bin"),
+                "-out",
+                &p("rt.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let rt = std::fs::read(dir.join("rt.bin")).unwrap();
+    assert_eq!(rt, b"SM2 message over the pkeyutl verb");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn lms_genpkey_sign_verify_advances_key() {
+    let dir = std::env::temp_dir().join(format!("pc_lms_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "LMS-SHA256-H5",
+                "-out",
+                &p("lms.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let before = std::fs::read(dir.join("lms.key")).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"LMS stateful message").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("lms.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    // The stateful key file MUST have advanced (index incremented).
+    let after = std::fs::read(dir.join("lms.key")).unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_ne!(before, after, "LMS key file did not advance after signing");
+
+    // Verify against the (now-advanced) key file: the public key is unchanged,
+    // so verification still succeeds.
+    let (out, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("lms.key"),
+            "-in",
+            &p("msg.bin"),
+            "-sigfile",
+            &p("sig.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "LMS verify failed: {out}");
+    assert!(out.contains("verified"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn xmss_genpkey_sign_verify_advances_key() {
+    let dir = std::env::temp_dir().join(format!("pc_xmss_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "XMSS-SHA2_10_256",
+                "-out",
+                &p("xmss.key"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let before = std::fs::read(dir.join("xmss.key")).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"XMSS stateful message").unwrap();
+
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("xmss.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig.bin"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let after = std::fs::read(dir.join("xmss.key")).unwrap();
+    assert_eq!(before.len(), after.len());
+    assert_ne!(before, after, "XMSS key file did not advance after signing");
+
+    let (out, ok) = run(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("xmss.key"),
+            "-in",
+            &p("msg.bin"),
+            "-sigfile",
+            &p("sig.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "XMSS verify failed: {out}");
+    assert!(out.contains("verified"));
+    let _ = std::fs::remove_dir_all(&dir);
+}

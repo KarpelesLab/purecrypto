@@ -8,16 +8,23 @@
  * Functional areas exposed by this header:
  *   - Hashing      — SHA-2/3, BLAKE2/3, Keccak, SM3, SHA-1, MD5, RIPEMD-160
  *                    (pc_digest, pc_hash_*, pc_hmac)
- *   - KDFs         — HKDF, PBKDF2, scrypt, Argon2 (pc_hkdf/pc_pbkdf2/...)
- *   - AEAD         — AES-GCM/CCM, ChaCha20-Poly1305 (pc_aead_*)
+ *   - KDFs         — HKDF, PBKDF2, scrypt, Argon2, SP 800-108 KBKDF
+ *                    (pc_hkdf/pc_pbkdf2/pc_scrypt/pc_argon2/pc_kbkdf_*)
+ *   - AEAD         — AES-GCM/CCM, ChaCha20-Poly1305, AEGIS-128L/256,
+ *                    Ascon-AEAD128 (pc_aead_*)
+ *   - MACs         — AES-CMAC (pc_cmac), GMAC (pc_gmac)
  *   - AES key wrap — RFC 3394 / 5649 (pc_aes_kw_*, pc_aes_kwp_*)
+ *   - Ascon XOFs   — Ascon-XOF128 / -CXOF128 (pc_ascon_xof / pc_ascon_cxof)
  *   - Randomness   — pc_rand_bytes
  *   - RSA          — keygen, PKCS#1 v1.5 + PSS sign/verify, OAEP enc/dec
  *   - ECDSA / Ed25519 / Ed448 — keygen + sign/verify
  *   - ECDH / X25519 / X448 — pc_ecdh, pc_x25519, pc_x448
+ *   - SM2          — GB/T 32918 / RFC 8998 keygen, sign, verify, enc/dec (pc_sm2_*)
  *   - ML-KEM       — FIPS 203 keygen, encaps, decaps (pc_mlkem_*)
  *   - ML-DSA       — FIPS 204 keygen, sign, verify (pc_mldsa_*)
  *   - SLH-DSA      — FIPS 205 keygen, sign, verify (pc_slhdsa_*)
+ *   - LMS / HSS    — RFC 8554 STATEFUL hash-based signatures (pc_lms_* / pc_hss_*)
+ *   - XMSS / XMSS^MT — RFC 8391 STATEFUL hash-based signatures (pc_xmss_* / pc_xmssmt_*)
  *   - CSR          — PKCS#10 build / parse / self-sig verify (pc_csr_*)
  *   - X.509        — pc_cert_*
  *   - CRL          — pc_crl_*
@@ -81,7 +88,15 @@ typedef enum {
   PC_AEAD_AES128_CCM = 4,
   PC_AEAD_AES256_CCM = 5,
   PC_AEAD_AES128_CCM8 = 6,
-  PC_AEAD_AES256_CCM8 = 7
+  PC_AEAD_AES256_CCM8 = 7,
+  PC_AEAD_AES128_GCM_SIV = 8,
+  PC_AEAD_AES256_GCM_SIV = 9,
+  PC_AEAD_XCHACHA20_POLY1305 = 10,
+  PC_AEAD_AES128_SIV = 11,  /* nonce arg is the single AD; output is V||ct */
+  PC_AEAD_AES256_SIV = 12,  /* 64-byte key */
+  PC_AEAD_AEGIS128L = 13,   /* 16-byte key, 16-byte nonce */
+  PC_AEAD_AEGIS256 = 14,    /* 32-byte key, 32-byte nonce */
+  PC_AEAD_ASCON_AEAD128 = 15 /* 16-byte key, 16-byte nonce */
 } pc_aead_id;
 
 /* Argon2 variant (for pc_argon2). */
@@ -111,8 +126,18 @@ typedef enum {
   PC_SM3 = 16,
   PC_SHA1 = 17,
   PC_MD5 = 18,
-  PC_RIPEMD160 = 19
+  PC_RIPEMD160 = 19,
+  PC_ASCON_HASH256 = 20
 } pc_hash_id;
+
+/* PRF selectors for the SP 800-108 KBKDF (pc_kbkdf_counter / _feedback). */
+typedef enum {
+  PC_KBKDF_HMAC_SHA256 = 1,
+  PC_KBKDF_HMAC_SHA384 = 2,
+  PC_KBKDF_HMAC_SHA512 = 3,
+  PC_KBKDF_CMAC_AES128 = 4,  /* requires a 16-byte KI */
+  PC_KBKDF_CMAC_AES256 = 5   /* requires a 32-byte KI */
+} pc_kbkdf_prf;
 
 /* Elliptic curve identifiers. */
 typedef enum {
@@ -152,6 +177,23 @@ typedef enum {
   PC_SLH_DSA_SHAKE_256F = 12
 } pc_slhdsa_set;
 
+/* LMS parameter sets (RFC 8554 §5.1 typecodes; tree height h). */
+typedef enum {
+  PC_LMS_SHA256_M32_H5 = 5,
+  PC_LMS_SHA256_M32_H10 = 6,
+  PC_LMS_SHA256_M32_H15 = 7,
+  PC_LMS_SHA256_M32_H20 = 8,
+  PC_LMS_SHA256_M32_H25 = 9
+} pc_lms_type;
+
+/* LM-OTS parameter sets (RFC 8554 §4.1 typecodes; Winternitz width w). */
+typedef enum {
+  PC_LMOTS_SHA256_N32_W1 = 1,
+  PC_LMOTS_SHA256_N32_W2 = 2,
+  PC_LMOTS_SHA256_N32_W4 = 3,
+  PC_LMOTS_SHA256_N32_W8 = 4
+} pc_lmots_type;
+
 /* Opaque handles. */
 typedef struct PcHash PcHash;
 typedef struct PcRsaKey PcRsaKey;
@@ -162,6 +204,11 @@ typedef struct PcCert PcCert;
 typedef struct PcMlKem PcMlKem;
 typedef struct PcMlDsa PcMlDsa;
 typedef struct PcSlhDsa PcSlhDsa;
+typedef struct PcSm2 PcSm2;
+typedef struct PcLms PcLms;     /* STATEFUL — see pc_lms_* contract below */
+typedef struct PcHss PcHss;     /* STATEFUL — see pc_hss_* contract below */
+typedef struct PcXmss PcXmss;   /* STATEFUL — see pc_xmss_* contract below */
+typedef struct PcXmssMt PcXmssMt; /* STATEFUL — see pc_xmssmt_* contract below */
 typedef struct PcCsr PcCsr;
 typedef struct PcCrl PcCrl;
 typedef struct PcTlsCfg PcTlsCfg;
@@ -225,6 +272,29 @@ pc_status pc_aes_kwp_unwrap(const uint8_t *kek, size_t kek_len,
                             const uint8_t *ct, size_t ct_len,
                             uint8_t *out, size_t *out_len);
 
+/* ---- Block-cipher MACs ----
+ * pc_cmac: AES-CMAC (RFC 4493). key_len 16/32 selects AES-128/256; 16-byte tag.
+ * pc_gmac: GMAC (NIST SP 800-38D). key_len 16/32 selects AES-128/256; the nonce
+ *          MUST be 12 bytes and unique per (key, message); 16-byte tag.
+ */
+pc_status pc_cmac(const uint8_t *key, size_t key_len,
+                  const uint8_t *msg, size_t msg_len,
+                  uint8_t *out, size_t *out_len);
+pc_status pc_gmac(const uint8_t *key, size_t key_len,
+                  const uint8_t *nonce, size_t nonce_len,
+                  const uint8_t *data, size_t data_len,
+                  uint8_t *out, size_t *out_len);
+
+/* ---- Ascon XOFs (NIST SP 800-232) ----
+ * Squeeze exactly out_len bytes (out_len is the requested length, not an in/out
+ * capacity). pc_ascon_cxof takes a customization string (at most 256 bytes).
+ */
+pc_status pc_ascon_xof(const uint8_t *data, size_t data_len,
+                       uint8_t *out, size_t out_len);
+pc_status pc_ascon_cxof(const uint8_t *custom, size_t custom_len,
+                        const uint8_t *data, size_t data_len,
+                        uint8_t *out, size_t out_len);
+
 /* ---- KDFs ---- */
 pc_status pc_hkdf(int32_t hash,
                   const uint8_t *salt, size_t salt_len,
@@ -245,6 +315,20 @@ pc_status pc_argon2(int32_t variant,
                     const uint8_t *salt, size_t salt_len,
                     uint32_t t_cost, uint32_t m_cost, uint32_t parallelism,
                     uint8_t *out, size_t out_len);
+/* SP 800-108 KBKDF. prf is a pc_kbkdf_prf. Counter-mode fixed input is
+ * [i]_32 || Label || 0x00 || Context || [L]_32; feedback-mode prepends K(i-1)
+ * with K(0) = iv (which may be empty). out_len is the requested output length. */
+pc_status pc_kbkdf_counter(int32_t prf,
+                           const uint8_t *ki, size_t ki_len,
+                           const uint8_t *label, size_t label_len,
+                           const uint8_t *context, size_t context_len,
+                           uint8_t *out, size_t out_len);
+pc_status pc_kbkdf_feedback(int32_t prf,
+                            const uint8_t *ki, size_t ki_len,
+                            const uint8_t *iv, size_t iv_len,
+                            const uint8_t *label, size_t label_len,
+                            const uint8_t *context, size_t context_len,
+                            uint8_t *out, size_t out_len);
 
 /* ---- Randomness ---- */
 pc_status pc_rand_bytes(uint8_t *out, size_t len);
@@ -400,6 +484,100 @@ pc_status pc_slhdsa_verify(const uint8_t *spki, size_t spki_len,
                            const uint8_t *msg, size_t msg_len,
                            const uint8_t *sig, size_t sig_len);
 void pc_slhdsa_free(PcSlhDsa *k);
+
+/* ---- SM2 (GB/T 32918 / RFC 8998) ----
+ * SM2 is NOT routed through pc_ec_* (which rejects the SM2 curve). These use
+ * SM2-DSA (with the Z_A signer identity; id NULL/0 selects the default
+ * 1234567812345678) and SM2 hybrid PKE. Private keys are SEC1 'EC PRIVATE KEY'
+ * PEM; public keys are 'PUBLIC KEY' SPKI DER. Signatures are DER Ecdsa-Sig-Value.
+ */
+PcSm2 *pc_sm2_generate(void);
+PcSm2 *pc_sm2_from_pem(const uint8_t *pem, size_t len);
+pc_status pc_sm2_private_to_pem(const PcSm2 *k, uint8_t *out, size_t *out_len);
+pc_status pc_sm2_public_to_pem(const PcSm2 *k, uint8_t *out, size_t *out_len);
+pc_status pc_sm2_sign(const PcSm2 *k, const uint8_t *id, size_t id_len,
+                      const uint8_t *msg, size_t msg_len,
+                      uint8_t *out, size_t *out_len);
+pc_status pc_sm2_verify(const uint8_t *spki, size_t spki_len,
+                        const uint8_t *id, size_t id_len,
+                        const uint8_t *msg, size_t msg_len,
+                        const uint8_t *sig, size_t sig_len);
+pc_status pc_sm2_encrypt(const uint8_t *spki, size_t spki_len,
+                         const uint8_t *pt, size_t pt_len,
+                         uint8_t *out, size_t *out_len);
+pc_status pc_sm2_decrypt(const PcSm2 *k, const uint8_t *ct, size_t ct_len,
+                         uint8_t *out, size_t *out_len);
+void pc_sm2_free(PcSm2 *k);
+
+/* ============================================================================
+ * STATEFUL hash-based signatures: LMS / HSS (RFC 8554) and XMSS / XMSS^MT
+ * (RFC 8391). These keys carry a one-time-key index that ADVANCES on every
+ * signature. The signing handle's state lives in memory only; there is no
+ * in-library persistence.
+ *
+ * CONTRACT — after EVERY successful *_sign:
+ *   1. re-serialize the handle with the matching *_private_to_bytes, and
+ *   2. durably persist those bytes (overwriting the prior copy)
+ * BEFORE the produced signature is released or used. Signing two different
+ * messages from the same persisted state reuses a one-time key and can leak
+ * the signing key — catastrophic. The private-key serialization embeds the
+ * live index; the public-key blob from *_public_to_bytes is self-describing
+ * (it carries the parameter set) so *_verify needs no extra parameter.
+ * ==========================================================================*/
+
+/* ---- LMS (single tree) ---- */
+PcLms *pc_lms_generate(int32_t lms_param, int32_t lmots_param); /* pc_lms_type, pc_lmots_type */
+PcLms *pc_lms_from_bytes(const uint8_t *bytes, size_t len);
+pc_status pc_lms_private_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
+pc_status pc_lms_public_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
+/* Advances the handle's index; persist via pc_lms_private_to_bytes before use. */
+pc_status pc_lms_sign(PcLms *k, const uint8_t *msg, size_t msg_len,
+                      uint8_t *out, size_t *out_len);
+pc_status pc_lms_verify(const uint8_t *pubkey, size_t pubkey_len,
+                        const uint8_t *msg, size_t msg_len,
+                        const uint8_t *sig, size_t sig_len);
+void pc_lms_free(PcLms *k);
+
+/* ---- HSS (multi-level LMS) ---- */
+PcHss *pc_hss_generate(size_t levels, int32_t lms_param, int32_t lmots_param); /* levels 1..8 */
+PcHss *pc_hss_from_bytes(const uint8_t *bytes, size_t len);
+pc_status pc_hss_private_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
+pc_status pc_hss_public_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
+/* Advances the handle's state; persist via pc_hss_private_to_bytes before use. */
+pc_status pc_hss_sign(PcHss *k, const uint8_t *msg, size_t msg_len,
+                      uint8_t *out, size_t *out_len);
+pc_status pc_hss_verify(const uint8_t *pubkey, size_t pubkey_len,
+                        const uint8_t *msg, size_t msg_len,
+                        const uint8_t *sig, size_t sig_len);
+void pc_hss_free(PcHss *k);
+
+/* ---- XMSS (single tree) ----
+ * oid is the RFC 8391 numeric parameter-set OID (e.g. 1 = XMSS-SHA2_10_256).
+ */
+PcXmss *pc_xmss_generate(uint32_t oid);
+PcXmss *pc_xmss_from_bytes(const uint8_t *bytes, size_t len);
+pc_status pc_xmss_private_to_bytes(const PcXmss *k, uint8_t *out, size_t *out_len);
+pc_status pc_xmss_public_to_bytes(const PcXmss *k, uint8_t *out, size_t *out_len);
+/* Advances the handle's index; persist via pc_xmss_private_to_bytes before use. */
+pc_status pc_xmss_sign(PcXmss *k, const uint8_t *msg, size_t msg_len,
+                       uint8_t *out, size_t *out_len);
+pc_status pc_xmss_verify(const uint8_t *pubkey, size_t pubkey_len,
+                         const uint8_t *msg, size_t msg_len,
+                         const uint8_t *sig, size_t sig_len);
+void pc_xmss_free(PcXmss *k);
+
+/* ---- XMSS^MT (multi-tree) ---- */
+PcXmssMt *pc_xmssmt_generate(uint32_t oid);
+PcXmssMt *pc_xmssmt_from_bytes(const uint8_t *bytes, size_t len);
+pc_status pc_xmssmt_private_to_bytes(const PcXmssMt *k, uint8_t *out, size_t *out_len);
+pc_status pc_xmssmt_public_to_bytes(const PcXmssMt *k, uint8_t *out, size_t *out_len);
+/* Advances the handle's state; persist via pc_xmssmt_private_to_bytes before use. */
+pc_status pc_xmssmt_sign(PcXmssMt *k, const uint8_t *msg, size_t msg_len,
+                         uint8_t *out, size_t *out_len);
+pc_status pc_xmssmt_verify(const uint8_t *pubkey, size_t pubkey_len,
+                           const uint8_t *msg, size_t msg_len,
+                           const uint8_t *sig, size_t sig_len);
+void pc_xmssmt_free(PcXmssMt *k);
 
 /* ---- CSR (PKCS#10) ---- */
 PcCsr *pc_csr_create_rsa(const PcRsaKey *rsa_key, const char *subject_cn,
