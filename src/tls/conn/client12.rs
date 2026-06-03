@@ -1526,6 +1526,7 @@ impl ClientConnection12 {
                 sig.to_der(k.curve())
             }
             ClientKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            ClientKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
             ClientKey::MlDsa44(k) => k
                 .sign_deterministic(&to_sign, b"")
                 .map_err(|_| Error::HandshakeFailure)?,

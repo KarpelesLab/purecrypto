@@ -3565,6 +3565,7 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         crate::tls::SigningKey::Rsa(k) => ServerConfig::with_rsa(chain, k.clone()),
         crate::tls::SigningKey::Ecdsa(k) => ServerConfig::with_ecdsa(chain, k.clone()),
         crate::tls::SigningKey::Ed25519(k) => ServerConfig::with_ed25519(chain, k.clone()),
+        crate::tls::SigningKey::Ed448(k) => ServerConfig::with_ed448(chain, k.clone()),
         crate::tls::SigningKey::MlDsa44(k) => ServerConfig::with_mldsa44(chain, k.clone()),
         crate::tls::SigningKey::MlDsa65(k) => ServerConfig::with_mldsa65(chain, k.clone()),
         crate::tls::SigningKey::MlDsa87(k) => ServerConfig::with_mldsa87(chain, k.clone()),
@@ -3595,6 +3596,9 @@ fn client_cert_from_signing(
         }
         crate::tls::SigningKey::Ed25519(k) => {
             crate::tls::conn::ClientCertConfig::with_ed25519(id.cert_chain.clone(), k.clone())
+        }
+        crate::tls::SigningKey::Ed448(k) => {
+            crate::tls::conn::ClientCertConfig::with_ed448(id.cert_chain.clone(), k.clone())
         }
         crate::tls::SigningKey::MlDsa44(k) => {
             crate::tls::conn::ClientCertConfig::with_mldsa44(id.cert_chain.clone(), k.clone())

@@ -470,6 +470,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
         super::config::SigningKey::Ed25519(k) => {
             super::conn::ServerConfig::with_ed25519(chain, k.clone())
         }
+        super::config::SigningKey::Ed448(k) => {
+            super::conn::ServerConfig::with_ed448(chain, k.clone())
+        }
         super::config::SigningKey::MlDsa44(k) => {
             super::conn::ServerConfig::with_mldsa44(chain, k.clone())
         }
@@ -679,6 +682,9 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
         }
         super::config::SigningKey::Ed25519(k) => {
             super::conn::ClientCertConfig::with_ed25519(id.cert_chain.clone(), k.clone())
+        }
+        super::config::SigningKey::Ed448(k) => {
+            super::conn::ClientCertConfig::with_ed448(id.cert_chain.clone(), k.clone())
         }
         super::config::SigningKey::MlDsa44(k) => {
             super::conn::ClientCertConfig::with_mldsa44(id.cert_chain.clone(), k.clone())

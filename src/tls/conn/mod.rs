@@ -517,7 +517,7 @@ mod quic_mode_tests {
 #[cfg(test)]
 mod loopback_tests {
     use super::{ClientConnection, ServerConfig, ServerConnection};
-    use crate::ec::Ed25519PrivateKey;
+    use crate::ec::{Ed448PrivateKey, Ed25519PrivateKey};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::rsa::BoxedRsaPrivateKey;
@@ -566,6 +566,28 @@ mod loopback_tests {
             ServerConfig::with_ed25519(alloc::vec![der.clone()], key),
             der,
         )
+    }
+
+    /// An Ed448 self-signed server config plus its certificate DER.
+    fn ed448_server() -> (ServerConfig, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"loopback-ed448-key", b"nonce", &[]);
+        let key = Ed448PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed448(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["loopback.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (ServerConfig::with_ed448(alloc::vec![der.clone()], key), der)
     }
 
     /// Runs a full in-process handshake with an RSA server, then exchanges
@@ -668,6 +690,20 @@ mod loopback_tests {
         // Ed25519 CertificateVerify signature end to end.
         run_with(
             ed25519_server(),
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+    }
+
+    #[test]
+    fn ed448_server_certificate() {
+        // An Ed448 server cert exercises Ed448 chain verification and the
+        // Ed448 CertificateVerify signature (scheme ed448 = 0x0808) end to end:
+        // the server signs CertificateVerify with its Ed448 key and the client
+        // verifies it, so a completed handshake is proof the 0x0808 path works.
+        assert_eq!(crate::tls::codec::SignatureScheme::ED448.0, 0x0808);
+        run_with(
+            ed448_server(),
             &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519],
         );
@@ -1400,6 +1436,79 @@ mod loopback_tests {
         client.read_tls(&s);
         client.process_new_packets().unwrap();
         assert_eq!(client.take_received_plaintext(), b"mtls-pong");
+    }
+
+    /// mTLS with Ed448 on BOTH ends: an Ed448 server cert and an Ed448 client
+    /// cert. Exercises the Ed448 CertificateVerify (0x0808) on both the server
+    /// and client roles; a completed handshake proves both signatures were
+    /// produced and verified.
+    #[test]
+    fn mtls_ed448_both_ends() {
+        use crate::tls::{ClientCertConfig, RootCertStore};
+
+        let (server_config, server_cert_der) = ed448_server();
+
+        // An Ed448 client cert (self-signed leaf == trust anchor).
+        let mut crng_seed = HmacDrbg::<Sha256>::new(b"mtls-ed448-client-key", b"nonce", &[]);
+        let client_key = Ed448PrivateKey::generate(&mut crng_seed);
+        let client_name = DistinguishedName::common_name("mtls-ed448-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert = Certificate::self_signed_general(
+            &CertSigner::Ed448(&client_key),
+            &client_name,
+            &validity,
+            1,
+            false,
+            &["mtls-ed448-client"],
+        )
+        .unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_ed448(alloc::vec![client_cert_der], client_key);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"mtls-ed448-client-rng", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"mtls-ed448-server-rng", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert_eq!(server.peer_certificates().len(), 1);
+
+        client.send_application_data(b"ed448-mtls-ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ed448-mtls-ping");
     }
 
     /// mTLS rejection: server requires a client cert from a SPECIFIC root,

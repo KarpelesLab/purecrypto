@@ -15,7 +15,8 @@
 use super::common::{ConnectionCore, Incoming};
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{
-    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed448PrivateKey,
+    Ed25519PrivateKey,
 };
 use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{CIPHERTEXT_BYTES, MlKem768Ciphertext, MlKem768DecapsKey};
@@ -69,6 +70,8 @@ pub(crate) enum ClientKey {
     Rsa(BoxedRsaPrivateKey),
     Ecdsa(BoxedEcdsaPrivateKey),
     Ed25519(Ed25519PrivateKey),
+    /// An Ed448 client key (TLS 1.3 only).
+    Ed448(Ed448PrivateKey),
     /// An ML-DSA-44 client key (FIPS 204, draft-ietf-tls-mldsa).
     /// Client-side ML-DSA `CertificateVerify` signing is deterministic —
     /// the client doesn't thread an RNG through the handshake state machine.
@@ -101,6 +104,14 @@ impl ClientCertConfig {
         ClientCertConfig {
             chain,
             key: ClientKey::Ed25519(key),
+        }
+    }
+
+    /// A client cert + Ed448 signing key.
+    pub fn with_ed448(chain: Vec<Vec<u8>>, key: Ed448PrivateKey) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::Ed448(key),
         }
     }
 
@@ -145,6 +156,7 @@ impl ClientCertConfig {
                 CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             },
             ClientKey::Ed25519(_) => SignatureScheme::ED25519,
+            ClientKey::Ed448(_) => SignatureScheme::ED448,
             ClientKey::MlDsa44(_) => SignatureScheme::MLDSA44,
             ClientKey::MlDsa65(_) => SignatureScheme::MLDSA65,
             ClientKey::MlDsa87(_) => SignatureScheme::MLDSA87,
@@ -2804,6 +2816,8 @@ impl ClientConnection {
                 sig.to_der(k.curve())
             }
             ClientKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
+            // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
+            ClientKey::Ed448(k) => k.sign(&content).to_bytes().to_vec(),
             // Client-side ML-DSA: sign deterministically (FIPS 204 supports
             // both deterministic and hedged modes; the client has no RNG
             // to thread here). The resulting signature still verifies under

@@ -12,7 +12,8 @@ use super::common::{ConnectionCore, Incoming};
 use crate::cipher::{Aes256, Gcm};
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{
-    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey,
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed448PrivateKey,
+    Ed25519PrivateKey,
 };
 use crate::hash::{Hmac, Sha256, Sha384, Sha512};
 use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
@@ -113,6 +114,8 @@ pub(crate) enum ServerKey {
     Ecdsa(BoxedEcdsaPrivateKey),
     /// An Ed25519 key; signs with `ed25519`.
     Ed25519(Ed25519PrivateKey),
+    /// An Ed448 key; signs with `ed448`.
+    Ed448(Ed448PrivateKey),
     /// An ML-DSA-44 key (FIPS 204, draft-ietf-tls-mldsa).
     MlDsa44(crate::mldsa::MlDsa44PrivateKey),
     /// An ML-DSA-65 key.
@@ -301,6 +304,37 @@ impl ServerConfig {
         ServerConfig {
             cert_chain,
             key: ServerKey::Ed25519(key),
+            alpn_protocols: Vec::new(),
+            record_size_limit: None,
+            ticket_key: None,
+            ticket_lifetime: 7200,
+            max_early_data_size: 0,
+            #[cfg(feature = "std")]
+            replay_window: None,
+            client_auth: None,
+            signature_policy: SignaturePolicy::modern(),
+            crls: crate::tls::pki::CrlStore::new(),
+            verification_time: None,
+            stapled_crl: None,
+            stapled_ocsp_response: None,
+            server_cert_type_preference: alloc::vec![0u8],
+            client_cert_type_preference: alloc::vec![0u8],
+            raw_public_key_spki: None,
+            #[cfg(feature = "cert-compression")]
+            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
+            #[cfg(feature = "ech")]
+            ech_server: None,
+            key_log: None,
+            preferred_key_exchange_group: None,
+        }
+    }
+
+    /// A configuration presenting `cert_chain` (leaf first) and signing with an
+    /// Ed448 private `key`.
+    pub fn with_ed448(cert_chain: Vec<Vec<u8>>, key: Ed448PrivateKey) -> Self {
+        ServerConfig {
+            cert_chain,
+            key: ServerKey::Ed448(key),
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             ticket_key: None,
@@ -601,6 +635,7 @@ impl ServerConfig {
                 CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             },
             ServerKey::Ed25519(_) => SignatureScheme::ED25519,
+            ServerKey::Ed448(_) => SignatureScheme::ED448,
             ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
             ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
             ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
@@ -2361,6 +2396,8 @@ impl<R: RngCore> ServerConnection<R> {
                 sig.to_der(k.curve())
             }
             ServerKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
+            // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
+            ServerKey::Ed448(k) => k.sign(&content).to_bytes().to_vec(),
             // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
             // with the server's RNG.
             ServerKey::MlDsa44(k) => k

@@ -60,6 +60,7 @@ pub(crate) fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Err
 pub(crate) fn signature_algorithms() -> RawExtension {
     let schemes = [
         SignatureScheme::ED25519,
+        SignatureScheme::ED448,
         SignatureScheme::ECDSA_SECP256R1_SHA256,
         SignatureScheme::ECDSA_SECP384R1_SHA384,
         SignatureScheme::ECDSA_SECP521R1_SHA512,

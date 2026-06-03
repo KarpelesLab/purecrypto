@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
+use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::signature_registry::SignaturePolicy;
 
@@ -43,6 +43,8 @@ pub enum SigningKey {
     Ecdsa(BoxedEcdsaPrivateKey),
     /// Ed25519 key.
     Ed25519(Ed25519PrivateKey),
+    /// Ed448 key (TLS 1.3 only).
+    Ed448(Ed448PrivateKey),
     /// ML-DSA-44 (FIPS 204, draft-ietf-tls-mldsa).
     MlDsa44(crate::mldsa::MlDsa44PrivateKey),
     /// ML-DSA-65.
@@ -628,6 +630,7 @@ impl SigningKey {
             SigningKey::Rsa(k) => super::conn::ServerKey::Rsa(k.clone()),
             SigningKey::Ecdsa(k) => super::conn::ServerKey::Ecdsa(k.clone()),
             SigningKey::Ed25519(k) => super::conn::ServerKey::Ed25519(k.clone()),
+            SigningKey::Ed448(k) => super::conn::ServerKey::Ed448(k.clone()),
             SigningKey::MlDsa44(k) => super::conn::ServerKey::MlDsa44(k.clone()),
             SigningKey::MlDsa65(k) => super::conn::ServerKey::MlDsa65(k.clone()),
             SigningKey::MlDsa87(k) => super::conn::ServerKey::MlDsa87(k.clone()),

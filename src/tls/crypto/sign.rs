@@ -51,6 +51,7 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
             CurveId::Secp256k1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
         },
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
+        ServerKey::Ed448(_) => SignatureScheme::ED448,
         ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
         ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
         ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
@@ -59,7 +60,7 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
 
 /// Signs `content` for a TLS 1.3 / DTLS 1.3 `CertificateVerify` using
 /// `key`, returning the (scheme, signature_bytes) tuple. Dispatches over
-/// every supported key type — RSA-PSS, ECDSA (any curve), Ed25519,
+/// every supported key type — RSA-PSS, ECDSA (any curve), Ed25519, Ed448,
 /// ML-DSA-44/65/87.
 pub(crate) fn sign_certificate_verify<R: RngCore>(
     key: &ServerKey,
@@ -82,6 +83,8 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
             sig.to_der(curve)
         }
         ServerKey::Ed25519(k) => k.sign(content).to_bytes().to_vec(),
+        // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
+        ServerKey::Ed448(k) => k.sign(content).to_bytes().to_vec(),
         // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
         // with the supplied RNG.
         ServerKey::MlDsa44(k) => k
