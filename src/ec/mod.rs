@@ -12,7 +12,8 @@
 //!   the TLS and X.509 layers, where the peer's curve is known only at parse
 //!   time.
 //!
-//! Also exposes X25519 ([`x25519`]) and Ed25519 ([`ed25519`]).
+//! Also exposes X25519 ([`x25519`]) / X448 ([`x448`]) Diffie-Hellman and
+//! Ed25519 ([`ed25519`]) signatures.
 
 pub mod boxed;
 mod curve25519;
@@ -30,6 +31,7 @@ pub mod ristretto255;
 pub mod secp256k1;
 mod weierstrass;
 pub mod x25519;
+pub mod x448;
 
 pub use boxed::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
