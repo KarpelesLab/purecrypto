@@ -241,17 +241,19 @@ fn hss_roundtrip_and_reload() {
     .unwrap();
     let pk = sk.public_key();
     assert_eq!(pk.to_bytes().len(), 60);
-    assert_eq!(sk.remaining(), 32 * 32);
+    // Capacity is one bottom tree (32) under the fail-closed mitigation, not
+    // 32*32 — advancing higher levels would re-use the fixed bottom OTS keys.
+    assert_eq!(sk.remaining(), 32);
 
     let s0 = sk.sign(&mut rng, b"hss-0").unwrap();
     assert!(pk.verify(b"hss-0", &s0));
     assert!(!pk.verify(b"hss-x", &s0));
-    assert_eq!(sk.remaining(), 32 * 32 - 1);
+    assert_eq!(sk.remaining(), 32 - 1);
 
     // Serialize, reload, continue: distinct signatures, both verify.
     let bytes = sk.to_bytes();
     let mut reloaded = HssPrivateKey::from_bytes(&bytes).unwrap();
-    assert_eq!(reloaded.remaining(), 32 * 32 - 1);
+    assert_eq!(reloaded.remaining(), 32 - 1);
     let s1 = reloaded.sign(&mut rng, b"hss-1").unwrap();
     assert!(pk.verify(b"hss-1", &s1));
     assert_ne!(s0, s1);
@@ -271,12 +273,81 @@ fn hss_single_level() {
     assert!(pk.verify(b"single", &sig));
 }
 
-/// The bottom HSS level rolling over advances the parent and keeps verifying.
+/// Returns the bottom-level LMS signature's leaf index `q` from an HSS sig.
+/// HSS sig layout: `u32(Nspk) || sig[0] || pub[1] || sig[1]`; `sig[1]` is the
+/// bottom level for a two-level key.
+fn bottom_leaf_q(sig: &[u8]) -> u32 {
+    let sig0_off = 4;
+    let sig0_len = lms_len(&sig[sig0_off..]);
+    let sig1_off = sig0_off + sig0_len + 24 + N;
+    u32::from_be_bytes([
+        sig[sig1_off],
+        sig[sig1_off + 1],
+        sig[sig1_off + 2],
+        sig[sig1_off + 3],
+    ])
+}
+
+/// SECURITY REGRESSION (RFC 8554 / SP 800-208 LM-OTS reuse).
+///
+/// A two-level HSS key keeps a *fixed* `(I, seed)` per level. Before the
+/// fail-closed mitigation, exhausting the bottom tree reset its leaf index to 0
+/// while the parent advanced, re-using the bottom tree's one-time keys to sign a
+/// second, different message (catastrophic forgery vector). This test asserts
+/// the key now refuses to wrap: it issues exactly `2^h_bottom` signatures, each
+/// on a *distinct* bottom leaf, and then fails closed with `Error::Exhausted`.
+/// No `(I, seed, leaf)` LM-OTS key is ever reused.
 #[test]
-fn hss_bottom_rollover() {
+fn hss_no_ots_reuse_fails_closed() {
+    use alloc::collections::BTreeSet;
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-no-reuse", b"n", &[]);
+    let mut key = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let pk = key.public_key();
+
+    // Capacity is exactly one bottom tree (32 leaves), not 32*32.
+    assert_eq!(key.remaining(), 32);
+
+    let mut seen_bottom: BTreeSet<u32> = BTreeSet::new();
+    let mut count = 0u32;
+    loop {
+        let msg = alloc::format!("msg-{count}");
+        match key.sign(&mut rng, msg.as_bytes()) {
+            Ok(sig) => {
+                assert!(pk.verify(msg.as_bytes(), &sig));
+                let q = bottom_leaf_q(&sig);
+                assert!(
+                    seen_bottom.insert(q),
+                    "bottom LM-OTS leaf {q} re-used — OTS reuse!"
+                );
+                count += 1;
+            }
+            Err(Error::Exhausted) => break,
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+    }
+    // Used exactly one full bottom tree, every leaf once, then failed closed.
+    assert_eq!(count, 32, "must issue exactly 2^h_bottom signatures");
+    assert_eq!(
+        seen_bottom.len(),
+        32,
+        "all 32 bottom leaves used exactly once"
+    );
+    assert_eq!(key.remaining(), 0);
+    assert_eq!(key.sign(&mut rng, b"after").err(), Some(Error::Exhausted));
+}
+
+/// The last bottom leaf signs fine, then the key fails closed instead of
+/// wrapping into LM-OTS reuse (the pre-mitigation rollover behaviour).
+#[test]
+fn hss_bottom_rollover_fails_closed() {
     let mut rng = HmacDrbg::<Sha256>::new(b"hss-rollover", b"n", &[]);
-    // Top H5, bottom H5: after the bottom (32 leaves) is used up, the parent
-    // advances. We fast-forward by setting q via serialization.
     let sk = HssPrivateKey::generate(
         &[
             (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
@@ -288,30 +359,49 @@ fn hss_bottom_rollover() {
     let pk = sk.public_key();
     let mut bytes = sk.to_bytes();
     // Layout: u32(L) then per level [type(4) ots(4) I(16) seed(32) q(4)].
-    // Set bottom level q to 31 (last leaf), top q stays 0.
+    // Park the bottom level on its last leaf (q=31), top q stays 0.
     let per = 4 + 4 + 16 + N + 4;
     let bottom_q_off = 4 + per + (per - 4);
     bytes[bottom_q_off..bottom_q_off + 4].copy_from_slice(&31u32.to_be_bytes());
     let mut key = HssPrivateKey::from_bytes(&bytes).unwrap();
+    assert_eq!(key.remaining(), 1);
 
-    // First sign uses bottom q=31, top q=0.
+    // The final bottom leaf signs and verifies.
     let s_last = key.sign(&mut rng, b"last-of-bottom").unwrap();
     assert!(pk.verify(b"last-of-bottom", &s_last));
-    // The bottom tree is now exhausted; the next sign must regenerate using
-    // top q=1 (and bottom q reset to 0) — still verifies against the same key.
-    let s_next = key.sign(&mut rng, b"after-rollover").unwrap();
-    assert!(pk.verify(b"after-rollover", &s_next));
-    // Confirm the parent advanced: bottom q reset to 0, top q to 1.
-    let snap = key.to_bytes();
-    let top_q_off = 4 + (per - 4);
-    let top_q = u32::from_be_bytes([
-        snap[top_q_off],
-        snap[top_q_off + 1],
-        snap[top_q_off + 2],
-        snap[top_q_off + 3],
-    ]);
+    assert_eq!(bottom_leaf_q(&s_last), 31);
+
+    // The bottom tree is now exhausted; the key MUST fail closed rather than
+    // wrap (which would re-use bottom OTS leaf 0).
+    assert_eq!(key.remaining(), 0);
     assert_eq!(
-        top_q, 1,
-        "top level must have advanced after bottom rollover"
+        key.sign(&mut rng, b"after-rollover").err(),
+        Some(Error::Exhausted),
+        "multi-level HSS must fail closed at bottom-tree wrap, never reuse OTS"
+    );
+}
+
+/// A persisted multi-level key with an advanced higher level is rejected: it
+/// could only be a pre-mitigation (already-wrapped) key that would re-use OTS.
+#[test]
+fn hss_from_bytes_rejects_advanced_higher_level() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-reject", b"n", &[]);
+    let sk = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let mut bytes = sk.to_bytes();
+    let per = 4 + 4 + 16 + N + 4;
+    // Set the TOP level q to 1 (a state the mitigation never produces).
+    let top_q_off = 4 + (per - 4);
+    bytes[top_q_off..top_q_off + 4].copy_from_slice(&1u32.to_be_bytes());
+    assert_eq!(
+        HssPrivateKey::from_bytes(&bytes).err(),
+        Some(Error::Malformed),
+        "advanced higher-level q must be rejected as a reuse-prone state"
     );
 }

@@ -303,18 +303,27 @@ pub struct HssPublicKey {
 /// A multi-level HSS private (signing) key.
 ///
 /// **Stateful** — see the [module documentation](crate::lms). Internally each
-/// of the `L` levels owns a fixed `(I, seed)`; the levels' leaf indices form a
-/// mixed-radix odometer, so the whole key signs `prod(2^h_i)` messages. Every
-/// [`sign`](Self::sign) advances that odometer; re-persist
+/// of the `L` levels owns a *fixed* `(I, seed)`. Every [`sign`](Self::sign)
+/// advances the bottom level's leaf index; re-persist
 /// [`to_bytes`](Self::to_bytes) afterwards. Not [`Clone`] by design.
 ///
-/// Unlike a literal RFC 8554 implementation, lower-level trees are not freshly
-/// randomized as they are exhausted — each level uses its fixed seed, and the
-/// per-level leaf index advances. This is a valid HSS instantiation (the
-/// per-level `(I, seed)` are independent key material) and is what lets the
-/// key reproduce the Appendix F Test Case 2 vector. The bottom level's signing
-/// randomizer `C` is drawn from the RNG per signature, so the message
-/// signature is hedged.
+/// # Capacity and the fail-closed multi-level mitigation
+///
+/// A literal RFC 8554 HSS regenerates each lower-level tree (a fresh `(I, seed)`
+/// signed by the next parent leaf) as it is exhausted, so the key can sign
+/// `prod(2^h_i)` messages with no LM-OTS key ever reused. This implementation
+/// does **not** regenerate lower trees — the per-level `(I, seed)` are fixed so
+/// it can reproduce the Appendix F Test Case 2 vector.
+///
+/// Because the lower trees are fixed, advancing a higher level would reset the
+/// bottom leaf index while the bottom `(I, seed)` is unchanged, re-using the
+/// bottom tree's one-time keys on different messages — a catastrophic forgery
+/// vector. To prevent that, a multi-level key (`L >= 2`) is **capped at one
+/// bottom tree**: it issues only `2^h_bottom` signatures (every higher level
+/// pinned at leaf 0) and then returns [`Error::Exhausted`]. No LM-OTS key is
+/// ever used twice. This is a conservative fail-closed mitigation; the full
+/// multi-level HSS regeneration is flagged for future work. The bottom level's
+/// signing randomizer `C` is drawn from the RNG per signature.
 pub struct HssPrivateKey {
     levels: Vec<HssLevel>,
     /// Cached root of each level's tree (`roots[i] = T[1]` of level i).
@@ -389,44 +398,54 @@ impl HssPrivateKey {
 
     /// Total signatures still available before the whole key is exhausted.
     ///
-    /// Treats the per-level leaf indices as a mixed-radix counter: the answer
-    /// is `prod(2^h_i) - value(q)`.
+    /// For a single-level key (`L == 1`) this is `2^h - q`, the number of unused
+    /// leaves of the one tree.
+    ///
+    /// For a multi-level key (`L >= 2`) it is `2^h_bottom - q_bottom`, the unused
+    /// leaves of the *bottom* tree only. See [`advance`](Self::advance) for why
+    /// the higher levels are deliberately pinned at leaf 0: advancing a higher
+    /// level would re-use the bottom tree's fixed LM-OTS keys, which is a
+    /// catastrophic key reuse. This conservative cap (one bottom tree's worth of
+    /// signatures) is the fail-closed mitigation for that finding.
     pub fn remaining(&self) -> u64 {
-        let mut total: u128 = 1;
-        for lv in &self.levels {
-            total *= lv.lms_type.leaves() as u128;
-        }
-        let mut used: u128 = 0;
-        for (i, &qi) in self.q.iter().enumerate() {
-            let mut weight: u128 = 1;
-            for lv in &self.levels[i + 1..] {
-                weight *= lv.lms_type.leaves() as u128;
-            }
-            used += qi as u128 * weight;
-        }
-        (total - used).min(u64::MAX as u128) as u64
+        let l = self.levels.len();
+        let bottom = l - 1;
+        self.levels[bottom]
+            .lms_type
+            .leaves()
+            .saturating_sub(self.q[bottom] as u64)
     }
 
-    /// Advances the mixed-radix leaf-index odometer by one signature. Returns
-    /// `Err(Exhausted)` once the top level rolls past its last leaf.
-    fn advance(&mut self) -> Result<(), Error> {
-        let l = self.levels.len();
-        let mut i = l - 1;
-        loop {
-            self.q[i] += 1;
-            if (self.q[i] as u64) < self.levels[i].lms_type.leaves() {
-                for d in (i + 1)..l {
-                    self.q[d] = 0;
-                }
-                return Ok(());
-            }
-            if i == 0 {
-                // Top exhausted: leave q[0] at leaves() so remaining()==0 and
-                // subsequent signs fail.
-                return Err(Error::Exhausted);
-            }
-            i -= 1;
-        }
+    /// Advances the leaf-index state by one signature.
+    ///
+    /// # Fail-closed multi-level behaviour (security mitigation)
+    ///
+    /// Each HSS level here owns a *fixed* `(I, seed)`. A full RFC 8554 HSS would
+    /// replace an exhausted lower-level tree with a freshly-keyed one signed by
+    /// the next parent leaf, so every signature uses unique LM-OTS material.
+    /// This implementation does not regenerate lower trees, so allowing the
+    /// mixed-radix odometer to *carry* out of the bottom level would reset
+    /// `q_bottom` to 0 while the bottom `(I, seed)` is unchanged — re-using the
+    /// bottom tree's one-time keys to sign different messages. LM-OTS reuse
+    /// reveals Winternitz pre-images and permits universal forgery.
+    ///
+    /// To make reuse impossible, a multi-level key (`L >= 2`) is treated as
+    /// exhausted the moment the bottom tree would wrap: only the first
+    /// `2^h_bottom` signatures (with every higher level pinned at leaf 0) are
+    /// ever issued. The higher levels are never advanced. This caps capacity at
+    /// one bottom tree but guarantees no LM-OTS key is ever used twice.
+    ///
+    /// `L == 1` is an ordinary single LMS tree and simply advances `q[0]`.
+    ///
+    /// This only increments the bottom leaf index; it never carries into a
+    /// higher level. When the bottom tree is consumed, `q[bottom]` is left at
+    /// `leaves()` (the exhausted sentinel) so `remaining()` becomes 0 and the
+    /// *next* [`sign`](Self::sign) returns [`Error::Exhausted`]. It does not
+    /// itself return an error, so the signature for the just-consumed leaf
+    /// (including the final one) is always emitted.
+    fn advance(&mut self) {
+        let bottom = self.levels.len() - 1;
+        self.q[bottom] += 1;
     }
 
     /// Signs `message` (RFC 8554 §6.2). Advances the internal state.
@@ -436,7 +455,7 @@ impl HssPrivateKey {
     /// signature** — see the [module documentation](crate::lms).
     pub fn sign<R: RngCore>(&mut self, rng: &mut R, message: &[u8]) -> Result<Vec<u8>, Error> {
         let l = self.levels.len();
-        if self.q[0] as u64 >= self.levels[0].lms_type.leaves() {
+        if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
 
@@ -449,7 +468,7 @@ impl HssPrivateKey {
             self.append_level_signature(&mut out, i, message, &c);
         }
 
-        self.advance()?;
+        self.advance();
         Ok(out)
     }
 
@@ -489,7 +508,7 @@ impl HssPrivateKey {
     #[cfg(test)]
     fn sign_with_cs(&mut self, message: &[u8], c_per_level: &[[u8; N]]) -> Result<Vec<u8>, Error> {
         let l = self.levels.len();
-        if self.q[0] as u64 >= self.levels[0].lms_type.leaves() {
+        if self.remaining() == 0 {
             return Err(Error::Exhausted);
         }
         let mut out = Vec::new();
@@ -497,7 +516,7 @@ impl HssPrivateKey {
         for (i, c) in c_per_level.iter().enumerate().take(l) {
             self.append_level_signature(&mut out, i, message, c);
         }
-        self.advance()?;
+        self.advance();
         Ok(out)
     }
 
@@ -575,6 +594,15 @@ impl HssPrivateKey {
             });
             q.push(qi);
             off += per;
+        }
+        // Fail-closed invariant: under the multi-level mitigation every higher
+        // level stays pinned at leaf 0 (only the bottom level advances). A
+        // persisted multi-level key with any non-bottom q != 0 can only be a
+        // pre-mitigation key that has already wrapped — i.e. one that has, or is
+        // about to, re-use the bottom tree's LM-OTS keys. Reject it rather than
+        // resume into reuse.
+        if l >= 2 && q[..l - 1].iter().any(|&qi| qi != 0) {
+            return Err(Error::Malformed);
         }
         Ok(HssPrivateKey { levels, roots, q })
     }
