@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/KarpelesLab/purecrypto/compare/v0.5.1...v0.6.0) - 2026-06-03
+
+### Added
+
+- enable ascon/lms/xmss by default
+
+### Fixed
+
+- fix CI: rustfmt build_subtree signature + sm2 rustdoc link errors
+
+### Other
+
+- retry serial lock on Windows delete-pending PermissionDenied
+- fix rustdoc intra-doc links broken by security-audit fixes
+- document no-policy verify on AnyPublicKey/CSR entry points (Finding 4)
+- hash full Name TLV + reject CA delegated responder (Findings 2, 3)
+- enforce inner/outer signatureAlgorithm consistency in verify (Finding 1)
+- validate GCM/CCM nonce length for AEAD parity
+- zeroize recovered plaintext in pc_sm2_decrypt
+- enforce RFC 8452 §6 input-length caps
+- guard AES-KWP unwrap against <16-byte ciphertext
+- silently drop per-packet AEAD failures (RFC 9000 §12.2)
+- stash digest of over-long HMAC key instead of asserting
+- zeroize secret k and v on drop
+- reject over-long Export + poison context after message limit
+- checked_mul the V-buffer size to avoid 32-bit overflow DoS
+- verify leaf hostname against server_name (auth bypass)
+- fail closed on multi-level HSS to stop LM-OTS key reuse
+- manual rotate to avoid non-inlined intrinsic in debug
+- cache built subtrees + PRF midstate so signing is O(h)
+- mark AnyPublicKey/CertSigner/CurveId/SigningKey non_exhaustive
+- document AEGIS/GMAC/SM4/Ascon/KBKDF/SM2/LMS/XMSS
+- declare new pc_* + CLI round-trip tests
+- wire SM2 and stateful LMS/XMSS signatures
+- wire SP 800-108 KBKDF + Ascon hashes/XOFs
+- wire AEGIS-128L/256, Ascon-AEAD128, and GMAC
+- reject SM2 curve keys in generic ECDSA sign/verify
+- add XMSS/XMSS^MT stateful hash-based signatures (RFC 8391)
+- add LMS/HSS stateful hash-based signatures (RFC 8554)
+- add Ascon-AEAD128 + Ascon-Hash256/XOF128/CXOF128 (NIST SP 800-232)
+- add SM2 curve + signature + encryption (GB/T 32918, RFC 8998)
+- add SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF)
+- add SM4 (GB/T 32907 / RFC 8998)
+- add GMAC (NIST SP 800-38D)
+- add AEGIS-128L/256 (draft-irtf-cfrg-aegis-aead)
+- add ascon/lms/xmss feature gates + placeholder modules
+- gate AES-SIV behind alloc and CMAC Mac impl behind hash
+- document AES-CMAC/SIV/GCM-SIV/XChaCha20-Poly1305 and X448/Ed448
+- add Ed448 (SignatureScheme 0x0808) certificate auth
+- expose Ed448/X448
+- register Ed448/X448 (OID, SPKI, signature registry)
+- add curve448 backend + Ed448 (RFC 8032)
+- add X448 Diffie-Hellman (RFC 7748)
+- wire new AEADs into C ABI and enc verb
+- add XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha-03)
+- add AES-GCM-SIV (RFC 8452)
+- add AES-SIV (RFC 5297)
+- add AES-CMAC (RFC 4493)
+
 ### Added
 
 - *(cipher)* AES-CMAC (RFC 4493) — generic over the block cipher, also exposed as a `Mac`
