@@ -5,7 +5,10 @@ use super::hash::id;
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
 use crate::kdf::scrypt::scrypt;
-use crate::kdf::{hkdf, pbkdf2};
+use crate::kdf::{
+    CmacAes128Prf, CmacAes256Prf, HmacSha256Prf, HmacSha384Prf, HmacSha512Prf, Prf, hkdf,
+    kbkdf_counter, kbkdf_feedback, pbkdf2,
+};
 
 /// Overwrites `buf` with zeros and routes the read through
 /// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
@@ -26,6 +29,146 @@ pub mod argon2_id {
     pub const ARGON2D: i32 = 4;
     pub const ARGON2I: i32 = 5;
     pub const ARGON2ID: i32 = 6;
+}
+
+/// PRF identifiers for the SP 800-108 KBKDF (mirror `PcKbkdfPrf` in
+/// `purecrypto.h`).
+pub mod kbkdf_prf {
+    #![allow(missing_docs)]
+    pub const HMAC_SHA256: i32 = 1;
+    pub const HMAC_SHA384: i32 = 2;
+    pub const HMAC_SHA512: i32 = 3;
+    pub const CMAC_AES128: i32 = 4;
+    pub const CMAC_AES256: i32 = 5;
+}
+
+/// Required `KI` length for the CMAC PRFs (HMAC PRFs accept any length).
+fn kbkdf_cmac_key_len(prf: i32) -> Option<usize> {
+    match prf {
+        kbkdf_prf::CMAC_AES128 => Some(16),
+        kbkdf_prf::CMAC_AES256 => Some(32),
+        _ => None,
+    }
+}
+
+/// SP 800-108 counter-mode KBKDF. `prf` is one of `PC_KBKDF_*`; the
+/// fixed-input layout is `[i]_32 ‖ Label ‖ 0x00 ‖ Context ‖ [L]_32`.
+///
+/// # Safety
+/// All pointers valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_kbkdf_counter(
+    prf: i32,
+    ki: *const u8,
+    ki_len: usize,
+    label: *const u8,
+    label_len: usize,
+    context: *const u8,
+    context_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(ki), Some(label), Some(context)) = (
+            unsafe { slice(ki, ki_len) },
+            unsafe { slice(label, label_len) },
+            unsafe { slice(context, context_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        if out.is_null() && out_len > 0 {
+            return PcStatus::NullPointer;
+        }
+        if let Some(want) = kbkdf_cmac_key_len(prf)
+            && ki.len() != want
+        {
+            return PcStatus::Unsupported;
+        }
+        let buf = if out_len == 0 {
+            &mut [][..]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
+        };
+        fn run<P: Prf>(ki: &[u8], label: &[u8], context: &[u8], out: &mut [u8]) -> PcStatus {
+            match kbkdf_counter::<P>(ki, label, context, out) {
+                Ok(()) => PcStatus::Ok,
+                Err(_) => PcStatus::Unsupported,
+            }
+        }
+        match prf {
+            kbkdf_prf::HMAC_SHA256 => run::<HmacSha256Prf>(ki, label, context, buf),
+            kbkdf_prf::HMAC_SHA384 => run::<HmacSha384Prf>(ki, label, context, buf),
+            kbkdf_prf::HMAC_SHA512 => run::<HmacSha512Prf>(ki, label, context, buf),
+            kbkdf_prf::CMAC_AES128 => run::<CmacAes128Prf>(ki, label, context, buf),
+            kbkdf_prf::CMAC_AES256 => run::<CmacAes256Prf>(ki, label, context, buf),
+            _ => PcStatus::Unsupported,
+        }
+    })
+}
+
+/// SP 800-108 feedback-mode KBKDF. `prf` is one of `PC_KBKDF_*`; `iv` seeds
+/// `K(0)` and may be empty. Layout: `K(i-1) ‖ [i]_32 ‖ Label ‖ 0x00 ‖ Context
+/// ‖ [L]_32`.
+///
+/// # Safety
+/// All pointers valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_kbkdf_feedback(
+    prf: i32,
+    ki: *const u8,
+    ki_len: usize,
+    iv: *const u8,
+    iv_len: usize,
+    label: *const u8,
+    label_len: usize,
+    context: *const u8,
+    context_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(ki), Some(iv), Some(label), Some(context)) = (
+            unsafe { slice(ki, ki_len) },
+            unsafe { slice(iv, iv_len) },
+            unsafe { slice(label, label_len) },
+            unsafe { slice(context, context_len) },
+        ) else {
+            return PcStatus::NullPointer;
+        };
+        if out.is_null() && out_len > 0 {
+            return PcStatus::NullPointer;
+        }
+        if let Some(want) = kbkdf_cmac_key_len(prf)
+            && ki.len() != want
+        {
+            return PcStatus::Unsupported;
+        }
+        let buf = if out_len == 0 {
+            &mut [][..]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
+        };
+        fn run<P: Prf>(
+            ki: &[u8],
+            iv: &[u8],
+            label: &[u8],
+            context: &[u8],
+            out: &mut [u8],
+        ) -> PcStatus {
+            match kbkdf_feedback::<P>(ki, iv, label, context, out) {
+                Ok(()) => PcStatus::Ok,
+                Err(_) => PcStatus::Unsupported,
+            }
+        }
+        match prf {
+            kbkdf_prf::HMAC_SHA256 => run::<HmacSha256Prf>(ki, iv, label, context, buf),
+            kbkdf_prf::HMAC_SHA384 => run::<HmacSha384Prf>(ki, iv, label, context, buf),
+            kbkdf_prf::HMAC_SHA512 => run::<HmacSha512Prf>(ki, iv, label, context, buf),
+            kbkdf_prf::CMAC_AES128 => run::<CmacAes128Prf>(ki, iv, label, context, buf),
+            kbkdf_prf::CMAC_AES256 => run::<CmacAes256Prf>(ki, iv, label, context, buf),
+            _ => PcStatus::Unsupported,
+        }
+    })
 }
 
 /// HKDF (RFC 5869). `hash` is `PC_SHA{256,384,512}`. `out_len` is the desired

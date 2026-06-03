@@ -4,10 +4,12 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use super::common::{PcStatus, guard, out_write, slice};
+use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
-    Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, Hmac, HmacSha224, HmacSha256, HmacSha384,
-    HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md5, Ripemd160, Sha1, Sha3_224,
-    Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256, Sm3,
+    Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, ExtendableOutput, Hmac, HmacSha224,
+    HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md5, Ripemd160,
+    Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Sha512_224,
+    Sha512_256, Sm3, XofReader,
 };
 
 /// Hash algorithm identifiers (mirror `PcHashId` in `purecrypto.h`).
@@ -32,6 +34,7 @@ pub mod id {
     pub const SHA1: i32 = 17;
     pub const MD5: i32 = 18;
     pub const RIPEMD160: i32 = 19;
+    pub const ASCON_HASH256: i32 = 20;
 }
 
 /// A runtime-selected hasher. (BLAKE3 carries a larger tree state than the
@@ -57,6 +60,7 @@ enum AnyHasher {
     Sha1(Sha1),
     Md5(Md5),
     Ripemd160(Ripemd160),
+    AsconHash256(AsconHash256),
 }
 
 impl AnyHasher {
@@ -81,6 +85,7 @@ impl AnyHasher {
             id::SHA1 => AnyHasher::Sha1(Sha1::new()),
             id::MD5 => AnyHasher::Md5(Md5::new()),
             id::RIPEMD160 => AnyHasher::Ripemd160(Ripemd160::new()),
+            id::ASCON_HASH256 => AnyHasher::AsconHash256(AsconHash256::new()),
             _ => return None,
         })
     }
@@ -111,6 +116,7 @@ impl AnyHasher {
             AnyHasher::Sha1(h) => u!(h),
             AnyHasher::Md5(h) => u!(h),
             AnyHasher::Ripemd160(h) => u!(h),
+            AnyHasher::AsconHash256(h) => u!(h),
         }
     }
 
@@ -140,6 +146,7 @@ impl AnyHasher {
             AnyHasher::Sha1(h) => f!(h),
             AnyHasher::Md5(h) => f!(h),
             AnyHasher::Ripemd160(h) => f!(h),
+            AnyHasher::AsconHash256(h) => f!(h),
         }
     }
 }
@@ -271,5 +278,74 @@ pub unsafe extern "C" fn pc_hmac(
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }
+    })
+}
+
+/// Ascon-XOF128 (NIST SP 800-232 §5.2): squeezes exactly `out_len` bytes of
+/// extendable output from `data` into `out`. Unlike the fixed-length digest
+/// APIs, `out_len` is the requested length (not an in/out capacity).
+///
+/// # Safety
+/// `data`/`out` must be valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ascon_xof(
+    data: *const u8,
+    data_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let Some(input) = (unsafe { slice(data, data_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        if out.is_null() && out_len > 0 {
+            return PcStatus::NullPointer;
+        }
+        let buf = if out_len == 0 {
+            &mut [][..]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
+        };
+        let mut x = AsconXof128::new();
+        x.update(input);
+        x.finalize_xof().read(buf);
+        PcStatus::Ok
+    })
+}
+
+/// Ascon-CXOF128 (NIST SP 800-232 §5.3): customized XOF. `custom` is the
+/// customization string `Z` (at most 256 bytes; longer is rejected with
+/// [`PcStatus::Unsupported`]). Squeezes exactly `out_len` bytes into `out`.
+///
+/// # Safety
+/// All pointers must be valid for their lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_ascon_cxof(
+    custom: *const u8,
+    custom_len: usize,
+    data: *const u8,
+    data_len: usize,
+    out: *mut u8,
+    out_len: usize,
+) -> PcStatus {
+    guard(|| {
+        let (Some(z), Some(input)) = (unsafe { slice(custom, custom_len) }, unsafe {
+            slice(data, data_len)
+        }) else {
+            return PcStatus::NullPointer;
+        };
+        if z.len() > AsconCxof128::MAX_CUSTOMIZATION_LEN {
+            return PcStatus::Unsupported;
+        }
+        if out.is_null() && out_len > 0 {
+            return PcStatus::NullPointer;
+        }
+        let buf = if out_len == 0 {
+            &mut [][..]
+        } else {
+            unsafe { core::slice::from_raw_parts_mut(out, out_len) }
+        };
+        AsconCxof128::xof(z, input, buf);
+        PcStatus::Ok
     })
 }
