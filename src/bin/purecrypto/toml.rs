@@ -722,3 +722,7 @@ x = 1
         assert_eq!(a["c"].as_int().unwrap(), 2);
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

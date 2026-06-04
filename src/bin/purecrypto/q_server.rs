@@ -21,3 +21,7 @@ pub(crate) fn run(args: Args) {
     // Inject `-quic` ahead of user-supplied flags. Right-most wins.
     s_server::run(args.with_prefix(&["-quic"]));
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

@@ -26,8 +26,12 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-#[cfg(feature = "std")]
+// On the libc-free fullrust target, `std` is provided by the fullrust-std
+// shim; everywhere else it is the real standard library.
+#[cfg(all(feature = "std", not(target_vendor = "fullrust")))]
 extern crate std;
+#[cfg(all(feature = "std", target_vendor = "fullrust"))]
+extern crate fullrust_std as std;
 
 pub mod ct;
 

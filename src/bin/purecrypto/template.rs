@@ -731,3 +731,7 @@ urls = ["http://crl.example/r.crl"]
         assert_eq!(t.crldp_urls, ["http://crl.example/r.crl"]);
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

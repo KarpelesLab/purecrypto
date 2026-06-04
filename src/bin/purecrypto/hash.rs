@@ -98,3 +98,7 @@ pub(crate) fn run(args: Args) {
         write_output(dest, line.as_bytes());
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

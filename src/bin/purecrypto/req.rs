@@ -81,3 +81,7 @@ pub(crate) fn run(args: Args) {
     };
     write_output(args.value("-out"), csr.to_pem().as_bytes());
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

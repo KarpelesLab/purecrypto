@@ -493,3 +493,7 @@ fn drive_udp_echo(conn: &mut Connection, socket: &UdpSocket, mtu: usize, idle_li
         }
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

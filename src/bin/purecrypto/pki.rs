@@ -219,3 +219,7 @@ pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
         .map(|e| e.strip_prefix("DNS:").unwrap_or(e).to_string())
         .collect()
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

@@ -21,3 +21,7 @@ pub(crate) fn run(args: Args) {
     // still get DTLS 1.3 — which is the most useful escape hatch.
     s_client::run(args.with_prefix(&["-dtls1_2"]));
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

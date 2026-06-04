@@ -174,3 +174,7 @@ fn parse_raw_or_hex_56(bytes: &[u8]) -> Option<[u8; 56]> {
         None
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

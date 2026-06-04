@@ -24,3 +24,7 @@ pub(crate) fn run(args: Args) {
     // as an escape hatch when comparing behavior.
     s_client::run(args.with_prefix(&["-quic"]));
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

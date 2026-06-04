@@ -641,3 +641,7 @@ fn drive_quic_data_server(
     drain_outbound(qc, sock);
     let _: Role = qc.role();
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

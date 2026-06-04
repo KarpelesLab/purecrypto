@@ -578,3 +578,7 @@ fn drive_udp_data(conn: &mut Connection, socket: &UdpSocket, mtu: usize, deadlin
     }
     let _ = stdout.flush();
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

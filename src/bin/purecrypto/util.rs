@@ -303,3 +303,7 @@ pub(crate) fn parse_usize_flag(value: &str, flag: &str) -> usize {
         .parse::<usize>()
         .unwrap_or_else(|_| die(format!("invalid integer for {flag}: {value}")))
 }
+
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;

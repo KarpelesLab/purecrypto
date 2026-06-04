@@ -1,6 +1,25 @@
 //! The `purecrypto` command-line tool: hashing, key generation, CA management,
 //! and a TLS test client (`s_client`), built entirely on the `purecrypto`
 //! library.
+//!
+//! On the libc-free `fullrust` target the binary is `no_std` and uses the
+//! `fullrust-std` shim in place of the standard library; everywhere else it is
+//! an ordinary `std` program.
+#![cfg_attr(target_vendor = "fullrust", no_std)]
+#![cfg_attr(target_vendor = "fullrust", no_main)]
+
+#[cfg(target_vendor = "fullrust")]
+extern crate alloc;
+#[cfg(target_vendor = "fullrust")]
+#[macro_use]
+extern crate fullrust_std as std;
+#[cfg(target_vendor = "fullrust")]
+mod __prelude {
+    pub use ::std::prelude::v1::*;
+}
+#[cfg(target_vendor = "fullrust")]
+#[allow(unused_imports)]
+use crate::__prelude::*;
 
 mod ca;
 mod crl;
@@ -91,3 +110,6 @@ fn main() {
         Some(other) => die(format!("unknown command '{other}' (try 'purecrypto help')")),
     }
 }
+
+#[cfg(target_vendor = "fullrust")]
+fullrust::entry!(main);
