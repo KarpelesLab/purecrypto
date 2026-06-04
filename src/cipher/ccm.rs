@@ -91,6 +91,12 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
     }
 
     /// Encrypts `buffer` in place and returns the `M`-byte authentication tag.
+    ///
+    /// # Panics
+    /// Panics if `nonce.len()` is outside `7..=13` bytes, or if `buffer.len()`
+    /// exceeds the per-nonce payload cap `2^(8·(15 − nonce.len())) − 1` bytes
+    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should
+    /// validate them first.
     pub fn encrypt(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> [u8; M] {
         self.validate(nonce, buffer.len());
 
@@ -110,6 +116,12 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
     /// Decrypts `buffer` in place and verifies `tag`. On verification failure,
     /// the buffer is wiped and `Err(TagMismatch)` is returned — no
     /// unauthenticated plaintext is left in the caller's hands.
+    ///
+    /// # Panics
+    /// Panics if `nonce.len()` is outside `7..=13` bytes, or if `buffer.len()`
+    /// exceeds the per-nonce payload cap `2^(8·(15 − nonce.len())) − 1` bytes
+    /// (NIST SP 800-38C). Callers passing untrusted nonce lengths should
+    /// validate them first.
     pub fn decrypt(
         &self,
         nonce: &[u8],
