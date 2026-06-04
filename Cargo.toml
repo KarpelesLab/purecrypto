@@ -30,7 +30,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "lms", "xmss", "mac", "cert-compression", "cli", "linux-getrandom"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "lms", "xmss", "mac", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
 std = ["alloc"]
 alloc = []
 
@@ -127,11 +127,15 @@ ech = ["tls", "hpke"]
 # (zlib) is the only codepoint wired today; brotli (2) and zstd (3)
 # remain unimplemented.
 cert-compression = ["tls", "dep:compcol"]
+# Embedded root-CA trust store: pre-seed a `RootCertStore` with the Mozilla CA
+# bundle from the first-party `cacrt` crate (no filesystem access; portable
+# across Linux/macOS/Windows). Enables `RootCertStore::with_embedded_roots`.
+embedded-roots = ["tls", "dep:cacrt"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher", "ascon", "lms", "xmss"]
 # The `purecrypto` command-line tool (gates the binary target below).
-cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss"]
+cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss", "embedded-roots"]
 
 # --- dependencies ---
 # This crate's design principle is to ship no foreign code, primarily so the
@@ -143,6 +147,12 @@ cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", 
 # compcol sits outside the cryptographic trust boundary.
 [dependencies]
 compcol = { version = "0.4", default-features = false, features = ["zlib"], optional = true }
+# Embedded root-CA bundle (Mozilla CA set, parsed at build time into static
+# DER). First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a
+# small, well-defined surface — enabled by default rather than treated as a
+# foreign-code dependency. Powers `RootCertStore::with_embedded_roots` under
+# the `embedded-roots` feature.
+cacrt = { version = "0.1", default-features = false, optional = true }
 
 [[bin]]
 name = "purecrypto"

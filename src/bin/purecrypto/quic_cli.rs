@@ -170,17 +170,15 @@ pub(crate) fn run_client(args: Args) {
     let alpn = args.value("-alpn").map(parse_alpn);
     let keylog = args.value("-keylogfile").map(open_keylog);
 
-    // Roots — QUIC v1 is TLS 1.3 only; we follow the existing DTLS-1.3
-    // convention requiring either `-CAfile` or `-insecure`.
+    // Roots — QUIC v1 is TLS 1.3 only. `-insecure` skips verification;
+    // otherwise trust comes from `-CAfile` if supplied, else the embedded
+    // `cacrt` bundle (so chain validation works out of the box).
     let roots = if insecure {
         RootCertStore::new()
     } else if let Some(path) = args.value("-CAfile") {
         load_roots_file(path)
     } else {
-        die(
-            "QUIC client requires either -CAfile <bundle> for chain validation, \
-             or -insecure to explicitly skip verification",
-        );
+        RootCertStore::with_embedded_roots()
     };
 
     let mut builder = TlsConfig::builder()

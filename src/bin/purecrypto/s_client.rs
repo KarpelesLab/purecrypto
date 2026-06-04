@@ -102,22 +102,17 @@ fn has_latest_quic(args: &Args) -> bool {
     true
 }
 
-/// Loads trust roots: from `ca_file` if given, else the system bundle.
+/// Loads trust roots: from `ca_file` if given, else the embedded `cacrt`
+/// bundle (portable, no filesystem access — unlike an OS bundle path).
 fn load_roots(ca_file: Option<&str>) -> RootCertStore {
-    const SYSTEM_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
-    let path = ca_file.unwrap_or(SYSTEM_BUNDLE);
-    let mut store = RootCertStore::new();
-    crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
-    store
-}
-
-/// Loads trust roots from a CA file if given, else returns an empty store.
-fn load_roots_optional(ca_file: Option<&str>) -> RootCertStore {
-    let mut store = RootCertStore::new();
-    if let Some(path) = ca_file {
-        crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
+    match ca_file {
+        Some(path) => {
+            let mut store = RootCertStore::new();
+            crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
+            store
+        }
+        None => RootCertStore::with_embedded_roots(),
     }
-    store
 }
 
 fn print_chain(chain: &[Vec<u8>], showcerts: bool) {
@@ -275,24 +270,13 @@ pub(crate) fn run(args: Args) {
     };
     let keylog = args.value("-keylogfile").map(open_keylog);
 
-    // Build the unified config.
-    let roots = match version {
-        ProtocolVersion::Tls12 | ProtocolVersion::Tls13 => {
-            if insecure {
-                RootCertStore::new()
-            } else {
-                load_roots(args.value("-CAfile"))
-            }
-        }
-        _ => {
-            if !insecure && args.value("-CAfile").is_none() {
-                die(
-                    "DTLS client requires either -CAfile <bundle> for chain validation, \
-                     or -insecure to explicitly skip verification (see openssl s_client)",
-                );
-            }
-            load_roots_optional(args.value("-CAfile"))
-        }
+    // Build the unified config. Across TLS and DTLS, `-insecure` skips
+    // verification; otherwise trust comes from `-CAfile` if supplied, else the
+    // embedded `cacrt` bundle (so chain validation works out of the box).
+    let roots = if insecure {
+        RootCertStore::new()
+    } else {
+        load_roots(args.value("-CAfile"))
     };
 
     let mut builder = Config::builder()
