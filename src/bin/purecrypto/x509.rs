@@ -312,7 +312,3 @@ pub(crate) fn run(args: Args) {
     let with_ext = args.flag("-ext") || args.flag("--ext");
     dump(&cert, with_ext);
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

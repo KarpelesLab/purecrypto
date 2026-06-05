@@ -26,7 +26,6 @@ fn read_password(args: &Args) -> Vec<u8> {
         .or_else(|| args.value("--password-file"))
     {
         let bytes = if p == "-" {
-            #[allow(unused_imports)] // used via BufRead::read_line on std; inherent on the shim
             use std::io::BufRead;
             let mut line = String::new();
             std::io::stdin()
@@ -361,7 +360,3 @@ pub(crate) fn run(args: Args) {
         other => die(format!("unknown kdf subcommand '{other}'\n\n{USAGE}")),
     }
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

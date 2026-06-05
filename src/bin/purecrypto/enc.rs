@@ -464,7 +464,3 @@ pub(crate) fn run(args: Args) {
     zero_buf(&mut key);
     write_output(dest, &result);
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

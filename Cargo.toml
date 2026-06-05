@@ -154,14 +154,6 @@ compcol = { version = "0.4", default-features = false, features = ["zlib"], opti
 # the `embedded-roots` feature.
 cacrt = { version = "0.1", default-features = false, optional = true }
 
-# On the libc-free fullrust target (`target_vendor = "fullrust"`), `std` is
-# provided by the fullrust-std shim and program startup by the fullrust runtime.
-# These dependencies only resolve when building for that target; normal builds
-# never see them.
-[target.'cfg(target_vendor = "fullrust")'.dependencies]
-fullrust = "0.1"
-fullrust-std = "0.1"
-
 [[bin]]
 name = "purecrypto"
 path = "src/bin/purecrypto/main.rs"
@@ -176,9 +168,6 @@ required-features = ["ech"]
 # foundation honest.
 missing_docs = "warn"
 unreachable_pub = "warn"
-# `target_vendor = "fullrust"` is our custom libc-free target; teach check-cfg
-# about it so normal builds don't warn on the freestanding cfg gates.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_vendor, values("fullrust"))'] }
 # Deny (not forbid) so a future `ffi`/SIMD module can opt back in locally
 # with a scoped `#[allow(unsafe_code)]`; the core stays safe.
 unsafe_code = "deny"

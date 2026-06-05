@@ -127,7 +127,3 @@ pub(crate) fn run(args: Args) {
     }
     die("usage: purecrypto crl -in FILE [-text | -CAfile FILE -verify | -serial S -is-revoked]");
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

@@ -275,7 +275,3 @@ pub(crate) fn run(args: Args) {
 
     write_output_with_mode(dest, pem.as_bytes(), /* private = */ true);
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

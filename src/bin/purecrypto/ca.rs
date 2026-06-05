@@ -1055,7 +1055,3 @@ mod tests {
         assert_eq!(compute(0, almost + 1), None);
     }
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

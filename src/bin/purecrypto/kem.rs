@@ -201,7 +201,3 @@ pub(crate) fn run(args: Args) {
         other => die(format!("unknown kem subcommand '{other}'\n\n{USAGE}")),
     }
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;

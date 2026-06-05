@@ -148,7 +148,3 @@ pub(crate) fn run(args: Args) {
         Key::SlhDsa(k) => write_output_with_mode(dest, k.to_pkcs8_pem().as_bytes(), private),
     }
 }
-
-#[cfg(target_vendor = "fullrust")]
-#[allow(unused_imports)]
-use crate::__prelude::*;
