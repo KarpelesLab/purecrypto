@@ -2,9 +2,13 @@
 //!
 //! Given the peer's certificate chain (end-entity first, as sent in the TLS
 //! `Certificate` message), each certificate is checked to be signed by the
-//! next, names are matched issuer-to-subject, the topmost certificate is
-//! anchored to a trusted root, and (when a verification time is supplied) every
-//! certificate is checked to be within its validity period.
+//! next and names are matched issuer-to-subject, walking upward until a
+//! certificate issued by a trusted root in the store is reached. That first
+//! anchorable certificate terminates the path: any further certificates the
+//! peer supplied above it (e.g. a redundant or cross-signed root) are
+//! discarded. When a verification time is supplied, every certificate in the
+//! validated path — but not the trust anchor itself — is checked to be within
+//! its validity period.
 //!
 //! Per RFC 5280:
 //!   * every non-leaf certificate must carry `basicConstraints.cA = true`
@@ -139,22 +143,87 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
         .collect::<Result<_, _>>()
         .map_err(|_| Error::BadCertificate)?;
 
-    // RFC 5280 §4.1.1.2 / §4.1.2.3: inner `signature` AlgorithmIdentifier in
-    // TBSCertificate MUST equal outer `signatureAlgorithm`.
-    for cert in &certs {
-        cert.check_signature_algid_consistent()
+    // Build and verify the trust path. Walk the supplied chain from the leaf
+    // (index 0) upward: each certificate must either be issued by a trusted
+    // anchor in `store` — at which point the path terminates — or be signed by
+    // the next certificate in the chain (which must itself be a CA, enforced
+    // below). The FIRST certificate whose issuer is a trusted anchor closes the
+    // path; any certificates the peer supplied ABOVE that point are discarded.
+    //
+    // Stopping at the first trusted anchor (rather than only anchoring the
+    // topmost supplied cert) is required, not merely lenient:
+    //   * a trust anchor may legitimately be reached below the top of the
+    //     presented chain — e.g. a server sends `[leaf, intermediate, transit
+    //     CA, cross-signed root]` where the *transit CA* is issued by a root we
+    //     already trust, and the final cross-signed root is anchored to some
+    //     other CA we don't carry; and
+    //   * a peer may append an expired or cross-signed copy of the root (e.g.
+    //     the 2021 "DST Root CA X3" cross-sign of ISRG Root X1).
+    // In both cases we trust the in-store anchor directly and never look above
+    // it. Consequently the validity, algorithm-identifier, critical-extension,
+    // and name/CA-constraint checks run over the validated path ONLY — never
+    // over the discarded tail (RFC 5280 §6.1: validation stops at a trust
+    // anchor, and the anchor itself is not validity-checked).
+    let mut anchor_at: Option<usize> = None;
+    for i in 0..certs.len() {
+        // (a) Is certs[i] issued directly by a trusted anchor? Anchors match by
+        //     byte-exact issuer/subject Name equality (RFC 5280 §7.1); several
+        //     anchors may share a Name (cross-signed renewal), so accept the
+        //     first whose key verifies certs[i]'s signature under `policy`.
+        let issuer_der = certs[i].issuer_der().map_err(|_| Error::BadCertificate)?;
+        let mut anchored: Option<&AnyPublicKey> = None;
+        for anchor in store.anchors_with_subject(issuer_der) {
+            if verify_cert_against_issuer(&certs[i], &anchor.key, policy).is_ok() {
+                anchored = Some(&anchor.key);
+                break;
+            }
+        }
+        if let Some(anchor_key) = anchored {
+            // Path closes here: certs[0..=i] is the validated path. certs[i]
+            // may still be revoked by a CRL signed by the anchor.
+            check_revocation(&certs[i], anchor_key, crls, now, policy)?;
+            anchor_at = Some(i + 1);
+            break;
+        }
+
+        // (b) Not anchored: certs[i] must be signed by the next supplied cert.
+        //     Running off the top of the chain without reaching an anchor means
+        //     the chain does not lead to a trusted root — reject.
+        let Some(issuer) = certs.get(i + 1) else {
+            return Err(Error::BadCertificate);
+        };
+        let issuer_key = issuer
+            .subject_public_key()
             .map_err(|_| Error::BadCertificate)?;
+        verify_cert_against_issuer(&certs[i], &issuer_key, policy)?;
+        if names_differ(&certs[i], issuer)? {
+            return Err(Error::BadCertificate);
+        }
+        check_revocation(&certs[i], &issuer_key, crls, now, policy)?;
     }
 
-    // RFC 5280 §4.2: any extension marked `critical` whose OID we do not
-    // understand requires rejection.
-    for cert in &certs {
+    // `anchor_at` is set whenever control reaches here: the loop either records
+    // the anchor and breaks, or returns BadCertificate on the no-anchor path.
+    let anchor_at = anchor_at.ok_or(Error::BadCertificate)?;
+    let path = &certs[..anchor_at];
+
+    // The remaining per-certificate checks apply to the validated path only.
+    for cert in path {
+        // RFC 5280 §4.1.1.2 / §4.1.2.3: inner `signature` AlgorithmIdentifier
+        // in TBSCertificate MUST equal the outer `signatureAlgorithm`.
+        cert.check_signature_algid_consistent()
+            .map_err(|_| Error::BadCertificate)?;
+        // RFC 5280 §4.2: a `critical` extension whose OID we don't understand
+        // requires rejection.
         check_critical_extensions_recognized(cert)?;
     }
 
-    // Each certificate must currently be within its validity period.
+    // Each certificate in the path must currently be within its validity
+    // period. The trust anchor itself is NOT validity-checked (RFC 5280 §6.1),
+    // which is exactly why a supplied-but-expired root above the anchor is
+    // harmless.
     if let Some(now) = now {
-        for cert in &certs {
+        for cert in path {
             let validity = cert.validity().map_err(|_| Error::BadCertificate)?;
             if !validity.accepts(now) {
                 return Err(Error::BadCertificate);
@@ -162,52 +231,15 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
         }
     }
 
-    // Each certificate must be signed by the next, with matching names. We
-    // also consult the CrlStore for revocation: the issuer key just verified
-    // is exactly what we need to validate a candidate CRL.
-    for pair in certs.windows(2) {
-        let (cert, issuer) = (&pair[0], &pair[1]);
-        let issuer_key = issuer
-            .subject_public_key()
-            .map_err(|_| Error::BadCertificate)?;
-        verify_cert_against_issuer(cert, &issuer_key, policy)?;
-        if names_differ(cert, issuer)? {
-            return Err(Error::BadCertificate);
-        }
-        check_revocation(cert, &issuer_key, crls, now, policy)?;
-    }
-
-    // Anchor the top of the chain to a trusted root sharing its issuer name.
-    // RFC 5280 §7.1 mandates byte-exact `Name` equality, so we compare the
-    // raw DER. Multiple anchors may share a name (cross-signed renewal); we
-    // accept the first whose key verifies the topmost cert's signature.
-    let top = certs.last().expect("chain is non-empty");
-    let top_issuer = top.issuer_der().map_err(|_| Error::BadCertificate)?;
-    let mut anchored = false;
-    let mut anchor_key: Option<&AnyPublicKey> = None;
-    for anchor in store.anchors_with_subject(top_issuer) {
-        if verify_cert_against_issuer(top, &anchor.key, policy).is_ok() {
-            anchored = true;
-            anchor_key = Some(&anchor.key);
-            break;
-        }
-    }
-    if !anchored {
-        return Err(Error::BadCertificate);
-    }
-    // Top cert may itself be revoked by a CRL signed by the anchor.
-    if let Some(key) = anchor_key {
-        check_revocation(top, key, crls, now, policy)?;
-    }
-
-    // RFC 5280 §6.1.4 — nameConstraints accumulated across every CA above
-    // the leaf, applied to the leaf's SAN entries. Critical constraints
+    // RFC 5280 §6.1.4 — nameConstraints accumulated across every CA in the
+    // path, applied to the certificates beneath each. Critical constraints
     // referencing GeneralName variants we don't evaluate have already been
     // rejected upstream by check_critical_extensions_recognized.
-    enforce_name_constraints(&certs)?;
+    enforce_name_constraints(path)?;
 
-    // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement.
-    enforce_constraints(&certs, purpose)?;
+    // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement (CA / keyUsage /
+    // extKeyUsage), over the validated path.
+    enforce_constraints(path, purpose)?;
 
     certs[0]
         .subject_public_key()
@@ -960,6 +992,188 @@ mod tests {
             verify_chain(&store, &chain, None, &policy()),
             Err(Error::BadCertificate)
         ));
+    }
+
+    /// A trust anchor reached BELOW the top of the presented chain must
+    /// terminate verification; certificates the peer supplied above it are
+    /// discarded. This is the real-world `example.com` shape: the chain ends
+    /// with a cross-signed root whose own issuer is some CA we don't carry,
+    /// while an earlier "transit"/intermediate cert is issued by a root we DO
+    /// trust. Regression for only ever anchoring `certs.last()`.
+    #[test]
+    fn anchors_at_first_trusted_ca_ignoring_cross_signed_tail() {
+        let root_key = rsa_test_key_a(); // the root we trust
+        let other_key = rsa_test_key_b(); // an unrelated CA we do NOT trust
+        let root_name = DistinguishedName::common_name("SSL.com TLS ECC Root CA 2022");
+        let transit_name = DistinguishedName::common_name("SSL.com TLS Transit ECC CA R2");
+        let leaf_name = DistinguishedName::common_name("example.com");
+        let other_ca_name = DistinguishedName::common_name("AAA Certificate Services");
+
+        // The transit CA is issued by the trusted root.
+        let transit = Certificate::issue(
+            &root_key,
+            &root_name,
+            &transit_name,
+            &other_key.public_key(),
+            &validity(),
+            2,
+            true,
+        )
+        .unwrap();
+        // The leaf is issued by the transit CA (signed with other_key, whose
+        // public half is the transit CA's subject key).
+        let leaf = Certificate::issue(
+            &other_key,
+            &transit_name,
+            &leaf_name,
+            &other_key.public_key(),
+            &validity(),
+            3,
+            false,
+        )
+        .unwrap();
+        // A cross-signed copy of the root: subject = root_name, but ISSUED BY a
+        // different CA ("AAA Certificate Services") that is not in our store.
+        // Its own signature therefore cannot anchor.
+        let cross_root = Certificate::issue(
+            &other_key,
+            &other_ca_name,
+            &root_name,
+            &root_key.public_key(),
+            &validity(),
+            4,
+            true,
+        )
+        .unwrap();
+
+        // Trust only the SSL.com root.
+        let real_root =
+            Certificate::self_signed(&root_key, &root_name, &validity(), 1, true).unwrap();
+        let mut store = RootCertStore::new();
+        store.add_der(real_root.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        // Full presented chain, ending in the un-anchorable cross-signed root.
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            transit.to_der().to_vec(),
+            cross_root.to_der().to_vec(),
+        ];
+        // Anchors at `transit` (issued by the trusted root); cross_root is
+        // discarded. Before the fix this returned BadCertificate because only
+        // cross_root's issuer ("AAA Certificate Services") was tried.
+        verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+    }
+
+    /// A peer that appends an EXPIRED copy of the root above the trust anchor
+    /// (cf. the 2021 "DST Root CA X3" cross-sign of ISRG Root X1) must still
+    /// validate: certificates above the anchor are not part of the path and are
+    /// never validity-checked. Regression for validity being enforced over the
+    /// whole supplied chain instead of the validated path.
+    #[test]
+    fn ignores_expired_root_supplied_above_anchor() {
+        let root_key = rsa_test_key_a();
+        let int_key = rsa_test_key_b();
+        let root_name = DistinguishedName::common_name("Root");
+        let int_name = DistinguishedName::common_name("Intermediate");
+        let leaf_name = DistinguishedName::common_name("leaf.example");
+
+        let intermediate = Certificate::issue(
+            &root_key,
+            &root_name,
+            &int_name,
+            &int_key.public_key(),
+            &validity(),
+            2,
+            true,
+        )
+        .unwrap();
+        let leaf = Certificate::issue(
+            &int_key,
+            &int_name,
+            &leaf_name,
+            &int_key.public_key(),
+            &validity(),
+            3,
+            false,
+        )
+        .unwrap();
+        // An expired self-signed root with the same name + key as the anchor.
+        let expired_root = Certificate::self_signed(
+            &root_key,
+            &root_name,
+            &Validity::new(
+                Time::utc(2020, 1, 1, 0, 0, 0),
+                Time::utc(2021, 1, 1, 0, 0, 0),
+            ),
+            1,
+            true,
+        )
+        .unwrap();
+
+        // Trust the (valid) root; the chain carries the expired copy above the
+        // anchor link.
+        let valid_root =
+            Certificate::self_signed(&root_key, &root_name, &validity(), 1, true).unwrap();
+        let mut store = RootCertStore::new();
+        store.add_der(valid_root.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![
+            leaf.to_der().to_vec(),
+            intermediate.to_der().to_vec(),
+            expired_root.to_der().to_vec(),
+        ];
+        verify_chain(&store, &chain, Some(&now), &policy()).unwrap();
+    }
+
+    /// A trust anchor that appears only as an *intermediate* in the store (we
+    /// trust the intermediate directly, not the root) terminates the path at
+    /// that intermediate.
+    #[test]
+    fn anchors_at_trusted_intermediate() {
+        let root_key = rsa_test_key_a();
+        let int_key = rsa_test_key_b();
+        let root_name = DistinguishedName::common_name("Root");
+        let int_name = DistinguishedName::common_name("Intermediate");
+        let leaf_name = DistinguishedName::common_name("leaf.example");
+
+        let intermediate = Certificate::issue(
+            &root_key,
+            &root_name,
+            &int_name,
+            &int_key.public_key(),
+            &validity(),
+            2,
+            true,
+        )
+        .unwrap();
+        let leaf = Certificate::issue(
+            &int_key,
+            &int_name,
+            &leaf_name,
+            &int_key.public_key(),
+            &validity(),
+            3,
+            false,
+        )
+        .unwrap();
+
+        // Trust ONLY the intermediate.
+        let mut store = RootCertStore::new();
+        store.add_der(intermediate.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        // chain = [leaf, intermediate]: anchors at the intermediate.
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), intermediate.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+        // chain = [leaf] alone: leaf's issuer (the trusted intermediate) anchors.
+        verify_chain(&store, &[leaf.to_der().to_vec()], Some(&now), &policy()).unwrap();
     }
 
     #[test]
