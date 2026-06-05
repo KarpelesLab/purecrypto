@@ -3,6 +3,7 @@
 use super::Error;
 use super::ecdsa::EcdsaPublicKey;
 use super::p256::{Fe, P256, random_scalar};
+use crate::ct::ConstantTimeLess;
 use crate::rng::{CryptoRng, RngCore};
 
 /// An ephemeral ECDH private value (a scalar in `[1, n-1]`).
@@ -21,6 +22,20 @@ impl EcdhPrivateKey {
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         EcdhPrivateKey {
             d: random_scalar(rng),
+        }
+    }
+
+    /// Creates an ECDH private value from a 32-byte big-endian scalar, checking
+    /// it is in `[1, n-1]`. Use this for a *static* ECDH key (e.g. reusing an
+    /// existing P-256 private scalar); generate ephemeral values with
+    /// [`generate`](EcdhPrivateKey::generate).
+    pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
+        let d = Fe::from_be_bytes(bytes);
+        let n = P256::order();
+        if !bool::from(d.is_zero()) && bool::from(d.ct_lt(&n)) {
+            Ok(EcdhPrivateKey { d })
+        } else {
+            Err(Error::InvalidInput)
         }
     }
 
