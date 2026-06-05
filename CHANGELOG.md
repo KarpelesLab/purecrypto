@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/KarpelesLab/purecrypto/compare/v0.6.1...v0.6.2) - 2026-06-05
+
+### Other
+
+- add EcdhPrivateKey::from_bytes for static ECDH scalars
+- document the nonce/payload-length panics on encrypt/decrypt
+- embedded root-CA trust store via the cacrt crate
+
 ## [0.6.1](https://github.com/KarpelesLab/purecrypto/compare/v0.6.0...v0.6.1) - 2026-06-03
 
 ### Other
