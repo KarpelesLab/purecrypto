@@ -156,11 +156,11 @@ cacrt = { version = "0.1", default-features = false, optional = true }
 
 # On the libc-free fullrust target (`target_vendor = "fullrust"`), `std` is
 # provided by the fullrust-std shim and program startup by the fullrust runtime.
-# These path dependencies only resolve when building for that target; normal
-# builds never see them.
+# These dependencies only resolve when building for that target; normal builds
+# never see them.
 [target.'cfg(target_vendor = "fullrust")'.dependencies]
-fullrust = { path = "../fullrust/crates/fullrust" }
-fullrust-std = { path = "../fullrust/crates/fullrust-std" }
+fullrust = "0.1"
+fullrust-std = "0.1"
 
 [[bin]]
 name = "purecrypto"
