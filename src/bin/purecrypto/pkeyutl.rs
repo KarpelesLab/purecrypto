@@ -185,12 +185,23 @@ fn atomic_overwrite(path: &str, data: &[u8]) {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let mut opts = OpenOptions::new();
-        opts.create(true).truncate(true).write(true);
+        // `create_new` refuses to clobber a pre-existing file or symlink at the
+        // temp path (defense in depth). If a stale temp survives a previous
+        // crashed run we remove it once and retry, then fail hard.
+        opts.create_new(true).write(true);
         #[cfg(unix)]
         opts.mode(0o600);
-        let mut f = opts
-            .open(&tmp)
-            .unwrap_or_else(|e| die(format!("cannot create temp key file {tmp}: {e}")));
+        let mut f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp).unwrap_or_else(|e| {
+                    die(format!("cannot remove stale temp key file {tmp}: {e}"))
+                });
+                opts.open(&tmp)
+                    .unwrap_or_else(|e| die(format!("cannot create temp key file {tmp}: {e}")))
+            }
+            Err(e) => die(format!("cannot create temp key file {tmp}: {e}")),
+        };
         f.write_all(data)
             .unwrap_or_else(|e| die(format!("cannot write temp key file {tmp}: {e}")));
         f.sync_all()
