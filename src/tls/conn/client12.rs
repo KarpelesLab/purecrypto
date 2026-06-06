@@ -1308,7 +1308,12 @@ impl ClientConnection12 {
             let resp = crate::x509::OcspResponse::from_der(ocsp.clone())
                 .map_err(|_| Error::OcspResponseInvalid)?;
             match resp
-                .check_for_cert(&leaf, &issuer, now.as_ref(), &self.config.signature_policy)
+                .check_for_cert_with_options(
+                    &leaf,
+                    &issuer,
+                    &crate::x509::OcspCheckOptions::new(&self.config.signature_policy)
+                        .with_time(now.as_ref()),
+                )
                 .map_err(|_| Error::OcspResponseInvalid)?
             {
                 crate::x509::OcspCertStatus::Good => {}

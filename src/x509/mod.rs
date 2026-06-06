@@ -21,8 +21,8 @@ pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
 pub use ocsp::{
-    OcspCertStatus, OcspRequest, OcspRequestBuilder, OcspResponse, OcspResponseBuilder,
-    OcspResponseStatus, OcspSingleResponse,
+    OcspCertStatus, OcspCheckOptions, OcspRequest, OcspRequestBuilder, OcspResponse,
+    OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse,
 };
 pub use pubkey::AnyPublicKey;
 pub use signer::CertSigner;

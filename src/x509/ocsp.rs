@@ -189,6 +189,58 @@ struct BasicParts<'a> {
     certs_inner: Option<&'a [u8]>,
 }
 
+/// Options for [`OcspResponse::check_for_cert_with_options`].
+///
+/// Bundles the verification knobs so the call site stays a single argument as
+/// new options are added (rather than growing the method's parameter list).
+/// Construct with [`OcspCheckOptions::new`] — which takes the mandatory
+/// signature [`SignaturePolicy`] that gates every signature the check verifies
+/// — then layer the optional settings:
+///
+/// ```ignore
+/// let opts = OcspCheckOptions::new(&policy)
+///     .with_time(Some(&now))      // staple freshness + responder validity
+///     .with_nonce(&request_nonce); // RFC 6960 §4.4.1 nonce binding
+/// let status = resp.check_for_cert_with_options(&leaf, &issuer, &opts)?;
+/// ```
+#[derive(Clone, Copy)]
+pub struct OcspCheckOptions<'a> {
+    policy: &'a SignaturePolicy,
+    now: Option<&'a Time>,
+    nonce: Option<&'a [u8]>,
+}
+
+impl<'a> OcspCheckOptions<'a> {
+    /// New options gating every verified signature — the BasicOCSPResponse
+    /// signature and any delegated-responder cert signature — by `policy`.
+    /// Freshness is skipped (no clock) and the response nonce is not checked
+    /// until you add them with [`with_time`](Self::with_time) /
+    /// [`with_nonce`](Self::with_nonce).
+    pub fn new(policy: &'a SignaturePolicy) -> Self {
+        Self {
+            policy,
+            now: None,
+            nonce: None,
+        }
+    }
+
+    /// Sets the clock used for staple freshness (`thisUpdate`/`nextUpdate`) and
+    /// delegated-responder certificate validity. `None` skips both checks — the
+    /// TLS layer passes `None` only under `verify_certificates = false`.
+    pub fn with_time(mut self, now: Option<&'a Time>) -> Self {
+        self.now = now;
+        self
+    }
+
+    /// Requires the response to echo `nonce` byte-for-byte (RFC 6960 §4.4.1).
+    /// Use when a fresh `OCSPRequest` is dispatched over a network; a missing
+    /// or mismatched nonce fails closed. Stapled-OCSP callers leave this unset.
+    pub fn with_nonce(mut self, nonce: &'a [u8]) -> Self {
+        self.nonce = Some(nonce);
+        self
+    }
+}
+
 impl OcspResponse {
     /// Wraps existing OCSP-response DER. Validates only that the outer
     /// structure is a single SEQUENCE with no trailing bytes.
@@ -443,6 +495,26 @@ impl OcspResponse {
         Ok(None)
     }
 
+    /// Backward-compatible convenience wrapper over
+    /// [`check_for_cert_with_options`](Self::check_for_cert_with_options) that
+    /// applies [`SignaturePolicy::modern()`] to every signature it verifies.
+    /// Prefer the options form when you need to supply your own policy (e.g.
+    /// the TLS layer threads its configured `signature_policy`) or a request
+    /// nonce.
+    pub fn check_for_cert(
+        &self,
+        leaf: &Certificate,
+        issuer: &Certificate,
+        now: Option<&Time>,
+    ) -> Result<OcspCertStatus, Error> {
+        let policy = SignaturePolicy::modern();
+        self.check_for_cert_with_options(
+            leaf,
+            issuer,
+            &OcspCheckOptions::new(&policy).with_time(now),
+        )
+    }
+
     /// End-to-end validation of a stapled OCSP response. Combines the
     /// signature verification, freshness check, and `(leaf, issuer)`
     /// match into a single call returning the asserted `CertStatus`.
@@ -476,13 +548,14 @@ impl OcspResponse {
     /// even if the signature would otherwise verify. This closes the
     /// revocation-path downgrade where a staple's signature was accepted under
     /// a weaker algorithm than the chain it speaks for.
-    pub fn check_for_cert(
+    pub fn check_for_cert_with_options(
         &self,
         leaf: &Certificate,
         issuer: &Certificate,
-        now: Option<&Time>,
-        policy: &SignaturePolicy,
+        opts: &OcspCheckOptions<'_>,
     ) -> Result<OcspCertStatus, Error> {
+        let policy = opts.policy;
+        let now = opts.now;
         // 1. Signature. Try the issuer key first; fall back to a delegated
         //    responder cert if present. Both the BasicOCSPResponse signature
         //    and the responder cert's signature are gated by `policy`.
@@ -565,6 +638,18 @@ impl OcspResponse {
             }
         }
 
+        // 4. Optional nonce binding (RFC 6960 §4.4.1). When the caller set a
+        //    nonce via `OcspCheckOptions::with_nonce`, the response MUST echo
+        //    it byte-for-byte: a missing nonce is as much a replay-window hole
+        //    as a mismatched one (the responder can ignore the request nonce
+        //    and return a fresh-looking cached staple), so both fail closed.
+        if let Some(expected_nonce) = opts.nonce {
+            match self.nonce()? {
+                Some(got) if got.as_slice() == expected_nonce => {}
+                _ => return Err(Error::Verification),
+            }
+        }
+
         Ok(single.status)
     }
 
@@ -591,19 +676,15 @@ impl OcspResponse {
         issuer: &Certificate,
         now: Option<&Time>,
         expected_nonce: &[u8],
-        policy: &SignaturePolicy,
     ) -> Result<OcspCertStatus, Error> {
-        let status = self.check_for_cert(leaf, issuer, now, policy)?;
-        match self.nonce()? {
-            Some(got) if got.as_slice() == expected_nonce => Ok(status),
-            // A missing nonce when one was requested is just as much a
-            // replay-window vulnerability as a mismatched one: the responder
-            // can ignore the request nonce and return a fresh-looking cached
-            // staple. RFC 6960 §4.4.1 frames this as the client's choice
-            // (the responder MAY omit), but a caller who reached this method
-            // explicitly opted in, so we fail-closed.
-            _ => Err(Error::Verification),
-        }
+        let policy = SignaturePolicy::modern();
+        self.check_for_cert_with_options(
+            leaf,
+            issuer,
+            &OcspCheckOptions::new(&policy)
+                .with_time(now)
+                .with_nonce(expected_nonce),
+        )
     }
 
     /// Finds the `SingleResponse` that names `leaf` under `issuer`. Compares
@@ -1235,13 +1316,6 @@ mod tests {
         )
     }
 
-    /// The shipped default signature policy — the same gate the TLS path uses
-    /// for chain signatures. The RSA-2048-SHA256 / Ed25519 fixtures below all
-    /// pass it.
-    fn policy() -> SignaturePolicy {
-        SignaturePolicy::modern()
-    }
-
     fn ed25519() -> Ed25519PrivateKey {
         // Deterministic test key.
         let seed = [7u8; 32];
@@ -1583,7 +1657,7 @@ mod tests {
 
         let now = Time::utc(2026, 6, 1, 0, 0, 0);
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
             Err(Error::Verification)
         ));
 
@@ -1599,8 +1673,7 @@ mod tests {
             ),
         );
         assert_eq!(
-            ok.check_for_cert(&leaf, &issuer, Some(&now), &policy())
-                .unwrap(),
+            ok.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1620,7 +1693,7 @@ mod tests {
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
         let now = Time::utc(2026, 6, 1, 0, 0, 0);
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
             Err(Error::Verification)
         ));
 
@@ -1631,8 +1704,7 @@ mod tests {
         );
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &valid);
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
-                .unwrap(),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
             OcspCertStatus::Good
         );
 
@@ -1640,8 +1712,7 @@ mod tests {
         // responder is NOT enforced — matching the freshness gate's behavior.
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, None, &policy())
-                .unwrap(),
+            resp.check_for_cert(&leaf, &issuer, None).unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1788,7 +1859,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         let status = resp
-            .check_for_cert_with_nonce(&leaf, &issuer, Some(&now), nonce, &policy())
+            .check_for_cert_with_nonce(&leaf, &issuer, Some(&now), nonce)
             .unwrap();
         assert_eq!(status, OcspCertStatus::Good);
     }
@@ -1808,8 +1879,7 @@ mod tests {
         // No nonce embedded.
         .sign(&signer)
         .unwrap();
-        let result =
-            resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"expected", &policy());
+        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"expected");
         assert!(matches!(result, Err(Error::Verification)));
     }
 
@@ -1828,8 +1898,7 @@ mod tests {
         .nonce(b"responder-chose-different")
         .sign(&signer)
         .unwrap();
-        let result =
-            resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"client-asked", &policy());
+        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"client-asked");
         assert!(matches!(result, Err(Error::Verification)));
     }
 
@@ -1929,8 +1998,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
-                .unwrap(),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1954,7 +2022,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
             Err(Error::Malformed)
         ));
     }
@@ -1986,7 +2054,11 @@ mod tests {
         // A valid RSA-SHA256 signature, but the policy whitelists nothing.
         let none = SignaturePolicy::empty();
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &none),
+            resp.check_for_cert_with_options(
+                &leaf,
+                &issuer,
+                &OcspCheckOptions::new(&none).with_time(Some(&now))
+            ),
             Err(Error::Verification)
         ));
         // The direct policy-aware verifier rejects it for the same reason...
@@ -2001,8 +2073,7 @@ mod tests {
         // And under the default modern() policy (which permits rsa-pkcs1-sha256)
         // the same response validates Good.
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
-                .unwrap(),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -2024,7 +2095,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
             Err(Error::Malformed)
         ));
     }
