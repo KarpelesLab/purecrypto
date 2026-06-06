@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/KarpelesLab/purecrypto/compare/v0.6.2...v0.6.3) - 2026-06-06
+
+### Other
+
+- drop Copy from OcspCheckOptions to keep it growable
+- pass OCSP check knobs via an OcspCheckOptions object
+- fix rustdoc private-intra-doc-link warning in from_pkcs1_der
+- use create_new for atomic key-overwrite temp file (LOW, defense in depth)
+- cap per-epoch send records to prevent AEAD nonce reuse
+- validate ServerHello session_id echo + pin post-HRR key_share group [LOW]
+- harden expand_label PRK copy against length mismatch [LOW]
+- reject keyUsage BIT STRING with non-zero unused trailing bits [LOW]
+- reject non-minimal long-form length encoding [LOW]
+- gate OCSP staple signatures by SignaturePolicy [MEDIUM]
+- zeroize context key material and secret PRK (audit LOW)
+- zeroize SharedSecret on drop (audit LOW)
+- zeroize password-derived working buffers [LOW]
+- make default verify length-strict for fixed-output MACs [LOW]
+- validate keyed-MAC key length [MEDIUM]
+- validate persisted signing keys in from_bytes (audit MEDIUM)
+- bound inbound DATAGRAM queue, enforce DATAGRAM/Initial/TP rules
+- admit stream before charging conn flow control [LOW]
+- reject even/zero modulus and undersized const-generic keys on import [HIGH/LOW]
+- enforce FIPS 186-5 |p-q| minimum distance in keygen [LOW]
+- Remove the fullrust freestanding-target build path
+- Depend on published fullrust crates instead of relative paths
+- anchor at the first trusted CA in the chain, not only the top
+- Build the CLI as a libc-free static binary on the fullrust target
+
 ## [0.6.2](https://github.com/KarpelesLab/purecrypto/compare/v0.6.1...v0.6.2) - 2026-06-05
 
 ### Other
