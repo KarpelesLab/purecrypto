@@ -2593,7 +2593,7 @@ impl ClientConnection {
                 let resp = crate::x509::OcspResponse::from_der(ocsp.to_vec())
                     .map_err(|_| Error::OcspResponseInvalid)?;
                 match resp
-                    .check_for_cert(&leaf, &issuer, now.as_ref())
+                    .check_for_cert(&leaf, &issuer, now.as_ref(), &self.config.signature_policy)
                     .map_err(|_| Error::OcspResponseInvalid)?
                 {
                     crate::x509::OcspCertStatus::Good => {}

@@ -82,6 +82,7 @@ use crate::der::{
 };
 use crate::hash::{sha1, sha256, sha384, sha512};
 use crate::rng::RngCore;
+use crate::signature_registry::{SignaturePolicy, find_by_oid};
 
 const PEM_LABEL: &str = "OCSP RESPONSE";
 
@@ -303,9 +304,32 @@ impl OcspResponse {
     /// policy. A SHA-1- or MD5-based signature, or an undersized RSA key, will
     /// verify **successfully** here. Callers MUST apply their own policy (e.g.
     /// `SignaturePolicy::permits`, as the TLS path does in
-    /// `tls::pki::verify`) before trusting the result.
+    /// `tls::pki::verify`) before trusting the result — or use
+    /// [`verify_signature_with_policy`](Self::verify_signature_with_policy),
+    /// which folds that gate in.
     pub fn verify_signature_with(&self, key: &AnyPublicKey) -> Result<(), Error> {
         let p = self.basic_parts()?;
+        key.verify(&p.sig_alg, p.tbs, p.signature)
+    }
+
+    /// Like [`verify_signature_with`](Self::verify_signature_with), but first
+    /// gates the BasicOCSPResponse `signatureAlgorithm` through `policy` —
+    /// mirroring how `tls::pki::verify::verify_cert_against_issuer` gates
+    /// chain signatures. Resolves the algorithm in the registry and rejects
+    /// with [`Error::Verification`] when `policy` does not permit it under
+    /// `key`'s SPKI (e.g. a SHA-1/MD5-signed staple under
+    /// `SignaturePolicy::modern()`), before performing the cryptographic
+    /// verification.
+    pub fn verify_signature_with_policy(
+        &self,
+        key: &AnyPublicKey,
+        policy: &SignaturePolicy,
+    ) -> Result<(), Error> {
+        let p = self.basic_parts()?;
+        let algo = find_by_oid(&p.sig_alg).ok_or(Error::Verification)?;
+        if !policy.permits(algo, &key.to_spki_der()) {
+            return Err(Error::Verification);
+        }
         key.verify(&p.sig_alg, p.tbs, p.signature)
     }
 
@@ -442,28 +466,40 @@ impl OcspResponse {
     /// TLS layer translates both into [`crate::tls::Error::OcspResponseInvalid`]
     /// to map to a `bad_certificate` alert.
     ///
-    /// SECURITY: the signature step applies **no** signature-algorithm-strength
-    /// or key-size policy — a response signed with SHA-1/MD5-RSA or under an
-    /// undersized key will verify **successfully**. Callers MUST apply their
-    /// own policy (e.g. `SignaturePolicy::permits`, as the TLS path does in
-    /// `tls::pki::verify`) before trusting the returned status.
+    /// SECURITY: `policy` gates every signature this verifies — the
+    /// BasicOCSPResponse signature AND, for a delegated responder, the
+    /// responder cert's own issuer signature — exactly as
+    /// `tls::pki::verify::verify_cert_against_issuer` gates chain signatures.
+    /// A response (or responder cert) signed with an algorithm `policy` does
+    /// not permit — e.g. SHA-1/MD5-RSA or an undersized RSA key under
+    /// `SignaturePolicy::modern()` — is rejected with [`Error::Verification`]
+    /// even if the signature would otherwise verify. This closes the
+    /// revocation-path downgrade where a staple's signature was accepted under
+    /// a weaker algorithm than the chain it speaks for.
     pub fn check_for_cert(
         &self,
         leaf: &Certificate,
         issuer: &Certificate,
         now: Option<&Time>,
+        policy: &SignaturePolicy,
     ) -> Result<OcspCertStatus, Error> {
         // 1. Signature. Try the issuer key first; fall back to a delegated
-        //    responder cert if present.
+        //    responder cert if present. Both the BasicOCSPResponse signature
+        //    and the responder cert's signature are gated by `policy`.
         let issuer_key = issuer.subject_public_key()?;
-        if self.verify_signature_with(&issuer_key).is_err() {
+        if self
+            .verify_signature_with_policy(&issuer_key, policy)
+            .is_err()
+        {
             let responder = self
                 .delegated_responder_cert()?
                 .ok_or(Error::Verification)?;
             // The responder cert chains back to the issuer (single hop —
             // RFC 6960 §4.2.2.2 requires the delegation come from the same
-            // CA that issued the certificate the response covers).
-            responder.verify_signature_with(&issuer_key)?;
+            // CA that issued the certificate the response covers). Gate the
+            // responder cert's own signatureAlgorithm through `policy` before
+            // verifying it, mirroring `verify_cert_against_issuer`.
+            verify_cert_signature_with_policy(&responder, &issuer_key, policy)?;
             // ...with id-kp-OCSPSigning in its EKU.
             let ekus = responder.extended_key_usages()?;
             if !ekus.iter().any(|o| o.as_slice() == oid::ID_KP_OCSP_SIGNING) {
@@ -492,7 +528,7 @@ impl OcspResponse {
                 return Err(Error::Verification);
             }
             let responder_key = responder.subject_public_key()?;
-            self.verify_signature_with(&responder_key)?;
+            self.verify_signature_with_policy(&responder_key, policy)?;
         }
 
         // 2. Locate the SingleResponse for this leaf.
@@ -555,8 +591,9 @@ impl OcspResponse {
         issuer: &Certificate,
         now: Option<&Time>,
         expected_nonce: &[u8],
+        policy: &SignaturePolicy,
     ) -> Result<OcspCertStatus, Error> {
-        let status = self.check_for_cert(leaf, issuer, now)?;
+        let status = self.check_for_cert(leaf, issuer, now, policy)?;
         match self.nonce()? {
             Some(got) if got.as_slice() == expected_nonce => Ok(status),
             // A missing nonce when one was requested is just as much a
@@ -739,6 +776,26 @@ fn strip_leading_sign_zero(bytes: &[u8]) -> &[u8] {
     } else {
         bytes
     }
+}
+
+/// Verifies the signature on a delegated responder `cert` under `issuer_key`,
+/// gating on `policy`. Mirrors `tls::pki::verify::verify_cert_against_issuer`:
+/// resolves the cert's `signatureAlgorithm` OID in the registry, rejects any
+/// algorithm `policy` does not permit (with [`Error::Verification`]), and only
+/// then delegates to the issuer key's verifier. Without this gate a SHA-1- or
+/// MD5-signed responder cert would be accepted even though the chain it
+/// vouches for is policy-gated.
+fn verify_cert_signature_with_policy(
+    cert: &Certificate,
+    issuer_key: &AnyPublicKey,
+    policy: &SignaturePolicy,
+) -> Result<(), Error> {
+    let sig_alg = cert.signature_algorithm_oid()?;
+    let algo = find_by_oid(&sig_alg).ok_or(Error::Verification)?;
+    if !policy.permits(algo, &issuer_key.to_spki_der()) {
+        return Err(Error::Verification);
+    }
+    cert.verify_signature_with(issuer_key)
 }
 
 /// Encodes a bare `AlgorithmIdentifier` for an OCSP `CertID.hashAlgorithm`
@@ -1178,6 +1235,13 @@ mod tests {
         )
     }
 
+    /// The shipped default signature policy — the same gate the TLS path uses
+    /// for chain signatures. The RSA-2048-SHA256 / Ed25519 fixtures below all
+    /// pass it.
+    fn policy() -> SignaturePolicy {
+        SignaturePolicy::modern()
+    }
+
     fn ed25519() -> Ed25519PrivateKey {
         // Deterministic test key.
         let seed = [7u8; 32];
@@ -1519,7 +1583,7 @@ mod tests {
 
         let now = Time::utc(2026, 6, 1, 0, 0, 0);
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
             Err(Error::Verification)
         ));
 
@@ -1535,7 +1599,8 @@ mod tests {
             ),
         );
         assert_eq!(
-            ok.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            ok.check_for_cert(&leaf, &issuer, Some(&now), &policy())
+                .unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1555,7 +1620,7 @@ mod tests {
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
         let now = Time::utc(2026, 6, 1, 0, 0, 0);
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
             Err(Error::Verification)
         ));
 
@@ -1566,7 +1631,8 @@ mod tests {
         );
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &valid);
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
+                .unwrap(),
             OcspCertStatus::Good
         );
 
@@ -1574,7 +1640,8 @@ mod tests {
         // responder is NOT enforced — matching the freshness gate's behavior.
         let resp = delegated_good_response(&issuer, &leaf, &issuer_key, &expired);
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, None).unwrap(),
+            resp.check_for_cert(&leaf, &issuer, None, &policy())
+                .unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1721,7 +1788,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         let status = resp
-            .check_for_cert_with_nonce(&leaf, &issuer, Some(&now), nonce)
+            .check_for_cert_with_nonce(&leaf, &issuer, Some(&now), nonce, &policy())
             .unwrap();
         assert_eq!(status, OcspCertStatus::Good);
     }
@@ -1741,7 +1808,8 @@ mod tests {
         // No nonce embedded.
         .sign(&signer)
         .unwrap();
-        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"expected");
+        let result =
+            resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"expected", &policy());
         assert!(matches!(result, Err(Error::Verification)));
     }
 
@@ -1760,7 +1828,8 @@ mod tests {
         .nonce(b"responder-chose-different")
         .sign(&signer)
         .unwrap();
-        let result = resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"client-asked");
+        let result =
+            resp.check_for_cert_with_nonce(&leaf, &issuer, Some(&now), b"client-asked", &policy());
         assert!(matches!(result, Err(Error::Verification)));
     }
 
@@ -1860,7 +1929,8 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert_eq!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
+                .unwrap(),
             OcspCertStatus::Good
         );
     }
@@ -1884,9 +1954,57 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
             Err(Error::Malformed)
         ));
+    }
+
+    // Revocation-path signature-downgrade gate (MEDIUM): the BasicOCSPResponse
+    // signature must be gated by the same SignaturePolicy the chain is. A
+    // policy that does not permit the staple's signature algorithm must reject
+    // the response even when the signature itself is cryptographically valid —
+    // exactly how a SHA-1/MD5-signed staple is refused under
+    // `SignaturePolicy::modern()` (which omits rsa-pkcs1-sha1). We can't sign
+    // SHA-1 with the in-tree CertSigner, so we drive the gate with an `empty()`
+    // policy that whitelists nothing: it stands in for "the staple's algorithm
+    // is not on the whitelist".
+    #[test]
+    fn check_for_cert_rejects_staple_signature_outside_policy() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let now = Time::utc(2026, 1, 2, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            Time::utc(2026, 1, 1, 0, 0, 0),
+            Some(Time::utc(2026, 1, 8, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+
+        // A valid RSA-SHA256 signature, but the policy whitelists nothing.
+        let none = SignaturePolicy::empty();
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &none),
+            Err(Error::Verification)
+        ));
+        // The direct policy-aware verifier rejects it for the same reason...
+        assert!(matches!(
+            resp.verify_signature_with_policy(&issuer.subject_public_key().unwrap(), &none),
+            Err(Error::Verification)
+        ));
+        // ...while the policy-free verifier still accepts the (valid) signature,
+        // proving the rejection is the policy gate, not a broken signature.
+        resp.verify_signature_with(&issuer.subject_public_key().unwrap())
+            .unwrap();
+        // And under the default modern() policy (which permits rsa-pkcs1-sha256)
+        // the same response validates Good.
+        assert_eq!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy())
+                .unwrap(),
+            OcspCertStatus::Good
+        );
     }
 
     #[test]
@@ -1906,7 +2024,7 @@ mod tests {
         .sign(&signer)
         .unwrap();
         assert!(matches!(
-            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            resp.check_for_cert(&leaf, &issuer, Some(&now), &policy()),
             Err(Error::Malformed)
         ));
     }
