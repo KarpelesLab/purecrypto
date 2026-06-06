@@ -86,7 +86,7 @@ fn key_schedule(
     key_schedule_context.extend_from_slice(&psk_id_hash);
     key_schedule_context.extend_from_slice(&info_hash);
 
-    let secret = labeled_extract(kdf, shared_secret, &suite_id, b"secret", psk);
+    let mut secret = labeled_extract(kdf, shared_secret, &suite_id, b"secret", psk);
 
     let mut key = alloc::vec![0u8; suite.aead.key_len()];
     if !key.is_empty() {
@@ -119,6 +119,15 @@ fn key_schedule(
         &key_schedule_context,
         &mut exporter_secret,
     );
+
+    // Wipe the `secret` PRK intermediate before it goes out of scope — it is
+    // the extract-stage secret all three outputs are expanded from, so it is
+    // as sensitive as the key itself. Same `core::hint::black_box`-guarded
+    // zeroing the rest of the crate uses for secret intermediates.
+    for b in secret.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&secret);
 
     Ok((key, base_nonce, exporter_secret))
 }
@@ -220,6 +229,27 @@ impl SenderContext {
     }
 }
 
+impl Drop for SenderContext {
+    fn drop(&mut self) {
+        // Best-effort wipe of the key-schedule secrets (the AEAD key, the
+        // base nonce, and the exporter secret) before their heap buffers are
+        // freed. Same `core::hint::black_box`-guarded zeroing the rest of the
+        // crate uses for secret material.
+        for b in self.key.iter_mut() {
+            *b = 0;
+        }
+        for b in self.base_nonce.iter_mut() {
+            *b = 0;
+        }
+        for b in self.exporter_secret.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.key);
+        let _ = core::hint::black_box(&self.base_nonce);
+        let _ = core::hint::black_box(&self.exporter_secret);
+    }
+}
+
 impl ReceiverContext {
     pub(super) fn new(
         suite: CipherSuite,
@@ -264,6 +294,25 @@ impl ReceiverContext {
     /// [`SenderContext::export`].
     pub fn export(&self, exporter_context: &[u8], length: usize) -> Result<Vec<u8>, Error> {
         export(self.suite, &self.exporter_secret, exporter_context, length)
+    }
+}
+
+impl Drop for ReceiverContext {
+    fn drop(&mut self) {
+        // Best-effort wipe of the key-schedule secrets — symmetric to
+        // [`SenderContext`]'s `Drop`.
+        for b in self.key.iter_mut() {
+            *b = 0;
+        }
+        for b in self.base_nonce.iter_mut() {
+            *b = 0;
+        }
+        for b in self.exporter_secret.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.key);
+        let _ = core::hint::black_box(&self.base_nonce);
+        let _ = core::hint::black_box(&self.exporter_secret);
     }
 }
 
@@ -344,6 +393,36 @@ mod tests {
             exhausted: false,
             exporter_secret: alloc::vec![0u8; suite.kdf.output_len()],
         }
+    }
+
+    /// A sender and receiver built from the same `key_schedule` output must
+    /// still seal/open correctly after the addition of the wiping `Drop`
+    /// impls and the `secret` PRK wipe — i.e. zeroization didn't disturb any
+    /// key-schedule output. Both contexts are dropped at the end of this test,
+    /// exercising the new `Drop` paths.
+    #[test]
+    fn paired_contexts_seal_open_roundtrip_after_zeroize() {
+        let suite = aes128_suite();
+        let shared_secret = [0x42u8; 32];
+        let info = b"info";
+
+        let mut sender =
+            SenderContext::new(suite, Mode::Base, &shared_secret, info, b"", b"").unwrap();
+        let mut receiver =
+            ReceiverContext::new(suite, Mode::Base, &shared_secret, info, b"", b"").unwrap();
+
+        let aad = b"aad";
+        for i in 0u8..4 {
+            let pt = alloc::vec![i; 16 + i as usize];
+            let ct = sender.seal(aad, &pt).unwrap();
+            assert_eq!(receiver.open(aad, &ct).unwrap(), pt);
+        }
+
+        // Exporter interface must agree across the paired contexts.
+        assert_eq!(
+            sender.export(b"exp-ctx", 32).unwrap(),
+            receiver.export(b"exp-ctx", 32).unwrap(),
+        );
     }
 
     /// Once the message limit is hit, the context is poisoned: every
