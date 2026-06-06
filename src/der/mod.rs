@@ -146,8 +146,16 @@ impl<'a> Reader<'a> {
         if count == 0 || count > core::mem::size_of::<usize>() {
             return Err(Error::InvalidLength);
         }
-        let mut len = 0usize;
-        for _ in 0..count {
+        // X.690 §8.1.3.5 / DER §10.1: the long form must use the minimum number
+        // of length octets, so the first length octet MUST NOT be 0x00 (e.g.
+        // `0x82 0x00 0xFF` is non-canonical — `0x81 0xFF` is the only valid
+        // encoding of 255). Reject the leading-zero padding outright.
+        let first_len_octet = self.read_u8()?;
+        if first_len_octet == 0x00 {
+            return Err(Error::InvalidLength);
+        }
+        let mut len = first_len_octet as usize;
+        for _ in 1..count {
             len = (len << 8) | self.read_u8()? as usize;
         }
         // Must have used the short form if it fit.
@@ -340,6 +348,28 @@ mod tests {
         assert_eq!(tlv[2], 200);
         let mut r = Reader::new(&tlv);
         assert_eq!(r.read_octet_string().unwrap(), &content[..]);
+    }
+
+    #[test]
+    fn rejects_non_minimal_long_form_length() {
+        // X.690 §8.1.3.5 / DER §10.1: a long-form length whose leading length
+        // octet is 0x00 is non-canonical. `0x04 0x82 0x00 0xFF` encodes length
+        // 255 in two octets when `0x81 0xFF` is the only valid form — reject it.
+        assert_eq!(
+            Reader::new(&[0x04, 0x82, 0x00, 0xFF]).read_octet_string(),
+            Err(Error::InvalidLength)
+        );
+        // The canonical `0x81 0xFF` form for the same length is accepted.
+        let content = vec![0xabu8; 255];
+        let mut tlv = vec![0x04, 0x81, 0xFF];
+        tlv.extend_from_slice(&content);
+        assert_eq!(Reader::new(&tlv).read_octet_string().unwrap(), &content[..]);
+        // A long form encoding a value that fits in short form is still
+        // rejected (existing rule, unchanged): `0x81 0x7F`.
+        assert_eq!(
+            Reader::new(&[0x04, 0x81, 0x7F]).read_octet_string(),
+            Err(Error::InvalidLength)
+        );
     }
 
     #[test]
