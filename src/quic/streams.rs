@@ -531,12 +531,20 @@ impl Streams {
         fin: bool,
         data: &[u8],
     ) -> Result<(), Error> {
+        // RFC 9000 §4.6 — admit the stream (and enforce STREAM_LIMIT)
+        // BEFORE charging any connection-level flow-control credit. A
+        // peer probing unknown stream IDs above its advertised limit
+        // must be rejected with STREAM_LIMIT_ERROR without first
+        // mutating `conn_recv_used` / `stream_high_offset` — otherwise
+        // the rejected (and now connection-fatal) frame would have left
+        // those counters perturbed. This keeps the QUIC-3 audit fix
+        // (conn-FC charged against the high-water mark, not contiguous
+        // progress) but runs it strictly after stream admission.
+        self.ensure_remote_stream_exists(id)?;
+
         // RFC 9000 §4.1 — connection-level flow control is charged
         // against the highest byte offset *ever observed* on each
-        // stream, not against contiguous progress. Charge it here
-        // BEFORE we admit the stream into `map`: a peer that probes
-        // unknown stream IDs to leak conn-level credit
-        // (QUIC-3 audit finding) is caught at this point.
+        // stream, not against contiguous progress.
         //
         // `new_high = max(0, end - prev_high)` is the count of "newly
         // seen high-water bytes" for this stream. Retransmits of
@@ -556,9 +564,6 @@ impl Streams {
             self.stream_high_offset.insert(id, end);
         }
 
-        // Only after the conn-level charge does the per-stream
-        // admission step run.
-        self.ensure_remote_stream_exists(id)?;
         let stream = self.map.get_mut(&id).expect("just-ensured");
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         // We no longer use the contig-progress return value at the
@@ -1391,5 +1396,35 @@ mod tests {
         // counter must remain at the pre-frame snapshot.
         assert_eq!(s.conn_recv_used, before);
         assert!(s.stream_high_offset.is_empty());
+    }
+
+    /// A STREAM frame on a peer-initiated stream ID that exceeds the
+    /// advertised stream limit (STREAM_LIMIT_ERROR) must be rejected
+    /// WITHOUT charging connection-level flow-control credit or
+    /// recording a high-water mark — admission runs before the FC
+    /// charge.
+    #[test]
+    fn stream_limit_violation_does_not_charge_conn_fc() {
+        let our = TransportParameters {
+            initial_max_data: Some(1 << 20),
+            initial_max_stream_data_bidi_local: Some(1 << 16),
+            initial_max_stream_data_bidi_remote: Some(1 << 16),
+            initial_max_stream_data_uni: Some(1 << 16),
+            // Only ONE client-initiated bidi stream permitted (number 1,
+            // i.e. stream id 0). Id 4 is stream number 2 → over limit.
+            initial_max_streams_bidi: Some(1),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 16, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let before = s.conn_recv_used;
+        let err = s.on_stream(4, 0, false, &[0u8; 100]);
+        assert!(err.is_err(), "must reject stream over STREAM_LIMIT");
+        assert_eq!(s.conn_recv_used, before, "conn FC must not be charged");
+        assert!(
+            !s.stream_high_offset.contains_key(&4),
+            "no high-water for the rejected stream"
+        );
     }
 }
