@@ -119,7 +119,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 
     /// Decodes a PKCS#1 `RSAPublicKey` DER structure. Rejects moduli below
-    /// [`MIN_RSA_BITS`](super::boxed::MIN_RSA_BITS) and degenerate public
+    /// `MIN_RSA_BITS` and degenerate public
     /// exponents (even/zero `n`; `e < 3`, `e` even, `e ≥ n`) per the structural
     /// shape check derived from RFC 8017 §3.1. The size floor mirrors the boxed
     /// parser so the two import paths refuse the same attacker-injected moduli.
