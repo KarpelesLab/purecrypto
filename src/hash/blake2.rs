@@ -532,14 +532,21 @@ impl Blake2bMac {
     /// A keyed BLAKE2b producing `out_len` bytes (1..=64); `key` ≤ 64 bytes.
     ///
     /// # Panics
-    /// Panics if `out_len` is 0 or > 64. RFC 7693 §2.5 restricts the
-    /// digest length to that range; an out-of-range value would otherwise
-    /// be silently truncated by the BLAKE2 parameter block and surface
-    /// later as a buffer overflow in `finalize_into` / `verify`.
+    /// Panics if `out_len` is 0 or > 64, or if `key.len() > 64`. RFC 7693
+    /// §2.5 restricts the digest length to that range; an out-of-range
+    /// value would otherwise be silently truncated by the BLAKE2 parameter
+    /// block and surface later as a buffer overflow in `finalize_into` /
+    /// `verify`. The same section caps the key at half a block (64 bytes);
+    /// a longer key would wrap the parameter-block length field and panic
+    /// out-of-bounds while padding the key block.
     pub fn new(key: &[u8], out_len: usize) -> Self {
         assert!(
             (1..=64).contains(&out_len),
             "Blake2bMac out_len must be in 1..=64 (RFC 7693 §2.5)",
+        );
+        assert!(
+            key.len() <= 64,
+            "Blake2bMac key must be <= 64 bytes (RFC 7693 §2.5)",
         );
         Blake2bMac {
             state: Blake2bState::with_key(out_len, key),
@@ -614,12 +621,18 @@ impl Blake2sMac {
     /// A keyed BLAKE2s producing `out_len` bytes (1..=32); `key` ≤ 32 bytes.
     ///
     /// # Panics
-    /// Panics if `out_len` is 0 or > 32. RFC 7693 §2.5 restricts the
-    /// digest length to that range.
+    /// Panics if `out_len` is 0 or > 32, or if `key.len() > 32`. RFC 7693
+    /// §2.5 restricts the digest length to that range and caps the key at
+    /// half a block (32 bytes); a longer key would wrap the parameter-block
+    /// length field and panic out-of-bounds while padding the key block.
     pub fn new(key: &[u8], out_len: usize) -> Self {
         assert!(
             (1..=32).contains(&out_len),
             "Blake2sMac out_len must be in 1..=32 (RFC 7693 §2.5)",
+        );
+        assert!(
+            key.len() <= 32,
+            "Blake2sMac key must be <= 32 bytes (RFC 7693 §2.5)",
         );
         Blake2sMac {
             state: Blake2sState::with_key(out_len, key),
@@ -927,6 +940,24 @@ mod tests {
             out,
             from_hex::<32>("48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2bMac key must be <= 64 bytes")]
+    fn blake2b_mac_rejects_overlong_key() {
+        // A 65-byte key exceeds the RFC 7693 §2.5 cap. Without the length
+        // check this would wrap the parameter-block length field and panic
+        // out-of-bounds while padding the key block; the assert rejects it
+        // cleanly up front instead.
+        let key = [0u8; 65];
+        let _ = Blake2bMac::new(&key, 32);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2sMac key must be <= 32 bytes")]
+    fn blake2s_mac_rejects_overlong_key() {
+        let key = [0u8; 33];
+        let _ = Blake2sMac::new(&key, 32);
     }
 
     #[test]
