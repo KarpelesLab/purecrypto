@@ -450,6 +450,11 @@ pub struct ClientConnection {
     /// Set to `true` after a single HelloRetryRequest has been processed; a
     /// second one is rejected (RFC 8446 §4.1.4).
     hrr_processed: bool,
+    /// The `key_share` group the server selected in a HelloRetryRequest, if the
+    /// HRR carried one. RFC 8446 §4.1.4: the real ServerHello that follows the
+    /// HRR MUST select this same group; any other group is a protocol
+    /// violation. `None` when no HRR (or an HRR without key_share) was seen.
+    hrr_selected_group: Option<NamedGroup>,
 
     suite: Option<SuiteParams>,
     ks: Option<KeySchedule>,
@@ -1047,6 +1052,7 @@ impl ClientConnection {
             offered_suites: effective_suites.clone(),
             offered_groups: groups.to_vec(),
             hrr_processed: false,
+            hrr_selected_group: None,
             suite: None,
             ks: None,
             client_hs_secret: None,
@@ -1692,6 +1698,17 @@ impl ClientConnection {
             return Err(Error::IllegalParameter);
         }
 
+        // RFC 8446 §4.1.3: the ServerHello MUST echo `legacy_session_id` from
+        // the ClientHello verbatim. This TLS 1.3 client never uses the
+        // middlebox-compatibility session id — it always offers an empty
+        // `legacy_session_id` — so the echo must be empty. Any non-empty echo
+        // means the server did not faithfully reflect what we offered; abort
+        // with illegal_parameter (the same check the RFC mandates the client
+        // perform, also applied on the HRR path below).
+        if !sh.session_id.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
+
         // RFC 8446 §4.1.3: the server MUST select a cipher_suite the client
         // offered in this ClientHello. Reject any other suite with
         // illegal_parameter (mirrors the HRR path's offered-suite check).
@@ -1726,6 +1743,15 @@ impl ClientConnection {
         // offered (and for which we therefore hold a private key). Reject any
         // other group with illegal_parameter (mirrors the HRR path's check).
         if !self.offered_groups.contains(&group) {
+            return Err(Error::IllegalParameter);
+        }
+        // RFC 8446 §4.1.4: when this ServerHello follows a HelloRetryRequest
+        // that selected a group, the server MUST send a key_share for that
+        // exact group. Pin it — a mismatch is a protocol violation (the server
+        // forcing us to a different group than the one it just demanded).
+        if let Some(hrr_group) = self.hrr_selected_group
+            && group != hrr_group
+        {
             return Err(Error::IllegalParameter);
         }
         let shared = self.key_agreement(group, &server_pub)?;
@@ -2083,6 +2109,10 @@ impl ClientConnection {
             }
         }
         self.hrr_processed = true;
+        // Remember the HRR-selected group so the real ServerHello's key_share
+        // can be pinned to it (RFC 8446 §4.1.4). `None` when the HRR carried
+        // only a cookie and no key_share.
+        self.hrr_selected_group = selected_group;
         // Stay in WaitServerHello for the real ServerHello.
         Ok(())
     }
@@ -3128,6 +3158,38 @@ mod tests {
         // A handshake record claiming to be a (truncated) ServerHello.
         client.read_tls(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00]);
         assert!(client.process_new_packets().is_err());
+    }
+
+    // RFC 8446 §4.1.3: the ServerHello MUST echo the ClientHello's
+    // `legacy_session_id`. This client always offers an empty session id, so a
+    // ServerHello that echoes a non-empty one is a protocol violation and must
+    // abort with illegal_parameter (fail-closed hardening).
+    #[test]
+    fn rejects_server_hello_with_nonempty_session_id_echo() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"sh-sid-echo", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng);
+        let _ = client.write_tls();
+
+        // A ServerHello with a non-HRR random, a non-empty session_id, and an
+        // otherwise plausible suite. The session_id echo check fires before any
+        // suite/version/key_share processing, so this minimal SH reaches it.
+        let sh = ServerHello {
+            random: [0x11; 32],
+            session_id: alloc::vec![0xab; 4], // non-empty: we offered empty
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![(ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04],)],
+        };
+        let raw = sh.encode();
+        // `on_server_hello` takes the message body (after the u24 length).
+        let mut c = ReadCursor::new(&raw);
+        assert_eq!(c.u8().unwrap(), hs_type::SERVER_HELLO);
+        let body = c.vec_u24().unwrap();
+
+        let err = client
+            .on_server_hello(hs_type::SERVER_HELLO, body, &raw)
+            .unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
     }
 
     // RFC 8446 §4.2: a TLS 1.3 handshake message must not contain two
