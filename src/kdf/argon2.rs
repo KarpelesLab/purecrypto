@@ -198,6 +198,14 @@ pub fn argon2(
 
     // --- Output = H'(C, T) ---
     h_prime(&c, out);
+
+    // Wipe the password-derived working buffers before they drop. There are no
+    // early returns past the `mem` allocation above, so this single pass covers
+    // every non-panic exit; `black_box` keeps the writes from being elided.
+    c.iter_mut().for_each(|b| *b = 0);
+    mem.iter_mut().for_each(|b| *b = 0);
+    let _ = core::hint::black_box(&c);
+    let _ = core::hint::black_box(&mem);
     Ok(())
 }
 

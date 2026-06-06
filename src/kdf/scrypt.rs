@@ -97,6 +97,16 @@ pub fn scrypt(
 
     // --- Second PBKDF2 expansion: DK = PBKDF2-HMAC-SHA256(P, B, 1, dkLen) ---
     pbkdf2::<Sha256>(password, &b, 1, out);
+
+    // Wipe the password-derived ROMix scratch before it drops. No early returns
+    // follow the allocations above, so this single pass covers every non-panic
+    // exit; `black_box` keeps the writes from being elided.
+    b.iter_mut().for_each(|byte| *byte = 0);
+    v.iter_mut().for_each(|byte| *byte = 0);
+    x.iter_mut().for_each(|byte| *byte = 0);
+    let _ = core::hint::black_box(&b);
+    let _ = core::hint::black_box(&v);
+    let _ = core::hint::black_box(&x);
     Ok(())
 }
 
