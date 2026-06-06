@@ -8,7 +8,7 @@
 
 use super::random_prime;
 use crate::bignum::{MontModulus, Uint, inv_mod};
-use crate::ct::ConstantTimeEq;
+use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
 
@@ -258,6 +258,21 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             let p = random_prime::<LIMBS, R>(rng, half_bits, rounds);
             let q = random_prime::<LIMBS, R>(rng, half_bits, rounds);
             if p == q {
+                continue;
+            }
+
+            // FIPS 186-5 B.3.1: redraw if |p − q| < 2^(bits/2 − 100), which would
+            // expose the modulus to Fermat factorization. `|p − q| < 2^k` iff its
+            // bit length is ≤ k, so compare bit lengths without materializing the
+            // power. `saturating_sub` keeps the bound total for sub-200-bit toy
+            // sizes (where the threshold collapses to 0 and the check is a no-op
+            // since `p ≠ q`).
+            let diff = if bool::from(p.ct_lt(&q)) {
+                q.wrapping_sub(&p)
+            } else {
+                p.wrapping_sub(&q)
+            };
+            if diff.bit_len() <= half_bits.saturating_sub(100) {
                 continue;
             }
 
