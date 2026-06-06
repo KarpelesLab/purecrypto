@@ -115,9 +115,21 @@ fn expand_label<D: Digest>(secret: &[u8], label: &[u8], context: &[u8], out: &mu
     info.push(context.len() as u8);
     info.extend_from_slice(context);
 
-    // The schedule's secrets are always exactly one hash output long.
+    // The schedule's secrets are always exactly one hash output long
+    // (`Derive-Secret`/`extract` produce a `Secret` of `D::OUTPUT_LEN`), so
+    // this PRK copy is exact. Guard the copy defensively: a `copy_from_slice`
+    // panics on any length mismatch, and a future caller passing a shorter or
+    // longer `secret` should hit a loud debug assertion rather than a release
+    // panic. PRECONDITION: `secret.len() == D::OUTPUT_LEN`.
+    debug_assert_eq!(
+        secret.len(),
+        D::OUTPUT_LEN,
+        "HKDF-Expand-Label PRK must be exactly one hash output long"
+    );
     let mut prk = D::zeroed_output();
-    prk.as_mut().copy_from_slice(secret);
+    let prk_buf = prk.as_mut();
+    let n = core::cmp::min(secret.len(), prk_buf.len());
+    prk_buf[..n].copy_from_slice(&secret[..n]);
     hkdf_expand::<D>(&prk, &info, out);
 }
 
