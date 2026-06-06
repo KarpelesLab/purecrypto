@@ -277,3 +277,74 @@ fn public_key_roundtrip() {
     assert_eq!(pk, pk2);
     assert!(XmssPublicKey::from_bytes(XmssParamSet::Sha2_10_256, &raw[..raw.len() - 1]).is_err());
 }
+
+#[test]
+fn from_bytes_rejects_out_of_range_index_and_bad_root() {
+    // Stateful integrity gap (MEDIUM): `from_bytes` must reject a corrupted or
+    // rewound index and a stored root that does not match the seeds, so a
+    // tampered persisted key cannot lead to one-time-key reuse.
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmss", b"validate", &[]);
+    let set = XmssParamSet::Sha2_10_256;
+    let sk = XmssPrivateKey::generate(set, &mut rng);
+    let p = set.params();
+    let good = sk.to_bytes();
+    // `magic(4) ‖ oid(4) ‖ idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
+    let idx_off = 8;
+    let root_off = 8 + p.index_bytes + 2 * p.n;
+
+    // The pristine key parses, and the exhausted sentinel `idx == 2^h` is a
+    // legitimate persisted state (matches the signer's exhaustion convention).
+    assert!(XmssPrivateKey::from_bytes(&good).is_ok());
+    let mut exhausted = good.clone();
+    idx_to_bytes(
+        1u64 << p.full_height,
+        &mut exhausted[idx_off..idx_off + p.index_bytes],
+    );
+    assert!(XmssPrivateKey::from_bytes(&exhausted).is_ok());
+
+    // One past the sentinel is out of range and must be rejected.
+    let mut over = good.clone();
+    idx_to_bytes(
+        (1u64 << p.full_height) + 1,
+        &mut over[idx_off..idx_off + p.index_bytes],
+    );
+    assert!(matches!(
+        XmssPrivateKey::from_bytes(&over),
+        Err(Error::InvalidKey)
+    ));
+
+    // A tampered root (seed/root mismatch) must be rejected.
+    let mut bad_root = good.clone();
+    bad_root[root_off] ^= 0xff;
+    assert!(matches!(
+        XmssPrivateKey::from_bytes(&bad_root),
+        Err(Error::InvalidKey)
+    ));
+
+    // Same checks for XMSS^MT.
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmssmt", b"validate", &[]);
+    let mtset = XmssMtParamSet::Sha2_20_2_256;
+    let mtsk = XmssMtPrivateKey::generate(mtset, &mut rng);
+    let mp = mtset.params();
+    let mt_good = mtsk.to_bytes();
+    let mt_root_off = 8 + mp.index_bytes + 2 * mp.n;
+
+    assert!(XmssMtPrivateKey::from_bytes(&mt_good).is_ok());
+
+    let mut mt_over = mt_good.clone();
+    idx_to_bytes(
+        (1u64 << mp.full_height) + 1,
+        &mut mt_over[8..8 + mp.index_bytes],
+    );
+    assert!(matches!(
+        XmssMtPrivateKey::from_bytes(&mt_over),
+        Err(Error::InvalidKey)
+    ));
+
+    let mut mt_bad_root = mt_good.clone();
+    mt_bad_root[mt_root_off] ^= 0xff;
+    assert!(matches!(
+        XmssMtPrivateKey::from_bytes(&mt_bad_root),
+        Err(Error::InvalidKey)
+    ));
+}

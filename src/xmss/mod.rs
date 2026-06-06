@@ -612,6 +612,11 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
         return false;
     }
     let idx = bytes_to_idx(&sig[..p.index_bytes]);
+    // A valid signature is always produced at a leaf strictly below the tree;
+    // reject an out-of-range index early instead of relying on the final ct_eq.
+    if p.full_height < 64 && idx >= (1u64 << p.full_height) {
+        return false;
+    }
     let r = &sig[p.index_bytes..p.index_bytes + n];
 
     let mut mhash = [0u8; MAX_N];
@@ -711,6 +716,45 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
 
 const SK_MAGIC: &[u8; 4] = b"XMSk";
 const MTSK_MAGIC: &[u8; 4] = b"XMTk";
+
+/// Validates a parsed raw signing key (`idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖
+/// PUB_SEED`) before it is trusted for signing — the integrity check that
+/// stateful schemes need so a corrupted or rewound persisted key cannot lead to
+/// one-time-key reuse (mirrors `lms::*::from_bytes` index bounds and
+/// `slhdsa::PrivateKey::from_bytes` root recomputation).
+///
+/// Rejects:
+/// 1. An out-of-range leaf index. The signer treats `idx == 2^full_height` as
+///    the exhausted sentinel (see `XmssPrivateKey::sign`), so that value is a
+///    legitimate persisted state and is accepted; only `idx > 2^full_height` is
+///    rejected.
+/// 2. A stored root that does not match the one recomputed from the seeds, so a
+///    tampered `root` (or a seed/root pair that never belonged together) fails.
+fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
+    let n = p.n;
+    let idx = bytes_to_idx(&raw[..p.index_bytes]);
+    // Match the signer's exhaustion convention exactly: `full_height >= 64`
+    // never exhausts (the index can never overflow the tree), otherwise the
+    // valid range is `0..=2^full_height` (inclusive of the exhausted sentinel).
+    if p.full_height < 64 && idx > (1u64 << p.full_height) {
+        return Err(Error::InvalidKey);
+    }
+
+    // Recompute the top (layer `d-1`) subtree root from the stored seeds and
+    // compare it against the persisted root, the same way `core_keygen` derives
+    // it. Tree 0 of the top layer is the public root for both XMSS and XMSS^MT.
+    let sk_seed = &raw[p.index_bytes..p.index_bytes + n];
+    let stored_root = &raw[p.index_bytes + 2 * n..p.index_bytes + 3 * n];
+    let pub_seed = &raw[p.index_bytes + 3 * n..p.index_bytes + 4 * n];
+    let mut top_addr = Adrs::new();
+    top_addr.set_layer(p.d - 1);
+    let levels = build_subtree(p, sk_seed, pub_seed, &top_addr);
+    let th = p.tree_height as usize;
+    if !bool::from(levels[th][..n].ct_eq(stored_root)) {
+        return Err(Error::InvalidKey);
+    }
+    Ok(())
+}
 
 fn wipe(v: &mut [u8]) {
     for b in v.iter_mut() {
@@ -855,6 +899,7 @@ impl XmssPrivateKey {
         if raw.len() != p.sk_bytes() {
             return Err(Error::InvalidKey);
         }
+        validate_raw_sk(&p, raw)?;
         Ok(XmssPrivateKey {
             set,
             bytes: raw.to_vec(),
@@ -1036,6 +1081,7 @@ impl XmssMtPrivateKey {
         if raw.len() != p.sk_bytes() {
             return Err(Error::InvalidKey);
         }
+        validate_raw_sk(&p, raw)?;
         Ok(XmssMtPrivateKey {
             set,
             bytes: raw.to_vec(),
