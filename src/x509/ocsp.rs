@@ -203,7 +203,13 @@ struct BasicParts<'a> {
 ///     .with_nonce(&request_nonce); // RFC 6960 §4.4.1 nonce binding
 /// let status = resp.check_for_cert_with_options(&leaf, &issuer, &opts)?;
 /// ```
-#[derive(Clone, Copy)]
+///
+/// The fields are private and the only constructors are [`new`](Self::new) plus
+/// the `with_*` builders, so a future option can be added as one more private
+/// field + builder method without breaking callers. `Copy` is intentionally
+/// *not* derived: it would otherwise become a backward-compatibility hazard if
+/// a later option needs an owned (non-`Copy`) type.
+#[derive(Clone)]
 pub struct OcspCheckOptions<'a> {
     policy: &'a SignaturePolicy,
     now: Option<&'a Time>,
