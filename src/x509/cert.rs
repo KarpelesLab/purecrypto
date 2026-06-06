@@ -729,8 +729,22 @@ impl Certificate {
                 if raw[0] > 7 {
                     return Err(Error::Malformed);
                 }
-                let _unused = raw[0];
+                let unused = raw[0];
                 let bytes = &raw[1..];
+                // DER §11.2.1: the `unused` trailing bits of the final content
+                // octet MUST be zero. A BIT STRING that declares N unused bits
+                // but leaves any of them set is non-canonical — reject it,
+                // matching the codebase's strict-DER stance (it rejects
+                // non-canonical INTEGERs and trailing data elsewhere). With no
+                // content octets there are no trailing bits, so `unused` must
+                // also be 0 (an empty BIT STRING cannot have unused bits).
+                if let Some(&last) = bytes.last() {
+                    if unused > 0 && (last & ((1u8 << unused) - 1)) != 0 {
+                        return Err(Error::Malformed);
+                    }
+                } else if unused != 0 {
+                    return Err(Error::Malformed);
+                }
                 let mut mask: u16 = 0;
                 if !bytes.is_empty() {
                     mask |= bytes[0] as u16;
@@ -1543,6 +1557,47 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
             .unwrap();
         assert!(matches!(cert.key_usage(), Err(Error::Malformed)));
+    }
+
+    #[test]
+    fn key_usage_rejects_nonzero_unused_trailing_bits() {
+        // DER §11.2.1: the declared `unused` trailing bits of the final
+        // content octet MUST be zero. A keyUsage BIT STRING with unused=1 but
+        // bit 0 of the last byte set (0x81 → low bit is an "unused" bit yet
+        // it's 1) is non-canonical and must be rejected — not silently masked.
+        use crate::der::{encode_tlv, tag};
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::extension::Extension;
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ku-trailing", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let name = DistinguishedName::common_name("ku-trailing");
+
+        // BIT STRING { unused=1, bits=0x81 }: declares 1 unused trailing bit,
+        // but that bit (the LSB) is set — illegal per DER.
+        let bad_bs = encode_tlv(tag::BIT_STRING, &[0x01, 0x81]);
+        let ext = Extension {
+            oid: oid::KEY_USAGE.to_vec(),
+            critical: true,
+            value: bad_bs,
+        };
+        let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
+            .unwrap();
+        assert!(matches!(cert.key_usage(), Err(Error::Malformed)));
+
+        // Canonical counterpart { unused=1, bits=0x80 }: the unused LSB is 0,
+        // so it parses and yields the expected mask (bit 0 set = 0x80).
+        let good_bs = encode_tlv(tag::BIT_STRING, &[0x01, 0x80]);
+        let ext = Extension {
+            oid: oid::KEY_USAGE.to_vec(),
+            critical: true,
+            value: good_bs,
+        };
+        let cert = Certificate::self_signed_with_extensions(&signer, &name, &validity(), 1, &[ext])
+            .unwrap();
+        assert_eq!(cert.key_usage().unwrap(), Some(0x80));
     }
 
     #[test]
