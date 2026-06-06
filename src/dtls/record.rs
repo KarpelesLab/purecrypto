@@ -42,6 +42,29 @@ pub(crate) const HEADER_LEN: usize = 13;
 /// callers respect this bound.
 const SEQ_MASK_48: u64 = (1u64 << 48) - 1;
 
+/// Per-epoch record-sequence cap for the DTLS send path.
+///
+/// In DTLS the AEAD nonce is derived from `epoch‖seq` (1.2) or `IV XOR seq`
+/// (1.3), so a single epoch key must never protect two records under the same
+/// sequence number. The wire field is 48 bits, but — exactly as the TLS 1.3
+/// record layer does (`src/tls/crypto/aead.rs::MAX_RECORDS_PER_KEY = 1 << 23`)
+/// — we refuse to send long before that, well inside every AEAD's safe-record
+/// limit. DTLS has no KeyUpdate path here, so hitting the cap is
+/// connection-fatal: callers return `Error::TooManyRecords` rather than rely on
+/// the debug-only 48-bit assert that silently truncates in release builds.
+pub(crate) const MAX_RECORDS_PER_EPOCH: u64 = 1 << 23;
+
+/// Returns `Err(TooManyRecords)` once `seq` reaches [`MAX_RECORDS_PER_EPOCH`].
+///
+/// Call this on the send path with the sequence number that is *about to be*
+/// used for a record, before incrementing the per-epoch counter.
+pub(crate) fn check_seq_cap(seq: u64) -> Result<(), Error> {
+    if seq >= MAX_RECORDS_PER_EPOCH {
+        return Err(Error::TooManyRecords);
+    }
+    Ok(())
+}
+
 /// One parsed DTLS record: content type, protocol version, epoch, sequence
 /// number, and the opaque fragment.
 pub(crate) struct ParsedDtlsRecord<'a> {
@@ -225,6 +248,28 @@ mod tests {
             Err(Error::RecordOverflow) => {}
             other => panic!("expected RecordOverflow, got {:?}", other.map(|_| ())),
         }
+    }
+
+    #[test]
+    fn seq_cap_is_below_48_bits_and_enforced() {
+        // The cap must sit well below the 48-bit wire field so we can never
+        // reuse an AEAD nonce by overflowing the sequence number.
+        const { assert!(MAX_RECORDS_PER_EPOCH < (1u64 << 48)) };
+
+        // Below the cap: accepted.
+        assert!(check_seq_cap(0).is_ok());
+        assert!(check_seq_cap(MAX_RECORDS_PER_EPOCH - 1).is_ok());
+
+        // At and above the cap: refused with the fatal record-cap error,
+        // mirroring the TLS record layer's `TooManyRecords`.
+        assert!(matches!(
+            check_seq_cap(MAX_RECORDS_PER_EPOCH),
+            Err(Error::TooManyRecords)
+        ));
+        assert!(matches!(
+            check_seq_cap(MAX_RECORDS_PER_EPOCH + 1),
+            Err(Error::TooManyRecords)
+        ));
     }
 
     #[test]

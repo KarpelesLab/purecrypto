@@ -1251,6 +1251,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .ok_or(Error::InappropriateState)?;
         let epoch = self.enc_write_epoch;
         let seq = self.enc_write_seq;
+        // Refuse to reuse an AEAD nonce: the DTLS 1.3 nonce is `IV XOR seq`, so
+        // cap the per-epoch record count well below the 48-bit field (see
+        // `record::MAX_RECORDS_PER_EPOCH`). Connection-fatal — no rekey path.
+        record::check_seq_cap(seq)?;
         self.enc_write_seq += 1;
         let seq_is_16bit = true;
         let omit_length = false;

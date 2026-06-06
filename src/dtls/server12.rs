@@ -803,6 +803,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             .write_crypter
             .as_ref()
             .ok_or(Error::InappropriateState)?;
+        // Refuse to reuse an AEAD nonce: the nonce is `epoch‖seq`, so cap the
+        // per-epoch record count well below the 48-bit field (see
+        // `record::MAX_RECORDS_PER_EPOCH`). Connection-fatal — no rekey path.
+        record::check_seq_cap(self.write_seq_in_epoch)?;
         let combined = ((self.write_epoch as u64) << 48) | self.write_seq_in_epoch;
         let fragment = crypter.encrypt_dtls(combined, ct, payload)?;
         let mut out = Vec::new();
