@@ -110,6 +110,11 @@ impl<D: Digest> Drop for Hmac<D> {
 }
 
 impl<D: Digest> Mac for Hmac<D> {
+    // HMAC is a fixed-output MAC: its tag is exactly the digest length. This
+    // makes the default `Mac::verify` length-strict (rejecting truncated tags)
+    // for code that reaches the MAC through the trait.
+    const OUTPUT_LEN: Option<usize> = Some(D::OUTPUT_LEN);
+
     #[inline]
     fn update(&mut self, data: &[u8]) {
         Hmac::update(self, data);
@@ -234,5 +239,35 @@ mod tests {
         assert!(!bool::from(
             HmacSha256::new(key).chain(msg).verify(&tag[..31])
         ));
+    }
+
+    #[test]
+    fn trait_verify_rejects_truncated_tag() {
+        use crate::hash::Mac;
+
+        let key = b"k";
+        let msg = b"data";
+        let tag = HmacSha256::mac(key, msg);
+
+        // The full-length tag verifies through the trait path.
+        let m = HmacSha256::new(key).chain(msg);
+        assert!(bool::from(Mac::verify(m, &tag)));
+
+        // A truncated tag must be rejected via the trait path: the default
+        // `Mac::verify` is length-strict for fixed-output MACs, so checking
+        // only a prefix of the tag cannot forge a match.
+        for trunc in [16usize, 24, 31] {
+            let m = HmacSha256::new(key).chain(msg);
+            assert!(
+                !bool::from(Mac::verify(m, &tag[..trunc])),
+                "truncated tag of len {trunc} was accepted"
+            );
+        }
+
+        // A trailing-zero-padded over-length tag must also fail.
+        let mut over = [0u8; 40];
+        over[..tag.len()].copy_from_slice(&tag);
+        let m = HmacSha256::new(key).chain(msg);
+        assert!(!bool::from(Mac::verify(m, &over)));
     }
 }

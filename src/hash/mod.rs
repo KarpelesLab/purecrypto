@@ -181,6 +181,17 @@ pub trait XofReader {
 /// constructor; this trait unifies the post-construction interface so generic
 /// code can feed data, produce a tag, and verify it.
 pub trait Mac: Clone {
+    /// The fixed tag length, in bytes, for MACs whose output size is fixed by
+    /// the construction (e.g. [`Hmac`], CMAC, GMAC).
+    ///
+    /// `None` (the default) marks a variable-output MAC — [`Kmac128`],
+    /// [`Kmac256`], [`Blake2bMac`], [`Blake2sMac`] — whose tag length is the
+    /// caller-chosen `out.len()`. When this is `Some(n)`, the default
+    /// [`verify`](Mac::verify) rejects any `expected` whose length is not
+    /// exactly `n`, so a truncated tag cannot be accepted by comparing only a
+    /// prefix.
+    const OUTPUT_LEN: Option<usize> = None;
+
     /// Feeds message bytes. May be called any number of times.
     fn update(&mut self, data: &[u8]);
 
@@ -199,10 +210,18 @@ pub trait Mac: Clone {
     /// [`ConstantTimeEq`](crate::ct::ConstantTimeEq) directly.
     fn verify(self, expected: &[u8]) -> crate::ct::Choice {
         use crate::ct::ConstantTimeEq;
+        // For fixed-output MACs, compare against the *full* tag: comparing only
+        // `expected.len()` bytes of a truncated `expected` would accept a
+        // forged short tag. Computing the natural-length tag and requiring an
+        // exact length match closes that off. `ct_eq` fails closed on the
+        // length mismatch, so the early reject does not leak timing.
+        let n = match Self::OUTPUT_LEN {
+            Some(len) => len.min(64),
+            None => expected.len().min(64),
+        };
         let mut buf = [0u8; 64];
-        let n = expected.len().min(buf.len());
         self.finalize_into(&mut buf[..n]);
-        // `ct_eq` fails closed when `n < expected.len()` (length mismatch).
+        // `ct_eq` fails closed when `n != expected.len()` (length mismatch).
         let eq = buf[..n].ct_eq(expected);
         zeroize::zero_bytes(&mut buf);
         eq
