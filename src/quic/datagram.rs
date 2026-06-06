@@ -22,6 +22,21 @@ use alloc::vec::Vec;
 use crate::quic::varint;
 use crate::tls::Error;
 
+/// Cap on the number of buffered inbound DATAGRAM payloads awaiting
+/// application drain. DATAGRAM frames are NOT flow-controlled (RFC 9221
+/// §4), so without a cap a peer could grow [`DatagramQueues::inbound`]
+/// without bound — a memory-exhaustion DoS. Mirrors the spirit of
+/// [`crate::quic::crypto_buf::MAX_PENDING_FRAGMENTS`]. RFC 9221 §5: "a
+/// receiver MAY drop datagrams", so once the cap is hit we drop the new
+/// arrival rather than close the connection.
+pub(crate) const MAX_INBOUND_DATAGRAMS: usize = 64;
+
+/// Cap on the total bytes buffered across the inbound DATAGRAM queue.
+/// Complements [`MAX_INBOUND_DATAGRAMS`] so that a flood of large
+/// datagrams is also bounded. Mirrors
+/// [`crate::quic::crypto_buf::MAX_PENDING_CRYPTO_BYTES`].
+pub(crate) const MAX_INBOUND_DATAGRAM_BYTES: usize = 1024 * 1024;
+
 /// Per-connection outbound + inbound DATAGRAM queues.
 ///
 /// Outbound: the application calls
@@ -38,6 +53,10 @@ pub(crate) struct DatagramQueues {
     pub(crate) outbound: VecDeque<Vec<u8>>,
     /// Received payloads awaiting application drain.
     pub(crate) inbound: VecDeque<Vec<u8>>,
+    /// Running total of bytes buffered in `inbound`, kept in sync with
+    /// every push/pop so the byte cap can be enforced in O(1) without
+    /// rescanning the deque.
+    inbound_bytes: usize,
     /// Peer-advertised `max_datagram_frame_size`. 0 means the peer
     /// refuses DATAGRAM (either absent transport parameter or explicit
     /// 0). RFC 9221 §3.
@@ -55,6 +74,7 @@ impl DatagramQueues {
         Self {
             outbound: VecDeque::new(),
             inbound: VecDeque::new(),
+            inbound_bytes: 0,
             peer_max_frame_size: peer_param.unwrap_or(0),
             our_max_frame_size: our_param.unwrap_or(0),
         }
@@ -96,7 +116,9 @@ impl DatagramQueues {
     /// Drain one received datagram in arrival order, or `None` if the
     /// inbound queue is empty.
     pub(crate) fn recv(&mut self) -> Option<Vec<u8>> {
-        self.inbound.pop_front()
+        let d = self.inbound.pop_front()?;
+        self.inbound_bytes -= d.len();
+        Some(d)
     }
 
     /// Pop the next outbound datagram if it fits in `budget` bytes
@@ -118,8 +140,23 @@ impl DatagramQueues {
 
     /// Push a received payload to the inbound queue. Called by the
     /// frame dispatcher when a `Frame::Datagram` is parsed.
-    pub(crate) fn enqueue_inbound(&mut self, data: Vec<u8>) {
+    ///
+    /// DATAGRAM frames are NOT flow-controlled (RFC 9221 §4), so the
+    /// inbound queue is bounded by both a count cap
+    /// ([`MAX_INBOUND_DATAGRAMS`]) and a total-byte cap
+    /// ([`MAX_INBOUND_DATAGRAM_BYTES`]). When either would be exceeded
+    /// the new datagram is DROPPED (RFC 9221 §5: "a receiver MAY drop
+    /// datagrams") and `false` is returned — the connection is NOT
+    /// closed. Returns `true` when the datagram was buffered.
+    pub(crate) fn enqueue_inbound(&mut self, data: Vec<u8>) -> bool {
+        if self.inbound.len() >= MAX_INBOUND_DATAGRAMS
+            || self.inbound_bytes.saturating_add(data.len()) > MAX_INBOUND_DATAGRAM_BYTES
+        {
+            return false;
+        }
+        self.inbound_bytes += data.len();
         self.inbound.push_back(data);
+        true
     }
 }
 
@@ -175,6 +212,37 @@ mod tests {
         assert_eq!(q.recv().unwrap(), b"a".to_vec());
         assert_eq!(q.recv().unwrap(), b"b".to_vec());
         assert!(q.recv().is_none());
+    }
+
+    #[test]
+    fn inbound_queue_caps_by_count_and_drops() {
+        let mut q = DatagramQueues::new(Some(1200), Some(1200));
+        // Fill exactly to the count cap.
+        for _ in 0..MAX_INBOUND_DATAGRAMS {
+            assert!(q.enqueue_inbound(b"x".to_vec()));
+        }
+        assert_eq!(q.inbound.len(), MAX_INBOUND_DATAGRAMS);
+        // The next one is dropped, not buffered, and does NOT error.
+        assert!(!q.enqueue_inbound(b"y".to_vec()));
+        assert_eq!(q.inbound.len(), MAX_INBOUND_DATAGRAMS);
+        // Draining one frees a slot.
+        assert_eq!(q.recv().unwrap(), b"x".to_vec());
+        assert!(q.enqueue_inbound(b"z".to_vec()));
+    }
+
+    #[test]
+    fn inbound_queue_caps_by_bytes_and_drops() {
+        let mut q = DatagramQueues::new(Some(1200), Some(1200));
+        // One payload just under the byte cap fits.
+        let big = alloc::vec![0u8; MAX_INBOUND_DATAGRAM_BYTES - 1];
+        assert!(q.enqueue_inbound(big));
+        // A 2-byte payload would push total over the cap → dropped.
+        assert!(!q.enqueue_inbound(b"no".to_vec()));
+        // A 1-byte payload exactly reaches the cap → accepted.
+        assert!(q.enqueue_inbound(b"k".to_vec()));
+        // Draining the big one restores headroom.
+        let _ = q.recv().unwrap();
+        assert!(q.enqueue_inbound(alloc::vec![0u8; 1024]));
     }
 
     #[test]

@@ -49,6 +49,7 @@ use crate::quic::stream::StreamId;
 use crate::quic::streams::Streams;
 use crate::quic::tls_glue::HookHandle;
 use crate::quic::transport_params::TransportParameters;
+use crate::quic::varint;
 use crate::rng::{OsRng, RngCore};
 use crate::tls::Error;
 use crate::tls::conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
@@ -612,8 +613,13 @@ impl QuicConnection {
         }
 
         let mut rest = datagram;
+        // RFC 9000 §14.1 — the size of the *containing UDP datagram*, used
+        // by the server to enforce the 1200-byte Initial floor. This is
+        // the full datagram length, NOT the per-packet length, and stays
+        // constant as we walk coalesced packets within it.
+        let udp_datagram_len = datagram.len();
         while !rest.is_empty() {
-            let consumed = self.feed_one_packet(rest)?;
+            let consumed = self.feed_one_packet(rest, udp_datagram_len)?;
             if consumed == 0 {
                 // Defensive: parser couldn't make progress. RFC 9000
                 // §12.2 says to drop the trailing bytes silently rather
@@ -1856,6 +1862,30 @@ impl QuicConnection {
     /// Any mismatch is a fatal protocol violation; the caller maps the
     /// returned `Err(Error::IllegalParameter)` to a connection close.
     fn validate_peer_transport_params(&self, parsed: &TransportParameters) -> Result<(), Error> {
+        // RFC 9000 §18.2 / §7.4 — numeric range checks that apply
+        // regardless of role. A value outside the permitted range is a
+        // TRANSPORT_PARAMETER_ERROR; the IllegalParameter mapping
+        // surfaces that on the wire.
+        //
+        // ack_delay_exponent (0x0A): MUST NOT exceed 20. RFC 9000 §18.2.
+        if parsed.ack_delay_exponent.is_some_and(|v| v > 20) {
+            return Err(Error::IllegalParameter);
+        }
+        // max_ack_delay (0x0B): MUST be < 2^14 milliseconds. RFC 9000 §18.2.
+        if parsed.max_ack_delay_ms.is_some_and(|v| v >= 1 << 14) {
+            return Err(Error::IllegalParameter);
+        }
+        // active_connection_id_limit (0x0E): if present, MUST be >= 2.
+        // RFC 9000 §18.2.
+        if parsed.active_connection_id_limit.is_some_and(|v| v < 2) {
+            return Err(Error::IllegalParameter);
+        }
+        // max_udp_payload_size (0x03): if present, MUST be >= 1200.
+        // RFC 9000 §18.2.
+        if parsed.max_udp_payload_size.is_some_and(|v| v < 1200) {
+            return Err(Error::IllegalParameter);
+        }
+
         match self.role {
             Role::Client => {
                 // RFC 9000 §7.3 — the server MUST echo the client's
@@ -2086,14 +2116,14 @@ impl QuicConnection {
     /// and returns the number of bytes consumed (header + ciphertext +
     /// tag for AEAD-sealed packets; the whole packet for VN / Retry).
     /// Returns `Err` on parse / AEAD failure.
-    fn feed_one_packet(&mut self, buf: &[u8]) -> Result<usize, Error> {
+    fn feed_one_packet(&mut self, buf: &[u8], udp_datagram_len: usize) -> Result<usize, Error> {
         if buf.is_empty() {
             return Ok(0);
         }
         let b0 = buf[0];
         // Header Form bit (RFC 9000 §17.2).
         if b0 & 0x80 != 0 {
-            self.feed_long_header_packet(buf)
+            self.feed_long_header_packet(buf, udp_datagram_len)
         } else {
             self.feed_short_header_packet(buf)
         }
@@ -2122,7 +2152,11 @@ impl QuicConnection {
         Ok(false)
     }
 
-    fn feed_long_header_packet(&mut self, datagram: &[u8]) -> Result<usize, Error> {
+    fn feed_long_header_packet(
+        &mut self,
+        datagram: &[u8],
+        udp_datagram_len: usize,
+    ) -> Result<usize, Error> {
         let hdr = LongHeader::parse(datagram)?;
 
         // G-4: Version Negotiation — RFC 9000 §17.2.1, §6.2.
@@ -2209,6 +2243,20 @@ impl QuicConnection {
             LongType::ZeroRtt => Level::EarlyData,
             LongType::Retry => unreachable!("handled above"),
         };
+
+        // RFC 9000 §14.1 — "A server MUST discard an Initial packet that
+        // is carried in a UDP datagram with a payload that is smaller
+        // than the smallest allowed maximum datagram size of 1200
+        // bytes." We key off the *containing UDP datagram* length (which
+        // includes any coalesced packets), not this packet's length, and
+        // apply it only to the server role. The discard is silent: we
+        // consume the rest of the datagram without deriving Initial keys
+        // or processing any frames. Anti-amplification credit from
+        // `note_recv` (already charged in `feed_datagram`) is harmless —
+        // a too-small datagram simply yields no response.
+        if self.role == Role::Server && level == Level::Initial && udp_datagram_len < 1200 {
+            return Ok(datagram.len());
+        }
 
         // Server side: on the very first Initial we receive, derive
         // Initial keys from the client's DCID (RFC 9001 §5.2). Also
@@ -2903,11 +2951,30 @@ impl QuicConnection {
                 }
                 Frame::Datagram { data } => {
                     // RFC 9221 §5: DATAGRAM frames are ack-eliciting
-                    // but NOT retransmitted on loss. Push to the
-                    // inbound queue for application draining.
+                    // but NOT retransmitted on loss.
                     ack_eliciting = true;
+                    // RFC 9221 §3: receiving a DATAGRAM frame when we
+                    // never advertised `max_datagram_frame_size` (value
+                    // 0, the default) is a PROTOCOL_VIOLATION. The
+                    // IllegalParameter mapping surfaces as
+                    // PROTOCOL_VIOLATION on the wire (same convention as
+                    // the NEW_TOKEN/server arm above).
+                    if self.datagram_queues.our_max_frame_size == 0 {
+                        return Err(Error::IllegalParameter);
+                    }
+                    // RFC 9221 §3: a DATAGRAM frame larger than the
+                    // `max_datagram_frame_size` we advertised is also a
+                    // PROTOCOL_VIOLATION. The advertised value bounds the
+                    // whole frame (type byte + varint length + payload).
+                    let frame_len = 1 + varint::encoded_len(data.len() as u64) + data.len();
+                    if frame_len as u64 > self.datagram_queues.our_max_frame_size {
+                        return Err(Error::IllegalParameter);
+                    }
                     if matches!(level, Level::OneRtt) {
-                        self.datagram_queues.enqueue_inbound(data.to_vec());
+                        // RFC 9221 §5: the inbound queue is bounded; an
+                        // over-cap datagram is silently DROPPED, not a
+                        // connection error.
+                        let _ = self.datagram_queues.enqueue_inbound(data.to_vec());
                     }
                 }
             }
@@ -3851,6 +3918,39 @@ mod tests {
         drive_until_complete(&mut c, &mut s, 8);
         assert!(c.is_handshake_complete());
         assert!(s.is_handshake_complete());
+    }
+
+    /// RFC 9000 §14.1 — a server MUST discard an Initial packet carried
+    /// in a UDP datagram smaller than 1200 bytes. Feeding the server a
+    /// sub-1200 datagram containing the client's Initial must leave the
+    /// server's Initial rx keys uninstalled (silent discard, Ok), while
+    /// the full ≥1200 datagram installs them.
+    #[test]
+    fn server_discards_sub_1200_initial() {
+        let (mut c, mut s_small) = loopback_pair();
+        let dg = c.pop_datagram();
+        // The client always pads its first Initial to >= 1200 (§14.1).
+        assert!(dg.len() >= 1200, "client Initial must be padded to 1200");
+
+        // Truncate below the floor and feed to a fresh server. The bytes
+        // never reach key derivation, so the short datagram is silently
+        // discarded and the server derives no Initial rx keys.
+        let short = &dg[..1199];
+        s_small
+            .feed_datagram(short)
+            .expect("sub-1200 Initial is silently discarded, not an error");
+        assert!(
+            s_small.endpoint.crypto.at(Level::Initial).rx.is_none(),
+            "server must NOT derive Initial keys from a sub-1200 datagram"
+        );
+
+        // The full datagram, by contrast, is processed and installs keys.
+        let (_c2, mut s_full) = loopback_pair();
+        s_full.feed_datagram(&dg).expect("full Initial processed");
+        assert!(
+            s_full.endpoint.crypto.at(Level::Initial).rx.is_some(),
+            "server must derive Initial keys from a >=1200 datagram"
+        );
     }
 
     /// Test 4 — CRYPTO frame out-of-order reassembly is covered by
@@ -5746,6 +5846,71 @@ mod tests {
         }
     }
 
+    /// RFC 9000 §18.2 / §7.4 — the validator must reject peer transport
+    /// parameters whose numeric fields fall outside their permitted
+    /// ranges: ack_delay_exponent > 20, max_ack_delay >= 2^14 ms,
+    /// active_connection_id_limit < 2, max_udp_payload_size < 1200.
+    #[test]
+    fn tp_server_rejects_out_of_range_numeric_params() {
+        type Mutator = fn(&mut TransportParameters);
+        let cases: &[(&str, Mutator)] = &[
+            ("ack_delay_exponent>20", |tp| {
+                tp.ack_delay_exponent = Some(21);
+            }),
+            ("max_ack_delay>=2^14", |tp| {
+                tp.max_ack_delay_ms = Some(1 << 14);
+            }),
+            ("active_connection_id_limit<2", |tp| {
+                tp.active_connection_id_limit = Some(1);
+            }),
+            ("max_udp_payload_size<1200", |tp| {
+                tp.max_udp_payload_size = Some(1199);
+            }),
+        ];
+        for (name, mutate) in cases {
+            let (mut c, mut s) = loopback_pair();
+            let initial = c.pop_datagram();
+            s.feed_datagram(&initial)
+                .unwrap_or_else(|_| panic!("{name}: server feeds CH"));
+            let client_first_scid = s.endpoint.cids.peer.as_slice().to_vec();
+            let mut bad_tp = TransportParameters {
+                initial_source_connection_id: Some(client_first_scid),
+                max_idle_timeout_ms: Some(30_000),
+                initial_max_data: Some(1 << 20),
+                initial_max_stream_data_bidi_local: Some(1 << 16),
+                initial_max_stream_data_bidi_remote: Some(1 << 16),
+                initial_max_stream_data_uni: Some(1 << 16),
+                initial_max_streams_bidi: Some(100),
+                initial_max_streams_uni: Some(3),
+                active_connection_id_limit: Some(2),
+                ..TransportParameters::default()
+            };
+            mutate(&mut bad_tp);
+            let r = s.validate_peer_transport_params(&bad_tp);
+            assert!(
+                matches!(r, Err(Error::IllegalParameter)),
+                "{name}: must reject out-of-range numeric TP; got {:?}",
+                r
+            );
+        }
+
+        // Boundary values that ARE legal must pass (ISCID still matches).
+        let (mut c, mut s) = loopback_pair();
+        let initial = c.pop_datagram();
+        s.feed_datagram(&initial).expect("server feeds CH");
+        let client_first_scid = s.endpoint.cids.peer.as_slice().to_vec();
+        let good_tp = TransportParameters {
+            initial_source_connection_id: Some(client_first_scid),
+            ack_delay_exponent: Some(20),
+            max_ack_delay_ms: Some((1 << 14) - 1),
+            active_connection_id_limit: Some(2),
+            max_udp_payload_size: Some(1200),
+            ..TransportParameters::default()
+        };
+        s.validate_peer_transport_params(&good_tp)
+            .expect("boundary-legal numeric params must pass");
+    }
+
     /// The validator must reject a server's TP whose
     /// `initial_source_connection_id` doesn't match the SCID the client
     /// observed on the server's first long-header packet (RFC 9000 §7.3).
@@ -6459,6 +6624,69 @@ mod tests {
         // Client side: legitimate direction, MUST accept.
         c.dispatch_frames(Level::OneRtt, 0, &payload)
             .expect("client must accept NEW_TOKEN from server");
+    }
+
+    /// RFC 9221 §3: receiving a DATAGRAM frame when we never advertised
+    /// `max_datagram_frame_size` MUST be a PROTOCOL_VIOLATION (mapped to
+    /// `IllegalParameter`). `loopback_pair` does NOT advertise the
+    /// parameter, so the inbound DATAGRAM must be rejected; the
+    /// DATAGRAM-enabled pair accepts the same frame.
+    #[test]
+    fn dispatch_rejects_datagram_when_not_advertised() {
+        let mut payload = Vec::new();
+        Frame::Datagram { data: b"hi" }.encode(&mut payload);
+
+        let (mut c, _s) = loopback_pair();
+        let err = c.dispatch_frames(Level::OneRtt, 0, &payload).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
+
+        // A pair that advertised support accepts it and buffers it.
+        let (mut cd, _sd) = datagram_loopback_pair();
+        cd.dispatch_frames(Level::OneRtt, 0, &payload)
+            .expect("advertised DATAGRAM must be accepted");
+        assert_eq!(cd.recv_datagram().as_deref(), Some(&b"hi"[..]));
+    }
+
+    /// RFC 9221 §3: a DATAGRAM frame whose encoded size exceeds the
+    /// `max_datagram_frame_size` we advertised MUST be a
+    /// PROTOCOL_VIOLATION.
+    #[test]
+    fn dispatch_rejects_oversized_datagram() {
+        // Build a connection that advertised a small max (100). The
+        // datagram_loopback_pair advertises 1200, so craft our own.
+        let (_server_cfg_tls, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut params = loopback_params();
+        params.max_datagram_frame_size = Some(100);
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params,
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client");
+
+        // A 200-byte payload yields a frame > 100 → PROTOCOL_VIOLATION.
+        let big = alloc::vec![0u8; 200];
+        let mut payload = Vec::new();
+        Frame::Datagram { data: &big }.encode(&mut payload);
+        let err = c.dispatch_frames(Level::OneRtt, 0, &payload).unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
+
+        // A small datagram within the advertised bound is accepted.
+        let mut ok = Vec::new();
+        Frame::Datagram { data: b"ok" }.encode(&mut ok);
+        c.dispatch_frames(Level::OneRtt, 1, &ok)
+            .expect("in-bound datagram accepted");
     }
 
     /// RFC 9000 §13.2.5: an outbound ACK frame's `ack_delay` field MUST
