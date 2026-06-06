@@ -93,8 +93,26 @@ impl SharedSecret {
     }
 
     /// Consumes the shared secret and returns the underlying byte buffer.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+    pub fn into_bytes(mut self) -> Vec<u8> {
+        // `SharedSecret` implements `Drop`, so the field cannot be moved out
+        // directly (E0509). Swap the buffer out with an empty `Vec` and hand
+        // it to the caller — the wiping `Drop` then runs over the now-empty
+        // `self.bytes`, a no-op, and the caller owns (and must protect) the
+        // raw secret.
+        core::mem::take(&mut self.bytes)
+    }
+}
+
+impl Drop for SharedSecret {
+    fn drop(&mut self) {
+        // Best-effort wipe of the raw finite-field shared secret before its
+        // heap buffer is freed. Same `core::hint::black_box`-guarded zeroing
+        // the rest of the crate uses (e.g. `cipher/cfb.rs`), mirroring the
+        // explicit wipe `DhPrivateKey::drop` performs on the exponent `x`.
+        for b in self.bytes.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.bytes);
     }
 }
 
@@ -425,6 +443,21 @@ mod tests {
         let mut buf = vec![0u8; 256];
         buf[255] = 1;
         assert!(DhPrivateKey::from_bytes(group14(), &buf).is_ok());
+    }
+
+    /// `into_bytes` must still hand back exactly the same secret it held,
+    /// proving the wiping `Drop` (which forbids a direct field move) didn't
+    /// change the consuming accessor's output.
+    #[test]
+    fn shared_secret_into_bytes_preserves_value() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-into-bytes", b"nonce", &[]);
+        let alice = DhPrivateKey::generate(group14(), &mut rng);
+        let bob = DhPrivateKey::generate(group14(), &mut rng);
+        let shared = alice.shared_secret(&bob.public_key()).unwrap();
+        let expected = shared.as_bytes().to_vec();
+        let owned = shared.into_bytes();
+        assert_eq!(owned, expected);
+        assert_eq!(owned.len(), 256);
     }
 
     #[test]
