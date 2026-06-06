@@ -51,20 +51,24 @@ fn int_to_uint<const LIMBS: usize>(content: &[u8]) -> Result<Uint<LIMBS>, Error>
 
 /// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
 /// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
-/// enforce the structural shape: `e ≥ 3`, `e` odd, and `e < n`. These three
-/// together rule out the degenerate values (`0`, `1`, even, oversized) that a
-/// malicious PKCS#1 / SPKI / certificate could otherwise smuggle through and
-/// break downstream sign / verify / encrypt math. Mirrors the boxed-key
-/// validator in [`super::boxed`].
+/// enforce the structural shape: `n` odd (hence non-zero), `e ≥ 3`, `e` odd,
+/// and `e < n`. These rule out the degenerate values (`0`, `1`, even, oversized)
+/// that a malicious PKCS#1 / SPKI / certificate could otherwise smuggle through
+/// and break downstream sign / verify / encrypt math. The `n` odd check is
+/// load-bearing: an even (or zero) modulus reaches `MontModulus::new`, which
+/// asserts an odd modulus and would otherwise panic on attacker-controlled
+/// input. Mirrors the boxed-key validator in [`super::boxed`].
 fn validate_public_exponent<const LIMBS: usize>(
     n: &Uint<LIMBS>,
     e: &Uint<LIMBS>,
 ) -> Result<(), Error> {
+    // A zero modulus is even, so the odd check also rejects `n = 0`.
+    let n_odd = bool::from(n.is_odd());
     let three = Uint::<LIMBS>::from_u64(3);
     let e_ge_3 = !bool::from(e.ct_lt(&three));
     let e_odd = bool::from(e.is_odd());
     let e_lt_n = bool::from(e.ct_lt(n));
-    if !(e_ge_3 && e_odd && e_lt_n) {
+    if !(n_odd && e_ge_3 && e_odd && e_lt_n) {
         return Err(Error::Malformed);
     }
     Ok(())
@@ -114,9 +118,11 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         encode_sequence(&body)
     }
 
-    /// Decodes a PKCS#1 `RSAPublicKey` DER structure. Rejects degenerate
-    /// public exponents (`e < 3`, `e` even, `e ≥ n`) per the structural
-    /// shape check derived from RFC 8017 §3.1.
+    /// Decodes a PKCS#1 `RSAPublicKey` DER structure. Rejects moduli below
+    /// [`MIN_RSA_BITS`](super::boxed::MIN_RSA_BITS) and degenerate public
+    /// exponents (even/zero `n`; `e < 3`, `e` even, `e ≥ n`) per the structural
+    /// shape check derived from RFC 8017 §3.1. The size floor mirrors the boxed
+    /// parser so the two import paths refuse the same attacker-injected moduli.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -124,6 +130,9 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         let e = int_to_uint(seq.read_integer_bytes()?)?;
         seq.finish()?;
         reader.finish()?;
+        if n.bit_len() < super::boxed::MIN_RSA_BITS {
+            return Err(Error::Malformed);
+        }
         validate_public_exponent(&n, &e)?;
         Ok(RsaPublicKey::new(n, e))
     }
@@ -507,6 +516,40 @@ mod tests {
         let pk = rsa_test_key_a().public_key();
         let n_bytes = uint_be(pk.modulus());
         let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[4])].concat());
+        assert!(RsaPublicKey::<32>::from_pkcs1_der(&der).is_err());
+    }
+
+    /// An even (or zero) modulus must be rejected as an error, never reach
+    /// `MontModulus::new` (whose `assert!(n is odd)` would panic on the raw /
+    /// verify path). Mirrors the boxed HIGH-severity reachable-panic fix.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_even_modulus() {
+        let pk = rsa_test_key_a().public_key();
+        // Clear bit 0 of the real 2048-bit modulus to make it even while keeping
+        // its bit length above MIN_RSA_BITS, so the odd-modulus gate is what
+        // fires (not the size floor).
+        let even_n = pk.modulus().wrapping_sub(&Uint::<32>::ONE);
+        assert!(!bool::from(even_n.is_odd()), "test modulus must be even");
+        let n_bytes = uint_be(&even_n);
+        let e_bytes = uint_be(&Uint::<32>::from_u64(65537));
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&e_bytes)].concat());
+        assert!(RsaPublicKey::<32>::from_pkcs1_der(&der).is_err());
+    }
+
+    /// A modulus below `MIN_RSA_BITS` must be rejected by the const-generic
+    /// parser's size floor, matching the boxed parser (RSA-2, LOW).
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_undersized_modulus() {
+        // A 512-bit odd modulus (top bit set, low bit set): well-formed shape,
+        // but far below the 1024-bit MIN_RSA_BITS floor.
+        let mut raw = [0u8; 64];
+        raw[0] = 0x80;
+        raw[63] = 0x01;
+        let small_n = Uint::<32>::from_be_bytes(&raw);
+        assert!(small_n.bit_len() < crate::rsa::boxed::MIN_RSA_BITS);
+        let n_bytes = uint_be(&small_n);
+        let e_bytes = uint_be(&Uint::<32>::from_u64(65537));
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&e_bytes)].concat());
         assert!(RsaPublicKey::<32>::from_pkcs1_der(&der).is_err());
     }
 

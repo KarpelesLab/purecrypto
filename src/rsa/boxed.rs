@@ -164,11 +164,17 @@ pub(crate) const MAX_RSA_BITS: usize = 16384;
 
 /// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
 /// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
-/// enforce the structural shape: `e ≥ 3`, `e` odd, and `e < n`. These three
-/// together rule out the degenerate values (`0`, `1`, even, oversized) that a
-/// malicious SPKI / certificate could otherwise smuggle through and break
-/// downstream sign / verify / encrypt math.
+/// enforce the structural shape: `n` odd (hence non-zero), `e ≥ 3`, `e` odd,
+/// and `e < n`. These rule out the degenerate values (`0`, `1`, even, oversized)
+/// that a malicious SPKI / certificate could otherwise smuggle through and break
+/// downstream sign / verify / encrypt math. The `n` odd check is load-bearing:
+/// an even (or zero) modulus reaches `BoxedMontModulus::new`, which asserts an
+/// odd modulus and would otherwise panic on attacker-controlled input.
 fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
+    // A zero modulus is even, so the odd check also rejects `n = 0`.
+    if !n.is_odd() {
+        return Err(Error::InvalidKey);
+    }
     let three = BoxedUint::from_u64(3);
     if e.lt(&three) || !e.is_odd() || !e.lt(n) {
         return Err(Error::InvalidKey);
@@ -186,6 +192,13 @@ fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
 fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> Result<(), Error> {
     let one = BoxedUint::from_u64(1);
     if !one.lt(p) || !one.lt(q) {
+        return Err(Error::InvalidKey);
+    }
+    // An even prime is invalid for RSA (the only even prime is 2, far below the
+    // size of any legitimate factor). Reject even `p`/`q` explicitly: an even
+    // factor cannot be a real prime and never reaches the assert-odd Montgomery
+    // path that an even `n` would.
+    if !p.is_odd() || !q.is_odd() {
         return Err(Error::InvalidKey);
     }
     if p == q {
@@ -1156,6 +1169,29 @@ mod tests {
         let n_bytes = boxed.modulus().to_be_bytes(256);
         // e = 4 (even, < 3 false but evenness gate fires).
         let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[4])].concat());
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
+    }
+
+    /// An even (or zero) modulus must be rejected as an error, never reach
+    /// `BoxedMontModulus::new` (whose `assert!(n is odd)` would panic). This is
+    /// the HIGH-severity reachable-panic DoS: a crafted SPKI/cert with an even
+    /// modulus is attacker-controlled input on the X.509 verification path.
+    #[test]
+    fn from_pkcs1_der_rejects_even_modulus() {
+        use crate::der::{encode_integer, encode_sequence};
+        let (_, boxed) = boxed_pub();
+        // Take the real 2048-bit modulus and clear bit 0 to make it even while
+        // keeping its bit length (so the size gate still passes and the
+        // odd-modulus gate is what must fire).
+        let one = BoxedUint::from_u64(1);
+        let mut n = boxed.modulus().clone();
+        if n.is_odd() {
+            n = n.sub(&one);
+        }
+        assert!(!n.is_odd(), "test modulus must be even");
+        let n_bytes = n.to_be_bytes(256);
+        let e_bytes = BoxedUint::from_u64(65537).to_be_bytes(3);
+        let der = encode_sequence(&[encode_integer(&n_bytes), encode_integer(&e_bytes)].concat());
         assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
     }
 
