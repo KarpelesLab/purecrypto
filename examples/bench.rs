@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use purecrypto::bignum::BoxedUint;
-use purecrypto::cipher::{Aes128, Aes256, BlockCipher, ChaCha20Poly1305, Gcm};
+use purecrypto::cipher::{Aes128, Aes256, Aez, BlockCipher, ChaCha20Poly1305, Gcm};
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::x25519::X25519PrivateKey;
@@ -77,6 +77,13 @@ fn main() {
         let mut blk = [0u8; 16];
         bench_throughput("AES-256 raw block enc", 16, t, || {
             aes.encrypt_block(black_box(&mut blk));
+        });
+
+        // AEZ on the software AES round (baseline for a future HW-round speedup).
+        let aez = Aez::new(&[0u8; 48]);
+        let ad: [&[u8]; 0] = [];
+        bench_throughput("AEZ enc (tau=16)", N, t, || {
+            black_box(aez.encrypt(black_box(b"nonce0"), &ad, 16, black_box(&buf[..N])));
         });
     }
 
