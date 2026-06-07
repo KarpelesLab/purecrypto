@@ -22,6 +22,20 @@ unsafe fn rk(rk: &[u8], i: usize) -> __m128i {
     unsafe { _mm_loadu_si128(rk.as_ptr().add(i * 16) as *const __m128i) }
 }
 
+/// One bare AES round (AESENC): `MixColumns(ShiftRows(SubBytes(state))) ⊕ rk`.
+/// The AEGIS/AEZ round primitive.
+#[target_feature(enable = "aes,sse2")]
+pub(super) unsafe fn aes_round(state: [u8; 16], rk: [u8; 16]) -> [u8; 16] {
+    unsafe {
+        let s = _mm_loadu_si128(state.as_ptr() as *const __m128i);
+        let k = _mm_loadu_si128(rk.as_ptr() as *const __m128i);
+        let r = _mm_aesenc_si128(s, k);
+        let mut out = [0u8; 16];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, r);
+        out
+    }
+}
+
 /// Single forward block via AES-NI.
 #[target_feature(enable = "aes,sse2")]
 pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8; 16]) {

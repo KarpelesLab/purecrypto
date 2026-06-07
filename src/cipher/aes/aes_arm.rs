@@ -72,6 +72,21 @@ unsafe fn load_schedule(round_keys: &[u8], nr: usize) -> [uint8x16_t; 15] {
     }
 }
 
+/// One bare AES round (AESENC semantics): `MixColumns(ShiftRows(SubBytes(state)))
+/// ⊕ rk`. `vaeseq_u8(x, 0)` gives `ShiftRows(SubBytes(x))` (AddRoundKey with a
+/// zero key is a no-op), `vaesmcq_u8` the MixColumns, then XOR the round key.
+#[target_feature(enable = "aes")]
+pub(super) unsafe fn aes_round(state: [u8; 16], rk: [u8; 16]) -> [u8; 16] {
+    unsafe {
+        let s = vld1q_u8(state.as_ptr());
+        let k = vld1q_u8(rk.as_ptr());
+        let r = veorq_u8(vaesmcq_u8(vaeseq_u8(s, vdupq_n_u8(0))), k);
+        let mut out = [0u8; 16];
+        vst1q_u8(out.as_mut_ptr(), r);
+        out
+    }
+}
+
 /// Single forward block.
 #[target_feature(enable = "aes")]
 pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8; 16]) {

@@ -265,10 +265,26 @@ fn decrypt(rk: &[u8], nr: usize, block: &mut [u8; 16]) {
 /// Applies one full AES round to `state`: `MixColumns(ShiftRows(SubBytes(state)))`
 /// XOR'd with `round_key`. This is the AESENC primitive (the per-round transform
 /// of the FIPS-197 cipher, sans the key schedule), exposed for constructions —
-/// such as AEGIS — that build on the bare round function rather than on a keyed
-/// AES instance. Constant-time: it reuses the same branchless, table-free step
-/// functions as the block cipher.
+/// such as AEGIS and AEZ — that build on the bare round function rather than on a
+/// keyed AES instance.
+///
+/// Dispatches to the hardware AES round (AES-NI `aesenc` / ARMv8 `aese`+`aesmc`)
+/// when available, else the table-free software round. Both are constant-time and
+/// return identical results.
+#[inline]
+#[allow(unsafe_code)]
 pub(crate) fn aes_round(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
+    match detect_backend() {
+        AesBackend::Software => aes_round_soft(state, round_key),
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => unsafe { aesni::aes_round(state, round_key) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => unsafe { aes_arm::aes_round(state, round_key) },
+    }
+}
+
+/// Table-free constant-time AES round (the software fallback for [`aes_round`]).
+fn aes_round_soft(state: [u8; 16], round_key: [u8; 16]) -> [u8; 16] {
     let mut s = state;
     sub_bytes(&mut s);
     shift_rows(&mut s);
@@ -453,6 +469,18 @@ mod tests {
         check!(Aes128, 16);
         check!(Aes192, 24);
         check!(Aes256, 32);
+    }
+
+    /// The hardware bare AES round must equal the software round for all inputs.
+    #[test]
+    fn aes_round_hardware_matches_software() {
+        let mut st = [0u8; 16];
+        let mut rk = [0u8; 16];
+        for seed in 0..256u64 {
+            fill(seed, &mut st);
+            fill(seed ^ 0x5555, &mut rk);
+            assert_eq!(aes_round(st, rk), aes_round_soft(st, rk), "seed {seed}");
+        }
     }
 
     #[test]
