@@ -45,10 +45,16 @@ unsafe fn enc_core(ks: &[uint8x16_t], nr: usize, mut s: uint8x16_t) -> uint8x16_
 #[target_feature(enable = "aes")]
 unsafe fn dec_core(ks: &[uint8x16_t], nr: usize, mut s: uint8x16_t) -> uint8x16_t {
     unsafe {
-        for i in 0..(nr - 1) {
-            s = vaesimcq_u8(vaesdq_u8(s, ks[nr - i]));
+        // Equivalent inverse cipher with the forward key schedule (canonical
+        // OpenSSL aesv8 decrypt): the first AESD uses the raw last round key,
+        // the middle round keys are InvMixColumns-transformed (vaesimcq) before
+        // AESD, and the state is InvMixColumns'd between rounds. AESD(x,k) =
+        // InvSubBytes(InvShiftRows(x XOR k)).
+        s = vaesdq_u8(s, ks[nr]);
+        for round in (1..nr).rev() {
+            s = vaesimcq_u8(s);
+            s = vaesdq_u8(s, vaesimcq_u8(ks[round]));
         }
-        s = vaesdq_u8(s, ks[1]);
         veorq_u8(s, ks[0])
     }
 }
