@@ -46,14 +46,42 @@ impl<C: BlockCipher> Ctr<C> {
     /// XORs the keystream into `data` in place, encrypting or decrypting it.
     ///
     /// May be called repeatedly; the keystream continues seamlessly across
-    /// calls regardless of how the data is chunked.
+    /// calls regardless of how the data is chunked. Whole blocks are generated a
+    /// window at a time through the batched
+    /// [`encrypt_blocks`](BlockCipher::encrypt_blocks), so a hardware AES backend
+    /// pipelines them; the streamed keystream is byte-for-byte the scalar one.
     pub fn apply_keystream(&mut self, data: &mut [u8]) {
-        for byte in data.iter_mut() {
-            if self.pos == 16 {
-                self.refill();
-            }
-            *byte ^= self.keystream[self.pos];
+        let mut i = 0;
+        // 1. Consume any leftover keystream from a previous partial block.
+        while self.pos < 16 && i < data.len() {
+            data[i] ^= self.keystream[self.pos];
             self.pos += 1;
+            i += 1;
+        }
+        // 2. Bulk whole-block windows (only reached with no pending keystream).
+        const W: usize = 64; // 1 KiB stack window
+        let mut ks = [0u8; 16 * W];
+        while data.len() - i >= 16 {
+            let nblk = ((data.len() - i) / 16).min(W);
+            for blk in ks[..nblk * 16].chunks_exact_mut(16) {
+                blk.copy_from_slice(&self.counter);
+                increment(&mut self.counter);
+            }
+            self.cipher.encrypt_blocks(&mut ks[..nblk * 16]);
+            for k in 0..nblk * 16 {
+                data[i + k] ^= ks[k];
+            }
+            i += nblk * 16;
+        }
+        // 3. Trailing partial block: generate one fresh keystream block and
+        //    consume part of it, leaving `pos` for the next call.
+        if i < data.len() {
+            self.refill();
+            while i < data.len() {
+                data[i] ^= self.keystream[self.pos];
+                self.pos += 1;
+                i += 1;
+            }
         }
     }
 }

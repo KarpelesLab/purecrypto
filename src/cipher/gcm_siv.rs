@@ -85,6 +85,14 @@ impl Cipher {
             Cipher::Aes256(c) => c.encrypt_block(block),
         }
     }
+
+    /// Batched forward permutation (feeds the hardware AES pipeline).
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        match self {
+            Cipher::Aes128(c) => c.encrypt_blocks(blocks),
+            Cipher::Aes256(c) => c.encrypt_blocks(blocks),
+        }
+    }
 }
 
 /// AES-GCM-SIV context (RFC 8452), keyed once and reused per message with a
@@ -242,20 +250,27 @@ impl AesGcmSiv {
     fn ctr(enc_cipher: &Cipher, tag: &[u8; 16], buf: &mut [u8]) {
         let mut counter = *tag;
         counter[15] |= 0x80;
-        let mut ks = [0u8; 16];
-        let mut pos = 16;
-        for byte in buf.iter_mut() {
-            if pos == 16 {
-                ks = counter;
-                enc_cipher.encrypt_block(&mut ks);
+        // Generate keystream blocks a window at a time and permute them with the
+        // batched API so a hardware AES backend pipelines them; the per-block
+        // counter sequence matches the scalar form.
+        const W: usize = 64; // 1 KiB stack window
+        let mut ks = [0u8; 16 * W];
+        let mut off = 0;
+        while off < buf.len() {
+            let n = (buf.len() - off).min(16 * W);
+            let blocks = n.div_ceil(16);
+            for blk in ks[..blocks * 16].chunks_exact_mut(16) {
+                blk.copy_from_slice(&counter);
                 // Increment the low 32 bits, little-endian, with wraparound.
                 let c = u32::from_le_bytes([counter[0], counter[1], counter[2], counter[3]])
                     .wrapping_add(1);
                 counter[..4].copy_from_slice(&c.to_le_bytes());
-                pos = 0;
             }
-            *byte ^= ks[pos];
-            pos += 1;
+            enc_cipher.encrypt_blocks(&mut ks[..blocks * 16]);
+            for (b, k) in buf[off..off + n].iter_mut().zip(ks[..n].iter()) {
+                *b ^= *k;
+            }
+            off += n;
         }
     }
 
