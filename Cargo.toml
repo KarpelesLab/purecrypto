@@ -163,6 +163,13 @@ required-features = ["cli"]
 name = "tls_ech_loopback"
 required-features = ["ech"]
 
+# Ad-hoc throughput/latency harness used to find optimization choke points
+# (`cargo run --release --example bench`). Gated so `--no-default-features`
+# (no_std) builds don't try to compile it.
+[[example]]
+name = "bench"
+required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem"]
+
 [lints.rust]
 # Constant-time correctness depends on disciplined arithmetic; keep the
 # foundation honest.

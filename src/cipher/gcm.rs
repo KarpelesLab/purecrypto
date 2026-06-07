@@ -54,6 +54,11 @@ pub struct Gcm<C: BlockCipher> {
     cipher: C,
     /// Hash subkey `H = E_K(0¹²⁸)`.
     h: u128,
+    /// Whether to use the hardware (PCLMULQDQ) GHASH multiply. Probed once at
+    /// construction; the software `gf_mul` is the fallback. Only present on the
+    /// one target that currently has a hardware GHASH backend.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    ghash_hw: bool,
 }
 
 impl<C: BlockCipher> Gcm<C> {
@@ -64,7 +69,23 @@ impl<C: BlockCipher> Gcm<C> {
         Gcm {
             cipher,
             h: u128::from_be_bytes(h),
+            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            ghash_hw: super::clmul::supported(),
         }
+    }
+
+    /// GF(2¹²⁸) multiply by the hash subkey, dispatched to the hardware GHASH
+    /// when available. Both paths are constant-time and return identical values.
+    #[inline]
+    #[allow(unsafe_code)]
+    fn mul_h(&self, x: u128) -> u128 {
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if self.ghash_hw {
+            // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
+            // the PCLMULQDQ/SSSE3 features this function requires.
+            return unsafe { super::clmul::gf_mul(x, self.h) };
+        }
+        gf_mul(x, self.h)
     }
 
     /// Computes the pre-counter block `J0` for a nonce of any length.
@@ -79,9 +100,9 @@ impl<C: BlockCipher> Gcm<C> {
             // J0 = GHASH_H(IV padded ‖ 0⁶⁴ ‖ [len(IV)]₆₄).
             let mut x = 0u128;
             for chunk in nonce.chunks(16) {
-                x = gf_mul(x ^ load_block(chunk), self.h);
+                x = self.mul_h(x ^ load_block(chunk));
             }
-            x = gf_mul(x ^ (nonce.len() as u128 * 8), self.h);
+            x = self.mul_h(x ^ (nonce.len() as u128 * 8));
             x
         }
     }
@@ -90,30 +111,42 @@ impl<C: BlockCipher> Gcm<C> {
     fn ghash(&self, aad: &[u8], ct: &[u8]) -> u128 {
         let mut x = 0u128;
         for chunk in aad.chunks(16) {
-            x = gf_mul(x ^ load_block(chunk), self.h);
+            x = self.mul_h(x ^ load_block(chunk));
         }
         for chunk in ct.chunks(16) {
-            x = gf_mul(x ^ load_block(chunk), self.h);
+            x = self.mul_h(x ^ load_block(chunk));
         }
         // Length block: [len(aad)]₆₄ ‖ [len(ct)]₆₄, in bits.
         let len_block = ((aad.len() as u128 * 8) << 64) | (ct.len() as u128 * 8);
-        gf_mul(x ^ len_block, self.h)
+        self.mul_h(x ^ len_block)
     }
 
     /// XORs the GCTR keystream (counter increments only its low 32 bits) into
     /// `buf`, starting from `counter`.
+    ///
+    /// Keystream blocks are generated a window at a time and permuted with the
+    /// batched [`encrypt_blocks`](super::BlockCipher::encrypt_blocks), so a
+    /// hardware AES backend pipelines them; the per-block counter sequence is
+    /// identical to the scalar form.
     fn gctr(&self, mut counter: u128, buf: &mut [u8]) {
-        let mut ks = [0u8; 16];
-        let mut pos = 16;
-        for byte in buf.iter_mut() {
-            if pos == 16 {
-                ks = counter.to_be_bytes();
-                self.cipher.encrypt_block(&mut ks);
+        // 64-block (1 KiB) window: enough to amortize dispatch and feed the
+        // 8-wide AES-NI / 4-wide ARM pipelines, small enough for the stack.
+        const W: usize = 64;
+        let mut ks = [0u8; 16 * W];
+        let mut offset = 0;
+        while offset < buf.len() {
+            let chunk = &mut buf[offset..];
+            let n = chunk.len().min(16 * W);
+            let blocks = n.div_ceil(16);
+            for blk in ks[..blocks * 16].chunks_exact_mut(16) {
+                blk.copy_from_slice(&counter.to_be_bytes());
                 counter = inc32(counter);
-                pos = 0;
             }
-            *byte ^= ks[pos];
-            pos += 1;
+            self.cipher.encrypt_blocks(&mut ks[..blocks * 16]);
+            for (b, k) in chunk[..n].iter_mut().zip(ks[..n].iter()) {
+                *b ^= *k;
+            }
+            offset += n;
         }
     }
 
@@ -207,6 +240,39 @@ mod tests {
 
     fn gcm128(key_hex: &str) -> Gcm<Aes128> {
         Gcm::new(Aes128::new(&from_hex::<16>(key_hex)))
+    }
+
+    /// The hardware (PCLMULQDQ) GHASH multiply must return exactly the same
+    /// value as the constant-time software `gf_mul` for every input — this pins
+    /// the reflected bit-order/reduction. Runs only where the extension exists.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn ghash_hardware_matches_software() {
+        if !crate::cipher::clmul::supported() {
+            return;
+        }
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Edge cases plus randomized coverage.
+        let edges: [u128; 4] = [0, 1, u128::MAX, 1u128 << 127];
+        for &x in &edges {
+            for &y in &edges {
+                let hw = unsafe { crate::cipher::clmul::gf_mul(x, y) };
+                assert_eq!(hw, gf_mul(x, y), "edge x={x:032x} y={y:032x}");
+            }
+        }
+        for _ in 0..20_000 {
+            let x = ((next() as u128) << 64) | next() as u128;
+            let y = ((next() as u128) << 64) | next() as u128;
+            let hw = unsafe { crate::cipher::clmul::gf_mul(x, y) };
+            assert_eq!(hw, gf_mul(x, y), "rand x={x:032x} y={y:032x}");
+        }
     }
 
     // McGrew & Viega GCM test vectors (AES-128).

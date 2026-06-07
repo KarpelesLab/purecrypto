@@ -20,6 +20,8 @@ mod ccm;
 mod cfb;
 mod chacha20;
 mod chacha20poly1305;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod clmul;
 mod cmac;
 mod ctr;
 mod des;
@@ -74,6 +76,36 @@ pub trait BlockCipher {
 
     /// Decrypts one block in place.
     fn decrypt_block(&self, block: &mut [u8; 16]);
+
+    /// Applies the forward permutation to each consecutive 16-byte block of
+    /// `blocks`, treating the blocks as independent (no chaining). `blocks.len()`
+    /// must be a multiple of 16.
+    ///
+    /// The default loops over [`encrypt_block`](Self::encrypt_block); hardware
+    /// backends (e.g. AES-NI / ARMv8-AES) override this to pipeline several
+    /// blocks at once. This is the batched primitive that counter-style modes
+    /// (CTR, GCM, GCM-SIV, OFB) build on — they prepare the counter blocks and
+    /// XOR the result, so all counter arithmetic stays in the mode. Like the
+    /// single-block path it is constant-time.
+    fn encrypt_blocks(&self, blocks: &mut [u8]) {
+        debug_assert_eq!(blocks.len() % 16, 0, "encrypt_blocks needs whole blocks");
+        for chunk in blocks.chunks_exact_mut(16) {
+            let block: &mut [u8; 16] = chunk.try_into().expect("16-byte chunk");
+            self.encrypt_block(block);
+        }
+    }
+
+    /// Applies the inverse permutation to each consecutive 16-byte block of
+    /// `blocks` independently (no chaining). `blocks.len()` must be a multiple
+    /// of 16. Default loops over [`decrypt_block`](Self::decrypt_block);
+    /// hardware backends override to pipeline. Constant-time.
+    fn decrypt_blocks(&self, blocks: &mut [u8]) {
+        debug_assert_eq!(blocks.len() % 16, 0, "decrypt_blocks needs whole blocks");
+        for chunk in blocks.chunks_exact_mut(16) {
+            let block: &mut [u8; 16] = chunk.try_into().expect("16-byte chunk");
+            self.decrypt_block(block);
+        }
+    }
 }
 
 /// A 64-bit-block cipher: parallel to [`BlockCipher`] but for legacy

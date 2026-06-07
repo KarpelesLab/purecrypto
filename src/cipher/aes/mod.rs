@@ -7,8 +7,104 @@
 
 mod gf;
 
+#[cfg(all(feature = "std", target_arch = "aarch64"))]
+mod aes_arm;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod aesni;
+
 use super::BlockCipher;
 use gf::{gf_mul, inv_sub_byte, sub_byte};
+
+/// Which implementation a keyed AES instance dispatches to. Chosen once at
+/// construction from a cached runtime CPU-feature probe; the software path is
+/// the table-free constant-time fallback used everywhere a hardware AES
+/// extension is absent (including all `no_std` builds).
+#[derive(Clone, Copy)]
+enum AesBackend {
+    Software,
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    Hardware,
+}
+
+/// Probes for a hardware AES extension. Both detection macros cache their
+/// result internally, so this is cheap to call per `Aes*::new()`.
+#[inline]
+fn detect_backend() -> AesBackend {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("aes") {
+            return AesBackend::Hardware;
+        }
+    }
+    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    {
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            return AesBackend::Hardware;
+        }
+    }
+    AesBackend::Software
+}
+
+// The four dispatch helpers route a keyed operation to the active backend. The
+// `Hardware` arms are reached only after `detect_backend` confirmed the
+// extension, satisfying the `#[target_feature]` safety contract.
+#[inline]
+#[allow(unsafe_code)]
+fn dispatch_encrypt_block(backend: AesBackend, rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+    match backend {
+        AesBackend::Software => encrypt(rk, nr, block),
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => unsafe { aesni::encrypt_block(rk, nr, block) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => unsafe { aes_arm::encrypt_block(rk, nr, block) },
+    }
+}
+
+#[inline]
+#[allow(unsafe_code)]
+fn dispatch_decrypt_block(backend: AesBackend, rk: &[u8], nr: usize, block: &mut [u8; 16]) {
+    match backend {
+        AesBackend::Software => decrypt(rk, nr, block),
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => unsafe { aesni::decrypt_block(rk, nr, block) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => unsafe { aes_arm::decrypt_block(rk, nr, block) },
+    }
+}
+
+#[inline]
+#[allow(unsafe_code)]
+fn dispatch_encrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
+    match backend {
+        AesBackend::Software => {
+            for block in blocks.chunks_exact_mut(16) {
+                let b: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
+                encrypt(rk, nr, b);
+            }
+        }
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => unsafe { aesni::encrypt_blocks(rk, nr, blocks) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => unsafe { aes_arm::encrypt_blocks(rk, nr, blocks) },
+    }
+}
+
+#[inline]
+#[allow(unsafe_code)]
+fn dispatch_decrypt_blocks(backend: AesBackend, rk: &[u8], nr: usize, blocks: &mut [u8]) {
+    match backend {
+        AesBackend::Software => {
+            for block in blocks.chunks_exact_mut(16) {
+                let b: &mut [u8; 16] = block.try_into().expect("16-byte chunk");
+                decrypt(rk, nr, b);
+            }
+        }
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        AesBackend::Hardware => unsafe { aesni::decrypt_blocks(rk, nr, blocks) },
+        #[cfg(all(feature = "std", target_arch = "aarch64"))]
+        AesBackend::Hardware => unsafe { aes_arm::decrypt_blocks(rk, nr, blocks) },
+    }
+}
 
 /// XORs a 16-byte round key into the state.
 #[inline]
@@ -189,15 +285,28 @@ macro_rules! aes_variant {
         #[derive(Clone)]
         pub struct $name {
             rk: [u8; $rk_len],
+            backend: AesBackend,
         }
 
         impl $name {
             /// Creates a cipher instance from the given key, expanding the key
-            /// schedule.
+            /// schedule. The fastest available backend (hardware AES extension
+            /// when present, otherwise the constant-time software path) is
+            /// selected once here.
             pub fn new(key: &[u8; $key_bytes]) -> Self {
                 let mut rk = [0u8; $rk_len];
                 key_expansion(key, $nk, $nr, &mut rk);
-                $name { rk }
+                $name { rk, backend: detect_backend() }
+            }
+
+            /// Forces the constant-time software backend, regardless of CPU
+            /// support. Test-only: used to differentially check a hardware
+            /// backend against the reference software path.
+            #[cfg(test)]
+            pub(crate) fn new_software(key: &[u8; $key_bytes]) -> Self {
+                let mut rk = [0u8; $rk_len];
+                key_expansion(key, $nk, $nr, &mut rk);
+                $name { rk, backend: AesBackend::Software }
             }
         }
 
@@ -207,12 +316,24 @@ macro_rules! aes_variant {
 
             #[inline]
             fn encrypt_block(&self, block: &mut [u8; 16]) {
-                encrypt(&self.rk, $nr, block);
+                dispatch_encrypt_block(self.backend, &self.rk, $nr, block);
             }
 
             #[inline]
             fn decrypt_block(&self, block: &mut [u8; 16]) {
-                decrypt(&self.rk, $nr, block);
+                dispatch_decrypt_block(self.backend, &self.rk, $nr, block);
+            }
+
+            #[inline]
+            fn encrypt_blocks(&self, blocks: &mut [u8]) {
+                debug_assert_eq!(blocks.len() % 16, 0, "encrypt_blocks needs whole blocks");
+                dispatch_encrypt_blocks(self.backend, &self.rk, $nr, blocks);
+            }
+
+            #[inline]
+            fn decrypt_blocks(&self, blocks: &mut [u8]) {
+                debug_assert_eq!(blocks.len() % 16, 0, "decrypt_blocks needs whole blocks");
+                dispatch_decrypt_blocks(self.backend, &self.rk, $nr, blocks);
             }
         }
 
@@ -278,6 +399,60 @@ mod tests {
         assert_eq!(block, from_hex::<16>("8ea2b7ca516745bfeafc49904b496089"));
         cipher.decrypt_block(&mut block);
         assert_eq!(block, from_hex::<16>("00112233445566778899aabbccddeeff"));
+    }
+
+    /// Deterministic pseudo-random byte fill (xorshift64*) for differential
+    /// tests — no RNG dependency, reproducible.
+    fn fill(seed: u64, out: &mut [u8]) {
+        let mut x = seed | 1;
+        for b in out.iter_mut() {
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            *b = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+        }
+    }
+
+    /// On a host with a hardware AES extension, the default backend must agree
+    /// byte-for-byte with the constant-time software path — for single blocks
+    /// and for the batched `encrypt_blocks`/`decrypt_blocks` (which exercise the
+    /// wide pipeline plus the sub-8/sub-4-block remainder), across all key
+    /// sizes. On a host without the extension both sides are software and this
+    /// still holds trivially. CI's aarch64 runner exercises the ARM path here.
+    #[test]
+    fn hardware_matches_software() {
+        macro_rules! check {
+            ($ty:ident, $kb:literal) => {{
+                let mut key = [0u8; $kb];
+                fill(0xA5A5_0000 + $kb, &mut key);
+                let hw = $ty::new(&key);
+                let sw = $ty::new_software(&key);
+
+                // Single block.
+                let mut a = [0u8; 16];
+                fill(1, &mut a);
+                let (mut h1, mut s1) = (a, a);
+                hw.encrypt_block(&mut h1);
+                sw.encrypt_block(&mut s1);
+                assert_eq!(h1, s1, "{} enc_block", stringify!($ty));
+                hw.decrypt_block(&mut h1);
+                assert_eq!(h1, a, "{} dec_block roundtrip", stringify!($ty));
+
+                // Batched: 19 blocks → exercises the 8-wide (x86) / 4-wide (arm)
+                // path and the remainder tail.
+                let mut data = [0u8; 16 * 19];
+                fill(0xDEAD_BEEF, &mut data);
+                let (mut hb, mut sb) = (data, data);
+                hw.encrypt_blocks(&mut hb);
+                sw.encrypt_blocks(&mut sb);
+                assert_eq!(hb, sb, "{} encrypt_blocks", stringify!($ty));
+                hw.decrypt_blocks(&mut hb);
+                assert_eq!(hb, data, "{} decrypt_blocks roundtrip", stringify!($ty));
+            }};
+        }
+        check!(Aes128, 16);
+        check!(Aes192, 24);
+        check!(Aes256, 32);
     }
 
     #[test]
