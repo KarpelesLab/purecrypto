@@ -22,7 +22,7 @@ mod ccm;
 mod cfb;
 mod chacha20;
 mod chacha20poly1305;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod clmul;
 mod cmac;
 mod ctr;

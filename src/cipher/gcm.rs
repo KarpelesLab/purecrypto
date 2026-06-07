@@ -57,7 +57,7 @@ pub struct Gcm<C: BlockCipher> {
     /// Whether to use the hardware (PCLMULQDQ) GHASH multiply. Probed once at
     /// construction; the software `gf_mul` is the fallback. Only present on the
     /// one target that currently has a hardware GHASH backend.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     ghash_hw: bool,
 }
 
@@ -69,7 +69,7 @@ impl<C: BlockCipher> Gcm<C> {
         Gcm {
             cipher,
             h: u128::from_be_bytes(h),
-            #[cfg(all(feature = "std", target_arch = "x86_64"))]
+            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
             ghash_hw: super::clmul::supported(),
         }
     }
@@ -79,7 +79,7 @@ impl<C: BlockCipher> Gcm<C> {
     #[inline]
     #[allow(unsafe_code)]
     fn mul_h(&self, x: u128) -> u128 {
-        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         if self.ghash_hw {
             // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
             // the PCLMULQDQ/SSSE3 features this function requires.
@@ -245,7 +245,7 @@ mod tests {
     /// The hardware (PCLMULQDQ) GHASH multiply must return exactly the same
     /// value as the constant-time software `gf_mul` for every input — this pins
     /// the reflected bit-order/reduction. Runs only where the extension exists.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     #[allow(unsafe_code)]
     fn ghash_hardware_matches_software() {
