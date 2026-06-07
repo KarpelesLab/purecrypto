@@ -448,8 +448,13 @@ impl RawPublic for BoxedRsaPublicKey {
         self.n.bit_len()
     }
     fn raw_public(&self, m: &[u8]) -> Vec<u8> {
+        // `e` and `m` are both public on every RSA public-key op (signature
+        // verification, encryption), so the public-exponent modexp — sized to
+        // `e`'s bit length instead of the modulus width — is the right tool. It
+        // is still branchless and leaks nothing about a secret. (For e = 65537
+        // this is ~17 squarings instead of ~2048.)
         self.mont
-            .pow(&BoxedUint::from_be_bytes(m), &self.e)
+            .pow_public(&BoxedUint::from_be_bytes(m), &self.e)
             .to_be_bytes(self.k)
     }
 }

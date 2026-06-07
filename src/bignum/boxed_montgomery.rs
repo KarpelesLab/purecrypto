@@ -240,6 +240,41 @@ impl BoxedMontModulus {
         BoxedUint::from_limbs(self.demont_limbs(&acc))
     }
 
+    /// Computes `base^exp mod n` for a **public** exponent, sized to the
+    /// exponent's actual bit length rather than the modulus width.
+    ///
+    /// This is square-and-multiply-*always* exactly like [`pow`](Self::pow) — it
+    /// is branchless and leaks nothing about `base`. It differs only in the loop
+    /// length: it iterates `exp.bit_len()` times instead of padding to the
+    /// modulus width, so its running time depends on `exp`. **`exp` must be
+    /// public** (e.g. an RSA public exponent in verify/encrypt, where both `exp`
+    /// and `base` are public). Never call it with a secret exponent — use
+    /// [`pow`](Self::pow) for those. For RSA `e = 65537` this replaces ~2048
+    /// squarings with ~17.
+    pub fn pow_public(&self, base: &BoxedUint, exp: &BoxedUint) -> BoxedUint {
+        let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
+        let mut one = vec![0 as Limb; self.limbs];
+        one[0] = 1;
+        let mut acc = self.to_mont_limbs(&one); // R mod N
+
+        let bits = exp.bit_len();
+        if bits == 0 {
+            // base^0 = 1.
+            return BoxedUint::from_limbs(self.demont_limbs(&acc));
+        }
+        let exp_limbs = exp.limbs_resized(exp.significant_limbs().max(1));
+        let mut i = bits;
+        while i > 0 {
+            i -= 1;
+            acc = self.mont_mul_limbs(&acc, &acc);
+            let mult = self.mont_mul_limbs(&acc, &base_m);
+            let limb = exp_limbs[i / 64];
+            let set = Choice::from(((limb >> (i % 64)) & 1) as u8);
+            acc = select_limbs(&mult, &acc, set);
+        }
+        BoxedUint::from_limbs(self.demont_limbs(&acc))
+    }
+
     /// Returns `(a + b) mod n`.
     pub fn add_mod(&self, a: &BoxedUint, b: &BoxedUint) -> BoxedUint {
         BoxedUint::from_limbs(add_mod_limbs(
@@ -263,6 +298,29 @@ impl BoxedMontModulus {
 mod tests {
     use super::*;
     use crate::bignum::{MontModulus, Uint};
+
+    #[test]
+    fn pow_public_matches_pow() {
+        // The public-exponent modexp must return exactly the same value as the
+        // constant-time `pow` for every (base, exp); it only changes timing.
+        let modulus = BoxedUint::from_be_bytes(&[
+            0xC0, 0x05, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x00, 0x11, 0x22,
+            0x33, 0x45,
+        ]); // odd 128-bit
+        let m = BoxedMontModulus::new(&modulus);
+        let exps: [u64; 7] = [0, 1, 2, 3, 65537, 0x1_0001, u32::MAX as u64];
+        for be in 1u64..=9 {
+            let base = BoxedUint::from_u64(be.wrapping_mul(0x9E37_79B9));
+            for &e in &exps {
+                let exp = BoxedUint::from_u64(e);
+                assert_eq!(
+                    m.pow(&base, &exp),
+                    m.pow_public(&base, &exp),
+                    "base={be} e={e}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn modexp_matches_u128() {
