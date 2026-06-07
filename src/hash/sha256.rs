@@ -199,13 +199,12 @@ const fn rotr(x: u32, n: u32) -> u32 {
 
 /// SHA-256 compression function: folds a 64-byte block into the state.
 ///
-/// Dispatches to the x86_64 SHA-NI extension when the CPU supports it, falling
-/// back to the portable software path otherwise. Both produce identical state
-/// and are constant-time. (aarch64 `sha2` and SHA-512 hardware are a planned
-/// follow-up — they need real ARM hardware to validate the intrinsic sequence.)
+/// Dispatches to the hardware SHA-256 extension (SHA-NI on x86_64, `sha2` on
+/// aarch64) when the CPU supports it, falling back to the portable software path
+/// otherwise. Both produce identical state and are constant-time.
 #[inline]
 fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha256_supported() {
         super::sha_hw::compress256(h, block);
         return;
@@ -383,7 +382,7 @@ mod tests {
     /// The SHA-NI compression must produce identical state to the software
     /// path for every block, across all initial-state / message combinations
     /// exercised here. Runs only where the extension exists.
-    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sha256_hardware_matches_software() {
         if !super::super::sha_hw::sha256_supported() {

@@ -43,7 +43,7 @@ mod sha1;
 mod sha256;
 mod sha3;
 mod sha512;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod sha_hw;
 mod shake;
 mod sm3;
