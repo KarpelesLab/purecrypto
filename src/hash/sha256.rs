@@ -28,7 +28,7 @@ const H224: [u32; 8] = [
 
 /// SHA-256 round constants (first 32 bits of the fractional parts of the cube
 /// roots of the first 64 primes).
-const K256: [u32; 64] = [
+pub(crate) const K256: [u32; 64] = [
     0x428a_2f98,
     0x7137_4491,
     0xb5c0_fbcf,
@@ -198,8 +198,24 @@ const fn rotr(x: u32, n: u32) -> u32 {
 }
 
 /// SHA-256 compression function: folds a 64-byte block into the state.
+///
+/// Dispatches to the x86_64 SHA-NI extension when the CPU supports it, falling
+/// back to the portable software path otherwise. Both produce identical state
+/// and are constant-time. (aarch64 `sha2` and SHA-512 hardware are a planned
+/// follow-up — they need real ARM hardware to validate the intrinsic sequence.)
 #[inline]
 fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if super::sha_hw::sha256_supported() {
+        super::sha_hw::compress256(h, block);
+        return;
+    }
+    compress256_soft(h, block);
+}
+
+/// Portable software SHA-256 compression (the constant-time fallback).
+#[inline]
+fn compress256_soft(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     for (word, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
         *word = u32::from_be_bytes(chunk.try_into().unwrap());
@@ -363,6 +379,64 @@ pub fn sha224(data: &[u8]) -> [u8; 28] {
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
+
+    /// The SHA-NI compression must produce identical state to the software
+    /// path for every block, across all initial-state / message combinations
+    /// exercised here. Runs only where the extension exists.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn sha256_hardware_matches_software() {
+        if !super::super::sha_hw::sha256_supported() {
+            return;
+        }
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for _ in 0..2000 {
+            let mut h_sw = H256;
+            for (j, v) in h_sw.iter_mut().enumerate() {
+                if j % 3 == 0 {
+                    *v = next() as u32;
+                }
+            }
+            let h_hw = h_sw;
+            let mut block = [0u8; 64];
+            next(); // advance
+            for b in block.iter_mut() {
+                *b = (next() >> 24) as u8;
+            }
+            let mut a = h_sw;
+            let mut b = h_hw;
+            compress256_soft(&mut a, &block);
+            super::super::sha_hw::compress256(&mut b, &block);
+            assert_eq!(a, b, "HW/soft mismatch");
+        }
+        // Multi-block consistency through the public API vs a forced-software
+        // recomputation: the dispatcher (HW here) must equal the soft digest.
+        let data: alloc::vec::Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
+        let hw = sha256(&data);
+        // Recompute purely in software by feeding compress256_soft directly.
+        let mut h = H256;
+        let mut buf = data.clone();
+        let bitlen = (buf.len() as u64) * 8;
+        buf.push(0x80);
+        while buf.len() % 64 != 56 {
+            buf.push(0);
+        }
+        buf.extend_from_slice(&bitlen.to_be_bytes());
+        for chunk in buf.chunks_exact(64) {
+            compress256_soft(&mut h, chunk.try_into().unwrap());
+        }
+        let mut soft = [0u8; 32];
+        for (o, w) in soft.chunks_exact_mut(4).zip(h.iter()) {
+            o.copy_from_slice(&w.to_be_bytes());
+        }
+        assert_eq!(hw, soft, "dispatched digest must equal software digest");
+    }
 
     #[test]
     fn sha256_vectors() {
