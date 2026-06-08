@@ -54,6 +54,7 @@ use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
+use crate::tls::crypto::record_prot::RecordProtection;
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -456,6 +457,10 @@ pub struct ClientConnection12 {
     /// Our offered groups.
     offered_groups: Vec<NamedGroup>,
 
+    /// Negotiated record-layer protocol version (set on SH). Defaults to
+    /// TLS 1.2; lowered to TLS 1.0/1.1 only on the opt-in legacy path. Threaded
+    /// into record framing and (for CBC suites) the record MAC.
+    negotiated_version: ProtocolVersion,
     /// Negotiated suite parameters (set on SH).
     suite: Option<SuiteParams12>,
     /// Peer certificate chain (leaf first), populated from `Certificate`.
@@ -471,16 +476,16 @@ pub struct ClientConnection12 {
     /// recovered from a stored session under resumption).
     master: Option<[u8; 48]>,
     /// Record-protection state once `client_crypter` is installed.
-    client_crypter: Option<RecordCrypter12>,
+    client_crypter: Option<RecordProtection>,
     /// Record-protection state for inbound records once the server's CCS has
     /// been received.
-    server_crypter: Option<RecordCrypter12>,
+    server_crypter: Option<RecordProtection>,
     /// Park the inbound crypter here until the server's CCS arrives. A
     /// plaintext `NewSessionTicket` (fresh handshake) or server `[NST]CCS
     /// Finished` (resumed handshake) may come before that CCS, so we must
     /// not install the read key early or the NST decode would be misread as
     /// encrypted bytes.
-    pending_server_crypter: Option<RecordCrypter12>,
+    pending_server_crypter: Option<RecordProtection>,
 
     /// mTLS: set to `true` after we see a server `CertificateRequest`.
     /// Drives whether we emit our own `Certificate` (+ CertificateVerify) in
@@ -580,6 +585,7 @@ impl ClientConnection12 {
             server_random: None,
             offered_suites: offered_suites.clone(),
             offered_groups: groups.to_vec(),
+            negotiated_version: ProtocolVersion::TLSv1_2,
             suite: None,
             cert_chain: Vec::new(),
             leaf_key: None,
@@ -899,18 +905,19 @@ impl ClientConnection12 {
 
     /// Writes a plaintext record straight to the outbound buffer.
     fn write_plain_record(&mut self, ct: ContentType, payload: &[u8]) {
-        write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload);
+        write_record(&mut self.outbuf, ct, self.negotiated_version, payload);
     }
 
     /// Encrypts `payload` under the installed `client_crypter` and frames it.
     /// Returns `Err(InappropriateState)` if write keys aren't installed yet.
     fn emit_encrypted(&mut self, ct: ContentType, payload: &[u8]) -> Result<(), Error> {
+        let version = self.negotiated_version;
         let crypter = self
             .client_crypter
             .as_mut()
             .ok_or(Error::InappropriateState)?;
-        let fragment = crypter.encrypt(ct, payload)?;
-        write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, &fragment);
+        let fragment = crypter.encrypt(ct, version, payload)?;
+        write_record(&mut self.outbuf, ct, version, &fragment);
         Ok(())
     }
 
@@ -1227,7 +1234,8 @@ impl ClientConnection12 {
             let (s_key, ivs) = rest.split_at(suite.key_len);
             let mut s_salt = [0u8; 4];
             s_salt.copy_from_slice(&ivs[4..8]);
-            self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt));
+            self.pending_server_crypter =
+                Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
             self.state = State::WaitResumedServerFinished;
         } else {
             self.state = State::WaitCertificate;
@@ -1464,12 +1472,12 @@ impl ClientConnection12 {
 
         // Install the client crypter — subsequent outbound records are
         // encrypted (starting with our Finished).
-        self.client_crypter = Some(client_crypter);
+        self.client_crypter = Some(client_crypter.into());
         // Park the server crypter; we install it on the server's CCS. The
         // server's NewSessionTicket (if any) arrives BEFORE its CCS as a
         // plaintext handshake message, so we must not pre-install the
         // inbound crypter or NST decoding would corrupt it.
-        self.pending_server_crypter = Some(server_crypter);
+        self.pending_server_crypter = Some(server_crypter.into());
         self.master = Some(master);
 
         // Compute and emit our Finished.
@@ -1604,7 +1612,7 @@ impl ClientConnection12 {
             let (_s_key, ivs) = rest.split_at(suite.key_len);
             let mut c_salt = [0u8; 4];
             c_salt.copy_from_slice(&ivs[..4]);
-            self.client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt));
+            self.client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
 
             // Our Finished, signed over Hash(CH..server_Finished).
             let th_cf = self.transcript.current_hash();

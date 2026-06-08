@@ -10,6 +10,7 @@ pub(crate) mod aead12;
 pub(crate) mod cbc_rec;
 mod hash;
 pub(crate) mod prf;
+pub(crate) mod record_prot;
 mod schedule;
 pub(crate) mod sign;
 mod suite;

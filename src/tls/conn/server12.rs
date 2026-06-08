@@ -49,6 +49,7 @@ use crate::tls::crypto::aead12::RecordCrypter12;
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
+use crate::tls::crypto::record_prot::RecordProtection;
 use crate::tls::crypto::verify_signature;
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::RootCertStore;
@@ -332,6 +333,10 @@ pub struct ServerConnection12<R: RngCore> {
     /// §7.1 allows exactly one per direction).
     ccs_received: bool,
 
+    /// Negotiated record-layer protocol version (set on CH). Defaults to
+    /// TLS 1.2; lowered to TLS 1.0/1.1 only on the opt-in legacy path. Threaded
+    /// into record framing and (for CBC suites) the record MAC.
+    negotiated_version: ProtocolVersion,
     /// Negotiated suite parameters (set on CH).
     suite: Option<SuiteParams12>,
     /// Ephemeral X25519 private key (used when we pick X25519).
@@ -363,15 +368,15 @@ pub struct ServerConnection12<R: RngCore> {
     master: Option<[u8; 48]>,
     /// Record-protection state once `server_crypter` is installed (after we
     /// emit our CCS).
-    server_crypter: Option<RecordCrypter12>,
+    server_crypter: Option<RecordProtection>,
     /// Record-protection state once `client_crypter` is installed (after the
     /// peer's CCS arrives).
-    client_crypter: Option<RecordCrypter12>,
+    client_crypter: Option<RecordProtection>,
     /// Pre-built crypters held until the matching CCS event installs them.
     /// Populated when we process the CKE (fresh) or right after parsing the
     /// CH (resumed).
-    pending_client_crypter: Option<RecordCrypter12>,
-    pending_server_crypter: Option<RecordCrypter12>,
+    pending_client_crypter: Option<RecordProtection>,
+    pending_server_crypter: Option<RecordProtection>,
 
     /// mTLS: the client's certificate chain (leaf first) after parsing its
     /// `Certificate` message. Empty if the client offered no cert.
@@ -424,6 +429,7 @@ impl<R: RngCore> ServerConnection12<R> {
             transcript: Transcript::new(),
             ccs_window_open: true,
             ccs_received: false,
+            negotiated_version: ProtocolVersion::TLSv1_2,
             suite: None,
             x25519: None,
             p256: None,
@@ -619,17 +625,18 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// Writes a plaintext record straight to the outbound buffer.
     fn write_plain_record(&mut self, ct: ContentType, payload: &[u8]) {
-        write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload);
+        write_record(&mut self.outbuf, ct, self.negotiated_version, payload);
     }
 
     /// Encrypts `payload` under the installed `server_crypter` and frames it.
     fn emit_encrypted(&mut self, ct: ContentType, payload: &[u8]) -> Result<(), Error> {
+        let version = self.negotiated_version;
         let crypter = self
             .server_crypter
             .as_mut()
             .ok_or(Error::InappropriateState)?;
-        let fragment = crypter.encrypt(ct, payload)?;
-        write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, &fragment);
+        let fragment = crypter.encrypt(ct, version, payload)?;
+        write_record(&mut self.outbuf, ct, version, &fragment);
         Ok(())
     }
 
@@ -993,8 +1000,10 @@ impl<R: RngCore> ServerConnection12<R> {
             c_salt.copy_from_slice(&ivs[..4]);
             let mut s_salt = [0u8; 4];
             s_salt.copy_from_slice(&ivs[4..8]);
-            self.pending_client_crypter = Some(RecordCrypter12::new(rs.suite.aead, c_key, c_salt));
-            self.pending_server_crypter = Some(RecordCrypter12::new(rs.suite.aead, s_key, s_salt));
+            self.pending_client_crypter =
+                Some(RecordCrypter12::new(rs.suite.aead, c_key, c_salt).into());
+            self.pending_server_crypter =
+                Some(RecordCrypter12::new(rs.suite.aead, s_key, s_salt).into());
 
             // SH (without echoing session_ticket — signals resumption to client).
             self.send_server_hello()?;
@@ -1459,8 +1468,8 @@ impl<R: RngCore> ServerConnection12<R> {
         s_salt.copy_from_slice(&rest[4..8]);
         // Stash the crypters; we install the read side on the peer's CCS and
         // the write side after we emit our own CCS.
-        self.pending_client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt));
-        self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt));
+        self.pending_client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
+        self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
         self.master = Some(master);
 
         // CKE was already added to the transcript above for the EMS path.
