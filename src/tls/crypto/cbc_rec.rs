@@ -17,13 +17,16 @@
 //! no padding-vs-MAC distinction) — which defeats the classic Vaudenay / POODLE
 //! padding oracle.
 //!
-//! It does **not** yet equalise the number of hash-compression blocks across
-//! padding lengths, so the MAC *recomputation time* retains a small residual
-//! dependence on the padding length (the Lucky13 signal). Exploiting it needs a
-//! local, high-volume timing adversary against an already-deprecated cipher;
-//! full block-count equalisation is tracked as a follow-up. Do not expose this
-//! path to untrusted high-precision timing where it matters — prefer TLS 1.2+
-//! AEAD, which this crate keeps fully constant-time.
+//! To blunt **Lucky13**, the decrypt path also equalises the number of
+//! hash-compression blocks the MAC computation performs: after the real HMAC it
+//! runs `max_blocks - real_blocks` throwaway compression blocks (see
+//! [`CbcRecordCrypter::equalize_mac_blocks`]), so the total compression-call
+//! count is fixed by the public record length rather than the secret plaintext
+//! length. This is a best-effort equaliser built on the high-level hash API
+//! (it does not capture intermediate compression states the way a bespoke
+//! constant-time HMAC would), and it does not cover SSL 3.0 (POODLE-broken
+//! regardless). Treat these suites as last-resort interop only and prefer
+//! TLS 1.2+ AEAD, which this crate keeps fully constant-time.
 
 // The suite-selection enums and the crypter are exercised by this module's
 // tests now and wired into the legacy handshake in later phases; allow the
@@ -32,7 +35,7 @@
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, BlockCipher64, TdesEde3};
 use crate::ct::ConstantTimeEq;
-use crate::hash::{Hmac, Sha1, Sha256};
+use crate::hash::{Digest, Hmac, Sha1, Sha256};
 use crate::rng::RngCore;
 use crate::tls::ContentType;
 use crate::tls::Error;
@@ -511,6 +514,46 @@ impl CbcRecordCrypter {
         }
     }
 
+    /// Runs `max_blocks - real_blocks` throwaway hash-compression blocks so the
+    /// total compression-function call count of the MAC verification is fixed by
+    /// the public record length rather than the secret plaintext length (the
+    /// Lucky13 equaliser). `content_len` is the recovered plaintext length and
+    /// `total` the ciphertext length (a public multiple of the block size).
+    ///
+    /// The TLS legacy MAC input is `header(13) || content`; SHA-1/SHA-256 hash
+    /// in 64-byte blocks and append a `0x80` byte + 8-byte length (≥9 bytes of
+    /// trailing overhead), so a message of `m` bytes occupies
+    /// `ceil((m + 9) / 64)` message blocks. The constant HMAC ipad/opad/outer
+    /// blocks do not depend on `content_len` and need no compensation.
+    fn equalize_mac_blocks(&self, content_len: usize, total: usize) {
+        const BLOCK: usize = 64; // SHA-1 / SHA-256 compression block
+        const OVERHEAD: usize = 9; // 0x80 + 8-byte length
+        const HEADER: usize = 13; // seq || type || version || len
+        let mac_len = self.mac.mac_len();
+        // Largest possible content for this ciphertext (minimum 1 padding byte).
+        let max_content = total.saturating_sub(mac_len + 1);
+        let real_blocks = (HEADER + content_len + OVERHEAD).div_ceil(BLOCK);
+        let max_blocks = (HEADER + max_content + OVERHEAD).div_ceil(BLOCK);
+        let extra = max_blocks.saturating_sub(real_blocks);
+        if extra == 0 {
+            return;
+        }
+        let dummy = vec![0u8; extra * BLOCK];
+        // The digest output is discarded — only the compression work matters.
+        match self.mac {
+            CbcMacAlg::Sha1 => {
+                let mut h = Sha1::new();
+                h.update(&dummy);
+                let _ = h.finalize();
+            }
+            CbcMacAlg::Sha256 => {
+                let mut h = Sha256::new();
+                h.update(&dummy);
+                let _ = h.finalize();
+            }
+        }
+    }
+
     /// Encrypts one record's `plaintext`, returning the record fragment
     /// (`explicit_iv || ciphertext` for TLS 1.1, `ciphertext` for TLS 1.0).
     #[allow(dead_code)]
@@ -624,6 +667,16 @@ impl CbcRecordCrypter {
 
         let received_mac = &buf[content_len..content_len + mac_len];
         let computed_mac = self.compute_mac(ct, version, &buf[..content_len]);
+        // Lucky13: the HMAC above processes a number of hash-compression blocks
+        // that depends on the (secret) plaintext length, which leaks the padding
+        // length through timing. Equalise it by running the *difference* between
+        // this record's block count and the maximum possible block count as
+        // throwaway compression work, so the total number of compression calls
+        // is fixed by the public record length. (SSL 3.0 is POODLE-broken
+        // regardless, so the equaliser is skipped there.)
+        if !self.ssl3 {
+            self.equalize_mac_blocks(content_len, total);
+        }
         let mac_ok = computed_mac.as_slice().ct_eq(received_mac);
 
         self.seq = self.seq.wrapping_add(1);
