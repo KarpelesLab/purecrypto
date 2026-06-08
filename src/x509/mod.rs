@@ -11,6 +11,7 @@ mod csr;
 pub mod extension;
 mod name;
 pub mod ocsp;
+mod privkey;
 mod pubkey;
 mod signer;
 mod time;
@@ -24,6 +25,7 @@ pub use ocsp::{
     OcspCertStatus, OcspCheckOptions, OcspRequest, OcspRequestBuilder, OcspResponse,
     OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse,
 };
+pub use privkey::{AnyPrivateKey, Pkcs8ReadOptions};
 pub use pubkey::AnyPublicKey;
 pub use signer::CertSigner;
 pub use time::{Time, Validity};
@@ -177,6 +179,10 @@ pub enum Error {
     Expired,
     /// The certificate does not match the expected host name.
     NameMismatch,
+    /// A PKCS#8 `EncryptedPrivateKeyInfo` was supplied without a password to
+    /// decrypt it (see
+    /// [`AnyPrivateKey::from_pkcs8_der`](crate::x509::AnyPrivateKey::from_pkcs8_der)).
+    PasswordRequired,
 }
 
 impl From<crate::der::Error> for Error {
@@ -201,6 +207,9 @@ impl core::fmt::Display for Error {
             Error::Verification => f.write_str("X.509 signature verification failed"),
             Error::Expired => f.write_str("X.509 certificate outside its validity period"),
             Error::NameMismatch => f.write_str("X.509 certificate host name mismatch"),
+            Error::PasswordRequired => {
+                f.write_str("encrypted PKCS#8 private key requires a password")
+            }
         }
     }
 }
