@@ -84,6 +84,50 @@ impl ServerKeyExchange {
     }
 }
 
+#[cfg(feature = "tls-legacy")]
+impl ServerKeyExchange {
+    /// Encodes a TLS 1.0/1.1 ECDHE `ServerKeyExchange`. Identical to the
+    /// TLS 1.2 form ([`Self::encode`]) except the 2-byte
+    /// `SignatureAndHashAlgorithm` is absent — it did not exist before TLS 1.2,
+    /// so the `signature<0..2^16-1>` follows the `point` directly. The `scheme`
+    /// field is ignored on this path: pre-1.2 RSA signatures are raw PKCS#1 v1.5
+    /// over `MD5(params) ‖ SHA1(params)` and ECDSA signs `SHA1(params)`, both
+    /// implied by the certificate's key type rather than carried on the wire.
+    pub(crate) fn encode_legacy(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::SERVER_KEY_EXCHANGE);
+        with_len_u24(&mut out, |b| {
+            put_u8(b, 0x03); // curve_type = named_curve
+            put_u16(b, self.group.0);
+            with_len_u8(b, |p| p.extend_from_slice(&self.point));
+            with_len_u16(b, |s| s.extend_from_slice(&self.signature));
+        });
+        out
+    }
+
+    /// Decodes a TLS 1.0/1.1 ECDHE `ServerKeyExchange` (no
+    /// `SignatureAndHashAlgorithm`). The `scheme` field is set to the zero
+    /// placeholder; callers on the legacy path recover the signature algorithm
+    /// from the negotiated suite's signature kind, not from the message.
+    pub(crate) fn decode_legacy(body: &[u8]) -> Result<Self, Error> {
+        let mut c = ReadCursor::new(body);
+        let curve_type = c.u8()?;
+        if curve_type != 0x03 {
+            return Err(Error::IllegalParameter);
+        }
+        let group = NamedGroup(c.u16()?);
+        let point = c.vec_u8()?.to_vec();
+        let signature = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+        Ok(ServerKeyExchange {
+            group,
+            point,
+            scheme: SignatureScheme(0),
+            signature,
+        })
+    }
+}
+
 /// Builds the byte string the server signs in a TLS 1.2 ECDHE
 /// `ServerKeyExchange` (RFC 5246 §7.4.3 / RFC 4492 §5.4):
 ///
@@ -322,6 +366,25 @@ mod tests {
         let bytes = ske.encode();
         let body = parse_one(&bytes, hs_type::SERVER_KEY_EXCHANGE);
         assert_eq!(ServerKeyExchange::decode(&body).unwrap(), ske);
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn server_key_exchange_legacy_roundtrip() {
+        // The TLS 1.0/1.1 SKE omits the 2-byte SignatureAndHashAlgorithm, so
+        // the legacy encoding is exactly 2 bytes shorter than the 1.2 form and
+        // decode_legacy recovers the params + signature (scheme = placeholder).
+        let ske = ServerKeyExchange {
+            group: NamedGroup::SECP256R1,
+            point: alloc::vec![0x04; 65],
+            scheme: SignatureScheme(0),
+            signature: alloc::vec![0xcd; 256], // raw PKCS#1 v1.5 over MD5‖SHA1
+        };
+        let legacy = ske.encode_legacy();
+        let modern = ske.encode();
+        assert_eq!(legacy.len() + 2, modern.len());
+        let body = parse_one(&legacy, hs_type::SERVER_KEY_EXCHANGE);
+        assert_eq!(ServerKeyExchange::decode_legacy(&body).unwrap(), ske);
     }
 
     #[test]
