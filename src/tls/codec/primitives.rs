@@ -43,6 +43,39 @@ u16_id!(
         /// TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (TLS 1.2, RFC 7905).
         #[allow(dead_code)]
         TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xCCA9,
+
+        // --- Legacy CBC suites (SSLv3 / TLS 1.0 / 1.1; `tls-legacy` only).
+        // Deprecated (RFC 8996); for interop with old devices. ---
+        /// TLS_RSA_WITH_3DES_EDE_CBC_SHA (static RSA, 3DES-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_RSA_WITH_3DES_EDE_CBC_SHA = 0x000A,
+        /// TLS_RSA_WITH_AES_128_CBC_SHA (static RSA, AES-128-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_RSA_WITH_AES_128_CBC_SHA = 0x002F,
+        /// TLS_RSA_WITH_AES_256_CBC_SHA (static RSA, AES-256-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_RSA_WITH_AES_256_CBC_SHA = 0x0035,
+        /// TLS_RSA_WITH_AES_128_CBC_SHA256 (static RSA, AES-128-CBC, HMAC-SHA256).
+        #[allow(dead_code)]
+        TLS_RSA_WITH_AES_128_CBC_SHA256 = 0x003C,
+        /// TLS_RSA_WITH_AES_256_CBC_SHA256 (static RSA, AES-256-CBC, HMAC-SHA256).
+        #[allow(dead_code)]
+        TLS_RSA_WITH_AES_256_CBC_SHA256 = 0x003D,
+        /// TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA (ECDHE-RSA, 3DES-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA = 0xC012,
+        /// TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA (ECDHE-RSA, AES-128-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA = 0xC013,
+        /// TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA (ECDHE-RSA, AES-256-CBC, HMAC-SHA1).
+        #[allow(dead_code)]
+        TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA = 0xC014,
+        /// TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 (ECDHE-RSA, AES-128-CBC, HMAC-SHA256).
+        #[allow(dead_code)]
+        TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256 = 0xC027,
+        /// TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256 (ECDHE-RSA, AES-256-CBC, HMAC-SHA256).
+        #[allow(dead_code)]
+        TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256 = 0xC028,
     }
 );
 

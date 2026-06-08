@@ -36,9 +36,148 @@ use crate::hash::{Hmac, Sha1, Sha256};
 use crate::rng::RngCore;
 use crate::tls::ContentType;
 use crate::tls::Error;
+use crate::tls::codec::CipherSuite;
 use crate::tls::version::ProtocolVersion;
 use alloc::vec;
 use alloc::vec::Vec;
+
+/// Key-exchange of a legacy CBC suite.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegacyKx {
+    /// Static RSA key transport (`TLS_RSA_WITH_*`): the client encrypts the
+    /// premaster to the server's RSA cert key. No forward secrecy.
+    Rsa,
+    /// Ephemeral ECDHE with an RSA-signed ServerKeyExchange (`TLS_ECDHE_RSA_*`).
+    EcdheRsa,
+}
+
+/// A legacy CBC cipher suite: its wire code and the cipher/MAC/kx it selects.
+#[derive(Clone, Copy)]
+pub(crate) struct LegacyCbcSuite {
+    pub(crate) suite: CipherSuite,
+    pub(crate) cipher: CbcCipherAlg,
+    pub(crate) mac: CbcMacAlg,
+    pub(crate) kx: LegacyKx,
+}
+
+/// The legacy CBC suites we support, strongest-first within each kx family.
+/// ECDHE-RSA (forward-secret) is preferred over static RSA; AES over 3DES;
+/// AES-256 over AES-128 (legacy peers rarely prefer 256 but offer it anyway).
+pub(crate) const LEGACY_CBC_SUITES: [LegacyCbcSuite; 10] = [
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256,
+        cipher: CbcCipherAlg::Aes256,
+        mac: CbcMacAlg::Sha256,
+        kx: LegacyKx::EcdheRsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+        cipher: CbcCipherAlg::Aes128,
+        mac: CbcMacAlg::Sha256,
+        kx: LegacyKx::EcdheRsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+        cipher: CbcCipherAlg::Aes256,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::EcdheRsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+        cipher: CbcCipherAlg::Aes128,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::EcdheRsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+        cipher: CbcCipherAlg::Tdes,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::EcdheRsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA256,
+        cipher: CbcCipherAlg::Aes256,
+        mac: CbcMacAlg::Sha256,
+        kx: LegacyKx::Rsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA256,
+        cipher: CbcCipherAlg::Aes128,
+        mac: CbcMacAlg::Sha256,
+        kx: LegacyKx::Rsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+        cipher: CbcCipherAlg::Aes256,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::Rsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+        cipher: CbcCipherAlg::Aes128,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::Rsa,
+    },
+    LegacyCbcSuite {
+        suite: CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+        cipher: CbcCipherAlg::Tdes,
+        mac: CbcMacAlg::Sha1,
+        kx: LegacyKx::Rsa,
+    },
+];
+
+/// Looks up a legacy CBC suite by its wire code.
+pub(crate) fn lookup_legacy_cbc(s: CipherSuite) -> Option<LegacyCbcSuite> {
+    LEGACY_CBC_SUITES.iter().copied().find(|p| p.suite == s)
+}
+
+/// One direction's CBC key material, sliced from the `key_block`.
+pub(crate) struct CbcKeyMaterial {
+    pub(crate) client_mac: Vec<u8>,
+    pub(crate) server_mac: Vec<u8>,
+    pub(crate) client_key: Vec<u8>,
+    pub(crate) server_key: Vec<u8>,
+    /// `fixed_iv` per direction — non-empty only for TLS 1.0 (`explicit_iv`
+    /// false); TLS 1.1+ uses a fresh per-record explicit IV instead.
+    pub(crate) client_iv: Vec<u8>,
+    pub(crate) server_iv: Vec<u8>,
+}
+
+/// `key_block` length for a CBC suite (RFC 5246 §6.3):
+/// `2·mac_key + 2·enc_key + 2·fixed_iv`, where `fixed_iv = block_size` for
+/// TLS 1.0 and `0` for TLS 1.1+ (explicit per-record IV).
+pub(crate) fn cbc_key_block_len(cipher: CbcCipherAlg, mac: CbcMacAlg, explicit_iv: bool) -> usize {
+    let fixed_iv = if explicit_iv { 0 } else { cipher.block_size() };
+    2 * mac.key_len() + 2 * cipher.key_len() + 2 * fixed_iv
+}
+
+/// Slices a derived `key_block` into the per-direction CBC key material in the
+/// RFC 5246 §6.3 order: client/server MAC keys, client/server enc keys, then
+/// (TLS 1.0 only) client/server fixed IVs.
+pub(crate) fn split_cbc_key_block(
+    kb: &[u8],
+    cipher: CbcCipherAlg,
+    mac: CbcMacAlg,
+    explicit_iv: bool,
+) -> CbcKeyMaterial {
+    let mk = mac.key_len();
+    let ek = cipher.key_len();
+    let iv = if explicit_iv { 0 } else { cipher.block_size() };
+    let mut o = 0;
+    let mut take = |n: usize| {
+        let s = kb[o..o + n].to_vec();
+        o += n;
+        s
+    };
+    CbcKeyMaterial {
+        client_mac: take(mk),
+        server_mac: take(mk),
+        client_key: take(ek),
+        server_key: take(ek),
+        client_iv: take(iv),
+        server_iv: take(iv),
+    }
+}
 
 /// CBC block cipher selection for a legacy suite.
 #[derive(Clone, Copy)]
@@ -456,6 +595,50 @@ mod tests {
             ),
             Err(Error::BadRecordMac)
         ));
+    }
+
+    #[test]
+    fn legacy_suite_lookup() {
+        let s = lookup_legacy_cbc(CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA).unwrap();
+        assert!(matches!(s.cipher, CbcCipherAlg::Aes128));
+        assert!(matches!(s.mac, CbcMacAlg::Sha1));
+        assert!(matches!(s.kx, LegacyKx::Rsa));
+
+        let s = lookup_legacy_cbc(CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256).unwrap();
+        assert!(matches!(s.cipher, CbcCipherAlg::Aes256));
+        assert!(matches!(s.mac, CbcMacAlg::Sha256));
+        assert!(matches!(s.kx, LegacyKx::EcdheRsa));
+
+        let s = lookup_legacy_cbc(CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA).unwrap();
+        assert!(matches!(s.cipher, CbcCipherAlg::Tdes));
+
+        assert!(lookup_legacy_cbc(CipherSuite::AES_128_GCM_SHA256).is_none());
+    }
+
+    #[test]
+    fn cbc_key_block_layout() {
+        // AES-128 + HMAC-SHA1, TLS 1.1 (explicit IV → no fixed IVs):
+        //   2*20 (mac) + 2*16 (key) = 72 bytes.
+        let len = cbc_key_block_len(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        assert_eq!(len, 72);
+        let kb: Vec<u8> = (0..len as u8).collect();
+        let km = split_cbc_key_block(&kb, CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        assert_eq!(km.client_mac, &kb[0..20]);
+        assert_eq!(km.server_mac, &kb[20..40]);
+        assert_eq!(km.client_key, &kb[40..56]);
+        assert_eq!(km.server_key, &kb[56..72]);
+        assert!(km.client_iv.is_empty() && km.server_iv.is_empty());
+
+        // AES-256 + HMAC-SHA1, TLS 1.0 (chained → 16-byte fixed IVs each):
+        //   2*20 + 2*32 + 2*16 = 136 bytes.
+        let len = cbc_key_block_len(CbcCipherAlg::Aes256, CbcMacAlg::Sha1, false);
+        assert_eq!(len, 136);
+        let kb: Vec<u8> = (0..len as u8).collect();
+        let km = split_cbc_key_block(&kb, CbcCipherAlg::Aes256, CbcMacAlg::Sha1, false);
+        assert_eq!(km.client_mac.len(), 20);
+        assert_eq!(km.client_key.len(), 32);
+        assert_eq!(km.client_iv, &kb[104..120]);
+        assert_eq!(km.server_iv, &kb[120..136]);
     }
 
     /// The MAC input construction matches an independent Python `hmac` reference
