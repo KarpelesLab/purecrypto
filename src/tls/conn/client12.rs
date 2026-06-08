@@ -1523,6 +1523,17 @@ impl ClientConnection12 {
     fn finish_client_legacy(&mut self, ls: LegacyCbcSuite) -> Result<(), Error> {
         let cr = self.client_random;
         let sr = self.server_random.expect("server_random set");
+
+        // mTLS (RFC 5246 §7.3): when the server sent a CertificateRequest, our
+        // `Certificate` MUST precede the `ClientKeyExchange`, and a
+        // `CertificateVerify` (over CH..CKE) follows it — but only when we
+        // actually present a key. An empty `Certificate` (no client cert
+        // configured) is allowed; the server then decides per its policy.
+        let send_cert_verify = self.cert_request_received && self.config.client_cert.is_some();
+        if self.cert_request_received {
+            self.send_client_certificate();
+        }
+
         let premaster: Vec<u8> = match ls.kx {
             LegacyKx::EcdheRsa => {
                 let (group, peer_point) = self
@@ -1561,6 +1572,12 @@ impl ClientConnection12 {
             }
         };
 
+        // CertificateVerify (RFC 5246 §7.4.8) signs CH..CKE; emit it now, after
+        // the ClientKeyExchange is in the transcript.
+        if send_cert_verify {
+            self.send_client_certificate_verify_legacy()?;
+        }
+
         let master = self.legacy_master_secret(&premaster, &cr, &sr);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
@@ -1576,6 +1593,47 @@ impl ClientConnection12 {
         self.transcript.update(&finished);
         self.emit_encrypted(ContentType::Handshake, &finished)?;
         self.state = State::WaitServerFinished;
+        Ok(())
+    }
+
+    /// mTLS on the legacy path: emit a TLS 1.0/1.1 `CertificateVerify`. Unlike
+    /// TLS 1.2 there is no `SignatureAndHashAlgorithm` prefix — an RSA signature
+    /// is raw PKCS#1 v1.5 over `MD5(handshake) || SHA1(handshake)` (no
+    /// DigestInfo) and ECDSA signs `SHA1(handshake)`, over the transcript
+    /// through `ClientKeyExchange`. PKCS#1 v1.5 signing is deterministic, so —
+    /// unlike the TLS 1.2 RSA-PSS path — no RNG is needed here.
+    #[cfg(feature = "tls-legacy")]
+    fn send_client_certificate_verify_legacy(&mut self) -> Result<(), Error> {
+        let cc = self
+            .config
+            .client_cert
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let buf = self.transcript.buffered_bytes().to_vec();
+        let signature: Vec<u8> = match cc.key() {
+            ClientKey::Rsa(k) => {
+                let mut t = Vec::with_capacity(36);
+                t.extend_from_slice(Md5::digest(&buf).as_ref());
+                t.extend_from_slice(Sha1::digest(&buf).as_ref());
+                k.sign_pkcs1v15_prehashed(&t)
+                    .map_err(|_| Error::HandshakeFailure)?
+            }
+            ClientKey::Ecdsa(k) => k
+                .sign::<Sha1>(&buf)
+                .map_err(|_| Error::HandshakeFailure)?
+                .to_der(k.curve()),
+            // Ed25519 / Ed448 / ML-DSA have no TLS 1.0/1.1 CertificateVerify
+            // encoding (no IANA SignatureScheme without the 1.2 algorithm
+            // negotiation), so they cannot be used for legacy client auth.
+            _ => return Err(Error::HandshakeFailure),
+        };
+        // TLS 1.0/1.1 CertificateVerify body: just `opaque signature<0..2^16-1>`.
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
+        with_len_u24(&mut msg, |b| {
+            with_len_u16(b, |s| s.extend_from_slice(&signature));
+        });
+        self.transcript.update(&msg);
+        self.write_plain_record(ContentType::Handshake, &msg);
         Ok(())
     }
 
@@ -1713,6 +1771,16 @@ impl ClientConnection12 {
         // final flight.
         #[cfg(feature = "tls-legacy")]
         if let Some(ls) = self.legacy_suite {
+            // mTLS: a `CertificateRequest` (RFC 5246 §7.4.4) MAY appear before
+            // `ServerHelloDone`. The TLS 1.0/1.1 form has no
+            // `signature_algorithms` field (a TLS 1.2 addition), so we don't
+            // strict-decode it — we only record that a client certificate was
+            // requested and feed it into the transcript.
+            if msg_type == hs_type::CERTIFICATE_REQUEST {
+                self.cert_request_received = true;
+                self.transcript.update(raw);
+                return Ok(());
+            }
             if msg_type != hs_type::SERVER_HELLO_DONE {
                 return Err(Error::UnexpectedMessage);
             }

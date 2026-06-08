@@ -4048,6 +4048,90 @@ mod tls12_loopback_tests {
         );
     }
 
+    /// Legacy mutual-auth: TLS 1.0 + static-RSA + AES-CBC-SHA with a client
+    /// certificate (the lockdownd / libimobiledevice pairing shape). Exercises
+    /// the legacy CertificateRequest -> client Certificate + RSA-CKE +
+    /// CertificateVerify -> server cert-verify path on both ends.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_static_rsa_mutual_auth() {
+        use super::ClientCertConfig;
+        use crate::test_util::rsa_test_key_b;
+
+        let (server_config, server_cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+
+        // Self-signed RSA client cert (no EKU => valid for client auth).
+        let client_key = rsa_test_key_b();
+        let name = DistinguishedName::common_name("legacy-mtls-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let client_cert =
+            Certificate::self_signed(&client_key, &name, &validity, 1, false).unwrap();
+        let client_cert_der = client_cert.to_der().to_vec();
+        let boxed_client = BoxedRsaPrivateKey::from_pkcs1_der(&client_key.to_pkcs1_der()).unwrap();
+
+        let mut server_roots = RootCertStore::new();
+        server_roots.add_der(client_cert_der.clone()).unwrap();
+        let server_config = server_config.with_client_auth(server_roots, true);
+
+        let cc = ClientCertConfig::with_rsa(alloc::vec![client_cert_der], boxed_client);
+        let client_cfg = ClientConfig12::new(roots)
+            .with_min_version(crate::tls::ProtocolVersion::TLSv1_0)
+            .with_max_version(crate::tls::ProtocolVersion::TLSv1_0)
+            .with_client_cert(cc);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"legacy-mtls-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"legacy-mtls-s", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            client_cfg,
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        // The server authenticated the client certificate.
+        assert_eq!(server.peer_certificates().len(), 1);
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA.0)
+        );
+
+        client
+            .send_application_data(b"hello over mutual-auth tls1.0")
+            .unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(
+            server.take_received_plaintext(),
+            b"hello over mutual-auth tls1.0"
+        );
+    }
+
     #[cfg(feature = "tls-legacy")]
     #[test]
     fn ssl3_rsa_aes128_cbc_sha() {

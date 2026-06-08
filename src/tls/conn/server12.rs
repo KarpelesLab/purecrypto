@@ -1225,10 +1225,38 @@ impl<R: RngCore> ServerConnection12<R> {
         if ls.kx == LegacyKx::EcdheRsa {
             self.send_server_key_exchange_legacy(group.expect("ecdhe group set"))?;
         }
+        // mTLS (RFC 5246 §7.4.4): request a client certificate when configured.
+        // The TLS 1.0/1.1 CertificateRequest carries no signature_algorithms.
+        if self.config.client_auth.is_some() {
+            self.send_certificate_request_legacy();
+        }
         self.send_server_hello_done();
 
-        self.state = State::WaitClientKeyExchange;
+        self.state = if self.config.client_auth.is_some() {
+            State::WaitClientCertificate
+        } else {
+            State::WaitClientKeyExchange
+        };
         Ok(())
+    }
+
+    /// Emits a TLS 1.0/1.1 `CertificateRequest` (RFC 4346 §7.4.4): cert types
+    /// (rsa_sign + ecdsa_sign) and an empty CA list. Unlike TLS 1.2 there is no
+    /// `supported_signature_algorithms` field.
+    #[cfg(feature = "tls-legacy")]
+    fn send_certificate_request_legacy(&mut self) {
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_REQUEST];
+        with_len_u24(&mut msg, |b| {
+            // certificate_types<1..2^8-1>: rsa_sign (1), ecdsa_sign (64).
+            b.push(2);
+            b.push(1);
+            b.push(64);
+            // certificate_authorities<0..2^16-1>: empty.
+            b.push(0);
+            b.push(0);
+        });
+        self.transcript.update(&msg);
+        self.write_plain_record(ContentType::Handshake, &msg);
     }
 
     /// Emits the legacy `ServerHello` carrying the negotiated `server_version`
@@ -1373,7 +1401,13 @@ impl<R: RngCore> ServerConnection12<R> {
         self.pending_client_crypter = Some(crypters.client.into());
         self.pending_server_crypter = Some(crypters.server.into());
         self.master = Some(master);
-        self.state = State::WaitClientFinished;
+        // mTLS: a `CertificateVerify` follows the CKE iff the client presented a
+        // (non-empty) certificate (RFC 5246 §7.4.8).
+        self.state = if self.client_leaf_key.is_some() {
+            State::WaitClientCertVerify
+        } else {
+            State::WaitClientFinished
+        };
         Ok(())
     }
 
@@ -1678,6 +1712,13 @@ impl<R: RngCore> ServerConnection12<R> {
         if msg_type != hs_type::CERTIFICATE_VERIFY {
             return Err(Error::UnexpectedMessage);
         }
+        // Legacy TLS 1.0/1.1: the CertificateVerify body is a bare
+        // `opaque signature<0..2^16-1>` (no SignatureAndHashAlgorithm); RSA
+        // signs raw PKCS#1 v1.5 over `MD5(tr)||SHA1(tr)`, ECDSA over `SHA1(tr)`.
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return self.on_client_cert_verify_legacy(body, raw);
+        }
         let mut c = ReadCursor::new(body);
         let scheme = SignatureScheme(c.u16()?);
         let signature = c.vec_u16()?.to_vec();
@@ -1704,6 +1745,42 @@ impl<R: RngCore> ServerConnection12<R> {
             other => other,
         })?;
 
+        self.transcript.update(raw);
+        self.state = State::WaitClientFinished;
+        Ok(())
+    }
+
+    /// mTLS for the legacy path: verify a TLS 1.0/1.1 `CertificateVerify`. The
+    /// body is a bare `opaque signature<0..2^16-1>`; RSA verifies raw PKCS#1
+    /// v1.5 over `MD5(tr)||SHA1(tr)`, ECDSA over `SHA1(tr)`, where `tr` is the
+    /// transcript through `ClientKeyExchange`.
+    #[cfg(feature = "tls-legacy")]
+    fn on_client_cert_verify_legacy(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        let mut c = ReadCursor::new(body);
+        let signature = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+        let leaf_key = self
+            .client_leaf_key
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let buf = self.transcript.buffered_bytes();
+        match leaf_key {
+            AnyPublicKey::Rsa(k) => {
+                let mut t = Vec::with_capacity(36);
+                t.extend_from_slice(Md5::digest(buf).as_ref());
+                t.extend_from_slice(Sha1::digest(buf).as_ref());
+                k.verify_pkcs1v15_prehashed(&t, &signature)
+                    .map_err(|_| Error::DecryptError)?;
+            }
+            AnyPublicKey::Ecdsa(k) => {
+                let sig = crate::ec::BoxedEcdsaSignature::from_der(&signature)
+                    .map_err(|_| Error::DecryptError)?;
+                k.verify::<Sha1>(buf, &sig)
+                    .map_err(|_| Error::DecryptError)?;
+            }
+            // No legacy CertificateVerify encoding for Ed25519/Ed448/ML-DSA.
+            _ => return Err(Error::HandshakeFailure),
+        }
         self.transcript.update(raw);
         self.state = State::WaitClientFinished;
         Ok(())
