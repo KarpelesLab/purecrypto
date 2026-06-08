@@ -183,6 +183,46 @@ impl ClientKeyExchange {
     }
 }
 
+/// `ClientKeyExchange` for static-RSA cipher suites (RFC 5246 §7.4.7.1) — the
+/// `TLS_RSA_WITH_*` key-transport path used by the opt-in legacy suites.
+///
+/// Wire form is the RSA-encrypted 48-byte `PreMasterSecret` carried as
+/// `EncryptedPreMasterSecret`. In TLS 1.0+ this is a `u16`-length-prefixed
+/// opaque blob (the explicit length was added after SSLv3, which sent the
+/// ciphertext bare). The premaster itself is `client_version(2) ‖ random(46)`;
+/// constructing/validating it is the connection's job — this struct only frames
+/// the ciphertext.
+#[cfg(feature = "tls-legacy")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RsaClientKeyExchange {
+    pub(crate) encrypted_premaster: Vec<u8>,
+}
+
+#[cfg(feature = "tls-legacy")]
+impl RsaClientKeyExchange {
+    /// Encodes the full handshake message (type + u24 length + u16-length
+    /// ciphertext) for TLS 1.0/1.1/1.2.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::CLIENT_KEY_EXCHANGE);
+        with_len_u24(&mut out, |b| {
+            with_len_u16(b, |c| c.extend_from_slice(&self.encrypted_premaster));
+        });
+        out
+    }
+
+    /// Decodes a TLS 1.0+ static-RSA `ClientKeyExchange` body (the bytes after
+    /// the 4-byte handshake header): a `u16`-length-prefixed ciphertext.
+    pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+        let mut c = ReadCursor::new(body);
+        let encrypted_premaster = c.vec_u16()?.to_vec();
+        c.expect_empty()?;
+        Ok(RsaClientKeyExchange {
+            encrypted_premaster,
+        })
+    }
+}
+
 /// `CertificateRequest` for TLS 1.2 (RFC 5246 §7.4.4). This wire format is
 /// distinct from TLS 1.3's `CertificateRequest` (RFC 8446 §4.3.2), which
 /// carries extensions instead.
@@ -385,6 +425,19 @@ mod tests {
         assert_eq!(legacy.len() + 2, modern.len());
         let body = parse_one(&legacy, hs_type::SERVER_KEY_EXCHANGE);
         assert_eq!(ServerKeyExchange::decode_legacy(&body).unwrap(), ske);
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn rsa_client_key_exchange_roundtrip() {
+        let cke = RsaClientKeyExchange {
+            encrypted_premaster: alloc::vec![0x5a; 256], // RSA-2048 ciphertext
+        };
+        let bytes = cke.encode();
+        let body = parse_one(&bytes, hs_type::CLIENT_KEY_EXCHANGE);
+        assert_eq!(RsaClientKeyExchange::decode(&body).unwrap(), cke);
+        // The u16 length prefix must frame the ciphertext exactly.
+        assert_eq!(&body[..2], &[0x01, 0x00]); // 256
     }
 
     #[test]
