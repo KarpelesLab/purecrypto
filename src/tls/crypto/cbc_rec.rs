@@ -330,13 +330,19 @@ pub(crate) struct CbcRecordCrypter {
     /// Running chaining value for TLS 1.0 (the previous record's last ciphertext
     /// block); unused when `explicit_iv` is set.
     chain: Vec<u8>,
+    /// CSPRNG for the TLS 1.1 per-record explicit IV, seeded once at
+    /// construction from the connection RNG so record emission needs no RNG
+    /// threading. Unused (but kept) for the TLS 1.0 chained path.
+    iv_rng: crate::rng::HmacDrbg<crate::hash::Sha256>,
     seq: u64,
 }
 
 impl CbcRecordCrypter {
     /// Builds a record crypter for one direction. `enc_key`/`mac_key` come from
     /// the CBC `key_block`; `initial_iv` is that direction's `key_block` IV and
-    /// is used only for TLS 1.0 (the `explicit_iv = false` case).
+    /// is used only for TLS 1.0 (the `explicit_iv = false` case). `iv_seed` seeds
+    /// the per-record explicit-IV CSPRNG for TLS 1.1; the caller supplies fresh
+    /// randomness from the connection RNG.
     #[allow(dead_code)] // wired into the legacy handshake in a later phase
     pub(crate) fn new(
         cipher_alg: CbcCipherAlg,
@@ -345,6 +351,7 @@ impl CbcRecordCrypter {
         mac_key: &[u8],
         explicit_iv: bool,
         initial_iv: &[u8],
+        iv_seed: &[u8],
     ) -> Self {
         let cipher = match cipher_alg {
             CbcCipherAlg::Aes128 => {
@@ -364,6 +371,7 @@ impl CbcRecordCrypter {
             block_size: cipher_alg.block_size(),
             explicit_iv,
             chain: initial_iv.to_vec(),
+            iv_rng: crate::rng::HmacDrbg::new(iv_seed, b"tls-cbc-explicit-iv", &[]),
             seq: 0,
         }
     }
@@ -394,12 +402,11 @@ impl CbcRecordCrypter {
     /// Encrypts one record's `plaintext`, returning the record fragment
     /// (`explicit_iv || ciphertext` for TLS 1.1, `ciphertext` for TLS 1.0).
     #[allow(dead_code)]
-    pub(crate) fn encrypt<R: RngCore>(
+    pub(crate) fn encrypt(
         &mut self,
         ct: ContentType,
         version: ProtocolVersion,
         plaintext: &[u8],
-        rng: &mut R,
     ) -> Vec<u8> {
         let mac = self.compute_mac(ct, version, plaintext);
         let mut buf = Vec::with_capacity(plaintext.len() + mac.len() + self.block_size);
@@ -412,7 +419,7 @@ impl CbcRecordCrypter {
 
         let out = if self.explicit_iv {
             let mut iv = vec![0u8; self.block_size];
-            rng.fill_bytes(&mut iv);
+            self.iv_rng.fill_bytes(&mut iv);
             self.cipher.cbc_encrypt(&iv, &mut buf);
             let mut out = iv;
             out.extend_from_slice(&buf);
@@ -513,12 +520,7 @@ impl CbcRecordCrypter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rng::HmacDrbg;
     use crate::tls::version::ProtocolVersion;
-
-    fn rng() -> HmacDrbg<crate::hash::Sha256> {
-        HmacDrbg::<crate::hash::Sha256>::new(b"cbc-rec-test", b"nonce", &[])
-    }
 
     fn pair(
         cipher: CbcCipherAlg,
@@ -529,14 +531,13 @@ mod tests {
         let mk = vec![0x22u8; mac.key_len()];
         let iv = vec![0x33u8; cipher.block_size()];
         (
-            CbcRecordCrypter::new(cipher, &enc, mac, &mk, explicit_iv, &iv),
-            CbcRecordCrypter::new(cipher, &enc, mac, &mk, explicit_iv, &iv),
+            CbcRecordCrypter::new(cipher, &enc, mac, &mk, explicit_iv, &iv, b"iv-seed-a"),
+            CbcRecordCrypter::new(cipher, &enc, mac, &mk, explicit_iv, &iv, b"iv-seed-b"),
         )
     }
 
     #[test]
     fn roundtrip_all_variants() {
-        let mut r = rng();
         for &cipher in &[
             CbcCipherAlg::Aes128,
             CbcCipherAlg::Aes256,
@@ -553,7 +554,6 @@ mod tests {
                             ContentType::ApplicationData,
                             ProtocolVersion::TLSv1_1,
                             &pt,
-                            &mut r,
                         );
                         let got = dec
                             .decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec)
@@ -567,15 +567,9 @@ mod tests {
 
     #[test]
     fn tampering_yields_bad_record_mac() {
-        let mut r = rng();
         let (mut enc, mut dec) = pair(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
         let pt = b"provisioning config payload";
-        let rec = enc.encrypt(
-            ContentType::ApplicationData,
-            ProtocolVersion::TLSv1_1,
-            pt,
-            &mut r,
-        );
+        let rec = enc.encrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, pt);
 
         // Flip a ciphertext byte → corrupts plaintext/MAC/padding → BadRecordMac.
         let mut bad = rec.clone();
@@ -654,6 +648,7 @@ mod tests {
             &mk,
             true,
             &[0u8; 16],
+            b"seed",
         );
         // seq=0, type=23 (application_data), version=0x0301 (TLS 1.0), content="hi"
         let mac = c.compute_mac(
