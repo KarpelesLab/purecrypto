@@ -161,6 +161,16 @@ pub struct Config {
     /// ALPN protocols. Client: preferences offered. Server: accepted set in
     /// preference order.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Client cipher-suite restriction (IANA wire IDs, in preference order).
+    /// `None` (the default) offers the library's full curated set. When set,
+    /// only suites that appear in BOTH this list and the engine's supported set
+    /// are offered, ordered by this list — the seam for curl-style `--ciphers`
+    /// / `--tls13-ciphers`. A list that excludes every suite an engine supports
+    /// is ignored for that engine (it falls back to the full set) so the
+    /// ClientHello is never left with an empty suite list. Server-side and
+    /// TLS 1.3 vs 1.2 are both covered (mix 0x13xx and classic codepoints in
+    /// one list); the value is inert on the server.
+    pub cipher_suites: Option<Vec<u16>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
     /// RFC 7627 §5.3 — when `true` (the default), a TLS 1.2 handshake
@@ -292,6 +302,7 @@ impl Default for Config {
             #[cfg(feature = "std")]
             replay_window: None,
             alpn_protocols: Vec::new(),
+            cipher_suites: None,
             record_size_limit: None,
             require_extended_master_secret: true,
             server_cert_type_preference: alloc::vec![0u8], // X.509 only.
@@ -424,6 +435,15 @@ impl ConfigBuilder {
     /// preference order.
     pub fn alpn(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.inner.alpn_protocols = protocols;
+        self
+    }
+    /// Restrict (and order) the client's offered cipher suites to the given
+    /// IANA wire IDs — the seam for curl `--ciphers` / `--tls13-ciphers`. Only
+    /// suites the engine also supports are offered, in this order; an empty
+    /// intersection for an engine falls back to its full set. See
+    /// [`Config::cipher_suites`].
+    pub fn cipher_suites(mut self, suites: &[u16]) -> Self {
+        self.inner.cipher_suites = Some(suites.to_vec());
         self
     }
     /// Enable or disable peer-certificate chain validation.

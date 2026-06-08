@@ -411,6 +411,7 @@ fn client_server_name(cfg: &Config) -> Result<&str, Error> {
 fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Error> {
     let mut cc = super::conn::ClientConfig::new(cfg.roots.clone_store());
     cc.verify_certificates = cfg.verify_certificates;
+    cc.cipher_suites = cfg.cipher_suites.clone();
     if !cfg.alpn_protocols.is_empty() {
         cc = cc.with_alpn(cfg.alpn_protocols.clone());
     }
@@ -455,6 +456,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
 fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, Error> {
     let mut cc = super::conn::ClientConfig12::new(cfg.roots.clone_store());
     cc.verify_certificates = cfg.verify_certificates;
+    cc.cipher_suites = cfg.cipher_suites.clone();
     if !cfg.alpn_protocols.is_empty() {
         cc = cc.with_alpn(cfg.alpn_protocols.clone());
     }

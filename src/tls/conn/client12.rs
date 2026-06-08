@@ -96,6 +96,10 @@ pub(crate) struct ClientConfig12 {
     /// ALPN protocols to offer (RFC 7301), in preference order. Empty
     /// suppresses the extension.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Optional restriction on the offered TLS 1.2 cipher suites (IANA wire
+    /// IDs, in preference order). `None` offers the full supported set. See
+    /// [`crate::tls::Config::cipher_suites`].
+    pub cipher_suites: Option<Vec<u16>>,
     /// `record_size_limit` (RFC 8449) we advertise — the largest plaintext
     /// fragment the server may send us.
     pub record_size_limit: Option<u16>,
@@ -164,6 +168,7 @@ impl ClientConfig12 {
             verify_certificates: true,
             verification_time: None,
             alpn_protocols: Vec::new(),
+            cipher_suites: None,
             record_size_limit: None,
             signature_policy: SignaturePolicy::modern(),
             client_cert: None,
@@ -602,6 +607,8 @@ impl ClientConnection12 {
         };
         #[cfg(not(feature = "tls-legacy"))]
         let suites: Vec<CipherSuite> = SUITES_12.iter().map(|p| p.suite).collect();
+        // Apply the optional caller cipher-suite restriction (curl --ciphers).
+        let suites = super::select_offered_suites(&config.cipher_suites, &suites);
         Self::new_with_offer(
             config,
             server_name,

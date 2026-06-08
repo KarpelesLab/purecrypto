@@ -26,6 +26,73 @@ pub(crate) use server::{ServerConfig, ServerKey};
 pub(crate) use server12::ServerConfig12;
 pub(crate) use server12::ServerConnection12;
 
+use crate::tls::codec::CipherSuite;
+use alloc::vec::Vec;
+
+/// Applies an optional client cipher-suite restriction to an engine's
+/// `supported` set (in that engine's preference order).
+///
+/// `None` returns the full `supported` set. `Some(list)` keeps only the suites
+/// present in BOTH `list` and `supported`, ordered by `list` (the caller's
+/// preference) — the curl `--ciphers` semantics. If that intersection is empty
+/// (e.g. a TLS-1.3-only list handed to the TLS 1.2 engine), the full
+/// `supported` set is returned so the ClientHello is never left without any
+/// suites.
+pub(crate) fn select_offered_suites(
+    restriction: &Option<Vec<u16>>,
+    supported: &[CipherSuite],
+) -> Vec<CipherSuite> {
+    match restriction {
+        None => supported.to_vec(),
+        Some(list) => {
+            let picked: Vec<CipherSuite> = list
+                .iter()
+                .map(|&id| CipherSuite(id))
+                .filter(|s| supported.contains(s))
+                .collect();
+            if picked.is_empty() {
+                supported.to_vec()
+            } else {
+                picked
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod select_suites_tests {
+    use super::select_offered_suites;
+    use crate::tls::codec::CipherSuite;
+
+    const A: CipherSuite = CipherSuite(0x1301);
+    const B: CipherSuite = CipherSuite(0x1302);
+    const C: CipherSuite = CipherSuite(0x1303);
+
+    #[test]
+    fn none_returns_full_set() {
+        assert_eq!(
+            select_offered_suites(&None, &[A, B, C]),
+            alloc::vec![A, B, C]
+        );
+    }
+
+    #[test]
+    fn restriction_filters_and_reorders() {
+        // Caller order wins, unknown ids dropped, supported-but-unlisted dropped.
+        let r = Some(alloc::vec![0x1303u16, 0x9999, 0x1301]);
+        assert_eq!(select_offered_suites(&r, &[A, B, C]), alloc::vec![C, A]);
+    }
+
+    #[test]
+    fn empty_intersection_falls_back_to_full() {
+        // A TLS-1.3-only restriction handed to a 1.2-only set must not yield an
+        // empty offer.
+        let r = Some(alloc::vec![0x1301u16, 0x1302]);
+        let tls12 = [CipherSuite(0xC02F), CipherSuite(0xC030)];
+        assert_eq!(select_offered_suites(&r, &tls12), tls12.to_vec());
+    }
+}
+
 #[cfg(test)]
 mod quic_mode_tests {
     //! QUIC-mode (RFC 9001) loopback. Drives a TLS 1.3 handshake through
@@ -4005,6 +4072,49 @@ mod tls12_loopback_tests {
         run_legacy(
             CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
             crate::tls::ProtocolVersion::SSLv3,
+        );
+    }
+
+    /// Issue #23: a `ClientConfig12::cipher_suites` restriction is honoured —
+    /// the client offers only the listed suite, so the server negotiates it
+    /// instead of its top default. Driven through `new()` (not `new_with_offer`)
+    /// so the config-level filter is exercised.
+    #[test]
+    fn tls12_cipher_suite_restriction_is_honoured() {
+        let (server_config, cert_der) = rsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"suite-restrict-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"suite-restrict-s", b"nonce", &[]);
+
+        // Restrict to AES-256-GCM only; the server's default top pick would be
+        // AES-128-GCM, so seeing 0xC030 proves the restriction took effect.
+        let mut cfg = ClientConfig12::new(roots);
+        cfg.cipher_suites = Some(alloc::vec![
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.0
+        ]);
+        let mut client = ClientConnection12::new(cfg, "loopback.example", &mut crng);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking());
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            Some(CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384.0),
         );
     }
 

@@ -193,6 +193,10 @@ pub(crate) struct ClientConfig {
     /// ALPN protocols to offer (RFC 7301), in preference order. Empty
     /// suppresses the extension. Example: `[b"h2".to_vec(), b"http/1.1".to_vec()]`.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Optional restriction on the offered TLS 1.3 cipher suites (IANA wire
+    /// IDs, in preference order). `None` offers the full supported set. See
+    /// [`crate::tls::Config::cipher_suites`].
+    pub cipher_suites: Option<Vec<u16>>,
     /// `record_size_limit` (RFC 8449) we advertise — the largest plaintext
     /// fragment the server may send us. `None` suppresses the extension; the
     /// peer is then free to use the TLS 1.3 default of 2¹⁴ bytes.
@@ -258,6 +262,7 @@ impl ClientConfig {
             verify_certificates: true,
             verification_time: None,
             alpn_protocols: Vec::new(),
+            cipher_suites: None,
             record_size_limit: None,
             session: None,
             client_cert: None,
@@ -888,15 +893,17 @@ impl ClientConnection {
     /// `rng` supplies the ephemeral key shares and the client random. Offers all
     /// supported cipher suites and both key-exchange groups.
     pub fn new<R: RngCore>(config: ClientConfig, server_name: &str, rng: &mut R) -> Self {
+        const DEFAULT_SUITES: [CipherSuite; 3] = [
+            CipherSuite::AES_128_GCM_SHA256,
+            CipherSuite::AES_256_GCM_SHA384,
+            CipherSuite::CHACHA20_POLY1305_SHA256,
+        ];
+        let suites = super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES);
         Self::new_with_offer(
             config,
             server_name,
             rng,
-            &[
-                CipherSuite::AES_128_GCM_SHA256,
-                CipherSuite::AES_256_GCM_SHA384,
-                CipherSuite::CHACHA20_POLY1305_SHA256,
-            ],
+            &suites,
             &[
                 NamedGroup::X25519MLKEM768,
                 NamedGroup::X25519,
