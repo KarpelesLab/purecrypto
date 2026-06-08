@@ -8,6 +8,11 @@
 
 use super::Error;
 use super::curves::CurveId;
+
+/// `id-ecPublicKey` (`1.2.840.10045.2.1`) — the PKCS#8 / SPKI algorithm OID for
+/// elliptic-curve keys. Defined locally because `ec` cannot depend on `x509`
+/// (which depends on `ec`).
+const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Hmac};
@@ -446,6 +451,101 @@ impl BoxedEcdsaPrivateKey {
         let der = crate::der::pem_decode(pem, "EC PRIVATE KEY").map_err(|_| Error::Malformed)?;
         Self::from_sec1_der(&der)
     }
+
+    /// Encodes the key as an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958):
+    /// `id-ecPublicKey` + the named-curve parameter, wrapping the SEC1
+    /// `ECPrivateKey` ([`Self::to_sec1_der`]) in the `privateKey` OCTET STRING.
+    pub fn to_pkcs8_der(&self) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(
+            &[
+                oid_tlv(EC_PUBLIC_KEY_OID),
+                oid_tlv(self.curve.named_curve_oid()),
+            ]
+            .concat(),
+        );
+        let inner = encode_octet_string(&self.to_sec1_der());
+        encode_sequence(&[encode_integer(&[0]), algid, inner].concat())
+    }
+
+    /// Encodes the key as an unencrypted PKCS#8 PEM document
+    /// (`-----BEGIN PRIVATE KEY-----`).
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+    }
+
+    /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958) wrapping a SEC1
+    /// EC private key. The curve is taken from the `privateKeyAlgorithm`
+    /// named-curve parameter; the inner SEC1 structure's optional `[0]`
+    /// parameters / `[1]` publicKey are ignored.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
+        use crate::der::{Reader, parse_oid};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
+        seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version (0)
+        let mut algid = seq.read_sequence().map_err(|_| Error::Malformed)?;
+        let alg = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?;
+        if alg.as_slice() != EC_PUBLIC_KEY_OID {
+            return Err(Error::Malformed);
+        }
+        let curve_arcs = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
+            .map_err(|_| Error::Malformed)?;
+        let curve = CurveId::from_named_curve_oid(&curve_arcs).ok_or(Error::Malformed)?;
+        let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
+        // inner = SEC1 ECPrivateKey { version, privateKey OCTET STRING, ... }.
+        let mut ir = Reader::new(inner);
+        let mut iseq = ir.read_sequence().map_err(|_| Error::Malformed)?;
+        iseq.read_integer_bytes().map_err(|_| Error::Malformed)?; // SEC1 version (1)
+        let priv_bytes = iseq.read_octet_string().map_err(|_| Error::Malformed)?;
+        Self::from_bytes(curve, priv_bytes)
+    }
+
+    /// Parses an unencrypted PKCS#8 PEM private key
+    /// (`-----BEGIN PRIVATE KEY-----`).
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, Error> {
+        let der = crate::der::pem_decode(pem, "PRIVATE KEY").map_err(|_| Error::Malformed)?;
+        Self::from_pkcs8_der(&der)
+    }
+
+    /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018 §6.2)
+    /// with caller-supplied parameters, returning the DER `EncryptedPrivateKeyInfo`.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn to_pkcs8_der_encrypted(
+        &self,
+        password: &[u8],
+        params: &crate::kdf::pbes2::Pbes2Params,
+        rng: &mut impl crate::rng::RngCore,
+    ) -> Vec<u8> {
+        crate::kdf::pbes2::encrypt(&self.to_pkcs8_der(), password, params, rng)
+    }
+
+    /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
+    /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`).
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn to_pkcs8_pem_encrypted(
+        &self,
+        password: &[u8],
+        params: &crate::kdf::pbes2::Pbes2Params,
+        rng: &mut impl crate::rng::RngCore,
+    ) -> alloc::string::String {
+        crate::kdf::pbes2::encrypt_pem(&self.to_pkcs8_der(), password, params, rng)
+    }
+
+    /// Parses an `EncryptedPrivateKeyInfo` DER (PBES2) and decrypts it back to a
+    /// PKCS#8 EC private key. Mirrors `BoxedRsaPrivateKey` / `Ed25519PrivateKey`.
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_der_encrypted(der: &[u8], password: &[u8]) -> Result<Self, Error> {
+        let inner = crate::kdf::pbes2::decrypt(der, password).map_err(|_| Error::Malformed)?;
+        Self::from_pkcs8_der(&inner)
+    }
+
+    /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
+    #[cfg(all(feature = "kdf", feature = "der"))]
+    pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, Error> {
+        let inner = crate::kdf::pbes2::decrypt_pem(pem, password).map_err(|_| Error::Malformed)?;
+        Self::from_pkcs8_der(&inner)
+    }
 }
 
 impl BoxedEcdhPrivateKey {
@@ -617,6 +717,84 @@ mod tests {
             // Same key: public points match.
             assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
         }
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn ec_pkcs8_roundtrip() {
+        for curve in [CurveId::P256, CurveId::P384, CurveId::P521] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"pkcs8", b"n", &[]);
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            // Unencrypted PKCS#8 PEM round-trip.
+            let pem = sk.to_pkcs8_pem();
+            assert!(pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+            let parsed = BoxedEcdsaPrivateKey::from_pkcs8_pem(&pem).unwrap();
+            assert_eq!(parsed.curve(), curve);
+            assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
+            // DER round-trip too.
+            let parsed_der = BoxedEcdsaPrivateKey::from_pkcs8_der(&sk.to_pkcs8_der()).unwrap();
+            assert_eq!(parsed_der.public_key().to_sec1(), sk.public_key().to_sec1());
+        }
+    }
+
+    /// Interop: load a P-256 PKCS#8 key generated by OpenSSL 3.x, both the
+    /// plaintext `PRIVATE KEY` form and the PBES2 (PBKDF2 + AES-256-CBC)
+    /// `ENCRYPTED PRIVATE KEY` form, and confirm both recover the same public
+    /// key. This is the `rsurl` curl `-E ... --pass` use case from issue #24.
+    #[cfg(all(feature = "der", feature = "kdf"))]
+    #[test]
+    fn ec_pkcs8_openssl_interop() {
+        const PLAIN: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPWfLPOd/TFwWJTCr\n\
+E5f4wo4KaaIPIAZWZMFAqEMjTfKhRANCAAQ2q5yE2IGZsOoMACF7A+349UNU4/bo\n\
+HCwXnzad7AT3M3i/cpHzz4hQ5SamPVsiQHh79RPMIhptanrHl+IqHnZW\n\
+-----END PRIVATE KEY-----\n";
+        // PBES2 with PBKDF2-HMAC-SHA256 (100000 iters, above our 10k floor) +
+        // AES-256-CBC, generated by `openssl pkcs8 -topk8 -v2 aes-256-cbc
+        // -iter 100000` (password "swordfish").
+        const ENC: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIH1MGAGCSqGSIb3DQEFDTBTMDIGCSqGSIb3DQEFDDAlBBCY+UTuXFns/MwLo3Ki\n\
+xoqQAgMBhqAwDAYIKoZIhvcNAgkFADAdBglghkgBZQMEASoEED21Z94FK0DiNUk7\n\
+kyKSLr4EgZBQ3Gv8EdxHAbYJW4EQErkkR2BQcDXl94uMRcxb9grTUueECvaCoOJ\n\
+FN7ev05ViuIhHs4Nf8urHf8E9mS7xW18RnHM0LqbtkLBpFgOCM7v0JXWsyacSGg\n\
+E2aHEj9+RUM5NRAvRB/ggKn1BUHMrJ1RRFpTJHBmL+XV9GJ8KiIeIyiCcogoils\n\
+x2dqVh/sT12MnE=\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+        let expected = from_hex(
+            "0436ab9c84d88199b0ea0c00217b03edf8f54354e3f6e81c2c179f369dec04f733\
+             78bf7291f3cf8850e526a63d5b2240787bf513cc221a6d6a7ac797e22a1e7656",
+        );
+        let plain = BoxedEcdsaPrivateKey::from_pkcs8_pem(PLAIN).unwrap();
+        assert_eq!(plain.curve(), CurveId::P256);
+        assert_eq!(plain.public_key().to_sec1(), expected);
+
+        let enc = BoxedEcdsaPrivateKey::from_pkcs8_pem_encrypted(ENC, b"swordfish").unwrap();
+        assert_eq!(enc.public_key().to_sec1(), expected);
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_pem_encrypted(ENC, b"bad").is_err());
+    }
+
+    #[cfg(all(feature = "der", feature = "kdf"))]
+    #[test]
+    fn ec_encrypted_pkcs8_roundtrip() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"ec-pbes2", b"nonce", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let params = crate::kdf::pbes2::Pbes2Params {
+            kdf: crate::kdf::pbes2::KdfChoice::Pbkdf2HmacSha256 { iterations: 10_000 },
+            cipher: crate::kdf::pbes2::CipherChoice::Aes256Gcm,
+            salt_len: 16,
+        };
+        // PEM round-trip.
+        let pem = sk.to_pkcs8_pem_encrypted(b"swordfish", &params, &mut rng);
+        assert!(pem.starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----"));
+        let parsed = BoxedEcdsaPrivateKey::from_pkcs8_pem_encrypted(&pem, b"swordfish").unwrap();
+        assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
+        // Wrong password is rejected.
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_pem_encrypted(&pem, b"wrong").is_err());
+        // DER round-trip.
+        let der = sk.to_pkcs8_der_encrypted(b"swordfish", &params, &mut rng);
+        let parsed_der =
+            BoxedEcdsaPrivateKey::from_pkcs8_der_encrypted(&der, b"swordfish").unwrap();
+        assert_eq!(parsed_der.public_key().to_sec1(), sk.public_key().to_sec1());
     }
 
     #[test]
