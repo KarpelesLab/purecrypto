@@ -65,6 +65,7 @@ Single crate, modules gated by Cargo features:
 | ECH              | `ech`      | ✅ draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
 | QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
 | Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
+| Legacy TLS       | `tls-legacy` | ⚠️ **deprecated/insecure, off by default** — SSL 3.0 / TLS 1.0 / TLS 1.1 (RFC 8996) with CBC MAC-then-encrypt suites (`TLS_RSA_*` static-RSA + `TLS_ECDHE_RSA_*` over AES-CBC-SHA/SHA256 + 3DES), client + server. Last-resort interop only (e.g. VoIP-phone provisioning); requires lowering `Config::min_version`. BEAST 1/n-1 split + constant-time CBC decrypt, but MD5/SHA-1 PRF, Lucky13 residual, and SSLv3 POODLE remain — do not use against modern peers. |
 | C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
 | CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
 

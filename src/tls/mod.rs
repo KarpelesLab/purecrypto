@@ -25,6 +25,32 @@
 //! macOS, and Windows. The codebase has had an internal security
 //! audit (`b52157d`…`8aa0881`) but no external audit; APIs may still
 //! evolve before 1.0.
+//!
+//! # Legacy TLS 1.0 / 1.1 / SSL 3.0 (opt-in, off by default)
+//!
+//! The non-default `tls-legacy` Cargo feature adds the deprecated
+//! SSL 3.0 / TLS 1.0 / TLS 1.1 protocol versions and their CBC
+//! MAC-then-encrypt cipher suites — `TLS_RSA_WITH_*` (static-RSA key
+//! transport) and `TLS_ECDHE_RSA_WITH_*` over AES-CBC-SHA, AES-CBC-SHA256
+//! (TLS 1.0/1.1 only) and 3DES-CBC-SHA — for client and server roles.
+//! These exist purely to interoperate with legacy hardware (e.g. VoIP-phone
+//! provisioning servers) that speaks nothing newer.
+//!
+//! Enabling the feature does **not** change defaults: a [`Config`] still
+//! negotiates only TLS 1.2/1.3 unless the caller explicitly lowers
+//! [`Config::min_version`] (e.g. to [`ProtocolVersion::TLSv1_0`]). To offer
+//! *only* legacy versions — talking to a peer that rejects a TLS 1.2
+//! ClientHello — also lower `max_version`.
+//!
+//! **These versions are insecure (RFC 8996).** They rely on MD5/SHA-1 in the
+//! PRF and signatures, are subject to CBC padding-oracle attacks (Lucky13;
+//! the legacy CBC decrypt is constant-time + uniform-error but does not yet
+//! fully equalise the MAC block count), BEAST (mitigated on TLS 1.0 send via
+//! 1/n-1 record splitting), and — for SSL 3.0 — POODLE (unauthenticated CBC
+//! padding, which cannot be fixed). Enable `tls-legacy` only for last-resort
+//! interop, and never expose it where an adversary controls a chosen-plaintext
+//! timing/oracle channel. Prefer TLS 1.2+ AEAD, which this crate keeps fully
+//! constant-time.
 
 #[cfg(feature = "cert-compression")]
 #[doc(hidden)]
