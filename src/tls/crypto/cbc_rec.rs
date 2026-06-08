@@ -203,6 +203,28 @@ pub(crate) fn build_legacy_crypters(
     client_random: &[u8; 32],
     server_random: &[u8; 32],
 ) -> LegacyCrypters {
+    // SSL 3.0: chained IV, SSLv3 key derivation + record MAC.
+    if version == ProtocolVersion::SSLv3 {
+        let kb_len = cbc_key_block_len(ls.cipher, ls.mac, false);
+        let mut kb = vec![0u8; kb_len];
+        super::ssl3::ssl3_key_block(master, server_random, client_random, &mut kb);
+        let km = split_cbc_key_block(&kb, ls.cipher, ls.mac, false);
+        let client = CbcRecordCrypter::new_ssl3(
+            ls.cipher,
+            &km.client_key,
+            ls.mac,
+            &km.client_mac,
+            &km.client_iv,
+        );
+        let server = CbcRecordCrypter::new_ssl3(
+            ls.cipher,
+            &km.server_key,
+            ls.mac,
+            &km.server_mac,
+            &km.server_iv,
+        );
+        return LegacyCrypters { client, server };
+    }
     let explicit_iv = version.as_u16() >= ProtocolVersion::TLSv1_1.as_u16();
     let kb_len = cbc_key_block_len(ls.cipher, ls.mac, explicit_iv);
     let mut kb = vec![0u8; kb_len + 64];
@@ -256,7 +278,7 @@ impl CbcCipherAlg {
 }
 
 /// HMAC hash for a legacy CBC suite.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CbcMacAlg {
     Sha1,
     Sha256,
@@ -386,6 +408,10 @@ pub(crate) struct CbcRecordCrypter {
     /// construction from the connection RNG so record emission needs no RNG
     /// threading. Unused (but kept) for the TLS 1.0 chained path.
     iv_rng: crate::rng::HmacDrbg<crate::hash::Sha256>,
+    /// SSL 3.0 mode: use the SSLv3 record MAC (no version byte, non-HMAC
+    /// cascade) and accept arbitrary CBC padding content on decrypt (the POODLE
+    /// weakness — SSLv3 padding bytes are not authenticated). Always chained-IV.
+    ssl3: bool,
     seq: u64,
 }
 
@@ -424,12 +450,46 @@ impl CbcRecordCrypter {
             explicit_iv,
             chain: initial_iv.to_vec(),
             iv_rng: crate::rng::HmacDrbg::new(iv_seed, b"tls-cbc-explicit-iv", &[]),
+            ssl3: false,
             seq: 0,
         }
     }
 
-    /// HMAC over `seq || type || version || len(content) || content`.
+    /// Builds an SSL 3.0 CBC record crypter (RFC 6101): chained IV, the SSLv3
+    /// record MAC, and lenient (unauthenticated) CBC padding. SSLv3 has no
+    /// SHA-256 CBC suites, so the MAC is always the SSLv3 MD5/SHA-1 cascade
+    /// selected by `mac_alg` (only `Sha1` is reachable through our suite table).
+    pub(crate) fn new_ssl3(
+        cipher_alg: CbcCipherAlg,
+        enc_key: &[u8],
+        mac_alg: CbcMacAlg,
+        mac_key: &[u8],
+        initial_iv: &[u8],
+    ) -> Self {
+        let mut c = Self::new(
+            cipher_alg,
+            enc_key,
+            mac_alg,
+            mac_key,
+            false,
+            initial_iv,
+            b"ssl3-unused",
+        );
+        c.ssl3 = true;
+        c
+    }
+
+    /// HMAC over `seq || type || version || len(content) || content`, or the
+    /// SSL 3.0 cascade MAC (no version byte) in SSLv3 mode.
     fn compute_mac(&self, ct: ContentType, version: ProtocolVersion, content: &[u8]) -> Vec<u8> {
+        if self.ssl3 {
+            let m = match self.mac {
+                CbcMacAlg::Sha1 => super::ssl3::Ssl3Mac::Sha1,
+                // No SHA-256 SSLv3 suite exists; treat anything else as SHA-1.
+                CbcMacAlg::Sha256 => super::ssl3::Ssl3Mac::Sha1,
+            };
+            return super::ssl3::ssl3_record_mac(m, &self.mac_key, self.seq, ct, content);
+        }
         let mut header = [0u8; 13];
         header[..8].copy_from_slice(&self.seq.to_be_bytes());
         header[8] = ct.as_u8();
@@ -533,15 +593,22 @@ impl CbcRecordCrypter {
         let pad_len = buf[total - 1] as usize;
         // Enough room for content(>=0) + MAC + (pad_len + 1) padding bytes.
         let mut good = ct_le(mac_len + pad_len + 1, total);
-        // Every one of the trailing `pad_len + 1` bytes must equal `pad_len`.
-        // Scan a fixed window (max TLS padding is 255 bytes) bounded by `total`.
-        let window = core::cmp::min(256, total);
-        for i in 0..window {
-            let byte = buf[total - 1 - i];
-            let in_pad = ct_le(i, pad_len); // 0xff if this byte is in the padding
-            let is_val = ct_eq_u8(byte, pad_len as u8);
-            // if in_pad then require is_val:  good &= (is_val | !in_pad)
-            good &= is_val | !in_pad;
+        // SSL 3.0 padding bytes are NOT authenticated (RFC 6101 §5.2.3.2): the
+        // receiver only honours the length byte. This is exactly the POODLE
+        // weakness; we therefore skip the per-byte padding scan in SSLv3 mode
+        // (documented in the module header). TLS 1.0/1.1 require every padding
+        // byte to equal `pad_len`, checked in constant time below.
+        if !self.ssl3 {
+            // Scan a fixed window (max TLS padding is 255 bytes) bounded by
+            // `total`.
+            let window = core::cmp::min(256, total);
+            for i in 0..window {
+                let byte = buf[total - 1 - i];
+                let in_pad = ct_le(i, pad_len); // 0xff if this byte is in the padding
+                let is_val = ct_eq_u8(byte, pad_len as u8);
+                // if in_pad then require is_val:  good &= (is_val | !in_pad)
+                good &= is_val | !in_pad;
+            }
         }
 
         // content_len = total - mac_len - pad_len - 1 when the padding is valid,

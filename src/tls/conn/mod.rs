@@ -3872,7 +3872,9 @@ mod tls12_loopback_tests {
     #[cfg(feature = "tls-legacy")]
     fn run_legacy(suite: CipherSuite, version: crate::tls::ProtocolVersion) {
         let (server_config, cert_der) = rsa_server12();
-        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+        // Floor the server at SSL 3.0 so it accepts every legacy version under
+        // test (SSLv3 .. TLS 1.1).
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::SSLv3);
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
 
@@ -3976,6 +3978,33 @@ mod tls12_loopback_tests {
         run_legacy(
             CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
             crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn ssl3_rsa_aes128_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::SSLv3,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn ssl3_rsa_3des_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+            crate::tls::ProtocolVersion::SSLv3,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn ssl3_ecdhe_rsa_aes128_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::SSLv3,
         );
     }
 
@@ -4809,7 +4838,7 @@ mod tls12_loopback_tests {
         let body = [0u8; 8];
         let mut rec: Vec<u8> = Vec::new();
         rec.push(ContentType::Handshake.as_u8());
-        rec.extend_from_slice(&[0x03, 0x00]); // SSL 3.0
+        rec.extend_from_slice(&[0x02, 0x00]); // SSL 2.0 (always rejected)
         rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
         rec.extend_from_slice(&body);
         server.read_tls(&rec);
@@ -4828,7 +4857,7 @@ mod tls12_loopback_tests {
         let _ = client.write_tls(); // drain CH
         let mut rec: Vec<u8> = Vec::new();
         rec.push(ContentType::Handshake.as_u8());
-        rec.extend_from_slice(&[0x03, 0x00]); // SSL 3.0
+        rec.extend_from_slice(&[0x02, 0x00]); // SSL 2.0 (always rejected)
         rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
         rec.extend_from_slice(&body);
         client.read_tls(&rec);

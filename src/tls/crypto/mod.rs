@@ -13,6 +13,8 @@ pub(crate) mod prf;
 pub(crate) mod record_prot;
 mod schedule;
 pub(crate) mod sign;
+#[cfg(feature = "tls-legacy")]
+pub(crate) mod ssl3;
 mod suite;
 
 #[allow(unused_imports)]

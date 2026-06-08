@@ -61,7 +61,16 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedRecord<'_>>, Error>
 /// `0x0301`, `0x0302`, or `0x0303`; SSL 3.0 (`0x0300`) and unknown codepoints
 /// are downgrade attempts and rejected with `protocol_version`.
 pub(crate) fn is_legal_record_version(version: u16) -> bool {
-    matches!(version, 0x0301..=0x0303)
+    // The opt-in legacy build additionally accepts SSL 3.0 (`0x0300`) record
+    // headers; without `tls-legacy` SSLv3 is treated as a downgrade attempt.
+    #[cfg(feature = "tls-legacy")]
+    {
+        matches!(version, 0x0300..=0x0303)
+    }
+    #[cfg(not(feature = "tls-legacy"))]
+    {
+        matches!(version, 0x0301..=0x0303)
+    }
 }
 
 /// Writes a record (header + `fragment`) to `out`.
@@ -111,8 +120,13 @@ mod tests {
         assert!(is_legal_record_version(0x0301));
         assert!(is_legal_record_version(0x0302));
         assert!(is_legal_record_version(0x0303));
-        // SSL 3.0 and earlier: reject (downgrade attempts).
+        // SSL 3.0 (0x0300): accepted only on the opt-in legacy build, otherwise
+        // a downgrade attempt.
+        #[cfg(feature = "tls-legacy")]
+        assert!(is_legal_record_version(0x0300));
+        #[cfg(not(feature = "tls-legacy"))]
         assert!(!is_legal_record_version(0x0300));
+        // SSL 2.0 and earlier: always rejected.
         assert!(!is_legal_record_version(0x0200));
         // TLS 1.3 wire version is 0x0303 in the record header (the real version
         // lives in `supported_versions`), so 0x0304 should never appear here.

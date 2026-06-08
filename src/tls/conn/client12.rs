@@ -65,6 +65,8 @@ use crate::tls::crypto::prf::{
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::prf::{finished_verify_data_legacy, master_secret_legacy};
 use crate::tls::crypto::record_prot::RecordProtection;
+#[cfg(feature = "tls-legacy")]
+use crate::tls::crypto::ssl3;
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -1552,7 +1554,7 @@ impl ClientConnection12 {
             }
         };
 
-        let master = master_secret_legacy(&premaster, &cr, &sr);
+        let master = self.legacy_master_secret(&premaster, &cr, &sr);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -1562,24 +1564,48 @@ impl ClientConnection12 {
         self.pending_server_crypter = Some(crypters.server.into());
         self.master = Some(master);
 
-        let seed = self.legacy_transcript_seed();
-        let verify_data = finished_verify_data_legacy(&master, b"client finished", &seed);
-        let finished = build_finished(&verify_data);
+        let verify_data = self.legacy_verify_data(&master, true);
+        let finished = build_finished_var(&verify_data);
         self.transcript.update(&finished);
         self.emit_encrypted(ContentType::Handshake, &finished)?;
         self.state = State::WaitServerFinished;
         Ok(())
     }
 
-    /// The 36-byte `MD5(transcript) || SHA1(transcript)` seed for the TLS
-    /// 1.0/1.1 Finished PRF over the current transcript bytes.
+    /// Version-aware legacy master secret (SSL 3.0 cascade or TLS 1.0/1.1 PRF).
     #[cfg(feature = "tls-legacy")]
-    fn legacy_transcript_seed(&self) -> Vec<u8> {
+    fn legacy_master_secret(&self, premaster: &[u8], cr: &Random, sr: &Random) -> [u8; 48] {
+        if self.negotiated_version == ProtocolVersion::SSLv3 {
+            ssl3::ssl3_master_secret(premaster, cr, sr)
+        } else {
+            master_secret_legacy(premaster, cr, sr)
+        }
+    }
+
+    /// Version-aware Finished `verify_data` over the current transcript bytes.
+    /// `client_sender` selects the role: SSL 3.0 tags it with CLNT/SRVR and
+    /// returns 36 bytes; TLS 1.0/1.1 returns the 12-byte legacy PRF value.
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_verify_data(&self, master: &[u8; 48], client_sender: bool) -> Vec<u8> {
         let buf = self.transcript.buffered_bytes();
-        let mut seed = Vec::with_capacity(36);
-        seed.extend_from_slice(Md5::digest(buf).as_ref());
-        seed.extend_from_slice(Sha1::digest(buf).as_ref());
-        seed
+        if self.negotiated_version == ProtocolVersion::SSLv3 {
+            let sender = if client_sender {
+                ssl3::SENDER_CLIENT
+            } else {
+                ssl3::SENDER_SERVER
+            };
+            ssl3::ssl3_finished(buf, &sender, master).to_vec()
+        } else {
+            let label: &[u8] = if client_sender {
+                b"client finished"
+            } else {
+                b"server finished"
+            };
+            let mut seed = Vec::with_capacity(36);
+            seed.extend_from_slice(Md5::digest(buf).as_ref());
+            seed.extend_from_slice(Sha1::digest(buf).as_ref());
+            finished_verify_data_legacy(master, label, &seed).to_vec()
+        }
     }
 
     /// RFC 6066 §8: a `CertificateStatus` carries the server's stapled OCSP
@@ -1879,13 +1905,9 @@ impl ClientConnection12 {
             if msg_type != hs_type::FINISHED {
                 return Err(Error::UnexpectedMessage);
             }
-            if body.len() != 12 {
-                return Err(Error::Decode);
-            }
             let master = self.master.expect("master set");
-            let seed = self.legacy_transcript_seed();
-            let expected = finished_verify_data_legacy(&master, b"server finished", &seed);
-            if !bool::from(expected.as_slice().ct_eq(body)) {
+            let expected = self.legacy_verify_data(&master, false);
+            if body.len() != expected.len() || !bool::from(expected.as_slice().ct_eq(body)) {
                 return Err(Error::HandshakeFailure);
             }
             self.transcript.update(raw);
@@ -2030,6 +2052,16 @@ pub(super) fn parse_certificate_list_12(body: &[u8]) -> Result<Vec<Vec<u8>>, Err
 }
 
 /// Builds a `Finished` handshake message body from a 12-byte `verify_data`.
+/// Builds a `Finished` handshake message for a variable-length `verify_data`
+/// (12 bytes for TLS 1.0–1.2, 36 for SSL 3.0).
+#[cfg(feature = "tls-legacy")]
+fn build_finished_var(verify_data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + verify_data.len());
+    out.push(hs_type::FINISHED);
+    with_len_u24(&mut out, |b| b.extend_from_slice(verify_data));
+    out
+}
+
 fn build_finished(verify_data: &[u8; 12]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + 12);
     out.push(hs_type::FINISHED);

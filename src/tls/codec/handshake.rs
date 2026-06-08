@@ -250,7 +250,7 @@ impl ServerHello {
     pub(crate) fn decode_relaxed(body: &[u8]) -> Result<(Self, u16), Error> {
         let mut c = ReadCursor::new(body);
         let version = c.u16()?;
-        if !(0x0301..=0x0303).contains(&version) {
+        if !(0x0300..=0x0303).contains(&version) {
             return Err(Error::Decode);
         }
         let random = read_random(&mut c)?;
