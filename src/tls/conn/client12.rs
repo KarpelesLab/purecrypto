@@ -940,6 +940,18 @@ impl ClientConnection12 {
         // (the extension is advisory and the only sane way to honour it is
         // server-side); a follow-up commit can wire that.
         const CAP: usize = 1 << 14;
+        // BEAST (TLS 1.0 CBC) mitigation: split the leading byte into its own
+        // record so the predictable IV an attacker could exploit only ever
+        // covers one chosen byte (the 1/n-1 record split). Applies only to the
+        // opt-in TLS 1.0 path; TLS 1.1+ uses a fresh explicit IV per record.
+        #[cfg(feature = "tls-legacy")]
+        if self.negotiated_version == ProtocolVersion::TLSv1_0 && data.len() > 1 {
+            self.emit_encrypted(ContentType::ApplicationData, &data[..1])?;
+            for chunk in data[1..].chunks(CAP) {
+                self.emit_encrypted(ContentType::ApplicationData, chunk)?;
+            }
+            return Ok(());
+        }
         if data.len() <= CAP {
             self.emit_encrypted(ContentType::ApplicationData, data)?;
         } else {
