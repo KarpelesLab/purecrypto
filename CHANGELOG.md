@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.6](https://github.com/KarpelesLab/purecrypto/compare/v0.6.5...v0.6.6) - 2026-06-08
+
+### Other
+
+- fix TLS 1.0/1.1 interop bugs found against OpenSSL
+
 ## [0.6.5](https://github.com/KarpelesLab/purecrypto/compare/v0.6.4...v0.6.5) - 2026-06-08
 
 ### Other
