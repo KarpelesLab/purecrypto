@@ -37,10 +37,14 @@ use super::client::{ClientCertConfig, ClientKey};
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
+#[cfg(feature = "tls-legacy")]
+use crate::hash::{Digest, Md5, Sha1};
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
+#[cfg(feature = "tls-legacy")]
+use crate::tls::codec::handshake12::RsaClientKeyExchange;
 use crate::tls::codec::handshake12::{
     CertificateRequest12, ClientKeyExchange, NewSessionTicket12, ServerHelloDone,
     ServerKeyExchange, signed_message,
@@ -51,9 +55,15 @@ use crate::tls::codec::{
 };
 use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
+#[cfg(feature = "tls-legacy")]
+use crate::tls::crypto::cbc_rec::{
+    LEGACY_CBC_SUITES, LegacyCbcSuite, LegacyKx, build_legacy_crypters, lookup_legacy_cbc,
+};
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
+#[cfg(feature = "tls-legacy")]
+use crate::tls::crypto::prf::{finished_verify_data_legacy, master_secret_legacy};
 use crate::tls::crypto::record_prot::RecordProtection;
 use crate::tls::crypto::{AeadAlg, Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
@@ -130,6 +140,17 @@ pub(crate) struct ClientConfig12 {
     /// cross-protocol attacks. Set to `false` only to interoperate with
     /// servers that predate RFC 7627.
     pub require_ems: bool,
+    /// Lowest protocol version this client will negotiate. Defaults to
+    /// TLS 1.2. Lowered to TLS 1.0/1.1 via [`Self::with_min_version`] to opt
+    /// into the deprecated legacy suites (off by default; see the module docs).
+    #[cfg(feature = "tls-legacy")]
+    pub min_version: ProtocolVersion,
+    /// Highest protocol version this client offers (capped at TLS 1.2 by this
+    /// engine). Drives the ClientHello `legacy_version` and whether the modern
+    /// AEAD suites are offered alongside the legacy CBC ones. Defaults to
+    /// TLS 1.2.
+    #[cfg(feature = "tls-legacy")]
+    pub max_version: ProtocolVersion,
 }
 
 impl ClientConfig12 {
@@ -150,7 +171,29 @@ impl ClientConfig12 {
             crls: CrlStore::new(),
             key_log: None,
             require_ems: true,
+            #[cfg(feature = "tls-legacy")]
+            min_version: ProtocolVersion::TLSv1_2,
+            #[cfg(feature = "tls-legacy")]
+            max_version: ProtocolVersion::TLSv1_2,
         }
+    }
+
+    /// Lowers the minimum negotiable version to opt into the deprecated
+    /// TLS 1.0/1.1 legacy CBC suites (RFC 8996 — weak; interop only). With the
+    /// default `TLSv1_2` the client offers only the modern AEAD suites.
+    #[cfg(feature = "tls-legacy")]
+    pub fn with_min_version(mut self, v: ProtocolVersion) -> Self {
+        self.min_version = v;
+        self
+    }
+
+    /// Caps the highest version offered (at most TLS 1.2). Set below TLS 1.2
+    /// together with [`Self::with_min_version`] to offer *only* the legacy
+    /// suites — e.g. to talk to a device that rejects a TLS 1.2 ClientHello.
+    #[cfg(feature = "tls-legacy")]
+    pub fn with_max_version(mut self, v: ProtocolVersion) -> Self {
+        self.max_version = v;
+        self
     }
 
     /// RFC 7627 §5.3 — require the server to negotiate Extended Master
@@ -463,6 +506,15 @@ pub struct ClientConnection12 {
     negotiated_version: ProtocolVersion,
     /// Negotiated suite parameters (set on SH).
     suite: Option<SuiteParams12>,
+    /// Negotiated legacy CBC suite (set on SH when the server picked TLS
+    /// 1.0/1.1). Mutually exclusive with `suite`.
+    #[cfg(feature = "tls-legacy")]
+    legacy_suite: Option<LegacyCbcSuite>,
+    /// CSPRNG retained for the legacy static-RSA premaster (the TLS 1.2 client
+    /// is otherwise stateless w.r.t. the construction RNG). Seeded once at
+    /// construction.
+    #[cfg(feature = "tls-legacy")]
+    legacy_rng: crate::rng::HmacDrbg<crate::hash::Sha256>,
     /// Peer certificate chain (leaf first), populated from `Certificate`.
     cert_chain: Vec<Vec<u8>>,
     /// Peer leaf public key, extracted from the leaf cert (verified or raw).
@@ -532,11 +584,27 @@ impl ClientConnection12 {
     /// `rng` supplies the ephemeral key shares and the client random. Offers
     /// all six AEAD-ECDHE suites and both supported groups.
     pub fn new<R: RngCore>(config: ClientConfig12, server_name: &str, rng: &mut R) -> Self {
+        // Modern AEAD suites are offered when the client tops out at TLS 1.2
+        // (always, unless `tls-legacy` lowered the max); the deprecated CBC
+        // suites are appended when the floor was lowered below 1.2.
+        #[cfg(feature = "tls-legacy")]
+        let suites: Vec<CipherSuite> = {
+            let mut v = Vec::new();
+            if config.max_version.as_u16() >= ProtocolVersion::TLSv1_2.as_u16() {
+                v.extend(SUITES_12.iter().map(|p| p.suite));
+            }
+            if config.min_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
+                v.extend(LEGACY_CBC_SUITES.iter().map(|p| p.suite));
+            }
+            v
+        };
+        #[cfg(not(feature = "tls-legacy"))]
+        let suites: Vec<CipherSuite> = SUITES_12.iter().map(|p| p.suite).collect();
         Self::new_with_offer(
             config,
             server_name,
             rng,
-            &SUITES_12.iter().map(|p| p.suite).collect::<Vec<_>>(),
+            &suites,
             &[
                 NamedGroup::X25519,
                 NamedGroup::SECP256R1,
@@ -564,8 +632,24 @@ impl ClientConnection12 {
         let offered_suites: Vec<CipherSuite> = suites
             .iter()
             .copied()
-            .filter(|s| lookup_suite_12(*s).is_some())
+            .filter(|s| {
+                #[cfg(feature = "tls-legacy")]
+                {
+                    lookup_suite_12(*s).is_some() || lookup_legacy_cbc(*s).is_some()
+                }
+                #[cfg(not(feature = "tls-legacy"))]
+                {
+                    lookup_suite_12(*s).is_some()
+                }
+            })
             .collect();
+
+        #[cfg(feature = "tls-legacy")]
+        let legacy_rng = {
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            crate::rng::HmacDrbg::<crate::hash::Sha256>::new(&seed, b"tls12-legacy-client", &[])
+        };
 
         let mut conn = ClientConnection12 {
             config,
@@ -587,6 +671,10 @@ impl ClientConnection12 {
             offered_groups: groups.to_vec(),
             negotiated_version: ProtocolVersion::TLSv1_2,
             suite: None,
+            #[cfg(feature = "tls-legacy")]
+            legacy_suite: None,
+            #[cfg(feature = "tls-legacy")]
+            legacy_rng,
             cert_chain: Vec::new(),
             leaf_key: None,
             peer_share: None,
@@ -619,24 +707,28 @@ impl ClientConnection12 {
 
     /// Builds the ClientHello with all the TLS-1.2-required extensions.
     fn build_client_hello(&self, suites: &[CipherSuite], groups: &[NamedGroup]) -> Vec<u8> {
-        let mut extensions = alloc::vec![
-            ext::supported_groups_list(groups),
-            ext::signature_algorithms(),
-            // RFC 4492 §5.1.2: TLS 1.2 ECDHE peers REQUIRE ec_point_formats
-            // even though only "uncompressed" is widely deployed.
-            ext::ec_point_formats(),
-            // RFC 5746 §3.5: present `renegotiation_info` (empty) so a
-            // strict server doesn't reject us for failing to advertise
-            // secure-renegotiation support. We never actually renegotiate.
-            ext::renegotiation_info_empty(),
-            // RFC 7627 §5.1: always offer `extended_master_secret`. A
-            // server that supports it echoes back the empty-body extension
-            // and both sides switch to the session-hash-bound derivation;
-            // a server that doesn't echo it falls back to the legacy
-            // randoms-only derivation. Modern peers (rustls, BoringSSL,
-            // OpenSSL, NSS) require EMS by default.
-            ext::extended_master_secret_empty(),
-        ];
+        // A client that tops out below TLS 1.2 (opt-in legacy) emits a clean
+        // pre-1.2 ClientHello: no `signature_algorithms` (1.2+ only) and no
+        // `extended_master_secret` (we run the legacy non-EMS derivation).
+        #[cfg(feature = "tls-legacy")]
+        let pure_legacy = self.config.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16();
+        #[cfg(not(feature = "tls-legacy"))]
+        let pure_legacy = false;
+
+        let mut extensions: Vec<(crate::tls::codec::ExtensionType, Vec<u8>)> = Vec::new();
+        extensions.push(ext::supported_groups_list(groups));
+        if !pure_legacy {
+            extensions.push(ext::signature_algorithms());
+        }
+        // RFC 4492 §5.1.2: TLS 1.0+ ECDHE peers REQUIRE ec_point_formats.
+        extensions.push(ext::ec_point_formats());
+        // RFC 5746 §3.5: present `renegotiation_info` (empty) so a strict
+        // server doesn't reject us. We never renegotiate.
+        extensions.push(ext::renegotiation_info_empty());
+        // RFC 7627 §5.1: offer `extended_master_secret` on the modern path.
+        if !pure_legacy {
+            extensions.push(ext::extended_master_secret_empty());
+        }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
         // server name (e.g. connecting by IP with certificate verification off).
         if !self.server_name.is_empty() {
@@ -681,10 +773,15 @@ impl ClientConnection12 {
         }
         cipher_suites_wire.extend_from_slice(suites);
 
-        // RFC 5246 §7.4.1.2: TLS 1.2 ClientHello carries `legacy_version =
-        // 0x0303`.
+        // RFC 5246 §7.4.1.2: the ClientHello `legacy_version` is the client's
+        // maximum (0x0303 for TLS 1.2; lowered to 0x0302/0x0301 by an opt-in
+        // legacy-only client so a pre-1.2 server negotiates that version).
+        #[cfg(feature = "tls-legacy")]
+        let legacy_version = self.config.max_version.as_u16().min(0x0303);
+        #[cfg(not(feature = "tls-legacy"))]
+        let legacy_version = 0x0303u16;
         ClientHello {
-            legacy_version: 0x0303,
+            legacy_version,
             random: self.client_random,
             session_id: Vec::new(),
             cipher_suites: cipher_suites_wire,
@@ -696,12 +793,24 @@ impl ClientConnection12 {
     /// The negotiated cipher-suite wire identifier, available once the
     /// `ServerHello` has been processed.
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        #[cfg(feature = "tls-legacy")]
+        if let Some(ls) = self.legacy_suite {
+            return Some(ls.suite.0);
+        }
         self.suite.map(|s| s.suite.0)
     }
 
-    /// Protocol version string, always `"TLSv1.2"` here once a SH has been
-    /// processed.
+    /// Protocol version string (`"TLSv1.2"`, or `"TLSv1.1"`/`"TLSv1.0"` on the
+    /// opt-in legacy path) once a SH has been processed.
     pub fn protocol_version(&self) -> Option<&'static str> {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return Some(match self.negotiated_version {
+                ProtocolVersion::TLSv1_1 => "TLSv1.1",
+                ProtocolVersion::TLSv1_0 => "TLSv1.0",
+                _ => "TLS",
+            });
+        }
         self.suite.map(|_| "TLSv1.2")
     }
 
@@ -1082,15 +1191,25 @@ impl ClientConnection12 {
         if msg_type != hs_type::SERVER_HELLO {
             return Err(Error::UnexpectedMessage);
         }
+        // The legacy build accepts a pre-1.2 `server_version` (0x0301/0x0302)
+        // here; the modern decoder keeps the strict 0x0303 check.
+        #[cfg(feature = "tls-legacy")]
+        let (sh, sh_version) = ServerHello::decode_relaxed(body)?;
+        #[cfg(not(feature = "tls-legacy"))]
         let sh = ServerHello::decode(body)?;
 
-        // The wire encoder of `ServerHello` doesn't expose `legacy_version`
-        // separately, but the codec already reads it as TLS 1.2 (0x0303).
         // What we still need to guard against is the server selecting TLS 1.3
         // via the `supported_versions` extension. If we see that, the server
         // thinks it's doing 1.3 — bail.
         if ext::find(&sh.extensions, ExtensionType::SUPPORTED_VERSIONS).is_some() {
             return Err(Error::UnsupportedVersion);
+        }
+
+        // Opt-in TLS 1.0/1.1: the server signalled a pre-1.2 version in
+        // `server_version`. Take the legacy path (separate from the 1.2 flow).
+        #[cfg(feature = "tls-legacy")]
+        if sh_version < 0x0303 {
+            return self.on_server_hello_legacy(sh, raw, sh_version);
         }
 
         // RFC 8446 §4.1.3: a TLS-1.3-aware server that downgraded to TLS 1.2
@@ -1273,6 +1392,25 @@ impl ClientConnection12 {
                 .map_err(|_| Error::BadCertificate)?
         };
 
+        // Legacy: every supported legacy CBC suite is RSA-authenticated. The
+        // next message is ServerKeyExchange (ECDHE) or ServerHelloDone (static
+        // RSA, no SKE).
+        #[cfg(feature = "tls-legacy")]
+        if let Some(ls) = self.legacy_suite {
+            if !matches!(leaf_key, AnyPublicKey::Rsa(_)) {
+                return Err(Error::HandshakeFailure);
+            }
+            self.cert_chain = chain;
+            self.leaf_key = Some(leaf_key);
+            self.transcript.update(raw);
+            self.state = if ls.kx == LegacyKx::EcdheRsa {
+                State::WaitServerKeyExchange
+            } else {
+                State::WaitServerHelloDone
+            };
+            return Ok(());
+        }
+
         // The leaf's key family must match the suite's signature half.
         let suite = self.suite.expect("suite set in on_server_hello");
         if !key_matches_sig_kind(&leaf_key, suite.sig_kind) {
@@ -1291,6 +1429,145 @@ impl ClientConnection12 {
             State::WaitServerKeyExchange
         };
         Ok(())
+    }
+
+    /// Opt-in TLS 1.0/1.1 ServerHello handler: validate the offered legacy
+    /// suite + negotiated version, pin them, and await the server's
+    /// `Certificate`.
+    #[cfg(feature = "tls-legacy")]
+    fn on_server_hello_legacy(
+        &mut self,
+        sh: crate::tls::codec::ServerHello,
+        raw: &[u8],
+        sh_version: u16,
+    ) -> Result<(), Error> {
+        if sh_version < self.config.min_version.as_u16()
+            || sh_version > self.config.max_version.as_u16().min(0x0303)
+        {
+            return Err(Error::UnsupportedVersion);
+        }
+        if !self.offered_suites.contains(&sh.cipher_suite) {
+            return Err(Error::HandshakeFailure);
+        }
+        let ls = lookup_legacy_cbc(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
+        self.negotiated_version = ProtocolVersion::from_u16(sh_version);
+        self.legacy_suite = Some(ls);
+        // Legacy Finished hashes MD5||SHA1 of the raw transcript; pin a defined
+        // alg anyway so any incidental `current_hash()` cannot panic.
+        self.transcript.set_alg(HashAlg::Sha256);
+        self.transcript.update(raw);
+        self.server_random = Some(sh.random);
+        self.state = State::WaitCertificate;
+        Ok(())
+    }
+
+    /// TLS 1.0/1.1 ECDHE `ServerKeyExchange`: verify the raw PKCS#1 v1.5
+    /// signature over `MD5(params) || SHA1(params)` against the leaf RSA key.
+    #[cfg(feature = "tls-legacy")]
+    fn on_server_key_exchange_legacy(
+        &mut self,
+        msg_type: u8,
+        body: &[u8],
+        raw: &[u8],
+    ) -> Result<(), Error> {
+        if msg_type != hs_type::SERVER_KEY_EXCHANGE {
+            return Err(Error::UnexpectedMessage);
+        }
+        let ske = ServerKeyExchange::decode_legacy(body)?;
+        if !self.offered_groups.contains(&ske.group) {
+            return Err(Error::IllegalParameter);
+        }
+        let cr = self.client_random;
+        let sr = self.server_random.expect("server_random set");
+        let to_verify = signed_message(&cr, &sr, ske.group, &ske.point);
+        let mut t = Vec::with_capacity(36);
+        t.extend_from_slice(Md5::digest(&to_verify).as_ref());
+        t.extend_from_slice(Sha1::digest(&to_verify).as_ref());
+        match self.leaf_key.as_ref().ok_or(Error::InappropriateState)? {
+            AnyPublicKey::Rsa(k) => k
+                .verify_pkcs1v15_prehashed(&t, &ske.signature)
+                .map_err(|_| Error::DecryptError)?,
+            _ => return Err(Error::HandshakeFailure),
+        }
+        self.peer_share = Some((ske.group, ske.point.clone()));
+        self.transcript.update(raw);
+        self.state = State::WaitServerHelloDone;
+        Ok(())
+    }
+
+    /// TLS 1.0/1.1 client final flight: build the premaster (ECDHE shared
+    /// secret or a fresh static-RSA-encrypted premaster), emit
+    /// `ClientKeyExchange` + CCS, derive the legacy keys, and send `Finished`.
+    #[cfg(feature = "tls-legacy")]
+    fn finish_client_legacy(&mut self, ls: LegacyCbcSuite) -> Result<(), Error> {
+        let cr = self.client_random;
+        let sr = self.server_random.expect("server_random set");
+        let premaster: Vec<u8> = match ls.kx {
+            LegacyKx::EcdheRsa => {
+                let (group, peer_point) = self
+                    .peer_share
+                    .as_ref()
+                    .cloned()
+                    .ok_or(Error::InappropriateState)?;
+                let (pm, our_point) = self.ecdhe(group, &peer_point)?;
+                let cke = ClientKeyExchange { point: our_point }.encode();
+                self.transcript.update(&cke);
+                self.write_plain_record(ContentType::Handshake, &cke);
+                pm
+            }
+            LegacyKx::Rsa => {
+                // RFC 5246 §7.4.7.1: premaster = client_version(2) || 46 random.
+                // The version is the client's offered maximum (rollback guard).
+                let cv = self.config.max_version.as_u16().min(0x0303);
+                let mut pm = alloc::vec![0u8; 48];
+                pm[0] = (cv >> 8) as u8;
+                pm[1] = cv as u8;
+                self.legacy_rng.fill_bytes(&mut pm[2..]);
+                let leaf_key = self.leaf_key.clone().ok_or(Error::InappropriateState)?;
+                let ct = match leaf_key {
+                    AnyPublicKey::Rsa(k) => k
+                        .encrypt_pkcs1v15(&pm, &mut self.legacy_rng)
+                        .map_err(|_| Error::HandshakeFailure)?,
+                    _ => return Err(Error::HandshakeFailure),
+                };
+                let cke = RsaClientKeyExchange {
+                    encrypted_premaster: ct,
+                }
+                .encode();
+                self.transcript.update(&cke);
+                self.write_plain_record(ContentType::Handshake, &cke);
+                pm
+            }
+        };
+
+        let master = master_secret_legacy(&premaster, &cr, &sr);
+        if let Some(kl) = self.config.key_log.as_ref() {
+            kl.log("CLIENT_RANDOM", &cr, &master);
+        }
+        let crypters = build_legacy_crypters(ls, self.negotiated_version, &master, &cr, &sr);
+        self.write_plain_record(ContentType::ChangeCipherSpec, &[0x01]);
+        self.client_crypter = Some(crypters.client.into());
+        self.pending_server_crypter = Some(crypters.server.into());
+        self.master = Some(master);
+
+        let seed = self.legacy_transcript_seed();
+        let verify_data = finished_verify_data_legacy(&master, b"client finished", &seed);
+        let finished = build_finished(&verify_data);
+        self.transcript.update(&finished);
+        self.emit_encrypted(ContentType::Handshake, &finished)?;
+        self.state = State::WaitServerFinished;
+        Ok(())
+    }
+
+    /// The 36-byte `MD5(transcript) || SHA1(transcript)` seed for the TLS
+    /// 1.0/1.1 Finished PRF over the current transcript bytes.
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_transcript_seed(&self) -> Vec<u8> {
+        let buf = self.transcript.buffered_bytes();
+        let mut seed = Vec::with_capacity(36);
+        seed.extend_from_slice(Md5::digest(buf).as_ref());
+        seed.extend_from_slice(Sha1::digest(buf).as_ref());
+        seed
     }
 
     /// RFC 6066 §8: a `CertificateStatus` carries the server's stapled OCSP
@@ -1347,6 +1624,10 @@ impl ClientConnection12 {
         body: &[u8],
         raw: &[u8],
     ) -> Result<(), Error> {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return self.on_server_key_exchange_legacy(msg_type, body, raw);
+        }
         if msg_type != hs_type::SERVER_KEY_EXCHANGE {
             return Err(Error::UnexpectedMessage);
         }
@@ -1382,6 +1663,19 @@ impl ClientConnection12 {
     }
 
     fn on_server_hello_done(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // Legacy TLS 1.0/1.1: no CertificateRequest/mTLS on this path; the only
+        // message we accept here is ServerHelloDone, which triggers the client
+        // final flight.
+        #[cfg(feature = "tls-legacy")]
+        if let Some(ls) = self.legacy_suite {
+            if msg_type != hs_type::SERVER_HELLO_DONE {
+                return Err(Error::UnexpectedMessage);
+            }
+            let _ = ServerHelloDone::decode(body)?;
+            self.transcript.update(raw);
+            return self.finish_client_legacy(ls);
+        }
+
         // mTLS: a `CertificateRequest` (RFC 5246 §7.4.4) MAY appear between
         // ServerKeyExchange and ServerHelloDone. Parse for structure, record
         // the request, and stay in `WaitServerHelloDone`.
@@ -1565,6 +1859,28 @@ impl ClientConnection12 {
     }
 
     fn on_server_finished(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // Legacy TLS 1.0/1.1: no NewSessionTicket, no resumption. Verify the
+        // server's `verify_data` over the legacy MD5||SHA1 transcript and
+        // complete the handshake.
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            if msg_type != hs_type::FINISHED {
+                return Err(Error::UnexpectedMessage);
+            }
+            if body.len() != 12 {
+                return Err(Error::Decode);
+            }
+            let master = self.master.expect("master set");
+            let seed = self.legacy_transcript_seed();
+            let expected = finished_verify_data_legacy(&master, b"server finished", &seed);
+            if !bool::from(expected.as_slice().ct_eq(body)) {
+                return Err(Error::HandshakeFailure);
+            }
+            self.transcript.update(raw);
+            self.state = State::Connected;
+            return Ok(());
+        }
+
         // RFC 5077 §3.3: a `NewSessionTicket` may arrive between the client's
         // Finished and the server's CCS. It's a plaintext handshake message,
         // included in the transcript, that the server's Finished signs.

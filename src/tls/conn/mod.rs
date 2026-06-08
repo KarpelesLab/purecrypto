@@ -3867,6 +3867,118 @@ mod tls12_loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong from server");
     }
 
+    /// Drives a full TLS 1.0/1.1 legacy CBC handshake (client capped at
+    /// `version`, server floor at TLS 1.0) and exchanges app data both ways.
+    #[cfg(feature = "tls-legacy")]
+    fn run_legacy(suite: CipherSuite, version: crate::tls::ProtocolVersion) {
+        let (server_config, cert_der) = rsa_server12();
+        let server_config = server_config.with_min_version(crate::tls::ProtocolVersion::TLSv1_0);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-legacy-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-legacy-s", b"nonce", &[]);
+
+        let cfg = ClientConfig12::new(roots)
+            .with_min_version(version)
+            .with_max_version(version);
+        let mut client = ClientConnection12::new_with_offer(
+            cfg,
+            "loopback.example",
+            &mut crng,
+            &[suite],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+
+        assert!(!client.is_handshaking(), "client did not finish");
+        assert!(!server.is_handshaking(), "server did not finish");
+        assert_eq!(client.negotiated_cipher_suite(), Some(suite.0));
+        assert_eq!(server.negotiated_cipher_suite(), Some(suite.0));
+
+        client.send_application_data(b"ping from client").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"ping from client");
+
+        server.send_application_data(b"pong from server").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"pong from server");
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_ecdhe_rsa_aes128_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_ecdhe_rsa_aes256_cbc_sha256() {
+        run_legacy(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_rsa_aes128_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls11_rsa_3des_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_1,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_ecdhe_rsa_aes128_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn tls10_rsa_aes256_cbc_sha() {
+        run_legacy(
+            CipherSuite::TLS_RSA_WITH_AES_256_CBC_SHA,
+            crate::tls::ProtocolVersion::TLSv1_0,
+        );
+    }
+
     #[test]
     fn tls12_ecdhe_rsa_aes128gcm_x25519() {
         run_with(

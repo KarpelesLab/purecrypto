@@ -70,6 +70,12 @@ impl Connection {
         let inner = match config.max_version {
             ProtocolVersion::TLSv1_3 => Engine::ClientTls13(Box::new(build_tls13_client(config)?)),
             ProtocolVersion::TLSv1_2 => Engine::ClientTls12(Box::new(build_tls12_client(config)?)),
+            // The TLS 1.2 engine also drives the opt-in legacy path; a caller
+            // that tops out at TLS 1.0/1.1 still routes through it.
+            #[cfg(feature = "tls-legacy")]
+            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 => {
+                Engine::ClientTls12(Box::new(build_tls12_client(config)?))
+            }
             ProtocolVersion::DTLSv1_3 => {
                 Engine::ClientDtls13(Box::new(build_dtls13_client(config)?))
             }
@@ -94,6 +100,10 @@ impl Connection {
         let inner = match config.max_version {
             ProtocolVersion::TLSv1_3 => Engine::ServerTls13(Box::new(build_tls13_server(config)?)),
             ProtocolVersion::TLSv1_2 => Engine::ServerTls12(Box::new(build_tls12_server(config)?)),
+            #[cfg(feature = "tls-legacy")]
+            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 => {
+                Engine::ServerTls12(Box::new(build_tls12_server(config)?))
+            }
             ProtocolVersion::DTLSv1_3 => {
                 Engine::ServerDtls13(Box::new(build_dtls13_server(config)?))
             }
@@ -465,6 +475,15 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     cc.key_log = cfg.key_log.clone();
+    #[cfg(feature = "tls-legacy")]
+    {
+        cc = cc.with_min_version(cfg.min_version);
+        // The 1.2 engine caps at TLS 1.2; only propagate a lower max so a
+        // legacy-only caller offers `legacy_version` ≤ 1.1 and no AEAD suites.
+        if cfg.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
+            cc = cc.with_max_version(cfg.max_version);
+        }
+    }
     let server_name = client_server_name(cfg)?;
     Ok(super::conn::ClientConnection12::new(
         cc,
@@ -579,6 +598,10 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
         sc = sc.with_verification_time(t);
     }
     sc.key_log = cfg.key_log.clone();
+    #[cfg(feature = "tls-legacy")]
+    {
+        sc = sc.with_min_version(cfg.min_version);
+    }
     Ok(super::conn::ServerConnection12::new(sc, OsRng))
 }
 

@@ -179,6 +179,58 @@ pub(crate) fn split_cbc_key_block(
     }
 }
 
+/// The two directional CBC record crypters for a legacy connection.
+pub(crate) struct LegacyCrypters {
+    /// Protects/parses records the client sends.
+    pub(crate) client: CbcRecordCrypter,
+    /// Protects/parses records the server sends.
+    pub(crate) server: CbcRecordCrypter,
+}
+
+/// Derives the legacy `key_block` and builds both directions' CBC record
+/// crypters. `version` selects the IV regime (TLS 1.1+ explicit per-record IV
+/// vs TLS 1.0 chained). Used by both the client and server legacy handshakes so
+/// the key-block layout is computed in exactly one place.
+///
+/// The TLS 1.1 explicit-IV CSPRNG seeds come from 64 extra bytes of `key_block`
+/// PRF stream past the keys/MACs — secret, unique per connection, and unused by
+/// the spec, so safe to repurpose as private DRBG seeds (they never appear on
+/// the wire). For TLS 1.0 the seeds are unused (the IV is chained).
+pub(crate) fn build_legacy_crypters(
+    ls: LegacyCbcSuite,
+    version: ProtocolVersion,
+    master: &[u8; 48],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> LegacyCrypters {
+    let explicit_iv = version.as_u16() >= ProtocolVersion::TLSv1_1.as_u16();
+    let kb_len = cbc_key_block_len(ls.cipher, ls.mac, explicit_iv);
+    let mut kb = vec![0u8; kb_len + 64];
+    crate::tls::crypto::prf::key_block_legacy(master, server_random, client_random, &mut kb);
+    let km = split_cbc_key_block(&kb[..kb_len], ls.cipher, ls.mac, explicit_iv);
+    let client_iv_seed = &kb[kb_len..kb_len + 32];
+    let server_iv_seed = &kb[kb_len + 32..kb_len + 64];
+    let client = CbcRecordCrypter::new(
+        ls.cipher,
+        &km.client_key,
+        ls.mac,
+        &km.client_mac,
+        explicit_iv,
+        &km.client_iv,
+        client_iv_seed,
+    );
+    let server = CbcRecordCrypter::new(
+        ls.cipher,
+        &km.server_key,
+        ls.mac,
+        &km.server_mac,
+        explicit_iv,
+        &km.server_iv,
+        server_iv_seed,
+    );
+    LegacyCrypters { client, server }
+}
+
 /// CBC block cipher selection for a legacy suite.
 #[derive(Clone, Copy)]
 pub(crate) enum CbcCipherAlg {

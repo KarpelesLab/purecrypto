@@ -222,6 +222,58 @@ impl ServerHello {
     }
 }
 
+#[cfg(feature = "tls-legacy")]
+impl ServerHello {
+    /// Encodes a `ServerHello` carrying an explicit `server_version` instead of
+    /// the hardcoded `0x0303`. TLS 1.0/1.1 signal the negotiated version in
+    /// this field (there is no `supported_versions` extension before TLS 1.3),
+    /// so the opt-in legacy server writes the real negotiated version here.
+    pub(crate) fn encode_versioned(&self, version: u16) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::SERVER_HELLO);
+        with_len_u24(&mut out, |b| {
+            put_u16(b, version);
+            b.extend_from_slice(&self.random);
+            with_len_u8(b, |b| b.extend_from_slice(&self.session_id));
+            put_u16(b, self.cipher_suite.0);
+            put_u8(b, 0); // legacy_compression_method
+            encode_extensions(b, &self.extensions);
+        });
+        out
+    }
+
+    /// Decodes a `ServerHello` whose `server_version` may be a legacy value
+    /// (`0x0301` TLS 1.0 .. `0x0303` TLS 1.2), returning the parsed struct and
+    /// the negotiated version. Used only by the opt-in TLS 1.2 engine's legacy
+    /// path; the modern [`Self::decode`] keeps the strict `0x0303` check that
+    /// protects the TLS 1.3 downgrade logic.
+    pub(crate) fn decode_relaxed(body: &[u8]) -> Result<(Self, u16), Error> {
+        let mut c = ReadCursor::new(body);
+        let version = c.u16()?;
+        if !(0x0301..=0x0303).contains(&version) {
+            return Err(Error::Decode);
+        }
+        let random = read_random(&mut c)?;
+        let session_id = c.vec_u8()?.to_vec();
+        let cipher_suite = CipherSuite(c.u16()?);
+        let compression = c.u8()?;
+        if compression != 0 {
+            return Err(Error::Decode);
+        }
+        let extensions = parse_extensions(c.vec_u16()?)?;
+        c.expect_empty()?;
+        Ok((
+            ServerHello {
+                random,
+                session_id,
+                cipher_suite,
+                extensions,
+            },
+            version,
+        ))
+    }
+}
+
 /// A `KeyUpdate` handshake message (RFC 8446 §4.6.3). The single body byte is
 /// `0` (update_not_requested) or `1` (update_requested); any other value MUST
 /// be rejected with `illegal_parameter`.
