@@ -614,7 +614,6 @@ impl ClientConnection12 {
     /// Builds the ClientHello with all the TLS-1.2-required extensions.
     fn build_client_hello(&self, suites: &[CipherSuite], groups: &[NamedGroup]) -> Vec<u8> {
         let mut extensions = alloc::vec![
-            ext::server_name(&self.server_name),
             ext::supported_groups_list(groups),
             ext::signature_algorithms(),
             // RFC 4492 §5.1.2: TLS 1.2 ECDHE peers REQUIRE ec_point_formats
@@ -632,6 +631,11 @@ impl ClientConnection12 {
             // OpenSSL, NSS) require EMS by default.
             ext::extended_master_secret_empty(),
         ];
+        // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
+        // server name (e.g. connecting by IP with certificate verification off).
+        if !self.server_name.is_empty() {
+            extensions.insert(0, ext::server_name(&self.server_name));
+        }
         if !self.config.alpn_protocols.is_empty() {
             let protos: Vec<&[u8]> = self
                 .config

@@ -384,6 +384,20 @@ fn cipher_suite_name(id: u16) -> &'static str {
 
 // ---- Engine builders --------------------------------------------------------
 
+/// The client's intended server name, used for SNI and (when enabled) hostname
+/// verification. A name is **required only when `verify_certificates` is on** —
+/// without it there is nothing to check the peer certificate against, so a
+/// missing name is a misconfiguration. With verification off (e.g. connecting to
+/// a device by IP), the name is optional; an empty string means "no SNI, no
+/// hostname check", which the engines honour by omitting the SNI extension.
+fn client_server_name(cfg: &Config) -> Result<&str, Error> {
+    match cfg.server_name.as_deref() {
+        Some(name) => Ok(name),
+        None if !cfg.verify_certificates => Ok(""),
+        None => Err(Error::MissingServerName),
+    }
+}
+
 fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Error> {
     let mut cc = super::conn::ClientConfig::new(cfg.roots.clone_store());
     cc.verify_certificates = cfg.verify_certificates;
@@ -420,7 +434,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
     {
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
-    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
+    let server_name = client_server_name(cfg)?;
     Ok(super::conn::ClientConnection::new(
         cc,
         server_name,
@@ -451,7 +465,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     cc.key_log = cfg.key_log.clone();
-    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
+    let server_name = client_server_name(cfg)?;
     Ok(super::conn::ClientConnection12::new(
         cc,
         server_name,
@@ -569,7 +583,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
 }
 
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
-    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
+    let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig12Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
         dc = dc.without_certificate_verification();
@@ -590,7 +604,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
 }
 
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
-    let server_name = cfg.server_name.as_deref().ok_or(Error::MissingServerName)?;
+    let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig13Internal::new(cfg.roots.clone_store(), server_name);
     if !cfg.verify_certificates {
         dc = dc.without_certificate_verification();
@@ -770,35 +784,44 @@ mod tests {
         assert!(Connection::server(&cfg).is_ok());
     }
 
-    /// A client `Config` with no `server_name` must be rejected at
-    /// [`Connection::client`] construction across every TLS/DTLS engine
-    /// path (audit F1). The previous behaviour silently substituted
-    /// `"localhost"` both into SNI and into the hostname-verification
-    /// reference identifier, which is a footgun: any local cert that
-    /// happened to list `localhost` as a SAN would satisfy verification
-    /// for an unintended peer, and forgotten-SNI callers got an opaque
-    /// `BadCertificate` downstream instead of an actionable config-time
-    /// error.
+    /// `server_name` is required only when certificate verification is on.
+    ///
+    /// When verifying (audit F1), a missing name must be rejected at
+    /// construction rather than silently substituted — the old `"localhost"`
+    /// substitution was a footgun, since any local cert listing `localhost` as a
+    /// SAN would then satisfy verification for an unintended peer. But with
+    /// verification *off* there is nothing to verify against, so a name is
+    /// optional (e.g. connecting to a device by IP); the engines simply omit the
+    /// SNI extension. This holds across every TLS/DTLS engine path.
     #[test]
-    fn client_refuses_construction_without_server_name() {
+    fn client_server_name_required_only_when_verifying() {
         for v in [
             ProtocolVersion::TLSv1_3,
             ProtocolVersion::TLSv1_2,
             ProtocolVersion::DTLSv1_3,
             ProtocolVersion::DTLSv1_2,
         ] {
+            // verify on (default) + no server_name → rejected at construction.
+            let cfg = Config::builder().versions(v, v).build();
+            assert!(cfg.verify_certificates && cfg.server_name.is_none());
+            match Connection::client(&cfg) {
+                Err(Error::MissingServerName) => {}
+                Err(e) => panic!("{v:?}: expected MissingServerName, got {e:?}"),
+                Ok(_) => panic!("{v:?}: verifying client must require server_name"),
+            }
+
+            // verify off + no server_name → allowed (no SNI, no hostname check).
             let cfg = Config::builder()
                 .versions(v, v)
                 .verify_certificates(false)
                 .build();
             assert!(cfg.server_name.is_none());
-            match Connection::client(&cfg) {
-                Err(Error::MissingServerName) => {}
-                Err(e) => panic!("{v:?}: expected MissingServerName, got {e:?}"),
-                Ok(_) => panic!("{v:?}: client must refuse construction without server_name"),
-            }
+            assert!(
+                Connection::client(&cfg).is_ok(),
+                "{v:?}: verify-off client must not require server_name"
+            );
 
-            // With an explicit server_name, construction succeeds.
+            // With an explicit server_name, construction succeeds either way.
             let cfg = Config::builder()
                 .versions(v, v)
                 .verify_certificates(false)

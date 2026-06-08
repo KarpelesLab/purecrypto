@@ -1261,12 +1261,16 @@ impl ClientConnection {
             }
         }
         let mut extensions = alloc::vec![
-            ext::server_name(&server_name),
             ext::supported_groups_list(groups),
             ext::signature_algorithms(),
             ext::client_supported_versions(),
             ext::client_key_shares(&key_shares),
         ];
+        // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
+        // server name (e.g. connecting by IP with certificate verification off).
+        if !server_name.is_empty() {
+            extensions.insert(0, ext::server_name(&server_name));
+        }
         if !self.config.alpn_protocols.is_empty() {
             let protos: alloc::vec::Vec<&[u8]> = self
                 .config

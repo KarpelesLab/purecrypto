@@ -122,7 +122,13 @@ impl ClientConfig13Internal {
     pub fn new(roots: RootCertStore, server_name: &str) -> Self {
         Self {
             roots,
-            server_name: Some(String::from(server_name)),
+            // An empty name (verification off, connecting by IP) means "no SNI,
+            // no hostname check" — store `None` so the optional handling applies.
+            server_name: if server_name.is_empty() {
+                None
+            } else {
+                Some(String::from(server_name))
+            },
             alpn_protocols: Vec::new(),
             signature_policy: Arc::new(SignaturePolicy::modern()),
             max_record_size: DEFAULT_MAX_RECORD_SIZE,

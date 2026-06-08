@@ -901,8 +901,7 @@ impl DtlsClientConnection12 {
         let suites: Vec<CipherSuite> = self.config.cipher_suites.clone();
         let groups: Vec<NamedGroup> = self.config.groups.clone();
 
-        let extensions = alloc::vec![
-            ext::server_name(&self.config.server_name),
+        let mut extensions = alloc::vec![
             ext::supported_groups_list(&groups),
             ext::signature_algorithms(),
             ext::ec_point_formats(),
@@ -910,6 +909,11 @@ impl DtlsClientConnection12 {
             // Always offer; the server echoes only when it also supports EMS.
             ext::extended_master_secret_empty(),
         ];
+        // RFC 6066 §3: omit SNI when there is no server name (e.g. connecting by
+        // IP with certificate verification off).
+        if !self.config.server_name.is_empty() {
+            extensions.insert(0, ext::server_name(&self.config.server_name));
+        }
 
         // Encode the DTLS ClientHello body. Wire layout (RFC 6347 §4.2.1):
         //   ProtocolVersion legacy_version  (0xfefd for DTLS 1.2)
