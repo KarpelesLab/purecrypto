@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.7](https://github.com/KarpelesLab/purecrypto/compare/v0.6.6...v0.6.7) - 2026-06-08
+
+### Other
+
+- secp256k1 group arithmetic — compressed lift_x, point add, x-only tweak
+- ECDSA sign_prehash / verify_prehash (sign an external digest)
+- bump actions/cache v4 -> v5 (Node 24; clears deprecation warning)
+- SSL 3.0 OpenSSL interop fixes + CI workflow
+
 ## [0.6.6](https://github.com/KarpelesLab/purecrypto/compare/v0.6.5...v0.6.6) - 2026-06-08
 
 ### Other
