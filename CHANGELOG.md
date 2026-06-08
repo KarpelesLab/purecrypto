@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4](https://github.com/KarpelesLab/purecrypto/compare/v0.6.3...v0.6.4) - 2026-06-08
+
+### Other
+
+- generic PKCS#8 loader AnyPrivateKey (self-describing key type)
+- client cipher-suite selection via Config::cipher_suites ([#23](https://github.com/KarpelesLab/purecrypto/pull/23))
+- Certificate::spki_der() exposes the raw SubjectPublicKeyInfo ([#25](https://github.com/KarpelesLab/purecrypto/pull/25))
+- PKCS#8 (incl. encrypted) loaders for BoxedEcdsaPrivateKey ([#24](https://github.com/KarpelesLab/purecrypto/pull/24))
+- Lucky13 block-count equaliser for the CBC decrypt MAC
+- document the tls-legacy feature (SSLv3/TLS1.0/1.1 interop)
+- SSL 3.0 crypto profile + handshake (POODLE-caveated)
+- BEAST 1/n-1 record split on the TLS 1.0 send path
+- stop tracking .claude/ session state (committed in error)
+- wire the TLS 1.0/1.1 handshake (client + server)
+- static-RSA ClientKeyExchange codec
+- version-branched ServerKeyExchange codec (no SigAndHashAlg)
+- RecordProtection dispatch enum + negotiated_version threading
+- CBC record crypter owns its explicit-IV CSPRNG
+- legacy CBC cipher suites + key_block layout (phase 3)
+- CBC MAC-then-encrypt record layer (phase 2 of legacy SSLv3/TLS1.0/1.1)
+- require client server_name only when verifying certificates
+- legacy PRF + raw PKCS#1v1.5 RSA sign (phase 1 of SSLv3/TLS1.0/1.1 interop)
+- aarch64 SHA-256 (sha2) and SHA-512 (sha512) hardware
+- aarch64 PMULL GHASH
+- batch standalone CTR and GCM-SIV keystreams via encrypt_blocks
+- hardware backend for the bare AES round (AEGIS/AEZ)
+- add AEZ v5 (robust authenticated-encryption by enciphering)
+- fix ARMv8 AES decryption (equivalent inverse cipher keys)
+- size the public-exponent modexp to e, not the modulus (verify ~108x)
+- hardware SHA-256 via x86_64 SHA-NI
+- hardware-accelerated AES-GCM (AES-NI + ARMv8-AES + PCLMULQDQ GHASH)
+
 ## [0.6.3](https://github.com/KarpelesLab/purecrypto/compare/v0.6.2...v0.6.3) - 2026-06-06
 
 ### Other
