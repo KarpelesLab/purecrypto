@@ -304,6 +304,59 @@ pub(crate) fn verify_pkcs1v15<D: Pkcs1Digest, K: RawPublic + PublicModulus>(
     }
 }
 
+/// EMSA-PKCS1-v1_5 over an already-formed `T` block (`DigestInfo`, or a bare
+/// pre-hash with no `DigestInfo` as TLS 1.0/1.1 use): `0x00 || 0x01 || PS(0xff…)
+/// || 0x00 || t`. Legacy-TLS only.
+#[cfg(feature = "tls-legacy")]
+fn encode_pkcs1v15_prehashed(t: &[u8], k: usize) -> Result<Vec<u8>, Error> {
+    if t.len() + 11 > k {
+        return Err(Error::MessageTooLong);
+    }
+    let ps_len = k - t.len() - 3;
+    let mut em = vec![0u8; k];
+    em[1] = 0x01;
+    for b in &mut em[2..2 + ps_len] {
+        *b = 0xff;
+    }
+    let t_start = 2 + ps_len + 1;
+    em[t_start..].copy_from_slice(t);
+    Ok(em)
+}
+
+/// PKCS#1 v1.5 signature over a pre-computed hash `t` with **no `DigestInfo`
+/// wrapping** — the TLS 1.0/1.1 (and SSLv3) handshake-signature convention,
+/// where RSA signs the bare `MD5(16) || SHA1(20)` (or SHA-1 alone). Legacy only.
+#[cfg(feature = "tls-legacy")]
+pub(crate) fn sign_pkcs1v15_raw<K: RawPrivate>(key: &K, t: &[u8]) -> Result<Vec<u8>, Error> {
+    let em = encode_pkcs1v15_prehashed(t, key.key_size())?;
+    Ok(key.raw_private(&em))
+}
+
+/// Verifies a [`sign_pkcs1v15_raw`] signature over the pre-computed hash `t`.
+#[cfg(feature = "tls-legacy")]
+pub(crate) fn verify_pkcs1v15_raw<K: RawPublic + PublicModulus>(
+    key: &K,
+    t: &[u8],
+    sig: &[u8],
+) -> Result<(), Error> {
+    let k = key.key_size();
+    if sig.len() != k {
+        return Err(Error::InvalidLength);
+    }
+    // RSAVP1 step 1: reject unless 0 <= s < n (same malleability guard as the
+    // DigestInfo path above).
+    if !ct_lt_be(sig, &key.modulus_be_bytes()) {
+        return Err(Error::Verification);
+    }
+    let em = key.raw_public(sig);
+    let expected = encode_pkcs1v15_prehashed(t, k)?;
+    if bool::from(em.as_slice().ct_eq(expected.as_slice())) {
+        Ok(())
+    } else {
+        Err(Error::Verification)
+    }
+}
+
 /// EMSA-PKCS1-v1_5: `0x00 || 0x01 || PS(0xff…) || 0x00 || DigestInfo`.
 fn encode_pkcs1v15<D: Pkcs1Digest>(msg: &[u8], k: usize) -> Result<Vec<u8>, Error> {
     let digest = D::digest(msg);

@@ -249,6 +249,13 @@ impl BoxedRsaPublicKey {
         emsa::verify_pkcs1v15::<D, _>(self, msg, sig)
     }
 
+    /// Verifies a [`sign_pkcs1v15_prehashed`](BoxedRsaPrivateKey::sign_pkcs1v15_prehashed)
+    /// signature over a pre-computed hash (no `DigestInfo`). Legacy interop only.
+    #[cfg(feature = "tls-legacy")]
+    pub fn verify_pkcs1v15_prehashed(&self, t: &[u8], sig: &[u8]) -> Result<(), Error> {
+        emsa::verify_pkcs1v15_raw(self, t, sig)
+    }
+
     /// Verifies an RSA-PSS signature over `msg`, hashing with `D`.
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
         emsa::verify_pss::<D, _>(self, msg, sig)
@@ -373,6 +380,14 @@ impl BoxedRsaPrivateKey {
     /// Signs `msg` with PKCS#1 v1.5, hashing with `D`.
     pub fn sign_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
         emsa::sign_pkcs1v15::<D, _>(self, msg)
+    }
+
+    /// PKCS#1 v1.5 signature over a pre-computed hash with **no `DigestInfo`**
+    /// wrapping — the TLS 1.0/1.1 / SSLv3 handshake convention (RSA signs the
+    /// bare `MD5(16) || SHA1(20)`). Legacy interop only.
+    #[cfg(feature = "tls-legacy")]
+    pub fn sign_pkcs1v15_prehashed(&self, t: &[u8]) -> Result<Vec<u8>, Error> {
+        emsa::sign_pkcs1v15_raw(self, t)
     }
 
     /// Signs `msg` with RSA-PSS, hashing with `D`.
@@ -925,6 +940,38 @@ mod tests {
         key.public_key()
             .verify_pkcs1v15::<Sha256>(b"sign me", &sig)
             .unwrap();
+    }
+
+    /// Raw (no-DigestInfo) PKCS#1 v1.5 round-trip over a 36-byte MD5||SHA1-shaped
+    /// pre-hash — the TLS 1.0/1.1 handshake-signature convention.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn boxed_prehashed_sign_verify_roundtrip() {
+        let key = rsa_test_key_a();
+        let mut nb = [0u8; 256];
+        key.modulus().write_be_bytes(&mut nb);
+        let mut eb = [0u8; 256];
+        key.exponent().write_be_bytes(&mut eb);
+        let mut db = [0u8; 256];
+        key.private_exponent().write_be_bytes(&mut db);
+        let sk = BoxedRsaPrivateKey::from_components(
+            BoxedUint::from_be_bytes(&nb),
+            BoxedUint::from_be_bytes(&eb),
+            BoxedUint::from_be_bytes(&db),
+        );
+        let pk = sk.public_key();
+
+        let mut t = [0u8; 36]; // MD5(16) || SHA1(20)
+        for (i, b) in t.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let sig = sk.sign_pkcs1v15_prehashed(&t).unwrap();
+        pk.verify_pkcs1v15_prehashed(&t, &sig).unwrap();
+
+        // A flipped hash byte must fail.
+        let mut bad = t;
+        bad[0] ^= 1;
+        assert!(pk.verify_pkcs1v15_prehashed(&bad, &sig).is_err());
     }
 
     // ---- SPKI / PKCS#8 round-trip and reject tests ----

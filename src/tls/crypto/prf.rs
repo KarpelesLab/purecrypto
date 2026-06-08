@@ -219,6 +219,85 @@ pub(crate) fn finished_verify_data(
     out
 }
 
+/// TLS 1.0 / 1.1 PRF (RFC 2246 §5 / RFC 4346 §5).
+///
+/// ```text
+/// PRF(secret, label, seed) = P_MD5 (S1, label || seed)
+///                          XOR P_SHA1(S2, label || seed)
+/// ```
+///
+/// where the secret is split into two halves `S1 || S2`, each `ceil(len/2)`
+/// bytes (so they overlap by one byte when the length is odd). MD5 and SHA-1
+/// are both cryptographically broken; this exists only for legacy interop and
+/// is gated behind `tls-legacy`.
+#[cfg(feature = "tls-legacy")]
+#[allow(dead_code)] // wired up in the legacy handshake (Phase 4)
+pub(crate) fn prf_legacy(secret: &[u8], label: &[u8], seed: &[u8], out: &mut [u8]) {
+    use crate::hash::{Md5, Sha1};
+    let half = secret.len().div_ceil(2);
+    let s1 = &secret[..half];
+    let s2 = &secret[secret.len() - half..];
+
+    let mut combined = alloc::vec::Vec::with_capacity(label.len() + seed.len());
+    combined.extend_from_slice(label);
+    combined.extend_from_slice(seed);
+
+    // P_SHA1 into `out`, P_MD5 into a scratch buffer, then XOR them together.
+    let mut md5 = alloc::vec![0u8; out.len()];
+    p_hash_impl::<Md5>(s1, &combined, &mut md5);
+    p_hash_impl::<Sha1>(s2, &combined, out);
+    for (o, m) in out.iter_mut().zip(md5.iter()) {
+        *o ^= *m;
+    }
+}
+
+/// TLS 1.0/1.1 `master_secret` (RFC 2246 §8.1) using the legacy PRF.
+#[cfg(feature = "tls-legacy")]
+#[allow(dead_code)] // wired up in the legacy handshake (Phase 4)
+pub(crate) fn master_secret_legacy(
+    premaster: &[u8],
+    client_random: &[u8; 32],
+    server_random: &[u8; 32],
+) -> [u8; 48] {
+    let mut seed = [0u8; 64];
+    seed[..32].copy_from_slice(client_random);
+    seed[32..].copy_from_slice(server_random);
+    let mut out = [0u8; 48];
+    prf_legacy(premaster, b"master secret", &seed, &mut out);
+    out
+}
+
+/// TLS 1.0/1.1 `key_block` (RFC 2246 §6.3) using the legacy PRF. Seed order is
+/// `server_random || client_random`.
+#[cfg(feature = "tls-legacy")]
+#[allow(dead_code)] // wired up in the legacy handshake (Phase 4)
+pub(crate) fn key_block_legacy(
+    master: &[u8; 48],
+    server_random: &[u8; 32],
+    client_random: &[u8; 32],
+    out: &mut [u8],
+) {
+    let mut seed = [0u8; 64];
+    seed[..32].copy_from_slice(server_random);
+    seed[32..].copy_from_slice(client_random);
+    prf_legacy(master, b"key expansion", &seed, out);
+}
+
+/// TLS 1.0/1.1 Finished `verify_data` (RFC 2246 §7.4.9): 12 bytes of
+/// `PRF(master, label, MD5(transcript) || SHA1(transcript))`. The caller passes
+/// the 36-byte `MD5 || SHA1` transcript hash as `md5_sha1_seed`.
+#[cfg(feature = "tls-legacy")]
+#[allow(dead_code)] // wired up in the legacy handshake (Phase 4)
+pub(crate) fn finished_verify_data_legacy(
+    master: &[u8; 48],
+    label: &[u8],
+    md5_sha1_seed: &[u8],
+) -> [u8; 12] {
+    let mut out = [0u8; 12];
+    prf_legacy(master, label, md5_sha1_seed, &mut out);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -478,6 +557,60 @@ mod tests {
         let mut short_sha384 = [0u8; 16];
         p_hash(HashAlg::Sha384, secret, seed, &mut short_sha384);
         assert_ne!(short, short_sha384);
+    }
+
+    /// TLS 1.0/1.1 PRF (`P_MD5 ⊕ P_SHA1`) against an independent Python
+    /// `hmac`+`hashlib` reference. The 13-byte (odd-length) secret exercises the
+    /// one-byte overlap of the two secret halves.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn prf_legacy_known_answer() {
+        let secret = [
+            1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, // odd length → halves overlap
+        ];
+        let seed = [0xaau8; 16];
+        let mut out = [0u8; 32];
+        prf_legacy(&secret, b"test label", &seed, &mut out);
+        let expected = [
+            0x17, 0x6c, 0x29, 0x12, 0x66, 0xfb, 0x5e, 0xba, 0x61, 0xf1, 0x3f, 0xfb, 0xd7, 0x07,
+            0xeb, 0x0d, 0xdd, 0x55, 0xe9, 0xb9, 0x9e, 0xcd, 0xd5, 0x3b, 0x6d, 0x51, 0x5d, 0xe6,
+            0xd4, 0x69, 0x34, 0xd7,
+        ];
+        assert_eq!(out, expected);
+
+        // master_secret_legacy against the same reference.
+        let ms = master_secret_legacy(&[0x42u8; 48], &[0x11u8; 32], &[0x22u8; 32]);
+        let ms_expected = [
+            0x32, 0x62, 0xd9, 0x1d, 0x8c, 0xc8, 0x75, 0xa4, 0x9b, 0x09, 0x20, 0x26, 0xc1, 0x9e,
+            0xe4, 0x7d, 0x09, 0xa5, 0x07, 0xa5, 0xcf, 0x5d, 0xc5, 0x02, 0x09, 0x64, 0x64, 0x12,
+            0x48, 0x48, 0xf7, 0xf3, 0x22, 0xa2, 0x9e, 0x26, 0x56, 0xaa, 0x91, 0xd4, 0xa2, 0x70,
+            0x8f, 0xee, 0x8e, 0xf3, 0x7b, 0x8b,
+        ];
+        assert_eq!(ms, ms_expected);
+    }
+
+    /// Legacy PRF structural properties: deterministic, prefix-extension, and
+    /// the secret split actually uses both halves.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn prf_legacy_structure() {
+        let secret = [0x9bu8; 20];
+        let seed = [0x33u8; 24];
+        let mut a = [0u8; 48];
+        let mut b = [0u8; 48];
+        prf_legacy(&secret, b"key expansion", &seed, &mut a);
+        prf_legacy(&secret, b"key expansion", &seed, &mut b);
+        assert_eq!(a, b, "deterministic");
+        let mut long = [0u8; 96];
+        prf_legacy(&secret, b"key expansion", &seed, &mut long);
+        assert_eq!(&long[..48], &a[..], "prefix-extension");
+        // Flipping a byte in the *second* half of the secret changes the output
+        // (proves P_SHA1 over S2 contributes).
+        let mut s2 = secret;
+        s2[19] ^= 1;
+        let mut c = [0u8; 48];
+        prf_legacy(&s2, b"key expansion", &seed, &mut c);
+        assert_ne!(a, c);
     }
 
     /// Cross-check: `prf(secret, label, seed)` is `p_hash(secret, label||seed)`.
