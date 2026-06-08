@@ -148,20 +148,64 @@ fn generate_k<D: Digest>(
 }
 
 impl BoxedEcdsaPublicKey {
-    /// Parses an uncompressed SEC1 point (`0x04 || X || Y`) on `curve`,
-    /// rejecting coordinates out of range or off the curve.
+    /// Parses a SEC1 point on `curve`, accepting both the uncompressed form
+    /// (`0x04 || X || Y`, `1 + 2·field_len` bytes) and the **compressed** form
+    /// (`0x02`/`0x03 || X`, `1 + field_len` bytes), where the tag's low bit is
+    /// the parity of `Y`. Compressed decoding recovers `Y` via the field square
+    /// root (a "lift_x" of the abscissa); a bare 32-byte BIP340 x-only key is
+    /// the compressed even-`Y` point `0x02 || X`.
+    ///
+    /// Rejects a bad length/tag, an out-of-range coordinate, an off-curve point,
+    /// or an abscissa with no square root.
     pub fn from_sec1(curve: CurveId, bytes: &[u8]) -> Result<Self, Error> {
         let flen = curve.field_len();
-        if bytes.len() != 1 + 2 * flen || bytes[0] != 0x04 {
-            return Err(Error::Malformed);
-        }
-        let x = BoxedUint::from_be_bytes(&bytes[1..1 + flen]);
-        let y = BoxedUint::from_be_bytes(&bytes[1 + flen..]);
         let c = curve.curve();
-        if !c.in_field(&x) || !c.in_field(&y) || !c.is_on_curve(&x, &y) {
+        match bytes.first().copied() {
+            Some(tag @ (0x02 | 0x03)) => {
+                if bytes.len() != 1 + flen {
+                    return Err(Error::Malformed);
+                }
+                let x = BoxedUint::from_be_bytes(&bytes[1..]);
+                let (x, y) = c.decompress(&x, tag & 1 == 1).ok_or(Error::InvalidInput)?;
+                Ok(BoxedEcdsaPublicKey { curve, x, y })
+            }
+            Some(0x04) => {
+                if bytes.len() != 1 + 2 * flen {
+                    return Err(Error::Malformed);
+                }
+                let x = BoxedUint::from_be_bytes(&bytes[1..1 + flen]);
+                let y = BoxedUint::from_be_bytes(&bytes[1 + flen..]);
+                if !c.in_field(&x) || !c.in_field(&y) || !c.is_on_curve(&x, &y) {
+                    return Err(Error::InvalidInput);
+                }
+                Ok(BoxedEcdsaPublicKey { curve, x, y })
+            }
+            _ => Err(Error::Malformed),
+        }
+    }
+
+    /// Adds two public keys as curve points: `Q = self + other`, returning the
+    /// public key for `Q`. Both keys must be on the same curve.
+    ///
+    /// Returns [`Error::InvalidInput`] if the curves differ or the sum is the
+    /// point at infinity (`self == -other`) — the identity has no public-key
+    /// encoding. Useful for key tweaking / aggregation (e.g. BIP341 Taproot:
+    /// `Q = lift_x(internal) + t·G`).
+    pub fn add(&self, other: &Self) -> Result<Self, Error> {
+        if self.curve != other.curve {
             return Err(Error::InvalidInput);
         }
-        Ok(BoxedEcdsaPublicKey { curve, x, y })
+        let c = self.curve.curve();
+        let sum = c.point_add(
+            &c.lift_affine(&self.x, &self.y),
+            &c.lift_affine(&other.x, &other.y),
+        );
+        let (x, y) = c.to_affine(&sum).ok_or(Error::InvalidInput)?;
+        Ok(BoxedEcdsaPublicKey {
+            curve: self.curve,
+            x,
+            y,
+        })
     }
 
     /// Encodes the key as an uncompressed SEC1 point (`0x04 || X || Y`).
@@ -785,6 +829,69 @@ mod tests {
             // Same key: public points match.
             assert_eq!(parsed.public_key().to_sec1(), sk.public_key().to_sec1());
         }
+    }
+
+    // Compressed (0x02/0x03 || X) SEC1 parsing recovers the same point as the
+    // uncompressed form, across every supported curve — i.e. a correct lift_x.
+    #[test]
+    fn from_sec1_compressed_roundtrip() {
+        for curve in [
+            CurveId::P256,
+            CurveId::P384,
+            CurveId::P521,
+            CurveId::Secp256k1,
+        ] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"compressed", b"n", &[]);
+            let flen = curve.field_len();
+            for _ in 0..4 {
+                let pk = BoxedEcdsaPrivateKey::generate(curve, &mut rng).public_key();
+                let uncompressed = pk.to_sec1(); // 0x04 || X || Y
+                let x = &uncompressed[1..1 + flen];
+                let y_odd = uncompressed[1 + 2 * flen - 1] & 1;
+                let mut compressed = alloc::vec![0x02 | y_odd];
+                compressed.extend_from_slice(x);
+                let parsed = BoxedEcdsaPublicKey::from_sec1(curve, &compressed).unwrap();
+                assert_eq!(parsed.to_sec1(), uncompressed);
+            }
+        }
+        // A bad tag / length is rejected.
+        assert!(BoxedEcdsaPublicKey::from_sec1(CurveId::Secp256k1, &[0x05; 33]).is_err());
+        assert!(BoxedEcdsaPublicKey::from_sec1(CurveId::Secp256k1, &[0x02; 10]).is_err());
+    }
+
+    // Point addition agrees with the group law: a·G + b·G == (a+b)·G, and the
+    // sum of a point and its negation (the identity) is rejected.
+    #[test]
+    fn public_key_point_add() {
+        let curve = CurveId::Secp256k1;
+        let g = |k: u64| {
+            let mut b = [0u8; 32];
+            b[24..].copy_from_slice(&k.to_be_bytes());
+            BoxedEcdsaPrivateKey::from_bytes(curve, &b)
+                .unwrap()
+                .public_key()
+        };
+        assert_eq!(g(3).add(&g(5)).unwrap().to_sec1(), g(8).to_sec1());
+        assert_eq!(g(100).add(&g(1)).unwrap().to_sec1(), g(101).to_sec1());
+
+        // a·G + (n − a)·G = identity (point at infinity) => error.
+        let n = curve.curve().order().clone();
+        let a = BoxedUint::from_u64(7);
+        let neg = n.sub(&a);
+        let neg_g = BoxedEcdsaPrivateKey::from_bytes(curve, &neg.to_be_bytes(32))
+            .unwrap()
+            .public_key();
+        assert!(g(7).add(&neg_g).is_err());
+
+        // Mismatched curves are rejected.
+        let p256g = {
+            let mut b = [0u8; 32];
+            b[31] = 2;
+            BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &b)
+                .unwrap()
+                .public_key()
+        };
+        assert!(g(2).add(&p256g).is_err());
     }
 
     #[cfg(feature = "der")]

@@ -120,6 +120,35 @@ impl Curve {
         Some((x, y))
     }
 
+    /// Recovers the affine point `(x, y)` with the requested Y parity from a
+    /// compressed x-coordinate, or `None` if `x` is not on the curve.
+    ///
+    /// Every supported curve has `p ≡ 3 (mod 4)`, so the square root is
+    /// `y = (x³ + a·x + b)^((p+1)/4)`; the result is verified (`y² == rhs`,
+    /// which also rejects an `x` that is not a valid abscissa) and the root of
+    /// the requested parity is returned (`p − y` flips it). The x-coordinate of
+    /// a public key is not secret, so a variable-time exponentiation is fine.
+    pub(crate) fn decompress(&self, x: &BoxedUint, y_odd: bool) -> Option<(BoxedUint, BoxedUint)> {
+        if !self.in_field(x) {
+            return None;
+        }
+        // rhs = x³ + a·x + b   (plain residues mod p)
+        let x2 = self.fp.mul_mod(x, x);
+        let x3 = self.fp.mul_mod(&x2, x);
+        let ax = self.fp.mul_mod(&self.a_plain, x);
+        let rhs = self.fp.add_mod(&self.fp.add_mod(&x3, &ax), &self.b_plain);
+        // p = (p − 2) + 2;  exp = (p + 1) / 4.
+        let p = self.p_minus_2.add(&BoxedUint::from_u64(2));
+        let exp = p.add(&BoxedUint::from_u64(1)).shr_bits(2);
+        let y = self.fp.pow(&rhs, &exp);
+        // Reject non-residues / off-curve abscissae.
+        if self.fp.mul_mod(&y, &y) != rhs {
+            return None;
+        }
+        let y = if y.is_odd() == y_odd { y } else { p.sub(&y) };
+        Some((x.clone(), y))
+    }
+
     /// Complete projective addition (Renes–Costello–Batina, Algorithm 1).
     /// Correct for all inputs and any `a`.
     pub(crate) fn point_add(&self, p: &Point, q: &Point) -> Point {

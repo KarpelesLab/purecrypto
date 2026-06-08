@@ -284,3 +284,29 @@ fn large_scalar_known_pubkey() {
     // Sanity: Q is not the identity and lies on the curve (from_sec1 validates).
     assert!(!bool::from(q.to_projective().is_identity()));
 }
+
+// BIP341 x-only tweak: Q = lift_x(P) + TapTweak(P)*G. Vector from the BIP341
+// "Specification" key-path test vectors (internalPubkey/tweak/tweakedPubkey).
+#[test]
+fn xonly_tweak_add_bip341_vector() {
+    use crate::hash::{Digest, Sha256};
+
+    let internal = fe_bytes("d6889cb081036e0faefa3a35157ad71086b123b2b144b649798b494c300a961d");
+    let expected = fe_bytes("53a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343");
+
+    // TapTweak(internal) = SHA256(SHA256(tag) || SHA256(tag) || internal).
+    let th = Sha256::digest(b"TapTweak");
+    let mut h = Sha256::new();
+    h.update(&th);
+    h.update(&th);
+    h.update(&internal);
+    let tweak: [u8; 32] = h.finalize();
+    // Cross-check against the published tweak value.
+    assert_eq!(
+        tweak,
+        fe_bytes("b86e7be8f39bab32a6f2c0443abbc210f0edac0e2c53d501b36b64437d9c6c70"),
+    );
+
+    let (x, _parity) = xonly_tweak_add(&internal, &tweak).unwrap();
+    assert_eq!(x, expected);
+}

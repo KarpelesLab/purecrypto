@@ -388,5 +388,35 @@ impl AffinePoint {
     }
 }
 
+/// BIP341 x-only public-key tweak — the analogue of libsecp256k1's
+/// `secp256k1_xonly_pubkey_tweak_add`.
+///
+/// Lifts the 32-byte x-only `internal` key to its even-`Y` point `P`
+/// (BIP340 `lift_x`), computes `Q = P + tweak·G`, and returns Q's 32-byte
+/// x-only coordinate together with the parity (oddness) of its `Y`. The caller
+/// computes `tweak` itself (e.g. `t = TapTweak(internal ‖ merkle_root)`).
+///
+/// # Errors
+/// [`Error::InvalidInput`] if `internal` is not a valid curve x-coordinate,
+/// `tweak` is not a valid scalar (`≥ n`), or `Q` is the point at infinity
+/// (`tweak·G == −P`, cryptographically unreachable).
+pub fn xonly_tweak_add(internal: &[u8; 32], tweak: &[u8; 32]) -> Result<([u8; 32], bool), Error> {
+    // lift_x: the even-Y point with abscissa `internal` (compressed 0x02‖X).
+    let mut compressed = [0u8; 33];
+    compressed[0] = 0x02;
+    compressed[1..].copy_from_slice(internal);
+    let p = AffinePoint::from_sec1(&compressed)?;
+
+    let t = Scalar::from_bytes_be(tweak)?;
+    let q = p
+        .to_projective()
+        .add(&ProjectivePoint::mul_generator(&t))
+        .to_affine()
+        .ok_or(Error::InvalidInput)?;
+
+    let parity = q.y_bytes()[31] & 1 == 1;
+    Ok((q.x_bytes(), parity))
+}
+
 #[cfg(test)]
 mod tests;
