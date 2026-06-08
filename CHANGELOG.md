@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5](https://github.com/KarpelesLab/purecrypto/compare/v0.6.4...v0.6.5) - 2026-06-08
+
+### Other
+
+- client-certificate mutual auth on the TLS 1.0/1.1 path
+
 ## [0.6.4](https://github.com/KarpelesLab/purecrypto/compare/v0.6.3...v0.6.4) - 2026-06-08
 
 ### Other
