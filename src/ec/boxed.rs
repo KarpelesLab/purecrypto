@@ -181,14 +181,21 @@ impl BoxedEcdsaPublicKey {
 
     /// Verifies `sig` over `msg`, hashing with `D`.
     pub fn verify<D: Digest>(&self, msg: &[u8], sig: &BoxedEcdsaSignature) -> Result<(), Error> {
+        self.verify_prehash(D::digest(msg).as_ref(), sig)
+    }
+
+    /// Verifies `sig` over an already-computed message digest `prehash`. Unlike
+    /// signing, verification takes no hash type parameter — it only reduces
+    /// `prehash` to the curve order's bit length. See
+    /// [`BoxedEcdsaPrivateKey::sign_prehash`].
+    pub fn verify_prehash(&self, prehash: &[u8], sig: &BoxedEcdsaSignature) -> Result<(), Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
         let fq = BoxedMontModulus::new(&n);
         if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
             return Err(Error::Verification);
         }
-        let hash = D::digest(msg);
-        let z = bits2int(hash.as_ref(), n.bit_len()).reduce(&n);
+        let z = bits2int(prehash, n.bit_len()).reduce(&n);
         let w = inv_mod(&fq, &sig.s, &n);
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
@@ -248,14 +255,34 @@ impl BoxedEcdsaPrivateKey {
 
     /// Signs `msg`, hashing with `D` and deriving the nonce per RFC 6979.
     pub fn sign<D: Digest>(&self, msg: &[u8]) -> Result<BoxedEcdsaSignature, Error> {
+        self.sign_prehash::<D>(D::digest(msg).as_ref())
+    }
+
+    /// Signs an already-computed message digest (e.g. a SHA-256 over a TLS
+    /// transcript, an X.509 TBS, or a JWS signing input), deriving the nonce
+    /// per RFC 6979.
+    ///
+    /// `D` is the hash used for the RFC 6979 nonce derivation — pass the same
+    /// hash that produced `prehash` so the deterministic nonce (and thus the
+    /// signature) matches [`sign::<D>`](Self::sign) and the RFC 6979 vectors.
+    /// `prehash` is reduced to the curve order's bit length internally, so a
+    /// digest wider than the order (e.g. SHA-512 on P-256) is truncated per
+    /// SEC1 / FIPS 186-5.
+    ///
+    /// # Security
+    /// The caller owns the guarantee that `prehash` is a cryptographically
+    /// strong digest of the intended, protocol-bound message. Signing
+    /// attacker-influenced bytes that are not such a digest can enable forgery
+    /// at the application layer. Prefer [`sign`](Self::sign) whenever the full
+    /// message is available.
+    pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<BoxedEcdsaSignature, Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
         let fq = BoxedMontModulus::new(&n);
         let order_len = self.curve.order_len();
 
-        let hash = D::digest(msg);
-        let z = bits2int(hash.as_ref(), n.bit_len()).reduce(&n);
-        let k = generate_k::<D>(&self.d, hash.as_ref(), &n, order_len, n.bit_len());
+        let z = bits2int(prehash, n.bit_len()).reduce(&n);
+        let k = generate_k::<D>(&self.d, prehash, &n, order_len, n.bit_len());
 
         let r = c
             .to_affine(&c.mul_generator(&k))
@@ -630,6 +657,47 @@ mod tests {
             from_hex("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8")
         );
         sk.public_key().verify::<Sha256>(b"sample", &sig).unwrap();
+    }
+
+    // Prehash signing matches the message-hashing path (and thus the RFC 6979
+    // vector): sign_prehash::<D>(D::digest(m)) == sign::<D>(m), and the result
+    // verifies both ways. Covers P-256/384/521 and a SHA-512 prehash on P-256
+    // (digest wider than the order, truncated per FIPS 186-5).
+    #[test]
+    fn sign_prehash_matches_message_signing() {
+        use crate::hash::Digest;
+        let mut rng = HmacDrbg::<Sha256>::new(b"prehash-ec", b"n", &[]);
+        for curve in [CurveId::P256, CurveId::P384, CurveId::P521] {
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let msg = b"prehash equivalence";
+            let from_msg = sk.sign::<Sha256>(msg).unwrap();
+            let from_hash = sk
+                .sign_prehash::<Sha256>(Sha256::digest(msg).as_ref())
+                .unwrap();
+            assert_eq!(from_msg.r_bytes(curve), from_hash.r_bytes(curve));
+            assert_eq!(from_msg.s_bytes(curve), from_hash.s_bytes(curve));
+            // verify_prehash accepts a signature made over the message, and the
+            // message-hashing verify accepts a signature made over the prehash.
+            let pk = sk.public_key();
+            pk.verify_prehash(Sha256::digest(msg).as_ref(), &from_msg)
+                .unwrap();
+            pk.verify::<Sha256>(msg, &from_hash).unwrap();
+            // A different prehash must not verify.
+            assert!(
+                pk.verify_prehash(Sha256::digest(b"other").as_ref(), &from_msg)
+                    .is_err()
+            );
+        }
+        // RFC 6979 A.2.5 exact vector via the prehash entry point.
+        let d = from_hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+        let sk = BoxedEcdsaPrivateKey::from_bytes(CurveId::P256, &d).unwrap();
+        let sig = sk
+            .sign_prehash::<Sha256>(Sha256::digest(b"sample").as_ref())
+            .unwrap();
+        assert_eq!(
+            sig.r.to_be_bytes(32),
+            from_hex("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716")
+        );
     }
 
     // RFC 6979 A.2.6 — P-384, SHA-384, message "sample".

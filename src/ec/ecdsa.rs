@@ -81,13 +81,25 @@ impl EcdsaPrivateKey {
     /// Signs `msg`, hashing with `D` (use SHA-256 for the standard P-256
     /// profile). The nonce is derived deterministically per RFC 6979.
     pub fn sign<D: Digest>(&self, msg: &[u8]) -> Result<Signature, Error> {
+        self.sign_prehash::<D>(D::digest(msg).as_ref())
+    }
+
+    /// Signs an already-computed message digest `prehash`, deriving the nonce
+    /// per RFC 6979. `D` is the hash used for the nonce derivation — pass the
+    /// same hash that produced `prehash` so the result matches
+    /// [`sign::<D>`](Self::sign) and the RFC 6979 vectors. `prehash` is
+    /// truncated to the curve order's bit length (FIPS 186-5).
+    ///
+    /// # Security
+    /// The caller must ensure `prehash` is a strong, protocol-bound digest;
+    /// prefer [`sign`](Self::sign) when the message is available.
+    pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<Signature, Error> {
         let curve = P256::new();
         let n = P256::order();
         let fq = MontModulus::new(n);
 
-        let hash = D::digest(msg);
-        let z = bits2int(hash.as_ref()).reduce(&n);
-        let k = generate_k::<D>(&self.d, hash.as_ref(), &n);
+        let z = bits2int(prehash).reduce(&n);
+        let k = generate_k::<D>(&self.d, prehash, &n);
 
         // r = (k*G).x mod n
         let r = curve
@@ -164,6 +176,13 @@ impl EcdsaPublicKey {
 
     /// Verifies `sig` over `msg`, hashing with `D`.
     pub fn verify<D: Digest>(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        self.verify_prehash(D::digest(msg).as_ref(), sig)
+    }
+
+    /// Verifies `sig` over an already-computed message digest `prehash` (no
+    /// hash type parameter — verification only truncates `prehash`). See
+    /// [`EcdsaPrivateKey::sign_prehash`].
+    pub fn verify_prehash(&self, prehash: &[u8], sig: &Signature) -> Result<(), Error> {
         let curve = P256::new();
         let n = P256::order();
         let fq = MontModulus::new(n);
@@ -172,8 +191,7 @@ impl EcdsaPublicKey {
             return Err(Error::Verification);
         }
 
-        let hash = D::digest(msg);
-        let z = bits2int(hash.as_ref()).reduce(&n);
+        let z = bits2int(prehash).reduce(&n);
         // Public-side inversion: `sig.s` is in [1, n-1] (checked above), so
         // Fermat works and is consistent with the constant-time discipline
         // used elsewhere (no leakage matters here, since `sig.s` is public).
@@ -405,6 +423,31 @@ mod tests {
         assert_eq!(
             sig.s,
             fe_from_hex("f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8")
+        );
+    }
+
+    #[test]
+    fn sign_prehash_matches_message() {
+        use crate::hash::Digest;
+        // sign_prehash::<Sha256>(SHA256("sample")) reproduces the RFC 6979
+        // vector and equals sign::<Sha256>("sample"); verify_prehash agrees.
+        let sk = priv_key();
+        let by_msg = sk.sign::<Sha256>(b"sample").unwrap();
+        let by_hash = sk
+            .sign_prehash::<Sha256>(Sha256::digest(b"sample").as_ref())
+            .unwrap();
+        assert_eq!(by_msg.r, by_hash.r);
+        assert_eq!(by_msg.s, by_hash.s);
+        assert_eq!(
+            by_hash.r,
+            fe_from_hex("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716")
+        );
+        let pk = sk.public_key();
+        pk.verify_prehash(Sha256::digest(b"sample").as_ref(), &by_msg)
+            .unwrap();
+        assert!(
+            pk.verify_prehash(Sha256::digest(b"other").as_ref(), &by_msg)
+                .is_err()
         );
     }
 
