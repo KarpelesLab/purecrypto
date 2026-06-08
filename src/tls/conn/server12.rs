@@ -531,6 +531,17 @@ impl<R: RngCore> ServerConnection12<R> {
         self.suite.map(|_| "TLSv1.2")
     }
 
+    /// The negotiated record-layer protocol version once it is fixed (after the
+    /// ClientHello is processed). `None` while still awaiting it. Always
+    /// `TLSv1_2` on the modern path; the real legacy version otherwise.
+    pub(crate) fn negotiated_protocol_version(&self) -> Option<ProtocolVersion> {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return Some(self.negotiated_version);
+        }
+        self.suite.map(|_| self.negotiated_version)
+    }
+
     /// The ALPN protocol the server selected, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
@@ -1182,6 +1193,17 @@ impl<R: RngCore> ServerConnection12<R> {
             self.peer_server_name = ext::parse_server_name(sni_body)?;
         }
 
+        // RFC 5746: the client signals secure renegotiation support either via
+        // the `renegotiation_info` extension or the `TLS_EMPTY_RENEGOTIATION_-
+        // INFO_SCSV` pseudo-suite (0x00FF). When signalled we MUST echo
+        // `renegotiation_info` in our ServerHello — strict clients (OpenSSL)
+        // abort with `handshake_failure` otherwise.
+        self.peer_offered_reneg_info = ext::find(&ch.extensions, ExtensionType::RENEGOTIATION_INFO)
+            .is_some()
+            || ch
+                .cipher_suites
+                .contains(&crate::tls::codec::CipherSuite(0x00ff));
+
         // ECDHE suites need a mutually supported group + uncompressed point
         // format; static-RSA needs neither.
         let group = if ls.kx == LegacyKx::EcdheRsa {
@@ -1266,6 +1288,11 @@ impl<R: RngCore> ServerConnection12<R> {
     fn send_server_hello_legacy(&mut self, ls: LegacyCbcSuite) -> Result<(), Error> {
         let sr = self.server_random.expect("server_random set");
         let mut extensions: Vec<(ExtensionType, Vec<u8>)> = Vec::new();
+        // RFC 5746 §3.6: echo `renegotiation_info` (empty) when the client
+        // signalled secure renegotiation (via the extension or the SCSV).
+        if self.peer_offered_reneg_info {
+            extensions.push(ext::renegotiation_info_empty());
+        }
         if ls.kx == LegacyKx::EcdheRsa {
             extensions.push(ext::ec_point_formats());
         }

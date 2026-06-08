@@ -823,6 +823,17 @@ impl ClientConnection12 {
         self.suite.map(|_| "TLSv1.2")
     }
 
+    /// The negotiated record-layer protocol version once it is fixed (after the
+    /// ServerHello is processed). `None` while still in the initial state.
+    /// Always `TLSv1_2` on the modern path; the real legacy version otherwise.
+    pub(crate) fn negotiated_protocol_version(&self) -> Option<ProtocolVersion> {
+        #[cfg(feature = "tls-legacy")]
+        if self.legacy_suite.is_some() {
+            return Some(self.negotiated_version);
+        }
+        self.suite.map(|_| self.negotiated_version)
+    }
+
     /// The peer's certificate chain in wire order (DER), leaf first.
     pub fn peer_certificates(&self) -> &[Vec<u8>] {
         &self.cert_chain
@@ -1977,6 +1988,18 @@ impl ClientConnection12 {
         // complete the handshake.
         #[cfg(feature = "tls-legacy")]
         if self.legacy_suite.is_some() {
+            // RFC 5077: a server that accepted our `session_ticket` offer sends
+            // a `NewSessionTicket` (plaintext, transcript-included) just before
+            // its CCS+Finished. Consume it and keep waiting for the Finished.
+            if msg_type == hs_type::NEW_SESSION_TICKET {
+                let nst = NewSessionTicket12::decode(body)?;
+                if !nst.ticket.is_empty() {
+                    self.received_ticket = Some(nst.ticket);
+                    self.received_ticket_lifetime = nst.lifetime;
+                }
+                self.transcript.update(raw);
+                return Ok(());
+            }
             if msg_type != hs_type::FINISHED {
                 return Err(Error::UnexpectedMessage);
             }

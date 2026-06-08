@@ -250,12 +250,15 @@ impl Connection {
     /// The negotiated wire version, if the handshake has progressed enough
     /// to determine it.
     pub fn negotiated_version(&self) -> Option<ProtocolVersion> {
-        Some(match &self.inner {
-            Engine::ClientTls13(_) | Engine::ServerTls13(_) => ProtocolVersion::TLSv1_3,
-            Engine::ClientTls12(_) | Engine::ServerTls12(_) => ProtocolVersion::TLSv1_2,
-            Engine::ClientDtls12(_) | Engine::ServerDtls12(_) => ProtocolVersion::DTLSv1_2,
-            Engine::ClientDtls13(_) | Engine::ServerDtls13(_) => ProtocolVersion::DTLSv1_3,
-        })
+        match &self.inner {
+            Engine::ClientTls13(_) | Engine::ServerTls13(_) => Some(ProtocolVersion::TLSv1_3),
+            // The TLS 1.2 engine also drives the opt-in legacy versions, so it
+            // reports its own negotiated version (TLS 1.0/1.1 when lowered).
+            Engine::ClientTls12(c) => c.negotiated_protocol_version(),
+            Engine::ServerTls12(c) => c.negotiated_protocol_version(),
+            Engine::ClientDtls12(_) | Engine::ServerDtls12(_) => Some(ProtocolVersion::DTLSv1_2),
+            Engine::ClientDtls13(_) | Engine::ServerDtls13(_) => Some(ProtocolVersion::DTLSv1_3),
+        }
     }
 
     /// IANA cipher-suite identifier of the negotiated suite. `None`
@@ -388,6 +391,17 @@ fn cipher_suite_name(id: u16) -> &'static str {
         0xC030 => "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
         0xCCA8 => "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
         0xCCA9 => "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+        // Opt-in legacy CBC suites (tls-legacy).
+        0x000A => "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+        0x002F => "TLS_RSA_WITH_AES_128_CBC_SHA",
+        0x0035 => "TLS_RSA_WITH_AES_256_CBC_SHA",
+        0x003C => "TLS_RSA_WITH_AES_128_CBC_SHA256",
+        0x003D => "TLS_RSA_WITH_AES_256_CBC_SHA256",
+        0xC012 => "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+        0xC013 => "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+        0xC014 => "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+        0xC027 => "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+        0xC028 => "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA256",
         _ => "UNKNOWN",
     }
 }
