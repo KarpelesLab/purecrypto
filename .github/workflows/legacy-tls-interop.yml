@@ -1,0 +1,75 @@
+name: Legacy TLS interop
+
+# Interop-tests the opt-in `tls-legacy` stack (SSL 3.0 / TLS 1.0 / TLS 1.1)
+# against OpenSSL — the de-facto reference — in BOTH roles, over real TCP
+# sockets, exchanging application data. Loopback (purecrypto<->purecrypto) can't
+# catch a symmetric bug, so this is the gate that actually validates wire
+# compatibility.
+#
+# The system OpenSSL 3.x on the runner removed SSL 3.0 and disables TLS 1.0/1.1,
+# so the job builds OpenSSL 1.1.1w with `enable-ssl3` once (cached) and points
+# the `tls_legacy_interop` example at it via OPENSSL_BIN.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Last OpenSSL 1.1.1 release; still ships the SSLv3 method behind enable flags.
+  OPENSSL_VERSION: 1.1.1w
+
+jobs:
+  interop:
+    name: SSLv3 / TLS 1.0 / 1.1 vs OpenSSL
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache legacy OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ~/openssl-legacy
+          key: openssl-${{ env.OPENSSL_VERSION }}-ssl3-v1
+
+      - name: Build legacy OpenSSL (with SSLv3)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          ver="${OPENSSL_VERSION}"
+          # Primary source, with a GitHub-release fallback.
+          curl -fsSLo openssl.tar.gz "https://www.openssl.org/source/openssl-${ver}.tar.gz" \
+            || curl -fsSLo openssl.tar.gz \
+               "https://github.com/openssl/openssl/releases/download/OpenSSL_${ver//./_}/openssl-${ver}.tar.gz"
+          tar xf openssl.tar.gz
+          cd "openssl-${ver}"
+          ./config enable-ssl3 enable-ssl3-method enable-weak-ssl-ciphers \
+            --prefix="$HOME/openssl-legacy" --openssldir="$HOME/openssl-legacy"
+          make -j"$(nproc)"
+          make install_sw
+
+      - name: Verify OpenSSL has SSLv3
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$HOME/openssl-legacy/lib"
+          "$HOME/openssl-legacy/bin/openssl" version
+          "$HOME/openssl-legacy/bin/openssl" s_client -help 2>&1 | grep -- '-ssl3'
+
+      - name: Interop (SSLv3 + TLS 1.0/1.1, both roles, vs OpenSSL)
+        env:
+          LD_LIBRARY_PATH: /home/runner/openssl-legacy/lib
+          OPENSSL_BIN: /home/runner/openssl-legacy/bin/openssl
+        run: cargo run --example tls_legacy_interop --features tls-legacy

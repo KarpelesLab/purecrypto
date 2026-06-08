@@ -1403,7 +1403,10 @@ impl<R: RngCore> ServerConnection12<R> {
                 }
             }
             LegacyKx::Rsa => {
-                let cke = RsaClientKeyExchange::decode(body)?;
+                let cke = RsaClientKeyExchange::decode(
+                    body,
+                    self.negotiated_version == ProtocolVersion::SSLv3,
+                )?;
                 match &self.config.key {
                     // RFC 5246 §7.4.7.1: decrypt to a fixed 48-byte premaster
                     // with Bleichenbacher-safe implicit rejection (a bad

@@ -158,7 +158,14 @@ impl ClientHello {
             cipher_suites.push(CipherSuite(cs.u16()?));
         }
         let _compression = c.vec_u8()?;
-        let extensions = parse_extensions(c.vec_u16()?)?;
+        // SSL 3.0 (and the earliest TLS 1.0 clients) predate the extensions
+        // block: when nothing follows the compression list, there are simply no
+        // extensions. TLS 1.x ClientHellos always carry it.
+        let extensions = if c.is_empty() {
+            Vec::new()
+        } else {
+            parse_extensions(c.vec_u16()?)?
+        };
         c.expect_empty()?;
         Ok(ClientHello {
             legacy_version,
@@ -260,7 +267,12 @@ impl ServerHello {
         if compression != 0 {
             return Err(Error::Decode);
         }
-        let extensions = parse_extensions(c.vec_u16()?)?;
+        // SSL 3.0 ServerHellos may omit the extensions block entirely.
+        let extensions = if c.is_empty() {
+            Vec::new()
+        } else {
+            parse_extensions(c.vec_u16()?)?
+        };
         c.expect_empty()?;
         Ok((
             ServerHello {

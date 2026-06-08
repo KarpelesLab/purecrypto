@@ -200,20 +200,30 @@ pub(crate) struct RsaClientKeyExchange {
 
 #[cfg(feature = "tls-legacy")]
 impl RsaClientKeyExchange {
-    /// Encodes the full handshake message (type + u24 length + u16-length
-    /// ciphertext) for TLS 1.0/1.1/1.2.
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    /// Encodes the full handshake message (type + u24 length + body). TLS
+    /// 1.0/1.1/1.2 prefix the ciphertext with a `u16` length; SSL 3.0 sends it
+    /// bare (`ssl3 = true`), which is what OpenSSL's SSLv3 server expects.
+    pub(crate) fn encode(&self, ssl3: bool) -> Vec<u8> {
         let mut out = Vec::new();
         put_u8(&mut out, hs_type::CLIENT_KEY_EXCHANGE);
         with_len_u24(&mut out, |b| {
-            with_len_u16(b, |c| c.extend_from_slice(&self.encrypted_premaster));
+            if ssl3 {
+                b.extend_from_slice(&self.encrypted_premaster);
+            } else {
+                with_len_u16(b, |c| c.extend_from_slice(&self.encrypted_premaster));
+            }
         });
         out
     }
 
-    /// Decodes a TLS 1.0+ static-RSA `ClientKeyExchange` body (the bytes after
-    /// the 4-byte handshake header): a `u16`-length-prefixed ciphertext.
-    pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+    /// Decodes a static-RSA `ClientKeyExchange` body. TLS 1.0+ carries a `u16`
+    /// length prefix; SSL 3.0 (`ssl3 = true`) is the bare ciphertext.
+    pub(crate) fn decode(body: &[u8], ssl3: bool) -> Result<Self, Error> {
+        if ssl3 {
+            return Ok(RsaClientKeyExchange {
+                encrypted_premaster: body.to_vec(),
+            });
+        }
         let mut c = ReadCursor::new(body);
         let encrypted_premaster = c.vec_u16()?.to_vec();
         c.expect_empty()?;
@@ -433,9 +443,9 @@ mod tests {
         let cke = RsaClientKeyExchange {
             encrypted_premaster: alloc::vec![0x5a; 256], // RSA-2048 ciphertext
         };
-        let bytes = cke.encode();
+        let bytes = cke.encode(false);
         let body = parse_one(&bytes, hs_type::CLIENT_KEY_EXCHANGE);
-        assert_eq!(RsaClientKeyExchange::decode(&body).unwrap(), cke);
+        assert_eq!(RsaClientKeyExchange::decode(&body, false).unwrap(), cke);
         // The u16 length prefix must frame the ciphertext exactly.
         assert_eq!(&body[..2], &[0x01, 0x00]); // 256
     }

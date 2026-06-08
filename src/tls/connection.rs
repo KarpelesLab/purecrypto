@@ -73,7 +73,7 @@ impl Connection {
             // The TLS 1.2 engine also drives the opt-in legacy path; a caller
             // that tops out at TLS 1.0/1.1 still routes through it.
             #[cfg(feature = "tls-legacy")]
-            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 => {
+            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3 => {
                 Engine::ClientTls12(Box::new(build_tls12_client(config)?))
             }
             ProtocolVersion::DTLSv1_3 => {
@@ -101,7 +101,7 @@ impl Connection {
             ProtocolVersion::TLSv1_3 => Engine::ServerTls13(Box::new(build_tls13_server(config)?)),
             ProtocolVersion::TLSv1_2 => Engine::ServerTls12(Box::new(build_tls12_server(config)?)),
             #[cfg(feature = "tls-legacy")]
-            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 => {
+            ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3 => {
                 Engine::ServerTls12(Box::new(build_tls12_server(config)?))
             }
             ProtocolVersion::DTLSv1_3 => {

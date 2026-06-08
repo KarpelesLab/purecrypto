@@ -1576,7 +1576,7 @@ impl ClientConnection12 {
                 let cke = RsaClientKeyExchange {
                     encrypted_premaster: ct,
                 }
-                .encode();
+                .encode(self.negotiated_version == ProtocolVersion::SSLv3);
                 self.transcript.update(&cke);
                 self.write_plain_record(ContentType::Handshake, &cke);
                 pm
