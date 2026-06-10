@@ -509,6 +509,7 @@ pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
             crate::rng::RngCore::fill_bytes(&mut crate::rng::OsRng, &mut secret);
             qcfg.require_retry = true;
             qcfg.retry_secret = Some(secret);
+            super::common::wipe_array(&mut secret);
         }
         let conn = match c.role {
             QuicRole::Client => {
