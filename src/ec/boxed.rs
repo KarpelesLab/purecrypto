@@ -320,6 +320,21 @@ impl BoxedEcdsaPrivateKey {
     /// at the application layer. Prefer [`sign`](Self::sign) whenever the full
     /// message is available.
     pub fn sign_prehash<D: Digest>(&self, prehash: &[u8]) -> Result<BoxedEcdsaSignature, Error> {
+        let (r, s, _, _) = self.sign_prehash_inner::<D>(prehash)?;
+        Ok(BoxedEcdsaSignature { r, s })
+    }
+
+    /// Core RFC 6979 signing returning the raw `(r, s)` plus the two facts a
+    /// caller needs to build a recovery id: whether the ephemeral point's
+    /// x-coordinate exceeded the group order before reduction (`x_overflow`),
+    /// and the parity of its y-coordinate (`y_is_odd`). `s` is **not** low-S
+    /// normalized here — the public [`sign_prehash`](Self::sign_prehash) keeps
+    /// its historical raw form, and [`sign_prehash_recoverable`] does the
+    /// normalization itself.
+    fn sign_prehash_inner<D: Digest>(
+        &self,
+        prehash: &[u8],
+    ) -> Result<(BoxedUint, BoxedUint, bool, bool), Error> {
         let c = self.curve.curve();
         let n = c.order().clone();
         let fq = BoxedMontModulus::new(&n);
@@ -328,21 +343,76 @@ impl BoxedEcdsaPrivateKey {
         let z = bits2int(prehash, n.bit_len()).reduce(&n);
         let k = generate_k::<D>(&self.d, prehash, &n, order_len, n.bit_len());
 
-        let r = c
+        let (full_x, full_y) = c
             .to_affine(&c.mul_generator(&k))
-            .ok_or(Error::InvalidInput)?
-            .0
-            .reduce(&n);
+            .ok_or(Error::InvalidInput)?;
+        let r = full_x.reduce(&n);
         if r.is_zero() {
             return Err(Error::InvalidInput);
         }
+        // x_overflow: the affine x was ≥ n, so r = x − n and recovery must add
+        // n back. y_is_odd: parity of R's y, the other half of the recovery id.
+        let x_overflow = !full_x.lt(&n);
+        let y_is_odd = full_y.is_odd();
+
         let k_inv = inv_mod(&fq, &k, &n);
         let z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
         let s = fq.mul_mod(&k_inv, &z_rd);
         if s.is_zero() {
             return Err(Error::InvalidInput);
         }
-        Ok(BoxedEcdsaSignature { r, s })
+        Ok((r, s, x_overflow, y_is_odd))
+    }
+
+    /// Signs `msg` (hashing with `D`) and also returns the **recovery id**
+    /// (`v`), so the public key can later be reconstructed from the signature
+    /// alone via [`BoxedEcdsaSignature::recover`]. See
+    /// [`sign_prehash_recoverable`](Self::sign_prehash_recoverable) for the
+    /// recovery-id encoding and the low-S guarantee.
+    ///
+    /// This is the building block for Ethereum-style signing, where a signature
+    /// is transmitted as `(r, s, v)` and the signer's address is derived by
+    /// recovering the public key. For Ethereum specifically, map the returned
+    /// `recid ∈ {0,1}` to `v` as `v = 27 + recid` (legacy) or
+    /// `v = 35 + 2·chain_id + recid` (EIP-155).
+    pub fn sign_recoverable<D: Digest>(
+        &self,
+        msg: &[u8],
+    ) -> Result<(BoxedEcdsaSignature, u8), Error> {
+        self.sign_prehash_recoverable::<D>(D::digest(msg).as_ref())
+    }
+
+    /// Signs an already-computed digest `prehash` (deriving the RFC 6979 nonce
+    /// with `D`), returning the signature **and** its recovery id.
+    ///
+    /// The signature is normalized to **low-S** (EIP-2 / BIP-62), so it is
+    /// canonical and accepted by Ethereum and Bitcoin consensus rules. The
+    /// recovery id corresponds to this normalized signature.
+    ///
+    /// `recid` is the libsecp256k1 / Ethereum encoding in `{0, 1, 2, 3}`:
+    /// - bit 0 = parity of the ephemeral point `R`'s y-coordinate, and
+    /// - bit 1 = whether `R.x` exceeded the group order `n` (so `R.x = r + n`).
+    ///
+    /// Bit 1 is set only when `r < p − n`, which is astronomically rare on
+    /// secp256k1 (and never on a curve with `n > p`), so `recid` is almost
+    /// always `0` or `1`. See [`BoxedEcdsaSignature::recover_prehash`] for the
+    /// inverse operation.
+    pub fn sign_prehash_recoverable<D: Digest>(
+        &self,
+        prehash: &[u8],
+    ) -> Result<(BoxedEcdsaSignature, u8), Error> {
+        let (r, s, x_overflow, y_is_odd) = self.sign_prehash_inner::<D>(prehash)?;
+        // Normalize to low-S; negating s reflects R across the x-axis, flipping
+        // its y-parity, so the recovery id's parity bit must flip with it.
+        let n = self.curve.curve().order().clone();
+        let half_n = n.shr_bits(1).add(&BoxedUint::from_u64(1));
+        let (s, y_is_odd) = if s.lt(&half_n) {
+            (s, y_is_odd)
+        } else {
+            (n.sub(&s), !y_is_odd)
+        };
+        let recid = (y_is_odd as u8) | ((x_overflow as u8) << 1);
+        Ok((BoxedEcdsaSignature { r, s }, recid))
     }
 }
 
@@ -411,6 +481,78 @@ impl BoxedEcdsaSignature {
                 s: n.sub(&self.s),
             }
         }
+    }
+
+    /// Recovers the signing public key from this signature over `msg` (hashed
+    /// with `D`) and the recovery id `recid`. See
+    /// [`recover_prehash`](Self::recover_prehash).
+    pub fn recover<D: Digest>(
+        &self,
+        curve: CurveId,
+        msg: &[u8],
+        recid: u8,
+    ) -> Result<BoxedEcdsaPublicKey, Error> {
+        self.recover_prehash(curve, D::digest(msg).as_ref(), recid)
+    }
+
+    /// Recovers the signing public key from this signature over the digest
+    /// `prehash` and the recovery id `recid` — the ECDSA "public key recovery"
+    /// operation (libsecp256k1 `ecdsa_recover`, Ethereum `ecrecover`).
+    ///
+    /// `recid ∈ {0, 1, 2, 3}` is the value produced alongside the signature by
+    /// [`BoxedEcdsaPrivateKey::sign_prehash_recoverable`]: bit 0 is the parity
+    /// of the ephemeral point `R`'s y-coordinate and bit 1 is whether `R.x`
+    /// overflowed the group order. The recovered key is the unique `Q` with
+    /// `Q = r⁻¹·(s·R − z·G)`, where `R = lift_x(r + (recid≫1)·n, recid&1)`.
+    ///
+    /// Returns [`Error::Verification`] if `r`/`s` are out of range, if the
+    /// recovery id does not yield a valid curve point, or if recovery produces
+    /// the identity. Returns [`Error::InvalidInput`] if `recid > 3`.
+    ///
+    /// Recovery does **not** authenticate the message: any `(r, s, recid)`
+    /// yields *some* key. To verify a signer, recover the key and then either
+    /// compare it to the expected key or re-run [`verify_prehash`] — recovery
+    /// alone proves only that the signature is self-consistent.
+    ///
+    /// [`verify_prehash`]: BoxedEcdsaPublicKey::verify_prehash
+    pub fn recover_prehash(
+        &self,
+        curve: CurveId,
+        prehash: &[u8],
+        recid: u8,
+    ) -> Result<BoxedEcdsaPublicKey, Error> {
+        if recid > 3 {
+            return Err(Error::InvalidInput);
+        }
+        let c = curve.curve();
+        let n = c.order().clone();
+        let fq = BoxedMontModulus::new(&n);
+        if !in_range(&self.r, &n) || !in_range(&self.s, &n) {
+            return Err(Error::Verification);
+        }
+
+        // R.x = r + (recid>>1)·n; decompress (lift_x) rejects an x ≥ p or an
+        // abscissa that is not on the curve, so an impossible recid errors out.
+        let rx = if recid & 2 == 0 {
+            self.r.clone()
+        } else {
+            self.r.add(&n)
+        };
+        let (rx, ry) = c
+            .decompress(&rx, recid & 1 == 1)
+            .ok_or(Error::Verification)?;
+        let r_point = c.lift_affine(&rx, &ry);
+
+        // Q = u1·G + u2·R with u1 = −z·r⁻¹, u2 = s·r⁻¹ (mod n). r is public, so
+        // the variable-time Fermat inverse used elsewhere here is fine.
+        let z = bits2int(prehash, n.bit_len()).reduce(&n);
+        let r_inv = inv_mod(&fq, &self.r, &n);
+        let neg_z = fq.sub_mod(&BoxedUint::zero(1), &z);
+        let u1 = fq.mul_mod(&neg_z, &r_inv);
+        let u2 = fq.mul_mod(&self.s, &r_inv);
+        let q = c.point_add(&c.mul_generator(&u1), &c.scalar_mul(&u2, &r_point));
+        let (x, y) = c.to_affine(&q).ok_or(Error::Verification)?;
+        Ok(BoxedEcdsaPublicKey { curve, x, y })
     }
 }
 
@@ -1050,5 +1192,78 @@ x2dqVh/sT12MnE=\n\
         let high = BoxedEcdsaSignature::from_components(low.r().clone(), n.sub(low.s()));
         assert!(!high.is_low_s(curve));
         assert_eq!(high.to_low_s(curve), low);
+    }
+
+    // Public-key recovery against a published go-ethereum vector
+    // (crypto/signature_test.go): Ecrecover(hash, r‖s‖v) == uncompressed key.
+    // Exercises the full secp256k1 ecrecover path end to end.
+    #[test]
+    fn ecrecover_ethereum_vector() {
+        let msg = from_hex("ce0677bb30baa8cf067c88db9811f4333d131bf8bcf12fe7065d211dce971008");
+        let r = from_hex("90f27b8b488db00b00606796d2987f6a5f59ae62ea05effe84fef5b8b0e54998");
+        let s = from_hex("4a691139ad57a3f0b906637673aa2f63d1f55cb1a69199d4009eea23ceaddc93");
+        let recid = 1u8; // the trailing v byte of the test signature
+        let sig = BoxedEcdsaSignature::from_components(
+            BoxedUint::from_be_bytes(&r),
+            BoxedUint::from_be_bytes(&s),
+        );
+        let pk = sig
+            .recover_prehash(CurveId::Secp256k1, &msg, recid)
+            .unwrap();
+        let expected = from_hex(
+            "04e32df42865e97135acfb65f3bae71bdc86f4d49150ad6a440b6f158781098\
+             80a0a2b2667f7e725ceea70c673093bf67663e0312623c8e091b13cf2c0f11ef652",
+        );
+        assert_eq!(pk.to_sec1(), expected);
+        // A wrong recovery id must not yield the same key.
+        let other = sig.recover_prehash(CurveId::Secp256k1, &msg, 0).unwrap();
+        assert_ne!(other.to_sec1(), expected);
+    }
+
+    // sign_recoverable → recover round-trips back to the signer's public key,
+    // and the emitted signature is low-S, on both a curve with n < p
+    // (secp256k1) and one with n > p (P-256).
+    #[test]
+    fn sign_recoverable_round_trips() {
+        for curve in [CurveId::Secp256k1, CurveId::P256, CurveId::P384] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"recoverable", &[curve.field_len() as u8], &[]);
+            for i in 0..8u8 {
+                let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+                let pk = sk.public_key();
+                let msg = [b'm', i];
+                let (sig, recid) = sk.sign_recoverable::<Sha256>(&msg).unwrap();
+                assert!(recid < 4);
+                assert!(sig.is_low_s(curve), "signature must be canonical low-S");
+                // The signature still verifies the usual way.
+                pk.verify::<Sha256>(&msg, &sig).unwrap();
+                // Recovery with the emitted recid reproduces the signer's key.
+                let rec = sig.recover::<Sha256>(curve, &msg, recid).unwrap();
+                assert_eq!(rec.to_sec1(), pk.to_sec1(), "recover != signer ({i})");
+                // The complementary parity recovers a *different* key.
+                let flipped = sig.recover::<Sha256>(curve, &msg, recid ^ 1);
+                if let Ok(other) = flipped {
+                    assert_ne!(other.to_sec1(), pk.to_sec1());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recover_rejects_bad_inputs() {
+        let curve = CurveId::Secp256k1;
+        let mut rng = HmacDrbg::<Sha256>::new(b"recover-neg", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+        let (sig, recid) = sk.sign_recoverable::<Sha256>(b"hello").unwrap();
+        // recid out of range.
+        assert!(matches!(
+            sig.recover::<Sha256>(curve, b"hello", 4),
+            Err(Error::InvalidInput)
+        ));
+        // r = 0 is not a valid signature component.
+        let bad = BoxedEcdsaSignature::from_components(BoxedUint::zero(4), sig.s().clone());
+        assert!(matches!(
+            bad.recover::<Sha256>(curve, b"hello", recid),
+            Err(Error::Verification)
+        ));
     }
 }
