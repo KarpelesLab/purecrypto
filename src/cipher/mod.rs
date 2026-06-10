@@ -1,9 +1,9 @@
 //! Symmetric ciphers.
 //!
-//! Provides the AES block cipher ([`Aes128`], [`Aes192`], [`Aes256`]) with a
-//! constant-time implementation: the S-box is computed by GF(2⁸) inversion
-//! rather than table lookup, so there are no secret-dependent memory accesses
-//! and hence no cache-timing leak.
+//! Provides the AES block cipher ([`Aes128`], [`Aes192`], [`Aes256`]) and
+//! [`Sm4`] with constant-time implementations: the S-boxes are computed by
+//! GF(2⁸) inversion rather than table lookup, so there are no
+//! secret-dependent memory accesses and hence no cache-timing leak.
 //!
 //! Block ciphers expose only the raw block transform via [`BlockCipher`];
 //! modes of operation (CTR, CBC, GCM, …) are layered on top separately.
