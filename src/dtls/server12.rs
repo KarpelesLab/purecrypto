@@ -215,6 +215,17 @@ pub struct DtlsServerConnection12<R: RngCore> {
     ems_negotiated: bool,
 }
 
+// The DTLS 1.2 master secret lives for the whole connection (exporters,
+// Finished verification) — scrub it on drop so it does not linger in freed
+// memory, same as the TLS 1.2 engine.
+impl<R: RngCore> Drop for DtlsServerConnection12<R> {
+    fn drop(&mut self) {
+        if let Some(m) = self.master.as_mut() {
+            crate::tls::conn::wipe(m);
+        }
+    }
+}
+
 impl<R: RngCore> DtlsServerConnection12<R> {
     /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
     /// is the opaque identifier used by the cookie generator.

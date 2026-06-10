@@ -243,6 +243,17 @@ pub struct DtlsClientConnection12 {
     ems_negotiated: bool,
 }
 
+// The DTLS 1.2 master secret lives for the whole connection (exporters,
+// Finished verification) — scrub it on drop so it does not linger in freed
+// memory, same as the TLS 1.2 engine.
+impl Drop for DtlsClientConnection12 {
+    fn drop(&mut self) {
+        if let Some(m) = self.master.as_mut() {
+            crate::tls::conn::wipe(m);
+        }
+    }
+}
+
 impl DtlsClientConnection12 {
     /// Creates a fresh client and emits the first ClientHello (with empty
     /// cookie). The RNG supplies the ephemeral key material and client

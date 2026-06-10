@@ -67,6 +67,15 @@ pub(crate) struct Ticket12Plaintext {
     pub(crate) alpn: Option<Vec<u8>>,
 }
 
+// The decoded ticket payload carries the 48-byte master secret; scrub it
+// when the payload is dropped so the secret does not linger on the heap /
+// stack frame (same overwrite + `black_box` pattern as `X25519PrivateKey`).
+impl Drop for Ticket12Plaintext {
+    fn drop(&mut self) {
+        super::wipe(&mut self.master_secret);
+    }
+}
+
 impl Ticket12Plaintext {
     /// Serialises the plaintext layout described in the module docs.
     pub(crate) fn encode(&self) -> Vec<u8> {

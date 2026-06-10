@@ -68,6 +68,17 @@ pub(crate) fn select_offered_suites(
     }
 }
 
+/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
+/// with `core::hint::black_box` so the writes are not elided as dead stores
+/// (same pattern as `X25519PrivateKey` / `kdf::pbes2`). Used by the TLS and
+/// DTLS 1.2 engines to scrub master-secret copies on drop.
+pub(crate) fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
+}
+
 #[cfg(test)]
 mod select_suites_tests {
     use super::select_offered_suites;

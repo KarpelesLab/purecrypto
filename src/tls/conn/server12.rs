@@ -455,6 +455,19 @@ pub struct ServerConnection12<R: RngCore> {
     ems_session_hash: Option<Vec<u8>>,
 }
 
+// Unlike the TLS 1.3 schedule (whose secrets are consumed as the handshake
+// ratchets forward), the TLS 1.2 master secret lives for the whole
+// connection — it feeds tickets, exporters and Finished verification.
+// Scrub it on drop so it does not linger in freed memory (overwrite +
+// `black_box`, the crate's standard wipe pattern).
+impl<R: RngCore> Drop for ServerConnection12<R> {
+    fn drop(&mut self) {
+        if let Some(m) = self.master.as_mut() {
+            super::wipe(m);
+        }
+    }
+}
+
 impl<R: RngCore> ServerConnection12<R> {
     /// Creates a server awaiting a `ClientHello`. `rng` supplies the server
     /// random, the ephemeral key share, and (for RSA-PSS) the salt.
@@ -565,7 +578,8 @@ impl<R: RngCore> ServerConnection12<R> {
     /// The TLS 1.2 master secret derived during the handshake. `None` until
     /// the CKE has been processed. Useful for cross-peer agreement checks
     /// and for writing the NSS `SSLKEYLOGFILE` `CLIENT_RANDOM` line from
-    /// the server side.
+    /// the server side. The connection's own copy is scrubbed on drop; the
+    /// returned copy is the caller's to wipe.
     pub fn master_secret(&self) -> Option<[u8; 48]> {
         self.master
     }
@@ -1572,8 +1586,12 @@ impl<R: RngCore> ServerConnection12<R> {
         offered: &[crate::tls::codec::CipherSuite],
     ) -> Option<ResumedState> {
         let key = self.config.ticket_key.as_ref()?;
-        let plain = open_ticket(key, ticket)?;
-        let parsed = Ticket12Plaintext::decode(&plain)?;
+        let mut plain = open_ticket(key, ticket)?;
+        let parsed = Ticket12Plaintext::decode(&plain);
+        // The decrypted plaintext buffer holds the master secret — scrub it
+        // as soon as the structured copy exists (or the parse failed).
+        super::wipe(&mut plain);
+        let parsed = parsed?;
         let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
         // The resumed suite MUST be one the client is still offering.
         if !offered.contains(&suite_code) {
@@ -2121,7 +2139,12 @@ impl<R: RngCore> ServerConnection12<R> {
             ems_used: self.ems_negotiated,
             alpn: self.alpn_negotiated.clone(),
         };
-        let ticket = seal_ticket(&mut self.rng, key, &plain.encode());
+        // `encode()` serialises the master secret into a transient buffer;
+        // scrub it once the AEAD-sealed ticket has been produced. (`plain`
+        // itself wipes on drop.)
+        let mut plain_bytes = plain.encode();
+        let ticket = seal_ticket(&mut self.rng, key, &plain_bytes);
+        super::wipe(&mut plain_bytes);
         let nst = NewSessionTicket12 {
             lifetime: self.config.ticket_lifetime,
             ticket,
@@ -2143,6 +2166,14 @@ struct ResumedState {
     /// RFC 7627 §5.3 — whether the originating session used Extended
     /// Master Secret. The resumed handshake's EMS negotiation MUST match.
     ems_used: bool,
+}
+
+// Carries the recovered master secret between ticket decryption and the
+// resumed handshake — scrub it on drop like every other holder.
+impl Drop for ResumedState {
+    fn drop(&mut self) {
+        super::wipe(&mut self.master_secret);
+    }
 }
 
 /// Current wall-clock time as a Unix timestamp under `std`; zero otherwise
