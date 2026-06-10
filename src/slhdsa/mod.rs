@@ -766,7 +766,15 @@ impl PrivateKey {
         let n = set.params().n as usize;
         let mut seeds = [0u8; 3 * MAX_N];
         rng.fill_bytes(&mut seeds[..3 * n]);
-        Self::from_seeds(set, &seeds[..n], &seeds[n..2 * n], &seeds[2 * n..3 * n])
+        let keys = Self::from_seeds(set, &seeds[..n], &seeds[n..2 * n], &seeds[2 * n..3 * n]);
+        // Wipe the stack copy of SK.seed / SK.prf / PK.seed before
+        // returning; `black_box` keeps the writes from being eliminated
+        // as dead stores.
+        for b in seeds.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&seeds);
+        keys
     }
 
     /// The matching public key.

@@ -102,12 +102,12 @@ pub(crate) fn decaps<
     let hek = &dk[pke_dk + pke_ek..pke_dk + pke_ek + 32];
     let z = &dk[dk.len() - 32..];
 
-    let m_prime = indcpa::decrypt::<K, DU, DV>(dk_pke, ct);
+    let mut m_prime = indcpa::decrypt::<K, DU, DV>(dk_pke, ct);
 
     let mut g_in = [0u8; 64];
     g_in[..32].copy_from_slice(&m_prime);
     g_in[32..].copy_from_slice(hek);
-    let g = sha3_512(&g_in);
+    let mut g = sha3_512(&g_in);
     let mut k_prime = [0u8; 32];
     k_prime.copy_from_slice(&g[..32]);
     let mut r_prime = [0u8; 32];
@@ -130,5 +130,19 @@ pub(crate) fn decaps<
     let matches = ct.ct_eq(&ct_cmp[..ct_len]);
     let mut out = k_bar;
     out.conditional_assign(&k_prime, matches);
+
+    // Wipe the transient secrets (the decrypted message, the G output and
+    // the key/coins derived from it) before they drop; `black_box` keeps
+    // the writes from being eliminated as dead stores.
+    for b in m_prime
+        .iter_mut()
+        .chain(g_in.iter_mut())
+        .chain(g.iter_mut())
+        .chain(k_prime.iter_mut())
+        .chain(r_prime.iter_mut())
+    {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime));
     out
 }

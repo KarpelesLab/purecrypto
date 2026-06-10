@@ -335,6 +335,13 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     for t in &t0 {
         sk.extend_from_slice(&pack_t0(t));
     }
+    // Wipe the expanded seed material (rho' and the signing key K live in
+    // here) before it drops; `black_box` keeps the writes from being
+    // eliminated as dead stores.
+    for b in expanded.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&expanded);
     (pk, sk)
 }
 
@@ -498,6 +505,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             sig.extend_from_slice(&pack_z(zi, p));
         }
         sig.extend_from_slice(&pack_hint(&hints, p.omega));
+        // Wipe rho' (and seed_buf, which carries a copy of it) before
+        // returning; `black_box` keeps the writes from being eliminated
+        // as dead stores.
+        for b in rho_prime.iter_mut().chain(seed_buf.iter_mut()) {
+            *b = 0;
+        }
+        let _ = core::hint::black_box((&rho_prime, &seed_buf));
         return sig;
     }
 }
