@@ -99,6 +99,11 @@ pub enum Error {
     Decryption,
     /// Iteration count below the floor we accept (currently 10_000).
     WeakKdfParameters,
+    /// Iteration count above the ceiling we accept (currently
+    /// 10_000_000). The count is attacker-controlled on decrypt; without
+    /// a cap a crafted blob can demand ~2.1 billion PBKDF2 iterations —
+    /// minutes of CPU — before any authentication check runs.
+    ExcessiveKdfParameters,
 }
 
 impl core::fmt::Display for Error {
@@ -108,6 +113,9 @@ impl core::fmt::Display for Error {
             Error::UnsupportedAlgorithm => f.write_str("unsupported PBES2 algorithm"),
             Error::Decryption => f.write_str("PBES2 decryption failed"),
             Error::WeakKdfParameters => f.write_str("PBES2 KDF parameters below safety floor"),
+            Error::ExcessiveKdfParameters => {
+                f.write_str("PBES2 KDF parameters above acceptance ceiling")
+            }
         }
     }
 }
@@ -134,6 +142,15 @@ const OID_AES256_GCM: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 1, 46];
 /// (1) and historical OpenSSL-default (2048) inputs that we don't want to
 /// silently accept.
 const MIN_PBKDF2_ITERATIONS: u32 = 10_000;
+
+/// PBKDF2 iteration-count ceiling enforced on decrypt. The count is
+/// attacker-controlled, so without a cap a crafted blob can demand up to
+/// ~2.1 billion iterations of CPU work before the first integrity check
+/// (a decryption-as-DoS vector). 10 million is ~17× the OWASP-recommended
+/// default (600_000) — far above any legitimate envelope while keeping
+/// the worst-case cost of a hostile blob bounded. [`encrypt`] is not
+/// capped: callers choose their own iteration count there.
+const MAX_PBKDF2_ITERATIONS: u32 = 10_000_000;
 
 /// PEM label for `EncryptedPrivateKeyInfo` (RFC 7468 §11).
 const PEM_LABEL: &str = "ENCRYPTED PRIVATE KEY";
@@ -195,6 +212,12 @@ pub fn encrypt(
 
 /// Decrypts the encrypted-PKCS#8 envelope with `password`. Returns the
 /// inner unencrypted PKCS#8 DER bytes.
+///
+/// The PBKDF2 iteration count carried in the envelope must lie within
+/// `10_000 ..= 10_000_000`; counts below the floor are rejected as
+/// [`Error::WeakKdfParameters`], counts above the ceiling as
+/// [`Error::ExcessiveKdfParameters`] (the count is attacker-controlled,
+/// so an uncapped value is a CPU-exhaustion vector).
 pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, Error> {
     // ---- Outer SEQUENCE ----
     let mut reader = Reader::new(encrypted_pkcs8_der);
@@ -309,6 +332,9 @@ fn parse_kdf_algid(r: &mut Reader<'_>) -> Result<(KdfChoice, Vec<u8>), Error> {
     let iterations = integer_to_u32(iter_bytes)?;
     if iterations < MIN_PBKDF2_ITERATIONS {
         return Err(Error::WeakKdfParameters);
+    }
+    if iterations > MAX_PBKDF2_ITERATIONS {
+        return Err(Error::ExcessiveKdfParameters);
     }
 
     // Optional keyLength: skip if present (we always derive 32 bytes for
@@ -720,6 +746,56 @@ mod tests {
         let ct = alloc::vec![0u8; 16];
         let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
         assert_eq!(decrypt(&blob, b"x"), Err(Error::WeakKdfParameters));
+    }
+
+    /// Handcraft an EncryptedPrivateKeyInfo with PBKDF2 iterations far
+    /// above the ceiling (a CPU-DoS payload) and verify it is rejected
+    /// before any key derivation happens.
+    #[test]
+    fn reject_pbkdf2_iterations_above_ceiling() {
+        let salt = [0u8; 16];
+        let prf =
+            encode_sequence(&[oid_tlv(OID_HMAC_WITH_SHA256), crate::der::encode_null()].concat());
+        let kdf_params = encode_sequence(
+            &[
+                encode_octet_string(&salt),
+                // ~2.1 billion iterations: minutes of PBKDF2 if accepted.
+                encode_integer(&2_100_000_000u32.to_be_bytes()),
+                prf,
+            ]
+            .concat(),
+        );
+        let kdf_algid = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+        let iv = [0u8; 16];
+        let cipher_algid =
+            encode_sequence(&[oid_tlv(OID_AES256_CBC_PAD), encode_octet_string(&iv)].concat());
+        let pbes2_params = encode_sequence(&[kdf_algid, cipher_algid].concat());
+        let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
+        let ct = alloc::vec![0u8; 16];
+        let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
+        assert_eq!(decrypt(&blob, b"x"), Err(Error::ExcessiveKdfParameters));
+
+        // The boundary itself is accepted by the KDF parser (the bogus
+        // ciphertext then fails as Decryption, proving we got past the
+        // parameter checks) — but running 10M iterations here would be
+        // slow, so only assert the just-above-ceiling rejection.
+        let kdf_params = encode_sequence(
+            &[
+                encode_octet_string(&salt),
+                encode_integer(&(MAX_PBKDF2_ITERATIONS + 1).to_be_bytes()),
+                encode_sequence(
+                    &[oid_tlv(OID_HMAC_WITH_SHA256), crate::der::encode_null()].concat(),
+                ),
+            ]
+            .concat(),
+        );
+        let kdf_algid = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+        let cipher_algid =
+            encode_sequence(&[oid_tlv(OID_AES256_CBC_PAD), encode_octet_string(&iv)].concat());
+        let pbes2_params = encode_sequence(&[kdf_algid, cipher_algid].concat());
+        let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
+        let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
+        assert_eq!(decrypt(&blob, b"x"), Err(Error::ExcessiveKdfParameters));
     }
 
     /// Handcraft an EncryptedPrivateKeyInfo with HMAC-SHA-1 PRF — we
