@@ -390,23 +390,30 @@ fn parse_cipher_algid(r: &mut Reader<'_>) -> Result<(CipherChoice, Vec<u8>), Err
     }
 }
 
-/// Converts a DER `INTEGER` body to `u32`, rejecting negatives and values
-/// that don't fit.
+/// Converts a DER `INTEGER` body to `u32`, rejecting negatives, non-minimal
+/// encodings, and values that don't fit.
 fn integer_to_u32(bytes: &[u8]) -> Result<u32, Error> {
     if bytes.is_empty() {
         return Err(Error::BadEncoding);
     }
-    // High bit of the leading byte must be clear (non-negative); a leading
-    // 0x00 is permitted to keep that invariant.
+    // DER INTEGERs are two's-complement: the sign lives in the high bit of
+    // the FIRST content byte, before any leading 0x00 pad is stripped. A
+    // value like 40_000 is encoded `00 9C 40` — the 0x00 keeps it positive
+    // even though 0x9C has its high bit set.
+    if bytes[0] & 0x80 != 0 {
+        // Negative — reject.
+        return Err(Error::BadEncoding);
+    }
+    // DER minimality: a leading 0x00 is only valid when the next byte would
+    // otherwise flip the sign bit.
+    if bytes.len() > 1 && bytes[0] == 0 && bytes[1] & 0x80 == 0 {
+        return Err(Error::BadEncoding);
+    }
     let trimmed = if bytes[0] == 0 && bytes.len() > 1 {
         &bytes[1..]
     } else {
         bytes
     };
-    if trimmed[0] & 0x80 != 0 {
-        // Negative — reject.
-        return Err(Error::BadEncoding);
-    }
     if trimmed.len() > 4 {
         return Err(Error::WeakKdfParameters); // way out of range; conservative.
     }
@@ -805,6 +812,79 @@ mod tests {
         // Wrong label.
         let pem = "-----BEGIN PRIVATE KEY-----\nZm9v\n-----END PRIVATE KEY-----\n";
         assert_eq!(decrypt_pem(pem, b"x"), Err(Error::BadEncoding));
+    }
+
+    /// `integer_to_u32` accepts every valid DER non-negative INTEGER body
+    /// across the byte-length band boundaries — in particular the
+    /// leading-0x00-then-high-bit forms (`00 9C 40` = 40_000) that the old
+    /// sign check wrongly rejected — and still refuses negatives,
+    /// non-minimal padding, and values beyond `u32::MAX`.
+    #[test]
+    fn integer_to_u32_band_boundaries() {
+        // 1-byte band.
+        assert_eq!(integer_to_u32(&[0x00]), Ok(0));
+        assert_eq!(integer_to_u32(&[0x7F]), Ok(127));
+        // 128..=255: encoded with a leading 0x00 pad.
+        assert_eq!(integer_to_u32(&[0x00, 0x80]), Ok(128));
+        assert_eq!(integer_to_u32(&[0x00, 0xC8]), Ok(200));
+        assert_eq!(integer_to_u32(&[0x00, 0xFF]), Ok(255));
+        // 2-byte band.
+        assert_eq!(integer_to_u32(&[0x01, 0x00]), Ok(256));
+        assert_eq!(integer_to_u32(&[0x7F, 0xFF]), Ok(32_767));
+        // 32_768..=65_535: leading 0x00 pad again.
+        assert_eq!(integer_to_u32(&[0x00, 0x80, 0x00]), Ok(32_768));
+        assert_eq!(integer_to_u32(&[0x00, 0x9C, 0x40]), Ok(40_000));
+        assert_eq!(integer_to_u32(&[0x00, 0xFF, 0xFF]), Ok(65_535));
+        // 3-byte band.
+        assert_eq!(integer_to_u32(&[0x01, 0x00, 0x00]), Ok(65_536));
+        assert_eq!(integer_to_u32(&[0x7F, 0xFF, 0xFF]), Ok(8_388_607));
+        // 8_388_608..=16_777_215: leading 0x00 pad.
+        assert_eq!(integer_to_u32(&[0x00, 0x80, 0x00, 0x00]), Ok(8_388_608));
+        assert_eq!(integer_to_u32(&[0x00, 0xFF, 0xFF, 0xFF]), Ok(16_777_215));
+        // 4-byte band.
+        assert_eq!(integer_to_u32(&[0x01, 0x00, 0x00, 0x00]), Ok(16_777_216));
+        assert_eq!(integer_to_u32(&[0x7F, 0xFF, 0xFF, 0xFF]), Ok(2_147_483_647));
+        // >= 2^31 needs the pad byte to stay positive.
+        assert_eq!(
+            integer_to_u32(&[0x00, 0x80, 0x00, 0x00, 0x00]),
+            Ok(2_147_483_648)
+        );
+        assert_eq!(
+            integer_to_u32(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Ok(u32::MAX)
+        );
+
+        // Negatives are rejected (high bit of the FIRST byte set).
+        assert_eq!(integer_to_u32(&[0x80]), Err(Error::BadEncoding));
+        assert_eq!(integer_to_u32(&[0xFF, 0x7F]), Err(Error::BadEncoding));
+        // Non-minimal zero padding is rejected.
+        assert_eq!(integer_to_u32(&[0x00, 0x00]), Err(Error::BadEncoding));
+        assert_eq!(integer_to_u32(&[0x00, 0x7F]), Err(Error::BadEncoding));
+        assert_eq!(integer_to_u32(&[0x00, 0x01, 0x00]), Err(Error::BadEncoding));
+        // Empty body is rejected.
+        assert_eq!(integer_to_u32(&[]), Err(Error::BadEncoding));
+        // Beyond u32::MAX.
+        assert_eq!(
+            integer_to_u32(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(Error::WeakKdfParameters)
+        );
+    }
+
+    /// Round-trip with an iteration count whose minimal encoding carries a
+    /// leading 0x00 pad (`40_000` → `00 9C 40`). The old sign check rejected
+    /// this library's own output for any count in 32_768..=65_535.
+    #[test]
+    fn roundtrip_iterations_with_high_bit_encoding() {
+        let mut rng = test_rng(b"high-bit-iter");
+        let inner = synthetic_pkcs8();
+        let params = Pbes2Params {
+            kdf: KdfChoice::Pbkdf2HmacSha256 { iterations: 40_000 },
+            cipher: CipherChoice::Aes256Gcm,
+            salt_len: 16,
+        };
+        let blob = encrypt(&inner, b"swordfish", &params, &mut rng);
+        let out = decrypt(&blob, b"swordfish").unwrap();
+        assert_eq!(out, inner);
     }
 
     /// Constant-time helpers behave as advertised.
