@@ -8,9 +8,10 @@
 //! `length` bytes — most often itself a varint, but some parameters carry
 //! opaque bytes (connection IDs, stateless reset token, preferred address).
 //!
-//! Per §18.1 a receiver MUST ignore unknown parameter IDs. Duplicate IDs
-//! are a protocol violation (we accept the last occurrence here — the
-//! connection-level validator will reject duplicates at the next layer up).
+//! Per §18.1 a receiver MUST ignore unknown parameter IDs. Per §7.4.1 a
+//! parameter MUST NOT appear more than once; [`TransportParameters::decode`]
+//! rejects any repeated ID (known or unknown) with a decode error, which
+//! the handshake surfaces as TRANSPORT_PARAMETER_ERROR.
 //!
 //! The struct fields use `Option<…>` for parameters with semantically
 //! meaningful defaults (so callers can distinguish "explicit value sent" vs
@@ -177,13 +178,33 @@ impl TransportParameters {
     }
 
     /// Decodes a transport-parameter list. Unknown IDs are ignored per
-    /// RFC 9000 §18.1.
+    /// RFC 9000 §18.1; duplicate IDs (known or unknown) are rejected per
+    /// §7.4.1 (TRANSPORT_PARAMETER_ERROR).
     pub fn decode(buf: &[u8]) -> Result<Self, Error> {
         let mut out = TransportParameters::default();
+        // RFC 9000 §7.4.1 — an endpoint MUST treat receipt of a
+        // duplicate transport parameter as a connection error of type
+        // TRANSPORT_PARAMETER_ERROR. The low codepoints (0..64, which
+        // cover every parameter we recognize) are tracked in a bitset;
+        // higher IDs (e.g. the §18.1 reserved/GREASE codepoints
+        // 31·N+27) go into a small ordered set.
+        let mut seen_low: u64 = 0;
+        let mut seen_high: alloc::collections::BTreeSet<u64> = alloc::collections::BTreeSet::new();
         let mut p = 0;
         while p < buf.len() {
             let (id, n) = varint::decode(&buf[p..])?;
             p += n;
+            let fresh = if id < 64 {
+                let bit = 1u64 << id;
+                let fresh = seen_low & bit == 0;
+                seen_low |= bit;
+                fresh
+            } else {
+                seen_high.insert(id)
+            };
+            if !fresh {
+                return Err(Error::Decode);
+            }
             let (length, n) = varint::decode(&buf[p..])?;
             p += n;
             let length = length as usize;
@@ -347,6 +368,45 @@ mod tests {
         buf.extend_from_slice(&[1, 2, 3]);
         let decoded = TransportParameters::decode(&buf).expect("decode");
         assert_eq!(decoded.max_idle_timeout_ms, Some(1000));
+    }
+
+    /// RFC 9000 §7.4.1 — duplicate transport parameters MUST be
+    /// rejected (TRANSPORT_PARAMETER_ERROR), not accepted last-wins.
+    #[test]
+    fn duplicate_id_is_rejected() {
+        // Known parameter sent twice (max_idle_timeout 0x01).
+        let mut buf = Vec::new();
+        for v in [1000u64, 2000u64] {
+            super::varint::encode(0x01, &mut buf);
+            super::varint::encode(super::varint::encoded_len(v) as u64, &mut buf);
+            super::varint::encode(v, &mut buf);
+        }
+        assert!(
+            TransportParameters::decode(&buf).is_err(),
+            "duplicate known id must be rejected"
+        );
+
+        // Unknown / reserved parameter sent twice (id 0xFF > 63 takes
+        // the high-id tracking path).
+        let mut buf = Vec::new();
+        for _ in 0..2 {
+            super::varint::encode(0xFF, &mut buf);
+            super::varint::encode(3, &mut buf);
+            buf.extend_from_slice(&[1, 2, 3]);
+        }
+        assert!(
+            TransportParameters::decode(&buf).is_err(),
+            "duplicate unknown id must be rejected"
+        );
+
+        // Two DIFFERENT unknown ids remain fine.
+        let mut buf = Vec::new();
+        for id in [0xFFu64, 0x1FF] {
+            super::varint::encode(id, &mut buf);
+            super::varint::encode(1, &mut buf);
+            buf.push(0);
+        }
+        assert!(TransportParameters::decode(&buf).is_ok());
     }
 
     #[test]
