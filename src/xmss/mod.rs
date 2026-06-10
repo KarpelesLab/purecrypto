@@ -717,19 +717,51 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
 const SK_MAGIC: &[u8; 4] = b"XMSk";
 const MTSK_MAGIC: &[u8; 4] = b"XMTk";
 
+/// Maximum per-layer subtree height for which [`validate_raw_sk`] recomputes
+/// the top-layer Merkle root from the stored seeds as a defense-in-depth check
+/// against a tampered `root` field.
+///
+/// The recompute is a full `O(2^tree_height)` subtree build (each leaf is a
+/// WOTS+ keygen plus an L-tree), and `tree_height` reaches 20 for
+/// `Sha2_20_256` / `Shake_20_256` / `Sha2_40_2_256` / `Sha2_60_3_256` etc. —
+/// roughly `10^9` hash compressions from a hostile blob whose parameter OID
+/// the attacker controls, i.e. a CPU-DoS on load. `tree_height <= 15` (`2^15`
+/// leaves) recomputes in well under a second on the worst supported set and
+/// covers all `tree_height ∈ {5, 10}` XMSS^MT splits plus `Sha2_10_256` /
+/// `Shake_10_256`; taller trees trust the stored root instead (see
+/// [`validate_raw_sk`] for why that is fail-closed). Mirrors
+/// `lms::LEGACY_RECOMPUTE_MAX_H`.
+const RECOMPUTE_MAX_TREE_HEIGHT: u32 = 15;
+
 /// Validates a parsed raw signing key (`idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖
 /// PUB_SEED`) before it is trusted for signing — the integrity check that
 /// stateful schemes need so a corrupted or rewound persisted key cannot lead to
-/// one-time-key reuse (mirrors `lms::*::from_bytes` index bounds and
-/// `slhdsa::PrivateKey::from_bytes` root recomputation).
+/// one-time-key reuse (mirrors `lms::*::from_bytes` index bounds and root
+/// handling).
 ///
 /// Rejects:
 /// 1. An out-of-range leaf index. The signer treats `idx == 2^full_height` as
 ///    the exhausted sentinel (see `XmssPrivateKey::sign`), so that value is a
 ///    legitimate persisted state and is accepted; only `idx > 2^full_height` is
 ///    rejected.
-/// 2. A stored root that does not match the one recomputed from the seeds, so a
-///    tampered `root` (or a seed/root pair that never belonged together) fails.
+/// 2. For `tree_height <= RECOMPUTE_MAX_TREE_HEIGHT` only: a stored root that
+///    does not match the one recomputed from the seeds, so a tampered `root`
+///    (or a seed/root pair that never belonged together) fails.
+///
+/// # Trusting the stored root is safe (tall trees)
+///
+/// Above the cap the stored root is taken as-is — recomputing it would be the
+/// `O(2^tree_height)` CPU-DoS described at [`RECOMPUTE_MAX_TREE_HEIGHT`]. The
+/// root is NOT secret: it is the first half of the public key (`root ‖
+/// PUB_SEED`) and is only ever fed to `H_msg` randomization and
+/// `public_key()`; authentication paths and WOTS+ chains are always recomputed
+/// from `SK_SEED`, never read from `root`. A tampered root therefore yields a
+/// wrong public key under which the genuine signatures simply fail to verify —
+/// a fail-closed self-DoS, never a forgery (the attacker lacks the seeds). An
+/// attacker able to rewrite the key file could instead rewind `idx` and force
+/// catastrophic one-time-key reuse, which is strictly worse — so burning a
+/// full keygen on every load to validate a public value buys nothing. Same
+/// policy as `lms::LmsPrivateKey::from_bytes` (root-bearing format).
 fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     let n = p.n;
     let idx = bytes_to_idx(&raw[..p.index_bytes]);
@@ -738,6 +770,12 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     // valid range is `0..=2^full_height` (inclusive of the exhausted sentinel).
     if p.full_height < 64 && idx > (1u64 << p.full_height) {
         return Err(Error::InvalidKey);
+    }
+
+    if p.tree_height > RECOMPUTE_MAX_TREE_HEIGHT {
+        // Trust the stored (public) root — see the method docs above for the
+        // fail-closed argument.
+        return Ok(());
     }
 
     // Recompute the top (layer `d-1`) subtree root from the stored seeds and

@@ -348,3 +348,56 @@ fn from_bytes_rejects_out_of_range_index_and_bad_root() {
         Err(Error::InvalidKey)
     ));
 }
+
+#[test]
+fn from_bytes_tall_tree_loads_without_recompute() {
+    // CPU-DoS (MEDIUM): a hostile blob whose attacker-chosen OID selects a
+    // tall per-layer subtree (`tree_height` 20 ⇒ ~2^20 WOTS+ keygens, ~10^9
+    // hash compressions) must NOT trigger the eager root recompute in
+    // `validate_raw_sk`. Above `RECOMPUTE_MAX_TREE_HEIGHT` the stored root is
+    // public data and is trusted on load; structurally-valid garbage seeds
+    // load instantly (a tampered root only makes signatures fail to verify —
+    // fail-closed, never a forgery).
+    let start = std::time::Instant::now();
+
+    // XMSS Sha2_20_256: tree_height = 20 (single tree).
+    let set = XmssParamSet::Sha2_20_256;
+    let p = set.params();
+    let mut blob = Vec::new();
+    blob.extend_from_slice(SK_MAGIC);
+    blob.extend_from_slice(&set.oid().to_be_bytes());
+    blob.resize(8 + p.sk_bytes(), 0xa5); // garbage seeds/root/pub_seed
+    blob[8..8 + p.index_bytes].fill(0); // in-range idx = 0
+    let sk = XmssPrivateKey::from_bytes(&blob).expect("tall XMSS blob loads without recompute");
+    assert_eq!(sk.index(), 0);
+    assert_eq!(sk.parameter_set(), set);
+
+    // Out-of-range index is still rejected on the trusted-root path.
+    let mut over = blob.clone();
+    idx_to_bytes((1u64 << p.full_height) + 1, &mut over[8..8 + p.index_bytes]);
+    assert!(matches!(
+        XmssPrivateKey::from_bytes(&over),
+        Err(Error::InvalidKey)
+    ));
+
+    // XMSS^MT Sha2_40_2_256: tree_height = 40 / 2 = 20 per layer.
+    let mtset = XmssMtParamSet::Sha2_40_2_256;
+    let mp = mtset.params();
+    let mut mtblob = Vec::new();
+    mtblob.extend_from_slice(MTSK_MAGIC);
+    mtblob.extend_from_slice(&mtset.oid().to_be_bytes());
+    mtblob.resize(8 + mp.sk_bytes(), 0x5a);
+    mtblob[8..8 + mp.index_bytes].fill(0);
+    let mtsk =
+        XmssMtPrivateKey::from_bytes(&mtblob).expect("tall XMSS^MT blob loads without recompute");
+    assert_eq!(mtsk.index(), 0);
+    assert_eq!(mtsk.parameter_set(), mtset);
+
+    // The whole test must complete instantly; the 2^20 recompute it guards
+    // against takes minutes. Generous bound for slow CI machines.
+    assert!(
+        start.elapsed() < core::time::Duration::from_secs(10),
+        "tall-tree from_bytes took {:?} — eager recompute not capped?",
+        start.elapsed()
+    );
+}
