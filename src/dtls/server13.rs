@@ -529,10 +529,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
-        let is_handshake = matches!(
-            inner_type,
-            ContentType::Handshake | ContentType::Alert | ContentType::Unknown(ACK_CONTENT_TYPE)
-        );
+        // Schedule an ACK for handshake records only (RFC 9147 §7): alerts
+        // are not handshake messages, and ACK records themselves MUST NOT
+        // be acknowledged — ACKing an ACK provokes the peer's ACK in
+        // return, locking two conforming endpoints into a perpetual
+        // encrypted ping-pong.
+        let is_handshake = matches!(inner_type, ContentType::Handshake);
         if is_handshake {
             self.pending_acks.push(RecordNumber {
                 epoch: read_epoch as u64,

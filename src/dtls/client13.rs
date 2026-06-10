@@ -606,12 +606,13 @@ impl DtlsClientConnection13 {
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
-        // Schedule an ACK for this protected record (handshake-only; we
-        // skip ACKing application_data per RFC 9147 §7 to reduce noise).
-        let is_handshake = matches!(
-            inner_type,
-            ContentType::Handshake | ContentType::Alert | ContentType::Unknown(ACK_CONTENT_TYPE)
-        );
+        // Schedule an ACK for this protected record. Handshake records only
+        // (RFC 9147 §7): application_data is skipped to reduce noise, alerts
+        // are not handshake messages, and ACK records themselves MUST NOT
+        // be acknowledged — ACKing an ACK provokes the peer's ACK in
+        // return, locking two conforming endpoints into a perpetual
+        // encrypted ping-pong.
+        let is_handshake = matches!(inner_type, ContentType::Handshake);
         if is_handshake {
             self.pending_acks.push(RecordNumber {
                 epoch: read_epoch as u64,

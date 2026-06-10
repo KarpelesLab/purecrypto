@@ -1240,6 +1240,43 @@ mod dtls13 {
         assert!(server.is_handshake_complete());
     }
 
+    /// Regression (RFC 9147 §7): received ACK records must NOT themselves
+    /// be acknowledged. Two of these endpoints previously locked into a
+    /// perpetual encrypted ACK ping-pong — every ACK provoked an ACK in
+    /// return. After the handshake completes, the exchange must quiesce.
+    #[test]
+    fn no_ack_of_ack_ping_pong_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-ackack", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Keep exchanging whatever is queued: the flow must die out within
+        // a couple of rounds instead of ping-ponging ACK-of-ACKs forever.
+        let mut quiesced = false;
+        for _ in 0..4 {
+            let c = client.pop_outbound_datagrams();
+            for dg in &c {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s = server.pop_outbound_datagrams();
+            for dg in &s {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                quiesced = true;
+                break;
+            }
+        }
+        assert!(
+            quiesced,
+            "post-handshake ACK exchange must quiesce: an ACK is never ACKed"
+        );
+    }
+
     /// Multi-suite negotiation (RFC 8446 §4.1.1 / RFC 9147 §5): when the
     /// client advertises only `TLS_CHACHA20_POLY1305_SHA256`, the server
     /// must pick that suite. Confirms the sequence-number obfuscation
