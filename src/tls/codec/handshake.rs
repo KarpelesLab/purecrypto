@@ -89,14 +89,25 @@ fn encode_extensions(out: &mut Vec<u8>, extensions: &[RawExtension]) {
     });
 }
 
+/// Upper bound on the number of extensions accepted in a single handshake
+/// message. Real hellos carry well under 30 even with GREASE + ECH + QUIC
+/// transport parameters; the cap keeps the linear duplicate scan below from
+/// being quadratic on attacker-controlled input (~16k minimal extensions
+/// would otherwise force ~10^8 comparisons per ClientHello).
+const MAX_EXTENSIONS: usize = 64;
+
 fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
     let mut c = ReadCursor::new(bytes);
     let mut out: Vec<RawExtension> = Vec::new();
     while !c.is_empty() {
         let ty = ExtensionType(c.u16()?);
         let data = c.vec_u16()?;
+        if out.len() >= MAX_EXTENSIONS {
+            return Err(Error::Decode);
+        }
         // RFC 8446 §4.2: every extension type may appear at most once in a
-        // single handshake message.
+        // single handshake message. With the count capped above, this scan
+        // is at most MAX_EXTENSIONS^2 comparisons — negligible.
         if out.iter().any(|(t, _)| *t == ty) {
             return Err(Error::IllegalParameter);
         }
@@ -431,6 +442,40 @@ mod tests {
     fn rejects_truncated() {
         let mut c = ReadCursor::new(&[1, 0, 0, 5, 0x03]); // claims 5 body bytes, has 1
         assert!(read_handshake(&mut c).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_extension() {
+        // RFC 8446 §4.2: the same extension type twice is illegal_parameter.
+        let mut bytes = Vec::new();
+        for _ in 0..2 {
+            bytes.extend_from_slice(&ExtensionType::KEY_SHARE.0.to_be_bytes());
+            bytes.extend_from_slice(&[0, 0]); // empty body
+        }
+        assert!(matches!(
+            parse_extensions(&bytes),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
+    #[test]
+    fn extension_count_capped() {
+        // Exactly MAX_EXTENSIONS distinct types decode fine; one more is a
+        // decode error (DoS bound on the duplicate scan, not a spec rule).
+        let encode_n = |n: usize| {
+            let mut bytes = Vec::new();
+            for i in 0..n {
+                bytes.extend_from_slice(&(i as u16).to_be_bytes());
+                bytes.extend_from_slice(&[0, 0]); // empty body
+            }
+            bytes
+        };
+        let ok = parse_extensions(&encode_n(MAX_EXTENSIONS)).unwrap();
+        assert_eq!(ok.len(), MAX_EXTENSIONS);
+        assert!(matches!(
+            parse_extensions(&encode_n(MAX_EXTENSIONS + 1)),
+            Err(Error::Decode)
+        ));
     }
 
     #[test]
