@@ -210,6 +210,11 @@ pub trait Mac: Clone {
     /// where a mismatch occurs. The default implementation supports tags up to
     /// 64 bytes; for longer tags use [`finalize_into`](Mac::finalize_into) with
     /// [`ConstantTimeEq`](crate::ct::ConstantTimeEq) directly.
+    ///
+    /// For variable-output MACs (`OUTPUT_LEN == None`) the tag is recomputed at
+    /// the caller-provided `expected.len()` and compared at that length. An
+    /// empty `expected` is always rejected, but the caller is responsible for
+    /// enforcing a minimum truncation length appropriate to their protocol.
     fn verify(self, expected: &[u8]) -> crate::ct::Choice {
         use crate::ct::ConstantTimeEq;
         // For fixed-output MACs, compare against the *full* tag: comparing only
@@ -219,7 +224,15 @@ pub trait Mac: Clone {
         // length mismatch, so the early reject does not leak timing.
         let n = match Self::OUTPUT_LEN {
             Some(len) => len.min(64),
-            None => expected.len().min(64),
+            None => {
+                // A zero-length tag would compare zero bytes and trivially
+                // succeed — an unconditional bypass. Reject it outright; the
+                // tag length is public, so this branch leaks nothing.
+                if expected.is_empty() {
+                    return crate::ct::Choice::from(0u8);
+                }
+                expected.len().min(64)
+            }
         };
         let mut buf = [0u8; 64];
         self.finalize_into(&mut buf[..n]);
@@ -227,5 +240,34 @@ pub trait Mac: Clone {
         let eq = buf[..n].ct_eq(expected);
         zeroize::zero_bytes(&mut buf);
         eq
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kmac128, Kmac256, Mac};
+
+    // A variable-output MAC (`OUTPUT_LEN == None`) must reject an empty
+    // expected tag: comparing zero bytes would otherwise succeed
+    // unconditionally.
+    #[test]
+    fn mac_verify_rejects_empty_tag() {
+        let key = [0x42u8; 32];
+        let data = b"empty tags must never verify";
+
+        let mut m = Kmac128::new(&key, b"");
+        Mac::update(&mut m, data);
+        assert!(!bool::from(Mac::verify(m, b"")));
+
+        let mut m = Kmac256::new(&key, b"App");
+        Mac::update(&mut m, data);
+        assert!(!bool::from(Mac::verify(m, b"")));
+
+        // Correct-tag verification still passes.
+        let mut m = Kmac256::new(&key, b"App");
+        Mac::update(&mut m, data);
+        let mut tag = [0u8; 32];
+        Mac::finalize_into(m.clone(), &mut tag);
+        assert!(bool::from(Mac::verify(m, &tag)));
     }
 }
