@@ -583,9 +583,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 // the reassembler. This is the pre-cookie, epoch-0,
                 // unauthenticated path — a hostile ClientHello with
                 // message_seq=0xFFFF would otherwise force up to 65 535
-                // allocate/serialize/parse/feed cycles below.
+                // allocate/serialize/parse/feed cycles below. Spoofable
+                // input, so the rejection is a silent drop (RFC 9147
+                // §4.5.2), never connection-fatal.
                 if msg_seq > MAX_HS_MSG_SEQ {
-                    return Err(Error::IllegalParameter);
+                    return Ok(());
                 }
                 let f = HandshakeFragment {
                     msg_type: frag.msg_type,
@@ -612,7 +614,22 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 });
                 if let Some((_mt, body)) = reasm.feed(f) {
                     self.pre_state_reasm = None;
-                    self.handle_pre_state_client_hello(msg_seq, &body)?;
+                    if let Err(e) = self.handle_pre_state_client_hello(msg_seq, &body) {
+                        // Everything on this path is unauthenticated,
+                        // epoch-0, attacker-spoofable input (a forged
+                        // cookie being the most reachable). Per RFC 9147
+                        // §4.5.2 these faults are silently dropped so a
+                        // single spoofed datagram on the 4-tuple can never
+                        // tear down a legitimate in-flight handshake. The
+                        // one exception is the local fail-closed
+                        // misconfiguration (cookie required but no
+                        // `cookie_secret`), which fires identically for
+                        // the genuine client and must stay loud.
+                        if matches!(e, Error::InappropriateState) {
+                            return Err(e);
+                        }
+                        return Ok(());
+                    }
                 }
                 continue;
             }
@@ -1583,7 +1600,10 @@ mod f3_msg_seq_tests {
     //! plaintext, epoch-0 `message_seq` is implausibly large BEFORE seeding a
     //! reassembler from it. An attacker setting `message_seq = 0xFFFF` would
     //! otherwise force up to 65 535 allocate/serialize/parse/feed cycles on
-    //! the unauthenticated, pre-cookie path.
+    //! the unauthenticated, pre-cookie path. The rejection is a SILENT DROP
+    //! (`feed_datagram` returns `Ok`): the input is trivially spoofable, so a
+    //! fatal error would hand an off-path attacker a one-datagram kill switch
+    //! for in-flight handshakes (RFC 9147 §4.5.2).
     use super::*;
     use crate::dtls::{DtlsClientConnection13, DtlsServerConnection13};
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
@@ -1651,23 +1671,24 @@ mod f3_msg_seq_tests {
     }
 
     #[test]
-    fn oversized_message_seq_is_rejected_without_giant_loop() {
+    fn oversized_message_seq_is_silently_dropped_without_giant_loop() {
         let mut dgram = client_hello_datagram();
         // A legitimate first CH uses message_seq 0; force the maximum.
         patch_message_seq(&mut dgram, 0xFFFF);
         let mut server = new_server();
-        let res = server.feed_datagram(&dgram);
-        assert_eq!(res, Err(Error::IllegalParameter));
-        // No server flight may have been emitted for the rejected CH.
+        // Spoofable epoch-0 input: dropped, never fatal.
+        assert_eq!(server.feed_datagram(&dgram), Ok(()));
+        // No server flight may have been emitted for the dropped CH.
         assert!(server.pop_outbound_datagrams().is_empty());
     }
 
     #[test]
-    fn message_seq_just_above_cap_is_rejected() {
+    fn message_seq_just_above_cap_is_silently_dropped() {
         let mut dgram = client_hello_datagram();
         patch_message_seq(&mut dgram, MAX_HS_MSG_SEQ + 1);
         let mut server = new_server();
-        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+        assert_eq!(server.feed_datagram(&dgram), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
     }
 
     #[test]

@@ -488,7 +488,21 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 let body = frag.fragment.to_vec();
                 let msg_seq = frag.message_seq;
                 off += consumed;
-                self.handle_pre_state_client_hello(msg_seq, &body)?;
+                if let Err(e) = self.handle_pre_state_client_hello(msg_seq, &body) {
+                    // Everything on this path is unauthenticated, epoch-0,
+                    // attacker-spoofable input (a forged cookie being the
+                    // most reachable). Per RFC 6347 §4.1.2.7 these faults
+                    // are silently dropped so a single spoofed datagram on
+                    // the 4-tuple can never tear down a legitimate
+                    // in-flight handshake. The one exception is the local
+                    // fail-closed misconfiguration (cookie required but no
+                    // `cookie_secret`), which fires identically for the
+                    // genuine client and must stay loud.
+                    if matches!(e, Error::InappropriateState) {
+                        return Err(e);
+                    }
+                    return Ok(());
+                }
                 continue;
             }
             // Owned reborrow.
@@ -1158,6 +1172,10 @@ mod f3_msg_seq_tests {
     //! (`for s in 0..=msg_seq`). `message_seq` is not bound by the cookie
     //! fingerprint, so a client that completed the HelloVerifyRequest
     //! roundtrip could otherwise still drive tens of thousands of cycles.
+    //! The rejection is a SILENT DROP (`feed_datagram` returns `Ok`): the
+    //! input is trivially spoofable, so a fatal error would hand an off-path
+    //! attacker a one-datagram kill switch for in-flight handshakes
+    //! (RFC 6347 §4.1.2.7).
     use super::*;
     use crate::dtls::{ClientConfig12Internal, DtlsClientConnection12, DtlsServerConnection12};
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
@@ -1222,20 +1240,22 @@ mod f3_msg_seq_tests {
     }
 
     #[test]
-    fn oversized_message_seq_is_rejected_without_giant_loop() {
+    fn oversized_message_seq_is_silently_dropped_without_giant_loop() {
         let mut dgram = client_hello_datagram();
         patch_message_seq(&mut dgram, 0xFFFF);
         let mut server = new_server();
-        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+        // Spoofable epoch-0 input: dropped, never fatal.
+        assert_eq!(server.feed_datagram(&dgram), Ok(()));
         assert!(server.pop_outbound_datagrams().is_empty());
     }
 
     #[test]
-    fn message_seq_just_above_cap_is_rejected() {
+    fn message_seq_just_above_cap_is_silently_dropped() {
         let mut dgram = client_hello_datagram();
         patch_message_seq(&mut dgram, MAX_HS_MSG_SEQ + 1);
         let mut server = new_server();
-        assert_eq!(server.feed_datagram(&dgram), Err(Error::IllegalParameter));
+        assert_eq!(server.feed_datagram(&dgram), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
     }
 
     #[test]

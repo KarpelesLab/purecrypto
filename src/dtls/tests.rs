@@ -517,6 +517,66 @@ fn spoofed_records_during_handshake_are_ignored_12() {
     assert!(server.is_handshake_complete());
 }
 
+/// Regression (D1, RFC 6347 §4.1.2.7): well-framed plaintext ClientHellos
+/// that fail handshake-layer validation — (a) a forged cookie (here: a
+/// corrupted client random, which breaks the cookie's HMAC binding), (b) an
+/// oversized `message_seq` — are exactly as spoofable as record-layer
+/// garbage. Injected mid-handshake they must be SILENTLY dropped
+/// (`feed_datagram` returns `Ok`), emit no server flight, and the genuine
+/// handshake must still complete.
+#[test]
+fn spoofed_client_hellos_mid_handshake_are_ignored_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg
+        .with_cookie_secret([0xa5; 32])
+        .require_cookie_exchange(true);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-spoof-ch", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // CH1 → server → HelloVerifyRequest → client.
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    let hvr = server.pop_outbound_datagrams();
+    assert!(!hvr.is_empty(), "server should emit HVR");
+    for dg in &hvr {
+        client.feed_datagram(dg).unwrap();
+    }
+    // The genuine cookie-bearing CH2 — hold it back while we spoof.
+    let ch2 = client.pop_outbound_datagrams();
+    assert!(!ch2.is_empty(), "client should emit CH2");
+
+    // (a) CH2 with a corrupted client random: the cookie (which binds the
+    // random) no longer validates — equivalent to a forged cookie. Offset
+    // 27 = record header (13) + handshake header (12) + legacy_version (2).
+    let mut bad_cookie = ch2[0].clone();
+    bad_cookie[27] ^= 0x5a;
+    assert_eq!(server.feed_datagram(&bad_cookie), Ok(()));
+    assert!(
+        server.pop_outbound_datagrams().is_empty(),
+        "no flight may be emitted for a forged-cookie CH"
+    );
+
+    // (b) CH2 with an implausibly large `message_seq` (offset 17 = record
+    // header (13) + msg_type (1) + length (3)).
+    let mut big_seq = ch2[0].clone();
+    big_seq[17] = 0xff;
+    big_seq[18] = 0xff;
+    assert_eq!(server.feed_datagram(&big_seq), Ok(()));
+    assert!(
+        server.pop_outbound_datagrams().is_empty(),
+        "no flight may be emitted for an oversized-message_seq CH"
+    );
+
+    // The genuine CH2 still drives the handshake to completion.
+    for dg in &ch2 {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(pump_handshake(&mut client, &mut server));
+}
+
 /// RFC 5705 §4 — DTLS 1.2 exporter agrees on both sides for a given
 /// `(label, context)`, and the no-context vs empty-context branches differ.
 #[test]
@@ -637,6 +697,69 @@ mod dtls13 {
         let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-cookie", b"nonce", &[]);
         let mut server =
             DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
+    /// Regression (D1, RFC 9147 §4.5.2): well-framed plaintext ClientHellos
+    /// that fail handshake-layer validation — (a) a forged cookie (here: a
+    /// corrupted client random, which breaks the cookie's HMAC binding),
+    /// (b) an oversized `message_seq` — are exactly as spoofable as
+    /// record-layer garbage. Injected mid-handshake they must be SILENTLY
+    /// dropped (`feed_datagram` returns `Ok`), emit no server flight, and
+    /// the genuine handshake must still complete.
+    #[test]
+    fn spoofed_client_hellos_mid_handshake_are_ignored_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-spoof-ch", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // CH1 (possibly fragmented across datagrams) → server → HRR(cookie).
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert!(!hrr.is_empty(), "server should emit cookie HRR");
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        // The genuine cookie-bearing CH2 — hold it back while we spoof.
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(!ch2.is_empty(), "client should emit CH2");
+
+        // (a) Full CH2 with a corrupted client random: the cookie (which
+        // binds the random) no longer validates — equivalent to a forged
+        // cookie. Corrupt the first fragment (fragment_offset 0 carries the
+        // random at offset 27 = record header (13) + handshake header (12)
+        // + legacy_version (2)) and deliver every fragment so the
+        // reassembled CH reaches cookie validation.
+        let mut tampered = ch2.clone();
+        tampered[0][27] ^= 0x5a;
+        for dg in &tampered {
+            assert_eq!(server.feed_datagram(dg), Ok(()));
+        }
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "no flight may be emitted for a forged-cookie CH"
+        );
+
+        // (b) A CH fragment with an implausibly large `message_seq`
+        // (offset 17 = record header (13) + msg_type (1) + length (3)).
+        let mut big_seq = ch2[0].clone();
+        big_seq[17] = 0xff;
+        big_seq[18] = 0xff;
+        assert_eq!(server.feed_datagram(&big_seq), Ok(()));
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "no flight may be emitted for an oversized-message_seq CH"
+        );
+
+        // The genuine CH2 still drives the handshake to completion.
+        for dg in &ch2 {
+            server.feed_datagram(dg).unwrap();
+        }
         assert!(pump_handshake_13(&mut client, &mut server));
     }
 
