@@ -39,7 +39,7 @@ use alloc::vec::Vec;
 
 use crate::quic::connection::Role;
 use crate::quic::frame::{Frame, StreamDir};
-use crate::quic::stream::{SendState, Stream, StreamId};
+use crate::quic::stream::{RecvState, SendState, Stream, StreamId};
 use crate::quic::transport_params::TransportParameters;
 use crate::quic::varint;
 use crate::tls::Error;
@@ -628,9 +628,44 @@ impl Streams {
         final_size: u64,
     ) -> Result<(), Error> {
         self.ensure_remote_stream_exists(id)?;
+        // RFC 9000 §4.5 — the declared final size counts against
+        // connection-level flow control exactly like received bytes:
+        // charge the delta above the stream's prior high offset.
+        let prev_high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
+        if final_size < prev_high {
+            // FINAL_SIZE_ERROR — final size below an offset already
+            // observed on the stream (RFC 9000 §4.5).
+            return Err(Error::Decode);
+        }
+        let new_high = final_size - prev_high;
+        let projected = self.conn_recv_used.saturating_add(new_high);
+        if projected > self.conn_recv_max {
+            // FLOW_CONTROL_ERROR (RFC 9000 §11.2).
+            return Err(Error::Decode);
+        }
         let stream = self.map.get_mut(&id).expect("just-ensured");
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
+        let already_reset = matches!(recv.state, RecvState::ResetRecvd | RecvState::ResetRead);
         recv.on_reset(app_error, final_size)?;
+        // The application will never read the discarded remainder of
+        // the stream; count it as consumed exactly once, so the
+        // connection-level window does not leak. (`read_off` bytes were
+        // already counted by `read`; `on_reset` cleared `delivered`, so
+        // no later read can double-count.)
+        let discarded = if already_reset {
+            0
+        } else {
+            final_size.saturating_sub(recv.read_off)
+        };
+        // All validations passed — commit the flow-control charge.
+        self.conn_recv_used = projected;
+        if new_high > 0 {
+            self.stream_high_offset.insert(id, final_size);
+        }
+        if !already_reset {
+            self.conn_consumed = self.conn_consumed.saturating_add(discarded);
+            self.maybe_replenish_conn();
+        }
         self.refresh_readable(id);
         Ok(())
     }
@@ -744,8 +779,10 @@ impl Streams {
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         let (copied, fin) = recv.read(into);
         // Stream-level replenishment, anchored on the consumed offset.
+        // A reset stream needs no further credit (its final size is
+        // known and its data was discarded).
         let r_window = recv.window;
-        if r_window > 0 {
+        if r_window > 0 && !matches!(recv.state, RecvState::ResetRecvd | RecvState::ResetRead) {
             let r_threshold = r_window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
             if recv.read_off + r_threshold > recv.max_data_announced {
                 let new_max = recv.read_off.saturating_add(r_window);
@@ -1478,6 +1515,84 @@ mod tests {
         let recv = s.map.get(&0).unwrap().recv.as_ref().unwrap();
         assert!(recv.max_data_pending);
         assert_eq!(recv.max_data, 200);
+    }
+
+    /// RFC 9000 §4.5 — RESET_STREAM's declared final size counts
+    /// against connection-level flow control like received bytes, and
+    /// the discarded unread remainder counts as consumed (replenishing
+    /// the window) exactly once.
+    #[test]
+    fn reset_stream_charges_connection_flow_control() {
+        let our = TransportParameters {
+            initial_max_data: Some(100),
+            initial_max_stream_data_bidi_local: Some(1 << 20),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // 30 bytes arrive; the app reads 20 of them.
+        s.on_stream(0, 0, false, &[0u8; 30]).expect("recv");
+        let mut buf = [0u8; 20];
+        let (n, _) = s.read(StreamId(0), &mut buf).expect("read");
+        assert_eq!(n, 20);
+        assert_eq!(s.conn_recv_used, 30);
+        assert_eq!(s.conn_consumed, 20);
+        // RESET_STREAM with final_size 80: charges the 50-byte delta
+        // above the prior high offset against conn credit, and counts
+        // the 60 never-to-be-read bytes (80 - 20 read) as consumed.
+        s.on_reset(0, 9, 80).expect("reset");
+        assert_eq!(s.conn_recv_used, 80);
+        assert_eq!(s.stream_high_offset.get(&0).copied(), Some(80));
+        assert_eq!(s.conn_consumed, 80);
+        // Consumption crossed the hysteresis threshold → fresh MAX_DATA.
+        assert!(s.max_data_pending);
+        assert_eq!(s.conn_recv_max, 180);
+        // Duplicate RESET_STREAM: fully idempotent, no double charge.
+        s.on_reset(0, 9, 80).expect("dup reset");
+        assert_eq!(s.conn_recv_used, 80);
+        assert_eq!(s.conn_consumed, 80);
+        // The discarded bytes can never be read back (no double count).
+        let (n, _) = s.read(StreamId(0), &mut buf).expect("post-reset read");
+        assert_eq!(n, 0);
+        assert_eq!(s.conn_consumed, 80);
+    }
+
+    /// A RESET_STREAM whose final size overflows our MAX_DATA is a
+    /// FLOW_CONTROL_ERROR, with no partial state mutation.
+    #[test]
+    fn reset_stream_final_size_overflow_rejected() {
+        let our = TransportParameters {
+            initial_max_data: Some(100),
+            initial_max_stream_data_bidi_local: Some(1 << 20),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(0, 0, false, &[0u8; 30]).expect("recv");
+        let err = s.on_reset(0, 9, 150);
+        assert!(err.is_err(), "final_size past MAX_DATA must be rejected");
+        assert_eq!(s.conn_recv_used, 30, "no partial charge");
+        assert_eq!(s.conn_consumed, 0);
+        assert_eq!(s.stream_high_offset.get(&0).copied(), Some(30));
+    }
+
+    /// A RESET_STREAM declaring a final size below the stream's
+    /// observed high offset is a FINAL_SIZE_ERROR.
+    #[test]
+    fn reset_stream_final_size_below_high_offset_rejected() {
+        let our = params_with(1 << 20, 1 << 20, 10);
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(0, 0, false, &[0u8; 30]).expect("recv");
+        assert!(s.on_reset(0, 9, 20).is_err());
     }
 
     /// Lost-credit recovery: a DATA_BLOCKED / STREAM_DATA_BLOCKED at a

@@ -766,6 +766,12 @@ impl RecvStream {
             return Ok(()); // idempotent
         }
         self.pending.clear();
+        // RFC 9000 §3.2 — on RESET_STREAM the receiver discards data it
+        // already received but the application has not read. (This also
+        // keeps the connection-level consumed accounting exact: the
+        // unread remainder of the stream is counted as consumed once,
+        // at reset time, and can never be read again afterwards.)
+        self.delivered.clear();
         self.reset_code = Some(code);
         self.fin_offset = Some(final_size);
         self.state = RecvState::ResetRecvd;
