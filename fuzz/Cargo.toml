@@ -19,6 +19,14 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Standalone workspace root. The parent crate's `workspace.exclude =
+# ["fuzz"]` already keeps this out of the main workspace when building
+# from the canonical checkout, but cargo's upward manifest search can
+# still capture us into an *outer* workspace when this repo is checked
+# out nested (e.g. a git worktree under another clone). The empty table
+# pins the boundary here unconditionally.
+[workspace]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 # Pull in every gated module the targets exercise. Matches the all-features
@@ -28,6 +36,7 @@ purecrypto = { path = "..", features = [
     "std", "alloc", "hash", "cipher", "kdf", "mac", "bignum", "rng",
     "rsa", "dh", "der", "x509", "ec", "tls", "dtls", "quic",
     "mlkem", "mldsa", "slhdsa", "hpke", "ech", "cert-compression",
+    "lms", "xmss", "tls-legacy",
 ] }
 
 # Optimised debug info so libFuzzer's stack traces and `cargo fuzz fmt`
@@ -146,6 +155,31 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ocsp_response"
+path = "fuzz_targets/ocsp_response.rs"
+test = false
+doc = false
+bench = false
+
+# --- Stateful hash-based signatures (LMS/HSS + XMSS/XMSS^MT): raw
+# key-file / public-key / signature byte parsers consumed by the CLI's
+# `pkeyutl` and by anyone exchanging RFC 8554 / RFC 8391 blobs.
+
+[[bin]]
+name = "lms_parse"
+path = "fuzz_targets/lms_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xmss_parse"
+path = "fuzz_targets/xmss_parse.rs"
+test = false
+doc = false
+bench = false
+
 # --- Network targets (via the public Connection::feed / feed_datagram API).
 # Each target stands up a fresh Connection per iteration and feeds fuzz
 # bytes as if they came from the wire. Exercises record layer + codec +
@@ -182,6 +216,20 @@ bench = false
 [[bin]]
 name = "quic_server_feed"
 path = "fuzz_targets/quic_server_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic_client_feed"
+path = "fuzz_targets/quic_client_feed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_legacy_feed"
+path = "fuzz_targets/tls_legacy_feed.rs"
 test = false
 doc = false
 bench = false

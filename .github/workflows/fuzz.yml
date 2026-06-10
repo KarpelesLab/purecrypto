@@ -6,7 +6,7 @@ name: Fuzz
 # workflow artifacts so they can be added to the per-target seed corpus
 # as regression fixtures.
 #
-# The 24 targets and the `fuzz/` workspace they live in are intentionally
+# The 29 targets and the `fuzz/` workspace they live in are intentionally
 # excluded from the main Cargo workspace, so nothing here affects the
 # day-to-day stable build.
 
@@ -50,11 +50,16 @@ jobs:
           - mlkem_pkcs8
           - dh_share
           - quic_transport_params
+          - ocsp_response
+          - lms_parse
+          - xmss_parse
           - tls_server_feed
           - tls_client_feed
           - dtls_server_feed
           - dtls_client_feed
           - quic_server_feed
+          - quic_client_feed
+          - tls_legacy_feed
           - ech_config_list
           - ech_retry_configs
           - ech_extension

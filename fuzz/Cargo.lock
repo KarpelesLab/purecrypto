@@ -9,6 +9,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "cacrt"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "883da6debf9bb96b0d591bb1589ad98b7428bd142f8acf4a014a8034fcab743d"
+
+[[package]]
 name = "cc"
 version = "1.2.62"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -78,8 +84,9 @@ dependencies = [
 
 [[package]]
 name = "purecrypto"
-version = "0.2.0"
+version = "0.6.8"
 dependencies = [
+ "cacrt",
  "compcol",
 ]
 
