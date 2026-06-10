@@ -258,6 +258,18 @@ fn count_ones(v: &[Poly]) -> usize {
     total
 }
 
+/// Zeroizes the coefficient memory of every polynomial in `v` before it
+/// drops; `black_box` keeps the writes from being eliminated as dead stores
+/// (same wipe pattern as the byte-buffer epilogues in this module).
+fn wipe_polys(v: &mut [Poly]) {
+    for poly in v.iter_mut() {
+        for c in poly.c.iter_mut() {
+            *c = 0;
+        }
+    }
+    let _ = core::hint::black_box(&*v);
+}
+
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
 fn matrix<const K: usize, const L: usize>(rho: &[u8]) -> [[Poly; L]; K] {
     let mut a = [[Poly::zero(); L]; K];
@@ -337,11 +349,16 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     }
     // Wipe the expanded seed material (rho' and the signing key K live in
     // here) before it drops; `black_box` keeps the writes from being
-    // eliminated as dead stores.
+    // eliminated as dead stores. Same for the unpacked secret vectors
+    // s1 / s2 / t0 and the NTT copy of s1 (t1 is the public key).
     for b in expanded.iter_mut() {
         *b = 0;
     }
     let _ = core::hint::black_box(&expanded);
+    wipe_polys(&mut s1);
+    wipe_polys(&mut s1_ntt);
+    wipe_polys(&mut s2);
+    wipe_polys(&mut t0);
     (pk, sk)
 }
 
@@ -399,9 +416,19 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     seed_buf[..64].copy_from_slice(&rho_prime);
 
     let mut kappa: u16 = 0;
-    loop {
+    // The rejection-loop candidate state holding secrets (the mask vector y —
+    // especially sensitive, since y = z − c·s1 given the published z — and the
+    // values derived from it) is hoisted out of the loop so rejected
+    // candidates are overwritten by the next attempt and the final values are
+    // wiped once after the loop.
+    let mut y = [Poly::zero(); L];
+    let mut y_ntt = [Poly::zero(); L];
+    let mut w = [Poly::zero(); K];
+    let mut z = [Poly::zero(); L];
+    let mut r0 = [[0i32; N]; K];
+    let mut ct0 = [Poly::zero(); K];
+    let sig = loop {
         // Masking vector y.
-        let mut y = [Poly::zero(); L];
         for (i, yi) in y.iter_mut().enumerate() {
             let nu = kappa + i as u16;
             seed_buf[64] = nu as u8;
@@ -409,13 +436,12 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             *yi = expand_mask(&seed_buf, p.gamma1_bits);
         }
 
-        let mut y_ntt = y;
-        for yi in y_ntt.iter_mut() {
+        for (i, yi) in y_ntt.iter_mut().enumerate() {
+            *yi = y[i];
             yi.ntt();
         }
 
         // w = A·y; w1 = HighBits(w).
-        let mut w = [Poly::zero(); K];
         let mut w1 = [Poly::zero(); K];
         for i in 0..K {
             let mut acc = Poly::zero();
@@ -445,11 +471,11 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         c_ntt.ntt();
 
         // z = y + c·s1.
-        let mut z = [Poly::zero(); L];
         for i in 0..L {
             let mut cs1 = ntt_mul(&c_ntt, &s1_ntt[i]);
             cs1.inv_ntt();
             z[i] = y[i].add(&cs1);
+            wipe_polys(core::slice::from_mut(&mut cs1));
         }
         if vec_inf_norm(&z) >= p.gamma1 - p.beta {
             kappa += L as u16;
@@ -457,7 +483,6 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         }
 
         // r0 = LowBits(w − c·s2).
-        let mut r0 = [[0i32; N]; K];
         for i in 0..K {
             let mut cs2 = ntt_mul(&c_ntt, &s2_ntt[i]);
             cs2.inv_ntt();
@@ -465,6 +490,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
                 let (_, low) = decompose(sub(w[i].c[jj], cs2.c[jj]), p.gamma2);
                 *slot = low;
             }
+            wipe_polys(core::slice::from_mut(&mut cs2));
         }
         if vec_inf_norm_signed(&r0) >= (p.gamma2 - p.beta) as i32 {
             kappa += L as u16;
@@ -472,11 +498,9 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         }
 
         // ct0 = c·t0; bound check.
-        let mut ct0 = [Poly::zero(); K];
         for i in 0..K {
-            let mut x = ntt_mul(&c_ntt, &t0_ntt[i]);
-            x.inv_ntt();
-            ct0[i] = x;
+            ct0[i] = ntt_mul(&c_ntt, &t0_ntt[i]);
+            ct0[i].inv_ntt();
         }
         if vec_inf_norm(&ct0) >= p.gamma2 {
             kappa += L as u16;
@@ -492,6 +516,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
                 let r = sub(w[i].c[jj], cs2.c[jj]);
                 hints[i].c[jj] = make_hint(ct0[i].c[jj], r, p.gamma2);
             }
+            wipe_polys(core::slice::from_mut(&mut cs2));
         }
         if count_ones(&hints) > p.omega {
             kappa += L as u16;
@@ -505,15 +530,37 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             sig.extend_from_slice(&pack_z(zi, p));
         }
         sig.extend_from_slice(&pack_hint(&hints, p.omega));
-        // Wipe rho' (and seed_buf, which carries a copy of it) before
-        // returning; `black_box` keeps the writes from being eliminated
-        // as dead stores.
-        for b in rho_prime.iter_mut().chain(seed_buf.iter_mut()) {
-            *b = 0;
-        }
-        let _ = core::hint::black_box((&rho_prime, &seed_buf));
-        return sig;
+        break sig;
+    };
+
+    // Wipe the transient secrets before returning: rho' (and seed_buf, which
+    // carries a copy of it), the unpacked secret vectors s1 / s2 / t0 and
+    // their NTT copies, the accepted candidate's mask vectors y / y_ntt, and
+    // the secret-derived w / r0 / ct0. mu, w1, c, ctilde, hints and z are
+    // public or part of the signature. `black_box` keeps the writes from
+    // being eliminated as dead stores.
+    for b in rho_prime.iter_mut().chain(seed_buf.iter_mut()) {
+        *b = 0;
     }
+    let _ = core::hint::black_box((&rho_prime, &seed_buf));
+    wipe_polys(&mut s1);
+    wipe_polys(&mut s1_ntt);
+    wipe_polys(&mut s2);
+    wipe_polys(&mut s2_ntt);
+    wipe_polys(&mut t0);
+    wipe_polys(&mut t0_ntt);
+    wipe_polys(&mut y);
+    wipe_polys(&mut y_ntt);
+    wipe_polys(&mut w);
+    wipe_polys(&mut z);
+    wipe_polys(&mut ct0);
+    for row in r0.iter_mut() {
+        for c in row.iter_mut() {
+            *c = 0;
+        }
+    }
+    let _ = core::hint::black_box(&r0);
+    sig
 }
 
 /// ML-DSA.Verify_internal (FIPS 204 Algorithm 8).
@@ -645,6 +692,11 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
         }
         pk.extend_from_slice(&pack_t1(&t1));
     }
+    // Wipe the unpacked secret vectors (and the NTT copy of s1) before they
+    // drop — same hygiene as `sign_internal`.
+    wipe_polys(&mut s1);
+    wipe_polys(&mut s1_ntt);
+    wipe_polys(&mut s2);
     pk
 }
 
@@ -709,7 +761,15 @@ macro_rules! ml_dsa_level {
             pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> ($sk, $pk) {
                 let mut seed = [0u8; SEED_SIZE];
                 rng.fill_bytes(&mut seed);
-                Self::from_seed(&seed)
+                let pair = Self::from_seed(&seed);
+                // Wipe the seed before it drops — it alone reconstructs the
+                // whole key; `black_box` keeps the writes from being
+                // eliminated as dead stores.
+                for b in seed.iter_mut() {
+                    *b = 0;
+                }
+                let _ = core::hint::black_box(&seed);
+                pair
             }
 
             /// Signs `msg` with an optional `ctx` string (≤ 255 bytes), hedged
