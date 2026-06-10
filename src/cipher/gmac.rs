@@ -120,6 +120,10 @@ impl<C: BlockCipher> Drop for Gmac<C> {
 // when that module is compiled in.
 #[cfg(feature = "hash")]
 impl<C: BlockCipher + Clone> crate::hash::Mac for Gmac<C> {
+    /// GMAC always produces a 16-byte tag, so the trait's default `verify`
+    /// rejects any `expected` that is not exactly 16 bytes.
+    const OUTPUT_LEN: Option<usize> = Some(16);
+
     fn update(&mut self, data: &[u8]) {
         Gmac::update(self, data);
     }
@@ -222,6 +226,13 @@ mod tests {
         Mac::update(&mut m, &[]);
         let mut bad = expected;
         bad[0] ^= 1;
-        assert!(!bool::from(Mac::verify(m, &bad)));
+        assert!(!bool::from(Mac::verify(m.clone(), &bad)));
+        // OUTPUT_LEN = Some(16): the trait verify rejects anything that is not
+        // exactly the full 16-byte tag — truncated, empty, or over-length.
+        assert!(!bool::from(Mac::verify(m.clone(), &expected[..8])));
+        assert!(!bool::from(Mac::verify(m.clone(), &[])));
+        let mut long = [0u8; 17];
+        long[..16].copy_from_slice(&expected);
+        assert!(!bool::from(Mac::verify(m, &long)));
     }
 }

@@ -166,6 +166,10 @@ impl<C: BlockCipher> Drop for Cmac<C> {
 // when that module is compiled in.
 #[cfg(feature = "hash")]
 impl<C: BlockCipher + Clone> crate::hash::Mac for Cmac<C> {
+    /// CMAC always produces a 16-byte tag, so the trait's default `verify`
+    /// rejects any `expected` that is not exactly 16 bytes.
+    const OUTPUT_LEN: Option<usize> = Some(16);
+
     fn update(&mut self, data: &[u8]) {
         Cmac::update(self, data);
     }
@@ -331,6 +335,13 @@ mod tests {
         Mac::finalize_into(m.clone(), &mut tag);
         assert_eq!(tag, from_hex::<16>("070a16b46b4d4144f79bdd9dd04a287c"));
         // The trait's default constant-time verify returns a `Choice`.
-        assert!(bool::from(Mac::verify(m, &tag)));
+        assert!(bool::from(Mac::verify(m.clone(), &tag)));
+        // OUTPUT_LEN = Some(16): the trait verify rejects anything that is not
+        // exactly the full 16-byte tag — truncated, empty, or over-length.
+        assert!(!bool::from(Mac::verify(m.clone(), &tag[..8])));
+        assert!(!bool::from(Mac::verify(m.clone(), &[])));
+        let mut long = [0u8; 17];
+        long[..16].copy_from_slice(&tag);
+        assert!(!bool::from(Mac::verify(m, &long)));
     }
 }
