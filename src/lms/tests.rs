@@ -77,6 +77,22 @@ fn rfc8554_tc2_verify() {
     assert!(!verify_hss(pubk, &other, sig), "wrong msg must reject");
 }
 
+/// `verify_hss` bounds the raw level count to RFC 8554's `1 <= L <= 8`, like
+/// `HssPublicKey::from_bytes` does, even when fed raw out-of-range bytes.
+#[test]
+fn verify_hss_rejects_out_of_range_levels() {
+    let k = kat();
+    let msg = &k["tc1_msg"][0];
+    let sig = &k["tc1_sig"][0];
+    for levels in [0u32, 9, u32::MAX] {
+        let mut pubk = k["tc1_pub"][0].clone();
+        pubk[..4].copy_from_slice(&levels.to_be_bytes());
+        let mut s = sig.clone();
+        s[..4].copy_from_slice(&levels.wrapping_sub(1).to_be_bytes());
+        assert!(!verify_hss(&pubk, msg, &s), "L = {levels} must reject");
+    }
+}
+
 /// Extracts the LM-OTS randomizer `C` (the n bytes right after the 4-byte type)
 /// from the LMS signature that starts at `off` in an HSS signature.
 fn extract_c(sig: &[u8], off: usize) -> [u8; N] {

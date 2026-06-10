@@ -677,6 +677,11 @@ pub fn verify_hss(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
         return false;
     }
     let levels = u32::from_be_bytes([public_key[0], public_key[1], public_key[2], public_key[3]]);
+    // RFC 8554 §6: 1 <= L <= 8 (same bound `HssPublicKey::from_bytes`
+    // enforces) — reject out-of-range level counts from raw key bytes too.
+    if !(1..=8).contains(&levels) {
+        return false;
+    }
     let nspk = u32::from_be_bytes([signature[0], signature[1], signature[2], signature[3]]);
     if nspk.checked_add(1) != Some(levels) {
         return false;
