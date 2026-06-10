@@ -20,7 +20,7 @@ use crate::pki::{
     spki_bit_string_contents, validity_days,
 };
 use crate::template::{CertTemplate, builtin_names};
-use crate::util::{Args, die, write_output, write_output_with_mode};
+use crate::util::{Args, SentinelLock, die, write_output, write_output_with_mode};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
@@ -156,78 +156,14 @@ fn bump_serial(ca: &CaDir, current: u64) {
     write_string(&ca.serial(), &format!("{next}\n"));
 }
 
-/// Inter-process lock around the read-modify-write of the `serial` file.
-///
-/// Two `purecrypto ca` invocations racing to issue would otherwise see the
-/// same value at `next_serial` and write the same `current + 1` back — both
-/// certificates would carry the same serial, breaking the auditing /
-/// revocation invariants the CA depends on.
-///
-/// We can't reach for `flock(2)` directly (the crate denies `unsafe_code`
-/// outside `src/ffi/`), so we use a pure-`std` sentinel file opened with
-/// `create_new(true)`. The kernel guarantees that at most one caller wins
-/// the create; everyone else gets `AlreadyExists` and retries with a small
-/// sleep. Bounded retry (~3 s) so a stale lock from a crashed peer eventually
-/// surfaces a clear error rather than hanging forever.
-struct SerialLock {
-    path: PathBuf,
-}
-
-impl SerialLock {
-    fn acquire(ca: &CaDir) -> Self {
-        let path = ca.dir.join("serial.lock");
-        // 150 * 20ms = 3s timeout. Long enough to overlap normal cert-issue
-        // wallclock; short enough that a crashed peer surfaces quickly.
-        const MAX_RETRIES: u32 = 150;
-        const SLEEP_MS: u64 = 20;
-        for attempt in 0..MAX_RETRIES {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(_f) => return SerialLock { path },
-                // `AlreadyExists`: another caller currently holds the lock.
-                // `PermissionDenied`: on Windows, a lock file that a peer is
-                // concurrently unlinking enters a "delete-pending" state in
-                // which `create_new` fails with ERROR_ACCESS_DENIED (os error
-                // 5) until the last handle closes — a transient race, not a
-                // hard error. Treat both as "retry", so a contended lock never
-                // spuriously aborts the process.
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::AlreadyExists
-                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    if attempt + 1 == MAX_RETRIES {
-                        die(format!(
-                            "timed out waiting for CA serial lock {} \
-                             (stale lock from a crashed `purecrypto ca`? \
-                             delete it manually if so)",
-                            path.display()
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
-                }
-                Err(e) => die(format!("cannot create lock {}: {e}", path.display())),
-            }
-        }
-        unreachable!()
-    }
-}
-
-impl Drop for SerialLock {
-    fn drop(&mut self) {
-        // Best-effort: if the unlink fails (e.g. another process already
-        // raced to remove it), there's nothing useful to recover.
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Reads the current serial, hands it back, and bumps the on-disk counter
-/// — all under the file lock so two racing `purecrypto ca` invocations
-/// cannot issue certificates with the same serial.
+/// — all under an inter-process [`SentinelLock`] so two racing
+/// `purecrypto ca` invocations cannot see the same value at `next_serial`,
+/// write the same `current + 1` back, and issue two certificates with the
+/// same serial (which would break the auditing / revocation invariants the
+/// CA depends on).
 fn allocate_serial(ca: &CaDir) -> u64 {
-    let _lock = SerialLock::acquire(ca);
+    let _lock = SentinelLock::acquire(ca.dir.join("serial.lock"), "`purecrypto ca`");
     let serial = next_serial(ca);
     bump_serial(ca, serial);
     serial
@@ -987,7 +923,7 @@ mod tests {
         let ca = Arc::new(ca);
         let ca_clone = Arc::clone(&ca);
         let h = std::thread::spawn(move || {
-            let _lock = SerialLock::acquire(&ca_clone);
+            let _lock = SentinelLock::acquire(ca_clone.dir.join("serial.lock"), "`purecrypto ca`");
             panic!("simulated allocator crash with lock held");
         });
         assert!(h.join().is_err(), "thread should have panicked");

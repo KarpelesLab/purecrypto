@@ -1,6 +1,6 @@
 //! `purecrypto pkeyutl` — generic asymmetric encrypt/decrypt/sign/verify.
 
-use crate::util::{Args, die, read_input, write_output};
+use crate::util::{Args, SentinelLock, die, read_input, write_output};
 use purecrypto::ec::sm2::DEFAULT_ID;
 use purecrypto::ec::{
     BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed448PrivateKey, Ed25519PrivateKey,
@@ -215,7 +215,17 @@ fn atomic_overwrite(path: &str, data: &[u8]) {
 
 /// Stateful `sign`: load, sign (advancing the index), persist the advanced key
 /// back to `key_path` atomically, warn, then return the signature.
+///
+/// The entire load → sign → persist sequence runs under an inter-process
+/// [`SentinelLock`] (`{key_path}.lock`). Without it, two concurrent
+/// invocations would both read index `N`, both emit signatures under the
+/// same one-time key, and the on-disk state would still end self-consistent
+/// — the catastrophic OTS reuse would be invisible after the fact.
 fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
+    let _lock = SentinelLock::acquire(
+        std::path::PathBuf::from(format!("{key_path}.lock")),
+        "`purecrypto pkeyutl sign`",
+    );
     crate::util::warn_if_world_readable_key(key_path);
     let raw =
         std::fs::read(key_path).unwrap_or_else(|e| die(format!("cannot read {key_path}: {e}")));
@@ -680,5 +690,109 @@ pub(crate) fn run(args: Args) {
         "verify" => run_verify(args),
         "" => die(USAGE),
         other => die(format!("unknown pkeyutl subcommand '{other}'\n\n{USAGE}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression coverage for the stateful-sign inter-process lock: two
+    //! concurrent `pkeyutl sign` invocations against the same LMS key file
+    //! must never both sign with the same one-time-key index. The `run_*`
+    //! entry points shell out to `die()` (process exit), so we exercise
+    //! `stateful_sign` directly against a scratch key file.
+    use super::*;
+    use purecrypto::lms::{LmotsType, LmsType};
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counter used to mint unique scratch directory names (no `tempfile`
+    /// dev-dependency — Cargo.toml is off-limits; same pattern as
+    /// `ca::tests`).
+    static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Auto-cleaning scratch directory. Drop removes the tree on a best-
+    /// effort basis so a panicking test does not leak permanent files.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let n = SCRATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let path =
+                std::env::temp_dir().join(format!("purecrypto-pkeyutl-{tag}-{pid}-{nanos}-{n}"));
+            std::fs::create_dir_all(&path).expect("mkdir scratch");
+            ScratchDir(path)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Threads racing `stateful_sign` against the same LMS key file must
+    /// each consume a DISTINCT one-time-key index `q` (the first 4 bytes of
+    /// an RFC 8554 LMS signature), and the on-disk key must end advanced by
+    /// exactly the number of signatures issued. Without the `{key}.lock`
+    /// sentinel held across load → sign → persist, two racers both read
+    /// index N and emit two signatures under the same OTS key.
+    #[test]
+    fn concurrent_stateful_sign_never_reuses_an_ots_index() {
+        let td = ScratchDir::new("statefulsign");
+        let key_path = td.0.join("lms.key");
+        let key_path_str = key_path.to_str().expect("utf-8 path").to_string();
+
+        let key = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W4, &mut OsRng);
+        std::fs::write(&key_path, key.to_bytes()).expect("seed key file");
+
+        const THREADS: u32 = 4;
+        const PER_THREAD: u32 = 3;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS as usize));
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let barrier = Arc::clone(&barrier);
+            let path = key_path_str.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut qs = Vec::with_capacity(PER_THREAD as usize);
+                for _ in 0..PER_THREAD {
+                    let sig = stateful_sign(&path, b"ots reuse regression");
+                    // LMS signature = u32(q) || LM-OTS sig || u32(type) || path.
+                    let q = u32::from_be_bytes(sig[..4].try_into().unwrap());
+                    qs.push(q);
+                }
+                qs
+            }));
+        }
+        let mut all: Vec<u32> = Vec::new();
+        for h in handles {
+            all.extend(h.join().expect("signer thread"));
+        }
+
+        // Every signature consumed a distinct OTS index, with no gaps.
+        let set: HashSet<u32> = all.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            all.len(),
+            "one-time-key index reused under concurrency: {all:?}"
+        );
+        let expected: HashSet<u32> = (0..THREADS * PER_THREAD).collect();
+        assert_eq!(set, expected, "unexpected index set: {all:?}");
+
+        // The persisted key advanced by exactly the number of signatures
+        // (H5 = 32 leaves total).
+        let advanced = std::fs::read(&key_path).expect("read advanced key");
+        let on_disk = LmsPrivateKey::from_bytes(&advanced).expect("parse advanced key");
+        assert_eq!(on_disk.remaining(), 32 - (THREADS * PER_THREAD) as u64);
+
+        // The sentinel lock was released.
+        assert!(!PathBuf::from(format!("{key_path_str}.lock")).exists());
     }
 }

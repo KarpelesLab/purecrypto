@@ -1,6 +1,7 @@
 //! Shared CLI helpers: argument parsing and file/stdin I/O.
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::exit;
 
 /// Prints `purecrypto: <msg>` to stderr and exits with status 1.
@@ -74,6 +75,73 @@ impl Args {
             out.push(t.as_str());
         }
         out
+    }
+}
+
+/// Inter-process lock around a multi-step read-modify-write of an on-disk
+/// resource (the CA `serial` counter, a stateful LMS/HSS/XMSS signing key, …).
+///
+/// We can't reach for `flock(2)` directly (the crate denies `unsafe_code`
+/// outside `src/ffi/`), so we use a pure-`std` sentinel file opened with
+/// `create_new(true)`. The kernel guarantees that at most one caller wins
+/// the create; everyone else gets `AlreadyExists` and retries with a small
+/// sleep. Bounded retry (~3 s) so a stale lock from a crashed peer eventually
+/// surfaces a clear error rather than hanging forever. The lock file is
+/// removed on `Drop` (including unwind), so a panicking holder unblocks the
+/// next caller immediately.
+pub(crate) struct SentinelLock {
+    path: PathBuf,
+}
+
+impl SentinelLock {
+    /// Acquires the lock at `path`. `holder` names the command that would be
+    /// holding a stale lock (e.g. "`purecrypto ca`") in the timeout message.
+    pub(crate) fn acquire(path: PathBuf, holder: &str) -> Self {
+        // 150 * 20ms = 3s timeout. Long enough to overlap a normal peer
+        // invocation's wallclock; short enough that a crashed peer surfaces
+        // quickly.
+        const MAX_RETRIES: u32 = 150;
+        const SLEEP_MS: u64 = 20;
+        for attempt in 0..MAX_RETRIES {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_f) => return SentinelLock { path },
+                // `AlreadyExists`: another caller currently holds the lock.
+                // `PermissionDenied`: on Windows, a lock file that a peer is
+                // concurrently unlinking enters a "delete-pending" state in
+                // which `create_new` fails with ERROR_ACCESS_DENIED (os error
+                // 5) until the last handle closes — a transient race, not a
+                // hard error. Treat both as "retry", so a contended lock never
+                // spuriously aborts the process.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        || e.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    if attempt + 1 == MAX_RETRIES {
+                        die(format!(
+                            "timed out waiting for lock {} \
+                             (stale lock from a crashed {holder}? \
+                             delete it manually if so)",
+                            path.display()
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(SLEEP_MS));
+                }
+                Err(e) => die(format!("cannot create lock {}: {e}", path.display())),
+            }
+        }
+        unreachable!()
+    }
+}
+
+impl Drop for SentinelLock {
+    fn drop(&mut self) {
+        // Best-effort: if the unlink fails (e.g. another process already
+        // raced to remove it), there's nothing useful to recover.
+        let _ = std::fs::remove_file(&self.path);
     }
 }
 
