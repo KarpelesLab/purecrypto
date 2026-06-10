@@ -1,6 +1,6 @@
 //! `purecrypto kem <subcommand>` — ML-KEM keygen / encaps / decaps.
 
-use crate::util::{Args, die, write_output, write_output_with_mode};
+use crate::util::{Args, die, read_secret_file, write_output, write_output_with_mode};
 use purecrypto::mlkem::{
     MlKem512Ciphertext, MlKem512DecapsKey, MlKem512EncapsKey, MlKem768Ciphertext,
     MlKem768DecapsKey, MlKem768EncapsKey, MlKem1024Ciphertext, MlKem1024DecapsKey,
@@ -143,8 +143,9 @@ fn run_decaps(args: Args) {
         .value("-out-ss")
         .unwrap_or_else(|| die("missing -out-ss FILE"));
 
-    let key_pem =
-        std::fs::read(key_path).unwrap_or_else(|e| die(format!("cannot read {key_path}: {e}")));
+    // The decapsulation key is private-key material: warn if the file is
+    // group/world-readable (same convention as the other `-key` readers).
+    let key_pem = read_secret_file(key_path);
     let key_pem = core::str::from_utf8(&key_pem).unwrap_or_else(|_| die("key is not valid PEM"));
     let ct_bytes =
         std::fs::read(ct_path).unwrap_or_else(|e| die(format!("cannot read {ct_path}: {e}")));

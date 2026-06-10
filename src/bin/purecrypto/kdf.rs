@@ -1,8 +1,8 @@
 //! `purecrypto kdf <subcommand>` — HKDF, PBKDF2, scrypt, and Argon2.
 
 use crate::util::{
-    Args, die, parse_hex_flag, parse_u32_flag, parse_usize_flag, to_hex_line, write_output,
-    write_output_with_mode,
+    Args, die, parse_hex_flag, parse_u32_flag, parse_usize_flag, read_secret_file, to_hex_line,
+    write_output, write_output_with_mode, zero_buf,
 };
 use purecrypto::hash::{Sha256, Sha384, Sha512};
 use purecrypto::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -35,7 +35,7 @@ fn read_password(args: &Args) -> Vec<u8> {
                 .unwrap_or_else(|e| die(format!("cannot read stdin: {e}")));
             line.into_bytes()
         } else {
-            std::fs::read(p).unwrap_or_else(|e| die(format!("cannot read {p}: {e}")))
+            read_secret_file(p)
         };
         // Strip a trailing newline (CR/LF), mirroring how shells write passphrase files.
         let mut out = bytes;
@@ -68,10 +68,20 @@ fn run_hkdf(args: Args) {
         .value("-salt")
         .map(|h| parse_hex_flag(h, "-salt"))
         .unwrap_or_default();
-    let ikm = args
-        .value("-ikm")
-        .map(|h| parse_hex_flag(h, "-ikm"))
-        .unwrap_or_else(|| die("missing -ikm HEX"));
+    // IKM: prefer `-ikmfile FILE` (raw bytes), fall back to `-ikm HEX` with a
+    // warning since argv is world-readable via /proc/<pid>/cmdline (same
+    // convention as `enc -key`).
+    let mut ikm = if let Some(h) = args.value("-ikm").or_else(|| args.value("--ikm")) {
+        eprintln!(
+            "purecrypto: warning: -ikm HEX exposes the input keying material via \
+             /proc/<pid>/cmdline; prefer -ikmfile FILE (raw bytes)"
+        );
+        parse_hex_flag(h, "-ikm")
+    } else if let Some(p) = args.value("-ikmfile").or_else(|| args.value("--ikmfile")) {
+        read_secret_file(p)
+    } else {
+        die("missing -ikm HEX or -ikmfile FILE (raw bytes)")
+    };
     let info = args
         .value("-info")
         .map(|h| parse_hex_flag(h, "-info"))
@@ -88,6 +98,7 @@ fn run_hkdf(args: Args) {
         "sha512" => hkdf::<Sha512>(&salt, &ikm, &info, &mut out),
         _ => die(format!("unsupported -hash for hkdf: {hash}")),
     }
+    zero_buf(&mut ikm);
     emit(&args, &out);
 }
 
@@ -96,7 +107,7 @@ fn run_pbkdf2(args: Args) {
         .value("-hash")
         .or_else(|| args.value("--hash"))
         .unwrap_or("sha256");
-    let pw = read_password(&args);
+    let mut pw = read_password(&args);
     let salt = args
         .value("-salt")
         .map(|h| parse_hex_flag(h, "-salt"))
@@ -117,11 +128,12 @@ fn run_pbkdf2(args: Args) {
         "sha512" => pbkdf2::<Sha512>(&pw, &salt, iter, &mut out),
         _ => die(format!("unsupported -hash for pbkdf2: {hash}")),
     }
+    zero_buf(&mut pw);
     emit(&args, &out);
 }
 
 fn run_scrypt(args: Args) {
-    let pw = read_password(&args);
+    let mut pw = read_password(&args);
     let salt = args
         .value("-salt")
         .map(|h| parse_hex_flag(h, "-salt"))
@@ -152,6 +164,7 @@ fn run_scrypt(args: Args) {
     let mut out = vec![0u8; len];
     scrypt(&pw, &salt, log_n, r, p, &mut out)
         .unwrap_or_else(|e| die(format!("scrypt failed: {e}")));
+    zero_buf(&mut pw);
     emit(&args, &out);
 }
 
@@ -166,7 +179,7 @@ fn run_argon2(args: Args) {
         "2id" | "argon2id" | "id" => Argon2Type::Argon2id,
         other => die(format!("unknown -variant: {other}")),
     };
-    let pw = read_password(&args);
+    let mut pw = read_password(&args);
     let salt = args
         .value("-salt")
         .map(|h| parse_hex_flag(h, "-salt"))
@@ -201,6 +214,7 @@ fn run_argon2(args: Args) {
     let mut out = vec![0u8; len];
     argon2(&params, &pw, &salt, &[], &[], &mut out)
         .unwrap_or_else(|e| die(format!("argon2 failed: {e}")));
+    zero_buf(&mut pw);
     emit(&args, &out);
 }
 
@@ -228,10 +242,20 @@ fn run_kbkdf(args: Args) {
         .or_else(|| args.value("--prf"))
         .unwrap_or("hmac-sha256")
         .to_ascii_lowercase();
-    let ki = args
-        .value("-ki")
-        .map(|h| parse_hex_flag(h, "-ki"))
-        .unwrap_or_else(|| die("missing -ki HEX (the key-derivation key)"));
+    // KI: prefer `-kifile FILE` (raw bytes), fall back to `-ki HEX` with a
+    // warning since argv is world-readable via /proc/<pid>/cmdline (same
+    // convention as `enc -key`).
+    let mut ki = if let Some(h) = args.value("-ki").or_else(|| args.value("--ki")) {
+        eprintln!(
+            "purecrypto: warning: -ki HEX exposes the key-derivation key via \
+             /proc/<pid>/cmdline; prefer -kifile FILE (raw bytes)"
+        );
+        parse_hex_flag(h, "-ki")
+    } else if let Some(p) = args.value("-kifile").or_else(|| args.value("--kifile")) {
+        read_secret_file(p)
+    } else {
+        die("missing -ki HEX or -kifile FILE (the key-derivation key, raw bytes)")
+    };
     let label = args
         .value("-label")
         .map(|h| parse_hex_flag(h, "-label"))
@@ -291,6 +315,7 @@ fn run_kbkdf(args: Args) {
              (hmac-sha256|hmac-sha384|hmac-sha512|cmac-aes128|cmac-aes256)"
         )),
     }
+    zero_buf(&mut ki);
     emit(&args, &out);
 }
 
@@ -298,12 +323,16 @@ const USAGE: &str = "\
 purecrypto kdf <subcommand> [options]
 
 SUBCOMMANDS:
-    hkdf    -hash sha256|sha384|sha512 -ikm HEX [-salt HEX] [-info HEX] -len N
-    pbkdf2  -hash sha256|sha384|sha512 -password STR -salt HEX -iter N -len N
-    scrypt  -password STR -salt HEX -n N -r R -p P -len N
-    argon2  -variant 2i|2d|2id -password STR -salt HEX -t-cost N -m-cost N [-p P] -len N
+    hkdf    -hash sha256|sha384|sha512 -ikm HEX|-ikmfile FILE [-salt HEX] [-info HEX] -len N
+    pbkdf2  -hash sha256|sha384|sha512 -password STR|-password-file FILE -salt HEX -iter N -len N
+    scrypt  -password STR|-password-file FILE -salt HEX -n N -r R -p P -len N
+    argon2  -variant 2i|2d|2id -password STR|-password-file FILE -salt HEX
+            -t-cost N -m-cost N [-p P] -len N
     kbkdf   -mode counter|feedback -prf hmac-sha256|hmac-sha384|hmac-sha512|cmac-aes128|cmac-aes256
-            -ki HEX [-label HEX] [-context HEX] [-iv HEX] -len N
+            -ki HEX|-kifile FILE [-label HEX] [-context HEX] [-iv HEX] -len N
+
+Secret-bearing argv flags (-ikm, -ki, -password) leak via /proc/<pid>/cmdline
+and warn on use; prefer the FILE forms (raw bytes; -password-file - is stdin).
 
 Output is hex unless `-binary` is set, written to `-out` (default stdout).
 `-binary` output is key material: files are created mode 0600 and never
@@ -318,6 +347,8 @@ pub(crate) fn run(args: Args) {
         "--salt",
         "-ikm",
         "--ikm",
+        "-ikmfile",
+        "--ikmfile",
         "-info",
         "--info",
         "-password",
@@ -346,6 +377,8 @@ pub(crate) fn run(args: Args) {
         "--prf",
         "-ki",
         "--ki",
+        "-kifile",
+        "--kifile",
         "-label",
         "--label",
         "-context",

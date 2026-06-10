@@ -1,7 +1,12 @@
 //! `purecrypto mac -alg ALG -key HEX|-keyfile FILE [in FILE] [-out FILE]`
 //! — emit an HMAC tag (mirrors `openssl dgst -mac hmac`).
+//!
+//! `-keyfile FILE` (raw bytes) is preferred over `-key HEX`: argv leaks to
+//! `/proc/<pid>/cmdline`, so the hex form emits a warning to stderr.
 
-use crate::util::{Args, die, parse_hex_flag, read_input, to_hex_line, write_output};
+use crate::util::{
+    Args, die, parse_hex_flag, read_input, read_secret_file, to_hex_line, write_output, zero_buf,
+};
 use purecrypto::cipher::{Aes128, Aes256, AesCmac128, AesCmac256, AesGmac128, AesGmac256};
 use purecrypto::hash::{Hmac, HmacSha256, HmacSha384, HmacSha512, Sha1};
 
@@ -74,12 +79,19 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.value("--alg"))
         .unwrap_or_else(|| die("missing -alg (try -alg hmac-sha256)"));
 
-    let key = if let Some(hex) = args.value("-key").or_else(|| args.value("--key")) {
+    // Key: prefer `-keyfile FILE` (raw bytes), fall back to `-key HEX` with a
+    // warning since argv is world-readable via /proc/<pid>/cmdline (same
+    // convention as `enc`).
+    let mut key = if let Some(hex) = args.value("-key").or_else(|| args.value("--key")) {
+        eprintln!(
+            "purecrypto: warning: -key HEX exposes the key via /proc/<pid>/cmdline; \
+             prefer -keyfile FILE (raw bytes)"
+        );
         parse_hex_flag(hex, "-key")
     } else if let Some(path) = args.value("-keyfile").or_else(|| args.value("--keyfile")) {
-        std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")))
+        read_secret_file(path)
     } else {
-        die("missing -key HEX or -keyfile FILE");
+        die("missing -key HEX or -keyfile FILE (raw bytes)");
     };
 
     let pos = args.positionals(&[
@@ -113,6 +125,7 @@ pub(crate) fn run(args: Args) {
         }
         _ => mac_tag(alg, &key, &msg).unwrap_or_else(|| die(format!("unknown -alg: {alg}"))),
     };
+    zero_buf(&mut key);
     let dest = args.value("-out").or_else(|| args.value("--out"));
     if args.flag("-binary") || args.flag("--binary") {
         write_output(dest, &tag);

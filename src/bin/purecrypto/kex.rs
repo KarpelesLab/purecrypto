@@ -1,7 +1,7 @@
 //! `purecrypto kex -alg X25519|X448|ECDH-P256|ECDH-P384|ECDH-P521 -key FILE -peer FILE -out FILE`
 //! — derive a Diffie-Hellman shared secret.
 
-use crate::util::{Args, die, write_output_with_mode};
+use crate::util::{Args, die, read_secret_file, write_output_with_mode, zero_buf};
 use purecrypto::der::{Reader, pem_decode, tag};
 use purecrypto::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId, x448::X448PrivateKey,
@@ -64,8 +64,9 @@ pub(crate) fn run(args: Args) {
         .or_else(|| args.value("--out"))
         .unwrap_or_else(|| die("missing -out FILE"));
 
-    let key_bytes =
-        std::fs::read(key_path).unwrap_or_else(|e| die(format!("cannot read {key_path}: {e}")));
+    // `-key` is private-key material: warn if the file is group/world-
+    // readable. `-peer` is the counterparty's PUBLIC key — a plain read.
+    let mut key_bytes = read_secret_file(key_path);
     let peer_bytes =
         std::fs::read(peer_path).unwrap_or_else(|e| die(format!("cannot read {peer_path}: {e}")));
 
@@ -135,6 +136,7 @@ pub(crate) fn run(args: Args) {
         }
         other => die(format!("unknown -alg: {other}")),
     };
+    zero_buf(&mut key_bytes);
 
     write_output_with_mode(Some(out_path), &secret, /* private = */ true);
 }
