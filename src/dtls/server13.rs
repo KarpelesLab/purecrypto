@@ -71,6 +71,17 @@ const EXT_COOKIE: u16 = 0x002C;
 /// Default per-fragment payload size for outbound handshake messages.
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
+/// Ceiling on the claimed `total_length` of a ClientHello fed through the
+/// pre-state reassembler, paired with a single in-flight message. This is
+/// the pre-cookie, pre-address-validation path: with the default
+/// reassembler limits (256 KiB × 8 messages) eight spoofed one-byte
+/// fragments with distinct `message_seq` values, each claiming the maximum
+/// `total_length`, would pin ~2 MiB of eagerly allocated buffers before
+/// any return-routability check. A legitimate CH — even multi-share with
+/// ML-KEM-768 — is well under 16 KiB, and the post-HRR CH2 is a single
+/// `message_seq`.
+const PRE_COOKIE_MAX_CH_LEN: u32 = 32 * 1024;
+
 /// Configuration for a DTLS 1.3 server.
 ///
 /// `pub(crate)`: external users build a [`crate::tls::Config`] and call
@@ -601,8 +612,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let reasm = self.pre_state_reasm.get_or_insert_with(|| {
                     // Catch up to whatever message_seq the client used
                     // (CH2 after a group-HRR is msg_seq=1, after a
-                    // cookie-HRR is also msg_seq=1).
-                    let mut r = Reassembler::new();
+                    // cookie-HRR is also msg_seq=1). Tight limits: this
+                    // is unauthenticated pre-cookie input, so cap the
+                    // claimed message size and allow only one in-flight
+                    // message (see `PRE_COOKIE_MAX_CH_LEN`).
+                    let mut r = Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, 1);
                     for s in 0..msg_seq {
                         let mut buf = Vec::new();
                         write_message(&mut buf, hs_type::CLIENT_HELLO, s, b"", 0);

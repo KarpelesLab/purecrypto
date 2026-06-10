@@ -189,19 +189,19 @@ impl PartialMessage {
     }
 }
 
-/// Upper bound on a single handshake message's `total_length`. RFC 6347 /
-/// 9147 don't dictate one, but real-world handshake bodies are well under
-/// 256 KiB even with PQC certificate chains and ML-DSA signatures (~50 KB
-/// SLH-DSA signatures push the high end). Capping prevents a hostile peer
-/// from claiming `total_length = 16 MiB` and triggering a multi-MiB
-/// allocation per message_seq.
+/// Default upper bound on a single handshake message's `total_length`.
+/// RFC 6347 / 9147 don't dictate one, but real-world handshake bodies are
+/// well under 256 KiB even with PQC certificate chains and ML-DSA
+/// signatures (~50 KB SLH-DSA signatures push the high end). Capping
+/// prevents a hostile peer from claiming `total_length = 16 MiB` and
+/// triggering a multi-MiB allocation per message_seq.
 const MAX_MESSAGE_LEN: u32 = 256 * 1024;
 
-/// Upper bound on the number of distinct `message_seq` values held in the
-/// in-progress map. RFC allows up to 65 535; an attacker emitting one
-/// fragment for each would otherwise pin tens of GiB of allocations. Eight
-/// concurrent in-flight messages is more than any legitimate handshake
-/// flight needs.
+/// Default upper bound on the number of distinct `message_seq` values held
+/// in the in-progress map. RFC allows up to 65 535; an attacker emitting
+/// one fragment for each would otherwise pin tens of GiB of allocations.
+/// Eight concurrent in-flight messages is more than any legitimate
+/// handshake flight needs.
 const MAX_IN_PROGRESS: usize = 8;
 
 /// Handshake-message reassembler. Tracks one in-flight reassembly per
@@ -210,14 +210,31 @@ const MAX_IN_PROGRESS: usize = 8;
 pub(crate) struct Reassembler {
     expected_msg_seq: u16,
     in_progress: BTreeMap<u16, PartialMessage>,
+    /// Per-message ceiling on the claimed `total_length`; oversized claims
+    /// are dropped before the dense buffer is allocated.
+    max_message_len: u32,
+    /// Cap on concurrently in-progress `message_seq` values.
+    max_in_progress: usize,
 }
 
 impl Reassembler {
-    /// Creates a fresh reassembler waiting on `message_seq = 0`.
+    /// Creates a fresh reassembler waiting on `message_seq = 0`, with the
+    /// default post-handshake limits (256 KiB per message, 8 in flight).
     pub(crate) fn new() -> Self {
+        Self::with_limits(MAX_MESSAGE_LEN, MAX_IN_PROGRESS)
+    }
+
+    /// Creates a reassembler with tighter memory-DoS caps. Used on the
+    /// pre-cookie / pre-address-validation paths, where a spoofable peer
+    /// must not be able to pin `default_max_message_len ×
+    /// default_max_in_progress` (~2 MiB) of eagerly allocated reassembly
+    /// buffers with a handful of one-byte fragments.
+    pub(crate) fn with_limits(max_message_len: u32, max_in_progress: usize) -> Self {
         Self {
             expected_msg_seq: 0,
             in_progress: BTreeMap::new(),
+            max_message_len,
+            max_in_progress,
         }
     }
 
@@ -239,11 +256,11 @@ impl Reassembler {
         }
         // Reject implausibly large messages and out-of-budget concurrency
         // (memory-DoS protection).
-        if frag.total_length > MAX_MESSAGE_LEN {
+        if frag.total_length > self.max_message_len {
             return None;
         }
         if !self.in_progress.contains_key(&frag.message_seq)
-            && self.in_progress.len() >= MAX_IN_PROGRESS
+            && self.in_progress.len() >= self.max_in_progress
         {
             return None;
         }
@@ -576,6 +593,50 @@ mod tests {
         assert_eq!(ty, 11);
         assert_eq!(got, body);
         assert_eq!(r.expected_msg_seq(), 1);
+    }
+
+    #[test]
+    fn with_limits_rejects_oversized_total_length() {
+        // A fragment claiming a total_length above the configured ceiling
+        // is dropped before the dense buffer is allocated; a message within
+        // the ceiling still reassembles on the same instance.
+        let mut r = Reassembler::with_limits(1024, 1);
+
+        let mut big = Vec::new();
+        write_fragment_header(&mut big, 1, 64 * 1024, 0, 0, 1);
+        big.push(0xab);
+        assert!(r.feed(read_fragment(&big).unwrap()).is_none());
+        assert_eq!(r.expected_msg_seq(), 0, "oversized claim must not advance");
+
+        let mut ok = Vec::new();
+        write_message(&mut ok, 1, 0, b"legit client hello", 0);
+        let out = r.feed(read_fragment(&ok).unwrap()).unwrap();
+        assert_eq!(out.1, b"legit client hello");
+    }
+
+    #[test]
+    fn with_limits_caps_in_progress_messages() {
+        // With max_in_progress = 1, a second distinct message_seq cannot
+        // open another buffer while the first is incomplete.
+        let mut r = Reassembler::with_limits(1024, 1);
+
+        // Half of msg_seq=0 (incomplete, occupies the only slot).
+        let mut half = Vec::new();
+        write_fragment_header(&mut half, 1, 20, 0, 0, 10);
+        half.extend_from_slice(&[0x11; 10]);
+        assert!(r.feed(read_fragment(&half).unwrap()).is_none());
+
+        // A future msg_seq=1 fragment is rejected (no second slot)...
+        let mut other = Vec::new();
+        write_message(&mut other, 1, 1, b"future", 0);
+        assert!(r.feed(read_fragment(&other).unwrap()).is_none());
+
+        // ...but completing msg_seq=0 still works.
+        let mut rest = Vec::new();
+        write_fragment_header(&mut rest, 1, 20, 0, 10, 10);
+        rest.extend_from_slice(&[0x22; 10]);
+        let out = r.feed(read_fragment(&rest).unwrap()).unwrap();
+        assert_eq!(out.1.len(), 20);
     }
 
     #[test]

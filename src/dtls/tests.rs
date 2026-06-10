@@ -763,6 +763,59 @@ mod dtls13 {
         assert!(pump_handshake_13(&mut client, &mut server));
     }
 
+    /// Regression (D2): a pre-cookie ClientHello fragment claiming an
+    /// enormous `total_length` must be dropped without seeding a large
+    /// reassembly buffer — the pre-state reassembler runs BEFORE any
+    /// address validation, so the default 256 KiB × 8-message budget would
+    /// let ~2 MiB be pinned by a few spoofed one-byte fragments. The drop
+    /// is silent, and a genuine handshake on the same connection still
+    /// completes afterwards. (The legitimate fragmented-CH path — e.g. a
+    /// multi-share ML-KEM offer — is covered by the default-group loopback
+    /// tests above.)
+    #[test]
+    fn oversized_pre_cookie_ch_claim_is_dropped_13() {
+        // A plaintext epoch-0 handshake record carrying one CH fragment
+        // that claims total_length = 64 KiB with a 16-byte body.
+        let mut frag = alloc::vec![
+            0x01, // client_hello
+            0x01, 0x00, 0x00, // total_length = 0x010000 (64 KiB)
+            0x00, 0x00, // message_seq = 0
+            0x00, 0x00, 0x00, // fragment_offset = 0
+            0x00, 0x00, 0x10, // fragment_length = 16
+        ];
+        frag.extend_from_slice(&[0xab; 16]);
+        let mut spoof = alloc::vec![
+            22u8, // handshake
+            0xfe,
+            0xfd, // DTLS 1.2 wire version
+            0x00,
+            0x00, // epoch 0
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x07, // seq
+            0x00,
+            frag.len() as u8, // length
+        ];
+        spoof.extend_from_slice(&frag);
+
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-bigclaim", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // The oversized claim is silently dropped — no flight, no error.
+        assert_eq!(server.feed_datagram(&spoof), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+
+        // The genuine handshake (cookie roundtrip included) still works.
+        assert!(pump_handshake_13(&mut client, &mut server));
+    }
+
     /// Regression (DTLS-cookie fail-closed): DTLS 1.3 server with the cookie
     /// exchange required but no `cookie_secret` must reject the first
     /// ClientHello and emit no HRR / server flight to a spoofable source.
