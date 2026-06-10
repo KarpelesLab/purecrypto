@@ -172,7 +172,7 @@ pub fn encrypt(
     rng.fill_bytes(&mut salt);
 
     // 2. Derive a 32-byte AES-256 key.
-    let key = derive_key(password, &salt, &params.kdf);
+    let mut key = derive_key(password, &salt, &params.kdf);
 
     // 3. Encrypt.
     let (cipher_algid, ciphertext) = match params.cipher {
@@ -198,6 +198,9 @@ pub fn encrypt(
             (encode_aes256_cbc_algid(&iv), buf)
         }
     };
+    // The expanded schedules inside the cipher objects above have gone out
+    // of scope; wipe our copy of the derived AES key too.
+    wipe(&mut key);
 
     // 4. PBES2-params SEQUENCE.
     let pbes2_params =
@@ -244,10 +247,10 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
     outer.finish().map_err(|_| Error::BadEncoding)?;
     reader.finish().map_err(|_| Error::BadEncoding)?;
 
-    // ---- KDF: derive a 32-byte AES-256 key ----
-    let key = derive_key(password, &salt, &kdf);
-
     // ---- Cipher: decrypt ----
+    // The 32-byte AES key is derived inside each arm only after the cheap
+    // structural checks, so no early return sits between derivation and
+    // the wipe of our key copy.
     match cipher_kind {
         CipherChoice::Aes256Gcm => {
             if iv_bytes.len() != 12 {
@@ -263,7 +266,9 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
             tag_arr.copy_from_slice(tag);
             let mut iv_arr = [0u8; 12];
             iv_arr.copy_from_slice(&iv_bytes);
+            let mut key = derive_key(password, &salt, &kdf);
             let gcm = Aes256Gcm::new(Aes256::new(&key));
+            wipe(&mut key);
             gcm.decrypt(&iv_arr, &[], &mut buf, &tag_arr)
                 .map_err(|_| Error::Decryption)?;
             Ok(buf)
@@ -278,14 +283,25 @@ pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, E
             let mut iv_arr = [0u8; 16];
             iv_arr.copy_from_slice(&iv_bytes);
             let mut buf = ciphertext.to_vec();
-            Cbc::new(Aes256::new(&key), &iv_arr)
-                .decrypt(&mut buf)
-                .map_err(|_| Error::Decryption)?;
+            let mut key = derive_key(password, &salt, &kdf);
+            let mut cbc = Cbc::new(Aes256::new(&key), &iv_arr);
+            wipe(&mut key);
+            cbc.decrypt(&mut buf).map_err(|_| Error::Decryption)?;
             // Constant-time PKCS#7 padding validation, then strip the padding.
             let stripped = strip_pkcs7_padding(buf)?;
             Ok(stripped)
         }
     }
+}
+
+/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
+/// with `core::hint::black_box` so the writes are not elided as dead
+/// stores.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
 }
 
 /// PEM-wrapped variant of [`encrypt`] using the RFC 7468 §11
@@ -502,6 +518,7 @@ fn encode_aes256_gcm_algid(nonce: &[u8; 12]) -> Vec<u8> {
 fn strip_pkcs7_padding(mut buf: Vec<u8>) -> Result<Vec<u8>, Error> {
     let n = buf.len();
     if n == 0 || !n.is_multiple_of(16) {
+        wipe(&mut buf);
         return Err(Error::Decryption);
     }
     let last = buf[n - 1];
@@ -541,6 +558,10 @@ fn strip_pkcs7_padding(mut buf: Vec<u8>) -> Result<Vec<u8>, Error> {
     // this point the padding has already been read in fixed order, so the
     // branch direction is the only thing the caller observes.
     if valid != 0xFF {
+        // `buf` holds the (wrong-key or tampered) decryption result; wipe
+        // it before the rejection so the recovered bytes don't linger in
+        // freed memory.
+        wipe(&mut buf);
         return Err(Error::Decryption);
     }
     buf.truncate(n - pad_len);

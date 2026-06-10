@@ -76,6 +76,18 @@ fn derive_block<D: Digest>(
 
     let n = out.len().min(acc.as_ref().len());
     out[..n].copy_from_slice(&acc.as_ref()[..n]);
+
+    // Wipe the PRF chaining value and the block accumulator: both are
+    // password-derived key material (`acc` IS the derived block). Overwrite
+    // plus a `black_box` fence so the stores are not elided.
+    for b in u.as_mut() {
+        *b = 0;
+    }
+    for b in acc.as_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(u.as_ref());
+    let _ = core::hint::black_box(acc.as_ref());
 }
 
 #[cfg(test)]

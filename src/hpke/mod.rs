@@ -114,6 +114,17 @@ impl core::error::Error for Error {}
 
 pub use schedule::{ReceiverContext, SenderContext};
 
+/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
+/// with `core::hint::black_box` so the writes are not elided as dead
+/// stores. Same pattern the rest of the crate uses for secret
+/// intermediates.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
+}
+
 /// `SetupBaseS`: derive a [`SenderContext`] for the given recipient
 /// public key and info string. Returns the encapsulated KEM share
 /// `enc` together with the sender state.
@@ -123,9 +134,10 @@ pub fn setup_sender<R: crate::rng::RngCore>(
     pk_r: &[u8],
     info: &[u8],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
-    let (shared_secret, enc) = suite.kem.encap(rng, pk_r)?;
-    let ctx = SenderContext::new(suite, Mode::Base, &shared_secret, info, &[], &[])?;
-    Ok((enc, ctx))
+    let (mut shared_secret, enc) = suite.kem.encap(rng, pk_r)?;
+    let ctx = SenderContext::new(suite, Mode::Base, &shared_secret, info, &[], &[]);
+    wipe(&mut shared_secret);
+    Ok((enc, ctx?))
 }
 
 /// `SetupBaseR`: derive a [`ReceiverContext`] from the encapsulated
@@ -136,8 +148,10 @@ pub fn setup_receiver(
     sk_r: &[u8],
     info: &[u8],
 ) -> Result<ReceiverContext, Error> {
-    let shared_secret = suite.kem.decap(enc, sk_r)?;
-    ReceiverContext::new(suite, Mode::Base, &shared_secret, info, &[], &[])
+    let mut shared_secret = suite.kem.decap(enc, sk_r)?;
+    let ctx = ReceiverContext::new(suite, Mode::Base, &shared_secret, info, &[], &[]);
+    wipe(&mut shared_secret);
+    ctx
 }
 
 /// `SetupPSKS`: like [`setup_sender`] but binds a pre-shared key.
@@ -149,9 +163,10 @@ pub fn setup_sender_psk<R: crate::rng::RngCore>(
     psk: &[u8],
     psk_id: &[u8],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
-    let (shared_secret, enc) = suite.kem.encap(rng, pk_r)?;
-    let ctx = SenderContext::new(suite, Mode::Psk, &shared_secret, info, psk, psk_id)?;
-    Ok((enc, ctx))
+    let (mut shared_secret, enc) = suite.kem.encap(rng, pk_r)?;
+    let ctx = SenderContext::new(suite, Mode::Psk, &shared_secret, info, psk, psk_id);
+    wipe(&mut shared_secret);
+    Ok((enc, ctx?))
 }
 
 /// `SetupPSKR`.
@@ -163,8 +178,10 @@ pub fn setup_receiver_psk(
     psk: &[u8],
     psk_id: &[u8],
 ) -> Result<ReceiverContext, Error> {
-    let shared_secret = suite.kem.decap(enc, sk_r)?;
-    ReceiverContext::new(suite, Mode::Psk, &shared_secret, info, psk, psk_id)
+    let mut shared_secret = suite.kem.decap(enc, sk_r)?;
+    let ctx = ReceiverContext::new(suite, Mode::Psk, &shared_secret, info, psk, psk_id);
+    wipe(&mut shared_secret);
+    ctx
 }
 
 /// `SetupAuthS`: like [`setup_sender`] but binds the sender's static
@@ -176,9 +193,10 @@ pub fn setup_sender_auth<R: crate::rng::RngCore>(
     info: &[u8],
     sk_s: &[u8],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
-    let (shared_secret, enc) = suite.kem.auth_encap(rng, pk_r, sk_s)?;
-    let ctx = SenderContext::new(suite, Mode::Auth, &shared_secret, info, &[], &[])?;
-    Ok((enc, ctx))
+    let (mut shared_secret, enc) = suite.kem.auth_encap(rng, pk_r, sk_s)?;
+    let ctx = SenderContext::new(suite, Mode::Auth, &shared_secret, info, &[], &[]);
+    wipe(&mut shared_secret);
+    Ok((enc, ctx?))
 }
 
 /// `SetupAuthR`.
@@ -189,8 +207,10 @@ pub fn setup_receiver_auth(
     info: &[u8],
     pk_s: &[u8],
 ) -> Result<ReceiverContext, Error> {
-    let shared_secret = suite.kem.auth_decap(enc, sk_r, pk_s)?;
-    ReceiverContext::new(suite, Mode::Auth, &shared_secret, info, &[], &[])
+    let mut shared_secret = suite.kem.auth_decap(enc, sk_r, pk_s)?;
+    let ctx = ReceiverContext::new(suite, Mode::Auth, &shared_secret, info, &[], &[]);
+    wipe(&mut shared_secret);
+    ctx
 }
 
 /// `SetupAuthPSKS`.
@@ -204,9 +224,10 @@ pub fn setup_sender_auth_psk<R: crate::rng::RngCore>(
     psk_id: &[u8],
     sk_s: &[u8],
 ) -> Result<(Vec<u8>, SenderContext), Error> {
-    let (shared_secret, enc) = suite.kem.auth_encap(rng, pk_r, sk_s)?;
-    let ctx = SenderContext::new(suite, Mode::AuthPsk, &shared_secret, info, psk, psk_id)?;
-    Ok((enc, ctx))
+    let (mut shared_secret, enc) = suite.kem.auth_encap(rng, pk_r, sk_s)?;
+    let ctx = SenderContext::new(suite, Mode::AuthPsk, &shared_secret, info, psk, psk_id);
+    wipe(&mut shared_secret);
+    Ok((enc, ctx?))
 }
 
 /// `SetupAuthPSKR`.
@@ -220,8 +241,10 @@ pub fn setup_receiver_auth_psk(
     psk_id: &[u8],
     pk_s: &[u8],
 ) -> Result<ReceiverContext, Error> {
-    let shared_secret = suite.kem.auth_decap(enc, sk_r, pk_s)?;
-    ReceiverContext::new(suite, Mode::AuthPsk, &shared_secret, info, psk, psk_id)
+    let mut shared_secret = suite.kem.auth_decap(enc, sk_r, pk_s)?;
+    let ctx = ReceiverContext::new(suite, Mode::AuthPsk, &shared_secret, info, psk, psk_id);
+    wipe(&mut shared_secret);
+    ctx
 }
 
 /// Single-shot `SealBase` (RFC 9180 §6.1): encapsulate, seal one

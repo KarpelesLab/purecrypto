@@ -85,6 +85,7 @@ impl HpkeAead {
                 k.copy_from_slice(key);
                 let mut buf = pt.to_vec();
                 let cipher = Aes128Gcm::new(Aes128::new(&k));
+                super::wipe(&mut k);
                 let tag = cipher.encrypt(nonce, aad, &mut buf);
                 buf.extend_from_slice(&tag);
                 Ok(buf)
@@ -97,6 +98,7 @@ impl HpkeAead {
                 k.copy_from_slice(key);
                 let mut buf = pt.to_vec();
                 let cipher = Aes256Gcm::new(Aes256::new(&k));
+                super::wipe(&mut k);
                 let tag = cipher.encrypt(nonce, aad, &mut buf);
                 buf.extend_from_slice(&tag);
                 Ok(buf)
@@ -111,6 +113,7 @@ impl HpkeAead {
                 n.copy_from_slice(nonce);
                 let mut buf = pt.to_vec();
                 let cipher = ChaCha20Poly1305::new(&k);
+                super::wipe(&mut k);
                 let tag = cipher.encrypt(&n, aad, &mut buf);
                 buf.extend_from_slice(&tag);
                 Ok(buf)
@@ -147,6 +150,7 @@ impl HpkeAead {
                 k.copy_from_slice(key);
                 let mut buf = body.to_vec();
                 let cipher = Aes128Gcm::new(Aes128::new(&k));
+                super::wipe(&mut k);
                 cipher
                     .decrypt(nonce, aad, &mut buf, &tag_arr)
                     .map_err(|_| Error::AeadError)?;
@@ -160,6 +164,7 @@ impl HpkeAead {
                 k.copy_from_slice(key);
                 let mut buf = body.to_vec();
                 let cipher = Aes256Gcm::new(Aes256::new(&k));
+                super::wipe(&mut k);
                 cipher
                     .decrypt(nonce, aad, &mut buf, &tag_arr)
                     .map_err(|_| Error::AeadError)?;
@@ -175,6 +180,7 @@ impl HpkeAead {
                 n.copy_from_slice(nonce);
                 let mut buf = body.to_vec();
                 let cipher = ChaCha20Poly1305::new(&k);
+                super::wipe(&mut k);
                 cipher
                     .decrypt(&n, aad, &mut buf, &tag_arr)
                     .map_err(|_| Error::AeadError)?;

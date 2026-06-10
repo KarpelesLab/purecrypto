@@ -181,6 +181,11 @@ pub fn argon2(
         h_prime(&input, &mut mem[off..off + 1024]);
     }
 
+    // H0 is password-derived and only needed for lane initialization; wipe
+    // it before the long main loop runs.
+    h0.iter_mut().for_each(|b| *b = 0);
+    let _ = core::hint::black_box(&h0);
+
     // --- Main loop: t passes × 4 slices × p lanes × seg_len blocks ---
     for pass in 0..params.t_cost as usize {
         for slice in 0..4 {
@@ -245,6 +250,11 @@ fn fill_segment(
 
     let start_idx = if pass == 0 && slice == 0 { 2 } else { 0 };
 
+    // Stack copies of the previous / reference blocks, reused across the
+    // segment and wiped once at the end (they hold password-derived state).
+    let mut prev_buf = [0u8; 1024];
+    let mut ref_buf = [0u8; 1024];
+
     #[allow(clippy::needless_range_loop)]
     for i_seg in start_idx..seg_len {
         let j_abs = slice * seg_len + i_seg; // absolute column
@@ -271,8 +281,6 @@ fn fill_segment(
         let ref_off = block_off(ref_lane, ref_col);
         let dst_off = block_off(lane, j_abs);
 
-        let mut prev_buf = [0u8; 1024];
-        let mut ref_buf = [0u8; 1024];
         prev_buf.copy_from_slice(&mem[prev_off..prev_off + 1024]);
         ref_buf.copy_from_slice(&mem[ref_off..ref_off + 1024]);
 
@@ -284,6 +292,11 @@ fn fill_segment(
             xor_into,
         );
     }
+
+    prev_buf.iter_mut().for_each(|b| *b = 0);
+    ref_buf.iter_mut().for_each(|b| *b = 0);
+    let _ = core::hint::black_box(&prev_buf);
+    let _ = core::hint::black_box(&ref_buf);
 }
 
 /// Argon2i / Argon2id (first-half) pseudo-random address generation. Produces

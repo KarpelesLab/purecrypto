@@ -247,7 +247,7 @@ impl HpkeKem {
     fn extract_and_expand(self, dh: &[u8], kem_context: &[u8]) -> Vec<u8> {
         let suite_id = kem_suite_id(self.id());
         let kdf = self.kdf();
-        let eae_prk = labeled_extract(kdf, b"", &suite_id, b"eae_prk", dh);
+        let mut eae_prk = labeled_extract(kdf, b"", &suite_id, b"eae_prk", dh);
         let mut shared = alloc::vec![0u8; self.n_secret()];
         labeled_expand(
             kdf,
@@ -257,6 +257,7 @@ impl HpkeKem {
             kem_context,
             &mut shared,
         );
+        super::wipe(&mut eae_prk);
         shared
     }
 
@@ -268,12 +269,17 @@ impl HpkeKem {
         pk_r: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), Error> {
         self.validate_public_key(pk_r)?;
-        let (sk_e, pk_e) = self.generate_key_pair(rng)?;
-        let dh = self.dh(&sk_e, pk_r)?;
+        let (mut sk_e, pk_e) = self.generate_key_pair(rng)?;
+        // Wipe the ephemeral scalar as soon as the DH is done — before
+        // propagating any DH failure.
+        let dh = self.dh(&sk_e, pk_r);
+        super::wipe(&mut sk_e);
+        let mut dh = dh?;
         let mut kem_context = Vec::with_capacity(pk_e.len() + pk_r.len());
         kem_context.extend_from_slice(&pk_e);
         kem_context.extend_from_slice(pk_r);
         let shared = self.extract_and_expand(&dh, &kem_context);
+        super::wipe(&mut dh);
         Ok((shared, pk_e))
     }
 
@@ -283,12 +289,16 @@ impl HpkeKem {
             return Err(Error::InvalidEnc);
         }
         self.validate_public_key(enc)?;
-        let dh = self.dh(sk_r, enc)?;
+        // Derive the public key first so no fallible step sits between the
+        // DH output's creation and its wipe below.
         let pk_r = self.pk_from_sk(sk_r)?;
+        let mut dh = self.dh(sk_r, enc)?;
         let mut kem_context = Vec::with_capacity(enc.len() + pk_r.len());
         kem_context.extend_from_slice(enc);
         kem_context.extend_from_slice(&pk_r);
-        Ok(self.extract_and_expand(&dh, &kem_context))
+        let shared = self.extract_and_expand(&dh, &kem_context);
+        super::wipe(&mut dh);
+        Ok(shared)
     }
 
     /// `AuthEncap(pkR, skS)`: like [`encap`](Self::encap) but also
@@ -300,18 +310,33 @@ impl HpkeKem {
         sk_s: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), Error> {
         self.validate_public_key(pk_r)?;
-        let (sk_e, pk_e) = self.generate_key_pair(rng)?;
-        let dh1 = self.dh(&sk_e, pk_r)?;
-        let dh2 = self.dh(sk_s, pk_r)?;
+        // Derive the sender's public key first so no fallible step sits
+        // between the DH outputs' creation and their wipes below.
+        let pk_s = self.pk_from_sk(sk_s)?;
+        let (mut sk_e, pk_e) = self.generate_key_pair(rng)?;
+        // Wipe the ephemeral scalar as soon as the DH is done — before
+        // propagating any DH failure.
+        let dh1 = self.dh(&sk_e, pk_r);
+        super::wipe(&mut sk_e);
+        let mut dh1 = dh1?;
+        let mut dh2 = match self.dh(sk_s, pk_r) {
+            Ok(dh2) => dh2,
+            Err(e) => {
+                super::wipe(&mut dh1);
+                return Err(e);
+            }
+        };
         let mut dh = Vec::with_capacity(dh1.len() + dh2.len());
         dh.extend_from_slice(&dh1);
         dh.extend_from_slice(&dh2);
-        let pk_s = self.pk_from_sk(sk_s)?;
+        super::wipe(&mut dh1);
+        super::wipe(&mut dh2);
         let mut kem_context = Vec::with_capacity(pk_e.len() + pk_r.len() + pk_s.len());
         kem_context.extend_from_slice(&pk_e);
         kem_context.extend_from_slice(pk_r);
         kem_context.extend_from_slice(&pk_s);
         let shared = self.extract_and_expand(&dh, &kem_context);
+        super::wipe(&mut dh);
         Ok((shared, pk_e))
     }
 
@@ -322,16 +347,28 @@ impl HpkeKem {
         }
         self.validate_public_key(enc)?;
         self.validate_public_key(pk_s)?;
-        let dh1 = self.dh(sk_r, enc)?;
-        let dh2 = self.dh(sk_r, pk_s)?;
+        // Derive the public key first so no fallible step sits between the
+        // DH outputs' creation and their wipes below.
+        let pk_r = self.pk_from_sk(sk_r)?;
+        let mut dh1 = self.dh(sk_r, enc)?;
+        let mut dh2 = match self.dh(sk_r, pk_s) {
+            Ok(dh2) => dh2,
+            Err(e) => {
+                super::wipe(&mut dh1);
+                return Err(e);
+            }
+        };
         let mut dh = Vec::with_capacity(dh1.len() + dh2.len());
         dh.extend_from_slice(&dh1);
         dh.extend_from_slice(&dh2);
-        let pk_r = self.pk_from_sk(sk_r)?;
+        super::wipe(&mut dh1);
+        super::wipe(&mut dh2);
         let mut kem_context = Vec::with_capacity(enc.len() + pk_r.len() + pk_s.len());
         kem_context.extend_from_slice(enc);
         kem_context.extend_from_slice(&pk_r);
         kem_context.extend_from_slice(pk_s);
-        Ok(self.extract_and_expand(&dh, &kem_context))
+        let shared = self.extract_and_expand(&dh, &kem_context);
+        super::wipe(&mut dh);
+        Ok(shared)
     }
 }

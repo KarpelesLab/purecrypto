@@ -72,7 +72,7 @@ pub fn bcrypt_pbkdf(
     let initial_amt: usize = keylen.div_ceil(stride);
 
     // SHA-512 of the password — same value across every PRF block.
-    let sha2pass: [u8; 64] = Sha512::digest(password);
+    let mut sha2pass: [u8; 64] = Sha512::digest(password);
 
     let mut out = vec![0u8; keylen];
     let mut remaining = keylen;
@@ -113,9 +113,28 @@ pub fn bcrypt_pbkdf(
         }
         remaining -= written;
         count += 1;
+
+        // Per-block secrets: the chained salt, the last PRF output, and the
+        // XOR accumulator (whose bytes feed the derived key).
+        wipe(&mut sha2salt);
+        wipe(&mut tmpout);
+        wipe(&mut block);
     }
 
+    // Password-derived; only needed while PRF blocks were being produced.
+    wipe(&mut sha2pass);
+
     Ok(out)
+}
+
+/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
+/// with `core::hint::black_box` so the writes are not elided as dead
+/// stores.
+fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
 }
 
 /// Inner PRF: 32-byte output from a 64-byte `sha2pass` "key" and a
@@ -168,6 +187,18 @@ fn bcrypt_hash(sha2pass: &[u8; 64], sha2salt: &[u8; 64]) -> [u8; BCRYPT_HASHSIZE
     for i in 0..8 {
         out[4 * i..4 * i + 4].copy_from_slice(&cdata[i].to_le_bytes());
     }
+
+    // The expanded Blowfish key schedule and the enciphered state words are
+    // both password-derived; wipe them before they go out of scope.
+    state.p.iter_mut().for_each(|w| *w = 0);
+    for sbox in state.s.iter_mut() {
+        sbox.iter_mut().for_each(|w| *w = 0);
+    }
+    let _ = core::hint::black_box(&state.p);
+    let _ = core::hint::black_box(&state.s);
+    cdata.iter_mut().for_each(|w| *w = 0);
+    let _ = core::hint::black_box(&cdata);
+
     out
 }
 
