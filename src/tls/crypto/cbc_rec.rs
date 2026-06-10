@@ -17,6 +17,14 @@
 //! no padding-vs-MAC distinction) — which defeats the classic Vaudenay / POODLE
 //! padding oracle.
 //!
+//! **BEAST** (CVE-2011-3389): TLS 1.0 (`explicit_iv == false`) chains each
+//! record's IV from the previous record's last ciphertext block, so the IV of
+//! the next record is predictable to an observer — the protocol flaw BEAST
+//! exploits via adaptive chosen-plaintext records. This is inherent to the
+//! TLS 1.0 record format and cannot be fixed here (we do not implement 1/n-1
+//! record splitting); TLS 1.1+ removes it with the per-record random explicit
+//! IV. Avoid TLS 1.0 CBC wherever the peer offers anything newer.
+//!
 //! To blunt **Lucky13**, the decrypt path also equalises the number of
 //! hash-compression blocks the MAC computation performs: after the real HMAC it
 //! runs throwaway compression work sized so that every path — minimal padding,
