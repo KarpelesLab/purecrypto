@@ -1,17 +1,25 @@
 //! Verifies an OpenSSL-generated RSA-PSS signature with purecrypto.
 //!
-//! Expects three files in /tmp: an RSA public key (PKCS#1 PEM) at
-//! `/tmp/pss_pub.pem`, the message at `/tmp/pss_msg.txt`, and the signature at
-//! `/tmp/pss_sig.bin`. Prints OK on success.
+//! Takes three file paths: an RSA public key (PKCS#1 PEM), the message, and
+//! the signature. Prints OK on success. Example invocation:
+//!
+//! ```sh
+//! cargo run --example pss_interop -- pss_pub.pem pss_msg.txt pss_sig.bin
+//! ```
 
 use purecrypto::der;
 use purecrypto::rsa::BoxedRsaPublicKey;
 use std::fs;
 
 fn main() {
-    let pem = fs::read_to_string("/tmp/pss_pub.pem").expect("read pub");
-    let msg = fs::read("/tmp/pss_msg.txt").expect("read msg");
-    let sig = fs::read("/tmp/pss_sig.bin").expect("read sig");
+    let args: Vec<String> = std::env::args().collect();
+    let [_, pub_path, msg_path, sig_path] = args.as_slice() else {
+        eprintln!("usage: pss_interop <pub.pem (PKCS#1)> <msg-file> <sig-file>");
+        std::process::exit(2);
+    };
+    let pem = fs::read_to_string(pub_path).expect("read pub");
+    let msg = fs::read(msg_path).expect("read msg");
+    let sig = fs::read(sig_path).expect("read sig");
 
     // Runtime-sized key: parse the PKCS#1 PEM body into a BoxedRsaPublicKey,
     // so the modulus size need not be known at compile time.

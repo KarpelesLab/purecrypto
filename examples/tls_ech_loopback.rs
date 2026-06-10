@@ -17,9 +17,8 @@
 //!    refresh and retry.
 
 use purecrypto::ec::Ed25519PrivateKey;
-use purecrypto::hash::Sha256;
 use purecrypto::hpke::{HpkeAead, HpkeKdf, HpkeKem};
-use purecrypto::rng::{HmacDrbg, OsRng};
+use purecrypto::rng::OsRng;
 use purecrypto::tls::ech::keys::{EchKeyPair, EchKeyRing};
 use purecrypto::tls::ech::{EchClient, EchConfigList, EchServer, HpkeSymCipherSuite};
 use purecrypto::tls::{Config, Connection, Error, RootCertStore, SigningKey};
@@ -33,8 +32,7 @@ const PUBLIC_NAME: &str = "public.example";
 const INNER_SNI: &str = "secret.example";
 
 fn make_server_cert() -> (Vec<u8>, Ed25519PrivateKey) {
-    let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-example-srvkey", b"nonce", &[]);
-    let key = Ed25519PrivateKey::generate(&mut keygen_rng);
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
     let name = DistinguishedName::common_name(PUBLIC_NAME);
     let validity = Validity::new(
         Time::utc(2024, 1, 1, 0, 0, 0),
@@ -52,14 +50,13 @@ fn make_server_cert() -> (Vec<u8>, Ed25519PrivateKey) {
     (cert.to_der().to_vec(), key)
 }
 
-fn fresh_ech_keypair(config_id: u8, seed: &[u8]) -> EchKeyPair {
-    let mut rng = HmacDrbg::<Sha256>::new(seed, b"ech-example", &[]);
+fn fresh_ech_keypair(config_id: u8) -> EchKeyPair {
     let suites = vec![HpkeSymCipherSuite {
         kdf_id: HpkeKdf::HkdfSha256.id(),
         aead_id: HpkeAead::Aes128Gcm.id(),
     }];
     EchKeyPair::generate(
-        &mut rng,
+        &mut OsRng,
         HpkeKem::DhkemX25519HkdfSha256,
         config_id,
         PUBLIC_NAME.as_bytes(),
@@ -90,7 +87,7 @@ fn run_accept_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
     println!("--- ACCEPT scenario: matching config_id ---");
 
     // Fresh ECH keypair with config_id=0x33; both sides see it.
-    let pair = fresh_ech_keypair(0x33, b"accept");
+    let pair = fresh_ech_keypair(0x33);
     let list = EchConfigList::new(vec![pair.config().clone()]);
     let ring = EchKeyRing::from_pairs(vec![pair]);
 
@@ -140,11 +137,11 @@ fn run_reject_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
     println!("--- REJECT scenario: stale config_id ---");
 
     // Client seals against config_id=0xAA (stale).
-    let client_side = fresh_ech_keypair(0xAA, b"reject-client");
+    let client_side = fresh_ech_keypair(0xAA);
     let stale_list = EchConfigList::new(vec![client_side.config().clone()]);
 
     // Server publishes config_id=0xBB — decap will miss.
-    let server_side = fresh_ech_keypair(0xBB, b"reject-server");
+    let server_side = fresh_ech_keypair(0xBB);
     let fresh_list = EchConfigList::new(vec![server_side.config().clone()]);
     let ring = EchKeyRing::from_pairs(vec![server_side]);
 
@@ -190,11 +187,6 @@ fn run_reject_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
 }
 
 fn main() {
-    // `OsRng` is touched to make sure the example compiles on any
-    // target where the example feature is enabled. It is not used
-    // directly (HMAC-DRBG drives the deterministic ECH keygen).
-    let _ = OsRng;
-
     let (cert_der, key) = make_server_cert();
 
     run_accept_scenario(&cert_der, &key);

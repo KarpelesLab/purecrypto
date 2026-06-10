@@ -78,6 +78,21 @@ fn openssl_supports(flag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Writes the throwaway private key with mode 0600 and `create_new` (Unix) so
+/// the PEM is never group/world-readable and the write never follows a
+/// pre-existing file or symlink planted at the path.
+fn write_private_key(path: &std::path::Path, data: &[u8]) {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).expect("create key file");
+    f.write_all(data).expect("write key file");
+}
+
 /// Pick a likely-free localhost port by binding to :0 and releasing it.
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
@@ -335,12 +350,20 @@ fn main() {
     let cert_der = cert.to_der().to_vec();
     let key = BoxedRsaPrivateKey::from_pkcs1_der(&rsa.to_pkcs1_der()).unwrap();
 
-    let dir = std::env::temp_dir().join("pc_legacy_interop");
+    // Per-run unique scratch dir: a fixed name under the shared /tmp would let
+    // another local user pre-create it (symlink games) and would leave the
+    // private key lying around between runs.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("pc_legacy_interop-{}-{nanos}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.to_pem()).unwrap();
-    std::fs::write(&key_path, rsa.to_pkcs1_pem()).unwrap();
+    write_private_key(&key_path, rsa.to_pkcs1_pem().as_bytes());
 
     // (version, cipher-suite) cases. SSL 3.0 is included only when this OpenSSL
     // build supports `-ssl3` (a legacy build); the system OpenSSL 3.x skips it.
@@ -386,6 +409,9 @@ fn main() {
             }
         }
     }
+
+    // Best-effort: don't leave the throwaway key/cert behind in /tmp.
+    let _ = std::fs::remove_dir_all(&dir);
 
     if failures == 0 {
         println!(
