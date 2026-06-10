@@ -88,15 +88,15 @@ pub enum Error {
     /// `psk` / `psk_id` violated the joint emptiness / non-emptiness
     /// invariant (RFC 9180 §5.1.1).
     PskInputsInconsistent,
+    /// An `Export` request asked for more bytes than the KDF can produce
+    /// (`255·Nh`, capped at `u16::MAX`). RFC 9180 §5.3 requires a clean
+    /// failure rather than a panic in the HKDF-Expand layer.
+    ExportLengthExceeded,
     /// The PSK is shorter than 32 bytes in a PSK / AuthPSK mode.
     /// RFC 9180 §9.5 requires the PSK to carry at least 32 bytes of
     /// entropy so it cannot be brute-forced offline; length is the
     /// enforceable proxy for that requirement.
     PskTooShort,
-    /// An `Export` request asked for more bytes than the KDF can produce
-    /// (`255·Nh`, capped at `u16::MAX`). RFC 9180 §5.3 requires a clean
-    /// failure rather than a panic in the HKDF-Expand layer.
-    ExportLengthExceeded,
 }
 
 impl core::fmt::Display for Error {
