@@ -264,6 +264,31 @@ impl Connection {
         }
     }
 
+    /// True once the peer's close_notify alert has been processed.
+    ///
+    /// Distinguishes a graceful TLS shutdown from an abrupt transport
+    /// close: after transport EOF, `false` here means the peer (or an
+    /// active attacker injecting a TCP FIN/RST) cut the stream without
+    /// the RFC 8446 §6.1 / RFC 5246 §7.2.1 closure alert. Callers using
+    /// EOF-delimited application framing should treat that as a
+    /// truncation attack and reject the data.
+    ///
+    /// Always `false` for DTLS engines — purecrypto's DTLS does not
+    /// exchange close_notify (datagram transports have no stream EOF to
+    /// authenticate; an application protocol signals its own end).
+    pub fn received_close_notify(&self) -> bool {
+        match &self.inner {
+            Engine::ClientTls13(c) => c.received_close_notify(),
+            Engine::ClientTls12(c) => c.received_close_notify(),
+            Engine::ServerTls13(c) => c.received_close_notify(),
+            Engine::ServerTls12(c) => c.received_close_notify(),
+            Engine::ClientDtls12(_)
+            | Engine::ClientDtls13(_)
+            | Engine::ServerDtls12(_)
+            | Engine::ServerDtls13(_) => false,
+        }
+    }
+
     /// The negotiated wire version, if the handshake has progressed enough
     /// to determine it.
     pub fn negotiated_version(&self) -> Option<ProtocolVersion> {

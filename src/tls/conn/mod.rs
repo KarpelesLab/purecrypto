@@ -716,6 +716,63 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong from server");
     }
 
+    /// Issue #30 — `received_close_notify()` distinguishes a graceful TLS
+    /// shutdown from an abrupt transport close. Before the peer's
+    /// close_notify is processed the flag is false (so transport EOF at
+    /// that point means truncation); after processing it flips to true.
+    #[test]
+    fn close_notify_sets_received_flag() {
+        let (server_config, cert_der) = ed25519_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback-cn-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback-cn-server", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // An EOF here would be a truncation: no close_notify seen yet.
+        assert!(!client.received_close_notify());
+        assert!(!server.received_close_notify());
+
+        // Server initiates a graceful shutdown.
+        server.send_close_notify();
+        let s = server.write_tls();
+        assert!(!s.is_empty());
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert!(client.received_close_notify());
+        assert!(!server.received_close_notify());
+
+        // Client responds in kind.
+        client.send_close_notify();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert!(server.received_close_notify());
+    }
+
     #[test]
     fn x25519_aes128_sha256() {
         run(&[CipherSuite::AES_128_GCM_SHA256], &[NamedGroup::X25519]);
@@ -4156,6 +4213,59 @@ mod tls12_loopback_tests {
         client.read_tls(&s);
         client.process_new_packets().unwrap();
         assert_eq!(client.take_received_plaintext(), b"pong from server");
+    }
+
+    /// Issue #30 — `received_close_notify()` on the TLS 1.2 engines:
+    /// false until the peer's close_notify is processed (transport EOF
+    /// there means truncation), true after.
+    #[test]
+    fn close_notify_sets_received_flag_12() {
+        let (server_config, cert_der) = ecdsa_server12();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"loopback12-cn-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"loopback12-cn-server", b"nonce", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection12::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        assert!(!client.received_close_notify());
+        assert!(!server.received_close_notify());
+
+        server.send_close_notify();
+        let s = server.write_tls();
+        assert!(!s.is_empty());
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert!(client.received_close_notify());
+        assert!(!server.received_close_notify());
+
+        client.send_close_notify();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert!(server.received_close_notify());
     }
 
     /// Drives a full TLS 1.0/1.1 legacy CBC handshake (client capped at

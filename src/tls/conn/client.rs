@@ -440,6 +440,11 @@ pub struct ClientConnection {
     config: ClientConfig,
     server_name: String,
     state: State,
+    /// True once the peer's close_notify alert has been processed. Lets
+    /// callers distinguish a graceful TLS shutdown from an abrupt
+    /// transport close (truncation attack) — `state` alone can't, since
+    /// `fail()` also parks the connection in [`State::Closed`].
+    received_close_notify: bool,
 
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
@@ -1070,6 +1075,7 @@ impl ClientConnection {
             config,
             server_name: String::from(server_name),
             state: State::WaitServerHello,
+            received_close_notify: false,
             x25519,
             p256,
             p384,
@@ -1480,6 +1486,15 @@ impl ClientConnection {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the peer's close_notify alert has been processed.
+    ///
+    /// After transport EOF, a `false` here means the TLS stream was cut
+    /// without a graceful shutdown — for EOF-delimited application
+    /// protocols that is a truncation attack indicator (RFC 8446 §6.1).
+    pub fn received_close_notify(&self) -> bool {
+        self.received_close_notify
+    }
+
     /// What the client learnt about ECH from the server's ServerHello,
     /// or `None` if real-ECH was not attempted (no `ech` configured, or
     /// only GREASE), or the SH has not yet been processed. Useful after
@@ -1553,6 +1568,7 @@ impl ClientConnection {
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
                     if alert.description == AlertDescription::CloseNotify {
+                        self.received_close_notify = true;
                         self.state = State::Closed;
                         return Ok(());
                     }

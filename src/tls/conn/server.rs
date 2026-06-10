@@ -759,6 +759,11 @@ pub struct ServerConnection<R: RngCore> {
     config: ServerConfig,
     rng: R,
     state: State,
+    /// True once the peer's close_notify alert has been processed. Lets
+    /// callers distinguish a graceful TLS shutdown from an abrupt
+    /// transport close (truncation attack) — `state` alone can't, since
+    /// failure paths also park the connection in [`State::Closed`].
+    received_close_notify: bool,
 
     suite: Option<SuiteParams>,
     client_hs_secret: Option<Secret>,
@@ -944,6 +949,7 @@ impl<R: RngCore> ServerConnection<R> {
             config,
             rng,
             state: State::WaitClientHello,
+            received_close_notify: false,
             suite: None,
             client_hs_secret: None,
             client_app_secret: None,
@@ -1192,6 +1198,15 @@ impl<R: RngCore> ServerConnection<R> {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the peer's close_notify alert has been processed.
+    ///
+    /// After transport EOF, a `false` here means the TLS stream was cut
+    /// without a graceful shutdown — for EOF-delimited application
+    /// protocols that is a truncation attack indicator (RFC 8446 §6.1).
+    pub fn received_close_notify(&self) -> bool {
+        self.received_close_notify
+    }
+
     /// The ALPN protocol picked from the client's offer, if any.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
         self.alpn_negotiated.as_deref()
@@ -1331,6 +1346,7 @@ impl<R: RngCore> ServerConnection<R> {
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
                     if alert.description == AlertDescription::CloseNotify {
+                        self.received_close_notify = true;
                         self.state = State::Closed;
                         return Ok(());
                     }

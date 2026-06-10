@@ -346,6 +346,11 @@ pub struct ServerConnection12<R: RngCore> {
     config: ServerConfig12,
     rng: R,
     state: State,
+    /// True once the peer's close_notify alert has been processed. Lets
+    /// callers distinguish a graceful TLS shutdown from an abrupt
+    /// transport close (truncation attack) — `state` alone can't, since
+    /// failure paths also park the connection in [`State::Closed`].
+    received_close_notify: bool,
 
     /// Inbound TLS bytes to parse into records.
     inbuf: Vec<u8>,
@@ -458,6 +463,7 @@ impl<R: RngCore> ServerConnection12<R> {
             config,
             rng,
             state: State::WaitClientHello,
+            received_close_notify: false,
             inbuf: Vec::new(),
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
@@ -610,6 +616,15 @@ impl<R: RngCore> ServerConnection12<R> {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the peer's close_notify alert has been processed.
+    ///
+    /// After transport EOF, a `false` here means the TLS stream was cut
+    /// without a graceful shutdown — for EOF-delimited application
+    /// protocols that is a truncation attack indicator (RFC 5246 §7.2.1).
+    pub fn received_close_notify(&self) -> bool {
+        self.received_close_notify
+    }
+
     /// Sends application data (only valid once the handshake completes).
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
@@ -671,6 +686,7 @@ impl<R: RngCore> ServerConnection12<R> {
                     // close_notify are non-fatal.
                     match alert.description {
                         AlertDescription::CloseNotify => {
+                            self.received_close_notify = true;
                             self.state = State::Closed;
                             return Ok(());
                         }
