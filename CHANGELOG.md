@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.8](https://github.com/KarpelesLab/purecrypto/compare/v0.6.7...v0.6.8) - 2026-06-10
+
+### Other
+
+- expose peer_certificates(), alpn_protocol(), negotiated_cipher_suite()
+- expose received_close_notify() so callers can detect truncation
+- wipe recovered plaintext / unwrapped keys in cipher decrypt paths
+- pc_mldsa_verify enforces the caller-pinned parameter set
+- check sign-buffer capacity before consuming a stateful one-time key
+- make pc_tls_pop/recv and pc_quic_pop/recv_datagram non-destructive on BufferTooSmall
+- converge argv/file secret hygiene on the enc conventions
+- write unwrapped/derived key material with private file mode
+- checked validity_days arithmetic (-days overflow)
+- lock stateful pkeyutl sign against concurrent OTS index reuse
+- RESET_STREAM charges connection flow control for final size
+- anchor flow-control credit on consumption, not receipt
+- enforce zero reserved header bits post-AEAD (RFC 9000 §17)
+- reject duplicate transport parameters (RFC 9000 §7.4.1)
+- cap ACK range-count preallocation by wire-length bound
+- silently discard invalid records instead of failing the connection
+- stop overclaiming a matched-pair ECDSA whitelist for X.509 chains
+- bind Time body format to its ASN.1 tag when reading (RFC 5280 §4.1.2.5)
+- evaluate subject CN against name constraints when leaf has no dNSName SAN
+- enforce RFC 5246 7.4.7.1 premaster client_version rollback check
+- fix Lucky13 equalizer off-by-one compression count
+- pin the HelloRetryRequest cipher suite across to the ServerHello
+- authenticate the server before surfacing retry_configs
+- quarantine accepted 0-RTT early data away from 1-RTT plaintext
+- wipe transient secrets before return in keygen/sign/decaps
+- guard argon2 memory-matrix size with checked_mul
+- validate keys parsed from SPKI/PKCS#8; fix FIPS 203 §7.2 modulus check
+- Miller-Rabin safe-prime validation in DhGroup::from_custom
+- reject non-canonical ristretto255 encodings (s >= p)
+- remove secret-dependent memory access in implicit-rejection decrypt
+- CMAC/GMAC — set Mac::OUTPUT_LEN so trait verify rejects truncated tags
+- Mac::verify — reject empty expected tag for variable-output MACs
+- fix HSS upper-level LM-OTS randomizer reuse (one-time-key reuse)
+- recoverable ECDSA — sign_recoverable + public-key recovery (ecrecover)
+
 ## [0.6.7](https://github.com/KarpelesLab/purecrypto/compare/v0.6.6...v0.6.7) - 2026-06-08
 
 ### Other
