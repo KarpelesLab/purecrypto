@@ -326,9 +326,25 @@ impl Validity {
     }
 }
 
-fn read_time(reader: &mut Reader) -> Result<Time, Error> {
+/// Reads one RFC 5280 `Time` (`UTCTime` or `GeneralizedTime`) from `reader`,
+/// keying the expected body format off the ASN.1 tag rather than the body
+/// length: `UTCTime` (0x17) must be exactly the 13-byte `YYMMDDHHMMSSZ` form
+/// and `GeneralizedTime` (0x18) exactly the 15-byte `YYYYMMDDHHMMSSZ` form.
+/// RFC 5280 §4.1.2.5 binds each format to its tag, so a mismatched pair —
+/// e.g. a 13-byte body under the GeneralizedTime tag — is rejected up front.
+/// This guarantees the two-digit-year century rule in [`Time::components`]
+/// (which keys off the 13-byte stored form) only ever applies to a value
+/// that was actually tagged `UTCTime` on the wire; after this check the
+/// stored length uniquely identifies the kind, so `Time` needs no separate
+/// discriminant.
+pub(super) fn read_time(reader: &mut Reader) -> Result<Time, Error> {
     let (t, value) = reader.read_any()?;
-    if t != tag::UTC_TIME && t != tag::GENERALIZED_TIME {
+    let expected_len = match t {
+        tag::UTC_TIME => 13,
+        tag::GENERALIZED_TIME => 15,
+        _ => return Err(Error::Malformed),
+    };
+    if value.len() != expected_len {
         return Err(Error::Malformed);
     }
     let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
@@ -449,6 +465,52 @@ mod tests {
         assert_eq!(g[0], tag::GENERALIZED_TIME);
         // No 4-digit-year widening happened — the body is the original 13 bytes.
         assert_eq!(g[1] as usize, 13);
+    }
+
+    #[test]
+    fn read_time_binds_format_to_tag() {
+        // RFC 5280 §4.1.2.5 binds the body format to the tag. The correct
+        // pairings parse...
+        let ok_utc = encode_string(tag::UTC_TIME, "240101000000Z");
+        let t = read_time(&mut Reader::new(&ok_utc)).unwrap();
+        assert_eq!(t.to_unix_checked(), Some(1_704_067_200)); // 2024-01-01
+        let ok_gen = encode_string(tag::GENERALIZED_TIME, "20240101000000Z");
+        let t = read_time(&mut Reader::new(&ok_gen)).unwrap();
+        assert_eq!(t.to_unix_checked(), Some(1_704_067_200));
+        // ...a 13-byte (UTCTime-shaped) body under the GeneralizedTime tag is
+        // rejected up front — otherwise the century rule would silently apply
+        // to a GeneralizedTime, shifting the year by ±100...
+        let bad_gen = encode_string(tag::GENERALIZED_TIME, "240101000000Z");
+        assert!(read_time(&mut Reader::new(&bad_gen)).is_err());
+        // ...a 15-byte (GeneralizedTime-shaped) body under the UTCTime tag is
+        // rejected too...
+        let bad_utc = encode_string(tag::UTC_TIME, "20240101000000Z");
+        assert!(read_time(&mut Reader::new(&bad_utc)).is_err());
+        // ...and any other tag (here UTF8String) never parses as a Time.
+        let other = encode_string(tag::UTF8_STRING, "240101000000Z");
+        assert!(read_time(&mut Reader::new(&other)).is_err());
+    }
+
+    #[test]
+    fn validity_decode_rejects_tag_format_mismatch() {
+        // A Validity whose notAfter is a UTCTime-shaped body under the
+        // GeneralizedTime tag must fail to decode.
+        let body = [
+            encode_string(tag::UTC_TIME, "240101000000Z"),
+            encode_string(tag::GENERALIZED_TIME, "340101000000Z"),
+        ]
+        .concat();
+        let der = encode_sequence(&body);
+        assert!(Validity::decode(&mut Reader::new(&der)).is_err());
+        // The well-formed mixed-tag variant still decodes.
+        let body = [
+            encode_string(tag::UTC_TIME, "240101000000Z"),
+            encode_string(tag::GENERALIZED_TIME, "20340101000000Z"),
+        ]
+        .concat();
+        let der = encode_sequence(&body);
+        let v = Validity::decode(&mut Reader::new(&der)).unwrap();
+        assert!(v.accepts(&Time::utc(2026, 5, 26, 12, 0, 0)));
     }
 
     #[test]

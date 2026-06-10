@@ -35,6 +35,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use super::time::read_time;
 use super::{AnyPublicKey, CertSigner, DistinguishedName, Error, Time, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_integer, encode_octet_string, encode_sequence, encode_tlv,
@@ -477,16 +478,6 @@ fn strip_leading_sign_zero(bytes: &[u8]) -> &[u8] {
     } else {
         bytes
     }
-}
-
-/// Reads one `Time` (`UTCTime` or `GeneralizedTime`) from `reader`.
-fn read_time(reader: &mut Reader) -> Result<Time, Error> {
-    let (t, value) = reader.read_any()?;
-    if t != tag::UTC_TIME && t != tag::GENERALIZED_TIME {
-        return Err(Error::Malformed);
-    }
-    let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
-    Ok(Time::from_repr(s))
 }
 
 #[cfg(test)]
