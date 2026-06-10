@@ -248,6 +248,10 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// ACK-driven retransmit state.
     retransmit: Retransmit13,
     last_now: Duration,
+    /// True once the caller has driven the clock via [`Self::set_now`] /
+    /// [`Self::on_timeout`]. Governs the cookie-clock fallback — see
+    /// [`Self::cookie_now_minutes`].
+    clock_driven: bool,
 }
 
 impl<R: RngCore> DtlsServerConnection13<R> {
@@ -297,6 +301,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             pending_acks: Vec::new(),
             retransmit: Retransmit13::new(),
             last_now: Duration::from_secs(0),
+            clock_driven: false,
         }
     }
 
@@ -359,19 +364,45 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
     /// Advances the connection's monotonic clock to `now`. Callers SHOULD
     /// invoke this (or [`Self::on_timeout`]) regularly so the cookie
-    /// generator sees a current time — otherwise a server with no
-    /// timeouts firing would reuse a stale cookie-issue timestamp and the
-    /// embedded-`TS` age check (RFC 9147 §5.1) would be effectively
-    /// disabled. Idempotent in the rewind direction (older times are
-    /// ignored).
+    /// generator sees a current time. Idempotent in the rewind direction
+    /// (older times are ignored).
+    ///
+    /// Cookie-clock contract: once this (or `on_timeout`) has been called,
+    /// the caller's clock stamps and validates HelloRetryRequest cookies.
+    /// If the caller NEVER drives the clock, the server falls back to wall
+    /// time under `std` so the cookie max-age bound (RFC 9147 §5.1) stays
+    /// real; on `no_std` builds with no caller clock, cookies are issued
+    /// and validated at `TS = 0` and therefore never expire — drive this
+    /// method if cookie expiry matters there. Avoid switching from the
+    /// never-driven mode to the caller-driven mode while a cookie exchange
+    /// is in flight: a cookie stamped from one clock will not validate
+    /// against the other.
     pub fn set_now(&mut self, now: Duration) {
+        self.clock_driven = true;
         if now > self.last_now {
             self.last_now = now;
         }
     }
 
+    /// Clock used to stamp / validate HelloRetryRequest cookies, in
+    /// minutes. Uses the caller-driven sans-I/O clock when the caller has
+    /// ever advanced it; otherwise (under `std`) falls back to wall time so
+    /// that with `last_now` stuck at 0 every cookie would not be issued AND
+    /// validated at `TS = 0`, which would silently disable the 10-minute
+    /// cookie max-age replay bound.
+    fn cookie_now_minutes(&self) -> u32 {
+        #[cfg(feature = "std")]
+        if !self.clock_driven
+            && let Ok(d) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        {
+            return (d.as_secs() / 60) as u32;
+        }
+        (self.last_now.as_secs() / 60) as u32
+    }
+
     /// Drives the retransmit machine.
     pub fn on_timeout(&mut self, now: Duration) {
+        self.clock_driven = true;
         self.last_now = now;
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
@@ -855,7 +886,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 .as_ref()
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
-            let now_min = (self.last_now.as_secs() / 60) as u32;
+            let now_min = self.cookie_now_minutes();
             let cookie = cg.generate_with_aux(&self.peer_addr, &ch.random, &ch_fp, &aux, now_min);
 
             // Emit HRR using the local (suite, group_needed) — we do NOT
@@ -896,7 +927,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 return Err(Error::Decode);
             }
             let cookie = &cookie_bytes[2..];
-            let now_min = (self.last_now.as_secs() / 60) as u32;
+            let now_min = self.cookie_now_minutes();
             let aux = cg
                 .validate_with_aux(&self.peer_addr, &ch.random, &ch_fp, now_min, cookie)
                 .ok_or(Error::IllegalParameter)?;

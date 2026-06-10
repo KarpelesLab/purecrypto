@@ -354,6 +354,66 @@ fn set_now_advances_cookie_clock_dtls12() {
     assert!(!hvr_rewound.is_empty());
 }
 
+/// Regression (cookie max-age vs a never-driven clock), DTLS 1.2 flavour
+/// of `dtls13::stale_ts_zero_cookie_rejected_without_caller_clock_13`:
+/// under `std` a server whose sans-I/O clock was never driven stamps and
+/// validates HelloVerifyRequest cookies with wall time, so a `TS = 0`
+/// cookie is rejected as expired instead of validating forever.
+#[cfg(feature = "std")]
+#[test]
+fn stale_ts_zero_cookie_rejected_without_caller_clock_12() {
+    use core::time::Duration;
+    let secret = [0x42u8; 32];
+
+    // Server B: caller-driven clock pinned at t=0 → issues TS=0 cookies.
+    let (cfg_b, cert) = make_server();
+    let cfg_b = cfg_b
+        .with_cookie_secret(secret)
+        .require_cookie_exchange(true);
+    let mut client = make_client(&cert);
+    let rng_b = HmacDrbg::<Sha256>::new(b"dtls12-cookie-clk-b", b"nonce", &[]);
+    let mut server_b = DtlsServerConnection12::new(Arc::new(cfg_b), b"client-addr".to_vec(), rng_b);
+    server_b.set_now(Duration::from_secs(0));
+
+    // CH1 → B → HVR(TS=0 cookie) → client → CH2 echoing the cookie.
+    for dg in client.pop_outbound_datagrams() {
+        server_b.feed_datagram(&dg).unwrap();
+    }
+    let hvr = server_b.pop_outbound_datagrams();
+    assert!(!hvr.is_empty());
+    for dg in &hvr {
+        client.feed_datagram(dg).unwrap();
+    }
+    let ch2 = client.pop_outbound_datagrams();
+    assert!(!ch2.is_empty());
+
+    // Server A: same cookie secret + peer address, clock NEVER driven →
+    // wall time. The TS=0 cookie is decades past the 10-minute window: it
+    // must be rejected (no server flight, no error).
+    let (cfg_a, _) = make_server();
+    let cfg_a = cfg_a
+        .with_cookie_secret(secret)
+        .require_cookie_exchange(true);
+    let rng_a = HmacDrbg::<Sha256>::new(b"dtls12-cookie-clk-a", b"nonce", &[]);
+    let mut server_a = DtlsServerConnection12::new(Arc::new(cfg_a), b"client-addr".to_vec(), rng_a);
+    for dg in &ch2 {
+        assert_eq!(server_a.feed_datagram(dg), Ok(()));
+    }
+    assert!(
+        server_a.pop_outbound_datagrams().is_empty(),
+        "expired TS=0 cookie must be silently rejected under a wall clock"
+    );
+
+    // Control: the TS=0-clock server still accepts its own cookie.
+    for dg in &ch2 {
+        server_b.feed_datagram(dg).unwrap();
+    }
+    assert!(
+        !server_b.pop_outbound_datagrams().is_empty(),
+        "control: TS=0 cookie validates on the t=0 caller-clock server"
+    );
+}
+
 #[test]
 fn application_data_both_ways_12() {
     let (server_cfg, cert) = make_server();
@@ -1402,6 +1462,66 @@ mod dtls13 {
         );
         assert!(!server.is_handshake_complete());
         assert!(server.send(b"after fatal alert").is_err());
+    }
+
+    /// Regression (cookie max-age vs a never-driven clock): with the
+    /// sans-I/O clock never driven, cookies used to be issued AND validated
+    /// at `TS = 0`, which disabled the 10-minute max-age replay bound
+    /// entirely. Under `std` the server now falls back to wall time, so a
+    /// cookie stamped `TS = 0` is rejected as expired (silent drop — the
+    /// epoch-0 path is spoofable), while a server whose caller pinned the
+    /// clock at t=0 still accepts it.
+    #[cfg(feature = "std")]
+    #[test]
+    fn stale_ts_zero_cookie_rejected_without_caller_clock_13() {
+        use core::time::Duration;
+        let secret = [0x42u8; 32];
+
+        // Server B: caller-driven clock pinned at t=0 → issues TS=0 cookies.
+        let (cfg_b, cert) = make_server13();
+        let cfg_b = cfg_b.with_cookie_secret(secret);
+        let mut client = make_client13(&cert);
+        let rng_b = HmacDrbg::<Sha256>::new(b"dtls13-cookie-clk-b", b"nonce", &[]);
+        let mut server_b =
+            DtlsServerConnection13::new(Arc::new(cfg_b), b"client-addr".to_vec(), rng_b);
+        server_b.set_now(Duration::from_secs(0));
+
+        // CH1 → B → HRR(TS=0 cookie) → client → CH2 echoing the cookie.
+        for dg in client.pop_outbound_datagrams() {
+            server_b.feed_datagram(&dg).unwrap();
+        }
+        let hrr = server_b.pop_outbound_datagrams();
+        assert!(!hrr.is_empty());
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(!ch2.is_empty());
+
+        // Server A: same cookie secret + peer address, clock NEVER driven →
+        // wall time. The TS=0 cookie is decades past the 10-minute window:
+        // it must be rejected (no server flight, no error).
+        let (cfg_a, _) = make_server13();
+        let cfg_a = cfg_a.with_cookie_secret(secret);
+        let rng_a = HmacDrbg::<Sha256>::new(b"dtls13-cookie-clk-a", b"nonce", &[]);
+        let mut server_a =
+            DtlsServerConnection13::new(Arc::new(cfg_a), b"client-addr".to_vec(), rng_a);
+        for dg in &ch2 {
+            assert_eq!(server_a.feed_datagram(dg), Ok(()));
+        }
+        assert!(
+            server_a.pop_outbound_datagrams().is_empty(),
+            "expired TS=0 cookie must be silently rejected under a wall clock"
+        );
+
+        // Control: the TS=0-clock server still accepts its own cookie.
+        for dg in &ch2 {
+            server_b.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            !server_b.pop_outbound_datagrams().is_empty(),
+            "control: TS=0 cookie validates on the t=0 caller-clock server"
+        );
     }
 
     /// Regression (retransmit GiveUp must not kill established connections):
