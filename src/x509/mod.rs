@@ -159,6 +159,9 @@ pub mod oid {
     pub const ID_SHA384: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 2];
     /// `id-sha512` (2.16.840.1.101.3.4.2.3).
     pub const ID_SHA512: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 2, 3];
+    /// `id-mgf1` (1.2.840.113549.1.1.8) — the MGF1 mask generation function
+    /// inside `RSASSA-PSS-params` (RFC 4055 §2.2).
+    pub const ID_MGF1: &[u64] = &[1, 2, 840, 113549, 1, 1, 8];
 }
 
 /// Errors from X.509 encoding, parsing, and verification.
