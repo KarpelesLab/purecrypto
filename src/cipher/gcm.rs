@@ -160,7 +160,18 @@ impl<C: BlockCipher> Gcm<C> {
 
     /// NIST SP 800-38D §5.2.1.1: |IV| ∈ [1, 2^64−1] bits. We surface the
     /// upper end as a byte cap; the lower end forbids zero-length nonces.
-    const MAX_NONCE_LEN: usize = (1usize << 61) - 1;
+    ///
+    /// Computed in `u64` and saturated to `usize::MAX` so 16/32-bit targets
+    /// (where `1usize << 61` would not even compile) keep a valid bound: any
+    /// slice they can address is shorter than 2^61 − 1 bytes anyway.
+    const MAX_NONCE_LEN: usize = {
+        const CAP: u64 = (1u64 << 61) - 1;
+        if CAP > usize::MAX as u64 {
+            usize::MAX
+        } else {
+            CAP as usize
+        }
+    };
     /// NIST SP 800-38D §5.2.1.1: |P| ≤ 2^39 − 256 bits, i.e. `(1<<36) − 32`
     /// bytes. Above this, the 32-bit GCTR counter wraps and reuses keystream.
     pub const MAX_PLAINTEXT_LEN: u64 = (1u64 << 36) - 32;
