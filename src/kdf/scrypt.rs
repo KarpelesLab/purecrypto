@@ -73,6 +73,24 @@ pub fn scrypt(
     if out.is_empty() {
         return Err(Error::InvalidParam);
     }
+    // p · ⌈dkLen/32⌉ ≤ 2³² − 1 (documented above; RFC 7914 §2's dkLen / p
+    // constraints with hLen = 32): keeps the final PBKDF2 expansion within
+    // its 32-bit block counter instead of panicking there.
+    let dk_blocks = (out.len() as u64).div_ceil(32);
+    if (p as u64)
+        .checked_mul(dk_blocks)
+        .is_none_or(|v| v > u32::MAX as u64)
+    {
+        return Err(Error::InvalidParam);
+    }
+    // The first expansion derives p·128·r bytes = 4·r·p blocks, which must
+    // also fit the 32-bit block counter (RFC 7914 §2:
+    // p ≤ ((2³² − 1) · hLen) / MFLen). Checked here, before the b/v
+    // allocations, so violating params return InvalidParam rather than
+    // aborting on a huge allocation or panicking inside pbkdf2.
+    if 4u64 * (r as u64) * (p as u64) > u32::MAX as u64 {
+        return Err(Error::InvalidParam);
+    }
 
     // --- First PBKDF2 expansion: B = PBKDF2-HMAC-SHA256(P, S, 1, p·128·r) ---
     let mut b: Vec<u8> = vec![0u8; b_len];
@@ -233,6 +251,18 @@ mod tests {
         // r·N ≥ 2³⁰ → reject.
         assert_eq!(
             scrypt(b"p", b"s", 30, 1, 1, &mut out),
+            Err(Error::InvalidParam)
+        );
+        // p · ⌈dkLen/32⌉ > 2³² − 1 → reject (documented bound) — must
+        // return InvalidParam before any allocation / PBKDF2 panic.
+        let mut out64 = [0u8; 64];
+        assert_eq!(
+            scrypt(b"p", b"s", 4, 1, u32::MAX, &mut out64),
+            Err(Error::InvalidParam)
+        );
+        // 4·r·p > 2³² − 1 (first-expansion block counter) → reject.
+        assert_eq!(
+            scrypt(b"p", b"s", 1, 1 << 20, 1 << 11, &mut out),
             Err(Error::InvalidParam)
         );
     }
