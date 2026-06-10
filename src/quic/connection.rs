@@ -1428,10 +1428,14 @@ impl QuicConnection {
             return;
         }
         // Stash the old-phase rx keys as the "previous" before
-        // overwriting them with next-next.
+        // overwriting them with next-next — along with the replay
+        // window accumulated under them (RFC 9001 §9.5: the replay
+        // constraint is per-key, so a delayed old-phase packet must
+        // be checked against the OLD key's accepted-PN state).
         {
             let lk = self.endpoint.crypto.at_mut(Level::OneRtt);
             lk.prev_rx_keys = lk.rx_by_phase[old_phase as usize].take();
+            lk.prev_rx_pn_window = lk.rx_pn_window;
         }
         // Sync the legacy `rx` slot to the new phase's keys + roll the
         // next-next rx chain into the slot we just vacated.
@@ -2611,7 +2615,6 @@ impl QuicConnection {
         } else {
             false
         };
-        let _ = opened_with_prev;
 
         // RFC 9000 §17.3.1 — the short-header reserved bits (0x18) MUST
         // be zero after header-protection removal; non-zero is a
@@ -2623,27 +2626,42 @@ impl QuicConnection {
         // RFC 9001 §9.5 — per-key PN replay check. The Application PN
         // space's replay window lives on the OneRtt level (1-RTT rx
         // keys are what verified `pn`). Like the long-header path,
-        // we check freshness *after* AEAD success.
-        if !self
-            .endpoint
-            .crypto
-            .at(Level::OneRtt)
-            .rx_pn_window
-            .is_fresh(pn)
+        // we check freshness *after* AEAD success. The window is
+        // per-KEY: a packet that only opened under `prev_rx_keys` is
+        // checked against the stashed previous-key window — NOT the
+        // live one (which restarted when the phase flip committed).
         {
-            return Ok(datagram.len());
+            let lk = self.endpoint.crypto.at_mut(Level::OneRtt);
+            let window = if opened_with_prev {
+                &mut lk.prev_rx_pn_window
+            } else {
+                &mut lk.rx_pn_window
+            };
+            if !window.is_fresh(pn) {
+                return Ok(datagram.len());
+            }
+            window.record(pn);
         }
-        self.endpoint
-            .crypto
-            .at_mut(Level::OneRtt)
-            .rx_pn_window
-            .record(pn);
 
-        // RFC 9001 §6.2: a successfully-opened phase-flipped packet
-        // commits the rx phase (and, if we haven't already initiated a
-        // tx-side update, also commits the tx side).
-        if self.one_rtt_phase_initialized && pkt_phase != current_phase {
+        // RFC 9001 §6.2 / §6.3: a packet successfully opened with the
+        // *next*-phase keys commits the rx phase (and, if we haven't
+        // already initiated a tx-side update, also commits the tx
+        // side). A packet that only opened under `prev_rx_keys` is a
+        // delayed/replayed OLD-phase packet — RFC 9001 §6.2: "An
+        // endpoint MUST NOT initiate a key update [...] as a result of
+        // unprotecting packets with old keys" — so it MUST NOT drive a
+        // (backwards) phase commit.
+        if self.one_rtt_phase_initialized && pkt_phase != current_phase && !opened_with_prev {
             self.commit_rx_key_phase_flip(pkt_phase);
+            // The commit restarted `rx_pn_window` for the new key; the
+            // committing packet itself was opened under that key, so
+            // seed the fresh window with its PN — otherwise a replay
+            // of this exact packet would pass the empty window.
+            self.endpoint
+                .crypto
+                .at_mut(Level::OneRtt)
+                .rx_pn_window
+                .record(pn);
         } else if self.one_rtt_phase_initialized
             && pkt_phase == current_phase
             && self
@@ -5694,6 +5712,116 @@ mod tests {
         assert!(
             accumulated.windows(b"PHASE1".len()).any(|w| w == b"PHASE1"),
             "phase-1 bytes must also be delivered"
+        );
+    }
+
+    /// A1 regression — RFC 9001 §6.2 / §6.3: a 1-RTT packet that only
+    /// decrypts under `prev_rx_keys` (a delayed or replayed OLD-phase
+    /// ciphertext) MUST NOT initiate a key update. Before the fix, any
+    /// old-phase packet spuriously re-ran `commit_rx_key_phase_flip`
+    /// (flipping `one_rtt_phase` backwards, rotating the tx keys, and
+    /// wiping the per-key PN replay window), letting an off-path
+    /// attacker replay a captured pre-update ciphertext to desync the
+    /// key phase and bypass replay protection.
+    #[test]
+    fn key_update_old_phase_packet_does_not_recommit() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Materialize a stream on the server.
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"abc").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Capture a phase-0 packet (buffered, not delivered), then a
+        // phase-1 packet after the server initiates the update.
+        let sid = StreamId(cid.0);
+        s.write(sid, b"PHASE0").expect("server write phase 0");
+        let phase0_dg = s.pop_datagram();
+        assert!(!phase0_dg.is_empty(), "phase-0 packet captured");
+        s.initiate_key_update().expect("server initiates");
+        s.write(sid, b"PHASE1").expect("server write phase 1");
+        let phase1_dg = s.pop_datagram();
+        assert!(!phase1_dg.is_empty(), "phase-1 packet captured");
+
+        // New-phase packet arrives first → the client commits phase 1.
+        c.feed_datagram(&phase1_dg).expect("client feed phase 1");
+        assert_eq!(c.endpoint.crypto.one_rtt_phase, 1);
+
+        // Snapshot the tx keys and the current-key replay window.
+        let tx_secret = c
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx
+            .as_ref()
+            .expect("tx keys")
+            .secret
+            .clone();
+        let window = c.endpoint.crypto.at(Level::OneRtt).rx_pn_window;
+
+        // Delayed old-phase packet: decrypts via `prev_rx_keys` but
+        // must not move any key-phase state.
+        c.feed_datagram(&phase0_dg).expect("feed delayed phase 0");
+        assert_eq!(
+            c.endpoint.crypto.one_rtt_phase, 1,
+            "old-phase packet must not flip the phase back"
+        );
+        assert_eq!(
+            c.endpoint
+                .crypto
+                .at(Level::OneRtt)
+                .tx
+                .as_ref()
+                .expect("tx keys")
+                .secret,
+            tx_secret,
+            "old-phase packet must not rotate the tx keys"
+        );
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).rx_pn_window == window,
+            "old-phase packet must not reset the current-key replay window"
+        );
+
+        // Off-path REPLAY of the same old-phase ciphertext: silently
+        // dropped (the previous-key window already holds its PN); no
+        // state moves and the replay window is NOT reset.
+        c.feed_datagram(&phase0_dg).expect("replay fed");
+        assert_eq!(
+            c.endpoint.crypto.one_rtt_phase, 1,
+            "replayed old-phase packet must not flip the phase"
+        );
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).rx_pn_window == window,
+            "replayed old-phase packet must not reset the replay window"
+        );
+
+        // Liveness: both sides still exchange data at the current phase.
+        c.write(cid, b"still-alive").expect("client write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(
+            s.endpoint.crypto.one_rtt_phase, 1,
+            "server stays at phase 1"
+        );
+        let mut buf = [0u8; 64];
+        let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        while let Ok((n, _fin)) = s.read(sid, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            got.windows(b"still-alive".len())
+                .any(|w| w == b"still-alive"),
+            "post-replay data must still flow at the current phase"
         );
     }
 

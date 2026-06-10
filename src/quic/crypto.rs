@@ -132,7 +132,7 @@ pub(crate) struct DirKeys {
 /// is also rejected (it cannot be proved fresh).
 ///
 /// This shape mirrors the DTLS replay window (`src/tls/dtls/replay.rs`).
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PnReplayWindow {
     /// Largest PN ever accepted under this key (the bit-0 anchor).
     top: u64,
@@ -297,6 +297,14 @@ pub(crate) struct LevelKeys {
     /// flipped can still decrypt. Holds the keys we just rotated out
     /// of `rx_by_phase[old_phase]`. Cleared on the next flip.
     pub(crate) prev_rx_keys: Option<DirKeys>,
+    /// RFC 9001 §9.5 — the replay window that was accumulated under
+    /// `prev_rx_keys` while those keys were current. Stashed alongside
+    /// `prev_rx_keys` on a phase-flip commit so a delayed old-phase
+    /// packet is still checked against the *old key's* accepted-PN
+    /// state (the live `rx_pn_window` restarts for the new key).
+    /// Without this, a replayed pre-update ciphertext would pass the
+    /// freshly-reset window and be processed twice.
+    pub(crate) prev_rx_pn_window: PnReplayWindow,
     /// True once we initiated a tx-side key update but haven't yet
     /// observed the peer use the new phase (which RFC 9001 §6.1
     /// requires before a second update can start).
@@ -346,6 +354,7 @@ impl LevelKeys {
             tx_by_phase: [None, None],
             rx_by_phase: [None, None],
             prev_rx_keys: None,
+            prev_rx_pn_window: PnReplayWindow::new(),
             tx_phase_pending_confirm: false,
             tx_hp_key_bytes: Vec::new(),
             rx_hp_key_bytes: Vec::new(),
@@ -1041,6 +1050,7 @@ mod tests {
             tx_by_phase: [None, None],
             rx_by_phase: [None, None],
             prev_rx_keys: None,
+            prev_rx_pn_window: PnReplayWindow::new(),
             tx_phase_pending_confirm: false,
             tx_hp_key_bytes: Vec::new(),
             rx_hp_key_bytes: Vec::new(),
