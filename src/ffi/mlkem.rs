@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_array};
 use crate::mlkem::{
     MlKem512Ciphertext, MlKem512DecapsKey, MlKem512EncapsKey, MlKem768Ciphertext,
     MlKem768DecapsKey, MlKem768EncapsKey, MlKem1024Ciphertext, MlKem1024DecapsKey,
@@ -231,17 +231,6 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
         wipe_array(&mut secret);
         PcStatus::Ok
     })
-}
-
-/// Overwrites `buf` with zeros and routes the read through
-/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
-/// stores (same pattern as ML-DSA/ML-KEM in `src/mldsa/mod.rs` and
-/// `src/mlkem/mod.rs`, avoiding a `zeroize` dep).
-fn wipe_array(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
 }
 
 /// Decapsulates `ct` under `k`, writing the 32-byte shared secret to `ss`.

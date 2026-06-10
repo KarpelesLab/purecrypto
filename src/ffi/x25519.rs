@@ -1,6 +1,6 @@
 //! C ABI for X25519 / X448 (RFC 7748).
 
-use super::common::{PcStatus, guard, slice};
+use super::common::{PcStatus, guard, slice, wipe_array};
 use crate::ec::x448::X448PrivateKey;
 use crate::ec::x25519::X25519PrivateKey;
 
@@ -23,8 +23,12 @@ pub unsafe extern "C" fn pc_x25519(scalar: *const u8, peer: *const u8, out: *mut
         let peer: [u8; 32] = p.try_into().unwrap();
         let sk = X25519PrivateKey::from_bytes(scalar);
         match sk.diffie_hellman(&peer) {
-            Ok(secret) => {
+            Ok(mut secret) => {
                 unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), out, 32) };
+                // Wipe the local copy of the shared secret before its array
+                // is returned to the stack frame; the caller already holds an
+                // authoritative copy at `out` (mirrors `pc_mlkem_decaps`).
+                wipe_array(&mut secret);
                 PcStatus::Ok
             }
             Err(_) => PcStatus::Verification,
@@ -73,8 +77,12 @@ pub unsafe extern "C" fn pc_x448(scalar: *const u8, peer: *const u8, out: *mut u
         let peer: [u8; 56] = p.try_into().unwrap();
         let sk = X448PrivateKey::from_bytes(scalar);
         match sk.diffie_hellman(&peer) {
-            Ok(secret) => {
+            Ok(mut secret) => {
                 unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), out, 56) };
+                // Wipe the local copy of the shared secret before its array
+                // is returned to the stack frame; the caller already holds an
+                // authoritative copy at `out` (mirrors `pc_mlkem_decaps`).
+                wipe_array(&mut secret);
                 PcStatus::Ok
             }
             Err(_) => PcStatus::Verification,

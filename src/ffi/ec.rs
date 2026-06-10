@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId,
     Ed448PrivateKey, Ed448Signature, Ed25519PrivateKey, Ed25519Signature,
@@ -525,9 +525,16 @@ pub unsafe extern "C" fn pc_ecdh(
             Ok(_) => return PcStatus::Unsupported,
             Err(_) => return PcStatus::BadEncoding,
         };
-        match sk.diffie_hellman(&peer) {
-            Ok(secret) => unsafe { out_write(&secret, out, out_len) },
-            Err(_) => PcStatus::Verification,
-        }
+        let mut secret = match sk.diffie_hellman(&peer) {
+            Ok(s) => s,
+            Err(_) => return PcStatus::Verification,
+        };
+        // Capture the status, then wipe the shared secret before its Vec is
+        // dropped so the bytes don't linger in a freed allocation — including
+        // on the `out_write` failure path (e.g. BufferTooSmall). Mirrors
+        // `pc_sm2_decrypt` / `pc_rsa_decrypt_oaep`.
+        let st = unsafe { out_write(&secret, out, out_len) };
+        wipe_vec(&mut secret);
+        st
     })
 }

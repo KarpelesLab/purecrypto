@@ -105,6 +105,16 @@ pub(super) fn wipe_vec(buf: &mut alloc::vec::Vec<u8>) {
     let _ = core::hint::black_box(&buf);
 }
 
+/// [`wipe_vec`] for stack-allocated buffers: zeros `buf` behind a
+/// `black_box` barrier so a shared secret copied out to the caller does
+/// not linger in the local array after the frame is popped.
+pub(super) fn wipe_array(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&buf);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
