@@ -309,6 +309,34 @@ impl CryptoBuf {
         true
     }
 
+    /// Confirms that the CRYPTO range `[offset, offset+length)` was
+    /// received by the peer (the packet that carried it was acked) and
+    /// prunes every `sent_history` entry fully covered by it. Without
+    /// pruning, the history grows for the lifetime of the connection —
+    /// post-handshake CRYPTO (NewSessionTicket flights) would
+    /// accumulate without bound.
+    ///
+    /// Entries only *partially* covered are kept: their unacked tail
+    /// may still be needed by [`Self::requeue_range`] for
+    /// retransmission. (Every carve is also covered by its own packet's
+    /// retransmit hint, so a fully-lost range remains reconstructable
+    /// from the entries that survive.)
+    pub(crate) fn on_range_acked(&mut self, offset: u64, length: u64) {
+        if length == 0 {
+            return;
+        }
+        let end = offset.saturating_add(length);
+        let covered: Vec<u64> = self
+            .sent_history
+            .range(offset..end)
+            .filter(|(k, v)| *k + v.len() as u64 <= end)
+            .map(|(k, _)| *k)
+            .collect();
+        for k in covered {
+            self.sent_history.remove(&k);
+        }
+    }
+
     /// Re-queue the most recent chunk at the *front* of `outbound` so it
     /// will be re-carved on the next packet build. Used by the PTO timer
     /// for the only level where we have a `last_sent` to retransmit.
@@ -543,6 +571,45 @@ mod tests {
             .expect("still in-order");
         assert_eq!(b.next_offset(), (half * 4) as u64);
         assert_eq!(b.total_pending_bytes(), 0);
+    }
+
+    /// A6 — acked CRYPTO ranges are pruned from `sent_history` so it
+    /// doesn't grow for the lifetime of the connection, while unacked
+    /// ranges stay retransmittable.
+    #[test]
+    fn sent_history_pruned_once_acked() {
+        let mut b = CryptoBuf::new();
+        b.enqueue_outbound(b"AAAABBBB");
+        let _ = b.carve(4).expect("carve 1"); // [0, 4)
+        let _ = b.carve(4).expect("carve 2"); // [4, 8)
+        assert_eq!(b.sent_history.len(), 2);
+
+        // Ack the first chunk — only its entry is pruned.
+        b.on_range_acked(0, 4);
+        assert_eq!(b.sent_history.len(), 1);
+        // The acked range can no longer be requeued (no-op)…
+        assert!(!b.requeue_range(0, 4));
+        // …but the unacked one still can.
+        assert!(b.requeue_range(4, 4));
+        let (off, chunk) = b.carve(100).expect("recarve");
+        assert_eq!(off, 4);
+        assert_eq!(chunk, b"BBBB");
+
+        // Ack the rest — history fully drains.
+        b.on_range_acked(4, 4);
+        assert!(b.sent_history.is_empty());
+    }
+
+    /// A partially-acked history entry is retained: its unacked tail
+    /// must remain available for retransmission.
+    #[test]
+    fn sent_history_partial_ack_keeps_covering_entry() {
+        let mut b = CryptoBuf::new();
+        b.enqueue_outbound(b"AAAAAAAA");
+        let _ = b.carve(8).expect("carve"); // single [0, 8) entry
+        b.on_range_acked(0, 4);
+        assert_eq!(b.sent_history.len(), 1, "partially-covered entry kept");
+        assert!(b.requeue_range(4, 4), "unacked tail still retransmittable");
     }
 
     /// Inserting a strictly-longer fragment at an offset that already

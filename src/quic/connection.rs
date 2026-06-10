@@ -2882,6 +2882,16 @@ impl QuicConnection {
                             self.requeue_from_hint(&pkt.retransmit_hint)?;
                         }
                     }
+                    // 6a. CRYPTO chunk accounting: acked packets confirm
+                    //     their CRYPTO ranges — prune the per-level
+                    //     sent-history so post-handshake CRYPTO
+                    //     (NewSessionTicket flights) doesn't grow it for
+                    //     the lifetime of the connection.
+                    for pkt in &acked {
+                        if !pkt.retransmit_hint.is_empty() {
+                            self.prune_crypto_history_from_hint(&pkt.retransmit_hint)?;
+                        }
+                    }
                     // 6b. STREAM chunk accounting: acked packets confirm
                     //     their stream ranges (pruning the sender-side
                     //     retransmission state); lost packets queue
@@ -3202,6 +3212,28 @@ impl QuicConnection {
                 .bufs
                 .at_mut(level)
                 .requeue_range(h.offset, h.length);
+        }
+        Ok(())
+    }
+
+    /// Parses a [`SentPacket::retransmit_hint`] blob for an *acked*
+    /// packet and prunes the confirmed CRYPTO ranges from the
+    /// appropriate level's sent-history (see
+    /// [`crate::quic::crypto_buf::CryptoBuf::on_range_acked`]).
+    fn prune_crypto_history_from_hint(&mut self, hint: &[u8]) -> Result<(), Error> {
+        let hints = parse_retransmit_hint(hint)?;
+        for h in hints {
+            let level = match h.level {
+                0 => Level::Initial,
+                1 => Level::EarlyData,
+                2 => Level::Handshake,
+                3 => Level::OneRtt,
+                _ => continue,
+            };
+            self.endpoint
+                .bufs
+                .at_mut(level)
+                .on_range_acked(h.offset, h.length);
         }
         Ok(())
     }
