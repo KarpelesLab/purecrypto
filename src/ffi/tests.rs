@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, lms, mlkem, quic, rsa, tls, x509, xmss};
+use super::{ec, hash, lms, mldsa, mlkem, quic, rsa, tls, x509, xmss};
 use crate::der::pem_decode;
 
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
@@ -323,6 +323,58 @@ fn quic_set_peer_addr_rejects_wrong_length() {
 
     unsafe { quic::pc_quic_free(q) };
     unsafe { quic::pc_quic_cfg_free(cfg) };
+}
+
+/// `pc_mldsa_verify` must honour the caller-pinned parameter set: a key of a
+/// different set must be rejected with `Unsupported`, never verified under
+/// the set the SPKI happens to declare.
+#[test]
+fn mldsa_verify_rejects_set_mismatch() {
+    let k = mldsa::pc_mldsa_generate(mldsa::set_id::ML_DSA_44);
+    assert!(!k.is_null());
+
+    let msg = b"mldsa set pinning";
+    let sig = read_out(|o, l| unsafe { mldsa::pc_mldsa_sign(k, msg.as_ptr(), msg.len(), o, l) });
+
+    let pub_pem = read_out(|o, l| unsafe { mldsa::pc_mldsa_public_to_pem(k, o, l) });
+    let spki = pem_decode(core::str::from_utf8(&pub_pem).unwrap(), "PUBLIC KEY").unwrap();
+
+    // Matching set verifies.
+    let st = unsafe {
+        mldsa::pc_mldsa_verify(
+            mldsa::set_id::ML_DSA_44,
+            spki.as_ptr(),
+            spki.len(),
+            msg.as_ptr(),
+            msg.len(),
+            sig.as_ptr(),
+            sig.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+
+    // A 44-key must NOT satisfy a caller demanding 65 or 87 — and an unknown
+    // set id must be rejected too.
+    for set in [mldsa::set_id::ML_DSA_65, mldsa::set_id::ML_DSA_87, 999] {
+        let st = unsafe {
+            mldsa::pc_mldsa_verify(
+                set,
+                spki.as_ptr(),
+                spki.len(),
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                sig.len(),
+            )
+        };
+        assert_eq!(
+            st,
+            PcStatus::Unsupported,
+            "set {set} must not verify under a 44 key"
+        );
+    }
+
+    unsafe { mldsa::pc_mldsa_free(k) };
 }
 
 // ---- Stateful hash-based signing: a size query must not burn a key ---------

@@ -468,6 +468,9 @@ pc_status pc_mldsa_private_to_pem(const PcMlDsa *k, uint8_t *out, size_t *out_le
 pc_status pc_mldsa_public_to_pem(const PcMlDsa *k, uint8_t *out, size_t *out_len);
 pc_status pc_mldsa_sign(const PcMlDsa *k, const uint8_t *msg, size_t msg_len,
                         uint8_t *out, size_t *out_len);
+/* `set` MUST match the parameter set declared by the SPKI's algorithm OID;
+ * a mismatch (or unknown `set`) returns PC_UNSUPPORTED rather than silently
+ * verifying under the key's own set. */
 pc_status pc_mldsa_verify(int32_t set, const uint8_t *spki, size_t spki_len,
                           const uint8_t *msg, size_t msg_len,
                           const uint8_t *sig, size_t sig_len);

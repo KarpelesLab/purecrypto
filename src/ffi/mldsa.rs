@@ -165,7 +165,10 @@ pub unsafe extern "C" fn pc_mldsa_sign(
 
 /// Verifies an ML-DSA signature `sig` over `msg` under the SPKI DER in
 /// `spki`. `set` selects the parameter set; pass the corresponding `PcMlDsa`
-/// constant.
+/// constant. `set` MUST match the parameter set declared by the SPKI's
+/// algorithm OID: a mismatch (or an unknown `set`) returns
+/// [`PcStatus::Unsupported`] — the caller-pinned set is never silently
+/// overridden by whatever the key material claims to be.
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -191,14 +194,12 @@ pub unsafe extern "C" fn pc_mldsa_verify(
             Ok(k) => k,
             Err(_) => return PcStatus::BadEncoding,
         };
+        // No wildcard fallback: a caller pinning ML-DSA-87 must not have the
+        // check silently downgraded because the SPKI declares ML-DSA-44.
         let ok = match (set, &any) {
             (set_id::ML_DSA_44, AnyPublicKey::MlDsa44(k)) => k.verify(sig, m, b""),
             (set_id::ML_DSA_65, AnyPublicKey::MlDsa65(k)) => k.verify(sig, m, b""),
             (set_id::ML_DSA_87, AnyPublicKey::MlDsa87(k)) => k.verify(sig, m, b""),
-            // Fall back: ignore `set` when the SPKI carries an unambiguous OID.
-            (_, AnyPublicKey::MlDsa44(k)) => k.verify(sig, m, b""),
-            (_, AnyPublicKey::MlDsa65(k)) => k.verify(sig, m, b""),
-            (_, AnyPublicKey::MlDsa87(k)) => k.verify(sig, m, b""),
             _ => return PcStatus::Unsupported,
         };
         if ok {
