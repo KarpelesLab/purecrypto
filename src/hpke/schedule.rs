@@ -45,9 +45,15 @@ impl Mode {
     }
 }
 
+/// RFC 9180 §9.5: the PSK must carry at least 32 bytes of entropy so it
+/// resists offline guessing; a 32-byte length floor is the enforceable
+/// proxy (matching BoringSSL / rust-hpke).
+const MIN_PSK_LEN: usize = 32;
+
 /// `VerifyPSKInputs(mode, psk, psk_id)` (RFC 9180 §5.1.1): the PSK and
 /// `psk_id` must be jointly empty or jointly non-empty, with the
-/// non-empty case selected only by PSK / AuthPSK modes.
+/// non-empty case selected only by PSK / AuthPSK modes. PSK modes
+/// additionally require `psk.len() >= 32` (RFC 9180 §9.5).
 fn verify_psk_inputs(mode: Mode, psk: &[u8], psk_id: &[u8]) -> Result<(), Error> {
     let got_psk = !psk.is_empty();
     let got_id = !psk_id.is_empty();
@@ -56,6 +62,9 @@ fn verify_psk_inputs(mode: Mode, psk: &[u8], psk_id: &[u8]) -> Result<(), Error>
     }
     if got_psk != mode.uses_psk() {
         return Err(Error::PskInputsInconsistent);
+    }
+    if mode.uses_psk() && psk.len() < MIN_PSK_LEN {
+        return Err(Error::PskTooShort);
     }
     Ok(())
 }

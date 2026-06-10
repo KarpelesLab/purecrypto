@@ -144,7 +144,7 @@ fn psk_mode_roundtrip() {
     let info = b"info";
     let aad = b"aad";
     let pt = b"plaintext";
-    let psk = b"a pre-shared key";
+    let psk = b"a pre-shared key of 32+ bytes!!!"; // RFC 9180 §9.5 minimum
     let psk_id = b"psk identifier";
     let mut rng = drbg();
 
@@ -180,6 +180,41 @@ fn psk_input_emptiness_rejected() {
     assert!(matches!(err, Err(Error::PskInputsInconsistent)));
 }
 
+/// PSK / AuthPSK modes reject PSKs shorter than RFC 9180 §9.5's 32-byte
+/// entropy floor; the boundary itself is accepted.
+#[test]
+fn psk_below_32_bytes_rejected() {
+    let mut rng = drbg();
+    let suite = CipherSuite::new(
+        HpkeKem::DhkemX25519HkdfSha256,
+        HpkeKdf::HkdfSha256,
+        HpkeAead::Aes128Gcm,
+    );
+    let (sk_r, pk_r) = suite.kem.generate_key_pair(&mut rng).unwrap();
+    let (sk_s, pk_s) = suite.kem.generate_key_pair(&mut rng).unwrap();
+    // A valid encapsulated share so receiver-side decap succeeds and the
+    // PSK check is what fires.
+    let (_, enc) = suite.kem.generate_key_pair(&mut rng).unwrap();
+
+    // 31 bytes: rejected in both PSK and AuthPSK modes, on both sides.
+    let short = [0xA5u8; 31];
+    let err = setup_sender_psk(&mut rng, suite, &pk_r, b"info", &short, b"id");
+    assert!(matches!(err, Err(Error::PskTooShort)));
+    let err = setup_sender_auth_psk(&mut rng, suite, &pk_r, b"info", &short, b"id", &sk_s);
+    assert!(matches!(err, Err(Error::PskTooShort)));
+    let err = setup_receiver_psk(suite, &enc, &sk_r, b"info", &short, b"id");
+    assert!(matches!(err, Err(Error::PskTooShort)));
+    let err = setup_receiver_auth_psk(suite, &enc, &sk_r, b"info", &short, b"id", &pk_s);
+    assert!(matches!(err, Err(Error::PskTooShort)));
+
+    // Exactly 32 bytes: accepted (full roundtrip).
+    let psk = [0x5Au8; 32];
+    let (enc, mut sender) = setup_sender_psk(&mut rng, suite, &pk_r, b"info", &psk, b"id").unwrap();
+    let mut receiver = setup_receiver_psk(suite, &enc, &sk_r, b"info", &psk, b"id").unwrap();
+    let ct = sender.seal(b"aad", b"hi").unwrap();
+    assert_eq!(receiver.open(b"aad", &ct).unwrap(), b"hi");
+}
+
 #[test]
 fn auth_mode_roundtrip() {
     let mut rng = drbg();
@@ -206,7 +241,7 @@ fn auth_psk_mode_roundtrip() {
     );
     let (sk_r, pk_r) = suite.kem.generate_key_pair(&mut rng).unwrap();
     let (sk_s, pk_s) = suite.kem.generate_key_pair(&mut rng).unwrap();
-    let psk = b"a pre-shared symmetric key";
+    let psk = b"a pre-shared symmetric key, 32B+"; // RFC 9180 §9.5 minimum
     let psk_id = b"id";
     let (enc, mut sender) =
         setup_sender_auth_psk(&mut rng, suite, &pk_r, b"info", psk, psk_id, &sk_s).unwrap();
