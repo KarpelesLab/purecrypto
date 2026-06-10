@@ -1237,17 +1237,21 @@ impl<R: RngCore> ServerConnection<R> {
     /// `client_application_traffic_secret_0`, exposed for keylogfile output
     /// in the server CLI. Available once the handshake completes.
     pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
-        self.client_app_secret.map(|s| s.as_slice().to_vec())
+        self.client_app_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// `server_application_traffic_secret_0`. See above.
     pub fn server_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
-        self.server_app_secret.map(|s| s.as_slice().to_vec())
+        self.server_app_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// `exporter_master_secret`. See above.
     pub fn exporter_master_secret(&self) -> Option<Vec<u8>> {
-        self.exporter_secret.map(|s| s.as_slice().to_vec())
+        self.exporter_secret.as_ref().map(|s| s.as_slice().to_vec())
     }
 
     /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705) —
@@ -2107,7 +2111,7 @@ impl<R: RngCore> ServerConnection<R> {
                 &shts,
             ));
             if self.early_data_accepted {
-                self.deferred_chts = Some(chts);
+                self.deferred_chts = Some(chts.clone());
             } else {
                 self.core.set_read(RecordCrypter::new(
                     suite.hash,
@@ -2119,7 +2123,7 @@ impl<R: RngCore> ServerConnection<R> {
             // RFC 9001 §8.4: ChangeCipherSpec MUST NOT appear in QUIC.
             self.core.emit_ccs();
         } else if self.early_data_accepted {
-            self.deferred_chts = Some(chts);
+            self.deferred_chts = Some(chts.clone());
         }
 
         // Encrypted server flight. Under PSK resumption we omit Certificate
@@ -2674,7 +2678,7 @@ impl<R: RngCore> ServerConnection<R> {
 
         // resumption_master_secret over Hash(CH..client Finished); set on
         // on_client_finished.
-        let rms = *self.rms.as_ref().expect("rms set");
+        let rms = self.rms.as_ref().expect("rms set").clone();
 
         // ticket_nonce: 4 random bytes is enough (RFC: <1..255>).
         let mut ticket_nonce = [0u8; 4];

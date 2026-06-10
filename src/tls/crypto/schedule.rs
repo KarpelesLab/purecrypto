@@ -36,10 +36,24 @@ const MAX_SECRET: usize = 64;
 /// A short byte string held inline: a key-schedule secret, a transcript hash,
 /// or a (possibly hybrid) (EC)DHE shared secret (≤ 64 bytes). Avoids heap
 /// allocation.
-#[derive(Clone, Copy)]
+///
+/// Deliberately NOT `Copy`: the buffer is wiped on drop (zero-overwrite
+/// fenced with `black_box`, the crate's standard wipe pattern), so
+/// long-lived holders — `KeySchedule.secret`, the `Option<Secret>`
+/// traffic/exporter/resumption fields on the TLS 1.3 / DTLS 1.3 / QUIC
+/// engines — do not retain key material after teardown. (Like every
+/// drop-wipe, this scrubs the final resting place; intermediate moves can
+/// still leave transient stack copies behind.)
+#[derive(Clone)]
 pub(crate) struct Secret {
     buf: [u8; MAX_SECRET],
     len: u8,
+}
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        crate::tls::conn::wipe(&mut self.buf);
+    }
 }
 
 impl Secret {
@@ -199,7 +213,7 @@ impl KeySchedule {
     /// The current Early Secret (only meaningful right after `new`).
     #[cfg(test)]
     pub(crate) fn early_secret(&self) -> Secret {
-        self.secret
+        self.secret.clone()
     }
 
     /// `binder_key = Derive-Secret(Early Secret, label, "")` (RFC 8446

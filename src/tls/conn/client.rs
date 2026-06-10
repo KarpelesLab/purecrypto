@@ -793,30 +793,38 @@ impl ClientConnection {
     /// The negotiated client_handshake_traffic_secret, available after
     /// `ServerHello` is processed. Intended for keylogfile output.
     pub fn client_handshake_traffic_secret(&self) -> Option<Vec<u8>> {
-        self.client_hs_secret.map(|s| s.as_slice().to_vec())
+        self.client_hs_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// The negotiated server_handshake_traffic_secret. See
     /// `client_handshake_traffic_secret`.
     pub fn server_handshake_traffic_secret(&self) -> Option<Vec<u8>> {
-        self.server_hs_secret.map(|s| s.as_slice().to_vec())
+        self.server_hs_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// `client_application_traffic_secret_0`, available after the handshake
     /// completes.
     pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
-        self.client_app_secret.map(|s| s.as_slice().to_vec())
+        self.client_app_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// `server_application_traffic_secret_0`, available after the handshake
     /// completes.
     pub fn server_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
-        self.server_app_secret.map(|s| s.as_slice().to_vec())
+        self.server_app_secret
+            .as_ref()
+            .map(|s| s.as_slice().to_vec())
     }
 
     /// `exporter_master_secret`, available after the handshake completes.
     pub fn exporter_master_secret(&self) -> Option<Vec<u8>> {
-        self.exporter_secret.map(|s| s.as_slice().to_vec())
+        self.exporter_secret.as_ref().map(|s| s.as_slice().to_vec())
     }
 
     /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705).
@@ -1962,7 +1970,7 @@ impl ClientConnection {
                 &shts,
             ));
             if self.early_data_offered {
-                self.deferred_client_hs_secret = Some(chts);
+                self.deferred_client_hs_secret = Some(chts.clone());
             } else {
                 self.core.set_write(RecordCrypter::new(
                     suite.hash,
@@ -1974,7 +1982,7 @@ impl ClientConnection {
             // RFC 9001 §8.4: ChangeCipherSpec MUST NOT appear in QUIC.
             self.core.emit_ccs(); // middlebox compatibility
         } else if self.early_data_offered {
-            self.deferred_client_hs_secret = Some(chts);
+            self.deferred_client_hs_secret = Some(chts.clone());
         }
 
         self.suite = Some(suite);
