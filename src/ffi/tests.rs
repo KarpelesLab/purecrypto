@@ -325,6 +325,196 @@ fn quic_set_peer_addr_rejects_wrong_length() {
     unsafe { quic::pc_quic_cfg_free(cfg) };
 }
 
+// ---- Non-destructive dequeue (pop / recv must survive BufferTooSmall) ------
+
+/// Generates a P-256 self-signed certificate + key as `(chain_pem, key_pem)`.
+fn loopback_identity() -> (alloc::string::String, alloc::string::String) {
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    let mut rng =
+        crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ffi-loopback-identity", b"nonce", &[]);
+    let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+    let name = DistinguishedName::common_name("loopback.example");
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2044, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ecdsa(&key),
+        &name,
+        &validity,
+        1,
+        false,
+        &["loopback.example"],
+    )
+    .unwrap();
+    (cert.to_pem(), key.to_sec1_pem())
+}
+
+/// Drains every pending wire chunk from `from` and feeds it to `to`, always
+/// size-querying (capacity 0) before reading. The regression mode under test
+/// is that the size query itself used to discard the chunk.
+unsafe fn pump_wire(from: *mut tls::PcTls, to: *mut tls::PcTls) {
+    loop {
+        let mut len = 0usize;
+        let st = unsafe { tls::pc_tls_pop(from, core::ptr::null_mut(), &mut len) };
+        if st == PcStatus::Ok {
+            assert_eq!(len, 0);
+            break;
+        }
+        assert_eq!(st, PcStatus::BufferTooSmall);
+        assert!(len > 0);
+        let mut buf = vec![0u8; len];
+        let mut cap = len;
+        let st = unsafe { tls::pc_tls_pop(from, buf.as_mut_ptr(), &mut cap) };
+        assert_eq!(st, PcStatus::Ok);
+        assert_eq!(cap, len, "retry must deliver exactly the queried bytes");
+        let mut consumed = 0usize;
+        let st = unsafe { tls::pc_tls_feed(to, buf.as_ptr(), cap, &mut consumed) };
+        assert_eq!(st, PcStatus::Ok);
+        assert_eq!(consumed, cap);
+    }
+}
+
+#[test]
+fn tls_pop_and_recv_too_small_are_non_destructive() {
+    let (chain_pem, key_pem) = loopback_identity();
+
+    let scfg = tls::pc_tls_cfg_new(1 /* server */, 0x0304);
+    assert!(!scfg.is_null());
+    let st = unsafe {
+        tls::pc_tls_cfg_set_certificate(
+            scfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            key_pem.as_ptr(),
+            key_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    let server = unsafe { tls::pc_tls_new(scfg) };
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+    assert!(!server.is_null());
+
+    let ccfg = tls::pc_tls_cfg_new(0 /* client */, 0x0304);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+
+    // Drive the handshake to completion, size-querying before every pop.
+    // Before the fix, the very first query discarded the ClientHello and the
+    // handshake could never complete.
+    for _ in 0..20 {
+        unsafe {
+            let _ = tls::pc_tls_handshake(client);
+            pump_wire(client, server);
+            let _ = tls::pc_tls_handshake(server);
+            pump_wire(server, client);
+        }
+        if unsafe { tls::pc_tls_is_handshake_complete(client) } == 1
+            && unsafe { tls::pc_tls_is_handshake_complete(server) } == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(client) }, 1);
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(server) }, 1);
+
+    // Server -> client application data.
+    let msg = b"pop/recv must not eat plaintext";
+    let st = unsafe { tls::pc_tls_send(server, msg.as_ptr(), msg.len()) };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { pump_wire(server, client) };
+
+    // 1. Size query with zero capacity reports the length, destroys nothing.
+    let mut need = 0usize;
+    let st = unsafe { tls::pc_tls_recv(client, core::ptr::null_mut(), &mut need) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(need, msg.len());
+
+    // 2. Too-small buffer: still BufferTooSmall, still nothing lost.
+    let mut small = [0u8; 1];
+    let mut cap = small.len();
+    let st = unsafe { tls::pc_tls_recv(client, small.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(cap, msg.len());
+
+    // 3. Full read returns the same bytes.
+    let mut buf = vec![0u8; need];
+    let mut cap = need;
+    let st = unsafe { tls::pc_tls_recv(client, buf.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(&buf[..cap], msg);
+
+    // 4. Queue is now empty.
+    let mut cap = 0usize;
+    let st = unsafe { tls::pc_tls_recv(client, core::ptr::null_mut(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(cap, 0);
+
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
+#[test]
+fn quic_pop_datagram_too_small_is_non_destructive() {
+    let cfg = quic::pc_quic_cfg_new(0 /* client */);
+    assert!(!cfg.is_null());
+    unsafe {
+        assert_eq!(
+            quic::pc_quic_cfg_set_verify_certificates(cfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+    assert!(!q.is_null());
+
+    // The first pop assembles the client's Initial flight (irreversibly, on
+    // the engine side). Size-query it: before the fix this discarded the
+    // datagram outright.
+    let mut need = 0usize;
+    let st = unsafe { quic::pc_quic_pop_datagram(q, core::ptr::null_mut(), &mut need) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert!(need > 0);
+
+    // Too-small retry must not lose the datagram either.
+    let mut small = [0u8; 8];
+    let mut cap = small.len();
+    let st = unsafe { quic::pc_quic_pop_datagram(q, small.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(cap, need);
+
+    // Full read delivers the same (sized) datagram: a QUIC long-header packet.
+    let mut buf = vec![0u8; need];
+    let mut cap = need;
+    let st = unsafe { quic::pc_quic_pop_datagram(q, buf.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(cap, need);
+    assert_ne!(buf[0] & 0x80, 0, "expected a long-header packet");
+
+    unsafe { quic::pc_quic_free(q) };
+}
+
 #[test]
 fn buffer_too_small_reports_length() {
     let msg = b"abc";

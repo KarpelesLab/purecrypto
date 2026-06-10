@@ -652,6 +652,10 @@ void pc_tls_free(PcTls *tls);
  * `*consumed` after a non-`Ok` return so they neither re-feed already-
  * buffered bytes nor lose the still-unbuffered tail. */
 pc_status pc_tls_feed(PcTls *tls, const uint8_t *wire_in, size_t in_len, size_t *consumed);
+/* pc_tls_pop / pc_tls_recv: a PC_BUFFER_TOO_SMALL return (including the
+ * size-query call with *out_len == 0) is non-destructive — the pending
+ * chunk is retained and re-served by the next call, with *out_len set to
+ * the required length. */
 pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
 pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);
 pc_status pc_tls_recv(PcTls *tls, uint8_t *app_out, size_t *out_len);
@@ -722,6 +726,10 @@ PcQuic *pc_quic_new(const PcQuicCfg *cfg);
 void    pc_quic_free(PcQuic *q);
 
 pc_status pc_quic_feed_datagram(PcQuic *q, const uint8_t *dg, size_t len);
+/* pc_quic_pop_datagram / pc_quic_recv_datagram: a PC_BUFFER_TOO_SMALL return
+ * (including the size-query call with *out_len == 0) is non-destructive —
+ * the pending datagram/payload is retained and re-served by the next call,
+ * with *out_len set to the required length. */
 pc_status pc_quic_pop_datagram(PcQuic *q, uint8_t *out, size_t *out_len);
 pc_status pc_quic_handshake(PcQuic *q);
 pc_status pc_quic_is_handshake_complete(const PcQuic *q, int32_t *out);

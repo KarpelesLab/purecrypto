@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use crate::quic::{QuicConfig, QuicConnection, Role as QuicRole, StreamId, TransportParameters};
 use crate::rsa::BoxedRsaPrivateKey;
@@ -420,6 +420,25 @@ pub unsafe extern "C" fn pc_quic_cfg_set_require_retry(
 /// A QUIC connection handle, wrapping a [`crate::quic::QuicConnection`].
 pub struct PcQuic {
     inner: QuicConnection,
+    /// Outbound UDP datagram already popped from the engine but not yet
+    /// delivered to the caller (e.g. the output buffer was too small, or a
+    /// size query with zero capacity). Re-served by the next
+    /// [`pc_quic_pop_datagram`] so a `BufferTooSmall` round-trip loses
+    /// nothing — popping is destructive on the engine side.
+    pending_pop: Option<Vec<u8>>,
+    /// Received DATAGRAM payload already dequeued from the engine but not yet
+    /// delivered. Re-served by the next [`pc_quic_recv_datagram`].
+    pending_recv: Option<Vec<u8>>,
+}
+
+impl Drop for PcQuic {
+    fn drop(&mut self) {
+        // Undelivered application payload must not be handed back to the
+        // allocator un-scrubbed.
+        if let Some(buf) = self.pending_recv.as_mut() {
+            wipe_vec(buf);
+        }
+    }
 }
 
 /// Materialises a QUIC connection from a configuration. Returns NULL if
@@ -467,7 +486,11 @@ pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
         let Ok(inner) = conn else {
             return core::ptr::null_mut();
         };
-        Box::into_raw(Box::new(PcQuic { inner }))
+        Box::into_raw(Box::new(PcQuic {
+            inner,
+            pending_pop: None,
+            pending_recv: None,
+        }))
     })
 }
 
@@ -512,6 +535,10 @@ pub unsafe extern "C" fn pc_quic_feed_datagram(
 /// Drains the next outbound UDP datagram. `*out_len = 0` when there is
 /// nothing pending. Each call returns at most one datagram.
 ///
+/// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
+/// zero capacity) is non-destructive: the datagram is retained and re-served
+/// by the next call, with `*out_len` reporting the required length.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -524,9 +551,18 @@ pub unsafe extern "C" fn pc_quic_pop_datagram(
         if q.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = &mut unsafe { &mut *q }.inner;
-        let dg = conn.pop_datagram();
-        unsafe { out_write(&dg, out, out_len) }
+        let handle = unsafe { &mut *q };
+        // Serve a previously popped-but-undelivered datagram before draining
+        // anything new — popping is destructive on the engine side.
+        let dg = match handle.pending_pop.take() {
+            Some(d) => d,
+            None => handle.inner.pop_datagram(),
+        };
+        let st = unsafe { out_write(&dg, out, out_len) };
+        if st != PcStatus::Ok {
+            handle.pending_pop = Some(dg);
+        }
+        st
     })
 }
 
@@ -863,6 +899,10 @@ pub unsafe extern "C" fn pc_quic_send_datagram(
 /// Drains the next received DATAGRAM payload (arrival order).
 /// `*out_len = 0` when the inbound queue is empty.
 ///
+/// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
+/// zero capacity) is non-destructive: the payload is retained and re-served
+/// by the next call, with `*out_len` reporting the required length.
+///
 /// # Safety
 /// All pointers valid.
 #[unsafe(no_mangle)]
@@ -875,9 +915,21 @@ pub unsafe extern "C" fn pc_quic_recv_datagram(
         if q.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = &mut unsafe { &mut *q }.inner;
-        let payload = conn.recv_datagram().unwrap_or_default();
-        unsafe { out_write(&payload, out, out_len) }
+        let handle = unsafe { &mut *q };
+        // Serve a previously dequeued-but-undelivered payload first —
+        // dequeueing is destructive on the engine side.
+        let mut payload = match handle.pending_recv.take() {
+            Some(p) => p,
+            None => handle.inner.recv_datagram().unwrap_or_default(),
+        };
+        let st = unsafe { out_write(&payload, out, out_len) };
+        if st == PcStatus::Ok {
+            // Delivered: scrub our copy of the payload before dropping it.
+            wipe_vec(&mut payload);
+        } else {
+            handle.pending_recv = Some(payload);
+        }
+        st
     })
 }
 

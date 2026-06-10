@@ -14,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
@@ -517,6 +517,24 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_cookie_secret(
 /// A TLS or DTLS connection handle, wrapping a [`crate::tls::Connection`].
 pub struct PcTls {
     inner: Connection,
+    /// Wire bytes already popped from the engine but not yet delivered to the
+    /// caller (e.g. the output buffer was too small, or a size query with zero
+    /// capacity). Re-served by the next [`pc_tls_pop`] so a `BufferTooSmall`
+    /// round-trip loses nothing — popping is destructive on the engine side.
+    pending_pop: Option<Vec<u8>>,
+    /// Decrypted application bytes already drained from the engine but not yet
+    /// delivered. Re-served by the next [`pc_tls_recv`] (same rationale).
+    pending_recv: Option<Vec<u8>>,
+}
+
+impl Drop for PcTls {
+    fn drop(&mut self) {
+        // Undelivered plaintext must not be handed back to the allocator
+        // un-scrubbed.
+        if let Some(buf) = self.pending_recv.as_mut() {
+            wipe_vec(buf);
+        }
+    }
 }
 
 /// Materialises a connection from a finished configuration. Returns NULL on a
@@ -543,7 +561,11 @@ pub unsafe extern "C" fn pc_tls_new(cfg: *const PcTlsCfg) -> *mut PcTls {
         let Ok(inner) = conn else {
             return core::ptr::null_mut();
         };
-        Box::into_raw(Box::new(PcTls { inner }))
+        Box::into_raw(Box::new(PcTls {
+            inner,
+            pending_pop: None,
+            pending_recv: None,
+        }))
     })
 }
 
@@ -631,6 +653,10 @@ pub unsafe extern "C" fn pc_tls_feed(
 /// underlying byte stream. Writes `*out_len = 0` when there is nothing
 /// pending.
 ///
+/// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
+/// zero capacity) is non-destructive: the chunk is retained and re-served by
+/// the next call, with `*out_len` reporting the required length.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -643,9 +669,18 @@ pub unsafe extern "C" fn pc_tls_pop(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = &mut unsafe { &mut *tls }.inner;
-        let bytes = conn.pop().unwrap_or_default();
-        unsafe { out_write(&bytes, wire_out, out_len) }
+        let handle = unsafe { &mut *tls };
+        // Serve a previously popped-but-undelivered chunk before draining
+        // anything new — popping is destructive on the engine side.
+        let bytes = match handle.pending_pop.take() {
+            Some(b) => b,
+            None => handle.inner.pop().unwrap_or_default(),
+        };
+        let st = unsafe { out_write(&bytes, wire_out, out_len) };
+        if st != PcStatus::Ok {
+            handle.pending_pop = Some(bytes);
+        }
+        st
     })
 }
 
@@ -681,6 +716,10 @@ pub unsafe extern "C" fn pc_tls_send(
 /// Drains decrypted application bytes. Writes `*out_len = 0` when nothing is
 /// pending.
 ///
+/// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
+/// zero capacity) is non-destructive: the plaintext is retained and re-served
+/// by the next call, with `*out_len` reporting the required length.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -693,9 +732,21 @@ pub unsafe extern "C" fn pc_tls_recv(
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
-        let conn = &mut unsafe { &mut *tls }.inner;
-        let bytes = conn.recv().unwrap_or_default();
-        unsafe { out_write(&bytes, app_out, out_len) }
+        let handle = unsafe { &mut *tls };
+        // Serve previously drained-but-undelivered plaintext first — draining
+        // is destructive on the engine side.
+        let mut bytes = match handle.pending_recv.take() {
+            Some(b) => b,
+            None => handle.inner.recv().unwrap_or_default(),
+        };
+        let st = unsafe { out_write(&bytes, app_out, out_len) };
+        if st == PcStatus::Ok {
+            // Delivered: scrub our copy of the plaintext before dropping it.
+            wipe_vec(&mut bytes);
+        } else {
+            handle.pending_recv = Some(bytes);
+        }
+        st
     })
 }
 
