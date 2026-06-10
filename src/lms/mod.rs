@@ -58,7 +58,27 @@ pub enum Error {
     InvalidLevels,
     /// Serialized key/signature bytes were malformed.
     Malformed,
+    /// A legacy (pre-root-bearing) serialized private key encodes a tree taller
+    /// than the legacy recompute cap (`H15`). Loading it would require
+    /// recomputing the Merkle root from the seed — an `O(2^h)` full-keygen pass
+    /// (tens of seconds to minutes for `H20`/`H25`) that an attacker could
+    /// trigger as a CPU-DoS by feeding an untrusted file. The current
+    /// serialization stores the public root, so re-saving such a key with this
+    /// build (load it once on a host you control, then call `to_bytes`) — or
+    /// regenerating it — removes the limit; the new format loads any height
+    /// instantly.
+    LegacyKeyTooTall,
 }
+
+/// Maximum tree height for which the LEGACY (root-less, 60-byte / `4 + L*60`)
+/// private-key serialization will recompute the Merkle root on load.
+///
+/// `H15` (`2^15 = 32768` leaves) recomputes in well under a second on the worst
+/// supported LM-OTS set and covers the common `H5`/`H10`/`H15` deployments.
+/// Taller legacy keys are rejected with [`Error::LegacyKeyTooTall`] to deny a
+/// CPU-DoS via an untrusted file. The NEW (root-bearing) format carries the
+/// public root and imposes no height limit.
+const LEGACY_RECOMPUTE_MAX_H: u32 = 15;
 
 /// Wipes a byte buffer in a way the optimizer cannot elide.
 fn wipe(buf: &mut [u8]) {
@@ -186,24 +206,58 @@ impl LmsPrivateKey {
         Ok(sig)
     }
 
-    /// Serializes the private key **including the live leaf index `q`**:
-    /// `u32(lms_type) || u32(ots_type) || I(16) || seed(32) || u32(q)`
-    /// (60 bytes). This embeds the state that MUST be persisted after each
+    /// Serializes the private key **including the live leaf index `q`** and the
+    /// cached public root:
+    /// `u32(lms_type) || u32(ots_type) || I(16) || seed(32) || u32(q) || root(32)`
+    /// (92 bytes). This embeds the state that MUST be persisted after each
     /// signature.
+    ///
+    /// The appended root is exactly the public key value `T[1]` (not secret);
+    /// storing it lets [`from_bytes`](Self::from_bytes) load any tree height
+    /// instantly instead of recomputing the root via a full `O(2^h)` keygen
+    /// pass. The layout is a pure superset of the legacy 60-byte form (the root
+    /// is appended at the end), so older builds' parsers are unaffected and this
+    /// build still reads legacy bytes (see [`from_bytes`](Self::from_bytes)).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + 4 + 16 + N + 4);
+        let mut v = Vec::with_capacity(4 + 4 + 16 + N + 4 + N);
         v.extend_from_slice(&self.lms_type.typecode().to_be_bytes());
         v.extend_from_slice(&self.ots_type.typecode().to_be_bytes());
         v.extend_from_slice(&self.i_id);
         v.extend_from_slice(&self.seed);
         v.extend_from_slice(&self.q.to_be_bytes());
+        v.extend_from_slice(&self.root);
         v
     }
 
     /// Parses a private key produced by [`to_bytes`](Self::to_bytes), resuming
     /// at the persisted `q`.
+    ///
+    /// Length-discriminated and backward compatible:
+    /// * **92 bytes** — the current root-bearing format. The stored root is
+    ///   read directly and **trusted** (no recompute), so a key of any height
+    ///   loads in constant time.
+    /// * **60 bytes** — the LEGACY root-less format. The root is recomputed via
+    ///   an `O(2^h)` keygen-equivalent pass; to deny a CPU-DoS from an untrusted
+    ///   file this path is capped at `H15` (`LEGACY_RECOMPUTE_MAX_H`) and returns
+    ///   [`Error::LegacyKeyTooTall`] above it.
+    /// * any other length — [`Error::Malformed`].
+    ///
+    /// # Trusting the stored root is safe (fast path)
+    ///
+    /// The root is NOT secret — it is the public key value `T[1]`
+    /// (`encode_public_key` = `type || type || I || T[1]`). It is used only by
+    /// [`public_key`](Self::public_key); signing recomputes the authentication
+    /// path from the seed and never reads `self.root`. A tampered root therefore
+    /// yields a wrong public key under which genuine signatures simply fail to
+    /// verify — a fail-closed self-DoS, never a forgery (the attacker lacks the
+    /// seed). Re-deriving the root on every load to validate a public value
+    /// would cost a full keygen and buy nothing: an attacker able to rewrite the
+    /// key file could already force catastrophic LM-OTS reuse, which is far
+    /// worse. So the stored root is taken as-is and deliberately NOT recomputed.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != 4 + 4 + 16 + N + 4 {
+        const LEGACY_LEN: usize = 4 + 4 + 16 + N + 4;
+        const NEW_LEN: usize = LEGACY_LEN + N;
+        if bytes.len() != LEGACY_LEN && bytes.len() != NEW_LEN {
             return Err(Error::Malformed);
         }
         let lms_type =
@@ -220,7 +274,18 @@ impl LmsPrivateKey {
         if q as u64 > lms_type.leaves() {
             return Err(Error::Malformed);
         }
-        let root = tree::compute_root(lms_type, ots_type, &i_id, &seed);
+        let root = if bytes.len() == NEW_LEN {
+            // Fast path: trust the stored public root (see method docs).
+            let mut r = [0u8; N];
+            r.copy_from_slice(&bytes[28 + N..28 + N + N]);
+            r
+        } else {
+            // Legacy path: recompute the root, but refuse a CPU-DoS-sized tree.
+            if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
+                return Err(Error::LegacyKeyTooTall);
+            }
+            tree::compute_root(lms_type, ots_type, &i_id, &seed)
+        };
         Ok(LmsPrivateKey {
             lms_type,
             ots_type,
@@ -556,14 +621,22 @@ impl HssPrivateKey {
         Ok(out)
     }
 
-    /// Serializes the private key **including every level's live leaf index**.
+    /// Serializes the private key **including every level's live leaf index**
+    /// and that level's cached public root.
     ///
     /// Layout: `u32(L) || for each level { u32(lms_type) || u32(ots_type) ||
-    /// I(16) || seed(32) || u32(q) }`. This embeds the full state that MUST be
-    /// persisted after each signature.
+    /// I(16) || seed(32) || u32(q) || root(32) }`. This embeds the full state
+    /// that MUST be persisted after each signature.
+    ///
+    /// Each appended root is the public value `T[1]` of that level's tree (the
+    /// child key the parent level signs); storing it lets
+    /// [`from_bytes`](Self::from_bytes) load any height instantly instead of
+    /// recomputing every level's root via a full `O(2^h)` keygen pass. The
+    /// per-level block is a pure superset of the legacy 60-byte block (the root
+    /// is appended at its end).
     pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.levels.len();
-        let mut v = Vec::with_capacity(4 + l * (4 + 4 + 16 + N + 4));
+        let mut v = Vec::with_capacity(4 + l * (4 + 4 + 16 + N + 4 + N));
         v.extend_from_slice(&(l as u32).to_be_bytes());
         for (i, lv) in self.levels.iter().enumerate() {
             v.extend_from_slice(&lv.lms_type.typecode().to_be_bytes());
@@ -571,12 +644,35 @@ impl HssPrivateKey {
             v.extend_from_slice(&lv.i_id);
             v.extend_from_slice(&lv.seed);
             v.extend_from_slice(&self.q[i].to_be_bytes());
+            v.extend_from_slice(&self.roots[i]);
         }
         v
     }
 
     /// Parses a private key produced by [`to_bytes`](Self::to_bytes), resuming
     /// at each persisted per-level `q`.
+    ///
+    /// Length-discriminated and backward compatible (per-level stride):
+    /// * `4 + L*92` — the current root-bearing format. Each level's stored root
+    ///   is read directly and **trusted** (no recompute); a key of any height
+    ///   loads in constant time.
+    /// * `4 + L*60` — the LEGACY root-less format. Each level's root is
+    ///   recomputed (an `O(2^h)` pass), capped per level at `H15`
+    ///   (`LEGACY_RECOMPUTE_MAX_H`) — taller levels return
+    ///   [`Error::LegacyKeyTooTall`] to deny a CPU-DoS from an untrusted file.
+    /// * any other length — [`Error::Malformed`].
+    ///
+    /// # Trusting the stored roots is safe (fast path)
+    ///
+    /// A root is NOT secret — `roots[i]` is the public value `T[1]` of level
+    /// `i`'s tree, and for `i + 1` it is exactly the child public key the parent
+    /// level signs. A tampered `roots[i+1]` makes the HSS signature's embedded
+    /// child key disagree with the seed-derived subtree, so verification fails:
+    /// fail-closed, never a forgery (the attacker lacks the seeds). Re-deriving
+    /// every root on load to validate a public value would cost a full keygen
+    /// and buy nothing — an attacker able to rewrite the file could already
+    /// force catastrophic LM-OTS reuse — so the stored roots are taken as-is and
+    /// deliberately NOT recomputed.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 4 {
             return Err(Error::Malformed);
@@ -585,10 +681,15 @@ impl HssPrivateKey {
         if !(1..=8).contains(&l) {
             return Err(Error::Malformed);
         }
-        let per = 4 + 4 + 16 + N + 4;
-        if bytes.len() != 4 + l * per {
+        const LEGACY_PER: usize = 4 + 4 + 16 + N + 4;
+        const NEW_PER: usize = LEGACY_PER + N;
+        let (per, has_root) = if bytes.len() == 4 + l * NEW_PER {
+            (NEW_PER, true)
+        } else if bytes.len() == 4 + l * LEGACY_PER {
+            (LEGACY_PER, false)
+        } else {
             return Err(Error::Malformed);
-        }
+        };
         let mut levels = Vec::with_capacity(l);
         let mut roots = Vec::with_capacity(l);
         let mut q = Vec::with_capacity(l);
@@ -621,7 +722,19 @@ impl HssPrivateKey {
             if qi as u64 > lms_type.leaves() {
                 return Err(Error::Malformed);
             }
-            roots.push(tree::compute_root(lms_type, ots_type, &i_id, &seed));
+            let root = if has_root {
+                // Fast path: trust the stored public root (see method docs).
+                let mut r = [0u8; N];
+                r.copy_from_slice(&bytes[off + 28 + N..off + 28 + N + N]);
+                r
+            } else {
+                // Legacy path: recompute, but refuse a CPU-DoS-sized tree.
+                if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
+                    return Err(Error::LegacyKeyTooTall);
+                }
+                tree::compute_root(lms_type, ots_type, &i_id, &seed)
+            };
+            roots.push(root);
             levels.push(HssLevel {
                 lms_type,
                 ots_type,

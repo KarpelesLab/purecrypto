@@ -83,11 +83,12 @@ fn lms_sig_len(lms: LmsType, ots: LmotsType) -> usize {
 /// (`24 + n` bytes each), RFC 8554 §6.2.
 ///
 /// [`HssPrivateKey`] does not expose its per-level parameter sets, so they
-/// are recovered from the self-describing private serialization
-/// (`u32(L) || per level { u32(lms) || u32(ots) || I(16) || seed(32) ||
-/// u32(q) }`); the copy contains the master seeds and is wiped before
-/// returning. Returns `None` only on a malformed serialization (which
-/// would indicate an internal bug, not user input).
+/// are recovered from the self-describing private serialization. The current
+/// format is `u32(L) || per level { u32(lms) || u32(ots) || I(16) ||
+/// seed(32) || u32(q) || root(32) }` (per-level = 92); the legacy root-less
+/// form (per-level = 60) is also accepted. The copy contains the master
+/// seeds and is wiped before returning. Returns `None` only on a malformed
+/// serialization (which would indicate an internal bug, not user input).
 fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
     let mut ser = key.to_bytes();
     let result = hss_sig_len_from_private_bytes(&ser);
@@ -96,14 +97,26 @@ fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
 }
 
 fn hss_sig_len_from_private_bytes(ser: &[u8]) -> Option<usize> {
-    const LEVEL_BYTES: usize = 4 + 4 + 16 + N + 4;
+    // Only the type fields at the start of each level block are read, so both
+    // the legacy 60-byte stride and the current root-bearing 92-byte stride are
+    // length-discriminated and handled. `to_bytes()` now emits the 92 stride;
+    // both are accepted for robustness (kept in sync with `HssPrivateKey`).
+    const LEGACY_LEVEL_BYTES: usize = 4 + 4 + 16 + N + 4;
+    const NEW_LEVEL_BYTES: usize = LEGACY_LEVEL_BYTES + N;
     let l = u32::from_be_bytes(ser.get(..4)?.try_into().ok()?) as usize;
-    if l == 0 || ser.len() != 4 + l * LEVEL_BYTES {
+    if l == 0 {
         return None;
     }
+    let level_bytes = if ser.len() == 4 + l * NEW_LEVEL_BYTES {
+        NEW_LEVEL_BYTES
+    } else if ser.len() == 4 + l * LEGACY_LEVEL_BYTES {
+        LEGACY_LEVEL_BYTES
+    } else {
+        return None;
+    };
     let mut total = 4; // u32(Nspk)
     for i in 0..l {
-        let off = 4 + i * LEVEL_BYTES;
+        let off = 4 + i * level_bytes;
         let lms = LmsType::from_u32(u32::from_be_bytes(ser[off..off + 4].try_into().ok()?))?;
         let ots = LmotsType::from_u32(u32::from_be_bytes(ser[off + 4..off + 8].try_into().ok()?))?;
         total += lms_sig_len(lms, ots);

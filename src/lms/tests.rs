@@ -219,7 +219,7 @@ fn lms_reload_resumes_q() {
     let _ = sk.sign(&mut rng, b"a").unwrap();
     let _ = sk.sign(&mut rng, b"b").unwrap();
     let bytes = sk.to_bytes();
-    assert_eq!(bytes.len(), 60);
+    assert_eq!(bytes.len(), 92, "new root-bearing private-key length");
 
     let mut reloaded = LmsPrivateKey::from_bytes(&bytes).unwrap();
     assert_eq!(reloaded.remaining(), 30);
@@ -235,9 +235,10 @@ fn lms_exhaustion_errors() {
     let mut rng = HmacDrbg::<Sha256>::new(b"lms-exhaust", b"n", &[]);
     let sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
     let mut bytes = sk.to_bytes();
-    // Set q = 32 (= leaves), the exhausted state.
-    let qoff = bytes.len() - 4;
-    bytes[qoff..].copy_from_slice(&32u32.to_be_bytes());
+    // Set q = 32 (= leaves), the exhausted state. Layout is
+    // type(4) type(4) I(16) seed(32) q(4) root(32), so q precedes the root.
+    let qoff = 4 + 4 + 16 + N;
+    bytes[qoff..qoff + 4].copy_from_slice(&32u32.to_be_bytes());
     let mut exhausted = LmsPrivateKey::from_bytes(&bytes).unwrap();
     assert_eq!(exhausted.remaining(), 0);
     assert_eq!(exhausted.sign(&mut rng, b"x"), Err(Error::Exhausted));
@@ -374,10 +375,12 @@ fn hss_bottom_rollover_fails_closed() {
     .unwrap();
     let pk = sk.public_key();
     let mut bytes = sk.to_bytes();
-    // Layout: u32(L) then per level [type(4) ots(4) I(16) seed(32) q(4)].
-    // Park the bottom level on its last leaf (q=31), top q stays 0.
-    let per = 4 + 4 + 16 + N + 4;
-    let bottom_q_off = 4 + per + (per - 4);
+    // Layout: u32(L) then per level [type(4) ots(4) I(16) seed(32) q(4) root(32)].
+    // Park the bottom level on its last leaf (q=31), top q stays 0. The q field
+    // sits right after seed (before the appended root).
+    let per = 4 + 4 + 16 + N + 4 + N;
+    let q_in_level = 4 + 4 + 16 + N;
+    let bottom_q_off = 4 + per + q_in_level;
     bytes[bottom_q_off..bottom_q_off + 4].copy_from_slice(&31u32.to_be_bytes());
     let mut key = HssPrivateKey::from_bytes(&bytes).unwrap();
     assert_eq!(key.remaining(), 1);
@@ -462,13 +465,227 @@ fn hss_from_bytes_rejects_advanced_higher_level() {
     )
     .unwrap();
     let mut bytes = sk.to_bytes();
-    let per = 4 + 4 + 16 + N + 4;
-    // Set the TOP level q to 1 (a state the mitigation never produces).
-    let top_q_off = 4 + (per - 4);
+    // Set the TOP level q to 1 (a state the mitigation never produces). The q
+    // field is after seed (before the appended root).
+    let top_q_off = 4 + (4 + 4 + 16 + N);
     bytes[top_q_off..top_q_off + 4].copy_from_slice(&1u32.to_be_bytes());
     assert_eq!(
         HssPrivateKey::from_bytes(&bytes).err(),
         Some(Error::Malformed),
         "advanced higher-level q must be rejected as a reuse-prone state"
+    );
+}
+
+// ===================================================================
+// Root-bearing serialization: fast-load path, backward compat, height cap.
+// ===================================================================
+
+/// Builds the legacy 60-byte LMS serialization (no appended root) for a key,
+/// by truncating off the 32-byte root the new `to_bytes` appends.
+fn lms_legacy_bytes(sk: &LmsPrivateKey) -> Vec<u8> {
+    let mut b = sk.to_bytes();
+    assert_eq!(b.len(), 92);
+    b.truncate(60);
+    b
+}
+
+/// New-format LMS round-trips: same public key and resumes at the persisted q,
+/// and the loaded key signs verifiably (the stored-root fast path is correct).
+#[test]
+fn lms_new_format_roundtrip() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-newfmt", b"n", &[]);
+    // H10 exercises a non-trivial (1024-leaf) tree on the stored-root path.
+    let mut sk = LmsPrivateKey::generate(LmsType::Sha256M32H10, LmotsType::Sha256N32W4, &mut rng);
+    let _ = sk.sign(&mut rng, b"warmup").unwrap();
+    let pk = sk.public_key();
+
+    let bytes = sk.to_bytes();
+    assert_eq!(bytes.len(), 92);
+    let mut reloaded = LmsPrivateKey::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        reloaded.public_key().to_bytes(),
+        pk.to_bytes(),
+        "stored root must reproduce the public key"
+    );
+    assert_eq!(reloaded.remaining(), sk.remaining());
+    let s = reloaded.sign(&mut rng, b"after-reload").unwrap();
+    assert!(pk.verify(b"after-reload", &s));
+    let q = u32::from_be_bytes([s[0], s[1], s[2], s[3]]);
+    assert_eq!(q, 1, "must resume at persisted q");
+}
+
+/// Backward compatibility: a hand-truncated legacy 60-byte LMS blob still loads
+/// (recomputing the root) and yields the correct public key.
+#[test]
+fn lms_legacy_60_byte_load() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-legacy", b"n", &[]);
+    let sk = LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+    let pk = sk.public_key();
+    let legacy = lms_legacy_bytes(&sk);
+    assert_eq!(legacy.len(), 60);
+    let loaded = LmsPrivateKey::from_bytes(&legacy).unwrap();
+    assert_eq!(
+        loaded.public_key().to_bytes(),
+        pk.to_bytes(),
+        "legacy recompute path must reproduce the public key"
+    );
+}
+
+/// The legacy recompute path rejects a tree taller than H15 (CPU-DoS guard),
+/// while the new root-bearing format accepts any height (no recompute).
+#[test]
+fn lms_legacy_height_cap() {
+    // Hand-build a legacy 60-byte H25 blob (typecode 9). The recompute path
+    // must refuse it WITHOUT attempting the O(2^25) keygen.
+    let mut legacy = Vec::with_capacity(60);
+    legacy.extend_from_slice(&LmsType::Sha256M32H25.typecode().to_be_bytes());
+    legacy.extend_from_slice(&LmotsType::Sha256N32W8.typecode().to_be_bytes());
+    legacy.extend_from_slice(&[0u8; 16]); // I
+    legacy.extend_from_slice(&[0u8; N]); // seed
+    legacy.extend_from_slice(&0u32.to_be_bytes()); // q
+    assert_eq!(legacy.len(), 60);
+    assert_eq!(
+        LmsPrivateKey::from_bytes(&legacy).err(),
+        Some(Error::LegacyKeyTooTall),
+        "legacy H25 must be rejected, not recomputed"
+    );
+
+    // The same H25 typecode in the NEW 92-byte format loads instantly: the
+    // appended root is trusted (arbitrary 32 bytes here), no recompute.
+    let mut new = legacy.clone();
+    new.extend_from_slice(&[0x5au8; N]); // arbitrary trusted root
+    assert_eq!(new.len(), 92);
+    let loaded =
+        LmsPrivateKey::from_bytes(&new).expect("new-format H25 must load with no recompute");
+    assert_eq!(loaded.lms_type(), LmsType::Sha256M32H25);
+    // The trusted root flows straight into the public key.
+    assert_eq!(&loaded.public_key().to_bytes()[24..24 + N], &[0x5au8; N]);
+}
+
+/// A non-trivial (H10, 1024-leaf) legacy blob loads via the recompute path and
+/// reproduces the public key. (The H15 cap boundary itself is covered by
+/// `lms_legacy_height_cap`; an actual H15+ keygen is too slow for `debug` CI.)
+#[test]
+fn lms_legacy_multilevel_recompute_load() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"lms-h10-legacy", b"n", &[]);
+    let sk = LmsPrivateKey::generate(LmsType::Sha256M32H10, LmotsType::Sha256N32W4, &mut rng);
+    let pk = sk.public_key();
+    let legacy = lms_legacy_bytes(&sk);
+    let loaded = LmsPrivateKey::from_bytes(&legacy).expect("H10 legacy blob must load");
+    assert_eq!(loaded.public_key().to_bytes(), pk.to_bytes());
+}
+
+/// Wrong-length LMS blobs are rejected as `Malformed` (not 60 or 92).
+#[test]
+fn lms_from_bytes_rejects_bad_length() {
+    for len in [0usize, 59, 61, 91, 93, 120] {
+        let blob = alloc::vec![0u8; len];
+        assert_eq!(
+            LmsPrivateKey::from_bytes(&blob).err(),
+            Some(Error::Malformed)
+        );
+    }
+}
+
+/// New-format HSS round-trips: stored per-level roots reproduce the public key,
+/// resume at the persisted q, and the loaded key signs verifiably.
+#[test]
+fn hss_new_format_roundtrip() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-newfmt", b"n", &[]);
+    let mut sk = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H10, LmotsType::Sha256N32W4),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let pk = sk.public_key();
+    let _ = sk.sign(&mut rng, b"warmup").unwrap();
+
+    let bytes = sk.to_bytes();
+    assert_eq!(bytes.len(), 4 + 2 * 92, "new HSS per-level stride is 92");
+    let mut reloaded = HssPrivateKey::from_bytes(&bytes).unwrap();
+    assert_eq!(
+        reloaded.public_key().to_bytes(),
+        pk.to_bytes(),
+        "stored roots must reproduce the HSS public key"
+    );
+    assert_eq!(reloaded.remaining(), sk.remaining());
+    let s = reloaded.sign(&mut rng, b"after-reload").unwrap();
+    assert!(pk.verify(b"after-reload", &s));
+}
+
+/// Backward compatibility: a hand-built legacy `4 + L*60` HSS blob still loads
+/// (recomputing every level's root) and yields the correct public key.
+#[test]
+fn hss_legacy_load() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-legacy", b"n", &[]);
+    let sk = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let pk = sk.public_key();
+
+    // Strip the 32-byte root appended to each 92-byte level block, yielding the
+    // legacy 60-byte-per-level layout.
+    let new = sk.to_bytes();
+    let l = 2usize;
+    assert_eq!(new.len(), 4 + l * 92);
+    let mut legacy = Vec::with_capacity(4 + l * 60);
+    legacy.extend_from_slice(&new[..4]);
+    for i in 0..l {
+        let off = 4 + i * 92;
+        legacy.extend_from_slice(&new[off..off + 60]); // drop the trailing root
+    }
+    assert_eq!(legacy.len(), 4 + l * 60);
+
+    let loaded = HssPrivateKey::from_bytes(&legacy).unwrap();
+    assert_eq!(
+        loaded.public_key().to_bytes(),
+        pk.to_bytes(),
+        "legacy HSS recompute path must reproduce the public key"
+    );
+}
+
+/// Legacy HSS rejects a level taller than H15; the new format accepts it.
+#[test]
+fn hss_legacy_height_cap() {
+    // Legacy single-level H20 blob → rejected without recompute.
+    let mut legacy = Vec::new();
+    legacy.extend_from_slice(&1u32.to_be_bytes()); // L = 1
+    legacy.extend_from_slice(&LmsType::Sha256M32H20.typecode().to_be_bytes());
+    legacy.extend_from_slice(&LmotsType::Sha256N32W8.typecode().to_be_bytes());
+    legacy.extend_from_slice(&[0u8; 16]);
+    legacy.extend_from_slice(&[0u8; N]);
+    legacy.extend_from_slice(&0u32.to_be_bytes());
+    assert_eq!(legacy.len(), 4 + 60);
+    assert_eq!(
+        HssPrivateKey::from_bytes(&legacy).err(),
+        Some(Error::LegacyKeyTooTall),
+        "legacy H20 level must be rejected, not recomputed"
+    );
+
+    // Same single-level H20 in the new format loads instantly (trusted root).
+    let mut new = legacy.clone();
+    new.extend_from_slice(&[0x7cu8; N]);
+    assert_eq!(new.len(), 4 + 92);
+    let loaded = HssPrivateKey::from_bytes(&new).expect("new-format H20 must load, no recompute");
+    assert_eq!(loaded.levels(), 1);
+}
+
+/// Wrong-length HSS blobs are rejected as `Malformed`.
+#[test]
+fn hss_from_bytes_rejects_bad_length() {
+    // L=2 but neither 4+2*60 nor 4+2*92 bytes long.
+    let mut blob = alloc::vec![0u8; 4 + 2 * 70];
+    blob[..4].copy_from_slice(&2u32.to_be_bytes());
+    assert_eq!(
+        HssPrivateKey::from_bytes(&blob).err(),
+        Some(Error::Malformed)
     );
 }
