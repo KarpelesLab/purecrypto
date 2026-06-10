@@ -151,13 +151,27 @@ pub(crate) fn describe_key(key: &AnyPublicKey) -> String {
     }
 }
 
-/// A validity window of `days` starting now.
+/// The notAfter timestamp `now + days * 86_400`, or `None` if the
+/// user-supplied `-days` value would wrap the u64 (same guard as the
+/// `ca crl` next-update arithmetic).
+fn validity_end(now: u64, days: u64) -> Option<u64> {
+    days.checked_mul(86_400).and_then(|d| now.checked_add(d))
+}
+
+/// A validity window of `days` starting now. `days` is user-supplied
+/// (`-days N` on `x509 -new`/`-req` and `ca issue`/`sign-csr`); dies with a
+/// clear message instead of silently wrapping on a pathologically large value.
 pub(crate) fn validity_days(days: u64) -> Validity {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    Validity::new(Time::from_unix(now), Time::from_unix(now + days * 86_400))
+    let end = validity_end(now, days).unwrap_or_else(|| {
+        die(format!(
+            "-days {days} overflows when added to current time; pick a smaller value"
+        ))
+    });
+    Validity::new(Time::from_unix(now), Time::from_unix(end))
 }
 
 /// A random 63-bit serial number with the high bit clear (positive DER) and
@@ -218,4 +232,32 @@ pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
         .filter(|e| !e.is_empty())
         .map(|e| e.strip_prefix("DNS:").unwrap_or(e).to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The `validity_days` notAfter arithmetic (`now + days * 86_400`) must
+    /// not silently wrap u64 on a user-controlled `-days` value (reached
+    /// from `x509 -new`/`-req` and `ca issue`/`sign-csr`). Mirrors the
+    /// `ca crl` next-update regression test.
+    #[test]
+    fn validity_end_uses_checked_arithmetic() {
+        // Normal cases work.
+        assert_eq!(validity_end(1_000, 30), Some(1_000 + 30 * 86_400));
+        assert_eq!(validity_end(0, 1), Some(86_400));
+        assert_eq!(validity_end(0, 365), Some(365 * 86_400));
+        // Multiplication overflow: 2^64/86400 ≈ 2.135e14 days. A u64-max
+        // days value must NOT silently wrap to a small notAfter timestamp.
+        assert_eq!(validity_end(0, u64::MAX), None);
+        // Addition overflow on a near-MAX `now`.
+        assert_eq!(validity_end(u64::MAX - 1, 1), None);
+        assert_eq!(validity_end(u64::MAX, 0), Some(u64::MAX));
+        // Boundary just past the safe zone: almost * 86_400 fits, but one
+        // more day overflows.
+        let almost = u64::MAX / 86_400;
+        assert!(validity_end(0, almost).is_some());
+        assert_eq!(validity_end(0, almost + 1), None);
+    }
 }
