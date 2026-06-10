@@ -579,8 +579,20 @@ impl QuicConnection {
     /// Like [`Self::feed_datagram`] but also records the source address.
     /// Production servers MUST use this entrypoint (the retry-token path
     /// requires the address).
+    ///
+    /// The address is only *learned* from the first datagram (or from an
+    /// explicit [`Self::set_peer_addr`] call). Datagrams are
+    /// unauthenticated at this layer and `peer_addr` feeds the
+    /// retry-token minting/validation path, so letting any inbound
+    /// datagram rewrite it would let an off-path sender redirect that
+    /// state. Connection migration is not implemented, so the address
+    /// never changes for the lifetime of the connection; datagrams from
+    /// other sources are still processed (and dropped if they fail
+    /// AEAD) but do not move the recorded address.
     pub fn feed_datagram_from(&mut self, addr: SocketAddr, datagram: &[u8]) -> Result<(), Error> {
-        self.peer_addr = Some(addr);
+        if self.peer_addr.is_none() {
+            self.peer_addr = Some(addr);
+        }
         self.feed_datagram(datagram)
     }
 
@@ -5981,6 +5993,57 @@ mod tests {
         c.feed_datagram(&phase0_dg)
             .expect("stale old-phase packet is silently dropped");
         assert_eq!(c.endpoint.crypto.one_rtt_phase, 1, "phase unchanged");
+    }
+
+    /// A4 — `peer_addr` is learned from the FIRST datagram only.
+    /// Datagrams are unauthenticated when the address is recorded, and
+    /// `peer_addr` feeds retry-token minting/validation, so a later
+    /// datagram claiming a different source must not rewrite it.
+    #[test]
+    fn peer_addr_not_overwritten_by_later_datagrams() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let (mut c, mut s) = loopback_pair();
+        let addr_a = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 1111);
+        let addr_b = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)), 2222);
+        // Drive the handshake, feeding the server via the address-aware
+        // entrypoint with addr_a throughout.
+        for _ in 0..8 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr_a, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+        }
+        assert!(s.is_handshake_complete());
+        assert_eq!(s.peer_addr, Some(addr_a));
+        // A datagram "from" another address (off-path / spoofed) must
+        // not move the recorded address — neither garbage...
+        let _ = s.feed_datagram_from(addr_b, &[0u8; 32]);
+        assert_eq!(
+            s.peer_addr,
+            Some(addr_a),
+            "unauthenticated datagram must not rewrite peer_addr"
+        );
+        // ...nor a genuine packet replayed from a different source.
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"hello").expect("write");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram_from(addr_b, &dg).expect("server feed");
+        assert_eq!(
+            s.peer_addr,
+            Some(addr_a),
+            "valid packet from a new source must not move peer_addr (no migration)"
+        );
     }
 
     /// Test — a datagram whose last 16 bytes are random (not a known
