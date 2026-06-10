@@ -96,7 +96,13 @@ pub(crate) fn build_tbs_raw(
     body.extend_from_slice(&validity.to_der());
     body.extend_from_slice(&subject.to_der());
     body.extend_from_slice(spki_der);
-    body.extend_from_slice(&extensions_explicit(extensions));
+    // RFC 5280 §4.1.2.9: `Extensions ::= SEQUENCE SIZE (1..MAX)` — a
+    // present-but-empty extensions block is malformed (and the parser
+    // rejects it), so omit the OPTIONAL `[3]` field entirely when the
+    // caller supplies no extensions.
+    if !extensions.is_empty() {
+        body.extend_from_slice(&extensions_explicit(extensions));
+    }
     encode_sequence(&body)
 }
 
@@ -695,6 +701,17 @@ impl Certificate {
                 } else {
                     None
                 };
+                // RFC 5280 §4.2.1.9: pathLenConstraint is only meaningful
+                // when cA=TRUE (and keyCertSign is asserted). A cA=FALSE
+                // cert carrying one is malformed — reject it rather than
+                // let two parsers disagree on what it means.
+                if !is_ca && path_len.is_some() {
+                    return Err(Error::Malformed);
+                }
+                // No trailing bytes inside the BasicConstraints SEQUENCE,
+                // and nothing after it inside the extnValue.
+                seq.finish()?;
+                r.finish()?;
                 out = Some((is_ca, path_len));
             }
             Ok(())
@@ -763,6 +780,8 @@ impl Certificate {
                 if bytes.len() > 1 {
                     mask |= (bytes[1] as u16) << 8;
                 }
+                // No trailing bytes after the BIT STRING inside extnValue.
+                r.finish()?;
                 out = Some(mask);
             }
             Ok(())
@@ -782,6 +801,8 @@ impl Certificate {
                     let raw = seq.read_oid()?;
                     out.push(parse_oid(raw)?);
                 }
+                // No trailing bytes after the SEQUENCE inside extnValue.
+                r.finish()?;
             }
             Ok(())
         })?;
@@ -882,6 +903,14 @@ impl Certificate {
         let wrapper = seq.read_tlv(tag::context(3))?;
         let mut outer = Reader::new(wrapper);
         let mut exts = outer.read_sequence()?;
+        // No trailing bytes between the extensions SEQUENCE and the end of
+        // the [3] wrapper.
+        outer.finish()?;
+        // RFC 5280 §4.1.2.9: `Extensions ::= SEQUENCE SIZE (1..MAX) OF
+        // Extension` — a present-but-empty extensions block is malformed.
+        if exts.is_empty() {
+            return Err(Error::Malformed);
+        }
 
         // RFC 5280 §4.2: "A certificate MUST NOT include more than one
         // instance of a particular extension." Track seen OIDs and reject
@@ -903,6 +932,8 @@ impl Certificate {
                 false
             };
             let value = ext.read_octet_string()?;
+            // No trailing bytes inside the Extension SEQUENCE after extnValue.
+            ext.finish()?;
             f(&id, critical, value)?;
         }
         Ok(())
@@ -964,6 +995,8 @@ pub(super) fn parse_dns_names(der: &[u8], out: &mut Vec<String>) -> Result<(), E
             out.push(String::from(s));
         }
     }
+    // No trailing bytes after the SEQUENCE inside extnValue.
+    reader.finish()?;
     Ok(())
 }
 

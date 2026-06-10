@@ -402,12 +402,7 @@ impl OcspResponse {
         }
         // responderID — opaque to producedAt.
         td.read_any()?;
-        let (t, value) = td.read_any()?;
-        if t != tag::GENERALIZED_TIME {
-            return Err(Error::Malformed);
-        }
-        let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
-        Ok(Time::from_repr(s))
+        read_generalized_time(&mut td)
     }
 
     /// The first delegated responder certificate in `BasicOCSPResponse.certs`,
@@ -732,6 +727,21 @@ impl OcspResponse {
     }
 }
 
+/// Reads a `GeneralizedTime` — the only time type RFC 6960 uses — binding the
+/// body to the exact 15-byte `YYYYMMDDHHMMSSZ` form. Without the length
+/// check, a 13-byte UTCTime-shaped body smuggled under the GENERALIZED_TIME
+/// tag would hit the two-digit-year century pivot in [`Time::components`]
+/// (which keys off the stored length), letting one blob parse to two
+/// different instants across parsers.
+fn read_generalized_time(r: &mut Reader<'_>) -> Result<Time, Error> {
+    let (t, value) = r.read_any()?;
+    if t != tag::GENERALIZED_TIME || value.len() != 15 {
+        return Err(Error::Malformed);
+    }
+    let s = core::str::from_utf8(value).map_err(|_| Error::Malformed)?;
+    Ok(Time::from_repr(s))
+}
+
 /// Reads one `SingleResponse` row.
 fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, Error> {
     let entry = reader.read_element()?;
@@ -769,12 +779,7 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
         // [1] IMPLICIT SEQUENCE — RevokedInfo (constructed).
         0xa1 => {
             let mut ri = Reader::new(status_body);
-            let (t, value) = ri.read_any()?;
-            if t != tag::GENERALIZED_TIME {
-                return Err(Error::Malformed);
-            }
-            let revocation_time =
-                Time::from_repr(core::str::from_utf8(value).map_err(|_| Error::Malformed)?);
+            let revocation_time = read_generalized_time(&mut ri)?;
             let mut reason = None;
             if !ri.is_empty() && ri.peek_tag() == Some(tag::context(0)) {
                 // [0] EXPLICIT CRLReason ::= ENUMERATED
@@ -787,6 +792,8 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
                 reason = Some(CrlReason::from_u8(enum_body[0])?);
                 br.finish()?;
             }
+            // No trailing bytes inside RevokedInfo after the optional reason.
+            ri.finish()?;
             OcspCertStatus::Revoked {
                 revocation_time,
                 reason,
@@ -803,24 +810,14 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
     };
 
     // thisUpdate (GeneralizedTime).
-    let (t, value) = s.read_any()?;
-    if t != tag::GENERALIZED_TIME {
-        return Err(Error::Malformed);
-    }
-    let this_update = Time::from_repr(core::str::from_utf8(value).map_err(|_| Error::Malformed)?);
+    let this_update = read_generalized_time(&mut s)?;
 
     let mut next_update = None;
     if !s.is_empty() && s.peek_tag() == Some(tag::context(0)) {
         // [0] EXPLICIT GeneralizedTime
         let body = s.read_tlv(tag::context(0))?;
         let mut nr = Reader::new(body);
-        let (t, value) = nr.read_any()?;
-        if t != tag::GENERALIZED_TIME {
-            return Err(Error::Malformed);
-        }
-        next_update = Some(Time::from_repr(
-            core::str::from_utf8(value).map_err(|_| Error::Malformed)?,
-        ));
+        next_update = Some(read_generalized_time(&mut nr)?);
         nr.finish()?;
     }
     // We don't surface singleExtensions [1] EXPLICIT Extensions OPTIONAL.
