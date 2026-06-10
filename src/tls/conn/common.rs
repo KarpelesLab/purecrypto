@@ -47,6 +47,17 @@ pub(crate) struct ConnectionCore {
     hs_pending: Vec<u8>,
     /// Decrypted application data awaiting the application.
     app_in: Vec<u8>,
+    /// Decrypted 0-RTT early data awaiting the application, kept strictly
+    /// separate from `app_in`: early data is replayable by an active
+    /// attacker (RFC 8446 §8 / appendix E.5), so applications must be able
+    /// to quarantine it. Filled only while `early_data_routing` is set.
+    early_in: Vec<u8>,
+    /// When true, inner `ApplicationData` plaintext is routed to
+    /// `early_in` instead of `app_in`. The server-side state machine sets
+    /// this while the client-early-traffic read key is installed (0-RTT
+    /// accepted, EndOfEarlyData not yet received) and clears it when the
+    /// read key rotates to the client-handshake key.
+    early_data_routing: bool,
     read: Option<RecordCrypter>,
     write: Option<RecordCrypter>,
     pub(crate) transcript: Transcript,
@@ -69,6 +80,8 @@ impl ConnectionCore {
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
             app_in: Vec::new(),
+            early_in: Vec::new(),
+            early_data_routing: false,
             read: None,
             write: None,
             transcript: Transcript::new(),
@@ -117,9 +130,24 @@ impl ConnectionCore {
         self.write = Some(crypter);
     }
 
-    /// Drains any received application plaintext.
+    /// Drains any received application plaintext. Never includes 0-RTT
+    /// early data — that is quarantined in its own buffer (see
+    /// [`Self::take_early_data`]).
     pub(crate) fn take_received(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.app_in)
+    }
+
+    /// Drains any received (accepted) 0-RTT early-data plaintext. The bytes
+    /// were protected under `client_early_traffic_secret` and are replayable
+    /// by an active attacker; callers must treat them accordingly.
+    pub(crate) fn take_early_data(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.early_in)
+    }
+
+    /// Selects where inner `ApplicationData` plaintext lands: `early_in`
+    /// (while the 0-RTT read key is installed) or `app_in` (otherwise).
+    pub(crate) fn set_early_data_routing(&mut self, enabled: bool) {
+        self.early_data_routing = enabled;
     }
 
     /// Updates the transcript with a handshake message and frames it for
@@ -330,7 +358,13 @@ impl ConnectionCore {
             }
             ContentType::ApplicationData => {
                 let plaintext_len = content.len();
-                self.app_in.extend_from_slice(&content);
+                if self.early_data_routing {
+                    // Replayable 0-RTT bytes: quarantine away from `app_in`
+                    // so `take_received` never mixes them with 1-RTT data.
+                    self.early_in.extend_from_slice(&content);
+                } else {
+                    self.app_in.extend_from_slice(&content);
+                }
                 Ok(Some(Incoming::ApplicationData(plaintext_len)))
             }
             ContentType::Alert => {

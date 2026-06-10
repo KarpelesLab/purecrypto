@@ -1904,8 +1904,26 @@ mod loopback_tests {
         assert!(server2.early_data_accepted(), "server accepted 0-RTT");
         assert!(client2.early_data_accepted(), "client saw 0-RTT acceptance");
 
-        let received = server2.take_received_plaintext();
+        // Replayable 0-RTT bytes arrive ONLY via `take_early_data`; the
+        // regular receive path must never deliver them.
+        assert_eq!(
+            server2.take_received_plaintext(),
+            b"",
+            "0-RTT bytes must not leak into take_received_plaintext"
+        );
+        let received = server2.take_early_data();
         assert_eq!(received, b"hello-0rtt", "server received 0-RTT data");
+        // Drained once; a second take is empty.
+        assert!(server2.take_early_data().is_empty());
+
+        // Post-handshake 1-RTT data still flows through the regular path
+        // and stays out of the early-data buffer.
+        client2.send_application_data(b"after-eoed").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert!(server2.take_early_data().is_empty());
+        assert_eq!(server2.take_received_plaintext(), b"after-eoed");
     }
 
     /// 0-RTT replay detection: when a ReplayWindow is shared across two
@@ -2167,7 +2185,8 @@ mod loopback_tests {
         }
         assert!(!client2.is_handshaking() && !server2.is_handshaking());
         assert!(server2.early_data_accepted());
-        assert_eq!(server2.take_received_plaintext(), payload);
+        assert!(server2.take_received_plaintext().is_empty());
+        assert_eq!(server2.take_early_data(), payload);
     }
 
     /// A PSK binder that's been tampered with: the server must reject with

@@ -218,6 +218,23 @@ impl Connection {
         })
     }
 
+    /// Accepted 0-RTT early-data plaintext out (server side).
+    ///
+    /// Early data is **replayable by an active attacker** (RFC 8446 §8), so
+    /// it is quarantined away from [`recv`](Connection::recv) — `recv` only
+    /// ever returns data protected by the completed handshake. Drain the
+    /// replayable bytes explicitly here and only act on them when doing so
+    /// is idempotent. Returns an empty vector on client engines, on engines
+    /// without 0-RTT support, when the server did not accept early data, or
+    /// once the buffer has been drained.
+    pub fn take_early_data(&mut self) -> Result<Vec<u8>, Error> {
+        Ok(match &mut self.inner {
+            Engine::ServerTls13(c) => c.take_early_data(),
+            // No other engine accepts 0-RTT early data today.
+            _ => Vec::new(),
+        })
+    }
+
     /// Close the connection, emitting a close_notify alert if the engine
     /// supports it.
     pub fn close(&mut self) -> Result<(), Error> {

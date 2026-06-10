@@ -600,8 +600,10 @@ impl ServerConfig {
 
     /// Enables 0-RTT: accept up to `max` bytes of early data on resumed
     /// connections, and advertise that budget in emitted NewSessionTickets.
-    /// 0-RTT data is replayable by an active attacker; callers should
-    /// treat any data received under `take_early_data` as idempotent.
+    /// 0-RTT data is replayable by an active attacker; it is delivered
+    /// only through [`ServerConnection::take_early_data`] (never through
+    /// `take_received_plaintext`) and callers should only act on it when
+    /// doing so is idempotent.
     pub fn with_max_early_data(mut self, max: u32) -> Self {
         self.max_early_data_size = max;
         self
@@ -1246,8 +1248,25 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     /// Removes and returns any received application plaintext.
+    ///
+    /// Never includes 0-RTT early data: bytes the client sent under
+    /// `client_early_traffic_secret` are quarantined in their own buffer
+    /// and must be drained explicitly via [`Self::take_early_data`].
     pub fn take_received_plaintext(&mut self) -> Vec<u8> {
         self.core.take_received()
+    }
+
+    /// Removes and returns any accepted 0-RTT early-data plaintext.
+    ///
+    /// Early data is **replayable by an active attacker** (RFC 8446 §8 /
+    /// Appendix E.5): an observer can re-send the captured ClientHello +
+    /// early-data flight to this or another server and have the same bytes
+    /// accepted again (subject to the configured anti-replay window).
+    /// Applications must only act on these bytes if doing so is idempotent.
+    /// Returns an empty vector when no early data was accepted or it has
+    /// already been drained.
+    pub fn take_early_data(&mut self) -> Vec<u8> {
+        self.core.take_early_data()
     }
 
     /// Queues a `close_notify`.
@@ -1358,6 +1377,10 @@ impl<R: RngCore> ServerConnection<R> {
                         suite.key_len,
                         &chts,
                     ));
+                    // The early-data read key is gone; application records
+                    // from here on are 1-RTT-bound and go to the regular
+                    // receive buffer again.
+                    self.core.set_early_data_routing(false);
                     // RFC 8446 §4.2.10: client signaled end of early data.
                     // The early-data byte budget is no longer relevant —
                     // subsequent application records arrive under the
@@ -1874,6 +1897,11 @@ impl<R: RngCore> ServerConnection<R> {
                     suite.key_len,
                     &cets,
                 ));
+                // Quarantine: while the early-data read key is installed,
+                // decrypted application plaintext is replayable 0-RTT data
+                // and must land in the dedicated early-data buffer, never
+                // in the buffer `take_received_plaintext` drains.
+                self.core.set_early_data_routing(true);
             }
             Some(cets)
         } else {
