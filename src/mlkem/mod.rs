@@ -251,9 +251,10 @@ macro_rules! ml_kem_set {
             }
 
             /// FIPS 203 §7.2 "Encapsulation key check": confirms
-            /// `ByteEncode₁₂(ByteDecode₁₂(t)) == t` for the polynomial-vector
-            /// portion of the EK (the trailing 32-byte `rho` is opaque and
-            /// not checked). Returns the validated key on success.
+            /// `ByteEncode₁₂(ByteDecode₁₂(t)) == t` — i.e. every 12-bit
+            /// coefficient of the polynomial-vector portion of the EK is in
+            /// `[0, q)` (the trailing 32-byte `rho` is opaque and not
+            /// checked). Returns the validated key on success.
             pub fn from_bytes_validated(
                 bytes: [u8; $ek_size],
             ) -> Result<Self, crate::mlkem::EncapsKeyCheckError> {
@@ -261,9 +262,7 @@ macro_rules! ml_kem_set {
                 let polyvec = &bytes[..POLYBYTES_LOCAL * $k];
                 for i in 0..$k {
                     let chunk = &polyvec[i * POLYBYTES_LOCAL..(i + 1) * POLYBYTES_LOCAL];
-                    let p = crate::mlkem::poly::from_bytes(chunk);
-                    let re = crate::mlkem::poly::to_bytes(&p);
-                    if re != chunk {
+                    if !crate::mlkem::poly::is_canonical(chunk) {
                         return Err(crate::mlkem::EncapsKeyCheckError);
                     }
                 }
@@ -320,7 +319,9 @@ macro_rules! ml_kem_set {
                 }
                 let inner = seq.read_octet_string()?;
                 let bytes: [u8; $dk_size] = inner.try_into().map_err(|_| Error::Malformed)?;
-                Ok($dk_name(bytes))
+                // PKCS#8 input is untrusted: run the FIPS 203 §7.3 hash
+                // check rather than constructing the key unvalidated.
+                Self::from_bytes_validated(bytes).map_err(|_| Error::Malformed)
             }
 
             /// Parses a PKCS#8 PEM private key.
@@ -402,7 +403,9 @@ macro_rules! ml_kem_set {
                 }
                 let key_bits = spki.read_bit_string()?;
                 let bytes: [u8; $ek_size] = key_bits.try_into().map_err(|_| Error::Malformed)?;
-                Ok($ek_name(bytes))
+                // SPKI input is untrusted: run the FIPS 203 §7.2 modulus
+                // check rather than constructing the key unvalidated.
+                Self::from_bytes_validated(bytes).map_err(|_| Error::Malformed)
             }
 
             /// Parses a PKIX PEM public key.
@@ -642,5 +645,45 @@ mod tests {
         // pke_dk = 384 * 4 = 1536; ek_size = 1568 → H starts at 3104.
         bad[3105] ^= 1;
         assert!(MlKem1024DecapsKey::from_bytes_validated(bad).is_err());
+    }
+
+    /// FIPS 203 §7.2 — `from_spki_der` must reject an encapsulation key
+    /// whose t̂ encoding carries an off-modulus 12-bit coefficient, not
+    /// hand back an unvalidated key.
+    #[cfg(feature = "der")]
+    #[test]
+    fn spki_rejects_off_modulus_coefficient() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"spki-check", b"nonce", &[]);
+        let (_dk, ek) = MlKem768DecapsKey::generate(&mut rng);
+        let mut bad = ek.to_bytes();
+        // Force the first 12-bit coefficient to 0xFFF = 4095 ≥ q = 3329.
+        bad[0] = 0xff;
+        bad[1] = 0xff;
+        // The strict raw-bytes path must reject it (this also exercises the
+        // [q, 4096) range the old round-trip check let through unreduced).
+        assert!(MlKem768EncapsKey::from_bytes_validated(bad).is_err());
+        let spki = MlKem768EncapsKey::from_bytes(bad).to_spki_der();
+        assert_eq!(
+            MlKem768EncapsKey::from_spki_der(&spki),
+            Err(crate::der::Error::Malformed)
+        );
+        // Sanity: the unmodified key still parses.
+        assert!(MlKem768EncapsKey::from_spki_der(&ek.to_spki_der()).is_ok());
+    }
+
+    /// FIPS 203 §7.3 — `from_pkcs8_der` must reject a decapsulation key
+    /// whose embedded H(ek) field has been corrupted.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_rejects_corrupted_hash_field() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"pkcs8-check", b"nonce", &[]);
+        let (dk, _ek) = MlKem768DecapsKey::generate(&mut rng);
+        let mut bad = dk.to_bytes();
+        // pke_dk = 384 * 3 = 1152; ek_size = 1184 → H(ek) starts at 2336.
+        bad[2337] ^= 1;
+        let der = MlKem768DecapsKey::from_bytes(bad).to_pkcs8_der();
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&der).is_err());
+        // Sanity: the unmodified key still parses.
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&dk.to_pkcs8_der()).is_ok());
     }
 }

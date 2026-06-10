@@ -234,6 +234,27 @@ pub(crate) fn to_bytes(p: &Poly) -> [u8; 384] {
     r
 }
 
+/// FIPS 203 §7.2 modulus check: returns `true` iff every 12-bit
+/// coefficient of the 384-byte encoding is canonical, i.e. in `[0, q)`.
+/// Equivalent to the `ByteEncode₁₂(ByteDecode₁₂(t)) == t` round-trip of
+/// the standard (whose `ByteDecode₁₂` reduces mod q); checking directly
+/// avoids relying on [`from_bytes`] / [`to_bytes`], which do not reduce
+/// coefficients in `[q, 4096)` and would round-trip them unchanged.
+pub(crate) fn is_canonical(a: &[u8]) -> bool {
+    debug_assert_eq!(a.len(), 384);
+    for i in 0..N / 2 {
+        let b0 = a[3 * i] as u16;
+        let b1 = a[3 * i + 1] as u16;
+        let b2 = a[3 * i + 2] as u16;
+        let c0 = (b0 | (b1 << 8)) & 0xfff;
+        let c1 = ((b1 >> 4) | (b2 << 4)) & 0xfff;
+        if c0 >= Q as u16 || c1 >= Q as u16 {
+            return false;
+        }
+    }
+    true
+}
+
 /// `ByteDecode₁₂`: parses a 384-byte polynomial (12 bits/coefficient).
 pub(crate) fn from_bytes(a: &[u8]) -> Poly {
     let mut p = Poly::zero();
