@@ -180,9 +180,13 @@ impl DhPrivateKey {
     ///   `x mod t` by exhaustive search of the resulting shared secret. For
     ///   the RFC 3526 / RFC 7919 safe-prime groups (`p = 2q + 1`, `q`
     ///   prime), the order-`q` subgroup is the only large subgroup and this
-    ///   test confines `peer.y` to it. For custom non-safe-prime groups the
-    ///   check still rejects every public value outside the order-`q`
-    ///   half-quotient subgroup;
+    ///   test confines `peer.y` to it. This defense is complete only for a
+    ///   safe prime: when `q = (p - 1) / 2` is composite, the order-`q`
+    ///   subgroup itself contains small subgroups, so confinement to it does
+    ///   not stop the attack. [`DhGroup::from_custom`] therefore verifies
+    ///   that both `p` and `q` are (probable) primes; only
+    ///   [`DhGroup::from_custom_unchecked`] groups can reach this code with
+    ///   a non-safe modulus, and those callers own that risk;
     /// * a resulting shared secret of 0 or 1 — contributory-failure
     ///   rejection per NIST SP 800-56A §5.6.2.3.
     pub fn shared_secret(&self, peer: &DhPublicKey) -> Result<SharedSecret, Error> {
@@ -201,9 +205,11 @@ impl DhPrivateKey {
         // 7919, every safe-prime SSH group-exchange responder), `q` is
         // the order of the prime subgroup; any element of order > 1
         // outside that subgroup has order 2 (i.e. is `p - 1`), already
-        // ruled out by the coarse range check above. Performing this
-        // modexp also makes a small-subgroup attack on a maliciously
-        // crafted non-safe-prime peer fail closed.
+        // ruled out by the coarse range check above. This check assumes a
+        // safe prime — `DhGroup::from_custom` enforces that with a
+        // Miller-Rabin test on both p and q; a `from_custom_unchecked`
+        // group with composite q is NOT protected against small subgroups
+        // inside the order-q subgroup.
         let q = p_minus_one.shr_bits(1);
         let one = BoxedUint::from_u64(1);
         let y_to_q = m.pow(&peer.y, &q);
