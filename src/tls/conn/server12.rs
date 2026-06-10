@@ -28,6 +28,8 @@ use super::client12::{
 };
 use super::server::ServerKey;
 use super::ticket12::{Ticket12Plaintext, open_ticket, seal_ticket};
+#[cfg(feature = "tls-legacy")]
+use crate::ct::ConditionallySelectable;
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId};
@@ -1412,9 +1414,34 @@ impl<R: RngCore> ServerConnection12<R> {
                     // with Bleichenbacher-safe implicit rejection (a bad
                     // ciphertext yields an unpredictable premaster, so the
                     // handshake fails only later at Finished, leaking nothing).
-                    ServerKey::Rsa(k) => k
-                        .decrypt_pkcs1v15_session(&cke.encrypted_premaster, 48)
-                        .map_err(|_| Error::DecryptError)?,
+                    ServerKey::Rsa(k) => {
+                        let mut pm = k
+                            .decrypt_pkcs1v15_session(&cke.encrypted_premaster, 48)
+                            .map_err(|_| Error::DecryptError)?;
+                        // RFC 5246 §7.4.7.1 version-rollback check: the first
+                        // two premaster bytes MUST equal the version the
+                        // client offered in its ClientHello. On this path the
+                        // offered version is exactly `negotiated_version`:
+                        // `on_client_hello_legacy` is only reached when
+                        // `ch.legacy_version < 0x0303`, where the negotiated
+                        // version is `ch.legacy_version` itself (the `min`
+                        // cap never fires below 0x0303). Per the RFC, a
+                        // mismatch MUST behave exactly like a PKCS#1 padding
+                        // failure: substitute `client_version || random` via
+                        // a constant-time masked select — no branch, no
+                        // distinct error — so a rollback probe is
+                        // indistinguishable from a Bleichenbacher probe and
+                        // the handshake only fails later at Finished.
+                        let offered = self.negotiated_version.as_u16().to_be_bytes();
+                        let version_bad = !(pm[0].ct_eq(&offered[0]) & pm[1].ct_eq(&offered[1]));
+                        let mut substitute = [0u8; 48];
+                        self.rng.fill_bytes(&mut substitute);
+                        substitute[..2].copy_from_slice(&offered);
+                        for (b, s) in pm.iter_mut().zip(substitute.iter()) {
+                            b.conditional_assign(s, version_bad);
+                        }
+                        pm
+                    }
                     _ => return Err(Error::HandshakeFailure),
                 }
             }
@@ -2650,5 +2677,101 @@ mod tests {
         assert_eq!(s.client_cert_chain.len(), 1);
         assert!(s.client_leaf_key.is_some());
         assert_eq!(s.state, State::WaitClientKeyExchange);
+    }
+
+    /// Drives a legacy TLS 1.0 static-RSA handshake up to `ClientKeyExchange`
+    /// with a hand-rolled client whose encrypted premaster claims
+    /// `premaster_version` in its first two bytes, and returns
+    /// `(derived_master, honest_master)` where `honest_master` is the master
+    /// secret that premaster would derive if the server used it as-is. The
+    /// server must take the SAME observable path for matching and mismatching
+    /// versions: `Ok` from `process_new_packets`, no alert bytes, state
+    /// advanced to `WaitClientFinished`.
+    #[cfg(feature = "tls-legacy")]
+    fn run_legacy_rsa_cke(premaster_version: u16) -> ([u8; 48], [u8; 48]) {
+        use crate::test_util::rsa_test_key_a;
+        use crate::tls::codec::handshake12::RsaClientKeyExchange;
+
+        let cfg = test_rsa_server_config().with_min_version(ProtocolVersion::TLSv1_0);
+        let srng = HmacDrbg::<Sha256>::new(b"s12-rollback-s", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, srng);
+
+        // Legacy ClientHello offering TLS 1.0 and a static-RSA CBC suite.
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-rollback-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0301,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            extensions: Vec::new(),
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_0,
+            &ch,
+        );
+        s.read_tls(&rec);
+        s.process_new_packets().unwrap();
+        // Drain the server flight (SH || Certificate || ServerHelloDone).
+        assert!(!s.write_tls().is_empty());
+
+        // ClientKeyExchange: RSA-encrypt `claimed_version || filler` to the
+        // server's certificate key.
+        let mut pm = [0x42u8; 48];
+        pm[..2].copy_from_slice(&premaster_version.to_be_bytes());
+        let ct = rsa_test_key_a()
+            .public_key()
+            .encrypt_pkcs1v15(&pm, &mut crng)
+            .unwrap();
+        let cke = RsaClientKeyExchange {
+            encrypted_premaster: ct,
+        }
+        .encode(false);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_0,
+            &cke,
+        );
+        s.read_tls(&rec);
+        // RFC 5246 §7.4.7.1 implicit rejection: a version mismatch MUST NOT
+        // produce an error, alert, or state divergence — only a different
+        // master secret (the handshake then dies at Finished).
+        s.process_new_packets().unwrap();
+        assert_eq!(s.state, State::WaitClientFinished);
+        assert!(s.write_tls().is_empty(), "no output before client Finished");
+
+        let cr = s.client_random.unwrap();
+        let sr = s.server_random.unwrap();
+        let honest = s.legacy_master_secret(&pm, &cr, &sr);
+        (s.master.unwrap(), honest)
+    }
+
+    /// Control: a premaster whose version bytes match the ClientHello offer
+    /// (TLS 1.0, 0x0301) is used as-is.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_rsa_premaster_version_match_derives_real_master() {
+        let (derived, honest) = run_legacy_rsa_cke(0x0301);
+        assert_eq!(derived, honest);
+    }
+
+    /// RFC 5246 §7.4.7.1 rollback check: a premaster claiming TLS 1.2
+    /// (0x0303) while the ClientHello offered TLS 1.0 must be implicitly
+    /// rejected — same `Ok`/state/no-alert behavior as the control (asserted
+    /// inside the helper), but the master secret is derived from a
+    /// substituted random premaster, so the handshake can only fail later at
+    /// Finished, exactly like a Bleichenbacher padding probe.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_rsa_premaster_version_rollback_implicitly_rejected() {
+        let (derived, honest) = run_legacy_rsa_cke(0x0303);
+        assert_ne!(derived, honest);
     }
 }
