@@ -381,6 +381,57 @@ fn hss_bottom_rollover_fails_closed() {
     );
 }
 
+/// SECURITY REGRESSION (upper-level LM-OTS randomizer reuse).
+///
+/// For `L >= 2` the non-bottom levels are pinned at leaf 0 and re-sign the
+/// same fixed child public key on every `sign()`. Their LM-OTS keys are
+/// one-time: drawing a fresh random `C` per call would change
+/// `Q = H(I || q || D_MESG || C || pub[i+1])` and expose the same Winternitz
+/// chains at different coefficient vectors — LM-OTS reuse enabling forgery.
+/// The upper-level signature must therefore be byte-identical across calls
+/// (including across a serialize/reload cycle), while signatures still verify.
+#[test]
+fn hss_upper_level_signature_is_deterministic() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-upper-det", b"n", &[]);
+    let mut key = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let pk = key.public_key();
+
+    let s0 = key.sign(&mut rng, b"det-0").unwrap();
+    let s1 = key.sign(&mut rng, b"det-1").unwrap();
+    assert!(pk.verify(b"det-0", &s0));
+    assert!(pk.verify(b"det-1", &s1));
+
+    // HSS sig layout: u32(Nspk) || sig[0] || pub[1] || sig[1]. The upper-level
+    // portion (sig[0], including its embedded C, plus pub[1]) must be
+    // bit-identical on every emission.
+    let upper_end = 4 + lms_len(&s0[4..]) + 24 + N;
+    assert_eq!(
+        s0[..upper_end],
+        s1[..upper_end],
+        "upper-level LM-OTS signature must be byte-identical across sign() calls"
+    );
+
+    // ...and identical again after a serialize/reload round-trip.
+    let mut reloaded = HssPrivateKey::from_bytes(&key.to_bytes()).unwrap();
+    let s2 = reloaded.sign(&mut rng, b"det-2").unwrap();
+    assert!(pk.verify(b"det-2", &s2));
+    assert_eq!(
+        s0[..upper_end],
+        s2[..upper_end],
+        "upper-level signature must survive serialize/reload unchanged"
+    );
+
+    // The bottom-level signatures differ (distinct leaves and messages).
+    assert_ne!(s0[upper_end..], s1[upper_end..]);
+}
+
 /// A persisted multi-level key with an advanced higher level is rejected: it
 /// could only be a pre-mitigation (already-wrapped) key that would re-use OTS.
 #[test]

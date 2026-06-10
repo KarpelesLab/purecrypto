@@ -75,6 +75,31 @@ pub(crate) fn derive_x(i_id: &[u8; 16], seed: &[u8; N], q: u32, chain: u16, out:
     *out = h.finalize();
 }
 
+/// Derives a deterministic LM-OTS message randomizer
+/// `C = H(I || u32str(q) || u16str(0xfffd) || 0xff || SEED || message)`.
+///
+/// Used for the *pinned* (non-bottom) levels of a multi-level HSS key, which
+/// re-emit the signature of the same fixed leaf over the same child public key
+/// on every `sign()` call. An LM-OTS key is one-time: re-signing it with a
+/// *different* `C` changes `Q = H(I || q || D_MESG || C || message)` and
+/// exposes the Winternitz chains at new coefficient vectors — catastrophic key
+/// reuse enabling forgery. Deriving `C` from the secret seed and the signed
+/// bytes makes every re-emission byte-identical.
+///
+/// The chain index `0xfffd` cannot collide with [`derive_x`] (whose chain
+/// indices are `< p <= 265`) and matches the C-randomizer index used by the
+/// RFC 8554 reference implementation.
+pub(crate) fn derive_c(i_id: &[u8; 16], seed: &[u8; N], q: u32, message: &[u8]) -> [u8; N] {
+    let mut h = Sha256::new();
+    h.update(i_id);
+    h.update(&q.to_be_bytes());
+    h.update(&0xfffdu16.to_be_bytes());
+    h.update(&[0xffu8]);
+    h.update(seed);
+    h.update(message);
+    h.finalize()
+}
+
 /// Computes the LM-OTS public key `K` for leaf `q` from the master `seed`
 /// (RFC 8554 §4.3, Algorithm 1, with the Appendix A private-element derivation).
 pub(crate) fn public_key(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {

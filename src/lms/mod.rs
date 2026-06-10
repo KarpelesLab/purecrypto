@@ -323,7 +323,9 @@ pub struct HssPublicKey {
 /// pinned at leaf 0) and then returns [`Error::Exhausted`]. No LM-OTS key is
 /// ever used twice. This is a conservative fail-closed mitigation; the full
 /// multi-level HSS regeneration is flagged for future work. The bottom level's
-/// signing randomizer `C` is drawn from the RNG per signature.
+/// signing randomizer `C` is drawn from the RNG per signature; the pinned
+/// higher levels derive theirs deterministically so their fixed one-time keys
+/// always re-emit byte-identical signatures (see `append_level_signature`).
 pub struct HssPrivateKey {
     levels: Vec<HssLevel>,
     /// Cached root of each level's tree (`roots[i] = T[1]` of level i).
@@ -450,7 +452,9 @@ impl HssPrivateKey {
 
     /// Signs `message` (RFC 8554 §6.2). Advances the internal state.
     ///
-    /// `rng` supplies each LM-OTS randomizer `C`; it SHOULD be a CSPRNG.
+    /// `rng` supplies the bottom level's LM-OTS randomizer `C`; it SHOULD be a
+    /// CSPRNG. The pinned higher levels derive their `C` deterministically —
+    /// see `append_level_signature` for why that is mandatory.
     /// **Persist [`to_bytes`](Self::to_bytes) before using the returned
     /// signature** — see the [module documentation](crate::lms).
     pub fn sign<R: RngCore>(&mut self, rng: &mut R, message: &[u8]) -> Result<Vec<u8>, Error> {
@@ -463,9 +467,18 @@ impl HssPrivateKey {
         out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
 
         for i in 0..l {
-            let mut c = [0u8; N];
-            rng.fill_bytes(&mut c);
-            self.append_level_signature(&mut out, i, message, &c);
+            if i + 1 < l {
+                // Pinned non-bottom level: its one-time key re-signs the same
+                // child public key on every call, so `C` MUST be deterministic
+                // (`None` selects the seed-derived randomizer).
+                self.append_level_signature(&mut out, i, message, None);
+            } else {
+                // Bottom level: `q` advances with every signature, so a fresh
+                // random `C` never re-randomizes an already-used one-time key.
+                let mut c = [0u8; N];
+                rng.fill_bytes(&mut c);
+                self.append_level_signature(&mut out, i, message, Some(&c));
+            }
         }
 
         self.advance();
@@ -474,7 +487,26 @@ impl HssPrivateKey {
 
     /// Appends `sig[i]` (signing either `pub[i+1]` or the message) and, for
     /// non-final levels, the signed public key `pub[i+1]`.
-    fn append_level_signature(&self, out: &mut Vec<u8>, i: usize, message: &[u8], c: &[u8; N]) {
+    ///
+    /// `c` is the LM-OTS randomizer; `None` derives it deterministically from
+    /// the level's secret seed and the signed bytes via [`ots::derive_c`].
+    ///
+    /// # Why pinned levels MUST use the deterministic randomizer
+    ///
+    /// Non-bottom levels are pinned at leaf 0 and sign the *fixed* child public
+    /// key, so the same LM-OTS key is re-emitted by every `sign()` call. Were a
+    /// fresh `C` drawn per call, `Q = H(I || q || D_MESG || C || pub[i+1])`
+    /// would change each time and the one-time Winternitz chains would be
+    /// exposed at different coefficient vectors — textbook LM-OTS reuse,
+    /// enabling offline forgery. With the seed-derived `C`, every emission of
+    /// an upper-level signature is byte-identical.
+    fn append_level_signature(
+        &self,
+        out: &mut Vec<u8>,
+        i: usize,
+        message: &[u8],
+        c: Option<&[u8; N]>,
+    ) {
         let l = self.levels.len();
         let lv = &self.levels[i];
         let signed = if i + 1 < l {
@@ -488,13 +520,17 @@ impl HssPrivateKey {
         } else {
             message.to_vec()
         };
+        let c = match c {
+            Some(c) => *c,
+            None => ots::derive_c(&lv.i_id, &lv.seed, self.q[i], &signed),
+        };
         let sig = tree::sign(
             lv.lms_type,
             lv.ots_type,
             &lv.i_id,
             &lv.seed,
             self.q[i],
-            c,
+            &c,
             &signed,
         );
         out.extend_from_slice(&sig);
@@ -514,7 +550,7 @@ impl HssPrivateKey {
         let mut out = Vec::new();
         out.extend_from_slice(&((l - 1) as u32).to_be_bytes());
         for (i, c) in c_per_level.iter().enumerate().take(l) {
-            self.append_level_signature(&mut out, i, message, c);
+            self.append_level_signature(&mut out, i, message, Some(c));
         }
         self.advance();
         Ok(out)
