@@ -64,6 +64,56 @@ pub struct PcLms(Box<LmsPrivateKey>);
 /// An opaque, mutable multi-level HSS signing key.
 pub struct PcHss(Box<HssPrivateKey>);
 
+/// Hash output length shared by every supported LMS / LM-OTS parameter set
+/// (all are SHA-256 with `n = m = 32`, RFC 8554 Tables 1 and 2).
+const N: usize = 32;
+
+/// Exact encoded length of a single-tree LMS signature for the given
+/// parameter sets: `u32(q) || lmots_signature || u32(lms_type) || path[h]`
+/// (RFC 8554 §5.4), where the LM-OTS signature is `4 + n*(p+1)` bytes.
+/// LMS signature sizes are constant per parameter set, so the FFI sign
+/// entry points can check the caller's capacity BEFORE consuming a
+/// one-time key. Cross-checked against the actual encoding in tests.
+fn lms_sig_len(lms: LmsType, ots: LmotsType) -> usize {
+    4 + ots.sig_len() + 4 + lms.h() as usize * N
+}
+
+/// Exact encoded length of an HSS signature: `u32(Nspk)` followed by `L`
+/// LMS signatures interleaved with the `L - 1` signed child public keys
+/// (`24 + n` bytes each), RFC 8554 §6.2.
+///
+/// [`HssPrivateKey`] does not expose its per-level parameter sets, so they
+/// are recovered from the self-describing private serialization
+/// (`u32(L) || per level { u32(lms) || u32(ots) || I(16) || seed(32) ||
+/// u32(q) }`); the copy contains the master seeds and is wiped before
+/// returning. Returns `None` only on a malformed serialization (which
+/// would indicate an internal bug, not user input).
+fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
+    let mut ser = key.to_bytes();
+    let result = hss_sig_len_from_private_bytes(&ser);
+    super::common::wipe_vec(&mut ser);
+    result
+}
+
+fn hss_sig_len_from_private_bytes(ser: &[u8]) -> Option<usize> {
+    const LEVEL_BYTES: usize = 4 + 4 + 16 + N + 4;
+    let l = u32::from_be_bytes(ser.get(..4)?.try_into().ok()?) as usize;
+    if l == 0 || ser.len() != 4 + l * LEVEL_BYTES {
+        return None;
+    }
+    let mut total = 4; // u32(Nspk)
+    for i in 0..l {
+        let off = 4 + i * LEVEL_BYTES;
+        let lms = LmsType::from_u32(u32::from_be_bytes(ser[off..off + 4].try_into().ok()?))?;
+        let ots = LmotsType::from_u32(u32::from_be_bytes(ser[off + 4..off + 8].try_into().ok()?))?;
+        total += lms_sig_len(lms, ots);
+        if i + 1 < l {
+            total += 24 + N; // signed child LMS public key
+        }
+    }
+    Some(total)
+}
+
 // ---------------------------------------------------------------------------
 // LMS
 // ---------------------------------------------------------------------------
@@ -141,6 +191,11 @@ pub unsafe extern "C" fn pc_lms_public_to_bytes(
 /// [`pc_lms_private_to_bytes`] and persist before releasing the signature.
 /// Returns [`PcStatus::Internal`] when the key is exhausted.
 ///
+/// The signature size is constant per parameter set and is checked BEFORE
+/// signing: a size query (`*out_len == 0`) or too-small buffer returns
+/// [`PcStatus::BufferTooSmall`] with the required length in `*out_len`
+/// without consuming a one-time key.
+///
 /// # Safety
 /// All pointers valid for their lengths.
 #[unsafe(no_mangle)]
@@ -152,16 +207,25 @@ pub unsafe extern "C" fn pc_lms_sign(
     out_len: *mut usize,
 ) -> PcStatus {
     guard(|| {
-        if k.is_null() {
+        if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
         let Some(m) = (unsafe { slice(msg, msg_len) }) else {
             return PcStatus::NullPointer;
         };
-        let sig = match unsafe { &mut *k }.0.sign(&mut OsRng, m) {
+        let key = unsafe { &mut *k };
+        // Capacity check BEFORE signing — sign() irreversibly burns a
+        // one-time key, so a mere size query must not advance the state.
+        let expected = lms_sig_len(key.0.lms_type(), key.0.ots_type());
+        if unsafe { *out_len } < expected {
+            unsafe { *out_len = expected };
+            return PcStatus::BufferTooSmall;
+        }
+        let sig = match key.0.sign(&mut OsRng, m) {
             Ok(s) => s,
             Err(_) => return PcStatus::Internal,
         };
+        debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
     })
 }
@@ -288,6 +352,11 @@ pub unsafe extern "C" fn pc_hss_public_to_bytes(
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
 /// [`pc_hss_private_to_bytes`] before releasing the signature.
 ///
+/// The signature size is constant per parameter-set configuration and is
+/// checked BEFORE signing: a size query (`*out_len == 0`) or too-small buffer
+/// returns [`PcStatus::BufferTooSmall`] with the required length in
+/// `*out_len` without consuming a one-time key.
+///
 /// # Safety
 /// All pointers valid for their lengths.
 #[unsafe(no_mangle)]
@@ -299,16 +368,27 @@ pub unsafe extern "C" fn pc_hss_sign(
     out_len: *mut usize,
 ) -> PcStatus {
     guard(|| {
-        if k.is_null() {
+        if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
         let Some(m) = (unsafe { slice(msg, msg_len) }) else {
             return PcStatus::NullPointer;
         };
-        let sig = match unsafe { &mut *k }.0.sign(&mut OsRng, m) {
+        let key = unsafe { &mut *k };
+        // Capacity check BEFORE signing — sign() irreversibly burns a
+        // one-time key, so a mere size query must not advance the state.
+        let Some(expected) = hss_sig_len(&key.0) else {
+            return PcStatus::Internal;
+        };
+        if unsafe { *out_len } < expected {
+            unsafe { *out_len = expected };
+            return PcStatus::BufferTooSmall;
+        }
+        let sig = match key.0.sign(&mut OsRng, m) {
             Ok(s) => s,
             Err(_) => return PcStatus::Internal,
         };
+        debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
     })
 }

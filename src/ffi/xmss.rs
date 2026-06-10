@@ -126,6 +126,11 @@ pub unsafe extern "C" fn pc_xmss_public_to_bytes(
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
 /// [`pc_xmss_private_to_bytes`] before releasing the signature.
 ///
+/// The signature size is constant per parameter set and is checked BEFORE
+/// signing: a size query (`*out_len == 0`) or too-small buffer returns
+/// [`PcStatus::BufferTooSmall`] with the required length in `*out_len`
+/// without consuming a one-time key.
+///
 /// # Safety
 /// All pointers valid for their lengths.
 #[unsafe(no_mangle)]
@@ -137,16 +142,25 @@ pub unsafe extern "C" fn pc_xmss_sign(
     out_len: *mut usize,
 ) -> PcStatus {
     guard(|| {
-        if k.is_null() {
+        if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
         let Some(m) = (unsafe { slice(msg, msg_len) }) else {
             return PcStatus::NullPointer;
         };
-        let sig = match unsafe { &mut *k }.0.sign(m) {
+        let key = unsafe { &mut *k };
+        // Capacity check BEFORE signing — sign() irreversibly burns a
+        // one-time key, so a mere size query must not advance the state.
+        let expected = key.0.parameter_set().params().sig_bytes();
+        if unsafe { *out_len } < expected {
+            unsafe { *out_len = expected };
+            return PcStatus::BufferTooSmall;
+        }
+        let sig = match key.0.sign(m) {
             Ok(s) => s,
             Err(_) => return PcStatus::Internal,
         };
+        debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
     })
 }
@@ -277,6 +291,11 @@ pub unsafe extern "C" fn pc_xmssmt_public_to_bytes(
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
 /// [`pc_xmssmt_private_to_bytes`] before releasing the signature.
 ///
+/// The signature size is constant per parameter set and is checked BEFORE
+/// signing: a size query (`*out_len == 0`) or too-small buffer returns
+/// [`PcStatus::BufferTooSmall`] with the required length in `*out_len`
+/// without consuming a one-time key.
+///
 /// # Safety
 /// All pointers valid for their lengths.
 #[unsafe(no_mangle)]
@@ -288,16 +307,25 @@ pub unsafe extern "C" fn pc_xmssmt_sign(
     out_len: *mut usize,
 ) -> PcStatus {
     guard(|| {
-        if k.is_null() {
+        if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
         let Some(m) = (unsafe { slice(msg, msg_len) }) else {
             return PcStatus::NullPointer;
         };
-        let sig = match unsafe { &mut *k }.0.sign(m) {
+        let key = unsafe { &mut *k };
+        // Capacity check BEFORE signing — sign() irreversibly burns a
+        // one-time key, so a mere size query must not advance the state.
+        let expected = key.0.parameter_set().params().sig_bytes();
+        if unsafe { *out_len } < expected {
+            unsafe { *out_len = expected };
+            return PcStatus::BufferTooSmall;
+        }
+        let sig = match key.0.sign(m) {
             Ok(s) => s,
             Err(_) => return PcStatus::Internal,
         };
+        debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
     })
 }

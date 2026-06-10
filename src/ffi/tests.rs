@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, mlkem, quic, rsa, tls, x509};
+use super::{ec, hash, lms, mlkem, quic, rsa, tls, x509, xmss};
 use crate::der::pem_decode;
 
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
@@ -323,6 +323,243 @@ fn quic_set_peer_addr_rejects_wrong_length() {
 
     unsafe { quic::pc_quic_free(q) };
     unsafe { quic::pc_quic_cfg_free(cfg) };
+}
+
+// ---- Stateful hash-based signing: a size query must not burn a key ---------
+
+#[test]
+fn lms_sign_size_query_does_not_burn_a_key() {
+    let msg = b"lms size-query message";
+    // Every LM-OTS width, smallest tree (H5) — validates the length formula
+    // across all four `p` values.
+    for ots in [1i32, 2, 3, 4] {
+        let k = lms::pc_lms_generate(5 /* SHA256_M32_H5 */, ots);
+        assert!(!k.is_null());
+        let state = |k| read_out(|o, l| unsafe { lms::pc_lms_private_to_bytes(k, o, l) });
+        let before = state(k);
+
+        // Size query (capacity 0): reports the length, advances nothing.
+        let mut need = 0usize;
+        let st = unsafe {
+            lms::pc_lms_sign(k, msg.as_ptr(), msg.len(), core::ptr::null_mut(), &mut need)
+        };
+        assert_eq!(st, PcStatus::BufferTooSmall);
+        assert!(need > 0);
+        assert_eq!(
+            before,
+            state(k),
+            "size query must not consume a one-time key"
+        );
+
+        // Too-small buffer: same.
+        let mut small = vec![0u8; need - 1];
+        let mut cap = small.len();
+        let st =
+            unsafe { lms::pc_lms_sign(k, msg.as_ptr(), msg.len(), small.as_mut_ptr(), &mut cap) };
+        assert_eq!(st, PcStatus::BufferTooSmall);
+        assert_eq!(cap, need);
+        assert_eq!(
+            before,
+            state(k),
+            "too-small sign must not consume a one-time key"
+        );
+
+        // Full sign: the predicted length must match the actual encoding.
+        let mut sig = vec![0u8; need];
+        let mut cap = need;
+        let st =
+            unsafe { lms::pc_lms_sign(k, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+        assert_eq!(st, PcStatus::Ok);
+        assert_eq!(
+            cap, need,
+            "predicted LMS signature length != actual (ots {ots})"
+        );
+        assert_ne!(before, state(k), "successful sign must advance the state");
+
+        // And it verifies.
+        let pk = read_out(|o, l| unsafe { lms::pc_lms_public_to_bytes(k, o, l) });
+        let st = unsafe {
+            lms::pc_lms_verify(
+                pk.as_ptr(),
+                pk.len(),
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                cap,
+            )
+        };
+        assert_eq!(st, PcStatus::Ok);
+        unsafe { lms::pc_lms_free(k) };
+    }
+}
+
+#[test]
+fn hss_sign_size_query_does_not_burn_a_key() {
+    let msg = b"hss size-query message";
+    // Single-level and multi-level (which appends the signed child public key).
+    for levels in [1usize, 2] {
+        let k = lms::pc_hss_generate(levels, 5 /* H5 */, 3 /* W4 */);
+        assert!(!k.is_null());
+        let state = |k| read_out(|o, l| unsafe { lms::pc_hss_private_to_bytes(k, o, l) });
+        let before = state(k);
+
+        let mut need = 0usize;
+        let st = unsafe {
+            lms::pc_hss_sign(k, msg.as_ptr(), msg.len(), core::ptr::null_mut(), &mut need)
+        };
+        assert_eq!(st, PcStatus::BufferTooSmall);
+        assert!(need > 0);
+        assert_eq!(
+            before,
+            state(k),
+            "size query must not consume a one-time key"
+        );
+
+        let mut small = vec![0u8; need - 1];
+        let mut cap = small.len();
+        let st =
+            unsafe { lms::pc_hss_sign(k, msg.as_ptr(), msg.len(), small.as_mut_ptr(), &mut cap) };
+        assert_eq!(st, PcStatus::BufferTooSmall);
+        assert_eq!(cap, need);
+        assert_eq!(
+            before,
+            state(k),
+            "too-small sign must not consume a one-time key"
+        );
+
+        let mut sig = vec![0u8; need];
+        let mut cap = need;
+        let st =
+            unsafe { lms::pc_hss_sign(k, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+        assert_eq!(st, PcStatus::Ok);
+        assert_eq!(
+            cap, need,
+            "predicted HSS signature length != actual (L = {levels})"
+        );
+        assert_ne!(before, state(k), "successful sign must advance the state");
+
+        let pk = read_out(|o, l| unsafe { lms::pc_hss_public_to_bytes(k, o, l) });
+        let st = unsafe {
+            lms::pc_hss_verify(
+                pk.as_ptr(),
+                pk.len(),
+                msg.as_ptr(),
+                msg.len(),
+                sig.as_ptr(),
+                cap,
+            )
+        };
+        assert_eq!(st, PcStatus::Ok);
+        unsafe { lms::pc_hss_free(k) };
+    }
+}
+
+#[test]
+fn xmss_sign_size_query_does_not_burn_a_key() {
+    let msg = b"xmss size-query message";
+    let k = xmss::pc_xmss_generate(1 /* XMSS-SHA2_10_256 */);
+    assert!(!k.is_null());
+    let state = |k| read_out(|o, l| unsafe { xmss::pc_xmss_private_to_bytes(k, o, l) });
+    let before = state(k);
+
+    let mut need = 0usize;
+    let st =
+        unsafe { xmss::pc_xmss_sign(k, msg.as_ptr(), msg.len(), core::ptr::null_mut(), &mut need) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert!(need > 0);
+    assert_eq!(
+        before,
+        state(k),
+        "size query must not consume a one-time key"
+    );
+
+    let mut small = vec![0u8; need - 1];
+    let mut cap = small.len();
+    let st =
+        unsafe { xmss::pc_xmss_sign(k, msg.as_ptr(), msg.len(), small.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(cap, need);
+    assert_eq!(
+        before,
+        state(k),
+        "too-small sign must not consume a one-time key"
+    );
+
+    let mut sig = vec![0u8; need];
+    let mut cap = need;
+    let st = unsafe { xmss::pc_xmss_sign(k, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(cap, need, "predicted XMSS signature length != actual");
+    assert_ne!(before, state(k), "successful sign must advance the state");
+
+    let pk = read_out(|o, l| unsafe { xmss::pc_xmss_public_to_bytes(k, o, l) });
+    let st = unsafe {
+        xmss::pc_xmss_verify(
+            pk.as_ptr(),
+            pk.len(),
+            msg.as_ptr(),
+            msg.len(),
+            sig.as_ptr(),
+            cap,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { xmss::pc_xmss_free(k) };
+}
+
+#[test]
+fn xmssmt_sign_size_query_does_not_burn_a_key() {
+    let msg = b"xmssmt size-query message";
+    let k = xmss::pc_xmssmt_generate(1 /* XMSSMT-SHA2_20/2_256 */);
+    assert!(!k.is_null());
+    let state = |k| read_out(|o, l| unsafe { xmss::pc_xmssmt_private_to_bytes(k, o, l) });
+    let before = state(k);
+
+    let mut need = 0usize;
+    let st = unsafe {
+        xmss::pc_xmssmt_sign(k, msg.as_ptr(), msg.len(), core::ptr::null_mut(), &mut need)
+    };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert!(need > 0);
+    assert_eq!(
+        before,
+        state(k),
+        "size query must not consume a one-time key"
+    );
+
+    let mut small = vec![0u8; need - 1];
+    let mut cap = small.len();
+    let st =
+        unsafe { xmss::pc_xmssmt_sign(k, msg.as_ptr(), msg.len(), small.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(cap, need);
+    assert_eq!(
+        before,
+        state(k),
+        "too-small sign must not consume a one-time key"
+    );
+
+    let mut sig = vec![0u8; need];
+    let mut cap = need;
+    let st =
+        unsafe { xmss::pc_xmssmt_sign(k, msg.as_ptr(), msg.len(), sig.as_mut_ptr(), &mut cap) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(cap, need, "predicted XMSS^MT signature length != actual");
+    assert_ne!(before, state(k), "successful sign must advance the state");
+
+    let pk = read_out(|o, l| unsafe { xmss::pc_xmssmt_public_to_bytes(k, o, l) });
+    let st = unsafe {
+        xmss::pc_xmssmt_verify(
+            pk.as_ptr(),
+            pk.len(),
+            msg.as_ptr(),
+            msg.len(),
+            sig.as_ptr(),
+            cap,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { xmss::pc_xmssmt_free(k) };
 }
 
 // ---- Non-destructive dequeue (pop / recv must survive BufferTooSmall) ------

@@ -530,7 +530,10 @@ PcLms *pc_lms_generate(int32_t lms_param, int32_t lmots_param); /* pc_lms_type, 
 PcLms *pc_lms_from_bytes(const uint8_t *bytes, size_t len);
 pc_status pc_lms_private_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
 pc_status pc_lms_public_to_bytes(const PcLms *k, uint8_t *out, size_t *out_len);
-/* Advances the handle's index; persist via pc_lms_private_to_bytes before use. */
+/* Advances the handle's index; persist via pc_lms_private_to_bytes before use.
+ * The output capacity is checked BEFORE signing: a size query (*out_len == 0)
+ * or too-small buffer returns PC_BUFFER_TOO_SMALL with the required length in
+ * *out_len and does NOT consume a one-time key. */
 pc_status pc_lms_sign(PcLms *k, const uint8_t *msg, size_t msg_len,
                       uint8_t *out, size_t *out_len);
 pc_status pc_lms_verify(const uint8_t *pubkey, size_t pubkey_len,
@@ -543,7 +546,9 @@ PcHss *pc_hss_generate(size_t levels, int32_t lms_param, int32_t lmots_param); /
 PcHss *pc_hss_from_bytes(const uint8_t *bytes, size_t len);
 pc_status pc_hss_private_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
 pc_status pc_hss_public_to_bytes(const PcHss *k, uint8_t *out, size_t *out_len);
-/* Advances the handle's state; persist via pc_hss_private_to_bytes before use. */
+/* Advances the handle's state; persist via pc_hss_private_to_bytes before use.
+ * Capacity is checked BEFORE signing (see pc_lms_sign): a size query never
+ * consumes a one-time key. */
 pc_status pc_hss_sign(PcHss *k, const uint8_t *msg, size_t msg_len,
                       uint8_t *out, size_t *out_len);
 pc_status pc_hss_verify(const uint8_t *pubkey, size_t pubkey_len,
@@ -558,7 +563,9 @@ PcXmss *pc_xmss_generate(uint32_t oid);
 PcXmss *pc_xmss_from_bytes(const uint8_t *bytes, size_t len);
 pc_status pc_xmss_private_to_bytes(const PcXmss *k, uint8_t *out, size_t *out_len);
 pc_status pc_xmss_public_to_bytes(const PcXmss *k, uint8_t *out, size_t *out_len);
-/* Advances the handle's index; persist via pc_xmss_private_to_bytes before use. */
+/* Advances the handle's index; persist via pc_xmss_private_to_bytes before use.
+ * Capacity is checked BEFORE signing (see pc_lms_sign): a size query never
+ * consumes a one-time key. */
 pc_status pc_xmss_sign(PcXmss *k, const uint8_t *msg, size_t msg_len,
                        uint8_t *out, size_t *out_len);
 pc_status pc_xmss_verify(const uint8_t *pubkey, size_t pubkey_len,
@@ -571,7 +578,9 @@ PcXmssMt *pc_xmssmt_generate(uint32_t oid);
 PcXmssMt *pc_xmssmt_from_bytes(const uint8_t *bytes, size_t len);
 pc_status pc_xmssmt_private_to_bytes(const PcXmssMt *k, uint8_t *out, size_t *out_len);
 pc_status pc_xmssmt_public_to_bytes(const PcXmssMt *k, uint8_t *out, size_t *out_len);
-/* Advances the handle's state; persist via pc_xmssmt_private_to_bytes before use. */
+/* Advances the handle's state; persist via pc_xmssmt_private_to_bytes before use.
+ * Capacity is checked BEFORE signing (see pc_lms_sign): a size query never
+ * consumes a one-time key. */
 pc_status pc_xmssmt_sign(PcXmssMt *k, const uint8_t *msg, size_t msg_len,
                          uint8_t *out, size_t *out_len);
 pc_status pc_xmssmt_verify(const uint8_t *pubkey, size_t pubkey_len,
