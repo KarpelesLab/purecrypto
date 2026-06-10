@@ -25,6 +25,11 @@ use alloc::vec::Vec;
 use super::varint;
 use crate::tls::Error;
 
+/// Largest stream count a MAX_STREAMS / STREAMS_BLOCKED frame may carry:
+/// 2^60, since stream IDs are 62-bit varints with 2 type bits (RFC 9000
+/// §19.11, §19.14). Larger values are FRAME_ENCODING_ERROR.
+pub(crate) const MAX_STREAMS_LIMIT: u64 = 1u64 << 60;
+
 /// Direction of a stream-id-bearing frame. RFC 9000 §2.1.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum StreamDir {
@@ -360,6 +365,14 @@ impl<'a> Frame<'a> {
             0x12 | 0x13 => {
                 let (limit, n) = varint::decode(&buf[p..])?;
                 p += n;
+                // RFC 9000 §19.11: a count exceeding 2^60 (the maximum
+                // number of streams of a type, since stream IDs only have
+                // 62 bits minus 2 type bits) "MUST be treated as a
+                // connection error of type FRAME_ENCODING_ERROR". 2^60
+                // itself is the largest legal value.
+                if limit > MAX_STREAMS_LIMIT {
+                    return Err(Error::Decode);
+                }
                 let dir = if t == 0x12 {
                     StreamDir::Bidi
                 } else {
@@ -382,6 +395,11 @@ impl<'a> Frame<'a> {
             0x16 | 0x17 => {
                 let (limit, n) = varint::decode(&buf[p..])?;
                 p += n;
+                // RFC 9000 §19.14: same 2^60 cap as MAX_STREAMS — a
+                // STREAMS_BLOCKED limit beyond it is FRAME_ENCODING_ERROR.
+                if limit > MAX_STREAMS_LIMIT {
+                    return Err(Error::Decode);
+                }
                 let dir = if t == 0x16 {
                     StreamDir::Bidi
                 } else {
@@ -399,7 +417,11 @@ impl<'a> Frame<'a> {
                 }
                 let cid_len = buf[p] as usize;
                 p += 1;
-                if cid_len > 20 {
+                // RFC 9000 §19.15: "values less than 1 and greater than 20
+                // are invalid and MUST be treated as a connection error of
+                // type FRAME_ENCODING_ERROR" — a zero-length CID cannot be
+                // issued via NEW_CONNECTION_ID.
+                if cid_len == 0 || cid_len > 20 {
                     return Err(Error::Decode);
                 }
                 if buf.len() - p < cid_len + 16 {
@@ -1005,6 +1027,54 @@ mod tests {
                 assert_eq!(data, b"x");
             }
             other => panic!("expected CRYPTO, got {other:?}"),
+        }
+    }
+
+    /// RFC 9000 §19.15 — a NEW_CONNECTION_ID frame with a zero-length
+    /// connection ID is a FRAME_ENCODING_ERROR and must be rejected at
+    /// decode (length "less than 1" is invalid).
+    #[test]
+    fn new_connection_id_zero_length_cid_rejected() {
+        // type 0x18, seq = 1, retire_prior_to = 0, cid_len = 0, no cid
+        // bytes, 16-byte reset token.
+        let mut buf = alloc::vec![0x18u8, 0x01, 0x00, 0x00];
+        buf.extend_from_slice(&[0u8; 16]);
+        assert!(matches!(Frame::decode(&buf), Err(Error::Decode)));
+
+        // cid_len = 1 with the same shape still decodes.
+        let mut ok = alloc::vec![0x18u8, 0x01, 0x00, 0x01, 0xAA];
+        ok.extend_from_slice(&[0u8; 16]);
+        let (frame, used) = Frame::decode(&ok).expect("decode 1-byte cid");
+        assert_eq!(used, ok.len());
+        match frame {
+            Frame::NewConnectionId { cid, .. } => assert_eq!(cid, &[0xAA]),
+            other => panic!("expected NEW_CONNECTION_ID, got {other:?}"),
+        }
+    }
+
+    /// RFC 9000 §19.11 / §19.14 — MAX_STREAMS and STREAMS_BLOCKED counts
+    /// above 2^60 are FRAME_ENCODING_ERROR; exactly 2^60 is the largest
+    /// legal value and must still decode.
+    #[test]
+    fn max_streams_and_streams_blocked_over_2_pow_60_rejected() {
+        for t in [0x12u8, 0x13, 0x16, 0x17] {
+            let mut bad = alloc::vec![t];
+            varint::encode(MAX_STREAMS_LIMIT + 1, &mut bad);
+            assert!(
+                matches!(Frame::decode(&bad), Err(Error::Decode)),
+                "type {t:#x} accepted a count > 2^60"
+            );
+
+            let mut ok = alloc::vec![t];
+            varint::encode(MAX_STREAMS_LIMIT, &mut ok);
+            let (frame, used) = Frame::decode(&ok).expect("decode at 2^60");
+            assert_eq!(used, ok.len());
+            match frame {
+                Frame::MaxStreams { limit, .. } | Frame::StreamsBlocked { limit, .. } => {
+                    assert_eq!(limit, MAX_STREAMS_LIMIT, "type {t:#x}");
+                }
+                other => panic!("type {t:#x}: unexpected frame {other:?}"),
+            }
         }
     }
 
