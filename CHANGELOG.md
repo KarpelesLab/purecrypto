@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.10](https://github.com/KarpelesLab/purecrypto/compare/v0.6.9...v0.6.10) - 2026-06-10
+
+### Other
+
+- wipe the minted QUIC retry secret stack copy
+- zeroize TLS 1.3 key-schedule secrets on drop
+- never leak the inner SNI on a non-confirming HelloRetryRequest
+- real cookie max-age when the caller never drives the clock
+- surface authenticated DTLS 1.3 alerts instead of discarding them
+- release handshake flights on peer response so connections outlive GiveUp
+- only acknowledge handshake records, never ACK-of-ACK (RFC 9147 §7)
+- accept PKCS#8 RSA keys in pc_quic_cfg_set_certificate
+- wire real negotiated ALPN and peer certificate through pc_quic
+- restrict application CONNECTION_CLOSE (0x1d) to 0-RTT/1-RTT levels
+- reject zero-length NEW_CONNECTION_ID CIDs and stream counts above 2^60
+- warn when kdf reads a passphrase from an interactive terminal
+- wipe private-key serialization temporaries and retained secrets
+- fsync the parent directory after the stateful-key rename
+- document the no-validation contract of the infallible constructors
+- validate RSASSA-PSS params and stop OID-sharing on PSS-RSAE entries
+- harden DN, time, nameConstraints, and OCSP responder parsing
+- wipe transient secrets in sign, keygen, pk-derivation and seed gen
+- wipe transient secrets in encaps, keygen, noise PRF and seed gen
+- cap from_bytes root recompute to deny untrusted-blob CPU-DoS
+- make GCM nonce cap compile on 16/32-bit targets; CI builds thumbv7em
+
 ## [0.6.9](https://github.com/KarpelesLab/purecrypto/compare/v0.6.8...v0.6.9) - 2026-06-10
 
 ### Other
