@@ -2680,6 +2680,60 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::UnexpectedMessage));
     }
 
+    /// RFC 8446 §4.1.4: a HelloRetryRequest whose `legacy_session_id_echo`
+    /// is not the verbatim echo of the ClientHello's `legacy_session_id`
+    /// (empty for this client) is rejected with `illegal_parameter`, the
+    /// same check the real-ServerHello path performs.
+    #[test]
+    fn rejects_hrr_nonempty_session_id_echo() {
+        use crate::tls::codec::{ExtensionType, ServerHello, put_u16};
+
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-sid-client", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+        let _ch1 = client.write_tls();
+
+        // Same shape as `synthetic_hrr_record`, but with a non-empty
+        // legacy_session_id_echo.
+        let hrr_random: [u8; 32] = [
+            0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65,
+            0xb8, 0x91, 0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2,
+            0xc8, 0xa8, 0x33, 0x9c,
+        ];
+        let mut ks_body = Vec::new();
+        put_u16(&mut ks_body, NamedGroup::SECP256R1.0);
+        let sh = ServerHello {
+            random: hrr_random,
+            session_id: alloc::vec![0xAA; 32],
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType::KEY_SHARE, ks_body),
+            ],
+        };
+        let body = sh.encode();
+        let mut hrr = Vec::new();
+        crate::tls::codec::write_record(
+            &mut hrr,
+            crate::tls::ContentType::Handshake,
+            crate::tls::ProtocolVersion::TLSv1_2,
+            &body,
+        );
+
+        client.read_tls(&hrr);
+        let err = client.process_new_packets().unwrap_err();
+        assert!(matches!(err, crate::tls::Error::IllegalParameter));
+    }
+
     /// A HRR pointing at a group we did NOT offer is rejected with
     /// `illegal_parameter`.
     #[test]

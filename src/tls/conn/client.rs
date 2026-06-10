@@ -1977,6 +1977,16 @@ impl ClientConnection {
             return Err(Error::UnexpectedMessage);
         }
 
+        // RFC 8446 §4.1.4: like the real ServerHello, the HRR MUST echo
+        // `legacy_session_id` from the ClientHello verbatim. This client
+        // always offers an empty `legacy_session_id`, so any non-empty echo
+        // means the server did not faithfully reflect what we offered;
+        // abort with illegal_parameter (mirrors the §4.1.3 check on the
+        // real-ServerHello path).
+        if !hrr.session_id.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
+
         // The HRR's cipher_suite must be one we offered.
         if !self.offered_suites.contains(&hrr.cipher_suite) {
             return Err(Error::IllegalParameter);
