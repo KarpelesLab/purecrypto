@@ -269,7 +269,11 @@ pub unsafe extern "C" fn pc_quic_cfg_set_certificate(
 }
 
 /// Sets the ALPN protocol list. `protocols` is an array of `n`
-/// NUL-terminated C strings, in preference order. `n == 0` disables ALPN.
+/// NUL-terminated C strings, in preference order.
+///
+/// ALPN is mandatory for QUIC (RFC 9001 §8.1): a configuration with no
+/// ALPN protocols is rejected by [`pc_quic_new`]. `n == 0` clears a
+/// previously-set list (which guarantees that rejection).
 ///
 /// # Safety
 /// All pointers valid.

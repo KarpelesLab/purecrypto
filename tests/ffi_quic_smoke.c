@@ -76,20 +76,28 @@ int main(void) {
     return fail("pc_ec_self_signed_pem");
   pc_ec_free(server_key);
 
-  /* 2. Server config: present (cert, key). */
+  /* ALPN is mandatory for QUIC (RFC 9001 §8.1); pc_quic_new rejects a
+   * config without it. */
+  static const char *alpn[] = { "smoke" };
+
+  /* 2. Server config: present (cert, key) + ALPN. */
   PcQuicCfg *scfg = pc_quic_cfg_new(PC_TLS_SERVER);
   if (!scfg) return fail("pc_quic_cfg_new server");
   if (pc_quic_cfg_set_certificate(scfg, cert_pem, cert_pem_len,
                                   ec_key_pem, ec_key_pem_len) != PC_OK)
     return fail("pc_quic_cfg_set_certificate");
+  if (pc_quic_cfg_set_alpn(scfg, alpn, 1) != PC_OK)
+    return fail("pc_quic_cfg_set_alpn server");
 
-  /* 3. Client config: trust the server cert as a root + SNI. */
+  /* 3. Client config: trust the server cert as a root + SNI + ALPN. */
   PcQuicCfg *ccfg = pc_quic_cfg_new(PC_TLS_CLIENT);
   if (!ccfg) return fail("pc_quic_cfg_new client");
   if (pc_quic_cfg_add_root_pem(ccfg, cert_pem, cert_pem_len) != PC_OK)
     return fail("pc_quic_cfg_add_root_pem");
   if (pc_quic_cfg_set_server_name(ccfg, "ffi-quic.test") != PC_OK)
     return fail("pc_quic_cfg_set_server_name");
+  if (pc_quic_cfg_set_alpn(ccfg, alpn, 1) != PC_OK)
+    return fail("pc_quic_cfg_set_alpn client");
 
   /* 4. Materialise both connections. */
   PcQuic *server = pc_quic_new(scfg);

@@ -167,7 +167,13 @@ pub(crate) fn run_client(args: Args) {
     let server_name = args.value("-servername").unwrap_or(host);
     let insecure = args.flag("-insecure") || args.flag("--insecure");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
-    let alpn = args.value("-alpn").map(parse_alpn);
+    // ALPN is mandatory for QUIC (RFC 9001 §8.1) — the engine rejects a
+    // config without it, so demand the flag up front with a clear error.
+    let alpn = args
+        .value("-alpn")
+        .map(parse_alpn)
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| die("QUIC requires ALPN (RFC 9001 §8.1): pass -alpn (e.g. -alpn h3)"));
     let keylog = args.value("-keylogfile").map(open_keylog);
 
     // Roots — QUIC v1 is TLS 1.3 only. `-insecure` skips verification;
@@ -185,10 +191,8 @@ pub(crate) fn run_client(args: Args) {
         .versions(PcVersion::TLSv1_3, PcVersion::TLSv1_3)
         .roots(roots)
         .server_name(server_name)
-        .verify_certificates(!insecure);
-    if let Some(a) = alpn {
-        builder = builder.alpn(a);
-    }
+        .verify_certificates(!insecure)
+        .alpn(alpn);
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
     }
@@ -237,7 +241,12 @@ pub(crate) fn run_server(args: Args) {
     let key_path = args
         .value("-key")
         .unwrap_or_else(|| die("-key is required"));
-    let alpn = args.value("-alpn").map(parse_alpn);
+    // ALPN is mandatory for QUIC (RFC 9001 §8.1) — see run_client.
+    let alpn = args
+        .value("-alpn")
+        .map(parse_alpn)
+        .filter(|a| !a.is_empty())
+        .unwrap_or_else(|| die("QUIC requires ALPN (RFC 9001 §8.1): pass -alpn (e.g. -alpn h3)"));
     let www = args.flag("-www") || args.flag("--www");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
     let retry = args.flag("-retry") || args.flag("--retry");
@@ -248,10 +257,8 @@ pub(crate) fn run_server(args: Args) {
 
     let mut builder = TlsConfig::builder()
         .versions(PcVersion::TLSv1_3, PcVersion::TLSv1_3)
-        .identity(chain, key);
-    if let Some(a) = alpn {
-        builder = builder.alpn(a);
-    }
+        .identity(chain, key)
+        .alpn(alpn);
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);
     }

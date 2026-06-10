@@ -7,6 +7,16 @@ use super::common::PcStatus;
 use super::{ec, hash, lms, mldsa, mlkem, quic, rsa, tls, x509, xmss};
 use crate::der::pem_decode;
 
+/// Sets a single ALPN protocol ("test") on a QUIC config. ALPN is
+/// mandatory for QUIC (RFC 9001 §8.1) — `pc_quic_new` rejects a config
+/// without it.
+fn set_test_alpn(cfg: *mut quic::PcQuicCfg) {
+    let alpn = b"test\0";
+    let arr = [alpn.as_ptr() as *const core::ffi::c_char];
+    let st = unsafe { quic::pc_quic_cfg_set_alpn(cfg, arr.as_ptr(), 1) };
+    assert_eq!(st, PcStatus::Ok);
+}
+
 /// Calls an FFI writer twice (query length, then fill) and returns the bytes.
 fn read_out(mut call: impl FnMut(*mut u8, *mut usize) -> PcStatus) -> Vec<u8> {
     let mut len = 0usize;
@@ -241,6 +251,7 @@ fn quic_stream_read_rejects_oversized_out_len() {
     // trust store (we never actually run the handshake — we just need
     // a valid PcQuic to call stream_read on).
     let _ = unsafe { quic::pc_quic_cfg_set_verify_certificates(cfg, 0) };
+    set_test_alpn(cfg);
     let q = unsafe { quic::pc_quic_new(cfg) };
     assert!(!q.is_null(), "expected a constructible client");
 
@@ -300,6 +311,7 @@ fn quic_set_peer_addr_rejects_wrong_length() {
     let st = unsafe { quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const c_char) };
     assert_eq!(st, PcStatus::Ok);
     let _ = unsafe { quic::pc_quic_cfg_set_verify_certificates(cfg, 0) };
+    set_test_alpn(cfg);
     let q = unsafe { quic::pc_quic_new(cfg) };
     assert!(!q.is_null());
 
@@ -774,6 +786,7 @@ fn quic_pop_datagram_too_small_is_non_destructive() {
             PcStatus::Ok
         );
     }
+    set_test_alpn(cfg);
     let q = unsafe { quic::pc_quic_new(cfg) };
     unsafe { quic::pc_quic_cfg_free(cfg) };
     assert!(!q.is_null());

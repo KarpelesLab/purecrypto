@@ -125,6 +125,13 @@ pub struct QuicConfig {
     /// The TLS 1.3 client / server config to drive. The QUIC layer adds
     /// QUIC-mode wrapping on top — `tls.max_version` is ignored (QUIC v1
     /// is hard-coded to TLS 1.3).
+    ///
+    /// `tls.alpn_protocols` MUST be non-empty: RFC 9001 §8.1 makes ALPN
+    /// mandatory for QUIC ("endpoints MUST immediately close a
+    /// connection [...] if an application protocol is not negotiated").
+    /// [`QuicConnection::client`] / [`QuicConnection::server`] return
+    /// [`Error::NoApplicationProtocol`](crate::tls::Error::NoApplicationProtocol)
+    /// when no ALPN protocol is configured.
     pub tls: crate::tls::Config,
     /// The peer-visible QUIC transport parameters this side advertises.
     pub transport_params: TransportParameters,
@@ -3762,11 +3769,17 @@ impl QuicConnection {
 // ---------------------------------------------------------------------
 
 fn build_client_tls_config(cfg: &QuicConfig) -> Result<ClientConfig, Error> {
+    // RFC 9001 §8.1 — "When using ALPN, endpoints MUST immediately close
+    // a connection [...] if an application protocol is not negotiated"
+    // and QUIC requires the use of ALPN. Fail closed at construction: a
+    // config with no ALPN protocols can never complete a compliant
+    // handshake.
+    if cfg.tls.alpn_protocols.is_empty() {
+        return Err(Error::NoApplicationProtocol);
+    }
     let mut cc = ClientConfig::new(cfg.tls.roots.clone_store());
     cc.verify_certificates = cfg.tls.verify_certificates;
-    if !cfg.tls.alpn_protocols.is_empty() {
-        cc = cc.with_alpn(cfg.tls.alpn_protocols.clone());
-    }
+    cc = cc.with_alpn(cfg.tls.alpn_protocols.clone());
     if !cfg.tls.crls.is_empty() {
         cc = cc.with_crls(cfg.tls.crls.clone_store());
     }
@@ -3785,6 +3798,11 @@ fn build_client_tls_config(cfg: &QuicConfig) -> Result<ClientConfig, Error> {
 }
 
 fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
+    // RFC 9001 §8.1 — ALPN is mandatory for QUIC; see
+    // [`build_client_tls_config`]. Fail closed at construction.
+    if cfg.tls.alpn_protocols.is_empty() {
+        return Err(Error::NoApplicationProtocol);
+    }
     let id = cfg.tls.identity.as_ref().ok_or(Error::InappropriateState)?;
     let chain = id.cert_chain.clone();
     let mut sc = match &id.key {
@@ -3884,6 +3902,9 @@ mod tests {
                 cert_chain: alloc::vec![der.clone()],
                 key: SigningKey::Ed25519(key),
             }),
+            // RFC 9001 §8.1 — ALPN is mandatory for QUIC; constructors
+            // reject configs without it.
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -3917,6 +3938,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -4067,6 +4089,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -4412,6 +4435,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = crate::tls::Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..crate::tls::Config::default()
@@ -4798,6 +4822,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -5085,6 +5110,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_tls = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -5158,6 +5184,47 @@ mod tests {
         // Neither side should be in a closed/error state.
         assert!(!c.is_closed());
         assert!(!s.is_closed());
+    }
+
+    /// A3 — RFC 9001 §8.1: ALPN is mandatory for QUIC. Constructing a
+    /// client or server whose TLS config carries no ALPN protocols must
+    /// fail closed with `NoApplicationProtocol`.
+    #[test]
+    fn quic_config_without_alpn_rejected_at_construction() {
+        // Server side: a valid identity but no ALPN.
+        let (mut server_tls, cert_der) = ed25519_server();
+        server_tls.alpn_protocols.clear();
+        let r = QuicConnection::server(QuicConfig {
+            tls: server_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        });
+        assert!(
+            matches!(r, Err(Error::NoApplicationProtocol)),
+            "server without ALPN must be rejected"
+        );
+
+        // Client side.
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_tls = Config {
+            roots,
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let r = QuicConnection::client(
+            QuicConfig {
+                tls: client_tls,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        );
+        assert!(
+            matches!(r, Err(Error::NoApplicationProtocol)),
+            "client without ALPN must be rejected"
+        );
     }
 
     /// RFC 9000 §18.2 — locally-advertising
@@ -5371,6 +5438,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -5541,6 +5609,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -5958,6 +6027,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -6679,6 +6749,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
@@ -7022,6 +7093,7 @@ mod tests {
         roots.add_der(cert_der).unwrap();
         let client_cfg = Config {
             roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
             max_version: crate::tls::ProtocolVersion::TLSv1_3,
             min_version: crate::tls::ProtocolVersion::TLSv1_3,
             ..Config::default()
