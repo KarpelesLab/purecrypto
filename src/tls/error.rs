@@ -172,10 +172,17 @@ pub enum Error {
     /// trusted, so the chain cannot be admitted under stapling.
     OcspResponseInvalid,
     /// The server rejected Encrypted Client Hello: the inner CH was not
-    /// accepted, the outer-CH handshake completed with the public-name
-    /// certificate, and `EncryptedExtensions` carries an
-    /// `ECHConfigList` whose contents are returned here for the
-    /// caller to retry with. Maps to `ech_required` (draft §11.2).
+    /// accepted and the outer-CH handshake completed with the
+    /// public-name certificate. Any `retry_configs` `ECHConfigList` the
+    /// server shipped in `EncryptedExtensions` is returned here for the
+    /// caller to retry with — but only after the server's
+    /// CertificateVerify and Finished authenticated it against
+    /// `ECHConfig.public_name` (draft-ietf-tls-esni-22 §6.1.6); EE alone
+    /// is not certificate-bound, so configs from an unauthenticated
+    /// server are never surfaced. An empty payload means the server
+    /// rejected ECH without publishing retry configs. The connection is
+    /// torn down either way and never becomes usable for application
+    /// data. Maps to `ech_required` (draft §11.2).
     #[cfg(feature = "ech")]
     EchRejected(alloc::vec::Vec<u8>),
     /// An ECH wire structure (extension body, ECHConfig list, retry

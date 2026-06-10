@@ -615,6 +615,19 @@ pub(crate) struct ClientEchState {
     /// from `inner_ch_bytes` (which alone wouldn't include the HRR or
     /// CH2-inner messages the SH binds to).
     pub(crate) inner_transcript_swapped: bool,
+    /// The `ECHConfig.public_name` the outer CH used as its SNI. On ECH
+    /// rejection the handshake continues under the *outer* identity, so
+    /// the server certificate is verified against this name — not the
+    /// inner (real) `server_name` — per draft-ietf-tls-esni-22 §6.1.6.
+    pub(crate) outer_public_name: String,
+    /// `retry_configs` bytes lifted from the server's
+    /// `EncryptedExtensions` on rejection (draft §6.1.6 / §7.1). They are
+    /// NOT surfaced to the caller at EE time: EncryptedExtensions is only
+    /// handshake-traffic protected, so an active attacker could plant
+    /// configs of its own. The bytes are held here until the server's
+    /// CertificateVerify + Finished authenticate the `public_name`
+    /// identity, and only then surfaced via [`Error::EchRejected`].
+    pub(crate) retry_configs: Option<Vec<u8>>,
 }
 
 /// What the client learnt about ECH from the server's ServerHello.
@@ -1131,6 +1144,7 @@ impl ClientConnection {
                 config_id,
                 inner_ch1_random,
                 maximum_name_length,
+                public_name,
             }) => {
                 conn.ech_state = Some(ClientEchState {
                     inner_ch_bytes,
@@ -1141,6 +1155,8 @@ impl ClientConnection {
                     inner_ch1_random: Some(inner_ch1_random),
                     maximum_name_length: Some(maximum_name_length),
                     inner_transcript_swapped: false,
+                    outer_public_name: public_name,
+                    retry_configs: None,
                 });
                 outer_ch
             }
@@ -2386,21 +2402,24 @@ impl ClientConnection {
             }
         }
 
-        // ECH rejection (draft §7.1): the client attempted real ECH
-        // (we have `ech_state`), the SH did not signal accept
-        // (`outcome == Some(Rejected)`), and the EE carried an
+        // ECH rejection (draft §7.1 / §6.1.6): the client attempted real
+        // ECH (we have `ech_state`), the SH did not signal accept
+        // (`outcome == Some(Rejected)`), and the EE may carry an
         // `encrypted_client_hello` extension whose body is a usable
-        // `ECHConfigList` of retry_configs. Surface the bytes through
-        // `Error::EchRejected` so the caller can retry against the
-        // refreshed configuration. We do this *before* the transcript
-        // update so the failed handshake doesn't leave the engine in
-        // a state expecting subsequent records — the outer alert path
-        // (driven by `process_new_packets`) handles teardown.
+        // `ECHConfigList` of retry_configs. Do NOT surface anything yet:
+        // EncryptedExtensions is only handshake-traffic protected — it is
+        // not bound to any server certificate — so trusting these bytes
+        // now would let an active MITM (with no certificate at all) hand
+        // us attacker-controlled retry configs and capture the real SNI
+        // on the retry. Stash them and continue the handshake under the
+        // outer/`public_name` identity; `Error::EchRejected` is surfaced
+        // by `on_finished` only after CertificateVerify + Finished have
+        // authenticated the server against `public_name`.
         #[cfg(feature = "ech")]
-        if let Some(retry_bytes) = ech_retry_configs
-            && matches!(self.ech_outcome(), Some(EchOutcome::Rejected))
+        if let Some(state) = self.ech_state.as_mut()
+            && matches!(state.outcome, Some(EchOutcome::Rejected))
         {
-            return Err(Error::EchRejected(retry_bytes));
+            state.retry_configs = ech_retry_configs.take();
         }
 
         self.core.transcript.update(raw);
@@ -2622,7 +2641,22 @@ impl ClientConnection {
                 now.as_ref(),
                 &self.config.signature_policy,
             )?;
-            verify_hostname(&leaf, &self.server_name)?;
+            // draft-ietf-tls-esni-22 §6.1.6: when the server rejected ECH
+            // the handshake continues under the *outer* identity — the
+            // outer CH carried `ECHConfig.public_name` as its SNI — so the
+            // certificate is checked against the public_name. Any other
+            // path (no ECH, GREASE, or ECH accepted) verifies against the
+            // real `server_name`.
+            #[cfg(feature = "ech")]
+            let reference_name: &str = match self.ech_state.as_ref() {
+                Some(state) if matches!(state.outcome, Some(EchOutcome::Rejected)) => {
+                    &state.outer_public_name
+                }
+                _ => &self.server_name,
+            };
+            #[cfg(not(feature = "ech"))]
+            let reference_name: &str = &self.server_name;
+            verify_hostname(&leaf, reference_name)?;
             // RFC 6066 §8 / RFC 6960: a stapled OCSP response is only
             // meaningful once the chain is trusted. Validate now against the
             // issuer; reject `revoked` or `unknown` outright.
@@ -2688,6 +2722,27 @@ impl ClientConnection {
             return Err(Error::HandshakeFailure);
         }
         self.core.transcript.update(raw);
+
+        // draft-ietf-tls-esni-22 §6.1.6: the server rejected our real-ECH
+        // offer. The handshake authenticated the server against the outer
+        // `public_name` identity (chain + hostname in CertificateVerify,
+        // MAC binding just above) — and ONLY now do we hand any
+        // `retry_configs` lifted from EncryptedExtensions to the caller.
+        // The connection itself must not become usable for application
+        // data: we abort here (before deriving application traffic keys
+        // or emitting our own Finished) and `process_new_packets` tears
+        // the engine down with an `ech_required` alert. If server
+        // authentication had failed, the error above surfaced WITHOUT the
+        // configs. An empty Vec means the server published no
+        // retry_configs (rejection without a refresh offer).
+        #[cfg(feature = "ech")]
+        if let Some(state) = self.ech_state.as_mut()
+            && matches!(state.outcome, Some(EchOutcome::Rejected))
+        {
+            return Err(Error::EchRejected(
+                state.retry_configs.take().unwrap_or_default(),
+            ));
+        }
 
         // Derive the application traffic secrets over Hash(CH..server
         // Finished). This must happen BEFORE we emit EOED (which would
@@ -2902,6 +2957,9 @@ pub(crate) struct EchSealOutput {
     pub config_id: u8,
     pub inner_ch1_random: [u8; 32],
     pub maximum_name_length: u8,
+    /// `ECHConfig.public_name` used as the outer CH's SNI; on rejection
+    /// the server certificate is verified against this name.
+    pub public_name: String,
 }
 
 /// draft-ietf-tls-esni-22 §6. Returns `Some(EchSealOutput)` if a
@@ -3011,6 +3069,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         config_id,
         inner_ch1_random,
         maximum_name_length,
+        public_name: public_name_str,
     })
 }
 
@@ -3035,6 +3094,11 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
         Error::EchDecodeError => AlertDescription::IllegalParameter,
+        // draft-ietf-tls-esni-22 §11.2: `ech_required` (121). The named
+        // variant is deliberately not added to the (exhaustive, public)
+        // `AlertDescription` enum; the raw code is wire-identical.
+        #[cfg(feature = "ech")]
+        Error::EchRejected(_) => AlertDescription::Unknown(121),
         #[cfg(feature = "cert-compression")]
         Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,

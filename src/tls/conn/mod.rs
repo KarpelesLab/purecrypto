@@ -3316,14 +3316,18 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong ech");
     }
 
-    /// Wave 3b.4: when the server cannot decap the inner CH (here:
-    /// the client sealed against `config_id = 0x33` but the server's
-    /// keyring only holds `config_id = 0x44`), the server completes
-    /// the outer handshake under the `public_name` certificate and
-    /// EE carries `encrypted_client_hello` with the server's fresh
-    /// `retry_configs`. The client surfaces `Error::EchRejected`
-    /// with the wire-form `ECHConfigList` bytes so the application
-    /// can retry against the published configuration.
+    /// Wave 3b.4 + draft §6.1.6: when the server cannot decap the inner
+    /// CH (here: the client sealed against `config_id = 0x33` but the
+    /// server's keyring only holds `config_id = 0x44`), the server
+    /// completes the outer handshake under the `public_name` certificate
+    /// and EE carries `encrypted_client_hello` with the server's fresh
+    /// `retry_configs`. The client must NOT surface those bytes at EE
+    /// time (EE is not certificate-bound): it continues the handshake,
+    /// authenticates the certificate against `ECHConfig.public_name`
+    /// (the cert below covers ONLY `public.example` — not the inner SNI
+    /// `secret.example` — proving the public-name verification path is
+    /// used), and surfaces `Error::EchRejected` with the wire-form
+    /// `ECHConfigList` only after the server's Finished verifies.
     #[cfg(feature = "ech")]
     #[test]
     fn ech_real_loopback_rejects_with_retry_configs() {
@@ -3332,10 +3336,9 @@ mod loopback_tests {
         use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
         use crate::tls::ech::{EchClient, EchConfigList, EchServer};
 
-        // Self-signed Ed25519 server cert covering BOTH the public_name
-        // (so the outer handshake on rejection authenticates the
-        // server-presented cert) AND the inner SNI (not strictly
-        // needed in the rejection flow, but harmless).
+        // Self-signed Ed25519 server cert covering ONLY the public_name:
+        // on rejection the outer handshake authenticates against
+        // `public.example`, never against the inner SNI.
         let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-3b4-srvkey", b"nonce", &[]);
         let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
         let name = DistinguishedName::common_name("public.example");
@@ -3349,7 +3352,7 @@ mod loopback_tests {
             &validity,
             1,
             false,
-            &["public.example", "secret.example"],
+            &["public.example"],
         )
         .unwrap();
         let cert_der = cert.to_der().to_vec();
@@ -3402,16 +3405,16 @@ mod loopback_tests {
         let mut crng = HmacDrbg::<Sha256>::new(b"ech-3b4-client", b"nonce", &[]);
         let srng = HmacDrbg::<Sha256>::new(b"ech-3b4-server", b"nonce", &[]);
 
-        // Inner SNI ("secret.example") is also covered by the cert so
-        // the outer-CH `public.example` handshake completes without
-        // hostname-verification noise.
-        let mut client = ClientConnection::new(client_cfg, "public.example", &mut crng);
+        // The client targets the REAL (inner) name; the cert does not
+        // cover it. On rejection the outer handshake authenticates
+        // against the ECHConfig's `public.example` instead.
+        let mut client = ClientConnection::new(client_cfg, "secret.example", &mut crng);
         let mut server = ServerConnection::new(server_config, srng);
 
-        // Drive: expect the client to surface `EchRejected` once EE
-        // arrives. (The server completes the outer handshake under
-        // the `public_name` cert; the EE walk catches the rejection
-        // before the client validates the rest of the flight.)
+        // Drive: the client must process the server's FULL flight
+        // (EE..Finished) and only then surface `EchRejected` — the
+        // retry_configs are not trusted before CertificateVerify +
+        // Finished authenticate the public_name identity.
         let mut surfaced: Option<crate::tls::Error> = None;
         for _ in 0..16 {
             let c = client.write_tls();
@@ -3436,6 +3439,17 @@ mod loopback_tests {
             crate::tls::Error::EchRejected(b) => b,
             other => panic!("unexpected error: {other:?}"),
         };
+        // The rejected connection must never become usable for app data.
+        assert!(client.is_handshaking() || client.send_application_data(b"x").is_err());
+        // The teardown alert on the wire is `ech_required` (121,
+        // draft §11.2) — observe it from the server's side.
+        let alert = client.write_tls();
+        assert!(!alert.is_empty(), "client must emit a fatal alert");
+        server.read_tls(&alert);
+        match server.process_new_packets() {
+            Err(crate::tls::Error::AlertReceived(d)) => assert_eq!(d.as_u8(), 121),
+            other => panic!("server should see the ech_required alert, got {other:?}"),
+        }
 
         // The surfaced bytes must round-trip back through
         // `EchConfigList::decode` and yield the SAME list the server
@@ -3450,6 +3464,117 @@ mod loopback_tests {
             .expect("retry_configs entry has contents");
         assert_eq!(contents.key_config.config_id, 0x44);
         assert_eq!(contents.public_name, b"public.example");
+    }
+
+    /// draft-ietf-tls-esni-22 §6.1.6 negative control: on ECH rejection
+    /// the `retry_configs` are only trustworthy once the server has
+    /// authenticated as the `public_name`. Here the server triggers a
+    /// rejection (keyring `config_id` mismatch) and ships retry_configs
+    /// in EE, but its certificate does NOT cover `public.example` — an
+    /// unauthenticated (MITM-shaped) server. The client must fail
+    /// certificate verification and surface that failure WITHOUT the
+    /// attacker-observable `EchRejected(retry_configs)` carrier.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_rejection_retry_configs_suppressed_when_server_auth_fails() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::{EchKeyPair, EchKeyRing};
+        use crate::tls::ech::{EchClient, EchConfigList, EchServer};
+
+        // Server cert for an unrelated name: chain-trusts fine (the
+        // client is given it as a root) but hostname verification
+        // against the ECHConfig's `public.example` must fail.
+        let mut srvkey_rng = HmacDrbg::<Sha256>::new(b"ech-noauth-srvkey", b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut srvkey_rng);
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &DistinguishedName::common_name("mitm.example"),
+            &validity,
+            1,
+            false,
+            &["mitm.example"],
+        )
+        .unwrap();
+        let cert_der = cert.to_der().to_vec();
+
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+
+        // Client seals against config_id 0x33; the server only holds
+        // 0x44, so ECH is rejected and retry_configs ride in EE.
+        let mut client_keygen_rng = HmacDrbg::<Sha256>::new(b"ech-noauth-ckey", b"nonce", &[]);
+        let client_side_pair = EchKeyPair::generate(
+            &mut client_keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x33,
+            b"public.example",
+            64,
+            suites.clone(),
+        )
+        .expect("client-side ech keygen");
+        let client_list = EchConfigList::new(alloc::vec![client_side_pair.config().clone()]);
+
+        let mut server_keygen_rng = HmacDrbg::<Sha256>::new(b"ech-noauth-skey", b"nonce", &[]);
+        let server_side_pair = EchKeyPair::generate(
+            &mut server_keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x44,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("server-side ech keygen");
+        let server_list = EchConfigList::new(alloc::vec![server_side_pair.config().clone()]);
+        let server_ring = EchKeyRing::from_pairs(alloc::vec![server_side_pair]);
+
+        let server_config = ServerConfig::with_ed25519(alloc::vec![cert_der.clone()], key)
+            .with_ech_server(EchServer::new(server_ring, server_list));
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut client_cfg = ClientConfig::new(roots);
+        client_cfg.ech = Some(EchClient::from_config_list(client_list));
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ech-noauth-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ech-noauth-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(client_cfg, "secret.example", &mut crng);
+        let mut server = ServerConnection::new(server_config, srng);
+
+        let mut surfaced: Option<crate::tls::Error> = None;
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                let _ = server.process_new_packets();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                if let Err(e) = client.process_new_packets() {
+                    surfaced = Some(e);
+                    break;
+                }
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let err = surfaced.expect("client must abort on failed server auth");
+        assert!(
+            !matches!(err, crate::tls::Error::EchRejected(_)),
+            "retry_configs must NOT be surfaced when server auth fails, got {err:?}"
+        );
+        assert!(
+            matches!(err, crate::tls::Error::BadCertificate),
+            "expected BadCertificate from public_name hostname mismatch, got {err:?}"
+        );
     }
 
     /// End-to-end HelloRetryRequest combined with real ECH
