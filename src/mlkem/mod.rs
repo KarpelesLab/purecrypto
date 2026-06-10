@@ -119,7 +119,14 @@ macro_rules! ml_kem_set {
                 let mut z = [0u8; 32];
                 rng.fill_bytes(&mut d);
                 rng.fill_bytes(&mut z);
-                Self::from_seeds(&d, &z)
+                let pair = Self::from_seeds(&d, &z);
+                // Wipe the seeds before they drop — `d` alone reconstructs
+                // the whole key (`z` is the implicit-rejection secret).
+                for b in d.iter_mut().chain(z.iter_mut()) {
+                    *b = 0;
+                }
+                let _ = core::hint::black_box((&d, &z));
+                pair
             }
 
             /// Deterministically derives a key pair from `(d, z)`

@@ -65,7 +65,14 @@ fn getnoise<const ETA: usize>(seed: &[u8; 32], nonce: u8) -> Poly {
     let mut buf = [0u8; 192];
     let need = 64 * ETA;
     shake256(&input, &mut buf[..need]);
-    poly::cbd::<ETA>(&buf[..need])
+    let out = poly::cbd::<ETA>(&buf[..need]);
+    // Wipe the PRF input (a copy of the secret noise seed) and output (the
+    // raw bits the secret noise polynomial is read from) before they drop.
+    for b in input.iter_mut().chain(buf.iter_mut()) {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&input, &buf));
+    out
 }
 
 /// Forward NTT on every component of a module vector.
@@ -107,7 +114,7 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
     let mut g_in = [0u8; 33];
     g_in[..32].copy_from_slice(d);
     g_in[32] = K as u8;
-    let g = crate::hash::sha3_512(&g_in);
+    let mut g = crate::hash::sha3_512(&g_in);
     let mut rho = [0u8; 32];
     rho.copy_from_slice(&g[..32]);
     let mut sigma32 = [0u8; 32];
@@ -146,6 +153,18 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
     for i in 0..K {
         dk[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&poly::to_bytes(&s[i]));
     }
+
+    // Wipe the transient secrets: the G input (a copy of the seed `d`, which
+    // alone reconstructs the whole key), the G output, and the noise seed σ.
+    // ρ is public (it is serialized into `ek`).
+    for b in g_in
+        .iter_mut()
+        .chain(g.iter_mut())
+        .chain(sigma32.iter_mut())
+    {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&g_in, &g, &sigma32));
 }
 
 /// K-PKE.Encrypt (FIPS 203 Algorithm 14). Writes the ciphertext into `ct`.

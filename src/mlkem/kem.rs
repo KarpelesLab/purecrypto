@@ -68,13 +68,23 @@ pub(crate) fn encaps<
     let mut g_in = [0u8; 64];
     g_in[..32].copy_from_slice(m);
     g_in[32..].copy_from_slice(&sha3_256(ek));
-    let g = sha3_512(&g_in);
+    let mut g = sha3_512(&g_in);
     let mut shared = [0u8; 32];
     shared.copy_from_slice(&g[..32]);
     let mut r = [0u8; 32];
     r.copy_from_slice(&g[32..]);
 
     indcpa::encrypt::<K, ETA1, ETA2, DU, DV>(ek, m, &r, ct);
+
+    // Wipe the transient secrets (the G input containing `m`, the G output
+    // containing both the shared secret and the coins, and the coins copy)
+    // before they drop — same hygiene as `decaps`. `shared` is the caller's
+    // return value; `black_box` keeps the writes from being eliminated as
+    // dead stores.
+    for b in g_in.iter_mut().chain(g.iter_mut()).chain(r.iter_mut()) {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&g_in, &g, &r));
     shared
 }
 
@@ -132,9 +142,10 @@ pub(crate) fn decaps<
     out.conditional_assign(&k_prime, matches);
 
     // Wipe the transient secrets (the decrypted message, the G output, the
-    // key/coins derived from it, and the implicit-rejection secret K̄ — `out`
-    // already holds its own copy) before they drop; `black_box` keeps the
-    // writes from being eliminated as dead stores.
+    // key/coins derived from it, the implicit-rejection secret K̄ — `out`
+    // already holds its own copy — and the re-encryption buffer, which on the
+    // reject path is a deterministic function of the secret m') before they
+    // drop; `black_box` keeps the writes from being eliminated as dead stores.
     for b in m_prime
         .iter_mut()
         .chain(g_in.iter_mut())
@@ -142,9 +153,10 @@ pub(crate) fn decaps<
         .chain(k_prime.iter_mut())
         .chain(r_prime.iter_mut())
         .chain(k_bar.iter_mut())
+        .chain(ct_cmp.iter_mut())
     {
         *b = 0;
     }
-    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime, &k_bar));
+    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime, &k_bar, &ct_cmp));
     out
 }
