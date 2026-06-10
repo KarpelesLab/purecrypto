@@ -1756,6 +1756,21 @@ impl<R: RngCore> ServerConnection<R> {
             }
         }
 
+        // RFC 8446 §4.2.10: early data may only be accepted when the
+        // selected ALPN protocol is identical to the one in use on the
+        // connection that issued the ticket. The ticket stores that
+        // protocol (empty when none was negotiated); the ALPN selection
+        // above runs after the provisional 0-RTT decision, so re-check
+        // here. A mismatch refuses 0-RTT only — the 1-RTT resumption
+        // handshake continues normally (§4.2.10 prescribes rejection,
+        // not an abort).
+        if accept_early {
+            let ticket_alpn = psk_state.as_ref().expect("psk_state set").alpn.as_slice();
+            if ticket_alpn != self.alpn_negotiated.as_deref().unwrap_or(&[]) {
+                accept_early = false;
+            }
+        }
+
         // record_size_limit: parse the peer's advertisement.
         if let Some(rsl_body) = ext::find(&ch.extensions, ExtensionType::RECORD_SIZE_LIMIT) {
             let limit = ext::parse_record_size_limit(rsl_body)?;
@@ -2764,6 +2779,10 @@ fn system_now() -> Option<crate::x509::Time> {
 struct AcceptedPsk {
     psk: Vec<u8>,
     hash: HashAlg,
+    /// ALPN protocol negotiated on the connection that issued the ticket
+    /// (empty when none was). RFC 8446 §4.2.10: 0-RTT may only be accepted
+    /// when the new connection selects the identical protocol.
+    alpn: Vec<u8>,
 }
 
 impl<R: RngCore> ServerConnection<R> {
@@ -2806,7 +2825,7 @@ impl<R: RngCore> ServerConnection<R> {
             let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
-            let TicketPlaintext { psk } = decrypted;
+            let TicketPlaintext { psk, alpn } = decrypted;
             let hash = match psk.len() {
                 32 => HashAlg::Sha256,
                 48 => HashAlg::Sha384,
@@ -2839,16 +2858,17 @@ impl<R: RngCore> ServerConnection<R> {
             {
                 return Err(Error::DecryptError);
             }
-            return Ok(Some(AcceptedPsk { psk, hash }));
+            return Ok(Some(AcceptedPsk { psk, hash, alpn }));
         }
         Ok(None)
     }
 }
 
-/// Decoded ticket payload: the original PSK and (unused for now) creation
-/// timestamp + ALPN that was negotiated when the ticket was issued.
+/// Decoded ticket payload: the original PSK plus the ALPN protocol that was
+/// negotiated on the connection that issued the ticket (empty when none was).
 struct TicketPlaintext {
     psk: Vec<u8>,
+    alpn: Vec<u8>,
 }
 
 /// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
@@ -2917,7 +2937,8 @@ fn decrypt_ticket(
         let alpn_len = rest[psk_len] as usize;
         if rest.len() == psk_len + 1 + alpn_len {
             let psk = rest[..psk_len].to_vec();
-            return Some(TicketPlaintext { psk });
+            let alpn = rest[psk_len + 1..].to_vec();
+            return Some(TicketPlaintext { psk, alpn });
         }
     }
     None

@@ -1983,6 +1983,111 @@ mod loopback_tests {
         assert_eq!(server2.take_received_plaintext(), b"after-eoed");
     }
 
+    /// RFC 8446 §4.2.10: the server MUST refuse 0-RTT when the ALPN
+    /// protocol selected on the new connection differs from the one in
+    /// use on the connection that issued the ticket. The refusal is NOT
+    /// an abort — the 1-RTT resumption handshake completes normally.
+    #[test]
+    fn zero_rtt_rejected_on_alpn_mismatch() {
+        // Phase 1: establish a ticket on a connection that negotiated "h2".
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x44u8; 32])
+            .with_max_early_data(16384)
+            .with_alpn(alloc::vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"alpn0rtt-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"alpn0rtt-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_alpn(alloc::vec![b"h2".to_vec()]),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let session = client.take_session().expect("ticket");
+        assert_eq!(session.negotiated_alpn.as_deref(), Some(b"h2".as_slice()));
+        assert_eq!(session.max_early_data_size, Some(16384));
+
+        // Phase 2: resume offering ONLY "http/1.1". The session still
+        // advertises 0-RTT capability, so the ClientHello carries the
+        // early_data extension; the server must select "http/1.1", spot
+        // the mismatch against the ticket's "h2", and refuse 0-RTT while
+        // letting the PSK handshake complete.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0x44u8; 32])
+            .with_max_early_data(16384)
+            .with_alpn(alloc::vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"alpn0rtt-client-2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"alpn0rtt-server-2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2)
+                .with_alpn(alloc::vec![b"http/1.1".to_vec()])
+                .with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client2.is_handshaking() && !server2.is_handshaking(),
+            "ALPN mismatch must refuse 0-RTT, not abort the handshake"
+        );
+        assert!(
+            !server2.early_data_accepted(),
+            "server must refuse 0-RTT when ALPN differs from the ticket's"
+        );
+        assert!(!client2.early_data_accepted());
+        assert_eq!(server2.alpn_protocol(), Some(b"http/1.1".as_slice()));
+
+        // 1-RTT application data still flows.
+        client2.send_application_data(b"post-reject").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"post-reject");
+    }
+
     /// 0-RTT replay detection: when a ReplayWindow is shared across two
     /// servers, a second connection presenting the same binder is refused
     /// 0-RTT (the handshake still completes via the regular PSK path, so
