@@ -131,18 +131,20 @@ pub(crate) fn decaps<
     let mut out = k_bar;
     out.conditional_assign(&k_prime, matches);
 
-    // Wipe the transient secrets (the decrypted message, the G output and
-    // the key/coins derived from it) before they drop; `black_box` keeps
-    // the writes from being eliminated as dead stores.
+    // Wipe the transient secrets (the decrypted message, the G output, the
+    // key/coins derived from it, and the implicit-rejection secret K̄ — `out`
+    // already holds its own copy) before they drop; `black_box` keeps the
+    // writes from being eliminated as dead stores.
     for b in m_prime
         .iter_mut()
         .chain(g_in.iter_mut())
         .chain(g.iter_mut())
         .chain(k_prime.iter_mut())
         .chain(r_prime.iter_mut())
+        .chain(k_bar.iter_mut())
     {
         *b = 0;
     }
-    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime));
+    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime, &k_bar));
     out
 }
