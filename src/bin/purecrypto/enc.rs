@@ -6,7 +6,8 @@
 //! but emit a warning to stderr, since they leak to `/proc/<pid>/cmdline`.
 
 use crate::util::{
-    Args, die, parse_hex_flag, read_input, read_secret_file, write_output, zero_buf,
+    Args, die, parse_hex_flag, read_input, read_secret_file, write_output, write_output_with_mode,
+    zero_buf,
 };
 use purecrypto::ascon::AsconAead128;
 use purecrypto::cipher::{
@@ -437,10 +438,15 @@ pub(crate) fn run(args: Args) {
     let result = match alg {
         Algo::Aes128Kw | Algo::Aes256Kw | Algo::Aes128Kwp | Algo::Aes256Kwp => {
             if decrypt {
-                kw_unwrap(alg, &key, &input)
-            } else {
-                kw_wrap(alg, &key, &input)
+                // An AES-KW/KWP unwrap recovers KEY MATERIAL: write it like
+                // the kem/kex secrets (0600, create_new, refuse a TTY) rather
+                // than a world-readable 0644 file.
+                let unwrapped = kw_unwrap(alg, &key, &input);
+                zero_buf(&mut key);
+                write_output_with_mode(dest, &unwrapped, /* private = */ true);
+                return;
             }
+            kw_wrap(alg, &key, &input)
         }
         _ => {
             let nonce = args

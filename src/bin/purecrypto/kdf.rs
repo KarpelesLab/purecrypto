@@ -2,6 +2,7 @@
 
 use crate::util::{
     Args, die, parse_hex_flag, parse_u32_flag, parse_usize_flag, to_hex_line, write_output,
+    write_output_with_mode,
 };
 use purecrypto::hash::{Sha256, Sha384, Sha512};
 use purecrypto::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -49,7 +50,10 @@ fn read_password(args: &Args) -> Vec<u8> {
 fn emit(args: &Args, out: &[u8]) {
     let dest = args.value("-out").or_else(|| args.value("--out"));
     if args.flag("-binary") || args.flag("--binary") {
-        write_output(dest, out);
+        // The derived output is key material: write it like the kem/kex
+        // secrets (0600, create_new, refuse a TTY) rather than a
+        // world-readable 0644 file.
+        write_output_with_mode(dest, out, /* private = */ true);
     } else {
         write_output(dest, to_hex_line(out).as_bytes());
     }
@@ -301,7 +305,9 @@ SUBCOMMANDS:
     kbkdf   -mode counter|feedback -prf hmac-sha256|hmac-sha384|hmac-sha512|cmac-aes128|cmac-aes256
             -ki HEX [-label HEX] [-context HEX] [-iv HEX] -len N
 
-Output is hex unless `-binary` is set, written to `-out` (default stdout).";
+Output is hex unless `-binary` is set, written to `-out` (default stdout).
+`-binary` output is key material: files are created mode 0600 and never
+overwritten, and writing raw bytes to a terminal is refused (use `-out -`).";
 
 pub(crate) fn run(args: Args) {
     // First positional after `kdf` selects the algorithm subcommand.
