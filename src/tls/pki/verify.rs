@@ -403,8 +403,10 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 /// each CA's constraints come into scope, they are enforced against the names
 /// of every certificate beneath it (intermediates and leaf), using the same
 /// `dns_in_subtree` / `ip_in_subtree` matchers. For each such certificate its
-/// dNSName / iPAddress SAN entries must satisfy, for every in-scope CA
-/// constraint:
+/// dNSName / iPAddress SAN entries (with a DNS-plausible subject commonName
+/// standing in for the dNSName entries when the certificate has no dNSName
+/// SAN — see [`enforce_constraints_on_cert`]) must satisfy, for every
+/// in-scope CA constraint:
 ///   * the cert must NOT match any excluded subtree (any match is fatal);
 ///   * when a CA declares ANY permitted dNSName subtree, each of the cert's
 ///     DNS SANs must match at least one such entry; same for iPAddress.
@@ -467,7 +469,9 @@ fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
 }
 
 /// Enforces the accumulated, in-scope name constraints (`active`) against a
-/// single subordinate certificate's dNSName and iPAddress SAN entries.
+/// single subordinate certificate's dNSName and iPAddress SAN entries — and,
+/// when the certificate carries no dNSName SAN, against its subject
+/// commonName (see below).
 ///
 /// Each constraint in `active` is checked independently (intersection
 /// semantics across CAs): an excluded match in any CA is fatal, and a CA that
@@ -477,23 +481,46 @@ fn enforce_constraints_on_cert(
     cert: &Certificate,
     active: &[&crate::x509::NameConstraints],
 ) -> Result<(), Error> {
-    let dns = cert
+    let mut dns = cert
         .subject_alt_names()
         .map_err(|_| Error::BadCertificate)?;
     let ips = cert.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
 
-    // Close the CN-fallback bypass and refuse SAN-less certificates that are
-    // governed by an active *permitted* constraint: the dNSName / iPAddress
-    // checks below only iterate SAN entries, so a certificate with no SAN
-    // would slip past every permitted-subtree constraint trivially (and for
-    // the leaf, `verify_hostname` would then fall back to commonName). When
-    // some active CA declared a permitted dNSName / iPAddress subtree, require
-    // the certificate to carry a SAN so those constraints can apply. (Modern
-    // PKI — CA/B Forum BR §7.1.4.2 — already requires SAN on server certs.)
-    // A CA that declared ONLY excluded subtrees does not by itself force a
-    // SAN to exist (RFC 5280: a name absent from the cert cannot violate an
-    // exclusion). This preserves the original leaf behavior while extending
-    // it to every governed subordinate certificate.
+    // CN fallback parity with `verify_hostname` (which falls back to matching
+    // the subject commonName when a certificate has no dNSName SAN): a name
+    // constraint must govern every name a relying party might accept. When
+    // there is no dNSName SAN and the CN is plausible as a DNS name — judged
+    // by the same syntax checks `parse_dns_names` applies to SAN dNSName
+    // entries — the CN is evaluated against the permitted AND excluded
+    // dNSName subtrees exactly as if it were a dNSName (matching common
+    // practice, e.g. OpenSSL). Without this, a CA constrained by only
+    // EXCLUDED subtrees could issue a SAN-less leaf whose CN sits inside the
+    // excluded subtree and have it pass both this check and
+    // `verify_hostname`'s CN fallback. IP-shaped CNs are kept out of the
+    // dNSName evaluation; they are inert for hostname verification anyway —
+    // `verify_hostname` never consults the CN for IP-literal hosts, and
+    // `dns_name_matches` refuses IP-shaped patterns — so they are not checked
+    // against iPAddress constraints either.
+    if dns.is_empty()
+        && let Some(cn) = cert
+            .subject()
+            .map_err(|_| Error::BadCertificate)?
+            .common_name
+        && cn_is_plausible_dns_name(&cn)
+    {
+        dns.push(cn);
+    }
+
+    // Refuse certificates that present NO evaluable name at all (no SAN, no
+    // DNS-plausible CN) while governed by an active *permitted* constraint:
+    // the dNSName / iPAddress checks below only iterate the collected names,
+    // so a nameless certificate would slip past every permitted-subtree
+    // constraint trivially. When some active CA declared a permitted dNSName
+    // / iPAddress subtree, require the certificate to carry a name those
+    // constraints can apply to. (Modern PKI — CA/B Forum BR §7.1.4.2 —
+    // already requires SAN on server certs.) A CA that declared ONLY
+    // excluded subtrees does not by itself force a name to exist (RFC 5280:
+    // a name absent from the cert cannot violate an exclusion).
     if dns.is_empty() && ips.is_empty() {
         let any_permitted = active
             .iter()
@@ -805,6 +832,16 @@ fn dns_name_matches(pattern: &str, host: &str) -> bool {
     } else {
         !pattern.is_empty() && pattern.eq_ignore_ascii_case(host)
     }
+}
+
+/// Whether a subject commonName is plausible as a DNS name, applying the same
+/// syntax checks `parse_dns_names` (the SAN parser in `x509::cert`) applies
+/// to SAN dNSName entries: non-empty, printable ASCII only (`0x20..=0x7E` — no
+/// control characters, NUL, or DEL), and not an IP literal in disguise. Only
+/// such CNs take part in the dNSName name-constraint evaluation (the
+/// CN-fallback path of [`enforce_constraints_on_cert`]).
+fn cn_is_plausible_dns_name(cn: &str) -> bool {
+    !cn.is_empty() && cn.bytes().all(|b| (0x20..=0x7E).contains(&b)) && !looks_like_ip(cn)
 }
 
 /// Coarse IP-literal heuristic; defense-in-depth against bytes that
@@ -1758,9 +1795,11 @@ mod tests {
     /// Builds a 2-CA chain (root → intermediate → leaf) with the intermediate
     /// carrying the supplied `nameConstraints` extension. The leaf is a
     /// server cert with `Certificate::issue_with_extensions` so SANs are
-    /// caller-controlled.
+    /// caller-controlled; `leaf_cn` is the leaf's subject commonName (the
+    /// CN-fallback tests put constraint-relevant names there).
     fn build_chain_with_nc(
         nc_ext: crate::x509::Extension,
+        leaf_cn: &str,
         leaf_sans: &[crate::x509::GeneralName],
     ) -> (Certificate, Certificate, Certificate) {
         use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
@@ -1780,7 +1819,7 @@ mod tests {
 
         let root_name = DistinguishedName::common_name("nc-root");
         let int_name = DistinguishedName::common_name("nc-intermediate");
-        let leaf_name = DistinguishedName::common_name("nc-leaf");
+        let leaf_name = DistinguishedName::common_name(leaf_cn);
 
         let root_exts = [
             basic_constraints(true, None),
@@ -1840,7 +1879,7 @@ mod tests {
             &[],
         );
         let leaf_sans = [GeneralName::Dns("host.good.example".into())];
-        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
@@ -1863,7 +1902,7 @@ mod tests {
         );
         // Leaf claims a host outside the permitted subtree.
         let leaf_sans = [GeneralName::Dns("attacker.example".into())];
-        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
@@ -1887,7 +1926,7 @@ mod tests {
             &[GeneralName::Dns(".bad.example".into())],
         );
         let leaf_sans = [GeneralName::Dns("host.bad.example".into())];
-        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
@@ -1905,19 +1944,19 @@ mod tests {
 
     #[test]
     fn name_constraints_chain_rejects_san_less_leaf() {
-        // CN-fallback bypass: when any CA declares name constraints, a leaf
-        // without SAN slips past the constraint loop trivially (nothing to
-        // iterate over) and then `verify_hostname` would happily fall back
-        // to commonName matching. Refuse the chain instead.
+        // CN-fallback under a permitted constraint: a leaf without SAN is
+        // evaluated through its commonName ("nc-leaf"), which falls outside
+        // the permitted subtree — the chain must be refused. (Before the CN
+        // fallback existed, the same chain was refused by the blanket
+        // SAN-less-under-permitted rule; either way it must not verify.)
         use crate::x509::GeneralName;
         let nc = crate::x509::extension::name_constraints(
             &[GeneralName::Dns(".good.example".into())],
             &[],
         );
-        // No SAN on the leaf — only a CN, which the bypass would route
-        // around constraints with.
+        // No SAN on the leaf — only a CN.
         let leaf_sans: [GeneralName; 0] = [];
-        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
@@ -1934,6 +1973,116 @@ mod tests {
     }
 
     #[test]
+    fn name_constraints_excluded_cn_fallback_rejected() {
+        // The CN-fallback bypass this closes: a CA constrained by ONLY
+        // excluded subtrees issues a SAN-less leaf whose CN sits inside the
+        // excluded subtree. With no dNSName SAN to iterate, the old code
+        // accepted the chain, and `verify_hostname` would then match the
+        // host against that very CN. The CN must be evaluated against the
+        // excluded dNSName subtrees as if it were a dNSName.
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let leaf_sans: [GeneralName; 0] = [];
+        let (root, int, leaf) = build_chain_with_nc(nc, "host.bad.example", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    #[test]
+    fn name_constraints_permitted_cn_fallback_accepted() {
+        // A SAN-less leaf whose DNS-plausible CN falls INSIDE the permitted
+        // subtree verifies: the CN stands in for the missing dNSName SAN on
+        // both the constraint side (here) and the hostname side
+        // (`verify_hostname`'s CN fallback), so the two must agree.
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns(".good.example".into())],
+            &[],
+        );
+        let leaf_sans: [GeneralName; 0] = [];
+        let (root, int, leaf) = build_chain_with_nc(nc, "host.good.example", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn name_constraints_cn_ignored_when_dns_san_present() {
+        // Certs WITH dNSName SANs keep the current behavior: the CN is not
+        // consulted (mirroring `verify_hostname`, which never falls back to
+        // CN when a dNSName SAN exists). An excluded-subtree CN next to an
+        // unconstrained SAN must not fail the chain.
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let leaf_sans = [GeneralName::Dns("host.good.example".into())];
+        let (root, int, leaf) = build_chain_with_nc(nc, "host.bad.example", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn name_constraints_ip_shaped_cn_not_dns_evaluated() {
+        // An IP-shaped CN is kept out of the dNSName evaluation (and is
+        // inert for hostname verification: `verify_hostname` never consults
+        // the CN for IP-literal hosts and `dns_name_matches` refuses
+        // IP-shaped patterns). Under an excluded-only dNSName constraint the
+        // SAN-less leaf therefore presents no evaluable name, which cannot
+        // violate an exclusion — the chain verifies.
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let leaf_sans: [GeneralName; 0] = [];
+        let (root, int, leaf) = build_chain_with_nc(nc, "10.0.0.1", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn name_constraints_critical_with_unenforceable_type_rejected() {
         // A critical nameConstraints carrying an rfc822Name (email) subtree
         // is something we can't evaluate — the chain must fail closed.
@@ -1945,7 +2094,7 @@ mod tests {
         // SAN unrelated; the rejection comes from the extension being a
         // critical unknown-shape rather than from SAN evaluation.
         let leaf_sans = [GeneralName::Dns("leaf.example".into())];
-        let (root, int, leaf) = build_chain_with_nc(nc, &leaf_sans);
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
 
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
