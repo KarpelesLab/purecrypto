@@ -1022,6 +1022,38 @@ impl QuicConnection {
         self.handshake_complete
     }
 
+    /// The peer's certificate chain (leaf first, DER), as presented
+    /// during the TLS 1.3 handshake. Empty until the Certificate message
+    /// has been processed (and on a server whose client sent none).
+    ///
+    /// Mirrors [`crate::tls::Connection::peer_certificates`], so callers
+    /// can run the same post-handshake checks (public-key pinning,
+    /// SAN-required policies) over QUIC that they run over plain TLS.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        match &self.engine {
+            EngineSide::Client(c) => c.peer_certificates(),
+            EngineSide::Server(s) => s.peer_certificates(),
+        }
+    }
+
+    /// The negotiated ALPN protocol id, if any (e.g. `b"h3"`). `None`
+    /// until the handshake has negotiated one.
+    ///
+    /// Mirrors [`crate::tls::Connection::alpn_selected`].
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        match &self.engine {
+            EngineSide::Client(c) => c.alpn_protocol(),
+            EngineSide::Server(s) => s.alpn_protocol(),
+        }
+    }
+
+    /// IANA identifier of the negotiated TLS 1.3 cipher suite, or `None`
+    /// until the suite is fixed (ServerHello processed). The wire version
+    /// is always TLS 1.3 in QUIC v1 (RFC 9001 §4.2).
+    pub fn negotiated_cipher_suite(&self) -> Option<u16> {
+        self.negotiated_suite
+    }
+
     /// Returns the monotonic [`Duration`] since this connection was
     /// constructed. Used as the time axis for the RFC 9002 loss-recovery
     /// state machine — every internal caller of `LossState::on_packet_sent`
@@ -1738,22 +1770,20 @@ impl QuicConnection {
             // processing. The cipher-suite id stays the same for all
             // subsequent traffic secrets. We track it lazily here.
             if self.negotiated_suite.is_none() {
-                // The first secret event's byte length is the hash output
-                // length; on the server we lack a public accessor for
-                // the negotiated CipherSuite (Phase 5+ will add one),
-                // so we map 32 → AES-128-GCM, 48 → AES-256-GCM. The
-                // ChaCha20 suite also uses 32-byte secrets (SHA-256) —
-                // Phase 4 doesn't exercise it on the server side, but
-                // we'd need to disambiguate via a ServerConnection
-                // accessor when it lands.
+                // Both engines expose the negotiated suite once the
+                // ServerHello is fixed, which is always before the first
+                // secret event. The secret-length mapping remains as a
+                // fallback only (32 → AES-128-GCM, 48 → AES-256-GCM;
+                // it cannot distinguish ChaCha20 from AES-128).
                 self.negotiated_suite = match &self.engine {
                     EngineSide::Client(c) => c.negotiated_cipher_suite(),
-                    EngineSide::Server(_) => match events.first() {
-                        Some((_, _, sec)) if sec.len() == 32 => Some(0x1301),
-                        Some((_, _, sec)) if sec.len() == 48 => Some(0x1302),
-                        _ => None,
-                    },
-                };
+                    EngineSide::Server(s) => s.negotiated_cipher_suite(),
+                }
+                .or(match events.first() {
+                    Some((_, _, sec)) if sec.len() == 32 => Some(0x1301),
+                    Some((_, _, sec)) if sec.len() == 48 => Some(0x1302),
+                    _ => None,
+                });
             }
             let suite = self.negotiated_suite;
             for (lvl, dir, secret) in events {
@@ -3904,6 +3934,60 @@ mod tests {
         assert_eq!(p.initial_max_data, Some(1 << 20));
         let q = s.peer_transport_params().expect("client params");
         assert_eq!(q.initial_max_data, Some(1 << 20));
+    }
+
+    /// Issue #31 — the peer certificate chain, negotiated ALPN, and
+    /// cipher suite are exposed post-handshake, mirroring the plain-TLS
+    /// `Connection` API, so callers can run public-key pinning and
+    /// SAN-required policies over QUIC (h3) exactly as over TLS.
+    #[test]
+    fn handshake_exposes_peer_certificates_and_alpn() {
+        let (mut server_cfg_tls, cert_der) = ed25519_server();
+        server_cfg_tls.alpn_protocols = alloc::vec![b"h3".to_vec()];
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"h3".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+
+        let mut client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+
+        // Nothing is exposed before the handshake has run.
+        assert!(client.peer_certificates().is_empty());
+        assert!(client.alpn_protocol().is_none());
+
+        drive_until_complete(&mut client, &mut server, 8);
+
+        // Client sees the server's chain (leaf first, DER); the server
+        // saw no client certificate.
+        assert_eq!(client.peer_certificates(), core::slice::from_ref(&cert_der));
+        assert!(server.peer_certificates().is_empty());
+        // Both sides agree on the negotiated ALPN id and cipher suite.
+        assert_eq!(client.alpn_protocol(), Some(&b"h3"[..]));
+        assert_eq!(server.alpn_protocol(), Some(&b"h3"[..]));
+        assert!(client.negotiated_cipher_suite().is_some());
+        assert_eq!(
+            client.negotiated_cipher_suite(),
+            server.negotiated_cipher_suite()
+        );
     }
 
     /// Test 2 — Initial-key derivation matches RFC 9001 §A.1.
