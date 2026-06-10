@@ -526,6 +526,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         cc = cc.with_record_size_limit(rsl);
     }
     cc = cc.with_signature_policy(cfg.signature_policy.clone());
+    cc = cc.with_require_ems(cfg.require_extended_master_secret);
     if let Some(id) = &cfg.identity {
         let cc_cfg = client_cert_from_signing(id);
         if let Some(c) = cc_cfg {
@@ -652,6 +653,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
         sc = sc.with_stapled_ocsp_response(ocsp);
     }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
+    sc = sc.with_require_ems(cfg.require_extended_master_secret);
     if let Some(t) = cfg.verification_time.clone() {
         sc = sc.with_verification_time(t);
     }
