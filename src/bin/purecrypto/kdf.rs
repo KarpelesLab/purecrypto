@@ -2,7 +2,7 @@
 
 use crate::util::{
     Args, die, parse_hex_flag, parse_u32_flag, parse_usize_flag, read_secret_file, to_hex_line,
-    write_output, write_output_with_mode, zero_buf,
+    write_output_with_mode, zero_buf,
 };
 use purecrypto::hash::{Sha256, Sha384, Sha512};
 use purecrypto::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -55,7 +55,12 @@ fn emit(args: &Args, out: &[u8]) {
         // world-readable 0644 file.
         write_output_with_mode(dest, out, /* private = */ true);
     } else {
-        write_output(dest, to_hex_line(out).as_bytes());
+        // Hex is the same key material, just re-encoded: a `-out FILE` must
+        // get the identical 0600/create_new treatment. Hex to stdout (or
+        // `-out -`) stays allowed — printing hex to a terminal is the
+        // intended interactive use.
+        let private = matches!(dest, Some(p) if p != "-");
+        write_output_with_mode(dest, to_hex_line(out).as_bytes(), private);
     }
 }
 

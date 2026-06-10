@@ -1,6 +1,6 @@
 //! `purecrypto pkeyutl` — generic asymmetric encrypt/decrypt/sign/verify.
 
-use crate::util::{Args, SentinelLock, die, read_input, write_output};
+use crate::util::{Args, SentinelLock, die, read_input, write_output, write_output_with_mode};
 use purecrypto::ec::sm2::DEFAULT_ID;
 use purecrypto::ec::{
     BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed448PrivateKey, Ed25519PrivateKey,
@@ -415,7 +415,10 @@ fn run_decrypt(args: Args) {
             .decrypt(&ct)
             .unwrap_or_else(|e| die(format!("SM2 decrypt failed: {e:?}")));
         let out_path = args.value("-out").or_else(|| args.value("--out"));
-        write_output(out_path, &pt);
+        // Recovered plaintext is typically a wrapped key: write it like the
+        // kem/kex secrets (0600, create_new, refuse a TTY) rather than a
+        // world-readable 0644 file (mirrors `enc -d` for AES-KW/KWP).
+        write_output_with_mode(out_path, &pt, /* private = */ true);
         return;
     }
     let rsa = match key {
@@ -444,7 +447,8 @@ fn run_decrypt(args: Args) {
         other => die(format!("unsupported rsa_padding_mode: {other}")),
     };
     let out_path = args.value("-out").or_else(|| args.value("--out"));
-    write_output(out_path, &pt);
+    // Same as the SM2 path above: the recovered plaintext is key-grade.
+    write_output_with_mode(out_path, &pt, /* private = */ true);
 }
 
 fn run_sign(args: Args) {

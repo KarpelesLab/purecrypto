@@ -1585,6 +1585,52 @@ fn kdf_pbkdf2_known_answer() {
     );
 }
 
+/// `kdf ... -out FILE` writes derived key material; the default hex encoding
+/// must land at mode 0o600 with create_new (same as `-binary`), not a
+/// world-readable, silently-overwritten 0644 file.
+#[cfg(unix)]
+#[test]
+fn kdf_hex_out_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_cli_kdf_mode_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out_path = dir.join("okm.hex").to_str().unwrap().to_string();
+
+    let hkdf_args = [
+        "kdf",
+        "hkdf",
+        "-hash",
+        "sha256",
+        "-ikm",
+        "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b",
+        "-salt",
+        "000102030405060708090a0b0c",
+        "-info",
+        "f0f1f2f3f4f5f6f7f8f9",
+        "-len",
+        "42",
+        "-out",
+        &out_path,
+    ];
+    assert!(run(&hkdf_args, b"").1, "kdf hkdf -out failed");
+    let mode = std::fs::metadata(&out_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "expected 0o600, got {mode:o}");
+    assert!(
+        std::fs::read_to_string(&out_path)
+            .unwrap()
+            .starts_with("3cb25f25faacd57a90434f64d0362f2a")
+    );
+
+    // And the file must not be silently overwritten by a second run.
+    assert!(
+        !run(&hkdf_args, b"").1,
+        "second kdf run overwrote an existing -out file"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn enc_aes_gcm_roundtrip() {
     let dir = std::env::temp_dir().join(format!("pc_enc_gcm_{}", std::process::id()));
