@@ -112,6 +112,16 @@ impl ServerConfig12Internal {
 
     /// Toggles whether the cookie exchange is enforced. Default is `true`.
     /// Disable only for tests where the cookie path isn't under test.
+    ///
+    /// # Warning: amplification / DoS vector
+    ///
+    /// With the cookie exchange off, a single spoofed-source ClientHello
+    /// makes the server allocate per-connection state, perform an
+    /// asymmetric signature, and emit its full multi-KB flight (SH +
+    /// Certificate + ServerKeyExchange + ServerHelloDone) to an unverified
+    /// address — well over 3x amplification toward a victim of the
+    /// attacker's choosing (RFC 6347 §4.2.1). Never disable cookies on a
+    /// server reachable from untrusted networks.
     pub fn require_cookie_exchange(mut self, required: bool) -> Self {
         self.require_cookie_exchange = required;
         self

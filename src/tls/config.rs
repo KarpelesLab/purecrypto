@@ -269,7 +269,9 @@ pub struct Config {
     pub cookie_secret: Option<[u8; 32]>,
     /// When `true`, the DTLS server mandates a cookie round-trip before
     /// allocating per-connection state. Default `true` on server, ignored
-    /// on client.
+    /// on client. **Setting this to `false` turns the server into a >3x
+    /// traffic amplifier toward spoofed source addresses** — see
+    /// [`ConfigBuilder::no_cookie`] for the full warning; tests only.
     pub require_cookie: bool,
     /// Target MTU for emitted DTLS records (default ~1200).
     pub max_record_size: usize,
@@ -473,6 +475,17 @@ impl ConfigBuilder {
         self
     }
     /// DTLS server: disable the cookie exchange (tests only).
+    ///
+    /// # Warning: amplification / DoS vector
+    ///
+    /// With the cookie exchange off, a single ClientHello from a spoofed
+    /// source address makes the server allocate per-connection state,
+    /// perform an asymmetric signature, and emit its full multi-KB
+    /// certificate flight to an unverified address — well over 3x
+    /// amplification toward a victim of the attacker's choosing
+    /// (RFC 6347 §4.2.1 / RFC 9147 §5.1). Never disable cookies on a
+    /// server reachable from untrusted networks; production servers
+    /// should call [`Self::cookie_secret`] instead.
     pub fn no_cookie(mut self) -> Self {
         self.inner.require_cookie = false;
         self

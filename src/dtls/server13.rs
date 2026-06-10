@@ -139,6 +139,16 @@ impl ServerConfig13Internal {
     }
 
     /// Disables the cookie exchange. Tests only.
+    ///
+    /// # Warning: amplification / DoS vector
+    ///
+    /// With the cookie exchange off, a single spoofed-source ClientHello
+    /// makes the server allocate per-connection state, perform an
+    /// asymmetric signature, and emit its full multi-KB flight (SH + EE +
+    /// Certificate + CertificateVerify + Finished) to an unverified
+    /// address — well over 3x amplification toward a victim of the
+    /// attacker's choosing (RFC 9147 §5.1). Never disable cookies on a
+    /// server reachable from untrusted networks.
     pub fn with_no_cookie(mut self) -> Self {
         self.require_cookie = false;
         self
