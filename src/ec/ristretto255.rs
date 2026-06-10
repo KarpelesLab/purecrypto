@@ -22,7 +22,7 @@
 //! rejects non-canonical and invalid encodings per RFC 9496 §4.3.1; the
 //! reject/accept decision is a public function of the (public) encoded bytes.
 
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::curve25519::field::{Fe, Field};
 use crate::ec::curve25519::point::Point;
 
@@ -237,13 +237,16 @@ impl CompressedRistretto {
 
         // Field-element canonicity: s must be a canonical, non-negative residue.
         let s_plain = Fe::from_le_bytes(&s_bytes);
-        // Re-encode and require equality (rejects s >= p, i.e. non-canonical).
-        let mut reenc = [0u8; 32];
-        s_plain.write_le_bytes(&mut reenc);
-        if reenc != s_bytes {
+        // The full 256-bit little-endian integer must already be reduced
+        // (`s < p`) — constant-time, mirroring how edwards25519 point decoding
+        // rejects a non-canonical `y`. This rejects encodings like `s + p` or
+        // `2p − s` that would otherwise alias an existing element
+        // (RFC 9496 §4.3.1 step 1).
+        if !bool::from(s_plain.ct_lt(&f.p)) {
             return None;
         }
-        // s must be non-negative (even).
+        // s must be non-negative (even). `s_plain < p` was just enforced, so
+        // this is the low bit of the canonical residue.
         if s_plain.is_odd().unwrap_u8() == 1 {
             return None;
         }
@@ -456,6 +459,39 @@ mod tests {
                     .decompress()
                     .is_none(),
                 "should reject {hexv}"
+            );
+        }
+    }
+
+    /// Non-canonical aliasing encodings must be rejected (RFC 9496 §4.3.1).
+    ///
+    /// For a point with even canonical `s0`, the 256-bit value `2p − s0` is
+    /// also even (so it passes the sign check on the raw low bit) and is
+    /// congruent to `−s0`, which decodes to the SAME point as `s0` since the
+    /// decoding only uses `s²`. Without the `s < p` canonicity check this
+    /// gives every group element a second wire encoding.
+    #[test]
+    fn noncanonical_two_p_minus_s_rejected() {
+        // 2p = 2^256 − 38, little-endian.
+        let mut two_p = [0xffu8; 32];
+        two_p[0] = 0xda;
+        for (k, hexv) in MULTIPLES.iter().enumerate() {
+            let s0 = from_hex::<32>(hexv);
+            // Canonical ristretto encodings are non-negative, i.e. even.
+            assert_eq!(s0[0] & 1, 0, "[{k}]B encoding should be even");
+            // enc = 2p − s0, little-endian schoolbook subtraction.
+            let mut enc = [0u8; 32];
+            let mut borrow = 0i16;
+            for i in 0..32 {
+                let d = two_p[i] as i16 - s0[i] as i16 - borrow;
+                enc[i] = (d & 0xff) as u8;
+                borrow = i16::from(d < 0);
+            }
+            assert_eq!(borrow, 0, "2p > s0, no final borrow");
+            assert_eq!(enc[0] & 1, 0, "2p − s0 is even");
+            assert!(
+                CompressedRistretto::from_slice(&enc).decompress().is_none(),
+                "non-canonical 2p − s encoding of [{k}]B must be rejected"
             );
         }
     }
