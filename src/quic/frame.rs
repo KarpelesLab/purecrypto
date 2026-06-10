@@ -278,6 +278,15 @@ impl<'a> Frame<'a> {
                 p += n;
                 let (length, n) = varint::decode(&buf[p..])?;
                 p += n;
+                // RFC 9000 §19.6 — "The largest offset delivered on a
+                // stream — the sum of the offset and data length —
+                // cannot exceed 2^62-1"; violations are a connection
+                // error of type FRAME_ENCODING_ERROR (Error::Decode
+                // here, which the connection layer surfaces fatally).
+                match offset.checked_add(length) {
+                    Some(end) if end <= varint::MAX => {}
+                    _ => return Err(Error::Decode),
+                }
                 let length = length as usize;
                 if buf.len() - p < length {
                     return Err(Error::Decode);
@@ -970,6 +979,32 @@ mod tests {
                 assert_eq!(data, b"abcd");
             }
             other => panic!("expected STREAM, got {other:?}"),
+        }
+    }
+
+    /// RFC 9000 §19.6 — a CRYPTO frame whose `offset + length` exceeds
+    /// 2^62−1 is a FRAME_ENCODING_ERROR and must be rejected at decode.
+    #[test]
+    fn crypto_offset_plus_length_past_varint_max_rejected() {
+        // offset = 2^62−1 (varint::MAX), length = 1 → end = 2^62.
+        let mut buf = alloc::vec![0x06u8];
+        varint::encode(varint::MAX, &mut buf);
+        varint::encode(1, &mut buf);
+        buf.push(b'x');
+        assert!(matches!(Frame::decode(&buf), Err(Error::Decode)));
+
+        // Exactly at the limit (end == 2^62−1) still decodes.
+        let mut ok = alloc::vec![0x06u8];
+        varint::encode(varint::MAX - 1, &mut ok);
+        varint::encode(1, &mut ok);
+        ok.push(b'x');
+        let (frame, _used) = Frame::decode(&ok).expect("decode at limit");
+        match frame {
+            Frame::Crypto { offset, data } => {
+                assert_eq!(offset, varint::MAX - 1);
+                assert_eq!(data, b"x");
+            }
+            other => panic!("expected CRYPTO, got {other:?}"),
         }
     }
 
