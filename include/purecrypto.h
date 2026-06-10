@@ -777,6 +777,13 @@ pc_status pc_quic_set_peer_addr(PcQuic *q,
                                 const uint8_t *ipv6_bytes, size_t ipv6_bytes_len,
                                 uint16_t port);
 
+/* Negotiated ALPN protocol id (e.g. "h3"), written to `out`. While the
+ * handshake has not selected one yet, `*out_len` is set to 0 and PC_OK is
+ * returned. The peer leaf certificate is the DER as presented in the TLS
+ * 1.3 handshake; PC_BAD_ENCODING when none is available (handshake
+ * incomplete, or the peer sent no certificate). Both follow the usual
+ * out-buffer convention: `*out_len` is capacity in, length out
+ * (PC_BUFFER_TOO_SMALL when the capacity is insufficient). */
 pc_status pc_quic_negotiated_alpn(const PcQuic *q, uint8_t *out, size_t *out_len);
 pc_status pc_quic_peer_certificate(const PcQuic *q, uint8_t *out, size_t *out_len);
 

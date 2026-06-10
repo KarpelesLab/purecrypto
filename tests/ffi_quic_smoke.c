@@ -150,6 +150,26 @@ int main(void) {
   if (pc_quic_handshake(server) != PC_OK)
     return fail("pc_quic_handshake server post-complete");
 
+  /* 7b. Negotiated info: both sides report the ALPN we configured, and
+   *     the client can fetch the server's leaf certificate DER. */
+  uint8_t alpn_buf[64];
+  size_t alpn_len = sizeof(alpn_buf);
+  if (pc_quic_negotiated_alpn(client, alpn_buf, &alpn_len) != PC_OK)
+    return fail("pc_quic_negotiated_alpn client");
+  if (alpn_len != 5 || memcmp(alpn_buf, "smoke", 5) != 0)
+    return fail("client negotiated ALPN != \"smoke\"");
+  alpn_len = sizeof(alpn_buf);
+  if (pc_quic_negotiated_alpn(server, alpn_buf, &alpn_len) != PC_OK)
+    return fail("pc_quic_negotiated_alpn server");
+  if (alpn_len != 5 || memcmp(alpn_buf, "smoke", 5) != 0)
+    return fail("server negotiated ALPN != \"smoke\"");
+
+  uint8_t leaf_der[4096];
+  size_t leaf_len = sizeof(leaf_der);
+  if (pc_quic_peer_certificate(client, leaf_der, &leaf_len) != PC_OK)
+    return fail("pc_quic_peer_certificate client");
+  if (leaf_len == 0) return fail("client peer certificate empty");
+
   /* 8. Drain post-handshake control flights (NEW_CID / HANDSHAKE_DONE). */
   for (int i = 0; i < 8; i++) {
     size_t a = pump_all(client, server);

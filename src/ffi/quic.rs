@@ -1064,18 +1064,11 @@ pub unsafe extern "C" fn pc_quic_negotiated_alpn(
         if q.is_null() {
             return PcStatus::NullPointer;
         }
-        // The QuicConnection holds the TLS engine internally; we can't
-        // borrow it here. The Phase-4 design surfaces ALPN via the
-        // engine's `alpn_protocol` method on ClientConnection /
-        // ServerConnection, but those are not re-exported through
-        // QuicConnection. Until QuicConnection exposes an accessor,
-        // return an empty selected protocol — matching the
-        // "ALPN not configured" branch in pc_tls_alpn_selected.
-        // Production callers that need to inspect the chosen ALPN
-        // should configure it explicitly and trust the server-side
-        // selection.
-        let alpn: Vec<u8> = Vec::new();
-        unsafe { out_write(&alpn, out, out_len) }
+        // Mirrors `pc_tls_alpn_selected`: the negotiated protocol id from
+        // the embedded TLS engine, or empty while the handshake hasn't
+        // selected one yet.
+        let alpn: &[u8] = unsafe { &*q }.inner.alpn_protocol().unwrap_or(&[]);
+        unsafe { out_write(alpn, out, out_len) }
     })
 }
 
@@ -1088,20 +1081,21 @@ pub unsafe extern "C" fn pc_quic_negotiated_alpn(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_quic_peer_certificate(
     q: *const PcQuic,
-    _out: *mut u8,
-    _out_len: *mut usize,
+    out: *mut u8,
+    out_len: *mut usize,
 ) -> PcStatus {
     guard(|| {
         if q.is_null() {
             return PcStatus::NullPointer;
         }
-        // The QuicConnection doesn't currently expose the peer
-        // certificate chain through its public API — Phase 10 ships the
-        // ABI surface for parity with `pc_tls_peer_certificate`, but
-        // until QuicConnection adds an accessor (later phase) the C ABI
-        // returns BadEncoding (matching pc_tls_peer_certificate's
-        // "no peer certificate available" branch).
-        PcStatus::BadEncoding
+        // Mirrors `pc_tls_peer_certificate`: leaf certificate DER from the
+        // chain the peer presented, or BadEncoding when none is available
+        // (handshake incomplete, or the peer sent no certificate).
+        let chain: &[Vec<u8>] = unsafe { &*q }.inner.peer_certificates();
+        let Some(leaf) = chain.first() else {
+            return PcStatus::BadEncoding;
+        };
+        unsafe { out_write(leaf, out, out_len) }
     })
 }
 
