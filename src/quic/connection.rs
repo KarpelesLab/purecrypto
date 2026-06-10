@@ -77,7 +77,18 @@ fn frame_allowed_at_level(frame: &Frame<'_>, level: Level) -> bool {
     use Frame::*;
     match frame {
         // Always permitted at every level.
-        Padding(_) | Ping | ConnectionClose { .. } => true,
+        Padding(_) | Ping => true,
+        // CONNECTION_CLOSE: only the transport variant (0x1c,
+        // `frame_type: Some(_)`) is permitted at Initial/Handshake; the
+        // application variant (0x1d, `frame_type: None`) is restricted to
+        // 0-RTT and 1-RTT (RFC 9000 §12.4 Table 3, §12.5).
+        ConnectionClose {
+            frame_type: Some(_),
+            ..
+        } => true,
+        ConnectionClose {
+            frame_type: None, ..
+        } => matches!(level, Level::EarlyData | Level::OneRtt),
         // ACK and CRYPTO: permitted at Initial, Handshake, 1-RTT (not 0-RTT).
         Ack { .. } | Crypto { .. } => !matches!(level, Level::EarlyData),
         // 0-RTT or 1-RTT only.
@@ -5457,6 +5468,53 @@ mod tests {
         assert!(
             matches!(r, Err(Error::IllegalParameter)),
             "retire_prior_to > seq must be a connection error, got {r:?}",
+        );
+    }
+
+    /// RFC 9000 §12.4 Table 3 / §12.5 — only the transport variant of
+    /// CONNECTION_CLOSE (0x1c, `frame_type: Some(_)`) may appear in
+    /// Initial or Handshake packets; the application variant (0x1d,
+    /// `frame_type: None`) is restricted to 0-RTT and 1-RTT.
+    #[test]
+    fn app_connection_close_rejected_at_initial_and_handshake() {
+        let transport = Frame::ConnectionClose {
+            error: 0x0a,
+            frame_type: Some(0x06),
+            reason: b"",
+        };
+        let app = Frame::ConnectionClose {
+            error: 1,
+            frame_type: None,
+            reason: b"",
+        };
+        for level in [
+            Level::Initial,
+            Level::Handshake,
+            Level::EarlyData,
+            Level::OneRtt,
+        ] {
+            assert!(
+                frame_allowed_at_level(&transport, level),
+                "transport CONNECTION_CLOSE must be allowed at {level:?}"
+            );
+            let app_ok = frame_allowed_at_level(&app, level);
+            let expected = matches!(level, Level::EarlyData | Level::OneRtt);
+            assert_eq!(
+                app_ok, expected,
+                "application CONNECTION_CLOSE at {level:?}: got {app_ok}, want {expected}"
+            );
+        }
+
+        // End-to-end: dispatching an application-variant close at the
+        // Initial level is a PROTOCOL_VIOLATION (IllegalParameter here).
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        let mut payload = Vec::new();
+        app.encode(&mut payload);
+        let r = c.dispatch_frames(Level::Initial, 0, &payload);
+        assert!(
+            matches!(r, Err(Error::IllegalParameter)),
+            "0x1d at Initial must be a connection error, got {r:?}",
         );
     }
 
