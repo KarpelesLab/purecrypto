@@ -49,9 +49,11 @@ pub struct BoxedEcdhPrivateKey {
     d: BoxedUint,
 }
 
-/// `1 <= v < n`.
+/// `1 <= v < n`, evaluated without short-circuiting (`v` may be a secret
+/// scalar — private-key import, nonce rejection sampling — so the zero test
+/// and the comparison must not leak which limb first differed).
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
-    !v.is_zero() && v.reduce(n) == *v
+    (!v.ct_is_zero() & v.reduce(n).ct_eq(v)).into()
 }
 
 /// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
@@ -94,8 +96,9 @@ fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> Boxe
         rng.fill_bytes(&mut buf);
         buf[0] &= high_mask;
         let candidate = BoxedUint::from_be_bytes(&buf);
-        // Accept iff 1 ≤ candidate < n.
-        if !candidate.is_zero() && candidate.lt(n) {
+        // Accept iff 1 ≤ candidate < n; non-short-circuiting `&` so the
+        // candidate's low limbs don't shape the timing of a rejection.
+        if bool::from(!candidate.ct_is_zero()) & candidate.lt(n) {
             return candidate;
         }
     }

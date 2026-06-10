@@ -167,10 +167,20 @@ impl BoxedUint {
         self.limbs.first().is_some_and(|l| l & 1 == 1)
     }
 
-    /// Whether the value is zero.
+    /// Whether the value is zero. **Not constant time** (stops at the first
+    /// non-zero limb) — use [`ct_is_zero`](Self::ct_is_zero) on secret values.
     #[inline]
     pub fn is_zero(&self) -> bool {
         self.limbs.iter().all(|&l| l == 0)
+    }
+
+    /// Constant-time zero test: ORs every limb with no short-circuit, so the
+    /// position of the first non-zero limb does not leak. Use this instead of
+    /// [`is_zero`](Self::is_zero) on secret values (private scalars, nonce
+    /// candidates, ...).
+    pub fn ct_is_zero(&self) -> Choice {
+        let acc = self.limbs.iter().fold(0 as Limb, |acc, &l| acc | l);
+        acc.ct_eq(&0)
     }
 
     /// The number of significant (non-leading-zero) limbs, at least one.
@@ -407,6 +417,21 @@ mod tests {
         let b = BoxedUint::from_limbs(vec![5, 0, 0]);
         assert_eq!(a, b);
         assert_ne!(a, BoxedUint::from_limbs(vec![6]));
+    }
+
+    #[test]
+    fn ct_is_zero_matches_is_zero() {
+        for limbs in [
+            vec![0],
+            vec![0, 0, 0],
+            vec![1],
+            vec![0, 0, 1],
+            vec![1, 0, 0],
+            vec![Limb::MAX, Limb::MAX],
+        ] {
+            let u = BoxedUint::from_limbs(limbs);
+            assert_eq!(bool::from(u.ct_is_zero()), u.is_zero());
+        }
     }
 
     #[test]

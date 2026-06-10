@@ -42,9 +42,11 @@ const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 /// RFC 8998 §2).
 pub const DEFAULT_ID: &[u8] = b"1234567812345678";
 
-/// `1 <= v < n`.
+/// `1 <= v < n`, evaluated without short-circuiting (`v` may be a secret
+/// scalar — private-key import, nonce rejection sampling — so the zero test
+/// must not leak which limb first differed).
 fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
-    !v.is_zero() && v.lt(n)
+    bool::from(!v.ct_is_zero()) & v.lt(n)
 }
 
 /// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
