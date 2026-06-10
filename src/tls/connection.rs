@@ -502,11 +502,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
     let server_name = client_server_name(cfg)?;
-    Ok(super::conn::ClientConnection::new(
-        cc,
-        server_name,
-        &mut OsRng,
-    ))
+    super::conn::ClientConnection::new(cc, server_name, &mut OsRng)
 }
 
 fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, Error> {
@@ -544,11 +540,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     let server_name = client_server_name(cfg)?;
-    Ok(super::conn::ClientConnection12::new(
-        cc,
-        server_name,
-        &mut OsRng,
-    ))
+    super::conn::ClientConnection12::new(cc, server_name, &mut OsRng)
 }
 
 fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRng>, Error> {
@@ -912,6 +904,56 @@ mod tests {
                 .build();
             assert!(Connection::client(&cfg).is_ok(), "{v:?}: explicit SNI ok");
         }
+    }
+
+    /// A non-empty `cipher_suites` restriction that excludes every suite the
+    /// configured version supports must refuse construction. The old
+    /// behaviour silently fell back to the engine's full default set, so a
+    /// typo'd suite ID (or a list meant for the other protocol version)
+    /// re-enabled everything the caller had deliberately disabled.
+    #[test]
+    fn cipher_suite_restriction_with_no_match_fails_closed() {
+        let client_cfg = |max: ProtocolVersion, suites: &[u16]| {
+            Config::builder()
+                .versions(max, max)
+                .verify_certificates(false)
+                .server_name("example.test")
+                .cipher_suites(suites)
+                .build()
+        };
+
+        // A TLS-1.3-only list handed to the TLS 1.2 engine, and vice versa.
+        for (v, suites) in [
+            (ProtocolVersion::TLSv1_2, &[0x1301u16, 0x1302, 0x1303][..]),
+            (ProtocolVersion::TLSv1_3, &[0xC02Fu16, 0xC030][..]),
+            // A typo'd / unknown codepoint matching nothing at all.
+            (ProtocolVersion::TLSv1_3, &[0x1300u16][..]),
+            // Explicitly empty is a vacuous restriction, not "defaults".
+            (ProtocolVersion::TLSv1_2, &[][..]),
+        ] {
+            match Connection::client(&client_cfg(v, suites)) {
+                Err(Error::NoUsableCipherSuites) => {}
+                Err(e) => panic!("{v:?}/{suites:?}: expected NoUsableCipherSuites, got {e:?}"),
+                Ok(_) => panic!("{v:?}/{suites:?}: empty intersection must fail closed"),
+            }
+        }
+
+        // A list that matches at least one suite of the engine's version
+        // range still constructs — extra IDs from the other version are
+        // simply not offered.
+        let cfg = client_cfg(ProtocolVersion::TLSv1_2, &[0x1301, 0xC02F]);
+        assert!(Connection::client(&cfg).is_ok(), "partial match must work");
+        let cfg = client_cfg(ProtocolVersion::TLSv1_3, &[0x1301, 0xC02F]);
+        assert!(Connection::client(&cfg).is_ok(), "partial match must work");
+
+        // Unset (None) keeps meaning "offer the defaults".
+        let cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("example.test")
+            .build();
+        assert!(cfg.cipher_suites.is_none());
+        assert!(Connection::client(&cfg).is_ok());
     }
 
     /// `cipher_suite_name` covers every suite the negotiator can pick,

@@ -916,14 +916,23 @@ impl ClientConnection {
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
     /// `rng` supplies the ephemeral key shares and the client random. Offers all
     /// supported cipher suites and both key-exchange groups.
-    pub fn new<R: RngCore>(config: ClientConfig, server_name: &str, rng: &mut R) -> Self {
+    ///
+    /// Errors with [`Error::NoUsableCipherSuites`] when a non-empty
+    /// [`ClientConfig::cipher_suites`] restriction excludes every TLS 1.3
+    /// suite — failing closed at construction instead of silently widening
+    /// the offer back to the defaults.
+    pub fn new<R: RngCore>(
+        config: ClientConfig,
+        server_name: &str,
+        rng: &mut R,
+    ) -> Result<Self, Error> {
         const DEFAULT_SUITES: [CipherSuite; 3] = [
             CipherSuite::AES_128_GCM_SHA256,
             CipherSuite::AES_256_GCM_SHA384,
             CipherSuite::CHACHA20_POLY1305_SHA256,
         ];
-        let suites = super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES);
-        Self::new_with_offer(
+        let suites = super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?;
+        Ok(Self::new_with_offer(
             config,
             server_name,
             rng,
@@ -934,7 +943,7 @@ impl ClientConnection {
                 NamedGroup::SECP256R1,
                 NamedGroup::SECP384R1,
             ],
-        )
+        ))
     }
 
     /// Like [`new`](Self::new) but with an explicit cipher-suite and
@@ -3246,7 +3255,7 @@ mod tests {
     fn client_hello_is_well_formed() {
         let mut rng = HmacDrbg::<Sha256>::new(b"p8-client", b"nonce", &[]);
         let config = ClientConfig::new(RootCertStore::new());
-        let mut client = ClientConnection::new(config, "example.com", &mut rng);
+        let mut client = ClientConnection::new(config, "example.com", &mut rng).unwrap();
         assert!(client.is_handshaking());
 
         let out = client.write_tls();
@@ -3279,7 +3288,7 @@ mod tests {
     fn rejects_garbage_server_hello() {
         let mut rng = HmacDrbg::<Sha256>::new(b"p8-client-2", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng);
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
         let _ = client.write_tls();
         // A handshake record claiming to be a (truncated) ServerHello.
         client.read_tls(&[0x16, 0x03, 0x03, 0x00, 0x04, 0x02, 0x00, 0x00, 0x00]);
@@ -3294,7 +3303,7 @@ mod tests {
     fn rejects_server_hello_with_nonempty_session_id_echo() {
         let mut rng = HmacDrbg::<Sha256>::new(b"sh-sid-echo", b"nonce", &[]);
         let mut client =
-            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng);
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
         let _ = client.write_tls();
 
         // A ServerHello with a non-HRR random, a non-empty session_id, and an
@@ -3330,7 +3339,7 @@ mod tests {
         // this, the second `alpn` is fine on its own but the test would
         // be checking the wrong code path.)
         config.alpn_protocols.push(b"h2".to_vec());
-        let mut client = ClientConnection::new(config, "h", &mut rng);
+        let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
         // One ALPN extension carrying a single protocol "h2".
         // ProtocolNameList: u16 length, then one entry (u8 length || bytes).
         let alpn_body: alloc::vec::Vec<u8> = alloc::vec![
@@ -3405,7 +3414,7 @@ mod tests {
         // outer SNI must be "public.example".
         let inner_sni = "secret.example";
         let mut rng = HmacDrbg::<Sha256>::new(b"ech-3b2-client", b"nonce", &[]);
-        let mut client = ClientConnection::new(cfg, inner_sni, &mut rng);
+        let mut client = ClientConnection::new(cfg, inner_sni, &mut rng).unwrap();
 
         // First emitted record is the outer CH as a plaintext handshake
         // record. Extract the handshake message bytes (header + body).

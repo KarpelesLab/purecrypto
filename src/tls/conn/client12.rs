@@ -595,7 +595,19 @@ impl ClientConnection12 {
     /// Starts a client handshake to `server_name`, emitting the `ClientHello`.
     /// `rng` supplies the ephemeral key shares and the client random. Offers
     /// all six AEAD-ECDHE suites and both supported groups.
-    pub fn new<R: RngCore>(config: ClientConfig12, server_name: &str, rng: &mut R) -> Self {
+    ///
+    /// Errors with [`Error::NoUsableCipherSuites`] when a non-empty
+    /// [`ClientConfig12::cipher_suites`] restriction excludes every suite the
+    /// configured version range supports (AEAD table for ≥ 1.2 plus the
+    /// `tls-legacy` CBC table below 1.2) — failing closed at construction
+    /// instead of silently widening the offer back to the defaults. A
+    /// restriction matching only one side of the range simply leaves the
+    /// other versions un-negotiable.
+    pub fn new<R: RngCore>(
+        config: ClientConfig12,
+        server_name: &str,
+        rng: &mut R,
+    ) -> Result<Self, Error> {
         // Modern AEAD suites are offered when the client tops out at TLS 1.2
         // (always, unless `tls-legacy` lowered the max); the deprecated CBC
         // suites are appended when the floor was lowered below 1.2.
@@ -613,8 +625,8 @@ impl ClientConnection12 {
         #[cfg(not(feature = "tls-legacy"))]
         let suites: Vec<CipherSuite> = SUITES_12.iter().map(|p| p.suite).collect();
         // Apply the optional caller cipher-suite restriction (curl --ciphers).
-        let suites = super::select_offered_suites(&config.cipher_suites, &suites);
-        Self::new_with_offer(
+        let suites = super::select_offered_suites(&config.cipher_suites, &suites)?;
+        Ok(Self::new_with_offer(
             config,
             server_name,
             rng,
@@ -624,7 +636,7 @@ impl ClientConnection12 {
                 NamedGroup::SECP256R1,
                 NamedGroup::SECP384R1,
             ],
-        )
+        ))
     }
 
     /// Like [`new`](Self::new) but with an explicit cipher-suite and
@@ -2246,7 +2258,7 @@ mod tests {
     fn client12_build_client_hello() {
         let mut rng = HmacDrbg::<Sha256>::new(b"c12-ch", b"nonce", &[]);
         let cfg = ClientConfig12::new(RootCertStore::new());
-        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng);
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
         assert!(c.is_handshaking());
 
         let out = c.write_tls();
@@ -2322,7 +2334,8 @@ mod tests {
             ClientConfig12::new(RootCertStore::new()),
             "example.com",
             &mut rng,
-        );
+        )
+        .unwrap();
         let _ = c.write_tls();
 
         // Carry a `renegotiation_info` empty so we don't trip THAT check;
@@ -2344,7 +2357,8 @@ mod tests {
             ClientConfig12::new(RootCertStore::new()),
             "example.com",
             &mut rng,
-        );
+        )
+        .unwrap();
         let _ = c.write_tls();
 
         // Pick a suite we offered (AES-128-GCM/SHA256/RSA) but emit NO
@@ -2373,7 +2387,8 @@ mod tests {
             ClientConfig12::new(RootCertStore::new()),
             "example.com",
             &mut rng,
-        );
+        )
+        .unwrap();
         let _ = c.write_tls();
 
         // SH carries renegotiation_info (passes RFC 5746) but no
@@ -2399,7 +2414,8 @@ mod tests {
             ClientConfig12::new(RootCertStore::new()).with_require_ems(false),
             "example.com",
             &mut rng,
-        );
+        )
+        .unwrap();
         let _ = c.write_tls();
 
         let exts = alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])];
@@ -2425,7 +2441,8 @@ mod tests {
             ClientConfig12::new(RootCertStore::new()),
             "example.com",
             &mut rng,
-        );
+        )
+        .unwrap();
         let _ = c.write_tls();
 
         let exts = alloc::vec![

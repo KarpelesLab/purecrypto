@@ -213,6 +213,13 @@ pub enum Error {
     /// default like `"localhost"` (which would misdirect hostname
     /// verification and surface as an opaque `BadCertificate` later).
     MissingServerName,
+    /// The caller's [`crate::tls::Config::cipher_suites`] restriction
+    /// excludes every cipher suite the configured protocol version(s)
+    /// support, leaving the engine nothing to offer. We fail closed at
+    /// construction rather than silently widening the offer back to the
+    /// full default set — a typo'd suite ID must not re-enable suites the
+    /// caller deliberately disabled.
+    NoUsableCipherSuites,
 }
 
 impl core::fmt::Display for Error {
@@ -247,6 +254,9 @@ impl core::fmt::Display for Error {
             }
             Error::MissingServerName => {
                 f.write_str("client Config has no server_name (SNI / verify reference)")
+            }
+            Error::NoUsableCipherSuites => {
+                f.write_str("cipher_suites restriction matches no supported cipher suite")
             }
         }
     }

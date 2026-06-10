@@ -214,7 +214,8 @@ mod tests {
         let mut roots = RootCertStore::new();
         roots.add_der(cert_der).unwrap();
         let mut sock = TcpStream::connect(addr).unwrap();
-        let mut conn = ClientConnection::new(ClientConfig::new(roots), "localhost", &mut OsRng);
+        let mut conn =
+            ClientConnection::new(ClientConfig::new(roots), "localhost", &mut OsRng).unwrap();
         let mut tls = Stream::new(&mut conn, &mut sock);
         tls.complete_handshake().unwrap();
         tls.write_all(b"GET /").unwrap();

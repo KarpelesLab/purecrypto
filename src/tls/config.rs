@@ -165,11 +165,15 @@ pub struct Config {
     /// `None` (the default) offers the library's full curated set. When set,
     /// only suites that appear in BOTH this list and the engine's supported set
     /// are offered, ordered by this list — the seam for curl-style `--ciphers`
-    /// / `--tls13-ciphers`. A list that excludes every suite an engine supports
-    /// is ignored for that engine (it falls back to the full set) so the
-    /// ClientHello is never left with an empty suite list. Server-side and
-    /// TLS 1.3 vs 1.2 are both covered (mix 0x13xx and classic codepoints in
-    /// one list); the value is inert on the server.
+    /// / `--tls13-ciphers`. Fail-closed: a list that excludes every suite the
+    /// configured protocol version(s) support makes
+    /// [`Connection::client`](crate::tls::Connection::client) error with
+    /// [`Error::NoUsableCipherSuites`](crate::tls::Error::NoUsableCipherSuites)
+    /// instead of silently falling back to the full set (which would let a
+    /// typo'd suite ID re-enable everything). A list matching only some of
+    /// the enabled versions is fine — versions with no matching suite simply
+    /// cannot be negotiated. TLS 1.3 and 1.2 are both covered (mix 0x13xx
+    /// and classic codepoints in one list); the value is inert on the server.
     pub cipher_suites: Option<Vec<u16>>,
     /// `record_size_limit` extension (RFC 8449). `None` = library default.
     pub record_size_limit: Option<u16>,
@@ -442,8 +446,9 @@ impl ConfigBuilder {
     /// Restrict (and order) the client's offered cipher suites to the given
     /// IANA wire IDs — the seam for curl `--ciphers` / `--tls13-ciphers`. Only
     /// suites the engine also supports are offered, in this order; an empty
-    /// intersection for an engine falls back to its full set. See
-    /// [`Config::cipher_suites`].
+    /// intersection fails closed at construction with
+    /// [`Error::NoUsableCipherSuites`](crate::tls::Error::NoUsableCipherSuites).
+    /// See [`Config::cipher_suites`].
     pub fn cipher_suites(mut self, suites: &[u16]) -> Self {
         self.inner.cipher_suites = Some(suites.to_vec());
         self
