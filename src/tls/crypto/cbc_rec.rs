@@ -19,7 +19,9 @@
 //!
 //! To blunt **Lucky13**, the decrypt path also equalises the number of
 //! hash-compression blocks the MAC computation performs: after the real HMAC it
-//! runs `max_blocks - real_blocks` throwaway compression blocks (see
+//! runs throwaway compression work sized so that every path — minimal padding,
+//! maximal padding, and invalid padding alike — performs exactly
+//! `max_blocks + 1` content-dependent compressions (see
 //! [`CbcRecordCrypter::equalize_mac_blocks`]), so the total compression-call
 //! count is fixed by the public record length rather than the secret plaintext
 //! length. This is a best-effort equaliser built on the high-level hash API
@@ -514,17 +516,34 @@ impl CbcRecordCrypter {
         }
     }
 
-    /// Runs `max_blocks - real_blocks` throwaway hash-compression blocks so the
-    /// total compression-function call count of the MAC verification is fixed by
-    /// the public record length rather than the secret plaintext length (the
-    /// Lucky13 equaliser). `content_len` is the recovered plaintext length and
-    /// `total` the ciphertext length (a public multiple of the block size).
+    /// Runs throwaway hash-compression work so the total compression-function
+    /// call count of the MAC verification is fixed by the public record length
+    /// rather than the secret plaintext length (the Lucky13 equaliser).
+    /// `content_len` is the recovered plaintext length and `total` the
+    /// ciphertext length (a public multiple of the block size).
+    ///
+    /// # Compression accounting
     ///
     /// The TLS legacy MAC input is `header(13) || content`; SHA-1/SHA-256 hash
-    /// in 64-byte blocks and append a `0x80` byte + 8-byte length (≥9 bytes of
-    /// trailing overhead), so a message of `m` bytes occupies
-    /// `ceil((m + 9) / 64)` message blocks. The constant HMAC ipad/opad/outer
-    /// blocks do not depend on `content_len` and need no compensation.
+    /// in 64-byte blocks, and finalisation appends a `0x80` byte + 8-byte
+    /// length (9 bytes of trailing overhead), so hashing a message of `m`
+    /// bytes costs exactly `ceil((m + 9) / 64)` compression calls — note the
+    /// overhead spills into ONE ADDITIONAL block whenever `m` is a multiple of
+    /// 64. The HMAC above therefore performs
+    /// `real_blocks = ceil((13 + content_len + 9) / 64)` content-dependent
+    /// compressions (the constant ipad/opad/outer blocks do not depend on
+    /// `content_len` and need no compensation).
+    ///
+    /// With `extra = max_blocks - real_blocks`, we hash a dummy message of
+    /// `(extra + 1) * 64 - 9` bytes, which by the formula above costs exactly
+    /// `extra + 1` compressions (update + finalisation block included). Every
+    /// path — minimal padding (`extra == 0`), maximal padding, and invalid
+    /// padding (`content_len` masked to 0) — thus performs the same
+    /// `real_blocks + extra + 1 = max_blocks + 1` content-dependent
+    /// compressions in total. There is deliberately no `extra == 0` early
+    /// return: `extra` derives from the secret `content_len`, and skipping the
+    /// dummy hash on that one path would make minimal padding exactly one
+    /// compression cheaper than every other case — the Lucky13 distinguisher.
     fn equalize_mac_blocks(&self, content_len: usize, total: usize) {
         const BLOCK: usize = 64; // SHA-1 / SHA-256 compression block
         const OVERHEAD: usize = 9; // 0x80 + 8-byte length
@@ -535,10 +554,10 @@ impl CbcRecordCrypter {
         let real_blocks = (HEADER + content_len + OVERHEAD).div_ceil(BLOCK);
         let max_blocks = (HEADER + max_content + OVERHEAD).div_ceil(BLOCK);
         let extra = max_blocks.saturating_sub(real_blocks);
-        if extra == 0 {
-            return;
-        }
-        let dummy = vec![0u8; extra * BLOCK];
+        // `(extra + 1) * 64 - 9` bytes hash in exactly `extra + 1` compressions
+        // (see the accounting note above); run on every path, including
+        // `extra == 0`.
+        let dummy = vec![0u8; (extra + 1) * BLOCK - OVERHEAD];
         // The digest output is discarded — only the compression work matters.
         match self.mac {
             CbcMacAlg::Sha1 => {
@@ -669,11 +688,11 @@ impl CbcRecordCrypter {
         let computed_mac = self.compute_mac(ct, version, &buf[..content_len]);
         // Lucky13: the HMAC above processes a number of hash-compression blocks
         // that depends on the (secret) plaintext length, which leaks the padding
-        // length through timing. Equalise it by running the *difference* between
-        // this record's block count and the maximum possible block count as
-        // throwaway compression work, so the total number of compression calls
-        // is fixed by the public record length. (SSL 3.0 is POODLE-broken
-        // regardless, so the equaliser is skipped there.)
+        // length through timing. Equalise it with throwaway compression work
+        // sized so every path performs the same `max_blocks + 1` total
+        // compressions, fixed by the public record length (see
+        // `equalize_mac_blocks` for the exact accounting). (SSL 3.0 is
+        // POODLE-broken regardless, so the equaliser is skipped there.)
         if !self.ssl3 {
             self.equalize_mac_blocks(content_len, total);
         }
@@ -761,6 +780,111 @@ mod tests {
             ),
             Err(Error::BadRecordMac)
         ));
+    }
+
+    /// Builds `explicit_iv || CBC(content || MAC || pad)` by hand so the tests
+    /// can drive padding shapes `encrypt` never produces (multi-block padding,
+    /// corrupted padding, out-of-range padding length). Uses the crypter's
+    /// current `seq` (0 for a fresh crypter) for the MAC.
+    fn craft_record(enc: &CbcRecordCrypter, content: &[u8], pad: &[u8]) -> Vec<u8> {
+        let mac = enc.compute_mac(
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_1,
+            content,
+        );
+        let mut buf = content.to_vec();
+        buf.extend_from_slice(&mac);
+        buf.extend_from_slice(pad);
+        assert!(
+            buf.len().is_multiple_of(enc.block_size),
+            "test record must be block-aligned"
+        );
+        let iv = [0x55u8; 16];
+        enc.cipher.cbc_encrypt(&iv, &mut buf);
+        let mut rec = iv.to_vec();
+        rec.extend_from_slice(&buf);
+        rec
+    }
+
+    /// Exercises the padding extremes the Lucky13 equaliser distinguishes
+    /// between: minimal padding (`extra == 0`, the case the old equaliser
+    /// short-circuited), maximal multi-block padding, corrupted padding, and an
+    /// out-of-range padding length. The compression accounting itself is
+    /// pinned by `lucky13_equalizer_compression_accounting`.
+    #[test]
+    fn padding_extremes_and_invalid_padding() {
+        // Minimal padding: 11 content + 20 MAC + 1 pad byte = 32 = 2 blocks,
+        // i.e. content_len == max_content and the equaliser's `extra` is 0.
+        let (enc, mut dec) = pair(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        let content = [0xabu8; 11];
+        let rec = craft_record(&enc, &content, &[0u8]);
+        let got = dec
+            .decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec)
+            .expect("minimal padding decrypts");
+        assert_eq!(got, content);
+
+        // Maximal padding for a 4-block record: empty content + 20 MAC +
+        // 44 padding bytes (pad_len 43) = 64; the padding spans blocks.
+        let (enc, mut dec) = pair(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        let rec = craft_record(&enc, b"", &[43u8; 44]);
+        let got = dec
+            .decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec)
+            .expect("maximal padding decrypts");
+        assert!(got.is_empty());
+
+        // Invalid padding: one padding byte != pad_len → uniform BadRecordMac.
+        let (enc, mut dec) = pair(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        let mut pad = [43u8; 44];
+        pad[0] ^= 0x01;
+        let rec = craft_record(&enc, b"", &pad);
+        assert!(matches!(
+            dec.decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec),
+            Err(Error::BadRecordMac)
+        ));
+
+        // Padding length byte exceeding the record (255 in a 32-byte record):
+        // `content_len` is masked to 0 → uniform BadRecordMac.
+        let (enc, mut dec) = pair(CbcCipherAlg::Aes128, CbcMacAlg::Sha1, true);
+        let rec = craft_record(&enc, &[0xabu8; 11], &[0xffu8]);
+        assert!(matches!(
+            dec.decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec),
+            Err(Error::BadRecordMac)
+        ));
+    }
+
+    /// Pins the Lucky13 equaliser's compression accounting. Hashing `n` bytes
+    /// through a 64-byte Merkle–Damgård hash costs `ceil((n + 9) / 64)`
+    /// compressions (the 0x80 marker + 8-byte length spill into one extra
+    /// block when `n` is a multiple of 64), so the dummy length
+    /// `(extra + 1) * 64 - 9` chosen by `equalize_mac_blocks` must make
+    /// `real_blocks + dummy_compressions` a constant function of the public
+    /// record length — for EVERY recoverable `content_len`, including the
+    /// invalid-padding case (`content_len == 0`) and the minimal-padding case
+    /// (`content_len == max_content`, where the old early-out leaked one
+    /// compression).
+    #[test]
+    fn lucky13_equalizer_compression_accounting() {
+        // Compressions performed by update+finalize over an n-byte message.
+        let compressions = |n: usize| (n + 9).div_ceil(64);
+        const HEADER: usize = 13;
+        for mac_len in [20usize, 32] {
+            // All AES-block-aligned record lengths up to 1024 bytes.
+            for total in (1..=64).map(|b| b * 16).filter(|t| *t > mac_len) {
+                let max_content = total - mac_len - 1;
+                let max_blocks = compressions(HEADER + max_content);
+                for content_len in 0..=max_content {
+                    let real_blocks = compressions(HEADER + content_len);
+                    let extra = max_blocks - real_blocks;
+                    let dummy_len = (extra + 1) * 64 - 9;
+                    assert_eq!(
+                        real_blocks + compressions(dummy_len),
+                        max_blocks + 1,
+                        "total compressions must be constant \
+                         (mac_len={mac_len} total={total} content_len={content_len})"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
