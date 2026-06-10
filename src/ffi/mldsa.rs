@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::mldsa::{
     MlDsa44PrivateKey, MlDsa44PublicKey, MlDsa65PrivateKey, MlDsa65PublicKey, MlDsa87PrivateKey,
     MlDsa87PublicKey,
@@ -92,12 +92,17 @@ pub unsafe extern "C" fn pc_mldsa_private_to_pem(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = match unsafe { &*k } {
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = match unsafe { &*k } {
             PcMlDsa::L44(sk) => sk.to_pkcs8_pem(),
             PcMlDsa::L65(sk) => sk.to_pkcs8_pem(),
             PcMlDsa::L87(sk) => sk.to_pkcs8_pem(),
-        };
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        }
+        .into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 

@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::rng::OsRng;
 use crate::slhdsa::{ParamSet, PrivateKey};
 use crate::x509::AnyPublicKey;
@@ -92,8 +92,12 @@ pub unsafe extern "C" fn pc_slhdsa_private_to_pem(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = unsafe { &*k }.0.to_pkcs8_pem();
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = unsafe { &*k }.0.to_pkcs8_pem().into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 

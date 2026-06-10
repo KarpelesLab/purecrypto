@@ -14,7 +14,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::lms::{HssPrivateKey, LmotsType, LmsPrivateKey, LmsType, verify_hss, verify_lms};
 use crate::rng::OsRng;
 
@@ -92,7 +92,7 @@ fn lms_sig_len(lms: LmsType, ots: LmotsType) -> usize {
 fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
     let mut ser = key.to_bytes();
     let result = hss_sig_len_from_private_bytes(&ser);
-    super::common::wipe_vec(&mut ser);
+    wipe_vec(&mut ser);
     result
 }
 
@@ -176,7 +176,12 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { out_write(&(*k).0.to_bytes(), out, out_len) }
+        // The serialization carries the live seed material; wipe the
+        // temporary before its backing storage returns to the allocator.
+        let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
     })
 }
 
@@ -339,7 +344,12 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { out_write(&(*k).0.to_bytes(), out, out_len) }
+        // The serialization carries the live seed material; wipe the
+        // temporary before its backing storage returns to the allocator.
+        let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
     })
 }
 

@@ -20,7 +20,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::rng::OsRng;
 use crate::xmss::{
     XmssMtParamSet, XmssMtPrivateKey, XmssMtPublicKey, XmssParamSet, XmssPrivateKey, XmssPublicKey,
@@ -99,7 +99,12 @@ pub unsafe extern "C" fn pc_xmss_private_to_bytes(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { out_write(&(*k).0.to_bytes(), out, out_len) }
+        // The serialization carries the live seed material; wipe the
+        // temporary before its backing storage returns to the allocator.
+        let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
     })
 }
 
@@ -264,7 +269,12 @@ pub unsafe extern "C" fn pc_xmssmt_private_to_bytes(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        unsafe { out_write(&(*k).0.to_bytes(), out, out_len) }
+        // The serialization carries the live seed material; wipe the
+        // temporary before its backing storage returns to the allocator.
+        let mut ser = unsafe { &*k }.0.to_bytes();
+        let st = unsafe { out_write(&ser, out, out_len) };
+        wipe_vec(&mut ser);
+        st
     })
 }
 

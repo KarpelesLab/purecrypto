@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_array};
+use super::common::{PcStatus, guard, out_write, slice, wipe_array, wipe_vec};
 use crate::mlkem::{
     MlKem512Ciphertext, MlKem512DecapsKey, MlKem512EncapsKey, MlKem768Ciphertext,
     MlKem768DecapsKey, MlKem768EncapsKey, MlKem1024Ciphertext, MlKem1024DecapsKey,
@@ -94,12 +94,17 @@ pub unsafe extern "C" fn pc_mlkem_private_to_pem(
         if k.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = match unsafe { &*k } {
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = match unsafe { &*k } {
             PcMlKem::K512(sk) => sk.to_pkcs8_pem(),
             PcMlKem::K768(sk) => sk.to_pkcs8_pem(),
             PcMlKem::K1024(sk) => sk.to_pkcs8_pem(),
-        };
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        }
+        .into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 

@@ -85,8 +85,12 @@ pub unsafe extern "C" fn pc_ec_private_to_pem(
         if key.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = unsafe { &*key }.0.to_sec1_pem();
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = unsafe { &*key }.0.to_sec1_pem().into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 
@@ -250,8 +254,12 @@ pub unsafe extern "C" fn pc_ed25519_private_to_pem(
         if key.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = unsafe { &*key }.0.to_pkcs8_pem();
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = unsafe { &*key }.0.to_pkcs8_pem().into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 
@@ -392,8 +400,12 @@ pub unsafe extern "C" fn pc_ed448_private_to_pem(
         if key.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = unsafe { &*key }.0.to_pkcs8_pem();
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = unsafe { &*key }.0.to_pkcs8_pem().into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 

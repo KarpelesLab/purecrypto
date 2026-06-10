@@ -14,7 +14,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, slice, wipe_array, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
@@ -90,6 +90,17 @@ pub struct PcTlsCfg {
     verify_certs: bool,
     cookie_secret: Option<[u8; 32]>,
     no_cookie: bool,
+}
+
+impl Drop for PcTlsCfg {
+    fn drop(&mut self) {
+        // The DTLS cookie secret is long-lived key material; scrub it before
+        // the config's storage is handed back to the allocator on
+        // pc_tls_cfg_free.
+        if let Some(secret) = self.cookie_secret.as_mut() {
+            wipe_array(secret);
+        }
+    }
 }
 
 struct CertAndKey {

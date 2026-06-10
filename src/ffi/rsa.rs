@@ -25,8 +25,25 @@ pub struct PcRsaKey {
 
 impl PcRsaKey {
     fn from_pkcs1_der(der: Vec<u8>) -> Option<Self> {
-        let key = BoxedRsaPrivateKey::from_pkcs1_der(&der).ok()?;
+        let key = match BoxedRsaPrivateKey::from_pkcs1_der(&der) {
+            Ok(k) => k,
+            Err(_) => {
+                // `der` may still hold (partial) private material from a
+                // garbled key; scrub before the allocation is recycled.
+                let mut der = der;
+                wipe_vec(&mut der);
+                return None;
+            }
+        };
         Some(PcRsaKey { key, der })
+    }
+}
+
+impl Drop for PcRsaKey {
+    fn drop(&mut self) {
+        // The retained PKCS#1 DER carries the CRT primes; don't hand it back
+        // to the allocator un-scrubbed on pc_rsa_free.
+        wipe_vec(&mut self.der);
     }
 }
 
@@ -95,8 +112,12 @@ pub unsafe extern "C" fn pc_rsa_private_to_pem(
         if key.is_null() {
             return PcStatus::NullPointer;
         }
-        let pem = pem_encode(PEM_LABEL, &unsafe { &*key }.der);
-        unsafe { out_write(pem.as_bytes(), out, out_len) }
+        // The PEM is a re-encoding of the private key; wipe the temporary
+        // before its backing storage returns to the allocator.
+        let mut pem = pem_encode(PEM_LABEL, &unsafe { &*key }.der).into_bytes();
+        let st = unsafe { out_write(&pem, out, out_len) };
+        wipe_vec(&mut pem);
+        st
     })
 }
 
