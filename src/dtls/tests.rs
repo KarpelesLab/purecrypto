@@ -379,6 +379,144 @@ fn application_data_both_ways_12() {
     assert_eq!(client.take_received(), b"pong from server");
 }
 
+/// Pseudo-random garbage that does not resemble any valid DTLS record:
+/// the first byte (11) routes it down the legacy-header path, where the
+/// pseudo-random length bytes exceed `MAX_FRAGMENT` (RecordOverflow class).
+fn garbage_datagram() -> Vec<u8> {
+    (0..64u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(11))
+        .collect()
+}
+
+/// A syntactically valid 13-byte DTLS record header carrying a bogus
+/// protocol version (wrong-version class).
+fn wrong_version_record() -> Vec<u8> {
+    alloc::vec![
+        22u8, // handshake
+        0xde, 0xad, // bogus version
+        0x00, 0x00, // epoch 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x63, // seq = 99
+        0x00, 0x04, // length 4
+        0xaa, 0xbb, 0xcc, 0xdd,
+    ]
+}
+
+/// A DTLS 1.2 plaintext handshake record whose fragment is too short to be
+/// a handshake header (fragment-framing class, pre-authentication).
+fn short_fragment_record() -> Vec<u8> {
+    alloc::vec![
+        22u8, // handshake
+        0xfe, 0xfd, // DTLS 1.2
+        0x00, 0x00, // epoch 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x63, // seq = 99
+        0x00, 0x04, // length 4 (< 12-byte handshake header)
+        0xaa, 0xbb, 0xcc, 0xdd,
+    ]
+}
+
+/// Regression (RFC 6347 §4.1.2.7 — single-packet remote DoS): records an
+/// off-path attacker can trivially spoof toward an ESTABLISHED DTLS 1.2
+/// connection — (a) garbage, (b) a corrupted AEAD tag, (c) a wrong record
+/// version — must be SILENTLY discarded (`feed_datagram` returns `Ok`), and
+/// the connection must keep passing application data afterwards.
+#[test]
+fn spoofed_records_are_silently_dropped_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-spoof", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert!(pump_handshake(&mut client, &mut server));
+
+    // (a) Garbage datagram: silently dropped on both sides.
+    let garbage = garbage_datagram();
+    assert_eq!(client.feed_datagram(&garbage), Ok(()));
+    assert_eq!(server.feed_datagram(&garbage), Ok(()));
+
+    // (b) Valid records with a corrupted AEAD tag: silently dropped.
+    server.send(b"to-client").unwrap();
+    let s = server.pop_outbound_datagrams();
+    assert_eq!(s.len(), 1);
+    let mut tampered_s = s[0].clone();
+    let last = tampered_s.len() - 1;
+    tampered_s[last] ^= 0x5a;
+    assert_eq!(client.feed_datagram(&tampered_s), Ok(()));
+    assert!(client.take_received().is_empty());
+
+    client.send(b"to-server").unwrap();
+    let c = client.pop_outbound_datagrams();
+    assert_eq!(c.len(), 1);
+    let mut tampered_c = c[0].clone();
+    let last = tampered_c.len() - 1;
+    tampered_c[last] ^= 0x5a;
+    assert_eq!(server.feed_datagram(&tampered_c), Ok(()));
+    assert!(server.take_received().is_empty());
+
+    // (c) Wrong record version: silently dropped on both sides.
+    let bad_version = wrong_version_record();
+    assert_eq!(client.feed_datagram(&bad_version), Ok(()));
+    assert_eq!(server.feed_datagram(&bad_version), Ok(()));
+
+    // The untampered records still decrypt (the spoofs did not burn the
+    // replay slots or any connection state).
+    client.feed_datagram(&s[0]).unwrap();
+    assert_eq!(client.take_received(), b"to-client");
+    server.feed_datagram(&c[0]).unwrap();
+    assert_eq!(server.take_received(), b"to-server");
+
+    // And fresh application data keeps flowing both ways.
+    client.send(b"still alive c2s").unwrap();
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.take_received(), b"still alive c2s");
+    server.send(b"still alive s2c").unwrap();
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(client.take_received(), b"still alive s2c");
+}
+
+/// Regression (RFC 6347 §4.1.2.7): spoofed garbage / wrong-version /
+/// short-fragment records injected while the DTLS 1.2 handshake is still
+/// IN PROGRESS must not abort it — the handshake completes regardless.
+#[test]
+fn spoofed_records_during_handshake_are_ignored_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-spoof-hs", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    let spoofs = [
+        garbage_datagram(),
+        wrong_version_record(),
+        short_fragment_record(),
+    ];
+    // Interleave spoofed datagrams with every legitimate flight.
+    for _ in 0..32 {
+        for sp in &spoofs {
+            assert_eq!(client.feed_datagram(sp), Ok(()));
+            assert_eq!(server.feed_datagram(sp), Ok(()));
+        }
+        let c_out = client.pop_outbound_datagrams();
+        for dg in &c_out {
+            server.feed_datagram(dg).unwrap();
+        }
+        let s_out = server.pop_outbound_datagrams();
+        for dg in &s_out {
+            client.feed_datagram(dg).unwrap();
+        }
+        if c_out.is_empty() && s_out.is_empty() {
+            break;
+        }
+    }
+    assert!(client.is_handshake_complete());
+    assert!(server.is_handshake_complete());
+}
+
 /// RFC 5705 §4 — DTLS 1.2 exporter agrees on both sides for a given
 /// `(label, context)`, and the no-context vs empty-context branches differ.
 #[test]
@@ -1361,6 +1499,149 @@ mod dtls13 {
         // tampered attempt didn't burn the slot for seq=#2.
         client.feed_datagram(&s2[0]).unwrap();
         assert_eq!(client.take_received(), b"two");
+    }
+
+    /// A unified-header record claiming a Connection ID (unsupported —
+    /// header layout becomes unparseable for us).
+    fn cid_record() -> Vec<u8> {
+        let mut v = alloc::vec![0x3Cu8]; // 001 C=1 S=1 L=1 EE=00
+        v.extend_from_slice(&[0u8; 24]);
+        v
+    }
+
+    /// A unified-header record whose declared body is smaller than the
+    /// 16-byte AEAD tag (bogus by construction).
+    fn short_body_record() -> Vec<u8> {
+        // 0x2C = 001 C=0 S=1 L=1 EE=00; seq=0xBEEF, length=5.
+        alloc::vec![0x2Cu8, 0xBE, 0xEF, 0x00, 0x05, 1, 2, 3, 4, 5]
+    }
+
+    /// A well-formed unified-header record at a wrong epoch (low 2 bits =
+    /// 01 — neither the handshake epoch 2 nor the application epoch 3).
+    fn wrong_epoch_record() -> Vec<u8> {
+        let mut v = alloc::vec![0x2Du8, 0x12, 0x34, 0x00, 0x14]; // len 20
+        v.extend_from_slice(&[0x42u8; 20]);
+        v
+    }
+
+    /// Regression (RFC 9147 §4.5.2 — single-packet remote DoS): records an
+    /// off-path attacker can trivially spoof toward an ESTABLISHED DTLS 1.3
+    /// connection — (a) garbage, (b) a corrupted AEAD tag, (c) a wrong
+    /// record version, plus malformed / wrong-epoch unified headers — must
+    /// be SILENTLY discarded (`feed_datagram` returns `Ok`), and the
+    /// connection must keep passing application data afterwards.
+    #[test]
+    fn spoofed_records_are_silently_dropped_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-spoof", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Drop any residual post-handshake ACK records still queued so the
+        // datagram counts below are exact.
+        let _ = client.pop_outbound_datagrams();
+        let _ = server.pop_outbound_datagrams();
+
+        // (a) Garbage + malformed unified headers: silently dropped.
+        for sp in [
+            garbage_datagram(),
+            cid_record(),
+            short_body_record(),
+            wrong_epoch_record(),
+        ] {
+            assert_eq!(client.feed_datagram(&sp), Ok(()));
+            assert_eq!(server.feed_datagram(&sp), Ok(()));
+        }
+
+        // (b) Valid records with a corrupted AEAD tag: silently dropped.
+        server.send(b"to-client").unwrap();
+        let s = server.pop_outbound_datagrams();
+        assert_eq!(s.len(), 1);
+        let mut tampered_s = s[0].clone();
+        let last = tampered_s.len() - 1;
+        tampered_s[last] ^= 0x5a;
+        assert_eq!(client.feed_datagram(&tampered_s), Ok(()));
+        assert!(client.take_received().is_empty());
+
+        client.send(b"to-server").unwrap();
+        let c = client.pop_outbound_datagrams();
+        assert_eq!(c.len(), 1);
+        let mut tampered_c = c[0].clone();
+        let last = tampered_c.len() - 1;
+        tampered_c[last] ^= 0x5a;
+        assert_eq!(server.feed_datagram(&tampered_c), Ok(()));
+        assert!(server.take_received().is_empty());
+
+        // (c) Wrong record version on the legacy-header path, and a
+        // spoofed plaintext handshake record post-handshake: dropped.
+        for sp in [wrong_version_record(), short_fragment_record()] {
+            assert_eq!(client.feed_datagram(&sp), Ok(()));
+            assert_eq!(server.feed_datagram(&sp), Ok(()));
+        }
+
+        // The untampered records still decrypt (the spoofs did not burn
+        // the replay slots or any connection state).
+        client.feed_datagram(&s[0]).unwrap();
+        assert_eq!(client.take_received(), b"to-client");
+        server.feed_datagram(&c[0]).unwrap();
+        assert_eq!(server.take_received(), b"to-server");
+
+        // And fresh application data keeps flowing both ways.
+        client.send(b"still alive c2s").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"still alive c2s");
+        server.send(b"still alive s2c").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"still alive s2c");
+    }
+
+    /// Regression (RFC 9147 §4.5.2): spoofed garbage / wrong-version /
+    /// malformed-unified-header records injected while the DTLS 1.3
+    /// handshake is still IN PROGRESS must not abort it.
+    #[test]
+    fn spoofed_records_during_handshake_are_ignored_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-spoof-hs", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        let spoofs = [
+            garbage_datagram(),
+            wrong_version_record(),
+            short_fragment_record(),
+            cid_record(),
+            short_body_record(),
+            wrong_epoch_record(),
+        ];
+        // Interleave spoofed datagrams with every legitimate flight.
+        for _ in 0..32 {
+            for sp in &spoofs {
+                assert_eq!(client.feed_datagram(sp), Ok(()));
+                assert_eq!(server.feed_datagram(sp), Ok(()));
+            }
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        assert!(client.is_handshake_complete());
+        assert!(server.is_handshake_complete());
     }
 }
 

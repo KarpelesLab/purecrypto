@@ -394,10 +394,14 @@ impl DtlsClientConnection12 {
     pub fn feed_datagram(&mut self, datagram: &[u8]) -> Result<(), Error> {
         let mut off = 0usize;
         while off < datagram.len() {
-            let Some(rec) = record::read_record(&datagram[off..])? else {
-                // Truncated trailing record — DTLS drops malformed records
-                // silently rather than failing the connection.
-                return Ok(());
+            // Truncated trailing record, or a header whose declared length
+            // is bogus (RecordOverflow): record framing is lost for the
+            // rest of the datagram. RFC 6347 §4.1.2.7 requires invalid
+            // records to be silently discarded — a single spoofed datagram
+            // must never be fatal.
+            let rec = match record::read_record(&datagram[off..]) {
+                Ok(Some(rec)) => rec,
+                Ok(None) | Err(_) => return Ok(()),
             };
             off += rec.len;
             self.process_record(rec)?;
@@ -405,12 +409,17 @@ impl DtlsClientConnection12 {
         Ok(())
     }
 
+    /// Processes one DTLS record.
+    ///
+    /// Per RFC 6347 §4.1.2.7, records that fail record-layer sanity checks
+    /// (bad version, wrong epoch, failed AEAD, unexpected content type) are
+    /// SILENTLY discarded — they are trivially spoofable by an off-path
+    /// attacker and must never be connection-fatal.
     fn process_record(&mut self, rec: ParsedDtlsRecord<'_>) -> Result<(), Error> {
-        // Version check: accept DTLS 1.2 + DTLS 1.0 (RFC 6347 says
-        // implementations should ignore mismatches if version is plausibly
-        // DTLS; we'll be strict and require DTLSv1.2).
+        // Version check: accept DTLS 1.2 + DTLS 1.0. Anything else is
+        // silently dropped.
         if rec.version != ProtocolVersion::DTLSv1_2 && rec.version != ProtocolVersion::DTLSv1_0 {
-            return Err(Error::UnsupportedVersion);
+            return Ok(());
         }
 
         // Epoch must be either current read_epoch or one ahead (after server
@@ -437,42 +446,66 @@ impl DtlsClientConnection12 {
         match rec.content_type {
             ContentType::ChangeCipherSpec => {
                 // RFC 6347 §4.1: the only legal CCS body is `[0x01]`. CCS is
-                // at epoch 0 (still plaintext); installing the read crypter
-                // bumps read_epoch to 1.
+                // at epoch 0 (still plaintext, spoofable); installing the
+                // read crypter bumps read_epoch to 1. Every rejection here
+                // is a silent drop.
                 if rec.fragment != [0x01] {
-                    return Err(Error::UnexpectedMessage);
+                    return Ok(());
                 }
                 if self.ccs_received {
                     // Drop duplicates.
                     return Ok(());
                 }
-                let c = self.read_crypter.take().ok_or(Error::UnexpectedMessage)?;
-                self.read_crypter = Some(c);
+                if self.read_crypter.is_none() {
+                    // CCS before the read keys exist (spoofed, or badly
+                    // reordered): ignore — a real server retransmits.
+                    return Ok(());
+                }
                 self.ccs_received = true;
                 self.read_epoch = 1;
                 self.replay = AntiReplayWindow::new();
                 Ok(())
             }
             ContentType::Handshake => {
-                let plain: Vec<u8> = if self.read_epoch >= 1 {
+                let plain: Vec<u8>;
+                let authenticated;
+                if self.read_epoch >= 1 {
                     let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-                    let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
-                    let p = c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)?;
+                    let Some(c) = self.read_crypter.as_ref() else {
+                        return Ok(());
+                    };
+                    let Ok(p) = c.decrypt_dtls(combined, ContentType::Handshake, rec.fragment)
+                    else {
+                        // AEAD failure: silent drop (RFC 6347 §4.1.2.7) —
+                        // a spoofed datagram must not kill the connection.
+                        // The replay window was deliberately not advanced.
+                        return Ok(());
+                    };
                     // AEAD verified: commit to the window only now.
                     self.replay.mark(rec.seq);
-                    p
+                    plain = p;
+                    authenticated = true;
                 } else {
-                    rec.fragment.to_vec()
-                };
-                self.process_handshake_record(&plain)
+                    plain = rec.fragment.to_vec();
+                    authenticated = false;
+                }
+                self.process_handshake_record(&plain, authenticated)
             }
             ContentType::ApplicationData => {
                 if self.read_epoch < 1 {
-                    return Err(Error::UnexpectedMessage);
+                    // Plaintext application data is spoofable: silent drop.
+                    return Ok(());
                 }
                 let combined = ((self.read_epoch as u64) << 48) | rec.seq;
-                let c = self.read_crypter.as_ref().ok_or(Error::UnexpectedMessage)?;
-                let plain = c.decrypt_dtls(combined, ContentType::ApplicationData, rec.fragment)?;
+                let Some(c) = self.read_crypter.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(plain) =
+                    c.decrypt_dtls(combined, ContentType::ApplicationData, rec.fragment)
+                else {
+                    // AEAD failure: silent drop, window not advanced.
+                    return Ok(());
+                };
                 // AEAD verified: commit to the window only now.
                 self.replay.mark(rec.seq);
                 self.app_in.extend_from_slice(&plain);
@@ -483,14 +516,31 @@ impl DtlsClientConnection12 {
                 // would surface them.
                 Ok(())
             }
-            _ => Err(Error::UnexpectedMessage),
+            // Unknown / unexpected content type: silent discard.
+            _ => Ok(()),
         }
     }
 
-    fn process_handshake_record(&mut self, plain: &[u8]) -> Result<(), Error> {
+    /// Processes the handshake fragments in one record body.
+    ///
+    /// `authenticated` is true when the bytes came out of a successfully
+    /// AEAD-verified record (epoch ≥ 1). Framing errors in unauthenticated
+    /// (plaintext, epoch-0) records are attacker-spoofable and dropped
+    /// silently; the same errors in authenticated records are genuine peer
+    /// faults and stay fatal.
+    fn process_handshake_record(&mut self, plain: &[u8], authenticated: bool) -> Result<(), Error> {
         let mut off = 0;
         while off < plain.len() {
-            let frag = read_fragment(&plain[off..])?;
+            let frag = match read_fragment(&plain[off..]) {
+                Ok(f) => f,
+                Err(e) => {
+                    if authenticated {
+                        return Err(e);
+                    }
+                    // Silently drop the rest of this spoofable record.
+                    return Ok(());
+                }
+            };
             let consumed = frag.len;
             // Special-case HelloVerifyRequest: it has the unusual property
             // of NOT incrementing the client's reassembler message_seq

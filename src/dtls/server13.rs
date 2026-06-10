@@ -369,8 +369,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         while off < datagram.len() {
             let first = datagram[off];
             if first < 32 {
-                let Some(rec) = record::read_record(&datagram[off..])? else {
-                    return Ok(());
+                // A truncated trailing record or a bogus declared length
+                // (RecordOverflow) means framing is lost for the rest of the
+                // datagram: silently discard (RFC 9147 §4.5.2) — a single
+                // spoofed datagram must never be fatal.
+                let rec = match record::read_record(&datagram[off..]) {
+                    Ok(Some(rec)) => rec,
+                    Ok(None) | Err(_) => return Ok(()),
                 };
                 off += rec.len;
                 self.process_plaintext_record(rec)?;
@@ -387,40 +392,81 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         Ok(())
     }
 
+    /// Processes one legacy-framed plaintext record (epoch 0).
+    ///
+    /// Everything in here is unauthenticated, attacker-spoofable input, so
+    /// per RFC 9147 §4.5.2 every rejection is a silent drop — never fatal.
     fn process_plaintext_record(&mut self, rec: ParsedDtlsRecord<'_>) -> Result<(), Error> {
         if rec.version != ProtocolVersion::DTLSv1_2 && rec.version != ProtocolVersion::DTLSv1_0 {
-            return Err(Error::UnsupportedVersion);
+            // Unknown record version: silently discard.
+            return Ok(());
         }
         if rec.epoch != 0 {
             return Ok(());
         }
         match rec.content_type {
-            ContentType::Handshake => self.process_handshake_record(rec.fragment),
+            ContentType::Handshake => {
+                // Plaintext handshake records are only meaningful while we
+                // still await a ClientHello. Afterwards (and in particular
+                // once connected) they are trivially spoofable and must not
+                // be able to affect the connection.
+                if matches!(
+                    self.state,
+                    State::WaitFirstClientHello | State::WaitSecondClientHello
+                ) {
+                    self.process_handshake_record(rec.fragment, false)
+                } else {
+                    Ok(())
+                }
+            }
             ContentType::Alert => Ok(()),
             ContentType::ChangeCipherSpec => Ok(()),
-            _ => Err(Error::UnexpectedMessage),
+            // Unknown / unexpected plaintext content type: silent discard.
+            _ => Ok(()),
         }
     }
 
+    /// Processes one unified-header protected record, returning the number
+    /// of bytes consumed from `buf` (0 = couldn't parse, drop datagram).
+    ///
+    /// Until the AEAD tag verifies, everything in here is unauthenticated,
+    /// attacker-spoofable input — per RFC 9147 §4.5.2 every rejection is a
+    /// silent drop (skip the record, or the rest of the datagram where
+    /// framing is lost), never connection-fatal.
     fn process_protected_record(&mut self, buf: &[u8]) -> Result<usize, Error> {
-        let (hdr_len, body_len) = peek_header_layout(buf)?;
+        // A malformed unified header means framing is lost: drop the rest
+        // of the datagram.
+        let Ok((hdr_len, body_len)) = peek_header_layout(buf) else {
+            return Ok(0);
+        };
         let total = hdr_len + body_len;
         if total > buf.len() {
             return Ok(0);
         }
         let body = &buf[hdr_len..total];
         if body.len() < 16 {
-            return Err(Error::Decode);
+            // Smaller than the AEAD tag alone — bogus; skip this record.
+            return Ok(total);
         }
-        let suite = self.suite.ok_or(Error::UnexpectedMessage)?;
-        let sn_key = self.read_sn_key.as_ref().ok_or(Error::UnexpectedMessage)?;
-        let mask_full = sn_mask_for(suite, sn_key, body)?;
+        // A protected record that arrives before the protected read keys
+        // exist is unprocessable — skip it.
+        let Some(suite) = self.suite else {
+            return Ok(total);
+        };
+        let Some(sn_key) = self.read_sn_key.as_ref() else {
+            return Ok(total);
+        };
+        let Ok(mask_full) = sn_mask_for(suite, sn_key, body) else {
+            return Ok(total);
+        };
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
             &mask_full[..2]
         } else {
             &mask_full[..1]
         };
-        let (hdr, ct_body) = record13::decode_record(buf, mask)?;
+        let Ok((hdr, ct_body)) = record13::decode_record(buf, mask) else {
+            return Ok(total);
+        };
         let consumed = hdr.header_len + ct_body.len();
 
         let read_epoch = self.current_read_epoch();
@@ -448,8 +494,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if !self.read_replay.check(seq) {
             return Ok(consumed);
         }
-        let crypter = self.read_crypter.as_mut().ok_or(Error::UnexpectedMessage)?;
-        let (inner_type, plain) = decrypt_dtls13_record(crypter, seq, &aad, ct_body)?;
+        let Some(crypter) = self.read_crypter.as_mut() else {
+            return Ok(consumed);
+        };
+        let Ok((inner_type, plain)) = decrypt_dtls13_record(crypter, seq, &aad, ct_body) else {
+            // AEAD authentication failed — a single spoofed datagram must
+            // not kill the connection (RFC 9147 §4.5.2): silent drop. The
+            // replay window was deliberately not advanced.
+            return Ok(consumed);
+        };
         // RFC 9147 §4.5.1: AEAD verified — now commit to the window.
         self.read_replay.mark(seq);
         if seq > self.enc_read_seq {
@@ -466,8 +519,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             });
         }
 
+        // Past this point the record is authenticated: protocol violations
+        // below come from the genuine peer and remain fatal.
         match inner_type {
-            ContentType::Handshake => self.process_handshake_record(&plain)?,
+            ContentType::Handshake => self.process_handshake_record(&plain, true)?,
             ContentType::ApplicationData => {
                 if self.state != State::Connected {
                     return Err(Error::UnexpectedMessage);
@@ -492,10 +547,25 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
     }
 
-    fn process_handshake_record(&mut self, plain: &[u8]) -> Result<(), Error> {
+    /// Processes the handshake fragments in one record body.
+    ///
+    /// `authenticated` is true when the bytes came out of a successfully
+    /// AEAD-verified record. Framing errors in unauthenticated (plaintext)
+    /// records are attacker-spoofable and dropped silently; the same errors
+    /// in authenticated records are genuine peer faults and stay fatal.
+    fn process_handshake_record(&mut self, plain: &[u8], authenticated: bool) -> Result<(), Error> {
         let mut off = 0;
         while off < plain.len() {
-            let frag = read_fragment(&plain[off..])?;
+            let frag = match read_fragment(&plain[off..]) {
+                Ok(f) => f,
+                Err(e) => {
+                    if authenticated {
+                        return Err(e);
+                    }
+                    // Silently drop the rest of this spoofable record.
+                    return Ok(());
+                }
+            };
             let consumed = frag.len;
             if self.reassembler.is_none() {
                 // Pre-state path: only ClientHello allowed. A multi-group
@@ -504,7 +574,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 // reassembler (RFC 9147 §5.5) and only dispatch once the
                 // full body is in hand.
                 if frag.msg_type != hs_type::CLIENT_HELLO {
-                    return Err(Error::UnexpectedMessage);
+                    // Unauthenticated epoch-0 input: silently drop the rest
+                    // of the record rather than killing the connection.
+                    return Ok(());
                 }
                 let msg_seq = frag.message_seq;
                 // F3: reject an implausibly large `message_seq` BEFORE seeding
