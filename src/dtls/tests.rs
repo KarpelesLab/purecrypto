@@ -1329,6 +1329,81 @@ mod dtls13 {
         );
     }
 
+    /// RFC 9147 / RFC 8446 §6.1: an authenticated close_notify from the
+    /// peer is a clean shutdown — the connection leaves the Connected
+    /// state and refuses further sends, with no error surfaced.
+    #[test]
+    fn close_notify_closes_connection_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-closenotify", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Server → client: warning-level close_notify (level 1, desc 0).
+        server.send_alert_record_for_test(1, 0);
+        for dg in server.pop_outbound_datagrams() {
+            // Clean shutdown: no error surfaced.
+            client.feed_datagram(&dg).unwrap();
+        }
+        assert!(
+            !client.is_handshake_complete(),
+            "close_notify must leave the Connected state"
+        );
+        assert!(
+            client.send(b"after close").is_err(),
+            "sends after close_notify must be refused"
+        );
+
+        // And the mirror direction: client → server.
+        let (server_cfg2, cert2) = make_server13();
+        let server_cfg2 = server_cfg2.with_no_cookie();
+        let mut client2 = make_client13(&cert2);
+        let srng2 = HmacDrbg::<Sha256>::new(b"dtls13-server-closenotify2", b"nonce", &[]);
+        let mut server2 =
+            DtlsServerConnection13::new(Arc::new(server_cfg2), b"client-addr".to_vec(), srng2);
+        assert!(pump_handshake_13(&mut client2, &mut server2));
+        client2.send_alert_record_for_test(1, 0);
+        for dg in client2.pop_outbound_datagrams() {
+            server2.feed_datagram(&dg).unwrap();
+        }
+        assert!(!server2.is_handshake_complete());
+        assert!(server2.send(b"after close").is_err());
+    }
+
+    /// RFC 8446 §6: every alert other than close_notify is fatal in (D)TLS
+    /// 1.3 — the receiver must surface `Error::AlertReceived` and close.
+    /// Previously authenticated alerts were decrypted and silently
+    /// discarded.
+    #[test]
+    fn fatal_alert_surfaces_error_13() {
+        use crate::tls::{AlertDescription, Error};
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-fatalalert", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Client → server: fatal handshake_failure (level 2, desc 40).
+        client.send_alert_record_for_test(2, 40);
+        let mut got = None;
+        for dg in client.pop_outbound_datagrams() {
+            if let Err(e) = server.feed_datagram(&dg) {
+                got = Some(e);
+            }
+        }
+        assert_eq!(
+            got,
+            Some(Error::AlertReceived(AlertDescription::HandshakeFailure))
+        );
+        assert!(!server.is_handshake_complete());
+        assert!(server.send(b"after fatal alert").is_err());
+    }
+
     /// Regression (retransmit GiveUp must not kill established connections):
     /// after a completed DTLS 1.3 handshake, neither side may have a
     /// handshake retransmit armed (the client's epoch-0 ClientHello is

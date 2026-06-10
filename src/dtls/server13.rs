@@ -42,7 +42,7 @@ use crate::tls::crypto::{
     finished_verify_data, supported_suites,
 };
 use crate::tls::keylog::KeyLog;
-use crate::tls::{ContentType, Error, ProtocolVersion};
+use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -570,7 +570,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 }
                 self.app_in.extend_from_slice(&plain);
             }
-            ContentType::Alert => {}
+            ContentType::Alert => self.process_peer_alert(&plain)?,
             ContentType::Unknown(t) if t == ACK_CONTENT_TYPE => {
                 let acks = decode_ack(&plain)?;
                 self.retransmit.on_ack(&acks);
@@ -578,6 +578,27 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             _ => return Err(Error::UnexpectedMessage),
         }
         Ok(consumed)
+    }
+
+    /// Handles an authenticated peer alert (RFC 9147 §4: once keys exist,
+    /// alerts travel inside protected records; the payload is the 2-byte
+    /// TLS alert `level ‖ description`). Mirrors the TLS engines:
+    /// `close_notify` is a clean shutdown (state → Closed, no error); every
+    /// other alert is fatal per RFC 8446 §6 and surfaced as
+    /// [`Error::AlertReceived`].
+    fn process_peer_alert(&mut self, plain: &[u8]) -> Result<(), Error> {
+        // The record authenticated, so a malformed alert is a genuine peer
+        // fault (RFC 8446 §6: an alert is exactly two bytes).
+        if plain.len() != 2 {
+            return Err(Error::Decode);
+        }
+        let desc = AlertDescription::from_u8(plain[1]);
+        self.state = State::Closed;
+        if desc == AlertDescription::CloseNotify {
+            Ok(())
+        } else {
+            Err(Error::AlertReceived(desc))
+        }
     }
 
     fn current_read_epoch(&self) -> u16 {
@@ -1495,6 +1516,17 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         {
             self.out_dgrams.push(dg);
         }
+    }
+
+    /// Test-only: queues a raw 2-byte alert (`level ‖ description`) under
+    /// the current protected write key, so loopback tests can exercise the
+    /// peer's authenticated-alert path without widening the public API.
+    #[cfg(test)]
+    pub(crate) fn send_alert_record_for_test(&mut self, level: u8, description: u8) {
+        let dg = self
+            .encrypt_protected_record(ContentType::Alert, &[level, description])
+            .expect("protected write keys installed");
+        self.out_dgrams.push(dg);
     }
 
     /// Generates the server-side ephemeral share and derives the
