@@ -32,6 +32,46 @@
 //! it indefinitely, yet long enough that a slow legitimate client doesn't
 //! get bounced.
 //!
+//! ## Clock requirement (fail-closed)
+//!
+//! `now_secs == 0` is the engine's "no clock configured" sentinel (the
+//! connection's counter defaults to 0 until
+//! [`set_now_secs`](crate::quic::QuicConnection::set_now_secs) is called).
+//! A server without a clock cannot time-bound tokens — a token minted at
+//! `ts = 0` and validated against a forever-`0` clock would never expire.
+//! [`validate`] therefore rejects `now_secs == 0` outright, and the
+//! retry-emission path in `connection.rs` checks the clock *before*
+//! minting, so no token is ever issued that the server could not later
+//! validate (which would livelock a legitimate client in a Retry loop).
+//! With the clock unset, Retry-based address validation is simply
+//! unavailable and the server falls back to the RFC 9000 §8.1 3×
+//! anti-amplification limit.
+//!
+//! ## Replay within the token lifetime
+//!
+//! The token is *stateless by design* (RFC 9000 §8.1.2): the server keeps
+//! no spent-token set, so the same token validates repeatedly until it
+//! ages out. What an attacker gains from this is narrow:
+//!
+//! * The token binds the full client 4-tuple endpoint — 16 bytes of
+//!   (IPv4-mapped) IPv6 address **and** the 2-byte UDP port — so a replay
+//!   only validates from the exact `ip:port` the original Initial came
+//!   from. An off-path attacker who captured the token must also spoof
+//!   that source address *and* be able to complete a handshake whose
+//!   return traffic it cannot see.
+//! * Re-validating only marks the address as validated (lifting the 3×
+//!   AMP cap) and pins the ODCID; the subsequent handshake still has to
+//!   echo the token's ODCID in the server transport parameters
+//!   (RFC 9000 §7.3), which the engine verifies downstream. A replayed
+//!   token therefore buys at most the AMP-cap exemption for a peer that
+//!   already proved ownership of that exact address within the last
+//!   [`MAX_TOKEN_AGE_SECS`] — which is precisely what address validation
+//!   is meant to establish.
+//!
+//! Single-use tracking would contradict the stateless design; the bounded
+//! 5-minute window plus full-address binding is the accepted trade-off
+//! (and matches quiche / ngtcp2 / msquic behaviour).
+//!
 //! ## Constant-time HMAC comparison
 //!
 //! [`Hmac::verify`](crate::hash::Hmac::verify) uses
@@ -66,6 +106,11 @@ const TAG_LEN: usize = 16;
 /// Mints a retry token binding `(client_addr_bytes, odcid, now_secs)` under
 /// `retry_secret`. Length of the returned `Vec` is
 /// `18 + 1 + odcid.len() + 8 + 16`.
+///
+/// `now_secs` must be nonzero — 0 is the "no clock configured" sentinel,
+/// and [`validate`] rejects it unconditionally, so a token minted at 0
+/// could never be redeemed. Callers (see `maybe_emit_retry` in
+/// `connection.rs`) check the clock before minting.
 pub(crate) fn mint(
     retry_secret: &[u8; 32],
     client_addr_bytes: &[u8; CLIENT_ADDR_BYTES],
@@ -73,6 +118,10 @@ pub(crate) fn mint(
     now_secs: u64,
 ) -> Vec<u8> {
     debug_assert!(odcid.len() <= 20, "QUIC v1 CID length must be ≤ 20 bytes");
+    debug_assert!(
+        now_secs != 0,
+        "retry tokens must not be minted without a clock (now_secs == 0)"
+    );
     let mut out = Vec::with_capacity(CLIENT_ADDR_BYTES + 1 + odcid.len() + 8 + TAG_LEN);
     out.extend_from_slice(client_addr_bytes);
     out.push(odcid.len() as u8);
@@ -88,6 +137,8 @@ pub(crate) fn mint(
 /// Validates a retry token. Returns the bound ODCID on success.
 ///
 /// Failure modes:
+/// * `now_secs == 0` (no clock configured — token age cannot be bounded,
+///   fail closed) → [`Error::Decode`].
 /// * Malformed wire syntax → [`Error::Decode`].
 /// * Client address mismatch (the address bytes in the token don't equal
 ///   `client_addr_bytes`) → [`Error::Decode`].
@@ -100,6 +151,15 @@ pub(crate) fn validate(
     token: &[u8],
     now_secs: u64,
 ) -> Result<Vec<u8>, Error> {
+    // Fail-closed clock check: with `now_secs == 0` (the "clock never
+    // configured" default) the age comparison below degenerates — every
+    // token minted at ts = 0 would stay valid forever. No token is ever
+    // minted without a clock (see `maybe_emit_retry`), so anything
+    // presented to a clock-less server is stale or forged; reject.
+    if now_secs == 0 {
+        return Err(Error::Decode);
+    }
+
     // Minimum: 18 addr + 1 odcid_len + 0 odcid + 8 ts + 16 tag = 43.
     if token.len() < CLIENT_ADDR_BYTES + 1 + 8 + TAG_LEN {
         return Err(Error::Decode);
@@ -222,6 +282,39 @@ mod tests {
         assert!(err.is_err());
     }
 
+    /// The token binds the UDP port, not just the IP: a token minted for
+    /// `ip:4433` must not validate for the same IP on a different port
+    /// (limits replay to the exact observed 4-tuple endpoint).
+    #[test]
+    fn retry_token_rejects_wrong_port() {
+        let secret = fixed_secret();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let addr1 = encode_addr(&SocketAddr::new(ip, 4433));
+        let addr2 = encode_addr(&SocketAddr::new(ip, 4434));
+        let odcid = [0xbb; 8];
+        let tok = mint(&secret, &addr1, &odcid, 1000);
+        assert!(validate(&secret, &addr2, &tok, 1000).is_err());
+        // Sanity: the original port still validates.
+        assert!(validate(&secret, &addr1, &tok, 1000).is_ok());
+    }
+
+    /// Fail-closed: a validator whose clock was never configured
+    /// (`now_secs == 0`) rejects every token, even a perfectly well-formed
+    /// one — otherwise tokens would never age out.
+    #[test]
+    fn retry_token_rejects_clock_unset_validator() {
+        let secret = fixed_secret();
+        let addr = encode_addr(&SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
+            4433,
+        ));
+        let tok = mint(&secret, &addr, &[0xcc; 8], 1000);
+        // Same token is valid with a real clock...
+        assert!(validate(&secret, &addr, &tok, 1000).is_ok());
+        // ...but a clock-less server must reject it.
+        assert!(validate(&secret, &addr, &tok, 0).is_err());
+    }
+
     #[test]
     fn retry_token_rejects_wrong_secret() {
         let secret_a = fixed_secret();
@@ -290,9 +383,10 @@ mod tests {
     fn retry_token_rejects_short_token() {
         let secret = fixed_secret();
         let addr = encode_addr(&SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0));
-        // Any sub-43-byte input is structurally invalid.
-        assert!(validate(&secret, &addr, &[], 0).is_err());
-        assert!(validate(&secret, &addr, &[0u8; 42], 0).is_err());
+        // Any sub-43-byte input is structurally invalid. (Nonzero clock so
+        // the length check, not the clock check, is what rejects.)
+        assert!(validate(&secret, &addr, &[], 100).is_err());
+        assert!(validate(&secret, &addr, &[0u8; 42], 100).is_err());
     }
 
     #[test]

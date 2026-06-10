@@ -22,7 +22,7 @@
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::util::{Args, die};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
@@ -34,6 +34,18 @@ use purecrypto::tls::{
 };
 use purecrypto::x509::Certificate;
 use std::sync::Arc;
+
+/// Wall-clock seconds since the Unix epoch, for the QUIC retry-token
+/// clock ([`QuicConnection::set_now_secs`]). The engine treats 0 as "no
+/// clock configured" and disables stateless Retry fail-closed, so a
+/// pre-epoch system clock (which maps to 0 here) simply turns the
+/// `-retry` flag into a no-op rather than minting unexpirable tokens.
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Parses a comma-separated ALPN list ("h3,hq-interop") into bytes vectors.
 fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
@@ -311,6 +323,9 @@ pub(crate) fn run_server(args: Args) {
     let mut qc =
         QuicConnection::server(qcfg).unwrap_or_else(|e| die(format!("QUIC server build: {e:?}")));
     qc.set_peer_addr(peer);
+    // Retry tokens are time-bounded; the engine fails closed (no Retry at
+    // all) unless a nonzero clock is supplied before the first feed.
+    qc.set_now_secs(unix_now_secs());
     qc.feed_datagram_from(peer, &buf[..n])
         .unwrap_or_else(|e| die(format!("QUIC initial feed_datagram failed: {e:?}")));
 
@@ -372,6 +387,10 @@ fn drive_quic_handshake(
         //    is informational (already locked in by `connect()`).
         match sock.recv(&mut buf) {
             Ok(n) if n > 0 => {
+                // Refresh the retry-token clock before each feed so token
+                // expiry tracks real elapsed time (server side; a no-op
+                // on the client, which ignores `now_secs`).
+                qc.set_now_secs(unix_now_secs());
                 let res = if let Some(addr) = peer_addr {
                     qc.feed_datagram_from(addr, &buf[..n])
                 } else {

@@ -405,6 +405,14 @@ pub unsafe extern "C" fn pc_quic_cfg_set_max_datagram_frame_size(
 /// secret is generated internally on [`pc_quic_new`] when this is set.
 /// Ignored on the client side.
 ///
+/// Retry tokens are time-bounded (5-minute lifetime). The C API sources
+/// the required clock internally from system time — it is set on
+/// [`pc_quic_new`] and refreshed before each [`pc_quic_feed_datagram`].
+/// If the system clock reads before the Unix epoch the engine fails
+/// closed: no Retry is emitted and no token is accepted (address
+/// validation falls back to the RFC 9000 §8.1 3× anti-amplification
+/// limit).
+///
 /// # Safety
 /// `cfg` valid.
 #[unsafe(no_mangle)]
@@ -421,9 +429,26 @@ pub unsafe extern "C" fn pc_quic_cfg_set_require_retry(
     })
 }
 
+/// Wall-clock seconds since the Unix epoch, for the retry-token clock
+/// ([`QuicConnection::set_now_secs`]). Returns 0 — the engine's "no
+/// clock" sentinel, which disables stateless Retry fail-closed — if the
+/// system clock reads before the epoch.
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// A QUIC connection handle, wrapping a [`crate::quic::QuicConnection`].
 pub struct PcQuic {
     inner: QuicConnection,
+    /// `true` for a server with stateless Retry enabled
+    /// ([`pc_quic_cfg_set_require_retry`]): the retry-token clock is
+    /// sourced internally from system time and refreshed before each
+    /// inbound datagram so token expiry (RFC 9000 §8.1.2) tracks real
+    /// elapsed time.
+    retry_clock: bool,
     /// Outbound UDP datagram already popped from the engine but not yet
     /// delivered to the caller (e.g. the output buffer was too small, or a
     /// size query with zero capacity). Re-served by the next
@@ -487,11 +512,19 @@ pub unsafe extern "C" fn pc_quic_new(cfg: *const PcQuicCfg) -> *mut PcQuic {
             }
             QuicRole::Server => QuicConnection::server(qcfg),
         };
-        let Ok(inner) = conn else {
+        let Ok(mut inner) = conn else {
             return core::ptr::null_mut();
         };
+        let retry_clock = c.role == QuicRole::Server && c.require_retry;
+        if retry_clock {
+            // Retry tokens are time-bounded; the engine fails closed (no
+            // Retry, no token accepted) while its clock is unset, so seed
+            // it before the first datagram is fed.
+            inner.set_now_secs(unix_now_secs());
+        }
         Box::into_raw(Box::new(PcQuic {
             inner,
+            retry_clock,
             pending_pop: None,
             pending_recv: None,
         }))
@@ -528,7 +561,13 @@ pub unsafe extern "C" fn pc_quic_feed_datagram(
         let Some(b) = (unsafe { slice(dg, len) }) else {
             return PcStatus::NullPointer;
         };
-        let conn = &mut unsafe { &mut *q }.inner;
+        let handle = unsafe { &mut *q };
+        let conn = &mut handle.inner;
+        if handle.retry_clock {
+            // Refresh the retry-token clock so token expiry tracks real
+            // elapsed time (RFC 9000 §8.1.2).
+            conn.set_now_secs(unix_now_secs());
+        }
         match conn.feed_datagram(b) {
             Ok(()) => PcStatus::Ok,
             Err(_) => PcStatus::Internal,

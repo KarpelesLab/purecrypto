@@ -139,6 +139,15 @@ pub struct QuicConfig {
     /// client's first Initial with a Retry packet, forcing the client to
     /// echo a server-minted token (RFC 9000 §8.1.2). Defaults to `false`.
     ///
+    /// **Requires a clock.** Retry tokens are time-bounded (5-minute
+    /// lifetime) and the engine has no implicit time source: the server
+    /// MUST call [`QuicConnection::set_now_secs`] with a nonzero,
+    /// monotonically non-decreasing seconds value before feeding
+    /// datagrams (and keep it updated). While the clock is unset
+    /// (`now_secs == 0`), the engine fails closed: no Retry is emitted,
+    /// no token is minted or accepted, and address validation falls back
+    /// to the RFC 9000 §8.1 3× anti-amplification limit.
+    ///
     /// Ignored on the client side.
     pub require_retry: bool,
     /// Server-only — HMAC-SHA256 key used to authenticate the stateless
@@ -247,10 +256,10 @@ pub struct QuicConnection {
     /// Remote CID pool — CIDs the peer issued to us. Initialized after
     /// the handshake (peer's first long-header SCID becomes seq=0).
     cid_remote: Option<CidPool>,
-    /// Monotonic seconds counter used for retry-token timestamping. The
-    /// connection itself uses `now_secs = 0` as a baseline; the caller's
-    /// clock determines the absolute value via [`Self::feed_datagram_from`].
-    /// Server-only.
+    /// Monotonic seconds counter used for retry-token timestamping, set by
+    /// the caller via [`Self::set_now_secs`]. `0` means "no clock
+    /// configured" and disables the stateless-Retry path fail-closed (no
+    /// token is minted or accepted — see `maybe_emit_retry`). Server-only.
     now_secs: u64,
     /// Server-side — `true` once `cid_local` has issued its post-handshake
     /// fresh CIDs via NEW_CONNECTION_ID. Suppresses re-issuing on every
@@ -568,10 +577,19 @@ impl QuicConnection {
     }
 
     /// Sets the monotonic seconds counter used for retry-token
-    /// timestamping. The default value is 0 — production servers should
-    /// pass the wall-clock seconds since process start, OR
+    /// timestamping. Production servers should pass the wall-clock
+    /// seconds since process start, OR
     /// `std::time::SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()`,
-    /// before calling [`Self::feed_datagram`] / [`Self::pop_datagram`].
+    /// before calling [`Self::feed_datagram`] / [`Self::pop_datagram`],
+    /// and keep it updated (re-set it before each feed) so token expiry
+    /// is enforced against real elapsed time.
+    ///
+    /// The default value 0 means "no clock configured" and disables the
+    /// stateless-Retry path fail-closed: with `now_secs == 0` the server
+    /// neither emits Retry packets nor accepts retry tokens (a token
+    /// validated against a never-advancing clock would otherwise stay
+    /// valid forever). [`QuicConfig::require_retry`] therefore only takes
+    /// effect once a nonzero value has been supplied here.
     pub fn set_now_secs(&mut self, secs: u64) {
         self.now_secs = secs;
     }
@@ -716,6 +734,21 @@ impl QuicConnection {
             Some(s) => *s,
             None => return Ok(None),
         };
+
+        // Fail-closed clock requirement: `now_secs == 0` means the caller
+        // never configured a time source ([`Self::set_now_secs`]), so retry
+        // tokens cannot be time-bounded — a token minted at ts = 0 and
+        // validated against a forever-0 clock would never expire. Checking
+        // here, BEFORE the mint/validate split, guarantees we never mint a
+        // token that `retry::validate` (which also rejects `now_secs == 0`)
+        // could not later accept — emitting such a token would livelock a
+        // legitimate client in an endless Retry loop. Without a clock,
+        // Retry-based address validation is unavailable: the Initial is
+        // processed normally and the RFC 9000 §8.1 3× anti-amplification
+        // cap remains the address-validation backstop.
+        if self.now_secs == 0 {
+            return Ok(None);
+        }
 
         if hdr.token.is_empty() {
             // G-1 hardening: if we've already sent a Retry to this
@@ -5052,6 +5085,53 @@ mod tests {
         assert!(!s.is_handshake_complete());
     }
 
+    /// Fail-closed clock requirement: a server configured with
+    /// `require_retry` but whose clock was never set (`set_now_secs` not
+    /// called, so `now_secs == 0`) must NOT emit a Retry — tokens minted
+    /// without a clock could never expire, and `retry::validate` rejects
+    /// `now_secs == 0`, so any minted token would livelock the client in
+    /// an endless Retry loop. Instead the Retry path is unavailable: no
+    /// Retry packet, no token, and the handshake still completes under
+    /// the 3× anti-amplification cap.
+    #[test]
+    fn retry_disabled_when_clock_unset() {
+        let secret = [0x55u8; 32];
+        let (mut c, mut s) = retry_loopback_pair(secret);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        s.set_peer_addr(addr);
+        // Deliberately NOT calling s.set_now_secs(...).
+        c.set_peer_addr(addr);
+
+        let mut round = 0usize;
+        let max_rounds = 8;
+        while !c.is_handshake_complete() || !s.is_handshake_complete() {
+            round += 1;
+            assert!(round <= max_rounds, "too many rounds: {round}");
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                // Long-header Retry type is (b0 >> 4) & 0x03 == 0x03 —
+                // the clock-less server must never produce one.
+                assert!(
+                    (dg[0] & 0x80) == 0 || ((dg[0] >> 4) & 0x03) != 0x03,
+                    "clock-unset server must not emit a Retry packet"
+                );
+                c.feed_datagram(&dg).expect("client feed");
+            }
+        }
+        assert!(c.is_handshake_complete());
+        assert!(s.is_handshake_complete());
+    }
+
     /// Test 8 — AMP cap arithmetic. The server's outbound budget is
     /// bounded by `3 × bytes_recv` until the address is validated. We
     /// drive the loopback handshake far enough to observe that:
@@ -6760,6 +6840,9 @@ mod tests {
             IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
             9000,
         ));
+        // Retry requires a configured clock (now_secs != 0) — without it
+        // the server fails closed and never emits a Retry at all.
+        server.set_now_secs(1_000);
 
         // Build a minimal client Initial (no token). We just need a long
         // header whose dcid/scid round-trip — `LongHeader::parse` is what
