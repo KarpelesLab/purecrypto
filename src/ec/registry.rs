@@ -9,9 +9,14 @@
 //! 2. **Strict curve/hash pair** entries (`EcdsaP{256,384,521}Sha{256,384,
 //!    512}`, `EcdsaSecp256k1Sha{256,384,512}`) — used for TLS 1.3
 //!    `CertificateVerify` dispatch (one TLS scheme code point per pair) and
-//!    for fine-grained policy whitelisting (the modern default permits only
-//!    the matched-curve / matched-hash pairs; cross-hash pairs and
-//!    secp256k1 require opt-in).
+//!    for fine-grained policy whitelisting. The modern default's
+//!    matched-curve / matched-hash restriction applies to THIS path only:
+//!    for TLS 1.3 `CertificateVerify` it permits exactly the matched pairs
+//!    over P-256/P-384/P-521, while the cross-hash and secp256k1 pair
+//!    entries (which carry no TLS scheme) require explicit opt-in. X.509
+//!    chain signatures instead go through the OID-keyed entries above —
+//!    which the modern default also permits — so a chain signature verifies
+//!    over any supported curve (including secp256k1) with the OID's hash.
 //!
 //! Ed25519 has a single entry (the OID and the TLS scheme both fully pin
 //! the algorithm).

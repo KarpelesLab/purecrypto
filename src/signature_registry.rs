@@ -26,10 +26,14 @@
 //! `SignaturePolicy` (requires `alloc`) enforces a strict **whitelist**:
 //! adding an algorithm to `ALGORITHMS` does NOT auto-permit it; the caller
 //! has to add the id explicitly. The shipped default
-//! `SignaturePolicy::modern` permits exactly the modern IANA-blessed set —
-//! RSA-PSS-RSAE / RSA-PKCS1 with SHA-256/384, ECDSA with matched-curve /
-//! matched-hash pairs over P-256/P-384/P-521, and Ed25519 — with RSA keys
-//! ≥ 2048 bits.
+//! `SignaturePolicy::modern` permits the modern IANA-blessed set —
+//! RSA-PSS-RSAE / RSA-PKCS1 with SHA-256/384, ECDSA, Ed25519/Ed448, and
+//! ML-DSA — with RSA keys ≥ 2048 bits. For ECDSA the two dispatch paths
+//! differ: X.509 chain signatures are keyed by the signature OID
+//! (`ecdsa-with-sha256/384/512`), which does not pin a curve, so any
+//! supported curve (P-256 / P-384 / P-521 / secp256k1) is accepted with the
+//! OID's hash; the matched-curve / matched-hash restriction over
+//! P-256/P-384/P-521 applies to TLS 1.3 `CertificateVerify` scheme dispatch.
 
 use crate::x509::Error;
 
@@ -218,8 +222,10 @@ mod policy {
     ///
     /// The shipped default — [`SignaturePolicy::modern`] — accepts exactly the
     /// modern IANA-blessed set: RSA-PKCS1 / RSA-PSS-RSAE with SHA-256/384/512,
-    /// ECDSA with matched curve/hash pairs over P-256/P-384/P-521, Ed25519,
-    /// and Ed448. RSA keys must be at least 2048 bits.
+    /// ECDSA (any supported curve for X.509 chain signatures; matched
+    /// curve/hash pairs over P-256/P-384/P-521 for TLS 1.3
+    /// `CertificateVerify`), Ed25519, and Ed448. RSA keys must be at least
+    /// 2048 bits.
     #[derive(Clone)]
     pub struct SignaturePolicy {
         permitted: Vec<&'static dyn SignatureAlgorithm>,
@@ -234,14 +240,27 @@ mod policy {
         /// Permitted ids:
         ///   * `rsa-pkcs1-sha256`, `rsa-pkcs1-sha384`
         ///   * `rsa-pss-rsae-sha256`, `rsa-pss-rsae-sha384`, `rsa-pss-rsae-sha512`
+        ///   * `ecdsa-with-sha256`, `ecdsa-with-sha384`, `ecdsa-with-sha512`
+        ///     — the OID-keyed X.509 chain-dispatch entries. The
+        ///     `ecdsa-with-SHA-N` OID does not pin a curve, so these accept
+        ///     **any supported curve** (P-256, P-384, P-521, or secp256k1)
+        ///     with the OID's hash.
         ///   * `ecdsa-secp256r1-sha256`, `ecdsa-secp384r1-sha384`,
-        ///     `ecdsa-secp521r1-sha512`
+        ///     `ecdsa-secp521r1-sha512` — the TLS 1.3 `CertificateVerify`
+        ///     scheme-dispatch entries; this is where the matched-curve /
+        ///     matched-hash restriction applies.
         ///   * `ed25519`, `ed448`
         ///   * `ml-dsa-44`, `ml-dsa-65`, `ml-dsa-87` (NIST FIPS 204)
         ///
-        /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, secp256k1,
-        /// cross-hash ECDSA, SLH-DSA, …) is one-line opt-in via
-        /// [`Self::permit`].
+        /// Note the asymmetry for ECDSA: an X.509 chain signature over
+        /// secp256k1 (or any supported-curve / SHA-256-384-512 combination)
+        /// verifies under this policy via the OID-keyed entries; only the
+        /// TLS 1.3 `CertificateVerify` path is limited to the matched pairs
+        /// above.
+        ///
+        /// Everything else in [`super::ALGORITHMS`] (SHA-1 RSA, the
+        /// scheme-less secp256k1 / cross-hash ECDSA pair entries, SLH-DSA,
+        /// …) is one-line opt-in via [`Self::permit`].
         pub fn modern() -> Self {
             let permitted_ids = [
                 "rsa-pkcs1-sha256",
