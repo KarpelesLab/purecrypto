@@ -21,9 +21,16 @@
 //!
 //! The connection-level flow control invariant (RFC 9000 §4.1.2):
 //! `conn_send_used` counts NEW bytes only. Retransmissions don't bump
-//! it. Symmetrically, `conn_recv_used` counts contiguous-receive
-//! progress across all streams. When `conn_recv_used + threshold >
-//! conn_recv_max_announced`, we queue a fresh MAX_DATA.
+//! it. On the receive side, `conn_recv_used` is the high-water mark of
+//! bytes received across all streams (checked against `conn_recv_max`),
+//! while fresh credit is anchored on `conn_consumed` — bytes the
+//! application has READ (or that were discarded by a stream reset).
+//! When `conn_consumed + threshold > conn_recv_max_announced`, we queue
+//! a fresh MAX_DATA at `conn_consumed + window`. Anchoring credit on
+//! consumption rather than receipt means a peer can never force more
+//! than ~one window of unread bytes to sit in `RecvStream::delivered`:
+//! if the application stops reading, the announced limits stop growing
+//! and the sender blocks.
 
 #![allow(dead_code)]
 
@@ -251,6 +258,17 @@ pub(crate) struct Streams {
     /// Highest contiguous bytes received across all streams (sum of
     /// per-stream `next_offset` advances).
     pub(crate) conn_recv_used: u64,
+    /// Connection-level receive credit window — the `initial_max_data`
+    /// WE advertised. Fresh credit is granted as `conn_consumed +
+    /// conn_recv_window`.
+    pub(crate) conn_recv_window: u64,
+    /// Total bytes CONSUMED across all streams: application reads
+    /// (per-stream `read_off` advances) plus bytes discarded when a
+    /// receive stream is reset. Connection-level credit replenishment
+    /// is anchored HERE, not on bytes received, so a slow (or absent)
+    /// reader bounds the peer at one window of in-flight data instead
+    /// of letting it grow `RecvStream::delivered` without limit.
+    pub(crate) conn_consumed: u64,
 
     /// RFC 9000 §4.1 — per-stream maximum offset *ever observed* on any
     /// inbound STREAM frame. Used to compute the connection-level
@@ -341,6 +359,8 @@ impl Streams {
             conn_recv_max: our_params.initial_max_data.unwrap_or(0),
             conn_recv_max_announced: our_params.initial_max_data.unwrap_or(0),
             conn_recv_used: 0,
+            conn_recv_window: our_params.initial_max_data.unwrap_or(0),
+            conn_consumed: 0,
             stream_high_offset: BTreeMap::new(),
             data_blocked_at: None,
             max_data_pending: false,
@@ -571,30 +591,33 @@ impl Streams {
         // conn-level credit against the high-water mark. The per-stream
         // FC check inside `on_data` is still required.
         recv.on_data(offset, data, fin)?;
-        // Replenishment hysteresis at the connection level.
-        let window = self.conn_recv_max_announced.saturating_sub(0);
-        let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
-        if self.conn_recv_used + threshold > self.conn_recv_max_announced {
-            // Bump by a fresh window.
-            self.conn_recv_max = self
-                .conn_recv_max
-                .saturating_add(window)
-                .max(self.conn_recv_used + window);
-            self.max_data_pending = true;
-        }
-        // Replenishment hysteresis at the stream level.
-        let r_window = recv.max_data_announced;
-        let r_threshold = r_window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
-        if recv.next_offset + r_threshold > recv.max_data_announced {
-            recv.max_data = recv
-                .max_data
-                .saturating_add(r_window)
-                .max(recv.next_offset + r_window);
-            recv.max_data_pending = true;
-            self.enqueue_ready(id);
-        }
+        // NOTE: no credit replenishment here. Flow-control credit is
+        // anchored on CONSUMPTION (application reads / reset discards),
+        // not on receipt — see `read` and `maybe_replenish_conn`. If we
+        // re-issued credit as fast as data arrived, a peer could grow
+        // `RecvStream::delivered` without bound whenever the
+        // application reads slower than the network delivers.
         self.refresh_readable(id);
         Ok(())
+    }
+
+    /// Connection-level credit replenishment, anchored on
+    /// `conn_consumed`. Once the consumed total comes within the
+    /// hysteresis threshold of the last announced limit, queue a
+    /// MAX_DATA granting `conn_consumed + window`.
+    fn maybe_replenish_conn(&mut self) {
+        let window = self.conn_recv_window;
+        if window == 0 {
+            return;
+        }
+        let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
+        if self.conn_consumed + threshold > self.conn_recv_max_announced {
+            let new_max = self.conn_consumed.saturating_add(window);
+            if new_max > self.conn_recv_max {
+                self.conn_recv_max = new_max;
+                self.max_data_pending = true;
+            }
+        }
     }
 
     /// Inbound RESET_STREAM.
@@ -654,16 +677,27 @@ impl Streams {
         Ok(())
     }
 
-    /// Inbound DATA_BLOCKED — informational. We may choose to bump
-    /// MAX_DATA in response, but for now we just log.
-    pub(crate) fn on_data_blocked(&mut self, _limit: u64) {
-        // No-op: we'll naturally bump MAX_DATA through the
-        // replenishment hysteresis. A more aggressive impl could
-        // immediately raise self.conn_recv_max here.
+    /// Inbound DATA_BLOCKED. If the peer reports being blocked below
+    /// the limit we have already granted, the MAX_DATA announcing that
+    /// grant was evidently lost — re-queue it. (Credit replenishment
+    /// itself is driven by consumption in [`Self::read`]; this is the
+    /// loss-recovery path.)
+    pub(crate) fn on_data_blocked(&mut self, limit: u64) {
+        if self.conn_recv_max > limit {
+            self.max_data_pending = true;
+        }
     }
 
-    /// Inbound STREAM_DATA_BLOCKED — informational.
-    pub(crate) fn on_stream_data_blocked(&mut self, _id: u64, _limit: u64) -> Result<(), Error> {
+    /// Inbound STREAM_DATA_BLOCKED — same recovery as
+    /// [`Self::on_data_blocked`], at the stream level.
+    pub(crate) fn on_stream_data_blocked(&mut self, id: u64, limit: u64) -> Result<(), Error> {
+        if let Some(stream) = self.map.get_mut(&id)
+            && let Some(recv) = stream.recv.as_mut()
+            && recv.max_data > limit
+        {
+            recv.max_data_pending = true;
+            self.enqueue_ready(id);
+        }
         Ok(())
     }
 
@@ -700,25 +734,31 @@ impl Streams {
     }
 
     /// Application read on `id`. Returns `(bytes_copied, fin_seen)`.
+    ///
+    /// This is the credit-replenishment point: both the per-stream and
+    /// the connection-level windows are re-anchored on the CONSUMED
+    /// offsets (`recv.read_off` / `conn_consumed`) here. Data merely
+    /// received does not generate credit.
     pub(crate) fn read(&mut self, id: StreamId, into: &mut [u8]) -> Result<(usize, bool), Error> {
         let stream = self.map.get_mut(&id.0).ok_or(Error::InappropriateState)?;
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         let (copied, fin) = recv.read(into);
-        // After draining application bytes we should also re-check the
-        // stream-level credit replenishment so the peer can keep sending.
-        // (Use `next_offset` as the "newly contiguous" anchor.)
-        let r_window = recv.max_data_announced;
+        // Stream-level replenishment, anchored on the consumed offset.
+        let r_window = recv.window;
         if r_window > 0 {
             let r_threshold = r_window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
-            if recv.next_offset + r_threshold > recv.max_data_announced {
-                recv.max_data = recv
-                    .max_data
-                    .saturating_add(r_window)
-                    .max(recv.next_offset + r_window);
-                recv.max_data_pending = true;
-                self.enqueue_ready(id.0);
+            if recv.read_off + r_threshold > recv.max_data_announced {
+                let new_max = recv.read_off.saturating_add(r_window);
+                if new_max > recv.max_data {
+                    recv.max_data = new_max;
+                    recv.max_data_pending = true;
+                    self.enqueue_ready(id.0);
+                }
             }
         }
+        // Connection-level consumption + replenishment.
+        self.conn_consumed = self.conn_consumed.saturating_add(copied as u64);
+        self.maybe_replenish_conn();
         self.refresh_readable(id.0);
         Ok((copied, fin))
     }
@@ -910,6 +950,42 @@ impl Streams {
                     continue;
                 }
             }
+            // Retransmissions before fresh data: a queued rtx chunk is
+            // (usually) the receiver's contiguity gap, so it unblocks
+            // the peer's delivery (and credit consumption) fastest.
+            if let Some(send) = stream.send.as_mut()
+                && let Some((r_off, r_len)) = send.peek_rtx()
+            {
+                // Header sized with the FULL chunk length; the emitted
+                // length is ≤ that, so its varint is never wider.
+                let header_overhead = 1
+                    + varint::encoded_len(id)
+                    + (if r_off > 0 {
+                        varint::encoded_len(r_off)
+                    } else {
+                        0
+                    })
+                    + varint::encoded_len(r_len as u64);
+                let min_payload = usize::from(r_len > 0);
+                if budget >= header_overhead + min_payload {
+                    let max_payload = budget - header_overhead;
+                    let (off, bytes, fin) = send.pop_rtx(max_payload).expect("just-peeked");
+                    self.map.insert(id, stream);
+                    if stream_needs_to_send(self.map.get(&id).unwrap()) {
+                        self.enqueue_ready(id);
+                    }
+                    return Some(PoppedFrame::Stream {
+                        id,
+                        offset: off,
+                        data: bytes,
+                        fin,
+                    });
+                } else {
+                    self.map.insert(id, stream);
+                    self.enqueue_ready(id);
+                    continue;
+                }
+            }
             // Fallback: STREAM frame. Try to carve as much as possible
             // up to the budget AND the conn_send_used credit.
             if let Some(send) = stream.send.as_mut()
@@ -997,10 +1073,38 @@ impl Streams {
         None
     }
 
+    /// A packet carrying stream chunk `[offset, offset+len)` (with
+    /// `fin` per its FIN bit) on stream `id` was acknowledged. Prunes
+    /// the sender-side retransmission state for that range.
+    pub(crate) fn on_chunk_acked(&mut self, id: u64, offset: u64, len: u64, fin: bool) {
+        if let Some(stream) = self.map.get_mut(&id)
+            && let Some(send) = stream.send.as_mut()
+        {
+            send.on_range_acked(offset, len, fin);
+        }
+    }
+
+    /// A packet carrying stream chunk `[offset, offset+len)` on stream
+    /// `id` was declared lost (RFC 9002 §6.1): queue the overlapping
+    /// unacked chunks for retransmission.
+    pub(crate) fn on_chunk_lost(&mut self, id: u64, offset: u64, len: u64, fin: bool) {
+        let moved = if let Some(stream) = self.map.get_mut(&id)
+            && let Some(send) = stream.send.as_mut()
+        {
+            send.on_range_lost(offset, len, fin)
+        } else {
+            false
+        };
+        if moved {
+            self.enqueue_ready(id);
+        }
+    }
+
     /// On PTO: requeue every sent-but-unconfirmed stream chunk so the
     /// next packet build re-emits it. RFC 9002 §6.2.4 says to send a
-    /// probe; for Phase 6 we proactively retransmit all unacked
-    /// stream data. Duplicates are dropped by the receiver's
+    /// probe; we retransmit all unacked stream data (chunks whose
+    /// ranges have meanwhile been acked are pruned by
+    /// `requeue_all_sent`). Duplicates are dropped by the receiver's
     /// reassembly.
     pub(crate) fn on_pto(&mut self) {
         for (&id, stream) in self.map.iter_mut() {
@@ -1292,11 +1396,19 @@ mod tests {
         let mut s = Streams::new(Role::Server, &our, &peer);
         // Peer (client) opens id=0 and sends 80 bytes.
         s.on_stream(0, 0, false, &[0u8; 80]).expect("recv");
+        // The application CONSUMES them — this is what generates fresh
+        // credit (receipt alone must not).
+        let mut buf = [0u8; 128];
+        let (n, _) = s.read(StreamId(0), &mut buf).expect("read");
+        assert_eq!(n, 80);
         // We should have queued a MAX_DATA frame.
         let mut saw_max_data = false;
         for _ in 0..5 {
             match s.pop_frame(64) {
-                Some(PoppedFrame::MaxData(_)) => {
+                Some(PoppedFrame::MaxData(limit)) => {
+                    // Credit is anchored on consumption: 80 consumed +
+                    // a 100-byte window.
+                    assert_eq!(limit, 180);
                     saw_max_data = true;
                     break;
                 }
@@ -1305,6 +1417,97 @@ mod tests {
             }
         }
         assert!(saw_max_data, "MAX_DATA must be queued for replenishment");
+    }
+
+    /// ISSUE 1 (memory exhaustion) — flow-control credit must be
+    /// anchored on bytes CONSUMED, not bytes received. If the
+    /// application never reads, the announced limits stop growing and
+    /// the sender blocks at ~one window; `RecvStream::delivered` can
+    /// never grow without bound.
+    #[test]
+    fn no_credit_growth_without_consumption() {
+        let our = TransportParameters {
+            initial_max_data: Some(100),
+            initial_max_stream_data_bidi_local: Some(100),
+            initial_max_stream_data_bidi_remote: Some(100),
+            initial_max_stream_data_uni: Some(100),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Peer fills the entire window in small chunks; the app never
+        // reads.
+        for off in (0..100u64).step_by(20) {
+            s.on_stream(0, off, false, &[0u8; 20]).expect("recv");
+        }
+        // No credit may have been issued or queued.
+        assert_eq!(s.conn_recv_max, 100, "conn limit must not grow unread");
+        assert!(!s.max_data_pending);
+        for _ in 0..10 {
+            match s.pop_frame(256) {
+                None => break,
+                Some(f) => assert!(
+                    !matches!(
+                        f,
+                        PoppedFrame::MaxData(_) | PoppedFrame::MaxStreamData { .. }
+                    ),
+                    "no credit frame may be emitted without consumption: {f:?}"
+                ),
+            }
+        }
+        {
+            let recv = s.map.get(&0).unwrap().recv.as_ref().unwrap();
+            assert_eq!(recv.max_data, 100, "stream limit must not grow unread");
+            assert!(!recv.max_data_pending);
+        }
+        // The sender is now blocked: one more byte overflows both the
+        // stream and the connection limit.
+        assert!(
+            s.on_stream(0, 100, false, &[0u8; 1]).is_err(),
+            "window-overflowing byte must be rejected"
+        );
+        // Once the application reads, credit replenishes — anchored on
+        // the consumed offset.
+        let mut buf = [0u8; 100];
+        let (n, _) = s.read(StreamId(0), &mut buf).expect("read");
+        assert_eq!(n, 100);
+        assert!(s.max_data_pending);
+        assert_eq!(s.conn_recv_max, 200);
+        let recv = s.map.get(&0).unwrap().recv.as_ref().unwrap();
+        assert!(recv.max_data_pending);
+        assert_eq!(recv.max_data, 200);
+    }
+
+    /// Lost-credit recovery: a DATA_BLOCKED / STREAM_DATA_BLOCKED at a
+    /// limit below what we already granted re-queues the (evidently
+    /// lost) MAX_DATA / MAX_STREAM_DATA announcement.
+    #[test]
+    fn blocked_frames_requeue_lost_credit() {
+        let our = params_with(100, 100, 10);
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(0, 0, false, &[0u8; 100]).expect("recv");
+        let mut buf = [0u8; 100];
+        let _ = s.read(StreamId(0), &mut buf).expect("read");
+        // Drain the queued credit frames (pretend they were sent —
+        // and then lost on the wire).
+        while s.pop_frame(256).is_some() {}
+        assert!(!s.max_data_pending);
+        // The peer reports being blocked at the OLD limits.
+        s.on_data_blocked(100);
+        assert!(s.max_data_pending, "lost MAX_DATA must be re-queued");
+        s.on_stream_data_blocked(0, 100).expect("sdb");
+        let recv = s.map.get(&0).unwrap().recv.as_ref().unwrap();
+        assert!(
+            recv.max_data_pending,
+            "lost MAX_STREAM_DATA must be re-queued"
+        );
+        // But a report at the CURRENT limit re-queues nothing.
+        while s.pop_frame(256).is_some() {}
+        s.on_data_blocked(s.conn_recv_max);
+        assert!(!s.max_data_pending);
     }
 
     // QUIC-3 — RFC 9000 §4.1: conn-level FC must be charged on receipt

@@ -186,6 +186,7 @@ mod tests {
             in_flight,
             time_sent,
             retransmit_hint: Vec::new(),
+            stream_hints: Vec::new(),
         }
     }
 

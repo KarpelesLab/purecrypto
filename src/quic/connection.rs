@@ -33,7 +33,9 @@ use crate::quic::crypto::{
 use crate::quic::datagram::DatagramQueues;
 use crate::quic::endpoint::Endpoint;
 use crate::quic::frame::{Frame, FrameIter, StreamDir, build_ack_ranges_raw};
-use crate::quic::loss::{CryptoHint, SentPacket, build_retransmit_hint, parse_retransmit_hint};
+use crate::quic::loss::{
+    CryptoHint, SentPacket, StreamHint, build_retransmit_hint, parse_retransmit_hint,
+};
 use crate::quic::path::PathChallengeState;
 use crate::quic::pkt::{
     LongHeader, LongType, QUIC_V1, ShortHeader, apply_header_protection, build_long_header,
@@ -362,6 +364,10 @@ pub(crate) struct PacketMeta {
     /// recover the exact bytes via
     /// [`crate::quic::crypto_buf::CryptoBuf::requeue_range`].
     pub(crate) crypto_hints: Vec<CryptoHint>,
+    /// STREAM chunks carved into this packet. Recorded on the
+    /// [`SentPacket`] so the ack path can confirm the ranges and the
+    /// loss path can queue them for retransmission.
+    pub(crate) stream_hints: Vec<StreamHint>,
 }
 
 /// Rejects locally-advertised transport parameters that QUIC v1 forbids.
@@ -2762,6 +2768,23 @@ impl QuicConnection {
                             self.requeue_from_hint(&pkt.retransmit_hint)?;
                         }
                     }
+                    // 6b. STREAM chunk accounting: acked packets confirm
+                    //     their stream ranges (pruning the sender-side
+                    //     retransmission state); lost packets queue
+                    //     theirs for immediate retransmission (RFC 9002
+                    //     §6.1 — without waiting for a PTO).
+                    if let Some(streams) = self.streams.as_mut() {
+                        for pkt in &acked {
+                            for h in &pkt.stream_hints {
+                                streams.on_chunk_acked(h.id, h.offset, h.length, h.fin);
+                            }
+                        }
+                        for pkt in &lost {
+                            for h in &pkt.stream_hints {
+                                streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                            }
+                        }
+                    }
                     // 7. Persistent congestion: if loss has accumulated
                     //    enough PTOs without progress, signal cwnd
                     //    reset to NewReno.
@@ -3366,6 +3389,7 @@ impl QuicConnection {
             in_flight: meta.in_flight,
             time_sent: now,
             retransmit_hint,
+            stream_hints: meta.stream_hints.clone(),
         };
         self.endpoint.loss.on_packet_sent(space_id, sent_pkt);
         if meta.in_flight {
@@ -3526,6 +3550,21 @@ impl QuicConnection {
                         None => break,
                     };
                     popped.encode(&mut out);
+                    // Record STREAM chunks for ack/loss accounting.
+                    if let crate::quic::streams::PoppedFrame::Stream {
+                        id,
+                        offset,
+                        ref data,
+                        fin,
+                    } = popped
+                    {
+                        meta.stream_hints.push(StreamHint {
+                            id,
+                            offset,
+                            length: data.len() as u64,
+                            fin,
+                        });
+                    }
                 }
                 if out.len() > pre_streams_len {
                     // STREAM / MAX_*/_BLOCKED / RESET_STREAM /
@@ -6133,6 +6172,7 @@ mod tests {
                     in_flight: true,
                     time_sent: Duration::from_millis(pn),
                     retransmit_hint: alloc::vec::Vec::new(),
+                    stream_hints: alloc::vec::Vec::new(),
                 },
             );
         }

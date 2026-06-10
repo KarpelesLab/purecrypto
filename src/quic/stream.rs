@@ -146,10 +146,61 @@ pub(crate) struct SendStream {
     /// True if a RESET_STREAM frame is queued and not yet emitted.
     pub(crate) reset_pending: bool,
     /// Chunks that have been emitted on the wire and are not yet
-    /// confirmed (ack of the carrying packet has not arrived). On PTO
-    /// we requeue all entries here; ack-level tracking lands in a
-    /// follow-up phase. Each entry is (offset, bytes, fin).
+    /// confirmed. Each entry is (offset, bytes, fin). Entries are
+    /// removed when the carrying packet is acked
+    /// ([`Self::on_range_acked`]) and moved to [`Self::rtx_queue`] when
+    /// it is declared lost ([`Self::on_range_lost`]) or a PTO fires
+    /// ([`Self::requeue_all_sent`]).
     pub(crate) sent_chunks: VecDeque<(u64, Vec<u8>, bool)>,
+    /// Chunks awaiting retransmission. The packet packer emits these
+    /// ahead of fresh `write_buf` bytes (they fill the receiver's
+    /// contiguity gap); an emitted entry re-enters `sent_chunks`.
+    /// Unlike the historical "rewind `write_off` and re-prepend"
+    /// scheme, this side queue can carry an *interior* lost range
+    /// without disturbing the contiguous `write_buf` model.
+    pub(crate) rtx_queue: VecDeque<(u64, Vec<u8>, bool)>,
+    /// Stream byte ranges the peer has acknowledged: merged,
+    /// non-overlapping `start → end` intervals.
+    pub(crate) acked_ranges: BTreeMap<u64, u64>,
+    /// True once a FIN-bearing STREAM frame has been acknowledged.
+    pub(crate) fin_acked: bool,
+}
+
+/// True if `[start, end)` is fully contained in one of the merged
+/// intervals of `ranges`. Zero-length ranges are vacuously covered.
+fn range_covered(ranges: &BTreeMap<u64, u64>, start: u64, end: u64) -> bool {
+    if start >= end {
+        return true;
+    }
+    match ranges.range(..=start).next_back() {
+        Some((&s, &e)) => s <= start && end <= e,
+        None => false,
+    }
+}
+
+/// Insert `[start, end)` into `ranges`, merging overlapping or adjacent
+/// intervals.
+fn insert_range(ranges: &mut BTreeMap<u64, u64>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    let mut start = start;
+    let mut end = end;
+    if let Some((&s, &e)) = ranges.range(..=start).next_back()
+        && e >= start
+    {
+        start = s;
+        end = end.max(e);
+        ranges.remove(&s);
+    }
+    while let Some((&s, &e)) = ranges.range(start..).next() {
+        if s > end {
+            break;
+        }
+        end = end.max(e);
+        ranges.remove(&s);
+    }
+    ranges.insert(start, end);
 }
 
 impl SendStream {
@@ -167,12 +218,19 @@ impl SendStream {
             blocked_at: None,
             reset_pending: false,
             sent_chunks: VecDeque::new(),
+            rtx_queue: VecDeque::new(),
+            acked_ranges: BTreeMap::new(),
+            fin_acked: false,
         }
     }
 
-    /// True if any STREAM frame bytes (or a FIN-only STREAM frame) are
-    /// queued in `write_buf`.
+    /// True if any STREAM frame bytes (fresh `write_buf` bytes, a
+    /// FIN-only STREAM frame, or queued retransmissions) are ready for
+    /// the packet packer.
     pub(crate) fn has_outbound(&self) -> bool {
+        if !self.rtx_queue.is_empty() {
+            return true;
+        }
         if !self.write_buf.is_empty() {
             return true;
         }
@@ -182,6 +240,98 @@ impl SendStream {
             return true;
         }
         false
+    }
+
+    /// True if a chunk consisting of `[off, off + len)` with `fin` has
+    /// been fully acknowledged by the peer.
+    fn chunk_acked(&self, off: u64, len: usize, fin: bool) -> bool {
+        range_covered(&self.acked_ranges, off, off.saturating_add(len as u64))
+            && (!fin || self.fin_acked)
+    }
+
+    /// The carrying packet of `[offset, offset + len)` (`fin` per the
+    /// frame's FIN bit) was acknowledged. Records the range and prunes
+    /// the in-flight / queued-retransmit copies of the data.
+    pub(crate) fn on_range_acked(&mut self, offset: u64, len: u64, fin: bool) {
+        if fin {
+            self.fin_acked = true;
+        }
+        insert_range(&mut self.acked_ranges, offset, offset.saturating_add(len));
+        // Contiguous acked prefix (informational).
+        if let Some((&s, &e)) = self.acked_ranges.iter().next()
+            && s == 0
+        {
+            self.acked_offset = e;
+        }
+        // Drop every copy of now-fully-acked data.
+        let ranges = &self.acked_ranges;
+        let fin_acked = self.fin_acked;
+        let covered = |(off, bytes, c_fin): &(u64, Vec<u8>, bool)| {
+            range_covered(ranges, *off, off.saturating_add(bytes.len() as u64))
+                && (!*c_fin || fin_acked)
+        };
+        self.sent_chunks.retain(|c| !covered(c));
+        self.rtx_queue.retain(|c| !covered(c));
+    }
+
+    /// The carrying packet of `[offset, offset + len)` was declared
+    /// lost (RFC 9002 §6.1). Moves every overlapping, not-yet-acked
+    /// in-flight chunk into the retransmit queue. Returns `true` if
+    /// anything was queued (the caller should mark the stream ready).
+    pub(crate) fn on_range_lost(&mut self, offset: u64, len: u64, fin: bool) -> bool {
+        let end = offset.saturating_add(len);
+        let mut keep: VecDeque<(u64, Vec<u8>, bool)> = VecDeque::new();
+        let mut moved = false;
+        while let Some((c_off, c_bytes, c_fin)) = self.sent_chunks.pop_front() {
+            let c_end = c_off + c_bytes.len() as u64;
+            let overlaps_data = c_off < end && offset < c_end;
+            // A FIN-only frame has a zero-length range; match it by
+            // offset + FIN bit.
+            let fin_only_match = c_bytes.is_empty() && c_fin && fin && c_off == offset;
+            let acked = self.chunk_acked(c_off, c_bytes.len(), c_fin);
+            if (overlaps_data || fin_only_match) && !acked {
+                self.rtx_queue.push_back((c_off, c_bytes, c_fin));
+                moved = true;
+            } else {
+                keep.push_back((c_off, c_bytes, c_fin));
+            }
+        }
+        self.sent_chunks = keep;
+        moved
+    }
+
+    /// True if any chunk awaits retransmission.
+    pub(crate) fn has_rtx(&self) -> bool {
+        !self.rtx_queue.is_empty()
+    }
+
+    /// `(offset, len)` of the chunk at the front of the retransmit
+    /// queue, for the packer's frame-header budgeting.
+    pub(crate) fn peek_rtx(&self) -> Option<(u64, usize)> {
+        self.rtx_queue.front().map(|(o, b, _)| (*o, b.len()))
+    }
+
+    /// Pop (up to `max_payload` bytes of) the front retransmit chunk.
+    /// If the chunk exceeds the budget it is split: the emitted head
+    /// loses its FIN bit and the tail stays queued. The emitted piece
+    /// re-enters `sent_chunks` so a further loss re-queues it again.
+    ///
+    /// `max_payload` must be ≥ 1 unless the front chunk is a FIN-only
+    /// (zero-length) entry.
+    pub(crate) fn pop_rtx(&mut self, max_payload: usize) -> Option<(u64, Vec<u8>, bool)> {
+        let (off, bytes, fin) = self.rtx_queue.pop_front()?;
+        if bytes.len() <= max_payload {
+            self.sent_chunks.push_back((off, bytes.clone(), fin));
+            Some((off, bytes, fin))
+        } else {
+            debug_assert!(max_payload > 0);
+            let tail = bytes[max_payload..].to_vec();
+            let head = bytes[..max_payload].to_vec();
+            self.rtx_queue
+                .push_front((off + max_payload as u64, tail, fin));
+            self.sent_chunks.push_back((off, head.clone(), false));
+            Some((off, head, false))
+        }
     }
 
     /// Number of bytes the sender has been authorized to put on the wire
@@ -255,63 +405,31 @@ impl SendStream {
         } else if matches!(self.state, SendState::Ready) && !bytes.is_empty() {
             self.state = SendState::Send;
         }
-        // Record the chunk so PTO can requeue it.
+        // Record the chunk so the ack/loss/PTO machinery can confirm or
+        // retransmit it.
         self.sent_chunks.push_back((offset, bytes.clone(), fin));
         Some((offset, bytes, fin))
     }
 
-    /// Requeue every sent-but-unconfirmed chunk at the front of
-    /// `write_buf`. Called on PTO timeout for streams that may have
-    /// lost packets. Phase-6 simplification: we don't track per-chunk
-    /// acks, so this is best-effort and may re-emit bytes the peer
-    /// already received (the receiver's reassembly drops dupes).
+    /// Queue every sent-but-unconfirmed chunk for retransmission.
+    /// Called on PTO timeout for streams that may have lost packets.
+    /// Chunks whose ranges the peer has meanwhile acknowledged are
+    /// dropped instead of re-sent, so the PTO probe carries only the
+    /// data the peer is actually missing (the receiver's reassembly
+    /// still drops any duplicates).
     pub(crate) fn requeue_all_sent(&mut self) {
-        // Drain sent_chunks in reverse order, prepending each.
-        let mut earliest_off = self.write_off;
-        let mut any_fin = false;
-        let chunks: alloc::vec::Vec<(u64, alloc::vec::Vec<u8>, bool)> =
-            self.sent_chunks.drain(..).collect();
-        for (off, _bytes, fin) in chunks.iter() {
-            if *off < earliest_off {
-                earliest_off = *off;
-            }
-            if *fin {
-                any_fin = true;
-            }
-        }
-        // Concatenate all chunks (sorted by offset) into a single
-        // contiguous prepend.
-        let mut sorted = chunks;
-        sorted.sort_by_key(|c| c.0);
-        let mut new_buf: VecDeque<u8> = VecDeque::new();
-        let mut cur_off = earliest_off;
-        for (off, bytes, _fin) in sorted.iter() {
-            // Skip any duplicates already covered.
-            if off + bytes.len() as u64 <= cur_off {
+        while let Some((off, bytes, fin)) = self.sent_chunks.pop_front() {
+            if self.chunk_acked(off, bytes.len(), fin) {
                 continue;
             }
-            let skip = cur_off.saturating_sub(*off) as usize;
-            if skip < bytes.len() {
-                for &b in &bytes[skip..] {
-                    new_buf.push_back(b);
-                }
-                cur_off = off + bytes.len() as u64;
-            }
-        }
-        // Append the (pre-existing) write_buf tail.
-        while let Some(b) = self.write_buf.pop_front() {
-            new_buf.push_back(b);
-        }
-        self.write_buf = new_buf;
-        self.write_off = earliest_off;
-        if any_fin {
-            self.fin_sent = false;
+            self.rtx_queue.push_back((off, bytes, fin));
         }
     }
 
-    /// True if any chunks are currently unconfirmed.
+    /// True if any chunks are currently unconfirmed (in flight or
+    /// awaiting retransmission).
     pub(crate) fn has_unacked(&self) -> bool {
-        !self.sent_chunks.is_empty()
+        !self.sent_chunks.is_empty() || !self.rtx_queue.is_empty()
     }
 
     /// Re-queue a lost chunk at the front of `write_buf` and rewind
@@ -339,9 +457,13 @@ impl SendStream {
     }
 
     /// Drop all buffered bytes (RFC 9000 §3.5 RESET_STREAM): the send
-    /// side abandons unsent data, transitions to ResetSent.
+    /// side abandons unsent data (including queued retransmissions —
+    /// after RESET_STREAM the sender stops retransmitting stream data),
+    /// transitions to ResetSent.
     pub(crate) fn enter_reset(&mut self, code: u64) {
         self.write_buf.clear();
+        self.rtx_queue.clear();
+        self.sent_chunks.clear();
         self.reset_code = Some(code);
         self.reset_pending = true;
         self.state = SendState::ResetSent;
@@ -386,6 +508,11 @@ pub(crate) struct RecvStream {
     /// The last `max_data` value we ANNOUNCED to the peer via
     /// MAX_STREAM_DATA. Used for hysteresis.
     pub(crate) max_data_announced: u64,
+    /// Size of the per-stream receive window. Fresh credit is granted
+    /// as `read_off + window` — anchored on what the application has
+    /// CONSUMED, not on what the peer has delivered, so a peer cannot
+    /// force more than ~one window of unread bytes to be buffered.
+    pub(crate) window: u64,
     /// Application error code surfaced by the peer's RESET_STREAM frame.
     pub(crate) reset_code: Option<u64>,
     /// True if we have sent STOP_SENDING for this stream — subsequent
@@ -406,6 +533,7 @@ impl RecvStream {
             fin_offset: None,
             max_data,
             max_data_announced: max_data,
+            window: max_data,
             reset_code: None,
             stop_sending_sent: false,
             max_data_pending: false,
@@ -895,6 +1023,76 @@ mod tests {
         let (off2, bytes2, _fin) = s.carve(100).unwrap();
         assert_eq!(off2, 0);
         assert_eq!(bytes2, b"hello world");
+    }
+
+    /// Ack/loss-driven retransmission: acked ranges are pruned from the
+    /// in-flight set; lost ranges move to the retransmit queue and are
+    /// re-emitted via `pop_rtx` (re-entering the in-flight set).
+    #[test]
+    fn ack_prunes_and_loss_requeues_chunks() {
+        let mut s = SendStream::new(1024);
+        let _ = s.enqueue(b"aaaabbbbcccc");
+        s.finish();
+        let (o1, b1, _) = s.carve(4).unwrap(); // [0, 4)
+        let (o2, b2, _) = s.carve(4).unwrap(); // [4, 8)
+        let (o3, b3, fin3) = s.carve(100).unwrap(); // [8, 12) + FIN
+        assert_eq!((o1, o2, o3), (0, 4, 8));
+        assert!(fin3);
+        assert_eq!(s.sent_chunks.len(), 3);
+
+        // Ack the middle chunk: pruned from in-flight.
+        s.on_range_acked(o2, b2.len() as u64, false);
+        assert_eq!(s.sent_chunks.len(), 2);
+        assert!(s.has_unacked());
+
+        // The middle chunk's loss report (e.g. a stale dup) is a no-op.
+        assert!(!s.on_range_lost(o2, b2.len() as u64, false));
+        assert!(!s.has_rtx());
+
+        // Lose the first chunk: moved to the rtx queue.
+        assert!(s.on_range_lost(o1, b1.len() as u64, false));
+        assert_eq!(s.sent_chunks.len(), 1);
+        assert_eq!(s.peek_rtx(), Some((0, 4)));
+
+        // Re-emit it (budget splits 4 bytes into 3 + 1).
+        let (ro, rb, rfin) = s.pop_rtx(3).unwrap();
+        assert_eq!((ro, rb.as_slice(), rfin), (0, &b"aaaa"[..3], false));
+        let (ro, rb, rfin) = s.pop_rtx(100).unwrap();
+        assert_eq!((ro, rb.as_slice(), rfin), (3, &b"aaaa"[3..], false));
+        assert!(!s.has_rtx());
+        // Both pieces are back in flight (plus the FIN chunk).
+        assert_eq!(s.sent_chunks.len(), 3);
+
+        // Ack everything including the FIN.
+        s.on_range_acked(0, 4, false);
+        s.on_range_acked(o3, b3.len() as u64, true);
+        assert!(!s.has_unacked());
+
+        // A PTO now has nothing to retransmit.
+        s.requeue_all_sent();
+        assert!(!s.has_rtx());
+    }
+
+    /// PTO requeue skips chunks whose ranges were acked in the
+    /// meantime, and a lost FIN-only frame is matched by offset.
+    #[test]
+    fn pto_requeue_skips_acked_ranges() {
+        let mut s = SendStream::new(1024);
+        let _ = s.enqueue(b"hello");
+        let (o1, b1, _) = s.carve(5).unwrap();
+        s.finish();
+        let (o2, b2, fin2) = s.carve(10).unwrap(); // FIN-only at 5
+        assert!(fin2 && b2.is_empty() && o2 == 5);
+        // Ack only the data chunk.
+        s.on_range_acked(o1, b1.len() as u64, false);
+        // PTO: only the FIN-only frame should be queued.
+        s.requeue_all_sent();
+        assert_eq!(s.peek_rtx(), Some((5, 0)));
+        let (ro, rb, rfin) = s.pop_rtx(0).unwrap();
+        assert!(ro == 5 && rb.is_empty() && rfin);
+        // Acking a FIN-bearing frame retires it for good.
+        s.on_range_acked(5, 0, true);
+        assert!(!s.has_unacked());
     }
 
     #[test]

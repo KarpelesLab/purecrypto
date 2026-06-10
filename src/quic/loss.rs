@@ -66,6 +66,24 @@ pub(crate) struct SentPacket {
     /// byte range. Phase-5 encoding is documented in
     /// [`build_retransmit_hint`].
     pub(crate) retransmit_hint: Vec<u8>,
+    /// STREAM chunks this packet carried. On ack, the connection
+    /// confirms the ranges (pruning the sender's retransmission state);
+    /// on loss, it queues them for retransmission.
+    pub(crate) stream_hints: Vec<StreamHint>,
+}
+
+/// One STREAM frame's `(id, offset, length, fin)` as carried by a sent
+/// packet — the stream-data analogue of [`CryptoHint`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamHint {
+    /// Stream identifier.
+    pub(crate) id: u64,
+    /// Stream byte offset of the chunk.
+    pub(crate) offset: u64,
+    /// Chunk length in bytes (0 for a FIN-only frame).
+    pub(crate) length: u64,
+    /// FIN bit of the frame.
+    pub(crate) fin: bool,
 }
 
 /// Per-PN-space state. RFC 9002 keeps three independent sets of sent
@@ -752,6 +770,7 @@ mod tests {
             in_flight,
             time_sent,
             retransmit_hint: Vec::new(),
+            stream_hints: Vec::new(),
         }
     }
 
