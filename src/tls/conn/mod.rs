@@ -2088,6 +2088,105 @@ mod loopback_tests {
         assert_eq!(server2.take_received_plaintext(), b"post-reject");
     }
 
+    /// RFC 8446 §8.2: the server compares the client's reported ticket age
+    /// (de-obfuscated with the ticket's `ticket_age_add`) against its own
+    /// expected age and refuses 0-RTT when they deviate beyond the window.
+    /// Tampering with the session's `age_add` skews the reported age by
+    /// ~60 s; 0-RTT must be refused while the resumption handshake itself
+    /// completes.
+    #[test]
+    fn zero_rtt_rejected_on_stale_ticket_age() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x55u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+
+        // Phase 1: establish a ticket.
+        let mut crng = HmacDrbg::<Sha256>::new(b"age0rtt-client-1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"age0rtt-server-1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let mut session = client.take_session().expect("ticket");
+        // Skew the obfuscator: the client now reports an age ~60 s larger
+        // than the server's expected age, well outside the ~10 s window.
+        session.age_add = session.age_add.wrapping_add(60_000);
+
+        // Phase 2: resume with the skewed age. 0-RTT must be refused;
+        // the PSK handshake completes.
+        let (server_config2, cert_der2) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0x55u8; 32])
+            .with_max_early_data(16384);
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der2).unwrap();
+
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"age0rtt-client-2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"age0rtt-server-2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        for _ in 0..16 {
+            let c = client2.write_tls();
+            if !c.is_empty() {
+                server2.read_tls(&c);
+                server2.process_new_packets().unwrap();
+            }
+            let s = server2.write_tls();
+            if !s.is_empty() {
+                client2.read_tls(&s);
+                client2.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client2.is_handshaking() && !server2.is_handshaking(),
+            "stale ticket age must refuse 0-RTT, not abort the handshake"
+        );
+        assert!(
+            !server2.early_data_accepted(),
+            "server must refuse 0-RTT when the reported ticket age is stale"
+        );
+        assert!(!client2.early_data_accepted());
+
+        // 1-RTT application data still flows.
+        client2.send_application_data(b"post-stale").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"post-stale");
+    }
+
     /// 0-RTT replay detection: when a ReplayWindow is shared across two
     /// servers, a second connection presenting the same binder is refused
     /// 0-RTT (the handshake still completes via the regular PSK path, so

@@ -513,6 +513,15 @@ impl ConfigBuilder {
         self
     }
     /// TLS 1.3 server: 0-RTT max early data size.
+    ///
+    /// 0-RTT data is replayable. The server enforces the RFC 8446 §8.2
+    /// ticket-age freshness window (~10 s), which bounds the replay
+    /// exposure in time but does not detect replays inside that window —
+    /// pair this knob with [`Self::replay_window`] (shared across all
+    /// instances accepting the same ticket key) when early data triggers
+    /// non-idempotent actions. Without a wall clock (`no_std`) the
+    /// freshness check is skipped and the replay window is the only
+    /// anti-replay protection.
     pub fn max_early_data(mut self, max: u32) -> Self {
         self.inner.max_early_data_size = max;
         self

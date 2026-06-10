@@ -604,6 +604,15 @@ impl ServerConfig {
     /// only through [`ServerConnection::take_early_data`] (never through
     /// `take_received_plaintext`) and callers should only act on it when
     /// doing so is idempotent.
+    ///
+    /// Anti-replay (RFC 8446 §8): the server always enforces the §8.2
+    /// ticket-age freshness window (~10 s), which bounds how long a
+    /// captured 0-RTT flight stays replayable but does NOT detect replays
+    /// inside that window. Deployments acting on early data should also
+    /// install a [`Self::with_replay_window`] shared across all server
+    /// instances that accept the same ticket key. On `no_std` builds
+    /// (no wall clock) the freshness check is unavailable and the
+    /// `ReplayWindow` is the only line of defense.
     pub fn with_max_early_data(mut self, max: u32) -> Self {
         self.max_early_data_size = max;
         self
@@ -1676,7 +1685,7 @@ impl<R: RngCore> ServerConnection<R> {
         // §4.2.10 forbids 0-RTT after HRR, so on retry we hard-disable it.
         let client_offered_early = ext::find(&ch.extensions, ExtensionType::EARLY_DATA).is_some();
         let mut accept_early = !is_retry
-            && psk_state.is_some()
+            && psk_state.as_ref().is_some_and(|s| s.age_fresh)
             && client_offered_early
             && self.config.max_early_data_size > 0;
         #[cfg(feature = "std")]
@@ -2645,7 +2654,8 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// Emits one NewSessionTicket (RFC 8446 §4.6.1) under the current write
     /// key. The ticket is a `nonce(12) ‖ AES-256-GCM(ticket_key, nonce, cleartext)`
-    /// blob where `cleartext = creation_unix_time_u64 ‖ psk ‖ alpn_len_u8 ‖ alpn`.
+    /// blob where `cleartext = creation_unix_time_u64 ‖ ticket_age_add_u32 ‖
+    /// psk ‖ alpn_len_u8 ‖ alpn`.
     fn emit_session_ticket(&mut self) -> Result<(), Error> {
         if !self.pending_nst {
             return Ok(());
@@ -2666,12 +2676,20 @@ impl<R: RngCore> ServerConnection<R> {
         let mut psk = alloc::vec![0u8; hash_len];
         psk_from_resumption(suite.hash, &rms, &ticket_nonce, &mut psk);
 
+        // ticket_age_add: 4 random bytes. Generated before the plaintext is
+        // assembled because the ticket embeds a copy — the §8.2 freshness
+        // check needs it back to de-obfuscate the client's reported age.
+        let mut age_add_bytes = [0u8; 4];
+        self.rng.fill_bytes(&mut age_add_bytes);
+        let ticket_age_add = u32::from_be_bytes(age_add_bytes);
+
         // ticket plaintext.
         let creation = system_now_u64();
         let alpn = self.alpn_negotiated.as_ref();
         let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
-        let mut plain = Vec::with_capacity(8 + hash_len + 1 + alpn_len as usize);
+        let mut plain = Vec::with_capacity(8 + 4 + hash_len + 1 + alpn_len as usize);
         plain.extend_from_slice(&creation.to_be_bytes());
+        plain.extend_from_slice(&age_add_bytes);
         plain.extend_from_slice(&psk);
         plain.push(alpn_len);
         if let Some(a) = alpn {
@@ -2689,11 +2707,6 @@ impl<R: RngCore> ServerConnection<R> {
         ticket.extend_from_slice(&nonce);
         ticket.extend_from_slice(&buf);
         ticket.extend_from_slice(&tag);
-
-        // ticket_age_add: 4 random bytes.
-        let mut age_add_bytes = [0u8; 4];
-        self.rng.fill_bytes(&mut age_add_bytes);
-        let ticket_age_add = u32::from_be_bytes(age_add_bytes);
 
         let mut extensions = Vec::new();
         if self.config.max_early_data_size > 0 {
@@ -2783,7 +2796,20 @@ struct AcceptedPsk {
     /// (empty when none was). RFC 8446 §4.2.10: 0-RTT may only be accepted
     /// when the new connection selects the identical protocol.
     alpn: Vec<u8>,
+    /// RFC 8446 §8.2: whether the client's reported ticket age
+    /// (de-obfuscated with `ticket_age_add`) agrees with the server-side
+    /// expected age within [`MAX_TICKET_AGE_DEVIATION_MS`]. `false` refuses
+    /// 0-RTT only — 1-RTT resumption proceeds normally. Always `true` when
+    /// the server has no wall clock (`no_std`), where freshness cannot be
+    /// assessed and anti-replay falls back to the optional `ReplayWindow`.
+    age_fresh: bool,
 }
+
+/// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
+/// client's reported ticket age and the server-side expected age before
+/// 0-RTT is refused. Covers the round-trip time of the ClientHello plus the
+/// one-second granularity of the ticket's embedded creation timestamp.
+const MAX_TICKET_AGE_DEVIATION_MS: u64 = 10_000;
 
 impl<R: RngCore> ServerConnection<R> {
     /// Tries to accept a `pre_shared_key` offer from the ClientHello.
@@ -2821,11 +2847,16 @@ impl<R: RngCore> ServerConnection<R> {
 
         // RFC 8446 §4.2.11: pick the first identity whose ticket decrypts
         // cleanly. Then verify its binder; mismatch is fatal.
-        for (idx, (ticket, _age)) in identities.iter().enumerate() {
+        for (idx, (ticket, obfuscated_age)) in identities.iter().enumerate() {
             let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
-            let TicketPlaintext { psk, alpn } = decrypted;
+            let TicketPlaintext {
+                psk,
+                alpn,
+                creation_secs,
+                age_add,
+            } = decrypted;
             let hash = match psk.len() {
                 32 => HashAlg::Sha256,
                 48 => HashAlg::Sha384,
@@ -2858,23 +2889,47 @@ impl<R: RngCore> ServerConnection<R> {
             {
                 return Err(Error::DecryptError);
             }
-            return Ok(Some(AcceptedPsk { psk, hash, alpn }));
+            // RFC 8446 §8.2: ticket-age freshness. The client reports the
+            // ticket's age in milliseconds, obfuscated by `ticket_age_add`;
+            // de-obfuscate it and require agreement with our own view
+            // (now − issuance) within a small window. A stale or
+            // forward-dated report marks the PSK as unfit for 0-RTT —
+            // resumption itself is unaffected. With no wall clock
+            // (`now == 0`, no_std) the check is skipped, matching the
+            // ticket-lifetime fallback above.
+            let age_fresh = if now == 0 {
+                true
+            } else {
+                let client_age_ms = obfuscated_age.wrapping_sub(age_add) as u64;
+                let expected_age_ms = now.saturating_sub(creation_secs).saturating_mul(1000);
+                client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
+            };
+            return Ok(Some(AcceptedPsk {
+                psk,
+                hash,
+                alpn,
+                age_fresh,
+            }));
         }
         Ok(None)
     }
 }
 
 /// Decoded ticket payload: the original PSK plus the ALPN protocol that was
-/// negotiated on the connection that issued the ticket (empty when none was).
+/// negotiated on the connection that issued the ticket (empty when none was),
+/// the issuance timestamp, and the `ticket_age_add` obfuscator — the latter
+/// two feed the RFC 8446 §8.2 ticket-age freshness check on 0-RTT.
 struct TicketPlaintext {
     psk: Vec<u8>,
     alpn: Vec<u8>,
+    creation_secs: u64,
+    age_add: u32,
 }
 
 /// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
-/// ciphertext ‖ tag(16)`, with `cleartext = creation_u64 ‖ psk(hash_len) ‖
-/// alpn_len_u8 ‖ alpn`. Returns `None` on any structural or authentication
-/// failure.
+/// ciphertext ‖ tag(16)`, with `cleartext = creation_u64 ‖ age_add_u32 ‖
+/// psk(hash_len) ‖ alpn_len_u8 ‖ alpn`. Returns `None` on any structural or
+/// authentication failure.
 ///
 /// RFC 8446 §4.6.1 + §8.1: when `now_secs > 0`, the embedded
 /// `creation_unix_time_u64` is enforced against `ticket_lifetime_secs`
@@ -2902,11 +2957,13 @@ fn decrypt_ticket(
     if gcm.decrypt(nonce, &[], &mut buf, tag).is_err() {
         return None;
     }
-    // Parse plaintext: 8-byte creation timestamp + psk + alpn_len + alpn.
-    if buf.len() < 8 + 1 {
+    // Parse plaintext: 8-byte creation timestamp + 4-byte ticket_age_add +
+    // psk + alpn_len + alpn.
+    if buf.len() < 8 + 4 + 1 {
         return None;
     }
     let creation_secs = u64::from_be_bytes(buf[..8].try_into().ok()?);
+    let age_add = u32::from_be_bytes(buf[8..12].try_into().ok()?);
     // RFC 8446 §4.6.1 + §8.1: enforce ticket age. Skip the check when the
     // server has no wall clock (`now_secs == 0`, matching the TLS 1.2
     // fallback in `server12.rs::try_resume`) or when the lifetime is
@@ -2924,9 +2981,10 @@ fn decrypt_ticket(
             return None;
         }
     }
-    let rest = &buf[8..];
-    // PSK length: derived by total - 8 (creation) - 1 (alpn_len) - alpn_len.
-    // PSK length is either 32 or 48; alpn_len is the last layout field, so:
+    let rest = &buf[12..];
+    // PSK length: derived by total - 12 (creation + age_add) - 1 (alpn_len)
+    // - alpn_len. PSK length is either 32 or 48; alpn_len is the last layout
+    // field, so:
     //   psk = rest[..psk_len]; alpn_len = rest[psk_len]; alpn = rest[psk_len+1..].
     // We try 32 first, then 48. Either is uniquely identified by checking
     // the length field's plausibility.
@@ -2938,7 +2996,12 @@ fn decrypt_ticket(
         if rest.len() == psk_len + 1 + alpn_len {
             let psk = rest[..psk_len].to_vec();
             let alpn = rest[psk_len + 1..].to_vec();
-            return Some(TicketPlaintext { psk, alpn });
+            return Some(TicketPlaintext {
+                psk,
+                alpn,
+                creation_secs,
+                age_add,
+            });
         }
     }
     None
@@ -3049,12 +3112,14 @@ mod tests {
         );
     }
 
-    /// Build a synthetic ticket whose plaintext header carries `creation_secs`
-    /// and a 32-byte PSK; matches the layout emitted by `emit_session_ticket`.
+    /// Build a synthetic ticket whose plaintext header carries `creation_secs`,
+    /// a zero `ticket_age_add` and a 32-byte PSK; matches the layout emitted
+    /// by `emit_session_ticket`.
     fn synth_ticket(key: &[u8; 32], creation_secs: u64, alpn: &[u8]) -> Vec<u8> {
         use crate::cipher::{Aes256, Gcm};
-        let mut plain = Vec::with_capacity(8 + 32 + 1 + alpn.len());
+        let mut plain = Vec::with_capacity(8 + 4 + 32 + 1 + alpn.len());
         plain.extend_from_slice(&creation_secs.to_be_bytes());
+        plain.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
         plain.extend_from_slice(&[0xABu8; 32]); // 32-byte PSK
         plain.push(alpn.len() as u8);
         plain.extend_from_slice(alpn);
