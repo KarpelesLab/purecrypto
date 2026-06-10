@@ -94,7 +94,9 @@ impl core::error::Error for Error {}
 
 /// Computes Argon2 over `(password, salt, secret, ad)` with the chosen
 /// parameters, writing `out.len()` bytes into `out`. `out.len()` must be
-/// in `4..=2^32 − 1`.
+/// in `4..=2^32 − 1` and `salt.len()` in `8..=2^32 − 1` (RFC 9106 §3.1:
+/// the reference implementation's 8-byte minimum; 16 bytes is
+/// recommended).
 pub fn argon2(
     params: &Argon2Params,
     password: &[u8],
@@ -124,6 +126,11 @@ pub fn argon2(
         || secret.len() > u32::MAX as usize
         || ad.len() > u32::MAX as usize
     {
+        return Err(Error::InvalidParam);
+    }
+    // RFC 9106 §3.1 / reference implementation: at least 8 bytes of salt.
+    // Shorter (or empty) salts gut Argon2's defense against precomputation.
+    if salt.len() < 8 {
         return Err(Error::InvalidParam);
     }
 
@@ -649,5 +656,23 @@ mod tests {
             argon2(&bad_v, b"p", b"saltsalt", b"", b"", &mut out),
             Err(Error::InvalidParam)
         );
+        // Salt below the RFC 9106 8-byte minimum (incl. empty) is rejected.
+        let ok = Argon2Params {
+            t_cost: 1,
+            m_cost_kib: 32,
+            parallelism: 4,
+            variant: Argon2Type::Argon2id,
+            version: 0x13,
+        };
+        assert_eq!(
+            argon2(&ok, b"p", b"7bytes!", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
+        assert_eq!(
+            argon2(&ok, b"p", b"", b"", b"", &mut out),
+            Err(Error::InvalidParam)
+        );
+        // The 8-byte boundary itself is accepted.
+        assert!(argon2(&ok, b"p", b"saltsalt", b"", b"", &mut out).is_ok());
     }
 }
