@@ -4,7 +4,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ascon::AsconAead128;
 use crate::cipher::{
     Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp, Aes256,
@@ -277,7 +277,14 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 _ => unreachable!(),
             };
             return match res {
-                Ok(pt_bytes) => unsafe { out_write(&pt_bytes, pt, pt_len) },
+                Ok(mut pt_bytes) => {
+                    let st = unsafe { out_write(&pt_bytes, pt, pt_len) };
+                    // Scrub the recovered plaintext before its backing
+                    // storage is returned to the allocator (mirrors
+                    // pc_sm2_decrypt / pc_rsa_decrypt_oaep).
+                    wipe_vec(&mut pt_bytes);
+                    st
+                }
                 Err(_) => PcStatus::Verification,
             };
         }
@@ -412,9 +419,17 @@ pub unsafe extern "C" fn pc_aead_decrypt(
             _ => return PcStatus::Unsupported,
         };
         if !ok {
+            // Some modes decrypt in place before the tag check fails, so
+            // `buf` may hold (unauthenticated) plaintext — scrub it too.
+            wipe_vec(&mut buf);
             return PcStatus::Verification;
         }
-        unsafe { out_write(&buf, pt, pt_len) }
+        let st = unsafe { out_write(&buf, pt, pt_len) };
+        // Scrub the recovered plaintext before its backing storage is
+        // returned to the allocator (mirrors pc_sm2_decrypt /
+        // pc_rsa_decrypt_oaep).
+        wipe_vec(&mut buf);
+        st
     })
 }
 
@@ -492,9 +507,15 @@ pub unsafe extern "C" fn pc_aes_kw_unwrap(
             _ => return PcStatus::Unsupported,
         };
         if res.is_err() {
+            // The buffer may hold a partially unwrapped key — scrub it.
+            wipe_vec(&mut plain);
             return PcStatus::Verification;
         }
-        unsafe { out_write(&plain, out, out_len) }
+        let st = unsafe { out_write(&plain, out, out_len) };
+        // Scrub the unwrapped key material before its backing storage is
+        // returned to the allocator.
+        wipe_vec(&mut plain);
+        st
     })
 }
 
@@ -573,10 +594,20 @@ pub unsafe extern "C" fn pc_aes_kwp_unwrap(
         };
         let n = match n {
             Ok(n) => n,
-            Err(_) => return PcStatus::Verification,
+            Err(_) => {
+                // The buffer may hold a partially unwrapped key — scrub it.
+                wipe_vec(&mut plain);
+                return PcStatus::Verification;
+            }
         };
-        plain.truncate(n);
-        unsafe { out_write(&plain, out, out_len) }
+        // Deliver `plain[..n]` without truncating first: truncate() would
+        // leave the padding tail beyond `n` in the allocation, out of
+        // wipe_vec's reach.
+        let st = unsafe { out_write(&plain[..n], out, out_len) };
+        // Scrub the unwrapped key material (full buffer, padding included)
+        // before its backing storage is returned to the allocator.
+        wipe_vec(&mut plain);
+        st
     })
 }
 
