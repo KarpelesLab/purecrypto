@@ -1858,8 +1858,17 @@ impl ClientConnection {
         // On mismatch, leave the transcript alone (outer prevails)
         // and let EE processing surface a rejection via retry_configs
         // in wave 3b.4.
+        //
+        // When an HRR already rejected ECH (no valid confirmation in
+        // the HRR — draft §6.1.4), the decision is final: the SH signal
+        // is not consulted, the handshake stays on the outer path, and
+        // a server cannot flip to "accepted" after the fact.
         #[cfg(feature = "ech")]
-        if let Some(state) = self.ech_state.as_mut() {
+        if let Some(state) = self
+            .ech_state
+            .as_mut()
+            .filter(|s| !matches!(s.outcome, Some(EchOutcome::Rejected)))
+        {
             let mut sh_zero_tail: Vec<u8> = raw.to_vec();
             // Handshake wire: 1 (type) + 3 (length) + 2 (version) + 32
             // (random) → random[24..32] is at bytes 30..38.
@@ -2142,6 +2151,28 @@ impl ClientConnection {
             // bytes here.
             let (outer, inner) = self.seal_real_ech_on_ch2(&share_only, &extras)?;
             (outer, Some(inner))
+        } else if self.ech_state.is_some() {
+            // Real ECH was attempted on CH1 but the HRR carried no
+            // (valid) confirmation: per draft-ietf-tls-esni-22 §6.1.4
+            // the server has rejected ECH and the handshake continues
+            // under the OUTER identity (§6.1.6). CH2 MUST therefore be
+            // built exactly like CH1 — public_name as the cleartext SNI
+            // and the inner CH re-sealed under the retained HPKE
+            // context (§7.1.1: the server ignores the second payload on
+            // the rejection path) — never with the real `server_name`,
+            // which is the very thing ECH exists to hide (§10.10.4).
+            // Unlike the accept arm above, the transcript stays on the
+            // OUTER wire bytes: the server negotiated against
+            // CH1-outer. Record the rejection now so the SH processing
+            // skips the accept-signal check (the decision is final at
+            // HRR time) and the certificate is verified against
+            // `outer_public_name`. If re-sealing fails, fail closed —
+            // aborting is always preferable to leaking the inner SNI.
+            if let Some(state) = self.ech_state.as_mut() {
+                state.outcome = Some(EchOutcome::Rejected);
+            }
+            let (outer, _inner) = self.seal_real_ech_on_ch2(&share_only, &extras)?;
+            (outer, None)
         } else {
             let ch = self.build_client_hello(
                 self.client_random,
@@ -2206,9 +2237,15 @@ impl ClientConnection {
     /// field; the AEAD seq increments to 1 by virtue of reusing the
     /// same HPKE schedule rather than spinning up a fresh sender.
     ///
-    /// On real-ECH GREASE / config-mismatch / non-ECH paths the caller
-    /// builds CH2 directly via `build_client_hello`; this function is
-    /// only reached when CH1's HRR carried a validated ECH signal.
+    /// On GREASE / non-ECH paths the caller builds CH2 directly via
+    /// `build_client_hello`; this function is reached whenever CH1
+    /// attempted real ECH — both when the HRR carried a validated ECH
+    /// confirmation (accept path: inner bytes go into the transcript)
+    /// and when it did not (reject path, draft §6.1.4/§6.1.6: the
+    /// handshake continues under the outer identity, the transcript
+    /// stays on the outer bytes, and the sealed payload merely keeps
+    /// CH2 shaped like CH1 so the real `server_name` never appears in
+    /// cleartext).
     ///
     /// Returns `(outer_ch2, inner_ch2)`: the outer goes on the wire (so
     /// the server can HPKE-decap CH2-outer under the retained sender),
@@ -3456,5 +3493,102 @@ mod tests {
             .unwrap()
             .expect("inner SNI present");
         assert_eq!(inner_sni_parsed, inner_sni);
+    }
+
+    /// draft-ietf-tls-esni-22 §6.1.4/§6.1.6: when the client attempted
+    /// real ECH and the server's HelloRetryRequest does NOT confirm ECH
+    /// acceptance, the handshake continues under the OUTER identity.
+    /// CH2 must keep `public_name` as its cleartext SNI (and still carry
+    /// an `encrypted_client_hello` extension) — it must never fall back
+    /// to emitting the real inner `server_name` in cleartext, which is
+    /// exactly the name ECH exists to hide.
+    #[cfg(feature = "ech")]
+    #[test]
+    fn ech_hrr_without_confirmation_does_not_leak_inner_sni() {
+        use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
+        use crate::tls::codec::{CipherSuite, HRR_RANDOM, ServerHello};
+        use crate::tls::ech::HpkeSymCipherSuite;
+        use crate::tls::ech::keys::EchKeyPair;
+
+        // Fresh server-side ECH key with public_name = "public.example".
+        let mut keygen_rng = HmacDrbg::<Sha256>::new(b"ech-hrr-keygen", b"nonce", &[]);
+        let suites = alloc::vec![HpkeSymCipherSuite {
+            kdf_id: HpkeKdf::HkdfSha256.id(),
+            aead_id: HpkeAead::Aes128Gcm.id(),
+        }];
+        let pair = EchKeyPair::generate(
+            &mut keygen_rng,
+            HpkeKem::DhkemX25519HkdfSha256,
+            0x42,
+            b"public.example",
+            64,
+            suites,
+        )
+        .expect("ech keygen");
+        let list = crate::tls::ech::EchConfigList::new(alloc::vec![pair.config().clone()]);
+
+        let mut cfg = ClientConfig::new(RootCertStore::new());
+        cfg.ech = Some(crate::tls::ech::EchClient::from_config_list(list));
+
+        let inner_sni = "secret.example";
+        let mut rng = HmacDrbg::<Sha256>::new(b"ech-hrr-client", b"nonce", &[]);
+        let mut client = ClientConnection::new(cfg, inner_sni, &mut rng).unwrap();
+        // Drain CH1.
+        let _ = client.write_tls();
+
+        // HelloRetryRequest with a cookie and NO encrypted_client_hello
+        // confirmation extension: an ECH-unaware (or rejecting) server.
+        let cookie_body: alloc::vec::Vec<u8> = alloc::vec![0x00, 0x04, 0xde, 0xad, 0xbe, 0xef];
+        let hrr = ServerHello {
+            random: HRR_RANDOM,
+            session_id: alloc::vec![],
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType(0x002c), cookie_body),
+            ],
+        };
+        let raw = hrr.encode();
+        let mut c = ReadCursor::new(&raw);
+        assert_eq!(c.u8().unwrap(), hs_type::SERVER_HELLO);
+        let body = c.vec_u24().unwrap();
+        client
+            .on_server_hello(hs_type::SERVER_HELLO, body, &raw)
+            .expect("HRR without ECH confirmation must be processable");
+
+        // CH2 goes out next. It must NOT contain the inner SNI in
+        // cleartext anywhere in the record stream.
+        let out = client.write_tls();
+        assert!(
+            !out.windows(inner_sni.len())
+                .any(|w| w == inner_sni.as_bytes()),
+            "CH2 leaks the real (inner) server_name in cleartext"
+        );
+
+        // And structurally: CH2's SNI is the ECHConfig public_name and
+        // the encrypted_client_hello extension is still present.
+        let rec = read_record(&out).unwrap().unwrap();
+        assert_eq!(rec.content_type, ContentType::Handshake);
+        let mut hc = ReadCursor::new(rec.fragment);
+        assert_eq!(hc.u8().unwrap(), hs_type::CLIENT_HELLO);
+        let ch2_body = hc.vec_u24().unwrap();
+        let ch2 = ClientHello::decode(ch2_body).unwrap();
+        let sni_body =
+            ext::find(&ch2.extensions, ExtensionType::SERVER_NAME).expect("CH2 has SNI extension");
+        let sni = crate::tls::codec::extension::parse_server_name(sni_body)
+            .unwrap()
+            .expect("CH2 SNI present");
+        assert_eq!(sni, "public.example");
+        assert!(
+            ext::find(&ch2.extensions, ExtensionType::ENCRYPTED_CLIENT_HELLO).is_some(),
+            "CH2 must keep the encrypted_client_hello extension on the rejection path"
+        );
+        // The cookie must be echoed verbatim (RFC 8446 §4.1.4).
+        let echoed = ch2
+            .extensions
+            .iter()
+            .find(|(t, _)| t.0 == 0x002c)
+            .expect("CH2 echoes the cookie");
+        assert_eq!(echoed.1, alloc::vec![0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]);
     }
 }
