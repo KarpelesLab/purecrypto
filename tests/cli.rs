@@ -2435,6 +2435,282 @@ fn pkeyutl_rsa_oaep_round_trip() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// PKCS#1 v1.5 encryption padding (the default) must warn on both encrypt and
+/// decrypt, and every decrypt failure must collapse into the single fixed
+/// "decrypt failed" string — anything cause-specific is a Bleichenbacher
+/// oracle for callers who loop this CLI over untrusted ciphertexts.
+#[test]
+fn pkeyutl_rsa_pkcs1_warns_and_uniform_decrypt_error() {
+    let dir = std::env::temp_dir().join(format!("pc_pkcs1_warn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-bits",
+                "2048",
+                "-out",
+                &p("rsa.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("rsa.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("rsa.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"pkcs1 warning round trip").unwrap();
+
+    // Encrypt with the implicit pkcs1 default: must warn, must still succeed.
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "encrypt",
+            "-inkey",
+            &p("rsa.pub"),
+            "-pubin",
+            "-in",
+            &p("msg.bin"),
+            "-out",
+            &p("ct.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "pkcs1 encrypt failed: {err}");
+    assert!(
+        err.contains("rsa_padding_mode:pkcs1") && err.contains("rsa_padding_mode:oaep"),
+        "expected pkcs1 encrypt warning, got stderr: {err}"
+    );
+
+    // Decrypt likewise warns (with the oracle caveat) and round-trips.
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "decrypt",
+            "-inkey",
+            &p("rsa.key"),
+            "-in",
+            &p("ct.bin"),
+            "-out",
+            &p("rt.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "pkcs1 decrypt failed: {err}");
+    assert!(
+        err.contains("padding oracle") && err.contains("untrusted ciphertexts"),
+        "expected pkcs1 decrypt oracle warning, got stderr: {err}"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("rt.bin")).unwrap(),
+        b"pkcs1 warning round trip"
+    );
+
+    // Failure 1: bit-flipped ciphertext (padding failure inside the modulus).
+    let mut bad = std::fs::read(dir.join("ct.bin")).unwrap();
+    bad[40] ^= 0x55;
+    std::fs::write(dir.join("bad.bin"), &bad).unwrap();
+    let (_out, err_pad, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "decrypt",
+            "-inkey",
+            &p("rsa.key"),
+            "-in",
+            &p("bad.bin"),
+            "-out",
+            &p("rt2.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+
+    // Failure 2: wrong-length garbage (a length failure, not a padding one).
+    std::fs::write(dir.join("short.bin"), b"way too short").unwrap();
+    let (_out, err_len, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "decrypt",
+            "-inkey",
+            &p("rsa.key"),
+            "-in",
+            &p("short.bin"),
+            "-out",
+            &p("rt3.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+
+    // Both failures print the fixed string with no cause detail, and the two
+    // stderr transcripts are byte-identical (warning + uniform error).
+    for err in [&err_pad, &err_len] {
+        assert!(
+            err.contains("purecrypto: decrypt failed"),
+            "expected uniform decrypt error, got stderr: {err}"
+        );
+        assert!(
+            !err.contains("PKCS1 decrypt failed"),
+            "cause-specific decrypt error leaked: {err}"
+        );
+    }
+    assert_eq!(
+        err_pad, err_len,
+        "padding vs length failures must be indistinguishable"
+    );
+
+    // OAEP must NOT trigger the pkcs1 warning, and its failures collapse into
+    // the same fixed string.
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "encrypt",
+            "-inkey",
+            &p("rsa.pub"),
+            "-pubin",
+            "-pkeyopt",
+            "rsa_padding_mode:oaep",
+            "-in",
+            &p("msg.bin"),
+            "-out",
+            &p("ct_oaep.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert!(
+        !err.contains("warning"),
+        "OAEP encrypt should not warn, got stderr: {err}"
+    );
+    let mut bad = std::fs::read(dir.join("ct_oaep.bin")).unwrap();
+    bad[40] ^= 0x55;
+    std::fs::write(dir.join("bad_oaep.bin"), &bad).unwrap();
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "decrypt",
+            "-inkey",
+            &p("rsa.key"),
+            "-pkeyopt",
+            "rsa_padding_mode:oaep",
+            "-in",
+            &p("bad_oaep.bin"),
+            "-out",
+            &p("rt4.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(
+        err.contains("purecrypto: decrypt failed") && !err.contains("OAEP decrypt failed"),
+        "expected uniform OAEP decrypt error, got stderr: {err}"
+    );
+    assert!(
+        !err.contains("warning"),
+        "OAEP decrypt should not warn, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `digest:sha1` must warn when SIGNING (new SHA-1 signatures), but verifying
+/// a legacy SHA-1 signature stays silent.
+#[test]
+fn pkeyutl_rsa_sha1_sign_warns_verify_silent() {
+    let dir = std::env::temp_dir().join(format!("pc_sha1_warn_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-bits",
+                "2048",
+                "-out",
+                &p("rsa.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pub_pem, ok) = run(&["pkey", "-in", &p("rsa.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("rsa.pub"), pub_pem).unwrap();
+    std::fs::write(dir.join("msg.bin"), b"sha1 legacy message").unwrap();
+
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "sign",
+            "-inkey",
+            &p("rsa.key"),
+            "-pkeyopt",
+            "digest:sha1",
+            "-in",
+            &p("msg.bin"),
+            "-out",
+            &p("sig.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "sha1 sign failed: {err}");
+    assert!(
+        err.contains("digest:sha1 is collision-broken"),
+        "expected sha1 signing warning, got stderr: {err}"
+    );
+
+    // Verification of the legacy signature succeeds with no warning.
+    let (vout, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "verify",
+            "-inkey",
+            &p("rsa.pub"),
+            "-pkeyopt",
+            "digest:sha1",
+            "-sigfile",
+            &p("sig.bin"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{vout}");
+    assert!(
+        !err.contains("collision-broken"),
+        "verify must stay silent for sha1, got stderr: {err}"
+    );
+
+    // And the default (sha256) signing path stays warning-free.
+    let (_out, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "sign",
+            "-inkey",
+            &p("rsa.key"),
+            "-in",
+            &p("msg.bin"),
+            "-out",
+            &p("sig256.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert!(
+        !err.contains("warning"),
+        "sha256 signing should not warn, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn pkeyutl_rsa_pss_sign_verify() {
     let dir = std::env::temp_dir().join(format!("pc_pss_{}", std::process::id()));

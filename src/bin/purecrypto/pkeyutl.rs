@@ -318,6 +318,26 @@ fn try_load_sm2_public(path: &str) -> Option<Sm2PublicKey> {
         .map(|sk| sk.public_key())
 }
 
+/// Emits the stderr warning for PKCS#1 v1.5 encryption padding (the
+/// OpenSSL-compatible default for `encrypt`/`decrypt`). The padding itself is
+/// legacy, and the decrypt failure modes form a Bleichenbacher oracle the
+/// moment the command is driven by attacker-supplied ciphertexts, so the
+/// decrypt variant spells that risk out.
+fn warn_pkcs1_padding(decrypt: bool) {
+    if decrypt {
+        eprintln!(
+            "purecrypto: warning: rsa_padding_mode:pkcs1 (the default) decryption is a \
+             Bleichenbacher padding oracle; do not expose this command to untrusted \
+             ciphertexts in a loop. Prefer -pkeyopt rsa_padding_mode:oaep"
+        );
+    } else {
+        eprintln!(
+            "purecrypto: warning: rsa_padding_mode:pkcs1 (the default) is legacy; \
+             prefer -pkeyopt rsa_padding_mode:oaep"
+        );
+    }
+}
+
 fn run_encrypt(args: Args) {
     let in_path = args.value("-in").or_else(|| args.value("--in"));
     let pt = read_input(in_path);
@@ -339,6 +359,10 @@ fn run_encrypt(args: Args) {
         return;
     }
 
+    // From here on the key is RSA, so the padding mode actually applies.
+    if padding == "pkcs1" {
+        warn_pkcs1_padding(/* decrypt = */ false);
+    }
     let ct = if args.flag("-pubin") || args.flag("--pubin") {
         let any = load_spki(inkey);
         let rsa = match any {
@@ -411,9 +435,9 @@ fn run_decrypt(args: Args) {
     let key = load_priv(inkey);
     // SM2 hybrid PKE decrypt routes to the SM2 private key.
     if let PrivKey::Sm2(sk) = &key {
-        let pt = sk
-            .decrypt(&ct)
-            .unwrap_or_else(|e| die(format!("SM2 decrypt failed: {e:?}")));
+        // Fixed failure string (see the RSA paths below): the C3 tag check vs
+        // malformed-C1 vs length causes must stay indistinguishable.
+        let pt = sk.decrypt(&ct).unwrap_or_else(|_| die("decrypt failed"));
         let out_path = args.value("-out").or_else(|| args.value("--out"));
         // Recovered plaintext is typically a wrapped key: write it like the
         // kem/kex secrets (0600, create_new, refuse a TTY) rather than a
@@ -425,25 +449,32 @@ fn run_decrypt(args: Args) {
         PrivKey::Rsa(k) => k,
         _ => die("RSA decrypt requires an RSA key"),
     };
+    if padding == "pkcs1" {
+        warn_pkcs1_padding(/* decrypt = */ true);
+    }
+    // All decryption failures collapse into one fixed string with no
+    // underlying detail: distinguishing bad-padding from bad-length (etc.) is
+    // exactly the Bleichenbacher / Manger oracle, and anyone wrapping this
+    // one-shot CLI in a network-facing loop would hand it to the attacker.
     let pt = match padding {
         "oaep" => {
             let md = opts.oaep_md.as_deref().unwrap_or("sha256");
             match md.to_ascii_lowercase().as_str() {
                 "sha256" => rsa
                     .decrypt_oaep::<Sha256>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|e| die(format!("OAEP decrypt failed: {e}"))),
+                    .unwrap_or_else(|_| die("decrypt failed")),
                 "sha384" => rsa
                     .decrypt_oaep::<Sha384>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|e| die(format!("OAEP decrypt failed: {e}"))),
+                    .unwrap_or_else(|_| die("decrypt failed")),
                 "sha512" => rsa
                     .decrypt_oaep::<Sha512>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|e| die(format!("OAEP decrypt failed: {e}"))),
+                    .unwrap_or_else(|_| die("decrypt failed")),
                 _ => die(format!("unsupported rsa_oaep_md: {md}")),
             }
         }
         "pkcs1" => rsa
             .decrypt_pkcs1v15(&ct)
-            .unwrap_or_else(|e| die(format!("PKCS1 decrypt failed: {e}"))),
+            .unwrap_or_else(|_| die("decrypt failed")),
         other => die(format!("unsupported rsa_padding_mode: {other}")),
     };
     let out_path = args.value("-out").or_else(|| args.value("--out"));
@@ -501,7 +532,16 @@ fn run_sign(args: Args) {
                     "sha256" => k.sign_pkcs1v15::<Sha256>(&msg),
                     "sha384" => k.sign_pkcs1v15::<Sha384>(&msg),
                     "sha512" => k.sign_pkcs1v15::<Sha512>(&msg),
-                    "sha1" => k.sign_pkcs1v15::<Sha1>(&msg),
+                    "sha1" => {
+                        // Creating NEW SHA-1 signatures deserves a nudge
+                        // (collisions are practical); verifying legacy ones is
+                        // fine, so `run_verify` stays silent.
+                        eprintln!(
+                            "purecrypto: warning: digest:sha1 is collision-broken for \
+                             signing; use digest:sha256 or stronger"
+                        );
+                        k.sign_pkcs1v15::<Sha1>(&msg)
+                    }
                     _ => die(format!("unsupported RSA digest: {digest}")),
                 }
                 .unwrap_or_else(|e| die(format!("RSA sign failed: {e}")))
