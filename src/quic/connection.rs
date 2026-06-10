@@ -37,7 +37,8 @@ use crate::quic::loss::{CryptoHint, SentPacket, build_retransmit_hint, parse_ret
 use crate::quic::path::PathChallengeState;
 use crate::quic::pkt::{
     LongHeader, LongType, QUIC_V1, ShortHeader, apply_header_protection, build_long_header,
-    build_retry, build_short_header, remove_header_protection, retry_integrity_tag,
+    build_retry, build_short_header, check_reserved_bits, remove_header_protection,
+    retry_integrity_tag,
 };
 use crate::quic::pn::{PnSpaceId, decode_packet_number, encode_packet_number_length};
 use crate::quic::retry::encode_addr as encode_retry_addr;
@@ -2387,6 +2388,10 @@ impl QuicConnection {
         // AAD = unprotected header bytes [0 .. pn_offset + pn_len].
         let aad_end = hdr.pn_offset + pn_len as usize;
         let aad: Vec<u8> = pkt[..aad_end].to_vec();
+        // Snapshot the unprotected first byte for the post-AEAD
+        // reserved-bit check (the mutable `ct_with_tag` borrow below
+        // makes `pkt[0]` inaccessible later).
+        let first_byte = pkt[0];
         // Ciphertext (including 16-byte tag) is [aad_end .. pkt_total_len].
         let ct_with_tag = &mut pkt[aad_end..];
         if ct_with_tag.len() < 16 {
@@ -2414,6 +2419,13 @@ impl QuicConnection {
             let _ = self.bump_rx_aead_failure(level)?;
             return Ok(pkt_total_len);
         }
+
+        // RFC 9000 §17.2 — the long-header reserved bits (0x0c) MUST be
+        // zero after header-protection removal; non-zero is a connection
+        // error of type PROTOCOL_VIOLATION. Checked only now, after the
+        // AEAD tag verified, so a forged packet cannot tear the
+        // connection down (it is silently dropped above instead).
+        check_reserved_bits(first_byte, true)?;
 
         // RFC 9001 §9.5 — per-key PN replay. A successfully-AEAD'd
         // packet with a PN we've already accepted under the same key
@@ -2489,6 +2501,9 @@ impl QuicConnection {
 
         let aad_end = hdr.pn_offset + pn_len as usize;
         let aad: Vec<u8> = pkt[..aad_end].to_vec();
+        // Snapshot the unprotected first byte for the post-AEAD
+        // reserved-bit check (see the long-header path).
+        let first_byte = pkt[0];
         let ct_with_tag = &mut pkt[aad_end..];
         if ct_with_tag.len() < 16 {
             return Err(Error::Decode);
@@ -2561,6 +2576,13 @@ impl QuicConnection {
             false
         };
         let _ = opened_with_prev;
+
+        // RFC 9000 §17.3.1 — the short-header reserved bits (0x18) MUST
+        // be zero after header-protection removal; non-zero is a
+        // connection error of type PROTOCOL_VIOLATION. Checked only now,
+        // after AEAD authentication succeeded (on either the primary or
+        // previous-phase keys), so forged packets stay silent drops.
+        check_reserved_bits(first_byte, false)?;
 
         // RFC 9001 §9.5 — per-key PN replay check. The Application PN
         // space's replay window lives on the OneRtt level (1-RTT rx

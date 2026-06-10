@@ -461,6 +461,30 @@ pub(crate) fn remove_header_protection(
     Ok(pn_len)
 }
 
+/// RFC 9000 §17.2 / §17.3.1 — validate the reserved bits of the first
+/// header byte after header-protection removal.
+///
+/// Long headers reserve bits 0x0c; short headers reserve bits 0x18.
+/// Both MUST be zero once header protection is removed; an endpoint
+/// that receives a packet with non-zero reserved bits MUST treat it as
+/// a connection error of type PROTOCOL_VIOLATION (mapped here to
+/// [`Error::IllegalParameter`], which the close path surfaces as
+/// PROTOCOL_VIOLATION on the wire).
+///
+/// IMPORTANT: callers must invoke this only AFTER the packet's AEAD
+/// tag has verified. The reserved bits are header-protected, so on a
+/// forged or corrupted packet they decode to garbage — checking them
+/// pre-authentication would let an off-path attacker tear down the
+/// connection with a single spoofed datagram, where the correct
+/// behavior is a silent per-packet drop (RFC 9000 §12.2).
+pub(crate) fn check_reserved_bits(first_byte: u8, long_header: bool) -> Result<(), Error> {
+    let reserved_mask = if long_header { 0x0c } else { 0x18 };
+    if first_byte & reserved_mask != 0 {
+        return Err(Error::IllegalParameter);
+    }
+    Ok(())
+}
+
 /// RFC 9001 §5.8 — fixed AES-128-GCM key for the Retry Integrity Tag,
 /// `0xbe0c690b9f66575a1d766b54e368c84e`. Derived in the RFC from the
 /// retry secret `0xd9c9943e6101fd200021506bcc02814c73030f25c79d71ce876e\
@@ -592,6 +616,35 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
             .collect()
+    }
+
+    // -------- Reserved-bit validation (RFC 9000 §17.2 / §17.3.1) -------
+
+    #[test]
+    fn reserved_bits_long_header() {
+        // All long-header first bytes with reserved bits (0x0c) zero
+        // pass, regardless of the other bits.
+        assert!(check_reserved_bits(0xc3, true).is_ok()); // Initial, pn_len=4
+        assert!(check_reserved_bits(0xe0, true).is_ok()); // Handshake
+        assert!(check_reserved_bits(0xc3 | 0x30, true).is_ok()); // type bits aren't reserved
+        // Each reserved bit set alone, and both together, must fail.
+        assert!(check_reserved_bits(0xc3 | 0x04, true).is_err());
+        assert!(check_reserved_bits(0xc3 | 0x08, true).is_err());
+        assert!(check_reserved_bits(0xc3 | 0x0c, true).is_err());
+    }
+
+    #[test]
+    fn reserved_bits_short_header() {
+        // Short header reserves 0x18; spin (0x20), key-phase (0x04)
+        // and pn_len (0x03) bits are all legitimate.
+        assert!(check_reserved_bits(0x40, false).is_ok());
+        assert!(check_reserved_bits(0x40 | 0x20 | 0x04 | 0x03, false).is_ok());
+        assert!(check_reserved_bits(0x40 | 0x08, false).is_err());
+        assert!(check_reserved_bits(0x40 | 0x10, false).is_err());
+        assert!(check_reserved_bits(0x40 | 0x18, false).is_err());
+        // Long-header reserved bits are NOT reserved in short headers
+        // (0x04 is the key-phase bit) — masks must not be mixed up.
+        assert!(check_reserved_bits(0x40 | 0x04, false).is_ok());
     }
 
     // -------- Long header build / parse roundtrip ----------------------
