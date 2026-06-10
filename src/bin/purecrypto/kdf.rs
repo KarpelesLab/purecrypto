@@ -28,6 +28,16 @@ fn read_password(args: &Args) -> Vec<u8> {
     {
         let bytes = if p == "-" {
             use std::io::BufRead;
+            // No raw-mode/termios available (the crate forbids unsafe outside
+            // ffi), so we cannot disable echo. Be honest about it instead of
+            // silently letting the passphrase appear on screen.
+            if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                eprintln!(
+                    "purecrypto: warning: reading the passphrase from an interactive \
+                     terminal; typed input WILL BE VISIBLE (echo cannot be disabled). \
+                     Pipe it in instead, e.g. `purecrypto kdf ... -password-file - < pw.txt`"
+                );
+            }
             let mut line = String::new();
             std::io::stdin()
                 .lock()
