@@ -1,21 +1,33 @@
 //! A store of trusted root certificates (trust anchors).
 
 use crate::tls::Error;
-use crate::x509::{AnyPublicKey, Certificate};
+use crate::x509::{AnyPublicKey, Certificate, NameConstraints};
 use alloc::vec::Vec;
 
-/// A trust anchor: a root certificate's subject name (raw DER) and its
-/// public key, the minimum needed to terminate a chain. We store the raw
-/// DER of the subject `Name` so chain-building uses RFC 5280 §7.1
-/// byte-exact equality, immune to encoding differences (PrintableString
-/// vs UTF8String, extra attributes, multi-valued RDNs).
+/// A trust anchor: a root certificate's subject name (raw DER), its public
+/// key, and any `nameConstraints` the root declared. The name + key are the
+/// minimum needed to terminate a chain. We store the raw DER of the subject
+/// `Name` so chain-building uses RFC 5280 §7.1 byte-exact equality, immune
+/// to encoding differences (PrintableString vs UTF8String, extra attributes,
+/// multi-valued RDNs). The anchor's `nameConstraints` (parsed once, at
+/// [`RootCertStore::add_der`] time) are seeded into the RFC 5280 §6.1.4
+/// constraint state so a deliberately constrained root (e.g. a corporate
+/// root limited to `.corp.example`) governs every certificate in the
+/// validated path, exactly as an in-chain CA's constraints would.
 #[derive(Clone)]
 pub(crate) struct TrustAnchor {
     pub(crate) subject_der: Vec<u8>,
     pub(crate) key: AnyPublicKey,
+    pub(crate) name_constraints: Option<NameConstraints>,
 }
 
 /// A set of trusted root certificates against which peer chains are verified.
+///
+/// Roots that declare a `nameConstraints` extension keep it: the constraints
+/// are enforced over every chain that anchors at that root (RFC 5280 §6.1.4),
+/// the same way constraints declared by in-chain intermediate CAs are. See
+/// [`RootCertStore::add_der`] for the fail-closed handling of constraint
+/// shapes the validator cannot evaluate.
 #[derive(Clone, Default)]
 pub struct RootCertStore {
     anchors: Vec<TrustAnchor>,
@@ -30,7 +42,16 @@ impl RootCertStore {
     }
 
     /// Adds a trust anchor from a DER-encoded root certificate, recording its
-    /// subject name and public key.
+    /// subject name, public key, and any `nameConstraints` it declares.
+    ///
+    /// A `nameConstraints` extension on the root is retained and enforced
+    /// over every chain that anchors at it (RFC 5280 §6.1.4), exactly as an
+    /// in-chain CA's constraints would be. Because an admin installing a
+    /// constrained root does so deliberately, this fails closed: a root
+    /// whose `nameConstraints` extension does not parse, or whose subtrees
+    /// reference a GeneralName variant the validator cannot evaluate
+    /// (anything other than dNSName / iPAddress), is rejected rather than
+    /// added with its constraints silently ignored.
     pub fn add_der(&mut self, der: Vec<u8>) -> Result<(), Error> {
         let cert = Certificate::from_der(der).map_err(|_| Error::BadCertificate)?;
         let subject_der = cert
@@ -40,7 +61,17 @@ impl RootCertStore {
         let key = cert
             .subject_public_key()
             .map_err(|_| Error::BadCertificate)?;
-        self.anchors.push(TrustAnchor { subject_der, key });
+        let name_constraints = cert.name_constraints().map_err(|_| Error::BadCertificate)?;
+        if let Some(nc) = &name_constraints
+            && (nc.has_unenforceable_permitted || nc.has_unenforceable_excluded)
+        {
+            return Err(Error::BadCertificate);
+        }
+        self.anchors.push(TrustAnchor {
+            subject_der,
+            key,
+            name_constraints,
+        });
         Ok(())
     }
 

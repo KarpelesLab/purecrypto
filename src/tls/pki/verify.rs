@@ -32,7 +32,7 @@
 //! common name).
 
 use super::crls::CrlStore;
-use super::store::RootCertStore;
+use super::store::{RootCertStore, TrustAnchor};
 use crate::signature_registry::{SignaturePolicy, find_by_oid};
 use crate::tls::Error;
 use crate::x509::{AnyPublicKey, Certificate, Time, Validity, oid};
@@ -165,24 +165,26 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     // over the discarded tail (RFC 5280 §6.1: validation stops at a trust
     // anchor, and the anchor itself is not validity-checked).
     let mut anchor_at: Option<usize> = None;
+    let mut matched_anchor: Option<&TrustAnchor> = None;
     for i in 0..certs.len() {
         // (a) Is certs[i] issued directly by a trusted anchor? Anchors match by
         //     byte-exact issuer/subject Name equality (RFC 5280 §7.1); several
         //     anchors may share a Name (cross-signed renewal), so accept the
         //     first whose key verifies certs[i]'s signature under `policy`.
         let issuer_der = certs[i].issuer_der().map_err(|_| Error::BadCertificate)?;
-        let mut anchored: Option<&AnyPublicKey> = None;
+        let mut anchored: Option<&TrustAnchor> = None;
         for anchor in store.anchors_with_subject(issuer_der) {
             if verify_cert_against_issuer(&certs[i], &anchor.key, policy).is_ok() {
-                anchored = Some(&anchor.key);
+                anchored = Some(anchor);
                 break;
             }
         }
-        if let Some(anchor_key) = anchored {
+        if let Some(anchor) = anchored {
             // Path closes here: certs[0..=i] is the validated path. certs[i]
             // may still be revoked by a CRL signed by the anchor.
-            check_revocation(&certs[i], anchor_key, crls, now, policy)?;
+            check_revocation(&certs[i], &anchor.key, crls, now, policy)?;
             anchor_at = Some(i + 1);
+            matched_anchor = Some(anchor);
             break;
         }
 
@@ -232,10 +234,15 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     }
 
     // RFC 5280 §6.1.4 — nameConstraints accumulated across every CA in the
-    // path, applied to the certificates beneath each. Critical constraints
-    // referencing GeneralName variants we don't evaluate have already been
-    // rejected upstream by check_critical_extensions_recognized.
-    enforce_name_constraints(path)?;
+    // path, applied to the certificates beneath each. The matched trust
+    // anchor's own constraints (retained by the store at add time) seed the
+    // state, so a deliberately constrained root governs the whole path.
+    // Critical constraints referencing GeneralName variants we don't
+    // evaluate have already been rejected upstream — by
+    // check_critical_extensions_recognized for in-chain CAs, and by
+    // RootCertStore::add_der for the anchor.
+    let anchor_nc = matched_anchor.and_then(|a| a.name_constraints.as_ref());
+    enforce_name_constraints(path, anchor_nc)?;
 
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement (CA / keyUsage /
     // extKeyUsage), over the validated path.
@@ -411,16 +418,14 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 ///   * when a CA declares ANY permitted dNSName subtree, each of the cert's
 ///     DNS SANs must match at least one such entry; same for iPAddress.
 ///
+/// `anchor_constraints` carries the matched trust anchor's own
+/// `nameConstraints` (parsed and retained by [`RootCertStore`] when the root
+/// was added). The anchor sits above the topmost supplied CA, so its
+/// constraints are in scope for **every** certificate in the validated path
+/// — they seed the constraint state before the walk begins, exactly as an
+/// in-chain CA's constraints govern everything beneath it.
+///
 /// Scope / limitations:
-///   * The matched trust anchor lives in the [`RootCertStore`], which retains
-///     only the anchor's subject name + public key — not the anchor's full
-///     certificate. A `nameConstraints` extension on the anchor (root) cert
-///     itself therefore cannot be brought into scope here; only constraints
-///     declared by CAs that appear in the presented chain (i.e.
-///     intermediates) are enforced. In practice constrained CAs are deployed
-///     as intermediates, which ARE in the chain. Enforcing anchor-resident
-///     constraints would require the store to retain the anchor DER —
-///     flagged-for-review, out of scope for this change.
 ///   * directoryName (subject DN) subtree constraints are NOT evaluated: the
 ///     parsed [`crate::x509::NameConstraints`] surfaces only dNSName and
 ///     iPAddress subtrees, and any constraint referencing another
@@ -430,9 +435,13 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
 ///     constraint is critical. directoryName-subtree matching is therefore
 ///     flagged-for-review rather than implemented (possibly-wrong) here.
 ///   * Constraints referencing GeneralName variants other than dNSName /
-///     iPAddress are skipped — a critical such constraint has already been
-///     rejected upstream.
-fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
+///     iPAddress are skipped — a critical such constraint on an in-chain CA
+///     has already been rejected upstream, and an anchor carrying one is
+///     refused by [`RootCertStore::add_der`] regardless of criticality.
+fn enforce_name_constraints(
+    certs: &[Certificate],
+    anchor_constraints: Option<&crate::x509::NameConstraints>,
+) -> Result<(), Error> {
     // Pre-parse each certificate's own constraints (only CAs, indices
     // 1..=last, can declare governing constraints; index 0 is the leaf). The
     // owned values live here so the `&` borrows accumulated in `in_scope`
@@ -449,8 +458,13 @@ fn enforce_name_constraints(certs: &[Certificate]) -> Result<(), Error> {
     // `i - 1`, so a CA's constraints govern every certificate at a strictly
     // lower index. We accumulate constraints as they come into scope (higher
     // CAs first) and, for each subordinate certificate, enforce all in-scope
-    // CAs' constraints against that certificate's own SAN names.
+    // CAs' constraints against that certificate's own SAN names. The trust
+    // anchor issued `certs[last]`, so its constraints are in scope from the
+    // very first iteration.
     let mut in_scope: Vec<&crate::x509::NameConstraints> = Vec::new();
+    if let Some(nc) = anchor_constraints {
+        in_scope.push(nc);
+    }
     for idx in (0..certs.len()).rev() {
         // Constraints declared by CAs above this position must hold for the
         // certificate at `idx`. Only meaningful once at least one such
@@ -2114,9 +2128,8 @@ mod tests {
     // RFC 5280 §6.1.4 propagation regression tests: a CA's nameConstraints
     // must apply to EVERY subordinate certificate (intermediates + leaf), not
     // only the end-entity leaf. The constraint is declared on the topmost
-    // in-chain intermediate (`sub1`) — the trust anchor (root) lives in the
-    // store, which retains only its name + key, so a root-resident constraint
-    // could not be enforced; `sub1` IS part of the presented chain.
+    // in-chain intermediate (`sub1`); anchor-resident constraints are covered
+    // separately by the anchor_name_constraints_* tests below.
     // ----------------------------------------------------------------------
 
     /// Builds `root → sub1 → sub2 → leaf`. `sub1` (topmost in-chain
@@ -2152,8 +2165,8 @@ mod tests {
         let sub2_name = DistinguishedName::common_name("prop-sub2");
         let leaf_name = DistinguishedName::common_name("prop-leaf");
 
-        // Unconstrained root (anchor; its own constraints could not be
-        // enforced from the store anyway).
+        // Unconstrained root: these tests exercise in-chain propagation, so
+        // the constraint lives on `sub1` rather than on the anchor.
         let root = Certificate::self_signed_with_extensions(
             &root_signer,
             &root_name,
@@ -2281,5 +2294,248 @@ mod tests {
             verify_chain(&store, &chain, Some(&now), &policy()),
             Err(Error::BadCertificate)
         ));
+    }
+
+    // ----------------------------------------------------------------------
+    // Anchor-resident nameConstraints: a `nameConstraints` extension on the
+    // trusted ROOT itself (retained by `RootCertStore::add_der`) must seed
+    // the RFC 5280 §6.1.4 state and govern the whole validated path —
+    // intermediates and leaf — exactly as an in-chain CA's constraints
+    // would. Previously the store kept only the root's name + key and the
+    // constraint was silently ignored.
+    // ----------------------------------------------------------------------
+
+    /// Builds `root → int → leaf` where the ROOT optionally carries
+    /// `root_nc` as its `nameConstraints` extension. The intermediate's
+    /// dNSName SAN is `int_san` and the leaf's is `leaf_san` (the anchor's
+    /// constraints govern both).
+    fn build_anchor_nc_chain(
+        root_nc: Option<crate::x509::Extension>,
+        int_san: &str,
+        leaf_san: &str,
+    ) -> (Certificate, Certificate, Certificate) {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, Extension, GeneralName, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage, subject_alt_name},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"anchor-nc", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+
+        let root_name = DistinguishedName::common_name("anchor-nc-root");
+        let int_name = DistinguishedName::common_name("anchor-nc-int");
+        let leaf_name = DistinguishedName::common_name("anchor-nc-leaf");
+
+        let mut root_exts: alloc::vec::Vec<Extension> = alloc::vec![
+            basic_constraints(true, None),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+        if let Some(nc) = root_nc {
+            root_exts.push(nc);
+        }
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &root_exts,
+        )
+        .unwrap();
+
+        let int_pub = crate::x509::AnyPublicKey::Ecdsa(int_key.public_key());
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &int_pub,
+            &validity(),
+            2,
+            &[
+                basic_constraints(true, Some(0)),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+                subject_alt_name(&[GeneralName::Dns(int_san.into())]),
+            ],
+        )
+        .unwrap();
+
+        let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &leaf_name,
+            &leaf_pub,
+            &validity(),
+            3,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[GeneralName::Dns(leaf_san.into())]),
+            ],
+        )
+        .unwrap();
+        (root, int, leaf)
+    }
+
+    /// Case a: a leaf inside the anchor's permitted subtree validates.
+    #[test]
+    fn anchor_name_constraints_permitted_accepts_in_subtree_leaf() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns(".good.example".into())],
+            &[],
+        );
+        let (root, int, leaf) =
+            build_anchor_nc_chain(Some(nc), "int.good.example", "host.good.example");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    /// Case b: a leaf outside the anchor's permitted subtree is rejected —
+    /// this is exactly the chain that wrongly validated when the store
+    /// dropped the root's constraints.
+    #[test]
+    fn anchor_name_constraints_permitted_rejects_outside_leaf() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns(".good.example".into())],
+            &[],
+        );
+        let (root, int, leaf) =
+            build_anchor_nc_chain(Some(nc), "int.good.example", "host.evil.example");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// The anchor's constraints govern the INTERMEDIATE too, not only the
+    /// leaf: an out-of-subtree intermediate below a constrained anchor is
+    /// rejected even when the leaf is in-subtree.
+    #[test]
+    fn anchor_name_constraints_permitted_rejects_outside_intermediate() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns(".good.example".into())],
+            &[],
+        );
+        let (root, int, leaf) =
+            build_anchor_nc_chain(Some(nc), "int.evil.example", "host.good.example");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// Case c: a leaf inside the anchor's EXCLUDED subtree is rejected.
+    #[test]
+    fn anchor_name_constraints_excluded_rejects_matching_leaf() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let (root, int, leaf) =
+            build_anchor_nc_chain(Some(nc), "int.good.example", "host.bad.example");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// Case d: an unconstrained anchor is unaffected — the same chain shape
+    /// with arbitrary SANs still validates.
+    #[test]
+    fn anchor_without_name_constraints_unaffected() {
+        let (root, int, leaf) =
+            build_anchor_nc_chain(None, "int.evil.example", "host.evil.example");
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+    }
+
+    /// Fail closed at add time: a root whose nameConstraints reference a
+    /// GeneralName variant the validator cannot evaluate (here rfc822Name)
+    /// is refused by `add_der` rather than installed with its constraints
+    /// silently ignored.
+    #[test]
+    fn add_der_rejects_anchor_with_unenforceable_constraints() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Email("admin@example.com".into())],
+            &[],
+        );
+        let (root, _int, _leaf) =
+            build_anchor_nc_chain(Some(nc), "int.good.example", "host.good.example");
+        let mut store = RootCertStore::new();
+        assert!(matches!(
+            store.add_der(root.to_der().to_vec()),
+            Err(Error::BadCertificate)
+        ));
+        assert!(store.is_empty());
+    }
+
+    /// Fail closed at add time: a root carrying a nameConstraints extension
+    /// that does not parse is refused by `add_der`.
+    #[test]
+    fn add_der_rejects_anchor_with_malformed_constraints() {
+        let garbage_nc = crate::x509::Extension {
+            oid: oid::NAME_CONSTRAINTS.to_vec(),
+            critical: true,
+            value: alloc::vec![0xff, 0x00],
+        };
+        let (root, _int, _leaf) =
+            build_anchor_nc_chain(Some(garbage_nc), "int.good.example", "host.good.example");
+        let mut store = RootCertStore::new();
+        assert!(matches!(
+            store.add_der(root.to_der().to_vec()),
+            Err(Error::BadCertificate)
+        ));
+        assert!(store.is_empty());
     }
 }
