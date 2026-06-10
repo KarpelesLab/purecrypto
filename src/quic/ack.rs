@@ -135,7 +135,14 @@ pub(crate) fn parse_ack_payload(body: &[u8]) -> Result<(Vec<RangeInclusive<u64>>
     if first_range > largest {
         return Err(Error::Decode);
     }
-    let mut ranges: Vec<RangeInclusive<u64>> = Vec::with_capacity(1 + range_count as usize);
+    // `range_count` is attacker-controlled (a varint can claim up to
+    // 2^62-1 ranges) — never preallocate from it directly. Every
+    // (gap, range_length) pair costs at least 2 bytes on the wire, so
+    // `body.len() / 2` upper-bounds the count of ranges that can
+    // actually decode; a bogus count fails varint::decode below long
+    // before memory becomes a concern.
+    let capacity_hint = core::cmp::min(range_count as usize, body.len() / 2);
+    let mut ranges: Vec<RangeInclusive<u64>> = Vec::with_capacity(1 + capacity_hint);
     let mut smallest_in_block = largest - first_range;
     ranges.push(smallest_in_block..=largest);
     for _ in 0..range_count {
