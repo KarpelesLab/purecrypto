@@ -285,6 +285,13 @@ pub struct QuicConnection {
     /// client. (Server-side, VN is always dropped — servers never
     /// receive VN.)
     peer_packet_seen: bool,
+    /// RFC 9001 §6.5 — when (relative to [`Self::start`]) the current
+    /// `prev_rx_keys` were stashed by a key-phase commit. Old read keys
+    /// MUST be retained no longer than three times the PTO after
+    /// receiving a packet protected with the new keys; the timeout
+    /// handler (and the feed path) discard them once that window has
+    /// elapsed. `None` while no previous-phase keys are retained.
+    prev_rx_keys_installed_at: Option<Duration>,
 }
 
 /// RFC 9000 §8.1 anti-amplification window. Until the server has
@@ -464,6 +471,7 @@ impl QuicConnection {
             start: Instant::now(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
+            prev_rx_keys_installed_at: None,
         };
 
         // Drain the ClientHello bytes the engine just produced into the
@@ -537,6 +545,7 @@ impl QuicConnection {
             start: Instant::now(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
+            prev_rx_keys_installed_at: None,
         })
     }
 
@@ -1075,6 +1084,9 @@ impl QuicConnection {
     /// constructed. Caller passes a monotonic clock reading. Engine
     /// re-evaluates timers and may queue retransmissions.
     pub fn on_timeout(&mut self, now_since_start: Duration) {
+        // RFC 9001 §6.5 — drop retained previous-phase read keys once
+        // 3×PTO has elapsed since the key-phase commit installed them.
+        self.maybe_discard_prev_rx_keys(now_since_start);
         if self.endpoint.loss.has_fired(now_since_start) {
             // RFC 9002 §6.2.4: on PTO, send a probe — Phase 4 implements
             // this as "retransmit the last CRYPTO chunk at *every* level
@@ -1437,6 +1449,19 @@ impl QuicConnection {
             lk.prev_rx_keys = lk.rx_by_phase[old_phase as usize].take();
             lk.prev_rx_pn_window = lk.rx_pn_window;
         }
+        // RFC 9001 §6.5 — stamp the retention clock: old read keys are
+        // kept at most 3×PTO from now (see maybe_discard_prev_rx_keys).
+        self.prev_rx_keys_installed_at = if self
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .prev_rx_keys
+            .is_some()
+        {
+            Some(self.now_since_start())
+        } else {
+            None
+        };
         // Sync the legacy `rx` slot to the new phase's keys + roll the
         // next-next rx chain into the slot we just vacated.
         let new_rx_secret = self.endpoint.crypto.at(Level::OneRtt).rx_by_phase[new_phase as usize]
@@ -1476,6 +1501,23 @@ impl QuicConnection {
                 .tx_phase_pending_confirm = false;
         }
         self.endpoint.crypto.one_rtt_phase = new_phase;
+    }
+
+    /// RFC 9001 §6.5 — "An endpoint SHOULD retain old read keys for no
+    /// more than three times the PTO after having received a packet
+    /// protected using the new keys." Discards `prev_rx_keys` (and the
+    /// replay window stashed with them) once that window has elapsed.
+    /// Called from the timeout handler and from the 1-RTT receive path.
+    fn maybe_discard_prev_rx_keys(&mut self, now: Duration) {
+        if let Some(installed) = self.prev_rx_keys_installed_at {
+            let retain = self.endpoint.loss.pto_period().saturating_mul(3);
+            if now.saturating_sub(installed) >= retain {
+                let lk = self.endpoint.crypto.at_mut(Level::OneRtt);
+                lk.prev_rx_keys = None;
+                lk.prev_rx_pn_window = PnReplayWindow::new();
+                self.prev_rx_keys_installed_at = None;
+            }
+        }
     }
 
     /// Refresh the per-phase tx + rx chains so the slot opposite
@@ -2501,6 +2543,11 @@ impl QuicConnection {
     }
 
     fn feed_short_header_packet(&mut self, datagram: &[u8]) -> Result<usize, Error> {
+        // RFC 9001 §6.5 — even if the application never ticks
+        // `on_timeout`, expired previous-phase read keys must not be
+        // used to open packets. Check before any fallback decrypt.
+        let now = self.now_since_start();
+        self.maybe_discard_prev_rx_keys(now);
         let dcid_len = self.endpoint.cids.local.len();
         let hdr = ShortHeader::parse(datagram, dcid_len)?;
         // Sample window: pn_offset + 4..+20.
@@ -5823,6 +5870,48 @@ mod tests {
                 .any(|w| w == b"still-alive"),
             "post-replay data must still flow at the current phase"
         );
+    }
+
+    /// A2 regression — RFC 9001 §6.5: previous-phase read keys are
+    /// retained no more than 3×PTO after the key-phase commit. Once
+    /// discarded, a stale old-phase ciphertext no longer decrypts.
+    #[test]
+    fn key_update_prev_rx_keys_discarded_after_3_pto() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"abc").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let sid = StreamId(cid.0);
+        s.write(sid, b"PHASE0").expect("server write phase 0");
+        let phase0_dg = s.pop_datagram();
+        s.initiate_key_update().expect("server initiates");
+        s.write(sid, b"PHASE1").expect("server write phase 1");
+        let phase1_dg = s.pop_datagram();
+
+        c.feed_datagram(&phase1_dg).expect("client feed phase 1");
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).prev_rx_keys.is_some(),
+            "prev keys retained right after the commit"
+        );
+
+        // Tick the timer far past 3×PTO — the retained keys expire.
+        c.on_timeout(Duration::from_secs(3600));
+        assert!(
+            c.endpoint.crypto.at(Level::OneRtt).prev_rx_keys.is_none(),
+            "prev keys must be discarded after 3×PTO (RFC 9001 §6.5)"
+        );
+
+        // The stale old-phase packet is now a silent drop (AEAD failure
+        // under the next-generation keys; no prev fallback remains).
+        c.feed_datagram(&phase0_dg)
+            .expect("stale old-phase packet is silently dropped");
+        assert_eq!(c.endpoint.crypto.one_rtt_phase, 1, "phase unchanged");
     }
 
     /// Test — a datagram whose last 16 bytes are random (not a known
