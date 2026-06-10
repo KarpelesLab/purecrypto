@@ -572,14 +572,78 @@ fn inner_extension_body_matches_marker() {
 
 #[test]
 fn accept_signal_deterministic_and_label_separated() {
-    let secret = [0x42u8; 32];
+    let inner_random = [0x42u8; 32];
     let th = [0x33u8; 32];
-    let sh = server_hello_signal(HashAlg::Sha256, &secret, &th);
-    let sh2 = server_hello_signal(HashAlg::Sha256, &secret, &th);
+    let sh = server_hello_signal(HashAlg::Sha256, &inner_random, &th);
+    let sh2 = server_hello_signal(HashAlg::Sha256, &inner_random, &th);
     assert_eq!(sh, sh2);
-    let hrr = hello_retry_request_signal(HashAlg::Sha256, &secret, &th);
+    let hrr = hello_retry_request_signal(HashAlg::Sha256, &inner_random, &th);
     // Distinct labels MUST yield distinct outputs.
     assert_ne!(sh, hrr);
+}
+
+/// RFC 9849 §7.2 / §7.2.1: both acceptance signals equal
+/// `HKDF-Expand-Label(HKDF-Extract(0, ClientHelloInner.random), label,
+/// transcript_ech_conf, 8)` — recomputed here from the raw HKDF
+/// primitives (manual `HkdfLabel` encoding included) so a regression in
+/// `server_hello_signal` / `hello_retry_request_signal` toward any
+/// key-schedule-derived variant fails loudly. The derivation must be
+/// fully independent of the TLS 1.3 key schedule.
+#[test]
+fn accept_signals_match_raw_hkdf_formula() {
+    use crate::hash::{Sha256, Sha384};
+    use crate::kdf::{hkdf_expand, hkdf_extract};
+
+    fn raw<D: crate::hash::Digest>(
+        label: &[u8],
+        inner_random: &[u8; 32],
+        transcript_hash: &[u8],
+    ) -> [u8; 8] {
+        // HKDF-Extract(0, random): "0" is Hash.length zero bytes.
+        let zeros = alloc::vec![0u8; D::OUTPUT_LEN];
+        let prk = hkdf_extract::<D>(&zeros, inner_random);
+        // HkdfLabel { length(2), label<7..255> = "tls13 " + label,
+        //             context<0..255> = transcript_hash } (RFC 8446 §7.1).
+        let mut info = Vec::new();
+        info.extend_from_slice(&8u16.to_be_bytes());
+        info.push((6 + label.len()) as u8);
+        info.extend_from_slice(b"tls13 ");
+        info.extend_from_slice(label);
+        info.push(transcript_hash.len() as u8);
+        info.extend_from_slice(transcript_hash);
+        let mut out = [0u8; 8];
+        hkdf_expand::<D>(&prk, &info, &mut out);
+        out
+    }
+
+    let inner_random: [u8; 32] = core::array::from_fn(|i| i as u8);
+    let th256 = HashAlg::Sha256.hash(b"transcript_ech_conf");
+    let th384 = HashAlg::Sha384.hash(b"transcript_ech_conf");
+
+    assert_eq!(
+        server_hello_signal(HashAlg::Sha256, &inner_random, th256.as_slice()),
+        raw::<Sha256>(b"ech accept confirmation", &inner_random, th256.as_slice()),
+    );
+    assert_eq!(
+        server_hello_signal(HashAlg::Sha384, &inner_random, th384.as_slice()),
+        raw::<Sha384>(b"ech accept confirmation", &inner_random, th384.as_slice()),
+    );
+    assert_eq!(
+        hello_retry_request_signal(HashAlg::Sha256, &inner_random, th256.as_slice()),
+        raw::<Sha256>(
+            b"hrr ech accept confirmation",
+            &inner_random,
+            th256.as_slice()
+        ),
+    );
+    assert_eq!(
+        hello_retry_request_signal(HashAlg::Sha384, &inner_random, th384.as_slice()),
+        raw::<Sha384>(
+            b"hrr ech accept confirmation",
+            &inner_random,
+            th384.as_slice()
+        ),
+    );
 }
 
 #[test]
@@ -1409,8 +1473,12 @@ fn full_ech_round_trip_seal_decap_and_accept_signal() {
     let mut to_hash = inner_ch.clone();
     to_hash.extend_from_slice(&sh_with_zero_tail_random);
     let th = alg.hash(&to_hash);
-    let mock_handshake_secret = [0xABu8; 32];
-    let signal = server_hello_signal(alg, &mock_handshake_secret, th.as_slice());
+    // The signal's IKM is the inner CH's `random` (RFC 9849 §7.2) —
+    // offset 6 in the handshake-message bytes (type 1 + length 3 +
+    // legacy_version 2).
+    let mut inner_ch_random = [0u8; 32];
+    inner_ch_random.copy_from_slice(&inner_ch[6..38]);
+    let signal = server_hello_signal(alg, &inner_ch_random, th.as_slice());
     let patched_random = patch_random_tail(&sh_random, &signal);
     assert_eq!(random_tail(&patched_random), signal);
 
@@ -1419,13 +1487,13 @@ fn full_ech_round_trip_seal_decap_and_accept_signal() {
     let mut client_hash_input = inner_ch.clone();
     client_hash_input.extend_from_slice(&random_with_zero_tail(&patched_random));
     let client_th = alg.hash(&client_hash_input);
-    let expected = server_hello_signal(alg, &mock_handshake_secret, client_th.as_slice());
+    let expected = server_hello_signal(alg, &inner_ch_random, client_th.as_slice());
     let received = random_tail(&patched_random);
     assert!(signals_eq_ct(&expected, &received));
 
-    // === Negative: wrong handshake_secret → mismatch ===
-    let wrong_secret = [0xCDu8; 32];
-    let wrong_expected = server_hello_signal(alg, &wrong_secret, client_th.as_slice());
+    // === Negative: wrong inner-CH random → mismatch ===
+    let wrong_random = [0xCDu8; 32];
+    let wrong_expected = server_hello_signal(alg, &wrong_random, client_th.as_slice());
     assert!(!signals_eq_ct(&wrong_expected, &received));
 }
 

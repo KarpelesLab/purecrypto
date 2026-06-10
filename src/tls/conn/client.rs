@@ -1840,10 +1840,10 @@ impl ClientConnection {
         // draft-ietf-tls-esni-22 §7: if real-ECH was attempted, the
         // server tells us whether it accepted by writing 8 bytes into
         // `sh.random[24..32]`. We recompute the expected signal over
-        // `Hash(inner_CH || sh_with_zero_tail)` using the *inner*
-        // transcript's handshake_secret (which equals the live
-        // schedule's `current_secret_bytes()` regardless of
-        // accept/reject — same ECDHE + same PSK selection). On match,
+        // `Hash(inner_CH || sh_with_zero_tail)` keyed from the inner
+        // CH's `random` (§7.2: `HKDF-Extract(0, ClientHelloInner.random)`
+        // — independent of the key schedule; CH2-inner reuses CH1-inner's
+        // random on the HRR retry path per RFC 8446 §4.1.2). On match,
         // swap the in-transcript outer CH for the inner CH bytes so
         // every subsequent message ends up on the inner transcript.
         // On mismatch, leave the transcript alone (outer prevails)
@@ -1874,9 +1874,10 @@ impl ClientConnection {
                     tbuf.extend_from_slice(&sh_zero_tail);
                     suite.hash.hash(&tbuf)
                 };
+                let inner_ch_random = state.inner_ch1_random.ok_or(Error::IllegalParameter)?;
                 let expected = crate::tls::ech::accept_signal::server_hello_signal(
                     suite.hash,
-                    ks.current_secret_bytes(),
+                    &inner_ch_random,
                     th_sig.as_slice(),
                 );
                 let sh_tail = crate::tls::ech::accept_signal::random_tail(&sh.random);

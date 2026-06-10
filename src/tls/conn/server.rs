@@ -2029,21 +2029,30 @@ impl<R: RngCore> ServerConnection<R> {
         };
         ks.enter_handshake(shared.as_slice());
 
-        // ECH accept signal (draft §7.2): with the handshake secret on
-        // the inner transcript now in hand, compute
-        // `HKDF-Expand-Label(Derive-Secret(hs_secret, "ech accept confirmation",
-        // Hash(inner_CH || zero-tail SH)), "ech accept confirmation", "", 8)`
+        // ECH accept signal (draft §7.2): compute
+        // `HKDF-Expand-Label(HKDF-Extract(0, ClientHelloInner.random),
+        // "ech accept confirmation", Hash(inner_CH || zero-tail SH), 8)`
         // and patch the 8 bytes into `sh_bytes[30..38]` (== `random[24..32]`
-        // on the wire). The current transcript already contains the inner
-        // CH (we substituted at the top of `on_client_hello`); we clone it
-        // so feeding the zero-tail SH for the signal hash does not pollute
-        // the real transcript that emit_handshake_at will feed next.
+        // on the wire). The IKM is the inner CH's `random` — independent of
+        // the key schedule. On the HRR retry path CH2-inner's random equals
+        // CH1-inner's (RFC 8446 §4.1.2, enforced by `verify_ch2_matches`),
+        // so the snapshot taken at decap time is the right value on both
+        // paths. The current transcript already contains the inner CH (we
+        // substituted at the top of `on_client_hello`); we hash with the
+        // zero-tail SH appended so the signal hash does not pollute the
+        // real transcript that emit_handshake_at will feed next.
         #[cfg(feature = "ech")]
         if ech_accepted {
+            let inner_ch_random = match self.ech_state {
+                Some(EchServerHandshakeState::Accepted {
+                    inner_ch1_random, ..
+                }) => inner_ch1_random,
+                _ => return Err(Error::HandshakeFailure),
+            };
             let th_sig = self.core.transcript.hash_with_appended(&server_hello);
             let signal = crate::tls::ech::accept_signal::server_hello_signal(
                 suite.hash,
-                ks.current_secret_bytes(),
+                &inner_ch_random,
                 th_sig.as_slice(),
             );
             // Wire layout: 1 (type) + 3 (length) + 2 (version) + 32 (random)

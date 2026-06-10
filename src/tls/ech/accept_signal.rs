@@ -10,55 +10,65 @@
 //! transcript and the inner CH's random — the client computes the
 //! same value locally and compares constant-time.
 //!
-//! Concretely, draft §7.2 specifies:
+//! Concretely, draft §7.2 (RFC 9849 §7.2) specifies:
 //!
 //! ```text
 //! accept_confirmation =
 //!     HKDF-Expand-Label(
-//!         Derive-Secret(handshake_secret, "ech accept confirmation",
-//!                       transcript_hash(ClientHelloInner..ServerHelloEchAcceptConfirmation)),
+//!         HKDF-Extract(0, ClientHelloInner.random),
 //!         "ech accept confirmation",
-//!         "",
+//!         transcript_ech_conf,
 //!         8)
 //! ```
 //!
-//! where `ServerHelloEchAcceptConfirmation` is the in-progress SH with
-//! its last 8 random bytes zeroed.
-//!
-//! In our codebase the equivalent is computed below by piggy-backing
-//! on the existing `derive_secret` / `expand_label_dyn` helpers.
+//! where `transcript_ech_conf` is the transcript hash over
+//! `ClientHelloInner` up to and including the in-progress SH with its
+//! last 8 random bytes zeroed, and "0" is a string of `Hash.length`
+//! zero bytes. The derivation is keyed solely from the inner CH's
+//! `random` — it is fully independent of the TLS 1.3 key schedule.
 
-use crate::tls::crypto::{HashAlg, derive_secret, expand_label_dyn, extract};
+use crate::tls::crypto::{HashAlg, expand_label_dyn, extract};
 use alloc::vec::Vec;
 
+/// Shared core of both acceptance signals:
+/// `HKDF-Expand-Label(HKDF-Extract(0, inner_ch_random), label,
+/// transcript_hash, 8)`. The salt is a string of `Hash.length` zero
+/// bytes per the spec's "0" notation; 64 is the maximum hash output
+/// length across the suites we support (SHA-256, SHA-384).
+fn confirmation_signal(
+    alg: HashAlg,
+    label: &'static [u8],
+    inner_ch_random: &[u8; 32],
+    transcript_hash: &[u8],
+) -> [u8; 8] {
+    let zeros = [0u8; 64];
+    let salt = &zeros[..alg.output_len()];
+    let prk = extract(alg, salt, inner_ch_random);
+    let mut out = [0u8; 8];
+    expand_label_dyn(alg, prk.as_slice(), label, transcript_hash, &mut out);
+    out
+}
+
 /// `accept_confirmation` for `ServerHello` (the 8 bytes patched into
-/// `sh.random[24..32]`). `handshake_secret` is the TLS-1.3 handshake
-/// secret on the **inner** transcript; `transcript_hash` is the hash
-/// of `(inner CH || zero-tail SH)` taken over the chosen `alg`.
+/// `sh.random[24..32]`, draft §7.2). `inner_ch_random` is the
+/// **inner** ClientHello's `random` (the IKM the spec prescribes —
+/// not a key-schedule secret); `transcript_hash` is the hash of
+/// `(inner CH || zero-tail SH)` taken over the chosen `alg`.
 ///
 /// The caller is responsible for zeroing the last 8 bytes of the SH's
 /// random field before hashing — that's the "zero placeholder" form
 /// the draft prescribes.
 pub fn server_hello_signal(
     alg: HashAlg,
-    handshake_secret: &[u8],
+    inner_ch_random: &[u8; 32],
     transcript_hash: &[u8],
 ) -> [u8; 8] {
-    let secret = derive_secret(
+    confirmation_signal(
         alg,
-        handshake_secret,
         b"ech accept confirmation",
+        inner_ch_random,
         transcript_hash,
-    );
-    let mut out = [0u8; 8];
-    expand_label_dyn(
-        alg,
-        secret.as_slice(),
-        b"ech accept confirmation",
-        b"",
-        &mut out,
-    );
-    out
+    )
 }
 
 /// `hrr_accept_confirmation` for `HelloRetryRequest` (draft §7.2.1).
@@ -81,22 +91,12 @@ pub fn hello_retry_request_signal(
     inner_ch1_random: &[u8; 32],
     transcript_hash: &[u8],
 ) -> [u8; 8] {
-    // HKDF-Extract(0, ClientHelloInner1.random). The salt is a string
-    // of `Hash.length` zero bytes per the spec's "0" notation; 64 is
-    // the maximum hash output length across the suites we support
-    // (SHA-256, SHA-384).
-    let zeros = [0u8; 64];
-    let salt = &zeros[..alg.output_len()];
-    let prk = extract(alg, salt, inner_ch1_random);
-    let mut out = [0u8; 8];
-    expand_label_dyn(
+    confirmation_signal(
         alg,
-        prk.as_slice(),
         b"hrr ech accept confirmation",
+        inner_ch1_random,
         transcript_hash,
-        &mut out,
-    );
-    out
+    )
 }
 
 /// Constant-time equality check on the 8-byte accept signal —
