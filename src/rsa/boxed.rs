@@ -212,6 +212,18 @@ fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> R
 
 impl BoxedRsaPublicKey {
     /// Builds a public key from modulus `n` and exponent `e`.
+    ///
+    /// This constructor performs **no validation** — it is intended for
+    /// components that are already trusted. Untrusted input (anything parsed
+    /// from a certificate, SPKI, key file, or the network) must go through
+    /// [`Self::try_new`] or the fallible parsers ([`Self::from_pkcs1_der`] /
+    /// [`Self::from_spki_der`]), which reject a zero/even modulus and a
+    /// degenerate exponent.
+    ///
+    /// # Panics
+    /// Panics if `n` is even or zero (the Montgomery precomputation requires
+    /// an odd modulus). There is also no size cap here — a huge `n` makes the
+    /// O(bits²) precomputation arbitrarily slow; `try_new` bounds it.
     pub fn new(n: BoxedUint, e: BoxedUint) -> Self {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
@@ -292,6 +304,16 @@ impl BoxedRsaPrivateKey {
     /// Builds a private key from `n`, `e`, and the private exponent `d` (without
     /// the prime factors, so CRT-based PKCS#1 export and base-blinding are
     /// unavailable; see the struct docs).
+    ///
+    /// This constructor performs **no validation** — it is intended for
+    /// components that are already trusted. Untrusted input (key files,
+    /// PKCS#1/PKCS#8 blobs) must go through the fallible parsers —
+    /// [`Self::from_pkcs1_der`] / [`Self::from_pkcs8_der`] — which validate
+    /// the components first.
+    ///
+    /// # Panics
+    /// Panics if `n` is even or zero (the Montgomery precomputation requires
+    /// an odd modulus).
     pub fn from_components(n: BoxedUint, e: BoxedUint, d: BoxedUint) -> Self {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
