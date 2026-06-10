@@ -460,6 +460,12 @@ pub struct ClientConnection {
     /// HRR MUST select this same group; any other group is a protocol
     /// violation. `None` when no HRR (or an HRR without key_share) was seen.
     hrr_selected_group: Option<NamedGroup>,
+    /// The cipher suite the server selected in a HelloRetryRequest. RFC 8446
+    /// §4.1.4: the ServerHello that follows MUST carry the same
+    /// `cipher_suite`; re-checking only "was it offered" would let the
+    /// server pick one suite's hash for the HRR transcript and then switch
+    /// suites in SH. `None` when no HRR was seen.
+    hrr_selected_suite: Option<CipherSuite>,
 
     suite: Option<SuiteParams>,
     ks: Option<KeySchedule>,
@@ -1073,6 +1079,7 @@ impl ClientConnection {
             offered_groups: groups.to_vec(),
             hrr_processed: false,
             hrr_selected_group: None,
+            hrr_selected_suite: None,
             suite: None,
             ks: None,
             client_hs_secret: None,
@@ -1742,6 +1749,15 @@ impl ClientConnection {
         if !self.offered_suites.contains(&sh.cipher_suite) {
             return Err(Error::IllegalParameter);
         }
+        // RFC 8446 §4.1.4: a ServerHello following a HelloRetryRequest MUST
+        // carry the same cipher_suite the HRR selected — the HRR pinned the
+        // transcript hash to that suite, so a switch here is a protocol
+        // violation even if the new suite was offered.
+        if let Some(hrr_suite) = self.hrr_selected_suite
+            && sh.cipher_suite != hrr_suite
+        {
+            return Err(Error::IllegalParameter);
+        }
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         // Confirm TLS 1.3 was selected.
         let sv = ext::find(
@@ -2140,6 +2156,9 @@ impl ClientConnection {
         // can be pinned to it (RFC 8446 §4.1.4). `None` when the HRR carried
         // only a cookie and no key_share.
         self.hrr_selected_group = selected_group;
+        // Pin the HRR-selected cipher suite too: §4.1.4 requires the
+        // subsequent ServerHello to carry the same suite.
+        self.hrr_selected_suite = Some(hrr.cipher_suite);
         // Stay in WaitServerHello for the real ServerHello.
         Ok(())
     }

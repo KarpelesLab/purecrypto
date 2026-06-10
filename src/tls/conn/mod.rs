@@ -2443,6 +2443,86 @@ mod loopback_tests {
         assert!(matches!(err, crate::tls::Error::IllegalParameter));
     }
 
+    /// RFC 8446 §4.1.4: the ServerHello that follows a HelloRetryRequest
+    /// MUST carry the same cipher_suite the HRR selected. A server that
+    /// pins one suite's hash into the HRR transcript and then switches to
+    /// a different (even legitimately offered) suite in SH is rejected
+    /// with `illegal_parameter`.
+    #[test]
+    fn rejects_sh_suite_switch_after_hrr() {
+        use crate::tls::codec::{ExtensionType, ServerHello};
+
+        // Builds a plaintext record carrying a minimal (non-HRR)
+        // ServerHello for `suite` with only `supported_versions`.
+        fn synthetic_sh_record(suite: CipherSuite) -> Vec<u8> {
+            let sh = ServerHello {
+                random: [0xAB; 32], // not the HRR sentinel, no downgrade tail
+                session_id: Vec::new(),
+                cipher_suite: suite,
+                extensions: alloc::vec![(
+                    ExtensionType::SUPPORTED_VERSIONS,
+                    alloc::vec![0x03, 0x04]
+                ),],
+            };
+            let body = sh.encode();
+            let mut out = Vec::new();
+            crate::tls::codec::write_record(
+                &mut out,
+                crate::tls::ContentType::Handshake,
+                crate::tls::ProtocolVersion::TLSv1_2,
+                &body,
+            );
+            out
+        }
+
+        let fresh_client = |seed: &'static [u8]| {
+            let (_server_config, cert_der) = rsa_server();
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+            ClientConnection::new_with_offer(
+                ClientConfig::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[
+                    CipherSuite::AES_128_GCM_SHA256,
+                    CipherSuite::AES_256_GCM_SHA384,
+                ],
+                &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            )
+        };
+
+        // Suite switch after HRR: offered, but not the HRR-pinned suite.
+        let mut client = fresh_client(b"hrr-suite-pin");
+        let _ch1 = client.write_tls();
+        let hrr = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
+        client.read_tls(&hrr);
+        client.process_new_packets().unwrap();
+        let _ch2 = client.write_tls();
+        client.read_tls(&synthetic_sh_record(CipherSuite::AES_256_GCM_SHA384));
+        let err = client.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::IllegalParameter),
+            "suite switch after HRR must be illegal_parameter, got {err:?}"
+        );
+
+        // Control: the same flow with the HRR-pinned suite passes the pin
+        // check and fails later for a different reason (the synthetic SH
+        // has no key_share), proving the rejection above is the pin.
+        let mut client = fresh_client(b"hrr-suite-pin-ok");
+        let _ch1 = client.write_tls();
+        let hrr = synthetic_hrr_record(CipherSuite::AES_128_GCM_SHA256, NamedGroup::SECP256R1);
+        client.read_tls(&hrr);
+        client.process_new_packets().unwrap();
+        let _ch2 = client.write_tls();
+        client.read_tls(&synthetic_sh_record(CipherSuite::AES_128_GCM_SHA256));
+        let err = client.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::HandshakeFailure),
+            "matching suite must pass the pin (and fail on missing key_share), got {err:?}"
+        );
+    }
+
     /// A `KeyUpdate` body byte that is neither 0 nor 1 is rejected with
     /// `illegal_parameter` (RFC 8446 §4.6.3).
     #[test]
