@@ -379,7 +379,14 @@ impl DtlsClientConnection12 {
                 }
             }
             super::reliability::Action::GiveUp => {
-                self.state = State::Closed;
+                if self.state == State::Connected {
+                    // Defensive: a fully established connection must never
+                    // self-close on a retransmit cap. (The client clears its
+                    // flight at Connected, so this should be unreachable.)
+                    self.retransmit.on_peer_response();
+                } else {
+                    self.state = State::Closed;
+                }
             }
             super::reliability::Action::Idle => {}
         }

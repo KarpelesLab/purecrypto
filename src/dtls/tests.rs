@@ -379,6 +379,58 @@ fn application_data_both_ways_12() {
     assert_eq!(client.take_received(), b"pong from server");
 }
 
+/// Regression (retransmit GiveUp must not kill established connections):
+/// after a completed DTLS 1.2 handshake, neither side may have a handshake
+/// retransmit armed, and driving the clock through every backoff step must
+/// produce no retransmissions and never flip the connection to Closed.
+/// Previously the server registered its final CCS+Finished flight with the
+/// timer-driven retransmit machine, re-emitted it on every backoff step,
+/// and then GiveUp-closed the healthy connection ~2 minutes in.
+#[test]
+fn connection_survives_retransmit_backoff_after_handshake_12() {
+    use core::time::Duration;
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-server-backoff", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+    assert!(pump_handshake(&mut client, &mut server));
+
+    // Once established, no handshake retransmit may be armed on either side.
+    assert_eq!(client.next_timeout(), None, "client timer must be disarmed");
+    assert_eq!(server.next_timeout(), None, "server timer must be disarmed");
+
+    // Walk the clock far past every backoff step (1+2+4+8+16+32+60s).
+    for i in 1..=8u64 {
+        let t = Duration::from_secs(i * 120);
+        client.on_timeout(t);
+        server.on_timeout(t);
+        assert!(
+            client.pop_outbound_datagrams().is_empty(),
+            "client must not retransmit after establishment"
+        );
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "server must not retransmit after establishment"
+        );
+    }
+    assert!(client.is_handshake_complete(), "client must stay Connected");
+    assert!(server.is_handshake_complete(), "server must stay Connected");
+
+    // The connection still carries application data both ways.
+    client.send(b"still alive").unwrap();
+    for dg in client.pop_outbound_datagrams() {
+        server.feed_datagram(&dg).unwrap();
+    }
+    assert_eq!(server.take_received(), b"still alive");
+    server.send(b"ack").unwrap();
+    for dg in server.pop_outbound_datagrams() {
+        client.feed_datagram(&dg).unwrap();
+    }
+    assert_eq!(client.take_received(), b"ack");
+}
+
 /// Pseudo-random garbage that does not resemble any valid DTLS record:
 /// the first byte (11) routes it down the legacy-header path, where the
 /// pseudo-random length bytes exceed `MAX_FRAGMENT` (RecordOverflow class).
@@ -1275,6 +1327,115 @@ mod dtls13 {
             quiesced,
             "post-handshake ACK exchange must quiesce: an ACK is never ACKed"
         );
+    }
+
+    /// Regression (retransmit GiveUp must not kill established connections):
+    /// after a completed DTLS 1.3 handshake, neither side may have a
+    /// handshake retransmit armed (the client's epoch-0 ClientHello is
+    /// implicitly acknowledged by the ServerHello, the server's epoch-0
+    /// ServerHello by the client's first authenticated record, and the
+    /// whole server flight by the client Finished — RFC 9147 §7.1).
+    /// Previously the epoch-0 records were never released, the timer kept
+    /// firing after establishment, and both roles GiveUp-closed every
+    /// connection ~2 minutes in.
+    #[test]
+    fn connection_survives_retransmit_backoff_after_handshake_13() {
+        use core::time::Duration;
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-backoff", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake_13(&mut client, &mut server));
+
+        // Once established (and the final ACK delivered), no handshake
+        // retransmit may be armed on either side.
+        assert_eq!(client.next_timeout(), None, "client timer must be disarmed");
+        assert_eq!(server.next_timeout(), None, "server timer must be disarmed");
+
+        // Walk the clock far past every backoff step (1+2+4+8+16+32+60s).
+        for i in 1..=8u64 {
+            let t = Duration::from_secs(i * 120);
+            client.on_timeout(t);
+            server.on_timeout(t);
+            assert!(
+                client.pop_outbound_datagrams().is_empty(),
+                "client must not retransmit after establishment"
+            );
+            assert!(
+                server.pop_outbound_datagrams().is_empty(),
+                "server must not retransmit after establishment"
+            );
+        }
+        assert!(client.is_handshake_complete(), "client must stay Connected");
+        assert!(server.is_handshake_complete(), "server must stay Connected");
+
+        // The connection still carries application data both ways.
+        client.send(b"still alive").unwrap();
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"still alive");
+        server.send(b"ack").unwrap();
+        for dg in server.pop_outbound_datagrams() {
+            client.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"ack");
+    }
+
+    /// Regression (GiveUp guard): when the server's final ACK (covering the
+    /// client Finished) is lost, the client legitimately keeps Finished in
+    /// flight and retransmits it through the full backoff schedule — but
+    /// exhausting the retransmit cap must NOT close the established
+    /// connection.
+    #[test]
+    fn lost_final_ack_does_not_close_established_client_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-server-lostack", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // CH → server; full server flight → client; client Finished (+ACKs)
+        // → server. Then DROP the server's final output (its ACK of the
+        // client Finished).
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        for dg in server.pop_outbound_datagrams() {
+            client.feed_datagram(&dg).unwrap();
+        }
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        let dropped = server.pop_outbound_datagrams();
+        assert!(!dropped.is_empty(), "server should have queued the ACK");
+        assert!(client.is_handshake_complete());
+        assert!(server.is_handshake_complete());
+
+        // The unACKed Finished keeps the client's timer armed; drive it
+        // through every retransmit and the final GiveUp.
+        let mut fired = 0;
+        while let Some(t) = client.next_timeout() {
+            client.on_timeout(t);
+            let _ = client.pop_outbound_datagrams();
+            fired += 1;
+            assert!(fired <= 16, "retransmit schedule must terminate");
+        }
+        assert!(
+            client.is_handshake_complete(),
+            "GiveUp must not close an established connection"
+        );
+        assert_eq!(client.next_timeout(), None);
+
+        // And the connection still works.
+        client.send(b"ping").unwrap();
+        for dg in client.pop_outbound_datagrams() {
+            server.feed_datagram(&dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping");
     }
 
     /// Multi-suite negotiation (RFC 8446 §4.1.1 / RFC 9147 §5): when the

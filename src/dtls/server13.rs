@@ -379,7 +379,18 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     self.out_dgrams.push(dg.to_vec());
                 }
             }
-            super::reliability::Action::GiveUp => self.state = State::Closed,
+            super::reliability::Action::GiveUp => {
+                if self.state == State::Connected {
+                    // A fully established connection must never self-close
+                    // just because a stale handshake record was not
+                    // explicitly ACKed. Drop the leftover in-flight state
+                    // and stay Connected; only an in-progress handshake
+                    // times out.
+                    self.retransmit = Retransmit13::new();
+                } else {
+                    self.state = State::Closed;
+                }
+            }
             super::reliability::Action::Idle => {}
         }
     }
@@ -529,6 +540,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if seq > self.enc_read_seq {
             self.enc_read_seq = seq;
         }
+        // RFC 9147 §7.1 implicit acknowledgement: an authenticated record
+        // from the client proves it holds the handshake keys, i.e. our
+        // plaintext (epoch 0) ServerHello arrived. Epoch-0 records are never
+        // explicitly ACKed, so release them here — otherwise the SH would
+        // sit in the in-flight set forever and the GiveUp cap would tear
+        // down a healthy connection minutes after it was established.
+        self.retransmit.release_epoch(0);
         // Schedule an ACK for handshake records only (RFC 9147 §7): alerts
         // are not handshake messages, and ACK records themselves MUST NOT
         // be acknowledged — ACKing an ACK provokes the peer's ACK in
@@ -1234,6 +1252,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.enc_write_seq = 0;
         self.enc_read_seq = 0;
         self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
+        // RFC 9147 §7.1: the client's Finished is the responding flight to
+        // our entire server flight — everything we sent is implicitly
+        // acknowledged. Drop the in-flight set and disarm the retransmit
+        // timer; the server sends no further handshake flights, so leaving
+        // anything armed here would re-emit stale records on every backoff
+        // step and then GiveUp-close the established connection.
+        self.retransmit = Retransmit13::new();
         self.state = State::Connected;
         Ok(())
     }

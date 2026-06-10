@@ -438,7 +438,18 @@ impl DtlsClientConnection13 {
                     self.out_dgrams.push(dg.to_vec());
                 }
             }
-            super::reliability::Action::GiveUp => self.state = State::Closed,
+            super::reliability::Action::GiveUp => {
+                if self.state == State::Connected {
+                    // A fully established connection must never self-close
+                    // just because a stale handshake record was not
+                    // explicitly ACKed (e.g. the server's final ACK was
+                    // lost). Drop the leftover in-flight state and stay
+                    // Connected; only an in-progress handshake times out.
+                    self.retransmit = Retransmit13::new();
+                } else {
+                    self.state = State::Closed;
+                }
+            }
             super::reliability::Action::Idle => {}
         }
     }
@@ -783,6 +794,14 @@ impl DtlsClientConnection13 {
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
         self.server_hs_secret = Some(shts);
+        // RFC 9147 §7.1 implicit acknowledgement: the server's responding
+        // flight proves our plaintext (epoch 0) ClientHello arrived. The
+        // peer never sends explicit ACKs for epoch-0 records, so without
+        // this release the CH would sit in the in-flight set forever, the
+        // retransmit timer would keep firing after the handshake completed,
+        // and the GiveUp cap would eventually tear down a healthy
+        // connection.
+        self.retransmit = Retransmit13::new();
         self.state = State::WaitEncryptedExtensions;
         Ok(())
     }

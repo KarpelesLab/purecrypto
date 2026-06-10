@@ -159,6 +159,25 @@ impl Retransmit13 {
         }
     }
 
+    /// RFC 9147 §7.1 implicit acknowledgement: removes every in-flight
+    /// record sent at `epoch`. Plaintext (epoch 0) records are never
+    /// explicitly ACKed by the peer — receipt of the peer's *responding*
+    /// flight is the only proof of delivery — so the connection state
+    /// machines call this when that proof arrives. Mirrors [`Self::on_ack`]:
+    /// if the in-flight set drains, the timer is cancelled and the backoff
+    /// state reset.
+    pub(crate) fn release_epoch(&mut self, epoch: u64) {
+        if self.in_flight.is_empty() {
+            return;
+        }
+        self.in_flight.retain(|r| r.record_number.epoch != epoch);
+        if self.in_flight.is_empty() {
+            self.deadline = None;
+            self.timeout = INITIAL_TIMEOUT;
+            self.attempts = 0;
+        }
+    }
+
     /// Returns the absolute time at which `on_timeout` should next be
     /// invoked, or `None` if no records are in flight.
     pub(crate) fn next_timeout(&self) -> Option<Instant> {
@@ -372,6 +391,33 @@ mod tests {
         // populated — the caller will fail the connection regardless.
         assert_eq!(r.next_timeout(), None);
         assert_eq!(r.in_flight_len(), 1);
+    }
+
+    #[test]
+    fn release_epoch_drops_only_that_epoch() {
+        let mut r = Retransmit13::new();
+        r.on_record_sent(rec(0, 0, b"plain"), Duration::from_secs(0));
+        r.on_record_sent(rec(2, 0, b"enc0"), Duration::from_secs(0));
+        r.on_record_sent(rec(2, 1, b"enc1"), Duration::from_secs(0));
+
+        r.release_epoch(0);
+        assert_eq!(r.in_flight_len(), 2);
+        assert!(r.next_timeout().is_some());
+        let remaining: Vec<&[u8]> = r.in_flight_datagrams().collect();
+        assert_eq!(remaining, vec![b"enc0".as_slice(), b"enc1".as_slice()]);
+
+        // Releasing the remaining epoch drains the set and cancels the timer.
+        r.release_epoch(2);
+        assert_eq!(r.in_flight_len(), 0);
+        assert_eq!(r.next_timeout(), None);
+    }
+
+    #[test]
+    fn release_epoch_on_empty_is_no_op() {
+        let mut r = Retransmit13::new();
+        r.release_epoch(0);
+        assert_eq!(r.in_flight_len(), 0);
+        assert_eq!(r.next_timeout(), None);
     }
 
     #[test]

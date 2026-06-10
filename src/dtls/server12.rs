@@ -351,7 +351,16 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                     self.out_dgrams.push(dg.clone());
                 }
             }
-            super::reliability::Action::GiveUp => self.state = State::Closed,
+            super::reliability::Action::GiveUp => {
+                if self.state == State::Connected {
+                    // A fully established connection must never self-close
+                    // on a retransmit cap; drop the stale flight and stay
+                    // Connected. Only an in-progress handshake times out.
+                    self.retransmit.on_peer_response();
+                } else {
+                    self.state = State::Closed;
+                }
+            }
             super::reliability::Action::Idle => {}
         }
     }
@@ -931,6 +940,12 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     fn on_client_key_exchange(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
+        // RFC 6347 §4.2.4: receipt of the client's responding flight
+        // implicitly acknowledges our ServerHello..ServerHelloDone flight.
+        // Cancel its retransmit timer (mirrors the client's
+        // `on_server_hello`); leaving it armed would keep re-emitting the
+        // flight on every backoff step.
+        self.retransmit.on_peer_response();
         let cke = ClientKeyExchange::decode(body)?;
         let group = self.group.ok_or(Error::InappropriateState)?;
         // Complete ECDHE on the negotiated group and derive the premaster.
@@ -1044,7 +1059,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let fin_dgram = self.encrypt_record_dtls(ContentType::Handshake, &fin_frag_buf)?;
         flight.push(fin_dgram);
 
-        self.send_flight(flight);
+        // This CCS + Finished is the LAST flight of the handshake: no
+        // responding flight from the client will ever arrive to cancel a
+        // retransmit timer, so we deliberately do NOT register it with the
+        // retransmit machine (RFC 6347 §4.2.4 puts the last-flight sender
+        // in the FINISHED state, where retransmission is triggered by
+        // seeing the peer re-send ITS flight — not by a timer). Arming the
+        // timer here would blindly re-emit the flight on every backoff step
+        // and previously GiveUp-closed a perfectly healthy connection ~2
+        // minutes after establishment.
+        for dg in &flight.datagrams {
+            self.out_dgrams.push(dg.clone());
+        }
+        self.retransmit.on_peer_response();
         self.state = State::Connected;
         Ok(())
     }
