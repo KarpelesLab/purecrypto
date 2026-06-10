@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.9](https://github.com/KarpelesLab/purecrypto/compare/v0.6.8...v0.6.9) - 2026-06-10
+
+### Other
+
+- store root(s) in private-key serialization to avoid O(2^h) load
+- harden pkeyutl pkcs1 decrypt oracle hygiene and warn on legacy modes
+- zeroize the TLS 1.2 master secret in every long-lived holder
+- fail closed when a cipher_suites restriction matches no supported suite
+- fail closed on retry tokens when no clock is configured
+- cover OCSP, QUIC-client, LMS/XMSS, and legacy-TLS attacker surfaces
+- enforce nameConstraints declared on trust anchors
+- make SM4 constant-time via an algebraic table-free S-box
+- move PskTooShort to the enum tail to keep variant discriminants stable
+- document BEAST exposure of TLS 1.0 CBC chained IVs
+- cap extensions per handshake message to bound duplicate scan
+- derive SH accept_confirmation per RFC 9849 §7.2 (extract from inner CH random)
+- stop silently ignoring Config::require_extended_master_secret
+- validate HelloRetryRequest legacy_session_id_echo
+- enforce the RFC 8446 §8.2 ticket-age freshness window on 0-RTT
+- reject 0-RTT when the negotiated ALPN differs from the ticket's session
+- prune acked CRYPTO ranges from the crypto_buf sent-history
+- reject CRYPTO frames whose offset + length exceeds 2^62-1
+- stop rewriting peer_addr from arbitrary inbound datagrams
+- enforce mandatory ALPN (RFC 9001 §8.1) at connection construction
+- discard retained previous-phase rx keys after 3xPTO
+- old-phase packets opened with retained keys no longer drive key-update commits
+- document the amplification risk of disabling the cookie exchange
+- cap pre-cookie reassembly at 32 KiB and one in-flight message
+- silently drop spoofable epoch-0 handshake faults instead of erroring
+- bind OCSP times to GeneralizedTime form; finish() extension readers
+- fix temp-dir/key-perm hygiene and fixed-seed/fixed-path patterns
+- write kdf hex output and pkeyutl-decrypt plaintext as private files
+- stop short-circuiting zero/equality tests on secret EC scalars
+- range-check levels in the free verify_hss function
+- zeroize the implicit-rejection secret k_bar in decapsulation
+- wipe ECDH/X25519/X448 shared secrets before they leave scope
+- scrypt enforces its documented 32-bit block-counter bounds
+- enforce RFC 9180 §9.5 32-byte PSK minimum in PSK / AuthPSK modes
+- argon2 rejects salts shorter than RFC 9106's 8-byte minimum
+- enforce SP 800-90A HMAC-DRBG bounds (per-request cap, entropy input)
+- kdf, hpke: wipe secret intermediates left in freed memory
+- cap attacker-controlled PBES2 iteration count at 10M on decrypt
+- pbes2 accepts DER INTEGERs whose minimal form carries a 0x00 pad
+
 ## [0.6.8](https://github.com/KarpelesLab/purecrypto/compare/v0.6.7...v0.6.8) - 2026-06-10
 
 ### Other
