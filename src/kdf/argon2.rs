@@ -158,7 +158,11 @@ pub fn argon2(
     }
 
     // --- Allocate the memory matrix: m' 1024-byte blocks ---
-    let mut mem: Vec<u8> = vec![0u8; m_prime * 1024];
+    // Guard the matrix size: on 32-bit targets m' · 1024 can wrap usize for
+    // per-RFC "valid" params, which would under-allocate and lead to OOB
+    // panics. Match the checked_mul discipline of the sibling scrypt code.
+    let mem_len = m_prime.checked_mul(1024).ok_or(Error::InvalidParam)?;
+    let mut mem: Vec<u8> = vec![0u8; mem_len];
     let block_off = |i: usize, j: usize| -> usize { (i * q + j) * 1024 };
 
     // --- Initialize B[i][0] and B[i][1] for each lane i ---
