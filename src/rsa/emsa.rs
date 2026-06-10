@@ -243,7 +243,15 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     // take the fallback. The real-plaintext length is variable (depends on
     // sep_idx) but the OUTPUT length is always `expected_len`, so the timing /
     // size of the return value reveals nothing.
-    let real_start = (sep_idx as usize).saturating_add(1);
+    // The real plaintext starts one past the separator. `sep_idx` (and thus
+    // this offset) is secret, so the copy below must not index `em` with it:
+    // a secret-offset load is a cache side channel that would re-open the
+    // exact Bleichenbacher oracle this function exists to close. Instead, for
+    // each output position the inner loop touches EVERY byte of `em` in a
+    // fixed address sequence and masks in the one whose index matches
+    // `real_start + j`. O(k²) over a ≤512-byte buffer on a per-handshake path
+    // — negligible next to the private-key operation above.
+    let real_start = sep_idx.wrapping_add(1);
     // Fold any nonzero bit of `bad` down into bit 0 so we can build a Choice.
     let mut fold = bad;
     fold |= fold >> 4;
@@ -252,13 +260,17 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     let bad_choice = crate::ct::Choice::from(fold & 1);
 
     let mut out = Vec::with_capacity(expected_len);
-    for (i, &fallback_byte) in fallback.iter().enumerate() {
-        // The "real" byte is em[real_start + i] when it exists. Because
-        // real_start + i may exceed em.len() if the padding is bad, we clamp
-        // to a valid index unconditionally; the resulting byte is suppressed
-        // by the conditional select.
-        let idx = real_start.saturating_add(i).min(em.len().saturating_sub(1));
-        let real_byte = em[idx];
+    for (j, &fallback_byte) in fallback.iter().enumerate() {
+        // The "real" byte is em[real_start + j] when it exists. When that
+        // index falls past the end of `em` (bad padding, or a message shorter
+        // than expected_len), no index matches and `real_byte` stays 0 — and
+        // the conditional select suppresses it anyway.
+        let want = real_start.wrapping_add(j as u32);
+        let mut real_byte = 0u8;
+        for (i, &b) in em.iter().enumerate() {
+            let hit = (i as u32).ct_eq(&want).unwrap_u8();
+            real_byte |= b & 0u8.wrapping_sub(hit);
+        }
         // `conditional_select(a, b, choice)` returns `a` iff `choice`; we want
         // the fallback when padding was bad, otherwise the real byte.
         out.push(u8::conditional_select(
