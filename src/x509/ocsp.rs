@@ -300,6 +300,9 @@ impl OcspResponse {
         }
         // `responseBytes [0] EXPLICIT ResponseBytes`.
         let rb_tlv = seq.read_tlv(tag::context(0))?;
+        // The OCSPResponse SEQUENCE ends here — reject trailing fields, for
+        // parity with Certificate / CRL strictness.
+        seq.finish()?;
         let mut rb = Reader::new(rb_tlv);
         let mut rb_seq = rb.read_sequence()?;
         let resp_type = parse_oid(rb_seq.read_oid()?)?;
@@ -309,6 +312,8 @@ impl OcspResponse {
         // `response OCTET STRING` whose content is the BasicOCSPResponse DER.
         let basic = rb_seq.read_octet_string()?;
         rb_seq.finish()?;
+        // ...and the `[0]` EXPLICIT wrapper holds exactly one ResponseBytes.
+        rb.finish()?;
         Ok(Some(basic))
     }
 
@@ -589,6 +594,13 @@ impl OcspResponse {
             if let Some((true, _)) = responder.basic_constraints()? {
                 return Err(Error::Verification);
             }
+            // ...and that it carries no critical extension we don't
+            // recognize. RFC 5280 §4.2 requires rejecting a certificate with
+            // an unhandled critical extension; the chain validator enforces
+            // this (`tls::pki::verify::check_critical_extensions_recognized`)
+            // but the responder cert never passes through that path, so
+            // mirror the same allowlist here before trusting its key.
+            check_responder_critical_extensions(&responder)?;
             // ...and (when a clock is supplied) still inside its own
             // notBefore/notAfter window. Without this, the private key of an
             // expired-but-once-valid OCSPSigning cert could forge a "good"
@@ -880,6 +892,36 @@ fn verify_cert_signature_with_policy(
         return Err(Error::Verification);
     }
     cert.verify_signature_with(issuer_key)
+}
+
+/// RFC 5280 §4.2: reject the delegated responder certificate if it carries
+/// any critical extension whose OID we don't recognize. This replicates
+/// `tls::pki::verify::check_critical_extensions_recognized` (which is private
+/// to the TLS layer and returns its error type) for the OCSP path: the
+/// recognized set is basicConstraints, keyUsage, extKeyUsage, and
+/// subjectAltName — the extensions the surrounding `check_for_cert_with_options`
+/// logic actually evaluates — plus `id-pkix-ocsp-nocheck` (RFC 6960
+/// §4.2.2.2.1), whose semantics ("don't revocation-check the responder") are
+/// trivially honored here since responder certs are not revocation-checked.
+/// A critical `nameConstraints` is rejected outright: constraints restrict
+/// certificates *issued by* the holder, the responder is required to be an
+/// end-entity (CA:TRUE is rejected above), and nothing in this path evaluates
+/// subtrees — accepting it would let a constraint we can't honor appear
+/// honored. Every other critical extension fails closed.
+fn check_responder_critical_extensions(cert: &Certificate) -> Result<(), Error> {
+    for o in cert.critical_extension_oids()? {
+        let bytes = o.as_slice();
+        if bytes == oid::BASIC_CONSTRAINTS
+            || bytes == oid::KEY_USAGE
+            || bytes == oid::EXT_KEY_USAGE
+            || bytes == oid::SUBJECT_ALT_NAME
+            || bytes == oid::ID_PKIX_OCSP_NOCHECK
+        {
+            continue;
+        }
+        return Err(Error::Verification);
+    }
+    Ok(())
 }
 
 /// Encodes a bare `AlgorithmIdentifier` for an OCSP `CertID.hashAlgorithm`
@@ -1677,6 +1719,98 @@ mod tests {
         );
         assert_eq!(
             ok.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
+            OcspCertStatus::Good
+        );
+    }
+
+    // A delegated responder cert carrying a critical extension we don't
+    // recognize must be rejected (RFC 5280 §4.2) — the responder never passes
+    // through the chain validator's unknown-critical-extension screen, so the
+    // OCSP path has to enforce it itself.
+    #[test]
+    fn check_for_cert_rejects_unknown_critical_extension_on_responder() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let issuer_signer = CertSigner::Rsa(&issuer_key);
+        let responder_key = ed25519();
+        let responder_pub = AnyPublicKey::Ed25519(responder_key.public_key());
+        let responder_dn = DistinguishedName::common_name("OCSP critical-ext responder");
+        // Same accepted-responder shape as `delegated_good_response`, plus one
+        // unknown critical extension (a made-up private-arc OID).
+        let responder_extensions = vec![
+            extension::basic_constraints(false, None),
+            Extension {
+                oid: oid::EXT_KEY_USAGE.to_vec(),
+                critical: false,
+                value: encode_sequence(&oid_tlv(oid::ID_KP_OCSP_SIGNING)),
+            },
+            Extension {
+                oid: alloc::vec![1, 3, 6, 1, 4, 1, 99999, 1],
+                critical: true,
+                value: encode_null(),
+            },
+        ];
+        let responder_cert = Certificate::issue_with_extensions(
+            &issuer_signer,
+            &issuer.subject().unwrap(),
+            &responder_dn,
+            &responder_pub,
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            101,
+            &responder_extensions,
+        )
+        .expect("issue responder");
+
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .delegated_responder_cert(responder_cert.to_der().to_vec())
+            .sign(&CertSigner::Ed25519(&responder_key))
+            .unwrap();
+
+        let now = Time::utc(2026, 6, 1, 0, 0, 0);
+        assert!(matches!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)),
+            Err(Error::Verification)
+        ));
+
+        // Sanity: the same extension marked non-critical is tolerated (RFC
+        // 5280 §4.2 lets a verifier ignore unrecognized non-critical
+        // extensions), pinning the rejection above on the critical flag.
+        let responder_extensions = vec![
+            extension::basic_constraints(false, None),
+            Extension {
+                oid: oid::EXT_KEY_USAGE.to_vec(),
+                critical: false,
+                value: encode_sequence(&oid_tlv(oid::ID_KP_OCSP_SIGNING)),
+            },
+            Extension {
+                oid: alloc::vec![1, 3, 6, 1, 4, 1, 99999, 1],
+                critical: false,
+                value: encode_null(),
+            },
+        ];
+        let responder_cert = Certificate::issue_with_extensions(
+            &issuer_signer,
+            &issuer.subject().unwrap(),
+            &responder_dn,
+            &responder_pub,
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            102,
+            &responder_extensions,
+        )
+        .expect("issue responder");
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .unwrap()
+            .delegated_responder_cert(responder_cert.to_der().to_vec())
+            .sign(&CertSigner::Ed25519(&responder_key))
+            .unwrap();
+        assert_eq!(
+            resp.check_for_cert(&leaf, &issuer, Some(&now)).unwrap(),
             OcspCertStatus::Good
         );
     }

@@ -70,36 +70,50 @@ impl DistinguishedName {
         let mut dn = DistinguishedName::default();
         let mut seq = reader.read_sequence()?;
         while !seq.is_empty() {
-            // RelativeDistinguishedName ::= SET OF AttributeTypeAndValue
+            // RelativeDistinguishedName ::= SET SIZE (1..MAX) OF
+            // AttributeTypeAndValue. Multi-valued RDNs are rare but legal —
+            // parse every AttributeTypeAndValue in the SET rather than
+            // silently dropping trailing ones (which would make two
+            // differently-named certificates render identically). An empty
+            // SET violates the SIZE (1..MAX) constraint and is rejected.
             let set = seq.read_tlv(tag::SET)?;
             let mut set_reader = Reader::new(set);
-            let mut atv = set_reader.read_sequence()?;
-            let oid_body = atv.read_oid()?;
-            let (_, value) = atv.read_any()?;
-            let s: String = core::str::from_utf8(value)
-                .map_err(|_| Error::Malformed)?
-                .into();
-            // Reject embedded NUL and other control characters in attribute
-            // values. They have no legitimate place in a printable name and
-            // enable display spoofing or log injection when the decoded DN is
-            // later rendered. The byte-exact issuer/subject comparison used
-            // for chain building works on raw TLV bytes elsewhere and is
-            // unaffected by this check.
-            if s.chars().any(|c| c.is_control()) {
+            if set_reader.is_empty() {
                 return Err(Error::Malformed);
             }
-            let arcs = parse_oid(oid_body)?;
-            let arcs = arcs.as_slice();
-            if arcs == oid::COMMON_NAME {
-                dn.common_name = Some(s);
-            } else if arcs == oid::ORGANIZATION {
-                dn.organization = Some(s);
-            } else if arcs == oid::ORGANIZATIONAL_UNIT {
-                dn.organizational_unit = Some(s);
-            } else if arcs == oid::COUNTRY {
-                dn.country = Some(s);
+            while !set_reader.is_empty() {
+                let mut atv = set_reader.read_sequence()?;
+                let oid_body = atv.read_oid()?;
+                let (_, value) = atv.read_any()?;
+                // Strict DER: an AttributeTypeAndValue is exactly
+                // `SEQUENCE { type, value }` — trailing bytes are rejected.
+                atv.finish()?;
+                let s: String = core::str::from_utf8(value)
+                    .map_err(|_| Error::Malformed)?
+                    .into();
+                // Reject embedded NUL and other control characters in
+                // attribute values. They have no legitimate place in a
+                // printable name and enable display spoofing or log injection
+                // when the decoded DN is later rendered. The byte-exact
+                // issuer/subject comparison used for chain building works on
+                // raw TLV bytes elsewhere and is unaffected by this check.
+                if s.chars().any(|c| c.is_control()) {
+                    return Err(Error::Malformed);
+                }
+                let arcs = parse_oid(oid_body)?;
+                let arcs = arcs.as_slice();
+                if arcs == oid::COMMON_NAME {
+                    dn.common_name = Some(s);
+                } else if arcs == oid::ORGANIZATION {
+                    dn.organization = Some(s);
+                } else if arcs == oid::ORGANIZATIONAL_UNIT {
+                    dn.organizational_unit = Some(s);
+                } else if arcs == oid::COUNTRY {
+                    dn.country = Some(s);
+                }
+                // Unknown attributes are ignored.
             }
-            // Unknown attributes are ignored.
+            set_reader.finish()?;
         }
         Ok(dn)
     }
@@ -136,6 +150,50 @@ mod tests {
         let mut r = Reader::new(&der);
         let dn = DistinguishedName::decode(&mut r).unwrap();
         assert_eq!(dn.common_name.as_deref(), Some("example.com"));
+    }
+
+    /// Encodes one AttributeTypeAndValue SEQUENCE with `arcs` as the type and
+    /// a UTF8String `value`.
+    fn atv(arcs: &[u64], value: &str) -> Vec<u8> {
+        encode_sequence(&[oid_tlv(arcs), encode_string(tag::UTF8_STRING, value)].concat())
+    }
+
+    #[test]
+    fn decode_parses_multi_valued_rdn() {
+        // One SET carrying two AttributeTypeAndValues (CN + O). Both must be
+        // surfaced — dropping the trailing one would let two distinct names
+        // render identically.
+        let set = encode_tlv(
+            tag::SET,
+            &[atv(oid::COMMON_NAME, "leaf"), atv(oid::ORGANIZATION, "org")].concat(),
+        );
+        let der = encode_sequence(&set);
+        let mut r = Reader::new(&der);
+        let dn = DistinguishedName::decode(&mut r).unwrap();
+        assert_eq!(dn.common_name.as_deref(), Some("leaf"));
+        assert_eq!(dn.organization.as_deref(), Some("org"));
+    }
+
+    #[test]
+    fn decode_rejects_empty_rdn_set() {
+        // RelativeDistinguishedName ::= SET SIZE (1..MAX): an empty SET is
+        // malformed.
+        let set = encode_tlv(tag::SET, &[]);
+        let der = encode_sequence(&set);
+        let mut r = Reader::new(&der);
+        assert!(DistinguishedName::decode(&mut r).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_trailing_bytes_inside_atv() {
+        // An AttributeTypeAndValue with trailing garbage after the value must
+        // be rejected, not silently accepted.
+        let mut inner = [oid_tlv(oid::COMMON_NAME), encode_string(0x0c, "x")].concat();
+        inner.push(0x00); // trailing junk inside the ATV SEQUENCE
+        let set = encode_tlv(tag::SET, &encode_sequence(&inner));
+        let der = encode_sequence(&set);
+        let mut r = Reader::new(&der);
+        assert!(DistinguishedName::decode(&mut r).is_err());
     }
 
     #[test]

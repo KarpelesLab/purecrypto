@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use super::Error;
 use crate::der::{Reader, encode_sequence, encode_string, tag};
 
-/// An X.509 time, stored in its ASN.1 textual form. Encoded as `UTCTime`
-/// (`YYMMDDHHMMSSZ`), which is valid for years 1950–2049.
+/// An X.509 time, stored in its ASN.1 textual form: `UTCTime`
+/// (`YYMMDDHHMMSSZ`) for years 1950–2049, `GeneralizedTime`
+/// (`YYYYMMDDHHMMSSZ`) otherwise, per RFC 5280 §4.1.2.5.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Time {
     repr: String,
@@ -15,9 +16,23 @@ pub struct Time {
 
 impl Time {
     /// Builds a time from UTC calendar components.
+    ///
+    /// Years 1950–2049 are stored in the two-digit-year `UTCTime` form; any
+    /// other year is stored in the four-digit-year `GeneralizedTime` form.
+    /// Storing, say, 2080 as UTCTime would re-parse as 1980 under the
+    /// RFC 5280 century rule, silently shifting the date by a century.
+    /// Years above 9999 are not representable in ASN.1 time types; the year
+    /// is reduced modulo 10000 (such values are nonsensical inputs, not
+    /// reachable from any parser).
     pub fn utc(year: u64, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Time {
-        let mut repr = String::with_capacity(13);
-        push2(&mut repr, (year % 100) as u8);
+        let mut repr = String::with_capacity(15);
+        if (1950..=2049).contains(&year) {
+            push2(&mut repr, (year % 100) as u8);
+        } else {
+            let y = year % 10000;
+            push2(&mut repr, (y / 100) as u8);
+            push2(&mut repr, (y % 100) as u8);
+        }
         push2(&mut repr, month);
         push2(&mut repr, day);
         push2(&mut repr, hour);
@@ -77,10 +92,6 @@ impl Time {
         Time {
             repr: String::from(s),
         }
-    }
-
-    pub(crate) fn to_der(&self) -> Vec<u8> {
-        encode_string(tag::UTC_TIME, &self.repr)
     }
 
     /// Encodes the time as an ASN.1 `GeneralizedTime`
@@ -312,7 +323,17 @@ impl Validity {
     }
 
     pub(crate) fn to_der(&self) -> Vec<u8> {
-        encode_sequence(&[self.not_before.to_der(), self.not_after.to_der()].concat())
+        // RFC 5280 §4.1.2.5: UTCTime for 1950–2049, GeneralizedTime
+        // otherwise. `to_der_choice` picks the tag from the stored form, so a
+        // 2050+ validity bound round-trips instead of mis-encoding as a
+        // century-shifted UTCTime.
+        encode_sequence(
+            &[
+                self.not_before.to_der_choice(),
+                self.not_after.to_der_choice(),
+            ]
+            .concat(),
+        )
     }
 
     pub(crate) fn decode(reader: &mut Reader) -> Result<Self, Error> {
@@ -412,6 +433,35 @@ mod tests {
         let utc2 = Time::from_repr("20240101000000Z").to_der_choice();
         assert_eq!(utc2[0], tag::UTC_TIME);
         assert_eq!(utc2[1] as usize, 13);
+    }
+
+    #[test]
+    fn utc_year_2080_round_trips_as_generalized_time() {
+        // Years outside 1950–2049 must be stored / emitted as
+        // GeneralizedTime. The old behavior stored "80…Z" (UTCTime form),
+        // which re-parses as 1980.
+        let t = Time::utc(2080, 1, 31, 12, 0, 0);
+        assert_eq!(t.as_str(), "20800131120000Z");
+        let der = t.to_der_choice();
+        assert_eq!(der[0], tag::GENERALIZED_TIME);
+        assert_eq!(der[1] as usize, 15);
+        let parsed = read_time(&mut Reader::new(&der)).unwrap();
+        assert_eq!(parsed.to_unix_checked(), t.to_unix_checked());
+        assert_eq!(parsed.as_str(), "20800131120000Z");
+        // 1900 (below the UTCTime window) also takes the GeneralizedTime form.
+        assert_eq!(Time::utc(1900, 1, 1, 0, 0, 0).as_str(), "19000101000000Z");
+        // A full Validity round-trips through DER with a 2050+ notAfter.
+        let v = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2080, 1, 1, 0, 0, 0),
+        );
+        let der = v.to_der();
+        let parsed = Validity::decode(&mut Reader::new(&der)).unwrap();
+        assert_eq!(parsed.not_before.as_str(), "240101000000Z");
+        assert_eq!(parsed.not_after.as_str(), "20800101000000Z");
+        // ...and accepts a 2060 instant, which the century-shifted encoding
+        // would have rejected.
+        assert!(parsed.accepts(&Time::utc(2060, 6, 1, 0, 0, 0)));
     }
 
     #[test]

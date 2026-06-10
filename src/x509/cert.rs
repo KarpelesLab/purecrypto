@@ -1129,8 +1129,10 @@ fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
     let mut out = NameConstraints::default();
     let mut r = Reader::new(value);
     let mut seq = r.read_sequence()?;
+    let mut any_subtrees = false;
     // permittedSubtrees [0] IMPLICIT GeneralSubtrees → constructed tag 0xA0.
     if seq.peek_tag() == Some(tag::context(0)) {
+        any_subtrees = true;
         let body = seq.read_tlv(tag::context(0))?;
         parse_subtrees(
             body,
@@ -1140,6 +1142,7 @@ fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
         )?;
     }
     if seq.peek_tag() == Some(tag::context(1)) {
+        any_subtrees = true;
         let body = seq.read_tlv(tag::context(1))?;
         parse_subtrees(
             body,
@@ -1150,6 +1153,12 @@ fn parse_name_constraints(value: &[u8]) -> Result<NameConstraints, Error> {
     }
     seq.finish()?;
     r.finish()?;
+    // RFC 5280 §4.2.1.10: "Conforming CAs MUST NOT issue certificates where
+    // name constraints is an empty sequence. That is, either the
+    // permittedSubtrees field or the excludedSubtrees MUST be present."
+    if !any_subtrees {
+        return Err(Error::Malformed);
+    }
     Ok(out)
 }
 
@@ -1944,6 +1953,31 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         perm.extend_from_slice(&subtree);
         let body = encode_sequence(&perm);
         assert!(super::parse_name_constraints(&body).is_err());
+    }
+
+    #[test]
+    fn name_constraints_rejects_empty_sequence() {
+        use crate::der::encode_sequence;
+        // RFC 5280 §4.2.1.10: at least one of permittedSubtrees /
+        // excludedSubtrees MUST be present. An empty NameConstraints SEQUENCE
+        // constrains nothing and must be rejected, not parsed as a vacuous
+        // (no-op) constraint.
+        let body = encode_sequence(&[]);
+        assert!(super::parse_name_constraints(&body).is_err());
+        // A NameConstraints with one real subtree still parses.
+        let dns = b"example.com";
+        let mut dns_tlv = alloc::vec::Vec::new();
+        dns_tlv.push(0x82); // dNSName [2] IMPLICIT IA5String
+        dns_tlv.push(dns.len() as u8);
+        dns_tlv.extend_from_slice(dns);
+        let subtree = encode_sequence(&dns_tlv);
+        let mut perm = alloc::vec::Vec::new();
+        perm.push(0xA0);
+        perm.push(subtree.len() as u8);
+        perm.extend_from_slice(&subtree);
+        let body = encode_sequence(&perm);
+        let nc = super::parse_name_constraints(&body).unwrap();
+        assert_eq!(nc.permitted_dns, alloc::vec![String::from("example.com")]);
     }
 
     /// Forges a TBSCertificate with a caller-controlled `version` tag and an
