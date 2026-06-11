@@ -367,19 +367,32 @@ pub unsafe extern "C" fn pc_tls_cfg_set_alpn(
         if cfg.is_null() {
             return PcStatus::NullPointer;
         }
+        // Cap the caller-controlled count BEFORE reserving so a garbage
+        // `n` can't drive `Vec::with_capacity` into `handle_alloc_error`
+        // (an abort the panic guard can't catch). 256 comfortably
+        // exceeds any realistic ALPN preference list.
+        const PC_ALPN_MAX: usize = 256;
+        if n > PC_ALPN_MAX {
+            return PcStatus::Unsupported;
+        }
+        if n > 0 && protocols.is_null() {
+            return PcStatus::NullPointer;
+        }
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
-        if n > 0 {
-            if protocols.is_null() {
+        for i in 0..n {
+            let p = unsafe { *protocols.add(i) };
+            if p.is_null() {
                 return PcStatus::NullPointer;
             }
-            for i in 0..n {
-                let p = unsafe { *protocols.add(i) };
-                if p.is_null() {
-                    return PcStatus::NullPointer;
-                }
-                let cs = unsafe { core::ffi::CStr::from_ptr(p) };
-                out.push(cs.to_bytes().to_vec());
+            let cs = unsafe { core::ffi::CStr::from_ptr(p) };
+            let bytes = cs.to_bytes();
+            // RFC 7301: a protocol name is 1..=255 bytes. Empty is
+            // illegal; >255 later trips a release assert in the
+            // ClientHello encoder. Reject cleanly at set time.
+            if bytes.is_empty() || bytes.len() > 255 {
+                return PcStatus::Unsupported;
             }
+            out.push(bytes.to_vec());
         }
         unsafe { &mut *cfg }.alpn = out;
         PcStatus::Ok
@@ -631,12 +644,16 @@ pub unsafe extern "C" fn pc_tls_feed(
                 unsafe { *consumed = n };
             }
         };
+        // Initialise `*consumed` to 0 BEFORE touching the engine. The
+        // documented contract guarantees it is written before return on
+        // every path; without this an unwind out of `conn.feed` (caught
+        // by the outer `guard` and turned into `Internal`) would leave
+        // the caller reading an uninitialised `size_t`.
+        write_consumed(0);
         if tls.is_null() {
-            write_consumed(0);
             return PcStatus::NullPointer;
         }
         let Some(b) = (unsafe { slice(wire_in, in_len) }) else {
-            write_consumed(0);
             return PcStatus::NullPointer;
         };
         let conn = &mut unsafe { &mut *tls }.inner;
