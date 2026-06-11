@@ -33,22 +33,28 @@ pub unsafe extern "C" fn pc_csr_create_rsa(
         let Ok(cn) = cn.to_str() else {
             return core::ptr::null_mut();
         };
+        // Cap the caller-controlled count BEFORE reserving so a garbage
+        // `dns_count` can't drive `Vec::with_capacity` into
+        // `handle_alloc_error` (an abort the panic guard can't catch).
+        // 1024 SAN entries comfortably exceeds any realistic request.
+        const PC_DNS_MAX: usize = 1024;
+        if dns_count > PC_DNS_MAX {
+            return core::ptr::null_mut();
+        }
+        if dns_count > 0 && dns_names.is_null() {
+            return core::ptr::null_mut();
+        }
         let mut dns: Vec<&str> = Vec::with_capacity(dns_count);
-        if dns_count > 0 {
-            if dns_names.is_null() {
+        for i in 0..dns_count {
+            let p = unsafe { *dns_names.add(i) };
+            if p.is_null() {
                 return core::ptr::null_mut();
             }
-            for i in 0..dns_count {
-                let p = unsafe { *dns_names.add(i) };
-                if p.is_null() {
-                    return core::ptr::null_mut();
-                }
-                let s = unsafe { core::ffi::CStr::from_ptr(p) };
-                let Ok(s) = s.to_str() else {
-                    return core::ptr::null_mut();
-                };
-                dns.push(s);
-            }
+            let s = unsafe { core::ffi::CStr::from_ptr(p) };
+            let Ok(s) = s.to_str() else {
+                return core::ptr::null_mut();
+            };
+            dns.push(s);
         }
         let subject = DistinguishedName::common_name(cn);
         // SAFETY: PcRsaKey is allocated by Box::into_raw, so we can borrow
