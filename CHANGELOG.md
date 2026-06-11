@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.11](https://github.com/KarpelesLab/purecrypto/compare/v0.6.10...v0.6.11) - 2026-06-11
+
+### Fixed
+
+- *(ct)* normalize Choice::from with branchless != 0 instead of & 1
+- *(cmac)* make inherent Cmac::verify length-strict (reject truncated/empty tags)
+
+### Other
+
+- scrub per-call AEAD/key-wrap/MAC key copies on drop
+- collapse nested if-let to satisfy clippy collapsible_if
+- normalize rustfmt formatting on CLI -len cap paths
+- enforce strict no-trailing-bytes finish() on ResponseData and SingleResponse
+- route typed verify_signature through algid-consistency check
+- reject trailing bytes after the iPAddress SAN SEQUENCE
+- cap caller-controlled output lengths and reject empty AEAD nonce
+- warn on world-readable private-key reads in pkey and pkeyutl
+- scrub leftover secret-key and cookie/retry-secret stack copies
+- reject NULL output before burning a stateful LMS/XMSS one-time key
+- cap caller counts before reserving and validate ALPN entries
+- wipe decrypted QUIC stream plaintext in pc_quic_stream_read
+- zeroize seed copies in LmsPrivateKey/HssPrivateKey generate
+- zeroize the random message m in encapsulate
+- fix XMSS^MT h=40 leaf-index wrap to 0 at exhaustion (OTS reuse)
+- reject app data after EndOfEarlyData but before client Finished
+- cap EncryptedExtensions extension count to keep dup scan linear
+- cap TLS 1.2 / legacy handshake reassembly buffer
+- drop conflicting overlapping fragments, not genuine bytes
+- silently drop spoofable plaintext handshake records mid-handshake
+- fix L-3 conn flow-control leak for bytes discarded after STOP_SENDING
+- fix L-2 retire_prior_to retiring the in-use outbound DCID
+- fix L-1 unbounded ACK-range tracking (quadratic insert DoS)
+- fix H-1 self-initiated key update desync + replay-window reset
+- declare the API mostly stable and sync drifted sections
+
 ## [0.6.10](https://github.com/KarpelesLab/purecrypto/compare/v0.6.9...v0.6.10) - 2026-06-10
 
 ### Other
