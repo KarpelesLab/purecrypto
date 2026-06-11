@@ -591,12 +591,33 @@ impl Streams {
         // conn-level credit against the high-water mark. The per-stream
         // FC check inside `on_data` is still required.
         recv.on_data(offset, data, fin)?;
-        // NOTE: no credit replenishment here. Flow-control credit is
-        // anchored on CONSUMPTION (application reads / reset discards),
+        // L-3: if we have already sent STOP_SENDING on this stream,
+        // `on_data` silently DROPS the payload (returns Ok(0)) — but the
+        // high-water bytes (`new_high`) were just charged to
+        // `conn_recv_used` above. The application will never read them,
+        // so — mirroring `on_reset` — count them as consumed once so the
+        // connection-level window is replenished and does not leak. A
+        // malicious peer could otherwise keep sending after STOP_SENDING
+        // (without ever resetting) to exhaust connection-level credit.
+        // `conn_fc_credited` makes a later RESET_STREAM credit only the
+        // not-yet-credited remainder, avoiding any double-count.
+        let credit_discarded = if recv.stop_sending_sent && new_high > 0 {
+            recv.conn_fc_credited = recv.conn_fc_credited.saturating_add(new_high);
+            true
+        } else {
+            false
+        };
+        // NOTE: outside the STOP_SENDING discard case there is no credit
+        // replenishment here. Flow-control credit is anchored on
+        // CONSUMPTION (application reads / reset & stop-sending discards),
         // not on receipt — see `read` and `maybe_replenish_conn`. If we
         // re-issued credit as fast as data arrived, a peer could grow
         // `RecvStream::delivered` without bound whenever the
         // application reads slower than the network delivers.
+        if credit_discarded {
+            self.conn_consumed = self.conn_consumed.saturating_add(new_high);
+            self.maybe_replenish_conn();
+        }
         self.refresh_readable(id);
         Ok(())
     }
@@ -649,14 +670,19 @@ impl Streams {
         recv.on_reset(app_error, final_size)?;
         // The application will never read the discarded remainder of
         // the stream; count it as consumed exactly once, so the
-        // connection-level window does not leak. (`read_off` bytes were
-        // already counted by `read`; `on_reset` cleared `delivered`, so
-        // no later read can double-count.)
+        // connection-level window does not leak. Credit only the bytes
+        // not yet credited for this stream (`conn_fc_credited` already
+        // covers bytes the app read AND bytes discarded post-STOP_SENDING
+        // — L-3), so a reset that follows a STOP_SENDING does not
+        // double-count the already-credited discards.
         let discarded = if already_reset {
             0
         } else {
-            final_size.saturating_sub(recv.read_off)
+            final_size.saturating_sub(recv.conn_fc_credited)
         };
+        // Record the credit on the stream before releasing the borrow so
+        // any later reset re-credits nothing.
+        recv.conn_fc_credited = recv.conn_fc_credited.saturating_add(discarded);
         // All validations passed — commit the flow-control charge.
         self.conn_recv_used = projected;
         if new_high > 0 {
@@ -778,6 +804,9 @@ impl Streams {
         let stream = self.map.get_mut(&id.0).ok_or(Error::InappropriateState)?;
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         let (copied, fin) = recv.read(into);
+        // Track the per-stream cumulative connection-FC credit (L-3) so
+        // the reset path credits only the not-yet-credited remainder.
+        recv.conn_fc_credited = recv.conn_fc_credited.saturating_add(copied as u64);
         // Stream-level replenishment, anchored on the consumed offset.
         // A reset stream needs no further credit (its final size is
         // known and its data was discarded).
@@ -1559,6 +1588,102 @@ mod tests {
         let (n, _) = s.read(StreamId(0), &mut buf).expect("post-reset read");
         assert_eq!(n, 0);
         assert_eq!(s.conn_consumed, 80);
+    }
+
+    /// L-3 — RFC 9000 §4.1: bytes that arrive AFTER we send STOP_SENDING
+    /// are silently discarded by `RecvStream::on_data`, but the
+    /// connection-level credit charged for them must still be returned
+    /// (counted as consumed) so the connection window is not leaked. A
+    /// peer that keeps sending after STOP_SENDING without ever resetting
+    /// must not be able to exhaust connection-level flow control.
+    #[test]
+    fn stop_sending_discarded_bytes_replenish_connection_credit() {
+        let our = TransportParameters {
+            initial_max_data: Some(100),
+            initial_max_stream_data_bidi_local: Some(1 << 20),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+
+        // 20 bytes arrive; charged to conn credit.
+        s.on_stream(0, 0, false, &[0u8; 20]).expect("recv");
+        assert_eq!(s.conn_recv_used, 20);
+        assert_eq!(s.conn_consumed, 0);
+
+        // The application sends STOP_SENDING on the stream.
+        s.stop_sending(StreamId(0), 7).expect("stop_sending");
+
+        // More bytes keep arriving. They are discarded by on_data, but
+        // the high-water charge must be returned as consumed.
+        s.on_stream(0, 20, false, &[0u8; 40])
+            .expect("post-stop recv");
+        assert_eq!(s.conn_recv_used, 60, "high-water still charged");
+        assert_eq!(
+            s.conn_consumed, 40,
+            "discarded post-STOP_SENDING bytes counted as consumed"
+        );
+
+        // Keep flooding — every discarded byte is credited, so the
+        // window never leaks no matter how much the peer sends.
+        s.on_stream(0, 60, false, &[0u8; 39])
+            .expect("more post-stop recv");
+        assert_eq!(s.conn_recv_used, 99);
+        assert_eq!(s.conn_consumed, 79);
+
+        // Retransmits of already-charged bytes credit nothing (no
+        // double-count).
+        s.on_stream(0, 0, false, &[0u8; 50]).expect("retransmit");
+        assert_eq!(s.conn_recv_used, 99, "no re-charge on retransmit");
+        assert_eq!(s.conn_consumed, 79, "no double credit on retransmit");
+
+        // A later RESET_STREAM (final_size 99) must credit only the
+        // not-yet-credited remainder (here: 0, all already consumed),
+        // never double-counting the discarded bytes.
+        s.on_reset(0, 7, 99).expect("reset");
+        assert_eq!(s.conn_recv_used, 99);
+        assert_eq!(
+            s.conn_consumed, 99,
+            "reset credits only the uncredited remainder"
+        );
+    }
+
+    /// L-3 companion — STOP_SENDING followed by a RESET_STREAM that
+    /// declares MORE bytes than were ever delivered. The reset's extra
+    /// bytes are credited once; the already-discarded bytes are not
+    /// re-credited.
+    #[test]
+    fn stop_sending_then_reset_with_larger_final_size() {
+        let our = TransportParameters {
+            initial_max_data: Some(1000),
+            initial_max_stream_data_bidi_local: Some(1 << 20),
+            initial_max_stream_data_bidi_remote: Some(1 << 20),
+            initial_max_stream_data_uni: Some(1 << 20),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 20, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+
+        s.on_stream(0, 0, false, &[0u8; 30]).expect("recv");
+        s.stop_sending(StreamId(0), 7).expect("stop_sending");
+        s.on_stream(0, 30, false, &[0u8; 20])
+            .expect("post-stop recv");
+        // 50 charged, 20 discarded+credited.
+        assert_eq!(s.conn_recv_used, 50);
+        assert_eq!(s.conn_consumed, 20);
+
+        // Reset declares final_size 80 (30 bytes beyond what we saw).
+        s.on_reset(0, 7, 80).expect("reset");
+        // conn_recv_used charges the 30-byte high-water delta (50 -> 80).
+        assert_eq!(s.conn_recv_used, 80);
+        // conn_consumed: 80 - conn_fc_credited(20) = 60 more, total 80.
+        assert_eq!(s.conn_consumed, 80, "no double count, no leak");
     }
 
     /// A RESET_STREAM whose final size overflows our MAX_DATA is a

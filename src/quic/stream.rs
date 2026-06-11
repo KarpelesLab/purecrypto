@@ -520,6 +520,14 @@ pub(crate) struct RecvStream {
     pub(crate) stop_sending_sent: bool,
     /// True if a MAX_STREAM_DATA frame is queued for this stream.
     pub(crate) max_data_pending: bool,
+    /// L-3: cumulative count of this stream's bytes already credited to
+    /// the connection-level `conn_consumed` total (whether via an
+    /// application read, a post-STOP_SENDING discard, or a reset
+    /// discard). Lets the reset path credit only the not-yet-credited
+    /// remainder, so connection-level flow-control credit is returned
+    /// exactly once per byte and never leaks nor double-counts. Equals
+    /// `read_off` whenever no bytes were discarded out-of-band.
+    pub(crate) conn_fc_credited: u64,
 }
 
 impl RecvStream {
@@ -537,6 +545,7 @@ impl RecvStream {
             reset_code: None,
             stop_sending_sent: false,
             max_data_pending: false,
+            conn_fc_credited: 0,
         }
     }
 
