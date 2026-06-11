@@ -26,6 +26,7 @@ use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, wr
 use super::client12::{
     SUITES_12, SigKind, SuiteParams12, lookup_suite_12, parse_certificate_list_12,
 };
+use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use super::server::ServerKey;
 use super::ticket12::{Ticket12Plaintext, open_ticket, seal_ticket};
 #[cfg(feature = "tls-legacy")]
@@ -831,9 +832,9 @@ impl<R: RngCore> ServerConnection12<R> {
                         if plain.is_empty() {
                             return Err(Error::UnexpectedMessage);
                         }
-                        self.hs_pending.extend_from_slice(&plain);
+                        self.append_handshake_bytes(&plain)?;
                     } else {
-                        self.hs_pending.extend_from_slice(&fragment);
+                        self.append_handshake_bytes(&fragment)?;
                     }
                 }
                 ContentType::ApplicationData => {
@@ -857,6 +858,20 @@ impl<R: RngCore> ServerConnection12<R> {
                 _ => return Err(Error::UnexpectedMessage),
             }
         }
+    }
+
+    /// Appends handshake-message bytes to the reassembly buffer, enforcing
+    /// [`MAX_HANDSHAKE_REASSEMBLY`]. `pop_handshake` only drains once a
+    /// complete `4 + u24_len` message is present, so without this ceiling a
+    /// peer could send a giant length-claim and slow-drip fragments that
+    /// never complete, pinning up to ~16 MiB per connection pre-authentication.
+    /// Mirrors `ConnectionCore::append_handshake_bytes` on the TLS 1.3 path.
+    fn append_handshake_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.hs_pending.len().saturating_add(bytes.len()) > MAX_HANDSHAKE_REASSEMBLY {
+            return Err(Error::RecordOverflow);
+        }
+        self.hs_pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Removes one complete handshake message from the reassembly buffer.
@@ -2341,6 +2356,59 @@ mod tests {
         let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
         let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
         ServerConfig12::with_rsa(alloc::vec![cert.to_der().to_vec()], boxed)
+    }
+
+    /// A peer that claims a giant handshake-message length in the 3-byte
+    /// header and then dribbles fragments that never complete the message
+    /// must be rejected with `RecordOverflow` once the reassembly buffer
+    /// would exceed `MAX_HANDSHAKE_REASSEMBLY`, rather than growing without
+    /// bound (memory DoS, pre-authentication).
+    #[test]
+    fn server12_caps_handshake_reassembly() {
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-reasm", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+
+        // First fragment: a handshake header claiming a ~16 MiB ClientHello
+        // (0xFFFFFF body), with a small slice of body so `pop_handshake`
+        // can never complete. Subsequent records dribble more body bytes.
+        let mut first = alloc::vec![hs_type::CLIENT_HELLO, 0xFF, 0xFF, 0xFF];
+        first.extend_from_slice(&[0u8; 16 * 1024 - 4]);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &first,
+        );
+        s.read_tls(&rec);
+        // The first record alone is under the cap; draining it yields no
+        // complete message yet (Ok(None) — buffer just grows).
+        let _ = s.process_new_packets();
+
+        // Now dribble plenty of plaintext handshake records (each 16 KiB of
+        // body) until we cross the 128 KiB ceiling. One of these must fail
+        // with RecordOverflow instead of the buffer growing unbounded.
+        let chunk = alloc::vec![0u8; 16 * 1024];
+        let mut hit_overflow = false;
+        for _ in 0..(MAX_HANDSHAKE_REASSEMBLY / chunk.len() + 2) {
+            let mut rec = Vec::new();
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                &chunk,
+            );
+            s.read_tls(&rec);
+            if matches!(s.process_new_packets(), Err(Error::RecordOverflow)) {
+                hit_overflow = true;
+                break;
+            }
+        }
+        assert!(
+            hit_overflow,
+            "dribbled oversize handshake must be rejected with RecordOverflow"
+        );
     }
 
     /// A server with no offered cipher suites matching ours returns

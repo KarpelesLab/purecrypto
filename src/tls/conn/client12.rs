@@ -34,6 +34,7 @@
 
 use super::super::codec::{ParsedRecord, is_legal_record_version, read_record, write_record};
 use super::client::{ClientCertConfig, ClientKey};
+use super::common::MAX_HANDSHAKE_REASSEMBLY;
 use crate::ct::ConstantTimeEq;
 use crate::ec::x25519::X25519PrivateKey;
 use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey, CurveId};
@@ -1201,9 +1202,9 @@ impl ClientConnection12 {
                         if plain.is_empty() {
                             return Err(Error::UnexpectedMessage);
                         }
-                        self.hs_pending.extend_from_slice(&plain);
+                        self.append_handshake_bytes(&plain)?;
                     } else {
-                        self.hs_pending.extend_from_slice(&fragment);
+                        self.append_handshake_bytes(&fragment)?;
                     }
                 }
                 ContentType::ApplicationData => {
@@ -1227,6 +1228,20 @@ impl ClientConnection12 {
                 _ => return Err(Error::UnexpectedMessage),
             }
         }
+    }
+
+    /// Appends handshake-message bytes to the reassembly buffer, enforcing
+    /// [`MAX_HANDSHAKE_REASSEMBLY`]. `pop_handshake` only drains once a
+    /// complete `4 + u24_len` message is present, so without this ceiling a
+    /// peer could send a giant length-claim and slow-drip fragments that
+    /// never complete, pinning up to ~16 MiB per connection pre-authentication.
+    /// Mirrors `ConnectionCore::append_handshake_bytes` on the TLS 1.3 path.
+    fn append_handshake_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        if self.hs_pending.len().saturating_add(bytes.len()) > MAX_HANDSHAKE_REASSEMBLY {
+            return Err(Error::RecordOverflow);
+        }
+        self.hs_pending.extend_from_slice(bytes);
+        Ok(())
     }
 
     /// Removes one complete handshake message (header + body) from the
@@ -2348,6 +2363,60 @@ mod tests {
             &body,
         );
         rec
+    }
+
+    /// A peer that claims a giant handshake-message length and then dribbles
+    /// fragments that never complete the message must be rejected with
+    /// `RecordOverflow` once the reassembly buffer would exceed
+    /// `MAX_HANDSHAKE_REASSEMBLY`, rather than growing without bound.
+    #[test]
+    fn client12_caps_handshake_reassembly() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-reasm", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        // Flush the ClientHello so the client is waiting for a ServerHello.
+        let _ = c.write_tls();
+
+        // First fragment: a handshake header claiming a ~16 MiB message, with
+        // a small slice of body so `pop_handshake` can never complete.
+        let mut first = alloc::vec![hs_type::SERVER_HELLO, 0xFF, 0xFF, 0xFF];
+        first.extend_from_slice(&[0u8; 16 * 1024 - 4]);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &first,
+        );
+        c.read_tls(&rec);
+        let _ = c.process_new_packets();
+
+        // Dribble plaintext handshake records until we cross the 128 KiB cap.
+        let chunk = alloc::vec![0u8; 16 * 1024];
+        let mut hit_overflow = false;
+        for _ in 0..(MAX_HANDSHAKE_REASSEMBLY / chunk.len() + 2) {
+            let mut rec = Vec::new();
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                &chunk,
+            );
+            c.read_tls(&rec);
+            if matches!(c.process_new_packets(), Err(Error::RecordOverflow)) {
+                hit_overflow = true;
+                break;
+            }
+        }
+        assert!(
+            hit_overflow,
+            "dribbled oversize handshake must be rejected with RecordOverflow"
+        );
     }
 
     /// A ServerHello picking an unsupported cipher suite is rejected with
