@@ -3166,6 +3166,16 @@ impl QuicConnection {
                         // that floods CID state (F2).
                         pool.note_retire_prior_to(retire_prior_to)?;
                         pool.add(entry)?;
+                        // L-2: `note_retire_prior_to`/`add` may have
+                        // rotated the pool's active CID (the old active
+                        // DCID was retired and a surviving higher-seq CID
+                        // took its place). Re-sync the outbound DCID
+                        // (`endpoint.cids.peer`) to the pool's active
+                        // entry so we never keep writing a retired CID.
+                        let active_cid = pool.active().map(|e| e.cid);
+                        if let Some(cid) = active_cid {
+                            self.endpoint.cids.peer = cid;
+                        }
                     }
                 }
                 Frame::RetireConnectionId { seq } => {
