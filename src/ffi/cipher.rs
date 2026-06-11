@@ -12,6 +12,32 @@ use crate::cipher::{
     AesGmac128, AesGmac256, AesSiv, ChaCha20Poly1305, XChaCha20Poly1305,
 };
 
+/// Owns a stack copy of secret key bytes and scrubs them on drop. Each
+/// one-shot AEAD / key-wrap / MAC arm copies the caller's key slice into a
+/// fixed-size array to satisfy the cipher constructors' `&[u8; N]` signature;
+/// the cipher keeps its own expanded schedule, so this copy is redundant once
+/// constructed and must not linger in the frame. `Drop` zeroizes it behind a
+/// `black_box` barrier on every exit path (including the mid-arm nonce/tag
+/// `try_into` early returns), so no `key`/`kk` copy survives the call.
+struct KeyBuf<const N: usize>([u8; N]);
+
+impl<const N: usize> KeyBuf<N> {
+    /// Borrows the key bytes for a cipher constructor.
+    #[inline]
+    fn r(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> Drop for KeyBuf<N> {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.0);
+    }
+}
+
 /// AEAD algorithm identifiers (mirror `PcAead` in `purecrypto.h`).
 pub mod aead_id {
     #![allow(missing_docs)]
@@ -123,8 +149,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if n.is_empty() {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
-                Aes128Gcm::new(Aes128::new(&key))
+                let key = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Gcm::new(Aes128::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
@@ -132,18 +158,18 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if n.is_empty() {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
-                Aes256Gcm::new(Aes256::new(&key))
+                let key = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Gcm::new(Aes256::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
             aead_id::CHACHA20_POLY1305 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 12] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                ChaCha20Poly1305::new(&key)
+                ChaCha20Poly1305::new(key.r())
                     .encrypt(&nonce, a, &mut buf)
                     .to_vec()
             }
@@ -151,8 +177,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
-                Aes128Ccm::new(Aes128::new(&key))
+                let key = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Ccm::new(Aes128::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
@@ -160,8 +186,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
-                Aes256Ccm::new(Aes256::new(&key))
+                let key = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Ccm::new(Aes256::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
@@ -169,8 +195,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
-                Aes128Ccm8::new(Aes128::new(&key))
+                let key = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Ccm8::new(Aes128::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
@@ -178,8 +204,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
-                Aes256Ccm8::new(Aes256::new(&key))
+                let key = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Ccm8::new(Aes256::new(key.r()))
                     .encrypt(n, a, &mut buf)
                     .to_vec()
             }
@@ -191,38 +217,40 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                 AesGcmSiv::new(k).encrypt(&nonce, a, &mut buf).to_vec()
             }
             aead_id::XCHACHA20_POLY1305 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 24] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                XChaCha20Poly1305::new(&key)
+                XChaCha20Poly1305::new(key.r())
                     .encrypt(&nonce, a, &mut buf)
                     .to_vec()
             }
             aead_id::AEGIS128L => {
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let nonce: [u8; 16] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                Aegis128L::new(&key).encrypt(&nonce, a, &mut buf).to_vec()
+                Aegis128L::new(key.r())
+                    .encrypt(&nonce, a, &mut buf)
+                    .to_vec()
             }
             aead_id::AEGIS256 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 32] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                Aegis256::new(&key).encrypt(&nonce, a, &mut buf).to_vec()
+                Aegis256::new(key.r()).encrypt(&nonce, a, &mut buf).to_vec()
             }
             aead_id::ASCON_AEAD128 => {
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let nonce: [u8; 16] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                AsconAead128::new(&key)
+                AsconAead128::new(key.r())
                     .encrypt(&nonce, a, &mut buf)
                     .to_vec()
             }
@@ -299,9 +327,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if n.is_empty() {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes128Gcm::new(Aes128::new(&key))
+                Aes128Gcm::new(Aes128::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
@@ -309,20 +337,20 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if n.is_empty() {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes256Gcm::new(Aes256::new(&key))
+                Aes256Gcm::new(Aes256::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
             aead_id::CHACHA20_POLY1305 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 12] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                ChaCha20Poly1305::new(&key)
+                ChaCha20Poly1305::new(key.r())
                     .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
@@ -330,9 +358,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes128Ccm::new(Aes128::new(&key))
+                Aes128Ccm::new(Aes128::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
@@ -340,9 +368,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aes256Ccm::new(Aes256::new(&key))
+                Aes256Ccm::new(Aes256::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
@@ -350,9 +378,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let t: [u8; 8] = tag.try_into().unwrap();
-                Aes128Ccm8::new(Aes128::new(&key))
+                Aes128Ccm8::new(Aes128::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
@@ -360,9 +388,9 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 if !(7..=13).contains(&n.len()) {
                     return PcStatus::Unsupported;
                 }
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let t: [u8; 8] = tag.try_into().unwrap();
-                Aes256Ccm8::new(Aes256::new(&key))
+                Aes256Ccm8::new(Aes256::new(key.r()))
                     .decrypt(n, a, &mut buf, &t)
                     .is_ok()
             }
@@ -375,44 +403,46 @@ pub unsafe extern "C" fn pc_aead_decrypt(
                 AesGcmSiv::new(k).decrypt(&nonce, a, &mut buf, &t).is_ok()
             }
             aead_id::XCHACHA20_POLY1305 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 24] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                XChaCha20Poly1305::new(&key)
+                XChaCha20Poly1305::new(key.r())
                     .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
             aead_id::AEGIS128L => {
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let nonce: [u8; 16] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aegis128L::new(&key)
+                Aegis128L::new(key.r())
                     .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
             aead_id::AEGIS256 => {
-                let key: [u8; 32] = k.try_into().unwrap();
+                let key = KeyBuf::<32>(k.try_into().unwrap());
                 let nonce: [u8; 32] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                Aegis256::new(&key).decrypt(&nonce, a, &mut buf, &t).is_ok()
+                Aegis256::new(key.r())
+                    .decrypt(&nonce, a, &mut buf, &t)
+                    .is_ok()
             }
             aead_id::ASCON_AEAD128 => {
-                let key: [u8; 16] = k.try_into().unwrap();
+                let key = KeyBuf::<16>(k.try_into().unwrap());
                 let nonce: [u8; 16] = match n.try_into() {
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
                 let t: [u8; 16] = tag.try_into().unwrap();
-                AsconAead128::new(&key)
+                AsconAead128::new(key.r())
                     .decrypt(&nonce, a, &mut buf, &t)
                     .is_ok()
             }
@@ -457,12 +487,12 @@ pub unsafe extern "C" fn pc_aes_kw_wrap(
         let mut wrapped = vec![0u8; pt.len() + 8];
         let res = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                Aes128Kw::new(Aes128::new(&kk)).wrap(pt, &mut wrapped)
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Kw::new(Aes128::new(kk.r())).wrap(pt, &mut wrapped)
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                Aes256Kw::new(Aes256::new(&kk)).wrap(pt, &mut wrapped)
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Kw::new(Aes256::new(kk.r())).wrap(pt, &mut wrapped)
             }
             _ => return PcStatus::Unsupported,
         };
@@ -497,12 +527,12 @@ pub unsafe extern "C" fn pc_aes_kw_unwrap(
         let mut plain = vec![0u8; c.len() - 8];
         let res = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                Aes128Kw::new(Aes128::new(&kk)).unwrap(c, &mut plain)
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Kw::new(Aes128::new(kk.r())).unwrap(c, &mut plain)
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                Aes256Kw::new(Aes256::new(&kk)).unwrap(c, &mut plain)
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Kw::new(Aes256::new(kk.r())).unwrap(c, &mut plain)
             }
             _ => return PcStatus::Unsupported,
         };
@@ -542,12 +572,12 @@ pub unsafe extern "C" fn pc_aes_kwp_wrap(
         let mut wrapped = vec![0u8; padded + 8];
         let res = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                Aes128Kwp::new(Aes128::new(&kk)).wrap(pt, &mut wrapped)
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Kwp::new(Aes128::new(kk.r())).wrap(pt, &mut wrapped)
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                Aes256Kwp::new(Aes256::new(&kk)).wrap(pt, &mut wrapped)
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Kwp::new(Aes256::new(kk.r())).wrap(pt, &mut wrapped)
             }
             _ => return PcStatus::Unsupported,
         };
@@ -583,12 +613,12 @@ pub unsafe extern "C" fn pc_aes_kwp_unwrap(
         let mut plain = vec![0u8; c.len() - 8];
         let n = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                Aes128Kwp::new(Aes128::new(&kk)).unwrap(c, &mut plain)
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                Aes128Kwp::new(Aes128::new(kk.r())).unwrap(c, &mut plain)
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                Aes256Kwp::new(Aes256::new(&kk)).unwrap(c, &mut plain)
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                Aes256Kwp::new(Aes256::new(kk.r())).unwrap(c, &mut plain)
             }
             _ => return PcStatus::Unsupported,
         };
@@ -634,14 +664,14 @@ pub unsafe extern "C" fn pc_cmac(
         };
         let tag = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                let mut c = AesCmac128::new(Aes128::new(&kk));
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                let mut c = AesCmac128::new(Aes128::new(kk.r()));
                 c.update(m);
                 c.finalize()
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                let mut c = AesCmac256::new(Aes256::new(&kk));
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                let mut c = AesCmac256::new(Aes256::new(kk.r()));
                 c.update(m);
                 c.finalize()
             }
@@ -683,14 +713,14 @@ pub unsafe extern "C" fn pc_gmac(
         };
         let tag = match k.len() {
             16 => {
-                let kk: [u8; 16] = k.try_into().unwrap();
-                let mut g = AesGmac128::new(Aes128::new(&kk), &nonce);
+                let kk = KeyBuf::<16>(k.try_into().unwrap());
+                let mut g = AesGmac128::new(Aes128::new(kk.r()), &nonce);
                 g.update(m);
                 g.finalize()
             }
             32 => {
-                let kk: [u8; 32] = k.try_into().unwrap();
-                let mut g = AesGmac256::new(Aes256::new(&kk), &nonce);
+                let kk = KeyBuf::<32>(k.try_into().unwrap());
+                let mut g = AesGmac256::new(Aes256::new(kk.r()), &nonce);
                 g.update(m);
                 g.finalize()
             }
