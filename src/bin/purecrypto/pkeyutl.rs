@@ -645,6 +645,10 @@ fn run_verify(args: Args) {
     let pss = matches!(opts.padding.as_deref(), Some("pss"));
     let digest = opts.digest.as_deref().unwrap_or("sha256");
 
+    // `-inkey` may be a raw LMS/HSS/XMSS or SM2/SEC1 PRIVATE key file
+    // (the public key is derived from it). Warn if it is group/world-
+    // readable, matching the other secret-key readers.
+    crate::util::warn_if_world_readable_key(inkey);
     let raw_key = std::fs::read(inkey).unwrap_or_else(|e| die(format!("cannot read {inkey}: {e}")));
 
     // Stateful hash-based signatures: the public key is derived from the raw

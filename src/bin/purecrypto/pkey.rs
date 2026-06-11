@@ -1,6 +1,8 @@
 //! `purecrypto pkey -in key.pem [-pubout] [-text]` — inspect or convert a key.
 
-use crate::util::{Args, die, read_input, write_output, write_output_with_mode};
+use crate::util::{
+    Args, die, read_input, warn_if_world_readable_key, write_output, write_output_with_mode,
+};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::mlkem::{MlKem512DecapsKey, MlKem768DecapsKey, MlKem1024DecapsKey};
@@ -71,6 +73,14 @@ fn parse_pkcs8(pem: &str) -> Option<Key> {
 
 pub(crate) fn run(args: Args) {
     let in_path = args.value("-in").or_else(|| args.value("--in"));
+    // `-in` is private-key material: warn if the file is group/world-
+    // readable, matching the other secret-key readers. Only a real file
+    // path is checkable (stdin / `-` has no mode).
+    if let Some(p) = in_path {
+        if p != "-" {
+            warn_if_world_readable_key(p);
+        }
+    }
     let raw = read_input(in_path);
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("input is not valid UTF-8 PEM"));
 
