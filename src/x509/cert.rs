@@ -1044,6 +1044,9 @@ fn parse_ip_addresses(der: &[u8], out: &mut Vec<SanIp>) -> Result<(), Error> {
             }
         }
     }
+    // No trailing bytes after the SEQUENCE inside extnValue (parity with
+    // `parse_dns_names`).
+    reader.finish()?;
     Ok(())
 }
 
