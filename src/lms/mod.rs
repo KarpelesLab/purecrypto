@@ -151,7 +151,12 @@ impl LmsPrivateKey {
         let mut seed = [0u8; N];
         rng.fill_bytes(&mut i_id);
         rng.fill_bytes(&mut seed);
-        Self::from_seed(lms_type, ots_type, &i_id, &seed)
+        let sk = Self::from_seed(lms_type, ots_type, &i_id, &seed);
+        // `seed` (with `i_id`) reconstructs every leaf's signing capability;
+        // wipe both before they drop, matching the sibling modules.
+        wipe(&mut seed);
+        wipe(&mut i_id);
+        sk
     }
 
     /// The LMS parameter set.
@@ -445,7 +450,16 @@ impl HssPrivateKey {
             rng.fill_bytes(&mut seed);
             levels.push((lms_type, ots_type, i_id, seed));
         }
-        Self::from_levels(&levels)
+        let sk = Self::from_levels(&levels);
+        // `from_levels` has copied every level's `(i_id, seed)`; wipe the master
+        // seeds left in the heap `Vec` before it frees — each reconstructs that
+        // level's signing capability. (`wipe` routes through `black_box` so the
+        // writes survive the imminent drop.)
+        for lvl in levels.iter_mut() {
+            wipe(&mut lvl.2);
+            wipe(&mut lvl.3);
+        }
+        sk
     }
 
     /// The number of levels `L`.
