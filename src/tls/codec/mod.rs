@@ -9,8 +9,8 @@ mod record;
 
 #[allow(unused_imports)]
 pub(crate) use handshake::{
-    ClientHello, HRR_RANDOM, KeyUpdate, NewSessionTicket, RawExtension, ServerHello, hs_type,
-    read_handshake,
+    ClientHello, HRR_RANDOM, KeyUpdate, MAX_EXTENSIONS, NewSessionTicket, RawExtension,
+    ServerHello, hs_type, read_handshake,
 };
 #[allow(unused_imports)]
 pub(crate) use handshake12::{

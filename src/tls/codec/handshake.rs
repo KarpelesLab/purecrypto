@@ -94,7 +94,7 @@ fn encode_extensions(out: &mut Vec<u8>, extensions: &[RawExtension]) {
 /// transport parameters; the cap keeps the linear duplicate scan below from
 /// being quadratic on attacker-controlled input (~16k minimal extensions
 /// would otherwise force ~10^8 comparisons per ClientHello).
-const MAX_EXTENSIONS: usize = 64;
+pub(crate) const MAX_EXTENSIONS: usize = 64;
 
 fn parse_extensions(bytes: &[u8]) -> Result<Vec<RawExtension>, Error> {
     let mut c = ReadCursor::new(bytes);

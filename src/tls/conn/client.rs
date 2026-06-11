@@ -2424,6 +2424,15 @@ impl ClientConnection {
             while !ec.is_empty() {
                 let ty = ec.u16()?;
                 let ext_body = ec.vec_u16()?;
+                // RFC 8446 §4.2: cap the extension count so the linear
+                // `seen.contains` duplicate scan below stays linear overall
+                // rather than going quadratic on attacker-controlled input
+                // (the EE body is bounded only by the 128 KiB reassembly cap,
+                // which permits ~32k minimal extensions → ~5e8 comparisons).
+                // Mirrors the shared `parse_extensions` ceiling.
+                if seen.len() >= crate::tls::codec::MAX_EXTENSIONS {
+                    return Err(Error::Decode);
+                }
                 if seen.contains(&ty) {
                     return Err(Error::IllegalParameter);
                 }
@@ -3415,6 +3424,63 @@ mod tests {
             .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// The manual EncryptedExtensions walk caps the extension count at
+    /// `MAX_EXTENSIONS` so its linear duplicate scan cannot be driven
+    /// quadratic by an attacker stuffing tens of thousands of (distinct,
+    /// otherwise-ignored) extensions into the EE body. The over-limit case
+    /// is rejected with `Decode`; exactly `MAX_EXTENSIONS` is fine.
+    #[test]
+    fn client_caps_ee_extension_count() {
+        use crate::tls::codec::MAX_EXTENSIONS;
+
+        // Build an EE body with `n` distinct empty extensions of unknown
+        // (GREASE-ish) types, which the EE walk counts but otherwise ignores.
+        fn ee_with_n_exts(n: usize) -> alloc::vec::Vec<u8> {
+            let mut all_exts = alloc::vec::Vec::new();
+            for i in 0..n {
+                // Distinct unknown extension type; empty body.
+                let ty = 0x1a1a_u16.wrapping_add(i as u16);
+                all_exts.extend_from_slice(&ty.to_be_bytes());
+                all_exts.extend_from_slice(&0u16.to_be_bytes());
+            }
+            let mut body = alloc::vec::Vec::new();
+            body.extend_from_slice(&(all_exts.len() as u16).to_be_bytes());
+            body.extend_from_slice(&all_exts);
+            let mut raw = alloc::vec::Vec::new();
+            raw.push(hs_type::ENCRYPTED_EXTENSIONS);
+            raw.push(0x00);
+            raw.extend_from_slice(&(body.len() as u16).to_be_bytes());
+            raw.extend_from_slice(&body);
+            raw
+        }
+
+        // Exactly MAX_EXTENSIONS distinct, ignored extensions parse fine.
+        let mut rng = HmacDrbg::<Sha256>::new(b"h1-ee-cap-ok", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
+        client
+            .on_encrypted_extensions(
+                hs_type::ENCRYPTED_EXTENSIONS,
+                &ee_with_n_exts(MAX_EXTENSIONS),
+            )
+            .expect("exactly MAX_EXTENSIONS extensions accepted");
+
+        // One more crosses the ceiling and is rejected with `Decode`.
+        let mut rng2 = HmacDrbg::<Sha256>::new(b"h1-ee-cap-bad", b"nonce", &[]);
+        let mut client2 =
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng2).unwrap();
+        let err = client2
+            .on_encrypted_extensions(
+                hs_type::ENCRYPTED_EXTENSIONS,
+                &ee_with_n_exts(MAX_EXTENSIONS + 1),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Decode),
+            "over-limit EE extension count must be rejected with Decode, got {err:?}"
+        );
     }
 
     /// Wave 3b.2: when [`ClientConfig::ech`] is set to a Real
