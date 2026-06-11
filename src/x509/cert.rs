@@ -534,10 +534,17 @@ impl Certificate {
 
     /// Verifies the certificate signature against `issuer_key`. Only
     /// `sha256WithRSAEncryption` is supported.
+    ///
+    /// As mandated by RFC 5280 §4.1.1.2, this first confirms the outer
+    /// `signatureAlgorithm` is byte-identical to the inner
+    /// `TBSCertificate.signature` AlgorithmIdentifier (via
+    /// `check_signature_algid_consistent`), keeping this typed entry point
+    /// uniform with [`verify_signature_with`](Self::verify_signature_with).
     pub fn verify_signature<const LIMBS: usize>(
         &self,
         issuer_key: &RsaPublicKey<LIMBS>,
     ) -> Result<(), Error> {
+        self.check_signature_algid_consistent()?;
         let parts = self.parts()?;
         if parts.sig_alg.as_slice() != oid::SHA256_WITH_RSA {
             return Err(Error::UnsupportedAlgorithm);
