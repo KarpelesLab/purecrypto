@@ -92,8 +92,10 @@ impl RootCertStore {
     }
 
     /// Builds a store pre-seeded with the embedded root-CA bundle from the
-    /// first-party [`cacrt`](https://crates.io/crates/cacrt) crate (the
-    /// Mozilla CA set, parsed into static DER at `cacrt` build time).
+    /// first-party [`cacrt`](https://crates.io/crates/cacrt) crate — a
+    /// curated root store built from the Mozilla root program and others,
+    /// following CA/Browser Forum rules, parsed into static DER at `cacrt`
+    /// build time.
     ///
     /// This is the zero-configuration trust store: it requires no filesystem
     /// access, so it behaves identically across Linux, macOS, Windows, and
@@ -152,8 +154,8 @@ mod embedded_roots_tests {
     #[test]
     fn with_embedded_roots_is_populated() {
         let store = RootCertStore::with_embedded_roots();
-        // The cacrt bundle carries the full Mozilla CA set; sanity-check that a
-        // substantial number of anchors loaded (not just a handful).
+        // The cacrt bundle carries a full curated root set; sanity-check that
+        // a substantial number of anchors loaded (not just a handful).
         assert!(
             store.len() > 50,
             "embedded root store unexpectedly small: {}",

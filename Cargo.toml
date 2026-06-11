@@ -138,9 +138,10 @@ ech = ["tls", "hpke"]
 # (zlib) is the only codepoint wired today; brotli (2) and zstd (3)
 # remain unimplemented.
 cert-compression = ["tls", "dep:compcol"]
-# Embedded root-CA trust store: pre-seed a `RootCertStore` with the Mozilla CA
-# bundle from the first-party `cacrt` crate (no filesystem access; portable
-# across Linux/macOS/Windows). Enables `RootCertStore::with_embedded_roots`.
+# Embedded root-CA trust store: pre-seed a `RootCertStore` with the curated
+# first-party `cacrt` bundle — built from the Mozilla root program and others,
+# following CA/Browser Forum rules (no filesystem access; portable across
+# Linux/macOS/Windows). Enables `RootCertStore::with_embedded_roots`.
 embedded-roots = ["tls", "dep:cacrt"]
 # C ABI: builds the `ffi` module (the only place `unsafe` is allowed). Build a
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
@@ -158,8 +159,9 @@ cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", 
 # compcol sits outside the cryptographic trust boundary.
 [dependencies]
 compcol = { version = "0.4", default-features = false, features = ["zlib"], optional = true }
-# Embedded root-CA bundle (Mozilla CA set, parsed at build time into static
-# DER). First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a
+# Embedded root-CA bundle (curated from the Mozilla root program and others
+# per CA/Browser Forum rules, parsed at build time into static DER).
+# First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a
 # small, well-defined surface — enabled by default rather than treated as a
 # foreign-code dependency. Powers `RootCertStore::with_embedded_roots` under
 # the `embedded-roots` feature.

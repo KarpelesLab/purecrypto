@@ -14,12 +14,17 @@ usable three ways:
 - as a **Rust library**,
 - as a **C library** (`cdylib` with a C ABI), and
 - as a **standalone command-line tool** (`purecrypto`: hashing, randomness, key
-  generation including PQ, CSRs, a small CA, a TLS 1.3 test client, …).
+  generation including PQ, CSRs, a small CA, TLS / DTLS / QUIC test clients
+  and servers, …).
 
-> Status: **work in progress.** Everything below is implemented and validated
-> against published test vectors (RFCs, NIST FIPS ACVP, OpenSSL interop), but
-> APIs are unstable and nothing here has been audited — do not use it for
-> anything real yet.
+> Status: **mostly stable.** Everything below is implemented and validated
+> against published test vectors (RFCs, NIST FIPS ACVP, OpenSSL interop), and
+> the public API is now mostly stable: breaking changes are rare, deliberate,
+> and gated by `cargo-semver-checks` in CI. The `hazmat-*` features are the
+> documented exception and carry no stability guarantee. The code has been
+> through repeated internal security-review-and-hardening passes, but has not
+> yet received an independent third-party audit — weigh that when deciding
+> what to protect with it.
 
 ## Design principles
 
@@ -45,12 +50,13 @@ Single crate, modules gated by Cargo features:
 | Constant-time    | `ct`        | ✅ implemented |
 | Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
 | Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon` |
+| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon`, AEZ v5 (robust AE) in `aez` |
 | MAC              | `mac`       | ✅ AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
 | Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
 | Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
 | Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106), SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF) |
 | Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032), SM2 signature + encryption (GB/T 32918 / RFC 8998) |
+| Prime-order group | `ristretto255` | ✅ ristretto255 (RFC 9496), a stable prime-order group API; low-level scalar/point arithmetic for threshold/FROST callers also exposed via `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` (**no semver guarantee** on `hazmat-*`) |
 | Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
 | Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
 | Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
@@ -66,8 +72,8 @@ Single crate, modules gated by Cargo features:
 | QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
 | Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
 | Legacy TLS       | `tls-legacy` | ⚠️ **deprecated/insecure, off by default** — SSL 3.0 / TLS 1.0 / TLS 1.1 (RFC 8996) with CBC MAC-then-encrypt suites (`TLS_RSA_*` static-RSA + `TLS_ECDHE_RSA_*` over AES-CBC-SHA/SHA256 + 3DES), client + server. Last-resort interop only (e.g. VoIP-phone provisioning); requires lowering `Config::min_version`. BEAST 1/n-1 split + constant-time CBC decrypt, but MD5/SHA-1 PRF, Lucky13 residual, and SSLv3 POODLE remain — do not use against modern peers. |
-| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
-| CLI              | (binary)    | ✅ `hash`, `rand`, `genpkey` (classical + PQ), `pkey`, `req`, `x509` (CA), `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server` |
+| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS / QUIC (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
+| CLI              | (binary)    | ✅ `hash`/`dgst`, `mac`, `kdf`, `enc`, `rand`, `genpkey` (classical + PQ), `pkey`, `pkeyutl`, `kem`, `kex`, `req`, `x509`, `ca`, `crl`, `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server`, `q_client`, `q_server` |
 
 ## CLI + C-API coverage matrix
 
@@ -105,6 +111,7 @@ Each functional area below is callable from the Rust library, the
 | CRL parse + verify                    | `crl`                                | `pc_crl_*`                                                         |
 | TLS 1.2 / 1.3 client + server         | `s_client`, `s_server`               | `pc_tls_cfg_*`, `pc_tls_*` (memory-BIO style)                      |
 | DTLS 1.2 / 1.3 client + server        | `s_dtls_client`, `s_dtls_server`     | `pc_tls_cfg_*` (`PC_DTLS_1_*` selector), `pc_dtls_next_timeout/on_timeout` |
+| QUIC v1 client + server               | `q_client`, `q_server`               | `pc_quic_cfg_*`, `pc_quic_*` (sans-I/O, datagram in/out + streams)  |
 
 The C ABI is sans-I/O for TLS/DTLS: the caller pumps wire bytes through
 `pc_tls_feed` / `pc_tls_pop` and application bytes through `pc_tls_send` /
@@ -117,18 +124,21 @@ build and re-enable only what you need:
 
 ```toml
 # Bare no_std, no allocator: just `ct` and primitives that fit.
-purecrypto = { version = "0.3", default-features = false }
+purecrypto = { version = "0.6", default-features = false }
 
 # no_std core + ML-KEM-768 (no alloc):
-purecrypto = { version = "0.3", default-features = false, features = ["mlkem"] }
+purecrypto = { version = "0.6", default-features = false, features = ["mlkem"] }
 
 # Library with PQ signing only:
-purecrypto = { version = "0.3", default-features = false, features = ["mldsa", "slhdsa"] }
+purecrypto = { version = "0.6", default-features = false, features = ["mldsa", "slhdsa"] }
 ```
 
 Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
-`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `x509`, `tls`, `dtls`, `quic`,
-`mlkem`, `mldsa`, `slhdsa`, `hpke`, `ech`, `cert-compression`, `ffi`, `cli`.
+`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `ristretto255`, `x509`, `tls`,
+`dtls`, `tls-legacy`, `quic`, `mlkem`, `mldsa`, `slhdsa`, `lms`, `xmss`,
+`ascon`, `aez`, `hpke`, `ech`, `cert-compression`, `embedded-roots`, `ffi`,
+`cli` — plus the unstable `hazmat-secp256k1` / `hazmat-edwards25519` /
+`hazmat-mldsa` gates (no semver guarantee).
 Each pulls in only its own dependencies. `alloc` is required by anything that
 needs heap (most things except `ct`, `hash`, `cipher`, and the no-alloc
 `mlkem` core).
@@ -328,6 +338,19 @@ filter once the handshake-protected keys are in place. The default
 record size is 1200 bytes to stay below common path MTUs; override with
 `-mtu`.
 
+### QUIC — `q_client` / `q_server`
+
+QUIC v1 (RFC 9000) over UDP, secured by TLS 1.3 keys (RFC 9001). Either use
+the dedicated binaries, or pass `-quic` to `s_client` / `s_server` — the two
+forms are equivalent. The client drives one bidirectional stream
+(stdin → server, reply → stdout); the unreliable DATAGRAM extension
+(RFC 9221) is reachable through the library API.
+
+```sh
+purecrypto q_server -accept 0.0.0.0:4434 -cert cert.pem -key key.pem -alpn h3
+purecrypto q_client -connect localhost:4434 -alpn h3
+```
+
 ### Cookbook
 
 End-to-end CA + leaf with EC keys:
@@ -491,7 +514,11 @@ write.
 ```rust,no_run
 use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
 
-let roots = RootCertStore::new();        // populate from a PEM bundle …
+// Use the embedded root bundle (feature `embedded-roots`, on by default):
+// a curated first-party store built from the Mozilla root program and
+// others, following CA/Browser Forum rules. Or start from
+// `RootCertStore::new()` and add your own PEMs.
+let roots = RootCertStore::with_embedded_roots();
 let cfg = Config::builder()
     .tls_only()
     .roots(roots)
