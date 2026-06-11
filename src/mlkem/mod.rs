@@ -232,7 +232,14 @@ macro_rules! ml_kem_set {
             ) -> ($ct_name, [u8; SHARED_SECRET_BYTES]) {
                 let mut m = [0u8; 32];
                 rng.fill_bytes(&mut m);
-                self.encapsulate_deterministic(&m)
+                let out = self.encapsulate_deterministic(&m);
+                // `m` (with the public `H(ek)`) fully determines the shared
+                // secret; wipe it before it drops, mirroring `generate`.
+                for b in m.iter_mut() {
+                    *b = 0;
+                }
+                let _ = core::hint::black_box(&m);
+                out
             }
 
             /// Encapsulates with an explicit message `m` (ML-KEM.Encaps_internal).
