@@ -314,6 +314,18 @@ impl CidPool {
     /// `pending_retire` so the caller can emit RETIRE_CONNECTION_ID
     /// frames in the next outbound packet.
     ///
+    /// L-2: if the currently-active CID (`active_seq`) is among the
+    /// sequences being retired, the active sequence is first rotated to
+    /// the lowest surviving entry whose sequence is `>= new` (a CID the
+    /// peer wants us to keep using). If *no* such replacement exists yet
+    /// — the peer advanced `retire_prior_to` past every CID it has so far
+    /// issued — the active entry is RETAINED (not removed) so the
+    /// connection keeps a usable outbound DCID until a replacement
+    /// NEW_CONNECTION_ID arrives. This is RFC 9000 §5.1.2-consistent:
+    /// retire_prior_to obligates us to retire old CIDs, but a peer that
+    /// leaves us with no usable CID would be breaking the connection on
+    /// itself; we degrade gracefully rather than discard our only DCID.
+    ///
     /// Returns [`Error::IllegalParameter`] if queueing the dropped
     /// sequences would exceed the `pending_retire` cap — only reachable
     /// when a peer drives growth far beyond the active-CID `limit`, which
@@ -324,8 +336,37 @@ impl CidPool {
             return Ok(());
         }
         self.retire_prior_to = new;
-        let dropped: alloc::vec::Vec<u64> =
-            self.entries.keys().copied().filter(|s| *s < new).collect();
+
+        // Determine whether the active CID is being retired, and if so,
+        // find a surviving replacement (lowest sequence >= new). The
+        // entries map is sorted, so the first key >= new is the
+        // replacement candidate.
+        let active_retired = self.active_seq < new;
+        let replacement = self.entries.range(new..).next().map(|(s, _)| *s);
+        let keep_active = if active_retired {
+            match replacement {
+                Some(repl) => {
+                    // Rotate to the surviving CID before removing the old
+                    // active one.
+                    self.active_seq = repl;
+                    None
+                }
+                // No replacement available yet: keep the active entry so
+                // we still have a usable outbound DCID. It will be
+                // retired by a later note_retire_prior_to once the peer
+                // supplies a higher-sequence CID.
+                None => Some(self.active_seq),
+            }
+        } else {
+            None
+        };
+
+        let dropped: alloc::vec::Vec<u64> = self
+            .entries
+            .keys()
+            .copied()
+            .filter(|s| *s < new && Some(*s) != keep_active)
+            .collect();
         for s in dropped {
             self.entries.remove(&s);
             self.queue_pending_retire(s)?;
@@ -530,6 +571,68 @@ mod tests {
     fn cidpool_retire_active_is_protocol_error() {
         let mut pool = CidPool::new(cid_n(0), None);
         assert!(matches!(pool.retire(0), Err(Error::IllegalParameter)));
+    }
+
+    // L-2: retire_prior_to that covers the active CID must rotate the
+    // active sequence to a surviving higher-sequence CID, never leaving
+    // `active()` pointing at a removed entry.
+    #[test]
+    fn cidpool_retire_prior_to_rotates_active() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(4);
+        for s in 1..=3 {
+            pool.add(CidEntry {
+                cid: cid_n(s as u8),
+                sequence: s,
+                reset_token: Some([s as u8; 16]),
+            })
+            .unwrap();
+        }
+        // active is still the handshake CID (seq 0).
+        assert_eq!(pool.active_seq, 0);
+        // Peer retires everything below 2 — the active CID (0) goes too.
+        pool.note_retire_prior_to(2).expect("retire ok");
+        // Active must have rotated to the lowest survivor (seq 2), and
+        // its entry must still be present.
+        assert_eq!(pool.active_seq, 2, "active rotated to surviving CID");
+        let active = pool.active().expect("active entry present");
+        assert_eq!(active.sequence, 2);
+        assert_eq!(active.cid, cid_n(2));
+        // The retired sequences (0, 1) are gone and queued.
+        assert!(!pool.entries.contains_key(&0));
+        assert!(!pool.entries.contains_key(&1));
+    }
+
+    // L-2: if retire_prior_to advances past every CID the peer has so far
+    // issued, the active entry is RETAINED (not removed) so a usable
+    // outbound DCID survives until a replacement arrives.
+    #[test]
+    fn cidpool_retire_prior_to_keeps_active_when_no_replacement() {
+        let mut pool = CidPool::new(cid_n(0), None);
+        pool.set_limit(4);
+        // Only the handshake CID (seq 0) exists. Peer retires prior to 5.
+        pool.note_retire_prior_to(5).expect("retire ok");
+        // No survivor >= 5, so the active CID (seq 0) is kept.
+        assert_eq!(pool.active_seq, 0, "active unchanged with no replacement");
+        let active = pool.active().expect("active entry retained");
+        assert_eq!(active.cid, cid_n(0));
+        // It was NOT queued for retire (we still use it).
+        assert!(pool.pop_pending_retire().is_none());
+        assert_eq!(pool.retire_prior_to, 5);
+
+        // When a higher-sequence CID finally arrives, the next
+        // retire_prior_to bump (or this one, re-evaluated) lets us rotate
+        // and drop the stale active CID.
+        pool.add(CidEntry {
+            cid: cid_n(7),
+            sequence: 7,
+            reset_token: None,
+        })
+        .unwrap();
+        // Re-announce a retire_prior_to that now has a survivor (>5).
+        pool.note_retire_prior_to(6).expect("retire ok");
+        assert_eq!(pool.active_seq, 7, "active rotates once a survivor exists");
+        assert!(!pool.entries.contains_key(&0), "stale active CID dropped");
     }
 
     #[test]
