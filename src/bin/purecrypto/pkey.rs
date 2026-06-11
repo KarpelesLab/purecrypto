@@ -76,10 +76,10 @@ pub(crate) fn run(args: Args) {
     // `-in` is private-key material: warn if the file is group/world-
     // readable, matching the other secret-key readers. Only a real file
     // path is checkable (stdin / `-` has no mode).
-    if let Some(p) = in_path {
-        if p != "-" {
-            warn_if_world_readable_key(p);
-        }
+    if let Some(p) = in_path
+        && p != "-"
+    {
+        warn_if_world_readable_key(p);
     }
     let raw = read_input(in_path);
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("input is not valid UTF-8 PEM"));
