@@ -1335,9 +1335,17 @@ impl<R: RngCore> ServerConnection<R> {
                 }
                 Ok(Some(Incoming::ApplicationData(plaintext_len))) => {
                     // Accept early-data records before the handshake completes
-                    // when 0-RTT was accepted; otherwise app data is invalid
-                    // until Connected.
-                    if self.state != State::Connected && !self.early_data_accepted {
+                    // only while 0-RTT is *live* — i.e. the early-data read key
+                    // is installed and its byte budget is still armed. We gate
+                    // on `early_data_remaining` (the live signal, cleared at
+                    // EndOfEarlyData) rather than the sticky `early_data_accepted`
+                    // flag: after EOED rotates us onto the client-handshake key
+                    // and zeroes the budget, an ApplicationData record in
+                    // `WaitClientFinished` must be rejected, not buffered into
+                    // `app_in` before the client Finished is verified.
+                    if self.state != State::Connected && self.early_data_remaining.is_none() {
+                        self.core.send_alert(AlertDescription::UnexpectedMessage);
+                        self.state = State::Closed;
                         return Err(Error::UnexpectedMessage);
                     }
                     // RFC 8446 §4.2.10: enforce `max_early_data_size`. A
