@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::util::{Args, die};
+use crate::util::{Args, die, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
@@ -229,6 +229,10 @@ pub(crate) fn run(args: Args) {
             let mut secret = [0u8; 32];
             purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
             builder = builder.cookie_secret(secret);
+            // `cookie_secret` takes the array by value (Copy), so our
+            // stack copy survives; scrub it as `pc_quic_new` does for
+            // the QUIC retry secret (commit 316e8a2).
+            zero_buf(&mut secret);
         }
     }
     let cfg = builder.build();

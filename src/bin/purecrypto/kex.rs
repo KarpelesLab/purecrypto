@@ -76,11 +76,14 @@ pub(crate) fn run(args: Args) {
             // X25519 has no PKCS#8 plumbing in the library yet — accept either
             // a 32-byte binary scalar or a 64-character hex scalar for both
             // `-key` and `-peer`.
-            let scalar = parse_raw_or_hex_32(&key_bytes)
+            let mut scalar = parse_raw_or_hex_32(&key_bytes)
                 .unwrap_or_else(|| die("-key must be a 32-byte X25519 scalar (raw or hex)"));
             let peer = parse_raw_or_hex_32(&peer_bytes)
                 .unwrap_or_else(|| die("-peer must be a 32-byte X25519 public key (raw or hex)"));
             let sk = X25519PrivateKey::from_bytes(scalar);
+            // `scalar` is `Copy`, so the local copy survives `from_bytes`;
+            // scrub it now that the key owns its own copy.
+            zero_buf(&mut scalar);
             sk.diffie_hellman(&peer)
                 .unwrap_or_else(|e| die(format!("X25519: {e}")))
                 .to_vec()
@@ -89,11 +92,14 @@ pub(crate) fn run(args: Args) {
             // X448 likewise has no PKCS#8 plumbing yet — accept either a
             // 56-byte binary scalar or a 112-character hex scalar for both
             // `-key` and `-peer`.
-            let scalar = parse_raw_or_hex_56(&key_bytes)
+            let mut scalar = parse_raw_or_hex_56(&key_bytes)
                 .unwrap_or_else(|| die("-key must be a 56-byte X448 scalar (raw or hex)"));
             let peer = parse_raw_or_hex_56(&peer_bytes)
                 .unwrap_or_else(|| die("-peer must be a 56-byte X448 public key (raw or hex)"));
             let sk = X448PrivateKey::from_bytes(scalar);
+            // `scalar` is `Copy`, so the local copy survives `from_bytes`;
+            // scrub it now that the key owns its own copy.
+            zero_buf(&mut scalar);
             sk.diffie_hellman(&peer)
                 .unwrap_or_else(|e| die(format!("X448: {e}")))
                 .to_vec()
@@ -110,7 +116,7 @@ pub(crate) fn run(args: Args) {
                 .unwrap_or_else(|_| die("-key is not a UTF-8 PEM document"));
             let peer_pem = core::str::from_utf8(&peer_bytes)
                 .unwrap_or_else(|_| die("-peer is not a UTF-8 PEM document"));
-            let (curve, scalar) = parse_sec1_scalar(key_pem)
+            let (curve, mut scalar) = parse_sec1_scalar(key_pem)
                 .unwrap_or_else(|| die("-key must be a SEC1 EC PRIVATE KEY PEM"));
             if curve != want_curve {
                 die(format!(
@@ -120,6 +126,9 @@ pub(crate) fn run(args: Args) {
             }
             let sk = BoxedEcdhPrivateKey::from_bytes(curve, &scalar)
                 .unwrap_or_else(|e| die(format!("invalid scalar: {e}")));
+            // `from_bytes` borrows, so we still own the decoded scalar
+            // Vec; scrub it now that the key holds its own copy.
+            zero_buf(&mut scalar);
             let peer_any = AnyPublicKey::from_spki_pem(peer_pem)
                 .unwrap_or_else(|e| die(format!("-peer must be SPKI PEM: {e}")));
             let peer_pk: BoxedEcdsaPublicKey = match peer_any {
@@ -149,14 +158,17 @@ fn parse_raw_or_hex_32(bytes: &[u8]) -> Option<[u8; 32]> {
     }
     // Treat as hex (ignoring whitespace).
     let s = core::str::from_utf8(bytes).ok()?;
-    let dec = crate::util::from_hex(s)?;
-    if dec.len() == 32 {
+    let mut dec = crate::util::from_hex(s)?;
+    let result = if dec.len() == 32 {
         let mut out = [0u8; 32];
         out.copy_from_slice(&dec);
         Some(out)
     } else {
         None
-    }
+    };
+    // Scrub the intermediate hex-decoded scalar copy we own.
+    zero_buf(&mut dec);
+    result
 }
 
 fn parse_raw_or_hex_56(bytes: &[u8]) -> Option<[u8; 56]> {
@@ -167,12 +179,15 @@ fn parse_raw_or_hex_56(bytes: &[u8]) -> Option<[u8; 56]> {
     }
     // Treat as hex (ignoring whitespace).
     let s = core::str::from_utf8(bytes).ok()?;
-    let dec = crate::util::from_hex(s)?;
-    if dec.len() == 56 {
+    let mut dec = crate::util::from_hex(s)?;
+    let result = if dec.len() == 56 {
         let mut out = [0u8; 56];
         out.copy_from_slice(&dec);
         Some(out)
     } else {
         None
-    }
+    };
+    // Scrub the intermediate hex-decoded scalar copy we own.
+    zero_buf(&mut dec);
+    result
 }

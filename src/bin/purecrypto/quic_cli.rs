@@ -24,7 +24,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::util::{Args, die};
+use crate::util::{Args, die, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::quic::{QuicConfig, QuicConnection, Role, StreamId, TransportParameters};
 use purecrypto::rng::OsRng;
@@ -292,6 +292,9 @@ pub(crate) fn run_server(args: Args) {
         purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
         qcfg.require_retry = true;
         qcfg.retry_secret = Some(secret);
+        // `retry_secret` stores a Copy of the array; scrub our stack
+        // copy as `pc_quic_new` does (commit 316e8a2).
+        zero_buf(&mut secret);
     }
 
     let socket = UdpSocket::bind(&bind_addr)
