@@ -295,19 +295,32 @@ pub unsafe extern "C" fn pc_quic_cfg_set_alpn(
         if cfg.is_null() {
             return PcStatus::NullPointer;
         }
+        // Cap the caller-controlled count BEFORE reserving so a garbage
+        // `n` can't drive `Vec::with_capacity` into `handle_alloc_error`
+        // (an abort the panic guard can't catch). 256 comfortably
+        // exceeds any realistic ALPN preference list.
+        const PC_ALPN_MAX: usize = 256;
+        if n > PC_ALPN_MAX {
+            return PcStatus::Unsupported;
+        }
+        if n > 0 && protocols.is_null() {
+            return PcStatus::NullPointer;
+        }
         let mut out: Vec<Vec<u8>> = Vec::with_capacity(n);
-        if n > 0 {
-            if protocols.is_null() {
+        for i in 0..n {
+            let p = unsafe { *protocols.add(i) };
+            if p.is_null() {
                 return PcStatus::NullPointer;
             }
-            for i in 0..n {
-                let p = unsafe { *protocols.add(i) };
-                if p.is_null() {
-                    return PcStatus::NullPointer;
-                }
-                let cs = unsafe { core::ffi::CStr::from_ptr(p) };
-                out.push(cs.to_bytes().to_vec());
+            let cs = unsafe { core::ffi::CStr::from_ptr(p) };
+            let bytes = cs.to_bytes();
+            // RFC 7301: a protocol name is 1..=255 bytes. Empty is
+            // illegal; >255 later trips a release assert in the
+            // ClientHello encoder. Reject cleanly at set time.
+            if bytes.is_empty() || bytes.len() > 255 {
+                return PcStatus::Unsupported;
             }
+            out.push(bytes.to_vec());
         }
         unsafe { &mut *cfg }.alpn = out;
         PcStatus::Ok
@@ -863,13 +876,19 @@ pub unsafe extern "C" fn pc_quic_stream_read(
         let mut tmp: Vec<u8> = alloc::vec![0u8; cap];
         let (n, fin) = match conn.read(StreamId(id), &mut tmp) {
             Ok(p) => p,
-            Err(_) => return PcStatus::Internal,
+            Err(_) => {
+                wipe_vec(&mut tmp);
+                return PcStatus::Internal;
+            }
         };
         unsafe { *out_len = n };
         unsafe { *fin_seen = if fin { 1 } else { 0 } };
         if n > 0 {
             unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), out, n) };
         }
+        // Scrub the decrypted stream plaintext from our scratch before
+        // dropping it — matches `pc_quic_recv_datagram` / `pc_tls_recv`.
+        wipe_vec(&mut tmp);
         PcStatus::Ok
     })
 }
