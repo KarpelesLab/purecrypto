@@ -576,23 +576,72 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 len: frag.len,
             };
             off += consumed;
+            // The client's first post-cookie flight (ClientKeyExchange, and
+            // optionally Certificate/CertificateVerify) arrives at epoch 0,
+            // unauthenticated. A spoofed plaintext CKE that decodes to a bad
+            // EC point would otherwise return Decode/IllegalParameter/
+            // PeerMisbehaved fatally and abort a legitimate in-flight
+            // handshake. On the unauthenticated path turn any reassembly/
+            // dispatch fault into a silent drop, keeping only our own
+            // `InappropriateState` misconfig fatal — mirroring the DTLS 1.3
+            // server pre-cookie wrapper. The encrypted client Finished
+            // (epoch ≥ 1, authenticated) keeps every error fatal.
+            // `feed`/`pop_ready` advance `expected_msg_seq` BEFORE dispatch, so
+            // on a silent drop we also rewind the reassembler: otherwise a
+            // spoofed but well-framed message would pin `expected_msg_seq`
+            // past the genuine one (same message_seq), which would then be
+            // rejected as stale.
+            let snapshot = self
+                .reassembler
+                .as_ref()
+                .expect("reassembler built")
+                .expected_msg_seq();
             let feeding = self
                 .reassembler
                 .as_mut()
                 .expect("reassembler built")
                 .feed(frag);
             if let Some((msg_type, body)) = feeding {
-                self.dispatch_one(msg_type, &body)?;
+                match self.dispatch_one(msg_type, &body) {
+                    Ok(()) => {}
+                    Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.reassembler
+                            .as_mut()
+                            .expect("reassembler built")
+                            .rewind_expected_msg_seq(snapshot);
+                        return Ok(());
+                    }
+                }
             }
             // Drain any further already-buffered messages.
             loop {
+                let snapshot = self
+                    .reassembler
+                    .as_ref()
+                    .expect("reassembler built")
+                    .expected_msg_seq();
                 let popped = self
                     .reassembler
                     .as_mut()
                     .expect("reassembler built")
                     .pop_ready();
                 match popped {
-                    Some((msg_type, body)) => self.dispatch_one(msg_type, &body)?,
+                    Some((msg_type, body)) => match self.dispatch_one(msg_type, &body) {
+                        Ok(()) => {}
+                        Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
+                            return Err(e);
+                        }
+                        Err(_) => {
+                            self.reassembler
+                                .as_mut()
+                                .expect("reassembler built")
+                                .rewind_expected_msg_seq(snapshot);
+                            return Ok(());
+                        }
+                    },
                     None => break,
                 }
             }
