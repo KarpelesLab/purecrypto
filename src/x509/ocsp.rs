@@ -448,6 +448,16 @@ impl OcspResponse {
         while !rseq.is_empty() {
             out.push(read_single_response(&mut rseq)?);
         }
+        // No trailing bytes after the responses SEQUENCE TLV.
+        rr.finish()?;
+        // responseExtensions [1] EXPLICIT Extensions OPTIONAL — not surfaced
+        // here (see `nonce()`), but skipped so the strict no-trailing-bytes
+        // `finish()` below holds for responses that carry it.
+        if !td.is_empty() && td.peek_tag() == Some(tag::context(1)) {
+            td.read_tlv(tag::context(1))?;
+        }
+        // No trailing bytes inside the ResponseData SEQUENCE.
+        td.finish()?;
         Ok(out)
     }
 
@@ -832,7 +842,14 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
         next_update = Some(read_generalized_time(&mut nr)?);
         nr.finish()?;
     }
-    // We don't surface singleExtensions [1] EXPLICIT Extensions OPTIONAL.
+    // We don't surface singleExtensions [1] EXPLICIT Extensions OPTIONAL, but
+    // skip over it when present so the strict no-trailing-bytes `finish()`
+    // below still holds for responses that carry it.
+    if !s.is_empty() && s.peek_tag() == Some(tag::context(1)) {
+        s.read_tlv(tag::context(1))?;
+    }
+    // No trailing bytes after the SingleResponse SEQUENCE.
+    s.finish()?;
 
     Ok(OcspSingleResponse {
         hash_alg_oid,
