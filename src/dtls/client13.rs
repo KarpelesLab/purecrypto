@@ -712,11 +712,46 @@ impl DtlsClientConnection13 {
                 len: frag.len,
             };
             off += consumed;
+            // On the unauthenticated (epoch-0, plaintext) path a single
+            // spoofed handshake record — e.g. a forged ServerHello or HRR —
+            // must never abort OR derail the in-flight handshake: feed and
+            // dispatch, but turn any reassembly/dispatch fault into a silent
+            // drop, keeping only our own `InappropriateState` misconfig fatal
+            // — mirroring the DTLS 1.3 server pre-cookie wrapper.
+            // `feed`/`pop_ready` advance `expected_msg_seq` BEFORE dispatch, so
+            // on a silent drop we also rewind the reassembler: otherwise a
+            // spoofed but well-framed ServerHello/HRR would pin
+            // `expected_msg_seq` past the genuine message (same message_seq),
+            // which would then be rejected as stale. The authenticated
+            // (epoch ≥ 1) path keeps every error fatal.
+            let snapshot = self.reassembler.expected_msg_seq();
             if let Some((mt, body)) = self.reassembler.feed(frag) {
-                self.dispatch_one(mt, &body)?;
+                match self.dispatch_one(mt, &body) {
+                    Ok(()) => {}
+                    Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.reassembler.rewind_expected_msg_seq(snapshot);
+                        return Ok(());
+                    }
+                }
             }
-            while let Some((mt, body)) = self.reassembler.pop_ready() {
-                self.dispatch_one(mt, &body)?;
+            loop {
+                let snapshot = self.reassembler.expected_msg_seq();
+                let Some((mt, body)) = self.reassembler.pop_ready() else {
+                    break;
+                };
+                match self.dispatch_one(mt, &body) {
+                    Ok(()) => {}
+                    Err(e) if authenticated || matches!(e, Error::InappropriateState) => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.reassembler.rewind_expected_msg_seq(snapshot);
+                        return Ok(());
+                    }
+                }
             }
         }
         Ok(())

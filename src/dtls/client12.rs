@@ -199,6 +199,11 @@ pub struct DtlsClientConnection12 {
 
     /// Currently held cookie (empty on the first CH, populated after HVR).
     cookie: Vec<u8>,
+    /// `true` once a genuine HelloVerifyRequest has been consumed. The HVR
+    /// path is unauthenticated (epoch-0, plaintext) and mutates the
+    /// transcript/state/reassembler, so a second or duplicate HVR — which
+    /// could be off-path spoofed — must be ignored rather than re-applied.
+    hvr_consumed: bool,
 
     /// Transcript: per RFC 6347 §4.2.1, only the second CH (with cookie) and
     /// onward are in the transcript. We use a single Transcript object;
@@ -287,6 +292,7 @@ impl DtlsClientConnection12 {
             client_random,
             server_random: None,
             cookie: Vec::new(),
+            hvr_consumed: false,
             transcript: Transcript::new(),
             suite: None,
             cert_chain: Vec::new(),
@@ -569,10 +575,35 @@ impl DtlsClientConnection12 {
             // (server hasn't sent a real "first" handshake message yet),
             // we route HVR fragments directly without going through the
             // reassembler.
-            if frag.msg_type == HS_HELLO_VERIFY_REQUEST
-                && matches!(self.state, State::WaitServerHelloOrHvr)
-            {
-                self.handle_hello_verify_request(&frag)?;
+            if frag.msg_type == HS_HELLO_VERIFY_REQUEST {
+                // The HVR is routed around the reassembler and is
+                // attacker-spoofable on the epoch-0 plaintext path: it
+                // carries no AEAD. A malformed/unexpected HVR (and any
+                // duplicate after the first one has been consumed) must be a
+                // silent drop rather than tearing down or derailing a
+                // legitimate in-flight handshake. We capture every HVR-typed
+                // fragment here so a spoofed one can never enter the
+                // reassembler. `handle_hello_verify_request` ignores any HVR
+                // once one has been consumed, and only acts in the
+                // WaitServerHelloOrHvr state. Convert its parse faults into a
+                // silent drop when this record was not authenticated.
+                let r = if self.hvr_consumed || !matches!(self.state, State::WaitServerHelloOrHvr) {
+                    // Already consumed, or arrived in a state where HVR is not
+                    // expected: ignore without mutating state.
+                    Ok(())
+                } else {
+                    self.handle_hello_verify_request(&frag)
+                };
+                match r {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if authenticated {
+                            return Err(e);
+                        }
+                        // Spoofable HVR: drop the rest of this record.
+                        return Ok(());
+                    }
+                }
                 off += consumed;
                 continue;
             }
@@ -587,13 +618,62 @@ impl DtlsClientConnection12 {
                 len: frag.len,
             };
             off += consumed;
+            // On the unauthenticated (epoch-0, plaintext) path a single
+            // spoofed ServerHello must never abort OR derail the handshake.
+            // The silent-drop is scoped to the pre-ServerHello states
+            // (`WaitServerHelloOrHvr` / `WaitServerHello`): the only message
+            // dispatched there is the ServerHello, and a forged one that fails
+            // handshake-layer validation (e.g. a non-offered suite →
+            // HandshakeFailure) is exactly the spoofable derail this guards.
+            // Once the genuine ServerHello is accepted and we advance to
+            // `WaitCertificate`+, dispatch faults are real peer/auth faults
+            // (e.g. a certificate that doesn't match the requested host) and
+            // MUST stay fatal even though that flight is still epoch-0
+            // plaintext. The authenticated (epoch ≥ 1) path always stays fatal.
+            // `feed`/`pop_ready` advance `expected_msg_seq` BEFORE dispatch, so
+            // on a silent drop we also rewind the reassembler: otherwise a
+            // spoofed ServerHello would pin `expected_msg_seq` past the genuine
+            // SH (same message_seq), which would then be rejected as stale.
+            let pre_sh = matches!(
+                self.state,
+                State::WaitServerHelloOrHvr | State::WaitServerHello
+            );
+            let spoofable = !authenticated && pre_sh;
+            let snapshot = self.reassembler.expected_msg_seq();
             if let Some((msg_type, body)) = self.reassembler.feed(frag) {
-                self.dispatch_one(msg_type, &body)?;
+                match self.dispatch_one(msg_type, &body) {
+                    Ok(()) => {}
+                    Err(e) if !spoofable || matches!(e, Error::InappropriateState) => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.reassembler.rewind_expected_msg_seq(snapshot);
+                        return Ok(());
+                    }
+                }
             }
             // Drain any further messages whose fragments were buffered
             // before earlier ones (out-of-order record delivery).
-            while let Some((msg_type, body)) = self.reassembler.pop_ready() {
-                self.dispatch_one(msg_type, &body)?;
+            loop {
+                let pre_sh = matches!(
+                    self.state,
+                    State::WaitServerHelloOrHvr | State::WaitServerHello
+                );
+                let spoofable = !authenticated && pre_sh;
+                let snapshot = self.reassembler.expected_msg_seq();
+                let Some((msg_type, body)) = self.reassembler.pop_ready() else {
+                    break;
+                };
+                match self.dispatch_one(msg_type, &body) {
+                    Ok(()) => {}
+                    Err(e) if !spoofable || matches!(e, Error::InappropriateState) => {
+                        return Err(e);
+                    }
+                    Err(_) => {
+                        self.reassembler.rewind_expected_msg_seq(snapshot);
+                        return Ok(());
+                    }
+                }
             }
         }
         Ok(())
@@ -627,6 +707,17 @@ impl DtlsClientConnection12 {
     }
 
     fn handle_hello_verify_request(&mut self, frag: &HandshakeFragment<'_>) -> Result<(), Error> {
+        // A genuine HVR is consumed exactly once. After it, the client has
+        // already reset its transcript, adopted the cookie, advanced state
+        // and bumped the reassembler msg_seq. A second HVR — duplicate or
+        // off-path spoofed — would re-do all that and derail the in-flight
+        // second flight (e.g. discard a just-received genuine ServerHello),
+        // so it is ignored without mutating any state. The caller treats
+        // `Ok(())` as "fully handled, do not fall through to the
+        // reassembler".
+        if self.hvr_consumed {
+            return Ok(());
+        }
         // HVR may itself be fragmented; require it whole for simplicity.
         if frag.fragment_offset != 0 || (frag.fragment.len() as u32) != frag.total_length {
             // Unsupported HVR fragmentation; reject.
@@ -684,6 +775,9 @@ impl DtlsClientConnection12 {
 
         let flight = self.build_client_hello_flight();
         self.send_flight(flight);
+        // A genuine HVR is now consumed; any subsequent HVR is a duplicate or
+        // spoof and must be ignored (handled at the top of this function).
+        self.hvr_consumed = true;
         Ok(())
     }
 

@@ -689,6 +689,129 @@ fn spoofed_client_hellos_mid_handshake_are_ignored_12() {
     assert!(pump_handshake(&mut client, &mut server));
 }
 
+/// Frames a single plaintext (epoch-0) DTLS 1.2 handshake message into one
+/// record, with the DTLS handshake header (`msg_type || length(3) ||
+/// message_seq(2) || fragment_offset(3) || fragment_length(3) || body`).
+/// Used to forge spoofed handshake records an off-path attacker could inject.
+fn dtls12_plaintext_handshake_record(msg_type: u8, message_seq: u16, body: &[u8]) -> Vec<u8> {
+    let blen = body.len() as u32;
+    let mut hs = Vec::new();
+    hs.push(msg_type);
+    hs.extend_from_slice(&[(blen >> 16) as u8, (blen >> 8) as u8, blen as u8]);
+    hs.extend_from_slice(&message_seq.to_be_bytes());
+    hs.extend_from_slice(&[0, 0, 0]); // fragment_offset = 0
+    hs.extend_from_slice(&[(blen >> 16) as u8, (blen >> 8) as u8, blen as u8]); // fragment_length
+    hs.extend_from_slice(body);
+
+    let rlen = hs.len() as u16;
+    let mut rec = Vec::new();
+    rec.push(22u8); // ContentType::Handshake
+    rec.extend_from_slice(&[0xfe, 0xfd]); // DTLS 1.2
+    rec.extend_from_slice(&[0x00, 0x00]); // epoch 0
+    rec.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x63]); // seq = 99
+    rec.extend_from_slice(&rlen.to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+/// Regression (off-path one-datagram DoS / handshake derail): once the DTLS
+/// 1.2 client has consumed its (genuine) HelloVerifyRequest, a SECOND HVR —
+/// duplicate or off-path spoofed — must be IGNORED. A real HVR resets the
+/// transcript, adopts the cookie, advances state and bumps the reassembler;
+/// re-applying any of that on a second HVR would derail the in-flight second
+/// flight (e.g. discard a just-received genuine ServerHello). Also: a
+/// malformed spoofed HVR is silently dropped (never fatal). The genuine
+/// handshake must still complete after all the spoof injections.
+#[test]
+fn spoofed_hello_verify_request_does_not_derail_client_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg
+        .with_cookie_secret([0xa5; 32])
+        .require_cookie_exchange(true);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-spoof-hvr", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // CH1 → server → genuine HVR → client. The client adopts the real cookie
+    // and emits the cookie-bearing CH2.
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    let genuine_hvr = server.pop_outbound_datagrams();
+    assert!(!genuine_hvr.is_empty(), "server should emit HVR");
+    for dg in &genuine_hvr {
+        client.feed_datagram(dg).unwrap();
+    }
+    let ch2 = client.pop_outbound_datagrams();
+    assert!(
+        !ch2.is_empty(),
+        "client should emit a genuine cookie-bearing CH2 after the real HVR"
+    );
+
+    // A second, forged HVR carrying the attacker's cookie (well-formed body:
+    // server_version(2) || cookie<len>). It must be ignored: no new CH2, no
+    // transcript/state reset — and `feed_datagram` stays `Ok`.
+    let mut forged_body = Vec::new();
+    forged_body.extend_from_slice(&[0xfe, 0xfd]); // server_version
+    forged_body.push(8u8); // cookie length
+    forged_body.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04]);
+    let forged_hvr = dtls12_plaintext_handshake_record(3, 0, &forged_body); // 3 = HVR
+    assert_eq!(client.feed_datagram(&forged_hvr), Ok(()));
+    assert!(
+        client.pop_outbound_datagrams().is_empty(),
+        "a second/duplicate HVR must be ignored, not re-applied"
+    );
+
+    // A malformed spoofed HVR (truncated body: claims a cookie but supplies
+    // no bytes) is silently dropped, never fatal.
+    let malformed_hvr = dtls12_plaintext_handshake_record(3, 0, &[0xfe, 0xfd, 0x08]);
+    assert_eq!(client.feed_datagram(&malformed_hvr), Ok(()));
+    assert!(client.pop_outbound_datagrams().is_empty());
+
+    // The genuine CH2 still drives the handshake to completion.
+    for dg in &ch2 {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(pump_handshake(&mut client, &mut server));
+}
+
+/// Regression (off-path one-datagram DoS): a well-framed spoofed plaintext
+/// ServerHello carrying a non-offered cipher suite (which fails
+/// handshake-layer validation → HandshakeFailure) injected at the DTLS 1.2
+/// client mid-handshake must be SILENTLY dropped, not propagated fatally; the
+/// genuine handshake still completes.
+#[test]
+fn spoofed_server_hello_does_not_abort_client_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-spoof-sh", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // Forge a ServerHello body the client will reject at the handshake layer:
+    // legacy_version(2) || random(32) || session_id<0> || cipher_suite(2) ||
+    // compression(1) || extensions<0>. cipher_suite = 0x0000
+    // (TLS_NULL_WITH_NULL_NULL) is never offered → HandshakeFailure.
+    let mut sh_body = Vec::new();
+    sh_body.extend_from_slice(&[0xfe, 0xfd]); // legacy_version DTLS 1.2
+    sh_body.extend_from_slice(&[0x11; 32]); // random
+    sh_body.push(0); // session_id length 0
+    sh_body.extend_from_slice(&[0x00, 0x00]); // cipher_suite (non-offered)
+    sh_body.push(0); // compression_method = null
+    sh_body.extend_from_slice(&[0x00, 0x00]); // extensions length 0
+    // The client awaits SH at message_seq 0 (no-cookie path).
+    let forged_sh = dtls12_plaintext_handshake_record(2, 0, &sh_body); // 2 = ServerHello
+
+    // Inject the forged ServerHello at the very start, while the client is in
+    // WaitServerHelloOrHvr: it must be silently dropped.
+    assert_eq!(client.feed_datagram(&forged_sh), Ok(()));
+
+    // The handshake still completes with the genuine server.
+    assert!(pump_handshake(&mut client, &mut server));
+}
+
 /// RFC 5705 §4 — DTLS 1.2 exporter agrees on both sides for a given
 /// `(label, context)`, and the no-context vs empty-context branches differ.
 #[test]
@@ -2211,6 +2334,45 @@ mod dtls13 {
         }
         assert!(client.is_handshake_complete());
         assert!(server.is_handshake_complete());
+    }
+
+    /// Regression (off-path one-datagram DoS / derail): a well-framed spoofed
+    /// plaintext ServerHello carrying a non-offered cipher suite (which fails
+    /// handshake-layer validation → HandshakeFailure) injected at the DTLS 1.3
+    /// client while it awaits ServerHello must be SILENTLY dropped, not
+    /// propagated fatally, and must not advance the reassembler past the
+    /// genuine ServerHello (same message_seq). The genuine handshake still
+    /// completes.
+    #[test]
+    fn spoofed_server_hello_does_not_abort_client_13() {
+        let (server_cfg, cert) = make_server13();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-spoof-sh", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+        // Forge a TLS 1.3 ServerHello body the client rejects at the handshake
+        // layer: legacy_version(2) || random(32) || session_id<0> ||
+        // cipher_suite(2) || compression(1) || extensions<0>. cipher_suite =
+        // 0x0000 is never offered → HandshakeFailure. (A random != HRR_RANDOM
+        // so it isn't treated as a HelloRetryRequest.)
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&[0x03, 0x03]); // legacy_version TLS 1.2
+        sh_body.extend_from_slice(&[0x11; 32]); // random (not HRR magic)
+        sh_body.push(0); // session_id length 0
+        sh_body.extend_from_slice(&[0x00, 0x00]); // cipher_suite (non-offered)
+        sh_body.push(0); // compression_method = null
+        sh_body.extend_from_slice(&[0x00, 0x00]); // extensions length 0
+        // ServerHello = handshake type 2; client awaits it at message_seq 0.
+        let forged_sh = super::dtls12_plaintext_handshake_record(2, 0, &sh_body);
+
+        // Inject the forged ServerHello while the client awaits SH: it must be
+        // silently dropped (Ok) without derailing the handshake.
+        assert_eq!(client.feed_datagram(&forged_sh), Ok(()));
+
+        // The handshake still completes with the genuine server.
+        assert!(pump_handshake_13(&mut client, &mut server));
     }
 }
 
