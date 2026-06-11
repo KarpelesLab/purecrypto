@@ -50,17 +50,22 @@ impl Choice {
 }
 
 impl From<u8> for Choice {
-    /// Wraps a `0`/`1` byte as a [`Choice`].
+    /// Wraps a byte as a [`Choice`] using `!= 0` semantics.
     ///
-    /// Debug builds assert the input is `0` or `1`. Release builds mask
-    /// `value & 1` so an out-of-domain byte is silently coerced to a valid
-    /// `Choice` rather than corrupting downstream constant-time selects.
-    /// (Internal callers should still keep the bit clean — the mask is a
-    /// safety net, not a license to pass arbitrary bytes.)
+    /// Debug builds assert the input is already `0` or `1`. In every build the
+    /// normalization is **branchless and constant time**: any nonzero byte maps
+    /// to `Choice(1)` and only `0` maps to `Choice(0)`. This avoids the old
+    /// `value & 1` foot-gun where a full `0xFF`/`0xFE` mask byte (the natural
+    /// output of constant-time mask computations) would be silently truncated
+    /// to its low bit — turning a `0xFE` "true" mask into `Choice(0)`.
+    /// (Internal callers should still keep the bit clean; the normalization is
+    /// a safety net, not a license to pass arbitrary bytes.)
     #[inline]
     fn from(value: u8) -> Self {
         debug_assert!(value == 0 || value == 1, "Choice must be 0 or 1");
-        Choice(value & 1)
+        // Branchless byte-nonzero: `(x | -x) >> 7` is 1 for any nonzero `x`
+        // and 0 for `x == 0`, with no data-dependent branch on `value`.
+        Choice(((value | value.wrapping_neg()) >> 7) & 1)
     }
 }
 
@@ -211,6 +216,24 @@ mod tests {
         assert!(truthy(t | f) && !truthy(f | f));
         assert!(truthy(t ^ f) && !truthy(t ^ t));
         assert!(truthy(!f) && !truthy(!t));
+    }
+
+    // `Choice::from` normalizes with `!= 0` semantics, so any nonzero byte —
+    // including a full `0xFF`/`0xFE` mask — maps to a truthy `Choice` and only
+    // `0` maps to a falsy one. We exercise the branchless normalization formula
+    // directly here because `Choice::from` debug-asserts a clean 0/1 input, and
+    // the unit tests build in debug mode.
+    #[test]
+    fn choice_from_nonzero_normalization() {
+        let normalize = |value: u8| ((value | value.wrapping_neg()) >> 7) & 1;
+        assert_eq!(normalize(0x00), 0);
+        for v in 1u16..=255 {
+            let v = v as u8;
+            assert_eq!(normalize(v), 1, "byte {v:#04x} must normalize to 1");
+        }
+        // The clean-input path still agrees with `Choice::from`.
+        assert!(truthy(Choice::from(1)));
+        assert!(!truthy(Choice::from(0)));
     }
 
     #[test]
