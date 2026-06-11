@@ -72,6 +72,33 @@ impl Params {
     pub(crate) fn pk_bytes(&self) -> usize {
         2 * self.n
     }
+
+    /// The lowest leaf index that counts as "exhausted" (the first index at
+    /// which [`sign`](crate::xmss::XmssMtPrivateKey::sign) must refuse).
+    ///
+    /// Normally this is `2^full_height`: every leaf `0..2^h` is signable and the
+    /// post-increment sentinel `2^h` is stored to mark the key spent. But when
+    /// `index_bytes * 8 == full_height` (the XMSS^MT h=40 sets, where the index
+    /// field is exactly `h` bits wide) the sentinel `2^h` is unrepresentable and
+    /// would wrap to `0`, silently re-enabling leaf 0 and reusing its WOTS+
+    /// one-time key. In that case the last leaf is sacrificed: the highest
+    /// signable index is `2^h - 2`, leaving `2^h - 1` (all-ones) as the
+    /// representable exhausted sentinel. Matches the xmss reference behaviour.
+    ///
+    /// Returns `None` when `full_height >= 64` (the index can never overflow a
+    /// `u64`, so the key never exhausts within representable state).
+    pub(crate) fn exhausted_index(&self) -> Option<u64> {
+        if self.full_height >= 64 {
+            return None;
+        }
+        let total = 1u64 << self.full_height;
+        if self.index_bytes * 8 == self.full_height as usize {
+            // Sentinel `2^h` does not fit in `index_bytes`; stop one leaf early.
+            Some(total - 1)
+        } else {
+            Some(total)
+        }
+    }
 }
 
 /// Builds the derived fields from the core inputs.

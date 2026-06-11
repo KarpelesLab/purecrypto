@@ -767,8 +767,12 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     let idx = bytes_to_idx(&raw[..p.index_bytes]);
     // Match the signer's exhaustion convention exactly: `full_height >= 64`
     // never exhausts (the index can never overflow the tree), otherwise the
-    // valid range is `0..=2^full_height` (inclusive of the exhausted sentinel).
-    if p.full_height < 64 && idx > (1u64 << p.full_height) {
+    // valid range is `0..=exhausted_index()` (inclusive of the exhausted
+    // sentinel). For the h=40 sets that sentinel is `2^h - 1` rather than `2^h`,
+    // so a wrapped/edge state above it cannot be reloaded as usable.
+    if let Some(max) = p.exhausted_index()
+        && idx > max
+    {
         return Err(Error::InvalidKey);
     }
 
@@ -1078,12 +1082,11 @@ impl XmssMtPrivateKey {
     pub fn sign(&mut self, msg: &[u8]) -> Result<Vec<u8>, Error> {
         let p = self.set.params();
         let idx = self.index();
-        let exhausted = if p.full_height >= 64 {
-            false
-        } else {
-            idx >= (1u64 << p.full_height)
-        };
-        if exhausted {
+        // `exhausted_index()` is `None` for h >= 64 (no overflow possible) and,
+        // crucially, returns `2^h - 1` instead of `2^h` for the h=40 sets whose
+        // index field is exactly `h` bits wide — there `2^h` would wrap to 0 on
+        // store and reuse leaf 0's one-time key.
+        if p.exhausted_index().is_some_and(|max| idx >= max) {
             return Err(Error::KeyExhausted);
         }
         let sig = {
