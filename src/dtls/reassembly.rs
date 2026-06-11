@@ -244,6 +244,24 @@ impl Reassembler {
         self.expected_msg_seq
     }
 
+    /// Rewinds `expected_msg_seq` to a previously-snapshotted value.
+    ///
+    /// `feed` / `pop_ready` advance `expected_msg_seq` and remove the
+    /// completed entry *before* the body is dispatched. On the unauthenticated
+    /// (epoch-0, plaintext) handshake path a spoofed but well-framed message
+    /// that fails handshake-layer validation is silently dropped — but if the
+    /// reassembler stayed advanced, the genuine message at the same
+    /// `message_seq` (e.g. a retransmitted ServerHello) would be rejected as
+    /// stale, derailing the handshake. Restoring the snapshot lets the
+    /// genuine message be accepted when it (re)arrives. Only valid to call
+    /// with a value `<=` the current `expected_msg_seq`; never used on the
+    /// authenticated path, where dispatch faults stay fatal.
+    pub(crate) fn rewind_expected_msg_seq(&mut self, to: u16) {
+        if to <= self.expected_msg_seq {
+            self.expected_msg_seq = to;
+        }
+    }
+
     /// Feeds one fragment. Returns `Some((msg_type, body))` only if the
     /// next-expected message just completed. Future-sequence fragments are
     /// buffered silently; past-sequence fragments (already-dispatched) are
@@ -285,18 +303,35 @@ impl Reassembler {
         }
 
         let off = frag.fragment_offset as usize;
+        // Bounds pre-check: `read_fragment` already verified offset + length
+        // fit within total_length, but be defensive — bail before mutating
+        // anything if any index would land out of range.
+        if off
+            .checked_add(frag.fragment.len())
+            .is_none_or(|end| end > entry.buf.len())
+        {
+            return None;
+        }
+        // Overlap-conflict pre-scan (off-path hardening): if any byte this
+        // fragment covers was already received but DISAGREES with the new
+        // content, drop the whole fragment without mutating state. Without
+        // this, a spoofed fragment that arrives first pins corrupt bytes and
+        // the genuine overlapping fragment's bytes are silently discarded,
+        // wedging the decode. Idempotent duplicates (identical overlapping
+        // bytes) still agree and are accepted as before.
         for (i, &b) in frag.fragment.iter().enumerate() {
             let idx = off + i;
-            // `read_fragment` already verified the offset + length is in
-            // bounds against total_length; this is belt-and-braces.
-            if idx >= entry.buf.len() {
+            if entry.is_received(idx) && entry.buf[idx] != b {
                 return None;
             }
+        }
+        for (i, &b) in frag.fragment.iter().enumerate() {
+            let idx = off + i;
             if entry.set_received(idx) {
                 entry.buf[idx] = b;
                 entry.received_count += 1;
             }
-            // else: duplicate byte — ignored, no overwrite.
+            // else: duplicate byte — already verified to agree above.
         }
 
         // Empty messages (ServerHelloDone, HelloRequest) complete on receipt
@@ -662,5 +697,70 @@ mod tests {
         let out1 = r.feed(read_fragment(&b1).unwrap()).unwrap();
         assert_eq!(out1.0, 1);
         assert_eq!(out1.1, b"one!");
+    }
+
+    #[test]
+    fn conflicting_overlap_dropped_genuine_bytes_win() {
+        // Pre-cookie hardening: a spoofed fragment must not be able to pin
+        // corrupt bytes that then cause the genuine overlapping fragment to be
+        // dropped under "first writer wins". A fragment whose overlapping
+        // bytes DISAGREE with already-buffered content is itself dropped, so
+        // the genuine content survives and completes the message.
+        let body: Vec<u8> = (0u8..20).collect();
+        let total = body.len() as u32;
+
+        // Genuine first half (offset 0..10) and second half (offset 10..20).
+        let mut early = Vec::new();
+        write_fragment_header(&mut early, 5, total, 0, 0, 10);
+        early.extend_from_slice(&body[..10]);
+        let mut late = Vec::new();
+        write_fragment_header(&mut late, 5, total, 0, 10, 10);
+        late.extend_from_slice(&body[10..]);
+
+        // Genuine first half pins the correct bytes for 0..10.
+        let mut r = Reassembler::new();
+        assert!(r.feed(read_fragment(&early).unwrap()).is_none());
+
+        // A spoofed first half (offset 0..10) with corrupt bytes overlaps the
+        // already-held genuine bytes and DISAGREES → it must be dropped.
+        let mut spoof_early = Vec::new();
+        write_fragment_header(&mut spoof_early, 5, total, 0, 0, 10);
+        spoof_early.extend_from_slice(&[0xff; 10]);
+        assert!(r.feed(read_fragment(&spoof_early).unwrap()).is_none());
+
+        // The genuine second half completes the message with the ORIGINAL
+        // (uncorrupted) first-half bytes — the spoof did not corrupt them.
+        let out = r.feed(read_fragment(&late).unwrap()).unwrap();
+        assert_eq!(
+            out.1, body,
+            "genuine bytes must survive a conflicting spoof"
+        );
+    }
+
+    #[test]
+    fn idempotent_duplicate_overlap_still_accepted() {
+        // The conflict-drop must NOT break legitimate idempotent duplicates:
+        // a fragment whose overlapping bytes AGREE with what's buffered is
+        // still accepted (no spurious drop).
+        let body: Vec<u8> = (0u8..16).collect();
+        let total = body.len() as u32;
+
+        let mut first = Vec::new();
+        write_fragment_header(&mut first, 6, total, 0, 0, 8);
+        first.extend_from_slice(&body[..8]);
+        // Overlapping duplicate covering 4..12 with IDENTICAL bytes for 4..8.
+        let mut overlap = Vec::new();
+        write_fragment_header(&mut overlap, 6, total, 0, 4, 8);
+        overlap.extend_from_slice(&body[4..12]);
+        let mut tail = Vec::new();
+        write_fragment_header(&mut tail, 6, total, 0, 12, 4);
+        tail.extend_from_slice(&body[12..]);
+
+        let mut r = Reassembler::new();
+        assert!(r.feed(read_fragment(&first).unwrap()).is_none());
+        // Agreeing overlap is accepted and extends coverage to 0..12.
+        assert!(r.feed(read_fragment(&overlap).unwrap()).is_none());
+        let out = r.feed(read_fragment(&tail).unwrap()).unwrap();
+        assert_eq!(out.1, body);
     }
 }
