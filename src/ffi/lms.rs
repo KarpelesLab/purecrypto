@@ -239,6 +239,13 @@ pub unsafe extern "C" fn pc_lms_sign(
             unsafe { *out_len = expected };
             return PcStatus::BufferTooSmall;
         }
+        // Reject a NULL output buffer BEFORE signing: `sign()` burns a
+        // one-time key irreversibly, so a caller passing `out == NULL`
+        // with a large `*out_len` must not consume an OTS leaf only to
+        // have `out_write` fail afterwards. `expected` is always > 0.
+        if out.is_null() {
+            return PcStatus::NullPointer;
+        }
         let sig = match key.0.sign(&mut OsRng, m) {
             Ok(s) => s,
             Err(_) => return PcStatus::Internal,
@@ -406,6 +413,13 @@ pub unsafe extern "C" fn pc_hss_sign(
         if unsafe { *out_len } < expected {
             unsafe { *out_len = expected };
             return PcStatus::BufferTooSmall;
+        }
+        // Reject a NULL output buffer BEFORE signing: `sign()` burns a
+        // one-time key irreversibly, so a caller passing `out == NULL`
+        // with a large `*out_len` must not consume an OTS leaf only to
+        // have `out_write` fail afterwards. `expected` is always > 0.
+        if out.is_null() {
+            return PcStatus::NullPointer;
         }
         let sig = match key.0.sign(&mut OsRng, m) {
             Ok(s) => s,
