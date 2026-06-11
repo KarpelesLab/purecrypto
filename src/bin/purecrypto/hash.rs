@@ -40,6 +40,15 @@ fn digest(alg: &str, data: &[u8]) -> Option<Vec<u8>> {
 /// Computes an extendable-output (XOF) digest of `data`. `ascon-xof128` takes
 /// just a length; `ascon-cxof128` also takes a customization string `custom`.
 fn xof(alg: &str, data: &[u8], len: usize, custom: &[u8]) -> Option<Vec<u8>> {
+    // Cap the caller-controlled output length: `vec![0u8; len]` on a
+    // garbage `-len` would OOM-abort otherwise. 1 GiB mirrors the
+    // `rand` subcommand's cap.
+    const MAX_XOF_BYTES: usize = 1 << 30;
+    if len > MAX_XOF_BYTES {
+        die(format!(
+            "-len {len} exceeds the {MAX_XOF_BYTES}-byte cap"
+        ));
+    }
     let mut out = vec![0u8; len];
     match alg.to_ascii_lowercase().as_str() {
         "ascon-xof128" => {
