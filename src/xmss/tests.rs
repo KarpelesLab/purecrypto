@@ -233,6 +233,55 @@ fn stateful_exhaustion_errors() {
     assert_eq!(sk.index(), last + 1, "exhausted sign does not advance");
 }
 
+/// The XMSS^MT h=40 sets carry exactly `index_bytes = ceil(40/8) = 5` index
+/// bytes — a 40-bit field. The post-increment exhaustion sentinel `2^40` needs
+/// 41 bits, so storing it truncates to `0` and silently re-enables leaf 0,
+/// reusing its WOTS+ one-time key (forgery). The fix sacrifices the last leaf:
+/// the highest signable index is `2^40 - 2`, leaving the representable
+/// all-ones `2^40 - 1` as the exhausted sentinel. Use Sha2_40_8_256 (d=8,
+/// tree_height=5) so keygen and root recomputation stay cheap; inject the
+/// near-exhaustion index via a `to_bytes`/`from_bytes` round-trip.
+#[test]
+fn xmssmt_h40_index_does_not_wrap_to_zero() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmssmt", b"h40-wrap", &[]);
+    let set = XmssMtParamSet::Sha2_40_8_256;
+    let p = set.params();
+    assert_eq!(p.full_height, 40);
+    assert_eq!(p.index_bytes, 5);
+    assert_eq!(p.index_bytes * 8, p.full_height as usize);
+
+    let sk0 = XmssMtPrivateKey::generate(set, &mut rng);
+    let pk = sk0.public_key();
+
+    // Inject idx = 2^40 - 2 (the last signable leaf under the fix) and reload,
+    // confirming the wrapped/edge index round-trips through validation.
+    let penultimate = (1u64 << 40) - 2;
+    let mut blob = sk0.to_bytes();
+    idx_to_bytes(penultimate, &mut blob[8..8 + p.index_bytes]);
+    let mut sk = XmssMtPrivateKey::from_bytes(&blob).expect("penultimate idx loads");
+    assert_eq!(sk.index(), penultimate);
+
+    // The final permitted signature succeeds and advances to the all-ones
+    // sentinel 2^40 - 1, which is representable in 5 bytes.
+    let sig = sk.sign(b"last permitted").unwrap();
+    assert!(pk.verify(b"last permitted", &sig));
+    let sentinel = (1u64 << 40) - 1;
+    assert_eq!(sk.index(), sentinel);
+    assert_eq!(sk.index() & 0xff_ffff_ffff, sentinel, "index must not wrap");
+
+    // The next sign must refuse and MUST NOT re-sign at a wrapped leaf 0.
+    assert_eq!(sk.sign(b"forge?"), Err(Error::KeyExhausted));
+    assert_eq!(sk.index(), sentinel, "exhausted sign does not advance/wrap");
+    assert_ne!(sk.index(), 0, "index must never wrap back to 0");
+
+    // A key already at the sentinel reloads but refuses to sign immediately.
+    let mut at_sentinel = sk0.to_bytes();
+    idx_to_bytes(sentinel, &mut at_sentinel[8..8 + p.index_bytes]);
+    let mut sk_sentinel =
+        XmssMtPrivateKey::from_bytes(&at_sentinel).expect("sentinel idx loads as exhausted");
+    assert_eq!(sk_sentinel.sign(b"nope"), Err(Error::KeyExhausted));
+}
+
 #[test]
 fn xmssmt_roundtrip() {
     let mut rng = HmacDrbg::<Sha256>::new(b"xmssmt", b"rt", &[]);
