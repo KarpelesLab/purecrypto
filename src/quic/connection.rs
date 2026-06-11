@@ -1427,6 +1427,7 @@ impl QuicConnection {
                 &lk.rx_hp_key_bytes,
             ));
             self.endpoint.crypto.one_rtt_phase = 0;
+            self.endpoint.crypto.rx_phase = 0;
             self.one_rtt_phase_initialized = true;
         }
     }
@@ -1563,7 +1564,12 @@ impl QuicConnection {
                 .at_mut(Level::OneRtt)
                 .tx_phase_pending_confirm = false;
         }
-        self.endpoint.crypto.one_rtt_phase = new_phase;
+        // The rx side has now committed to `new_phase`. The tx phase is
+        // moved separately (by `flip_tx_key_phase` above for a
+        // peer-initiated update, or it was already advanced by
+        // `initiate_key_update` for the confirm case), so only the rx
+        // reference is updated here.
+        self.endpoint.crypto.rx_phase = new_phase;
     }
 
     /// RFC 9001 §6.5 — "An endpoint SHOULD retain old read keys for no
@@ -2647,7 +2653,14 @@ impl QuicConnection {
         // RFC 9001 §6 — read the now-unprotected Key Phase bit. The
         // first byte's bit 2 carries the phase (0 or 1).
         let pkt_phase: u8 = (pkt[0] >> 2) & 1;
-        let current_phase = self.endpoint.crypto.one_rtt_phase;
+        // RFC 9001 §6.2 — the receive path's notion of "current phase"
+        // is the *rx* phase, which advances only on an observed peer
+        // key update. It is deliberately decoupled from the tx phase
+        // (`one_rtt_phase`): a self-initiated update bumps tx while the
+        // peer keeps sending at the old rx phase, and comparing against
+        // the tx phase here would mis-read those in-flight old-phase
+        // packets as a peer key update (H-1).
+        let current_phase = self.endpoint.crypto.rx_phase;
 
         let aad_end = hdr.pn_offset + pn_len as usize;
         let aad: Vec<u8> = pkt[..aad_end].to_vec();
@@ -2689,7 +2702,7 @@ impl QuicConnection {
             // packet's phase matches the just-rotated-out slot, try
             // it before giving up.
             if self.one_rtt_phase_initialized
-                && pkt_phase != self.endpoint.crypto.one_rtt_phase
+                && pkt_phase != current_phase
                 && self
                     .endpoint
                     .crypto
@@ -2762,6 +2775,18 @@ impl QuicConnection {
         // unprotecting packets with old keys" — so it MUST NOT drive a
         // (backwards) phase commit.
         if self.one_rtt_phase_initialized && pkt_phase != current_phase && !opened_with_prev {
+            // The packet opened with the NEXT-generation rx keys
+            // (`rx_by_phase[pkt_phase]`), i.e. the peer genuinely
+            // performed a key update — commit the rx phase forward.
+            // (A packet that opened with the keys already installed for
+            // the current rx phase, or only with `prev_rx_keys`, falls
+            // through here and never triggers a commit — H-1.)
+            //
+            // `commit_rx_key_phase_flip` itself clears
+            // `tx_phase_pending_confirm` when the commit confirms a
+            // self-initiated update (the peer's reply at our new tx
+            // phase is exactly such a commit), so no separate confirm
+            // branch is needed for that case.
             self.commit_rx_key_phase_flip(pkt_phase);
             // The commit restarted `rx_pn_window` for the new key; the
             // committing packet itself was opened under that key, so
@@ -2774,15 +2799,21 @@ impl QuicConnection {
                 .record(pn);
         } else if self.one_rtt_phase_initialized
             && pkt_phase == current_phase
+            && pkt_phase == self.endpoint.crypto.one_rtt_phase
             && self
                 .endpoint
                 .crypto
                 .at(Level::OneRtt)
                 .tx_phase_pending_confirm
         {
-            // RFC 9001 §6.1: receiving a packet at the new phase
-            // (matching our tx) confirms the peer has switched too —
-            // we may now initiate another update if desired.
+            // RFC 9001 §6.1: the peer sent a packet at OUR new tx phase
+            // (and the rx phase already matches it, so no commit was
+            // needed) — this confirms the peer has switched too and we
+            // may initiate another update. This branch only fires when
+            // `pkt_phase == one_rtt_phase` (the tx phase we advanced
+            // to); an in-flight OLD-phase packet (pkt_phase ==
+            // rx_phase != one_rtt_phase) must NOT clear the pending
+            // flag (H-1).
             self.endpoint
                 .crypto
                 .at_mut(Level::OneRtt)
@@ -6163,6 +6194,149 @@ mod tests {
         c.feed_datagram(&phase0_dg)
             .expect("stale old-phase packet is silently dropped");
         assert_eq!(c.endpoint.crypto.one_rtt_phase, 1, "phase unchanged");
+    }
+
+    /// H-1 regression — a SELF-initiated key update must not be desynced
+    /// by an in-flight OLD-phase packet from the peer. The existing
+    /// key_update tests are all peer-initiated and lock-step (the
+    /// receiver only sees the new phase), so they never exercise the
+    /// case the audit flagged: the INITIATOR's tx phase has advanced
+    /// while the peer is still legitimately sending at the old phase.
+    ///
+    /// Before the fix, the receive path compared the packet's phase
+    /// against the tx-derived `one_rtt_phase`; an in-flight old-phase
+    /// peer packet (which still decrypts under the unchanged old-phase
+    /// rx keys) was therefore mis-read as a peer key update and ran a
+    /// spurious `commit_rx_key_phase_flip` — stamping later ciphertext
+    /// with the wrong phase, clearing `tx_phase_pending_confirm`, and
+    /// resetting the per-key replay window while the same rx keys stayed
+    /// live (RFC 9001 §9.5 replay bypass).
+    #[test]
+    fn key_update_initiator_ignores_in_flight_old_phase_packet() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+
+        // Open a bidi stream so both directions carry 1-RTT data.
+        let cid = c.open_bidi().expect("open");
+        c.write(cid, b"hi").expect("write");
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let sid = StreamId(cid.0);
+
+        // The CLIENT produces a phase-0 packet that is captured but NOT
+        // delivered yet (an in-flight old-phase packet).
+        c.write(cid, b"CLIENT-OLD").expect("client old-phase write");
+        let client_old_dg = c.pop_datagram();
+        assert!(!client_old_dg.is_empty(), "captured client phase-0 pkt");
+
+        // The SERVER (the initiator) starts a key update. Its tx phase
+        // advances to 1; its rx phase must stay 0 because the client is
+        // still sending at phase 0.
+        s.initiate_key_update().expect("server initiates");
+        assert_eq!(s.endpoint.crypto.one_rtt_phase, 1, "server tx phase = 1");
+        assert_eq!(s.endpoint.crypto.rx_phase, 0, "server rx phase stays 0");
+        assert!(
+            s.endpoint.crypto.at(Level::OneRtt).tx_phase_pending_confirm,
+            "server has an unconfirmed update outstanding"
+        );
+
+        // Snapshot the state that the spurious commit would have moved.
+        let tx_secret = s
+            .endpoint
+            .crypto
+            .at(Level::OneRtt)
+            .tx
+            .as_ref()
+            .expect("tx keys")
+            .secret
+            .clone();
+        let window_before = s.endpoint.crypto.at(Level::OneRtt).rx_pn_window;
+
+        // Now deliver the in-flight OLD-phase (phase 0) client packet to
+        // the server-initiator. It decrypts cleanly under the unchanged
+        // phase-0 rx keys and MUST NOT trigger any key-phase movement.
+        s.feed_datagram(&client_old_dg)
+            .expect("server feeds in-flight old-phase packet");
+
+        assert_eq!(
+            s.endpoint.crypto.one_rtt_phase, 1,
+            "in-flight old-phase packet must not move the tx phase"
+        );
+        assert_eq!(
+            s.endpoint.crypto.rx_phase, 0,
+            "in-flight old-phase packet must not move the rx phase"
+        );
+        assert!(
+            s.endpoint.crypto.at(Level::OneRtt).tx_phase_pending_confirm,
+            "in-flight old-phase packet must not clear pending-confirm"
+        );
+        assert_eq!(
+            s.endpoint
+                .crypto
+                .at(Level::OneRtt)
+                .tx
+                .as_ref()
+                .expect("tx keys")
+                .secret,
+            tx_secret,
+            "in-flight old-phase packet must not rotate the tx keys"
+        );
+        // The live rx replay window must have advanced (recorded the
+        // packet's PN) rather than being reset to empty by a spurious
+        // commit. It therefore differs from the pre-feed snapshot.
+        assert!(
+            s.endpoint.crypto.at(Level::OneRtt).rx_pn_window != window_before,
+            "the rx replay window must record the PN, not be reset"
+        );
+        // Replaying the exact same packet is now a silent drop and must
+        // not move any key-phase state.
+        s.feed_datagram(&client_old_dg)
+            .expect("replay silently dropped");
+        assert_eq!(
+            s.endpoint.crypto.one_rtt_phase, 1,
+            "replay must not move the tx phase"
+        );
+        assert_eq!(
+            s.endpoint.crypto.rx_phase, 0,
+            "replay must not move the rx phase"
+        );
+
+        // The server's actual data must have been delivered.
+        let mut buf = [0u8; 64];
+        let mut got: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+        while let Ok((n, _fin)) = s.read(sid, &mut buf) {
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert!(
+            got.windows(b"CLIENT-OLD".len()).any(|w| w == b"CLIENT-OLD"),
+            "the in-flight old-phase payload must still be delivered"
+        );
+
+        // Liveness: the self-initiated update still completes normally
+        // once the peer observes it. Drive the client to phase 1.
+        s.write(sid, b"SERVER-NEW").expect("server new-phase write");
+        for _ in 0..6 {
+            let _ = pump(&mut c, &mut s);
+        }
+        assert_eq!(
+            c.endpoint.crypto.one_rtt_phase, 1,
+            "client eventually commits to phase 1"
+        );
+        assert_eq!(
+            s.endpoint.crypto.rx_phase, 1,
+            "server rx commits once the client's phase-1 reply arrives"
+        );
+        assert!(
+            !s.endpoint.crypto.at(Level::OneRtt).tx_phase_pending_confirm,
+            "server's update is confirmed after the round-trip"
+        );
     }
 
     /// A4 — `peer_addr` is learned from the FIRST datagram only.

@@ -33,11 +33,21 @@ pub(crate) struct CryptoState {
     /// construction time; the others fill in as the TLS engine surfaces
     /// secrets via the hook.
     pub(crate) levels: [LevelKeys; 4],
-    /// RFC 9001 §6 — the current 1-RTT Key Phase bit (0 or 1). Outbound
-    /// short-header packets carry this in bit 2 of the first byte;
-    /// inbound packets are opened with the rx slot whose phase matches
-    /// the masked-off bit.
+    /// RFC 9001 §6 — the current 1-RTT **tx** Key Phase bit (0 or 1).
+    /// Outbound short-header packets carry this in bit 2 of the first
+    /// byte. A self-initiated key update advances this WITHOUT moving
+    /// [`Self::rx_phase`]: the peer is still sending at the old phase
+    /// until it observes our flip, so the receive path must keep
+    /// decrypting (and not mis-commit) against the unchanged rx phase.
     pub(crate) one_rtt_phase: u8,
+    /// RFC 9001 §6 — the current 1-RTT **rx** Key Phase bit (0 or 1).
+    /// Inbound packets are opened with the rx slot whose phase matches
+    /// the masked-off bit; this field is the reference the receive path
+    /// compares the packet's phase against to decide whether the peer
+    /// has performed a key update. It only advances when a packet is
+    /// successfully opened with the NEXT-generation rx keys (a real
+    /// peer-initiated flip), NOT when the local tx phase moves.
+    pub(crate) rx_phase: u8,
 }
 
 impl CryptoState {
@@ -51,6 +61,7 @@ impl CryptoState {
                 LevelKeys::empty(),
             ],
             one_rtt_phase: 0,
+            rx_phase: 0,
         }
     }
 
