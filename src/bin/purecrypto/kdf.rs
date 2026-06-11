@@ -29,12 +29,12 @@ fn parse_len_capped(args: &Args, extra_max: Option<usize>) -> usize {
     if len > MAX_KDF_BYTES {
         die(format!("-len {len} exceeds the {MAX_KDF_BYTES}-byte cap"));
     }
-    if let Some(m) = extra_max {
-        if len > m {
-            die(format!(
-                "-len {len} exceeds this KDF's maximum of {m} bytes"
-            ));
-        }
+    if let Some(m) = extra_max
+        && len > m
+    {
+        die(format!(
+            "-len {len} exceeds this KDF's maximum of {m} bytes"
+        ));
     }
     len
 }
