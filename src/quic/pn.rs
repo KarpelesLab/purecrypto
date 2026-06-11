@@ -33,10 +33,26 @@ pub(crate) enum PnSpaceId {
     Application = 2,
 }
 
+/// Maximum number of disjoint ACK ranges retained per PN space.
+///
+/// Without a cap, an on-path attacker who can synthesize AEAD-valid
+/// packets with gapped packet numbers makes [`AckRanges::insert`] create
+/// an unbounded number of ranges, turning the O(n) scan-per-insert into
+/// O(n²) CPU and O(n) memory before the PN space is discarded. We bound
+/// the set to a fixed ceiling (matching the order of magnitude common
+/// QUIC stacks use) and drop the lowest/oldest range when full — the
+/// lost low PNs are the least useful to ACK (the peer has long since
+/// moved past them) and dropping an ACK range is always safe: ACKs are
+/// purely informational and the peer simply retransmits if needed.
+pub(crate) const MAX_ACK_RANGES: usize = 32;
+
 /// A sorted-descending set of disjoint inclusive packet-number ranges.
 ///
 /// Stored largest-first because that is the order the QUIC ACK frame
 /// transmits ranges (RFC 9000 §19.3).
+///
+/// The number of ranges is capped at [`MAX_ACK_RANGES`]; see there for
+/// the DoS rationale.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct AckRanges {
     /// Disjoint inclusive ranges sorted descending by `start()`. The first
@@ -113,7 +129,19 @@ impl AckRanges {
             }
             (true, false) | (false, true) => {}
             (false, false) => {
+                if self.ranges.len() >= MAX_ACK_RANGES && insert_idx >= self.ranges.len() {
+                    // At capacity and the new range would become the
+                    // lowest one — it would be the first to be evicted,
+                    // so drop it outright rather than churn the vector.
+                    return;
+                }
                 self.ranges.insert(insert_idx, pn..=pn);
+                if self.ranges.len() > MAX_ACK_RANGES {
+                    // Evict the lowest/oldest range. The list is sorted
+                    // descending, so the last element holds the smallest
+                    // PNs — the least useful to keep ACKing.
+                    self.ranges.truncate(MAX_ACK_RANGES);
+                }
             }
         }
     }
@@ -322,5 +350,56 @@ mod tests {
         r.insert(5);
         r.insert(5);
         assert_eq!(r.ranges(), &[5..=5]);
+    }
+
+    #[test]
+    fn ackranges_capped_at_max() {
+        // Insert many gapped PNs (every other PN → each is its own
+        // range). The set must never exceed the cap.
+        let mut r = AckRanges::new();
+        for i in 0..(MAX_ACK_RANGES as u64 * 4) {
+            r.insert(i * 2);
+            assert!(
+                r.ranges().len() <= MAX_ACK_RANGES,
+                "range count must stay bounded"
+            );
+        }
+        assert_eq!(r.ranges().len(), MAX_ACK_RANGES);
+        // The largest PNs are retained; the smallest are evicted. The
+        // last inserted (highest) PN must still be present.
+        let highest = (MAX_ACK_RANGES as u64 * 4 - 1) * 2;
+        assert!(r.contains(highest), "highest PN retained");
+        // The very first (lowest) PN must have been evicted.
+        assert!(!r.contains(0), "lowest PN evicted once over the cap");
+        // The largest()-reported PN is the highest inserted.
+        assert_eq!(r.largest(), Some(highest));
+    }
+
+    #[test]
+    fn ackranges_cap_does_not_evict_when_coalescing() {
+        // Filling with adjacent PNs coalesces into a single range, so the
+        // cap is never hit no matter how many we insert.
+        let mut r = AckRanges::new();
+        for i in 0..(MAX_ACK_RANGES as u64 * 8) {
+            r.insert(i);
+        }
+        assert_eq!(r.ranges(), &[0..=(MAX_ACK_RANGES as u64 * 8 - 1)]);
+    }
+
+    #[test]
+    fn ackranges_low_new_range_dropped_at_capacity() {
+        // At capacity, a brand-new range *below* all existing ones is
+        // dropped outright (it would be the immediate eviction target).
+        let mut r = AckRanges::new();
+        // Fill with high, gapped ranges: 1000, 1002, 1004, ...
+        for i in 0..MAX_ACK_RANGES as u64 {
+            r.insert(1000 + i * 2);
+        }
+        assert_eq!(r.ranges().len(), MAX_ACK_RANGES);
+        let before = r.ranges().to_vec();
+        // A low PN cannot displace any retained higher range.
+        r.insert(0);
+        assert_eq!(r.ranges(), before.as_slice(), "low PN dropped at cap");
+        assert!(!r.contains(0));
     }
 }
