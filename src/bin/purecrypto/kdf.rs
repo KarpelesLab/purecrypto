@@ -12,6 +12,31 @@ use purecrypto::kdf::{
     kbkdf_counter, kbkdf_feedback, pbkdf2,
 };
 
+/// Cap on a single KDF output length: 1 GiB. Above this we refuse rather
+/// than `vec![0u8; len]` and OOM-abort on a garbage `-len`. Mirrors the
+/// `rand` subcommand's cap.
+const MAX_KDF_BYTES: usize = 1 << 30;
+
+/// Parses `-len N` and rejects an oversized request cleanly (instead of a
+/// later allocation abort). `extra_max`, when `Some`, applies a tighter
+/// algorithm-specific bound (HKDF's RFC 5869 `255 * HashLen` ceiling),
+/// reported as a clean error rather than the raw assert panic.
+fn parse_len_capped(args: &Args, extra_max: Option<usize>) -> usize {
+    let len = args
+        .value("-len")
+        .map(|s| parse_usize_flag(s, "-len"))
+        .unwrap_or_else(|| die("missing -len N"));
+    if len > MAX_KDF_BYTES {
+        die(format!("-len {len} exceeds the {MAX_KDF_BYTES}-byte cap"));
+    }
+    if let Some(m) = extra_max {
+        if len > m {
+            die(format!("-len {len} exceeds this KDF's maximum of {m} bytes"));
+        }
+    }
+    len
+}
+
 /// Resolves a password from either `-password STR` or `-password-file FILE`.
 /// `-password-file -` reads stdin's first line.
 fn read_password(args: &Args) -> Vec<u8> {
@@ -101,10 +126,16 @@ fn run_hkdf(args: Args) {
         .value("-info")
         .map(|h| parse_hex_flag(h, "-info"))
         .unwrap_or_default();
-    let len = args
-        .value("-len")
-        .map(|s| parse_usize_flag(s, "-len"))
-        .unwrap_or_else(|| die("missing -len N"));
+    // RFC 5869 caps HKDF output at `255 * HashLen`; `hkdf_expand` asserts
+    // this. Bound `-len` to that ceiling so an oversize request is a clean
+    // error rather than a raw panic.
+    let hkdf_max = match hash.to_ascii_lowercase().as_str() {
+        "sha256" => Some(255 * 32),
+        "sha384" => Some(255 * 48),
+        "sha512" => Some(255 * 64),
+        _ => die(format!("unsupported -hash for hkdf: {hash}")),
+    };
+    let len = parse_len_capped(&args, hkdf_max);
 
     let mut out = vec![0u8; len];
     match hash.to_ascii_lowercase().as_str() {
@@ -131,10 +162,7 @@ fn run_pbkdf2(args: Args) {
         .value("-iter")
         .map(|s| parse_u32_flag(s, "-iter"))
         .unwrap_or_else(|| die("missing -iter N"));
-    let len = args
-        .value("-len")
-        .map(|s| parse_usize_flag(s, "-len"))
-        .unwrap_or_else(|| die("missing -len N"));
+    let len = parse_len_capped(&args, None);
 
     let mut out = vec![0u8; len];
     match hash.to_ascii_lowercase().as_str() {
@@ -165,10 +193,7 @@ fn run_scrypt(args: Args) {
         .value("-p")
         .map(|s| parse_u32_flag(s, "-p"))
         .unwrap_or_else(|| die("missing -p N"));
-    let len = args
-        .value("-len")
-        .map(|s| parse_usize_flag(s, "-len"))
-        .unwrap_or_else(|| die("missing -len N"));
+    let len = parse_len_capped(&args, None);
 
     // -n is N, but the library takes log2(N). Validate that N is a power of two.
     if n == 0 || (n & (n - 1)) != 0 {
@@ -214,10 +239,7 @@ fn run_argon2(args: Args) {
         .or_else(|| args.value("--p"))
         .map(|s| parse_u32_flag(s, "-p"))
         .unwrap_or(1);
-    let len = args
-        .value("-len")
-        .map(|s| parse_usize_flag(s, "-len"))
-        .unwrap_or_else(|| die("missing -len N"));
+    let len = parse_len_capped(&args, None);
 
     let params = Argon2Params {
         t_cost,
@@ -283,10 +305,7 @@ fn run_kbkdf(args: Args) {
         .value("-iv")
         .map(|h| parse_hex_flag(h, "-iv"))
         .unwrap_or_default();
-    let len = args
-        .value("-len")
-        .map(|s| parse_usize_flag(s, "-len"))
-        .unwrap_or_else(|| die("missing -len N"));
+    let len = parse_len_capped(&args, None);
 
     // CMAC PRFs require an exactly-sized KI; reject early with a clear message
     // (the library would otherwise panic inside `Prf::init`).

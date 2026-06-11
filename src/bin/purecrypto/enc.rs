@@ -457,6 +457,13 @@ pub(crate) fn run(args: Args) {
                     zero_buf(&mut key);
                     die("missing -nonce HEX (12 bytes for GCM/ChaCha20-Poly1305)")
                 });
+            // An empty nonce is invalid for every AEAD here (AES-GCM
+            // would otherwise accept it; the FFI rejects it). Reject
+            // cleanly before touching the cipher.
+            if nonce.is_empty() {
+                zero_buf(&mut key);
+                die("-nonce must not be empty");
+            }
             if decrypt {
                 aead_decrypt(alg, &key, &nonce, &aad, &input)
             } else {
