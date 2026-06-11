@@ -2488,6 +2488,136 @@ mod loopback_tests {
         assert_eq!(server2.take_early_data(), payload);
     }
 
+    /// After the client's `EndOfEarlyData` rotates the server onto the
+    /// client-handshake read key (and zeroes the early-data budget), an
+    /// `ApplicationData` record arriving in `WaitClientFinished` — i.e.
+    /// before the client `Finished` is verified — MUST be rejected with
+    /// `unexpected_message`, not buffered into the regular receive path.
+    ///
+    /// The pre-`Connected` accept gate keys off the *live* early-data
+    /// condition (`early_data_remaining`), not the sticky `early_data_accepted`
+    /// flag, so this window is closed once EOED is processed.
+    #[test]
+    fn server_rejects_app_data_after_eoed_before_finished() {
+        use crate::tls::ContentType;
+        use crate::tls::codec::read_record;
+        use crate::tls::crypto::{AeadAlg, HashAlg, RecordCrypter, Secret};
+
+        // Phase 1: establish a resumable session that permits 0-RTT.
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x9eu8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"eoed-gap-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"eoed-gap-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        let session = client.take_session().expect("ticket");
+
+        // Phase 2: resume with 0-RTT. Drive only until the client emits its
+        // final flight (EndOfEarlyData + Finished) — do NOT hand that flight
+        // to the server yet.
+        let (server_config2, _cert2) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0x9eu8; 32])
+            .with_max_early_data(16384);
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-gap-c2", b"nonce", &[]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"eoed-gap-s2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(RootCertStore::new()).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+
+        client2.write_early_data(b"zero-rtt-bytes").unwrap();
+
+        // CH + early data → server flight → client processes it and queues
+        // its final flight.
+        let ch = client2.write_tls();
+        server2.read_tls(&ch);
+        server2.process_new_packets().unwrap();
+        let sflight = server2.write_tls();
+        client2.read_tls(&sflight);
+        client2.process_new_packets().unwrap();
+        assert!(client2.early_data_accepted(), "0-RTT accepted");
+
+        // The client's final flight: [EndOfEarlyData][Finished], each its own
+        // ApplicationData record. Split it at record boundaries.
+        let flight = client2.write_tls();
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut rest = flight.as_slice();
+        while let Some(rec) = read_record(rest).unwrap() {
+            records.push(rest[..rec.len].to_vec());
+            rest = &rest[rec.len..];
+        }
+        assert!(
+            records.len() >= 2,
+            "expected at least EOED + Finished records, got {}",
+            records.len()
+        );
+        // Feed every record up to (but excluding) the LAST one — the last is
+        // the client Finished. Everything before it (any middlebox CCS, then
+        // EndOfEarlyData) is processed normally and rotates the server onto
+        // the client-handshake read key with the early-data budget cleared.
+        let finished_idx = records.len() - 1;
+
+        // Forge an ApplicationData record encrypted under the SAME
+        // client-handshake key the server will install on EOED, at seq 0 —
+        // exactly where the server expects the client Finished.
+        let chts = client2
+            .client_handshake_traffic_secret()
+            .expect("client handshake secret");
+        let mut crypter =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &Secret::new(&chts));
+        let forged = crypter
+            .encrypt(ContentType::ApplicationData, b"smuggled-1rtt")
+            .expect("encrypt forged record");
+
+        // Feed everything up to the client Finished (rotates the server's
+        // read key and clears the early-data budget), then the forged
+        // ApplicationData record. The server must reject it.
+        for rec in &records[..finished_idx] {
+            server2.read_tls(rec);
+            server2.process_new_packets().unwrap();
+        }
+        server2.read_tls(&forged);
+        let err = server2.process_new_packets().unwrap_err();
+        assert!(
+            matches!(err, crate::tls::Error::UnexpectedMessage),
+            "app data after EOED before Finished must be rejected, got {err:?}"
+        );
+        // The connection is torn down: a fatal alert was emitted and the
+        // handshake never reaches `Connected`, so the application never
+        // obtains the smuggled plaintext through a usable connection.
+        assert!(!server2.write_tls().is_empty(), "fatal alert emitted");
+    }
+
     /// A PSK binder that's been tampered with: the server must reject with
     /// `decrypt_error` (RFC 8446 §4.2.11.2).
     #[test]
