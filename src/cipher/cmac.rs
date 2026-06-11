@@ -134,15 +134,18 @@ impl<C: BlockCipher> Cmac<C> {
 
     /// Consumes the MAC and checks it against `expected` in constant time.
     ///
-    /// Returns `true` iff the recomputed tag (truncated to `expected.len()`)
-    /// equals `expected`. The comparison time depends only on the (public) tag
-    /// length, not on where any mismatch occurs.
+    /// Returns `true` iff `expected` is a full 16-byte tag equal to the
+    /// recomputed tag. Truncated tags (including the empty slice) are rejected
+    /// unconditionally: accepting a short `n`-byte prefix would drop forgery
+    /// resistance to `2^(8n)`, and an empty tag would be an unconditional
+    /// accept. The comparison time of the full-length path depends only on the
+    /// (public) tag length, not on where any mismatch occurs.
     pub fn verify(self, expected: &[u8]) -> bool {
-        if expected.len() > 16 {
+        if expected.len() != 16 {
             return false;
         }
         let tag = self.finalize();
-        bool::from(tag[..expected.len()].ct_eq(expected))
+        bool::from(tag[..].ct_eq(expected))
     }
 }
 
@@ -313,8 +316,11 @@ mod tests {
         };
         let tag = make().finalize();
         assert!(make().verify(&tag));
-        // Truncated tag also verifies against its prefix.
-        assert!(make().verify(&tag[..8]));
+        // Truncated tags are rejected: only a full 16-byte tag can verify.
+        // Accepting a prefix would drop forgery resistance to 2^(8n), and an
+        // empty tag would be an unconditional accept.
+        assert!(!make().verify(&tag[..8]));
+        assert!(!make().verify(b""));
         let mut bad = tag;
         bad[0] ^= 1;
         assert!(!make().verify(&bad));
