@@ -45,9 +45,7 @@ fn xof(alg: &str, data: &[u8], len: usize, custom: &[u8]) -> Option<Vec<u8>> {
     // `rand` subcommand's cap.
     const MAX_XOF_BYTES: usize = 1 << 30;
     if len > MAX_XOF_BYTES {
-        die(format!(
-            "-len {len} exceeds the {MAX_XOF_BYTES}-byte cap"
-        ));
+        die(format!("-len {len} exceeds the {MAX_XOF_BYTES}-byte cap"));
     }
     let mut out = vec![0u8; len];
     match alg.to_ascii_lowercase().as_str() {
