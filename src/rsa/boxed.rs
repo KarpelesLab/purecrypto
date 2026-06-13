@@ -537,8 +537,8 @@ impl BoxedRsaPublicKey {
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
-        let n = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let e = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
+        let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let e = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
         seq.finish()?;
         reader.finish()?;
         let bits = n.bit_len();
@@ -628,14 +628,14 @@ impl BoxedRsaPrivateKey {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
         let _version = seq.read_integer_bytes()?;
-        let n = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let e = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let d = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let p = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let q = BoxedUint::from_be_bytes(seq.read_integer_bytes()?);
-        let _dp = seq.read_integer_bytes()?;
-        let _dq = seq.read_integer_bytes()?;
-        let _qinv = seq.read_integer_bytes()?;
+        let n = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let e = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let d = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let p = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let q = BoxedUint::from_be_bytes(seq.read_unsigned_integer_bytes()?);
+        let _dp = seq.read_unsigned_integer_bytes()?;
+        let _dq = seq.read_unsigned_integer_bytes()?;
+        let _qinv = seq.read_unsigned_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
         let bits = n.bit_len();

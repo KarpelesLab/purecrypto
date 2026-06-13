@@ -126,8 +126,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
-        let n = int_to_uint(seq.read_integer_bytes()?)?;
-        let e = int_to_uint(seq.read_integer_bytes()?)?;
+        let n = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let e = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
         seq.finish()?;
         reader.finish()?;
         if n.bit_len() < super::boxed::MIN_RSA_BITS {
@@ -237,14 +237,14 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
         let _version = seq.read_integer_bytes()?;
-        let n = int_to_uint(seq.read_integer_bytes()?)?;
-        let e = int_to_uint(seq.read_integer_bytes()?)?;
-        let d = int_to_uint(seq.read_integer_bytes()?)?;
-        let p = int_to_uint(seq.read_integer_bytes()?)?;
-        let q = int_to_uint(seq.read_integer_bytes()?)?;
-        let _dp = seq.read_integer_bytes()?;
-        let _dq = seq.read_integer_bytes()?;
-        let _qinv = seq.read_integer_bytes()?;
+        let n = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let e = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let d = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let p = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let q = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
+        let _dp = seq.read_unsigned_integer_bytes()?;
+        let _dq = seq.read_unsigned_integer_bytes()?;
+        let _qinv = seq.read_unsigned_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
         validate_public_exponent(&n, &e)?;
