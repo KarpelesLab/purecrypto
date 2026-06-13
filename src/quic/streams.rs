@@ -699,11 +699,12 @@ impl Streams {
     /// Inbound STOP_SENDING. RFC 9000 §3.5: triggers us to RESET_STREAM
     /// our own send side with the same application error code.
     pub(crate) fn on_stop_sending(&mut self, id: u64, app_error: u64) -> Result<(), Error> {
+        // RFC 9000 §19.5: receiving STOP_SENDING for a receive-only stream
+        // is a STREAM_STATE_ERROR.
         let stream = self.map.get_mut(&id).ok_or(Error::InappropriateState)?;
-        if let Some(send) = stream.send.as_mut() {
-            send.enter_reset(app_error);
-            self.enqueue_ready(id);
-        }
+        let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
+        send.enter_reset(app_error);
+        self.enqueue_ready(id);
         Ok(())
     }
 
