@@ -1589,6 +1589,7 @@ impl ClientConnection {
                         self.state = State::Closed;
                         return Ok(());
                     }
+                    self.state = State::Closed;
                     return Err(Error::AlertReceived(alert.description));
                 }
                 Ok(None) => return Ok(()),
