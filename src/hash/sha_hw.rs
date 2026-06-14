@@ -24,14 +24,27 @@ pub(super) fn sha256_supported() -> bool {
 
 /// SHA-256 compression of one 64-byte block, dispatched to the active backend.
 pub(super) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+    compress256_blocks(h, block);
+}
+
+/// SHA-256 compression of `data` (a whole number of 64-byte blocks), dispatched
+/// to the active backend. The backend loads the hash state into registers once
+/// and keeps it there across every block, so a single multi-block call avoids
+/// the per-block state spill/reload and dispatch overhead that repeated
+/// [`compress256`] calls incur — a measurable throughput win on bulk input.
+pub(super) fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
+    debug_assert!(data.len().is_multiple_of(64));
+    if data.is_empty() {
+        return;
+    }
     // SAFETY: only called after `sha256_supported()` confirmed the features.
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        x86::compress256(h, block)
+        x86::compress256_blocks(h, data)
     }
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        arm::compress256(h, block)
+        arm::compress256_blocks(h, data)
     }
 }
 
@@ -57,11 +70,14 @@ mod x86 {
     use crate::hash::sha256::K256;
     use core::arch::x86_64::*;
 
-    /// SHA-NI single-block compression. Structured as a 16-group loop driven by
-    /// `g % 4` so the message-schedule rotation is computed, not transcribed —
-    /// the standard `sha256rnds2` / `sha256msg1` / `sha256msg2` sequence.
+    /// SHA-NI multi-block compression. The state is loaded into the ABEF / CDGH
+    /// register layout once and kept there across every 64-byte block (only the
+    /// per-block Davies–Meyer feed-forward touches it), so an N-block call pays
+    /// the state load/store exactly once instead of N times. Each block runs the
+    /// standard 16-group `sha256rnds2` / `sha256msg1` / `sha256msg2` sequence,
+    /// with the schedule rotation computed from `g % 4`.
     #[target_feature(enable = "sha,sse2,ssse3,sse4.1")]
-    pub(super) unsafe fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
+    pub(super) unsafe fn compress256_blocks(state: &mut [u32; 8], data: &[u8]) {
         unsafe {
             // Per-32-bit-word byte-reverse mask (block words are big-endian).
             let mask = _mm_set_epi64x(
@@ -69,61 +85,59 @@ mod x86 {
                 0x0405_0607_0001_0203u64 as i64,
             );
 
-            // Load and rearrange the state into the SHA-NI ABEF / CDGH layout.
+            // Load and rearrange the state into the SHA-NI ABEF / CDGH layout
+            // once; it stays resident in `state0` / `state1` across all blocks.
             let tmp0 = _mm_loadu_si128(state.as_ptr() as *const __m128i); // a b c d
             let s1_0 = _mm_loadu_si128(state.as_ptr().add(4) as *const __m128i); // e f g h
             let tmp = _mm_shuffle_epi32(tmp0, 0xB1); // c d a b
             let s1 = _mm_shuffle_epi32(s1_0, 0x1B); // h g f e
             let mut state0 = _mm_alignr_epi8(tmp, s1, 8); // ABEF
             let mut state1 = _mm_blend_epi16(s1, tmp, 0xF0); // CDGH
-            let abef_save = state0;
-            let cdgh_save = state1;
-
-            // Load the four message vectors (16 bytes each), byte-reversed.
-            let mut m = [
-                _mm_shuffle_epi8(_mm_loadu_si128(block.as_ptr() as *const __m128i), mask),
-                _mm_shuffle_epi8(
-                    _mm_loadu_si128(block.as_ptr().add(16) as *const __m128i),
-                    mask,
-                ),
-                _mm_shuffle_epi8(
-                    _mm_loadu_si128(block.as_ptr().add(32) as *const __m128i),
-                    mask,
-                ),
-                _mm_shuffle_epi8(
-                    _mm_loadu_si128(block.as_ptr().add(48) as *const __m128i),
-                    mask,
-                ),
-            ];
 
             let kptr = K256.as_ptr();
-            for g in 0..16usize {
-                let i = g % 4;
-                // Round constants K[4g..4g+4] line up with the message lanes.
-                let mut msg =
-                    _mm_add_epi32(m[i], _mm_loadu_si128(kptr.add(4 * g) as *const __m128i));
-                state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+            let base = data.as_ptr();
+            let nblocks = data.len() / 64;
+            for blk in 0..nblocks {
+                let bptr = base.add(blk * 64);
+                let abef_save = state0;
+                let cdgh_save = state1;
 
-                // Message schedule (sha256msg2 half): groups 3..=14.
-                if (3..=14).contains(&g) {
-                    let tmp = _mm_alignr_epi8(m[i], m[(i + 3) % 4], 4);
-                    m[(i + 1) % 4] = _mm_add_epi32(m[(i + 1) % 4], tmp);
-                    m[(i + 1) % 4] = _mm_sha256msg2_epu32(m[(i + 1) % 4], m[i]);
+                // Load the four message vectors (16 bytes each), byte-reversed.
+                let mut m = [
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr as *const __m128i), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(16) as *const __m128i), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(32) as *const __m128i), mask),
+                    _mm_shuffle_epi8(_mm_loadu_si128(bptr.add(48) as *const __m128i), mask),
+                ];
+
+                for g in 0..16usize {
+                    let i = g % 4;
+                    // Round constants K[4g..4g+4] line up with the message lanes.
+                    let mut msg =
+                        _mm_add_epi32(m[i], _mm_loadu_si128(kptr.add(4 * g) as *const __m128i));
+                    state1 = _mm_sha256rnds2_epu32(state1, state0, msg);
+
+                    // Message schedule (sha256msg2 half): groups 3..=14.
+                    if (3..=14).contains(&g) {
+                        let tmp = _mm_alignr_epi8(m[i], m[(i + 3) % 4], 4);
+                        m[(i + 1) % 4] = _mm_add_epi32(m[(i + 1) % 4], tmp);
+                        m[(i + 1) % 4] = _mm_sha256msg2_epu32(m[(i + 1) % 4], m[i]);
+                    }
+
+                    msg = _mm_shuffle_epi32(msg, 0x0E);
+                    state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
+
+                    // Message schedule (sha256msg1 half): groups 1..=12.
+                    if (1..=12).contains(&g) {
+                        m[(i + 3) % 4] = _mm_sha256msg1_epu32(m[(i + 3) % 4], m[i]);
+                    }
                 }
 
-                msg = _mm_shuffle_epi32(msg, 0x0E);
-                state0 = _mm_sha256rnds2_epu32(state0, state1, msg);
-
-                // Message schedule (sha256msg1 half): groups 1..=12.
-                if (1..=12).contains(&g) {
-                    m[(i + 3) % 4] = _mm_sha256msg1_epu32(m[(i + 3) % 4], m[i]);
-                }
+                state0 = _mm_add_epi32(state0, abef_save);
+                state1 = _mm_add_epi32(state1, cdgh_save);
             }
 
-            state0 = _mm_add_epi32(state0, abef_save);
-            state1 = _mm_add_epi32(state1, cdgh_save);
-
-            // Un-shuffle ABEF / CDGH back to a..h and store.
+            // Un-shuffle ABEF / CDGH back to a..h and store once.
             let tmp = _mm_shuffle_epi32(state0, 0x1B); // FEBA
             let s1 = _mm_shuffle_epi32(state1, 0xB1); // DCHG
             let out0 = _mm_blend_epi16(tmp, s1, 0xF0); // DCBA
@@ -140,39 +154,47 @@ mod arm {
     use crate::hash::sha512::K512;
     use core::arch::aarch64::*;
 
-    /// SHA-256 compression of one 64-byte block using the ARMv8 `sha2`
-    /// extension. State is `abcd`/`efgh`; messages are byte-reversed per 32-bit
-    /// word. A 16-group loop keyed on `g % 4` evolves the schedule with
-    /// `sha256su0`/`sha256su1` (the round key uses the pre-update message words).
+    /// SHA-256 multi-block compression using the ARMv8 `sha2` extension. State
+    /// (`abcd`/`efgh`) is loaded once and kept in registers across every block;
+    /// messages are byte-reversed per 32-bit word. Each block runs a 16-group
+    /// loop keyed on `g % 4`, evolving the schedule with `sha256su0`/`sha256su1`
+    /// (the round key uses the pre-update message words).
     #[target_feature(enable = "sha2")]
-    pub(super) unsafe fn compress256(state: &mut [u32; 8], block: &[u8; 64]) {
+    pub(super) unsafe fn compress256_blocks(state: &mut [u32; 8], data: &[u8]) {
         unsafe {
             let mut abcd = vld1q_u32(state.as_ptr());
             let mut efgh = vld1q_u32(state.as_ptr().add(4));
-            let abcd0 = abcd;
-            let efgh0 = efgh;
-            let mut m = [
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr()))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(16)))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(32)))),
-                vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(48)))),
-            ];
-            for g in 0..16usize {
-                let i = g % 4;
-                let wk = vaddq_u32(m[i], vld1q_u32(K256.as_ptr().add(4 * g)));
-                if g < 12 {
-                    m[i] = vsha256su1q_u32(
-                        vsha256su0q_u32(m[i], m[(i + 1) % 4]),
-                        m[(i + 2) % 4],
-                        m[(i + 3) % 4],
-                    );
+            let base = data.as_ptr();
+            let nblocks = data.len() / 64;
+            for blk in 0..nblocks {
+                let bptr = base.add(blk * 64);
+                let abcd0 = abcd;
+                let efgh0 = efgh;
+                let mut m = [
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(16)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(32)))),
+                    vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(bptr.add(48)))),
+                ];
+                for g in 0..16usize {
+                    let i = g % 4;
+                    let wk = vaddq_u32(m[i], vld1q_u32(K256.as_ptr().add(4 * g)));
+                    if g < 12 {
+                        m[i] = vsha256su1q_u32(
+                            vsha256su0q_u32(m[i], m[(i + 1) % 4]),
+                            m[(i + 2) % 4],
+                            m[(i + 3) % 4],
+                        );
+                    }
+                    let tmp = abcd;
+                    abcd = vsha256hq_u32(abcd, efgh, wk);
+                    efgh = vsha256h2q_u32(efgh, tmp, wk);
                 }
-                let tmp = abcd;
-                abcd = vsha256hq_u32(abcd, efgh, wk);
-                efgh = vsha256h2q_u32(efgh, tmp, wk);
+                abcd = vaddq_u32(abcd, abcd0);
+                efgh = vaddq_u32(efgh, efgh0);
             }
-            vst1q_u32(state.as_mut_ptr(), vaddq_u32(abcd, abcd0));
-            vst1q_u32(state.as_mut_ptr().add(4), vaddq_u32(efgh, efgh0));
+            vst1q_u32(state.as_mut_ptr(), abcd);
+            vst1q_u32(state.as_mut_ptr().add(4), efgh);
         }
     }
 

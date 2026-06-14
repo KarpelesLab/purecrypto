@@ -133,11 +133,12 @@ impl State256 {
             }
         }
 
-        // Compress full blocks straight from the input.
-        while data.len() >= 64 {
-            let block: &[u8; 64] = data[..64].try_into().unwrap();
-            compress256(&mut self.h, block);
-            data = &data[64..];
+        // Compress all full blocks straight from the input in one call, so the
+        // hardware backend keeps the state register-resident across them.
+        let full = data.len() & !63;
+        if full > 0 {
+            compress256_blocks(&mut self.h, &data[..full]);
+            data = &data[full..];
         }
 
         // Stash the remainder.
@@ -210,6 +211,25 @@ fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
         return;
     }
     compress256_soft(h, block);
+}
+
+/// Compresses `data` (a whole number of 64-byte blocks) into the state.
+///
+/// Dispatches the entire run to the hardware backend in a single call when
+/// available — the backend keeps the state in registers across all blocks,
+/// avoiding the per-block spill/reload of repeated [`compress256`] calls — and
+/// otherwise loops the software compression.
+#[inline]
+fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
+    debug_assert!(data.len().is_multiple_of(64));
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if super::sha_hw::sha256_supported() {
+        super::sha_hw::compress256_blocks(h, data);
+        return;
+    }
+    for block in data.chunks_exact(64) {
+        compress256_soft(h, block.try_into().unwrap());
+    }
 }
 
 /// Portable software SHA-256 compression (the constant-time fallback).
@@ -414,6 +434,28 @@ mod tests {
             super::super::sha_hw::compress256(&mut b, &block);
             assert_eq!(a, b, "HW/soft mismatch");
         }
+        // Multi-block kernel: the register-resident `compress256_blocks` over a
+        // run of N blocks must equal looping `compress256_soft` block-by-block,
+        // from an arbitrary (non-IV) start state. Directly pins the cross-block
+        // Davies-Meyer feed-forward in the multi-block path.
+        for nblocks in [1usize, 2, 5, 16] {
+            let mut start = H256;
+            for v in start.iter_mut() {
+                *v ^= next() as u32;
+            }
+            let mut blocks = alloc::vec![0u8; nblocks * 64];
+            for b in blocks.iter_mut() {
+                *b = (next() >> 24) as u8;
+            }
+            let mut h_hw = start;
+            super::super::sha_hw::compress256_blocks(&mut h_hw, &blocks);
+            let mut h_sw = start;
+            for chunk in blocks.chunks_exact(64) {
+                compress256_soft(&mut h_sw, chunk.try_into().unwrap());
+            }
+            assert_eq!(h_hw, h_sw, "multi-block HW/soft mismatch (n={nblocks})");
+        }
+
         // Multi-block consistency through the public API vs a forced-software
         // recomputation: the dispatcher (HW here) must equal the soft digest.
         let data: alloc::vec::Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
