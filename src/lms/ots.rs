@@ -102,7 +102,23 @@ pub(crate) fn derive_c(i_id: &[u8; 16], seed: &[u8; N], q: u32, message: &[u8]) 
 
 /// Computes the LM-OTS public key `K` for leaf `q` from the master `seed`
 /// (RFC 8554 §4.3, Algorithm 1, with the Appendix A private-element derivation).
+///
+/// On x86_64 with AVX2 this dispatches to a multi-buffer SHA-256 batcher
+/// ([`lmots_x8::public_key_x8`]) that evaluates the `p` Winternitz chains eight
+/// at a time; the scalar [`public_key_scalar`] is the fallback and the
+/// reference for the differential test.
 pub(crate) fn public_key(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if crate::hash::sha256_mb::supported() {
+        return lmots_x8::public_key_x8(t, i_id, seed, q);
+    }
+    public_key_scalar(t, i_id, seed, q)
+}
+
+/// Scalar reference implementation of [`public_key`]: runs each of the `p`
+/// Winternitz chains over its full `0..max` range one at a time, then folds the
+/// chain outputs into `K = H(I ‖ q ‖ D_PBLC ‖ K_0 ‖ … ‖ K_{p-1})`.
+pub(crate) fn public_key_scalar(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
     let p = t.p();
     let max = t.max_digit();
     let mut k_hash = Sha256::new();
@@ -118,6 +134,149 @@ pub(crate) fn public_key(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) 
         k_hash.update(&tmp);
     }
     k_hash.finalize()
+}
+
+/// Multi-buffer batcher for [`public_key`]: evaluates the LM-OTS Winternitz
+/// chains eight at a time through the AVX2 multi-buffer SHA-256 kernel.
+///
+/// Every chain runs the full `0..max` range in lockstep, so all eight lanes
+/// share the same `j` schedule. Each `derive_x` / `chain_step` is a single
+/// 55-byte (one-block) SHA-256 message; the layouts here are byte-for-byte the
+/// scalar [`derive_x`] / [`chain_step`] in this module. The final
+/// `K = H(I ‖ q ‖ D_PBLC ‖ K_0 ‖ … ‖ K_{p-1})` stays scalar and absorbs the
+/// chain outputs in strict order `0..p`.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod lmots_x8 {
+    use super::{D_PBLC, LmotsType, N};
+    use crate::hash::sha256::H256;
+    use crate::hash::sha256_mb::{LANES, compress8};
+    use crate::hash::{Digest, Sha256};
+
+    /// Builds the single padded SHA-256 block for a 55-byte LM-OTS message
+    /// `I(16) ‖ u32be(q) ‖ u16be(chain) ‖ byte22 ‖ tail(32)`. `byte22` is `0xff`
+    /// for `derive_x` and the chain index `j` for `chain_step`.
+    #[inline]
+    fn block55(i_id: &[u8; 16], q: u32, chain: u16, byte22: u8, tail: &[u8; N]) -> [u8; 64] {
+        let mut b = [0u8; 64];
+        b[..16].copy_from_slice(i_id);
+        b[16..20].copy_from_slice(&q.to_be_bytes());
+        b[20..22].copy_from_slice(&chain.to_be_bytes());
+        b[22] = byte22;
+        b[23..55].copy_from_slice(tail);
+        b[55] = 0x80;
+        // Message length in bits: 55 * 8 = 440.
+        b[56..64].copy_from_slice(&440u64.to_be_bytes());
+        b
+    }
+
+    /// Big-endian serialization of a SHA-256 state into its 32-byte digest.
+    #[inline]
+    fn state_be(s: &[u32; 8]) -> [u8; N] {
+        let mut o = [0u8; N];
+        for (i, w) in s.iter().enumerate() {
+            o[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        o
+    }
+
+    /// Computes the LM-OTS public key `K` for leaf `q`, batching the `p`
+    /// Winternitz chains eight at a time. Equivalent to [`super::public_key_scalar`].
+    pub(super) fn public_key_x8(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
+        let p = t.p();
+        let max = t.max_digit();
+
+        let mut k_hash = Sha256::new();
+        k_hash.update(i_id);
+        k_hash.update(&q.to_be_bytes());
+        k_hash.update(&D_PBLC.to_be_bytes());
+
+        let mut c0 = 0usize;
+        while c0 < p {
+            let lanes = (p - c0).min(LANES);
+
+            // derive_x for the eight lanes. Lanes beyond `lanes` duplicate the
+            // first chain of the group so compress8 stays in bounds; their
+            // outputs are never consumed.
+            let mut blocks = [[0u8; 64]; LANES];
+            for (l, blk) in blocks.iter_mut().enumerate() {
+                let chain = if l < lanes { c0 + l } else { c0 };
+                *blk = block55(i_id, q, chain as u16, 0xff, seed);
+            }
+            let mut states = [H256; LANES];
+            compress8(&mut states, &blocks);
+            let mut tmps = [[0u8; N]; LANES];
+            for (l, tmp) in tmps.iter_mut().enumerate() {
+                *tmp = state_be(&states[l]);
+            }
+
+            // Run the chains in lockstep over the full 0..max range.
+            for j in 0..max {
+                let mut blocks = [[0u8; 64]; LANES];
+                for (l, blk) in blocks.iter_mut().enumerate() {
+                    let chain = if l < lanes { c0 + l } else { c0 };
+                    *blk = block55(i_id, q, chain as u16, j as u8, &tmps[l]);
+                }
+                let mut states = [H256; LANES];
+                compress8(&mut states, &blocks);
+                for (l, tmp) in tmps.iter_mut().enumerate() {
+                    *tmp = state_be(&states[l]);
+                }
+            }
+
+            // Absorb the valid lanes' chain outputs into K in chain order.
+            for tmp in tmps.iter().take(lanes) {
+                k_hash.update(tmp);
+            }
+            c0 += lanes;
+        }
+
+        k_hash.finalize()
+    }
+}
+
+/// Differential test: the AVX2 multi-buffer batcher must reproduce the scalar
+/// public key byte-for-byte across LM-OTS parameter sets and random inputs.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+mod lmots_x8_tests {
+    use super::{LmotsType, N, lmots_x8, public_key_scalar};
+
+    #[test]
+    fn batched_matches_scalar() {
+        if !crate::hash::sha256_mb::supported() {
+            return;
+        }
+        // Cheap xorshift PRNG for random-but-deterministic I/seed/q.
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        // Include the w=8 default and one other set (w=4); cover w=1/w=2 too.
+        let types = [
+            LmotsType::Sha256N32W8,
+            LmotsType::Sha256N32W4,
+            LmotsType::Sha256N32W2,
+            LmotsType::Sha256N32W1,
+        ];
+        for t in types {
+            for _ in 0..8 {
+                let mut i_id = [0u8; 16];
+                for b in i_id.iter_mut() {
+                    *b = (next() >> 24) as u8;
+                }
+                let mut seed = [0u8; N];
+                for b in seed.iter_mut() {
+                    *b = (next() >> 24) as u8;
+                }
+                let q = next() as u32;
+                let want = public_key_scalar(t, &i_id, &seed, q);
+                let got = lmots_x8::public_key_x8(t, &i_id, &seed, q);
+                assert_eq!(got, want, "type {t:?}, q={q}");
+            }
+        }
+    }
 }
 
 /// Generates an LM-OTS signature into `out` (RFC 8554 §4.5, Algorithm 3).
