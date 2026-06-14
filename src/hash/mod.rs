@@ -31,6 +31,8 @@
 
 mod blake2;
 mod blake3;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod blake3_simd;
 mod block;
 mod hmac;
 mod k12;

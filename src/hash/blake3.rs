@@ -9,17 +9,18 @@ use super::{Digest, ExtendableOutput, XofReader};
 
 const OUT_LEN: usize = 32;
 const BLOCK_LEN: usize = 64;
-const CHUNK_LEN: usize = 1024;
+// `pub(super)` items are shared with the SIMD backend in `super::blake3_simd`.
+pub(super) const CHUNK_LEN: usize = 1024;
 
-const CHUNK_START: u32 = 1 << 0;
-const CHUNK_END: u32 = 1 << 1;
+pub(super) const CHUNK_START: u32 = 1 << 0;
+pub(super) const CHUNK_END: u32 = 1 << 1;
 const PARENT: u32 = 1 << 2;
 const ROOT: u32 = 1 << 3;
 const KEYED_HASH: u32 = 1 << 4;
 const DERIVE_KEY_CONTEXT: u32 = 1 << 5;
 const DERIVE_KEY_MATERIAL: u32 = 1 << 6;
 
-const IV: [u32; 8] = [
+pub(super) const IV: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,
     0x3c6e_f372,
@@ -30,7 +31,8 @@ const IV: [u32; 8] = [
     0x5be0_cd19,
 ];
 
-const MSG_PERMUTATION: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
+pub(super) const MSG_PERMUTATION: [usize; 16] =
+    [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
 #[inline]
 fn g(state: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize, mx: u32, my: u32) {
@@ -314,6 +316,30 @@ impl Blake3 {
 
     /// Feeds input.
     pub fn update(&mut self, mut input: &[u8]) {
+        // SIMD fast path: on a fresh chunk boundary with more than `DEGREE` full
+        // chunks still ahead (the strict `>` keeps at least one byte, so none of
+        // the batched chunks can be the final/root chunk), hash `DEGREE` chunks
+        // at once and feed their chaining values into the tree. The scalar loop
+        // below owns the last — possibly partial, possibly root — chunk.
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        {
+            use super::blake3_simd::{DEGREE, hash_chunks8, supported};
+            const BULK: usize = DEGREE * CHUNK_LEN;
+            if supported() {
+                while self.chunk_state.len() == 0 && input.len() > BULK {
+                    let base = self.chunk_state.chunk_counter;
+                    let cvs = hash_chunks8(&input[..BULK], &self.key, base, self.flags);
+                    for (k, cv) in cvs.iter().enumerate() {
+                        self.add_chunk_cv(*cv, base + k as u64 + 1);
+                    }
+                    // The batched chunks are absorbed directly; advance the
+                    // (still-empty) chunk_state to the next chunk index.
+                    self.chunk_state.chunk_counter = base + DEGREE as u64;
+                    input = &input[BULK..];
+                }
+            }
+        }
+
         while !input.is_empty() {
             if self.chunk_state.len() == CHUNK_LEN {
                 let chunk_cv = self.chunk_state.output().chaining_value();
@@ -578,5 +604,91 @@ mod tests {
         h.update(&buf[1024..1025]);
         h.update(&buf[1025..]);
         assert_eq!(h.finalize(), oneshot);
+    }
+
+    /// Deterministic xorshift byte generator for the SIMD differential tests.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    fn xorshift(seed: u64) -> impl FnMut() -> u8 {
+        let mut s = seed | 1;
+        move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 24) as u8
+        }
+    }
+
+    /// The AVX2 8-way chunk kernel must produce, for every lane, exactly the
+    /// chaining value the scalar `ChunkState` produces for that chunk — across
+    /// random data, several counter bases, and every keying mode.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn simd_chunk_kernel_matches_scalar() {
+        use super::super::blake3_simd::{hash_chunks8, supported};
+        if !supported() {
+            return;
+        }
+        let mut next = xorshift(0x1234_5678_9abc_def0);
+        let mut key = [0u32; 8];
+        for w in key.iter_mut() {
+            *w = u32::from_le_bytes([next(), next(), next(), next()]);
+        }
+
+        for &(k, flags) in &[(IV, 0u32), (key, KEYED_HASH), (key, DERIVE_KEY_MATERIAL)] {
+            for &base in &[0u64, 1, 7, 8, 1_000_000, (1u64 << 32) - 3] {
+                let mut buf = alloc::vec![0u8; 8 * CHUNK_LEN];
+                for b in buf.iter_mut() {
+                    *b = next();
+                }
+                let simd = hash_chunks8(&buf, &k, base, flags);
+                for (lane, got) in simd.iter().enumerate() {
+                    let mut cs = ChunkState::new(k, base + lane as u64, flags);
+                    cs.update(&buf[lane * CHUNK_LEN..(lane + 1) * CHUNK_LEN]);
+                    let want = cs.output().chaining_value();
+                    assert_eq!(*got, want, "lane {lane}, base {base}, flags {flags}");
+                }
+            }
+        }
+    }
+
+    /// End-to-end: hashing a large buffer through the public API (which takes
+    /// the SIMD bulk path for inputs above 8 chunks) must equal feeding the same
+    /// bytes in sub-8-KiB pieces (which never triggers the bulk path), for every
+    /// hasher mode. Validates the bulk-path counter / tree-merge integration on
+    /// top of the kernel.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn simd_bulk_matches_scalar_end_to_end() {
+        use super::super::blake3_simd::supported;
+        if !supported() {
+            return;
+        }
+        // Sizes around chunk-batch boundaries plus a large value, including a
+        // partial trailing chunk.
+        for &n in &[8 * CHUNK_LEN + 1, 24 * CHUNK_LEN + 5, 97 * CHUNK_LEN + 672] {
+            let mut buf = alloc::vec![0u8; n];
+            fill_input(&mut buf);
+
+            #[allow(clippy::type_complexity)]
+            let mk: [(fn() -> Blake3, &str); 3] = [
+                (|| Blake3::new(), "hash"),
+                (|| Blake3::new_keyed(KEY), "keyed"),
+                (|| Blake3::new_derive_key(CONTEXT), "derive"),
+            ];
+            for (ctor, name) in mk {
+                // Bulk path (single update of the whole buffer).
+                let mut a = ctor();
+                a.update(&buf);
+                let simd = a.finalize();
+                // Scalar reference: feed in 4000-byte pieces (< 8 KiB each, so
+                // the bulk fast path never fires on a fresh chunk boundary).
+                let mut b = ctor();
+                for piece in buf.chunks(4000) {
+                    b.update(piece);
+                }
+                let scalar = b.finalize();
+                assert_eq!(simd, scalar, "mode {name}, n {n}");
+            }
+        }
     }
 }
