@@ -3,7 +3,7 @@
 use super::Digest;
 
 /// SHA-256 initial hash value.
-const H256: [u32; 8] = [
+pub(crate) const H256: [u32; 8] = [
     0x6a09_e667,
     0xbb67_ae85,
     0x3c6e_f372,
@@ -234,7 +234,7 @@ fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
 
 /// Portable software SHA-256 compression (the constant-time fallback).
 #[inline]
-fn compress256_soft(h: &mut [u32; 8], block: &[u8; 64]) {
+pub(crate) fn compress256_soft(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
     for (word, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
         *word = u32::from_be_bytes(chunk.try_into().unwrap());

@@ -42,7 +42,9 @@ mod md4;
 mod md5;
 mod ripemd160;
 mod sha1;
-mod sha256;
+pub(crate) mod sha256;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) mod sha256_mb;
 mod sha3;
 mod sha512;
 #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
