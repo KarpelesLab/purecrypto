@@ -597,7 +597,12 @@ pub(crate) fn parse_client_pre_shared_key(body: &[u8]) -> Result<ClientPsk, Erro
     let mut binders = Vec::new();
     while !bin_cur.is_empty() {
         let b = bin_cur.vec_u8()?.to_vec();
-        if b.len() < 32 {
+        // RFC 8446 §4.2.11.2: a binder is HMAC output sized to the PSK's hash.
+        // TLS 1.3 only defines SHA-256 (32) and SHA-384 (48) cipher suites, so
+        // any other length is malformed — reject it here rather than at the
+        // later constant-time binder comparison (which already enforces an
+        // exact match against the negotiated hash length).
+        if b.len() != 32 && b.len() != 48 {
             return Err(Error::IllegalParameter);
         }
         binders.push(b);
