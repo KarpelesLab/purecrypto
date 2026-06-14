@@ -268,9 +268,30 @@ impl BoxedRsaPublicKey {
         emsa::verify_pkcs1v15_raw(self, t, sig)
     }
 
-    /// Verifies an RSA-PSS signature over `msg`, hashing with `D`.
+    /// Verifies an RSA-PSS signature over `msg`, hashing with `D` and
+    /// requiring the salt length to equal `D`'s output length (the strict
+    /// TLS 1.3 / X.509 profile).
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
         emsa::verify_pss::<D, _>(self, msg, sig)
+    }
+
+    /// Verifies an RSA-PSS signature over `msg`, requiring the salt to be
+    /// exactly `salt_len` octets.
+    pub fn verify_pss_with_salt_len<D: Digest>(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        salt_len: usize,
+    ) -> Result<(), Error> {
+        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len)
+    }
+
+    /// Verifies an RSA-PSS signature over `msg`, recovering the salt length
+    /// from the encoded message (accepts any valid salt length). Use this for
+    /// interop with signers that do not use the salt-length == digest-length
+    /// profile.
+    pub fn verify_pss_any_salt<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
+        emsa::verify_pss_any_salt::<D, _>(self, msg, sig)
     }
 
     /// Encrypts `msg` with PKCS#1 v1.5.
@@ -412,13 +433,26 @@ impl BoxedRsaPrivateKey {
         emsa::sign_pkcs1v15_raw(self, t)
     }
 
-    /// Signs `msg` with RSA-PSS, hashing with `D`.
+    /// Signs `msg` with RSA-PSS, hashing with `D` and a salt of `D`'s output
+    /// length (the TLS 1.3 / X.509 profile).
     pub fn sign_pss<D: Digest, R: RngCore>(
         &self,
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
         emsa::sign_pss::<D, _, R>(self, msg, rng)
+    }
+
+    /// Signs `msg` with RSA-PSS using an explicit salt length (in octets).
+    /// `salt_len == 0` is permitted; the maximum is bounded by the modulus
+    /// size (`Error::MessageTooLong` otherwise).
+    pub fn sign_pss_with_salt_len<D: Digest, R: RngCore>(
+        &self,
+        msg: &[u8],
+        salt_len: usize,
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
+        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext.

@@ -403,7 +403,9 @@ fn fill_nonzero<R: RngCore>(dst: &mut [u8], rng: &mut R) {
 }
 
 // --------------------------------------------------------------------------
-// PSS (salt length = digest length)
+// PSS (RFC 8017 §8.1). The default salt length is the digest length (the
+// profile used by TLS 1.3 and the X.509 PSS parameter set); the
+// `*_with_salt_len` / `*_any_salt` variants relax that for general interop.
 // --------------------------------------------------------------------------
 
 pub(crate) fn sign_pss<D: Digest, K: RawPrivate, R: RngCore>(
@@ -411,7 +413,16 @@ pub(crate) fn sign_pss<D: Digest, K: RawPrivate, R: RngCore>(
     msg: &[u8],
     rng: &mut R,
 ) -> Result<Vec<u8>, Error> {
-    let em = emsa_pss_encode::<D, R>(msg, key.modulus_bits() - 1, rng)?;
+    sign_pss_with_salt_len::<D, K, R>(key, msg, D::OUTPUT_LEN, rng)
+}
+
+pub(crate) fn sign_pss_with_salt_len<D: Digest, K: RawPrivate, R: RngCore>(
+    key: &K,
+    msg: &[u8],
+    salt_len: usize,
+    rng: &mut R,
+) -> Result<Vec<u8>, Error> {
+    let em = emsa_pss_encode::<D, R>(msg, key.modulus_bits() - 1, salt_len, rng)?;
     Ok(key.raw_private(&em))
 }
 
@@ -419,6 +430,36 @@ pub(crate) fn verify_pss<D: Digest, K: RawPublic + PublicModulus>(
     key: &K,
     msg: &[u8],
     sig: &[u8],
+) -> Result<(), Error> {
+    verify_pss_inner::<D, K>(key, msg, sig, Some(D::OUTPUT_LEN))
+}
+
+/// Verifies an RSA-PSS signature requiring the salt to be exactly `salt_len`
+/// octets.
+pub(crate) fn verify_pss_with_salt_len<D: Digest, K: RawPublic + PublicModulus>(
+    key: &K,
+    msg: &[u8],
+    sig: &[u8],
+    salt_len: usize,
+) -> Result<(), Error> {
+    verify_pss_inner::<D, K>(key, msg, sig, Some(salt_len))
+}
+
+/// Verifies an RSA-PSS signature, recovering the salt length from the encoded
+/// message (accepts any valid salt length).
+pub(crate) fn verify_pss_any_salt<D: Digest, K: RawPublic + PublicModulus>(
+    key: &K,
+    msg: &[u8],
+    sig: &[u8],
+) -> Result<(), Error> {
+    verify_pss_inner::<D, K>(key, msg, sig, None)
+}
+
+fn verify_pss_inner<D: Digest, K: RawPublic + PublicModulus>(
+    key: &K,
+    msg: &[u8],
+    sig: &[u8],
+    salt_len: Option<usize>,
 ) -> Result<(), Error> {
     let k = key.key_size();
     if sig.len() != k {
@@ -442,7 +483,7 @@ pub(crate) fn verify_pss<D: Digest, K: RawPublic + PublicModulus>(
     if m[..k - em_len].iter().any(|&b| b != 0) {
         return Err(Error::Verification);
     }
-    emsa_pss_verify::<D>(msg, &m[k - em_len..], em_bits)
+    emsa_pss_verify::<D>(msg, &m[k - em_len..], em_bits, salt_len)
 }
 
 // --------------------------------------------------------------------------
@@ -590,10 +631,11 @@ pub(crate) fn mgf1<D: Digest>(seed: &[u8], mask_len: usize) -> Vec<u8> {
 fn emsa_pss_encode<D: Digest, R: RngCore>(
     msg: &[u8],
     em_bits: usize,
+    salt_len: usize,
     rng: &mut R,
 ) -> Result<Vec<u8>, Error> {
     let h_len = D::OUTPUT_LEN;
-    let s_len = h_len;
+    let s_len = salt_len;
     let em_len = em_bits.div_ceil(8);
     if em_len < h_len + s_len + 2 {
         return Err(Error::MessageTooLong);
@@ -628,11 +670,26 @@ fn emsa_pss_encode<D: Digest, R: RngCore>(
     Ok(em)
 }
 
-fn emsa_pss_verify<D: Digest>(msg: &[u8], em: &[u8], em_bits: usize) -> Result<(), Error> {
+/// EMSA-PSS-VERIFY (RFC 8017 §9.1.2).
+///
+/// `salt_len` selects how the salt length is determined:
+/// * `Some(n)` — require the salt to be exactly `n` octets (the `0x01`
+///   separator sits at a fixed offset). This is the strict profile mandated
+///   by TLS 1.3 / the X.509 PSS parameter set, where `n == D::OUTPUT_LEN`.
+/// * `None` — recover the salt length from the encoded message (the standard
+///   variable-salt verify): DB is zero padding, then a single `0x01` octet,
+///   then the salt. More interoperable; salt length does not affect PSS
+///   security.
+fn emsa_pss_verify<D: Digest>(
+    msg: &[u8],
+    em: &[u8],
+    em_bits: usize,
+    salt_len: Option<usize>,
+) -> Result<(), Error> {
     let h_len = D::OUTPUT_LEN;
-    let s_len = h_len;
     let em_len = em.len();
-    if em_len < h_len + s_len + 2 || em[em_len - 1] != 0xbc {
+    // Absolute minimum: maskedDB (>= 1 octet) ‖ H ‖ 0xBC.
+    if em_len < h_len + 2 || em[em_len - 1] != 0xbc {
         return Err(Error::Verification);
     }
 
@@ -654,11 +711,28 @@ fn emsa_pss_verify<D: Digest>(msg: &[u8], em: &[u8], em_bits: usize) -> Result<(
         db[0] &= 0xff >> clear;
     }
 
-    let ps_len = db_len - s_len - 1;
-    if db[..ps_len].iter().any(|&b| b != 0) || db[ps_len] != 0x01 {
-        return Err(Error::Verification);
-    }
-    let salt = &db[ps_len + 1..];
+    // Locate the `PS ‖ 0x01 ‖ salt` structure of DB and extract the salt.
+    let salt: &[u8] = match salt_len {
+        Some(n) => {
+            // Fixed salt length: the 0x01 separator sits at a known offset.
+            if db_len < n + 1 {
+                return Err(Error::Verification);
+            }
+            let ps_len = db_len - n - 1;
+            if db[..ps_len].iter().any(|&b| b != 0) || db[ps_len] != 0x01 {
+                return Err(Error::Verification);
+            }
+            &db[ps_len + 1..]
+        }
+        None => {
+            // Recover the salt length: the first non-zero DB octet must be
+            // exactly 0x01 (everything before it is the zero PS).
+            match db.iter().position(|&b| b != 0) {
+                Some(i) if db[i] == 0x01 => &db[i + 1..],
+                _ => return Err(Error::Verification),
+            }
+        }
+    };
 
     let m_hash = D::digest(msg);
     let mut m_prime = vec![0u8; 8];
