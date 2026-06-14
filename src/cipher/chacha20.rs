@@ -129,6 +129,14 @@ impl ChaCha20 {
             counter_end <= u64::from(u32::MAX) + 1,
             "ChaCha20 counter would overflow 2^32 (buf too large for a single invocation)"
         );
+        // On x86_64 with AVX2, generate the keystream eight blocks at a time
+        // (ChaCha20 blocks are independent, so the 8-wide layout needs no
+        // diagonal shuffles). Byte-identical to the scalar path.
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if simd::supported() {
+            simd::apply_keystream(&self.key, nonce, counter, buf);
+            return;
+        }
         let mut block_counter = counter;
         for block in buf.chunks_mut(64) {
             let ks = self.block(nonce, block_counter);
@@ -136,6 +144,110 @@ impl ChaCha20 {
                 *b ^= *k;
             }
             block_counter = block_counter.wrapping_add(1);
+        }
+    }
+}
+
+/// AVX2 8-way ChaCha20 keystream (x86_64). Each of the 16 state words is held in
+/// a `__m256i` lane-per-block across eight consecutive block counters; the
+/// quarter-round indices are identical to the scalar path (independent blocks =
+/// no diagonalization). Pinned byte-for-byte by a differential test.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+mod simd {
+    use super::CONSTANTS;
+    use core::arch::x86_64::*;
+
+    pub(super) fn supported() -> bool {
+        std::is_x86_feature_detected!("avx2")
+    }
+
+    /// Rotate-left each 32-bit lane by `N` (with `M = 32 - N`).
+    #[inline(always)]
+    unsafe fn rol<const N: i32, const M: i32>(x: __m256i) -> __m256i {
+        unsafe { _mm256_or_si256(_mm256_slli_epi32::<N>(x), _mm256_srli_epi32::<M>(x)) }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn qr(v: &mut [__m256i; 16], a: usize, b: usize, c: usize, d: usize) {
+        unsafe {
+            v[a] = _mm256_add_epi32(v[a], v[b]);
+            v[d] = rol::<16, 16>(_mm256_xor_si256(v[d], v[a]));
+            v[c] = _mm256_add_epi32(v[c], v[d]);
+            v[b] = rol::<12, 20>(_mm256_xor_si256(v[b], v[c]));
+            v[a] = _mm256_add_epi32(v[a], v[b]);
+            v[d] = rol::<8, 24>(_mm256_xor_si256(v[d], v[a]));
+            v[c] = _mm256_add_epi32(v[c], v[d]);
+            v[b] = rol::<7, 25>(_mm256_xor_si256(v[b], v[c]));
+        }
+    }
+
+    pub(super) fn apply_keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+        // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
+        unsafe { apply_keystream_avx2(key, nonce, counter, buf) }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn apply_keystream_avx2(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+        unsafe {
+            let n =
+                |o: usize| u32::from_le_bytes([nonce[o], nonce[o + 1], nonce[o + 2], nonce[o + 3]]);
+            let (n0, n1, n2) = (n(0), n(4), n(8));
+            let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+            let mut ctr = counter;
+            let mut off = 0usize;
+            while off < buf.len() {
+                let mut v = [
+                    _mm256_set1_epi32(CONSTANTS[0] as i32),
+                    _mm256_set1_epi32(CONSTANTS[1] as i32),
+                    _mm256_set1_epi32(CONSTANTS[2] as i32),
+                    _mm256_set1_epi32(CONSTANTS[3] as i32),
+                    _mm256_set1_epi32(key[0] as i32),
+                    _mm256_set1_epi32(key[1] as i32),
+                    _mm256_set1_epi32(key[2] as i32),
+                    _mm256_set1_epi32(key[3] as i32),
+                    _mm256_set1_epi32(key[4] as i32),
+                    _mm256_set1_epi32(key[5] as i32),
+                    _mm256_set1_epi32(key[6] as i32),
+                    _mm256_set1_epi32(key[7] as i32),
+                    _mm256_add_epi32(_mm256_set1_epi32(ctr as i32), lanes),
+                    _mm256_set1_epi32(n0 as i32),
+                    _mm256_set1_epi32(n1 as i32),
+                    _mm256_set1_epi32(n2 as i32),
+                ];
+                let init = v;
+                for _ in 0..10 {
+                    qr(&mut v, 0, 4, 8, 12);
+                    qr(&mut v, 1, 5, 9, 13);
+                    qr(&mut v, 2, 6, 10, 14);
+                    qr(&mut v, 3, 7, 11, 15);
+                    qr(&mut v, 0, 5, 10, 15);
+                    qr(&mut v, 1, 6, 11, 12);
+                    qr(&mut v, 2, 7, 8, 13);
+                    qr(&mut v, 3, 4, 9, 14);
+                }
+                let mut words = [[0u32; 8]; 16];
+                for i in 0..16 {
+                    let added = _mm256_add_epi32(v[i], init[i]);
+                    _mm256_storeu_si256(words[i].as_mut_ptr() as *mut __m256i, added);
+                }
+                // Emit up to eight 64-byte keystream blocks (lane = block) and
+                // XOR the bytes still needed into `buf`.
+                let avail = (buf.len() - off).min(512);
+                let mut ks = [0u8; 512];
+                for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
+                    for (i, word) in blk.chunks_exact_mut(4).enumerate() {
+                        word.copy_from_slice(&words[i][b].to_le_bytes());
+                    }
+                }
+                for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
+                    *dst ^= *k;
+                }
+                off += 512;
+                ctr = ctr.wrapping_add(8);
+            }
         }
     }
 }
@@ -196,5 +308,56 @@ only one tip for the future, sunscreen would be it.";
         // Keystream is its own inverse: re-applying recovers the plaintext.
         ChaCha20::new(&key).apply_keystream(&nonce, 1, &mut buf);
         assert_eq!(buf, plaintext);
+    }
+
+    /// The AVX2 8-way keystream must equal the scalar block path for every
+    /// length, including partial blocks and partial 8-block groups, and across
+    /// a counter value near the 32-bit boundary.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn simd_matches_scalar() {
+        use alloc::vec::Vec;
+        if !super::simd::supported() {
+            return;
+        }
+        let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+        let nonce: [u8; 12] = core::array::from_fn(|i| (i as u8).wrapping_mul(5).wrapping_add(3));
+        let c = ChaCha20::new(&key);
+        for &len in &[
+            0usize,
+            1,
+            63,
+            64,
+            65,
+            200,
+            511,
+            512,
+            513,
+            1024,
+            1500,
+            4096 + 7,
+        ] {
+            for &ctr in &[0u32, 1, 100, u32::MAX - 20] {
+                // Skip combinations that would legitimately overflow the counter.
+                if (ctr as u64) + (len.div_ceil(64) as u64) > u64::from(u32::MAX) + 1 {
+                    continue;
+                }
+                let base: Vec<u8> = (0..len).map(|i| (i * 31 + 9) as u8).collect();
+                // SIMD path (the real apply_keystream).
+                let mut simd = base.clone();
+                c.apply_keystream(&nonce, ctr, &mut simd);
+                // Scalar reference, block by block.
+                let mut scalar = base.clone();
+                let mut bc = ctr;
+                for block in scalar.chunks_mut(64) {
+                    let ks = c.block(&nonce, bc);
+                    for (b, k) in block.iter_mut().zip(ks.iter()) {
+                        *b ^= *k;
+                    }
+                    bc = bc.wrapping_add(1);
+                }
+                assert_eq!(simd, scalar, "len={len} ctr={ctr}");
+            }
+        }
     }
 }
