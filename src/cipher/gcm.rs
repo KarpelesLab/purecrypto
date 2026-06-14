@@ -108,12 +108,29 @@ impl<C: BlockCipher> Gcm<C> {
     }
 
     /// GHASH over associated data `aad` and ciphertext `ct`.
+    #[allow(unsafe_code)]
     fn ghash(&self, aad: &[u8], ct: &[u8]) -> u128 {
         let mut x = 0u128;
         for chunk in aad.chunks(16) {
             x = self.mul_h(x ^ load_block(chunk));
         }
-        for chunk in ct.chunks(16) {
+        // The ciphertext is the bulk; on a hardware GHASH backend fold its full
+        // blocks via the aggregated-reduction path (one reduction per four
+        // blocks), leaving any partial trailing block to the serial multiply.
+        // NB: keep `ct` intact — the length block below reads `ct.len()`.
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let tail = if self.ghash_hw {
+            let full = ct.len() & !15;
+            // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
+            // the carryless-multiply features `ghash_blocks` requires.
+            x = unsafe { super::clmul::ghash_blocks(x, self.h, &ct[..full]) };
+            &ct[full..]
+        } else {
+            ct
+        };
+        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let tail = ct;
+        for chunk in tail.chunks(16) {
             x = self.mul_h(x ^ load_block(chunk));
         }
         // Length block: [len(aad)]₆₄ ‖ [len(ct)]₆₄, in bits.
