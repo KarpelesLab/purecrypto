@@ -146,6 +146,7 @@ fn wots_pk_gen(
     let mut sk_addr = *addr;
     sk_addr.set_type_and_clear(AdrsType::WotsPrf);
     sk_addr.copy_key_pair(addr);
+    // Fill `tmp` with the per-chain secret start values (kept scalar).
     for i in 0..p.len {
         sk_addr.set_chain(i);
         hash::prf(
@@ -155,15 +156,170 @@ fn wots_pk_gen(
             sk_addr.bytes(),
             &mut tmp[i as usize * n..],
         );
-        addr.set_chain(i);
-        let lo = i as usize * n;
-        wots_chain(p, pk_seed, &mut tmp[lo..lo + n], 0, 15, addr);
+    }
+    // Every chain runs the full 0..15 range and the chains are mutually
+    // independent, so on x86_64+AVX2 for the SHA-2 n=16 sets (where `F` is
+    // SHA-256) run them eight at a time through the multi-buffer kernel — this
+    // dominates WOTS+ keygen and hypertree building.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    let batched = if wots_x8::eligible(p) && crate::hash::sha256_mb::supported() {
+        wots_x8::full_chains(p, pk_seed, addr, tmp);
+        true
+    } else {
+        false
+    };
+    #[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+    let batched = false;
+    if !batched {
+        for i in 0..p.len {
+            addr.set_chain(i);
+            let lo = i as usize * n;
+            wots_chain(p, pk_seed, &mut tmp[lo..lo + n], 0, 15, addr);
+        }
     }
     let mut pk_addr = *addr;
     pk_addr.set_type_and_clear(AdrsType::WotsPk);
     pk_addr.copy_key_pair(addr);
     let total = p.len as usize * n;
     hash::t(p, pk_seed, pk_addr.bytes(), &tmp[..total], out);
+}
+
+/// Fast differential test: the batched WOTS+ chains must equal the scalar
+/// `wots_chain` loop over the same chain-start values, for a SHA-2 n=16 set.
+/// This avoids the multi-second ACVP KAT runs while pinning the AVX2 layout.
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+mod wots_x8_tests {
+    use super::*;
+
+    #[test]
+    fn batched_matches_scalar() {
+        if !crate::hash::sha256_mb::supported() {
+            return;
+        }
+        // SLH-DSA-SHA2-128s: !is_shake, n=16, len=35.
+        let p = ParamSet::Sha2_128s.params();
+        let n = p.n as usize;
+        let total = p.len as usize * n;
+
+        let mut starts = vec![0u8; total];
+        for (i, b) in starts.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(7).wrapping_add(1)) as u8;
+        }
+        let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+
+        let mut base = Adrs::new(p.is_shake);
+        base.set_type_and_clear(AdrsType::WotsHash);
+        base.set_layer(2);
+        base.set_tree(0x0102_0304_0506_0708);
+        base.set_key_pair(42);
+
+        // Scalar reference: full 0..15 chains.
+        let mut tmp_scalar = starts.clone();
+        for i in 0..p.len {
+            let mut a = base;
+            a.set_chain(i);
+            let lo = i as usize * n;
+            wots_chain(p, &pk_seed, &mut tmp_scalar[lo..lo + n], 0, 15, &mut a);
+        }
+
+        // Batched.
+        let mut tmp_batched = starts.clone();
+        wots_x8::full_chains(p, &pk_seed, &base, &mut tmp_batched);
+
+        assert_eq!(tmp_scalar, tmp_batched);
+    }
+}
+
+/// Multi-buffer (AVX2) WOTS+ chain evaluation for SLH-DSA's SHA-2 n=16 sets:
+/// eight independent F-chains hashed in lockstep through the 8-way SHA-256
+/// kernel. Produces byte-identical output to the scalar [`wots_chain`] loop
+/// (pinned by a differential test). For n=16, `F(pk_seed, addr, m1)` is
+/// `SHA256(pk_seed[..16] ‖ 0^48 ‖ addr(22) ‖ m1[..16])` — a 102-byte, two-block
+/// message whose first block (`pk_seed ‖ 0^48`) is constant, so its midstate is
+/// precomputed once and reused for every lane and step.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod wots_x8 {
+    use super::adrs::Adrs;
+    use super::params::Params;
+    use crate::hash::sha256::{H256, compress256_soft};
+    use crate::hash::sha256_mb::{LANES, compress8};
+
+    /// The batcher handles only the SHA-2 (`!is_shake`) sets with `n == 16`,
+    /// where `F` is SHA-256. n=24/32 use SHA-512 and SHAKE uses Keccak.
+    pub(super) fn eligible(p: &Params) -> bool {
+        !p.is_shake && p.n == 16
+    }
+
+    /// Second block of the 102-byte `F` message: `addr(22) ‖ m1(16) ‖ 0x80 ‖
+    /// 0…0 ‖ len`, with `len = 816` bits (`102 * 8`). `addr` is the 22-byte
+    /// compressed ADRS; `m1` is the 16-byte chain value.
+    #[inline]
+    fn block1_f(addr: &[u8], m1: &[u8; 16]) -> [u8; 64] {
+        debug_assert_eq!(addr.len(), 22);
+        let mut b = [0u8; 64];
+        b[..22].copy_from_slice(addr);
+        b[22..38].copy_from_slice(m1);
+        b[38] = 0x80;
+        b[56..64].copy_from_slice(&816u64.to_be_bytes());
+        b
+    }
+
+    /// Big-endian serialization of a SHA-256 state, truncated to 16 bytes (n).
+    #[inline]
+    fn state_be16(s: &[u32; 8]) -> [u8; 16] {
+        let mut o = [0u8; 16];
+        for (i, w) in s.iter().take(4).enumerate() {
+            o[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        o
+    }
+
+    /// Runs every WOTS+ chain over its full `0..15` range, eight chains at a
+    /// time. `tmp` enters holding the per-chain secret start values (written by
+    /// the `prf` loop) and leaves holding the chain ends. `base` supplies the
+    /// layer/tree/key-pair fields (type WotsHash); chain/hash are set per lane
+    /// and step.
+    pub(super) fn full_chains(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
+        const N: usize = 16;
+        // Constant first block: pk_seed[..16] ‖ 0^48 → one midstate, reused for
+        // every lane and step (pk_seed is fixed for the whole key).
+        let mut b0 = [0u8; 64];
+        b0[..N].copy_from_slice(&pk_seed[..N]);
+        let mut mid = H256;
+        compress256_soft(&mut mid, &b0);
+
+        let len = p.len as usize;
+        let mut c0 = 0usize;
+        while c0 < len {
+            let lanes = (len - c0).min(LANES);
+            let mut inout = [[0u8; N]; LANES];
+            for (l, io) in inout.iter_mut().enumerate().take(lanes) {
+                io.copy_from_slice(&tmp[(c0 + l) * N..(c0 + l) * N + N]);
+            }
+
+            for step in 0..15u32 {
+                let mut b1 = [[0u8; 64]; LANES];
+                for (l, slot) in b1.iter_mut().enumerate() {
+                    // Remainder lanes duplicate the first active chain.
+                    let chain = if l < lanes { c0 + l } else { c0 };
+                    let mut a = *base;
+                    a.set_chain(chain as u32);
+                    a.set_hash(step);
+                    *slot = block1_f(a.bytes(), &inout[l]);
+                }
+                let mut st = [mid; LANES];
+                compress8(&mut st, &b1);
+                for (l, io) in inout.iter_mut().enumerate() {
+                    *io = state_be16(&st[l]);
+                }
+            }
+
+            for (l, io) in inout.iter().enumerate().take(lanes) {
+                tmp[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
+            }
+            c0 += lanes;
+        }
+    }
 }
 
 /// Computes the WOTS+ message-and-checksum nibbles for an n-byte message.
