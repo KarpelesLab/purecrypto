@@ -82,6 +82,25 @@ pub enum Error {
 /// Derives the `len` WOTS+ secret chain starts from `SK_SEED` via `PRF_keygen`
 /// (SP 800-208), writing `len·n` bytes into `out`. Mirrors `expand_seed`.
 fn wots_expand_seed(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, out: &mut [u8]) {
+    // The `wots_len` (~67) PRF_keygen calls are mutually independent, so on
+    // x86_64+AVX2 (SHA-256 sets) derive them eight at a time through the
+    // multi-buffer SHA-256 kernel — this is on the hot keygen/tree-build path.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if wots_x8::eligible(p) && crate::hash::sha256_mb::supported() {
+        wots_x8::expand_seed_x8(p, sk_seed, pub_seed, addr, out);
+        return;
+    }
+    wots_expand_seed_scalar(p, sk_seed, pub_seed, addr, out);
+}
+
+/// Scalar reference path for [`wots_expand_seed`]: one `PRF_keygen` per chain.
+fn wots_expand_seed_scalar(
+    p: &Params,
+    sk_seed: &[u8],
+    pub_seed: &[u8],
+    addr: &mut Adrs,
+    out: &mut [u8],
+) {
     let n = p.n;
     addr.set_hash(0);
     addr.set_key_and_mask(0);
@@ -194,6 +213,32 @@ mod wots_x8_tests {
 
         assert_eq!(pk_scalar, pk_batched);
     }
+
+    #[test]
+    fn expand_seed_batched_matches_scalar() {
+        if !crate::hash::sha256_mb::supported() {
+            return;
+        }
+        let p = XmssParamSet::Sha2_10_256.params();
+        let n = p.n;
+        let sk_seed: Vec<u8> = (0..n).map(|i| (i * 11 + 3) as u8).collect();
+        let pub_seed: Vec<u8> = (0..n).map(|i| (i * 5 + 9) as u8).collect();
+        let mut base = Adrs::new();
+        base.set_type(AdrsType::Ots);
+        base.set_ots(7);
+
+        let mut out_scalar = vec![0u8; p.wots_len * n];
+        let mut a_scalar = base;
+        wots_expand_seed_scalar(&p, &sk_seed, &pub_seed, &mut a_scalar, &mut out_scalar);
+
+        let mut out_batched = vec![0u8; p.wots_len * n];
+        let mut a_batched = base;
+        wots_x8::expand_seed_x8(&p, &sk_seed, &pub_seed, &mut a_batched, &mut out_batched);
+
+        assert_eq!(out_scalar, out_batched);
+        // The dispatcher and scalar fallback must leave `addr` in the same state.
+        assert_eq!(a_scalar.to_bytes(), a_batched.to_bytes());
+    }
 }
 
 /// Multi-buffer (AVX2) WOTS+ chain evaluation: eight independent chains hashed
@@ -302,6 +347,73 @@ mod wots_x8 {
                 pk[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
             }
             c0 += lanes;
+        }
+    }
+
+    /// Derives every WOTS+ secret chain start via `PRF_keygen`, eight chains at
+    /// a time. Byte-identical to the scalar `wots_expand_seed` loop (pinned by a
+    /// differential test); SHA-256 `n = 32` sets only.
+    ///
+    /// `PRF_keygen(SK_SEED, PUB_SEED ‖ ADRS_i)` = SHA-256 over a 128-byte
+    /// (3-block) message `toByte(4,32) ‖ SK_SEED ‖ PUB_SEED ‖ ADRS_i`:
+    /// - block0 = `toByte(4,32) ‖ SK_SEED` — constant (SK_SEED fixed) → one
+    ///   precomputed midstate, reused for every chain;
+    /// - block1 = `PUB_SEED ‖ ADRS_i` — a full 64-byte block, ADRS differs per
+    ///   lane (chain index);
+    /// - block2 = padding only (`0x80 …  len=1024` bits), identical for all lanes.
+    pub(super) fn expand_seed_x8(
+        p: &Params,
+        sk_seed: &[u8],
+        pub_seed: &[u8],
+        addr: &mut Adrs,
+        out: &mut [u8],
+    ) {
+        const N: usize = 32;
+        // block0 = toByte(4, 32) ‖ SK_SEED → one midstate (SK_SEED is constant).
+        let mut b0 = [0u8; 64];
+        b0[31] = 4;
+        b0[32..64].copy_from_slice(&sk_seed[..N]);
+        let mut keygen_mid = H256;
+        compress256_soft(&mut keygen_mid, &b0);
+
+        // block2 = padding for a 128-byte message: 0x80 then the bit length
+        // (1024) in the trailing u64. Identical across all eight lanes.
+        let mut block2 = [0u8; 64];
+        block2[0] = 0x80;
+        block2[56..64].copy_from_slice(&1024u64.to_be_bytes());
+
+        // Mirror the scalar address state: hash = 0, keyAndMask = 0 (chain set
+        // per lane). Leaves `addr` with chain = wots_len - 1, matching the
+        // scalar path so any later reader sees the same address.
+        addr.set_hash(0);
+        addr.set_key_and_mask(0);
+
+        let mut c0 = 0usize;
+        while c0 < p.wots_len {
+            let lanes = (p.wots_len - c0).min(LANES);
+            // block1 = PUB_SEED ‖ ADRS_i per lane.
+            let mut b1 = [[0u8; 64]; LANES];
+            for (l, b) in b1.iter_mut().enumerate() {
+                let chain = if l < lanes { c0 + l } else { c0 };
+                addr.set_chain(chain as u32);
+                b[..N].copy_from_slice(&pub_seed[..N]);
+                b[N..64].copy_from_slice(&addr.to_bytes());
+            }
+            let mut states = [keygen_mid; LANES];
+            compress8(&mut states, &b1);
+            let block2s = [block2; LANES];
+            compress8(&mut states, &block2s);
+
+            for (l, st) in states.iter().enumerate().take(lanes) {
+                out[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(&state_be(st));
+            }
+            c0 += lanes;
+        }
+
+        // Leave `addr` exactly as the scalar loop does: chain = wots_len - 1
+        // (padding lanes above rolled it back to a group start).
+        if p.wots_len > 0 {
+            addr.set_chain((p.wots_len - 1) as u32);
         }
     }
 }
