@@ -215,7 +215,25 @@ impl BoxedMontModulus {
         let base_m = self.to_mont_limbs(&base.limbs_resized(self.limbs));
         let mut one = vec![0 as Limb; self.limbs];
         one[0] = 1;
-        let mut acc = self.to_mont_limbs(&one); // R mod N
+        let r_mod_n = self.to_mont_limbs(&one); // R mod N (= 1 in Montgomery form)
+
+        // Fixed 4-bit window: precompute `base^0 … base^15` (Montgomery form)
+        // once, then consume the exponent four bits at a time — four squarings
+        // and one multiply by the window's value per nibble, versus the eight
+        // squarings + four multiplies a bit-by-bit ladder would do over the same
+        // four bits. The table value is chosen by scanning all 16 entries with a
+        // constant-time select (no secret-indexed memory access) and the per-
+        // nibble multiply is unconditional, so this stays square-and-multiply-
+        // *always*: the operation count is a function of the (public) exponent
+        // width only, leaking nothing about `base` or the exponent's bits.
+        let mut table: Vec<Vec<Limb>> = Vec::with_capacity(16);
+        table.push(r_mod_n.clone());
+        table.push(base_m);
+        for i in 2..16 {
+            table.push(self.mont_mul_limbs(&table[i - 1], &table[1]));
+        }
+
+        let mut acc = r_mod_n;
 
         // Pad the exponent to at least `self.limbs` 64-bit words; if the
         // caller hands in a wider exponent we keep every bit. `limbs_resized`
@@ -228,13 +246,21 @@ impl BoxedMontModulus {
         while i > 0 {
             i -= 1;
             let limb = exp_limbs[i];
-            let mut bit = 64;
-            while bit > 0 {
-                bit -= 1;
+            let mut shift = 64;
+            while shift > 0 {
+                shift -= 4;
                 acc = self.mont_mul_limbs(&acc, &acc);
-                let mult = self.mont_mul_limbs(&acc, &base_m);
-                let set = Choice::from(((limb >> bit) & 1) as u8);
-                acc = select_limbs(&mult, &acc, set);
+                acc = self.mont_mul_limbs(&acc, &acc);
+                acc = self.mont_mul_limbs(&acc, &acc);
+                acc = self.mont_mul_limbs(&acc, &acc);
+
+                let digit = ((limb >> shift) & 0xf) as usize;
+                // Constant-time gather of table[digit].
+                let mut sel = table[0].clone();
+                for (j, t) in table.iter().enumerate() {
+                    sel = select_limbs(t, &sel, Choice::from((j == digit) as u8));
+                }
+                acc = self.mont_mul_limbs(&acc, &sel);
             }
         }
         BoxedUint::from_limbs(self.demont_limbs(&acc))
