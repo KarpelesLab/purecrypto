@@ -97,10 +97,17 @@ impl SentinelLock {
     /// Acquires the lock at `path`. `holder` names the command that would be
     /// holding a stale lock (e.g. "`purecrypto ca`") in the timeout message.
     pub(crate) fn acquire(path: PathBuf, holder: &str) -> Self {
-        // 150 * 20ms = 3s timeout. Long enough to overlap a normal peer
-        // invocation's wallclock; short enough that a crashed peer surfaces
-        // quickly.
-        const MAX_RETRIES: u32 = 150;
+        // 1500 * 20ms = 30s timeout. This bounds recovery from a *stale* lock
+        // left by a crashed peer; live contention must never hit it. The budget
+        // therefore has to comfortably exceed the wallclock of many serialized
+        // peer invocations, each of which holds the lock for a full stateful
+        // sign + fsync'd key rewrite — which for a large tree, a slow disk, or a
+        // debug build is far from instant. (The earlier 3s budget was already
+        // ~85% consumed by a routine 12-signature concurrency test on fast
+        // hardware, and tipped over on loaded CI runners.) A crashed peer's lock
+        // taking 30s to break is an acceptable price for never spuriously
+        // failing a legitimate signature.
+        const MAX_RETRIES: u32 = 1500;
         const SLEEP_MS: u64 = 20;
         for attempt in 0..MAX_RETRIES {
             match std::fs::OpenOptions::new()
