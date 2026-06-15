@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.12](https://github.com/KarpelesLab/purecrypto/compare/v0.6.11...v0.6.12) - 2026-06-15
+
+### Other
+
+- widen stateful-sign lock budget 3s -> 30s (fix CI flake)
+- fix aarch64 aggregated-GHASH block byte order
+- 4-bit windowed constant-time modexp (~1.55x RSA-2048 sign)
+- aggregated-reduction GHASH (~2.8x on AES-GCM)
+- AVX2 8-way keystream (~2.2x on ChaCha20-Poly1305)
+- 8-way multi-buffer PRF_keygen for expand_seed
+- batch WOTS+ F-chains through 8-way SHA-256 kernel (SHA-2 n=16)
+- batch LM-OTS public_key Winternitz chains through AVX2 multi-buffer SHA-256
+- multi-buffer AVX2 SHA-256, batched into XMSS WOTS+
+- AVX2 8-way SIMD chunk backend (~2.5x on bulk)
+- register-resident multi-block SHA-NI / sha2 compression
+- reject PSK binders that are not 32 or 48 bytes at parse
+- add configurable salt-length sign/verify (strict default)
+- enforce canonical DER INTEGER encoding on key import
+- reject STOP_SENDING on receive-only stream as STREAM_STATE_ERROR
+- park connection in Closed state on received fatal alert
+
 ## [0.6.11](https://github.com/KarpelesLab/purecrypto/compare/v0.6.10...v0.6.11) - 2026-06-11
 
 ### Fixed
