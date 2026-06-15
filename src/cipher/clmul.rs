@@ -295,9 +295,25 @@ mod arm {
     /// Aggregated GHASH (four blocks per reduction), the NEON analogue of the
     /// x86 [`ghash_blocks`]. `blocks.len()` must be a multiple of 16. Returns the
     /// same value as repeated `gf_mul(x ⊕ bᵢ, h)`.
+    /// Loads a 16-byte GCM block into the byte-swapped ("reflected")
+    /// representation `gfmul` expects. A `u128` reaches that form for free via
+    /// `to_le_bytes` (its little-endian bytes are the big-endian block
+    /// reversed); a raw block must be reversed explicitly, the NEON equivalent
+    /// of the x86 path's `bswap`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn load_rev(p: *const u8) -> uint8x16_t {
+        unsafe {
+            let v = vrev64q_u8(vld1q_u8(p));
+            vextq_u8(v, v, 8)
+        }
+    }
+
     #[target_feature(enable = "aes,neon")]
     pub(in super::super) unsafe fn ghash_blocks(x: u128, h: u128, blocks: &[u8]) -> u128 {
         unsafe {
+            // `x` and `h` are `u128`, so their little-endian bytes already are
+            // the reflected representation; the message blocks are reversed.
             let h1 = vld1q_u8(h.to_le_bytes().as_ptr());
             let h2 = gfmul(h1, h1);
             let h3 = gfmul(h2, h1);
@@ -307,17 +323,17 @@ mod arm {
             let mut chunks = blocks.chunks_exact(64);
             for c in &mut chunks {
                 let p = c.as_ptr();
-                let d0 = veorq_u8(acc, vld1q_u8(p));
+                let d0 = veorq_u8(acc, load_rev(p));
                 let (mut lo, mut hi) = clmul_halves(d0, h4);
-                let (l1, h1p) = clmul_halves(vld1q_u8(p.add(16)), h3);
-                let (l2, h2p) = clmul_halves(vld1q_u8(p.add(32)), h2);
-                let (l3, h3p) = clmul_halves(vld1q_u8(p.add(48)), h1);
+                let (l1, h1p) = clmul_halves(load_rev(p.add(16)), h3);
+                let (l2, h2p) = clmul_halves(load_rev(p.add(32)), h2);
+                let (l3, h3p) = clmul_halves(load_rev(p.add(48)), h1);
                 lo = veorq_u8(veorq_u8(lo, l1), veorq_u8(l2, l3));
                 hi = veorq_u8(veorq_u8(hi, h1p), veorq_u8(h2p, h3p));
                 acc = reduce(lo, hi);
             }
             for c in chunks.remainder().chunks_exact(16) {
-                acc = gfmul(veorq_u8(acc, vld1q_u8(c.as_ptr())), h1);
+                acc = gfmul(veorq_u8(acc, load_rev(c.as_ptr())), h1);
             }
 
             let mut out = [0u8; 16];
