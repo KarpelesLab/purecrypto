@@ -303,6 +303,69 @@ mod tests {
         }
     }
 
+    /// Independent serial-software GHASH reference: `X = 0`, then fold each
+    /// 16-byte (zero-padded) block of `aad`, then each block of `ct`, then the
+    /// length block — every step a single `gf_mul` by `h`. Deliberately *not*
+    /// the aggregated-reduction path, so it cross-checks the hardware
+    /// `ghash_blocks` 4-block grouping + serial remainder.
+    fn ghash_serial_ref(h: u128, aad: &[u8], ct: &[u8]) -> u128 {
+        let mut x = 0u128;
+        for chunk in aad.chunks(16) {
+            x = gf_mul(x ^ load_block(chunk), h);
+        }
+        for chunk in ct.chunks(16) {
+            x = gf_mul(x ^ load_block(chunk), h);
+        }
+        let len_block = ((aad.len() as u128 * 8) << 64) | (ct.len() as u128 * 8);
+        gf_mul(x ^ len_block, h)
+    }
+
+    /// Differential guard for the aggregated-reduction GHASH (`clmul::ghash_blocks`,
+    /// reached via `Gcm::encrypt`'s hardware path): the real tag must match an
+    /// independent serial-software GHASH reference across many ciphertext lengths
+    /// — spanning every full/partial 4-block group residue and multiple groups —
+    /// and AAD lengths that exercise the AAD→CT accumulator handoff. The shipped
+    /// NIST KATs only hit the 0-remainder and single-4-block-group cases.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[test]
+    fn aggregated_ghash_matches_serial_reference() {
+        use std::vec::Vec;
+        if !crate::cipher::clmul::supported() {
+            return;
+        }
+        let key = from_hex::<16>("feffe9928665731c6d6a8f9467308308");
+        let g = Gcm::new(Aes128::new(&key));
+        // H = E_K(0¹²⁸) and J0 for a 12-byte nonce, reconstructed as the code does.
+        let mut h = [0u8; 16];
+        Aes128::new(&key).encrypt_block(&mut h);
+        let h = u128::from_be_bytes(h);
+        let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+        let mut j0 = [0u8; 16];
+        j0[..12].copy_from_slice(&nonce);
+        j0[15] = 1;
+        let mut ej0 = j0;
+        Aes128::new(&key).encrypt_block(&mut ej0);
+        let ej0 = u128::from_be_bytes(ej0);
+
+        // msg lengths 0..=200 span 0..12+ blocks → every group/remainder residue
+        // and several full groups; AAD lengths probe the AAD→CT handoff.
+        for &aad_len in &[0usize, 1, 16, 17, 31, 48, 63] {
+            let aad: Vec<u8> = (0..aad_len).map(|i| (i as u8).wrapping_mul(31)).collect();
+            for msg_len in 0..=200usize {
+                let mut buf: Vec<u8> = (0..msg_len)
+                    .map(|i| (i as u8).wrapping_mul(37).wrapping_add(13))
+                    .collect();
+                let tag = g.encrypt(&nonce, &aad, &mut buf);
+                // buf now holds the ciphertext GHASH actually ran over.
+                let expected = (ej0 ^ ghash_serial_ref(h, &aad, &buf)).to_be_bytes();
+                assert_eq!(
+                    tag, expected,
+                    "tag mismatch at aad_len={aad_len} msg_len={msg_len}"
+                );
+            }
+        }
+    }
+
     // McGrew & Viega GCM test vectors (AES-128).
 
     #[test]
