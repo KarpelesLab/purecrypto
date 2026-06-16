@@ -4895,7 +4895,11 @@ mod tests {
                     (None, Some(b)) => b,
                     (None, None) => core::time::Duration::from_millis(50),
                 };
-                now = now.saturating_add(step + core::time::Duration::from_millis(1));
+                // `next_timeout()` reports an absolute deadline; over many
+                // drop-heavy rounds `now` can climb until a saturated deadline
+                // would make `step + 1ms` overflow `Duration`. Add saturating so
+                // the virtual clock pins at the max instead of panicking.
+                now = now.saturating_add(step.saturating_add(core::time::Duration::from_millis(1)));
                 c.on_timeout(now);
                 s.on_timeout(now);
             }

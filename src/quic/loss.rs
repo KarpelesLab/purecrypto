@@ -324,7 +324,7 @@ impl LossState {
         // latest_rtt - ack_delay)" rule), and only when this is a 1-RTT
         // ACK (Initial+Handshake have implicit ack_delay = 0 anyway).
         let _ = space; // ack_delay already scaled by the caller; per-space rule applied there
-        let adjusted_rtt = if self.min_rtt + ack_delay <= latest_rtt {
+        let adjusted_rtt = if self.min_rtt.saturating_add(ack_delay) <= latest_rtt {
             latest_rtt - ack_delay
         } else {
             latest_rtt
