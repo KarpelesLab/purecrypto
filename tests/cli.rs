@@ -96,6 +96,30 @@ fn enc_kwp_short_ciphertext_dies_cleanly() {
 }
 
 #[test]
+fn enc_ccm_bad_nonce_dies_cleanly() {
+    // AES-CCM accepts only a 7..=13-byte nonce (RFC 3610); `Ccm::validate`
+    // asserts this internally, so a wrong-length nonce must be rejected with a
+    // clean error rather than a panic/abort with a backtrace.
+    let bad_nonce = "00112233445566778899aabbccddeeff"; // 16 bytes (hex), out of range.
+    for alg in ["AES-128-CCM", "AES-256-CCM", "AES-128-CCM8", "AES-256-CCM8"] {
+        let key = if alg.starts_with("AES-256") {
+            "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+        } else {
+            "00112233445566778899aabbccddeeff"
+        };
+        let (_out, err, ok) = run_capture(
+            &["enc", "-alg", alg, "-key", key, "-nonce", bad_nonce],
+            b"hello",
+        );
+        assert!(!ok, "{alg}: out-of-range CCM nonce should fail");
+        assert!(
+            err.contains("AES-CCM nonce must be 7..=13 bytes"),
+            "{alg}: expected CCM nonce diagnostic, got stderr: {err}"
+        );
+    }
+}
+
+#[test]
 fn ca_workflow_genpkey_req_sign() {
     // Unique scratch dir for this test process.
     let dir = std::env::temp_dir().join(format!("pc_cli_{}", std::process::id()));

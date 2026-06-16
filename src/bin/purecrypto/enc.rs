@@ -91,7 +91,20 @@ fn key_size(alg: Algo) -> usize {
     }
 }
 
+/// CCM accepts only a 7..=13-byte nonce (RFC 3610). The `Ccm::validate` path
+/// asserts this internally, so a wrong-length nonce would `panic!` instead of
+/// reaching the CLI's clean `die()`. Guard it here, mirroring the explicit
+/// nonce-length checks the sibling AEAD arms perform via `try_into`.
+fn ccm_check_nonce(nonce: &[u8]) {
+    if !(7..=13).contains(&nonce.len()) {
+        die("AES-CCM nonce must be 7..=13 bytes (12 recommended)");
+    }
+}
+
 fn aead_encrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], buf: &mut Vec<u8>) {
+    if let Algo::Aes128Ccm | Algo::Aes256Ccm | Algo::Aes128Ccm8 | Algo::Aes256Ccm8 = alg {
+        ccm_check_nonce(nonce);
+    }
     let tag = match alg {
         Algo::Aes128Gcm => {
             let k: [u8; 16] = key.try_into().expect("aes-128 key length");
@@ -193,6 +206,9 @@ fn aead_decrypt(alg: Algo, key: &[u8], nonce: &[u8], aad: &[u8], ct_and_tag: &[u
         die("ciphertext shorter than the authentication tag");
     }
     let (ct, tag) = ct_and_tag.split_at(ct_and_tag.len() - tag_len);
+    if let Algo::Aes128Ccm | Algo::Aes256Ccm | Algo::Aes128Ccm8 | Algo::Aes256Ccm8 = alg {
+        ccm_check_nonce(nonce);
+    }
     let mut buf = ct.to_vec();
     let ok = match alg {
         Algo::Aes128Gcm => {
