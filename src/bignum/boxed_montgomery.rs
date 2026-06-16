@@ -46,6 +46,21 @@ fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, Limb) {
     (out, bo)
 }
 
+/// Best-effort wipe of a secret-dependent `Vec<Limb>` scratch buffer.
+///
+/// Mirrors the `core::hint::black_box`-guarded zeroing used by
+/// [`BoxedUint::zeroize`](super::boxed::BoxedUint) and the AEAD/MAC drop paths
+/// in `src/cipher`: the writes are unconditional (no data-dependent branch, so
+/// the constant-time property is preserved) and the `black_box` fence prevents
+/// LLVM from eliding them as a dead store.
+#[inline]
+fn zeroize_limbs(v: &mut [Limb]) {
+    for limb in v.iter_mut() {
+        *limb = 0;
+    }
+    let _ = core::hint::black_box(&v);
+}
+
 /// Selects `a` if `choice` is true, else `b`, limb-by-limb (constant time).
 fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> {
     (0..a.len())
@@ -149,10 +164,16 @@ impl BoxedMontModulus {
         }
 
         // Conditional final subtraction (result < 2N).
-        let (diff, borrow_low) = sbb_limbs(&t, n, 0);
+        let (mut diff, borrow_low) = sbb_limbs(&t, n, 0);
         let (_, borrow) = sbb(ts, 0, borrow_low);
         let ge = Choice::from((borrow ^ 1) as u8);
-        select_limbs(&diff, &t, ge)
+        let out = select_limbs(&diff, &t, ge);
+        // Scrub the secret-dependent CIOS scratch (`t`) and the rejected
+        // final-subtraction candidate (`diff`) before they drop. `out` is a
+        // freshly allocated Vec, so this does not touch the returned value.
+        zeroize_limbs(&mut t);
+        zeroize_limbs(&mut diff);
+        out
     }
 
     fn to_mont_limbs(&self, x: &[Limb]) -> Vec<Limb> {
@@ -261,9 +282,21 @@ impl BoxedMontModulus {
                     sel = select_limbs(t, &sel, Choice::from((j == digit) as u8));
                 }
                 acc = self.mont_mul_limbs(&acc, &sel);
+                // Scrub the per-nibble gather buffer (holds the selected
+                // window value, a base-derived secret) before it drops.
+                zeroize_limbs(&mut sel);
             }
         }
-        BoxedUint::from_limbs(self.demont_limbs(&acc))
+        // Construct the result first, then scrub the Montgomery accumulator
+        // and the precomputed window table (all base-derived secrets). The
+        // returned `BoxedUint` owns a fresh Vec from `demont_limbs`, so the
+        // zeroing below cannot corrupt it.
+        let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
+        zeroize_limbs(&mut acc);
+        for entry in table.iter_mut() {
+            zeroize_limbs(entry);
+        }
+        result
     }
 
     /// Computes `base^exp mod n` for a **public** exponent, sized to the
