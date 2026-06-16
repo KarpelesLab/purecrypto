@@ -398,9 +398,9 @@ fn key_ring_lookup_by_config_id() {
     )
     .unwrap();
     let ring = EchKeyRing::from_pairs(alloc::vec![kp1, kp2]);
-    assert!(ring.find_by_config_id(1).is_some());
-    assert!(ring.find_by_config_id(2).is_some());
-    assert!(ring.find_by_config_id(99).is_none());
+    assert_eq!(ring.matching_by_config_id(1).count(), 1);
+    assert_eq!(ring.matching_by_config_id(2).count(), 1);
+    assert_eq!(ring.matching_by_config_id(99).count(), 0);
     let list = ring.to_config_list();
     assert_eq!(list.configs.len(), 2);
 }
@@ -1176,6 +1176,69 @@ fn seal_and_decap_round_trip_x25519_aes128gcm() {
     // Decap on the server side and recover the inner CH.
     let recovered = try_decap_inner(&sealed.outer_ch, &ring).expect("decap");
     assert_eq!(recovered.inner_ch_bytes, inner);
+}
+
+/// Privacy regression: the 8-bit `config_id` is only a lookup hint and
+/// collides readily, so during operator key rotation two distinct
+/// `EchKeyPair`s can share one `config_id`. A client that picked the
+/// NEWER key must still decap even when an OLDER key with the same
+/// `config_id` sits earlier in the ring. draft-ietf-tls-esni-22 §7.1
+/// says the server SHOULD try ALL configs whose `config_id` matches;
+/// the old code committed to the first match, decap failed, and the
+/// connection was pushed onto the cleartext-SNI public_name path — the
+/// exact exposure ECH exists to prevent. Here both keys publish
+/// `config_id = 0x42`; the client seals under the second (newer) key,
+/// and decap MUST recover the inner CH by trying the second candidate.
+#[test]
+fn seal_and_decap_matches_second_key_sharing_config_id() {
+    let mut rng = drbg(b"seal-rotation-collision");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    // Two independent keys, SAME config_id (0x42), different key
+    // material (different public keys), as happens on an 8-bit
+    // config_id collision during rotation.
+    let old_pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites.clone(),
+    )
+    .expect("generate old");
+    let new_pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate new");
+    // The client holds the NEWER config and seals under it.
+    let new_config = new_pair.config().clone();
+    // The ring lists the OLDER key first, so a first-match-only server
+    // would attempt (and fail) decap against the old key.
+    let ring = EchKeyRing::from_pairs(alloc::vec![old_pair, new_pair]);
+
+    let inner = build_inner_ch_marker();
+    let sym = HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    };
+    let sealed = seal_with(&new_config, sym, &inner, 5, &mut rng, |enc, padded_len| {
+        let body = build_outer_ext_body(sym, 0x42, enc, padded_len);
+        build_outer_ch_with_ech(&body)
+    })
+    .expect("seal");
+
+    // Must succeed by sweeping past the colliding older key to the one
+    // the client actually used.
+    let recovered = try_decap_inner(&sealed.outer_ch, &ring).expect("decap newer key");
+    assert_eq!(recovered.inner_ch_bytes, inner);
+    assert_eq!(recovered.config_id, 0x42);
 }
 
 /// TLS-4 regression: the server-side decap path MUST verify that the

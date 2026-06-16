@@ -114,10 +114,11 @@ impl EchKeyPair {
 }
 
 /// An ordered ring of server-side ECH keys. Each incoming outer-CH ECH
-/// extension carries a `config_id`; the server picks the first
-/// matching pair to attempt decryption with. Multiple keys exist to
-/// support key rotation without breaking in-flight clients that may
-/// still hold an older config.
+/// extension carries a `config_id`; the server attempts decryption
+/// against every pair whose `config_id` matches (the 8-bit space
+/// collides, so a match is only a hint), in ring order, until one
+/// decaps. Multiple keys exist to support key rotation without breaking
+/// in-flight clients that may still hold an older config.
 #[derive(Clone, Debug)]
 pub struct EchKeyRing {
     pub(crate) pairs: Vec<EchKeyPair>,
@@ -139,9 +140,17 @@ impl EchKeyRing {
         self.pairs.push(pair);
     }
 
-    /// Find the first pair with this `config_id`.
-    pub(crate) fn find_by_config_id(&self, config_id: u8) -> Option<&EchKeyPair> {
-        self.pairs.iter().find(|p| p.config_id() == config_id)
+    /// Iterate over every pair whose `config_id` matches, in ring
+    /// order. The 8-bit `config_id` space collides readily, and during
+    /// operator key rotation two distinct `EchKeyPair`s can legitimately
+    /// share one `config_id`. draft-ietf-tls-esni §7.1 says the server
+    /// SHOULD try ALL configs whose `config_id` matches before treating
+    /// the ECH as rejected, so the consumer attempts HPKE decap against
+    /// each candidate rather than committing to the first one.
+    pub(crate) fn matching_by_config_id(&self, config_id: u8) -> impl Iterator<Item = &EchKeyPair> {
+        self.pairs
+            .iter()
+            .filter(move |p| p.config_id() == config_id)
     }
 
     /// Publish the keys as an `ECHConfigList` clients can use to seal.

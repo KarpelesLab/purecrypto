@@ -333,39 +333,63 @@ pub(crate) fn try_decap_inner(
     // Locate and parse the extension body so we recover (sym, config_id, enc).
     let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
 
-    let pair = keys
-        .find_by_config_id(config_id)
-        .ok_or(Error::EchDecryptionFailed)?;
     // Per draft-ietf-tls-esni-22 §7.1, the client's chosen HPKE
     // symmetric suite MUST be one the server published in this
     // ECHConfig's `cipher_suites`. If it isn't, treat the ECH as a
     // rejection (fall back to the outer ClientHello / retry_configs)
     // rather than attempting decap with an unannounced suite.
     let (kdf, aead) = map_sym_suite(sym)?;
-    if !pair.accepts(kdf, aead) {
-        return Err(Error::EchDecryptionFailed);
+    // The 8-bit `config_id` is only a hint: during key rotation two
+    // distinct keys can share it. Per §7.1 the server SHOULD try every
+    // config whose `config_id` matches before rejecting, so iterate the
+    // ring and attempt HPKE decap against each candidate (skipping any
+    // whose announced suites don't include the client's chosen
+    // (kdf, aead)). The first candidate that decaps cleanly and yields a
+    // well-formed inner CH wins. Only if every candidate fails do we
+    // fall back to the reject / public_name path — identical in outcome
+    // to committing to a single key, but without the rotation-induced
+    // SNI-leak when the client used a newer same-config_id key.
+    for pair in keys.matching_by_config_id(config_id) {
+        if !pair.accepts(kdf, aead) {
+            continue;
+        }
+        let (mut receiver, _suite) =
+            match setup_receiver(pair.config(), pair.private_key_bytes(), &enc, sym) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+        let plaintext = match receiver.open(&aad, &ciphertext) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        // A successful AEAD `open` authenticates this candidate: the
+        // ciphertext was sealed under exactly this key + AAD, so this is
+        // the client's intended config. From here on, any malformation
+        // of the recovered inner CH is a hard protocol error
+        // (`illegal_parameter`), NOT a reason to try another key or to
+        // fall back to the public_name path — trying further keys after
+        // an authenticated open could never succeed and would only blur
+        // the failure mode.
+        //
+        // Strip trailing zero padding to recover the encoded inner CH.
+        // Padding consists of an arbitrary number of trailing zero
+        // bytes; since a ClientHello body is length-prefixed, anything
+        // past the declared length is padding.
+        let unpadded = strip_trailing_padding(&plaintext)?;
+        // Per draft §7.1, the recovered inner CH MUST carry an
+        // `encrypted_client_hello` extension with the inner-form body
+        // (`[0x01]`). Reject as malformed otherwise (maps to
+        // illegal_parameter at the alert layer).
+        require_inner_marker(&unpadded)?;
+        return Ok(DecappedInner {
+            inner_ch_bytes: unpadded,
+            receiver,
+            sym,
+            config_id,
+        });
     }
-    let (mut receiver, _suite) =
-        setup_receiver(pair.config(), pair.private_key_bytes(), &enc, sym)?;
-    let plaintext = receiver
-        .open(&aad, &ciphertext)
-        .map_err(|_| Error::EchDecryptionFailed)?;
-    // Strip trailing zero padding to recover the encoded inner CH.
-    // Padding consists of an arbitrary number of trailing zero bytes;
-    // since a ClientHello body is length-prefixed, anything past the
-    // declared length is padding.
-    let unpadded = strip_trailing_padding(&plaintext)?;
-    // Per draft §7.1, the recovered inner CH MUST carry an
-    // `encrypted_client_hello` extension with the inner-form body
-    // (`[0x01]`). Reject as malformed otherwise (maps to
-    // illegal_parameter at the alert layer).
-    require_inner_marker(&unpadded)?;
-    Ok(DecappedInner {
-        inner_ch_bytes: unpadded,
-        receiver,
-        sym,
-        config_id,
-    })
+    // No matching config decapped successfully → ECH reject.
+    Err(Error::EchDecryptionFailed)
 }
 
 /// Server-side CH2-outer decap on the HRR retry path. Uses the
