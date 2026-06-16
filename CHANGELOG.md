@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.13](https://github.com/KarpelesLab/purecrypto/compare/v0.6.12...v0.6.13) - 2026-06-16
+
+### Other
+
+- fix Duration-overflow panic in out_of_order loss test (CI flake)
+- strict-DER finish() on RSA SPKI + ct PATH_RESPONSE compare
+- server SHOULD try all configs sharing a config_id before reject
+- reject out-of-range AES-CCM nonce with clean die() instead of panic
+- add differential test guarding aggregated-reduction GHASH
+- scrub secret modexp Vec<Limb> scratch on drop
+
 ## [0.6.12](https://github.com/KarpelesLab/purecrypto/compare/v0.6.11...v0.6.12) - 2026-06-15
 
 ### Other
