@@ -43,6 +43,7 @@ fn parse_rsa_spki(spki: &[u8]) -> Result<BoxedRsaPublicKey, Error> {
     }
     let key_bits = outer.read_bit_string()?;
     outer.finish()?;
+    reader.finish()?;
     Ok(BoxedRsaPublicKey::from_pkcs1_der(key_bits)?)
 }
 

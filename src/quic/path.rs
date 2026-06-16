@@ -88,7 +88,12 @@ impl PathChallengeState {
     /// caller can use the return value to mark the path validated.
     /// Returns `false` for unsolicited / stale PATH_RESPONSE.
     pub(crate) fn on_response(&mut self, data: [u8; 8]) -> bool {
-        if let Some(idx) = self.outstanding.iter().position(|(d, _)| d == &data) {
+        use crate::ct::ConstantTimeEq;
+        if let Some(idx) = self
+            .outstanding
+            .iter()
+            .position(|(d, _)| bool::from(d.ct_eq(&data)))
+        {
             self.outstanding.remove(idx);
             true
         } else {
