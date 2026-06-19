@@ -91,6 +91,12 @@ ristretto255 = ["ec", "hash", "rng"]
 # ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
 # the RNG trait are required.
 mlkem = ["hash", "rng"]
+# Falcon / FN-DSA (FIPS 206 draft) signature VERIFICATION ONLY — Falcon-512 and
+# Falcon-1024. Key generation and signing are deliberately out of scope (they
+# need a constant-time floating-point lattice Gaussian sampler); verify needs
+# only SHAKE-256 (HashToPoint) plus integer arithmetic mod q=12289 and `alloc`
+# for the heap-backed polynomial buffers.
+falcon = ["hash", "alloc"]
 # ML-DSA (FIPS 204) signatures. Needs alloc for the variable-width signature
 # encoding; the polynomial arithmetic itself is on the stack.
 mldsa = ["hash", "rng", "alloc"]

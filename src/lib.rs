@@ -61,6 +61,9 @@ pub mod kdf;
 #[cfg(feature = "mac")]
 pub mod mac;
 
+#[cfg(feature = "falcon")]
+pub mod falcon;
+
 #[cfg(feature = "mldsa")]
 pub mod mldsa;
 
