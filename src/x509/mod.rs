@@ -13,6 +13,7 @@ mod name;
 pub mod ocsp;
 mod privkey;
 mod pubkey;
+pub mod sct;
 mod signer;
 mod time;
 
@@ -27,6 +28,7 @@ pub use ocsp::{
 };
 pub use privkey::{AnyPrivateKey, Pkcs8ReadOptions};
 pub use pubkey::AnyPublicKey;
+pub use sct::{CtLog, Sct, SctVerification, SctVersion};
 pub use signer::CertSigner;
 pub use time::{Time, Validity};
 
@@ -122,8 +124,27 @@ pub mod oid {
     pub const NAME_CONSTRAINTS: &[u64] = &[2, 5, 29, 30];
     /// `id-ce-certificatePolicies` (2.5.29.32).
     pub const CERTIFICATE_POLICIES: &[u64] = &[2, 5, 29, 32];
+    /// `anyPolicy` (2.5.29.32.0) — the special policy identifier that, in a
+    /// `certificatePolicies` extension, asserts the CA makes no policy
+    /// commitment, and in `inhibitAnyPolicy` / policy processing is the
+    /// wildcard (RFC 5280 §4.2.1.4).
+    pub const ANY_POLICY: &[u64] = &[2, 5, 29, 32, 0];
+    /// `id-ce-policyMappings` (2.5.29.33) (RFC 5280 §4.2.1.5).
+    pub const POLICY_MAPPINGS: &[u64] = &[2, 5, 29, 33];
+    /// `id-ce-policyConstraints` (2.5.29.36) (RFC 5280 §4.2.1.11).
+    pub const POLICY_CONSTRAINTS: &[u64] = &[2, 5, 29, 36];
+    /// `id-ce-inhibitAnyPolicy` (2.5.29.54) (RFC 5280 §4.2.1.14).
+    pub const INHIBIT_ANY_POLICY: &[u64] = &[2, 5, 29, 54];
     /// `id-ce-cRLDistributionPoints` (2.5.29.31).
     pub const CRL_DISTRIBUTION_POINTS: &[u64] = &[2, 5, 29, 31];
+    /// `SignedCertificateTimestampList` (1.3.6.1.4.1.11129.2.4.2) — the
+    /// X.509v3 extension that carries embedded SCTs in a certificate
+    /// (RFC 6962 §3.3).
+    pub const SCT_LIST: &[u64] = &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 2];
+    /// `CT Precertificate Poison` (1.3.6.1.4.1.11129.2.4.3) — the critical
+    /// extension that marks a precertificate (RFC 6962 §3.1). It is removed
+    /// from the TBSCertificate when reconstructing the signed precert entry.
+    pub const CT_POISON: &[u64] = &[1, 3, 6, 1, 4, 1, 11129, 2, 4, 3];
     /// `id-kp-codeSigning` (1.3.6.1.5.5.7.3.3).
     pub const ID_KP_CODE_SIGNING: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 3, 3];
     /// `id-kp-emailProtection` (1.3.6.1.5.5.7.3.4).

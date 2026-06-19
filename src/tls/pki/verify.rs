@@ -121,6 +121,29 @@ pub(crate) fn verify_chain_for_purpose(
     verify_chain_with_crls_for_purpose(store, &empty, chain, now, policy, purpose)
 }
 
+/// Like [`verify_chain_with_crls_for_purpose`], but additionally runs RFC 5280
+/// §6.1 certificate-policy-tree processing over the validated path under
+/// `policy_opts`.
+///
+/// Policy processing is **opt-in**: with [`super::PolicyOptions::none`] (the
+/// value every other entry point passes) this is identical to
+/// [`verify_chain_with_crls_for_purpose`] and the default validation behavior
+/// is unchanged. When the caller supplies an initial policy set / requires an
+/// explicit policy, a path whose computed policy tree cannot satisfy the
+/// requirement is rejected with [`Error::BadCertificate`].
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn verify_chain_with_policy(
+    store: &RootCertStore,
+    crls: &CrlStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+    purpose: ChainPurpose,
+    policy_opts: &super::policy::PolicyOptions,
+) -> Result<AnyPublicKey, Error> {
+    verify_chain_inner(store, crls, chain, now, policy, purpose, policy_opts)
+}
+
 pub(crate) fn verify_chain_with_crls_for_purpose(
     store: &RootCertStore,
     crls: &CrlStore,
@@ -128,6 +151,27 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     now: Option<&Time>,
     policy: &SignaturePolicy,
     purpose: ChainPurpose,
+) -> Result<AnyPublicKey, Error> {
+    verify_chain_inner(
+        store,
+        crls,
+        chain,
+        now,
+        policy,
+        purpose,
+        &super::policy::PolicyOptions::none(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_chain_inner(
+    store: &RootCertStore,
+    crls: &CrlStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+    purpose: ChainPurpose,
+    policy_opts: &super::policy::PolicyOptions,
 ) -> Result<AnyPublicKey, Error> {
     if chain.is_empty() {
         return Err(Error::BadCertificate);
@@ -216,8 +260,13 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
         cert.check_signature_algid_consistent()
             .map_err(|_| Error::BadCertificate)?;
         // RFC 5280 §4.2: a `critical` extension whose OID we don't understand
-        // requires rejection.
-        check_critical_extensions_recognized(cert)?;
+        // requires rejection. When the caller has enabled policy processing,
+        // the policy-related critical extensions (certificatePolicies,
+        // policyMappings, policyConstraints, inhibitAnyPolicy) ARE processed
+        // by `check_policies` below, so they count as recognized; with policy
+        // processing disabled (the default) they remain fail-closed exactly as
+        // before — the default path is unchanged.
+        check_critical_extensions_recognized(cert, policy_opts.policy_processing_enabled())?;
     }
 
     // Each certificate in the path must currently be within its validity
@@ -247,6 +296,11 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
     // RFC 5280 §4.2.1.9 / §4.2.1.3 / §4.2.1.12 enforcement (CA / keyUsage /
     // extKeyUsage), over the validated path.
     enforce_constraints(path, purpose)?;
+
+    // RFC 5280 §6.1.2–§6.1.5 — certificate-policy-tree processing. A no-op
+    // (returns immediately) when `policy_opts` does not enable policy
+    // processing, so the default path is unaffected.
+    super::policy::check_policies(path, policy_opts)?;
 
     certs[0]
         .subject_public_key()
@@ -655,7 +709,10 @@ fn ip_in_subtree(host: &[u8], addr: &[u8], mask: &[u8]) -> bool {
 /// critical constraint mentions any other type we route it through the same
 /// fail-closed path as an unknown OID — accepting it would let a constraint
 /// we can't check appear to have been honored.
-fn check_critical_extensions_recognized(cert: &Certificate) -> Result<(), Error> {
+fn check_critical_extensions_recognized(
+    cert: &Certificate,
+    policy_processing: bool,
+) -> Result<(), Error> {
     let critical = cert
         .critical_extension_oids()
         .map_err(|_| Error::BadCertificate)?;
@@ -665,6 +722,19 @@ fn check_critical_extensions_recognized(cert: &Certificate) -> Result<(), Error>
             || bytes == oid::KEY_USAGE
             || bytes == oid::EXT_KEY_USAGE
             || bytes == oid::SUBJECT_ALT_NAME
+        {
+            continue;
+        }
+        // Policy-related critical extensions are "recognized" only when the
+        // caller enabled policy processing — `check_policies` then evaluates
+        // them. With policy processing off (the default) they fall through to
+        // the fail-closed unknown-critical rejection, preserving the
+        // pre-existing default behavior exactly.
+        if policy_processing
+            && (bytes == oid::CERTIFICATE_POLICIES
+                || bytes == oid::POLICY_MAPPINGS
+                || bytes == oid::POLICY_CONSTRAINTS
+                || bytes == oid::INHIBIT_ANY_POLICY)
         {
             continue;
         }

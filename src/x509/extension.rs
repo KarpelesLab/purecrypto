@@ -324,6 +324,69 @@ pub fn certificate_policies(policy_oids: &[&[u64]]) -> Extension {
     }
 }
 
+/// `policyMappings` (RFC 5280 §4.2.1.5). Each pair is
+/// `(issuerDomainPolicy, subjectDomainPolicy)` OID arcs. The RFC marks this
+/// SHOULD-critical; emitted critical here.
+pub fn policy_mappings(pairs: &[(&[u64], &[u64])]) -> Extension {
+    let mut body = Vec::new();
+    for (issuer, subject) in pairs {
+        // PolicyMapping ::= SEQUENCE { issuerDomainPolicy OID,
+        //                              subjectDomainPolicy OID }
+        let pair = [oid_tlv(issuer), oid_tlv(subject)].concat();
+        body.extend_from_slice(&encode_sequence(&pair));
+    }
+    Extension {
+        oid: oid::POLICY_MAPPINGS.to_vec(),
+        critical: true,
+        value: encode_sequence(&body),
+    }
+}
+
+/// `policyConstraints` (RFC 5280 §4.2.1.11). `require_explicit` and
+/// `inhibit_mapping` are the two OPTIONAL `SkipCerts` (INTEGER) fields. Always
+/// critical (the RFC mandates it).
+pub fn policy_constraints(
+    require_explicit: Option<u32>,
+    inhibit_mapping: Option<u32>,
+) -> Extension {
+    let mut body = Vec::new();
+    // requireExplicitPolicy [0] IMPLICIT SkipCerts — IMPLICIT INTEGER, so the
+    // INTEGER body is carried under the primitive context tag 0x80.
+    if let Some(n) = require_explicit {
+        let int = encode_integer(&n.to_be_bytes());
+        // Strip the INTEGER tag+len, keep the content, re-tag as [0] primitive.
+        body.extend_from_slice(&encode_tlv(0x80, integer_content(&int)));
+    }
+    if let Some(n) = inhibit_mapping {
+        let int = encode_integer(&n.to_be_bytes());
+        body.extend_from_slice(&encode_tlv(0x81, integer_content(&int)));
+    }
+    Extension {
+        oid: oid::POLICY_CONSTRAINTS.to_vec(),
+        critical: true,
+        value: encode_sequence(&body),
+    }
+}
+
+/// `inhibitAnyPolicy` (RFC 5280 §4.2.1.14). The value is a bare `SkipCerts`
+/// INTEGER. Always critical (the RFC mandates it).
+pub fn inhibit_any_policy(skip_certs: u32) -> Extension {
+    Extension {
+        oid: oid::INHIBIT_ANY_POLICY.to_vec(),
+        critical: true,
+        value: encode_integer(&skip_certs.to_be_bytes()),
+    }
+}
+
+/// Returns the content octets of a DER INTEGER TLV produced by
+/// [`encode_integer`] (strips the `02 LL` prefix). The length is always a
+/// single byte here because `encode_integer` of a `u32` magnitude never
+/// exceeds 5 content bytes.
+fn integer_content(int_tlv: &[u8]) -> &[u8] {
+    // int_tlv = [0x02, len, content...]; len is one byte for our small values.
+    &int_tlv[2..]
+}
+
 /// `cRLDistributionPoints` (RFC 5280 §4.2.1.13). Non-critical.
 ///
 /// Each URL becomes a `DistributionPoint` with the URI carried as a
@@ -350,6 +413,30 @@ pub fn crl_distribution_points(urls: &[&str]) -> Extension {
         oid: oid::CRL_DISTRIBUTION_POINTS.to_vec(),
         critical: false,
         value: encode_sequence(&body),
+    }
+}
+
+/// `SignedCertificateTimestampList` embedded-SCT extension
+/// (1.3.6.1.4.1.11129.2.4.2, RFC 6962 §3.3). `tls_sct_list` is the
+/// TLS-serialized `SignedCertificateTimestampList` (its own 2-byte total
+/// length prefix included); this wraps it in the DER `OCTET STRING` the
+/// extension's `extnValue` carries. Non-critical (RFC 6962 §3.3). Primarily a
+/// test / tooling helper — CAs normally obtain this list from the logs.
+pub fn sct_list(tls_sct_list: &[u8]) -> Extension {
+    Extension {
+        oid: oid::SCT_LIST.to_vec(),
+        critical: false,
+        value: encode_octet_string(tls_sct_list),
+    }
+}
+
+/// `CT Precertificate Poison` extension (1.3.6.1.4.1.11129.2.4.3, RFC 6962
+/// §3.1). Critical, value is `DER NULL`. Marks a precertificate.
+pub fn ct_poison() -> Extension {
+    Extension {
+        oid: oid::CT_POISON.to_vec(),
+        critical: true,
+        value: crate::der::encode_null(),
     }
 }
 

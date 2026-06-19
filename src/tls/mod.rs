@@ -82,5 +82,5 @@ pub use groups::NamedGroup;
 pub use keylog::KeyLog;
 #[cfg(feature = "std")]
 pub use keylog::{WriterKeyLog, file_keylog};
-pub use pki::{CrlStore, RootCertStore};
+pub use pki::{CrlStore, PolicyOptions, RootCertStore};
 pub use version::{ContentType, ProtocolVersion};

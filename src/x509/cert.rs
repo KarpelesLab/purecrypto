@@ -743,6 +743,179 @@ impl Certificate {
         Ok(out)
     }
 
+    /// Returns the `policyIdentifier` OIDs from the `certificatePolicies`
+    /// extension (RFC 5280 §4.2.1.4), in order, or an empty list if the
+    /// certificate has no such extension. `anyPolicy` (2.5.29.32.0) is
+    /// surfaced like any other OID — the policy-tree validator interprets it.
+    ///
+    /// Policy qualifiers are parsed-past but not returned (only the leading
+    /// `policyIdentifier` of each `PolicyInformation` is needed for path
+    /// validation). The second flag of the tuple reports whether the
+    /// extension was marked critical.
+    #[allow(clippy::type_complexity)]
+    pub fn certificate_policies(&self) -> Result<Option<(Vec<Vec<u64>>, bool)>, Error> {
+        let mut out: Option<(Vec<Vec<u64>>, bool)> = None;
+        self.walk_extensions(|id, critical, value| {
+            if id == oid::CERTIFICATE_POLICIES {
+                let mut oids = Vec::new();
+                let mut r = Reader::new(value);
+                let mut seq = r.read_sequence()?;
+                // PolicyInformation ::= SEQUENCE { policyIdentifier OID,
+                //   policyQualifiers SEQUENCE OF .. OPTIONAL }
+                while !seq.is_empty() {
+                    let mut pi = seq.read_sequence()?;
+                    let pid = parse_oid(pi.read_oid()?)?;
+                    // RFC 5280 §4.2.1.4: at most one PolicyInformation per
+                    // policyIdentifier. A duplicate is a parser-confusion
+                    // vector (two validators disagreeing on which entry wins),
+                    // so reject it.
+                    if oids
+                        .iter()
+                        .any(|p: &Vec<u64>| p.as_slice() == pid.as_slice())
+                    {
+                        return Err(Error::Malformed);
+                    }
+                    oids.push(pid);
+                    // Ignore the optional policyQualifiers (we don't surface
+                    // them) but require a clean structure: any remaining
+                    // element is the qualifiers SEQUENCE, which we skip.
+                    if !pi.is_empty() {
+                        pi.read_element()?;
+                    }
+                    pi.finish()?;
+                }
+                r.finish()?;
+                out = Some((oids, critical));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the `policyMappings` extension (RFC 5280 §4.2.1.5) as a list of
+    /// `(issuerDomainPolicy, subjectDomainPolicy)` OID pairs, or `None` if
+    /// absent. The boolean reports the extension's critical flag.
+    ///
+    /// RFC 5280 §4.2.1.5: a CA MUST NOT map to or from `anyPolicy`; such a
+    /// mapping is rejected as malformed.
+    #[allow(clippy::type_complexity)]
+    pub fn policy_mappings(&self) -> Result<Option<(Vec<(Vec<u64>, Vec<u64>)>, bool)>, Error> {
+        let mut out: Option<(Vec<(Vec<u64>, Vec<u64>)>, bool)> = None;
+        self.walk_extensions(|id, critical, value| {
+            if id == oid::POLICY_MAPPINGS {
+                let mut pairs = Vec::new();
+                let mut r = Reader::new(value);
+                let mut seq = r.read_sequence()?;
+                if seq.is_empty() {
+                    // SEQUENCE SIZE (1..MAX): an empty mapping list is malformed.
+                    return Err(Error::Malformed);
+                }
+                while !seq.is_empty() {
+                    let mut m = seq.read_sequence()?;
+                    let issuer = parse_oid(m.read_oid()?)?;
+                    let subject = parse_oid(m.read_oid()?)?;
+                    m.finish()?;
+                    // RFC 5280 §4.2.1.5: neither domain policy may be anyPolicy.
+                    if issuer.as_slice() == oid::ANY_POLICY || subject.as_slice() == oid::ANY_POLICY
+                    {
+                        return Err(Error::Malformed);
+                    }
+                    pairs.push((issuer, subject));
+                }
+                r.finish()?;
+                out = Some((pairs, critical));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the `policyConstraints` extension (RFC 5280 §4.2.1.11) as
+    /// `(requireExplicitPolicy, inhibitPolicyMapping)` skip-counts, each
+    /// `Option<u32>` (`None` when that field is absent). The boolean reports
+    /// the critical flag. Returns `None` for the whole tuple if the
+    /// certificate carries no `policyConstraints` extension.
+    #[allow(clippy::type_complexity)]
+    pub fn policy_constraints(&self) -> Result<Option<(Option<u32>, Option<u32>, bool)>, Error> {
+        let mut out: Option<(Option<u32>, Option<u32>, bool)> = None;
+        self.walk_extensions(|id, critical, value| {
+            if id == oid::POLICY_CONSTRAINTS {
+                let mut r = Reader::new(value);
+                let mut seq = r.read_sequence()?;
+                // PolicyConstraints ::= SEQUENCE {
+                //   requireExplicitPolicy [0] SkipCerts OPTIONAL,
+                //   inhibitPolicyMapping  [1] SkipCerts OPTIONAL }
+                // SkipCerts ::= INTEGER (0..MAX). The fields are IMPLICIT-
+                // tagged on a primitive INTEGER, so they carry the PRIMITIVE
+                // context tags 0x80 ([0]) / 0x81 ([1]) — not the constructed
+                // 0xA0 / 0xA1.
+                const CTX0: u8 = 0x80;
+                const CTX1: u8 = 0x81;
+                let require = if seq.peek_tag() == Some(CTX0) {
+                    Some(read_skipcerts(seq.read_tlv(CTX0)?)?)
+                } else {
+                    None
+                };
+                let inhibit = if seq.peek_tag() == Some(CTX1) {
+                    Some(read_skipcerts(seq.read_tlv(CTX1)?)?)
+                } else {
+                    None
+                };
+                seq.finish()?;
+                r.finish()?;
+                // RFC 5280 §4.2.1.11: the extension MUST carry at least one
+                // of the two fields — an empty SEQUENCE is malformed.
+                if require.is_none() && inhibit.is_none() {
+                    return Err(Error::Malformed);
+                }
+                out = Some((require, inhibit, critical));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the `inhibitAnyPolicy` skip-count (RFC 5280 §4.2.1.14), or
+    /// `None` if the extension is absent. The boolean reports the critical
+    /// flag (the RFC requires this extension to be critical).
+    pub fn inhibit_any_policy(&self) -> Result<Option<(u32, bool)>, Error> {
+        let mut out: Option<(u32, bool)> = None;
+        self.walk_extensions(|id, critical, value| {
+            if id == oid::INHIBIT_ANY_POLICY {
+                // InhibitAnyPolicy ::= SkipCerts ::= INTEGER (0..MAX).
+                let mut r = Reader::new(value);
+                let n = read_skipcerts(r.read_tlv(tag::INTEGER)?)?;
+                r.finish()?;
+                out = Some((n, critical));
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the raw inner DER (the `extnValue` body) of the
+    /// `SignedCertificateTimestampList` extension (RFC 6962 §3.3), or `None`
+    /// if the certificate carries no embedded-SCT extension. The body is the
+    /// DER OCTET STRING wrapping the TLS-serialized SCT list — see
+    /// [`crate::x509::sct`] for parsing.
+    pub fn sct_list_extension(&self) -> Result<Option<Vec<u8>>, Error> {
+        let mut out = None;
+        self.walk_extensions(|id, _critical, value| {
+            if id == oid::SCT_LIST {
+                out = Some(value.to_vec());
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Returns the raw DER `TBSCertificate` element (tag-length-value) — the
+    /// bytes the certificate signature commits to. Exposed for RFC 6962
+    /// precertificate reconstruction in [`crate::x509::sct`].
+    pub(crate) fn tbs_der(&self) -> Result<&[u8], Error> {
+        Ok(self.parts()?.tbs)
+    }
+
     /// Returns the `keyUsage` bit-mask, or `None` if the certificate has no
     /// such extension. The mask is read MSB-first per BIT STRING wire order:
     /// `keyUsage` bit 0 (`digitalSignature`) appears in `mask & 0x80`,
@@ -1271,6 +1444,48 @@ fn parse_subtrees(
         }
     }
     Ok(())
+}
+
+/// Decodes a `SkipCerts ::= INTEGER (0..MAX)` value body (the raw INTEGER
+/// content octets) into a `u32`, applying strict-DER unsigned-integer rules
+/// (no negative encodings, at most one leading `0x00`) and rejecting values
+/// that don't fit in 32 bits. Used by `policyConstraints` and
+/// `inhibitAnyPolicy` (RFC 5280 §4.2.1.11 / §4.2.1.14).
+fn read_skipcerts(body: &[u8]) -> Result<u32, Error> {
+    // `body` is the content octets of the INTEGER (the [0]/[1] IMPLICIT
+    // context tag already stripped for policyConstraints, or the bare INTEGER
+    // body for inhibitAnyPolicy). Strict-DER unsigned-integer rules:
+    //   * non-empty,
+    //   * a leading 0x00 is permitted only when the next byte's high bit is
+    //     set (otherwise it's a non-canonical leading zero),
+    //   * the top bit of the first octet must be clear (SkipCerts is a
+    //     non-negative INTEGER (0..MAX); a set high bit is a negative
+    //     two's-complement encoding).
+    if body.is_empty() {
+        return Err(Error::Malformed);
+    }
+    if body[0] & 0x80 != 0 {
+        // Negative encoding — not allowed for SkipCerts.
+        return Err(Error::Malformed);
+    }
+    let mag: &[u8] = match body {
+        // A leading 0x00 followed by a byte whose high bit is set is the only
+        // legitimate leading-zero (the sign byte); any other leading 0x00 is
+        // non-canonical. (We already rejected body[0] & 0x80, so a lone 0x00
+        // is the canonical encoding of zero and passes through.)
+        [0x00] => body,
+        [0x00, b, ..] if b & 0x80 != 0 => &body[1..],
+        [0x00, ..] => return Err(Error::Malformed),
+        other => other,
+    };
+    if mag.len() > 4 {
+        return Err(Error::Malformed);
+    }
+    let mut v: u32 = 0;
+    for &b in mag {
+        v = (v << 8) | b as u32;
+    }
+    Ok(v)
 }
 
 #[cfg(test)]
