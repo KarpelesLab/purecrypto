@@ -48,9 +48,15 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
             CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
             CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
             CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-            // secp256k1 / SM2 have no IANA TLS signature scheme; fall back to
-            // the P-256 code point (they are never negotiated over TLS).
-            CurveId::Secp256k1 | CurveId::Sm2p256v1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+            // secp256k1 / SM2 / Brainpool have no IANA TLS signature scheme;
+            // fall back to the matched-hash NIST code point (they are never
+            // negotiated over TLS). Brainpool maps by hash width so the
+            // reported scheme's hash matches the signing hash below.
+            CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
+                SignatureScheme::ECDSA_SECP256R1_SHA256
+            }
+            CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+            CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
         },
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         ServerKey::Ed448(_) => SignatureScheme::ED448,
@@ -77,8 +83,8 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
         ServerKey::Ecdsa(k) => {
             let curve = k.curve();
             let sig = match curve {
-                CurveId::P384 => k.sign::<Sha384>(content),
-                CurveId::P521 => k.sign::<Sha512>(content),
+                CurveId::P384 | CurveId::BrainpoolP384r1 => k.sign::<Sha384>(content),
+                CurveId::P521 | CurveId::BrainpoolP512r1 => k.sign::<Sha512>(content),
                 _ => k.sign::<Sha256>(content),
             }
             .map_err(|_| Error::HandshakeFailure)?;

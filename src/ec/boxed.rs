@@ -936,6 +936,110 @@ mod tests {
         sk.public_key().verify::<Sha512>(b"sample", &sig).unwrap();
     }
 
+    // Brainpool (RFC 5639) sign+verify round-trip on each curve, using the
+    // curve's matched hash (P256r1/SHA-256, P384r1/SHA-384, P512r1/SHA-512).
+    #[test]
+    fn brainpool_sign_verify_roundtrip() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"brainpool-rt", b"nonce", &[]);
+
+        // P256r1 / SHA-256.
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP256r1, &mut rng);
+        let pk = sk.public_key();
+        let sig = sk.sign::<Sha256>(b"hello brainpool p256").unwrap();
+        pk.verify::<Sha256>(b"hello brainpool p256", &sig).unwrap();
+        assert!(pk.verify::<Sha256>(b"tampered", &sig).is_err());
+        let sec1 = pk.to_sec1();
+        assert_eq!(
+            BoxedEcdsaPublicKey::from_sec1(CurveId::BrainpoolP256r1, &sec1)
+                .unwrap()
+                .to_sec1(),
+            sec1
+        );
+
+        // P384r1 / SHA-384.
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP384r1, &mut rng);
+        let pk = sk.public_key();
+        let sig = sk.sign::<Sha384>(b"hello brainpool p384").unwrap();
+        pk.verify::<Sha384>(b"hello brainpool p384", &sig).unwrap();
+        assert!(pk.verify::<Sha384>(b"tampered", &sig).is_err());
+
+        // P512r1 / SHA-512.
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::BrainpoolP512r1, &mut rng);
+        let pk = sk.public_key();
+        let sig = sk.sign::<Sha512>(b"hello brainpool p512").unwrap();
+        pk.verify::<Sha512>(b"hello brainpool p512", &sig).unwrap();
+        assert!(pk.verify::<Sha512>(b"tampered", &sig).is_err());
+    }
+
+    // Authoritative known-answer vectors from Google/C2SP Wycheproof
+    // (`ecdsa_brainpool{P256,P384,P512}r1_sha{256,384,512}_test.json`,
+    // testvectors_v1). Each pins a published (public key, message, DER
+    // signature) triple that MUST verify, anchoring the Brainpool curve
+    // arithmetic and ECDSA verify path against an independent reference. RFC
+    // 6979 itself carries no Brainpool deterministic vectors, so a verify-only
+    // KAT against an external suite is the strongest pin available.
+    #[test]
+    fn brainpool_wycheproof_kat() {
+        // All three groups use tcId 2: msg = "Msg" (0x4d7367), result "valid".
+        let msg = from_hex("4d7367");
+
+        // brainpoolP256r1 / SHA-256.
+        let pk = BoxedEcdsaPublicKey::from_sec1(
+            CurveId::BrainpoolP256r1,
+            &from_hex(
+                "042676bd1e3fd83f3328d1af941442c036760f09587729419053083eb61d1ed2\
+                 2c2cf769688a5ffd67da1899d243e66bcabe21f9e78335263bf5308b8e41a71b39",
+            ),
+        )
+        .unwrap();
+        let sig = BoxedEcdsaSignature::from_der(&from_hex(
+            "304502200ff9279a0775740b7db8bec07f9a0401b7903886cb198c1b18c46de067\
+             3b31c30221008b3c8686bd1a1508b5b785e762fece8c6cf19b6156983e5c36b2bbe724d6c23e",
+        ))
+        .unwrap();
+        pk.verify::<Sha256>(&msg, &sig).unwrap();
+        // A one-byte tweak to the message must fail.
+        assert!(pk.verify::<Sha256>(b"msg", &sig).is_err());
+
+        // brainpoolP384r1 / SHA-384.
+        let pk = BoxedEcdsaPublicKey::from_sec1(
+            CurveId::BrainpoolP384r1,
+            &from_hex(
+                "046c9aaba343cb2faf098319cc4d15ea218786f55c8cf0a8b668091170a6422f\
+                 6c2498945a8164a4b6f27cdd11e800da501be961b37b09804610ce0df40dd8236\
+                 c75a12d0c8014b163464a4aeba7cb18d20d3222083ec4a941852f24aa3d5d84e3",
+            ),
+        )
+        .unwrap();
+        let sig = BoxedEcdsaSignature::from_der(&from_hex(
+            "3064023001057e36ad00f79e7c1cfcf4dea301e4e2350644d5eff4d4c7f23cdd2f4f\
+             236093ff27e33eb44fd804b2f0daf5c327a402302a9b2b910dd23b994cac12f32282\
+             8461094c8790481b392569c6674ac2eca74dd74957d94456548546b65bd50558f4a6",
+        ))
+        .unwrap();
+        pk.verify::<Sha384>(&msg, &sig).unwrap();
+
+        // brainpoolP512r1 / SHA-512.
+        let pk = BoxedEcdsaPublicKey::from_sec1(
+            CurveId::BrainpoolP512r1,
+            &from_hex(
+                "041ec7fe2275860c3bc0e4e6e459af7e16985d37adba7351ac357a7c397e0752\
+                 2ea41bcca8e89777fe05b8f0d9dc8c614004fcaf30a97001a5011a159f46fcd54\
+                 43cbc1ddfc7ac89a1a2f8eef77bf9bba8ade73da2100cb6a371546b495fb5ea88\
+                 5eb631645e79591db659c49266d263d5cbd3403081cb407536efe9a5bec69955",
+            ),
+        )
+        .unwrap();
+        let sig = BoxedEcdsaSignature::from_der(&from_hex(
+            "3081840240225dc2310177ce6267efde9937eff898fb0bad12b0dbeb4fa9c6be6e2\
+             0f88563e6d2991d47a648b0ba5a7039842dbf883bbd735df793cce0d136023fbfc9b\
+             e95024000d59783d8bd050cf728b3506c16ee4a78ac26c12fd33dadb6ee8146372e4\
+             fb2a880ef77eb20ac90f3a4275c1718a033a7c0b2df538eb35827330154191153cb",
+        ))
+        .unwrap();
+        pk.verify::<Sha512>(&msg, &sig).unwrap();
+    }
+
     #[test]
     fn secp256k1_sign_verify_roundtrip() {
         let mut rng = HmacDrbg::<Sha256>::new(b"secp256k1-key", b"nonce", &[]);

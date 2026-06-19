@@ -57,9 +57,12 @@ impl CertSigner<'_> {
         match self {
             CertSigner::Rsa(_) => oid::SHA256_WITH_RSA,
             CertSigner::Ecdsa(k) => match k.curve() {
-                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => oid::ECDSA_WITH_SHA256,
-                CurveId::P384 => oid::ECDSA_WITH_SHA384,
-                CurveId::P521 => oid::ECDSA_WITH_SHA512,
+                CurveId::P256
+                | CurveId::Secp256k1
+                | CurveId::Sm2p256v1
+                | CurveId::BrainpoolP256r1 => oid::ECDSA_WITH_SHA256,
+                CurveId::P384 | CurveId::BrainpoolP384r1 => oid::ECDSA_WITH_SHA384,
+                CurveId::P521 | CurveId::BrainpoolP512r1 => oid::ECDSA_WITH_SHA512,
             },
             CertSigner::Ed25519(_) => oid::ID_ED25519,
             CertSigner::Ed448(_) => oid::ID_ED448,
@@ -95,11 +98,12 @@ impl CertSigner<'_> {
             CertSigner::Ecdsa(k) => {
                 let curve = k.curve();
                 let sig = match curve {
-                    CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => {
-                        k.sign::<Sha256>(tbs)
-                    }
-                    CurveId::P384 => k.sign::<Sha384>(tbs),
-                    CurveId::P521 => k.sign::<Sha512>(tbs),
+                    CurveId::P256
+                    | CurveId::Secp256k1
+                    | CurveId::Sm2p256v1
+                    | CurveId::BrainpoolP256r1 => k.sign::<Sha256>(tbs),
+                    CurveId::P384 | CurveId::BrainpoolP384r1 => k.sign::<Sha384>(tbs),
+                    CurveId::P521 | CurveId::BrainpoolP512r1 => k.sign::<Sha512>(tbs),
                 }
                 .map_err(|_| Error::Verification)?;
                 Ok(sig.to_der(curve))

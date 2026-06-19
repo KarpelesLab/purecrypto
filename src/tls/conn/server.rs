@@ -643,7 +643,11 @@ impl ServerConfig {
                 CurveId::P256 => SignatureScheme::ECDSA_SECP256R1_SHA256,
                 CurveId::P384 => SignatureScheme::ECDSA_SECP384R1_SHA384,
                 CurveId::P521 => SignatureScheme::ECDSA_SECP521R1_SHA512,
-                CurveId::Secp256k1 | CurveId::Sm2p256v1 => SignatureScheme::ECDSA_SECP256R1_SHA256,
+                CurveId::Secp256k1 | CurveId::Sm2p256v1 | CurveId::BrainpoolP256r1 => {
+                    SignatureScheme::ECDSA_SECP256R1_SHA256
+                }
+                CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
+                CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
             },
             ServerKey::Ed25519(_) => SignatureScheme::ED25519,
             ServerKey::Ed448(_) => SignatureScheme::ED448,

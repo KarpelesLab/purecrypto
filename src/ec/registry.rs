@@ -52,6 +52,12 @@ fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error
         CurveId::P521
     } else if curve_arcs.as_slice() == oid::SECP256K1 {
         CurveId::Secp256k1
+    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P256R1 {
+        CurveId::BrainpoolP256r1
+    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P384R1 {
+        CurveId::BrainpoolP384r1
+    } else if curve_arcs.as_slice() == oid::BRAINPOOL_P512R1 {
+        CurveId::BrainpoolP512r1
     } else {
         return Err(Error::UnsupportedAlgorithm);
     };
@@ -255,6 +261,35 @@ strict_ecdsa_entry!(
     EcdsaSecp256k1Sha512, "ecdsa-secp256k1-sha512", CurveId::Secp256k1, Sha512, &[]
 );
 
+// Brainpool (RFC 5639) — matched curve/hash pairs. No IANA TLS scheme is
+// allocated here (RFC 7027 assigns TLS *groups* for ECDHE, not signature
+// schemes), so these are X.509 / policy-only entries, keyed off the
+// `ecdsa-with-SHA*` OID for chain dispatch via the any-curve entries above.
+strict_ecdsa_entry!(
+    /// brainpoolP256r1 with SHA-256. Policy-only.
+    EcdsaBrainpoolP256r1Sha256,
+    "ecdsa-brainpoolP256r1-sha256",
+    CurveId::BrainpoolP256r1,
+    Sha256,
+    &[]
+);
+strict_ecdsa_entry!(
+    /// brainpoolP384r1 with SHA-384. Policy-only.
+    EcdsaBrainpoolP384r1Sha384,
+    "ecdsa-brainpoolP384r1-sha384",
+    CurveId::BrainpoolP384r1,
+    Sha384,
+    &[]
+);
+strict_ecdsa_entry!(
+    /// brainpoolP512r1 with SHA-512. Policy-only.
+    EcdsaBrainpoolP512r1Sha512,
+    "ecdsa-brainpoolP512r1-sha512",
+    CurveId::BrainpoolP512r1,
+    Sha512,
+    &[]
+);
+
 /// Parses an SM2 SPKI (`id-ecPublicKey` + the `sm2p256v1` named curve) and
 /// returns the public key. The SM2 SPKI shares the EC SPKI shape; it differs
 /// only in the named-curve OID.
@@ -404,6 +439,50 @@ mod tests {
         // path: chains signed with secp256k1 carry `ecdsa-with-SHA256`).
         let any = find_by_id("ecdsa-with-sha256").unwrap();
         any.verify(&spki, b"hi", &sig).unwrap();
+    }
+
+    /// Brainpool (RFC 5639) strict-pair entries verify end-to-end through the
+    /// registry, and the OID-keyed any-curve entry accepts the same curve via
+    /// the `ecdsa-with-SHA*` chain-dispatch path.
+    #[test]
+    fn brainpool_verify_via_registry() {
+        for (curve, id, oid_id) in [
+            (
+                CurveId::BrainpoolP256r1,
+                "ecdsa-brainpoolP256r1-sha256",
+                "ecdsa-with-sha256",
+            ),
+            (
+                CurveId::BrainpoolP384r1,
+                "ecdsa-brainpoolP384r1-sha384",
+                "ecdsa-with-sha384",
+            ),
+            (
+                CurveId::BrainpoolP512r1,
+                "ecdsa-brainpoolP512r1-sha512",
+                "ecdsa-with-sha512",
+            ),
+        ] {
+            let mut rng =
+                HmacDrbg::<Sha256>::new(b"reg-brainpool", &[curve.field_len() as u8], &[]);
+            let sk = BoxedEcdsaPrivateKey::generate(curve, &mut rng);
+            let pk = AnyPublicKey::Ecdsa(sk.public_key());
+            let spki = pk.to_spki_der();
+            // Sign with the curve's matched hash so the verify entries line up.
+            let sig = match curve {
+                CurveId::BrainpoolP256r1 => sk.sign::<Sha256>(b"hi").unwrap().to_der(curve),
+                CurveId::BrainpoolP384r1 => sk.sign::<Sha384>(b"hi").unwrap().to_der(curve),
+                _ => sk.sign::<Sha512>(b"hi").unwrap().to_der(curve),
+            };
+
+            let algo = find_by_id(id).unwrap();
+            algo.verify(&spki, b"hi", &sig).unwrap();
+            assert!(algo.verify(&spki, b"other", &sig).is_err());
+
+            // The OID-keyed any-curve entry (X.509 chain dispatch) also accepts it.
+            let any = find_by_id(oid_id).unwrap();
+            any.verify(&spki, b"hi", &sig).unwrap();
+        }
     }
 
     #[test]

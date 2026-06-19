@@ -63,6 +63,12 @@ pub mod oid {
     /// `sm2p256v1` / `id-sm2` (1.2.156.10197.1.301) — the SM2 named curve
     /// (GB/T 32918, RFC 8998).
     pub const SM2_P256V1: &[u64] = &[1, 2, 156, 10197, 1, 301];
+    /// `brainpoolP256r1` (1.3.36.3.3.2.8.1.1.7) — RFC 5639 named curve.
+    pub const BRAINPOOL_P256R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 7];
+    /// `brainpoolP384r1` (1.3.36.3.3.2.8.1.1.11) — RFC 5639 named curve.
+    pub const BRAINPOOL_P384R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 11];
+    /// `brainpoolP512r1` (1.3.36.3.3.2.8.1.1.13) — RFC 5639 named curve.
+    pub const BRAINPOOL_P512R1: &[u64] = &[1, 3, 36, 3, 3, 2, 8, 1, 1, 13];
     /// `SM2-with-SM3` (1.2.156.10197.1.501) — the SM2 signature algorithm
     /// over SM3 (GB/T 32918.2, RFC 8998).
     pub const SM2_WITH_SM3: &[u64] = &[1, 2, 156, 10197, 1, 501];

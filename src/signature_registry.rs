@@ -126,6 +126,13 @@ pub static ALGORITHMS: &[&'static dyn SignatureAlgorithm] = &[
     &crate::ec::registry::EcdsaSecp256k1Sha384,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::EcdsaSecp256k1Sha512,
+    // Brainpool (RFC 5639) matched curve/hash pairs — policy-only, no TLS scheme.
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaBrainpoolP256r1Sha256,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaBrainpoolP384r1Sha384,
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    &crate::ec::registry::EcdsaBrainpoolP512r1Sha512,
     #[cfg(all(feature = "ec", feature = "alloc"))]
     &crate::ec::registry::Ed25519,
     #[cfg(all(feature = "ec", feature = "alloc"))]
