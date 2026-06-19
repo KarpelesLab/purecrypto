@@ -30,7 +30,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
 std = ["alloc"]
 alloc = []
 
@@ -61,6 +61,12 @@ hazmat-secp256k1 = ["ec"]
 dh = ["bignum", "rng", "alloc"]
 der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
+# PKCS#12 / PFX (RFC 7292) `.p12`/`.pfx` archives: parse + build the
+# password-protected key+certificate bundles OpenSSL emits. Wraps PKCS#8
+# (PBES2 for the shrouded key) and X.509 cert bags, sealed with the RFC 7292
+# Appendix B SHA-based HMAC. Legacy `pbeWithSHAAnd3-KeyTripleDES-CBC` archives
+# parse too (40-bit RC2 is not supported).
+pkcs12 = ["x509", "kdf", "cipher", "der", "alloc"]
 ec = ["bignum", "rng", "hash", "alloc"]
 tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "alloc"]
 # DTLS (RFC 6347 + RFC 9147). Builds on the `tls` stack — the record / replay /

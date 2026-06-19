@@ -107,6 +107,9 @@ pub mod dtls;
 #[cfg(feature = "x509")]
 pub mod x509;
 
+#[cfg(feature = "pkcs12")]
+pub mod pkcs12;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {
