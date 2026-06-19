@@ -76,6 +76,27 @@ jobs:
       - name: Build ec + der without x509
         run: cargo build --target ${{ matrix.target }} --no-default-features --features ec,der
 
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Keep this pin in sync with `rust-version` in Cargo.toml. Compiling on
+      # the declared minimum guards against accidentally using a std/library or
+      # language feature newer than 1.88 (behavior itself is covered by the
+      # stable `test` jobs, so this is compile-only).
+      - name: Install Rust 1.88 (declared MSRV)
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - name: cargo check --all-features --all-targets
+        run: cargo check --all-features --all-targets
+
   c_abi:
     name: C ABI smoke test
     runs-on: ubuntu-latest

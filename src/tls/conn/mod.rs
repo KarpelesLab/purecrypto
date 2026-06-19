@@ -3398,9 +3398,9 @@ mod loopback_tests {
         let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
         let ca_name = DistinguishedName::common_name("Stapling Test CA");
         // Empty CRL.
-        let signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let signer = CertSigner::Rsa(&signer_key);
         let crl = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None)
             .sign(&signer)
             .unwrap();
@@ -3444,9 +3444,9 @@ mod loopback_tests {
         let (mut server_config, root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
         let ca_name = DistinguishedName::common_name("Stapling Test CA");
         // Revoke the leaf's serial (7).
-        let signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let signer = CertSigner::Rsa(&signer_key);
         let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
         b.revoke(&[7], Time::utc(2026, 1, 2, 0, 0, 0), None);
         let crl = b.sign(&signer).unwrap();
@@ -3605,9 +3605,9 @@ mod loopback_tests {
         use crate::x509::{CrlBuilder, DistinguishedName};
         let (mut server_config, _root_der, _leaf_der, _seed) = ca_signed_ed25519_leaf();
         let ca_name = DistinguishedName::common_name("Stapling Test CA");
-        let signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let signer = CertSigner::Rsa(&signer_key);
         let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
         b.revoke(&[7], Time::utc(2026, 1, 2, 0, 0, 0), None);
         let crl = b.sign(&signer).unwrap();
@@ -3645,9 +3645,9 @@ mod loopback_tests {
     fn stapled_ocsp_good() {
         use crate::x509::OcspResponseBuilder;
         let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
-        let ca_signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let ca_signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_signer = CertSigner::Rsa(&ca_signer_key);
         let leaf = Certificate::from_der(leaf_der).unwrap();
         let root = Certificate::from_der(root_der.clone()).unwrap();
         let resp = OcspResponseBuilder::good(
@@ -3698,9 +3698,9 @@ mod loopback_tests {
     fn stapled_ocsp_revoked() {
         use crate::x509::OcspResponseBuilder;
         let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
-        let ca_signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let ca_signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_signer = CertSigner::Rsa(&ca_signer_key);
         let leaf = Certificate::from_der(leaf_der).unwrap();
         let root = Certificate::from_der(root_der.clone()).unwrap();
         let resp = OcspResponseBuilder::revoked(
@@ -3737,9 +3737,9 @@ mod loopback_tests {
     fn stapled_ocsp_expired_rejected() {
         use crate::x509::OcspResponseBuilder;
         let (mut server_config, root_der, leaf_der, _seed) = ca_signed_ed25519_leaf();
-        let ca_signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let ca_signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_signer = CertSigner::Rsa(&ca_signer_key);
         let leaf = Certificate::from_der(leaf_der).unwrap();
         let root = Certificate::from_der(root_der.clone()).unwrap();
         // thisUpdate / nextUpdate well in the past relative to the client's
@@ -6420,9 +6420,9 @@ mod tls12_loopback_tests {
     fn tls12_stapled_ocsp_good() {
         use crate::x509::OcspResponseBuilder;
         let (mut server_config, root_der, leaf_der) = ca_signed_ecdsa_leaf_12();
-        let ca_signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let ca_signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_signer = CertSigner::Rsa(&ca_signer_key);
         let leaf = Certificate::from_der(leaf_der).unwrap();
         let root = Certificate::from_der(root_der.clone()).unwrap();
         let resp = OcspResponseBuilder::good(
@@ -6472,9 +6472,9 @@ mod tls12_loopback_tests {
     fn tls12_stapled_ocsp_revoked() {
         use crate::x509::OcspResponseBuilder;
         let (mut server_config, root_der, leaf_der) = ca_signed_ecdsa_leaf_12();
-        let ca_signer = CertSigner::Rsa(
-            &BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap(),
-        );
+        let ca_signer_key =
+            BoxedRsaPrivateKey::from_pkcs1_der(&rsa_test_key_a().to_pkcs1_der()).unwrap();
+        let ca_signer = CertSigner::Rsa(&ca_signer_key);
         let leaf = Certificate::from_der(leaf_der).unwrap();
         let root = Certificate::from_der(root_der.clone()).unwrap();
         let resp = OcspResponseBuilder::revoked(

@@ -1505,12 +1505,11 @@ mod tests {
         store.add_der(root.to_der().to_vec()).unwrap();
 
         // Build a CRL that revokes serial 42.
-        let signer = CertSigner::Rsa(
-            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
-                "../../../testdata/rsa2048_test_a.pem"
-            ))
-            .unwrap(),
-        );
+        let signer_key = crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+            "../../../testdata/rsa2048_test_a.pem"
+        ))
+        .unwrap();
+        let signer = CertSigner::Rsa(&signer_key);
         let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
         b.revoke(&[42], Time::utc(2026, 1, 2, 0, 0, 0), None);
         let crl = b.sign(&signer).unwrap();
@@ -1569,12 +1568,11 @@ mod tests {
         let mut store = RootCertStore::new();
         store.add_der(root.to_der().to_vec()).unwrap();
 
-        let signer = CertSigner::Rsa(
-            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
-                "../../../testdata/rsa2048_test_a.pem"
-            ))
-            .unwrap(),
-        );
+        let signer_key = crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+            "../../../testdata/rsa2048_test_a.pem"
+        ))
+        .unwrap();
+        let signer = CertSigner::Rsa(&signer_key);
         // CRL window: 2024-01-01 .. 2024-12-31. We verify at `now =
         // 2026-01-01`, which is past nextUpdate ⇒ the CRL is treated as
         // not covering this point in time.
@@ -1628,12 +1626,11 @@ mod tests {
         // CRL signed by the OTHER key, not the CA. is_revoked would say
         // true, but the signature won't verify under the CA, so the CRL is
         // ignored.
-        let bogus_signer = CertSigner::Rsa(
-            &crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
-                "../../../testdata/rsa2048_test_b.pem"
-            ))
-            .unwrap(),
-        );
+        let bogus_signer_key = crate::rsa::BoxedRsaPrivateKey::from_pkcs1_pem(include_str!(
+            "../../../testdata/rsa2048_test_b.pem"
+        ))
+        .unwrap();
+        let bogus_signer = CertSigner::Rsa(&bogus_signer_key);
         let mut b = CrlBuilder::new(&ca_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
         b.revoke(&[55], Time::utc(2026, 1, 2, 0, 0, 0), None);
         let crl = b.sign(&bogus_signer).unwrap();
