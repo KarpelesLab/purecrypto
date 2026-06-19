@@ -493,6 +493,9 @@ impl Certificate {
     /// The raw DER bytes of the certificate's `issuer` field — the full
     /// `Name` TLV (`30 LL …`). Used for byte-exact chain-building matches
     /// (RFC 5280 §7.1 requires byte equality for issuer/subject linking).
+    // Consumed only by the `tls`-gated path validator (`tls::pki`); dead under a
+    // bare `x509` build (e.g. `--features pkcs12 --no-default-features`).
+    #[cfg_attr(not(feature = "tls"), allow(dead_code))]
     pub(crate) fn issuer_der(&self) -> Result<&[u8], Error> {
         let mut seq = self.tbs_after_algid()?;
         let bytes = seq.read_element()?;
