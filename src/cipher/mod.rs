@@ -16,7 +16,9 @@ mod aegis;
 mod aes;
 #[cfg(feature = "aez")]
 mod aez;
+mod aria;
 pub(crate) mod blowfish;
+mod camellia;
 mod cbc;
 mod ccm;
 mod cfb;
@@ -45,6 +47,8 @@ pub use aegis::{Aegis128L, Aegis256};
 pub use aes::{Aes128, Aes192, Aes256};
 #[cfg(feature = "aez")]
 pub use aez::Aez;
+pub use aria::{Aria128, Aria192, Aria256};
+pub use camellia::{Camellia128, Camellia192, Camellia256};
 pub use cbc::Cbc;
 pub use ccm::{Aes128Ccm, Aes128Ccm8, Aes192Ccm, Aes256Ccm, Aes256Ccm8, Ccm};
 pub use cfb::Cfb;

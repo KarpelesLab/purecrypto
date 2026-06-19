@@ -9,7 +9,7 @@
 /// Multiplies two field elements in constant time (branchless Russian-peasant
 /// multiplication with reduction by `0x11b`).
 #[inline]
-pub(super) fn gf_mul(mut a: u8, mut b: u8) -> u8 {
+pub(crate) fn gf_mul(mut a: u8, mut b: u8) -> u8 {
     let mut product = 0u8;
     let mut i = 0;
     while i < 8 {
@@ -31,7 +31,7 @@ pub(super) fn gf_mul(mut a: u8, mut b: u8) -> u8 {
 /// Computed as `x²⁵⁴`; since `x²⁵⁵ = 1` for every nonzero `x`, this equals
 /// `x⁻¹`. The fixed addition chain runs in constant time.
 #[inline]
-pub(super) fn gf_inv(x: u8) -> u8 {
+pub(crate) fn gf_inv(x: u8) -> u8 {
     let x2 = gf_mul(x, x); // x^2
     let x4 = gf_mul(x2, x2); // x^4
     let x8 = gf_mul(x4, x4); // x^8
@@ -52,7 +52,7 @@ pub(super) fn gf_inv(x: u8) -> u8 {
 
 /// AES S-box: multiplicative inverse, then the forward affine transform.
 #[inline]
-pub(super) fn sub_byte(x: u8) -> u8 {
+pub(crate) fn sub_byte(x: u8) -> u8 {
     let inv = gf_inv(x);
     inv ^ inv.rotate_left(1) ^ inv.rotate_left(2) ^ inv.rotate_left(3) ^ inv.rotate_left(4) ^ 0x63
 }
@@ -60,7 +60,7 @@ pub(super) fn sub_byte(x: u8) -> u8 {
 /// AES inverse S-box: inverse affine transform, then the multiplicative
 /// inverse.
 #[inline]
-pub(super) fn inv_sub_byte(x: u8) -> u8 {
+pub(crate) fn inv_sub_byte(x: u8) -> u8 {
     let t = x.rotate_left(1) ^ x.rotate_left(3) ^ x.rotate_left(6) ^ 0x05;
     gf_inv(t)
 }

@@ -5,7 +5,7 @@
 //! transforms are branchless and table-free, so encryption time does not
 //! depend on key or data values.
 
-mod gf;
+pub(crate) mod gf;
 
 #[cfg(all(feature = "std", target_arch = "aarch64"))]
 mod aes_arm;
