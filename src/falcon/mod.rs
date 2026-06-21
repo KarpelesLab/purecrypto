@@ -33,7 +33,9 @@
 
 #![allow(clippy::needless_range_loop)]
 
+mod fft;
 mod fpr;
+mod sampler;
 
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
 
