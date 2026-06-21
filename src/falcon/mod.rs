@@ -36,6 +36,7 @@
 mod fft;
 mod fpr;
 mod sampler;
+mod tree;
 
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
 

@@ -131,9 +131,12 @@ fn approx_exp(x: Fpr, ccs: Fpr) -> u64 {
 /// (`x ≥ 0`). Reads one byte per MSB-first comparison step, up to 8.
 fn ber_exp<R: SamplerRng>(x: Fpr, ccs: Fpr, rng: &mut R) -> bool {
     // s = ⌊x / ln 2⌋ (unclamped for the residual r), then clamp for the shift.
+    // For every valid call `x ≥ 0`, so `s_full ∈ [0, 63]` and the lower clamp is
+    // a no-op (the sampler KATs are unaffected); the `0` floor only guards the
+    // shift against a negative `x` from a pathological out-of-range σ.
     let s_full = x.mul(ILN2).trunc();
     let r = x.sub(Fpr::of_i64(s_full).mul(LN2));
-    let s = core::cmp::min(s_full, 63) as u32;
+    let s = s_full.clamp(0, 63) as u32;
     // z ≈ 2⁶³ · ccs · exp(−x), scaled down to a 64-bit acceptance threshold.
     let z = approx_exp(r, ccs).wrapping_sub(1) >> s;
     let mut i: i32 = 56;

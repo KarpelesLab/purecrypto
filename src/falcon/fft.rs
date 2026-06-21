@@ -270,6 +270,11 @@ pub(crate) fn adj_fft(a: &[Cplx]) -> Vec<Cplx> {
     a.iter().map(|&x| x.conj()).collect()
 }
 
+/// Elementwise complex division (pointwise quotient in the FFT domain).
+pub(crate) fn div_fft(a: &[Cplx], b: &[Cplx]) -> Vec<Cplx> {
+    a.iter().zip(b).map(|(&x, &y)| x.div(y)).collect()
+}
+
 #[cfg(test)]
 #[path = "fft_tests.rs"]
 mod fft_tests;
