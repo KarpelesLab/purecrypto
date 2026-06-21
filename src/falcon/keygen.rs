@@ -14,7 +14,7 @@
 
 #![allow(dead_code)] // consumed by the sign / public-API phases
 
-use super::fft::{Fft, add_fft, adj_fft, div_fft, mul_fft};
+use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft};
 use super::fpr::Fpr;
 use super::sampler::{SamplerRng, sampler_z};
 use super::zint::{Zint, ext_gcd};
@@ -105,8 +105,29 @@ fn negacyclic_interp(
     out
 }
 
+/// Recompute `G` from `(f, g, F)` via `G = (q + g·F)/f`, exact in the ring (the
+/// FFT division is rounded back to integers). Used when importing a compact
+/// secret key that omits `G`.
+pub(crate) fn recompute_g(f: &[i64], g: &[i64], cap_f: &[i64], n: usize) -> Vec<i64> {
+    let fft = Fft::new(n);
+    let to_fpr = |p: &[i64]| -> Vec<Fpr> { p.iter().map(|&c| Fpr::of_i64(c)).collect() };
+    let f_fft = fft.fft(&to_fpr(f));
+    let g_fft = fft.fft(&to_fpr(g));
+    let cf_fft = fft.fft(&to_fpr(cap_f));
+    let qf = Fpr::of_i64(Q);
+    // num = q + g·F (the constant polynomial q has FFT equal to q everywhere).
+    let num: Vec<Cplx> = (0..n)
+        .map(|i| {
+            let gf = g_fft[i].mul(cf_fft[i]);
+            Cplx::new(gf.re.add(qf), gf.im)
+        })
+        .collect();
+    let g_cap_fft = div_fft(&num, &f_fft);
+    fft.ifft(&g_cap_fft).iter().map(|x| x.rint()).collect()
+}
+
 /// Compute `h = g·f⁻¹ mod (xⁿ+1, q)`, or `None` if `f` is not invertible.
-fn compute_h(f: &[i64], g: &[i64], n: usize) -> Option<Vec<u16>> {
+pub(crate) fn compute_h(f: &[i64], g: &[i64], n: usize) -> Option<Vec<u16>> {
     let psi = find_psi(n);
     let omega = psi * psi % Q;
     let psi_inv = inv_mod(psi, Q);

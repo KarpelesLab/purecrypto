@@ -1,17 +1,28 @@
-//! Falcon (FN-DSA) signature **verification** — Falcon-512 and Falcon-1024.
+//! Falcon (FN-DSA) signatures — Falcon-512 and Falcon-1024: key generation,
+//! signing, and verification.
 //!
 //! Falcon is the NTRU-lattice hash-and-sign signature scheme selected by NIST
-//! for standardization as FN-DSA (FIPS 206, draft). This module implements
-//! **verification only**: parsing a public key, decompressing a signature, and
-//! checking the short-vector acceptance bound. It deliberately does **not**
-//! implement key generation or signing — those require a constant-time
-//! floating-point lattice Gaussian sampler that is out of scope here.
+//! for standardization as FN-DSA (FIPS 206, draft). This module implements the
+//! full scheme: [`FalconPrivateKey::generate`] / [`FalconPrivateKey::sign`] and
+//! the [`verify`] / [`FalconPublicKey`] verification path.
 //!
-//! Verification is self-contained: it needs only SHAKE-256 (for `HashToPoint`)
-//! and integer arithmetic modulo `q = 12289`. All inputs to verification are
-//! public, so constant-time discipline is not required; the implementation
-//! never panics on malformed input (every slice access is bounds-checked) and
-//! returns `false`/`Err` instead.
+//! **Floating point.** Signing needs an FFT, an LDL tree, and a discrete
+//! Gaussian sampler — all floating-point — but the crate is `no_std` with no
+//! `libm`, and the signing path is secret-dependent. So all FP runs in an
+//! emulated constant-time IEEE-754 double (`fpr`, the approach Falcon's
+//! reference calls FPEMU): pure integer ops, data-oblivious, identical on every
+//! target (no FPU required), and bit-reproducible.
+//!
+//! **Constant-time scope.** The **signing path is strictly constant-time** (the
+//! sampler and all FFT/tree arithmetic on secrets are data-oblivious). **Key
+//! generation is best-effort** — NTRUSolve's big-integer arithmetic and the
+//! Gaussian-rejection retries are variable-time (as in the reference); keygen is
+//! one-time, on fresh entropy. **Verification** takes only public inputs, never
+//! panics on malformed input (every access is bounds-checked), and returns
+//! `false`/`Err` instead.
+//!
+//! Verification needs only SHAKE-256 (for `HashToPoint`) and integer arithmetic
+//! modulo `q = 12289`.
 //!
 //! Implemented against the Falcon specification v1.2 (2020-10-01), the document
 //! underlying the NIST round-3 submission and the FN-DSA draft:
@@ -106,6 +117,14 @@ impl Degree {
         match self {
             Degree::Falcon512 => 34_034_726,
             Degree::Falcon1024 => 70_265_242,
+        }
+    }
+
+    /// The `logn` nibble used in encoding headers (`log₂ n`).
+    const fn logn(self) -> u8 {
+        match self {
+            Degree::Falcon512 => 9,
+            Degree::Falcon1024 => 10,
         }
     }
 
@@ -414,6 +433,132 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<Vec<i16>> {
     }
 
     Some(out)
+}
+
+/// A Falcon secret key: the NTRU polynomials `(f, g, F, G)`, the public key
+/// `h`, and a cached expanded form (FFT basis + LDL tree) for fast signing.
+///
+/// Generation and signing require a CSPRNG. The secret polynomials are wiped on
+/// drop. The signing path is constant-time; key generation is one-time and
+/// best-effort (it samples and solves the NTRU equation with variable-time
+/// big-integer arithmetic).
+pub struct FalconPrivateKey {
+    degree: Degree,
+    f: Vec<i64>,
+    g: Vec<i64>,
+    cap_f: Vec<i64>,
+    cap_g: Vec<i64>,
+    h: Vec<u16>,
+    expanded: sign::ExpandedKey,
+}
+
+/// Adapts a [`crate::rng::RngCore`] CSPRNG to the sampler's byte-source trait.
+struct RngBytes<'a, R>(&'a mut R);
+
+impl<R: crate::rng::RngCore> sampler::SamplerRng for RngBytes<'_, R> {
+    fn next_bytes(&mut self, buf: &mut [u8]) {
+        self.0.fill_bytes(buf);
+    }
+}
+
+impl FalconPrivateKey {
+    /// Generate a fresh Falcon key of the given degree from a CSPRNG.
+    pub fn generate<R: crate::rng::RngCore + crate::rng::CryptoRng>(
+        degree: Degree,
+        rng: &mut R,
+    ) -> FalconPrivateKey {
+        let n = degree.n();
+        let (f, g, cap_f, cap_g, h) = {
+            let mut src = RngBytes(rng);
+            keygen::ntru_gen(n, &mut src)
+        };
+        let expanded = sign::expand_key(&f, &g, &cap_f, &cap_g, degree);
+        FalconPrivateKey {
+            degree,
+            f,
+            g,
+            cap_f,
+            cap_g,
+            h,
+            expanded,
+        }
+    }
+
+    /// The parameter set of this key.
+    pub fn degree(&self) -> Degree {
+        self.degree
+    }
+
+    /// Sign `msg`, returning an encoded Falcon signature (padded format,
+    /// `header || salt || compressed-s`). Draws a fresh salt and sampler
+    /// randomness from `rng`; the per-signature path is constant-time.
+    pub fn sign<R: crate::rng::RngCore + crate::rng::CryptoRng>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Vec<u8> {
+        let mut salt = [0u8; NONCE_LEN];
+        rng.fill_bytes(&mut salt);
+        let mut src = RngBytes(rng);
+        sign::sign_internal(&self.expanded, msg, &salt, &mut src)
+    }
+
+    /// The matching public key.
+    pub fn public_key(&self) -> FalconPublicKey {
+        FalconPublicKey {
+            degree: self.degree,
+            h: self.h.clone(),
+        }
+    }
+
+    /// The encoded public key bytes (header + 14-bit-packed `h`).
+    pub fn public_key_bytes(&self) -> Vec<u8> {
+        encode::encode_pubkey(&self.h, self.degree.logn())
+    }
+
+    /// Serialize to the compact secret-key encoding (`0101nnnn` header, then
+    /// `f`, `g`, `F`; `G` is recomputed on import).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encode::encode_privkey(&self.f, &self.g, &self.cap_f, self.degree.logn())
+    }
+
+    /// Parse a compact secret-key encoding, recomputing `G` and `h` and
+    /// rebuilding the expanded form. Returns `Err` if the key is malformed or
+    /// `f` is not invertible mod `q`.
+    pub fn from_bytes(sk: &[u8]) -> Result<FalconPrivateKey, Error> {
+        let header = *sk.first().ok_or(Error::InvalidLength)?;
+        if header & 0xF0 != 0x50 {
+            return Err(Error::Malformed);
+        }
+        let degree = Degree::from_logn(header & 0x0F).ok_or(Error::Malformed)?;
+        let n = degree.n();
+        let (f, g, cap_f) = encode::decode_privkey(sk, n).ok_or(Error::InvalidLength)?;
+        let h = keygen::compute_h(&f, &g, n).ok_or(Error::Malformed)?;
+        let cap_g = keygen::recompute_g(&f, &g, &cap_f, n);
+        let expanded = sign::expand_key(&f, &g, &cap_f, &cap_g, degree);
+        Ok(FalconPrivateKey {
+            degree,
+            f,
+            g,
+            cap_f,
+            cap_g,
+            h,
+            expanded,
+        })
+    }
+}
+
+impl Drop for FalconPrivateKey {
+    fn drop(&mut self) {
+        // Wipe the secret polynomials; route through black_box so the writes are
+        // not elided (same pattern as the RSA/ML-DSA private keys).
+        for v in [&mut self.f, &mut self.g, &mut self.cap_f, &mut self.cap_g] {
+            for x in v.iter_mut() {
+                *x = 0;
+            }
+            let _ = core::hint::black_box(&*v);
+        }
+    }
 }
 
 /// Verify a Falcon signature.

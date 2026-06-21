@@ -379,3 +379,52 @@ fn rejects_malformed_pk_header() {
     pk[0] = 0xFF; // top nibble nonzero + bad logn
     assert!(FalconPublicKey::from_bytes(&pk).is_err());
 }
+
+/// A deterministic CSPRNG-shaped source for the public-API tests.
+struct TestRng(u64);
+impl crate::rng::RngCore for TestRng {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        for b in dest.iter_mut() {
+            self.0 = self
+                .0
+                .wrapping_mul(0x5851_F42D_4C95_7F2D)
+                .wrapping_add(0x1405_7B7E_F767_814F);
+            *b = (self.0 >> 56) as u8;
+        }
+    }
+}
+impl crate::rng::CryptoRng for TestRng {}
+
+#[test]
+fn keypair_generate_sign_verify_and_sk_roundtrip() {
+    use super::{Degree, FalconPrivateKey};
+    let mut rng = TestRng(0x0FA1_C09A_1C00_DE17);
+
+    let sk = FalconPrivateKey::generate(Degree::Falcon512, &mut rng);
+    assert_eq!(sk.degree(), Degree::Falcon512);
+    let pk = sk.public_key_bytes();
+    let msg = b"the quick brown fox jumps over the lazy dog";
+
+    let sig = sk.sign(msg, &mut rng);
+    assert_eq!(sig.len(), Degree::Falcon512.sig_len());
+    assert!(verify(&pk, msg, &sig), "generated key must sign-verify");
+    assert!(!verify(&pk, b"different message", &sig));
+
+    // The typed public key agrees with the encoded bytes.
+    assert_eq!(
+        FalconPublicKey::from_bytes(&pk).unwrap().degree(),
+        Degree::Falcon512
+    );
+
+    // Secret-key serialization round-trip: G and h are recomputed on import,
+    // and the reimported key produces verifying signatures.
+    let skb = sk.to_bytes();
+    let sk2 = FalconPrivateKey::from_bytes(&skb).expect("sk round-trip");
+    assert_eq!(
+        sk2.public_key_bytes(),
+        pk,
+        "h must match after sk round-trip"
+    );
+    let sig2 = sk2.sign(msg, &mut rng);
+    assert!(verify(&pk, msg, &sig2), "reimported key must sign-verify");
+}
