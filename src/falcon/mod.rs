@@ -33,6 +33,8 @@
 
 #![allow(clippy::needless_range_loop)]
 
+mod fpr;
+
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
 
 /// Falcon modulus `q`.
