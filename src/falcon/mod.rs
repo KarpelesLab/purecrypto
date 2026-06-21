@@ -35,8 +35,10 @@
 
 mod fft;
 mod fpr;
+mod keygen;
 mod sampler;
 mod tree;
+mod zint;
 
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
 
