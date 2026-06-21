@@ -33,10 +33,12 @@
 
 #![allow(clippy::needless_range_loop)]
 
+mod encode;
 mod fft;
 mod fpr;
 mod keygen;
 mod sampler;
+mod sign;
 mod tree;
 mod zint;
 
