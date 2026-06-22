@@ -236,12 +236,13 @@ pub(crate) struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// A configuration presenting `cert_chain` (leaf first) and signing with an
-    /// RSA private `key` (RSA-PSS).
-    pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+    /// Shared constructor: a default configuration presenting `cert_chain`
+    /// (leaf first) and signing with `key`. The `with_*` helpers differ only
+    /// in which [`ServerKey`] they wrap, so they all funnel through here.
+    fn from_key(cert_chain: Vec<Vec<u8>>, key: ServerKey) -> Self {
         ServerConfig {
             cert_chain,
-            key: ServerKey::Rsa(key),
+            key,
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             ticket_key: None,
@@ -265,192 +266,48 @@ impl ServerConfig {
             key_log: None,
             preferred_key_exchange_group: None,
         }
+    }
+
+    /// A configuration presenting `cert_chain` (leaf first) and signing with an
+    /// RSA private `key` (RSA-PSS).
+    pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+        Self::from_key(cert_chain, ServerKey::Rsa(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with an
     /// ECDSA private `key` (the scheme follows the key's curve).
     pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::Ecdsa(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::Ecdsa(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with an
     /// Ed25519 private `key`.
     pub fn with_ed25519(cert_chain: Vec<Vec<u8>>, key: Ed25519PrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::Ed25519(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::Ed25519(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with an
     /// Ed448 private `key`.
     pub fn with_ed448(cert_chain: Vec<Vec<u8>>, key: Ed448PrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::Ed448(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::Ed448(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-44 private key (NIST FIPS 204, draft-ietf-tls-mldsa).
     pub fn with_mldsa44(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa44PrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::MlDsa44(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::MlDsa44(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-65 private key.
     pub fn with_mldsa65(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa65PrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::MlDsa65(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::MlDsa65(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-87 private key.
     pub fn with_mldsa87(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
-        ServerConfig {
-            cert_chain,
-            key: ServerKey::MlDsa87(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            max_early_data_size: 0,
-            #[cfg(feature = "std")]
-            replay_window: None,
-            client_auth: None,
-            signature_policy: SignaturePolicy::modern(),
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_crl: None,
-            stapled_ocsp_response: None,
-            server_cert_type_preference: alloc::vec![0u8],
-            client_cert_type_preference: alloc::vec![0u8],
-            raw_public_key_spki: None,
-            #[cfg(feature = "cert-compression")]
-            cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
-            #[cfg(feature = "ech")]
-            ech_server: None,
-            key_log: None,
-            preferred_key_exchange_group: None,
-        }
+        Self::from_key(cert_chain, ServerKey::MlDsa87(key))
     }
 
     /// Replaces the signature-algorithm whitelist used to validate client

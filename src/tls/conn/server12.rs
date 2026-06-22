@@ -154,12 +154,13 @@ pub(crate) struct ClientAuthPolicy12 {
 }
 
 impl ServerConfig12 {
-    /// A configuration presenting `cert_chain` and signing with an RSA private
-    /// `key` (RSA-PSS, scheme `rsa_pss_rsae_sha256`).
-    pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+    /// Shared constructor: a default TLS 1.2 configuration presenting
+    /// `cert_chain` and signing with `key`. The `with_*` helpers differ only
+    /// in which [`ServerKey`] they wrap.
+    fn from_key(cert_chain: Vec<Vec<u8>>, key: ServerKey) -> Self {
         ServerConfig12 {
             cert_chain,
-            key: ServerKey::Rsa(key),
+            key,
             alpn_protocols: Vec::new(),
             record_size_limit: None,
             signature_policy: SignaturePolicy::modern(),
@@ -176,26 +177,16 @@ impl ServerConfig12 {
         }
     }
 
+    /// A configuration presenting `cert_chain` and signing with an RSA private
+    /// `key` (RSA-PSS, scheme `rsa_pss_rsae_sha256`).
+    pub fn with_rsa(cert_chain: Vec<Vec<u8>>, key: BoxedRsaPrivateKey) -> Self {
+        Self::from_key(cert_chain, ServerKey::Rsa(key))
+    }
+
     /// A configuration presenting `cert_chain` and signing with an ECDSA
     /// private `key` (scheme follows the curve).
     pub fn with_ecdsa(cert_chain: Vec<Vec<u8>>, key: BoxedEcdsaPrivateKey) -> Self {
-        ServerConfig12 {
-            cert_chain,
-            key: ServerKey::Ecdsa(key),
-            alpn_protocols: Vec::new(),
-            record_size_limit: None,
-            signature_policy: SignaturePolicy::modern(),
-            client_auth: None,
-            ticket_key: None,
-            ticket_lifetime: 7200,
-            crls: crate::tls::pki::CrlStore::new(),
-            verification_time: None,
-            stapled_ocsp_response: None,
-            key_log: None,
-            require_ems: true,
-            #[cfg(feature = "tls-legacy")]
-            min_version: ProtocolVersion::TLSv1_2,
-        }
+        Self::from_key(cert_chain, ServerKey::Ecdsa(key))
     }
 
     /// Sets the ALPN protocols the server is willing to negotiate.
