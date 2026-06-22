@@ -699,9 +699,15 @@ impl Streams {
     /// Inbound STOP_SENDING. RFC 9000 §3.5: triggers us to RESET_STREAM
     /// our own send side with the same application error code.
     pub(crate) fn on_stop_sending(&mut self, id: u64, app_error: u64) -> Result<(), Error> {
+        // A peer may legally send STOP_SENDING on a stream it opened before we
+        // have processed its first STREAM frame (so the stream is not yet in
+        // `map`). Mirror `on_reset` and lazily instantiate peer-initiated
+        // streams; `ensure_remote_stream_exists` still rejects never-opened
+        // locally-initiated ids as STREAM_STATE_ERROR (RFC 9000 §19.5).
+        self.ensure_remote_stream_exists(id)?;
+        let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.5: receiving STOP_SENDING for a receive-only stream
         // is a STREAM_STATE_ERROR.
-        let stream = self.map.get_mut(&id).ok_or(Error::InappropriateState)?;
         let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
         send.enter_reset(app_error);
         self.enqueue_ready(id);
@@ -724,9 +730,15 @@ impl Streams {
 
     /// Inbound MAX_STREAM_DATA.
     pub(crate) fn on_max_stream_data(&mut self, id: u64, limit: u64) -> Result<(), Error> {
+        // As with STOP_SENDING, a conformant peer may grant MAX_STREAM_DATA on
+        // a stream it opened before its first STREAM frame reaches us. Mirror
+        // `on_reset`: lazily instantiate peer-initiated streams, while
+        // `ensure_remote_stream_exists` keeps never-opened locally-initiated ids
+        // a STREAM_STATE_ERROR (RFC 9000 §19.10).
+        self.ensure_remote_stream_exists(id)?;
+        let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.10: receiving MAX_STREAM_DATA on a recv-only
         // stream is a STREAM_STATE_ERROR.
-        let stream = self.map.get_mut(&id).ok_or(Error::InappropriateState)?;
         let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
         if limit > send.peer_max_data {
             send.peer_max_data = limit;
