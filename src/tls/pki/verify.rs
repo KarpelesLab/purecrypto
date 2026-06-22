@@ -389,15 +389,45 @@ fn verify_cert_against_issuer(
         .map_err(|_| Error::BadCertificate)
 }
 
+/// `anyExtendedKeyUsage` (2.5.29.37.0) — an EKU value that asserts the
+/// certificate is valid for *any* purpose, satisfying every specific EKU
+/// requirement (RFC 5280 §4.2.1.12).
+const ANY_EXTENDED_KEY_USAGE: &[u64] = &[2, 5, 29, 37, 0];
+
 /// Per-position chain constraints:
 ///   * every non-leaf must have `basicConstraints.cA = true`;
 ///   * every non-leaf with a `keyUsage` extension must include `keyCertSign`
 ///     (RFC 5280 §4.2.1.3);
-///   * `pathLenConstraint` on a non-leaf bounds the number of intermediates
-///     between it and the leaf;
+///   * `pathLenConstraint` on a non-leaf bounds the number of *non-self-issued*
+///     intermediates between it and the leaf (RFC 5280 §6.1.4(h)/(l));
+///   * every non-leaf with an `extKeyUsage` extension must include
+///     `id-kp-serverAuth`/`id-kp-clientAuth` (or `anyExtendedKeyUsage`), so a
+///     TLS-scoped intermediate cannot smuggle an out-of-scope leaf;
 ///   * if the leaf carries `keyUsage`, `digitalSignature` (bit 0) must be set;
-///   * if the leaf carries `extKeyUsage`, it must include `id-kp-serverAuth`.
+///   * if the leaf carries `extKeyUsage`, it must include the required purpose.
+///
+/// NOTE: the trust anchor's *own* `pathLenConstraint` is not enforced here —
+/// the anchor is not part of `certs` (it lives in the [`RootCertStore`] and is
+/// excluded from validity/constraint processing per RFC 5280 §6.1), and the
+/// store currently retains only the anchor's name constraints, not its
+/// `basicConstraints`. Honoring the anchor's pathLen would require the store to
+/// keep that field; in-chain CA pathLen *is* enforced below.
 fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(), Error> {
+    let required = match purpose {
+        ChainPurpose::Server => oid::ID_KP_SERVER_AUTH,
+        ChainPurpose::Client => oid::ID_KP_CLIENT_AUTH,
+    };
+    // RFC 5280 §6.1.4(h): a self-issued certificate (one whose subject equals
+    // its issuer but that is not a self-signed trust anchor) does not consume a
+    // pathLenConstraint "slot". We count only the non-self-issued intermediates
+    // that sit *below* a given CA toward the leaf.
+    let is_self_issued = |cert: &Certificate| -> bool {
+        match (cert.subject_der(), cert.issuer_der()) {
+            (Ok(s), Ok(i)) => s == i,
+            _ => false,
+        }
+    };
+
     // `certs[0]` is the leaf, `certs[last]` is the topmost supplied
     // certificate (its issuer is the trust anchor in the store).
     for (i, cert) in certs.iter().enumerate().skip(1) {
@@ -417,12 +447,27 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
         {
             return Err(Error::BadCertificate);
         }
-        // `pathLenConstraint = N` permits at most N intermediate certificates
-        // between this CA and any leaf. For the cert at position `i` (i > 0),
-        // intermediates between it and the leaf live at positions 1..=i-1,
-        // i.e. `i - 1` certs. So require `path_len >= i - 1`.
+        // RFC 5280 §4.2.1.12 chained to intermediates: an intermediate that
+        // carries an `extKeyUsage` extension constrains what may appear beneath
+        // it. A TLS-scoped intermediate must permit the required purpose
+        // (serverAuth/clientAuth) or `anyExtendedKeyUsage`. An intermediate
+        // with NO EKU extension is unconstrained and passes.
+        let ekus = cert
+            .extended_key_usages()
+            .map_err(|_| Error::BadCertificate)?;
+        if !ekus.is_empty()
+            && !ekus
+                .iter()
+                .any(|o| o.as_slice() == required || o.as_slice() == ANY_EXTENDED_KEY_USAGE)
+        {
+            return Err(Error::BadCertificate);
+        }
+        // `pathLenConstraint = N` permits at most N non-self-issued
+        // intermediate certificates between this CA and any leaf. The
+        // intermediates below the CA at position `i` live at positions
+        // 1..=i-1; self-issued ones among them do not count (§6.1.4(h)).
         if let Some(plc) = bc.1 {
-            let intermediates_below = i.saturating_sub(1);
+            let intermediates_below = certs[1..i].iter().filter(|c| !is_self_issued(c)).count();
             if (plc as usize) < intermediates_below {
                 return Err(Error::BadCertificate);
             }
@@ -430,7 +475,7 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
     }
 
     // Leaf: keyUsage (if present) must include digitalSignature; EKU (if
-    // present) must include id-kp-serverAuth.
+    // present) must include the required purpose.
     let leaf = &certs[0];
     if let Some(mask) = leaf.key_usage().map_err(|_| Error::BadCertificate)?
         && (mask & KU_DIGITAL_SIGNATURE) == 0
@@ -440,11 +485,11 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
     let ekus = leaf
         .extended_key_usages()
         .map_err(|_| Error::BadCertificate)?;
-    let required = match purpose {
-        ChainPurpose::Server => oid::ID_KP_SERVER_AUTH,
-        ChainPurpose::Client => oid::ID_KP_CLIENT_AUTH,
-    };
-    if !ekus.is_empty() && !ekus.iter().any(|o| o.as_slice() == required) {
+    if !ekus.is_empty()
+        && !ekus
+            .iter()
+            .any(|o| o.as_slice() == required || o.as_slice() == ANY_EXTENDED_KEY_USAGE)
+    {
         return Err(Error::BadCertificate);
     }
     Ok(())
@@ -2604,5 +2649,122 @@ mod tests {
             Err(Error::BadCertificate)
         ));
         assert!(store.is_empty());
+    }
+
+    /// Builds a `[leaf, intermediate]` chain + anchored store where the
+    /// intermediate carries the given EKU OIDs (none ⇒ no EKU extension). The
+    /// leaf always has serverAuth. Returns `(store, chain_der)`.
+    fn build_chain_with_int_eku(
+        int_ekus: &[&[u64]],
+    ) -> (RootCertStore, alloc::vec::Vec<alloc::vec::Vec<u8>>) {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::GeneralName;
+        use crate::x509::{
+            CertSigner, DistinguishedName, Extension, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage, subject_alt_name},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"eku-chain", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+
+        let root_name = DistinguishedName::common_name("eku-root");
+        let int_name = DistinguishedName::common_name("eku-int");
+        let leaf_name = DistinguishedName::common_name("eku-leaf");
+
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+
+        let mut int_exts: alloc::vec::Vec<Extension> = alloc::vec![
+            basic_constraints(true, Some(0)),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+        if !int_ekus.is_empty() {
+            int_exts.push(extended_key_usage(int_ekus));
+        }
+        let int_pub = crate::x509::AnyPublicKey::Ecdsa(int_key.public_key());
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &int_pub,
+            &validity(),
+            2,
+            &int_exts,
+        )
+        .unwrap();
+
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &leaf_name,
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            3,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[GeneralName::Dns("eku-leaf".into())]),
+            ],
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        (store, chain)
+    }
+
+    fn verify_chain_now(store: &RootCertStore, chain: &[alloc::vec::Vec<u8>]) -> Result<(), Error> {
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(store, chain, Some(&now), &policy()).map(|_| ())
+    }
+
+    #[test]
+    fn intermediate_with_no_eku_is_unconstrained() {
+        // An intermediate carrying no extKeyUsage extension is unconstrained
+        // and must still validate.
+        let (store, chain) = build_chain_with_int_eku(&[]);
+        verify_chain_now(&store, &chain).unwrap();
+    }
+
+    #[test]
+    fn intermediate_with_serverauth_eku_passes() {
+        // serverAuth on the intermediate covers the server chain purpose.
+        let (store, chain) = build_chain_with_int_eku(&[oid::ID_KP_SERVER_AUTH]);
+        verify_chain_now(&store, &chain).unwrap();
+    }
+
+    #[test]
+    fn intermediate_with_any_eku_passes() {
+        // anyExtendedKeyUsage on the intermediate satisfies every purpose.
+        let (store, chain) = build_chain_with_int_eku(&[ANY_EXTENDED_KEY_USAGE]);
+        verify_chain_now(&store, &chain).unwrap();
+    }
+
+    #[test]
+    fn intermediate_eku_without_serverauth_is_rejected() {
+        // A TLS-scoped intermediate that carries an extKeyUsage NOT including
+        // serverAuth (here only clientAuth) must NOT be usable to issue a
+        // serverAuth leaf — EKU is now chained to intermediates.
+        let (store, chain) = build_chain_with_int_eku(&[oid::ID_KP_CLIENT_AUTH]);
+        assert!(matches!(
+            verify_chain_now(&store, &chain),
+            Err(Error::BadCertificate)
+        ));
     }
 }
