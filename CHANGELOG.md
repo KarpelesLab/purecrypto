@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.18](https://github.com/KarpelesLab/purecrypto/compare/v0.6.17...v0.6.18) - 2026-06-22
+
+### Other
+
+- export the fallible try_hkdf_expand / HkdfError publicly
+- wipe interactive passphrase buffer; warn on weak work factors
+- document non-thread-safety of stateful OTS signers
+- clamp peer active_connection_id_limit to a sane ceiling
+- clamp ack_delay to peer max_ack_delay in update_rtt
+- reject send-half frames on peer-initiated uni streams before lazy creation
+- make unpack_signed total with internal bounds check (audit Low #1)
+- assert wots_msg_csum accumulator bound (audit Low #3)
+- remove expand panic-on-mismatch; document X25519 validation gap (audit Low #2)
+- add fallible try_hkdf_expand variant (audit Low #4)
+- guard scalar_mul against over-wide scalars (Low, latent)
+- fail loud on non-coprime qInv in to_pkcs1_der (Low)
+- parse INTEGER length via DER reader, not a fixed offset
+- decode DN attribute values per their ASN.1 string tag
+- bound PBMAC1 keyLength before pre-auth PBKDF2/allocation
+- fail closed on critical crlExtensions and entry extensions
+- close hostname-skip, HRR-group, and session_id parity gaps
+- reject SKE group not in offered supported_groups
+- tls 1.2 server: enforce validated client cert when mTLS is required
+- tls 1.2/1.3: scrub transient premaster, key_block and shared secrets
+- key 0-RTT anti-replay window on the selected PSK binder
+- larger default GREASE payload; bounds-safe outer-ext decode
+- remap surviving parent indices in inhibited-mapping prune
+- exclude self-issued from pathLen, chain EKU to intermediates
+- surface truncation on EOF without close_notify; zeroize plaintext
+
 ## [0.6.17](https://github.com/KarpelesLab/purecrypto/compare/v0.6.16...v0.6.17) - 2026-06-22
 
 ### Other
