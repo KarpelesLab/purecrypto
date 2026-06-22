@@ -37,9 +37,15 @@ pub fn pbkdf2<D: Digest>(password: &[u8], salt: &[u8], iterations: u32, out: &mu
         "PBKDF2 output length exceeds RFC 8018 §5.2 limit (2^32 - 1 blocks)",
     );
 
+    // Key the HMAC with the password exactly once. Each U_j is then a cheap
+    // `clone()` of this keyed state, which skips re-deriving the ipad/opad
+    // key schedule (two extra compressions) on every one of the `iterations`
+    // rounds. `prf` holds password-derived state and is wiped on drop.
+    let prf = Hmac::<D>::new(password);
+
     let mut block_index: u32 = 1;
     for chunk in out.chunks_mut(hlen) {
-        derive_block::<D>(password, salt, iterations, block_index, chunk);
+        derive_block::<D>(&prf, salt, iterations, block_index, chunk);
         // Use checked_add so an off-by-one bug would trip the assert
         // above on entry rather than silently wrap to 1.
         block_index = block_index
@@ -49,26 +55,26 @@ pub fn pbkdf2<D: Digest>(password: &[u8], salt: &[u8], iterations: u32, out: &mu
 }
 
 /// Computes one PBKDF2 output block `T_i = U_1 ^ U_2 ^ … ^ U_c` and copies its
-/// leading bytes into `out` (which is at most one digest long).
+/// leading bytes into `out` (which is at most one digest long). `prf` is the
+/// HMAC already keyed with the password; each `U_j` clones it.
 fn derive_block<D: Digest>(
-    password: &[u8],
+    prf: &Hmac<D>,
     salt: &[u8],
     iterations: u32,
     index: u32,
     out: &mut [u8],
 ) {
     // U_1 = PRF(password, salt || INT_32_BE(index))
-    let mut u = {
-        let mut mac = Hmac::<D>::new(password);
-        mac.update(salt);
-        mac.update(&index.to_be_bytes());
-        mac.finalize()
-    };
+    let mut u = prf
+        .clone()
+        .chain(salt)
+        .chain(&index.to_be_bytes())
+        .finalize();
 
     let mut acc = u; // running XOR, starts at U_1
     for _ in 1..iterations {
         // U_j = PRF(password, U_{j-1})
-        u = Hmac::<D>::mac(password, u.as_ref());
+        u = prf.clone().chain(u.as_ref()).finalize();
         for (a, b) in acc.as_mut().iter_mut().zip(u.as_ref().iter()) {
             *a ^= *b;
         }

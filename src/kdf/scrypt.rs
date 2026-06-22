@@ -105,11 +105,14 @@ pub fn scrypt(
     let v_len = n_us.checked_mul(block_size).ok_or(Error::InvalidParam)?;
     let mut v: Vec<u8> = vec![0u8; v_len];
     let mut x: Vec<u8> = vec![0u8; block_size];
+    // One BlockMix scratch buffer, reused across all 2·N·p calls instead of
+    // allocating a fresh `128·r`-byte Vec inside every BlockMix.
+    let mut y: Vec<u8> = vec![0u8; block_size];
 
     for i in 0..p as usize {
         let off = i * block_size;
         x.copy_from_slice(&b[off..off + block_size]);
-        romix(&mut x, n_us, r as usize, &mut v);
+        romix(&mut x, n_us, r as usize, &mut v, &mut y);
         b[off..off + block_size].copy_from_slice(&x);
     }
 
@@ -122,20 +125,23 @@ pub fn scrypt(
     b.iter_mut().for_each(|byte| *byte = 0);
     v.iter_mut().for_each(|byte| *byte = 0);
     x.iter_mut().for_each(|byte| *byte = 0);
+    y.iter_mut().for_each(|byte| *byte = 0);
     let _ = core::hint::black_box(&b);
     let _ = core::hint::black_box(&v);
     let _ = core::hint::black_box(&x);
+    let _ = core::hint::black_box(&y);
     Ok(())
 }
 
-/// ROMix(X, N, r) — the memory-hard core (RFC 7914 §4).
-fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8]) {
+/// ROMix(X, N, r) — the memory-hard core (RFC 7914 §4). `y` is a caller-owned
+/// `128·r`-byte BlockMix scratch buffer, reused across every BlockMix call.
+fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8], y: &mut [u8]) {
     let block_size = 128 * r;
 
     // V_i = X^{(i)} for i = 0..N
     for i in 0..n {
         v[i * block_size..(i + 1) * block_size].copy_from_slice(x);
-        block_mix(x, r);
+        block_mix(x, r, y);
     }
 
     // Second loop: data-dependent indexing.
@@ -145,20 +151,21 @@ fn romix(x: &mut [u8], n: usize, r: usize, v: &mut [u8]) {
         for k in 0..block_size {
             x[k] ^= v[j_off + k];
         }
-        block_mix(x, r);
+        block_mix(x, r, y);
     }
 }
 
 /// BlockMix(B, r) — applies Salsa20/8 sequentially over `2r` 64-byte sub-blocks
-/// and reorders the result (RFC 7914 §3).
-fn block_mix(b: &mut [u8], r: usize) {
+/// and reorders the result (RFC 7914 §3). `y` is a `128·r`-byte scratch buffer
+/// supplied by the caller (fully overwritten here, so its prior contents are
+/// irrelevant).
+fn block_mix(b: &mut [u8], r: usize, y: &mut [u8]) {
     let two_r = 2 * r;
     // X = B_{2r-1}.
     let mut x = [0u8; 64];
     x.copy_from_slice(&b[(two_r - 1) * 64..two_r * 64]);
 
     // Y_i = Salsa20/8(X ⊕ B_i); X' = Y_i for the next iteration.
-    let mut y: Vec<u8> = vec![0u8; 128 * r];
     for i in 0..two_r {
         for k in 0..64 {
             x[k] ^= b[i * 64 + k];

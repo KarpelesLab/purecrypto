@@ -24,13 +24,18 @@ pub fn hkdf_expand<D: Digest>(prk: &D::Output, info: &[u8], out: &mut [u8]) {
         "HKDF output too long (> 255 * HashLen)"
     );
 
+    // Key the HMAC with `prk` once; each T(i) block clones this keyed state
+    // rather than re-deriving the ipad/opad key schedule. `prf` holds
+    // key-derived state and is wiped on drop.
+    let prf = Hmac::<D>::new(prk.as_ref());
+
     let mut prev = D::zeroed_output();
     let mut has_prev = false;
     let mut counter: u8 = 1;
     let mut filled = 0;
 
     while filled < out.len() {
-        let mut mac = Hmac::<D>::new(prk.as_ref());
+        let mut mac = prf.clone();
         if has_prev {
             mac.update(prev.as_ref());
         }
