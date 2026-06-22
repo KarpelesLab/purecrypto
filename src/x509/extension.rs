@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use super::oid;
 use crate::der::{
-    encode_boolean, encode_context, encode_integer, encode_octet_string, encode_sequence,
+    Reader, encode_boolean, encode_context, encode_integer, encode_octet_string, encode_sequence,
     encode_tlv, oid_tlv, tag,
 };
 use crate::hash::{Digest, Sha1};
@@ -379,12 +379,16 @@ pub fn inhibit_any_policy(skip_certs: u32) -> Extension {
 }
 
 /// Returns the content octets of a DER INTEGER TLV produced by
-/// [`encode_integer`] (strips the `02 LL` prefix). The length is always a
-/// single byte here because `encode_integer` of a `u32` magnitude never
-/// exceeds 5 content bytes.
+/// [`encode_integer`] (strips the tag + length prefix). Parses the length
+/// through the crate's DER reader rather than assuming a short-form length
+/// octet: although `encode_integer` of a `u32` magnitude never needs the long
+/// form today, hardcoding the `02 LL` offset would silently corrupt the output
+/// the moment a longer value flowed through here.
 fn integer_content(int_tlv: &[u8]) -> &[u8] {
-    // int_tlv = [0x02, len, content...]; len is one byte for our small values.
-    &int_tlv[2..]
+    // The input is always well-formed DER from `encode_integer`, so this parse
+    // cannot fail; fall back to an empty slice rather than panic if it ever
+    // somehow does.
+    Reader::new(int_tlv).read_integer_bytes().unwrap_or(&[])
 }
 
 /// `cRLDistributionPoints` (RFC 5280 §4.2.1.13). Non-critical.
