@@ -3911,6 +3911,10 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         crate::tls::SigningKey::MlDsa44(k) => ServerConfig::with_mldsa44(chain, k.clone()),
         crate::tls::SigningKey::MlDsa65(k) => ServerConfig::with_mldsa65(chain, k.clone()),
         crate::tls::SigningKey::MlDsa87(k) => ServerConfig::with_mldsa87(chain, k.clone()),
+        // External (suspend/resume) signing is not wired through the QUIC
+        // driver — the QUIC connection has no `provide_signature` resume path —
+        // so reject it at construction rather than stalling the handshake.
+        crate::tls::SigningKey::External { .. } => return Err(Error::InappropriateState),
     };
     if !cfg.tls.alpn_protocols.is_empty() {
         sc = sc.with_alpn(cfg.tls.alpn_protocols.clone());
@@ -3951,6 +3955,9 @@ fn client_cert_from_signing(
         crate::tls::SigningKey::MlDsa87(k) => {
             crate::tls::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
         }
+        // External (suspend/resume) signing is not wired through the QUIC
+        // driver; treat it as "no client certificate" rather than stalling.
+        crate::tls::SigningKey::External { .. } => return None,
     })
 }
 

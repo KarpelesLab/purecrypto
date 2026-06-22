@@ -63,6 +63,14 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
         ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
         ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
         ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
+        // External keys advertise a list; the concrete scheme is negotiated
+        // against the peer's offer at handshake time (the engine stores it and
+        // never reaches the inline sign path). Report the preferred entry as a
+        // representative for any single-scheme query.
+        ServerKey::External { schemes } => schemes
+            .first()
+            .copied()
+            .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
     }
 }
 
@@ -104,6 +112,10 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
         ServerKey::MlDsa87(k) => k
             .sign(rng, content, b"")
             .map_err(|_| Error::HandshakeFailure)?,
+        // External keys never reach the in-process sign path: the engine
+        // suspends the handshake and the caller supplies the signature. This
+        // arm is defensive only.
+        ServerKey::External { .. } => return Err(Error::HandshakeFailure),
     };
     Ok((scheme, signature))
 }

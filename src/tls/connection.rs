@@ -54,11 +54,31 @@ pub enum HandshakeStatus {
     /// The handshake is complete; application data may flow.
     Complete,
     /// The engine has nothing to emit; the caller should
-    /// [`feed`](Connection::feed) bytes from the peer.
+    /// [`feed`](Connection::feed) bytes from the peer — **or**, for an
+    /// [`SigningKey::External`](super::config::SigningKey::External) identity,
+    /// supply a pending external signature. Check
+    /// [`signature_request`](Connection::signature_request) before blocking on
+    /// a read: when it returns `Some`, the handshake is suspended awaiting a
+    /// `CertificateVerify` signature, not peer bytes.
     WantRead,
     /// The engine has wire bytes ready; the caller should drain them with
     /// [`pop`](Connection::pop) and forward them to the peer.
     WantWrite,
+}
+
+/// A request for an external `CertificateVerify` signature, returned by
+/// [`Connection::signature_request`]. The caller signs `message` under the
+/// algorithm identified by `scheme` (the signature operation applies the
+/// scheme's own hashing/padding) and resumes via
+/// [`Connection::provide_signature`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SignatureRequest {
+    /// IANA `SignatureScheme` code point (RFC 8446 §4.2.3) negotiated for this
+    /// handshake — the algorithm the returned signature must use.
+    pub scheme: u16,
+    /// The exact bytes to sign: the TLS 1.3 `CertificateVerify` signature input
+    /// (the 64-octet pad, context string, `0x00`, and transcript hash).
+    pub message: Vec<u8>,
 }
 
 /// A unified TLS or DTLS connection (client or server, any supported
@@ -161,6 +181,37 @@ impl Connection {
             Ok(HandshakeStatus::WantWrite)
         } else {
             Ok(HandshakeStatus::WantRead)
+        }
+    }
+
+    /// If the handshake is suspended awaiting an external `CertificateVerify`
+    /// signature (an [`SigningKey::External`](super::config::SigningKey::External)
+    /// identity), returns the [`SignatureRequest`] describing what to sign;
+    /// otherwise `None`.
+    ///
+    /// Drive loop: after [`feed`](Self::feed) and draining [`pop`](Self::pop),
+    /// check this **before** blocking on a peer read. When it is `Some`, sign
+    /// `request.message` under `request.scheme` (on a TPM/HSM, synchronously or
+    /// `.await`ed) and call [`provide_signature`](Self::provide_signature); the
+    /// engine then emits the rest of its flight.
+    pub fn signature_request(&self) -> Option<SignatureRequest> {
+        let pending = match &self.inner {
+            Engine::ServerTls13(c) => c.pending_signature(),
+            _ => None,
+        };
+        pending.map(|(scheme, message)| SignatureRequest { scheme, message })
+    }
+
+    /// Resumes a handshake suspended by [`signature_request`](Self::signature_request),
+    /// supplying the externally-produced `CertificateVerify` signature.
+    ///
+    /// # Errors
+    /// Returns [`Error::InappropriateState`] if the handshake is not currently
+    /// awaiting an external signature.
+    pub fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        match &mut self.inner {
+            Engine::ServerTls13(c) => c.provide_signature(signature),
+            _ => Err(Error::InappropriateState),
         }
     }
 
@@ -598,6 +649,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
         super::config::SigningKey::MlDsa87(k) => {
             super::conn::ServerConfig::with_mldsa87(chain, k.clone())
         }
+        super::config::SigningKey::External { schemes } => {
+            super::conn::ServerConfig::with_external(chain, schemes.clone())
+        }
     };
     if !cfg.alpn_protocols.is_empty() {
         sc = sc.with_alpn(cfg.alpn_protocols.clone());
@@ -819,6 +873,9 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
         }
         super::config::SigningKey::MlDsa87(k) => {
             super::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
+        }
+        super::config::SigningKey::External { schemes } => {
+            super::conn::ClientCertConfig::with_external(id.cert_chain.clone(), schemes.clone())
         }
     })
 }
@@ -1147,5 +1204,131 @@ mod tests {
             client.is_handshake_complete() && server.is_handshake_complete(),
             "TLS 1.3 handshake must complete using the injected EntropySource"
         );
+    }
+
+    /// A self-signed ECDSA P-256 leaf + its key, for external-signing tests.
+    fn ecdsa_p256_identity() -> (BoxedEcdsaPrivateKey, Vec<u8>) {
+        let mut kg = HmacDrbg::<Sha256>::new(b"ext-sign-leaf", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut kg);
+        let name = DistinguishedName::common_name("ext.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["ext.example"],
+        )
+        .unwrap();
+        (key, cert.to_der().to_vec())
+    }
+
+    /// A TLS 1.3 server using `SigningKey::External` completes the handshake
+    /// when the caller fulfils the `signature_request` out-of-band (here with
+    /// an in-process ECDSA key standing in for an HSM). Completion implies the
+    /// client verified the externally-produced CertificateVerify, so the
+    /// suspend/resume produces a wire-valid signature.
+    #[test]
+    fn server_external_signing_round_trips() {
+        const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+        let (key, leaf) = ecdsa_p256_identity();
+
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![leaf],
+                super::super::config::SigningKey::External {
+                    schemes: alloc::vec![ECDSA_SECP256R1_SHA256],
+                },
+            )
+            .build();
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("ext.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let mut signed = false;
+        for _ in 0..32 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            // Fulfil a pending external signature: sign exactly as the in-process
+            // ECDSA path would (P-256 → ECDSA-SHA256, DER-encoded).
+            if let Some(req) = server.signature_request() {
+                assert_eq!(req.scheme, ECDSA_SECP256R1_SHA256);
+                let sig = key
+                    .sign::<Sha256>(&req.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                server.provide_signature(sig).unwrap();
+                signed = true;
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            signed,
+            "the server must have requested an external signature"
+        );
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "external-signed TLS 1.3 handshake must complete and verify"
+        );
+    }
+
+    /// If the client offers no signature scheme the external key advertises,
+    /// the server aborts the handshake (handshake_failure) rather than stalling.
+    #[test]
+    fn server_external_signing_rejects_disjoint_schemes() {
+        // Advertise only an unassigned scheme no client ever offers, so the
+        // intersection with the ClientHello's signature_algorithms is empty.
+        const UNOFFERED: u16 = 0xFFFF;
+        let (_key, leaf) = ecdsa_p256_identity();
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![leaf],
+                super::super::config::SigningKey::External {
+                    schemes: alloc::vec![UNOFFERED],
+                },
+            )
+            .build();
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("ext.example")
+            .build();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let ch = client.pop().unwrap();
+        // The server rejects the ClientHello: no scheme its key can produce was
+        // offered. It must error, not suspend awaiting a signature.
+        let res = server.feed(&ch);
+        assert!(
+            res.is_err(),
+            "disjoint signature schemes must fail the handshake"
+        );
+        assert!(server.signature_request().is_none());
     }
 }

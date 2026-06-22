@@ -75,7 +75,7 @@ pub(crate) use conn::ClientCertConfig;
 #[cfg(test)]
 #[cfg(feature = "std")]
 pub(crate) use conn::ReplayWindow;
-pub use connection::{Connection, HandshakeStatus};
+pub use connection::{Connection, HandshakeStatus, SignatureRequest};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use groups::NamedGroup;

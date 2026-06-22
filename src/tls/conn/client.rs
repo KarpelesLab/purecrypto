@@ -80,6 +80,13 @@ pub(crate) enum ClientKey {
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// An ML-DSA-87 client key.
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
+    /// An external client key: `CertificateVerify` is signed out-of-band by
+    /// the caller via the suspend/resume API. `schemes` are the IANA
+    /// `SignatureScheme` code points it can produce, most-preferred first.
+    External {
+        /// Acceptable signature schemes, preferred first.
+        schemes: Vec<SignatureScheme>,
+    },
 }
 
 impl ClientCertConfig {
@@ -139,6 +146,18 @@ impl ClientCertConfig {
         }
     }
 
+    /// A client cert whose `CertificateVerify` is signed out-of-band by the
+    /// caller. `schemes` are the IANA `SignatureScheme` code points the
+    /// external key can produce, most-preferred first. See [`ClientKey::External`].
+    pub fn with_external(chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
+        ClientCertConfig {
+            chain,
+            key: ClientKey::External {
+                schemes: schemes.into_iter().map(SignatureScheme).collect(),
+            },
+        }
+    }
+
     fn signature_scheme(&self) -> SignatureScheme {
         Self::signature_scheme_for(&self.key)
     }
@@ -164,6 +183,12 @@ impl ClientCertConfig {
             ClientKey::MlDsa44(_) => SignatureScheme::MLDSA44,
             ClientKey::MlDsa65(_) => SignatureScheme::MLDSA65,
             ClientKey::MlDsa87(_) => SignatureScheme::MLDSA87,
+            // Representative only; the concrete scheme is negotiated against the
+            // server's CertificateRequest.
+            ClientKey::External { schemes } => schemes
+                .first()
+                .copied()
+                .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
         }
     }
 
@@ -3001,6 +3026,9 @@ impl ClientConnection {
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&content, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            // External client-cert signing (suspend/resume) is wired in a
+            // follow-up; reject for now rather than mis-sign.
+            ClientKey::External { .. } => return Err(Error::HandshakeFailure),
         };
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {

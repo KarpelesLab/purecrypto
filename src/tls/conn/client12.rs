@@ -2039,6 +2039,8 @@ impl ClientConnection12 {
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&to_sign, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            // Classic TLS 1.2 client-cert external signing is out of scope.
+            ClientKey::External { .. } => return Err(Error::HandshakeFailure),
         };
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {

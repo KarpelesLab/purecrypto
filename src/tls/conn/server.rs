@@ -21,7 +21,7 @@ use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed448PrivateKey,
     Ed25519PrivateKey,
 };
-use crate::hash::{Hmac, Sha256, Sha384, Sha512};
+use crate::hash::{Hmac, Sha256, Sha384};
 use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::rsa::BoxedRsaPrivateKey;
@@ -127,9 +127,15 @@ pub(crate) enum ServerKey {
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// An ML-DSA-87 key.
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
+    /// An external key: signing is performed out-of-band by the caller. The
+    /// handshake suspends at `CertificateVerify` and resumes once the caller
+    /// supplies the signature. `schemes` are the IANA `SignatureScheme` code
+    /// points the key can produce, most-preferred first.
+    External {
+        /// Acceptable signature schemes, preferred first.
+        schemes: Vec<SignatureScheme>,
+    },
 }
-
-/// Client-authentication policy for a server (RFC 8446 §4.3.2): roots to
 /// validate the presented client chain against, and whether a client cert
 /// is required (`certificate_required` alert on absence).
 pub(crate) struct ClientAuthPolicy {
@@ -313,6 +319,15 @@ impl ServerConfig {
     /// an ML-DSA-87 private key.
     pub fn with_mldsa87(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
         Self::from_key(cert_chain, ServerKey::MlDsa87(key))
+    }
+
+    /// A configuration presenting `cert_chain` (leaf first) whose
+    /// `CertificateVerify` is signed out-of-band by the caller. `schemes` are
+    /// the IANA `SignatureScheme` code points the external key can produce,
+    /// most-preferred first. See [`ServerKey::External`].
+    pub fn with_external(cert_chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
+        let schemes = schemes.into_iter().map(SignatureScheme).collect();
+        Self::from_key(cert_chain, ServerKey::External { schemes })
     }
 
     /// Replaces the signature-algorithm whitelist used to validate client
@@ -521,6 +536,29 @@ impl ServerConfig {
             ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
             ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
             ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
+            // Representative only; the concrete scheme is negotiated against the
+            // client's offer (see `negotiate_sig_scheme`).
+            ServerKey::External { schemes } => schemes
+                .first()
+                .copied()
+                .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
+        }
+    }
+
+    /// Selects the signature scheme to use against a client that offered
+    /// `offered`. For an in-process key this is the key's fixed scheme (if the
+    /// client accepts it); for an [`ServerKey::External`] key it is the first
+    /// advertised scheme the client also offered. `None` means no overlap —
+    /// the caller aborts with `handshake_failure`.
+    fn negotiate_sig_scheme(&self, offered: &[SignatureScheme]) -> Option<SignatureScheme> {
+        match &self.key {
+            ServerKey::External { schemes } => {
+                schemes.iter().copied().find(|s| offered.contains(s))
+            }
+            _ => {
+                let s = self.signature_scheme();
+                offered.contains(&s).then_some(s)
+            }
         }
     }
 }
@@ -542,6 +580,11 @@ enum State {
     /// is non-required).
     WaitClientCertVerify,
     WaitClientFinished,
+    /// External-signing pause: the server flight is built through Certificate
+    /// and is waiting for the caller to supply the `CertificateVerify`
+    /// signature via `provide_signature`, after which the flight is finished
+    /// (CertificateVerify + Finished) and the state advances.
+    AwaitingCertVerifySignature,
     Connected,
     Closed,
 }
@@ -634,6 +677,28 @@ impl Ch1Immutable {
 }
 
 /// A TLS 1.3 server connection.
+/// State stashed while the server flight is suspended awaiting an external
+/// `CertificateVerify` signature (see [`ServerKey::External`]). Holds the bytes
+/// the caller must sign plus everything `finish_server_flight` needs once the
+/// signature arrives — the flight cannot be re-derived from scratch.
+struct PendingServerFlight {
+    /// Negotiated signature scheme for the `CertificateVerify` message.
+    scheme: SignatureScheme,
+    /// The signature input (TLS 1.3 CertificateVerify content) the caller signs.
+    content: Vec<u8>,
+    /// The negotiated cipher suite (for `send_finished` / key install).
+    suite: SuiteParams,
+    /// Server handshake-traffic secret (for `send_finished`).
+    shts: Secret,
+    /// Client handshake-traffic secret (retained for `client_hs_secret`).
+    chts: Secret,
+    /// The key schedule, parked at the handshake stage, advanced to master in
+    /// `finish_server_flight`.
+    ks: KeySchedule,
+    /// ClientHello random, for key-log labelling.
+    ch_random: [u8; 32],
+}
+
 pub struct ServerConnection<R: RngCore> {
     core: ConnectionCore,
     config: ServerConfig,
@@ -688,6 +753,15 @@ pub struct ServerConnection<R: RngCore> {
     /// When 0-RTT is accepted, the client-handshake-traffic secret is stashed
     /// here and installed as the read key only after EndOfEarlyData arrives.
     deferred_chts: Option<Secret>,
+    /// Signature scheme negotiated for our `CertificateVerify` (the key's fixed
+    /// scheme, or — for an external key — the first advertised scheme the
+    /// client also offered). Set while processing the ClientHello.
+    negotiated_sig_scheme: Option<SignatureScheme>,
+    /// External-signing continuation: when an [`ServerKey::External`] key is in
+    /// use, the server flight is built through Certificate, the
+    /// `CertificateVerify` input + the state needed to finish the flight is
+    /// stashed here, and the engine yields. `provide_signature` consumes it.
+    pending_flight: Option<PendingServerFlight>,
     /// mTLS: the client's certificate chain (leaf first) after parsing its
     /// `Certificate` message. Empty if the client offered no cert.
     client_cert_chain: Vec<Vec<u8>>,
@@ -830,6 +904,8 @@ impl<R: RngCore> ServerConnection<R> {
             rng,
             state: State::WaitClientHello,
             received_close_notify: false,
+            negotiated_sig_scheme: None,
+            pending_flight: None,
             suite: None,
             client_hs_secret: None,
             client_app_secret: None,
@@ -1622,15 +1698,20 @@ impl<R: RngCore> ServerConnection<R> {
             return Err(Error::UnsupportedVersion);
         }
 
-        // The client must accept the signature scheme our certificate uses —
-        // unless PSK is being used, in which case we sign nothing.
+        // The client must accept a signature scheme our key can produce —
+        // unless PSK is being used, in which case we sign nothing. For an
+        // external key this picks the first advertised scheme the client
+        // offered; for an in-process key it is the key's fixed scheme. The
+        // choice is stashed so the CertificateVerify step reuses it.
         if psk_state.is_none() {
-            let our_scheme = self.config.signature_scheme();
             let sig_algs = ext::find(&ch.extensions, ExtensionType::SIGNATURE_ALGORITHMS)
                 .ok_or(Error::HandshakeFailure)?;
-            if !ext::parse_signature_algorithms(sig_algs)?.contains(&our_scheme) {
-                return Err(Error::HandshakeFailure);
-            }
+            let offered = ext::parse_signature_algorithms(sig_algs)?;
+            let scheme = self
+                .config
+                .negotiate_sig_scheme(&offered)
+                .ok_or(Error::HandshakeFailure)?;
+            self.negotiated_sig_scheme = Some(scheme);
         }
 
         // SNI: stash the client's offered host_name so multi-tenant servers can
@@ -2005,15 +2086,71 @@ impl<R: RngCore> ServerConnection<R> {
         // useful (resumption already authenticates the client), so the two
         // are mutually exclusive here.
         self.send_encrypted_extensions();
+        self.psk_used = psk_state.is_some();
         if psk_state.is_none() {
             if self.config.client_auth.is_some() {
                 self.send_certificate_request();
             }
             self.send_certificate();
-            self.send_certificate_verify()?;
+            // CertificateVerify. The signature input is the transcript hash
+            // through Certificate. For an external key we stash the flight
+            // continuation and yield — the caller signs the input and resumes
+            // via `provide_signature`; the rest of the flight (CertificateVerify
+            // + Finished + key install) runs then. For an in-process key we
+            // sign inline and continue.
+            let th = self.core.transcript.current_hash();
+            let content = certificate_verify_content(true, th.as_slice());
+            let scheme = self
+                .negotiated_sig_scheme
+                .expect("signature scheme negotiated during ClientHello");
+            if matches!(self.config.key, ServerKey::External { .. }) {
+                self.pending_flight = Some(PendingServerFlight {
+                    scheme,
+                    content,
+                    suite,
+                    shts,
+                    chts,
+                    ks,
+                    ch_random: ch.random,
+                });
+                self.state = State::AwaitingCertVerifySignature;
+                return Ok(());
+            }
+            let (scheme, sig) = super::super::crypto::sign_certificate_verify(
+                &self.config.key,
+                &content,
+                &mut self.rng,
+            )?;
+            self.emit_certificate_verify(scheme, &sig);
         }
+        self.finish_server_flight(suite, shts, chts, ks, ch.random)
+    }
+
+    /// Builds and emits the `CertificateVerify` handshake message from a
+    /// negotiated `scheme` and the produced `signature` bytes (RFC 8446 §4.4.3).
+    fn emit_certificate_verify(&mut self, scheme: SignatureScheme, signature: &[u8]) {
+        let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
+        with_len_u24(&mut msg, |b| {
+            b.extend_from_slice(&scheme.0.to_be_bytes());
+            with_len_u16(b, |s| s.extend_from_slice(signature));
+        });
+        // RFC 9001 §4.1.4: CertificateVerify rides at Handshake level.
+        self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
+    }
+
+    /// The flight tail shared by the inline and external-signing paths: sends
+    /// the server `Finished`, derives the 1-RTT application secrets over
+    /// `Hash(CH..server Finished)`, installs the server write key, stores the
+    /// per-connection secrets/schedule, and advances the handshake state.
+    fn finish_server_flight(
+        &mut self,
+        suite: SuiteParams,
+        shts: Secret,
+        chts: Secret,
+        mut ks: KeySchedule,
+        ch_random: [u8; 32],
+    ) -> Result<(), Error> {
         self.send_finished(suite, &shts);
-        self.psk_used = psk_state.is_some();
 
         // Derive application traffic secrets over Hash(CH..server Finished).
         ks.enter_master();
@@ -2022,9 +2159,9 @@ impl<R: RngCore> ServerConnection<R> {
         let sats = ks.server_application_traffic_secret(th_app.as_slice());
         let ems = ks.exporter_master_secret(th_app.as_slice());
         if let Some(kl) = self.config.key_log.as_ref() {
-            kl.log("CLIENT_TRAFFIC_SECRET_0", &ch.random, cats.as_slice());
-            kl.log("SERVER_TRAFFIC_SECRET_0", &ch.random, sats.as_slice());
-            kl.log("EXPORTER_SECRET", &ch.random, ems.as_slice());
+            kl.log("CLIENT_TRAFFIC_SECRET_0", &ch_random, cats.as_slice());
+            kl.log("SERVER_TRAFFIC_SECRET_0", &ch_random, sats.as_slice());
+            kl.log("EXPORTER_SECRET", &ch_random, ems.as_slice());
         }
         // QUIC layer hooks at 1-RTT level. Server writes with `sats`,
         // reads with `cats` — DO NOT FLIP.
@@ -2065,6 +2202,27 @@ impl<R: RngCore> ServerConnection<R> {
             State::WaitClientFinished
         };
         Ok(())
+    }
+
+    /// Resumes a server flight suspended for an external `CertificateVerify`
+    /// signature: emits the CertificateVerify with the caller-supplied
+    /// `signature`, then finishes the flight. Returns the signature input +
+    /// negotiated scheme via [`Self::pending_signature`].
+    pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        let pf = self
+            .pending_flight
+            .take()
+            .ok_or(Error::InappropriateState)?;
+        self.emit_certificate_verify(pf.scheme, &signature);
+        self.finish_server_flight(pf.suite, pf.shts, pf.chts, pf.ks, pf.ch_random)
+    }
+
+    /// If the flight is suspended awaiting an external signature, returns the
+    /// IANA scheme code point and the bytes to sign.
+    pub(crate) fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
+        self.pending_flight
+            .as_ref()
+            .map(|pf| (pf.scheme.0, pf.content.clone()))
     }
 
     fn key_agreement(
@@ -2325,49 +2483,6 @@ impl<R: RngCore> ServerConnection<R> {
         });
         // RFC 9001 §4.1.4: CertificateRequest rides at Handshake level.
         self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
-    }
-
-    fn send_certificate_verify(&mut self) -> Result<(), Error> {
-        let th = self.core.transcript.current_hash();
-        let content = certificate_verify_content(true, th.as_slice());
-        let scheme = self.config.signature_scheme();
-        let signature = match &self.config.key {
-            ServerKey::Rsa(k) => k
-                .sign_pss::<Sha256, _>(&content, &mut self.rng)
-                .map_err(|_| Error::HandshakeFailure)?,
-            ServerKey::Ecdsa(k) => {
-                let sig = match k.curve() {
-                    CurveId::P384 => k.sign::<Sha384>(&content),
-                    CurveId::P521 => k.sign::<Sha512>(&content),
-                    _ => k.sign::<Sha256>(&content),
-                }
-                .map_err(|_| Error::HandshakeFailure)?;
-                sig.to_der(k.curve())
-            }
-            ServerKey::Ed25519(k) => k.sign(&content).to_bytes().to_vec(),
-            // Ed448: raw 114-byte R‖S over the empty context (pure Ed448).
-            ServerKey::Ed448(k) => k.sign(&content).to_bytes().to_vec(),
-            // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
-            // with the server's RNG.
-            ServerKey::MlDsa44(k) => k
-                .sign(&mut self.rng, &content, b"")
-                .map_err(|_| Error::HandshakeFailure)?,
-            ServerKey::MlDsa65(k) => k
-                .sign(&mut self.rng, &content, b"")
-                .map_err(|_| Error::HandshakeFailure)?,
-            ServerKey::MlDsa87(k) => k
-                .sign(&mut self.rng, &content, b"")
-                .map_err(|_| Error::HandshakeFailure)?,
-        };
-
-        let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
-        with_len_u24(&mut msg, |b| {
-            b.extend_from_slice(&scheme.0.to_be_bytes());
-            with_len_u16(b, |s| s.extend_from_slice(&signature));
-        });
-        // RFC 9001 §4.1.4: CertificateVerify rides at Handshake level.
-        self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
-        Ok(())
     }
 
     fn send_finished(&mut self, suite: SuiteParams, shts: &Secret) {

@@ -52,6 +52,24 @@ pub enum SigningKey {
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// ML-DSA-87.
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
+    /// An **external** signing key: no key material is held in-process. The
+    /// handshake yields [`HandshakeStatus::NeedsSignature`](crate::tls::HandshakeStatus)
+    /// when it needs the `CertificateVerify` signature; the caller signs the
+    /// supplied message out-of-band (e.g. on a TPM/HSM, synchronously or
+    /// `.await`ed) and resumes with
+    /// [`Connection::provide_signature`](crate::tls::Connection::provide_signature).
+    ///
+    /// `schemes` lists the IANA `SignatureScheme` code points the external key
+    /// can produce (RFC 8446 §4.2.3 — e.g. `0x0804` rsa_pss_rsae_sha256,
+    /// `0x0403` ecdsa_secp256r1_sha256, `0x0807` ed25519), most-preferred first.
+    /// The endpoint signs with the first one the peer also offered; the
+    /// handshake fails if none overlap. Supported for TLS 1.3 and DTLS 1.2/1.3
+    /// (classic TLS 1.2 server auth is not).
+    External {
+        /// IANA `SignatureScheme` code points the key can produce, preferred
+        /// first.
+        schemes: Vec<u16>,
+    },
 }
 
 /// A certificate chain (leaf first) paired with its signing key.
@@ -711,6 +729,12 @@ impl SigningKey {
             SigningKey::MlDsa44(k) => super::conn::ServerKey::MlDsa44(k.clone()),
             SigningKey::MlDsa65(k) => super::conn::ServerKey::MlDsa65(k.clone()),
             SigningKey::MlDsa87(k) => super::conn::ServerKey::MlDsa87(k.clone()),
+            SigningKey::External { schemes } => super::conn::ServerKey::External {
+                schemes: schemes
+                    .iter()
+                    .map(|&s| super::codec::SignatureScheme(s))
+                    .collect(),
+            },
         }
     }
 
