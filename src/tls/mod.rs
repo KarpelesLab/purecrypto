@@ -69,7 +69,7 @@ pub(crate) mod pki;
 pub(crate) mod quic_hooks;
 mod version;
 
-pub use config::{ClientAuth, Config, ConfigBuilder, Identity, SigningKey};
+pub use config::{ClientAuth, Config, ConfigBuilder, EntropySource, Identity, SigningKey};
 #[cfg(test)]
 pub(crate) use conn::ClientCertConfig;
 #[cfg(test)]

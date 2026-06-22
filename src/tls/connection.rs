@@ -10,11 +10,43 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use crate::rng::OsRng;
+use crate::rng::{CryptoRng, OsRng, RngCore};
 
 use super::config::Config;
 use super::error::Error;
 use super::version::ProtocolVersion;
+
+/// Type-erased RNG the public [`Connection`] hands to its engines, so the
+/// `OsRng` default and a caller-supplied
+/// [`EntropySource`](super::config::EntropySource) share one concrete type
+/// (the per-(version, role) engines are generic over `R: RngCore`, but the
+/// public enum cannot be).
+enum ConfigRng {
+    Os(OsRng),
+    Shared(alloc::sync::Arc<dyn super::config::EntropySource>),
+}
+
+impl RngCore for ConfigRng {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        match self {
+            ConfigRng::Os(r) => r.fill_bytes(dest),
+            ConfigRng::Shared(s) => s.fill(dest),
+        }
+    }
+}
+
+// The configured source is contractually a CSPRNG — `OsRng`, or an
+// `EntropySource` the caller promises is cryptographically secure — so it is
+// valid wherever the engines require `CryptoRng`.
+impl CryptoRng for ConfigRng {}
+
+/// The engine RNG for `cfg`: the caller's [`EntropySource`] if set, else `OsRng`.
+fn config_rng(cfg: &Config) -> ConfigRng {
+    match &cfg.rng {
+        Some(src) => ConfigRng::Shared(src.clone()),
+        None => ConfigRng::Os(OsRng),
+    }
+}
 
 /// Handshake progress, as observed from the uniform API.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -50,17 +82,17 @@ enum Engine {
     /// TLS 1.2 client.
     ClientTls12(Box<super::conn::ClientConnection12>),
     /// TLS 1.3 server.
-    ServerTls13(Box<super::conn::ServerConnection<OsRng>>),
+    ServerTls13(Box<super::conn::ServerConnection<ConfigRng>>),
     /// TLS 1.2 server.
-    ServerTls12(Box<super::conn::ServerConnection12<OsRng>>),
+    ServerTls12(Box<super::conn::ServerConnection12<ConfigRng>>),
     /// DTLS 1.3 client.
     ClientDtls13(Box<crate::dtls::DtlsClientConnection13>),
     /// DTLS 1.2 client.
     ClientDtls12(Box<crate::dtls::DtlsClientConnection12>),
     /// DTLS 1.3 server.
-    ServerDtls13(Box<crate::dtls::DtlsServerConnection13<OsRng>>),
+    ServerDtls13(Box<crate::dtls::DtlsServerConnection13<ConfigRng>>),
     /// DTLS 1.2 server.
-    ServerDtls12(Box<crate::dtls::DtlsServerConnection12<OsRng>>),
+    ServerDtls12(Box<crate::dtls::DtlsServerConnection12<ConfigRng>>),
 }
 
 impl Connection {
@@ -502,7 +534,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
     let server_name = client_server_name(cfg)?;
-    super::conn::ClientConnection::new(cc, server_name, &mut OsRng)
+    super::conn::ClientConnection::new(cc, server_name, &mut config_rng(cfg))
 }
 
 fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, Error> {
@@ -540,10 +572,10 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     let server_name = client_server_name(cfg)?;
-    super::conn::ClientConnection12::new(cc, server_name, &mut OsRng)
+    super::conn::ClientConnection12::new(cc, server_name, &mut config_rng(cfg))
 }
 
-fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRng>, Error> {
+fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<ConfigRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     let chain = id.cert_chain.clone();
     let mut sc = match &id.key {
@@ -616,10 +648,10 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<OsRn
         sc = sc.with_verification_time(t);
     }
     sc.key_log = cfg.key_log.clone();
-    Ok(super::conn::ServerConnection::new(sc, OsRng))
+    Ok(super::conn::ServerConnection::new(sc, config_rng(cfg)))
 }
 
-fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<OsRng>, Error> {
+fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<ConfigRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     let chain = id.cert_chain.clone();
     let mut sc = id
@@ -654,7 +686,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Os
     {
         sc = sc.with_min_version(cfg.min_version);
     }
-    Ok(super::conn::ServerConnection12::new(sc, OsRng))
+    Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)))
 }
 
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
@@ -674,7 +706,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
-        &mut OsRng,
+        &mut config_rng(cfg),
     ))
 }
 
@@ -696,11 +728,13 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
-        &mut OsRng,
+        &mut config_rng(cfg),
     ))
 }
 
-fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection12<OsRng>, Error> {
+fn build_dtls12_server(
+    cfg: &Config,
+) -> Result<crate::dtls::DtlsServerConnection12<ConfigRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     // RFC 6347 §4.2.1: the cookie exchange defeats blind amplification
     // attacks. We refuse to construct a server that claims to require the
@@ -732,11 +766,13 @@ fn build_dtls12_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),
-        OsRng,
+        config_rng(cfg),
     ))
 }
 
-fn build_dtls13_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection13<OsRng>, Error> {
+fn build_dtls13_server(
+    cfg: &Config,
+) -> Result<crate::dtls::DtlsServerConnection13<ConfigRng>, Error> {
     let id = cfg.identity.as_ref().ok_or(Error::InappropriateState)?;
     // RFC 9147 §5.1: DTLS 1.3 retains the cookie-based stateless rejection
     // for the same DoS-amplification reason. Mirror the fail-closed posture
@@ -757,7 +793,7 @@ fn build_dtls13_server(cfg: &Config) -> Result<crate::dtls::DtlsServerConnection
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),
-        OsRng,
+        config_rng(cfg),
     ))
 }
 
@@ -789,6 +825,7 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::EntropySource;
     use super::*;
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
     use crate::hash::Sha256;
@@ -1032,5 +1069,83 @@ mod tests {
             .build();
         let server = Connection::server(&cfg).unwrap();
         assert!(server.negotiated_cipher_suite().is_none());
+    }
+
+    /// A caller-supplied [`EntropySource`] (here an HMAC-DRBG behind a mutex)
+    /// must feed every server-side random draw — server random, ephemeral
+    /// (EC)DHE key, signature salts — so a full TLS 1.3 handshake completes
+    /// with `Config::rng` set instead of the default `OsRng`.
+    #[test]
+    fn server_drives_handshake_from_injected_entropy_source() {
+        struct DrbgSource(std::sync::Mutex<HmacDrbg<Sha256>>);
+        impl EntropySource for DrbgSource {
+            fn fill(&self, dest: &mut [u8]) {
+                self.0.lock().unwrap().fill_bytes(dest);
+            }
+        }
+
+        let mut kg = HmacDrbg::<Sha256>::new(b"rng-inject-leaf", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut kg);
+        let name = DistinguishedName::common_name("rng.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["rng.example"],
+        )
+        .unwrap();
+
+        let source: alloc::sync::Arc<dyn EntropySource> = alloc::sync::Arc::new(DrbgSource(
+            std::sync::Mutex::new(HmacDrbg::<Sha256>::new(b"entropy-source", b"nonce", &[])),
+        ));
+        let server_cfg = Config::builder()
+            .tls_only()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+            .rng(source)
+            .build();
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("rng.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        // Pump client <-> server until both sides finish (TLS 1.3 is 1-RTT, so
+        // a handful of iterations is plenty).
+        for _ in 0..16 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "TLS 1.3 handshake must complete using the injected EntropySource"
+        );
     }
 }

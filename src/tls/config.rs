@@ -286,6 +286,27 @@ pub struct Config {
     /// internal to the engine. Used to feed Wireshark / NSS-format key
     /// logs.
     pub key_log: Option<Arc<dyn KeyLog>>,
+
+    /// Optional entropy source for all randomness this endpoint draws (server
+    /// random, ephemeral (EC)DHE / ML-KEM key shares, RSA-PSS salts, ML-DSA
+    /// hedging, session-ticket nonces). `None` (the default) uses the platform
+    /// [`OsRng`](crate::rng::OsRng). Supply an [`EntropySource`] to route
+    /// entropy through a hardware device (TPM/HSM). Shared (`Arc`) across every
+    /// connection built from this `Config`.
+    pub rng: Option<Arc<dyn EntropySource>>,
+}
+
+/// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
+/// [`Config::rng`].
+///
+/// Implementations MUST be cryptographically secure — the bytes seed keys,
+/// nonces, and signature salts. `fill` takes `&self` (not `&mut self`) so one
+/// source can be shared across connections behind an `Arc`; the implementation
+/// owns any interior synchronization. It must fill the whole buffer or abort:
+/// there is no short-read or error return, matching [`OsRng`](crate::rng::OsRng).
+pub trait EntropySource: Send + Sync {
+    /// Fills `dest` entirely with cryptographically secure random bytes.
+    fn fill(&self, dest: &mut [u8]);
 }
 
 impl Default for Config {
@@ -326,6 +347,7 @@ impl Default for Config {
             require_cookie: true,
             max_record_size: 1200,
             key_log: None,
+            rng: None,
         }
     }
 }
@@ -416,6 +438,13 @@ impl ConfigBuilder {
     pub fn tls_only(mut self) -> Self {
         self.inner.min_version = ProtocolVersion::TLSv1_2;
         self.inner.max_version = ProtocolVersion::TLSv1_3;
+        self
+    }
+    /// Routes all of this endpoint's randomness through `source` (e.g. a
+    /// TPM/HSM RNG) instead of the platform [`OsRng`](crate::rng::OsRng). See
+    /// [`Config::rng`] / [`EntropySource`].
+    pub fn rng(mut self, source: Arc<dyn EntropySource>) -> Self {
+        self.inner.rng = Some(source);
         self
     }
     /// Install a cert chain + signing key.
