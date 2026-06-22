@@ -2087,6 +2087,19 @@ impl<R: RngCore> ServerConnection12<R> {
         let suite = self.suite.expect("suite set");
         let master = self.master.expect("master set");
 
+        // Defense-in-depth (RFC 5246 §7.4.6): when client auth is REQUIRED, a
+        // validated client leaf key MUST be present before we accept the
+        // connection. The normal flow already enforces this (on_certificate
+        // rejects an empty chain, and CertificateVerify must validate against
+        // `client_leaf_key`), but the invariant otherwise rests solely on
+        // state-ordering. Re-check it here so no future state-machine change
+        // can let a required-cert handshake reach `Connected` unauthenticated.
+        if self.config.client_auth.as_ref().is_some_and(|p| p.required)
+            && self.client_leaf_key.is_none()
+        {
+            return Err(Error::CertificateRequired);
+        }
+
         // The transcript at this point covers CH..CKE (and CertVerify if
         // mTLS was negotiated); the client's verify_data is over exactly
         // that prefix.
