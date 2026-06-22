@@ -2237,28 +2237,36 @@ impl<R: RngCore> ServerConnection<R> {
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 let peer: [u8; 32] = client_pub.try_into().map_err(|_| Error::Decode)?;
                 // RFC 8446 §7.4.2: reject the all-zero (small-order) DH output.
-                let shared = sk
+                let mut shared = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
-                Ok((sk.public_key().to_vec(), Secret::new(&shared)))
+                let secret = Secret::new(&shared);
+                // The raw ECDHE output is copied into `Secret` (zeroizing);
+                // scrub the transient stack copy.
+                super::wipe(&mut shared);
+                Ok((sk.public_key().to_vec(), secret))
             }
             NamedGroup::SECP256R1 => {
                 let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, client_pub)
                     .map_err(|_| Error::Decode)?;
-                let shared = sk
+                let mut shared = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
-                Ok((sk.public_key().to_sec1(), Secret::new(&shared)))
+                let secret = Secret::new(&shared);
+                super::wipe(&mut shared);
+                Ok((sk.public_key().to_sec1(), secret))
             }
             NamedGroup::SECP384R1 => {
                 let sk = BoxedEcdhPrivateKey::generate(CurveId::P384, &mut self.rng);
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, client_pub)
                     .map_err(|_| Error::Decode)?;
-                let shared = sk
+                let mut shared = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
-                Ok((sk.public_key().to_sec1(), Secret::new(&shared)))
+                let secret = Secret::new(&shared);
+                super::wipe(&mut shared);
+                Ok((sk.public_key().to_sec1(), secret))
             }
             NamedGroup::X25519MLKEM768 => {
                 // Client share: ML-KEM-768 encapsulation key (1184) ‖ X25519 (32).
@@ -2277,11 +2285,11 @@ impl<R: RngCore> ServerConnection<R> {
                 // encapsulator's noise polynomials.
                 let validated_ek = MlKem768EncapsKey::from_bytes_validated(ek)
                     .map_err(|_| Error::IllegalParameter)?;
-                let (ct, ml_ss) = validated_ek.encapsulate(&mut self.rng);
+                let (ct, mut ml_ss) = validated_ek.encapsulate(&mut self.rng);
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 // RFC 8446 §7.4.2: reject the all-zero X25519 contribution
                 // even though the ML-KEM half is independently secure.
-                let x_ss = sk
+                let mut x_ss = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
 
@@ -2292,7 +2300,13 @@ impl<R: RngCore> ServerConnection<R> {
                 let mut combined = [0u8; 64];
                 combined[..32].copy_from_slice(&ml_ss);
                 combined[32..].copy_from_slice(&x_ss);
-                Ok((share, Secret::new(&combined)))
+                let secret = Secret::new(&combined);
+                // Scrub the transient stack copies of the raw shared secrets;
+                // `Secret` keeps its own zeroizing copy.
+                super::wipe(&mut combined);
+                super::wipe(&mut ml_ss);
+                super::wipe(&mut x_ss);
+                Ok((share, secret))
             }
             _ => Err(Error::HandshakeFailure),
         }

@@ -1138,6 +1138,9 @@ impl<R: RngCore> ServerConnection12<R> {
                 Some(RecordCrypter12::new(rs.suite.aead, c_key, c_salt).into());
             self.pending_server_crypter =
                 Some(RecordCrypter12::new(rs.suite.aead, s_key, s_salt).into());
+            // The key_block holds the live AEAD keys; the crypters own their
+            // own copies now, so scrub the derivation buffer.
+            super::wipe(&mut kb);
 
             // SH (without echoing session_ticket — signals resumption to client).
             self.send_server_hello()?;
@@ -1502,7 +1505,11 @@ impl<R: RngCore> ServerConnection12<R> {
         self.transcript.update(raw);
         let cr = self.client_random.expect("client_random set");
         let sr = self.server_random.expect("server_random set");
+        let mut premaster = premaster;
         let master = self.legacy_master_secret(&premaster, &cr, &sr);
+        // The raw ECDHE/static-RSA premaster is no longer needed once the
+        // master secret is derived; scrub it so it does not linger.
+        super::wipe(&mut premaster);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -2017,6 +2024,7 @@ impl<R: RngCore> ServerConnection12<R> {
         self.transcript.update(raw);
         let cr = self.client_random.expect("client_random set");
         let sr = self.server_random.expect("server_random set");
+        let mut premaster = premaster;
         let master = if self.ems_negotiated {
             let sh = self.transcript.current_hash();
             self.ems_session_hash = Some(sh.as_slice().to_vec());
@@ -2024,6 +2032,9 @@ impl<R: RngCore> ServerConnection12<R> {
         } else {
             master_secret(suite.hash, &premaster, &cr, &sr)
         };
+        // The raw ECDHE premaster is no longer needed once the master secret is
+        // derived; scrub it so it does not linger in freed memory.
+        super::wipe(&mut premaster);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -2040,6 +2051,9 @@ impl<R: RngCore> ServerConnection12<R> {
         // the write side after we emit our own CCS.
         self.pending_client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
         self.pending_server_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
+        // The key_block holds the live AEAD keys; the crypters own their own
+        // copies now, so scrub the derivation buffer.
+        super::wipe(&mut kb);
         self.master = Some(master);
 
         // CKE was already added to the transcript above for the EMS path.

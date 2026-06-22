@@ -1455,6 +1455,9 @@ impl ClientConnection12 {
             s_salt.copy_from_slice(&ivs[4..8]);
             self.pending_server_crypter =
                 Some(RecordCrypter12::new(suite.aead, s_key, s_salt).into());
+            // The key_block holds the live AEAD keys; the crypter owns its own
+            // copy now, so scrub the derivation buffer.
+            super::wipe(&mut kb);
             self.state = State::WaitResumedServerFinished;
         } else {
             self.state = State::WaitCertificate;
@@ -1657,7 +1660,11 @@ impl ClientConnection12 {
             self.send_client_certificate_verify_legacy()?;
         }
 
+        let mut premaster = premaster;
         let master = self.legacy_master_secret(&premaster, &cr, &sr);
+        // The raw ECDHE/static-RSA premaster is no longer needed once the
+        // master secret is derived; scrub it so it does not linger.
+        super::wipe(&mut premaster);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -1917,6 +1924,7 @@ impl ClientConnection12 {
         // depends on whether both peers offered/echoed EMS.
         let cr = self.client_random;
         let sr = self.server_random.expect("server_random set");
+        let mut premaster = premaster;
         let master = if self.ems_negotiated {
             let session_hash = self
                 .ems_session_hash
@@ -1926,6 +1934,9 @@ impl ClientConnection12 {
         } else {
             master_secret(suite.hash, &premaster, &cr, &sr)
         };
+        // The raw ECDHE premaster is no longer needed once the master secret is
+        // derived; scrub it so it does not linger in freed memory.
+        super::wipe(&mut premaster);
 
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
@@ -1944,6 +1955,9 @@ impl ClientConnection12 {
         s_salt.copy_from_slice(&rest[4..8]);
         let client_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
         let server_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
+        // The key_block holds the live AEAD keys; the crypters own their own
+        // copies now, so scrub the derivation buffer.
+        super::wipe(&mut kb);
 
         // The client Certificate (under mTLS) and ClientKeyExchange were
         // emitted ABOVE so the EMS session_hash snapshot covers them
@@ -2131,6 +2145,9 @@ impl ClientConnection12 {
             let mut c_salt = [0u8; 4];
             c_salt.copy_from_slice(&ivs[..4]);
             self.client_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt).into());
+            // The key_block holds the live AEAD keys; the crypter owns its own
+            // copy now, so scrub the derivation buffer.
+            super::wipe(&mut kb);
 
             // Our Finished, signed over Hash(CH..server_Finished).
             let th_cf = self.transcript.current_hash();
@@ -2140,6 +2157,11 @@ impl ClientConnection12 {
             self.transcript.update(&finished);
             self.emit_encrypted(ContentType::Handshake, &finished)?;
         }
+
+        // The local copy of the master secret derived above is no longer
+        // needed; the canonical copy in `self.master` is scrubbed on drop.
+        let mut master = master;
+        super::wipe(&mut master);
 
         // No more ChangeCipherSpec allowed.
         self.ccs_window_open = false;
