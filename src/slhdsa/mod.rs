@@ -327,6 +327,12 @@ fn wots_msg_csum(p: &Params, msg: &[u8]) -> [u8; MAX_WOTS_LEN] {
     let mut mc = [0u8; MAX_WOTS_LEN];
     bytes_to_nibbles(&msg[..p.n as usize], &mut mc);
     let len1 = (p.n * 2) as usize;
+    // The checksum `15 * len1 - sum(nibbles)` accumulates into a u16; its
+    // maximum value is `15 * len1` (when every nibble is zero). For all 12
+    // standardized SLH-DSA parameter sets `len1 <= 64` (n <= 32), so this is at
+    // most 960 and cannot overflow. Assert the invariant so a future,
+    // non-standard parameter set cannot silently wrap.
+    debug_assert!(15 * len1 as u32 <= u16::MAX as u32);
     let mut csum: u16 = 0;
     for &x in &mc[..len1] {
         csum += x as u16;
