@@ -82,12 +82,14 @@ pub(crate) fn decode_outer_extensions(body: &[u8]) -> Result<Vec<ExtensionType>,
     if list_len < 2 || !list_len.is_multiple_of(2) || 1 + list_len != body.len() {
         return Err(Error::EchDecodeError);
     }
+    // `body[1..]` is exactly `list_len` bytes (checked above) and
+    // `list_len` is a non-zero multiple of 2, so `chunks_exact(2)`
+    // consumes it with no remainder and no out-of-bounds indexing —
+    // the bounds safety no longer depends on a non-local invariant.
     let mut out = Vec::with_capacity(list_len / 2);
-    let mut i = 1;
-    while i < body.len() {
-        let t = u16::from_be_bytes([body[i], body[i + 1]]);
+    for chunk in body[1..].chunks_exact(2) {
+        let t = u16::from_be_bytes([chunk[0], chunk[1]]);
         out.push(ExtensionType(t));
-        i += 2;
     }
     Ok(out)
 }

@@ -15,13 +15,30 @@ use super::extension::EchExtension;
 use crate::rng::RngCore;
 use alloc::vec::Vec;
 
+/// Default GREASE `payload` length (bytes).
+///
+/// A real ECH payload is the AEAD output over a padded encoded inner
+/// ClientHello: the inner CH is padded up to a multiple of 32 (ECH
+/// draft §6.1.3, see `super::outer::pad_inner`) and then gains a
+/// 16-byte HPKE/AEAD tag. A typical encoded inner CH (key_share, ALPN,
+/// the usual extensions) lands in the ~250–290 byte range, padding to
+/// 288, so a representative sealed payload is `288 + 16 = 304` bytes.
+/// The previous default (144) was far below any real padded inner CH,
+/// which let a passive observer distinguish GREASE from genuine ECH on
+/// length alone — exactly what GREASE exists to prevent.
+pub const DEFAULT_GREASE_PAYLOAD_LEN: usize = 304;
+
 /// Defaults for a GREASE-mode `encrypted_client_hello`.
 ///
 /// The default suite is `(HKDF-SHA-256, AES-128-GCM)` which is the
 /// most commonly published ECH symmetric suite (Cloudflare, ITP).
 /// The default `enc` is 32 bytes — DHKEM(X25519) — and the default
-/// `payload` is 144 bytes (slightly over a typical sealed-and-padded
-/// inner CH). All can be overridden by the caller.
+/// `payload` is [`DEFAULT_GREASE_PAYLOAD_LEN`] bytes, sized to match a
+/// real sealed-and-padded inner CH so a passive censor cannot tell
+/// GREASE apart from genuine ECH by length alone. All can be
+/// overridden by the caller — and a client that *does* speak ECH on
+/// other connections should set `payload_len` to the size its real
+/// ECH payloads occupy so the two are indistinguishable.
 #[derive(Copy, Clone, Debug)]
 pub struct GreaseParams {
     /// `(kdf_id, aead_id)` advertised in the GREASE outer extension.
@@ -30,10 +47,12 @@ pub struct GreaseParams {
     /// KEM whose `cipher_suite` you want to mimic: 32 for X25519, 65
     /// for P-256, 97 for P-384, 133 for P-521.
     pub enc_len: usize,
-    /// `payload` length to emit (bytes). Should be a small constant
-    /// like 128 / 144 / 200 that doesn't unique-fingerprint your
-    /// client. Must be ≥ 17 (one byte of compressed inner CH + 16-byte
-    /// AEAD tag).
+    /// `payload` length to emit (bytes). Defaults to
+    /// [`DEFAULT_GREASE_PAYLOAD_LEN`], representative of a real
+    /// sealed-and-padded inner CH. Set it to match the size your real
+    /// ECH payloads occupy if you also speak genuine ECH, so a passive
+    /// censor cannot distinguish the two by length. Must be ≥ 17 (one
+    /// byte of compressed inner CH + 16-byte AEAD tag).
     pub payload_len: usize,
     /// `config_id` byte; rotating across CHs would be a fingerprint
     /// so the default is freshly random per call.
@@ -58,7 +77,7 @@ impl Default for GreaseParams {
                 aead_id: 0x0001, // AES-128-GCM
             },
             enc_len: 32,
-            payload_len: 144,
+            payload_len: DEFAULT_GREASE_PAYLOAD_LEN,
             config_id_strategy: GreaseConfigIdStrategy::Random,
         }
     }
