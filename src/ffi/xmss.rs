@@ -138,6 +138,14 @@ pub unsafe extern "C" fn pc_xmss_public_to_bytes(
 ///
 /// # Safety
 /// All pointers valid for their lengths.
+///
+/// **NOT thread-safe.** This call mutates the handle's one-time-key index in
+/// place. The caller MUST externally serialize all access to a given `k`
+/// (sign, serialize, free) — concurrent use of the same handle from multiple
+/// threads is undefined behavior and, worse, can race the index counter into
+/// reusing a one-time-signature leaf, which is catastrophic for XMSS/XMSS^MT
+/// (it can leak the signing key). Use a distinct handle per thread, or guard
+/// each handle with your own mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_xmss_sign(
     k: *mut PcXmss,
@@ -315,6 +323,14 @@ pub unsafe extern "C" fn pc_xmssmt_public_to_bytes(
 ///
 /// # Safety
 /// All pointers valid for their lengths.
+///
+/// **NOT thread-safe.** This call mutates the handle's one-time-key index in
+/// place. The caller MUST externally serialize all access to a given `k`
+/// (sign, serialize, free) — concurrent use of the same handle from multiple
+/// threads is undefined behavior and, worse, can race the index counter into
+/// reusing a one-time-signature leaf, which is catastrophic for XMSS/XMSS^MT
+/// (it can leak the signing key). Use a distinct handle per thread, or guard
+/// each handle with your own mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_xmssmt_sign(
     k: *mut PcXmssMt,
