@@ -317,11 +317,21 @@ impl LossState {
             self.rttvar = latest_rtt / 2;
             return;
         }
+        // §5.3 — clamp ack_delay to the peer's advertised max_ack_delay before
+        // it is applied. The Initial and Handshake spaces use an implicit
+        // ack_delay of 0 (the peer is not yet bound by max_ack_delay there), so
+        // the clamp only applies to the Application (1-RTT) space. Without this
+        // ceiling a peer could report an arbitrarily large ack_delay and shrink
+        // our RTT sample below what it should be.
+        let ack_delay = if space == PnSpaceId::Application {
+            ack_delay.min(self.max_ack_delay)
+        } else {
+            ack_delay
+        };
         // §5.3 — apply ack_delay only if it would not reduce adjusted_rtt
         // below min_rtt (the spec's "adjusted_rtt = max(min_rtt,
         // latest_rtt - ack_delay)" rule), and only when this is a 1-RTT
         // ACK (Initial+Handshake have implicit ack_delay = 0 anyway).
-        let _ = space; // ack_delay already scaled by the caller; per-space rule applied there
         let adjusted_rtt = if self.min_rtt.saturating_add(ack_delay) <= latest_rtt {
             latest_rtt - ack_delay
         } else {
