@@ -213,6 +213,12 @@ impl Curve {
     /// Constant-time `scalar * point` via double-and-add-always over a fixed
     /// number of bits (the order's bit width).
     pub(crate) fn scalar_mul(&self, scalar: &BoxedUint, point: &Point) -> Point {
+        // The ladder iterates only over the order's limb width; callers must
+        // pre-reduce mod n so no higher scalar limbs are silently dropped.
+        debug_assert!(
+            scalar.bit_len() <= self.n.bit_len(),
+            "scalar_mul: scalar wider than curve order — higher limbs would be silently truncated"
+        );
         let order_limbs = self.n.bit_len().div_ceil(64);
         let limbs = scalar.as_limbs();
         let mut acc = self.identity();
