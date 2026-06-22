@@ -1,6 +1,35 @@
 //! HKDF — HMAC-based Extract-and-Expand KDF (RFC 5869).
 
+// This module is declared `mod hkdf;` (private) in `kdf/mod.rs`, which
+// re-exports the infallible entry points individually. The fallible
+// `try_hkdf_expand` and its `Error` are kept `pub` so they are ready to export
+// if `kdf/mod.rs` later re-exports them, but are currently only reachable
+// within the crate — silence `unreachable_pub` the same way other internal
+// modules do.
+#![allow(unreachable_pub)]
+
 use crate::hash::{Digest, Hmac};
+
+/// Error returned by the fallible HKDF entry point [`try_hkdf_expand`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Error {
+    /// The requested output length exceeds the RFC 5869 maximum of
+    /// `255 * HashLen` bytes, which the `L/HashLen` block counter (a single
+    /// octet) cannot address.
+    OutputTooLong,
+}
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Error::OutputTooLong => f.write_str("HKDF output length exceeds 255 * HashLen"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for Error {}
 
 /// HKDF-Extract: derives a pseudorandom key from input keying material `ikm`
 /// and an optional `salt`. An empty salt is treated as `HashLen` zero bytes.
@@ -17,12 +46,25 @@ pub fn hkdf_extract<D: Digest>(salt: &[u8], ikm: &[u8]) -> D::Output {
 /// length `out.len()`, bound to the context `info`.
 ///
 /// # Panics
-/// Panics if `out.len() > 255 * HashLen` (the RFC 5869 maximum).
+/// Panics if `out.len() > 255 * HashLen` (the RFC 5869 maximum). Callers that
+/// derive the output length from untrusted input should use the fallible
+/// [`try_hkdf_expand`] instead.
 pub fn hkdf_expand<D: Digest>(prk: &D::Output, info: &[u8], out: &mut [u8]) {
-    assert!(
-        out.len() <= 255 * D::OUTPUT_LEN,
-        "HKDF output too long (> 255 * HashLen)"
-    );
+    try_hkdf_expand::<D>(prk, info, out).expect("HKDF output too long (> 255 * HashLen)");
+}
+
+/// Fallible HKDF-Expand: like [`hkdf_expand`], but returns
+/// [`Error::OutputTooLong`] instead of panicking when
+/// `out.len() > 255 * HashLen` (the RFC 5869 maximum). Behaviour is otherwise
+/// byte-for-byte identical for valid lengths.
+pub fn try_hkdf_expand<D: Digest>(
+    prk: &D::Output,
+    info: &[u8],
+    out: &mut [u8],
+) -> Result<(), Error> {
+    if out.len() > 255 * D::OUTPUT_LEN {
+        return Err(Error::OutputTooLong);
+    }
 
     // Key the HMAC with `prk` once; each T(i) block clones this keyed state
     // rather than re-deriving the ipad/opad key schedule. `prf` holds
@@ -50,6 +92,8 @@ pub fn hkdf_expand<D: Digest>(prk: &D::Output, info: &[u8], out: &mut [u8]) {
         filled += take;
         counter = counter.wrapping_add(1);
     }
+
+    Ok(())
 }
 
 /// One-shot HKDF: `Extract` then `Expand` into `out`.
