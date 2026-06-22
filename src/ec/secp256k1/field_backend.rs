@@ -60,24 +60,7 @@ pub(crate) const P_HEX: &str = "ffffffffffffffffffffffffffffffffffffffffffffffff
 
 /// Decodes a 64-character big-endian hex string into an [`Fe`].
 pub(crate) fn fe_from_hex(hex: &str) -> Fe {
-    let h = hex.as_bytes();
-    assert!(h.len() == 64, "field hex must be 64 chars");
-    let mut bytes = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        bytes[i] = (hex_nibble(h[2 * i]) << 4) | hex_nibble(h[2 * i + 1]);
-        i += 1;
-    }
-    Fe::from_be_bytes(&bytes)
-}
-
-const fn hex_nibble(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => 0,
-    }
+    super::super::uint_from_be_hex(hex)
 }
 
 /// Returns the prime `p` as a [`Fe`].

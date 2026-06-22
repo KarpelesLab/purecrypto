@@ -44,6 +44,36 @@ pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 pub use sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 
+/// Decodes a big-endian hex string of fixed-width curve constants into a
+/// [`Uint`](crate::bignum::Uint).
+///
+/// The per-curve field modules each used to carry an identical nibble decoder
+/// and byte loop; this is the one shared copy. The input is always a hardcoded,
+/// even-length, valid-hex curve constant of at most `LIMBS * 8` bytes, so a
+/// malformed digit decodes as a zero nibble rather than erroring.
+pub(crate) fn uint_from_be_hex<const LIMBS: usize>(hex: &str) -> crate::bignum::Uint<LIMBS> {
+    const fn nibble(c: u8) -> u8 {
+        match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => 0,
+        }
+    }
+    let h = hex.as_bytes();
+    debug_assert!(h.len().is_multiple_of(2), "hex must have even length");
+    let n = h.len() / 2;
+    // Decode into a stack buffer wide enough for every curve here (P-521 is the
+    // widest at 66 bytes); `from_be_bytes` left-pads into the `Uint<LIMBS>`.
+    let mut bytes = [0u8; 72];
+    let mut i = 0;
+    while i < n {
+        bytes[i] = (nibble(h[2 * i]) << 4) | nibble(h[2 * i + 1]);
+        i += 1;
+    }
+    crate::bignum::Uint::from_be_bytes(&bytes[..n])
+}
+
 /// Errors from elliptic-curve operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

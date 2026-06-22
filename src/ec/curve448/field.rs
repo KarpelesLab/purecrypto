@@ -46,16 +46,7 @@ pub(crate) const BASE_ENC: [u8; 57] = {
 
 /// Parses 112 big-endian hex characters into a field element.
 fn fe_from_be_hex(hex: &str) -> Fe {
-    let h = hex.as_bytes();
-    let mut bytes = [0u8; 56];
-    let mut i = 0;
-    while i < 56 {
-        let hi = (h[2 * i] as char).to_digit(16).unwrap() as u8;
-        let lo = (h[2 * i + 1] as char).to_digit(16).unwrap() as u8;
-        bytes[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Fe::from_be_bytes(&bytes)
+    crate::ec::uint_from_be_hex(hex)
 }
 
 /// Modular exponentiation in Montgomery form (`base` and the result are in

@@ -38,25 +38,9 @@ const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d8
 const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
 
-fn hex_nibble(c: u8) -> u8 {
-    match c {
-        b'0'..=b'9' => c - b'0',
-        b'a'..=b'f' => c - b'a' + 10,
-        b'A'..=b'F' => c - b'A' + 10,
-        _ => 0,
-    }
-}
-
 /// Decodes a 64-character hex string into a [`Fe`].
 pub(crate) fn fe_from_hex(hex: &str) -> Fe {
-    let h = hex.as_bytes();
-    let mut bytes = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        bytes[i] = (hex_nibble(h[2 * i]) << 4) | hex_nibble(h[2 * i + 1]);
-        i += 1;
-    }
-    Fe::from_be_bytes(&bytes)
+    super::uint_from_be_hex(hex)
 }
 
 /// A point in projective coordinates `(X : Y : Z)` with field elements held in

@@ -42,16 +42,7 @@ const INVSQRT_A_MINUS_D_HEX: &str =
 
 /// Parses 64 big-endian hex chars into a plain residue `Fe`.
 fn fe_from_be_hex(hex: &str) -> Fe {
-    let h = hex.as_bytes();
-    let mut bytes = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        let hi = (h[2 * i] as char).to_digit(16).unwrap() as u8;
-        let lo = (h[2 * i + 1] as char).to_digit(16).unwrap() as u8;
-        bytes[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Fe::from_be_bytes(&bytes)
+    super::uint_from_be_hex(hex)
 }
 
 /// The ristretto255-specific field constants, in Montgomery form, alongside the

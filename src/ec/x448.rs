@@ -49,16 +49,7 @@ const A24: u64 = 39081;
 type Fe = Uint<7>;
 
 fn fe_from_hex(hex: &str) -> Fe {
-    let h = hex.as_bytes();
-    let mut bytes = [0u8; 56];
-    let mut i = 0;
-    while i < 56 {
-        let hi = (h[2 * i] as char).to_digit(16).unwrap() as u8;
-        let lo = (h[2 * i + 1] as char).to_digit(16).unwrap() as u8;
-        bytes[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    Fe::from_be_bytes(&bytes)
+    super::uint_from_be_hex(hex)
 }
 
 /// Computes the raw X448 function: `scalar * point` on Curve448, returning the
