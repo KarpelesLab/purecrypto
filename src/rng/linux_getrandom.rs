@@ -36,7 +36,11 @@ pub(super) enum Error {
     NotImplemented,
     /// Any other error (EFAULT, EAGAIN with GRND_NONBLOCK — we don't pass
     /// that flag — etc.). Treated as fatal by the caller.
-    #[allow(dead_code)] // currently unreachable; kept for the explicit branch
+    // Constructed only by the real syscall path (supported arches); the
+    // unsupported-arch `try_getrandom` stub below returns `NotImplemented`
+    // exclusively, so the variant is never built on those targets — hence the
+    // allow, which keeps cross-target `-D warnings` builds green.
+    #[allow(dead_code)]
     Other(i32),
 }
 

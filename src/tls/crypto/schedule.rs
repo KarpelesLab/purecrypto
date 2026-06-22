@@ -231,8 +231,6 @@ impl KeySchedule {
 
     /// `client_early_traffic_secret` from `Hash(ClientHello)` — used by
     /// 0-RTT writes before ServerHello arrives.
-    // Wired in by the 0-RTT commit.
-    #[allow(dead_code)]
     pub(crate) fn client_early_traffic_secret(&self, transcript: &[u8]) -> Secret {
         derive_secret(self.alg, self.secret.as_slice(), b"c e traffic", transcript)
     }

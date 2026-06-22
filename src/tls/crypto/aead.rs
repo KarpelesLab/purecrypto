@@ -55,7 +55,6 @@ impl Aead {
 
     /// Builds an AEAD for the given algorithm from a raw key. The key length
     /// must match `alg` (16 for AES-128, 32 for AES-256/ChaCha20).
-    #[allow(dead_code)]
     pub(crate) fn from_key(alg: AeadAlg, key: &[u8]) -> Self {
         match alg {
             AeadAlg::Aes128Gcm => {

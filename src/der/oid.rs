@@ -58,8 +58,7 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
     let mut arcs = Vec::new();
     let mut acc: u64 = 0;
     let mut started = false;
-    let mut arc_first_byte_idx: Option<usize> = None;
-    for (i, &b) in body.iter().enumerate() {
+    for &b in body.iter() {
         // Canonical encoding: the first byte of a multi-byte arc must not
         // be 0x80 (that would be a redundant leading-zero continuation).
         if !started && b == 0x80 {
@@ -72,7 +71,6 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
             return Err(Error::Malformed);
         }
         if !started {
-            arc_first_byte_idx = Some(i);
             started = true;
         }
         acc = (acc << 7) | (b & 0x7f) as u64;
@@ -94,13 +92,11 @@ pub fn parse_oid(body: &[u8]) -> Result<Vec<u64>, Error> {
             }
             acc = 0;
             started = false;
-            arc_first_byte_idx = None;
         }
     }
     if started {
         return Err(Error::Malformed); // truncated multi-byte arc
     }
-    let _ = arc_first_byte_idx;
     Ok(arcs)
 }
 

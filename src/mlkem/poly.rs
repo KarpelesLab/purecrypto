@@ -210,7 +210,7 @@ pub(crate) fn cbd<const ETA: usize>(buf: &[u8]) -> Poly {
 
 /// Back-compat shim for the η = 2 case (kept for the existing tests; new
 /// callers use `cbd::<ETA>` directly).
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn cbd2(buf: &[u8; 128]) -> Poly {
     cbd::<2>(buf)
 }

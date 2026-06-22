@@ -3,7 +3,7 @@
 //! (RFC 9180 §7.3).
 
 use super::Error;
-use crate::cipher::{Aes128, Aes128Gcm, Aes256, Aes256Gcm, ChaCha20Poly1305, Gcm};
+use crate::cipher::{Aes128, Aes128Gcm, Aes256, Aes256Gcm, ChaCha20Poly1305};
 use alloc::vec::Vec;
 
 /// HPKE AEAD identifiers (RFC 9180 §7.3).
@@ -189,8 +189,4 @@ impl HpkeAead {
             HpkeAead::ExportOnly => Err(Error::ExportOnly),
         }
     }
-
-    // Suppress dead-code lint when only some entry points are exercised.
-    #[allow(dead_code)]
-    pub(crate) const _GCM_REUSE_HINT: Option<Gcm<Aes128>> = None;
 }

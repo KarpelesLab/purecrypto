@@ -34,7 +34,6 @@ use alloc::vec::Vec;
 /// bound (≈ 2³² records per key), and well below ChaCha20-Poly1305's much
 /// higher bound — leaves plenty of headroom while still triggering a key
 /// rotation long before either AEAD becomes risky.
-#[allow(dead_code)]
 const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
 
 /// One direction's TLS 1.2 record protection: an AEAD keyed from the
