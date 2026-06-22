@@ -203,13 +203,20 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Encodes the key as a PKCS#1 `RSAPrivateKey` DER structure, including the
     /// CRT parameters (`dP`, `dQ`, `qInv`). Requires a key that carries its
     /// prime factors (i.e. from [`generate`](RsaPrivateKey::generate)).
+    ///
+    /// # Panics
+    /// Panics if `gcd(q, p) ≠ 1` — `q⁻¹ mod p` (`qInv`) cannot exist for a
+    /// well-formed two-prime RSA key, so reaching this branch means the key is
+    /// structurally broken and re-exporting would otherwise emit a `qInv`
+    /// parameter silently set to zero (a structurally invalid PKCS#1 blob). We
+    /// refuse to round-trip a corrupted key.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
         let (p, q) = self.primes();
         let d = self.private_exponent();
         let one = Uint::ONE;
         let dp = d.reduce(&p.wrapping_sub(&one));
         let dq = d.reduce(&q.wrapping_sub(&one));
-        let qinv = inv_mod(q, p).unwrap_or(Uint::ZERO);
+        let qinv = inv_mod(q, p).expect("to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime");
 
         let body = [
             encode_integer(&[0]), // version = 0 (two-prime)
