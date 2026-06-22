@@ -14,8 +14,6 @@
 //! An advertised value of 0 (the default when the parameter is absent)
 //! means the peer refuses DATAGRAM frames.
 
-#![allow(dead_code)]
-
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 

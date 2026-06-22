@@ -22,8 +22,6 @@
 //! ∈ {bidi, uni}). Helpers live on the public [`StreamId`] newtype
 //! re-exported from `crate::quic`.
 
-#![allow(dead_code)]
-
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
@@ -63,13 +61,6 @@ impl StreamId {
     pub fn value(self) -> u64 {
         self.0
     }
-}
-
-/// Direction of a stream, kept separate from initiator for ID composition.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum StreamKind {
-    Bidi,
-    Uni,
 }
 
 /// RFC 9000 §3.1 — send-side state machine.

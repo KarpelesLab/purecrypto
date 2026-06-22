@@ -16,8 +16,6 @@
 //! structures and trivial accessors. The handshake state machine,
 //! datagram packing, and inbound dispatch live in `connection.rs`.
 
-#![allow(dead_code)]
-
 use crate::quic::cid::CidPair;
 use crate::quic::congestion::NewReno;
 use crate::quic::crypto::LevelKeys;

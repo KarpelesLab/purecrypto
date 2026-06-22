@@ -22,8 +22,6 @@
 //! All other QUIC state (PN spaces, packet framing, frame codec, …) lives
 //! in sibling modules. This module is sans-I/O and side-effect-free.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20, ChaCha20Poly1305, Gcm};

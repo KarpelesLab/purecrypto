@@ -15,10 +15,8 @@
 //!
 //! ACK ranges are kept as a raw slice (`ranges_raw`) at parse time —
 //! materializing the ranges requires deciding what to do with them, which
-//! is a connection-level concern. Use [`AckRangeIter`] (returned by
-//! [`Frame::ack_range_iter`]) to walk the encoded ranges on demand.
-
-#![allow(dead_code)]
+//! is a connection-level concern. Use [`AckRangeIter`] to walk the encoded
+//! ranges on demand.
 
 use alloc::vec::Vec;
 
@@ -58,7 +56,7 @@ pub(crate) enum Frame<'a> {
     /// PING (`0x01`). Ack-eliciting, no payload.
     Ping,
     /// ACK (`0x02` no ECN, `0x03` with ECN). `ranges_raw` is the encoded
-    /// trailing range list — see [`Frame::ack_range_iter`].
+    /// trailing range list — see [`AckRangeIter`].
     Ack {
         /// Largest acknowledged PN.
         largest: u64,
@@ -185,16 +183,6 @@ pub(crate) enum Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    /// Returns an iterator over the (gap, range_length) pairs of an ACK
-    /// frame's tail. Returns an empty iterator (and zero pairs decoded) for
-    /// non-ACK variants.
-    pub(crate) fn ack_range_iter(&self) -> AckRangeIter<'a> {
-        match *self {
-            Frame::Ack { ranges_raw, .. } => AckRangeIter { buf: ranges_raw },
-            _ => AckRangeIter { buf: &[] },
-        }
-    }
-
     /// Decodes the first frame at the start of `buf`. Returns the frame
     /// and the number of bytes consumed.
     pub(crate) fn decode(buf: &'a [u8]) -> Result<(Frame<'a>, usize), Error> {

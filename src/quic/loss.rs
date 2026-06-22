@@ -18,8 +18,6 @@
 //! [`LossState::on_handshake_progress`], [`LossState::is_armed`]) so the
 //! connection-level call sites stay surgical.
 
-#![allow(dead_code)]
-
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;

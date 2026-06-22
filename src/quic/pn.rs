@@ -17,8 +17,6 @@
 //! shortest length such that the receiver — armed with the same algorithm —
 //! cannot mistake the encoded PN for any other PN ≤ `largest_acked`.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 

@@ -16,8 +16,6 @@
 //! Full multi-CID management — NEW_CONNECTION_ID, RETIRE_CONNECTION_ID,
 //! sequence numbers, stateless reset tokens — lands in Phase 7.
 
-#![allow(dead_code)]
-
 use alloc::collections::BTreeMap;
 
 use crate::rng::RngCore;

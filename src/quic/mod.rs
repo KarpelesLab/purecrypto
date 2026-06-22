@@ -19,6 +19,15 @@
 //! Streams, full RFC 9002, Retry, key update, and DATAGRAM are deferred
 //! to later phases per the master plan.
 
+// QUIC v1 is shipped but pre-interop (several follow-ups remain before
+// interop testing). A number of parsed-but-not-yet-consumed packet/header
+// fields, ACK/version-negotiation codec helpers, ECN counters, PnSet query
+// methods, and reserved RFC 9000 stream-state variants are intentionally
+// retained for that pending work and for protocol-completeness/auditability
+// against the RFCs. Rather than scatter per-item `#[allow]`s, dead_code is
+// suppressed module-wide here; revisit and tighten once interop work lands.
+#![allow(dead_code)]
+
 pub(crate) mod ack;
 pub(crate) mod cid;
 pub(crate) mod client;

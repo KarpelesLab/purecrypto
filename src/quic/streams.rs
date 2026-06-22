@@ -32,8 +32,6 @@
 //! if the application stops reading, the announced limits stop growing
 //! and the sender blocks.
 
-#![allow(dead_code)]
-
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 

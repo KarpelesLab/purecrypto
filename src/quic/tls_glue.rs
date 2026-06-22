@@ -34,8 +34,6 @@
 //! trait bound. RFC-wise this is irrelevant: QUIC state machines are
 //! single-threaded by design.
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

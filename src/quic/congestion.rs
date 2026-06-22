@@ -7,8 +7,6 @@
 //! ECN-CE counters are present in the type for future wiring (Phase 7+);
 //! [`NewReno::on_ecn_ce_increase`] is a no-op stub in Phase 5.
 
-#![allow(dead_code)]
-
 use core::time::Duration;
 
 use crate::quic::loss::SentPacket;

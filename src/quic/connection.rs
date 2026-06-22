@@ -12,8 +12,6 @@
 //! is in place — `open_bidi` / `open_uni` return
 //! [`Error::InappropriateState`] until Phase 6 fills them in.
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -2112,14 +2110,6 @@ impl QuicConnection {
         Ok(())
     }
 
-    /// Drives the TLS engine one step after fresh handshake bytes have
-    /// been fed via `process_quic_handshake_bytes`.
-    fn advance_engine(&mut self) {
-        // No-op: the call sites in `feed_one_packet` already invoke
-        // `process_quic_handshake_bytes` on each newly delivered CRYPTO
-        // suffix, which advances the engine itself.
-    }
-
     fn check_handshake_complete(&mut self) {
         let engine_done = match &self.engine {
             EngineSide::Client(c) => !c.is_handshaking(),
@@ -2240,27 +2230,6 @@ impl QuicConnection {
         if !self.datagram_queues.outbound.is_empty() {
             return true;
         }
-        false
-    }
-
-    /// True if any level has unconfirmed CRYPTO (some bytes have been
-    /// sent and the peer hasn't acked them yet). Phase 4 doesn't track
-    /// per-PN in-flight; we use "any level has a non-zero outbound
-    /// offset minus any cleared ack-eliciting flag" as a proxy.
-    fn has_unconfirmed_crypto(&self) -> bool {
-        // If the handshake is complete, nothing more to retransmit.
-        if self.handshake_complete {
-            return false;
-        }
-        // Simple: any level that ever sent CRYPTO bytes counts. (Phase
-        // 5 replaces this with proper in-flight tracking.)
-        for lvl in [Level::Initial, Level::Handshake] {
-            if self.endpoint.bufs.at(lvl).outbound_pending() {
-                return true;
-            }
-        }
-        // If the engine still has handshake bytes to produce, the PTO
-        // doesn't need to fire (next pop will emit them naturally).
         false
     }
 

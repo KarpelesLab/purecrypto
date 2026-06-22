@@ -25,8 +25,6 @@
 //! fragment whose start lies before `next_offset` is trimmed at the
 //! boundary.
 
-#![allow(dead_code)]
-
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 

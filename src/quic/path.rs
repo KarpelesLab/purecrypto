@@ -13,8 +13,6 @@
 //! migration itself (detecting that the peer moved to a new address);
 //! that is a Phase 8+ concern.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 use core::time::Duration;
 

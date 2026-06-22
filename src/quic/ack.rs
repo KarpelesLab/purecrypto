@@ -25,8 +25,6 @@
 //! `(real_range_length_in_packets − 1)`. See [`build_ack_payload`] for
 //! the exact arithmetic.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
 use core::time::Duration;

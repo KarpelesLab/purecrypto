@@ -81,8 +81,6 @@
 //! a timing oracle that leaks the first-differing byte would let an
 //! attacker forge a token in 256 × 16 = 4096 queries).
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;

@@ -12,8 +12,6 @@
 //! generic over the RNG type, we monomorphize to `OsRng` here for the
 //! sans-I/O wrapper.
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 

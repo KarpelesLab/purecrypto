@@ -20,8 +20,6 @@
 //! [`apply_header_protection`] / [`remove_header_protection`]. AEAD seal
 //! and open live in [`super::crypto`].
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use crate::cipher::{Aes128, Gcm};

@@ -6,17 +6,14 @@
 //! invoked from [`crate::quic::QuicConnection::client`] /
 //! [`crate::quic::QuicConnection::client_with_fixed_dcid`].
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::quic::cid::{CidPair, ConnectionId};
 use crate::quic::crypto::{AeadAlg, derive_dir_keys, derive_initial_secrets};
 use crate::quic::endpoint::Endpoint;
 use crate::quic::tls_glue::{HookHandle, build_hooks};
-use crate::rng::{OsRng, RngCore};
+use crate::rng::OsRng;
 use crate::tls::Error;
 use crate::tls::codec::{CipherSuite, NamedGroup};
 use crate::tls::conn::{ClientConfig, ClientConnection};
@@ -93,16 +90,4 @@ pub(crate) fn build_tls_engine(
 pub(crate) fn random_default_cid() -> ConnectionId {
     let mut rng = OsRng;
     ConnectionId::random(&mut rng, DEFAULT_CID_LEN)
-}
-
-/// Like [`random_default_cid`] but takes an explicit RNG — used by tests
-/// that need reproducible CIDs.
-pub(crate) fn random_default_cid_with<R: RngCore>(rng: &mut R) -> ConnectionId {
-    ConnectionId::random(rng, DEFAULT_CID_LEN)
-}
-
-/// Stringify a server name. Kept here so the `connection.rs` constructor
-/// reads as a single pass.
-pub(crate) fn snify(name: &str) -> alloc::string::String {
-    name.to_string()
 }
