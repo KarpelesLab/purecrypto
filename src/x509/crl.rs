@@ -44,6 +44,29 @@ use crate::der::{
 
 const PEM_LABEL: &str = "X509 CRL";
 
+/// `id-ce-cRLNumber` (2.5.29.20) — non-critical monotonic CRL sequence number
+/// (RFC 5280 §5.2.3). Recognized; carries no policy we must act on.
+const OID_CRL_NUMBER: &[u64] = &[2, 5, 29, 20];
+/// `id-ce-deltaCRLIndicator` (2.5.29.27) — marks a *delta* CRL and is always
+/// critical (RFC 5280 §5.2.4). We do not implement delta-CRL processing, so a
+/// CRL bearing it MUST be rejected rather than silently treated as a base CRL.
+const OID_DELTA_CRL_INDICATOR: &[u64] = &[2, 5, 29, 27];
+/// `id-ce-issuingDistributionPoint` (2.5.29.28) — critical scoping extension
+/// (RFC 5280 §5.2.5). Recognized; see [`CertificateRevocationList::validate_extensions`]
+/// for the (conservative) handling.
+const OID_ISSUING_DISTRIBUTION_POINT: &[u64] = &[2, 5, 29, 28];
+
+/// `id-ce-authorityKeyIdentifier` (2.5.29.35) — non-critical (RFC 5280 §5.2.1).
+const OID_AUTHORITY_KEY_IDENTIFIER: &[u64] = &[2, 5, 29, 35];
+
+/// `id-ce-certificateIssuer` (2.5.29.29) — per-entry extension used by
+/// *indirect* CRLs; always critical (RFC 5280 §5.3.3). We do not implement
+/// indirect CRLs, so an entry bearing it is refused as unsupported.
+const OID_CERTIFICATE_ISSUER: &[u64] = &[2, 5, 29, 29];
+/// `id-ce-invalidityDate` (2.5.29.24) — non-critical per-entry hint
+/// (RFC 5280 §5.3.2). Recognized and ignored.
+const OID_INVALIDITY_DATE: &[u64] = &[2, 5, 29, 24];
+
 /// Reasons a certificate may be revoked (RFC 5280 §5.3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -278,20 +301,29 @@ struct CrlParts<'a> {
 }
 
 impl CertificateRevocationList {
-    /// Wraps existing CRL DER. Validates only that it is a single SEQUENCE
-    /// with no trailing bytes (strict, matching the certificate parser).
+    /// Wraps existing CRL DER. Validates that it is a single SEQUENCE with no
+    /// trailing bytes (strict, matching the certificate parser) and that any
+    /// `crlExtensions` it carries are acceptable — in particular, any
+    /// **unrecognized critical** top-level extension causes rejection
+    /// (RFC 5280 §5.2), and a delta CRL (which we do not implement) is
+    /// refused. This fails closed, mirroring the certificate parser.
     pub fn from_der(der: Vec<u8>) -> Result<Self, Error> {
         let mut r = Reader::new(&der);
         r.read_sequence()?;
         r.finish()?;
-        Ok(CertificateRevocationList { der })
+        let crl = CertificateRevocationList { der };
+        crl.validate_extensions()?;
+        Ok(crl)
     }
 
-    /// Parses a PEM `X509 CRL` document (RFC 7468 label).
+    /// Parses a PEM `X509 CRL` document (RFC 7468 label). Applies the same
+    /// `crlExtensions` validation as [`from_der`](Self::from_der).
     pub fn from_pem(pem: &str) -> Result<Self, Error> {
-        Ok(CertificateRevocationList {
+        let crl = CertificateRevocationList {
             der: pem_decode(pem, PEM_LABEL)?,
-        })
+        };
+        crl.validate_extensions()?;
+        Ok(crl)
     }
 
     /// The DER encoding.
@@ -439,6 +471,103 @@ impl CertificateRevocationList {
         issuer_key.verify(&parts.sig_alg, parts.tbs, parts.signature)
     }
 
+    /// Returns a sub-reader positioned at the optional `crlExtensions [0]`
+    /// field of the `TBSCertList`, having consumed every field that precedes
+    /// it (issuer, thisUpdate, optional nextUpdate, optional
+    /// revokedCertificates). The returned reader is empty when no
+    /// `crlExtensions` field is present.
+    fn tbs_at_crl_extensions(&self) -> Result<Reader<'_>, Error> {
+        let mut seq = self.tbs_after_algid()?;
+        seq.read_element()?; // issuer
+        read_time(&mut seq)?; // thisUpdate
+        // Optional nextUpdate.
+        if let Some(t) = seq.peek_tag()
+            && (t == tag::UTC_TIME || t == tag::GENERALIZED_TIME)
+        {
+            read_time(&mut seq)?;
+        }
+        // Optional revokedCertificates SEQUENCE OF SEQUENCE.
+        if seq.peek_tag() == Some(tag::SEQUENCE) {
+            seq.read_element()?;
+        }
+        Ok(seq)
+    }
+
+    /// Parses and vets the top-level `crlExtensions [0] EXPLICIT Extensions`
+    /// field (RFC 5280 §5.2), failing closed exactly as the certificate parser
+    /// does for certificate extensions:
+    ///
+    /// * Any **unrecognized critical** extension causes rejection — the CRL is
+    ///   not silently consumed as understood.
+    /// * `deltaCRLIndicator` (2.5.29.27) is refused outright: this crate does
+    ///   not implement delta-CRL processing, so applying a delta CRL as if it
+    ///   were a base CRL would mis-state revocation status.
+    /// * A critical `issuingDistributionPoint` (2.5.29.28) is refused: the CRL
+    ///   validator treats a CRL as covering everything its issuer signed, but a
+    ///   critical IDP narrows that scope in ways we do not evaluate — honouring
+    ///   the CRL anyway risks reporting a revoked certificate as good.
+    /// * `cRLNumber` (2.5.29.20) and `authorityKeyIdentifier` (2.5.29.35) are
+    ///   recognized; per RFC 5280 they MUST be non-critical, so a critical
+    ///   instance is rejected.
+    /// * A duplicate top-level extension OID is rejected (matching the
+    ///   certificate parser's CVE-2014-1568-shaped guard).
+    fn validate_extensions(&self) -> Result<(), Error> {
+        let mut seq = self.tbs_at_crl_extensions()?;
+        // crlExtensions [0] EXPLICIT — absent is fine.
+        if seq.peek_tag() != Some(tag::context(0)) {
+            return Ok(());
+        }
+        let wrapper = seq.read_tlv(tag::context(0))?;
+        let mut outer = Reader::new(wrapper);
+        let mut exts = outer.read_sequence()?;
+        outer.finish()?;
+        // Extensions ::= SEQUENCE SIZE (1..MAX): a present-but-empty block is
+        // malformed.
+        if exts.is_empty() {
+            return Err(Error::Malformed);
+        }
+        let mut seen: Vec<Vec<u64>> = Vec::new();
+        while !exts.is_empty() {
+            let mut ext = exts.read_sequence()?;
+            let id = parse_oid(ext.read_oid()?)?;
+            if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+                return Err(Error::Malformed);
+            }
+            seen.push(id.clone());
+            let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
+                ext.read_boolean()?
+            } else {
+                false
+            };
+            let _value = ext.read_octet_string()?;
+            ext.finish()?;
+            let id = id.as_slice();
+            if id == OID_DELTA_CRL_INDICATOR {
+                // Delta CRLs are not supported; refuse regardless of the
+                // critical flag (the RFC requires it to be critical anyway).
+                return Err(Error::UnsupportedAlgorithm);
+            } else if id == OID_ISSUING_DISTRIBUTION_POINT {
+                // We do not evaluate the IDP scoping fields; a critical IDP
+                // must therefore be rejected (fail closed).
+                if critical {
+                    return Err(Error::UnsupportedAlgorithm);
+                }
+            } else if id == OID_CRL_NUMBER || id == OID_AUTHORITY_KEY_IDENTIFIER {
+                // Recognized informational extensions. RFC 5280 mandates these
+                // be non-critical; a critical instance is malformed.
+                if critical {
+                    return Err(Error::Malformed);
+                }
+            } else if critical {
+                // RFC 5280 §5.2: an unrecognized critical extension MUST cause
+                // the CRL to be rejected.
+                return Err(Error::UnsupportedAlgorithm);
+            }
+            // Unrecognized non-critical extensions are ignored.
+        }
+        Ok(())
+    }
+
     /// Iterates the `revokedCertificates` entries. Returns an empty list if
     /// the field is absent.
     pub fn entries(&self) -> Result<Vec<RevokedCertificate>, Error> {
@@ -471,13 +600,14 @@ impl CertificateRevocationList {
                     while !exts.is_empty() {
                         let mut ext = exts.read_sequence()?;
                         let id = parse_oid(ext.read_oid()?)?;
-                        let _critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
+                        let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
                             ext.read_boolean()?
                         } else {
                             false
                         };
                         let value = ext.read_octet_string()?;
-                        if id.as_slice() == oid::CRL_REASON_CODE {
+                        let id = id.as_slice();
+                        if id == oid::CRL_REASON_CODE {
                             let mut vr = Reader::new(value);
                             let enum_body = vr.read_tlv(0x0a)?;
                             // ENUMERATED is single-byte in practice for the
@@ -488,7 +618,18 @@ impl CertificateRevocationList {
                                 return Err(Error::Malformed);
                             }
                             reason = Some(CrlReason::from_u8(enum_body[0])?);
+                        } else if id == OID_CERTIFICATE_ISSUER {
+                            // Indirect CRLs are not supported; refuse the entry
+                            // rather than mis-attribute it to the CRL issuer.
+                            return Err(Error::UnsupportedAlgorithm);
+                        } else if id == OID_INVALIDITY_DATE {
+                            // Recognized, non-critical hint; nothing to do.
+                        } else if critical {
+                            // RFC 5280 §5.2: an unrecognized *critical* entry
+                            // extension MUST cause rejection. Fail closed.
+                            return Err(Error::UnsupportedAlgorithm);
                         }
+                        // Unrecognized non-critical entry extensions: ignored.
                     }
                 }
                 out.push(RevokedCertificate {
@@ -750,10 +891,13 @@ mod tests {
         let sig = signer.sign(&tbs).unwrap();
         let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
 
-        let crl = CertificateRevocationList::from_der(der).unwrap();
-        // Any accessor that walks past the version field surfaces the error.
-        assert!(matches!(crl.issuer(), Err(Error::Malformed)));
-        assert!(matches!(crl.entries(), Err(Error::Malformed)));
+        // `from_der` now validates the (absent) crlExtensions field, which
+        // walks the version and surfaces the malformed value at construction
+        // time — fail closed at the boundary.
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::Malformed)
+        ));
     }
 
     #[test]
@@ -792,6 +936,92 @@ mod tests {
 
         let crl = CertificateRevocationList::from_der(der).unwrap();
         assert!(matches!(crl.entries(), Err(Error::Malformed)));
+    }
+
+    /// Encodes one `Extension ::= SEQUENCE { OID, critical?, OCTET STRING }`.
+    fn ext(oid_arcs: &[u64], critical: bool, value: &[u8]) -> Vec<u8> {
+        let mut body = oid_tlv(oid_arcs);
+        if critical {
+            body.extend_from_slice(&encode_tlv(0x01, &[0xff])); // BOOLEAN TRUE
+        }
+        body.extend_from_slice(&encode_octet_string(value));
+        encode_sequence(&body)
+    }
+
+    /// Signs a `TBSCertList` carrying a top-level `crlExtensions [0]` built from
+    /// the concatenated `exts`, returning the full CRL DER (unparsed).
+    fn crl_der_with_extensions(exts: &[u8]) -> Vec<u8> {
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+        let mut tbs_body = Vec::new();
+        tbs_body.extend_from_slice(&encode_integer(&[1]));
+        tbs_body.extend_from_slice(&algid);
+        tbs_body.extend_from_slice(&dn.to_der());
+        tbs_body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
+        // crlExtensions [0] EXPLICIT Extensions.
+        let extensions = encode_sequence(exts);
+        tbs_body.extend_from_slice(&encode_tlv(tag::context(0), &extensions));
+        let tbs = encode_sequence(&tbs_body);
+        let sig = signer.sign(&tbs).unwrap();
+        encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat())
+    }
+
+    #[test]
+    fn rejects_unknown_critical_crl_extension() {
+        // A bogus critical top-level extension (OID 2.5.29.99) must cause the
+        // CRL to be rejected at parse time (RFC 5280 §5.2 fail-closed).
+        let der = crl_der_with_extensions(&ext(&[2, 5, 29, 99], true, &[0x05, 0x00]));
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    #[test]
+    fn rejects_delta_crl_indicator() {
+        // deltaCRLIndicator (2.5.29.27) marks an unsupported delta CRL.
+        let base_crl_number = encode_integer(&[0x01]);
+        let der = crl_der_with_extensions(&ext(&[2, 5, 29, 27], true, &base_crl_number));
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    #[test]
+    fn rejects_critical_issuing_distribution_point() {
+        // A critical IDP narrows scope in ways we don't evaluate → fail closed.
+        let idp = encode_sequence(&[]); // empty IssuingDistributionPoint SEQUENCE
+        let der = crl_der_with_extensions(&ext(&[2, 5, 29, 28], true, &idp));
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    #[test]
+    fn accepts_known_noncritical_crl_extensions() {
+        // cRLNumber (2.5.29.20) + authorityKeyIdentifier (2.5.29.35), both
+        // non-critical, are recognized and accepted.
+        let crl_number = ext(&[2, 5, 29, 20], false, &encode_integer(&[0x2a]));
+        let aki = ext(&[2, 5, 29, 35], false, &encode_sequence(&[]));
+        let der = crl_der_with_extensions(&[crl_number, aki].concat());
+        let crl = CertificateRevocationList::from_der(der).expect("known exts accepted");
+        // And the parsed CRL still behaves normally.
+        assert!(crl.entries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_critical_crl_number() {
+        // cRLNumber MUST be non-critical (RFC 5280 §5.2.3): a critical instance
+        // is malformed.
+        let der = crl_der_with_extensions(&ext(&[2, 5, 29, 20], true, &encode_integer(&[0x01])));
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::Malformed)
+        ));
     }
 
     #[test]
