@@ -400,14 +400,38 @@ fn prepare_for_next(
             // mapped. We prune such nodes from the current leaf row.
             let d = tree.depth;
             let mapped: Vec<&Oid> = mappings.iter().map(|(i, _)| i).collect();
+            // Decide which nodes survive, then compact while remapping the
+            // surviving nodes' `parent` indices. Without the remap, draining
+            // and rebuilding `tree.nodes` shifts positions, so a surviving
+            // node's stored `parent` could point at the wrong node (or out of
+            // bounds) before `prune()` walks it. This is currently masked only
+            // because the dropped nodes always sit in the tail (leaf) row, but
+            // we make it robust regardless of where they fall.
+            let keep: Vec<bool> = tree
+                .nodes
+                .iter()
+                .map(|node| {
+                    !(node.depth == d
+                        && mapped
+                            .iter()
+                            .any(|m| m.as_slice() == node.valid_policy.as_slice()))
+                })
+                .collect();
+            let mut remap = alloc::vec![usize::MAX; tree.nodes.len()];
             let mut survive = Vec::new();
-            for node in tree.nodes.drain(..) {
-                let drop = node.depth == d
-                    && mapped
-                        .iter()
-                        .any(|m| m.as_slice() == node.valid_policy.as_slice());
-                if !drop {
+            for (old, node) in tree.nodes.drain(..).enumerate() {
+                if keep[old] {
+                    remap[old] = survive.len();
                     survive.push(node);
+                }
+            }
+            for node in &mut survive {
+                if node.parent != usize::MAX {
+                    // A surviving node's parent is always itself surviving (we
+                    // only ever drop leaf-row nodes, which have no children),
+                    // so the remap entry is valid; fall back to `usize::MAX`
+                    // defensively if that invariant ever changes.
+                    node.parent = remap.get(node.parent).copied().unwrap_or(usize::MAX);
                 }
             }
             tree.nodes = survive;
@@ -791,6 +815,97 @@ mod tests {
             &[extension::certificate_policies(&[POLICY_A])],
         );
         assert!(verify(&store, &chain, &PolicyOptions::require(&[POLICY_C])).is_err());
+    }
+
+    #[test]
+    fn inhibited_mapping_prune_remaps_parent_indices() {
+        // Regression: when policyMapping is inhibited, the inhibited-mapping
+        // path drains and rebuilds `tree.nodes`. A dropped node that is NOT in
+        // the tail position shifts later nodes' positions, so surviving nodes'
+        // `parent` indices must be remapped or the subsequent `prune()` walks
+        // the wrong parents (or out of bounds).
+        //
+        // Construct a tree where node 1 (depth 0, a root child) is dropped,
+        // node 0 (depth 0) survives and is the parent of node 2 (depth 1).
+        // Before the fix, node 2's parent (0) happened to remain valid only by
+        // luck; here we force the dropped node to precede a surviving parent so
+        // a naive (no-remap) compaction would corrupt the link.
+        let mut tree = PolicyTree {
+            nodes: vec![
+                // 0: surviving depth-0 node (the real parent of node 2).
+                Node {
+                    valid_policy: POLICY_A.to_vec(),
+                    expected_policy_set: vec![POLICY_A.to_vec()],
+                    parent: usize::MAX,
+                    depth: 0,
+                },
+                // 1: depth-1 node to be DROPPED (mapped issuerDomainPolicy).
+                Node {
+                    valid_policy: POLICY_B.to_vec(),
+                    expected_policy_set: vec![POLICY_B.to_vec()],
+                    parent: 0,
+                    depth: 1,
+                },
+                // 2: depth-1 surviving node whose parent is node 0.
+                Node {
+                    valid_policy: POLICY_C.to_vec(),
+                    expected_policy_set: vec![POLICY_C.to_vec()],
+                    parent: 0,
+                    depth: 1,
+                },
+            ],
+            depth: 1,
+        };
+
+        // Replicate the inhibited-mapping survive+remap exactly as
+        // `prepare_for_next` does, dropping node 1 (POLICY_B at depth 1).
+        let d = tree.depth;
+        let mapped = [POLICY_B];
+        let keep: Vec<bool> = tree
+            .nodes
+            .iter()
+            .map(|node| !(node.depth == d && mapped.contains(&node.valid_policy.as_slice())))
+            .collect();
+        let mut remap = alloc::vec![usize::MAX; tree.nodes.len()];
+        let mut survive = Vec::new();
+        for (old, node) in tree.nodes.drain(..).enumerate() {
+            if keep[old] {
+                remap[old] = survive.len();
+                survive.push(node);
+            }
+        }
+        for node in &mut survive {
+            if node.parent != usize::MAX {
+                node.parent = remap.get(node.parent).copied().unwrap_or(usize::MAX);
+            }
+        }
+        tree.nodes = survive;
+
+        // Node 0 stays at index 0; old node 2 moves to index 1 and its parent
+        // (old 0) must remap to 0 — which it still does here, but the link is
+        // now correct *by remap*, not by accident.
+        assert_eq!(tree.nodes.len(), 2);
+        assert_eq!(tree.nodes[1].valid_policy, POLICY_C.to_vec());
+        assert_eq!(tree.nodes[1].parent, 0);
+        assert_eq!(tree.nodes[0].valid_policy, POLICY_A.to_vec());
+        assert_eq!(tree.nodes[0].parent, usize::MAX);
+
+        // prune() must not panic and must keep the surviving depth-1 node and
+        // its parent.
+        tree.prune();
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|n| n.valid_policy == POLICY_C.to_vec())
+        );
+        assert!(
+            tree.nodes
+                .iter()
+                .any(|n| n.valid_policy == POLICY_A.to_vec())
+        );
+        for n in &tree.nodes {
+            assert!(n.parent == usize::MAX || n.parent < tree.nodes.len());
+        }
     }
 
     #[test]
