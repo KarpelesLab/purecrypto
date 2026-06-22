@@ -16,6 +16,16 @@ pub struct EcdhPrivateKey {
     d: Fe,
 }
 
+impl Drop for EcdhPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the secret scalar with a `black_box` barrier so
+        // the store is not elided (mirrors `secp256k1::Scalar` and the boxed
+        // EC key types).
+        self.d = Fe::ZERO;
+        let _ = core::hint::black_box(&self.d);
+    }
+}
+
 impl EcdhPrivateKey {
     /// Generates a fresh ephemeral key from `rng`. The RNG must be a
     /// cryptographically secure CSPRNG (see [`CryptoRng`]).

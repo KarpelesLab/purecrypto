@@ -13,6 +13,16 @@ pub struct EcdsaPrivateKey {
     d: Fe,
 }
 
+impl Drop for EcdsaPrivateKey {
+    fn drop(&mut self) {
+        // Best-effort wipe of the secret scalar with a `black_box` barrier so
+        // the store is not elided (mirrors `secp256k1::Scalar` and the boxed
+        // EC key types).
+        self.d = Fe::ZERO;
+        let _ = core::hint::black_box(&self.d);
+    }
+}
+
 /// A P-256 ECDSA public key (an affine curve point).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EcdsaPublicKey {
