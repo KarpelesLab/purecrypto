@@ -199,6 +199,7 @@ impl Connection {
             Engine::ServerTls13(c) => c.pending_signature(),
             Engine::ClientTls13(c) => c.pending_signature(),
             Engine::ServerDtls13(c) => c.pending_signature(),
+            Engine::ServerDtls12(c) => c.pending_signature(),
             _ => None,
         };
         pending.map(|(scheme, message)| SignatureRequest { scheme, message })
@@ -215,6 +216,7 @@ impl Connection {
             Engine::ServerTls13(c) => c.provide_signature(signature),
             Engine::ClientTls13(c) => c.provide_signature(signature),
             Engine::ServerDtls13(c) => c.provide_signature(signature),
+            Engine::ServerDtls12(c) => c.provide_signature(signature),
             _ => Err(Error::InappropriateState),
         }
     }
@@ -809,6 +811,9 @@ fn build_dtls12_server(
         }
         super::config::SigningKey::Rsa(k) => {
             crate::dtls::ServerConfig12Internal::with_rsa(chain, k.clone())
+        }
+        super::config::SigningKey::External { schemes } => {
+            crate::dtls::ServerConfig12Internal::with_external(chain, schemes.clone())
         }
         // DTLS 1.2 mirrors TLS 1.2's scope: RSA + ECDSA only. Ed25519 and
         // ML-DSA are not common in TLS 1.2 practice.
@@ -1451,6 +1456,74 @@ mod tests {
         assert!(
             client.is_handshake_complete() && server.is_handshake_complete(),
             "external-signed DTLS 1.3 handshake must complete and verify"
+        );
+    }
+
+    /// DTLS 1.2 signs the `ServerKeyExchange` (not a CertificateVerify), so the
+    /// suspend/resume seam sits at a different point in the flight than 1.3.
+    /// Drive a full loopback handshake where the server's identity is an
+    /// `External` ECDSA key and the test "HSM" signs the SKE bytes out-of-band.
+    #[test]
+    fn dtls12_server_external_signing_round_trips() {
+        const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+        let (key, leaf) = ecdsa_identity(b"dtls12-ext", "dtls12.example");
+
+        let mut server_cfg = Config::builder()
+            .versions(ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_2)
+            .identity(
+                alloc::vec![leaf],
+                super::super::config::SigningKey::External {
+                    schemes: alloc::vec![ECDSA_SECP256R1_SHA256],
+                },
+            )
+            .build();
+        // Keep the test single-round: skip the cookie exchange.
+        server_cfg.require_cookie = false;
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_2)
+            .verify_certificates(false)
+            .server_name("dtls12.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let mut signed = false;
+        for _ in 0..64 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            if let Some(req) = server.signature_request() {
+                assert_eq!(req.scheme, ECDSA_SECP256R1_SHA256);
+                let sig = key
+                    .sign::<Sha256>(&req.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                server.provide_signature(sig).unwrap();
+                signed = true;
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            signed,
+            "the DTLS 1.2 server must have requested an external signature"
+        );
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "external-signed DTLS 1.2 handshake must complete and verify"
         );
     }
 

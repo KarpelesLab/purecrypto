@@ -106,6 +106,22 @@ impl ServerConfig12Internal {
         }
     }
 
+    /// New configuration whose `ServerKeyExchange` signature is produced
+    /// out-of-band by the caller (suspend/resume). `schemes` are the IANA
+    /// `SignatureScheme` code points the external key can produce; the first
+    /// drives suite selection (ECDSA vs RSA `ECDHE-*`).
+    pub fn with_external(cert_chain: Vec<Vec<u8>>, schemes: Vec<u16>) -> Self {
+        let schemes = schemes.into_iter().map(SignatureScheme).collect();
+        Self {
+            cert_chain,
+            key: ServerKey::External { schemes },
+            cookie_secret: None,
+            require_cookie_exchange: true,
+            signature_policy: SignaturePolicy::modern(),
+            key_log: None,
+        }
+    }
+
     /// Sets the cookie secret used for HelloVerifyRequest. Callers
     /// typically derive this from a long-lived high-entropy server secret.
     pub fn with_cookie_secret(mut self, secret: [u8; 32]) -> Self {
@@ -141,9 +157,31 @@ enum State {
     /// Sent server flight (SH/Cert/SKE/SHDone), awaiting client
     /// CKE/CCS/Finished.
     WaitClientFlight,
+    /// External-signing pause: SH + Certificate are built and the flight is
+    /// held while the caller signs the `ServerKeyExchange` params; on resume
+    /// the SKE + ServerHelloDone are appended and the flight is sent.
+    AwaitingSkeSignature,
     /// Sent our CCS/Finished, awaiting nothing further from the client.
     Connected,
     Closed,
+}
+
+/// State stashed while a DTLS 1.2 server flight is suspended awaiting an
+/// external `ServerKeyExchange` signature (see
+/// [`ServerKey::External`](crate::tls::conn::ServerKey::External)). Holds the
+/// half-built flight (ServerHello + Certificate) plus the ECDHE params the
+/// resume needs to assemble the signed SKE.
+struct PendingSke {
+    /// Negotiated signature scheme for the SKE.
+    scheme: SignatureScheme,
+    /// The SKE signature input (`client_random ‖ server_random ‖ params`).
+    content: Vec<u8>,
+    /// The flight built so far (ServerHello, Certificate).
+    flight: Flight,
+    /// Negotiated (EC)DHE group.
+    group: NamedGroup,
+    /// The server's ephemeral public key share.
+    our_point: Vec<u8>,
 }
 
 /// A DTLS 1.2 server connection.
@@ -187,6 +225,9 @@ pub struct DtlsServerConnection12<R: RngCore> {
 
     client_random: Option<Random>,
     server_random: Option<Random>,
+    /// External-signing continuation; `Some` while suspended awaiting the
+    /// `ServerKeyExchange` signature.
+    pending_ske: Option<PendingSke>,
 
     /// Negotiated cipher-suite parameters, pinned on the cookie-validated
     /// ClientHello (or the only CH when cookies are disabled).
@@ -259,6 +300,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             p384: None,
             client_random: None,
             server_random: None,
+            pending_ske: None,
             suite: None,
             group: None,
             transcript: Transcript::new(),
@@ -909,11 +951,37 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .map_err(|_| Error::HandshakeFailure)?;
                 sig.to_der(k.curve())
             }
-            // The public DTLS-1.2 server constructors (`with_ecdsa`,
-            // `with_rsa`) only build RSA / ECDSA server keys, so other
-            // variants are unreachable. Be explicit.
+            // External key: hold the half-built flight + ECDHE params and
+            // suspend; the caller signs `to_sign` and resumes via
+            // `provide_signature`, which assembles the SKE + ServerHelloDone.
+            ServerKey::External { .. } => {
+                self.pending_ske = Some(PendingSke {
+                    scheme,
+                    content: to_sign,
+                    flight,
+                    group,
+                    our_point,
+                });
+                self.state = State::AwaitingSkeSignature;
+                return Ok(());
+            }
+            // Other variants are unreachable through the public constructors.
             _ => return Err(Error::HandshakeFailure),
         };
+        self.finish_ske_flight(flight, scheme, group, our_point, signature)
+    }
+
+    /// Appends the signed `ServerKeyExchange` + `ServerHelloDone` to the
+    /// half-built `flight`, then sends it. Shared by the inline and external
+    /// signing paths.
+    fn finish_ske_flight(
+        &mut self,
+        mut flight: Flight,
+        scheme: SignatureScheme,
+        group: NamedGroup,
+        our_point: Vec<u8>,
+        signature: Vec<u8>,
+    ) -> Result<(), Error> {
         let ske = ServerKeyExchange {
             group,
             point: our_point,
@@ -937,6 +1005,22 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.send_flight(flight);
         self.state = State::WaitClientFlight;
         Ok(())
+    }
+
+    /// Resumes a flight suspended for an external `ServerKeyExchange` signature:
+    /// assembles the SKE with the caller-supplied `signature`, then sends the
+    /// flight.
+    pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        let p = self.pending_ske.take().ok_or(Error::InappropriateState)?;
+        self.finish_ske_flight(p.flight, p.scheme, p.group, p.our_point, signature)
+    }
+
+    /// If suspended awaiting an external signature, returns the IANA scheme code
+    /// point and the bytes to sign.
+    pub(crate) fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
+        self.pending_ske
+            .as_ref()
+            .map(|p| (p.scheme.0, p.content.clone()))
     }
 
     fn emit_hello_verify_request(&mut self, cookie: &[u8]) -> Result<(), Error> {
@@ -1275,9 +1359,26 @@ fn signature_scheme(key: &ServerKey) -> SignatureScheme {
             CurveId::P384 | CurveId::BrainpoolP384r1 => SignatureScheme::ECDSA_SECP384R1_SHA384,
             CurveId::P521 | CurveId::BrainpoolP512r1 => SignatureScheme::ECDSA_SECP521R1_SHA512,
         },
+        // External key: the caller advertises the scheme(s); use the preferred.
+        ServerKey::External { schemes } => schemes
+            .first()
+            .copied()
+            .unwrap_or(SignatureScheme::RSA_PSS_RSAE_SHA256),
         // Unreachable through the public constructors but the compiler
         // requires the match to be total.
         _ => SignatureScheme::RSA_PSS_RSAE_SHA256,
+    }
+}
+
+/// The signature family of an IANA `SignatureScheme` code point, for DTLS 1.2
+/// `ECDHE-*` suite selection: the ECDSA code points map to `Ecdsa`, everything
+/// else (RSA-PSS) to `Rsa`.
+fn sig_kind_from_scheme(scheme: SignatureScheme) -> SigKind {
+    match scheme {
+        SignatureScheme::ECDSA_SECP256R1_SHA256
+        | SignatureScheme::ECDSA_SECP384R1_SHA384
+        | SignatureScheme::ECDSA_SECP521R1_SHA512 => SigKind::Ecdsa,
+        _ => SigKind::Rsa,
     }
 }
 
@@ -1289,6 +1390,12 @@ fn sig_kind_for_key(key: &ServerKey) -> SigKind {
     match key {
         ServerKey::Rsa(_) => SigKind::Rsa,
         ServerKey::Ecdsa(_) => SigKind::Ecdsa,
+        // External key: infer the family from the preferred advertised scheme
+        // so the matching `ECDHE-RSA-*` / `ECDHE-ECDSA-*` suites are offered.
+        ServerKey::External { schemes } => schemes
+            .first()
+            .copied()
+            .map_or(SigKind::Rsa, sig_kind_from_scheme),
         // Other variants are inhabited by the shared `ServerKey` enum but
         // are unreachable through the public DTLS-1.2 constructors. Default
         // to a kind that will fail to match any of our suites.
