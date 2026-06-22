@@ -27,9 +27,8 @@ use crate::tls::codec::{
     with_len_u24,
 };
 use crate::tls::crypto::{
-    HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
-    certificate_verify_content, finished_verify_data, next_traffic_secret, psk_from_resumption,
-    supported_suites, tls_exporter,
+    HashAlg, KeySchedule, Secret, SuiteParams, binder_finished_key, certificate_verify_content,
+    finished_verify_data, next_traffic_secret, psk_from_resumption, supported_suites, tls_exporter,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::{AlertDescription, Error};
@@ -1274,12 +1273,7 @@ impl<R: RngCore> ServerConnection<R> {
                     }
                     let suite = self.suite.expect("suite set");
                     let chts = self.deferred_chts.take().expect("deferred chts");
-                    self.core.set_read(RecordCrypter::new(
-                        suite.hash,
-                        suite.aead,
-                        suite.key_len,
-                        &chts,
-                    ));
+                    self.core.set_read(suite.crypter(&chts));
                     // The early-data read key is gone; application records
                     // from here on are 1-RTT-bound and go to the regular
                     // receive buffer again.
@@ -1323,12 +1317,7 @@ impl<R: RngCore> ServerConnection<R> {
             .as_ref()
             .ok_or(Error::IllegalParameter)?;
         let next = next_traffic_secret(suite.hash, prev);
-        self.core.set_read(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &next,
-        ));
+        self.core.set_read(suite.crypter(&next));
         self.client_app_secret = Some(next);
         if ku.request_update {
             self.send_key_update(false)?;
@@ -1354,12 +1343,7 @@ impl<R: RngCore> ServerConnection<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let next = next_traffic_secret(suite.hash, prev);
-        self.core.set_write(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &next,
-        ));
+        self.core.set_write(suite.crypter(&next));
         self.server_app_secret = Some(next);
         Ok(())
     }
@@ -1825,12 +1809,7 @@ impl<R: RngCore> ServerConnection<R> {
                 cets.as_slice(),
             );
             if !self.skip_record_keys() {
-                self.core.set_read(RecordCrypter::new(
-                    suite.hash,
-                    suite.aead,
-                    suite.key_len,
-                    &cets,
-                ));
+                self.core.set_read(suite.crypter(&cets));
                 // Quarantine: while the early-data read key is installed,
                 // decrypted application plaintext is replayable 0-RTT data
                 // and must land in the dedicated early-data buffer, never
@@ -1994,21 +1973,11 @@ impl<R: RngCore> ServerConnection<R> {
         // install chts now. In QUIC mode the record crypter is never
         // installed (the QUIC layer holds the per-level AEAD state).
         if !self.skip_record_keys() {
-            self.core.set_write(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &shts,
-            ));
+            self.core.set_write(suite.crypter(&shts));
             if self.early_data_accepted {
                 self.deferred_chts = Some(chts.clone());
             } else {
-                self.core.set_read(RecordCrypter::new(
-                    suite.hash,
-                    suite.aead,
-                    suite.key_len,
-                    &chts,
-                ));
+                self.core.set_read(suite.crypter(&chts));
             }
             // RFC 9001 §8.4: ChangeCipherSpec MUST NOT appear in QUIC.
             self.core.emit_ccs();
@@ -2061,12 +2030,7 @@ impl<R: RngCore> ServerConnection<R> {
         // reads the client Finished with the client handshake key. Skip in
         // QUIC mode — the QUIC layer holds 1-RTT AEAD state itself.
         if !self.skip_record_keys() {
-            self.core.set_write(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &sats,
-            ));
+            self.core.set_write(suite.crypter(&sats));
         }
 
         self.suite = Some(suite);
@@ -2534,12 +2498,7 @@ impl<R: RngCore> ServerConnection<R> {
         // mode the QUIC layer holds the 1-RTT read-side AEAD state itself.
         if !self.skip_record_keys() {
             let cats = self.client_app_secret.as_ref().expect("client app secret");
-            self.core.set_read(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                cats,
-            ));
+            self.core.set_read(suite.crypter(cats));
         }
         // RFC 8446 §5: ChangeCipherSpec is no longer permitted after this point.
         self.core.close_ccs_window();

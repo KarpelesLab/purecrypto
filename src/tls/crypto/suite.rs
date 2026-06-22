@@ -30,6 +30,15 @@ pub(crate) struct SuiteParams {
     pub(crate) aead: AeadAlg,
 }
 
+impl SuiteParams {
+    /// Builds a [`RecordCrypter`](super::aead::RecordCrypter) for this suite
+    /// keyed from `secret`, supplying the suite's hash, AEAD, and key length in
+    /// one call instead of spelling all three out at every key-install site.
+    pub(crate) fn crypter(&self, secret: &super::schedule::Secret) -> super::aead::RecordCrypter {
+        super::aead::RecordCrypter::new(self.hash, self.aead, self.key_len, secret)
+    }
+}
+
 /// The suites we support, in descending preference order.
 pub(crate) const SUPPORTED: [SuiteParams; 3] = [
     SuiteParams {

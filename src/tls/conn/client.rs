@@ -30,9 +30,9 @@ use crate::tls::codec::{
     with_len_u24,
 };
 use crate::tls::crypto::{
-    HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, binder_finished_key,
-    certificate_verify_content, finished_verify_data, lookup_suite, next_traffic_secret,
-    psk_from_resumption, tls_exporter, verify_signature,
+    HashAlg, KeySchedule, Secret, SuiteParams, binder_finished_key, certificate_verify_content,
+    finished_verify_data, lookup_suite, next_traffic_secret, psk_from_resumption, tls_exporter,
+    verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -1255,12 +1255,7 @@ impl ClientConnection {
                 cets.as_slice(),
             );
             if !conn.skip_record_keys() {
-                conn.core.set_write(RecordCrypter::new(
-                    suite.hash,
-                    suite.aead,
-                    suite.key_len,
-                    &cets,
-                ));
+                conn.core.set_write(suite.crypter(&cets));
             }
             conn.cets = Some(cets);
         }
@@ -1682,12 +1677,7 @@ impl ClientConnection {
             .as_ref()
             .ok_or(Error::IllegalParameter)?;
         let next = next_traffic_secret(suite.hash, prev);
-        self.core.set_read(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &next,
-        ));
+        self.core.set_read(suite.crypter(&next));
         self.server_app_secret = Some(next);
 
         if ku.request_update {
@@ -1724,12 +1714,7 @@ impl ClientConnection {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let next = next_traffic_secret(suite.hash, prev);
-        self.core.set_write(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &next,
-        ));
+        self.core.set_write(suite.crypter(&next));
         self.client_app_secret = Some(next);
         Ok(())
     }
@@ -1968,21 +1953,11 @@ impl ClientConnection {
         // later. In QUIC mode the record crypter is never installed (the
         // QUIC layer holds the AEAD state per encryption level).
         if !self.skip_record_keys() {
-            self.core.set_read(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &shts,
-            ));
+            self.core.set_read(suite.crypter(&shts));
             if self.early_data_offered {
                 self.deferred_client_hs_secret = Some(chts.clone());
             } else {
-                self.core.set_write(RecordCrypter::new(
-                    suite.hash,
-                    suite.aead,
-                    suite.key_len,
-                    &chts,
-                ));
+                self.core.set_write(suite.crypter(&chts));
             }
             // RFC 9001 §8.4: ChangeCipherSpec MUST NOT appear in QUIC.
             self.core.emit_ccs(); // middlebox compatibility
@@ -2558,12 +2533,7 @@ impl ClientConnection {
                     .deferred_client_hs_secret
                     .take()
                     .ok_or(Error::InappropriateState)?;
-                self.core.set_write(RecordCrypter::new(
-                    suite.hash,
-                    suite.aead,
-                    suite.key_len,
-                    &chts,
-                ));
+                self.core.set_write(suite.crypter(&chts));
             }
         }
 
@@ -2916,12 +2886,7 @@ impl ClientConnection {
                 .deferred_client_hs_secret
                 .take()
                 .ok_or(Error::InappropriateState)?;
-            self.core.set_write(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &chts,
-            ));
+            self.core.set_write(suite.crypter(&chts));
         }
 
         // mTLS: if the server sent CertificateRequest, emit Certificate +
@@ -2958,18 +2923,8 @@ impl ClientConnection {
         // Switch to application traffic keys (TLS / DTLS only; the QUIC
         // layer holds 1-RTT AEAD state in its own crypto module).
         if !self.skip_record_keys() {
-            self.core.set_write(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &cats,
-            ));
-            self.core.set_read(RecordCrypter::new(
-                suite.hash,
-                suite.aead,
-                suite.key_len,
-                &sats,
-            ));
+            self.core.set_write(suite.crypter(&cats));
+            self.core.set_read(suite.crypter(&sats));
         }
         // Retain both directions' app secrets so we can step them on KeyUpdate.
         self.client_app_secret = Some(cats);
