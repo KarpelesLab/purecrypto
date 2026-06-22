@@ -17,8 +17,6 @@
 //! reference's table (so signing is validated by round-trip + the sampler KAT
 //! rather than byte-exact NIST sign vectors; see the module docs).
 
-#![allow(dead_code)] // consumed by the tree/sign phases
-
 use super::fpr::Fpr;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -70,13 +68,6 @@ impl Cplx {
     #[inline]
     pub(crate) fn scale(self, s: Fpr) -> Cplx {
         Cplx::new(self.re.mul(s), self.im.mul(s))
-    }
-
-    /// `1 / self` for a nonzero complex value: `conj / |self|²`.
-    #[inline]
-    pub(crate) fn inv(self) -> Cplx {
-        let d = self.re.mul(self.re).add(self.im.mul(self.im));
-        Cplx::new(self.re.div(d), self.im.neg().div(d))
     }
 
     /// Complex division `self / o`.
@@ -203,7 +194,7 @@ impl Fft {
 
     /// `mergefft`: combine the FFTs of the even/odd halves into the level-`m` FFT.
     /// `f_fft[2i] = f0[i] + ρ·f1[i]`, `f_fft[2i+1] = f0[i] − ρ·f1[i]`.
-    fn merge_fft(&self, f0h: &[Cplx], f1h: &[Cplx]) -> Vec<Cplx> {
+    pub(crate) fn merge_fft(&self, f0h: &[Cplx], f1h: &[Cplx]) -> Vec<Cplx> {
         let half = f0h.len();
         let m = 2 * half;
         let level = m.trailing_zeros() as usize;
@@ -234,11 +225,6 @@ impl Fft {
             f1.push(a.sub(b).scale(Fpr::from_f64(0.5)).mul(rho[i].conj()));
         }
         (f0, f1)
-    }
-
-    /// `mergefft` exposed for the tree code (combines two half-length FFTs).
-    pub(crate) fn merge_fft_pub(&self, f0h: &[Cplx], f1h: &[Cplx]) -> Vec<Cplx> {
-        self.merge_fft(f0h, f1h)
     }
 }
 

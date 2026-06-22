@@ -26,8 +26,6 @@
 //! so the type is well-defined, but the values that matter for Falcon — normals
 //! and zero — are exact.
 
-#![allow(dead_code)] // the full op-set lands incrementally across the Falcon phases
-
 /// An emulated IEEE-754 binary64 value, stored as its 64-bit bit pattern.
 ///
 /// All arithmetic is integer-only, constant-time, and correctly rounded
@@ -48,12 +46,14 @@ impl Fpr {
     }
 
     /// Reinterpret as a host `f64` (bit reinterpretation only).
+    #[cfg(test)]
     #[inline]
     pub(crate) const fn to_f64(self) -> f64 {
         f64::from_bits(self.0)
     }
 
     /// `true` iff the value is `+0.0` or `-0.0`.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn is_zero(self) -> bool {
         (self.0 & 0x7FFF_FFFF_FFFF_FFFF) == 0
@@ -66,6 +66,7 @@ impl Fpr {
     }
 
     /// Absolute value: clear the sign bit.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn abs(self) -> Fpr {
         Fpr(self.0 & 0x7FFF_FFFF_FFFF_FFFF)
@@ -470,6 +471,7 @@ impl Fpr {
     }
 
     /// `self <= other` by numeric value.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn le(self, other: Fpr) -> bool {
         self.order_key() <= other.order_key()

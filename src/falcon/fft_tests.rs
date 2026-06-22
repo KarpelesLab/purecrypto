@@ -92,7 +92,7 @@ fn split_merge_round_trip() {
         let f = rand_poly(&mut rng, n);
         let fh = fft.fft(&f);
         let (f0, f1) = fft.split_fft(&fh);
-        let merged = fft.merge_fft_pub(&f0, &f1);
+        let merged = fft.merge_fft(&f0, &f1);
         let mut maxerr = 0.0f64;
         for i in 0..n {
             let e = (fh[i].re.to_f64() - merged[i].re.to_f64()).abs();

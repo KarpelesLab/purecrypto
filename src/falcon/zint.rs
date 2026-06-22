@@ -11,8 +11,6 @@
 //! Key generation is a one-time, non-secret-dependent operation, so these
 //! routines favor clarity over constant-time or peak throughput.
 
-#![allow(dead_code)] // consumed by keygen
-
 use alloc::vec::Vec;
 use core::cmp::Ordering;
 
@@ -165,6 +163,7 @@ impl Zint {
         Zint { neg, mag }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_i128(v: i128) -> Zint {
         let neg = v < 0;
         let mut x = v.unsigned_abs();
@@ -177,6 +176,7 @@ impl Zint {
     }
 
     /// Reconstruct an `i128` if the value fits in ≤4 limbs and the `i128` range.
+    #[cfg(test)]
     pub(crate) fn to_i128(&self) -> Option<i128> {
         if self.mag.len() > 4 {
             return None;

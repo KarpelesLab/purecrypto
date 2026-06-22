@@ -13,8 +13,6 @@
 //! constant-time [`Fpr`]; this is the secret-dependent path, so it is
 //! data-oblivious.
 
-#![allow(dead_code)] // consumed by the public-API phase
-
 use super::Degree;
 use super::encode::compress;
 use super::fft::{Cplx, Fft, add_fft, mul_fft};

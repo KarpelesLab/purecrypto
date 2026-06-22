@@ -12,8 +12,6 @@
 //! Key generation is one-time and operates on fresh, non-secret-dependent
 //! entropy, so it favors clarity over constant-time.
 
-#![allow(dead_code)] // consumed by the sign / public-API phases
-
 use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft};
 use super::fpr::Fpr;
 use super::sampler::{SamplerRng, sampler_z};

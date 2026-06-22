@@ -15,8 +15,6 @@
 //! (`L·D·L\* == G`); the full statistical behavior is exercised by the
 //! sign round-trip in a later phase.
 
-#![allow(dead_code)] // consumed by the sign phase
-
 use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft};
 use super::fpr::Fpr;
 use super::sampler::{SamplerRng, sampler_z};
@@ -125,13 +123,13 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
             // Sample the second coordinate first (split → recurse → merge).
             let (t1a, t1b) = fft.split_fft(t1);
             let (z1a, z1b) = ff_sampling(fft, &t1a, &t1b, right, sigmin, rng);
-            let z1 = fft.merge_fft_pub(&z1a, &z1b);
+            let z1 = fft.merge_fft(&z1a, &z1b);
             // t0' = t0 + (t1 − z1)·L10.
             let diff = sub_fft(t1, &z1);
             let t0b = add_fft(t0, &mul_fft(&diff, l10));
             let (t0a, t0bb) = fft.split_fft(&t0b);
             let (z0a, z0b) = ff_sampling(fft, &t0a, &t0bb, left, sigmin, rng);
-            let z0 = fft.merge_fft_pub(&z0a, &z0b);
+            let z0 = fft.merge_fft(&z0a, &z0b);
             (z0, z1)
         }
     }

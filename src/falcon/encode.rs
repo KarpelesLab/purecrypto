@@ -5,8 +5,6 @@
 //! the high bits in unary. [`encode_pubkey`] packs `h` at 14 bits/coefficient,
 //! matching `FalconPublicKey::from_bytes`.
 
-#![allow(dead_code)] // consumed by the sign / public-API phases
-
 use alloc::vec::Vec;
 
 /// Compress the signature polynomial `s` into exactly `slen` bytes, or `None`

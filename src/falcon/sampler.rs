@@ -21,8 +21,6 @@
 //! reference `samplerz` KAT vectors in `sampler_tests.rs`, which pin both the
 //! output distribution and the exact random-byte consumption.
 
-#![allow(dead_code)] // consumed by the tree/sign phases
-
 use super::fpr::Fpr;
 
 /// A random-byte source for the sampler, mirroring the reference's
