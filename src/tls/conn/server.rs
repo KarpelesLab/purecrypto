@@ -1643,12 +1643,14 @@ impl<R: RngCore> ServerConnection<R> {
         #[cfg(feature = "std")]
         if accept_early
             && let Some(window) = self.config.replay_window.as_ref()
-            && let Some(psk_body) = ext::find(&ch.extensions, ExtensionType::PRE_SHARED_KEY)
-            && let Ok((_ids, binders)) = ext::parse_client_pre_shared_key(psk_body)
-            && let Some(b0) = binders.first()
-            && !window.check_and_insert(b0)
+            && let Some(s) = psk_state.as_ref()
+            && !window.check_and_insert(&s.selected_binder)
         {
-            // Use the presented binder (first identity's) as the replay-key.
+            // Key the replay window on the binder of the *actually-selected*
+            // identity (the first whose ticket decrypted), not `binders[0]`.
+            // Keying on identity index 0 would let an attacker park junk at
+            // index 0 and the real ticket at index 1, then vary the junk
+            // binder to replay the same early-data flight past the window.
             // A repeat refuses 0-RTT but still allows 1-RTT resumption.
             accept_early = false;
         }
@@ -2800,6 +2802,14 @@ struct AcceptedPsk {
     /// anti-replay protection, so 0-RTT is only safe if a `ReplayWindow`
     /// is installed (see the 0-RTT acceptance floor in `process_client_hello`).
     age_checked: bool,
+    /// The binder of the identity that was *actually selected* (the first one
+    /// whose ticket decrypted cleanly), not necessarily identity index 0. The
+    /// 0-RTT [`ReplayWindow`] MUST be keyed on this binder: keying on
+    /// `binders.first()` would let an attacker park junk at identity index 0
+    /// and the real ticket at a later index, then vary the index-0 junk binder
+    /// to replay the same early-data flight past the window.
+    #[cfg_attr(not(feature = "std"), allow(dead_code))]
+    selected_binder: Vec<u8>,
 }
 
 /// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
@@ -2907,6 +2917,7 @@ impl<R: RngCore> ServerConnection<R> {
                 alpn,
                 age_fresh,
                 age_checked: now != 0,
+                selected_binder: presented.to_vec(),
             }));
         }
         Ok(None)
@@ -3209,6 +3220,112 @@ mod tests {
             .on_client_hello(hs_type::CLIENT_HELLO, body, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// Finding #1 (0-RTT anti-replay keyed on the WRONG binder): `try_accept_psk`
+    /// selects the first identity whose ticket DECRYPTS, which need not be index
+    /// 0. The accepted `selected_binder` MUST be the binder of that
+    /// actually-selected identity (so the ReplayWindow is keyed on it), not
+    /// `binders[0]`. We park a junk ticket + junk binder at index 0 and the real
+    /// ticket + its correct binder at index 1, then assert the returned
+    /// `selected_binder` is the index-1 binder.
+    #[test]
+    fn try_accept_psk_keys_replay_on_selected_identity_not_index_zero() {
+        let ticket_key = [0xAAu8; 32];
+        // Real ticket at index 1; PSK is the synth_ticket's fixed `[0xAB; 32]`.
+        // Stamp it with the current wall clock (or 0 under no clock) so it is
+        // not rejected as expired against the server's `system_now_u64()`.
+        let real_ticket = synth_ticket(&ticket_key, super::system_now_u64(), b"");
+        let psk = [0xABu8; 32];
+        // Junk ticket at index 0: won't decrypt under `ticket_key`, so the
+        // selection loop skips it via `continue`.
+        let junk_ticket = alloc::vec![0x00u8; real_ticket.len()];
+
+        // Build the PSK extension body, leaving the binder for index 1 (the real
+        // identity) as a placeholder we fill in after computing it over the
+        // truncated transcript. The junk binder at index 0 is arbitrary.
+        let junk_binder = alloc::vec![0x55u8; 32];
+        let mut real_binder = alloc::vec![0x00u8; 32];
+
+        // Helper: assemble the full CH raw bytes given the two binders, then
+        // return (raw, ch). The PSK extension is the LAST extension.
+        let assemble = |b0: &[u8], b1: &[u8]| -> (Vec<u8>, ClientHello) {
+            // identities block: each = vec_u16(identity) || u32(obfuscated_age)
+            let mut ids = Vec::new();
+            for tkt in [&junk_ticket, &real_ticket] {
+                ids.extend_from_slice(&(tkt.len() as u16).to_be_bytes());
+                ids.extend_from_slice(tkt);
+                ids.extend_from_slice(&0u32.to_be_bytes());
+            }
+            // binders block: each = vec_u8(binder)
+            let mut bins = Vec::new();
+            for b in [b0, b1] {
+                bins.push(b.len() as u8);
+                bins.extend_from_slice(b);
+            }
+            let mut psk_body = Vec::new();
+            psk_body.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+            psk_body.extend_from_slice(&ids);
+            psk_body.extend_from_slice(&(bins.len() as u16).to_be_bytes());
+            psk_body.extend_from_slice(&bins);
+
+            // psk_key_exchange_modes = len_u8 || modes; mode 1 = psk_dhe_ke.
+            // Required for `try_accept_psk` to consider the offer; PSK stays last.
+            let modes_body: alloc::vec::Vec<u8> = alloc::vec![1u8, 1u8];
+            let ch = ClientHello {
+                legacy_version: 0x0303,
+                random: [0x11; 32],
+                session_id: alloc::vec::Vec::new(),
+                cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+                extensions: alloc::vec![
+                    (ExtensionType::PSK_KEY_EXCHANGE_MODES, modes_body),
+                    (ExtensionType::PRE_SHARED_KEY, psk_body),
+                ],
+            };
+            let raw = ch.encode();
+            (raw, ch)
+        };
+
+        // First assembly with a placeholder real binder, just to learn the wire
+        // length of the binders field (so we can truncate identically to the
+        // server) — the binder length is fixed (32), so the truncated prefix is
+        // stable regardless of the binder *value*.
+        let (raw, _ch) = assemble(&junk_binder, &real_binder);
+        // binders_field_len = 2 (vec_u16 len prefix) + sum(1 + binder_len).
+        let binders_field_len: usize = 2 + (1 + junk_binder.len()) + (1 + real_binder.len());
+        let truncated = &raw[..raw.len() - binders_field_len];
+
+        // Compute the correct binder for the real identity over the truncated
+        // transcript, mirroring `try_accept_psk`.
+        let ks = KeySchedule::with_psk(HashAlg::Sha256, &psk);
+        let res_bk = ks.binder_key(b"res binder");
+        let fk = binder_finished_key(HashAlg::Sha256, &res_bk);
+        let th = HashAlg::Sha256.hash(truncated);
+        real_binder = Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec();
+
+        // Reassemble with the correct real binder (same lengths → same truncation).
+        let (raw, ch) = assemble(&junk_binder, &real_binder);
+
+        let mut cfg = test_server_config();
+        cfg.ticket_key = Some(ticket_key);
+        let server = ServerConnection::new(
+            cfg,
+            ScriptedRng {
+                data: alloc::vec![0u8; 64],
+                pos: 0,
+            },
+        );
+
+        let accepted = server
+            .try_accept_psk(&ch, &raw)
+            .expect("try_accept_psk should not error")
+            .expect("the index-1 ticket should be accepted");
+
+        // The replay-key MUST be the selected (index-1) binder, NOT binders[0].
+        assert_eq!(accepted.selected_binder, real_binder);
+        assert_ne!(accepted.selected_binder, junk_binder);
     }
 
     /// Wave 3b.1 — the ECH server decap → SH signal patch path. The
