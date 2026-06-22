@@ -2379,29 +2379,37 @@ impl ClientConnection {
             NamedGroup::X25519 => {
                 let peer: [u8; 32] = server_pub.try_into().map_err(|_| Error::Decode)?;
                 // RFC 8446 §7.4.2: reject the all-zero (small-order) DH output.
-                let shared = self
+                let mut shared = self
                     .x25519
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
-                Ok(Secret::new(&shared))
+                let secret = Secret::new(&shared);
+                // The raw ECDHE output is copied into `Secret` (zeroizing);
+                // scrub the transient stack copy.
+                super::wipe(&mut shared);
+                Ok(secret)
             }
             NamedGroup::SECP256R1 => {
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, server_pub)
                     .map_err(|_| Error::Decode)?;
-                let shared = self
+                let mut shared = self
                     .p256
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
-                Ok(Secret::new(&shared))
+                let secret = Secret::new(&shared);
+                super::wipe(&mut shared);
+                Ok(secret)
             }
             NamedGroup::SECP384R1 => {
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P384, server_pub)
                     .map_err(|_| Error::Decode)?;
-                let shared = self
+                let mut shared = self
                     .p384
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::PeerMisbehaved)?;
-                Ok(Secret::new(&shared))
+                let secret = Secret::new(&shared);
+                super::wipe(&mut shared);
+                Ok(secret)
             }
             NamedGroup::X25519MLKEM768 => {
                 // Server share: ML-KEM ciphertext (1088) ‖ X25519 key (32).
@@ -2413,11 +2421,11 @@ impl ClientConnection {
                 let peer: [u8; 32] = server_pub[CIPHERTEXT_BYTES..]
                     .try_into()
                     .map_err(|_| Error::Decode)?;
-                let ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
+                let mut ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
                 // RFC 8446 §7.4.2: reject the all-zero X25519 contribution.
                 // The ML-KEM contribution remains pristine even if X25519 is
                 // small-order, but TLS 1.3 mandates aborting either way.
-                let x_ss = self
+                let mut x_ss = self
                     .x25519
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
@@ -2425,7 +2433,13 @@ impl ClientConnection {
                 let mut combined = [0u8; 64];
                 combined[..32].copy_from_slice(&ml_ss);
                 combined[32..].copy_from_slice(&x_ss);
-                Ok(Secret::new(&combined))
+                let secret = Secret::new(&combined);
+                // Scrub the transient stack copies of the raw shared secrets;
+                // `Secret` keeps its own zeroizing copy.
+                super::wipe(&mut combined);
+                super::wipe(&mut ml_ss);
+                super::wipe(&mut x_ss);
+                Ok(secret)
             }
             _ => Err(Error::HandshakeFailure),
         }
