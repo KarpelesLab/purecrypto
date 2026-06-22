@@ -697,6 +697,12 @@ impl Streams {
     /// Inbound STOP_SENDING. RFC 9000 §3.5: triggers us to RESET_STREAM
     /// our own send side with the same application error code.
     pub(crate) fn on_stop_sending(&mut self, id: u64, app_error: u64) -> Result<(), Error> {
+        // RFC 9000 §19.5: STOP_SENDING targets our send half. A peer-initiated
+        // unidirectional stream has no local send half, so such a frame is a
+        // STREAM_STATE_ERROR. Reject it BEFORE lazily instantiating any state,
+        // otherwise processing a protocol violation would create a recv-only
+        // stream, advance `peer_uni_used`, and possibly queue MAX_STREAMS.
+        self.reject_send_half_frame_on_peer_uni(id)?;
         // A peer may legally send STOP_SENDING on a stream it opened before we
         // have processed its first STREAM frame (so the stream is not yet in
         // `map`). Mirror `on_reset` and lazily instantiate peer-initiated
@@ -728,6 +734,13 @@ impl Streams {
 
     /// Inbound MAX_STREAM_DATA.
     pub(crate) fn on_max_stream_data(&mut self, id: u64, limit: u64) -> Result<(), Error> {
+        // RFC 9000 §19.10: MAX_STREAM_DATA grants credit to our send half. A
+        // peer-initiated unidirectional stream has no local send half, so such
+        // a frame is a STREAM_STATE_ERROR. Reject it BEFORE lazily creating any
+        // state, otherwise processing a protocol violation would create a
+        // recv-only stream, advance `peer_uni_used`, and possibly queue
+        // MAX_STREAMS.
+        self.reject_send_half_frame_on_peer_uni(id)?;
         // As with STOP_SENDING, a conformant peer may grant MAX_STREAM_DATA on
         // a stream it opened before its first STREAM frame reaches us. Mirror
         // `on_reset`: lazily instantiate peer-initiated streams, while
@@ -1215,6 +1228,29 @@ impl Streams {
     /// haven't seen before, materialize a recv-only or bidi entry. RFC
     /// 9000 §3.2 — receiving the first STREAM frame implicitly opens the
     /// stream.
+    /// Guard for frames that target a local send half (STOP_SENDING,
+    /// MAX_STREAM_DATA). A peer-initiated unidirectional stream has no local
+    /// send half, so such a frame is a STREAM_STATE_ERROR (RFC 9000
+    /// §19.5/§19.10). Returns the error WITHOUT touching any stream state, so a
+    /// protocol violation can never lazily create a recv-only stream, advance
+    /// `peer_uni_used`, or queue MAX_STREAMS as a side effect. Locally-opened
+    /// and bidirectional ids fall through to the normal handler path.
+    fn reject_send_half_frame_on_peer_uni(&self, id: u64) -> Result<(), Error> {
+        let sid = StreamId(id);
+        if !sid.is_uni() {
+            return Ok(());
+        }
+        let peer_initiated = match self.role {
+            Role::Client => sid.is_server_initiated(),
+            Role::Server => sid.is_client_initiated(),
+        };
+        if peer_initiated {
+            // No local send half exists, nor will one ever — reject.
+            return Err(Error::InappropriateState);
+        }
+        Ok(())
+    }
+
     fn ensure_remote_stream_exists(&mut self, id: u64) -> Result<(), Error> {
         if self.map.contains_key(&id) {
             return Ok(());
@@ -1339,6 +1375,34 @@ mod tests {
         let mut s = Streams::new(Role::Client, &our, &peer);
         let id = s.open_uni().expect("open uni");
         assert_eq!(id.0, 2);
+    }
+
+    #[test]
+    fn send_half_frames_on_peer_uni_error_without_creating_state() {
+        // A peer-initiated unidirectional stream has no local send half.
+        // STOP_SENDING / MAX_STREAM_DATA targeting it is a STREAM_STATE_ERROR
+        // (RFC 9000 §19.5/§19.10) and must be rejected BEFORE any lazy state
+        // is created — no Stream entry, no peer_uni_used advance.
+        let our = params_with(64, 1024, 10);
+        let peer = params_with(64, 1024, 10);
+        // Client: server-initiated uni id = 3 (low bit 1, bit1 set).
+        let peer_uni = 3u64;
+
+        let mut s = Streams::new(Role::Client, &our, &peer);
+        assert!(s.on_stop_sending(peer_uni, 7).is_err());
+        assert!(!s.map.contains_key(&peer_uni));
+        assert_eq!(s.peer_uni_used, 0);
+
+        let mut s = Streams::new(Role::Client, &our, &peer);
+        assert!(s.on_max_stream_data(peer_uni, 1234).is_err());
+        assert!(!s.map.contains_key(&peer_uni));
+        assert_eq!(s.peer_uni_used, 0);
+
+        // Server role: client-initiated uni id = 2 is peer-initiated.
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        assert!(s.on_stop_sending(2, 7).is_err());
+        assert!(!s.map.contains_key(&2));
+        assert_eq!(s.peer_uni_used, 0);
     }
 
     #[test]
