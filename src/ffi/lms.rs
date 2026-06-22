@@ -216,6 +216,14 @@ pub unsafe extern "C" fn pc_lms_public_to_bytes(
 ///
 /// # Safety
 /// All pointers valid for their lengths.
+///
+/// **NOT thread-safe.** This call mutates the handle's one-time-key index in
+/// place. The caller MUST externally serialize all access to a given `k`
+/// (sign, serialize, free) — concurrent use of the same handle from multiple
+/// threads is undefined behavior and, worse, can race the index counter into
+/// reusing a one-time-signature leaf, which is catastrophic for LMS/HSS (it can
+/// leak the signing key). Use a distinct handle per thread, or guard each
+/// handle with your own mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_lms_sign(
     k: *mut PcLms,
@@ -389,6 +397,14 @@ pub unsafe extern "C" fn pc_hss_public_to_bytes(
 ///
 /// # Safety
 /// All pointers valid for their lengths.
+///
+/// **NOT thread-safe.** This call mutates the handle's one-time-key index in
+/// place. The caller MUST externally serialize all access to a given `k`
+/// (sign, serialize, free) — concurrent use of the same handle from multiple
+/// threads is undefined behavior and, worse, can race the index counter into
+/// reusing a one-time-signature leaf, which is catastrophic for LMS/HSS (it can
+/// leak the signing key). Use a distinct handle per thread, or guard each
+/// handle with your own mutex.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn pc_hss_sign(
     k: *mut PcHss,
