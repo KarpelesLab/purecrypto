@@ -34,12 +34,13 @@ use crate::ec::{BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, 
 use crate::mlkem::{ENCAPS_KEY_BYTES, MlKem768EncapsKey};
 use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
+use crate::tls::codec::SignatureScheme;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
     CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello, hs_type,
     put_u16, with_len_u16, with_len_u24,
 };
-use crate::tls::crypto::sign::sign_certificate_verify;
+use crate::tls::crypto::sign::{sign_certificate_verify, signature_scheme_for};
 use crate::tls::crypto::{
     HashAlg, KeySchedule, RecordCrypter, SuiteParams, Transcript, certificate_verify_content,
     finished_verify_data, supported_suites,
@@ -166,8 +167,23 @@ enum State {
     WaitSecondClientHello,
     /// Sent the server flight; awaiting client Finished.
     WaitClientFinished,
+    /// External-signing pause: the flight is built through Certificate and is
+    /// waiting for the caller to supply the `CertificateVerify` signature.
+    AwaitingCertVerifySignature,
     Connected,
     Closed,
+}
+
+/// State stashed while a DTLS 1.3 server flight is suspended awaiting an
+/// external `CertificateVerify` signature (see
+/// [`ServerKey::External`](crate::tls::conn::ServerKey::External)). The
+/// suite, key schedule, secrets, and client random already live on the
+/// connection, so only the signature input + scheme need stashing.
+struct PendingFlight {
+    /// Negotiated signature scheme for the `CertificateVerify`.
+    scheme: SignatureScheme,
+    /// The signature input the caller signs.
+    content: Vec<u8>,
 }
 
 /// A DTLS 1.3 server connection.
@@ -235,6 +251,9 @@ pub struct DtlsServerConnection13<R: RngCore> {
     write_app_sn_key: Option<Vec<u8>>,
     pending_read_app_crypter: Option<RecordCrypter>,
     pending_write_app_crypter: Option<RecordCrypter>,
+    /// External-signing continuation; `Some` while suspended awaiting the
+    /// `CertificateVerify` signature.
+    pending_flight: Option<PendingFlight>,
     /// Negotiated cipher suite parameters (set once we pick a suite from
     /// the cookie-validated CH).
     suite: Option<SuiteParams>,
@@ -298,6 +317,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             write_app_sn_key: None,
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
+            pending_flight: None,
             suite: None,
             exporter_secret: None,
             hrr_selected_group: None,
@@ -1162,8 +1182,55 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // Finished.
         self.send_encrypted_extensions()?;
         self.send_certificate()?;
+        // CertificateVerify. For an external key, stash the signature input and
+        // suspend; the caller signs and resumes via `provide_signature`, after
+        // which the rest of the flight (CertificateVerify + Finished + key
+        // install) runs. For an in-process key, sign inline and continue.
+        if matches!(
+            self.config.key,
+            crate::tls::conn::ServerKey::External { .. }
+        ) {
+            let th = self.transcript.current_hash();
+            let content = certificate_verify_content(true, th.as_slice());
+            let scheme = signature_scheme_for(&self.config.key);
+            self.pending_flight = Some(PendingFlight { scheme, content });
+            self.state = State::AwaitingCertVerifySignature;
+            return Ok(());
+        }
         self.send_certificate_verify()?;
+        self.finish_server_flight()
+    }
+
+    /// Builds and emits the `CertificateVerify` from a negotiated `scheme` and
+    /// the produced `signature` bytes.
+    fn emit_certificate_verify(
+        &mut self,
+        scheme: SignatureScheme,
+        sig_der: &[u8],
+    ) -> Result<(), Error> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&scheme.0.to_be_bytes());
+        with_len_u16(&mut body, |b| b.extend_from_slice(sig_der));
+        let mut tls_msg = Vec::with_capacity(4 + body.len());
+        tls_msg.push(hs_type::CERTIFICATE_VERIFY);
+        let n = body.len() as u32;
+        tls_msg.push(((n >> 16) & 0xff) as u8);
+        tls_msg.push(((n >> 8) & 0xff) as u8);
+        tls_msg.push((n & 0xff) as u8);
+        tls_msg.extend_from_slice(&body);
+        self.transcript.update(&tls_msg);
+        self.emit_encrypted_handshake(hs_type::CERTIFICATE_VERIFY, &body)
+    }
+
+    /// The server flight tail shared by the inline and external-signing paths:
+    /// emits the server `Finished`, derives the 1-RTT application secrets, and
+    /// stages the application crypters/SN keys for install at client Finished.
+    /// Reads the suite, key schedule, and client random from `self`.
+    fn finish_server_flight(&mut self) -> Result<(), Error> {
         self.send_finished()?;
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let sn_len = sn_key_len_for(suite.aead);
+        let client_random = self.client_random;
 
         // Derive application traffic secrets (Hash(CH..server Finished))
         // and stash them for installation at client Finished.
@@ -1176,10 +1243,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let ems = ks.exporter_master_secret(th_app.as_slice());
             (cats, sats, ems)
         };
-        if let Some(kl) = self.config.key_log.as_ref() {
-            kl.log("CLIENT_TRAFFIC_SECRET_0", &ch.random, cats.as_slice());
-            kl.log("SERVER_TRAFFIC_SECRET_0", &ch.random, sats.as_slice());
-            kl.log("EXPORTER_SECRET", &ch.random, ems.as_slice());
+        if let (Some(kl), Some(cr)) = (self.config.key_log.as_ref(), client_random.as_ref()) {
+            kl.log("CLIENT_TRAFFIC_SECRET_0", cr, cats.as_slice());
+            kl.log("SERVER_TRAFFIC_SECRET_0", cr, sats.as_slice());
+            kl.log("EXPORTER_SECRET", cr, ems.as_slice());
         }
         self.exporter_secret = Some(ems);
         self.pending_write_app_crypter = Some(RecordCrypter::new(
@@ -1201,6 +1268,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         self.state = State::WaitClientFinished;
         Ok(())
+    }
+
+    /// Resumes a flight suspended for an external `CertificateVerify` signature:
+    /// emits the CertificateVerify with the caller-supplied `signature`, then
+    /// finishes the flight.
+    pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        let pf = self
+            .pending_flight
+            .take()
+            .ok_or(Error::InappropriateState)?;
+        self.emit_certificate_verify(pf.scheme, &signature)?;
+        self.finish_server_flight()
+    }
+
+    /// If suspended awaiting an external signature, returns the IANA scheme code
+    /// point and the bytes to sign.
+    pub(crate) fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
+        self.pending_flight
+            .as_ref()
+            .map(|pf| (pf.scheme.0, pf.content.clone()))
     }
 
     fn send_encrypted_extensions(&mut self) -> Result<(), Error> {
@@ -1245,20 +1332,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let th = self.transcript.current_hash();
         let content = certificate_verify_content(true, th.as_slice());
         let (scheme, sig_der) = sign_certificate_verify(&self.config.key, &content, &mut self.rng)?;
-
-        let mut body = Vec::new();
-        body.extend_from_slice(&scheme.0.to_be_bytes());
-        with_len_u16(&mut body, |b| b.extend_from_slice(&sig_der));
-        let mut tls_msg = Vec::with_capacity(4 + body.len());
-        tls_msg.push(hs_type::CERTIFICATE_VERIFY);
-        let n = body.len() as u32;
-        tls_msg.push(((n >> 16) & 0xff) as u8);
-        tls_msg.push(((n >> 8) & 0xff) as u8);
-        tls_msg.push((n & 0xff) as u8);
-        tls_msg.extend_from_slice(&body);
-        self.transcript.update(&tls_msg);
-        self.emit_encrypted_handshake(hs_type::CERTIFICATE_VERIFY, &body)?;
-        Ok(())
+        self.emit_certificate_verify(scheme, &sig_der)
     }
 
     fn send_finished(&mut self) -> Result<(), Error> {

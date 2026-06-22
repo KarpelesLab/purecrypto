@@ -198,6 +198,7 @@ impl Connection {
         let pending = match &self.inner {
             Engine::ServerTls13(c) => c.pending_signature(),
             Engine::ClientTls13(c) => c.pending_signature(),
+            Engine::ServerDtls13(c) => c.pending_signature(),
             _ => None,
         };
         pending.map(|(scheme, message)| SignatureRequest { scheme, message })
@@ -213,6 +214,7 @@ impl Connection {
         match &mut self.inner {
             Engine::ServerTls13(c) => c.provide_signature(signature),
             Engine::ClientTls13(c) => c.provide_signature(signature),
+            Engine::ServerDtls13(c) => c.provide_signature(signature),
             _ => Err(Error::InappropriateState),
         }
     }
@@ -1382,6 +1384,73 @@ mod tests {
         assert!(
             client.is_handshake_complete() && server.is_handshake_complete(),
             "external-signed client mTLS handshake must complete and verify"
+        );
+    }
+
+    /// A DTLS 1.3 server using `SigningKey::External` completes the handshake
+    /// when the caller fulfils `signature_request` out-of-band — the
+    /// suspend/resume path works over the datagram engine too.
+    #[test]
+    fn dtls13_server_external_signing_round_trips() {
+        const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+        let (key, leaf) = ecdsa_identity(b"dtls-ext", "dtls.example");
+
+        let mut server_cfg = Config::builder()
+            .versions(ProtocolVersion::DTLSv1_3, ProtocolVersion::DTLSv1_3)
+            .identity(
+                alloc::vec![leaf],
+                super::super::config::SigningKey::External {
+                    schemes: alloc::vec![ECDSA_SECP256R1_SHA256],
+                },
+            )
+            .build();
+        // Keep the test single-round: skip the cookie exchange.
+        server_cfg.require_cookie = false;
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::DTLSv1_3, ProtocolVersion::DTLSv1_3)
+            .verify_certificates(false)
+            .server_name("dtls.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let mut signed = false;
+        for _ in 0..64 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            if let Some(req) = server.signature_request() {
+                assert_eq!(req.scheme, ECDSA_SECP256R1_SHA256);
+                let sig = key
+                    .sign::<Sha256>(&req.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                server.provide_signature(sig).unwrap();
+                signed = true;
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            signed,
+            "the DTLS server must have requested an external signature"
+        );
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "external-signed DTLS 1.3 handshake must complete and verify"
         );
     }
 
