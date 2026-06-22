@@ -786,6 +786,14 @@ impl DtlsClientConnection13 {
         if sh.random == HRR_RANDOM {
             return self.on_hello_retry_request(sh, raw);
         }
+        // RFC 8446 §4.1.3: the ServerHello MUST echo `legacy_session_id`
+        // verbatim. This client always offers an empty `legacy_session_id`,
+        // so any non-empty echo means the server did not faithfully reflect
+        // what we offered — abort with illegal_parameter (mirrors the TLS 1.3
+        // client; also applied on the HRR path below).
+        if !sh.session_id.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
         // The server must have picked one of the suites we offered.
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         if !supported_suites().iter().any(|s| s.suite == suite.suite) {
@@ -807,6 +815,15 @@ impl DtlsClientConnection13 {
         let (group, server_pub) = ext::parse_server_key_share(ks_ext)?;
         if !self.config.groups.contains(&group) {
             return Err(Error::HandshakeFailure);
+        }
+        // RFC 8446 §4.1.4: when this ServerHello follows a HelloRetryRequest
+        // that selected a group, the server MUST send a key_share for that
+        // exact group. Pin it — a mismatch is a protocol violation (the server
+        // forcing us to a different group than the one it just demanded).
+        if let Some(hrr_group) = self.hrr_selected_group
+            && group != hrr_group
+        {
+            return Err(Error::IllegalParameter);
         }
         let shared = self.key_agreement(group, &server_pub)?;
 
@@ -866,6 +883,13 @@ impl DtlsClientConnection13 {
     fn on_hello_retry_request(&mut self, hrr: ServerHello, raw: &[u8]) -> Result<(), Error> {
         if self.hrr_processed {
             return Err(Error::UnexpectedMessage);
+        }
+        // RFC 8446 §4.1.3: the HelloRetryRequest MUST echo `legacy_session_id`
+        // verbatim. This client always offers an empty `legacy_session_id`, so
+        // any non-empty echo is a protocol violation — abort with
+        // illegal_parameter (mirrors the TLS 1.3 client).
+        if !hrr.session_id.is_empty() {
+            return Err(Error::IllegalParameter);
         }
         // HRR carries the same suite the eventual ServerHello will use
         // (RFC 8446 §4.1.4). Accept any suite we offered.
@@ -1049,9 +1073,20 @@ impl DtlsClientConnection13 {
                 now.as_ref(),
                 &self.config.signature_policy,
             )?;
-            if let Some(name) = self.config.server_name.as_deref() {
-                verify_hostname(&leaf, name)?;
-            }
+            // RFC 6125: a chain-valid certificate is meaningless without an
+            // identity binding. Skipping `verify_hostname` while chain
+            // verification is on would accept ANY CA-valid cert for ANY host
+            // (a MITM bypass). When certificate verification is enabled we
+            // therefore REQUIRE a server name and always check it — mirroring
+            // the DTLS 1.2 client and the TLS clients, which fail closed on an
+            // empty/absent name. (`verify_hostname` itself rejects an empty
+            // name and handles iPAddress-SAN matching for IP literals.)
+            let name = self
+                .config
+                .server_name
+                .as_deref()
+                .ok_or(Error::BadCertificate)?;
+            verify_hostname(&leaf, name)?;
             key
         } else {
             leaf.subject_public_key()
