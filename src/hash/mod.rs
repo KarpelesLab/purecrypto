@@ -50,6 +50,8 @@ mod sha512;
 #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod sha_hw;
 mod shake;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod simd_x86;
 mod sm3;
 mod zeroize;
 

@@ -52,37 +52,9 @@ mod avx2 {
         unsafe { _mm256_xor_si256(a, b) }
     }
 
-    /// In-place 8x8 transpose of eight `__m256i` (each holding 8 `u32`). On entry
-    /// `rows[r]` is the r-th row; on exit `rows[c]` is the c-th column.
-    #[inline(always)]
-    unsafe fn transpose8(rows: &mut [__m256i; 8]) {
-        unsafe {
-            let t0 = _mm256_unpacklo_epi32(rows[0], rows[1]);
-            let t1 = _mm256_unpackhi_epi32(rows[0], rows[1]);
-            let t2 = _mm256_unpacklo_epi32(rows[2], rows[3]);
-            let t3 = _mm256_unpackhi_epi32(rows[2], rows[3]);
-            let t4 = _mm256_unpacklo_epi32(rows[4], rows[5]);
-            let t5 = _mm256_unpackhi_epi32(rows[4], rows[5]);
-            let t6 = _mm256_unpacklo_epi32(rows[6], rows[7]);
-            let t7 = _mm256_unpackhi_epi32(rows[6], rows[7]);
-            let s0 = _mm256_unpacklo_epi64(t0, t2);
-            let s1 = _mm256_unpackhi_epi64(t0, t2);
-            let s2 = _mm256_unpacklo_epi64(t1, t3);
-            let s3 = _mm256_unpackhi_epi64(t1, t3);
-            let s4 = _mm256_unpacklo_epi64(t4, t6);
-            let s5 = _mm256_unpackhi_epi64(t4, t6);
-            let s6 = _mm256_unpacklo_epi64(t5, t7);
-            let s7 = _mm256_unpackhi_epi64(t5, t7);
-            rows[0] = _mm256_permute2x128_si256(s0, s4, 0x20);
-            rows[1] = _mm256_permute2x128_si256(s1, s5, 0x20);
-            rows[2] = _mm256_permute2x128_si256(s2, s6, 0x20);
-            rows[3] = _mm256_permute2x128_si256(s3, s7, 0x20);
-            rows[4] = _mm256_permute2x128_si256(s0, s4, 0x31);
-            rows[5] = _mm256_permute2x128_si256(s1, s5, 0x31);
-            rows[6] = _mm256_permute2x128_si256(s2, s6, 0x31);
-            rows[7] = _mm256_permute2x128_si256(s3, s7, 0x31);
-        }
-    }
+    // In-place 8x8 transpose of eight `__m256i` (each holding 8 `u32`), shared
+    // with the BLAKE3 8-way kernel.
+    use crate::hash::simd_x86::transpose8_epi32 as transpose8;
 
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn compress8(states: &mut [[u32; 8]; 8], blocks: &[[u8; 64]; 8]) {
