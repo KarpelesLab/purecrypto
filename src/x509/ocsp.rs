@@ -75,7 +75,9 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Extension, Time, oid};
+use super::{
+    AnyPublicKey, CertSigner, Certificate, CrlReason, Error, Extension, SignatureAlgId, Time, oid,
+};
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
     encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
@@ -1074,6 +1076,38 @@ impl OcspResponseBuilder {
     /// Signs the response, producing a complete RFC 6960 `OCSPResponse` with
     /// `responseStatus = successful` and the BasicOCSPResponse inside.
     pub fn sign(self, signer: &CertSigner<'_>) -> Result<OcspResponse, Error> {
+        let tbs = self.build_tbs_response_data()?;
+        let algid = signer.algorithm_identifier();
+        let signature = signer.sign(&tbs)?;
+        Ok(PreparedOcsp {
+            tbs,
+            algid,
+            certs: self.delegated_responder_cert,
+        }
+        .finish(&signature))
+    }
+
+    /// Begins two-phase signing for a responder key held outside the process
+    /// (TPM/HSM): builds the `tbsResponseData` and returns a [`PreparedOcsp`]
+    /// exposing the bytes to sign. The caller signs [`PreparedOcsp::tbs`] with
+    /// its external key and calls [`PreparedOcsp::finish`] to assemble the
+    /// `OCSPResponse`.
+    ///
+    /// `sig_alg` must match the algorithm of the external signer; it is written
+    /// into the `BasicOCSPResponse.signatureAlgorithm` field.
+    pub fn prepare(self, sig_alg: SignatureAlgId) -> Result<PreparedOcsp, Error> {
+        let tbs = self.build_tbs_response_data()?;
+        Ok(PreparedOcsp {
+            tbs,
+            algid: sig_alg.algorithm_identifier(),
+            certs: self.delegated_responder_cert,
+        })
+    }
+
+    /// Encodes the `tbsResponseData` (the signed-over portion of a
+    /// `BasicOCSPResponse`). Shared by [`sign`](Self::sign) and
+    /// [`prepare`](Self::prepare).
+    fn build_tbs_response_data(&self) -> Result<Vec<u8>, Error> {
         // Compute CertID using the chosen hash algorithm.
         let (name_hash, key_hash) = hash_pair(
             self.hash_alg_oid,
@@ -1158,18 +1192,39 @@ impl OcspResponseBuilder {
             let exts_seq = encode_sequence(&nonce_ext);
             td.extend_from_slice(&encode_context(1, &exts_seq));
         }
-        let tbs_response_data = encode_sequence(&td);
+        Ok(encode_sequence(&td))
+    }
+}
 
-        // signatureAlgorithm + signature.
-        let sig_algid = signer.algorithm_identifier();
-        let signature = signer.sign(&tbs_response_data)?;
+/// A `tbsResponseData` awaiting an externally produced signature.
+///
+/// Returned by [`OcspResponseBuilder::prepare`]. Sign [`tbs`](Self::tbs) with
+/// the responder's out-of-process key, then call [`finish`](Self::finish) with
+/// the resulting signature to obtain the complete [`OcspResponse`].
+pub struct PreparedOcsp {
+    tbs: Vec<u8>,
+    algid: Vec<u8>,
+    certs: Option<Vec<u8>>,
+}
 
+impl PreparedOcsp {
+    /// The DER `tbsResponseData` bytes the external signer must sign. The
+    /// signer applies the hash/padding of the algorithm passed to
+    /// [`OcspResponseBuilder::prepare`]; these bytes are unhashed.
+    pub fn tbs(&self) -> &[u8] {
+        &self.tbs
+    }
+
+    /// Assembles the final `OCSPResponse` from the externally produced
+    /// `signature` (the raw `signatureValue` bytes, encoded as documented on
+    /// the [`SignatureAlgId`] variant).
+    pub fn finish(self, signature: &[u8]) -> OcspResponse {
         // BasicOCSPResponse SEQUENCE { tbs, sigAlg, signature, [0] certs OPTIONAL }.
         let mut bocsp = Vec::new();
-        bocsp.extend_from_slice(&tbs_response_data);
-        bocsp.extend_from_slice(&sig_algid);
-        bocsp.extend_from_slice(&encode_bit_string(&signature));
-        if let Some(cert_der) = &self.delegated_responder_cert {
+        bocsp.extend_from_slice(&self.tbs);
+        bocsp.extend_from_slice(&self.algid);
+        bocsp.extend_from_slice(&encode_bit_string(signature));
+        if let Some(cert_der) = &self.certs {
             // certs [0] EXPLICIT SEQUENCE OF Certificate.
             let certs_seq = encode_sequence(cert_der);
             bocsp.extend_from_slice(&encode_context(0, &certs_seq));
@@ -1187,9 +1242,9 @@ impl OcspResponseBuilder {
         let mut out = Vec::new();
         out.extend_from_slice(&status);
         out.extend_from_slice(&encode_context(0, &response_bytes));
-        Ok(OcspResponse {
+        OcspResponse {
             der: encode_sequence(&out),
-        })
+        }
     }
 }
 
@@ -1895,6 +1950,35 @@ mod tests {
                 .verify_signature_with(&signer.public_key())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn two_phase_external_signing_matches_one_shot() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+
+        // One-shot, in-process signing.
+        let one_shot =
+            OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+                .unwrap()
+                .sign(&signer)
+                .unwrap();
+
+        // Two-phase: the responder key is exercised only on the prepared TBS.
+        let prepared =
+            OcspResponseBuilder::good(&leaf, &issuer, Time::utc(2026, 1, 1, 0, 0, 0), None)
+                .unwrap()
+                .prepare(SignatureAlgId::RsaPkcs1Sha256)
+                .unwrap();
+        let sig = signer.sign(prepared.tbs()).unwrap();
+        let two_phase = prepared.finish(&sig);
+
+        // RSA PKCS#1 v1.5 is deterministic → byte-identical to the one-shot path.
+        assert_eq!(one_shot.to_der(), two_phase.to_der());
+        // The externally assembled response verifies against the responder key.
+        two_phase
+            .verify_signature_with(&signer.public_key())
+            .unwrap();
     }
 
     #[test]

@@ -36,7 +36,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::time::read_time;
-use super::{AnyPublicKey, CertSigner, DistinguishedName, Error, Time, oid};
+use super::{AnyPublicKey, CertSigner, DistinguishedName, Error, SignatureAlgId, Time, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_integer, encode_octet_string, encode_sequence, encode_tlv,
     oid_tlv, parse_oid, pem_decode, pem_encode, tag,
@@ -160,8 +160,55 @@ impl CrlBuilder {
             &algid,
         );
         let sig = signer.sign(&tbs)?;
-        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
-        Ok(CertificateRevocationList { der })
+        Ok(PreparedCrl { tbs, algid }.finish(&sig))
+    }
+
+    /// Begins two-phase signing for a CA key held outside the process
+    /// (TPM/HSM): encodes the `TBSCertList` with the `sig_alg` algorithm
+    /// identifier and returns a [`PreparedCrl`] exposing the exact bytes to
+    /// sign. The caller signs [`PreparedCrl::tbs`] with its external key and
+    /// calls [`PreparedCrl::finish`] with the signature to assemble the CRL.
+    ///
+    /// No key material is required here — `sig_alg` must match the algorithm
+    /// the external signer will use, since it is written into both the inner
+    /// `signature` field and the outer `signatureAlgorithm`.
+    pub fn prepare(self, sig_alg: SignatureAlgId) -> PreparedCrl {
+        let algid = sig_alg.algorithm_identifier();
+        let tbs = encode_tbs_cert_list(
+            &self.issuer_der,
+            &self.this_update,
+            self.next_update.as_ref(),
+            &self.entries,
+            &algid,
+        );
+        PreparedCrl { tbs, algid }
+    }
+}
+
+/// A `TBSCertList` awaiting an externally produced signature.
+///
+/// Returned by [`CrlBuilder::prepare`]. Sign [`tbs`](Self::tbs) with the CA's
+/// out-of-process key, then call [`finish`](Self::finish) with the resulting
+/// signature to obtain the complete [`CertificateRevocationList`].
+pub struct PreparedCrl {
+    tbs: Vec<u8>,
+    algid: Vec<u8>,
+}
+
+impl PreparedCrl {
+    /// The DER `TBSCertList` bytes the external signer must sign. The signer
+    /// applies the hash/padding of the algorithm passed to
+    /// [`CrlBuilder::prepare`]; these bytes are unhashed.
+    pub fn tbs(&self) -> &[u8] {
+        &self.tbs
+    }
+
+    /// Assembles the final `CertificateList` from the externally produced
+    /// `signature` (the raw `signatureValue` bytes, encoding as documented on
+    /// the [`SignatureAlgId`] variant).
+    pub fn finish(self, signature: &[u8]) -> CertificateRevocationList {
+        let der = encode_sequence(&[self.tbs, self.algid, encode_bit_string(signature)].concat());
+        CertificateRevocationList { der }
     }
 }
 
@@ -566,6 +613,42 @@ mod tests {
         assert!(crl.is_revoked(&[0x00, 0x01]).unwrap());
         // A different serial: not revoked.
         assert!(!crl.is_revoked(&[0x07]).unwrap());
+    }
+
+    #[test]
+    fn two_phase_external_signing_matches_one_shot() {
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        let build = || {
+            let mut b = CrlBuilder::new(
+                &dn,
+                Time::utc(2026, 1, 1, 0, 0, 0),
+                Some(Time::utc(2026, 12, 31, 0, 0, 0)),
+            );
+            b.revoke(
+                &[0x01],
+                Time::utc(2026, 2, 1, 0, 0, 0),
+                Some(CrlReason::KeyCompromise),
+            );
+            b
+        };
+
+        // One-shot, in-process signing.
+        let one_shot = build().sign(&signer).unwrap();
+
+        // Two-phase: the "HSM" is the same in-process key, but invoked only on
+        // the prepared TBS bytes — no key was handed to the builder.
+        let prepared = build().prepare(SignatureAlgId::RsaPkcs1Sha256);
+        let sig = signer.sign(prepared.tbs()).unwrap();
+        let two_phase = prepared.finish(&sig);
+
+        // RSA PKCS#1 v1.5 is deterministic, so the two paths are byte-identical.
+        assert_eq!(one_shot.to_der(), two_phase.to_der());
+        // And the externally assembled CRL verifies against the issuer key.
+        two_phase
+            .verify_signature_with(&signer.public_key())
+            .unwrap();
     }
 
     #[test]

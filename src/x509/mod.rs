@@ -17,19 +17,19 @@ pub mod sct;
 mod signer;
 mod time;
 
-pub use cert::{Certificate, NameConstraints, SanIp};
-pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, RevokedCertificate};
+pub use cert::{Certificate, NameConstraints, PreparedCertificate, SanIp};
+pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, PreparedCrl, RevokedCertificate};
 pub use csr::CertificationRequest;
 pub use extension::{Extension, GeneralName, KeyUsageBits};
 pub use name::DistinguishedName;
 pub use ocsp::{
     OcspCertStatus, OcspCheckOptions, OcspRequest, OcspRequestBuilder, OcspResponse,
-    OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse,
+    OcspResponseBuilder, OcspResponseStatus, OcspSingleResponse, PreparedOcsp,
 };
 pub use privkey::{AnyPrivateKey, Pkcs8ReadOptions};
 pub use pubkey::AnyPublicKey;
 pub use sct::{CtLog, Sct, SctVerification, SctVersion};
-pub use signer::CertSigner;
+pub use signer::{CertSigner, SignatureAlgId};
 pub use time::{Time, Validity};
 
 use alloc::vec::Vec;

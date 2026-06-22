@@ -51,6 +51,89 @@ pub enum CertSigner<'a> {
     SlhDsa(&'a slhdsa::PrivateKey),
 }
 
+/// The signature algorithm of an externally held (TPM/HSM) CA key.
+///
+/// This is the descriptor a caller supplies to the two-phase `prepare` /
+/// `finish` issuance API ([`crate::x509::CrlBuilder::prepare`],
+/// [`crate::x509::OcspResponseBuilder::prepare`],
+/// [`crate::x509::Certificate::prepare`]) when the private key never enters
+/// the process and the signature is produced out-of-band. It carries no key
+/// material — only enough to emit the correct DER `AlgorithmIdentifier` and to
+/// tell the caller which hash/padding their signer must apply to the TBS bytes.
+///
+/// The variants name the exact `signatureAlgorithm` OID written to the wire,
+/// so the caller's signer must produce a matching signature (e.g.
+/// [`EcdsaSha256`](Self::EcdsaSha256) → an ECDSA-over-SHA-256 signature encoded
+/// as the `Ecdsa-Sig-Value` DER `SEQUENCE { r, s }`; RSA variants → PKCS#1 v1.5
+/// over the named hash). The TBS bytes handed back are unhashed — the signer
+/// applies the algorithm's own hash and encoding.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignatureAlgId {
+    /// `sha256WithRSAEncryption` — RSA PKCS#1 v1.5 over SHA-256.
+    RsaPkcs1Sha256,
+    /// `sha384WithRSAEncryption` — RSA PKCS#1 v1.5 over SHA-384.
+    RsaPkcs1Sha384,
+    /// `sha512WithRSAEncryption` — RSA PKCS#1 v1.5 over SHA-512.
+    RsaPkcs1Sha512,
+    /// `ecdsa-with-SHA256`. Signature is the `Ecdsa-Sig-Value` DER SEQUENCE.
+    EcdsaSha256,
+    /// `ecdsa-with-SHA384`. Signature is the `Ecdsa-Sig-Value` DER SEQUENCE.
+    EcdsaSha384,
+    /// `ecdsa-with-SHA512`. Signature is the `Ecdsa-Sig-Value` DER SEQUENCE.
+    EcdsaSha512,
+    /// `id-Ed25519` (PureEdDSA, RFC 8410). Signature is the raw 64-byte R‖S.
+    Ed25519,
+    /// `id-Ed448` (PureEdDSA, RFC 8410). Signature is the raw 114-byte R‖S.
+    Ed448,
+    /// `id-ml-dsa-44` (FIPS 204). Signature is the raw ML-DSA-44 signature.
+    #[cfg(feature = "mldsa")]
+    MlDsa44,
+    /// `id-ml-dsa-65` (FIPS 204). Signature is the raw ML-DSA-65 signature.
+    #[cfg(feature = "mldsa")]
+    MlDsa65,
+    /// `id-ml-dsa-87` (FIPS 204). Signature is the raw ML-DSA-87 signature.
+    #[cfg(feature = "mldsa")]
+    MlDsa87,
+}
+
+impl SignatureAlgId {
+    /// The `signatureAlgorithm` OID arcs for this algorithm.
+    pub(crate) fn sig_alg_oid(self) -> &'static [u64] {
+        match self {
+            SignatureAlgId::RsaPkcs1Sha256 => oid::SHA256_WITH_RSA,
+            SignatureAlgId::RsaPkcs1Sha384 => oid::SHA384_WITH_RSA,
+            SignatureAlgId::RsaPkcs1Sha512 => oid::SHA512_WITH_RSA,
+            SignatureAlgId::EcdsaSha256 => oid::ECDSA_WITH_SHA256,
+            SignatureAlgId::EcdsaSha384 => oid::ECDSA_WITH_SHA384,
+            SignatureAlgId::EcdsaSha512 => oid::ECDSA_WITH_SHA512,
+            SignatureAlgId::Ed25519 => oid::ID_ED25519,
+            SignatureAlgId::Ed448 => oid::ID_ED448,
+            #[cfg(feature = "mldsa")]
+            SignatureAlgId::MlDsa44 => oid::ID_ML_DSA_44,
+            #[cfg(feature = "mldsa")]
+            SignatureAlgId::MlDsa65 => oid::ID_ML_DSA_65,
+            #[cfg(feature = "mldsa")]
+            SignatureAlgId::MlDsa87 => oid::ID_ML_DSA_87,
+        }
+    }
+
+    /// The DER `AlgorithmIdentifier` for this algorithm. RSA-PKCS1 carries a
+    /// NULL `parameters`; everything else is the bare OID, matching
+    /// [`CertSigner::algorithm_identifier`].
+    pub(crate) fn algorithm_identifier(self) -> Vec<u8> {
+        algorithm_identifier(
+            self.sig_alg_oid(),
+            matches!(
+                self,
+                SignatureAlgId::RsaPkcs1Sha256
+                    | SignatureAlgId::RsaPkcs1Sha384
+                    | SignatureAlgId::RsaPkcs1Sha512
+            ),
+        )
+    }
+}
+
 impl CertSigner<'_> {
     /// The `signatureAlgorithm` OID arcs.
     pub(crate) fn sig_alg_oid(&self) -> &'static [u64] {

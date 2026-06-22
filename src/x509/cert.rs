@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 
 use super::extension::{self, Extension, GeneralName};
 use super::{
-    AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error, Validity,
-    algorithm_identifier, oid,
+    AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error, SignatureAlgId,
+    Validity, algorithm_identifier, oid,
 };
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_sequence, parse_oid,
@@ -127,6 +127,33 @@ fn build_tbs<const LIMBS: usize>(
         &algorithm_identifier(oid::SHA256_WITH_RSA, true),
         &exts,
     )
+}
+
+/// A `TBSCertificate` awaiting an externally produced signature.
+///
+/// Returned by [`Certificate::prepare`]. Sign [`tbs`](Self::tbs) with the CA's
+/// out-of-process key, then call [`finish`](Self::finish) with the resulting
+/// signature to obtain the complete [`Certificate`].
+pub struct PreparedCertificate {
+    tbs: Vec<u8>,
+    algid: Vec<u8>,
+}
+
+impl PreparedCertificate {
+    /// The DER `TBSCertificate` bytes the external signer must sign. The signer
+    /// applies the hash/padding of the algorithm passed to
+    /// [`Certificate::prepare`]; these bytes are unhashed.
+    pub fn tbs(&self) -> &[u8] {
+        &self.tbs
+    }
+
+    /// Assembles the final `Certificate` from the externally produced
+    /// `signature` (the raw `signatureValue` bytes, encoded as documented on
+    /// the [`SignatureAlgId`] variant).
+    pub fn finish(self, signature: &[u8]) -> Certificate {
+        let der = encode_sequence(&[self.tbs, self.algid, encode_bit_string(signature)].concat());
+        Certificate { der }
+    }
 }
 
 impl Certificate {
@@ -283,8 +310,41 @@ impl Certificate {
             extensions,
         );
         let sig = signer.sign(&tbs)?;
-        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
-        Ok(Certificate { der })
+        Ok(PreparedCertificate { tbs, algid }.finish(&sig))
+    }
+
+    /// Begins two-phase issuance for a CA key held outside the process
+    /// (TPM/HSM): encodes the `TBSCertificate` with the `sig_alg` algorithm
+    /// identifier and returns a [`PreparedCertificate`] exposing the bytes to
+    /// sign. The caller signs [`PreparedCertificate::tbs`] with its external
+    /// key and calls [`PreparedCertificate::finish`] with the signature to
+    /// assemble the certificate.
+    ///
+    /// No CA key material is needed here; `subject_key` is the subject's public
+    /// key (the certified key), and `sig_alg` must match the algorithm the
+    /// external CA signer will use — it is written into both the inner
+    /// `signature` field and the outer `signatureAlgorithm`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        sig_alg: SignatureAlgId,
+        issuer: &DistinguishedName,
+        subject: &DistinguishedName,
+        subject_key: &AnyPublicKey,
+        validity: &Validity,
+        serial: u64,
+        extensions: &[Extension],
+    ) -> PreparedCertificate {
+        let algid = sig_alg.algorithm_identifier();
+        let tbs = build_tbs_raw(
+            serial,
+            issuer,
+            subject,
+            validity,
+            &subject_key.to_spki_der(),
+            &algid,
+            extensions,
+        );
+        PreparedCertificate { tbs, algid }
     }
 
     /// Issues a self-signed certificate (issuer == subject, signed by `signer`)
@@ -1850,6 +1910,55 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
         // Self-signature still verifies under the embedded key.
         let pk = cert.subject_public_key().unwrap();
         cert.verify_signature_with(&pk).unwrap();
+    }
+
+    #[test]
+    fn two_phase_external_signing_matches_one_shot() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::SignatureAlgId;
+        use crate::x509::extension::{KeyUsageBits, basic_constraints, key_usage};
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"two-phase", b"n", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let signer = crate::x509::CertSigner::Ecdsa(&key);
+        let subject = DistinguishedName::common_name("two-phase-ca");
+        let subject_key = signer.public_key();
+        let exts = [
+            basic_constraints(true, None),
+            key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+        ];
+
+        // One-shot, in-process signing.
+        let one_shot = Certificate::issue_with_extensions(
+            &signer,
+            &subject,
+            &subject,
+            &subject_key,
+            &validity(),
+            7,
+            &exts,
+        )
+        .unwrap();
+
+        // Two-phase: the CA key is invoked only on the prepared TBS — the
+        // builder is handed a SignatureAlgId, not a key.
+        let prepared = Certificate::prepare(
+            SignatureAlgId::EcdsaSha256,
+            &subject,
+            &subject,
+            &subject_key,
+            &validity(),
+            7,
+            &exts,
+        );
+        let sig = signer.sign(prepared.tbs()).unwrap();
+        let two_phase = prepared.finish(&sig);
+
+        // ECDSA here is RFC 6979 deterministic → byte-identical to the one-shot.
+        assert_eq!(one_shot.to_der(), two_phase.to_der());
+        // The externally assembled certificate verifies under the CA key.
+        two_phase.verify_signature_with(&subject_key).unwrap();
     }
 
     #[test]
