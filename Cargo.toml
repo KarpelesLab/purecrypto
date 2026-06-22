@@ -187,6 +187,11 @@ required-features = ["cli"]
 name = "tls_ech_loopback"
 required-features = ["ech"]
 
+# External (TPM/HSM) identity signing via the suspend/resume seam.
+[[example]]
+name = "tls_external_signing"
+required-features = ["tls"]
+
 # Legacy TLS 1.0/1.1 interop against the system `openssl` (run on demand:
 # `cargo run --example tls_legacy_interop --features tls-legacy`).
 [[example]]
