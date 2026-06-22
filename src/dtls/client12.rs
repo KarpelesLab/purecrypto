@@ -867,6 +867,12 @@ impl DtlsClientConnection12 {
             return Err(Error::UnexpectedMessage);
         }
         let ske = ServerKeyExchange::decode(body)?;
+        // RFC 4492 §5.4: the server's selected ECDHE group MUST be one the
+        // client advertised in `supported_groups`. Reject any other group
+        // before using/verifying the share (mirrors the TLS 1.2 client).
+        if !self.config.groups.contains(&ske.group) {
+            return Err(Error::IllegalParameter);
+        }
         // Verify the SKE signature under the leaf's key.
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
