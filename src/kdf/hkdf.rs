@@ -1,13 +1,8 @@
 //! HKDF — HMAC-based Extract-and-Expand KDF (RFC 5869).
 
 // This module is declared `mod hkdf;` (private) in `kdf/mod.rs`, which
-// re-exports the infallible entry points individually. The fallible
-// `try_hkdf_expand` and its `Error` are kept `pub` so they are ready to export
-// if `kdf/mod.rs` later re-exports them, but are currently only reachable
-// within the crate — silence `unreachable_pub` the same way other internal
-// modules do.
-#![allow(unreachable_pub)]
-
+// re-exports the public entry points individually (`hkdf`, `hkdf_extract`,
+// `hkdf_expand`, the fallible `try_hkdf_expand`, and `Error` as `HkdfError`).
 use crate::hash::{Digest, Hmac};
 
 /// Error returned by the fallible HKDF entry point [`try_hkdf_expand`].
