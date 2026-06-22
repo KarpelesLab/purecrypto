@@ -24,16 +24,14 @@ use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::util::{Args, die, zero_buf};
+use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::quic::{QuicConfig, QuicConnection, Role, StreamId, TransportParameters};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
-    Config as TlsConfig, ProtocolVersion as PcVersion, RootCertStore, SigningKey, WriterKeyLog,
+    Config as TlsConfig, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
 };
-use purecrypto::x509::Certificate;
-use std::sync::Arc;
 
 /// Wall-clock seconds since the Unix epoch, for the QUIC retry-token
 /// clock ([`QuicConnection::set_now_secs`]). The engine treats 0 as "no
@@ -45,45 +43,6 @@ fn unix_now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Parses a comma-separated ALPN list ("h3,hq-interop") into bytes vectors.
-fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.as_bytes().to_vec())
-        .collect()
-}
-
-/// Loads one or more PEM CERTIFICATE blocks from `path`, returning the
-/// DER chain (leaf first).
-fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read cert file {path}: {e}")));
-    let mut out = Vec::new();
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let cert = Certificate::from_pem(&block)
-                .unwrap_or_else(|_| die(format!("could not parse cert in {path}")));
-            out.push(cert.to_der().to_vec());
-        }
-    }
-    if out.is_empty() {
-        die(format!("{path} contained no CERTIFICATE blocks"));
-    }
-    out
 }
 
 /// Loads a PEM CA bundle into a `RootCertStore`.
@@ -109,22 +68,6 @@ fn load_signing_key(key_path: &str) -> SigningKey {
             "{key_path}: server key must be RSA (PKCS#1), ECDSA (SEC1), or Ed25519 (PKCS#8)"
         ));
     }
-}
-
-/// Opens a NSS `SSLKEYLOGFILE` sink for key logging (Unix mode 0o600).
-fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let f = opts
-        .open(path)
-        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
-    Arc::new(WriterKeyLog::new(f))
 }
 
 /// Standard QUIC transport-parameters defaults used by both client and

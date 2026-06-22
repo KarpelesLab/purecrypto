@@ -15,16 +15,14 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::util::{Args, die, zero_buf};
+use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     ClientAuth, Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore,
-    SigningKey, WriterKeyLog,
+    SigningKey,
 };
-use purecrypto::x509::Certificate;
-use std::sync::Arc;
 
 /// Which protocol/transport combination the CLI should drive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -96,65 +94,11 @@ fn has_latest_quic(args: &Args) -> bool {
     true
 }
 
-/// Parses a comma-separated ALPN list.
-fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.as_bytes().to_vec())
-        .collect()
-}
-
-/// Loads a PEM cert file (one or more CERTIFICATE blocks) as a DER chain.
-fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read cert file {path}: {e}")));
-    let mut out = Vec::new();
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let cert = Certificate::from_pem(&block)
-                .unwrap_or_else(|_| die(format!("could not parse cert in {path}")));
-            out.push(cert.to_der().to_vec());
-        }
-    }
-    if out.is_empty() {
-        die(format!("{path} contained no CERTIFICATE blocks"));
-    }
-    out
-}
-
 /// Loads a PEM CA bundle into a RootCertStore.
 fn load_roots_file(path: &str) -> RootCertStore {
     let mut store = RootCertStore::new();
     crate::util::load_pem_certs_into(path, |pem| store.add_pem(pem));
     store
-}
-
-/// Opens `path` as an NSS `SSLKEYLOGFILE` sink — append + Unix mode 0o600.
-fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let f = opts
-        .open(path)
-        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
-    Arc::new(WriterKeyLog::new(f))
 }
 
 /// Reads a server key from PEM as a unified [`SigningKey`].

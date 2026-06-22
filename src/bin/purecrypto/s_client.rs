@@ -20,15 +20,13 @@ use std::net::{TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
 use crate::pki::format_dn;
-use crate::util::{Args, die};
+use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
     Config, Connection, HandshakeStatus, ProtocolVersion as PcVersion, RootCertStore, SigningKey,
-    WriterKeyLog,
 };
 use purecrypto::x509::Certificate;
-use std::sync::Arc;
 
 /// Which protocol/transport combination the CLI should drive.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -141,43 +139,6 @@ fn print_chain(chain: &[Vec<u8>], showcerts: bool) {
 }
 
 /// Parses a comma-separated ALPN list ("h2,http/1.1") into a Vec<Vec<u8>>.
-fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(|p| p.as_bytes().to_vec())
-        .collect()
-}
-
-/// Loads a single PEM certificate chain (one or more CERTIFICATE blocks).
-fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
-    let data = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| die(format!("cannot read cert file {path}: {e}")));
-    let mut out = Vec::new();
-    let mut block = String::new();
-    let mut in_cert = false;
-    for line in data.lines() {
-        if line.starts_with("-----BEGIN CERTIFICATE-----") {
-            in_cert = true;
-            block.clear();
-        }
-        if in_cert {
-            block.push_str(line);
-            block.push('\n');
-        }
-        if line.starts_with("-----END CERTIFICATE-----") {
-            in_cert = false;
-            let cert = Certificate::from_pem(&block)
-                .unwrap_or_else(|_| die(format!("could not parse cert in {path}")));
-            out.push(cert.to_der().to_vec());
-        }
-    }
-    if out.is_empty() {
-        die(format!("{path} contained no CERTIFICATE blocks"));
-    }
-    out
-}
-
 /// Loads a client identity (cert chain + key) from `-cert` + `-key` paths.
 fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, SigningKey) {
     let chain = load_cert_chain(cert_path);
@@ -196,25 +157,6 @@ fn load_client_identity(cert_path: &str, key_path: &str) -> (Vec<Vec<u8>>, Signi
         ));
     };
     (chain, key)
-}
-
-/// Opens `path` as the destination for an NSS `SSLKEYLOGFILE` dump.
-/// Unix mode 0o600, append-only — multiple connections in the same
-/// process append to the same file. The returned `Arc` is registered on
-/// the [`Config`] via [`purecrypto::tls::ConfigBuilder::key_log`].
-fn open_keylog(path: &str) -> Arc<dyn purecrypto::tls::KeyLog> {
-    use std::fs::OpenOptions;
-    #[cfg(unix)]
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut opts = OpenOptions::new();
-    opts.create(true).append(true);
-    #[cfg(unix)]
-    opts.mode(0o600);
-    let f = opts
-        .open(path)
-        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
-    Arc::new(WriterKeyLog::new(f))
 }
 
 pub(crate) fn run(args: Args) {

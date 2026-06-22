@@ -378,3 +378,61 @@ pub(crate) fn parse_usize_flag(value: &str, flag: &str) -> usize {
         .parse::<usize>()
         .unwrap_or_else(|_| die(format!("invalid integer for {flag}: {value}")))
 }
+
+/// Parses a comma-separated `-alpn` value into a list of protocol identifiers.
+/// Shared by the TLS and QUIC client/server drivers.
+pub(crate) fn parse_alpn(s: &str) -> Vec<Vec<u8>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.as_bytes().to_vec())
+        .collect()
+}
+
+/// Loads a single PEM certificate chain (one or more CERTIFICATE blocks) into
+/// a list of DER-encoded certificates. Shared by the TLS and QUIC drivers.
+pub(crate) fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
+    let data = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| die(format!("cannot read cert file {path}: {e}")));
+    let mut out = Vec::new();
+    let mut block = String::new();
+    let mut in_cert = false;
+    for line in data.lines() {
+        if line.starts_with("-----BEGIN CERTIFICATE-----") {
+            in_cert = true;
+            block.clear();
+        }
+        if in_cert {
+            block.push_str(line);
+            block.push('\n');
+        }
+        if line.starts_with("-----END CERTIFICATE-----") {
+            in_cert = false;
+            let cert = purecrypto::x509::Certificate::from_pem(&block)
+                .unwrap_or_else(|_| die(format!("could not parse cert in {path}")));
+            out.push(cert.to_der().to_vec());
+        }
+    }
+    if out.is_empty() {
+        die(format!("{path} contained no CERTIFICATE blocks"));
+    }
+    out
+}
+
+/// Opens `path` as the destination for an NSS `SSLKEYLOGFILE` dump. Unix mode
+/// `0o600`, append-only — multiple connections in the same process append to
+/// the same file. Shared by the TLS and QUIC drivers.
+pub(crate) fn open_keylog(path: &str) -> std::sync::Arc<dyn purecrypto::tls::KeyLog> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let f = opts
+        .open(path)
+        .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
+    std::sync::Arc::new(purecrypto::tls::WriterKeyLog::new(f))
+}

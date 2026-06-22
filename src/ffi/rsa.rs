@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use super::hash::id;
 use crate::bignum::Uint;
 use crate::der::{pem_decode, pem_encode};
@@ -400,17 +400,4 @@ pub unsafe extern "C" fn pc_rsa_decrypt_oaep(
             Err(_) => PcStatus::Verification,
         }
     })
-}
-
-/// Overwrites `buf` with zeros and routes the read through
-/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
-/// stores. Used to scrub plaintext / shared-secret intermediates before
-/// their backing storage is returned to the allocator (same in-house
-/// pattern used by ML-DSA/ML-KEM in `src/mldsa/mod.rs` and
-/// `src/mlkem/mod.rs`).
-fn wipe_vec(buf: &mut Vec<u8>) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
 }

@@ -1,6 +1,6 @@
 //! C ABI for HKDF, PBKDF2, scrypt, and Argon2.
 
-use super::common::{PcStatus, guard, slice};
+use super::common::{PcStatus, guard, slice, wipe_array};
 use super::hash::id;
 use crate::hash::{Sha256, Sha384, Sha512};
 use crate::kdf::argon2::{Argon2Params, Argon2Type, argon2};
@@ -9,19 +9,6 @@ use crate::kdf::{
     CmacAes128Prf, CmacAes256Prf, HmacSha256Prf, HmacSha384Prf, HmacSha512Prf, Prf, hkdf,
     kbkdf_counter, kbkdf_feedback, pbkdf2,
 };
-
-/// Overwrites `buf` with zeros and routes the read through
-/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead
-/// stores. Used to wipe a partially-written caller buffer on an error
-/// return path so the half-derived key material does not surface
-/// (same in-house pattern used by ML-DSA/ML-KEM in `src/mldsa/mod.rs`
-/// and `src/mlkem/mod.rs`).
-fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
-}
 
 /// Argon2 variant identifiers.
 pub mod argon2_id {
@@ -296,7 +283,7 @@ pub unsafe extern "C" fn pc_scrypt(
                 // The implementation may have written partial state into
                 // `buf` before erroring; wipe so the caller does not see
                 // a half-derived key in their output buffer.
-                wipe(buf);
+                wipe_array(buf);
                 PcStatus::Unsupported
             }
         }
@@ -352,7 +339,7 @@ pub unsafe extern "C" fn pc_argon2(
             Err(_) => {
                 // See the scrypt error path for rationale: wipe any
                 // partial output before propagating.
-                wipe(buf);
+                wipe_array(buf);
                 PcStatus::Unsupported
             }
         }
