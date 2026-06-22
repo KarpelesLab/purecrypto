@@ -57,14 +57,34 @@ impl HpkeKdf {
         }
     }
 
-    /// HKDF-Expand into `out`. `prk` must be exactly [`output_len`](Self::output_len)
-    /// bytes; mismatches panic.
-    pub(crate) fn expand(self, prk: &[u8], info: &[u8], out: &mut [u8]) {
-        assert_eq!(
+    /// HKDF-Expand into `out`.
+    ///
+    /// `prk` must be exactly [`output_len`](Self::output_len) bytes and
+    /// `out.len()` must not exceed `255 * output_len` (the RFC 5869 maximum).
+    /// Both are invariants of the in-crate call sites (PRKs always come from
+    /// [`extract`](Self::extract) and lengths are fixed by the suite), so a
+    /// violation is a programming error rather than attacker-reachable.
+    ///
+    /// Returns `false` without touching `out` if either invariant is broken,
+    /// rather than panicking on untrusted input; a `debug_assert` flags the
+    /// contract violation in debug builds. Callers that need the output ignore
+    /// the boolean for valid inputs (where it is always `true`).
+    pub(crate) fn expand(self, prk: &[u8], info: &[u8], out: &mut [u8]) -> bool {
+        let nh = self.output_len();
+        debug_assert_eq!(
             prk.len(),
-            self.output_len(),
+            nh,
             "HPKE HKDF prk length must equal output_len()"
         );
+        debug_assert!(
+            out.len() <= 255 * nh,
+            "HPKE HKDF output too long (> 255 * HashLen)"
+        );
+        // Guard both RFC 5869 invariants up front so the panicking
+        // `hkdf_expand` below is never reached with out-of-contract lengths.
+        if prk.len() != nh || out.len() > 255 * nh {
+            return false;
+        }
         match self {
             HpkeKdf::HkdfSha256 => {
                 let mut p = <Sha256 as Digest>::zeroed_output();
@@ -82,5 +102,6 @@ impl HpkeKdf {
                 hkdf_expand::<Sha512>(&p, info, out);
             }
         }
+        true
     }
 }

@@ -112,9 +112,15 @@ impl HpkeKem {
     /// Validates an encoded public key without computing anything else
     /// with it. For NIST curves this enforces SEC1 framing, in-range
     /// coordinates, and on-curve membership (the underlying group is
-    /// prime-order, so a co-factor check is unnecessary). For X25519
-    /// every 32-byte string is a valid encoding; small-order rejection
-    /// happens later, in `dh`.
+    /// prime-order, so a co-factor check is unnecessary).
+    ///
+    /// For X25519 this is **only a length check**: every 32-byte string is a
+    /// syntactically valid u-coordinate, so this method intentionally accepts
+    /// all of them. Small-order / low-order point rejection is *not* performed
+    /// here — it is deferred to [`dh`](Self::dh), which maps an all-zero
+    /// shared secret to [`Error::InvalidDhOutput`] per RFC 9180 §7.1.4. Do not
+    /// rely on this method alone to reject contributory-behaviour attacks on
+    /// the X25519 KEM; the DH step is the security-relevant gate.
     pub(crate) fn validate_public_key(self, pk: &[u8]) -> Result<(), Error> {
         match self.nist_curve() {
             Some(curve) => {
