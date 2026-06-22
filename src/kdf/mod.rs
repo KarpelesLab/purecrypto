@@ -26,7 +26,7 @@ pub mod scrypt;
 
 #[cfg(feature = "alloc")]
 pub use bcrypt_pbkdf::{Error as BcryptPbkdfError, bcrypt_pbkdf};
-pub use hkdf::{hkdf, hkdf_expand, hkdf_extract};
+pub use hkdf::{Error as HkdfError, hkdf, hkdf_expand, hkdf_extract, try_hkdf_expand};
 pub use kbkdf::{
     CmacAes128Prf, CmacAes256Prf, Error as KbkdfError, HmacPrf, HmacSha256Prf, HmacSha384Prf,
     HmacSha512Prf, Prf, kbkdf_counter, kbkdf_counter_fixed, kbkdf_feedback, kbkdf_feedback_fixed,
