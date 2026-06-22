@@ -1753,7 +1753,7 @@ mod tests {
     fn drive_with_device_signer_round_trips() {
         use super::super::signer::{PrivateKey, Readiness, SignOp, SignProgress};
         use alloc::sync::Arc;
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::net::UnixStream;
 
         const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
@@ -1842,6 +1842,12 @@ mod tests {
                     }
                     Step::WantSigner(r) => {
                         if let Some(r) = r {
+                            // Exercise the async-facing seam too: the std fd
+                            // traits must yield the same valid descriptor an
+                            // `AsyncFd`/`SourceFd` would register.
+                            assert!(r.as_raw_fd() >= 0);
+                            assert_eq!(r.as_fd().as_raw_fd(), r.as_raw_fd());
+                            // Then the sync path: block until readable.
                             r.wait().unwrap();
                             waited = true;
                         }

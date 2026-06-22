@@ -94,12 +94,21 @@ pub enum SignProgress {
 /// An opaque "wait until the device can make progress" token, exposed by
 /// [`SignOp::readiness`].
 ///
-/// On unix it wraps a raw file descriptor. Synchronous callers can block on it
-/// with [`wait`](Self::wait); async callers register
-/// [`as_raw_fd`](Self::as_raw_fd) with their reactor
-/// (`tokio::io::unix::AsyncFd`, `mio::unix::SourceFd`, …). The descriptor is
-/// owned by the [`SignOp`] and remains valid until the next
-/// [`resume`](SignOp::resume).
+/// On unix it wraps a raw file descriptor. Two ways to use it, neither of which
+/// reveals what device is behind it:
+///
+/// - **Synchronous** callers block on it with [`wait`](Self::wait) — no fd ever
+///   surfaces.
+/// - **Asynchronous** callers register it with their reactor through the std fd
+///   traits: `Readiness` implements [`AsFd`](std::os::fd::AsFd) and
+///   [`AsRawFd`](std::os::fd::AsRawFd) (unix), so it drops straight into
+///   `tokio::io::unix::AsyncFd::new(readiness)` or `mio::unix::SourceFd`. The
+///   reactor then signals readability and the caller re-enters
+///   [`Connection::drive`](super::Connection::drive).
+///
+/// The descriptor is owned by the [`SignOp`] and remains valid until the next
+/// [`resume`](SignOp::resume); a [`BorrowedFd`](std::os::fd::BorrowedFd)
+/// obtained from [`AsFd`](std::os::fd::AsFd) must not outlive that.
 #[derive(Clone, Copy)]
 pub struct Readiness {
     #[cfg(unix)]
@@ -115,15 +124,10 @@ impl Readiness {
         Readiness { fd }
     }
 
-    /// The underlying file descriptor, for registration with an async reactor.
-    #[cfg(unix)]
-    pub fn as_raw_fd(&self) -> core::ffi::c_int {
-        self.fd
-    }
-
     /// Block until the descriptor is readable (synchronous callers). Retries on
     /// `EINTR`. Async callers should ignore this and drive readiness through
-    /// their reactor via [`as_raw_fd`](Self::as_raw_fd) instead.
+    /// their reactor via the [`AsFd`](std::os::fd::AsFd) /
+    /// [`AsRawFd`](std::os::fd::AsRawFd) impls instead.
     ///
     /// On non-unix platforms this is a no-op (device keys there report no
     /// readiness and are simply re-polled).
@@ -156,6 +160,30 @@ impl Readiness {
         #[cfg(not(unix))]
         {
             Ok(())
+        }
+    }
+}
+
+// The std fd traits are the async integration seam: an `AsyncFd`/`SourceFd`
+// takes the `Readiness` token directly, so the caller registers readiness with
+// its reactor without ever learning what device is behind the fd. `std` only
+// (the module is `#[cfg(feature = "std")]`), unix only (fds).
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Readiness {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.fd
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for Readiness {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        // SAFETY: the fd is owned by the SignOp and valid until its next
+        // `resume`; the returned borrow is tied to `&self`, and callers are
+        // documented not to hold it past that point.
+        #[allow(unsafe_code)]
+        unsafe {
+            std::os::fd::BorrowedFd::borrow_raw(self.fd)
         }
     }
 }
