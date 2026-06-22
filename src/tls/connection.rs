@@ -247,6 +247,7 @@ impl Connection {
     ///         Step::WantSigner(Some(r)) => r.wait()?,
     ///         Step::WantSigner(None) => {} // no fd: just loop and re-drive
     ///         Step::Complete => break,
+    ///         _ => {} // `Step` is #[non_exhaustive]
     ///     }
     /// }
     /// # Ok(())
@@ -285,6 +286,17 @@ impl Connection {
                     // CertificateVerify + Finished records are now pending.
                 }
             }
+        }
+        // Drain any buffered output before reporting completion. The engine
+        // marks the handshake complete as soon as it *builds* its last flight
+        // (e.g. the TLS 1.3 client's Finished), so `handshake()` — which checks
+        // completion first — would otherwise return `Complete` with that flight
+        // still in the buffer and the driver would stop without sending it,
+        // leaving the peer waiting forever. Prioritising the write here makes
+        // `drive` fully flush the final flight first.
+        if self.wants_write() {
+            self.refill_dtls_pending();
+            return Ok(Step::WantWrite);
         }
         match self.handshake()? {
             HandshakeStatus::Complete => Ok(Step::Complete),

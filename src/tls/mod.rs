@@ -65,9 +65,13 @@ pub mod ech;
 mod error;
 mod groups;
 pub(crate) mod keylog;
+#[cfg(feature = "mio")]
+pub mod mio;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
 mod signer;
+#[cfg(feature = "tokio")]
+pub mod tokio;
 mod version;
 
 pub use config::{ClientAuth, Config, ConfigBuilder, EntropySource, Identity, SigningKey};

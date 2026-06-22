@@ -159,6 +159,13 @@ embedded-roots = ["tls", "dep:cacrt"]
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher", "ascon", "lms", "xmss"]
 # The `purecrypto` command-line tool (gates the binary target below).
 cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss", "embedded-roots"]
+# Async I/O surface for the sans-I/O TLS engine: `tls::tokio::TlsStream`
+# (AsyncRead + AsyncWrite) that drives the handshake and awaits the
+# device-signer `Readiness` via `tokio::io::unix::AsyncFd`. Off by default.
+tokio = ["tls", "std", "dep:tokio"]
+# Reactor I/O surface for the sans-I/O TLS engine: the signer `Readiness` as a
+# `mio::event::Source` plus `tls::mio::drive_handshake`. Off by default.
+mio = ["tls", "std", "dep:mio"]
 
 # --- dependencies ---
 # This crate's design principle is to ship no foreign code, primarily so the
@@ -177,6 +184,18 @@ compcol = { version = "0.4", default-features = false, features = ["zlib"], opti
 # foreign-code dependency. Powers `RootCertStore::with_embedded_roots` under
 # the `embedded-roots` feature.
 cacrt = { version = "0.1", default-features = false, optional = true }
+# Optional async/reactor I/O adapters for the sans-I/O TLS engine, each behind
+# its own off-by-default feature. They are pure glue over the public
+# `Connection`/`Readiness` surface and never compile unless requested, so the
+# default build and `no_std` stay free of them. `net` provides tokio's
+# `AsyncFd`; `os-ext` provides mio's `SourceFd`.
+tokio = { version = "1", default-features = false, features = ["net", "io-util"], optional = true }
+mio = { version = "1", default-features = false, features = ["os-ext", "net"], optional = true }
+
+# Test-only: a full tokio runtime + `#[tokio::test]` for the `tokio` integration
+# tests. Not shipped to consumers.
+[dev-dependencies]
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
 
 [[bin]]
 name = "purecrypto"

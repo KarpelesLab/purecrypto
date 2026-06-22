@@ -557,6 +557,7 @@ fn s_client_loopback() {
         let key = BoxedRsaPrivateKey::from_pkcs1_pem(KEY).unwrap();
         let cfg = Config::builder()
             .tls_only()
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .identity(vec![cert.to_der().to_vec()], SigningKey::Rsa(key))
             .build();
         let mut conn = Connection::server(&cfg).expect("server config");
