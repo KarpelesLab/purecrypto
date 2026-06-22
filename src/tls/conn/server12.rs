@@ -1,4 +1,10 @@
-#![allow(dead_code, unreachable_pub)]
+// `server12` is a private module whose types are re-exported only as
+// `pub(crate)`, so its `pub` items are intentionally crate-internal: allow
+// `unreachable_pub` module-wide rather than demoting dozens of items. `dead_code`
+// is deliberately NOT allowed here so unused handshake code is caught; the few
+// introspection accessors not yet surfaced through the public connection wrapper
+// carry their own targeted `#[allow(dead_code)]`.
+#![allow(unreachable_pub)]
 
 //! TLS 1.2 server state machine (RFC 5246 + RFC 5077) — ECDHE-AEAD.
 //!
@@ -272,6 +278,7 @@ impl ServerConfig12 {
     /// Sets the lifetime advertised in `NewSessionTicket` (seconds), also used
     /// as the server-side expiry cap on decrypted tickets. Capped at 7 days;
     /// defaults to two hours.
+    #[allow(dead_code)] // builder not yet surfaced by the public config wrapper
     pub fn with_ticket_lifetime(mut self, seconds: u32) -> Self {
         const MAX: u32 = 7 * 24 * 60 * 60;
         self.ticket_lifetime = seconds.min(MAX);
@@ -520,6 +527,7 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// `true` if this handshake resumed a prior session via RFC 5077
     /// session ticket.
+    #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
     pub fn did_resume(&self) -> bool {
         self.resumed
     }
@@ -536,6 +544,7 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// Protocol version string (`"TLSv1.2"`, or `"TLSv1.1"`/`"TLSv1.0"` on the
     /// opt-in legacy path) once a CH has been processed.
+    #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
     pub fn protocol_version(&self) -> Option<&'static str> {
         #[cfg(feature = "tls-legacy")]
         if self.legacy_suite.is_some() {
@@ -576,11 +585,13 @@ impl<R: RngCore> ServerConnection12<R> {
     /// and for writing the NSS `SSLKEYLOGFILE` `CLIENT_RANDOM` line from
     /// the server side. The connection's own copy is scrubbed on drop; the
     /// returned copy is the caller's to wipe.
+    #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
     pub fn master_secret(&self) -> Option<[u8; 48]> {
         self.master
     }
 
     /// Whether the handshake negotiated RFC 7627 Extended Master Secret.
+    #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
     pub fn ems_negotiated(&self) -> bool {
         self.ems_negotiated
     }
@@ -592,6 +603,7 @@ impl<R: RngCore> ServerConnection12<R> {
     /// distinction.
     ///
     /// [`ClientConnection12::tls_exporter`]: super::client12::ClientConnection12::tls_exporter
+    #[allow(dead_code)] // introspection not yet surfaced by the public connection wrapper
     pub fn tls_exporter(
         &self,
         label: &[u8],

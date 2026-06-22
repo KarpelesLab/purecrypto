@@ -1,4 +1,10 @@
-#![allow(dead_code, unreachable_pub)]
+// `server` is a private module whose types are re-exported only as
+// `pub(crate)`, so its `pub` items are intentionally crate-internal: allow
+// `unreachable_pub` module-wide rather than demoting dozens of items. `dead_code`
+// is deliberately NOT allowed here so unused handshake code is caught; the few
+// introspection/control accessors not yet surfaced through the public connection
+// wrapper carry their own targeted `#[allow(dead_code)]`.
+#![allow(unreachable_pub)]
 
 //! The TLS 1.3 server handshake state machine.
 //!
@@ -448,6 +454,7 @@ impl ServerConfig {
 
     /// Sets the lifetime advertised in NewSessionTickets (seconds). Capped at
     /// 7 days per RFC 8446 §4.6.1; defaults to two hours.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn with_ticket_lifetime(mut self, seconds: u32) -> Self {
         const MAX: u32 = 7 * 24 * 60 * 60;
         self.ticket_lifetime = seconds.min(MAX);
@@ -1041,12 +1048,14 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// Whether the just-completed handshake accepted 0-RTT data from the
     /// client. Always `false` on fresh handshakes.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn early_data_accepted(&self) -> bool {
         self.early_data_accepted
     }
 
     /// Whether the just-completed handshake resumed a prior session via PSK
     /// (RFC 8446 §2.2). Always `false` for fresh handshakes.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn psk_used(&self) -> bool {
         self.psk_used
     }
@@ -1100,6 +1109,7 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// `client_application_traffic_secret_0`, exposed for keylogfile output
     /// in the server CLI. Available once the handshake completes.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn client_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
         self.client_app_secret
             .as_ref()
@@ -1107,6 +1117,7 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     /// `server_application_traffic_secret_0`. See above.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn server_application_traffic_secret_0(&self) -> Option<Vec<u8>> {
         self.server_app_secret
             .as_ref()
@@ -1114,12 +1125,14 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     /// `exporter_master_secret`. See above.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn exporter_master_secret(&self) -> Option<Vec<u8>> {
         self.exporter_secret.as_ref().map(|s| s.as_slice().to_vec())
     }
 
     /// TLS 1.3 application-layer Exporter (RFC 8446 §7.5 / RFC 5705) —
     /// symmetric to `ClientConnection::tls_exporter`.
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
         let ems = self
             .exporter_secret
@@ -1350,6 +1363,7 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// Requests a key update from the peer; symmetric to
     /// [`ClientConnection::request_key_update`](super::ClientConnection::request_key_update).
+    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
     pub fn request_key_update(&mut self) -> Result<(), Error> {
         if !matches!(self.state, State::Connected) {
             return Err(Error::InappropriateState);
