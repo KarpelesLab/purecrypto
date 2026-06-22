@@ -109,6 +109,39 @@ fn increment(counter: &mut [u8; 16]) {
     }
 }
 
+/// Windowed CTR keystream generation shared by the AEAD modes (GCM and
+/// AES-GCM-SIV), which differ only in how the counter block advances.
+///
+/// Generates keystream a window at a time — 64 blocks (1 KiB), enough to
+/// amortize dispatch and feed the 8-wide AES-NI / 4-wide ARM pipelines, small
+/// enough for the stack — and XORs it into `buf`. `block` is the first counter
+/// block; `next` advances it to the following block; `enc` applies the keyed
+/// block cipher to a packed buffer of whole blocks (a closure rather than a
+/// trait bound so callers with different cipher representations can share it).
+pub(crate) fn windowed_ctr(
+    mut block: [u8; 16],
+    buf: &mut [u8],
+    mut next: impl FnMut(&mut [u8; 16]),
+    mut enc: impl FnMut(&mut [u8]),
+) {
+    const W: usize = 64;
+    let mut ks = [0u8; 16 * W];
+    let mut off = 0;
+    while off < buf.len() {
+        let n = (buf.len() - off).min(16 * W);
+        let blocks = n.div_ceil(16);
+        for blk in ks[..blocks * 16].chunks_exact_mut(16) {
+            blk.copy_from_slice(&block);
+            next(&mut block);
+        }
+        enc(&mut ks[..blocks * 16]);
+        for (b, k) in buf[off..off + n].iter_mut().zip(ks[..n].iter()) {
+            *b ^= *k;
+        }
+        off += n;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

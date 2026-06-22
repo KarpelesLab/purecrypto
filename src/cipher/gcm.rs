@@ -145,26 +145,14 @@ impl<C: BlockCipher> Gcm<C> {
     /// batched [`encrypt_blocks`](super::BlockCipher::encrypt_blocks), so a
     /// hardware AES backend pipelines them; the per-block counter sequence is
     /// identical to the scalar form.
-    fn gctr(&self, mut counter: u128, buf: &mut [u8]) {
-        // 64-block (1 KiB) window: enough to amortize dispatch and feed the
-        // 8-wide AES-NI / 4-wide ARM pipelines, small enough for the stack.
-        const W: usize = 64;
-        let mut ks = [0u8; 16 * W];
-        let mut offset = 0;
-        while offset < buf.len() {
-            let chunk = &mut buf[offset..];
-            let n = chunk.len().min(16 * W);
-            let blocks = n.div_ceil(16);
-            for blk in ks[..blocks * 16].chunks_exact_mut(16) {
-                blk.copy_from_slice(&counter.to_be_bytes());
-                counter = inc32(counter);
-            }
-            self.cipher.encrypt_blocks(&mut ks[..blocks * 16]);
-            for (b, k) in chunk[..n].iter_mut().zip(ks[..n].iter()) {
-                *b ^= *k;
-            }
-            offset += n;
-        }
+    fn gctr(&self, counter: u128, buf: &mut [u8]) {
+        super::ctr::windowed_ctr(
+            counter.to_be_bytes(),
+            buf,
+            // GCM advances the rightmost 32 bits of the big-endian block.
+            |b| *b = inc32(u128::from_be_bytes(*b)).to_be_bytes(),
+            |ks| self.cipher.encrypt_blocks(ks),
+        );
     }
 
     /// Computes the authentication tag `E_K(J0) ⊕ GHASH(aad, ct)`.

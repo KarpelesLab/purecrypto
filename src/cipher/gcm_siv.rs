@@ -250,28 +250,16 @@ impl AesGcmSiv {
     fn ctr(enc_cipher: &Cipher, tag: &[u8; 16], buf: &mut [u8]) {
         let mut counter = *tag;
         counter[15] |= 0x80;
-        // Generate keystream blocks a window at a time and permute them with the
-        // batched API so a hardware AES backend pipelines them; the per-block
-        // counter sequence matches the scalar form.
-        const W: usize = 64; // 1 KiB stack window
-        let mut ks = [0u8; 16 * W];
-        let mut off = 0;
-        while off < buf.len() {
-            let n = (buf.len() - off).min(16 * W);
-            let blocks = n.div_ceil(16);
-            for blk in ks[..blocks * 16].chunks_exact_mut(16) {
-                blk.copy_from_slice(&counter);
-                // Increment the low 32 bits, little-endian, with wraparound.
-                let c = u32::from_le_bytes([counter[0], counter[1], counter[2], counter[3]])
-                    .wrapping_add(1);
-                counter[..4].copy_from_slice(&c.to_le_bytes());
-            }
-            enc_cipher.encrypt_blocks(&mut ks[..blocks * 16]);
-            for (b, k) in buf[off..off + n].iter_mut().zip(ks[..n].iter()) {
-                *b ^= *k;
-            }
-            off += n;
-        }
+        super::ctr::windowed_ctr(
+            counter,
+            buf,
+            // AES-GCM-SIV advances the low 32 bits little-endian, with wraparound.
+            |b| {
+                let c = u32::from_le_bytes([b[0], b[1], b[2], b[3]]).wrapping_add(1);
+                b[..4].copy_from_slice(&c.to_le_bytes());
+            },
+            |ks| enc_cipher.encrypt_blocks(ks),
+        );
     }
 
     /// Encrypts `buffer` in place under `nonce` and returns the 16-byte tag,
