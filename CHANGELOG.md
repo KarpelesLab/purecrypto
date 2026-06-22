@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.16](https://github.com/KarpelesLab/purecrypto/compare/v0.6.15...v0.6.16) - 2026-06-22
+
+### Other
+
+- injectable entropy source (Config::rng / EntropySource)
+- narrow the state-machine modules' blanket allow to unreachable_pub
+- narrow the server modules' blanket allow to unreachable_pub
+- share the CT PKCS#1 v1.5 padding check and the rsaEncryption OID
+- add SuiteParams::crypter to collapse RecordCrypter::new sites
+- share limb helpers between boxed and boxed_montgomery
+- share the windowed-CTR keystream loop between GCM and GCM-SIV
+- dedup shared helpers (wipe, ALPN/cert/keylog loaders)
+- share one big-endian hex decoder across the curve field modules
+- funnel ServerConfig constructors through one from_key
+- share the AVX2 8x8 transpose between SHA-256-MB and BLAKE3
+- use public-exponent ladder for the public operation
+- reuse keyed HMAC across iterations; reuse scrypt BlockMix scratch
+- clear stale dead-code allows; scope the staged ones
+- consolidate dead-code allows; drop vestigial helpers
+- drop blanket dead-code allows; gate test-only helpers
+- remove stale dead-code suppressions and dead bookkeeping
+
 ## [0.6.15](https://github.com/KarpelesLab/purecrypto/compare/v0.6.14...v0.6.15) - 2026-06-22
 
 ### Other
