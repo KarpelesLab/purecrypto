@@ -459,8 +459,29 @@ enum State {
     WaitCertificate,
     WaitCertificateVerify,
     WaitFinished,
+    /// mTLS external-signing pause: our Certificate has been emitted and we are
+    /// waiting for the caller to supply the client `CertificateVerify`
+    /// signature, after which the rest of our flight (CertificateVerify +
+    /// Finished + key install) runs.
+    AwaitingCertVerifySignature,
     Connected,
     Closed,
+}
+
+/// State stashed while the client mTLS flight is suspended awaiting an external
+/// `CertificateVerify` signature (see [`ClientKey::External`]). Holds the bytes
+/// to sign plus what `finish_client_flight` needs to complete the flight.
+struct PendingClientFlight {
+    /// Negotiated signature scheme for the client `CertificateVerify`.
+    scheme: SignatureScheme,
+    /// The signature input the caller signs.
+    content: Vec<u8>,
+    /// Negotiated cipher suite.
+    suite: SuiteParams,
+    /// Client / server 1-RTT application secrets, installed once the flight
+    /// finishes.
+    cats: Secret,
+    sats: Secret,
 }
 
 /// A TLS 1.3 client connection.
@@ -469,6 +490,9 @@ pub struct ClientConnection {
     config: ClientConfig,
     server_name: String,
     state: State,
+    /// External mTLS signing continuation; `Some` while suspended awaiting the
+    /// client `CertificateVerify` signature.
+    pending_flight: Option<PendingClientFlight>,
     /// True once the peer's close_notify alert has been processed. Lets
     /// callers distinguish a graceful TLS shutdown from an abrupt
     /// transport close (truncation attack) — `state` alone can't, since
@@ -1121,6 +1145,7 @@ impl ClientConnection {
             config,
             server_name: String::from(server_name),
             state: State::WaitServerHello,
+            pending_flight: None,
             received_close_notify: false,
             x25519,
             p256,
@@ -1640,6 +1665,9 @@ impl ClientConnection {
             State::WaitCertificate => self.on_certificate(msg_type, body, &msg),
             State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &msg),
             State::WaitFinished => self.on_finished(msg_type, body, &msg),
+            // Suspended mid-flight awaiting our own external signature; the peer
+            // must not be sending anything yet.
+            State::AwaitingCertVerifySignature => Err(Error::UnexpectedMessage),
             State::Connected => self.on_post_handshake(msg_type, body),
             State::Closed => Err(Error::UnexpectedMessage),
         }
@@ -2920,11 +2948,44 @@ impl ClientConnection {
         // close with `certificate_required` if it demanded one.
         if self.cert_request_received {
             self.send_client_certificate();
+            let external = self
+                .config
+                .client_cert
+                .as_ref()
+                .is_some_and(|cc| matches!(cc.key, ClientKey::External { .. }));
+            if external {
+                // External mTLS key: stash the flight continuation and yield;
+                // the caller signs and resumes via `provide_signature`.
+                let cc = self.config.client_cert.as_ref().expect("client cert");
+                let scheme = cc.signature_scheme();
+                let th = self.core.transcript.current_hash();
+                let content = certificate_verify_content(false, th.as_slice());
+                self.pending_flight = Some(PendingClientFlight {
+                    scheme,
+                    content,
+                    suite,
+                    cats,
+                    sats,
+                });
+                self.state = State::AwaitingCertVerifySignature;
+                return Ok(());
+            }
             if self.config.client_cert.is_some() {
                 self.send_client_certificate_verify()?;
             }
         }
+        self.finish_client_flight(suite, cats, sats)
+    }
 
+    /// The client flight tail shared by the inline and external-signing paths:
+    /// emits the client `Finished`, derives the resumption master secret, and
+    /// installs the 1-RTT application keys.
+    fn finish_client_flight(
+        &mut self,
+        suite: SuiteParams,
+        cats: Secret,
+        sats: Secret,
+    ) -> Result<(), Error> {
         // Our Finished, over the handshake context up to (and including, for
         // 0-RTT) EndOfEarlyData — i.e. the current transcript hash here.
         let chts = self.client_hs_secret.as_ref().expect("client hs secret");
@@ -2959,6 +3020,25 @@ impl ClientConnection {
         self.core.close_ccs_window();
         self.state = State::Connected;
         Ok(())
+    }
+
+    /// mTLS external signing: emits the client `CertificateVerify` with the
+    /// caller-supplied `signature`, then finishes the flight.
+    pub(crate) fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
+        let pf = self
+            .pending_flight
+            .take()
+            .ok_or(Error::InappropriateState)?;
+        self.emit_client_certificate_verify(pf.scheme, &signature);
+        self.finish_client_flight(pf.suite, pf.cats, pf.sats)
+    }
+
+    /// If the client flight is suspended awaiting an external signature, returns
+    /// the IANA scheme code point and the bytes to sign.
+    pub(crate) fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
+        self.pending_flight
+            .as_ref()
+            .map(|pf| (pf.scheme.0, pf.content.clone()))
     }
 }
 
@@ -3026,18 +3106,24 @@ impl ClientConnection {
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&content, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
-            // External client-cert signing (suspend/resume) is wired in a
-            // follow-up; reject for now rather than mis-sign.
+            // External keys are handled by the suspend/resume path before this
+            // inline signer is reached; this arm is defensive only.
             ClientKey::External { .. } => return Err(Error::HandshakeFailure),
         };
+        self.emit_client_certificate_verify(scheme, &signature);
+        Ok(())
+    }
+
+    /// Builds and emits the client mTLS `CertificateVerify` from a negotiated
+    /// `scheme` and the produced `signature` bytes.
+    fn emit_client_certificate_verify(&mut self, scheme: SignatureScheme, signature: &[u8]) {
         let mut msg = alloc::vec![hs_type::CERTIFICATE_VERIFY];
         with_len_u24(&mut msg, |b| {
             b.extend_from_slice(&scheme.0.to_be_bytes());
-            with_len_u16(b, |s| s.extend_from_slice(&signature));
+            with_len_u16(b, |s| s.extend_from_slice(signature));
         });
         // RFC 9001 §4.1.4: mTLS client CertificateVerify rides at Handshake.
         self.emit_handshake_at(super::super::quic_hooks::Level::Handshake, msg);
-        Ok(())
     }
 }
 

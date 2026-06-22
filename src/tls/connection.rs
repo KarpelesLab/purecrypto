@@ -197,6 +197,7 @@ impl Connection {
     pub fn signature_request(&self) -> Option<SignatureRequest> {
         let pending = match &self.inner {
             Engine::ServerTls13(c) => c.pending_signature(),
+            Engine::ClientTls13(c) => c.pending_signature(),
             _ => None,
         };
         pending.map(|(scheme, message)| SignatureRequest { scheme, message })
@@ -211,6 +212,7 @@ impl Connection {
     pub fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
         match &mut self.inner {
             Engine::ServerTls13(c) => c.provide_signature(signature),
+            Engine::ClientTls13(c) => c.provide_signature(signature),
             _ => Err(Error::InappropriateState),
         }
     }
@@ -1206,11 +1208,13 @@ mod tests {
         );
     }
 
-    /// A self-signed ECDSA P-256 leaf + its key, for external-signing tests.
-    fn ecdsa_p256_identity() -> (BoxedEcdsaPrivateKey, Vec<u8>) {
-        let mut kg = HmacDrbg::<Sha256>::new(b"ext-sign-leaf", b"nonce", &[]);
+    /// A self-signed ECDSA P-256 leaf + its key (seeded for reproducibility),
+    /// for external-signing tests. `cn` is used as both the subject CN and the
+    /// single DNS SAN.
+    fn ecdsa_identity(seed: &[u8], cn: &str) -> (BoxedEcdsaPrivateKey, Vec<u8>) {
+        let mut kg = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
         let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut kg);
-        let name = DistinguishedName::common_name("ext.example");
+        let name = DistinguishedName::common_name(cn);
         let validity = Validity::new(
             Time::utc(2024, 1, 1, 0, 0, 0),
             Time::utc(2034, 1, 1, 0, 0, 0),
@@ -1220,11 +1224,17 @@ mod tests {
             &name,
             &validity,
             1,
-            false,
-            &["ext.example"],
+            // A self-signed cert used as a client-auth trust anchor must be a CA.
+            true,
+            &[cn],
         )
         .unwrap();
         (key, cert.to_der().to_vec())
+    }
+
+    /// A self-signed ECDSA P-256 leaf + its key, for external-signing tests.
+    fn ecdsa_p256_identity() -> (BoxedEcdsaPrivateKey, Vec<u8>) {
+        ecdsa_identity(b"ext-sign-leaf", "ext.example")
     }
 
     /// A TLS 1.3 server using `SigningKey::External` completes the handshake
@@ -1293,6 +1303,85 @@ mod tests {
         assert!(
             client.is_handshake_complete() && server.is_handshake_complete(),
             "external-signed TLS 1.3 handshake must complete and verify"
+        );
+    }
+
+    /// mTLS with an **external client** key: the client's `CertificateVerify`
+    /// is produced out-of-band via the suspend/resume API, and the server (which
+    /// requires and verifies client auth) completes the handshake — proving the
+    /// externally-produced client signature verified.
+    #[test]
+    fn client_mtls_external_signing_round_trips() {
+        const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+        let (server_key, server_leaf) = ecdsa_identity(b"mtls-server", "srv.example");
+        let (client_key, client_leaf) = ecdsa_identity(b"mtls-client", "cli.example");
+
+        // Server: inline identity; requires + verifies client auth against the
+        // client's self-signed cert as trust anchor.
+        let mut roots = crate::tls::RootCertStore::new();
+        roots.add_der(client_leaf.clone()).unwrap();
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![server_leaf],
+                super::super::config::SigningKey::Ecdsa(server_key),
+            )
+            .client_auth(crate::tls::ClientAuth::new(roots, true))
+            .build();
+
+        // Client: external identity; does not verify the server here.
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("srv.example")
+            .identity(
+                alloc::vec![client_leaf],
+                super::super::config::SigningKey::External {
+                    schemes: alloc::vec![ECDSA_SECP256R1_SHA256],
+                },
+            )
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let mut signed = false;
+        for _ in 0..32 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            loop {
+                let out = server.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                client.feed(&out).unwrap();
+            }
+            // The client suspends to sign its own CertificateVerify.
+            if let Some(req) = client.signature_request() {
+                assert_eq!(req.scheme, ECDSA_SECP256R1_SHA256);
+                let sig = client_key
+                    .sign::<Sha256>(&req.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                client.provide_signature(sig).unwrap();
+                signed = true;
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            signed,
+            "the client must have requested an external signature"
+        );
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "external-signed client mTLS handshake must complete and verify"
         );
     }
 
