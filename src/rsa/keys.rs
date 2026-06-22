@@ -225,7 +225,9 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// and never trip this; only a key assembled from unchecked components
     /// via [`Self::new`] can.
     pub fn raw(&self, m: &Uint<LIMBS>) -> Uint<LIMBS> {
-        MontModulus::new(self.n).pow(m, &self.e)
+        // `e` is public, so use the public-exponent ladder (~17 squarings for
+        // e = 65537) rather than the secret-width constant-time `pow`.
+        MontModulus::new(self.n).pow_public(m, &self.e)
     }
 }
 

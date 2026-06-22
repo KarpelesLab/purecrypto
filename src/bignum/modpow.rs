@@ -36,6 +36,39 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         self.from_mont(&acc)
     }
 
+    /// Computes `base^exp mod N` for a **public** exponent.
+    ///
+    /// Square-and-multiply-*always* exactly like [`pow`](Self::pow) — branchless
+    /// and leaking nothing about `base` — but it iterates `exp.bit_len()` times
+    /// instead of padding to the full modulus width, so its running time depends
+    /// on `exp`. **`exp` must be public** (e.g. an RSA public exponent in
+    /// verify/encrypt, where both `exp` and `base` are public); never call it
+    /// with a secret exponent — use [`pow`](Self::pow) for those. For the common
+    /// RSA `e = 65537` this replaces ~2048 squarings with ~17.
+    pub fn pow_public(&self, base: &Uint<LIMBS>, exp: &Uint<LIMBS>) -> Uint<LIMBS> {
+        let base_m = self.to_mont(base);
+        // Montgomery form of 1 is R mod N.
+        let mut acc = self.to_mont(&Uint::ONE);
+
+        let bits = exp.bit_len();
+        // base^0 = 1.
+        if bits == 0 {
+            return self.from_mont(&acc);
+        }
+        let exp = exp.as_limbs();
+        let mut i = bits;
+        while i > 0 {
+            i -= 1;
+            acc = self.mont_mul(&acc, &acc);
+            let multiplied = self.mont_mul(&acc, &base_m);
+            let set = Choice::from(((exp[i / 64] >> (i % 64)) & 1) as u8);
+            // Take the multiplied value when the exponent bit is set.
+            acc = Uint::conditional_select(&multiplied, &acc, set);
+        }
+
+        self.from_mont(&acc)
+    }
+
     /// Computes the modular inverse `a^-1 mod N` **assuming `N` is prime**, via
     /// Fermat's little theorem (`a^(N-2) mod N`). Constant time.
     ///
@@ -79,6 +112,25 @@ mod tests {
                         .pow(&Uint::<2>::from_u64(base % n), &Uint::<2>::from_u64(e))
                         .as_limbs()[0];
                     assert_eq!(got, modexp_u64(base % n, e, n), "{base}^{e} mod {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pow_public_matches_pow() {
+        // The public-exponent ladder must return exactly the same value as the
+        // constant-time `pow` for every (base, exp); it only changes timing.
+        let moduli: [u64; 3] = [0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0001, 1_000_003];
+        let bases: [u64; 4] = [0, 2, 3, 0x1234_5678_9abc_def1];
+        let exps: [u64; 5] = [0, 1, 17, 65537, 0xdead_beef];
+        for &n in &moduli {
+            let m = MontModulus::new(Uint::<2>::from_u64(n));
+            for &base in &bases {
+                let b = Uint::<2>::from_u64(base % n);
+                for &e in &exps {
+                    let e = Uint::<2>::from_u64(e);
+                    assert_eq!(m.pow_public(&b, &e), m.pow(&b, &e), "{base}^{e:?} mod {n}");
                 }
             }
         }
