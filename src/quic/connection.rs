@@ -3812,11 +3812,18 @@ impl QuicConnection {
     /// `cid_local` for future stateless-reset emission (Phase 8 work,
     /// not exercised by Phase 7).
     fn issue_new_local_cids(&mut self, out: &mut Vec<u8>) {
+        // RFC 9000 §18.2 sets only a lower bound (>= 2) on the peer's
+        // active_connection_id_limit; the value is otherwise attacker-
+        // controlled and unbounded. Clamp it to a sane ceiling so a malicious
+        // peer cannot drive us to issue an unbounded number of local CIDs.
+        // The `.max(2)` mirrors the existing defensive lower bound (the parse
+        // step already rejects < 2).
         let limit = self
             .peer_params
             .as_ref()
             .and_then(|p| p.active_connection_id_limit)
-            .unwrap_or(2);
+            .unwrap_or(2)
+            .clamp(2, 8);
         let pool = match self.cid_local.as_mut() {
             Some(p) => p,
             None => return,
