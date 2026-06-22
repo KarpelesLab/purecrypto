@@ -16,7 +16,8 @@ use alloc::vec::Vec;
 // which `Limb` satisfies; `BoxedUint` itself selects via an inherent method.
 
 /// `a + b + carry` over equal-length limb slices, returning `(sum, carry_out)`.
-fn adc_limbs(a: &[Limb], b: &[Limb], carry_in: Limb) -> (Vec<Limb>, Limb) {
+/// Shared with [`super::boxed_montgomery`].
+pub(crate) fn adc_limbs(a: &[Limb], b: &[Limb], carry_in: Limb) -> (Vec<Limb>, Limb) {
     let mut out = vec![0 as Limb; a.len()];
     let mut c = carry_in;
     for i in 0..a.len() {
@@ -28,7 +29,8 @@ fn adc_limbs(a: &[Limb], b: &[Limb], carry_in: Limb) -> (Vec<Limb>, Limb) {
 }
 
 /// `a - b - borrow` over equal-length limb slices, returning `(diff, borrow_out)`.
-fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, Limb) {
+/// Shared with [`super::boxed_montgomery`].
+pub(crate) fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, Limb) {
     let mut out = vec![0 as Limb; a.len()];
     let mut bo = borrow_in;
     for i in 0..a.len() {
@@ -40,7 +42,8 @@ fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, Limb) {
 }
 
 /// Selects `a` if `choice` is true, else `b`, limb-by-limb (constant time).
-fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> {
+/// Shared with [`super::boxed_montgomery`].
+pub(crate) fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> {
     (0..a.len())
         .map(|i| Limb::conditional_select(&a[i], &b[i], choice))
         .collect()

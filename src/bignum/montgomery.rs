@@ -12,8 +12,9 @@ use super::uint::{Limb, adc, sbb};
 use crate::ct::{Choice, ConditionallySelectable};
 
 /// Computes `n^-1 mod 2^64` for odd `n` via Newton's iteration (each step
-/// doubles the number of correct low bits; six steps cover 64 bits).
-const fn inv_mod_2_64(n: u64) -> u64 {
+/// doubles the number of correct low bits; six steps cover 64 bits). Shared
+/// with [`super::boxed_montgomery`].
+pub(crate) const fn inv_mod_2_64(n: u64) -> u64 {
     let mut x = 1u64; // correct mod 2 (n is odd)
     let mut i = 0;
     while i < 6 {

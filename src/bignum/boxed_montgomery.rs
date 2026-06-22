@@ -4,47 +4,13 @@
 //! multiplication and square-and-multiply-always exponentiation, over
 //! `Vec<Limb>` scratch so the modulus width is chosen at runtime.
 
-use super::boxed::BoxedUint;
+use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
+use super::montgomery::inv_mod_2_64;
 use super::mul::mac;
 use super::uint::{Limb, adc, sbb};
-use crate::ct::{Choice, ConditionallySelectable};
+use crate::ct::Choice;
 use alloc::vec;
 use alloc::vec::Vec;
-
-/// `n^-1 mod 2^64` for odd `n` (Newton's iteration).
-fn inv_mod_2_64(n: u64) -> u64 {
-    let mut x = 1u64;
-    let mut i = 0;
-    while i < 6 {
-        x = x.wrapping_mul(2u64.wrapping_sub(n.wrapping_mul(x)));
-        i += 1;
-    }
-    x
-}
-
-/// `a + b + carry` over equal-length limb slices, returning `(sum, carry_out)`.
-fn adc_limbs(a: &[Limb], b: &[Limb], carry_in: Limb) -> (Vec<Limb>, Limb) {
-    let mut out = vec![0 as Limb; a.len()];
-    let mut c = carry_in;
-    for i in 0..a.len() {
-        let (s, co) = adc(a[i], b[i], c);
-        out[i] = s;
-        c = co;
-    }
-    (out, c)
-}
-
-/// `a - b - borrow` over equal-length limb slices, returning `(diff, borrow_out)`.
-fn sbb_limbs(a: &[Limb], b: &[Limb], borrow_in: Limb) -> (Vec<Limb>, Limb) {
-    let mut out = vec![0 as Limb; a.len()];
-    let mut bo = borrow_in;
-    for i in 0..a.len() {
-        let (d, b) = sbb(a[i], b[i], bo);
-        out[i] = d;
-        bo = b;
-    }
-    (out, bo)
-}
 
 /// Best-effort wipe of a secret-dependent `Vec<Limb>` scratch buffer.
 ///
@@ -59,13 +25,6 @@ fn zeroize_limbs(v: &mut [Limb]) {
         *limb = 0;
     }
     let _ = core::hint::black_box(&v);
-}
-
-/// Selects `a` if `choice` is true, else `b`, limb-by-limb (constant time).
-fn select_limbs(a: &[Limb], b: &[Limb], choice: Choice) -> Vec<Limb> {
-    (0..a.len())
-        .map(|i| Limb::conditional_select(&a[i], &b[i], choice))
-        .collect()
 }
 
 /// `(a + b) mod n` for equal-length `a, b < n`.
