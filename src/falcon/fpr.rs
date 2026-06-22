@@ -377,6 +377,14 @@ impl Fpr {
             return 0;
         }
         let mag: u128 = if e >= 0 {
+            // Mirror the `sh >= 128` guard below: a shift `>= 128` is UB / a
+            // panic under overflow-checks, and any such magnitude is far beyond
+            // `i64` range anyway. Reachable from malformed imported keys (via
+            // `recompute_g`), which the caller rejects afterwards, so saturating
+            // rather than panicking is the safe behavior.
+            if e >= 128 {
+                return if s == 1 { i64::MIN } else { i64::MAX };
+            }
             m << e
         } else {
             let sh = (-e) as u32;
@@ -403,6 +411,11 @@ impl Fpr {
             return 0;
         }
         if e >= 0 {
+            // See `rint`: guard the `>= 128` shift to avoid a panic/UB on the
+            // out-of-range exponents reachable from malformed imported keys.
+            if e >= 128 {
+                return if s == 1 { i64::MIN } else { i64::MAX };
+            }
             let mag = m << e;
             return if s == 1 { -(mag as i64) } else { mag as i64 };
         }
@@ -427,6 +440,11 @@ impl Fpr {
             return 0;
         }
         let mag = if e >= 0 {
+            // See `rint`: guard the `>= 128` shift to avoid a panic/UB on the
+            // out-of-range exponents reachable from malformed imported keys.
+            if e >= 128 {
+                return if s == 1 { i64::MIN } else { i64::MAX };
+            }
             m << e
         } else {
             let sh = (-e) as u32;
