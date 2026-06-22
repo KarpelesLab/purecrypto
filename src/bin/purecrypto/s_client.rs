@@ -222,6 +222,7 @@ pub(crate) fn run(args: Args) {
     };
 
     let mut builder = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .versions(version.to_pc_version(), version.to_pc_version())
         .roots(roots)
         .server_name(server_name)

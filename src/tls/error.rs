@@ -220,6 +220,14 @@ pub enum Error {
     /// full default set — a typo'd suite ID must not re-enable suites the
     /// caller deliberately disabled.
     NoUsableCipherSuites,
+    /// A [`crate::tls::Config`] was passed to
+    /// [`crate::tls::Connection::client`] / [`server`](crate::tls::Connection::server)
+    /// without an entropy source. The sans-I/O engine takes randomness as an
+    /// input and never falls back to a default RNG, so the caller MUST install
+    /// one via [`crate::tls::ConfigBuilder::rng`] (e.g.
+    /// `.rng(alloc::sync::Arc::new(crate::rng::OsRng))` under `std`, or a
+    /// hardware [`crate::tls::EntropySource`]). Fail-closed at construction.
+    MissingEntropySource,
 }
 
 impl core::fmt::Display for Error {
@@ -257,6 +265,9 @@ impl core::fmt::Display for Error {
             }
             Error::NoUsableCipherSuites => {
                 f.write_str("cipher_suites restriction matches no supported cipher suite")
+            }
+            Error::MissingEntropySource => {
+                f.write_str("Config has no entropy source (set ConfigBuilder::rng)")
             }
         }
     }

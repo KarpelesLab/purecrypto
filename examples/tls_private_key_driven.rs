@@ -144,12 +144,14 @@ mod unix {
         // Install the key as a trait object — no key bytes, no transport, in
         // the server config. The caller is now key-agnostic.
         let server_cfg = Config::builder()
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .tls_only()
             .private_key(vec![cert_der], Arc::new(DeviceKey { key }))
             .build();
         let mut server = Connection::server(&server_cfg).expect("server config");
 
         let client_cfg = Config::builder()
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
             .tls_only()
             .verify_certificates(false)
             .server_name("device.example")

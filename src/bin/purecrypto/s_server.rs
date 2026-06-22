@@ -153,6 +153,7 @@ pub(crate) fn run(args: Args) {
     let key = load_signing_key(key_path);
 
     let mut builder = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .versions(version.to_pc_version(), version.to_pc_version())
         .identity(chain, key)
         .max_record_size(mtu);

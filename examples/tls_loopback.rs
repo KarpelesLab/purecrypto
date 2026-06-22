@@ -23,6 +23,7 @@ fn main() {
 
     let server_key = BoxedRsaPrivateKey::from_pkcs1_pem(SERVER_KEY_PEM).unwrap();
     let server_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .identity(vec![cert_der.clone()], SigningKey::Rsa(server_key))
         .build();
@@ -32,6 +33,7 @@ fn main() {
     let mut roots = RootCertStore::new();
     roots.add_der(cert_der).unwrap();
     let client_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .roots(roots)
         .server_name("example.test")

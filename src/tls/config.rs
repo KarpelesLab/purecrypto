@@ -324,9 +324,7 @@ pub struct Config {
     /// Transparent pluggable private key (TPM/HSM or in-process), installed via
     /// [`ConfigBuilder::private_key`]. When set, the identity signature is
     /// brokered through this key during [`super::Connection::drive`] and the
-    /// caller never hand-manages the signature. `std` only (the key may own a
-    /// device file descriptor). See [`super::PrivateKey`].
-    #[cfg(feature = "std")]
+    /// caller never hand-manages the signature. See [`super::PrivateKey`].
     pub signer: Option<Arc<dyn super::signer::PrivateKey>>,
 }
 
@@ -341,6 +339,21 @@ pub struct Config {
 pub trait EntropySource: Send + Sync {
     /// Fills `dest` entirely with cryptographically secure random bytes.
     fn fill(&self, dest: &mut [u8]);
+}
+
+/// The platform [`OsRng`](crate::rng::OsRng) as an [`EntropySource`], so a
+/// `std` caller can opt into OS entropy explicitly with
+/// `.rng(alloc::sync::Arc::new(OsRng))`. There is no implicit default: a
+/// sans-I/O engine takes entropy as an input, so the source is always chosen
+/// by the caller.
+#[cfg(all(feature = "std", any(unix, windows)))]
+impl EntropySource for crate::rng::OsRng {
+    fn fill(&self, dest: &mut [u8]) {
+        use crate::rng::RngCore;
+        // `OsRng` is a stateless ZST; a fresh value is equivalent.
+        let mut r = crate::rng::OsRng;
+        r.fill_bytes(dest);
+    }
 }
 
 impl Default for Config {
@@ -382,7 +395,6 @@ impl Default for Config {
             max_record_size: 1200,
             key_log: None,
             rng: None,
-            #[cfg(feature = "std")]
             signer: None,
         }
     }
@@ -496,8 +508,7 @@ impl ConfigBuilder {
     ///
     /// The engine advertises `key.schemes()` and parks at the identity
     /// signature; [`super::Connection::drive`] then brokers the signature
-    /// through `key` so the caller never hand-manages it. `std` only.
-    #[cfg(feature = "std")]
+    /// through `key` so the caller never hand-manages it.
     pub fn private_key(
         mut self,
         chain: Vec<Vec<u8>>,

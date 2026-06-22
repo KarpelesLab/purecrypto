@@ -93,6 +93,7 @@ fn run_accept_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
 
     // Server: real Ed25519 identity + ECH server with the matching ring.
     let server_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .identity(vec![cert_der.to_vec()], SigningKey::Ed25519(key.clone()))
         .ech_server(EchServer::new(ring, list.clone()))
@@ -103,6 +104,7 @@ fn run_accept_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
     let mut roots = RootCertStore::new();
     roots.add_der(cert_der.to_vec()).unwrap();
     let client_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .roots(roots)
         .server_name(INNER_SNI)
@@ -146,6 +148,7 @@ fn run_reject_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
     let ring = EchKeyRing::from_pairs(vec![server_side]);
 
     let server_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .identity(vec![cert_der.to_vec()], SigningKey::Ed25519(key.clone()))
         .ech_server(EchServer::new(ring, fresh_list))
@@ -155,6 +158,7 @@ fn run_reject_scenario(cert_der: &[u8], key: &Ed25519PrivateKey) {
     let mut roots = RootCertStore::new();
     roots.add_der(cert_der.to_vec()).unwrap();
     let client_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .roots(roots)
         // Outer-CH verification path: client connects to the

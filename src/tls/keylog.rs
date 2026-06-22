@@ -123,7 +123,9 @@ pub fn file_keylog(path: &std::path::Path) -> std::io::Result<Arc<WriterKeyLog<s
     Ok(Arc::new(WriterKeyLog::new(f)))
 }
 
-/// Appends `bytes` as lowercase hex to `out`.
+/// Appends `bytes` as lowercase hex to `out`. Only the `std` `WriterKeyLog`
+/// uses it; `no_std` builds have no built-in keylog sink.
+#[cfg(feature = "std")]
 fn append_hex(out: &mut alloc::string::String, bytes: &[u8]) {
     for b in bytes {
         out.push(char::from_digit((b >> 4) as u32, 16).unwrap());

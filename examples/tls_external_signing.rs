@@ -46,6 +46,7 @@ fn main() {
     let cert_der = cert.to_der().to_vec();
 
     let server_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .identity(
             vec![cert_der.clone()],
@@ -61,6 +62,7 @@ fn main() {
     let mut roots = RootCertStore::new();
     roots.add_der(cert_der).unwrap();
     let client_cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .roots(roots)
         .server_name("example.test")

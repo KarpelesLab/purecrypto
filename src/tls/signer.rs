@@ -29,9 +29,9 @@
 //! building on bare targets.
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 
+#[cfg(feature = "std")]
 use super::config::SigningKey;
 use super::error::Error;
 
@@ -111,15 +111,17 @@ pub enum SignProgress {
 /// obtained from [`AsFd`](std::os::fd::AsFd) must not outlive that.
 #[derive(Clone, Copy)]
 pub struct Readiness {
-    #[cfg(unix)]
+    #[cfg(all(feature = "std", unix))]
     fd: core::ffi::c_int,
 }
 
 impl Readiness {
     /// Wrap a raw, borrowed file descriptor. The caller (a [`SignOp`]
     /// implementation) guarantees the fd outlives this token, i.e. is not
-    /// closed before the next `resume`.
-    #[cfg(unix)]
+    /// closed before the next `resume`. Only available on `std` + unix; on
+    /// other targets a [`SignOp`] cannot construct a `Readiness` and must
+    /// report no readiness (the caller busy-polls via `resume`).
+    #[cfg(all(feature = "std", unix))]
     pub fn from_raw_fd(fd: core::ffi::c_int) -> Self {
         Readiness { fd }
     }
@@ -129,8 +131,9 @@ impl Readiness {
     /// their reactor via the [`AsFd`](std::os::fd::AsFd) /
     /// [`AsRawFd`](std::os::fd::AsRawFd) impls instead.
     ///
-    /// On non-unix platforms this is a no-op (device keys there report no
-    /// readiness and are simply re-polled).
+    /// `std` only (it blocks on `poll(2)` and returns [`std::io::Result`]). On
+    /// non-unix `std` it is a no-op (device keys there report no readiness).
+    #[cfg(feature = "std")]
     pub fn wait(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -168,14 +171,14 @@ impl Readiness {
 // takes the `Readiness` token directly, so the caller registers readiness with
 // its reactor without ever learning what device is behind the fd. `std` only
 // (the module is `#[cfg(feature = "std")]`), unix only (fds).
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl std::os::fd::AsRawFd for Readiness {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.fd
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 impl std::os::fd::AsFd for Readiness {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         // SAFETY: the fd is owned by the SignOp and valid until its next
@@ -188,7 +191,7 @@ impl std::os::fd::AsFd for Readiness {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "std", unix))]
 mod sys {
     //! Minimal direct `poll(2)` binding. Declared inline rather than via a
     //! foreign crate, matching the `arc4random_buf` extern in `crate::rng`. The
@@ -235,10 +238,16 @@ mod sys {
 /// [`EntropySource`](super::EntropySource) on the `Config`. Callers needing the
 /// config RNG for in-process signing should use
 /// [`ConfigBuilder::identity`](super::ConfigBuilder::identity) instead.
+///
+/// `std` only: it draws salts from [`OsRng`](crate::rng::OsRng). A `no_std`
+/// caller implements [`PrivateKey`] for its own (device or in-process) key
+/// directly.
+#[cfg(feature = "std")]
 pub struct LocalSigner {
     key: SigningKey,
 }
 
+#[cfg(feature = "std")]
 impl LocalSigner {
     /// Wrap an in-process [`SigningKey`]. Intended for the in-process variants
     /// (`Rsa`/`Ecdsa`/`Ed25519`/`Ed448`/`MlDsa*`); wrapping
@@ -249,10 +258,11 @@ impl LocalSigner {
     }
 }
 
+#[cfg(feature = "std")]
 impl PrivateKey for LocalSigner {
     fn schemes(&self) -> Vec<u16> {
         let server_key = self.key.to_server_key_13();
-        vec![super::crypto::signature_scheme_for(&server_key).0]
+        alloc::vec![super::crypto::signature_scheme_for(&server_key).0]
     }
 
     fn start_sign(&self, _scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error> {
@@ -267,10 +277,12 @@ impl PrivateKey for LocalSigner {
 }
 
 /// A trivial [`SignOp`] holding an already-computed signature.
+#[cfg(feature = "std")]
 struct ReadySignOp {
     sig: Option<Vec<u8>>,
 }
 
+#[cfg(feature = "std")]
 impl SignOp for ReadySignOp {
     fn resume(&mut self) -> Result<SignProgress, Error> {
         match self.sig.take() {

@@ -76,6 +76,13 @@ jobs:
       - name: Build ec + der without x509
         run: cargo build --target ${{ matrix.target }} --no-default-features --features ec,der
 
+      # The sans-I/O TLS/DTLS engine must build without `std`: it takes entropy
+      # as a caller-supplied `EntropySource` and never reaches for `OsRng`.
+      # Run on the hosted target only (the alloc `Arc` it uses needs atomics).
+      - name: Build no_std TLS/DTLS engine
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features tls,dtls,mldsa
+
   msrv:
     name: MSRV (Rust 1.88)
     runs-on: ubuntu-latest

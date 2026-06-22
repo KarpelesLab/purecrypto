@@ -10,41 +10,40 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use crate::rng::{CryptoRng, OsRng, RngCore};
+use crate::rng::{CryptoRng, RngCore};
 
 use super::config::Config;
 use super::error::Error;
 use super::version::ProtocolVersion;
 
-/// Type-erased RNG the public [`Connection`] hands to its engines, so the
-/// `OsRng` default and a caller-supplied
-/// [`EntropySource`](super::config::EntropySource) share one concrete type
-/// (the per-(version, role) engines are generic over `R: RngCore`, but the
-/// public enum cannot be).
-enum ConfigRng {
-    Os(OsRng),
-    Shared(alloc::sync::Arc<dyn super::config::EntropySource>),
-}
+/// Type-erased RNG the public [`Connection`] hands to its engines: the
+/// caller-supplied [`EntropySource`](super::config::EntropySource), wrapped so
+/// it satisfies the `R: RngCore` bound the per-(version, role) engines are
+/// generic over (the public enum itself cannot be generic).
+///
+/// There is deliberately no `OsRng` default — a sans-I/O engine takes entropy
+/// as an input, so the caller must always supply a source via
+/// [`ConfigBuilder::rng`](super::ConfigBuilder::rng). `OsRng` is just one
+/// [`EntropySource`] the caller may choose to pass.
+struct ConfigRng(alloc::sync::Arc<dyn super::config::EntropySource>);
 
 impl RngCore for ConfigRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
-        match self {
-            ConfigRng::Os(r) => r.fill_bytes(dest),
-            ConfigRng::Shared(s) => s.fill(dest),
-        }
+        self.0.fill(dest);
     }
 }
 
-// The configured source is contractually a CSPRNG — `OsRng`, or an
-// `EntropySource` the caller promises is cryptographically secure — so it is
-// valid wherever the engines require `CryptoRng`.
+// The configured source is contractually a CSPRNG — the caller promises the
+// `EntropySource` is cryptographically secure — so it is valid wherever the
+// engines require `CryptoRng`.
 impl CryptoRng for ConfigRng {}
 
-/// The engine RNG for `cfg`: the caller's [`EntropySource`] if set, else `OsRng`.
-fn config_rng(cfg: &Config) -> ConfigRng {
+/// The engine RNG for `cfg`. Errors with [`Error::MissingEntropySource`] when
+/// the caller did not install one: the engine never falls back to a default.
+fn config_rng(cfg: &Config) -> Result<ConfigRng, Error> {
     match &cfg.rng {
-        Some(src) => ConfigRng::Shared(src.clone()),
-        None => ConfigRng::Os(OsRng),
+        Some(src) => Ok(ConfigRng(src.clone())),
+        None => Err(Error::MissingEntropySource),
     }
 }
 
@@ -73,7 +72,6 @@ pub enum HandshakeStatus {
 ///
 /// `#[non_exhaustive]`: future drive reasons can be added without breaking
 /// exhaustive matches.
-#[cfg(feature = "std")]
 #[non_exhaustive]
 pub enum Step {
     /// The engine needs bytes from the peer: read the socket and
@@ -121,11 +119,9 @@ pub struct Connection {
     pending_dtls: alloc::collections::VecDeque<Vec<u8>>,
     /// Transparent pluggable signer (from [`Config::signer`]), brokered by
     /// [`Connection::drive`]. `None` when the identity signs in-process.
-    #[cfg(feature = "std")]
     signer: Option<alloc::sync::Arc<dyn super::signer::PrivateKey>>,
     /// The in-flight external signing operation, while [`Connection::drive`] is
     /// waiting on the signer's device.
-    #[cfg(feature = "std")]
     active_sign: Option<Box<dyn super::signer::SignOp>>,
 }
 
@@ -173,9 +169,7 @@ impl Connection {
         Ok(Connection {
             inner,
             pending_dtls: alloc::collections::VecDeque::new(),
-            #[cfg(feature = "std")]
             signer: config.signer.clone(),
-            #[cfg(feature = "std")]
             active_sign: None,
         })
     }
@@ -205,9 +199,7 @@ impl Connection {
         Ok(Connection {
             inner,
             pending_dtls: alloc::collections::VecDeque::new(),
-            #[cfg(feature = "std")]
             signer: config.signer.clone(),
-            #[cfg(feature = "std")]
             active_sign: None,
         })
     }
@@ -260,7 +252,6 @@ impl Connection {
     /// # Ok(())
     /// # }
     /// ```
-    #[cfg(feature = "std")]
     pub fn drive(&mut self) -> Result<Step, Error> {
         // If the engine has parked awaiting the identity signature, broker it
         // through the installed PrivateKey rather than asking the caller.
@@ -709,7 +700,7 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
     let server_name = client_server_name(cfg)?;
-    super::conn::ClientConnection::new(cc, server_name, &mut config_rng(cfg))
+    super::conn::ClientConnection::new(cc, server_name, &mut config_rng(cfg)?)
 }
 
 fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, Error> {
@@ -747,7 +738,7 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         }
     }
     let server_name = client_server_name(cfg)?;
-    super::conn::ClientConnection12::new(cc, server_name, &mut config_rng(cfg))
+    super::conn::ClientConnection12::new(cc, server_name, &mut config_rng(cfg)?)
 }
 
 fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<ConfigRng>, Error> {
@@ -826,7 +817,7 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
         sc = sc.with_verification_time(t);
     }
     sc.key_log = cfg.key_log.clone();
-    Ok(super::conn::ServerConnection::new(sc, config_rng(cfg)))
+    Ok(super::conn::ServerConnection::new(sc, config_rng(cfg)?))
 }
 
 fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<ConfigRng>, Error> {
@@ -864,7 +855,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     {
         sc = sc.with_min_version(cfg.min_version);
     }
-    Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)))
+    Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)?))
 }
 
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
@@ -884,7 +875,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     Ok(crate::dtls::DtlsClientConnection12::new(
         dc,
         Vec::new(),
-        &mut config_rng(cfg),
+        &mut config_rng(cfg)?,
     ))
 }
 
@@ -906,7 +897,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     Ok(crate::dtls::DtlsClientConnection13::new(
         dc,
         Vec::new(),
-        &mut config_rng(cfg),
+        &mut config_rng(cfg)?,
     ))
 }
 
@@ -947,7 +938,7 @@ fn build_dtls12_server(
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),
-        config_rng(cfg),
+        config_rng(cfg)?,
     ))
 }
 
@@ -974,7 +965,7 @@ fn build_dtls13_server(
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
         Vec::new(),
-        config_rng(cfg),
+        config_rng(cfg)?,
     ))
 }
 
@@ -1036,6 +1027,7 @@ mod tests {
         )
         .unwrap();
         Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(max_version, max_version)
             .identity(
                 alloc::vec![cert.to_der().to_vec()],
@@ -1098,7 +1090,10 @@ mod tests {
             ProtocolVersion::DTLSv1_2,
         ] {
             // verify on (default) + no server_name → rejected at construction.
-            let cfg = Config::builder().versions(v, v).build();
+            let cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(v, v)
+                .build();
             assert!(cfg.verify_certificates && cfg.server_name.is_none());
             match Connection::client(&cfg) {
                 Err(Error::MissingServerName) => {}
@@ -1108,6 +1103,7 @@ mod tests {
 
             // verify off + no server_name → allowed (no SNI, no hostname check).
             let cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
                 .versions(v, v)
                 .verify_certificates(false)
                 .build();
@@ -1119,6 +1115,7 @@ mod tests {
 
             // With an explicit server_name, construction succeeds either way.
             let cfg = Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
                 .versions(v, v)
                 .verify_certificates(false)
                 .server_name("example.test")
@@ -1136,6 +1133,7 @@ mod tests {
     fn cipher_suite_restriction_with_no_match_fails_closed() {
         let client_cfg = |max: ProtocolVersion, suites: &[u16]| {
             Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
                 .versions(max, max)
                 .verify_certificates(false)
                 .server_name("example.test")
@@ -1169,6 +1167,7 @@ mod tests {
 
         // Unset (None) keeps meaning "offer the defaults".
         let cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("example.test")
@@ -1236,6 +1235,7 @@ mod tests {
         // TLS 1.3 client (cipher selected from ServerHello — None
         // before any bytes flow in).
         let cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .tls_only()
             .server_name("suite.example")
             .build();
@@ -1245,6 +1245,7 @@ mod tests {
 
         // TLS 1.3 server (cipher selected during ClientHello dispatch).
         let cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .tls_only()
             .identity(
                 alloc::vec![cert.to_der().to_vec()],
@@ -1298,6 +1299,7 @@ mod tests {
             .rng(source)
             .build();
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("rng.example")
@@ -1331,6 +1333,55 @@ mod tests {
             client.is_handshake_complete() && server.is_handshake_complete(),
             "TLS 1.3 handshake must complete using the injected EntropySource"
         );
+    }
+
+    /// The sans-I/O engine never invents entropy: a `Config` with no
+    /// `EntropySource` fails closed at construction rather than reaching for a
+    /// hidden `OsRng`. Covers both roles across TLS and DTLS.
+    #[test]
+    fn construction_requires_an_entropy_source() {
+        for v in [
+            ProtocolVersion::TLSv1_3,
+            ProtocolVersion::TLSv1_2,
+            ProtocolVersion::DTLSv1_3,
+            ProtocolVersion::DTLSv1_2,
+        ] {
+            // Client: no rng, verification off + a name so server_name is not
+            // the failure → the missing entropy source must be what trips.
+            let client_cfg = Config::builder()
+                .versions(v, v)
+                .verify_certificates(false)
+                .server_name("rng.example")
+                .build();
+            assert!(client_cfg.rng.is_none());
+            assert!(matches!(
+                Connection::client(&client_cfg),
+                Err(Error::MissingEntropySource)
+            ));
+
+            // Same config but WITH an OsRng source constructs fine.
+            let ok_cfg = Config::builder()
+                .versions(v, v)
+                .verify_certificates(false)
+                .server_name("rng.example")
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .build();
+            assert!(Connection::client(&ok_cfg).is_ok());
+        }
+
+        // Server path (TLS 1.3): an identity but no rng → MissingEntropySource.
+        let (key, leaf) = ecdsa_p256_identity();
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![leaf],
+                super::super::config::SigningKey::Ecdsa(key),
+            )
+            .build();
+        assert!(matches!(
+            Connection::server(&server_cfg),
+            Err(Error::MissingEntropySource)
+        ));
     }
 
     /// A self-signed ECDSA P-256 leaf + its key (seeded for reproducibility),
@@ -1373,6 +1424,7 @@ mod tests {
         let (key, leaf) = ecdsa_p256_identity();
 
         let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .identity(
                 alloc::vec![leaf],
@@ -1382,6 +1434,7 @@ mod tests {
             )
             .build();
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("ext.example")
@@ -1446,6 +1499,7 @@ mod tests {
         let mut roots = crate::tls::RootCertStore::new();
         roots.add_der(client_leaf.clone()).unwrap();
         let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .identity(
                 alloc::vec![server_leaf],
@@ -1456,6 +1510,7 @@ mod tests {
 
         // Client: external identity; does not verify the server here.
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("srv.example")
@@ -1519,6 +1574,7 @@ mod tests {
         let (key, leaf) = ecdsa_identity(b"dtls-ext", "dtls.example");
 
         let mut server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::DTLSv1_3, ProtocolVersion::DTLSv1_3)
             .identity(
                 alloc::vec![leaf],
@@ -1530,6 +1586,7 @@ mod tests {
         // Keep the test single-round: skip the cookie exchange.
         server_cfg.require_cookie = false;
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::DTLSv1_3, ProtocolVersion::DTLSv1_3)
             .verify_certificates(false)
             .server_name("dtls.example")
@@ -1587,6 +1644,7 @@ mod tests {
         let (key, leaf) = ecdsa_identity(b"dtls12-ext", "dtls12.example");
 
         let mut server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_2)
             .identity(
                 alloc::vec![leaf],
@@ -1598,6 +1656,7 @@ mod tests {
         // Keep the test single-round: skip the cookie exchange.
         server_cfg.require_cookie = false;
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_2)
             .verify_certificates(false)
             .server_name("dtls12.example")
@@ -1654,6 +1713,7 @@ mod tests {
         const UNOFFERED: u16 = 0xFFFF;
         let (_key, leaf) = ecdsa_p256_identity();
         let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .identity(
                 alloc::vec![leaf],
@@ -1663,6 +1723,7 @@ mod tests {
             )
             .build();
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("ext.example")
@@ -1691,6 +1752,7 @@ mod tests {
 
         let (key, leaf) = ecdsa_p256_identity();
         let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .private_key(
                 alloc::vec![leaf],
@@ -1700,6 +1762,7 @@ mod tests {
             )
             .build();
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("ext.example")
@@ -1810,10 +1873,12 @@ mod tests {
 
         let (key, leaf) = ecdsa_p256_identity();
         let server_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .private_key(alloc::vec![leaf], Arc::new(DeviceKey { key }))
             .build();
         let client_cfg = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
             .verify_certificates(false)
             .server_name("ext.example")

@@ -174,6 +174,7 @@ fn pc_client_vs_openssl_server(
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     let cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .min_version(version)
         .max_version(version)
@@ -267,6 +268,7 @@ fn pc_server_vs_openssl_client(
     sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
 
     let cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .min_version(version)
         .max_version(version)

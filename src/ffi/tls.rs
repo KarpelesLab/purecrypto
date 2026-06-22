@@ -183,6 +183,7 @@ impl PcTlsCfg {
 
     fn build_config(&self) -> Option<Config> {
         let mut b: ConfigBuilder = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
             .versions(
                 self.version.to_protocol_version(),
                 self.version.to_protocol_version(),

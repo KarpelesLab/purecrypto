@@ -25,6 +25,7 @@ fn main() {
         load_system_roots()
     };
     let cfg = Config::builder()
+        .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .tls_only()
         .roots(roots)
         .server_name(HOST)
