@@ -65,12 +65,21 @@ fn read_password(args: &Args) -> Vec<u8> {
                      Pipe it in instead, e.g. `purecrypto kdf ... -password-file - < pw.txt`"
                 );
             }
-            let mut line = String::new();
+            // Read raw bytes (not via `read_line`/`String`) so the typed
+            // passphrase never lands in an intermediate buffer we cannot wipe:
+            // the crate denies `unsafe` outside `src/ffi/`, so we could not call
+            // `String::as_bytes_mut()` to zero a `String`'s backing store. With
+            // a `Vec<u8>` we own the bytes outright. The returned Vec IS this
+            // buffer (no copy), and the derived `pw` is `zero_buf`-ed by the
+            // caller, matching the wipe the non-interactive `read_secret_file`
+            // path already gets downstream. (`BufRead` is already in scope from
+            // the `use` above, providing `read_until`.)
+            let mut line: Vec<u8> = Vec::new();
             std::io::stdin()
                 .lock()
-                .read_line(&mut line)
+                .read_until(b'\n', &mut line)
                 .unwrap_or_else(|e| die(format!("cannot read stdin: {e}")));
-            line.into_bytes()
+            line
         } else {
             read_secret_file(p)
         };
@@ -82,6 +91,28 @@ fn read_password(args: &Args) -> Vec<u8> {
         return out;
     }
     die("missing -password STR or -password-file FILE");
+}
+
+/// Sane lower bounds for password-hashing work factors. Below these the
+/// derived key is cheap to brute-force; we WARN (never hard-fail, to avoid
+/// breaking existing scripts and KAT/interop usage with deliberately tiny
+/// parameters) so an operator notices a trivially weak configuration. These
+/// floors are intentionally conservative — a passing value is the bare
+/// minimum, not a recommendation.
+mod work_factor {
+    /// PBKDF2 iteration count floor. OWASP's 2023 PBKDF2-HMAC-SHA256 guidance
+    /// is 600k; 100k is a generous lower bound below which we warn.
+    pub(super) const PBKDF2_MIN_ITER: u32 = 100_000;
+    /// scrypt cost-parameter floor (N, not log2 N). 2^15 = 32768 is the
+    /// commonly cited interactive minimum.
+    pub(super) const SCRYPT_MIN_N: u32 = 1 << 15;
+    /// Argon2 time-cost (passes) floor. RFC 9106 requires t >= 1; a single
+    /// pass is the weakest legal setting, so warn below 2.
+    pub(super) const ARGON2_MIN_T_COST: u32 = 2;
+    /// Argon2 memory-cost floor in KiB. 8 MiB is well under modern guidance
+    /// (RFC 9106's second recommended option is 64 MiB) but flags the truly
+    /// tiny configurations that offer little memory-hardness.
+    pub(super) const ARGON2_MIN_M_COST_KIB: u32 = 8 * 1024;
 }
 
 fn emit(args: &Args, out: &[u8]) {
@@ -164,6 +195,13 @@ fn run_pbkdf2(args: Args) {
         .value("-iter")
         .map(|s| parse_u32_flag(s, "-iter"))
         .unwrap_or_else(|| die("missing -iter N"));
+    if iter < work_factor::PBKDF2_MIN_ITER {
+        eprintln!(
+            "purecrypto: warning: -iter {iter} is below the recommended minimum of {} \
+             for PBKDF2; the derived key will be cheap to brute-force",
+            work_factor::PBKDF2_MIN_ITER
+        );
+    }
     let len = parse_len_capped(&args, None);
 
     let mut out = vec![0u8; len];
@@ -200,6 +238,13 @@ fn run_scrypt(args: Args) {
     // -n is N, but the library takes log2(N). Validate that N is a power of two.
     if n == 0 || (n & (n - 1)) != 0 {
         die(format!("-n must be a power of two (got {n})"));
+    }
+    if n < work_factor::SCRYPT_MIN_N {
+        eprintln!(
+            "purecrypto: warning: -n {n} is below the recommended minimum of {} (2^15) \
+             for scrypt; the derived key offers little memory-hardness",
+            work_factor::SCRYPT_MIN_N
+        );
     }
     let log_n = n.trailing_zeros() as u8;
 
@@ -241,6 +286,20 @@ fn run_argon2(args: Args) {
         .or_else(|| args.value("--p"))
         .map(|s| parse_u32_flag(s, "-p"))
         .unwrap_or(1);
+    if t_cost < work_factor::ARGON2_MIN_T_COST {
+        eprintln!(
+            "purecrypto: warning: -t-cost {t_cost} is below the recommended minimum of {} \
+             passes for Argon2; the derived key will be cheaper to attack",
+            work_factor::ARGON2_MIN_T_COST
+        );
+    }
+    if m_cost < work_factor::ARGON2_MIN_M_COST_KIB {
+        eprintln!(
+            "purecrypto: warning: -m-cost {m_cost} KiB is below the recommended minimum of {} KiB \
+             for Argon2; the derived key offers little memory-hardness",
+            work_factor::ARGON2_MIN_M_COST_KIB
+        );
+    }
     let len = parse_len_capped(&args, None);
 
     let params = Argon2Params {
