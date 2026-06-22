@@ -606,13 +606,17 @@ impl ServerConfig {
     /// doing so is idempotent.
     ///
     /// Anti-replay (RFC 8446 §8): the server always enforces the §8.2
-    /// ticket-age freshness window (~10 s), which bounds how long a
-    /// captured 0-RTT flight stays replayable but does NOT detect replays
-    /// inside that window. Deployments acting on early data should also
-    /// install a [`Self::with_replay_window`] shared across all server
-    /// instances that accept the same ticket key. On `no_std` builds
-    /// (no wall clock) the freshness check is unavailable and the
-    /// `ReplayWindow` is the only line of defense.
+    /// ticket-age freshness window (~10 s) when a wall clock is available,
+    /// which bounds how long a captured 0-RTT flight stays replayable but
+    /// does NOT detect replays inside that window. Deployments acting on
+    /// early data should also install a [`Self::with_replay_window`] shared
+    /// across all server instances that accept the same ticket key.
+    ///
+    /// If neither defense is active for a given flight — i.e. there is no
+    /// wall clock (`no_std`, or a clock that reads 0) AND no `ReplayWindow`
+    /// is installed — the server fails closed and refuses 0-RTT for that
+    /// flight, transparently falling back to the (replay-safe) 1-RTT
+    /// handshake rather than accepting undefended early data.
     pub fn with_max_early_data(mut self, max: u32) -> Self {
         self.max_early_data_size = max;
         self
@@ -1715,6 +1719,22 @@ impl<R: RngCore> ServerConnection<R> {
         {
             // Use the presented binder (first identity's) as the replay-key.
             // A repeat refuses 0-RTT but still allows 1-RTT resumption.
+            accept_early = false;
+        }
+
+        // Anti-replay floor (RFC 8446 §8 / Appendix E.5): never accept 0-RTT
+        // unless some replay defense is actually active for this flight. The
+        // §8.2 freshness window only runs against a real clock; if it was
+        // skipped (`now == 0`, e.g. a no_std server with no wall clock) AND no
+        // ReplayWindow is installed, a captured early-data flight would be
+        // unboundedly replayable — so fall back to the spec-compliant 1-RTT
+        // path instead of silently accepting undefended 0-RTT.
+        #[cfg(feature = "std")]
+        let has_replay_window = self.config.replay_window.is_some();
+        #[cfg(not(feature = "std"))]
+        let has_replay_window = false;
+        let freshness_active = psk_state.as_ref().is_some_and(|s| s.age_checked);
+        if accept_early && !freshness_active && !has_replay_window {
             accept_early = false;
         }
 
@@ -2826,9 +2846,15 @@ struct AcceptedPsk {
     /// (de-obfuscated with `ticket_age_add`) agrees with the server-side
     /// expected age within [`MAX_TICKET_AGE_DEVIATION_MS`]. `false` refuses
     /// 0-RTT only — 1-RTT resumption proceeds normally. Always `true` when
-    /// the server has no wall clock (`no_std`), where freshness cannot be
-    /// assessed and anti-replay falls back to the optional `ReplayWindow`.
+    /// the server has no wall clock (`now == 0`, e.g. `no_std`), where
+    /// freshness cannot be assessed and anti-replay falls back to the
+    /// optional `ReplayWindow`.
     age_fresh: bool,
+    /// Whether the §8.2 freshness check actually ran against a real clock
+    /// (`now != 0`). When `false` the freshness window provided no
+    /// anti-replay protection, so 0-RTT is only safe if a `ReplayWindow`
+    /// is installed (see the 0-RTT acceptance floor in `process_client_hello`).
+    age_checked: bool,
 }
 
 /// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
@@ -2935,6 +2961,7 @@ impl<R: RngCore> ServerConnection<R> {
                 hash,
                 alpn,
                 age_fresh,
+                age_checked: now != 0,
             }));
         }
         Ok(None)
