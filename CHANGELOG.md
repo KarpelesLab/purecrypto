@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.15](https://github.com/KarpelesLab/purecrypto/compare/v0.6.14...v0.6.15) - 2026-06-22
+
+### Other
+
+- fail closed on 0-RTT with no active anti-replay defense
+- assert tree/leaf index lengths fit u64 in split_digest
+- constant-time PKCS#7 padding strip; clarify MIN_ITERATIONS
+- don't fatally close on STOP_SENDING/MAX_STREAM_DATA for an
+- zeroize const-generic ECDSA/ECDH private keys on drop
+- guard >=128 shifts in rint/floor/trunc (panic-DoS hardening)
+- public keygen/sign API + compact key serialization (Phase 5)
+- signing — ffSampling preimage + compression (Phase 4)
+- key generation — NTRUGen/NTRUSolve/Reduce + public key (Phase 3)
+- LDL tree (ffLDL) + fast-Fourier sampling (ffSampling) (Phase 2)
+- FFT over emulated double + constant-time Gaussian sampler (Phase 1)
+- emulated constant-time IEEE-754 double (Phase 0 of keygen+sign)
+- wire Brainpool curves into pc_ec_sign/verify (integration fixup)
+- add RFC 7292 PFX parse + build with OpenSSL interop
+- add FN-DSA (FIPS 206) signature verification (verify-only)
+- add RFC 5280 §6.1 policy-tree processing and RFC 6962 SCT/CT verification
+- add Brainpool curves (RFC 5639) with ECDSA support
+- add constant-time Camellia (RFC 3713) and ARIA (RFC 5794)
+
 ## [0.6.14](https://github.com/KarpelesLab/purecrypto/compare/v0.6.13...v0.6.14) - 2026-06-19
 
 ### Other
