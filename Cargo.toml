@@ -192,6 +192,12 @@ required-features = ["ech"]
 name = "tls_external_signing"
 required-features = ["tls"]
 
+# Transparent pluggable private keys: one drive() loop for in-process or
+# device (TPM/HSM) keys. Models the device with a unix-socket-backed thread.
+[[example]]
+name = "tls_private_key_driven"
+required-features = ["tls", "std"]
+
 # Legacy TLS 1.0/1.1 interop against the system `openssl` (run on demand:
 # `cargo run --example tls_legacy_interop --features tls-legacy`).
 [[example]]

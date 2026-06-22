@@ -30,7 +30,9 @@ pub(crate) use schedule::{
     traffic_key_iv,
 };
 #[allow(unused_imports)]
-pub(crate) use sign::{certificate_verify_content, sign_certificate_verify, verify_signature};
+pub(crate) use sign::{
+    certificate_verify_content, sign_certificate_verify, signature_scheme_for, verify_signature,
+};
 #[allow(unused_imports)]
 pub(crate) use suite::{
     AeadAlg, SuiteParams, lookup as lookup_suite, supported as supported_suites,

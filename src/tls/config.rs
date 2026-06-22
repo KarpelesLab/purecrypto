@@ -52,12 +52,20 @@ pub enum SigningKey {
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// ML-DSA-87.
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
-    /// An **external** signing key: no key material is held in-process. The
-    /// handshake yields [`HandshakeStatus::NeedsSignature`](crate::tls::HandshakeStatus)
-    /// when it needs the `CertificateVerify` signature; the caller signs the
-    /// supplied message out-of-band (e.g. on a TPM/HSM, synchronously or
-    /// `.await`ed) and resumes with
+    /// An **external** signing key: no key material is held in-process. When the
+    /// handshake needs the `CertificateVerify` (or DTLS 1.2 `ServerKeyExchange`)
+    /// signature it suspends; the caller fetches the bytes via
+    /// [`Connection::signature_request`](crate::tls::Connection::signature_request),
+    /// signs them out-of-band (e.g. on a TPM/HSM, synchronously or `.await`ed),
+    /// and resumes with
     /// [`Connection::provide_signature`](crate::tls::Connection::provide_signature).
+    ///
+    /// This is the low-level seam. For a transparent, key-agnostic experience —
+    /// where the caller installs a [`PrivateKey`](crate::tls::PrivateKey) and
+    /// drives the handshake with [`Connection::drive`](crate::tls::Connection::drive),
+    /// never hand-managing the signature — use
+    /// [`ConfigBuilder::private_key`](crate::tls::ConfigBuilder::private_key)
+    /// instead (`std` only).
     ///
     /// `schemes` lists the IANA `SignatureScheme` code points the external key
     /// can produce (RFC 8446 §4.2.3 — e.g. `0x0804` rsa_pss_rsae_sha256,
@@ -312,6 +320,14 @@ pub struct Config {
     /// entropy through a hardware device (TPM/HSM). Shared (`Arc`) across every
     /// connection built from this `Config`.
     pub rng: Option<Arc<dyn EntropySource>>,
+
+    /// Transparent pluggable private key (TPM/HSM or in-process), installed via
+    /// [`ConfigBuilder::private_key`]. When set, the identity signature is
+    /// brokered through this key during [`super::Connection::drive`] and the
+    /// caller never hand-manages the signature. `std` only (the key may own a
+    /// device file descriptor). See [`super::PrivateKey`].
+    #[cfg(feature = "std")]
+    pub signer: Option<Arc<dyn super::signer::PrivateKey>>,
 }
 
 /// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
@@ -366,6 +382,8 @@ impl Default for Config {
             max_record_size: 1200,
             key_log: None,
             rng: None,
+            #[cfg(feature = "std")]
+            signer: None,
         }
     }
 }
@@ -471,6 +489,27 @@ impl ConfigBuilder {
             cert_chain: chain,
             key,
         });
+        self
+    }
+    /// Install a cert chain + a transparent pluggable [`PrivateKey`](super::PrivateKey)
+    /// (TPM/HSM or in-process via [`LocalSigner`](super::LocalSigner)).
+    ///
+    /// The engine advertises `key.schemes()` and parks at the identity
+    /// signature; [`super::Connection::drive`] then brokers the signature
+    /// through `key` so the caller never hand-manages it. `std` only.
+    #[cfg(feature = "std")]
+    pub fn private_key(
+        mut self,
+        chain: Vec<Vec<u8>>,
+        key: Arc<dyn super::signer::PrivateKey>,
+    ) -> Self {
+        self.inner.identity = Some(Identity {
+            cert_chain: chain,
+            key: SigningKey::External {
+                schemes: key.schemes(),
+            },
+        });
+        self.inner.signer = Some(key);
         self
     }
     /// Replace the trust anchors.

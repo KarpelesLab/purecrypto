@@ -67,6 +67,8 @@ mod groups;
 pub(crate) mod keylog;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
+#[cfg(feature = "std")]
+mod signer;
 mod version;
 
 pub use config::{ClientAuth, Config, ConfigBuilder, EntropySource, Identity, SigningKey};
@@ -75,6 +77,8 @@ pub(crate) use conn::ClientCertConfig;
 #[cfg(test)]
 #[cfg(feature = "std")]
 pub(crate) use conn::ReplayWindow;
+#[cfg(feature = "std")]
+pub use connection::Step;
 pub use connection::{Connection, HandshakeStatus, SignatureRequest};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
@@ -83,4 +87,6 @@ pub use keylog::KeyLog;
 #[cfg(feature = "std")]
 pub use keylog::{WriterKeyLog, file_keylog};
 pub use pki::{CrlStore, PolicyOptions, RootCertStore};
+#[cfg(feature = "std")]
+pub use signer::{LocalSigner, PrivateKey, Readiness, SignOp, SignProgress};
 pub use version::{ContentType, ProtocolVersion};

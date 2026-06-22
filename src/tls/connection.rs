@@ -66,6 +66,32 @@ pub enum HandshakeStatus {
     WantWrite,
 }
 
+/// What [`Connection::drive`] needs next — the unified, key-agnostic drive
+/// surface. Unlike [`HandshakeStatus`], this folds the signing device into the
+/// same loop, so a caller services peer I/O *and* (transparently) a TPM/HSM
+/// without ever branching on the kind of key behind [`Config::signer`].
+///
+/// `#[non_exhaustive]`: future drive reasons can be added without breaking
+/// exhaustive matches.
+#[cfg(feature = "std")]
+#[non_exhaustive]
+pub enum Step {
+    /// The engine needs bytes from the peer: read the socket and
+    /// [`feed`](Connection::feed) them.
+    WantRead,
+    /// The engine has wire bytes to send: [`pop`](Connection::pop) and write
+    /// them to the peer.
+    WantWrite,
+    /// The signing device needs servicing. If `Some`, wait on the
+    /// [`Readiness`](super::signer::Readiness) (sync: [`wait`](super::signer::Readiness::wait);
+    /// async: register its fd with your reactor), then call
+    /// [`drive`](Connection::drive) again. `None` means the op has no waitable
+    /// descriptor — just call `drive` again. In-process keys never yield this.
+    WantSigner(Option<super::signer::Readiness>),
+    /// The handshake is complete; application data may flow.
+    Complete,
+}
+
 /// A request for an external `CertificateVerify` signature, returned by
 /// [`Connection::signature_request`]. The caller signs `message` under the
 /// algorithm identified by `scheme` (the signature operation applies the
@@ -93,6 +119,14 @@ pub struct Connection {
     /// call. Empty for TLS engines, which return their entire write buffer
     /// in one call.
     pending_dtls: alloc::collections::VecDeque<Vec<u8>>,
+    /// Transparent pluggable signer (from [`Config::signer`]), brokered by
+    /// [`Connection::drive`]. `None` when the identity signs in-process.
+    #[cfg(feature = "std")]
+    signer: Option<alloc::sync::Arc<dyn super::signer::PrivateKey>>,
+    /// The in-flight external signing operation, while [`Connection::drive`] is
+    /// waiting on the signer's device.
+    #[cfg(feature = "std")]
+    active_sign: Option<Box<dyn super::signer::SignOp>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -139,6 +173,10 @@ impl Connection {
         Ok(Connection {
             inner,
             pending_dtls: alloc::collections::VecDeque::new(),
+            #[cfg(feature = "std")]
+            signer: config.signer.clone(),
+            #[cfg(feature = "std")]
+            active_sign: None,
         })
     }
 
@@ -167,6 +205,10 @@ impl Connection {
         Ok(Connection {
             inner,
             pending_dtls: alloc::collections::VecDeque::new(),
+            #[cfg(feature = "std")]
+            signer: config.signer.clone(),
+            #[cfg(feature = "std")]
+            active_sign: None,
         })
     }
 
@@ -181,6 +223,82 @@ impl Connection {
             Ok(HandshakeStatus::WantWrite)
         } else {
             Ok(HandshakeStatus::WantRead)
+        }
+    }
+
+    /// Drive the handshake forward, transparently brokering the identity
+    /// signature through the [`PrivateKey`](super::PrivateKey) installed via
+    /// [`ConfigBuilder::private_key`](super::ConfigBuilder::private_key).
+    ///
+    /// This is the key-agnostic alternative to [`handshake`](Self::handshake):
+    /// the same loop drives an in-process key, a local TPM, or a network HSM,
+    /// because the signing device is folded into the returned [`Step`]. The
+    /// caller services peer I/O on `WantRead`/`WantWrite` exactly as with
+    /// `handshake`, and on `WantSigner` waits on the (opaque) device readiness
+    /// before calling `drive` again — it never touches the message, the
+    /// signature, or the device transport.
+    ///
+    /// ```no_run
+    /// # use purecrypto::tls::{Connection, Step};
+    /// # fn run(conn: &mut Connection, sock: &mut std::net::TcpStream) -> std::io::Result<()> {
+    /// use std::io::{Read, Write};
+    /// let mut buf = [0u8; 16 * 1024];
+    /// loop {
+    ///     match conn.drive().map_err(std::io::Error::other)? {
+    ///         Step::WantWrite => sock.write_all(&conn.pop().map_err(std::io::Error::other)?)?,
+    ///         Step::WantRead => {
+    ///             let n = sock.read(&mut buf)?;
+    ///             conn.feed(&buf[..n]).map_err(std::io::Error::other)?;
+    ///         }
+    ///         // Sync: block on the device fd. Async: register
+    ///         // `r.as_raw_fd()` with your reactor and `.await` instead.
+    ///         Step::WantSigner(Some(r)) => r.wait()?,
+    ///         Step::WantSigner(None) => {} // no fd: just loop and re-drive
+    ///         Step::Complete => break,
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "std")]
+    pub fn drive(&mut self) -> Result<Step, Error> {
+        // If the engine has parked awaiting the identity signature, broker it
+        // through the installed PrivateKey rather than asking the caller.
+        if self.active_sign.is_none()
+            && let Some(req) = self.signature_request()
+        {
+            let op = {
+                let signer = self.signer.as_ref().ok_or(Error::InappropriateState)?;
+                signer.start_sign(req.scheme, &req.message)?
+            };
+            self.active_sign = Some(op);
+        }
+        if self.active_sign.is_some() {
+            let progress = {
+                let op = self.active_sign.as_mut().expect("checked is_some");
+                op.resume()?
+            };
+            match progress {
+                super::signer::SignProgress::Pending => {
+                    let readiness = self
+                        .active_sign
+                        .as_ref()
+                        .expect("still in flight")
+                        .readiness();
+                    return Ok(Step::WantSigner(readiness));
+                }
+                super::signer::SignProgress::Done(sig) => {
+                    self.active_sign = None;
+                    self.provide_signature(sig)?;
+                    // Fall through: provide_signature drove the engine, so the
+                    // CertificateVerify + Finished records are now pending.
+                }
+            }
+        }
+        match self.handshake()? {
+            HandshakeStatus::Complete => Ok(Step::Complete),
+            HandshakeStatus::WantWrite => Ok(Step::WantWrite),
+            HandshakeStatus::WantRead => Ok(Step::WantRead),
         }
     }
 
@@ -1561,5 +1679,184 @@ mod tests {
             "disjoint signature schemes must fail the handshake"
         );
         assert!(server.signature_request().is_none());
+    }
+
+    /// `Connection::drive()` brokers an in-process key through the transparent
+    /// `PrivateKey` path (via `LocalSigner`) without ever yielding `WantSigner`:
+    /// the same loop a device key would use also completes a normal handshake.
+    #[test]
+    fn drive_with_local_signer_completes_without_signer_step() {
+        use super::super::signer::LocalSigner;
+        use alloc::sync::Arc;
+
+        let (key, leaf) = ecdsa_p256_identity();
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .private_key(
+                alloc::vec![leaf],
+                Arc::new(LocalSigner::new(super::super::config::SigningKey::Ecdsa(
+                    key,
+                ))),
+            )
+            .build();
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("ext.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        // Drive the server via drive(); the client via the plain loop.
+        let mut saw_signer_step = false;
+        for _ in 0..32 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            // Pump the server with drive() until it needs peer bytes / is done.
+            loop {
+                match server.drive().unwrap() {
+                    Step::WantWrite => {
+                        let out = server.pop().unwrap();
+                        if out.is_empty() {
+                            break;
+                        }
+                        client.feed(&out).unwrap();
+                    }
+                    Step::WantSigner(_) => saw_signer_step = true,
+                    Step::WantRead | Step::Complete => break,
+                }
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            !saw_signer_step,
+            "an in-process LocalSigner must never yield WantSigner"
+        );
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// A device-backed `PrivateKey` whose `SignOp` returns `Pending` once
+    /// (exposing a real, readable fd) before producing the signature drives a
+    /// full handshake through `drive()` — exercising the `WantSigner` path and
+    /// `Readiness::wait()`. The "device" is an in-process ECDSA key behind a
+    /// `UnixStream` whose peer end is pre-armed so `wait()` returns at once.
+    #[cfg(unix)]
+    #[test]
+    fn drive_with_device_signer_round_trips() {
+        use super::super::signer::{PrivateKey, Readiness, SignOp, SignProgress};
+        use alloc::sync::Arc;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
+
+        struct DeviceKey {
+            key: BoxedEcdsaPrivateKey,
+        }
+        struct DeviceOp {
+            key: BoxedEcdsaPrivateKey,
+            message: Vec<u8>,
+            // `near` is the fd we expose; `_far` keeps the peer end (and its
+            // pre-written byte) alive so `near` stays readable.
+            near: UnixStream,
+            _far: UnixStream,
+            polled: bool,
+        }
+        impl PrivateKey for DeviceKey {
+            fn schemes(&self) -> Vec<u16> {
+                alloc::vec![ECDSA_SECP256R1_SHA256]
+            }
+            fn start_sign(&self, _scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error> {
+                use std::io::Write;
+                let (near, mut far) = UnixStream::pair().unwrap();
+                // Pre-arm: a byte already waiting makes `near` readable, so the
+                // test's wait() returns immediately (no real device latency).
+                far.write_all(b"x").unwrap();
+                Ok(Box::new(DeviceOp {
+                    key: self.key.clone(),
+                    message: message.to_vec(),
+                    near,
+                    _far: far,
+                    polled: false,
+                }))
+            }
+        }
+        impl SignOp for DeviceOp {
+            fn resume(&mut self) -> Result<SignProgress, Error> {
+                if !self.polled {
+                    // First step: not ready yet — make the caller wait.
+                    self.polled = true;
+                    return Ok(SignProgress::Pending);
+                }
+                let sig = self
+                    .key
+                    .sign::<Sha256>(&self.message)
+                    .unwrap()
+                    .to_der(CurveId::P256);
+                Ok(SignProgress::Done(sig))
+            }
+            fn readiness(&self) -> Option<Readiness> {
+                Some(Readiness::from_raw_fd(self.near.as_raw_fd()))
+            }
+        }
+
+        let (key, leaf) = ecdsa_p256_identity();
+        let server_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .private_key(alloc::vec![leaf], Arc::new(DeviceKey { key }))
+            .build();
+        let client_cfg = Config::builder()
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .verify_certificates(false)
+            .server_name("ext.example")
+            .build();
+
+        let mut server = Connection::server(&server_cfg).unwrap();
+        let mut client = Connection::client(&client_cfg).unwrap();
+
+        let mut waited = false;
+        for _ in 0..32 {
+            loop {
+                let out = client.pop().unwrap();
+                if out.is_empty() {
+                    break;
+                }
+                server.feed(&out).unwrap();
+            }
+            loop {
+                match server.drive().unwrap() {
+                    Step::WantWrite => {
+                        let out = server.pop().unwrap();
+                        if out.is_empty() {
+                            break;
+                        }
+                        client.feed(&out).unwrap();
+                    }
+                    Step::WantSigner(r) => {
+                        if let Some(r) = r {
+                            r.wait().unwrap();
+                            waited = true;
+                        }
+                    }
+                    Step::WantRead | Step::Complete => break,
+                }
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(waited, "the device SignOp must have suspended on its fd");
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "device-signed handshake must complete and verify"
+        );
     }
 }
