@@ -57,7 +57,15 @@ fn pack_signed(coeffs: &[i64], w: u32) -> Vec<u8> {
 }
 
 /// Inverse of [`pack_signed`]: read `n` sign-extended `w`-bit coefficients.
-fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Vec<i64> {
+///
+/// Returns `None` if `bytes` is too short to hold `n·w` bits, so the primitive
+/// is total on any input rather than relying on the caller having pre-validated
+/// the length (which would otherwise panic on an out-of-bounds index).
+fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Option<Vec<i64>> {
+    // Reject inputs that cannot supply every requested bit before indexing.
+    if (n * w as usize).div_ceil(8) > bytes.len() {
+        return None;
+    }
     let mut out = Vec::with_capacity(n);
     let mut pos = 0usize;
     for _ in 0..n {
@@ -73,7 +81,7 @@ fn unpack_signed(bytes: &[u8], n: usize, w: u32) -> Vec<i64> {
         }
         out.push(v);
     }
-    out
+    Some(out)
 }
 
 /// Bit width for `f`/`g` coefficients in the compact secret key: 6 bits for
@@ -106,9 +114,9 @@ pub(crate) fn decode_privkey(bytes: &[u8], n: usize) -> Option<(Vec<i64>, Vec<i6
         return None;
     }
     let body = &bytes[1..];
-    let f = unpack_signed(&body[..fg_len], n, w);
-    let g = unpack_signed(&body[fg_len..2 * fg_len], n, w);
-    let cap_f = unpack_signed(&body[2 * fg_len..], n, 8);
+    let f = unpack_signed(&body[..fg_len], n, w)?;
+    let g = unpack_signed(&body[fg_len..2 * fg_len], n, w)?;
+    let cap_f = unpack_signed(&body[2 * fg_len..], n, 8)?;
     Some((f, g, cap_f))
 }
 
