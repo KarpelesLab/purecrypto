@@ -48,6 +48,31 @@ async fn yield_once() {
     YieldOnce(false).await;
 }
 
+/// A buffer of decrypted application plaintext that scrubs itself on drop
+/// (defense-in-depth: decrypted bytes should not linger in freed heap).
+/// Wraps a `Vec<u8>` and wipes its live contents in `Drop`.
+#[derive(Default)]
+struct Plaintext(Vec<u8>);
+
+impl core::ops::Deref for Plaintext {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for Plaintext {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
+    }
+}
+
+impl Drop for Plaintext {
+    fn drop(&mut self) {
+        super::conn::wipe(&mut self.0);
+    }
+}
+
 /// An async TLS stream: a [`Connection`] bridged onto a tokio
 /// [`AsyncRead`] + [`AsyncWrite`] transport. Construct via
 /// [`handshake`](Self::handshake).
@@ -55,7 +80,7 @@ pub struct TlsStream<S> {
     conn: Connection,
     sock: S,
     /// Decrypted plaintext awaiting the reader (`rbuf[rpos..]`).
-    rbuf: Vec<u8>,
+    rbuf: Plaintext,
     rpos: usize,
     /// Ciphertext awaiting the socket (`wbuf[wpos..]`).
     wbuf: Vec<u8>,
@@ -119,7 +144,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
         Ok(TlsStream {
             conn,
             sock,
-            rbuf: Vec::new(),
+            rbuf: Plaintext::default(),
             rpos: 0,
             wbuf: Vec::new(),
             wpos: 0,
@@ -133,6 +158,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
 
     /// Consume the stream, returning the inner [`Connection`] and transport.
     pub fn into_inner(self) -> (Connection, S) {
+        // `self.rbuf` (a `Plaintext`) is dropped here, scrubbing any residual
+        // decrypted application data; `conn`/`sock` move out to the caller.
         (self.conn, self.sock)
     }
 
@@ -168,6 +195,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
                 buf.put_slice(&this.rbuf[this.rpos..this.rpos + n]);
                 this.rpos += n;
                 if this.rpos == this.rbuf.len() {
+                    // Plaintext fully delivered to the reader: scrub it before
+                    // releasing the buffer (defense-in-depth — decrypted
+                    // application data should not linger in freed capacity).
+                    super::conn::wipe(&mut this.rbuf);
                     this.rbuf.clear();
                     this.rpos = 0;
                 }
@@ -176,7 +207,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
             // 2. Pull plaintext the engine already has buffered.
             let pt = this.conn.recv().map_err(ioerr)?;
             if !pt.is_empty() {
-                this.rbuf = pt;
+                // Replacing `rbuf` drops the previous `Plaintext`, which scrubs
+                // its residual decrypted bytes.
+                this.rbuf = Plaintext(pt);
                 this.rpos = 0;
                 continue;
             }
@@ -187,8 +220,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
                 Poll::Ready(Ok(())) => {
                     let filled = rb.filled();
                     if filled.is_empty() {
-                        // Clean EOF: leave `buf` untouched (0 bytes read).
-                        return Poll::Ready(Ok(()));
+                        // Transport EOF. RFC 8446 §6.1: a TLS peer signals
+                        // end-of-data with a `close_notify` alert. If the
+                        // transport closed WITHOUT one, the stream was
+                        // truncated — possibly by an attacker stripping the
+                        // tail — so we must surface an error rather than a
+                        // clean EOF. Only a received close_notify makes EOF
+                        // clean.
+                        if this.conn.received_close_notify() {
+                            // Orderly close: leave `buf` untouched (0 bytes).
+                            return Poll::Ready(Ok(()));
+                        }
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "peer closed connection without close_notify (possible truncation attack)",
+                        )));
                     }
                     let mut fed = 0;
                     while fed < filled.len() {
