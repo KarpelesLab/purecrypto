@@ -17,8 +17,9 @@ const PRIVATE_LABEL: &str = "RSA PRIVATE KEY";
 const SPKI_LABEL: &str = "PUBLIC KEY";
 const PKCS8_LABEL: &str = "PRIVATE KEY";
 
-/// DER OID arcs for `rsaEncryption` (RFC 3279 §2.3.1).
-const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
+/// DER OID arcs for `rsaEncryption` (RFC 3279 §2.3.1). Shared with the
+/// boxed-key encoder in [`super::boxed`].
+pub(crate) const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
 
 /// Encodes the `AlgorithmIdentifier` for rsaEncryption with explicit NULL
 /// parameters (the form mandated by RFC 3279 §2.3.1 / enforced on import by

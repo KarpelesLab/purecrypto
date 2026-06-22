@@ -647,9 +647,10 @@ impl BoxedRsaPublicKey {
     }
 }
 
-/// DER OID arcs for `rsaEncryption` (RFC 3279 §2.3.1).
+/// DER OID arcs for `rsaEncryption` (RFC 3279 §2.3.1) — shared with the
+/// const-generic encoder in [`super::encoding`].
 #[cfg(feature = "der")]
-const RSA_ENCRYPTION_OID: [u64; 7] = [1, 2, 840, 113549, 1, 1, 1];
+use super::encoding::RSA_ENCRYPTION_OID;
 
 /// PKCS#1 DER/PEM for runtime-sized private keys.
 #[cfg(feature = "der")]

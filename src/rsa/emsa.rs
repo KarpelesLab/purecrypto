@@ -116,27 +116,17 @@ pub(crate) fn encrypt_pkcs1v15<K: RawPublic, R: RngCore>(
 /// is known a priori (TLS 1.0–1.2 RSA key transport, CMS): it produces a
 /// fixed-width, key-bound synthetic plaintext on padding failure that the
 /// attacker cannot distinguish from a real one.
-pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<u8>, Error> {
-    let k = key.key_size();
-    if ct.len() != k {
-        return Err(Error::InvalidLength);
-    }
-    // RFC 8017 §7.2.2 step 1: `k` must be at least 11 octets so the PS field
-    // (>= 8 bytes) plus the three framing bytes (0x00 0x02 ... 0x00) can fit.
-    // A smaller modulus could otherwise drive the `em[0]` / `em[1]` indexing
-    // below into a panic on attacker-controlled tiny keys.
-    if k < 11 {
-        return Err(Error::InvalidLength);
-    }
-    let em = key.raw_private(ct);
-
-    // RFC 8017 §7.2.2 constant-time padding validation. Every branch on plaintext
-    // bytes is folded into a single `bad` accumulator so the running time of a
-    // failed unwrap is indistinguishable from a successful one (Bleichenbacher's
-    // padding oracle is the canonical attack — see also Manger / ROBOT). The
-    // resulting Vec length still leaks across success/failure boundaries — for
-    // protocol-level implicit rejection that hides even that, see
-    // [`decrypt_pkcs1v15_session`].
+/// RFC 8017 §7.2.2 constant-time PKCS#1 v1.5 padding validation, shared by
+/// [`decrypt_pkcs1v15`] and [`decrypt_pkcs1v15_session`].
+///
+/// Walks the decrypted block `em` (which the callers guarantee is at least 11
+/// bytes long) and returns `(bad, sep_idx)`. Every check on plaintext bytes is
+/// folded into the single `bad` accumulator — nonzero iff the padding is
+/// malformed — so the running time is independent of the (secret) contents
+/// (Bleichenbacher / Manger / ROBOT). `sep_idx` is the index of the first
+/// `0x00` separator after the `00 02` prefix; the plaintext is
+/// `em[sep_idx + 1..]`.
+fn pkcs1v15_padding_check(em: &[u8]) -> (u8, u32) {
     let mut bad: u8 = em[0]; // must be 0x00
     bad |= em[1] ^ 0x02; //   must be 0x02
 
@@ -162,6 +152,28 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<
     // ct_lt yields a Choice that is true when sep_idx < 10.
     let too_small = sep_idx.ct_lt(&10u32).unwrap_u8();
     bad |= 0u8.wrapping_sub(too_small);
+
+    (bad, sep_idx)
+}
+
+pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(key: &K, ct: &[u8]) -> Result<Vec<u8>, Error> {
+    let k = key.key_size();
+    if ct.len() != k {
+        return Err(Error::InvalidLength);
+    }
+    // RFC 8017 §7.2.2 step 1: `k` must be at least 11 octets so the PS field
+    // (>= 8 bytes) plus the three framing bytes (0x00 0x02 ... 0x00) can fit.
+    // A smaller modulus could otherwise drive the `em[0]` / `em[1]` indexing
+    // below into a panic on attacker-controlled tiny keys.
+    if k < 11 {
+        return Err(Error::InvalidLength);
+    }
+    let em = key.raw_private(ct);
+
+    // Constant-time padding validation. The Vec length below still leaks across
+    // success/failure boundaries — for protocol-level implicit rejection that
+    // hides even that, see [`decrypt_pkcs1v15_session`].
+    let (bad, sep_idx) = pkcs1v15_padding_check(&em);
 
     if bad != 0 {
         return Err(Error::Decryption);
@@ -206,21 +218,7 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     let em = key.raw_private(ct);
 
     // Same constant-time padding check as decrypt_pkcs1v15.
-    let mut bad: u8 = em[0];
-    bad |= em[1] ^ 0x02;
-    let mut found: u8 = 0;
-    let mut sep_idx: u32 = 0;
-    for (i, &b) in em.iter().enumerate().skip(2) {
-        let is_zero = ct_eq_u8(b, 0x00) & !found;
-        // See decrypt_pkcs1v15: broadcast to full index width so separators at
-        // index >= 256 (keys > 2048-bit) are not truncated to `i & 0xff`.
-        let mask = 0u32.wrapping_sub((is_zero & 1) as u32);
-        sep_idx |= (i as u32) & mask;
-        found |= is_zero;
-    }
-    bad |= !found;
-    let too_small = sep_idx.ct_lt(&10u32).unwrap_u8();
-    bad |= 0u8.wrapping_sub(too_small);
+    let (bad, sep_idx) = pkcs1v15_padding_check(&em);
 
     // Derive the synthetic fallback: HMAC(key_secret, ct) expanded to expected_len.
     // The derivation is keyed by the long-term private value so the attacker
