@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.17](https://github.com/KarpelesLab/purecrypto/compare/v0.6.16...v0.6.17) - 2026-06-22
+
+### Other
+
+- optional tokio + mio I/O surfaces over the sans-I/O engine
+- require caller-provided entropy; the sans-I/O engine no longer defaults to OsRng
+- expose Readiness via std AsFd/AsRawFd for clean async integration
+- transparent pluggable private keys (PrivateKey trait + Connection::drive)
+- tls_external_signing — TPM/HSM suspend/resume driver loop
+- two-phase prepare/finish signing for offline (TPM/HSM) CA keys
+- external ServerKeyExchange signing (suspend/resume)
+- external CertificateVerify signing — DTLS 1.3 server
+- external CertificateVerify signing — TLS 1.3 client mTLS
+- external (suspend/resume) CertificateVerify signing — TLS 1.3 server
+
 ## [0.6.16](https://github.com/KarpelesLab/purecrypto/compare/v0.6.15...v0.6.16) - 2026-06-22
 
 ### Other
