@@ -92,8 +92,12 @@ const OID_PBKDF2: &[u64] = &[1, 2, 840, 113549, 1, 5, 12];
 const OID_HMAC_SHA256: &[u64] = &[1, 2, 840, 113549, 2, 9];
 
 /// Iteration-count floor accepted for any password-derived material on parse.
-/// Real OpenSSL archives use 2048+; we accept down to 1024 for tolerance but
-/// reject pathologically weak counts.
+/// Set to 1 deliberately: in PKCS#12 the iteration count is a cost knob, not a
+/// confidentiality gate — the whole archive is authenticated by the file MAC
+/// against the password (verified in constant time before any content is
+/// decrypted), so a low count cannot weaken integrity. Real OpenSSL archives
+/// use 2048+; we accept any positive count for interop tolerance. The DoS risk
+/// of a *huge* count is bounded by [`MAX_ITERATIONS`] below.
 const MIN_ITERATIONS: u32 = 1;
 /// Iteration-count ceiling: the count is attacker-controlled, so cap it to
 /// bound the worst-case CPU of a hostile file (DoS guard, mirroring PBES2).
@@ -592,27 +596,69 @@ fn pbe_sha1_3des_decrypt(
 
 /// Strips PKCS#7 padding for a `block`-byte block size, rejecting invalid
 /// padding as [`Error::Decryption`].
+///
+/// The inspection is constant-time with respect to the (secret) plaintext: the
+/// trailing `block` bytes are always scanned in the same order regardless of
+/// the claimed pad length, and validity is folded into a single mask. Only the
+/// final accept/reject decision branches, which reveals no more than the
+/// `Ok`/`Err` already returned. (In PKCS#12 every caller runs this only after
+/// the file MAC has authenticated the content, so this is defense-in-depth;
+/// it mirrors the construction in [`crate::kdf`]'s `strip_pkcs7_padding`.)
 fn strip_pkcs7(mut buf: Vec<u8>, block: usize) -> Result<Vec<u8>, Error> {
     let n = buf.len();
-    if n == 0 || !n.is_multiple_of(block) {
+    // `n` and `block` are public (ciphertext length and cipher block size),
+    // so branching on them leaks nothing about the plaintext.
+    if n == 0 || block == 0 || block > 255 || !n.is_multiple_of(block) {
         return Err(Error::Decryption);
     }
-    let pad = buf[n - 1] as usize;
-    if pad == 0 || pad > block || pad > n {
-        return Err(Error::Decryption);
+    let last = buf[n - 1];
+    let block_u8 = block as u8;
+
+    // range_ok: 0xFF iff 1 <= last <= block.
+    let range_ok = ct_nonzero_u8(last) & ct_le_u8(last, block_u8);
+
+    // Scan exactly the trailing `block` bytes; positions inside the claimed
+    // padding region (the last `last` bytes) must all equal `last`.
+    let mut bytes_ok: u8 = 0xFF;
+    let start = n - block;
+    for (i, &b) in buf[start..].iter().enumerate() {
+        let pos_from_end = block_u8 - i as u8; // block, block-1, ..., 1
+        let is_pad = ct_le_u8(pos_from_end, last); // 0xFF when pos_from_end <= last
+        let byte_bad = is_pad & ct_nonzero_u8(b ^ last);
+        bytes_ok &= !byte_bad;
     }
-    // All padding bytes must equal `pad`.
-    let mut ok = true;
-    for &b in &buf[n - pad..] {
-        if b as usize != pad {
-            ok = false;
+
+    if (range_ok & bytes_ok) != 0xFF {
+        // Wrong-key / tampered result — wipe the recovered bytes before the
+        // rejection so they don't linger in freed memory.
+        for x in buf.iter_mut() {
+            *x = 0;
         }
-    }
-    if !ok {
+        let _ = core::hint::black_box(&buf);
         return Err(Error::Decryption);
     }
-    buf.truncate(n - pad);
+    buf.truncate(n - last as usize);
     Ok(buf)
+}
+
+/// Constant-time `(x <= y)` over `u8`: `0xFF` for true, `0x00` for false.
+#[inline]
+fn ct_le_u8(x: u8, y: u8) -> u8 {
+    // (y - x) borrow: if x > y the high bit of (y - x) as i16 is set.
+    let diff = y as i16 - x as i16;
+    let sign = ((diff as u16) >> 15) as u8; // 1 if negative, 0 otherwise.
+    sign.wrapping_sub(1) // 0 -> 0xFF; 1 -> 0x00
+}
+
+/// Constant-time `x != 0`: `0xFF` when non-zero, `0x00` when zero.
+#[inline]
+fn ct_nonzero_u8(x: u8) -> u8 {
+    // Spread the OR of all bits into bit 0, then mask-extend.
+    let mut v = x;
+    v |= v >> 4;
+    v |= v >> 2;
+    v |= v >> 1;
+    0u8.wrapping_sub(v & 1)
 }
 
 // ---- MAC ----------------------------------------------------------------
