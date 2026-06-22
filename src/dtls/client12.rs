@@ -1,4 +1,7 @@
-#![allow(dead_code, unreachable_pub)]
+// Private module, re-exported only as `pub(crate)`, so its `pub` items are
+// crate-internal: allow `unreachable_pub` module-wide. `dead_code` is not
+// suppressed (the module is fully used).
+#![allow(unreachable_pub)]
 
 //! DTLS 1.2 client state machine (RFC 6347).
 //!
