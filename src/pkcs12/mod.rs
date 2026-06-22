@@ -103,6 +103,15 @@ const MIN_ITERATIONS: u32 = 1;
 /// bound the worst-case CPU of a hostile file (DoS guard, mirroring PBES2).
 const MAX_ITERATIONS: u32 = 10_000_000;
 
+/// Upper bound on a PBKDF2 `keyLength` we will honour before the MAC is
+/// verified. The only wired PBMAC1 PRF is HMAC-SHA-256 (32-byte output); a
+/// derived key longer than the PRF block (64 bytes) buys no extra security, so
+/// anything beyond this is rejected up front. Without the cap an
+/// attacker-supplied `keyLength` (up to `u32::MAX`) would drive a huge
+/// `vec![0u8; key_len]` allocation and PBKDF2 run *before* the MAC is checked —
+/// a pre-authentication DoS.
+const MAX_PBMAC1_KEY_LEN: usize = 64;
+
 /// Errors from PKCS#12 parsing and building.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -768,6 +777,13 @@ fn pbmac1_compute(alg: &mut Reader<'_>, password: &str, content: &[u8]) -> Resul
         && t == tag::INTEGER
     {
         key_len = read_iterations(&mut p)? as usize;
+        // Bound the attacker-controlled keyLength *before* allocating or
+        // running PBKDF2: this is processed pre-MAC-verification, so an
+        // unbounded value is a pre-auth memory/CPU DoS. A key longer than
+        // the HMAC-SHA-256 block buys no security anyway.
+        if key_len == 0 || key_len > MAX_PBMAC1_KEY_LEN {
+            return Err(Error::BadParameters);
+        }
     }
     // Optional PRF: must be HMAC-SHA-256 if present.
     if let Some(t) = p.peek_tag()
