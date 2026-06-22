@@ -761,6 +761,11 @@ fn split_digest(p: &Params, digest: &[u8]) -> (usize, u64, u32) {
     let rest = &digest[md_len..];
     let til = p.tree_idx_len();
     let lil = p.leaf_idx_len();
+    // `to_int` folds into a `u64`; all twelve standardized parameter sets have
+    // tree/leaf index lengths <= 8, so this never truncates. Assert it so a
+    // future parameter set that violated the invariant fails loudly in debug
+    // rather than silently dropping high index bytes.
+    debug_assert!(til <= 8 && lil <= 8, "SLH-DSA index length exceeds u64");
     let tree_idx = to_int(&rest[..til]) & p.tree_idx_mask();
     let leaf_idx = (to_int(&rest[til..til + lil]) & p.leaf_idx_mask()) as u32;
     (md_len, tree_idx, leaf_idx)
