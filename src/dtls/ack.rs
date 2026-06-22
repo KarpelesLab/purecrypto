@@ -36,11 +36,8 @@
 //! [`ACK_CONTENT_TYPE`] so the record layer can dispatch on it without
 //! re-magic-numbering this constant.
 //!
-//! This codec is consumed by [`super::reliability13`]; the client / server
-//! state machines that emit and consume ACKs land in commit 14, so the
-//! items are `#[allow(dead_code)]` for now.
-
-#![allow(dead_code)]
+//! This codec is consumed by [`super::reliability13`] and the DTLS 1.3
+//! client / server state machines that emit and consume ACKs.
 
 use crate::tls::Error;
 use alloc::vec::Vec;

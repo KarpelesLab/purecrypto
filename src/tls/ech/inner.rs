@@ -39,6 +39,14 @@
 //! `ech_outer_extensions` extension occupied, preserving the order
 //! of the list.
 
+// The `ech_outer_extensions` compress/decompress primitive below is fully
+// implemented and unit-tested but not yet called from the live handshake:
+// the HPKE seal of the inner CH and the `ClientHelloOuterAAD` plumbing land
+// in a follow-up wave (see the module doc above). Suppress dead_code here
+// rather than per-item until that wiring lands. `inner_extension_body` is the
+// one live entry point and is `pub`, so it is unaffected.
+#![allow(dead_code)]
+
 use super::extension::EchExtension;
 use crate::tls::Error;
 use crate::tls::codec::{ExtensionType, RawExtension};

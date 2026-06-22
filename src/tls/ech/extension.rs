@@ -123,6 +123,9 @@ impl EchExtension {
 /// Re-encode an outer-form ECH extension with the `payload` field
 /// zeroed (same length). Used to compute `ClientHelloOuterAAD` for
 /// the HPKE seal/open (draft §6.1.2).
+// Staged alongside the `inner` ech_outer_extensions primitive; called once
+// the HPKE seal/open is wired through the connection state machine.
+#[allow(dead_code)]
 pub(crate) fn zero_payload(ext_body: &[u8]) -> Result<Vec<u8>, Error> {
     // Fast path: only mutate the payload bytes; preserve the rest
     // verbatim. We have to re-parse to find the offset.

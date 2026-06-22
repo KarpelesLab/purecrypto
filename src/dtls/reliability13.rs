@@ -55,10 +55,7 @@
 //! }
 //! ```
 //!
-//! Consumed by the DTLS 1.3 client / server state machines in commit 14,
-//! so the items here are `#[allow(dead_code)]` until then.
-
-#![allow(dead_code)]
+//! Consumed by the DTLS 1.3 client / server state machines.
 
 use super::ack::RecordNumber;
 use super::reliability::Action;
@@ -227,6 +224,7 @@ impl Retransmit13 {
 
     /// Number of records currently in the in-flight set. Useful for tests
     /// and for emitting metrics.
+    #[cfg(test)]
     pub(crate) fn in_flight_len(&self) -> usize {
         self.in_flight.len()
     }

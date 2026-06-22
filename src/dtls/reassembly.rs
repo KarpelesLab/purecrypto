@@ -24,10 +24,7 @@
 //! whose `offset + length` exceeds the message's claimed `length` is a
 //! protocol violation and yields [`Error::Decode`] at parse time.
 //!
-//! The consumers (DTLS client/server state machines) arrive in follow-up
-//! commits, so items below are `#[allow(dead_code)]` for now.
-
-#![allow(dead_code)]
+//! Consumed by the DTLS client / server state machines.
 
 use crate::tls::Error;
 use alloc::collections::BTreeMap;

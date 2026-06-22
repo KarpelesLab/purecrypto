@@ -42,10 +42,7 @@
 //! (`std::time::Instant` is not available without `std`) while still
 //! letting the std-using caller plug in `Instant::elapsed_since(epoch)`.
 //!
-//! The DTLS 1.2 state machine that consumes this lands in commit 10, so the
-//! items below are `#[allow(dead_code)]` for now.
-
-#![allow(dead_code)]
+//! Consumed by the DTLS 1.2 client / server state machines.
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -92,6 +89,7 @@ impl Flight {
     }
 
     /// Returns `true` if the flight contains no datagrams.
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.datagrams.is_empty()
     }

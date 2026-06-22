@@ -21,10 +21,8 @@
 //! This module only frames the opaque payload — record protection (AEAD) is
 //! layered on top in the version-specific connection modules.
 //!
-//! The state-machine consumers (DTLS 1.2 / 1.3 client and server) land in
-//! follow-up commits, so the items below are flagged `#[allow(dead_code)]`.
-
-#![allow(dead_code)]
+//! Consumed by the version-specific connection modules (DTLS 1.2 / 1.3
+//! client and server).
 
 use crate::tls::{ContentType, Error, ProtocolVersion};
 use alloc::vec::Vec;

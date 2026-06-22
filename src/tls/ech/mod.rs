@@ -25,16 +25,13 @@
 //!
 //! ## Implementation status
 //!
-//! The ECH module lands in two waves. This wave ships the codec
-//! foundations (ECHConfig + extension codecs, HPKE wrappers, accept
-//! signal, key types, GREASE producer) and wires GREASE into the
-//! ClientHello. The real-ECH inner/outer split, the server-side
-//! HPKE decap + inner-CH dispatch, and the retry_configs flow land
-//! in a follow-up commit under the same Phase 5 banner. Items that
-//! will be referenced by that follow-up but are unused today are
-//! marked with `#[allow(dead_code)]` at the module level here; the
-//! in-module tests still exercise them so they don't bit-rot.
-#![allow(dead_code)]
+//! This module ships the ECH codec foundations (ECHConfig + extension
+//! codecs, HPKE wrappers, accept signal, key types, GREASE producer), the
+//! real-ECH inner/outer split, the server-side HPKE decap + inner-CH
+//! dispatch, and the retry_configs flow. The one piece still staged for a
+//! follow-up wave is the `ech_outer_extensions` compress/decompress
+//! primitive (see [`inner`]); it is unit-tested but not yet wired into the
+//! handshake, and carries its own scoped `#[allow(dead_code)]`.
 
 pub mod accept_signal;
 pub mod config;

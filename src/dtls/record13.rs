@@ -32,8 +32,6 @@
 //! This commit lands the framing only; the DTLS 1.3 state machine and ACK
 //! reliability layer build on top in subsequent commits.
 
-#![allow(dead_code)]
-
 use crate::cipher::{Aes128, Aes256, BlockCipher, ChaCha20};
 use crate::tls::Error;
 use crate::tls::crypto::{AeadAlg, SuiteParams};
@@ -56,7 +54,12 @@ const FLAG_EPOCH_LO2: u8 = 0b0000_0011;
 const SEQ_MASK_48: u64 = (1u64 << 48) - 1;
 
 /// Parsed DTLS 1.3 unified record header.
+// A full decode of the unified-header first byte: `is_ciphertext`/`has_length`
+// document the parsed wire form and `has_cid` is reserved for not-yet-supported
+// Connection IDs, so they are retained even though the current record path does
+// not read them back.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) struct UnifiedHeader {
     /// True for the encrypted DTLS-1.3 record; false (or absent path)
     /// for plaintext records that still use the legacy 13-byte header.
