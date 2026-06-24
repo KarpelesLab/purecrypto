@@ -27,9 +27,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use purecrypto::quic::{
-    EcnCodepoint, QuicConfig, QuicConnection, QuicServer, StreamId, TransportParameters,
-};
+use purecrypto::quic::{QuicConfig, QuicConnection, QuicServer, StreamId, TransportParameters};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
@@ -165,6 +163,9 @@ pub(crate) fn run_client(args: Args) {
     socket
         .connect((host, port))
         .unwrap_or_else(|e| die(format!("UDP connect to {host}:{port} failed: {e}")));
+    // Mark egress ECT(0) so the path/peer can signal congestion (RFC 9000
+    // §13.4); Linux-only, a no-op elsewhere.
+    crate::ecn_socket::configure(&socket);
 
     let mut qc = QuicConnection::client(qcfg, server_name)
         .unwrap_or_else(|e| die(format!("QUIC client config rejected: {e:?}")));
@@ -261,6 +262,11 @@ pub(crate) fn run_server(args: Args) {
     // datagrams that match no connection draw a stateless reset (RFC 9000
     // §10.3) — which the old single-connection, `connect`'d-socket server could
     // never see, let alone answer.
+    // Mark egress ECT(0) and request the IP ECN codepoint on receive so the
+    // engine's ECN support (RFC 9000 §13.4) works over the real socket
+    // (Linux; a no-op elsewhere).
+    crate::ecn_socket::configure(&socket);
+
     let mut server =
         QuicServer::new(make_config).unwrap_or_else(|e| die(format!("QUIC server build: {e:?}")));
     server.set_now_secs(unix_now_secs());
@@ -311,9 +317,9 @@ fn run_quic_server_loop(server: &mut QuicServer, sock: &UdpSocket, www: bool, qu
             .unwrap_or(Duration::from_millis(100))
             .clamp(Duration::from_millis(1), Duration::from_millis(100));
         sock.set_read_timeout(Some(wait)).ok();
-        match sock.recv_from(&mut net_buf) {
-            Ok((n, from)) if n > 0 => {
-                let _ = server.recv(from, EcnCodepoint::NotEct, &net_buf[..n]);
+        match crate::ecn_socket::recv_ecn(sock, &mut net_buf) {
+            Ok((n, from, ecn)) if n > 0 => {
+                let _ = server.recv(from, ecn, &net_buf[..n]);
             }
             Ok(_) => {}
             Err(e)

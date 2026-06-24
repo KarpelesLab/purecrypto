@@ -4,6 +4,7 @@
 
 mod ca;
 mod crl;
+mod ecn_socket;
 mod enc;
 mod genpkey;
 mod hash;
