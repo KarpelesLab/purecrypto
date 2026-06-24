@@ -304,6 +304,11 @@ pub struct QuicConnection {
     /// callers feed `Instant::now() - self.start` (via
     /// [`Self::now_since_start`]).
     start: Instant,
+    /// RFC 9000 §10.1 idle timeout: time (relative to [`Self::start`]) of the
+    /// last packet we received and successfully processed from the peer. The
+    /// idle timer is measured from here; an idle connection is silently closed
+    /// once `min(local, peer) max_idle_timeout` (floored at 3×PTO) elapses.
+    last_recv_activity: Duration,
     /// True once the peer's `ack_delay_exponent` / `max_ack_delay` have
     /// been installed in `endpoint.loss`. Idempotent guard so we don't
     /// reinstall on every drain cycle.
@@ -502,6 +507,7 @@ impl QuicConnection {
             start: Instant::now(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
+            last_recv_activity: Duration::ZERO,
             prev_rx_keys_installed_at: None,
         };
 
@@ -576,6 +582,7 @@ impl QuicConnection {
             start: Instant::now(),
             peer_ack_params_installed: false,
             peer_packet_seen: false,
+            last_recv_activity: Duration::ZERO,
             prev_rx_keys_installed_at: None,
         })
     }
@@ -1139,12 +1146,53 @@ impl QuicConnection {
         Instant::now().saturating_duration_since(self.start)
     }
 
-    /// Time until the next internal event (PTO firing). Returns `None`
-    /// if no timer is pending.
+    /// RFC 9000 §10.1: a packet was received and successfully processed —
+    /// remember the peer is live and restart the idle timer.
+    fn note_peer_packet_processed(&mut self) {
+        self.peer_packet_seen = true;
+        self.last_recv_activity = self.now_since_start();
+    }
+
+    /// RFC 9000 §10.1.2: the idle timeout actually in force — the smaller of
+    /// the two non-zero `max_idle_timeout` advertisements (ours and, once the
+    /// handshake surfaces them, the peer's), raised to at least three times the
+    /// current PTO (§10.1) so loss recovery always gets a chance first.
+    /// `None` when neither endpoint advertised a (non-zero) idle timeout.
+    fn effective_idle_timeout(&self) -> Option<Duration> {
+        let local = self.our_params.max_idle_timeout_ms.filter(|&v| v != 0);
+        let peer = self
+            .peer_params
+            .as_ref()
+            .and_then(|p| p.max_idle_timeout_ms)
+            .filter(|&v| v != 0);
+        let chosen_ms = match (local, peer) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => return None,
+        };
+        let base = Duration::from_millis(chosen_ms);
+        let floor = self.endpoint.loss.pto_period().saturating_mul(3);
+        Some(base.max(floor))
+    }
+
+    /// The idle-close deadline, measured from [`Self::start`] like the PTO
+    /// surface, or `None` when no idle timeout is in force.
+    fn idle_deadline(&self) -> Option<Duration> {
+        self.effective_idle_timeout()
+            .map(|t| self.last_recv_activity.saturating_add(t))
+    }
+
+    /// Time of the next internal event — the earlier of the PTO firing and the
+    /// RFC 9000 §10.1 idle-timeout deadline (both measured from
+    /// [`Self::start`]). `None` if neither timer is armed.
     pub fn next_timeout(&self) -> Option<Duration> {
-        // Phase 4: only the PTO is implemented; idle timeout lands in
-        // Phase 5+.
-        self.endpoint.loss.next_deadline(Duration::ZERO)
+        let pto = self.endpoint.loss.next_deadline(Duration::ZERO);
+        match (pto, self.idle_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
     }
 
     /// Signals that `now_since_start` elapsed since this connection was
@@ -1177,6 +1225,15 @@ impl QuicConnection {
             if let Some(streams) = self.streams.as_mut() {
                 streams.on_pto();
             }
+        }
+        // RFC 9000 §10.1: if the negotiated idle timeout has elapsed since the
+        // last packet we processed, silently close (no CONNECTION_CLOSE) and
+        // discard state. The 3×PTO floor in `effective_idle_timeout` ensures
+        // loss recovery has already had its turn by the time we get here.
+        if let Some(deadline) = self.idle_deadline()
+            && now_since_start >= deadline
+        {
+            self.closed = true;
         }
     }
 
@@ -2355,7 +2412,7 @@ impl QuicConnection {
             self.process_retry_packet(datagram, &hdr)?;
             // G-4: Retry is a non-VN packet; processing it commits us
             // to v1 and disqualifies subsequent VN per RFC 9000 §6.2.
-            self.peer_packet_seen = true;
+            self.note_peer_packet_processed();
             // Retry packets are single-packet datagrams (RFC 9000 §12.2:
             // "Coalescing only applies to long header packets ... Retry
             // packets cannot be coalesced"). Consume the rest of the
@@ -2581,7 +2638,7 @@ impl QuicConnection {
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
         // discarded (RFC 9000 §6.2).
-        self.peer_packet_seen = true;
+        self.note_peer_packet_processed();
 
         Ok(pkt_total_len)
     }
@@ -2806,7 +2863,7 @@ impl QuicConnection {
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
         // discarded (RFC 9000 §6.2).
-        self.peer_packet_seen = true;
+        self.note_peer_packet_processed();
         // Short-header packet always consumes the rest of the datagram.
         Ok(datagram.len())
     }
@@ -4121,6 +4178,39 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// RFC 9000 §10.1: a connection idle past the negotiated `max_idle_timeout`
+    /// (30 s here) is silently closed — no CONNECTION_CLOSE emitted — while a
+    /// connection within the window stays open. Also checks the idle deadline
+    /// is reported by `next_timeout` even when no PTO is armed.
+    #[test]
+    fn idle_timeout_silently_closes_idle_connection() {
+        let (mut client, mut server) = loopback_pair();
+        drive_until_complete(&mut client, &mut server, 8);
+        // Drain any normal post-handshake traffic (e.g. a pending ACK) so the
+        // only thing that could appear below is an idle-close artifact.
+        while !client.pop_datagram().is_empty() {}
+        assert!(
+            client.next_timeout().is_some(),
+            "idle timer must be armed once a timeout is negotiated"
+        );
+        // Well inside the 30 s window: still open.
+        client.on_timeout(Duration::from_secs(2));
+        assert!(
+            !client.is_closed(),
+            "must not close before the negotiated idle timeout"
+        );
+        // Past the idle deadline: silent close.
+        client.on_timeout(Duration::from_secs(120));
+        assert!(
+            client.is_closed(),
+            "idle connection must close after max_idle_timeout"
+        );
+        assert!(
+            client.pop_datagram().is_empty(),
+            "idle close is silent (no CONNECTION_CLOSE on the wire)"
+        );
     }
 
     /// Test 1 — in-process loopback handshake completes within 8 rounds.

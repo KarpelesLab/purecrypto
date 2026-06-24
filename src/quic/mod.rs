@@ -13,8 +13,8 @@
 //! per-level CRYPTO reassembly, ACK emission, RFC 9002 loss recovery with
 //! NewReno congestion control, streams with flow control, Retry + address
 //! validation, connection-ID rotation, key update, and RFC 9221 unreliable
-//! DATAGRAMs. Out of scope: 0-RTT emission, the idle-timeout timer (only
-//! the PTO is wired), HTTP/3, and stateless-reset emission.
+//! DATAGRAMs, and the RFC 9000 §10.1 idle timeout. Out of scope: 0-RTT
+//! emission, connection migration, HTTP/3, and stateless-reset emission.
 
 // QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
 // client, with several follow-ups still open (see the project notes). A
