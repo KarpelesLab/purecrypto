@@ -1127,7 +1127,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             cipher_suite: suite.suite,
             extensions: sh_extensions,
         }
-        .encode();
+        .encode_dtls();
         self.transcript.update(&sh_bytes);
 
         // Send SH as a plaintext DTLS record (epoch 0).
@@ -1439,7 +1439,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             cipher_suite: suite_id,
             extensions,
         }
-        .encode()
+        .encode_dtls()
     }
 
     fn emit_hello_retry_request(&mut self, cookie: Option<&[u8]>) -> Result<(), Error> {

@@ -907,13 +907,33 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         if self.ems_negotiated {
             sh_exts.push(ext::extended_master_secret_empty());
         }
+        // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
+        // signalled secure renegotiation — either via the extension (whose
+        // body MUST be empty on an initial handshake) or the
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` pseudo-suite (0x00FF). Strict
+        // clients (OpenSSL) abort with `handshake_failure` otherwise.
+        let signalled_reneg = match ext::find(&parsed.extensions, ExtensionType::RENEGOTIATION_INFO)
+        {
+            Some(reneg) => {
+                // Reject a non-empty `renegotiated_connection` on an initial
+                // handshake (we never renegotiate).
+                if !ext::parse_renegotiation_info(reneg)?.is_empty() {
+                    return Err(Error::HandshakeFailure);
+                }
+                true
+            }
+            None => parsed.cipher_suites.contains(&CipherSuite(0x00ff)),
+        };
+        if signalled_reneg {
+            sh_exts.push(ext::renegotiation_info_empty());
+        }
         let sh = ServerHello {
             random: sr,
             session_id: Vec::new(),
             cipher_suite: suite.suite,
             extensions: sh_exts,
         }
-        .encode();
+        .encode_dtls();
         // sh has leading 4-byte TLS header — strip for transcript not
         // needed (transcript wants full TLS-shaped including header). Keep
         // as-is for transcript.

@@ -788,7 +788,7 @@ impl DtlsClientConnection12 {
         if msg_type != hs_type::SERVER_HELLO {
             return Err(Error::UnexpectedMessage);
         }
-        let sh = ServerHello::decode(body)?;
+        let sh = ServerHello::decode_dtls(body)?;
         // RFC 5246 §7.4.1.3: the SH's `cipher_suite` MUST be one of those the
         // client offered. We additionally require it to be a member of our
         // SUITES_12 table; an unknown / non-offered codepoint is a fatal

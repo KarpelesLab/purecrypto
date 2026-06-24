@@ -782,7 +782,7 @@ impl DtlsClientConnection13 {
         if msg_type != hs_type::SERVER_HELLO {
             return Err(Error::UnexpectedMessage);
         }
-        let sh = ServerHello::decode(body)?;
+        let sh = ServerHello::decode_dtls(body)?;
         if sh.random == HRR_RANDOM {
             return self.on_hello_retry_request(sh, raw);
         }

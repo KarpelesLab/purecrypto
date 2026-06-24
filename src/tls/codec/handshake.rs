@@ -198,12 +198,25 @@ pub(crate) struct ServerHello {
 }
 
 impl ServerHello {
-    /// Encodes the full handshake message (type + length + body).
+    /// Encodes the full handshake message (type + length + body) with the TLS
+    /// `legacy_version` `0x0303`.
     pub(crate) fn encode(&self) -> Vec<u8> {
+        self.encode_with_legacy_version(0x0303)
+    }
+
+    /// DTLS variant: the `legacy_version` field is the DTLS 1.2 wire value
+    /// `0xfefd` (RFC 6347 §4.1 / RFC 9147 §4), not the TLS `0x0303`. The DTLS
+    /// 1.3 ServerHello and HelloRetryRequest likewise carry `0xfefd` here.
+    #[cfg(feature = "dtls")]
+    pub(crate) fn encode_dtls(&self) -> Vec<u8> {
+        self.encode_with_legacy_version(0xfefd)
+    }
+
+    fn encode_with_legacy_version(&self, legacy_version: u16) -> Vec<u8> {
         let mut out = Vec::new();
         put_u8(&mut out, hs_type::SERVER_HELLO);
         with_len_u24(&mut out, |b| {
-            put_u16(b, 0x0303); // legacy_version
+            put_u16(b, legacy_version);
             b.extend_from_slice(&self.random);
             with_len_u8(b, |b| b.extend_from_slice(&self.session_id));
             put_u16(b, self.cipher_suite.0);
@@ -217,9 +230,20 @@ impl ServerHello {
     /// §4.1.3 / RFC 5246 §7.4.1.3: `legacy_version` MUST be `0x0303` (TLS
     /// 1.2 wire) and `legacy_compression_method` MUST be `0`.
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
+        Self::decode_expecting(body, 0x0303)
+    }
+
+    /// DTLS variant of [`Self::decode`]: `legacy_version` MUST be the DTLS 1.2
+    /// wire value `0xfefd` (RFC 6347 / RFC 9147).
+    #[cfg(feature = "dtls")]
+    pub(crate) fn decode_dtls(body: &[u8]) -> Result<Self, Error> {
+        Self::decode_expecting(body, 0xfefd)
+    }
+
+    fn decode_expecting(body: &[u8], expected_version: u16) -> Result<Self, Error> {
         let mut c = ReadCursor::new(body);
         let legacy_version = c.u16()?;
-        if legacy_version != 0x0303 {
+        if legacy_version != expected_version {
             return Err(Error::Decode);
         }
         let random = read_random(&mut c)?;
