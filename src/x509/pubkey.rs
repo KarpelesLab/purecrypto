@@ -266,6 +266,32 @@ impl AnyPublicKey {
     }
 }
 
+#[cfg(feature = "key")]
+impl AnyPublicKey {
+    /// Converts this key into a boxed unified [`key::PublicKey`] trait object,
+    /// so a parsed-by-OID key can be operated on polymorphically (verify /
+    /// encrypt) without matching on the variant.
+    ///
+    /// [`key::PublicKey`]: crate::key::PublicKey
+    pub fn into_dyn(self) -> alloc::boxed::Box<dyn crate::key::PublicKey> {
+        use alloc::boxed::Box;
+        match self {
+            AnyPublicKey::Rsa(k) => Box::new(k),
+            AnyPublicKey::Ecdsa(k) => Box::new(k),
+            AnyPublicKey::Ed25519(k) => Box::new(k),
+            AnyPublicKey::Ed448(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa44(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa65(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa87(k) => Box::new(k),
+            #[cfg(feature = "slhdsa")]
+            AnyPublicKey::SlhDsa(k) => Box::new(k),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

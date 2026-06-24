@@ -269,6 +269,28 @@ fn decode_spki_public() {
     assert_eq!(pub_dyn.algorithm(), Algorithm::Rsa);
 }
 
+#[test]
+fn any_key_into_dyn_bridge() {
+    // The enum world (`key::AnyPrivateKey`, re-exported from x509) crosses into
+    // the trait world via `into_dyn()`.
+    let mut r = rng();
+    let sk = crate::ec::Ed25519PrivateKey::generate(&mut r);
+    let pkcs8 = sk.to_pkcs8_der();
+    let any: crate::key::AnyPrivateKey =
+        crate::x509::AnyPrivateKey::from_pkcs8_der(&pkcs8, crate::x509::Pkcs8ReadOptions::new())
+            .expect("parse pkcs8");
+    let priv_dyn = any.into_dyn();
+    assert_eq!(priv_dyn.algorithm(), Algorithm::Ed25519);
+
+    let params = SignParams::new();
+    let sig = priv_dyn.sign(b"bridge", &params, &mut r).expect("sign");
+    priv_dyn
+        .public_key()
+        .expect("pub")
+        .verify(b"bridge", &sig, &params)
+        .expect("verify");
+}
+
 // ----------------------------------------------------------------------------
 // ECDSA signature wire encoding: Raw r||s vs DER round-trips, and differ
 // ----------------------------------------------------------------------------

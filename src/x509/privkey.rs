@@ -180,6 +180,32 @@ impl AnyPrivateKey {
     }
 }
 
+#[cfg(feature = "key")]
+impl AnyPrivateKey {
+    /// Converts this key into a boxed unified [`key::PrivateKey`] trait object,
+    /// so a parsed-by-OID key can be operated on polymorphically (sign /
+    /// decrypt / make_secret) without matching on the variant.
+    ///
+    /// [`key::PrivateKey`]: crate::key::PrivateKey
+    pub fn into_dyn(self) -> alloc::boxed::Box<dyn crate::key::PrivateKey> {
+        use alloc::boxed::Box;
+        match self {
+            AnyPrivateKey::Rsa(k) => Box::new(k),
+            AnyPrivateKey::Ecdsa(k) => Box::new(k),
+            AnyPrivateKey::Ed25519(k) => Box::new(k),
+            AnyPrivateKey::Ed448(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa44(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa65(k) => Box::new(k),
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa87(k) => Box::new(k),
+            #[cfg(feature = "slhdsa")]
+            AnyPrivateKey::SlhDsa(k) => Box::new(k),
+        }
+    }
+}
+
 /// Distinguishes a plaintext `PrivateKeyInfo` (first inner element is the
 /// version `INTEGER`) from an `EncryptedPrivateKeyInfo` (first inner element is
 /// the PBES2 `AlgorithmIdentifier` `SEQUENCE`).
