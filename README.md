@@ -22,9 +22,22 @@ usable three ways:
 > the public API is now mostly stable: breaking changes are rare, deliberate,
 > and gated by `cargo-semver-checks` in CI. The `hazmat-*` features are the
 > documented exception and carry no stability guarantee. The code has been
-> through repeated internal security-review-and-hardening passes, but has not
-> yet received an independent third-party audit — weigh that when deciding
-> what to protect with it.
+> through repeated internal security-review-and-hardening passes (including
+> automated whole-codebase audits by Claude Fable 5), but has not yet received
+> an independent third-party human audit — weigh that when deciding what to
+> protect with it.
+
+## Documentation
+
+- **[Security policy](SECURITY.md)** — how to report a vulnerability; assurance status.
+- **[Validation & assurance matrix](docs/validation.md)** — per module: test
+  vectors, interop targets, fuzzing, negative-input coverage, constant-time
+  posture, known limitations.
+- **[Recommended usage](docs/recommended-usage.md)** — the opinionated *safe
+  path*: blessed defaults vs. compatibility-only vs. hazmat.
+- **[Threat model](docs/threat-model.md)** — what is and isn't defended against.
+- **[Benchmarks](docs/benchmarks.md)** — real per-algorithm numbers + the
+  constant-time tradeoffs behind them.
 
 ## Design principles
 
