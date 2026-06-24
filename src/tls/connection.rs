@@ -777,6 +777,9 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
     for spki in &cfg.expected_raw_public_keys {
         cc = cc.add_expected_raw_public_key(spki.clone());
     }
+    if let Some(spki) = cfg.raw_public_key_spki.clone() {
+        cc = cc.with_client_raw_public_key_spki(spki);
+    }
     cc.key_log = cfg.key_log.clone();
     #[cfg(feature = "ech")]
     {

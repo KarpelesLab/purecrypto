@@ -226,12 +226,14 @@ pub struct Config {
     /// Client-cert-type preference list for `client_certificate_type` (mTLS).
     /// Wire encoding and defaults mirror `server_cert_type_preference`.
     pub client_cert_type_preference: Vec<u8>,
-    /// Server: bare `SubjectPublicKeyInfo` DER to send as the single
-    /// `CertificateEntry` body when `RawPublicKey` is the negotiated
-    /// server-cert type (RFC 7250 §4.2). MUST be set if
-    /// `server_cert_type_preference` advertises `RawPublicKey`; the server
-    /// otherwise falls back to its X.509 chain (and may have to refuse the
-    /// handshake if the client only offered RawPublicKey).
+    /// Bare `SubjectPublicKeyInfo` DER for THIS endpoint to send as the single
+    /// `CertificateEntry` body when `RawPublicKey` is the negotiated cert type
+    /// (RFC 7250) — the server's identity for the `server_certificate_type`
+    /// path (§4.2), or the client's identity for the mTLS
+    /// `client_certificate_type` path (§4.4). MUST correspond to the signing
+    /// key (the server identity / the client `identity`). When `RawPublicKey`
+    /// is advertised but this is unset, the endpoint falls back to its X.509
+    /// chain.
     pub raw_public_key_spki: Option<Vec<u8>>,
     /// Client: allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted
     /// as the server's raw public key. When `RawPublicKey` is negotiated,

@@ -261,6 +261,12 @@ pub(crate) struct ClientConfig {
     /// type. Empty disables the path even if the extension list advertises
     /// it (so the server's RawPublicKey would be rejected at receive time).
     pub expected_raw_public_keys: Vec<Vec<u8>>,
+    /// Bare `SubjectPublicKeyInfo` DER for THIS client to present when
+    /// `RawPublicKey` is the negotiated `client_certificate_type` (mTLS,
+    /// RFC 7250 §4.4). Must correspond to the `client_cert` signing key, or
+    /// the server's `CertificateVerify` check fails. `None` falls back to the
+    /// X.509 `client_cert` chain.
+    pub raw_public_key_spki: Option<Vec<u8>>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format). When `Some`,
     /// the engine logs every derived traffic / master secret as it
     /// progresses through the handshake.
@@ -300,6 +306,7 @@ impl ClientConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             expected_raw_public_keys: Vec::new(),
+            raw_public_key_spki: None,
             key_log: None,
             #[cfg(feature = "ech")]
             ech: None,
@@ -326,17 +333,26 @@ impl ClientConfig {
     /// Same semantics as
     /// [`with_server_cert_type_preference`](Self::with_server_cert_type_preference).
     ///
-    /// Note: the client side currently only emits X.509 `Certificate`
-    /// messages; offering `RawPublicKey` here is wired through negotiation
-    /// but the client's `send_client_certificate` path does not yet derive
-    /// an SPKI from the configured private key. Production mTLS deployments
-    /// should leave this at the default `[0]`.
+    /// Offering `RawPublicKey` (`[2]` or `[2, 0]`) also requires
+    /// [`with_client_raw_public_key_spki`](Self::with_client_raw_public_key_spki)
+    /// so the client has an SPKI to present; otherwise an X.509
+    /// [`with_client_cert`](Self::with_client_cert) chain is used.
     pub fn with_client_cert_type_preference(mut self, prefs: Vec<u8>) -> Self {
         self.client_cert_type_preference = if prefs.is_empty() {
             alloc::vec![0u8]
         } else {
             prefs
         };
+        self
+    }
+
+    /// Sets the bare `SubjectPublicKeyInfo` DER this client presents when
+    /// `RawPublicKey` is the negotiated `client_certificate_type` (mTLS,
+    /// RFC 7250 §4.4). Must match the [`with_client_cert`](Self::with_client_cert)
+    /// signing key. Combine with `with_client_cert_type_preference([2])`
+    /// (or `[2, 0]`).
+    pub fn with_client_raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
+        self.raw_public_key_spki = Some(spki_der);
         self
     }
 
@@ -3060,11 +3076,22 @@ impl ClientConnection {
     /// mTLS: emit a `Certificate` carrying our configured chain (or an empty
     /// chain if no client cert is configured).
     fn send_client_certificate(&mut self) {
+        // RFC 7250 §4.4: when RawPublicKey was negotiated for the client
+        // direction, the CertificateEntry list collapses to a single entry
+        // whose body is the SPKI DER (no X.509 cert, no per-entry extensions).
+        let rpk = self.negotiated_client_cert_type == crate::tls::codec::cert_type::RAW_PUBLIC_KEY;
         let mut msg = alloc::vec![hs_type::CERTIFICATE];
         with_len_u24(&mut msg, |b| {
             b.push(0); // certificate_request_context: empty
             with_len_u24(b, |list| {
-                if let Some(cc) = self.config.client_cert.as_ref() {
+                if rpk {
+                    // Emit the configured SPKI; if RPK was negotiated without
+                    // one configured, send an empty list (= "no certificate").
+                    if let Some(spki) = self.config.raw_public_key_spki.as_ref() {
+                        with_len_u24(list, |c| c.extend_from_slice(spki));
+                        with_len_u16(list, |_| {});
+                    }
+                } else if let Some(cc) = self.config.client_cert.as_ref() {
                     for cert in &cc.chain {
                         with_len_u24(list, |c| c.extend_from_slice(cert));
                         with_len_u16(list, |_| {});

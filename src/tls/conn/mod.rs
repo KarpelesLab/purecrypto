@@ -986,6 +986,81 @@ mod loopback_tests {
         assert_eq!(client.take_received_plaintext(), b"pong rpk");
     }
 
+    /// RFC 7250 client-side raw public key (mTLS): the server requests a
+    /// client certificate and accepts `RawPublicKey`; the client presents a
+    /// bare SPKI (no X.509 chain) and signs `CertificateVerify` with the
+    /// matching key. The handshake completes, the server recovers the SPKI as
+    /// the peer identity, and application data round-trips — exercising the
+    /// client send path that previously only emitted X.509.
+    #[test]
+    fn client_raw_public_key_mtls_loopback() {
+        use crate::tls::codec::cert_type;
+        use crate::tls::{ClientCertConfig, RootCertStore};
+        use crate::x509::AnyPublicKey;
+
+        // Normal X.509 server identity; the client trusts it via roots.
+        let (server_config, server_cert_der) = rsa_server();
+
+        // Client RPK identity: a bare Ed25519 key and its SPKI.
+        let mut ckeygen = HmacDrbg::<Sha256>::new(b"client-rpk-key", b"nonce", &[]);
+        let client_key = Ed25519PrivateKey::generate(&mut ckeygen);
+        let client_spki = AnyPublicKey::Ed25519(client_key.public_key()).to_spki_der();
+
+        // Server: require client auth and accept RawPublicKey. RPK skips PKI,
+        // so the client-auth root store is unused — pass an empty one.
+        let server_config = server_config
+            .with_client_auth(RootCertStore::new(), true)
+            .with_client_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ]);
+
+        // Client: trust the server cert; present RPK (no X.509 chain sent).
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert_der).unwrap();
+        let cc = ClientCertConfig::with_ed25519(alloc::vec::Vec::new(), client_key);
+        let client_cfg = ClientConfig::new(roots)
+            .with_client_cert(cc)
+            .with_client_cert_type_preference(alloc::vec![
+                cert_type::RAW_PUBLIC_KEY,
+                cert_type::X509,
+            ])
+            .with_client_raw_public_key_spki(client_spki.clone());
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"crpk-client", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"crpk-server", b"nonce", &[]);
+        let mut client = ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
+        let mut server = ServerConnection::new(server_config, srng);
+
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !client.is_handshaking() && !server.is_handshaking(),
+            "client-RPK mTLS handshake did not complete"
+        );
+        // The server recovered exactly the client's SPKI as the leaf identity.
+        assert_eq!(server.peer_certificates(), &[client_spki]);
+
+        client.send_application_data(b"crpk-ping").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"crpk-ping");
+    }
+
     /// RFC 7250 SPKI allowlist mismatch: the client offers RawPublicKey and
     /// the server agrees, but the client's expected SPKI doesn't match
     /// what the server actually sends. The handshake aborts at
