@@ -62,7 +62,7 @@ pub trait HandshakeSigner: Send + Sync {
 }
 
 /// Former name of [`HandshakeSigner`].
-#[deprecated(since = "0.7.0", note = "renamed to HandshakeSigner")]
+#[deprecated(since = "0.6.19", note = "renamed to HandshakeSigner")]
 pub use HandshakeSigner as PrivateKey;
 
 /// One in-flight signing operation: a non-blocking state machine that owns its

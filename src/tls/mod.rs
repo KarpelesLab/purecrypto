@@ -91,7 +91,7 @@ pub use pki::{CrlStore, PolicyOptions, RootCertStore};
 #[cfg(feature = "std")]
 pub use signer::LocalSigner;
 /// Former name of [`HandshakeSigner`], re-exported for back-compat.
-#[deprecated(since = "0.7.0", note = "renamed to HandshakeSigner")]
+#[deprecated(since = "0.6.19", note = "renamed to HandshakeSigner")]
 #[allow(deprecated)]
 pub use signer::PrivateKey;
 pub use signer::{HandshakeSigner, Readiness, SignOp, SignProgress};
