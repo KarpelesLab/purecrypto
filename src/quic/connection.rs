@@ -1410,6 +1410,26 @@ impl QuicConnection {
         self.closed
     }
 
+    /// The set of local connection IDs the peer may currently address us by
+    /// (the handshake CID at sequence 0 plus any issued via NEW_CONNECTION_ID).
+    /// A [`QuicServer`] uses this to route inbound datagrams to this connection
+    /// by their Destination Connection ID. Empty until the server has chosen
+    /// its SCID (i.e. before the first Initial is processed).
+    pub(crate) fn local_cids(&self) -> Vec<ConnectionId> {
+        self.cid_local
+            .as_ref()
+            .map(|p| p.entries.values().map(|e| e.cid).collect())
+            .unwrap_or_default()
+    }
+
+    /// The monotonic instant this connection was constructed — the `t=0`
+    /// anchor for [`Self::next_timeout`] / [`Self::on_timeout`]. A
+    /// [`QuicServer`] uses it to translate each hosted connection's
+    /// start-relative timers into a common clock frame.
+    pub(crate) fn started_at(&self) -> Instant {
+        self.start
+    }
+
     /// Queues `data` for transmission as an unreliable DATAGRAM frame
     /// (RFC 9221). Returns:
     /// * [`Error::InappropriateState`] if the handshake hasn't completed

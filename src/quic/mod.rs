@@ -34,6 +34,7 @@ pub(crate) mod connection;
 pub(crate) mod crypto;
 pub(crate) mod crypto_buf;
 pub(crate) mod datagram;
+pub mod ecn;
 pub(crate) mod endpoint;
 pub(crate) mod frame;
 pub(crate) mod loss;
@@ -50,5 +51,7 @@ pub mod transport_params;
 pub(crate) mod varint;
 
 pub use connection::{QuicConfig, QuicConnection, Role};
+pub use ecn::EcnCodepoint;
+pub use server::QuicServer;
 pub use stream::StreamId;
 pub use transport_params::TransportParameters;
