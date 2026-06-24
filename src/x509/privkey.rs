@@ -184,7 +184,7 @@ impl AnyPrivateKey {
 impl AnyPrivateKey {
     /// Converts this key into a boxed unified [`key::PrivateKey`] trait object,
     /// so a parsed-by-OID key can be operated on polymorphically (sign /
-    /// decrypt / make_secret) without matching on the variant.
+    /// decrypt / agree) without matching on the variant.
     ///
     /// [`key::PrivateKey`]: crate::key::PrivateKey
     pub fn into_dyn(self) -> alloc::boxed::Box<dyn crate::key::PrivateKey> {

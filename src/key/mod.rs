@@ -3,45 +3,43 @@
 //! Every asymmetric algorithm in the crate keeps its own concrete key type with
 //! full, statically-typed control (`RsaPrivateKey::sign_pss`,
 //! `Ed25519PrivateKey::sign`, `X25519PrivateKey::diffie_hellman`, …). This
-//! module layers a *uniform* interface over them so a caller can hold "some
-//! private key" and ask it to sign, decrypt, or derive a shared secret without
-//! branching on the concrete algorithm.
+//! module layers a *uniform*, object-safe interface over them so a caller can
+//! hold "some private key" and ask it to sign, decrypt, or derive a shared
+//! secret without branching on the concrete algorithm.
 //!
-//! # Two layers
+//! # The facade
 //!
-//! **Capability traits** describe a single operation and are implemented only by
-//! keys that can actually perform it, so the type system rejects a misuse at
-//! compile time:
+//! [`PrivateKey`] (`sign` / `decrypt` / `agree`) and [`PublicKey`] (`verify` /
+//! `encrypt`) gather the shared-reference operations behind trait objects
+//! (`Box<dyn PrivateKey>`). Each operation has a default returning
+//! [`Error::Unsupported`]; a key overrides only what it supports, and every
+//! implementor supports at least one. Asking a key to do something it cannot —
+//! decrypting with an Ed25519 key, signing with an X25519 key — fails at the
+//! call with a descriptive error rather than at compile time. This is the right
+//! shape when the algorithm is only known at run time (parsed keys,
+//! heterogeneous collections).
 //!
-//! * [`Signer`] / [`Verifier`] — signatures.
-//! * [`Decryptor`] / [`Encryptor`] — public-key encryption (RSA, SM2).
-//! * [`KeyAgreement`] — Diffie-Hellman shared secrets (ECDH, X25519/X448, DH).
-//! * [`StatefulSigner`] — the stateful hash-based signers (XMSS/LMS), whose
-//!   `sign` takes `&mut self` and consumes a one-time key.
-//! * [`Encapsulator`] / [`Decapsulator`] — KEMs (ML-KEM).
+//! # Keys that don't fit the `&self` facade
 //!
-//! **Facade traits** [`PrivateKey`] and [`PublicKey`] gather the shared-reference
-//! operations behind object-safe trait objects (`Box<dyn PrivateKey>`). Every
-//! operation has a default that returns [`Error::Unsupported`]; a key overrides
-//! only the operations it supports. Asking a key to do something it cannot —
-//! decrypting with an Ed25519 key, signing with an X25519 key — therefore fails
-//! at the call with a descriptive error rather than failing to compile. This is
-//! the right shape when the algorithm is only known at run time (parsed keys,
-//! heterogeneous collections); reach for the capability traits when the type is
-//! known and you want the compiler to check capability.
+//! Two key classes have contracts the facade can't honour and are reached
+//! through their own traits instead:
 //!
-//! Two operations do not fit the `&self` facade and live only as capability
-//! traits: stateful signing (needs `&mut self`) and KEMs (encapsulate/decapsulate
-//! is not pairwise agreement). For those keys the facade's `sign` / `make_secret`
-//! return [`Error::StatefulKey`] / [`Error::Unsupported`] and point at the
-//! capability trait.
+//! * **Stateful hash-based signers** (XMSS/LMS/HSS) — [`StatefulSigner`], whose
+//!   `sign` takes `&mut self` because each signature consumes a one-time key.
+//! * **KEMs** (ML-KEM) — [`Encapsulator`] / [`Decapsulator`]; encapsulate /
+//!   decapsulate is not pairwise agreement.
+//!
+//! These keys are deliberately **not** `PrivateKey`s, so `Box<dyn PrivateKey>`
+//! is a meaningful guarantee that a key can sign, decrypt, and/or agree.
 //!
 //! # Parameters
 //!
 //! Signing and encryption take a [`SignParams`] / [`EncryptParams`] that selects
-//! the hash, padding, and context. The [`Default`] is always valid; each
-//! algorithm reads only the fields that apply to it. See [`SignParams`] and
-//! [`EncryptParams`] for the field-by-field applicability.
+//! the hash, padding, context, and signature encoding. The [`Default`] is always
+//! valid. The structs are **consume-tracked**: setting a parameter an algorithm
+//! does not honour (an RSA padding on an Ed25519 key, a digest on a scheme that
+//! fixes its own) fails loudly with [`Error::UnsupportedParam`] rather than being
+//! silently ignored. See the [`params`](self) docs.
 
 mod algorithm;
 #[cfg(feature = "x509")]
@@ -80,8 +78,8 @@ mod tests;
 pub use algorithm::{Algorithm, Operation};
 pub use error::Error;
 pub use params::{
-    DecryptParams, EncryptParams, Hash, RsaEncPadding, RsaSigPadding, SaltLen, SigEncoding,
-    SignParams,
+    CryptParams, CryptParamsReader, DecryptParams, EncryptParams, Hash, RsaEncPadding,
+    RsaSigPadding, SaltLen, SigEncoding, SignParams, SignParamsReader,
 };
 pub use secret::Secret;
 
@@ -89,57 +87,95 @@ use crate::rng::CryptoRngCore;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-/// A key that can produce signatures.
-pub trait Signer {
+/// A private (secret) asymmetric key, behind an object-safe facade.
+///
+/// Every implementor supports at least one of [`sign`](Self::sign),
+/// [`decrypt`](Self::decrypt), or [`agree`](Self::agree); the operations it does
+/// not support keep their default, which returns [`Error::Unsupported`]. Asking
+/// a key to do something it cannot — decrypting with an Ed25519 key, signing
+/// with an X25519 key — therefore fails at the call rather than at compile time.
+///
+/// Keys whose contract does not fit a shared-reference operation are **not**
+/// `PrivateKey`s and are reached through their own traits instead: the stateful
+/// hash-based signers (XMSS/LMS, `&mut self`) via [`StatefulSigner`], and KEM
+/// decapsulation keys via [`Decapsulator`].
+pub trait PrivateKey {
+    /// The algorithm (and curve / parameter set) of this key.
+    fn algorithm(&self) -> Algorithm;
+
+    /// Derives the matching [`PublicKey`].
+    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error>;
+
     /// Signs `msg` under `params`, drawing any hedging/salt randomness from
-    /// `rng` (deterministic schemes ignore it). Returns the scheme's signature
-    /// encoding.
+    /// `rng` (deterministic schemes ignore it). Default: [`Error::Unsupported`].
     fn sign(
         &self,
         msg: &[u8],
         params: &SignParams<'_>,
         rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error>;
-}
+    ) -> Result<Vec<u8>, Error> {
+        let _ = (msg, params, rng);
+        Err(Error::unsupported(Operation::Sign, self.algorithm()))
+    }
 
-/// A key that can verify signatures.
-pub trait Verifier {
-    /// Verifies `sig` over `msg` under `params`. Returns `Ok(())` on a valid
-    /// signature and [`Error::Signature`] on an invalid one.
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error>;
-}
-
-/// A key that can decrypt ciphertext.
-pub trait Decryptor {
     /// Decrypts `ct` under `params`, returning the recovered plaintext as a
-    /// zeroize-on-drop [`Secret`].
-    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error>;
+    /// zeroize-on-drop [`Secret`]. Default: [`Error::Unsupported`].
+    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
+        let _ = (ct, params);
+        Err(Error::unsupported(Operation::Decrypt, self.algorithm()))
+    }
+
+    /// Derives a Diffie-Hellman shared secret with `peer`, which must be the
+    /// same algorithm/curve as this key (else [`Error::AlgorithmMismatch`]).
+    /// Default: [`Error::Unsupported`].
+    fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
+        let _ = peer;
+        Err(Error::unsupported(Operation::Agree, self.algorithm()))
+    }
 }
 
-/// A key that can encrypt plaintext.
-pub trait Encryptor {
-    /// Encrypts `pt` under `params`, drawing randomness from `rng`.
+/// A public asymmetric key, behind an object-safe facade.
+///
+/// Every implementor reports its [`algorithm`](Self::algorithm) and can serve as
+/// a key-agreement peer (via [`as_any`](Self::as_any)); [`verify`](Self::verify)
+/// and [`encrypt`](Self::encrypt) default to [`Error::Unsupported`] for keys
+/// that do not support them.
+pub trait PublicKey {
+    /// The algorithm (and curve / parameter set) of this key.
+    fn algorithm(&self) -> Algorithm;
+
+    /// Upcast for downcasting back to the concrete type — used by
+    /// [`PrivateKey::agree`] to recover the peer's concrete key after checking
+    /// [`algorithm`](Self::algorithm).
+    fn as_any(&self) -> &dyn core::any::Any;
+
+    /// Verifies `sig` over `msg` under `params`. Returns `Ok(())` on a valid
+    /// signature and [`Error::Signature`] on an invalid one. Default:
+    /// [`Error::Unsupported`].
+    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
+        let _ = (msg, sig, params);
+        Err(Error::unsupported(Operation::Verify, self.algorithm()))
+    }
+
+    /// Encrypts `pt` under `params`, drawing randomness from `rng`. Default:
+    /// [`Error::Unsupported`].
     fn encrypt(
         &self,
         pt: &[u8],
         params: &EncryptParams<'_>,
         rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error>;
+    ) -> Result<Vec<u8>, Error> {
+        let _ = (pt, params, rng);
+        Err(Error::unsupported(Operation::Encrypt, self.algorithm()))
+    }
 }
 
-/// A key that can derive a shared secret with a peer public key.
-pub trait KeyAgreement {
-    /// Derives a Diffie-Hellman shared secret with `peer`. `peer` must be the
-    /// same algorithm/curve as this key, otherwise
-    /// [`Error::AlgorithmMismatch`] is returned.
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error>;
-}
-
-/// A stateful hash-based signer (XMSS/LMS).
+/// A stateful hash-based signer (XMSS/LMS/HSS).
 ///
-/// Unlike [`Signer`], `sign` takes `&mut self`: each signature consumes a
-/// one-time key and advances internal state that **must** be persisted before
-/// the key is used again. Reusing a state index is catastrophic.
+/// `sign` takes `&mut self`: each signature consumes a one-time key and advances
+/// internal state that **must** be persisted before the key is used again.
+/// Reusing a state index is catastrophic, which is why these keys are not
+/// [`PrivateKey`]s (whose `sign` is `&self`).
 pub trait StatefulSigner {
     /// Signs `msg`, advancing the one-time-key index. `rng` supplies the
     /// randomizer for schemes that need one (LMS/HSS).
@@ -164,79 +200,12 @@ pub trait Decapsulator {
     fn decapsulate(&self, ct: &[u8]) -> Result<Secret, Error>;
 }
 
-/// A private (secret) asymmetric key, behind an object-safe facade.
-///
-/// Each operation defaults to [`Error::Unsupported`]; an implementor overrides
-/// only what its algorithm supports. See the [module docs](crate::key) for how
-/// this relates to the capability traits.
-pub trait PrivateKey {
-    /// The algorithm (and curve / parameter set) of this key.
-    fn algorithm(&self) -> Algorithm;
-
-    /// Derives the matching [`PublicKey`].
-    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error>;
-
-    /// Signs `msg`. Default: [`Error::Unsupported`].
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let _ = (msg, params, rng);
-        Err(Error::unsupported(Operation::Sign, self.algorithm()))
-    }
-
-    /// Decrypts `ct`. Default: [`Error::Unsupported`].
-    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        let _ = (ct, params);
-        Err(Error::unsupported(Operation::Decrypt, self.algorithm()))
-    }
-
-    /// Derives a shared secret with `peer`. Default: [`Error::Unsupported`].
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let _ = peer;
-        Err(Error::unsupported(Operation::Agree, self.algorithm()))
-    }
-}
-
-/// A public asymmetric key, behind an object-safe facade.
-///
-/// Each operation defaults to [`Error::Unsupported`]; an implementor overrides
-/// only what its algorithm supports.
-pub trait PublicKey {
-    /// The algorithm (and curve / parameter set) of this key.
-    fn algorithm(&self) -> Algorithm;
-
-    /// Upcast for downcasting back to the concrete type — used by
-    /// [`KeyAgreement::make_secret`] to recover the peer's concrete key after
-    /// checking [`algorithm`](Self::algorithm).
-    fn as_any(&self) -> &dyn core::any::Any;
-
-    /// Verifies `sig` over `msg`. Default: [`Error::Unsupported`].
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let _ = (msg, sig, params);
-        Err(Error::unsupported(Operation::Verify, self.algorithm()))
-    }
-
-    /// Encrypts `pt`. Default: [`Error::Unsupported`].
-    fn encrypt(
-        &self,
-        pt: &[u8],
-        params: &EncryptParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let _ = (pt, params, rng);
-        Err(Error::unsupported(Operation::Encrypt, self.algorithm()))
-    }
-}
-
 /// Checks `peer.algorithm()` against `expected` and downcasts the trait object
 /// to the concrete public-key type `T`.
 ///
-/// Used by [`KeyAgreement::make_secret`] implementations to recover the peer's
-/// concrete key. Returns [`Error::AlgorithmMismatch`] if the algorithm tag does
-/// not match or the concrete type is not `T`.
+/// Used by [`PrivateKey::agree`] implementations to recover the peer's concrete
+/// key. Returns [`Error::AlgorithmMismatch`] if the algorithm tag does not match
+/// or the concrete type is not `T`.
 //
 // `allow(dead_code)`: only the key-agreement impls (EC, DH) call this, so it is
 // unused under feature combinations that enable `key` without any agreement

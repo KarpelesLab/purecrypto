@@ -8,7 +8,7 @@ use crate::key::{Algorithm, Operation};
 /// Operation failures are mapped to coarse categories (`Signature`,
 /// `Decryption`, …) rather than wrapping each algorithm's own error, so the
 /// facade stays uniform across schemes. The structural variants
-/// (`Unsupported`, `AlgorithmMismatch`, `StatefulKey`, `InvalidParams`)
+/// (`Unsupported`, `AlgorithmMismatch`, `UnsupportedParam`, `InvalidParams`)
 /// describe misuse of the abstraction itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -29,13 +29,15 @@ pub enum Error {
         /// The algorithm the supplied peer actually has.
         found: Algorithm,
     },
-    /// The key is a stateful hash-based signer (XMSS/LMS): it cannot sign
-    /// through the shared-reference facade. Use
-    /// [`StatefulSigner`](crate::key::StatefulSigner) instead.
-    StatefulKey,
-    /// The supplied [`SignParams`](crate::key::SignParams) /
-    /// [`EncryptParams`](crate::key::EncryptParams) cannot be honoured by this
-    /// algorithm (e.g. a padding or hash it does not implement).
+    /// The caller explicitly set a parameter this algorithm does not honour
+    /// (e.g. an RSA padding on an Ed25519 key, or a digest on a scheme that
+    /// fixes its own). `param` names the offending field.
+    UnsupportedParam {
+        /// The name of the parameter that is not supported.
+        param: &'static str,
+    },
+    /// A supported parameter was set to a value this algorithm cannot honour
+    /// (e.g. an unimplemented PSS salt length).
     InvalidParams,
     /// Signature generation or verification failed.
     Signature,
@@ -74,8 +76,15 @@ impl core::fmt::Display for Error {
                 f,
                 "key-agreement peer mismatch: expected {expected:?}, got {found:?}"
             ),
-            Error::StatefulKey => f.write_str("stateful key: use the StatefulSigner trait to sign"),
-            Error::InvalidParams => f.write_str("parameters not supported by this algorithm"),
+            Error::UnsupportedParam { param } => {
+                write!(
+                    f,
+                    "the `{param}` parameter is not supported by this algorithm"
+                )
+            }
+            Error::InvalidParams => {
+                f.write_str("a parameter value is not supported by this algorithm")
+            }
             Error::Signature => f.write_str("signature operation failed"),
             Error::Encryption => f.write_str("encryption failed"),
             Error::Decryption => f.write_str("decryption failed"),

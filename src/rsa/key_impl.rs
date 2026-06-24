@@ -1,32 +1,31 @@
-//! Unified [`key`](crate::key) trait impls for the RSA keys.
+//! Unified [`key`](crate::key) facade impls for the RSA keys.
 //!
-//! Each key implements the fine-grained capability trait(s) it supports
-//! (`Signer`/`Verifier` for signatures, `Decryptor`/`Encryptor` for
-//! public-key encryption) plus the object-safe facade
-//! (`PrivateKey`/`PublicKey`); the facade methods just delegate to the
-//! capability impls. Operations a key cannot perform fall through to the
-//! facade's defaulted [`Error::Unsupported`](crate::key::Error).
+//! Each key implements [`PrivateKey`]/[`PublicKey`] directly for the operations
+//! it supports; unsupported operations fall through to the facade defaults
+//! ([`Error::Unsupported`](crate::key::Error)). Per-call parameters are read
+//! through the consume-tracking
+//! [`SignParamsReader`](crate::key::SignParamsReader) /
+//! [`CryptParamsReader`](crate::key::CryptParamsReader) so that any parameter
+//! the algorithm does not honour is rejected loudly.
 //!
 //! Both the runtime-sized [`BoxedRsaPrivateKey`]/[`BoxedRsaPublicKey`] and the
 //! const-generic [`RsaPrivateKey`]/[`RsaPublicKey`] are covered; they share the
 //! same dispatch logic since they expose the same PKCS#1 / PSS / OAEP method
 //! surface.
 //!
-//! # Unsupported parameter combinations
-//!
-//! * `SignParams::prehashed == true` — RSA's only prehash entry points are the
-//!   `tls-legacy` raw MD5‖SHA-1 helpers (no `DigestInfo`, no PSS/OAEP
-//!   equivalent), not a general prehash of an arbitrary digest, so the unified
-//!   facade maps prehashed RSA to [`Error::InvalidParams`].
-//! * `SaltLen::Max` for PSS — there is no "maximum salt length" signing API
-//!   here, so it maps to [`Error::InvalidParams`].
+//! RSA honours `hash` + `padding` (a [`RsaSigPadding`]) for signing and
+//! verification, and `padding` (a [`RsaEncPadding`]) + `label` for encryption
+//! and decryption. It does not read `prehashed`, `context`, `deterministic`, or
+//! `sig_encoding`, so the reader's `finish()` rejects them if the caller set
+//! them. [`SaltLen::Max`] has no signing API here and maps to
+//! [`Error::InvalidParams`].
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, DecryptParams, Decryptor, EncryptParams, Encryptor, Error, Hash, PrivateKey,
-    PublicKey, RsaEncPadding, RsaSigPadding, SaltLen, Secret, SignParams, Signer, Verifier,
+    Algorithm, DecryptParams, EncryptParams, Error, Hash, PrivateKey, PublicKey, RsaEncPadding,
+    RsaSigPadding, SaltLen, Secret, SignParams,
 };
 use crate::rng::CryptoRngCore;
 
@@ -65,47 +64,6 @@ macro_rules! dispatch_hash {
 // BoxedRsaPrivateKey
 // ----------------------------------------------------------------------------
 
-impl Signer for BoxedRsaPrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        if params.prehashed {
-            return Err(Error::InvalidParams);
-        }
-        let mut rng = rng;
-        match params.padding {
-            RsaSigPadding::Pss { salt_len } => dispatch_hash!(params.hash, |D| {
-                match salt_len {
-                    SaltLen::DigestLength => self.sign_pss::<D, _>(msg, &mut rng),
-                    SaltLen::Fixed(n) => self.sign_pss_with_salt_len::<D, _>(msg, n, &mut rng),
-                    SaltLen::Max => return Err(Error::InvalidParams),
-                }
-            })
-            .map_err(|_| Error::Signature),
-            RsaSigPadding::Pkcs1v15 => {
-                dispatch_hash!(params.hash, |D| { self.sign_pkcs1v15::<D>(msg) })
-                    .map_err(|_| Error::Signature)
-            }
-        }
-    }
-}
-
-impl Decryptor for BoxedRsaPrivateKey {
-    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        let pt = match params.padding {
-            RsaEncPadding::Oaep { hash, .. } => {
-                dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, params.label) })
-            }
-            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
-        }
-        .map_err(|_| Error::Decryption)?;
-        Ok(Secret::from_bytes(pt))
-    }
-}
-
 impl PrivateKey for BoxedRsaPrivateKey {
     fn algorithm(&self) -> Algorithm {
         Algorithm::Rsa
@@ -119,58 +77,43 @@ impl PrivateKey for BoxedRsaPrivateKey {
         params: &SignParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let padding = p.padding();
+        p.finish()?;
+        let mut rng = rng;
+        match padding {
+            RsaSigPadding::Pss { salt_len } => dispatch_hash!(hash, |D| {
+                match salt_len {
+                    SaltLen::DigestLength => self.sign_pss::<D, _>(msg, &mut rng),
+                    SaltLen::Fixed(n) => self.sign_pss_with_salt_len::<D, _>(msg, n, &mut rng),
+                    SaltLen::Max => return Err(Error::InvalidParams),
+                }
+            })
+            .map_err(|_| Error::Signature),
+            RsaSigPadding::Pkcs1v15 => dispatch_hash!(hash, |D| { self.sign_pkcs1v15::<D>(msg) })
+                .map_err(|_| Error::Signature),
+        }
     }
     fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        Decryptor::decrypt(self, ct, params)
+        let mut p = params.reader();
+        let padding = p.padding();
+        let label = p.label();
+        p.finish()?;
+        let pt = match padding {
+            RsaEncPadding::Oaep { hash, .. } => {
+                dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, label) })
+            }
+            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
+        }
+        .map_err(|_| Error::Decryption)?;
+        Ok(Secret::from_bytes(pt))
     }
 }
 
 // ----------------------------------------------------------------------------
 // BoxedRsaPublicKey
 // ----------------------------------------------------------------------------
-
-impl Verifier for BoxedRsaPublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        if params.prehashed {
-            return Err(Error::InvalidParams);
-        }
-        match params.padding {
-            RsaSigPadding::Pss { salt_len } => dispatch_hash!(params.hash, |D| {
-                match salt_len {
-                    SaltLen::DigestLength => self.verify_pss::<D>(msg, sig),
-                    SaltLen::Fixed(n) => self.verify_pss_with_salt_len::<D>(msg, sig, n),
-                    SaltLen::Max => return Err(Error::InvalidParams),
-                }
-            })
-            .map_err(|_| Error::Signature),
-            RsaSigPadding::Pkcs1v15 => {
-                dispatch_hash!(params.hash, |D| { self.verify_pkcs1v15::<D>(msg, sig) })
-                    .map_err(|_| Error::Signature)
-            }
-        }
-    }
-}
-
-impl Encryptor for BoxedRsaPublicKey {
-    fn encrypt(
-        &self,
-        pt: &[u8],
-        params: &EncryptParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let mut rng = rng;
-        match params.padding {
-            RsaEncPadding::Oaep { hash, .. } => {
-                dispatch_hash!(hash, |D| {
-                    self.encrypt_oaep::<D, _>(pt, params.label, &mut rng)
-                })
-            }
-            RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),
-        }
-        .map_err(|_| Error::Encryption)
-    }
-}
 
 impl PublicKey for BoxedRsaPublicKey {
     fn algorithm(&self) -> Algorithm {
@@ -180,7 +123,24 @@ impl PublicKey for BoxedRsaPublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let padding = p.padding();
+        p.finish()?;
+        match padding {
+            RsaSigPadding::Pss { salt_len } => dispatch_hash!(hash, |D| {
+                match salt_len {
+                    SaltLen::DigestLength => self.verify_pss::<D>(msg, sig),
+                    SaltLen::Fixed(n) => self.verify_pss_with_salt_len::<D>(msg, sig, n),
+                    SaltLen::Max => return Err(Error::InvalidParams),
+                }
+            })
+            .map_err(|_| Error::Signature),
+            RsaSigPadding::Pkcs1v15 => {
+                dispatch_hash!(hash, |D| { self.verify_pkcs1v15::<D>(msg, sig) })
+                    .map_err(|_| Error::Signature)
+            }
+        }
     }
     fn encrypt(
         &self,
@@ -188,54 +148,24 @@ impl PublicKey for BoxedRsaPublicKey {
         params: &EncryptParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Encryptor::encrypt(self, pt, params, rng)
+        let mut p = params.reader();
+        let padding = p.padding();
+        let label = p.label();
+        p.finish()?;
+        let mut rng = rng;
+        match padding {
+            RsaEncPadding::Oaep { hash, .. } => {
+                dispatch_hash!(hash, |D| { self.encrypt_oaep::<D, _>(pt, label, &mut rng) })
+            }
+            RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),
+        }
+        .map_err(|_| Error::Encryption)
     }
 }
 
 // ----------------------------------------------------------------------------
 // RsaPrivateKey<LIMBS>
 // ----------------------------------------------------------------------------
-
-impl<const LIMBS: usize> Signer for RsaPrivateKey<LIMBS> {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        if params.prehashed {
-            return Err(Error::InvalidParams);
-        }
-        let mut rng = rng;
-        match params.padding {
-            RsaSigPadding::Pss { salt_len } => dispatch_hash!(params.hash, |D| {
-                match salt_len {
-                    SaltLen::DigestLength => self.sign_pss::<D, _>(msg, &mut rng),
-                    SaltLen::Fixed(n) => self.sign_pss_with_salt_len::<D, _>(msg, n, &mut rng),
-                    SaltLen::Max => return Err(Error::InvalidParams),
-                }
-            })
-            .map_err(|_| Error::Signature),
-            RsaSigPadding::Pkcs1v15 => {
-                dispatch_hash!(params.hash, |D| { self.sign_pkcs1v15::<D>(msg) })
-                    .map_err(|_| Error::Signature)
-            }
-        }
-    }
-}
-
-impl<const LIMBS: usize> Decryptor for RsaPrivateKey<LIMBS> {
-    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        let pt = match params.padding {
-            RsaEncPadding::Oaep { hash, .. } => {
-                dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, params.label) })
-            }
-            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
-        }
-        .map_err(|_| Error::Decryption)?;
-        Ok(Secret::from_bytes(pt))
-    }
-}
 
 impl<const LIMBS: usize> PrivateKey for RsaPrivateKey<LIMBS> {
     fn algorithm(&self) -> Algorithm {
@@ -250,58 +180,43 @@ impl<const LIMBS: usize> PrivateKey for RsaPrivateKey<LIMBS> {
         params: &SignParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let padding = p.padding();
+        p.finish()?;
+        let mut rng = rng;
+        match padding {
+            RsaSigPadding::Pss { salt_len } => dispatch_hash!(hash, |D| {
+                match salt_len {
+                    SaltLen::DigestLength => self.sign_pss::<D, _>(msg, &mut rng),
+                    SaltLen::Fixed(n) => self.sign_pss_with_salt_len::<D, _>(msg, n, &mut rng),
+                    SaltLen::Max => return Err(Error::InvalidParams),
+                }
+            })
+            .map_err(|_| Error::Signature),
+            RsaSigPadding::Pkcs1v15 => dispatch_hash!(hash, |D| { self.sign_pkcs1v15::<D>(msg) })
+                .map_err(|_| Error::Signature),
+        }
     }
     fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        Decryptor::decrypt(self, ct, params)
+        let mut p = params.reader();
+        let padding = p.padding();
+        let label = p.label();
+        p.finish()?;
+        let pt = match padding {
+            RsaEncPadding::Oaep { hash, .. } => {
+                dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, label) })
+            }
+            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
+        }
+        .map_err(|_| Error::Decryption)?;
+        Ok(Secret::from_bytes(pt))
     }
 }
 
 // ----------------------------------------------------------------------------
 // RsaPublicKey<LIMBS>
 // ----------------------------------------------------------------------------
-
-impl<const LIMBS: usize> Verifier for RsaPublicKey<LIMBS> {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        if params.prehashed {
-            return Err(Error::InvalidParams);
-        }
-        match params.padding {
-            RsaSigPadding::Pss { salt_len } => dispatch_hash!(params.hash, |D| {
-                match salt_len {
-                    SaltLen::DigestLength => self.verify_pss::<D>(msg, sig),
-                    SaltLen::Fixed(n) => self.verify_pss_with_salt_len::<D>(msg, sig, n),
-                    SaltLen::Max => return Err(Error::InvalidParams),
-                }
-            })
-            .map_err(|_| Error::Signature),
-            RsaSigPadding::Pkcs1v15 => {
-                dispatch_hash!(params.hash, |D| { self.verify_pkcs1v15::<D>(msg, sig) })
-                    .map_err(|_| Error::Signature)
-            }
-        }
-    }
-}
-
-impl<const LIMBS: usize> Encryptor for RsaPublicKey<LIMBS> {
-    fn encrypt(
-        &self,
-        pt: &[u8],
-        params: &EncryptParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let mut rng = rng;
-        match params.padding {
-            RsaEncPadding::Oaep { hash, .. } => {
-                dispatch_hash!(hash, |D| {
-                    self.encrypt_oaep::<D, _>(pt, params.label, &mut rng)
-                })
-            }
-            RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),
-        }
-        .map_err(|_| Error::Encryption)
-    }
-}
 
 impl<const LIMBS: usize> PublicKey for RsaPublicKey<LIMBS> {
     fn algorithm(&self) -> Algorithm {
@@ -311,7 +226,24 @@ impl<const LIMBS: usize> PublicKey for RsaPublicKey<LIMBS> {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let padding = p.padding();
+        p.finish()?;
+        match padding {
+            RsaSigPadding::Pss { salt_len } => dispatch_hash!(hash, |D| {
+                match salt_len {
+                    SaltLen::DigestLength => self.verify_pss::<D>(msg, sig),
+                    SaltLen::Fixed(n) => self.verify_pss_with_salt_len::<D>(msg, sig, n),
+                    SaltLen::Max => return Err(Error::InvalidParams),
+                }
+            })
+            .map_err(|_| Error::Signature),
+            RsaSigPadding::Pkcs1v15 => {
+                dispatch_hash!(hash, |D| { self.verify_pkcs1v15::<D>(msg, sig) })
+                    .map_err(|_| Error::Signature)
+            }
+        }
     }
     fn encrypt(
         &self,
@@ -319,6 +251,17 @@ impl<const LIMBS: usize> PublicKey for RsaPublicKey<LIMBS> {
         params: &EncryptParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Encryptor::encrypt(self, pt, params, rng)
+        let mut p = params.reader();
+        let padding = p.padding();
+        let label = p.label();
+        p.finish()?;
+        let mut rng = rng;
+        match padding {
+            RsaEncPadding::Oaep { hash, .. } => {
+                dispatch_hash!(hash, |D| { self.encrypt_oaep::<D, _>(pt, label, &mut rng) })
+            }
+            RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),
+        }
+        .map_err(|_| Error::Encryption)
     }
 }

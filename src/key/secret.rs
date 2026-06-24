@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 /// A heap buffer of secret bytes that is wiped when dropped.
 ///
 /// Returned by the operations that produce raw secret material — key agreement
-/// ([`PrivateKey::make_secret`](crate::key::PrivateKey::make_secret)),
+/// ([`PrivateKey::agree`](crate::key::PrivateKey::agree)),
 /// decryption ([`PrivateKey::decrypt`](crate::key::PrivateKey::decrypt)), and
 /// KEM decapsulation ([`Decapsulator::decapsulate`](crate::key::Decapsulator::decapsulate))
 /// — so the plaintext/shared-secret does not linger on the heap after use.

@@ -1,10 +1,11 @@
-//! Unified [`key`](crate::key) trait impls for the SLH-DSA (FIPS 205) keys.
+//! Unified [`key`](crate::key) facade impls for the SLH-DSA (FIPS 205) keys.
 //!
-//! The single [`PrivateKey`](super::PrivateKey) implements [`Signer`] and the
-//! [`PrivateKey`] facade; [`PublicKey`](super::PublicKey) implements
-//! [`Verifier`] and the [`PublicKey`] facade. Both carry their parameter set at
-//! run time; every set maps to the single [`Algorithm::SlhDsa`] discriminant.
-//! The facade methods just delegate to the capability impls.
+//! The single [`PrivateKey`](super::PrivateKey)/[`PublicKey`](super::PublicKey)
+//! implement the [`key`](crate::key) facade directly. Both carry their
+//! parameter set at run time; every set maps to the single
+//! [`Algorithm::SlhDsa`] discriminant. Per-call parameters are read through the
+//! consume-tracking [`SignParamsReader`](crate::key::SignParamsReader) so that
+//! any parameter the algorithm does not honour is rejected loudly.
 //!
 //! # `SignParams` usage
 //!
@@ -14,35 +15,17 @@
 //! * `deterministic` — selects the deterministic (zero-randomness) signing
 //!   variant when set; otherwise the hedged variant draws from `rng`.
 //!
-//! `hash`, `prehashed`, and `padding` are ignored.
+//! Setting `hash`, `prehashed`, `padding`, or `sig_encoding` is rejected.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, Error, PrivateKey as KeyPrivateKey, PublicKey as KeyPublicKey, SignParams, Signer,
-    Verifier,
+    Algorithm, Error, PrivateKey as KeyPrivateKey, PublicKey as KeyPublicKey, SignParams,
 };
 use crate::rng::CryptoRngCore;
 
 use super::{PrivateKey, PublicKey};
-
-impl Signer for PrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let sig = if params.deterministic {
-            self.sign_deterministic(msg, params.context)
-        } else {
-            let mut rng = rng;
-            self.sign(&mut rng, msg, params.context)
-        };
-        sig.map_err(|_| Error::Signature)
-    }
-}
 
 impl KeyPrivateKey for PrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -57,17 +40,17 @@ impl KeyPrivateKey for PrivateKey {
         params: &SignParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-}
-
-impl Verifier for PublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        if self.verify(sig, msg, params.context) {
-            Ok(())
+        let mut p = params.reader();
+        let context = p.context();
+        let deterministic = p.deterministic();
+        p.finish()?;
+        let sig = if deterministic {
+            self.sign_deterministic(msg, context)
         } else {
-            Err(Error::Signature)
-        }
+            let mut rng = rng;
+            self.sign(&mut rng, msg, context)
+        };
+        sig.map_err(|_| Error::Signature)
     }
 }
 
@@ -79,6 +62,13 @@ impl KeyPublicKey for PublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let context = p.context();
+        p.finish()?;
+        if self.verify(sig, msg, context) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
+        }
     }
 }

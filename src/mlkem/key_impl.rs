@@ -2,15 +2,14 @@
 //!
 //! ML-KEM is a KEM, not a signature or pairwise-agreement scheme, so the
 //! encapsulation (public) keys implement [`Encapsulator`] and the decapsulation
-//! (secret) keys implement [`Decapsulator`]. Both also wear the object-safe
-//! facade ([`PublicKey`] / [`PrivateKey`]) for introspection and public-key
-//! derivation; the facade's sign / decrypt / make_secret operations stay at
-//! their defaulted [`Error::Unsupported`].
+//! (secret) keys implement [`Decapsulator`]. These keys are deliberately **not**
+//! [`PrivateKey`](crate::key::PrivateKey) / [`PublicKey`](crate::key::PublicKey)
+//! facade keys: encapsulate / decapsulate is not the facade's sign / decrypt /
+//! agree contract.
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::key::{Algorithm, Decapsulator, Encapsulator, Error, PrivateKey, PublicKey, Secret};
+use crate::key::{Decapsulator, Encapsulator, Error, Secret};
 use crate::rng::CryptoRngCore;
 
 use super::{
@@ -34,29 +33,11 @@ macro_rules! ml_kem_key_impls {
             }
         }
 
-        impl PrivateKey for $dk {
-            fn algorithm(&self) -> Algorithm {
-                Algorithm::$alg
-            }
-            fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
-                Ok(Box::new(self.encapsulation_key()))
-            }
-        }
-
         impl Encapsulator for $ek {
             fn encapsulate(&self, rng: &mut dyn CryptoRngCore) -> Result<(Vec<u8>, Secret), Error> {
                 let mut rng = rng;
                 let (ct, ss) = self.encapsulate(&mut rng);
                 Ok((ct.to_bytes().to_vec(), Secret::from_bytes(ss.to_vec())))
-            }
-        }
-
-        impl PublicKey for $ek {
-            fn algorithm(&self) -> Algorithm {
-                Algorithm::$alg
-            }
-            fn as_any(&self) -> &dyn core::any::Any {
-                self
             }
         }
     };

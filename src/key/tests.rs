@@ -1,7 +1,7 @@
 //! End-to-end tests that drive the per-algorithm keys through the unified
-//! [`key`](crate::key) traits — proving the object-safe facade and the
-//! capability traits work over `dyn` objects, that unsupported operations fail
-//! at the call, and that peer-mismatch / stateful guards fire.
+//! [`key`](crate::key) facade over `dyn` objects — proving operations work,
+//! that unsupported operations and unsupported parameters fail loudly, and that
+//! peer-mismatch is rejected.
 //!
 //! Gated to the feature set these tests exercise (the default build has them
 //! all); see the `#[cfg(...)] mod tests` line in `key/mod.rs`.
@@ -148,15 +148,15 @@ fn x25519_agreement_and_mismatch() {
     let a_pub = a_dyn.public_key().expect("a pub");
     let b_pub = b_dyn.public_key().expect("b pub");
 
-    let s_ab = a_dyn.make_secret(b_pub.as_ref()).expect("a·B");
-    let s_ba = b_dyn.make_secret(a_pub.as_ref()).expect("b·A");
+    let s_ab = a_dyn.agree(b_pub.as_ref()).expect("a·B");
+    let s_ba = b_dyn.agree(a_pub.as_ref()).expect("b·A");
     assert_eq!(s_ab.as_bytes(), s_ba.as_bytes());
 
     // A peer of a different algorithm is rejected before any computation.
     let ed = crate::ec::Ed25519PrivateKey::generate(&mut r);
     let ed_dyn: Box<dyn PrivateKey> = Box::new(ed);
     let ed_pub = ed_dyn.public_key().expect("ed pub");
-    match a_dyn.make_secret(ed_pub.as_ref()) {
+    match a_dyn.agree(ed_pub.as_ref()) {
         Err(Error::AlgorithmMismatch {
             expected: Algorithm::X25519,
             found: Algorithm::Ed25519,
@@ -174,8 +174,8 @@ fn ecdh_p256_agreement() {
     let b_dyn: Box<dyn PrivateKey> = Box::new(b);
     let a_pub = a_dyn.public_key().expect("a pub");
     let b_pub = b_dyn.public_key().expect("b pub");
-    let s_ab = a_dyn.make_secret(b_pub.as_ref()).expect("a·B");
-    let s_ba = b_dyn.make_secret(a_pub.as_ref()).expect("b·A");
+    let s_ab = a_dyn.agree(b_pub.as_ref()).expect("a·B");
+    let s_ba = b_dyn.agree(a_pub.as_ref()).expect("b·A");
     assert_eq!(s_ab.as_bytes(), s_ba.as_bytes());
 }
 
@@ -214,11 +214,12 @@ fn mldsa65_sign_verify_via_facade() {
 }
 
 // ----------------------------------------------------------------------------
-// XMSS: stateful signer advances; the &self facade refuses to sign
+// XMSS: stateful signer advances. (Stateful private keys are deliberately NOT
+// `PrivateKey`s — they are reached only through `StatefulSigner`.)
 // ----------------------------------------------------------------------------
 
 #[test]
-fn xmss_stateful_signer_and_facade_guard() {
+fn xmss_stateful_signer() {
     let mut r = rng();
     let mut sk =
         crate::xmss::XmssPrivateKey::generate(crate::xmss::XmssParamSet::Sha2_10_256, &mut r);
@@ -228,16 +229,34 @@ fn xmss_stateful_signer_and_facade_guard() {
     let after = StatefulSigner::remaining(&sk);
     assert_eq!(after, before - 1, "stateful sign must consume one OTS key");
 
-    let pk = sk.public_key();
-    assert!(pk.verify(b"once", &sig));
+    // The public key (a normal `&self` verifier) still works through the facade.
+    let pub_dyn: Box<dyn PublicKey> = Box::new(sk.public_key());
+    assert_eq!(pub_dyn.algorithm(), Algorithm::Xmss);
+    pub_dyn
+        .verify(b"once", &sig, &SignParams::new())
+        .expect("xmss verify");
+}
 
-    // The shared-reference facade cannot sign a stateful key.
+// ----------------------------------------------------------------------------
+// Consume-tracked params: an unsupported field set by the caller fails loudly.
+// ----------------------------------------------------------------------------
+
+#[test]
+fn unsupported_param_is_rejected() {
+    let mut r = rng();
+    let sk = crate::ec::Ed25519PrivateKey::generate(&mut r);
     let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
-    match priv_dyn.sign(b"again", &SignParams::new(), &mut r) {
-        Err(Error::StatefulKey) => {}
-        other => panic!("expected StatefulKey, got {other:?}"),
+
+    // Ed25519 honours no parameters; setting a hash must fail loudly.
+    let params = SignParams::new().hash(Hash::Sha256);
+    match priv_dyn.sign(b"m", &params, &mut r) {
+        Err(Error::UnsupportedParam { param: "hash" }) => {}
+        other => panic!("expected UnsupportedParam(hash), got {other:?}"),
     }
-    assert_eq!(priv_dyn.algorithm(), Algorithm::Xmss);
+    // Default params (nothing set) are accepted.
+    priv_dyn
+        .sign(b"m", &SignParams::new(), &mut r)
+        .expect("default params ok");
 }
 
 // ----------------------------------------------------------------------------

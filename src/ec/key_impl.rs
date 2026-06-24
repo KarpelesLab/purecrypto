@@ -1,17 +1,17 @@
-//! Unified [`key`](crate::key) trait impls for the elliptic-curve keys.
+//! Unified [`key`](crate::key) facade impls for the elliptic-curve keys.
 //!
-//! Each key implements the fine-grained capability trait(s) it supports
-//! (`Signer`/`Verifier`/`KeyAgreement`) plus the object-safe facade
-//! (`PrivateKey`/`PublicKey`); the facade methods just delegate to the
-//! capability impls. Operations a key cannot perform fall through to the
-//! facade's defaulted [`Error::Unsupported`](crate::key::Error).
+//! Each key implements [`PrivateKey`]/[`PublicKey`] directly for the operations
+//! it supports; unsupported operations fall through to the facade defaults
+//! ([`Error::Unsupported`](crate::key::Error)). Per-call parameters are read
+//! through the consume-tracking [`SignParamsReader`](crate::key::SignParamsReader)
+//! so that any parameter the algorithm does not honour is rejected loudly.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, DecryptParams, Decryptor, EncryptParams, Encryptor, Error, Hash, KeyAgreement,
-    PrivateKey, PublicKey, Secret, SigEncoding, SignParams, Signer, Verifier, downcast_peer,
+    Algorithm, CryptParams, Error, Hash, PrivateKey, PublicKey, Secret, SigEncoding, SignParams,
+    downcast_peer,
 };
 use crate::rng::CryptoRngCore;
 
@@ -24,7 +24,7 @@ use super::x448::{X448PrivateKey, X448PublicKey};
 use super::x25519::{X25519PrivateKey, X25519PublicKey};
 
 /// Runs `$body` with `$d` aliased to the concrete digest named by `$h`
-/// (a [`Hash`]). Used to bridge the runtime hash selector into the generic
+/// (a [`Hash`]). Bridges the runtime hash selector into the generic
 /// `sign::<D>` / `verify::<D>` methods.
 macro_rules! dispatch_hash {
     ($h:expr, |$d:ident| $body:block) => {
@@ -50,21 +50,8 @@ macro_rules! dispatch_hash {
 }
 
 // ----------------------------------------------------------------------------
-// Ed25519
+// Ed25519 — fixes its own hash, no params honoured
 // ----------------------------------------------------------------------------
-
-impl Signer for Ed25519PrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        _params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        // Ed25519 is deterministic and fixes its own hash (SHA-512); it has no
-        // prehash or context variant here, so `params` and `rng` are ignored.
-        Ok(self.sign(msg).to_bytes().to_vec())
-    }
-}
 
 impl PrivateKey for Ed25519PrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -77,17 +64,10 @@ impl PrivateKey for Ed25519PrivateKey {
         &self,
         msg: &[u8],
         params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
+        _rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-}
-
-impl Verifier for Ed25519PublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], _params: &SignParams<'_>) -> Result<(), Error> {
-        let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
-        self.verify(msg, &Ed25519Signature::from_bytes(bytes))
-            .map_err(|_| Error::Signature)
+        params.reader().finish()?;
+        Ok(self.sign(msg).to_bytes().to_vec())
     }
 }
 
@@ -99,29 +79,16 @@ impl PublicKey for Ed25519PublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        params.reader().finish()?;
+        let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
+        self.verify(msg, &Ed25519Signature::from_bytes(bytes))
+            .map_err(|_| Error::Signature)
     }
 }
 
 // ----------------------------------------------------------------------------
-// Ed448
+// Ed448 — honours `context`
 // ----------------------------------------------------------------------------
-
-impl Signer for Ed448PrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let sig = if params.context.is_empty() {
-            self.sign(msg)
-        } else {
-            self.sign_ctx(msg, params.context)
-        };
-        Ok(sig.to_bytes().to_vec())
-    }
-}
 
 impl PrivateKey for Ed448PrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -134,22 +101,17 @@ impl PrivateKey for Ed448PrivateKey {
         &self,
         msg: &[u8],
         params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
+        _rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-}
-
-impl Verifier for Ed448PublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let bytes: [u8; 114] = sig.try_into().map_err(|_| Error::Signature)?;
-        let signature = Ed448Signature::from_bytes(bytes);
-        let res = if params.context.is_empty() {
-            self.verify(msg, &signature)
+        let mut p = params.reader();
+        let context = p.context();
+        p.finish()?;
+        let sig = if context.is_empty() {
+            self.sign(msg)
         } else {
-            self.verify_ctx(msg, &signature, params.context)
+            self.sign_ctx(msg, context)
         };
-        res.map_err(|_| Error::Signature)
+        Ok(sig.to_bytes().to_vec())
     }
 }
 
@@ -161,35 +123,23 @@ impl PublicKey for Ed448PublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let context = p.context();
+        p.finish()?;
+        let bytes: [u8; 114] = sig.try_into().map_err(|_| Error::Signature)?;
+        let signature = Ed448Signature::from_bytes(bytes);
+        let res = if context.is_empty() {
+            self.verify(msg, &signature)
+        } else {
+            self.verify_ctx(msg, &signature, context)
+        };
+        res.map_err(|_| Error::Signature)
     }
 }
 
 // ----------------------------------------------------------------------------
-// ECDSA over P-256 (fixed)
+// ECDSA over P-256 (fixed) — honours hash, prehashed, sig_encoding
 // ----------------------------------------------------------------------------
-
-impl Signer for EcdsaPrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let sig = dispatch_hash!(params.hash, |D| {
-            if params.prehashed {
-                self.sign_prehash::<D>(msg)
-            } else {
-                self.sign::<D>(msg)
-            }
-        })
-        .map_err(|_| Error::Signature)?;
-        Ok(match params.sig_encoding {
-            SigEncoding::Raw => sig.to_bytes().to_vec(),
-            SigEncoding::Der => sig.to_der(),
-        })
-    }
-}
 
 impl PrivateKey for EcdsaPrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -202,27 +152,25 @@ impl PrivateKey for EcdsaPrivateKey {
         &self,
         msg: &[u8],
         params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
+        _rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-}
-
-impl Verifier for EcdsaPublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let signature = match params.sig_encoding {
-            SigEncoding::Raw => {
-                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
-                Signature::from_bytes(&bytes)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let sig = dispatch_hash!(hash, |D| {
+            if prehashed {
+                self.sign_prehash::<D>(msg)
+            } else {
+                self.sign::<D>(msg)
             }
-            SigEncoding::Der => Signature::from_der(sig).map_err(|_| Error::Signature)?,
-        };
-        if params.prehashed {
-            self.verify_prehash(msg, &signature)
-        } else {
-            dispatch_hash!(params.hash, |D| { self.verify::<D>(msg, &signature) })
-        }
-        .map_err(|_| Error::Signature)
+        })
+        .map_err(|_| Error::Signature)?;
+        Ok(match enc {
+            SigEncoding::Raw => sig.to_bytes().to_vec(),
+            SigEncoding::Der => sig.to_der(),
+        })
     }
 }
 
@@ -234,21 +182,30 @@ impl PublicKey for EcdsaPublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let signature = match enc {
+            SigEncoding::Raw => {
+                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
+                Signature::from_bytes(&bytes)
+            }
+            SigEncoding::Der => Signature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
+        if prehashed {
+            self.verify_prehash(msg, &signature)
+        } else {
+            dispatch_hash!(hash, |D| { self.verify::<D>(msg, &signature) })
+        }
+        .map_err(|_| Error::Signature)
     }
 }
 
 // ----------------------------------------------------------------------------
 // ECDH over P-256 (fixed)
 // ----------------------------------------------------------------------------
-
-impl KeyAgreement for EcdhPrivateKey {
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let peer = downcast_peer::<EcdsaPublicKey>(peer, Algorithm::P256)?;
-        let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
-        Ok(Secret::from_bytes(shared.to_vec()))
-    }
-}
 
 impl PrivateKey for EcdhPrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -257,24 +214,16 @@ impl PrivateKey for EcdhPrivateKey {
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
     }
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        KeyAgreement::make_secret(self, peer)
+    fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
+        let peer = downcast_peer::<EcdsaPublicKey>(peer, Algorithm::P256)?;
+        let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
+        Ok(Secret::from_bytes(shared.to_vec()))
     }
 }
 
 // ----------------------------------------------------------------------------
 // X25519
 // ----------------------------------------------------------------------------
-
-impl KeyAgreement for X25519PrivateKey {
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let peer = downcast_peer::<X25519PublicKey>(peer, Algorithm::X25519)?;
-        let shared = self
-            .diffie_hellman(peer.as_bytes())
-            .map_err(|_| Error::KeyAgreement)?;
-        Ok(Secret::from_bytes(shared.to_vec()))
-    }
-}
 
 impl PrivateKey for X25519PrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -283,8 +232,12 @@ impl PrivateKey for X25519PrivateKey {
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(X25519PublicKey::from_bytes(self.public_key())))
     }
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        KeyAgreement::make_secret(self, peer)
+    fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
+        let peer = downcast_peer::<X25519PublicKey>(peer, Algorithm::X25519)?;
+        let shared = self
+            .diffie_hellman(peer.as_bytes())
+            .map_err(|_| Error::KeyAgreement)?;
+        Ok(Secret::from_bytes(shared.to_vec()))
     }
 }
 
@@ -301,16 +254,6 @@ impl PublicKey for X25519PublicKey {
 // X448
 // ----------------------------------------------------------------------------
 
-impl KeyAgreement for X448PrivateKey {
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let peer = downcast_peer::<X448PublicKey>(peer, Algorithm::X448)?;
-        let shared = self
-            .diffie_hellman(peer.as_bytes())
-            .map_err(|_| Error::KeyAgreement)?;
-        Ok(Secret::from_bytes(shared.to_vec()))
-    }
-}
-
 impl PrivateKey for X448PrivateKey {
     fn algorithm(&self) -> Algorithm {
         Algorithm::X448
@@ -318,8 +261,12 @@ impl PrivateKey for X448PrivateKey {
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(X448PublicKey::from_bytes(self.public_key())))
     }
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        KeyAgreement::make_secret(self, peer)
+    fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
+        let peer = downcast_peer::<X448PublicKey>(peer, Algorithm::X448)?;
+        let shared = self
+            .diffie_hellman(peer.as_bytes())
+            .map_err(|_| Error::KeyAgreement)?;
+        Ok(Secret::from_bytes(shared.to_vec()))
     }
 }
 
@@ -333,32 +280,8 @@ impl PublicKey for X448PublicKey {
 }
 
 // ----------------------------------------------------------------------------
-// SM2
+// SM2 — honours `context` (signer ID) and `sig_encoding`
 // ----------------------------------------------------------------------------
-
-impl Signer for Sm2PrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        let id = sm2_id(params.context);
-        let mut rng = rng;
-        let sig = self.sign(msg, id, &mut rng).map_err(|_| Error::Signature)?;
-        Ok(match params.sig_encoding {
-            SigEncoding::Raw => sig.to_bytes(),
-            SigEncoding::Der => sig.to_der(),
-        })
-    }
-}
-
-impl Decryptor for Sm2PrivateKey {
-    fn decrypt(&self, ct: &[u8], _params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        let pt = self.decrypt(ct).map_err(|_| Error::Decryption)?;
-        Ok(Secret::from_bytes(pt))
-    }
-}
 
 impl PrivateKey for Sm2PrivateKey {
     fn algorithm(&self) -> Algorithm {
@@ -373,33 +296,21 @@ impl PrivateKey for Sm2PrivateKey {
         params: &SignParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-    fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
-        Decryptor::decrypt(self, ct, params)
-    }
-}
-
-impl Verifier for Sm2PublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let signature = match params.sig_encoding {
-            SigEncoding::Raw => Sm2Signature::from_bytes(sig).map_err(|_| Error::Signature)?,
-            SigEncoding::Der => Sm2Signature::from_der(sig).map_err(|_| Error::Signature)?,
-        };
-        self.verify(msg, &signature, sm2_id(params.context))
-            .map_err(|_| Error::Signature)
-    }
-}
-
-impl Encryptor for Sm2PublicKey {
-    fn encrypt(
-        &self,
-        pt: &[u8],
-        _params: &EncryptParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
+        let mut p = params.reader();
+        let id = sm2_id(p.context());
+        let enc = p.sig_encoding();
+        p.finish()?;
         let mut rng = rng;
-        self.encrypt(pt, &mut rng).map_err(|_| Error::Encryption)
+        let sig = self.sign(msg, id, &mut rng).map_err(|_| Error::Signature)?;
+        Ok(match enc {
+            SigEncoding::Raw => sig.to_bytes(),
+            SigEncoding::Der => sig.to_der(),
+        })
+    }
+    fn decrypt(&self, ct: &[u8], params: &CryptParams<'_>) -> Result<Secret, Error> {
+        params.reader().finish()?;
+        let pt = self.decrypt(ct).map_err(|_| Error::Decryption)?;
+        Ok(Secret::from_bytes(pt))
     }
 }
 
@@ -411,15 +322,138 @@ impl PublicKey for Sm2PublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        let mut p = params.reader();
+        let id = sm2_id(p.context());
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let signature = match enc {
+            SigEncoding::Raw => Sm2Signature::from_bytes(sig).map_err(|_| Error::Signature)?,
+            SigEncoding::Der => Sm2Signature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
+        self.verify(msg, &signature, id)
+            .map_err(|_| Error::Signature)
     }
     fn encrypt(
         &self,
         pt: &[u8],
-        params: &EncryptParams<'_>,
+        params: &CryptParams<'_>,
         rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
-        Encryptor::encrypt(self, pt, params, rng)
+        params.reader().finish()?;
+        let mut rng = rng;
+        self.encrypt(pt, &mut rng).map_err(|_| Error::Encryption)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Runtime-curve ("boxed") ECDSA / ECDH
+//
+// `curve_alg` maps the four supported curves to `Algorithm`; an unsupported
+// curve (e.g. Brainpool or the SM2 curve carried as ECDSA) returns `None`, so
+// the capability ops reject it up front while `algorithm()` falls back to P256.
+// ----------------------------------------------------------------------------
+
+use super::boxed::{
+    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
+};
+use super::curves::CurveId;
+use crate::bignum::BoxedUint;
+
+fn curve_alg(curve: CurveId) -> Option<Algorithm> {
+    match curve {
+        CurveId::P256 => Some(Algorithm::P256),
+        CurveId::P384 => Some(Algorithm::P384),
+        CurveId::P521 => Some(Algorithm::P521),
+        CurveId::Secp256k1 => Some(Algorithm::Secp256k1),
+        _ => None,
+    }
+}
+
+impl PrivateKey for BoxedEcdsaPrivateKey {
+    fn algorithm(&self) -> Algorithm {
+        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
+    }
+    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
+        Ok(Box::new(self.public_key()))
+    }
+    fn sign(
+        &self,
+        msg: &[u8],
+        params: &SignParams<'_>,
+        _rng: &mut dyn CryptoRngCore,
+    ) -> Result<Vec<u8>, Error> {
+        let curve = self.curve();
+        curve_alg(curve).ok_or(Error::InvalidParams)?;
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let sig = dispatch_hash!(hash, |D| {
+            if prehashed {
+                self.sign_prehash::<D>(msg)
+            } else {
+                self.sign::<D>(msg)
+            }
+        })
+        .map_err(|_| Error::Signature)?;
+        Ok(match enc {
+            SigEncoding::Raw => sig.to_bytes(curve),
+            SigEncoding::Der => sig.to_der(curve),
+        })
+    }
+}
+
+impl PublicKey for BoxedEcdsaPublicKey {
+    fn algorithm(&self) -> Algorithm {
+        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
+        let curve = self.curve();
+        curve_alg(curve).ok_or(Error::InvalidParams)?;
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let signature = match enc {
+            // No `from_bytes` on BoxedEcdsaSignature: split raw `r||s` halves of
+            // `field_len()` -> BoxedUint -> from_components.
+            SigEncoding::Raw => {
+                let flen = curve.field_len();
+                if sig.len() != 2 * flen {
+                    return Err(Error::Signature);
+                }
+                let r = BoxedUint::from_be_bytes(&sig[..flen]);
+                let s = BoxedUint::from_be_bytes(&sig[flen..]);
+                BoxedEcdsaSignature::from_components(r, s)
+            }
+            SigEncoding::Der => BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
+        if prehashed {
+            self.verify_prehash(msg, &signature)
+        } else {
+            dispatch_hash!(hash, |D| { self.verify::<D>(msg, &signature) })
+        }
+        .map_err(|_| Error::Signature)
+    }
+}
+
+impl PrivateKey for BoxedEcdhPrivateKey {
+    fn algorithm(&self) -> Algorithm {
+        curve_alg(self.public_key().curve()).unwrap_or(Algorithm::P256)
+    }
+    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
+        Ok(Box::new(self.public_key()))
+    }
+    fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
+        let alg = curve_alg(self.public_key().curve()).ok_or(Error::InvalidParams)?;
+        let peer = downcast_peer::<BoxedEcdsaPublicKey>(peer, alg)?;
+        let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
+        Ok(Secret::from_bytes(shared))
     }
 }
 
@@ -434,151 +468,5 @@ fn sm2_id(context: &[u8]) -> &[u8] {
         super::sm2::DEFAULT_ID
     } else {
         context
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Runtime-curve ("boxed") ECDSA / ECDH
-// ----------------------------------------------------------------------------
-//
-// The const-generic impls above are P-256 only. These cover the runtime-curve
-// `Boxed*` keys, which carry their `CurveId` at runtime and serve every
-// supported curve. The unified `Algorithm` enum, however, only names the four
-// curves these traits target — P-256, P-384, P-521, secp256k1. `curve_alg`
-// maps those four to their `Algorithm`; any other curve (SM2, Brainpool — both
-// constructible as `BoxedEcdsa*` keys) returns `None`.
-//
-// Resolution of the "unsupported curve" question: `algorithm()` cannot fail, so
-// it falls back to `Algorithm::P256` for an unmapped curve, but every capability
-// op (`sign`/`verify`/`make_secret`) first calls `curve_alg(..)` and returns
-// `Error::InvalidParams` when the curve has no `Algorithm`. So an SM2 or
-// Brainpool boxed key never silently signs/verifies/agrees through these unified
-// traits — the operation is rejected up front. (Brainpool ECDSA has a dedicated
-// home via the concrete `BoxedEcdsa*` API and the `der`/x509 layers; these
-// unified traits are intentionally scoped to the four `Algorithm` curves.)
-
-use super::boxed::{
-    BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
-};
-use super::curves::CurveId;
-use crate::bignum::BoxedUint;
-
-/// Maps the four curves that have a unified [`Algorithm`] discriminant; any
-/// other [`CurveId`] (SM2, Brainpool) returns `None` and is rejected by the
-/// capability ops below.
-fn curve_alg(curve: CurveId) -> Option<Algorithm> {
-    match curve {
-        CurveId::P256 => Some(Algorithm::P256),
-        CurveId::P384 => Some(Algorithm::P384),
-        CurveId::P521 => Some(Algorithm::P521),
-        CurveId::Secp256k1 => Some(Algorithm::Secp256k1),
-        _ => None,
-    }
-}
-
-impl Signer for BoxedEcdsaPrivateKey {
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        // Reject curves outside the unified `Algorithm` set (e.g. Brainpool):
-        // their boxed keys can sign via the concrete API, but not through here.
-        let curve = self.curve();
-        curve_alg(curve).ok_or(Error::InvalidParams)?;
-        // RFC 6979 deterministic nonce — no `rng` needed.
-        let sig = dispatch_hash!(params.hash, |D| {
-            if params.prehashed {
-                self.sign_prehash::<D>(msg)
-            } else {
-                self.sign::<D>(msg)
-            }
-        })
-        .map_err(|_| Error::Signature)?;
-        Ok(match params.sig_encoding {
-            SigEncoding::Raw => sig.to_bytes(curve),
-            SigEncoding::Der => sig.to_der(curve),
-        })
-    }
-}
-
-impl PrivateKey for BoxedEcdsaPrivateKey {
-    fn algorithm(&self) -> Algorithm {
-        // `algorithm()` is infallible; an unmapped curve falls back to P256.
-        // The capability ops above reject unmapped curves before doing work.
-        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
-    }
-    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
-        Ok(Box::new(self.public_key()))
-    }
-    fn sign(
-        &self,
-        msg: &[u8],
-        params: &SignParams<'_>,
-        rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        Signer::sign(self, msg, params, rng)
-    }
-}
-
-impl Verifier for BoxedEcdsaPublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let curve = self.curve();
-        curve_alg(curve).ok_or(Error::InvalidParams)?;
-        let signature = match params.sig_encoding {
-            // Reconstruct from the fixed-width `r || s` encoding
-            // (`BoxedEcdsaSignature` has no `from_bytes`): two `field_len`-byte
-            // big-endian halves -> `BoxedUint` -> `from_components`.
-            SigEncoding::Raw => {
-                let flen = curve.field_len();
-                if sig.len() != 2 * flen {
-                    return Err(Error::Signature);
-                }
-                let r = BoxedUint::from_be_bytes(&sig[..flen]);
-                let s = BoxedUint::from_be_bytes(&sig[flen..]);
-                BoxedEcdsaSignature::from_components(r, s)
-            }
-            SigEncoding::Der => BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?,
-        };
-        if params.prehashed {
-            self.verify_prehash(msg, &signature)
-        } else {
-            dispatch_hash!(params.hash, |D| { self.verify::<D>(msg, &signature) })
-        }
-        .map_err(|_| Error::Signature)
-    }
-}
-
-impl PublicKey for BoxedEcdsaPublicKey {
-    fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
-    }
-    fn as_any(&self) -> &dyn core::any::Any {
-        self
-    }
-    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
-    }
-}
-
-impl KeyAgreement for BoxedEcdhPrivateKey {
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let alg = curve_alg(self.public_key().curve()).ok_or(Error::InvalidParams)?;
-        let peer = downcast_peer::<BoxedEcdsaPublicKey>(peer, alg)?;
-        let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
-        Ok(Secret::from_bytes(shared))
-    }
-}
-
-impl PrivateKey for BoxedEcdhPrivateKey {
-    fn algorithm(&self) -> Algorithm {
-        curve_alg(self.public_key().curve()).unwrap_or(Algorithm::P256)
-    }
-    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
-        Ok(Box::new(self.public_key()))
-    }
-    fn make_secret(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        KeyAgreement::make_secret(self, peer)
     }
 }

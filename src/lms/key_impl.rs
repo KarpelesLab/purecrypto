@@ -4,14 +4,14 @@
 //! additionally consumes randomness for the per-message LM-OTS randomizer, so
 //! [`StatefulSigner::sign`] threads the supplied `rng` through. Each signature
 //! consumes a state index that must be persisted before reuse. The private
-//! keys implement [`StatefulSigner`] and the [`PrivateKey`] facade (whose
-//! shared-reference `sign` returns [`Error::StatefulKey`]); the public keys
-//! implement [`Verifier`] and [`PublicKey`].
+//! keys implement only [`StatefulSigner`] — they are deliberately **not**
+//! [`PrivateKey`](crate::key::PrivateKey)s, since the facade's
+//! shared-reference `sign` cannot advance the state. The public keys verify
+//! fine through a shared reference and implement [`PublicKey`].
 
-use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use crate::key::{Algorithm, Error, PrivateKey, PublicKey, SignParams, StatefulSigner, Verifier};
+use crate::key::{Algorithm, Error, PublicKey, SignParams, StatefulSigner};
 use crate::rng::CryptoRngCore;
 
 use super::{HssPrivateKey, HssPublicKey, LmsPrivateKey, LmsPublicKey};
@@ -31,35 +31,6 @@ impl StatefulSigner for LmsPrivateKey {
     }
 }
 
-impl PrivateKey for LmsPrivateKey {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::Lms
-    }
-    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
-        Ok(Box::new(self.public_key()))
-    }
-    fn sign(
-        &self,
-        _msg: &[u8],
-        _params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        // The shared-reference facade cannot advance the one-time-key state;
-        // direct callers must hold `&mut self` and use `StatefulSigner::sign`.
-        Err(Error::StatefulKey)
-    }
-}
-
-impl Verifier for LmsPublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], _params: &SignParams<'_>) -> Result<(), Error> {
-        if self.verify(msg, sig) {
-            Ok(())
-        } else {
-            Err(Error::Signature)
-        }
-    }
-}
-
 impl PublicKey for LmsPublicKey {
     fn algorithm(&self) -> Algorithm {
         Algorithm::Lms
@@ -68,7 +39,12 @@ impl PublicKey for LmsPublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        params.reader().finish()?;
+        if self.verify(msg, sig) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
+        }
     }
 }
 
@@ -87,33 +63,6 @@ impl StatefulSigner for HssPrivateKey {
     }
 }
 
-impl PrivateKey for HssPrivateKey {
-    fn algorithm(&self) -> Algorithm {
-        Algorithm::Hss
-    }
-    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
-        Ok(Box::new(self.public_key()))
-    }
-    fn sign(
-        &self,
-        _msg: &[u8],
-        _params: &SignParams<'_>,
-        _rng: &mut dyn CryptoRngCore,
-    ) -> Result<Vec<u8>, Error> {
-        Err(Error::StatefulKey)
-    }
-}
-
-impl Verifier for HssPublicKey {
-    fn verify(&self, msg: &[u8], sig: &[u8], _params: &SignParams<'_>) -> Result<(), Error> {
-        if self.verify(msg, sig) {
-            Ok(())
-        } else {
-            Err(Error::Signature)
-        }
-    }
-}
-
 impl PublicKey for HssPublicKey {
     fn algorithm(&self) -> Algorithm {
         Algorithm::Hss
@@ -122,6 +71,11 @@ impl PublicKey for HssPublicKey {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        Verifier::verify(self, msg, sig, params)
+        params.reader().finish()?;
+        if self.verify(msg, sig) {
+            Ok(())
+        } else {
+            Err(Error::Signature)
+        }
     }
 }

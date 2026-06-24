@@ -5,7 +5,7 @@
 /// [`PublicKey`](crate::key::PublicKey).
 ///
 /// Used for introspection and to check compatibility before a key-agreement —
-/// `make_secret` rejects a peer whose `Algorithm` does not match.
+/// `agree` rejects a peer whose `Algorithm` does not match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Algorithm {
@@ -76,10 +76,6 @@ pub enum Operation {
     Encrypt,
     /// Derive a shared secret with a peer public key.
     Agree,
-    /// KEM encapsulation.
-    Encapsulate,
-    /// KEM decapsulation.
-    Decapsulate,
 }
 
 impl core::fmt::Display for Operation {
@@ -90,8 +86,6 @@ impl core::fmt::Display for Operation {
             Operation::Decrypt => "decrypt",
             Operation::Encrypt => "encrypt",
             Operation::Agree => "key-agreement",
-            Operation::Encapsulate => "encapsulate",
-            Operation::Decapsulate => "decapsulate",
         };
         f.write_str(s)
     }
