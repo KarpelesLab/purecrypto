@@ -290,6 +290,53 @@ impl AnyPublicKey {
             AnyPublicKey::SlhDsa(k) => Box::new(k),
         }
     }
+
+    /// Borrows the matched variant as a [`key::PublicKey`](crate::key::PublicKey).
+    fn inner(&self) -> &dyn crate::key::PublicKey {
+        match self {
+            AnyPublicKey::Rsa(k) => k,
+            AnyPublicKey::Ecdsa(k) => k,
+            AnyPublicKey::Ed25519(k) => k,
+            AnyPublicKey::Ed448(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa44(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa65(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPublicKey::MlDsa87(k) => k,
+            #[cfg(feature = "slhdsa")]
+            AnyPublicKey::SlhDsa(k) => k,
+        }
+    }
+}
+
+/// `AnyPublicKey` is itself a [`key::PublicKey`](crate::key::PublicKey): each
+/// operation delegates to the matched variant (including `as_any`, so an
+/// `AnyPublicKey` wrapping an ECDSA key works directly as a key-agreement peer).
+#[cfg(feature = "key")]
+impl crate::key::PublicKey for AnyPublicKey {
+    fn algorithm(&self) -> crate::key::Algorithm {
+        self.inner().algorithm()
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self.inner().as_any()
+    }
+    fn verify(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        params: &crate::key::SignParams<'_>,
+    ) -> Result<(), crate::key::Error> {
+        self.inner().verify(msg, sig, params)
+    }
+    fn encrypt(
+        &self,
+        pt: &[u8],
+        params: &crate::key::EncryptParams<'_>,
+        rng: &mut dyn crate::rng::CryptoRngCore,
+    ) -> Result<alloc::vec::Vec<u8>, crate::key::Error> {
+        self.inner().encrypt(pt, params, rng)
+    }
 }
 
 #[cfg(test)]

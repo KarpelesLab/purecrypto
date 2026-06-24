@@ -204,6 +204,61 @@ impl AnyPrivateKey {
             AnyPrivateKey::SlhDsa(k) => Box::new(k),
         }
     }
+
+    /// Borrows the matched variant as a [`key::PrivateKey`](crate::key::PrivateKey).
+    fn inner(&self) -> &dyn crate::key::PrivateKey {
+        match self {
+            AnyPrivateKey::Rsa(k) => k,
+            AnyPrivateKey::Ecdsa(k) => k,
+            AnyPrivateKey::Ed25519(k) => k,
+            AnyPrivateKey::Ed448(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa44(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa65(k) => k,
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa87(k) => k,
+            #[cfg(feature = "slhdsa")]
+            AnyPrivateKey::SlhDsa(k) => k,
+        }
+    }
+}
+
+/// `AnyPrivateKey` is itself a [`key::PrivateKey`](crate::key::PrivateKey): each
+/// operation delegates to the matched variant. So a parsed-by-OID key is usable
+/// both ways — `match` on it for the concrete algorithm-specific API, or call
+/// the facade operations on it directly without erasing the type.
+#[cfg(feature = "key")]
+impl crate::key::PrivateKey for AnyPrivateKey {
+    fn algorithm(&self) -> crate::key::Algorithm {
+        self.inner().algorithm()
+    }
+    fn public_key(
+        &self,
+    ) -> Result<alloc::boxed::Box<dyn crate::key::PublicKey>, crate::key::Error> {
+        self.inner().public_key()
+    }
+    fn sign(
+        &self,
+        msg: &[u8],
+        params: &crate::key::SignParams<'_>,
+        rng: &mut dyn crate::rng::CryptoRngCore,
+    ) -> Result<alloc::vec::Vec<u8>, crate::key::Error> {
+        self.inner().sign(msg, params, rng)
+    }
+    fn decrypt(
+        &self,
+        ct: &[u8],
+        params: &crate::key::DecryptParams<'_>,
+    ) -> Result<crate::key::Secret, crate::key::Error> {
+        self.inner().decrypt(ct, params)
+    }
+    fn agree(
+        &self,
+        peer: &dyn crate::key::PublicKey,
+    ) -> Result<crate::key::Secret, crate::key::Error> {
+        self.inner().agree(peer)
+    }
 }
 
 /// Distinguishes a plaintext `PrivateKeyInfo` (first inner element is the

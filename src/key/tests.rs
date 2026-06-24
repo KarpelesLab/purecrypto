@@ -310,6 +310,34 @@ fn any_key_into_dyn_bridge() {
         .expect("verify");
 }
 
+#[test]
+fn any_key_is_a_facade_key_directly() {
+    // `AnyPrivateKey` implements `PrivateKey` itself, so the parsed enum is
+    // usable as a facade key WITHOUT erasing it via `into_dyn` / `Box`.
+    let mut r = rng();
+    let sk = crate::ec::Ed25519PrivateKey::generate(&mut r);
+    let any = crate::x509::AnyPrivateKey::from_pkcs8_der(
+        &sk.to_pkcs8_der(),
+        crate::x509::Pkcs8ReadOptions::new(),
+    )
+    .expect("parse pkcs8");
+
+    // Call the facade methods straight on the enum value.
+    assert_eq!(PrivateKey::algorithm(&any), Algorithm::Ed25519);
+    let params = SignParams::new();
+    let sig = any.sign(b"direct", &params, &mut r).expect("sign");
+    let pk = any.public_key().expect("pub");
+    pk.verify(b"direct", &sig, &params).expect("verify");
+
+    // ...and it can still be matched for the concrete, algorithm-specific API.
+    match any {
+        crate::key::AnyPrivateKey::Ed25519(ref k) => {
+            let _ = k.public_key(); // concrete Ed25519PublicKey, not the facade
+        }
+        _ => panic!("expected Ed25519 variant"),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // ECDSA signature wire encoding: Raw r||s vs DER round-trips, and differ
 // ----------------------------------------------------------------------------
