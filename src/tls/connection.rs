@@ -119,7 +119,7 @@ pub struct Connection {
     pending_dtls: alloc::collections::VecDeque<Vec<u8>>,
     /// Transparent pluggable signer (from [`Config::signer`]), brokered by
     /// [`Connection::drive`]. `None` when the identity signs in-process.
-    signer: Option<alloc::sync::Arc<dyn super::signer::PrivateKey>>,
+    signer: Option<alloc::sync::Arc<dyn super::signer::HandshakeSigner>>,
     /// The in-flight external signing operation, while [`Connection::drive`] is
     /// waiting on the signer's device.
     active_sign: Option<Box<dyn super::signer::SignOp>>,
@@ -219,7 +219,7 @@ impl Connection {
     }
 
     /// Drive the handshake forward, transparently brokering the identity
-    /// signature through the [`PrivateKey`](super::PrivateKey) installed via
+    /// signature through the [`HandshakeSigner`](super::HandshakeSigner) installed via
     /// [`ConfigBuilder::private_key`](super::ConfigBuilder::private_key).
     ///
     /// This is the key-agnostic alternative to [`handshake`](Self::handshake):
@@ -255,7 +255,7 @@ impl Connection {
     /// ```
     pub fn drive(&mut self) -> Result<Step, Error> {
         // If the engine has parked awaiting the identity signature, broker it
-        // through the installed PrivateKey rather than asking the caller.
+        // through the installed HandshakeSigner rather than asking the caller.
         if self.active_sign.is_none()
             && let Some(req) = self.signature_request()
         {
@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     /// `Connection::drive()` brokers an in-process key through the transparent
-    /// `PrivateKey` path (via `LocalSigner`) without ever yielding `WantSigner`:
+    /// `HandshakeSigner` path (via `LocalSigner`) without ever yielding `WantSigner`:
     /// the same loop a device key would use also completes a normal handshake.
     #[test]
     fn drive_with_local_signer_completes_without_signer_step() {
@@ -1818,7 +1818,7 @@ mod tests {
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
-    /// A device-backed `PrivateKey` whose `SignOp` returns `Pending` once
+    /// A device-backed `HandshakeSigner` whose `SignOp` returns `Pending` once
     /// (exposing a real, readable fd) before producing the signature drives a
     /// full handshake through `drive()` — exercising the `WantSigner` path and
     /// `Readiness::wait()`. The "device" is an in-process ECDSA key behind a
@@ -1826,7 +1826,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drive_with_device_signer_round_trips() {
-        use super::super::signer::{PrivateKey, Readiness, SignOp, SignProgress};
+        use super::super::signer::{HandshakeSigner, Readiness, SignOp, SignProgress};
         use alloc::sync::Arc;
         use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::net::UnixStream;
@@ -1845,7 +1845,7 @@ mod tests {
             _far: UnixStream,
             polled: bool,
         }
-        impl PrivateKey for DeviceKey {
+        impl HandshakeSigner for DeviceKey {
             fn schemes(&self) -> Vec<u16> {
                 alloc::vec![ECDSA_SECP256R1_SHA256]
             }

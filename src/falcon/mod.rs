@@ -47,6 +47,8 @@
 mod encode;
 mod fft;
 mod fpr;
+#[cfg(feature = "key")]
+mod key_impl;
 mod keygen;
 mod sampler;
 mod sign;

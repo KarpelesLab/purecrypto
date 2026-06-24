@@ -90,5 +90,9 @@ pub use keylog::{WriterKeyLog, file_keylog};
 pub use pki::{CrlStore, PolicyOptions, RootCertStore};
 #[cfg(feature = "std")]
 pub use signer::LocalSigner;
-pub use signer::{PrivateKey, Readiness, SignOp, SignProgress};
+/// Former name of [`HandshakeSigner`], re-exported for back-compat.
+#[deprecated(since = "0.7.0", note = "renamed to HandshakeSigner")]
+#[allow(deprecated)]
+pub use signer::PrivateKey;
+pub use signer::{HandshakeSigner, Readiness, SignOp, SignProgress};
 pub use version::{ContentType, ProtocolVersion};

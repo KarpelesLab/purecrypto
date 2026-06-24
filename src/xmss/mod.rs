@@ -51,6 +51,8 @@
 
 mod adrs;
 mod hash;
+#[cfg(feature = "key")]
+mod key_impl;
 mod params;
 
 use adrs::{Adrs, AdrsType};

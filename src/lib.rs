@@ -58,6 +58,9 @@ pub mod hpke;
 #[cfg(feature = "kdf")]
 pub mod kdf;
 
+#[cfg(feature = "key")]
+pub mod key;
+
 #[cfg(feature = "mac")]
 pub mod mac;
 

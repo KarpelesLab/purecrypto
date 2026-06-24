@@ -15,6 +15,8 @@ mod encode;
 mod field;
 #[cfg(feature = "hazmat-mldsa")]
 pub mod hazmat;
+#[cfg(feature = "key")]
+mod key_impl;
 mod reduce;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;

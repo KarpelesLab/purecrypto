@@ -1,6 +1,6 @@
 //! Transparent pluggable private keys: one `drive()` loop for any key.
 //!
-//! The server's identity key is installed as a [`PrivateKey`] trait object and
+//! The server's identity key is installed as a [`HandshakeSigner`] trait object and
 //! the handshake is driven with [`Connection::drive`]. The caller's loop is the
 //! same it would write for an in-process key — it services peer I/O and, when
 //! the engine needs the identity signature, simply waits on an *opaque*
@@ -34,7 +34,9 @@ mod unix {
     use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId};
     use purecrypto::hash::Sha256;
     use purecrypto::rng::HmacDrbg;
-    use purecrypto::tls::{Config, Connection, PrivateKey, Readiness, SignOp, SignProgress, Step};
+    use purecrypto::tls::{
+        Config, Connection, HandshakeSigner, Readiness, SignOp, SignProgress, Step,
+    };
     use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
     // ecdsa_secp256r1_sha256 (RFC 8446 §4.2.3).
@@ -48,7 +50,7 @@ mod unix {
         key: BoxedEcdsaPrivateKey,
     }
 
-    impl PrivateKey for DeviceKey {
+    impl HandshakeSigner for DeviceKey {
         fn schemes(&self) -> Vec<u16> {
             vec![ECDSA_SECP256R1_SHA256]
         }

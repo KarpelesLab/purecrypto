@@ -61,7 +61,7 @@ pub enum SigningKey {
     /// [`Connection::provide_signature`](crate::tls::Connection::provide_signature).
     ///
     /// This is the low-level seam. For a transparent, key-agnostic experience —
-    /// where the caller installs a [`PrivateKey`](crate::tls::PrivateKey) and
+    /// where the caller installs a [`HandshakeSigner`](crate::tls::HandshakeSigner) and
     /// drives the handshake with [`Connection::drive`](crate::tls::Connection::drive),
     /// never hand-managing the signature — use
     /// [`ConfigBuilder::private_key`](crate::tls::ConfigBuilder::private_key)
@@ -324,8 +324,8 @@ pub struct Config {
     /// Transparent pluggable private key (TPM/HSM or in-process), installed via
     /// [`ConfigBuilder::private_key`]. When set, the identity signature is
     /// brokered through this key during [`super::Connection::drive`] and the
-    /// caller never hand-manages the signature. See [`super::PrivateKey`].
-    pub signer: Option<Arc<dyn super::signer::PrivateKey>>,
+    /// caller never hand-manages the signature. See [`super::HandshakeSigner`].
+    pub signer: Option<Arc<dyn super::signer::HandshakeSigner>>,
 }
 
 /// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
@@ -503,7 +503,7 @@ impl ConfigBuilder {
         });
         self
     }
-    /// Install a cert chain + a transparent pluggable [`PrivateKey`](super::PrivateKey)
+    /// Install a cert chain + a transparent pluggable [`HandshakeSigner`](super::HandshakeSigner)
     /// (TPM/HSM or in-process via [`LocalSigner`](super::LocalSigner)).
     ///
     /// The engine advertises `key.schemes()` and parks at the identity
@@ -512,7 +512,7 @@ impl ConfigBuilder {
     pub fn private_key(
         mut self,
         chain: Vec<Vec<u8>>,
-        key: Arc<dyn super::signer::PrivateKey>,
+        key: Arc<dyn super::signer::HandshakeSigner>,
     ) -> Self {
         self.inner.identity = Some(Identity {
             cert_chain: chain,

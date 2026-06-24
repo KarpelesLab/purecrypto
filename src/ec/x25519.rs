@@ -197,6 +197,32 @@ impl X25519PrivateKey {
     }
 }
 
+/// An X25519 public key — the 32-byte u-coordinate sent to a peer.
+///
+/// A thin newtype over the raw bytes so X25519 keys can participate in the
+/// unified [`key`](crate::key) traits, which pass peer public keys as
+/// `&dyn PublicKey`. The low-level [`X25519PrivateKey::public_key`] and
+/// [`X25519PrivateKey::diffie_hellman`] still take and return raw `[u8; 32]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X25519PublicKey([u8; 32]);
+
+impl X25519PublicKey {
+    /// Wraps a 32-byte u-coordinate.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        X25519PublicKey(bytes)
+    }
+
+    /// The 32-byte u-coordinate.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    /// Borrows the 32-byte u-coordinate.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

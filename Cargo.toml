@@ -30,7 +30,7 @@ name = "purecrypto"
 # The feature is internally `#[cfg(target_os = "linux")]`-gated, so enabling it
 # by default is inert on every non-Linux target and on unsupported Linux arches
 # (where it transparently falls back to /dev/urandom).
-default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
+default = ["std", "hash", "cipher", "kdf", "bignum", "rng", "rsa", "der", "dh", "x509", "pkcs12", "ec", "tls", "dtls", "mlkem", "mldsa", "slhdsa", "ascon", "aez", "lms", "xmss", "mac", "key", "cert-compression", "embedded-roots", "cli", "linux-getrandom"]
 std = ["alloc"]
 alloc = []
 
@@ -43,6 +43,11 @@ kdf = ["hash", "cipher"]
 mac = ["cipher"]
 bignum = []
 rng = ["hash"]
+# Unified asymmetric-key traits (`key::PrivateKey` / `key::PublicKey` plus the
+# fine-grained capability traits). A thin object-safe layer over the per-algorithm
+# key types; the trait impls for each algorithm are gated on that algorithm's own
+# feature, so enabling `key` alongside e.g. only `ec` pulls in just the EC impls.
+key = ["rng", "alloc"]
 # Opt-in: on Linux, draw OsRng bytes via getrandom(2) instead of reading from
 # /dev/urandom. Hardens the early-boot path (getrandom(2) blocks until the
 # kernel CSPRNG is initialised; /dev/urandom historically did not). Uses raw

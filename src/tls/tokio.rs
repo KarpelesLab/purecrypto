@@ -7,7 +7,7 @@
 //! handshake to completion, then the value itself implements [`AsyncRead`] +
 //! [`AsyncWrite`] over the TLS record layer.
 //!
-//! When the server identity is a device-backed [`PrivateKey`](super::PrivateKey)
+//! When the server identity is a device-backed [`HandshakeSigner`](super::HandshakeSigner)
 //! (TPM/HSM), the handshake transparently awaits the signer's
 //! [`Readiness`](super::Readiness) through [`tokio::io::unix::AsyncFd`] — the
 //! caller writes no signing glue and never sees the device.
@@ -93,7 +93,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> TlsStream<S> {
     /// [`Connection::client`](super::Connection::client) /
     /// [`server`](super::Connection::server); the cert chain, RNG
     /// ([`ConfigBuilder::rng`](super::ConfigBuilder::rng)), and any device
-    /// [`PrivateKey`](super::PrivateKey) come from its `Config`.
+    /// [`HandshakeSigner`](super::HandshakeSigner) come from its `Config`.
     pub async fn handshake(mut conn: Connection, mut sock: S) -> io::Result<Self> {
         let mut rd = [0u8; 16 * 1024];
         loop {

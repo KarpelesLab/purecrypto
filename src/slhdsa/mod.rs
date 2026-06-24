@@ -15,6 +15,8 @@
 
 mod adrs;
 mod hash;
+#[cfg(feature = "key")]
+mod key_impl;
 mod params;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;

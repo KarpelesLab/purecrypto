@@ -53,6 +53,42 @@ pub trait RngCore {
 /// can verify; do not implement it for non-CSPRNGs.
 pub trait CryptoRng {}
 
+// Forwarding impls so a `&mut R` (and therefore a `&mut dyn RngCore`) can be
+// used anywhere an `R: RngCore` is expected by value. Generic primitives in the
+// crate take the RNG as a sized `R: RngCore` parameter; these blanket impls are
+// what let a trait-object RNG (e.g. the `&mut dyn CryptoRngCore` the [`key`]
+// facade hands around) bridge into them.
+//
+// [`key`]: crate::key
+impl<R: RngCore + ?Sized> RngCore for &mut R {
+    #[inline]
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        (**self).fill_bytes(dest)
+    }
+    #[inline]
+    fn next_u32(&mut self) -> u32 {
+        (**self).next_u32()
+    }
+    #[inline]
+    fn next_u64(&mut self) -> u64 {
+        (**self).next_u64()
+    }
+}
+
+impl<R: CryptoRng + ?Sized> CryptoRng for &mut R {}
+
+/// Object-safe combination of [`RngCore`] and [`CryptoRng`].
+///
+/// APIs that need a *secure* RNG behind a trait object take
+/// `&mut dyn CryptoRngCore` rather than two separate bounds (which `dyn` cannot
+/// express). The blanket impl covers every `T: RngCore + CryptoRng`, and the
+/// forwarding `RngCore`/`CryptoRng` impls on `&mut R` above make
+/// `&mut dyn CryptoRngCore` itself usable wherever a sized `R: RngCore +
+/// CryptoRng` is required.
+pub trait CryptoRngCore: RngCore + CryptoRng {}
+
+impl<T: RngCore + CryptoRng + ?Sized> CryptoRngCore for T {}
+
 /// Operating-system entropy source.
 ///
 /// Reads from `/dev/urandom`. Available on Unix targets with the `std` feature.

@@ -38,6 +38,8 @@
 
 pub mod groups;
 mod key;
+#[cfg(feature = "key")]
+mod key_impl;
 
 pub use groups::{DhGroup, group14, group15, group16, group17, group18};
 pub use key::{DhPrivateKey, DhPublicKey, Error, SharedSecret};

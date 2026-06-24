@@ -63,6 +63,9 @@ pub const CIPHERTEXT_BYTES: usize = kem::ct_bytes(3, 10, 4);
 /// Size in bytes of a shared secret (same across all ML-KEM sets).
 pub const SHARED_SECRET_BYTES: usize = 32;
 
+#[cfg(feature = "key")]
+mod key_impl;
+
 #[cfg(feature = "der")]
 mod oids {
     /// `id-alg-ml-kem-512`  — 2.16.840.1.101.3.4.4.1.

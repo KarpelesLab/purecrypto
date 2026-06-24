@@ -43,6 +43,11 @@ pub use curves::CurveId;
 pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 pub use sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
+pub use x448::{X448PrivateKey, X448PublicKey};
+pub use x25519::{X25519PrivateKey, X25519PublicKey};
+
+#[cfg(feature = "key")]
+mod key_impl;
 
 /// Decodes a big-endian hex string of fixed-width curve constants into a
 /// [`Uint`](crate::bignum::Uint).

@@ -33,6 +33,8 @@
 //! `H10`/`W4` over `H5`/`W8`). Both the public-key/root derivation and the
 //! full signature bytes are reproduced from the vectors' seed material.
 
+#[cfg(feature = "key")]
+mod key_impl;
 mod ots;
 mod params;
 mod tree;

@@ -14,6 +14,8 @@ mod boxed;
 mod emsa;
 #[cfg(all(feature = "der", feature = "alloc"))]
 mod encoding;
+#[cfg(feature = "key")]
+mod key_impl;
 #[cfg(feature = "alloc")]
 mod pkcs1;
 #[cfg(feature = "alloc")]

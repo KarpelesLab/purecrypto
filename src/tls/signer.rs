@@ -8,7 +8,7 @@
 //! hand-broker each signature.
 //!
 //! This module layers a *transparent* API on top of it: the caller installs one
-//! [`PrivateKey`] trait object on the [`Config`](super::Config) via
+//! [`HandshakeSigner`] trait object on the [`Config`](super::Config) via
 //! [`ConfigBuilder::private_key`](super::ConfigBuilder::private_key) and then
 //! drives the handshake with [`Connection::drive`](super::Connection::drive),
 //! never branching on what kind of key it is. An in-process RSA key, a local
@@ -35,8 +35,8 @@ use alloc::vec::Vec;
 use super::config::SigningKey;
 use super::error::Error;
 
-/// A private key for the local endpoint, usable whether the key lives in this
-/// process or behind a device (TPM/HSM/PKCS#11) driver crate.
+/// A TLS handshake-signer plugin for the local endpoint, usable whether the key
+/// lives in this process or behind a device (TPM/HSM/PKCS#11) driver crate.
 ///
 /// Install one on a [`Config`](super::Config) with
 /// [`ConfigBuilder::private_key`](super::ConfigBuilder::private_key). The engine
@@ -48,7 +48,7 @@ use super::error::Error;
 /// an `Arc`; per-signature state lives in the [`SignOp`] returned by
 /// `start_sign`. In-process keys can be obtained from a [`SigningKey`] via
 /// [`LocalSigner`].
-pub trait PrivateKey: Send + Sync {
+pub trait HandshakeSigner: Send + Sync {
     /// The IANA `SignatureScheme` code points (RFC 8446 §4.2.3) this key can
     /// produce, most-preferred first. Advertised to the peer; the engine
     /// negotiates the concrete scheme against the peer's offer and passes it
@@ -60,6 +60,10 @@ pub trait PrivateKey: Send + Sync {
     /// already framed them. Returns a non-blocking [`SignOp`] driving the work.
     fn start_sign(&self, scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error>;
 }
+
+/// Former name of [`HandshakeSigner`].
+#[deprecated(since = "0.7.0", note = "renamed to HandshakeSigner")]
+pub use HandshakeSigner as PrivateKey;
 
 /// One in-flight signing operation: a non-blocking state machine that owns its
 /// device transport.
@@ -225,7 +229,7 @@ mod sys {
     }
 }
 
-/// A [`PrivateKey`] backed by an in-process [`SigningKey`].
+/// A [`HandshakeSigner`] backed by an in-process [`SigningKey`].
 ///
 /// Lets the uniform [`Connection::drive`](super::Connection::drive) loop work
 /// for ordinary in-process keys too, so callers need only one code path. Its
@@ -240,7 +244,7 @@ mod sys {
 /// [`ConfigBuilder::identity`](super::ConfigBuilder::identity) instead.
 ///
 /// `std` only: it draws salts from [`OsRng`](crate::rng::OsRng). A `no_std`
-/// caller implements [`PrivateKey`] for its own (device or in-process) key
+/// caller implements [`HandshakeSigner`] for its own (device or in-process) key
 /// directly.
 #[cfg(feature = "std")]
 pub struct LocalSigner {
@@ -259,7 +263,7 @@ impl LocalSigner {
 }
 
 #[cfg(feature = "std")]
-impl PrivateKey for LocalSigner {
+impl HandshakeSigner for LocalSigner {
     fn schemes(&self) -> Vec<u16> {
         let server_key = self.key.to_server_key_13();
         alloc::vec![super::crypto::signature_scheme_for(&server_key).0]
