@@ -64,6 +64,7 @@ Single crate, modules gated by Cargo features:
 | Stateful HBS     | `xmss`      | ✅ XMSS / XMSS^MT (RFC 8391, NIST SP 800-208); **stateful** advancing key; RFC 8391 / reference KATs |
 | Lightweight      | `ascon`     | ✅ Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / XOF128 / CXOF128 from one 320-bit permutation |
 | Diffie-Hellman   | `dh`        | ✅ Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
+| Unified keys     | `key`       | ✅ object-safe `PrivateKey`/`PublicKey` facade — `sign`/`decrypt`/`agree`, `verify`/`encrypt` — over every asymmetric key, with consume-checked params (unsupported params fail loudly) and generic PKCS#8/SPKI decoders (`AnyPrivateKey`/`AnyPublicKey`, which are facade keys themselves); stateful XMSS/LMS via `StatefulSigner`, KEMs via `Encapsulator`/`Decapsulator` |
 | ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
 | X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
 | TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/Ed448/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
@@ -134,7 +135,7 @@ purecrypto = { version = "0.6", default-features = false, features = ["mldsa", "
 ```
 
 Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
-`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `ristretto255`, `x509`, `tls`,
+`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `key`, `ristretto255`, `x509`, `tls`,
 `dtls`, `tls-legacy`, `quic`, `mlkem`, `mldsa`, `slhdsa`, `lms`, `xmss`,
 `ascon`, `aez`, `hpke`, `ech`, `cert-compression`, `embedded-roots`, `ffi`,
 `cli` — plus the unstable `hazmat-secp256k1` / `hazmat-edwards25519` /
