@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.20](https://github.com/KarpelesLab/purecrypto/compare/v0.6.19...v0.6.20) - 2026-06-24
+
+### Added
+
+- *(key)* parse ML-KEM from PKCS#8/SPKI + unified outer AnyKey enum
+- *(key)* parse X25519/X448 from PKCS#8 + SPKI (AnyPrivateKey/AnyPublicKey)
+
+### Fixed
+
+- *(x509)* gate the anykey module on `key`, not just `mlkem`
+
+### Other
+
+- list the `key` module in the README + fix its feature comment
+
 ## [0.6.19](https://github.com/KarpelesLab/purecrypto/compare/v0.6.18...v0.6.19) - 2026-06-24
 
 ### Added
