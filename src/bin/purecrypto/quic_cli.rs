@@ -20,13 +20,16 @@
 //!   so values above the RFC 9000 §18.2 minimum of 2 are honored.
 //! * `max_datagram_frame_size = 1200` (RFC 9221).
 
+use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::util::{Args, die, load_cert_chain, open_keylog, parse_alpn, zero_buf};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use purecrypto::quic::{QuicConfig, QuicConnection, Role, StreamId, TransportParameters};
+use purecrypto::quic::{
+    EcnCodepoint, QuicConfig, QuicConnection, QuicServer, StreamId, TransportParameters,
+};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::tls::{
@@ -207,18 +210,6 @@ pub(crate) fn run_server(args: Args) {
     let retry = args.flag("-retry") || args.flag("--retry");
     let keylog = args.value("-keylogfile").map(open_keylog);
 
-    let chain = load_cert_chain(cert_path);
-    let key = load_signing_key(key_path);
-
-    let mut builder = TlsConfig::builder()
-        .versions(PcVersion::TLSv1_3, PcVersion::TLSv1_3)
-        .identity(chain, key)
-        .alpn(alpn);
-    if let Some(sink) = keylog {
-        builder = builder.key_log(sink);
-    }
-    let tls_cfg = builder.build();
-
     // `-accept` accepts either `PORT` or `host:port` to match s_server.
     let accept_arg = args.value("-accept").unwrap_or("127.0.0.1:4433");
     let bind_addr = if accept_arg.contains(':') {
@@ -227,18 +218,34 @@ pub(crate) fn run_server(args: Args) {
         format!("127.0.0.1:{accept_arg}")
     };
 
-    let mut qcfg = QuicConfig::default();
-    qcfg.tls = tls_cfg;
-    qcfg.transport_params = default_transport_params();
-    if retry {
-        let mut secret = [0u8; 32];
-        purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
-        qcfg.require_retry = true;
-        qcfg.retry_secret = Some(secret);
-        // `retry_secret` stores a Copy of the array; scrub our stack
-        // copy as `pc_quic_new` does (commit 316e8a2).
-        zero_buf(&mut secret);
-    }
+    // Own everything the per-connection config factory needs. The TLS `Config`
+    // and `SigningKey` are not `Clone`, so each accepted connection re-loads the
+    // identity from disk and rebuilds its config (fine for a CLI server).
+    let cert_path = cert_path.to_string();
+    let key_path = key_path.to_string();
+    let make_config = move || -> Result<QuicConfig, purecrypto::tls::Error> {
+        let chain = load_cert_chain(&cert_path);
+        let key = load_signing_key(&key_path);
+        let mut builder = TlsConfig::builder()
+            .versions(PcVersion::TLSv1_3, PcVersion::TLSv1_3)
+            .identity(chain, key)
+            .alpn(alpn.clone());
+        if let Some(sink) = keylog.clone() {
+            builder = builder.key_log(sink);
+        }
+        let mut qcfg = QuicConfig::default();
+        qcfg.tls = builder.build();
+        qcfg.transport_params = default_transport_params();
+        if retry {
+            let mut secret = [0u8; 32];
+            purecrypto::rng::RngCore::fill_bytes(&mut OsRng, &mut secret);
+            qcfg.require_retry = true;
+            qcfg.retry_secret = Some(secret);
+            // `retry_secret` stores a Copy of the array; scrub our stack copy.
+            zero_buf(&mut secret);
+        }
+        Ok(qcfg)
+    };
 
     let socket = UdpSocket::bind(&bind_addr)
         .unwrap_or_else(|e| die(format!("cannot bind UDP {bind_addr}: {e}")));
@@ -249,39 +256,145 @@ pub(crate) fn run_server(args: Args) {
         }
     }
 
-    // Wait for the first datagram so we learn the peer's address.
-    socket.set_read_timeout(Some(Duration::from_secs(60))).ok();
-    let mut buf = vec![0u8; 1500 + 256];
-    let (n, peer) = socket
-        .recv_from(&mut buf)
-        .unwrap_or_else(|e| die(format!("UDP recv (initial) failed: {e}")));
-    if !quiet {
-        eprintln!("accepted handshake start from {peer}");
+    // An UNconnected socket + a QuicServer router: datagrams from any peer are
+    // demultiplexed by Connection ID, new connections are accepted, and
+    // datagrams that match no connection draw a stateless reset (RFC 9000
+    // §10.3) — which the old single-connection, `connect`'d-socket server could
+    // never see, let alone answer.
+    let mut server =
+        QuicServer::new(make_config).unwrap_or_else(|e| die(format!("QUIC server build: {e:?}")));
+    server.set_now_secs(unix_now_secs());
+
+    run_quic_server_loop(&mut server, &socket, www, quiet);
+}
+
+/// Per-peer application state for the demo server's echo / `-www` behaviour.
+#[derive(Default)]
+struct ServerConnState {
+    /// The peer-initiated bidi stream we answer on.
+    stream: Option<StreamId>,
+    /// `-www`: the canned reply has been sent + finished.
+    canned_sent: bool,
+    /// We have FIN'd our send side.
+    our_fin: bool,
+    /// The peer FIN'd its send side.
+    peer_fin: bool,
+}
+
+/// Drives the [`QuicServer`] router I/O loop: receive → route, run the demo
+/// application logic (echo, or a canned `-www` reply) per connection, and send
+/// outbound datagrams (including connection-less resets / Version Negotiation)
+/// to their peers. Exits once a connection's exchange has finished both ways
+/// (plus a short grace for trailing ACKs) or a safety deadline elapses — the
+/// `QuicServer` itself stays multi-connection; this CLI demo serves one
+/// exchange then exits so it composes with the loopback tests.
+fn run_quic_server_loop(server: &mut QuicServer, sock: &UdpSocket, www: bool, quiet: bool) {
+    let canned: &[u8] = b"hello from purecrypto q_server\n";
+    let mut net_buf = vec![0u8; 1500 + 256];
+    let mut app: HashMap<SocketAddr, ServerConnState> = HashMap::new();
+    let overall_deadline = Duration::from_secs(30);
+    let post_done_grace = Duration::from_millis(500);
+    let start = Instant::now();
+    let mut announced = false;
+    let mut served_any = false;
+    let mut done_since: Option<Instant> = None;
+
+    loop {
+        if start.elapsed() > overall_deadline {
+            break;
+        }
+        server.set_now_secs(unix_now_secs());
+
+        // 1. Receive one datagram, bounded by the soonest connection timer.
+        let wait = server
+            .next_timeout()
+            .unwrap_or(Duration::from_millis(100))
+            .clamp(Duration::from_millis(1), Duration::from_millis(100));
+        sock.set_read_timeout(Some(wait)).ok();
+        match sock.recv_from(&mut net_buf) {
+            Ok((n, from)) if n > 0 => {
+                let _ = server.recv(from, EcnCodepoint::NotEct, &net_buf[..n]);
+            }
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                server.on_timeout();
+            }
+            Err(_) => break,
+        }
+
+        // 2. Application logic per connection.
+        for (addr, conn) in server.connections_mut() {
+            if !announced && !quiet && conn.is_handshake_complete() {
+                eprintln!("QUIC handshake complete");
+                announced = true;
+            }
+            let st = app.entry(addr).or_default();
+            let ids: Vec<StreamId> = conn.readable_streams().collect();
+            for id in ids {
+                if st.stream.is_none() && id.is_client_initiated() && id.is_bidi() {
+                    st.stream = Some(id);
+                }
+                let mut buf = [0u8; 16 * 1024];
+                while let Ok((n, fin)) = conn.read(id, &mut buf) {
+                    if !www && n > 0 {
+                        let _ = conn.write(id, &buf[..n]); // echo
+                    }
+                    if fin && st.stream == Some(id) {
+                        st.peer_fin = true;
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+            }
+            // `-www`: send the canned body once we know the peer's bidi stream.
+            if www
+                && !st.canned_sent
+                && let Some(id) = st.stream
+            {
+                let _ = conn.write(id, canned);
+                let _ = conn.finish(id);
+                st.canned_sent = true;
+                st.our_fin = true;
+            }
+            // Echo: FIN our side back once the peer has FIN'd.
+            if !www
+                && st.peer_fin
+                && !st.our_fin
+                && let Some(id) = st.stream
+            {
+                let _ = conn.finish(id);
+                st.our_fin = true;
+            }
+        }
+
+        // 3. Drain outbound datagrams to their peers.
+        while let Some((to, _ecn, dg)) = server.poll_transmit() {
+            let _ = sock.send_to(&dg, to);
+        }
+
+        // 4. Decide when the demo's single exchange is finished: in `-www` the
+        //    reply is delivered as soon as it's sent; in echo mode when both
+        //    sides have FIN'd; or when the peer has closed and no connection
+        //    remains. Exit after a short grace so trailing ACKs / the reply
+        //    land before the socket goes away.
+        served_any |= server.connection_count() > 0;
+        let exchange_done = app
+            .values()
+            .any(|s| s.canned_sent || (s.our_fin && s.peer_fin))
+            || (served_any && server.connection_count() == 0);
+        if exchange_done {
+            let since = done_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > post_done_grace {
+                break;
+            }
+        }
     }
-
-    // `connect` the socket so subsequent `send` / `recv` are bound to
-    // this peer — and any spurious off-path datagrams (a different
-    // attacker on the same machine) are filtered by the OS.
-    socket
-        .connect(peer)
-        .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
-
-    let mut qc =
-        QuicConnection::server(qcfg).unwrap_or_else(|e| die(format!("QUIC server build: {e:?}")));
-    qc.set_peer_addr(peer);
-    // Retry tokens are time-bounded; the engine fails closed (no Retry at
-    // all) unless a nonzero clock is supplied before the first feed.
-    qc.set_now_secs(unix_now_secs());
-    qc.feed_datagram_from(peer, &buf[..n])
-        .unwrap_or_else(|e| die(format!("QUIC initial feed_datagram failed: {e:?}")));
-
-    drive_quic_handshake(&mut qc, &socket, Some(peer), Duration::from_secs(30));
-
-    if !quiet {
-        eprintln!("QUIC handshake complete");
-    }
-
-    drive_quic_data_server(&mut qc, &socket, www, Duration::from_secs(30));
 }
 
 // ====================================================================
@@ -494,122 +607,4 @@ fn drive_quic_data_client(qc: &mut QuicConnection, sock: &UdpSocket, deadline: D
 
     drain_outbound(qc, sock);
     let _ = stdout.flush();
-}
-
-/// Server data path. With `-www`, sends a canned payload over the
-/// peer-initiated bidi stream and closes. Otherwise, echoes inbound
-/// bytes until FIN.
-fn drive_quic_data_server(
-    qc: &mut QuicConnection,
-    sock: &UdpSocket,
-    www: bool,
-    deadline: Duration,
-) {
-    let mut read_buf = vec![0u8; 16 * 1024];
-    let mut net_buf = vec![0u8; 1500 + 256];
-
-    let start = Instant::now();
-    let mut peer_stream: Option<StreamId> = None;
-    let mut peer_fin_seen = false;
-    let mut sent_canned = false;
-    let mut finished = false;
-    // Grace period AFTER both sides have FIN'd, to allow trailing ACKs
-    // to land before we tear down the UDP socket. 500 ms is well below
-    // the 60 s idle timeout but generous enough for a slow scheduler.
-    let post_fin_grace = Duration::from_millis(500);
-    let mut all_done_since: Option<Instant> = None;
-
-    let canned: &[u8] = b"hello from purecrypto q_server\n";
-
-    loop {
-        if qc.is_closed() {
-            break;
-        }
-        if start.elapsed() > deadline {
-            break;
-        }
-
-        // Discover peer-initiated streams.
-        let ids: Vec<StreamId> = qc.readable_streams().collect();
-        for id in ids {
-            if peer_stream.is_none() && id.is_client_initiated() && id.is_bidi() {
-                peer_stream = Some(id);
-            }
-            while let Ok((n, fin)) = qc.read(id, &mut read_buf) {
-                if !www && n > 0 {
-                    // Echo what we read back into the same stream.
-                    let _ = qc.write(id, &read_buf[..n]);
-                }
-                if fin && peer_stream == Some(id) {
-                    peer_fin_seen = true;
-                }
-                if n == 0 {
-                    break;
-                }
-            }
-        }
-
-        // Canned -www response. Send as soon as we know the peer's
-        // bidi stream id (regardless of whether the peer has FIN'd
-        // yet — they may be waiting for our reply before closing).
-        if www
-            && !sent_canned
-            && let Some(id) = peer_stream
-        {
-            let _ = qc.write(id, canned);
-            let _ = qc.finish(id);
-            sent_canned = true;
-            finished = true;
-        }
-
-        // Echo mode: once the peer FINs, FIN our send side back.
-        if !www
-            && peer_fin_seen
-            && !finished
-            && let Some(id) = peer_stream
-        {
-            let _ = qc.finish(id);
-            finished = true;
-        }
-
-        drain_outbound(qc, sock);
-
-        let next = qc.next_timeout().unwrap_or(Duration::from_millis(50));
-        let wait = next.min(Duration::from_millis(50));
-        sock.set_read_timeout(Some(wait.max(Duration::from_millis(1))))
-            .ok();
-        match sock.recv(&mut net_buf) {
-            Ok(n) if n > 0 => {
-                if qc.feed_datagram(&net_buf[..n]).is_err() {
-                    break;
-                }
-            }
-            Ok(_) => {}
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                qc.on_timeout(start.elapsed());
-            }
-            Err(_) => break,
-        }
-
-        // Termination — once we've FIN'd our side AND observed peer FIN
-        // AND a short grace has elapsed, exit. Tying termination to
-        // both-directions-FIN'd (rather than wire-idle) means the client
-        // gets the full reply before the socket goes away.
-        if finished && peer_fin_seen {
-            if all_done_since.is_none() {
-                all_done_since = Some(Instant::now());
-            }
-            if all_done_since.unwrap().elapsed() > post_fin_grace {
-                break;
-            }
-        }
-    }
-
-    drain_outbound(qc, sock);
-    let _: Role = qc.role();
 }

@@ -328,12 +328,13 @@ impl QuicServer {
         self.reap_closed();
     }
 
-    /// Iterates the hosted connections mutably — e.g. to read delivered
-    /// application data, open/answer streams, or queue sends. Outbound bytes a
+    /// Iterates the hosted connections mutably, each paired with its peer
+    /// address — e.g. to read delivered application data, open/answer streams,
+    /// or queue sends, and to key per-connection host state. Outbound bytes a
     /// connection produces are routed to its peer automatically by
     /// [`Self::poll_transmit`].
-    pub fn connections_mut(&mut self) -> impl Iterator<Item = &mut QuicConnection> {
-        self.conns.values_mut().map(|h| &mut h.conn)
+    pub fn connections_mut(&mut self) -> impl Iterator<Item = (SocketAddr, &mut QuicConnection)> {
+        self.conns.values_mut().map(|h| (h.addr, &mut h.conn))
     }
 
     // ---- internals ----
@@ -547,7 +548,7 @@ mod server_tests {
 
         // Collect the stream payloads delivered across all server connections.
         let mut got: Vec<Vec<u8>> = Vec::new();
-        for conn in srv.connections_mut() {
+        for (_addr, conn) in srv.connections_mut() {
             let ids: Vec<_> = conn.readable_streams().collect();
             for sid in ids {
                 let mut buf = [0u8; 256];
