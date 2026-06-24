@@ -280,6 +280,34 @@ fn decode_pkcs8_private_then_sign() {
 }
 
 #[test]
+fn decode_x25519_pkcs8_and_agree() {
+    // X25519 now parses out of PKCS#8 via AnyPrivateKey, and the parsed enum is
+    // a facade key (it agrees).
+    let mut r = rng();
+    let a = crate::ec::X25519PrivateKey::generate(&mut r);
+    let b = crate::ec::X25519PrivateKey::generate(&mut r);
+
+    let a_any = crate::x509::AnyPrivateKey::from_pkcs8_pem(
+        &a.to_pkcs8_pem(),
+        crate::x509::Pkcs8ReadOptions::new(),
+    )
+    .expect("parse x25519 pkcs8");
+    assert!(matches!(a_any, crate::key::AnyPrivateKey::X25519(_)));
+    assert_eq!(PrivateKey::algorithm(&a_any), Algorithm::X25519);
+
+    // Agree directly on the parsed enum with b's public key (SPKI round-trip).
+    let b_pub_der =
+        crate::x509::AnyPublicKey::X25519(crate::ec::X25519PublicKey::from_bytes(b.public_key()))
+            .to_spki_der();
+    let b_pub = crate::key::public_key_from_spki_der(&b_pub_der).expect("parse x25519 spki");
+
+    let s_ab = a_any.agree(b_pub.as_ref()).expect("agree");
+    // Cross-check against the raw X25519 shared secret.
+    let raw = a.diffie_hellman(&b.public_key()).expect("raw dh");
+    assert_eq!(s_ab.as_bytes(), &raw);
+}
+
+#[test]
 fn decode_spki_public() {
     let pk_der = crate::test_util::rsa_test_key_a()
         .public_key()

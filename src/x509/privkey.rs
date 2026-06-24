@@ -10,7 +10,9 @@
 
 use super::{Error, oid};
 use crate::der::{Reader, parse_oid, pem_decode, tag};
-use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
+use crate::ec::{
+    BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey, X448PrivateKey, X25519PrivateKey,
+};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
@@ -34,6 +36,10 @@ pub enum AnyPrivateKey {
     Ed25519(Ed25519PrivateKey),
     /// An Ed448 private key.
     Ed448(Ed448PrivateKey),
+    /// An X25519 key-agreement private key.
+    X25519(X25519PrivateKey),
+    /// An X448 key-agreement private key.
+    X448(X448PrivateKey),
     /// An ML-DSA-44 (FIPS 204) private key.
     #[cfg(feature = "mldsa")]
     MlDsa44(MlDsa44PrivateKey),
@@ -57,6 +63,8 @@ impl core::fmt::Debug for AnyPrivateKey {
             AnyPrivateKey::Ecdsa(_) => "Ecdsa",
             AnyPrivateKey::Ed25519(_) => "Ed25519",
             AnyPrivateKey::Ed448(_) => "Ed448",
+            AnyPrivateKey::X25519(_) => "X25519",
+            AnyPrivateKey::X448(_) => "X448",
             #[cfg(feature = "mldsa")]
             AnyPrivateKey::MlDsa44(_) => "MlDsa44",
             #[cfg(feature = "mldsa")]
@@ -138,6 +146,14 @@ impl AnyPrivateKey {
             Ok(AnyPrivateKey::Ed448(
                 Ed448PrivateKey::from_pkcs8_der(plain).map_err(|_| Error::Malformed)?,
             ))
+        } else if alg == oid::ID_X25519 {
+            Ok(AnyPrivateKey::X25519(
+                X25519PrivateKey::from_pkcs8_der(plain).map_err(|_| Error::Malformed)?,
+            ))
+        } else if alg == oid::ID_X448 {
+            Ok(AnyPrivateKey::X448(
+                X448PrivateKey::from_pkcs8_der(plain).map_err(|_| Error::Malformed)?,
+            ))
         } else {
             #[cfg(feature = "mldsa")]
             {
@@ -194,6 +210,8 @@ impl AnyPrivateKey {
             AnyPrivateKey::Ecdsa(k) => Box::new(k),
             AnyPrivateKey::Ed25519(k) => Box::new(k),
             AnyPrivateKey::Ed448(k) => Box::new(k),
+            AnyPrivateKey::X25519(k) => Box::new(k),
+            AnyPrivateKey::X448(k) => Box::new(k),
             #[cfg(feature = "mldsa")]
             AnyPrivateKey::MlDsa44(k) => Box::new(k),
             #[cfg(feature = "mldsa")]
@@ -212,6 +230,8 @@ impl AnyPrivateKey {
             AnyPrivateKey::Ecdsa(k) => k,
             AnyPrivateKey::Ed25519(k) => k,
             AnyPrivateKey::Ed448(k) => k,
+            AnyPrivateKey::X25519(k) => k,
+            AnyPrivateKey::X448(k) => k,
             #[cfg(feature = "mldsa")]
             AnyPrivateKey::MlDsa44(k) => k,
             #[cfg(feature = "mldsa")]

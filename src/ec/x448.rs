@@ -230,6 +230,54 @@ impl X448PublicKey {
     }
 }
 
+/// RFC 8410 `id-X448` algorithm OID (1.3.101.111).
+#[cfg(feature = "der")]
+pub(crate) const X448_OID: &[u64] = &[1, 3, 101, 111];
+
+/// PKCS#8 v1 (RFC 8410) private-key serialization (`id-X448`, raw 56-byte
+/// scalar).
+#[cfg(feature = "der")]
+impl X448PrivateKey {
+    /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
+    pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let version = encode_integer(&[0]);
+        let algid = encode_sequence(&oid_tlv(X448_OID));
+        let privkey = encode_octet_string(&encode_octet_string(&self.scalar));
+        encode_sequence(&[version, algid, privkey].concat())
+    }
+
+    /// Encodes the key as a PKCS#8 PEM document (`-----BEGIN PRIVATE KEY-----`).
+    pub fn to_pkcs8_pem(&self) -> alloc::string::String {
+        crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
+    }
+
+    /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
+    pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
+        use crate::der::{Error, Reader, parse_oid};
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence()?;
+        seq.read_integer_bytes()?; // version (v1 = 0)
+        let mut algid = seq.read_sequence()?;
+        if parse_oid(algid.read_oid()?)?.as_slice() != X448_OID {
+            return Err(Error::Malformed);
+        }
+        let inner = seq.read_octet_string()?;
+        let scalar_bytes = Reader::new(inner).read_octet_string()?;
+        if scalar_bytes.len() != 56 {
+            return Err(Error::Malformed);
+        }
+        let mut scalar = [0u8; 56];
+        scalar.copy_from_slice(scalar_bytes);
+        Ok(X448PrivateKey { scalar })
+    }
+
+    /// Parses a PKCS#8 PEM private key.
+    pub fn from_pkcs8_pem(pem: &str) -> Result<Self, crate::der::Error> {
+        Self::from_pkcs8_der(&crate::der::pem_decode(pem, "PRIVATE KEY")?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -8,7 +8,9 @@ use super::{Error, algorithm_identifier, oid};
 use crate::der::{
     Reader, encode_bit_string, encode_sequence, oid_tlv, parse_oid, pem_decode, pem_encode,
 };
-use crate::ec::{BoxedEcdsaPublicKey, CurveId, Ed448PublicKey, Ed25519PublicKey};
+use crate::ec::{
+    BoxedEcdsaPublicKey, CurveId, Ed448PublicKey, Ed25519PublicKey, X448PublicKey, X25519PublicKey,
+};
 #[cfg(feature = "mldsa")]
 use crate::mldsa::{MlDsa44PublicKey, MlDsa65PublicKey, MlDsa87PublicKey};
 use crate::rsa::BoxedRsaPublicKey;
@@ -73,6 +75,10 @@ pub enum AnyPublicKey {
     Ecdsa(BoxedEcdsaPublicKey),
     /// An Ed25519 public key.
     Ed25519(Ed25519PublicKey),
+    /// An X25519 key-agreement public key.
+    X25519(X25519PublicKey),
+    /// An X448 key-agreement public key.
+    X448(X448PublicKey),
     /// An Ed448 public key.
     Ed448(Ed448PublicKey),
     /// An ML-DSA-44 (FIPS 204) public key.
@@ -114,6 +120,14 @@ impl AnyPublicKey {
                 // RFC 8410: AlgorithmIdentifier is the bare OID (no parameters).
                 let algid = encode_sequence(&oid_tlv(oid::ID_ED448));
                 encode_sequence(&[algid, encode_bit_string(&k.to_bytes())].concat())
+            }
+            AnyPublicKey::X25519(k) => {
+                let algid = encode_sequence(&oid_tlv(oid::ID_X25519));
+                encode_sequence(&[algid, encode_bit_string(k.as_bytes())].concat())
+            }
+            AnyPublicKey::X448(k) => {
+                let algid = encode_sequence(&oid_tlv(oid::ID_X448));
+                encode_sequence(&[algid, encode_bit_string(k.as_bytes())].concat())
             }
             // ML-DSA (draft-ietf-lamps-dilithium-certificates): bare OID, no
             // parameters; key bytes are the raw FIPS 204 encoding.
@@ -189,6 +203,18 @@ impl AnyPublicKey {
             spki.finish()?;
             let bytes: [u8; 57] = key_bits.try_into().map_err(|_| Error::Malformed)?;
             Ok(AnyPublicKey::Ed448(Ed448PublicKey::from_bytes(bytes)))
+        } else if alg.as_slice() == oid::ID_X25519 {
+            algid.finish()?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
+            let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+            Ok(AnyPublicKey::X25519(X25519PublicKey::from_bytes(bytes)))
+        } else if alg.as_slice() == oid::ID_X448 {
+            algid.finish()?;
+            let key_bits = spki.read_bit_string()?;
+            spki.finish()?;
+            let bytes: [u8; 56] = key_bits.try_into().map_err(|_| Error::Malformed)?;
+            Ok(AnyPublicKey::X448(X448PublicKey::from_bytes(bytes)))
         } else {
             #[cfg(feature = "mldsa")]
             {
@@ -280,6 +306,8 @@ impl AnyPublicKey {
             AnyPublicKey::Ecdsa(k) => Box::new(k),
             AnyPublicKey::Ed25519(k) => Box::new(k),
             AnyPublicKey::Ed448(k) => Box::new(k),
+            AnyPublicKey::X25519(k) => Box::new(k),
+            AnyPublicKey::X448(k) => Box::new(k),
             #[cfg(feature = "mldsa")]
             AnyPublicKey::MlDsa44(k) => Box::new(k),
             #[cfg(feature = "mldsa")]
@@ -298,6 +326,8 @@ impl AnyPublicKey {
             AnyPublicKey::Ecdsa(k) => k,
             AnyPublicKey::Ed25519(k) => k,
             AnyPublicKey::Ed448(k) => k,
+            AnyPublicKey::X25519(k) => k,
+            AnyPublicKey::X448(k) => k,
             #[cfg(feature = "mldsa")]
             AnyPublicKey::MlDsa44(k) => k,
             #[cfg(feature = "mldsa")]
