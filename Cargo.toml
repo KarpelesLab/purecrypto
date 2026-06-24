@@ -163,7 +163,7 @@ embedded-roots = ["tls", "dep:cacrt"]
 # C library with `cargo rustc --features ffi --crate-type cdylib` (or staticlib).
 ffi = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "mldsa", "slhdsa", "mlkem", "kdf", "cipher", "ascon", "lms", "xmss"]
 # The `purecrypto` command-line tool (gates the binary target below).
-cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss", "embedded-roots"]
+cli = ["std", "hash", "rng", "rsa", "ec", "der", "x509", "key", "tls", "dtls", "quic", "kdf", "cipher", "ascon", "lms", "xmss", "embedded-roots"]
 # Async I/O surface for the sans-I/O TLS engine: `tls::tokio::TlsStream`
 # (AsyncRead + AsyncWrite) that drives the handshake and awaits the
 # device-signer `Readiness` via `tokio::io::unix::AsyncFd`. Off by default.

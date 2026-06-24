@@ -2,16 +2,14 @@
 
 use crate::util::{Args, SentinelLock, die, read_input, write_output, write_output_with_mode};
 use purecrypto::ec::sm2::DEFAULT_ID;
-use purecrypto::ec::{
-    BoxedEcdsaPrivateKey, BoxedEcdsaSignature, CurveId, Ed448PrivateKey, Ed25519PrivateKey,
-    Sm2PrivateKey, Sm2PublicKey, Sm2Signature,
+use purecrypto::ec::{BoxedEcdsaPrivateKey, Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
+use purecrypto::hash::{Sha256, Sha384, Sha512};
+use purecrypto::key::{
+    self, Algorithm as KeyAlg, Hash as KeyHash, PrivateKey as KeyPriv, SigEncoding, SignParams,
 };
-use purecrypto::hash::{Sha1, Sha256, Sha384, Sha512};
 use purecrypto::lms::{HssPrivateKey, LmsPrivateKey};
-use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa65PrivateKey, MlDsa87PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
-use purecrypto::slhdsa;
 use purecrypto::x509::AnyPublicKey;
 use purecrypto::xmss::{XmssMtPrivateKey, XmssPrivateKey};
 
@@ -79,16 +77,14 @@ fn parse_opts(args: &Args) -> Opts {
 // The RSA-2048 / -3072 / -4096 variant dominates the enum size, but the value
 // is short-lived inside `pkeyutl` — boxing every arm would be ceremony for no
 // real benefit. (See the matching pattern in `pkey.rs`.)
+//
+// `encrypt`/`decrypt` only operate on RSA and SM2 keys (the only schemes with a
+// public-key encryption mode), so this loader recognizes just those two. The
+// `sign`/`verify` paths load keys through the unified `key::PrivateKey` facade
+// instead (see `load_priv_dyn`).
 #[allow(clippy::large_enum_variant)]
 enum PrivKey {
     Rsa(BoxedRsaPrivateKey),
-    Ec(BoxedEcdsaPrivateKey),
-    Ed25519(Ed25519PrivateKey),
-    Ed448(Ed448PrivateKey),
-    MlDsa44(MlDsa44PrivateKey),
-    MlDsa65(MlDsa65PrivateKey),
-    MlDsa87(MlDsa87PrivateKey),
-    SlhDsa(slhdsa::PrivateKey),
     Sm2(Sm2PrivateKey),
 }
 
@@ -99,35 +95,93 @@ fn load_priv(path: &str) -> PrivKey {
     if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
         return PrivKey::Rsa(k);
     }
-    // SM2 keys share the SEC1 `EC PRIVATE KEY` PEM label with ECDSA keys, and the
-    // generic ECDSA parser would accept the SM2 named-curve OID — so try the SM2
-    // parser FIRST (it rejects every non-SM2 curve) to route SM2 to SM2-DSA /
-    // SM2-PKE rather than the ECDSA path.
+    // SM2 keys share the SEC1 `EC PRIVATE KEY` PEM label with ECDSA keys; the
+    // SM2 parser rejects every non-SM2 curve, routing SM2 to SM2-PKE.
     if let Ok(k) = Sm2PrivateKey::from_sec1_pem(pem) {
         return PrivKey::Sm2(k);
     }
+    die("unrecognized private key for encrypt/decrypt (expected RSA PKCS#1 or SM2 SEC1 PEM)");
+}
+
+/// Loads a private key as a boxed unified [`key::PrivateKey`] trait object for
+/// the `sign` path. The format-specific parsers the generic PKCS#8 decoder does
+/// not cover are tried first: PKCS#1 (`RSA PRIVATE KEY`), SM2 SEC1 (routed to
+/// SM2-DSA rather than ECDSA-over-the-SM2-curve), and plain ECDSA SEC1; the
+/// generic decoder then covers Ed25519/Ed448/ML-DSA/SLH-DSA and PKCS#8
+/// RSA/ECDSA.
+fn load_priv_dyn(path: &str) -> Box<dyn KeyPriv> {
+    crate::util::warn_if_world_readable_key(path);
+    let raw = std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {path}: {e}")));
+    let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("key file is not UTF-8 PEM"));
+    if let Ok(k) = BoxedRsaPrivateKey::from_pkcs1_pem(pem) {
+        return Box::new(k);
+    }
+    if let Ok(k) = Sm2PrivateKey::from_sec1_pem(pem) {
+        return Box::new(k);
+    }
     if let Ok(k) = BoxedEcdsaPrivateKey::from_sec1_pem(pem) {
-        return PrivKey::Ec(k);
+        return Box::new(k);
     }
-    if let Ok(k) = Ed25519PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::Ed25519(k);
-    }
-    if let Ok(k) = Ed448PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::Ed448(k);
-    }
-    if let Ok(k) = MlDsa65PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::MlDsa65(k);
-    }
-    if let Ok(k) = MlDsa44PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::MlDsa44(k);
-    }
-    if let Ok(k) = MlDsa87PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::MlDsa87(k);
-    }
-    if let Ok(k) = slhdsa::PrivateKey::from_pkcs8_pem(pem) {
-        return PrivKey::SlhDsa(k);
+    if let Ok(k) = key::private_key_from_pkcs8_pem(pem) {
+        return k;
     }
     die("unrecognized private key (expected RSA PKCS#1, EC SEC1, or PKCS#8 PEM)");
+}
+
+/// Maps the RSA `-pkeyopt digest:` choice onto a [`KeyHash`], reproducing the
+/// previous per-path validation: SHA-1 is rejected for PSS and (when signing)
+/// warned for PKCS#1 v1.5; unknown digests die.
+fn rsa_digest(opts: &Opts, pss: bool, warn_sha1: bool) -> KeyHash {
+    match opts
+        .digest
+        .as_deref()
+        .unwrap_or("sha256")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sha256" => KeyHash::Sha256,
+        "sha384" => KeyHash::Sha384,
+        "sha512" => KeyHash::Sha512,
+        "sha1" if !pss => {
+            if warn_sha1 {
+                eprintln!(
+                    "purecrypto: warning: digest:sha1 is collision-broken for \
+                     signing; use digest:sha256 or stronger"
+                );
+            }
+            KeyHash::Sha1
+        }
+        other if pss => die(format!("unsupported RSA-PSS digest: {other}")),
+        other => die(format!("unsupported RSA digest: {other}")),
+    }
+}
+
+/// Builds the [`SignParams`] for a `sign`/`verify` call from the key's
+/// algorithm and the `-pkeyopt` flags, reproducing the previous dispatch:
+/// curve-implied hash and DER `Ecdsa-Sig-Value` for ECDSA, the SM2 signer id +
+/// DER for SM2, opt-driven hash/padding for RSA, and scheme defaults (ignored
+/// params) for EdDSA / ML-DSA / SLH-DSA. `id` is only read for SM2; `warn_sha1`
+/// is set on the signing path. Used for both `sign` and `verify` (`id` is empty
+/// for verify, where SM2 is handled separately).
+fn build_params<'a>(
+    alg: KeyAlg,
+    opts: &Opts,
+    id: &'a [u8],
+    pss: bool,
+    warn_sha1: bool,
+) -> SignParams<'a> {
+    let p = SignParams::new();
+    match alg {
+        KeyAlg::Rsa => {
+            let p = p.hash(rsa_digest(opts, pss, warn_sha1));
+            if pss { p } else { p.pkcs1v15() }
+        }
+        KeyAlg::P256 | KeyAlg::Secp256k1 => p.hash(KeyHash::Sha256).sig_encoding(SigEncoding::Der),
+        KeyAlg::P384 => p.hash(KeyHash::Sha384).sig_encoding(SigEncoding::Der),
+        KeyAlg::P521 => p.hash(KeyHash::Sha512).sig_encoding(SigEncoding::Der),
+        KeyAlg::Sm2 => p.context(id).sig_encoding(SigEncoding::Der),
+        _ => p,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,27 +328,26 @@ fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
     // Sign, then capture the ADVANCED serialization to persist before we hand
     // the signature back to the caller.
     let (sig, advanced) = match key {
+        // UFCS on the concrete type to reach the inherent stateful `sign`
+        // (`&mut self`): the in-scope `key::PrivateKey::sign` (`&self`) would
+        // otherwise win method resolution at the shared-ref autoref step.
         StatefulKey::Lms(mut k) => {
-            let s = k
-                .sign(&mut OsRng, msg)
+            let s = LmsPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("LMS sign failed: {e:?}")));
             (s, k.to_bytes())
         }
         StatefulKey::Hss(mut k) => {
-            let s = k
-                .sign(&mut OsRng, msg)
+            let s = HssPrivateKey::sign(&mut k, &mut OsRng, msg)
                 .unwrap_or_else(|e| die(format!("HSS sign failed: {e:?}")));
             (s, k.to_bytes())
         }
         StatefulKey::Xmss(mut k) => {
-            let s = k
-                .sign(msg)
+            let s = XmssPrivateKey::sign(&mut k, msg)
                 .unwrap_or_else(|e| die(format!("XMSS sign failed: {e:?}")));
             (s, k.to_bytes())
         }
         StatefulKey::XmssMt(mut k) => {
-            let s = k
-                .sign(msg)
+            let s = XmssMtPrivateKey::sign(&mut k, msg)
                 .unwrap_or_else(|e| die(format!("XMSS^MT sign failed: {e:?}")));
             (s, k.to_bytes())
         }
@@ -552,72 +605,16 @@ fn run_sign(args: Args) {
         return;
     }
 
-    let key = load_priv(inkey);
+    // Dispatch through the unified `key::PrivateKey` facade: the per-algorithm
+    // hash / padding / encoding choices that used to be a big `match` are now
+    // encoded in `SignParams`, keyed off the loaded key's `algorithm()`.
+    let key = load_priv_dyn(inkey);
     let pss = matches!(opts.padding.as_deref(), Some("pss"));
-    let digest = opts.digest.as_deref().unwrap_or("sha256");
-
-    let sig = match key {
-        PrivKey::Rsa(k) => {
-            if pss {
-                match digest.to_ascii_lowercase().as_str() {
-                    "sha256" => k.sign_pss::<Sha256, _>(&msg, &mut OsRng),
-                    "sha384" => k.sign_pss::<Sha384, _>(&msg, &mut OsRng),
-                    "sha512" => k.sign_pss::<Sha512, _>(&msg, &mut OsRng),
-                    _ => die(format!("unsupported RSA-PSS digest: {digest}")),
-                }
-                .unwrap_or_else(|e| die(format!("RSA-PSS sign failed: {e}")))
-            } else {
-                match digest.to_ascii_lowercase().as_str() {
-                    "sha256" => k.sign_pkcs1v15::<Sha256>(&msg),
-                    "sha384" => k.sign_pkcs1v15::<Sha384>(&msg),
-                    "sha512" => k.sign_pkcs1v15::<Sha512>(&msg),
-                    "sha1" => {
-                        // Creating NEW SHA-1 signatures deserves a nudge
-                        // (collisions are practical); verifying legacy ones is
-                        // fine, so `run_verify` stays silent.
-                        eprintln!(
-                            "purecrypto: warning: digest:sha1 is collision-broken for \
-                             signing; use digest:sha256 or stronger"
-                        );
-                        k.sign_pkcs1v15::<Sha1>(&msg)
-                    }
-                    _ => die(format!("unsupported RSA digest: {digest}")),
-                }
-                .unwrap_or_else(|e| die(format!("RSA sign failed: {e}")))
-            }
-        }
-        PrivKey::Ec(k) => {
-            let curve = k.curve();
-            let sig = match curve {
-                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => k.sign::<Sha256>(&msg),
-                CurveId::P384 => k.sign::<Sha384>(&msg),
-                CurveId::P521 => k.sign::<Sha512>(&msg),
-                _ => die("unsupported EC curve"),
-            }
-            .unwrap_or_else(|e| die(format!("ECDSA sign failed: {e}")));
-            sig.to_der(curve)
-        }
-        PrivKey::Ed25519(k) => k.sign(&msg).to_bytes().to_vec(),
-        PrivKey::Ed448(k) => k.sign(&msg).to_bytes().to_vec(),
-        PrivKey::MlDsa44(k) => k
-            .sign(&mut OsRng, &msg, b"")
-            .unwrap_or_else(|e| die(format!("ML-DSA-44 sign failed: {e:?}"))),
-        PrivKey::MlDsa65(k) => k
-            .sign(&mut OsRng, &msg, b"")
-            .unwrap_or_else(|e| die(format!("ML-DSA-65 sign failed: {e:?}"))),
-        PrivKey::MlDsa87(k) => k
-            .sign(&mut OsRng, &msg, b"")
-            .unwrap_or_else(|e| die(format!("ML-DSA-87 sign failed: {e:?}"))),
-        PrivKey::SlhDsa(k) => k
-            .sign(&mut OsRng, &msg, b"")
-            .unwrap_or_else(|e| die(format!("SLH-DSA sign failed: {e:?}"))),
-        PrivKey::Sm2(k) => {
-            let id = sm2_id(&args);
-            k.sign(&msg, &id, &mut OsRng)
-                .unwrap_or_else(|e| die(format!("SM2 sign failed: {e:?}")))
-                .to_der()
-        }
-    };
+    let id = sm2_id(&args);
+    let params = build_params(key.algorithm(), &opts, &id, pss, /* warn_sha1 */ true);
+    let sig = key
+        .sign(&msg, &params, &mut OsRng)
+        .unwrap_or_else(|e| die(format!("sign failed: {e}")));
     let out_path = args
         .value("-out")
         .or_else(|| args.value("--out"))
@@ -643,7 +640,6 @@ fn run_verify(args: Args) {
         .unwrap_or_else(|| die("missing -inkey"));
     let opts = parse_opts(&args);
     let pss = matches!(opts.padding.as_deref(), Some("pss"));
-    let digest = opts.digest.as_deref().unwrap_or("sha256");
 
     // `-inkey` may be a raw LMS/HSS/XMSS or SM2/SEC1 PRIVATE key file
     // (the public key is derived from it). Warn if it is group/world-
@@ -681,66 +677,23 @@ fn run_verify(args: Args) {
         }
     }
 
-    let any = load_spki(inkey);
-    let ok = match any {
-        AnyPublicKey::Rsa(k) => {
-            if pss {
-                match digest.to_ascii_lowercase().as_str() {
-                    "sha256" => k.verify_pss::<Sha256>(&msg, &sig),
-                    "sha384" => k.verify_pss::<Sha384>(&msg, &sig),
-                    "sha512" => k.verify_pss::<Sha512>(&msg, &sig),
-                    _ => die(format!("unsupported RSA-PSS digest: {digest}")),
-                }
-                .is_ok()
-            } else {
-                match digest.to_ascii_lowercase().as_str() {
-                    "sha256" => k.verify_pkcs1v15::<Sha256>(&msg, &sig),
-                    "sha384" => k.verify_pkcs1v15::<Sha384>(&msg, &sig),
-                    "sha512" => k.verify_pkcs1v15::<Sha512>(&msg, &sig),
-                    "sha1" => k.verify_pkcs1v15::<Sha1>(&msg, &sig),
-                    _ => die(format!("unsupported RSA digest: {digest}")),
-                }
-                .is_ok()
-            }
-        }
-        AnyPublicKey::Ecdsa(k) => {
-            let parsed = match BoxedEcdsaSignature::from_der(&sig) {
-                Ok(s) => s,
-                Err(_) => {
-                    println!("verify FAIL");
-                    std::process::exit(1);
-                }
-            };
-            match k.curve() {
-                CurveId::P256 | CurveId::Secp256k1 | CurveId::Sm2p256v1 => {
-                    k.verify::<Sha256>(&msg, &parsed)
-                }
-                CurveId::P384 => k.verify::<Sha384>(&msg, &parsed),
-                CurveId::P521 => k.verify::<Sha512>(&msg, &parsed),
-                _ => die("unsupported EC curve"),
-            }
-            .is_ok()
-        }
-        AnyPublicKey::Ed25519(k) => {
-            use purecrypto::ec::Ed25519Signature;
-            match <[u8; 64]>::try_from(sig.as_slice()) {
-                Ok(b) => k.verify(&msg, &Ed25519Signature::from_bytes(b)).is_ok(),
-                Err(_) => false,
-            }
-        }
-        AnyPublicKey::Ed448(k) => {
-            use purecrypto::ec::Ed448Signature;
-            match <[u8; 114]>::try_from(sig.as_slice()) {
-                Ok(b) => k.verify(&msg, &Ed448Signature::from_bytes(b)).is_ok(),
-                Err(_) => false,
-            }
-        }
-        AnyPublicKey::MlDsa44(k) => k.verify(&sig, &msg, b""),
-        AnyPublicKey::MlDsa65(k) => k.verify(&sig, &msg, b""),
-        AnyPublicKey::MlDsa87(k) => k.verify(&sig, &msg, b""),
-        AnyPublicKey::SlhDsa(k) => k.verify(&sig, &msg, b""),
-        _ => die("unsupported public key type for verify"),
-    };
+    // Unified verify: decode the SPKI public key and check through the
+    // `key::PublicKey` facade. The hash (curve-implied for ECDSA) and DER
+    // signature encoding are selected from the key's `algorithm()`, reproducing
+    // the previous per-type dispatch. SM2 and the stateful schemes are handled
+    // above; everything else flows through here. A malformed signature (wrong
+    // length, bad DER) verifies as a plain failure.
+    let pem = core::str::from_utf8(&raw_key).unwrap_or_else(|_| die("pubkey is not UTF-8 PEM"));
+    let pub_key = key::public_key_from_spki_pem(pem)
+        .unwrap_or_else(|e| die(format!("cannot parse SPKI: {e}")));
+    let params = build_params(
+        pub_key.algorithm(),
+        &opts,
+        &[],
+        pss,
+        /* warn_sha1 */ false,
+    );
+    let ok = pub_key.verify(&msg, &sig, &params).is_ok();
     report_verify(ok);
 }
 
