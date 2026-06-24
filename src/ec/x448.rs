@@ -175,6 +175,14 @@ impl X448PrivateKey {
         X448PrivateKey { scalar }
     }
 
+    /// The raw 56-byte scalar, as supplied to [`from_bytes`](Self::from_bytes)
+    /// or generated (clamping is applied on use, not stored). This is secret
+    /// key material: the caller owns the returned array and is responsible for
+    /// wiping it after use.
+    pub fn to_bytes(&self) -> [u8; 56] {
+        self.scalar
+    }
+
     /// The public key `X448(scalar, 5)` to send to the peer.
     pub fn public_key(&self) -> [u8; 56] {
         x448(&self.scalar, &BASE_POINT)

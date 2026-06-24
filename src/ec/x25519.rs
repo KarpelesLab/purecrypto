@@ -175,6 +175,14 @@ impl X25519PrivateKey {
         X25519PrivateKey { scalar }
     }
 
+    /// The raw 32-byte scalar, as supplied to [`from_bytes`](Self::from_bytes)
+    /// or generated (clamping is applied on use, not stored). This is secret
+    /// key material: the caller owns the returned array and is responsible for
+    /// wiping it after use.
+    pub fn to_bytes(&self) -> [u8; 32] {
+        self.scalar
+    }
+
     /// The public key `X25519(scalar, 9)` to send to the peer.
     pub fn public_key(&self) -> [u8; 32] {
         x25519(&self.scalar, &BASE_POINT)
@@ -238,6 +246,16 @@ mod tests {
             out[i] = (hi << 4) | lo;
         }
         out
+    }
+
+    #[test]
+    fn private_key_bytes_round_trip() {
+        let scalar = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let sk = X25519PrivateKey::from_bytes(scalar);
+        assert_eq!(sk.to_bytes(), scalar, "to_bytes mirrors from_bytes");
+        // The reconstructed key derives the same public key.
+        let sk2 = X25519PrivateKey::from_bytes(sk.to_bytes());
+        assert_eq!(sk2.public_key(), sk.public_key());
     }
 
     #[test]
