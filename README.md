@@ -154,7 +154,8 @@ cargo test                                           # full suite
 cargo test --release -- --ignored                    # heavy KATs (SLH-DSA 's' sets, RSA keygen)
 ```
 
-Requires Rust 1.95+ (edition 2024).
+Requires Rust 1.88+ (edition 2024); the MSRV is declared as `rust-version =
+"1.88"` and enforced in CI.
 
 ## Command-line tool
 
