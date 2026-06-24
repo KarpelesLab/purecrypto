@@ -137,8 +137,10 @@ The C ABI is sans-I/O for TLS/DTLS: the caller pumps wire bytes through
 
 ## Cargo features
 
-Default is `std + cli` with every module on. Disable defaults for a `no_std`
-build and re-enable only what you need:
+Default is `std + cli` with most modules on. A few are opt-in: `quic`, `hpke`,
+`ech`, `falcon`, `tls-legacy`, `ristretto255`, the `ffi` C ABI, and the
+`tokio` / `mio` I/O adapters. Disable defaults for a `no_std` build and
+re-enable only what you need:
 
 ```toml
 # Bare no_std, no allocator: just `ct` and primitives that fit.
@@ -152,11 +154,12 @@ purecrypto = { version = "0.6", default-features = false, features = ["mldsa", "
 ```
 
 Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
-`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `key`, `ristretto255`, `x509`, `tls`,
-`dtls`, `tls-legacy`, `quic`, `mlkem`, `mldsa`, `slhdsa`, `lms`, `xmss`,
-`ascon`, `aez`, `hpke`, `ech`, `cert-compression`, `embedded-roots`, `ffi`,
-`cli` — plus the unstable `hazmat-secp256k1` / `hazmat-edwards25519` /
-`hazmat-mldsa` gates (no semver guarantee).
+`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `key`, `ristretto255`, `x509`,
+`pkcs12`, `tls`, `dtls`, `tls-legacy`, `quic`, `mlkem`, `mldsa`, `slhdsa`,
+`falcon`, `lms`, `xmss`, `ascon`, `aez`, `hpke`, `ech`, `cert-compression`,
+`embedded-roots`, `ffi`, `cli` (plus the `tokio` / `mio` I/O adapters) — plus
+the unstable `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` gates
+(no semver guarantee).
 Each pulls in only its own dependencies. `alloc` is required by anything that
 needs heap (most things except `ct`, `hash`, `cipher`, and the no-alloc
 `mlkem` core).
@@ -511,7 +514,7 @@ let mut conn = Connection::client(&cfg)?;   // or Connection::server(&cfg)
 
 After a handshake completes, both sides expose:
 
-- `connection.alpn_protocol()` — the negotiated ALPN name, if any.
+- `connection.alpn_selected()` — the negotiated ALPN name, if any.
 - `connection.tls_exporter(label, context, out)` — RFC 8446 §7.5 / RFC 5705
   application-layer keying material.
 - `connection.peer_certificates()` — the validated chain (leaf first).

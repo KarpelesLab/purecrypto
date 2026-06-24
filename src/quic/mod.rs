@@ -6,21 +6,19 @@
 //! and produces wire datagrams via `pop`. The host wires it to a
 //! `UdpSocket`.
 //!
-//! Phase 1 shipped the pure data-structure foundations: varint, packet
-//! numbers, the frame codec, and the transport parameters. Phase 2 added
-//! per-direction Initial + handshake keys plus the long/short header
-//! codec and header-protection wrappers (RFC 9001 §5). Phase 3 added the
-//! TLS-QUIC seam (`QuicHooks` trait, `EngineMode::Quic`).
-//!
-//! Phase 4 (this module) glues the previous three phases into the
-//! [`QuicConnection`] state machine: per-level CRYPTO reassembly, ACK
-//! emission, PADDING on the client's first datagram, PTO-driven Initial /
-//! Handshake retransmission, in-process loopback handshake to completion.
-//! Streams, full RFC 9002, Retry, key update, and DATAGRAM are deferred
-//! to later phases per the master plan.
+//! The [`QuicConnection`] state machine drives the full v1 transport over
+//! the sans-I/O feed/pop seam: varint / packet-number / frame codecs and
+//! transport parameters, per-direction Initial + Handshake + 1-RTT keys
+//! with header protection (RFC 9001 §5), the TLS-QUIC seam (`QuicHooks`),
+//! per-level CRYPTO reassembly, ACK emission, RFC 9002 loss recovery with
+//! NewReno congestion control, streams with flow control, Retry + address
+//! validation, connection-ID rotation, key update, and RFC 9221 unreliable
+//! DATAGRAMs. Out of scope: 0-RTT emission, the idle-timeout timer (only
+//! the PTO is wired), HTTP/3, and stateless-reset emission.
 
-// QUIC v1 is shipped but pre-interop (several follow-ups remain before
-// interop testing). A number of parsed-but-not-yet-consumed packet/header
+// QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
+// client, with several follow-ups still open (see the project notes). A
+// number of parsed-but-not-yet-consumed packet/header
 // fields, ACK/version-negotiation codec helpers, ECN counters, PnSet query
 // methods, and reserved RFC 9000 stream-state variants are intentionally
 // retained for that pending work and for protocol-completeness/auditability

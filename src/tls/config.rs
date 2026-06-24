@@ -263,18 +263,16 @@ pub struct Config {
     /// GREASE — the CH carries no `encrypted_client_hello` extension at
     /// all. `Some(EchClient::default_grease())` emits a bit-shape
     /// identical GREASE extension so the wire image is constant across
-    /// users. `Some(EchClient::from_config_list(list))` will, in a
-    /// follow-up, actually seal the inner CH against the published
-    /// `ECHConfigList` — for now this is stored but treated as GREASE
-    /// at the wire layer.
+    /// users. `Some(EchClient::from_config_list(list))` performs real ECH:
+    /// it seals the inner CH against the published `ECHConfigList`.
     #[cfg(feature = "ech")]
     pub ech: Option<super::ech::EchClient>,
     /// Server-side ECH configuration. `None` (default) = no ECH. When
-    /// set, in a follow-up the server will attempt HPKE-decap on the
-    /// outer-CH `encrypted_client_hello` extension and, on success,
-    /// continue the handshake against the decrypted inner CH; on
-    /// failure it completes the outer handshake and emits
-    /// `retry_configs` in `EncryptedExtensions`.
+    /// set, the server attempts HPKE-decap on the outer-CH
+    /// `encrypted_client_hello` extension and, on success, continues the
+    /// handshake against the decrypted inner CH; on failure it completes
+    /// the outer handshake and emits `retry_configs` in
+    /// `EncryptedExtensions`.
     #[cfg(feature = "ech")]
     pub ech_server: Option<super::ech::EchServer>,
 
@@ -717,10 +715,9 @@ impl ConfigBuilder {
     /// for GREASE — a wire-shape-identical `encrypted_client_hello`
     /// that hides whether the client speaks ECH from passive
     /// observers. Pass
-    /// [`super::ech::EchClient::from_config_list`] to seal against a
-    /// published `ECHConfigList`. The full real-ECH client lands in a
-    /// follow-up commit; for now this stores the choice and emits
-    /// GREASE on the wire either way.
+    /// [`super::ech::EchClient::from_config_list`] for real ECH, which
+    /// seals the inner CH against a published `ECHConfigList`. GREASE mode
+    /// emits a wire-shape-identical decoy instead.
     #[cfg(feature = "ech")]
     pub fn ech(mut self, ech: super::ech::EchClient) -> Self {
         self.inner.ech = Some(ech);
@@ -728,9 +725,9 @@ impl ConfigBuilder {
     }
     /// Server: install Encrypted Client Hello key material
     /// (draft-ietf-tls-esni-22) — the active key ring and the
-    /// `retry_configs` list to ship on rejection. Stored now; the
-    /// outer-CH HPKE decap + inner-CH dispatch + retry_configs
-    /// emission land in a follow-up under the same Phase 5 banner.
+    /// `retry_configs` list to ship on rejection. The server performs
+    /// outer-CH HPKE decap, inner-CH dispatch, and `retry_configs`
+    /// emission on decap failure.
     #[cfg(feature = "ech")]
     pub fn ech_server(mut self, ech: super::ech::EchServer) -> Self {
         self.inner.ech_server = Some(ech);

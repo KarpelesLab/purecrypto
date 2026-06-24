@@ -29,7 +29,7 @@ The crate exposes a lot. Most of it you should not reach for. Three tiers:
 | Key derivation (from a strong secret) | **HKDF-SHA-256** | `crate::kdf` |
 | Password hashing / KDF | **Argon2id** | `crate::kdf`; scrypt acceptable |
 | Transport | **TLS 1.3** | set `min_version` to 1.3 |
-| Load a key of unknown type | `key::AnyKey::from_pkcs8` → operate via the `key` facade | type-honest, covers KEM keys too |
+| Load a key of unknown type | `key::AnyKey::from_pkcs8_der` / `_pem` → operate via the `key` facade | type-honest, covers KEM keys too |
 
 ## Per-domain
 

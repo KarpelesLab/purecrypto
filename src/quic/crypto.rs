@@ -497,9 +497,8 @@ pub(crate) fn derive_dir_keys(alg: AeadAlg, secret: &[u8]) -> DirKeys {
 /// RFC 9001 §6.1 — derive the next application-traffic secret for a
 /// direction, using HKDF-Expand-Label with label `"quic ku"`.
 ///
-/// Used by the Phase 8 key-update path; exposed now so the eventual
-/// plumbing is a one-line call. The output is one hash-output long
-/// (matching the input secret length).
+/// Used by the key-update path (`QuicConnection::initiate_key_update`).
+/// The output is one hash-output long (matching the input secret length).
 pub(crate) fn derive_next_application_secret(alg: AeadAlg, current: &[u8]) -> Vec<u8> {
     let mut next = alloc::vec![0u8; current.len()];
     expand_label_dyn(alg.hash(), current, b"quic ku", &[], &mut next);

@@ -17,8 +17,8 @@
 //!   tracks `outbound_offset` — the running byte offset to be stamped on
 //!   the next CRYPTO frame, mirroring the TLS-record stream offset on the
 //!   sending side. The "last sent" suffix is retained as `last_chunk`
-//!   for the Phase-4 PTO retransmit (we just resend the trailing chunk —
-//!   full RFC 9002 lands in Phase 5).
+//!   for the CRYPTO-stream PTO retransmit (we resend the trailing chunk;
+//!   datagram-level loss recovery lives in `loss.rs`).
 //!
 //! The reassembly logic is conservative: any byte already covered by
 //! `delivered` is silently discarded (duplicate retransmits), and any
