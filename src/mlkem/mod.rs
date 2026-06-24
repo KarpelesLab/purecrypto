@@ -486,6 +486,109 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+    use alloc::vec::Vec;
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let b = s.as_bytes();
+        let mut v = Vec::with_capacity(b.len() / 2);
+        let mut i = 0;
+        while i < b.len() {
+            let hi = (b[i] as char).to_digit(16).unwrap() as u8;
+            let lo = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            v.push((hi << 4) | lo);
+            i += 2;
+        }
+        v
+    }
+
+    // NIST ACVP FIPS 203 known-answer tests for ML-KEM (keyGen, deterministic
+    // encapsulation, decapsulation). Vectors are a bounded subset (at most the
+    // first 20 records per file) extracted from the NIST ACVP-Server corpus at
+    // gen-val/json-files/ML-KEM-{keyGen,encapDecap}-FIPS203/internalProjection.json.
+    macro_rules! acvp_mlkem_tests {
+        ($kg:ident, $en:ident, $de:ident,
+         $dk_ty:ty, $ek_ty:ty, $ct_ty:ty,
+         $kgf:expr, $enf:expr, $def:expr) => {
+            // keyGen: d z ek dk
+            #[test]
+            fn $kg() {
+                for line in include_str!($kgf).lines() {
+                    let mut it = line.split_whitespace();
+                    let d: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
+                    let z: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
+                    let ek_exp = unhex(it.next().unwrap());
+                    let dk_exp = unhex(it.next().unwrap());
+                    let (dk, ek) = <$dk_ty>::from_seeds(&d, &z);
+                    assert_eq!(ek.to_bytes()[..], ek_exp[..], "ek");
+                    assert_eq!(dk.to_bytes()[..], dk_exp[..], "dk");
+                }
+            }
+
+            // encap (AFT): ek m c k
+            #[test]
+            fn $en() {
+                for line in include_str!($enf).lines() {
+                    let mut it = line.split_whitespace();
+                    let ek_bytes = unhex(it.next().unwrap());
+                    let m: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
+                    let c_exp = unhex(it.next().unwrap());
+                    let k_exp = unhex(it.next().unwrap());
+                    let ek = <$ek_ty>::from_bytes(ek_bytes.try_into().unwrap());
+                    let (ct, k) = ek.encapsulate_deterministic(&m);
+                    assert_eq!(ct.to_bytes()[..], c_exp[..], "ciphertext");
+                    assert_eq!(k[..], k_exp[..], "shared secret");
+                }
+            }
+
+            // decap (VAL): dk c k
+            #[test]
+            fn $de() {
+                for line in include_str!($def).lines() {
+                    let mut it = line.split_whitespace();
+                    let dk_bytes = unhex(it.next().unwrap());
+                    let ct_bytes = unhex(it.next().unwrap());
+                    let k_exp = unhex(it.next().unwrap());
+                    let dk = <$dk_ty>::from_bytes(dk_bytes.try_into().unwrap());
+                    let k = dk.decapsulate(&<$ct_ty>::from_bytes(ct_bytes.try_into().unwrap()));
+                    assert_eq!(k[..], k_exp[..], "shared secret");
+                }
+            }
+        };
+    }
+
+    acvp_mlkem_tests!(
+        acvp_mlkem512_keygen,
+        acvp_mlkem512_encap,
+        acvp_mlkem512_decap,
+        MlKem512DecapsKey,
+        MlKem512EncapsKey,
+        MlKem512Ciphertext,
+        "../../testdata/mlkem512_keygen.kat",
+        "../../testdata/mlkem512_encap.kat",
+        "../../testdata/mlkem512_decap.kat"
+    );
+    acvp_mlkem_tests!(
+        acvp_mlkem768_keygen,
+        acvp_mlkem768_encap,
+        acvp_mlkem768_decap,
+        MlKem768DecapsKey,
+        MlKem768EncapsKey,
+        MlKem768Ciphertext,
+        "../../testdata/mlkem768_keygen.kat",
+        "../../testdata/mlkem768_encap.kat",
+        "../../testdata/mlkem768_decap.kat"
+    );
+    acvp_mlkem_tests!(
+        acvp_mlkem1024_keygen,
+        acvp_mlkem1024_encap,
+        acvp_mlkem1024_decap,
+        MlKem1024DecapsKey,
+        MlKem1024EncapsKey,
+        MlKem1024Ciphertext,
+        "../../testdata/mlkem1024_keygen.kat",
+        "../../testdata/mlkem1024_encap.kat",
+        "../../testdata/mlkem1024_decap.kat"
+    );
 
     #[test]
     fn fips203_sizes() {
