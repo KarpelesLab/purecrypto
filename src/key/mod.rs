@@ -44,9 +44,17 @@
 //! [`EncryptParams`] for the field-by-field applicability.
 
 mod algorithm;
+#[cfg(feature = "x509")]
+mod decode;
 mod error;
 mod params;
 mod secret;
+
+#[cfg(feature = "x509")]
+pub use decode::{
+    private_key_from_pkcs8_der, private_key_from_pkcs8_der_encrypted, private_key_from_pkcs8_pem,
+    private_key_from_pkcs8_pem_encrypted, public_key_from_spki_der, public_key_from_spki_pem,
+};
 
 #[cfg(all(
     test,
@@ -62,7 +70,8 @@ mod tests;
 pub use algorithm::{Algorithm, Operation};
 pub use error::Error;
 pub use params::{
-    DecryptParams, EncryptParams, Hash, RsaEncPadding, RsaSigPadding, SaltLen, SignParams,
+    DecryptParams, EncryptParams, Hash, RsaEncPadding, RsaSigPadding, SaltLen, SigEncoding,
+    SignParams,
 };
 pub use secret::Secret;
 

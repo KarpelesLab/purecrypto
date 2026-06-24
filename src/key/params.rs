@@ -104,6 +104,25 @@ pub struct SignParams<'a> {
     /// Select the deterministic variant for schemes that offer both. Ignored
     /// where it does not apply.
     pub deterministic: bool,
+    /// Wire encoding for the signatures of schemes that have a choice — ECDSA
+    /// and SM2, whose `(r, s)` pair can be either a fixed-width `r || s`
+    /// concatenation ([`SigEncoding::Raw`]) or an ASN.1 DER `SEQUENCE`
+    /// ([`SigEncoding::Der`], the X.509 / TLS / OpenSSL form). Ignored by every
+    /// other scheme (their signatures have a single defined encoding).
+    pub sig_encoding: SigEncoding,
+}
+
+/// Wire encoding for ECDSA / SM2 signatures (see [`SignParams::sig_encoding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SigEncoding {
+    /// Fixed-width `r || s` (each coordinate big-endian, padded to the field
+    /// width). Used by JWS/COSE and the low-level fixed-curve APIs.
+    #[default]
+    Raw,
+    /// ASN.1 DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` — the
+    /// X.509, TLS, and OpenSSL encoding.
+    Der,
 }
 
 impl Default for SignParams<'_> {
@@ -116,6 +135,7 @@ impl Default for SignParams<'_> {
                 salt_len: SaltLen::DigestLength,
             },
             deterministic: false,
+            sig_encoding: SigEncoding::Raw,
         }
     }
 }
@@ -141,6 +161,12 @@ impl<'a> SignParams<'a> {
     /// Sets the context string (Ed448 / ML-DSA / SLH-DSA) or SM2 signer ID.
     pub fn context(mut self, context: &'a [u8]) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Sets the signature wire encoding (ECDSA / SM2).
+    pub fn sig_encoding(mut self, enc: SigEncoding) -> Self {
+        self.sig_encoding = enc;
         self
     }
 

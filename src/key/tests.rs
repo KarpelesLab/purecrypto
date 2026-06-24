@@ -241,6 +241,69 @@ fn xmss_stateful_signer_and_facade_guard() {
 }
 
 // ----------------------------------------------------------------------------
+// Generic decoders: PKCS#8 / SPKI -> Box<dyn ...>, then operate
+// ----------------------------------------------------------------------------
+
+#[test]
+fn decode_pkcs8_private_then_sign() {
+    let mut r = rng();
+    let sk = crate::ec::Ed25519PrivateKey::generate(&mut r);
+    let sk_pem = sk.to_pkcs8_pem();
+
+    let priv_dyn = crate::key::private_key_from_pkcs8_pem(&sk_pem).expect("decode pkcs8");
+    assert_eq!(priv_dyn.algorithm(), Algorithm::Ed25519);
+
+    let params = SignParams::new();
+    let sig = priv_dyn.sign(b"decoded", &params, &mut r).expect("sign");
+    // Public key derived from the decoded private key verifies its signature.
+    let pub_dyn = priv_dyn.public_key().expect("derive public");
+    pub_dyn.verify(b"decoded", &sig, &params).expect("verify");
+}
+
+#[test]
+fn decode_spki_public() {
+    let pk_der = crate::test_util::rsa_test_key_a()
+        .public_key()
+        .to_spki_der();
+    let pub_dyn = crate::key::public_key_from_spki_der(&pk_der).expect("decode spki");
+    assert_eq!(pub_dyn.algorithm(), Algorithm::Rsa);
+}
+
+// ----------------------------------------------------------------------------
+// ECDSA signature wire encoding: Raw r||s vs DER round-trips, and differ
+// ----------------------------------------------------------------------------
+
+#[test]
+fn ecdsa_der_vs_raw_encoding() {
+    use crate::key::SigEncoding;
+    let mut r = rng();
+    let sk = crate::ec::ecdsa::EcdsaPrivateKey::generate(&mut r);
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let pk = priv_dyn.public_key().expect("pub");
+
+    let raw_p = SignParams::new().hash(Hash::Sha256); // SigEncoding::Raw default
+    let der_p = SignParams::new()
+        .hash(Hash::Sha256)
+        .sig_encoding(SigEncoding::Der);
+
+    let raw = priv_dyn.sign(b"m", &raw_p, &mut r).expect("raw sign");
+    let der = priv_dyn.sign(b"m", &der_p, &mut r).expect("der sign");
+    assert_eq!(raw.len(), 64, "raw r||s is fixed 64 bytes for P-256");
+    assert_eq!(
+        der.first(),
+        Some(&0x30),
+        "DER signature starts with SEQUENCE"
+    );
+    assert_ne!(raw, der);
+
+    // Each verifies only under its matching encoding.
+    pk.verify(b"m", &raw, &raw_p).expect("raw verify");
+    pk.verify(b"m", &der, &der_p).expect("der verify");
+    assert!(pk.verify(b"m", &der, &raw_p).is_err());
+    assert!(pk.verify(b"m", &raw, &der_p).is_err());
+}
+
+// ----------------------------------------------------------------------------
 // Object safety: a heterogeneous collection of boxed private keys
 // ----------------------------------------------------------------------------
 

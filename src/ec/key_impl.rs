@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::key::{
     Algorithm, DecryptParams, Decryptor, EncryptParams, Encryptor, Error, Hash, KeyAgreement,
-    PrivateKey, PublicKey, Secret, SignParams, Signer, Verifier, downcast_peer,
+    PrivateKey, PublicKey, Secret, SigEncoding, SignParams, Signer, Verifier, downcast_peer,
 };
 use crate::rng::CryptoRngCore;
 
@@ -184,7 +184,10 @@ impl Signer for EcdsaPrivateKey {
             }
         })
         .map_err(|_| Error::Signature)?;
-        Ok(sig.to_bytes().to_vec())
+        Ok(match params.sig_encoding {
+            SigEncoding::Raw => sig.to_bytes().to_vec(),
+            SigEncoding::Der => sig.to_der(),
+        })
     }
 }
 
@@ -207,8 +210,13 @@ impl PrivateKey for EcdsaPrivateKey {
 
 impl Verifier for EcdsaPublicKey {
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
-        let signature = Signature::from_bytes(&bytes);
+        let signature = match params.sig_encoding {
+            SigEncoding::Raw => {
+                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
+                Signature::from_bytes(&bytes)
+            }
+            SigEncoding::Der => Signature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
         if params.prehashed {
             self.verify_prehash(msg, &signature)
         } else {
@@ -338,7 +346,10 @@ impl Signer for Sm2PrivateKey {
         let id = sm2_id(params.context);
         let mut rng = rng;
         let sig = self.sign(msg, id, &mut rng).map_err(|_| Error::Signature)?;
-        Ok(sig.to_bytes())
+        Ok(match params.sig_encoding {
+            SigEncoding::Raw => sig.to_bytes(),
+            SigEncoding::Der => sig.to_der(),
+        })
     }
 }
 
@@ -371,7 +382,10 @@ impl PrivateKey for Sm2PrivateKey {
 
 impl Verifier for Sm2PublicKey {
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
-        let signature = Sm2Signature::from_bytes(sig).map_err(|_| Error::Signature)?;
+        let signature = match params.sig_encoding {
+            SigEncoding::Raw => Sm2Signature::from_bytes(sig).map_err(|_| Error::Signature)?,
+            SigEncoding::Der => Sm2Signature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
         self.verify(msg, &signature, sm2_id(params.context))
             .map_err(|_| Error::Signature)
     }
@@ -482,7 +496,10 @@ impl Signer for BoxedEcdsaPrivateKey {
             }
         })
         .map_err(|_| Error::Signature)?;
-        Ok(sig.to_bytes(curve))
+        Ok(match params.sig_encoding {
+            SigEncoding::Raw => sig.to_bytes(curve),
+            SigEncoding::Der => sig.to_der(curve),
+        })
     }
 }
 
@@ -509,16 +526,21 @@ impl Verifier for BoxedEcdsaPublicKey {
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
         let curve = self.curve();
         curve_alg(curve).ok_or(Error::InvalidParams)?;
-        // Reconstruct the signature from the fixed-width `r || s` encoding
-        // (`BoxedEcdsaSignature` has no `from_bytes`): two `field_len`-byte
-        // big-endian halves -> `BoxedUint` -> `from_components`.
-        let flen = curve.field_len();
-        if sig.len() != 2 * flen {
-            return Err(Error::Signature);
-        }
-        let r = BoxedUint::from_be_bytes(&sig[..flen]);
-        let s = BoxedUint::from_be_bytes(&sig[flen..]);
-        let signature = BoxedEcdsaSignature::from_components(r, s);
+        let signature = match params.sig_encoding {
+            // Reconstruct from the fixed-width `r || s` encoding
+            // (`BoxedEcdsaSignature` has no `from_bytes`): two `field_len`-byte
+            // big-endian halves -> `BoxedUint` -> `from_components`.
+            SigEncoding::Raw => {
+                let flen = curve.field_len();
+                if sig.len() != 2 * flen {
+                    return Err(Error::Signature);
+                }
+                let r = BoxedUint::from_be_bytes(&sig[..flen]);
+                let s = BoxedUint::from_be_bytes(&sig[flen..]);
+                BoxedEcdsaSignature::from_components(r, s)
+            }
+            SigEncoding::Der => BoxedEcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
         if params.prehashed {
             self.verify_prehash(msg, &signature)
         } else {
