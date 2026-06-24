@@ -22,7 +22,12 @@
 //! bytes than requested for `len > 256`; [`try_getrandom`] handles both by
 //! looping.
 
-#![allow(unsafe_code)] // syscall asm — `rng/` is one of the two unsafe carve-outs
+#![allow(unsafe_code)]
+// syscall asm — `rng/` is one of the two unsafe carve-outs
+// Under Miri the syscall `asm!` is never invoked (try_getrandom takes the
+// `/dev/urandom` fallback), leaving the per-arch `getrandom_syscall` helpers
+// uncalled.
+#![cfg_attr(miri, allow(dead_code))]
 
 /// Reasons [`try_getrandom`] can fail. The caller (in `super::OsRng`)
 /// distinguishes between `NotImplemented` (definitely fall back to
@@ -49,6 +54,7 @@ pub(super) enum Error {
 /// `Err(NotImplemented)` on `ENOSYS` so the caller can fall back.
 #[cfg(all(
     target_os = "linux",
+    not(miri),
     any(
         target_arch = "x86_64",
         target_arch = "aarch64",
@@ -89,16 +95,20 @@ pub(super) fn try_getrandom(buf: &mut [u8]) -> Result<(), Error> {
 }
 
 /// Catch-all stub for Linux on unsupported architectures (e.g. mips64,
-/// powerpc64, s390x). Reports unimplemented so the caller falls back to
-/// `/dev/urandom`.
+/// powerpc64, s390x), and for **Miri**, which cannot execute the raw syscall
+/// `asm!`. Reports unimplemented so the caller falls back to `/dev/urandom`
+/// (which Miri supports under `-Zmiri-disable-isolation`).
 #[cfg(all(
     target_os = "linux",
-    not(any(
-        target_arch = "x86_64",
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "riscv64",
-    ))
+    any(
+        miri,
+        not(any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+        ))
+    )
 ))]
 pub(super) fn try_getrandom(_buf: &mut [u8]) -> Result<(), Error> {
     Err(Error::NotImplemented)
@@ -188,6 +198,7 @@ mod tests {
     /// is a no-op.
     #[cfg(all(
         target_os = "linux",
+        not(miri), // exercises the raw syscall asm, which Miri cannot execute
         any(
             target_arch = "x86_64",
             target_arch = "aarch64",
@@ -208,6 +219,7 @@ mod tests {
     /// should still return a fully-filled buffer.
     #[cfg(all(
         target_os = "linux",
+        not(miri), // exercises the raw syscall asm, which Miri cannot execute
         any(
             target_arch = "x86_64",
             target_arch = "aarch64",
