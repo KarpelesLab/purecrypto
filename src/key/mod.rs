@@ -54,6 +54,8 @@ pub use decode::{
     private_key_from_pkcs8_pem_encrypted, public_key_from_spki_der, public_key_from_spki_pem,
 };
 
+#[cfg(all(feature = "x509", feature = "mlkem"))]
+pub use crate::x509::{AnyDecapsulationKey, AnyEncapsulationKey, AnyKey, AnyKeyPublic};
 /// The algorithm-tagged "any key" enums and their PKCS#8 / SPKI parsers live in
 /// [`x509`](crate::x509) (they are built on the PKIX OID machinery), but they
 /// are the enum counterpart to the [`PrivateKey`]/[`PublicKey`] trait objects

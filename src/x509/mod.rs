@@ -5,6 +5,8 @@
 //! certificates from a CA key, and parsing + signature verification, using
 //! RSA with PKCS#1 v1.5 signatures.
 
+#[cfg(feature = "mlkem")]
+mod anykey;
 pub(crate) mod cert;
 mod crl;
 mod csr;
@@ -17,6 +19,8 @@ pub mod sct;
 mod signer;
 mod time;
 
+#[cfg(feature = "mlkem")]
+pub use anykey::{AnyDecapsulationKey, AnyEncapsulationKey, AnyKey, AnyKeyPublic};
 pub use cert::{Certificate, NameConstraints, PreparedCertificate, SanIp};
 pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, PreparedCrl, RevokedCertificate};
 pub use csr::CertificationRequest;
