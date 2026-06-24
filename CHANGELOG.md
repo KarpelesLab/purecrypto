@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.19](https://github.com/KarpelesLab/purecrypto/compare/v0.6.18...v0.6.19) - 2026-06-24
+
+### Added
+
+- *(ec)* add X25519PrivateKey/X448PrivateKey::to_bytes
+- *(key)* impl PrivateKey/PublicKey for AnyPrivateKey/AnyPublicKey
+- *(key)* surface AnyPrivateKey/AnyPublicKey from key + into_dyn() bridges
+- *(cli)* route pkeyutl sign/verify through the unified key traits
+- *(key)* generic from_pkcs8/from_spki decoders + ECDSA/SM2 DER encoding option
+- *(key)* unified asymmetric-key traits (PrivateKey/PublicKey + capabilities)
+
+### Other
+
+- *(tls)* deprecate the PrivateKey alias since 0.6.19, not 0.7.0
+- *(key)* tighten the facade — drop capability traits, de-scope KEM/stateful, self-validating params
+
 ## [0.6.18](https://github.com/KarpelesLab/purecrypto/compare/v0.6.17...v0.6.18) - 2026-06-22
 
 ### Other
