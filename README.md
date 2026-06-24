@@ -17,6 +17,10 @@ usable three ways:
   generation including PQ, CSRs, a small CA, TLS / DTLS / QUIC test clients
   and servers, …).
 
+It's a **modular** toolkit with OpenSSL-like breadth — but unlike a monolithic
+binary dependency, every algorithm and protocol layer is feature-gated (over a
+`#![no_std]` core), so an application compiles in only the parts it needs.
+
 > Status: **mostly stable.** Everything below is implemented and validated
 > against published test vectors (RFCs, NIST FIPS ACVP, OpenSSL interop), and
 > the public API is now mostly stable: breaking changes are rare, deliberate,
