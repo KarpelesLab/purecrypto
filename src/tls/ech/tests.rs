@@ -18,7 +18,7 @@ use super::grease::{GreaseConfigIdStrategy, GreaseParams};
 use super::hpke_setup::{ech_info, map_kem, map_sym_suite};
 use super::inner::{
     compress_extensions, decode_outer_extensions, decompress_extensions, encode_outer_extensions,
-    inner_extension_body,
+    inner_extension_body, longest_shared_block,
 };
 use super::keys::{EchKeyPair, EchKeyRing};
 use super::retry::{decode_retry_configs, encode_retry_configs};
@@ -778,6 +778,81 @@ fn compress_then_decompress_yields_canonical() {
     assert_eq!(compressed[2].0, ExtensionType::ENCRYPTED_CLIENT_HELLO);
     let decompressed = decompress_extensions(&compressed, &outer).expect("decompress");
     assert_eq!(decompressed, canonical_inner);
+}
+
+#[test]
+fn longest_shared_block_picks_byte_identical_run_and_round_trips() {
+    // A realistic inner/outer pair: SNI differs (inner = secret, outer =
+    // public), the ECH extension differs (inner marker vs outer GREASE-ish),
+    // and the middle run of extensions is byte-identical between the two.
+    let ks = &[0xAB, 0xCD][..];
+    let inner = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"secret.example"),
+        ext(ExtensionType::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]),
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x1d]),
+        ext(ExtensionType::KEY_SHARE, ks),
+        (
+            ExtensionType::ENCRYPTED_CLIENT_HELLO,
+            inner_extension_body()
+        ),
+    ];
+    let outer = alloc::vec![
+        ext(ExtensionType::SERVER_NAME, b"public.example"),
+        ext(ExtensionType::SUPPORTED_VERSIONS, &[0x02, 0x03, 0x04]),
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x1d]),
+        ext(ExtensionType::KEY_SHARE, ks),
+        ext(ExtensionType::ENCRYPTED_CLIENT_HELLO, b"outer-ech"),
+    ];
+
+    // The longest byte-identical run is the three middle extensions; SNI and
+    // the ECH marker (differing / reserved) are excluded.
+    let share = longest_shared_block(&inner, &outer);
+    assert_eq!(
+        share,
+        alloc::vec![
+            ExtensionType::SUPPORTED_VERSIONS,
+            ExtensionType::SUPPORTED_GROUPS,
+            ExtensionType::KEY_SHARE,
+        ]
+    );
+
+    // Compressing that block then decompressing against the outer must rebuild
+    // the canonical inner exactly — the whole correctness property.
+    let compressed = compress_extensions(&inner, &outer, &share).expect("compress");
+    assert!(
+        compressed.len() < inner.len(),
+        "compression must shrink the list"
+    );
+    assert!(
+        compressed
+            .iter()
+            .any(|(t, _)| *t == ExtensionType::ECH_OUTER_EXTENSIONS),
+        "a placeholder is inserted"
+    );
+    let round_tripped = decompress_extensions(&compressed, &outer).expect("decompress");
+    assert_eq!(
+        round_tripped, inner,
+        "decompress rebuilds the canonical inner"
+    );
+}
+
+#[test]
+fn longest_shared_block_skips_type_match_with_differing_body() {
+    // Same type, different body must NOT be compressed (decompress would copy
+    // the outer body and corrupt the inner CH).
+    let inner = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x1d]),
+        ext(ExtensionType::KEY_SHARE, &[0x11]),
+    ];
+    let outer = alloc::vec![
+        ext(ExtensionType::SUPPORTED_GROUPS, &[0x00, 0x1d]),
+        ext(ExtensionType::KEY_SHARE, &[0x22]), // body differs
+    ];
+    // Only `supported_groups` is byte-identical, so that's the (length-1) block.
+    assert_eq!(
+        longest_shared_block(&inner, &outer),
+        alloc::vec![ExtensionType::SUPPORTED_GROUPS]
+    );
 }
 
 #[test]

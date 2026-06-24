@@ -182,6 +182,64 @@ pub(crate) fn decompress_extensions(
     Ok(out)
 }
 
+/// Picks the longest contiguous block of `inner` extensions that can be
+/// compressed against `outer`: each entry must have a **byte-identical** (type
+/// *and* body) match in `outer`, those matches must occur at strictly
+/// increasing positions (the relative-order constraint `decompress_extensions`
+/// enforces), and the two reserved types are excluded. Returns the block's
+/// types in order (empty if nothing qualifies).
+///
+/// Body-identity is essential: `decompress_extensions` rebuilds the inner CH by
+/// copying the *outer* body for each referenced type, so a type may only be
+/// compressed away when the bodies already match — exactly the extensions an
+/// ECH client duplicates verbatim between its inner and outer ClientHello
+/// (everything except SNI and the ECH extension itself).
+pub(crate) fn longest_shared_block(
+    inner: &[RawExtension],
+    outer: &[RawExtension],
+) -> Vec<ExtensionType> {
+    let reserved = |t: ExtensionType| {
+        t == ExtensionType::ECH_OUTER_EXTENSIONS || t == ExtensionType::ENCRYPTED_CLIENT_HELLO
+    };
+    // Outer match position for each inner extension (extension types are unique
+    // within a ClientHello, so there is at most one byte-identical match).
+    let pos: Vec<Option<usize>> = inner
+        .iter()
+        .map(|(ty, body)| {
+            if reserved(*ty) {
+                return None;
+            }
+            outer
+                .iter()
+                .position(|(oty, obody)| oty == ty && obody == body)
+        })
+        .collect();
+    let (mut best_start, mut best_len) = (0usize, 0usize);
+    let mut k = 0;
+    while k < inner.len() {
+        if pos[k].is_none() {
+            k += 1;
+            continue;
+        }
+        let run_start = k;
+        k += 1;
+        while k < inner.len() && pos[k].is_some() && pos[k].unwrap() > pos[k - 1].unwrap() {
+            k += 1;
+        }
+        if k - run_start > best_len {
+            best_len = k - run_start;
+            best_start = run_start;
+        }
+    }
+    if best_len == 0 {
+        return Vec::new();
+    }
+    inner[best_start..best_start + best_len]
+        .iter()
+        .map(|(t, _)| *t)
+        .collect()
+}
+
 /// Validates `types`: no duplicates, no reserved entries.
 fn validate_share_types(types: &[ExtensionType]) -> Result<(), Error> {
     for (i, t) in types.iter().enumerate() {

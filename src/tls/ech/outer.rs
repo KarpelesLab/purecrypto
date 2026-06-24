@@ -381,8 +381,9 @@ pub(crate) fn try_decap_inner(
         // (`[0x01]`). Reject as malformed otherwise (maps to
         // illegal_parameter at the alert layer).
         require_inner_marker(&unpadded)?;
+        let inner_ch_bytes = decompress_inner_against_outer(&unpadded, handshake_msg)?;
         return Ok(DecappedInner {
-            inner_ch_bytes: unpadded,
+            inner_ch_bytes,
             receiver,
             sym,
             config_id,
@@ -390,6 +391,43 @@ pub(crate) fn try_decap_inner(
     }
     // No matching config decapped successfully → ECH reject.
     Err(Error::EchDecryptionFailed)
+}
+
+/// If the recovered inner CH carries an `ech_outer_extensions` reference,
+/// reconstructs the canonical inner CH by expanding it against the outer CH's
+/// extensions (draft-ietf-tls-esni §5.1), re-encoding through
+/// [`crate::tls::codec::ClientHello::encode`] so the bytes match what the
+/// client fed its transcript. An inner CH without the reference is returned
+/// byte-for-byte unchanged (the uncompressed path is untouched).
+fn decompress_inner_against_outer(
+    unpadded: &[u8],
+    outer_handshake: &[u8],
+) -> Result<Vec<u8>, Error> {
+    use crate::tls::codec::{ClientHello, ExtensionType};
+    // The 4-byte handshake header (type + 24-bit length) precedes the body.
+    let inner_body = unpadded.get(4..).ok_or(Error::EchDecodeError)?;
+    let inner = match ClientHello::decode(inner_body) {
+        Ok(ch) => ch,
+        // Not a parseable ClientHello: leave it for the downstream parser to
+        // reject, exactly as before this hook existed.
+        Err(_) => return Ok(unpadded.to_vec()),
+    };
+    if !inner
+        .extensions
+        .iter()
+        .any(|(t, _)| *t == ExtensionType::ECH_OUTER_EXTENSIONS)
+    {
+        return Ok(unpadded.to_vec());
+    }
+    let outer_body = outer_handshake.get(4..).ok_or(Error::EchDecodeError)?;
+    let outer = ClientHello::decode(outer_body).map_err(|_| Error::EchDecodeError)?;
+    let canonical_exts =
+        crate::tls::ech::inner::decompress_extensions(&inner.extensions, &outer.extensions)?;
+    let canonical = ClientHello {
+        extensions: canonical_exts,
+        ..inner
+    };
+    Ok(canonical.encode())
 }
 
 /// Server-side CH2-outer decap on the HRR retry path. Uses the
@@ -424,7 +462,7 @@ pub(crate) fn try_decap_inner_retry(
     let unpadded = strip_trailing_padding(&plaintext)?;
     // Same inner-marker requirement as on the CH1 path (draft §7.1).
     require_inner_marker(&unpadded)?;
-    Ok(unpadded)
+    decompress_inner_against_outer(&unpadded, handshake_msg)
 }
 
 /// Walks the outer CH to find the `encrypted_client_hello` extension

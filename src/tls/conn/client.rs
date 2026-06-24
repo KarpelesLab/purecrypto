@@ -3254,11 +3254,61 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     let groups_owned = groups.to_vec();
     let share_groups_owned = share_groups.to_vec();
     let public_name_closure = public_name_str.clone();
+
+    // draft-ietf-tls-esni §5: compress the inner CH by replacing the run of
+    // extensions it duplicates verbatim from the outer CH with a single
+    // `ech_outer_extensions` reference, shrinking the encrypted payload. Both
+    // peers reconstruct the *canonical* (decompressed) inner CH via
+    // `ClientHello::encode`, so the transcript and accept-signal match exactly.
+    //
+    // A reference outer CH reveals the shared extensions; its non-ECH
+    // extensions are byte-identical to the real outer (same suites/groups —
+    // only SNI and the ECH extension itself differ). On any parse hiccup we
+    // fall back to sealing the inner CH verbatim (correct, just larger).
+    let reference_outer = conn.build_client_hello(
+        random,
+        public_name_str.clone(),
+        effective_suites,
+        groups,
+        share_groups,
+        &[],
+        Some(&crate::tls::ech::outer::build_outer_ext_body(
+            sym, config_id, &[0u8; 32], 100,
+        )),
+    );
+    let (canonical_inner, inner_to_seal) = match (
+        ClientHello::decode(inner_ch.get(4..)?),
+        ClientHello::decode(reference_outer.get(4..)?),
+    ) {
+        (Ok(inner_struct), Ok(outer_struct)) => {
+            let canonical = inner_struct.encode();
+            let share = crate::tls::ech::inner::longest_shared_block(
+                &inner_struct.extensions,
+                &outer_struct.extensions,
+            );
+            match crate::tls::ech::inner::compress_extensions(
+                &inner_struct.extensions,
+                &outer_struct.extensions,
+                &share,
+            ) {
+                Ok(compressed_exts) if !share.is_empty() => {
+                    let compressed = ClientHello {
+                        extensions: compressed_exts,
+                        ..inner_struct
+                    };
+                    (canonical, compressed.encode())
+                }
+                _ => (canonical.clone(), canonical),
+            }
+        }
+        _ => (inner_ch.clone(), inner_ch.clone()),
+    };
+
     let conn_for_closure = conn;
     let sealed = crate::tls::ech::outer::seal_with(
         &echcfg,
         sym,
-        &inner_ch,
+        &inner_to_seal,
         inner_sni_len,
         rng,
         |enc, padded_len| {
@@ -3276,18 +3326,18 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         },
     )
     .ok()?;
-    // Extract CH1-inner's `random` from the encoded inner CH. The
+    // Extract CH1-inner's `random` from the canonical inner CH. The
     // ClientHello body opens with version(2) + random(32); the
     // handshake header (type=1 + 24-bit length) precedes it, so the
     // random sits at offset 4 + 2 = 6.
-    if inner_ch.len() < 38 {
+    if canonical_inner.len() < 38 {
         return None;
     }
     let mut inner_ch1_random = [0u8; 32];
-    inner_ch1_random.copy_from_slice(&inner_ch[6..38]);
+    inner_ch1_random.copy_from_slice(&canonical_inner[6..38]);
     Some(EchSealOutput {
         outer_ch: sealed.outer_ch,
-        inner_ch_bytes: inner_ch,
+        inner_ch_bytes: canonical_inner,
         sender: sealed.sender,
         sym,
         config_id,
