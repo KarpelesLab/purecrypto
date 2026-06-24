@@ -2,15 +2,20 @@
 //!
 //! The engine ingests UDP datagrams via [`QuicConnection::feed_datagram`]
 //! and emits UDP datagrams via [`QuicConnection::pop_datagram`]. The host
-//! wires this to a `UdpSocket` (Phase 9 ships the CLI shim, Phase 10 the
-//! C ABI).
+//! wires this to a `UdpSocket`; the `q_client` / `q_server` CLI and the
+//! C ABI (`PcQuic`) are thin hosts over exactly this API.
 //!
-//! Phase 4 ships the Initial-level + Handshake-level handshake plus PTO
-//! retransmit; streams (Phase 6), full RFC 9002 (Phase 5), Retry (Phase
-//! 7), key update (Phase 8), and the application-data path are all
-//! beyond this phase. The public API surface for the deferred features
-//! is in place — `open_bidi` / `open_uni` return
-//! [`Error::InappropriateState`] until Phase 6 fills them in.
+//! This is the full QUIC v1 engine: Initial + Handshake + 1-RTT packet
+//! spaces, the TLS-over-QUIC handshake, RFC 9002 loss recovery with NewReno
+//! congestion control, streams with flow control (`open_bidi` / `open_uni` /
+//! `stream_send` / `stream_recv`), the application-data path, Retry +
+//! address validation, connection-ID rotation, key update, and RFC 9221
+//! unreliable DATAGRAM. `open_bidi` / `open_uni` return
+//! [`Error::InappropriateState`] only before the handshake has progressed
+//! far enough to initialise stream state, not because they are unimplemented.
+//!
+//! Deliberately out of scope: 0-RTT (we never emit it), the idle-timeout
+//! timer (only the PTO is wired), HTTP/3, and stateless-reset emission.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -196,8 +201,9 @@ pub struct QuicConnection {
     /// AEAD/HKDF pair for QUIC's level keys).
     negotiated_suite: Option<u16>,
     /// True once both 1-RTT keys are installed and the TLS state is
-    /// `!is_handshaking`. Once this flips on, subsequent `pop_datagram`
-    /// calls return an empty vector (Phase 4 ships no app-data path).
+    /// `!is_handshaking`. Once this flips on, `pop_datagram` returns an
+    /// empty vector only when nothing is pending outbound — otherwise it
+    /// emits 1-RTT packets carrying stream / DATAGRAM / ACK frames.
     handshake_complete: bool,
     /// SNI hostname (client side only). Stored so we can re-rebuild the
     /// engine on a Retry (Phase 7) — for Phase 4 we just keep it for
@@ -964,7 +970,7 @@ impl QuicConnection {
             datagram.extend_from_slice(&pkt);
         }
 
-        // 1-RTT packet (Phase 4: ACK-only).
+        // 1-RTT packet: ACK + stream / DATAGRAM / path / CID frames.
         if let Some(pkt) = self.build_packet_at(Level::OneRtt) {
             datagram.extend_from_slice(&pkt);
         }
