@@ -1,10 +1,9 @@
 # Recommended usage (the safe path)
 
-> **DRAFT — maintainer to bless the opinions below.** The crate is broad and
-> ships compatibility/legacy algorithms on purpose. This page is the opinionated
-> "use exactly this" guide. The factual coverage is in
-> [`validation.md`](validation.md); the boundaries are in
-> [`threat-model.md`](threat-model.md).
+The crate is broad and ships compatibility/legacy algorithms on purpose. This is
+the opinionated "use exactly this" guide; the factual coverage is in
+[`validation.md`](validation.md) and the boundaries are in
+[`threat-model.md`](threat-model.md).
 
 The crate exposes a lot. Most of it you should not reach for. Three tiers:
 

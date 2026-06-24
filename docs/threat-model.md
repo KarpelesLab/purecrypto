@@ -1,9 +1,9 @@
 # Threat model
 
-> **DRAFT — maintainer to review and own.** This is a starting skeleton drafted
-> from the code's stated properties. The boundaries below (especially what is
-> *out of scope*) are security commitments the project owns; confirm or amend
-> before treating this as authoritative.
+The boundaries below — especially what is *out of scope* — are security
+commitments of the project. See [`validation.md`](validation.md) for the
+concrete coverage map and [`recommended-usage.md`](recommended-usage.md) for the
+safe subset of the API.
 
 ## What this crate protects
 
