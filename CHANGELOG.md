@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.21](https://github.com/KarpelesLab/purecrypto/compare/v0.6.20...v0.6.21) - 2026-06-24
+
+### Other
+
+- record OpenSSL DTLS/QUIC server interop and shipped ML-KEM ACVP corpus
+- fix ServerHello interop with OpenSSL (legacy_version + renegotiation_info)
+- *(mlkem)* add genuine NIST ACVP ML-KEM known-answer tests
+- lead with the modular / feature-gated positioning in the README
+- drop DRAFT notes from threat-model and recommended-usage
+- add validation matrix, recommended-usage, threat model, benchmarks + SECURITY.md
+- fix stated MSRV in README (1.88, not 1.95)
+
 ## [0.6.20](https://github.com/KarpelesLab/purecrypto/compare/v0.6.19...v0.6.20) - 2026-06-24
 
 ### Added
