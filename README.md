@@ -518,9 +518,10 @@ After a handshake completes, both sides expose:
 - `connection.tls_exporter(label, context, out)` — RFC 8446 §7.5 / RFC 5705
   application-layer keying material.
 - `connection.peer_certificates()` — the validated chain (leaf first).
-- (client) `connection.take_session()` — moves out a `StoredSession`
+- (client) `connection.take_session()` — moves out a `ResumptionSession`
   derived from the server's NewSessionTicket; pass it to
-  `ClientConfig::with_session` next time you connect to the same server.
+  `Config::builder().resumption_session(...)` next time you connect to the
+  same server (TLS 1.3 PSK or TLS 1.2 RFC 5077 ticket).
 - (client) `connection.write_early_data(&[u8])` — sends application data
   under the early-traffic key before `ServerHello` arrives, valid only on a
   resumed connection whose session enabled 0-RTT.

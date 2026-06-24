@@ -80,7 +80,7 @@ pub(crate) use conn::ClientCertConfig;
 #[cfg(test)]
 #[cfg(feature = "std")]
 pub(crate) use conn::ReplayWindow;
-pub use connection::{Connection, HandshakeStatus, SignatureRequest, Step};
+pub use connection::{Connection, HandshakeStatus, ResumptionSession, SignatureRequest, Step};
 pub use crypto::HashAlg;
 pub use error::{Alert, AlertDescription, Error};
 pub use groups::NamedGroup;

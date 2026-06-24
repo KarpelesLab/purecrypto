@@ -14,6 +14,7 @@ pub(crate) use client::ClientConfig;
 pub(crate) use client::{ClientCertConfig, ClientConnection, ReceivedSessionTicket, StoredSession};
 pub(crate) use client12::ClientConfig12;
 pub(crate) use client12::ClientConnection12;
+pub(crate) use client12::StoredSession12;
 // Re-exported for the DTLS 1.2 client / server, which drive suite negotiation
 // from the same 6-entry SUITES_12 table as the TLS 1.2 layer.
 #[allow(unused_imports)]

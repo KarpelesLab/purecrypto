@@ -105,6 +105,23 @@ pub struct SignatureRequest {
     pub message: Vec<u8>,
 }
 
+/// An opaque, resumable TLS session captured from a completed client
+/// handshake.
+///
+/// Obtain one with [`Connection::take_session`] after the handshake finishes,
+/// persist it, and prime a later connection to the same server by passing it
+/// to [`super::ConfigBuilder::resumption_session`]. A TLS 1.3 session resumes
+/// via PSK (RFC 8446 §2.2); a TLS 1.2 session via an RFC 5077 ticket. The
+/// contents are version-specific and deliberately not inspectable.
+#[derive(Clone)]
+pub struct ResumptionSession(ResumptionSessionKind);
+
+#[derive(Clone)]
+enum ResumptionSessionKind {
+    Tls13(super::conn::StoredSession),
+    Tls12(super::conn::StoredSession12),
+}
+
 /// A unified TLS or DTLS connection (client or server, any supported
 /// version).
 ///
@@ -445,6 +462,64 @@ impl Connection {
         })
     }
 
+    /// Exports keying material bound to this connection (RFC 8446 §7.5 for
+    /// TLS 1.3, RFC 5705 for TLS 1.2 / DTLS). `label` and `context` namespace
+    /// the output; `out` is filled with `out.len()` bytes derived from the
+    /// connection's master/exporter secret. Available once the handshake has
+    /// completed on every TLS and DTLS engine; an error is returned if called
+    /// too early.
+    pub fn tls_exporter(&self, label: &[u8], context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        // RFC 5705 (TLS 1.2 / DTLS 1.2) distinguishes "no context" from an
+        // empty context; RFC 8446 (TLS 1.3) always carries a context value.
+        // Unify on `&[u8]` where empty means "no context", matching the 1.3
+        // empty-context behaviour across versions.
+        let ctx12 = if context.is_empty() {
+            None
+        } else {
+            Some(context)
+        };
+        match &self.inner {
+            Engine::ClientTls13(c) => c.tls_exporter(label, context, out),
+            Engine::ClientTls12(c) => c.tls_exporter(label, ctx12, out),
+            Engine::ServerTls13(c) => c.tls_exporter(label, context, out),
+            Engine::ServerTls12(c) => c.tls_exporter(label, ctx12, out),
+            Engine::ClientDtls12(c) => c.tls_exporter(label, ctx12, out),
+            Engine::ClientDtls13(c) => c.tls_exporter(label, context, out),
+            Engine::ServerDtls12(c) => c.tls_exporter(label, ctx12, out),
+            Engine::ServerDtls13(c) => c.tls_exporter(label, context, out),
+        }
+    }
+
+    /// Client 0-RTT: queue application `data` to be sent under the
+    /// early-traffic key before `ServerHello` arrives. Valid only on a TLS 1.3
+    /// client whose [`super::ConfigBuilder::resumption_session`] enabled 0-RTT
+    /// (the stored session carried a non-zero `max_early_data_size`); any other
+    /// engine returns [`Error::InappropriateState`]. See the 0-RTT replay
+    /// caveat in the crate docs — early data is replayable.
+    pub fn write_early_data(&mut self, data: &[u8]) -> Result<(), Error> {
+        match &mut self.inner {
+            Engine::ClientTls13(c) => c.write_early_data(data),
+            _ => Err(Error::InappropriateState),
+        }
+    }
+
+    /// Client only: move out a [`ResumptionSession`] derived from a
+    /// `NewSessionTicket` the server sent, for resumption on a later
+    /// connection (feed it back via
+    /// [`super::ConfigBuilder::resumption_session`]). Returns `None` on a
+    /// server engine, or when the server issued no resumable ticket.
+    pub fn take_session(&mut self) -> Option<ResumptionSession> {
+        match &mut self.inner {
+            Engine::ClientTls13(c) => c
+                .take_session()
+                .map(|s| ResumptionSession(ResumptionSessionKind::Tls13(s))),
+            Engine::ClientTls12(c) => c
+                .take_session()
+                .map(|s| ResumptionSession(ResumptionSessionKind::Tls12(s))),
+            _ => None,
+        }
+    }
+
     /// Close the connection, emitting a close_notify alert if the engine
     /// supports it.
     pub fn close(&mut self) -> Result<(), Error> {
@@ -711,6 +786,11 @@ fn build_tls13_client(cfg: &Config) -> Result<super::conn::ClientConnection, Err
     {
         cc = cc.with_cert_compression_algorithms(cfg.cert_compression_algorithms.clone());
     }
+    // Prime PSK resumption from a stored TLS 1.3 session, if one was supplied
+    // (a 1.2 session here is simply ignored — version mismatch).
+    if let Some(ResumptionSession(ResumptionSessionKind::Tls13(s))) = &cfg.resumption {
+        cc = cc.with_session(s.clone());
+    }
     let server_name = client_server_name(cfg)?;
     super::conn::ClientConnection::new(cc, server_name, &mut config_rng(cfg)?)
 }
@@ -748,6 +828,11 @@ fn build_tls12_client(cfg: &Config) -> Result<super::conn::ClientConnection12, E
         if cfg.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
             cc = cc.with_max_version(cfg.max_version);
         }
+    }
+    // Prime RFC 5077 ticket resumption from a stored TLS 1.2 session, if one
+    // was supplied (a 1.3 session here is simply ignored — version mismatch).
+    if let Some(ResumptionSession(ResumptionSessionKind::Tls12(s))) = &cfg.resumption {
+        cc = cc.with_session(s.clone());
     }
     let server_name = client_server_name(cfg)?;
     super::conn::ClientConnection12::new(cc, server_name, &mut config_rng(cfg)?)
@@ -1046,6 +1131,151 @@ mod tests {
                 super::super::config::SigningKey::Ecdsa(key),
             )
             .build()
+    }
+
+    /// Minimal TLS 1.3 server [`Config`] (P-256 ECDSA self-signed leaf for
+    /// `tls.example`). With `with_tickets`, a ticket key is installed so the
+    /// server issues `NewSessionTicket` (enabling resumption).
+    fn tls13_server_cfg(with_tickets: bool) -> Config {
+        let mut rng = HmacDrbg::<Sha256>::new(b"tls13-conn-test", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("tls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["tls.example"],
+        )
+        .unwrap();
+        let mut b = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .identity(
+                alloc::vec![cert.to_der().to_vec()],
+                super::super::config::SigningKey::Ecdsa(key),
+            );
+        if with_tickets {
+            b = b.ticket_key([0x5a; 32]);
+        }
+        b.build()
+    }
+
+    /// Matching TLS 1.3 client `Config` (verification off, SNI `tls.example`),
+    /// optionally primed with a resumption session.
+    fn tls13_client_cfg(session: Option<ResumptionSession>) -> Config {
+        let mut b = Config::builder()
+            .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+            .versions(ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_3)
+            .server_name("tls.example")
+            .verify_certificates(false);
+        if let Some(s) = session {
+            b = b.resumption_session(s);
+        }
+        b.build()
+    }
+
+    /// Drive two public [`Connection`]s to a completed handshake and then pump
+    /// a few extra rounds so post-handshake flights (e.g. NewSessionTicket)
+    /// are delivered. Panics if the handshake stalls.
+    fn drive_pair(client: &mut Connection, server: &mut Connection) {
+        let mut completed = false;
+        for _ in 0..64 {
+            let _ = client.handshake();
+            let c = client.pop().unwrap();
+            if !c.is_empty() {
+                server.feed(&c).unwrap();
+            }
+            let _ = server.handshake();
+            let s = server.pop().unwrap();
+            if !s.is_empty() {
+                client.feed(&s).unwrap();
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                if completed {
+                    return; // one extra round after completion flushed tickets
+                }
+                completed = true;
+            }
+        }
+        if !completed {
+            panic!("TLS 1.3 handshake did not complete");
+        }
+    }
+
+    /// RFC 8446 §7.5: the exporter is a function of the (shared) master secret,
+    /// so both peers MUST derive identical material for the same label/context,
+    /// and different material for a different label.
+    #[test]
+    fn tls_exporter_agrees_across_peers() {
+        let server_cfg = tls13_server_cfg(false);
+        let client_cfg = tls13_client_cfg(None);
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+
+        let mut ce = [0u8; 32];
+        let mut se = [0u8; 32];
+        client
+            .tls_exporter(b"EXPORTER-test", b"ctx", &mut ce)
+            .unwrap();
+        server
+            .tls_exporter(b"EXPORTER-test", b"ctx", &mut se)
+            .unwrap();
+        assert_eq!(ce, se, "exporter material must match across peers");
+
+        let mut ce2 = [0u8; 32];
+        client
+            .tls_exporter(b"EXPORTER-other", b"ctx", &mut ce2)
+            .unwrap();
+        assert_ne!(ce, ce2, "different label must derive different material");
+    }
+
+    /// `take_session` yields `None` on a server engine and before any ticket;
+    /// `write_early_data` is rejected on a non-(TLS 1.3 client) engine.
+    #[test]
+    fn session_and_early_data_guards() {
+        let server_cfg = tls13_server_cfg(true);
+        let mut server = Connection::server(&server_cfg).unwrap();
+        assert!(server.take_session().is_none());
+        assert!(matches!(
+            server.write_early_data(b"x"),
+            Err(Error::InappropriateState)
+        ));
+    }
+
+    /// End-to-end TLS 1.3 PSK resumption through the public API: a first
+    /// handshake yields a `ResumptionSession` via `take_session`; feeding it
+    /// back through `ConfigBuilder::resumption_session` drives a second
+    /// handshake that still completes and still agrees on an exporter.
+    #[test]
+    fn tls13_resumption_round_trip() {
+        let server_cfg = tls13_server_cfg(true);
+        let client_cfg = tls13_client_cfg(None);
+        let mut client = Connection::client(&client_cfg).unwrap();
+        let mut server = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client, &mut server);
+        let session = client
+            .take_session()
+            .expect("server should have issued a NewSessionTicket");
+
+        // Second connection, primed with the stored session.
+        let resumed_client_cfg = tls13_client_cfg(Some(session));
+        let mut client2 = Connection::client(&resumed_client_cfg).unwrap();
+        let mut server2 = Connection::server(&server_cfg).unwrap();
+        drive_pair(&mut client2, &mut server2);
+        assert!(client2.is_handshake_complete() && server2.is_handshake_complete());
+
+        let mut ce = [0u8; 16];
+        let mut se = [0u8; 16];
+        client2.tls_exporter(b"EXPORTER-r", b"", &mut ce).unwrap();
+        server2.tls_exporter(b"EXPORTER-r", b"", &mut se).unwrap();
+        assert_eq!(ce, se);
     }
 
     // RFC 6347 §4.2.1 / RFC 9147 §5.1: the cookie exchange is the DoS-

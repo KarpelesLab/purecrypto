@@ -324,6 +324,13 @@ pub struct Config {
     /// brokered through this key during [`super::Connection::drive`] and the
     /// caller never hand-manages the signature. See [`super::HandshakeSigner`].
     pub signer: Option<Arc<dyn super::signer::HandshakeSigner>>,
+
+    /// Client: a session captured from a previous handshake
+    /// ([`super::Connection::take_session`]) to attempt resumption on the next
+    /// connection. Installed via [`ConfigBuilder::resumption_session`]; a
+    /// session whose TLS version doesn't match the negotiated engine is
+    /// ignored. `None` (default) starts a full handshake.
+    pub resumption: Option<super::connection::ResumptionSession>,
 }
 
 /// A caller-supplied entropy source (e.g. a TPM/HSM RNG), installed via
@@ -394,6 +401,7 @@ impl Default for Config {
             key_log: None,
             rng: None,
             signer: None,
+            resumption: None,
         }
     }
 }
@@ -723,6 +731,17 @@ impl ConfigBuilder {
         self.inner.ech = Some(ech);
         self
     }
+    /// Client: prime the next handshake to attempt session resumption using a
+    /// [`ResumptionSession`](super::ResumptionSession) captured from a previous
+    /// connection via [`super::Connection::take_session`]. TLS 1.3 resumes via
+    /// PSK (RFC 8446 §2.2); TLS 1.2 via an RFC 5077 ticket. A session whose
+    /// version does not match the negotiated engine is ignored, so this is safe
+    /// to set even when the version is not pinned.
+    pub fn resumption_session(mut self, session: super::connection::ResumptionSession) -> Self {
+        self.inner.resumption = Some(session);
+        self
+    }
+
     /// Server: install Encrypted Client Hello key material
     /// (draft-ietf-tls-esni-22) — the active key ring and the
     /// `retry_configs` list to ship on rejection. The server performs
