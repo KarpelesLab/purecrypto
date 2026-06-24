@@ -5,7 +5,10 @@
 //! certificates from a CA key, and parsing + signature verification, using
 //! RSA with PKCS#1 v1.5 signatures.
 
-#[cfg(feature = "mlkem")]
+// `anykey` builds the unified `AnyKey` / KEM routing on top of the `key` traits
+// (it returns `key::Algorithm`, `Box<dyn key::Decapsulator>`, …), so it needs
+// both `mlkem` (the only KEM) and `key`.
+#[cfg(all(feature = "mlkem", feature = "key"))]
 mod anykey;
 pub(crate) mod cert;
 mod crl;
@@ -19,7 +22,7 @@ pub mod sct;
 mod signer;
 mod time;
 
-#[cfg(feature = "mlkem")]
+#[cfg(all(feature = "mlkem", feature = "key"))]
 pub use anykey::{AnyDecapsulationKey, AnyEncapsulationKey, AnyKey, AnyKeyPublic};
 pub use cert::{Certificate, NameConstraints, PreparedCertificate, SanIp};
 pub use crl::{CertificateRevocationList, CrlBuilder, CrlReason, PreparedCrl, RevokedCertificate};
