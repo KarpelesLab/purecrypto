@@ -50,3 +50,25 @@ impl EcnCodepoint {
         matches!(self, EcnCodepoint::Ect0 | EcnCodepoint::Ect1)
     }
 }
+
+/// Per-path ECN validation state (RFC 9000 §13.4.2). A sender marks egress
+/// packets ECT(0) while *testing* or *capable*; it stops (and never reacts to
+/// CE) once *failed*, e.g. because the path bleached or remarked the codepoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum EcnValidation {
+    /// Marking egress ECT(0), waiting for the peer's ACKs to confirm the path
+    /// preserves ECN before trusting CE feedback.
+    #[default]
+    Testing,
+    /// The peer's echoed ECN counts validated — CE marks are acted on.
+    Capable,
+    /// The path mishandled ECN; stop marking and ignore CE counts.
+    Failed,
+}
+
+impl EcnValidation {
+    /// Whether egress packets should be marked ECT(0) in this state.
+    pub(crate) fn marks_egress(self) -> bool {
+        !matches!(self, EcnValidation::Failed)
+    }
+}

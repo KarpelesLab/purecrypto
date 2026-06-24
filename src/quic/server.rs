@@ -223,7 +223,6 @@ impl QuicServer {
         ecn: EcnCodepoint,
         datagram: &[u8],
     ) -> Result<(), Error> {
-        let _ = ecn; // carried through the API; consumed by ECN support (Phase D).
         if datagram.is_empty() {
             return Ok(());
         }
@@ -257,11 +256,11 @@ impl QuicServer {
                 None => return Ok(()),
             };
             if let Some(&id) = self.by_cid.get(&dcid) {
-                self.feed(id, from, datagram);
+                self.feed(id, from, ecn, datagram);
             } else if let Some(&id) = self.by_addr.get(&from) {
-                self.feed(id, from, datagram);
+                self.feed(id, from, ecn, datagram);
             } else if hdr.typ == LongType::Initial {
-                self.accept(from, datagram)?;
+                self.accept(from, ecn, datagram)?;
             } else {
                 // A Handshake/0-RTT packet for a connection we have no state
                 // for — a stateless reset tells the peer to give up.
@@ -276,9 +275,9 @@ impl QuicServer {
             }
             let dcid = ConnectionId::from_slice(&datagram[1..1 + dlen]).expect("len <= 20");
             if let Some(&id) = self.by_cid.get(&dcid) {
-                self.feed(id, from, datagram);
+                self.feed(id, from, ecn, datagram);
             } else if let Some(&id) = self.by_addr.get(&from) {
-                self.feed(id, from, datagram);
+                self.feed(id, from, ecn, datagram);
             } else {
                 self.queue_reset(from, &dcid, datagram.len());
             }
@@ -296,8 +295,7 @@ impl QuicServer {
         for h in self.conns.values_mut() {
             let dg = h.conn.pop_datagram();
             if !dg.is_empty() {
-                // Egress ECN marking is added by ECN support (Phase D).
-                return Some((h.addr, EcnCodepoint::NotEct, dg));
+                return Some((h.addr, h.conn.egress_ecn(), dg));
             }
         }
         None
@@ -339,12 +337,12 @@ impl QuicServer {
 
     // ---- internals ----
 
-    fn feed(&mut self, id: u64, from: SocketAddr, datagram: &[u8]) {
+    fn feed(&mut self, id: u64, from: SocketAddr, ecn: EcnCodepoint, datagram: &[u8]) {
         let cids = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2).
-                let _ = h.conn.feed_datagram_from(from, datagram);
+                let _ = h.conn.feed_datagram_from_with_ecn(from, ecn, datagram);
                 h.addr = from;
                 h.conn.local_cids()
             }
@@ -357,7 +355,12 @@ impl QuicServer {
         }
     }
 
-    fn accept(&mut self, from: SocketAddr, datagram: &[u8]) -> Result<(), Error> {
+    fn accept(
+        &mut self,
+        from: SocketAddr,
+        ecn: EcnCodepoint,
+        datagram: &[u8],
+    ) -> Result<(), Error> {
         let mut cfg = (self.make_config)()?;
         cfg.reset_key = Some(self.reset_key);
         let mut conn = QuicConnection::server(cfg)?;
@@ -367,7 +370,7 @@ impl QuicServer {
         self.next_id += 1;
         self.conns.insert(id, Hosted { conn, addr: from });
         self.by_addr.insert(from, id);
-        self.feed(id, from, datagram);
+        self.feed(id, from, ecn, datagram);
         Ok(())
     }
 

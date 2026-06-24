@@ -34,8 +34,9 @@ use crate::quic::crypto::{
     derive_hp_key_bytes, derive_next_application_secret,
 };
 use crate::quic::datagram::DatagramQueues;
+use crate::quic::ecn::{EcnCodepoint, EcnValidation};
 use crate::quic::endpoint::Endpoint;
-use crate::quic::frame::{Frame, FrameIter, StreamDir, build_ack_ranges_raw};
+use crate::quic::frame::{EcnCounts, Frame, FrameIter, StreamDir, build_ack_ranges_raw};
 use crate::quic::loss::{
     CryptoHint, SentPacket, StreamHint, build_retransmit_hint, parse_retransmit_hint,
 };
@@ -329,6 +330,15 @@ pub struct QuicConnection {
     /// idle timer is measured from here; an idle connection is silently closed
     /// once `min(local, peer) max_idle_timeout` (floored at 3×PTO) elapses.
     last_recv_activity: Duration,
+    /// IP ECN codepoint of the datagram currently being processed (set per
+    /// [`Self::feed_datagram_from_with_ecn`]); each successfully-processed
+    /// packet folds it into its space's `rx_ecn` totals (RFC 9000 §13.4).
+    current_rx_ecn: EcnCodepoint,
+    /// RFC 9000 §13.4.2 path ECN-validation state for our egress marking.
+    ecn_tx: EcnValidation,
+    /// The peer's most recently reported ECN counts for the application space
+    /// (monotonicity + CE-increase are measured against this).
+    ecn_acked: EcnCounts,
     /// True once the peer's `ack_delay_exponent` / `max_ack_delay` have
     /// been installed in `endpoint.loss`. Idempotent guard so we don't
     /// reinstall on every drain cycle.
@@ -538,6 +548,9 @@ impl QuicConnection {
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
+            current_rx_ecn: EcnCodepoint::NotEct,
+            ecn_tx: EcnValidation::default(),
+            ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
         };
 
@@ -632,6 +645,9 @@ impl QuicConnection {
             peer_ack_params_installed: false,
             peer_packet_seen: false,
             last_recv_activity: Duration::ZERO,
+            current_rx_ecn: EcnCodepoint::NotEct,
+            ecn_tx: EcnValidation::default(),
+            ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
         })
     }
@@ -678,6 +694,30 @@ impl QuicConnection {
     /// never changes for the lifetime of the connection; datagrams from
     /// other sources are still processed (and dropped if they fail
     /// AEAD) but do not move the recorded address.
+    /// Like [`Self::feed_datagram_from`] but carrying the datagram's IP ECN
+    /// codepoint (RFC 9000 §13.4). Each packet decoded from it folds the
+    /// codepoint into its packet-number space's ECN totals, which are echoed
+    /// to the peer in ACK_ECN frames. `current_rx_ecn` is restored to
+    /// `NotEct` afterwards so plain `feed_datagram*` callers never see a stale
+    /// codepoint.
+    pub fn feed_datagram_from_with_ecn(
+        &mut self,
+        addr: SocketAddr,
+        ecn: EcnCodepoint,
+        datagram: &[u8],
+    ) -> Result<(), Error> {
+        if self.peer_addr.is_none() {
+            self.peer_addr = Some(addr);
+        }
+        self.current_rx_ecn = ecn;
+        let result = self.feed_datagram(datagram);
+        self.current_rx_ecn = EcnCodepoint::NotEct;
+        result
+    }
+
+    /// Feeds one received datagram, recording the source address (for
+    /// address-validation bookkeeping). Equivalent to
+    /// [`Self::feed_datagram_from_with_ecn`] with no ECN marking.
     pub fn feed_datagram_from(&mut self, addr: SocketAddr, datagram: &[u8]) -> Result<(), Error> {
         if self.peer_addr.is_none() {
             self.peer_addr = Some(addr);
@@ -1200,6 +1240,48 @@ impl QuicConnection {
     fn note_peer_packet_processed(&mut self) {
         self.peer_packet_seen = true;
         self.last_recv_activity = self.now_since_start();
+    }
+
+    /// Processes the ECN counts the peer echoed for the application space
+    /// (RFC 9000 §13.4.2 / RFC 9002 §7.3). Enforces that the counts are
+    /// monotonically non-decreasing (a decrease fails validation, disabling our
+    /// egress marking), promotes the path to *capable* on the first valid
+    /// feedback, and signals congestion to the controller when the CE count
+    /// rises. `event_time` is the send time of the largest newly-acked packet,
+    /// so the reaction fires at most once per recovery window.
+    fn process_ecn_ack(&mut self, reported: Option<EcnCounts>, event_time: Duration) {
+        if self.ecn_tx == EcnValidation::Failed {
+            return;
+        }
+        let Some(counts) = reported else {
+            return;
+        };
+        let prev = self.ecn_acked;
+        if counts.ect0 < prev.ect0 || counts.ect1 < prev.ect1 || counts.ce < prev.ce {
+            self.ecn_tx = EcnValidation::Failed;
+            return;
+        }
+        if self.ecn_tx == EcnValidation::Testing {
+            self.ecn_tx = EcnValidation::Capable;
+        }
+        if counts.ce > prev.ce {
+            self.endpoint
+                .cc
+                .on_ecn_ce_increase(PnSpaceId::Application, counts.ce, event_time);
+        }
+        self.ecn_acked = counts;
+    }
+
+    /// The IP ECN codepoint to mark on egress datagrams (RFC 9000 §13.4):
+    /// ECT(0) while ECN validation has not failed, otherwise Not-ECT. A
+    /// [`QuicServer`](crate::quic::QuicServer) reads this for `poll_transmit`;
+    /// a plain `pop_datagram` host can apply it too.
+    pub fn egress_ecn(&self) -> EcnCodepoint {
+        if self.ecn_tx.marks_egress() {
+            EcnCodepoint::Ect0
+        } else {
+            EcnCodepoint::NotEct
+        }
     }
 
     /// RFC 9000 §10.1.2: the idle timeout actually in force — the smaller of
@@ -2968,7 +3050,7 @@ impl QuicConnection {
                     ack_delay,
                     ranges_raw,
                     first_range,
-                    ecn: _,
+                    ecn: ack_ecn,
                 } => {
                     // RFC 9002 §A.7 + RFC 9000 §13.2.5:
                     // 1. Reconstruct the inclusive PN ranges by walking
@@ -3049,6 +3131,13 @@ impl QuicConnection {
                         acked.iter().filter(|p| p.in_flight).cloned().collect();
                     if !in_flight_acked.is_empty() {
                         self.endpoint.cc.on_packets_acked(&in_flight_acked);
+                    }
+                    // 4a. ECN (RFC 9000 §13.4 / RFC 9002 §7.3): validate the
+                    //     peer's echoed counts and react to new CE marks. Only
+                    //     the application space drives congestion control here.
+                    if space_id == PnSpaceId::Application {
+                        let event_time = acked.iter().map(|p| p.time_sent).max().unwrap_or(now);
+                        self.process_ecn_ack(ack_ecn, event_time);
                     }
                     // 5. Detect newly-lost packets (packet-threshold +
                     //    time-threshold).
@@ -3353,6 +3442,7 @@ impl QuicConnection {
         }
         // Update PN-space bookkeeping.
         let arrival_us = self.now_since_start().as_micros().min(u128::from(u64::MAX)) as u64;
+        let rx_ecn = self.current_rx_ecn;
         let space = match level {
             Level::Initial => &mut self.endpoint.pn.initial,
             Level::Handshake => &mut self.endpoint.pn.handshake,
@@ -3363,6 +3453,14 @@ impl QuicConnection {
             None => pn,
         });
         space.pending_ack.insert(pn);
+        // RFC 9000 §13.4.1: fold this packet's IP ECN codepoint into the space's
+        // running totals, echoed back to the sender in ACK_ECN frames.
+        match rx_ecn {
+            EcnCodepoint::Ect0 => space.rx_ecn.ect0 += 1,
+            EcnCodepoint::Ect1 => space.rx_ecn.ect1 += 1,
+            EcnCodepoint::Ce => space.rx_ecn.ce += 1,
+            EcnCodepoint::NotEct => {}
+        }
         if ack_eliciting {
             space.ack_eliciting_pending = true;
             // Track the arrival time of the most recent ack-eliciting
@@ -3773,12 +3871,20 @@ impl QuicConnection {
                 .largest_eliciting_arrival_us
                 .map(|t| now_us.saturating_sub(t) >> ack_exp_for_emit)
                 .unwrap_or(0);
+            // RFC 9000 §13.4.1: include ECN counts once we've observed any
+            // ECN-marked packet in this space, so the sender can react to CE.
+            let rx_ecn = space_ref.rx_ecn;
+            let ecn = if rx_ecn.ect0 | rx_ecn.ect1 | rx_ecn.ce != 0 {
+                Some(rx_ecn)
+            } else {
+                None
+            };
             let ack = Frame::Ack {
                 largest,
                 ack_delay,
                 ranges_raw: &raw,
                 first_range,
-                ecn: None,
+                ecn,
             };
             ack.encode(&mut out);
             // ACK is NOT ack-eliciting; not in-flight on its own.
@@ -4254,6 +4360,77 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// RFC 9000 §13.4 / RFC 9002 §7.3 end-to-end ECN: every client→server
+    /// datagram is marked ECT(0); the server counts the marks and echoes them
+    /// in ACK_ECN frames, and the client's ACK handling validates the path
+    /// (reaches `Capable`) and keeps marking egress ECT(0).
+    #[test]
+    fn ecn_counted_echoed_and_validated_over_loopback() {
+        use std::net::SocketAddr;
+        let (mut client, mut server) = loopback_pair();
+        let ca: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 6001));
+        let sa: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 6002));
+        let mut opened = false;
+        for _ in 0..64 {
+            if !opened && client.is_handshake_complete() && server.is_handshake_complete() {
+                let s = client.open_bidi().unwrap();
+                client.write(s, b"ecn-payload").unwrap();
+                opened = true;
+            }
+            loop {
+                let dg = client.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                server
+                    .feed_datagram_from_with_ecn(ca, EcnCodepoint::Ect0, &dg)
+                    .unwrap();
+            }
+            loop {
+                let dg = server.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                client
+                    .feed_datagram_from_with_ecn(sa, EcnCodepoint::Ect0, &dg)
+                    .unwrap();
+            }
+        }
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
+        // The server tallied the client's ECT(0) marks across the spaces.
+        let server_ect0 = server.endpoint.pn.initial.rx_ecn.ect0
+            + server.endpoint.pn.handshake.rx_ecn.ect0
+            + server.endpoint.pn.application.rx_ecn.ect0;
+        assert!(server_ect0 > 0, "server counted ECT(0)-marked packets");
+        // The client saw the echoed counts in the application space and
+        // validated the path, so it keeps marking egress ECT(0).
+        assert_eq!(client.ecn_tx, EcnValidation::Capable);
+        assert_eq!(client.egress_ecn(), EcnCodepoint::Ect0);
+    }
+
+    /// A peer that reports a *decreasing* ECN count fails validation, after
+    /// which we stop marking egress (RFC 9000 §13.4.2.1).
+    #[test]
+    fn ecn_decreasing_counts_fail_validation() {
+        let (mut client, _server) = loopback_pair();
+        // Seed a prior count, then feed a decrease.
+        client.ecn_acked = EcnCounts {
+            ect0: 5,
+            ect1: 0,
+            ce: 0,
+        };
+        client.process_ecn_ack(
+            Some(EcnCounts {
+                ect0: 3,
+                ect1: 0,
+                ce: 0,
+            }),
+            Duration::ZERO,
+        );
+        assert_eq!(client.ecn_tx, EcnValidation::Failed);
+        assert_eq!(client.egress_ecn(), EcnCodepoint::NotEct);
     }
 
     /// RFC 9000 §10.1: a connection idle past the negotiated `max_idle_timeout`

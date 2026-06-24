@@ -188,6 +188,10 @@ pub(crate) struct PnSpace {
     /// `ack_delay` field on the outbound ACK frame (RFC 9000 §13.2.5).
     /// `None` whenever `ack_eliciting_pending == false`.
     pub(crate) largest_eliciting_arrival_us: Option<u64>,
+    /// RFC 9000 §13.4: running totals of the IP ECN codepoints observed on
+    /// received packets in this space, echoed back in ACK_ECN frames so the
+    /// sender can detect congestion (CE) and validate the path.
+    pub(crate) rx_ecn: crate::quic::frame::EcnCounts,
 }
 
 /// Decodes a truncated packet number per RFC 9000 §17.1 (reference

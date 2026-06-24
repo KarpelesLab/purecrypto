@@ -4,8 +4,8 @@
 //! interop. The state machine is the Appendix B pseudocode 1:1 — slow
 //! start, congestion avoidance, recovery, persistent congestion.
 //!
-//! ECN-CE counters are present in the type for future wiring (Phase 7+);
-//! [`NewReno::on_ecn_ce_increase`] is a no-op stub in Phase 5.
+//! ECN-CE feedback (RFC 9002 §7.3) is wired: [`NewReno::on_ecn_ce_increase`]
+//! reacts to a rise in the peer's reported CE count as a congestion signal.
 
 use core::time::Duration;
 
@@ -41,8 +41,8 @@ pub(crate) struct NewReno {
     pub(crate) bytes_in_flight: u64,
     /// `congestion_recovery_start_time`.
     pub(crate) recovery_start_time: Option<Duration>,
-    /// ECN-CE counts per PN space (Phase 5 keeps the counter but does
-    /// not act on it; Phase 7+ will wire ECN feedback).
+    /// Last-seen peer-reported ECN-CE count per PN space; a rise drives a
+    /// congestion event via [`Self::on_ecn_ce_increase`] (RFC 9002 §7.3).
     pub(crate) ecn_ce_counters: [u64; 3],
 }
 
@@ -163,11 +163,22 @@ impl NewReno {
         self.bytes_in_flight < self.cwnd
     }
 
-    /// Phase-5 stub: ECN-CE counter increment. Per the brief, ECN is
-    /// not wired in this phase — the function records the count for
-    /// future use but takes no action.
-    pub(crate) fn on_ecn_ce_increase(&mut self, space: PnSpaceId, new_count: u64) {
+    /// RFC 9002 §7.3 — react to ECN. When the peer's reported CE count for a
+    /// space rises above what we last saw, treat it as a congestion signal
+    /// (the same multiplicative `cwnd` reduction as a loss), anchored at
+    /// `event_time` (the send time of the largest newly-acked packet) so it
+    /// fires at most once per recovery window.
+    pub(crate) fn on_ecn_ce_increase(
+        &mut self,
+        space: PnSpaceId,
+        new_count: u64,
+        event_time: Duration,
+    ) {
+        let prev = self.ecn_ce_counters[space as usize];
         self.ecn_ce_counters[space as usize] = new_count;
+        if new_count > prev {
+            self.on_new_congestion_event(event_time);
+        }
     }
 }
 
@@ -196,6 +207,32 @@ mod tests {
         assert_eq!(c.bytes_in_flight, 0);
         assert!(c.recovery_start_time.is_none());
         assert!(c.can_send());
+    }
+
+    /// RFC 9002 §7.3 — a rise in the peer's reported CE count reduces the
+    /// congestion window like a loss, but only once per recovery window.
+    #[test]
+    fn ecn_ce_increase_reduces_cwnd_once_per_window() {
+        let mut c = NewReno::new();
+        c.on_packet_sent(10 * 1200);
+        let before = c.cwnd;
+        // First CE increase at t=5ms: enter recovery, halve cwnd.
+        c.on_ecn_ce_increase(PnSpaceId::Application, 1, Duration::from_millis(5));
+        assert!(c.cwnd < before, "CE increase must reduce cwnd");
+        let reduced = c.cwnd;
+        // A further CE rise for a packet sent within the same recovery window
+        // (t <= 5ms) must NOT reduce again.
+        c.on_ecn_ce_increase(PnSpaceId::Application, 2, Duration::from_millis(3));
+        assert_eq!(c.cwnd, reduced, "no second reduction within the window");
+        // No change in count → no reaction even for a later send time.
+        c.on_ecn_ce_increase(PnSpaceId::Application, 2, Duration::from_millis(50));
+        assert_eq!(
+            c.cwnd, reduced,
+            "equal count is not a new congestion signal"
+        );
+        // A new CE rise for a packet sent after the recovery window reduces again.
+        c.on_ecn_ce_increase(PnSpaceId::Application, 3, Duration::from_millis(50));
+        assert!(c.cwnd <= reduced, "a fresh CE event reduces again");
     }
 
     /// Test 8 — slow-start additive growth, then switch to congestion
