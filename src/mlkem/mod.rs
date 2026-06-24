@@ -15,16 +15,15 @@
 //! re-encryption check and the implicit-rejection fallback both run in
 //! constant time (see the `kem` submodule).
 //!
-//! # Test-vector coverage — known gap
+//! # Test-vector coverage
 //!
 //! Unit tests cover the FIPS 203 reference flow at all three parameter
-//! sets, but the crate does **not** ship the full NIST ACVP test set for
-//! ML-KEM (`testdata/` carries ACVP for ML-DSA and SLH-DSA, but not yet
-//! for ML-KEM). The ACVP corpus is multi-megabyte and out of scope for
-//! the audit hardening batch; landing it is tracked as future work.
-//! In the meantime the existing per-set fixed vectors plus deterministic
-//! constructors (`from_seeds`, `encapsulate_deterministic`) make the
-//! algorithm fully testable against external implementations.
+//! sets, backed by **NIST ACVP** keyGen / encapDecap vectors extracted from
+//! the ACVP-Server corpus (`testdata/mlkem{512,768,1024}_{keygen,encap,decap}.kat`,
+//! a trimmed slice of the multi-megabyte upstream set). These are
+//! complemented by deterministic constructors (`from_seeds`,
+//! `encapsulate_deterministic`) and OpenSSL 3.5 byte-compatibility fixtures,
+//! making the algorithm testable against external implementations.
 
 pub(crate) mod indcpa;
 pub(crate) mod kem;

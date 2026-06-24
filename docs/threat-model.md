@@ -71,7 +71,8 @@ The implementations are built to withstand:
 
 ## Residual risk
 
-No third-party human audit, no timing-tool validation, no CMVP. DTLS/QUIC are
-loopback-validated only. See [`validation.md`](validation.md) for the concrete
-coverage map and [`recommended-usage.md`](recommended-usage.md) for the safe
-subset.
+No third-party human audit, no timing-tool validation, no CMVP. The DTLS 1.2 and
+QUIC v1 **server** directions interop with OpenSSL 3.5, but the client directions
+and DTLS 1.3 are loopback-validated only. See [`validation.md`](validation.md)
+for the concrete coverage map and [`recommended-usage.md`](recommended-usage.md)
+for the safe subset.

@@ -54,8 +54,9 @@ The crate exposes a lot. Most of it you should not reach for. Three tiers:
 - **TLS / DTLS / QUIC.** Set `Config` `min_version` to TLS 1.3 for new
   deployments; the default suites (AES-GCM / ChaCha20-Poly1305) and groups are
   the right set. Enable mTLS via client certificates where appropriate. Note:
-  DTLS/QUIC are loopback-validated only (see validation matrix) — pilot
-  accordingly.
+  the DTLS 1.2 / QUIC v1 server directions interop with OpenSSL 3.5, but the
+  client directions and DTLS 1.3 are loopback-validated only (see validation
+  matrix) — pilot accordingly.
 - **X.509 / signature policy.** Use the default modern signature policy
   (whitelist). Do **not** enable SHA-1 signature algorithms except for explicit,
   scoped legacy verification.

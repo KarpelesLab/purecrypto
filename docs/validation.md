@@ -57,8 +57,8 @@ hand-derived correctness tests.
 | `x509` | RFC 5280 | unit | OpenSSL (SPKI pin) | `x509_certificate`, `x509_crl`, `x509_csr`, `spki_pubkey`, `ocsp_response`, `cert_decompress` | delegates to primitives |
 | `pkcs12` | RFC 7292, RFC 9579 (PBMAC1) | OpenSSL fixtures | OpenSSL 3 + 1.1.1 legacy | `pbes2_decrypt` | MAC CT, wrong-pw gate, wipe |
 | `tls` | RFC 8446 (1.3), RFC 5246 (1.2) | **RFC 8448** traces | loopback; legacy vs OpenSSL 1.1.1; PSS interop | `tls_client_feed`, `tls_server_feed`, `tls_legacy_feed`, `ech_*` | CT record protection; legacy CBC caveats |
-| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback only | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
-| `quic` | RFC 9000/9001/9002/9221 | loopback | loopback only (pre-interop) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
+| `dtls` | RFC 6347 (1.2), RFC 9147 (1.3) | loopback | loopback; **DTLS 1.2 server vs OpenSSL 3.5** (`s_client`) | `dtls_client_feed`, `dtls_server_feed` | inherits TLS |
+| `quic` | RFC 9000/9001/9002/9221 | loopback | loopback; **QUIC v1 server vs OpenSSL 3.5** (`s_client -quic`) | `quic_client_feed`, `quic_server_feed`, `quic_transport_params` | inherits TLS 1.3 |
 | `hpke` | RFC 9180 | **RFC 9180 App. A** (full 12-suite matrix) | RFC vectors | — | delegates to EC/KDF/AEAD |
 | `signature_registry` | — (X.509/TLS dispatch) | via primitives | via X.509/TLS | — | delegates |
 | `ffi` | — (C ABI) | unit (C-boundary) | — | — | delegates; panic-catching |
@@ -70,11 +70,11 @@ hand-derived correctness tests.
   `testdata/slhdsa_{keygen,siggen,sigver}.kat`). Falcon runs the reference
   discrete-Gaussian sampler KAT (`testdata/falcon_samplerz.kat`) plus
   sign→verify round-trips.
-- **ML-KEM** — round-trips and **OpenSSL 3.5 byte-compatibility** with
-  deterministic keygen (`d = z = 0x32`), checked against
-  `testdata/mlkem768_openssl_{spki,ct}.hex`. Note: the full NIST ACVP ML-KEM set
-  is **not** shipped (the multi-MB corpus is out of scope; documented in
-  `src/mlkem/mod.rs`).
+- **ML-KEM** — **NIST ACVP** keyGen / encapDecap vectors at all three parameter
+  sets (`testdata/mlkem{512,768,1024}_{keygen,encap,decap}.kat`, a trimmed slice
+  of the multi-MB ACVP-Server corpus), plus round-trips and **OpenSSL 3.5
+  byte-compatibility** with deterministic keygen (`d = z = 0x32`), checked
+  against `testdata/mlkem768_openssl_{spki,ct}.hex`.
 - **Stateful HBS** — LMS runs the **RFC 8554 Appendix F** vectors
   (`testdata/lms_rfc8554.kat`); XMSS runs reference-implementation vectors
   (`testdata/xmss_kat.kat`).
@@ -96,9 +96,13 @@ hand-derived correctness tests.
 - **OpenSSL, behavioural**: ECDSA sign↔verify via `openssl dgst`, TLS 1.0/1.1
   legacy interop against OpenSSL 1.1.1 (`examples/tls_legacy_interop`, the
   `tls-legacy` feature).
+- **OpenSSL 3.5, DTLS/QUIC handshake**: the **DTLS 1.2 server** completes a
+  handshake (and exchanges app data) with `openssl s_client -dtls1_2`, and the
+  **QUIC v1 server** with `openssl s_client -quic` (TLS 1.3, ALPN, app data).
+  The client directions and DTLS 1.3 remain loopback-only: OpenSSL is
+  QUIC-client-only and its `s_client` here lacks `-dtls1_3`.
 - **Loopback** (own client ↔ own server, all platforms): TLS 1.2/1.3, DTLS
-  1.2/1.3, QUIC v1. DTLS and QUIC are **loopback-validated only** — no external
-  interop yet (QUIC is explicitly pre-interop).
+  1.2/1.3, QUIC v1.
 
 ## Fuzzing
 
@@ -185,15 +189,19 @@ Reported as **what the code is built to do** — not as an audited guarantee.
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every
   signature; **reuse is catastrophic** and the caller must persist state after
   every `sign`.
-- **Pre-interop / phased**: DTLS and QUIC are loopback-validated only; QUIC ships
-  v1 but is pre-interop, with streams / full RFC 9002 recovery / Retry / key
-  update / DATAGRAM partially deferred (see module docs).
+- **Phased interop**: the DTLS 1.2 and QUIC v1 **server** directions are
+  validated against OpenSSL 3.5, but the client directions and DTLS 1.3 are
+  still loopback-only (OpenSSL is QUIC-client-only and exposes no `-dtls1_3`
+  client here). QUIC ships v1 with streams / full RFC 9002 recovery / Retry /
+  key update / DATAGRAM partially deferred (see module docs).
 - **Hazmat**: the `hazmat-*` features expose low-level arithmetic with **no
   semver and no constant-time guarantee** — the caller owns correctness and CT.
 - **Scope**: the crate is primitives + TLS/PKI plumbing (OpenSSL-like). Threshold
   / multi-party / message-envelope layers are out of scope.
-- **Coverage gaps**: no full NIST ACVP ML-KEM corpus; no external DTLS/QUIC
-  interop yet; no NIST FIPS validation (CMVP) and no third-party audit.
+- **Coverage gaps**: ML-KEM ACVP is a trimmed slice (not the full corpus);
+  external DTLS/QUIC interop covers the server directions only (client
+  directions + DTLS 1.3 pending a suitable reference peer); no NIST FIPS
+  validation (CMVP) and no third-party audit.
 
 ---
 
