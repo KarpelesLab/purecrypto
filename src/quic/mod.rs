@@ -40,6 +40,7 @@ pub(crate) mod loss;
 pub(crate) mod path;
 pub(crate) mod pkt;
 pub(crate) mod pn;
+pub(crate) mod reset;
 pub(crate) mod retry;
 pub(crate) mod server;
 pub(crate) mod stream;

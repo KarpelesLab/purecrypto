@@ -171,6 +171,17 @@ pub struct QuicConfig {
     ///
     /// Ignored on the client side.
     pub retry_secret: Option<[u8; 32]>,
+    /// Server-only — long-lived secret keying RFC 9000 §10.3.1 stateless-reset
+    /// tokens. Every reset token this endpoint advertises (its handshake-CID
+    /// token in transport parameters, and every `NEW_CONNECTION_ID` token) is
+    /// `HMAC-SHA256(reset_key, cid)[..16]`, so a [`QuicServer`](crate::quic::QuicServer)
+    /// holding the same key can regenerate the token to reset a connection whose
+    /// state it has dropped. `None` (default) makes the server pick a fresh
+    /// random key at construction; the router sets it explicitly so the key is
+    /// shared across every hosted connection.
+    ///
+    /// Ignored on the client side.
+    pub reset_key: Option<[u8; 32]>,
 }
 
 /// One QUIC v1 connection — either a client (sends the first Initial) or
@@ -262,6 +273,15 @@ pub struct QuicConnection {
     /// as the DCID on retried Initials). Set on both sides when Retry is
     /// part of the handshake.
     retry_scid: Option<ConnectionId>,
+    /// Server-only — the SCID chosen at construction (so the seq-0
+    /// stateless-reset token in our transport parameters can be derived from
+    /// it before the engine serialises them). Reused as our local CID when the
+    /// first Initial arrives, unless a Retry already fixed `retry_scid`.
+    pending_scid: Option<ConnectionId>,
+    /// Server-only — resolved RFC 9000 §10.3.1 stateless-reset key (random per
+    /// connection unless the hosting [`QuicServer`] supplied a shared one).
+    /// Every reset token we advertise is `HMAC-SHA256(reset_key, cid)[..16]`.
+    reset_key: [u8; 32],
     /// Path-validation state (RFC 9000 §8.2).
     path: PathChallengeState,
     /// Local CID pool — CIDs we issued to the peer. Initialized once we
@@ -458,6 +478,14 @@ impl QuicConnection {
         // RFC 9000 §18.2 — reject locally-advertised TP values that are
         // protocol violations (e.g. `active_connection_id_limit < 2`).
         validate_local_transport_params(&cfg.transport_params)?;
+        // Even a client issues NEW_CONNECTION_ID frames, each carrying a
+        // stateless-reset token; derive them from a real key (random unless the
+        // caller supplied one) so they are unpredictable (RFC 9000 §10.3.1).
+        let reset_key = cfg.reset_key.unwrap_or_else(|| {
+            let mut k = [0u8; 32];
+            OsRng.fill_bytes(&mut k);
+            k
+        });
         let scid = random_default_cid();
         let endpoint = build_initial_endpoint(dcid, scid);
         // RFC 9000 §7.3 — both endpoints MUST include their
@@ -496,6 +524,8 @@ impl QuicConnection {
             retry_token: Vec::new(),
             original_dcid: Some(dcid),
             retry_scid: None,
+            pending_scid: None,
+            reset_key,
             path: PathChallengeState::new(),
             cid_local: Some(cid_local),
             cid_remote: None,
@@ -544,8 +574,25 @@ impl QuicConnection {
         // populated lazily once we know what to put there (so they aren't
         // encoded into the engine's tp_bytes here unless they're already
         // set in `cfg.transport_params`).
+        // Resolve the stateless-reset key (RFC 9000 §10.3.1) and choose our
+        // handshake SCID now — before serialising transport parameters — so the
+        // seq-0 `stateless_reset_token` we advertise is derivable from that CID.
+        let reset_key = cfg.reset_key.unwrap_or_else(|| {
+            let mut k = [0u8; 32];
+            OsRng.fill_bytes(&mut k);
+            k
+        });
+        let pending_scid = crate::quic::server::random_default_scid();
+        let mut params = cfg.transport_params.clone();
+        // Advertise a derivable seq-0 reset token unless the caller pinned one.
+        if params.stateless_reset_token.is_none() {
+            params.stateless_reset_token = Some(crate::quic::reset::stateless_reset_token(
+                &reset_key,
+                &pending_scid,
+            ));
+        }
         let mut tp_bytes = Vec::new();
-        cfg.transport_params.encode(&mut tp_bytes);
+        params.encode(&mut tp_bytes);
         let tls_cfg = build_server_tls_config(&cfg)?;
         let (engine, hooks) = build_server_engine(tls_cfg, tp_bytes)?;
 
@@ -555,7 +602,7 @@ impl QuicConnection {
             endpoint,
             engine: EngineSide::Server(Box::new(engine)),
             hooks,
-            our_params: cfg.transport_params.clone(),
+            our_params: params,
             peer_params: None,
             negotiated_suite: None,
             handshake_complete: false,
@@ -571,6 +618,8 @@ impl QuicConnection {
             retry_token: Vec::new(),
             original_dcid: None,
             retry_scid: None,
+            pending_scid: Some(pending_scid),
+            reset_key,
             path: PathChallengeState::new(),
             cid_local: None,
             cid_remote: None,
@@ -2467,16 +2516,23 @@ impl QuicConnection {
                 // matches the Retry-time decision exactly.
                 *retry_scid
             } else {
-                // No-Retry path: pick a fresh SCID and capture the
-                // ODCID for the transport-param echo (RFC 9000 §7.3).
+                // No-Retry path: reuse the SCID chosen at construction (so it
+                // matches the seq-0 stateless-reset token already advertised in
+                // our transport parameters) and capture the ODCID for the
+                // transport-param echo (RFC 9000 §7.3).
                 self.original_dcid = ConnectionId::from_slice(hdr.dcid);
-                random_default_scid()
+                self.pending_scid.unwrap_or_else(random_default_scid)
             };
             set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
             install_initial_keys(&mut self.endpoint, hdr.dcid);
-            // Seed the local CID pool with our SCID at sequence 0.
+            // Seed the local CID pool with our SCID at sequence 0, carrying the
+            // exact stateless-reset token we advertised in our transport
+            // parameters (RFC 9000 §10.3.1) so server and client agree on it.
             if self.cid_local.is_none() {
-                self.cid_local = Some(CidPool::new(our_scid, None));
+                self.cid_local = Some(CidPool::new(
+                    our_scid,
+                    self.our_params.stateless_reset_token,
+                ));
             }
             // Seed the remote CID pool with the peer's SCID at sequence
             // 0, and propagate OUR advertised
@@ -3899,10 +3955,10 @@ impl QuicConnection {
         let mut rng = OsRng;
         let start_seq = pool.max_sequence() + 1;
         for (next_seq, _) in (start_seq..).zip(0..to_issue) {
-            // Random 8-byte CID + random 16-byte reset token.
+            // Random 8-byte CID; its reset token is derived from our static
+            // reset key (RFC 9000 §10.3.1) so a router can recompute it later.
             let cid = ConnectionId::random(&mut rng, 8);
-            let mut reset_token = [0u8; 16];
-            rng.fill_bytes(&mut reset_token);
+            let reset_token = crate::quic::reset::stateless_reset_token(&self.reset_key, &cid);
             let entry = CidEntry {
                 cid,
                 sequence: next_seq,
@@ -5054,6 +5110,7 @@ mod tests {
             transport_params: loopback_params(),
             require_retry: true,
             retry_secret: Some(retry_secret),
+            reset_key: None,
         })
         .expect("server build");
         (client, server)
@@ -7159,6 +7216,7 @@ mod tests {
             transport_params: loopback_params(),
             require_retry: true,
             retry_secret: Some([0x77; 32]),
+            reset_key: None,
         })
         .expect("server build");
         server.set_peer_addr(SocketAddr::new(
