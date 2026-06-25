@@ -143,8 +143,17 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
     }
 
     /// Converts `x` (a plain residue `< N`) into Montgomery form `xR mod N`.
+    ///
+    /// `x` is required to be a plain residue strictly below the modulus; a
+    /// debug-only assertion documents and checks that precondition (it also
+    /// guards [`pow`](Self::pow), which routes its `base` through here).
+    /// Release behavior is unchanged.
     #[inline]
     pub fn to_mont(&self, x: &Uint<LIMBS>) -> Uint<LIMBS> {
+        debug_assert!(
+            bool::from(crate::ct::ConstantTimeLess::ct_lt(x, &self.modulus)),
+            "to_mont precondition violated: base must be < N"
+        );
         self.mont_mul(x, &self.r2)
     }
 

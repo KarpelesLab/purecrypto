@@ -199,6 +199,18 @@ impl BoxedEcdsaPublicKey {
             return Err(Error::InvalidInput);
         }
         let c = self.curve.curve();
+        // Both operands are validated public keys, so their affine coordinates
+        // are guaranteed on-curve (enforced at construction in `from_sec1`). A
+        // debug-only check documents that invariant before lifting; release
+        // behavior is unchanged.
+        debug_assert!(
+            c.is_on_curve(&self.x, &self.y),
+            "self is not on the curve before point lift"
+        );
+        debug_assert!(
+            c.is_on_curve(&other.x, &other.y),
+            "other is not on the curve before point lift"
+        );
         let sum = c.point_add(
             &c.lift_affine(&self.x, &self.y),
             &c.lift_affine(&other.x, &other.y),
