@@ -50,6 +50,27 @@ pub fn peek_client_hello(buf: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
     let Some(ch) = peek_decode_client_hello(buf)? else {
         return Ok(None);
     };
+    Ok(Some(extract_client_hello_info(&ch)?))
+}
+
+/// Decodes a ClientHello from the raw handshake-message bytes (msg_type(1) ||
+/// length(3) || body) and extracts its SNI + ALPN. Unlike [`peek_client_hello`]
+/// this takes the bare handshake message with NO TLS record framing — the form
+/// QUIC carries in CRYPTO frames (RFC 9001) — so `crate::quic::peek_initial_sni`
+/// can reuse the exact same ClientHello parsing. `Ok(None)` = the handshake
+/// message isn't fully present yet.
+pub(crate) fn client_hello_info_from_handshake(
+    handshake: &[u8],
+) -> Result<Option<ClientHelloInfo>, Error> {
+    let Some(ch) = decode_first_client_hello(handshake)? else {
+        return Ok(None);
+    };
+    Ok(Some(extract_client_hello_info(&ch)?))
+}
+
+/// Pulls the SNI host name and offered ALPN list out of a decoded ClientHello.
+/// Shared by the TCP ([`peek_client_hello`]) and QUIC peek paths.
+fn extract_client_hello_info(ch: &ClientHello) -> Result<ClientHelloInfo, Error> {
     let mut info = ClientHelloInfo::default();
     for (ty, body) in &ch.extensions {
         if *ty == ExtensionType::SERVER_NAME {
@@ -58,7 +79,7 @@ pub fn peek_client_hello(buf: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
             info.alpn_protocols = ext::parse_alpn(body)?;
         }
     }
-    Ok(Some(info))
+    Ok(info)
 }
 
 /// Selects the TLS server engine version from the first ClientHello, reusing the

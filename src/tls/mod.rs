@@ -67,7 +67,7 @@ mod groups;
 pub(crate) mod keylog;
 #[cfg(feature = "mio")]
 pub mod mio;
-mod peek;
+pub(crate) mod peek;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
 mod signer;

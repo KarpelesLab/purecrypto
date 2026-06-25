@@ -39,6 +39,7 @@ pub(crate) mod endpoint;
 pub(crate) mod frame;
 pub(crate) mod loss;
 pub(crate) mod path;
+pub(crate) mod peek;
 pub(crate) mod pkt;
 pub(crate) mod pn;
 pub(crate) mod reset;
@@ -52,6 +53,9 @@ pub(crate) mod varint;
 
 pub use connection::{QuicConfig, QuicConnection, Role};
 pub use ecn::EcnCodepoint;
+pub use peek::peek_initial_sni;
+// Re-export so callers can name the peek's return type from `quic` directly.
+pub use crate::tls::ClientHelloInfo;
 pub use server::QuicServer;
 pub use stream::StreamId;
 pub use transport_params::TransportParameters;
