@@ -3147,22 +3147,35 @@ fn q_client_q_server_roundtrip() {
         .spawn()
         .expect("spawn q_server");
 
-    // Give the server time to bind the UDP socket. 300ms matches the
-    // DTLS tests' guard for the same kind of bind race.
-    std::thread::sleep(std::time::Duration::from_millis(300));
-
-    let (out, _ok) = run(
-        &[
-            "q_client",
-            "-connect",
-            &format!("127.0.0.1:{port}"),
-            "-insecure",
-            "-alpn",
-            "h3",
-            "-quiet",
-        ],
-        b"",
-    );
+    // Run the client, retrying until the server has bound its UDP socket. A
+    // single fixed sleep races the server's spawn + bind on a slow CI host
+    // (this test has flaked on Windows runners): the client then `connect()`s
+    // to an as-yet-unbound port, gets an ICMP port-unreachable, and exits
+    // before the server is ready. `q_server` stays up ~30s and is one-shot, and
+    // a run that yields no body means no handshake completed — so the server is
+    // still listening and the client can safely be retried until it answers.
+    // (The retries fit well inside the server's 30s `overall_deadline`.)
+    let mut out = String::new();
+    for _ in 0..15 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (o, _ok) = run(
+            &[
+                "q_client",
+                "-connect",
+                &format!("127.0.0.1:{port}"),
+                "-insecure",
+                "-alpn",
+                "h3",
+                "-quiet",
+            ],
+            b"",
+        );
+        if o.contains("hello from purecrypto q_server") {
+            out = o;
+            break;
+        }
+        out = o;
+    }
 
     let _ = server_proc.wait_with_output();
 
