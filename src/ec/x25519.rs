@@ -256,10 +256,10 @@ impl X25519PrivateKey {
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
-        use crate::der::{Error, Reader, parse_oid};
+        use crate::der::{Error, Reader, parse_oid, tag};
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence()?;
-        seq.read_integer_bytes()?; // version (v1 = 0)
+        seq.read_integer_bytes()?; // version (v1 = 0, v2 = 1)
         let mut algid = seq.read_sequence()?;
         if parse_oid(algid.read_oid()?)?.as_slice() != X25519_OID {
             return Err(Error::Malformed);
@@ -271,6 +271,19 @@ impl X25519PrivateKey {
         }
         let mut scalar = [0u8; 32];
         scalar.copy_from_slice(scalar_bytes);
+        // RFC 5958 (PKCS#8 v2): skip the OPTIONAL `[0]` attributes (constructed
+        // SET) and `[1]` publicKey (IMPLICIT BIT STRING, primitive tag `0x81`;
+        // also accept the constructed `0xA1` spelling) if present, then assert
+        // the SEQUENCE and outer reader are fully consumed so genuine trailing
+        // garbage is rejected.
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_any()?;
+        }
+        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
+            seq.read_any()?;
+        }
+        seq.finish()?;
+        r.finish()?;
         Ok(X25519PrivateKey { scalar })
     }
 
@@ -328,6 +341,41 @@ mod tests {
         let sk2 = X25519PrivateKey::from_pkcs8_pem(&pem).expect("parse pkcs8");
         assert_eq!(sk2.to_bytes(), scalar);
         assert_eq!(sk2.public_key(), sk.public_key());
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_rejects_trailing_garbage() {
+        let scalar = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let mut der = X25519PrivateKey::from_bytes(scalar).to_pkcs8_der();
+        der.push(0xff);
+        der.push(0x00);
+        assert!(X25519PrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_v2_with_public_key_parses() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let scalar = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let sk = X25519PrivateKey::from_bytes(scalar);
+        let pub_enc = sk.public_key();
+
+        // PKCS#8 v2 (RFC 5958) with the OPTIONAL `[1]` publicKey present as a
+        // primitive IMPLICIT BIT STRING (tag 0x81), the OpenSSL spelling.
+        let version = encode_integer(&[1]);
+        let algid = encode_sequence(&oid_tlv(X25519_OID));
+        let privkey = encode_octet_string(&encode_octet_string(&scalar));
+        let mut pub_bitstring = alloc::vec![0u8]; // 0 unused bits
+        pub_bitstring.extend_from_slice(&pub_enc);
+        let mut pubkey_field = alloc::vec![0x81u8];
+        pubkey_field.push(pub_bitstring.len() as u8);
+        pubkey_field.extend_from_slice(&pub_bitstring);
+        let der = encode_sequence(&[version, algid, privkey, pubkey_field].concat());
+
+        let parsed = X25519PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
+        assert_eq!(parsed.to_bytes(), scalar);
+        assert_eq!(parsed.public_key(), pub_enc);
     }
 
     #[test]

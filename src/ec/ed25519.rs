@@ -142,10 +142,10 @@ impl Ed25519PrivateKey {
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
-        use crate::der::{Error, Reader, parse_oid};
+        use crate::der::{Error, Reader, parse_oid, tag};
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence()?;
-        seq.read_integer_bytes()?; // version (v1 = 0)
+        seq.read_integer_bytes()?; // version (v1 = 0, v2 = 1)
         let mut algid = seq.read_sequence()?;
         if parse_oid(algid.read_oid()?)?.as_slice() != ED25519_OID {
             return Err(Error::Malformed);
@@ -157,6 +157,21 @@ impl Ed25519PrivateKey {
         }
         let mut seed = [0u8; 32];
         seed.copy_from_slice(seed_bytes);
+        // RFC 5958 (PKCS#8 v2 / OneAsymmetricKey): an OPTIONAL `[0]` attributes
+        // (IMPLICIT SET, constructed) and an OPTIONAL `[1]` publicKey (IMPLICIT
+        // BIT STRING) may follow the privateKey OCTET STRING. The publicKey is
+        // a primitive BIT STRING, so its IMPLICIT tag is `0x81`; accept the
+        // constructed `0xA1` spelling too for robustness. Skip whichever are
+        // present, then assert the SEQUENCE and outer reader are fully consumed
+        // so genuine trailing garbage is rejected.
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_any()?;
+        }
+        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
+            seq.read_any()?;
+        }
+        seq.finish()?;
+        r.finish()?;
         Ok(Ed25519PrivateKey { seed })
     }
 
@@ -445,6 +460,59 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_v1_round_trip() {
+        let seed =
+            from_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let sk = Ed25519PrivateKey::from_bytes(seed);
+        let der = sk.to_pkcs8_der();
+        let sk2 = Ed25519PrivateKey::from_pkcs8_der(&der).expect("v1 parse");
+        assert_eq!(sk2.to_bytes(), seed);
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_rejects_trailing_garbage() {
+        let seed =
+            from_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let mut der = Ed25519PrivateKey::from_bytes(seed).to_pkcs8_der();
+        // Appending junk after the well-formed SEQUENCE must now be rejected
+        // (the outer reader is no longer left unverified).
+        der.push(0xff);
+        der.push(0x00);
+        assert!(Ed25519PrivateKey::from_pkcs8_der(&der).is_err());
+    }
+
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_v2_with_public_key_parses() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let seed =
+            from_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60");
+        let sk = Ed25519PrivateKey::from_bytes(seed);
+        let pub_enc = sk.public_key().to_bytes();
+
+        // Hand-build a PKCS#8 v2 (RFC 5958) key with the OPTIONAL `[1]`
+        // publicKey present, encoded as a primitive IMPLICIT BIT STRING
+        // (tag 0x81) the way OpenSSL emits it: 0x00 unused-bits prefix
+        // followed by the 32-byte public key.
+        let version = encode_integer(&[1]);
+        let algid = encode_sequence(&oid_tlv(ED25519_OID));
+        let privkey = encode_octet_string(&encode_octet_string(&seed));
+        let mut pub_bitstring = alloc::vec![0u8]; // 0 unused bits
+        pub_bitstring.extend_from_slice(&pub_enc);
+        let mut pubkey_field = alloc::vec![0x81u8];
+        // length is 33 (< 0x80), short form.
+        pubkey_field.push(pub_bitstring.len() as u8);
+        pubkey_field.extend_from_slice(&pub_bitstring);
+        let der = encode_sequence(&[version, algid, privkey, pubkey_field].concat());
+
+        let parsed = Ed25519PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
+        assert_eq!(parsed.to_bytes(), seed);
+        assert_eq!(parsed.public_key().to_bytes(), pub_enc);
     }
 
     #[test]
