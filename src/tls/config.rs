@@ -156,6 +156,20 @@ pub struct Config {
     /// Required for client role.
     pub server_name: Option<String>,
     /// Validate the peer's chain. Set `false` for pinned-key flows.
+    ///
+    /// # Warning: disables ALL peer authentication
+    ///
+    /// Setting this to `false` does not merely relax chain building — it
+    /// turns off *every* X.509 check the client performs: chain-to-anchor
+    /// validation, `notBefore`/`notAfter` expiry, CRL/OCSP revocation, AND
+    /// hostname / SAN matching against [`server_name`](Self::server_name).
+    /// The connection then trusts whatever leaf the peer presents, so any
+    /// active on-path attacker can substitute their own certificate and the
+    /// handshake will still complete — i.e. it is fully MITM-open. Only set
+    /// `false` when you authenticate the peer out-of-band (e.g. a pinned raw
+    /// public key via [`expected_raw_public_keys`](Self::expected_raw_public_keys),
+    /// or your own application-level key pin). Never disable it as a
+    /// convenience to silence a validation error.
     pub verify_certificates: bool,
     /// Clock used for cert validity (`notBefore`/`notAfter`). Applies to the
     /// server certificate the client verifies AND to the client certificate a
@@ -559,6 +573,15 @@ impl ConfigBuilder {
         self
     }
     /// Enable or disable peer-certificate chain validation.
+    ///
+    /// # Warning: disables ALL peer authentication
+    ///
+    /// Passing `false` turns off *every* X.509 check the client performs —
+    /// chain-to-anchor validation, expiry, CRL/OCSP revocation, AND hostname
+    /// / SAN matching — leaving the connection fully MITM-open. Use it only
+    /// with out-of-band key pinning. See
+    /// [`Config::verify_certificates`](Config#structfield.verify_certificates)
+    /// for the full caveat.
     pub fn verify_certificates(mut self, v: bool) -> Self {
         self.inner.verify_certificates = v;
         self
