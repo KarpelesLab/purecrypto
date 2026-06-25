@@ -12,13 +12,21 @@
 //! implemented entirely in integer arithmetic. [`Fpr`] stores the standard
 //! IEEE-754 binary64 bit pattern in a `u64`; every operation
 //! (`add`/`mul`/`div`/`sqrt`/…) reproduces correctly-rounded (round-to-nearest,
-//! ties-to-even) IEEE results using only integer ops, with no data-dependent
-//! branches and no wide-integer division/`sqrt` libcalls (a manual restoring
-//! divider and bit-by-bit integer sqrt run a fixed number of iterations). The
-//! result is constant-time, identical on every target (including no-FPU
-//! `thumbv7em`), and bit-for-bit equal to a conforming hardware `f64` — which is
-//! exactly what the `#[cfg(test)]` differential harness in `fpr_tests.rs`
-//! checks against the host's real `f64` over millions of random operations.
+//! ties-to-even) IEEE results using only integer ops and no wide-integer
+//! division/`sqrt` libcalls (a manual restoring divider and bit-by-bit integer
+//! sqrt run a fixed number of iterations). The point is portability and
+//! reproducibility: the result is identical on every target (including no-FPU
+//! `thumbv7em`) and bit-for-bit equal to a conforming hardware `f64` — exactly
+//! what the `#[cfg(test)]` differential harness in `fpr_tests.rs` checks against
+//! the host's real `f64` over millions of random operations.
+//!
+//! **Constant-time caveat.** The emulation is *best-effort* constant-time, not
+//! guaranteed branch-free: `pack` and `add` branch on operand values, and
+//! `mul`/`div`/`sqrt` take zero-operand early-outs — values that, on the signing
+//! path, derive from secret data. So while the emulation removes the
+//! subnormal-timing and FMA-contraction leaks of a hardware `f64`, it does not
+//! by itself make signing strictly constant-time; a fully branchless FPEMU is
+//! future work (mirroring the candid limits documented elsewhere in the crate).
 //!
 //! Falcon never produces NaN or infinities in normal operation and its analysis
 //! shows subnormals do not arise on the hot path; those edges are still handled

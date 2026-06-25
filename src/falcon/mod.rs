@@ -8,18 +8,22 @@
 //!
 //! **Floating point.** Signing needs an FFT, an LDL tree, and a discrete
 //! Gaussian sampler — all floating-point — but the crate is `no_std` with no
-//! `libm`, and the signing path is secret-dependent. So all FP runs in an
-//! emulated constant-time IEEE-754 double (`fpr`, the approach Falcon's
-//! reference calls FPEMU): pure integer ops, data-oblivious, identical on every
-//! target (no FPU required), and bit-reproducible.
+//! `libm`, and the signing path is secret-dependent. So all FP runs in a
+//! software-emulated IEEE-754 double (`fpr`, the approach Falcon's reference
+//! calls FPEMU): pure integer ops, no FPU required, identical on every target,
+//! and bit-reproducible. The emulation is *best-effort* constant-time — some
+//! operations still branch on operand values (see `fpr`) — so it is not
+//! guaranteed free of data-dependent branches.
 //!
-//! **Constant-time scope.** The **signing path is strictly constant-time** (the
-//! sampler and all FFT/tree arithmetic on secrets are data-oblivious). **Key
-//! generation is best-effort** — NTRUSolve's big-integer arithmetic and the
-//! Gaussian-rejection retries are variable-time (as in the reference); keygen is
-//! one-time, on fresh entropy. **Verification** takes only public inputs, never
-//! panics on malformed input (every access is bounds-checked), and returns
-//! `false`/`Err` instead.
+//! **Constant-time scope.** The **signing path is best-effort constant-time**:
+//! the sampler and the FFT/tree arithmetic on secrets are written to be
+//! data-oblivious, but the underlying FPEMU (`fpr`) retains some value-dependent
+//! branches on operands that derive from secret data, so strictly branchless
+//! constant-time signing is future work. **Key generation is best-effort** —
+//! NTRUSolve's big-integer arithmetic and the Gaussian-rejection retries are
+//! variable-time (as in the reference); keygen is one-time, on fresh entropy.
+//! **Verification** takes only public inputs, never panics on malformed input
+//! (every access is bounds-checked), and returns `false`/`Err` instead.
 //!
 //! Verification needs only SHAKE-256 (for `HashToPoint`) and integer arithmetic
 //! modulo `q = 12289`.
