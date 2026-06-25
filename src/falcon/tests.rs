@@ -465,3 +465,31 @@ fn keypair_generate_sign_verify_and_sk_roundtrip() {
     let sig2 = sk2.sign(msg, &mut rng);
     assert!(verify(&pk, msg, &sig2), "reimported key must sign-verify");
 }
+
+#[test]
+fn from_bytes_rejects_corrupted_f_coefficient() {
+    use super::{Degree, Error, FalconPrivateKey, encode};
+    let mut rng = TestRng(0xC0FFEE_1234_5678);
+
+    let sk = FalconPrivateKey::generate(Degree::Falcon512, &mut rng);
+    let n = Degree::Falcon512.n();
+    let skb = sk.to_bytes();
+
+    // A freshly generated key must round-trip cleanly.
+    assert!(FalconPrivateKey::from_bytes(&skb).is_ok());
+
+    // Decode (f, g, F), perturb a single f coefficient so the NTRU equation
+    // f·G − g·F ≡ q no longer holds, then re-encode. The perturbation keeps f
+    // encodable and (in practice) invertible mod q, so the only thing catching
+    // it is the new NTRU-equation check in from_bytes.
+    let (mut f, g, cap_f) = encode::decode_privkey(&skb, n).expect("decode");
+    // Pick a coefficient whose +2 stays within the encodable signed range.
+    let i = f.iter().position(|&c| c.abs() < 100).unwrap_or(0);
+    f[i] += 2;
+    let bad = encode::encode_privkey(&f, &g, &cap_f, Degree::Falcon512.logn());
+
+    assert!(
+        matches!(FalconPrivateKey::from_bytes(&bad), Err(Error::Malformed)),
+        "a key violating the NTRU equation must be rejected"
+    );
+}

@@ -124,6 +124,27 @@ pub(crate) fn recompute_g(f: &[i64], g: &[i64], cap_f: &[i64], n: usize) -> Vec<
     fft.ifft(&g_cap_fft).iter().map(|x| x.rint()).collect()
 }
 
+/// Verify the NTRU equation `f·G − g·F ≡ q (mod xⁿ+1)` exactly over ℤ.
+///
+/// Used when importing a compact secret key: `(f, g, F)` come from the wire and
+/// `G` is recomputed, but a corrupted (yet invertible) `f` can still yield a
+/// structurally valid key whose signatures never verify. This catches that by
+/// checking the defining equation holds over the integers.
+pub(crate) fn check_ntru(f: &[i64], g: &[i64], cap_f: &[i64], cap_g: &[i64]) -> bool {
+    let to_zint = |p: &[i64]| -> Vec<Zint> { p.iter().map(|&c| Zint::from_i64(c)).collect() };
+    let fz = to_zint(f);
+    let gz = to_zint(g);
+    let cap_fz = to_zint(cap_f);
+    let cap_gz = to_zint(cap_g);
+    // f·G − g·F mod (xⁿ+1).
+    let fg = karamul(&fz, &cap_gz);
+    let gf = karamul(&gz, &cap_fz);
+    let diff: Vec<Zint> = (0..fg.len()).map(|i| fg[i].sub(&gf[i])).collect();
+    // Must equal the constant polynomial q: coefficient 0 is q, the rest zero.
+    let q = Zint::from_i64(Q);
+    diff[0] == q && diff[1..].iter().all(|c| c.is_zero())
+}
+
 /// Compute `h = g·f⁻¹ mod (xⁿ+1, q)`, or `None` if `f` is not invertible.
 pub(crate) fn compute_h(f: &[i64], g: &[i64], n: usize) -> Option<Vec<u16>> {
     let psi = find_psi(n);

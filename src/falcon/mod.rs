@@ -556,6 +556,12 @@ impl FalconPrivateKey {
         let (f, g, cap_f) = encode::decode_privkey(sk, n).ok_or(Error::InvalidLength)?;
         let h = keygen::compute_h(&f, &g, n).ok_or(Error::Malformed)?;
         let cap_g = keygen::recompute_g(&f, &g, &cap_f, n);
+        // Validate the NTRU equation `f·G − g·F ≡ q (mod xⁿ+1)`: a corrupted but
+        // still-invertible `f` produces a structurally valid key whose signatures
+        // would silently fail to verify. Reject it here instead.
+        if !keygen::check_ntru(&f, &g, &cap_f, &cap_g) {
+            return Err(Error::Malformed);
+        }
         let expanded = sign::expand_key(&f, &g, &cap_f, &cap_g, degree);
         Ok(FalconPrivateKey {
             degree,
