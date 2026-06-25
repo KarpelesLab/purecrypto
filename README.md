@@ -224,13 +224,14 @@ Output format:
 - Ed25519 / ML-DSA / ML-KEM / SLH-DSA → `-----BEGIN PRIVATE KEY-----` (PKCS#8,
   algorithm identified by the embedded OID)
 
-> **PKCS#8 interop note.** purecrypto uses the simple PKCS#8 form — `OCTET
-> STRING` containing the raw expanded key bytes — for every PQ scheme. This
-> matches OpenSSL 3.5 byte-for-byte for SLH-DSA, and OpenSSL parses the
-> resulting private keys directly. For ML-DSA and ML-KEM, OpenSSL writes a
-> richer `SEQUENCE { seed, expanded }` form; purecrypto's PEM round-trips
-> through itself but may not load into OpenSSL as a private key. Public-key
-> SPKI is fully interoperable for every scheme.
+> **PKCS#8 interop note.** Private keys use the LAMPS PQC encodings and are
+> fully interoperable with OpenSSL 3.5 in both directions. ML-DSA and ML-KEM
+> emit the `ML-DSA-PrivateKey` / `ML-KEM-PrivateKey` CHOICE `both`
+> (`SEQUENCE { seed, expandedKey }`) form — byte-for-byte identical to OpenSSL
+> 3.5's default `seed-priv` output — and the parser also accepts the `seed`,
+> `expandedKey`, and legacy raw-expanded forms. SLH-DSA uses the bare `OCTET
+> STRING` form, matching OpenSSL byte-for-byte. Public-key SPKI is fully
+> interoperable for every scheme.
 
 ### `pkey` — inspect or convert a key
 
