@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.24](https://github.com/KarpelesLab/purecrypto/compare/v0.6.23...v0.6.24) - 2026-06-25
+
+### Other
+
+- lazy single-engine server front-end (build one engine, not both)
+- negotiate TLS 1.2 or 1.3 from the ClientHello on a spanning server
+- group hex literal to satisfy clippy::unusual_byte_groupings
+- reject duplicate CertificateRequest in TLS 1.3 client
+- *(tls)* flag verify_certificates(false) as MITM-open in docs
+- zeroize XOF reader buffers on drop
+- *(kdf/argon2)* note m_cost/t_cost are unbounded for untrusted input
+- *(kdf/scrypt)* correct enforced-bound description, note p is unbounded
+- reject empty salt and password
+- correct overstated constant-time docs for the FPEMU
+- validate imported secret keys against the NTRU equation
+- reject trailing whole zero bytes in unpadded signatures
+- add defense-in-depth debug_asserts
+- reject trailing junk in EdDSA/X25519/X448 PKCS#8 parsers
+- enforce cRLSign keyUsage on CRL signers (RFC 5280 §6.3.3)
+- *(readme)* PQC PKCS#8 now fully interoperable with OpenSSL 3.5
+- emit LAMPS CHOICE PKCS#8 private keys (OpenSSL 3.5 interop)
+- *(readme)* drop ✅ badges from the capability table
+
 ## [0.6.23](https://github.com/KarpelesLab/purecrypto/compare/v0.6.22...v0.6.23) - 2026-06-25
 
 ### Other
