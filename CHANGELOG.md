@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.0](https://github.com/KarpelesLab/purecrypto/compare/v0.6.21...v0.7.0) - 2026-06-25
+## [0.6.22](https://github.com/KarpelesLab/purecrypto/compare/v0.6.21...v0.6.22) - 2026-06-25
 
 ### Other
 
