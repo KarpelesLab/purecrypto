@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.25](https://github.com/KarpelesLab/purecrypto/compare/v0.6.24...v0.6.25) - 2026-06-25
+
+### Other
+
+- *(cli)* de-flake q_client_q_server_roundtrip on slow CI hosts
+- add peek_initial_sni — pre-handshake SNI/ALPN for HTTP/3 cert selection
+- client-side TLS 1.2/1.3 version negotiation (hybrid ClientHello + downgrade)
+
 ## [0.6.24](https://github.com/KarpelesLab/purecrypto/compare/v0.6.23...v0.6.24) - 2026-06-25
 
 ### Other
