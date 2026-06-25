@@ -469,7 +469,7 @@ fn keypair_generate_sign_verify_and_sk_roundtrip() {
 #[test]
 fn from_bytes_rejects_corrupted_f_coefficient() {
     use super::{Degree, Error, FalconPrivateKey, encode};
-    let mut rng = TestRng(0xC0FFEE_1234_5678);
+    let mut rng = TestRng(0x00C0_FFEE_1234_5678);
 
     let sk = FalconPrivateKey::generate(Degree::Falcon512, &mut rng);
     let n = Degree::Falcon512.n();
