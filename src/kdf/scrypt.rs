@@ -29,9 +29,12 @@ use crate::kdf::pbkdf2;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// One of `log_n`, `r`, `p`, or `dkLen` is outside RFC 7914 §1's range:
+    /// One of `log_n`, `r`, `p`, or `dkLen` is outside the enforced range:
     /// `log_n` must be in `1..64`, `r ≥ 1`, `p ≥ 1`, `r·N < 2³⁰`, and
-    /// `p · ⌈dkLen/32⌉ ≤ (2³² − 1)`.
+    /// `p · ⌈dkLen/32⌉ ≤ (2³² − 1)`. Note `r·N < 2³⁰` is the bound this
+    /// implementation enforces; it is sound but is *not* the RFC 7914 §1
+    /// relation `N < 2^(128·r/8)`, which is not separately checked. `p` has
+    /// no independent upper bound (see [`scrypt`]).
     InvalidParam,
 }
 
@@ -45,6 +48,21 @@ impl core::error::Error for Error {}
 
 /// Derives `out.len()` key bytes from `(password, salt)` using scrypt with
 /// parameters `(log_n, r, p)` (so `N = 2^log_n`).
+///
+/// # Enforced bounds
+///
+/// The memory/CPU bound this function checks is `r·N < 2³⁰` (with
+/// `N = 2^log_n`), which caps the `128·r·N`-byte ROMix allocation. This is
+/// *not* the RFC 7914 §1 relation `N < 2^(128·r/8)`; that relation is not
+/// separately enforced.
+///
+/// # Untrusted parameters
+///
+/// `p` has **no independent upper bound** here: total work scales with `p`,
+/// so a large `p` (with `log_n`/`r` each individually small enough to pass
+/// the `r·N` check) is a CPU-exhaustion DoS vector. Callers that derive
+/// `(log_n, r, p)` from untrusted input (e.g. a parsed PHC `$scrypt$`
+/// string) MUST clamp them to sane maxima themselves before calling.
 pub fn scrypt(
     password: &[u8],
     salt: &[u8],
