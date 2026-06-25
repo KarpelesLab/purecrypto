@@ -768,6 +768,15 @@ impl super::XofReader for Blake2xbReader {
     }
 }
 
+impl Drop for Blake2xbReader {
+    fn drop(&mut self) {
+        // `b0` (the finalized root hash) and `node` (squeezed output blocks)
+        // are key material; wipe them on drop.
+        super::zeroize::zero_bytes(&mut self.b0);
+        super::zeroize::zero_bytes(&mut self.node);
+    }
+}
+
 /// BLAKE2Xs: an extendable-output function built on BLAKE2s.
 #[derive(Clone)]
 pub struct Blake2xs {
@@ -852,6 +861,15 @@ impl super::XofReader for Blake2xsReader {
             i += take;
             self.pos += take as u32;
         }
+    }
+}
+
+impl Drop for Blake2xsReader {
+    fn drop(&mut self) {
+        // `b0` (the finalized root hash) and `node` (squeezed output blocks)
+        // are key material; wipe them on drop.
+        super::zeroize::zero_bytes(&mut self.b0);
+        super::zeroize::zero_bytes(&mut self.node);
     }
 }
 

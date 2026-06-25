@@ -463,6 +463,17 @@ impl XofReader for Blake3Reader {
     }
 }
 
+impl Drop for Blake3Reader {
+    fn drop(&mut self) {
+        // The squeezed-output block buffer and the root output state it is
+        // derived from are key material; wipe them, matching the rest of the
+        // crate's best-effort zeroization.
+        super::zeroize::zero_bytes(&mut self.block);
+        super::zeroize::zero_words(&mut self.output.input_cv);
+        super::zeroize::zero_words(&mut self.output.block);
+    }
+}
+
 impl Digest for Blake3 {
     type Output = [u8; OUT_LEN];
     type Block = [u8; BLOCK_LEN];
