@@ -756,6 +756,122 @@ impl ClientConnection12 {
         conn
     }
 
+    /// Builds a TLS 1.2 client that ADOPTS a ClientHello already sent by a TLS
+    /// 1.3 client engine (version-spanning downgrade): the handshake resumes at
+    /// `WaitServerHello` with our transcript seeded by the exact `sent_ch`
+    /// bytes — no second ClientHello is built or sent. `sent_ch` is the full
+    /// ClientHello handshake message (`type ‖ u24 len ‖ body`).
+    ///
+    /// The offered cipher suites and `client_random` are recovered from
+    /// `sent_ch` (so the server's suite choice validates against what was
+    /// actually advertised); fresh ECDHE keypairs are generated for the classic
+    /// curves (the 1.2 ECDHE keys never appear in the ClientHello, so they need
+    /// not match anything sent). Extended Master Secret is treated as offered —
+    /// the hybrid ClientHello always carries it.
+    pub(crate) fn adopt_sent_client_hello<R: RngCore>(
+        config: ClientConfig12,
+        server_name: &str,
+        sent_ch: &[u8],
+        rng: &mut R,
+    ) -> Result<Self, Error> {
+        // Strip the 4-byte handshake header and decode the ClientHello body.
+        if sent_ch.len() < 4 || sent_ch[0] != hs_type::CLIENT_HELLO {
+            return Err(Error::Decode);
+        }
+        let body_len =
+            ((sent_ch[1] as usize) << 16) | ((sent_ch[2] as usize) << 8) | (sent_ch[3] as usize);
+        if sent_ch.len() < 4 + body_len {
+            return Err(Error::Decode);
+        }
+        let ch = ClientHello::decode(&sent_ch[4..4 + body_len])?;
+        let client_random = ch.random;
+        // Keep the offered suites the (hybrid) ClientHello actually carried,
+        // filtered to those this 1.2 engine recognises — so the server's pick
+        // validates against the real advertisement.
+        let offered_suites: Vec<CipherSuite> = ch
+            .cipher_suites
+            .iter()
+            .copied()
+            .filter(|s| {
+                #[cfg(feature = "tls-legacy")]
+                {
+                    lookup_suite_12(*s).is_some() || lookup_legacy_cbc(*s).is_some()
+                }
+                #[cfg(not(feature = "tls-legacy"))]
+                {
+                    lookup_suite_12(*s).is_some()
+                }
+            })
+            .collect();
+        // The classic ECDHE curves whose keys we generate here; the 1.2 server
+        // selects its group from these in ServerKeyExchange.
+        let groups = [
+            NamedGroup::X25519,
+            NamedGroup::SECP256R1,
+            NamedGroup::SECP384R1,
+        ];
+
+        let x25519 = X25519PrivateKey::generate(rng);
+        let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
+        let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
+
+        #[cfg(feature = "tls-legacy")]
+        let legacy_rng = {
+            let mut seed = [0u8; 32];
+            rng.fill_bytes(&mut seed);
+            crate::rng::HmacDrbg::<crate::hash::Sha256>::new(&seed, b"tls12-legacy-client", &[])
+        };
+
+        let mut conn = ClientConnection12 {
+            config,
+            server_name: String::from(server_name),
+            state: State::WaitServerHello,
+            received_close_notify: false,
+            inbuf: Vec::new(),
+            outbuf: Vec::new(), // ClientHello already sent by the 1.3 engine.
+            hs_pending: Vec::new(),
+            app_in: Vec::new(),
+            transcript: Transcript::new(),
+            ccs_window_open: true,
+            ccs_received: false,
+            x25519,
+            p256,
+            p384,
+            client_random,
+            server_random: None,
+            offered_suites,
+            offered_groups: groups.to_vec(),
+            negotiated_version: ProtocolVersion::TLSv1_2,
+            suite: None,
+            #[cfg(feature = "tls-legacy")]
+            legacy_suite: None,
+            #[cfg(feature = "tls-legacy")]
+            legacy_rng,
+            cert_chain: Vec::new(),
+            leaf_key: None,
+            peer_share: None,
+            alpn_negotiated: None,
+            master: None,
+            client_crypter: None,
+            server_crypter: None,
+            pending_server_crypter: None,
+            cert_request_received: false,
+            received_ticket: None,
+            received_ticket_lifetime: 0,
+            resumed: false,
+            ems_offered: true,
+            ems_negotiated: false,
+            ems_session_hash: None,
+            server_echoed_ocsp_staple: false,
+            peer_ocsp_response: None,
+        };
+        // Seed the transcript with the EXACT bytes the 1.3 engine sent (the
+        // 1.2 server hashed these same bytes). The hash alg stays unpinned
+        // until ServerHello selects the suite — `Transcript` buffers raw bytes.
+        conn.transcript.update(sent_ch);
+        Ok(conn)
+    }
+
     /// Builds the ClientHello with all the TLS-1.2-required extensions.
     fn build_client_hello(&self, suites: &[CipherSuite], groups: &[NamedGroup]) -> Vec<u8> {
         // A client that tops out below TLS 1.2 (opt-in legacy) emits a clean

@@ -139,6 +139,13 @@ pub(crate) struct ServerConfig12 {
     /// that would happily speak legacy TLS 1.2. Set to `false` only to
     /// interoperate with very old clients that predate RFC 7627.
     pub(crate) require_ems: bool,
+    /// Whether the *deployment* supports TLS 1.3 (i.e. this 1.2 engine is the
+    /// downgrade target of a version-spanning server, not a pinned `max=1.2`
+    /// server). Per RFC 8446 §4.1.3 ONLY a 1.3-capable server sets the
+    /// `DOWNGRD\x01` sentinel in `server_random`; a pure 1.2 server must NOT,
+    /// or 1.3-capable clients abort with `illegal_parameter`. Defaults to
+    /// `false`; set by `build_tls12_server` when `Config::max_version` is 1.3.
+    pub(crate) supports_tls13: bool,
     /// Lowest protocol version this server will negotiate. Defaults to
     /// TLS 1.2. Lowered to TLS 1.0/1.1 via [`Self::with_min_version`] to accept
     /// the deprecated legacy suites (off by default; see the module docs).
@@ -178,9 +185,17 @@ impl ServerConfig12 {
             stapled_ocsp_response: None,
             key_log: None,
             require_ems: true,
+            supports_tls13: false,
             #[cfg(feature = "tls-legacy")]
             min_version: ProtocolVersion::TLSv1_2,
         }
+    }
+
+    /// Marks this 1.2 engine as the downgrade target of a 1.3-capable
+    /// deployment (RFC 8446 §4.1.3 — see [`supports_tls13`](Self::supports_tls13)).
+    pub(crate) fn with_supports_tls13(mut self, yes: bool) -> Self {
+        self.supports_tls13 = yes;
+        self
     }
 
     /// A configuration presenting `cert_chain` and signing with an RSA private
@@ -1102,14 +1117,16 @@ impl<R: RngCore> ServerConnection12<R> {
 
             let mut server_random: Random = [0u8; 32];
             self.rng.fill_bytes(&mut server_random);
-            // RFC 8446 §4.1.3: a TLS 1.2 server SHOULD always embed the
-            // downgrade sentinel in the last 8 bytes of `server_random`,
-            // not only when the client advertised TLS 1.3 via
-            // `supported_versions`. A 1.3-aware client checks this
-            // unconditionally and aborts on mismatch, which protects
-            // legacy clients that did not advertise 1.3 but were forced
-            // down by an in-path attacker.
-            apply_downgrade_sentinel(&mut server_random);
+            // RFC 8446 §4.1.3: ONLY a TLS-1.3-capable server that negotiates
+            // TLS 1.2 embeds the `DOWNGRD\x01` sentinel — it tells a 1.3-aware
+            // client "I support 1.3 but we're at 1.2", which the client treats
+            // as an attack. A pinned (pure) 1.2 server MUST NOT set it, or every
+            // 1.3-capable client would abort. Gated on the deployment's 1.3
+            // support (set when this engine is a version-spanning server's
+            // downgrade target).
+            if self.config.supports_tls13 {
+                apply_downgrade_sentinel(&mut server_random);
+            }
 
             self.suite = Some(rs.suite);
             self.client_random = Some(ch.random);
@@ -1176,13 +1193,15 @@ impl<R: RngCore> ServerConnection12<R> {
         self.transcript.set_alg(suite.hash);
         self.transcript.update(raw);
 
-        // Server random. RFC 8446 §4.1.3: a TLS 1.2 server SHOULD embed the
-        // downgrade sentinel in the trailing 8 bytes of `server_random`
-        // regardless of whether the client advertised TLS 1.3, so a 1.3-
-        // aware client can detect an attacker that stripped supported_versions.
+        // Server random. RFC 8446 §4.1.3: embed the `DOWNGRD\x01` downgrade
+        // sentinel ONLY when this deployment is TLS-1.3-capable (a
+        // version-spanning server that negotiated down to 1.2). A pinned 1.2
+        // server must NOT set it, or 1.3-capable clients abort the handshake.
         let mut server_random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut server_random);
-        apply_downgrade_sentinel(&mut server_random);
+        if self.config.supports_tls13 {
+            apply_downgrade_sentinel(&mut server_random);
+        }
 
         self.suite = Some(suite);
         self.group = Some(group);
@@ -2600,56 +2619,61 @@ mod tests {
         assert!(s.process_new_packets().is_ok());
     }
 
-    /// RFC 8446 §4.1.3 — a TLS 1.2 server embeds the `DOWNGRD\x01`
-    /// sentinel in `server_random` regardless of whether the client offered
-    /// TLS 1.3 in `supported_versions`. This guards a legacy 1.2 client
-    /// against an in-path attacker stripping the extension to hide the
-    /// downgrade.
+    /// RFC 8446 §4.1.3 — the `DOWNGRD\x01` sentinel is set ONLY by a
+    /// TLS-1.3-capable server that negotiated TLS 1.2 (`supports_tls13`). A
+    /// pinned (pure) TLS 1.2 server MUST NOT set it, or 1.3-capable clients
+    /// abort. This checks both arms of the gate.
     #[test]
-    fn server12_embeds_downgrade_sentinel_without_supported_versions() {
+    fn server12_downgrade_sentinel_gated_on_tls13_support() {
         const DOWNGRD_13: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x01];
 
-        let cfg = test_rsa_server_config();
-        let rng = HmacDrbg::<Sha256>::new(b"s12-dgrd", b"nonce", &[]);
-        let mut s = ServerConnection12::new(cfg, rng);
+        // A legacy TLS 1.2 ClientHello (no supported_versions), reused for both
+        // server variants.
+        let build_ch = || {
+            let mut crng = HmacDrbg::<Sha256>::new(b"s12-dgrd-c", b"nonce", &[]);
+            let mut random = [0u8; 32];
+            crng.fill_bytes(&mut random);
+            let ch = ClientHello {
+                legacy_version: 0x0303,
+                random,
+                session_id: Vec::new(),
+                cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+                extensions: alloc::vec![
+                    ext::signature_algorithms(),
+                    ext::supported_groups_list(&[NamedGroup::X25519]),
+                    ext::ec_point_formats(),
+                    ext::extended_master_secret_empty(),
+                    ext::renegotiation_info_empty(),
+                ],
+            }
+            .encode();
+            let mut rec = Vec::new();
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                &ch,
+            );
+            rec
+        };
 
-        // Synthesise a legacy TLS 1.2 ClientHello — no supported_versions.
-        let mut crng = HmacDrbg::<Sha256>::new(b"s12-dgrd-c", b"nonce", &[]);
-        let mut random = [0u8; 32];
-        crng.fill_bytes(&mut random);
-        let ch = ClientHello {
-            legacy_version: 0x0303,
-            random,
-            session_id: Vec::new(),
-            cipher_suites: alloc::vec![CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
-            extensions: alloc::vec![
-                ext::signature_algorithms(),
-                ext::supported_groups_list(&[NamedGroup::X25519]),
-                ext::ec_point_formats(),
-                ext::extended_master_secret_empty(),
-                ext::renegotiation_info_empty(),
-            ],
-        }
-        .encode();
-        let mut rec = Vec::new();
-        write_record(
-            &mut rec,
-            ContentType::Handshake,
-            ProtocolVersion::TLSv1_2,
-            &ch,
-        );
-        s.read_tls(&rec);
-        s.process_new_packets().unwrap();
+        let server_random = |supports_tls13: bool| -> [u8; 32] {
+            let cfg = test_rsa_server_config().with_supports_tls13(supports_tls13);
+            let rng = HmacDrbg::<Sha256>::new(b"s12-dgrd", b"nonce", &[]);
+            let mut s = ServerConnection12::new(cfg, rng);
+            s.read_tls(&build_ch());
+            s.process_new_packets().unwrap();
+            let out = s.write_tls();
+            let parsed = read_record(&out).unwrap().unwrap();
+            assert_eq!(parsed.fragment[0], hs_type::SERVER_HELLO);
+            ServerHello::decode(&parsed.fragment[4..]).unwrap().random
+        };
 
-        // Find the ServerHello in the emitted records and decode it.
-        let out = s.write_tls();
-        let parsed = read_record(&out).unwrap().unwrap();
-        assert_eq!(parsed.content_type, ContentType::Handshake);
-        // First handshake byte is the message type; the rest is type+len+body.
-        assert_eq!(parsed.fragment[0], hs_type::SERVER_HELLO);
-        // The handshake body starts after the 4-byte type+length header.
-        let sh = ServerHello::decode(&parsed.fragment[4..]).unwrap();
-        assert_eq!(&sh.random[24..], &DOWNGRD_13);
+        // 1.3-capable deployment (version-spanning server downgraded to 1.2):
+        // the sentinel IS present.
+        assert_eq!(&server_random(true)[24..], &DOWNGRD_13);
+        // Pinned 1.2-only server: the sentinel is NOT present.
+        assert_ne!(&server_random(false)[24..], &DOWNGRD_13);
     }
 
     /// A normal CH yields a complete server flight: SH || Certificate ||

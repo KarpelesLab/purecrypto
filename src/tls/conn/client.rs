@@ -271,6 +271,13 @@ pub(crate) struct ClientConfig {
     /// the engine logs every derived traffic / master secret as it
     /// progresses through the handshake.
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// When `true`, the ClientHello additionally offers TLS 1.2 (the 1.2
+    /// ECDHE-AEAD suites, `supported_versions = [1.3, 1.2]`, plus
+    /// `ec_point_formats` / `extended_master_secret`) so a 1.2-only server can
+    /// negotiate; on a 1.2 ServerHello the engine signals a downgrade rather
+    /// than erroring. Set by the version-spanning client front-end; `false`
+    /// keeps a pure-1.3 ClientHello (pinned 1.3 or 1.3 resumption).
+    pub offer_tls12: bool,
     /// ECH client configuration (draft-ietf-tls-esni-22). `None` (the
     /// default) emits no `encrypted_client_hello` extension. `Some` —
     /// either GREASE or a real `ECHConfigList` — emits a bit-shape-identical
@@ -308,6 +315,7 @@ impl ClientConfig {
             expected_raw_public_keys: Vec::new(),
             raw_public_key_spki: None,
             key_log: None,
+            offer_tls12: false,
             #[cfg(feature = "ech")]
             ech: None,
             #[cfg(feature = "cert-compression")]
@@ -617,6 +625,20 @@ pub struct ClientConnection {
     /// mTLS: set when the server sent a `CertificateRequest` between EE and
     /// its `Certificate`. Drives client-cert emission after server Finished.
     cert_request_received: bool,
+
+    /// When `true`, our ClientHello offered TLS 1.2 alongside 1.3, so a 1.2
+    /// ServerHello triggers a downgrade (see `downgrade_to_tls12`) rather than
+    /// `UnsupportedVersion`.
+    offer_tls12: bool,
+    /// Set in `on_server_hello` when the server selected TLS 1.2 and we had
+    /// offered it: the version-spanning client front-end then hands the
+    /// already-sent ClientHello to a TLS 1.2 engine. No alert is emitted and no
+    /// state advances.
+    downgrade_to_tls12: bool,
+    /// The exact ClientHello handshake-message bytes we emitted (header
+    /// included), retained so a 1.2 downgrade can seed the TLS 1.2 engine's
+    /// transcript with them without re-encoding.
+    sent_client_hello: Vec<u8>,
 
     /// Which framing mode this engine runs in (TLS / DTLS / QUIC).
     ///
@@ -1008,7 +1030,17 @@ impl ClientConnection {
             CipherSuite::AES_256_GCM_SHA384,
             CipherSuite::CHACHA20_POLY1305_SHA256,
         ];
-        let suites = super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?;
+        // A version-spanning client (`offer_tls12`) advertises the TLS 1.2
+        // ECDHE-AEAD suites after the 1.3 trio, so a 1.2-only server can pick
+        // one. A 1.3 server ignores them. Both pass through the same
+        // `cipher_suites` restriction filter.
+        let suites = if config.offer_tls12 {
+            let mut available: Vec<CipherSuite> = DEFAULT_SUITES.to_vec();
+            available.extend(super::SUITES_12.iter().map(|p| p.suite));
+            super::select_offered_suites(&config.cipher_suites, &available)?
+        } else {
+            super::select_offered_suites(&config.cipher_suites, &DEFAULT_SUITES)?
+        };
         Ok(Self::new_with_offer(
             config,
             server_name,
@@ -1132,6 +1164,10 @@ impl ClientConnection {
         let p256 = BoxedEcdhPrivateKey::generate(CurveId::P256, rng);
         let p384 = BoxedEcdhPrivateKey::generate(CurveId::P384, rng);
         let (mlkem, _) = MlKem768DecapsKey::generate(rng);
+        // Whether this ClientHello also offers TLS 1.2 (set by the
+        // version-spanning client front-end via `ClientConfig::offer_tls12`).
+        // Captured before `config` is moved into the struct below.
+        let offer_tls12 = config.offer_tls12;
         let mut random: Random = [0u8; 32];
         rng.fill_bytes(&mut random);
         // Private seed for the ECH GREASE HKDF expansion (see the
@@ -1198,6 +1234,9 @@ impl ClientConnection {
             cets: None,
             deferred_client_hs_secret: None,
             cert_request_received: false,
+            offer_tls12,
+            downgrade_to_tls12: false,
+            sent_client_hello: Vec::new(),
             engine_mode,
             hooks,
             peer_quic_params_seen: false,
@@ -1288,6 +1327,10 @@ impl ClientConnection {
         {
             conn.core.transcript.set_alg(session.cipher_suite_hash);
         }
+        // Retain the exact emitted ClientHello bytes so a TLS 1.2 downgrade can
+        // seed the 1.2 engine's transcript with them (the 1.2 server hashed
+        // these same bytes).
+        conn.sent_client_hello = hello.clone();
         // RFC 9001 §4.1.4: ClientHello rides at the Initial encryption level
         // in QUIC; in TLS / DTLS mode this just goes into the record stream.
         conn.emit_handshake_at(super::super::quic_hooks::Level::Initial, hello);
@@ -1381,9 +1424,25 @@ impl ClientConnection {
         let mut extensions = alloc::vec![
             ext::supported_groups_list(groups),
             ext::signature_algorithms(),
-            ext::client_supported_versions(),
+            if self.offer_tls12 {
+                // Offer both 1.3 and 1.2 so a 1.2-only server can negotiate.
+                ext::client_supported_versions_with_tls12()
+            } else {
+                ext::client_supported_versions()
+            },
             ext::client_key_shares(&key_shares),
         ];
+        // TLS 1.2 ECDHE peers expect `ec_point_formats` (uncompressed),
+        // negotiate Extended Master Secret (RFC 7627), and require secure
+        // renegotiation signalling (RFC 5746 — a 1.2 server echoes
+        // `renegotiation_info` only if we offered it, and our 1.2 engine
+        // rejects a ServerHello missing the echo). The pure-1.3 CH omits all
+        // three; a 1.3 server ignores them.
+        if self.offer_tls12 {
+            extensions.push(ext::ec_point_formats());
+            extensions.push(ext::extended_master_secret_empty());
+            extensions.push(ext::renegotiation_info_empty());
+        }
         // RFC 6066 §3: SNI carries a host name only. Omit it when there is no
         // server name (e.g. connecting by IP with certificate verification off).
         if !server_name.is_empty() {
@@ -1568,6 +1627,20 @@ impl ClientConnection {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once a ServerHello selecting TLS 1.2 has flagged a downgrade (only
+    /// possible when this client offered 1.2). The version-spanning front-end
+    /// then hands [`sent_client_hello`](Self::sent_client_hello) to a TLS 1.2
+    /// engine. No alert is emitted and no state advances when this is set.
+    pub(crate) fn downgrade_requested(&self) -> bool {
+        self.downgrade_to_tls12
+    }
+
+    /// The exact ClientHello handshake-message bytes this engine emitted —
+    /// used to seed a TLS 1.2 engine's transcript on downgrade.
+    pub(crate) fn sent_client_hello(&self) -> &[u8] {
+        &self.sent_client_hello
+    }
+
     /// True once the peer's close_notify alert has been processed.
     ///
     /// After transport EOF, a `false` here means the TLS stream was cut
@@ -1639,6 +1712,14 @@ impl ClientConnection {
                     if let Err(e) = self.handle_handshake(msg) {
                         self.fail(&e);
                         return Err(e);
+                    }
+                    if self.downgrade_to_tls12 {
+                        // The ServerHello selected TLS 1.2: stop processing as
+                        // 1.3 (the rest of the server's flight must not be
+                        // parsed by this engine). The version-spanning
+                        // front-end re-feeds the buffered flight to a TLS 1.2
+                        // engine seeded with our sent ClientHello.
+                        return Ok(());
                     }
                 }
                 Ok(Some(Incoming::ApplicationData(_))) => {
@@ -1810,18 +1891,43 @@ impl ClientConnection {
             return self.on_hello_retry_request(sh, raw);
         }
 
-        // RFC 8446 §4.1.3: a TLS-1.3 ServerHello carrying the downgrade
-        // sentinel "DOWNGRD\x01" (TLS 1.2) or "...\x00" (TLS 1.1/below) in
-        // the last 8 bytes of `server_random` is a TLS-1.3-aware server
-        // signaling that it intentionally negotiated a lower version.
-        // Because this code path is the TLS-1.3 client (we always offered
-        // 1.3), seeing the sentinel here means an attacker is downgrading
-        // us; abort with `illegal_parameter`.
+        // RFC 8446 §4.1.3: a ServerHello carrying the downgrade sentinel
+        // "DOWNGRD\x01" (TLS 1.2) or "...\x00" (TLS 1.1/below) in the last 8
+        // bytes of `server_random` is a TLS-1.3-capable server signalling it
+        // negotiated a lower version. We offered TLS 1.3 (and, when
+        // `offer_tls12`, 1.2 as well); a 1.3-capable server that reached our
+        // unmodified offer would have selected 1.3, so the sentinel means our
+        // 1.3 offer was stripped on the wire — a downgrade attack. Abort with
+        // `illegal_parameter`. (This precedes the version branch below so the
+        // attack is caught whether or not we were willing to speak 1.2.)
         let tail: &[u8] = &sh.random[24..];
         if tail == super::client12::DOWNGRADE_SENTINEL_TLS12
             || tail == super::client12::DOWNGRADE_SENTINEL_TLS11_OR_BELOW
         {
             return Err(Error::IllegalParameter);
+        }
+
+        // Version branch (RFC 8446 §4.2.1): a TLS 1.3 ServerHello carries
+        // `supported_versions = 1.3`; its absence (or a 1.2 value) means the
+        // server selected TLS 1.2. If we offered 1.2 (`offer_tls12`) and the
+        // sentinel was absent (checked above), this is a genuine 1.2-only
+        // server — flag a downgrade and return WITHOUT touching the transcript
+        // or emitting anything, so the version-spanning front-end can hand our
+        // already-sent ClientHello to a TLS 1.2 engine. Without `offer_tls12`
+        // (pinned 1.3 / resumption) a non-1.3 selection is unacceptable.
+        let selected_tls13 = match ext::find(
+            &sh.extensions,
+            crate::tls::codec::ExtensionType::SUPPORTED_VERSIONS,
+        ) {
+            Some(sv) => ext::parse_selected_version(sv)? == crate::tls::ProtocolVersion::TLSv1_3,
+            None => false,
+        };
+        if !selected_tls13 {
+            if self.offer_tls12 {
+                self.downgrade_to_tls12 = true;
+                return Ok(());
+            }
+            return Err(Error::UnsupportedVersion);
         }
 
         // RFC 8446 §4.1.3: the ServerHello MUST echo `legacy_session_id` from

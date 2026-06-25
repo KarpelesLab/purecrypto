@@ -19,6 +19,18 @@ pub(crate) fn client_supported_versions() -> RawExtension {
     (ExtensionType::SUPPORTED_VERSIONS, body)
 }
 
+/// `supported_versions` for a version-spanning ClientHello: a `u8`-length list
+/// offering TLS 1.3 first (preferred) then TLS 1.2, so a 1.2-only server can
+/// still negotiate.
+pub(crate) fn client_supported_versions_with_tls12() -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u8(&mut body, |b| {
+        put_u16(b, ProtocolVersion::TLSv1_3.as_u16());
+        put_u16(b, ProtocolVersion::TLSv1_2.as_u16());
+    });
+    (ExtensionType::SUPPORTED_VERSIONS, body)
+}
+
 /// Parses the server's selected version from a ServerHello `supported_versions`
 /// (a bare `u16`).
 pub(crate) fn parse_selected_version(body: &[u8]) -> Result<ProtocolVersion, Error> {

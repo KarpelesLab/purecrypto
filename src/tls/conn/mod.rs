@@ -5677,12 +5677,15 @@ mod tls12_loopback_tests {
     };
     use crate::tls::{ContentType, Error, ProtocolVersion};
 
-    /// A TLS 1.2 server presented with a CH that carries `supported_versions`
-    /// listing TLS 1.3 MUST overwrite the last 8 bytes of `server_random`
-    /// with the RFC 8446 §4.1.3 downgrade sentinel.
+    /// A TLS-1.3-capable deployment that negotiates TLS 1.2 (its 1.2 engine is
+    /// marked `supports_tls13`) MUST overwrite the last 8 bytes of
+    /// `server_random` with the RFC 8446 §4.1.3 downgrade sentinel. (A pinned
+    /// 1.2-only server, `supports_tls13 == false`, must NOT — covered by
+    /// `server12::tests::server12_downgrade_sentinel_gated_on_tls13_support`.)
     #[test]
     fn tls12_server_writes_downgrade_sentinel() {
         let (server_config, _cert_der) = rsa_server12();
+        let server_config = server_config.with_supports_tls13(true);
         let srng = HmacDrbg::<Sha256>::new(b"dg-sentinel-s", b"nonce", &[]);
         let mut server = ServerConnection12::new(server_config, srng);
 
