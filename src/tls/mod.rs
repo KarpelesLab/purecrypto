@@ -67,6 +67,7 @@ mod groups;
 pub(crate) mod keylog;
 #[cfg(feature = "mio")]
 pub mod mio;
+mod peek;
 pub(crate) mod pki;
 pub(crate) mod quic_hooks;
 mod signer;
@@ -87,6 +88,7 @@ pub use groups::NamedGroup;
 pub use keylog::KeyLog;
 #[cfg(feature = "std")]
 pub use keylog::{WriterKeyLog, file_keylog};
+pub use peek::{ClientHelloInfo, peek_client_hello};
 pub use pki::{CrlStore, PolicyOptions, RootCertStore};
 #[cfg(feature = "std")]
 pub use signer::LocalSigner;
