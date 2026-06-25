@@ -1315,8 +1315,8 @@ impl QuicConnection {
     }
 
     /// Time of the next internal event — the earlier of the PTO firing and the
-    /// RFC 9000 §10.1 idle-timeout deadline (both measured from
-    /// [`Self::start`]). `None` if neither timer is armed.
+    /// RFC 9000 §10.1 idle-timeout deadline (both measured from connection
+    /// construction). `None` if neither timer is armed.
     pub fn next_timeout(&self) -> Option<Duration> {
         let pto = self.endpoint.loss.next_deadline(Duration::ZERO);
         match (pto, self.idle_deadline()) {
