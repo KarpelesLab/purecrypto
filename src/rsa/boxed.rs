@@ -354,6 +354,41 @@ impl BoxedRsaPrivateKey {
         }
     }
 
+    /// Builds a private key from `n`, `e`, `d` **and** the prime factors
+    /// `p`/`q`, so base-blinding stays enabled (unlike
+    /// [`from_components`](Self::from_components), which drops the primes and
+    /// thus the blinding). Used by [`RsaPrivateKey::to_boxed`](crate::rsa::RsaPrivateKey::to_boxed)
+    /// to convert a fixed-size key without losing its side-channel protection.
+    ///
+    /// Like the other component constructors this performs **no validation**;
+    /// the components must already be a consistent, trusted key.
+    ///
+    /// # Panics
+    /// Panics if `n` is even or zero (the Montgomery precomputation requires an
+    /// odd modulus).
+    pub fn from_components_with_primes(
+        n: BoxedUint,
+        e: BoxedUint,
+        d: BoxedUint,
+        p: BoxedUint,
+        q: BoxedUint,
+    ) -> Self {
+        let k = n.bit_len().div_ceil(8);
+        let mont = BoxedMontModulus::new(&n);
+        let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+        BoxedRsaPrivateKey {
+            n,
+            e,
+            d,
+            p,
+            q,
+            mont,
+            k,
+            phi_n_minus_1,
+            blinding_seed,
+        }
+    }
+
     /// Generates a runtime-sized RSA key pair with a `bits`-bit modulus and
     /// public exponent `e` (commonly 65537). `bits` must be even; each prime is
     /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate.

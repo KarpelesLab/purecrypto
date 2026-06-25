@@ -358,6 +358,30 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         }
     }
 
+    /// Converts this fixed-size key into a runtime-sized
+    /// [`BoxedRsaPrivateKey`](super::BoxedRsaPrivateKey) — e.g. to wrap in an
+    /// [`AnyPrivateKey`](crate::x509::AnyPrivateKey) for certificate issuance —
+    /// directly, without a PKCS#1 DER round-trip. The prime factors are carried
+    /// over, so base-blinding stays enabled (a naive `n,e,d`-only copy would
+    /// silently disable it). The component limbs are copied via their
+    /// big-endian byte form; no ASN.1 encoding/parsing is involved.
+    #[cfg(feature = "alloc")]
+    pub fn to_boxed(&self) -> super::BoxedRsaPrivateKey {
+        use crate::bignum::BoxedUint;
+        let conv = |u: &Uint<LIMBS>| {
+            let mut bytes = alloc::vec![0u8; LIMBS * 8];
+            u.write_be_bytes(&mut bytes);
+            BoxedUint::from_be_bytes(&bytes)
+        };
+        super::BoxedRsaPrivateKey::from_components_with_primes(
+            conv(&self.n),
+            conv(&self.e),
+            conv(&self.d),
+            conv(&self.p),
+            conv(&self.q),
+        )
+    }
+
     /// The modulus `n`.
     #[inline]
     pub fn modulus(&self) -> &Uint<LIMBS> {
@@ -507,5 +531,26 @@ mod tests {
         let c = pubkey.raw(&m);
         assert_ne!(c, m);
         assert_eq!(key.raw(&c), m);
+    }
+
+    /// `to_boxed` produces a faithful runtime-sized key: a signature from the
+    /// converted key verifies under both the converted and the *original*
+    /// public key — proving n/e/d converted consistently — without a DER
+    /// round-trip, and (since p/q are carried over) base-blinding stays on.
+    #[cfg(feature = "der")]
+    #[test]
+    fn to_boxed_preserves_the_key() {
+        let fixed = crate::test_util::rsa_test_key_a();
+        let boxed = fixed.to_boxed();
+        let msg = b"to_boxed round-trip";
+        let sig = boxed.sign_pkcs1v15::<Sha256>(msg).unwrap();
+        boxed
+            .public_key()
+            .verify_pkcs1v15::<Sha256>(msg, &sig)
+            .unwrap();
+        fixed
+            .public_key()
+            .verify_pkcs1v15::<Sha256>(msg, &sig)
+            .unwrap();
     }
 }

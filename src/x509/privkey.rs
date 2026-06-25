@@ -101,6 +101,38 @@ impl<'a> Pkcs8ReadOptions<'a> {
 }
 
 impl AnyPrivateKey {
+    /// Borrows this key as a [`CertSigner`] for issuing certificates, CRLs, and
+    /// OCSP responses (e.g. via [`Certificate::self_signed_with_sans`] or
+    /// [`Certificate::self_signed_general`]).
+    ///
+    /// The signature variants (RSA, ECDSA, EdDSA, ML-DSA, SLH-DSA) map directly;
+    /// the key-agreement variants (X25519, X448) cannot produce signatures and
+    /// return [`Error::UnsupportedAlgorithm`].
+    ///
+    /// [`CertSigner`]: crate::x509::CertSigner
+    /// [`Certificate::self_signed_with_sans`]: crate::x509::Certificate::self_signed_with_sans
+    /// [`Certificate::self_signed_general`]: crate::x509::Certificate::self_signed_general
+    pub fn cert_signer(&self) -> Result<super::CertSigner<'_>, Error> {
+        use super::CertSigner;
+        Ok(match self {
+            AnyPrivateKey::Rsa(k) => CertSigner::Rsa(k),
+            AnyPrivateKey::Ecdsa(k) => CertSigner::Ecdsa(k),
+            AnyPrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
+            AnyPrivateKey::Ed448(k) => CertSigner::Ed448(k),
+            AnyPrivateKey::X25519(_) | AnyPrivateKey::X448(_) => {
+                return Err(Error::UnsupportedAlgorithm);
+            }
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa44(k) => CertSigner::MlDsa44(k),
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa65(k) => CertSigner::MlDsa65(k),
+            #[cfg(feature = "mldsa")]
+            AnyPrivateKey::MlDsa87(k) => CertSigner::MlDsa87(k),
+            #[cfg(feature = "slhdsa")]
+            AnyPrivateKey::SlhDsa(k) => CertSigner::SlhDsa(k),
+        })
+    }
+
     /// Parses a PKCS#8 private key from DER, returning the algorithm-specific
     /// variant. Handles both plaintext `PrivateKeyInfo` and PBES2
     /// `EncryptedPrivateKeyInfo` — the latter requires

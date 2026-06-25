@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 
 use super::extension::{self, Extension, GeneralName};
 use super::{
-    AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error, SignatureAlgId,
-    Validity, algorithm_identifier, oid,
+    AnyPrivateKey, AnyPublicKey, CertSigner, CertificationRequest, DistinguishedName, Error,
+    SignatureAlgId, Validity, algorithm_identifier, oid,
 };
 use crate::der::{
     Reader, encode_bit_string, encode_context, encode_integer, encode_sequence, parse_oid,
@@ -235,20 +235,24 @@ impl Certificate {
     }
 
     /// Issues a self-signed certificate carrying a `subjectAltName` with the
-    /// given dNSName entries.
-    pub fn self_signed_with_sans<const LIMBS: usize>(
-        key: &RsaPrivateKey<LIMBS>,
+    /// given dNSName entries, signed by any [`AnyPrivateKey`] capable of
+    /// signing (RSA, ECDSA, EdDSA, ML-DSA, SLH-DSA). A key-agreement key
+    /// (X25519, X448) returns [`Error::UnsupportedAlgorithm`].
+    pub fn self_signed_with_sans(
+        key: &AnyPrivateKey,
         subject: &DistinguishedName,
         validity: &Validity,
         serial: u64,
         is_ca: bool,
         dns_names: &[&str],
     ) -> Result<Certificate, Error> {
-        Self::issue_with_sans(
-            key,
+        let signer = key.cert_signer()?;
+        let subject_key = signer.public_key();
+        Self::issue_general(
+            &signer,
             subject,
             subject,
-            &key.public_key(),
+            &subject_key,
             validity,
             serial,
             is_ca,
@@ -1838,7 +1842,7 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
 
     #[test]
     fn subject_alt_name_roundtrip() {
-        let key = rsa_test_key_a();
+        let key = AnyPrivateKey::Rsa(rsa_test_key_a().to_boxed());
         let cert = Certificate::self_signed_with_sans(
             &key,
             &DistinguishedName::common_name("ignored-cn"),
@@ -1853,6 +1857,44 @@ RENTjAEB2yR6Dd5XY5jNxLqSJH4fJUKeGH8lMauQh7YCIGf8bBLXdk+nCnKjuiZw\n\
             cert.subject_alt_names().unwrap(),
             ["example.com", "*.example.com", "localhost"]
         );
+    }
+
+    /// `self_signed_with_sans` now accepts any signing [`AnyPrivateKey`], not
+    /// just RSA: an Ed25519 key issues a SAN certificate, while a key-agreement
+    /// key (X25519) is rejected as it cannot sign.
+    #[test]
+    fn self_signed_with_sans_accepts_non_rsa_and_rejects_key_agreement() {
+        use crate::ec::{Ed25519PrivateKey, X25519PrivateKey};
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let mut rng = HmacDrbg::<Sha256>::new(b"cert-sans-nonrsa", b"nonce", &[]);
+
+        let ed = AnyPrivateKey::Ed25519(Ed25519PrivateKey::generate(&mut rng));
+        let cert = Certificate::self_signed_with_sans(
+            &ed,
+            &DistinguishedName::common_name("cn"),
+            &validity(),
+            1,
+            false,
+            &["ed.example"],
+        )
+        .unwrap();
+        cert.check_well_formed().unwrap();
+        assert_eq!(cert.subject_alt_names().unwrap(), ["ed.example"]);
+
+        let x = AnyPrivateKey::X25519(X25519PrivateKey::generate(&mut rng));
+        assert!(matches!(x.cert_signer(), Err(Error::UnsupportedAlgorithm)));
+        assert!(matches!(
+            Certificate::self_signed_with_sans(
+                &x,
+                &DistinguishedName::common_name("cn"),
+                &validity(),
+                1,
+                false,
+                &[],
+            ),
+            Err(Error::UnsupportedAlgorithm)
+        ));
     }
 
     // An OpenSSL-issued P-384 self-signed certificate (ecdsa-with-SHA384) —

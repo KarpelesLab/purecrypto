@@ -1368,10 +1368,11 @@ mod tests {
 
     #[test]
     fn hostname_san_and_cn() {
-        let key = rsa_test_key_a();
+        let rsa_key = rsa_test_key_a();
+        let any_key = crate::x509::AnyPrivateKey::Rsa(rsa_key.to_boxed());
         // SAN cert: matches SAN entries (incl. wildcard), ignores CN.
         let san_cert = Certificate::self_signed_with_sans(
-            &key,
+            &any_key,
             &DistinguishedName::common_name("ignored"),
             &validity(),
             1,
@@ -1388,7 +1389,7 @@ mod tests {
 
         // No SAN: falls back to the subject common name.
         let cn_cert = Certificate::self_signed(
-            &key,
+            &rsa_key,
             &DistinguishedName::common_name("host.example"),
             &validity(),
             2,
