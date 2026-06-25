@@ -2637,6 +2637,13 @@ impl ClientConnection {
             // RFC 8446 §4.3.2: certificate_request_context is empty in
             // handshake auth; we ignore the extensions list contents (just
             // parse for structure) and remember that the server asked.
+            // RFC 8446 §4.3.2: at most one CertificateRequest precedes the
+            // server `Certificate` in the handshake flow. A second one here
+            // is a protocol violation — reject it like any other unexpected
+            // message rather than letting it grow the transcript.
+            if self.cert_request_received {
+                return Err(Error::UnexpectedMessage);
+            }
             let mut c = ReadCursor::new(body);
             let _ctx = c.vec_u8()?;
             let _exts = c.vec_u16()?;
