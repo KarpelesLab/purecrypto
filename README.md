@@ -54,34 +54,34 @@ Single crate, modules gated by Cargo features:
 
 | Layer            | Module      | Status |
 | ---------------- | ----------- | ------ |
-| Constant-time    | `ct`        | ✅ implemented |
-| Hashing          | `hash`      | ✅ SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
-| Randomness       | `rng`       | ✅ RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | ✅ AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon`, AEZ v5 (robust AE) in `aez` |
-| MAC              | `mac`       | ✅ AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
-| Bignum (CT)      | `bignum`    | ✅ `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
-| Asymmetric keys  | `rsa`       | ✅ RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
-| Key derivation   | `kdf`       | ✅ PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106), SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF) |
-| Elliptic curve   | `ec`        | ✅ ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032), SM2 signature + encryption (GB/T 32918 / RFC 8998) |
-| Prime-order group | `ristretto255` | ✅ ristretto255 (RFC 9496), a stable prime-order group API; low-level scalar/point arithmetic for threshold/FROST callers also exposed via `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` (**no semver guarantee** on `hazmat-*`) |
-| Post-quantum KEM | `mlkem`     | ✅ ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
-| Post-quantum sig | `mldsa`     | ✅ ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
-| Post-quantum sig | `slhdsa`    | ✅ SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
-| Stateful HBS     | `lms`       | ✅ LMS / HSS (RFC 8554, NIST SP 800-208); LM-OTS W{1,2,4,8} × LMS H{5,10,15,20,25}; **stateful** advancing key; RFC 8554 KATs |
-| Stateful HBS     | `xmss`      | ✅ XMSS / XMSS^MT (RFC 8391, NIST SP 800-208); **stateful** advancing key; RFC 8391 / reference KATs |
-| Lightweight      | `ascon`     | ✅ Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / XOF128 / CXOF128 from one 320-bit permutation |
-| Diffie-Hellman   | `dh`        | ✅ Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
-| Unified keys     | `key`       | ✅ object-safe `PrivateKey`/`PublicKey` facade — `sign`/`decrypt`/`agree`, `verify`/`encrypt` — over every asymmetric key, with consume-checked params (unsupported params fail loudly) and generic PKCS#8/SPKI decoders (`AnyPrivateKey`/`AnyPublicKey`, which are facade keys themselves); stateful XMSS/LMS via `StatefulSigner`, KEMs via `Encapsulator`/`Decapsulator` |
-| ASN.1 / DER      | `der`       | ✅ DER reader/writer, base64, PEM |
-| X.509            | `x509`      | ✅ self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
-| TLS              | `tls`       | ✅ TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/Ed448/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
-| HPKE             | `hpke`     | ✅ RFC 9180 hybrid public-key encryption — 4 KEMs × 3 KDFs × 3 AEADs + ExportOnly, all four modes (Base/PSK/Auth/AuthPSK) |
-| ECH              | `ech`      | ✅ draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
-| QUIC             | `quic`     | ✅ QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
-| Cert compression | `cert-compression` | ✅ RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
+| Constant-time    | `ct`        | implemented |
+| Hashing          | `hash`      | SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
+| Randomness       | `rng`       | RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
+| Symmetric cipher | `cipher`    | AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon`, AEZ v5 (robust AE) in `aez` |
+| MAC              | `mac`       | AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
+| Bignum (CT)      | `bignum`    | `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
+| Asymmetric keys  | `rsa`       | RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
+| Key derivation   | `kdf`       | PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106), SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF) |
+| Elliptic curve   | `ec`        | ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032), SM2 signature + encryption (GB/T 32918 / RFC 8998) |
+| Prime-order group | `ristretto255` | ristretto255 (RFC 9496), a stable prime-order group API; low-level scalar/point arithmetic for threshold/FROST callers also exposed via `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` (**no semver guarantee** on `hazmat-*`) |
+| Post-quantum KEM | `mlkem`     | ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
+| Post-quantum sig | `mldsa`     | ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
+| Post-quantum sig | `slhdsa`    | SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
+| Stateful HBS     | `lms`       | LMS / HSS (RFC 8554, NIST SP 800-208); LM-OTS W{1,2,4,8} × LMS H{5,10,15,20,25}; **stateful** advancing key; RFC 8554 KATs |
+| Stateful HBS     | `xmss`      | XMSS / XMSS^MT (RFC 8391, NIST SP 800-208); **stateful** advancing key; RFC 8391 / reference KATs |
+| Lightweight      | `ascon`     | Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / XOF128 / CXOF128 from one 320-bit permutation |
+| Diffie-Hellman   | `dh`        | Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
+| Unified keys     | `key`       | object-safe `PrivateKey`/`PublicKey` facade — `sign`/`decrypt`/`agree`, `verify`/`encrypt` — over every asymmetric key, with consume-checked params (unsupported params fail loudly) and generic PKCS#8/SPKI decoders (`AnyPrivateKey`/`AnyPublicKey`, which are facade keys themselves); stateful XMSS/LMS via `StatefulSigner`, KEMs via `Encapsulator`/`Decapsulator` |
+| ASN.1 / DER      | `der`       | DER reader/writer, base64, PEM |
+| X.509            | `x509`      | self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
+| TLS              | `tls`       | TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/Ed448/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
+| HPKE             | `hpke`     | RFC 9180 hybrid public-key encryption — 4 KEMs × 3 KDFs × 3 AEADs + ExportOnly, all four modes (Base/PSK/Auth/AuthPSK) |
+| ECH              | `ech`      | draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
+| QUIC             | `quic`     | QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
+| Cert compression | `cert-compression` | RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
 | Legacy TLS       | `tls-legacy` | ⚠️ **deprecated/insecure, off by default** — SSL 3.0 / TLS 1.0 / TLS 1.1 (RFC 8996) with CBC MAC-then-encrypt suites (`TLS_RSA_*` static-RSA + `TLS_ECDHE_RSA_*` over AES-CBC-SHA/SHA256 + 3DES), client + server. Last-resort interop only (e.g. VoIP-phone provisioning); requires lowering `Config::min_version`. BEAST 1/n-1 split + constant-time CBC decrypt, but MD5/SHA-1 PRF, Lucky13 residual, and SSLv3 POODLE remain — do not use against modern peers. |
-| C ABI            | `ffi`       | ✅ hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS / QUIC (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
-| CLI              | (binary)    | ✅ `hash`/`dgst`, `mac`, `kdf`, `enc`, `rand`, `genpkey` (classical + PQ), `pkey`, `pkeyutl`, `kem`, `kex`, `req`, `x509`, `ca`, `crl`, `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server`, `q_client`, `q_server` |
+| C ABI            | `ffi`       | hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS / QUIC (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
+| CLI              | (binary)    | `hash`/`dgst`, `mac`, `kdf`, `enc`, `rand`, `genpkey` (classical + PQ), `pkey`, `pkeyutl`, `kem`, `kex`, `req`, `x509`, `ca`, `crl`, `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server`, `q_client`, `q_server` |
 
 ## CLI + C-API coverage matrix
 
@@ -559,23 +559,23 @@ primitive purecrypto can do appears as a registry entry; a strict whitelist
 | `id` (whitelist key)        | X.509 OID                       | TLS 1.3 scheme | Default `modern()` |
 | --------------------------- | ------------------------------- | -------------- | ------------------ |
 | `rsa-pkcs1-sha1`            | `1.2.840.113549.1.1.5`          | (none)         | opt-in |
-| `rsa-pkcs1-sha256`          | `1.2.840.113549.1.1.11`         | `0x0401`       | ✅ |
-| `rsa-pkcs1-sha384`          | `1.2.840.113549.1.1.12`         | `0x0501`       | ✅ |
+| `rsa-pkcs1-sha256`          | `1.2.840.113549.1.1.11`         | `0x0401`       | |
+| `rsa-pkcs1-sha384`          | `1.2.840.113549.1.1.12`         | `0x0501`       | |
 | `rsa-pkcs1-sha512`          | `1.2.840.113549.1.1.13`         | (none)         | opt-in |
-| `rsa-pss-rsae-sha256`       | `1.2.840.113549.1.1.11` (RSAE)  | `0x0804`       | ✅ |
-| `rsa-pss-rsae-sha384`       | `1.2.840.113549.1.1.12` (RSAE)  | `0x0805`       | ✅ |
-| `rsa-pss-rsae-sha512`       | `1.2.840.113549.1.1.13` (RSAE)  | `0x0806`       | ✅ |
+| `rsa-pss-rsae-sha256`       | `1.2.840.113549.1.1.11` (RSAE)  | `0x0804`       | |
+| `rsa-pss-rsae-sha384`       | `1.2.840.113549.1.1.12` (RSAE)  | `0x0805`       | |
+| `rsa-pss-rsae-sha512`       | `1.2.840.113549.1.1.13` (RSAE)  | `0x0806`       | |
 | `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (PSS-keys) | (none)      | opt-in |
-| `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | ✅ |
-| `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | ✅ |
-| `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | ✅ |
-| `ecdsa-secp256r1-sha256`    | (TLS-only — strict curve)       | `0x0403`       | ✅ |
-| `ecdsa-secp384r1-sha384`    | (TLS-only — strict curve)       | `0x0503`       | ✅ |
-| `ecdsa-secp521r1-sha512`    | (TLS-only — strict curve)       | `0x0603`       | ✅ |
+| `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | |
+| `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | |
+| `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | |
+| `ecdsa-secp256r1-sha256`    | (TLS-only — strict curve)       | `0x0403`       | |
+| `ecdsa-secp384r1-sha384`    | (TLS-only — strict curve)       | `0x0503`       | |
+| `ecdsa-secp521r1-sha512`    | (TLS-only — strict curve)       | `0x0603`       | |
 | `ecdsa-secp256r1-sha384/512`, `ecdsa-secp384r1-sha256/512`, `ecdsa-secp521r1-sha256/384` | cross-hash, policy-only | (none) | opt-in |
 | `ecdsa-secp256k1-sha256/384/512` | secp256k1, policy-only      | (none)         | opt-in |
-| `ed25519`                   | `1.3.101.112`                   | `0x0807`       | ✅ |
-| `ml-dsa-44` / `-65` / `-87` | `2.16.840.1.101.3.4.3.17/18/19` | `0x0904/05/06` | ✅ (NIST FIPS 204) |
+| `ed25519`                   | `1.3.101.112`                   | `0x0807`       | |
+| `ml-dsa-44` / `-65` / `-87` | `2.16.840.1.101.3.4.3.17/18/19` | `0x0904/05/06` | (NIST FIPS 204) |
 | `slh-dsa-sha2-128s/128f/192s/192f/256s/256f`, `slh-dsa-shake-128s/128f/192s/192f/256s/256f` | `2.16.840.1.101.3.4.3.20..31` | (none) | opt-in (FIPS 205) |
 
 The matched-curve / matched-hash ECDSA pairs (e.g. P-256 + SHA-256) have IANA
