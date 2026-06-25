@@ -266,14 +266,27 @@ impl FalconPublicKey {
             _ => return Err(Error::Malformed),
         }
 
+        let is_padded = header & 0xF0 == 0x30;
+
         let nonce = &sig[1..1 + NONCE_LEN];
         let s_bytes = &sig[1 + NONCE_LEN..];
 
         // --- Decompress s -> s2 (n signed coefficients), canonical. ---
-        let s2 = match decompress(s_bytes, n) {
+        let (s2, consumed_bits) = match decompress(s_bytes, n) {
             Some(v) => v,
             None => return Ok(false),
         };
+
+        // Canonical encoding (unpadded only): the padded format legitimately
+        // zero-pads `s` up to a fixed length, but the unpadded format is
+        // variable-length, so a whole unused trailing byte means the signature
+        // carries surplus bytes. Appending `0x00` bytes leaves the residual-bit
+        // check (in `decompress`) satisfied yet changes the encoding, giving one
+        // (message, key) pair multiple valid byte-encodings (malleability).
+        // Reject when a full unused trailing byte remains.
+        if !is_padded && s_bytes.len() * 8 - consumed_bits >= 8 {
+            return Ok(false);
+        }
 
         // --- c = HashToPoint(nonce || msg). ---
         let c = hash_to_point(nonce, msg, n);
@@ -368,8 +381,10 @@ fn poly_mul_mod_q(a: &[i16], b: &[u16], n: usize) -> Vec<u16> {
 ///
 /// `s_bytes` is the byte region following the nonce in the signature; the bit
 /// length `slen = 8·sbytelen − 328` is therefore `8 · s_bytes.len()`. Returns
-/// `None` (the spec's `⊥`) on any malformed / non-canonical input.
-fn decompress(s_bytes: &[u8], n: usize) -> Option<Vec<i16>> {
+/// `None` (the spec's `⊥`) on any malformed / non-canonical input, otherwise the
+/// `n` coefficients and the number of bits consumed by the coefficient encoding
+/// (i.e. excluding the trailing zero-padding bits the caller may further gate).
+fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
     // A bit cursor over `s_bytes`, MSB-first within each byte.
     let total_bits = s_bytes.len() * 8;
     let mut pos = 0usize;
@@ -427,6 +442,10 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<Vec<i16>> {
         out.push(val as i16);
     }
 
+    // Bits consumed by the coefficient encoding proper, before the trailing
+    // zero-padding the caller may additionally constrain.
+    let consumed_bits = pos;
+
     // Canonical: every remaining bit must be zero (Alg 18 lines 12-13).
     while pos < total_bits {
         if get_bit(s_bytes, &mut pos)? != 0 {
@@ -434,7 +453,7 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<Vec<i16>> {
         }
     }
 
-    Some(out)
+    Some((out, consumed_bits))
 }
 
 /// A Falcon secret key: the NTRU polynomials `(f, g, F, G)`, the public key

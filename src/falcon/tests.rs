@@ -374,6 +374,43 @@ fn rejects_truncated_inputs_without_panic() {
 }
 
 #[test]
+fn falcon512_unpadded_rejects_extra_trailing_zero_byte() {
+    // The unpadded (compressed) format is variable-length: a whole unused
+    // trailing 0x00 byte is surplus and must be rejected as non-canonical,
+    // otherwise one (message, key) pair has multiple valid byte-encodings
+    // (malleability). The original signature must still verify.
+    let pk = f512_c1_pk();
+    let msg = f512_c1_msg();
+    let sig = f512_c1_sig();
+    assert!(verify(&pk, &msg, &sig), "original unpadded sig must verify");
+
+    let mut padded = sig.clone();
+    padded.push(0x00);
+    // Stays within the padded length bound, so it reaches decompression.
+    assert!(padded.len() <= super::Degree::Falcon512.sig_len());
+    assert!(
+        !verify(&pk, &msg, &padded),
+        "unpadded sig with an extra trailing zero byte must be rejected"
+    );
+}
+
+#[test]
+fn falcon1024_unpadded_rejects_extra_trailing_zero_byte() {
+    let pk = f1024_c1_pk();
+    let msg = f1024_c1_msg();
+    let sig = f1024_c1_sig();
+    assert!(verify(&pk, &msg, &sig), "original unpadded sig must verify");
+
+    let mut padded = sig.clone();
+    padded.push(0x00);
+    assert!(padded.len() <= super::Degree::Falcon1024.sig_len());
+    assert!(
+        !verify(&pk, &msg, &padded),
+        "unpadded sig with an extra trailing zero byte must be rejected"
+    );
+}
+
+#[test]
 fn rejects_malformed_pk_header() {
     let mut pk = f512_pk();
     pk[0] = 0xFF; // top nibble nonzero + bad logn
