@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.22](https://github.com/KarpelesLab/purecrypto/compare/v0.6.21...v0.6.22) - 2026-06-25
+
+### Other
+
+- fix a broken intra-doc link in next_timeout's docs
+- self_signed_with_sans accepts any signing key, not just RSA
+- read & set IP ECN on the QUIC sockets (Linux)
+- implement ECN — counting, ACK echo, CE reaction, validation
+- wire ech_outer_extensions compression into the handshake
+- drive q_server through the QuicServer router
+- add a QuicServer connection router with stateless-reset emission
+- derive stateless-reset tokens from a static key (RFC 9000 §10.3.1)
+- send a RawPublicKey client certificate for mTLS (RFC 7250 §4.4)
+- implement the RFC 9000 §10.1 idle timeout
+- expose exporter, 0-RTT send, and resumption on the public Connection
+- fix stale claims found in the documentation audit
+- *(quic)* correct stale "Phase 4" capability claims in connection.rs
+- let Miri run the getrandom path via the /dev/urandom fallback
+
 ## [0.6.21](https://github.com/KarpelesLab/purecrypto/compare/v0.6.20...v0.6.21) - 2026-06-24
 
 ### Other
