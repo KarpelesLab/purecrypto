@@ -42,6 +42,8 @@ use alloc::vec::Vec;
 const KU_DIGITAL_SIGNATURE: u16 = 0x80; // bit 0 in BIT STRING wire order = MSB of byte 0
 /// `keyUsage` bit-5 `keyCertSign`.
 const KU_KEY_CERT_SIGN: u16 = 0x04;
+/// `keyUsage` bit-6 `cRLSign` (RFC 5280 §4.2.1.3 / §6.3.3).
+const KU_CRL_SIGN: u16 = 0x02;
 
 /// Upper bound on the length of a peer-supplied certificate chain. Each cert
 /// triggers a signature verification (RSA / ECDSA / PQ) plus repeated DN
@@ -226,7 +228,10 @@ fn verify_chain_inner(
         if let Some(anchor) = anchored {
             // Path closes here: certs[0..=i] is the validated path. certs[i]
             // may still be revoked by a CRL signed by the anchor.
-            check_revocation(&certs[i], &anchor.key, crls, now, policy)?;
+            // The anchor's full certificate is not retained by the store, so
+            // its keyUsage cannot be consulted here (RFC 5280 excludes the
+            // trust anchor from constraint processing anyway, §6.1).
+            check_revocation(&certs[i], &anchor.key, None, crls, now, policy)?;
             anchor_at = Some(i + 1);
             matched_anchor = Some(anchor);
             break;
@@ -245,7 +250,7 @@ fn verify_chain_inner(
         if names_differ(&certs[i], issuer)? {
             return Err(Error::BadCertificate);
         }
-        check_revocation(&certs[i], &issuer_key, crls, now, policy)?;
+        check_revocation(&certs[i], &issuer_key, Some(issuer), crls, now, policy)?;
     }
 
     // `anchor_at` is set whenever control reaches here: the loop either records
@@ -316,9 +321,18 @@ fn verify_chain_inner(
 /// is treated as "not covering" — advisory behavior. CRLs that fail their
 /// own signature verification under the issuer key are silently skipped
 /// (an attacker cannot make us reject a chain by injecting a forged CRL).
+///
+/// When `issuer_cert` is supplied (in-chain issuer; absent for a trust
+/// anchor, whose full certificate the store does not retain), RFC 5280
+/// §6.3.3 requires that a key used to sign a CRL assert the `cRLSign`
+/// keyUsage bit when a keyUsage extension is present. An issuer that carries
+/// keyUsage *without* `cRLSign` cannot validly sign a CRL, so any matching
+/// CRL is skipped (fail closed, exactly as the invalid-signature path does)
+/// rather than being given the deciding vote.
 fn check_revocation(
     cert: &Certificate,
     issuer_key: &AnyPublicKey,
+    issuer_cert: Option<&Certificate>,
     crls: &CrlStore,
     now: Option<&Time>,
     policy: &SignaturePolicy,
@@ -342,6 +356,17 @@ fn check_revocation(
         }
         // Skip CRLs not signed by this issuer.
         if crl.verify_signature_with(issuer_key).is_err() {
+            continue;
+        }
+        // RFC 5280 §6.3.3: a key used to sign a CRL MUST assert `cRLSign` in
+        // its keyUsage extension when one is present. An issuer cert that
+        // carries keyUsage without `cRLSign` cannot validly sign this CRL —
+        // skip it (fail closed, same as a forged-signature CRL) rather than
+        // honoring its revocation verdict.
+        if let Some(issuer) = issuer_cert
+            && let Some(mask) = issuer.key_usage().map_err(|_| Error::BadCertificate)?
+            && (mask & KU_CRL_SIGN) == 0
+        {
             continue;
         }
         // Skip CRLs that are not currently valid (advisory: stale CRL ≈ no CRL).
@@ -1754,6 +1779,179 @@ mod tests {
         crls.add_der(crl.to_der().to_vec()).unwrap();
 
         verify_chain_with_crls(&store, &crls, &[leaf.to_der().to_vec()], None, &policy()).unwrap();
+    }
+
+    /// RFC 5280 §6.3.3: a key used to sign a CRL must assert `cRLSign` in its
+    /// keyUsage extension when one is present. An intermediate CA that carries
+    /// keyUsage with `keyCertSign` but WITHOUT `cRLSign` cannot validly sign a
+    /// CRL, so a CRL it signs revoking the leaf must be ignored — the chain
+    /// still validates. The companion `crl_with_crlsign_issuer_revokes` test
+    /// confirms an issuer that *does* assert `cRLSign` revokes as expected.
+    #[test]
+    fn crl_issuer_without_crlsign_is_ignored() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{
+            CertSigner, CrlBuilder, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"crlsign-ku", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+
+        let root_name = DistinguishedName::common_name("crlku-root");
+        let int_name = DistinguishedName::common_name("crlku-int");
+        let leaf_name = DistinguishedName::common_name("crlku-leaf");
+
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+
+        // Intermediate CA: keyCertSign is set (so it may sign the leaf) but
+        // cRLSign is deliberately omitted.
+        let int_pub = crate::x509::AnyPublicKey::Ecdsa(int_key.public_key());
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &int_pub,
+            &validity(),
+            2,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN),
+            ],
+        )
+        .unwrap();
+
+        let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &leaf_name,
+            &leaf_pub,
+            &validity(),
+            77,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+            ],
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        // The intermediate signs a CRL revoking the leaf (serial 77). Because
+        // the intermediate lacks cRLSign, RFC 5280 §6.3.3 says it is not a
+        // valid CRL signer, so the CRL is skipped and the leaf is NOT revoked.
+        let mut b = CrlBuilder::new(&int_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[77], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&int_signer).unwrap();
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()).unwrap();
+    }
+
+    /// Sanity counterpart to `crl_issuer_without_crlsign_is_ignored`: the same
+    /// chain shape, but the intermediate asserts `cRLSign`, so its CRL is
+    /// honored and the leaf is revoked.
+    #[test]
+    fn crl_with_crlsign_issuer_revokes() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{
+            CertSigner, CrlBuilder, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"crlsign-ok", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let int_signer = CertSigner::Ecdsa(&int_key);
+
+        let root_name = DistinguishedName::common_name("crlok-root");
+        let int_name = DistinguishedName::common_name("crlok-int");
+        let leaf_name = DistinguishedName::common_name("crlok-leaf");
+
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+
+        let int_pub = crate::x509::AnyPublicKey::Ecdsa(int_key.public_key());
+        let int = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &int_name,
+            &int_pub,
+            &validity(),
+            2,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+
+        let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+        let leaf = Certificate::issue_with_extensions(
+            &int_signer,
+            &int_name,
+            &leaf_name,
+            &leaf_pub,
+            &validity(),
+            77,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+            ],
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+
+        let mut b = CrlBuilder::new(&int_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.revoke(&[77], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let crl = b.sign(&int_signer).unwrap();
+        let mut crls = CrlStore::new();
+        crls.add_der(crl.to_der().to_vec()).unwrap();
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![leaf.to_der().to_vec(), int.to_der().to_vec()];
+        assert!(matches!(
+            verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
     }
 
     /// A chain whose signature algorithm is in the registry but not on the
