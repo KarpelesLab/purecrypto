@@ -745,7 +745,12 @@ macro_rules! ml_dsa_level {
     ) => {
         $(#[$km])*
         #[derive(Clone)]
-        pub struct $sk(Vec<u8>);
+        // Field 0 is the FIPS 204 expanded secret key. Field 1 is the 32-byte
+        // generation seed ξ, retained when known so the PKCS#8 encoder can emit
+        // the LAMPS `both` (seed-priv) form OpenSSL 3.5 writes by default; `None`
+        // for keys imported from expanded bytes, which can only re-emit
+        // `expandedKey`.
+        pub struct $sk(Vec<u8>, Option<[u8; SEED_SIZE]>);
 
         #[doc = concat!("An ", stringify!($kind), " public (verification) key.")]
         #[derive(Clone, PartialEq, Eq, Debug)]
@@ -755,7 +760,7 @@ macro_rules! ml_dsa_level {
             /// Deterministically derives a key pair from a 32-byte seed.
             pub fn from_seed(seed: &[u8; SEED_SIZE]) -> ($sk, $pk) {
                 let (pk, sk) = keygen::<$k, $l>(seed, &$params);
-                ($sk(sk), $pk(pk))
+                ($sk(sk, Some(*seed)), $pk(pk))
             }
 
             /// Generates a fresh key pair from `rng`. The RNG must be a
@@ -764,9 +769,10 @@ macro_rules! ml_dsa_level {
                 let mut seed = [0u8; SEED_SIZE];
                 rng.fill_bytes(&mut seed);
                 let pair = Self::from_seed(&seed);
-                // Wipe the seed before it drops — it alone reconstructs the
-                // whole key; `black_box` keeps the writes from being
-                // eliminated as dead stores.
+                // The returned key retains its own copy of the seed (zeroized on
+                // drop) so it can be exported in the LAMPS seed-priv PKCS#8 form;
+                // wipe this local copy regardless. `black_box` keeps the writes
+                // from being eliminated as dead stores.
                 for b in seed.iter_mut() {
                     *b = 0;
                 }
@@ -821,18 +827,32 @@ macro_rules! ml_dsa_level {
             /// `sign` call cannot panic on a malformed buffer.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
                 validate_sk_ranges::<$k, $l>(bytes, &$params)?;
-                Ok($sk(bytes.to_vec()))
+                Ok($sk(bytes.to_vec(), None))
             }
 
-            /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER. The
-            /// `privateKey` OCTET STRING holds the raw expanded key bytes
-            /// (purecrypto's own format).
+            /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER.
+            ///
+            /// The `privateKey` OCTET STRING carries the LAMPS
+            /// `ML-DSA-PrivateKey` CHOICE
+            /// (draft-ietf-lamps-dilithium-certificates): the `both`
+            /// `SEQUENCE { seed, expandedKey }` form when the 32-byte seed ξ is
+            /// known (byte-for-byte identical to OpenSSL 3.5's default
+            /// `seed-priv` output), or the `expandedKey` OCTET STRING form for
+            /// keys imported from expanded bytes. OpenSSL 3.5 loads both.
             #[cfg(feature = "der")]
             pub fn to_pkcs8_der(&self) -> Vec<u8> {
                 use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+                let inner = match &self.1 {
+                    // both ::= SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
+                    Some(seed) => encode_sequence(
+                        &[encode_octet_string(seed), encode_octet_string(&self.0)].concat(),
+                    ),
+                    // expandedKey ::= OCTET STRING
+                    None => encode_octet_string(&self.0),
+                };
                 let algid = encode_sequence(&oid_tlv($oid));
                 encode_sequence(
-                    &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
+                    &[encode_integer(&[0]), algid, encode_octet_string(&inner)].concat(),
                 )
             }
 
@@ -842,8 +862,14 @@ macro_rules! ml_dsa_level {
                 crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
             }
 
-            /// Parses a PKCS#8 `PrivateKeyInfo` DER, expecting the raw expanded
-            /// key bytes in the `privateKey` OCTET STRING.
+            /// Parses a PKCS#8 `PrivateKeyInfo` DER.
+            ///
+            /// Accepts every LAMPS `ML-DSA-PrivateKey` CHOICE alternative in the
+            /// `privateKey` OCTET STRING — `seed [0]`, `expandedKey`, and `both`
+            /// (so OpenSSL 3.5's default `seed-priv` keys load) — plus the legacy
+            /// untagged raw-expanded encoding purecrypto previously emitted. For
+            /// the `both` form the seed is regenerated and checked against the
+            /// supplied expanded key, which is rejected on mismatch.
             #[cfg(feature = "der")]
             pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
                 use crate::der::{Reader, parse_oid};
@@ -857,7 +883,51 @@ macro_rules! ml_dsa_level {
                     return Err(Error::Malformed);
                 }
                 let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
-                Self::from_bytes(inner)
+
+                // Legacy fast-path: the historical encoding was the raw expanded
+                // key with no inner CHOICE tag. Its length is exactly `privkey`,
+                // which can never equal a tagged alternative (those add ≥2 bytes
+                // of tag+length), so the length alone disambiguates.
+                if inner.len() == $params.privkey {
+                    return Self::from_bytes(inner);
+                }
+
+                let mut cr = Reader::new(inner);
+                match cr.peek_tag() {
+                    // expandedKey ::= OCTET STRING
+                    Some(0x04) => {
+                        let expanded = cr.read_octet_string().map_err(|_| Error::Malformed)?;
+                        Self::from_bytes(expanded)
+                    }
+                    // seed ::= [0] IMPLICIT OCTET STRING (SIZE (32))
+                    Some(0x80) => {
+                        let seed = cr.read_tlv(0x80).map_err(|_| Error::Malformed)?;
+                        let seed: [u8; SEED_SIZE] =
+                            seed.try_into().map_err(|_| Error::Malformed)?;
+                        Ok(Self::from_seed(&seed).0)
+                    }
+                    // both ::= SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
+                    Some(0x30) => {
+                        let mut both = cr.read_sequence().map_err(|_| Error::Malformed)?;
+                        let seed = both.read_octet_string().map_err(|_| Error::Malformed)?;
+                        let expanded = both.read_octet_string().map_err(|_| Error::Malformed)?;
+                        let seed: [u8; SEED_SIZE] =
+                            seed.try_into().map_err(|_| Error::Malformed)?;
+                        let key = Self::from_seed(&seed).0;
+                        // LAMPS: when both are present the recipient MUST reject a
+                        // seed/expandedKey pair that is inconsistent. (Length check
+                        // guards `ct_eq`'s zip from silently truncating.)
+                        if key.0.len() != expanded.len()
+                            || !bool::from(<[u8] as crate::ct::ConstantTimeEq>::ct_eq(
+                                &key.0, expanded,
+                            ))
+                        {
+                            return Err(Error::Malformed);
+                        }
+                        Ok(key)
+                    }
+                    _ => Err(Error::Malformed),
+                }
             }
 
             /// Parses a PKCS#8 PEM private key.
@@ -921,6 +991,14 @@ macro_rules! ml_dsa_level {
                     *b = 0;
                 }
                 let _ = core::hint::black_box(&self.0);
+                // The retained generation seed reconstructs the whole key, so it
+                // is just as sensitive — wipe it too.
+                if let Some(seed) = &mut self.1 {
+                    for b in seed.iter_mut() {
+                        *b = 0;
+                    }
+                    let _ = core::hint::black_box(&seed);
+                }
             }
         }
 
@@ -1153,6 +1231,131 @@ mod tests {
         let d2 = sk.sign_deterministic(b"abc", b"").unwrap();
         assert_eq!(d1, d2);
         assert!(pk.verify(&d1, b"abc", b""));
+    }
+
+    /// ML-DSA-44 OID, for hand-building PKCS#8 CHOICE alternatives in tests.
+    #[cfg(feature = "der")]
+    const TEST_OID_44: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 3, 17];
+
+    /// Wraps an already-encoded `privateKey` CHOICE body in a PKCS#8
+    /// `PrivateKeyInfo` carrying the ML-DSA-44 OID.
+    #[cfg(feature = "der")]
+    fn wrap_pkcs8_44(inner: &[u8]) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&oid_tlv(TEST_OID_44));
+        encode_sequence(&[encode_integer(&[0]), algid, encode_octet_string(inner)].concat())
+    }
+
+    /// Returns the first byte of the `privateKey` OCTET STRING content (the
+    /// inner CHOICE tag) of a PKCS#8 DER.
+    #[cfg(feature = "der")]
+    fn inner_tag(der: &[u8]) -> u8 {
+        use crate::der::Reader;
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().unwrap();
+        seq.read_integer_bytes().unwrap();
+        seq.read_sequence().unwrap();
+        seq.read_octet_string().unwrap()[0]
+    }
+
+    /// A generated key retains its seed and emits the LAMPS `both` form; an
+    /// expanded-only import emits `expandedKey`. Both round-trip and re-emit
+    /// identically.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_emits_both_or_expandedkey_and_roundtrips() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-pkcs8", b"nonce", &[]);
+        let (sk, pk) = MlDsa44PrivateKey::generate(&mut rng);
+
+        // Generated -> both (inner SEQUENCE, tag 0x30).
+        let der_both = sk.to_pkcs8_der();
+        assert_eq!(inner_tag(&der_both), 0x30);
+        let back = MlDsa44PrivateKey::from_pkcs8_der(&der_both).unwrap();
+        assert_eq!(
+            back.to_pkcs8_der(),
+            der_both,
+            "both must re-emit identically"
+        );
+        let sig = back.sign_deterministic(b"m", b"").unwrap();
+        assert!(pk.verify(&sig, b"m", b""));
+
+        // from_bytes drops the seed -> expandedKey (inner OCTET STRING, tag 0x04),
+        // shorter than the both form.
+        let imported = MlDsa44PrivateKey::from_bytes(sk.to_bytes()).unwrap();
+        let der_exp = imported.to_pkcs8_der();
+        assert_eq!(inner_tag(&der_exp), 0x04);
+        assert!(der_exp.len() < der_both.len());
+        let back2 = MlDsa44PrivateKey::from_pkcs8_der(&der_exp).unwrap();
+        assert_eq!(back2.to_bytes(), sk.to_bytes());
+        assert_eq!(back2.to_pkcs8_der(), der_exp);
+    }
+
+    /// The decoder accepts the seed-only `[0]` form and the legacy untagged
+    /// raw-expanded form, and rejects a `both` whose seed and expandedKey
+    /// disagree.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_accepts_seed_and_legacy_rejects_inconsistent_both() {
+        use crate::der::{encode_octet_string, encode_sequence};
+        let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-forms", b"nonce", &[]);
+        let mut seed = [0u8; SEED_SIZE];
+        rng.fill_bytes(&mut seed);
+        let (sk, _pk) = MlDsa44PrivateKey::from_seed(&seed);
+        let expanded = sk.to_bytes().to_vec();
+
+        // seed ::= [0] IMPLICIT OCTET STRING (SIZE (32)) — tag 0x80.
+        let mut seed_inner = alloc::vec![0x80u8, SEED_SIZE as u8];
+        seed_inner.extend_from_slice(&seed);
+        let from_seed_form =
+            MlDsa44PrivateKey::from_pkcs8_der(&wrap_pkcs8_44(&seed_inner)).unwrap();
+        assert_eq!(from_seed_form.to_bytes(), expanded.as_slice());
+        // A key decoded from the seed knows its seed, so it re-emits `both`.
+        assert_eq!(inner_tag(&from_seed_form.to_pkcs8_der()), 0x30);
+
+        // Legacy: the privateKey OCTET STRING content is the raw expanded key
+        // with no inner CHOICE tag.
+        let legacy = wrap_pkcs8_44(&expanded);
+        // (sanity: this is shaped like the pre-fix encoder's output)
+        let mut probe = crate::der::Reader::new(&legacy);
+        let mut s = probe.read_sequence().unwrap();
+        s.read_integer_bytes().unwrap();
+        s.read_sequence().unwrap();
+        assert_eq!(s.read_octet_string().unwrap().len(), expanded.len());
+        let from_legacy = MlDsa44PrivateKey::from_pkcs8_der(&legacy).unwrap();
+        assert_eq!(from_legacy.to_bytes(), expanded.as_slice());
+
+        // both with a tampered expandedKey must be rejected.
+        let mut bad_expanded = expanded.clone();
+        bad_expanded[0] ^= 1;
+        let both_inner = encode_sequence(
+            &[
+                encode_octet_string(&seed),
+                encode_octet_string(&bad_expanded),
+            ]
+            .concat(),
+        );
+        match MlDsa44PrivateKey::from_pkcs8_der(&wrap_pkcs8_44(&both_inner)) {
+            Err(Error::Malformed) => {}
+            other => panic!("expected Malformed, got {:?}", other.err()),
+        }
+    }
+
+    /// Byte-for-byte interop with OpenSSL 3.5's default `seed-priv` output: load
+    /// a real OpenSSL ML-DSA-44 key, re-emit identical bytes, and sign with it.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_matches_openssl_seed_priv() {
+        let der = unhex(include_str!("../../testdata/mldsa44_openssl_pkcs8.hex").trim());
+        let sk = MlDsa44PrivateKey::from_pkcs8_der(&der).unwrap();
+        assert_eq!(inner_tag(&der), 0x30, "OpenSSL default is the both form");
+        assert_eq!(
+            sk.to_pkcs8_der(),
+            der,
+            "must re-emit OpenSSL's bytes verbatim"
+        );
+        let pk = sk.public_key();
+        let sig = sk.sign_deterministic(b"interop", b"").unwrap();
+        assert!(pk.verify(&sig, b"interop", b""));
     }
 
     /// `from_bytes` must reject a buffer whose length is correct but whose

@@ -94,7 +94,12 @@ macro_rules! ml_kem_set {
 
         #[doc = concat!("An ", $set_doc, " decapsulation (secret) key.")]
         #[derive(Clone)]
-        pub struct $dk_name([u8; $dk_size]);
+        // Field 0 is the FIPS 203 expanded decapsulation key. Field 1 is the
+        // 64-byte generation seed `d‖z`, retained when known so the PKCS#8
+        // encoder can emit the LAMPS `both` (seed-priv) form OpenSSL 3.5 writes
+        // by default; `None` for keys imported from expanded bytes, which can
+        // only re-emit `expandedKey`.
+        pub struct $dk_name([u8; $dk_size], Option<[u8; 64]>);
 
         #[doc = concat!("An ", $set_doc, " ciphertext.")]
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -122,8 +127,9 @@ macro_rules! ml_kem_set {
                 rng.fill_bytes(&mut d);
                 rng.fill_bytes(&mut z);
                 let pair = Self::from_seeds(&d, &z);
-                // Wipe the seeds before they drop — `d` alone reconstructs
-                // the whole key (`z` is the implicit-rejection secret).
+                // The returned key retains its own copy of `d‖z` (zeroized on
+                // drop) so it can be exported in the LAMPS seed-priv PKCS#8 form;
+                // wipe these local copies regardless.
                 for b in d.iter_mut().chain(z.iter_mut()) {
                     *b = 0;
                 }
@@ -137,7 +143,10 @@ macro_rules! ml_kem_set {
                 let mut ek = [0u8; $ek_size];
                 let mut dk = [0u8; $dk_size];
                 kem::keygen::<$k, $eta1>(d, z, &mut ek, &mut dk);
-                ($dk_name(dk), $ek_name(ek))
+                let mut seed = [0u8; 64];
+                seed[..32].copy_from_slice(d);
+                seed[32..].copy_from_slice(z);
+                ($dk_name(dk, Some(seed)), $ek_name(ek))
             }
 
             /// The matching encapsulation key.
@@ -161,7 +170,7 @@ macro_rules! ml_kem_set {
             /// [`from_bytes_validated`](Self::from_bytes_validated) when
             /// the bytes come from an untrusted source.
             pub fn from_bytes(bytes: [u8; $dk_size]) -> Self {
-                $dk_name(bytes)
+                $dk_name(bytes, None)
             }
 
             /// FIPS 203 §7.3 "Decapsulation key check": confirms that the
@@ -192,7 +201,7 @@ macro_rules! ml_kem_set {
                 if h.as_ref() != &bytes[h_start..h_end] {
                     return Err(crate::mlkem::EncapsKeyCheckError);
                 }
-                Ok($dk_name(bytes))
+                Ok($dk_name(bytes, None))
             }
 
             /// The byte encoding.
@@ -212,6 +221,14 @@ macro_rules! ml_kem_set {
                     *b = 0;
                 }
                 let _ = core::hint::black_box(&self.0);
+                // The retained seed `d‖z` reconstructs the whole key, so it is
+                // just as sensitive — wipe it too.
+                if let Some(seed) = &mut self.1 {
+                    for b in seed.iter_mut() {
+                        *b = 0;
+                    }
+                    let _ = core::hint::black_box(&seed);
+                }
             }
         }
 
@@ -306,15 +323,31 @@ macro_rules! ml_kem_set {
             }
         }
 
-        /// PKCS#8 (raw expanded dk) for the decapsulation key.
+        /// PKCS#8 for the decapsulation key, using the LAMPS
+        /// `ML-KEM-PrivateKey` CHOICE (draft-ietf-lamps-kyber-certificates).
         #[cfg(feature = "der")]
         impl $dk_name {
             /// Encodes the key as a PKCS#8 `PrivateKeyInfo` DER.
+            ///
+            /// The `privateKey` OCTET STRING carries the LAMPS
+            /// `ML-KEM-PrivateKey` CHOICE: the `both`
+            /// `SEQUENCE { seed, expandedKey }` form when the 64-byte seed `d‖z`
+            /// is known (byte-for-byte identical to OpenSSL 3.5's default
+            /// `seed-priv` output), or the `expandedKey` OCTET STRING form for
+            /// keys imported from expanded `dk` bytes. OpenSSL 3.5 loads both.
             pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
                 use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+                let inner = match &self.1 {
+                    // both ::= SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
+                    Some(seed) => encode_sequence(
+                        &[encode_octet_string(seed), encode_octet_string(&self.0)].concat(),
+                    ),
+                    // expandedKey ::= OCTET STRING
+                    None => encode_octet_string(&self.0),
+                };
                 let algid = encode_sequence(&oid_tlv(oids::$oid));
                 encode_sequence(
-                    &[encode_integer(&[0]), algid, encode_octet_string(&self.0)].concat(),
+                    &[encode_integer(&[0]), algid, encode_octet_string(&inner)].concat(),
                 )
             }
 
@@ -323,7 +356,14 @@ macro_rules! ml_kem_set {
                 crate::der::pem_encode("PRIVATE KEY", &self.to_pkcs8_der())
             }
 
-            /// Parses a PKCS#8 `PrivateKeyInfo` DER (raw `dk` form).
+            /// Parses a PKCS#8 `PrivateKeyInfo` DER.
+            ///
+            /// Accepts every LAMPS `ML-KEM-PrivateKey` CHOICE alternative in the
+            /// `privateKey` OCTET STRING — `seed [0]`, `expandedKey`, and `both`
+            /// (so OpenSSL 3.5's default `seed-priv` keys load) — plus the legacy
+            /// untagged raw-`dk` encoding purecrypto previously emitted. Any
+            /// provided expanded `dk` runs the FIPS 203 §7.3 hash check; for the
+            /// `both` form the regenerated `dk` must equal the supplied one.
             pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
                 use crate::der::{Error, Reader, parse_oid};
                 let mut r = Reader::new(der);
@@ -334,10 +374,57 @@ macro_rules! ml_kem_set {
                     return Err(Error::Malformed);
                 }
                 let inner = seq.read_octet_string()?;
-                let bytes: [u8; $dk_size] = inner.try_into().map_err(|_| Error::Malformed)?;
-                // PKCS#8 input is untrusted: run the FIPS 203 §7.3 hash
-                // check rather than constructing the key unvalidated.
-                Self::from_bytes_validated(bytes).map_err(|_| Error::Malformed)
+
+                // Legacy fast-path: the historical encoding was the raw `dk`
+                // with no inner CHOICE tag. Its length is exactly `$dk_size`,
+                // which can never equal a tagged alternative (those add ≥2 bytes
+                // of tag+length), so the length alone disambiguates.
+                if inner.len() == $dk_size {
+                    let bytes: [u8; $dk_size] = inner.try_into().map_err(|_| Error::Malformed)?;
+                    return Self::from_bytes_validated(bytes).map_err(|_| Error::Malformed);
+                }
+
+                // Regenerates a validated key from a 64-byte `d‖z` seed.
+                let from_seed = |seed: &[u8]| -> Result<Self, Error> {
+                    let seed: [u8; 64] = seed.try_into().map_err(|_| Error::Malformed)?;
+                    let mut d = [0u8; 32];
+                    let mut z = [0u8; 32];
+                    d.copy_from_slice(&seed[..32]);
+                    z.copy_from_slice(&seed[32..]);
+                    Ok(Self::from_seeds(&d, &z).0)
+                };
+
+                let mut cr = Reader::new(inner);
+                match cr.peek_tag() {
+                    // expandedKey ::= OCTET STRING
+                    Some(0x04) => {
+                        let expanded = cr.read_octet_string()?;
+                        let bytes: [u8; $dk_size] =
+                            expanded.try_into().map_err(|_| Error::Malformed)?;
+                        Self::from_bytes_validated(bytes).map_err(|_| Error::Malformed)
+                    }
+                    // seed ::= [0] IMPLICIT OCTET STRING (SIZE (64))
+                    Some(0x80) => from_seed(cr.read_tlv(0x80)?),
+                    // both ::= SEQUENCE { seed OCTET STRING, expandedKey OCTET STRING }
+                    Some(0x30) => {
+                        let mut both = cr.read_sequence()?;
+                        let seed = both.read_octet_string()?;
+                        let expanded = both.read_octet_string()?;
+                        let key = from_seed(seed)?;
+                        // LAMPS: a `both` whose seed and expandedKey disagree
+                        // MUST be rejected. (Length check guards `ct_eq`'s zip
+                        // from silently truncating.)
+                        if key.0.len() != expanded.len()
+                            || !bool::from(<[u8] as crate::ct::ConstantTimeEq>::ct_eq(
+                                &key.0, expanded,
+                            ))
+                        {
+                            return Err(Error::Malformed);
+                        }
+                        Ok(key)
+                    }
+                    _ => Err(Error::Malformed),
+                }
             }
 
             /// Parses a PKCS#8 PEM private key.
@@ -733,6 +820,118 @@ mod tests {
         let pem = dk.to_pkcs8_pem();
         let parsed = MlKem1024DecapsKey::from_pkcs8_pem(&pem).unwrap();
         assert_eq!(parsed.to_bytes(), dk.to_bytes());
+    }
+
+    /// ML-KEM-768 OID, for hand-building PKCS#8 CHOICE alternatives in tests.
+    #[cfg(feature = "der")]
+    const TEST_OID_768: &[u64] = &[2, 16, 840, 1, 101, 3, 4, 4, 2];
+
+    /// Wraps an already-encoded `privateKey` CHOICE body in a PKCS#8
+    /// `PrivateKeyInfo` carrying the ML-KEM-768 OID.
+    #[cfg(feature = "der")]
+    fn wrap_pkcs8_768(inner: &[u8]) -> Vec<u8> {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let algid = encode_sequence(&oid_tlv(TEST_OID_768));
+        encode_sequence(&[encode_integer(&[0]), algid, encode_octet_string(inner)].concat())
+    }
+
+    /// First byte of the `privateKey` OCTET STRING content (the inner CHOICE tag).
+    #[cfg(feature = "der")]
+    fn inner_tag_768(der: &[u8]) -> u8 {
+        use crate::der::Reader;
+        let mut r = Reader::new(der);
+        let mut seq = r.read_sequence().unwrap();
+        seq.read_integer_bytes().unwrap();
+        seq.read_sequence().unwrap();
+        seq.read_octet_string().unwrap()[0]
+    }
+
+    /// A generated key retains its seed and emits the LAMPS `both` form; an
+    /// expanded-only import emits `expandedKey`. Both round-trip and re-emit
+    /// identically.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_emits_both_or_expandedkey_and_roundtrips() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-pkcs8", b"nonce", &[]);
+        let (dk, _ek) = MlKem768DecapsKey::generate(&mut rng);
+
+        // Generated -> both (inner SEQUENCE, tag 0x30).
+        let der_both = dk.to_pkcs8_der();
+        assert_eq!(inner_tag_768(&der_both), 0x30);
+        let back = MlKem768DecapsKey::from_pkcs8_der(&der_both).unwrap();
+        assert_eq!(
+            back.to_pkcs8_der(),
+            der_both,
+            "both must re-emit identically"
+        );
+        assert_eq!(back.to_bytes(), dk.to_bytes());
+
+        // from_bytes drops the seed -> expandedKey (tag 0x04), shorter form.
+        let imported = MlKem768DecapsKey::from_bytes(dk.to_bytes());
+        let der_exp = imported.to_pkcs8_der();
+        assert_eq!(inner_tag_768(&der_exp), 0x04);
+        assert!(der_exp.len() < der_both.len());
+        let back2 = MlKem768DecapsKey::from_pkcs8_der(&der_exp).unwrap();
+        assert_eq!(back2.to_bytes(), dk.to_bytes());
+        assert_eq!(back2.to_pkcs8_der(), der_exp);
+    }
+
+    /// The decoder accepts the seed-only `[0]` form and the legacy untagged
+    /// raw-`dk` form, and rejects a `both` whose seed and expandedKey disagree.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_accepts_seed_and_legacy_rejects_inconsistent_both() {
+        use crate::der::{encode_octet_string, encode_sequence};
+        let (dk, _ek) = MlKem768DecapsKey::from_seeds(&[7u8; 32], &[9u8; 32]);
+        let expanded = dk.to_bytes();
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&[7u8; 32]);
+        seed[32..].copy_from_slice(&[9u8; 32]);
+
+        // seed ::= [0] IMPLICIT OCTET STRING (SIZE (64)) — tag 0x80.
+        let mut seed_inner = alloc::vec![0x80u8, 64u8];
+        seed_inner.extend_from_slice(&seed);
+        let from_seed_form =
+            MlKem768DecapsKey::from_pkcs8_der(&wrap_pkcs8_768(&seed_inner)).unwrap();
+        assert_eq!(from_seed_form.to_bytes(), expanded);
+        // Knows its seed -> re-emits `both`.
+        assert_eq!(inner_tag_768(&from_seed_form.to_pkcs8_der()), 0x30);
+
+        // Legacy: raw `dk` as the privateKey OCTET STRING content, no inner tag.
+        let from_legacy = MlKem768DecapsKey::from_pkcs8_der(&wrap_pkcs8_768(&expanded)).unwrap();
+        assert_eq!(from_legacy.to_bytes(), expanded);
+
+        // both with a tampered expandedKey must be rejected.
+        let mut bad = expanded.to_vec();
+        bad[0] ^= 1;
+        let both_inner =
+            encode_sequence(&[encode_octet_string(&seed), encode_octet_string(&bad)].concat());
+        assert!(MlKem768DecapsKey::from_pkcs8_der(&wrap_pkcs8_768(&both_inner)).is_err());
+    }
+
+    /// Byte-for-byte interop with OpenSSL 3.5's default `seed-priv` output: load
+    /// a real OpenSSL ML-KEM-768 key, re-emit identical bytes, and decapsulate.
+    #[cfg(feature = "der")]
+    #[test]
+    fn pkcs8_matches_openssl_seed_priv() {
+        use crate::test_util::from_hex_vec;
+        let der = from_hex_vec(include_str!("../../testdata/mlkem768_openssl_pkcs8.hex"));
+        let dk = MlKem768DecapsKey::from_pkcs8_der(&der).unwrap();
+        assert_eq!(
+            inner_tag_768(&der),
+            0x30,
+            "OpenSSL default is the both form"
+        );
+        assert_eq!(
+            dk.to_pkcs8_der(),
+            der,
+            "must re-emit OpenSSL's bytes verbatim"
+        );
+        // The loaded key encapsulates/decapsulates consistently.
+        let ek = dk.encapsulation_key();
+        let mut rng = HmacDrbg::<Sha256>::new(b"mlkem-interop", b"nonce", &[]);
+        let (ct, ss) = ek.encapsulate(&mut rng);
+        assert_eq!(dk.decapsulate(&ct), ss);
     }
 
     /// FIPS 203 §7.3 — the decapsulation key embeds `H(ek)` so a future
