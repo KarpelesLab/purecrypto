@@ -37,7 +37,8 @@ const BCRYPT_HASHSIZE: usize = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Error {
-    /// One of: `rounds == 0`, `keylen == 0`, or `keylen > 1024`.
+    /// One of: `rounds == 0`, `keylen == 0`, `keylen > 1024`, or an empty
+    /// password or salt.
     InvalidParameters,
 }
 
@@ -51,14 +52,15 @@ impl core::error::Error for Error {}
 
 /// Derives `keylen` bytes from `(password, salt)` using OpenSSH's
 /// `bcrypt_pbkdf` with `rounds` iterations. Returns an error when
-/// `rounds == 0`, `keylen == 0`, or `keylen > 1024`.
+/// `rounds == 0`, `keylen == 0`, `keylen > 1024`, or `password`/`salt` is
+/// empty (OpenSSH rejects an empty passphrase or salt outright).
 pub fn bcrypt_pbkdf(
     password: &[u8],
     salt: &[u8],
     rounds: u32,
     keylen: usize,
 ) -> Result<Vec<u8>, Error> {
-    if rounds == 0 || keylen == 0 || keylen > MAX_KEYLEN {
+    if rounds == 0 || keylen == 0 || keylen > MAX_KEYLEN || password.is_empty() || salt.is_empty() {
         return Err(Error::InvalidParameters);
     }
 
@@ -311,5 +313,24 @@ mod tests {
     fn accepts_max_keylen() {
         let out = bcrypt_pbkdf(b"password", b"salt", 1, 1024).unwrap();
         assert_eq!(out.len(), 1024);
+    }
+
+    #[test]
+    fn rejects_empty_salt() {
+        // OpenSSH rejects an empty salt; an otherwise-valid call must still
+        // succeed.
+        assert_eq!(
+            bcrypt_pbkdf(b"password", b"", 4, 32),
+            Err(Error::InvalidParameters)
+        );
+        assert!(bcrypt_pbkdf(b"password", b"salt", 4, 32).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_password() {
+        assert_eq!(
+            bcrypt_pbkdf(b"", b"salt", 4, 32),
+            Err(Error::InvalidParameters)
+        );
     }
 }
