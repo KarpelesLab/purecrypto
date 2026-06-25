@@ -47,15 +47,51 @@ pub struct ClientHelloInfo {
 /// from one or more plaintext handshake records — the client's first flight is
 /// never encrypted — so no keys are involved.
 pub fn peek_client_hello(buf: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
-    // Reassemble the handshake byte stream from the leading handshake records.
-    // A ClientHello may legally be split across several records (RFC 8446 §5.1);
-    // we only need its head (SNI/ALPN sit in the extensions), but parse the
-    // whole message to stay strictly correct.
+    let Some(ch) = peek_decode_client_hello(buf)? else {
+        return Ok(None);
+    };
+    let mut info = ClientHelloInfo::default();
+    for (ty, body) in &ch.extensions {
+        if *ty == ExtensionType::SERVER_NAME {
+            info.server_name = ext::parse_server_name(body)?;
+        } else if *ty == ExtensionType::ALPN {
+            info.alpn_protocols = ext::parse_alpn(body)?;
+        }
+    }
+    Ok(Some(info))
+}
+
+/// Selects the TLS server engine version from the first ClientHello, reusing the
+/// same non-consuming reassembly as [`peek_client_hello`]. `Ok(None)` = the
+/// ClientHello isn't fully buffered yet; `Ok(Some(true))` = the client offered
+/// TLS 1.3 in `supported_versions` (use the 1.3 engine); `Ok(Some(false))` = no
+/// 1.3 was offered (a legacy 1.2-only client — use the 1.2 / legacy engine).
+/// Mirrors the server's own selection: the 1.2 engine deliberately ignores the
+/// *content* of `supported_versions` and caps at TLS 1.2, so the only question
+/// here is whether 1.3 was offered at all.
+pub(crate) fn peek_offers_tls13(buf: &[u8]) -> Result<Option<bool>, Error> {
+    let Some(ch) = peek_decode_client_hello(buf)? else {
+        return Ok(None);
+    };
+    let offers13 = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS) {
+        Some(sv) => ext::client_offers_tls13(sv)?,
+        None => false,
+    };
+    Ok(Some(offers13))
+}
+
+/// Reassembles the first handshake message from the leading handshake records of
+/// `buf` and decodes it as a [`ClientHello`], **without consuming `buf`**. A
+/// ClientHello may legally span several records (RFC 8446 §5.1). `Ok(None)` =
+/// the message isn't fully buffered yet; `Err` = the first record isn't a
+/// handshake record or the first message isn't a ClientHello. The client's
+/// first flight is never encrypted, so no keys are involved.
+fn peek_decode_client_hello(buf: &[u8]) -> Result<Option<ClientHello>, Error> {
     let mut handshake: Vec<u8> = Vec::new();
     let mut offset = 0usize;
     loop {
-        if let Some(info) = parse_client_hello(&handshake)? {
-            return Ok(Some(info));
+        if let Some(ch) = decode_first_client_hello(&handshake)? {
+            return Ok(Some(ch));
         }
         match read_record(&buf[offset..])? {
             // Not enough bytes for another full record — need more from the wire.
@@ -72,10 +108,10 @@ pub fn peek_client_hello(buf: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
     }
 }
 
-/// Parses a complete ClientHello out of the accumulated handshake bytes.
+/// Decodes a complete ClientHello out of the accumulated handshake bytes.
 /// `Ok(None)` means more bytes are needed; `Err` means the first handshake
 /// message is malformed or isn't a ClientHello.
-fn parse_client_hello(handshake: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
+fn decode_first_client_hello(handshake: &[u8]) -> Result<Option<ClientHello>, Error> {
     // Handshake message header: msg_type(1) || length(3) || body.
     if handshake.len() < 4 {
         return Ok(None);
@@ -88,17 +124,7 @@ fn parse_client_hello(handshake: &[u8]) -> Result<Option<ClientHelloInfo>, Error
     if handshake.len() < 4 + body_len {
         return Ok(None);
     }
-    let ch = ClientHello::decode(&handshake[4..4 + body_len])?;
-
-    let mut info = ClientHelloInfo::default();
-    for (ty, body) in &ch.extensions {
-        if *ty == ExtensionType::SERVER_NAME {
-            info.server_name = ext::parse_server_name(body)?;
-        } else if *ty == ExtensionType::ALPN {
-            info.alpn_protocols = ext::parse_alpn(body)?;
-        }
-    }
-    Ok(Some(info))
+    Ok(Some(ClientHello::decode(&handshake[4..4 + body_len])?))
 }
 
 #[cfg(test)]

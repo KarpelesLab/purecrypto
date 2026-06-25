@@ -171,38 +171,39 @@ enum Engine {
 /// ClientHello is cut off with `decode_error` rather than buffered unboundedly.
 const MAX_HS_PEEK: usize = 64 * 1024;
 
-/// Deferred TLS server engine for a config whose version range spans TLS 1.2
+/// The single concrete server engine a [`ServerConnectionAuto`] resolves to.
+#[allow(clippy::large_enum_variant)]
+enum ResolvedServer {
+    Tls13(Box<super::conn::ServerConnection<ConfigRng>>),
+    Tls12(Box<super::conn::ServerConnection12<ConfigRng>>),
+}
+
+/// Deferred TLS server front-end for a config whose version range spans TLS 1.2
 /// and 1.3. `Connection::server` runs before any ClientHello exists, so the
-/// concrete engine cannot be chosen from config alone; instead both engines are
-/// pre-built and the first ClientHello's `supported_versions` selects one
-/// (RFC 8446 §4.1.1 / Appendix D.1). The unselected engine is dropped on
-/// resolution.
+/// concrete engine cannot be chosen from config alone. This buffers the opening
+/// bytes, peeks the first ClientHello's `supported_versions` (RFC 8446 §4.1.1 /
+/// Appendix D.1), then builds the ONE matching engine and replays the buffered
+/// bytes into it. Exactly one engine is ever constructed.
 struct ServerConnectionAuto {
     /// Raw wire bytes received before the version was resolved.
     buffered: Vec<u8>,
-    /// Pre-built TLS 1.3 engine (supports every server key type).
-    tls13: Option<Box<super::conn::ServerConnection<ConfigRng>>>,
-    /// Pre-built TLS 1.2 engine, or `None` when the configured key cannot sign
-    /// TLS 1.2 suites (Ed25519 / Ed448 / ML-DSA / …) — a 1.2-only client then
-    /// gets `handshake_failure`.
-    tls12: Option<Box<super::conn::ServerConnection12<ConfigRng>>>,
-    /// `None` while undecided; `Some(true)` once resolved to 1.3, `Some(false)`
-    /// once resolved to 1.2.
-    resolved: Option<bool>,
+    /// Owned config the selected engine is built from; taken (dropped) on
+    /// resolution. `Config` is immutable, so this clone never diverges.
+    config: Option<Config>,
+    /// The selected engine, once the version is known.
+    resolved: Option<ResolvedServer>,
 }
 
 impl ServerConnectionAuto {
     /// Feed wire bytes. Before resolution, buffer and try to decide the
     /// version from the first ClientHello; after resolution, delegate.
     fn feed(&mut self, wire_in: &[u8]) -> Result<(), Error> {
-        match self.resolved {
-            Some(true) => {
-                let c = self.tls13.as_mut().ok_or(Error::InappropriateState)?;
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => {
                 c.read_tls(wire_in);
                 c.process_new_packets()
             }
-            Some(false) => {
-                let c = self.tls12.as_mut().ok_or(Error::InappropriateState)?;
+            Some(ResolvedServer::Tls12(c)) => {
                 c.read_tls(wire_in);
                 c.process_new_packets()
             }
@@ -216,94 +217,61 @@ impl ServerConnectionAuto {
         }
     }
 
-    /// Once enough of the first ClientHello is buffered, pick the engine,
-    /// replay all buffered bytes into it, and drop the other engine.
+    /// Once enough of the first ClientHello is buffered, select the version,
+    /// build the one matching engine, and replay the buffered bytes into it.
     fn try_resolve(&mut self) -> Result<(), Error> {
-        let offers13 = match peek_offers_tls13(&self.buffered)? {
+        let offers13 = match super::peek::peek_offers_tls13(&self.buffered)? {
             None => return Ok(()), // need more bytes; nothing to emit yet
             Some(v) => v,
         };
+        let config = self.config.take().ok_or(Error::InappropriateState)?;
         let buffered = core::mem::take(&mut self.buffered);
         if offers13 {
-            let mut c = self.tls13.take().ok_or(Error::InappropriateState)?;
-            self.tls12 = None;
+            let mut c = Box::new(build_tls13_server(&config)?);
             c.read_tls(&buffered);
             let r = c.process_new_packets();
-            self.tls13 = Some(c);
-            self.resolved = Some(true);
+            self.resolved = Some(ResolvedServer::Tls13(c));
             r
         } else {
-            // Client offered no TLS 1.3: route to the 1.2 (or legacy) engine.
-            let mut c = match self.tls12.take() {
-                Some(c) => c,
-                // No 1.2-capable engine (e.g. an Ed25519/PQC-only key).
-                None => return Err(Error::HandshakeFailure),
-            };
-            self.tls13 = None;
+            // Client offered no TLS 1.3: build the 1.2 (or legacy) engine. A key
+            // that cannot sign TLS 1.2 suites (Ed25519/Ed448/ML-DSA) makes the
+            // build fail; surface that as `handshake_failure`.
+            let mut c = Box::new(build_tls12_server(&config).map_err(|_| Error::HandshakeFailure)?);
             c.read_tls(&buffered);
             let r = c.process_new_packets();
-            self.tls12 = Some(c);
-            self.resolved = Some(false);
+            self.resolved = Some(ResolvedServer::Tls12(c));
             r
         }
     }
 
     fn write_tls(&mut self) -> Vec<u8> {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_mut()
-                .map(|c| c.write_tls())
-                .unwrap_or_default(),
-            Some(false) => self
-                .tls12
-                .as_mut()
-                .map(|c| c.write_tls())
-                .unwrap_or_default(),
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.write_tls(),
+            Some(ResolvedServer::Tls12(c)) => c.write_tls(),
             None => Vec::new(),
         }
     }
 
     fn send_application_data(&mut self, app: &[u8]) -> Result<(), Error> {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_mut()
-                .ok_or(Error::InappropriateState)?
-                .send_application_data(app),
-            Some(false) => self
-                .tls12
-                .as_mut()
-                .ok_or(Error::InappropriateState)?
-                .send_application_data(app),
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.send_application_data(app),
+            Some(ResolvedServer::Tls12(c)) => c.send_application_data(app),
             None => Err(Error::InappropriateState),
         }
     }
 
     fn take_received_plaintext(&mut self) -> Vec<u8> {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_mut()
-                .map(|c| c.take_received_plaintext())
-                .unwrap_or_default(),
-            Some(false) => self
-                .tls12
-                .as_mut()
-                .map(|c| c.take_received_plaintext())
-                .unwrap_or_default(),
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.take_received_plaintext(),
+            Some(ResolvedServer::Tls12(c)) => c.take_received_plaintext(),
             None => Vec::new(),
         }
     }
 
     fn take_early_data(&mut self) -> Vec<u8> {
         // Only the resolved TLS 1.3 engine can have accepted 0-RTT.
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_mut()
-                .map(|c| c.take_early_data())
-                .unwrap_or_default(),
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.take_early_data(),
             _ => Vec::new(),
         }
     }
@@ -314,33 +282,17 @@ impl ServerConnectionAuto {
         } else {
             Some(context)
         };
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .ok_or(Error::InappropriateState)?
-                .tls_exporter(label, context, out),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .ok_or(Error::InappropriateState)?
-                .tls_exporter(label, ctx12, out),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.tls_exporter(label, context, out),
+            Some(ResolvedServer::Tls12(c)) => c.tls_exporter(label, ctx12, out),
             None => Err(Error::InappropriateState),
         }
     }
 
     fn close(&mut self) {
-        match self.resolved {
-            Some(true) => {
-                if let Some(c) = self.tls13.as_mut() {
-                    c.send_close_notify();
-                }
-            }
-            Some(false) => {
-                if let Some(c) = self.tls12.as_mut() {
-                    c.send_close_notify();
-                }
-            }
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.send_close_notify(),
+            Some(ResolvedServer::Tls12(c)) => c.send_close_notify(),
             None => {}
         }
     }
@@ -348,174 +300,82 @@ impl ServerConnectionAuto {
     /// `true` while still handshaking — which includes the pre-resolution
     /// buffering window.
     fn is_handshaking(&self) -> bool {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .map(|c| c.is_handshaking())
-                .unwrap_or(true),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .map(|c| c.is_handshaking())
-                .unwrap_or(true),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.is_handshaking(),
+            Some(ResolvedServer::Tls12(c)) => c.is_handshaking(),
             None => true,
         }
     }
 
     fn received_close_notify(&self) -> bool {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .map(|c| c.received_close_notify())
-                .unwrap_or(false),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .map(|c| c.received_close_notify())
-                .unwrap_or(false),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.received_close_notify(),
+            Some(ResolvedServer::Tls12(c)) => c.received_close_notify(),
             None => false,
         }
     }
 
     fn negotiated_version(&self) -> Option<ProtocolVersion> {
-        match self.resolved {
-            Some(true) => Some(ProtocolVersion::TLSv1_3),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .and_then(|c| c.negotiated_protocol_version()),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(_)) => Some(ProtocolVersion::TLSv1_3),
+            Some(ResolvedServer::Tls12(c)) => c.negotiated_protocol_version(),
             None => None,
         }
     }
 
     fn negotiated_cipher_suite(&self) -> Option<u16> {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .and_then(|c| c.negotiated_cipher_suite()),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .and_then(|c| c.negotiated_cipher_suite()),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.negotiated_cipher_suite(),
+            Some(ResolvedServer::Tls12(c)) => c.negotiated_cipher_suite(),
             None => None,
         }
     }
 
     fn alpn_protocol(&self) -> Option<&[u8]> {
-        match self.resolved {
-            Some(true) => self.tls13.as_ref().and_then(|c| c.alpn_protocol()),
-            Some(false) => self.tls12.as_ref().and_then(|c| c.alpn_protocol()),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.alpn_protocol(),
+            Some(ResolvedServer::Tls12(c)) => c.alpn_protocol(),
             None => None,
         }
     }
 
     fn peer_server_name(&self) -> Option<&str> {
-        match self.resolved {
-            Some(true) => self.tls13.as_ref().and_then(|c| c.peer_server_name()),
-            Some(false) => self.tls12.as_ref().and_then(|c| c.peer_server_name()),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.peer_server_name(),
+            Some(ResolvedServer::Tls12(c)) => c.peer_server_name(),
             None => None,
         }
     }
 
     fn peer_certificates(&self) -> &[Vec<u8>] {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .map(|c| c.peer_certificates())
-                .unwrap_or(&[]),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .map(|c| c.peer_certificates())
-                .unwrap_or(&[]),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.peer_certificates(),
+            Some(ResolvedServer::Tls12(c)) => c.peer_certificates(),
             None => &[],
         }
     }
 
     fn wants_write(&self) -> bool {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_ref()
-                .map(|c| c.wants_write())
-                .unwrap_or(false),
-            Some(false) => self
-                .tls12
-                .as_ref()
-                .map(|c| c.wants_write())
-                .unwrap_or(false),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.wants_write(),
+            Some(ResolvedServer::Tls12(c)) => c.wants_write(),
             None => false,
         }
     }
 
     fn pending_signature(&self) -> Option<(u16, Vec<u8>)> {
         // Only the TLS 1.3 server brokers an external CertificateVerify here.
-        match self.resolved {
-            Some(true) => self.tls13.as_ref().and_then(|c| c.pending_signature()),
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.pending_signature(),
             _ => None,
         }
     }
 
     fn provide_signature(&mut self, signature: Vec<u8>) -> Result<(), Error> {
-        match self.resolved {
-            Some(true) => self
-                .tls13
-                .as_mut()
-                .ok_or(Error::InappropriateState)?
-                .provide_signature(signature),
+        match &mut self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.provide_signature(signature),
             _ => Err(Error::InappropriateState),
         }
-    }
-}
-
-/// Peeks the first ClientHello in `buf` (a prefix of raw TLS records) and
-/// reports whether it offers TLS 1.3 in `supported_versions`. Returns
-/// `Ok(None)` when not enough bytes are buffered yet to decide. Errors on a
-/// non-Handshake first record, a first handshake message that is not a
-/// ClientHello, or malformed framing.
-fn peek_offers_tls13(buf: &[u8]) -> Result<Option<bool>, Error> {
-    use super::codec::extension as ext;
-    use super::codec::{ClientHello, ExtensionType, hs_type, read_record};
-    use super::version::ContentType;
-
-    // Reassemble the first handshake message from consecutive Handshake records
-    // (a ClientHello is normally one record but MAY be fragmented across
-    // several plaintext handshake records).
-    let mut hs: Vec<u8> = Vec::new();
-    let mut off = 0usize;
-    loop {
-        if hs.len() > MAX_HS_PEEK || off > MAX_HS_PEEK {
-            return Err(Error::Decode);
-        }
-        let rec = match read_record(&buf[off..])? {
-            None => return Ok(None), // need more bytes
-            Some(r) => r,
-        };
-        if rec.content_type != ContentType::Handshake {
-            // The first thing a client sends must be a Handshake record.
-            return Err(Error::UnexpectedMessage);
-        }
-        hs.extend_from_slice(rec.fragment);
-        off += rec.len;
-        if hs.len() >= 4 {
-            let body_len = ((hs[1] as usize) << 16) | ((hs[2] as usize) << 8) | (hs[3] as usize);
-            if hs.len() >= 4 + body_len {
-                if hs[0] != hs_type::CLIENT_HELLO {
-                    return Err(Error::UnexpectedMessage);
-                }
-                let ch = ClientHello::decode(&hs[4..4 + body_len])?;
-                let offers13 = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS) {
-                    Some(sv) => ext::client_offers_tls13(sv)?,
-                    None => false,
-                };
-                return Ok(Some(offers13));
-            }
-        }
-        // else: need the next record to complete the ClientHello.
     }
 }
 
@@ -558,21 +418,16 @@ impl Connection {
         // When the configured range spans TLS 1.2 and 1.3 (e.g. the default
         // `min 1.2 / max 1.3`), the engine cannot be chosen from config alone —
         // a 1.2-only client offers no `supported_versions`, so the version is
-        // decided from the first ClientHello. Pre-build the 1.3 engine (it
-        // supports every key type) and, when the key can sign 1.2 suites, the
-        // 1.2 engine too; `ServerConnectionAuto` selects on the first CH.
-        // Pinning `min_version = TLSv1_3` opts back into 1.3-only.
+        // decided from the first ClientHello. Defer construction: keep an owned
+        // (immutable) `Config` clone and let `ServerConnectionAuto` build the
+        // ONE matching engine after peeking the ClientHello. Pinning
+        // `min_version = TLSv1_3` opts back into 1.3-only.
         if config.max_version == ProtocolVersion::TLSv1_3
             && config.min_version != ProtocolVersion::TLSv1_3
         {
-            let tls13 = build_tls13_server(config)?;
-            // A key that cannot do TLS 1.2 (Ed25519/Ed448/ML-DSA) yields `None`;
-            // a 1.2-only client is then refused with `handshake_failure`.
-            let tls12 = build_tls12_server(config).ok();
             let inner = Engine::ServerTlsAuto(Box::new(ServerConnectionAuto {
                 buffered: Vec::new(),
-                tls13: Some(Box::new(tls13)),
-                tls12: tls12.map(Box::new),
+                config: Some(config.clone()),
                 resolved: None,
             }));
             return Ok(Connection {
@@ -1718,6 +1573,58 @@ mod tests {
         assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
         drive_pair(&mut client, &mut server);
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// Auto server with an **Ed25519** leaf (which cannot sign TLS 1.2 suites):
+    /// serves a TLS 1.3 client normally, but a 1.2-only client is refused with
+    /// `handshake_failure`. Proves the 1.2 engine is built *lazily* — its
+    /// unsupported-key failure surfaces at the (1.2) ClientHello, not at
+    /// `Connection::server` construction, and the 1.3 path never needs it.
+    #[test]
+    fn auto_server_ed25519_serves_tls13_refuses_tls12() {
+        let ed25519_cfg = || {
+            let mut rng = HmacDrbg::<Sha256>::new(b"tls-auto-ed25519", b"nonce", &[]);
+            let key = crate::ec::Ed25519PrivateKey::generate(&mut rng);
+            let name = DistinguishedName::common_name("tls.example");
+            let validity = Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            );
+            let cert = Certificate::self_signed_general(
+                &CertSigner::Ed25519(&key),
+                &name,
+                &validity,
+                1,
+                false,
+                &["tls.example"],
+            )
+            .unwrap();
+            Config::builder()
+                .rng(alloc::sync::Arc::new(crate::rng::OsRng))
+                .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+                .identity(
+                    alloc::vec![cert.to_der().to_vec()],
+                    super::super::config::SigningKey::Ed25519(key),
+                )
+                .build()
+        };
+
+        // TLS 1.3 client: completes (Ed25519 is a valid 1.3 identity), and the
+        // server never builds a 1.2 engine.
+        let mut c13 = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut s13 = Connection::server(&ed25519_cfg()).unwrap();
+        drive_pair(&mut c13, &mut s13);
+        assert!(c13.is_handshake_complete() && s13.is_handshake_complete());
+        assert_eq!(s13.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+
+        // TLS 1.2-only client: the lazy 1.2 build fails (no 1.2-capable key) and
+        // surfaces as handshake_failure on the ClientHello.
+        let mut c12 = Connection::client(&tls12_client_cfg()).unwrap();
+        let mut s12 = Connection::server(&ed25519_cfg()).unwrap();
+        let _ = c12.handshake();
+        let ch = c12.pop().unwrap();
+        assert!(!ch.is_empty());
+        assert!(matches!(s12.feed(&ch), Err(Error::HandshakeFailure)));
     }
 
     /// RFC 8446 §7.5: the exporter is a function of the (shared) master secret,

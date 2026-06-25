@@ -36,6 +36,7 @@ use super::conn::ReplayWindow;
 /// variant-size disparity flagged by `clippy::large_enum_variant` is a
 /// non-issue.
 #[allow(clippy::large_enum_variant)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub enum SigningKey {
     /// RSA key; signs with `rsa_pss_rsae_sha256`.
@@ -81,6 +82,7 @@ pub enum SigningKey {
 }
 
 /// A certificate chain (leaf first) paired with its signing key.
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Identity {
     /// DER-encoded certificate chain, leaf first.
@@ -99,6 +101,7 @@ impl Identity {
 }
 
 /// Client-authentication policy for a server (mTLS).
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ClientAuth {
     /// Trust anchors for verifying the peer's chain.
@@ -129,6 +132,7 @@ impl ClientAuth {
 /// ECH, RFC 8879 cert compression, future RFCs) — every new knob would
 /// otherwise be a source-breaking change. Construct via [`Config::default`]
 /// or [`Config::builder`].
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct Config {
     // ---- Protocol versions ----
