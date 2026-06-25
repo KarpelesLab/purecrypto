@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use crate::tls::{ClientHelloInfo, Error};
 
-use super::crypto::{AeadAlg, aead_open, derive_dir_keys, derive_initial_secrets};
+use super::crypto::{AeadAlg, DirKeys, aead_open, derive_dir_keys, derive_initial_secrets};
 use super::crypto_buf::CryptoBuf;
 use super::frame::Frame;
 use super::pkt::{LongHeader, LongType, QUIC_V1, remove_header_protection};
@@ -49,94 +49,129 @@ use super::pn::decode_packet_number;
 /// no secret material, never panics on malformed input, and bounds CRYPTO
 /// reassembly (64 KiB / 32 fragments) against a pre-handshake flood.
 pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
-    let hdr = LongHeader::parse(datagram)?;
-    // Only QUIC v1 has a defined Initial salt here; reject everything else
-    // (this also catches Version Negotiation, version == 0).
-    if hdr.version != QUIC_V1 {
-        return Err(Error::UnsupportedVersion);
-    }
-    if hdr.typ != LongType::Initial {
-        // 0-RTT / Handshake / Retry are not where the ClientHello lives.
-        return Err(Error::Decode);
-    }
-
-    // RFC 9000 §17.2: `length` covers PN + payload + tag, so the packet ends at
-    // `payload_off + length`. If the datagram doesn't hold the whole packet yet,
-    // we can't decrypt — ask for more (Ok(None)).
-    let pkt_total = hdr
-        .payload_off
-        .checked_add(hdr.length as usize)
-        .ok_or(Error::Decode)?;
-    if datagram.len() < pkt_total {
-        return Ok(None);
-    }
-
-    // RFC 9001 §5.2: derive the client's Initial read keys from the DCID.
-    let (client_secret, _server_secret) = derive_initial_secrets(hdr.dcid);
-    let keys = derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret);
-
-    // Work on an owned copy of just this packet — header protection and AEAD
-    // mutate these bytes, and we must not touch the caller's `datagram`.
-    let mut pkt = datagram[..pkt_total].to_vec();
-
-    // Remove header protection (RFC 9001 §5.4): sample 16 bytes at pn_offset+4.
-    let sample_start = hdr.pn_offset.checked_add(4).ok_or(Error::Decode)?;
-    let sample_end = sample_start.checked_add(16).ok_or(Error::Decode)?;
-    if sample_end > pkt.len() {
-        return Err(Error::Decode);
-    }
-    let sample: [u8; 16] = pkt[sample_start..sample_end]
-        .try_into()
-        .expect("16-byte sample slice");
-    let mask = keys.hp.mask(&sample)?;
-    let pn_len = remove_header_protection(&mut pkt, hdr.pn_offset, &mask, true)?;
-
-    // Recover the (truncated) packet number; decode against a 0 baseline — the
-    // client's first Initial uses a small PN.
-    let mut truncated_pn = 0u64;
-    for i in 0..pn_len as usize {
-        truncated_pn = (truncated_pn << 8) | pkt[hdr.pn_offset + i] as u64;
-    }
-    let pn = decode_packet_number(0, truncated_pn, (pn_len as u32) * 8);
-
-    // AEAD: AAD = unprotected header [0 .. pn_offset+pn_len]; ciphertext+tag is
-    // the rest, tag = last 16 bytes (RFC 9001 §5.3).
-    let aad_end = hdr.pn_offset + pn_len as usize;
-    let aad = pkt[..aad_end].to_vec();
-    let ct_with_tag = &mut pkt[aad_end..];
-    if ct_with_tag.len() < 16 {
-        return Err(Error::Decode);
-    }
-    let tag_start = ct_with_tag.len() - 16;
-    let tag: [u8; 16] = ct_with_tag[tag_start..]
-        .try_into()
-        .expect("16-byte tag slice");
-    let payload = &mut ct_with_tag[..tag_start];
-    // Tag failure (wrong DCID / tampered / unreadable) surfaces as an error.
-    aead_open(&keys, pn, &aad, payload, &tag)?;
-
-    // Reassemble the CRYPTO stream from the decrypted payload's frames. CRYPTO
-    // frames carry the raw TLS handshake bytes (no TLS record framing). The
-    // CryptoBuf caps (64 KiB / 32 fragments) bound a pre-handshake flood.
+    // The ClientHello's CRYPTO stream can be split across several Initial
+    // packets coalesced into one datagram (ngtcp2/curl do this), so walk every
+    // coalesced Initial — exactly like the engine's `feed_datagram` — feeding
+    // all CRYPTO into one reassembly buffer. The CryptoBuf caps (64 KiB / 32
+    // fragments) bound a pre-handshake flood.
     let mut crypto = CryptoBuf::new();
     let mut handshake: Vec<u8> = Vec::new();
-    let mut p = 0usize;
-    while p < payload.len() {
-        let (frame, n) = Frame::decode(&payload[p..])?;
-        if n == 0 {
-            break; // defensive: Frame::decode always consumes ≥1, never loop forever
+    // Coalesced Initials share the client DCID, so the keys are derived once.
+    let mut keys: Option<DirKeys> = None;
+    let mut off = 0usize;
+
+    while off < datagram.len() {
+        let rest = &datagram[off..];
+        // A region that no longer parses as a long header ends the walk — e.g.
+        // trailing 0x00 datagram padding, or a short header, after the last
+        // coalesced packet. Only the very first packet must be a real Initial.
+        let hdr = match LongHeader::parse(rest) {
+            Ok(h) => h,
+            Err(_) if off > 0 => break,
+            Err(e) => return Err(e),
+        };
+        // Only QUIC v1 has a defined Initial salt here (also catches Version
+        // Negotiation, version == 0).
+        if hdr.version != QUIC_V1 {
+            if off == 0 {
+                return Err(Error::UnsupportedVersion);
+            }
+            break;
         }
-        p += n;
-        if let Frame::Crypto { offset, data } = frame {
-            let fresh = crypto.on_crypto(offset, data)?;
-            handshake.extend_from_slice(&fresh);
+        if hdr.typ != LongType::Initial {
+            // 0-RTT / Handshake / Retry don't carry the ClientHello, and their
+            // keys aren't derivable here; stop at the first non-Initial.
+            if off == 0 {
+                return Err(Error::Decode);
+            }
+            break;
         }
-        // PADDING / PING / ACK / … are irrelevant to the ClientHello.
+
+        // RFC 9000 §17.2: `length` covers PN + payload + tag.
+        let pkt_total = hdr
+            .payload_off
+            .checked_add(hdr.length as usize)
+            .ok_or(Error::Decode)?;
+        if rest.len() < pkt_total {
+            // The (first) packet isn't fully buffered — ask for more.
+            if off == 0 {
+                return Ok(None);
+            }
+            break;
+        }
+
+        // RFC 9001 §5.2: derive the client's Initial read keys from the DCID.
+        let keys = keys.get_or_insert_with(|| {
+            let (client_secret, _server_secret) = derive_initial_secrets(hdr.dcid);
+            derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret)
+        });
+
+        // Owned copy of this packet — header protection and AEAD mutate it, and
+        // we must not touch the caller's `datagram`.
+        let mut pkt = rest[..pkt_total].to_vec();
+
+        // Remove header protection (RFC 9001 §5.4): sample 16 bytes at pn_offset+4.
+        let sample_start = hdr.pn_offset.checked_add(4).ok_or(Error::Decode)?;
+        let sample_end = sample_start.checked_add(16).ok_or(Error::Decode)?;
+        if sample_end > pkt.len() {
+            return Err(Error::Decode);
+        }
+        let sample: [u8; 16] = pkt[sample_start..sample_end]
+            .try_into()
+            .expect("16-byte sample slice");
+        let mask = keys.hp.mask(&sample)?;
+        let pn_len = remove_header_protection(&mut pkt, hdr.pn_offset, &mask, true)?;
+
+        // Recover the (truncated) packet number; decode against a 0 baseline —
+        // a client's first-flight Initials use small PNs.
+        let mut truncated_pn = 0u64;
+        for i in 0..pn_len as usize {
+            truncated_pn = (truncated_pn << 8) | pkt[hdr.pn_offset + i] as u64;
+        }
+        let pn = decode_packet_number(0, truncated_pn, (pn_len as u32) * 8);
+
+        // AEAD: AAD = unprotected header [0 .. pn_offset+pn_len]; ciphertext+tag
+        // is the rest, tag = last 16 bytes (RFC 9001 §5.3).
+        let aad_end = hdr.pn_offset + pn_len as usize;
+        let aad = pkt[..aad_end].to_vec();
+        let ct_with_tag = &mut pkt[aad_end..];
+        if ct_with_tag.len() < 16 {
+            return Err(Error::Decode);
+        }
+        let tag_start = ct_with_tag.len() - 16;
+        let tag: [u8; 16] = ct_with_tag[tag_start..]
+            .try_into()
+            .expect("16-byte tag slice");
+        let payload = &mut ct_with_tag[..tag_start];
+        // Tag failure (wrong DCID / tampered / unreadable) surfaces as an error.
+        aead_open(keys, pn, &aad, payload, &tag)?;
+
+        // Reassemble CRYPTO from this packet's frames (raw TLS handshake bytes,
+        // no record framing). PADDING / PING / ACK are irrelevant.
+        let mut p = 0usize;
+        while p < payload.len() {
+            let (frame, n) = Frame::decode(&payload[p..])?;
+            if n == 0 {
+                break; // defensive: Frame::decode always consumes ≥1
+            }
+            p += n;
+            if let Frame::Crypto { offset, data } = frame {
+                let fresh = crypto.on_crypto(offset, data)?;
+                handshake.extend_from_slice(&fresh);
+            }
+        }
+
+        // A complete ClientHello yet? (Shared with the TCP peek.)
+        if let Some(info) = crate::tls::peek::client_hello_info_from_handshake(&handshake)? {
+            return Ok(Some(info));
+        }
+
+        off += pkt_total;
     }
 
-    // Parse the ClientHello out of the in-order CRYPTO bytes — shared with the
-    // TCP peek. `Ok(None)` if the ClientHello isn't fully present yet.
-    crate::tls::peek::client_hello_info_from_handshake(&handshake)
+    // Walked every coalesced packet; the ClientHello isn't complete in this
+    // datagram (the rest is in a later one).
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -212,5 +247,126 @@ mod tests {
             // Every prefix must return cleanly (Ok(None) / Err), never panic.
             let _ = peek_initial_sni(&dg[..n]);
         }
+    }
+
+    /// Seal a hand-built Initial payload into a wire packet using v1 Initial
+    /// keys derived from `dcid` — lets us drive arbitrary frame layouts.
+    fn seal_initial(dcid: &[u8], plaintext: &mut [u8]) -> Vec<u8> {
+        use super::super::crypto::aead_seal;
+        use super::super::pkt::{apply_header_protection, build_long_header};
+        let (cs, _ss) = derive_initial_secrets(dcid);
+        let keys = derive_dir_keys(AeadAlg::Aes128Gcm, &cs);
+        let pn: u64 = 0;
+        let pn_len: u8 = 1;
+        let payload_len_field = pn_len as u64 + plaintext.len() as u64 + 16;
+        let (hdr, pn_offset) = build_long_header(
+            LongType::Initial,
+            QUIC_V1,
+            dcid,
+            &[],
+            &[],
+            pn,
+            pn_len,
+            payload_len_field,
+        );
+        let tag = aead_seal(&keys, pn, &hdr, plaintext); // encrypts in place
+        let mut pkt = hdr;
+        pkt.extend_from_slice(plaintext);
+        pkt.extend_from_slice(&tag);
+        let sample: [u8; 16] = pkt[pn_offset + 4..pn_offset + 4 + 16].try_into().unwrap();
+        let mask = keys.hp.mask(&sample).unwrap();
+        apply_header_protection(&mut pkt, pn_offset, pn_len, &mask, true);
+        pkt
+    }
+
+    fn sample_client_hello(sni: &str) -> Vec<u8> {
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{CipherSuite, ClientHello};
+        ClientHello {
+            legacy_version: 0x0303,
+            random: [7u8; 32],
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite(0x1301)],
+            extensions: alloc::vec![
+                ext::server_name(sni),
+                ext::alpn_protocols(&[b"h3".as_slice()]),
+            ],
+        }
+        .encode()
+    }
+
+    /// curl/ngtcp2 layout: PADDING frames BEFORE the CRYPTO frame. The peek must
+    /// skip them and still recover the ClientHello.
+    #[test]
+    fn padding_before_crypto_is_handled() {
+        use super::super::frame::Frame;
+        let ch = sample_client_hello("curl.example");
+        let dcid = [0x11u8; 8];
+        let mut pt = Vec::new();
+        pt.extend(core::iter::repeat_n(0u8, 30)); // leading PADDING
+        Frame::Crypto {
+            offset: 0,
+            data: &ch,
+        }
+        .encode(&mut pt);
+        let dg = seal_initial(&dcid, &mut pt);
+        let info = peek_initial_sni(&dg).expect("ok").expect("complete CH");
+        assert_eq!(info.server_name.as_deref(), Some("curl.example"));
+        assert_eq!(info.alpn_protocols, alloc::vec![b"h3".to_vec()]);
+    }
+
+    /// The ClientHello split across TWO coalesced Initial packets in a single
+    /// datagram (ngtcp2/curl emit this). The peek must process every coalesced
+    /// Initial, not just the first.
+    #[test]
+    fn coalesced_initials_reassemble_split_ch() {
+        use super::super::frame::Frame;
+        let ch = sample_client_hello("coalesce.example");
+        let dcid = [0x33u8; 8];
+        let mid = ch.len() / 2;
+        let mut pt1 = Vec::new();
+        Frame::Crypto {
+            offset: 0,
+            data: &ch[..mid],
+        }
+        .encode(&mut pt1);
+        let mut dg = seal_initial(&dcid, &mut pt1);
+        let mut pt2 = Vec::new();
+        Frame::Crypto {
+            offset: mid as u64,
+            data: &ch[mid..],
+        }
+        .encode(&mut pt2);
+        dg.extend_from_slice(&seal_initial(&dcid, &mut pt2));
+        let info = peek_initial_sni(&dg)
+            .expect("ok")
+            .expect("complete CH across coalesced Initials");
+        assert_eq!(info.server_name.as_deref(), Some("coalesce.example"));
+    }
+
+    /// ClientHello split across several CRYPTO frames (some out of order),
+    /// interleaved with PADDING — another shape real clients emit.
+    #[test]
+    fn split_and_reordered_crypto_is_reassembled() {
+        use super::super::frame::Frame;
+        let ch = sample_client_hello("split.example");
+        let dcid = [0x22u8; 8];
+        let mid = ch.len() / 2;
+        let mut pt = Vec::new();
+        // Second half first (offset = mid), then PADDING, then first half.
+        Frame::Crypto {
+            offset: mid as u64,
+            data: &ch[mid..],
+        }
+        .encode(&mut pt);
+        pt.extend(core::iter::repeat_n(0u8, 10));
+        Frame::Crypto {
+            offset: 0,
+            data: &ch[..mid],
+        }
+        .encode(&mut pt);
+        let dg = seal_initial(&dcid, &mut pt);
+        let info = peek_initial_sni(&dg).expect("ok").expect("complete CH");
+        assert_eq!(info.server_name.as_deref(), Some("split.example"));
     }
 }
