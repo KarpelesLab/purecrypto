@@ -97,6 +97,16 @@ impl core::error::Error for Error {}
 /// in `4..=2^32 − 1` and `salt.len()` in `8..=2^32 − 1` (RFC 9106 §3.1:
 /// the reference implementation's 8-byte minimum; 16 bytes is
 /// recommended).
+///
+/// # Untrusted parameters
+///
+/// `m_cost_kib` and `t_cost` have **no upper bound** here: Argon2 allocates
+/// `m_cost_kib · 1024` bytes and runs `t_cost` passes over them, so a
+/// hostile `(m, t)` pair is an OOM/CPU-exhaustion DoS vector. Callers that
+/// derive these costs from untrusted input — e.g. the `m=`/`t=` fields of a
+/// parsed PHC `$argon2...$` string — MUST clamp them to sane maxima before
+/// calling. (Compare PBES2, which caps the attacker-controlled PBKDF2
+/// iteration count it accepts from a key file.)
 pub fn argon2(
     params: &Argon2Params,
     password: &[u8],
