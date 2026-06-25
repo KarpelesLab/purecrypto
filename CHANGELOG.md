@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.23](https://github.com/KarpelesLab/purecrypto/compare/v0.6.22...v0.6.23) - 2026-06-25
+
+### Other
+
+- *(readme)* drop dated "Status: mostly stable" blockquote
+- add non-consuming peek_client_hello for per-connection cert selection
+
 ## [0.6.22](https://github.com/KarpelesLab/purecrypto/compare/v0.6.21...v0.6.22) - 2026-06-25
 
 ### Other
