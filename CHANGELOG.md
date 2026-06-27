@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.26](https://github.com/KarpelesLab/purecrypto/compare/v0.6.25...v0.6.26) - 2026-06-27
+
+### Other
+
+- add Streebog, Whirlpool, MarsupilamiFourteen and MD2
+- peek_initial_sni — handle coalesced Initial packets
+
 ## [0.6.25](https://github.com/KarpelesLab/purecrypto/compare/v0.6.24...v0.6.25) - 2026-06-25
 
 ### Other
