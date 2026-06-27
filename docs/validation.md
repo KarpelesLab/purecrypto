@@ -37,7 +37,7 @@ hand-derived correctness tests.
 |---|---|---|---|---|---|
 | `ct` | — (foundation) | unit (exhaustive u8/i8) | — | — | foundation |
 | `bignum` | — (foundation) | unit | — | — | yes (unconditional) |
-| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3 | RFC / NIST samples | — | — | MAC verify CT |
+| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; M14 oracle-derived (K12-validated) | — | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC) | RFC | — | — | built on CT AES |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
 | `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST | — | — | AES table-free; ARX |
@@ -183,7 +183,7 @@ Reported as **what the code is built to do** — not as an audited guarantee.
 - **Compat-only / legacy** (off by default or to be avoided in new code): the
   `tls-legacy` feature (SSL 3.0 / TLS 1.0/1.1 — BEAST/POODLE/Lucky13 residue,
   MD5/SHA-1 PRF, static-RSA); RSA PKCS#1 v1.5 *encryption* (Bleichenbacher
-  oracle); SHA-1/MD5/MD4/RIPEMD-160 (not collision-resistant); DES/3DES;
+  oracle); MD2/MD4/MD5/SHA-1/RIPEMD-160 (not collision-resistant); DES/3DES;
   finite-field `dh` (prefer ECDH); SM2 (regional). See
   [`recommended-usage.md`](recommended-usage.md).
 - **Stateful keys**: LMS and XMSS advance a one-time-key index on every

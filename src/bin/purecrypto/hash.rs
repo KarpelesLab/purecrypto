@@ -30,8 +30,13 @@ fn digest(alg: &str, data: &[u8]) -> Option<Vec<u8>> {
             h.finalize().to_vec()
         }
         "sha1" => hash::sha1(data).to_vec(),
+        "md2" => hash::md2(data).to_vec(),
         "md5" => hash::md5(data).to_vec(),
         "ripemd160" => hash::ripemd160(data).to_vec(),
+        "whirlpool" => hash::whirlpool(data).to_vec(),
+        "streebog256" => hash::streebog256(data).to_vec(),
+        "streebog512" => hash::streebog512(data).to_vec(),
+        "m14" => hash::m14(data).to_vec(),
         _ => return None,
     };
     Some(d)

@@ -127,7 +127,11 @@ typedef enum {
   PC_SHA1 = 17,
   PC_MD5 = 18,
   PC_RIPEMD160 = 19,
-  PC_ASCON_HASH256 = 20
+  PC_ASCON_HASH256 = 20,
+  PC_MD2 = 21,
+  PC_WHIRLPOOL = 22,
+  PC_STREEBOG256 = 23,
+  PC_STREEBOG512 = 24
 } pc_hash_id;
 
 /* PRF selectors for the SP 800-108 KBKDF (pc_kbkdf_counter / _feedback). */

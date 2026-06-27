@@ -55,7 +55,7 @@ Single crate, modules gated by Cargo features:
 | Layer            | Module      | Status |
 | ---------------- | ----------- | ------ |
 | Constant-time    | `ct`        | implemented |
-| Hashing          | `hash`      | SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
+| Hashing          | `hash`      | SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve/MarsupilamiFourteen, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, Whirlpool (ISO/IEC 10118-3), Streebog-256/512 (GOST R 34.11-2012), MD2/MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
 | Randomness       | `rng`       | RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
 | Symmetric cipher | `cipher`    | AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon`, AEZ v5 (robust AE) in `aez` |
 | MAC              | `mac`       | AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
@@ -182,9 +182,10 @@ echo -n abc | purecrypto hash sha3-256       # any algorithm from the `hash` mod
 
 Algorithms: `sha224`, `sha256`, `sha384`, `sha512`, `sha512-224`, `sha512-256`,
 `sha3-224`, `sha3-256`, `sha3-384`, `sha3-512`, `keccak256`, `blake2b256`,
-`blake2b384`, `blake2b512`, `blake2s256`, `blake3`, `sm3`, `sha1`, `md5`,
-`ripemd160`. (The XOFs `shake128`/`shake256` and the BLAKE2X/cSHAKE/KMAC
-variants are exposed through the Rust library, not the CLI.)
+`blake2b384`, `blake2b512`, `blake2s256`, `blake3`, `m14`, `sm3`, `whirlpool`,
+`streebog256`, `streebog512`, `sha1`, `md2`, `md5`, `ripemd160`. (The XOFs
+`shake128`/`shake256` and the BLAKE2X/cSHAKE/KMAC variants are exposed through
+the Rust library, not the CLI.)
 
 ### `rand` — randomness
 

@@ -7,9 +7,9 @@ use super::common::{PcStatus, guard, out_write, slice};
 use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
     Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, ExtendableOutput, Hmac, HmacSha224,
-    HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md5, Ripemd160,
-    Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512, Sha512_224,
-    Sha512_256, Sm3, XofReader,
+    HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md2, Md5,
+    Ripemd160, Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512,
+    Sha512_224, Sha512_256, Sm3, Streebog256, Streebog512, Whirlpool, XofReader,
 };
 
 /// Hash algorithm identifiers (mirror `PcHashId` in `purecrypto.h`).
@@ -35,6 +35,10 @@ pub mod id {
     pub const MD5: i32 = 18;
     pub const RIPEMD160: i32 = 19;
     pub const ASCON_HASH256: i32 = 20;
+    pub const MD2: i32 = 21;
+    pub const WHIRLPOOL: i32 = 22;
+    pub const STREEBOG256: i32 = 23;
+    pub const STREEBOG512: i32 = 24;
 }
 
 /// A runtime-selected hasher. (BLAKE3 carries a larger tree state than the
@@ -61,6 +65,10 @@ enum AnyHasher {
     Md5(Md5),
     Ripemd160(Ripemd160),
     AsconHash256(AsconHash256),
+    Md2(Md2),
+    Whirlpool(Whirlpool),
+    Streebog256(Streebog256),
+    Streebog512(Streebog512),
 }
 
 impl AnyHasher {
@@ -86,6 +94,10 @@ impl AnyHasher {
             id::MD5 => AnyHasher::Md5(Md5::new()),
             id::RIPEMD160 => AnyHasher::Ripemd160(Ripemd160::new()),
             id::ASCON_HASH256 => AnyHasher::AsconHash256(AsconHash256::new()),
+            id::MD2 => AnyHasher::Md2(Md2::new()),
+            id::WHIRLPOOL => AnyHasher::Whirlpool(Whirlpool::new()),
+            id::STREEBOG256 => AnyHasher::Streebog256(Streebog256::new()),
+            id::STREEBOG512 => AnyHasher::Streebog512(Streebog512::new()),
             _ => return None,
         })
     }
@@ -117,6 +129,10 @@ impl AnyHasher {
             AnyHasher::Md5(h) => u!(h),
             AnyHasher::Ripemd160(h) => u!(h),
             AnyHasher::AsconHash256(h) => u!(h),
+            AnyHasher::Md2(h) => u!(h),
+            AnyHasher::Whirlpool(h) => u!(h),
+            AnyHasher::Streebog256(h) => u!(h),
+            AnyHasher::Streebog512(h) => u!(h),
         }
     }
 
@@ -147,6 +163,10 @@ impl AnyHasher {
             AnyHasher::Md5(h) => f!(h),
             AnyHasher::Ripemd160(h) => f!(h),
             AnyHasher::AsconHash256(h) => f!(h),
+            AnyHasher::Md2(h) => f!(h),
+            AnyHasher::Whirlpool(h) => f!(h),
+            AnyHasher::Streebog256(h) => f!(h),
+            AnyHasher::Streebog512(h) => f!(h),
         }
     }
 }
@@ -240,8 +260,9 @@ pub unsafe extern "C" fn pc_hash_free(h: *mut PcHash) {
 }
 
 /// Computes HMAC of `msg` under `key`, with the hash selected by `alg`,
-/// writing the tag to `out`. Supports every hash supplied by
-/// [`pc_digest`] (SHA-1, SHA-2 family, SHA-3 family, SM3, RIPEMD-160).
+/// writing the tag to `out`. Supports the fixed-output hashes from
+/// [`pc_digest`] (SHA-1, SHA-2 family, SHA-3 family, SM3, RIPEMD-160, MD2,
+/// Whirlpool, Streebog-256/512).
 ///
 /// # Safety
 /// All pointers must be valid for their lengths; `out_len` non-NULL.
@@ -275,6 +296,10 @@ pub unsafe extern "C" fn pc_hmac(
             id::SHA3_512 => Hmac::<Sha3_512>::mac(k, m).as_ref().to_vec(),
             id::SM3 => Hmac::<Sm3>::mac(k, m).as_ref().to_vec(),
             id::RIPEMD160 => Hmac::<Ripemd160>::mac(k, m).as_ref().to_vec(),
+            id::MD2 => Hmac::<Md2>::mac(k, m).as_ref().to_vec(),
+            id::WHIRLPOOL => Hmac::<Whirlpool>::mac(k, m).as_ref().to_vec(),
+            id::STREEBOG256 => Hmac::<Streebog256>::mac(k, m).as_ref().to_vec(),
+            id::STREEBOG512 => Hmac::<Streebog512>::mac(k, m).as_ref().to_vec(),
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }

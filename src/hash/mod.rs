@@ -15,14 +15,17 @@
 //!   plus the keyed MACs [`Blake2bMac`]/[`Blake2sMac`].
 //! - [`Blake3`] — also an XOF, with keyed and key-derivation modes.
 //! - SM3: [`Sm3`].
-//! - Legacy (interop only, not collision-resistant): [`Md4`], [`Md5`],
+//! - National / other standards: [`Streebog256`]/[`Streebog512`]
+//!   (GOST R 34.11-2012), [`Whirlpool`] (ISO/IEC 10118-3).
+//! - Legacy (interop only, not collision-resistant): [`Md2`], [`Md4`], [`Md5`],
 //!   [`Sha1`], [`Ripemd160`].
 //!
 //! Extendable-output functions ([`ExtendableOutput`] or an inherent
 //! `finalize_xof`): [`Shake128`], [`Shake256`], [`CShake128`], [`CShake256`],
 //! [`Blake2xb`], [`Blake2xs`], [`Blake3`], [`KmacXof128`], [`KmacXof256`],
 //! [`TupleHash128`]/[`TupleHash256`], [`ParallelHash128`]/[`ParallelHash256`],
-//! [`TurboShake128`]/[`TurboShake256`], and [`KangarooTwelve`].
+//! [`TurboShake128`]/[`TurboShake256`], [`KangarooTwelve`], and
+//! [`MarsupilamiFourteen`].
 //!
 //! Message authentication codes ([`Mac`], with constant-time
 //! [`verify`](Mac::verify)): [`Hmac`], [`Kmac128`], [`Kmac256`],
@@ -38,6 +41,7 @@ mod hmac;
 mod k12;
 mod keccak;
 mod kmac;
+mod md2;
 mod md4;
 mod md5;
 mod ripemd160;
@@ -53,6 +57,8 @@ mod shake;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod simd_x86;
 mod sm3;
+mod streebog;
+mod whirlpool;
 mod zeroize;
 
 pub use blake2::{
@@ -63,12 +69,13 @@ pub use blake3::{Blake3, Blake3Reader, blake3};
 pub use hmac::{
     Hmac, HmacSha224, HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256,
 };
-pub use k12::{KangarooTwelve, TurboShake128, TurboShake256, k12};
+pub use k12::{KangarooTwelve, MarsupilamiFourteen, TurboShake128, TurboShake256, k12, m14};
 pub use keccak::KeccakReader;
 pub use kmac::{
     CShake128, CShake256, Kmac128, Kmac256, KmacXof128, KmacXof256, ParallelHash128,
     ParallelHash256, TupleHash128, TupleHash256,
 };
+pub use md2::{Md2, md2};
 pub use md4::{Md4, md4};
 pub use md5::{Md5, md5};
 pub use ripemd160::{Ripemd160, ripemd160};
@@ -81,6 +88,8 @@ pub use sha256::{Sha224, Sha256, sha224, sha256};
 pub use sha512::{Sha384, Sha512, Sha512_224, Sha512_256, sha384, sha512, sha512_224, sha512_256};
 pub use shake::{Shake128, Shake256, shake128, shake256};
 pub use sm3::{Sm3, sm3};
+pub use streebog::{Streebog256, Streebog512, streebog256, streebog512};
+pub use whirlpool::{Whirlpool, whirlpool};
 
 /// A cryptographic hash function with an incremental (streaming) interface.
 ///
