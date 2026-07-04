@@ -1,15 +1,14 @@
 name: Release binaries
 
-# Fires whenever a GitHub Release is published. release-plz creates the
-# release on its own (see release-plz.yml); this workflow attaches the
-# cross-built CLI binary, the C library (static + shared), and the C header.
-#
-# Also exposed via workflow_dispatch so a failed asset upload can be
-# retried against an existing release without re-tagging.
+# Attaches the cross-built CLI binary, the C library (static + shared), and
+# the C header to a GitHub Release. release-plz creates the release and then
+# dispatches this workflow explicitly (see release-plz.yml), so
+# workflow_dispatch is the sole, deterministic trigger — we do NOT also listen
+# on `release: published`, which would double-fire and race two upload runs
+# against the same release. The manual dispatch also lets a failed asset
+# upload be retried against an existing release without re-tagging.
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -23,9 +22,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Resolve the target tag once — `release` and `workflow_dispatch` use
-  # different paths in the event payload.
-  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+  # The release tag to upload against, supplied by the workflow_dispatch input.
+  TAG: ${{ inputs.tag }}
 
 jobs:
   build:
