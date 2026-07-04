@@ -37,7 +37,7 @@ hand-derived correctness tests.
 |---|---|---|---|---|---|
 | `ct` | — (foundation) | unit (exhaustive u8/i8) | — | — | foundation |
 | `bignum` | — (foundation) | unit | — | — | yes (unconditional) |
-| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; M14 oracle-derived (K12-validated) | — | — | MAC verify CT |
+| `hash` | FIPS 180-4, FIPS 202, SP 800-185, RFC 7693, BLAKE3, GOST R 34.11-2012 / RFC 6986 (Streebog), ISO/IEC 10118-3 (Whirlpool), K12/M14 paper, RFC 1319 (MD2) | RFC / NIST samples; M14 oracle-derived (K12-validated), cross-checked vs noble-hashes | OpenSSL (Whirlpool, SM3, SHAKE, BLAKE2), PyCryptodome (MD2), gostcrypto (Streebog), noble-hashes (M14, 14-round) | — | MAC verify CT |
 | `mac` | RFC 4418 (UMAC) | RFC | — | — | built on CT AES |
 | `rng` | SP 800-90A (HMAC-DRBG) | CAVP | — | — | n/a (public output) |
 | `cipher` | FIPS 197, SP 800-38A/C/D, RFC 8439/8452, RFC 3713 | RFC / NIST | — | — | AES table-free; ARX |

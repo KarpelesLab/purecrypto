@@ -156,7 +156,8 @@ mod tests {
     use super::*;
     use crate::test_util::from_hex;
 
-    // RFC 1319, Appendix A.5 test suite.
+    // RFC 1319, Appendix A.5 test suite. Cross-checked byte-for-byte against
+    // PyCryptodome's `Crypto.Hash.MD2` (OpenSSL 3.x dropped MD2 entirely).
     #[test]
     fn rfc1319_vectors() {
         assert_eq!(md2(b""), from_hex::<16>("8350e5a3e24c153df2275c9f80692773"));

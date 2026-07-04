@@ -452,14 +452,18 @@ mod tests {
 
     // MarsupilamiFourteen (Keccak-p[1600,14], rate 136, 64-byte CVs).
     //
-    // No direct hex KATs are published for the original 14-round M14 (the K12
-    // paper's Appendix B is K12-only, and later code packages replaced M14 with
-    // the 12-round CFRG `KT256`). These vectors were produced by an independent
-    // Python Keccak-p tree-hash reference that was first validated to reproduce
-    // every published K12 vector (paper Appendix B) and this module's own K12
-    // boundary vectors byte-for-byte, then re-parameterized to rate 136 / 64-byte
-    // CV / 14 rounds. Covers the single-node path, the 8191/8192 tree boundary,
-    // and a multi-leaf tree.
+    // No direct hex KATs are published for the original 14-round M14: it was
+    // never standardized (the K12 paper's Appendix B is K12-only, and later code
+    // packages replaced M14 with the 12-round CFRG `KT256`). These vectors were
+    // produced by an independent Python Keccak-p tree-hash reference — first
+    // validated to reproduce every published K12 vector (paper Appendix B) and
+    // this module's own K12 boundary vectors byte-for-byte, then re-parameterized
+    // to rate 136 / 64-byte CV / 14 rounds — and then cross-checked byte-for-byte
+    // against a second, independent implementation: noble-hashes v2.2.0's
+    // `_KangarooTwelve(136, 64, dkLen, 14)` (its `kt256` is the same tree with 12
+    // rounds, which produces different output, confirming the round count is what
+    // these vectors pin down). Covers the single-node path, the 8191/8192 tree
+    // boundary, and a multi-leaf tree.
     #[test]
     fn m14_vectors() {
         assert_eq!(

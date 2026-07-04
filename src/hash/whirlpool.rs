@@ -252,6 +252,8 @@ mod tests {
     use crate::test_util::from_hex;
 
     // ISO/IEC 10118-3 / NESSIE reference vectors (final 2003 Whirlpool).
+    // Cross-checked byte-for-byte against `openssl dgst -whirlpool` (the legacy
+    // provider in OpenSSL 3.x).
     #[test]
     fn reference_vectors() {
         assert_eq!(

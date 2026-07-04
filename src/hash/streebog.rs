@@ -431,6 +431,9 @@ mod tests {
     use super::*;
     use crate::test_util::from_hex;
 
+    // The RFC 6986 vectors below (empty string and the §10 worked examples M1/M2)
+    // are additionally cross-checked byte-for-byte against the independent
+    // `gostcrypto` pure-Python GOST implementation.
     #[test]
     fn empty_string() {
         assert_eq!(
