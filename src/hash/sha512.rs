@@ -4,7 +4,7 @@
 use super::Digest;
 
 /// SHA-512 initial hash value.
-const H512: [u64; 8] = [
+pub(crate) const H512: [u64; 8] = [
     0x6a09_e667_f3bc_c908,
     0xbb67_ae85_84ca_a73b,
     0x3c6e_f372_fe94_f82b,
@@ -249,7 +249,7 @@ fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
 
 /// Portable software SHA-512 compression (the constant-time fallback).
 #[inline]
-fn compress512_soft(h: &mut [u64; 8], block: &[u8; 128]) {
+pub(crate) fn compress512_soft(h: &mut [u64; 8], block: &[u8; 128]) {
     let mut w = [0u64; 80];
     for (word, chunk) in w.iter_mut().zip(block.chunks_exact(8)) {
         *word = u64::from_be_bytes(chunk.try_into().unwrap());

@@ -171,6 +171,18 @@ fn main() {
         bench_latency("ML-KEM-768 decaps", t, || {
             black_box(dk.decapsulate(black_box(&ct)));
         });
+
+        // SLH-DSA (hash-based; dominated by WOTS+/FORS hashing).
+        {
+            use purecrypto::slhdsa::{ParamSet, PrivateKey};
+            let (sk, _pk) = PrivateKey::generate(ParamSet::Sha2_192s, &mut rng);
+            bench_latency("SLH-DSA-SHA2-192s keygen", t, || {
+                black_box(PrivateKey::generate(ParamSet::Sha2_192s, &mut rng));
+            });
+            bench_latency("SLH-DSA-SHA2-192s sign", t, || {
+                black_box(sk.sign_deterministic(b"bench message", &[]).unwrap());
+            });
+        }
     }
     println!();
 }

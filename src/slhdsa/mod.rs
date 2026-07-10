@@ -160,9 +160,10 @@ fn wots_pk_gen(
         );
     }
     // Every chain runs the full 0..15 range and the chains are mutually
-    // independent, so on x86_64+AVX2 for the SHA-2 n=16 sets (where `F` is
-    // SHA-256) run them eight at a time through the multi-buffer kernel — this
-    // dominates WOTS+ keygen and hypertree building.
+    // independent, so on x86_64+AVX2 for the SHA-2 sets (where `F` is SHA-256
+    // for every n — FIPS 205 §11.2) run them eight at a time through the
+    // multi-buffer kernel — this dominates WOTS+ keygen and hypertree
+    // building.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     let batched = if wots_x8::eligible(p) && crate::hash::sha256_mb::supported() {
         wots_x8::full_chains(p, pk_seed, addr, tmp);
@@ -187,8 +188,9 @@ fn wots_pk_gen(
 }
 
 /// Fast differential test: the batched WOTS+ chains must equal the scalar
-/// `wots_chain` loop over the same chain-start values, for a SHA-2 n=16 set.
-/// This avoids the multi-second ACVP KAT runs while pinning the AVX2 layout.
+/// `wots_chain` loop over the same chain-start values, for every SHA-2 set
+/// (n = 16/24/32). This avoids the multi-second ACVP KAT runs while pinning
+/// the AVX2 layout.
 #[cfg(all(test, feature = "std", target_arch = "x86_64"))]
 mod wots_x8_tests {
     use super::*;
@@ -198,82 +200,104 @@ mod wots_x8_tests {
         if !crate::hash::sha256_mb::supported() {
             return;
         }
-        // SLH-DSA-SHA2-128s: !is_shake, n=16, len=35.
-        let p = ParamSet::Sha2_128s.params();
-        let n = p.n as usize;
-        let total = p.len as usize * n;
+        for set in [
+            ParamSet::Sha2_128s,
+            ParamSet::Sha2_192s,
+            ParamSet::Sha2_256s,
+        ] {
+            let p = set.params();
+            let n = p.n as usize;
+            let total = p.len as usize * n;
 
-        let mut starts = vec![0u8; total];
-        for (i, b) in starts.iter_mut().enumerate() {
-            *b = (i.wrapping_mul(7).wrapping_add(1)) as u8;
+            let mut starts = vec![0u8; total];
+            for (i, b) in starts.iter_mut().enumerate() {
+                *b = (i.wrapping_mul(7).wrapping_add(1)) as u8;
+            }
+            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+
+            let mut base = Adrs::new(p.is_shake);
+            base.set_type_and_clear(AdrsType::WotsHash);
+            base.set_layer(2);
+            base.set_tree(0x0102_0304_0506_0708);
+            base.set_key_pair(42);
+
+            // Scalar reference: full 0..15 chains.
+            let mut tmp_scalar = starts.clone();
+            for i in 0..p.len {
+                let mut a = base;
+                a.set_chain(i);
+                let lo = i as usize * n;
+                wots_chain(p, &pk_seed, &mut tmp_scalar[lo..lo + n], 0, 15, &mut a);
+            }
+
+            // Batched.
+            let mut tmp_batched = starts.clone();
+            wots_x8::full_chains(p, &pk_seed, &base, &mut tmp_batched);
+
+            assert_eq!(tmp_scalar, tmp_batched, "set {set:?}");
         }
-        let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
-
-        let mut base = Adrs::new(p.is_shake);
-        base.set_type_and_clear(AdrsType::WotsHash);
-        base.set_layer(2);
-        base.set_tree(0x0102_0304_0506_0708);
-        base.set_key_pair(42);
-
-        // Scalar reference: full 0..15 chains.
-        let mut tmp_scalar = starts.clone();
-        for i in 0..p.len {
-            let mut a = base;
-            a.set_chain(i);
-            let lo = i as usize * n;
-            wots_chain(p, &pk_seed, &mut tmp_scalar[lo..lo + n], 0, 15, &mut a);
-        }
-
-        // Batched.
-        let mut tmp_batched = starts.clone();
-        wots_x8::full_chains(p, &pk_seed, &base, &mut tmp_batched);
-
-        assert_eq!(tmp_scalar, tmp_batched);
     }
 }
 
-/// Multi-buffer (AVX2) WOTS+ chain evaluation for SLH-DSA's SHA-2 n=16 sets:
-/// eight independent F-chains hashed in lockstep through the 8-way SHA-256
-/// kernel. Produces byte-identical output to the scalar [`wots_chain`] loop
-/// (pinned by a differential test). For n=16, `F(pk_seed, addr, m1)` is
-/// `SHA256(pk_seed[..16] ‖ 0^48 ‖ addr(22) ‖ m1[..16])` — a 102-byte, two-block
-/// message whose first block (`pk_seed ‖ 0^48`) is constant, so its midstate is
-/// precomputed once and reused for every lane and step.
+/// Multi-buffer (AVX2) WOTS+ chain evaluation for SLH-DSA's SHA-2 sets: eight
+/// independent F-chains hashed in lockstep through the 8-way SHA-256 kernel.
+/// Produces byte-identical output to the scalar [`wots_chain`] loop (pinned by
+/// a differential test). In the SHA-2 instantiation `F(pk_seed, addr, m1)` is
+/// `SHA256(pk_seed[..n] ‖ 0^(64−n) ‖ addr(22) ‖ m1[..n])` for **every** n
+/// (16/24/32 — FIPS 205 §11.2; only `H`/`T` switch to SHA-512 at n ≥ 24) — a
+/// two-block message whose first block (`pk_seed ‖ 0^(64−n)`) is constant, so
+/// its midstate is precomputed once and reused for every lane and step.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 mod wots_x8 {
     use super::adrs::Adrs;
-    use super::params::Params;
+    use super::params::{MAX_N, Params};
     use crate::hash::sha256::{H256, compress256_soft};
     use crate::hash::sha256_mb::{LANES, compress8};
 
-    /// The batcher handles only the SHA-2 (`!is_shake`) sets with `n == 16`,
-    /// where `F` is SHA-256. n=24/32 use SHA-512 and SHAKE uses Keccak.
+    /// The batcher handles every SHA-2 (`!is_shake`) set: `F` is SHA-256 for
+    /// all of them, and for n ≤ 32 the variable tail (`addr(22) ‖ m1(n) ‖
+    /// 0x80-padding ‖ 8-byte length`) fits a single second block. SHAKE sets
+    /// use Keccak and stay scalar.
     pub(super) fn eligible(p: &Params) -> bool {
-        !p.is_shake && p.n == 16
+        !p.is_shake && matches!(p.n, 16 | 24 | 32)
     }
 
-    /// Second block of the 102-byte `F` message: `addr(22) ‖ m1(16) ‖ 0x80 ‖
-    /// 0…0 ‖ len`, with `len = 816` bits (`102 * 8`). `addr` is the 22-byte
-    /// compressed ADRS; `m1` is the 16-byte chain value.
+    /// Second block of the `(86 + N)`-byte `F` message: `addr(22) ‖ m1(N) ‖
+    /// 0x80 ‖ 0…0 ‖ len`, with `len = (64 + 22 + N) · 8` bits. `addr` is the
+    /// 22-byte compressed ADRS; `m1` is the N-byte chain value. Const-generic
+    /// over N so the copies compile to fixed-size moves in the hot loop.
     #[inline]
-    fn block1_f(addr: &[u8], m1: &[u8; 16]) -> [u8; 64] {
+    pub(super) fn block1_f<const N: usize>(addr: &[u8], m1: &[u8; N]) -> [u8; 64] {
+        const { assert!(N <= MAX_N) };
         debug_assert_eq!(addr.len(), 22);
         let mut b = [0u8; 64];
         b[..22].copy_from_slice(addr);
-        b[22..38].copy_from_slice(m1);
-        b[38] = 0x80;
-        b[56..64].copy_from_slice(&816u64.to_be_bytes());
+        b[22..22 + N].copy_from_slice(m1);
+        b[22 + N] = 0x80;
+        let bits = ((64 + 22 + N) * 8) as u64;
+        b[56..64].copy_from_slice(&bits.to_be_bytes());
         b
     }
 
-    /// Big-endian serialization of a SHA-256 state, truncated to 16 bytes (n).
+    /// Big-endian serialization of a SHA-256 state, truncated to N bytes
+    /// (always a multiple of 4 for the standardized sets).
     #[inline]
-    fn state_be16(s: &[u32; 8]) -> [u8; 16] {
-        let mut o = [0u8; 16];
-        for (i, w) in s.iter().take(4).enumerate() {
-            o[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+    pub(super) fn state_be<const N: usize>(s: &[u32; 8], out: &mut [u8; N]) {
+        const { assert!(N.is_multiple_of(4) && N <= 32) };
+        for i in 0..N / 4 {
+            out[i * 4..i * 4 + 4].copy_from_slice(&s[i].to_be_bytes());
         }
-        o
+    }
+
+    /// SHA-256 midstate after the constant first block `pk_seed[..n] ‖
+    /// 0^(64−n)` — shared by every `F`/`PRF` evaluation of the key.
+    #[inline]
+    pub(super) fn midstate256(pk_seed: &[u8], n: usize) -> [u32; 8] {
+        let mut b0 = [0u8; 64];
+        b0[..n].copy_from_slice(&pk_seed[..n]);
+        let mut mid = H256;
+        compress256_soft(&mut mid, &b0);
+        mid
     }
 
     /// Runs every WOTS+ chain over its full `0..15` range, eight chains at a
@@ -282,13 +306,16 @@ mod wots_x8 {
     /// layer/tree/key-pair fields (type WotsHash); chain/hash are set per lane
     /// and step.
     pub(super) fn full_chains(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
-        const N: usize = 16;
-        // Constant first block: pk_seed[..16] ‖ 0^48 → one midstate, reused for
-        // every lane and step (pk_seed is fixed for the whole key).
-        let mut b0 = [0u8; 64];
-        b0[..N].copy_from_slice(&pk_seed[..N]);
-        let mut mid = H256;
-        compress256_soft(&mut mid, &b0);
+        // Monomorphize on n (`eligible` admits only the SHA-2 sets).
+        match p.n {
+            16 => full_chains_n::<16>(p, pk_seed, base, tmp),
+            24 => full_chains_n::<24>(p, pk_seed, base, tmp),
+            _ => full_chains_n::<32>(p, pk_seed, base, tmp),
+        }
+    }
+
+    fn full_chains_n<const N: usize>(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
+        let mid = midstate256(pk_seed, N);
 
         let len = p.len as usize;
         let mut c0 = 0usize;
@@ -312,7 +339,7 @@ mod wots_x8 {
                 let mut st = [mid; LANES];
                 compress8(&mut st, &b1);
                 for (l, io) in inout.iter_mut().enumerate() {
-                    *io = state_be16(&st[l]);
+                    state_be(&st[l], io);
                 }
             }
 
@@ -606,6 +633,29 @@ fn fors_node(
     addr: &mut Adrs,
     out: &mut [u8],
 ) {
+    // On x86_64+AVX2, SHA-2 sets compute height-3 subtrees batched: the eight
+    // leaves' PRF+F through the 8-way SHA-256 kernel and the sibling `H`
+    // merges through the 4-way SHA-512 kernel (n ≥ 24) or the SHA-256 kernel
+    // (n = 16). Deeper recursions land here for each height-3 subtree.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if layer == 3 && fors_x4::eligible(p) {
+        fors_x4::subtree8(p, pk_seed, sk_seed, node_id, addr, out);
+        return;
+    }
+    fors_node_scalar(p, pk_seed, sk_seed, node_id, layer, addr, out);
+}
+
+/// Scalar recursion for [`fors_node`]. Children re-enter `fors_node`, so trees
+/// higher than 3 still batch their height-3 subtrees.
+fn fors_node_scalar(
+    p: &Params,
+    pk_seed: &[u8],
+    sk_seed: &[u8],
+    node_id: u32,
+    layer: u32,
+    addr: &mut Adrs,
+    out: &mut [u8],
+) {
     let n = p.n as usize;
     if layer == 0 {
         let mut sk = [0u8; MAX_N];
@@ -637,6 +687,269 @@ fn fors_node(
         addr.set_tree_height(layer);
         addr.set_tree_index(node_id);
         hash::h(p, pk_seed, addr.bytes(), &lnode[..n], &rnode[..n], out);
+    }
+}
+
+/// Multi-buffer (AVX2) FORS subtree evaluation for the SHA-2 sets: a height-3
+/// subtree is eight leaves (PRF + F, both SHA-256 for every n — batched
+/// through the 8-way SHA-256 kernel) merged by seven `H` calls (SHA-512 for
+/// n ≥ 24, batched through the 4-lane SHA-512 kernel; SHA-256 for n = 16,
+/// batched 8-wide). Produces byte-identical output to the scalar
+/// [`fors_node_scalar`] recursion (pinned by a differential test). Like `F`,
+/// `H`'s first block (`pk_seed ‖ 0^(blk−n)`) is constant, so its midstate is
+/// computed once per subtree.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+mod fors_x4 {
+    use super::adrs::{Adrs, AdrsType};
+    use super::params::Params;
+    use super::wots_x8::{block1_f, midstate256, state_be};
+    use crate::hash::sha256_mb::compress8;
+    use crate::hash::sha512::{H512, compress512_soft};
+    use crate::hash::sha512_mb::compress4;
+
+    /// Same coverage as the WOTS batcher: every SHA-2 (`!is_shake`) set. Both
+    /// kernels are AVX2, so one runtime check would do; keep both for clarity.
+    pub(super) fn eligible(p: &Params) -> bool {
+        !p.is_shake
+            && matches!(p.n, 16 | 24 | 32)
+            && crate::hash::sha256_mb::supported()
+            && crate::hash::sha512_mb::supported()
+    }
+
+    /// Second block of the SHA-512 `H` message: `addr(22) ‖ l(N) ‖ r(N) ‖ 0x80
+    /// ‖ 0…0 ‖ len`, with `len = (128 + 22 + 2N) · 8` bits (the n ≥ 24 sets).
+    #[inline]
+    fn block1_h512<const N: usize>(addr: &[u8], l: &[u8; N], r: &[u8; N]) -> [u8; 128] {
+        const { assert!(N == 24 || N == 32) };
+        debug_assert_eq!(addr.len(), 22);
+        let mut b = [0u8; 128];
+        b[..22].copy_from_slice(addr);
+        b[22..22 + N].copy_from_slice(l);
+        b[22 + N..22 + 2 * N].copy_from_slice(r);
+        b[22 + 2 * N] = 0x80;
+        let bits = ((128 + 22 + 2 * N) * 8) as u64;
+        b[120..128].copy_from_slice(&bits.to_be_bytes());
+        b
+    }
+
+    /// Second block of the SHA-256 `H` message (the n = 16 sets): `addr(22) ‖
+    /// l(16) ‖ r(16) ‖ 0x80 ‖ 0…0 ‖ len`, with `len = 944` bits (`118 · 8`).
+    #[inline]
+    fn block1_h256(addr: &[u8], l: &[u8; 16], r: &[u8; 16]) -> [u8; 64] {
+        debug_assert_eq!(addr.len(), 22);
+        let mut b = [0u8; 64];
+        b[..22].copy_from_slice(addr);
+        b[22..38].copy_from_slice(l);
+        b[38..54].copy_from_slice(r);
+        b[54] = 0x80;
+        b[56..64].copy_from_slice(&944u64.to_be_bytes());
+        b
+    }
+
+    /// Big-endian serialization of a SHA-512 state, truncated to N bytes
+    /// (N = 24/32; both multiples of 8).
+    #[inline]
+    fn state_be64<const N: usize>(s: &[u64; 8], out: &mut [u8; N]) {
+        const { assert!(N.is_multiple_of(8) && N <= 64) };
+        for i in 0..N / 8 {
+            out[i * 8..i * 8 + 8].copy_from_slice(&s[i].to_be_bytes());
+        }
+    }
+
+    /// Computes the eight leaves of a height-3 subtree — the PRF secret
+    /// values, then F over each — both 8-wide through the SHA-256 kernel.
+    fn leaves8<const N: usize>(
+        sk_seed: &[u8],
+        mid256: &[u32; 8],
+        leaf0: u32,
+        addr: &mut Adrs,
+    ) -> [[u8; N]; 8] {
+        let sk: &[u8; N] = (&sk_seed[..N]).try_into().unwrap();
+        let mut sk_addr = *addr;
+        sk_addr.set_type_and_clear(AdrsType::ForsPrf);
+        sk_addr.copy_key_pair(addr);
+        let mut blocks = [[0u8; 64]; 8];
+        for (l, slot) in blocks.iter_mut().enumerate() {
+            sk_addr.set_tree_index(leaf0 + l as u32);
+            *slot = block1_f(sk_addr.bytes(), sk);
+        }
+        let mut st = [*mid256; 8];
+        compress8(&mut st, &blocks);
+        let mut nodes = [[0u8; N]; 8];
+        for (l, node) in nodes.iter_mut().enumerate() {
+            state_be(&st[l], node);
+        }
+
+        addr.set_tree_height(0);
+        for (l, slot) in blocks.iter_mut().enumerate() {
+            addr.set_tree_index(leaf0 + l as u32);
+            *slot = block1_f(addr.bytes(), &nodes[l]);
+        }
+        let mut st = [*mid256; 8];
+        compress8(&mut st, &blocks);
+        for (l, node) in nodes.iter_mut().enumerate() {
+            state_be(&st[l], node);
+        }
+        nodes
+    }
+
+    /// One merge level for the n = 16 sets (`H` is SHA-256): hashes `pairs`
+    /// sibling pairs `(nodes[2j], nodes[2j+1])` into `nodes[j]` with tree
+    /// index `idx0 + j` at `height`. Idle lanes duplicate pair 0.
+    fn merge_level256(
+        mid256: &[u32; 8],
+        addr: &mut Adrs,
+        idx0: u32,
+        height: u32,
+        nodes: &mut [[u8; 16]; 8],
+        pairs: usize,
+    ) {
+        addr.set_tree_height(height);
+        let mut blocks = [[0u8; 64]; 8];
+        for (j, slot) in blocks.iter_mut().enumerate() {
+            let pair = if j < pairs { j } else { 0 };
+            addr.set_tree_index(idx0 + pair as u32);
+            *slot = block1_h256(addr.bytes(), &nodes[2 * pair], &nodes[2 * pair + 1]);
+        }
+        let mut st = [*mid256; 8];
+        compress8(&mut st, &blocks);
+        for j in 0..pairs {
+            state_be(&st[j], &mut nodes[j]);
+        }
+    }
+
+    /// One merge level for the n = 24/32 sets (`H` is SHA-512), through the
+    /// 4-lane SHA-512 kernel. Same contract as [`merge_level256`].
+    fn merge_level512<const N: usize>(
+        mid512: &[u64; 8],
+        addr: &mut Adrs,
+        idx0: u32,
+        height: u32,
+        nodes: &mut [[u8; N]; 8],
+        pairs: usize,
+    ) {
+        addr.set_tree_height(height);
+        let mut blocks = [[0u8; 128]; 4];
+        for (j, slot) in blocks.iter_mut().enumerate() {
+            let pair = if j < pairs { j } else { 0 };
+            addr.set_tree_index(idx0 + pair as u32);
+            *slot = block1_h512(addr.bytes(), &nodes[2 * pair], &nodes[2 * pair + 1]);
+        }
+        let mut st = [*mid512; 4];
+        compress4(&mut st, &blocks);
+        for j in 0..pairs {
+            state_be64(&st[j], &mut nodes[j]);
+        }
+    }
+
+    /// Computes FORS node `node_id` at layer 3 — a height-3 subtree over
+    /// leaves `8·node_id .. 8·node_id + 8` — writing the n-byte root to `out`.
+    /// Hash-for-hash identical to the scalar recursion (same ADRS values).
+    pub(super) fn subtree8(
+        p: &Params,
+        pk_seed: &[u8],
+        sk_seed: &[u8],
+        node_id: u32,
+        addr: &mut Adrs,
+        out: &mut [u8],
+    ) {
+        // Monomorphize on n (`eligible` admits only the SHA-2 sets).
+        match p.n {
+            16 => subtree16(p, pk_seed, sk_seed, node_id, addr, out),
+            24 => subtree512::<24>(p, pk_seed, sk_seed, node_id, addr, out),
+            _ => subtree512::<32>(p, pk_seed, sk_seed, node_id, addr, out),
+        }
+    }
+
+    /// [`subtree8`] for the n = 16 sets, where `H` is SHA-256 (8-wide, idle
+    /// lanes duplicated on the upper levels).
+    fn subtree16(
+        p: &Params,
+        pk_seed: &[u8],
+        sk_seed: &[u8],
+        node_id: u32,
+        addr: &mut Adrs,
+        out: &mut [u8],
+    ) {
+        let mid256 = midstate256(pk_seed, 16);
+        let mut nodes = leaves8::<16>(sk_seed, &mid256, node_id * 8, addr);
+        // Merge levels 1 and 2 batched; the top level is a single pair, so it
+        // goes through the scalar `H` (which also restores the ADRS state the
+        // scalar recursion leaves behind).
+        merge_level256(&mid256, addr, node_id * 4, 1, &mut nodes, 4);
+        merge_level256(&mid256, addr, node_id * 2, 2, &mut nodes, 2);
+        addr.set_tree_height(3);
+        addr.set_tree_index(node_id);
+        super::hash::h(p, pk_seed, addr.bytes(), &nodes[0], &nodes[1], out);
+    }
+
+    /// [`subtree8`] for the n = 24/32 sets, where `H` is SHA-512 (4-wide).
+    fn subtree512<const N: usize>(
+        p: &Params,
+        pk_seed: &[u8],
+        sk_seed: &[u8],
+        node_id: u32,
+        addr: &mut Adrs,
+        out: &mut [u8],
+    ) {
+        let mid256 = midstate256(pk_seed, N);
+        // SHA-512 midstate over the constant block `pk_seed ‖ 0^(128−N)`.
+        let mid512 = {
+            let mut b0 = [0u8; 128];
+            b0[..N].copy_from_slice(&pk_seed[..N]);
+            let mut m = H512;
+            compress512_soft(&mut m, &b0);
+            m
+        };
+        let mut nodes = leaves8::<N>(sk_seed, &mid256, node_id * 8, addr);
+        // Merge levels 1 and 2 batched; the top level is a single pair, so it
+        // goes through the scalar `H` (which also restores the ADRS state the
+        // scalar recursion leaves behind).
+        merge_level512::<N>(&mid512, addr, node_id * 4, 1, &mut nodes, 4);
+        merge_level512::<N>(&mid512, addr, node_id * 2, 2, &mut nodes, 2);
+        addr.set_tree_height(3);
+        addr.set_tree_index(node_id);
+        super::hash::h(p, pk_seed, addr.bytes(), &nodes[0], &nodes[1], out);
+    }
+}
+
+/// Fast differential test: the batched height-3 FORS subtree must equal the
+/// pure scalar recursion (children of `fors_node_scalar` at layer ≤ 2 never
+/// re-batch), for every SHA-2 set (n = 16/24/32).
+#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
+mod fors_x4_tests {
+    use super::*;
+
+    #[test]
+    fn subtree_matches_scalar() {
+        if !crate::hash::sha256_mb::supported() {
+            return;
+        }
+        use ParamSet::*;
+        for set in [
+            Sha2_128s, Sha2_128f, Sha2_192s, Sha2_192f, Sha2_256s, Sha2_256f,
+        ] {
+            let p = set.params();
+            let n = p.n as usize;
+            let pk_seed: Vec<u8> = (0..n).map(|i| (i * 3 + 5) as u8).collect();
+            let sk_seed: Vec<u8> = (0..n).map(|i| (i * 11 + 1) as u8).collect();
+
+            let mut base = Adrs::new(p.is_shake);
+            base.set_type_and_clear(AdrsType::ForsTree);
+            base.set_layer(0);
+            base.set_tree(0x1122_3344_5566_7788);
+            base.set_key_pair(3);
+
+            for node_id in [0u32, 5] {
+                let mut want = [0u8; MAX_N];
+                let mut a = base;
+                fors_node_scalar(p, &pk_seed, &sk_seed, node_id, 3, &mut a, &mut want);
+                let mut got = [0u8; MAX_N];
+                let mut b = base;
+                fors_x4::subtree8(p, &pk_seed, &sk_seed, node_id, &mut b, &mut got);
+                assert_eq!(want[..n], got[..n], "set {set:?} node {node_id}");
+            }
+        }
     }
 }
 

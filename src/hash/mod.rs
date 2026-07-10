@@ -50,7 +50,9 @@ pub(crate) mod sha256;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
 pub(crate) mod sha256_mb;
 mod sha3;
-mod sha512;
+pub(crate) mod sha512;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) mod sha512_mb;
 #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod sha_hw;
 mod shake;
