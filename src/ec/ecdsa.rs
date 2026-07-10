@@ -209,8 +209,13 @@ impl EcdsaPublicKey {
         let u1 = fq.mul_mod(&z, &w);
         let u2 = fq.mul_mod(&sig.r, &w);
 
+        // Variable-time double-scalar multiplication is sound here — and
+        // ONLY here: every input (signature, message digest, public key) is
+        // public in the verification setting, so timing reveals nothing an
+        // attacker does not already know. Signing and ECDH keep the
+        // constant-time `mul_generator` / `scalar_mul` paths.
         let point = curve.lift_affine(&self.x, &self.y);
-        let sum = curve.point_add(&curve.mul_generator(&u1), &curve.scalar_mul(&u2, &point));
+        let sum = curve.mul_double_vartime(&u1, &u2, &point);
         let (vx, _) = curve.to_affine(&sum).ok_or(Error::Verification)?;
         let v = vx.reduce(&n);
 
@@ -524,6 +529,76 @@ mod tests {
         let mut sec1 = priv_key().public_key().to_sec1();
         sec1[64] ^= 1; // perturb Y
         assert_eq!(EcdsaPublicKey::from_sec1(&sec1), Err(Error::InvalidInput));
+    }
+
+    /// Reference verification over the constant-time scalar-multiplication
+    /// paths (`mul_generator` + `scalar_mul`) — the exact computation
+    /// `verify_prehash` performed before the variable-time double-scalar
+    /// path was introduced.
+    fn verify_ct_reference(pk: &EcdsaPublicKey, prehash: &[u8], sig: &Signature) -> bool {
+        let curve = P256::new();
+        let n = P256::order();
+        let fq = MontModulus::new(n);
+        if !in_range(&sig.r, &n) || !in_range(&sig.s, &n) {
+            return false;
+        }
+        let z = bits2int(prehash).reduce(&n);
+        let w = fq.inv_prime(&sig.s);
+        let u1 = fq.mul_mod(&z, &w);
+        let u2 = fq.mul_mod(&sig.r, &w);
+        let point = curve.lift_affine(&pk.x, &pk.y);
+        let sum = curve.point_add(&curve.mul_generator(&u1), &curve.scalar_mul(&u2, &point));
+        match curve.to_affine(&sum) {
+            Some((vx, _)) => bool::from(vx.reduce(&n).ct_eq(&sig.r)),
+            None => false,
+        }
+    }
+
+    /// The variable-time verify path must accept exactly what the
+    /// constant-time path accepts: differential over many random
+    /// sign/verify pairs, plus corrupted signatures (bit-flipped r, s and
+    /// digest, swapped halves, and the n−s malleability twin, which both
+    /// paths accept by ECDSA's definition).
+    #[test]
+    fn vartime_verify_matches_constant_time_path() {
+        use crate::hash::Digest;
+        let mut rng = HmacDrbg::<Sha256>::new(b"ecdsa-vartime-diff", b"nonce", &[]);
+        for i in 0..48u32 {
+            let sk = EcdsaPrivateKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let msg = [i as u8, (i >> 8) as u8, 0xA5, 0x5A];
+            let digest = Sha256::digest(&msg);
+            let sig = sk.sign_prehash::<Sha256>(digest.as_ref()).unwrap();
+
+            let agree = |sig: &Signature, digest: &[u8]| {
+                let vt = pk.verify_prehash(digest, sig).is_ok();
+                let ct = verify_ct_reference(&pk, digest, sig);
+                assert_eq!(vt, ct, "vartime/ct verdict mismatch (iteration {i})");
+                vt
+            };
+
+            // Valid signature: both accept.
+            assert!(agree(&sig, digest.as_ref()));
+            // Malleability twin (r, n − s): both accept.
+            let twin = Signature {
+                r: sig.r,
+                s: P256::order().wrapping_sub(&sig.s),
+            };
+            assert!(agree(&twin, digest.as_ref()));
+            // Corrupted r / s / digest and swapped halves: both reject.
+            let mut bad_r = sig.clone();
+            bad_r.r = bad_r.r.wrapping_add(&Fe::ONE);
+            assert!(!agree(&bad_r, digest.as_ref()));
+            let mut bad_s = sig.clone();
+            bad_s.s = bad_s.s.wrapping_add(&Fe::ONE);
+            assert!(!agree(&bad_s, digest.as_ref()));
+            let mut bad_digest = [0u8; 32];
+            bad_digest.copy_from_slice(digest.as_ref());
+            bad_digest[i as usize % 32] ^= 1 << (i % 8);
+            assert!(!agree(&sig, &bad_digest));
+            let swapped = Signature { r: sig.s, s: sig.r };
+            assert!(!agree(&swapped, digest.as_ref()));
+        }
     }
 
     #[test]
