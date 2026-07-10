@@ -30,7 +30,7 @@ use field::{D, N, Poly, ntt_mul, sub};
 use reduce::{
     GAMMA2_32, GAMMA2_88, decompose, high_bits, inf_norm, make_hint, power2_round, use_hint,
 };
-use sample::{expand_mask, sample_bounded_poly, sample_challenge, sample_ntt_poly};
+use sample::{expand_mask_vec, sample_bounded_poly, sample_challenge, sample_ntt_poly};
 
 /// Size of the key-generation seed.
 pub const SEED_SIZE: usize = 32;
@@ -448,13 +448,9 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     let mut r0 = [[0i32; N]; K];
     let mut ct0 = [Poly::zero(); K];
     let sig = loop {
-        // Masking vector y.
-        for (i, yi) in y.iter_mut().enumerate() {
-            let nu = kappa + i as u16;
-            seed_buf[64] = nu as u8;
-            seed_buf[65] = (nu >> 8) as u8;
-            *yi = expand_mask(&seed_buf, p.gamma1_bits);
-        }
+        // Masking vector y (four SHAKE256 streams per 4-way Keccak
+        // permutation when the AVX2 kernel is available).
+        expand_mask_vec(&mut y, &mut seed_buf, kappa, p.gamma1_bits);
 
         for (i, yi) in y_ntt.iter_mut().enumerate() {
             *yi = y[i];

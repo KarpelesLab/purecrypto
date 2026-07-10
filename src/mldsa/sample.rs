@@ -166,6 +166,106 @@ pub(crate) fn expand_mask(seed: &[u8], gamma1_bits: u32) -> Poly {
     }
 }
 
+/// ExpandMask for a whole masking vector: `y[i] = ExpandMask(seed_buf[..64] ‖
+/// LE16(kappa + i))`, batching full groups of four SHAKE256 streams through
+/// the 4-way Keccak kernel when available (scalar remainder, as in the ML-KEM
+/// noise sampler). Byte-identical to the scalar per-index
+/// [`expand_mask`] loop. `seed_buf` holds `rho''` in its first 64 bytes; its
+/// two nonce bytes are scratch (the scalar fallback writes them).
+pub(crate) fn expand_mask_vec(
+    y: &mut [Poly],
+    seed_buf: &mut [u8; 66],
+    kappa: u16,
+    gamma1_bits: u32,
+) {
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    let done = if crate::hash::keccak_x4::supported() {
+        let mut i = 0;
+        while y.len() - i >= 4 {
+            let nonces: [u16; 4] = core::array::from_fn(|l| kappa.wrapping_add((i + l) as u16));
+            let mut polys = expand_mask_x4(&seed_buf[..64], nonces, gamma1_bits);
+            y[i..i + 4].copy_from_slice(&polys);
+            // The mask vector is secret; the local candidate array must not
+            // linger on the stack.
+            super::wipe_polys(&mut polys);
+            i += 4;
+        }
+        i
+    } else {
+        0
+    };
+    #[cfg(not(all(feature = "std", target_arch = "x86_64")))]
+    let done = 0;
+    for (j, yi) in y.iter_mut().enumerate().skip(done) {
+        let nu = kappa.wrapping_add(j as u16);
+        seed_buf[64] = nu as u8;
+        seed_buf[65] = (nu >> 8) as u8;
+        *yi = expand_mask(seed_buf, gamma1_bits);
+    }
+}
+
+/// Four [`expand_mask`] streams squeezed in parallel by the 4-way AVX2 Keccak
+/// kernel: single-block absorb of `rho''(64) ‖ LE16(nonce)`, then 5 rate
+/// blocks squeezed per stream. The output is the SECRET mask vector y — the
+/// kernel is branch-free in the state, and every intermediate buffer holding
+/// seed or squeezed bytes is wiped before returning (the [`super`] caller
+/// wipes the returned polynomials).
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn expand_mask_x4(rho_prime: &[u8], nonces: [u16; 4], gamma1_bits: u32) -> [Poly; 4] {
+    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+    /// The SHAKE256 rate.
+    const RATE: usize = 136;
+    debug_assert_eq!(rho_prime.len(), 64);
+    let need = if gamma1_bits == 17 {
+        N * 18 / 8
+    } else {
+        N * 20 / 8
+    };
+    debug_assert!(need <= 5 * RATE);
+
+    let mut msgs = [[0u8; 66]; LANES];
+    for (l, msg) in msgs.iter_mut().enumerate() {
+        msg[..64].copy_from_slice(rho_prime);
+        msg[64] = nonces[l] as u8;
+        msg[65] = (nonces[l] >> 8) as u8;
+    }
+    let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
+    let mut x4 = KeccakX4::new(RATE, msgs_ref, 0x1F);
+
+    let mut bufs = [[0u8; 5 * RATE]; LANES];
+    let mut blocks = [[0u8; MAX_RATE]; LANES];
+    let mut off = 0;
+    while off < need {
+        x4.squeeze_blocks(&mut blocks);
+        let take = RATE.min(need - off);
+        for (buf, block) in bufs.iter_mut().zip(blocks.iter()) {
+            buf[off..off + take].copy_from_slice(&block[..take]);
+        }
+        off += take;
+    }
+    let out = core::array::from_fn(|l| {
+        if gamma1_bits == 17 {
+            unpack_z17(&bufs[l][..need])
+        } else {
+            unpack_z19(&bufs[l][..need])
+        }
+    });
+
+    // Wipe everything derived from the secret rho'': the XOF inputs, the
+    // sponge states, and the raw packed-mask buffers.
+    x4.zeroize();
+    for b in msgs
+        .iter_mut()
+        .flatten()
+        .chain(bufs.iter_mut().flatten())
+        .chain(blocks.iter_mut().flatten())
+    {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&msgs, &bufs, &blocks));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +284,33 @@ mod tests {
         for (l, &(s, r)) in sr.iter().enumerate() {
             let expect = sample_ntt_poly(&rho, s, r);
             assert_eq!(batched[l].c, expect.c, "stream {l} (s={s}, r={r})");
+        }
+    }
+
+    /// The batched mask expansion must be byte-identical to the scalar
+    /// per-index sampler, for every vector length L and both gamma1 widths
+    /// (including the duplicated remainder lanes for L = 5 and 7).
+    #[test]
+    fn expand_mask_vec_matches_scalar() {
+        let mut seed_buf = [0u8; 66];
+        for (i, b) in seed_buf[..64].iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(0x5b).wrapping_add(3);
+        }
+        for gamma1_bits in [17u32, 19] {
+            for len in [4usize, 5, 7] {
+                let kappa = 0xfffd; // exercises the wrapping nonce
+                let mut y = alloc::vec![Poly::zero(); len];
+                let mut sb = seed_buf;
+                expand_mask_vec(&mut y, &mut sb, kappa, gamma1_bits);
+                for (i, yi) in y.iter().enumerate() {
+                    let nu = kappa.wrapping_add(i as u16);
+                    let mut sb2 = seed_buf;
+                    sb2[64] = nu as u8;
+                    sb2[65] = (nu >> 8) as u8;
+                    let expect = expand_mask(&sb2, gamma1_bits);
+                    assert_eq!(yi.c, expect.c, "gamma1_bits {gamma1_bits} len {len} i {i}");
+                }
+            }
         }
     }
 }
