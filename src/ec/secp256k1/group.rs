@@ -148,23 +148,41 @@ impl Point {
         }
     }
 
-    /// Constant-time scalar multiplication `scalar · point` via
-    /// double-and-add-always over all 256 bits of `scalar` (little-endian
-    /// limbs, MSB first).
+    /// Constant-time scalar multiplication `scalar · point` (little-endian
+    /// limbs) via a fixed 4-bit window: 4 doublings and one *unconditional*
+    /// addition per nibble, the window value fetched by a masked scan of all
+    /// 16 table entries (no secret-indexed memory access). A zero nibble adds
+    /// the identity — a no-op with the same operation sequence, since the RCB
+    /// formulas are complete — so, as with the previous double-and-add-always
+    /// ladder, the schedule depends only on the public scalar width.
     pub(crate) fn mul<F: FieldBackend>(f: &F, scalar: &[u64; 4], point: &Point) -> Point {
+        // table[j] = [j]P; table[0] is the identity.
+        let mut table = [Point::identity(f); 16];
+        table[1] = *point;
+        for i in 2..16 {
+            table[i] = Point::add(f, &table[i - 1], point);
+        }
+
         let mut acc = Point::identity(f);
         let mut i = 4;
         while i > 0 {
             i -= 1;
             let limb = scalar[i];
-            let mut bit = 64;
-            while bit > 0 {
-                bit -= 1;
+            let mut shift = 64;
+            while shift > 0 {
+                shift -= 4;
                 acc = Point::double(f, &acc);
-                let sum = Point::add(f, &acc, point);
-                let set = Choice::from(((limb >> bit) & 1) as u8);
-                // set == 1 -> take the sum.
-                acc = Point::conditional_select(&sum, &acc, set);
+                acc = Point::double(f, &acc);
+                acc = Point::double(f, &acc);
+                acc = Point::double(f, &acc);
+
+                let digit = ((limb >> shift) & 0xf) as usize;
+                // Constant-time gather of table[digit].
+                let mut sel = table[0];
+                for (j, entry) in table.iter().enumerate() {
+                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                }
+                acc = Point::add(f, &acc, &sel);
             }
         }
         acc

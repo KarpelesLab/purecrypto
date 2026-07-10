@@ -210,8 +210,14 @@ impl Curve {
         self.point_add(p, p)
     }
 
-    /// Constant-time `scalar * point` via double-and-add-always over a fixed
-    /// number of bits (the order's bit width).
+    /// Constant-time `scalar * point` over a fixed number of bits (the
+    /// order's bit width), via a fixed 4-bit window: 4 doublings and one
+    /// *unconditional* addition per nibble, the window value fetched by a
+    /// masked scan of all 16 table entries (no secret-indexed memory
+    /// access). A zero nibble adds the identity — a no-op with the same
+    /// operation sequence, since the RCB Algorithm 1 formulas are complete —
+    /// so, as with the previous double-and-add-always ladder, the schedule
+    /// depends only on the public order width.
     pub(crate) fn scalar_mul(&self, scalar: &BoxedUint, point: &Point) -> Point {
         // The ladder iterates only over the order's limb width; callers must
         // pre-reduce mod n so no higher scalar limbs are silently dropped.
@@ -219,6 +225,14 @@ impl Curve {
             scalar.bit_len() <= self.n.bit_len(),
             "scalar_mul: scalar wider than curve order — higher limbs would be silently truncated"
         );
+        // table[j] = [j]P; table[0] is the identity.
+        let mut table = alloc::vec::Vec::with_capacity(16);
+        table.push(self.identity());
+        table.push(point.clone());
+        for i in 2..16 {
+            table.push(self.point_add(&table[i - 1], point));
+        }
+
         let order_limbs = self.n.bit_len().div_ceil(64);
         let limbs = scalar.as_limbs();
         let mut acc = self.identity();
@@ -226,13 +240,21 @@ impl Curve {
         while i > 0 {
             i -= 1;
             let limb = limbs.get(i).copied().unwrap_or(0);
-            let mut bit = 64;
-            while bit > 0 {
-                bit -= 1;
+            let mut shift = 64;
+            while shift > 0 {
+                shift -= 4;
                 acc = self.double(&acc);
-                let sum = self.point_add(&acc, point);
-                let set = Choice::from(((limb >> bit) & 1) as u8);
-                acc = Point::conditional_select(&sum, &acc, set);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+
+                let digit = ((limb >> shift) & 0xf) as usize;
+                // Constant-time gather of table[digit].
+                let mut sel = table[0].clone();
+                for (j, entry) in table.iter().enumerate() {
+                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                }
+                acc = self.point_add(&acc, &sel);
             }
         }
         acc
