@@ -142,6 +142,132 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         Uint::conditional_select(&diff, &result, ge)
     }
 
+    /// Montgomery squaring: given `a` in Montgomery form, returns
+    /// `a²·R^-1 mod N` — exactly [`mont_mul`](Self::mont_mul)`(a, a)`, but
+    /// with the standard squaring optimization: each off-diagonal partial
+    /// product `a[i]·a[j]` (`i < j`) is computed once and doubled, then the
+    /// diagonal `a[i]²` terms are added, roughly halving the `mac` count of
+    /// the schoolbook phase. The Montgomery reduction is a separate SOS pass
+    /// over the full `2·LIMBS`-limb square held in `(lo, hi)` halves.
+    ///
+    /// Constant time: all loop bounds and the `lo`/`hi` split are functions
+    /// of the public `LIMBS` and loop indices only (the same public-index
+    /// branch pattern as [`Uint::mul_wide`]); the final subtraction uses the
+    /// same mask-based select as `mont_mul`.
+    pub fn mont_sqr(&self, a: &Uint<LIMBS>) -> Uint<LIMBS> {
+        let a = a.as_limbs();
+        let n = self.modulus.as_limbs();
+
+        // The 2·LIMBS-limb square lives in (lo, hi); positions >= LIMBS map
+        // into hi. The index is always a public loop expression.
+        let mut lo = [0 as Limb; LIMBS];
+        let mut hi = [0 as Limb; LIMBS];
+
+        // Off-diagonal partial products a[i]·a[j] for i < j, each once.
+        // Iteration i drops its carry into position i+LIMBS (hi[i]), which
+        // the next iteration's top mac then accumulates into.
+        let mut i = 0;
+        while i < LIMBS {
+            let mut carry = 0;
+            let mut j = i + 1;
+            while j < LIMBS {
+                let p = i + j;
+                if p < LIMBS {
+                    let (v, c) = mac(lo[p], a[i], a[j], carry);
+                    lo[p] = v;
+                    carry = c;
+                } else {
+                    let (v, c) = mac(hi[p - LIMBS], a[i], a[j], carry);
+                    hi[p - LIMBS] = v;
+                    carry = c;
+                }
+                j += 1;
+            }
+            hi[i] = carry; // position i + LIMBS, untouched so far
+            i += 1;
+        }
+
+        // Double the off-diagonal sum S: 2S <= a² < 2^(128·LIMBS), so the
+        // shift cannot carry out of the top limb.
+        let mut carry: Limb = 0;
+        let mut k = 0;
+        while k < LIMBS {
+            let next = lo[k] >> 63;
+            lo[k] = (lo[k] << 1) | carry;
+            carry = next;
+            k += 1;
+        }
+        let mut k = 0;
+        while k < LIMBS {
+            let next = hi[k] >> 63;
+            hi[k] = (hi[k] << 1) | carry;
+            carry = next;
+            k += 1;
+        }
+
+        // Add the diagonal a[i]² terms at positions (2i, 2i+1); the high
+        // half's carry-out feeds the next even position's mac carry-in. The
+        // total is a², which fits in 2·LIMBS limbs, so the last carry is 0.
+        let mut carry: Limb = 0;
+        let mut i = 0;
+        while i < LIMBS {
+            let (p0, p1) = (2 * i, 2 * i + 1);
+            let w0 = if p0 < LIMBS { lo[p0] } else { hi[p0 - LIMBS] };
+            let (v, c) = mac(w0, a[i], a[i], carry);
+            if p0 < LIMBS {
+                lo[p0] = v;
+            } else {
+                hi[p0 - LIMBS] = v;
+            }
+            let w1 = if p1 < LIMBS { lo[p1] } else { hi[p1 - LIMBS] };
+            let (v, c2) = adc(w1, c, 0);
+            if p1 < LIMBS {
+                lo[p1] = v;
+            } else {
+                hi[p1 - LIMBS] = v;
+            }
+            carry = c2;
+            i += 1;
+        }
+
+        // Montgomery reduction, SOS style: cancel the LIMBS low limbs one at
+        // a time. `hic` carries iteration i's top-limb overflow into position
+        // i+LIMBS+1, exactly where iteration i+1 adds its own top carry, so a
+        // single riding limb suffices.
+        let mut hic: Limb = 0;
+        let mut i = 0;
+        while i < LIMBS {
+            let m = lo[i].wrapping_mul(self.n_prime);
+            let mut carry = 0;
+            let mut j = 0;
+            while j < LIMBS {
+                let p = i + j;
+                if p < LIMBS {
+                    let (v, c) = mac(lo[p], m, n[j], carry);
+                    lo[p] = v;
+                    carry = c;
+                } else {
+                    let (v, c) = mac(hi[p - LIMBS], m, n[j], carry);
+                    hi[p - LIMBS] = v;
+                    carry = c;
+                }
+                j += 1;
+            }
+            let (v, c) = adc(hi[i], carry, hic);
+            hi[i] = v;
+            hic = c;
+            i += 1;
+        }
+
+        // Result is the (LIMBS+1)-limb value (hi, hic) and is < 2N; same
+        // mask-based conditional final subtraction as `mont_mul`.
+        let result = Uint::from_limbs(hi);
+        let (diff, borrow_low) = result.sbb(&self.modulus, 0);
+        let (_, borrow) = sbb(hic, 0, borrow_low);
+        let ge = Choice::from((borrow ^ 1) as u8);
+        Uint::conditional_select(&diff, &result, ge)
+    }
+
     /// Converts `x` (a plain residue `< N`) into Montgomery form `xR mod N`.
     ///
     /// `x` is required to be a plain residue strictly below the modulus; a
@@ -281,6 +407,64 @@ mod tests {
             }
         }
         r
+    }
+
+    /// SplitMix64 — deterministic test-only RNG.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Differential: `mont_sqr(a)` must be bit-identical to `mont_mul(a, a)`
+    /// for random odd moduli and residues, plus the edge values 0, 1, n-1,
+    /// and all-limbs-set (reduced).
+    fn sqr_matches_mul_width<const L: usize>(rng: &mut u64) {
+        for _ in 0..4 {
+            let mut n_limbs = [0 as Limb; L];
+            for l in n_limbs.iter_mut() {
+                *l = splitmix64(rng);
+            }
+            n_limbs[0] |= 1; // odd
+            n_limbs[L - 1] &= !(1 << 63); // top bit clear so `reduce` works
+            n_limbs[L - 1] |= 1 << 62; // ...but still (64L-1)-bit wide
+            let n = Uint::<L>::from_limbs(n_limbs);
+            let m = MontModulus::new(n);
+
+            let mut values = [Uint::<L>::ZERO; 10];
+            values[1] = Uint::ONE;
+            values[2] = n.wrapping_sub(&Uint::ONE);
+            values[3] = reduce(&Uint::from_limbs([Limb::MAX; L]), &n);
+            for k in 0..6 {
+                let mut v = [0 as Limb; L];
+                for (j, l) in v.iter_mut().enumerate() {
+                    // Include top-heavy values (low limbs zero).
+                    *l = if k >= 4 && j < L / 2 {
+                        0
+                    } else {
+                        splitmix64(rng)
+                    };
+                }
+                values[4 + k] = reduce(&Uint::from_limbs(v), &n);
+            }
+            for a in &values {
+                assert_eq!(m.mont_sqr(a), m.mont_mul(a, a), "L={L} a={a:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mont_sqr_matches_mont_mul() {
+        let mut rng: u64 = 0xD1F5_ACE5_0FBE_EF01;
+        sqr_matches_mul_width::<1>(&mut rng);
+        sqr_matches_mul_width::<2>(&mut rng);
+        sqr_matches_mul_width::<3>(&mut rng);
+        sqr_matches_mul_width::<4>(&mut rng);
+        sqr_matches_mul_width::<7>(&mut rng);
+        sqr_matches_mul_width::<8>(&mut rng);
+        sqr_matches_mul_width::<16>(&mut rng);
     }
 
     #[test]

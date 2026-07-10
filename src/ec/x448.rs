@@ -83,6 +83,7 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     let a24 = fp.to_mont(&Fe::from_u64(A24));
 
     let mul = |a: &Fe, b: &Fe| fp.mont_mul(a, b);
+    let sq = |a: &Fe| fp.mont_sqr(a);
     let add = |a: &Fe, b: &Fe| fp.add_mod(a, b);
     let sub = |a: &Fe, b: &Fe| fp.sub_mod(a, b);
 
@@ -99,18 +100,18 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
         swap = kt;
 
         let a = add(&x2, &z2);
-        let aa = mul(&a, &a);
+        let aa = sq(&a);
         let b = sub(&x2, &z2);
-        let bb = mul(&b, &b);
+        let bb = sq(&b);
         let e = sub(&aa, &bb);
         let c = add(&x3, &z3);
         let d = sub(&x3, &z3);
         let da = mul(&d, &a);
         let cb = mul(&c, &b);
         let t0 = add(&da, &cb);
-        x3 = mul(&t0, &t0);
+        x3 = sq(&t0);
         let t1 = sub(&da, &cb);
-        let t1sq = mul(&t1, &t1);
+        let t1sq = sq(&t1);
         z3 = mul(&x1, &t1sq);
         x2 = mul(&aa, &bb);
         let t2 = add(&aa, &mul(&a24, &e));

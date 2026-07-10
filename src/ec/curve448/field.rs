@@ -58,7 +58,7 @@ fn fe_pow(fp: &MontModulus<7>, one: &Fe, base: Fe, exp: &Fe) -> Fe {
     let mut i = 448;
     while i > 0 {
         i -= 1;
-        r = fp.mont_mul(&r, &r);
+        r = fp.mont_sqr(&r);
         let bit = ((limbs[i / 64] >> (i % 64)) & 1) as u8;
         let prod = fp.mont_mul(&r, &base);
         // conditional_select(a, b, c) returns a when c is set (this crate's
@@ -122,7 +122,7 @@ impl Field {
     }
     #[inline]
     pub(crate) fn sq(&self, a: Fe) -> Fe {
-        self.fp.mont_mul(&a, &a)
+        self.fp.mont_sqr(&a)
     }
     #[inline]
     pub(crate) fn add(&self, a: Fe, b: Fe) -> Fe {

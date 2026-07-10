@@ -107,7 +107,9 @@ impl BoxedMontModulus {
     fn mont_mul_to(&self, a: &[Limb], b: &[Limb], t: &mut [Limb], out: &mut [Limb]) {
         let l = self.limbs;
         let n = &self.n;
-        t.fill(0);
+        // Only the low `l` limbs of `t` are used; the exponentiation ladders
+        // hand in the wider squaring scratch and share it with `mont_sqr_to`.
+        t[..l].fill(0);
         let mut ts: Limb = 0;
 
         for &bi in b.iter().take(l) {
@@ -145,6 +147,103 @@ impl BoxedMontModulus {
         let ge = Choice::from((borrow ^ 1) as u8);
         for j in 0..l {
             out[j] = Limb::conditional_select(&out[j], &t[j], ge);
+        }
+    }
+
+    /// Montgomery squaring of a `limbs`-wide value into `out`, with
+    /// caller-provided scratch `t` of at least `2 * limbs` limbs.
+    ///
+    /// Produces exactly the same value as `mont_mul_to(a, a, ..)` but uses the
+    /// standard squaring optimization: each off-diagonal partial product
+    /// `a[i]·a[j]` (`i < j`) is computed once and doubled, then the diagonal
+    /// `a[i]²` terms are added — roughly halving the `mac` count of the
+    /// schoolbook phase. The Montgomery reduction is then done as a separate
+    /// SOS pass over the full `2·limbs`-limb square (CIOS interleaving is not
+    /// possible once the product is formed up front).
+    ///
+    /// Constant time: every loop bound is a function of `self.limbs` only (a
+    /// public quantity), the doubling is an unconditional shift across the
+    /// whole product, and the final subtraction uses the same mask-based
+    /// select as `mont_mul_to` — no data-dependent branch anywhere.
+    ///
+    /// `out` may alias `a`: `a` is only read while the square is accumulated
+    /// into `t`, and `out` is written exclusively in the final-subtraction
+    /// step. `t` must not alias anything.
+    fn mont_sqr_to(&self, a: &[Limb], t: &mut [Limb], out: &mut [Limb]) {
+        let l = self.limbs;
+        let n = &self.n;
+        let p = &mut t[..2 * l];
+        p.fill(0);
+
+        // Off-diagonal partial products a[i]·a[j] for i < j, each computed
+        // once. Iteration i writes p[2i+1 ..= i+l-1] and drops its carry into
+        // p[i+l], which iteration i+1 then accumulates into — the ordinary
+        // schoolbook triangle.
+        for i in 0..l {
+            let mut carry = 0;
+            for j in (i + 1)..l {
+                let (s, c) = mac(p[i + j], a[i], a[j], carry);
+                p[i + j] = s;
+                carry = c;
+            }
+            p[i + l] = carry;
+        }
+
+        // Double the off-diagonal sum S. 2S <= a² < 2^(128·l), so the shift
+        // cannot carry out of the 2l-limb product.
+        let mut carry: Limb = 0;
+        for w in p.iter_mut() {
+            let next = *w >> 63;
+            *w = (*w << 1) | carry;
+            carry = next;
+        }
+
+        // Add the diagonal a[i]² terms at positions (2i, 2i+1). The high half
+        // of each square lands on an odd position whose add can carry into the
+        // next even position, which is exactly where the next mac's carry-in
+        // goes. The total is a², which fits in 2l limbs, so the last carry
+        // out is zero.
+        let mut carry: Limb = 0;
+        for i in 0..l {
+            let (s, c) = mac(p[2 * i], a[i], a[i], carry);
+            p[2 * i] = s;
+            let (s, c2) = adc(p[2 * i + 1], c, 0);
+            p[2 * i + 1] = s;
+            carry = c2;
+        }
+
+        // Montgomery reduction, SOS style: for each of the l low limbs, add
+        // m·N so the limb cancels, then shift the window up one limb (done
+        // implicitly by indexing from i). `hi` carries the overflow of
+        // iteration i's top-limb add into position i+l+1, which is where
+        // iteration i+1 adds its own top carry — so a single riding limb
+        // suffices and the loop shape stays independent of the data.
+        let mut hi: Limb = 0;
+        for i in 0..l {
+            let m = p[i].wrapping_mul(self.n_prime);
+            let mut carry = 0;
+            for j in 0..l {
+                let (s, c) = mac(p[i + j], m, n[j], carry);
+                p[i + j] = s;
+                carry = c;
+            }
+            let (s, c) = adc(p[i + l], carry, hi);
+            p[i + l] = s;
+            hi = c;
+        }
+
+        // Result is the (l+1)-limb value (p[l..2l], hi) and is < 2N; same
+        // mask-based conditional final subtraction as `mont_mul_to`.
+        let mut bo: Limb = 0;
+        for j in 0..l {
+            let (d, b) = sbb(p[l + j], n[j], bo);
+            out[j] = d;
+            bo = b;
+        }
+        let (_, borrow) = sbb(hi, 0, bo);
+        let ge = Choice::from((borrow ^ 1) as u8);
+        for j in 0..l {
+            out[j] = Limb::conditional_select(&out[j], &p[l + j], ge);
         }
     }
 
@@ -237,12 +336,13 @@ impl BoxedMontModulus {
         }
 
         let mut acc = r_mod_n;
-        // Reused scratch: CIOS accumulator `t`, ping-pong output `nxt`, and
-        // the per-nibble gather buffer `sel`. All hold base-derived secrets
-        // during the loop and are scrubbed once at the end — reusing them
-        // (instead of a fresh allocation per multiply) changes where the
+        // Reused scratch: accumulator `t` (sized 2·limbs for the squaring's
+        // full product; `mont_mul_to` uses its low half), ping-pong output
+        // `nxt`, and the per-nibble gather buffer `sel`. All hold base-derived
+        // secrets during the loop and are scrubbed once at the end — reusing
+        // them (instead of a fresh allocation per multiply) changes where the
         // intermediate values live, not what is computed.
-        let mut t = vec![0 as Limb; self.limbs];
+        let mut t = vec![0 as Limb; 2 * self.limbs];
         let mut nxt = vec![0 as Limb; self.limbs];
         let mut sel = vec![0 as Limb; self.limbs];
 
@@ -261,7 +361,7 @@ impl BoxedMontModulus {
             while shift > 0 {
                 shift -= 4;
                 for _ in 0..4 {
-                    self.mont_mul_to(&acc, &acc, &mut t, &mut nxt);
+                    self.mont_sqr_to(&acc, &mut t, &mut nxt);
                     core::mem::swap(&mut acc, &mut nxt);
                 }
 
@@ -315,15 +415,16 @@ impl BoxedMontModulus {
             // base^0 = 1.
             return BoxedUint::from_limbs(self.demont_limbs(&acc));
         }
-        // Reused scratch, as in `pow`: `acc` still holds a base-derived
-        // secret even though the exponent is public.
-        let mut t = vec![0 as Limb; self.limbs];
+        // Reused scratch, as in `pow` (`t` again sized 2·limbs for the
+        // squaring): `acc` still holds a base-derived secret even though the
+        // exponent is public.
+        let mut t = vec![0 as Limb; 2 * self.limbs];
         let mut nxt = vec![0 as Limb; self.limbs];
         let exp_limbs = exp.limbs_resized(exp.significant_limbs().max(1));
         let mut i = bits;
         while i > 0 {
             i -= 1;
-            self.mont_mul_to(&acc, &acc, &mut t, &mut nxt);
+            self.mont_sqr_to(&acc, &mut t, &mut nxt);
             core::mem::swap(&mut acc, &mut nxt);
             self.mont_mul_to(&acc, &base_m, &mut t, &mut nxt);
             let limb = exp_limbs[i / 64];
@@ -459,6 +560,70 @@ mod tests {
 
         // Sanity: the truncation bug would have produced 1.
         assert_ne!(got, [0, 0, 0, 0, 0, 0, 0, 1]);
+    }
+
+    /// SplitMix64 — deterministic test-only RNG.
+    fn splitmix64(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    #[test]
+    fn mont_sqr_matches_mont_mul() {
+        // Differential: the dedicated squaring must produce bit-identical
+        // output to the general multiply with both operands equal, across
+        // every limb width the RSA/DH paths use, random odd moduli, random
+        // residues, and the edge values 0, 1, n-1, and all-limbs-set
+        // (reduced). Both routines require inputs < n.
+        let mut rng: u64 = 0x5EED_CAFE_F00D_D00D;
+        for limbs in 1..=64usize {
+            // More modulus/value samples at the small widths where edge
+            // cases concentrate; keep the total runtime sane at width 64.
+            let moduli_per_width = if limbs <= 8 { 4 } else { 2 };
+            for _ in 0..moduli_per_width {
+                let mut n_limbs: Vec<Limb> = (0..limbs).map(|_| splitmix64(&mut rng)).collect();
+                n_limbs[0] |= 1; // odd
+                n_limbs[limbs - 1] |= 1 << 63; // full width
+                let n = BoxedUint::from_limbs(n_limbs);
+                let m = BoxedMontModulus::new(&n);
+                assert_eq!(m.limbs(), limbs);
+
+                let mut values: Vec<BoxedUint> = Vec::new();
+                // Edge values: 0, 1, n-1, all-ones (reduced mod n).
+                values.push(BoxedUint::zero(limbs));
+                values.push(BoxedUint::from_u64(1));
+                values.push(n.sub(&BoxedUint::from_u64(1)));
+                let ones = BoxedUint::from_limbs(vec![Limb::MAX; limbs]);
+                values.push(ones.reduce(&n));
+                // Random residues, including some with only high limbs set.
+                for k in 0..6 {
+                    let v: Vec<Limb> = (0..limbs)
+                        .map(|j| {
+                            if k >= 4 && j < limbs / 2 {
+                                0 // top-heavy value
+                            } else {
+                                splitmix64(&mut rng)
+                            }
+                        })
+                        .collect();
+                    values.push(BoxedUint::from_limbs(v).reduce(&n));
+                }
+
+                let mut t_mul = vec![0 as Limb; limbs];
+                let mut t_sqr = vec![0 as Limb; 2 * limbs];
+                let mut out_mul = vec![0 as Limb; limbs];
+                let mut out_sqr = vec![0 as Limb; limbs];
+                for v in &values {
+                    let a = v.limbs_resized(limbs);
+                    m.mont_mul_to(&a, &a, &mut t_mul, &mut out_mul);
+                    m.mont_sqr_to(&a, &mut t_sqr, &mut out_sqr);
+                    assert_eq!(out_sqr, out_mul, "limbs={limbs} a={a:x?}");
+                }
+            }
+        }
     }
 
     #[test]

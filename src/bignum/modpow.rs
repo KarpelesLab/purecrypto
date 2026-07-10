@@ -25,7 +25,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
             let mut bit = 64;
             while bit > 0 {
                 bit -= 1;
-                acc = self.mont_mul(&acc, &acc);
+                acc = self.mont_sqr(&acc);
                 let multiplied = self.mont_mul(&acc, &base_m);
                 let set = Choice::from(((limb >> bit) & 1) as u8);
                 // Take the multiplied value when the exponent bit is set.
@@ -59,7 +59,7 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
         let mut i = bits;
         while i > 0 {
             i -= 1;
-            acc = self.mont_mul(&acc, &acc);
+            acc = self.mont_sqr(&acc);
             let multiplied = self.mont_mul(&acc, &base_m);
             let set = Choice::from(((exp[i / 64] >> (i % 64)) & 1) as u8);
             // Take the multiplied value when the exponent bit is set.
