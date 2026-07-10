@@ -180,8 +180,9 @@ fn main() {
             black_box(dk.decapsulate(black_box(&ct)));
         });
 
-        // ML-DSA-65
-        let (mldsa_sk, mldsa_pk) = MlDsa65PrivateKey::generate(&mut rng);
+        // ML-DSA-65. Fixed seed: deterministic signing's rejection-loop
+        // count depends on the key, so a pinned key keeps runs comparable.
+        let (mldsa_sk, mldsa_pk) = MlDsa65PrivateKey::from_seed(&[0x42u8; 32]);
         let mldsa_sig = mldsa_sk.sign_deterministic(msg, b"").unwrap();
         bench_latency("ML-DSA-65 keygen", t, || {
             black_box(MlDsa65PrivateKey::generate(&mut rng));

@@ -273,12 +273,30 @@ fn wipe_polys(v: &mut [Poly]) {
 }
 
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
+///
+/// On x86_64 with AVX2 the K·L independent SHAKE128 streams are squeezed
+/// four at a time by the 4-way Keccak kernel (byte-identical output); `rho`
+/// is public, so the batching's control flow leaks nothing.
 fn matrix<const K: usize, const L: usize>(rho: &[u8]) -> [[Poly; L]; K] {
     let mut a = [[Poly::zero(); L]; K];
-    for (i, row) in a.iter_mut().enumerate() {
-        for (j, cell) in row.iter_mut().enumerate() {
-            *cell = sample_ntt_poly(rho, j as u8, i as u8);
+    let mut done = 0;
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if crate::hash::keccak_x4::supported() {
+        while done + 4 <= K * L {
+            let sr: [(u8, u8); 4] =
+                core::array::from_fn(|l| (((done + l) % L) as u8, ((done + l) / L) as u8));
+            let polys = sample::sample_ntt_x4(rho, sr);
+            for (l, p) in polys.into_iter().enumerate() {
+                a[(done + l) / L][(done + l) % L] = p;
+            }
+            done += 4;
         }
+    }
+
+    while done < K * L {
+        a[done / L][done % L] = sample_ntt_poly(rho, (done % L) as u8, (done / L) as u8);
+        done += 1;
     }
     a
 }

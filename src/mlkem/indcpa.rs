@@ -27,30 +27,75 @@ pub(crate) const fn dv_bytes(dv: usize) -> usize {
     32 * dv
 }
 
+/// Rejection-samples one matrix entry from `SHAKE128(seed ‖ x ‖ y)`.
+fn gen_matrix_entry(seed: &[u8; 32], x: u8, y: u8, out: &mut Poly) {
+    let mut xof = Shake128::new();
+    xof.update(seed);
+    xof.update(&[x, y]);
+    let mut reader = xof.finalize_xof();
+    let mut ctr = 0;
+    let mut block = [0u8; XOF_BLOCK];
+    while ctr < N {
+        reader.read(&mut block);
+        ctr += poly::rej_uniform(&mut out.c[ctr..], &block);
+    }
+}
+
 /// Generates the public matrix `Â` (or its transpose) by rejection sampling a
 /// SHAKE128 stream per entry. `Â[i][j]` absorbs `ρ ‖ j ‖ i` (or `ρ ‖ i ‖ j`
 /// when transposed), matching the FIPS 203 / pq-crystals ordering.
+///
+/// On x86_64 with AVX2 the K² independent streams are squeezed four at a
+/// time by the 4-way Keccak kernel (byte-identical output); the seed and the
+/// rejection-sampling control flow are public (`ρ` is serialized into `ek`).
 fn gen_matrix<const K: usize>(seed: &[u8; 32], transposed: bool) -> [[Poly; K]; K] {
     let mut a = [[Poly::zero(); K]; K];
-    #[allow(clippy::needless_range_loop)]
-    for i in 0..K {
-        for j in 0..K {
-            let (x, y) = if transposed {
-                (i as u8, j as u8)
-            } else {
-                (j as u8, i as u8)
-            };
-            let mut xof = Shake128::new();
-            xof.update(seed);
-            xof.update(&[x, y]);
-            let mut reader = xof.finalize_xof();
-            let mut ctr = 0;
-            let mut block = [0u8; XOF_BLOCK];
-            while ctr < N {
-                reader.read(&mut block);
-                ctr += poly::rej_uniform(&mut a[i][j].c[ctr..], &block);
+    let mut done = 0;
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if crate::hash::keccak_x4::supported() {
+        use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+        while done + LANES <= K * K {
+            let mut msgs = [[0u8; 34]; LANES];
+            for (l, msg) in msgs.iter_mut().enumerate() {
+                let (i, j) = ((done + l) / K, (done + l) % K);
+                msg[..32].copy_from_slice(seed);
+                let (x, y) = if transposed {
+                    (i as u8, j as u8)
+                } else {
+                    (j as u8, i as u8)
+                };
+                msg[32] = x;
+                msg[33] = y;
             }
+            let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
+            let mut x4 = KeccakX4::new(XOF_BLOCK, msgs_ref, 0x1F);
+            let mut blocks = [[0u8; MAX_RATE]; LANES];
+            let mut ctrs = [0usize; LANES];
+            while ctrs.iter().any(|&c| c < N) {
+                x4.squeeze_blocks(&mut blocks);
+                for (l, ctr) in ctrs.iter_mut().enumerate() {
+                    if *ctr < N {
+                        let (i, j) = ((done + l) / K, (done + l) % K);
+                        *ctr += poly::rej_uniform(&mut a[i][j].c[*ctr..], &blocks[l][..XOF_BLOCK]);
+                    }
+                }
+            }
+            done += LANES;
         }
+    }
+
+    // Scalar path: all entries when the 4-way kernel is unavailable, or the
+    // `K² mod 4` remainder after the batched groups.
+    while done < K * K {
+        let (i, j) = (done / K, done % K);
+        let (x, y) = if transposed {
+            (i as u8, j as u8)
+        } else {
+            (j as u8, i as u8)
+        };
+        gen_matrix_entry(seed, x, y, &mut a[i][j]);
+        done += 1;
     }
     a
 }
@@ -73,6 +118,77 @@ fn getnoise<const ETA: usize>(seed: &[u8; 32], nonce: u8) -> Poly {
     }
     let _ = core::hint::black_box((&input, &buf));
     out
+}
+
+/// Four [`getnoise`] PRF streams squeezed in parallel by the 4-way AVX2
+/// Keccak kernel: `PRF_η(seed, nonces[l])` then `SamplePolyCBD_η` per lane.
+/// Byte-identical to four scalar calls. The kernel is branch-free in the
+/// state, so the secret seed sees the same bitwise-only pipeline as the
+/// scalar sponge; all buffers holding key-derived bytes are wiped.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn getnoise_x4<const ETA: usize>(seed: &[u8; 32], nonces: [u8; 4]) -> [Poly; 4] {
+    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+    /// The SHAKE256 rate.
+    const RATE: usize = 136;
+    let need = 64 * ETA;
+    debug_assert!(need <= 2 * RATE);
+
+    let mut msgs = [[0u8; 33]; LANES];
+    for (l, msg) in msgs.iter_mut().enumerate() {
+        msg[..32].copy_from_slice(seed);
+        msg[32] = nonces[l];
+    }
+    let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
+    let mut x4 = KeccakX4::new(RATE, msgs_ref, 0x1F);
+
+    let mut bufs = [[0u8; 2 * RATE]; LANES];
+    let mut blocks = [[0u8; MAX_RATE]; LANES];
+    let mut off = 0;
+    while off < need {
+        x4.squeeze_blocks(&mut blocks);
+        let take = RATE.min(need - off);
+        for (buf, block) in bufs.iter_mut().zip(blocks.iter()) {
+            buf[off..off + take].copy_from_slice(&block[..take]);
+        }
+        off += RATE;
+    }
+    let out = core::array::from_fn(|l| poly::cbd::<ETA>(&bufs[l][..need]));
+
+    // Wipe everything derived from the secret noise seed: the PRF inputs,
+    // the sponge states, and the raw CBD bit buffers.
+    x4.zeroize();
+    for b in msgs
+        .iter_mut()
+        .flatten()
+        .chain(bufs.iter_mut().flatten())
+        .chain(blocks.iter_mut().flatten())
+    {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&msgs, &bufs, &blocks));
+    out
+}
+
+/// Fills `out[i]` with the CBD noise polynomial `PRF_η(seed, base + i)`,
+/// batching four PRF streams at a time through the 4-way Keccak kernel when
+/// available (scalar remainder). Byte-identical to per-index [`getnoise`].
+fn fill_noise<const ETA: usize>(seed: &[u8; 32], base: u8, out: &mut [Poly]) {
+    let mut idx = 0;
+
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    if crate::hash::keccak_x4::supported() {
+        while idx + 4 <= out.len() {
+            let nonces = core::array::from_fn(|l| base + (idx + l) as u8);
+            let polys = getnoise_x4::<ETA>(seed, nonces);
+            out[idx..idx + 4].copy_from_slice(&polys);
+            idx += 4;
+        }
+    }
+
+    while idx < out.len() {
+        out[idx] = getnoise::<ETA>(seed, base + idx as u8);
+        idx += 1;
+    }
 }
 
 /// Forward NTT on every component of a module vector.
@@ -122,17 +238,12 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
 
     let a = gen_matrix::<K>(&rho, false);
 
-    let mut nonce = 0u8;
-    let mut s: [Poly; K] = [Poly::zero(); K];
-    for p in s.iter_mut() {
-        *p = getnoise::<ETA1>(&sigma32, nonce);
-        nonce += 1;
-    }
-    let mut e: [Poly; K] = [Poly::zero(); K];
-    for p in e.iter_mut() {
-        *p = getnoise::<ETA1>(&sigma32, nonce);
-        nonce += 1;
-    }
+    // s ‖ e is one run of 2K nonce-indexed PRF_η₁ streams; sampling them
+    // through a single flat slice lets `fill_noise` batch across the s/e
+    // boundary (e.g. one 4-way group for K = 2, one plus two scalar for K = 3).
+    let mut se = [[Poly::zero(); K]; 2];
+    fill_noise::<ETA1>(&sigma32, 0, se.as_flattened_mut());
+    let [mut s, mut e] = se;
     vec_ntt::<K>(&mut s);
     vec_ntt::<K>(&mut e);
 
@@ -194,18 +305,15 @@ pub(crate) fn encrypt<
     let mu = poly::from_msg(m);
     let at = gen_matrix::<K>(&rho, true);
 
-    let mut nonce = 0u8;
+    // r̂ uses PRF_η₁ (nonces 0..K); e₁ ‖ e₂ is one run of K+1 PRF_η₂ streams
+    // (nonces K..2K+1), sampled through a flat slice so `fill_noise` can
+    // batch across the e₁/e₂ boundary (a full 4-way group for K = 3).
     let mut sp: [Poly; K] = [Poly::zero(); K];
-    for p in sp.iter_mut() {
-        *p = getnoise::<ETA1>(coins, nonce);
-        nonce += 1;
-    }
-    let mut ep: [Poly; K] = [Poly::zero(); K];
-    for p in ep.iter_mut() {
-        *p = getnoise::<ETA2>(coins, nonce);
-        nonce += 1;
-    }
-    let epp = getnoise::<ETA2>(coins, nonce);
+    fill_noise::<ETA1>(coins, 0, &mut sp);
+    let mut ep_epp = [[Poly::zero(); K]; 2];
+    fill_noise::<ETA2>(coins, K as u8, &mut ep_epp.as_flattened_mut()[..K + 1]);
+    let ep = ep_epp[0];
+    let epp = ep_epp[1][0];
 
     vec_ntt::<K>(&mut sp);
 
@@ -356,6 +464,29 @@ mod tests {
         diff.reduce();
         let maxabs = diff.c.iter().map(|&c| c.unsigned_abs()).max().unwrap();
         assert!(maxabs <= 1, "cancellation residual too large: {maxabs}");
+    }
+
+    /// The (possibly 4-way-batched) `gen_matrix` must be byte-identical to
+    /// the per-entry scalar oracle.
+    #[test]
+    #[allow(clippy::needless_range_loop)]
+    fn gen_matrix_matches_scalar_oracle() {
+        let seed = [0xa7u8; 32];
+        for transposed in [false, true] {
+            let a = gen_matrix::<K_TEST>(&seed, transposed);
+            for i in 0..K_TEST {
+                for j in 0..K_TEST {
+                    let (x, y) = if transposed {
+                        (i as u8, j as u8)
+                    } else {
+                        (j as u8, i as u8)
+                    };
+                    let mut expect = Poly::zero();
+                    gen_matrix_entry(&seed, x, y, &mut expect);
+                    assert_eq!(a[i][j].c, expect.c, "entry ({i},{j}) t={transposed}");
+                }
+            }
+        }
     }
 
     #[test]
