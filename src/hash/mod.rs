@@ -40,6 +40,8 @@ mod block;
 mod hmac;
 mod k12;
 mod keccak;
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+pub(crate) mod keccak_x4;
 mod kmac;
 mod md2;
 mod md4;

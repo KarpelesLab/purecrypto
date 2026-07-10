@@ -10,7 +10,7 @@
 use super::XofReader;
 
 /// Keccak-f[1600] round constants.
-const RC: [u64; 24] = [
+pub(super) const RC: [u64; 24] = [
     0x0000_0000_0000_0001,
     0x0000_0000_0000_8082,
     0x8000_0000_0000_808a,
