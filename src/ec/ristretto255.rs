@@ -23,15 +23,15 @@
 //! reject/accept decision is a public function of the (public) encoded bytes.
 
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
-use crate::ec::curve25519::field::{Fe, Field};
+use crate::ec::curve25519::field::{Fe, Field, ScalarInt};
 use crate::ec::curve25519::point::Point;
 
 #[doc(inline)]
 pub use crate::ec::edwards25519::hazmat::Scalar;
 
-/// `(1 − d²) mod p`, in Montgomery form (RFC 9496 `ONE_MINUS_D_SQ`).
+/// `(1 − d²) mod p` (RFC 9496 `ONE_MINUS_D_SQ`).
 const ONE_MINUS_D_SQ_HEX: &str = "029072a8b2b3e0d79994abddbe70dfe42c81a138cd5e350fe27c09c1945fc176";
-/// `(d − 1)² mod p`, in Montgomery form (RFC 9496 `D_MINUS_ONE_SQ`).
+/// `(d − 1)² mod p` (RFC 9496 `D_MINUS_ONE_SQ`).
 const D_MINUS_ONE_SQ_HEX: &str = "5968b37af66c22414cdcd32f529b4eebd29e4a2cb01e199931ad5aaa44ed4d20";
 /// `√(a·d − 1) mod p` with `a = −1` (RFC 9496 `SQRT_AD_MINUS_ONE`).
 const SQRT_AD_MINUS_ONE_HEX: &str =
@@ -40,13 +40,16 @@ const SQRT_AD_MINUS_ONE_HEX: &str =
 const INVSQRT_A_MINUS_D_HEX: &str =
     "786c8905cfaffca216c27b91fe01d8409d2f16175a4172be99c8fdaa805d40ea";
 
-/// Parses 64 big-endian hex chars into a plain residue `Fe`.
+/// Parses 64 big-endian hex chars into a field element.
 fn fe_from_be_hex(hex: &str) -> Fe {
-    super::uint_from_be_hex(hex)
+    let v: ScalarInt = super::uint_from_be_hex(hex);
+    let mut b = [0u8; 32];
+    v.write_le_bytes(&mut b);
+    Fe::from_bytes(&b)
 }
 
-/// The ristretto255-specific field constants, in Montgomery form, alongside the
-/// shared [`Field`] backend.
+/// The ristretto255-specific field constants alongside the shared [`Field`]
+/// backend.
 struct R255 {
     f: Field,
     one_minus_d_sq: Fe,
@@ -58,10 +61,10 @@ struct R255 {
 impl R255 {
     fn new() -> Self {
         let f = Field::new();
-        let one_minus_d_sq = f.to_mont(&fe_from_be_hex(ONE_MINUS_D_SQ_HEX));
-        let d_minus_one_sq = f.to_mont(&fe_from_be_hex(D_MINUS_ONE_SQ_HEX));
-        let sqrt_ad_minus_one = f.to_mont(&fe_from_be_hex(SQRT_AD_MINUS_ONE_HEX));
-        let invsqrt_a_minus_d = f.to_mont(&fe_from_be_hex(INVSQRT_A_MINUS_D_HEX));
+        let one_minus_d_sq = fe_from_be_hex(ONE_MINUS_D_SQ_HEX);
+        let d_minus_one_sq = fe_from_be_hex(D_MINUS_ONE_SQ_HEX);
+        let sqrt_ad_minus_one = fe_from_be_hex(SQRT_AD_MINUS_ONE_HEX);
+        let invsqrt_a_minus_d = fe_from_be_hex(INVSQRT_A_MINUS_D_HEX);
         R255 {
             f,
             one_minus_d_sq,
@@ -174,9 +177,7 @@ impl RistrettoPoint {
         // s = |den_inv * (z - y)|
         let s = f.abs(f.mul(den_inv, f.sub(p.z, y)));
 
-        let mut out = [0u8; 32];
-        f.from_mont(&s).write_le_bytes(&mut out);
-        CompressedRistretto(out)
+        CompressedRistretto(s.to_bytes())
     }
 
     /// The one-way map / hash-to-group (RFC 9496 §4.3.4): maps 64 uniformly
@@ -228,7 +229,7 @@ impl CompressedRistretto {
         let s_bytes = self.0;
 
         // Field-element canonicity: s must be a canonical, non-negative residue.
-        let s_plain = Fe::from_le_bytes(&s_bytes);
+        let s_plain = ScalarInt::from_le_bytes(&s_bytes);
         // The full 256-bit little-endian integer must already be reduced
         // (`s < p`) — constant-time, mirroring how edwards25519 point decoding
         // rejects a non-canonical `y`. This rejects encodings like `s + p` or
@@ -243,7 +244,7 @@ impl CompressedRistretto {
             return None;
         }
 
-        let s = f.to_mont(&s_plain);
+        let s = Fe::from_bytes(&s_bytes);
         let ss = f.sq(s);
         let u1 = f.sub(f.one, ss); // 1 - s^2
         let u2 = f.add(f.one, ss); // 1 + s^2
@@ -265,7 +266,7 @@ impl CompressedRistretto {
 
         // Reject: not a square, or t negative, or y == 0.
         let ok =
-            bool::from(was_square) && !bool::from(f.is_negative(t)) && !bool::from(f.is_zero(y));
+            bool::from(was_square) && !bool::from(f.is_negative(t)) && !bool::from(y.is_zero());
         if !ok {
             return None;
         }
@@ -292,7 +293,7 @@ impl Eq for CompressedRistretto {}
 fn map(t_bytes: &[u8; 32]) -> Point {
     let r255 = R255::new();
     let f = &r255.f;
-    let t = f.to_mont(&Fe::from_le_bytes(t_bytes));
+    let t = Fe::from_bytes(t_bytes);
 
     // r = SQRT_M1 * t^2
     let rr = f.mul(f.sqrtm1, f.sq(t));

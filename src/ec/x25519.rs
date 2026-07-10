@@ -1,11 +1,12 @@
 //! X25519 Diffie-Hellman over Curve25519 (RFC 7748).
 //!
-//! The field is GF(2²⁵⁵−19); arithmetic reuses the constant-time
-//! [`MontModulus`]. The scalar multiplication is
-//! the Montgomery ladder with constant-time conditional swaps.
+//! The field is GF(2²⁵⁵−19); arithmetic reuses the constant-time unsaturated
+//! 5×51-bit limb backend (`ec::curve25519::field::Fe`). The scalar
+//! multiplication is the Montgomery ladder with constant-time conditional
+//! swaps.
 
-use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ec::curve25519::field::Fe;
 use crate::rng::RngCore;
 
 /// An X25519 Diffie-Hellman failure mode. Currently only one: the peer
@@ -32,16 +33,8 @@ impl core::fmt::Display for X25519Error {
 
 impl core::error::Error for X25519Error {}
 
-/// `p = 2^255 - 19` (big-endian hex).
-const P25519_HEX: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed";
-/// `(A - 2) / 4 = 121665` for Curve25519.
-const A24: u64 = 121665;
-
-type Fe = Uint<4>;
-
-fn fe_from_hex(hex: &str) -> Fe {
-    super::uint_from_be_hex(hex)
-}
+/// `(A - 2) / 4 = 121665` for Curve25519, as a field element.
+const A24: Fe = Fe([121665, 0, 0, 0, 0]);
 
 /// Computes the raw X25519 function: `scalar * point` on Curve25519, returning
 /// the resulting u-coordinate (little-endian, 32 bytes).
@@ -52,62 +45,51 @@ fn fe_from_hex(hex: &str) -> Fe {
 /// contexts, so callers exposed to network peer input should use
 /// [`X25519PrivateKey::diffie_hellman`] (which returns `Result`) instead.
 pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
-    let fp = MontModulus::new(fe_from_hex(P25519_HEX));
-
     // Clamp the scalar (RFC 7748 §5).
     let mut k = *scalar;
     k[0] &= 248;
     k[31] &= 127;
     k[31] |= 64;
-    let k = Fe::from_le_bytes(&k);
 
-    // Decode the u-coordinate: mask the top bit, reduce mod p.
+    // Decode the u-coordinate: mask the top bit. The value may be a
+    // non-canonical residue (`p ≤ u < 2^255`) — the lazy 51-bit
+    // representation handles it, and RFC 7748 mandates this masking-only
+    // treatment.
     let mut ub = *point;
     ub[31] &= 127;
-    let u = Fe::from_le_bytes(&ub).reduce(fp.modulus());
+    let x1 = Fe::from_bytes(&ub);
 
-    let one = fp.to_mont(&Fe::ONE);
-    let x1 = fp.to_mont(&u);
-    let mut x2 = one;
+    let mut x2 = Fe::ONE;
     let mut z2 = Fe::ZERO;
     let mut x3 = x1;
-    let mut z3 = one;
-    let a24 = fp.to_mont(&Fe::from_u64(A24));
+    let mut z3 = Fe::ONE;
 
-    let mul = |a: &Fe, b: &Fe| fp.mont_mul(a, b);
-    let sq = |a: &Fe| fp.mont_sqr(a);
-    let add = |a: &Fe, b: &Fe| fp.add_mod(a, b);
-    let sub = |a: &Fe, b: &Fe| fp.sub_mod(a, b);
-
+    // Montgomery ladder over bits 254..0 of the clamped scalar (bit 255 is
+    // cleared and bit 254 set by clamping).
     let mut swap = 0u8;
-    let limbs = k.as_limbs();
     let mut t = 255;
     while t > 0 {
         t -= 1;
-        let kt = ((limbs[t / 64] >> (t % 64)) & 1) as u8;
+        let kt = (k[t / 8] >> (t % 8)) & 1;
         swap ^= kt;
         let sw = Choice::from(swap);
         Fe::conditional_swap(&mut x2, &mut x3, sw);
         Fe::conditional_swap(&mut z2, &mut z3, sw);
         swap = kt;
 
-        let a = add(&x2, &z2);
-        let aa = sq(&a);
-        let b = sub(&x2, &z2);
-        let bb = sq(&b);
-        let e = sub(&aa, &bb);
-        let c = add(&x3, &z3);
-        let d = sub(&x3, &z3);
-        let da = mul(&d, &a);
-        let cb = mul(&c, &b);
-        let t0 = add(&da, &cb);
-        x3 = sq(&t0);
-        let t1 = sub(&da, &cb);
-        let t1sq = sq(&t1);
-        z3 = mul(&x1, &t1sq);
-        x2 = mul(&aa, &bb);
-        let t2 = add(&aa, &mul(&a24, &e));
-        z2 = mul(&e, &t2);
+        let a = x2.add(&z2);
+        let aa = a.sq();
+        let b = x2.sub(&z2);
+        let bb = b.sq();
+        let e = aa.sub(&bb);
+        let c = x3.add(&z3);
+        let d = x3.sub(&z3);
+        let da = d.mul(&a);
+        let cb = c.mul(&b);
+        x3 = da.add(&cb).sq();
+        z3 = x1.mul(&da.sub(&cb).sq());
+        x2 = aa.mul(&bb);
+        z2 = e.mul(&aa.add(&A24.mul(&e)));
     }
     let sw = Choice::from(swap);
     Fe::conditional_swap(&mut x2, &mut x3, sw);
@@ -115,19 +97,13 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 
     // result = x2 / z2 (or 0 if z2 == 0).
     //
-    // The inverse is via Fermat's little theorem (`z^{p-2} mod p`) using the
-    // constant-time Montgomery ladder, NOT the variable-time extended-Euclidean
-    // `inv_mod` — z2 depends on the secret scalar and any timing variation
-    // here would leak. Fermat naturally returns 0 when z2 == 0, so the
-    // small-order / contributory-failure case yields the all-zero output
-    // without a data-dependent branch.
-    let z2_plain = fp.from_mont(&z2);
-    let p_minus_2 = fp.modulus().wrapping_sub(&Fe::from_u64(2));
-    let z_inv = fp.pow(&z2_plain, &p_minus_2);
-    let res = fp.mul_mod(&fp.from_mont(&x2), &z_inv);
-    let mut out = [0u8; 32];
-    res.write_le_bytes(&mut out);
-    out
+    // The inverse is the constant-time Fermat addition chain (`z^{p-2}`),
+    // NOT a variable-time extended-Euclidean inverse — z2 depends on the
+    // secret scalar and any timing variation here would leak. Fermat
+    // naturally returns 0 when z2 == 0, so the small-order /
+    // contributory-failure case yields the all-zero output without a
+    // data-dependent branch.
+    x2.mul(&z2.invert()).to_bytes()
 }
 
 /// The X25519 base point (`u = 9`).

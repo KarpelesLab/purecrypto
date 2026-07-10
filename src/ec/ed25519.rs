@@ -1,22 +1,24 @@
 //! Ed25519 signatures (EdDSA over edwards25519, RFC 8032).
 //!
-//! The field is GF(2²⁵⁵−19) — the same prime as X25519 — so the arithmetic
-//! reuses the constant-time [`MontModulus`](crate::bignum::MontModulus). Curve
+//! The field is GF(2²⁵⁵−19) — the same prime as X25519 — implemented in the
+//! constant-time unsaturated 5×51-bit limb representation
+//! (`ec::curve25519::field`). Curve
 //! points use the twisted Edwards curve `−x² + y² = 1 + d·x²·y²` in extended
 //! homogeneous coordinates `(X:Y:Z:T)`, with complete addition formulas
-//! (Hisil–Wong–Carter–Dawson 2008), so there are no exceptional cases. Scalar
-//! multiplication is a fixed-window-free constant-time double-and-add: every
-//! step doubles and conditionally selects the sum, independent of the secret
-//! scalar bits. Reduction of scalars modulo the group order `L` rides on the
-//! constant-time [`Uint`](crate::bignum::Uint) long division.
+//! (Hisil–Wong–Carter–Dawson 2008), so there are no exceptional cases. Secret
+//! scalar multiplications are constant-time fixed-window ladders; signature
+//! *verification* — whose inputs are all public — uses clearly-marked
+//! variable-time double-base multiplication for speed. Reduction of scalars
+//! modulo the group order `L` rides on the constant-time
+//! [`Uint`](crate::bignum::Uint) long division.
 //!
 //! The field, point, and scalar arithmetic live in the shared `curve25519`
 //! backend, which this module consumes; the same backend powers the
 //! `edwards25519::hazmat` and `ristretto255` exposures.
 
-use crate::ct::{ConstantTimeEq, ConstantTimeLess};
+use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
-use crate::ec::curve25519::field::{Fe, Field};
+use crate::ec::curve25519::field::{Field, ScalarInt};
 use crate::ec::curve25519::scalar::{clamp, scalar_muladd, scalar_reduce_wide};
 use crate::hash::{Digest, Sha512};
 use crate::rng::{CryptoRng, RngCore};
@@ -112,7 +114,7 @@ impl Ed25519PrivateKey {
         hk.update(&a_enc);
         hk.update(message);
         let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
-        let a_scalar = Fe::from_le_bytes(&a);
+        let a_scalar = ScalarInt::from_le_bytes(&a);
         let s = scalar_muladd(&r, &k, &a_scalar, &f.l8);
 
         let mut sig = [0u8; 64];
@@ -247,13 +249,19 @@ impl Ed25519PublicKey {
     ///
     /// Returns [`Error::Verification`] on any failure (malformed inputs
     /// included).
+    ///
+    /// All verification inputs — signature, message, and public key — are
+    /// public, so this path deliberately uses the **variable-time** scalar
+    /// multiplications (`mul_base_vartime`, `scalar_mult_vartime`); nothing
+    /// secret flows through them. Signing and key generation stay on the
+    /// constant-time ladders.
     pub fn verify(&self, message: &[u8], signature: &Ed25519Signature) -> Result<(), Error> {
         let f = Field::new();
 
         // S must be a canonical scalar in [0, L).
         let mut s_bytes = [0u8; 32];
         s_bytes.copy_from_slice(&signature.0[32..]);
-        let s = Fe::from_le_bytes(&s_bytes);
+        let s = ScalarInt::from_le_bytes(&s_bytes);
         if !bool::from(s.ct_lt(&f.l)) {
             return Err(Error::Verification);
         }
@@ -274,20 +282,18 @@ impl Ed25519PublicKey {
 
         // Cofactored verify: accept iff [8S]B == [8R] + [8k]A. We multiply
         // each side of the cofactor-less equation by 8 = [2][2][2].
-        // `S` is public here, but the fixed-base comb is both constant-time
-        // and the fastest path, so use it for the [S]B side too.
-        let lhs = f.mul_base(&s_bytes);
-        let ka = f.scalar_mult(&k_bytes, &a_point);
+        // Every operand here is public (S, k, R, A), so the variable-time
+        // multiplications are safe — and much faster than the constant-time
+        // gathers. They are differentially tested against the constant-time
+        // paths in `curve25519::point`.
+        let lhs = f.mul_base_vartime(&s_bytes);
+        let ka = f.scalar_mult_vartime(&k_bytes, &a_point);
         let rhs = f.point_add(&r_point, &ka);
         let lhs8 = f.point_double(&f.point_double(&f.point_double(&lhs)));
         let rhs8 = f.point_double(&f.point_double(&f.point_double(&rhs)));
-        // Operands are public, but the rest of the crate uses constant-time
-        // equality for encoded-point comparison; staying consistent here keeps
-        // a future refactor from accidentally folding secret bytes through `==`
-        // (which has early-exit semantics on `[u8; N]`).
-        let lhs_enc = f.encode(&lhs8);
-        let rhs_enc = f.encode(&rhs8);
-        if bool::from(lhs_enc.ct_eq(&rhs_enc)) {
+        // Projective cross-multiply comparison (X₁Z₂ == X₂Z₁, Y₁Z₂ == Y₂Z₁):
+        // no field inversions, unlike encoding both sides.
+        if bool::from(f.point_ct_eq(&lhs8, &rhs8)) {
             Ok(())
         } else {
             Err(Error::Verification)
@@ -392,15 +398,15 @@ mod tests {
 
     #[test]
     fn field_invariants() {
-        use crate::ec::curve25519::field::BASE_ENC;
+        use crate::ec::curve25519::field::{BASE_ENC, Fe};
         let f = Field::new();
         // inversion: a * a^(p-2) == 1
-        let three = f.to_mont(&Fe::from_u64(3));
+        let three = Fe::from_u64(3);
         let inv3 = f.inv(three);
-        assert!(bool::from(f.mul(three, inv3).ct_eq(&f.one)), "inv broken");
+        assert!(bool::from(f.ct_eq(f.mul(three, inv3), f.one)), "inv broken");
         // sqrt(-1)^2 == -1
         let neg1 = f.neg(f.one);
-        assert!(bool::from(f.sq(f.sqrtm1).ct_eq(&neg1)), "sqrtm1 broken");
+        assert!(bool::from(f.ct_eq(f.sq(f.sqrtm1), neg1)), "sqrtm1 broken");
         // base point decodes
         assert!(f.decode(&BASE_ENC).is_some(), "base decode failed");
     }
@@ -515,6 +521,87 @@ mod tests {
         let parsed = Ed25519PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
         assert_eq!(parsed.to_bytes(), seed);
         assert_eq!(parsed.public_key().to_bytes(), pub_enc);
+    }
+
+    /// The old fully constant-time verification path (constant-time comb +
+    /// windowed ladder + encoded comparison), kept as the differential oracle
+    /// for the vartime path now used by `verify`.
+    fn verify_ct_reference(
+        pk: &Ed25519PublicKey,
+        message: &[u8],
+        signature: &Ed25519Signature,
+    ) -> bool {
+        use crate::ct::ConstantTimeEq;
+        let f = Field::new();
+        let mut s_bytes = [0u8; 32];
+        s_bytes.copy_from_slice(&signature.0[32..]);
+        let s = ScalarInt::from_le_bytes(&s_bytes);
+        if !bool::from(s.ct_lt(&f.l)) {
+            return false;
+        }
+        let mut r_bytes = [0u8; 32];
+        r_bytes.copy_from_slice(&signature.0[..32]);
+        let (Some(r_point), Some(a_point)) = (f.decode(&r_bytes), f.decode(&pk.0)) else {
+            return false;
+        };
+        let mut hk = Sha512::new();
+        hk.update(&r_bytes);
+        hk.update(&pk.0);
+        hk.update(message);
+        let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
+        let mut k_bytes = [0u8; 32];
+        k.write_le_bytes(&mut k_bytes);
+        let lhs = f.mul_base(&s_bytes);
+        let ka = f.scalar_mult(&k_bytes, &a_point);
+        let rhs = f.point_add(&r_point, &ka);
+        let lhs8 = f.point_double(&f.point_double(&f.point_double(&lhs)));
+        let rhs8 = f.point_double(&f.point_double(&f.point_double(&rhs)));
+        bool::from(f.encode(&lhs8).ct_eq(&f.encode(&rhs8)))
+    }
+
+    /// The vartime verify must accept/reject exactly like the constant-time
+    /// reference over many random signatures, corrupted signatures (every
+    /// byte position of R and S), wrong keys, and wrong messages.
+    #[test]
+    fn vartime_verify_matches_constant_time_reference() {
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed25519-vartime-diff", b"n", &[]);
+        for i in 0..8u8 {
+            let sk = Ed25519PrivateKey::generate(&mut rng);
+            let pk = sk.public_key();
+            let msg = [i; 24];
+            let sig = sk.sign(&msg);
+
+            // Valid signature: both accept.
+            assert!(verify_ct_reference(&pk, &msg, &sig));
+            assert!(pk.verify(&msg, &sig).is_ok());
+
+            // Corrupt each byte of the signature in turn: both paths must
+            // agree bit-for-bit on accept/reject (some corruptions of R may
+            // still decode; the equation then fails in both).
+            for pos in 0..64 {
+                let mut bad = sig.to_bytes();
+                bad[pos] ^= 0x40;
+                let bad_sig = Ed25519Signature::from_bytes(bad);
+                assert_eq!(
+                    pk.verify(&msg, &bad_sig).is_ok(),
+                    verify_ct_reference(&pk, &msg, &bad_sig),
+                    "vartime/CT divergence at corrupted byte {pos}"
+                );
+            }
+
+            // Wrong message and wrong key: both reject.
+            assert_eq!(
+                pk.verify(b"other message", &sig).is_ok(),
+                verify_ct_reference(&pk, b"other message", &sig)
+            );
+            assert!(pk.verify(b"other message", &sig).is_err());
+            let pk2 = Ed25519PrivateKey::generate(&mut rng).public_key();
+            assert_eq!(
+                pk2.verify(&msg, &sig).is_ok(),
+                verify_ct_reference(&pk2, &msg, &sig)
+            );
+            assert!(pk2.verify(&msg, &sig).is_err());
+        }
     }
 
     #[test]

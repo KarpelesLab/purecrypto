@@ -26,7 +26,7 @@
 //!   with RFC 8032 32-byte compression.
 
 use crate::ct::{Choice, ConstantTimeEq, ConstantTimeLess};
-use crate::ec::curve25519::field::{Fe, Field};
+use crate::ec::curve25519::field::{Field, ScalarInt};
 use crate::ec::curve25519::point::Point;
 use crate::ec::curve25519::scalar::{
     scalar_add, scalar_invert, scalar_mul, scalar_negate, scalar_reduce_wide, scalar_sub,
@@ -42,27 +42,27 @@ use crate::ec::curve25519::scalar::{
 /// Because the value is zeroized on drop, `Scalar` is [`Clone`] but not
 /// `Copy`; pass it by reference or clone it explicitly.
 #[derive(Clone)]
-pub struct Scalar(pub(crate) Fe);
+pub struct Scalar(pub(crate) ScalarInt);
 
 impl Drop for Scalar {
     fn drop(&mut self) {
         // Best-effort wipe; the black_box barrier keeps LLVM from eliding it.
-        self.0 = Fe::ZERO;
+        self.0 = ScalarInt::ZERO;
         let _ = core::hint::black_box(&self.0);
     }
 }
 
 impl Scalar {
     /// The additive identity `0`.
-    pub const ZERO: Scalar = Scalar(Fe::ZERO);
+    pub const ZERO: Scalar = Scalar(ScalarInt::ZERO);
     /// The multiplicative identity `1`.
-    pub const ONE: Scalar = Scalar(Fe::ONE);
+    pub const ONE: Scalar = Scalar(ScalarInt::ONE);
 
     /// Decodes a 32-byte little-endian scalar, returning `None` if it is not
     /// canonical (i.e. `>= L`).
     pub fn from_bytes_canonical(bytes: &[u8; 32]) -> Option<Scalar> {
         let f = Field::new();
-        let v = Fe::from_le_bytes(bytes);
+        let v = ScalarInt::from_le_bytes(bytes);
         if bool::from(v.ct_lt(&f.l)) {
             Some(Scalar(v))
         } else {
@@ -264,7 +264,7 @@ impl PartialEq for EdwardsPoint {
 impl Eq for EdwardsPoint {}
 
 /// Little-endian 32-byte view of a residue `< L`, for the scalar ladder.
-fn scalar_bytes(v: &Fe) -> [u8; 32] {
+fn scalar_bytes(v: &ScalarInt) -> [u8; 32] {
     let mut b = [0u8; 32];
     v.write_le_bytes(&mut b);
     b
@@ -431,7 +431,7 @@ mod tests {
         f.l.write_le_bytes(&mut lbytes);
         assert!(Scalar::from_bytes_canonical(&lbytes).is_none());
         // L - 1 is canonical.
-        let lm1 = f.l.wrapping_sub(&Fe::from_u64(1));
+        let lm1 = f.l.wrapping_sub(&ScalarInt::from_u64(1));
         let mut lm1b = [0u8; 32];
         lm1.write_le_bytes(&mut lm1b);
         assert!(Scalar::from_bytes_canonical(&lm1b).is_some());
