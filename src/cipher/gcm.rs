@@ -59,18 +59,42 @@ pub struct Gcm<C: BlockCipher> {
     /// one target that currently has a hardware GHASH backend.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     ghash_hw: bool,
+    /// Precomputed hash-subkey powers `hpow[i] = H^{i+1}` for the aggregated
+    /// (multi-block, single-reduction) hardware GHASH. Computed once here so
+    /// neither the bulk hash nor the fused CTR+GHASH loop rederives them per
+    /// message. All zero when the hardware backend is absent.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    hpow: [u128; 8],
 }
 
 impl<C: BlockCipher> Gcm<C> {
     /// Creates a GCM context, deriving the hash subkey from `cipher`.
+    #[allow(unsafe_code)]
     pub fn new(cipher: C) -> Self {
         let mut h = [0u8; 16];
         cipher.encrypt_block(&mut h);
+        let h = u128::from_be_bytes(h);
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let (ghash_hw, hpow) = {
+            let hw = super::clmul::supported();
+            let mut hp = [0u128; 8];
+            if hw {
+                hp[0] = h;
+                for i in 1..8 {
+                    // SAFETY: `supported()` confirmed the carryless-multiply
+                    // features `gf_mul` requires.
+                    hp[i] = unsafe { super::clmul::gf_mul(hp[i - 1], h) };
+                }
+            }
+            (hw, hp)
+        };
         Gcm {
             cipher,
-            h: u128::from_be_bytes(h),
+            h,
             #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            ghash_hw: super::clmul::supported(),
+            ghash_hw,
+            #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+            hpow,
         }
     }
 
@@ -123,7 +147,7 @@ impl<C: BlockCipher> Gcm<C> {
             let full = ct.len() & !15;
             // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
             // the carryless-multiply features `ghash_blocks` requires.
-            x = unsafe { super::clmul::ghash_blocks(x, self.h, &ct[..full]) };
+            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &ct[..full]) };
             &ct[full..]
         } else {
             ct
@@ -161,6 +185,96 @@ impl<C: BlockCipher> Gcm<C> {
         let mut ej0 = j0.to_be_bytes();
         self.cipher.encrypt_block(&mut ej0);
         (u128::from_be_bytes(ej0) ^ s).to_be_bytes()
+    }
+
+    /// Folds `data` (any length; the final partial block is zero-padded) into
+    /// the GHASH accumulator `x` via the aggregated hardware path. Only called
+    /// from the fused path, i.e. with `ghash_hw` set.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[allow(unsafe_code)]
+    fn ghash_partial(&self, mut x: u128, data: &[u8]) -> u128 {
+        let full = data.len() & !15;
+        if full > 0 {
+            // SAFETY: the fused path runs only when `clmul::supported()`
+            // confirmed the features `ghash_blocks` requires.
+            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &data[..full]) };
+        }
+        if full < data.len() {
+            x = self.mul_h(x ^ load_block(&data[full..]));
+        }
+        x
+    }
+
+    /// Single-pass AES-CTR ⊕ GHASH ("stitched") implementation of the GCM
+    /// bulk work, used when both a hardware AES schedule and the carryless
+    /// multiplier are available. Interleaving the two dependency chains in one
+    /// loop lets the CPU's AES units and carryless multiplier run
+    /// concurrently, where the generic path makes two serial passes over the
+    /// buffer.
+    ///
+    /// Encrypts (`encrypt = true`) or decrypts (`false`) `buffer` in place and
+    /// returns the authentication tag; `None` means no fused backend, caller
+    /// falls back to the generic path. NB: on decrypt the tag is computed but
+    /// NOT verified here — and the buffer has already been decrypted — so the
+    /// caller must check the tag and restore the ciphertext on mismatch.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[allow(unsafe_code)]
+    fn crypt_fused(
+        &self,
+        j0: u128,
+        aad: &[u8],
+        buffer: &mut [u8],
+        encrypt: bool,
+    ) -> Option<[u8; 16]> {
+        if !self.ghash_hw {
+            return None;
+        }
+        let (rk, nr) = self.cipher.hw_aes_schedule()?;
+        let total_len = buffer.len();
+
+        // AAD prefix of the GHASH (outside the bulk loop).
+        let mut x = self.ghash_partial(0, aad);
+
+        // Bulk: whole 128-byte (8-block) groups run through the fused loop.
+        let fused = total_len & !127;
+        let ctr0 = inc32(j0);
+        if fused > 0 {
+            // SAFETY: `ghash_hw` plus `hw_aes_schedule()` returning `Some`
+            // confirmed the AES-NI + PCLMULQDQ features the kernel requires;
+            // `rk` is the cipher's own `16 * (nr + 1)`-byte schedule.
+            x = unsafe {
+                super::clmul::ctr_ghash_fused(
+                    rk,
+                    nr,
+                    ctr0,
+                    &self.hpow,
+                    x,
+                    &mut buffer[..fused],
+                    encrypt,
+                )
+            };
+        }
+
+        // Tail (< 8 blocks): generic windowed CTR + aggregated GHASH. The
+        // counter after `fused/16` blocks; GCM `inc32` wraps modulo 2³².
+        let ctr_tail =
+            (ctr0 & !0xffff_ffffu128) | ((ctr0 as u32).wrapping_add((fused / 16) as u32) as u128);
+        let tail = &mut buffer[fused..];
+        if encrypt {
+            self.gctr(ctr_tail, tail);
+            x = self.ghash_partial(x, tail);
+        } else {
+            // Hash the ciphertext before overwriting it with plaintext.
+            x = self.ghash_partial(x, tail);
+            self.gctr(ctr_tail, tail);
+        }
+
+        // Length block, then the tag mask E_K(J0).
+        let len_block = ((aad.len() as u128 * 8) << 64) | (total_len as u128 * 8);
+        x = self.mul_h(x ^ len_block);
+        let mut ej0 = j0.to_be_bytes();
+        self.cipher.encrypt_block(&mut ej0);
+        Some((u128::from_be_bytes(ej0) ^ x).to_be_bytes())
     }
 
     /// NIST SP 800-38D §5.2.1.1: |IV| ∈ [1, 2^64−1] bits. We surface the
@@ -201,6 +315,10 @@ impl<C: BlockCipher> Gcm<C> {
     pub fn encrypt(&self, nonce: &[u8], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
         Self::validate(nonce, buffer);
         let j0 = self.j0(nonce);
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if let Some(tag) = self.crypt_fused(j0, aad, buffer, true) {
+            return tag;
+        }
         self.gctr(inc32(j0), buffer);
         self.tag(j0, aad, buffer)
     }
@@ -222,6 +340,18 @@ impl<C: BlockCipher> Gcm<C> {
     ) -> Result<(), TagMismatch> {
         Self::validate(nonce, buffer);
         let j0 = self.j0(nonce);
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if let Some(expected) = self.crypt_fused(j0, aad, buffer, false) {
+            if bool::from(expected.ct_eq(tag)) {
+                return Ok(());
+            }
+            // The stitched pass decrypts while it hashes, so `buffer` already
+            // holds the (unauthenticated) plaintext; re-applying the keystream
+            // restores the ciphertext before returning, upholding the
+            // documented contract. The plaintext never leaves this function.
+            self.gctr(inc32(j0), buffer);
+            return Err(TagMismatch);
+        }
         // GHASH is computed over the ciphertext, which is still in `buffer`.
         let expected = self.tag(j0, aad, buffer);
         if !bool::from(expected.ct_eq(tag)) {
@@ -234,12 +364,18 @@ impl<C: BlockCipher> Gcm<C> {
 
 impl<C: BlockCipher> Drop for Gcm<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the GHASH subkey `H = E_K(0¹²⁸)`, which is
-        // secret-equivalent (it lets an attacker forge tags, and nonce reuse
-        // already leaks it). Same `core::hint::black_box`-guarded zeroing as
-        // the AES round-key drop in `cipher/aes/mod.rs`.
+        // Best-effort wipe of the GHASH subkey `H = E_K(0¹²⁸)` and its
+        // precomputed powers, which are secret-equivalent (they let an
+        // attacker forge tags, and nonce reuse already leaks H). Same
+        // `core::hint::black_box`-guarded zeroing as the AES round-key drop
+        // in `cipher/aes/mod.rs`.
         self.h = 0;
         let _ = core::hint::black_box(&self.h);
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            self.hpow = [0u128; 8];
+            let _ = core::hint::black_box(&self.hpow);
+        }
     }
 }
 
@@ -350,6 +486,74 @@ mod tests {
                     tag, expected,
                     "tag mismatch at aad_len={aad_len} msg_len={msg_len}"
                 );
+            }
+        }
+    }
+
+    /// Differential guard for the fused (stitched AES-CTR ⊕ GHASH) bulk path:
+    /// on hardware with AES-NI + PCLMULQDQ the default context takes the fused
+    /// path, while a context built on the software AES backend (no
+    /// `hw_aes_schedule`) takes the generic two-pass path. Ciphertext and tag
+    /// must be byte-identical across a length sweep covering every block,
+    /// 4-block, 8-block-group and partial-block residue, with several AAD
+    /// lengths, for encrypt AND decrypt — including tag rejection leaving the
+    /// buffer untouched (the fused decrypt must restore the ciphertext).
+    /// Without the hardware features both sides take the generic path and the
+    /// test still holds trivially.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn fused_matches_two_pass() {
+        use std::vec::Vec;
+        let key128 = from_hex::<16>("feffe9928665731c6d6a8f9467308308");
+        let key256 =
+            from_hex::<32>("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308");
+        let fused128 = Gcm::new(Aes128::new(&key128));
+        let plain128 = Gcm::new(Aes128::new_software(&key128));
+        let fused256 = Gcm::new(crate::cipher::Aes256::new(&key256));
+        let plain256 = Gcm::new(crate::cipher::Aes256::new_software(&key256));
+        let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+
+        let mut lens: Vec<usize> = (0..=300).collect();
+        lens.extend([511, 512, 513, 1023, 1024, 1025, 4096, 8191]);
+
+        fn check<C: crate::cipher::BlockCipher>(
+            fused: &Gcm<C>,
+            plain: &Gcm<C>,
+            nonce: &[u8; 12],
+            aad: &[u8],
+            len: usize,
+        ) {
+            use std::vec::Vec;
+            let pt: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(41).wrapping_add(7))
+                .collect();
+            let mut a = pt.clone();
+            let mut b = pt.clone();
+            let ta = fused.encrypt(nonce, aad, &mut a);
+            let tb = plain.encrypt(nonce, aad, &mut b);
+            assert_eq!(a, b, "ciphertext len={len} aad={}", aad.len());
+            assert_eq!(ta, tb, "tag len={len} aad={}", aad.len());
+
+            // Fused decrypt round-trips.
+            fused.decrypt(nonce, aad, &mut a, &ta).unwrap();
+            assert_eq!(a, pt, "roundtrip len={len} aad={}", aad.len());
+
+            // Rejection restores the ciphertext byte-for-byte.
+            let ct = b.clone();
+            let mut bad = ta;
+            bad[15] ^= 1;
+            assert_eq!(fused.decrypt(nonce, aad, &mut b, &bad), Err(TagMismatch));
+            assert_eq!(b, ct, "restore on mismatch len={len} aad={}", aad.len());
+        }
+
+        for &aad_len in &[0usize, 5, 16, 37] {
+            let aad: Vec<u8> = (0..aad_len).map(|i| (i as u8) ^ 0xa5).collect();
+            for &len in &lens {
+                check(&fused128, &plain128, &nonce, &aad, len);
+            }
+            // AES-256 exercises the 14-round schedule in the fused kernel.
+            for &len in &[0usize, 96, 127, 128, 129, 1024, 4096] {
+                check(&fused256, &plain256, &nonce, &aad, len);
             }
         }
     }

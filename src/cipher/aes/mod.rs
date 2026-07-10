@@ -351,6 +351,18 @@ macro_rules! aes_variant {
                 debug_assert_eq!(blocks.len() % 16, 0, "decrypt_blocks needs whole blocks");
                 dispatch_decrypt_blocks(self.backend, &self.rk, $nr, blocks);
             }
+
+            // Exposes the round-key schedule to the GCM fused CTR+GHASH loop,
+            // but only when the hardware AES backend is active (the fused loop
+            // is built on the AES instruction-set extensions).
+            #[doc(hidden)]
+            fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
+                #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+                if matches!(self.backend, AesBackend::Hardware) {
+                    return Some((&self.rk[..], $nr));
+                }
+                None
+            }
         }
 
         impl Drop for $name {

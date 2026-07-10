@@ -114,6 +114,17 @@ pub trait BlockCipher {
             self.decrypt_block(block);
         }
     }
+
+    /// Internal hook for the stitched AES-CTR ⊕ GHASH bulk path in GCM: when
+    /// the cipher is AES running on a hardware backend, returns the FIPS-197
+    /// round-key schedule bytes and the round count so the mode can drive the
+    /// AES pipeline and the carryless multiplier in a single fused loop.
+    /// `None` (the default, and the only sensible answer for anything that is
+    /// not hardware-backed AES) selects the generic two-pass path.
+    #[doc(hidden)]
+    fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
+        None
+    }
 }
 
 /// A 64-bit-block cipher: parallel to [`BlockCipher`] but for legacy

@@ -15,7 +15,7 @@
 #[cfg(target_arch = "aarch64")]
 pub(super) use arm::{gf_mul, ghash_blocks};
 #[cfg(target_arch = "x86_64")]
-pub(super) use x86::{gf_mul, ghash_blocks};
+pub(super) use x86::{ctr_ghash_fused, gf_mul, ghash_blocks};
 
 /// Whether a hardware GHASH backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
@@ -52,17 +52,22 @@ mod x86 {
     /// Separated from the reduction so several products can be XOR-accumulated
     /// and reduced once — the aggregated-reduction trick (the reduction is
     /// XOR-linear, so `reduce(Σ pᵢ) = Σ reduce(pᵢ)`).
+    ///
+    /// Uses Karatsuba: 3 PCLMULQDQ instead of the 4 of the schoolbook form —
+    /// the two cross terms `a₀b₁ ⊕ a₁b₀` are recovered from one multiply as
+    /// `(a₀⊕a₁)(b₀⊕b₁) ⊕ a₀b₀ ⊕ a₁b₁` (carryless, so additions are XOR).
     #[inline]
     #[target_feature(enable = "pclmulqdq,sse2")]
     unsafe fn clmul_halves(a: __m128i, b: __m128i) -> (__m128i, __m128i) {
         unsafe {
-            let t3 = _mm_clmulepi64_si128(a, b, 0x00);
-            let t6 = _mm_clmulepi64_si128(a, b, 0x11);
-            let t4 = _mm_clmulepi64_si128(a, b, 0x10);
-            let t5 = _mm_clmulepi64_si128(a, b, 0x01);
-            let t4 = _mm_xor_si128(t4, t5);
-            let t5 = _mm_slli_si128(t4, 8);
-            let t4 = _mm_srli_si128(t4, 8);
+            let t3 = _mm_clmulepi64_si128(a, b, 0x00); // a₀·b₀
+            let t6 = _mm_clmulepi64_si128(a, b, 0x11); // a₁·b₁
+            let ax = _mm_xor_si128(a, _mm_srli_si128(a, 8)); // low 64 = a₀⊕a₁
+            let bx = _mm_xor_si128(b, _mm_srli_si128(b, 8)); // low 64 = b₀⊕b₁
+            let mid = _mm_clmulepi64_si128(ax, bx, 0x00);
+            let mid = _mm_xor_si128(mid, _mm_xor_si128(t3, t6)); // a₀b₁ ⊕ a₁b₀
+            let t5 = _mm_slli_si128(mid, 8);
+            let t4 = _mm_srli_si128(mid, 8);
             (_mm_xor_si128(t3, t5), _mm_xor_si128(t6, t4))
         }
     }
@@ -130,36 +135,172 @@ mod x86 {
         }
     }
 
+    /// Loads the eight precomputed hash-subkey powers (`hpow[i] = H^{i+1}`,
+    /// computed once at GCM construction) into registers in the reflected
+    /// representation. A `u128`'s little-endian bytes ARE the byte-swapped
+    /// big-endian block, so no shuffle is needed.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_hpow(hpow: &[u128; 8]) -> [__m128i; 8] {
+        unsafe {
+            let mut h = [_mm_setzero_si128(); 8];
+            for (hv, hp) in h.iter_mut().zip(hpow.iter()) {
+                let b = hp.to_le_bytes();
+                *hv = _mm_loadu_si128(b.as_ptr() as *const __m128i);
+            }
+            h
+        }
+    }
+
+    /// Folds the eight 16-byte blocks at `p` into `acc` with one reduction:
+    /// `acc ← (acc ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` (aggregated reduction).
+    #[inline]
+    #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
+    unsafe fn ghash_group8(acc: __m128i, h: &[__m128i; 8], p: *const u8) -> __m128i {
+        unsafe {
+            let load = |q: *const u8| bswap(_mm_loadu_si128(q as *const __m128i));
+            let d0 = _mm_xor_si128(acc, load(p));
+            let (mut lo, mut hi) = clmul_halves(d0, h[7]);
+            for j in 1..8 {
+                let (l, hh) = clmul_halves(load(p.add(j * 16)), h[7 - j]);
+                lo = _mm_xor_si128(lo, l);
+                hi = _mm_xor_si128(hi, hh);
+            }
+            reduce(lo, hi)
+        }
+    }
+
     /// Aggregated GHASH: folds whole 16-byte `blocks` (length a multiple of 16)
-    /// into the accumulator `x`, four blocks per reduction.
+    /// into the accumulator `x`, eight blocks per reduction using the
+    /// precomputed powers `hpow[i] = H^{i+1}`.
     ///
-    /// `x ← (x ⊕ b₀)·H⁴ ⊕ b₁·H³ ⊕ b₂·H² ⊕ b₃·H` per group, accumulating the four
-    /// unreduced products and reducing once; the `< 4`-block tail folds serially.
+    /// `x ← (x ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` per group, accumulating the eight
+    /// unreduced products and reducing once; a `≥ 4`-block remainder folds as
+    /// one four-block group and the final `< 4`-block tail folds serially.
     /// Returns the same value as repeated `gf_mul(x ⊕ bᵢ, h)`.
     #[target_feature(enable = "pclmulqdq,sse2,ssse3")]
-    pub(in super::super) unsafe fn ghash_blocks(x: u128, h: u128, blocks: &[u8]) -> u128 {
+    pub(in super::super) unsafe fn ghash_blocks(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
         unsafe {
             let load = |p: *const u8| bswap(_mm_loadu_si128(p as *const __m128i));
-            let h1 = load(h.to_be_bytes().as_ptr());
-            let h2 = gfmul(h1, h1);
-            let h3 = gfmul(h2, h1);
-            let h4 = gfmul(h3, h1);
+            let h = load_hpow(hpow);
 
-            let mut acc = bswap(_mm_loadu_si128(x.to_be_bytes().as_ptr() as *const __m128i));
-            let mut chunks = blocks.chunks_exact(64);
+            let xb = x.to_le_bytes();
+            let mut acc = _mm_loadu_si128(xb.as_ptr() as *const __m128i);
+            let mut chunks = blocks.chunks_exact(128);
             for c in &mut chunks {
-                let p = c.as_ptr();
-                let d0 = _mm_xor_si128(acc, load(p));
-                let (mut lo, mut hi) = clmul_halves(d0, h4);
-                let (l1, h1p) = clmul_halves(load(p.add(16)), h3);
-                let (l2, h2p) = clmul_halves(load(p.add(32)), h2);
-                let (l3, h3p) = clmul_halves(load(p.add(48)), h1);
-                lo = _mm_xor_si128(_mm_xor_si128(lo, l1), _mm_xor_si128(l2, l3));
-                hi = _mm_xor_si128(_mm_xor_si128(hi, h1p), _mm_xor_si128(h2p, h3p));
-                acc = reduce(lo, hi);
+                acc = ghash_group8(acc, &h, c.as_ptr());
             }
-            for c in chunks.remainder().chunks_exact(16) {
-                acc = gfmul(_mm_xor_si128(acc, load(c.as_ptr())), h1);
+            let mut rest = chunks.remainder();
+            if rest.len() >= 64 {
+                let p = rest.as_ptr();
+                let d0 = _mm_xor_si128(acc, load(p));
+                let (mut lo, mut hi) = clmul_halves(d0, h[3]);
+                for j in 1..4 {
+                    let (l, hh) = clmul_halves(load(p.add(j * 16)), h[3 - j]);
+                    lo = _mm_xor_si128(lo, l);
+                    hi = _mm_xor_si128(hi, hh);
+                }
+                acc = reduce(lo, hi);
+                rest = &rest[64..];
+            }
+            for c in rest.chunks_exact(16) {
+                acc = gfmul(_mm_xor_si128(acc, load(c.as_ptr())), h[0]);
+            }
+
+            let p = bswap(acc);
+            let mut out = [0u8; 16];
+            _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
+            u128::from_be_bytes(out)
+        }
+    }
+
+    /// Stitched AES-CTR ⊕ GHASH bulk loop — GCM "function stitching".
+    ///
+    /// Per 128-byte group the eight AESENC dependency chains and the
+    /// PCLMULQDQ aggregation of the neighbouring group are issued in the same
+    /// loop body, so the out-of-order core overlaps the AES units and the
+    /// carryless multiplier instead of running two separate passes over the
+    /// buffer.
+    ///
+    /// CTR-encrypts (⇔ decrypts) `buf` in place with AES under `round_keys`
+    /// (`nr` rounds), starting from counter block `ctr` (GCM `inc32`
+    /// semantics), while folding the *ciphertext* blocks into the GHASH
+    /// accumulator `acc` using the precomputed powers `hpow[i] = H^{i+1}`.
+    /// Encryption hashes each group's output with a one-group lag (the
+    /// ciphertext exists only after the XOR); decryption hashes its input
+    /// group directly. `buf.len()` must be a multiple of 128. Returns the
+    /// updated accumulator.
+    ///
+    /// Constant-time: AESENC and PCLMULQDQ are data-independent, and the only
+    /// branches here depend on the public buffer length and direction flag.
+    #[target_feature(enable = "aes,pclmulqdq,sse2,ssse3")]
+    pub(in super::super) unsafe fn ctr_ghash_fused(
+        round_keys: &[u8],
+        nr: usize,
+        ctr: u128,
+        hpow: &[u128; 8],
+        acc: u128,
+        buf: &mut [u8],
+        encrypt: bool,
+    ) -> u128 {
+        debug_assert_eq!(buf.len() % 128, 0);
+        unsafe {
+            // Preload the schedule once (≤ 15 round keys for AES-256).
+            let mut ks = [_mm_setzero_si128(); 15];
+            for (i, k) in ks.iter_mut().enumerate().take(nr + 1) {
+                *k = _mm_loadu_si128(round_keys.as_ptr().add(i * 16) as *const __m128i);
+            }
+            let h = load_hpow(hpow);
+            let ab = acc.to_le_bytes();
+            let mut acc = _mm_loadu_si128(ab.as_ptr() as *const __m128i);
+
+            // Block `i`'s counter is independent of block `i-1`'s: GCM `inc32`
+            // advances only the rightmost 32 bits, so counter `i` is
+            // `hi ‖ (lo + i mod 2³²)` — no serial dependency chain.
+            let ctr_hi = ctr & !0xffff_ffffu128;
+            let ctr_lo = ctr as u32;
+            let mut blk: u32 = 0;
+
+            let n = buf.len();
+            let base = buf.as_mut_ptr();
+            let mut off = 0;
+            while off < n {
+                // Eight counter blocks through the AES rounds, 8-wide.
+                let mut b = [_mm_setzero_si128(); 8];
+                for bj in b.iter_mut() {
+                    let cb = (ctr_hi | ctr_lo.wrapping_add(blk) as u128).to_be_bytes();
+                    *bj = _mm_xor_si128(_mm_loadu_si128(cb.as_ptr() as *const __m128i), ks[0]);
+                    blk = blk.wrapping_add(1);
+                }
+                for &k in ks.iter().take(nr).skip(1) {
+                    for bj in b.iter_mut() {
+                        *bj = _mm_aesenc_si128(*bj, k);
+                    }
+                }
+                for bj in b.iter_mut() {
+                    *bj = _mm_aesenclast_si128(*bj, ks[nr]);
+                }
+                // GHASH the neighbouring ciphertext group: the previous output
+                // group when encrypting, the current input group when
+                // decrypting (before the XOR below overwrites it).
+                if encrypt {
+                    if off >= 128 {
+                        acc = ghash_group8(acc, &h, base.add(off - 128));
+                    }
+                } else {
+                    acc = ghash_group8(acc, &h, base.add(off));
+                }
+                // XOR the keystream into the data.
+                for (j, bj) in b.iter().enumerate() {
+                    let q = base.add(off + j * 16);
+                    let d = _mm_loadu_si128(q as *const __m128i);
+                    _mm_storeu_si128(q as *mut __m128i, _mm_xor_si128(d, *bj));
+                }
+                off += 128;
+            }
+            // Flush the lag: the last output group is still unhashed.
+            if encrypt && n != 0 {
+                acc = ghash_group8(acc, &h, base.add(n - 128));
             }
 
             let p = bswap(acc);
@@ -211,18 +352,23 @@ mod arm {
 
     /// Carryless 128×128 multiply (byte-swapped rep), returning the UNREDUCED
     /// 256-bit product `(lo, hi)`. Split from the reduction for aggregation.
+    ///
+    /// Uses Karatsuba: 3 PMULL instead of the 4 of the schoolbook form — the
+    /// two cross terms `a₀b₁ ⊕ a₁b₀` are recovered from one multiply as
+    /// `(a₀⊕a₁)(b₀⊕b₁) ⊕ a₀b₀ ⊕ a₁b₁` (carryless, so additions are XOR).
     #[inline]
     #[target_feature(enable = "aes,neon")]
     unsafe fn clmul_halves(a: uint8x16_t, b: uint8x16_t) -> (uint8x16_t, uint8x16_t) {
         unsafe {
             let zero = vdupq_n_u8(0);
-            let t3 = clmul(a, b, 0x00);
-            let t6 = clmul(a, b, 0x11);
-            let t4 = clmul(a, b, 0x10);
-            let t5 = clmul(a, b, 0x01);
-            let t4 = veorq_u8(t4, t5);
-            let t5 = vextq_u8(zero, t4, 8); // slli_si128(t4, 8)
-            let t4 = vextq_u8(t4, zero, 8); // srli_si128(t4, 8)
+            let t3 = clmul(a, b, 0x00); // a₀·b₀
+            let t6 = clmul(a, b, 0x11); // a₁·b₁
+            let ax = veorq_u8(a, vextq_u8(a, zero, 8)); // low 64 = a₀⊕a₁
+            let bx = veorq_u8(b, vextq_u8(b, zero, 8)); // low 64 = b₀⊕b₁
+            let mid = clmul(ax, bx, 0x00);
+            let mid = veorq_u8(mid, veorq_u8(t3, t6)); // a₀b₁ ⊕ a₁b₀
+            let t5 = vextq_u8(zero, mid, 8); // slli_si128(mid, 8)
+            let t4 = vextq_u8(mid, zero, 8); // srli_si128(mid, 8)
             (veorq_u8(t3, t5), veorq_u8(t6, t4))
         }
     }
@@ -309,31 +455,62 @@ mod arm {
         }
     }
 
+    /// Folds the eight 16-byte blocks at `p` into `acc` with one reduction:
+    /// `acc ← (acc ⊕ b₀)·H⁸ ⊕ b₁·H⁷ ⊕ … ⊕ b₇·H` (aggregated reduction).
+    #[inline]
     #[target_feature(enable = "aes,neon")]
-    pub(in super::super) unsafe fn ghash_blocks(x: u128, h: u128, blocks: &[u8]) -> u128 {
+    unsafe fn ghash_group8(acc: uint8x16_t, h: &[uint8x16_t; 8], p: *const u8) -> uint8x16_t {
         unsafe {
-            // `x` and `h` are `u128`, so their little-endian bytes already are
-            // the reflected representation; the message blocks are reversed.
-            let h1 = vld1q_u8(h.to_le_bytes().as_ptr());
-            let h2 = gfmul(h1, h1);
-            let h3 = gfmul(h2, h1);
-            let h4 = gfmul(h3, h1);
-
-            let mut acc = vld1q_u8(x.to_le_bytes().as_ptr());
-            let mut chunks = blocks.chunks_exact(64);
-            for c in &mut chunks {
-                let p = c.as_ptr();
-                let d0 = veorq_u8(acc, load_rev(p));
-                let (mut lo, mut hi) = clmul_halves(d0, h4);
-                let (l1, h1p) = clmul_halves(load_rev(p.add(16)), h3);
-                let (l2, h2p) = clmul_halves(load_rev(p.add(32)), h2);
-                let (l3, h3p) = clmul_halves(load_rev(p.add(48)), h1);
-                lo = veorq_u8(veorq_u8(lo, l1), veorq_u8(l2, l3));
-                hi = veorq_u8(veorq_u8(hi, h1p), veorq_u8(h2p, h3p));
-                acc = reduce(lo, hi);
+            let d0 = veorq_u8(acc, load_rev(p));
+            let (mut lo, mut hi) = clmul_halves(d0, h[7]);
+            for j in 1..8 {
+                let (l, hh) = clmul_halves(load_rev(p.add(j * 16)), h[7 - j]);
+                lo = veorq_u8(lo, l);
+                hi = veorq_u8(hi, hh);
             }
-            for c in chunks.remainder().chunks_exact(16) {
-                acc = gfmul(veorq_u8(acc, load_rev(c.as_ptr())), h1);
+            reduce(lo, hi)
+        }
+    }
+
+    /// Aggregated GHASH, the NEON analogue of the x86 [`ghash_blocks`]: folds
+    /// whole 16-byte `blocks` (length a multiple of 16) into `x`, eight blocks
+    /// per reduction using the precomputed powers `hpow[i] = H^{i+1}`; a
+    /// `≥ 4`-block remainder folds as one four-block group and the final
+    /// `< 4`-block tail folds serially. Returns the same value as repeated
+    /// `gf_mul(x ⊕ bᵢ, h)`.
+    #[target_feature(enable = "aes,neon")]
+    pub(in super::super) unsafe fn ghash_blocks(x: u128, hpow: &[u128; 8], blocks: &[u8]) -> u128 {
+        unsafe {
+            // `x` and the powers are `u128`, so their little-endian bytes
+            // already are the reflected representation; the message blocks are
+            // reversed by `load_rev`.
+            let mut h = [vdupq_n_u8(0); 8];
+            for (hv, hp) in h.iter_mut().zip(hpow.iter()) {
+                let b = hp.to_le_bytes();
+                *hv = vld1q_u8(b.as_ptr());
+            }
+
+            let xb = x.to_le_bytes();
+            let mut acc = vld1q_u8(xb.as_ptr());
+            let mut chunks = blocks.chunks_exact(128);
+            for c in &mut chunks {
+                acc = ghash_group8(acc, &h, c.as_ptr());
+            }
+            let mut rest = chunks.remainder();
+            if rest.len() >= 64 {
+                let p = rest.as_ptr();
+                let d0 = veorq_u8(acc, load_rev(p));
+                let (mut lo, mut hi) = clmul_halves(d0, h[3]);
+                for j in 1..4 {
+                    let (l, hh) = clmul_halves(load_rev(p.add(j * 16)), h[3 - j]);
+                    lo = veorq_u8(lo, l);
+                    hi = veorq_u8(hi, hh);
+                }
+                acc = reduce(lo, hi);
+                rest = &rest[64..];
+            }
+            for c in rest.chunks_exact(16) {
+                acc = gfmul(veorq_u8(acc, load_rev(c.as_ptr())), h[0]);
             }
 
             let mut out = [0u8; 16];

@@ -69,6 +69,17 @@ fn main() {
             let _ = black_box(gcm256.encrypt(&nonce12, b"", black_box(&mut buf[..N])));
         });
 
+        // Decrypt: restore the same ciphertext each iteration so the tag check
+        // passes (the memcpy is noise next to the AEAD work).
+        let tag = gcm128.encrypt(&nonce12, b"", &mut buf[..N]);
+        let ct = buf[..N].to_vec();
+        bench_throughput("AES-128-GCM dec", N, t, || {
+            buf[..N].copy_from_slice(&ct);
+            gcm128
+                .decrypt(&nonce12, b"", black_box(&mut buf[..N]), &tag)
+                .expect("tag must verify");
+        });
+
         let cc = ChaCha20Poly1305::new(&[0u8; 32]);
         bench_throughput("ChaCha20-Poly1305 enc", N, t, || {
             let _ = black_box(cc.encrypt(&nonce12, b"", black_box(&mut buf[..N])));
