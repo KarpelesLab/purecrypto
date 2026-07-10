@@ -215,6 +215,13 @@ fn main() {
             bench_latency("SLH-DSA-SHA2-192s sign", t, || {
                 black_box(sk.sign_deterministic(b"bench message", &[]).unwrap());
             });
+            let (sk, _pk) = PrivateKey::generate(ParamSet::Shake_192s, &mut rng);
+            bench_latency("SLH-DSA-SHAKE-192s keygen", t, || {
+                black_box(PrivateKey::generate(ParamSet::Shake_192s, &mut rng));
+            });
+            bench_latency("SLH-DSA-SHAKE-192s sign", t, || {
+                black_box(sk.sign_deterministic(b"bench message", &[]).unwrap());
+            });
         }
     }
     println!();
