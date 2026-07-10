@@ -176,7 +176,10 @@ fn raw_private_blinded<const LIMBS: usize>(
         bad,
     );
 
-    let r_e = modulus.pow(&r, e);
+    // `e` is public, so the exponent-length ladder applies — ~17 iterations
+    // for e = 65537 instead of a full modulus-width pass. It is still
+    // branchless and constant-time in the secret base `r`.
+    let r_e = modulus.pow_public(&r, e);
     let r_inv = modulus.pow(&r, phi_n_minus_1);
     let c_blind = modulus.mul_mod(c, &r_e);
     let m_blind = modulus.pow(&c_blind, d);

@@ -53,6 +53,10 @@ pub struct BoxedRsaPrivateKey {
     /// `(p−1)·(q−1) − 1` when both primes are known; `None` when the key was
     /// imported without them (then blinding is disabled).
     phi_n_minus_1: Option<BoxedUint>,
+    /// CRT parameters (`dP`, `dQ`, `qInv`, Fermat exponents) when both primes
+    /// are known and usable; `None` disables the CRT fast path. Boxed so the
+    /// five extra `BoxedUint`s don't bloat every `AnyPrivateKey`.
+    crt: Option<alloc::boxed::Box<BoxedRsaCrt>>,
     /// HMAC-SHA256 key (derived from `d`) for per-call blinding values.
     blinding_seed: [u8; 32],
 }
@@ -104,22 +108,78 @@ fn derive_blinding_boxed(
     (phi_n_minus_1, seed)
 }
 
-/// Base-blinded raw RSA private op for the runtime-sized key.
-fn raw_private_blinded_boxed(
-    mont: &BoxedMontModulus,
-    e: &BoxedUint,
+/// Precomputed CRT parameters for the runtime-sized private key: the
+/// half-width exponents `dP`/`dQ`, the recombination coefficient
+/// `qInv = q⁻¹ mod p`, and the Fermat exponents `p−2`/`q−2` used to invert
+/// the per-call blinder inside each prime field. Everything here is derived
+/// from (and as secret as) the prime factors.
+#[derive(Clone)]
+pub(crate) struct BoxedRsaCrt {
+    dp: BoxedUint,
+    dq: BoxedUint,
+    qinv: BoxedUint,
+    pm2: BoxedUint,
+    qm2: BoxedUint,
+}
+
+impl Drop for BoxedRsaCrt {
+    fn drop(&mut self) {
+        self.dp.zeroize();
+        self.dq.zeroize();
+        self.qinv.zeroize();
+        self.pm2.zeroize();
+        self.qm2.zeroize();
+    }
+}
+
+impl core::fmt::Debug for BoxedRsaCrt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Every field is secret key material — never print it.
+        f.write_str("BoxedRsaCrt(<redacted>)")
+    }
+}
+
+/// Derives the CRT parameters from the prime factors, or `None` when the key
+/// has no (usable) primes. `qInv` is computed as `q^(p−2) mod p` through the
+/// constant-time Montgomery ladder rather than `inv_mod_boxed` (whose binary
+/// GCD is variable-time in its operands — fine for the one-time DER export,
+/// not for something derived on every key parse). Degenerate primes (even,
+/// tiny, or equal) yield `None`; a key whose primes merely *lie* (wrong
+/// factors for `n`) still gets parameters, and the fault check in
+/// [`raw_private_blinded_boxed`] routes it to the non-CRT path at runtime.
+fn derive_crt_boxed(
+    p: &BoxedUint,
+    q: &BoxedUint,
     d: &BoxedUint,
-    phi_n_minus_1: Option<&BoxedUint>,
+) -> Option<alloc::boxed::Box<BoxedRsaCrt>> {
+    if p.bit_len() < 3 || q.bit_len() < 3 || !p.is_odd() || !q.is_odd() || p == q {
+        return None;
+    }
+    let one = BoxedUint::from_u64(1);
+    let two = BoxedUint::from_u64(2);
+    let pm2 = p.sub(&two);
+    let qm2 = q.sub(&two);
+    let dp = d.reduce(&p.sub(&one));
+    let dq = d.reduce(&q.sub(&one));
+    let mont_p = BoxedMontModulus::new(p);
+    let qinv = mont_p.pow(&q.reduce(p), &pm2);
+    Some(alloc::boxed::Box::new(BoxedRsaCrt {
+        dp,
+        dq,
+        qinv,
+        pm2,
+        qm2,
+    }))
+}
+
+/// Derives the deterministic per-call blinder `r` (HMAC-SHA256 of the input,
+/// keyed by the key-bound seed), reduced into `[2, n)`.
+fn derive_blinder_boxed(
+    mont: &BoxedMontModulus,
     blinding_seed: &[u8; 32],
     k_bytes: usize,
     c: &BoxedUint,
 ) -> BoxedUint {
-    let phi_n_minus_1 = match phi_n_minus_1 {
-        Some(v) => v,
-        None => return mont.pow(c, d), // imported key without primes
-    };
-
-    // Derive blinder bytes of width `k_bytes` from HMAC-SHA256.
     let c_bytes = c.to_be_bytes(k_bytes);
     let mut blinder_bytes = Vec::with_capacity(k_bytes);
     let mut counter: u32 = 0;
@@ -135,16 +195,110 @@ fn raw_private_blinded_boxed(
     blinder_bytes.truncate(k_bytes);
     let r_raw = BoxedUint::from_be_bytes(&blinder_bytes);
     let r = r_raw.reduce(&mont.modulus());
-    let r = if r.is_zero() || r == BoxedUint::from_u64(1) {
+    if r.is_zero() || r == BoxedUint::from_u64(1) {
         BoxedUint::from_u64(2)
     } else {
         r
+    }
+}
+
+/// Base-blinded raw RSA private op via the CRT: two half-width
+/// exponentiations instead of one full-width one (~4× fewer limb
+/// multiplications), with the blinder inverted per prime by Fermat.
+///
+/// ```text
+///   c_blind = c · r^e mod n            (pow_public: e is public, base CT)
+///   m_p     = (c_blind mod p)^dP · r^(p−2) mod p    ( = m·r·r⁻¹ = m mod p )
+///   m_q     = (c_blind mod q)^dQ · r^(q−2) mod q
+///   m       = m_q + q · (qInv·(m_p − m_q) mod p)    (Garner)
+/// ```
+///
+/// All four exponentiations run the constant-time windowed ladder with
+/// secret exponents of public width; the reductions mod `p`/`q` are
+/// constant-time long division. The caller MUST fault-check the result
+/// (`m^e ≡ c mod n`) before releasing it: a fault in one CRT half — or a key
+/// imported with inconsistent primes — otherwise yields output that factors
+/// `n` (Boneh–DeMillo–Lipton).
+fn raw_private_crt_blinded(
+    key: &BoxedRsaPrivateKey,
+    crt: &BoxedRsaCrt,
+    c: &BoxedUint,
+) -> BoxedUint {
+    let mont = &key.mont;
+    let mut r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, c);
+    let mut r_e = mont.pow_public(&r, &key.e);
+    let mut c_blind = mont.mul_mod(c, &r_e);
+
+    let mont_p = BoxedMontModulus::new(&key.p);
+    let mont_q = BoxedMontModulus::new(&key.q);
+
+    let half = |mp: &BoxedMontModulus, dx: &BoxedUint, xm2: &BoxedUint| {
+        let mut cx = c_blind.reduce(&mp.modulus());
+        let mut mx_blind = mp.pow(&cx, dx);
+        let mut rx = r.reduce(&mp.modulus());
+        let mut rx_inv = mp.pow(&rx, xm2);
+        let mx = mp.mul_mod(&mx_blind, &rx_inv);
+        cx.zeroize();
+        mx_blind.zeroize();
+        rx.zeroize();
+        rx_inv.zeroize();
+        mx
+    };
+    let mut m_p = half(&mont_p, &crt.dp, &crt.pm2);
+    let mut m_q = half(&mont_q, &crt.dq, &crt.qm2);
+
+    // Garner recombination: m = m_q + q·(qInv·(m_p − m_q) mod p).
+    let mut m_q_mod_p = m_q.reduce(&key.p);
+    let mut diff = mont_p.sub_mod(&m_p, &m_q_mod_p);
+    let mut h = mont_p.mul_mod(&diff, &crt.qinv);
+    let m = m_q.add(&key.q.mul(&h));
+
+    r.zeroize();
+    r_e.zeroize();
+    c_blind.zeroize();
+    m_p.zeroize();
+    m_q.zeroize();
+    m_q_mod_p.zeroize();
+    diff.zeroize();
+    h.zeroize();
+    m
+}
+
+/// Base-blinded raw RSA private op for the runtime-sized key.
+///
+/// With CRT parameters available this runs [`raw_private_crt_blinded`] and
+/// fault-checks the result with the (cheap, public-exponent) `m^e ≡ c mod n`
+/// before releasing it, so a faulted CRT half can never escape
+/// (Boneh–DeMillo–Lipton). On mismatch it falls back to the full-width path
+/// below: for a well-formed key that recomputes the correct `c^d mod n`; a
+/// key imported with primes that don't actually factor `n` gets exactly what
+/// it got before the CRT path existed (garbage in, garbage out — but never a
+/// factorable half-fault).
+fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUint {
+    let mont = &key.mont;
+    if let Some(crt) = key.crt.as_deref() {
+        let m = raw_private_crt_blinded(key, crt, c);
+        // `c` is public in every caller (a ciphertext or an EMSA-encoded
+        // digest), so the variable-time `lt` shortcut leaks nothing.
+        let n = mont.modulus();
+        let c_mod_n = if c.lt(&n) { c.clone() } else { c.reduce(&n) };
+        if mont.pow_public(&m, &key.e) == c_mod_n {
+            return m;
+        }
+    }
+
+    let phi_n_minus_1 = match key.phi_n_minus_1.as_ref() {
+        Some(v) => v,
+        None => return mont.pow(c, &key.d), // imported key without primes
     };
 
-    let r_e = mont.pow(&r, e);
+    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, c);
+    // `e` is public, so the exponent-length ladder applies (still branchless
+    // and constant-time in the secret base `r`).
+    let r_e = mont.pow_public(&r, &key.e);
     let r_inv = mont.pow(&r, phi_n_minus_1);
     let c_blind = mont.mul_mod(c, &r_e);
-    let m_blind = mont.pow(&c_blind, d);
+    let m_blind = mont.pow(&c_blind, &key.d);
     mont.mul_mod(&m_blind, &r_inv)
 }
 
@@ -350,6 +504,7 @@ impl BoxedRsaPrivateKey {
             mont,
             k,
             phi_n_minus_1,
+            crt: None,
             blinding_seed,
         }
     }
@@ -376,6 +531,7 @@ impl BoxedRsaPrivateKey {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+        let crt = derive_crt_boxed(&p, &q, &d);
         BoxedRsaPrivateKey {
             n,
             e,
@@ -385,6 +541,7 @@ impl BoxedRsaPrivateKey {
             mont,
             k,
             phi_n_minus_1,
+            crt,
             blinding_seed,
         }
     }
@@ -430,6 +587,7 @@ impl BoxedRsaPrivateKey {
                 let k = n.bit_len().div_ceil(8);
                 let mont = BoxedMontModulus::new(&n);
                 let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+                let crt = derive_crt_boxed(&p, &q, &d);
                 return BoxedRsaPrivateKey {
                     n,
                     e,
@@ -439,6 +597,7 @@ impl BoxedRsaPrivateKey {
                     mont,
                     k,
                     phi_n_minus_1,
+                    crt,
                     blinding_seed,
                 };
             }
@@ -583,16 +742,7 @@ impl RawPrivate for BoxedRsaPrivateKey {
     }
     fn raw_private(&self, c: &[u8]) -> Vec<u8> {
         let c_uint = BoxedUint::from_be_bytes(c);
-        raw_private_blinded_boxed(
-            &self.mont,
-            &self.e,
-            &self.d,
-            self.phi_n_minus_1.as_ref(),
-            &self.blinding_seed,
-            self.k,
-            &c_uint,
-        )
-        .to_be_bytes(self.k)
+        raw_private_blinded_boxed(self, &c_uint).to_be_bytes(self.k)
     }
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
@@ -717,6 +867,7 @@ impl BoxedRsaPrivateKey {
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
+        let crt = derive_crt_boxed(&p, &q, &d);
         Ok(BoxedRsaPrivateKey {
             n,
             e,
@@ -726,6 +877,7 @@ impl BoxedRsaPrivateKey {
             mont,
             k,
             phi_n_minus_1,
+            crt,
             blinding_seed,
         })
     }
@@ -1009,6 +1161,56 @@ mod tests {
         let e = [0x01, 0x00, 0x01];
         let der = encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat());
         assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
+    }
+
+    /// The CRT fast path must be bit-for-bit identical to the plain
+    /// full-width `c^d mod n` path (PKCS#1 v1.5 signing is deterministic, so
+    /// signature equality is exactly result equality).
+    #[test]
+    fn crt_path_matches_full_width_result() {
+        let fixed = rsa_test_key_a();
+        let with_primes = fixed.to_boxed();
+        assert!(
+            with_primes.crt.is_some(),
+            "key with primes must enable the CRT path"
+        );
+
+        let mut nb = [0u8; 256];
+        fixed.modulus().write_be_bytes(&mut nb);
+        let mut eb = [0u8; 256];
+        fixed.exponent().write_be_bytes(&mut eb);
+        let mut db = [0u8; 256];
+        fixed.private_exponent().write_be_bytes(&mut db);
+        let no_primes = BoxedRsaPrivateKey::from_components(
+            BoxedUint::from_be_bytes(&nb),
+            BoxedUint::from_be_bytes(&eb),
+            BoxedUint::from_be_bytes(&db),
+        );
+        assert!(no_primes.crt.is_none());
+
+        for msg in [&b"crt-vs-full-1"[..], b"crt-vs-full-2", b""] {
+            assert_eq!(
+                with_primes.sign_pkcs1v15::<Sha256>(msg).unwrap(),
+                no_primes.sign_pkcs1v15::<Sha256>(msg).unwrap(),
+                "CRT and full-width paths diverged"
+            );
+        }
+    }
+
+    /// Boneh–DeMillo–Lipton guard: corrupt one CRT half and the `m^e ≡ c`
+    /// fault check must reject it and fall back to the full-width path — the
+    /// emitted signature is still correct, and the factorable half-fault
+    /// never escapes.
+    #[test]
+    fn corrupted_crt_half_falls_back_to_correct_signature() {
+        let mut key = rsa_test_key_a().to_boxed();
+        let crt = key.crt.as_deref_mut().expect("CRT params present");
+        crt.dp = BoxedUint::from_u64(0x1337);
+
+        let sig = key.sign_pkcs1v15::<Sha256>(b"fault me").unwrap();
+        key.public_key()
+            .verify_pkcs1v15::<Sha256>(b"fault me", &sig)
+            .unwrap();
     }
 
     #[test]
