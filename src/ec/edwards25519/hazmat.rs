@@ -181,11 +181,12 @@ impl EdwardsPoint {
         EdwardsPoint(f.scalar_mult(&bytes, &self.0))
     }
 
-    /// `[scalar]·B` (scalar times the basepoint), constant-time.
+    /// `[scalar]·B` (scalar times the basepoint), constant-time (precomputed
+    /// fixed-base comb).
     pub fn mul_base(scalar: &Scalar) -> EdwardsPoint {
         let f = Field::new();
         let bytes = scalar_bytes(&scalar.0);
-        EdwardsPoint(f.scalar_mult(&bytes, &f.base()))
+        EdwardsPoint(f.mul_base(&bytes))
     }
 
     /// `[8]self` — multiply by the curve cofactor.

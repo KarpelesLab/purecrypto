@@ -88,14 +88,14 @@ impl Ed25519PrivateKey {
     pub fn public_key(&self) -> Ed25519PublicKey {
         let f = Field::new();
         let (a, _) = self.expand();
-        Ed25519PublicKey(f.encode(&f.scalar_mult(&a, &f.base())))
+        Ed25519PublicKey(f.encode(&f.mul_base(&a)))
     }
 
     /// Signs `message`, returning the 64-byte signature (RFC 8032 §5.1.6).
     pub fn sign(&self, message: &[u8]) -> Ed25519Signature {
         let f = Field::new();
         let (a, prefix) = self.expand();
-        let a_enc = f.encode(&f.scalar_mult(&a, &f.base()));
+        let a_enc = f.encode(&f.mul_base(&a));
 
         // r = SHA-512(prefix ‖ message) mod L; R = [r]B.
         let mut hr = Sha512::new();
@@ -104,7 +104,7 @@ impl Ed25519PrivateKey {
         let r = scalar_reduce_wide(&hr.finalize(), &f.l8);
         let mut r_bytes = [0u8; 32];
         r.write_le_bytes(&mut r_bytes);
-        let r_enc = f.encode(&f.scalar_mult(&r_bytes, &f.base()));
+        let r_enc = f.encode(&f.mul_base(&r_bytes));
 
         // k = SHA-512(R ‖ A ‖ message) mod L; S = (r + k·a) mod L.
         let mut hk = Sha512::new();
@@ -274,7 +274,9 @@ impl Ed25519PublicKey {
 
         // Cofactored verify: accept iff [8S]B == [8R] + [8k]A. We multiply
         // each side of the cofactor-less equation by 8 = [2][2][2].
-        let lhs = f.scalar_mult(&s_bytes, &f.base());
+        // `S` is public here, but the fixed-base comb is both constant-time
+        // and the fastest path, so use it for the [S]B side too.
+        let lhs = f.mul_base(&s_bytes);
         let ka = f.scalar_mult(&k_bytes, &a_point);
         let rhs = f.point_add(&r_point, &ka);
         let lhs8 = f.point_double(&f.point_double(&f.point_double(&lhs)));

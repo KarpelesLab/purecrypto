@@ -118,11 +118,12 @@ impl RistrettoPoint {
         RistrettoPoint(f.scalar_mult(&bytes, &self.0))
     }
 
-    /// Scalar multiplication of the generator `[scalar]·B`, constant-time.
+    /// Scalar multiplication of the generator `[scalar]·B`, constant-time
+    /// (precomputed fixed-base comb).
     pub fn mul_base(scalar: &Scalar) -> RistrettoPoint {
         let f = Field::new();
         let bytes = scalar.to_bytes();
-        RistrettoPoint(f.scalar_mult(&bytes, &f.base()))
+        RistrettoPoint(f.mul_base(&bytes))
     }
 
     /// Constant-time ristretto equality (RFC 9496 §4.3.3): two points `P`, `Q`

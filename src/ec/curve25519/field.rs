@@ -21,6 +21,10 @@ const L_HEX: &str = "1000000000000000000000000000000014def9dea2f79cd65812631a5cf
 
 /// The standard base point `B`, as its 32-byte RFC 8032 encoding (`y = 4/5`,
 /// with an even `x`).
+// Library-path base multiplications go through the precomputed comb table;
+// only the ristretto255 group API (and tests) still decompress `B` itself, so
+// gate to match [`Field::base`] and avoid dead_code on the default build.
+#[cfg(any(test, feature = "hazmat-edwards25519", feature = "ristretto255"))]
 pub(crate) const BASE_ENC: [u8; 32] = {
     let mut b = [0x66u8; 32];
     b[0] = 0x58;

@@ -1,5 +1,6 @@
 //! NIST P-256 (secp256r1) field and group arithmetic.
 
+use super::p256_gtable::P256_GEN_TABLE;
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
@@ -34,7 +35,13 @@ pub(crate) fn random_scalar<R: RngCore>(rng: &mut R) -> Fe {
 // Curve parameters (hex, big-endian).
 const P_HEX: &str = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff";
 const B_HEX: &str = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b";
+// The generator's affine coordinates. Only the tests need `G` itself these
+// days: the library-path fixed-base multiplications go through the
+// precomputed `P256_GEN_TABLE` (whose window 0, entry 0 *is* `G`, verified
+// against these coordinates by `tests::gen_table_matches_computed`).
+#[cfg(test)]
 const GX_HEX: &str = "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+#[cfg(test)]
 const GY_HEX: &str = "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
 const N_HEX: &str = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551";
 
@@ -96,7 +103,10 @@ impl P256 {
         }
     }
 
-    /// The base point `G`.
+    /// The base point `G`. Test-only: library code multiplies by `G` through
+    /// the precomputed comb ([`Self::mul_generator`]) and never needs the
+    /// point itself.
+    #[cfg(test)]
     pub(crate) fn generator(&self) -> Point {
         self.lift_affine(&fe_from_hex(GX_HEX), &fe_from_hex(GY_HEX))
     }
@@ -288,10 +298,37 @@ impl P256 {
         acc
     }
 
-    /// Convenience: `scalar * G`.
+    /// Constant-time fixed-base multiplication `scalar * G` via the
+    /// precomputed comb table [`P256_GEN_TABLE`]: `[k]G = Σᵢ [dᵢ · 16^i]G`
+    /// over the 64 base-16 digits `dᵢ` of the scalar, so there are **no
+    /// doublings** — just 64 unconditional additions, each operand fetched by
+    /// a masked scan of that window's 15 stored points (no secret-indexed
+    /// memory access, same gather discipline as [`Self::scalar_mul`]). A zero
+    /// digit adds the identity, a uniform no-op under the complete RCB
+    /// formulas, so the schedule depends only on the (public) scalar width.
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
-        let g = self.generator();
-        self.scalar_mul(scalar, &g)
+        let id = self.identity();
+        // Montgomery-form 1, the Z coordinate of every (affine) table entry.
+        let one = id.y;
+        let mut acc = id;
+        let limbs = scalar.as_limbs();
+        for (i, window) in P256_GEN_TABLE.iter().enumerate() {
+            // Digit i = bits [4i, 4i+4) of the little-endian scalar.
+            let digit = ((limbs[i / 16] >> ((i % 16) * 4)) & 0xf) as usize;
+            // Constant-time gather: scan all 15 entries, keep entry j when
+            // j + 1 == digit; a zero digit keeps the identity.
+            let mut sel = id;
+            for (j, entry) in window.iter().enumerate() {
+                let cand = Point {
+                    x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
+                    y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
+                    z: one,
+                };
+                sel = Point::conditional_select(&cand, &sel, Choice::from((j + 1 == digit) as u8));
+            }
+            acc = self.point_add(&acc, &sel);
+        }
+        acc
     }
 
     /// Tests whether affine `(x, y)` (plain coordinates) satisfies the curve
@@ -369,6 +406,119 @@ mod tests {
             curve.to_affine(&result).is_none(),
             "n*G must be the identity"
         );
+    }
+
+    /// Re-derives every entry of the embedded fixed-base table from the
+    /// group law and cross-checks the constants, so `P256_GEN_TABLE` is
+    /// verified on every test run rather than trusted. The check is
+    /// inversion-free: the stored affine `(x, y)` matches the computed
+    /// projective `(X : Y : Z)` iff `x·Z == X` and `y·Z == Y`.
+    #[test]
+    fn gen_table_matches_computed() {
+        let curve = P256::new();
+        let mut base = curve.generator();
+        for window in P256_GEN_TABLE.iter() {
+            let mut acc = base;
+            for (j, entry) in window.iter().enumerate() {
+                if j > 0 {
+                    acc = curve.point_add(&acc, &base);
+                }
+                assert!(
+                    !bool::from(acc.z.is_zero()),
+                    "table entry must not be the identity"
+                );
+                let ex = Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]);
+                let ey = Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]);
+                assert_eq!(curve.mul(&ex, &acc.z), acc.x, "x mismatch");
+                assert_eq!(curve.mul(&ey, &acc.z), acc.y, "y mismatch");
+            }
+            base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
+        }
+    }
+
+    /// Differential test: the fixed-base comb agrees with the generic
+    /// windowed ladder for edge scalars (0, 1, 2, n−1, n, n+1, 2²⁵⁵-ish,
+    /// all-ones) and a batch of random ones.
+    #[test]
+    fn mul_generator_matches_generic_scalar_mul() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let curve = P256::new();
+        let g = curve.generator();
+        let n = P256::order();
+
+        let check = |k: &Fe| {
+            assert_eq!(
+                curve.to_affine(&curve.mul_generator(k)),
+                curve.to_affine(&curve.scalar_mul(k, &g)),
+                "comb/ladder mismatch"
+            );
+        };
+
+        let edges = [
+            Fe::ZERO,
+            Fe::ONE,
+            Fe::from_u64(2),
+            n.wrapping_sub(&Fe::ONE),
+            n,
+            n.wrapping_add(&Fe::ONE),
+            fe_from_hex("8000000000000000000000000000000000000000000000000000000000000000"),
+            Fe::from_limbs([u64::MAX; 4]),
+        ];
+        for k in &edges {
+            check(k);
+        }
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-comb-differential", b"nonce", &[]);
+        for _ in 0..32 {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            check(&Fe::from_limbs(limbs));
+        }
+    }
+
+    /// Regenerates the fixed-base table source (`src/ec/p256_gtable.rs`).
+    /// Run with:
+    /// `cargo test --release gen_p256_gen_table -- --ignored --nocapture`
+    /// and paste the emitted `static` between the file's header comment and
+    /// EOF. The non-ignored `gen_table_matches_computed` test keeps the
+    /// pasted constants honest on every test run.
+    #[test]
+    #[ignore = "table generator; emits Rust source on stdout"]
+    #[cfg(feature = "std")]
+    fn gen_p256_gen_table() {
+        use std::{print, println};
+        let curve = P256::new();
+        // base = [16^i]G for the current window i.
+        let mut base = curve.generator();
+        println!("pub(crate) static P256_GEN_TABLE: [[[u64; 8]; 15]; 64] = [");
+        for _ in 0..64 {
+            println!("    [");
+            let mut acc = base;
+            for j in 1..=15u32 {
+                if j > 1 {
+                    acc = curve.point_add(&acc, &base);
+                }
+                let (x, y) = curve
+                    .to_affine(&acc)
+                    .expect("table entry is never identity");
+                let xm = curve.fp.to_mont(&x);
+                let ym = curve.fp.to_mont(&y);
+                print!("        [");
+                for l in xm.as_limbs() {
+                    print!("0x{l:016x}, ");
+                }
+                for l in ym.as_limbs() {
+                    print!("0x{l:016x}, ");
+                }
+                println!("],");
+            }
+            println!("    ],");
+            base = curve.double(&curve.double(&curve.double(&curve.double(&base))));
+        }
+        println!("];");
     }
 
     #[test]
