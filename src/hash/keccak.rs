@@ -37,60 +37,111 @@ const RC: [u64; 24] = [
     0x8000_0000_8000_8008,
 ];
 
-/// Rotation offsets for the combined ρ/π step.
-const RHO: [u32; 24] = [
-    1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 2, 14, 27, 41, 56, 8, 25, 43, 62, 18, 39, 61, 20, 44,
-];
+/// Lanes stored complemented in the in-round state representation (the XKCP
+/// "bebigokimisa" pattern, flat indices `x + 5y`). Complementing exactly these
+/// lanes lets χ be computed with plain AND/OR for all but 8 of the 25 output
+/// lanes per round (instead of a NOT in every one), and the pattern is
+/// invariant across rounds so a single unrolled round body serves all rounds.
+const COMPLEMENTED: [usize; 6] = [1, 2, 8, 12, 17, 20];
 
-/// Lane permutation for the combined ρ/π step.
-const PI: [usize; 24] = [
-    10, 7, 11, 17, 18, 3, 5, 16, 8, 21, 24, 4, 15, 23, 19, 13, 12, 2, 20, 14, 22, 9, 6, 1,
-];
+/// One lane-complemented Keccak-p round: θ, fused ρ/π (into fresh `b` lanes,
+/// with the θ `d` values folded in), then χ+ι in the complemented
+/// representation.
+///
+/// The straight-line body is machine-derived from the loop formulation this
+/// replaces (see git history) by propagating a per-lane complement flag
+/// through θ (flags XOR through the column parities) and ρ/π (flags follow
+/// the lane permutation), then choosing for each χ output the single AND/OR
+/// form that yields the output lane again in the [`COMPLEMENTED`] pattern.
+/// It is pinned by the SHA-3/SHAKE KATs (24 rounds) and the
+/// TurboSHAKE/KangarooTwelve vectors (12 rounds).
+#[inline(always)]
+fn round(a: &mut [u64; 25], rc: u64) {
+    // θ: column parities and the per-column mixers. Complement flags cancel
+    // structurally; no extra NOTs are needed here.
+    let c0 = a[0] ^ a[5] ^ a[10] ^ a[15] ^ a[20];
+    let c1 = a[1] ^ a[6] ^ a[11] ^ a[16] ^ a[21];
+    let c2 = a[2] ^ a[7] ^ a[12] ^ a[17] ^ a[22];
+    let c3 = a[3] ^ a[8] ^ a[13] ^ a[18] ^ a[23];
+    let c4 = a[4] ^ a[9] ^ a[14] ^ a[19] ^ a[24];
+    let d0 = c4 ^ c1.rotate_left(1);
+    let d1 = c0 ^ c2.rotate_left(1);
+    let d2 = c1 ^ c3.rotate_left(1);
+    let d3 = c2 ^ c4.rotate_left(1);
+    let d4 = c3 ^ c0.rotate_left(1);
+
+    // θ (lane update) fused with ρ/π: b[π(i)] = (a[i] ^ d[i mod 5]) <<< ρ(i).
+    let b0 = a[0] ^ d0;
+    let b1 = (a[6] ^ d1).rotate_left(44);
+    let b2 = (a[12] ^ d2).rotate_left(43);
+    let b3 = (a[18] ^ d3).rotate_left(21);
+    let b4 = (a[24] ^ d4).rotate_left(14);
+    let b5 = (a[3] ^ d3).rotate_left(28);
+    let b6 = (a[9] ^ d4).rotate_left(20);
+    let b7 = (a[10] ^ d0).rotate_left(3);
+    let b8 = (a[16] ^ d1).rotate_left(45);
+    let b9 = (a[22] ^ d2).rotate_left(61);
+    let b10 = (a[1] ^ d1).rotate_left(1);
+    let b11 = (a[7] ^ d2).rotate_left(6);
+    let b12 = (a[13] ^ d3).rotate_left(25);
+    let b13 = (a[19] ^ d4).rotate_left(8);
+    let b14 = (a[20] ^ d0).rotate_left(18);
+    let b15 = (a[4] ^ d4).rotate_left(27);
+    let b16 = (a[5] ^ d0).rotate_left(36);
+    let b17 = (a[11] ^ d1).rotate_left(10);
+    let b18 = (a[17] ^ d2).rotate_left(15);
+    let b19 = (a[23] ^ d3).rotate_left(56);
+    let b20 = (a[2] ^ d2).rotate_left(62);
+    let b21 = (a[8] ^ d3).rotate_left(55);
+    let b22 = (a[14] ^ d4).rotate_left(39);
+    let b23 = (a[15] ^ d0).rotate_left(41);
+    let b24 = (a[21] ^ d1).rotate_left(2);
+
+    // χ (complemented form) and ι.
+    a[0] = (b0 ^ (b1 | b2)) ^ rc;
+    a[1] = b1 ^ (!b2 | b3);
+    a[2] = b2 ^ (b3 & b4);
+    a[3] = b3 ^ (b4 | b0);
+    a[4] = b4 ^ (b0 & b1);
+    a[5] = b5 ^ (b6 | b7);
+    a[6] = b6 ^ (b7 & b8);
+    a[7] = b7 ^ (b8 | !b9);
+    a[8] = b8 ^ (b9 | b5);
+    a[9] = b9 ^ (b5 & b6);
+    a[10] = b10 ^ (b11 | b12);
+    a[11] = b11 ^ (b12 & b13);
+    a[12] = b12 ^ (!b13 & b14);
+    a[13] = b13 ^ !(b14 | b10);
+    a[14] = b14 ^ (b10 & b11);
+    a[15] = b15 ^ (b16 & b17);
+    a[16] = b16 ^ (b17 | b18);
+    a[17] = b17 ^ (!b18 | b19);
+    a[18] = b18 ^ !(b19 & b15);
+    a[19] = b19 ^ (b15 | b16);
+    a[20] = b20 ^ (!b21 & b22);
+    a[21] = b21 ^ !(b22 | b23);
+    a[22] = b22 ^ (b23 & b24);
+    a[23] = b23 ^ (b24 | b20);
+    a[24] = b24 ^ (b20 & b21);
+}
 
 /// The Keccak-p[1600, `rounds`] permutation over a 5×5 array of 64-bit lanes.
 ///
 /// `rounds == 24` is the full Keccak-f used by SHA-3, SHAKE, and KMAC; the
 /// reduced-round variant (`rounds == 12`, the last 12 round constants) is used
-/// by TurboSHAKE and KangarooTwelve.
-fn keccak_p(a: &mut [u64; 25], rounds: usize) {
+/// by TurboSHAKE and KangarooTwelve. Constant time: bitwise operations only.
+pub(super) fn keccak_p(a: &mut [u64; 25], rounds: usize) {
+    // Enter the lane-complemented representation, run the (identical) rounds,
+    // and leave it again. The pattern is round-invariant, so the round count
+    // (24 or 12) does not matter.
+    for &i in COMPLEMENTED.iter() {
+        a[i] = !a[i];
+    }
     for &rc in RC[24 - rounds..].iter() {
-        // θ
-        let mut c = [0u64; 5];
-        for x in 0..5 {
-            c[x] = a[x] ^ a[x + 5] ^ a[x + 10] ^ a[x + 15] ^ a[x + 20];
-        }
-        for x in 0..5 {
-            let d = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
-            for y in 0..5 {
-                a[x + 5 * y] ^= d;
-            }
-        }
-
-        // ρ and π
-        let mut last = a[1];
-        for i in 0..24 {
-            let j = PI[i];
-            let tmp = a[j];
-            a[j] = last.rotate_left(RHO[i]);
-            last = tmp;
-        }
-
-        // χ
-        for y in 0..5 {
-            let row = [
-                a[5 * y],
-                a[5 * y + 1],
-                a[5 * y + 2],
-                a[5 * y + 3],
-                a[5 * y + 4],
-            ];
-            for x in 0..5 {
-                a[5 * y + x] = row[x] ^ ((!row[(x + 1) % 5]) & row[(x + 2) % 5]);
-            }
-        }
-
-        // ι
-        a[0] ^= rc;
+        round(a, rc);
+    }
+    for &i in COMPLEMENTED.iter() {
+        a[i] = !a[i];
     }
 }
 

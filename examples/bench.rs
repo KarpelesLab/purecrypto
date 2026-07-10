@@ -11,7 +11,8 @@ use purecrypto::cipher::{Aes128, Aes256, Aez, BlockCipher, ChaCha20Poly1305, Gcm
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::x25519::X25519PrivateKey;
-use purecrypto::hash::{Blake3, Digest, Sha256, Sha512};
+use purecrypto::hash::{Blake3, Digest, Sha3_256, Sha256, Sha512, shake128};
+use purecrypto::mldsa::MlDsa65PrivateKey;
 use purecrypto::mlkem::MlKem768DecapsKey;
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::BoxedRsaPrivateKey;
@@ -107,6 +108,13 @@ fn main() {
         bench_throughput("BLAKE3", N, t, || {
             black_box(Blake3::digest(black_box(&data)));
         });
+        bench_throughput("SHA3-256", N, t, || {
+            black_box(Sha3_256::digest(black_box(&data)));
+        });
+        let mut xof_out = [0u8; 64];
+        bench_throughput("SHAKE-128", N, t, || {
+            shake128(black_box(&data), black_box(&mut xof_out));
+        });
     }
 
     println!("\n=== Asymmetric (latency) ===");
@@ -170,6 +178,19 @@ fn main() {
         });
         bench_latency("ML-KEM-768 decaps", t, || {
             black_box(dk.decapsulate(black_box(&ct)));
+        });
+
+        // ML-DSA-65
+        let (mldsa_sk, mldsa_pk) = MlDsa65PrivateKey::generate(&mut rng);
+        let mldsa_sig = mldsa_sk.sign_deterministic(msg, b"").unwrap();
+        bench_latency("ML-DSA-65 keygen", t, || {
+            black_box(MlDsa65PrivateKey::generate(&mut rng));
+        });
+        bench_latency("ML-DSA-65 sign (det)", t, || {
+            black_box(mldsa_sk.sign_deterministic(black_box(msg), b"").unwrap());
+        });
+        bench_latency("ML-DSA-65 verify", t, || {
+            black_box(mldsa_pk.verify(black_box(&mldsa_sig), black_box(msg), b""));
         });
 
         // SLH-DSA (hash-based; dominated by WOTS+/FORS hashing).
