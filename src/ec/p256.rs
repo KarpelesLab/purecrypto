@@ -198,27 +198,91 @@ impl P256 {
         }
     }
 
-    #[inline]
+    /// Complete projective point doubling for `a = -3`
+    /// (Renes–Costello–Batina, Algorithm 6). Exception-free for all inputs,
+    /// including the identity. One multiply cheaper than `point_add(p, p)`
+    /// (8M + 3S + 2·mb vs 12M + 2·mb, with S = M in this generic Montgomery
+    /// field).
     fn double(&self, p: &Point) -> Point {
-        self.point_add(p, p)
+        let b = self.b;
+        let mut t0 = self.mul(&p.x, &p.x);
+        let t1 = self.mul(&p.y, &p.y);
+        let mut t2 = self.mul(&p.z, &p.z);
+        let mut t3 = self.mul(&p.x, &p.y);
+        t3 = self.add(&t3, &t3);
+        let mut z3 = self.mul(&p.x, &p.z);
+        z3 = self.add(&z3, &z3);
+        let mut y3 = self.mul(&b, &t2);
+        y3 = self.sub(&y3, &z3);
+        let mut x3 = self.add(&y3, &y3);
+        y3 = self.add(&x3, &y3);
+        x3 = self.sub(&t1, &y3);
+        y3 = self.add(&t1, &y3);
+        y3 = self.mul(&x3, &y3);
+        x3 = self.mul(&x3, &t3);
+        t3 = self.add(&t2, &t2);
+        t2 = self.add(&t2, &t3);
+        z3 = self.mul(&b, &z3);
+        z3 = self.sub(&z3, &t2);
+        z3 = self.sub(&z3, &t0);
+        t3 = self.add(&z3, &z3);
+        z3 = self.add(&z3, &t3);
+        t3 = self.add(&t0, &t0);
+        t0 = self.add(&t3, &t0);
+        t0 = self.sub(&t0, &t2);
+        t0 = self.mul(&t0, &z3);
+        y3 = self.add(&y3, &t0);
+        t0 = self.mul(&p.y, &p.z);
+        t0 = self.add(&t0, &t0);
+        z3 = self.mul(&t0, &z3);
+        x3 = self.sub(&x3, &z3);
+        z3 = self.mul(&t0, &t1);
+        z3 = self.add(&z3, &z3);
+        z3 = self.add(&z3, &z3);
+        Point {
+            x: x3,
+            y: y3,
+            z: z3,
+        }
     }
 
-    /// Constant-time scalar multiplication `scalar * point` via
-    /// double-and-add-always over all 256 bits.
+    /// Constant-time scalar multiplication `scalar * point` via a fixed
+    /// 4-bit window: 4 doublings and one *unconditional* addition per
+    /// nibble, with the window value fetched by a masked scan of all 16
+    /// table entries (no secret-indexed memory access). A zero nibble adds
+    /// the identity — the complete RCB formulas make that a no-op with the
+    /// same operation sequence — so, like the previous
+    /// double-and-add-always ladder, the schedule is a function of the
+    /// (public) scalar width only.
     pub(crate) fn scalar_mul(&self, scalar: &Fe, point: &Point) -> Point {
+        // table[j] = [j]P; table[0] is the identity.
+        let mut table = [self.identity(); 16];
+        table[1] = *point;
+        for i in 2..16 {
+            table[i] = self.point_add(&table[i - 1], point);
+        }
+
         let mut acc = self.identity();
         let limbs = scalar.as_limbs();
         let mut i = 4;
         while i > 0 {
             i -= 1;
             let limb = limbs[i];
-            let mut bit = 64;
-            while bit > 0 {
-                bit -= 1;
+            let mut shift = 64;
+            while shift > 0 {
+                shift -= 4;
                 acc = self.double(&acc);
-                let sum = self.point_add(&acc, point);
-                let set = Choice::from(((limb >> bit) & 1) as u8);
-                acc = Point::conditional_select(&sum, &acc, set);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+                acc = self.double(&acc);
+
+                let digit = ((limb >> shift) & 0xf) as usize;
+                // Constant-time gather of table[digit].
+                let mut sel = table[0];
+                for (j, entry) in table.iter().enumerate() {
+                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                }
+                acc = self.point_add(&acc, &sel);
             }
         }
         acc
