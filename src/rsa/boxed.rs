@@ -41,7 +41,7 @@ pub struct BoxedRsaPublicKey {
 /// Keys imported with [`from_components`](Self::from_components) (no primes)
 /// fall back to plain `c^d mod n`; the constant-time Montgomery ladder still
 /// applies, but base-blinding cannot.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BoxedRsaPrivateKey {
     n: BoxedUint,
     e: BoxedUint,
@@ -59,6 +59,22 @@ pub struct BoxedRsaPrivateKey {
     crt: Option<alloc::boxed::Box<BoxedRsaCrt>>,
     /// HMAC-SHA256 key (derived from `d`) for per-call blinding values.
     blinding_seed: [u8; 32],
+}
+
+// Manual impl instead of `#[derive(Debug)]`: the derive printed `d`, `p`,
+// `q`, `phi_n_minus_1`, the CRT parameters, and the blinding seed — a whole
+// private key leaked into any log line that formats the struct. Only the
+// public half is shown. (Kept as an impl rather than dropped entirely:
+// removing the trait bound would be a breaking change for downstream code
+// that formats key-bearing containers.)
+impl core::fmt::Debug for BoxedRsaPrivateKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoxedRsaPrivateKey")
+            .field("n", &self.n)
+            .field("e", &self.e)
+            .field("k", &self.k)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Drop for BoxedRsaPrivateKey {
@@ -1195,6 +1211,24 @@ mod tests {
                 "CRT and full-width paths diverged"
             );
         }
+    }
+
+    /// The `Debug` impl must never print secret key material: not the private
+    /// exponent, not the primes, not the CRT parameters, not the blinding
+    /// seed.
+    #[test]
+    fn private_key_debug_redacts_secrets() {
+        let key = rsa_test_key_a().to_boxed();
+        let s = alloc::format!("{key:?}");
+        for (name, secret) in [
+            ("d", alloc::format!("{:?}", key.d)),
+            ("p", alloc::format!("{:?}", key.p)),
+            ("q", alloc::format!("{:?}", key.q)),
+        ] {
+            assert!(!s.contains(&secret), "Debug output leaks `{name}`");
+        }
+        assert!(s.contains("BoxedRsaPrivateKey"));
+        assert!(s.ends_with(".. }"), "expected finish_non_exhaustive: {s}");
     }
 
     /// Boneh–DeMillo–Lipton guard: corrupt one CRT half and the `m^e ≡ c`
