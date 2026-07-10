@@ -8,7 +8,7 @@ use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
 use super::montgomery::inv_mod_2_64;
 use super::mul::mac;
 use super::uint::{Limb, adc, sbb};
-use crate::ct::Choice;
+use crate::ct::{Choice, ConditionallySelectable};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -92,11 +92,22 @@ impl BoxedMontModulus {
         self.limbs
     }
 
-    /// CIOS Montgomery multiplication of two `limbs`-wide values.
-    fn mont_mul_limbs(&self, a: &[Limb], b: &[Limb]) -> Vec<Limb> {
+    /// CIOS Montgomery multiplication of two `limbs`-wide values into `out`,
+    /// with caller-provided scratch `t` — no allocation, so the
+    /// exponentiation ladders can reuse two buffers across their thousands
+    /// of multiplies instead of hitting the allocator on each one.
+    ///
+    /// `out` may alias `a` and/or `b`: the accumulation only reads them, and
+    /// `out` is written exclusively in the final-subtraction step, after the
+    /// last read. (Rust's borrow rules forbid literal aliasing anyway;
+    /// callers ping-pong two buffers and `mem::swap`.) `t` must not alias
+    /// anything. The operation sequence is identical to the previous
+    /// allocating version — same mask-based conditional subtraction, no new
+    /// branches — so the constant-time property is unchanged.
+    fn mont_mul_to(&self, a: &[Limb], b: &[Limb], t: &mut [Limb], out: &mut [Limb]) {
         let l = self.limbs;
         let n = &self.n;
-        let mut t = vec![0 as Limb; l];
+        t.fill(0);
         let mut ts: Limb = 0;
 
         for &bi in b.iter().take(l) {
@@ -122,16 +133,28 @@ impl BoxedMontModulus {
             ts = ts1 + c;
         }
 
-        // Conditional final subtraction (result < 2N).
-        let (mut diff, borrow_low) = sbb_limbs(&t, n, 0);
-        let (_, borrow) = sbb(ts, 0, borrow_low);
+        // Conditional final subtraction (result < 2N): out = t - n, kept only
+        // when the subtraction doesn't underflow the (l+1)-limb value.
+        let mut bo: Limb = 0;
+        for j in 0..l {
+            let (d, b) = sbb(t[j], n[j], bo);
+            out[j] = d;
+            bo = b;
+        }
+        let (_, borrow) = sbb(ts, 0, bo);
         let ge = Choice::from((borrow ^ 1) as u8);
-        let out = select_limbs(&diff, &t, ge);
-        // Scrub the secret-dependent CIOS scratch (`t`) and the rejected
-        // final-subtraction candidate (`diff`) before they drop. `out` is a
-        // freshly allocated Vec, so this does not touch the returned value.
+        for j in 0..l {
+            out[j] = Limb::conditional_select(&out[j], &t[j], ge);
+        }
+    }
+
+    /// CIOS Montgomery multiplication of two `limbs`-wide values.
+    fn mont_mul_limbs(&self, a: &[Limb], b: &[Limb]) -> Vec<Limb> {
+        let mut t = vec![0 as Limb; self.limbs];
+        let mut out = vec![0 as Limb; self.limbs];
+        self.mont_mul_to(a, b, &mut t, &mut out);
+        // Scrub the secret-dependent CIOS scratch before it drops.
         zeroize_limbs(&mut t);
-        zeroize_limbs(&mut diff);
         out
     }
 
@@ -214,6 +237,14 @@ impl BoxedMontModulus {
         }
 
         let mut acc = r_mod_n;
+        // Reused scratch: CIOS accumulator `t`, ping-pong output `nxt`, and
+        // the per-nibble gather buffer `sel`. All hold base-derived secrets
+        // during the loop and are scrubbed once at the end — reusing them
+        // (instead of a fresh allocation per multiply) changes where the
+        // intermediate values live, not what is computed.
+        let mut t = vec![0 as Limb; self.limbs];
+        let mut nxt = vec![0 as Limb; self.limbs];
+        let mut sel = vec![0 as Limb; self.limbs];
 
         // Pad the exponent to at least `self.limbs` 64-bit words; if the
         // caller hands in a wider exponent we keep every bit. `limbs_resized`
@@ -229,29 +260,33 @@ impl BoxedMontModulus {
             let mut shift = 64;
             while shift > 0 {
                 shift -= 4;
-                acc = self.mont_mul_limbs(&acc, &acc);
-                acc = self.mont_mul_limbs(&acc, &acc);
-                acc = self.mont_mul_limbs(&acc, &acc);
-                acc = self.mont_mul_limbs(&acc, &acc);
+                for _ in 0..4 {
+                    self.mont_mul_to(&acc, &acc, &mut t, &mut nxt);
+                    core::mem::swap(&mut acc, &mut nxt);
+                }
 
                 let digit = ((limb >> shift) & 0xf) as usize;
                 // Constant-time gather of table[digit].
-                let mut sel = table[0].clone();
-                for (j, t) in table.iter().enumerate() {
-                    sel = select_limbs(t, &sel, Choice::from((j == digit) as u8));
+                sel.copy_from_slice(&table[0]);
+                for (j, entry) in table.iter().enumerate() {
+                    let hit = Choice::from((j == digit) as u8);
+                    for (s, e) in sel.iter_mut().zip(entry.iter()) {
+                        *s = Limb::conditional_select(e, s, hit);
+                    }
                 }
-                acc = self.mont_mul_limbs(&acc, &sel);
-                // Scrub the per-nibble gather buffer (holds the selected
-                // window value, a base-derived secret) before it drops.
-                zeroize_limbs(&mut sel);
+                self.mont_mul_to(&acc, &sel, &mut t, &mut nxt);
+                core::mem::swap(&mut acc, &mut nxt);
             }
         }
-        // Construct the result first, then scrub the Montgomery accumulator
-        // and the precomputed window table (all base-derived secrets). The
-        // returned `BoxedUint` owns a fresh Vec from `demont_limbs`, so the
-        // zeroing below cannot corrupt it.
+        // Construct the result first, then scrub the Montgomery accumulator,
+        // the scratch buffers, and the precomputed window table (all
+        // base-derived secrets). The returned `BoxedUint` owns a fresh Vec
+        // from `demont_limbs`, so the zeroing below cannot corrupt it.
         let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
         zeroize_limbs(&mut acc);
+        zeroize_limbs(&mut t);
+        zeroize_limbs(&mut nxt);
+        zeroize_limbs(&mut sel);
         for entry in table.iter_mut() {
             zeroize_limbs(entry);
         }
@@ -280,17 +315,28 @@ impl BoxedMontModulus {
             // base^0 = 1.
             return BoxedUint::from_limbs(self.demont_limbs(&acc));
         }
+        // Reused scratch, as in `pow`: `acc` still holds a base-derived
+        // secret even though the exponent is public.
+        let mut t = vec![0 as Limb; self.limbs];
+        let mut nxt = vec![0 as Limb; self.limbs];
         let exp_limbs = exp.limbs_resized(exp.significant_limbs().max(1));
         let mut i = bits;
         while i > 0 {
             i -= 1;
-            acc = self.mont_mul_limbs(&acc, &acc);
-            let mult = self.mont_mul_limbs(&acc, &base_m);
+            self.mont_mul_to(&acc, &acc, &mut t, &mut nxt);
+            core::mem::swap(&mut acc, &mut nxt);
+            self.mont_mul_to(&acc, &base_m, &mut t, &mut nxt);
             let limb = exp_limbs[i / 64];
             let set = Choice::from(((limb >> (i % 64)) & 1) as u8);
-            acc = select_limbs(&mult, &acc, set);
+            for (a, m) in acc.iter_mut().zip(nxt.iter()) {
+                *a = Limb::conditional_select(m, a, set);
+            }
         }
-        BoxedUint::from_limbs(self.demont_limbs(&acc))
+        let result = BoxedUint::from_limbs(self.demont_limbs(&acc));
+        zeroize_limbs(&mut acc);
+        zeroize_limbs(&mut t);
+        zeroize_limbs(&mut nxt);
+        result
     }
 
     /// Returns `(a + b) mod n`.
