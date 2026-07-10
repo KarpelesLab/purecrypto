@@ -7,7 +7,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use purecrypto::bignum::BoxedUint;
-use purecrypto::cipher::{Aes128, Aes256, Aez, BlockCipher, ChaCha20Poly1305, Gcm};
+use purecrypto::cipher::{Aes128, Aes256, Aez, BlockCipher, ChaCha20Poly1305, Gcm, Poly1305};
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::x25519::X25519PrivateKey;
@@ -71,6 +71,13 @@ fn main() {
         let cc = ChaCha20Poly1305::new(&[0u8; 32]);
         bench_throughput("ChaCha20-Poly1305 enc", N, t, || {
             let _ = black_box(cc.encrypt(&nonce12, b"", black_box(&mut buf[..N])));
+        });
+
+        let poly_key = [7u8; 32];
+        bench_throughput("Poly1305 MAC", N, t, || {
+            let mut p = Poly1305::new(black_box(&poly_key));
+            p.update(black_box(&buf[..N]));
+            black_box(p.finish());
         });
 
         let aes = Aes256::new(&[0u8; 32]);
