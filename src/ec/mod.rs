@@ -25,6 +25,7 @@ pub mod ed25519;
 pub mod ed448;
 pub mod edwards25519;
 mod p256;
+mod p256_field;
 mod p256_gtable;
 #[cfg(feature = "x509")]
 pub(crate) mod registry;

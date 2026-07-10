@@ -1,7 +1,13 @@
 //! NIST P-256 (secp256r1) field and group arithmetic.
+//!
+//! The base field runs on the native Solinas backend
+//! ([`super::p256_field`]): plain (non-Montgomery) residues in `[0, p)` with
+//! the FIPS 186 fast reduction, so SEC1 encode/decode and the point formulas
+//! share one representation with no conversions.
 
+use super::p256_field as field;
 use super::p256_gtable::P256_GEN_TABLE;
-use crate::bignum::{MontModulus, Uint};
+use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
 
@@ -50,8 +56,8 @@ pub(crate) fn fe_from_hex(hex: &str) -> Fe {
     super::uint_from_be_hex(hex)
 }
 
-/// A point in projective coordinates `(X : Y : Z)` with field elements held in
-/// Montgomery form. The identity is `(0 : 1 : 0)`.
+/// A point in projective coordinates `(X : Y : Z)` with field elements held
+/// as plain residues in `[0, p)`. The identity is `(0 : 1 : 0)`.
 #[derive(Clone, Copy)]
 pub(crate) struct Point {
     x: Fe,
@@ -69,19 +75,18 @@ impl ConditionallySelectable for Point {
     }
 }
 
-/// The P-256 curve context: the field modulus `p` and the curve coefficient
-/// `b`, both ready for Montgomery arithmetic.
+/// The P-256 curve context (the curve coefficient `b`; the field arithmetic
+/// itself is the stateless [`super::p256_field`] backend).
 pub(crate) struct P256 {
-    fp: MontModulus<4>,
-    /// `b` in Montgomery form.
+    /// The curve coefficient `b`.
     b: Fe,
 }
 
 impl P256 {
     pub(crate) fn new() -> Self {
-        let fp = MontModulus::new(fe_from_hex(P_HEX));
-        let b = fp.to_mont(&fe_from_hex(B_HEX));
-        P256 { fp, b }
+        P256 {
+            b: fe_from_hex(B_HEX),
+        }
     }
 
     /// The group order `n`.
@@ -98,7 +103,7 @@ impl P256 {
     pub(crate) fn identity(&self) -> Point {
         Point {
             x: Fe::ZERO,
-            y: self.fp.to_mont(&Fe::ONE),
+            y: Fe::ONE,
             z: Fe::ZERO,
         }
     }
@@ -111,46 +116,48 @@ impl P256 {
         self.lift_affine(&fe_from_hex(GX_HEX), &fe_from_hex(GY_HEX))
     }
 
-    /// Lifts an affine point `(x, y)` (plain coordinates) to projective form.
+    /// Lifts an affine point `(x, y)` to projective form.
     pub(crate) fn lift_affine(&self, x: &Fe, y: &Fe) -> Point {
         Point {
-            x: self.fp.to_mont(x),
-            y: self.fp.to_mont(y),
-            z: self.fp.to_mont(&Fe::ONE),
+            x: *x,
+            y: *y,
+            z: Fe::ONE,
         }
     }
 
-    /// Converts a point to affine `(x, y)` (plain coordinates), or `None` if it
-    /// is the identity.
+    /// Converts a point to affine `(x, y)`, or `None` if it is the identity.
     ///
-    /// The inversion is via Fermat's little theorem (`z^{p-2} mod p`) using
-    /// the constant-time Montgomery ladder, NOT the variable-time
-    /// extended-Euclidean `inv_mod` — `z` is derived from the secret scalar
-    /// on every ECDH / ECDSA hot path and a timing leak here would be
-    /// exploitable.
+    /// The inversion is the fixed-addition-chain Fermat exponentiation
+    /// `z^{p-2} mod p` ([`field::invert`]) — constant time by construction
+    /// (a fixed sequence of 255 squarings and 13 multiplies), NOT the
+    /// variable-time extended-Euclidean `inv_mod` — `z` is derived from the
+    /// secret scalar on every ECDH / ECDSA hot path and a timing leak here
+    /// would be exploitable.
     pub(crate) fn to_affine(&self, point: &Point) -> Option<(Fe, Fe)> {
         if bool::from(point.z.is_zero()) {
             return None;
         }
-        let z = self.fp.from_mont(&point.z);
-        let p_minus_2 = self.fp.modulus().wrapping_sub(&Fe::from_u64(2));
-        let z_inv = self.fp.pow(&z, &p_minus_2);
-        let x = self.fp.mul_mod(&self.fp.from_mont(&point.x), &z_inv);
-        let y = self.fp.mul_mod(&self.fp.from_mont(&point.y), &z_inv);
+        let z_inv = field::invert(&point.z);
+        let x = field::mul(&point.x, &z_inv);
+        let y = field::mul(&point.y, &z_inv);
         Some((x, y))
     }
 
     #[inline]
     fn mul(&self, a: &Fe, b: &Fe) -> Fe {
-        self.fp.mont_mul(a, b)
+        field::mul(a, b)
+    }
+    #[inline]
+    fn sqr(&self, a: &Fe) -> Fe {
+        field::square(a)
     }
     #[inline]
     fn add(&self, a: &Fe, b: &Fe) -> Fe {
-        self.fp.add_mod(a, b)
+        field::add(a, b)
     }
     #[inline]
     fn sub(&self, a: &Fe, b: &Fe) -> Fe {
-        self.fp.sub_mod(a, b)
+        field::sub(a, b)
     }
 
     /// Complete projective point addition for `a = -3`
@@ -210,14 +217,13 @@ impl P256 {
 
     /// Complete projective point doubling for `a = -3`
     /// (Renes–Costello–Batina, Algorithm 6). Exception-free for all inputs,
-    /// including the identity. One multiply cheaper than `point_add(p, p)`
-    /// (8M + 3S + 2·mb vs 12M + 2·mb, with S = M in this generic Montgomery
-    /// field).
+    /// including the identity. Cheaper than `point_add(p, p)` (8M + 3S vs
+    /// 12M, and the native field's dedicated squaring makes S < M).
     fn double(&self, p: &Point) -> Point {
         let b = self.b;
-        let mut t0 = self.mul(&p.x, &p.x);
-        let t1 = self.mul(&p.y, &p.y);
-        let mut t2 = self.mul(&p.z, &p.z);
+        let mut t0 = self.sqr(&p.x);
+        let t1 = self.sqr(&p.y);
+        let mut t2 = self.sqr(&p.z);
         let mut t3 = self.mul(&p.x, &p.y);
         t3 = self.add(&t3, &t3);
         let mut z3 = self.mul(&p.x, &p.z);
@@ -308,8 +314,6 @@ impl P256 {
     /// formulas, so the schedule depends only on the (public) scalar width.
     pub(crate) fn mul_generator(&self, scalar: &Fe) -> Point {
         let id = self.identity();
-        // Montgomery-form 1, the Z coordinate of every (affine) table entry.
-        let one = id.y;
         let mut acc = id;
         let limbs = scalar.as_limbs();
         for (i, window) in P256_GEN_TABLE.iter().enumerate() {
@@ -322,7 +326,7 @@ impl P256 {
                 let cand = Point {
                     x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
                     y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
-                    z: one,
+                    z: Fe::ONE,
                 };
                 sel = Point::conditional_select(&cand, &sel, Choice::from((j + 1 == digit) as u8));
             }
@@ -331,17 +335,125 @@ impl P256 {
         acc
     }
 
-    /// Tests whether affine `(x, y)` (plain coordinates) satisfies the curve
-    /// equation `y^2 = x^3 - 3x + b (mod p)`.
+    /// Point negation `(X : -Y : Z)` (the negation itself is constant time;
+    /// currently only the variable-time verify path needs it).
+    fn negate_point(&self, p: &Point) -> Point {
+        Point {
+            x: p.x,
+            y: field::negate(&p.y),
+            z: p.z,
+        }
+    }
+
+    /// **VARIABLE-TIME** double-scalar multiplication `u1·G + u2·Q`.
+    ///
+    /// # Warning — never call with secret scalars
+    /// The execution time, branch pattern and memory-access pattern all
+    /// depend on `u1`, `u2` and `q`. This is only sound when every input is
+    /// public — which is exactly the ECDSA *verification* setting (signature,
+    /// message digest and public key are all public). Signing, key
+    /// generation and ECDH must keep using the constant-time
+    /// [`Self::mul_generator`] / [`Self::scalar_mul`] paths.
+    ///
+    /// Strategy: `u1·G` through the fixed-base comb with direct (public)
+    /// indexing and zero-digit skipping — no doublings at all — plus `u2·Q`
+    /// via width-5 wNAF (8 precomputed odd multiples, ~256 doublings and
+    /// ~43 additions on average), joined by one final addition.
+    pub(crate) fn mul_double_vartime(&self, u1: &Fe, u2: &Fe, q: &Point) -> Point {
+        self.point_add(
+            &self.mul_generator_vartime(u1),
+            &self.scalar_mul_vartime(u2, q),
+        )
+    }
+
+    /// **VARIABLE-TIME** fixed-base multiplication `k·G` (comb table with
+    /// direct indexing, zero digits skipped). Public scalars only — see
+    /// [`Self::mul_double_vartime`].
+    fn mul_generator_vartime(&self, k: &Fe) -> Point {
+        let mut acc = self.identity();
+        let limbs = k.as_limbs();
+        for (i, window) in P256_GEN_TABLE.iter().enumerate() {
+            let digit = ((limbs[i / 16] >> ((i % 16) * 4)) & 0xf) as usize;
+            if digit != 0 {
+                let entry = &window[digit - 1];
+                let cand = Point {
+                    x: Fe::from_limbs([entry[0], entry[1], entry[2], entry[3]]),
+                    y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
+                    z: Fe::ONE,
+                };
+                acc = self.point_add(&acc, &cand);
+            }
+        }
+        acc
+    }
+
+    /// **VARIABLE-TIME** scalar multiplication `k·point` via width-5 wNAF.
+    /// Public scalars only — see [`Self::mul_double_vartime`].
+    fn scalar_mul_vartime(&self, k: &Fe, point: &Point) -> Point {
+        // Odd multiples [1]P, [3]P, ..., [15]P.
+        let two_p = self.double(point);
+        let mut table = [*point; 8];
+        for i in 1..8 {
+            table[i] = self.point_add(&table[i - 1], &two_p);
+        }
+
+        let naf = wnaf5(k);
+        // Skip leading zero digits (public scalar, so this leak is fine).
+        let mut i = naf.len();
+        while i > 0 && naf[i - 1] == 0 {
+            i -= 1;
+        }
+        let mut acc = self.identity();
+        while i > 0 {
+            i -= 1;
+            acc = self.double(&acc);
+            let d = naf[i];
+            if d > 0 {
+                acc = self.point_add(&acc, &table[(d as usize - 1) / 2]);
+            } else if d < 0 {
+                let neg = self.negate_point(&table[((-d) as usize - 1) / 2]);
+                acc = self.point_add(&acc, &neg);
+            }
+        }
+        acc
+    }
+
+    /// Tests whether affine `(x, y)` satisfies the curve equation
+    /// `y^2 = x^3 - 3x + b (mod p)`.
     pub(crate) fn is_on_curve(&self, x: &Fe, y: &Fe) -> bool {
         let three = Fe::from_u64(3);
-        let b = self.fp.from_mont(&self.b);
-        let lhs = self.fp.mul_mod(y, y);
-        let x3 = self.fp.mul_mod(&self.fp.mul_mod(x, x), x);
-        let three_x = self.fp.mul_mod(&three, x);
-        let rhs = self.fp.add_mod(&self.fp.sub_mod(&x3, &three_x), &b);
+        let lhs = field::square(y);
+        let x3 = field::mul(&field::square(x), x);
+        let three_x = field::mul(&three, x);
+        let rhs = field::add(&field::sub(&x3, &three_x), &self.b);
         bool::from(lhs.ct_eq(&rhs))
     }
+}
+
+/// Width-5 wNAF recoding of a 256-bit scalar: digits in
+/// `{0, ±1, ±3, …, ±15}` with any two nonzero digits at least 5 positions
+/// apart. **Variable time** in the scalar — public scalars only.
+fn wnaf5(k: &Fe) -> [i8; 257] {
+    let mut naf = [0i8; 257];
+    let mut k = *k;
+    let mut i = 0;
+    while !bool::from(k.is_zero()) {
+        if bool::from(k.is_odd()) {
+            let low = (k.as_limbs()[0] & 31) as i8;
+            let d = if low > 16 { low - 32 } else { low };
+            naf[i] = d;
+            if d > 0 {
+                k = k.wrapping_sub(&Fe::from_u64(d as u64));
+            } else {
+                // k < 2^256 - 15 always holds here (k only shrinks from an
+                // initial value < 2^256 - 2^224), so this cannot wrap.
+                k = k.wrapping_add(&Fe::from_u64((-d) as u64));
+            }
+        }
+        k = k.shr1();
+        i += 1;
+    }
+    naf
 }
 
 #[cfg(test)]
@@ -479,6 +591,66 @@ mod tests {
         }
     }
 
+    /// Differential test: the variable-time double-scalar multiplication
+    /// (verify path) agrees with the constant-time comb + windowed ladder on
+    /// edge scalars and a random batch, for a random non-generator base.
+    #[test]
+    fn mul_double_vartime_matches_constant_time() {
+        use crate::hash::Sha256;
+        use crate::rng::HmacDrbg;
+        let curve = P256::new();
+        let n = P256::order();
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"p256-vartime-differential", b"nonce", &[]);
+        let rand_fe = |rng: &mut HmacDrbg<Sha256>| {
+            let mut limbs = [0u64; 4];
+            for l in &mut limbs {
+                *l = rng.next_u64();
+            }
+            Fe::from_limbs(limbs)
+        };
+
+        // A "random" public point Q = t·G.
+        let t = rand_fe(&mut rng).reduce(&n);
+        let (qx, qy) = curve.to_affine(&curve.mul_generator(&t)).unwrap();
+        let q = curve.lift_affine(&qx, &qy);
+
+        let check = |u1: &Fe, u2: &Fe| {
+            let ct = curve.point_add(&curve.mul_generator(u1), &curve.scalar_mul(u2, &q));
+            let vt = curve.mul_double_vartime(u1, u2, &q);
+            assert_eq!(
+                curve.to_affine(&ct),
+                curve.to_affine(&vt),
+                "vartime/ct mismatch: u1={:x?} u2={:x?}",
+                u1.as_limbs(),
+                u2.as_limbs()
+            );
+        };
+
+        let edges = [
+            Fe::ZERO,
+            Fe::ONE,
+            Fe::from_u64(2),
+            Fe::from_u64(15),
+            Fe::from_u64(16),
+            Fe::from_u64(17),
+            n.wrapping_sub(&Fe::ONE),
+            n.wrapping_sub(&Fe::from_u64(15)),
+            fe_from_hex("8000000000000000000000000000000000000000000000000000000000000000"),
+        ];
+        for u1 in &edges {
+            for u2 in &edges {
+                check(u1, u2);
+            }
+        }
+
+        for _ in 0..48 {
+            let u1 = rand_fe(&mut rng).reduce(&n);
+            let u2 = rand_fe(&mut rng).reduce(&n);
+            check(&u1, &u2);
+        }
+    }
+
     /// Regenerates the fixed-base table source (`src/ec/p256_gtable.rs`).
     /// Run with:
     /// `cargo test --release gen_p256_gen_table -- --ignored --nocapture`
@@ -504,13 +676,11 @@ mod tests {
                 let (x, y) = curve
                     .to_affine(&acc)
                     .expect("table entry is never identity");
-                let xm = curve.fp.to_mont(&x);
-                let ym = curve.fp.to_mont(&y);
                 print!("        [");
-                for l in xm.as_limbs() {
+                for l in x.as_limbs() {
                     print!("0x{l:016x}, ");
                 }
-                for l in ym.as_limbs() {
+                for l in y.as_limbs() {
                     print!("0x{l:016x}, ");
                 }
                 println!("],");
