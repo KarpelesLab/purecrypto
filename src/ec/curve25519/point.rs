@@ -133,7 +133,8 @@ impl Field {
     pub(crate) fn point_double(&self, p: &Point) -> Point {
         let a = self.sq(p.x);
         let b = self.sq(p.y);
-        let c = self.add(self.sq(p.z), self.sq(p.z));
+        let zz = self.sq(p.z);
+        let c = self.add(zz, zz);
         let d = self.neg(a);
         let e = self.sub(self.sub(self.sq(self.add(p.x, p.y)), a), b);
         let g = self.add(d, b);
@@ -161,17 +162,39 @@ impl Field {
         }
     }
 
-    /// Constant-time `[scalar]·p`, scanning the 256-bit little-endian scalar
-    /// from the most significant bit. The scalar bytes are treated as secret.
+    /// Constant-time `[scalar]·p` over the 256-bit little-endian scalar, via
+    /// a fixed 4-bit window: 4 doublings and one *unconditional* addition per
+    /// nibble, with the window value fetched by a masked scan of all 16 table
+    /// entries (no secret-indexed memory access). A zero nibble adds the
+    /// identity — a no-op with the same operation sequence, since the HWCD
+    /// formulas are complete — so the schedule depends only on the (public)
+    /// scalar width, exactly like the previous bit-at-a-time ladder. The
+    /// scalar bytes are treated as secret.
     pub(crate) fn scalar_mult(&self, scalar: &[u8; 32], p: &Point) -> Point {
+        // table[j] = [j]P; table[0] is the identity.
+        let mut table = [self.identity(); 16];
+        table[1] = *p;
+        for i in 2..16 {
+            table[i] = self.point_add(&table[i - 1], p);
+        }
+
         let mut acc = self.identity();
-        let mut i = 256;
+        let mut i = 64;
         while i > 0 {
             i -= 1;
             acc = self.point_double(&acc);
-            let bit = (scalar[i / 8] >> (i % 8)) & 1;
-            let sum = self.point_add(&acc, p);
-            acc = point_select(&acc, &sum, Choice::from(bit));
+            acc = self.point_double(&acc);
+            acc = self.point_double(&acc);
+            acc = self.point_double(&acc);
+
+            let byte = scalar[i / 2];
+            let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
+            // Constant-time gather of table[digit].
+            let mut sel = table[0];
+            for (j, entry) in table.iter().enumerate() {
+                sel = point_select(&sel, entry, Choice::from((j == digit) as u8));
+            }
+            acc = self.point_add(&acc, &sel);
         }
         acc
     }
