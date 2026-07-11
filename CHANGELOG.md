@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.27](https://github.com/KarpelesLab/purecrypto/compare/v0.6.26...v0.6.27) - 2026-07-10
+
+### Other
+
+- variable-time double-scalar multiplication in ECDSA verification
+- native Solinas field backend + addition-chain inversion for P-256
+- batch expand_mask through the 4-way Keccak kernel
+- batch SHAKE WOTS+ and FORS through the 4-way Keccak kernel
+- stitched AES-CTR+GHASH loop, Karatsuba PCLMUL, 8-block aggregation
+- 51-bit-radix field, const constants, addition-chain inversion, vartime verify
+- mlkem, mldsa: batch expansion XOFs through the 4-way Keccak kernel
+- 4-way AVX2 KeccakP1600times4 kernel
+- lane-complemented, fully unrolled Keccak-p round
+- 4-way AVX2 multi-buffer SHA-512; batch all SHA-2 SLH-DSA sets
+- precomputed fixed-base comb tables for P-256 and edwards25519 [k]G
+- dedicated constant-time Montgomery squaring in both backends
+- AVX2 two-stripe parallel-Horner evaluation (~2x MAC throughput)
+- redact secrets from BoxedRsaPrivateKey's Debug output
+- fixed 4-bit window scalar mul for secp256k1 and boxed Weierstrass
+- fixed 4-bit window scalar mult; drop duplicate z-squaring
+- fixed 4-bit window scalar mul + dedicated RCB Alg 6 doubling
+- allocation-free CIOS core for the boxed exponentiation ladders
+- CRT private op with per-prime Fermat-inverted blinding (3.7x sign)
+
 ## [0.6.26](https://github.com/KarpelesLab/purecrypto/compare/v0.6.25...v0.6.26) - 2026-07-04
 
 ### Other
