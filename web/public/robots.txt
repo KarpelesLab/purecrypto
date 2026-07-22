@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://karpeleslab.github.io/purecrypto/sitemap.xml

@@ -1,0 +1,22 @@
+{
+  "name": "purecrypto-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "smoke": "node scripts/smoke.mjs",
+    "dom-smoke": "node scripts/dom-smoke.mjs",
+    "wasm": "cargo rustc --manifest-path ../Cargo.toml --lib --crate-type cdylib --features ffi --no-default-features --target wasm32-unknown-unknown --release && cp ../target/wasm32-unknown-unknown/release/purecrypto.wasm public/purecrypto.wasm"
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.1",
+    "jsdom": "^25.0.1",
+    "vite": "^6.0.7"
+  }
+}

@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <meta name="theme-color" content="#0a0c14" />
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <title>purecrypto — pure-Rust cryptography, running in your browser</title>
+    <meta
+      name="description"
+      content="A pure-Rust cryptography toolkit with no foreign-code dependencies: constant-time primitives, RSA, elliptic curves, post-quantum ML-KEM / ML-DSA / SLH-DSA, X.509, and TLS 1.3 / QUIC. Every demo here is the real library compiled to WebAssembly, computing in your browser."
+    />
+    <link rel="canonical" href="https://karpeleslab.github.io/purecrypto/" />
+
+    <!-- Open Graph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="purecrypto" />
+    <meta property="og:title" content="purecrypto — pure-Rust cryptography in your browser" />
+    <meta
+      property="og:description"
+      content="Constant-time primitives to TLS 1.3, RSA to post-quantum ML-KEM / ML-DSA — the real Rust library, compiled to WebAssembly, running live."
+    />
+    <meta property="og:url" content="https://karpeleslab.github.io/purecrypto/" />
+    <meta property="og:image" content="https://karpeleslab.github.io/purecrypto/og.svg" />
+
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="purecrypto — pure-Rust cryptography in your browser" />
+    <meta
+      name="twitter:description"
+      content="Constant-time primitives to TLS 1.3, RSA to post-quantum ML-KEM / ML-DSA — real Rust, compiled to WebAssembly, running live."
+    />
+    <meta name="twitter:image" content="https://karpeleslab.github.io/purecrypto/og.svg" />
+
+    <!-- Structured data -->
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "SoftwareSourceCode",
+        "name": "purecrypto",
+        "description": "A pure-Rust cryptography toolkit with no foreign-code dependencies, from constant-time primitives up to keys, X.509, TLS 1.3, DTLS and QUIC, including post-quantum ML-KEM, ML-DSA and SLH-DSA.",
+        "codeRepository": "https://github.com/KarpelesLab/purecrypto",
+        "programmingLanguage": "Rust",
+        "license": "https://opensource.org/licenses/MIT",
+        "keywords": "cryptography, rust, constant-time, post-quantum, TLS, QUIC, X.509, WebAssembly, no_std"
+      }
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <noscript>
+      purecrypto is a pure-Rust cryptography toolkit — constant-time primitives,
+      RSA, elliptic curves, post-quantum ML-KEM / ML-DSA / SLH-DSA, X.509 and
+      TLS 1.3 / QUIC. This page demonstrates the library compiled to
+      WebAssembly; enable JavaScript to run the live demos, or read the source
+      at github.com/KarpelesLab/purecrypto.
+    </noscript>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#8b6cff"/>
+      <stop offset="1" stop-color="#2fe0c8"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="80%" cy="0%" r="70%">
+      <stop offset="0" stop-color="#8b6cff" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#8b6cff" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="44" height="44" patternUnits="userSpaceOnUse">
+      <path d="M44 0 L0 0 0 44" fill="none" stroke="#7882b4" stroke-opacity="0.08" stroke-width="1"/>
+    </pattern>
+  </defs>
+  <rect width="1200" height="630" fill="#090b13"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect width="1200" height="630" fill="url(#glow)"/>
+
+  <g transform="translate(90,96)">
+    <rect x="0" y="0" width="46" height="46" rx="12" fill="none" stroke="url(#g)" stroke-width="2.5"/>
+    <g fill="url(#g)">
+      <circle cx="14" cy="14" r="2.8"/><circle cx="32" cy="14" r="2.8"/>
+      <circle cx="14" cy="32" r="2.8"/><circle cx="32" cy="32" r="2.8"/><circle cx="23" cy="23" r="2.8"/>
+    </g>
+    <text x="64" y="32" font-family="'IBM Plex Mono',monospace" font-size="26" fill="#e9ebf6" font-weight="600">purecrypto</text>
+  </g>
+
+  <text x="90" y="300" font-family="'IBM Plex Sans',sans-serif" font-size="72" font-weight="700" fill="#e9ebf6" letter-spacing="-2">Pure-Rust cryptography,</text>
+  <text x="90" y="384" font-family="'IBM Plex Sans',sans-serif" font-size="72" font-weight="700" letter-spacing="-2">
+    <tspan fill="#e9ebf6">running in your </tspan><tspan fill="url(#g)">browser.</tspan>
+  </text>
+
+  <text x="92" y="452" font-family="'IBM Plex Sans',sans-serif" font-size="28" fill="#aab2cc">Constant-time primitives · RSA &amp; elliptic curves · post-quantum ML-KEM / ML-DSA · TLS 1.3 &amp; QUIC</text>
+
+  <g font-family="'IBM Plex Mono',monospace" font-size="21" fill="#8b93ab">
+    <rect x="90" y="512" width="196" height="46" rx="9" fill="#12162a" stroke="#232a4a"/>
+    <text x="112" y="541"><tspan fill="#737c9c">$ </tspan>cargo add purecrypto</text>
+    <text x="316" y="541" fill="#2fe0c8">no C · no OpenSSL · WebAssembly</text>
+  </g>
+</svg>

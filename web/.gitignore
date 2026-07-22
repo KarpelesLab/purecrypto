@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# The wasm is built from the crate by CI (and `npm run wasm` locally); not tracked.
+public/purecrypto.wasm
