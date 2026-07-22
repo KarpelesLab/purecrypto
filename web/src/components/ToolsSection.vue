@@ -5,12 +5,14 @@ import ToolHash from './tools/ToolHash.vue';
 import ToolHashFile from './tools/ToolHashFile.vue';
 import ToolKeygen from './tools/ToolKeygen.vue';
 import ToolCsr from './tools/ToolCsr.vue';
+import ToolCert from './tools/ToolCert.vue';
 
 const tabs = [
   { id: 'hash', label: 'Hash', desc: 'Digest any input under any algorithm.', comp: ToolHash },
   { id: 'file', label: 'Hash a file', desc: 'One read, every algorithm at once.', comp: ToolHashFile },
   { id: 'keygen', label: 'Key generator', desc: 'Generate a private key in any scheme.', comp: ToolKeygen },
   { id: 'csr', label: 'CSR', desc: 'Build a PKCS#10 certificate request.', comp: ToolCsr },
+  { id: 'cert', label: 'X.509 analyzer', desc: 'Inspect any certificate in detail.', comp: ToolCert },
 ];
 const active = ref('hash');
 </script>
@@ -59,7 +61,7 @@ const active = ref('hash');
 <style scoped>
 .tabs {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 10px;
   margin-bottom: 20px;
 }

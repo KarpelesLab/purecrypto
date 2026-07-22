@@ -376,3 +376,36 @@ export function csrPem(csrType, handle, cn, sans = []) {
     free(cp, cl); free(sp, sl);
   }
 }
+
+// ---- X.509 analysis ------------------------------------------------------
+
+// Parse a certificate (PEM string or DER bytes) and return a structured
+// summary: subject/issuer, validity, serial, key, SANs, constraints, usages,
+// fingerprints, and whether it is self-signed.
+export function analyzeCert(input) {
+  let handle;
+  if (typeof input === 'string') {
+    const [p, l] = put(utf8(input));
+    try { handle = wasm.pc_cert_from_pem(p, l); } finally { free(p, l); }
+  } else {
+    const [p, l] = put(input);
+    try { handle = wasm.pc_cert_from_der(p, l); } finally { free(p, l); }
+  }
+  if (!handle) throw new Error('could not parse an X.509 certificate from that input');
+  try {
+    const info = JSON.parse(fromUtf8(withOutput(8192, (o, l) => wasm.pc_cert_analyze(handle, o, l))));
+    // from_der is lazy, so structurally-broken input parses to a shell with no
+    // fields. A real certificate always has a decodable public key.
+    if (!info.key) throw new Error('that does not appear to be a valid X.509 certificate');
+    const der = withOutput(8192, (o, l) => wasm.pc_cert_to_der(handle, o, l));
+    info.der_bytes = der.length;
+    info.fingerprints = {
+      sha256: toHex(digest(HASH.SHA256, der)),
+      sha1: toHex(digest(17 /* SHA-1 */, der)),
+    };
+    info.self_signed = wasm.pc_cert_verify(handle, handle) === OK;
+    return info;
+  } finally {
+    wasm.pc_cert_free(handle);
+  }
+}

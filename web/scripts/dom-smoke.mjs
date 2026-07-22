@@ -22,7 +22,8 @@ const { window } = dom;
 globalThis.window = window;
 globalThis.document = window.document;
 if (!window.crypto) Object.defineProperty(window, 'crypto', { value: webcrypto });
-for (const g of ['MutationObserver', 'HTMLElement', 'Node', 'Element', 'Event', 'CustomEvent', 'SVGElement']) {
+for (const g of ['MutationObserver', 'HTMLElement', 'Node', 'Element', 'Event', 'CustomEvent',
+  'SVGElement', 'Document', 'DocumentFragment', 'Text', 'Comment']) {
   if (window[g] && !globalThis[g]) globalThis[g] = window[g];
 }
 globalThis.requestAnimationFrame = window.requestAnimationFrame || ((cb) => setTimeout(cb, 16));
@@ -75,7 +76,7 @@ const sigAfter = dsa?.querySelector('.live-row:nth-child(2) .hex')?.textContent;
 check('ML-DSA re-sign changes the signature (hedged)', sigBefore && sigAfter && sigBefore !== sigAfter);
 
 // Tools section.
-check('tools section + 4 tabs', !!$('#tools') && doc.querySelectorAll('#tools .tab').length === 4);
+check('tools section present', !!$('#tools') && doc.querySelectorAll('#tools .tab').length >= 4);
 check('hash tool shows a digest', /[0-9a-f]{32}/.test($('#tools .digest')?.textContent || ''));
 
 // Switch to the Key generator tab and generate an Ed25519 key.
@@ -93,6 +94,17 @@ await sleep(60);
 [...doc.querySelectorAll('#tools button')].find((b) => /Create CSR/.test(b.textContent))?.click();
 await sleep(250);
 check('CSR tool produced a certificate request', /BEGIN CERTIFICATE REQUEST/.test($('#tools').textContent));
+
+// Switch to the X.509 analyzer, load the example, verify the report renders.
+check('tools now has 5 tabs', doc.querySelectorAll('#tools .tab').length === 5);
+[...doc.querySelectorAll('#tools .tab')].find((t) => /analyzer/i.test(t.textContent))?.click();
+await sleep(60);
+[...doc.querySelectorAll('#tools button')].find((b) => /Load an example/.test(b.textContent))?.click();
+await sleep(200);
+const certText = $('#tools').textContent;
+check('X.509 analyzer parsed the example', /analyzer\.example/.test(certText) && /ECDSA · P-256/.test(certText));
+check('X.509 analyzer shows SANs + usages', /DNS: analyzer\.example/.test(certText) && /TLS server auth/.test(certText));
+check('X.509 analyzer shows a SHA-256 fingerprint', /[0-9a-f]{64}/.test($('#tools .fp .hex')?.textContent || ''));
 
 console.log(fail ? `\n${fail} checks FAILED` : '\nall render + tool checks passed');
 // jsdom keeps timers alive; exit explicitly.

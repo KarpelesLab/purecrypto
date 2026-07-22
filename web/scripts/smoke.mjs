@@ -111,5 +111,22 @@ for (const [kind, param, csr] of [['ed25519', 0, 'ed25519'], ['ecdsa', 2, 'ec']]
   k.free();
 }
 
+// X.509 analyzer: parse a real (openssl-generated) cert fixture, inspect it.
+const certPem = readFileSync(path.join(here, 'testcert.pem'), 'utf8');
+const info = pc.analyzeCert(certPem);
+check('analyze: subject CN + O + C', info.subject?.cn === 'analyzer.example'
+  && info.subject?.o === 'purecrypto demo' && info.subject?.c === 'US');
+check('analyze: self-signed detected', info.self_signed === true);
+check('analyze: key is ECDSA P-256', info.key?.algorithm === 'ECDSA' && info.key?.curve === 'P-256');
+check('analyze: SANs (DNS + IP)', info.sans_dns?.includes('analyzer.example') && info.sans_ip?.includes('192.0.2.10'));
+check('analyze: keyUsage = digitalSignature|keyEncipherment', info.key_usage === 160);
+check('analyze: EKU serverAuth + clientAuth', info.eku?.includes('1.3.6.1.5.5.7.3.1') && info.eku?.includes('1.3.6.1.5.5.7.3.2'));
+check('analyze: SHA-256 fingerprint', /^[0-9a-f]{64}$/.test(info.fingerprints?.sha256 || ''));
+check('analyze: validity window', info.not_before > 0 && info.not_after > info.not_before);
+// Garbage input is rejected, not crashed.
+let certRejected = false;
+try { pc.analyzeCert('-----BEGIN CERTIFICATE-----\nnope\n-----END CERTIFICATE-----'); } catch { certRejected = true; }
+check('analyze: rejects malformed cert', certRejected);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
