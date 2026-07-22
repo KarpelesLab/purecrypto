@@ -79,5 +79,37 @@ check('ML-DSA-65 verify ok', pc.mldsaVerify(pc.MLDSA.D65, dpub, msg, dsig) === t
 check('ML-DSA-65 verify rejects wrong msg', pc.mldsaVerify(pc.MLDSA.D65, dpub, pc.utf8('other'), dsig) === false);
 d.free();
 
+// Supported-hash probe + streaming multi-hash matches one-shot digest.
+const supp = pc.supportedHashes();
+check('supported hashes probe (>= 15 algos)', supp.length >= 15, `${supp.length}`);
+const mh = pc.multiHash([{ id: pc.HASH.SHA256, name: 'SHA-256' }, { id: pc.HASH.BLAKE3, name: 'BLAKE3' }]);
+mh.updateChunk(pc.utf8('ab'));
+mh.updateChunk(pc.utf8('c'));
+const res = mh.finish();
+const sha256 = res.find((r) => r.name === 'SHA-256');
+check('streaming multi-hash == one-shot SHA-256("abc")',
+  sha256.hex === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+
+// Key generation across algorithms.
+for (const [kind, param] of [['ed25519', 0], ['ecdsa', 1], ['mldsa', 2], ['slhdsa', 1], ['sm2', 0]]) {
+  const k = pc.generateKey(kind, param);
+  const priv = k.privatePem(), pub = k.publicPem();
+  check(`${kind} keygen -> PEM`, /-----BEGIN .*PRIVATE KEY-----/.test(priv) && /-----BEGIN PUBLIC KEY-----/.test(pub));
+  k.free();
+}
+
+// CSR generation for ed25519 / ec, and a load-your-own-key round-trip.
+for (const [kind, param, csr] of [['ed25519', 0, 'ed25519'], ['ecdsa', 2, 'ec']]) {
+  const k = pc.generateKey(kind, param);
+  const csrPem = pc.csrPem(csr, k.handle, 'example.com', ['example.com', 'www.example.com']);
+  check(`${kind} CSR PEM`, /-----BEGIN CERTIFICATE REQUEST-----/.test(csrPem));
+  // reload the private key from its PEM and sign a CSR with it
+  const reloaded = pc.loadPrivatePem(csr, k.privatePem());
+  const csr2 = pc.csrPem(csr, reloaded.handle, 'example.com', []);
+  check(`${kind} CSR from reloaded key`, /-----BEGIN CERTIFICATE REQUEST-----/.test(csr2));
+  reloaded.free();
+  k.free();
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

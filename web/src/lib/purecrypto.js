@@ -254,3 +254,125 @@ export function mldsaVerify(set, publicPem, msg, sig) {
     free(sp, sl); free(mp, ml); free(gp, gl);
   }
 }
+
+// ---- full hash catalogue (mirrors src/ffi/hash.rs `id`) -------------------
+
+export const HASHES = [
+  { id: 2, name: 'SHA-256' }, { id: 3, name: 'SHA-384' }, { id: 4, name: 'SHA-512' },
+  { id: 5, name: 'SHA-512/224' }, { id: 6, name: 'SHA-512/256' },
+  { id: 7, name: 'SHA3-224' }, { id: 8, name: 'SHA3-256' }, { id: 9, name: 'SHA3-384' },
+  { id: 10, name: 'SHA3-512' }, { id: 11, name: 'Keccak-256' },
+  { id: 12, name: 'BLAKE2b-256' }, { id: 13, name: 'BLAKE2b-512' }, { id: 14, name: 'BLAKE2s-256' },
+  { id: 15, name: 'BLAKE3' }, { id: 16, name: 'SM3' }, { id: 1, name: 'SHA-224' },
+  { id: 17, name: 'SHA-1' }, { id: 18, name: 'MD5' }, { id: 19, name: 'RIPEMD-160' },
+  { id: 20, name: 'Ascon-Hash256' }, { id: 21, name: 'MD2' }, { id: 22, name: 'Whirlpool' },
+  { id: 23, name: 'Streebog-256' }, { id: 24, name: 'Streebog-512' },
+];
+
+// The subset actually wired in the ffi build (probe once).
+let _supported = null;
+export function supportedHashes() {
+  if (_supported) return _supported;
+  _supported = HASHES.filter((h) => {
+    const p = wasm.pc_hash_new(h.id);
+    if (!p) return false;
+    wasm.pc_hash_free(p);
+    return true;
+  });
+  return _supported;
+}
+
+// ---- streaming multi-hash (one pass over the input) ----------------------
+
+// Hash a stream of chunks under every algorithm in `algs` simultaneously,
+// copying each chunk into linear memory once. Returns { updateChunk, finish }.
+export function multiHash(algs) {
+  const hs = algs.map((a) => ({ a, h: wasm.pc_hash_new(a.id) })).filter((x) => x.h);
+  return {
+    updateChunk(chunk) {
+      if (!chunk.length) return;
+      const [p, l] = put(chunk);
+      try {
+        for (const x of hs) wasm.pc_hash_update(x.h, p, l);
+      } finally {
+        free(p, l);
+      }
+    },
+    finish() {
+      return hs.map((x) => {
+        const digest = withOutput(64, (o, l) => wasm.pc_hash_finish(x.h, o, l));
+        wasm.pc_hash_free(x.h);
+        return { name: x.a.name, hex: toHex(digest), bits: digest.length * 8 };
+      });
+    },
+  };
+}
+
+// ---- key generation ------------------------------------------------------
+
+// Each entry: how to generate + serialize a private key, and whether the ffi
+// can build a CSR for it (rsa / ec / ed25519 have PEM CSR wrappers).
+const KEY_IMPL = {
+  ed25519: { gen: () => wasm.pc_ed25519_generate(), pr: (h, o, l) => wasm.pc_ed25519_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_ed25519_public_to_pem(h, o, l), fr: (h) => wasm.pc_ed25519_free(h), csr: 'ed25519' },
+  ed448: { gen: () => wasm.pc_ed448_generate(), pr: (h, o, l) => wasm.pc_ed448_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_ed448_public_to_pem(h, o, l), fr: (h) => wasm.pc_ed448_free(h), csr: null },
+  ecdsa: { gen: (p) => wasm.pc_ec_generate(p), pr: (h, o, l) => wasm.pc_ec_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_ec_public_to_pem(h, o, l), fr: (h) => wasm.pc_ec_free(h), csr: 'ec' },
+  rsa: { gen: (p) => wasm.pc_rsa_generate(p), pr: (h, o, l) => wasm.pc_rsa_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_rsa_public_to_pem(h, o, l), fr: (h) => wasm.pc_rsa_free(h), csr: 'rsa' },
+  mldsa: { gen: (p) => wasm.pc_mldsa_generate(p), pr: (h, o, l) => wasm.pc_mldsa_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_mldsa_public_to_pem(h, o, l), fr: (h) => wasm.pc_mldsa_free(h), csr: null },
+  slhdsa: { gen: (p) => wasm.pc_slhdsa_generate(p), pr: (h, o, l) => wasm.pc_slhdsa_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_slhdsa_public_to_pem(h, o, l), fr: (h) => wasm.pc_slhdsa_free(h), csr: null },
+  sm2: { gen: () => wasm.pc_sm2_generate(), pr: (h, o, l) => wasm.pc_sm2_private_to_pem(h, o, l), pu: (h, o, l) => wasm.pc_sm2_public_to_pem(h, o, l), fr: (h) => wasm.pc_sm2_free(h), csr: null },
+};
+
+// Generate a private key. `kind` keys KEY_IMPL; `param` is the curve/bits/set.
+export function generateKey(kind, param = 0) {
+  const impl = KEY_IMPL[kind];
+  if (!impl) throw new Error(`unknown key kind: ${kind}`);
+  const h = impl.gen(param | 0);
+  if (!h) throw new Error(`${kind} key generation failed`);
+  return {
+    kind,
+    csrType: impl.csr,
+    handle: h,
+    privatePem: () => fromUtf8(withOutput(6144, (o, l) => impl.pr(h, o, l))),
+    publicPem: () => fromUtf8(withOutput(6144, (o, l) => impl.pu(h, o, l))),
+    free: () => impl.fr(h),
+  };
+}
+
+// Load a private key PEM into a handle for CSR signing (rsa / ec / ed25519).
+const FROM_PEM = {
+  rsa: (p, l) => wasm.pc_rsa_from_pem(p, l),
+  ec: (p, l) => wasm.pc_ec_from_pem(p, l),
+  ed25519: (p, l) => wasm.pc_ed25519_from_pem(p, l),
+};
+const FREE_BY = {
+  rsa: (h) => wasm.pc_rsa_free(h),
+  ec: (h) => wasm.pc_ec_free(h),
+  ed25519: (h) => wasm.pc_ed25519_free(h),
+};
+export function loadPrivatePem(csrType, pem) {
+  const [p, l] = put(utf8(pem));
+  try {
+    const h = FROM_PEM[csrType](p, l);
+    if (!h) throw new Error(`could not parse a ${csrType} private key from that PEM`);
+    return { handle: h, free: () => FREE_BY[csrType](h) };
+  } finally {
+    free(p, l);
+  }
+}
+
+// ---- CSR (PKCS#10) -------------------------------------------------------
+
+const CSR_FN = {
+  rsa: (h, cp, cl, sp, sl, o, ol) => wasm.pc_csr_create_rsa_pem(h, cp, cl, sp, sl, o, ol),
+  ec: (h, cp, cl, sp, sl, o, ol) => wasm.pc_csr_create_ec_pem(h, cp, cl, sp, sl, o, ol),
+  ed25519: (h, cp, cl, sp, sl, o, ol) => wasm.pc_csr_create_ed25519_pem(h, cp, cl, sp, sl, o, ol),
+};
+export function csrPem(csrType, handle, cn, sans = []) {
+  const [cp, cl] = put(utf8(cn));
+  const [sp, sl] = put(utf8(sans.join('\n')));
+  try {
+    return fromUtf8(withOutput(4096, (o, l) => CSR_FN[csrType](handle, cp, cl, sp, sl, o, l)));
+  } finally {
+    free(cp, cl); free(sp, sl);
+  }
+}

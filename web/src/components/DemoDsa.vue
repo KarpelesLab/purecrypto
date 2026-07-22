@@ -7,12 +7,14 @@ const message = ref('Signed under a post-quantum key.');
 const key = ref(null);
 const publicPem = ref('');
 const sig = ref(null);
+const keyId = ref(''); // short public-key fingerprint, changes on new keypair
 
 function generate() {
   if (state.status !== 'ready') return;
   if (key.value) key.value.free();
   key.value = pc.mldsa(pc.MLDSA.D65);
   publicPem.value = key.value.publicPem();
+  keyId.value = pc.toHex(pc.digest(pc.HASH.SHA256, pc.utf8(publicPem.value))).slice(0, 16);
   sign();
 }
 function sign() {
@@ -22,6 +24,11 @@ const verified = computed(() => {
   if (!sig.value || !publicPem.value) return null;
   return pc.mldsaVerify(pc.MLDSA.D65, publicPem.value, pc.utf8(message.value), sig.value);
 });
+// A window onto the signature so a re-sign is visibly different (ML-DSA is
+// hedged — the signature changes every time, even for the same message).
+const sigHead = computed(() =>
+  sig.value ? pc.toHex(sig.value.slice(0, 26)) + ' …' : '—',
+);
 
 watch(() => state.status, (s) => s === 'ready' && generate(), { immediate: true });
 onBeforeUnmount(() => key.value && key.value.free());
@@ -47,12 +54,25 @@ onBeforeUnmount(() => key.value && key.value.free());
         <span class="lbl mono">signature bytes</span>
       </div>
       <div class="stat">
-        <span class="num mono teal">{{ publicPem ? '1,952' : '—' }}</span>
+        <span class="num mono teal">1,952</span>
         <span class="lbl mono">public key bytes</span>
       </div>
       <div class="stat">
         <span class="num mono">ML-DSA-65</span>
         <span class="lbl mono">NIST level 3</span>
+      </div>
+    </div>
+
+    <div class="live">
+      <div class="live-row">
+        <span class="tag public">key id</span>
+        <code class="hex public">{{ keyId || '—' }}</code>
+        <span class="hint">changes on new keypair</span>
+      </div>
+      <div class="live-row">
+        <span class="tag">signature</span>
+        <code class="hex">{{ sigHead }}</code>
+        <span class="hint">changes on every sign (hedged)</span>
       </div>
     </div>
 
@@ -95,6 +115,33 @@ onBeforeUnmount(() => key.value && key.value.free());
   font-size: 0.7rem;
   color: var(--muted);
   letter-spacing: 0.05em;
+}
+.live {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 13px;
+  background: var(--ink-2);
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+}
+.live-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.live-row .tag {
+  flex-shrink: 0;
+}
+.live-row .hex {
+  flex: 1;
+  min-width: 120px;
+}
+.hint {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--muted);
 }
 .verify-row {
   display: flex;

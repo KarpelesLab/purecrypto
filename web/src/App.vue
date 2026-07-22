@@ -3,6 +3,7 @@ import SiteNav from './components/SiteNav.vue';
 import HeroSection from './components/HeroSection.vue';
 import CapabilityMatrix from './components/CapabilityMatrix.vue';
 import DemosSection from './components/DemosSection.vue';
+import ToolsSection from './components/ToolsSection.vue';
 import PrinciplesSection from './components/PrinciplesSection.vue';
 import SiteFooter from './components/SiteFooter.vue';
 </script>
@@ -14,6 +15,7 @@ import SiteFooter from './components/SiteFooter.vue';
     <HeroSection />
     <CapabilityMatrix />
     <DemosSection />
+    <ToolsSection />
     <PrinciplesSection />
   </main>
   <SiteFooter />

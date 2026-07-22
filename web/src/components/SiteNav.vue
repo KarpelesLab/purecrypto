@@ -12,6 +12,7 @@ import { state } from '../store.js';
       <nav class="links">
         <a href="#capabilities">Capabilities</a>
         <a href="#demos">Live demos</a>
+        <a href="#tools">Tools</a>
         <a href="#principles">Principles</a>
       </nav>
       <div class="nav-right">
