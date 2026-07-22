@@ -89,6 +89,116 @@ impl PcRsaKeyAccess for PcRsaKey {
     }
 }
 
+/// Builds a CSR for common-name `cn` signed by `signer`, requesting each
+/// newline-separated entry of `sans` as a DNS `subjectAltName`, and writes the
+/// PEM to `out`. A JS/wasm-friendly path: strings are `ptr`+`len` (not C
+/// strings) and the PEM is returned directly rather than via an opaque handle.
+///
+/// # Safety
+/// `cn`/`sans` point to `cn_len`/`sans_len` valid bytes (or are NULL when the
+/// length is 0); `out`/`out_len` follow the usual out-buffer convention.
+unsafe fn create_csr_pem(
+    signer: &CertSigner,
+    cn: *const core::ffi::c_char,
+    cn_len: usize,
+    sans: *const core::ffi::c_char,
+    sans_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    let Some(cn_bytes) = (unsafe { slice(cn.cast(), cn_len) }) else {
+        return PcStatus::NullPointer;
+    };
+    let Ok(cn_str) = core::str::from_utf8(cn_bytes) else {
+        return PcStatus::BadEncoding;
+    };
+    let Some(sans_bytes) = (unsafe { slice(sans.cast(), sans_len) }) else {
+        return PcStatus::NullPointer;
+    };
+    let Ok(sans_str) = core::str::from_utf8(sans_bytes) else {
+        return PcStatus::BadEncoding;
+    };
+    let dns: Vec<&str> = sans_str
+        .split('\n')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let subject = DistinguishedName::common_name(cn_str);
+    match CertificationRequest::create(signer, &subject, &dns) {
+        Ok(csr) => unsafe { out_write(csr.to_pem().as_bytes(), out, out_len) },
+        Err(_) => PcStatus::Internal,
+    }
+}
+
+/// Creates an RSA-signed CSR and writes its PEM to `out`. See [`create_csr_pem`].
+///
+/// # Safety
+/// `rsa_key` valid; string/out pointers as in [`create_csr_pem`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_csr_create_rsa_pem(
+    rsa_key: *const PcRsaKey,
+    cn: *const core::ffi::c_char,
+    cn_len: usize,
+    sans: *const core::ffi::c_char,
+    sans_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if rsa_key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let signer = CertSigner::Rsa(super::rsa::pc_rsa_inner_key(unsafe { &*rsa_key }));
+        unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
+    })
+}
+
+/// Creates an ECDSA-signed CSR and writes its PEM to `out`. See [`create_csr_pem`].
+///
+/// # Safety
+/// `ec_key` valid; string/out pointers as in [`create_csr_pem`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_csr_create_ec_pem(
+    ec_key: *const super::ec::PcEcKey,
+    cn: *const core::ffi::c_char,
+    cn_len: usize,
+    sans: *const core::ffi::c_char,
+    sans_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if ec_key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let signer = CertSigner::Ecdsa(super::ec::pc_ec_inner_key(unsafe { &*ec_key }));
+        unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
+    })
+}
+
+/// Creates an Ed25519-signed CSR and writes its PEM to `out`. See [`create_csr_pem`].
+///
+/// # Safety
+/// `ed_key` valid; string/out pointers as in [`create_csr_pem`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_csr_create_ed25519_pem(
+    ed_key: *const super::ec::PcEd25519Key,
+    cn: *const core::ffi::c_char,
+    cn_len: usize,
+    sans: *const core::ffi::c_char,
+    sans_len: usize,
+    out: *mut u8,
+    out_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if ed_key.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let signer = CertSigner::Ed25519(super::ec::pc_ed25519_inner_key(unsafe { &*ed_key }));
+        unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
+    })
+}
+
 /// Parses a CSR from PEM.
 ///
 /// # Safety

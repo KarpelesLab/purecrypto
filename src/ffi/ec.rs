@@ -212,6 +212,12 @@ pub unsafe extern "C" fn pc_ec_free(key: *mut PcEcKey) {
 /// An opaque Ed25519 private key.
 pub struct PcEd25519Key(Ed25519PrivateKey);
 
+/// Returns a shared borrow of the inner Rust key. Used by sibling FFI
+/// modules (notably `csr.rs::pc_csr_create_ed25519_pem`).
+pub(super) fn pc_ed25519_inner_key(handle: &PcEd25519Key) -> &Ed25519PrivateKey {
+    &handle.0
+}
+
 /// Generates an Ed25519 key, or NULL on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn pc_ed25519_generate() -> *mut PcEd25519Key {
