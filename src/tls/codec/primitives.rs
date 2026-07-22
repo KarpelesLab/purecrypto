@@ -122,10 +122,13 @@ u16_id!(
         /// ml-dsa-44 (draft-ietf-tls-mldsa). The TLS 1.3 wire format for
         /// these schemes carries the raw ML-DSA signature bytes in the
         /// `CertificateVerify` body (no DER wrapping).
+        #[cfg_attr(not(feature = "mldsa"), allow(dead_code))]
         MLDSA44 = 0x0904,
         /// ml-dsa-65 (draft-ietf-tls-mldsa).
+        #[cfg_attr(not(feature = "mldsa"), allow(dead_code))]
         MLDSA65 = 0x0905,
         /// ml-dsa-87 (draft-ietf-tls-mldsa).
+        #[cfg_attr(not(feature = "mldsa"), allow(dead_code))]
         MLDSA87 = 0x0906,
     }
 );

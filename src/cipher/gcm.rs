@@ -296,10 +296,18 @@ impl<C: BlockCipher> Gcm<C> {
     pub const MAX_PLAINTEXT_LEN: u64 = (1u64 << 36) - 32;
 
     fn validate(nonce: &[u8], buffer: &[u8]) {
-        assert!(
-            !nonce.is_empty() && nonce.len() <= Self::MAX_NONCE_LEN,
-            "AES-GCM nonce must be 1..=2^61-1 bytes (NIST SP 800-38D §5.2.1.1)"
-        );
+        // On 16/32-bit targets (e.g. `wasm32`) `MAX_NONCE_LEN` saturates to
+        // `usize::MAX`, so `nonce.len() <= MAX_NONCE_LEN` is trivially true —
+        // no addressable slice can reach 2^61 bytes there. The check is kept
+        // for its meaning on 64-bit targets; silence the vacuous-comparison
+        // lint that only fires where `usize` is narrower than 61 bits.
+        #[allow(clippy::absurd_extreme_comparisons)]
+        {
+            assert!(
+                !nonce.is_empty() && nonce.len() <= Self::MAX_NONCE_LEN,
+                "AES-GCM nonce must be 1..=2^61-1 bytes (NIST SP 800-38D §5.2.1.1)"
+            );
+        }
         assert!(
             (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
             "AES-GCM plaintext exceeds 2^39 − 256 bits (NIST SP 800-38D §5.2.1.1)"

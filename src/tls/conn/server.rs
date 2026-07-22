@@ -122,10 +122,13 @@ pub(crate) enum ServerKey {
     /// An Ed448 key; signs with `ed448`.
     Ed448(Ed448PrivateKey),
     /// An ML-DSA-44 key (FIPS 204, draft-ietf-tls-mldsa).
+    #[cfg(feature = "mldsa")]
     MlDsa44(crate::mldsa::MlDsa44PrivateKey),
     /// An ML-DSA-65 key.
+    #[cfg(feature = "mldsa")]
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// An ML-DSA-87 key.
+    #[cfg(feature = "mldsa")]
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
     /// An external key: signing is performed out-of-band by the caller. The
     /// handshake suspends at `CertificateVerify` and resumes once the caller
@@ -305,18 +308,21 @@ impl ServerConfig {
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-44 private key (NIST FIPS 204, draft-ietf-tls-mldsa).
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa44(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa44PrivateKey) -> Self {
         Self::from_key(cert_chain, ServerKey::MlDsa44(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-65 private key.
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa65(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa65PrivateKey) -> Self {
         Self::from_key(cert_chain, ServerKey::MlDsa65(key))
     }
 
     /// A configuration presenting `cert_chain` (leaf first) and signing with
     /// an ML-DSA-87 private key.
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa87(cert_chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
         Self::from_key(cert_chain, ServerKey::MlDsa87(key))
     }
@@ -533,8 +539,11 @@ impl ServerConfig {
             },
             ServerKey::Ed25519(_) => SignatureScheme::ED25519,
             ServerKey::Ed448(_) => SignatureScheme::ED448,
+            #[cfg(feature = "mldsa")]
             ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+            #[cfg(feature = "mldsa")]
             ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+            #[cfg(feature = "mldsa")]
             ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
             // Representative only; the concrete scheme is negotiated against the
             // client's offer (see `negotiate_sig_scheme`).

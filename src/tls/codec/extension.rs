@@ -70,7 +70,7 @@ pub(crate) fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Err
 /// list — those schemes are reserved for chain signatures and must be
 /// offered via `signature_algorithms_cert` (RFC 8446 §4.2.3) if needed.
 pub(crate) fn signature_algorithms() -> RawExtension {
-    let schemes = [
+    let base = [
         SignatureScheme::ED25519,
         SignatureScheme::ED448,
         SignatureScheme::ECDSA_SECP256R1_SHA256,
@@ -78,16 +78,22 @@ pub(crate) fn signature_algorithms() -> RawExtension {
         SignatureScheme::ECDSA_SECP521R1_SHA512,
         SignatureScheme::RSA_PSS_RSAE_SHA256,
         SignatureScheme::RSA_PSS_RSAE_SHA384,
-        // ML-DSA (draft-ietf-tls-mldsa). The TLS 1.3 wire format carries
-        // the raw FIPS 204 signature in the CertificateVerify body, no
-        // DER wrapping.
+    ];
+    // ML-DSA (draft-ietf-tls-mldsa). The TLS 1.3 wire format carries the raw
+    // FIPS 204 signature in the CertificateVerify body, no DER wrapping. Only
+    // advertised when the `mldsa` feature is compiled in.
+    #[cfg(feature = "mldsa")]
+    let mldsa = [
         SignatureScheme::MLDSA44,
         SignatureScheme::MLDSA65,
         SignatureScheme::MLDSA87,
     ];
+    #[cfg(not(feature = "mldsa"))]
+    let mldsa: [SignatureScheme; 0] = [];
+
     let mut body = Vec::new();
     with_len_u16(&mut body, |b| {
-        for s in schemes {
+        for s in base.iter().chain(mldsa.iter()) {
             put_u16(b, s.0);
         }
     });

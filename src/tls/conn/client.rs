@@ -75,10 +75,13 @@ pub(crate) enum ClientKey {
     /// An ML-DSA-44 client key (FIPS 204, draft-ietf-tls-mldsa).
     /// Client-side ML-DSA `CertificateVerify` signing is deterministic —
     /// the client doesn't thread an RNG through the handshake state machine.
+    #[cfg(feature = "mldsa")]
     MlDsa44(crate::mldsa::MlDsa44PrivateKey),
     /// An ML-DSA-65 client key.
+    #[cfg(feature = "mldsa")]
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// An ML-DSA-87 client key.
+    #[cfg(feature = "mldsa")]
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
     /// An external client key: `CertificateVerify` is signed out-of-band by
     /// the caller via the suspend/resume API. `schemes` are the IANA
@@ -123,6 +126,7 @@ impl ClientCertConfig {
     }
 
     /// A client cert + ML-DSA-44 signing key (NIST FIPS 204).
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa44(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa44PrivateKey) -> Self {
         ClientCertConfig {
             chain,
@@ -131,6 +135,7 @@ impl ClientCertConfig {
     }
 
     /// A client cert + ML-DSA-65 signing key.
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa65(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa65PrivateKey) -> Self {
         ClientCertConfig {
             chain,
@@ -139,6 +144,7 @@ impl ClientCertConfig {
     }
 
     /// A client cert + ML-DSA-87 signing key.
+    #[cfg(feature = "mldsa")]
     pub fn with_mldsa87(chain: Vec<Vec<u8>>, key: crate::mldsa::MlDsa87PrivateKey) -> Self {
         ClientCertConfig {
             chain,
@@ -180,8 +186,11 @@ impl ClientCertConfig {
             },
             ClientKey::Ed25519(_) => SignatureScheme::ED25519,
             ClientKey::Ed448(_) => SignatureScheme::ED448,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa87(_) => SignatureScheme::MLDSA87,
             // Representative only; the concrete scheme is negotiated against the
             // server's CertificateRequest.
@@ -3251,12 +3260,15 @@ impl ClientConnection {
             // both deterministic and hedged modes; the client has no RNG
             // to thread here). The resulting signature still verifies under
             // the standard ML-DSA verify routine.
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa44(k) => k
                 .sign_deterministic(&content, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa65(k) => k
                 .sign_deterministic(&content, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&content, b"")
                 .map_err(|_| Error::HandshakeFailure)?,

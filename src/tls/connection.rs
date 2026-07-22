@@ -132,7 +132,9 @@ pub struct Connection {
     inner: Engine,
     /// Pending outbound DTLS datagrams; [`Connection::pop`] returns one per
     /// call. Empty for TLS engines, which return their entire write buffer
-    /// in one call.
+    /// in one call. Always constructed (keeps the connection constructors
+    /// uniform); only read on the DTLS paths, hence dead when `dtls` is off.
+    #[cfg_attr(not(feature = "dtls"), allow(dead_code))]
     pending_dtls: alloc::collections::VecDeque<Vec<u8>>,
     /// Transparent pluggable signer (from [`Config::signer`]), brokered by
     /// [`Connection::drive`]. `None` when the identity signs in-process.
@@ -160,12 +162,16 @@ enum Engine {
     /// if the server selects TLS 1.2.
     ClientTlsAuto(Box<ClientConnectionAuto>),
     /// DTLS 1.3 client.
+    #[cfg(feature = "dtls")]
     ClientDtls13(Box<crate::dtls::DtlsClientConnection13>),
     /// DTLS 1.2 client.
+    #[cfg(feature = "dtls")]
     ClientDtls12(Box<crate::dtls::DtlsClientConnection12>),
     /// DTLS 1.3 server.
+    #[cfg(feature = "dtls")]
     ServerDtls13(Box<crate::dtls::DtlsServerConnection13<ConfigRng>>),
     /// DTLS 1.2 server.
+    #[cfg(feature = "dtls")]
     ServerDtls12(Box<crate::dtls::DtlsServerConnection12<ConfigRng>>),
 }
 
@@ -624,9 +630,11 @@ impl Connection {
             ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3 => {
                 Engine::ClientTls12(Box::new(build_tls12_client(config)?))
             }
+            #[cfg(feature = "dtls")]
             ProtocolVersion::DTLSv1_3 => {
                 Engine::ClientDtls13(Box::new(build_dtls13_client(config)?))
             }
+            #[cfg(feature = "dtls")]
             ProtocolVersion::DTLSv1_2 => {
                 Engine::ClientDtls12(Box::new(build_dtls12_client(config)?))
             }
@@ -676,9 +684,11 @@ impl Connection {
             ProtocolVersion::TLSv1_1 | ProtocolVersion::TLSv1_0 | ProtocolVersion::SSLv3 => {
                 Engine::ServerTls12(Box::new(build_tls12_server(config)?))
             }
+            #[cfg(feature = "dtls")]
             ProtocolVersion::DTLSv1_3 => {
                 Engine::ServerDtls13(Box::new(build_dtls13_server(config)?))
             }
+            #[cfg(feature = "dtls")]
             ProtocolVersion::DTLSv1_2 => {
                 Engine::ServerDtls12(Box::new(build_dtls12_server(config)?))
             }
@@ -698,6 +708,7 @@ impl Connection {
             return Ok(HandshakeStatus::Complete);
         }
         // Refill DTLS pending queue.
+        #[cfg(feature = "dtls")]
         self.refill_dtls_pending();
         if self.wants_write() {
             Ok(HandshakeStatus::WantWrite)
@@ -783,6 +794,7 @@ impl Connection {
         // leaving the peer waiting forever. Prioritising the write here makes
         // `drive` fully flush the final flight first.
         if self.wants_write() {
+            #[cfg(feature = "dtls")]
             self.refill_dtls_pending();
             return Ok(Step::WantWrite);
         }
@@ -807,7 +819,9 @@ impl Connection {
         let pending = match &self.inner {
             Engine::ServerTls13(c) => c.pending_signature(),
             Engine::ClientTls13(c) => c.pending_signature(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.pending_signature(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.pending_signature(),
             Engine::ServerTlsAuto(c) => c.pending_signature(),
             Engine::ClientTlsAuto(c) => c.pending_signature(),
@@ -826,7 +840,9 @@ impl Connection {
         match &mut self.inner {
             Engine::ServerTls13(c) => c.provide_signature(signature),
             Engine::ClientTls13(c) => c.provide_signature(signature),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.provide_signature(signature),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.provide_signature(signature),
             Engine::ServerTlsAuto(c) => c.provide_signature(signature),
             Engine::ClientTlsAuto(c) => c.provide_signature(signature),
@@ -856,12 +872,17 @@ impl Connection {
             }
             Engine::ServerTlsAuto(c) => c.feed(wire_in)?,
             Engine::ClientTlsAuto(c) => c.feed(wire_in)?,
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.feed_datagram(wire_in)?,
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.feed_datagram(wire_in)?,
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.feed_datagram(wire_in)?,
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.feed_datagram(wire_in)?,
         }
         // Eagerly pull DTLS datagrams into the buffer.
+        #[cfg(feature = "dtls")]
         self.refill_dtls_pending();
         Ok(wire_in.len())
     }
@@ -876,13 +897,18 @@ impl Connection {
             Engine::ServerTls12(c) => c.write_tls(),
             Engine::ServerTlsAuto(c) => c.write_tls(),
             Engine::ClientTlsAuto(c) => c.write_tls(),
+            #[cfg(feature = "dtls")]
             _ => {
                 // Refill if buffer empty, then pop the next datagram.
                 if self.pending_dtls.is_empty() {
                     let drained = match &mut self.inner {
+                        #[cfg(feature = "dtls")]
                         Engine::ClientDtls12(c) => c.pop_outbound_datagrams(),
+                        #[cfg(feature = "dtls")]
                         Engine::ClientDtls13(c) => c.pop_outbound_datagrams(),
+                        #[cfg(feature = "dtls")]
                         Engine::ServerDtls12(c) => c.pop_outbound_datagrams(),
+                        #[cfg(feature = "dtls")]
                         Engine::ServerDtls13(c) => c.pop_outbound_datagrams(),
                         _ => Vec::new(),
                     };
@@ -905,9 +931,13 @@ impl Connection {
             Engine::ServerTls12(c) => c.send_application_data(app),
             Engine::ServerTlsAuto(c) => c.send_application_data(app),
             Engine::ClientTlsAuto(c) => c.send_application_data(app),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.send(app),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.send(app),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.send(app),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.send(app),
         }
     }
@@ -921,9 +951,13 @@ impl Connection {
             Engine::ServerTls12(c) => c.take_received_plaintext(),
             Engine::ServerTlsAuto(c) => c.take_received_plaintext(),
             Engine::ClientTlsAuto(c) => c.take_received_plaintext(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.take_received(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.take_received(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.take_received(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.take_received(),
         })
     }
@@ -969,9 +1003,13 @@ impl Connection {
             Engine::ServerTls12(c) => c.tls_exporter(label, ctx12, out),
             Engine::ServerTlsAuto(c) => c.tls_exporter(label, context, out),
             Engine::ClientTlsAuto(c) => c.tls_exporter(label, context, out),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.tls_exporter(label, ctx12, out),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.tls_exporter(label, context, out),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.tls_exporter(label, ctx12, out),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.tls_exporter(label, context, out),
         }
     }
@@ -1020,6 +1058,7 @@ impl Connection {
             Engine::ClientTlsAuto(c) => c.close(),
             // DTLS in this library does not emit an explicit close_notify
             // through its public API; the connection is closed when freed.
+            #[cfg(feature = "dtls")]
             _ => {}
         }
         Ok(())
@@ -1034,9 +1073,13 @@ impl Connection {
             Engine::ServerTls12(c) => !c.is_handshaking(),
             Engine::ServerTlsAuto(c) => !c.is_handshaking(),
             Engine::ClientTlsAuto(c) => !c.is_handshaking(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.is_handshake_complete(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.is_handshake_complete(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.is_handshake_complete(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.is_handshake_complete(),
         }
     }
@@ -1061,6 +1104,7 @@ impl Connection {
             Engine::ServerTls12(c) => c.received_close_notify(),
             Engine::ServerTlsAuto(c) => c.received_close_notify(),
             Engine::ClientTlsAuto(c) => c.received_close_notify(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(_)
             | Engine::ClientDtls13(_)
             | Engine::ServerDtls12(_)
@@ -1079,7 +1123,9 @@ impl Connection {
             Engine::ServerTls12(c) => c.negotiated_protocol_version(),
             Engine::ServerTlsAuto(c) => c.negotiated_version(),
             Engine::ClientTlsAuto(c) => c.negotiated_version(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(_) | Engine::ServerDtls12(_) => Some(ProtocolVersion::DTLSv1_2),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(_) | Engine::ServerDtls13(_) => Some(ProtocolVersion::DTLSv1_3),
         }
     }
@@ -1101,9 +1147,13 @@ impl Connection {
             Engine::ServerTls12(c) => c.negotiated_cipher_suite(),
             Engine::ServerTlsAuto(c) => c.negotiated_cipher_suite(),
             Engine::ClientTlsAuto(c) => c.negotiated_cipher_suite(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.negotiated_cipher_suite(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.negotiated_cipher_suite(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.negotiated_cipher_suite(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.negotiated_cipher_suite(),
         }
     }
@@ -1125,7 +1175,11 @@ impl Connection {
             Engine::ServerTls12(c) => c.alpn_protocol(),
             Engine::ServerTlsAuto(c) => c.alpn_protocol(),
             Engine::ClientTlsAuto(c) => c.alpn_protocol(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.alpn_protocol(),
+            // Reachable only when `dtls` is enabled (catches the DTLS variants
+            // not handled above); exhaustive over the TLS variants otherwise.
+            #[cfg_attr(not(feature = "dtls"), allow(unreachable_patterns))]
             _ => None,
         }
     }
@@ -1152,7 +1206,11 @@ impl Connection {
             Engine::ServerTls12(c) => c.peer_certificates(),
             Engine::ServerTlsAuto(c) => c.peer_certificates(),
             Engine::ClientTlsAuto(c) => c.peer_certificates(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.peer_certificates(),
+            // Reachable only when `dtls` is enabled (catches the DTLS variants
+            // not handled above); exhaustive over the TLS variants otherwise.
+            #[cfg_attr(not(feature = "dtls"), allow(unreachable_patterns))]
             _ => &[],
         }
     }
@@ -1160,9 +1218,13 @@ impl Connection {
     /// DTLS: next retransmit timeout. None on TLS variants.
     pub fn next_timeout(&self) -> Option<Duration> {
         match &self.inner {
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.next_timeout(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.next_timeout(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.next_timeout(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.next_timeout(),
             _ => None,
         }
@@ -1170,11 +1232,16 @@ impl Connection {
 
     /// DTLS: notify the engine that the retransmit deadline has elapsed.
     /// No-op on TLS variants.
+    #[cfg_attr(not(feature = "dtls"), allow(unused_variables))]
     pub fn on_timeout(&mut self, now: Duration) {
         match &mut self.inner {
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.on_timeout(now),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.on_timeout(now),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.on_timeout(now),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.on_timeout(now),
             _ => {}
         }
@@ -1189,17 +1256,23 @@ impl Connection {
             Engine::ServerTlsAuto(c) => c.wants_write(),
             Engine::ClientTlsAuto(c) => c.wants_write(),
             // DTLS: any pending datagram counts as wanting-write.
+            #[cfg(feature = "dtls")]
             _ => !self.pending_dtls.is_empty(),
         }
     }
 
     /// Drain new outbound datagrams from the DTLS engine into the pending
     /// buffer. No-op for TLS variants.
+    #[cfg(feature = "dtls")]
     fn refill_dtls_pending(&mut self) {
         let drained: Vec<Vec<u8>> = match &mut self.inner {
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.pop_outbound_datagrams(),
+            #[cfg(feature = "dtls")]
             Engine::ClientDtls13(c) => c.pop_outbound_datagrams(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls12(c) => c.pop_outbound_datagrams(),
+            #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.pop_outbound_datagrams(),
             _ => return,
         };
@@ -1391,12 +1464,15 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
         super::config::SigningKey::Ed448(k) => {
             super::conn::ServerConfig::with_ed448(chain, k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa44(k) => {
             super::conn::ServerConfig::with_mldsa44(chain, k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa65(k) => {
             super::conn::ServerConfig::with_mldsa65(chain, k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa87(k) => {
             super::conn::ServerConfig::with_mldsa87(chain, k.clone())
         }
@@ -1498,6 +1574,7 @@ fn build_tls12_server(cfg: &Config) -> Result<super::conn::ServerConnection12<Co
     Ok(super::conn::ServerConnection12::new(sc, config_rng(cfg)?))
 }
 
+#[cfg(feature = "dtls")]
 fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection12, Error> {
     let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig12Internal::new(cfg.roots.clone_store(), server_name);
@@ -1519,6 +1596,7 @@ fn build_dtls12_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     ))
 }
 
+#[cfg(feature = "dtls")]
 fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection13, Error> {
     let server_name = client_server_name(cfg)?;
     let mut dc = crate::dtls::ClientConfig13Internal::new(cfg.roots.clone_store(), server_name);
@@ -1541,6 +1619,7 @@ fn build_dtls13_client(cfg: &Config) -> Result<crate::dtls::DtlsClientConnection
     ))
 }
 
+#[cfg(feature = "dtls")]
 fn build_dtls12_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection12<ConfigRng>, Error> {
@@ -1582,6 +1661,7 @@ fn build_dtls12_server(
     ))
 }
 
+#[cfg(feature = "dtls")]
 fn build_dtls13_server(
     cfg: &Config,
 ) -> Result<crate::dtls::DtlsServerConnection13<ConfigRng>, Error> {
@@ -1623,12 +1703,15 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
         super::config::SigningKey::Ed448(k) => {
             super::conn::ClientCertConfig::with_ed448(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa44(k) => {
             super::conn::ClientCertConfig::with_mldsa44(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa65(k) => {
             super::conn::ClientCertConfig::with_mldsa65(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         super::config::SigningKey::MlDsa87(k) => {
             super::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
         }

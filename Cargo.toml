@@ -57,6 +57,11 @@ key = ["rng", "alloc", "der"]
 # On other Linux arches the feature is a no-op and OsRng falls back to
 # /dev/urandom.
 linux-getrandom = ["rng", "std"]
+# Opt-in: on `wasm32-wasip1`, provide `rng::OsRng` backed by the WASI
+# preview-1 `wasi_snapshot_preview1::random_get` import. On the browser target
+# (`wasm32-unknown-unknown`) `OsRng` is instead backed by an embedder-supplied
+# `purecrypto.random_get` host import and needs no feature. See `src/rng/wasm.rs`.
+wasi-getrandom = ["rng"]
 rsa = ["bignum", "rng", "hash"]
 # hazmat: low-level secp256k1 scalar / point arithmetic + compressed SEC1 codec.
 # NO semver-stability guarantee; off by default. Caller owns correctness and
@@ -238,6 +243,11 @@ name = "bench"
 required-features = ["std", "cipher", "hash", "ec", "rsa", "mlkem", "aez"]
 
 [lints.rust]
+# `fullrust` is a custom, out-of-tree `target_os` (a libc-free Linux
+# environment) that the `rng::OsRng` fullrust backend compiles for. Register it
+# so those `#[cfg(target_os = "fullrust")]` blocks don't trip the
+# `unexpected_cfgs` lint under `-D warnings` when building for the usual targets.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("fullrust"))'] }
 # Constant-time correctness depends on disciplined arithmetic; keep the
 # foundation honest.
 missing_docs = "warn"

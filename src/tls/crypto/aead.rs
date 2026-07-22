@@ -171,7 +171,8 @@ impl RecordCrypter {
 
     /// Per-record nonce for an externally-supplied sequence number. Mirrors
     /// [`Self::next_nonce`] but does not advance the internal counter — used
-    /// by DTLS where seq is record-layer state, not crypter state.
+    /// by DTLS and QUIC where seq is record-layer state, not crypter state.
+    #[cfg(any(feature = "dtls", feature = "quic"))]
     fn nonce_for(&self, seq: u64) -> [u8; 12] {
         let mut nonce = self.iv;
         let s = seq.to_be_bytes();
@@ -187,6 +188,7 @@ impl RecordCrypter {
     /// Intended for DTLS 1.3 (RFC 9147 §4.2.1), where the AAD is the
     /// caller-supplied unified-header bytes and the per-record sequence
     /// number is tracked by the record layer instead of the crypter.
+    #[cfg(any(feature = "dtls", feature = "quic"))]
     pub(crate) fn encrypt_raw(
         &mut self,
         seq: u64,
@@ -201,6 +203,7 @@ impl RecordCrypter {
     /// by the caller (DTLS reconstructs it from the masked wire value);
     /// `aad` is the unified-header bytes; `buf` carries the ciphertext and
     /// is decrypted in place.
+    #[cfg(any(feature = "dtls", feature = "quic"))]
     pub(crate) fn decrypt_raw(
         &mut self,
         seq: u64,

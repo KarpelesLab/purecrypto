@@ -60,8 +60,11 @@ pub(crate) fn signature_scheme_for(key: &ServerKey) -> SignatureScheme {
         },
         ServerKey::Ed25519(_) => SignatureScheme::ED25519,
         ServerKey::Ed448(_) => SignatureScheme::ED448,
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa44(_) => SignatureScheme::MLDSA44,
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa65(_) => SignatureScheme::MLDSA65,
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa87(_) => SignatureScheme::MLDSA87,
         // External keys advertise a list; the concrete scheme is negotiated
         // against the peer's offer at handshake time (the engine stores it and
@@ -103,12 +106,15 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
         ServerKey::Ed448(k) => k.sign(content).to_bytes().to_vec(),
         // ML-DSA: raw FIPS 204 signature bytes; no DER wrapping. Hedged
         // with the supplied RNG.
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa44(k) => k
             .sign(rng, content, b"")
             .map_err(|_| Error::HandshakeFailure)?,
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa65(k) => k
             .sign(rng, content, b"")
             .map_err(|_| Error::HandshakeFailure)?,
+        #[cfg(feature = "mldsa")]
         ServerKey::MlDsa87(k) => k
             .sign(rng, content, b"")
             .map_err(|_| Error::HandshakeFailure)?,

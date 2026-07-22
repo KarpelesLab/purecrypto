@@ -2160,12 +2160,15 @@ impl ClientConnection12 {
             }
             ClientKey::Ed25519(k) => k.sign(&to_sign).to_bytes().to_vec(),
             ClientKey::Ed448(k) => k.sign(&to_sign).to_bytes().to_vec(),
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa44(k) => k
                 .sign_deterministic(&to_sign, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa65(k) => k
                 .sign_deterministic(&to_sign, b"")
                 .map_err(|_| Error::HandshakeFailure)?,
+            #[cfg(feature = "mldsa")]
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&to_sign, b"")
                 .map_err(|_| Error::HandshakeFailure)?,

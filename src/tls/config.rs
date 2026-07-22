@@ -48,10 +48,13 @@ pub enum SigningKey {
     /// Ed448 key (TLS 1.3 only).
     Ed448(Ed448PrivateKey),
     /// ML-DSA-44 (FIPS 204, draft-ietf-tls-mldsa).
+    #[cfg(feature = "mldsa")]
     MlDsa44(crate::mldsa::MlDsa44PrivateKey),
     /// ML-DSA-65.
+    #[cfg(feature = "mldsa")]
     MlDsa65(crate::mldsa::MlDsa65PrivateKey),
     /// ML-DSA-87.
+    #[cfg(feature = "mldsa")]
     MlDsa87(crate::mldsa::MlDsa87PrivateKey),
     /// An **external** signing key: no key material is held in-process. When the
     /// handshake needs the `CertificateVerify` (or DTLS 1.2 `ServerKeyExchange`)
@@ -371,7 +374,17 @@ pub trait EntropySource: Send + Sync {
 /// `.rng(alloc::sync::Arc::new(OsRng))`. There is no implicit default: a
 /// sans-I/O engine takes entropy as an input, so the source is always chosen
 /// by the caller.
-#[cfg(all(feature = "std", any(unix, windows)))]
+#[cfg(all(
+    feature = "std",
+    any(
+        unix,
+        windows,
+        target_os = "fullrust",
+        // wasm: matches the targets for which `rng::OsRng` is defined.
+        all(target_arch = "wasm32", target_os = "unknown"),
+        all(target_arch = "wasm32", target_os = "wasi", feature = "wasi-getrandom"),
+    )
+))]
 impl EntropySource for crate::rng::OsRng {
     fn fill(&self, dest: &mut [u8]) {
         use crate::rng::RngCore;
@@ -821,8 +834,11 @@ impl SigningKey {
             SigningKey::Ecdsa(k) => super::conn::ServerKey::Ecdsa(k.clone()),
             SigningKey::Ed25519(k) => super::conn::ServerKey::Ed25519(k.clone()),
             SigningKey::Ed448(k) => super::conn::ServerKey::Ed448(k.clone()),
+            #[cfg(feature = "mldsa")]
             SigningKey::MlDsa44(k) => super::conn::ServerKey::MlDsa44(k.clone()),
+            #[cfg(feature = "mldsa")]
             SigningKey::MlDsa65(k) => super::conn::ServerKey::MlDsa65(k.clone()),
+            #[cfg(feature = "mldsa")]
             SigningKey::MlDsa87(k) => super::conn::ServerKey::MlDsa87(k.clone()),
             SigningKey::External { schemes } => super::conn::ServerKey::External {
                 schemes: schemes

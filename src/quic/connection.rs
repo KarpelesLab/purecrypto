@@ -4160,8 +4160,11 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
         crate::tls::SigningKey::Ecdsa(k) => ServerConfig::with_ecdsa(chain, k.clone()),
         crate::tls::SigningKey::Ed25519(k) => ServerConfig::with_ed25519(chain, k.clone()),
         crate::tls::SigningKey::Ed448(k) => ServerConfig::with_ed448(chain, k.clone()),
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa44(k) => ServerConfig::with_mldsa44(chain, k.clone()),
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa65(k) => ServerConfig::with_mldsa65(chain, k.clone()),
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa87(k) => ServerConfig::with_mldsa87(chain, k.clone()),
         // External (suspend/resume) signing is not wired through the QUIC
         // driver — the QUIC connection has no `provide_signature` resume path —
@@ -4198,12 +4201,15 @@ fn client_cert_from_signing(
         crate::tls::SigningKey::Ed448(k) => {
             crate::tls::conn::ClientCertConfig::with_ed448(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa44(k) => {
             crate::tls::conn::ClientCertConfig::with_mldsa44(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa65(k) => {
             crate::tls::conn::ClientCertConfig::with_mldsa65(id.cert_chain.clone(), k.clone())
         }
+        #[cfg(feature = "mldsa")]
         crate::tls::SigningKey::MlDsa87(k) => {
             crate::tls::conn::ClientCertConfig::with_mldsa87(id.cert_chain.clone(), k.clone())
         }

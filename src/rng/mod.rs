@@ -22,6 +22,28 @@ mod hmac_drbg;
 #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]
 mod linux_getrandom;
 
+// WebAssembly entropy backends. `wasm32` has no ambient OS CSPRNG, so `OsRng`
+// routes to the host: an imported function on `wasm32-unknown-unknown`, or
+// `wasi_snapshot_preview1::random_get` on `wasm32-wasip1` (feature
+// `wasi-getrandom`). The gate matches exactly one available backend so the
+// `wasm` module never compiles without one.
+#[cfg(all(
+    target_arch = "wasm32",
+    any(
+        target_os = "unknown",
+        all(target_os = "wasi", feature = "wasi-getrandom"),
+    )
+))]
+mod wasm;
+#[cfg(all(
+    target_arch = "wasm32",
+    any(
+        target_os = "unknown",
+        all(target_os = "wasi", feature = "wasi-getrandom"),
+    )
+))]
+pub use wasm::OsRng;
+
 pub use hmac_drbg::HmacDrbg;
 
 /// A source of random bytes.
@@ -95,6 +117,32 @@ impl<T: RngCore + CryptoRng + ?Sized> CryptoRngCore for T {}
 #[cfg(all(feature = "std", unix))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OsRng;
+
+/// Operating-system entropy source for the `fullrust` target (libc-free Linux).
+///
+/// Reads `/dev/urandom` through plain `std::fs`; `File::open` is `O_CLOEXEC` on
+/// this target, so the fd is not inherited across `execve(2)` — the same
+/// guarantee the unix path pins explicitly with `custom_flags`. `fullrust` is
+/// not a member of the `unix` family, so it needs its own `OsRng` here.
+#[cfg(all(feature = "std", target_os = "fullrust"))]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OsRng;
+
+#[cfg(all(feature = "std", target_os = "fullrust"))]
+impl RngCore for OsRng {
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        use std::io::Read;
+        if dest.is_empty() {
+            return;
+        }
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(dest))
+            .expect("OsRng: reading /dev/urandom failed");
+    }
+}
+
+#[cfg(all(feature = "std", target_os = "fullrust"))]
+impl CryptoRng for OsRng {}
 
 // Per-thread cached `/dev/urandom` file handle. Keep one open file per
 // thread to avoid the open/close overhead that dominates the cost of a
