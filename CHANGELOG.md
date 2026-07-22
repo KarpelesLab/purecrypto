@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.28](https://github.com/KarpelesLab/purecrypto/compare/v0.6.27...v0.6.28) - 2026-07-22
+
+### Other
+
+- X.509 analyzer tool
+- pc_cert_analyze — JSON summary of an X.509 certificate
+- real crypto tools + fix static ML-DSA demo
+- JS-friendly CSR-to-PEM wrappers for EC / Ed25519 / RSA
+- WebAssembly demo site + GitHub Pages deploy
+- add pc_malloc / pc_free for WebAssembly hosts
+- wasm support + modular TLS (mldsa/dtls opt-out)
+
 ## [0.6.27](https://github.com/KarpelesLab/purecrypto/compare/v0.6.26...v0.6.27) - 2026-07-10
 
 ### Other
