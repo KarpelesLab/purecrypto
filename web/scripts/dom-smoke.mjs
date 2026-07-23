@@ -58,6 +58,8 @@ const cardBy = (id) => [...doc.querySelectorAll('.demo')].find((c) => c.textCont
 
 check('app mounted (hero headline present)', /live in your browser/i.test(text));
 check('capability matrix rendered', /Post-quantum/.test(text) && /TLS 1\.2 \/ 1\.3/.test(text));
+check('philosophy section rendered', !!$('#philosophy') && /Nothing foreign to trust/.test(text)
+  && /No foreign code/.test(text) && /Runs where Rust runs/.test(text));
 check('wasm reached ready state', !!$('.status[data-s="ready"]'));
 check('hero produced a live digest (hex bytes)', doc.querySelectorAll('.instrument .byte').length >= 16
   && /[0-9a-f]{2}/.test($('.instrument .byte')?.textContent || ''));

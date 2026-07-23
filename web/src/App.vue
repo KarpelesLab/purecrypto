@@ -4,7 +4,7 @@ import HeroSection from './components/HeroSection.vue';
 import CapabilityMatrix from './components/CapabilityMatrix.vue';
 import DemosSection from './components/DemosSection.vue';
 import ToolsSection from './components/ToolsSection.vue';
-import PrinciplesSection from './components/PrinciplesSection.vue';
+import PhilosophySection from './components/PhilosophySection.vue';
 import SiteFooter from './components/SiteFooter.vue';
 </script>
 
@@ -16,7 +16,7 @@ import SiteFooter from './components/SiteFooter.vue';
     <CapabilityMatrix />
     <DemosSection />
     <ToolsSection />
-    <PrinciplesSection />
+    <PhilosophySection />
   </main>
   <SiteFooter />
 </template>

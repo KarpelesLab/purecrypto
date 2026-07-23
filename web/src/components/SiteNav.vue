@@ -13,7 +13,7 @@ import { state } from '../store.js';
         <a href="#capabilities">Capabilities</a>
         <a href="#demos">Live demos</a>
         <a href="#tools">Tools</a>
-        <a href="#principles">Principles</a>
+        <a href="#philosophy">Philosophy</a>
       </nav>
       <div class="nav-right">
         <span class="status" :data-s="state.status">
