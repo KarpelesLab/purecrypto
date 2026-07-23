@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.29](https://github.com/KarpelesLab/purecrypto/compare/v0.6.28...v0.6.29) - 2026-07-23
+
+### Other
+
+- fuller philosophy section
+
 ## [0.6.28](https://github.com/KarpelesLab/purecrypto/compare/v0.6.27...v0.6.28) - 2026-07-22
 
 ### Other
