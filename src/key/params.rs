@@ -19,36 +19,22 @@
 
 use crate::key::Error;
 
-/// A hash function, selected at runtime.
+/// A hash function, selected at runtime — the crate-wide
+/// [`HashAlgorithm`](crate::hash::HashAlgorithm) enum, re-exported here under
+/// the name these parameters use.
 ///
 /// Used by RSA and ECDSA (which are parameterised by a digest) and as the
 /// OAEP/MGF1 hash for RSA encryption. EdDSA and the post-quantum schemes fix
 /// their own internal hash and ignore this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Hash {
-    /// SHA-256.
-    Sha256,
-    /// SHA-384.
-    Sha384,
-    /// SHA-512.
-    Sha512,
-    /// SHA-1 — legacy verification and interop only; do not use for new
-    /// signatures.
-    Sha1,
-}
-
-impl Hash {
-    /// The digest output length in bytes.
-    pub fn output_len(self) -> usize {
-        match self {
-            Hash::Sha256 => 32,
-            Hash::Sha384 => 48,
-            Hash::Sha512 => 64,
-            Hash::Sha1 => 20,
-        }
-    }
-}
+///
+/// The enum names every digest the crate implements, but a *signature* scheme
+/// accepts only the subset it has a standardised encoding for: through this
+/// facade RSA and ECDSA take SHA-1 and SHA-224/256/384/512, and anything else
+/// fails with [`Error::UnsupportedParam`](crate::key::Error::UnsupportedParam)
+/// naming `hash`. The generic per-algorithm APIs (e.g.
+/// [`sign_pss::<D>`](crate::rsa::RsaPrivateKey::sign_pss)) remain open to any
+/// [`Digest`](crate::hash::Digest).
+pub use crate::hash::HashAlgorithm as Hash;
 
 /// RSA signature padding scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

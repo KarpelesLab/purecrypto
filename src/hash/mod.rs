@@ -31,7 +31,36 @@
 //! [`verify`](Mac::verify)): [`Hmac`], [`Kmac128`], [`Kmac256`],
 //! [`Blake2bMac`], [`Blake2sMac`]. Keyed constructions wipe their key-derived
 //! state on drop.
+//!
+//! # Choosing the hash at runtime
+//!
+//! [`Digest`] fixes the algorithm at compile time. When it instead arrives from
+//! a certificate, a protocol field, a config file, or the C ABI, name it with
+//! the [`HashAlgorithm`] enum: it covers every fixed-output digest above,
+//! carries the output/block lengths and canonical names, and hands out a
+//! [`Hasher`] holding the concrete state (inline — no allocation). [`DynDigest`]
+//! is the `dyn`-compatible trait both [`Hasher`] and every concrete hasher
+//! implement, so generic code can take a `&mut dyn DynDigest` and not care
+//! which it got.
+//!
+//! The one-shot helpers take anything byte-like and the [`Hasher`] is a write
+//! target, so the common shapes are one line each:
+//!
+//! ```
+//! # use purecrypto::hash::HashAlgorithm;
+//! let alg = HashAlgorithm::Sha256;
+//! let a = alg.digest("a string");            // &str / String / Vec<u8> / [u8; N]
+//! let b = alg.digest_parts([&b"two"[..], &b"parts"[..]]);
+//! let c = alg.hasher().chain("a").chain(b"b").finalize();
+//! # let _ = (a, b, c);
+//! # #[cfg(feature = "std")] {
+//! let mut h = alg.hasher();
+//! std::io::copy(&mut std::io::Cursor::new(&b"a stream"[..]), &mut h).unwrap();
+//! println!("{}", h.finalize());              // lowercase hex
+//! # }
+//! ```
 
+mod algorithm;
 mod blake2;
 mod blake3;
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
@@ -65,6 +94,13 @@ mod streebog;
 mod whirlpool;
 mod zeroize;
 
+// Used by `ascon::AsconHash256` (its own feature), so unused in a build
+// without it.
+#[cfg_attr(not(feature = "ascon"), allow(unused_imports))]
+pub(crate) use algorithm::impl_dyn_digest;
+pub use algorithm::{
+    DynDigest, HashAlgorithm, HashOutput, Hasher, InvalidOutputLen, UnknownHashAlgorithm,
+};
 pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
     Blake2xbReader, Blake2xs, Blake2xsReader, blake2b256, blake2b384, blake2b512, blake2s256,

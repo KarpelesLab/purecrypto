@@ -2,40 +2,24 @@
 
 use crate::util::{Args, die, parse_hex_flag, parse_usize_flag, read_input, to_hex, write_output};
 use purecrypto::ascon::{AsconCxof128, AsconHash256, AsconXof128};
-use purecrypto::hash::{self, Digest, ExtendableOutput, XofReader};
+use purecrypto::hash::{self, Digest, ExtendableOutput, HashAlgorithm, XofReader};
 
 /// Computes the digest of `data` under the named algorithm.
 fn digest(alg: &str, data: &[u8]) -> Option<Vec<u8>> {
+    // Everything the `hash::HashAlgorithm` registry names — SHA-2, SHA-3,
+    // BLAKE2/3, SM3, Streebog, Whirlpool, and the legacy digests — resolves by
+    // name, aliases included.
+    if let Some(alg) = HashAlgorithm::from_name(alg) {
+        return Some(alg.digest(data).as_slice().to_vec());
+    }
+    // The two fixed-output digests outside that enum: Ascon (its own feature)
+    // and MarsupilamiFourteen (a XOF taken at its default length).
     let d = match alg.to_ascii_lowercase().as_str() {
-        "sha224" => hash::sha224(data).to_vec(),
-        "sha256" => hash::sha256(data).to_vec(),
-        "sha384" => hash::sha384(data).to_vec(),
-        "sha512" => hash::sha512(data).to_vec(),
-        "sha512-224" => hash::sha512_224(data).to_vec(),
-        "sha512-256" => hash::sha512_256(data).to_vec(),
-        "sha3-224" => hash::sha3_224(data).to_vec(),
-        "sha3-256" => hash::sha3_256(data).to_vec(),
-        "sha3-384" => hash::sha3_384(data).to_vec(),
-        "sha3-512" => hash::sha3_512(data).to_vec(),
-        "keccak256" => hash::keccak256(data).to_vec(),
-        "blake2b256" => hash::blake2b256(data).to_vec(),
-        "blake2b384" => hash::blake2b384(data).to_vec(),
-        "blake2b512" => hash::blake2b512(data).to_vec(),
-        "blake2s256" => hash::blake2s256(data).to_vec(),
-        "blake3" => hash::blake3(data).to_vec(),
-        "sm3" => hash::sm3(data).to_vec(),
         "ascon-hash256" => {
             let mut h = AsconHash256::new();
             h.update(data);
             h.finalize().to_vec()
         }
-        "sha1" => hash::sha1(data).to_vec(),
-        "md2" => hash::md2(data).to_vec(),
-        "md5" => hash::md5(data).to_vec(),
-        "ripemd160" => hash::ripemd160(data).to_vec(),
-        "whirlpool" => hash::whirlpool(data).to_vec(),
-        "streebog256" => hash::streebog256(data).to_vec(),
-        "streebog512" => hash::streebog512(data).to_vec(),
         "m14" => hash::m14(data).to_vec(),
         _ => return None,
     };

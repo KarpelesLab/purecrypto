@@ -165,6 +165,11 @@ impl Drop for AsconHash256 {
     }
 }
 
+// Also usable through the runtime-dispatch `hash::DynDigest` interface. It has
+// no `hash::HashAlgorithm` variant (that enum covers `hash` only, and Ascon is
+// behind its own feature), so `DynDigest::algorithm` reports `None`.
+crate::hash::impl_dyn_digest!(AsconHash256);
+
 /// Ascon-XOF128 (NIST SP 800-232 §5.2): an extendable-output function with up
 /// to 128-bit security strength.
 #[derive(Clone)]

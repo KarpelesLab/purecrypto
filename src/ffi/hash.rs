@@ -6,10 +6,9 @@ use alloc::vec::Vec;
 use super::common::{PcStatus, guard, out_write, slice};
 use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
-    Blake2b256, Blake2b512, Blake2s256, Blake3, Digest, ExtendableOutput, Hmac, HmacSha224,
-    HmacSha256, HmacSha384, HmacSha512, HmacSha512_224, HmacSha512_256, Keccak256, Md2, Md5,
-    Ripemd160, Sha1, Sha3_224, Sha3_256, Sha3_384, Sha3_512, Sha224, Sha256, Sha384, Sha512,
-    Sha512_224, Sha512_256, Sm3, Streebog256, Streebog512, Whirlpool, XofReader,
+    Digest, ExtendableOutput, HashAlgorithm, Hasher, Hmac, HmacSha224, HmacSha256, HmacSha384,
+    HmacSha512, HmacSha512_224, HmacSha512_256, Md2, Ripemd160, Sha1, Sha3_224, Sha3_256, Sha3_384,
+    Sha3_512, Sm3, Streebog256, Streebog512, Whirlpool, XofReader,
 };
 
 /// Hash algorithm identifiers (mirror `PcHashId` in `purecrypto.h`).
@@ -41,132 +40,64 @@ pub mod id {
     pub const STREEBOG512: i32 = 24;
 }
 
-/// A runtime-selected hasher. (BLAKE3 carries a larger tree state than the
-/// others, but the context is heap-allocated once via `pc_hash_new`.)
+/// A runtime-selected hasher: either one of the algorithms
+/// [`HashAlgorithm`] names, or Ascon-Hash256 (which lives behind the `ascon`
+/// feature and so is not in that enum).
+///
+/// `Hasher` holds the widest hasher state inline (BLAKE3's chunk stack
+/// dominates), but the context is heap-allocated once by `pc_hash_new`.
 #[allow(clippy::large_enum_variant)]
 enum AnyHasher {
-    Sha224(Sha224),
-    Sha256(Sha256),
-    Sha384(Sha384),
-    Sha512(Sha512),
-    Sha512_224(Sha512_224),
-    Sha512_256(Sha512_256),
-    Sha3_224(Sha3_224),
-    Sha3_256(Sha3_256),
-    Sha3_384(Sha3_384),
-    Sha3_512(Sha3_512),
-    Keccak256(Keccak256),
-    Blake2b256(Blake2b256),
-    Blake2b512(Blake2b512),
-    Blake2s256(Blake2s256),
-    Blake3(Blake3),
-    Sm3(Sm3),
-    Sha1(Sha1),
-    Md5(Md5),
-    Ripemd160(Ripemd160),
-    AsconHash256(AsconHash256),
-    Md2(Md2),
-    Whirlpool(Whirlpool),
-    Streebog256(Streebog256),
-    Streebog512(Streebog512),
+    Alg(Hasher),
+    Ascon(AsconHash256),
 }
 
 impl AnyHasher {
+    /// Maps a `PcHashId` to its hasher, or `None` for an unknown id.
     fn new(alg: i32) -> Option<Self> {
-        Some(match alg {
-            id::SHA224 => AnyHasher::Sha224(Sha224::new()),
-            id::SHA256 => AnyHasher::Sha256(Sha256::new()),
-            id::SHA384 => AnyHasher::Sha384(Sha384::new()),
-            id::SHA512 => AnyHasher::Sha512(Sha512::new()),
-            id::SHA512_224 => AnyHasher::Sha512_224(Sha512_224::new()),
-            id::SHA512_256 => AnyHasher::Sha512_256(Sha512_256::new()),
-            id::SHA3_224 => AnyHasher::Sha3_224(Sha3_224::new()),
-            id::SHA3_256 => AnyHasher::Sha3_256(Sha3_256::new()),
-            id::SHA3_384 => AnyHasher::Sha3_384(Sha3_384::new()),
-            id::SHA3_512 => AnyHasher::Sha3_512(Sha3_512::new()),
-            id::KECCAK256 => AnyHasher::Keccak256(Keccak256::new()),
-            id::BLAKE2B256 => AnyHasher::Blake2b256(Blake2b256::new()),
-            id::BLAKE2B512 => AnyHasher::Blake2b512(Blake2b512::new()),
-            id::BLAKE2S256 => AnyHasher::Blake2s256(Blake2s256::new()),
-            id::BLAKE3 => AnyHasher::Blake3(<Blake3 as Digest>::new()),
-            id::SM3 => AnyHasher::Sm3(Sm3::new()),
-            id::SHA1 => AnyHasher::Sha1(Sha1::new()),
-            id::MD5 => AnyHasher::Md5(Md5::new()),
-            id::RIPEMD160 => AnyHasher::Ripemd160(Ripemd160::new()),
-            id::ASCON_HASH256 => AnyHasher::AsconHash256(AsconHash256::new()),
-            id::MD2 => AnyHasher::Md2(Md2::new()),
-            id::WHIRLPOOL => AnyHasher::Whirlpool(Whirlpool::new()),
-            id::STREEBOG256 => AnyHasher::Streebog256(Streebog256::new()),
-            id::STREEBOG512 => AnyHasher::Streebog512(Streebog512::new()),
+        let alg = match alg {
+            id::SHA224 => HashAlgorithm::Sha224,
+            id::SHA256 => HashAlgorithm::Sha256,
+            id::SHA384 => HashAlgorithm::Sha384,
+            id::SHA512 => HashAlgorithm::Sha512,
+            id::SHA512_224 => HashAlgorithm::Sha512_224,
+            id::SHA512_256 => HashAlgorithm::Sha512_256,
+            id::SHA3_224 => HashAlgorithm::Sha3_224,
+            id::SHA3_256 => HashAlgorithm::Sha3_256,
+            id::SHA3_384 => HashAlgorithm::Sha3_384,
+            id::SHA3_512 => HashAlgorithm::Sha3_512,
+            id::KECCAK256 => HashAlgorithm::Keccak256,
+            id::BLAKE2B256 => HashAlgorithm::Blake2b256,
+            id::BLAKE2B512 => HashAlgorithm::Blake2b512,
+            id::BLAKE2S256 => HashAlgorithm::Blake2s256,
+            id::BLAKE3 => HashAlgorithm::Blake3,
+            id::SM3 => HashAlgorithm::Sm3,
+            id::SHA1 => HashAlgorithm::Sha1,
+            id::MD5 => HashAlgorithm::Md5,
+            id::RIPEMD160 => HashAlgorithm::Ripemd160,
+            id::MD2 => HashAlgorithm::Md2,
+            id::WHIRLPOOL => HashAlgorithm::Whirlpool,
+            id::STREEBOG256 => HashAlgorithm::Streebog256,
+            id::STREEBOG512 => HashAlgorithm::Streebog512,
+            id::ASCON_HASH256 => return Some(AnyHasher::Ascon(AsconHash256::new())),
             _ => return None,
-        })
+        };
+        Some(AnyHasher::Alg(alg.hasher()))
     }
 
     fn update(&mut self, data: &[u8]) {
-        macro_rules! u {
-            ($h:expr) => {
-                $h.update(data)
-            };
-        }
         match self {
-            AnyHasher::Sha224(h) => u!(h),
-            AnyHasher::Sha256(h) => u!(h),
-            AnyHasher::Sha384(h) => u!(h),
-            AnyHasher::Sha512(h) => u!(h),
-            AnyHasher::Sha512_224(h) => u!(h),
-            AnyHasher::Sha512_256(h) => u!(h),
-            AnyHasher::Sha3_224(h) => u!(h),
-            AnyHasher::Sha3_256(h) => u!(h),
-            AnyHasher::Sha3_384(h) => u!(h),
-            AnyHasher::Sha3_512(h) => u!(h),
-            AnyHasher::Keccak256(h) => u!(h),
-            AnyHasher::Blake2b256(h) => u!(h),
-            AnyHasher::Blake2b512(h) => u!(h),
-            AnyHasher::Blake2s256(h) => u!(h),
-            AnyHasher::Blake3(h) => Digest::update(h, data),
-            AnyHasher::Sm3(h) => u!(h),
-            AnyHasher::Sha1(h) => u!(h),
-            AnyHasher::Md5(h) => u!(h),
-            AnyHasher::Ripemd160(h) => u!(h),
-            AnyHasher::AsconHash256(h) => u!(h),
-            AnyHasher::Md2(h) => u!(h),
-            AnyHasher::Whirlpool(h) => u!(h),
-            AnyHasher::Streebog256(h) => u!(h),
-            AnyHasher::Streebog512(h) => u!(h),
+            AnyHasher::Alg(h) => h.update(data),
+            AnyHasher::Ascon(h) => Digest::update(h, data),
         }
     }
 
+    /// The digest of everything absorbed so far, leaving the context usable
+    /// (the C API allows `pc_hash_finish` followed by more updates).
     fn finish(&self) -> Vec<u8> {
-        macro_rules! f {
-            ($h:expr) => {
-                Digest::finalize($h.clone()).as_ref().to_vec()
-            };
-        }
         match self {
-            AnyHasher::Sha224(h) => f!(h),
-            AnyHasher::Sha256(h) => f!(h),
-            AnyHasher::Sha384(h) => f!(h),
-            AnyHasher::Sha512(h) => f!(h),
-            AnyHasher::Sha512_224(h) => f!(h),
-            AnyHasher::Sha512_256(h) => f!(h),
-            AnyHasher::Sha3_224(h) => f!(h),
-            AnyHasher::Sha3_256(h) => f!(h),
-            AnyHasher::Sha3_384(h) => f!(h),
-            AnyHasher::Sha3_512(h) => f!(h),
-            AnyHasher::Keccak256(h) => f!(h),
-            AnyHasher::Blake2b256(h) => f!(h),
-            AnyHasher::Blake2b512(h) => f!(h),
-            AnyHasher::Blake2s256(h) => f!(h),
-            AnyHasher::Blake3(h) => f!(h),
-            AnyHasher::Sm3(h) => f!(h),
-            AnyHasher::Sha1(h) => f!(h),
-            AnyHasher::Md5(h) => f!(h),
-            AnyHasher::Ripemd160(h) => f!(h),
-            AnyHasher::AsconHash256(h) => f!(h),
-            AnyHasher::Md2(h) => f!(h),
-            AnyHasher::Whirlpool(h) => f!(h),
-            AnyHasher::Streebog256(h) => f!(h),
-            AnyHasher::Streebog512(h) => f!(h),
+            AnyHasher::Alg(h) => h.clone().finalize().as_slice().to_vec(),
+            AnyHasher::Ascon(h) => Digest::finalize(h.clone()).as_ref().to_vec(),
         }
     }
 }

@@ -26,6 +26,14 @@ use super::x25519::{X25519PrivateKey, X25519PublicKey};
 /// Runs `$body` with `$d` aliased to the concrete digest named by `$h`
 /// (a [`Hash`]). Bridges the runtime hash selector into the generic
 /// `sign::<D>` / `verify::<D>` methods.
+///
+/// [`Hash`] names every digest the crate implements; ECDSA through this facade
+/// honours the SHA-1 / SHA-2 family that the X.509, TLS and JOSE signature
+/// registries define. Any other digest returns
+/// [`Error::UnsupportedParam`] rather than silently falling back to one that
+/// was not asked for; the generic `sign::<D>` API stays open to any
+/// [`Digest`](crate::hash::Digest). The expansion `return`s, so every use must
+/// sit in a function returning `Result<_, crate::key::Error>`.
 macro_rules! dispatch_hash {
     ($h:expr, |$d:ident| $body:block) => {
         match $h {
@@ -41,10 +49,15 @@ macro_rules! dispatch_hash {
                 type $d = crate::hash::Sha512;
                 $body
             }
+            Hash::Sha224 => {
+                type $d = crate::hash::Sha224;
+                $body
+            }
             Hash::Sha1 => {
                 type $d = crate::hash::Sha1;
                 $body
             }
+            _ => return Err(Error::UnsupportedParam { param: "hash" }),
         }
     };
 }

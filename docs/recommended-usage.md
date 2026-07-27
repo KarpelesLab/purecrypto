@@ -33,6 +33,12 @@ The crate exposes a lot. Most of it you should not reach for. Three tiers:
 
 ## Per-domain
 
+- **Hashing.** Prefer the concrete types (`Sha256`, `Sha3_256`, `Blake3`) so the
+  algorithm is fixed at compile time. When it genuinely comes from outside — a
+  certificate, a protocol field, a config file — name it with
+  `hash::HashAlgorithm` and gate on `is_legacy()`, which flags the digests
+  (MD2/MD4/MD5/SHA-1, RIPEMD-160) that must never back a new signature or
+  commitment.
 - **Symmetric encryption.** Default to `Aes256Gcm` where AES-NI is available,
   `ChaCha20Poly1305` otherwise. If nonce uniqueness is hard to guarantee, use the
   misuse-resistant `AesGcmSiv`/`AesSiv`. For random 192-bit nonces use

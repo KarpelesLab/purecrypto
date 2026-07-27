@@ -401,6 +401,74 @@ fn ecdsa_der_vs_raw_encoding() {
 }
 
 // ----------------------------------------------------------------------------
+// `Hash` is the crate-wide `hash::HashAlgorithm`: the digests RSA/ECDSA have a
+// standardised encoding for work, the rest are rejected loudly
+// ----------------------------------------------------------------------------
+
+#[test]
+fn sha224_is_accepted_by_rsa_and_ecdsa() {
+    let mut r = rng();
+    let params = SignParams::new().hash(Hash::Sha224);
+
+    let sk = crate::test_util::rsa_test_key_a();
+    let pk: Box<dyn PublicKey> = Box::new(sk.public_key());
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let sig = priv_dyn.sign(b"msg", &params, &mut r).expect("rsa sign");
+    pk.verify(b"msg", &sig, &params).expect("rsa verify");
+
+    let sk = crate::ec::ecdsa::EcdsaPrivateKey::generate(&mut r);
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let pk = priv_dyn.public_key().expect("pub");
+    let sig = priv_dyn.sign(b"msg", &params, &mut r).expect("ecdsa sign");
+    pk.verify(b"msg", &sig, &params).expect("ecdsa verify");
+}
+
+#[test]
+fn digests_outside_the_signature_set_are_rejected() {
+    let mut r = rng();
+    // Real digests the crate implements, but with no PKCS#1 / X.509 encoding
+    // behind this facade — they must fail rather than fall back to SHA-256.
+    let unsupported = [Hash::Blake3, Hash::Sha3_256, Hash::Md5, Hash::Streebog512];
+
+    let rsa = crate::test_util::rsa_test_key_a();
+    let rsa_pub: Box<dyn PublicKey> = Box::new(rsa.public_key());
+    let rsa_priv: Box<dyn PrivateKey> = Box::new(rsa);
+    let ec_priv: Box<dyn PrivateKey> =
+        Box::new(crate::ec::ecdsa::EcdsaPrivateKey::generate(&mut r));
+    let ec_pub = ec_priv.public_key().expect("pub");
+
+    for hash in unsupported {
+        let params = SignParams::new().hash(hash);
+        for signer in [&rsa_priv, &ec_priv] {
+            match signer.sign(b"msg", &params, &mut r) {
+                Err(Error::UnsupportedParam { param: "hash" }) => {}
+                other => panic!("{hash}: expected UnsupportedParam(hash), got {other:?}"),
+            }
+        }
+        // Verification rejects it too — a signature must never be checked
+        // under a digest the signer would have refused.
+        for verifier in [&rsa_pub, &ec_pub] {
+            match verifier.verify(b"msg", &[0u8; 64], &params) {
+                Err(Error::UnsupportedParam { param: "hash" }) => {}
+                other => panic!("{hash}: expected UnsupportedParam(hash), got {other:?}"),
+            }
+        }
+
+        // Same for the RSA-OAEP hash/MGF1 selection.
+        let crypt =
+            EncryptParams::new().padding(crate::key::RsaEncPadding::Oaep { hash, mgf1: hash });
+        match rsa_pub.encrypt(b"pt", &crypt, &mut r) {
+            Err(Error::UnsupportedParam { param: "hash" }) => {}
+            other => panic!("{hash}: expected UnsupportedParam(hash), got {other:?}"),
+        }
+        match rsa_priv.decrypt(b"ct", &crypt) {
+            Err(Error::UnsupportedParam { param: "hash" }) => {}
+            other => panic!("{hash}: expected UnsupportedParam(hash), got {other:?}"),
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Object safety: a heterogeneous collection of boxed private keys
 // ----------------------------------------------------------------------------
 

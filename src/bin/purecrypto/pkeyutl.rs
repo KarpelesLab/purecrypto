@@ -132,17 +132,13 @@ fn load_priv_dyn(path: &str) -> Box<dyn KeyPriv> {
 /// previous per-path validation: SHA-1 is rejected for PSS and (when signing)
 /// warned for PKCS#1 v1.5; unknown digests die.
 fn rsa_digest(opts: &Opts, pss: bool, warn_sha1: bool) -> KeyHash {
-    match opts
-        .digest
-        .as_deref()
-        .unwrap_or("sha256")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "sha256" => KeyHash::Sha256,
-        "sha384" => KeyHash::Sha384,
-        "sha512" => KeyHash::Sha512,
-        "sha1" if !pss => {
+    let name = opts.digest.as_deref().unwrap_or("sha256");
+    // `KeyHash` (= `hash::HashAlgorithm`) names every digest the crate
+    // implements; only the SHA-2 family (plus SHA-1, for non-PSS interop) has
+    // an RSA signature encoding behind the key facade.
+    match KeyHash::from_name(name) {
+        Some(h @ (KeyHash::Sha224 | KeyHash::Sha256 | KeyHash::Sha384 | KeyHash::Sha512)) => h,
+        Some(KeyHash::Sha1) if !pss => {
             if warn_sha1 {
                 eprintln!(
                     "purecrypto: warning: digest:sha1 is collision-broken for \
@@ -151,8 +147,8 @@ fn rsa_digest(opts: &Opts, pss: bool, warn_sha1: bool) -> KeyHash {
             }
             KeyHash::Sha1
         }
-        other if pss => die(format!("unsupported RSA-PSS digest: {other}")),
-        other => die(format!("unsupported RSA digest: {other}")),
+        _ if pss => die(format!("unsupported RSA-PSS digest: {name}")),
+        _ => die(format!("unsupported RSA digest: {name}")),
     }
 }
 

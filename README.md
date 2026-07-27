@@ -183,7 +183,9 @@ echo -n abc | purecrypto hash sha3-256       # any algorithm from the `hash` mod
 Algorithms: `sha224`, `sha256`, `sha384`, `sha512`, `sha512-224`, `sha512-256`,
 `sha3-224`, `sha3-256`, `sha3-384`, `sha3-512`, `keccak256`, `blake2b256`,
 `blake2b384`, `blake2b512`, `blake2s256`, `blake3`, `m14`, `sm3`, `whirlpool`,
-`streebog256`, `streebog512`, `sha1`, `md2`, `md5`, `ripemd160`. (The XOFs
+`streebog256`, `streebog512`, `ascon-hash256`, `sha1`, `md2`, `md4`, `md5`,
+`ripemd160` — i.e. every `hash::HashAlgorithm` name (common spellings such as
+`sha-256` or `sha512/256` are accepted too), plus Ascon and M14. (The XOFs
 `shake128`/`shake256` and the BLAKE2X/cSHAKE/KMAC variants are exposed through
 the Rust library, not the CLI.)
 
@@ -419,6 +421,21 @@ the full reference. A few common patterns:
 ```rust
 use purecrypto::hash::{Digest, Sha256};
 let d = Sha256::digest(b"abc");
+
+// Same hash, chosen at runtime: `HashAlgorithm` names every digest in the
+// crate and `Hasher` holds the state inline (no allocation). Both it and the
+// concrete hashers implement `hash::DynDigest`, so generic code can take a
+// `&mut dyn DynDigest` and not care which it got.
+use purecrypto::hash::HashAlgorithm;
+let alg: HashAlgorithm = "sha256".parse().unwrap();
+assert_eq!(alg.output_len(), 32);
+assert_eq!(alg.digest("abc").as_slice(), &d[..]);   // &str / String / Vec<u8> / [u8; N]
+assert_eq!(format!("{}", alg.digest("abc")).len(), 64); // hex via Display
+
+let mut h = alg.hasher();                            // also an io::Write + fmt::Write sink
+h.update(b"a");
+h.update(b"bc");
+assert_eq!(h.finalize().as_slice(), &d[..]);
 
 use purecrypto::ec::Ed25519PrivateKey;
 use purecrypto::rng::OsRng;
