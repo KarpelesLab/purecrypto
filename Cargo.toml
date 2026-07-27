@@ -8,7 +8,7 @@ exclude = ["fuzz", "web"]
 
 [package]
 name = "purecrypto"
-version = "0.6.28"
+version = "0.6.29"
 edition = "2024"
 rust-version = "1.88"
 description = "A pure-Rust cryptography toolkit with no foreign-code dependencies, from constant-time primitives up to keys, X.509 and TLS."
