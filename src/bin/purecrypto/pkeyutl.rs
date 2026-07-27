@@ -1,9 +1,10 @@
 //! `purecrypto pkeyutl` — generic asymmetric encrypt/decrypt/sign/verify.
 
 use crate::util::{Args, SentinelLock, die, read_input, write_output, write_output_with_mode};
+use purecrypto::dispatch_digest;
 use purecrypto::ec::sm2::DEFAULT_ID;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
-use purecrypto::hash::{Sha256, Sha384, Sha512};
+use purecrypto::hash::HashAlgorithm;
 use purecrypto::key::{
     self, Algorithm as KeyAlg, Hash as KeyHash, PrivateKey as KeyPriv, SigEncoding, SignParams,
 };
@@ -25,9 +26,9 @@ purecrypto pkeyutl <subcommand>
   rsa_padding_mode:oaep        OAEP encrypt/decrypt
   rsa_padding_mode:pkcs1       PKCS#1 v1.5 encrypt/decrypt / signature
   rsa_padding_mode:pss         RSA-PSS signature
-  rsa_oaep_md:sha256|sha384|sha512   OAEP hash (default sha256)
+  rsa_oaep_md:NAME             OAEP hash, any `purecrypto hash` name (default sha256)
   rsa_oaep_label:HEX           OAEP label (default empty)
-  digest:sha256|sha384|sha512|sha1   hash for sign/verify (default sha256)
+  digest:sha224|sha256|sha384|sha512|sha1   hash for sign/verify (default sha256)
 
 SM2 (GB/T 32918 / RFC 8998): an SM2 key auto-routes to SM2-DSA (sign/verify,
 DER Ecdsa-Sig-Value) and SM2-PKE (encrypt/decrypt). Use -id STR to override the
@@ -126,6 +127,13 @@ fn load_priv_dyn(path: &str) -> Box<dyn KeyPriv> {
         return k;
     }
     die("unrecognized private key (expected RSA PKCS#1, EC SEC1, or PKCS#8 PEM)");
+}
+
+/// The OAEP digest named by `-pkeyopt rsa_oaep_md:` (default SHA-256),
+/// resolved through the shared `hash::HashAlgorithm` name table.
+fn oaep_md(opts: &Opts) -> HashAlgorithm {
+    let md = opts.oaep_md.as_deref().unwrap_or("sha256");
+    HashAlgorithm::from_name(md).unwrap_or_else(|| die(format!("unsupported rsa_oaep_md: {md}")))
 }
 
 /// Maps the RSA `-pkeyopt digest:` choice onto a [`KeyHash`], reproducing the
@@ -459,19 +467,11 @@ fn run_encrypt(args: Args) {
         };
         match padding {
             "oaep" => {
-                let md = opts.oaep_md.as_deref().unwrap_or("sha256");
-                match md.to_ascii_lowercase().as_str() {
-                    "sha256" => rsa
-                        .encrypt_oaep::<Sha256, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    "sha384" => rsa
-                        .encrypt_oaep::<Sha384, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    "sha512" => rsa
-                        .encrypt_oaep::<Sha512, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    _ => die(format!("unsupported rsa_oaep_md: {md}")),
-                }
+                dispatch_digest!(oaep_md(&opts), |D| {
+                    rsa
+                        .encrypt_oaep::<D, _>(&pt, &opts.oaep_label, &mut OsRng)
+                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}")))
+                }, _ => die("unsupported rsa_oaep_md"))
             }
             "pkcs1" => rsa
                 .encrypt_pkcs1v15(&pt, &mut OsRng)
@@ -487,19 +487,11 @@ fn run_encrypt(args: Args) {
         let pub_k = rsa.public_key();
         match padding {
             "oaep" => {
-                let md = opts.oaep_md.as_deref().unwrap_or("sha256");
-                match md.to_ascii_lowercase().as_str() {
-                    "sha256" => pub_k
-                        .encrypt_oaep::<Sha256, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    "sha384" => pub_k
-                        .encrypt_oaep::<Sha384, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    "sha512" => pub_k
-                        .encrypt_oaep::<Sha512, _>(&pt, &opts.oaep_label, &mut OsRng)
-                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}"))),
-                    _ => die(format!("unsupported rsa_oaep_md: {md}")),
-                }
+                dispatch_digest!(oaep_md(&opts), |D| {
+                    pub_k
+                        .encrypt_oaep::<D, _>(&pt, &opts.oaep_label, &mut OsRng)
+                        .unwrap_or_else(|e| die(format!("OAEP encrypt failed: {e}")))
+                }, _ => die("unsupported rsa_oaep_md"))
             }
             "pkcs1" => pub_k
                 .encrypt_pkcs1v15(&pt, &mut OsRng)
@@ -546,19 +538,10 @@ fn run_decrypt(args: Args) {
     // one-shot CLI in a network-facing loop would hand it to the attacker.
     let pt = match padding {
         "oaep" => {
-            let md = opts.oaep_md.as_deref().unwrap_or("sha256");
-            match md.to_ascii_lowercase().as_str() {
-                "sha256" => rsa
-                    .decrypt_oaep::<Sha256>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|_| die("decrypt failed")),
-                "sha384" => rsa
-                    .decrypt_oaep::<Sha384>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|_| die("decrypt failed")),
-                "sha512" => rsa
-                    .decrypt_oaep::<Sha512>(&ct, &opts.oaep_label)
-                    .unwrap_or_else(|_| die("decrypt failed")),
-                _ => die(format!("unsupported rsa_oaep_md: {md}")),
-            }
+            dispatch_digest!(oaep_md(&opts), |D| {
+                rsa.decrypt_oaep::<D>(&ct, &opts.oaep_label)
+                    .unwrap_or_else(|_| die("decrypt failed"))
+            }, _ => die("unsupported rsa_oaep_md"))
         }
         "pkcs1" => rsa
             .decrypt_pkcs1v15(&ct)

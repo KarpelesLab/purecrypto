@@ -24,7 +24,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, DecryptParams, EncryptParams, Error, Hash, PrivateKey, PublicKey, RsaEncPadding,
+    Algorithm, DecryptParams, EncryptParams, Error, PrivateKey, PublicKey, RsaEncPadding,
     RsaSigPadding, SaltLen, Secret, SignParams,
 };
 use crate::rng::CryptoRngCore;
@@ -32,45 +32,9 @@ use crate::rng::CryptoRngCore;
 use super::boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
 use super::keys::{RsaPrivateKey, RsaPublicKey};
 
-/// Runs `$body` with `$d` aliased to the concrete digest named by `$h`
-/// (a [`Hash`]). Used to bridge the runtime hash selector into the generic
-/// `sign_pss::<D>` / `verify_pss::<D>` / OAEP methods.
-///
-/// [`Hash`] names every digest the crate implements; RSA honours the subset
-/// that also implements [`Pkcs1Digest`](super::Pkcs1Digest) — SHA-1 and
-/// SHA-224/256/384/512 — so this one macro serves the PSS, OAEP *and* PKCS#1
-/// v1.5 paths. Any other digest returns [`Error::UnsupportedParam`] rather than
-/// silently falling back to one that was not asked for; callers wanting e.g.
-/// PSS over SHA-3 use the generic `sign_pss::<D>` API directly. The expansion
-/// `return`s, so every use must sit in a function returning
-/// `Result<_, crate::key::Error>`.
-macro_rules! dispatch_hash {
-    ($h:expr, |$d:ident| $body:block) => {
-        match $h {
-            Hash::Sha256 => {
-                type $d = crate::hash::Sha256;
-                $body
-            }
-            Hash::Sha384 => {
-                type $d = crate::hash::Sha384;
-                $body
-            }
-            Hash::Sha512 => {
-                type $d = crate::hash::Sha512;
-                $body
-            }
-            Hash::Sha224 => {
-                type $d = crate::hash::Sha224;
-                $body
-            }
-            Hash::Sha1 => {
-                type $d = crate::hash::Sha1;
-                $body
-            }
-            _ => return Err(Error::UnsupportedParam { param: "hash" }),
-        }
-    };
-}
+// The runtime-hash -> concrete-digest bridge, and the facade's accepted-digest
+// policy, live once in `key::params`.
+use crate::key::dispatch_key_hash as dispatch_hash;
 
 // ----------------------------------------------------------------------------
 // BoxedRsaPrivateKey

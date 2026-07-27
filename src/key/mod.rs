@@ -83,6 +83,9 @@ pub use params::{
     CryptParams, CryptParamsReader, DecryptParams, EncryptParams, Hash, RsaEncPadding,
     RsaSigPadding, SaltLen, SigEncoding, SignParams, SignParamsReader,
 };
+// The shared runtime-hash -> concrete-digest bridge for the per-algorithm
+// facade impls (`rsa::key_impl`, `ec::key_impl`).
+pub(crate) use params::dispatch_key_hash;
 pub use secret::Secret;
 
 use crate::rng::CryptoRngCore;

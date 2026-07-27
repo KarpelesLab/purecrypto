@@ -4,7 +4,8 @@ use crate::util::{
     Args, die, parse_hex_flag, parse_u32_flag, parse_usize_flag, read_secret_file, to_hex_line,
     write_output_with_mode, zero_buf,
 };
-use purecrypto::hash::{Sha256, Sha384, Sha512};
+use purecrypto::dispatch_digest;
+use purecrypto::hash::HashAlgorithm;
 use purecrypto::kdf::argon2::{Argon2Params, Argon2Type, argon2};
 use purecrypto::kdf::scrypt::scrypt;
 use purecrypto::kdf::{
@@ -159,24 +160,17 @@ fn run_hkdf(args: Args) {
         .value("-info")
         .map(|h| parse_hex_flag(h, "-info"))
         .unwrap_or_default();
+    let Some(alg) = HashAlgorithm::from_name(hash) else {
+        die(format!("unsupported -hash for hkdf: {hash}"))
+    };
     // RFC 5869 caps HKDF output at `255 * HashLen`; `hkdf_expand` asserts
     // this. Bound `-len` to that ceiling so an oversize request is a clean
     // error rather than a raw panic.
-    let hkdf_max = match hash.to_ascii_lowercase().as_str() {
-        "sha256" => Some(255 * 32),
-        "sha384" => Some(255 * 48),
-        "sha512" => Some(255 * 64),
-        _ => die(format!("unsupported -hash for hkdf: {hash}")),
-    };
-    let len = parse_len_capped(&args, hkdf_max);
+    let len = parse_len_capped(&args, Some(255 * alg.output_len()));
 
     let mut out = vec![0u8; len];
-    match hash.to_ascii_lowercase().as_str() {
-        "sha256" => hkdf::<Sha256>(&salt, &ikm, &info, &mut out),
-        "sha384" => hkdf::<Sha384>(&salt, &ikm, &info, &mut out),
-        "sha512" => hkdf::<Sha512>(&salt, &ikm, &info, &mut out),
-        _ => die(format!("unsupported -hash for hkdf: {hash}")),
-    }
+    dispatch_digest!(alg, |D| { hkdf::<D>(&salt, &ikm, &info, &mut out) },
+        _ => die(format!("unsupported -hash for hkdf: {hash}")));
     zero_buf(&mut ikm);
     emit(&args, &out);
 }
@@ -204,13 +198,13 @@ fn run_pbkdf2(args: Args) {
     }
     let len = parse_len_capped(&args, None);
 
+    let Some(alg) = HashAlgorithm::from_name(hash) else {
+        die(format!("unsupported -hash for pbkdf2: {hash}"))
+    };
+
     let mut out = vec![0u8; len];
-    match hash.to_ascii_lowercase().as_str() {
-        "sha256" => pbkdf2::<Sha256>(&pw, &salt, iter, &mut out),
-        "sha384" => pbkdf2::<Sha384>(&pw, &salt, iter, &mut out),
-        "sha512" => pbkdf2::<Sha512>(&pw, &salt, iter, &mut out),
-        _ => die(format!("unsupported -hash for pbkdf2: {hash}")),
-    }
+    dispatch_digest!(alg, |D| { pbkdf2::<D>(&pw, &salt, iter, &mut out) },
+        _ => die(format!("unsupported -hash for pbkdf2: {hash}")));
     zero_buf(&mut pw);
     emit(&args, &out);
 }

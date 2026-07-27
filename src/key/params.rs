@@ -36,6 +36,53 @@ use crate::key::Error;
 /// [`Digest`](crate::hash::Digest).
 pub use crate::hash::HashAlgorithm as Hash;
 
+/// Runs `$body` with `$d` aliased to the concrete digest type named by a
+/// runtime [`Hash`] — the bridge from the parameter enum into the generic
+/// `sign_pss::<D>` / `verify::<D>` / `encrypt_oaep::<D>` APIs.
+///
+/// The accepted set is the *policy* of this facade, stated once here rather
+/// than per algorithm: SHA-1 and SHA-224/256/384/512, i.e. exactly the digests
+/// with a standardised PKCS#1 `DigestInfo` and X.509/TLS signature encoding
+/// (every one of them also implements [`Pkcs1Digest`](crate::rsa::Pkcs1Digest),
+/// so the PSS, OAEP and PKCS#1 v1.5 paths all share this macro). Any other
+/// digest is refused with [`Error::UnsupportedParam`] rather than silently
+/// falling back to one the caller did not ask for; callers wanting e.g. PSS
+/// over SHA-3 use the generic per-algorithm API directly.
+///
+/// The expansion `return`s on the unsupported arm, so every use must sit in a
+/// function returning `Result<_, crate::key::Error>`.
+macro_rules! dispatch_key_hash {
+    ($h:expr, |$d:ident| $body:block) => {
+        match $h {
+            $crate::key::Hash::Sha256 => {
+                type $d = $crate::hash::Sha256;
+                $body
+            }
+            $crate::key::Hash::Sha384 => {
+                type $d = $crate::hash::Sha384;
+                $body
+            }
+            $crate::key::Hash::Sha512 => {
+                type $d = $crate::hash::Sha512;
+                $body
+            }
+            $crate::key::Hash::Sha224 => {
+                type $d = $crate::hash::Sha224;
+                $body
+            }
+            $crate::key::Hash::Sha1 => {
+                type $d = $crate::hash::Sha1;
+                $body
+            }
+            _ => {
+                return Err($crate::key::Error::UnsupportedParam { param: "hash" });
+            }
+        }
+    };
+}
+
+pub(crate) use dispatch_key_hash;
+
 /// RSA signature padding scheme.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

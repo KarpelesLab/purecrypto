@@ -101,6 +101,9 @@ pub(crate) use algorithm::impl_dyn_digest;
 pub use algorithm::{
     DynDigest, HashAlgorithm, HashOutput, Hasher, InvalidOutputLen, UnknownHashAlgorithm,
 };
+// `#[macro_export]` puts it at the crate root; re-export it here so it is
+// documented and importable alongside the enum it dispatches on.
+pub use crate::dispatch_digest;
 pub use blake2::{
     Blake2b256, Blake2b384, Blake2b512, Blake2bMac, Blake2s256, Blake2sMac, Blake2xb,
     Blake2xbReader, Blake2xs, Blake2xsReader, blake2b256, blake2b384, blake2b512, blake2s256,

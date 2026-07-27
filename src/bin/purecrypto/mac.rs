@@ -8,9 +8,8 @@ use crate::util::{
     Args, die, parse_hex_flag, read_input, read_secret_file, to_hex_line, write_output, zero_buf,
 };
 use purecrypto::cipher::{Aes128, Aes256, AesCmac128, AesCmac256, AesGmac128, AesGmac256};
-use purecrypto::hash::{Hmac, HmacSha256, HmacSha384, HmacSha512, Sha1};
-
-type HmacSha1 = Hmac<Sha1>;
+use purecrypto::dispatch_digest;
+use purecrypto::hash::{HashAlgorithm, Hmac, Mac};
 
 /// Computes the AES-CMAC tag (RFC 4493), selecting AES-128 or AES-256 by key
 /// length. Exits with an error if the key is not 16 or 32 bytes.
@@ -58,19 +57,27 @@ fn gmac_tag(key: &[u8], nonce: &[u8], msg: &[u8]) -> Vec<u8> {
 }
 
 /// Returns the MAC tag (raw bytes) of `msg` under `key` for the named
-/// algorithm. Supported: `hmac-sha1`, `hmac-sha256`, `hmac-sha384`,
-/// `hmac-sha512`, and `cmac` / `aes-cmac` (AES-CMAC, RFC 4493). GMAC is
-/// handled separately in `run` since it also requires a nonce.
+/// algorithm. Supported: `hmac-<hash>` (or a bare `<hash>`) for any digest
+/// `hash::HashAlgorithm` names — `hmac-sha256`, `hmac-sha3-256`, … — plus
+/// `cmac` / `aes-cmac` (AES-CMAC, RFC 4493). GMAC is handled separately in
+/// `run` since it also requires a nonce.
 fn mac_tag(alg: &str, key: &[u8], msg: &[u8]) -> Option<Vec<u8>> {
-    let tag = match alg.to_ascii_lowercase().as_str() {
-        "hmac-sha1" | "sha1" => HmacSha1::mac(key, msg).as_ref().to_vec(),
-        "hmac-sha256" | "sha256" => HmacSha256::mac(key, msg).as_ref().to_vec(),
-        "hmac-sha384" | "sha384" => HmacSha384::mac(key, msg).as_ref().to_vec(),
-        "hmac-sha512" | "sha512" => HmacSha512::mac(key, msg).as_ref().to_vec(),
-        "cmac" | "aes-cmac" => cmac_tag(key, msg),
-        _ => return None,
-    };
-    Some(tag)
+    let lower = alg.to_ascii_lowercase();
+    if let "cmac" | "aes-cmac" = lower.as_str() {
+        return Some(cmac_tag(key, msg));
+    }
+    // One name table for hashes, shared with the `hash` subcommand: accept
+    // both `hmac-sha256` and the bare `sha256`.
+    let hash = lower.strip_prefix("hmac-").unwrap_or(&lower);
+    let alg = HashAlgorithm::from_name(hash)?;
+    let mut tag = [0u8; HashAlgorithm::MAX_OUTPUT_LEN];
+    let n = alg.output_len();
+    dispatch_digest!(alg, |D| {
+        let mut m = Hmac::<D>::new(key);
+        Mac::update(&mut m, msg);
+        Mac::finalize_into(m, &mut tag[..n]);
+    }, _ => return None);
+    Some(tag[..n].to_vec())
 }
 
 pub(crate) fn run(args: Args) {

@@ -10,7 +10,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, CryptParams, Error, Hash, PrivateKey, PublicKey, Secret, SigEncoding, SignParams,
+    Algorithm, CryptParams, Error, PrivateKey, PublicKey, Secret, SigEncoding, SignParams,
     downcast_peer,
 };
 use crate::rng::CryptoRngCore;
@@ -23,44 +23,9 @@ use super::sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 use super::x448::{X448PrivateKey, X448PublicKey};
 use super::x25519::{X25519PrivateKey, X25519PublicKey};
 
-/// Runs `$body` with `$d` aliased to the concrete digest named by `$h`
-/// (a [`Hash`]). Bridges the runtime hash selector into the generic
-/// `sign::<D>` / `verify::<D>` methods.
-///
-/// [`Hash`] names every digest the crate implements; ECDSA through this facade
-/// honours the SHA-1 / SHA-2 family that the X.509, TLS and JOSE signature
-/// registries define. Any other digest returns
-/// [`Error::UnsupportedParam`] rather than silently falling back to one that
-/// was not asked for; the generic `sign::<D>` API stays open to any
-/// [`Digest`](crate::hash::Digest). The expansion `return`s, so every use must
-/// sit in a function returning `Result<_, crate::key::Error>`.
-macro_rules! dispatch_hash {
-    ($h:expr, |$d:ident| $body:block) => {
-        match $h {
-            Hash::Sha256 => {
-                type $d = crate::hash::Sha256;
-                $body
-            }
-            Hash::Sha384 => {
-                type $d = crate::hash::Sha384;
-                $body
-            }
-            Hash::Sha512 => {
-                type $d = crate::hash::Sha512;
-                $body
-            }
-            Hash::Sha224 => {
-                type $d = crate::hash::Sha224;
-                $body
-            }
-            Hash::Sha1 => {
-                type $d = crate::hash::Sha1;
-                $body
-            }
-            _ => return Err(Error::UnsupportedParam { param: "hash" }),
-        }
-    };
-}
+// The runtime-hash -> concrete-digest bridge, and the facade's accepted-digest
+// policy, live once in `key::params`.
+use crate::key::dispatch_key_hash as dispatch_hash;
 
 // ----------------------------------------------------------------------------
 // Ed25519 — fixes its own hash, no params honoured

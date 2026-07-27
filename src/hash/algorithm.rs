@@ -440,6 +440,151 @@ hash_algorithms! {
     Md2 => crate::hash::Md2, "md2", legacy: true;
 }
 
+/// Bridges a runtime [`HashAlgorithm`] into code that is generic over a
+/// compile-time [`Digest`] type: runs `$body` once per algorithm, with `$d`
+/// aliased to that algorithm's concrete hasher.
+///
+/// [`Hasher`] covers the case where a hasher *object* is enough. It cannot
+/// serve `Hmac<D>`, `hkdf::<D>`, `pbkdf2::<D>`, `sign_pss::<D>` and friends,
+/// which need the digest as a *type* — that is what this macro is for:
+///
+/// ```
+/// use purecrypto::hash::{Digest, HashAlgorithm, Hmac, Mac};
+/// use purecrypto::dispatch_digest;
+///
+/// fn hmac(alg: HashAlgorithm, key: &[u8], msg: &[u8]) -> Option<[u8; 64]> {
+///     let mut tag = [0u8; 64];
+///     dispatch_digest!(alg, |D| {
+///         let mut m = Hmac::<D>::new(key);
+///         Mac::update(&mut m, msg);
+///         Mac::finalize_into(m, &mut tag[..<D as Digest>::OUTPUT_LEN]);
+///     }, _ => return None);
+///     Some(tag)
+/// }
+/// # assert!(hmac(HashAlgorithm::Sha256, b"k", b"m").is_some());
+/// ```
+///
+/// The `_ =>` arm is required: [`HashAlgorithm`] is `#[non_exhaustive]`, so a
+/// build against a newer `purecrypto` may hand you a variant this macro's
+/// caller was not compiled for. It is also the hook for refusing digests a
+/// scheme has no encoding for.
+///
+/// `$body` is instantiated once per algorithm, so a large body costs code
+/// size. To dispatch over a subset, `match` the algorithm first and call this
+/// only on the arm you accept.
+#[macro_export]
+macro_rules! dispatch_digest {
+    ($alg:expr, |$d:ident| $body:block, _ => $fallback:expr $(,)?) => {
+        match $alg {
+            $crate::hash::HashAlgorithm::Sha224 => {
+                type $d = $crate::hash::Sha224;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha256 => {
+                type $d = $crate::hash::Sha256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha384 => {
+                type $d = $crate::hash::Sha384;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha512 => {
+                type $d = $crate::hash::Sha512;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha512_224 => {
+                type $d = $crate::hash::Sha512_224;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha512_256 => {
+                type $d = $crate::hash::Sha512_256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha3_224 => {
+                type $d = $crate::hash::Sha3_224;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha3_256 => {
+                type $d = $crate::hash::Sha3_256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha3_384 => {
+                type $d = $crate::hash::Sha3_384;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha3_512 => {
+                type $d = $crate::hash::Sha3_512;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Keccak256 => {
+                type $d = $crate::hash::Keccak256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Blake2b256 => {
+                type $d = $crate::hash::Blake2b256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Blake2b384 => {
+                type $d = $crate::hash::Blake2b384;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Blake2b512 => {
+                type $d = $crate::hash::Blake2b512;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Blake2s256 => {
+                type $d = $crate::hash::Blake2s256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Blake3 => {
+                type $d = $crate::hash::Blake3;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sm3 => {
+                type $d = $crate::hash::Sm3;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Streebog256 => {
+                type $d = $crate::hash::Streebog256;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Streebog512 => {
+                type $d = $crate::hash::Streebog512;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Whirlpool => {
+                type $d = $crate::hash::Whirlpool;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Ripemd160 => {
+                type $d = $crate::hash::Ripemd160;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Sha1 => {
+                type $d = $crate::hash::Sha1;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Md5 => {
+                type $d = $crate::hash::Md5;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Md4 => {
+                type $d = $crate::hash::Md4;
+                $body
+            }
+            $crate::hash::HashAlgorithm::Md2 => {
+                type $d = $crate::hash::Md2;
+                $body
+            }
+            // Reachable only for a caller outside this crate (where the
+            // `#[non_exhaustive]` enum may carry a newer variant); in-crate
+            // uses cover every variant, so silence the lint there.
+            #[allow(unreachable_patterns)]
+            _ => $fallback,
+        }
+    };
+}
+
 impl HashAlgorithm {
     /// The widest [`output_len`](HashAlgorithm::output_len) of any variant, and
     /// so the capacity of a [`HashOutput`].
@@ -910,6 +1055,29 @@ mod tests {
         let mut h = HashAlgorithm::Sha512.hasher();
         std::io::copy(&mut std::io::Cursor::new(&b"streamed"[..]), &mut h).unwrap();
         assert_eq!(h.finalize(), HashAlgorithm::Sha512.digest("streamed"));
+    }
+
+    // Guards the one piece of duplication the macro cannot avoid: its arm list
+    // must name every `HashAlgorithm` variant, and pair each with the right
+    // type. A variant added to the table without a macro arm falls through to
+    // `_` and fails here.
+    #[test]
+    fn dispatch_digest_covers_every_variant() {
+        for &alg in HashAlgorithm::ALL {
+            let (out, block, digest) = crate::dispatch_digest!(alg, |D| {
+                (
+                    <D as Digest>::OUTPUT_LEN,
+                    <D as Digest>::BLOCK_LEN,
+                    <D as Digest>::digest(b"abc").as_ref().to_vec(),
+                )
+            }, _ => panic!("dispatch_digest! has no arm for {alg}"));
+
+            assert_eq!(out, alg.output_len(), "{alg}");
+            assert_eq!(block, alg.block_len(), "{alg}");
+            // Same type, not merely the same length: the digest must match the
+            // one the enum's own hasher produces.
+            assert_eq!(digest, alg.digest(b"abc").as_slice(), "{alg}");
+        }
     }
 
     #[test]
