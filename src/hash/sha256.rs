@@ -405,9 +405,13 @@ mod tests {
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sha256_hardware_matches_software() {
+        // See the note in `sha1.rs`: report skip-vs-run so a green suite is not
+        // mistaken for evidence that the hardware kernel ran.
         if !super::super::sha_hw::sha256_supported() {
+            std::eprintln!("hw-sha256: SKIPPED (no hardware SHA-256 on this CPU)");
             return;
         }
+        std::eprintln!("hw-sha256: RUNNING against hardware backend");
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             s ^= s << 13;

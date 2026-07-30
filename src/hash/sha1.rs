@@ -148,9 +148,16 @@ mod tests {
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sha1_hardware_matches_software() {
+        // Say which path was taken: these tests self-skip on CPUs without the
+        // extension, so under `--nocapture` a skip is otherwise indistinguishable
+        // from a real run — and "the suite is green" would wrongly imply the
+        // hardware kernel was exercised. Matters most for the aarch64 kernels,
+        // which no x86 CI job can reach.
         if !super::super::sha_hw::sha1_supported() {
+            std::eprintln!("hw-sha1: SKIPPED (no hardware SHA-1 on this CPU)");
             return;
         }
+        std::eprintln!("hw-sha1: RUNNING against hardware backend");
         let mut s = 0x9e37_79b9_7f4a_7c15u64;
         let mut next = || {
             s ^= s << 13;

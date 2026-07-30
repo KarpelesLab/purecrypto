@@ -398,9 +398,14 @@ mod tests {
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
     fn sha512_hardware_matches_software() {
+        // See the note in `sha1.rs`: report skip-vs-run so a green suite is not
+        // mistaken for evidence that the hardware kernel ran. On x86 this is the
+        // SHA512-extension path, which no CPU here can reach yet.
         if !super::super::sha_hw::sha512_supported() {
+            std::eprintln!("hw-sha512: SKIPPED (no hardware SHA-512 on this CPU)");
             return;
         }
+        std::eprintln!("hw-sha512: RUNNING against hardware backend");
         let mut s = 0x0123_4567_89ab_cdefu64;
         let mut next = || {
             s ^= s << 13;
