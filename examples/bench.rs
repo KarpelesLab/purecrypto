@@ -11,7 +11,7 @@ use purecrypto::cipher::{Aes128, Aes256, Aez, BlockCipher, ChaCha20Poly1305, Gcm
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
 use purecrypto::ec::x25519::X25519PrivateKey;
-use purecrypto::hash::{Blake3, Digest, Sha3_256, Sha256, Sha512, shake128};
+use purecrypto::hash::{Blake3, Digest, Sha1, Sha3_256, Sha256, Sha512, shake128};
 use purecrypto::mldsa::MlDsa65PrivateKey;
 use purecrypto::mlkem::MlKem768DecapsKey;
 use purecrypto::rng::OsRng;
@@ -112,6 +112,9 @@ fn main() {
         let data = vec![0u8; N];
         bench_throughput("SHA-256", N, t, || {
             black_box(Sha256::digest(black_box(&data)));
+        });
+        bench_throughput("SHA-1", N, t, || {
+            black_box(Sha1::digest(black_box(&data)));
         });
         bench_throughput("SHA-512", N, t, || {
             black_box(Sha512::digest(black_box(&data)));

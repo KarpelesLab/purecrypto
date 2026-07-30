@@ -7,6 +7,10 @@
 //! little-endian for the MD/RIPEMD hashes). [`MdState`] captures the common
 //! part; each algorithm supplies its `compress` function.
 
+/// Multi-block compression: folds a whole number of 64-byte blocks into the `W`
+/// state words in a single call (see [`MdState::new_bulk`]).
+type CompressBlocks<const W: usize> = fn(&mut [u32; W], &[u8]);
+
 /// Streaming state for a 64-byte-block Merkle–Damgård hash over `W` 32-bit
 /// state words.
 #[derive(Clone)]
@@ -18,6 +22,8 @@ pub(super) struct MdState<const W: usize> {
     /// Whether the trailing length field is big-endian (SHA-1) vs little-endian.
     len_be: bool,
     compress: fn(&mut [u32; W], &[u8; 64]),
+    /// Optional multi-block compression for the bulk path (see [`Self::new_bulk`]).
+    compress_blocks: Option<CompressBlocks<W>>,
 }
 
 impl<const W: usize> MdState<W> {
@@ -30,6 +36,25 @@ impl<const W: usize> MdState<W> {
             msg_len: 0,
             len_be,
             compress,
+            compress_blocks: None,
+        }
+    }
+
+    /// Like [`Self::new`], but with a multi-block compression function for the
+    /// bulk path: [`Self::update`] hands every full block of the input to
+    /// `compress_blocks` in one call instead of looping `compress`, so a hardware
+    /// backend can keep the hash state register-resident across them (SHA-1).
+    /// `compress` still handles the partial-block top-up and the padding blocks.
+    #[inline]
+    pub(super) fn new_bulk(
+        iv: [u32; W],
+        len_be: bool,
+        compress: fn(&mut [u32; W], &[u8; 64]),
+        compress_blocks: CompressBlocks<W>,
+    ) -> Self {
+        MdState {
+            compress_blocks: Some(compress_blocks),
+            ..Self::new(iv, len_be, compress)
         }
     }
 
@@ -47,10 +72,19 @@ impl<const W: usize> MdState<W> {
             }
         }
 
-        while data.len() >= 64 {
-            let block: &[u8; 64] = data[..64].try_into().unwrap();
-            (self.compress)(&mut self.h, block);
-            data = &data[64..];
+        // Compress all full blocks. With a bulk function they go out in a single
+        // call, so a hardware backend keeps the state register-resident across
+        // them; otherwise, block by block.
+        let full = data.len() & !63;
+        if full > 0 {
+            if let Some(compress_blocks) = self.compress_blocks {
+                compress_blocks(&mut self.h, &data[..full]);
+            } else {
+                for block in data[..full].chunks_exact(64) {
+                    (self.compress)(&mut self.h, block.try_into().unwrap());
+                }
+            }
+            data = &data[full..];
         }
 
         if !data.is_empty() {
