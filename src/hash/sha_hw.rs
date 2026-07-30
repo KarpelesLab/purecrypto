@@ -1,8 +1,9 @@
-//! Hardware SHA — SHA-256 via the x86_64 SHA-NI extension or the aarch64 `sha2`
-//! extension, SHA-512 via the aarch64 `sha512` extension (there is no
-//! broadly-available x86 SHA-512 instruction, so x86 keeps the software path),
-//! and SHA-1 via the SHA-1 instructions of those same two extensions (SHA-NI's
-//! `sha1rnds4` family on x86_64, `sha1c`/`sha1p`/`sha1m` on aarch64).
+//! Hardware SHA — SHA-1 and SHA-256 via the x86_64 SHA-NI extension or the
+//! aarch64 `sha2` extension (which covers FEAT_SHA1 as well as FEAT_SHA256), and
+//! SHA-512 via the x86_64 SHA512 extension (Intel Arrow Lake / Lunar Lake and
+//! newer, AMD Zen 5 and newer) or the aarch64 `sha512` extension. Every backend
+//! is runtime-detected, with the software path as the fallback on CPUs that lack
+//! the instructions.
 //!
 //! Each path produces identical state to the `*_soft` software compression, so
 //! it drops into the dispatch unchanged; pinned by differential tests. The SHA
@@ -50,21 +51,69 @@ pub(super) fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
     }
 }
 
-/// Whether a hardware SHA-512 backend is available (aarch64 `sha512` only; x86
-/// has no SHA-512 instruction, so this is defined only on aarch64 where the
-/// SHA-512 dispatch references it).
+/// Whether a hardware SHA-512 backend is available.
+///
+/// The x86 SHA512 extension has no stable feature-detection macro on the crate
+/// MSRV (`is_x86_feature_detected!("sha512")` is still unstable), so it is read
+/// straight out of `CPUID` leaf 7 sub-leaf 1, EAX bit 0. AVX2 is required on top
+/// of that: the instructions take 256-bit `ymm` operands, and the
+/// `is_x86_feature_detected!` probe additionally covers the OS `XCR0`
+/// state-enable check that a raw `CPUID` feature bit does not.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn sha512_supported() -> bool {
+    use core::arch::x86_64::__cpuid_count;
+
+    // Cached: this is consulted once per compression call, and `CPUID` is a
+    // serializing instruction far too expensive to run per 128-byte block.
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if !std::is_x86_feature_detected!("avx2") {
+            return false;
+        }
+        // SAFETY: `CPUID` is unconditionally present on x86_64 and never faults.
+        // Leaf 0 reports the highest basic leaf and leaf 7 sub-leaf 0 reports
+        // leaf 7's highest sub-leaf; both are checked before sub-leaf 1 is read,
+        // so nothing here relies on out-of-range leaves reading back as zero.
+        unsafe {
+            if __cpuid_count(0, 0).eax < 7 || __cpuid_count(7, 0).eax < 1 {
+                return false;
+            }
+            __cpuid_count(7, 1).eax & 1 != 0
+        }
+    })
+}
 #[cfg(target_arch = "aarch64")]
 pub(super) fn sha512_supported() -> bool {
     // The SHA512 instructions are reported under the FEAT_SHA512 / "sha3" gate.
     std::arch::is_aarch64_feature_detected!("sha3")
 }
 
-/// SHA-512 compression of one 128-byte block (aarch64 hardware only; never
-/// called on x86, where [`sha512_supported`] is `false`).
-#[cfg(target_arch = "aarch64")]
+/// SHA-512 compression of one 128-byte block, dispatched to the active backend.
 pub(super) fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
-    // SAFETY: only called after `sha512_supported()` confirmed FEAT_SHA512.
-    unsafe { arm::compress512(h, block) }
+    compress512_blocks(h, block);
+}
+
+/// SHA-512 compression of `data` (a whole number of 128-byte blocks), dispatched
+/// to the active backend. On x86 the backend loads the hash state into registers
+/// once and keeps it there across every block, so a single multi-block call
+/// avoids the per-block state spill/reload and dispatch overhead that repeated
+/// [`compress512`] calls incur — a measurable throughput win on bulk input. The
+/// aarch64 backend has no multi-block kernel and is simply looped per block.
+pub(super) fn compress512_blocks(h: &mut [u64; 8], data: &[u8]) {
+    debug_assert!(data.len().is_multiple_of(128));
+    if data.is_empty() {
+        return;
+    }
+    // SAFETY: only called after `sha512_supported()` confirmed the features.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        x86::compress512_blocks(h, data)
+    }
+    #[cfg(target_arch = "aarch64")]
+    for block in data.chunks_exact(128) {
+        // SAFETY: only called after `sha512_supported()` confirmed FEAT_SHA512.
+        unsafe { arm::compress512(h, block.try_into().unwrap()) }
+    }
 }
 
 /// Whether a hardware SHA-1 backend is available.
@@ -115,6 +164,8 @@ pub(super) fn compress_sha1_blocks(h: &mut [u32; 5], data: &[u8]) {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use crate::hash::sha256::K256;
+    use crate::hash::sha512::K512;
+    use core::arch::asm;
     use core::arch::x86_64::*;
 
     /// SHA-NI multi-block compression. The state is loaded into the ABEF / CDGH
@@ -305,6 +356,361 @@ mod x86 {
                 _mm_shuffle_epi32(abcd, 0x1B),
             );
             state[4] = _mm_extract_epi32::<3>(e) as u32;
+        }
+    }
+
+    /// The three x86 SHA512-extension instructions, abstracted behind a trait so
+    /// that [`compress512_kernel`] — all of the state packing, message-schedule
+    /// plumbing and feed-forward — can also be executed on CPUs that lack the
+    /// extension. [`Sha512Hw`] emits the real instructions; the test module below
+    /// supplies a scalar emulation transcribed from the Intel pseudocode and runs
+    /// the very same kernel through it, which is what pins the kernel's structure
+    /// on the (currently overwhelming) majority of machines. The trait is
+    /// dispatched statically, so the hardware instantiation compiles to exactly
+    /// what a direct implementation would.
+    ///
+    /// The instructions are emitted with `asm!` rather than the
+    /// `_mm256_sha512*_epi64` intrinsics because those (and
+    /// `#[target_feature(enable = "sha512")]`, and
+    /// `is_x86_feature_detected!("sha512")`) are all still unstable on the crate
+    /// MSRV. LLVM's integrated assembler accepts the mnemonics independently of
+    /// Rust's target-feature gating, so the emitted encodings are the same.
+    trait Sha512Insn {
+        /// `VSHA512MSG1 ymm1, xmm2` — first half of the message schedule for the
+        /// next four words: with `W[0..4] = a` and `W[4] = b.qword[0]`, returns
+        /// `W[i] + σ0(W[i+1])` in lane `i`.
+        unsafe fn msg1(a: __m256i, b: __m128i) -> __m256i;
+
+        /// `VSHA512MSG2 ymm1, ymm2` — second half of the message schedule: `a`
+        /// holds `W[i-16] + σ0(W[i-15]) + W[i-7]` for the four words being
+        /// produced and `b.qword[2..4]` holds `W[i-2]`, `W[i-1]`; returns the
+        /// four finished words, including the two that depend on the first two.
+        unsafe fn msg2(a: __m256i, b: __m256i) -> __m256i;
+
+        /// `VSHA512RNDS2 ymm1, ymm2, xmm3` — two SHA-512 rounds, taking the
+        /// `(C,D,G,H)` state half in `a`, the `(A,B,E,F)` half in `b` and two
+        /// pre-summed `W + K` round keys in `k`, returning the updated
+        /// `(A,B,E,F)` half.
+        unsafe fn rnds2(a: __m256i, b: __m256i, k: __m128i) -> __m256i;
+    }
+
+    /// The real SHA512-extension instructions.
+    ///
+    /// `avx2` is enabled on these wrappers only to legalise the `ymm_reg`
+    /// operand class (inline assembly may not name a `ymm` register without it);
+    /// the SHA512 instructions themselves are not part of AVX2 and are not
+    /// checked by Rust at all here — [`sha512_supported`](super::sha512_supported)
+    /// is what gates reaching this code.
+    ///
+    /// Every operand is read before the destination is written, so it is
+    /// harmless if the register allocator happens to assign one register to two
+    /// operands that it has proved equal.
+    struct Sha512Hw;
+
+    impl Sha512Insn for Sha512Hw {
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn msg1(a: __m256i, b: __m128i) -> __m256i {
+            let mut d = a;
+            // SAFETY: a plain register-to-register computation on caller-provided
+            // vectors — it touches no memory, no flags and no stack, and the
+            // caller has confirmed the SHA512 extension is present.
+            unsafe {
+                asm!(
+                    "vsha512msg1 {d:y}, {b:x}",
+                    d = inout(ymm_reg) d,
+                    b = in(xmm_reg) b,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            d
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn msg2(a: __m256i, b: __m256i) -> __m256i {
+            let mut d = a;
+            // SAFETY: see `msg1`.
+            unsafe {
+                asm!(
+                    "vsha512msg2 {d:y}, {b:y}",
+                    d = inout(ymm_reg) d,
+                    b = in(ymm_reg) b,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            d
+        }
+
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn rnds2(a: __m256i, b: __m256i, k: __m128i) -> __m256i {
+            let mut d = a;
+            // SAFETY: see `msg1`.
+            unsafe {
+                asm!(
+                    "vsha512rnds2 {d:y}, {b:y}, {k:x}",
+                    d = inout(ymm_reg) d,
+                    b = in(ymm_reg) b,
+                    k = in(xmm_reg) k,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            d
+        }
+    }
+
+    /// SHA512-extension multi-block compression: the hardware entry point.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support both AVX2 (the kernel's data movement) and the
+    /// SHA512 extension (the three instructions) — i.e.
+    /// [`sha512_supported`](super::sha512_supported) must have returned `true`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn compress512_blocks(state: &mut [u64; 8], data: &[u8]) {
+        // SAFETY: the caller confirmed AVX2 + the SHA512 extension.
+        unsafe { compress512_kernel::<Sha512Hw>(state, data) }
+    }
+
+    /// SHA-512 multi-block compression over the SHA512-extension primitives.
+    ///
+    /// The state is packed into two `ymm` registers in the layout the
+    /// instructions want — `abef` = `(F,E,B,A)` and `cdgh` = `(H,G,D,C)` from
+    /// qword 0 up — once, and kept there across every 128-byte block (only the
+    /// per-block Davies–Meyer feed-forward touches it), so an N-block call pays
+    /// the state load/store exactly once instead of N times.
+    ///
+    /// The 80 rounds run as 20 groups of four. Each group holds `W[4g..4g+4]` in
+    /// `m[g % 4]`, adds `K512[4g..4g+4]` to form four round keys, then issues two
+    /// `rnds2` — the first consuming the low two keys, the second the high two.
+    /// Because `rnds2` returns the new `(A,B,E,F)` half, the two state registers
+    /// swap roles between the calls and are back in place after the group, the
+    /// same alternation the SHA-NI SHA-256 kernel above uses.
+    ///
+    /// Scheduling runs four groups ahead: during group `g` the register holding
+    /// `W[4g..4g+4]` is advanced in place to `W[4g+16..4g+20]` (the round keys
+    /// having already been taken from its pre-update value), so its inputs are
+    /// the three *other* registers, which together hold `W[4g+4..4g+16]`.
+    /// Spelling out the SHA-512 recurrence `W[n] = W[n-16] + σ0(W[n-15]) +
+    /// W[n-7] + σ1(W[n-2])` for `n = 4g+16`: `msg1` folds in `W[n-16..n-12]`
+    /// (the register itself) and `σ0(W[n-15..n-11])` (needing `W[n-12]`, i.e.
+    /// lane 0 of the next register), the explicit add supplies `W[n-7..n-3]`
+    /// (a one-qword rotation across the two registers after that), and `msg2`
+    /// applies the `σ1` term, whose last two words depend on the first two.
+    #[target_feature(enable = "avx2")]
+    unsafe fn compress512_kernel<I: Sha512Insn>(state: &mut [u64; 8], data: &[u8]) {
+        unsafe {
+            // Per-64-bit-word byte-reverse mask (block words are big-endian).
+            let bswap = _mm256_setr_epi8(
+                7, 6, 5, 4, 3, 2, 1, 0, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 15,
+                14, 13, 12, 11, 10, 9, 8,
+            );
+
+            // Load a..h and pack into the two register halves, once.
+            let t0 = _mm256_loadu_si256(state.as_ptr() as *const __m256i); // a b c d
+            let t1 = _mm256_loadu_si256(state.as_ptr().add(4) as *const __m256i); // e f g h
+            let mut abef = _mm256_permute4x64_epi64(_mm256_permute2x128_si256(t1, t0, 0x20), 0xB1);
+            let mut cdgh = _mm256_permute4x64_epi64(_mm256_permute2x128_si256(t1, t0, 0x31), 0xB1);
+
+            let kptr = K512.as_ptr();
+            let base = data.as_ptr();
+            let nblocks = data.len() / 128;
+            for blk in 0..nblocks {
+                let bptr = base.add(blk * 128);
+                let abef_save = abef;
+                let cdgh_save = cdgh;
+
+                // W[0..16] as four vectors of four byte-reversed words.
+                let mut m = [
+                    _mm256_shuffle_epi8(_mm256_loadu_si256(bptr as *const __m256i), bswap),
+                    _mm256_shuffle_epi8(_mm256_loadu_si256(bptr.add(32) as *const __m256i), bswap),
+                    _mm256_shuffle_epi8(_mm256_loadu_si256(bptr.add(64) as *const __m256i), bswap),
+                    _mm256_shuffle_epi8(_mm256_loadu_si256(bptr.add(96) as *const __m256i), bswap),
+                ];
+
+                for g in 0..20usize {
+                    let i = g % 4;
+                    // Round keys for rounds 4g..4g+4, from the pre-update words.
+                    let wk = _mm256_add_epi64(
+                        m[i],
+                        _mm256_loadu_si256(kptr.add(4 * g) as *const __m256i),
+                    );
+
+                    // Advance m[i] to W[4g+16..4g+20], consumed by group g + 4.
+                    // Groups 16..20 need no further schedule.
+                    if g < 16 {
+                        let m2 = m[(i + 2) % 4];
+                        let m3 = m[(i + 3) % 4];
+                        m[i] = I::msg1(m[i], _mm256_castsi256_si128(m[(i + 1) % 4]));
+                        // W[4g+9..4g+13]: concat(m2, m3) rotated down one qword.
+                        let rot =
+                            _mm256_alignr_epi8(_mm256_permute2x128_si256(m2, m3, 0x21), m2, 8);
+                        m[i] = _mm256_add_epi64(m[i], rot);
+                        m[i] = I::msg2(m[i], m3);
+                    }
+
+                    cdgh = I::rnds2(cdgh, abef, _mm256_castsi256_si128(wk));
+                    abef = I::rnds2(abef, cdgh, _mm256_extracti128_si256(wk, 1));
+                }
+
+                // Davies–Meyer feed-forward, in the packed layout.
+                abef = _mm256_add_epi64(abef, abef_save);
+                cdgh = _mm256_add_epi64(cdgh, cdgh_save);
+            }
+
+            // Un-pack (F,E,B,A) / (H,G,D,C) back to a..h and store once.
+            let ra = _mm256_permute4x64_epi64(abef, 0xB1);
+            let rc = _mm256_permute4x64_epi64(cdgh, 0xB1);
+            _mm256_storeu_si256(
+                state.as_mut_ptr() as *mut __m256i,
+                _mm256_permute2x128_si256(ra, rc, 0x31),
+            );
+            _mm256_storeu_si256(
+                state.as_mut_ptr().add(4) as *mut __m256i,
+                _mm256_permute2x128_si256(ra, rc, 0x20),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{Sha512Insn, compress512_kernel};
+        use crate::hash::sha512::compress512_soft;
+        use core::arch::x86_64::*;
+
+        /// Scalar emulation of the three SHA512-extension instructions, written
+        /// from the Intel pseudocode (SDM / intrinsics guide) rather than from
+        /// the kernel it is checked against. Feeding it to the *shipped*
+        /// [`compress512_kernel`] exercises the state packing, message-schedule
+        /// plumbing, round-key formation and feed-forward on any AVX2 CPU, so
+        /// the only thing left resting on real SHA512 silicon is whether the
+        /// three `asm!` wrappers match this pseudocode.
+        struct Sha512Emu;
+
+        /// `ROR64`, spelled the FIPS 180-4 way (this is test code, so unlike the
+        /// hot software path there is no reason to avoid `rotate_right`).
+        fn rotr(x: u64, n: u32) -> u64 {
+            x.rotate_right(n)
+        }
+        /// `σ0` — the SHA-512 message-schedule small sigma (FIPS 180-4 §4.1.3).
+        fn sigma0(x: u64) -> u64 {
+            rotr(x, 1) ^ rotr(x, 8) ^ (x >> 7)
+        }
+        /// `σ1` — the other message-schedule small sigma.
+        fn sigma1(x: u64) -> u64 {
+            rotr(x, 19) ^ rotr(x, 61) ^ (x >> 6)
+        }
+        /// `Σ0` — the round-function big sigma applied to `a`.
+        fn big_sigma0(x: u64) -> u64 {
+            rotr(x, 28) ^ rotr(x, 34) ^ rotr(x, 39)
+        }
+        /// `Σ1` — the round-function big sigma applied to `e`.
+        fn big_sigma1(x: u64) -> u64 {
+            rotr(x, 14) ^ rotr(x, 18) ^ rotr(x, 41)
+        }
+
+        fn get4(v: __m256i) -> [u64; 4] {
+            let mut o = [0u64; 4];
+            // SAFETY: writing 32 bytes into a 32-byte local.
+            unsafe { _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, v) };
+            o
+        }
+        fn get2(v: __m128i) -> [u64; 2] {
+            let mut o = [0u64; 2];
+            // SAFETY: writing 16 bytes into a 16-byte local.
+            unsafe { _mm_storeu_si128(o.as_mut_ptr() as *mut __m128i, v) };
+            o
+        }
+        fn put4(o: [u64; 4]) -> __m256i {
+            // SAFETY: reading 32 bytes out of a 32-byte local.
+            unsafe { _mm256_loadu_si256(o.as_ptr() as *const __m256i) }
+        }
+
+        impl Sha512Insn for Sha512Emu {
+            unsafe fn msg1(a: __m256i, b: __m128i) -> __m256i {
+                let a = get4(a);
+                let w = [a[0], a[1], a[2], a[3], get2(b)[0]];
+                put4([
+                    w[0].wrapping_add(sigma0(w[1])),
+                    w[1].wrapping_add(sigma0(w[2])),
+                    w[2].wrapping_add(sigma0(w[3])),
+                    w[3].wrapping_add(sigma0(w[4])),
+                ])
+            }
+
+            unsafe fn msg2(a: __m256i, b: __m256i) -> __m256i {
+                let a = get4(a);
+                let b = get4(b);
+                let w16 = a[0].wrapping_add(sigma1(b[2]));
+                let w17 = a[1].wrapping_add(sigma1(b[3]));
+                let w18 = a[2].wrapping_add(sigma1(w16));
+                let w19 = a[3].wrapping_add(sigma1(w17));
+                put4([w16, w17, w18, w19])
+            }
+
+            unsafe fn rnds2(a: __m256i, b: __m256i, k: __m128i) -> __m256i {
+                let cdgh = get4(a);
+                let abef = get4(b);
+                let (mut sa, mut sb) = (abef[3], abef[2]);
+                let (mut sc, mut sd) = (cdgh[3], cdgh[2]);
+                let (mut se, mut sf) = (abef[1], abef[0]);
+                let (mut sg, mut sh) = (cdgh[1], cdgh[0]);
+                for wk in get2(k) {
+                    let t1 = sh
+                        .wrapping_add(big_sigma1(se))
+                        .wrapping_add((se & sf) ^ (!se & sg))
+                        .wrapping_add(wk);
+                    let t2 = big_sigma0(sa).wrapping_add((sa & sb) ^ (sa & sc) ^ (sb & sc));
+                    sh = sg;
+                    sg = sf;
+                    sf = se;
+                    se = sd.wrapping_add(t1);
+                    sd = sc;
+                    sc = sb;
+                    sb = sa;
+                    sa = t1.wrapping_add(t2);
+                }
+                put4([sf, se, sb, sa])
+            }
+        }
+
+        /// Drives the shipped SHA512-extension kernel with the emulated
+        /// instructions and requires bit-identical state to the software
+        /// compression, over runs of 1..=17 blocks from arbitrary start states.
+        #[test]
+        fn sha512_kernel_structure_matches_software() {
+            if !std::is_x86_feature_detected!("avx2") {
+                return;
+            }
+            let mut s = 0x0123_4567_89ab_cdefu64;
+            let mut next = || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            for nblocks in [1usize, 2, 3, 5, 8, 17] {
+                for _ in 0..40 {
+                    let mut start = [0u64; 8];
+                    for v in start.iter_mut() {
+                        *v = next();
+                    }
+                    let mut data = alloc::vec![0u8; nblocks * 128];
+                    for b in data.iter_mut() {
+                        *b = (next() >> 24) as u8;
+                    }
+                    let mut emu = start;
+                    // SAFETY: AVX2 confirmed above; the emulated instructions
+                    // need nothing further.
+                    unsafe { compress512_kernel::<Sha512Emu>(&mut emu, &data) };
+                    let mut sw = start;
+                    for chunk in data.chunks_exact(128) {
+                        compress512_soft(&mut sw, chunk.try_into().unwrap());
+                    }
+                    assert_eq!(emu, sw, "kernel/soft mismatch (n={nblocks})");
+                }
+            }
         }
     }
 }

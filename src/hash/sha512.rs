@@ -173,10 +173,12 @@ impl State512 {
             }
         }
 
-        while data.len() >= 128 {
-            let block: &[u8; 128] = data[..128].try_into().unwrap();
-            compress512(&mut self.h, block);
-            data = &data[128..];
+        // Compress all full blocks straight from the input in one call, so the
+        // hardware backend keeps the state register-resident across them.
+        let full = data.len() & !127;
+        if full > 0 {
+            compress512_blocks(&mut self.h, &data[..full]);
+            data = &data[full..];
         }
 
         if !data.is_empty() {
@@ -234,17 +236,36 @@ const fn rotr(x: u64, n: u32) -> u64 {
 
 /// SHA-512 compression function: folds a 128-byte block into the state.
 ///
-/// Dispatches to the aarch64 `sha512` hardware extension when available, else
-/// the portable software path. Both produce identical state and are
-/// constant-time. (x86 has no broadly-available SHA-512 instruction.)
+/// Dispatches to the hardware SHA-512 extension (the x86_64 SHA512 extension,
+/// `sha512` on aarch64) when the CPU supports it, falling back to the portable
+/// software path otherwise. Both produce identical state and are constant-time.
 #[inline]
 fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha512_supported() {
         super::sha_hw::compress512(h, block);
         return;
     }
     compress512_soft(h, block);
+}
+
+/// Compresses `data` (a whole number of 128-byte blocks) into the state.
+///
+/// Dispatches the entire run to the hardware backend in a single call when
+/// available — the x86 backend keeps the state in registers across all blocks,
+/// avoiding the per-block spill/reload of repeated [`compress512`] calls — and
+/// otherwise loops the software compression.
+#[inline]
+fn compress512_blocks(h: &mut [u64; 8], data: &[u8]) {
+    debug_assert!(data.len().is_multiple_of(128));
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    if super::sha_hw::sha512_supported() {
+        super::sha_hw::compress512_blocks(h, data);
+        return;
+    }
+    for block in data.chunks_exact(128) {
+        compress512_soft(h, block.try_into().unwrap());
+    }
 }
 
 /// Portable software SHA-512 compression (the constant-time fallback).
@@ -393,9 +414,10 @@ mod tests {
     use super::*;
     use crate::test_util::from_hex;
 
-    /// The aarch64 `sha512` hardware compression must equal the software path
-    /// for every block. Runs only where the extension exists.
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    /// The hardware SHA-512 compression (the x86_64 SHA512 extension, `sha512`
+    /// on aarch64) must equal the software path for every block. Runs only where
+    /// the extension exists.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
     fn sha512_hardware_matches_software() {
         // See the note in `sha1.rs`: report skip-vs-run so a green suite is not
@@ -431,13 +453,34 @@ mod tests {
             super::super::sha_hw::compress512(&mut b, &block);
             assert_eq!(a, b, "sha512 HW/soft mismatch");
         }
+        // Multi-block kernel: the register-resident `compress512_blocks` over a
+        // run of N blocks must equal looping `compress512_soft` block-by-block,
+        // from an arbitrary (non-IV) start state. Directly pins the cross-block
+        // Davies-Meyer feed-forward in the multi-block path.
+        for nblocks in [1usize, 2, 3, 5, 17] {
+            let mut start = H512;
+            for v in start.iter_mut() {
+                *v ^= next();
+            }
+            let mut blocks = alloc::vec![0u8; nblocks * 128];
+            for b in blocks.iter_mut() {
+                *b = (next() >> 24) as u8;
+            }
+            let mut h_hw = start;
+            super::super::sha_hw::compress512_blocks(&mut h_hw, &blocks);
+            let mut h_sw = start;
+            for chunk in blocks.chunks_exact(128) {
+                compress512_soft(&mut h_sw, chunk.try_into().unwrap());
+            }
+            assert_eq!(h_hw, h_sw, "multi-block HW/soft mismatch (n={nblocks})");
+        }
         // Dispatched digest must equal a pure-software digest of the same data.
         let data: alloc::vec::Vec<u8> = (0..900u32).map(|i| (i * 5) as u8).collect();
         assert_eq!(sha512(&data).to_vec(), software_sha512(&data));
     }
 
     /// Pure-software SHA-512 digest (bypasses the HW dispatch) for the test.
-    #[cfg(all(feature = "std", target_arch = "aarch64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn software_sha512(data: &[u8]) -> alloc::vec::Vec<u8> {
         let mut h = H512;
         let mut buf = data.to_vec();
