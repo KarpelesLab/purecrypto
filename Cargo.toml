@@ -71,6 +71,9 @@ hazmat-secp256k1 = ["ec"]
 # Finite-field Diffie-Hellman over RFC 3526 MODP groups (group14..group18)
 # plus RFC 4419 group-exchange. For SSH and legacy TLS / IKE interop;
 # ECDH (in the `ec` module) is preferred for new code.
+# Requires `alloc`: a `DhGroup` carries its modulus as a runtime-sized
+# `BoxedUint`, and RFC 4419 group exchange lets the *peer* choose the prime, so
+# the operand width has no compile-time bound to size a fixed buffer against.
 dh = ["bignum", "rng", "alloc"]
 der = []
 x509 = ["der", "rsa", "hash", "alloc", "ec"]
