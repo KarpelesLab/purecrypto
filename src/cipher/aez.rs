@@ -34,7 +34,7 @@ use super::TagMismatch;
 use super::aes::aes_round;
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Blake2b384, Digest};
-use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 const BLOCK: usize = 16;
@@ -236,8 +236,8 @@ impl Aez {
     }
 
     /// AEZ-prf: keystream `(E^{-1,3}(Δ) ‖ E^{-1,3}(Δ⊕1) ‖ …)[..tau]`.
-    fn aez_prf(&self, delta: &Block, tau: usize) -> Vec<u8> {
-        let mut out = vec![0u8; tau];
+    fn aez_prf(&self, delta: &Block, out: &mut [u8]) {
+        let tau = out.len();
         let mut ctr = ZERO;
         let mut off = 0;
         while off < tau {
@@ -258,7 +258,6 @@ impl Aez {
             }
             off += BLOCK;
         }
-        out
     }
 
     /// AEZ-core pass 1 (in place over the i-blocks): computes `X` and writes the
@@ -519,23 +518,35 @@ impl Aez {
     /// `ad`, with a `tau`-byte expansion. Returns `m.len() + tau` ciphertext
     /// bytes. A given `(key, nonce)` should be unique, though AEZ degrades
     /// gracefully on reuse.
+    #[cfg(feature = "alloc")]
     pub fn encrypt(&self, nonce: &[u8], ad: &[&[u8]], tau: usize, m: &[u8]) -> Vec<u8> {
+        let mut out = alloc::vec![0u8; m.len() + tau];
+        self.encrypt_into(nonce, ad, tau, m, &mut out);
+        out
+    }
+
+    /// Allocation-free counterpart of [`encrypt`](Self::encrypt): writes the
+    /// ciphertext into `out`, which must be exactly `m.len() + tau` octets.
+    ///
+    /// # Panics
+    /// If `out.len() != m.len() + tau`.
+    pub fn encrypt_into(&self, nonce: &[u8], ad: &[&[u8]], tau: usize, m: &[u8], out: &mut [u8]) {
+        assert_eq!(out.len(), m.len() + tau, "AEZ encrypt: wrong output length");
         let delta = self.aez_hash(nonce, ad, (tau * 8) as u32);
-        let mut out = vec![0u8; m.len() + tau];
+        out.fill(0);
         if m.is_empty() {
-            let prf = self.aez_prf(&delta, tau);
-            out.copy_from_slice(&prf);
+            self.aez_prf(&delta, out);
         } else {
             out[..m.len()].copy_from_slice(m);
             // trailing tau bytes are already zero
-            self.encipher(&delta, &mut out);
+            self.encipher(&delta, out);
         }
-        out
     }
 
     /// Verifies and decrypts `c` (which must be `plaintext_len + tau` bytes),
     /// returning the plaintext on success and [`TagMismatch`] if authentication
     /// fails. The accept/reject check is constant-time.
+    #[cfg(feature = "alloc")]
     pub fn decrypt(
         &self,
         nonce: &[u8],
@@ -546,30 +557,65 @@ impl Aez {
         if c.len() < tau {
             return Err(TagMismatch);
         }
+        let mut buf = alloc::vec![0u8; c.len()];
+        let n = self.decrypt_into(nonce, ad, tau, c, &mut buf)?;
+        buf.truncate(n);
+        Ok(buf)
+    }
+
+    /// Allocation-free counterpart of [`decrypt`](Self::decrypt): deciphers into
+    /// `out` and returns the plaintext length (`c.len() - tau`).
+    ///
+    /// `out` must be at least `c.len()` octets — the whole ciphertext is
+    /// deciphered in place before the trailing expansion is checked, so the
+    /// buffer is sized by the ciphertext, not the plaintext.
+    ///
+    /// # Panics
+    /// If `out.len() < c.len()`.
+    pub fn decrypt_into(
+        &self,
+        nonce: &[u8],
+        ad: &[&[u8]],
+        tau: usize,
+        c: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, TagMismatch> {
+        if c.len() < tau {
+            return Err(TagMismatch);
+        }
+        assert!(out.len() >= c.len(), "AEZ decrypt: output buffer too small");
         let delta = self.aez_hash(nonce, ad, (tau * 8) as u32);
         if c.len() == tau {
             // Empty plaintext: ciphertext is exactly the PRF tag.
-            let prf = self.aez_prf(&delta, tau);
+            let prf = &mut out[..tau];
+            self.aez_prf(&delta, prf);
             if bool::from(prf.ct_eq(c)) {
-                return Ok(Vec::new());
+                return Ok(0);
             }
             return Err(TagMismatch);
         }
-        let mut buf = c.to_vec();
-        self.decipher(&delta, &mut buf);
+        let buf = &mut out[..c.len()];
+        buf.copy_from_slice(c);
+        self.decipher(&delta, buf);
         let m_len = c.len() - tau;
-        // The trailing tau bytes must all be zero (constant-time check).
-        let zeros = vec![0u8; tau];
-        if bool::from(buf[m_len..].ct_eq(&zeros)) {
-            buf.truncate(m_len);
-            Ok(buf)
+        // The trailing tau bytes must all be zero. Fold them into one
+        // accumulator rather than comparing against a zero buffer: same
+        // constant-time property, no allocation, and no early exit.
+        let mut acc = 0u8;
+        for &b in &buf[m_len..] {
+            acc |= b;
+        }
+        if bool::from(acc.ct_eq(&0)) {
+            Ok(m_len)
         } else {
             Err(TagMismatch)
         }
     }
 }
 
-#[cfg(test)]
+// The AEZ reference vectors decode hex into `Vec`s and drive the
+// `Vec`-returning API; `nobuf_tests` covers the allocator-free path.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
 
@@ -619,7 +665,8 @@ mod tests {
             let aez = Aez::new(&h(k));
             let mut d = [0u8; 16];
             d.copy_from_slice(&h(delta));
-            let got = aez.aez_prf(&d, *tau);
+            let mut got = alloc::vec![0u8; *tau];
+            aez.aez_prf(&d, &mut got);
             assert_eq!(got, h(r), "prf k={k}");
         }
     }
@@ -705,5 +752,75 @@ mod tests {
                 assert_eq!(pt, m, "roundtrip m={len} tau={tau}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod nobuf_tests {
+    use super::*;
+
+    /// Encrypt/decrypt into caller buffers, with no allocator.
+    #[test]
+    fn roundtrip_into_no_alloc() {
+        let aez = Aez::new(b"an AEZ key");
+        let m = b"attack at dawn";
+        let tau = 16;
+        let mut ct = [0u8; 14 + 16];
+        aez.encrypt_into(b"nonce", &[b"ad".as_slice()], tau, m, &mut ct);
+
+        let mut pt = [0u8; 30];
+        let n = aez
+            .decrypt_into(b"nonce", &[b"ad".as_slice()], tau, &ct, &mut pt)
+            .expect("authentic");
+        assert_eq!(&pt[..n], m);
+    }
+
+    /// A tampered ciphertext, a wrong nonce and wrong AD are all rejected.
+    #[test]
+    fn rejects_tampering_no_alloc() {
+        let aez = Aez::new(b"k");
+        let tau = 16;
+        let mut ct = [0u8; 4 + 16];
+        aez.encrypt_into(b"n", &[], tau, b"abcd", &mut ct);
+        let mut pt = [0u8; 20];
+
+        let mut bad = ct;
+        bad[0] ^= 1;
+        assert!(aez.decrypt_into(b"n", &[], tau, &bad, &mut pt).is_err());
+        assert!(aez.decrypt_into(b"x", &[], tau, &ct, &mut pt).is_err());
+        assert!(
+            aez.decrypt_into(b"n", &[b"ad".as_slice()], tau, &ct, &mut pt)
+                .is_err()
+        );
+    }
+
+    /// The empty-plaintext case is the bare PRF tag, and round-trips to zero
+    /// bytes rather than erroring.
+    #[test]
+    fn empty_plaintext_no_alloc() {
+        let aez = Aez::new(b"k");
+        let tau = 16;
+        let mut ct = [0u8; 16];
+        aez.encrypt_into(b"n", &[], tau, b"", &mut ct);
+        let mut pt = [0u8; 16];
+        assert_eq!(
+            aez.decrypt_into(b"n", &[], tau, &ct, &mut pt).expect("ok"),
+            0
+        );
+    }
+
+    /// The buffer-passing and allocating APIs agree byte for byte.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn into_matches_allocating_api() {
+        let aez = Aez::new(b"k2");
+        let m = b"0123456789abcdef0123";
+        let tau = 8;
+        let mut ct = [0u8; 20 + 8];
+        aez.encrypt_into(b"nn", &[b"a".as_slice()], tau, m, &mut ct);
+        assert_eq!(
+            ct.as_slice(),
+            aez.encrypt(b"nn", &[b"a".as_slice()], tau, m)
+        );
     }
 }

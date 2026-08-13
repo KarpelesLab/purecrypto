@@ -67,7 +67,8 @@ impl Drop for XChaCha20Poly1305 {
     }
 }
 
-#[cfg(test)]
+// Uses the `alloc`-gated hex helpers.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::test_util::{from_hex, from_hex_vec};

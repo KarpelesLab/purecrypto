@@ -106,6 +106,10 @@ jobs:
       - name: Build slhdsa without alloc
         run: cargo build --target ${{ matrix.target }} --no-default-features --features slhdsa
 
+      # `aez` without alloc: encrypt/decrypt into caller buffers.
+      - name: Build aez without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features aez
+
       # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
       # must still build when `alloc` is present but `std` is not.
       - name: Build ec with alloc, no std

@@ -137,7 +137,7 @@ ascon = ["hash", "cipher"]
 # built from the AES round. Nonce-misuse-resistant, arbitrary expansion, vector
 # AD. Needs `alloc` for the variable-length enciphered output and `hash` for the
 # BLAKE2b key-derivation (`Extract`).
-aez = ["cipher", "hash", "alloc"]
+aez = ["cipher", "hash"]
 # LMS / HSS stateful hash-based signatures (RFC 8554, NIST SP 800-208).
 # Stateful: the private key advances a one-time-key index on every signature
 # and MUST be re-persisted after each sign — reuse is catastrophic.

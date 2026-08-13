@@ -321,7 +321,8 @@ pub type Aes128GcmSiv = AesGcmSiv;
 /// AES-256-GCM-SIV (32-byte key).
 pub type Aes256GcmSiv = AesGcmSiv;
 
-#[cfg(test)]
+// Uses the `alloc`-gated hex helpers.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::test_util::{from_hex, from_hex_vec};
