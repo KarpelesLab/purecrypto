@@ -41,6 +41,7 @@ mod tree;
 
 pub use params::{LmotsType, LmsType};
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 use params::N;
 
@@ -94,12 +95,29 @@ fn wipe(buf: &mut [u8]) {
 // LMS — single-tree stateful key
 // ===================================================================
 
+/// Length of an encoded single-tree LMS public key:
+/// `u32(lms_type) || u32(ots_type) || I(16) || T[1](N)`.
+pub const PUBKEY_LEN: usize = 24 + N;
+
+/// Length of an encoded single-tree LMS private key (including the live leaf
+/// index `q` and the cached root).
+pub const PRIVKEY_LEN: usize = 4 + 4 + 16 + N + 4 + N;
+
+/// Byte length of an LMS signature for the given parameter pair.
+///
+/// Use this to size the buffer for
+/// [`LmsPrivateKey::sign_into`](LmsPrivateKey::sign_into) on allocator-free
+/// targets. Ranges from 1 KiB (`W8`/`H5`) to roughly 9 KiB (`W1`/`H25`).
+pub const fn signature_len(lms: LmsType, ots: LmotsType) -> usize {
+    4 + ots.sig_len() + 4 + (lms.h() as usize) * N
+}
+
 /// A single-tree LMS public (verification) key.
 ///
 /// Wraps the wire encoding `u32(lms_type) || u32(ots_type) || I || T[1]`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct LmsPublicKey {
-    bytes: Vec<u8>,
+    bytes: [u8; PUBKEY_LEN],
 }
 
 /// A single-tree LMS private (signing) key.
@@ -188,6 +206,7 @@ impl LmsPrivateKey {
     /// `rng` supplies the per-signature LM-OTS randomizer `C`; it SHOULD be a
     /// CSPRNG. **Persist [`to_bytes`](Self::to_bytes) before using the returned
     /// signature** — see the [module documentation](crate::lms).
+    #[cfg(feature = "alloc")]
     pub fn sign<R: RngCore>(&mut self, rng: &mut R, message: &[u8]) -> Result<Vec<u8>, Error> {
         let mut c = [0u8; N];
         rng.fill_bytes(&mut c);
@@ -196,11 +215,19 @@ impl LmsPrivateKey {
 
     /// Signs with a caller-supplied randomizer `c` (used to reproduce the RFC
     /// 8554 vectors, which fix `C`). Advances `q`.
-    fn sign_with_c(&mut self, message: &[u8], c: &[u8; N]) -> Result<Vec<u8>, Error> {
+    fn sign_with_c_into(
+        &mut self,
+        message: &[u8],
+        c: &[u8; N],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if self.q as u64 >= self.lms_type.leaves() {
             return Err(Error::Exhausted);
         }
-        let sig = tree::sign(
+        if out.len() != self.signature_len() {
+            return Err(Error::InvalidKey);
+        }
+        let n = tree::sign(
             self.lms_type,
             self.ots_type,
             &self.i_id,
@@ -208,9 +235,41 @@ impl LmsPrivateKey {
             self.q,
             c,
             message,
+            out,
         );
         self.q += 1;
-        Ok(sig)
+        Ok(n)
+    }
+
+    /// Signs with a caller-supplied randomizer, returning a heap signature.
+    #[cfg(feature = "alloc")]
+    fn sign_with_c(&mut self, message: &[u8], c: &[u8; N]) -> Result<Vec<u8>, Error> {
+        let mut out = alloc::vec![0u8; self.signature_len()];
+        self.sign_with_c_into(message, c, &mut out)?;
+        Ok(out)
+    }
+
+    /// Byte length of the signatures this key produces — the exact size the
+    /// `out` buffer of [`sign_into`](Self::sign_into) must have.
+    pub const fn signature_len(&self) -> usize {
+        signature_len(self.lms_type, self.ots_type)
+    }
+
+    /// Signs `message` into `out` (exactly [`signature_len`](Self::signature_len)
+    /// octets), advancing `q`. Allocation-free counterpart of
+    /// [`sign`](Self::sign).
+    ///
+    /// **Persist [`to_bytes_array`](Self::to_bytes_array) before releasing the
+    /// signature** — see the [module documentation](crate::lms).
+    pub fn sign_into<R: RngCore>(
+        &mut self,
+        rng: &mut R,
+        message: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        let mut c = [0u8; N];
+        rng.fill_bytes(&mut c);
+        self.sign_with_c_into(message, &c, out)
     }
 
     /// Serializes the private key **including the live leaf index `q`** and the
@@ -225,14 +284,24 @@ impl LmsPrivateKey {
     /// pass. The layout is a pure superset of the legacy 60-byte form (the root
     /// is appended at the end), so older builds' parsers are unaffected and this
     /// build still reads legacy bytes (see [`from_bytes`](Self::from_bytes)).
+    #[cfg(feature = "alloc")]
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + 4 + 16 + N + 4 + N);
-        v.extend_from_slice(&self.lms_type.typecode().to_be_bytes());
-        v.extend_from_slice(&self.ots_type.typecode().to_be_bytes());
-        v.extend_from_slice(&self.i_id);
-        v.extend_from_slice(&self.seed);
-        v.extend_from_slice(&self.q.to_be_bytes());
-        v.extend_from_slice(&self.root);
+        self.to_bytes_array().to_vec()
+    }
+
+    /// Allocation-free counterpart of [`to_bytes`](Self::to_bytes): the encoding
+    /// is a fixed [`PRIVKEY_LEN`] octets, so it needs no heap at all.
+    ///
+    /// This is the value to persist after **every** signature — see the
+    /// [module documentation](crate::lms).
+    pub fn to_bytes_array(&self) -> [u8; PRIVKEY_LEN] {
+        let mut v = [0u8; PRIVKEY_LEN];
+        v[..4].copy_from_slice(&self.lms_type.typecode().to_be_bytes());
+        v[4..8].copy_from_slice(&self.ots_type.typecode().to_be_bytes());
+        v[8..24].copy_from_slice(&self.i_id);
+        v[24..24 + N].copy_from_slice(&self.seed);
+        v[24 + N..28 + N].copy_from_slice(&self.q.to_be_bytes());
+        v[28 + N..].copy_from_slice(&self.root);
         v
     }
 
@@ -319,7 +388,7 @@ impl LmsPublicKey {
 
     /// Parses a raw LMS public key, validating its length and typecodes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() != 24 + N {
+        if bytes.len() != PUBKEY_LEN {
             return Err(Error::InvalidKey);
         }
         let lms_ok =
@@ -331,9 +400,9 @@ impl LmsPublicKey {
         if !lms_ok || !ots_ok {
             return Err(Error::InvalidKey);
         }
-        Ok(LmsPublicKey {
-            bytes: bytes.to_vec(),
-        })
+        let mut b = [0u8; PUBKEY_LEN];
+        b.copy_from_slice(bytes);
+        Ok(LmsPublicKey { bytes: b })
     }
 
     /// Verifies an LMS `signature` over `message` (RFC 8554 §5.4.2).
@@ -351,6 +420,7 @@ pub fn verify_lms(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
 // HSS — multi-level stateful key
 // ===================================================================
 
+#[cfg(feature = "alloc")]
 /// One level of an HSS key: its parameter sets, identifier, and master seed.
 struct HssLevel {
     lms_type: LmsType,
@@ -359,6 +429,7 @@ struct HssLevel {
     seed: [u8; N],
 }
 
+#[cfg(feature = "alloc")]
 impl Drop for HssLevel {
     fn drop(&mut self) {
         wipe(&mut self.seed);
@@ -366,12 +437,14 @@ impl Drop for HssLevel {
     }
 }
 
+#[cfg(feature = "alloc")]
 /// An HSS public (verification) key: `u32(L) || lms_public_key`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct HssPublicKey {
     bytes: Vec<u8>,
 }
 
+#[cfg(feature = "alloc")]
 /// A multi-level HSS private (signing) key.
 ///
 /// **Stateful** — see the [module documentation](crate::lms). Internally each
@@ -406,6 +479,7 @@ pub struct HssPrivateKey {
     q: Vec<u32>,
 }
 
+#[cfg(feature = "alloc")]
 impl HssPrivateKey {
     /// Builds an HSS key from a fixed `(lms_type, ots_type, I, seed)` per level
     /// (top level first). `L = levels.len()` must be 1..=8.
@@ -590,33 +664,40 @@ impl HssPrivateKey {
     ) {
         let l = self.levels.len();
         let lv = &self.levels[i];
-        let signed = if i + 1 < l {
+        // The signed bytes are either the child level's encoded public key
+        // (fixed size) or the caller's message; keep the encoded key alive in a
+        // local so both arms can borrow as a slice.
+        let child_pk;
+        let signed: &[u8] = if i + 1 < l {
             let child = &self.levels[i + 1];
-            tree::encode_public_key(
+            child_pk = tree::encode_public_key(
                 child.lms_type,
                 child.ots_type,
                 &child.i_id,
                 &self.roots[i + 1],
-            )
+            );
+            &child_pk
         } else {
-            message.to_vec()
+            message
         };
         let c = match c {
             Some(c) => *c,
-            None => ots::derive_c(&lv.i_id, &lv.seed, self.q[i], &signed),
+            None => ots::derive_c(&lv.i_id, &lv.seed, self.q[i], signed),
         };
-        let sig = tree::sign(
+        let mut sig = alloc::vec![0u8; signature_len(lv.lms_type, lv.ots_type)];
+        tree::sign(
             lv.lms_type,
             lv.ots_type,
             &lv.i_id,
             &lv.seed,
             self.q[i],
             &c,
-            &signed,
+            signed,
+            &mut sig,
         );
         out.extend_from_slice(&sig);
         if i + 1 < l {
-            out.extend_from_slice(&signed); // pub[i+1]
+            out.extend_from_slice(signed); // pub[i+1]
         }
     }
 
@@ -773,6 +854,7 @@ impl HssPrivateKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl HssPublicKey {
     /// The encoded public key (`u32(L) || lms_public_key`).
     pub fn to_bytes(&self) -> &[u8] {
@@ -800,6 +882,7 @@ impl HssPublicKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 /// Verifies an HSS signature against a raw HSS public key (RFC 8554 §6.3).
 pub fn verify_hss(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     if public_key.len() != 4 + 24 + N || signature.len() < 4 {
@@ -856,6 +939,7 @@ pub fn verify_hss(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     tree::verify(&key, message, &signature[off..off + sig_len])
 }
 
+#[cfg(feature = "alloc")]
 /// Returns the byte length of the LMS signature that prefixes `buf`, parsing
 /// just enough of it to determine the length, or `None` if malformed.
 fn lms_sig_len(buf: &[u8]) -> Option<usize> {
@@ -879,5 +963,71 @@ fn lms_sig_len(buf: &[u8]) -> Option<usize> {
     Some(4 + ots_len + 4 + lms_type.h() as usize * N)
 }
 
-#[cfg(test)]
+// The RFC 8554 vector suite drives the `Vec`-returning APIs and the HSS layer,
+// both of which need `alloc`; `nobuf_tests` covers the allocator-free path.
+#[cfg(all(test, feature = "alloc"))]
 mod tests;
+
+#[cfg(test)]
+mod nobuf_tests {
+    use super::*;
+    use crate::rng::HmacDrbg;
+
+    fn drbg(tag: &[u8]) -> HmacDrbg<crate::hash::Sha256> {
+        HmacDrbg::<crate::hash::Sha256>::new(tag, b"nonce", &[])
+    }
+
+    /// Signing into a caller buffer and verifying, with no allocator in play.
+    #[test]
+    fn sign_into_verify_roundtrip_no_alloc() {
+        let mut rng = drbg(b"lms-nobuf");
+        let mut sk =
+            LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+        let pk = sk.public_key();
+
+        let mut sig = [0u8; 1292];
+        let n = sk.signature_len();
+        assert_eq!(
+            n,
+            signature_len(LmsType::Sha256M32H5, LmotsType::Sha256N32W8)
+        );
+        let written = sk
+            .sign_into(&mut rng, b"firmware image", &mut sig[..n])
+            .expect("sign");
+        assert_eq!(written, n);
+
+        assert!(pk.verify(b"firmware image", &sig[..n]));
+        assert!(!pk.verify(b"other image", &sig[..n]));
+        assert!(verify_lms(pk.to_bytes(), b"firmware image", &sig[..n]));
+    }
+
+    /// The fixed-size private-key encoding round-trips and carries the live
+    /// leaf index, which is the whole point of persisting it.
+    #[test]
+    fn privkey_array_roundtrip_carries_q_no_alloc() {
+        let mut rng = drbg(b"lms-state");
+        let mut sk =
+            LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+        let before = sk.remaining();
+        let mut sig = [0u8; 1292];
+        let n = sk.signature_len();
+        sk.sign_into(&mut rng, b"m", &mut sig[..n]).expect("sign");
+        assert_eq!(sk.remaining(), before - 1);
+
+        let enc = sk.to_bytes_array();
+        assert_eq!(enc.len(), PRIVKEY_LEN);
+        let restored = LmsPrivateKey::from_bytes(&enc).expect("reload");
+        assert_eq!(restored.remaining(), sk.remaining());
+        assert_eq!(restored.public_key().to_bytes(), sk.public_key().to_bytes());
+    }
+
+    /// A wrong-size output buffer is rejected rather than silently truncating.
+    #[test]
+    fn sign_into_rejects_wrong_buffer_len() {
+        let mut rng = drbg(b"lms-len");
+        let mut sk =
+            LmsPrivateKey::generate(LmsType::Sha256M32H5, LmotsType::Sha256N32W8, &mut rng);
+        let mut short = [0u8; 16];
+        assert!(sk.sign_into(&mut rng, b"m", &mut short).is_err());
+    }
+}

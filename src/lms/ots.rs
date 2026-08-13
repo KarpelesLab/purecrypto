@@ -89,6 +89,9 @@ pub(crate) fn derive_x(i_id: &[u8; 16], seed: &[u8; N], q: u32, chain: u16, out:
 /// The chain index `0xfffd` cannot collide with [`derive_x`] (whose chain
 /// indices are `< p <= 265`) and matches the C-randomizer index used by the
 /// RFC 8554 reference implementation.
+// Only the HSS layer derives a deterministic randomizer, and that layer is
+// `alloc`-gated (its level vectors are runtime-sized).
+#[cfg(feature = "alloc")]
 pub(crate) fn derive_c(i_id: &[u8; 16], seed: &[u8; N], q: u32, message: &[u8]) -> [u8; N] {
     let mut h = Sha256::new();
     h.update(i_id);

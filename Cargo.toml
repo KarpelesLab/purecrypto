@@ -141,7 +141,7 @@ aez = ["cipher", "hash", "alloc"]
 # LMS / HSS stateful hash-based signatures (RFC 8554, NIST SP 800-208).
 # Stateful: the private key advances a one-time-key index on every signature
 # and MUST be re-persisted after each sign — reuse is catastrophic.
-lms = ["hash", "rng", "alloc"]
+lms = ["hash", "rng"]
 # XMSS / XMSS^MT stateful hash-based signatures (RFC 8391, NIST SP 800-208).
 # Same stateful-key discipline as `lms`.
 xmss = ["hash", "rng", "alloc"]

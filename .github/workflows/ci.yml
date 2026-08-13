@@ -85,6 +85,11 @@ jobs:
       - name: Build rsa without alloc
         run: cargo build --target ${{ matrix.target }} --no-default-features --features rsa
 
+      # `lms` without alloc: single-tree LMS keygen/sign/verify (the secure-boot
+      # shape). HSS is alloc-gated — its level vectors are runtime-sized.
+      - name: Build lms without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features lms
+
       # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
       # must still build when `alloc` is present but `std` is not.
       - name: Build ec with alloc, no std

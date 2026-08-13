@@ -47,12 +47,12 @@ impl LmotsType {
     }
 
     /// The wire typecode.
-    pub(crate) fn typecode(self) -> u32 {
+    pub(crate) const fn typecode(self) -> u32 {
         self as u32
     }
 
     /// The Winternitz width `w` in bits (one of 1, 2, 4, 8).
-    pub(crate) fn w(self) -> u32 {
+    pub(crate) const fn w(self) -> u32 {
         match self {
             LmotsType::Sha256N32W1 => 1,
             LmotsType::Sha256N32W2 => 2,
@@ -62,7 +62,7 @@ impl LmotsType {
     }
 
     /// The number of Winternitz chains `p` (RFC 8554 Table 1 / Appendix B).
-    pub(crate) fn p(self) -> usize {
+    pub(crate) const fn p(self) -> usize {
         match self {
             LmotsType::Sha256N32W1 => 265,
             LmotsType::Sha256N32W2 => 133,
@@ -72,7 +72,7 @@ impl LmotsType {
     }
 
     /// The checksum left-shift `ls` (RFC 8554 Table 1 / Appendix B).
-    pub(crate) fn ls(self) -> u32 {
+    pub(crate) const fn ls(self) -> u32 {
         match self {
             LmotsType::Sha256N32W1 => 7,
             LmotsType::Sha256N32W2 => 6,
@@ -87,7 +87,7 @@ impl LmotsType {
     }
 
     /// The serialized LM-OTS signature length: `4 + n*(p+1)` bytes.
-    pub(crate) fn sig_len(self) -> usize {
+    pub(crate) const fn sig_len(self) -> usize {
         4 + N * (self.p() + 1)
     }
 }
@@ -125,12 +125,12 @@ impl LmsType {
     }
 
     /// The wire typecode.
-    pub(crate) fn typecode(self) -> u32 {
+    pub(crate) const fn typecode(self) -> u32 {
         self as u32
     }
 
     /// The Merkle tree height `h`.
-    pub(crate) fn h(self) -> u32 {
+    pub(crate) const fn h(self) -> u32 {
         match self {
             LmsType::Sha256M32H5 => 5,
             LmsType::Sha256M32H10 => 10,
@@ -141,7 +141,7 @@ impl LmsType {
     }
 
     /// The number of leaves `2^h`.
-    pub(crate) fn leaves(self) -> u64 {
+    pub(crate) const fn leaves(self) -> u64 {
         1u64 << self.h()
     }
 }

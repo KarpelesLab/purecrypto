@@ -4,8 +4,6 @@ use super::ots;
 use super::params::{D_INTR, D_LEAF, LmotsType, LmsType, N};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Sha256};
-use alloc::vec;
-use alloc::vec::Vec;
 
 /// Computes the LMS leaf hash for leaf `q`
 /// (`H(I || u32str(2^h + q) || u16str(D_LEAF) || K)`), where `K` is the LM-OTS
@@ -76,18 +74,25 @@ pub(crate) fn encode_public_key(
     ots_type: LmotsType,
     i_id: &[u8; 16],
     root: &[u8; N],
-) -> Vec<u8> {
-    let mut v = Vec::with_capacity(24 + N);
-    v.extend_from_slice(&lms.typecode().to_be_bytes());
-    v.extend_from_slice(&ots_type.typecode().to_be_bytes());
-    v.extend_from_slice(i_id);
-    v.extend_from_slice(root);
+) -> [u8; super::PUBKEY_LEN] {
+    let mut v = [0u8; super::PUBKEY_LEN];
+    v[..4].copy_from_slice(&lms.typecode().to_be_bytes());
+    v[4..8].copy_from_slice(&ots_type.typecode().to_be_bytes());
+    v[8..24].copy_from_slice(i_id);
+    v[24..].copy_from_slice(root);
     v
 }
 
 /// Generates an LMS signature for leaf `q` (RFC 8554 §5.4, Algorithm 5 + D).
 ///
-/// Returns `u32str(q) || lmots_signature || u32str(lms_type) || path[0..h]`.
+/// Writes `u32str(q) || lmots_signature || u32str(lms_type) || path[0..h]` into
+/// `sig`, which must be exactly [`signature_len`](super::signature_len) octets,
+/// and returns the number written. Allocation-free so that signing works on
+/// allocator-less targets; the `Vec`-returning wrapper lives in `super`.
+// One argument over clippy's default threshold: the RFC 8554 signing inputs
+// (parameter pair, I, seed, q, randomizer, message) plus the caller's output
+// buffer. Bundling them into a struct would only move the same fields around.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sign(
     lms: LmsType,
     ots_type: LmotsType,
@@ -96,10 +101,12 @@ pub(crate) fn sign(
     q: u32,
     c: &[u8; N],
     message: &[u8],
-) -> Vec<u8> {
+    sig: &mut [u8],
+) -> usize {
     let h = lms.h();
     let ots_len = ots_type.sig_len();
-    let mut sig = vec![0u8; 4 + ots_len + 4 + h as usize * N];
+    debug_assert_eq!(sig.len(), 4 + ots_len + 4 + h as usize * N);
+    sig.fill(0);
 
     sig[..4].copy_from_slice(&q.to_be_bytes());
     ots::sign(
@@ -123,7 +130,7 @@ pub(crate) fn sign(
         sig[path_off..path_off + N].copy_from_slice(&val);
         path_off += N;
     }
-    sig
+    path_off
 }
 
 /// Computes the candidate LMS root `Tc` from a signature and message
