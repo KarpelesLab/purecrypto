@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0](https://github.com/KarpelesLab/purecrypto/compare/v0.6.29...v0.7.0) - 2026-08-13
+
+### Added
+
+- *(kdf)* multi-part HKDF extract/expand; document why dh needs alloc
+- *(aez)* AEZ encryption and decryption without alloc
+- *(slhdsa)* SLH-DSA keygen, signing and verification without alloc
+- *(mldsa)* [**breaking**] ML-DSA keygen, signing and verification without alloc
+- *(xmss)* XMSS / XMSS^MT verification without alloc
+- *(lms)* single-tree LMS without alloc
+- *(rsa)* allocator-free PKCS#1 v1.5, PSS and OAEP
+- *(ec)* [**breaking**] make the fixed-curve primitives usable without alloc
+
+### Fixed
+
+- *(ct)* close constant-time gaps found in the secret-dependent paths
+- *(rsa)* make `features = ["rsa"]` build without alloc, as it already claimed
+
+### Other
+
+- *(hash)* report skip-vs-run for the hardware SHA differential tests
+- SHA-1 hardware acceleration (SHA-NI / ARMv8 sha1)
+
 ## [0.6.29](https://github.com/KarpelesLab/purecrypto/compare/v0.6.28...v0.6.29) - 2026-07-27
 
 ### Other
