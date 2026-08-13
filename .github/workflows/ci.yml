@@ -79,6 +79,12 @@ jobs:
       - name: Build ec without alloc
         run: cargo build --target ${{ matrix.target }} --no-default-features --features ec
 
+      # `rsa` declares no `alloc` dependency; keep that honest. Without alloc it
+      # provides key generation, the raw primitives and primality testing (the
+      # padded schemes live in the alloc-gated `emsa`/`pkcs1`/`pss` modules).
+      - name: Build rsa without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features rsa
+
       # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
       # must still build when `alloc` is present but `std` is not.
       - name: Build ec with alloc, no std

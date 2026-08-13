@@ -234,6 +234,10 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 }
 
+// `emsa` (and the `PublicModulus` trait it defines) is itself `alloc`-gated, so
+// this impl must be too: without it the fixed-size keys are still fully usable
+// for the raw primitives and key generation, just not the padded schemes.
+#[cfg(feature = "alloc")]
 impl<const LIMBS: usize> super::emsa::PublicModulus for RsaPublicKey<LIMBS> {
     fn modulus_be_bytes(&self) -> alloc::vec::Vec<u8> {
         // `key_size() == LIMBS * 8` big-endian octets of `n`, matching the
@@ -410,7 +414,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     }
 
     /// Constructs a private key from all components, including the primes.
-    /// Used by key deserialization.
+    /// Used by key deserialization, which is `alloc`-gated along with the DER
+    /// codecs — hence the cfg, which keeps allocator-free builds free of a
+    /// dead-code warning.
+    #[cfg(feature = "alloc")]
     pub(crate) fn from_raw_parts(
         n: Uint<LIMBS>,
         e: Uint<LIMBS>,
@@ -452,7 +459,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 
     /// Per-key 32-byte secret used to seed PKCS#1 v1.5 implicit-rejection
     /// fallbacks. Same value as the blinding HMAC key (derived once at key
-    /// construction from `d`).
+    /// construction from `d`). Only the `alloc`-gated PKCS#1 v1.5 decryption
+    /// path consumes this.
+    #[cfg(feature = "alloc")]
     pub(crate) fn secret_seed_bytes(&self) -> [u8; 32] {
         self.blinding_seed
     }
