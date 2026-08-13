@@ -11,88 +11,11 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::emsa::{self, RawPrivate, RawPublic};
+use super::digest_info::Pkcs1Digest;
+use super::emsa;
 use super::{Error, RsaPrivateKey, RsaPublicKey};
-use crate::bignum::Uint;
 use crate::hash::Digest;
 use crate::rng::{CryptoRng, RngCore};
-
-/// Big-endian `k`-byte serialization of a fixed-width `Uint`.
-fn uint_to_k_bytes<const LIMBS: usize>(value: &Uint<LIMBS>) -> Vec<u8> {
-    let mut buf = vec![0u8; LIMBS * 8];
-    value.write_be_bytes(&mut buf);
-    buf
-}
-
-impl<const LIMBS: usize> RawPublic for RsaPublicKey<LIMBS> {
-    fn key_size(&self) -> usize {
-        LIMBS * 8
-    }
-    fn modulus_bits(&self) -> usize {
-        self.modulus().bit_len()
-    }
-    fn raw_public(&self, m: &[u8]) -> Vec<u8> {
-        uint_to_k_bytes(&self.raw(&Uint::<LIMBS>::from_be_bytes(m)))
-    }
-}
-
-impl<const LIMBS: usize> RawPrivate for RsaPrivateKey<LIMBS> {
-    fn key_size(&self) -> usize {
-        LIMBS * 8
-    }
-    fn modulus_bits(&self) -> usize {
-        self.modulus().bit_len()
-    }
-    fn raw_private(&self, c: &[u8]) -> Vec<u8> {
-        uint_to_k_bytes(&self.raw(&Uint::<LIMBS>::from_be_bytes(c)))
-    }
-    fn secret_seed(&self) -> [u8; 32] {
-        self.secret_seed_bytes()
-    }
-}
-
-/// A hash usable with PKCS#1 v1.5 signatures: it carries the DER-encoded
-/// `DigestInfo` prefix that precedes the hash value in the signature encoding.
-pub trait Pkcs1Digest: Digest {
-    /// The DER `DigestInfo` prefix (algorithm identifier + OCTET STRING header)
-    /// for this hash.
-    const DIGEST_INFO_PREFIX: &'static [u8];
-}
-
-impl Pkcs1Digest for crate::hash::Sha1 {
-    // RFC 8017 §9.2 / RFC 3447 §9.2: DigestInfo prefix for SHA-1.
-    const DIGEST_INFO_PREFIX: &'static [u8] = &[
-        0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14,
-    ];
-}
-
-impl Pkcs1Digest for crate::hash::Sha256 {
-    const DIGEST_INFO_PREFIX: &'static [u8] = &[
-        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01,
-        0x05, 0x00, 0x04, 0x20,
-    ];
-}
-
-impl Pkcs1Digest for crate::hash::Sha384 {
-    const DIGEST_INFO_PREFIX: &'static [u8] = &[
-        0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02,
-        0x05, 0x00, 0x04, 0x30,
-    ];
-}
-
-impl Pkcs1Digest for crate::hash::Sha512 {
-    const DIGEST_INFO_PREFIX: &'static [u8] = &[
-        0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03,
-        0x05, 0x00, 0x04, 0x40,
-    ];
-}
-
-impl Pkcs1Digest for crate::hash::Sha224 {
-    const DIGEST_INFO_PREFIX: &'static [u8] = &[
-        0x30, 0x2d, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x04,
-        0x05, 0x00, 0x04, 0x1c,
-    ];
-}
 
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// Encrypts `msg` with PKCS#1 v1.5 (RFC 8017 §7.2.1). Returns the
@@ -105,7 +28,9 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::encrypt_pkcs1v15(self, msg, rng)
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::encrypt_pkcs1v15(self, msg, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Encrypts `msg` with RSAES-OAEP (RFC 8017 §7.1.1), using hash `D` for both
@@ -123,7 +48,9 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         label: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng)
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.
@@ -132,7 +59,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// [`Error::Verification`] if the signature is invalid;
     /// [`Error::InvalidLength`] if `sig` is not `LIMBS*8` bytes.
     pub fn verify_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pkcs1v15::<D, _>(self, msg, sig)
+        let (mut em, mut expected) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pkcs1v15::<D, _>(self, msg, sig, &mut em, &mut expected)
     }
 }
 
@@ -161,7 +89,11 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     ///
     /// For new code, prefer OAEP via [`decrypt_oaep`](Self::decrypt_oaep).
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_pkcs1v15(self, ct)
+        let mut scratch = vec![0u8; LIMBS * 8];
+        let mut out = vec![0u8; LIMBS * 8];
+        let n = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext with implicit rejection (RFC 8017
@@ -190,7 +122,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         ct: &[u8],
         expected_len: usize,
     ) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_pkcs1v15_session(self, ct, expected_len)
+        let mut scratch = vec![0u8; LIMBS * 8];
+        let mut out = vec![0u8; expected_len];
+        emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out)?;
+        Ok(out)
     }
 
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` must match
@@ -199,7 +134,11 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// decrypted EM so that a bad ciphertext is not distinguishable in timing
     /// from a bad label.
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_oaep::<D, _>(self, ct, label)
+        let mut scratch = vec![0u8; LIMBS * 8];
+        let mut out = vec![0u8; LIMBS * 8];
+        let n = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// Produces a PKCS#1 v1.5 signature over `msg`, hashing with `D`
@@ -208,7 +147,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// # Errors
     /// [`Error::MessageTooLong`] if the modulus is too small for the digest.
     pub fn sign_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::sign_pkcs1v15::<D, _>(self, msg)
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::sign_pkcs1v15::<D, _>(self, msg, &mut out)?;
+        Ok(out)
     }
 }
 

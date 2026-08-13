@@ -6,6 +6,7 @@
 //! [`super::emsa`] with the const-generic keys, so PKCS#1 v1.5 and PSS behave
 //! identically.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::emsa::{self, RawPrivate, RawPublic};
@@ -428,21 +429,24 @@ impl BoxedRsaPublicKey {
 
     /// Verifies a PKCS#1 v1.5 signature over `msg`, hashing with `D`.
     pub fn verify_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pkcs1v15::<D, _>(self, msg, sig)
+        let (mut em, mut expected) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pkcs1v15::<D, _>(self, msg, sig, &mut em, &mut expected)
     }
 
     /// Verifies a [`sign_pkcs1v15_prehashed`](BoxedRsaPrivateKey::sign_pkcs1v15_prehashed)
     /// signature over a pre-computed hash (no `DigestInfo`). Legacy interop only.
     #[cfg(feature = "tls-legacy")]
     pub fn verify_pkcs1v15_prehashed(&self, t: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pkcs1v15_raw(self, t, sig)
+        let (mut em, mut expected) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pkcs1v15_raw(self, t, sig, &mut em, &mut expected)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, hashing with `D` and
     /// requiring the salt length to equal `D`'s output length (the strict
     /// TLS 1.3 / X.509 profile).
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pss::<D, _>(self, msg, sig)
+        let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pss::<D, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, requiring the salt to be
@@ -453,7 +457,8 @@ impl BoxedRsaPublicKey {
         sig: &[u8],
         salt_len: usize,
     ) -> Result<(), Error> {
-        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len)
+        let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, recovering the salt length
@@ -461,7 +466,8 @@ impl BoxedRsaPublicKey {
     /// interop with signers that do not use the salt-length == digest-length
     /// profile.
     pub fn verify_pss_any_salt<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pss_any_salt::<D, _>(self, msg, sig)
+        let (mut em, mut db) = (vec![0u8; self.k], vec![0u8; self.k]);
+        emsa::verify_pss_any_salt::<D, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Encrypts `msg` with PKCS#1 v1.5.
@@ -473,7 +479,9 @@ impl BoxedRsaPublicKey {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::encrypt_pkcs1v15(self, msg, rng)
+        let mut out = vec![0u8; self.k];
+        emsa::encrypt_pkcs1v15(self, msg, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Encrypts `msg` with RSAES-OAEP (RFC 8017 §7.1.1), hashing with `D` and
@@ -487,7 +495,9 @@ impl BoxedRsaPublicKey {
         label: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng)
+        let mut out = vec![0u8; self.k];
+        emsa::encrypt_oaep::<D, _, _>(self, msg, label, rng, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -632,7 +642,9 @@ impl BoxedRsaPrivateKey {
 
     /// Signs `msg` with PKCS#1 v1.5, hashing with `D`.
     pub fn sign_pkcs1v15<D: Pkcs1Digest>(&self, msg: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::sign_pkcs1v15::<D, _>(self, msg)
+        let mut out = vec![0u8; self.k];
+        emsa::sign_pkcs1v15::<D, _>(self, msg, &mut out)?;
+        Ok(out)
     }
 
     /// PKCS#1 v1.5 signature over a pre-computed hash with **no `DigestInfo`**
@@ -640,7 +652,9 @@ impl BoxedRsaPrivateKey {
     /// bare `MD5(16) || SHA1(20)`). Legacy interop only.
     #[cfg(feature = "tls-legacy")]
     pub fn sign_pkcs1v15_prehashed(&self, t: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::sign_pkcs1v15_raw(self, t)
+        let mut out = vec![0u8; self.k];
+        emsa::sign_pkcs1v15_raw(self, t, &mut out)?;
+        Ok(out)
     }
 
     /// Signs `msg` with RSA-PSS, hashing with `D` and a salt of `D`'s output
@@ -650,7 +664,9 @@ impl BoxedRsaPrivateKey {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::sign_pss::<D, _, R>(self, msg, rng)
+        let mut out = vec![0u8; self.k];
+        emsa::sign_pss::<D, _, R>(self, msg, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Signs `msg` with RSA-PSS using an explicit salt length (in octets).
@@ -662,7 +678,9 @@ impl BoxedRsaPrivateKey {
         salt_len: usize,
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng)
+        let mut out = vec![0u8; self.k];
+        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext.
@@ -681,7 +699,11 @@ impl BoxedRsaPrivateKey {
     /// instead. For new code, prefer OAEP via
     /// [`decrypt_oaep`](Self::decrypt_oaep).
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_pkcs1v15(self, ct)
+        let mut scratch = vec![0u8; self.k];
+        let mut out = vec![0u8; self.k];
+        let n = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 
     /// Decrypts a PKCS#1 v1.5 ciphertext with implicit rejection (RFC 8017
@@ -711,13 +733,20 @@ impl BoxedRsaPrivateKey {
         ct: &[u8],
         expected_len: usize,
     ) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_pkcs1v15_session(self, ct, expected_len)
+        let mut scratch = vec![0u8; self.k];
+        let mut out = vec![0u8; expected_len];
+        emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out)?;
+        Ok(out)
     }
 
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` and
     /// `label` must match those used at encryption.
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
-        emsa::decrypt_oaep::<D, _>(self, ct, label)
+        let mut scratch = vec![0u8; self.k];
+        let mut out = vec![0u8; self.k];
+        let n = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out)?;
+        out.truncate(n);
+        Ok(out)
     }
 }
 
@@ -728,24 +757,26 @@ impl RawPublic for BoxedRsaPublicKey {
     fn modulus_bits(&self) -> usize {
         self.n.bit_len()
     }
-    fn raw_public(&self, m: &[u8]) -> Vec<u8> {
+    fn raw_public_in_place(&self, buf: &mut [u8]) {
         // `e` and `m` are both public on every RSA public-key op (signature
         // verification, encryption), so the public-exponent modexp — sized to
         // `e`'s bit length instead of the modulus width — is the right tool. It
         // is still branchless and leaks nothing about a secret. (For e = 65537
         // this is ~17 squarings instead of ~2048.)
-        self.mont
-            .pow_public(&BoxedUint::from_be_bytes(m), &self.e)
-            .to_be_bytes(self.k)
+        let out = self
+            .mont
+            .pow_public(&BoxedUint::from_be_bytes(buf), &self.e)
+            .to_be_bytes(self.k);
+        buf.copy_from_slice(&out);
     }
 }
 
 impl emsa::PublicModulus for BoxedRsaPublicKey {
-    fn modulus_be_bytes(&self) -> Vec<u8> {
+    fn modulus_be_into(&self, out: &mut [u8]) {
         // `k`-wide big-endian `n`, matching the width of a validated signature
         // so the RSAVP1 `s < n` comparison in `emsa::verify_*` is over equal
         // lengths.
-        self.n.to_be_bytes(self.k)
+        out.copy_from_slice(&self.n.to_be_bytes(self.k));
     }
 }
 
@@ -756,9 +787,10 @@ impl RawPrivate for BoxedRsaPrivateKey {
     fn modulus_bits(&self) -> usize {
         self.n.bit_len()
     }
-    fn raw_private(&self, c: &[u8]) -> Vec<u8> {
-        let c_uint = BoxedUint::from_be_bytes(c);
-        raw_private_blinded_boxed(self, &c_uint).to_be_bytes(self.k)
+    fn raw_private_in_place(&self, buf: &mut [u8]) {
+        let c_uint = BoxedUint::from_be_bytes(buf);
+        let out = raw_private_blinded_boxed(self, &c_uint).to_be_bytes(self.k);
+        buf.copy_from_slice(&out);
     }
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed

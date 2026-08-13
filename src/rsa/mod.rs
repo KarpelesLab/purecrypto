@@ -10,12 +10,15 @@ mod prime;
 
 #[cfg(feature = "alloc")]
 mod boxed;
-#[cfg(feature = "alloc")]
+mod digest_info;
+// Allocation-free: works entirely in caller-supplied buffers.
 mod emsa;
 #[cfg(all(feature = "der", feature = "alloc"))]
 mod encoding;
 #[cfg(feature = "key")]
 mod key_impl;
+// Buffer-passing PKCS#1 / PSS / OAEP: available with or without `alloc`.
+mod nobuf;
 #[cfg(feature = "alloc")]
 mod pkcs1;
 #[cfg(feature = "alloc")]
@@ -28,8 +31,7 @@ pub use boxed::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
 pub use keys::{RsaPrivateKey, RsaPublicKey};
 pub use prime::{is_prime, random_prime};
 
-#[cfg(feature = "alloc")]
-pub use pkcs1::Pkcs1Digest;
+pub use digest_info::Pkcs1Digest;
 
 /// Errors produced by RSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

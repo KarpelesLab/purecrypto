@@ -6,6 +6,7 @@
 //! encoding logic lives in [`super::emsa`]; these are thin wrappers over the
 //! const-generic keys.
 
+use alloc::vec;
 use alloc::vec::Vec;
 
 use super::emsa;
@@ -21,7 +22,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         msg: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::sign_pss::<D, _, R>(self, msg, rng)
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::sign_pss::<D, _, R>(self, msg, rng, &mut out)?;
+        Ok(out)
     }
 
     /// Signs `msg` with RSA-PSS using an explicit salt length (in octets).
@@ -33,7 +36,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         salt_len: usize,
         rng: &mut R,
     ) -> Result<Vec<u8>, Error> {
-        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng)
+        let mut out = vec![0u8; LIMBS * 8];
+        emsa::sign_pss_with_salt_len::<D, _, R>(self, msg, salt_len, rng, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -42,7 +47,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// requiring the salt length to equal `D`'s output length (the strict
     /// TLS 1.3 / X.509 profile).
     pub fn verify_pss<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pss::<D, _>(self, msg, sig)
+        let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pss::<D, _>(self, msg, sig, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, requiring the salt to be
@@ -53,7 +59,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         sig: &[u8],
         salt_len: usize,
     ) -> Result<(), Error> {
-        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len)
+        let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pss_with_salt_len::<D, _>(self, msg, sig, salt_len, &mut em, &mut db)
     }
 
     /// Verifies an RSA-PSS signature over `msg`, recovering the salt length
@@ -61,7 +68,8 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// interop with signers that do not use the salt-length == digest-length
     /// profile.
     pub fn verify_pss_any_salt<D: Digest>(&self, msg: &[u8], sig: &[u8]) -> Result<(), Error> {
-        emsa::verify_pss_any_salt::<D, _>(self, msg, sig)
+        let (mut em, mut db) = (vec![0u8; LIMBS * 8], vec![0u8; LIMBS * 8]);
+        emsa::verify_pss_any_salt::<D, _>(self, msg, sig, &mut em, &mut db)
     }
 }
 

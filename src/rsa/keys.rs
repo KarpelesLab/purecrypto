@@ -234,19 +234,61 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 }
 
-// `emsa` (and the `PublicModulus` trait it defines) is itself `alloc`-gated, so
-// this impl must be too: without it the fixed-size keys are still fully usable
-// for the raw primitives and key generation, just not the padded schemes.
-#[cfg(feature = "alloc")]
+// The `emsa` hooks for the fixed-width keys. These live here rather than in
+// `pkcs1` so that the padded schemes are available in allocator-free builds:
+// `emsa` itself works in caller-supplied buffers, and `k == LIMBS * 8` is known
+// at compile time, so the callers below can put that buffer on the stack.
+impl<const LIMBS: usize> super::emsa::RawPublic for RsaPublicKey<LIMBS> {
+    fn key_size(&self) -> usize {
+        LIMBS * 8
+    }
+    fn modulus_bits(&self) -> usize {
+        self.modulus().bit_len()
+    }
+    fn raw_public_in_place(&self, buf: &mut [u8]) {
+        let out = self.raw(&Uint::<LIMBS>::from_be_bytes(buf));
+        out.write_be_bytes(buf);
+    }
+}
+
+impl<const LIMBS: usize> super::emsa::RawPrivate for RsaPrivateKey<LIMBS> {
+    fn key_size(&self) -> usize {
+        LIMBS * 8
+    }
+    fn modulus_bits(&self) -> usize {
+        self.modulus().bit_len()
+    }
+    fn raw_private_in_place(&self, buf: &mut [u8]) {
+        let out = self.raw(&Uint::<LIMBS>::from_be_bytes(buf));
+        out.write_be_bytes(buf);
+    }
+    fn secret_seed(&self) -> [u8; 32] {
+        self.blinding_seed
+    }
+}
+
 impl<const LIMBS: usize> super::emsa::PublicModulus for RsaPublicKey<LIMBS> {
-    fn modulus_be_bytes(&self) -> alloc::vec::Vec<u8> {
+    fn modulus_be_into(&self, out: &mut [u8]) {
         // `key_size() == LIMBS * 8` big-endian octets of `n`, matching the
         // width of a validated signature so the RSAVP1 `s < n` comparison in
         // `emsa::verify_*` is over equal lengths.
-        let mut buf = alloc::vec![0u8; LIMBS * 8];
-        self.n.write_be_bytes(&mut buf);
-        buf
+        self.n.write_be_bytes(out);
     }
+}
+
+/// A `k`-octet stack scratch buffer for a `LIMBS`-limb key.
+///
+/// `[u8; LIMBS * 8]` is not expressible on stable (it needs const-expression
+/// arithmetic), but `[[u8; 8]; LIMBS]` is exactly the same size and
+/// `as_flattened_mut` (stable since 1.80) reinterprets it as `&mut [u8]` safely
+/// — so the padded schemes get exact-size scratch with no allocator and no
+/// `unsafe`, rather than an oversized fixed maximum.
+pub(crate) struct KeyScratch<const LIMBS: usize>;
+
+impl<const LIMBS: usize> KeyScratch<LIMBS> {
+    /// A zeroed `k`-octet buffer. (`Default` is not implemented for arrays of
+    /// generic length, so this is a plain associated const.)
+    pub(crate) const ZEROED: [[u8; 8]; LIMBS] = [[0u8; 8]; LIMBS];
 }
 
 // Best-effort zeroize on drop: the private exponent `d`, primes `p`/`q`,
@@ -455,15 +497,6 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             &self.blinding_seed,
             c,
         )
-    }
-
-    /// Per-key 32-byte secret used to seed PKCS#1 v1.5 implicit-rejection
-    /// fallbacks. Same value as the blinding HMAC key (derived once at key
-    /// construction from `d`). Only the `alloc`-gated PKCS#1 v1.5 decryption
-    /// path consumes this.
-    #[cfg(feature = "alloc")]
-    pub(crate) fn secret_seed_bytes(&self) -> [u8; 32] {
-        self.blinding_seed
     }
 }
 
