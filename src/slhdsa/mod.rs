@@ -22,7 +22,7 @@ mod params;
 pub(crate) mod registry;
 
 use adrs::{Adrs, AdrsType};
-use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 use params::{MAX_CONTEXT, MAX_K, MAX_M, MAX_N, MAX_WOTS_LEN, Params, SETS};
 
@@ -41,6 +41,8 @@ pub enum Error {
     EmptyMessage,
     /// A DER/PEM structure was malformed.
     Malformed,
+    /// A caller-supplied output buffer had the wrong length.
+    InvalidLength,
 }
 
 /// An SLH-DSA parameter set (FIPS 205). Variant names mirror the standard set
@@ -226,7 +228,7 @@ mod wots_x8_tests {
             let n = p.n as usize;
             let total = p.len as usize * n;
 
-            let mut starts = vec![0u8; total];
+            let mut starts = alloc::vec![0u8; total];
             for (i, b) in starts.iter_mut().enumerate() {
                 *b = (i.wrapping_mul(7).wrapping_add(1)) as u8;
             }
@@ -541,7 +543,7 @@ mod wots_shake_x4_tests {
             let n = p.n as usize;
             let total = p.len as usize * n;
 
-            let mut starts = vec![0u8; total];
+            let mut starts = alloc::vec![0u8; total];
             for (i, b) in starts.iter_mut().enumerate() {
                 *b = (i.wrapping_mul(13).wrapping_add(3)) as u8;
             }
@@ -593,7 +595,7 @@ mod wots_shake_x4_tests {
             base.set_tree(0x1122_3344_5566_7788);
             base.set_key_pair(9);
 
-            let mut want = vec![0u8; total];
+            let mut want = alloc::vec![0u8; total];
             for i in 0..p.len {
                 let mut a = base;
                 a.set_chain(i);
@@ -606,7 +608,7 @@ mod wots_shake_x4_tests {
                 );
             }
 
-            let mut got = vec![0u8; total];
+            let mut got = alloc::vec![0u8; total];
             wots_shake_x4::prf_fill(p, &pk_seed, &sk_seed, &base, &mut got);
 
             assert_eq!(want, got, "set {set:?}");
@@ -799,7 +801,10 @@ fn ht_sign(
     let mask = p.leaf_idx_mask();
     let mut root = [0u8; MAX_N];
     root[..n].copy_from_slice(&pk_fors[..n]);
-    let mut tmp = vec![0u8; n * p.len as usize];
+    // `p.len <= MAX_WOTS_LEN` and `n <= MAX_N`, so this WOTS scratch is bounded
+    // and lives on the stack.
+    let mut tmp = [0u8; MAX_WOTS_LEN * MAX_N];
+    let tmp = &mut tmp[..n * p.len as usize];
     let mut off = 0;
 
     let mut addr = Adrs::new(p.is_shake);
@@ -811,7 +816,7 @@ fn ht_sign(
             pk_seed,
             sk_seed,
             &root[..n],
-            &mut tmp,
+            tmp,
             leaf_idx,
             &mut addr,
             &mut sig[off..],
@@ -824,7 +829,7 @@ fn ht_sign(
                 leaf_idx,
                 &sig[off..],
                 &root[..n],
-                &mut tmp,
+                tmp,
                 &mut addr,
                 &mut new_root,
             );
@@ -851,7 +856,10 @@ fn ht_verify(
     let mask = p.leaf_idx_mask();
     let mut root = [0u8; MAX_N];
     root[..n].copy_from_slice(&pk_fors[..n]);
-    let mut tmp = vec![0u8; n * p.len as usize];
+    // `p.len <= MAX_WOTS_LEN` and `n <= MAX_N`, so this WOTS scratch is bounded
+    // and lives on the stack.
+    let mut tmp = [0u8; MAX_WOTS_LEN * MAX_N];
+    let tmp = &mut tmp[..n * p.len as usize];
 
     let mut addr = Adrs::new(p.is_shake);
     let mut off = 0;
@@ -865,7 +873,7 @@ fn ht_verify(
             leaf_idx,
             &sig[off..],
             &root[..n],
-            &mut tmp,
+            tmp,
             &mut addr,
             &mut new_root,
         );
@@ -1442,7 +1450,9 @@ fn fors_pk_from_sig(
     base_2b(md, p.a, &mut indices[..p.k as usize]);
     let two_a = 1u32 << p.a;
     let mut tree_base = 0u32;
-    let mut roots = vec![0u8; n * p.k as usize];
+    // `p.k <= MAX_K` FORS trees of `n` octets each.
+    let mut roots = [0u8; MAX_K * MAX_N];
+    let roots = &mut roots[..n * p.k as usize];
     let mut off = 0;
     for tree_id in 0..p.k {
         let rp = tree_id as usize * n;
@@ -1494,7 +1504,7 @@ fn fors_pk_from_sig(
     let mut pk_addr = *addr;
     pk_addr.set_type_and_clear(AdrsType::ForsRoots);
     pk_addr.copy_key_pair(addr);
-    hash::t(p, pk_seed, pk_addr.bytes(), &roots, out);
+    hash::t(p, pk_seed, pk_addr.bytes(), roots, out);
     off
 }
 
@@ -1502,8 +1512,9 @@ fn fors_pk_from_sig(
 fn compute_root(p: &Params, pk_seed: &[u8], sk_seed: &[u8], out: &mut [u8]) {
     let mut addr = Adrs::new(p.is_shake);
     addr.set_layer(p.d - 1);
-    let mut tmp = vec![0u8; p.n as usize * p.len as usize];
-    xmss_node(p, pk_seed, sk_seed, out, &mut tmp, 0, p.h_prime, &mut addr);
+    let mut tmp = [0u8; MAX_WOTS_LEN * MAX_N];
+    let tmp = &mut tmp[..p.n as usize * p.len as usize];
+    xmss_node(p, pk_seed, sk_seed, out, tmp, 0, p.h_prime, &mut addr);
 }
 
 /// Splits the message digest into FORS message, tree index, and leaf index.
@@ -1532,12 +1543,14 @@ fn sign_internal(
     m_prefix: &[u8],
     msg: &[u8],
     opt_rand: &[u8],
-) -> Vec<u8> {
+    sig: &mut [u8],
+) {
     let n = p.n as usize;
-    let mut sig = vec![0u8; p.sig_size];
+    debug_assert_eq!(sig.len(), p.sig_size);
+    sig.fill(0);
 
     // Randomizer R = PRF_msg(opt_rand, m_prefix, msg) into sig[..n].
-    hash::prf_msg(p, sk_prf, opt_rand, m_prefix, msg, &mut sig);
+    hash::prf_msg(p, sk_prf, opt_rand, m_prefix, msg, sig);
     let mut r = [0u8; MAX_N];
     r[..n].copy_from_slice(&sig[..n]);
 
@@ -1567,7 +1580,6 @@ fn sign_internal(
         leaf_idx,
         &mut sig[ht_off..],
     );
-    sig
 }
 
 /// slh_verify_internal (FIPS 205 Algorithm 20).
@@ -1606,29 +1618,32 @@ fn verify_internal(
     )
 }
 
-/// Builds `0x00 ‖ |ctx| ‖ ctx`.
-fn m_prefix(ctx: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(2 + ctx.len());
-    v.push(0);
-    v.push(ctx.len() as u8);
-    v.extend_from_slice(ctx);
-    v
+/// Builds `0x00 ‖ |ctx| ‖ ctx` into `buf`, returning the filled prefix.
+///
+/// `ctx` is capped at [`MAX_CONTEXT`] (255) by every caller, so the buffer is a
+/// fixed 257 octets and this needs no heap.
+fn m_prefix<'a>(ctx: &[u8], buf: &'a mut [u8; 2 + MAX_CONTEXT]) -> &'a [u8] {
+    buf[0] = 0;
+    buf[1] = ctx.len() as u8;
+    buf[2..2 + ctx.len()].copy_from_slice(ctx);
+    &buf[..2 + ctx.len()]
 }
 
 /// An SLH-DSA private (signing) key.
 #[derive(Clone)]
 pub struct PrivateKey {
     set: ParamSet,
-    /// `SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root`.
-    bytes: Vec<u8>,
+    /// `SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root` — `4n <= 4 * MAX_N` octets, so a
+    /// fixed array; the parameter set fixes the used prefix.
+    bytes: [u8; 4 * MAX_N],
 }
 
 /// An SLH-DSA public (verification) key.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PublicKey {
     set: ParamSet,
-    /// `PK.seed ‖ PK.root`.
-    bytes: Vec<u8>,
+    /// `PK.seed ‖ PK.root` — `2n <= 2 * MAX_N` octets.
+    bytes: [u8; 2 * MAX_N],
 }
 
 impl PrivateKey {
@@ -1660,15 +1675,15 @@ impl PrivateKey {
         let mut root = [0u8; MAX_N];
         compute_root(p, &pk_seed[..n], &sk_seed[..n], &mut root);
 
-        let mut bytes = Vec::with_capacity(4 * n);
-        bytes.extend_from_slice(&sk_seed[..n]);
-        bytes.extend_from_slice(&sk_prf[..n]);
-        bytes.extend_from_slice(&pk_seed[..n]);
-        bytes.extend_from_slice(&root[..n]);
+        let mut bytes = [0u8; 4 * MAX_N];
+        bytes[..n].copy_from_slice(&sk_seed[..n]);
+        bytes[n..2 * n].copy_from_slice(&sk_prf[..n]);
+        bytes[2 * n..3 * n].copy_from_slice(&pk_seed[..n]);
+        bytes[3 * n..4 * n].copy_from_slice(&root[..n]);
 
-        let mut pk = Vec::with_capacity(2 * n);
-        pk.extend_from_slice(&pk_seed[..n]);
-        pk.extend_from_slice(&root[..n]);
+        let mut pk = [0u8; 2 * MAX_N];
+        pk[..n].copy_from_slice(&pk_seed[..n]);
+        pk[n..2 * n].copy_from_slice(&root[..n]);
         (PrivateKey { set, bytes }, PublicKey { set, bytes: pk })
     }
 
@@ -1692,9 +1707,9 @@ impl PrivateKey {
     /// The matching public key.
     pub fn public_key(&self) -> PublicKey {
         let n = self.set.params().n as usize;
-        let mut pk = Vec::with_capacity(2 * n);
-        pk.extend_from_slice(&self.bytes[2 * n..3 * n]); // PK.seed
-        pk.extend_from_slice(&self.bytes[3 * n..4 * n]); // PK.root
+        let mut pk = [0u8; 2 * MAX_N];
+        pk[..n].copy_from_slice(&self.bytes[2 * n..3 * n]); // PK.seed
+        pk[n..2 * n].copy_from_slice(&self.bytes[3 * n..4 * n]); // PK.root
         PublicKey {
             set: self.set,
             bytes: pk,
@@ -1708,50 +1723,105 @@ impl PrivateKey {
     /// equivalent signing (still safe per FIPS 205, but loses hedging). The
     /// bound is left at [`RngCore`] only so the X.509 / TLS dispatch layers
     /// can thread a single shared RNG type.
+    #[cfg(feature = "alloc")]
     pub fn sign<R: RngCore>(&self, rng: &mut R, msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = alloc::vec![0u8; self.signature_len()];
+        self.sign_into(rng, msg, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Byte length of the signatures this key produces — the exact size the
+    /// `out` buffer of [`sign_into`](Self::sign_into) must have.
+    pub fn signature_len(&self) -> usize {
+        self.set.signature_size()
+    }
+
+    /// Signs `msg` into `out` (exactly [`signature_len`](Self::signature_len)
+    /// octets), returning the number written. Allocation-free counterpart of
+    /// [`sign`](Self::sign).
+    ///
+    /// SLH-DSA signatures are large — from ~7.8 KiB to ~49 KiB depending on the
+    /// parameter set — so the buffer is the caller's to place.
+    pub fn sign_into<R: RngCore>(
+        &self,
+        rng: &mut R,
+        msg: &[u8],
+        ctx: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if msg.is_empty() {
             return Err(Error::EmptyMessage);
         }
         if ctx.len() > MAX_CONTEXT {
             return Err(Error::ContextTooLong);
+        }
+        if out.len() != self.signature_len() {
+            return Err(Error::InvalidLength);
         }
         let n = self.set.params().n as usize;
         let mut rnd = [0u8; MAX_N];
         rng.fill_bytes(&mut rnd[..n]);
-        Ok(self.do_sign(msg, ctx, &rnd[..n]))
+        self.do_sign(msg, ctx, &rnd[..n], out);
+        Ok(out.len())
     }
 
     /// Signs `msg` deterministically (the public seed is the randomizer).
+    #[cfg(feature = "alloc")]
     pub fn sign_deterministic(&self, msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut out = alloc::vec![0u8; self.signature_len()];
+        self.sign_deterministic_into(msg, ctx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Signs `msg` deterministically into `out`. Allocation-free counterpart of
+    /// [`sign_deterministic`](Self::sign_deterministic).
+    pub fn sign_deterministic_into(
+        &self,
+        msg: &[u8],
+        ctx: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
         if msg.is_empty() {
             return Err(Error::EmptyMessage);
         }
         if ctx.len() > MAX_CONTEXT {
             return Err(Error::ContextTooLong);
         }
+        if out.len() != self.signature_len() {
+            return Err(Error::InvalidLength);
+        }
         let n = self.set.params().n as usize;
-        let pk_seed = self.bytes[2 * n..3 * n].to_vec();
-        Ok(self.do_sign(msg, ctx, &pk_seed))
+        let mut pk_seed = [0u8; MAX_N];
+        pk_seed[..n].copy_from_slice(&self.bytes[2 * n..3 * n]);
+        self.do_sign(msg, ctx, &pk_seed[..n], out);
+        Ok(out.len())
     }
 
-    fn do_sign(&self, msg: &[u8], ctx: &[u8], opt_rand: &[u8]) -> Vec<u8> {
+    fn do_sign(&self, msg: &[u8], ctx: &[u8], opt_rand: &[u8], out: &mut [u8]) {
         let p = self.set.params();
         let n = p.n as usize;
+        let mut pfx = [0u8; 2 + MAX_CONTEXT];
+        let pfx = m_prefix(ctx, &mut pfx);
         sign_internal(
             p,
             &self.bytes[..n],
             &self.bytes[n..2 * n],
             &self.bytes[2 * n..3 * n],
             &self.bytes[3 * n..4 * n],
-            &m_prefix(ctx),
+            pfx,
             msg,
             opt_rand,
+            out,
         )
     }
 
-    /// The encoded private key.
+    /// The encoded private key (`SK.seed ‖ SK.prf ‖ PK.seed ‖ PK.root`).
+    ///
+    /// The backing array is sized for the widest parameter set, so this slices
+    /// to the `4n` actually in use — returning the whole array would append
+    /// trailing zeros for every set with `n < MAX_N`.
     pub fn to_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[..4 * self.set.params().n as usize]
     }
 
     /// Parses a private key, recomputing and checking the embedded root.
@@ -1766,10 +1836,9 @@ impl PrivateKey {
         if !bool::from(root[..n].ct_eq(&bytes[3 * n..4 * n])) {
             return Err(Error::InvalidKey);
         }
-        Ok(PrivateKey {
-            set,
-            bytes: bytes.to_vec(),
-        })
+        let mut b = [0u8; 4 * MAX_N];
+        b[..bytes.len()].copy_from_slice(bytes);
+        Ok(PrivateKey { set, bytes: b })
     }
 
     /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER (matches the
@@ -1783,7 +1852,7 @@ impl PrivateKey {
             &[
                 encode_integer(&[0]),
                 algid,
-                encode_octet_string(&self.bytes),
+                encode_octet_string(self.to_bytes()),
             ]
             .concat(),
         )
@@ -1897,19 +1966,16 @@ impl PublicKey {
             return false;
         }
         let n = p.n as usize;
-        verify_internal(
-            p,
-            &self.bytes[..n],
-            &self.bytes[n..2 * n],
-            sig,
-            &m_prefix(ctx),
-            msg,
-        )
+        let mut pfx = [0u8; 2 + MAX_CONTEXT];
+        let pfx = m_prefix(ctx, &mut pfx);
+        verify_internal(p, &self.bytes[..n], &self.bytes[n..2 * n], sig, pfx, msg)
     }
 
     /// The encoded public key (`PK.seed ‖ PK.root`).
+    ///
+    /// Sliced to the `2n` in use — see [`PrivateKey::to_bytes`].
     pub fn to_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[..2 * self.set.params().n as usize]
     }
 
     /// Parses a raw public key.
@@ -1917,10 +1983,9 @@ impl PublicKey {
         if bytes.len() != set.params().pk_size {
             return Err(Error::InvalidKey);
         }
-        Ok(PublicKey {
-            set,
-            bytes: bytes.to_vec(),
-        })
+        let mut b = [0u8; 2 * MAX_N];
+        b[..bytes.len()].copy_from_slice(bytes);
+        Ok(PublicKey { set, bytes: b })
     }
 
     /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure
@@ -1929,7 +1994,7 @@ impl PublicKey {
     pub fn to_spki_der(&self) -> Vec<u8> {
         use crate::der::{encode_bit_string, encode_sequence, oid_tlv};
         let algid = encode_sequence(&oid_tlv(self.set.params().oid));
-        encode_sequence(&[algid, encode_bit_string(&self.bytes)].concat())
+        encode_sequence(&[algid, encode_bit_string(self.to_bytes())].concat())
     }
 
     /// Encodes the key as a PKIX PEM document.
@@ -1962,7 +2027,9 @@ impl PublicKey {
     }
 }
 
-#[cfg(test)]
+// The ACVP vector suite decodes hex into `Vec`s and drives the `Vec`-returning
+// API; `nobuf_tests` covers the allocator-free path.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::hash::Sha256;
@@ -2183,5 +2250,72 @@ mod tests {
                 ParamSet::Shake_256f => b"shake-256f",
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod nobuf_tests {
+    use super::*;
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+
+    /// Sign into a caller buffer and verify, with no allocator. Uses a `f`
+    /// (fast) set so the test stays quick; the `s` sets differ only in
+    /// parameters, not in the buffer plumbing.
+    #[test]
+    fn sign_into_verify_roundtrip_no_alloc() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-nobuf", b"nonce", &[]);
+        let (sk, pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+
+        let n = sk.signature_len();
+        assert_eq!(n, ParamSet::Sha2_128f.signature_size());
+        let mut sig = [0u8; 17088]; // SLH-DSA-SHA2-128f signature size
+        let written = sk
+            .sign_into(&mut rng, b"firmware", b"", &mut sig[..n])
+            .expect("sign");
+        assert_eq!(written, n);
+
+        assert!(pk.verify(&sig[..n], b"firmware", b""));
+        assert!(!pk.verify(&sig[..n], b"other", b""));
+    }
+
+    /// Deterministic signing is reproducible and binds the context.
+    #[test]
+    fn deterministic_sign_is_stable_no_alloc() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-det", b"nonce", &[]);
+        let (sk, pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let n = sk.signature_len();
+        let mut a = [0u8; 17088];
+        let mut b = [0u8; 17088];
+        sk.sign_deterministic_into(b"msg", b"ctx", &mut a[..n])
+            .unwrap();
+        sk.sign_deterministic_into(b"msg", b"ctx", &mut b[..n])
+            .unwrap();
+        assert_eq!(a[..n], b[..n]);
+        assert!(pk.verify(&a[..n], b"msg", b"ctx"));
+        assert!(!pk.verify(&a[..n], b"msg", b"other"));
+    }
+
+    /// Keys round-trip through their raw encodings, which must carry the used
+    /// prefix rather than the max-sized backing array.
+    #[test]
+    fn key_encoding_roundtrip_no_alloc() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-enc", b"nonce", &[]);
+        let (sk, pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let p = ParamSet::Sha2_128f.params();
+        assert_eq!(sk.to_bytes().len(), 4 * p.n as usize);
+        assert_eq!(pk.to_bytes().len(), 2 * p.n as usize);
+        let pk2 = PublicKey::from_bytes(ParamSet::Sha2_128f, pk.to_bytes()).expect("pk");
+        assert_eq!(pk2.to_bytes(), pk.to_bytes());
+        assert!(PublicKey::from_bytes(ParamSet::Sha2_128f, &pk.to_bytes()[..3]).is_err());
+    }
+
+    /// A wrong-size output buffer is rejected rather than silently truncating.
+    #[test]
+    fn sign_into_rejects_wrong_buffer_len() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-len", b"nonce", &[]);
+        let (sk, _pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let mut short = [0u8; 64];
+        assert!(sk.sign_into(&mut rng, b"m", b"", &mut short).is_err());
     }
 }

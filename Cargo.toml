@@ -128,7 +128,7 @@ mldsa = ["hash", "rng"]
 hazmat-mldsa = ["mldsa"]
 # SLH-DSA (FIPS 205) hash-based signatures. Needs alloc for the large
 # signatures (up to ~50 KB); built purely from the hash primitives.
-slhdsa = ["hash", "rng", "alloc"]
+slhdsa = ["hash", "rng"]
 # Ascon (NIST SP 800-232 lightweight cryptography): Ascon-AEAD128 plus
 # Ascon-Hash256 / Ascon-XOF128 / Ascon-CXOF128, all from one 320-bit
 # permutation.
