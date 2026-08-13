@@ -56,13 +56,16 @@ mod key_impl;
 mod params;
 
 use adrs::{Adrs, AdrsType};
+#[cfg(feature = "alloc")]
 use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 use params::{MAX_N, MAX_WOTS_LEN, Params};
 
 pub use params::{XmssMtParamSet, XmssParamSet};
 
 use crate::ct::ConstantTimeEq;
+#[cfg(feature = "alloc")]
 use crate::rng::{CryptoRng, RngCore};
 
 /// Errors from XMSS / XMSS^MT operations.
@@ -83,6 +86,7 @@ pub enum Error {
 
 /// Derives the `len` WOTS+ secret chain starts from `SK_SEED` via `PRF_keygen`
 /// (SP 800-208), writing `len·n` bytes into `out`. Mirrors `expand_seed`.
+#[cfg(feature = "alloc")]
 fn wots_expand_seed(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, out: &mut [u8]) {
     // The `wots_len` (~67) PRF_keygen calls are mutually independent, so on
     // x86_64+AVX2 (SHA-256 sets) derive them eight at a time through the
@@ -96,6 +100,7 @@ fn wots_expand_seed(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs
 }
 
 /// Scalar reference path for [`wots_expand_seed`]: one `PRF_keygen` per chain.
+#[cfg(feature = "alloc")]
 fn wots_expand_seed_scalar(
     p: &Params,
     sk_seed: &[u8],
@@ -149,6 +154,7 @@ fn wots_chain(
 }
 
 /// WOTS+ public key generation (RFC 8391 §3.1.4): full chains over the secret.
+#[cfg(feature = "alloc")]
 fn wots_pkgen(p: &Params, sk_seed: &[u8], pub_seed: &[u8], addr: &mut Adrs, pk: &mut [u8]) {
     let n = p.n;
     wots_expand_seed(p, sk_seed, pub_seed, addr, pk);
@@ -463,6 +469,7 @@ fn chain_lengths(p: &Params, msg: &[u8]) -> [u32; MAX_WOTS_LEN] {
 }
 
 /// WOTS+ sign (RFC 8391 §3.1.5): partial chains to the message lengths.
+#[cfg(feature = "alloc")]
 fn wots_sign(
     p: &Params,
     msg: &[u8],
@@ -572,6 +579,7 @@ fn l_tree(p: &Params, wots_pk: &mut [u8], pub_seed: &[u8], addr: &mut Adrs, leaf
 
 /// Computes the leaf (L-tree root) for the WOTS+ key pair addressed by
 /// `ltree_addr` / `ots_addr` (RFC 8391 §4.1.6).
+#[cfg(feature = "alloc")]
 fn gen_leaf(
     p: &Params,
     sk_seed: &[u8],
@@ -580,14 +588,19 @@ fn gen_leaf(
     ots_addr: &mut Adrs,
     leaf: &mut [u8],
 ) {
-    let mut pk = vec![0u8; p.wots_sig_bytes()];
-    wots_pkgen(p, sk_seed, pub_seed, ots_addr, &mut pk);
-    l_tree(p, &mut pk, pub_seed, ltree_addr, leaf);
+    // `wots_sig_bytes() = wots_len * n <= MAX_WOTS_LEN * MAX_N`, so this scratch
+    // fits on the stack and `gen_leaf` needs no allocator.
+    let mut pk = [0u8; MAX_WOTS_LEN * MAX_N];
+    let pk = &mut pk[..p.wots_sig_bytes()];
+    wots_pkgen(p, sk_seed, pub_seed, ots_addr, pk);
+    l_tree(p, pk, pub_seed, ltree_addr, leaf);
 }
 
+#[cfg(feature = "alloc")]
 /// All nodes of a subtree, returned level-by-level.
 type SubtreeNodes = Vec<Vec<u8>>;
 
+#[cfg(feature = "alloc")]
 /// Builds **all** nodes of the subtree addressed by `subtree_addr` (its layer +
 /// tree fields), level-by-level: `levels[0]` holds the `2^h` leaves, `levels[L]`
 /// the `2^{h-L}` nodes at height `L`, and `levels[h]` the single subtree root.
@@ -654,6 +667,7 @@ fn build_subtree(p: &Params, sk_seed: &[u8], pub_seed: &[u8], subtree_addr: &Adr
     levels
 }
 
+#[cfg(feature = "alloc")]
 /// Writes the height-`h` authentication path for `idx_leaf` out of a subtree
 /// built by [`build_subtree`]: `auth_path[j]` is the sibling of the path node at
 /// height `j`, i.e. node `(idx_leaf >> j) ^ 1` of `levels[j]`.
@@ -665,6 +679,7 @@ fn auth_path_from_subtree(p: &Params, levels: &[Vec<u8>], idx_leaf: u32, auth_pa
     }
 }
 
+#[cfg(feature = "alloc")]
 /// A signer-side cache of fully-built subtrees, keyed by `(layer, tree)`.
 ///
 /// XMSS / XMSS^MT consume leaves sequentially, so at any moment only the `d`
@@ -678,6 +693,7 @@ struct SubtreeCache {
     entries: Vec<(u32, u64, SubtreeNodes)>,
 }
 
+#[cfg(feature = "alloc")]
 impl SubtreeCache {
     /// A cache pre-populated with one already-built subtree (used to hand the
     /// top subtree built during key generation straight to the signer, so the
@@ -775,11 +791,13 @@ fn root_from_sig(
 // ---------------------------------------------------------------------------
 
 /// Raw secret-key view: `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
+#[cfg(feature = "alloc")]
 struct SkView<'a> {
     p: &'a Params,
     bytes: &'a [u8],
 }
 
+#[cfg(feature = "alloc")]
 impl SkView<'_> {
     fn sk_seed(&self) -> &[u8] {
         &self.bytes[self.p.index_bytes..self.p.index_bytes + self.p.n]
@@ -804,6 +822,7 @@ fn bytes_to_idx(b: &[u8]) -> u64 {
 }
 
 /// Big-endian encode an index into `out` (length `out.len()`).
+#[cfg(feature = "alloc")]
 fn idx_to_bytes(idx: u64, out: &mut [u8]) {
     let len = out.len();
     let mut v = idx;
@@ -813,6 +832,7 @@ fn idx_to_bytes(idx: u64, out: &mut [u8]) {
     }
 }
 
+#[cfg(feature = "alloc")]
 /// Produces a full XMSS / XMSS^MT signature for leaf `idx` over `msg`. The
 /// signature buffer layout is `idx ‖ R ‖ (WOTS_sig ‖ auth_path)^d`.
 fn core_sign(p: &Params, sk: &SkView, idx: u64, msg: &[u8], cache: &mut SubtreeCache) -> Vec<u8> {
@@ -924,20 +944,23 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
         ots_addr.set_ots(idx_leaf);
 
         // Recover the WOTS+ public key, then the leaf via L-tree.
-        let mut wots_pk = vec![0u8; p.wots_sig_bytes()];
+        // Same bound as in `gen_leaf`: stack scratch keeps verification
+        // allocator-free, which is the path constrained devices actually run.
+        let mut wots_pk = [0u8; MAX_WOTS_LEN * MAX_N];
+        let wots_pk: &mut [u8] = &mut wots_pk[..p.wots_sig_bytes()];
         wots_pk_from_sig(
             p,
             &sig[off..off + p.wots_sig_bytes()],
             &root[..n],
             pub_seed,
             &mut ots_addr,
-            &mut wots_pk,
+            wots_pk,
         );
         off += p.wots_sig_bytes();
 
         ltree_addr.set_ltree(idx_leaf);
         let mut leaf = [0u8; MAX_N];
-        l_tree(p, &mut wots_pk, pub_seed, &mut ltree_addr, &mut leaf);
+        l_tree(p, wots_pk, pub_seed, &mut ltree_addr, &mut leaf);
 
         let auth_path = &sig[off..off + p.tree_height as usize * n];
         off += p.tree_height as usize * n;
@@ -957,6 +980,7 @@ fn core_verify(p: &Params, pub_root: &[u8], pub_seed: &[u8], sig: &[u8], msg: &[
     bool::from(root[..n].ct_eq(&pub_root[..n]))
 }
 
+#[cfg(feature = "alloc")]
 /// Generates the raw secret/public key payloads from a `3n`-byte seed
 /// (`SK_SEED ‖ SK_PRF ‖ PUB_SEED`). Returns `(sk_bytes, pk_bytes, top_subtree)`,
 /// where `top_subtree` is the fully-built layer-`(d-1)` tree (for seeding the
@@ -990,7 +1014,9 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
 // Serialization helpers (raw, self-describing format)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "alloc")]
 const SK_MAGIC: &[u8; 4] = b"XMSk";
+#[cfg(feature = "alloc")]
 const MTSK_MAGIC: &[u8; 4] = b"XMTk";
 
 /// Maximum per-layer subtree height for which [`validate_raw_sk`] recomputes
@@ -1007,6 +1033,7 @@ const MTSK_MAGIC: &[u8; 4] = b"XMTk";
 /// `Shake_10_256`; taller trees trust the stored root instead (see
 /// [`validate_raw_sk`] for why that is fail-closed). Mirrors
 /// `lms::LEGACY_RECOMPUTE_MAX_H`.
+#[cfg(feature = "alloc")]
 const RECOMPUTE_MAX_TREE_HEIGHT: u32 = 15;
 
 /// Validates a parsed raw signing key (`idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖
@@ -1038,6 +1065,7 @@ const RECOMPUTE_MAX_TREE_HEIGHT: u32 = 15;
 /// catastrophic one-time-key reuse, which is strictly worse — so burning a
 /// full keygen on every load to validate a public value buys nothing. Same
 /// policy as `lms::LmsPrivateKey::from_bytes` (root-bearing format).
+#[cfg(feature = "alloc")]
 fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     let n = p.n;
     let idx = bytes_to_idx(&raw[..p.index_bytes]);
@@ -1074,6 +1102,7 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+#[cfg(feature = "alloc")]
 fn wipe(v: &mut [u8]) {
     for b in v.iter_mut() {
         *b = 0;
@@ -1085,6 +1114,7 @@ fn wipe(v: &mut [u8]) {
 // Public XMSS key API
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "alloc")]
 /// A stateful XMSS signing key (RFC 8391 §4.1).
 ///
 /// Holds the secret seeds and the next leaf index. See the [module
@@ -1103,9 +1133,12 @@ pub struct XmssPrivateKey {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct XmssPublicKey {
     set: XmssParamSet,
-    bytes: Vec<u8>,
+    /// `root ‖ PUB_SEED`, i.e. `2n <= 2 * MAX_N` octets; the parameter set
+    /// fixes the used prefix, so this needs no heap.
+    bytes: [u8; 2 * MAX_N],
 }
 
+#[cfg(feature = "alloc")]
 impl XmssPrivateKey {
     /// The parameter set this key was generated for.
     pub fn parameter_set(&self) -> XmssParamSet {
@@ -1147,7 +1180,7 @@ impl XmssPrivateKey {
     pub fn public_key(&self) -> XmssPublicKey {
         let p = self.set.params();
         let n = p.n;
-        let mut bytes = vec![0u8; 2 * n];
+        let mut bytes = [0u8; 2 * MAX_N];
         bytes[..n].copy_from_slice(&self.bytes[p.index_bytes + 2 * n..p.index_bytes + 3 * n]);
         bytes[n..2 * n].copy_from_slice(&self.bytes[p.index_bytes + 3 * n..p.index_bytes + 4 * n]);
         XmssPublicKey {
@@ -1226,6 +1259,7 @@ impl XmssPrivateKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Drop for XmssPrivateKey {
     fn drop(&mut self) {
         wipe(&mut self.bytes);
@@ -1246,8 +1280,12 @@ impl XmssPublicKey {
     }
 
     /// The raw public key bytes (`root ‖ PUB_SEED`).
+    ///
+    /// The backing array is sized for the widest parameter set, so this slices
+    /// to the `2n` actually in use — returning the whole array would append
+    /// trailing zeros for the `n = 24` sets.
     pub fn to_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[..self.set.params().pk_bytes()]
     }
 
     /// Parses a raw public key (`root ‖ PUB_SEED`) for parameter `set`.
@@ -1255,10 +1293,9 @@ impl XmssPublicKey {
         if bytes.len() != set.params().pk_bytes() {
             return Err(Error::InvalidKey);
         }
-        Ok(XmssPublicKey {
-            set,
-            bytes: bytes.to_vec(),
-        })
+        let mut b = [0u8; 2 * MAX_N];
+        b[..bytes.len()].copy_from_slice(bytes);
+        Ok(XmssPublicKey { set, bytes: b })
     }
 }
 
@@ -1266,6 +1303,7 @@ impl XmssPublicKey {
 // Public XMSS^MT key API
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "alloc")]
 /// A stateful XMSS^MT signing key (RFC 8391 §4.2).
 ///
 /// Same single-use-per-index discipline as [`XmssPrivateKey`]; see the [module
@@ -1282,9 +1320,11 @@ pub struct XmssMtPrivateKey {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct XmssMtPublicKey {
     set: XmssMtParamSet,
-    bytes: Vec<u8>,
+    /// `root ‖ PUB_SEED` — see [`XmssPublicKey::bytes`].
+    bytes: [u8; 2 * MAX_N],
 }
 
+#[cfg(feature = "alloc")]
 impl XmssMtPrivateKey {
     /// The parameter set this key was generated for.
     pub fn parameter_set(&self) -> XmssMtParamSet {
@@ -1325,7 +1365,7 @@ impl XmssMtPrivateKey {
     pub fn public_key(&self) -> XmssMtPublicKey {
         let p = self.set.params();
         let n = p.n;
-        let mut bytes = vec![0u8; 2 * n];
+        let mut bytes = [0u8; 2 * MAX_N];
         bytes[..n].copy_from_slice(&self.bytes[p.index_bytes + 2 * n..p.index_bytes + 3 * n]);
         bytes[n..2 * n].copy_from_slice(&self.bytes[p.index_bytes + 3 * n..p.index_bytes + 4 * n]);
         XmssMtPublicKey {
@@ -1407,6 +1447,7 @@ impl XmssMtPrivateKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Drop for XmssMtPrivateKey {
     fn drop(&mut self) {
         wipe(&mut self.bytes);
@@ -1427,8 +1468,12 @@ impl XmssMtPublicKey {
     }
 
     /// The raw public key bytes (`root ‖ PUB_SEED`).
+    ///
+    /// The backing array is sized for the widest parameter set, so this slices
+    /// to the `2n` actually in use — returning the whole array would append
+    /// trailing zeros for the `n = 24` sets.
     pub fn to_bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.bytes[..self.set.params().pk_bytes()]
     }
 
     /// Parses a raw public key for parameter `set`.
@@ -1436,12 +1481,59 @@ impl XmssMtPublicKey {
         if bytes.len() != set.params().pk_bytes() {
             return Err(Error::InvalidKey);
         }
-        Ok(XmssMtPublicKey {
-            set,
-            bytes: bytes.to_vec(),
-        })
+        let mut b = [0u8; 2 * MAX_N];
+        b[..bytes.len()].copy_from_slice(bytes);
+        Ok(XmssMtPublicKey { set, bytes: b })
     }
 }
 
-#[cfg(test)]
+// The RFC 8391 vector suite exercises keygen and signing, which are
+// `alloc`-gated (the subtree cache is runtime-sized); `nobuf_tests` covers the
+// allocator-free verification path.
+#[cfg(all(test, feature = "alloc"))]
 mod tests;
+
+#[cfg(test)]
+mod nobuf_tests {
+    use super::*;
+
+    /// Verification — the path a constrained device actually runs — must work
+    /// with no allocator. The key and signature are produced by the
+    /// `alloc`-gated signer, then checked through the same API a no-alloc build
+    /// would use.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn verify_roundtrip() {
+        let set = XmssParamSet::Sha2_10_256;
+        let seed = [7u8; 96];
+        let mut sk = XmssPrivateKey::from_seed(set, &seed);
+        let pk = sk.public_key();
+        let sig = sk.sign(b"firmware").expect("sign");
+        assert!(pk.verify(b"firmware", &sig));
+        assert!(!pk.verify(b"other", &sig));
+    }
+
+    /// The fixed-size public key round-trips through its raw encoding, which is
+    /// what a device stores in ROM.
+    #[test]
+    fn public_key_roundtrip_no_alloc() {
+        let set = XmssParamSet::Sha2_10_256;
+        let raw = [0x5au8; 64];
+        let pk = XmssPublicKey::from_bytes(set, &raw[..set.params().pk_bytes()]).expect("parse");
+        assert_eq!(pk.to_bytes(), &raw[..set.params().pk_bytes()]);
+        assert_eq!(pk.parameter_set(), set);
+        // A wrong length is rejected rather than silently padded.
+        assert!(XmssPublicKey::from_bytes(set, &raw[..10]).is_err());
+    }
+
+    /// A garbage signature must be rejected without allocating (and without
+    /// panicking on the length arithmetic).
+    #[test]
+    fn rejects_malformed_signature_no_alloc() {
+        let set = XmssParamSet::Sha2_10_256;
+        let raw = [0x11u8; 64];
+        let pk = XmssPublicKey::from_bytes(set, &raw[..set.params().pk_bytes()]).expect("parse");
+        assert!(!pk.verify(b"m", &[]));
+        assert!(!pk.verify(b"m", &[0u8; 32]));
+    }
+}

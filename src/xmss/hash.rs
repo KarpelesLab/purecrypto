@@ -17,6 +17,7 @@ const PAD_F: u64 = 0;
 const PAD_H: u64 = 1;
 const PAD_HASH: u64 = 2;
 const PAD_PRF: u64 = 3;
+#[cfg(feature = "alloc")]
 const PAD_PRF_KEYGEN: u64 = 4;
 
 /// Big-endian `outlen`-byte encoding of `x` (RFC 8391 `toByte`).
@@ -69,6 +70,7 @@ pub(crate) fn prf(p: &Params, key: &[u8], input: &[u8; 32], out: &mut [u8]) {
 
 /// `PRF_keygen(key, in)`: `hash(toByte(4, pad) ‖ key ‖ in)`, with an
 /// `(n + 32)`-byte `input` (`PUB_SEED ‖ ADRS`). Derives WOTS+ secret values.
+#[cfg(feature = "alloc")]
 pub(crate) fn prf_keygen(p: &Params, key: &[u8], input: &[u8], out: &mut [u8]) {
     let mut pad = [0u8; MAX_PAD];
     to_byte(PAD_PRF_KEYGEN, p.padding_len, &mut pad);

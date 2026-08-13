@@ -90,6 +90,12 @@ jobs:
       - name: Build lms without alloc
         run: cargo build --target ${{ matrix.target }} --no-default-features --features lms
 
+      # `xmss` without alloc: verification (what a device running secure boot
+      # does). Keygen/signing stay alloc-gated — the subtree cache is
+      # runtime-sized and O(2^h).
+      - name: Build xmss without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features xmss
+
       # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
       # must still build when `alloc` is present but `std` is not.
       - name: Build ec with alloc, no std

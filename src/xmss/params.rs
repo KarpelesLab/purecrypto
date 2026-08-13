@@ -64,6 +64,7 @@ impl Params {
     }
 
     /// Bytes in the raw secret key payload: `idx ‖ SK_SEED ‖ SK_PRF ‖ root ‖ PUB_SEED`.
+    #[cfg(feature = "alloc")]
     pub(crate) fn sk_bytes(&self) -> usize {
         self.index_bytes + 4 * self.n
     }
@@ -87,6 +88,7 @@ impl Params {
     ///
     /// Returns `None` when `full_height >= 64` (the index can never overflow a
     /// `u64`, so the key never exhausts within representable state).
+    #[cfg(feature = "alloc")]
     pub(crate) fn exhausted_index(&self) -> Option<u64> {
         if self.full_height >= 64 {
             return None;

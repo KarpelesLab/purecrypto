@@ -65,6 +65,7 @@ impl Adrs {
     }
 
     /// Copies the layer/tree fields (words 0–2) from `src`.
+    #[cfg(feature = "alloc")]
     pub(crate) fn copy_subtree(&mut self, src: &Adrs) {
         self.words[0] = src.words[0];
         self.words[1] = src.words[1];
