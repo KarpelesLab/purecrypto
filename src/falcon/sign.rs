@@ -10,8 +10,12 @@
 //! `tprest/falcon.py` (`__sample_preimage__` / `sign`).
 //!
 //! The expansion and the per-signature sampling run entirely in the emulated
-//! constant-time [`Fpr`]; this is the secret-dependent path, so it is
-//! data-oblivious.
+//! [`Fpr`], which removes the subnormal-timing and FMA-contraction leaks of a
+//! hardware `f64`. That is **not** the same as being data-oblivious: `Fpr` is
+//! best-effort constant time, not branch-free (see its "Constant-time caveat"),
+//! and this is the secret-dependent path, so a residual floating-point timing
+//! side channel remains. A fully branchless FPEMU is the fix and is future
+//! work; until then, treat Falcon signing as not strictly constant time.
 
 use super::Degree;
 use super::encode::compress;

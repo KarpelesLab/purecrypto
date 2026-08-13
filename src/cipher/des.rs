@@ -23,11 +23,24 @@
 //! The F-function uses the canonical 8 × 64-entry S-box tables; round
 //! output is therefore not constant time in the round-key bits. This
 //! matches the [`crate::cipher::blowfish`] precedent and is acceptable
-//! for the legacy-interop threat model: the keys these ciphers protect
-//! are password-derived (offline cracking dominates) or already broken
-//! (single DES). A bitsliced implementation would buy timing-side-channel
-//! resistance at the cost of ~3× the code with no realistic security
-//! improvement for the intended use cases.
+//! for the at-rest legacy-interop threat model: the keys those formats
+//! protect are password-derived (offline cracking dominates) or already
+//! broken (single DES). A bitsliced implementation would buy
+//! timing-side-channel resistance at the cost of ~3× the code with no
+//! realistic security improvement for those use cases.
+//!
+//! **One use does not fit that rationale.** The `tls-legacy` CBC record
+//! layer can negotiate `TLS_RSA_WITH_3DES_EDE_CBC_SHA` /
+//! `TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA` (see
+//! `tls::crypto::cbc_rec::LEGACY_CBC_SUITES`), where the key is a
+//! per-connection *session* key rather than a password-derived one — so
+//! the table lookups are a cache-timing exposure against live traffic,
+//! not just against an offline attacker. Reaching that path requires
+//! opting into the `tls-legacy` feature *and* lowering `min_version`
+//! below TLS 1.2, which already concedes far more (SSLv3/TLS 1.0, RC4-era
+//! suites, Sweet32 on 3DES itself). Do not enable those suites where
+//! side-channel resistance matters; prefer the AEAD suites, which stay
+//! fully constant time.
 //!
 //! Parity bits in the 64-bit key encoding (bits 8, 16, 24, 32, 40, 48,
 //! 56, 64 per FIPS 46-3 §3) are silently ignored by the key schedule;

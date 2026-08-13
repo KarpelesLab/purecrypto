@@ -32,11 +32,20 @@
 //! `max_blocks + 1` content-dependent compressions (see
 //! [`CbcRecordCrypter::equalize_mac_blocks`]), so the total compression-call
 //! count is fixed by the public record length rather than the secret plaintext
-//! length. This is a best-effort equaliser built on the high-level hash API
-//! (it does not capture intermediate compression states the way a bespoke
-//! constant-time HMAC would), and it does not cover SSL 3.0 (POODLE-broken
-//! regardless). Treat these suites as last-resort interop only and prefer
-//! TLS 1.2+ AEAD, which this crate keeps fully constant-time.
+//! length. The received MAC is also lifted out of the plaintext buffer by a
+//! fixed scan ([`ct_extract_mac`]) instead of `buf[content_len..]`, so the
+//! padding length never steers a memory address — a direct index would have
+//! leaked through the cache exactly what the equaliser hides from the clock.
+//!
+//! Two gaps remain, and neither is closed here: the equaliser is best-effort,
+//! built on the high-level hash API (it does not control intermediate
+//! compression states the way a bespoke constant-time HMAC would), and the MAC
+//! is still computed over `buf[..content_len]`, whose *length* — and therefore
+//! the read pattern over the record — depends on the padding. Closing that
+//! needs the OpenSSL-style fixed-width HMAC over a maximum-length buffer.
+//! SSL 3.0 is not covered at all (POODLE-broken regardless). Treat these
+//! suites as last-resort interop only and prefer TLS 1.2+ AEAD, which this
+//! crate keeps fully constant-time.
 
 // The suite-selection enums and the crypter are exercised by this module's
 // tests now and wired into the legacy handshake in later phases; allow the
@@ -406,6 +415,46 @@ fn ct_le(a: usize, b: usize) -> u8 {
     !((r >> 63) as u8) // r>=0 → !0x00=0xff ; r<0 → !0xff=0x00
 }
 
+/// `0xff` if `a == b`, else `0x00` (constant-time), for small lengths/indices.
+#[inline]
+fn ct_eq_usize(a: usize, b: usize) -> u8 {
+    let d = (a ^ b) as u64;
+    // The top bit of `d | -d` is 1 iff d != 0; invert to get "equal".
+    let differ = ((d | d.wrapping_neg()) >> 63) as u8;
+    differ.wrapping_sub(1)
+}
+
+/// Copies the `mac_len` MAC octets that begin at the **secret** offset
+/// `content_len` out of `buf`, without ever indexing `buf` at a secret
+/// position.
+///
+/// Indexing directly (`&buf[content_len..][..mac_len]`) makes the *address*
+/// depend on the padding length, which is exactly the secret Lucky13 tries to
+/// recover — a cache-timing leak that survives the compression-count
+/// equalisation done elsewhere. Instead, note that `pad_len <= 255` bounds the
+/// MAC to the last `mac_len + 256` octets, so a fixed scan of that window with
+/// constant-time selection suffices (~5 KiB of byte ops for SHA-1, independent
+/// of the record size).
+///
+/// When the padding was invalid the caller passes `content_len = 0`, in which
+/// case some or all of the wanted indices fall outside the window and the
+/// corresponding output bytes stay zero — harmless, since that path is already
+/// forced to fail.
+fn ct_extract_mac(buf: &[u8], content_len: usize, mac_len: usize) -> Vec<u8> {
+    let total = buf.len();
+    let window_start = total.saturating_sub(mac_len + 256);
+    let mut out = vec![0u8; mac_len];
+    for (j, slot) in out.iter_mut().enumerate() {
+        let want = content_len + j;
+        let mut acc = 0u8;
+        for (i, &b) in buf.iter().enumerate().skip(window_start) {
+            acc |= b & ct_eq_usize(i, want);
+        }
+        *slot = acc;
+    }
+    out
+}
+
 /// One direction's TLS 1.0/1.1 CBC record protection (MAC-then-encrypt).
 pub(crate) struct CbcRecordCrypter {
     cipher: Cipher,
@@ -692,7 +741,9 @@ impl CbcRecordCrypter {
         let mask = 0usize.wrapping_sub((good & 1) as usize);
         let content_len = cand & mask;
 
-        let received_mac = &buf[content_len..content_len + mac_len];
+        // Extracted with a fixed scan rather than `buf[content_len..]`, so the
+        // padding length never steers a memory address (see `ct_extract_mac`).
+        let received_mac = ct_extract_mac(&buf, content_len, mac_len);
         let computed_mac = self.compute_mac(ct, version, &buf[..content_len]);
         // Lucky13: the HMAC above processes a number of hash-compression blocks
         // that depends on the (secret) plaintext length, which leaks the padding
@@ -704,7 +755,7 @@ impl CbcRecordCrypter {
         if !self.ssl3 {
             self.equalize_mac_blocks(content_len, total);
         }
-        let mac_ok = computed_mac.as_slice().ct_eq(received_mac);
+        let mac_ok = computed_mac.as_slice().ct_eq(received_mac.as_slice());
 
         self.seq = self.seq.wrapping_add(1);
 

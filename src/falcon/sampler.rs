@@ -16,8 +16,11 @@
 //! * [`sampler_z`] — the outer rejection loop: `base_sampler`, a sign byte, the
 //!   rejection exponent, then `ber_exp`.
 //!
-//! All floating-point work is done in the emulated constant-time [`Fpr`], so the
-//! sampler is data-oblivious and bit-reproducible. Validated against the
+//! All floating-point work is done in the emulated [`Fpr`], so the sampler is
+//! bit-reproducible across targets. It is **not** data-oblivious: `Fpr` is
+//! best-effort constant time, not branch-free (see its "Constant-time caveat"),
+//! so a residual timing side channel remains on this secret-dependent path.
+//! Validated against the
 //! reference `samplerz` KAT vectors in `sampler_tests.rs`, which pin both the
 //! output distribution and the exact random-byte consumption.
 

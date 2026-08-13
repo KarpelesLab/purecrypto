@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{RsaPrivateKey, RsaPublicKey};
-use crate::bignum::{Uint, inv_mod};
+use crate::bignum::{MontModulus, Uint};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::der::{
     Error, Reader, encode_bit_string, encode_integer, encode_null, encode_octet_string,
@@ -216,7 +216,19 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         let one = Uint::ONE;
         let dp = d.reduce(&p.wrapping_sub(&one));
         let dq = d.reduce(&q.wrapping_sub(&one));
-        let qinv = inv_mod(q, p).expect("to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime");
+        // `qInv = q^-1 mod p` over the *secret* primes, so use the constant-time
+        // Fermat inversion (`p` is prime) rather than the variable-time
+        // extended-Euclid `inv_mod`, whose iteration count depends on the
+        // operands. `q` is reduced first because Fermat needs a residue.
+        let mp = MontModulus::new(*p);
+        let qinv = mp.inv_prime(&q.reduce(p));
+        // Fermat yields a garbage value instead of failing when `q ≡ 0 (mod p)`
+        // (i.e. the primes are not coprime), so keep the old contract — refuse
+        // to re-export a structurally broken key — by checking the result.
+        assert!(
+            bool::from(mp.mul_mod(&qinv, &q.reduce(p)).ct_eq(&Uint::ONE)),
+            "to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime"
+        );
 
         let body = [
             encode_integer(&[0]), // version = 0 (two-prime)

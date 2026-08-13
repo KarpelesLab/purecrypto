@@ -10,8 +10,10 @@
 //! Algorithms 9 & 11) and `tprest/falcon.py` (`ffldl_fft` / `normalize_tree` /
 //! `ffsampling_fft`).
 //!
-//! Everything runs in the emulated [`Fpr`], so the sign-time path is
-//! data-oblivious. The LDL math is checked by `tree_tests.rs`
+//! Everything runs in the emulated [`Fpr`]. Note that this does not make the
+//! sign-time path data-oblivious: `Fpr` is best-effort constant time, not
+//! branch-free (see its "Constant-time caveat"). The LDL math is checked by
+//! `tree_tests.rs`
 //! (`L·D·L\* == G`); the full statistical behavior is exercised by the
 //! sign round-trip in a later phase.
 

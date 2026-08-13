@@ -253,7 +253,16 @@ impl Sm2PublicKey {
             let mut z = enc32(&x2);
             z.extend_from_slice(&enc32(&y2));
             let t = kdf(&z, msg.len());
-            if t.iter().all(|&b| b == 0) {
+            // GB/T 32918.4 requires retrying when the whole key stream is zero.
+            // `t` is derived from the shared secret, so fold every byte into one
+            // accumulator instead of using a short-circuiting `all()`, whose
+            // exit point would reveal the index of the first non-zero byte of
+            // secret key stream.
+            let mut acc = 0u8;
+            for &b in t.iter() {
+                acc |= b;
+            }
+            if bool::from(acc.ct_eq(&0)) {
                 continue;
             }
 
