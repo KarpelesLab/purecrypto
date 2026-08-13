@@ -266,7 +266,7 @@ fn expand_mask_x4(rho_prime: &[u8], nonces: [u16; 4], gamma1_bits: u32) -> [Poly
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
 

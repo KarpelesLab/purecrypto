@@ -152,15 +152,15 @@ pub unsafe extern "C" fn pc_mldsa_sign(
         };
         let sig: Vec<u8> = match unsafe { &*k } {
             PcMlDsa::L44(sk) => match sk.sign(&mut OsRng, m, b"") {
-                Ok(s) => s,
+                Ok(s) => s.to_vec(),
                 Err(_) => return PcStatus::Internal,
             },
             PcMlDsa::L65(sk) => match sk.sign(&mut OsRng, m, b"") {
-                Ok(s) => s,
+                Ok(s) => s.to_vec(),
                 Err(_) => return PcStatus::Internal,
             },
             PcMlDsa::L87(sk) => match sk.sign(&mut OsRng, m, b"") {
-                Ok(s) => s,
+                Ok(s) => s.to_vec(),
                 Err(_) => return PcStatus::Internal,
             },
         };

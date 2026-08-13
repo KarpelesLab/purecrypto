@@ -3263,14 +3263,17 @@ impl ClientConnection {
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa44(k) => k
                 .sign_deterministic(&content, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa65(k) => k
                 .sign_deterministic(&content, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&content, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             // External keys are handled by the suspend/resume path before this
             // inline signer is reached; this arm is defensive only.

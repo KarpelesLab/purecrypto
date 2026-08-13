@@ -96,6 +96,11 @@ jobs:
       - name: Build xmss without alloc
         run: cargo build --target ${{ matrix.target }} --no-default-features --features xmss
 
+      # `mldsa` without alloc: every ML-DSA length is fixed by the parameter
+      # set, so keygen, signing and verification are all allocator-free.
+      - name: Build mldsa without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features mldsa
+
       # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
       # must still build when `alloc` is present but `std` is not.
       - name: Build ec with alloc, no std

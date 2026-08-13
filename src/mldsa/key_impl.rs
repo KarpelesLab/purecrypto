@@ -51,7 +51,9 @@ macro_rules! ml_dsa_key_impl {
                     let mut rng = rng;
                     self.sign(&mut rng, msg, context)
                 };
-                sig.map_err(|_| Error::Signature)
+                // The per-level signature is a fixed-size array; the `key`
+                // facade is `alloc`-gated and hands back a `Vec`.
+                sig.map(|s| s.to_vec()).map_err(|_| Error::Signature)
             }
         }
 

@@ -198,14 +198,17 @@ impl CertSigner<'_> {
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa44(k) => k
                 .sign_deterministic(tbs, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::Verification),
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa65(k) => k
                 .sign_deterministic(tbs, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::Verification),
             #[cfg(feature = "mldsa")]
             CertSigner::MlDsa87(k) => k
                 .sign_deterministic(tbs, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::Verification),
             #[cfg(feature = "slhdsa")]
             CertSigner::SlhDsa(k) => k
@@ -227,11 +230,20 @@ impl CertSigner<'_> {
     ) -> Result<Vec<u8>, Error> {
         match self {
             #[cfg(feature = "mldsa")]
-            CertSigner::MlDsa44(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            CertSigner::MlDsa44(k) => k
+                .sign(rng, tbs, b"")
+                .map_err(|_| Error::Verification)
+                .map(|s| s.to_vec()),
             #[cfg(feature = "mldsa")]
-            CertSigner::MlDsa65(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            CertSigner::MlDsa65(k) => k
+                .sign(rng, tbs, b"")
+                .map_err(|_| Error::Verification)
+                .map(|s| s.to_vec()),
             #[cfg(feature = "mldsa")]
-            CertSigner::MlDsa87(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
+            CertSigner::MlDsa87(k) => k
+                .sign(rng, tbs, b"")
+                .map_err(|_| Error::Verification)
+                .map(|s| s.to_vec()),
             #[cfg(feature = "slhdsa")]
             CertSigner::SlhDsa(k) => k.sign(rng, tbs, b"").map_err(|_| Error::Verification),
             other => other.sign(tbs),

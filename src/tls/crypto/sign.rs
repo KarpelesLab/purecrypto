@@ -109,14 +109,17 @@ pub(crate) fn sign_certificate_verify<R: RngCore>(
         #[cfg(feature = "mldsa")]
         ServerKey::MlDsa44(k) => k
             .sign(rng, content, b"")
+            .map(|s| s.to_vec())
             .map_err(|_| Error::HandshakeFailure)?,
         #[cfg(feature = "mldsa")]
         ServerKey::MlDsa65(k) => k
             .sign(rng, content, b"")
+            .map(|s| s.to_vec())
             .map_err(|_| Error::HandshakeFailure)?,
         #[cfg(feature = "mldsa")]
         ServerKey::MlDsa87(k) => k
             .sign(rng, content, b"")
+            .map(|s| s.to_vec())
             .map_err(|_| Error::HandshakeFailure)?,
         // External keys never reach the in-process sign path: the engine
         // suspends the handshake and the caller supplies the signature. This

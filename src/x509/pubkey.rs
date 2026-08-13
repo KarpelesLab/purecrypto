@@ -68,6 +68,11 @@ fn curve_from_oid(arcs: &[u64]) -> Option<CurveId> {
 /// from a certificate or a PKIX SPKI document.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
+// ML-DSA keys are fixed-size inline arrays (that is what makes ML-DSA usable
+// without an allocator), so the PQ variants dwarf the classical ones. Boxing
+// them would trade this for a heap indirection on every key; the enum is only
+// ever built by the `alloc`-gated X.509 parsers and moved rarely.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyPublicKey {
     /// An RSA public key (runtime-sized).
     Rsa(BoxedRsaPublicKey),

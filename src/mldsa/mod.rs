@@ -22,6 +22,7 @@ mod reduce;
 pub(crate) mod registry;
 mod sample;
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::rng::{CryptoRng, RngCore};
@@ -81,12 +82,24 @@ pub struct Params {
     pub sig: usize,
 }
 
+/// Widest `c̃` over the parameter sets (`λ/4`, λ = 256 for ML-DSA-87).
+const MAX_CTILDE: usize = 256 / 4;
+/// Widest packed `w1` polynomial (6 bits per coefficient).
+const MAX_W1: usize = N * 6 / 8;
+
 const POLY_T1: usize = N * 10 / 8; // 320
 const POLY_T0: usize = N * 13 / 8; // 416
 
 impl Params {
     const fn eta_bytes(&self) -> usize {
         if self.eta == 2 { N * 3 / 8 } else { N * 4 / 8 }
+    }
+    const fn w1_bytes(&self) -> usize {
+        if self.gamma2 == GAMMA2_88 {
+            N * 6 / 8
+        } else {
+            N * 4 / 8
+        }
     }
     const fn z_bytes(&self) -> usize {
         if self.gamma1_bits == 17 {
@@ -142,13 +155,42 @@ pub(crate) const P87: Params = Params {
     sig: 256 / 4 + 7 * (N * 20 / 8) + 75 + 8,
 };
 
+/// Sequential writer over a caller-supplied output buffer.
+///
+/// Every ML-DSA encoding length is fixed by the parameter set, so key and
+/// signature bytes are written straight into a caller's buffer at successive
+/// offsets rather than accumulated in a `Vec`. `take` hands a packer the exact
+/// subslice it must fill.
+struct Cursor<'a> {
+    buf: &'a mut [u8],
+    off: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(buf: &'a mut [u8]) -> Self {
+        Cursor { buf, off: 0 }
+    }
+    fn put(&mut self, src: &[u8]) {
+        self.buf[self.off..self.off + src.len()].copy_from_slice(src);
+        self.off += src.len();
+    }
+    fn take(&mut self, n: usize) -> &mut [u8] {
+        let s = &mut self.buf[self.off..self.off + n];
+        self.off += n;
+        s
+    }
+    fn done(&self) -> usize {
+        self.off
+    }
+}
+
 // --- encoding dispatch helpers ---
 
-fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
+fn pack_eta(f: &Poly, p: &Params, out: &mut [u8]) {
     if p.eta == 2 {
-        pack_eta2(f)
+        pack_eta2(f, out)
     } else {
-        pack_eta4(f)
+        pack_eta4(f, out)
     }
 }
 fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, Error> {
@@ -159,11 +201,11 @@ fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, Error> {
     };
     r.map_err(|_| Error::Malformed)
 }
-fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
+fn pack_z(f: &Poly, p: &Params, out: &mut [u8]) {
     if p.gamma1_bits == 17 {
-        pack_z17(f)
+        pack_z17(f, out)
     } else {
-        pack_z19(f)
+        pack_z19(f, out)
     }
 }
 fn unpack_z(b: &[u8], p: &Params) -> Poly {
@@ -173,11 +215,11 @@ fn unpack_z(b: &[u8], p: &Params) -> Poly {
         unpack_z19(b)
     }
 }
-fn pack_w1(f: &Poly, p: &Params) -> Vec<u8> {
+fn pack_w1(f: &Poly, p: &Params, out: &mut [u8]) {
     if p.gamma2 == GAMMA2_88 {
-        pack_w1_6(f)
+        pack_w1_6(f, out)
     } else {
-        pack_w1_4(f)
+        pack_w1_4(f, out)
     }
 }
 
@@ -305,7 +347,9 @@ fn matrix<const K: usize, const L: usize>(rho: &[u8]) -> [[Poly; L]; K] {
 pub(crate) fn keygen<const K: usize, const L: usize>(
     seed: &[u8; 32],
     p: &Params,
-) -> (Vec<u8>, Vec<u8>) {
+    pk_out: &mut [u8],
+    sk_out: &mut [u8],
+) {
     let mut expanded = [0u8; 128];
     shake256(&[seed, &[K as u8, L as u8]], &mut expanded);
     let rho = &expanded[..32];
@@ -344,29 +388,33 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     }
 
     // Public key: rho || ByteEncode(t1).
-    let mut pk = Vec::with_capacity(p.pubkey);
-    pk.extend_from_slice(rho);
+    let mut pkc = Cursor::new(pk_out);
+    pkc.put(rho);
     for t in &t1 {
-        pk.extend_from_slice(&pack_t1(t));
+        pack_t1(t, pkc.take(POLY_T1));
     }
+    debug_assert_eq!(pkc.done(), p.pubkey);
 
     let mut tr = [0u8; 64];
-    shake256(&[&pk], &mut tr);
+    shake256(&[&*pk_out], &mut tr);
 
     // Secret key: rho || key || tr || s1 || s2 || t0.
-    let mut sk = Vec::with_capacity(p.privkey);
-    sk.extend_from_slice(rho);
-    sk.extend_from_slice(key);
-    sk.extend_from_slice(&tr);
+    let mut skc = Cursor::new(sk_out);
+    skc.put(rho);
+    skc.put(key);
+    skc.put(&tr);
     for s in &s1 {
-        sk.extend_from_slice(&pack_eta(s, p));
+        let eb = p.eta_bytes();
+        pack_eta(s, p, skc.take(eb));
     }
     for s in &s2 {
-        sk.extend_from_slice(&pack_eta(s, p));
+        let eb = p.eta_bytes();
+        pack_eta(s, p, skc.take(eb));
     }
     for t in &t0 {
-        sk.extend_from_slice(&pack_t0(t));
+        pack_t0(t, skc.take(POLY_T0));
     }
+    debug_assert_eq!(skc.done(), p.privkey);
     // Wipe the expanded seed material (rho' and the signing key K live in
     // here) before it drops; `black_box` keeps the writes from being
     // eliminated as dead stores. Same for the unpacked secret vectors
@@ -379,7 +427,6 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     wipe_polys(&mut s1_ntt);
     wipe_polys(&mut s2);
     wipe_polys(&mut t0);
-    (pk, sk)
 }
 
 /// ML-DSA.Sign_internal (FIPS 204 Algorithm 7). `m_prime` is the already-formed
@@ -388,9 +435,10 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
 pub(crate) fn sign_internal<const K: usize, const L: usize>(
     sk: &[u8],
     rnd: &[u8; 32],
-    m_prime: &[u8],
+    m_prime: &[&[u8]],
     p: &Params,
-) -> Vec<u8> {
+    sig_out: &mut [u8],
+) {
     let rho = &sk[..32];
     let key = &sk[32..64];
     let tr = &sk[64..128];
@@ -428,7 +476,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     }
 
     let mut mu = [0u8; 64];
-    shake256(&[tr, m_prime], &mut mu);
+    {
+        // `M'` arrives as its parts (see `m_prime_parts`); absorb tr then each.
+        let mut parts = [&[] as &[u8]; 4];
+        parts[0] = tr;
+        parts[1..1 + m_prime.len()].copy_from_slice(m_prime);
+        shake256(&parts[..1 + m_prime.len()], &mut mu);
+    }
     let mut rho_prime = [0u8; 64];
     shake256(&[key, rnd, &mu], &mut rho_prime);
 
@@ -447,7 +501,7 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     let mut z = [Poly::zero(); L];
     let mut r0 = [[0i32; N]; K];
     let mut ct0 = [Poly::zero(); K];
-    let sig = loop {
+    loop {
         // Masking vector y (four SHAKE256 streams per 4-way Keccak
         // permutation when the AVX2 kernel is available).
         expand_mask_vec(&mut y, &mut seed_buf, kappa, p.gamma1_bits);
@@ -472,17 +526,21 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         }
 
         // c̃ = H(mu || w1); c = SampleInBall(c̃).
-        let mut ctilde = alloc::vec![0u8; p.ctilde];
+        let mut ctilde_buf = [0u8; MAX_CTILDE];
+        let ctilde = &mut ctilde_buf[..p.ctilde];
         {
             use crate::hash::{ExtendableOutput, Shake256};
             let mut h = Shake256::new();
             h.update(&mu);
+            let mut w1b = [0u8; MAX_W1];
+            let w1b = &mut w1b[..p.w1_bytes()];
             for wi in &w1 {
-                h.update(&pack_w1(wi, p));
+                pack_w1(wi, p, w1b);
+                h.update(w1b);
             }
-            h.finalize_into(&mut ctilde);
+            h.finalize_into(ctilde);
         }
-        let c = sample_challenge(&ctilde, p.tau);
+        let c = sample_challenge(ctilde, p.tau);
         let mut c_ntt = c;
         c_ntt.ntt();
 
@@ -539,15 +597,17 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
             continue;
         }
 
-        // Encode the signature.
-        let mut sig = Vec::with_capacity(p.sig);
-        sig.extend_from_slice(&ctilde);
+        // Encode the signature into the caller's buffer.
+        let mut sc = Cursor::new(sig_out);
+        sc.put(ctilde);
+        let zb = p.z_bytes();
         for zi in &z {
-            sig.extend_from_slice(&pack_z(zi, p));
+            pack_z(zi, p, sc.take(zb));
         }
-        sig.extend_from_slice(&pack_hint(&hints, p.omega));
-        break sig;
-    };
+        pack_hint(&hints, p.omega, sc.take(p.omega + K));
+        debug_assert_eq!(sc.done(), p.sig);
+        break;
+    }
 
     // Wipe the transient secrets before returning: rho' (and seed_buf, which
     // carries a copy of it), the unpacked secret vectors s1 / s2 / t0 and
@@ -576,14 +636,13 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
         }
     }
     let _ = core::hint::black_box(&r0);
-    sig
 }
 
 /// ML-DSA.Verify_internal (FIPS 204 Algorithm 8).
 pub(crate) fn verify_internal<const K: usize, const L: usize>(
     pk: &[u8],
     sig: &[u8],
-    m_prime: &[u8],
+    m_prime: &[&[u8]],
     p: &Params,
 ) -> bool {
     if pk.len() != p.pubkey || sig.len() != p.sig {
@@ -600,7 +659,12 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
     let mut tr = [0u8; 64];
     shake256(&[pk], &mut tr);
     let mut mu = [0u8; 64];
-    shake256(&[&tr, m_prime], &mut mu);
+    {
+        let mut parts = [&[] as &[u8]; 4];
+        parts[0] = &tr;
+        parts[1..1 + m_prime.len()].copy_from_slice(m_prime);
+        shake256(&parts[..1 + m_prime.len()], &mut mu);
+    }
 
     // Decode the signature.
     let ctilde = &sig[..p.ctilde];
@@ -652,10 +716,14 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
         for jj in 0..N {
             w1.c[jj] = use_hint(hints[i].c[jj], acc.c[jj], p.gamma2);
         }
-        h.update(&pack_w1(&w1, p));
+        let mut w1b = [0u8; MAX_W1];
+        let w1b = &mut w1b[..p.w1_bytes()];
+        pack_w1(&w1, p, w1b);
+        h.update(w1b);
     }
-    let mut check = alloc::vec![0u8; p.ctilde];
-    h.finalize_into(&mut check);
+    let mut check_buf = [0u8; MAX_CTILDE];
+    let check = &mut check_buf[..p.ctilde];
+    h.finalize_into(check);
 
     // Constant-time comparison of c̃ — both inputs are public, but uniform
     // with the rest of the codebase. The explicit length check protects
@@ -663,10 +731,7 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
     if ctilde.len() != check.len() {
         return false;
     }
-    bool::from(<[u8] as crate::ct::ConstantTimeEq>::ct_eq(
-        ctilde,
-        check.as_slice(),
-    ))
+    bool::from(<[u8] as crate::ct::ConstantTimeEq>::ct_eq(ctilde, &*check))
 }
 
 /// Derives the public key bytes from a parsed private key (FIPS 204 §7.2:
@@ -674,7 +739,8 @@ pub(crate) fn verify_internal<const K: usize, const L: usize>(
 pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
     sk: &[u8],
     p: &Params,
-) -> Vec<u8> {
+    pk_out: &mut [u8],
+) {
     let rho = &sk[..32];
     let mut off = 128;
     let eb = p.eta_bytes();
@@ -693,8 +759,8 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
     for s in s1_ntt.iter_mut() {
         s.ntt();
     }
-    let mut pk = Vec::with_capacity(p.pubkey);
-    pk.extend_from_slice(rho);
+    let mut pkc = Cursor::new(pk_out);
+    pkc.put(rho);
     for i in 0..K {
         let mut acc = Poly::zero();
         for j in 0..L {
@@ -706,14 +772,14 @@ pub(crate) fn derive_public_from_sk<const K: usize, const L: usize>(
         for jj in 0..N {
             (t1.c[jj], _) = power2_round(t.c[jj]);
         }
-        pk.extend_from_slice(&pack_t1(&t1));
+        pack_t1(&t1, pkc.take(POLY_T1));
     }
+    debug_assert_eq!(pkc.done(), p.pubkey);
     // Wipe the unpacked secret vectors (and the NTT copy of s1) before they
     // drop — same hygiene as `sign_internal`.
     wipe_polys(&mut s1);
     wipe_polys(&mut s1_ntt);
     wipe_polys(&mut s2);
-    pk
 }
 
 /// Validates the `s1` and `s2` byte ranges inside a packed ML-DSA private
@@ -740,14 +806,17 @@ fn validate_sk_ranges<const K: usize, const L: usize>(sk: &[u8], p: &Params) -> 
     Ok(())
 }
 
-/// Builds `M' = 0 ‖ len(ctx) ‖ ctx ‖ msg` for the external signing interface.
-fn m_prime(ctx: &[u8], msg: &[u8]) -> Vec<u8> {
-    let mut m = Vec::with_capacity(2 + ctx.len() + msg.len());
-    m.push(0);
-    m.push(ctx.len() as u8);
-    m.extend_from_slice(ctx);
-    m.extend_from_slice(msg);
-    m
+/// The pieces of `M' = 0 ‖ len(ctx) ‖ ctx ‖ msg` for the external signing
+/// interface.
+///
+/// `M'` is only ever absorbed into SHAKE, and `msg` is arbitrary-length, so the
+/// parts are streamed into the hash instead of being concatenated into a
+/// buffer — which is what let this module drop its last unavoidable-looking
+/// allocation.
+fn m_prime_parts<'a>(prefix: &'a mut [u8; 2], ctx: &'a [u8], msg: &'a [u8]) -> [&'a [u8]; 3] {
+    prefix[0] = 0;
+    prefix[1] = ctx.len() as u8;
+    [&prefix[..], ctx, msg]
 }
 
 /// Generates a per-level type family `(PrivateKey, PublicKey)`.
@@ -764,16 +833,18 @@ macro_rules! ml_dsa_level {
         // the LAMPS `both` (seed-priv) form OpenSSL 3.5 writes by default; `None`
         // for keys imported from expanded bytes, which can only re-emit
         // `expandedKey`.
-        pub struct $sk(Vec<u8>, Option<[u8; SEED_SIZE]>);
+        pub struct $sk([u8; $params.privkey], Option<[u8; SEED_SIZE]>);
 
         #[doc = concat!("An ", stringify!($kind), " public (verification) key.")]
         #[derive(Clone, PartialEq, Eq, Debug)]
-        pub struct $pk(Vec<u8>);
+        pub struct $pk([u8; $params.pubkey]);
 
         impl $sk {
             /// Deterministically derives a key pair from a 32-byte seed.
             pub fn from_seed(seed: &[u8; SEED_SIZE]) -> ($sk, $pk) {
-                let (pk, sk) = keygen::<$k, $l>(seed, &$params);
+                let mut pk = [0u8; $params.pubkey];
+                let mut sk = [0u8; $params.privkey];
+                keygen::<$k, $l>(seed, &$params, &mut pk, &mut sk);
                 ($sk(sk, Some(*seed)), $pk(pk))
             }
 
@@ -808,26 +879,34 @@ macro_rules! ml_dsa_level {
                 rng: &mut R,
                 msg: &[u8],
                 ctx: &[u8],
-            ) -> Result<Vec<u8>, Error> {
+            ) -> Result<[u8; $params.sig], Error> {
                 if ctx.len() > 255 {
                     return Err(Error::ContextTooLong);
                 }
                 let mut rnd = [0u8; 32];
                 rng.fill_bytes(&mut rnd);
-                Ok(sign_internal::<$k, $l>(&self.0, &rnd, &m_prime(ctx, msg), &$params))
+                let mut sig = [0u8; $params.sig];
+                let mut pfx = [0u8; 2];
+                sign_internal::<$k, $l>(&self.0, &rnd, &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
+                Ok(sig)
             }
 
             /// Signs `msg` deterministically (zero randomness).
-            pub fn sign_deterministic(&self, msg: &[u8], ctx: &[u8]) -> Result<Vec<u8>, Error> {
+            pub fn sign_deterministic(&self, msg: &[u8], ctx: &[u8]) -> Result<[u8; $params.sig], Error> {
                 if ctx.len() > 255 {
                     return Err(Error::ContextTooLong);
                 }
-                Ok(sign_internal::<$k, $l>(&self.0, &[0u8; 32], &m_prime(ctx, msg), &$params))
+                let mut sig = [0u8; $params.sig];
+                let mut pfx = [0u8; 2];
+                sign_internal::<$k, $l>(&self.0, &[0u8; 32], &m_prime_parts(&mut pfx, ctx, msg), &$params, &mut sig);
+                Ok(sig)
             }
 
             /// Derives the matching public key from this private key.
             pub fn public_key(&self) -> $pk {
-                $pk(derive_public_from_sk::<$k, $l>(&self.0, &$params))
+                let mut pk = [0u8; $params.pubkey];
+                derive_public_from_sk::<$k, $l>(&self.0, &$params, &mut pk);
+                $pk(pk)
             }
 
             /// The encoded private key.
@@ -841,7 +920,9 @@ macro_rules! ml_dsa_level {
             /// `sign` call cannot panic on a malformed buffer.
             pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
                 validate_sk_ranges::<$k, $l>(bytes, &$params)?;
-                Ok($sk(bytes.to_vec(), None))
+                let mut b = [0u8; $params.privkey];
+                b.copy_from_slice(bytes);
+                Ok($sk(b, None))
             }
 
             /// Encodes the private key as a PKCS#8 `PrivateKeyInfo` DER.
@@ -1022,7 +1103,10 @@ macro_rules! ml_dsa_level {
                 if ctx.len() > 255 {
                     return false;
                 }
-                verify_internal::<$k, $l>(&self.0, sig, &m_prime(ctx, msg), &$params)
+                {
+                    let mut pfx = [0u8; 2];
+                    verify_internal::<$k, $l>(&self.0, sig, &m_prime_parts(&mut pfx, ctx, msg), &$params)
+                }
             }
 
             /// The raw encoded public key.
@@ -1035,7 +1119,9 @@ macro_rules! ml_dsa_level {
                 if bytes.len() != $params.pubkey {
                     return Err(Error::InvalidLength);
                 }
-                Ok($pk(bytes.to_vec()))
+                let mut b = [0u8; $params.pubkey];
+                b.copy_from_slice(bytes);
+                Ok($pk(b))
             }
 
             /// Encodes the key as a PKIX `SubjectPublicKeyInfo` DER structure
@@ -1117,7 +1203,9 @@ ml_dsa_level!(
     MlDsa87, MlDsa87PrivateKey, MlDsa87PublicKey, 8, 7, P87, OID_87
 );
 
-#[cfg(test)]
+// The ACVP vector suite decodes hex into `Vec`s; `nobuf_tests` covers the
+// allocator-free path.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::hash::Sha256;
@@ -1147,7 +1235,9 @@ mod tests {
                     let seed: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
                     let pk_exp = unhex(it.next().unwrap());
                     let sk_exp = unhex(it.next().unwrap());
-                    let (pk, sk) = keygen::<$k, $l>(&seed, &$params);
+                    let mut pk = alloc::vec![0u8; $params.pubkey];
+                    let mut sk = alloc::vec![0u8; $params.privkey];
+                    keygen::<$k, $l>(&seed, &$params, &mut pk, &mut sk);
                     assert_eq!(pk, pk_exp, "pk");
                     assert_eq!(sk, sk_exp, "sk");
                 }
@@ -1161,7 +1251,8 @@ mod tests {
                     let rnd: [u8; 32] = unhex(it.next().unwrap()).try_into().unwrap();
                     let msg = unhex(it.next().unwrap());
                     let sig_exp = unhex(it.next().unwrap());
-                    let sig = sign_internal::<$k, $l>(&sk, &rnd, &msg, &$params);
+                    let mut sig = alloc::vec![0u8; $params.sig];
+                    sign_internal::<$k, $l>(&sk, &rnd, &[&msg[..]], &$params, &mut sig);
                     assert_eq!(sig, sig_exp, "signature");
                 }
             }
@@ -1174,7 +1265,7 @@ mod tests {
                     let msg = unhex(it.next().unwrap());
                     let sig = unhex(it.next().unwrap());
                     let want = it.next().unwrap() == "1";
-                    let got = verify_internal::<$k, $l>(&pk, &sig, &msg, &$params);
+                    let got = verify_internal::<$k, $l>(&pk, &sig, &[&msg[..]], &$params);
                     assert_eq!(got, want, "verify");
                 }
             }
@@ -1236,7 +1327,7 @@ mod tests {
         // Wrong message, wrong context, and a tampered signature all fail.
         assert!(!pk.verify(&sig, b"other", b"ctx"));
         assert!(!pk.verify(&sig, b"hello purecrypto", b"other"));
-        let mut bad = sig.clone();
+        let mut bad = sig;
         *bad.last_mut().unwrap() ^= 1;
         assert!(!pk.verify(&bad, b"hello purecrypto", b"ctx"));
 
@@ -1491,5 +1582,52 @@ mod tests {
             let want = if a <= Q_MINUS_1_DIV2 { a } else { Q - a };
             assert_eq!(inf_norm(a), want, "inf_norm({})", a);
         }
+    }
+}
+
+#[cfg(test)]
+mod nobuf_tests {
+    use super::*;
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+
+    /// Keygen, sign and verify with no allocator: every ML-DSA length is fixed
+    /// by the parameter set, so the keys and the signature are plain arrays.
+    #[test]
+    fn sign_verify_roundtrip_no_alloc() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-nobuf", b"nonce", &[]);
+        let (sk, pk) = MlDsa44PrivateKey::generate(&mut rng);
+        let sig = sk.sign(&mut rng, b"firmware", b"").expect("sign");
+        assert_eq!(sig.len(), P44.sig);
+        assert!(pk.verify(&sig, b"firmware", b""));
+        assert!(!pk.verify(&sig, b"other", b""));
+    }
+
+    /// Deterministic signing is reproducible and independent of the RNG.
+    #[test]
+    fn deterministic_sign_is_stable_no_alloc() {
+        let seed = [3u8; SEED_SIZE];
+        let (sk, pk) = MlDsa44PrivateKey::from_seed(&seed);
+        let a = sk.sign_deterministic(b"msg", b"ctx").expect("sign");
+        let b = sk.sign_deterministic(b"msg", b"ctx").expect("sign");
+        assert_eq!(a, b);
+        assert!(pk.verify(&a, b"msg", b"ctx"));
+        // The context is bound into the signature.
+        assert!(!pk.verify(&a, b"msg", b"other"));
+    }
+
+    /// Keys round-trip through their fixed-size encodings.
+    #[test]
+    fn key_encoding_roundtrip_no_alloc() {
+        let seed = [9u8; SEED_SIZE];
+        let (sk, pk) = MlDsa65PrivateKey::from_seed(&seed);
+        assert_eq!(pk.to_bytes().len(), P65.pubkey);
+        assert_eq!(sk.to_bytes().len(), P65.privkey);
+        let pk2 = MlDsa65PublicKey::from_bytes(pk.to_bytes()).expect("pk");
+        assert_eq!(pk2.to_bytes(), pk.to_bytes());
+        let sk2 = MlDsa65PrivateKey::from_bytes(sk.to_bytes()).expect("sk");
+        assert_eq!(sk2.public_key().to_bytes(), pk.to_bytes());
+        // Wrong length is rejected.
+        assert!(MlDsa65PublicKey::from_bytes(&pk.to_bytes()[..10]).is_err());
     }
 }

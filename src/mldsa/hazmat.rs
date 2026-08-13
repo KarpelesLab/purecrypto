@@ -172,8 +172,11 @@ pub fn expand_mask(seed: &[u8], gamma1_bits: u32) -> Poly {
 // --- bit-packing of polynomials and the hint (FIPS 204 §7.2–§7.3) ---
 
 /// Packs `t1` with 10 bits per coefficient (320 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_t1(f: &Poly) -> Vec<u8> {
-    super::encode::pack_t1(f)
+    let mut v = alloc::vec![0u8; N * 10 / 8];
+    super::encode::pack_t1(f, &mut v);
+    v
 }
 
 /// Unpacks `t1` (10 bits per coefficient).
@@ -182,8 +185,11 @@ pub fn unpack_t1(b: &[u8]) -> Poly {
 }
 
 /// Packs `t0` with 13 bits per signed coefficient (416 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_t0(f: &Poly) -> Vec<u8> {
-    super::encode::pack_t0(f)
+    let mut v = alloc::vec![0u8; N * 13 / 8];
+    super::encode::pack_t0(f, &mut v);
+    v
 }
 
 /// Unpacks `t0` (13 bits per signed coefficient).
@@ -192,8 +198,11 @@ pub fn unpack_t0(b: &[u8]) -> Poly {
 }
 
 /// Packs an `η = 2` secret coefficient vector (3 bits each, 96 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_eta2(f: &Poly) -> Vec<u8> {
-    super::encode::pack_eta2(f)
+    let mut v = alloc::vec![0u8; N * 3 / 8];
+    super::encode::pack_eta2(f, &mut v);
+    v
 }
 
 /// Unpacks an `η = 2` vector, validating each 3-bit group is ≤ 4. `Err(())`
@@ -203,8 +212,11 @@ pub fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
 }
 
 /// Packs an `η = 4` secret coefficient vector (4 bits each, 128 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_eta4(f: &Poly) -> Vec<u8> {
-    super::encode::pack_eta4(f)
+    let mut v = alloc::vec![0u8; N * 4 / 8];
+    super::encode::pack_eta4(f, &mut v);
+    v
 }
 
 /// Unpacks an `η = 4` vector, validating each nibble is ≤ 8. `Err(())` signals
@@ -214,13 +226,19 @@ pub fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
 }
 
 /// Packs `z` with `γ₁ = 2¹⁷` (18 bits each, 576 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_z17(f: &Poly) -> Vec<u8> {
-    super::encode::pack_z17(f)
+    let mut v = alloc::vec![0u8; N * 18 / 8];
+    super::encode::pack_z17(f, &mut v);
+    v
 }
 
 /// Packs `z` with `γ₁ = 2¹⁹` (20 bits each, 640 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_z19(f: &Poly) -> Vec<u8> {
-    super::encode::pack_z19(f)
+    let mut v = alloc::vec![0u8; N * 20 / 8];
+    super::encode::pack_z19(f, &mut v);
+    v
 }
 
 /// Unpacks `z` with `γ₁ = 2¹⁷` (18 bits each).
@@ -234,19 +252,28 @@ pub fn unpack_z19(b: &[u8]) -> Poly {
 }
 
 /// Packs `w1` with 4 bits per coefficient (ML-DSA-65/87, 128 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_w1_4(f: &Poly) -> Vec<u8> {
-    super::encode::pack_w1_4(f)
+    let mut v = alloc::vec![0u8; N * 4 / 8];
+    super::encode::pack_w1_4(f, &mut v);
+    v
 }
 
 /// Packs `w1` with 6 bits per coefficient (ML-DSA-44, 192 bytes).
+#[cfg(feature = "alloc")]
 pub fn pack_w1_6(f: &Poly) -> Vec<u8> {
-    super::encode::pack_w1_6(f)
+    let mut v = alloc::vec![0u8; N * 6 / 8];
+    super::encode::pack_w1_6(f, &mut v);
+    v
 }
 
 /// Packs the hint: per-polynomial set-bit positions followed by running counts
 /// (`omega + k` bytes, where `k = hints.len()`).
+#[cfg(feature = "alloc")]
 pub fn pack_hint(hints: &[Poly], omega: usize) -> Vec<u8> {
-    super::encode::pack_hint(hints, omega)
+    let mut v = alloc::vec![0u8; omega + hints.len()];
+    super::encode::pack_hint(hints, omega, &mut v);
+    v
 }
 
 /// Unpacks the hint into `hints`, rejecting malformed encodings (non-increasing
@@ -259,8 +286,11 @@ pub fn unpack_hint(b: &[u8], hints: &mut [Poly], omega: usize) -> bool {
 // --- Params-dispatched packing helpers ---
 
 /// Packs the secret coefficient vector `f` with the `η` width selected by `p`.
+#[cfg(feature = "alloc")]
 pub fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
-    super::pack_eta(f, p)
+    let mut v = alloc::vec![0u8; if p.eta == 2 { N * 3 / 8 } else { N * 4 / 8 }];
+    super::pack_eta(f, p, &mut v);
+    v
 }
 
 /// Unpacks an `η`-encoded coefficient vector for the level described by `p`,
@@ -270,8 +300,11 @@ pub fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, super::Error> {
 }
 
 /// Packs `z` with the `γ₁` width selected by `p`.
+#[cfg(feature = "alloc")]
 pub fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
-    super::pack_z(f, p)
+    let mut v = alloc::vec![0u8; if p.gamma1_bits == 17 { N * 18 / 8 } else { N * 20 / 8 }];
+    super::pack_z(f, p, &mut v);
+    v
 }
 
 /// Unpacks a `z`-encoded coefficient vector for the level described by `p`.
@@ -280,8 +313,11 @@ pub fn unpack_z(b: &[u8], p: &Params) -> Poly {
 }
 
 /// Packs `w1` with the width selected by `p`.
+#[cfg(feature = "alloc")]
 pub fn pack_w1(f: &Poly, p: &Params) -> Vec<u8> {
-    super::pack_w1(f, p)
+    let mut v = alloc::vec![0u8; if p.gamma2 == super::GAMMA2_88 { N * 6 / 8 } else { N * 4 / 8 }];
+    super::pack_w1(f, p, &mut v);
+    v
 }
 
 #[cfg(test)]

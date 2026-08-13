@@ -27,6 +27,11 @@ use alloc::borrow::Cow;
 /// provided but deliberately redacts the secret key material.
 #[derive(Clone)]
 #[non_exhaustive]
+// ML-DSA keys are fixed-size inline arrays (that is what makes ML-DSA usable
+// without an allocator), so the PQ variants dwarf the classical ones. Boxing
+// them would trade this for a heap indirection on every key; the enum is only
+// ever built by the `alloc`-gated X.509 parsers and moved rarely.
+#[allow(clippy::large_enum_variant)]
 pub enum AnyPrivateKey {
     /// An RSA private key (runtime-sized).
     Rsa(BoxedRsaPrivateKey),

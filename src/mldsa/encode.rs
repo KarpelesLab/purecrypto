@@ -1,24 +1,29 @@
 //! Bit-packing of polynomials and the hint (FIPS 204 §7.2–§7.3).
 //!
-//! Mirrors the reference byte layout exactly. Packers return `Vec<u8>`;
-//! unpackers read borrowed slices. The `eta` and hint unpackers validate their
-//! input and return an error on malformed encodings.
+//! Mirrors the reference byte layout exactly. Packers write into a
+//! caller-supplied slice of exactly the encoded length (every length here is
+//! fixed by the parameter set, so nothing needs a heap); unpackers read
+//! borrowed slices. The `eta` and hint unpackers validate their input and
+//! return an error on malformed encodings.
 
 use super::field::{N, Poly, sub};
-use alloc::vec;
-use alloc::vec::Vec;
 
-/// Reads 8 little-endian bytes as a `u64`.
+/// Reads up to 8 little-endian bytes as a `u64`, zero-extending a short slice.
+///
+/// Zero-extending in place replaces the old `[&b[..], &[0,0,0][..]].concat()`
+/// call sites, which allocated purely to pad five bytes out to eight.
 #[inline]
 fn le64(b: &[u8]) -> u64 {
     let mut a = [0u8; 8];
-    a.copy_from_slice(&b[..8]);
+    let n = b.len().min(8);
+    a[..n].copy_from_slice(&b[..n]);
     u64::from_le_bytes(a)
 }
 
 /// Packs `t1` with 10 bits per coefficient (320 bytes).
-pub(crate) fn pack_t1(f: &Poly) -> Vec<u8> {
-    let mut b = vec![0u8; N * 10 / 8];
+pub(crate) fn pack_t1(f: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * 10 / 8);
+    let b = out;
     for i in (0..N).step_by(4) {
         let x = f.c[i] as u64
             | (f.c[i + 1] as u64) << 10
@@ -27,7 +32,6 @@ pub(crate) fn pack_t1(f: &Poly) -> Vec<u8> {
         let o = i / 4 * 5;
         b[o..o + 5].copy_from_slice(&x.to_le_bytes()[..5]);
     }
-    b
 }
 
 /// Unpacks `t1` (10 bits per coefficient).
@@ -35,7 +39,7 @@ pub(crate) fn unpack_t1(b: &[u8]) -> Poly {
     let mut f = Poly::zero();
     for i in (0..N).step_by(4) {
         let o = i / 4 * 5;
-        let x = le64(&[&b[o..o + 5], &[0, 0, 0][..]].concat());
+        let x = le64(&b[o..o + 5]);
         f.c[i] = (x & 0x3ff) as u32;
         f.c[i + 1] = ((x >> 10) & 0x3ff) as u32;
         f.c[i + 2] = ((x >> 20) & 0x3ff) as u32;
@@ -45,9 +49,10 @@ pub(crate) fn unpack_t1(b: &[u8]) -> Poly {
 }
 
 /// Packs `t0` with 13 bits per signed coefficient (416 bytes).
-pub(crate) fn pack_t0(f: &Poly) -> Vec<u8> {
+pub(crate) fn pack_t0(f: &Poly, out: &mut [u8]) {
     const CENTER: u32 = 1 << 12;
-    let mut b = vec![0u8; N * 13 / 8];
+    debug_assert_eq!(out.len(), N * 13 / 8);
+    let b = out;
     let mut idx = 0;
     for i in (0..N).step_by(8) {
         let mut x1 = sub(CENTER, f.c[i]) as u64;
@@ -64,7 +69,6 @@ pub(crate) fn pack_t0(f: &Poly) -> Vec<u8> {
         b[idx + 8..idx + 13].copy_from_slice(&x2.to_le_bytes()[..5]);
         idx += 13;
     }
-    b
 }
 
 /// Unpacks `t0` (13 bits per signed coefficient).
@@ -75,7 +79,7 @@ pub(crate) fn unpack_t0(b: &[u8]) -> Poly {
     let mut o = 0;
     for i in (0..N).step_by(8) {
         let x1 = le64(&b[o..o + 8]);
-        let x2 = le64(&[&b[o + 8..o + 13], &[0, 0, 0][..]].concat());
+        let x2 = le64(&b[o + 8..o + 13]);
         o += 13;
         f.c[i] = sub(CENTER, (x1 & MASK) as u32);
         f.c[i + 1] = sub(CENTER, ((x1 >> 13) & MASK) as u32);
@@ -90,8 +94,9 @@ pub(crate) fn unpack_t0(b: &[u8]) -> Poly {
 }
 
 /// Packs a secret coefficient vector with `η = 2` (3 bits each, 96 bytes).
-pub(crate) fn pack_eta2(f: &Poly) -> Vec<u8> {
-    let mut b = vec![0u8; N * 3 / 8];
+pub(crate) fn pack_eta2(f: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * 3 / 8);
+    let b = out;
     for i in (0..N).step_by(8) {
         let mut x = 0u32;
         for j in 0..8 {
@@ -100,7 +105,6 @@ pub(crate) fn pack_eta2(f: &Poly) -> Vec<u8> {
         let o = i / 8 * 3;
         b[o..o + 3].copy_from_slice(&x.to_le_bytes()[..3]);
     }
-    b
 }
 
 /// Unpacks an `η = 2` vector, validating each 3-bit group is ≤ 4.
@@ -121,12 +125,12 @@ pub(crate) fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
 }
 
 /// Packs a secret coefficient vector with `η = 4` (4 bits each, 128 bytes).
-pub(crate) fn pack_eta4(f: &Poly) -> Vec<u8> {
-    let mut b = vec![0u8; N * 4 / 8];
+pub(crate) fn pack_eta4(f: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * 4 / 8);
+    let b = out;
     for i in (0..N).step_by(2) {
         b[i / 2] = (sub(4, f.c[i]) | (sub(4, f.c[i + 1]) << 4)) as u8;
     }
-    b
 }
 
 /// Unpacks an `η = 4` vector, validating each nibble is ≤ 8.
@@ -150,9 +154,10 @@ pub(crate) fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
 }
 
 /// Packs `z` with `γ₁ = 2¹⁷` (18 bits each, 576 bytes).
-pub(crate) fn pack_z17(f: &Poly) -> Vec<u8> {
+pub(crate) fn pack_z17(f: &Poly, out: &mut [u8]) {
     const G: u32 = 1 << 17;
-    let mut b = vec![0u8; N * 18 / 8];
+    debug_assert_eq!(out.len(), N * 18 / 8);
+    let b = out;
     let mut idx = 0;
     for i in (0..N).step_by(4) {
         let mut x1 = sub(G, f.c[i]) as u64;
@@ -165,13 +170,13 @@ pub(crate) fn pack_z17(f: &Poly) -> Vec<u8> {
         b[idx + 8] = x2 as u8;
         idx += 9;
     }
-    b
 }
 
 /// Packs `z` with `γ₁ = 2¹⁹` (20 bits each, 640 bytes).
-pub(crate) fn pack_z19(f: &Poly) -> Vec<u8> {
+pub(crate) fn pack_z19(f: &Poly, out: &mut [u8]) {
     const G: u32 = 1 << 19;
-    let mut b = vec![0u8; N * 20 / 8];
+    debug_assert_eq!(out.len(), N * 20 / 8);
+    let b = out;
     let mut idx = 0;
     for i in (0..N).step_by(4) {
         let mut x1 = sub(G, f.c[i]) as u64;
@@ -184,7 +189,6 @@ pub(crate) fn pack_z19(f: &Poly) -> Vec<u8> {
         b[idx + 8..idx + 10].copy_from_slice(&(x2 as u16).to_le_bytes());
         idx += 10;
     }
-    b
 }
 
 /// Unpacks `z` with `γ₁ = 2¹⁷` (18 bits each). Used for both `ExpandMask`
@@ -225,30 +229,32 @@ pub(crate) fn unpack_z19(b: &[u8]) -> Poly {
 }
 
 /// Packs `w1` with 4 bits per coefficient (ML-DSA-65/87, 128 bytes).
-pub(crate) fn pack_w1_4(f: &Poly) -> Vec<u8> {
-    let mut b = vec![0u8; N * 4 / 8];
+pub(crate) fn pack_w1_4(f: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * 4 / 8);
+    let b = out;
     for i in (0..N).step_by(2) {
         b[i / 2] = (f.c[i] | (f.c[i + 1] << 4)) as u8;
     }
-    b
 }
 
 /// Packs `w1` with 6 bits per coefficient (ML-DSA-44, 192 bytes).
-pub(crate) fn pack_w1_6(f: &Poly) -> Vec<u8> {
-    let mut b = vec![0u8; N * 6 / 8];
+pub(crate) fn pack_w1_6(f: &Poly, out: &mut [u8]) {
+    debug_assert_eq!(out.len(), N * 6 / 8);
+    let b = out;
     for i in (0..N).step_by(4) {
         let x = f.c[i] | (f.c[i + 1] << 6) | (f.c[i + 2] << 12) | (f.c[i + 3] << 18);
         let o = i / 4 * 3;
         b[o..o + 3].copy_from_slice(&x.to_le_bytes()[..3]);
     }
-    b
 }
 
 /// Packs the hint: positions of set bits per polynomial, then the running
 /// counts (`omega + k` bytes).
-pub(crate) fn pack_hint(hints: &[Poly], omega: usize) -> Vec<u8> {
+pub(crate) fn pack_hint(hints: &[Poly], omega: usize, out: &mut [u8]) {
     let k = hints.len();
-    let mut b = vec![0u8; omega + k];
+    debug_assert_eq!(out.len(), omega + k);
+    out.fill(0);
+    let b = out;
     let mut idx = 0;
     for (i, h) in hints.iter().enumerate() {
         for (j, &c) in h.c.iter().enumerate() {
@@ -259,7 +265,6 @@ pub(crate) fn pack_hint(hints: &[Poly], omega: usize) -> Vec<u8> {
         }
         b[omega + i] = idx as u8;
     }
-    b
 }
 
 /// Unpacks the hint into `hints`, rejecting malformed encodings (non-increasing

@@ -2163,14 +2163,17 @@ impl ClientConnection12 {
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa44(k) => k
                 .sign_deterministic(&to_sign, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa65(k) => k
                 .sign_deterministic(&to_sign, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             #[cfg(feature = "mldsa")]
             ClientKey::MlDsa87(k) => k
                 .sign_deterministic(&to_sign, b"")
+                .map(|s| s.to_vec())
                 .map_err(|_| Error::HandshakeFailure)?,
             // Classic TLS 1.2 client-cert external signing is out of scope.
             ClientKey::External { .. } => return Err(Error::HandshakeFailure),
