@@ -556,24 +556,24 @@ mod tests {
         Fe::from_bytes(b)
     }
 
-    fn edge_values() -> alloc::vec::Vec<[u8; 32]> {
-        let mut vals = alloc::vec::Vec::new();
-        let mut push_int = |v: ScalarInt| {
-            let mut b = [0u8; 32];
-            v.write_le_bytes(&mut b);
-            vals.push(b);
-        };
+    fn edge_values() -> [[u8; 32]; 10] {
         let p = P_INT;
-        push_int(ScalarInt::ZERO);
-        push_int(ScalarInt::ONE);
-        push_int(ScalarInt::from_u64(2));
-        push_int(ScalarInt::from_u64(19));
-        push_int(p.wrapping_sub(&ScalarInt::ONE)); // p − 1
-        push_int(p.wrapping_sub(&ScalarInt::from_u64(2))); // p − 2
-        push_int(p); // non-canonical: p
-        push_int(p.wrapping_add(&ScalarInt::ONE)); // non-canonical: p + 1
-        push_int(p.wrapping_add(&ScalarInt::from_u64(18))); // non-canonical: p + 18
-        vals.push([0xff; 32]); // 2^255 − 1 after masking (= p + 18)
+        let ints = [
+            ScalarInt::ZERO,
+            ScalarInt::ONE,
+            ScalarInt::from_u64(2),
+            ScalarInt::from_u64(19),
+            p.wrapping_sub(&ScalarInt::ONE),          // p − 1
+            p.wrapping_sub(&ScalarInt::from_u64(2)),  // p − 2
+            p,                                        // non-canonical: p
+            p.wrapping_add(&ScalarInt::ONE),          // non-canonical: p + 1
+            p.wrapping_add(&ScalarInt::from_u64(18)), // non-canonical: p + 18
+        ];
+        let mut vals = [[0u8; 32]; 10];
+        for (slot, v) in vals.iter_mut().zip(ints.iter()) {
+            v.write_le_bytes(slot);
+        }
+        vals[9] = [0xff; 32]; // 2^255 − 1 after masking (= p + 18)
         vals
     }
 
@@ -628,11 +628,11 @@ mod tests {
         let o = Oracle::new();
         let mut rng = HmacDrbg::<Sha256>::new(b"fe51-differential", b"nonce", &[]);
 
-        let mut values = edge_values();
-        for _ in 0..64 {
-            let mut b = [0u8; 32];
-            rng.fill_bytes(&mut b);
-            values.push(b);
+        let edges = edge_values();
+        let mut values = [[0u8; 32]; 74];
+        values[..edges.len()].copy_from_slice(&edges);
+        for slot in values[edges.len()..].iter_mut() {
+            rng.fill_bytes(slot);
         }
 
         for a_bytes in &values {

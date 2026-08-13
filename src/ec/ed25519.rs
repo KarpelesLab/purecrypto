@@ -25,7 +25,7 @@ use crate::rng::{CryptoRng, RngCore};
 
 /// The `id-Ed25519` OID (1.3.101.112), used for both the key and the signature
 /// algorithm (RFC 8410).
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 pub(crate) const ED25519_OID: &[u64] = &[1, 3, 101, 112];
 
 /// An Ed25519 private key — a 32-byte seed.
@@ -125,7 +125,7 @@ impl Ed25519PrivateKey {
 }
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization.
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 impl Ed25519PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
@@ -185,7 +185,7 @@ impl Ed25519PrivateKey {
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018
     /// §6.2) with caller-supplied parameters, returning the DER-encoded
     /// `EncryptedPrivateKeyInfo`.
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn to_pkcs8_der_encrypted(
         &self,
         password: &[u8],
@@ -197,7 +197,7 @@ impl Ed25519PrivateKey {
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
     /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`, RFC 7468 §11).
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn to_pkcs8_pem_encrypted(
         &self,
         password: &[u8],
@@ -209,7 +209,7 @@ impl Ed25519PrivateKey {
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a
     /// PKCS#8 Ed25519 private key.
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_der_encrypted(
         der: &[u8],
         password: &[u8],
@@ -220,7 +220,7 @@ impl Ed25519PrivateKey {
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
         let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
             .map_err(|_| crate::der::Error::Malformed)?;
@@ -470,7 +470,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_v1_round_trip() {
         let seed =
@@ -481,7 +481,7 @@ mod tests {
         assert_eq!(sk2.to_bytes(), seed);
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_rejects_trailing_garbage() {
         let seed =
@@ -494,7 +494,7 @@ mod tests {
         assert!(Ed25519PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_v2_with_public_key_parses() {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};

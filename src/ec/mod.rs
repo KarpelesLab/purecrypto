@@ -14,10 +14,31 @@
 //!
 //! Also exposes X25519 ([`x25519`]) / X448 ([`x448`]) Diffie-Hellman and
 //! Ed25519 ([`ed25519`]) / Ed448 ([`ed448`]) signatures.
+//!
+//! # Without `alloc`
+//!
+//! This module does **not** require the `alloc` feature. An allocator-free build
+//! (`--no-default-features --features ec`) provides the fixed-curve primitives —
+//! key generation, ECDH, and sign/verify for P-256 ([`ecdsa`], [`ecdh`]), X25519,
+//! X448, Ed25519 and Ed448 — together with their fixed-size byte encodings
+//! (`to_bytes` / `from_bytes`, and SEC1 for P-256). Everything there works on
+//! bare-metal targets with no global allocator.
+//!
+//! Enabling `alloc` additionally provides:
+//!
+//! - the runtime multi-curve [`boxed`] path and [`CurveId`], i.e. P-384, P-521,
+//!   secp256k1 and the Brainpool curves, whose arithmetic is heap-backed;
+//! - [`sm2`], which is built on the same heap bignums; and
+//! - every DER/PEM codec (`to_pkcs8_der`, `to_pkcs8_pem`, `Signature::to_der`,
+//!   …). These are gated on `alloc` in *both* directions: the `der` encoders and
+//!   its OID parser allocate, so `from_pkcs8_der` needs `alloc` as much as
+//!   `to_pkcs8_der` does.
 
+#[cfg(feature = "alloc")]
 pub mod boxed;
 mod curve25519;
 mod curve448;
+#[cfg(feature = "alloc")]
 pub mod curves;
 pub mod ecdh;
 pub mod ecdsa;
@@ -33,17 +54,22 @@ pub(crate) mod registry;
 pub mod ristretto255;
 #[cfg(feature = "hazmat-secp256k1")]
 pub mod secp256k1;
+#[cfg(feature = "alloc")]
 pub mod sm2;
+#[cfg(feature = "alloc")]
 mod weierstrass;
 pub mod x25519;
 pub mod x448;
 
+#[cfg(feature = "alloc")]
 pub use boxed::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature,
 };
+#[cfg(feature = "alloc")]
 pub use curves::CurveId;
 pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
+#[cfg(feature = "alloc")]
 pub use sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 pub use x448::{X448PrivateKey, X448PublicKey};
 pub use x25519::{X25519PrivateKey, X25519PublicKey};

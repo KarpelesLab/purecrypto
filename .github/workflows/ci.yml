@@ -71,10 +71,23 @@ jobs:
       - name: Build no_std with all module features
         run: cargo build --target ${{ matrix.target }} --no-default-features --features bignum,hash,cipher,kdf
 
+      # `ec` must not require `alloc`: the fixed-curve primitives (P-256
+      # ECDSA/ECDH, X25519, X448, Ed25519, Ed448) are usable on allocator-free
+      # targets. Guards against a stray `alloc::` creeping back into an
+      # ungated EC path — which fails here as E0433, since `extern crate alloc`
+      # is itself feature-gated.
+      - name: Build ec without alloc
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features ec
+
+      # ...and the alloc-gated half (boxed multi-curve, SM2, DER/PEM codecs)
+      # must still build when `alloc` is present but `std` is not.
+      - name: Build ec with alloc, no std
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features ec,alloc,der,kdf
+
       # `ec` + `der` without `x509`: regression guard for the SM2 SPKI codecs,
       # which must not reach into the `x509`-gated `oid` module.
       - name: Build ec + der without x509
-        run: cargo build --target ${{ matrix.target }} --no-default-features --features ec,der
+        run: cargo build --target ${{ matrix.target }} --no-default-features --features ec,der,alloc
 
       # The sans-I/O TLS/DTLS engine must build without `std`: it takes entropy
       # as a caller-supplied `EntropySource` and never reaches for `OsRng`.

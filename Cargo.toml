@@ -80,7 +80,11 @@ x509 = ["der", "rsa", "hash", "alloc", "ec"]
 # Appendix B SHA-based HMAC. Legacy `pbeWithSHAAnd3-KeyTripleDES-CBC` archives
 # parse too (40-bit RC2 is not supported).
 pkcs12 = ["x509", "kdf", "cipher", "der", "alloc"]
-ec = ["bignum", "rng", "hash", "alloc"]
+# Usable without `alloc`: the fixed-curve primitives (P-256 ECDSA/ECDH, X25519,
+# X448, Ed25519, Ed448) and their fixed-size byte encodings need no heap. Adding
+# `alloc` additionally enables the runtime multi-curve `boxed` path (P-384/P-521/
+# secp256k1/brainpool via heap `BoxedUint`), SM2, and every DER/PEM serializer.
+ec = ["bignum", "rng", "hash"]
 tls = ["cipher", "hash", "kdf", "ec", "rsa", "x509", "der", "rng", "mlkem", "alloc"]
 # DTLS (RFC 6347 + RFC 9147). Builds on the `tls` stack — the record / replay /
 # reassembly / cookie chassis lives in `src/dtls/`, with version-specific

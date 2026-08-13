@@ -497,6 +497,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     fn der_signature_roundtrip() {
         let sig = priv_key().sign::<Sha256>(b"sample").unwrap();
         let der = sig.to_der();

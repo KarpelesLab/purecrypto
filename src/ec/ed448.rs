@@ -28,7 +28,7 @@ use crate::rng::{CryptoRng, RngCore};
 
 /// The `id-Ed448` OID (1.3.101.113), used for both the key and the signature
 /// algorithm (RFC 8410).
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 pub(crate) const ED448_OID: &[u64] = &[1, 3, 101, 113];
 
 /// SHAKE256 output length for every Ed448 hash (RFC 8032 §5.2): 114 bytes.
@@ -172,7 +172,7 @@ fn fe_to_scalar_bytes(x: &Fe) -> [u8; 57] {
 }
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization.
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 impl Ed448PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
@@ -217,7 +217,7 @@ impl Ed448PrivateKey {
     /// Encrypts the PKCS#8 encoding under PBES2 (RFC 5958 §3 + RFC 8018 §6.2)
     /// with caller-supplied parameters, returning the DER-encoded
     /// `EncryptedPrivateKeyInfo`.
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn to_pkcs8_der_encrypted(
         &self,
         password: &[u8],
@@ -229,7 +229,7 @@ impl Ed448PrivateKey {
 
     /// PEM-wrapped variant of [`Self::to_pkcs8_der_encrypted`]
     /// (`-----BEGIN ENCRYPTED PRIVATE KEY-----`, RFC 7468 §11).
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn to_pkcs8_pem_encrypted(
         &self,
         password: &[u8],
@@ -241,7 +241,7 @@ impl Ed448PrivateKey {
 
     /// Parses an `EncryptedPrivateKeyInfo` DER and decrypts it back to a PKCS#8
     /// Ed448 private key.
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_der_encrypted(
         der: &[u8],
         password: &[u8],
@@ -252,7 +252,7 @@ impl Ed448PrivateKey {
     }
 
     /// PEM-wrapped variant of [`Self::from_pkcs8_der_encrypted`].
-    #[cfg(all(feature = "kdf", feature = "der"))]
+    #[cfg(all(feature = "kdf", feature = "der", feature = "alloc"))]
     pub fn from_pkcs8_pem_encrypted(pem: &str, password: &[u8]) -> Result<Self, crate::der::Error> {
         let inner = crate::kdf::pbes2::decrypt_pem(pem, password)
             .map_err(|_| crate::der::Error::Malformed)?;
@@ -380,52 +380,52 @@ mod tests {
         seed: [u8; 57],
         public: [u8; 57],
         context: &'static [u8],
-        message: alloc::vec::Vec<u8>,
+        message: &'static [u8],
         signature: [u8; 114],
     }
 
-    fn vectors() -> alloc::vec::Vec<Vector> {
-        alloc::vec![
+    fn vectors() -> [Vector; 3] {
+        [
             // "Blank" — empty message, empty context.
             Vector {
                 seed: from_hex::<57>(
-                    "6c82a562cb808d10d632be89c8513ebf6c929f34ddfa8c9f63c9960ef6e348a3528c8a3fcc2f044e39a3fc5b94492f8f032e7549a20098f95b"
+                    "6c82a562cb808d10d632be89c8513ebf6c929f34ddfa8c9f63c9960ef6e348a3528c8a3fcc2f044e39a3fc5b94492f8f032e7549a20098f95b",
                 ),
                 public: from_hex::<57>(
-                    "5fd7449b59b461fd2ce787ec616ad46a1da1342485a70e1f8a0ea75d80e96778edf124769b46c7061bd6783df1e50f6cd1fa1abeafe8256180"
+                    "5fd7449b59b461fd2ce787ec616ad46a1da1342485a70e1f8a0ea75d80e96778edf124769b46c7061bd6783df1e50f6cd1fa1abeafe8256180",
                 ),
                 context: &[],
-                message: alloc::vec![],
+                message: &[],
                 signature: from_hex::<114>(
-                    "533a37f6bbe457251f023c0d88f976ae2dfb504a843e34d2074fd823d41a591f2b233f034f628281f2fd7a22ddd47d7828c59bd0a21bfd3980ff0d2028d4b18a9df63e006c5d1c2d345b925d8dc00b4104852db99ac5c7cdda8530a113a0f4dbb61149f05a7363268c71d95808ff2e652600"
+                    "533a37f6bbe457251f023c0d88f976ae2dfb504a843e34d2074fd823d41a591f2b233f034f628281f2fd7a22ddd47d7828c59bd0a21bfd3980ff0d2028d4b18a9df63e006c5d1c2d345b925d8dc00b4104852db99ac5c7cdda8530a113a0f4dbb61149f05a7363268c71d95808ff2e652600",
                 ),
             },
             // "1 octet" — message 0x03, empty context.
             Vector {
                 seed: from_hex::<57>(
-                    "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e"
+                    "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e",
                 ),
                 public: from_hex::<57>(
-                    "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480"
+                    "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480",
                 ),
                 context: &[],
-                message: alloc::vec![0x03],
+                message: &[0x03],
                 signature: from_hex::<114>(
-                    "26b8f91727bd62897af15e41eb43c377efb9c610d48f2335cb0bd0087810f4352541b143c4b981b7e18f62de8ccdf633fc1bf037ab7cd779805e0dbcc0aae1cbcee1afb2e027df36bc04dcecbf154336c19f0af7e0a6472905e799f1953d2a0ff3348ab21aa4adafd1d234441cf807c03a00"
+                    "26b8f91727bd62897af15e41eb43c377efb9c610d48f2335cb0bd0087810f4352541b143c4b981b7e18f62de8ccdf633fc1bf037ab7cd779805e0dbcc0aae1cbcee1afb2e027df36bc04dcecbf154336c19f0af7e0a6472905e799f1953d2a0ff3348ab21aa4adafd1d234441cf807c03a00",
                 ),
             },
             // "1 octet (with context)" — message 0x03, context "foo".
             Vector {
                 seed: from_hex::<57>(
-                    "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e"
+                    "c4eab05d357007c632f3dbb48489924d552b08fe0c353a0d4a1f00acda2c463afbea67c5e8d2877c5e3bc397a659949ef8021e954e0a12274e",
                 ),
                 public: from_hex::<57>(
-                    "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480"
+                    "43ba28f430cdff456ae531545f7ecd0ac834a55d9358c0372bfa0c6c6798c0866aea01eb00742802b8438ea4cb82169c235160627b4c3a9480",
                 ),
                 context: b"foo",
-                message: alloc::vec![0x03],
+                message: &[0x03],
                 signature: from_hex::<114>(
-                    "d4f8f6131770dd46f40867d6fd5d5055de43541f8c5e35abbcd001b32a89f7d2151f7647f11d8ca2ae279fb842d607217fce6e042f6815ea000c85741de5c8da1144a6a1aba7f96de42505d7a7298524fda538fccbbb754f578c1cad10d54d0d5428407e85dcbc98a49155c13764e66c3c00"
+                    "d4f8f6131770dd46f40867d6fd5d5055de43541f8c5e35abbcd001b32a89f7d2151f7647f11d8ca2ae279fb842d607217fce6e042f6815ea000c85741de5c8da1144a6a1aba7f96de42505d7a7298524fda538fccbbb754f578c1cad10d54d0d5428407e85dcbc98a49155c13764e66c3c00",
                 ),
             },
         ]
@@ -461,7 +461,7 @@ mod tests {
         for v in vectors() {
             let sk = Ed448PrivateKey::from_bytes(v.seed);
             assert_eq!(
-                sk.sign_ctx(&v.message, v.context).to_bytes(),
+                sk.sign_ctx(v.message, v.context).to_bytes(),
                 v.signature,
                 "signature mismatch"
             );
@@ -473,18 +473,20 @@ mod tests {
         for v in vectors() {
             let pk = Ed448PublicKey::from_bytes(v.public);
             let sig = Ed448Signature::from_bytes(v.signature);
-            pk.verify_ctx(&v.message, &sig, v.context).unwrap();
+            pk.verify_ctx(v.message, &sig, v.context).unwrap();
 
             // A flipped message byte must not verify.
-            let mut bad = v.message.clone();
-            bad.push(0x01);
-            assert!(pk.verify_ctx(&bad, &sig, v.context).is_err());
+            let n = v.message.len();
+            let mut bad = [0u8; 8];
+            bad[..n].copy_from_slice(v.message);
+            bad[n] = 0x01;
+            assert!(pk.verify_ctx(&bad[..n + 1], &sig, v.context).is_err());
 
             // A tampered signature must not verify.
             let mut bad_sig = v.signature;
             bad_sig[0] ^= 0x01;
             assert!(
-                pk.verify_ctx(&v.message, &Ed448Signature::from_bytes(bad_sig), v.context)
+                pk.verify_ctx(v.message, &Ed448Signature::from_bytes(bad_sig), v.context)
                     .is_err()
             );
         }
@@ -530,7 +532,7 @@ mod tests {
         assert_eq!(rebuilt.to_bytes(), sig.to_bytes());
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_der_pem_roundtrip() {
         let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-pkcs8", b"n", &[]);

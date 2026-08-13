@@ -139,6 +139,11 @@ purecrypto = { version = "0.6", default-features = false }
 # no_std core + ML-KEM-768 (no alloc):
 purecrypto = { version = "0.6", default-features = false, features = ["mlkem"] }
 
+# no_std elliptic curves, no allocator: P-256 ECDSA/ECDH, X25519, X448,
+# Ed25519, Ed448 and their fixed-size encodings. Add `alloc` for the runtime
+# multi-curve (P-384/P-521/secp256k1) path, SM2, and the DER/PEM codecs.
+purecrypto = { version = "0.6", default-features = false, features = ["ec"] }
+
 # Library with PQ signing only:
 purecrypto = { version = "0.6", default-features = false, features = ["mldsa", "slhdsa"] }
 ```
@@ -151,8 +156,8 @@ Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
 the unstable `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` gates
 (no semver guarantee).
 Each pulls in only its own dependencies. `alloc` is required by anything that
-needs heap (most things except `ct`, `hash`, `cipher`, and the no-alloc
-`mlkem` core).
+needs heap (most things except `ct`, `hash`, `cipher`, the no-alloc `mlkem`
+core, and the fixed-curve half of `ec`).
 
 ## Building
 

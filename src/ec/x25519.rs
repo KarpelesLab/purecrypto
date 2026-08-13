@@ -209,12 +209,12 @@ impl X25519PublicKey {
 }
 
 /// RFC 8410 `id-X25519` algorithm OID (1.3.101.110).
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 pub(crate) const X25519_OID: &[u64] = &[1, 3, 101, 110];
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization. Structurally identical to
 /// Ed25519's, with the `id-X25519` OID and the raw 32-byte scalar.
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 impl X25519PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
@@ -308,7 +308,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_round_trip() {
         let scalar = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -320,7 +320,7 @@ mod tests {
         assert_eq!(sk2.public_key(), sk.public_key());
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_rejects_trailing_garbage() {
         let scalar = hex32("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -330,7 +330,7 @@ mod tests {
         assert!(X25519PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_v2_with_public_key_parses() {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};

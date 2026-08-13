@@ -232,12 +232,12 @@ impl X448PublicKey {
 }
 
 /// RFC 8410 `id-X448` algorithm OID (1.3.101.111).
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 pub(crate) const X448_OID: &[u64] = &[1, 3, 101, 111];
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization (`id-X448`, raw 56-byte
 /// scalar).
-#[cfg(feature = "der")]
+#[cfg(all(feature = "der", feature = "alloc"))]
 impl X448PrivateKey {
     /// Encodes the key as a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn to_pkcs8_der(&self) -> alloc::vec::Vec<u8> {
@@ -303,7 +303,7 @@ mod tests {
         from_hex::<56>(s)
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_v1_round_trip() {
         let scalar = hex56(
@@ -316,7 +316,7 @@ mod tests {
         assert_eq!(sk2.to_bytes(), scalar);
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_rejects_trailing_garbage() {
         let scalar = hex56(
@@ -329,7 +329,7 @@ mod tests {
         assert!(X448PrivateKey::from_pkcs8_der(&der).is_err());
     }
 
-    #[cfg(feature = "der")]
+    #[cfg(all(feature = "der", feature = "alloc"))]
     #[test]
     fn pkcs8_v2_with_public_key_parses() {
         use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
