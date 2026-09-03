@@ -323,8 +323,26 @@ impl Blake3 {
         // below owns the last — possibly partial, possibly root — chunk.
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         {
-            use super::blake3_simd::{DEGREE, hash_chunks8, supported};
+            use super::blake3_simd::{
+                DEGREE, DEGREE16, hash_chunks8, hash_chunks16, supported, supported16,
+            };
             const BULK: usize = DEGREE * CHUNK_LEN;
+            const BULK16: usize = DEGREE16 * CHUNK_LEN;
+            // Widest kernel first. The chunk CVs only have to arrive in order,
+            // so the batch width is free to change between passes — the 16-wide
+            // loop runs while there is enough input for it, then the 8-wide one
+            // mops up, then the scalar loop takes the final chunk.
+            if supported16() {
+                while self.chunk_state.len() == 0 && input.len() > BULK16 {
+                    let base = self.chunk_state.chunk_counter;
+                    let cvs = hash_chunks16(&input[..BULK16], &self.key, base, self.flags);
+                    for (k, cv) in cvs.iter().enumerate() {
+                        self.add_chunk_cv(*cv, base + k as u64 + 1);
+                    }
+                    self.chunk_state.chunk_counter = base + DEGREE16 as u64;
+                    input = &input[BULK16..];
+                }
+            }
             if supported() {
                 while self.chunk_state.len() == 0 && input.len() > BULK {
                     let base = self.chunk_state.chunk_counter;
@@ -629,14 +647,23 @@ mod tests {
         }
     }
 
-    /// The AVX2 8-way chunk kernel must produce, for every lane, exactly the
+    /// Each wide chunk kernel must produce, for every lane, exactly the
     /// chaining value the scalar `ChunkState` produces for that chunk — across
     /// random data, several counter bases, and every keying mode.
+    ///
+    /// Both kernels are driven directly rather than through `update`, so an
+    /// AVX-512 host still covers the 8-wide path (the dispatcher would never
+    /// reach it) and vice versa.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn simd_chunk_kernel_matches_scalar() {
-        use super::super::blake3_simd::{hash_chunks8, supported};
-        if !supported() {
+        use super::super::blake3_simd::{hash_chunks8, hash_chunks16, supported, supported16};
+        std::eprintln!(
+            "blake3: avx2={} avx512={}",
+            if supported() { "RUNNING" } else { "SKIPPED" },
+            if supported16() { "RUNNING" } else { "SKIPPED" },
+        );
+        if !supported() && !supported16() {
             return;
         }
         let mut next = xorshift(0x1234_5678_9abc_def0);
@@ -647,16 +674,35 @@ mod tests {
 
         for &(k, flags) in &[(IV, 0u32), (key, KEYED_HASH), (key, DERIVE_KEY_MATERIAL)] {
             for &base in &[0u64, 1, 7, 8, 1_000_000, (1u64 << 32) - 3] {
-                let mut buf = alloc::vec![0u8; 8 * CHUNK_LEN];
+                let mut buf = alloc::vec![0u8; 16 * CHUNK_LEN];
                 for b in buf.iter_mut() {
                     *b = next();
                 }
-                let simd = hash_chunks8(&buf, &k, base, flags);
-                for (lane, got) in simd.iter().enumerate() {
-                    let mut cs = ChunkState::new(k, base + lane as u64, flags);
-                    cs.update(&buf[lane * CHUNK_LEN..(lane + 1) * CHUNK_LEN]);
-                    let want = cs.output().chaining_value();
-                    assert_eq!(*got, want, "lane {lane}, base {base}, flags {flags}");
+                // Scalar reference chaining value for each of the 16 chunks.
+                let want: alloc::vec::Vec<[u32; 8]> = (0..16)
+                    .map(|lane| {
+                        let mut cs = ChunkState::new(k, base + lane as u64, flags);
+                        cs.update(&buf[lane * CHUNK_LEN..(lane + 1) * CHUNK_LEN]);
+                        cs.output().chaining_value()
+                    })
+                    .collect();
+                if supported() {
+                    let got = hash_chunks8(&buf[..8 * CHUNK_LEN], &k, base, flags);
+                    for (lane, g) in got.iter().enumerate() {
+                        assert_eq!(
+                            *g, want[lane],
+                            "avx2 lane {lane}, base {base}, flags {flags}"
+                        );
+                    }
+                }
+                if supported16() {
+                    let got = hash_chunks16(&buf, &k, base, flags);
+                    for (lane, g) in got.iter().enumerate() {
+                        assert_eq!(
+                            *g, want[lane],
+                            "avx512 lane {lane}, base {base}, flags {flags}"
+                        );
+                    }
                 }
             }
         }
@@ -676,7 +722,15 @@ mod tests {
         }
         // Sizes around chunk-batch boundaries plus a large value, including a
         // partial trailing chunk.
-        for &n in &[8 * CHUNK_LEN + 1, 24 * CHUNK_LEN + 5, 97 * CHUNK_LEN + 672] {
+        for &n in &[
+            8 * CHUNK_LEN + 1,
+            16 * CHUNK_LEN + 1,
+            24 * CHUNK_LEN + 5,
+            // 25 chunks: one 16-wide pass, one 8-wide pass, then the scalar
+            // tail — pins the handoff between all three widths.
+            25 * CHUNK_LEN + 3,
+            97 * CHUNK_LEN + 672,
+        ] {
             let mut buf = alloc::vec![0u8; n];
             fill_input(&mut buf);
 

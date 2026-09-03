@@ -1,4 +1,5 @@
-//! AVX2 SIMD backend for BLAKE3 — 8-way parallel chunk compression.
+//! SIMD backends for BLAKE3 — 8-way (AVX2) and 16-way (AVX-512) parallel chunk
+//! compression.
 //!
 //! BLAKE3 hashes its input as independent 1024-byte chunks whose chaining
 //! values form a binary tree. Those chunks are mutually independent, so the
@@ -21,6 +22,30 @@ use super::blake3::{CHUNK_END, CHUNK_LEN, CHUNK_START, IV, MSG_PERMUTATION};
 /// Number of chunks processed per call (AVX2 lane count).
 pub(super) const DEGREE: usize = 8;
 
+/// Number of chunks processed per call by the AVX-512 kernel.
+pub(super) const DEGREE16: usize = 16;
+
+/// Whether the AVX-512 BLAKE3 backend is available on this CPU.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn supported16() -> bool {
+    std::is_x86_feature_detected!("avx512f")
+}
+
+/// Compresses `DEGREE16` consecutive full 1024-byte chunks in parallel.
+///
+/// Same contract as [`hash_chunks8`], sixteen lanes wide.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn hash_chunks16(
+    input: &[u8],
+    key: &[u32; 8],
+    counter_base: u64,
+    flags: u32,
+) -> [[u32; 8]; 16] {
+    debug_assert_eq!(input.len(), DEGREE16 * CHUNK_LEN);
+    // SAFETY: `supported16()` (checked by the caller) confirmed AVX-512F.
+    unsafe { avx512::hash_chunks16(input, key, counter_base, flags) }
+}
+
 /// Whether the AVX2 BLAKE3 backend is available on this CPU.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn supported() -> bool {
@@ -42,6 +67,188 @@ pub(super) fn hash_chunks8(
     debug_assert_eq!(input.len(), DEGREE * CHUNK_LEN);
     // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
     unsafe { avx2::hash_chunks8(input, key, counter_base, flags) }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod avx512 {
+    use super::*;
+    use core::arch::x86_64::*;
+
+    const BLOCK_LEN: u32 = 64;
+
+    // AVX-512 rotates a lane in one instruction (`vprord`), where the AVX2
+    // kernel below needs a shift/shift/or trio per rotation. BLAKE3's `g` is
+    // four rotations and four adds, so this lands on the critical path.
+    #[inline(always)]
+    unsafe fn rotr<const N: i32>(x: __m512i) -> __m512i {
+        unsafe { _mm512_ror_epi32::<N>(x) }
+    }
+    #[inline(always)]
+    unsafe fn add(a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_add_epi32(a, b) }
+    }
+    #[inline(always)]
+    unsafe fn xor(a: __m512i, b: __m512i) -> __m512i {
+        unsafe { _mm512_xor_si512(a, b) }
+    }
+
+    /// The 16-wide BLAKE3 `g` mixing function (lanes are independent chunks).
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn g(
+        v: &mut [__m512i; 16],
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+        mx: __m512i,
+        my: __m512i,
+    ) {
+        unsafe {
+            v[a] = add(add(v[a], v[b]), mx);
+            v[d] = rotr::<16>(xor(v[d], v[a]));
+            v[c] = add(v[c], v[d]);
+            v[b] = rotr::<12>(xor(v[b], v[c]));
+            v[a] = add(add(v[a], v[b]), my);
+            v[d] = rotr::<8>(xor(v[d], v[a]));
+            v[c] = add(v[c], v[d]);
+            v[b] = rotr::<7>(xor(v[b], v[c]));
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn round(v: &mut [__m512i; 16], m: &[__m512i; 16]) {
+        unsafe {
+            g(v, 0, 4, 8, 12, m[0], m[1]);
+            g(v, 1, 5, 9, 13, m[2], m[3]);
+            g(v, 2, 6, 10, 14, m[4], m[5]);
+            g(v, 3, 7, 11, 15, m[6], m[7]);
+            g(v, 0, 5, 10, 15, m[8], m[9]);
+            g(v, 1, 6, 11, 12, m[10], m[11]);
+            g(v, 2, 7, 8, 13, m[12], m[13]);
+            g(v, 3, 4, 9, 14, m[14], m[15]);
+        }
+    }
+
+    use crate::hash::simd_x86::transpose16_epi32 as transpose16;
+
+    /// Loads block `b` of all 16 chunks and transposes into 16 message vectors,
+    /// where `m[j]` holds word `j` of that block across the 16 lanes.
+    ///
+    /// A 64-byte BLAKE3 block is exactly one `__m512i`, so unlike the AVX2 path
+    /// this is one load per lane and a single transpose rather than two halves.
+    #[inline(always)]
+    unsafe fn load_msg(input: &[u8], b: usize) -> [__m512i; 16] {
+        unsafe {
+            let mut m = [_mm512_setzero_si512(); 16];
+            for (lane, mi) in m.iter_mut().enumerate() {
+                let p = input.as_ptr().add(lane * CHUNK_LEN + b * 64);
+                // BLAKE3 words are little-endian, so the raw bytes are the words.
+                *mi = _mm512_loadu_si512(p as *const _);
+            }
+            transpose16(&mut m);
+            m
+        }
+    }
+
+    /// Reorders the 16 message vectors per `MSG_PERMUTATION` between rounds.
+    #[inline(always)]
+    unsafe fn permute(m: &[__m512i; 16]) -> [__m512i; 16] {
+        let mut out = [unsafe { _mm512_setzero_si512() }; 16];
+        for (i, &p) in MSG_PERMUTATION.iter().enumerate() {
+            out[i] = m[p];
+        }
+        out
+    }
+
+    #[target_feature(enable = "avx512f")]
+    pub(super) unsafe fn hash_chunks16(
+        input: &[u8],
+        key: &[u32; 8],
+        counter_base: u64,
+        flags: u32,
+    ) -> [[u32; 8]; 16] {
+        unsafe {
+            // Per-lane counters: chunk k uses counter_base + k.
+            let mut clo = [0u32; 16];
+            let mut chi = [0u32; 16];
+            for (k, (lo, hi)) in clo.iter_mut().zip(chi.iter_mut()).enumerate() {
+                let c = counter_base.wrapping_add(k as u64);
+                *lo = c as u32;
+                *hi = (c >> 32) as u32;
+            }
+            let counter_lo = _mm512_loadu_si512(clo.as_ptr() as *const _);
+            let counter_hi = _mm512_loadu_si512(chi.as_ptr() as *const _);
+            let block_len = _mm512_set1_epi32(BLOCK_LEN as i32);
+
+            // Chaining values, one broadcast key word per state lane.
+            let mut h = [_mm512_setzero_si512(); 8];
+            for (hi, &kw) in h.iter_mut().zip(key.iter()) {
+                *hi = _mm512_set1_epi32(kw as i32);
+            }
+
+            for b in 0..16usize {
+                let block_flags = {
+                    let mut f = flags;
+                    if b == 0 {
+                        f |= CHUNK_START;
+                    }
+                    if b == 15 {
+                        f |= CHUNK_END;
+                    }
+                    _mm512_set1_epi32(f as i32)
+                };
+
+                let msg = load_msg(input, b);
+
+                let mut v = [
+                    h[0],
+                    h[1],
+                    h[2],
+                    h[3],
+                    h[4],
+                    h[5],
+                    h[6],
+                    h[7],
+                    _mm512_set1_epi32(IV[0] as i32),
+                    _mm512_set1_epi32(IV[1] as i32),
+                    _mm512_set1_epi32(IV[2] as i32),
+                    _mm512_set1_epi32(IV[3] as i32),
+                    counter_lo,
+                    counter_hi,
+                    block_len,
+                    block_flags,
+                ];
+
+                let mut m = msg;
+                for r in 0..7 {
+                    round(&mut v, &m);
+                    if r < 6 {
+                        m = permute(&m);
+                    }
+                }
+
+                // Chunk chaining value = first 8 words: state[i] ^ state[i + 8].
+                for i in 0..8 {
+                    h[i] = xor(v[i], v[i + 8]);
+                }
+            }
+
+            // Transpose the 8 CV word-vectors back to per-lane CVs. The
+            // transpose is square, so rows 8..16 are padded with zeros and the
+            // CV is the first 8 words of each output row.
+            let mut rows = [_mm512_setzero_si512(); 16];
+            rows[..8].copy_from_slice(&h);
+            transpose16(&mut rows);
+            let mut out = [[0u32; 8]; 16];
+            for (lane, o) in out.iter_mut().enumerate() {
+                let mut full = [0u32; 16];
+                _mm512_storeu_si512(full.as_mut_ptr() as *mut _, rows[lane]);
+                o.copy_from_slice(&full[..8]);
+            }
+            out
+        }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
