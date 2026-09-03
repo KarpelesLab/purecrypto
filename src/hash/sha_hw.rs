@@ -1,9 +1,17 @@
 //! Hardware SHA — SHA-1 and SHA-256 via the x86_64 SHA-NI extension or the
 //! aarch64 `sha2` extension (which covers FEAT_SHA1 as well as FEAT_SHA256), and
 //! SHA-512 via the x86_64 SHA512 extension (Intel Arrow Lake / Lunar Lake and
-//! newer, AMD Zen 5 and newer) or the aarch64 `sha512` extension. Every backend
-//! is runtime-detected, with the software path as the fallback on CPUs that lack
-//! the instructions.
+//! newer) or the aarch64 `sha512` extension. Every backend is runtime-detected,
+//! with the software path as the fallback on CPUs that lack the instructions.
+//!
+//! Note on x86 availability: the SHA512 extension is an *Intel* addition and is
+//! **not** present on AMD Zen 5 — measured directly on a Ryzen Threadripper
+//! 9970X (family 0x1A), where CPUID leaf 7 sub-leaf 1 EAX bit 0 reads 0 despite
+//! the part carrying SHA-NI, the full AVX-512 set, VAES, VPCLMULQDQ and GFNI.
+//! An earlier revision of this comment claimed Zen 5 support; it was wrong.
+//! That run did confirm the detection predicate does not false-positive on a
+//! feature-rich non-Intel CPU — it reported SKIPPED rather than executing
+//! `vsha512*` into a SIGILL.
 //!
 //! Each path produces identical state to the `*_soft` software compression, so
 //! it drops into the dispatch unchanged; pinned by differential tests. The SHA
