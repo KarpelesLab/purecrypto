@@ -129,9 +129,15 @@ impl ChaCha20 {
             counter_end <= u64::from(u32::MAX) + 1,
             "ChaCha20 counter would overflow 2^32 (buf too large for a single invocation)"
         );
-        // On x86_64 with AVX2, generate the keystream eight blocks at a time
-        // (ChaCha20 blocks are independent, so the 8-wide layout needs no
-        // diagonal shuffles). Byte-identical to the scalar path.
+        // On x86_64, generate the keystream many blocks at a time — ChaCha20
+        // blocks are independent, so the wide layout needs no diagonal
+        // shuffles. AVX-512 does sixteen blocks per pass, AVX2 eight; both are
+        // byte-identical to the scalar path.
+        #[cfg(all(feature = "std", target_arch = "x86_64"))]
+        if simd512::supported() {
+            simd512::apply_keystream(&self.key, nonce, counter, buf);
+            return;
+        }
         #[cfg(all(feature = "std", target_arch = "x86_64"))]
         if simd::supported() {
             simd::apply_keystream(&self.key, nonce, counter, buf);
@@ -144,6 +150,121 @@ impl ChaCha20 {
                 *b ^= *k;
             }
             block_counter = block_counter.wrapping_add(1);
+        }
+    }
+}
+
+/// AVX-512 16-way ChaCha20 keystream (x86_64). Same shape as the AVX2 kernel
+/// below, with each of the 16 state words held in a `__m512i` lane-per-block
+/// across sixteen consecutive counters, so one pass emits 1 KiB of keystream.
+///
+/// Two AVX-512 instructions do real work here beyond the doubled width:
+/// `vprold` rotates in one instruction where AVX2 needs a shift/shift/or trio,
+/// which matters because ChaCha20 is four rotates per quarter-round and nothing
+/// else. Pinned byte-for-byte against the scalar path by a differential test.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+mod simd512 {
+    use super::CONSTANTS;
+    use core::arch::x86_64::*;
+
+    pub(super) fn supported() -> bool {
+        std::is_x86_feature_detected!("avx512f")
+    }
+
+    /// Rotate-left each 32-bit lane by `N` — a single `vprold`.
+    #[inline(always)]
+    unsafe fn rol<const N: i32>(x: __m512i) -> __m512i {
+        unsafe { _mm512_rol_epi32::<N>(x) }
+    }
+
+    #[inline(always)]
+    unsafe fn qr(v: &mut [__m512i; 16], a: usize, b: usize, c: usize, d: usize) {
+        unsafe {
+            v[a] = _mm512_add_epi32(v[a], v[b]);
+            v[d] = rol::<16>(_mm512_xor_si512(v[d], v[a]));
+            v[c] = _mm512_add_epi32(v[c], v[d]);
+            v[b] = rol::<12>(_mm512_xor_si512(v[b], v[c]));
+            v[a] = _mm512_add_epi32(v[a], v[b]);
+            v[d] = rol::<8>(_mm512_xor_si512(v[d], v[a]));
+            v[c] = _mm512_add_epi32(v[c], v[d]);
+            v[b] = rol::<7>(_mm512_xor_si512(v[b], v[c]));
+        }
+    }
+
+    pub(super) fn apply_keystream(key: &[u32; 8], nonce: &[u8; 12], counter: u32, buf: &mut [u8]) {
+        // SAFETY: `supported()` (checked by the caller) confirmed AVX-512F.
+        unsafe { apply_keystream_avx512(key, nonce, counter, buf) }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    unsafe fn apply_keystream_avx512(
+        key: &[u32; 8],
+        nonce: &[u8; 12],
+        counter: u32,
+        buf: &mut [u8],
+    ) {
+        unsafe {
+            let n =
+                |o: usize| u32::from_le_bytes([nonce[o], nonce[o + 1], nonce[o + 2], nonce[o + 3]]);
+            let (n0, n1, n2) = (n(0), n(4), n(8));
+            #[rustfmt::skip]
+            let lanes = _mm512_setr_epi32(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            );
+
+            let mut ctr = counter;
+            let mut off = 0usize;
+            while off < buf.len() {
+                let mut v = [
+                    _mm512_set1_epi32(CONSTANTS[0] as i32),
+                    _mm512_set1_epi32(CONSTANTS[1] as i32),
+                    _mm512_set1_epi32(CONSTANTS[2] as i32),
+                    _mm512_set1_epi32(CONSTANTS[3] as i32),
+                    _mm512_set1_epi32(key[0] as i32),
+                    _mm512_set1_epi32(key[1] as i32),
+                    _mm512_set1_epi32(key[2] as i32),
+                    _mm512_set1_epi32(key[3] as i32),
+                    _mm512_set1_epi32(key[4] as i32),
+                    _mm512_set1_epi32(key[5] as i32),
+                    _mm512_set1_epi32(key[6] as i32),
+                    _mm512_set1_epi32(key[7] as i32),
+                    _mm512_add_epi32(_mm512_set1_epi32(ctr as i32), lanes),
+                    _mm512_set1_epi32(n0 as i32),
+                    _mm512_set1_epi32(n1 as i32),
+                    _mm512_set1_epi32(n2 as i32),
+                ];
+                let init = v;
+                for _ in 0..10 {
+                    qr(&mut v, 0, 4, 8, 12);
+                    qr(&mut v, 1, 5, 9, 13);
+                    qr(&mut v, 2, 6, 10, 14);
+                    qr(&mut v, 3, 7, 11, 15);
+                    qr(&mut v, 0, 5, 10, 15);
+                    qr(&mut v, 1, 6, 11, 12);
+                    qr(&mut v, 2, 7, 8, 13);
+                    qr(&mut v, 3, 4, 9, 14);
+                }
+                let mut words = [[0u32; 16]; 16];
+                for i in 0..16 {
+                    let added = _mm512_add_epi32(v[i], init[i]);
+                    _mm512_storeu_si512(words[i].as_mut_ptr() as *mut _, added);
+                }
+                // Emit up to sixteen 64-byte keystream blocks (lane = block) and
+                // XOR the bytes still needed into `buf`.
+                let avail = (buf.len() - off).min(1024);
+                let mut ks = [0u8; 1024];
+                for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
+                    for (i, word) in blk.chunks_exact_mut(4).enumerate() {
+                        word.copy_from_slice(&words[i][b].to_le_bytes());
+                    }
+                }
+                for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
+                    *dst ^= *k;
+                }
+                off += 1024;
+                ctr = ctr.wrapping_add(16);
+            }
         }
     }
 }
@@ -317,7 +438,24 @@ only one tip for the future, sunscreen would be it.";
     #[test]
     fn simd_matches_scalar() {
         use alloc::vec::Vec;
-        if !super::simd::supported() {
+        // Exercise *each* wide kernel against the scalar path, rather than
+        // whichever one `apply_keystream` happens to select: on an AVX-512 host
+        // the dispatcher never reaches the AVX2 kernel, so going through it
+        // would leave the 8-wide path untested there (and vice versa).
+        let mut ran_any = false;
+        if super::simd::supported() {
+            std::eprintln!("chacha20: RUNNING avx2 8-wide kernel vs scalar");
+            ran_any = true;
+        } else {
+            std::eprintln!("chacha20: SKIPPED avx2 (no AVX2 on this CPU)");
+        }
+        if super::simd512::supported() {
+            std::eprintln!("chacha20: RUNNING avx512 16-wide kernel vs scalar");
+            ran_any = true;
+        } else {
+            std::eprintln!("chacha20: SKIPPED avx512 (no AVX-512F on this CPU)");
+        }
+        if !ran_any {
             return;
         }
         let key: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
@@ -343,9 +481,6 @@ only one tip for the future, sunscreen would be it.";
                     continue;
                 }
                 let base: Vec<u8> = (0..len).map(|i| (i * 31 + 9) as u8).collect();
-                // SIMD path (the real apply_keystream).
-                let mut simd = base.clone();
-                c.apply_keystream(&nonce, ctr, &mut simd);
                 // Scalar reference, block by block.
                 let mut scalar = base.clone();
                 let mut bc = ctr;
@@ -356,7 +491,21 @@ only one tip for the future, sunscreen would be it.";
                     }
                     bc = bc.wrapping_add(1);
                 }
-                assert_eq!(simd, scalar, "len={len} ctr={ctr}");
+                // Each wide kernel, called directly.
+                if super::simd::supported() {
+                    let mut w = base.clone();
+                    super::simd::apply_keystream(&c.key, &nonce, ctr, &mut w);
+                    assert_eq!(w, scalar, "avx2 len={len} ctr={ctr}");
+                }
+                if super::simd512::supported() {
+                    let mut w = base.clone();
+                    super::simd512::apply_keystream(&c.key, &nonce, ctr, &mut w);
+                    assert_eq!(w, scalar, "avx512 len={len} ctr={ctr}");
+                }
+                // ...and the dispatcher, which must agree with both.
+                let mut simd = base.clone();
+                c.apply_keystream(&nonce, ctr, &mut simd);
+                assert_eq!(simd, scalar, "dispatch len={len} ctr={ctr}");
             }
         }
     }
