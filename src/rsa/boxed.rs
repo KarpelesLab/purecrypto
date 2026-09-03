@@ -137,6 +137,13 @@ pub(crate) struct BoxedRsaCrt {
     qinv: BoxedUint,
     pm2: BoxedUint,
     qm2: BoxedUint,
+    /// Montgomery contexts for the two primes. They depend only on `p`/`q`, so
+    /// they are built once with the rest of the CRT parameters rather than on
+    /// every private-key operation — constructing one costs about 100 us at
+    /// 1024 bits (it reduces R² into the field), and the signing path needs
+    /// two, which was ~9% of an RSA-2048 signature.
+    mont_p: BoxedMontModulus,
+    mont_q: BoxedMontModulus,
 }
 
 impl Drop for BoxedRsaCrt {
@@ -179,6 +186,7 @@ fn derive_crt_boxed(
     let dp = d.reduce(&p.sub(&one));
     let dq = d.reduce(&q.sub(&one));
     let mont_p = BoxedMontModulus::new(p);
+    let mont_q = BoxedMontModulus::new(q);
     let qinv = mont_p.pow(&q.reduce(p), &pm2);
     Some(alloc::boxed::Box::new(BoxedRsaCrt {
         dp,
@@ -186,6 +194,8 @@ fn derive_crt_boxed(
         qinv,
         pm2,
         qm2,
+        mont_p,
+        mont_q,
     }))
 }
 
@@ -246,8 +256,8 @@ fn raw_private_crt_blinded(
     let mut r_e = mont.pow_public(&r, &key.e);
     let mut c_blind = mont.mul_mod(c, &r_e);
 
-    let mont_p = BoxedMontModulus::new(&key.p);
-    let mont_q = BoxedMontModulus::new(&key.q);
+    let mont_p = &crt.mont_p;
+    let mont_q = &crt.mont_q;
 
     let half = |mp: &BoxedMontModulus, dx: &BoxedUint, xm2: &BoxedUint| {
         let mut cx = c_blind.reduce(&mp.modulus());
@@ -261,8 +271,8 @@ fn raw_private_crt_blinded(
         rx_inv.zeroize();
         mx
     };
-    let mut m_p = half(&mont_p, &crt.dp, &crt.pm2);
-    let mut m_q = half(&mont_q, &crt.dq, &crt.qm2);
+    let mut m_p = half(mont_p, &crt.dp, &crt.pm2);
+    let mut m_q = half(mont_q, &crt.dq, &crt.qm2);
 
     // Garner recombination: m = m_q + q·(qInv·(m_p − m_q) mod p).
     let mut m_q_mod_p = m_q.reduce(&key.p);

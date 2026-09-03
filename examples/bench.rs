@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use purecrypto::bignum::BoxedUint;
 use purecrypto::cipher::{
-    Aes128, Aes256, Aez, BlockCipher, ChaCha20, ChaCha20Poly1305, Gcm, Poly1305,
+    Aes128, Aes256, AesGmac128, Aez, BlockCipher, ChaCha20, ChaCha20Poly1305, Ctr, Gcm, Poly1305,
 };
 use purecrypto::ec::ecdsa::EcdsaPrivateKey;
 use purecrypto::ec::ed25519::Ed25519PrivateKey;
@@ -87,6 +87,24 @@ fn main() {
             let _ = black_box(cc.encrypt(&nonce12, b"", black_box(&mut buf[..N])));
         });
 
+        // AES-GCM's two halves, measured to see which one a wider AES (VAES) or
+        // a wider GHASH (VPCLMULQDQ on zmm) would actually move. Note these do
+        // NOT compose as `1/GCM = 1/CTR + 1/GHASH`: GCM interleaves AES and
+        // GHASH in one stitched loop, and standalone `Ctr` is a different (and
+        // measurably slower) code path than the AES inside it. GMAC is the
+        // useful half — it isolates GHASH, which dominates GCM.
+        let aes128 = Aes128::new(&[0u8; 16]);
+        bench_throughput("AES-128-CTR (AES only)", N, t, || {
+            let mut c = Ctr::new(Aes128::new(&[0u8; 16]), &[0u8; 16]);
+            c.apply_keystream(black_box(&mut buf[..N]));
+        });
+        let _ = &aes128;
+        bench_throughput("AES-128 GMAC (GHASH only)", N, t, || {
+            let mut m = AesGmac128::new(Aes128::new(&[0u8; 16]), &nonce12);
+            m.update(black_box(&buf[..N]));
+            black_box(m.finalize());
+        });
+
         // Raw ChaCha20 keystream, so the block kernel is measured on its own
         // rather than in series with Poly1305 (which dominates the AEAD number).
         let cha = ChaCha20::new(&[0u8; 32]);
@@ -149,6 +167,36 @@ fn main() {
         let rsa = BoxedRsaPrivateKey::generate(2048, e, &mut rng, 5);
         let rsa_pub = rsa.public_key();
         let rsa_sig = rsa.sign_pkcs1v15::<Sha256>(msg).unwrap();
+        // A bare 1024-bit modexp — the unit RSA-2048 CRT signing is built from.
+        // Each CRT half runs two of these: the real `c^dp mod p`, plus a Fermat
+        // inverse `r^(p-2) mod p` to undo the base blinding.
+        {
+            use purecrypto::bignum::{BoxedMontModulus, BoxedUint};
+            // Deterministic pseudo-random operands; only their size matters.
+            let mut pbytes = [0u8; 128];
+            for (i, b) in pbytes.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(37).wrapping_add(11);
+            }
+            pbytes[0] |= 0x80;
+            pbytes[127] |= 1; // odd modulus
+            let pm = BoxedUint::from_be_bytes(&pbytes);
+            let mont1024 = BoxedMontModulus::new(&pm);
+            let mut bb = [0u8; 128];
+            for (i, b) in bb.iter_mut().enumerate() {
+                *b = (i as u8).wrapping_mul(53).wrapping_add(7);
+            }
+            bb[0] &= 0x7f;
+            let base1024 = BoxedUint::from_be_bytes(&bb);
+            let exp1024 = BoxedUint::from_be_bytes(&bb);
+            bench_latency("modexp 1024-bit (secret exp)", t, || {
+                black_box(mont1024.pow(black_box(&base1024), &exp1024));
+            });
+            // The CRT path builds a Montgomery context per half, per signature.
+            bench_latency("BoxedMontModulus::new 1024-bit", t, || {
+                black_box(BoxedMontModulus::new(black_box(&pm)));
+            });
+        }
+
         bench_latency("RSA-2048 sign (pkcs1)", t, || {
             black_box(rsa.sign_pkcs1v15::<Sha256>(black_box(msg)).unwrap());
         });
