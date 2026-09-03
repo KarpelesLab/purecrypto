@@ -41,52 +41,77 @@ fn gen_matrix_entry(seed: &[u8; 32], x: u8, y: u8, out: &mut Poly) {
     }
 }
 
+/// Fills `L` matrix entries at a time from the `L`-way Keccak kernel, starting
+/// at `done`, and returns the new `done`. Generic over the lane count so one
+/// body serves both the AVX2 (4) and AVX-512 (8) kernels.
+///
+/// Callers must have checked `supported_lanes::<L>()`.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn gen_matrix_batched<const K: usize, const L: usize>(
+    seed: &[u8; 32],
+    transposed: bool,
+    a: &mut [[Poly; K]; K],
+    mut done: usize,
+) -> usize {
+    use crate::hash::keccak_x4::{KeccakXn, MAX_RATE};
+    while done + L <= K * K {
+        let mut msgs = [[0u8; 34]; L];
+        for (l, msg) in msgs.iter_mut().enumerate() {
+            let (i, j) = ((done + l) / K, (done + l) % K);
+            msg[..32].copy_from_slice(seed);
+            let (x, y) = if transposed {
+                (i as u8, j as u8)
+            } else {
+                (j as u8, i as u8)
+            };
+            msg[32] = x;
+            msg[33] = y;
+        }
+        let msgs_ref: [&[u8]; L] = core::array::from_fn(|l| &msgs[l][..]);
+        let mut xof = KeccakXn::<L>::new(XOF_BLOCK, msgs_ref, 0x1F);
+        let mut blocks = [[0u8; MAX_RATE]; L];
+        let mut ctrs = [0usize; L];
+        while ctrs.iter().any(|&c| c < N) {
+            xof.squeeze_blocks(&mut blocks);
+            for (l, ctr) in ctrs.iter_mut().enumerate() {
+                if *ctr < N {
+                    let (i, j) = ((done + l) / K, (done + l) % K);
+                    *ctr += poly::rej_uniform(&mut a[i][j].c[*ctr..], &blocks[l][..XOF_BLOCK]);
+                }
+            }
+        }
+        done += L;
+    }
+    done
+}
+
 /// Generates the public matrix `Â` (or its transpose) by rejection sampling a
 /// SHAKE128 stream per entry. `Â[i][j]` absorbs `ρ ‖ j ‖ i` (or `ρ ‖ i ‖ j`
 /// when transposed), matching the FIPS 203 / pq-crystals ordering.
 ///
-/// On x86_64 with AVX2 the K² independent streams are squeezed four at a
-/// time by the 4-way Keccak kernel (byte-identical output); the seed and the
+/// On x86_64 the K² independent streams are squeezed through the widest
+/// available Keccak kernel — eight at a time on AVX-512, then four on AVX2,
+/// then a scalar remainder (byte-identical output). The seed and the
 /// rejection-sampling control flow are public (`ρ` is serialized into `ek`).
 fn gen_matrix<const K: usize>(seed: &[u8; 32], transposed: bool) -> [[Poly; K]; K] {
     let mut a = [[Poly::zero(); K]; K];
     let mut done = 0;
 
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if crate::hash::keccak_x4::supported() {
-        use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
-        while done + LANES <= K * K {
-            let mut msgs = [[0u8; 34]; LANES];
-            for (l, msg) in msgs.iter_mut().enumerate() {
-                let (i, j) = ((done + l) / K, (done + l) % K);
-                msg[..32].copy_from_slice(seed);
-                let (x, y) = if transposed {
-                    (i as u8, j as u8)
-                } else {
-                    (j as u8, i as u8)
-                };
-                msg[32] = x;
-                msg[33] = y;
-            }
-            let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
-            let mut x4 = KeccakX4::new(XOF_BLOCK, msgs_ref, 0x1F);
-            let mut blocks = [[0u8; MAX_RATE]; LANES];
-            let mut ctrs = [0usize; LANES];
-            while ctrs.iter().any(|&c| c < N) {
-                x4.squeeze_blocks(&mut blocks);
-                for (l, ctr) in ctrs.iter_mut().enumerate() {
-                    if *ctr < N {
-                        let (i, j) = ((done + l) / K, (done + l) % K);
-                        *ctr += poly::rej_uniform(&mut a[i][j].c[*ctr..], &blocks[l][..XOF_BLOCK]);
-                    }
-                }
-            }
-            done += LANES;
+    {
+        use crate::hash::keccak_x4::{LANES, LANES8, supported, supported8};
+        // Widest kernel first, then the narrower one mops up what is left; the
+        // scalar loop below takes the final `K² mod L` entries.
+        if supported8() {
+            done = gen_matrix_batched::<K, LANES8>(seed, transposed, &mut a, done);
+        }
+        if supported() {
+            done = gen_matrix_batched::<K, LANES>(seed, transposed, &mut a, done);
         }
     }
 
-    // Scalar path: all entries when the 4-way kernel is unavailable, or the
-    // `K² mod 4` remainder after the batched groups.
+    // Scalar path: all entries when no batched kernel is available, or the
+    // remainder after the batched groups.
     while done < K * K {
         let (i, j) = (done / K, done % K);
         let (x, y) = if transposed {
@@ -120,29 +145,29 @@ fn getnoise<const ETA: usize>(seed: &[u8; 32], nonce: u8) -> Poly {
     out
 }
 
-/// Four [`getnoise`] PRF streams squeezed in parallel by the 4-way AVX2
-/// Keccak kernel: `PRF_η(seed, nonces[l])` then `SamplePolyCBD_η` per lane.
+/// `L` [`getnoise`] PRF streams squeezed in parallel by the `L`-way Keccak
+/// kernel: `PRF_η(seed, nonces[l])` then `SamplePolyCBD_η` per lane.
 /// Byte-identical to four scalar calls. The kernel is branch-free in the
 /// state, so the secret seed sees the same bitwise-only pipeline as the
 /// scalar sponge; all buffers holding key-derived bytes are wiped.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-fn getnoise_x4<const ETA: usize>(seed: &[u8; 32], nonces: [u8; 4]) -> [Poly; 4] {
-    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+fn getnoise_xn<const ETA: usize, const L: usize>(seed: &[u8; 32], nonces: [u8; L]) -> [Poly; L] {
+    use crate::hash::keccak_x4::{KeccakXn, MAX_RATE};
     /// The SHAKE256 rate.
     const RATE: usize = 136;
     let need = 64 * ETA;
     debug_assert!(need <= 2 * RATE);
 
-    let mut msgs = [[0u8; 33]; LANES];
+    let mut msgs = [[0u8; 33]; L];
     for (l, msg) in msgs.iter_mut().enumerate() {
         msg[..32].copy_from_slice(seed);
         msg[32] = nonces[l];
     }
-    let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
-    let mut x4 = KeccakX4::new(RATE, msgs_ref, 0x1F);
+    let msgs_ref: [&[u8]; L] = core::array::from_fn(|l| &msgs[l][..]);
+    let mut x4 = KeccakXn::<L>::new(RATE, msgs_ref, 0x1F);
 
-    let mut bufs = [[0u8; 2 * RATE]; LANES];
-    let mut blocks = [[0u8; MAX_RATE]; LANES];
+    let mut bufs = [[0u8; 2 * RATE]; L];
+    let mut blocks = [[0u8; MAX_RATE]; L];
     let mut off = 0;
     while off < need {
         x4.squeeze_blocks(&mut blocks);
@@ -170,18 +195,30 @@ fn getnoise_x4<const ETA: usize>(seed: &[u8; 32], nonces: [u8; 4]) -> [Poly; 4] 
 }
 
 /// Fills `out[i]` with the CBD noise polynomial `PRF_η(seed, base + i)`,
-/// batching four PRF streams at a time through the 4-way Keccak kernel when
-/// available (scalar remainder). Byte-identical to per-index [`getnoise`].
+/// batching PRF streams through the widest available Keccak kernel (8 on
+/// AVX-512, then 4 on AVX2, then a scalar remainder). Byte-identical to
+/// per-index [`getnoise`].
 fn fill_noise<const ETA: usize>(seed: &[u8; 32], base: u8, out: &mut [Poly]) {
     let mut idx = 0;
 
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    if crate::hash::keccak_x4::supported() {
-        while idx + 4 <= out.len() {
-            let nonces = core::array::from_fn(|l| base + (idx + l) as u8);
-            let polys = getnoise_x4::<ETA>(seed, nonces);
-            out[idx..idx + 4].copy_from_slice(&polys);
-            idx += 4;
+    {
+        use crate::hash::keccak_x4::{LANES, LANES8, supported, supported8};
+        if supported8() {
+            while idx + LANES8 <= out.len() {
+                let nonces = core::array::from_fn(|l| base + (idx + l) as u8);
+                let polys = getnoise_xn::<ETA, LANES8>(seed, nonces);
+                out[idx..idx + LANES8].copy_from_slice(&polys);
+                idx += LANES8;
+            }
+        }
+        if supported() {
+            while idx + LANES <= out.len() {
+                let nonces = core::array::from_fn(|l| base + (idx + l) as u8);
+                let polys = getnoise_xn::<ETA, LANES>(seed, nonces);
+                out[idx..idx + LANES].copy_from_slice(&polys);
+                idx += LANES;
+            }
         }
     }
 

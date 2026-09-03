@@ -390,8 +390,9 @@ mod wots_x8 {
     }
 }
 
-/// Multi-buffer (AVX2) WOTS+ chain evaluation for SLH-DSA's SHAKE sets: four
-/// independent F-chains hashed in lockstep through the 4-way Keccak kernel.
+/// Multi-buffer WOTS+ chain evaluation for SLH-DSA's SHAKE sets: independent
+/// F-chains hashed in lockstep through the widest available Keccak kernel
+/// (8 lanes on AVX-512, else 4 on AVX2).
 /// Produces byte-identical output to the scalar [`wots_chain`] loop (pinned by
 /// a differential test). In the SHAKE instantiation `F(pk_seed, addr, m1)` is
 /// `SHAKE256(pk_seed[..n] ‖ ADRS(32) ‖ m1[..n], 8n)` (FIPS 205 §11.1) — a
@@ -402,7 +403,7 @@ mod wots_x8 {
 mod wots_shake_x4 {
     use super::adrs::Adrs;
     use super::params::{MAX_N, Params};
-    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+    use crate::hash::keccak_x4::{KeccakXn, LANES, LANES8, MAX_RATE, supported, supported8};
 
     /// SHAKE256's rate in bytes. Every tweakable-hash preimage of the
     /// standardized SHAKE sets fits one block (`F`/`PRF`: 2n + 32 ≤ 96 bytes;
@@ -412,7 +413,11 @@ mod wots_shake_x4 {
     /// The batcher handles every SHAKE (`is_shake`) set when AVX2 is present:
     /// `F` is a fixed-shape single-block SHAKE256 call for all of them.
     pub(super) fn eligible(p: &Params) -> bool {
-        p.is_shake && crate::hash::keccak_x4::supported()
+        // AVX2 is the entry condition; the batcher then uses the 8-lane
+        // AVX-512 kernel where present. Every AVX-512 part also has AVX2, so
+        // requiring it here costs nothing and keeps the 4-lane fallback inside
+        // the batcher unconditionally legal.
+        p.is_shake && supported()
     }
 
     /// Fills the single-block preimage `pk_seed[..N] ‖ ADRS(32) ‖ tail…` into
@@ -436,18 +441,18 @@ mod wots_shake_x4 {
         off
     }
 
-    /// Four one-shot SHAKE256 streams over `msgs[l][..msg_len]`, N output
-    /// bytes each — one 4-way Keccak permutation total.
-    pub(super) fn shake4<const N: usize>(
-        msgs: &[[u8; RATE]; LANES],
+    /// `L` one-shot SHAKE256 streams over `msgs[l][..msg_len]`, N output bytes
+    /// each — one `L`-way Keccak permutation total.
+    pub(super) fn shake_n<const N: usize, const L: usize>(
+        msgs: &[[u8; RATE]; L],
         msg_len: usize,
-    ) -> [[u8; N]; LANES] {
+    ) -> [[u8; N]; L] {
         const { assert!(N <= MAX_N) };
         debug_assert!(msg_len < RATE);
-        let refs: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..msg_len]);
-        let mut x4 = KeccakX4::new(RATE, refs, 0x1F);
-        let mut blocks = [[0u8; MAX_RATE]; LANES];
-        x4.squeeze_blocks(&mut blocks);
+        let refs: [&[u8]; L] = core::array::from_fn(|l| &msgs[l][..msg_len]);
+        let mut x = KeccakXn::<L>::new(RATE, refs, 0x1F);
+        let mut blocks = [[0u8; MAX_RATE]; L];
+        x.squeeze_blocks(&mut blocks);
         core::array::from_fn(|l| blocks[l][..N].try_into().unwrap())
     }
 
@@ -462,14 +467,25 @@ mod wots_shake_x4 {
         base: &Adrs,
         tmp: &mut [u8],
     ) {
-        match p.n {
-            16 => prf_fill_n::<16>(p, pk_seed, sk_seed, base, tmp),
-            24 => prf_fill_n::<24>(p, pk_seed, sk_seed, base, tmp),
-            _ => prf_fill_n::<32>(p, pk_seed, sk_seed, base, tmp),
+        // Monomorphize on n and on the lane count, so the widest available
+        // Keccak kernel drives the same loop.
+        macro_rules! go {
+            ($l:expr) => {
+                match p.n {
+                    16 => prf_fill_n::<16, $l>(p, pk_seed, sk_seed, base, tmp),
+                    24 => prf_fill_n::<24, $l>(p, pk_seed, sk_seed, base, tmp),
+                    _ => prf_fill_n::<32, $l>(p, pk_seed, sk_seed, base, tmp),
+                }
+            };
+        }
+        if supported8() {
+            go!(LANES8)
+        } else {
+            go!(LANES)
         }
     }
 
-    fn prf_fill_n<const N: usize>(
+    fn prf_fill_n<const N: usize, const L: usize>(
         p: &Params,
         pk_seed: &[u8],
         sk_seed: &[u8],
@@ -479,8 +495,8 @@ mod wots_shake_x4 {
         let len = p.len as usize;
         let mut c0 = 0usize;
         while c0 < len {
-            let lanes = (len - c0).min(LANES);
-            let mut msgs = [[0u8; RATE]; LANES];
+            let lanes = (len - c0).min(L);
+            let mut msgs = [[0u8; RATE]; L];
             let mut msg_len = 0;
             for (l, m) in msgs.iter_mut().enumerate() {
                 // Remainder lanes duplicate the first active chain.
@@ -489,7 +505,7 @@ mod wots_shake_x4 {
                 a.set_chain(chain as u32);
                 msg_len = fill_msg::<N>(m, pk_seed, a.bytes(), &[&sk_seed[..N]]);
             }
-            let outs = shake4::<N>(&msgs, msg_len);
+            let outs = shake_n::<N, L>(&msgs, msg_len);
             for (l, o) in outs.iter().enumerate().take(lanes) {
                 tmp[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(o);
             }
@@ -497,31 +513,46 @@ mod wots_shake_x4 {
         }
     }
 
-    /// Runs every WOTS+ chain over its full `0..15` range, four chains at a
+    /// Runs every WOTS+ chain over its full `0..15` range, `L` chains at a
     /// time. Same contract as [`super::wots_x8::full_chains`]: `tmp` enters
     /// holding the per-chain secret start values and leaves holding the chain
     /// ends; `base` supplies the layer/tree/key-pair fields (type WotsHash).
     pub(super) fn full_chains(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
-        // Monomorphize on n (`eligible` admits only the standardized sets).
-        match p.n {
-            16 => full_chains_n::<16>(p, pk_seed, base, tmp),
-            24 => full_chains_n::<24>(p, pk_seed, base, tmp),
-            _ => full_chains_n::<32>(p, pk_seed, base, tmp),
+        // Monomorphize on n (`eligible` admits only the standardized sets) and
+        // on the lane count.
+        macro_rules! go {
+            ($l:expr) => {
+                match p.n {
+                    16 => full_chains_n::<16, $l>(p, pk_seed, base, tmp),
+                    24 => full_chains_n::<24, $l>(p, pk_seed, base, tmp),
+                    _ => full_chains_n::<32, $l>(p, pk_seed, base, tmp),
+                }
+            };
+        }
+        if supported8() {
+            go!(LANES8)
+        } else {
+            go!(LANES)
         }
     }
 
-    fn full_chains_n<const N: usize>(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
+    fn full_chains_n<const N: usize, const L: usize>(
+        p: &Params,
+        pk_seed: &[u8],
+        base: &Adrs,
+        tmp: &mut [u8],
+    ) {
         let len = p.len as usize;
         let mut c0 = 0usize;
         while c0 < len {
-            let lanes = (len - c0).min(LANES);
-            let mut inout = [[0u8; N]; LANES];
+            let lanes = (len - c0).min(L);
+            let mut inout = [[0u8; N]; L];
             for (l, io) in inout.iter_mut().enumerate().take(lanes) {
                 io.copy_from_slice(&tmp[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
             for step in 0..15u32 {
-                let mut msgs = [[0u8; RATE]; LANES];
+                let mut msgs = [[0u8; RATE]; L];
                 let mut msg_len = 0;
                 for (l, m) in msgs.iter_mut().enumerate() {
                     // Remainder lanes duplicate the first active chain.
@@ -531,7 +562,7 @@ mod wots_shake_x4 {
                     a.set_hash(step);
                     msg_len = fill_msg::<N>(m, pk_seed, a.bytes(), &[&inout[l]]);
                 }
-                inout = shake4::<N>(&msgs, msg_len);
+                inout = shake_n::<N, L>(&msgs, msg_len);
             }
 
             for (l, io) in inout.iter().enumerate().take(lanes) {
@@ -1261,7 +1292,7 @@ mod fors_x4_tests {
 mod fors_shake_x4 {
     use super::adrs::{Adrs, AdrsType};
     use super::params::Params;
-    use super::wots_shake_x4::{RATE, fill_msg, shake4};
+    use super::wots_shake_x4::{RATE, fill_msg, shake_n};
 
     /// Same coverage as the SHAKE WOTS batcher: every SHAKE set with AVX2.
     pub(super) fn eligible(p: &Params) -> bool {
@@ -1269,7 +1300,9 @@ mod fors_shake_x4 {
     }
 
     /// Computes the eight leaves of a height-3 subtree — the PRF secret
-    /// values, then F over each — both four-wide through the Keccak kernel.
+    /// values, then F over each — through the Keccak kernel. With the 8-lane
+    /// AVX-512 kernel the whole subtree is one batch per stage; with the
+    /// 4-lane kernel it is two.
     fn leaves8<const N: usize>(
         pk_seed: &[u8],
         sk_seed: &[u8],
@@ -1280,26 +1313,46 @@ mod fors_shake_x4 {
         sk_addr.set_type_and_clear(AdrsType::ForsPrf);
         sk_addr.copy_key_pair(addr);
         let mut sk_nodes = [[0u8; N]; 8];
-        for (half, out4) in sk_nodes.chunks_exact_mut(4).enumerate() {
-            let mut msgs = [[0u8; RATE]; 4];
+        if crate::hash::keccak_x4::supported8() {
+            let mut msgs = [[0u8; RATE]; 8];
             let mut msg_len = 0;
             for (l, m) in msgs.iter_mut().enumerate() {
-                sk_addr.set_tree_index(leaf0 + (half * 4 + l) as u32);
+                sk_addr.set_tree_index(leaf0 + l as u32);
                 msg_len = fill_msg::<N>(m, pk_seed, sk_addr.bytes(), &[&sk_seed[..N]]);
             }
-            out4.copy_from_slice(&shake4::<N>(&msgs, msg_len));
+            sk_nodes = shake_n::<N, 8>(&msgs, msg_len);
+        } else {
+            for (half, out4) in sk_nodes.chunks_exact_mut(4).enumerate() {
+                let mut msgs = [[0u8; RATE]; 4];
+                let mut msg_len = 0;
+                for (l, m) in msgs.iter_mut().enumerate() {
+                    sk_addr.set_tree_index(leaf0 + (half * 4 + l) as u32);
+                    msg_len = fill_msg::<N>(m, pk_seed, sk_addr.bytes(), &[&sk_seed[..N]]);
+                }
+                out4.copy_from_slice(&shake_n::<N, 4>(&msgs, msg_len));
+            }
         }
 
         addr.set_tree_height(0);
         let mut nodes = [[0u8; N]; 8];
-        for (half, out4) in nodes.chunks_exact_mut(4).enumerate() {
-            let mut msgs = [[0u8; RATE]; 4];
+        if crate::hash::keccak_x4::supported8() {
+            let mut msgs = [[0u8; RATE]; 8];
             let mut msg_len = 0;
             for (l, m) in msgs.iter_mut().enumerate() {
-                addr.set_tree_index(leaf0 + (half * 4 + l) as u32);
-                msg_len = fill_msg::<N>(m, pk_seed, addr.bytes(), &[&sk_nodes[half * 4 + l]]);
+                addr.set_tree_index(leaf0 + l as u32);
+                msg_len = fill_msg::<N>(m, pk_seed, addr.bytes(), &[&sk_nodes[l]]);
             }
-            out4.copy_from_slice(&shake4::<N>(&msgs, msg_len));
+            nodes = shake_n::<N, 8>(&msgs, msg_len);
+        } else {
+            for (half, out4) in nodes.chunks_exact_mut(4).enumerate() {
+                let mut msgs = [[0u8; RATE]; 4];
+                let mut msg_len = 0;
+                for (l, m) in msgs.iter_mut().enumerate() {
+                    addr.set_tree_index(leaf0 + (half * 4 + l) as u32);
+                    msg_len = fill_msg::<N>(m, pk_seed, addr.bytes(), &[&sk_nodes[half * 4 + l]]);
+                }
+                out4.copy_from_slice(&shake_n::<N, 4>(&msgs, msg_len));
+            }
         }
         nodes
     }
@@ -1329,7 +1382,7 @@ mod fors_shake_x4 {
                 &[&nodes[2 * pair], &nodes[2 * pair + 1]],
             );
         }
-        let merged = shake4::<N>(&msgs, msg_len);
+        let merged = shake_n::<N, 4>(&msgs, msg_len);
         nodes[..pairs].copy_from_slice(&merged[..pairs]);
     }
 

@@ -45,26 +45,26 @@ pub(crate) fn sample_ntt_poly(rho: &[u8], s: u8, r: u8) -> Poly {
     a
 }
 
-/// Four [`sample_ntt_poly`] streams squeezed in parallel by the 4-way AVX2
-/// Keccak kernel. `rho` must be the 32-byte public seed; `sr[l]` is the
+/// `L` [`sample_ntt_poly`] streams squeezed in parallel by the `L`-way Keccak
+/// kernel. `rho` must be the 32-byte public seed; `sr[l]` is the
 /// `(s, r)` index pair of stream `l`. Byte-identical to the scalar sampler
 /// (pinned by a differential test); all inputs and the rejection control
 /// flow are public.
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-pub(crate) fn sample_ntt_x4(rho: &[u8], sr: [(u8, u8); 4]) -> [Poly; 4] {
-    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+pub(crate) fn sample_ntt_xn<const L: usize>(rho: &[u8], sr: [(u8, u8); L]) -> [Poly; L] {
+    use crate::hash::keccak_x4::{KeccakXn, MAX_RATE};
     debug_assert_eq!(rho.len(), 32);
-    let mut msgs = [[0u8; 34]; LANES];
+    let mut msgs = [[0u8; 34]; L];
     for (l, msg) in msgs.iter_mut().enumerate() {
         msg[..32].copy_from_slice(rho);
         msg[32] = sr[l].0;
         msg[33] = sr[l].1;
     }
-    let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
-    let mut x4 = KeccakX4::new(NTT_XOF_BLOCK, msgs_ref, 0x1F);
-    let mut blocks = [[0u8; MAX_RATE]; LANES];
-    let mut a = [Poly::zero(); LANES];
-    let mut fill = [0usize; LANES];
+    let msgs_ref: [&[u8]; L] = core::array::from_fn(|l| &msgs[l][..]);
+    let mut x4 = KeccakXn::<L>::new(NTT_XOF_BLOCK, msgs_ref, 0x1F);
+    let mut blocks = [[0u8; MAX_RATE]; L];
+    let mut a = [Poly::zero(); L];
+    let mut fill = [0usize; L];
     while fill.iter().any(|&j| j < N) {
         x4.squeeze_blocks(&mut blocks);
         for (l, j) in fill.iter_mut().enumerate() {
@@ -179,20 +179,31 @@ pub(crate) fn expand_mask_vec(
     gamma1_bits: u32,
 ) {
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
-    let done = if crate::hash::keccak_x4::supported() {
+    let done = {
+        use crate::hash::keccak_x4::{LANES, LANES8, supported, supported8};
         let mut i = 0;
-        while y.len() - i >= 4 {
-            let nonces: [u16; 4] = core::array::from_fn(|l| kappa.wrapping_add((i + l) as u16));
-            let mut polys = expand_mask_x4(&seed_buf[..64], nonces, gamma1_bits);
-            y[i..i + 4].copy_from_slice(&polys);
-            // The mask vector is secret; the local candidate array must not
-            // linger on the stack.
-            super::wipe_polys(&mut polys);
-            i += 4;
+        // Widest kernel first, then the narrower one, then the scalar tail.
+        macro_rules! batch {
+            ($l:expr) => {
+                while y.len() - i >= $l {
+                    let nonces: [u16; $l] =
+                        core::array::from_fn(|l| kappa.wrapping_add((i + l) as u16));
+                    let mut polys = expand_mask_xn::<$l>(&seed_buf[..64], nonces, gamma1_bits);
+                    y[i..i + $l].copy_from_slice(&polys);
+                    // The mask vector is secret; the local candidate array must
+                    // not linger on the stack.
+                    super::wipe_polys(&mut polys);
+                    i += $l;
+                }
+            };
+        }
+        if supported8() {
+            batch!(LANES8);
+        }
+        if supported() {
+            batch!(LANES);
         }
         i
-    } else {
-        0
     };
     #[cfg(not(all(feature = "std", target_arch = "x86_64")))]
     let done = 0;
@@ -211,8 +222,12 @@ pub(crate) fn expand_mask_vec(
 /// seed or squeezed bytes is wiped before returning (the [`super`] caller
 /// wipes the returned polynomials).
 #[cfg(all(feature = "std", target_arch = "x86_64"))]
-fn expand_mask_x4(rho_prime: &[u8], nonces: [u16; 4], gamma1_bits: u32) -> [Poly; 4] {
-    use crate::hash::keccak_x4::{KeccakX4, LANES, MAX_RATE};
+fn expand_mask_xn<const L: usize>(
+    rho_prime: &[u8],
+    nonces: [u16; L],
+    gamma1_bits: u32,
+) -> [Poly; L] {
+    use crate::hash::keccak_x4::{KeccakXn, MAX_RATE};
     /// The SHAKE256 rate.
     const RATE: usize = 136;
     debug_assert_eq!(rho_prime.len(), 64);
@@ -223,17 +238,17 @@ fn expand_mask_x4(rho_prime: &[u8], nonces: [u16; 4], gamma1_bits: u32) -> [Poly
     };
     debug_assert!(need <= 5 * RATE);
 
-    let mut msgs = [[0u8; 66]; LANES];
+    let mut msgs = [[0u8; 66]; L];
     for (l, msg) in msgs.iter_mut().enumerate() {
         msg[..64].copy_from_slice(rho_prime);
         msg[64] = nonces[l] as u8;
         msg[65] = (nonces[l] >> 8) as u8;
     }
-    let msgs_ref: [&[u8]; LANES] = core::array::from_fn(|l| &msgs[l][..]);
-    let mut x4 = KeccakX4::new(RATE, msgs_ref, 0x1F);
+    let msgs_ref: [&[u8]; L] = core::array::from_fn(|l| &msgs[l][..]);
+    let mut x4 = KeccakXn::<L>::new(RATE, msgs_ref, 0x1F);
 
-    let mut bufs = [[0u8; 5 * RATE]; LANES];
-    let mut blocks = [[0u8; MAX_RATE]; LANES];
+    let mut bufs = [[0u8; 5 * RATE]; L];
+    let mut blocks = [[0u8; MAX_RATE]; L];
     let mut off = 0;
     while off < need {
         x4.squeeze_blocks(&mut blocks);
@@ -270,20 +285,38 @@ fn expand_mask_x4(rho_prime: &[u8], nonces: [u16; 4], gamma1_bits: u32) -> [Poly
 mod tests {
     use super::*;
 
-    /// The 4-way batched NTT sampler must be byte-identical to the scalar
-    /// one for every stream.
+    /// Each batched NTT sampler must be byte-identical to the scalar one for
+    /// every stream. Both widths are driven directly, so an AVX-512 host still
+    /// covers the 4-lane path that non-AVX-512 CPUs run.
     #[cfg(all(feature = "std", target_arch = "x86_64"))]
     #[test]
     fn sample_ntt_x4_matches_scalar() {
-        if !crate::hash::keccak_x4::supported() {
-            return;
-        }
+        use crate::hash::keccak_x4::{supported, supported8};
         let rho: [u8; 32] = core::array::from_fn(|i| (i as u8).wrapping_mul(0x33));
-        let sr = [(0u8, 0u8), (4, 1), (2, 7), (255, 3)];
-        let batched = sample_ntt_x4(&rho, sr);
-        for (l, &(s, r)) in sr.iter().enumerate() {
-            let expect = sample_ntt_poly(&rho, s, r);
-            assert_eq!(batched[l].c, expect.c, "stream {l} (s={s}, r={r})");
+        if supported() {
+            let sr = [(0u8, 0u8), (4, 1), (2, 7), (255, 3)];
+            let batched = sample_ntt_xn::<4>(&rho, sr);
+            for (l, &(s, r)) in sr.iter().enumerate() {
+                let expect = sample_ntt_poly(&rho, s, r);
+                assert_eq!(batched[l].c, expect.c, "x4 stream {l} (s={s}, r={r})");
+            }
+        }
+        if supported8() {
+            let sr = [
+                (0u8, 0u8),
+                (4, 1),
+                (2, 7),
+                (255, 3),
+                (1, 1),
+                (9, 0),
+                (17, 5),
+                (200, 200),
+            ];
+            let batched = sample_ntt_xn::<8>(&rho, sr);
+            for (l, &(s, r)) in sr.iter().enumerate() {
+                let expect = sample_ntt_poly(&rho, s, r);
+                assert_eq!(batched[l].c, expect.c, "x8 stream {l} (s={s}, r={r})");
+            }
         }
     }
 
