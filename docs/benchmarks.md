@@ -13,7 +13,7 @@ cargo run --release --example bench --features std,cipher,hash,ec,rsa,mlkem,aez
 - **CPU**: Intel Core i9-14900K (crypto ISA present: `aes`, `pclmulqdq`,
   `sha_ni`, `avx2`).
 - **Build**: `--release` (thin-LTO), single thread, warm cache.
-- **rustc**: 1.96.0 (MSRV is 1.88; newer compilers may differ slightly).
+- **rustc**: 1.96.0 (MSRV is 1.89; newer compilers may differ slightly).
 - Throughput is measured at a 64 KiB message; asymmetric ops are reported as
   latency (µs/op) and ops/s.
 
