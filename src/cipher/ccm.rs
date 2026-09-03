@@ -198,22 +198,21 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
         if !aad.is_empty() {
             let a = aad.len();
             let mut header = [0u8; 10];
-            let hlen;
-            if a < 0xff00 {
+            let hlen = if a < 0xff00 {
                 header[0] = ((a >> 8) & 0xff) as u8;
                 header[1] = (a & 0xff) as u8;
-                hlen = 2;
+                2
             } else if (a as u64) < (1u64 << 32) {
                 header[0] = 0xff;
                 header[1] = 0xfe;
                 header[2..6].copy_from_slice(&(a as u32).to_be_bytes());
-                hlen = 6;
+                6
             } else {
                 header[0] = 0xff;
                 header[1] = 0xff;
                 header[2..10].copy_from_slice(&(a as u64).to_be_bytes());
-                hlen = 10;
-            }
+                10
+            };
             mac.update(&header[..hlen]);
             mac.update(aad);
             let rem = (hlen + a) % 16;

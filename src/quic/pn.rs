@@ -261,6 +261,11 @@ pub(crate) fn encode_packet_number_length(pn: u64, largest_acked: Option<u64>) -
 }
 
 #[cfg(test)]
+// These tests pass ACK ranges as `&[a..=b]` slices, and a range covering a
+// single packet number is a legitimate (and common) case. The lint reads a
+// one-element array of `RangeInclusive` as a mistyped `vec![v; n]`, which it is
+// not here.
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use super::*;
 

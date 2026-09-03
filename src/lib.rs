@@ -22,6 +22,17 @@
 //! `--no-default-features` for a bare `no_std` target.
 
 #![no_std]
+// `clippy::chunks_exact_to_as_chunks` (new in Clippy 1.98) fires ~80 times
+// across the hash, cipher and TLS record code, which slices byte buffers with
+// `chunks_exact(N)` throughout. The suggested `as_chunks::<N>()` yields
+// `&[[u8; N]]` rather than `&[u8]`, so it is not a drop-in: it changes the
+// iteration item type at every call site, and `cargo clippy --fix` cannot apply
+// it. The lint has no correctness dimension (both forms drop the same trailing
+// remainder); its argument is codegen, since a statically-known chunk length can
+// vectorise better. Migrating the hash compression loops to `as_chunks` may well
+// be worth it, but that is a measurable perf change across a lot of slicing code
+// and belongs in its own pass with benchmarks, not a lint-silencing sweep.
+#![allow(clippy::chunks_exact_to_as_chunks)]
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
