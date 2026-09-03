@@ -259,7 +259,7 @@ mod wots_x8 {
     use super::Adrs;
     use super::params::{HashFamily, Params};
     use crate::hash::sha256::{H256, compress256_soft};
-    use crate::hash::sha256_mb::{LANES, compress8};
+    use crate::hash::sha256_mb::{LANES, LANES16, compress8, compress16, supported16};
 
     /// The batcher handles only the SHA-256, `n = 32`, `padding_len = 32` sets,
     /// where `pad‖key` is exactly one block and `F`/`PRF` are 96-byte messages.
@@ -288,11 +288,26 @@ mod wots_x8 {
         o
     }
 
-    /// Runs every WOTS+ chain over its full `0..w-1` range, eight chains at a
-    /// time. `pk` enters holding the chain start values and leaves holding the
+    /// Runs every WOTS+ chain over its full `0..w-1` range, 16 chains at a
+    /// time on AVX-512, else 8. `pk` enters holding the chain start values and leaves holding the
     /// chain ends. `addr` supplies the layer/tree/OTS fields (chain/hash/keymask
     /// are set per lane).
     pub(super) fn full_chains(p: &Params, pub_seed: &[u8], addr: &Adrs, pk: &mut [u8]) {
+        // Widest available multi-buffer kernel drives the same loop.
+        if supported16() {
+            full_chains_n::<LANES16>(p, pub_seed, addr, pk, compress16)
+        } else {
+            full_chains_n::<LANES>(p, pub_seed, addr, pk, compress8)
+        }
+    }
+
+    fn full_chains_n<const L: usize>(
+        p: &Params,
+        pub_seed: &[u8],
+        addr: &Adrs,
+        pk: &mut [u8],
+        compress: fn(&mut [[u32; 8]; L], &[[u8; 64]; L]),
+    ) {
         const N: usize = 32;
         // PRF shared block 0 = toByte(3, 32) ‖ PUB_SEED → a single midstate
         // reused for every key/bitmask PRF (PUB_SEED is constant).
@@ -305,17 +320,17 @@ mod wots_x8 {
         let steps = p.wots_w - 1;
         let mut c0 = 0usize;
         while c0 < p.wots_len {
-            let lanes = (p.wots_len - c0).min(LANES);
-            let mut inout = [[0u8; N]; LANES];
+            let lanes = (p.wots_len - c0).min(L);
+            let mut inout = [[0u8; N]; L];
             for (l, io) in inout.iter_mut().enumerate().take(lanes) {
                 io.copy_from_slice(&pk[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
             for step in 0..steps {
                 // KEY = PRF(.., keyAndMask=0); BM = PRF(.., keyAndMask=1).
-                let mut keyb1 = [[0u8; 64]; LANES];
-                let mut bmb1 = [[0u8; 64]; LANES];
-                for l in 0..LANES {
+                let mut keyb1 = [[0u8; 64]; L];
+                let mut bmb1 = [[0u8; 64]; L];
+                for l in 0..L {
                     let chain = if l < lanes { c0 + l } else { c0 };
                     let mut a = *addr;
                     a.set_chain(chain as u32);
@@ -325,15 +340,15 @@ mod wots_x8 {
                     a.set_key_and_mask(1);
                     bmb1[l] = block1_96(&a.to_bytes());
                 }
-                let mut ks = [prf_mid; LANES];
-                compress8(&mut ks, &keyb1);
-                let mut bs = [prf_mid; LANES];
-                compress8(&mut bs, &bmb1);
+                let mut ks = [prf_mid; L];
+                compress(&mut ks, &keyb1);
+                let mut bs = [prf_mid; L];
+                compress(&mut bs, &bmb1);
 
                 // F(KEY, inout ⊕ BM) = SHA-256(toByte(0,32) ‖ KEY ‖ masked).
-                let mut fb0 = [[0u8; 64]; LANES];
-                let mut fb1 = [[0u8; 64]; LANES];
-                for l in 0..LANES {
+                let mut fb0 = [[0u8; 64]; L];
+                let mut fb1 = [[0u8; 64]; L];
+                for l in 0..L {
                     let key = state_be(&ks[l]);
                     let bm = state_be(&bs[l]);
                     fb0[l][32..64].copy_from_slice(&key);
@@ -343,9 +358,9 @@ mod wots_x8 {
                     }
                     fb1[l] = block1_96(&masked);
                 }
-                let mut fs = [H256; LANES];
-                compress8(&mut fs, &fb0);
-                compress8(&mut fs, &fb1);
+                let mut fs = [H256; L];
+                compress(&mut fs, &fb0);
+                compress(&mut fs, &fb1);
                 for (l, io) in inout.iter_mut().enumerate().take(lanes) {
                     *io = state_be(&fs[l]);
                 }

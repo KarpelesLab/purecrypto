@@ -152,7 +152,7 @@ pub(crate) fn public_key_scalar(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q
 mod lmots_x8 {
     use super::{D_PBLC, LmotsType, N};
     use crate::hash::sha256::H256;
-    use crate::hash::sha256_mb::{LANES, compress8};
+    use crate::hash::sha256_mb::{LANES, LANES16, compress8, compress16, supported16};
     use crate::hash::{Digest, Sha256};
 
     /// Builds the single padded SHA-256 block for a 55-byte LM-OTS message
@@ -183,8 +183,24 @@ mod lmots_x8 {
     }
 
     /// Computes the LM-OTS public key `K` for leaf `q`, batching the `p`
-    /// Winternitz chains eight at a time. Equivalent to [`super::public_key_scalar`].
+    /// Winternitz chains 16 at a time on AVX-512, else 8. Equivalent to
+    /// [`super::public_key_scalar`].
     pub(super) fn public_key_x8(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q: u32) -> [u8; N] {
+        // Widest available multi-buffer kernel drives the same loop.
+        if supported16() {
+            public_key_xn::<LANES16>(t, i_id, seed, q, compress16)
+        } else {
+            public_key_xn::<LANES>(t, i_id, seed, q, compress8)
+        }
+    }
+
+    fn public_key_xn<const L: usize>(
+        t: LmotsType,
+        i_id: &[u8; 16],
+        seed: &[u8; N],
+        q: u32,
+        compress: fn(&mut [[u32; 8]; L], &[[u8; 64]; L]),
+    ) -> [u8; N] {
         let p = t.p();
         let max = t.max_digit();
 
@@ -195,32 +211,32 @@ mod lmots_x8 {
 
         let mut c0 = 0usize;
         while c0 < p {
-            let lanes = (p - c0).min(LANES);
+            let lanes = (p - c0).min(L);
 
-            // derive_x for the eight lanes. Lanes beyond `lanes` duplicate the
-            // first chain of the group so compress8 stays in bounds; their
-            // outputs are never consumed.
-            let mut blocks = [[0u8; 64]; LANES];
+            // derive_x for the lanes of this group. Lanes beyond `lanes`
+            // duplicate the first chain of the group so the kernel stays in
+            // bounds; their outputs are never consumed.
+            let mut blocks = [[0u8; 64]; L];
             for (l, blk) in blocks.iter_mut().enumerate() {
                 let chain = if l < lanes { c0 + l } else { c0 };
                 *blk = block55(i_id, q, chain as u16, 0xff, seed);
             }
-            let mut states = [H256; LANES];
-            compress8(&mut states, &blocks);
-            let mut tmps = [[0u8; N]; LANES];
+            let mut states = [H256; L];
+            compress(&mut states, &blocks);
+            let mut tmps = [[0u8; N]; L];
             for (l, tmp) in tmps.iter_mut().enumerate() {
                 *tmp = state_be(&states[l]);
             }
 
             // Run the chains in lockstep over the full 0..max range.
             for j in 0..max {
-                let mut blocks = [[0u8; 64]; LANES];
+                let mut blocks = [[0u8; 64]; L];
                 for (l, blk) in blocks.iter_mut().enumerate() {
                     let chain = if l < lanes { c0 + l } else { c0 };
                     *blk = block55(i_id, q, chain as u16, j as u8, &tmps[l]);
                 }
-                let mut states = [H256; LANES];
-                compress8(&mut states, &blocks);
+                let mut states = [H256; L];
+                compress(&mut states, &blocks);
                 for (l, tmp) in tmps.iter_mut().enumerate() {
                     *tmp = state_be(&states[l]);
                 }

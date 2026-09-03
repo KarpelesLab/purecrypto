@@ -259,7 +259,8 @@ mod wots_x8_tests {
 }
 
 /// Multi-buffer (AVX2) WOTS+ chain evaluation for SLH-DSA's SHA-2 sets: eight
-/// independent F-chains hashed in lockstep through the 8-way SHA-256 kernel.
+/// independent F-chains hashed in lockstep through the widest available
+/// multi-buffer SHA-256 kernel (16 lanes on AVX-512, else 8 on AVX2).
 /// Produces byte-identical output to the scalar [`wots_chain`] loop (pinned by
 /// a differential test). In the SHA-2 instantiation `F(pk_seed, addr, m1)` is
 /// `SHA256(pk_seed[..n] ‖ 0^(64−n) ‖ addr(22) ‖ m1[..n])` for **every** n
@@ -271,7 +272,7 @@ mod wots_x8 {
     use super::adrs::Adrs;
     use super::params::{MAX_N, Params};
     use crate::hash::sha256::{H256, compress256_soft};
-    use crate::hash::sha256_mb::{LANES, compress8};
+    use crate::hash::sha256_mb::{LANES, LANES16, compress8, compress16, supported16};
 
     /// The batcher handles every SHA-2 (`!is_shake`) set: `F` is SHA-256 for
     /// all of them, and for n ≤ 32 the variable tail (`addr(22) ‖ m1(n) ‖
@@ -325,28 +326,47 @@ mod wots_x8 {
     /// layer/tree/key-pair fields (type WotsHash); chain/hash are set per lane
     /// and step.
     pub(super) fn full_chains(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
-        // Monomorphize on n (`eligible` admits only the SHA-2 sets).
-        match p.n {
-            16 => full_chains_n::<16>(p, pk_seed, base, tmp),
-            24 => full_chains_n::<24>(p, pk_seed, base, tmp),
-            _ => full_chains_n::<32>(p, pk_seed, base, tmp),
+        // Monomorphize on n (`eligible` admits only the SHA-2 sets) and on the
+        // lane count, so the widest available multi-buffer kernel drives the
+        // same loop. `len` is 35/51/67 depending on the set, so a 16-lane pass
+        // still leaves a partial batch — the remainder lanes duplicate the
+        // first active chain and their results are discarded, exactly as in the
+        // 8-lane path.
+        if supported16() {
+            match p.n {
+                16 => full_chains_n::<16, LANES16>(p, pk_seed, base, tmp, compress16),
+                24 => full_chains_n::<24, LANES16>(p, pk_seed, base, tmp, compress16),
+                _ => full_chains_n::<32, LANES16>(p, pk_seed, base, tmp, compress16),
+            }
+        } else {
+            match p.n {
+                16 => full_chains_n::<16, LANES>(p, pk_seed, base, tmp, compress8),
+                24 => full_chains_n::<24, LANES>(p, pk_seed, base, tmp, compress8),
+                _ => full_chains_n::<32, LANES>(p, pk_seed, base, tmp, compress8),
+            }
         }
     }
 
-    fn full_chains_n<const N: usize>(p: &Params, pk_seed: &[u8], base: &Adrs, tmp: &mut [u8]) {
+    fn full_chains_n<const N: usize, const L: usize>(
+        p: &Params,
+        pk_seed: &[u8],
+        base: &Adrs,
+        tmp: &mut [u8],
+        compress: fn(&mut [[u32; 8]; L], &[[u8; 64]; L]),
+    ) {
         let mid = midstate256(pk_seed, N);
 
         let len = p.len as usize;
         let mut c0 = 0usize;
         while c0 < len {
-            let lanes = (len - c0).min(LANES);
-            let mut inout = [[0u8; N]; LANES];
+            let lanes = (len - c0).min(L);
+            let mut inout = [[0u8; N]; L];
             for (l, io) in inout.iter_mut().enumerate().take(lanes) {
                 io.copy_from_slice(&tmp[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
             for step in 0..15u32 {
-                let mut b1 = [[0u8; 64]; LANES];
+                let mut b1 = [[0u8; 64]; L];
                 for (l, slot) in b1.iter_mut().enumerate() {
                     // Remainder lanes duplicate the first active chain.
                     let chain = if l < lanes { c0 + l } else { c0 };
@@ -355,8 +375,8 @@ mod wots_x8 {
                     a.set_hash(step);
                     *slot = block1_f(a.bytes(), &inout[l]);
                 }
-                let mut st = [mid; LANES];
-                compress8(&mut st, &b1);
+                let mut st = [mid; L];
+                compress(&mut st, &b1);
                 for (l, io) in inout.iter_mut().enumerate() {
                     state_be(&st[l], io);
                 }
