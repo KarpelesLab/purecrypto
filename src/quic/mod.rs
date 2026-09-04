@@ -19,8 +19,9 @@
 //! stateless resets for datagrams whose Connection ID it has no state for.
 //! RFC 9001 §4.6 0-RTT is supported on both sides: a client that resumes with
 //! a [`QuicSession`] can open streams and write before the handshake
-//! completes, and a server that opts in accepts that early data. Out of
-//! scope: the §9.6 server preferred address, and HTTP/3.
+//! completes, and a server that opts in accepts that early data. A server may
+//! advertise a §9.6 [`PreferredAddress`] and a client migrate to it. Out of
+//! scope: HTTP/3.
 
 // QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
 // client, with several follow-ups still open (see the project notes). A
@@ -66,4 +67,4 @@ pub use peek::peek_initial_sni;
 pub use crate::tls::ClientHelloInfo;
 pub use server::QuicServer;
 pub use stream::StreamId;
-pub use transport_params::TransportParameters;
+pub use transport_params::{PreferredAddress, TransportParameters};

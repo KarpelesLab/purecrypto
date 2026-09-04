@@ -77,7 +77,7 @@ use crate::quic::server::{
 use crate::quic::stream::StreamId;
 use crate::quic::streams::Streams;
 use crate::quic::tls_glue::HookHandle;
-use crate::quic::transport_params::TransportParameters;
+use crate::quic::transport_params::{PreferredAddress, TransportParameters};
 use crate::quic::varint;
 use crate::rng::{OsRng, RngCore};
 use crate::tls::Error;
@@ -301,6 +301,9 @@ pub(crate) struct PathMigration {
     /// the congestion controller and RTT estimator across such a change,
     /// since the path itself is very likely unchanged.
     port_only: bool,
+    /// The Destination CID the old path used, restored alongside `prev_addr`
+    /// if validation fails, and retired once it succeeds (RFC 9000 §9.5).
+    prev_cid: ConnectionId,
 }
 
 /// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
@@ -703,11 +706,22 @@ pub(crate) struct PacketMeta {
 /// (values 0 and 1 are spec violations). We refuse to *send* such a
 /// value rather than discover the problem during the peer's TP
 /// validation — that produces a clear error at construction time.
+/// Ceiling on the `active_connection_id_limit` this endpoint will advertise.
+///
+/// RFC 9000 §18.2 puts no upper bound on the parameter, but the value is a
+/// promise: the peer may issue that many connection IDs and we must hold them
+/// all. Advertising an enormous limit is therefore a self-inflicted memory
+/// DoS, so it is rejected at construction rather than silently honoured or
+/// silently clamped (clamping would make us reject CIDs the peer was entitled
+/// to send, a protocol violation on our side).
+const MAX_LOCAL_ACTIVE_CID_LIMIT: u64 = 64;
+
 fn validate_local_transport_params(tp: &TransportParameters) -> Result<(), Error> {
     if let Some(limit) = tp.active_connection_id_limit
-        && limit < 2
+        && !(2..=MAX_LOCAL_ACTIVE_CID_LIMIT).contains(&limit)
     {
-        // RFC 9000 §18.2: "Values below 2 are invalid."
+        // RFC 9000 §18.2: "Values below 2 are invalid." The upper bound is
+        // ours; see MAX_LOCAL_ACTIVE_CID_LIMIT.
         return Err(Error::IllegalParameter);
     }
     Ok(())
@@ -2082,25 +2096,7 @@ impl QuicConnection {
         }
 
         // §9.3: start sending to the new address immediately, and validate it.
-        let port_only = from.ip() == current.ip();
-        let now = self.now_since_start();
-        let challenge = self.path.issue(&mut OsRng, now);
-        // §8.2.4: give the response at least three PTOs, with a floor so a
-        // connection whose RTT estimate is still tiny doesn't give up early.
-        let timeout = self
-            .endpoint
-            .loss
-            .pto_period()
-            .saturating_mul(3)
-            .max(Duration::from_millis(200));
-        self.migration = Some(PathMigration {
-            prev_addr: current,
-            challenge,
-            deadline: now.saturating_add(timeout),
-            port_only,
-        });
-        self.peer_addr = Some(from);
-        self.peer_addr_validated = false;
+        self.begin_migration(current, from);
         // §9.3.1: the new address is unvalidated, so the 3x anti-amplification
         // budget of §8.1 applies again — an attacker who spoofs a victim's
         // address must not be able to aim a flood at it. Credit the datagram
@@ -2114,6 +2110,111 @@ impl QuicConnection {
         // an observer could link the two paths to one connection. Retire the
         // one we were using and switch to a spare if the peer gave us any.
         self.rotate_cid_for_new_path();
+    }
+
+    /// Switches the send address to `to` and arms the RFC 9000 §8.2 path
+    /// validation that must confirm it, remembering `from` as the fallback.
+    fn begin_migration(&mut self, from: SocketAddr, to: SocketAddr) {
+        let now = self.now_since_start();
+        let challenge = self.path.issue(&mut OsRng, now);
+        // §8.2.4: give the response at least three PTOs, with a floor so a
+        // connection whose RTT estimate is still tiny doesn't give up early.
+        let timeout = self
+            .endpoint
+            .loss
+            .pto_period()
+            .saturating_mul(3)
+            .max(Duration::from_millis(200));
+        self.migration = Some(PathMigration {
+            prev_addr: from,
+            challenge,
+            deadline: now.saturating_add(timeout),
+            // §9.4: a port-only change is nearly always the same path through
+            // a NAT, so the congestion and RTT state survives it.
+            port_only: from.ip() == to.ip(),
+            prev_cid: self.endpoint.cids.peer,
+        });
+        self.peer_addr = Some(to);
+        self.peer_addr_validated = false;
+    }
+
+    /// The address the server asked this client to move to, if it advertised
+    /// one (RFC 9000 §9.6 `preferred_address`). `None` on a server, before the
+    /// peer's transport parameters arrive, or when none was offered.
+    pub fn server_preferred_address(&self) -> Option<PreferredAddress> {
+        if self.role != Role::Client {
+            return None;
+        }
+        let raw = self.peer_params.as_ref()?.preferred_address.as_deref()?;
+        // Already validated in `validate_peer_transport_params`.
+        PreferredAddress::decode(raw).ok()
+    }
+
+    /// RFC 9000 §9.6 — migrates this client to the server's advertised
+    /// preferred address, returning the address the host should send to from
+    /// now on. [`Self::peer_address`] reports the same value.
+    ///
+    /// The move is provisional until path validation succeeds: a
+    /// PATH_CHALLENGE goes out on the next [`Self::pop_datagram`], and if the
+    /// server never echoes it (three PTOs, driven by [`Self::on_timeout`]) the
+    /// connection reverts to the address it was using. [`Self::is_migrating`]
+    /// is true meanwhile.
+    ///
+    /// Per §9.6 the new path is addressed by the connection ID carried in the
+    /// parameter, which is installed at sequence number 1 (§5.1.1) together
+    /// with its stateless-reset token.
+    ///
+    /// Returns [`Error::InappropriateState`] on a server, before the handshake
+    /// completes (§9 forbids migrating earlier), when the server advertised no
+    /// preferred address or none in the address family currently in use, or
+    /// while another migration is still being validated.
+    pub fn migrate_to_preferred_address(&mut self) -> Result<SocketAddr, Error> {
+        if self.role != Role::Client || !self.handshake_complete {
+            return Err(Error::InappropriateState);
+        }
+        if self.closed || self.draining || self.pending_close.is_some() {
+            return Err(Error::InappropriateState);
+        }
+        if self.migration.is_some() {
+            return Err(Error::InappropriateState);
+        }
+        let pa = self
+            .server_preferred_address()
+            .ok_or(Error::InappropriateState)?;
+        let current = self.peer_addr.ok_or(Error::InappropriateState)?;
+        // Stay in the address family the host's socket is already bound for:
+        // a sans-I/O engine cannot open a new socket on the caller's behalf.
+        let target: SocketAddr = match current {
+            SocketAddr::V4(_) => (*pa.ipv4.as_ref().ok_or(Error::InappropriateState)?).into(),
+            SocketAddr::V6(_) => (*pa.ipv6.as_ref().ok_or(Error::InappropriateState)?).into(),
+        };
+        if target == current {
+            return Err(Error::InappropriateState);
+        }
+        // §9.6 / §5.1.1: the parameter's connection ID is sequence 1. Install
+        // it (idempotently) and address the new path by it.
+        let cid = ConnectionId::from_slice(&pa.connection_id).ok_or(Error::IllegalParameter)?;
+        if let Some(pool) = self.cid_remote.as_mut() {
+            match pool.entries.get(&1) {
+                // Already installed (a repeat call, or a NEW_CONNECTION_ID
+                // that re-sent the same CID).
+                Some(e) if e.cid == cid => {}
+                // §5.1.1 reserves sequence 1 for the preferred-address CID
+                // when one is advertised, so a *different* CID sitting there
+                // means the server contradicted its own parameter.
+                Some(_) => return Err(Error::IllegalParameter),
+                None => pool
+                    .add(CidEntry {
+                        cid,
+                        sequence: 1,
+                        reset_token: Some(pa.stateless_reset_token),
+                    })
+                    .map_err(|_| Error::IllegalParameter)?,
+            }
+        }
+        self.begin_migration(current, target);
+        self.endpoint.cids.peer = cid;
+        Ok(target)
     }
 
     /// RFC 9000 §9.5 — move to an unused Destination Connection ID for the
@@ -2135,18 +2236,9 @@ impl QuicConnection {
             return;
         };
         self.endpoint.cids.peer = next;
-        // Retire the CID the old path was using, so the peer can drop it.
-        if let Some((old_seq, _)) = pool
-            .entries
-            .iter()
-            .find(|(_, e)| e.cid == current)
-            .map(|(&s, e)| (s, e.cid))
-        {
-            pool.entries.remove(&old_seq);
-            if !pool.pending_retire.contains(&old_seq) {
-                pool.pending_retire.push(old_seq);
-            }
-        }
+        // The old CID is retired once the new path validates
+        // (`on_migration_validated`) — keeping it until then is what lets
+        // `abandon_migration` fall back to it.
         let _ = seq;
     }
 
@@ -2157,6 +2249,18 @@ impl QuicConnection {
             return;
         };
         self.peer_addr_validated = true;
+        // §9.5: the old path's connection ID is done. Retire it so the peer
+        // can drop the state, unless we are still using it (no spare was
+        // available when we moved).
+        if m.prev_cid != self.endpoint.cids.peer
+            && let Some(pool) = self.cid_remote.as_mut()
+            && let Some((&seq, _)) = pool.entries.iter().find(|(_, e)| e.cid == m.prev_cid)
+        {
+            pool.entries.remove(&seq);
+            if !pool.pending_retire.contains(&seq) {
+                pool.pending_retire.push(seq);
+            }
+        }
         // The peer has proven it receives at this address; §8.1's
         // amplification limit no longer applies to it.
         self.addr_validation.validated = true;
@@ -2176,6 +2280,7 @@ impl QuicConnection {
             return;
         };
         self.peer_addr = Some(m.prev_addr);
+        self.endpoint.cids.peer = m.prev_cid;
         self.peer_addr_validated = true;
         self.addr_validation.validated = true;
     }
@@ -3246,6 +3351,14 @@ impl QuicConnection {
                         }
                     }
                     _ => return Err(Error::IllegalParameter),
+                }
+
+                // RFC 9000 §9.6 — a malformed `preferred_address` is a
+                // TRANSPORT_PARAMETER_ERROR, including the specific cases
+                // §9.6 calls out: a zero-length connection ID, or a body
+                // offering neither address family.
+                if let Some(raw) = parsed.preferred_address.as_deref() {
+                    PreferredAddress::decode(raw).map_err(|_| Error::IllegalParameter)?;
                 }
             }
             Role::Server => {
@@ -6611,8 +6724,10 @@ mod tests {
         );
     }
 
-    /// A client never follows a moving server (RFC 9000 §9 leaves that to the
-    /// `preferred_address` transport parameter, which we do not act on).
+    /// A client never follows a moving server on its own: RFC 9000 §9 leaves
+    /// that to the `preferred_address` transport parameter, which the
+    /// application must act on explicitly
+    /// (`migration_client_moves_to_preferred_address`).
     #[test]
     fn migration_client_does_not_follow_the_server() {
         let old_addr = ip4(192, 0, 2, 1, 1111);
@@ -6628,6 +6743,159 @@ mod tests {
             .expect("client feed");
         assert_eq!(c.peer_address(), Some(server_addr));
         assert!(!c.is_migrating());
+    }
+
+    /// RFC 9000 §18.2 — the `preferred_address` wire form round-trips, and
+    /// §9.6's two hard requirements are enforced on decode: a zero-length
+    /// connection ID and a body offering neither address family are both
+    /// errors.
+    #[test]
+    fn preferred_address_codec_round_trip_and_rejections() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 4433)),
+            ipv6: Some(SocketAddrV6::new(
+                Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+                4434,
+                0,
+                0,
+            )),
+            connection_id: alloc::vec![0xAB; 8],
+            stateless_reset_token: [0x5e; 16],
+        };
+        let encoded = pa.encode();
+        assert_eq!(encoded.len(), 41 + 8);
+        assert_eq!(PreferredAddress::decode(&encoded).expect("decode"), pa);
+
+        // IPv4 only: the omitted family is all-zeros with port 0 (§18.2).
+        let v4_only = PreferredAddress {
+            ipv6: None,
+            ..pa.clone()
+        };
+        let decoded = PreferredAddress::decode(&v4_only.encode()).expect("decode v4-only");
+        assert_eq!(decoded.ipv6, None);
+        assert_eq!(decoded.ipv4, v4_only.ipv4);
+
+        // §9.6: a zero-length connection ID is a protocol error.
+        let mut zero_cid = pa.encode();
+        zero_cid[24] = 0;
+        zero_cid.drain(25..33);
+        assert!(PreferredAddress::decode(&zero_cid).is_err());
+
+        // Neither family offered.
+        let neither = {
+            let mut b = alloc::vec![0u8; 24];
+            b.push(4);
+            b.extend_from_slice(&[1, 2, 3, 4]);
+            b.extend_from_slice(&[0u8; 16]);
+            b
+        };
+        assert!(PreferredAddress::decode(&neither).is_err());
+
+        // Truncated, over-long, and an out-of-range CID length.
+        assert!(PreferredAddress::decode(&encoded[..encoded.len() - 1]).is_err());
+        let mut too_long = encoded.clone();
+        too_long.push(0);
+        assert!(PreferredAddress::decode(&too_long).is_err());
+        let mut bad_len = encoded.clone();
+        bad_len[24] = 21;
+        assert!(PreferredAddress::decode(&bad_len).is_err());
+    }
+
+    /// RFC 9000 §9.6 — a client migrates to the server's advertised preferred
+    /// address: output moves there, addressed by the connection ID from the
+    /// parameter (sequence 1 per §5.1.1), under path validation. A failed
+    /// validation reverts both the address and the connection ID.
+    #[test]
+    fn migration_client_moves_to_preferred_address() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let preferred = ip4(203, 0, 113, 7, 4433);
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC1; 8],
+            stateless_reset_token: [0x77; 16],
+        };
+
+        let (mut c, mut s) = migration_pair(old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        // Splice the parameter into the peer params the client already holds
+        // (the loopback server does not advertise one).
+        c.peer_params
+            .as_mut()
+            .expect("peer params")
+            .preferred_address = Some(pa.encode());
+
+        let seen = c.server_preferred_address().expect("advertised");
+        assert_eq!(seen, pa);
+        let before_cid = c.endpoint.cids.peer;
+
+        // §5.1.1 reserves sequence 1 for the preferred-address CID. This
+        // loopback server issued an ordinary NEW_CONNECTION_ID there, so the
+        // parameter contradicts it and the migration is refused.
+        assert!(
+            c.cid_remote
+                .as_ref()
+                .is_some_and(|p| p.entries.contains_key(&1)),
+            "the handshake already issued a sequence-1 CID"
+        );
+        assert!(
+            c.migrate_to_preferred_address().is_err(),
+            "§5.1.1: a conflicting sequence-1 CID is a protocol violation"
+        );
+        // Drop it, as a server that actually reserved sequence 1 would have.
+        c.cid_remote.as_mut().expect("pool").entries.remove(&1);
+
+        let target = c.migrate_to_preferred_address().expect("migrate");
+        assert_eq!(target, preferred);
+        assert_eq!(c.peer_address(), Some(preferred));
+        assert!(c.is_migrating());
+        assert_eq!(
+            c.endpoint.cids.peer.as_slice(),
+            &pa.connection_id[..],
+            "§9.6: the new path is addressed by the parameter's CID"
+        );
+        assert_eq!(
+            c.cid_remote
+                .as_ref()
+                .and_then(|p| p.entries.get(&1))
+                .map(|e| e.reset_token),
+            Some(Some(pa.stateless_reset_token)),
+            "§5.1.1: installed at sequence 1, with its reset token"
+        );
+        // A second attempt while the first is unvalidated is refused.
+        assert!(c.migrate_to_preferred_address().is_err());
+
+        // The probe goes out, expanded per §8.2.1.
+        let probe = c.pop_datagram();
+        assert_eq!(probe.len(), 1200);
+
+        // Nobody answers: the client falls back to where it was.
+        c.on_timeout(Duration::from_secs(3600));
+        assert!(!c.is_migrating());
+        assert_eq!(c.peer_address(), Some(server_addr));
+        assert_eq!(
+            c.endpoint.cids.peer, before_cid,
+            "a failed migration restores the old connection ID too"
+        );
+        let _ = &mut s;
+    }
+
+    /// A server never has a preferred address to move to, and a client cannot
+    /// migrate before the handshake completes (RFC 9000 §9).
+    #[test]
+    fn preferred_address_migration_is_gated() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        assert!(!c.is_handshake_complete());
+        assert!(c.migrate_to_preferred_address().is_err());
+        assert!(s.migrate_to_preferred_address().is_err());
+        assert_eq!(s.server_preferred_address(), None);
+        drive_until_complete(&mut c, &mut s, 8);
+        // Handshake done, but the server advertised no preferred address.
+        assert_eq!(c.server_preferred_address(), None);
+        assert!(c.migrate_to_preferred_address().is_err());
     }
 
     // ============================================================

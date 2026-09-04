@@ -24,6 +24,108 @@ use alloc::vec::Vec;
 use super::varint;
 use crate::tls::Error;
 
+/// The server's preferred address (RFC 9000 §9.6 / §18.2).
+///
+/// A server that would rather serve a connection from a different address
+/// advertises one here during the handshake. After the handshake completes a
+/// client may migrate to it with
+/// [`QuicConnection::migrate_to_preferred_address`](crate::quic::QuicConnection::migrate_to_preferred_address),
+/// which validates the new path before committing to it.
+///
+/// Either address family may be omitted (§18.2 lets a server zero the family
+/// it does not offer); at least one must be present. The connection ID is the
+/// one the client must address the new path by, and is implicitly sequence
+/// number 1 (§5.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreferredAddress {
+    /// The IPv4 address to migrate to, if the server offered one.
+    pub ipv4: Option<std::net::SocketAddrV4>,
+    /// The IPv6 address to migrate to, if the server offered one.
+    pub ipv6: Option<std::net::SocketAddrV6>,
+    /// The connection ID to use on the new path. RFC 9000 §9.6 forbids this
+    /// being empty, so a server using zero-length connection IDs cannot
+    /// advertise a preferred address at all.
+    pub connection_id: Vec<u8>,
+    /// The stateless-reset token paired with `connection_id` (§10.3.1).
+    pub stateless_reset_token: [u8; 16],
+}
+
+impl PreferredAddress {
+    /// The fixed part of the encoding: 4-byte IPv4 + 2-byte port + 16-byte
+    /// IPv6 + 2-byte port + 1-byte CID length + 16-byte reset token.
+    const FIXED_LEN: usize = 4 + 2 + 16 + 2 + 1 + 16;
+
+    /// Encodes the RFC 9000 §18.2 wire form, for
+    /// [`TransportParameters::preferred_address`].
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::FIXED_LEN + self.connection_id.len());
+        match &self.ipv4 {
+            Some(a) => {
+                out.extend_from_slice(&a.ip().octets());
+                out.extend_from_slice(&a.port().to_be_bytes());
+            }
+            // §18.2: a family that is not offered is all-zeros with port 0.
+            None => out.extend_from_slice(&[0u8; 6]),
+        }
+        match &self.ipv6 {
+            Some(a) => {
+                out.extend_from_slice(&a.ip().octets());
+                out.extend_from_slice(&a.port().to_be_bytes());
+            }
+            None => out.extend_from_slice(&[0u8; 18]),
+        }
+        out.push(self.connection_id.len() as u8);
+        out.extend_from_slice(&self.connection_id);
+        out.extend_from_slice(&self.stateless_reset_token);
+        out
+    }
+
+    /// Decodes the RFC 9000 §18.2 wire form.
+    ///
+    /// Rejects a truncated or over-long body, a connection ID longer than the
+    /// 20-byte QUIC v1 maximum, an *empty* connection ID (§9.6 forbids it),
+    /// and a body that offers neither address family.
+    pub fn decode(body: &[u8]) -> Result<Self, Error> {
+        if body.len() < Self::FIXED_LEN {
+            return Err(Error::Decode);
+        }
+        let v4_ip = std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]);
+        let v4_port = u16::from_be_bytes([body[4], body[5]]);
+        let mut v6_octets = [0u8; 16];
+        v6_octets.copy_from_slice(&body[6..22]);
+        let v6_ip = std::net::Ipv6Addr::from(v6_octets);
+        let v6_port = u16::from_be_bytes([body[22], body[23]]);
+        let cid_len = body[24] as usize;
+        if cid_len > 20 {
+            return Err(Error::Decode);
+        }
+        // §9.6: "a server MUST NOT include a zero-length connection ID in
+        // this transport parameter"; a client MUST treat it as an error.
+        if cid_len == 0 {
+            return Err(Error::Decode);
+        }
+        if body.len() != Self::FIXED_LEN + cid_len {
+            return Err(Error::Decode);
+        }
+        let connection_id = body[25..25 + cid_len].to_vec();
+        let mut stateless_reset_token = [0u8; 16];
+        stateless_reset_token.copy_from_slice(&body[25 + cid_len..]);
+        let ipv4 = (!v4_ip.is_unspecified() || v4_port != 0)
+            .then(|| std::net::SocketAddrV4::new(v4_ip, v4_port));
+        let ipv6 = (!v6_ip.is_unspecified() || v6_port != 0)
+            .then(|| std::net::SocketAddrV6::new(v6_ip, v6_port, 0, 0));
+        if ipv4.is_none() && ipv6.is_none() {
+            return Err(Error::Decode);
+        }
+        Ok(Self {
+            ipv4,
+            ipv6,
+            connection_id,
+            stateless_reset_token,
+        })
+    }
+}
+
 /// QUIC transport parameters exchanged in the TLS handshake.
 ///
 /// All `Option<…>` fields are absent on the wire when set to `None`. The
@@ -58,8 +160,9 @@ pub struct TransportParameters {
     pub max_ack_delay_ms: Option<u64>,
     /// `disable_active_migration` (0x0C) — zero-length on the wire.
     pub disable_active_migration: bool,
-    /// `preferred_address` (0x0D) — opaque blob; this phase does not
-    /// destructure its internals (RFC 9000 §18.2 has the full layout).
+    /// `preferred_address` (0x0D) — server only. Held in its RFC 9000 §18.2
+    /// wire form; build one with [`PreferredAddress::encode`] and read it
+    /// back with [`PreferredAddress::decode`].
     pub preferred_address: Option<Vec<u8>>,
     /// `active_connection_id_limit` (0x0E) — default 2.
     pub active_connection_id_limit: Option<u64>,
