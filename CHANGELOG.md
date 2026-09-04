@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/KarpelesLab/purecrypto/compare/v0.7.0...v0.8.0) - 2026-09-03
+
+### Fixed
+
+- *(lint)* unbreak CI under Clippy 1.98's new lints
+
+### Other
+
+- *(bignum,rsa)* window the fixed-width modexp; cache the CRT Montgomery contexts
+- *(keccak)* 8-way AVX-512 Keccak; wire ML-KEM/ML-DSA/SLH-DSA to it
+- *(hash)* 16-lane AVX-512 multi-buffer SHA-256; use it in SLH-DSA/XMSS/LMS
+- *(blake3)* AVX-512 16-chunk kernel (~1.45x over AVX2)
+- *(chacha20)* AVX-512 16-block keystream kernel (1.9x over AVX2)
+- [**breaking**] raise MSRV to Rust 1.89
+
 ## [0.7.0](https://github.com/KarpelesLab/purecrypto/compare/v0.6.29...v0.7.0) - 2026-08-13
 
 ### Added
