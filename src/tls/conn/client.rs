@@ -3081,17 +3081,22 @@ impl ClientConnection {
         // packet-number space rather than by a handshake message.
         if self.early_data_accepted {
             if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
-                debug_assert!(false, "RFC 9001 §8.3 forbids EndOfEarlyData in QUIC mode");
-                return Err(Error::InappropriateState);
+                // RFC 9001 §8.3: QUIC signals the end of 0-RTT by moving to
+                // the 1-RTT packet-number space, so no EndOfEarlyData message
+                // is sent and there is no record-layer write key to swap —
+                // the QUIC layer holds the per-level AEAD state. Drop the
+                // deferred handshake secret and carry on to Finished.
+                self.deferred_client_hs_secret = None;
+            } else {
+                let mut eoed = alloc::vec![hs_type::END_OF_EARLY_DATA];
+                eoed.extend_from_slice(&[0u8, 0, 0]); // u24 length = 0
+                self.core.emit_handshake(eoed);
+                let chts = self
+                    .deferred_client_hs_secret
+                    .take()
+                    .ok_or(Error::InappropriateState)?;
+                self.core.set_write(suite.crypter(&chts));
             }
-            let mut eoed = alloc::vec![hs_type::END_OF_EARLY_DATA];
-            eoed.extend_from_slice(&[0u8, 0, 0]); // u24 length = 0
-            self.core.emit_handshake(eoed);
-            let chts = self
-                .deferred_client_hs_secret
-                .take()
-                .ok_or(Error::InappropriateState)?;
-            self.core.set_write(suite.crypter(&chts));
         }
 
         // mTLS: if the server sent CertificateRequest, emit Certificate +

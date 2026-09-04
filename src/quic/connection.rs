@@ -27,10 +27,17 @@
 //! §9.3.1 amplification limit, reverting if the new path never answers.
 //! [`QuicConnection::peer_address`] is the authority on where output goes.
 //!
-//! Deliberately out of scope: 0-RTT (we never emit it), the §9.6 server
-//! preferred address, HTTP/3, and stateless-reset *emission* — a reset is by
-//! definition sent when no connection state exists, so it belongs to the
-//! router: see [`QuicServer`](crate::quic::QuicServer), which does emit them.
+//! RFC 9001 §4.6 0-RTT is wired on both sides. A client given a
+//! [`QuicSession`] through [`QuicConfig::resumption`] offers early data in its
+//! ClientHello and carries streams written before the handshake completes in
+//! 0-RTT packets coalesced behind the first Initial; a server with
+//! `enable_early_data` accepts them. On rejection the engine requeues the
+//! bytes for 1-RTT retransmission, so the application never resends.
+//!
+//! Deliberately out of scope: the §9.6 server preferred address, HTTP/3, and
+//! stateless-reset *emission* — a reset is by definition sent when no
+//! connection state exists, so it belongs to the router: see
+//! [`QuicServer`](crate::quic::QuicServer), which does emit them.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -198,7 +205,85 @@ pub struct QuicConfig {
     ///
     /// Ignored on the client side.
     pub reset_key: Option<[u8; 32]>,
+    /// Client-only — a session from an earlier connection to the same server,
+    /// taken with [`QuicConnection::take_session`]. Resumes the TLS handshake
+    /// via PSK and, when the ticket allows it, enables 0-RTT: streams opened
+    /// before the handshake completes are carried in 0-RTT packets alongside
+    /// the first Initial.
+    ///
+    /// RFC 9001 §4.6.1: while 0-RTT is in flight the connection honours the
+    /// transport parameters remembered in the session, not the ones the server
+    /// is about to send.
+    ///
+    /// **0-RTT data is replayable** — see [`QuicSession`].
+    ///
+    /// Ignored on the server side.
+    pub resumption: Option<QuicSession>,
+    /// Enable 0-RTT.
+    ///
+    /// On a **server**, this advertises 0-RTT capability in the
+    /// NewSessionTickets it issues (`tls.ticket_key` must also be set, or no
+    /// tickets are issued at all) and makes it accept early data on resumed
+    /// connections. Data arriving in 0-RTT packets is replayable by an
+    /// attacker: only enable this when the application protocol's early
+    /// requests are safe to process more than once.
+    ///
+    /// On a **client**, this permits offering 0-RTT when
+    /// [`Self::resumption`] carries a ticket that supports it. Defaults to
+    /// `false` on both sides, so 0-RTT is strictly opt-in.
+    pub enable_early_data: bool,
 }
+
+/// Everything needed to resume a QUIC connection with 0-RTT.
+///
+/// Take one from a completed client connection with
+/// [`QuicConnection::take_session`], persist it, and hand it back through
+/// [`QuicConfig::resumption`] on a later connection to the same server.
+///
+/// RFC 9001 §4.6.1 requires the client to remember the server's transport
+/// parameters alongside the TLS ticket and to stay within them while sending
+/// 0-RTT, so both travel together here. The contents are deliberately
+/// opaque.
+///
+/// **0-RTT data is replayable.** An attacker who captures a 0-RTT flight can
+/// replay it to the server; QUIC's own machinery does not prevent that. Only
+/// send requests whose repetition is harmless.
+#[derive(Clone)]
+pub struct QuicSession {
+    tls: crate::tls::conn::StoredSession,
+    /// The server's transport parameters from the original connection.
+    peer_params: TransportParameters,
+}
+
+impl QuicSession {
+    /// The ALPN protocol negotiated on the originating connection. A client
+    /// that would negotiate a different protocol MUST NOT offer 0-RTT
+    /// (RFC 9001 §4.6.2).
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.tls.negotiated_alpn.as_deref()
+    }
+
+    /// Whether the server advertised 0-RTT capability on this ticket. When
+    /// `false` the session still resumes the handshake (saving the
+    /// certificate exchange) but no early data can be sent.
+    pub fn supports_early_data(&self) -> bool {
+        matches!(self.tls.max_early_data_size, Some(n) if n > 0)
+    }
+}
+
+impl core::fmt::Debug for QuicSession {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QuicSession")
+            .field("server_name", &self.tls.server_name)
+            .field("supports_early_data", &self.supports_early_data())
+            .finish_non_exhaustive()
+    }
+}
+
+/// RFC 9001 §4.6.1 — the only `max_early_data_size` a QUIC server may put in
+/// a NewSessionTicket. Any other value is a PROTOCOL_VIOLATION, because QUIC
+/// bounds early data with its own flow control rather than a TLS byte budget.
+const QUIC_MAX_EARLY_DATA_SIZE: u32 = 0xffff_ffff;
 
 /// RFC 9000 §9 — an in-progress migration to a new peer address.
 ///
@@ -431,6 +516,19 @@ pub struct QuicConnection {
     /// state. After this flips on every public API call is a no-op /
     /// short-circuit; the application drains via [`Self::is_closed`].
     pub(crate) closed: bool,
+    /// Client-only: `peer_params` currently holds the values *remembered*
+    /// from a resumption session (RFC 9001 §4.6.1) rather than ones the
+    /// server sent on this connection. Replaced when the real ones arrive.
+    peer_params_remembered: bool,
+    /// Client-only: we offered 0-RTT in the ClientHello. `None` on a fresh
+    /// connection.
+    early_data_offered: bool,
+    /// `Some(true)` once the server accepted our 0-RTT, `Some(false)` once it
+    /// rejected it, `None` while unknown or when none was offered.
+    early_data_accepted: Option<bool>,
+    /// Set once the 0-RTT keys have been dropped (RFC 9001 §4.9.3), so the
+    /// discard and the rejection requeue each happen exactly once.
+    early_keys_discarded: bool,
     /// RFC 9000 §9 — set while a peer address change is being validated.
     pub(crate) migration: Option<PathMigration>,
     /// True while the address in `peer_addr` is known to belong to the peer:
@@ -661,7 +759,21 @@ impl QuicConnection {
         tp_with_iscid.initial_source_connection_id = Some(scid.as_slice().to_vec());
         let mut tp_bytes = Vec::new();
         tp_with_iscid.encode(&mut tp_bytes);
-        let tls_cfg = build_client_tls_config(&cfg)?;
+        // RFC 9001 §4.6.1 / §4.6.2 — 0-RTT is offered only when the caller
+        // opted in, the ticket advertises it, and the ALPN protocol we are
+        // about to negotiate is the one the session was established with.
+        let offering_early_data = cfg.enable_early_data
+            && cfg.resumption.as_ref().is_some_and(|s| {
+                s.supports_early_data()
+                    && s.alpn_protocol()
+                        .is_some_and(|a| cfg.tls.alpn_protocols.iter().any(|p| p == a))
+            });
+        let remembered_params = cfg
+            .resumption
+            .as_ref()
+            .map(|s| s.peer_params.clone())
+            .unwrap_or_default();
+        let tls_cfg = build_client_tls_config(&cfg, offering_early_data)?;
         let (engine, hooks) = build_client_engine(tls_cfg, server_name, tp_bytes)?;
 
         // Local CID pool seeded with our SCID at sequence 0 (RFC 9000
@@ -699,6 +811,10 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            peer_params_remembered: false,
+            early_data_offered: false,
+            early_data_accepted: None,
+            early_keys_discarded: false,
             migration: None,
             peer_addr_validated: false,
             current_rx_addr: None,
@@ -720,6 +836,17 @@ impl QuicConnection {
             ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
         };
+
+        // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
+        // server's *remembered* transport parameters until the real ones
+        // arrive. Seeding them here also materialises the stream substrate in
+        // `drain_engine_outputs` below, which is what lets the application
+        // open streams and write before the handshake completes.
+        if offering_early_data {
+            conn.peer_params = Some(remembered_params);
+            conn.peer_params_remembered = true;
+            conn.early_data_offered = true;
+        }
 
         // Drain the ClientHello bytes the engine just produced into the
         // Initial-level outbound CRYPTO queue. The peer hasn't sent
@@ -807,6 +934,10 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            peer_params_remembered: false,
+            early_data_offered: false,
+            early_data_accepted: None,
+            early_keys_discarded: false,
             migration: None,
             peer_addr_validated: false,
             current_rx_addr: None,
@@ -1263,6 +1394,10 @@ impl QuicConnection {
         // also contribute to this datagram so we don't pad more than
         // necessary.
         let initial_will_emit = self.level_has_pending(Level::Initial);
+        let zero_rtt_will_emit = self.role == Role::Client
+            && !self.early_keys_discarded
+            && self.endpoint.crypto.at(Level::EarlyData).tx.is_some()
+            && self.level_has_pending(Level::EarlyData);
         let handshake_will_emit = self.level_has_pending(Level::Handshake);
         let onertt_will_emit = self.level_has_pending(Level::OneRtt);
 
@@ -1271,11 +1406,15 @@ impl QuicConnection {
         // Initial-bearing datagram MUST be at least 1200 bytes total;
         // the padding lives inside the AEAD-sealed Initial payload so
         // it shares the same authentication tag.
-        let initial_pad_target = if need_first_initial_pad && initial_will_emit {
-            Some(1200usize)
-        } else {
-            None
-        };
+        // When a 0-RTT packet is coalesced behind it, the datagram reaches
+        // 1200 bytes on its own; padding the Initial to 1200 first would push
+        // the datagram past the MTU. Pad afterwards instead.
+        let initial_pad_target =
+            if need_first_initial_pad && initial_will_emit && !zero_rtt_will_emit {
+                Some(1200usize)
+            } else {
+                None
+            };
 
         // Initial-level packet (may carry CRYPTO + ACK + PADDING).
         if let Some(pkt) =
@@ -1285,6 +1424,17 @@ impl QuicConnection {
         }
         let _ = handshake_will_emit;
         let _ = onertt_will_emit;
+
+        // 0-RTT packet (RFC 9001 §4.6): stream / DATAGRAM frames the
+        // application queued before the handshake finished, coalesced behind
+        // the Initial in the same datagram (§12.2). Only the client emits
+        // these, only while its early keys are live.
+        if self.role == Role::Client
+            && !self.early_keys_discarded
+            && let Some(pkt) = self.build_packet_at(Level::EarlyData)
+        {
+            datagram.extend_from_slice(&pkt);
+        }
 
         // Handshake-level packet.
         if let Some(pkt) = self.build_packet_at(Level::Handshake) {
@@ -1318,6 +1468,23 @@ impl QuicConnection {
 
         if datagram.is_empty() {
             return Vec::new();
+        }
+        // RFC 9000 §14.1 — the client's Initial-bearing datagrams must be at
+        // least 1200 bytes. With a 0-RTT packet coalesced in, the Initial was
+        // built unpadded, so top the datagram up here with a PADDING-only
+        // trailer at the 0-RTT level (PADDING is a legal 0-RTT frame and
+        // stays inside that packet's AEAD).
+        if need_first_initial_pad && initial_will_emit && datagram.len() < 1200 {
+            // An empty payload lets `seal_packet`'s pad arithmetic size the
+            // PADDING run exactly against the remaining room.
+            if let Some(pad_pkt) = self.seal_packet(
+                Level::EarlyData,
+                Vec::new(),
+                Some((1200, datagram.len())),
+                Some(PacketMeta::default()),
+            ) {
+                datagram.extend_from_slice(&pad_pkt);
+            }
         }
 
         // RFC 9000 §8.1 — server MUST NOT send more than 3× bytes_recv
@@ -1394,7 +1561,9 @@ impl QuicConnection {
 
     /// True if `level` currently has CRYPTO or pending-ACK bytes to send.
     fn level_has_pending(&self, level: Level) -> bool {
-        if self.endpoint.bufs.at(level).outbound_pending() {
+        // RFC 9000 §12.4 Table 3: CRYPTO and ACK are forbidden in 0-RTT
+        // packets, so neither can make that level "pending".
+        if !matches!(level, Level::EarlyData) && self.endpoint.bufs.at(level).outbound_pending() {
             return true;
         }
         let space = match level {
@@ -1402,15 +1571,22 @@ impl QuicConnection {
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        if !space.pending_ack.is_empty() && space.ack_eliciting_pending {
+        if !matches!(level, Level::EarlyData)
+            && !space.pending_ack.is_empty()
+            && space.ack_eliciting_pending
+        {
             return true;
         }
-        // 1-RTT carries stream-related frames + Phase-7 path/CID frames.
-        if matches!(level, Level::OneRtt) {
+        // 1-RTT and 0-RTT both carry stream-related frames; the path/CID
+        // housekeeping below is 1-RTT-only (RFC 9000 §12.4 Table 3).
+        if matches!(level, Level::OneRtt | Level::EarlyData) {
             if let Some(streams) = self.streams.as_ref()
                 && streams.has_pending()
             {
                 return true;
+            }
+            if matches!(level, Level::EarlyData) {
+                return !self.datagram_queues.outbound.is_empty();
             }
             if self.path.has_pending_response() || self.path.has_pending_challenge() {
                 return true;
@@ -1763,6 +1939,61 @@ impl QuicConnection {
     pub fn send_capacity(&self, id: StreamId) -> Result<usize, Error> {
         let s = self.streams.as_ref().ok_or(Error::InappropriateState)?;
         s.send_capacity(id)
+    }
+
+    // ============================================================
+    // 0-RTT / session resumption (RFC 9001 §4.6)
+    // ============================================================
+
+    /// Takes the resumption session the server issued, for 0-RTT on a later
+    /// connection to the same server. Client-side; `None` until the server's
+    /// NewSessionTicket has been processed, which happens shortly *after*
+    /// [`Self::is_handshake_complete`] turns true — keep pumping
+    /// `pop_datagram` / `feed_datagram` for a round trip before asking.
+    ///
+    /// Returns `None` if the server issued no ticket (it has no
+    /// `tls.ticket_key` configured), and the same session is returned only
+    /// once.
+    ///
+    /// Sessions are scoped to a server: never offer one to a different host.
+    /// The 0-RTT data sent under it is replayable — see [`QuicSession`].
+    pub fn take_session(&mut self) -> Option<QuicSession> {
+        let EngineSide::Client(c) = &mut self.engine else {
+            return None;
+        };
+        let tls = c.take_session()?;
+        // RFC 9001 §4.6.1: a QUIC server MUST advertise
+        // `max_early_data_size` of exactly 0xffffffff. Rather than fail the
+        // (already-complete) connection, drop the 0-RTT capability from the
+        // session we hand back: resumption still works, early data does not.
+        let tls = match tls.max_early_data_size {
+            None | Some(QUIC_MAX_EARLY_DATA_SIZE) => tls,
+            Some(_) => crate::tls::conn::StoredSession {
+                max_early_data_size: None,
+                ..tls
+            },
+        };
+        let peer_params = self.peer_params.clone()?;
+        Some(QuicSession { tls, peer_params })
+    }
+
+    /// Whether the server accepted the 0-RTT this connection offered.
+    ///
+    /// * `None` — no 0-RTT was offered, or the handshake has not resolved yet.
+    /// * `Some(true)` — early data was accepted; the bytes written before the
+    ///   handshake completed reached the peer in 0-RTT packets.
+    /// * `Some(false)` — early data was rejected. Nothing is lost: the engine
+    ///   has requeued every unacknowledged byte for retransmission at the
+    ///   1-RTT level, so the application need not resend anything.
+    pub fn early_data_accepted(&self) -> Option<bool> {
+        self.early_data_accepted
+    }
+
+    /// Whether this connection offered 0-RTT in its ClientHello. Streams may
+    /// be opened and written to before the handshake completes only when this
+    /// is `true`.
+    pub fn early_data_offered(&self) -> bool {
+        self.early_data_offered
     }
 
     // ============================================================
@@ -2232,9 +2463,11 @@ impl QuicConnection {
             return Err(Error::InappropriateState);
         }
         if !self.handshake_complete {
-            // RFC 9221 §5: DATAGRAM frames only travel in 0-RTT and
-            // 1-RTT packets. Phase 8 doesn't ship 0-RTT, so we gate on
-            // handshake completion.
+            // RFC 9221 §5: DATAGRAM frames travel in 0-RTT and 1-RTT
+            // packets. Gating on handshake completion keeps them out of a
+            // replayable 0-RTT flight, which for an unreliable, unordered
+            // datagram is rarely what the application wants; use a stream if
+            // early delivery matters.
             return Err(Error::InappropriateState);
         }
         self.datagram_queues.send(data)
@@ -2842,11 +3075,25 @@ impl QuicConnection {
         // a mismatching `original_destination_connection_id`, and the
         // only thing standing between a redirected handshake and a
         // silent compromise is this check (RFC 9000 §7.3).
-        if self.peer_params.is_none()
+        if (self.peer_params.is_none() || self.peer_params_remembered)
             && let Some(raw) = self.hooks.take_peer_params()
         {
             let parsed = TransportParameters::decode(&raw)?;
             self.validate_peer_transport_params(&parsed)?;
+            // RFC 9001 §4.6.1 — the 0-RTT flight went out under the values
+            // remembered from the previous connection. The server is
+            // forbidden from reducing them; if it did, streams we already
+            // wrote to would be outside the window it will honour.
+            if self.peer_params_remembered {
+                self.peer_params_remembered = false;
+                if let Some(streams) = self.streams.as_mut()
+                    && !streams.adopt_peer_limits(&parsed)
+                {
+                    return Err(Error::IllegalParameter);
+                }
+                self.peer_params = None;
+                self.peer_ack_params_installed = false;
+            }
             // G-3: the peer's `stateless_reset_token` TP is the token
             // for the handshake CID (sequence 0 in our `cid_remote`
             // pool). Install it now so subsequent inbound datagrams
@@ -3052,6 +3299,37 @@ impl QuicConnection {
             // receiver drop any already-in-flight ones (the rx-key `None`
             // branch in `feed_long_header_packet` silently discards them).
             self.discard_handshake_levels();
+            self.resolve_early_data();
+        }
+    }
+
+    /// RFC 9001 §4.6 / §4.9.3 — settle the 0-RTT outcome once 1-RTT keys are
+    /// in hand.
+    ///
+    /// The client discards its 0-RTT keys the moment it installs 1-RTT keys
+    /// (§4.9.3: it never sends 0-RTT after a 1-RTT packet, so they have no
+    /// further use). If the server *rejected* the early data, everything sent
+    /// in 0-RTT packets never reached the application, so every carved but
+    /// unacknowledged stream chunk is requeued for retransmission at 1-RTT —
+    /// the same requeue a PTO performs.
+    fn resolve_early_data(&mut self) {
+        if self.role != Role::Client || self.early_keys_discarded {
+            return;
+        }
+        self.early_keys_discarded = true;
+        if !self.early_data_offered {
+            return;
+        }
+        let accepted = match &self.engine {
+            EngineSide::Client(c) => c.early_data_accepted(),
+            EngineSide::Server(_) => false,
+        };
+        self.early_data_accepted = Some(accepted);
+        let lk = self.endpoint.crypto.at_mut(Level::EarlyData);
+        lk.tx = None;
+        lk.rx = None;
+        if !accepted && let Some(streams) = self.streams.as_mut() {
+            streams.requeue_all_unacked();
         }
     }
 
@@ -4320,14 +4598,17 @@ impl QuicConnection {
         // STREAM and flow-control frames to the 1-RTT level. Phase 7
         // adds PATH_RESPONSE / NEW_CID / RETIRE_CID / pending CID
         // issuance at the 1-RTT level.
-        let has_crypto = self.endpoint.bufs.at(level).outbound_pending();
+        // RFC 9000 §12.4 Table 3: no CRYPTO and no ACK in a 0-RTT packet.
+        let zero_rtt = matches!(level, Level::EarlyData);
+        let has_crypto = !zero_rtt && self.endpoint.bufs.at(level).outbound_pending();
         let space_ref = match level {
             Level::Initial => &self.endpoint.pn.initial,
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        let has_pending_ack = !space_ref.pending_ack.is_empty() && space_ref.ack_eliciting_pending;
-        let has_streams = matches!(level, Level::OneRtt)
+        let has_pending_ack =
+            !zero_rtt && !space_ref.pending_ack.is_empty() && space_ref.ack_eliciting_pending;
+        let has_streams = matches!(level, Level::OneRtt | Level::EarlyData)
             && self
                 .streams
                 .as_ref()
@@ -4343,8 +4624,8 @@ impl QuicConnection {
                     .unwrap_or(false)
                 || (self.handshake_complete && !self.new_cids_issued));
         // Phase 8 — DATAGRAM frames live only at the 1-RTT level.
-        let has_datagrams =
-            matches!(level, Level::OneRtt) && !self.datagram_queues.outbound.is_empty();
+        let has_datagrams = matches!(level, Level::OneRtt | Level::EarlyData)
+            && !self.datagram_queues.outbound.is_empty();
         if !has_crypto && !has_pending_ack && !has_streams && !has_path_or_cid && !has_datagrams {
             return None;
         }
@@ -4479,17 +4760,18 @@ impl QuicConnection {
             // byte + DCID + PN, with no version, SCID, token, or Length
             // field. Getting this wrong under-pads the datagram, which
             // matters for the §8.2.1 PATH_CHALLENGE expansion.
+            // Only the Initial packet has a Token field at all (RFC 9000
+            // §17.2.2); 0-RTT and Handshake long headers omit it entirely,
+            // varint length included.
+            let token_bytes = if matches!(level, Level::Initial) {
+                token_len_varint_bytes + token_len
+            } else {
+                0
+            };
             let header_overhead = if matches!(level, Level::OneRtt) {
                 1 + dcid_len
             } else {
-                1 + 4
-                    + 1
-                    + dcid_len
-                    + 1
-                    + scid_len
-                    + token_len_varint_bytes
-                    + token_len
-                    + length_field_bytes
+                1 + 4 + 1 + dcid_len + 1 + scid_len + token_bytes + length_field_bytes
             };
             let pn_and_tag = pn_len as usize + 16;
             let needed_pkt_len = target_total.saturating_sub(already_in_datagram);
@@ -4559,8 +4841,20 @@ impl QuicConnection {
                 )
             }
             Level::EarlyData => {
-                // Phase 4 doesn't emit 0-RTT.
-                return None;
+                // RFC 9000 §17.2.3 — 0-RTT packet: a long header of type
+                // 0x01, with no Token field, sharing the Application
+                // packet-number space with 1-RTT (§12.3).
+                let length_field = (pn_len as u64) + payload.len() as u64 + 16;
+                build_long_header(
+                    LongType::ZeroRtt,
+                    QUIC_V1,
+                    self.endpoint.cids.peer.as_slice(),
+                    self.endpoint.cids.local.as_slice(),
+                    &[],
+                    pn,
+                    pn_len,
+                    length_field,
+                )
             }
         };
 
@@ -4669,7 +4963,10 @@ impl QuicConnection {
             Level::Handshake => &self.endpoint.pn.handshake,
             _ => &self.endpoint.pn.application,
         };
-        if !space_ref.pending_ack.is_empty()
+        // RFC 9000 §12.4 Table 3: ACK is forbidden in 0-RTT packets. The
+        // Application space's pending ACKs ride the 1-RTT packet instead.
+        if !matches!(level, Level::EarlyData)
+            && !space_ref.pending_ack.is_empty()
             && let Some((largest, first_range, raw)) = build_ack_ranges_raw(&space_ref.pending_ack)
         {
             let ack_delay = space_ref
@@ -4728,74 +5025,66 @@ impl QuicConnection {
         // permitted in 1-RTT packets (and 0-RTT, but we don't emit
         // 0-RTT). Phase 7 adds PATH_RESPONSE / PATH_CHALLENGE / NEW_CID
         // / RETIRE_CID at the same level.
-        if matches!(level, Level::OneRtt) {
-            // PATH_RESPONSE (RFC 9000 §8.2.2): emit one per pending
-            // request before everything else. They're tiny (9 bytes
-            // each) and high-priority.
-            while let Some(data) = self.path.pop_outbound_response() {
-                Frame::PathResponse(data).encode(&mut out);
-                meta.ack_eliciting = true;
-                meta.in_flight = true;
-                meta.has_path_frame = true;
-                if out.len() > 900 {
-                    break;
-                }
-            }
-            // PATH_CHALLENGE (RFC 9000 §8.2.1): challenges this endpoint has
-            // issued — either explicitly via `send_path_challenge` or by the
-            // §9.3 migration path — and not yet put on the wire.
-            while let Some(data) = self.path.pop_outbound_challenge() {
-                Frame::PathChallenge(data).encode(&mut out);
-                meta.ack_eliciting = true;
-                meta.in_flight = true;
-                meta.has_path_frame = true;
-                if out.len() > 900 {
-                    break;
-                }
-            }
-            // PATH_CHALLENGE (if the application called
-            // `send_path_challenge`): the state machine queues them
-            // internally; we don't carve here. Instead the public
-            // `send_path_challenge` method bundles the issue + the
-            // frame emission. For now, also dump any outstanding
-            // challenges that haven't been sent yet. We mirror the
-            // outstanding list by pulling any value not yet on the
-            // wire; PathChallengeState's `issue` returns the bytes
-            // for the *first* outbound and we record it. To avoid
-            // a tracking double-emit, we leave PATH_CHALLENGE off the
-            // automatic packer — `send_path_challenge` exposes the
-            // bytes; the caller can call `enqueue_path_challenge` to
-            // wire it. Phase 7's integration test issues + reads
-            // directly from `path` for the round-trip assertion.
-
-            // RETIRE_CONNECTION_ID (RFC 9000 §19.16): for every
-            // sequence the local CID pool retired (peer's
-            // retire_prior_to advanced), emit a frame.
-            if let Some(pool) = self.cid_remote.as_mut() {
-                while let Some(seq) = pool.pop_pending_retire() {
-                    Frame::RetireConnectionId { seq }.encode(&mut out);
+        //
+        // RFC 9000 §12.4 Table 3 lets STREAM, the flow-control frames and
+        // DATAGRAM ride 0-RTT packets too — that is what 0-RTT *is* — while
+        // PATH_RESPONSE, NEW_TOKEN and HANDSHAKE_DONE stay 1-RTT-only, so the
+        // path / CID housekeeping below is kept inside its own guard.
+        if matches!(level, Level::OneRtt | Level::EarlyData) {
+            if matches!(level, Level::OneRtt) {
+                // PATH_RESPONSE (RFC 9000 §8.2.2): emit one per pending
+                // request before everything else. They're tiny (9 bytes
+                // each) and high-priority.
+                while let Some(data) = self.path.pop_outbound_response() {
+                    Frame::PathResponse(data).encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
+                    meta.has_path_frame = true;
                     if out.len() > 900 {
                         break;
                     }
                 }
-            }
-
-            // NEW_CONNECTION_ID (RFC 9000 §19.15): once the handshake
-            // is complete, opportunistically issue fresh local CIDs to
-            // the peer up to the peer's `active_connection_id_limit`
-            // (default 2 — we have 1 from the handshake, so we send 1
-            // extra). Idempotent via `new_cids_issued`.
-            if self.handshake_complete && !self.new_cids_issued {
-                let prev_len = out.len();
-                self.issue_new_local_cids(&mut out);
-                if out.len() > prev_len {
+                // PATH_CHALLENGE (RFC 9000 §8.2.1): challenges this endpoint has
+                // issued — either explicitly via `send_path_challenge` or by the
+                // §9.3 migration path — and not yet put on the wire.
+                while let Some(data) = self.path.pop_outbound_challenge() {
+                    Frame::PathChallenge(data).encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
+                    meta.has_path_frame = true;
+                    if out.len() > 900 {
+                        break;
+                    }
                 }
-                self.new_cids_issued = true;
-            }
+                // RETIRE_CONNECTION_ID (RFC 9000 §19.16): for every
+                // sequence the local CID pool retired (peer's
+                // retire_prior_to advanced), emit a frame.
+                if let Some(pool) = self.cid_remote.as_mut() {
+                    while let Some(seq) = pool.pop_pending_retire() {
+                        Frame::RetireConnectionId { seq }.encode(&mut out);
+                        meta.ack_eliciting = true;
+                        meta.in_flight = true;
+                        if out.len() > 900 {
+                            break;
+                        }
+                    }
+                }
+
+                // NEW_CONNECTION_ID (RFC 9000 §19.15): once the handshake
+                // is complete, opportunistically issue fresh local CIDs to
+                // the peer up to the peer's `active_connection_id_limit`
+                // (default 2 — we have 1 from the handshake, so we send 1
+                // extra). Idempotent via `new_cids_issued`.
+                if self.handshake_complete && !self.new_cids_issued {
+                    let prev_len = out.len();
+                    self.issue_new_local_cids(&mut out);
+                    if out.len() > prev_len {
+                        meta.ack_eliciting = true;
+                        meta.in_flight = true;
+                    }
+                    self.new_cids_issued = true;
+                }
+            } // end 1-RTT-only path / CID housekeeping
 
             if let Some(streams) = self.streams.as_mut() {
                 // Target payload cap: ~1100 bytes to leave headroom for
@@ -4936,7 +5225,10 @@ impl QuicConnection {
 // here so we don't add a new public API in `tls::`.
 // ---------------------------------------------------------------------
 
-fn build_client_tls_config(cfg: &QuicConfig) -> Result<ClientConfig, Error> {
+fn build_client_tls_config(
+    cfg: &QuicConfig,
+    offer_early_data: bool,
+) -> Result<ClientConfig, Error> {
     // RFC 9001 §8.1 — "When using ALPN, endpoints MUST immediately close
     // a connection [...] if an application protocol is not negotiated"
     // and QUIC requires the use of ALPN. Fail closed at construction: a
@@ -4962,6 +5254,17 @@ fn build_client_tls_config(cfg: &QuicConfig) -> Result<ClientConfig, Error> {
         }
     }
     cc.key_log = cfg.tls.key_log.clone();
+    // Resumption. The TLS client offers `early_data` in its ClientHello
+    // whenever the stored session carries a non-zero `max_early_data_size`,
+    // so a caller who resumed without opting into 0-RTT gets the ticket with
+    // that field zeroed: PSK resumption without early data.
+    if let Some(session) = cfg.resumption.as_ref() {
+        let mut stored = session.tls.clone();
+        if !offer_early_data {
+            stored.max_early_data_size = None;
+        }
+        cc = cc.with_session(stored);
+    }
     Ok(cc)
 }
 
@@ -5000,6 +5303,19 @@ fn build_server_tls_config(cfg: &QuicConfig) -> Result<ServerConfig, Error> {
     }
     sc = sc.with_signature_policy(cfg.tls.signature_policy.clone());
     sc.key_log = cfg.tls.key_log.clone();
+    // Session resumption. Without a ticket key the server issues no
+    // NewSessionTicket at all, so clients can never resume — which is why
+    // this must be propagated for 0-RTT to be reachable.
+    if let Some(key) = cfg.tls.ticket_key {
+        sc = sc.with_ticket_key(key);
+    }
+    if cfg.enable_early_data {
+        // RFC 9001 §4.6.1: a QUIC server MUST advertise exactly 0xffffffff.
+        // The byte budget is meaningless here — QUIC bounds early data with
+        // its own flow control — and any other value is a protocol violation
+        // the client must reject.
+        sc = sc.with_max_early_data(QUIC_MAX_EARLY_DATA_SIZE);
+    }
     Ok(sc)
 }
 
@@ -5783,6 +6099,236 @@ mod tests {
             c.feed_datagram(&dg).expect("client feed");
         }
         any
+    }
+
+    // ============================================================
+    // RFC 9001 §4.6 — 0-RTT / session resumption
+    // ============================================================
+
+    /// Builds the client and server configs for a 0-RTT-capable loopback
+    /// pair: the server has a ticket key (without which it issues no
+    /// NewSessionTicket at all) and both sides opt into early data.
+    fn zero_rtt_configs() -> (crate::tls::Config, crate::tls::Config, TransportParameters) {
+        let (mut server_cfg_tls, cert_der) = ed25519_server();
+        server_cfg_tls.ticket_key = Some([0x5c; 32]);
+        let mut roots = crate::tls::RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = crate::tls::Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..crate::tls::Config::default()
+        };
+        let params = TransportParameters {
+            max_idle_timeout_ms: Some(30_000),
+            max_udp_payload_size: Some(1500),
+            initial_max_data: Some(256 * 1024),
+            initial_max_stream_data_bidi_local: Some(64 * 1024),
+            initial_max_stream_data_bidi_remote: Some(64 * 1024),
+            initial_max_stream_data_uni: Some(64 * 1024),
+            initial_max_streams_bidi: Some(100),
+            initial_max_streams_uni: Some(3),
+            ack_delay_exponent: Some(3),
+            max_ack_delay_ms: Some(25),
+            active_connection_id_limit: Some(2),
+            ..TransportParameters::default()
+        };
+        (client_cfg, server_cfg_tls, params)
+    }
+
+    fn zero_rtt_server(
+        tls: crate::tls::Config,
+        params: TransportParameters,
+        early: bool,
+    ) -> QuicConnection {
+        QuicConnection::server(QuicConfig {
+            tls,
+            transport_params: params,
+            enable_early_data: early,
+            ..QuicConfig::default()
+        })
+        .expect("server build")
+    }
+
+    /// Runs a full connection to obtain a resumption session.
+    fn obtain_session(
+        client_cfg: &crate::tls::Config,
+        server_cfg: &crate::tls::Config,
+        params: &TransportParameters,
+        early: bool,
+    ) -> QuicSession {
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg.clone(),
+                transport_params: params.clone(),
+                enable_early_data: early,
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = zero_rtt_server(server_cfg.clone(), params.clone(), early);
+        // Extra rounds after completion so the NewSessionTicket flight lands.
+        let mut session = None;
+        for _ in 0..12 {
+            pump(&mut c, &mut s);
+            if let Some(sess) = c.take_session() {
+                session = Some(sess);
+                break;
+            }
+        }
+        session.expect("server must issue a NewSessionTicket")
+    }
+
+    /// A resumed connection carries application data in 0-RTT packets: the
+    /// client writes before the handshake completes, the very first flight
+    /// already contains the bytes, and the server reads them out. The
+    /// handshake then confirms acceptance (RFC 9001 §4.6).
+    #[test]
+    fn zero_rtt_early_data_is_sent_and_accepted() {
+        let (client_cfg, server_cfg, params) = zero_rtt_configs();
+        let session = obtain_session(&client_cfg, &server_cfg, &params, true);
+        assert!(session.supports_early_data(), "§4.6.1: ticket allows 0-RTT");
+        assert_eq!(session.alpn_protocol(), Some(&b"test"[..]));
+
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+                enable_early_data: true,
+                resumption: Some(session),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = zero_rtt_server(server_cfg, params, true);
+
+        // The remembered transport parameters make streams usable *before*
+        // the handshake — that is the whole point of 0-RTT.
+        assert!(c.early_data_offered());
+        assert!(!c.is_handshake_complete());
+        let id = c.open_bidi().expect("open a stream before the handshake");
+        let n = c.write(id, b"GET /early").expect("write early data");
+        assert_eq!(n, 10);
+
+        // The client's first flight carries Initial + 0-RTT coalesced, and is
+        // still a full-size datagram per RFC 9000 §14.1.
+        let first = c.pop_datagram();
+        assert!(!first.is_empty());
+        assert_eq!(first.len(), 1200, "§14.1: Initial-bearing datagram >= 1200");
+        s.feed_datagram(&first).expect("server feed 0-RTT flight");
+
+        // The server has the early data before it has finished the handshake.
+        assert!(!s.is_handshake_complete());
+        let mut buf = [0u8; 64];
+        let sid = s.readable_streams().next().expect("0-RTT stream data");
+        let (n, _fin) = s.read(sid, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"GET /early");
+
+        // Finish the handshake; the client confirms acceptance.
+        for _ in 0..8 {
+            pump(&mut c, &mut s);
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert_eq!(c.early_data_accepted(), Some(true));
+        // §4.9.3 — the 0-RTT keys are gone once 1-RTT keys are installed.
+        assert!(c.endpoint.crypto.at(Level::EarlyData).tx.is_none());
+    }
+
+    /// A server that did not opt into early data still resumes the handshake
+    /// via PSK but rejects the 0-RTT. RFC 9001 §4.6: nothing is lost — the
+    /// engine retransmits the rejected bytes at the 1-RTT level without the
+    /// application resending them.
+    #[test]
+    fn zero_rtt_rejected_data_is_retransmitted_at_1_rtt() {
+        let (client_cfg, server_cfg, params) = zero_rtt_configs();
+        // Session obtained from an early-data-capable server...
+        let session = obtain_session(&client_cfg, &server_cfg, &params, true);
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+                enable_early_data: true,
+                resumption: Some(session),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        // ...but this server refuses early data.
+        let mut s = zero_rtt_server(server_cfg, params, false);
+
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"replayable").expect("write");
+
+        for _ in 0..12 {
+            pump(&mut c, &mut s);
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert_eq!(
+            c.early_data_accepted(),
+            Some(false),
+            "server rejected 0-RTT"
+        );
+
+        // The application never resent anything; the engine did.
+        for _ in 0..8 {
+            pump(&mut c, &mut s);
+        }
+        let mut buf = [0u8; 64];
+        let sid = s
+            .readable_streams()
+            .next()
+            .expect("the rejected bytes must arrive at 1-RTT");
+        let (n, _fin) = s.read(sid, &mut buf).expect("read");
+        assert_eq!(&buf[..n], b"replayable");
+    }
+
+    /// Without `enable_early_data` the client resumes the TLS handshake but
+    /// offers no 0-RTT, so nothing may be written before it completes.
+    #[test]
+    fn resumption_without_early_data_offers_no_zero_rtt() {
+        let (client_cfg, server_cfg, params) = zero_rtt_configs();
+        let session = obtain_session(&client_cfg, &server_cfg, &params, true);
+        let mut c = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: params.clone(),
+                resumption: Some(session),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut s = zero_rtt_server(server_cfg, params, true);
+        assert!(!c.early_data_offered());
+        assert!(
+            c.open_bidi().is_err(),
+            "no remembered parameters without 0-RTT, so no early streams"
+        );
+        for _ in 0..8 {
+            pump(&mut c, &mut s);
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert_eq!(c.early_data_accepted(), None);
+        // The resumed connection still works.
+        let id = c.open_bidi().expect("open after the handshake");
+        c.write(id, b"post").expect("write");
+        for _ in 0..4 {
+            pump(&mut c, &mut s);
+        }
+        assert!(s.readable_streams().next().is_some());
     }
 
     // ============================================================
@@ -6644,7 +7190,7 @@ mod tests {
             transport_params: loopback_params(),
             require_retry: true,
             retry_secret: Some(retry_secret),
-            reset_key: None,
+            ..QuicConfig::default()
         })
         .expect("server build");
         (client, server)
@@ -8755,7 +9301,7 @@ mod tests {
             transport_params: loopback_params(),
             require_retry: true,
             retry_secret: Some([0x77; 32]),
-            reset_key: None,
+            ..QuicConfig::default()
         })
         .expect("server build");
         server.set_peer_addr(SocketAddr::new(

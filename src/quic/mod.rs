@@ -17,8 +17,10 @@
 //! (application CONNECTION_CLOSE with the closing / draining states), and
 //! §9 connection migration. [`QuicServer`] additionally emits §10.3
 //! stateless resets for datagrams whose Connection ID it has no state for.
-//! Out of scope: 0-RTT emission, the §9.6 server preferred address, and
-//! HTTP/3.
+//! RFC 9001 §4.6 0-RTT is supported on both sides: a client that resumes with
+//! a [`QuicSession`] can open streams and write before the handshake
+//! completes, and a server that opts in accepts that early data. Out of
+//! scope: the §9.6 server preferred address, and HTTP/3.
 
 // QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
 // client, with several follow-ups still open (see the project notes). A
@@ -55,7 +57,9 @@ pub(crate) mod tls_glue;
 pub mod transport_params;
 pub(crate) mod varint;
 
-pub use connection::{CloseInfo, CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role};
+pub use connection::{
+    CloseInfo, CloseInitiator, CloseKind, QuicConfig, QuicConnection, QuicSession, Role,
+};
 pub use ecn::EcnCodepoint;
 pub use peek::peek_initial_sni;
 // Re-export so callers can name the peek's return type from `quic` directly.

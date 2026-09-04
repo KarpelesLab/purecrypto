@@ -441,6 +441,66 @@ impl Streams {
         core::cmp::min(conn_room, stream_room) as usize
     }
 
+    /// RFC 9001 §4.6.1 — adopt the peer's real transport parameters after a
+    /// 0-RTT flight was sent under the values remembered from an earlier
+    /// connection.
+    ///
+    /// Returns `false` when the peer *reduced* any limit the client relied
+    /// on, which §4.6.1 forbids ("the server MUST NOT reduce limits") and the
+    /// caller turns into a connection error: data already queued or sent
+    /// could otherwise sit outside the window the server will honour.
+    ///
+    /// Per-stream limits already handed to open streams are raised in place;
+    /// streams opened later read the new values directly.
+    pub(crate) fn adopt_peer_limits(&mut self, peer: &TransportParameters) -> bool {
+        let new_conn_max = peer.initial_max_data.unwrap_or(0);
+        let new_bidi = peer.initial_max_streams_bidi.unwrap_or(0);
+        let new_uni = peer.initial_max_streams_uni.unwrap_or(0);
+        let new_sd_bidi_local = peer.initial_max_stream_data_bidi_local.unwrap_or(0);
+        let new_sd_bidi_remote = peer.initial_max_stream_data_bidi_remote.unwrap_or(0);
+        let new_sd_uni = peer.initial_max_stream_data_uni.unwrap_or(0);
+        if new_conn_max < self.conn_send_max
+            || new_bidi < self.peer_max_bidi
+            || new_uni < self.peer_max_uni
+            || new_sd_bidi_local < self.peer_initial_max_stream_data_bidi_local
+            || new_sd_bidi_remote < self.peer_initial_max_stream_data_bidi_remote
+            || new_sd_uni < self.peer_initial_max_stream_data_uni
+        {
+            return false;
+        }
+        // Raise the per-stream allowance of streams already open under the
+        // remembered values. `peer_max_data` is the send-side credit ceiling
+        // each stream was created with.
+        for (&id, stream) in self.map.iter_mut() {
+            let Some(send) = stream.send.as_mut() else {
+                continue;
+            };
+            let raised = if id % 4 == 2 || id % 4 == 3 {
+                new_sd_uni
+            } else {
+                new_sd_bidi_remote
+            };
+            if raised > send.peer_max_data {
+                send.peer_max_data = raised;
+            }
+        }
+        self.conn_send_max = new_conn_max;
+        self.peer_max_bidi = new_bidi;
+        self.peer_max_uni = new_uni;
+        self.peer_initial_max_stream_data_bidi_local = new_sd_bidi_local;
+        self.peer_initial_max_stream_data_bidi_remote = new_sd_bidi_remote;
+        self.peer_initial_max_stream_data_uni = new_sd_uni;
+        true
+    }
+
+    /// RFC 9001 §4.6 — the server rejected our 0-RTT. Every byte we sent in
+    /// 0-RTT packets must be retransmitted at the 1-RTT level; the send-side
+    /// bookkeeping already tracks carved-but-unacked chunks, so requeueing
+    /// them is the same operation a PTO performs.
+    pub(crate) fn requeue_all_unacked(&mut self) {
+        self.on_pto();
+    }
+
     /// Iterator over IDs of streams that can accept at least one byte now.
     ///
     /// The connection-level credit is shared, so when it is exhausted this
