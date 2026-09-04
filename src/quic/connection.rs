@@ -21,8 +21,16 @@
 //! [`QuicConnection::is_closed`] turns true. [`QuicConnection::close_info`]
 //! reports why any connection ended.
 //!
-//! Deliberately out of scope: 0-RTT (we never emit it), HTTP/3, and
-//! stateless-reset emission.
+//! RFC 9000 §9 connection migration is implemented on the server side: an
+//! authenticated, highest-numbered, non-probing 1-RTT packet from a new
+//! address moves the connection there (§9.3), under path validation and the
+//! §9.3.1 amplification limit, reverting if the new path never answers.
+//! [`QuicConnection::peer_address`] is the authority on where output goes.
+//!
+//! Deliberately out of scope: 0-RTT (we never emit it), the §9.6 server
+//! preferred address, HTTP/3, and stateless-reset *emission* — a reset is by
+//! definition sent when no connection state exists, so it belongs to the
+//! router: see [`QuicServer`](crate::quic::QuicServer), which does emit them.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -190,6 +198,24 @@ pub struct QuicConfig {
     ///
     /// Ignored on the client side.
     pub reset_key: Option<[u8; 32]>,
+}
+
+/// RFC 9000 §9 — an in-progress migration to a new peer address.
+///
+/// Created when a non-probing packet arrives from an address other than the
+/// one we are sending to. Per §9.3 we switch to the new address immediately
+/// *and* validate it; if validation fails we fall back to `prev_addr`.
+pub(crate) struct PathMigration {
+    /// The address we moved away from, restored if validation fails.
+    prev_addr: SocketAddr,
+    /// The PATH_CHALLENGE payload whose echo confirms the new path.
+    challenge: [u8; 8],
+    /// Deadline for the PATH_RESPONSE (RFC 9000 §8.2.4 — at least 3x PTO).
+    deadline: Duration,
+    /// True when the two addresses differ only in port. RFC 9000 §9.4 keeps
+    /// the congestion controller and RTT estimator across such a change,
+    /// since the path itself is very likely unchanged.
+    port_only: bool,
 }
 
 /// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
@@ -405,6 +431,22 @@ pub struct QuicConnection {
     /// state. After this flips on every public API call is a no-op /
     /// short-circuit; the application drains via [`Self::is_closed`].
     pub(crate) closed: bool,
+    /// RFC 9000 §9 — set while a peer address change is being validated.
+    pub(crate) migration: Option<PathMigration>,
+    /// True while the address in `peer_addr` is known to belong to the peer:
+    /// either it is the address the handshake ran on, or a migration to it
+    /// completed path validation. Drives the §9.3.1 amplification guard.
+    pub(crate) peer_addr_validated: bool,
+    /// Source address of the datagram currently being processed, and its
+    /// length — set by `feed_datagram_from*` for the duration of the call,
+    /// exactly like `current_rx_ecn`. `None` for plain `feed_datagram`
+    /// callers, which therefore never migrate.
+    current_rx_addr: Option<SocketAddr>,
+    current_rx_len: usize,
+    /// Whether the packet currently being dispatched carried a non-probing
+    /// frame (RFC 9000 §9.1). Only a non-probing packet can move us to a new
+    /// address.
+    rx_non_probing: bool,
     /// An immediate close we initiated and must (re)transmit: the encoded
     /// CONNECTION_CLOSE and the level to send it at (RFC 9000 §10.2.1).
     /// `None` unless [`Self::close`] was called.
@@ -537,6 +579,10 @@ enum EngineSide {
 /// counts.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct PacketMeta {
+    /// True if this packet carries a PATH_CHALLENGE or PATH_RESPONSE. RFC
+    /// 9000 §8.2.1 requires the containing datagram to be expanded to at
+    /// least 1200 bytes so path validation also probes the path MTU.
+    pub(crate) has_path_frame: bool,
     /// True if any frame in this packet requires the peer to ack
     /// (RFC 9000 §13.2.1).
     pub(crate) ack_eliciting: bool,
@@ -653,6 +699,11 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            migration: None,
+            peer_addr_validated: false,
+            current_rx_addr: None,
+            current_rx_len: 0,
+            rx_non_probing: false,
             pending_close: None,
             close_deadline: None,
             draining: false,
@@ -756,6 +807,11 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            migration: None,
+            peer_addr_validated: false,
+            current_rx_addr: None,
+            current_rx_len: 0,
+            rx_non_probing: false,
             pending_close: None,
             close_deadline: None,
             draining: false,
@@ -783,6 +839,7 @@ impl QuicConnection {
     /// side; retry-token enforcement is server-only).
     pub fn set_peer_addr(&mut self, addr: SocketAddr) {
         self.peer_addr = Some(addr);
+        self.peer_addr_validated = true;
     }
 
     /// Sets the monotonic seconds counter used for retry-token
@@ -807,15 +864,18 @@ impl QuicConnection {
     /// Production servers MUST use this entrypoint (the retry-token path
     /// requires the address).
     ///
-    /// The address is only *learned* from the first datagram (or from an
-    /// explicit [`Self::set_peer_addr`] call). Datagrams are
-    /// unauthenticated at this layer and `peer_addr` feeds the
-    /// retry-token minting/validation path, so letting any inbound
-    /// datagram rewrite it would let an off-path sender redirect that
-    /// state. Connection migration is not implemented, so the address
-    /// never changes for the lifetime of the connection; datagrams from
-    /// other sources are still processed (and dropped if they fail
-    /// AEAD) but do not move the recorded address.
+    /// The address is *learned* from the first datagram (or from an explicit
+    /// [`Self::set_peer_addr`] call) and thereafter only ever changes through
+    /// the RFC 9000 §9 migration path — that is, when an authenticated 1-RTT
+    /// packet carrying a non-probing frame arrives from somewhere else, after
+    /// the handshake, with the highest packet number seen so far. Datagrams
+    /// are unauthenticated at this layer, so anything short of that (a
+    /// pre-handshake datagram, a reordered packet, one that fails AEAD) is
+    /// still processed where valid but never moves the recorded address:
+    /// otherwise an off-path sender could redirect our output, and with it the
+    /// retry-token minting/validation state, at an address of its choosing.
+    ///
+    /// Read the current value back with [`Self::peer_address`].
     /// Like [`Self::feed_datagram_from`] but carrying the datagram's IP ECN
     /// codepoint (RFC 9000 §13.4). Each packet decoded from it folds the
     /// codepoint into its packet-number space's ECN totals, which are echoed
@@ -830,10 +890,15 @@ impl QuicConnection {
     ) -> Result<(), Error> {
         if self.peer_addr.is_none() {
             self.peer_addr = Some(addr);
+            self.peer_addr_validated = true;
         }
         self.current_rx_ecn = ecn;
+        self.current_rx_addr = Some(addr);
+        self.current_rx_len = datagram.len();
         let result = self.feed_datagram(datagram);
         self.current_rx_ecn = EcnCodepoint::NotEct;
+        self.current_rx_addr = None;
+        self.current_rx_len = 0;
         result
     }
 
@@ -843,8 +908,14 @@ impl QuicConnection {
     pub fn feed_datagram_from(&mut self, addr: SocketAddr, datagram: &[u8]) -> Result<(), Error> {
         if self.peer_addr.is_none() {
             self.peer_addr = Some(addr);
+            self.peer_addr_validated = true;
         }
-        self.feed_datagram(datagram)
+        self.current_rx_addr = Some(addr);
+        self.current_rx_len = datagram.len();
+        let result = self.feed_datagram(datagram);
+        self.current_rx_addr = None;
+        self.current_rx_len = 0;
+        result
     }
 
     /// Feeds one received UDP datagram into the connection. May contain
@@ -903,6 +974,7 @@ impl QuicConnection {
         // The check runs until the peer is validated.
         if self.role == Role::Server
             && self.require_retry
+            && !self.handshake_complete
             && !self.addr_validation.validated
             && let Some(consumed) = self.maybe_emit_retry(datagram)?
         {
@@ -1220,7 +1292,27 @@ impl QuicConnection {
         }
 
         // 1-RTT packet: ACK + stream / DATAGRAM / path / CID frames.
-        if let Some(pkt) = self.build_packet_at(Level::OneRtt) {
+        //
+        // RFC 9000 §8.2.1: a datagram carrying PATH_CHALLENGE (or, per
+        // §8.2.2, PATH_RESPONSE) MUST be expanded to at least 1200 bytes, so
+        // that path validation also confirms the path carries a full-size
+        // QUIC datagram. §8.2.1 exempts an endpoint that would thereby exceed
+        // its anti-amplification limit, which is exactly the server's state
+        // on a freshly-migrated, not-yet-validated path — so we only ask for
+        // the expansion when the budget can cover it.
+        let path_frame_pending =
+            self.path.has_pending_response() || self.path.has_pending_challenge();
+        let onertt_pad = if path_frame_pending
+            && (self.role != Role::Server
+                || self
+                    .addr_validation
+                    .can_send(1200 - datagram.len().min(1200)))
+        {
+            Some((1200usize, datagram.len()))
+        } else {
+            None
+        };
+        if let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad) {
             datagram.extend_from_slice(&pkt);
         }
 
@@ -1320,7 +1412,7 @@ impl QuicConnection {
             {
                 return true;
             }
-            if self.path.has_pending_response() {
+            if self.path.has_pending_response() || self.path.has_pending_challenge() {
                 return true;
             }
             if let Some(pool) = self.cid_remote.as_ref()
@@ -1478,7 +1570,13 @@ impl QuicConnection {
             return Some(deadline);
         }
         let pto = self.endpoint.loss.next_deadline(Duration::ZERO);
-        match (pto, self.idle_deadline()) {
+        let base = match (pto, self.idle_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
+        // RFC 9000 §8.2.4 — a migration under validation has its own deadline.
+        match (base, self.migration.as_ref().map(|m| m.deadline)) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (Some(a), None) => Some(a),
             (None, b) => b,
@@ -1533,6 +1631,19 @@ impl QuicConnection {
                 frame_type: None,
                 reason: String::new(),
             });
+        }
+
+        // RFC 9000 §9.3 / §8.2.4 — a migration whose PATH_CHALLENGE went
+        // unanswered falls back to the address that was working. The challenge
+        // is re-sent once, halfway to the deadline, in case it was simply lost.
+        if let Some(m) = self.migration.as_ref() {
+            let deadline = m.deadline;
+            let challenge = m.challenge;
+            if now_since_start >= deadline {
+                self.abandon_migration();
+            } else if self.path.has_outstanding() && !self.path.has_pending_challenge() {
+                self.path.requeue_challenge(challenge);
+            }
         }
 
         // RFC 9000 §10.2 — the closing / draining period lasts three times the
@@ -1652,6 +1763,190 @@ impl QuicConnection {
     pub fn send_capacity(&self, id: StreamId) -> Result<usize, Error> {
         let s = self.streams.as_ref().ok_or(Error::InappropriateState)?;
         s.send_capacity(id)
+    }
+
+    // ============================================================
+    // Connection migration (RFC 9000 §9)
+    // ============================================================
+
+    /// The address this connection is currently sending to. `None` until it
+    /// has been set by [`Self::set_peer_addr`] or learned from the first
+    /// datagram fed through [`Self::feed_datagram_from`].
+    ///
+    /// A [`QuicServer`](crate::quic::QuicServer) reads this after every
+    /// `feed` so its routing table follows an RFC 9000 §9 migration — the
+    /// engine, not the datagram's source address, is the authority on where
+    /// replies go.
+    pub fn peer_address(&self) -> Option<SocketAddr> {
+        self.peer_addr
+    }
+
+    /// True while a peer address change is being validated: we are already
+    /// sending to the new address (RFC 9000 §9.3) but have not yet seen the
+    /// PATH_RESPONSE that proves the peer owns it, so the §9.3.1
+    /// anti-amplification limit applies and the old address is still the
+    /// fallback.
+    pub fn is_migrating(&self) -> bool {
+        self.migration.is_some()
+    }
+
+    /// RFC 9000 §9.3 — decide whether the just-authenticated 1-RTT packet
+    /// means the peer moved.
+    ///
+    /// `pn` is the packet's number and `largest_rx_before` the application
+    /// space's high-water mark *excluding* it, so a reordered old packet
+    /// arriving from a stale address cannot drag us backwards (§9.3, and the
+    /// off-path forwarding attack of §9.3.3).
+    fn maybe_migrate(&mut self, pn: u64, largest_rx_before: Option<u64>) {
+        let Some(from) = self.current_rx_addr else {
+            // A plain `feed_datagram` caller gave us no address to act on.
+            return;
+        };
+        let Some(current) = self.peer_addr else {
+            self.peer_addr = Some(from);
+            self.peer_addr_validated = true;
+            return;
+        };
+        if from == current {
+            // Back on the address we are already using: if this was the
+            // fallback during a failed migration, the migration is moot.
+            return;
+        }
+        // §9: a client never follows a moving server. It sends to the address
+        // the application configured; the server's `preferred_address`
+        // transport parameter is the only sanctioned way for that to change,
+        // and we do not act on it.
+        if self.role != Role::Server {
+            return;
+        }
+        // §9: migration is forbidden before the handshake is confirmed. Until
+        // then a source-address change is either a spoof or a client bug.
+        if !self.handshake_complete {
+            return;
+        }
+        // A closing or draining connection has nothing left to move.
+        if self.closed || self.draining || self.pending_close.is_some() {
+            return;
+        }
+        // §9.1: a packet of purely probing frames says nothing about where
+        // the peer wants its traffic delivered.
+        if !self.rx_non_probing {
+            return;
+        }
+        // §9.3: only the highest-numbered non-probing packet moves us.
+        if largest_rx_before.is_some_and(|l| pn <= l) {
+            return;
+        }
+        // §18.2 `disable_active_migration`: we told the peer we would not
+        // follow it off the handshake address. Keep processing the packet —
+        // it authenticated, so its frames are genuine — but leave the send
+        // address alone.
+        if self.our_params.disable_active_migration {
+            return;
+        }
+        // Don't stack migrations: a second address change while the first is
+        // still unvalidated would lose the original fallback.
+        if self.migration.is_some() {
+            return;
+        }
+
+        // §9.3: start sending to the new address immediately, and validate it.
+        let port_only = from.ip() == current.ip();
+        let now = self.now_since_start();
+        let challenge = self.path.issue(&mut OsRng, now);
+        // §8.2.4: give the response at least three PTOs, with a floor so a
+        // connection whose RTT estimate is still tiny doesn't give up early.
+        let timeout = self
+            .endpoint
+            .loss
+            .pto_period()
+            .saturating_mul(3)
+            .max(Duration::from_millis(200));
+        self.migration = Some(PathMigration {
+            prev_addr: current,
+            challenge,
+            deadline: now.saturating_add(timeout),
+            port_only,
+        });
+        self.peer_addr = Some(from);
+        self.peer_addr_validated = false;
+        // §9.3.1: the new address is unvalidated, so the 3x anti-amplification
+        // budget of §8.1 applies again — an attacker who spoofs a victim's
+        // address must not be able to aim a flood at it. Credit the datagram
+        // that triggered the migration.
+        self.addr_validation = AddressValidation {
+            bytes_recv: self.current_rx_len as u64,
+            bytes_sent: 0,
+            validated: false,
+        };
+        // §9.5: a connection ID must not be reused across peer addresses, or
+        // an observer could link the two paths to one connection. Retire the
+        // one we were using and switch to a spare if the peer gave us any.
+        self.rotate_cid_for_new_path();
+    }
+
+    /// RFC 9000 §9.5 — move to an unused Destination Connection ID for the
+    /// new path, retiring the one the old path used. No-op when the peer has
+    /// not issued a spare, in which case §9.5 permits continuing with the
+    /// current CID.
+    fn rotate_cid_for_new_path(&mut self) {
+        let Some(pool) = self.cid_remote.as_mut() else {
+            return;
+        };
+        let current = self.endpoint.cids.peer;
+        let Some((seq, next)) = pool
+            .entries
+            .iter()
+            .filter(|(_, e)| e.cid != current)
+            .map(|(&seq, e)| (seq, e.cid))
+            .min_by_key(|(seq, _)| *seq)
+        else {
+            return;
+        };
+        self.endpoint.cids.peer = next;
+        // Retire the CID the old path was using, so the peer can drop it.
+        if let Some((old_seq, _)) = pool
+            .entries
+            .iter()
+            .find(|(_, e)| e.cid == current)
+            .map(|(&s, e)| (s, e.cid))
+        {
+            pool.entries.remove(&old_seq);
+            if !pool.pending_retire.contains(&old_seq) {
+                pool.pending_retire.push(old_seq);
+            }
+        }
+        let _ = seq;
+    }
+
+    /// RFC 9000 §9.3 / §9.4 — the peer echoed the challenge we sent on the
+    /// new path, so it really is reachable there.
+    fn on_migration_validated(&mut self) {
+        let Some(m) = self.migration.take() else {
+            return;
+        };
+        self.peer_addr_validated = true;
+        // The peer has proven it receives at this address; §8.1's
+        // amplification limit no longer applies to it.
+        self.addr_validation.validated = true;
+        // §9.4: the new path's capacity and RTT are unknown, so the estimates
+        // built on the old path MUST be discarded — unless only the port
+        // changed, which almost always means the same path through a NAT.
+        if !m.port_only {
+            self.endpoint.cc.reset();
+            self.endpoint.loss.reset_rtt();
+        }
+    }
+
+    /// RFC 9000 §9.3 — path validation for a migration timed out. The new
+    /// address is not usable, so fall back to the one that was working.
+    fn abandon_migration(&mut self) {
+        let Some(m) = self.migration.take() else {
+            return;
+        };
+        self.peer_addr = Some(m.prev_addr);
+        self.peer_addr_validated = true;
+        self.addr_validation.validated = true;
     }
 
     // ============================================================
@@ -1870,8 +2165,12 @@ impl QuicConnection {
 
     /// Queues an outbound PATH_CHALLENGE (RFC 9000 §8.2). The peer will
     /// echo the 8-byte challenge in a PATH_RESPONSE; matching it via
-    /// the `PathChallengeState` confirms path reachability. Phase 7
-    /// ships only the frame round-trip; path migration itself is Phase 8+.
+    /// the `PathChallengeState` confirms path reachability.
+    ///
+    /// The frame goes out on the next [`Self::pop_datagram`], in a datagram
+    /// expanded to 1200 bytes per RFC 9000 §8.2.1. A matching PATH_RESPONSE
+    /// clears it; [`Self::on_timeout`] ages out challenges the peer never
+    /// answered.
     ///
     /// Returns [`Error::InappropriateState`] if the handshake isn't
     /// complete yet (PATH_CHALLENGE is only valid at the 1-RTT level
@@ -2831,8 +3130,12 @@ impl QuicConnection {
         {
             return true;
         }
-        // Phase 7 — path validation + CID housekeeping.
-        if self.path.has_pending_response() {
+        // Phase 7 — path validation + CID housekeeping. Both directions
+        // count: without the challenge here, `pop_datagram`'s
+        // post-handshake short-circuit would swallow every PATH_CHALLENGE
+        // this endpoint issues (`send_path_challenge`, and the §9.3
+        // migration probe).
+        if self.path.has_pending_response() || self.path.has_pending_challenge() {
             return true;
         }
         if let Some(pool) = self.cid_remote.as_ref()
@@ -3425,6 +3728,10 @@ impl QuicConnection {
 
         let cleartext: Vec<u8> = payload.to_vec();
         self.dispatch_frames(Level::OneRtt, pn, &cleartext)?;
+        // RFC 9000 §9.3 — the packet authenticated, so its source address is
+        // now trustworthy enough to act on. `largest_rx` was read before
+        // dispatch, so it is the high-water mark *excluding* this packet.
+        self.maybe_migrate(pn, largest_rx);
         // G-4: a non-VN packet from the peer has been successfully
         // processed — any future VN packet on this connection MUST be
         // discarded (RFC 9000 §6.2).
@@ -3437,10 +3744,23 @@ impl QuicConnection {
     fn dispatch_frames(&mut self, level: Level, pn: u64, payload: &[u8]) -> Result<(), Error> {
         let mut ack_eliciting = false;
         let mut frames_decoded: usize = 0;
+        // RFC 9000 §9.1 — PATH_CHALLENGE, PATH_RESPONSE, NEW_CONNECTION_ID and
+        // PADDING are *probing* frames; a packet built only from those does not
+        // signal that the peer has migrated. Reset per packet.
+        self.rx_non_probing = false;
         let it = FrameIter::new(payload);
         for frame in it {
             let frame = frame?;
             frames_decoded += 1;
+            if !matches!(
+                frame,
+                Frame::Padding(_)
+                    | Frame::PathChallenge(_)
+                    | Frame::PathResponse(_)
+                    | Frame::NewConnectionId { .. }
+            ) {
+                self.rx_non_probing = true;
+            }
             // RFC 9000 §12.4 Table 3 — many frame types are illegal at
             // certain encryption levels. Reject them as PROTOCOL_VIOLATION
             // (mapped here to IllegalParameter, which the close path
@@ -3759,7 +4079,20 @@ impl QuicConnection {
                     // outstanding PATH_CHALLENGE validates the path. An
                     // unmatched response is dropped silently.
                     ack_eliciting = true;
-                    let _matched = self.path.on_response(data);
+                    let matched = self.path.on_response(data);
+                    // §9.3: when the echoed value is the one we sent to probe
+                    // a migration, the peer has proven it owns the new
+                    // address. §8.2.3 also requires the response to arrive on
+                    // the path the challenge went out on, which here means the
+                    // address we migrated to.
+                    if matched
+                        && self.migration.as_ref().is_some_and(|m| m.challenge == data)
+                        && self
+                            .current_rx_addr
+                            .is_none_or(|a| Some(a) == self.peer_addr)
+                    {
+                        self.on_migration_validated();
+                    }
                 }
                 Frame::NewConnectionId {
                     seq,
@@ -4002,6 +4335,7 @@ impl QuicConnection {
                 .unwrap_or(false);
         let has_path_or_cid = matches!(level, Level::OneRtt)
             && (self.path.has_pending_response()
+                || self.path.has_pending_challenge()
                 || self
                     .cid_remote
                     .as_ref()
@@ -4116,6 +4450,7 @@ impl QuicConnection {
             //   + 16 (AEAD tag)
             let scid_len = self.endpoint.cids.local.len();
             let dcid_len = self.endpoint.cids.peer.len();
+
             // Token field (Initial only). After a Retry the client
             // re-sends with the server-minted token; before Retry the
             // token field is empty (1-byte varint = 0).
@@ -4140,15 +4475,22 @@ impl QuicConnection {
             // are about to commit to. We do a single iteration: assume 2
             // bytes; that decision holds for any payload up to ~16 KiB.
             let length_field_bytes = 2;
-            let header_overhead = 1
-                + 4
-                + 1
-                + dcid_len
-                + 1
-                + scid_len
-                + token_len_varint_bytes
-                + token_len
-                + length_field_bytes;
+            // A 1-RTT packet uses the short header (RFC 9000 §17.3): first
+            // byte + DCID + PN, with no version, SCID, token, or Length
+            // field. Getting this wrong under-pads the datagram, which
+            // matters for the §8.2.1 PATH_CHALLENGE expansion.
+            let header_overhead = if matches!(level, Level::OneRtt) {
+                1 + dcid_len
+            } else {
+                1 + 4
+                    + 1
+                    + dcid_len
+                    + 1
+                    + scid_len
+                    + token_len_varint_bytes
+                    + token_len
+                    + length_field_bytes
+            };
             let pn_and_tag = pn_len as usize + 16;
             let needed_pkt_len = target_total.saturating_sub(already_in_datagram);
             let payload_needed = needed_pkt_len.saturating_sub(header_overhead + pn_and_tag);
@@ -4394,6 +4736,19 @@ impl QuicConnection {
                 Frame::PathResponse(data).encode(&mut out);
                 meta.ack_eliciting = true;
                 meta.in_flight = true;
+                meta.has_path_frame = true;
+                if out.len() > 900 {
+                    break;
+                }
+            }
+            // PATH_CHALLENGE (RFC 9000 §8.2.1): challenges this endpoint has
+            // issued — either explicitly via `send_path_challenge` or by the
+            // §9.3 migration path — and not yet put on the wire.
+            while let Some(data) = self.path.pop_outbound_challenge() {
+                Frame::PathChallenge(data).encode(&mut out);
+                meta.ack_eliciting = true;
+                meta.in_flight = true;
+                meta.has_path_frame = true;
                 if out.len() > 900 {
                     break;
                 }
@@ -5428,6 +5783,305 @@ mod tests {
             c.feed_datagram(&dg).expect("client feed");
         }
         any
+    }
+
+    // ============================================================
+    // RFC 9000 §9 — connection migration
+    // ============================================================
+
+    /// Drives the handshake with the server fed through `addr`, leaving both
+    /// sides complete and the server's `peer_addr` set to it.
+    fn migration_pair(addr: SocketAddr) -> (QuicConnection, QuicConnection) {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        for _ in 0..8 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        assert_eq!(s.peer_address(), Some(addr));
+        (c, s)
+    }
+
+    /// Pumps both directions until neither has anything left to send, so a
+    /// subsequently-built datagram carries only what the test puts in it.
+    fn quiesce(c: &mut QuicConnection, s: &mut QuicConnection, addr: SocketAddr) {
+        for _ in 0..16 {
+            let mut moved = false;
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                moved = true;
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                moved = true;
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            if !moved {
+                return;
+            }
+        }
+    }
+
+    fn ip4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
+        use std::net::{IpAddr, Ipv4Addr};
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), port)
+    }
+
+    /// RFC 9000 §9.3: an authenticated, highest-numbered, non-probing packet
+    /// from a new address migrates the connection — output switches there at
+    /// once, a PATH_CHALLENGE probes it, and the peer's echo validates it.
+    /// §9.4: the congestion controller and RTT estimator reset on a genuine
+    /// path change.
+    #[test]
+    fn migration_follows_peer_and_validates_the_new_path() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+
+        // Seed state the §9.4 reset must clear. `min_rtt` goes *below* any
+        // sample a loopback exchange can produce, so a later genuine sample
+        // cannot lower it further — only the reset can move it.
+        s.endpoint.loss.min_rtt = Duration::from_nanos(1);
+        s.endpoint.cc.cwnd = 999_999;
+
+        // Client sends real stream data; deliver it from the new address.
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"after the move").expect("write");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram_from(new_addr, &dg).expect("server feed");
+
+        assert_eq!(
+            s.peer_address(),
+            Some(new_addr),
+            "§9.3: start sending to the new address immediately"
+        );
+        assert!(s.is_migrating(), "§9.3: and validate it");
+        assert!(!s.peer_addr_validated);
+        // The stream data was still processed — migration is not a drop.
+        assert!(s.readable_streams().any(|r| r == id));
+
+        // The probe goes out. §8.2.1 wants probing datagrams expanded to 1200
+        // bytes, but exempts an endpoint that would thereby exceed its
+        // anti-amplification limit — which is exactly where §9.3.1 has just
+        // put us, so the probe stays inside 3x what the migration packet
+        // carried. (`client_pads_path_challenge_datagram` covers the
+        // expansion itself, on the side that has no such limit.)
+        let probe = s.pop_datagram();
+        assert!(!probe.is_empty(), "a PATH_CHALLENGE must be emitted");
+        assert!(
+            probe.len() <= 3 * dg.len(),
+            "§9.3.1: the unvalidated path is amplification-limited"
+        );
+
+        // The client answers it. Its reply validates the new path.
+        c.feed_datagram(&probe).expect("client feed probe");
+        let response = c.pop_datagram();
+        assert!(!response.is_empty());
+        s.feed_datagram_from(new_addr, &response)
+            .expect("server feed response");
+
+        assert!(!s.is_migrating(), "PATH_RESPONSE completes the migration");
+        assert!(s.peer_addr_validated);
+        assert_eq!(s.peer_address(), Some(new_addr));
+        // §9.4 — estimates from the old path are gone. `min_rtt` was seeded
+        // below anything a fresh sample can produce, so its only way back up
+        // is through the reset.
+        assert!(
+            s.endpoint.loss.min_rtt > Duration::from_nanos(1),
+            "§9.4: min_rtt from the old path must be discarded"
+        );
+        assert!(
+            s.endpoint.cc.cwnd < 999_999,
+            "§9.4: the congestion window returns to its initial value"
+        );
+    }
+
+    /// RFC 9000 §8.2.1 — a datagram carrying a PATH_CHALLENGE is expanded to
+    /// 1200 bytes so validation also proves the path carries a full-size
+    /// datagram. Checked on the client, which is never
+    /// amplification-limited.
+    #[test]
+    fn client_pads_path_challenge_datagram() {
+        let (mut c, mut s) = migration_pair(ip4(192, 0, 2, 1, 1111));
+        quiesce(&mut c, &mut s, ip4(192, 0, 2, 1, 1111));
+        c.send_path_challenge().expect("issue challenge");
+        let probe = c.pop_datagram();
+        assert_eq!(probe.len(), 1200, "§8.2.1: expand the probing datagram");
+    }
+
+    /// RFC 9000 §9.4: a change of port alone (the classic NAT rebinding)
+    /// still migrates and still validates, but keeps the congestion and RTT
+    /// state — the underlying path is almost certainly the same one.
+    #[test]
+    fn migration_port_only_keeps_congestion_state() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(192, 0, 2, 1, 5555);
+        let (mut c, mut s) = migration_pair(old_addr);
+        s.endpoint.loss.min_rtt = Duration::from_nanos(1);
+        s.endpoint.cc.cwnd = 999_999;
+
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"rebound").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram_from(new_addr, &dg).expect("server feed");
+        assert_eq!(s.peer_address(), Some(new_addr));
+
+        let probe = s.pop_datagram();
+        c.feed_datagram(&probe).expect("client feed");
+        let response = c.pop_datagram();
+        s.feed_datagram_from(new_addr, &response).expect("feed");
+
+        assert!(!s.is_migrating());
+        assert_eq!(
+            s.endpoint.loss.min_rtt,
+            Duration::from_nanos(1),
+            "§9.4: a port-only change keeps the RTT estimate"
+        );
+        assert!(s.endpoint.cc.cwnd >= 999_999, "and the congestion window");
+    }
+
+    /// RFC 9000 §9.3 — if the new path never answers the PATH_CHALLENGE, the
+    /// connection falls back to the address that was working (§8.2.4 gives
+    /// the response at least three PTOs).
+    #[test]
+    fn migration_reverts_when_path_validation_times_out() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"maybe moved").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram_from(new_addr, &dg).expect("server feed");
+        assert_eq!(s.peer_address(), Some(new_addr));
+        assert!(s.is_migrating());
+        // The migration deadline is what the engine now wants to be woken for.
+        assert!(s.next_timeout().is_some());
+
+        // Nobody answers.
+        s.on_timeout(Duration::from_secs(3600));
+        assert!(!s.is_migrating());
+        assert_eq!(
+            s.peer_address(),
+            Some(old_addr),
+            "§9.3: an unvalidated path is abandoned for the previous one"
+        );
+    }
+
+    /// RFC 9000 §9.1 — a packet built only from probing frames says nothing
+    /// about where the peer wants its traffic, so it must not migrate us.
+    /// §9.3 — nor may a *reordered* packet: only the highest-numbered
+    /// non-probing packet moves the address (the §9.3.3 off-path forwarding
+    /// defence).
+    #[test]
+    fn migration_ignores_probing_and_reordered_packets() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+
+        // Drain both sides so the client's next datagram carries nothing but
+        // the challenge: RFC 9000 §9.1 counts ACK as a *non*-probing frame,
+        // so a piggybacked ACK would legitimately migrate us.
+        quiesce(&mut c, &mut s, old_addr);
+        // A pure PATH_CHALLENGE packet from elsewhere: answered, not followed.
+        c.send_path_challenge().expect("issue challenge");
+        let probe = c.pop_datagram();
+        assert!(!probe.is_empty());
+        s.feed_datagram_from(new_addr, &probe).expect("server feed");
+        assert_eq!(
+            s.peer_address(),
+            Some(old_addr),
+            "§9.1: a probing-only packet must not migrate"
+        );
+        assert!(!s.is_migrating());
+
+        // Now a reordered non-probing packet. Capture an early one, deliver a
+        // later one first, then replay the early one from the new address.
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"first").expect("write");
+        let early = c.pop_datagram();
+        assert!(!early.is_empty());
+        c.write(id, b"second").expect("write");
+        let later = c.pop_datagram();
+        assert!(!later.is_empty());
+
+        s.feed_datagram_from(old_addr, &later).expect("feed later");
+        let _ = s.feed_datagram_from(new_addr, &early);
+        assert_eq!(
+            s.peer_address(),
+            Some(old_addr),
+            "§9.3: only the highest-numbered non-probing packet migrates"
+        );
+        assert!(!s.is_migrating());
+    }
+
+    /// RFC 9000 §18.2 — a server that advertised `disable_active_migration`
+    /// keeps processing the peer's packets (they authenticated) but never
+    /// follows it off the handshake address.
+    #[test]
+    fn migration_refused_when_disable_active_migration_advertised() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+        s.our_params.disable_active_migration = true;
+
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"payload").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram_from(new_addr, &dg).expect("server feed");
+
+        assert_eq!(
+            s.peer_address(),
+            Some(old_addr),
+            "we said we would not move"
+        );
+        assert!(!s.is_migrating());
+        assert!(
+            s.readable_streams().any(|r| r == id),
+            "the packet is still processed — only the address is pinned"
+        );
+    }
+
+    /// A client never follows a moving server (RFC 9000 §9 leaves that to the
+    /// `preferred_address` transport parameter, which we do not act on).
+    #[test]
+    fn migration_client_does_not_follow_the_server() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let (mut c, mut s) = migration_pair(old_addr);
+        let server_addr = ip4(203, 0, 113, 5, 443);
+        c.set_peer_addr(server_addr);
+
+        let sid = s.open_uni().expect("open uni");
+        s.write(sid, b"from elsewhere").expect("write");
+        let dg = s.pop_datagram();
+        assert!(!dg.is_empty());
+        c.feed_datagram_from(ip4(203, 0, 113, 99, 443), &dg)
+            .expect("client feed");
+        assert_eq!(c.peer_address(), Some(server_addr));
+        assert!(!c.is_migrating());
     }
 
     // ============================================================
@@ -7369,10 +8023,12 @@ mod tests {
         );
     }
 
-    /// A4 — `peer_addr` is learned from the FIRST datagram only.
-    /// Datagrams are unauthenticated when the address is recorded, and
-    /// `peer_addr` feeds retry-token minting/validation, so a later
-    /// datagram claiming a different source must not rewrite it.
+    /// A4 — an *unauthenticated* datagram never moves `peer_addr`.
+    /// Datagrams are unauthenticated when the address is first recorded, and
+    /// `peer_addr` feeds retry-token minting/validation as well as deciding
+    /// where our output goes, so garbage claiming a different source must not
+    /// rewrite it. (An authenticated packet may — that is RFC 9000 §9
+    /// migration, covered by `migration_*` below.)
     #[test]
     fn peer_addr_not_overwritten_by_later_datagrams() {
         use std::net::{IpAddr, Ipv4Addr};
@@ -7407,17 +8063,20 @@ mod tests {
             Some(addr_a),
             "unauthenticated datagram must not rewrite peer_addr"
         );
-        // ...nor a genuine packet replayed from a different source.
+        // ...nor a truncated / corrupted one that fails AEAD.
         let cid = c.open_bidi().expect("open");
         c.write(cid, b"hello").expect("write");
-        let dg = c.pop_datagram();
+        let mut dg = c.pop_datagram();
         assert!(!dg.is_empty());
-        s.feed_datagram_from(addr_b, &dg).expect("server feed");
+        let last = dg.len() - 1;
+        dg[last] ^= 0xff; // break the auth tag
+        let _ = s.feed_datagram_from(addr_b, &dg);
         assert_eq!(
             s.peer_addr,
             Some(addr_a),
-            "valid packet from a new source must not move peer_addr (no migration)"
+            "packet that fails AEAD must not move peer_addr"
         );
+        assert!(!s.is_migrating());
     }
 
     /// Test — a datagram whose last 16 bytes are random (not a known

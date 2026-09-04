@@ -66,6 +66,16 @@ impl NewReno {
         }
     }
 
+    /// RFC 9000 §9.4 — reset to the initial window after confirming a peer's
+    /// migration to a new path. The old path's capacity estimate says nothing
+    /// about the new one, and `bytes_in_flight` is deliberately preserved:
+    /// those packets are still on the wire and will still be acked or lost.
+    pub(crate) fn reset(&mut self) {
+        self.cwnd = K_INITIAL_WINDOW_PACKETS * self.max_datagram_size;
+        self.ssthresh = u64::MAX;
+        self.recovery_start_time = None;
+    }
+
     /// RFC 9002 Appendix B — `OnPacketSentCC`. Bumps `bytes_in_flight`.
     pub(crate) fn on_packet_sent(&mut self, bytes: u64) {
         self.bytes_in_flight = self.bytes_in_flight.saturating_add(bytes);

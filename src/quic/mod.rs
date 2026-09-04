@@ -13,10 +13,12 @@
 //! per-level CRYPTO reassembly, ACK emission, RFC 9002 loss recovery with
 //! NewReno congestion control, streams with flow control, Retry + address
 //! validation, connection-ID rotation, key update, and RFC 9221 unreliable
-//! DATAGRAMs, the RFC 9000 §10.1 idle timeout, and the §10.2 immediate
-//! close (application CONNECTION_CLOSE with the closing / draining states).
-//! Out of scope: 0-RTT emission, connection migration, HTTP/3, and
-//! stateless-reset emission.
+//! DATAGRAMs, the RFC 9000 §10.1 idle timeout, the §10.2 immediate close
+//! (application CONNECTION_CLOSE with the closing / draining states), and
+//! §9 connection migration. [`QuicServer`] additionally emits §10.3
+//! stateless resets for datagrams whose Connection ID it has no state for.
+//! Out of scope: 0-RTT emission, the §9.6 server preferred address, and
+//! HTTP/3.
 
 // QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
 // client, with several follow-ups still open (see the project notes). A

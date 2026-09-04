@@ -7,11 +7,13 @@
 //! could read and respond to the challenge at the address the local
 //! endpoint sent it to.
 //!
-//! Phase 7 ships *the frame round-trip* — both sides answer
-//! PATH_CHALLENGE with PATH_RESPONSE and accept a matching PATH_RESPONSE
-//! to clear an outstanding challenge. Phase 7 does NOT ship path
-//! migration itself (detecting that the peer moved to a new address);
-//! that is a Phase 8+ concern.
+//! This module owns three queues: challenges we have issued and are waiting
+//! on (`outstanding`), challenges we have issued but not yet placed in a
+//! packet (`pending_challenge`), and challenges the peer sent us that we owe
+//! a response to (`pending_response`). `QuicConnection` drains the two
+//! pending queues into PATH_CHALLENGE / PATH_RESPONSE frames and feeds
+//! inbound frames back in. RFC 9000 §9 connection migration is driven from
+//! `QuicConnection` on top of this state machine.
 
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -31,6 +33,9 @@ pub(crate) struct PathChallengeState {
     /// Challenges we've sent: `(data, sent_at)`. The peer's PATH_RESPONSE
     /// must echo `data` byte-for-byte (RFC 9000 §8.2.2).
     outstanding: Vec<([u8; 8], Duration)>,
+    /// Challenges issued but not yet written into a packet. Drained by
+    /// `QuicConnection::assemble_payload` into PATH_CHALLENGE frames.
+    pending_challenge: Vec<[u8; 8]>,
     /// Challenges the peer sent us; we owe a PATH_RESPONSE carrying the
     /// same 8 bytes on the next outbound 1-RTT packet (RFC 9000 §8.2.2).
     pending_response: Vec<[u8; 8]>,
@@ -45,6 +50,7 @@ impl PathChallengeState {
     pub(crate) fn new() -> Self {
         Self {
             outstanding: Vec::new(),
+            pending_challenge: Vec::new(),
             pending_response: Vec::new(),
         }
     }
@@ -63,7 +69,23 @@ impl PathChallengeState {
             self.outstanding.remove(0);
         }
         self.outstanding.push((data, now));
+        if self.pending_challenge.len() >= PATH_CHALLENGE_CAP {
+            self.pending_challenge.remove(0);
+        }
+        self.pending_challenge.push(data);
         data
+    }
+
+    /// Re-queues `data` for transmission — used when a PATH_CHALLENGE is
+    /// presumed lost and the validation attempt is retried (RFC 9000 §8.2.4).
+    /// No-op if `data` is no longer outstanding (the peer already answered).
+    pub(crate) fn requeue_challenge(&mut self, data: [u8; 8]) {
+        if !self.outstanding.iter().any(|(d, _)| *d == data) {
+            return;
+        }
+        if !self.pending_challenge.contains(&data) {
+            self.pending_challenge.push(data);
+        }
     }
 
     /// Records that the peer sent us a PATH_CHALLENGE. We owe them a
@@ -93,6 +115,7 @@ impl PathChallengeState {
             .position(|(d, _)| bool::from(d.ct_eq(&data)))
         {
             self.outstanding.remove(idx);
+            self.pending_challenge.retain(|d| *d != data);
             true
         } else {
             false
@@ -110,12 +133,30 @@ impl PathChallengeState {
         }
     }
 
+    /// Pops the next PATH_CHALLENGE bytes awaiting transmission (FIFO), or
+    /// `None` if none. The caller wires them into a PATH_CHALLENGE frame.
+    pub(crate) fn pop_outbound_challenge(&mut self) -> Option<[u8; 8]> {
+        if self.pending_challenge.is_empty() {
+            None
+        } else {
+            Some(self.pending_challenge.remove(0))
+        }
+    }
+
+    /// True iff a PATH_CHALLENGE is waiting to be written into a packet.
+    pub(crate) fn has_pending_challenge(&self) -> bool {
+        !self.pending_challenge.is_empty()
+    }
+
     /// Garbage-collect outstanding challenges older than `max_age`. RFC
     /// 9000 §8.2.4 says the timer SHOULD be at least 3×PTO; the caller
     /// supplies the value.
     pub(crate) fn gc(&mut self, now: Duration, max_age: Duration) {
         self.outstanding
             .retain(|(_, t)| now.saturating_sub(*t) <= max_age);
+        let live = self.outstanding.clone();
+        self.pending_challenge
+            .retain(|d| live.iter().any(|(o, _)| o == d));
     }
 
     /// True iff there is at least one outstanding challenge awaiting a

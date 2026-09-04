@@ -475,6 +475,18 @@ impl LossState {
     /// The Initial+Handshake spaces use `max_ack_delay = 0` per §6.2.1;
     /// the caller decides which to use. This default returns the
     /// 1-RTT-applicable value (with `max_ack_delay`).
+    /// RFC 9000 §9.4 — discard the RTT estimate after confirming a peer's
+    /// migration to a new path, returning the estimator to the §5.3 initial
+    /// values. `min_rtt` in particular must go: it is a floor derived from a
+    /// path that is no longer in use.
+    pub(crate) fn reset_rtt(&mut self) {
+        self.latest_rtt = Duration::ZERO;
+        self.smoothed_rtt = K_INITIAL_RTT;
+        self.rttvar = K_INITIAL_RTT / 2;
+        self.min_rtt = Duration::MAX;
+        self.first_rtt_sample = None;
+    }
+
     pub(crate) fn pto_period(&self) -> Duration {
         let four_rttvar = self.rttvar.saturating_mul(4);
         let g = core::cmp::max(four_rttvar, K_GRANULARITY);

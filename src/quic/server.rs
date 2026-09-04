@@ -343,11 +343,22 @@ impl QuicServer {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2).
                 let _ = h.conn.feed_datagram_from_with_ecn(from, ecn, datagram);
-                h.addr = from;
+                // RFC 9000 §9 — the *connection* decides where replies go. It
+                // follows the peer to a new address only after an
+                // authenticated, non-probing, highest-numbered 1-RTT packet
+                // arrives from there; copying `from` here unconditionally
+                // would let anyone who can guess a Connection ID redirect our
+                // output with a single spoofed datagram, valid or not.
+                let addr = h.conn.peer_address().unwrap_or(from);
+                if addr != h.addr {
+                    self.by_addr.remove(&h.addr);
+                    h.addr = addr;
+                }
                 h.conn.local_cids()
             }
             None => return,
         };
+        self.by_addr.insert(self.conns[&id].addr, id);
         // Learn any CIDs this connection now answers to (its SCID after the
         // first Initial, plus any issued via NEW_CONNECTION_ID).
         for cid in cids {
@@ -568,6 +579,98 @@ mod server_tests {
         assert!(
             got.iter().any(|p| p == b"hello-from-client-2"),
             "client 2 payload delivered"
+        );
+    }
+
+    /// RFC 9000 §9 through the router: when a client's address changes the
+    /// server follows it — replies are addressed to the new address and the
+    /// routing table moves with them — but *only* on an authenticated
+    /// non-probing packet. A forged datagram claiming the same source must
+    /// not redirect the connection's output.
+    #[test]
+    fn router_follows_client_migration_but_not_a_forged_source() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x44; 32]);
+        let mut c = client(&cert);
+        let (a_old, a_new, a_forged, sa) = (addr(41001), addr(41002), addr(41003), addr(443));
+
+        for _ in 0..64 {
+            loop {
+                let d = c.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                srv.recv(a_old, EcnCodepoint::NotEct, &d).unwrap();
+            }
+            while let Some((to, _ecn, d)) = srv.poll_transmit() {
+                assert_eq!(to, a_old, "pre-migration replies go to the old address");
+                let _ = c.feed_datagram_from(sa, &d);
+            }
+            let server_done = srv
+                .connections_mut()
+                .next()
+                .is_some_and(|(_, conn)| conn.is_handshake_complete());
+            if c.is_handshake_complete() && server_done {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete());
+        assert!(
+            srv.connections_mut()
+                .next()
+                .is_some_and(|(_, conn)| conn.is_handshake_complete()),
+            "server handshake complete — §9 forbids migrating before that"
+        );
+
+        // A datagram carrying the connection's real CID — which any observer
+        // can read off the wire — but a payload that fails AEAD. It routes to
+        // the connection, and must not redirect it.
+        let cid = srv
+            .connections_mut()
+            .next()
+            .expect("hosted connection")
+            .1
+            .local_cids()[0];
+        let mut forged = alloc::vec![0x40u8];
+        forged.extend_from_slice(cid.as_slice());
+        forged.extend_from_slice(&[0x5a; 64]);
+        srv.recv(a_forged, EcnCodepoint::NotEct, &forged).unwrap();
+        while let Some((to, _ecn, _d)) = srv.poll_transmit() {
+            assert_ne!(
+                to, a_forged,
+                "an unauthenticated datagram must not redirect"
+            );
+        }
+        assert_eq!(
+            srv.connections_mut().next().unwrap().1.peer_address(),
+            Some(a_old),
+            "the connection stays on the address that authenticated"
+        );
+
+        // A genuine packet delivered from the new address migrates the
+        // connection; every subsequent reply is addressed there.
+        let sid = c.open_bidi().unwrap();
+        c.write(sid, b"moved").unwrap();
+        let d = c.pop_datagram();
+        assert!(!d.is_empty());
+        srv.recv(a_new, EcnCodepoint::NotEct, &d).unwrap();
+
+        let (to, _ecn, probe) = srv.poll_transmit().expect("path challenge");
+        assert_eq!(to, a_new, "§9.3: replies follow the peer immediately");
+        // Complete the validation so the connection leaves the migrating state.
+        c.feed_datagram_from(sa, &probe).unwrap();
+        loop {
+            let d = c.pop_datagram();
+            if d.is_empty() {
+                break;
+            }
+            srv.recv(a_new, EcnCodepoint::NotEct, &d).unwrap();
+        }
+        let (_, conn) = srv.connections_mut().next().expect("the hosted connection");
+        assert_eq!(conn.peer_address(), Some(a_new));
+        assert!(
+            !conn.is_migrating(),
+            "PATH_RESPONSE completed the migration"
         );
     }
 

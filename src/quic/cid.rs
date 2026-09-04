@@ -290,18 +290,26 @@ impl CidPool {
     }
 
     /// Retires the CID at `sequence`. Returns the removed entry, or
-    /// `Ok(None)` if no such sequence was present. Returns
-    /// [`Error::IllegalParameter`] if the caller is trying to retire the
-    /// CID that is currently in use (RFC 9000 §19.16: "Receipt of a
-    /// RETIRE_CONNECTION_ID frame that retires the same connection ID
-    /// the endpoint used to send the frame ... MUST be treated as a
-    /// connection error"). Phase 7 conservatively checks this whether
-    /// this side or the peer is retiring.
+    /// `Ok(None)` if no such sequence was present.
+    ///
+    /// Retiring the *active* CID is legitimate: RFC 9000 §9.5 requires an
+    /// endpoint that migrates to a new peer address to switch connection IDs
+    /// and retire the one the old path used, so the peer's
+    /// RETIRE_CONNECTION_ID names whichever of our CIDs it has just stopped
+    /// addressing us by. In that case `active_seq` rotates to the lowest
+    /// surviving entry, the same way [`Self::retire_prior_to`] handles L-2.
+    ///
+    /// Returns [`Error::IllegalParameter`] only when that would leave no
+    /// usable CID at all (RFC 9000 §19.16 makes it a connection error to
+    /// retire the connection ID the retiring packet was itself sent to,
+    /// which is the case that gets us here with nothing left to rotate to).
     pub(crate) fn retire(&mut self, sequence: u64) -> Result<Option<CidEntry>, Error> {
         if sequence == self.active_seq && self.entries.contains_key(&sequence) {
-            // Phase 7 doesn't migrate; if asked to retire the active CID
-            // we treat it as a protocol violation.
-            return Err(Error::IllegalParameter);
+            let replacement = self.entries.keys().copied().find(|&seq| seq != sequence);
+            match replacement {
+                Some(seq) => self.active_seq = seq,
+                None => return Err(Error::IllegalParameter),
+            }
         }
         Ok(self.entries.remove(&sequence))
     }
