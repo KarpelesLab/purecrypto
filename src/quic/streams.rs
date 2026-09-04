@@ -414,6 +414,53 @@ impl Streams {
         self.readable.iter().map(|&id| StreamId(id))
     }
 
+    /// Bytes a [`Self::write`] on `id` would accept right now.
+    ///
+    /// This is the exact quantity `write` computes before enqueueing: the
+    /// smaller of the connection-level credit (`max_data` minus what we have
+    /// already charged) and the stream's own remaining credit (`max_stream_data`
+    /// minus bytes stamped into frames, minus what is already buffered but not
+    /// yet framed). Zero means the next `write` returns `Ok(0)` and queues the
+    /// matching DATA_BLOCKED / STREAM_DATA_BLOCKED.
+    pub(crate) fn send_capacity(&self, id: StreamId) -> Result<usize, Error> {
+        let stream = self.map.get(&id.0).ok_or(Error::InappropriateState)?;
+        let send = stream.send.as_ref().ok_or(Error::InappropriateState)?;
+        if !matches!(send.state, SendState::Ready | SendState::Send) || send.fin_offset.is_some() {
+            return Err(Error::InappropriateState);
+        }
+        Ok(self.send_capacity_of(send))
+    }
+
+    /// Shared by [`Self::send_capacity`] and [`Self::writable_iter`]; assumes
+    /// the send state has already been checked.
+    fn send_capacity_of(&self, send: &crate::quic::stream::SendStream) -> usize {
+        let conn_room = self.conn_send_max.saturating_sub(self.conn_send_used);
+        let stream_room = send
+            .available_credit()
+            .saturating_sub(send.write_buf.len() as u64);
+        core::cmp::min(conn_room, stream_room) as usize
+    }
+
+    /// Iterator over IDs of streams that can accept at least one byte now.
+    ///
+    /// The connection-level credit is shared, so when it is exhausted this
+    /// yields nothing even if individual streams still have stream credit —
+    /// which is the truth the caller needs, since `write` would return `Ok(0)`
+    /// on every one of them.
+    pub(crate) fn writable_iter(&self) -> impl Iterator<Item = StreamId> + '_ {
+        self.map.iter().filter_map(move |(&id, stream)| {
+            let send = stream.send.as_ref()?;
+            // A finished stream keeps its `Send` state until the FIN chunk is
+            // actually carved, but the application may not write to it again.
+            if !matches!(send.state, SendState::Ready | SendState::Send)
+                || send.fin_offset.is_some()
+            {
+                return None;
+            }
+            (self.send_capacity_of(send) > 0).then_some(StreamId(id))
+        })
+    }
+
     // ====================================================================
     // Outbound side — public API plumbed through QuicConnection.
     // ====================================================================
@@ -461,7 +508,11 @@ impl Streams {
         // Verify the stream exists and we are allowed to write to it.
         let stream = self.map.get_mut(&id.0).ok_or(Error::InappropriateState)?;
         let send = stream.send.as_mut().ok_or(Error::InappropriateState)?;
-        if !matches!(send.state, SendState::Ready | SendState::Send) {
+        // RFC 9000 §3.1 — once FIN has been signalled the send side is in
+        // "Data Sent"; no further data may be queued behind the final offset.
+        // The state field only flips once the FIN chunk is carved, so the
+        // `fin_offset` check is what actually closes the window.
+        if !matches!(send.state, SendState::Ready | SendState::Send) || send.fin_offset.is_some() {
             return Err(Error::InappropriateState);
         }
         // Connection-level credit.

@@ -22,7 +22,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
-use crate::quic::{QuicConfig, QuicConnection, Role as QuicRole, StreamId, TransportParameters};
+use crate::quic::{
+    CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role as QuicRole, StreamId,
+    TransportParameters,
+};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{Config, ConfigBuilder, ProtocolVersion, RootCertStore, SigningKey};
 
@@ -812,6 +815,38 @@ pub unsafe extern "C" fn pc_quic_stream_write(
     })
 }
 
+/// Writes to `*out` the number of bytes a [`pc_quic_stream_write`] on `id`
+/// would accept right now — the smaller of the remaining connection-level and
+/// stream-level flow-control credit. `0` means the stream is blocked; poll
+/// again after a `pop_datagram` / `feed_datagram` cycle has surfaced fresh
+/// credit from the peer.
+///
+/// Returns [`PcStatus::Internal`] if `id` is unknown, has no send side, or is
+/// already finished or reset.
+///
+/// # Safety
+/// `q`, `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_stream_send_capacity(
+    q: *const PcQuic,
+    id: u64,
+    out: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if q.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let conn = &unsafe { &*q }.inner;
+        match conn.send_capacity(StreamId(id)) {
+            Ok(n) => {
+                unsafe { *out = n };
+                PcStatus::Ok
+            }
+            Err(_) => PcStatus::Internal,
+        }
+    })
+}
+
 /// Signals FIN on `id`'s send side.
 ///
 /// # Safety
@@ -1001,6 +1036,118 @@ pub unsafe extern "C" fn pc_quic_recv_datagram(
             handle.pending_recv = Some(payload);
         }
         st
+    })
+}
+
+// ---- Connection close (RFC 9000 §10.2) -----------------------------------
+
+/// Closes the connection gracefully (RFC 9000 §10.2 immediate close),
+/// queueing an application CONNECTION_CLOSE with `error_code` and the
+/// optional `reason` phrase (`reason` may be NULL when `reason_len` is 0).
+///
+/// The frame is not sent by this call: keep pumping [`pc_quic_pop_datagram`]
+/// to drain it, then keep driving [`pc_quic_on_timeout`] until
+/// [`pc_quic_is_closed`] reports `1` — the connection lingers for three PTOs
+/// so it can repeat the close to a peer that did not hear it.
+///
+/// Idempotent; a second call, or a call after the peer already closed, is a
+/// no-op.
+///
+/// # Safety
+/// `q` valid; `reason` valid for `reason_len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_close(
+    q: *mut PcQuic,
+    error_code: u64,
+    reason: *const u8,
+    reason_len: usize,
+) -> PcStatus {
+    guard(|| {
+        if q.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let r: &[u8] = if reason_len == 0 {
+            &[]
+        } else {
+            match unsafe { slice(reason, reason_len) } {
+                Some(b) => b,
+                None => return PcStatus::NullPointer,
+            }
+        };
+        let conn = &mut unsafe { &mut *q }.inner;
+        match conn.close(error_code, r) {
+            Ok(()) => PcStatus::Ok,
+            Err(_) => PcStatus::Internal,
+        }
+    })
+}
+
+/// Writes `1` to `*out` once the connection is fully closed — the closing or
+/// draining period has expired, or a stateless reset / idle timeout ended it.
+/// `pc_quic_feed_datagram` and `pc_quic_pop_datagram` are no-ops from then on.
+///
+/// # Safety
+/// `q`, `out` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_is_closed(q: *const PcQuic, out: *mut i32) -> PcStatus {
+    guard(|| {
+        if q.is_null() || out.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe { *out = i32::from((*q).inner.is_closed()) };
+        PcStatus::Ok
+    })
+}
+
+/// Reports why the connection terminated: the error code to `*code_out` and
+/// the reason phrase to `reason` / `*reason_len` (as for
+/// [`pc_quic_pop_datagram`], a too-small buffer sets `*reason_len` to the
+/// required length and returns [`PcStatus::BufferTooSmall`] without
+/// consuming anything).
+///
+/// `*initiator_out` is 0 local, 1 peer, 2 idle timeout, 3 stateless reset;
+/// `*is_app_out` is 1 for an application close (frame 0x1d), 0 for a
+/// transport close (0x1c). Returns [`PcStatus::WantRead`] while the
+/// connection is still live and has no close to report.
+///
+/// # Safety
+/// All pointers valid for their declared lengths.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_quic_close_info(
+    q: *const PcQuic,
+    code_out: *mut u64,
+    initiator_out: *mut i32,
+    is_app_out: *mut i32,
+    reason: *mut u8,
+    reason_len: *mut usize,
+) -> PcStatus {
+    guard(|| {
+        if q.is_null()
+            || code_out.is_null()
+            || initiator_out.is_null()
+            || is_app_out.is_null()
+            || reason_len.is_null()
+        {
+            return PcStatus::NullPointer;
+        }
+        let Some(info) = unsafe { &*q }.inner.close_info() else {
+            return PcStatus::WantRead;
+        };
+        let st = unsafe { out_write(info.reason.as_bytes(), reason, reason_len) };
+        if st != PcStatus::Ok {
+            return st;
+        }
+        unsafe {
+            *code_out = info.error_code;
+            *initiator_out = match info.initiator {
+                CloseInitiator::Local => 0,
+                CloseInitiator::Peer => 1,
+                CloseInitiator::IdleTimeout => 2,
+                CloseInitiator::StatelessReset => 3,
+            };
+            *is_app_out = i32::from(info.kind == CloseKind::Application);
+        }
+        PcStatus::Ok
     })
 }
 

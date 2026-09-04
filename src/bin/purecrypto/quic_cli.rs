@@ -401,6 +401,18 @@ fn run_quic_server_loop(server: &mut QuicServer, sock: &UdpSocket, www: bool, qu
             }
         }
     }
+
+    // RFC 9000 §10.2 — tell every peer we are going away with an application
+    // CONNECTION_CLOSE (NO_ERROR) rather than vanishing and leaving them to
+    // time out.
+    for (_addr, conn) in server.connections_mut() {
+        if !conn.is_closed() {
+            let _ = conn.close(0, b"");
+        }
+    }
+    while let Some((to, _ecn, dg)) = server.poll_transmit() {
+        let _ = sock.send_to(&dg, to);
+    }
 }
 
 // ====================================================================
@@ -611,6 +623,12 @@ fn drive_quic_data_client(qc: &mut QuicConnection, sock: &UdpSocket, deadline: D
         }
     }
 
+    // RFC 9000 §10.2 — leave gracefully: emit an application
+    // CONNECTION_CLOSE with NO_ERROR so the peer learns the connection ended
+    // deliberately instead of waiting out its idle timeout.
+    if !qc.is_closed() {
+        let _ = qc.close(0, b"");
+    }
     drain_outbound(qc, sock);
     let _ = stdout.flush();
 }

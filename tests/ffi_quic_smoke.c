@@ -244,7 +244,70 @@ int main(void) {
     return fail("client received wrong bytes");
   if (!c_fin_seen) return fail("client didn't see server FIN");
 
-  /* 13. Free everything in reverse order. */
+  /* 13. Writability: a fresh uni stream reports the peer's credit, drops to
+   *     zero once it is consumed, and is rejected outright after FIN. */
+  uint64_t uid = 0;
+  if (pc_quic_open_uni(client, &uid) != PC_OK)
+    return fail("pc_quic_open_uni");
+  size_t cap = 0;
+  if (pc_quic_stream_send_capacity(client, uid, &cap) != PC_OK)
+    return fail("pc_quic_stream_send_capacity");
+  if (cap == 0) return fail("fresh stream reported zero capacity");
+  uint8_t *filler = (uint8_t *)malloc(cap);
+  if (!filler) return fail("malloc filler");
+  memset(filler, 0x5a, cap);
+  size_t took = 0;
+  if (pc_quic_stream_write(client, uid, filler, cap, &took) != PC_OK)
+    return fail("pc_quic_stream_write filler");
+  free(filler);
+  if (took != cap) return fail("write accepted != send_capacity");
+  size_t cap2 = 1;
+  if (pc_quic_stream_send_capacity(client, uid, &cap2) != PC_OK)
+    return fail("pc_quic_stream_send_capacity after fill");
+  if (cap2 != 0) return fail("capacity not exhausted after filling it");
+  if (pc_quic_stream_finish(client, uid) != PC_OK)
+    return fail("pc_quic_stream_finish uni");
+  if (pc_quic_stream_send_capacity(client, uid, &cap2) == PC_OK)
+    return fail("finished stream still reports capacity");
+
+  /* 14. Graceful close (RFC 9000 §10.2): the client emits an application
+   *     CONNECTION_CLOSE; the server reports it and stops sending. */
+  int closed = -1;
+  if (pc_quic_is_closed(client, &closed) != PC_OK) return fail("pc_quic_is_closed");
+  if (closed != 0) return fail("client closed too early");
+
+  const uint8_t reason[] = "done";
+  if (pc_quic_close(client, 0x42, reason, sizeof(reason) - 1) != PC_OK)
+    return fail("pc_quic_close");
+  if (pump_all(client, server) == (size_t)-1) return fail("pump close c->s");
+
+  uint64_t code = 0;
+  int initiator = -1, is_app = -1;
+  uint8_t rbuf[64];
+  size_t rlen = sizeof(rbuf);
+  if (pc_quic_close_info(server, &code, &initiator, &is_app, rbuf, &rlen) != PC_OK)
+    return fail("pc_quic_close_info server");
+  if (code != 0x42) return fail("server saw wrong close code");
+  if (initiator != 1) return fail("server should report a peer-initiated close");
+  if (is_app != 1) return fail("server should report an application close");
+  if (rlen != sizeof(reason) - 1 || memcmp(rbuf, reason, rlen) != 0)
+    return fail("server saw wrong close reason");
+
+  /* A draining endpoint sends nothing at all (§10.2.2). */
+  size_t none = sizeof(buf);
+  if (pc_quic_pop_datagram(server, buf, &none) != PC_OK)
+    return fail("pop after close");
+  if (none != 0) return fail("draining endpoint must not send");
+
+  /* After the 3xPTO close period both sides report fully closed. */
+  pc_quic_on_timeout(server, 3600, 0);
+  pc_quic_on_timeout(client, 3600, 0);
+  if (pc_quic_is_closed(server, &closed) != PC_OK || !closed)
+    return fail("server not closed after the draining period");
+  if (pc_quic_is_closed(client, &closed) != PC_OK || !closed)
+    return fail("client not closed after the closing period");
+
+  /* 15. Free everything in reverse order. */
   pc_quic_free(client);
   pc_quic_free(server);
   pc_quic_cfg_free(ccfg);

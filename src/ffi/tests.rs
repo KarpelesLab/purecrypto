@@ -771,6 +771,92 @@ fn tls_pop_and_recv_too_small_are_non_destructive() {
     }
 }
 
+/// The C ABI close surface: `pc_quic_close` before any close is reported as
+/// `PC_WANT_READ`, then reports the local application close it queued, and
+/// `pc_quic_close_info` size-queries its reason phrase non-destructively.
+#[test]
+fn quic_close_info_reports_local_application_close() {
+    let cfg = quic::pc_quic_cfg_new(0 /* client */);
+    assert!(!cfg.is_null());
+    unsafe {
+        assert_eq!(
+            quic::pc_quic_cfg_set_verify_certificates(cfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    set_test_alpn(cfg);
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+    assert!(!q.is_null());
+
+    // Live connection: nothing to report yet.
+    let (mut code, mut initiator, mut is_app, mut rlen) = (0u64, 0i32, 0i32, 0usize);
+    let st = unsafe {
+        quic::pc_quic_close_info(
+            q,
+            &mut code,
+            &mut initiator,
+            &mut is_app,
+            core::ptr::null_mut(),
+            &mut rlen,
+        )
+    };
+    assert_eq!(st, PcStatus::WantRead);
+
+    let mut closed = -1i32;
+    assert_eq!(
+        unsafe { quic::pc_quic_is_closed(q, &mut closed) },
+        PcStatus::Ok
+    );
+    assert_eq!(closed, 0);
+
+    let reason = b"shutting down";
+    assert_eq!(
+        unsafe { quic::pc_quic_close(q, 0x1234, reason.as_ptr(), reason.len()) },
+        PcStatus::Ok
+    );
+
+    // Size query first — non-destructive, like pc_quic_pop_datagram.
+    let mut rlen = 0usize;
+    let st = unsafe {
+        quic::pc_quic_close_info(
+            q,
+            &mut code,
+            &mut initiator,
+            &mut is_app,
+            core::ptr::null_mut(),
+            &mut rlen,
+        )
+    };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(rlen, reason.len());
+
+    let mut buf = vec![0u8; rlen];
+    let mut cap = rlen;
+    let st = unsafe {
+        quic::pc_quic_close_info(
+            q,
+            &mut code,
+            &mut initiator,
+            &mut is_app,
+            buf.as_mut_ptr(),
+            &mut cap,
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(&buf[..cap], reason);
+    assert_eq!(code, 0x1234);
+    assert_eq!(initiator, 0, "locally initiated");
+    assert_eq!(is_app, 1, "application close");
+
+    unsafe { quic::pc_quic_free(q) };
+}
+
 #[test]
 fn quic_pop_datagram_too_small_is_non_destructive() {
     let cfg = quic::pc_quic_cfg_new(0 /* client */);

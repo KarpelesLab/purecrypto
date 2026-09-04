@@ -14,8 +14,15 @@
 //! [`Error::InappropriateState`] only before the handshake has progressed
 //! far enough to initialise stream state, not because they are unimplemented.
 //!
-//! Deliberately out of scope: 0-RTT (we never emit it), the idle-timeout
-//! timer (only the PTO is wired), HTTP/3, and stateless-reset emission.
+//! Graceful shutdown is the RFC 9000 §10.2 immediate close:
+//! [`QuicConnection::close`] arms a CONNECTION_CLOSE, `pop_datagram` emits
+//! it, and the connection then sits in the closing (or, when the peer
+//! closed first, draining) state for three PTOs before
+//! [`QuicConnection::is_closed`] turns true. [`QuicConnection::close_info`]
+//! reports why any connection ended.
+//!
+//! Deliberately out of scope: 0-RTT (we never emit it), HTTP/3, and
+//! stateless-reset emission.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -185,6 +192,91 @@ pub struct QuicConfig {
     pub reset_key: Option<[u8; 32]>,
 }
 
+/// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
+/// application close has to be sent in an Initial or Handshake packet, where
+/// the application close frame type (0x1d) is forbidden (§10.2.3).
+const ERROR_APPLICATION_ERROR: u64 = 0x0c;
+
+/// Cap on the reason phrase we send or retain, in bytes. RFC 9000 sets no
+/// limit; this keeps a hostile peer's reason from being retained unboundedly
+/// and keeps our own close frame comfortably inside one packet.
+const MAX_REASON_LEN: usize = 1024;
+
+/// Decodes a peer-supplied reason phrase. RFC 9000 §19.19 says it "SHOULD" be
+/// UTF-8 but does not require it, so invalid sequences become U+FFFD rather
+/// than failing the close.
+fn decode_reason(reason: &[u8]) -> String {
+    let reason = &reason[..reason.len().min(MAX_REASON_LEN)];
+    String::from_utf8_lossy(reason).into_owned()
+}
+
+/// Who terminated the connection, as reported by
+/// [`QuicConnection::close_info`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CloseInitiator {
+    /// This endpoint called [`QuicConnection::close`], or the engine
+    /// itself hit a fatal condition and emitted a CONNECTION_CLOSE.
+    Local,
+    /// The peer sent a CONNECTION_CLOSE frame.
+    Peer,
+    /// RFC 9000 §10.1 — the negotiated idle timeout elapsed. Nothing is
+    /// sent on the wire for this one.
+    IdleTimeout,
+    /// RFC 9000 §10.3 — an incoming stateless reset was detected.
+    StatelessReset,
+}
+
+/// Which CONNECTION_CLOSE frame type carried the error code
+/// (RFC 9000 §19.19).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CloseKind {
+    /// Frame type 0x1c: a QUIC transport error. `frame_type` in
+    /// [`CloseInfo`] names the frame that triggered it, when the sender
+    /// identified one.
+    Transport,
+    /// Frame type 0x1d: an application-protocol error. The error code is
+    /// defined by the application protocol (e.g. HTTP/3), not by QUIC.
+    Application,
+}
+
+/// Why the connection terminated. Returned by
+/// [`QuicConnection::close_info`] once the connection has started closing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CloseInfo {
+    /// Which side ended the connection.
+    pub initiator: CloseInitiator,
+    /// Transport (0x1c) vs application (0x1d) close. Meaningless for
+    /// [`CloseInitiator::IdleTimeout`] / [`CloseInitiator::StatelessReset`],
+    /// which report [`CloseKind::Transport`] with code 0 (NO_ERROR).
+    pub kind: CloseKind,
+    /// The error code. `0` is NO_ERROR for a transport close; for an
+    /// application close the meaning is the application protocol's.
+    pub error_code: u64,
+    /// For a transport close, the frame type that triggered it, when the
+    /// sender named one. Always `None` for an application close.
+    pub frame_type: Option<u64>,
+    /// The (possibly empty) human-readable reason phrase. Peer-supplied
+    /// bytes are UTF-8-lossy-decoded and truncated to 1024 bytes.
+    pub reason: String,
+}
+
+/// A CONNECTION_CLOSE we initiated and must (re)transmit while in the
+/// closing state (RFC 9000 §10.2.1).
+pub(crate) struct PendingClose {
+    /// The already-encoded CONNECTION_CLOSE frame.
+    frame: Vec<u8>,
+    /// The encryption level to send it at — chosen once, when
+    /// [`QuicConnection::close`] runs, per RFC 9000 §10.2.3.
+    level: Level,
+    /// Set whenever the frame should go out on the next
+    /// [`QuicConnection::pop_datagram`]: on arming, and again each time
+    /// the resend backoff fires.
+    armed: bool,
+}
+
 /// One QUIC v1 connection — either a client (sends the first Initial) or
 /// a server (responds).
 ///
@@ -313,6 +405,24 @@ pub struct QuicConnection {
     /// state. After this flips on every public API call is a no-op /
     /// short-circuit; the application drains via [`Self::is_closed`].
     pub(crate) closed: bool,
+    /// An immediate close we initiated and must (re)transmit: the encoded
+    /// CONNECTION_CLOSE and the level to send it at (RFC 9000 §10.2.1).
+    /// `None` unless [`Self::close`] was called.
+    pub(crate) pending_close: Option<PendingClose>,
+    /// Deadline (start-relative) at which a closing/draining connection stops
+    /// retaining state and becomes fully closed — 3x PTO per RFC 9000 §10.2.
+    pub(crate) close_deadline: Option<Duration>,
+    /// True once the peer's CONNECTION_CLOSE put us in the draining state
+    /// (§10.2.2): we must not send anything further, not even ACKs.
+    pub(crate) draining: bool,
+    /// Why the connection terminated, surfaced by [`Self::close_info`].
+    pub(crate) close_info: Option<CloseInfo>,
+    /// Packets received since we last repeated the close frame, and the
+    /// threshold that triggers the next repeat. RFC 9000 §10.2.1 says an
+    /// endpoint in the closing state SHOULD limit how often it regenerates the
+    /// close packet; we back off exponentially in received-packet count.
+    pub(crate) close_rx_since_send: u32,
+    pub(crate) close_resend_threshold: u32,
     /// True once we've pre-derived 1-RTT next-phase keys for the very
     /// first time. Used to defend against repeating the derivation on
     /// every drain cycle.
@@ -543,6 +653,12 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            pending_close: None,
+            close_deadline: None,
+            draining: false,
+            close_info: None,
+            close_rx_since_send: 0,
+            close_resend_threshold: 1,
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             peer_ack_params_installed: false,
@@ -640,6 +756,12 @@ impl QuicConnection {
             new_cids_issued: false,
             datagram_queues: DatagramQueues::new(None, our_dg),
             closed: false,
+            pending_close: None,
+            close_deadline: None,
+            draining: false,
+            close_info: None,
+            close_rx_since_send: 0,
+            close_resend_threshold: 1,
             one_rtt_phase_initialized: false,
             start: Instant::now(),
             peer_ack_params_installed: false,
@@ -746,6 +868,21 @@ impl QuicConnection {
         // the close even if it would have failed parsing further down.
         if self.detect_stateless_reset(datagram) {
             self.closed = true;
+            self.close_info.get_or_insert(CloseInfo {
+                initiator: CloseInitiator::StatelessReset,
+                kind: CloseKind::Transport,
+                error_code: 0,
+                frame_type: None,
+                reason: String::new(),
+            });
+            return Ok(());
+        }
+
+        // RFC 9000 §10.2 — a closing or draining connection processes no
+        // further packets. Closing repeats its CONNECTION_CLOSE on a backoff
+        // (§10.2.1); draining sends nothing at all (§10.2.2).
+        if self.pending_close.is_some() || self.draining {
+            self.note_close_state_datagram();
             return Ok(());
         }
 
@@ -784,6 +921,12 @@ impl QuicConnection {
         let udp_datagram_len = datagram.len();
         while !rest.is_empty() {
             let consumed = self.feed_one_packet(rest, udp_datagram_len)?;
+            // RFC 9000 §10.2.2 — a CONNECTION_CLOSE in one of the coalesced
+            // packets ends the connection; the packets behind it belong to
+            // state that no longer exists.
+            if self.draining {
+                break;
+            }
             if consumed == 0 {
                 // Defensive: parser couldn't make progress. RFC 9000
                 // §12.2 says to drop the trailing bytes silently rather
@@ -959,6 +1102,16 @@ impl QuicConnection {
         // Phase 8 — closed connections never emit.
         if self.closed {
             return Vec::new();
+        }
+        // RFC 9000 §10.2.2 — a draining connection MUST NOT send anything,
+        // not even an ACK.
+        if self.draining {
+            return Vec::new();
+        }
+        // RFC 9000 §10.2.1 — a closing connection sends only its
+        // CONNECTION_CLOSE, and only when the resend backoff has re-armed it.
+        if self.pending_close.is_some() {
+            return self.pop_close_datagram();
         }
         // Server-side: if a Retry packet is pending, emit it first
         // (and only it — Retry is its own datagram per RFC 9000 §17.2.5,
@@ -1318,6 +1471,12 @@ impl QuicConnection {
     /// RFC 9000 §10.1 idle-timeout deadline (both measured from connection
     /// construction). `None` if neither timer is armed.
     pub fn next_timeout(&self) -> Option<Duration> {
+        // While closing or draining the only timer that matters is the
+        // 3x-PTO close deadline (RFC 9000 §10.2); loss recovery is over and
+        // the idle timer is moot.
+        if let Some(deadline) = self.close_deadline {
+            return Some(deadline);
+        }
         let pto = self.endpoint.loss.next_deadline(Duration::ZERO);
         match (pto, self.idle_deadline()) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1363,7 +1522,28 @@ impl QuicConnection {
         // loss recovery has already had its turn by the time we get here.
         if let Some(deadline) = self.idle_deadline()
             && now_since_start >= deadline
+            && self.pending_close.is_none()
+            && !self.draining
         {
+            self.closed = true;
+            self.close_info.get_or_insert(CloseInfo {
+                initiator: CloseInitiator::IdleTimeout,
+                kind: CloseKind::Transport,
+                error_code: 0,
+                frame_type: None,
+                reason: String::new(),
+            });
+        }
+
+        // RFC 9000 §10.2 — the closing / draining period lasts three times the
+        // PTO. Once it expires the connection is fully closed and all state
+        // may be discarded.
+        if let Some(deadline) = self.close_deadline
+            && now_since_start >= deadline
+        {
+            self.pending_close = None;
+            self.close_deadline = None;
+            self.draining = false;
             self.closed = true;
         }
     }
@@ -1439,6 +1619,233 @@ impl QuicConnection {
             }
             None => alloc::vec::Vec::new().into_iter(),
         }
+    }
+
+    /// IDs of streams whose send side can accept at least one more byte
+    /// right now — i.e. a [`Self::write`] on them would return `Ok(n)` with
+    /// `n > 0`. Order is stable across calls.
+    ///
+    /// This is the writability signal that pairs with [`Self::write`]'s
+    /// partial writes: a stream that is blocked on the connection-level
+    /// MAX_DATA credit or on its own MAX_STREAM_DATA credit disappears from
+    /// this iterator and reappears once a `pop_datagram` / `feed_datagram`
+    /// cycle has surfaced fresh credit from the peer.
+    ///
+    /// Streams that are closed for sending (finished or reset) are never
+    /// listed.
+    pub fn writable_streams(&self) -> impl Iterator<Item = StreamId> + '_ {
+        match self.streams.as_ref() {
+            Some(s) => {
+                let v: alloc::vec::Vec<StreamId> = s.writable_iter().collect();
+                v.into_iter()
+            }
+            None => alloc::vec::Vec::new().into_iter(),
+        }
+    }
+
+    /// How many bytes a [`Self::write`] on `id` would accept right now —
+    /// the smaller of the remaining connection-level and stream-level flow
+    /// control credit. `0` means the stream is currently blocked.
+    ///
+    /// Returns [`Error::InappropriateState`] if `id` has no send side, is
+    /// unknown, or is already finished / reset.
+    pub fn send_capacity(&self, id: StreamId) -> Result<usize, Error> {
+        let s = self.streams.as_ref().ok_or(Error::InappropriateState)?;
+        s.send_capacity(id)
+    }
+
+    // ============================================================
+    // Connection close (RFC 9000 §10.2)
+    // ============================================================
+
+    /// Closes the connection gracefully, emitting a CONNECTION_CLOSE frame
+    /// carrying the application error code `error_code` and the (optional)
+    /// `reason` phrase.
+    ///
+    /// This is the *immediate close* of RFC 9000 §10.2. The frame is not
+    /// emitted by this call — the caller must drain it with
+    /// [`Self::pop_datagram`] and send it, exactly as for any other outbound
+    /// datagram. After that the connection enters the **closing** state: it
+    /// discards incoming packets, sends nothing but a periodic repeat of the
+    /// same CONNECTION_CLOSE (§10.2.1), and becomes fully
+    /// [`closed`](Self::is_closed) once three PTOs have elapsed — which the
+    /// host observes by driving [`Self::next_timeout`] / [`Self::on_timeout`]
+    /// as usual.
+    ///
+    /// Stream data already queued but not yet sent is discarded: an immediate
+    /// close does not flush. Call [`Self::finish`] and let `pop_datagram`
+    /// drain first if the peer must see the data.
+    ///
+    /// RFC 9000 §10.2.3 forbids the application close (frame type 0x1d) in
+    /// Initial and Handshake packets. Closing before the handshake completes
+    /// therefore sends a *transport* close (0x1c) with the
+    /// `APPLICATION_ERROR` (0x0c) code and no reason phrase, at the highest
+    /// encryption level whose keys are installed; `error_code` and `reason`
+    /// are not transmitted in that case (they still show up in the local
+    /// [`Self::close_info`]).
+    ///
+    /// Idempotent: a second call, or a call after the peer already closed, is
+    /// a no-op. `reason` is truncated to 1024 bytes.
+    pub fn close(&mut self, error_code: u64, reason: &[u8]) -> Result<(), Error> {
+        if self.closed || self.draining || self.pending_close.is_some() {
+            return Ok(());
+        }
+        let reason = &reason[..reason.len().min(MAX_REASON_LEN)];
+
+        // RFC 9000 §10.2.3 — pick the level, and with it the frame type.
+        let onertt_ready =
+            self.handshake_complete && self.endpoint.crypto.at(Level::OneRtt).tx.is_some();
+        let (level, frame) = if onertt_ready {
+            (
+                Level::OneRtt,
+                Frame::ConnectionClose {
+                    error: error_code,
+                    frame_type: None,
+                    reason,
+                },
+            )
+        } else {
+            // Highest level we hold tx keys for. An application close is not
+            // permitted there, so it becomes APPLICATION_ERROR with the reason
+            // phrase dropped (§10.2.3 explicitly warns against leaking
+            // application detail into the handshake).
+            let level = [Level::Handshake, Level::Initial]
+                .into_iter()
+                .find(|&l| self.endpoint.crypto.at(l).tx.is_some());
+            match level {
+                Some(level) => (
+                    level,
+                    Frame::ConnectionClose {
+                        error: ERROR_APPLICATION_ERROR,
+                        frame_type: Some(0),
+                        reason: &[],
+                    },
+                ),
+                // No keys at all — nothing can be sent. Close locally.
+                None => {
+                    self.closed = true;
+                    self.close_info = Some(CloseInfo {
+                        initiator: CloseInitiator::Local,
+                        kind: CloseKind::Application,
+                        error_code,
+                        frame_type: None,
+                        reason: decode_reason(reason),
+                    });
+                    return Ok(());
+                }
+            }
+        };
+
+        let mut encoded = Vec::new();
+        frame.encode(&mut encoded);
+        self.pending_close = Some(PendingClose {
+            frame: encoded,
+            level,
+            armed: true,
+        });
+        self.close_rx_since_send = 0;
+        self.close_resend_threshold = 1;
+        self.close_deadline = Some(
+            self.now_since_start()
+                .saturating_add(self.endpoint.loss.pto_period().saturating_mul(3)),
+        );
+        self.close_info = Some(CloseInfo {
+            initiator: CloseInitiator::Local,
+            kind: CloseKind::Application,
+            error_code,
+            frame_type: None,
+            reason: decode_reason(reason),
+        });
+        Ok(())
+    }
+
+    /// Why the connection terminated, or `None` while it is still live.
+    ///
+    /// Set as soon as the connection starts closing — by [`Self::close`], by
+    /// an incoming CONNECTION_CLOSE, by the idle timeout, or by a stateless
+    /// reset — and stays readable after [`Self::is_closed`] turns true.
+    pub fn close_info(&self) -> Option<&CloseInfo> {
+        self.close_info.as_ref()
+    }
+
+    /// True while this connection is in the RFC 9000 §10.2.2 *draining*
+    /// state: the peer has closed, we retain state to absorb reordered
+    /// packets, and we will never send again. Becomes
+    /// [`closed`](Self::is_closed) after three PTOs.
+    pub fn is_draining(&self) -> bool {
+        self.draining
+    }
+
+    /// True while this connection is in the RFC 9000 §10.2.1 *closing*
+    /// state: we have sent (or are about to send) a CONNECTION_CLOSE and will
+    /// emit nothing else but occasional repeats of it.
+    pub fn is_closing(&self) -> bool {
+        self.pending_close.is_some()
+    }
+
+    /// Enters the draining state with the given reason. Called when the peer
+    /// closes; also used by the internal fatal-error paths.
+    fn enter_draining(&mut self, info: CloseInfo) {
+        self.pending_close = None;
+        self.draining = true;
+        self.close_deadline = Some(
+            self.now_since_start()
+                .saturating_add(self.endpoint.loss.pto_period().saturating_mul(3)),
+        );
+        self.close_info.get_or_insert(info);
+    }
+
+    /// RFC 9000 §10.2.1 — a packet arrived while we are closing or draining.
+    /// Draining stays silent. Closing repeats the CONNECTION_CLOSE, but only
+    /// once the arrival count crosses the current threshold, which then
+    /// doubles: an endpoint SHOULD limit how often it regenerates the close
+    /// packet so a flood cannot be amplified back at the sender.
+    fn note_close_state_datagram(&mut self) {
+        if self.draining || self.pending_close.is_none() {
+            return;
+        }
+        self.close_rx_since_send = self.close_rx_since_send.saturating_add(1);
+        if self.close_rx_since_send >= self.close_resend_threshold {
+            self.close_rx_since_send = 0;
+            self.close_resend_threshold = self.close_resend_threshold.saturating_mul(2);
+            if let Some(pc) = self.pending_close.as_mut() {
+                pc.armed = true;
+            }
+        }
+    }
+
+    /// Emits the pending CONNECTION_CLOSE if it is armed, otherwise nothing.
+    fn pop_close_datagram(&mut self) -> Vec<u8> {
+        let Some(pc) = self.pending_close.as_mut() else {
+            return Vec::new();
+        };
+        if !pc.armed {
+            return Vec::new();
+        }
+        pc.armed = false;
+        let level = pc.level;
+        let payload = pc.frame.clone();
+        // RFC 9000 §14.1 — a client MUST expand every datagram carrying an
+        // Initial packet to at least 1200 bytes, close packets included;
+        // otherwise the server is required to discard it.
+        let pad = if matches!(level, Level::Initial) && self.role == Role::Client {
+            Some((1200usize, 0usize))
+        } else {
+            None
+        };
+        // RFC 9000 §10.2.1 — the close packet still counts against the
+        // server's anti-amplification budget.
+        let Some(wire) = self.seal_packet(level, payload, pad, None) else {
+            return Vec::new();
+        };
+        if self.role == Role::Server {
+            if !self.addr_validation.can_send(wire.len()) {
+                return Vec::new();
+            }
+            self.addr_validation.note_sent(wire.len());
+        }
+        self.endpoint.sent_first_datagram = true;
+        wire
     }
 
     /// Role of this endpoint.
@@ -3238,12 +3645,41 @@ impl QuicConnection {
                     // its own completion.
                     ack_eliciting = true;
                 }
-                Frame::ConnectionClose { .. } => {
-                    // Phase 4: propagate as a handshake failure. The
-                    // QUIC layer should also disable further IO; we just
-                    // mark complete to stop further packet emission.
-                    self.handshake_complete = true;
-                    self.endpoint.handshake_complete = true;
+                Frame::ConnectionClose {
+                    error,
+                    frame_type,
+                    reason,
+                } => {
+                    // RFC 9000 §10.2.2 — the peer has closed. Enter the
+                    // draining state: retain state (so late-arriving packets
+                    // are discarded rather than provoking a stateless reset)
+                    // but never send again, and surface why through
+                    // [`Self::close_info`].
+                    //
+                    // A CONNECTION_CLOSE is *not* by itself an error: a
+                    // graceful application close is the normal end of an HTTP/3
+                    // connection. Only a close that arrives before the
+                    // handshake finished is reported as an error, because the
+                    // caller's `feed_datagram` loop would otherwise spin
+                    // waiting for a handshake that can never complete.
+                    let graceful = self.handshake_complete;
+                    self.enter_draining(CloseInfo {
+                        initiator: CloseInitiator::Peer,
+                        kind: if frame_type.is_some() {
+                            CloseKind::Transport
+                        } else {
+                            CloseKind::Application
+                        },
+                        error_code: error,
+                        frame_type,
+                        reason: decode_reason(reason),
+                    });
+                    if graceful {
+                        // Stop parsing the rest of the packet — every
+                        // subsequent frame belongs to a connection that no
+                        // longer exists.
+                        return Ok(());
+                    }
                     return Err(Error::AlertReceived(
                         crate::tls::AlertDescription::HandshakeFailure,
                     ));
@@ -3612,10 +4048,32 @@ impl QuicConnection {
         // right one. Handshake-level packets use the same CID pair as
         // Initial (peer's chosen SCID we observed on the server's first
         // long-header packet).
-        let (mut payload, meta) = self.assemble_payload(level)?;
+        let (payload, meta) = self.assemble_payload(level)?;
         if payload.is_empty() {
             return None;
         }
+        self.seal_packet(level, payload, pad, Some(meta))
+    }
+
+    /// Encrypts an already-assembled plaintext `payload` into a protected
+    /// packet at `level`: allocates the packet number, applies any requested
+    /// PADDING, builds the header, seals, and applies header protection.
+    ///
+    /// `meta` carries the per-frame flags of a normally-assembled payload and
+    /// is `None` for a CONNECTION_CLOSE-only packet built by
+    /// [`Self::build_close_packet`] — such a packet is neither ack-eliciting
+    /// nor in flight (RFC 9002 §2), so it is not registered with loss recovery,
+    /// and it must not clear the space's pending-ACK state.
+    fn seal_packet(
+        &mut self,
+        level: Level,
+        payload: Vec<u8>,
+        pad: Option<(usize, usize)>,
+        meta: Option<PacketMeta>,
+    ) -> Option<Vec<u8>> {
+        let mut payload = payload;
+        // Keys must be installed for this direction.
+        self.endpoint.crypto.at(level).tx.as_ref()?;
 
         // Allocate a PN.
         let pn = {
@@ -3795,6 +4253,11 @@ impl QuicConnection {
             let lk = self.endpoint.crypto.at_mut(level);
             lk.tx_packets = lk.tx_packets.saturating_add(1);
         }
+
+        // A close-only packet carries no ACK and never enters loss recovery.
+        let Some(meta) = meta else {
+            return Some(wire);
+        };
 
         // ACK has been emitted (if it was queued) — clear the
         // ack-eliciting flag and pending list for this space.
@@ -4965,6 +5428,215 @@ mod tests {
             c.feed_datagram(&dg).expect("client feed");
         }
         any
+    }
+
+    // ============================================================
+    // RFC 9000 §10.2 — graceful close + §4.1 writability signal
+    // ============================================================
+
+    /// A client `close()` after the handshake must emit an *application*
+    /// CONNECTION_CLOSE (frame type 0x1d) at the 1-RTT level, carrying the
+    /// application error code and reason verbatim. The server that receives it
+    /// enters draining: it reports the peer's code and reason, never sends
+    /// again, and reaches `is_closed` once the 3xPTO period expires.
+    #[test]
+    fn graceful_close_application_error_reaches_peer() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+
+        c.close(0x0105, b"bye now").expect("close");
+        assert!(c.is_closing(), "close() must enter the closing state");
+        assert!(!c.is_closed(), "closing is not yet closed");
+
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty(), "close must produce a datagram");
+        // Exactly one close datagram: the resend is arrival-driven.
+        assert!(c.pop_datagram().is_empty());
+
+        s.feed_datagram(&dg).expect("server feed of close");
+        assert!(s.is_draining(), "peer close puts the receiver in draining");
+        let info = s.close_info().expect("close info");
+        assert_eq!(info.initiator, CloseInitiator::Peer);
+        assert_eq!(info.kind, CloseKind::Application);
+        assert_eq!(info.error_code, 0x0105);
+        assert_eq!(info.frame_type, None);
+        assert_eq!(info.reason, "bye now");
+
+        // §10.2.2: a draining endpoint sends nothing, not even an ACK.
+        assert!(s.pop_datagram().is_empty());
+
+        // The local side records its own close identically.
+        let own = c.close_info().expect("local close info");
+        assert_eq!(own.initiator, CloseInitiator::Local);
+        assert_eq!(own.error_code, 0x0105);
+        assert_eq!(own.reason, "bye now");
+
+        // §10.2: three PTOs later both sides are fully closed.
+        let far_future = Duration::from_secs(3600);
+        s.on_timeout(far_future);
+        assert!(s.is_closed() && !s.is_draining());
+        c.on_timeout(far_future);
+        assert!(c.is_closed() && !c.is_closing());
+    }
+
+    /// `close()` is idempotent and, once armed, suppresses all other output:
+    /// queued stream data is discarded rather than flushed.
+    #[test]
+    fn close_is_idempotent_and_suppresses_other_output() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"never sent").expect("write");
+        c.close(7, b"").expect("close");
+        c.close(9, b"second").expect("second close is a no-op");
+        assert_eq!(c.close_info().expect("info").error_code, 7);
+
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram(&dg).expect("feed");
+        // The stream data was discarded by the immediate close, so the server
+        // never sees a readable stream.
+        assert_eq!(s.readable_streams().count(), 0);
+    }
+
+    /// RFC 9000 §10.2.3 — an application close before the handshake completes
+    /// must be sent as a *transport* close (0x1c) with APPLICATION_ERROR
+    /// (0x0c) and no reason phrase, since 0x1d is forbidden in Initial and
+    /// Handshake packets. The local `close_info` still reports what the
+    /// application asked for.
+    #[test]
+    fn pre_handshake_close_downgrades_to_transport_error() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        // Emit the first Initial so the server has state, but stop there.
+        let first = c.pop_datagram();
+        assert!(!first.is_empty());
+        s.feed_datagram(&first).expect("server feed initial");
+        assert!(!c.is_handshake_complete());
+
+        c.close(0x0105, b"leaky reason").expect("close");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        // The peer sees a transport close with APPLICATION_ERROR. Before the
+        // handshake is complete the receiver also surfaces it as a fatal error
+        // so the caller's pump loop stops.
+        let err = s
+            .feed_datagram(&dg)
+            .expect_err("pre-handshake close is fatal");
+        assert!(matches!(err, Error::AlertReceived(_)), "got {err:?}");
+        let info = s.close_info().expect("close info");
+        assert_eq!(info.kind, CloseKind::Transport);
+        assert_eq!(info.error_code, ERROR_APPLICATION_ERROR);
+        assert_eq!(info.reason, "", "§10.2.3: reason must not leak");
+
+        // Locally we still remember the application's own code and reason.
+        let own = c.close_info().expect("local info");
+        assert_eq!(own.error_code, 0x0105);
+        assert_eq!(own.reason, "leaky reason");
+    }
+
+    /// RFC 9000 §10.2.1 — a closing endpoint repeats its CONNECTION_CLOSE in
+    /// response to incoming packets, but on a backoff: once after the first
+    /// arrival, then after 2 more, then 4.
+    #[test]
+    fn closing_repeats_connection_close_on_a_backoff() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+
+        // Give the server something to send at us so we have a real datagram
+        // to replay as "incoming traffic".
+        let sid = s.open_uni().expect("open uni");
+        s.write(sid, b"still talking").expect("write");
+        let noise = s.pop_datagram();
+        assert!(!noise.is_empty());
+
+        c.close(1, b"").expect("close");
+        assert!(!c.pop_datagram().is_empty(), "initial close emission");
+        assert!(c.pop_datagram().is_empty());
+
+        // Arrival #1 → re-arm (threshold was 1, now 2).
+        c.feed_datagram(&noise).expect("feed while closing");
+        assert!(!c.pop_datagram().is_empty(), "repeat after 1 packet");
+        // Arrival #2 → not yet (threshold 2).
+        c.feed_datagram(&noise).expect("feed");
+        assert!(c.pop_datagram().is_empty(), "backoff must suppress");
+        // Arrival #3 → re-arm (threshold now 4).
+        c.feed_datagram(&noise).expect("feed");
+        assert!(!c.pop_datagram().is_empty(), "repeat after 2 more packets");
+        for _ in 0..3 {
+            c.feed_datagram(&noise).expect("feed");
+            assert!(c.pop_datagram().is_empty());
+        }
+        c.feed_datagram(&noise).expect("feed");
+        assert!(!c.pop_datagram().is_empty(), "repeat after 4 more packets");
+    }
+
+    /// RFC 9000 §10.1 — an idle-timeout close is silent but still reported.
+    #[test]
+    fn idle_timeout_reports_close_info() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        c.on_timeout(Duration::from_secs(3600));
+        assert!(c.is_closed());
+        let info = c.close_info().expect("close info");
+        assert_eq!(info.initiator, CloseInitiator::IdleTimeout);
+        assert!(c.pop_datagram().is_empty(), "idle close is silent");
+    }
+
+    /// The writability signal: `send_capacity` must exactly predict what
+    /// `write` accepts, `writable_streams` must drop a flow-control-blocked
+    /// stream, and both must recover once the peer grants fresh credit.
+    #[test]
+    fn writability_tracks_flow_control_credit() {
+        const STREAM_LIMIT: u64 = 4 * 1024;
+        const CONN_LIMIT: u64 = 256 * 1024;
+        let (mut c, mut s) = streams_loopback_pair_with_limits(STREAM_LIMIT, CONN_LIMIT);
+        drive_until_complete(&mut c, &mut s, 8);
+
+        let id = c.open_bidi().expect("open bidi");
+        assert!(c.writable_streams().any(|w| w == id));
+        let cap = c.send_capacity(id).expect("capacity");
+        assert_eq!(cap as u64, STREAM_LIMIT, "stream limit binds first");
+
+        // A write of exactly the capacity is fully accepted and leaves none.
+        let payload = alloc::vec![0x5au8; cap + 4096];
+        let n = c.write(id, &payload).expect("write");
+        assert_eq!(n, cap, "write must accept exactly send_capacity bytes");
+        assert_eq!(c.send_capacity(id).expect("capacity"), 0);
+        assert!(
+            !c.writable_streams().any(|w| w == id),
+            "a blocked stream must not be reported writable"
+        );
+
+        // Drain the data to the server and read it out; the server's
+        // MAX_STREAM_DATA update then reopens the window.
+        let mut buf = alloc::vec![0u8; 8192];
+        let mut drained = 0usize;
+        for _ in 0..64 {
+            pump(&mut c, &mut s);
+            let ids: alloc::vec::Vec<StreamId> = s.readable_streams().collect();
+            for sid in ids {
+                let (got, _fin) = s.read(sid, &mut buf).expect("read");
+                drained += got;
+            }
+            if c.send_capacity(id).expect("capacity") > 0 {
+                break;
+            }
+        }
+        assert_eq!(drained, cap, "server must have received everything");
+        assert!(
+            c.send_capacity(id).expect("capacity") > 0,
+            "credit must be replenished after the peer reads"
+        );
+        assert!(c.writable_streams().any(|w| w == id));
+
+        // A finished stream is never writable and has no capacity.
+        c.finish(id).expect("finish");
+        assert!(!c.writable_streams().any(|w| w == id));
+        assert!(c.send_capacity(id).is_err());
+        // An unknown stream id is an error, not a zero capacity.
+        assert!(c.send_capacity(StreamId(4242)).is_err());
     }
 
     /// Test 13 — 1 MiB single-stream echo with conservative credit

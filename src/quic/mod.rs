@@ -13,8 +13,10 @@
 //! per-level CRYPTO reassembly, ACK emission, RFC 9002 loss recovery with
 //! NewReno congestion control, streams with flow control, Retry + address
 //! validation, connection-ID rotation, key update, and RFC 9221 unreliable
-//! DATAGRAMs, and the RFC 9000 §10.1 idle timeout. Out of scope: 0-RTT
-//! emission, connection migration, HTTP/3, and stateless-reset emission.
+//! DATAGRAMs, the RFC 9000 §10.1 idle timeout, and the §10.2 immediate
+//! close (application CONNECTION_CLOSE with the closing / draining states).
+//! Out of scope: 0-RTT emission, connection migration, HTTP/3, and
+//! stateless-reset emission.
 
 // QUIC v1 is shipped; the server direction interops with OpenSSL 3.5's QUIC
 // client, with several follow-ups still open (see the project notes). A
@@ -51,7 +53,7 @@ pub(crate) mod tls_glue;
 pub mod transport_params;
 pub(crate) mod varint;
 
-pub use connection::{QuicConfig, QuicConnection, Role};
+pub use connection::{CloseInfo, CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role};
 pub use ecn::EcnCodepoint;
 pub use peek::peek_initial_sni;
 // Re-export so callers can name the peek's return type from `quic` directly.

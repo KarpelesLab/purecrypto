@@ -762,6 +762,9 @@ pc_status pc_quic_stream_write(PcQuic *q, uint64_t id,
                                const uint8_t *data, size_t len,
                                size_t *written_out);
 pc_status pc_quic_stream_finish(PcQuic *q, uint64_t id);
+/* Bytes pc_quic_stream_write would accept right now (0 = flow-control
+ * blocked; poll again after a pop/feed cycle surfaces fresh credit). */
+pc_status pc_quic_stream_send_capacity(const PcQuic *q, uint64_t id, size_t *out);
 pc_status pc_quic_stream_read(PcQuic *q, uint64_t id,
                               uint8_t *out, size_t *out_len,
                               int32_t *fin_seen);
@@ -772,6 +775,27 @@ pc_status pc_quic_send_datagram(PcQuic *q, const uint8_t *data, size_t len);
 pc_status pc_quic_recv_datagram(PcQuic *q, uint8_t *out, size_t *out_len);
 
 pc_status pc_quic_initiate_key_update(PcQuic *q);
+
+/* Connection close (RFC 9000 §10.2 immediate close).
+ *
+ * pc_quic_close queues an application CONNECTION_CLOSE; drain it with
+ * pc_quic_pop_datagram, then keep driving pc_quic_on_timeout until
+ * pc_quic_is_closed reports 1 (the connection lingers 3xPTO to repeat the
+ * close). Idempotent. `reason` may be NULL when reason_len == 0.
+ *
+ * pc_quic_close_info reports why the connection ended, for a close from
+ * either side: *initiator_out is 0 local / 1 peer / 2 idle timeout /
+ * 3 stateless reset, *is_app_out is 1 for an application close (frame
+ * 0x1d) and 0 for a transport close (0x1c). It returns PC_WANT_READ while
+ * the connection is still live, and PC_BUFFER_TOO_SMALL (non-destructively,
+ * with *reason_len set to the required length) if the reason does not fit. */
+pc_status pc_quic_close(PcQuic *q, uint64_t error_code,
+                        const uint8_t *reason, size_t reason_len);
+pc_status pc_quic_is_closed(const PcQuic *q, int32_t *out);
+pc_status pc_quic_close_info(const PcQuic *q,
+                             uint64_t *code_out, int32_t *initiator_out,
+                             int32_t *is_app_out,
+                             uint8_t *reason, size_t *reason_len);
 
 /* `ipv6_bytes_len` MUST be 16 (an IPv6 representation; IPv4-mapped
  * `::ffff:a.b.c.d` is fine). Any other length is rejected with
