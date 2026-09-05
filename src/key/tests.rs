@@ -486,3 +486,62 @@ fn heterogeneous_private_keys_are_object_safe() {
         alloc::vec![Algorithm::Ed25519, Algorithm::P256, Algorithm::X25519]
     );
 }
+
+// ----------------------------------------------------------------------------
+// Curve reporting: a non-NIST curve must never masquerade as a NIST curve
+// ----------------------------------------------------------------------------
+
+/// A boxed EC key on a Brainpool or SM2 curve used to report `Algorithm::P256`
+/// because `curve_alg` fell back to it, so a "NIST curves only" policy gate
+/// keyed on `algorithm()` let it through. Each curve must now report itself.
+#[test]
+fn boxed_ec_curves_report_their_own_algorithm() {
+    use crate::ec::boxed::BoxedEcdsaPrivateKey;
+    use crate::ec::curves::CurveId;
+
+    let mut r = rng();
+    for (curve, want) in [
+        (CurveId::P256, Algorithm::P256),
+        (CurveId::P384, Algorithm::P384),
+        (CurveId::P521, Algorithm::P521),
+        (CurveId::Secp256k1, Algorithm::Secp256k1),
+        (CurveId::Sm2p256v1, Algorithm::Sm2),
+        (CurveId::BrainpoolP256r1, Algorithm::BrainpoolP256r1),
+        (CurveId::BrainpoolP384r1, Algorithm::BrainpoolP384r1),
+        (CurveId::BrainpoolP512r1, Algorithm::BrainpoolP512r1),
+    ] {
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut r);
+        let pk = sk.public_key();
+        let sk_dyn: Box<dyn PrivateKey> = Box::new(sk);
+        let pk_dyn: Box<dyn PublicKey> = Box::new(pk);
+        assert_eq!(sk_dyn.algorithm(), want, "{curve:?} private");
+        assert_eq!(pk_dyn.algorithm(), want, "{curve:?} public");
+    }
+}
+
+/// The reachable-from-untrusted-bytes path: a Brainpool SPKI decoded through
+/// the generic decoder must not claim to be a NIST curve.
+#[cfg(feature = "x509")]
+#[test]
+fn brainpool_spki_does_not_report_p256() {
+    use crate::ec::boxed::BoxedEcdsaPrivateKey;
+    use crate::ec::curves::CurveId;
+    use crate::x509::AnyPublicKey;
+
+    let mut r = rng();
+    for (curve, want) in [
+        (CurveId::BrainpoolP256r1, Algorithm::BrainpoolP256r1),
+        (CurveId::BrainpoolP384r1, Algorithm::BrainpoolP384r1),
+        (CurveId::BrainpoolP512r1, Algorithm::BrainpoolP512r1),
+    ] {
+        let sk = BoxedEcdsaPrivateKey::generate(curve, &mut r);
+        let spki = AnyPublicKey::Ecdsa(sk.public_key()).to_spki_der();
+        let pk = crate::key::public_key_from_spki_der(&spki).expect("decode SPKI");
+        assert_eq!(pk.algorithm(), want);
+        // The policy gate an application would write must reject it.
+        assert!(!matches!(
+            pk.algorithm(),
+            Algorithm::P256 | Algorithm::P384 | Algorithm::P521
+        ));
+    }
+}

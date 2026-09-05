@@ -326,9 +326,12 @@ impl PublicKey for Sm2PublicKey {
 // ----------------------------------------------------------------------------
 // Runtime-curve ("boxed") ECDSA / ECDH
 //
-// `curve_alg` maps the four supported curves to `Algorithm`; an unsupported
-// curve (e.g. Brainpool or the SM2 curve carried as ECDSA) returns `None`, so
-// the capability ops reject it up front while `algorithm()` falls back to P256.
+// `curve_alg` is total: every `CurveId` maps to a distinct `Algorithm`, so
+// `algorithm()` never mislabels a curve (a caller gating on "NIST curves only"
+// must be able to trust it). `ecdsa_alg` is the narrower capability gate: only
+// the four curves whose ECDSA/ECDH ops are wired up here return `Some`, so the
+// Brainpool curves and the SM2 curve carried as plain ECDSA are rejected up
+// front by `sign` / `verify` / `agree`.
 // ----------------------------------------------------------------------------
 
 use super::boxed::{
@@ -337,19 +340,33 @@ use super::boxed::{
 use super::curves::CurveId;
 use crate::bignum::BoxedUint;
 
-fn curve_alg(curve: CurveId) -> Option<Algorithm> {
+/// The `Algorithm` a curve is reported as. Total by construction: a new
+/// `CurveId` must be given its own `Algorithm`, never folded into another
+/// curve's discriminant.
+fn curve_alg(curve: CurveId) -> Algorithm {
     match curve {
-        CurveId::P256 => Some(Algorithm::P256),
-        CurveId::P384 => Some(Algorithm::P384),
-        CurveId::P521 => Some(Algorithm::P521),
-        CurveId::Secp256k1 => Some(Algorithm::Secp256k1),
+        CurveId::P256 => Algorithm::P256,
+        CurveId::P384 => Algorithm::P384,
+        CurveId::P521 => Algorithm::P521,
+        CurveId::Secp256k1 => Algorithm::Secp256k1,
+        CurveId::Sm2p256v1 => Algorithm::Sm2,
+        CurveId::BrainpoolP256r1 => Algorithm::BrainpoolP256r1,
+        CurveId::BrainpoolP384r1 => Algorithm::BrainpoolP384r1,
+        CurveId::BrainpoolP512r1 => Algorithm::BrainpoolP512r1,
+    }
+}
+
+/// The curves whose boxed ECDSA / ECDH operations are supported here.
+fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
+    match curve {
+        CurveId::P256 | CurveId::P384 | CurveId::P521 | CurveId::Secp256k1 => Some(curve_alg(curve)),
         _ => None,
     }
 }
 
 impl PrivateKey for BoxedEcdsaPrivateKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
+        curve_alg(self.curve())
     }
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
@@ -361,7 +378,7 @@ impl PrivateKey for BoxedEcdsaPrivateKey {
         _rng: &mut dyn CryptoRngCore,
     ) -> Result<Vec<u8>, Error> {
         let curve = self.curve();
-        curve_alg(curve).ok_or(Error::InvalidParams)?;
+        ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
         let mut p = params.reader();
         let hash = p.hash();
         let prehashed = p.prehashed();
@@ -384,14 +401,14 @@ impl PrivateKey for BoxedEcdsaPrivateKey {
 
 impl PublicKey for BoxedEcdsaPublicKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.curve()).unwrap_or(Algorithm::P256)
+        curve_alg(self.curve())
     }
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
     fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
         let curve = self.curve();
-        curve_alg(curve).ok_or(Error::InvalidParams)?;
+        ecdsa_alg(curve).ok_or(Error::InvalidParams)?;
         let mut p = params.reader();
         let hash = p.hash();
         let prehashed = p.prehashed();
@@ -422,13 +439,13 @@ impl PublicKey for BoxedEcdsaPublicKey {
 
 impl PrivateKey for BoxedEcdhPrivateKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.public_key().curve()).unwrap_or(Algorithm::P256)
+        curve_alg(self.public_key().curve())
     }
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
     }
     fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let alg = curve_alg(self.public_key().curve()).ok_or(Error::InvalidParams)?;
+        let alg = ecdsa_alg(self.public_key().curve()).ok_or(Error::InvalidParams)?;
         let peer = downcast_peer::<BoxedEcdsaPublicKey>(peer, alg)?;
         let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
         Ok(Secret::from_bytes(shared))

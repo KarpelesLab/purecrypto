@@ -29,6 +29,12 @@ pub enum Algorithm {
     X448,
     /// SM2 (GB/T 32918) signatures and public-key encryption.
     Sm2,
+    /// ECDSA / ECDH over brainpoolP256r1 (RFC 5639).
+    BrainpoolP256r1,
+    /// ECDSA / ECDH over brainpoolP384r1 (RFC 5639).
+    BrainpoolP384r1,
+    /// ECDSA / ECDH over brainpoolP512r1 (RFC 5639).
+    BrainpoolP512r1,
     /// Finite-field Diffie-Hellman over an RFC 3526 MODP group.
     DhModp,
     /// ML-DSA-44 (FIPS 204).
