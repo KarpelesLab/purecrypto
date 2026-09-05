@@ -452,11 +452,13 @@ impl OcspResponse {
         }
         // No trailing bytes after the responses SEQUENCE TLV.
         rr.finish()?;
-        // responseExtensions [1] EXPLICIT Extensions OPTIONAL — not surfaced
-        // here (see `nonce()`), but skipped so the strict no-trailing-bytes
-        // `finish()` below holds for responses that carry it.
+        // responseExtensions [1] EXPLICIT Extensions OPTIONAL — the values are
+        // not surfaced here (see `nonce()`), but the block must still be
+        // walked: RFC 6960 inherits the X.509 §4.2 rule that a critical
+        // extension the relying party does not process MUST cause rejection.
         if !td.is_empty() && td.peek_tag() == Some(tag::context(1)) {
-            td.read_tlv(tag::context(1))?;
+            let wrapper = td.read_tlv(tag::context(1))?;
+            reject_unknown_critical_exts(wrapper)?;
         }
         // No trailing bytes inside the ResponseData SEQUENCE.
         td.finish()?;
@@ -844,11 +846,15 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
         next_update = Some(read_generalized_time(&mut nr)?);
         nr.finish()?;
     }
-    // We don't surface singleExtensions [1] EXPLICIT Extensions OPTIONAL, but
-    // skip over it when present so the strict no-trailing-bytes `finish()`
-    // below still holds for responses that carry it.
+    // singleExtensions [1] EXPLICIT Extensions OPTIONAL. The values are not
+    // surfaced, but a critical extension here qualifies the very status this
+    // SingleResponse asserts (id-pkix-ocsp-archive-cutoff scopes a `good` to
+    // archived information; id-pkix-ocsp-extended-revoke redefines
+    // `unknown`), so an unrecognized critical one must reject rather than be
+    // laundered into an unqualified answer.
     if !s.is_empty() && s.peek_tag() == Some(tag::context(1)) {
-        s.read_tlv(tag::context(1))?;
+        let wrapper = s.read_tlv(tag::context(1))?;
+        reject_unknown_critical_exts(wrapper)?;
     }
     // No trailing bytes after the SingleResponse SEQUENCE.
     s.finish()?;
@@ -862,6 +868,38 @@ fn read_single_response(reader: &mut Reader<'_>) -> Result<OcspSingleResponse, E
         this_update,
         next_update,
     })
+}
+
+/// Walks an OCSP `Extensions` block — the content of a `[1] EXPLICIT`
+/// wrapper, i.e. the `SEQUENCE OF Extension` TLV — and rejects any extension
+/// marked `critical` whose OID this crate does not process.
+///
+/// RFC 6960 inherits the RFC 5280 §4.2 rule: an unrecognized critical
+/// extension MUST cause the relying party to reject the object. The only
+/// critical extension we act on is `id-pkix-ocsp-nonce` (RFC 6960 §4.4.1,
+/// surfaced by [`OcspResponse::nonce`]); everything else — notably
+/// `id-pkix-ocsp-archive-cutoff` (§4.4.4) and `id-pkix-ocsp-extended-revoke`
+/// (§4.4.8), both of which *qualify* the asserted status — is fatal when
+/// critical. Non-critical extensions are ignored, as the RFC allows.
+fn reject_unknown_critical_exts(wrapper: &[u8]) -> Result<(), Error> {
+    let mut outer = Reader::new(wrapper);
+    let mut exts = outer.read_sequence()?;
+    outer.finish()?;
+    while !exts.is_empty() {
+        let mut ext = exts.read_sequence()?;
+        let id = parse_oid(ext.read_oid()?)?;
+        let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
+            ext.read_boolean()?
+        } else {
+            false
+        };
+        let _value = ext.read_octet_string()?;
+        ext.finish()?;
+        if critical && id.as_slice() != oid::ID_PKIX_OCSP_NONCE {
+            return Err(Error::UnsupportedAlgorithm);
+        }
+    }
+    Ok(())
 }
 
 /// Hashes `(name_tlv, key_bits)` under `hash_alg_oid`. `name_tlv` MUST be the
@@ -1995,6 +2033,110 @@ mod tests {
         // The lookup uses the leaf's own serial — round-trips by construction.
         let single = resp.find_response_for(&leaf, &issuer).unwrap().unwrap();
         assert_eq!(single.status, OcspCertStatus::Good);
+    }
+
+    /// `id-pkix-ocsp-archive-cutoff` (RFC 6960 §4.4.4) — one of the
+    /// status-qualifying extensions that must not be silently dropped.
+    const OID_ARCHIVE_CUTOFF: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 48, 1, 6];
+
+    /// Assembles a syntactically complete `OCSPResponse` carrying exactly one
+    /// `SingleResponse` (status `good`), optionally with `singleExtensions`
+    /// and/or `responseExtensions`. The signature bytes are filler: the
+    /// critical-extension gate under test lives in the parser, ahead of any
+    /// signature verification, so `responses()` is the exact surface to
+    /// exercise.
+    fn handmade_response(single_exts: &[Extension], response_exts: &[Extension]) -> OcspResponse {
+        fn ext_block(exts: &[Extension]) -> Vec<u8> {
+            let mut body = Vec::new();
+            for e in exts {
+                body.extend_from_slice(&e.to_der());
+            }
+            encode_sequence(&body)
+        }
+
+        let mut cert_id_body = ocsp_hash_algid(oid::ID_SHA1);
+        cert_id_body.extend_from_slice(&encode_octet_string(&[0x11u8; 20]));
+        cert_id_body.extend_from_slice(&encode_octet_string(&[0x22u8; 20]));
+        cert_id_body.extend_from_slice(&encode_integer(&[0x2a]));
+        let cert_id = encode_sequence(&cert_id_body);
+
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let mut sr = cert_id;
+        sr.extend_from_slice(&encode_tlv(0x80, &[])); // good [0] IMPLICIT NULL
+        sr.extend_from_slice(&now.to_generalized_time()); // thisUpdate
+        if !single_exts.is_empty() {
+            sr.extend_from_slice(&encode_context(1, &ext_block(single_exts)));
+        }
+        let responses = encode_sequence(&encode_sequence(&sr));
+
+        // responderID byKey [2] EXPLICIT KeyHash.
+        let mut td = encode_context(2, &encode_octet_string(&[0x33u8; 20]));
+        td.extend_from_slice(&now.to_generalized_time()); // producedAt
+        td.extend_from_slice(&responses);
+        if !response_exts.is_empty() {
+            td.extend_from_slice(&encode_context(1, &ext_block(response_exts)));
+        }
+        let tbs = encode_sequence(&td);
+
+        let mut bocsp = tbs;
+        bocsp.extend_from_slice(&CertSigner::Rsa(&rsa_a()).algorithm_identifier());
+        bocsp.extend_from_slice(&encode_bit_string(&[0u8; 64]));
+        let basic = encode_sequence(&bocsp);
+
+        let mut rb = oid_tlv(oid::ID_PKIX_OCSP_BASIC);
+        rb.extend_from_slice(&encode_octet_string(&basic));
+        let response_bytes = encode_sequence(&rb);
+
+        let mut out = encode_tlv(0x0a, &[OcspResponseStatus::Successful as u8]);
+        out.extend_from_slice(&encode_context(0, &response_bytes));
+        OcspResponse::from_der(encode_sequence(&out)).expect("well-formed OCSPResponse")
+    }
+
+    fn ext(arcs: &[u64], critical: bool) -> Extension {
+        Extension {
+            oid: arcs.to_vec(),
+            critical,
+            // extnValue content — any DER; only criticality is under test.
+            value: encode_octet_string(&[0u8; 4]),
+        }
+    }
+
+    /// MEDIUM: RFC 6960 inherits the X.509 §4.2 rule that an unrecognized
+    /// CRITICAL extension MUST cause rejection. `archive-cutoff` scopes a
+    /// `good` to archived information about an already-expired certificate;
+    /// dropping it launders a qualified assertion into an unqualified one.
+    #[test]
+    fn critical_unknown_single_extension_rejected() {
+        let resp = handmade_response(&[ext(OID_ARCHIVE_CUTOFF, true)], &[]);
+        assert!(matches!(
+            resp.responses(),
+            Err(crate::x509::Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    /// Same rule on the `responseExtensions` side.
+    #[test]
+    fn critical_unknown_response_extension_rejected() {
+        let resp = handmade_response(&[], &[ext(OID_ARCHIVE_CUTOFF, true)]);
+        assert!(matches!(
+            resp.responses(),
+            Err(crate::x509::Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    /// The gate must not over-reject: non-critical unknown extensions are
+    /// explicitly ignorable, and the one critical extension we DO process
+    /// (`id-pkix-ocsp-nonce`) stays acceptable.
+    #[test]
+    fn non_critical_and_nonce_extensions_accepted() {
+        let resp = handmade_response(
+            &[ext(OID_ARCHIVE_CUTOFF, false)],
+            &[ext(OID_ARCHIVE_CUTOFF, false)],
+        );
+        assert_eq!(resp.responses().unwrap().len(), 1);
+
+        let nonce_ok = handmade_response(&[], &[ext(oid::ID_PKIX_OCSP_NONCE, true)]);
+        assert_eq!(nonce_ok.responses().unwrap().len(), 1);
     }
 
     #[test]
