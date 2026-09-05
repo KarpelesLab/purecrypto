@@ -41,11 +41,18 @@ pub(crate) const fn encoded_len(value: u64) -> usize {
 
 /// Encodes `value` using the shortest legal varint form.
 ///
+/// A value above `2^62 − 1` cannot be represented and always indicates a
+/// caller bug, so it trips a `debug_assert!` in debug builds. Release builds
+/// clamp to [`MAX`] instead of aborting: several encoded quantities
+/// (stream limits, flow-control ceilings, packet numbers) are derived from
+/// peer-supplied input, and a missed range check upstream must degrade into
+/// a malformed frame rather than a remotely triggerable process panic.
+///
 /// # Panics
-/// Panics if `value > 2^62 − 1` — the QUIC varint cannot represent such a
-/// number and any caller producing one is buggy.
+/// Panics in debug builds (only) if `value > 2^62 − 1`.
 pub(crate) fn encode(value: u64, out: &mut Vec<u8>) {
-    assert!(value <= MAX, "QUIC varint value out of range: {value:#x}");
+    debug_assert!(value <= MAX, "QUIC varint value out of range: {value:#x}");
+    let value = value.min(MAX);
     if value < 1 << 6 {
         out.push(value as u8);
     } else if value < 1 << 14 {
@@ -151,10 +158,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
-    fn panics_on_oversize() {
+    fn panics_on_oversize_in_debug() {
         let mut buf = Vec::new();
         encode(1u64 << 62, &mut buf);
+    }
+
+    /// Release builds must clamp rather than abort: an out-of-range value
+    /// that slipped past an upstream check produces a malformed frame, not
+    /// a remotely triggerable panic.
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn clamps_oversize_in_release() {
+        let mut buf = Vec::new();
+        encode(u64::MAX, &mut buf);
+        let (v, used) = decode(&buf).expect("decode");
+        assert_eq!(v, MAX);
+        assert_eq!(used, 8);
     }
 
     #[test]
