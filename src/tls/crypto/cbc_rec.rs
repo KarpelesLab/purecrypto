@@ -21,8 +21,11 @@
 //! record's IV from the previous record's last ciphertext block, so the IV of
 //! the next record is predictable to an observer — the protocol flaw BEAST
 //! exploits via adaptive chosen-plaintext records. This is inherent to the
-//! TLS 1.0 record format and cannot be fixed here (we do not implement 1/n-1
-//! record splitting); TLS 1.1+ removes it with the per-record random explicit
+//! TLS 1.0 record format and cannot be fixed in the record crypter itself;
+//! the write side mitigates it with the 1/n-1 record split (the leading
+//! plaintext byte is sent in a record of its own — see
+//! `client12::send_application_data` and `server12::send_application_data`),
+//! and TLS 1.1+ removes the flaw outright with the per-record random explicit
 //! IV. Avoid TLS 1.0 CBC wherever the peer offers anything newer.
 //!
 //! To blunt **Lucky13**, the decrypt path also equalises the number of
@@ -37,15 +40,21 @@
 //! padding length never steers a memory address — a direct index would have
 //! leaked through the cache exactly what the equaliser hides from the clock.
 //!
-//! Two gaps remain, and neither is closed here: the equaliser is best-effort,
-//! built on the high-level hash API (it does not control intermediate
-//! compression states the way a bespoke constant-time HMAC would), and the MAC
-//! is still computed over `buf[..content_len]`, whose *length* — and therefore
-//! the read pattern over the record — depends on the padding. Closing that
-//! needs the OpenSSL-style fixed-width HMAC over a maximum-length buffer.
-//! SSL 3.0 is not covered at all (POODLE-broken regardless). Treat these
-//! suites as last-resort interop only and prefer TLS 1.2+ AEAD, which this
-//! crate keeps fully constant-time.
+//! The equaliser performs no secret-sized allocation — the dummy compressions
+//! are driven from a fixed 64-byte zero block, so neither an allocator call
+//! nor a `memset` scales with the padding length — and its digest is passed
+//! through `core::hint::black_box` so the compiler cannot delete the
+//! throwaway hash as dead code.
+//!
+//! One gap remains, and it is not closed here: the MAC is still computed over
+//! `buf[..content_len]`, whose *length* — and therefore the read pattern over
+//! the record — depends on the padding, and the equaliser is built on the
+//! high-level hash API rather than controlling intermediate compression
+//! states the way a bespoke constant-time HMAC would. Closing that needs the
+//! OpenSSL-style fixed-width HMAC over a maximum-length buffer. SSL 3.0 is
+//! not covered at all (POODLE-broken regardless). Treat these suites as
+//! last-resort interop only and prefer TLS 1.2+ AEAD, which this crate keeps
+//! fully constant-time.
 
 // The suite-selection enums and the crypter are exercised by this module's
 // tests now and wired into the legacy handshake in later phases; allow the
@@ -592,7 +601,9 @@ impl CbcRecordCrypter {
     /// `content_len` and need no compensation).
     ///
     /// With `extra = max_blocks - real_blocks`, we hash a dummy message of
-    /// `(extra + 1) * 64 - 9` bytes, which by the formula above costs exactly
+    /// `(extra + 1) * 64 - 9` bytes — fed as `extra` repetitions of a fixed
+    /// 64-byte zero block plus a 55-byte tail, so no allocation's size ever
+    /// depends on the secret — which by the formula above costs exactly
     /// `extra + 1` compressions (update + finalisation block included). Every
     /// path — minimal padding (`extra == 0`), maximal padding, and invalid
     /// padding (`content_len` masked to 0) — thus performs the same
@@ -613,19 +624,33 @@ impl CbcRecordCrypter {
         let extra = max_blocks.saturating_sub(real_blocks);
         // `(extra + 1) * 64 - 9` bytes hash in exactly `extra + 1` compressions
         // (see the accounting note above); run on every path, including
-        // `extra == 0`.
-        let dummy = vec![0u8; (extra + 1) * BLOCK - OVERHEAD];
-        // The digest output is discarded — only the compression work matters.
+        // `extra == 0`. The bytes are fed from a fixed 64-byte zero block —
+        // `extra` full blocks plus a 55-byte tail — rather than from a
+        // heap buffer: allocating `(extra + 1) * 64 - 9` bytes would make the
+        // allocation size (and its zero-fill cost) a linear function of the
+        // secret padding length, reintroducing Lucky13 with a smaller
+        // coefficient (memset instead of SHA).
+        const ZERO: [u8; BLOCK] = [0u8; BLOCK];
+        // The digest output is discarded, but must be fed through
+        // `black_box`: without an optimisation barrier the compiler is free
+        // to see the result is unused and delete the whole dummy hash,
+        // silently removing the equaliser.
         match self.mac {
             CbcMacAlg::Sha1 => {
                 let mut h = Sha1::new();
-                h.update(&dummy);
-                let _ = h.finalize();
+                for _ in 0..extra {
+                    h.update(&ZERO);
+                }
+                h.update(&ZERO[..BLOCK - OVERHEAD]);
+                let _ = core::hint::black_box(h.finalize());
             }
             CbcMacAlg::Sha256 => {
                 let mut h = Sha256::new();
-                h.update(&dummy);
-                let _ = h.finalize();
+                for _ in 0..extra {
+                    h.update(&ZERO);
+                }
+                h.update(&ZERO[..BLOCK - OVERHEAD]);
+                let _ = core::hint::black_box(h.finalize());
             }
         }
     }
@@ -909,6 +934,50 @@ mod tests {
             dec.decrypt(ContentType::ApplicationData, ProtocolVersion::TLSv1_1, &rec),
             Err(Error::BadRecordMac)
         ));
+    }
+
+    /// The Lucky13 equaliser must not allocate a buffer whose SIZE derives
+    /// from the secret padding length — the allocation + zero-fill cost is
+    /// itself a monotone function of exactly what the equaliser hides. The
+    /// dummy compressions are therefore driven from a fixed 64-byte zero
+    /// block: `extra` whole blocks plus a 55-byte tail. This pins that the
+    /// block-fed message is byte-identical to the contiguous
+    /// `(extra + 1) * 64 - 9` buffer it replaced, so the compression
+    /// accounting the equaliser depends on is unchanged.
+    #[test]
+    fn lucky13_equalizer_block_feed_matches_contiguous_dummy() {
+        const BLOCK: usize = 64;
+        const OVERHEAD: usize = 9;
+        for extra in 0..8usize {
+            let contiguous = alloc::vec![0u8; (extra + 1) * BLOCK - OVERHEAD];
+
+            let mut a = Sha1::new();
+            a.update(&contiguous);
+            let mut b = Sha1::new();
+            let zero = [0u8; BLOCK];
+            for _ in 0..extra {
+                b.update(&zero);
+            }
+            b.update(&zero[..BLOCK - OVERHEAD]);
+            assert_eq!(
+                a.finalize().as_ref(),
+                b.finalize().as_ref(),
+                "SHA-1 block-fed dummy must equal the contiguous one (extra={extra})"
+            );
+
+            let mut a = Sha256::new();
+            a.update(&contiguous);
+            let mut b = Sha256::new();
+            for _ in 0..extra {
+                b.update(&zero);
+            }
+            b.update(&zero[..BLOCK - OVERHEAD]);
+            assert_eq!(
+                a.finalize().as_ref(),
+                b.finalize().as_ref(),
+                "SHA-256 block-fed dummy must equal the contiguous one (extra={extra})"
+            );
+        }
     }
 
     /// Pins the Lucky13 equaliser's compression accounting. Hashing `n` bytes
