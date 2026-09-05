@@ -58,7 +58,8 @@ use crate::tls::crypto::HashAlg;
 use crate::tls::crypto::aead12::RecordCrypter12;
 #[cfg(feature = "tls-legacy")]
 use crate::tls::crypto::cbc_rec::{
-    LEGACY_CBC_SUITES, LegacyCbcSuite, LegacyKx, build_legacy_crypters, lookup_legacy_cbc,
+    CbcMacAlg, LEGACY_CBC_SUITES, LegacyCbcSuite, LegacyKx, build_legacy_crypters,
+    lookup_legacy_cbc,
 };
 use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
@@ -1670,6 +1671,15 @@ impl ClientConnection12 {
         }
         let ls = lookup_legacy_cbc(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
         self.negotiated_version = ProtocolVersion::from_u16(sh_version);
+        // Mirror the server's filter (`server12::on_client_hello_legacy`):
+        // SSL 3.0 has no SHA-256 CBC suites — those are a TLS 1.2 addition.
+        // Accepting the pair would derive full keys and then wedge the
+        // connection on every record, because the SSL 3.0 MAC is 20 bytes
+        // while the suite says 32 (`bad_record_mac` forever). Reject at
+        // negotiation instead.
+        if self.negotiated_version == ProtocolVersion::SSLv3 && ls.mac == CbcMacAlg::Sha256 {
+            return Err(Error::IllegalParameter);
+        }
         self.legacy_suite = Some(ls);
         // Legacy Finished hashes MD5||SHA1 of the raw transcript; pin a defined
         // alg anyway so any incidental `current_hash()` cannot panic.
@@ -1979,6 +1989,14 @@ impl ClientConnection12 {
             // strict-decode it — we only record that a client certificate was
             // requested and feed it into the transcript.
             if msg_type == hs_type::CERTIFICATE_REQUEST {
+                // RFC 5246 §7.4.4 permits exactly one. Accepting a repeat
+                // keeps us in `WaitServerHelloDone` while every copy is
+                // appended to the transcript, which buffers forever and has
+                // no total cap — a server could grow our heap 1:1 with what
+                // it sends, indefinitely.
+                if self.cert_request_received {
+                    return Err(Error::UnexpectedMessage);
+                }
                 self.cert_request_received = true;
                 self.transcript.update(raw);
                 return Ok(());
@@ -1995,6 +2013,14 @@ impl ClientConnection12 {
         // ServerKeyExchange and ServerHelloDone. Parse for structure, record
         // the request, and stay in `WaitServerHelloDone`.
         if msg_type == hs_type::CERTIFICATE_REQUEST {
+            // RFC 5246 §7.4.4 permits exactly one. Accepting a repeat keeps
+            // us in `WaitServerHelloDone` while every copy is appended to the
+            // transcript, which buffers forever and has no total cap — a
+            // server could grow our heap 1:1 with what it sends,
+            // indefinitely.
+            if self.cert_request_received {
+                return Err(Error::UnexpectedMessage);
+            }
             let _cr = CertificateRequest12::decode(body)?;
             self.cert_request_received = true;
             self.transcript.update(raw);
@@ -2402,7 +2428,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
-        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        Error::EchDecodeError | Error::EchInnerMalformed => AlertDescription::IllegalParameter,
         #[cfg(feature = "cert-compression")]
         Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
