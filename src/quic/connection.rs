@@ -345,6 +345,26 @@ pub const DEFAULT_MAX_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// forever; we close instead.
 const IDLE_TIMEOUT_CEILING: Duration = Duration::from_secs(30);
 
+/// True when `addr` is an address a client may migrate to (RFC 9000 §9.6).
+///
+/// The server picks the preferred address unilaterally, so the obviously
+/// abusable targets are refused: loopback (aims the client at itself),
+/// multicast and the IPv4 broadcast address (aims it at a whole segment), the
+/// unspecified address, and port 0.
+fn is_usable_migration_target(addr: &SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr.ip() {
+        core::net::IpAddr::V4(v4) => {
+            !v4.is_loopback() && !v4.is_multicast() && !v4.is_broadcast() && !v4.is_unspecified()
+        }
+        core::net::IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_multicast() && !v6.is_unspecified()
+        }
+    }
+}
+
 /// RFC 9000 §14.1 — the smallest UDP payload a datagram carrying an Initial
 /// packet may have. A server MUST discard Initials received in anything
 /// smaller, and a client MUST expand its Initial-bearing datagrams to at least
@@ -2406,6 +2426,13 @@ impl QuicConnection {
         if target == current {
             return Err(Error::InappropriateState);
         }
+        // L-2 / RFC 9000 §21.5.3: the preferred address is entirely
+        // server-controlled, so refuse the ones that are not a unicast peer —
+        // loopback (points the client at itself), multicast and the IPv4
+        // broadcast address (would make the client flood a whole segment).
+        if !is_usable_migration_target(&target) {
+            return Err(Error::IllegalParameter);
+        }
         // §9.6 / §5.1.1: the parameter's connection ID is sequence 1. Install
         // it (idempotently) and address the new path by it.
         let cid = ConnectionId::from_slice(&pa.connection_id).ok_or(Error::IllegalParameter)?;
@@ -3226,6 +3253,17 @@ impl QuicConnection {
         // Extract the new SCID (used as the DCID for all subsequent
         // client Initials).
         let new_scid = ConnectionId::from_slice(hdr.scid).ok_or(Error::Decode)?;
+
+        // RFC 9000 §17.2.5.2: "A client MUST discard a Retry packet that
+        // contains a SCID field that is identical to the DCID field of its
+        // Initial packet." L-1: the Retry integrity key is a published
+        // constant, so any on-path observer can forge a Retry; one with
+        // `SCID == our DCID` makes us re-derive the *same* Initial keys and
+        // reset `next_tx` to 0, re-sending a different ClientHello under an
+        // already-used key+nonce pair — an AES-GCM nonce reuse.
+        if new_scid == original_dcid {
+            return Ok(());
+        }
 
         // Extract the token. RFC 9000 §17.2.5: the Retry Token field
         // runs from `pn_offset` (the parser puts the token there for
@@ -4455,7 +4493,13 @@ impl QuicConnection {
                                 .unwrap_or(3) as u32
                         }
                     };
-                    let ack_delay_us = ack_delay.checked_shl(exp).unwrap_or(u64::MAX);
+                    // `checked_shl` only rejects a shift amount >= 64, so it
+                    // silently discarded high bits of the *value*; the intent
+                    // is a saturating multiply by 2^exp (L-9).
+                    let ack_delay_us = 1u64
+                        .checked_shl(exp)
+                        .and_then(|m| ack_delay.checked_mul(m))
+                        .unwrap_or(u64::MAX);
                     let ack_delay_dur = Duration::from_micros(ack_delay_us);
 
                     // RFC 9000 §13.1: a peer MUST NOT acknowledge a packet
@@ -5584,7 +5628,10 @@ impl QuicConnection {
             return;
         }
         let mut rng = OsRng;
-        let start_seq = pool.max_sequence() + 1;
+        // Count from the high-water mark, not the highest *stored* sequence:
+        // retiring an entry removes it, and reusing its sequence number for a
+        // fresh CID would collide with the peer's own bookkeeping (L-12).
+        let start_seq = pool.issued_high + 1;
         for (next_seq, _) in (start_seq..).zip(0..to_issue) {
             // Random 8-byte CID; its reset token is derived from our static
             // reset key (RFC 9000 §10.3.1) so a router can recompute it later.
@@ -7408,6 +7455,101 @@ mod tests {
         assert_eq!(
             s.endpoint.cc.bytes_in_flight, before_in_flight,
             "an ACK-only packet does not add to bytes_in_flight"
+        );
+    }
+
+    /// L-2 — a preferred-address family counts as offered only when it has
+    /// both a specified address and a non-zero port, and the client refuses to
+    /// migrate to loopback / multicast / broadcast targets (RFC 9000 §21.5.3:
+    /// the value is entirely server-controlled).
+    #[test]
+    fn preferred_address_rejects_degenerate_and_non_unicast_targets() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let base = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 4), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xD1; 8],
+            stateless_reset_token: [0x33; 16],
+        };
+        assert!(PreferredAddress::decode(&base.encode()).is_ok());
+
+        // A specified address with port 0, and an unspecified address with a
+        // port, are both "not offered" — with no v6 family either, the whole
+        // parameter is a decode error.
+        for degenerate in [
+            SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 4), 0),
+            SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 4433),
+        ] {
+            let pa = PreferredAddress {
+                ipv4: Some(degenerate),
+                ..base.clone()
+            };
+            assert!(
+                PreferredAddress::decode(&pa.encode()).is_err(),
+                "degenerate address {degenerate} must not count as offered"
+            );
+        }
+
+        // Well-formed but non-unicast targets are refused at migration time.
+        let old_addr = ip4(192, 0, 2, 1, 4444);
+        for bad in [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(255, 255, 255, 255),
+        ] {
+            let (mut c, _s) = migration_pair(old_addr);
+            c.set_peer_addr(ip4(198, 51, 100, 1, 443));
+            let pa = PreferredAddress {
+                ipv4: Some(SocketAddrV4::new(bad, 4433)),
+                ..base.clone()
+            };
+            c.peer_params
+                .as_mut()
+                .expect("peer params")
+                .preferred_address = Some(pa.encode());
+            c.cid_remote.as_mut().expect("pool").entries.remove(&1);
+            assert!(
+                c.migrate_to_preferred_address().is_err(),
+                "must not migrate to {bad}"
+            );
+            assert!(!c.is_migrating());
+        }
+    }
+
+    /// L-1 — RFC 9000 §17.2.5.2: a client MUST discard a Retry whose Source
+    /// Connection ID equals the Destination Connection ID of its Initial. The
+    /// Retry integrity key is a published constant, so an on-path observer can
+    /// forge such a packet; acting on it re-derives the *same* Initial keys and
+    /// rewinds the packet number to 0, re-sending a different ClientHello under
+    /// an already-used AES-GCM key+nonce pair.
+    #[test]
+    fn retry_echoing_our_own_dcid_is_discarded() {
+        let (mut c, _s) = retry_loopback_pair([0x5a; 32]);
+        let first = c.pop_datagram();
+        assert!(!first.is_empty(), "client sends its Initial");
+        let odcid = c.original_dcid.expect("client picked a DCID");
+        let next_tx_before = c.endpoint.pn.initial.next_tx;
+        assert_ne!(next_tx_before, 0, "test premise: a PN was consumed");
+
+        // Forged Retry: DCID = our SCID (so it looks addressed to us), and
+        // SCID = the DCID we chose. The integrity tag is over our ODCID and
+        // is computable by anyone.
+        let forged = build_retry(
+            QUIC_V1,
+            c.endpoint.cids.local.as_slice(),
+            odcid.as_slice(),
+            b"forged-token",
+            odcid.as_slice(),
+        );
+        c.feed_datagram(&forged).expect("silently discarded");
+
+        assert!(
+            !c.retry_processed,
+            "a Retry echoing our own DCID must be discarded"
+        );
+        assert_eq!(
+            c.endpoint.pn.initial.next_tx, next_tx_before,
+            "the Initial packet-number space must not be rewound"
         );
     }
 

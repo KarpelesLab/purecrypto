@@ -84,7 +84,10 @@ impl PreferredAddress {
     ///
     /// Rejects a truncated or over-long body, a connection ID longer than the
     /// 20-byte QUIC v1 maximum, an *empty* connection ID (§9.6 forbids it),
-    /// and a body that offers neither address family.
+    /// and a body that offers neither address family. An address family counts
+    /// as offered only when it carries both a specified address and a non-zero
+    /// port; the degenerate combinations (`0.0.0.0:443`, `1.2.3.4:0`) are
+    /// treated as absent.
     pub fn decode(body: &[u8]) -> Result<Self, Error> {
         if body.len() < Self::FIXED_LEN {
             return Err(Error::Decode);
@@ -110,9 +113,15 @@ impl PreferredAddress {
         let connection_id = body[25..25 + cid_len].to_vec();
         let mut stateless_reset_token = [0u8; 16];
         stateless_reset_token.copy_from_slice(&body[25 + cid_len..]);
-        let ipv4 = (!v4_ip.is_unspecified() || v4_port != 0)
+        // L-2: an address family counts as offered only when BOTH halves are
+        // usable. The old `||` accepted `0.0.0.0:443` and `1.2.3.4:0`, which
+        // are not addresses a client can migrate to; combined with the H-4
+        // gap that let a malicious server aim a client somewhere useless (or
+        // at a broadcast group). Degenerate values in one family now simply
+        // mean "not offered".
+        let ipv4 = (!v4_ip.is_unspecified() && v4_port != 0)
             .then(|| std::net::SocketAddrV4::new(v4_ip, v4_port));
-        let ipv6 = (!v6_ip.is_unspecified() || v6_port != 0)
+        let ipv6 = (!v6_ip.is_unspecified() && v6_port != 0)
             .then(|| std::net::SocketAddrV6::new(v6_ip, v6_port, 0, 0));
         if ipv4.is_none() && ipv6.is_none() {
             return Err(Error::Decode);

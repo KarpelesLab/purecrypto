@@ -196,6 +196,12 @@ pub(crate) struct CidPool {
     /// a RETIRE_CONNECTION_ID for every sequence we previously stored
     /// below N.)
     pub(crate) pending_retire: alloc::vec::Vec<u64>,
+    /// Highest sequence number ever present in this pool, retired entries
+    /// included. RFC 9000 §19.16 makes it a PROTOCOL_VIOLATION for the peer to
+    /// RETIRE_CONNECTION_ID a sequence the issuer has never used, and it is
+    /// also what the issuing side must count from so a retired sequence is
+    /// never handed out twice (L-12).
+    pub(crate) issued_high: u64,
 }
 
 impl CidPool {
@@ -219,6 +225,7 @@ impl CidPool {
             retire_prior_to: 0,
             limit: 2,
             pending_retire: alloc::vec::Vec::new(),
+            issued_high: 0,
         }
     }
 
@@ -285,6 +292,7 @@ impl CidPool {
             // Exceeded active_connection_id_limit.
             return Err(Error::IllegalParameter);
         }
+        self.issued_high = self.issued_high.max(entry.sequence);
         self.entries.insert(entry.sequence, entry);
         Ok(())
     }
@@ -299,11 +307,21 @@ impl CidPool {
     /// addressing us by. In that case `active_seq` rotates to the lowest
     /// surviving entry, the same way [`Self::retire_prior_to`] handles L-2.
     ///
-    /// Returns [`Error::IllegalParameter`] only when that would leave no
-    /// usable CID at all (RFC 9000 §19.16 makes it a connection error to
-    /// retire the connection ID the retiring packet was itself sent to,
-    /// which is the case that gets us here with nothing left to rotate to).
+    /// Returns [`Error::IllegalParameter`] when the sequence was never issued
+    /// (RFC 9000 §19.16: "Receipt of a RETIRE_CONNECTION_ID frame containing a
+    /// sequence number greater than any previously sent to the peer MUST be
+    /// treated as a connection error of type PROTOCOL_VIOLATION"), or when
+    /// retiring would leave no usable CID at all (§19.16 also makes it a
+    /// connection error to retire the connection ID the retiring packet was
+    /// itself sent to, which is the case that gets us here with nothing left to
+    /// rotate to).
+    ///
+    /// Retiring an already-retired sequence is *not* an error: the peer may
+    /// legitimately retransmit a RETIRE_CONNECTION_ID.
     pub(crate) fn retire(&mut self, sequence: u64) -> Result<Option<CidEntry>, Error> {
+        if sequence > self.issued_high {
+            return Err(Error::IllegalParameter);
+        }
         if sequence == self.active_seq && self.entries.contains_key(&sequence) {
             let replacement = self.entries.keys().copied().find(|&seq| seq != sequence);
             match replacement {
@@ -641,12 +659,24 @@ mod tests {
         assert!(!pool.entries.contains_key(&0), "stale active CID dropped");
     }
 
+    /// L-12 — RFC 9000 §19.16: retiring a sequence above anything we ever
+    /// issued is a PROTOCOL_VIOLATION, while retiring one we issued and have
+    /// already dropped is a tolerated retransmit.
     #[test]
-    fn cidpool_retire_unknown_sequence_returns_none() {
+    fn cidpool_retire_never_issued_sequence_is_a_protocol_error() {
         let mut pool = CidPool::new(cid_n(0), None);
-        // Sequence 42 was never added; retire returns Ok(None).
-        let r = pool.retire(42).expect("ok");
-        assert!(r.is_none());
+        pool.set_limit(4);
+        pool.add(CidEntry {
+            cid: cid_n(1),
+            sequence: 1,
+            reset_token: None,
+        })
+        .expect("add");
+        // Never issued.
+        assert!(matches!(pool.retire(42), Err(Error::IllegalParameter)));
+        // Issued, retired once, then retired again: idempotent.
+        assert!(pool.retire(1).expect("ok").is_some());
+        assert!(pool.retire(1).expect("ok").is_none());
     }
 
     #[test]
