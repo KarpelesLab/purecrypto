@@ -4,7 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, lms, mldsa, mlkem, quic, rsa, tls, x509, xmss};
+use super::{ec, hash, kdf, lms, mldsa, mlkem, quic, rsa, tls, x509, x25519, xmss};
 use crate::der::pem_decode;
 
 /// Sets a single ALPN protocol ("test") on a QUIC config. ALPN is
@@ -918,4 +918,227 @@ fn buffer_too_small_reports_length() {
     };
     assert_eq!(st, PcStatus::BufferTooSmall);
     assert_eq!(len, 32);
+}
+
+// --- Memory-hard KDF cost caps -------------------------------------------
+//
+// `pc_argon2`/`pc_scrypt` size their working buffer directly from caller-
+// supplied cost parameters. Rust reports an allocation failure through
+// `handle_alloc_error`, which ABORTS — `guard`'s `catch_unwind` cannot
+// intercept that, so an unbounded cost would take the process down with no
+// `PcStatus` ever returned, in violation of the module contract ("every entry
+// point catches panics"). Since verifying a password hash means re-deriving
+// with the cost parameters stored *in the hash string*, those values are
+// routinely attacker-influenced. These tests pin the cap: an oversized cost
+// must come back as `Unsupported`. If a regression removes the check they do
+// not merely fail — the whole test binary dies with SIGABRT, which is also a
+// very visible signal.
+
+/// An `m_cost` above the ceiling is rejected rather than aborting the process.
+#[test]
+fn argon2_rejects_oversized_m_cost() {
+    let pw = b"password";
+    let salt = b"saltsaltsaltsalt";
+    let mut out = [0u8; 32];
+    for m_cost in [u32::MAX, u32::MAX / 2, 4 * 1024 * 1024 + 1] {
+        let st = unsafe {
+            kdf::pc_argon2(
+                kdf::argon2_id::ARGON2ID,
+                pw.as_ptr(),
+                pw.len(),
+                salt.as_ptr(),
+                salt.len(),
+                1,
+                m_cost,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            st,
+            PcStatus::Unsupported,
+            "m_cost={m_cost} must be rejected, not allocated"
+        );
+    }
+}
+
+/// Ordinary Argon2 parameters still work, so the cap does not intrude on the
+/// useful range.
+#[test]
+fn argon2_accepts_ordinary_cost() {
+    let pw = b"password";
+    let salt = b"saltsaltsaltsalt";
+    let mut out = [0u8; 32];
+    let st = unsafe {
+        kdf::pc_argon2(
+            kdf::argon2_id::ARGON2ID,
+            pw.as_ptr(),
+            pw.len(),
+            salt.as_ptr(),
+            salt.len(),
+            1,
+            64,
+            1,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    assert_ne!(out, [0u8; 32]);
+}
+
+/// scrypt's working set is `128 * r * n` bytes; combinations above the ceiling
+/// are rejected even though RFC 7914 itself permits them (its `r * N < 2^30`
+/// bound allows ~128 GiB).
+#[test]
+fn scrypt_rejects_oversized_cost() {
+    let pw = b"password";
+    let salt = b"NaCl";
+    let mut out = [0u8; 32];
+    // (n, r): 2^29 * 128 B = 64 GiB; 2^25 * 8 * 128 B = 32 GiB; 2^26 = 8 GiB.
+    for (n, r) in [(1u32 << 29, 1u32), (1u32 << 25, 8u32), (1u32 << 26, 1u32)] {
+        let st = unsafe {
+            kdf::pc_scrypt(
+                pw.as_ptr(),
+                pw.len(),
+                salt.as_ptr(),
+                salt.len(),
+                n,
+                r,
+                1,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            st,
+            PcStatus::Unsupported,
+            "scrypt n={n} r={r} must be rejected, not allocated"
+        );
+    }
+}
+
+/// `r == 0` is degenerate (zero-sized working set) and must be rejected up
+/// front rather than reaching the implementation.
+#[test]
+fn scrypt_rejects_zero_r() {
+    let pw = b"password";
+    let salt = b"NaCl";
+    let mut out = [0u8; 32];
+    let st = unsafe {
+        kdf::pc_scrypt(
+            pw.as_ptr(),
+            pw.len(),
+            salt.as_ptr(),
+            salt.len(),
+            16,
+            0,
+            1,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Unsupported);
+}
+
+/// Ordinary scrypt parameters still work (RFC 7914 §11, second vector).
+#[test]
+fn scrypt_accepts_ordinary_cost() {
+    let pw = b"password";
+    let salt = b"NaCl";
+    let mut out = [0u8; 64];
+    let st = unsafe {
+        kdf::pc_scrypt(
+            pw.as_ptr(),
+            pw.len(),
+            salt.as_ptr(),
+            salt.len(),
+            1024,
+            8,
+            16,
+            out.as_mut_ptr(),
+            out.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(out[..4], [0xfd, 0xba, 0xbe, 0x1c]);
+}
+
+// --- X25519/X448 scrub the caller's private scalar ------------------------
+//
+// The entry points copy the caller's scalar into a stack array (`[u8; N]` is
+// `Copy`, so `from_bytes` leaves a second copy behind) and must wipe it before
+// returning — the treatment the shared secret already gets, applied to the more
+// valuable secret. There is no portable way to inspect a dead stack frame, so
+// these tests pin the observable half of the contract: the wipe targets the
+// FFI's private copy and never the caller's own buffer, and the operations
+// still produce the right answers. The wipe itself is reviewed in
+// `src/ffi/x25519.rs`.
+
+/// RFC 7748 §6.1 test vector: the X25519 shared secret is computed correctly
+/// and the caller's scalar buffer is not disturbed by the internal wipe.
+#[test]
+fn x25519_preserves_caller_scalar_and_matches_rfc7748() {
+    // Alice's private key / Bob's public key (RFC 7748 §6.1).
+    let alice_sk: [u8; 32] = [
+        0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2, 0x66,
+        0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5, 0x1d, 0xb9,
+        0x2c, 0x2a,
+    ];
+    let bob_pk: [u8; 32] = [
+        0xde, 0x9e, 0xdb, 0x7d, 0x7b, 0x7d, 0xc1, 0xb4, 0xd3, 0x5b, 0x61, 0xc2, 0xec, 0xe4, 0x35,
+        0x37, 0x3f, 0x83, 0x43, 0xc8, 0x5b, 0x78, 0x67, 0x4d, 0xad, 0xfc, 0x7e, 0x14, 0x6f, 0x88,
+        0x2b, 0x4f,
+    ];
+    let expect: [u8; 32] = [
+        0x4a, 0x5d, 0x9d, 0x5b, 0xa4, 0xce, 0x2d, 0xe1, 0x72, 0x8e, 0x3b, 0xf4, 0x80, 0x35, 0x0f,
+        0x25, 0xe0, 0x7e, 0x21, 0xc9, 0x47, 0xd1, 0x9e, 0x33, 0x76, 0xf0, 0x9b, 0x3c, 0x1e, 0x16,
+        0x17, 0x42,
+    ];
+    let mut out = [0u8; 32];
+    let st = unsafe { x25519::pc_x25519(alice_sk.as_ptr(), bob_pk.as_ptr(), out.as_mut_ptr()) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(out, expect);
+    assert_eq!(
+        alice_sk[0], 0x77,
+        "pc_x25519 must not scrub the caller's own scalar buffer"
+    );
+
+    // Public-key derivation takes the same copy-and-wipe path.
+    let mut pk = [0u8; 32];
+    let st = unsafe { x25519::pc_x25519_public(alice_sk.as_ptr(), pk.as_mut_ptr()) };
+    assert_eq!(st, PcStatus::Ok);
+    assert_eq!(alice_sk[0], 0x77);
+    assert_ne!(pk, [0u8; 32]);
+}
+
+/// The X448 path mirrors X25519: agreement still round-trips and the caller's
+/// scalar survives.
+#[test]
+fn x448_preserves_caller_scalar_and_agrees() {
+    let a_sk = [0x11u8; 56];
+    let b_sk = [0x22u8; 56];
+    let (mut a_pk, mut b_pk) = ([0u8; 56], [0u8; 56]);
+    assert_eq!(
+        unsafe { x25519::pc_x448_public(a_sk.as_ptr(), a_pk.as_mut_ptr()) },
+        PcStatus::Ok
+    );
+    assert_eq!(
+        unsafe { x25519::pc_x448_public(b_sk.as_ptr(), b_pk.as_mut_ptr()) },
+        PcStatus::Ok
+    );
+    let (mut ss1, mut ss2) = ([0u8; 56], [0u8; 56]);
+    assert_eq!(
+        unsafe { x25519::pc_x448(a_sk.as_ptr(), b_pk.as_ptr(), ss1.as_mut_ptr()) },
+        PcStatus::Ok
+    );
+    assert_eq!(
+        unsafe { x25519::pc_x448(b_sk.as_ptr(), a_pk.as_ptr(), ss2.as_mut_ptr()) },
+        PcStatus::Ok
+    );
+    assert_eq!(ss1, ss2);
+    assert_ne!(ss1, [0u8; 56]);
+    assert_eq!(a_sk, [0x11u8; 56], "caller's scalar buffer must be intact");
+    assert_eq!(b_sk, [0x22u8; 56], "caller's scalar buffer must be intact");
 }

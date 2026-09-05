@@ -243,7 +243,29 @@ pub unsafe extern "C" fn pc_pbkdf2(
     })
 }
 
+/// Upper bound on the working memory a single memory-hard KDF call may ask
+/// for, in kibibytes (4 GiB).
+///
+/// Both [`pc_scrypt`] and [`pc_argon2`] allocate a buffer sized directly from
+/// caller-supplied cost parameters. The wrapped Rust functions deliberately
+/// impose no ceiling (see `kdf::argon2::argon2` — "callers MUST clamp"), and an
+/// allocation that large fails through `handle_alloc_error`, which **aborts**:
+/// [`guard`] catches panics, not aborts, so an unbounded cost would take the
+/// process down with no [`PcStatus`] ever returned. Since the canonical use of
+/// both KDFs is to re-derive from cost parameters parsed out of a *stored*
+/// string (a PHC `$argon2...$` header, an scrypt key file), those parameters are
+/// routinely attacker-influenced. Anything above this ceiling is rejected with
+/// [`PcStatus::Unsupported`] — the same treatment as any other out-of-range
+/// parameter, and the same pattern as `PC_ALPN_MAX` / `PC_DNS_MAX` elsewhere in
+/// this module.
+const PC_KDF_MAX_MEM_KIB: u64 = 4 * 1024 * 1024;
+
 /// scrypt (RFC 7914). `n` must be a power of two.
+///
+/// `n`/`r` are additionally capped so the derived working-memory size
+/// (`128 · r · n` bytes) stays at or below 4 GiB; a larger request returns
+/// [`PcStatus::Unsupported`] rather than aborting the process on a failed
+/// allocation.
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -268,7 +290,14 @@ pub unsafe extern "C" fn pc_scrypt(
         if out.is_null() && out_len > 0 {
             return PcStatus::NullPointer;
         }
-        if n == 0 || !n.is_power_of_two() {
+        if n == 0 || !n.is_power_of_two() || r == 0 {
+            return PcStatus::Unsupported;
+        }
+        // scrypt's working set is 128 · r · n bytes (RFC 7914 §6, the `V`
+        // array). Reject before dispatch: an oversized `vec![0u8; ...]` aborts
+        // rather than unwinding, which `guard` cannot intercept.
+        let mem_kib = (128u64 * u64::from(r) * u64::from(n)).div_ceil(1024);
+        if mem_kib > PC_KDF_MAX_MEM_KIB {
             return PcStatus::Unsupported;
         }
         let log_n = n.trailing_zeros() as u8;
@@ -291,6 +320,12 @@ pub unsafe extern "C" fn pc_scrypt(
 }
 
 /// Argon2 (RFC 9106).
+///
+/// `m_cost` (kibibytes) is capped at 4 GiB; a larger request returns
+/// [`PcStatus::Unsupported`] rather than aborting the process on a failed
+/// allocation. This matters because the standard way to *verify* an Argon2
+/// password hash is to re-derive using the `m=` field of the stored PHC
+/// string, which an attacker who controls the stored record controls too.
 ///
 /// # Safety
 /// All pointers valid for their lengths.
@@ -315,6 +350,12 @@ pub unsafe extern "C" fn pc_argon2(
         };
         if out.is_null() && out_len > 0 {
             return PcStatus::NullPointer;
+        }
+        // Argon2 allocates `m_cost · 1024` bytes; reject before dispatch so an
+        // oversized request is a status code, not a `handle_alloc_error` abort
+        // that `guard` cannot catch.
+        if u64::from(m_cost) > PC_KDF_MAX_MEM_KIB {
+            return PcStatus::Unsupported;
         }
         let variant = match variant {
             argon2_id::ARGON2I => Argon2Type::Argon2i,
