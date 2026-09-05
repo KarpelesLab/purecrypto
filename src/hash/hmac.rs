@@ -54,6 +54,13 @@ impl<D: Digest> Hmac<D> {
         let mut outer = D::new();
         outer.update(opad_block.as_ref());
 
+        // K' and both pad blocks are trivially key-equivalent — `K' ^ ipad` is
+        // one XOR away from K' — so leaving them in the constructor's stack
+        // frame would defeat the careful `Drop` on `inner`/`outer` below.
+        super::zeroize::zero_bytes(block.as_mut());
+        super::zeroize::zero_bytes(ipad_block.as_mut());
+        super::zeroize::zero_bytes(opad_block.as_mut());
+
         Hmac { inner, outer }
     }
 
