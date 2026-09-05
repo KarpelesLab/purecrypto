@@ -402,10 +402,26 @@ pub(crate) fn ntru_gen<R: SamplerRng>(n: usize, rng: &mut R) -> RawNtruKey {
         // F, G must fit i64 to be a usable key; otherwise retry.
         let cap_f_i: Option<Vec<i64>> = cap_f.iter().map(|z| z.to_i64()).collect();
         let cap_g_i: Option<Vec<i64>> = cap_g.iter().map(|z| z.to_i64()).collect();
-        match (cap_f_i, cap_g_i) {
-            (Some(cf), Some(cg)) => return (f, g, cf, cg, h),
+        let (cf, cg) = match (cap_f_i, cap_g_i) {
+            (Some(cf), Some(cg)) => (cf, cg),
             _ => continue,
+        };
+        // The compact secret-key encoding carries `f`/`g` in `fg_bits(n)`-bit
+        // fields (6 at n=512, 5 at n=1024) and `F` in 8-bit ones. The reference
+        // implementation makes this a *mandatory retry* condition, and skipping
+        // it is not benign: the key signs correctly in memory but `to_bytes`
+        // emits a wrapped encoding that `check_ntru` rejects on reload. It fails
+        // closed, but a server that generates a key, writes it to disk and
+        // restarts has silently and unrecoverably lost it. Only `|F_i| > 127`
+        // has non-negligible probability, but all three are checked.
+        let w = super::encode::fg_bits(n);
+        if !super::encode::fits_reference_signed(&f, w)
+            || !super::encode::fits_reference_signed(&g, w)
+            || !super::encode::fits_reference_signed(&cf, 8)
+        {
+            continue;
         }
+        return (f, g, cf, cg, h);
     }
 }
 

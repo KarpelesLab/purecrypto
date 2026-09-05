@@ -589,10 +589,17 @@ fn from_bytes_rejects_corrupted_f_coefficient() {
     // encodable and (in practice) invertible mod q, so the only thing catching
     // it is the new NTRU-equation check in from_bytes.
     let (mut f, g, cap_f) = encode::decode_privkey(&skb, n).expect("decode");
-    // Pick a coefficient whose +2 stays within the encodable signed range.
-    let i = f.iter().position(|&c| c.abs() < 100).unwrap_or(0);
+    // `f` is packed in 6-bit fields at n = 512, so pick a coefficient whose +2
+    // stays inside that range (the encoder now refuses to wrap).
+    let w = encode::fg_bits(n);
+    let hi = (1i64 << (w - 1)) - 1;
+    let i = f
+        .iter()
+        .position(|&c| c + 2 <= hi)
+        .expect("some f coefficient has headroom");
     f[i] += 2;
-    let bad = encode::encode_privkey(&f, &g, &cap_f, Degree::Falcon512.logn());
+    let bad = encode::encode_privkey(&f, &g, &cap_f, Degree::Falcon512.logn())
+        .expect("perturbed f is still encodable");
 
     assert!(
         matches!(FalconPrivateKey::from_bytes(&bad), Err(Error::Malformed)),

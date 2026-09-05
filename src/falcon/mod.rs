@@ -626,8 +626,15 @@ impl FalconPrivateKey {
 
     /// Serialize to the compact secret-key encoding (`0101nnnn` header, then
     /// `f`, `g`, `F`; `G` is recomputed on import).
+    ///
+    /// Always succeeds: both constructors guarantee the coefficients fit their
+    /// packed field widths — [`generate`](Self::generate) retries key
+    /// generation until they do (the reference implementation's mandatory
+    /// range condition), and [`from_bytes`](Self::from_bytes) can only produce
+    /// values the decoder itself read out of those same fields.
     pub fn to_bytes(&self) -> Vec<u8> {
         encode::encode_privkey(&self.f, &self.g, &self.cap_f, self.degree.logn())
+            .expect("keygen and from_bytes both bound the coefficients to their field widths")
     }
 
     /// Parse a compact secret-key encoding, recomputing `G` and `h` and

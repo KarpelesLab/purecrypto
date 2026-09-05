@@ -36,10 +36,38 @@ pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// `true` iff every coefficient fits a `w`-bit two's-complement field — that
+/// is, iff [`pack_signed`] can encode it without truncation. This is exactly
+/// the range [`unpack_signed`] can produce, so anything that passes here
+/// round-trips.
+pub(crate) fn fits_signed(coeffs: &[i64], w: u32) -> bool {
+    let hi = (1i64 << (w - 1)) - 1;
+    let lo = -(1i64 << (w - 1));
+    coeffs.iter().all(|&c| c >= lo && c <= hi)
+}
+
+/// The stricter *symmetric* range the Falcon reference implementation demands
+/// of a freshly generated key (`Zf(trim_i8_encode)`: `[-(2^(w-1) − 1),
+/// 2^(w-1) − 1]`, excluding the most-negative value). Key generation retries
+/// until every coefficient fits, so keys this crate produces stay byte-
+/// compatible with the reference encoder.
+pub(crate) fn fits_reference_signed(coeffs: &[i64], w: u32) -> bool {
+    let hi = (1i64 << (w - 1)) - 1;
+    coeffs.iter().all(|&c| c >= -hi && c <= hi)
+}
+
 /// Pack `n` signed coefficients at `w` bits each (two's complement, MSB first).
 /// `n·w` is a multiple of 8 for the Falcon parameter sets, so the result is
 /// byte-aligned.
-fn pack_signed(coeffs: &[i64], w: u32) -> Vec<u8> {
+///
+/// Returns `None` if any coefficient is outside the `w`-bit range. Truncating
+/// instead (`c & ((1 << w) - 1)`, as this used to do) produces a corrupt
+/// encoding that the decoder later rejects — silent, unrecoverable key loss for
+/// anyone who generated a key, wrote it to disk and restarted.
+fn pack_signed(coeffs: &[i64], w: u32) -> Option<Vec<u8>> {
+    if !fits_signed(coeffs, w) {
+        return None;
+    }
     let mut bits: Vec<u8> = Vec::with_capacity(coeffs.len() * w as usize);
     for &c in coeffs {
         let u = c & ((1i64 << w) - 1);
@@ -53,7 +81,7 @@ fn pack_signed(coeffs: &[i64], w: u32) -> Vec<u8> {
             out[i / 8] |= 1 << (7 - (i % 8));
         }
     }
-    out
+    Some(out)
 }
 
 /// Inverse of [`pack_signed`]: read `n` sign-extended `w`-bit coefficients.
@@ -92,15 +120,19 @@ pub(crate) fn fg_bits(n: usize) -> u32 {
 
 /// Encode a secret key into the compact form: `0101nnnn` header, then `f` and
 /// `g` at `fg_bits` each and `F` at 8 bits (`G` is recomputed on decode).
-pub(crate) fn encode_privkey(f: &[i64], g: &[i64], cap_f: &[i64], logn: u8) -> Vec<u8> {
+///
+/// Returns `None` if any coefficient is outside the field width it is packed
+/// into, rather than emitting a wrapped encoding that would decode to a
+/// different — and invalid — key.
+pub(crate) fn encode_privkey(f: &[i64], g: &[i64], cap_f: &[i64], logn: u8) -> Option<Vec<u8>> {
     let n = f.len();
     let w = fg_bits(n);
     let mut out = Vec::new();
     out.push(0x50 | logn);
-    out.extend_from_slice(&pack_signed(f, w));
-    out.extend_from_slice(&pack_signed(g, w));
-    out.extend_from_slice(&pack_signed(cap_f, 8));
-    out
+    out.extend_from_slice(&pack_signed(f, w)?);
+    out.extend_from_slice(&pack_signed(g, w)?);
+    out.extend_from_slice(&pack_signed(cap_f, 8)?);
+    Some(out)
 }
 
 /// Decode the compact secret key into `(f, g, F)`; returns `None` on a bad
