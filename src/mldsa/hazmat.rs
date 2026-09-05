@@ -179,9 +179,30 @@ pub fn pack_t1(f: &Poly) -> Vec<u8> {
     v
 }
 
+/// The exact byte length [`unpack_t1`] consumes (320).
+pub const T1_LEN: usize = N * 10 / 8;
+/// The exact byte length [`unpack_t0`] consumes (416).
+pub const T0_LEN: usize = N * 13 / 8;
+/// The exact byte length [`unpack_eta2`] consumes (96).
+pub const ETA2_LEN: usize = N * 3 / 8;
+/// The exact byte length [`unpack_eta4`] consumes (128).
+pub const ETA4_LEN: usize = N * 4 / 8;
+/// The exact byte length [`unpack_z17`] consumes (576).
+pub const Z17_LEN: usize = N * 18 / 8;
+/// The exact byte length [`unpack_z19`] consumes (640).
+pub const Z19_LEN: usize = N * 20 / 8;
+
 /// Unpacks `t1` (10 bits per coefficient).
-pub fn unpack_t1(b: &[u8]) -> Poly {
-    super::encode::unpack_t1(b)
+///
+/// Returns `None` unless `b` is exactly [`T1_LEN`] bytes. The decoders index
+/// fixed offsets, so a short slice would panic; the rest of the crate always
+/// length-checks before calling, but this is a public surface reachable with
+/// any slice.
+pub fn unpack_t1(b: &[u8]) -> Option<Poly> {
+    if b.len() != T1_LEN {
+        return None;
+    }
+    Some(super::encode::unpack_t1(b))
 }
 
 /// Packs `t0` with 13 bits per signed coefficient (416 bytes).
@@ -192,9 +213,13 @@ pub fn pack_t0(f: &Poly) -> Vec<u8> {
     v
 }
 
-/// Unpacks `t0` (13 bits per signed coefficient).
-pub fn unpack_t0(b: &[u8]) -> Poly {
-    super::encode::unpack_t0(b)
+/// Unpacks `t0` (13 bits per signed coefficient). Returns `None` unless `b` is
+/// exactly [`T0_LEN`] bytes.
+pub fn unpack_t0(b: &[u8]) -> Option<Poly> {
+    if b.len() != T0_LEN {
+        return None;
+    }
+    Some(super::encode::unpack_t0(b))
 }
 
 /// Packs an `η = 2` secret coefficient vector (3 bits each, 96 bytes).
@@ -206,8 +231,12 @@ pub fn pack_eta2(f: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks an `η = 2` vector, validating each 3-bit group is ≤ 4. `Err(())`
-/// signals only "malformed encoding".
+/// signals only "malformed encoding" — including `b` not being exactly
+/// [`ETA2_LEN`] bytes.
 pub fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
+    if b.len() != ETA2_LEN {
+        return Err(());
+    }
     super::encode::unpack_eta2(b)
 }
 
@@ -220,8 +249,12 @@ pub fn pack_eta4(f: &Poly) -> Vec<u8> {
 }
 
 /// Unpacks an `η = 4` vector, validating each nibble is ≤ 8. `Err(())` signals
-/// only "malformed encoding".
+/// only "malformed encoding" — including `b` not being exactly [`ETA4_LEN`]
+/// bytes.
 pub fn unpack_eta4(b: &[u8]) -> Result<Poly, ()> {
+    if b.len() != ETA4_LEN {
+        return Err(());
+    }
     super::encode::unpack_eta4(b)
 }
 
@@ -241,14 +274,22 @@ pub fn pack_z19(f: &Poly) -> Vec<u8> {
     v
 }
 
-/// Unpacks `z` with `γ₁ = 2¹⁷` (18 bits each).
-pub fn unpack_z17(b: &[u8]) -> Poly {
-    super::encode::unpack_z17(b)
+/// Unpacks `z` with `γ₁ = 2¹⁷` (18 bits each). Returns `None` unless `b` is
+/// exactly [`Z17_LEN`] bytes.
+pub fn unpack_z17(b: &[u8]) -> Option<Poly> {
+    if b.len() != Z17_LEN {
+        return None;
+    }
+    Some(super::encode::unpack_z17(b))
 }
 
-/// Unpacks `z` with `γ₁ = 2¹⁹` (20 bits each).
-pub fn unpack_z19(b: &[u8]) -> Poly {
-    super::encode::unpack_z19(b)
+/// Unpacks `z` with `γ₁ = 2¹⁹` (20 bits each). Returns `None` unless `b` is
+/// exactly [`Z19_LEN`] bytes.
+pub fn unpack_z19(b: &[u8]) -> Option<Poly> {
+    if b.len() != Z19_LEN {
+        return None;
+    }
+    Some(super::encode::unpack_z19(b))
 }
 
 /// Packs `w1` with 4 bits per coefficient (ML-DSA-65/87, 128 bytes).
@@ -269,18 +310,34 @@ pub fn pack_w1_6(f: &Poly) -> Vec<u8> {
 
 /// Packs the hint: per-polynomial set-bit positions followed by running counts
 /// (`omega + k` bytes, where `k = hints.len()`).
+///
+/// Returns `None` if the hints carry more than `omega` set coefficients in
+/// total. The underlying packer writes positions into the first `omega` bytes
+/// without checking, so an over-full hint would corrupt the running-count
+/// region and then panic past the end of the buffer.
 #[cfg(feature = "alloc")]
-pub fn pack_hint(hints: &[Poly], omega: usize) -> Vec<u8> {
+pub fn pack_hint(hints: &[Poly], omega: usize) -> Option<Vec<u8>> {
+    let total: usize = hints
+        .iter()
+        .map(|h| h.c.iter().filter(|&&c| c != 0).count())
+        .sum();
+    if total > omega {
+        return None;
+    }
     let mut v = alloc::vec![0u8; omega + hints.len()];
     super::encode::pack_hint(hints, omega, &mut v);
-    v
+    Some(v)
 }
 
 /// Unpacks the hint into `hints`, rejecting malformed encodings (non-increasing
 /// positions, out-of-range counts, or non-zero padding). Returns `false` on a
-/// malformed input.
+/// malformed input — including a `b` shorter than the `omega + hints.len()`
+/// bytes the encoding occupies, which the underlying decoder would index past.
 pub fn unpack_hint(b: &[u8], hints: &mut [Poly], omega: usize) -> bool {
-    super::encode::unpack_hint(b, hints, omega)
+    match omega.checked_add(hints.len()) {
+        Some(need) if b.len() >= need => super::encode::unpack_hint(b, hints, omega),
+        _ => false,
+    }
 }
 
 // --- Params-dispatched packing helpers ---
@@ -294,8 +351,13 @@ pub fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
 }
 
 /// Unpacks an `η`-encoded coefficient vector for the level described by `p`,
-/// returning [`super::Error::Malformed`] on an out-of-range encoding.
+/// returning [`super::Error::Malformed`] on an out-of-range encoding or a `b`
+/// whose length is not the [`ETA2_LEN`] / [`ETA4_LEN`] the level requires.
 pub fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, super::Error> {
+    let need = if p.eta == 2 { ETA2_LEN } else { ETA4_LEN };
+    if b.len() != need {
+        return Err(super::Error::Malformed);
+    }
     super::unpack_eta(b, p)
 }
 
@@ -308,8 +370,19 @@ pub fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
 }
 
 /// Unpacks a `z`-encoded coefficient vector for the level described by `p`.
-pub fn unpack_z(b: &[u8], p: &Params) -> Poly {
-    super::unpack_z(b, p)
+///
+/// Returns `None` unless `b` is exactly the [`Z17_LEN`] / [`Z19_LEN`] the
+/// level's `γ₁` requires.
+pub fn unpack_z(b: &[u8], p: &Params) -> Option<Poly> {
+    let need = if p.gamma1_bits == 17 {
+        Z17_LEN
+    } else {
+        Z19_LEN
+    };
+    if b.len() != need {
+        return None;
+    }
+    Some(super::unpack_z(b, p))
 }
 
 /// Packs `w1` with the width selected by `p`.
@@ -407,7 +480,7 @@ mod tests {
         }
         let bytes = pack_t1(&p);
         assert_eq!(bytes.len(), N * 10 / 8);
-        assert_eq!(unpack_t1(&bytes), p);
+        assert_eq!(unpack_t1(&bytes), Some(p));
     }
 
     /// `pack_z` / `unpack_z` round-trips through both `γ₁` widths.
@@ -419,14 +492,14 @@ mod tests {
             p.c[i] = sub(ML_DSA_44.params.gamma1, (i as u32) % 7);
         }
         let b44 = pack_z(&p, &ML_DSA_44.params);
-        assert_eq!(unpack_z(&b44, &ML_DSA_44.params), p);
+        assert_eq!(unpack_z(&b44, &ML_DSA_44.params), Some(p));
 
         let mut p2 = Poly::zero();
         for i in 0..N {
             p2.c[i] = sub(ML_DSA_65.params.gamma1, (i as u32) % 11);
         }
         let b65 = pack_z(&p2, &ML_DSA_65.params);
-        assert_eq!(unpack_z(&b65, &ML_DSA_65.params), p2);
+        assert_eq!(unpack_z(&b65, &ML_DSA_65.params), Some(p2));
     }
 
     /// `sample_ntt_poly` is deterministic in its `(rho, s, r)` inputs.
@@ -447,5 +520,78 @@ mod tests {
         assert_eq!((ML_DSA_44.k, ML_DSA_44.l), (4, 4));
         assert_eq!((ML_DSA_65.k, ML_DSA_65.l), (6, 5));
         assert_eq!((ML_DSA_87.k, ML_DSA_87.l), (8, 7));
+    }
+
+    /// The decoders index fixed offsets into `b`. The rest of the crate always
+    /// length-checks first, but this is a public surface that takes any slice,
+    /// so every short (and over-long) input must be refused rather than panic.
+    #[test]
+    fn decoders_reject_short_input_instead_of_panicking() {
+        for len in [0usize, 1, 95, 96, 127, 320, 415, 416, 575, 639, 641, 1024] {
+            let b = alloc::vec![0u8; len];
+            assert_eq!(unpack_t1(&b).is_some(), len == T1_LEN, "t1 len={len}");
+            assert_eq!(unpack_t0(&b).is_some(), len == T0_LEN, "t0 len={len}");
+            assert_eq!(unpack_z17(&b).is_some(), len == Z17_LEN, "z17 len={len}");
+            assert_eq!(unpack_z19(&b).is_some(), len == Z19_LEN, "z19 len={len}");
+            // The all-zero encodings are in range, so a correct length is the
+            // only thing that can make these succeed.
+            assert_eq!(unpack_eta2(&b).is_ok(), len == ETA2_LEN, "eta2 len={len}");
+            assert_eq!(unpack_eta4(&b).is_ok(), len == ETA4_LEN, "eta4 len={len}");
+
+            for level in [ML_DSA_44, ML_DSA_65, ML_DSA_87] {
+                let p = &level.params;
+                let eta_need = if p.eta == 2 { ETA2_LEN } else { ETA4_LEN };
+                assert_eq!(unpack_eta(&b, p).is_ok(), len == eta_need, "eta len={len}");
+                let z_need = if p.gamma1_bits == 17 {
+                    Z17_LEN
+                } else {
+                    Z19_LEN
+                };
+                assert_eq!(unpack_z(&b, p).is_some(), len == z_need, "z len={len}");
+            }
+        }
+    }
+
+    /// `unpack_hint` indexed `b[omega + i]` unchecked, so a buffer shorter than
+    /// `omega + k` panicked.
+    #[test]
+    fn unpack_hint_rejects_short_input() {
+        let omega = ML_DSA_44.params.omega;
+        let k = ML_DSA_44.k;
+        for len in 0..(omega + k) {
+            let b = alloc::vec![0u8; len];
+            let mut hints = alloc::vec![Poly::zero(); k];
+            assert!(!unpack_hint(&b, &mut hints, omega), "len={len}");
+        }
+        // At the exact length an all-zero (empty) hint decodes fine.
+        let b = alloc::vec![0u8; omega + k];
+        let mut hints = alloc::vec![Poly::zero(); k];
+        assert!(unpack_hint(&b, &mut hints, omega));
+    }
+
+    /// `pack_hint` wrote positions into the first `omega` bytes without
+    /// checking: more than `omega` set coefficients corrupted the running-count
+    /// region and then panicked past the end of the buffer.
+    #[test]
+    fn pack_hint_rejects_more_than_omega_set_bits() {
+        let omega = ML_DSA_44.params.omega;
+        let k = ML_DSA_44.k;
+
+        // Exactly `omega` set bits, spread over the k polynomials: accepted.
+        let mut hints = alloc::vec![Poly::zero(); k];
+        for i in 0..omega {
+            hints[i % k].c[i] = 1;
+        }
+        let packed = pack_hint(&hints, omega).expect("exactly omega set bits fits");
+        assert_eq!(packed.len(), omega + k);
+        let mut back = alloc::vec![Poly::zero(); k];
+        assert!(unpack_hint(&packed, &mut back, omega));
+
+        // One more: refused instead of corrupting the buffer.
+        let mut over = alloc::vec![Poly::zero(); k];
+        for i in 0..=omega {
+            over[i % k].c[i] = 1;
+        }
+        assert!(pack_hint(&over, omega).is_none());
     }
 }
