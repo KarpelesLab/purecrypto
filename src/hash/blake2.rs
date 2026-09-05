@@ -574,10 +574,23 @@ impl Blake2bMac {
     pub fn update(&mut self, data: &[u8]) {
         self.state.update(data);
     }
-    /// Writes the `out_len`-byte tag into `out` (`out.len()` must equal the
-    /// `out_len` given to [`new`](Self::new)).
+    /// Writes the `out_len`-byte tag into `out`.
+    ///
+    /// # Panics
+    /// Panics unless `out.len()` equals the `out_len` given to
+    /// [`new`](Self::new) / [`new_unkeyed`](Self::new_unkeyed). BLAKE2 folds
+    /// the digest length into the parameter block, so a shorter `out` would
+    /// silently yield a *truncation* of the `out_len`-byte tag — a different,
+    /// weaker value than the `out.len()`-byte BLAKE2b MAC the [`Mac`] trait
+    /// contract promises — and a longer one would run past the 64-byte digest.
+    /// This is a real assertion, matching the `out_len`/`key.len()` checks in
+    /// the constructors.
     pub fn finalize_into(mut self, out: &mut [u8]) {
-        debug_assert_eq!(out.len(), self.out_len);
+        assert_eq!(
+            out.len(),
+            self.out_len,
+            "Blake2bMac output length is fixed at construction"
+        );
         self.state.finalize_into(out);
     }
     /// Consumes the MAC and checks it against `expected` in constant time.
@@ -644,8 +657,20 @@ impl Blake2sMac {
         self.state.update(data);
     }
     /// Writes the `out_len`-byte tag into `out`.
+    ///
+    /// # Panics
+    /// Panics unless `out.len()` equals the `out_len` given to
+    /// [`new`](Self::new). BLAKE2 folds the digest length into the parameter
+    /// block, so a shorter `out` would silently yield a *truncation* of the
+    /// `out_len`-byte tag rather than the `out.len()`-byte BLAKE2s MAC the
+    /// [`Mac`] trait contract promises, and a longer one would run past the
+    /// 32-byte digest.
     pub fn finalize_into(mut self, out: &mut [u8]) {
-        debug_assert_eq!(out.len(), self.out_len);
+        assert_eq!(
+            out.len(),
+            self.out_len,
+            "Blake2sMac output length is fixed at construction"
+        );
         self.state.finalize_into(out);
     }
     /// Consumes the MAC and checks it against `expected` in constant time.
@@ -1040,5 +1065,53 @@ mod tests {
                 "d4a23a17b657fa3ddc2df61eefce362f048b9dd156809062997ab9d5b1fb26b8542b1a638f517fcbad72a6fb23de0754db7bb488b75c12ac826dcced9806d7873e6b31922097ef7b42506275ccc54caf86918f9d1c6cdb9bad2bacf123c0380b2e5dc3e98de83a159ee9e10a8444832c371e5b72039b31c38621261aa04d8271598b17dba0d28c20d1858d879038485ab069bdb58733b5495f934889658ae81b7536bcf601cfcc572060863c1ff2202d2ea84c800482dbe777335002204b7c1f70133e4d8a6b7516c66bb433ad31030a7a9a9a6b9ea69890aa40662d908a5acfe8328802595f0284c51a000ce274a985823de9ee74250063a879a3787fca23a6"
             )
         );
+    }
+
+    // BLAKE2 folds the digest length into its parameter block, so a
+    // `Blake2bMac` built for `out_len` bytes cannot honour a different
+    // `out.len()`: a shorter slice would receive a truncation of the
+    // `out_len`-byte tag, which is a *different* value from the BLAKE2b MAC of
+    // that shorter length. The check used to be a `debug_assert_eq!` and so
+    // vanished in release builds, silently violating the `Mac` contract.
+    #[test]
+    #[should_panic(expected = "Blake2bMac output length is fixed")]
+    fn blake2b_mac_rejects_short_out() {
+        let m = Blake2bMac::new(b"key", 32);
+        let mut out = [0u8; 16];
+        m.finalize_into(&mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2bMac output length is fixed")]
+    fn blake2b_mac_rejects_long_out() {
+        let m = Blake2bMac::new(b"key", 32);
+        // Over 64 would previously index past the digest buffer.
+        let mut out = [0u8; 65];
+        m.finalize_into(&mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2sMac output length is fixed")]
+    fn blake2s_mac_rejects_short_out() {
+        let m = Blake2sMac::new(b"key", 32);
+        let mut out = [0u8; 16];
+        m.finalize_into(&mut out);
+    }
+
+    // Truncating a longer tag is genuinely not the shorter tag — the exact
+    // reason the length cannot be chosen at finalize time.
+    #[test]
+    fn blake2_mac_truncation_is_not_the_shorter_tag() {
+        let mut long = [0u8; 32];
+        let mut m = Blake2bMac::new(b"key", 32);
+        m.update(b"message");
+        m.finalize_into(&mut long);
+
+        let mut short = [0u8; 16];
+        let mut m = Blake2bMac::new(b"key", 16);
+        m.update(b"message");
+        m.finalize_into(&mut short);
+
+        assert_ne!(&long[..16], &short[..]);
     }
 }

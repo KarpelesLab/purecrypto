@@ -257,9 +257,15 @@ pub trait Mac: Clone {
 
     /// Consumes the MAC and writes the tag into `out`.
     ///
-    /// For variable-length MACs (KMAC, BLAKE2-MAC) the tag length is
-    /// `out.len()`. For fixed-length MACs (HMAC) the full digest is written,
-    /// truncated to `out.len()` if shorter.
+    /// For variable-length MACs (KMAC) the tag length is `out.len()`. For
+    /// fixed-length MACs (HMAC) the full digest is written, truncated to
+    /// `out.len()` if shorter.
+    ///
+    /// [`Blake2bMac`]/[`Blake2sMac`] are the exception: BLAKE2 binds the digest
+    /// length into its parameter block, so their tag length is fixed at
+    /// construction and they **panic** unless `out.len()` equals it. Truncating
+    /// their output is not the same value as a shorter-parameter BLAKE2 MAC, so
+    /// they cannot silently accept a shorter `out`.
     fn finalize_into(self, out: &mut [u8]);
 
     /// Consumes the MAC and checks the tag against `expected` in constant time.
