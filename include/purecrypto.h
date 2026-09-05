@@ -16,6 +16,7 @@
  *   - AES key wrap — RFC 3394 / 5649 (pc_aes_kw_*, pc_aes_kwp_*)
  *   - Ascon XOFs   — Ascon-XOF128 / -CXOF128 (pc_ascon_xof / pc_ascon_cxof)
  *   - Randomness   — pc_rand_bytes
+ *   - Library heap — pc_malloc / pc_free (for wasm hosts; see below)
  *   - RSA          — keygen, PKCS#1 v1.5 + PSS sign/verify, OAEP enc/dec
  *   - ECDSA / Ed25519 / Ed448 — keygen + sign/verify
  *   - ECDH / X25519 / X448 — pc_ecdh, pc_x25519, pc_x448
@@ -310,6 +311,14 @@ pc_status pc_pbkdf2(int32_t hash,
                     const uint8_t *salt, size_t salt_len,
                     uint32_t iterations,
                     uint8_t *out, size_t out_len);
+/* The two memory-hard KDFs size their working buffer directly from the cost
+ * parameters, so both cap it at PC_KDF_MAX_MEM_KIB (4 GiB) and return
+ * PC_UNSUPPORTED above that. An allocation failure in Rust aborts the process
+ * rather than unwinding, which no status code could report — and the normal way
+ * to VERIFY a password hash is to re-derive using the cost parameters stored in
+ * the hash string, which an attacker who controls that record controls too.
+ * scrypt's working set is 128 * r * n bytes; Argon2's is m_cost kibibytes. */
+#define PC_KDF_MAX_MEM_KIB (4u * 1024u * 1024u)
 pc_status pc_scrypt(const uint8_t *pw, size_t pw_len,
                     const uint8_t *salt, size_t salt_len,
                     uint32_t n, uint32_t r, uint32_t p,
@@ -336,6 +345,21 @@ pc_status pc_kbkdf_feedback(int32_t prf,
 
 /* ---- Randomness ---- */
 pc_status pc_rand_bytes(uint8_t *out, size_t len);
+
+/* ---- Library heap ----
+ * Exposed chiefly for WebAssembly hosts: JavaScript cannot allocate inside the
+ * wasm linear memory on its own, so it calls pc_malloc to reserve space for the
+ * buffers the pc_* entry points read and write, then releases it with pc_free.
+ * Native C callers can simply use their own malloc/free.
+ *
+ * pc_malloc returns `size` UNINITIALIZED bytes, or NULL if `size` is 0 or the
+ * allocation fails. The allocation is untracked, so the caller MUST remember
+ * `size` and pass the identical value to pc_free; passing a different size, a
+ * pointer that did not come from pc_malloc, or freeing twice is undefined
+ * behaviour. A NULL pointer or a zero size makes pc_free a no-op. Buffers from
+ * pc_malloc must NOT be released with the C library's free(), and vice versa. */
+uint8_t *pc_malloc(size_t size);
+void pc_free(uint8_t *ptr, size_t size);
 
 /* ---- RSA ---- */
 PcRsaKey *pc_rsa_generate(uint32_t bits); /* 2048 | 3072 | 4096 */
@@ -424,6 +448,12 @@ pc_status pc_cert_to_der(const PcCert *cert, uint8_t *out, size_t *out_len);
 pc_status pc_cert_public_key_spki(const PcCert *cert, uint8_t *out,
                                   size_t *out_len);
 pc_status pc_cert_verify(const PcCert *cert, const PcCert *issuer);
+/* Writes a JSON summary of `cert` to `out` (out-buffer convention). Fields:
+ * subject/issuer (CN/O/OU/C), validity (Unix seconds), serial (hex),
+ * key {algorithm, curve, bits}, signature algorithm OID, subjectAltName
+ * DNS/IP lists, basic constraints, keyUsage bits, extended key usage OIDs.
+ * The exact JSON shape is NOT part of the stable ABI — parse defensively. */
+pc_status pc_cert_analyze(const PcCert *cert, uint8_t *out, size_t *out_len);
 void pc_cert_free(PcCert *cert);
 
 /* Convenience: issue a self-signed ECDSA certificate (DNS SAN = `cn`,
@@ -603,6 +633,29 @@ pc_status pc_csr_to_pem(const PcCsr *csr, uint8_t *out, size_t *out_len);
 pc_status pc_csr_verify_self_signed(const PcCsr *csr);
 pc_status pc_csr_subject_cn(const PcCsr *csr, uint8_t *out, size_t *out_len);
 void pc_csr_free(PcCsr *csr);
+
+/* One-shot CSR builders: sign with the given key and write the PKCS#10 PEM
+ * straight to `out` (out-buffer convention), without minting a PcCsr handle.
+ * `cn`/`cn_len` is the subject common name (UTF-8, not NUL-terminated).
+ * `sans`/`sans_len` is an optional newline-separated list of DNS names for the
+ * requested subjectAltName extension; pass NULL/0 for none. Blank lines and
+ * surrounding whitespace are ignored.
+ *
+ * NOTE for CA operators: a subjectAltName in a CSR is a *request*, not an
+ * entitlement. Never copy these names into an issued certificate without
+ * checking the requester is authorised for each one. */
+pc_status pc_csr_create_rsa_pem(const PcRsaKey *rsa_key,
+                                const char *cn, size_t cn_len,
+                                const char *sans, size_t sans_len,
+                                uint8_t *out, size_t *out_len);
+pc_status pc_csr_create_ec_pem(const PcEcKey *ec_key,
+                               const char *cn, size_t cn_len,
+                               const char *sans, size_t sans_len,
+                               uint8_t *out, size_t *out_len);
+pc_status pc_csr_create_ed25519_pem(const PcEd25519Key *ed_key,
+                                    const char *cn, size_t cn_len,
+                                    const char *sans, size_t sans_len,
+                                    uint8_t *out, size_t *out_len);
 
 /* ---- CRL ---- */
 PcCrl *pc_crl_from_pem(const uint8_t *pem, size_t len);
