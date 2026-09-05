@@ -61,6 +61,9 @@ impl<C: BlockCipher> Ctr<C> {
         // 2. Bulk whole-block windows (only reached with no pending keystream).
         const W: usize = 64; // 1 KiB stack window
         let mut ks = [0u8; 16 * W];
+        // High-water mark of `ks`: only this prefix ever held keystream, so
+        // only it needs wiping on the way out.
+        let mut ks_used = 0;
         while data.len() - i >= 16 {
             let nblk = ((data.len() - i) / 16).min(W);
             for blk in ks[..nblk * 16].chunks_exact_mut(16) {
@@ -71,8 +74,14 @@ impl<C: BlockCipher> Ctr<C> {
             for k in 0..nblk * 16 {
                 data[i + k] ^= ks[k];
             }
+            ks_used = ks_used.max(nblk * 16);
             i += nblk * 16;
         }
+        // Raw keystream for this key: leaving up to 1 KiB of it in the stack
+        // frame would let anyone who later reads that frame decrypt the
+        // matching ciphertext blocks outright, no key recovery needed. `Drop`
+        // wipes `self.keystream` for exactly this reason.
+        zero_keystream(&mut ks[..ks_used]);
         // 3. Trailing partial block: generate one fresh keystream block and
         //    consume part of it, leaving `pos` for the next call.
         if i < data.len() {
@@ -126,6 +135,8 @@ pub(crate) fn windowed_ctr(
 ) {
     const W: usize = 64;
     let mut ks = [0u8; 16 * W];
+    // High-water mark of `ks`; see `Ctr::apply_keystream`.
+    let mut ks_used = 0;
     let mut off = 0;
     while off < buf.len() {
         let n = (buf.len() - off).min(16 * W);
@@ -138,8 +149,28 @@ pub(crate) fn windowed_ctr(
         for (b, k) in buf[off..off + n].iter_mut().zip(ks[..n].iter()) {
             *b ^= *k;
         }
+        ks_used = ks_used.max(blocks * 16);
         off += n;
     }
+    // Don't leave raw keystream for this key in the stack frame — this runs on
+    // every GCM and AES-GCM-SIV operation.
+    zero_keystream(&mut ks[..ks_used]);
+    // The final counter block is key-independent (a nonce/counter), but the
+    // caller's `block` copy is dead here either way.
+    block = [0u8; 16];
+    let _ = core::hint::black_box(&block);
+}
+
+/// Best-effort wipe of a stack keystream buffer.
+///
+/// Zeros then `black_box`, the crate-wide idiom (`hash::zeroize`) — that
+/// module's helpers are `pub(in crate::hash)`, so this is the local twin.
+#[inline]
+fn zero_keystream(ks: &mut [u8]) {
+    for b in ks.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(ks);
 }
 
 #[cfg(test)]
