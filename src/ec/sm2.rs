@@ -493,7 +493,8 @@ impl Sm2Signature {
         )
     }
 
-    /// Decodes a DER `Ecdsa-Sig-Value` with strict-DER enforcement.
+    /// Decodes a DER `Ecdsa-Sig-Value` with strict-DER enforcement, rejecting
+    /// `r` or `s` wider than the 32-byte sm2p256v1 group order.
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::Reader;
         let mut reader = Reader::new(der);
@@ -506,6 +507,12 @@ impl Sm2Signature {
             .map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
         reader.finish().map_err(|_| Error::Malformed)?;
+        // sm2p256v1's order is 32 bytes; anything wider would panic in
+        // `enc32`'s `to_be_bytes(32)` when the signature is re-encoded
+        // (`to_bytes`, `to_der`) before verification.
+        if super::boxed::der_magnitude_len(r) > 32 || super::boxed::der_magnitude_len(s) > 32 {
+            return Err(Error::Malformed);
+        }
         Ok(Sm2Signature {
             r: BoxedUint::from_be_bytes(r),
             s: BoxedUint::from_be_bytes(s),
@@ -757,5 +764,32 @@ mod tests {
         let sig = sk.sign(b"der", DEFAULT_ID, &mut rng).unwrap();
         let der = sig.to_der();
         assert_eq!(Sm2Signature::from_der(&der).unwrap(), sig);
+    }
+
+    /// An SM2 DER signature with an over-wide `r`/`s` must be rejected at
+    /// parse rather than panicking in `enc32` when re-encoded.
+    #[test]
+    fn oversize_der_signature_rejected_at_parse() {
+        use crate::der::{encode_integer, encode_sequence};
+
+        let wide = [0x7fu8; 40];
+        let der = encode_sequence(&[encode_integer(&wide), encode_integer(&[1])].concat());
+        assert!(matches!(
+            Sm2Signature::from_der(&der),
+            Err(Error::Malformed)
+        ));
+
+        let der2 = encode_sequence(&[encode_integer(&[1]), encode_integer(&wide)].concat());
+        assert!(matches!(
+            Sm2Signature::from_der(&der2),
+            Err(Error::Malformed)
+        ));
+
+        // Exactly 32 bytes is fine and round-trips.
+        let ok = [0x7fu8; 32];
+        let der3 = encode_sequence(&[encode_integer(&ok), encode_integer(&ok)].concat());
+        let sig = Sm2Signature::from_der(&der3).unwrap();
+        assert_eq!(sig.to_bytes().len(), 64);
+        assert_eq!(sig.to_der(), der3);
     }
 }

@@ -20,6 +20,26 @@ use crate::rng::{CryptoRng, RngCore};
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// Width to encode `v` at when the caller asked for `len` bytes: `len`, unless
+/// `v` genuinely needs more. `BoxedUint::to_be_bytes` panics rather than
+/// truncating, and a signature component can be wider than the curve's order
+/// when the two were never paired (a signature parsed for one curve and
+/// re-encoded for a narrower one). Widening keeps those re-encoders total; the
+/// verifier's range check is what rejects the value.
+fn enc_len(v: &BoxedUint, len: usize) -> usize {
+    len.max(v.bit_len().div_ceil(8))
+}
+
+/// Magnitude width of a strict-DER unsigned INTEGER body: the body minus the
+/// optional `0x00` sign octet (`[0x00]`, the canonical zero, has width 0).
+#[cfg(feature = "der")]
+pub(super) fn der_magnitude_len(body: &[u8]) -> usize {
+    match body {
+        [0x00, rest @ ..] => rest.len(),
+        _ => body.len(),
+    }
+}
+
 /// A runtime-curve ECDSA public key (an affine point on its curve).
 #[derive(Clone, Debug)]
 pub struct BoxedEcdsaPublicKey {
@@ -448,23 +468,33 @@ impl BoxedEcdsaSignature {
         &self.s
     }
 
+    /// The widest group order this crate supports, in bytes (P-521, 521 bits
+    /// → 66 bytes). Signature components parsed by
+    /// [`from_der`](Self::from_der) are bounded by this.
+    pub const MAX_ORDER_LEN: usize = 66;
+
     /// The `r` component encoded big-endian, left-padded to
     /// `curve.order_len()` bytes (the SEC1 fixed-width encoding).
+    ///
+    /// A component too wide for `curve` (only reachable by pairing a
+    /// signature with a curve other than the one it was parsed/created for)
+    /// widens the output rather than panicking.
     pub fn r_bytes(&self, curve: CurveId) -> Vec<u8> {
-        self.r.to_be_bytes(curve.order_len())
+        self.r.to_be_bytes(enc_len(&self.r, curve.order_len()))
     }
 
     /// The `s` component encoded big-endian, left-padded to
-    /// `curve.order_len()` bytes.
+    /// `curve.order_len()` bytes. See [`Self::r_bytes`].
     pub fn s_bytes(&self, curve: CurveId) -> Vec<u8> {
-        self.s.to_be_bytes(curve.order_len())
+        self.s.to_be_bytes(enc_len(&self.s, curve.order_len()))
     }
 
     /// The fixed `r ‖ s` encoding, each half `curve.order_len()` bytes.
+    /// See [`Self::r_bytes`] for the over-wide-component behaviour.
     pub fn to_bytes(&self, curve: CurveId) -> Vec<u8> {
         let len = curve.order_len();
-        let mut out = self.r.to_be_bytes(len);
-        out.extend_from_slice(&self.s.to_be_bytes(len));
+        let mut out = self.r.to_be_bytes(enc_len(&self.r, len));
+        out.extend_from_slice(&self.s.to_be_bytes(enc_len(&self.s, len)));
         out
     }
 
@@ -597,8 +627,8 @@ impl BoxedEcdsaSignature {
         let len = curve.order_len();
         encode_sequence(
             &[
-                encode_integer(&self.r.to_be_bytes(len)),
-                encode_integer(&self.s.to_be_bytes(len)),
+                encode_integer(&self.r.to_be_bytes(enc_len(&self.r, len))),
+                encode_integer(&self.s.to_be_bytes(enc_len(&self.s, len))),
             ]
             .concat(),
         )
@@ -609,7 +639,26 @@ impl BoxedEcdsaSignature {
     /// data). Closes the ECDSA signature-malleability gap at the bytes
     /// layer — many byte-distinct encodings of the same `(r, s)` are
     /// otherwise accepted.
+    ///
+    /// `r` and `s` are additionally bounded to
+    /// [`MAX_ORDER_LEN`](Self::MAX_ORDER_LEN) bytes of magnitude — the widest
+    /// group order this crate supports (P-521). The curve is not known at this
+    /// point, so the final range check is the verifier's `in_range`; the width
+    /// bound is what keeps a hostile signature from reaching the fixed-width
+    /// re-encoders. See [`Self::from_der_for_curve`] for the exact check.
     pub fn from_der(der: &[u8]) -> Result<Self, Error> {
+        Self::from_der_bounded(der, Self::MAX_ORDER_LEN)
+    }
+
+    /// Like [`from_der`](Self::from_der), but bounds the magnitude of `r` and
+    /// `s` by `curve`'s group-order width, so every fixed-width re-encoding
+    /// (`r_bytes`, `s_bytes`, `to_bytes`, `to_der`) for that curve is exact.
+    /// Prefer this when the curve is known at parse time.
+    pub fn from_der_for_curve(der: &[u8], curve: CurveId) -> Result<Self, Error> {
+        Self::from_der_bounded(der, curve.order_len())
+    }
+
+    fn from_der_bounded(der: &[u8], max_len: usize) -> Result<Self, Error> {
         use crate::der::Reader;
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence().map_err(|_| Error::Malformed)?;
@@ -621,6 +670,13 @@ impl BoxedEcdsaSignature {
             .map_err(|_| Error::Malformed)?;
         seq.finish().map_err(|_| Error::Malformed)?;
         reader.finish().map_err(|_| Error::Malformed)?;
+        // Reject components wider than the target order. Without this,
+        // `to_bytes`/`to_der`/`r_bytes` would panic in
+        // `BoxedUint::to_be_bytes` on an attacker-supplied
+        // `SEQUENCE { INTEGER(40 random bytes), INTEGER(1) }`.
+        if der_magnitude_len(r) > max_len || der_magnitude_len(s) > max_len {
+            return Err(Error::Malformed);
+        }
         Ok(BoxedEcdsaSignature {
             r: BoxedUint::from_be_bytes(r),
             s: BoxedUint::from_be_bytes(s),
@@ -1384,5 +1440,55 @@ x2dqVh/sT12MnE=\n\
             bad.recover::<Sha256>(curve, b"hello", recid),
             Err(Error::Verification)
         ));
+    }
+
+    /// A DER signature whose INTEGERs are wider than any supported group order
+    /// must be rejected at parse time, not panic later in
+    /// `BoxedUint::to_be_bytes` when the application re-encodes it (logging,
+    /// canonicalisation, DER↔raw conversion) before verifying.
+    #[cfg(feature = "der")]
+    #[test]
+    fn oversize_der_signature_rejected_at_parse() {
+        use crate::der::{encode_integer, encode_sequence};
+
+        // SEQUENCE { INTEGER(67 bytes), INTEGER(1) } — one byte wider than
+        // P-521's order.
+        let wide = [0x7fu8; 67];
+        let der = encode_sequence(&[encode_integer(&wide), encode_integer(&[1])].concat());
+        assert!(matches!(
+            BoxedEcdsaSignature::from_der(&der),
+            Err(Error::Malformed)
+        ));
+
+        // A 40-byte component is inside the generic bound but outside P-256's
+        // 32-byte order: `from_der_for_curve` rejects it, and the generic
+        // parse must still survive re-encoding without panicking.
+        let wide40 = [0x7fu8; 40];
+        let der40 = encode_sequence(&[encode_integer(&wide40), encode_integer(&[1])].concat());
+        assert!(matches!(
+            BoxedEcdsaSignature::from_der_for_curve(&der40, CurveId::P256),
+            Err(Error::Malformed)
+        ));
+        let sig = BoxedEcdsaSignature::from_der(&der40).expect("within the generic bound");
+        // These used to panic ("value does not fit in 32 bytes").
+        assert_eq!(sig.r_bytes(CurveId::P256).len(), 40);
+        assert_eq!(sig.s_bytes(CurveId::P256).len(), 32);
+        assert_eq!(sig.to_bytes(CurveId::P256).len(), 72);
+        let _ = sig.to_der(CurveId::P256);
+
+        // …and it must not verify against any key on that curve.
+        let mut rng = crate::rng::HmacDrbg::<Sha256>::new(b"boxed-oversize", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        assert!(sk.public_key().verify::<Sha256>(b"hello", &sig).is_err());
+
+        // A well-formed signature still round-trips through both parsers.
+        let good = sk.sign::<Sha256>(b"hello").unwrap();
+        let good_der = good.to_der(CurveId::P256);
+        assert_eq!(
+            BoxedEcdsaSignature::from_der_for_curve(&good_der, CurveId::P256)
+                .unwrap()
+                .to_bytes(CurveId::P256),
+            good.to_bytes(CurveId::P256)
+        );
     }
 }
