@@ -64,6 +64,18 @@ pub enum AlertDescription {
 }
 
 impl AlertDescription {
+    /// `inappropriate_fallback` (86) — RFC 7507 §3: the client offered
+    /// `TLS_FALLBACK_SCSV` while the server can negotiate a higher protocol
+    /// version than the ClientHello asked for, so the downgrade was not the
+    /// client's real ceiling.
+    ///
+    /// Spelled as an associated constant over the [`Unknown`](Self::Unknown)
+    /// catch-all rather than a variant of its own: this enum is not
+    /// `#[non_exhaustive]`, so a new variant would break every downstream
+    /// exhaustive `match`. [`as_u8`](Self::as_u8) and
+    /// [`from_u8`](Self::from_u8) round-trip it correctly either way.
+    pub const INAPPROPRIATE_FALLBACK: AlertDescription = AlertDescription::Unknown(86);
+
     /// The 8-bit wire encoding.
     pub fn as_u8(self) -> u8 {
         match self {
@@ -154,6 +166,11 @@ pub enum Error {
     /// The per-key record-sequence cap has been reached without a `KeyUpdate`.
     /// Maps to `internal_error`; the connection should rekey before continuing.
     TooManyRecords,
+    /// The client offered `TLS_FALLBACK_SCSV` (0x5600) in a ClientHello that
+    /// asks for a lower version than this server can actually negotiate —
+    /// the signature of a downgrade attack driven by an in-path attacker
+    /// forcing retries. Maps to `inappropriate_fallback` (RFC 7507 §3).
+    InappropriateFallback,
     /// The peer's ALPN list contains nothing acceptable. Maps to
     /// `no_application_protocol` (RFC 7301).
     NoApplicationProtocol,
@@ -196,6 +213,22 @@ pub enum Error {
     /// HRR confirmation signal was wrong. Maps to `decrypt_error`.
     #[cfg(feature = "ech")]
     EchDecryptionFailed,
+    /// The ECH envelope authenticated (HPKE `open` succeeded) but what came
+    /// out of it is malformed: the inner ClientHello does not decode, its
+    /// `ech_outer_extensions` reconstruction is invalid, or an outer
+    /// ClientHello carried an inner-form `encrypted_client_hello`.
+    ///
+    /// This is deliberately distinct from
+    /// [`EchDecryptionFailed`](Self::EchDecryptionFailed): a pre-
+    /// authentication failure means the client used a stale or unknown
+    /// ECHConfig and the handshake continues on the outer CH so the
+    /// EncryptedExtensions can ship `retry_configs`, whereas a
+    /// post-authentication failure comes from a peer that holds the correct
+    /// config and is a hard protocol error (draft-ietf-tls-esni-22 §7.1).
+    /// Falling back for it would leave a client with a stale config unable
+    /// to refresh. Maps to `illegal_parameter`.
+    #[cfg(feature = "ech")]
+    EchInnerMalformed,
     /// A `CompressedCertificate` handshake message (RFC 8879 §4) could not
     /// be expanded: the declared `algorithm` is one the receiver does not
     /// support, the compressed body is malformed, decompression aborted
@@ -247,6 +280,9 @@ impl core::fmt::Display for Error {
             Error::TooManyRecords => f.write_str("per-key record-sequence cap reached"),
             Error::NoApplicationProtocol => f.write_str("no ALPN overlap with peer"),
             Error::DecryptError => f.write_str("TLS handshake decrypt error (binder/MAC)"),
+            Error::InappropriateFallback => {
+                f.write_str("TLS_FALLBACK_SCSV offered below our maximum version")
+            }
             Error::CertificateRequired => f.write_str("server required a client certificate"),
             Error::CertificateRevoked => f.write_str("peer certificate revoked (stapled OCSP)"),
             Error::OcspResponseInvalid => f.write_str("stapled OCSP response invalid"),
@@ -256,6 +292,8 @@ impl core::fmt::Display for Error {
             Error::EchDecodeError => f.write_str("ECH wire structure malformed"),
             #[cfg(feature = "ech")]
             Error::EchDecryptionFailed => f.write_str("ECH HPKE seal/open failed"),
+            #[cfg(feature = "ech")]
+            Error::EchInnerMalformed => f.write_str("ECH inner ClientHello malformed"),
             #[cfg(feature = "cert-compression")]
             Error::CertDecompressionFailed => {
                 f.write_str("RFC 8879 CompressedCertificate could not be decompressed")

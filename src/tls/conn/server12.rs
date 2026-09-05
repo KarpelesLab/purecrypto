@@ -955,20 +955,33 @@ impl<R: RngCore> ServerConnection12<R> {
         if neg_version < floor {
             return Err(Error::UnsupportedVersion);
         }
+
+        // RFC 7507 §3: `TLS_FALLBACK_SCSV` (0x5600) says the client
+        // deliberately downgraded because a previous, higher-version attempt
+        // failed. If we can in fact negotiate a version above the one this
+        // ClientHello asks for, the failure it retried past was not ours —
+        // it is the signature of an in-path attacker forcing retries — and
+        // the server MUST respond with `inappropriate_fallback`.
+        //
+        // Two ways we can be above `neg_version`: this engine was reached via
+        // `ServerConnectionAuto`, which strips a TLS 1.3 ClientHello and sets
+        // `supports_tls13` (so 1.3 was available), or the opt-in legacy path
+        // negotiated 1.0/1.1 while this engine also speaks 1.2. The check
+        // runs before the legacy dispatch so both handlers are covered.
+        if ch
+            .cipher_suites
+            .contains(&crate::tls::codec::CipherSuite(0x5600))
+            && (self.config.supports_tls13 || neg_version < 0x0303)
+        {
+            return Err(Error::InappropriateFallback);
+        }
+
         // TLS 1.0/1.1 take the opt-in legacy handshake path (separate from the
         // AEAD 1.2 flow below).
         #[cfg(feature = "tls-legacy")]
         if neg_version < 0x0303 {
             return self.on_client_hello_legacy(ch, raw, neg_version);
         }
-
-        // RFC 7507 §4 / RFC 8446 §4.1.3: `TLS_FALLBACK_SCSV` (0x5600) signals
-        // a deliberate downgrade. Our server tops out at TLS 1.2, so we are
-        // always at our maximum supported version and MUST NOT abort with
-        // `inappropriate_fallback`; the codepoint is simply ignored. (A
-        // hypothetical future server that also speaks TLS 1.3 would, when
-        // seeing 0x5600 here while still able to negotiate 1.3, abort with
-        // `IllegalParameter`.)
 
         // RFC 8446 §4.1.3: validate the structure of `supported_versions`
         // if present (the parser rejects malformed encodings), then ignore
@@ -2352,6 +2365,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
             AlertDescription::IllegalParameter
         }
+        Error::InappropriateFallback => AlertDescription::INAPPROPRIATE_FALLBACK,
         Error::RecordOverflow => AlertDescription::RecordOverflow,
         Error::TooManyRecords => AlertDescription::InternalError,
         Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
@@ -2361,7 +2375,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
-        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        Error::EchDecodeError | Error::EchInnerMalformed => AlertDescription::IllegalParameter,
         #[cfg(feature = "cert-compression")]
         Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
