@@ -306,12 +306,28 @@ impl<const L: usize> KeccakXn<L> {
     ///
     /// Callers must have checked [`supported`] (for `L == LANES`) or
     /// [`supported8`] (for `L == LANES8`).
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `rate` is a multiple of 8 no larger than [`MAX_RATE`] and
+    /// every message is shorter than `rate`. These are real assertions, not
+    /// `debug_assert!`s: an over-long message would place the domain byte
+    /// outside the absorbed `block[..rate]` region, silently producing a sponge
+    /// with no domain separation and non-injective padding that diverges from
+    /// the scalar [`super::keccak::Keccak`] on AVX2/AVX-512 hosts only. They run
+    /// once per sponge, not per block, so the cost is nil.
     pub(crate) fn new(rate: usize, msgs: [&[u8]; L], pad: u8) -> Self {
-        debug_assert!(rate <= MAX_RATE && rate.is_multiple_of(8));
+        assert!(
+            rate <= MAX_RATE && rate.is_multiple_of(8),
+            "Keccak rate must be a multiple of 8 and at most MAX_RATE"
+        );
         let mut state = [0u64; MAX_STATE];
         let mut block = [0u8; MAX_RATE];
         for (l, msg) in msgs.iter().enumerate() {
-            debug_assert!(msg.len() < rate);
+            assert!(
+                msg.len() < rate,
+                "each absorbed message must be shorter than the rate"
+            );
             block[..rate].fill(0);
             block[..msg.len()].copy_from_slice(msg);
             block[msg.len()] ^= pad;
@@ -361,6 +377,15 @@ impl<const L: usize> KeccakXn<L> {
     /// the CBD noise PRF).
     pub(crate) fn zeroize(&mut self) {
         super::zeroize::zero_words(&mut self.state);
+    }
+}
+
+/// Sponges seeded with secret material (SLH-DSA's PRF/Hash calls, ML-KEM's CBD
+/// noise) must not leave that material in freed stack/heap; ML-KEM and ML-DSA
+/// call [`KeccakXn::zeroize`] explicitly, this makes it automatic everywhere.
+impl<const L: usize> Drop for KeccakXn<L> {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -426,6 +451,26 @@ mod tests {
         }
     }
 
+    /// A message at least as long as the rate would push the domain byte past
+    /// `block[..rate]`, dropping domain separation entirely. The check must
+    /// fire in release builds too, so it is a real `assert!`.
+    #[test]
+    #[should_panic(expected = "shorter than the rate")]
+    fn absorb_rejects_message_at_or_above_rate() {
+        let msg = [0u8; 136];
+        let msgs: [&[u8]; LANES] = [&msg[..]; LANES];
+        let _ = KeccakXn::<LANES>::new(136, msgs, 0x1F);
+    }
+
+    /// Likewise for a rate the interleaved block buffer cannot hold.
+    #[test]
+    #[should_panic(expected = "multiple of 8")]
+    fn absorb_rejects_oversized_rate() {
+        let msg = [0u8; 4];
+        let msgs: [&[u8]; LANES] = [&msg[..]; LANES];
+        let _ = KeccakXn::<LANES>::new(MAX_RATE + 8, msgs, 0x1F);
+    }
+
     fn sponge_matches_scalar<const L: usize>() {
         for &(rate, pad) in &[(168usize, 0x1Fu8), (136, 0x1F)] {
             let msgs_buf: [[u8; 34]; L] =
@@ -471,6 +516,10 @@ mod tests_x8 {
     /// both supported round counts, over random states.
     #[test]
     fn keccak_p_x8_matches_scalar() {
+        std::eprintln!(
+            "keccak_p_x8: avx512={}",
+            if supported8() { "RUNNING" } else { "SKIPPED" },
+        );
         if !supported8() {
             return;
         }
