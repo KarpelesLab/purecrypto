@@ -11,6 +11,7 @@ use crate::bignum::{MontModulus, Uint, inv_mod};
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// An RSA public key `(n, e)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,19 +27,29 @@ pub struct RsaPublicKey<const LIMBS: usize> {
 /// # Side-channel protection
 ///
 /// The raw private operation applies *base blinding* (RSA-OAEP-Coron 1999):
-/// each call multiplies the input by a per-call random-looking blinder `r^e`,
-/// performs the secret exponentiation on the masked value, then strips the
-/// blinder with `r^{-1}`. The blinder `r` is derived deterministically from a
-/// key-bound HMAC keyed by a digest of the secret exponent — so two callers
-/// querying the same ciphertext see the same blinder, but the blinder is
-/// unpredictable to an external attacker, defeating Bleichenbacher- /
-/// Manger-style chosen-ciphertext timing attacks and most cache-timing leaks.
+/// each call multiplies the input by an unpredictable blinder `r^e`, performs
+/// the secret exponentiation on the masked value, then strips the blinder
+/// with `r^{-1}`. `r` is `HMAC-SHA256(seed, counter ‖ c)`, where `seed` is a
+/// digest of the secret exponent and `counter` is a per-key operation counter
+/// bumped on every call — so the blinder is unpredictable to anyone without
+/// `d`, *and* it differs between two operations on the same ciphertext. The
+/// second property is what Coron/Kocher blinding needs: with a blinder fixed
+/// per `(key, ciphertext)` an attacker can replay a ciphertext and average
+/// many traces of a byte-identical computation, which is the measurement
+/// primitive the Marvin / Brumley-class attacks are built on.
+///
+/// This defeats Bleichenbacher- / Manger-style chosen-ciphertext timing
+/// attacks and raises the cost of trace averaging. It is *not* a claim of
+/// resistance to an attacker with unlimited power/EM traces: the counter is
+/// not a random nonce, it never repeats for a given key instance (wrapping
+/// only after 2³² operations) but it is predictable, so the blinder sequence
+/// is fresh rather than secret-seeded-fresh. `Clone`ing a key copies the
+/// counter, so clones repeat each other's sequence.
 ///
 /// Blinding requires φ(n), which is only known when the key was generated
 /// here (so `p`, `q` are non-zero). Keys imported via
 /// [`from_components`](Self::from_components) carry `phi_n = 0` and fall back
 /// to unblinded exponentiation — document this when accepting external keys.
-#[derive(Clone)]
 pub struct RsaPrivateKey<const LIMBS: usize> {
     n: Uint<LIMBS>,
     e: Uint<LIMBS>,
@@ -50,8 +61,31 @@ pub struct RsaPrivateKey<const LIMBS: usize> {
     phi_n_minus_1: Uint<LIMBS>,
     /// HMAC-SHA256 key for deriving per-call blinding values. Derived once at
     /// key construction from `d` (so it never changes for a given key) and used
-    /// only as the HMAC key — the input is the ciphertext bytes.
+    /// only as the HMAC key — the input is the counter and the ciphertext.
     blinding_seed: [u8; 32],
+    /// Per-key operation counter, mixed into every blinder so that repeating a
+    /// ciphertext does not repeat the blinded computation. `AtomicU32` (not
+    /// `u64`) because 64-bit atomics do not exist on the 32-bit bare-metal
+    /// targets this crate builds for; wrapping after 2³² private operations on
+    /// one key instance is acceptable.
+    blind_counter: AtomicU32,
+}
+
+// Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
+// original's current counter value.
+impl<const LIMBS: usize> Clone for RsaPrivateKey<LIMBS> {
+    fn clone(&self) -> Self {
+        RsaPrivateKey {
+            n: self.n,
+            e: self.e,
+            d: self.d,
+            p: self.p,
+            q: self.q,
+            phi_n_minus_1: self.phi_n_minus_1,
+            blinding_seed: self.blinding_seed,
+            blind_counter: AtomicU32::new(self.blind_counter.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 /// Computes `phi(n) − 1` from the prime factors and the derived HMAC seed.
@@ -97,7 +131,7 @@ fn derive_blinding<const LIMBS: usize>(
 /// of Kocher / Messerges blinding):
 ///
 /// ```text
-///   r        = HMAC-SHA256(blinding_seed, c)    // reduced mod n
+///   r        = HMAC-SHA256(blinding_seed, nonce ‖ c)   // reduced mod n
 ///   r_e      = r^e mod n                        // public exponent, cheap
 ///   r_inv    = r^{φ(n)-1} mod n                 // Fermat inverse, constant time
 ///   c_blind  = (c · r_e) mod n
@@ -113,6 +147,7 @@ fn raw_private_blinded<const LIMBS: usize>(
     d: &Uint<LIMBS>,
     phi_n_minus_1: &Uint<LIMBS>,
     blinding_seed: &[u8; 32],
+    nonce: u32,
     c: &Uint<LIMBS>,
 ) -> Uint<LIMBS> {
     use crate::hash::HmacSha256;
@@ -139,6 +174,10 @@ fn raw_private_blinded<const LIMBS: usize>(
         let mut m = HmacSha256::new(blinding_seed);
         m.update(b"r");
         m.update(&counter.to_be_bytes());
+        // Per-operation nonce: without it the whole blinded computation is a
+        // pure function of `(key, c)`, so replaying `c` reproduces every
+        // intermediate bit-for-bit and lets an attacker average traces.
+        m.update(&nonce.to_be_bytes());
         // Stream the ciphertext limb-by-limb (BE) into the HMAC.
         for i in 0..LIMBS {
             let limb_bytes = c.as_limbs()[LIMBS - 1 - i].to_be_bytes();
@@ -265,6 +304,9 @@ impl<const LIMBS: usize> super::emsa::RawPrivate for RsaPrivateKey<LIMBS> {
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
     }
+    fn modulus_be_into(&self, out: &mut [u8]) {
+        self.n.write_be_bytes(out);
+    }
 }
 
 impl<const LIMBS: usize> super::emsa::PublicModulus for RsaPublicKey<LIMBS> {
@@ -319,9 +361,18 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Generates an RSA key pair with an `LIMBS * 64`-bit modulus and the given
     /// public exponent `e` (commonly 65537).
     ///
-    /// `rounds` is the number of Miller-Rabin rounds per prime candidate. Key
-    /// generation uses a non-constant-time modular inverse (see
-    /// [`inv_mod`](crate::bignum::inv_mod)).
+    /// `rounds` is the number of Miller-Rabin rounds per prime candidate.
+    ///
+    /// # Side channels
+    /// Key generation deliberately uses the **variable-time** extended-Euclid
+    /// modular inverse [`inv_mod`](crate::bignum::inv_mod) for
+    /// `d = e⁻¹ mod φ(n)`, whose loop count depends on its operands. This is a
+    /// one-time operation on freshly generated material, not a per-message
+    /// path, and with the usual public `e = 65537` the schedule is short and
+    /// near data-independent. Generate keys somewhere an attacker cannot take
+    /// timing or power measurements; every *use* of the key (sign, decrypt)
+    /// stays on the constant-time ladders. Primality testing is likewise
+    /// variable-time.
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(e: Uint<LIMBS>, rng: &mut R, rounds: usize) -> Self {
@@ -365,6 +416,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
                     q,
                     phi_n_minus_1,
                     blinding_seed,
+                    blind_counter: AtomicU32::new(0),
                 };
             }
         }
@@ -396,6 +448,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             q: Uint::ZERO,
             phi_n_minus_1,
             blinding_seed,
+            blind_counter: AtomicU32::new(0),
         }
     }
 
@@ -476,6 +529,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             q,
             phi_n_minus_1,
             blinding_seed,
+            blind_counter: AtomicU32::new(0),
         }
     }
 
@@ -495,6 +549,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             &self.d,
             &self.phi_n_minus_1,
             &self.blinding_seed,
+            self.blind_counter.fetch_add(1, Ordering::Relaxed),
             c,
         )
     }

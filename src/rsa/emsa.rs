@@ -95,6 +95,10 @@ pub(crate) trait RawPrivate {
     /// Must be the same value for every call on a given key, and unknown to
     /// anyone without the private key.
     fn secret_seed(&self) -> [u8; 32];
+    /// Writes the modulus `n` big-endian into `out`, which is exactly
+    /// [`key_size`](Self::key_size) octets. Used for the RFC 8017 §7.2.2
+    /// step-1 `0 <= c < n` range check on the decrypt paths (`n` is public).
+    fn modulus_be_into(&self, out: &mut [u8]);
 }
 
 // --------------------------------------------------------------------------
@@ -199,6 +203,15 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(
     if k < 11 {
         return Err(Error::InvalidLength);
     }
+    // RFC 8017 §7.2.2 step 1: "ciphertext representative out of range" —
+    // reject unless `0 <= c < n`. Without it the private op is handed a `c`
+    // it silently reduces mod `n` (and trips the `to_mont` debug assertion on
+    // an unblinded key). `ct` is public, so branching on the result is fine.
+    // `scratch` doubles as the modulus buffer before it takes the ciphertext.
+    key.modulus_be_into(scratch);
+    if !ct_lt_be(ct, scratch) {
+        return Err(Error::Decryption);
+    }
     scratch.copy_from_slice(ct);
     key.raw_private_in_place(scratch);
 
@@ -256,8 +269,20 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     if k < 11 {
         return Err(Error::InvalidLength);
     }
-    scratch.copy_from_slice(ct);
-    key.raw_private_in_place(scratch);
+    // RFC 8017 §7.2.2 step 1's range check, `0 <= c < n`. Unlike
+    // [`decrypt_pkcs1v15`] this must NOT surface as an error: implicit
+    // rejection requires an out-of-range ciphertext to be indistinguishable
+    // from one with bad padding, so we skip the private operation and let the
+    // padding check below fail, which returns the synthetic plaintext.
+    // `ct` is public, so the branch leaks nothing.
+    key.modulus_be_into(scratch);
+    if ct_lt_be(ct, scratch) {
+        scratch.copy_from_slice(ct);
+        key.raw_private_in_place(scratch);
+    } else {
+        // Any encoding whose first octet is not 0x00 fails the padding check.
+        scratch.fill(0xff);
+    }
     let em: &[u8] = scratch;
 
     // Same constant-time padding check as decrypt_pkcs1v15.
@@ -649,6 +674,12 @@ pub(crate) fn decrypt_oaep<D: Digest, K: RawPrivate>(
     }
     if scratch.len() != k {
         return Err(Error::InvalidLength);
+    }
+    // RFC 8017 §7.1.2 step 1(b) / §7.2.2 step 1: reject a ciphertext
+    // representative outside `[0, n)`. `ciphertext` is public.
+    key.modulus_be_into(scratch);
+    if !ct_lt_be(ciphertext, scratch) {
+        return Err(Error::Decryption);
     }
     scratch.copy_from_slice(ciphertext);
     key.raw_private_in_place(scratch);

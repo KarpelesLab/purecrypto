@@ -14,6 +14,7 @@ use super::{Error, Pkcs1Digest};
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::hash::{Digest, HmacSha256, Sha256};
 use crate::rng::{CryptoRng, RngCore};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// A runtime-sized RSA public key.
 #[derive(Clone, Debug)]
@@ -33,16 +34,18 @@ pub struct BoxedRsaPublicKey {
 ///
 /// When the prime factors are known the raw private operation runs Coron's
 /// base blinding (see [`RsaPrivateKey`](super::RsaPrivateKey) for the full
-/// recipe). The blinder is derived deterministically from a key-bound
-/// HMAC keyed by a digest of `d`, so two callers asking about the same
-/// ciphertext see the same blinder but an attacker who does not know `d`
-/// cannot predict it — defeating Bleichenbacher / Manger / cache-timing
-/// attacks on the secret exponentiation.
+/// recipe). The blinder is `HMAC-SHA256(seed, counter ‖ c)` — keyed by a
+/// digest of `d`, so unpredictable without the private key, and mixed with a
+/// per-key operation counter, so replaying a ciphertext does not replay a
+/// byte-identical computation. That freshness is what stops an attacker from
+/// averaging many traces of the same exponentiation; without it the residual
+/// data-dependent signal accumulates coherently while noise falls as
+/// `1/√N`. This does not make the exponentiation trace-proof, it removes the
+/// replay primitive.
 ///
 /// Keys imported with [`from_components`](Self::from_components) (no primes)
 /// fall back to plain `c^d mod n`; the constant-time Montgomery ladder still
 /// applies, but base-blinding cannot.
-#[derive(Clone)]
 pub struct BoxedRsaPrivateKey {
     n: BoxedUint,
     e: BoxedUint,
@@ -60,6 +63,31 @@ pub struct BoxedRsaPrivateKey {
     crt: Option<alloc::boxed::Box<BoxedRsaCrt>>,
     /// HMAC-SHA256 key (derived from `d`) for per-call blinding values.
     blinding_seed: [u8; 32],
+    /// Per-key operation counter, mixed into every blinder so that repeating a
+    /// ciphertext does not repeat the blinded computation. `AtomicU32` (not
+    /// `u64`) because 64-bit atomics do not exist on the 32-bit bare-metal
+    /// targets this crate builds for.
+    blind_counter: AtomicU32,
+}
+
+// Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
+// original's current counter value.
+impl Clone for BoxedRsaPrivateKey {
+    fn clone(&self) -> Self {
+        BoxedRsaPrivateKey {
+            n: self.n.clone(),
+            e: self.e.clone(),
+            d: self.d.clone(),
+            p: self.p.clone(),
+            q: self.q.clone(),
+            mont: self.mont.clone(),
+            k: self.k,
+            phi_n_minus_1: self.phi_n_minus_1.clone(),
+            crt: self.crt.clone(),
+            blinding_seed: self.blinding_seed,
+            blind_counter: AtomicU32::new(self.blind_counter.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 // Manual impl instead of `#[derive(Debug)]`: the derive printed `d`, `p`,
@@ -199,12 +227,16 @@ fn derive_crt_boxed(
     }))
 }
 
-/// Derives the deterministic per-call blinder `r` (HMAC-SHA256 of the input,
-/// keyed by the key-bound seed), reduced into `[2, n)`.
+/// Derives the per-call blinder `r` — `HMAC-SHA256(seed, nonce ‖ c)`, keyed by
+/// the key-bound seed — reduced into `[2, n)`. `nonce` is the caller's
+/// per-operation counter: it is what makes two operations on the *same*
+/// ciphertext use different blinders, so an attacker cannot replay a
+/// ciphertext and average traces of a byte-identical computation.
 fn derive_blinder_boxed(
     mont: &BoxedMontModulus,
     blinding_seed: &[u8; 32],
     k_bytes: usize,
+    nonce: u32,
     c: &BoxedUint,
 ) -> BoxedUint {
     let c_bytes = c.to_be_bytes(k_bytes);
@@ -214,6 +246,7 @@ fn derive_blinder_boxed(
         let mut m = HmacSha256::new(blinding_seed);
         m.update(b"r");
         m.update(&counter.to_be_bytes());
+        m.update(&nonce.to_be_bytes());
         m.update(&c_bytes);
         let tag = m.finalize();
         blinder_bytes.extend_from_slice(tag.as_ref());
@@ -249,10 +282,11 @@ fn derive_blinder_boxed(
 fn raw_private_crt_blinded(
     key: &BoxedRsaPrivateKey,
     crt: &BoxedRsaCrt,
+    nonce: u32,
     c: &BoxedUint,
 ) -> BoxedUint {
     let mont = &key.mont;
-    let mut r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, c);
+    let mut r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, c);
     let mut r_e = mont.pow_public(&r, &key.e);
     let mut c_blind = mont.mul_mod(c, &r_e);
 
@@ -303,8 +337,11 @@ fn raw_private_crt_blinded(
 /// factorable half-fault).
 fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUint {
     let mont = &key.mont;
+    // One counter bump per private operation. `Relaxed` is enough: the value
+    // only has to differ between operations, it orders nothing else.
+    let nonce = key.blind_counter.fetch_add(1, Ordering::Relaxed);
     if let Some(crt) = key.crt.as_deref() {
-        let m = raw_private_crt_blinded(key, crt, c);
+        let m = raw_private_crt_blinded(key, crt, nonce, c);
         // `c` is public in every caller (a ciphertext or an EMSA-encoded
         // digest), so the variable-time `lt` shortcut leaks nothing.
         let n = mont.modulus();
@@ -319,7 +356,7 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
         None => return mont.pow(c, &key.d), // imported key without primes
     };
 
-    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, c);
+    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, c);
     // `e` is public, so the exponent-length ladder applies (still branchless
     // and constant-time in the secret base `r`).
     let r_e = mont.pow_public(&r, &key.e);
@@ -542,6 +579,7 @@ impl BoxedRsaPrivateKey {
             phi_n_minus_1,
             crt: None,
             blinding_seed,
+            blind_counter: AtomicU32::new(0),
         }
     }
 
@@ -579,6 +617,7 @@ impl BoxedRsaPrivateKey {
             phi_n_minus_1,
             crt,
             blinding_seed,
+            blind_counter: AtomicU32::new(0),
         }
     }
 
@@ -586,9 +625,17 @@ impl BoxedRsaPrivateKey {
     /// public exponent `e` (commonly 65537). `bits` must be even; each prime is
     /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate.
     ///
-    /// Key generation uses non-constant-time modular inverse and primality
-    /// testing (see [`inv_mod_boxed`](crate::bignum::inv_mod_boxed)); this is a
-    /// one-time operation, not a per-message secret path.
+    /// # Side channels
+    /// Key generation deliberately uses the **variable-time** extended-Euclid
+    /// modular inverse [`inv_mod_boxed`](crate::bignum::inv_mod_boxed) for
+    /// `d = e⁻¹ mod φ(n)`, whose loop count depends on its operands, and
+    /// variable-time primality testing. This is a one-time operation on
+    /// freshly generated material, not a per-message secret path, and with the
+    /// usual public `e = 65537` the schedule is short and near
+    /// data-independent — but generate keys somewhere an attacker cannot take
+    /// timing or power measurements. Every *use* of the key stays on the
+    /// constant-time ladders; `qInv` for the PKCS#1 export comes from the
+    /// constant-time CRT precomputation, not from `inv_mod_boxed`.
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(
@@ -635,6 +682,7 @@ impl BoxedRsaPrivateKey {
                     phi_n_minus_1,
                     crt,
                     blinding_seed,
+                    blind_counter: AtomicU32::new(0),
                 };
             }
         }
@@ -805,6 +853,9 @@ impl RawPrivate for BoxedRsaPrivateKey {
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
     }
+    fn modulus_be_into(&self, out: &mut [u8]) {
+        out.copy_from_slice(&self.n.to_be_bytes(self.k));
+    }
 }
 
 /// PKCS#1 DER for runtime-sized keys.
@@ -937,6 +988,7 @@ impl BoxedRsaPrivateKey {
             phi_n_minus_1,
             crt,
             blinding_seed,
+            blind_counter: AtomicU32::new(0),
         })
     }
 
@@ -956,7 +1008,6 @@ impl BoxedRsaPrivateKey {
     /// is structurally broken and re-exporting would emit a CRT parameter
     /// silently set to zero. We refuse to round-trip a corrupted key.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
-        use crate::bignum::inv_mod_boxed;
         use crate::der::{encode_integer, encode_sequence};
         assert!(
             !self.p.is_zero() && !self.q.is_zero(),
@@ -965,8 +1016,19 @@ impl BoxedRsaPrivateKey {
         let one = BoxedUint::from_u64(1);
         let dp = self.d.reduce(&self.p.sub(&one));
         let dq = self.d.reduce(&self.q.sub(&one));
-        let qinv = inv_mod_boxed(&self.q, &self.p)
-            .expect("to_pkcs1_der: gcd(q, p) ≠ 1 — RSA primes are not coprime");
+        // Reuse the CRT precomputation's `qInv`, which is `q^(p−2) mod p`
+        // through the constant-time Montgomery ladder. The variable-time
+        // extended-Euclid `inv_mod_boxed` would run its binary GCD on the
+        // secret primes here — and would need an `expect` for the
+        // non-coprime case. Fall back to it only for a key whose primes are
+        // degenerate enough that `derive_crt_boxed` refused them (in which
+        // case `qInv` is meaningless anyway and any value round-trips).
+        let qinv = match self.crt.as_deref() {
+            Some(crt) => crt.qinv.clone(),
+            None => {
+                crate::bignum::inv_mod_boxed(&self.q, &self.p).unwrap_or_else(|| BoxedUint::zero(1))
+            }
+        };
         let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
         encode_sequence(
             &[
@@ -1752,5 +1814,54 @@ mod tests {
             key.decrypt_pkcs1v15_session(&short, 48),
             Err(Error::InvalidLength)
         );
+    }
+
+    /// RFC 8017 §7.2.2 step 1 on the runtime-sized key: a ciphertext
+    /// representative `>= n` is rejected before the private operation, and
+    /// the session variant keeps its implicit-rejection contract.
+    #[test]
+    fn out_of_range_ciphertext_is_rejected_boxed() {
+        let sk = gen_small_key(b"rsa-oor");
+        let ct = vec![0xffu8; 128]; // 2^1024 − 1 > n for any 1024-bit n
+
+        assert!(sk.decrypt_pkcs1v15(&ct).is_err());
+        assert!(sk.decrypt_oaep::<Sha256>(&ct, b"label").is_err());
+
+        let synthetic = sk.decrypt_pkcs1v15_session(&ct, 48).unwrap();
+        assert_eq!(synthetic.len(), 48);
+        assert_eq!(sk.decrypt_pkcs1v15_session(&ct, 48).unwrap(), synthetic);
+
+        // A well-formed ciphertext still round-trips.
+        let mut rng = HmacDrbg::<Sha256>::new(b"rsa-oor-ok", b"n", &[]);
+        let good = sk
+            .public_key()
+            .encrypt_pkcs1v15(b"secret", &mut rng)
+            .unwrap();
+        assert_eq!(sk.decrypt_pkcs1v15(&good).unwrap().as_slice(), b"secret");
+    }
+
+    /// The blinder must be fresh per operation: two calls with the same
+    /// ciphertext must not reproduce the same blinded computation. Checked at
+    /// the derivation, since the blinder never leaves the private path.
+    #[test]
+    fn blinder_differs_between_operations_on_the_same_ciphertext() {
+        let sk = gen_small_key(b"rsa-blind-nonce");
+        let c = BoxedUint::from_u64(0x1234_5678_9abc_def0);
+        let r0 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 0, &c);
+        let r1 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 1, &c);
+        assert_ne!(r0, r1, "blinder must depend on the operation counter");
+
+        // …and the operation itself still produces the same plaintext twice.
+        let mut rng = HmacDrbg::<Sha256>::new(b"rsa-blind-nonce-ct", b"n", &[]);
+        let ct = sk
+            .public_key()
+            .encrypt_pkcs1v15(b"stable", &mut rng)
+            .unwrap();
+        assert_eq!(
+            sk.decrypt_pkcs1v15(&ct).unwrap(),
+            sk.decrypt_pkcs1v15(&ct).unwrap()
+        );
+        // The counter advanced across those operations.
+        assert!(sk.blind_counter.load(Ordering::Relaxed) >= 2);
     }
 }

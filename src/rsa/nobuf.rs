@@ -262,6 +262,59 @@ mod tests {
         );
     }
 
+    /// RFC 8017 §7.2.2 step 1: a ciphertext representative outside `[0, n)`
+    /// must be reported, not silently reduced mod `n` (release) or tripped
+    /// over in `MontModulus::to_mont`'s debug assertion (debug builds).
+    /// `0xff…ff` is `2^1024 − 1`, above every 1024-bit modulus.
+    #[test]
+    fn out_of_range_ciphertext_is_rejected() {
+        // A key imported without primes: blinding is disabled, so the raw op
+        // is a bare `modulus.pow(c, d)` and `c >= n` reaches `to_mont`
+        // directly. `d` need not be the real exponent — the point is that the
+        // range check fires before any modular arithmetic runs.
+        let real = key();
+        let sk = RsaPrivateKey::<16>::from_components(
+            *real.public_key().modulus(),
+            Uint::from_u64(65537),
+            Uint::from_u64(3),
+        );
+        let ct = [0xffu8; 128];
+        let mut pt = [0u8; 128];
+
+        assert!(sk.decrypt_pkcs1v15_into(&ct, &mut pt).is_err());
+        assert!(
+            sk.decrypt_oaep_into::<Sha256>(&ct, b"label", &mut pt)
+                .is_err()
+        );
+
+        // The session variant must preserve implicit rejection: an
+        // out-of-range ciphertext looks exactly like bad padding, so it
+        // returns the synthetic plaintext rather than an error.
+        let mut out = [0u8; 48];
+        sk.decrypt_pkcs1v15_session_into(&ct, &mut out).unwrap();
+        assert!(out.iter().any(|&b| b != 0));
+        let mut again = [0u8; 48];
+        sk.decrypt_pkcs1v15_session_into(&ct, &mut again).unwrap();
+        assert_eq!(out, again, "synthetic plaintext must be deterministic");
+
+        // An in-range ciphertext still decrypts on a fully-formed key.
+        let mut rng = HmacDrbg::<Sha256>::new(b"oor-inrange", b"nonce", &[]);
+        let mut good = [0u8; 128];
+        real.public_key()
+            .encrypt_pkcs1v15_into(b"secret", &mut rng, &mut good)
+            .unwrap();
+        let n = real.decrypt_pkcs1v15_into(&good, &mut pt).unwrap();
+        assert_eq!(&pt[..n], b"secret");
+
+        // And a blinded (generated) key rejects the out-of-range ciphertext
+        // just the same.
+        assert!(real.decrypt_pkcs1v15_into(&ct, &mut pt).is_err());
+        assert!(
+            real.decrypt_oaep_into::<Sha256>(&ct, b"label", &mut pt)
+                .is_err()
+        );
+    }
+
     #[test]
     fn implicit_rejection_fills_the_whole_buffer() {
         let sk = key();
