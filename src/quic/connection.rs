@@ -306,6 +306,25 @@ pub(crate) struct PathMigration {
     prev_cid: ConnectionId,
 }
 
+/// RFC 9000 §14.1 — the smallest UDP payload a datagram carrying an Initial
+/// packet may have. A server MUST discard Initials received in anything
+/// smaller, and a client MUST expand its Initial-bearing datagrams to at least
+/// this size.
+pub(crate) const MIN_INITIAL_DATAGRAM: usize = 1200;
+
+/// True when the first packet in `datagram` is a QUIC v1 long-header Initial.
+///
+/// Used to apply the RFC 9000 §14.1 datagram-size floor before any
+/// state-changing work (notably the Retry decision) happens. Deliberately
+/// conservative: anything that does not parse as a v1 Initial long header is
+/// left to the normal packet loop.
+fn first_packet_is_initial(datagram: &[u8]) -> bool {
+    if datagram.is_empty() || datagram[0] & 0x80 == 0 {
+        return false;
+    }
+    matches!(LongHeader::parse(datagram), Ok(h) if h.typ == LongType::Initial)
+}
+
 /// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
 /// application close has to be sent in an Initial or Handshake packet, where
 /// the application close frame type (0x1d) is forbidden (§10.2.3).
@@ -1102,12 +1121,42 @@ impl QuicConnection {
             return Ok(());
         }
 
+        // RFC 9000 §14.1 — "A server MUST discard an Initial packet that is
+        // carried in a UDP datagram with a payload that is smaller than the
+        // smallest allowed maximum datagram size of 1200 bytes."
+        //
+        // H-1: this has to run BEFORE the Retry decision below (and before the
+        // anti-amplification credit), otherwise a 9-byte spoofed Initial draws
+        // a ~74-byte Retry at whatever source address it claims — an
+        // unauthenticated 8x reflection amplifier. The per-packet copy of this
+        // check in `feed_long_header_packet` only runs once the Retry path has
+        // already been consulted, so it cannot cover this.
+        if self.role == Role::Server
+            && datagram.len() < MIN_INITIAL_DATAGRAM
+            && first_packet_is_initial(datagram)
+        {
+            return Ok(());
+        }
+
         // RFC 9000 §8.1 — every byte received from an unvalidated peer
         // expands the server's outbound AMP budget by 3×. Bytes that
         // turn out to belong to a non-decryptable packet still count
         // (a generous attacker could otherwise burn our budget without
         // ever proving address ownership).
-        if self.role == Role::Server {
+        //
+        // H-3: the budget is a *per-path* allowance (§8.1, §9.3.1), but
+        // `addr_validation` is a single connection-wide counter, so only
+        // datagrams that arrived from the address we are actually sending to
+        // may extend it. Without this, an attacker who learns the cleartext
+        // DCID can flood undecryptable datagrams from spoofed sources and
+        // credit a budget that is then spent on a migrated-to victim.
+        // `current_rx_addr` is `None` for plain `feed_datagram` callers (no
+        // address information at all), which keeps the legacy behaviour.
+        if self.role == Role::Server
+            && self
+                .current_rx_addr
+                .is_none_or(|a| Some(a) == self.peer_addr)
+        {
             self.addr_validation.note_recv(datagram.len());
         }
 
@@ -1334,8 +1383,19 @@ impl QuicConnection {
         // (and only it — Retry is its own datagram per RFC 9000 §17.2.5,
         // not coalesced with anything else).
         if let Some(dg) = self.pending_retry_datagram.take() {
-            // RFC 9000 §8.1: Retry packets do NOT count against the AMP
-            // budget. (They're inherently bounded to 1 per handshake.)
+            // H-1: charge the Retry against the RFC 9000 §8.1 budget like every
+            // other server egress. The "bounded to 1 per handshake" reasoning
+            // that used to exempt it is void under source-address spoofing —
+            // every spoofed address is a brand-new connection, so "1 per
+            // handshake" is "1 per attacker datagram". The Initial that
+            // triggered the Retry is at least `MIN_INITIAL_DATAGRAM` bytes
+            // (enforced in `feed_datagram`), so a legitimate client always
+            // leaves ample budget for the ~74-byte Retry.
+            if !self.addr_validation.can_send(dg.len()) {
+                self.pending_retry_datagram = Some(dg);
+                return Vec::new();
+            }
+            self.addr_validation.note_sent(dg.len());
             self.endpoint.sent_first_datagram = true;
             return dg;
         }
@@ -3690,7 +3750,10 @@ impl QuicConnection {
         // or processing any frames. Anti-amplification credit from
         // `note_recv` (already charged in `feed_datagram`) is harmless —
         // a too-small datagram simply yields no response.
-        if self.role == Role::Server && level == Level::Initial && udp_datagram_len < 1200 {
+        if self.role == Role::Server
+            && level == Level::Initial
+            && udp_datagram_len < MIN_INITIAL_DATAGRAM
+        {
             return Ok(datagram.len());
         }
 
@@ -7462,6 +7525,89 @@ mod tests {
         })
         .expect("server build");
         (client, server)
+    }
+
+    /// H-1 — RFC 9000 §14.1: a server MUST discard an Initial carried in a
+    /// UDP datagram smaller than 1200 bytes. Before the fix the Retry
+    /// decision ran first, so a 9-byte spoofed Initial drew a ~74-byte Retry
+    /// at an arbitrary (spoofed) address: an unauthenticated 8x reflection
+    /// amplifier.
+    #[test]
+    fn undersized_initial_draws_no_retry() {
+        let (_, mut s) = retry_loopback_pair([7u8; 32]);
+        s.set_peer_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433));
+        s.set_now_secs(1_700_000_000);
+        // Minimal long-header Initial: version 1, zero-length DCID + SCID,
+        // empty token, zero-length payload.
+        let tiny = [0xc0u8, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00];
+        assert!(
+            super::first_packet_is_initial(&tiny),
+            "test vector must parse as an Initial, else it proves nothing"
+        );
+        s.feed_datagram(&tiny)
+            .expect("undersized Initial is dropped");
+        assert!(
+            s.pending_retry_datagram.is_none(),
+            "no Retry may be minted for a sub-1200-byte Initial"
+        );
+        assert!(
+            s.pop_datagram().is_empty(),
+            "sub-1200-byte Initial must draw no response at all"
+        );
+    }
+
+    /// H-1 (companion) — a full-size Initial still gets its Retry, and the
+    /// Retry is now charged against the RFC 9000 §8.1 anti-amplification
+    /// budget instead of being exempt from it.
+    #[test]
+    fn full_size_initial_draws_a_budgeted_retry() {
+        let (mut c, mut s) = retry_loopback_pair([8u8; 32]);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        s.set_peer_addr(peer);
+        s.set_now_secs(1_700_000_000);
+        let first = c.pop_datagram();
+        assert!(first.len() >= 1200, "client Initial must be padded to 1200");
+        s.feed_datagram(&first).expect("feed");
+        let retry = s.pop_datagram();
+        assert!(!retry.is_empty(), "full-size Initial must draw a Retry");
+        assert!(
+            s.addr_validation.bytes_sent >= retry.len() as u64,
+            "the Retry must be charged against the AMP budget"
+        );
+        assert!(
+            s.addr_validation.bytes_sent <= s.addr_validation.bytes_recv * 3,
+            "AMP budget must not be exceeded"
+        );
+    }
+
+    /// H-3 — RFC 9000 §8.1 / §9.3.1 make the anti-amplification allowance a
+    /// *per-path* budget. Datagrams arriving from an address other than the
+    /// one we send to must not extend it, or an attacker who learns the
+    /// cleartext DCID can credit a budget that is later spent on a
+    /// migrated-to victim.
+    #[test]
+    fn amp_budget_ignores_off_path_datagrams() {
+        let (_, mut s) = retry_loopback_pair([9u8; 32]);
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433);
+        s.set_peer_addr(peer);
+        let spoofed = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 1234);
+        // Undecryptable short-header garbage: it is dropped either way; the
+        // question is only whether it bought the attacker any budget.
+        let junk = alloc::vec![0x40u8; 1200];
+
+        let before = s.addr_validation.bytes_recv;
+        let _ = s.feed_datagram_from(spoofed, &junk);
+        assert_eq!(
+            s.addr_validation.bytes_recv, before,
+            "off-path datagram must not extend the AMP budget"
+        );
+
+        let _ = s.feed_datagram_from(peer, &junk);
+        assert_eq!(
+            s.addr_validation.bytes_recv,
+            before + junk.len() as u64,
+            "on-path datagram must still extend the AMP budget"
+        );
     }
 
     /// Test 9 — full Retry handshake, with the ODCID risk-surface check.
