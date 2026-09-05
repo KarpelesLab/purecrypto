@@ -13,10 +13,19 @@
 //! * **No file descriptor.** Saves one open fd per thread and one
 //!   read-from-`/dev/urandom` VFS traversal per call.
 //!
-//! Architectures supported: x86_64, aarch64, armv7 (EABI), riscv64. On any
-//! other Linux arch [`try_getrandom`] returns `Err(NotImplemented)` and the
-//! caller falls back to `/dev/urandom`. On kernels older than 3.17 the
-//! syscall returns `ENOSYS`; the caller falls back transparently.
+//! Architectures supported: x86_64, aarch64, armv7 (EABI, both ARM and Thumb
+//! instruction sets) and riscv64. On any other Linux arch [`try_getrandom`]
+//! returns `Err(NotImplemented)` and the caller falls back to `/dev/urandom`.
+//! On kernels older than 3.17 the syscall returns `ENOSYS`; the caller falls
+//! back transparently.
+//!
+//! On armv7 the syscall number lives in `r7`, which is also the Thumb frame
+//! pointer and therefore reserved by LLVM — naming it as an `asm!` operand is a
+//! hard compile error on any Thumb-mode target (`thumbv7neon-unknown-linux-*`).
+//! [`getrandom_syscall`] saves and restores it around the trap instead. CI
+//! `cargo check`s both `arm-unknown-linux-gnueabihf` (ARM mode) and
+//! `thumbv7neon-unknown-linux-gnueabihf` (Thumb mode) so this cannot regress
+//! into a feature that is in the DEFAULT set yet silently unbuildable.
 //!
 //! The syscall is interrupted by signals (`EINTR`) and may return fewer
 //! bytes than requested for `len > 256`; [`try_getrandom`] handles both by
@@ -154,13 +163,25 @@ unsafe fn getrandom_syscall(buf: *mut u8, len: usize, flags: u32) -> isize {
 
 /// armv7 (32-bit EABI): `svc #0`, syscall number 384, args in r0/r1/r2,
 /// syscall number in r7, return in r0.
+///
+/// `r7` is the ARM/Thumb frame pointer and LLVM reserves it, so it cannot be
+/// named as an `asm!` operand — `in("r7")` is rejected outright with *"the
+/// frame pointer (r7) cannot be used as an operand for inline asm"*. The
+/// portable workaround (the same one `rustix`/`linux-raw-sys` use for this
+/// exact register) is to let the register allocator pick a scratch register,
+/// save `r7` into it, load the syscall number, trap, and restore `r7` — all
+/// within one `asm!` block so nothing observes the clobbered frame pointer.
 #[cfg(all(target_os = "linux", target_arch = "arm"))]
 unsafe fn getrandom_syscall(buf: *mut u8, len: usize, flags: u32) -> isize {
     let ret: isize;
     unsafe {
         core::arch::asm!(
+            "mov {tmp}, r7",
+            "mov r7, {nr}",
             "svc #0",
-            in("r7") 384isize,
+            "mov r7, {tmp}",
+            tmp = out(reg) _,
+            nr = in(reg) 384isize,
             inlateout("r0") buf as isize => ret,
             in("r1") len,
             in("r2") flags as usize,
