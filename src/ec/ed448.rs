@@ -652,14 +652,25 @@ mod tests {
         sig_bytes[57] = 1;
         let sig = Ed448Signature::from_bytes(sig_bytes);
 
-        // identity (y = 1) and the order-2 point (y = p − 1 ≡ −1).
+        // The full 4-torsion subgroup of edwards448, little-endian `y`
+        // with the sign bit in the top byte:
+        //   (0, 1)  identity
+        //   (0, −1) order 2, y = p − 1
+        //   (±1, 0) order 4, y = 0 with either sign of x
+        // p = 2^448 − 2^224 − 1, so p − 1 is 0xfe, 0xff×26, 0xfe, 0xff×27.
         let mut identity = [0u8; 57];
         identity[0] = 1;
+
         let mut order2 = [0xffu8; 57];
-        order2[27] = 0xfe; // p = 2^448 − 2^224 − 1, so p − 1 has a 0xfe limb
+        order2[0] = 0xfe;
+        order2[28] = 0xfe;
         order2[56] = 0x00;
 
-        for a in [identity, order2] {
+        let order4_even = [0u8; 57];
+        let mut order4_odd = [0u8; 57];
+        order4_odd[56] = 0x80;
+
+        for a in [identity, order2, order4_even, order4_odd] {
             let pk = Ed448PublicKey::from_bytes(a);
             assert!(pk.verify(b"small order", &sig).is_err());
             assert!(pk.verify(b"", &sig).is_err());
