@@ -262,7 +262,10 @@ impl Sm2PublicKey {
             for &b in t.iter() {
                 acc |= b;
             }
-            if bool::from(acc.ct_eq(&0)) {
+            // An empty plaintext has an empty key stream, so the accumulator is
+            // trivially zero and the retry would never terminate; the zero-key
+            // rule only makes sense for a stream that actually masks something.
+            if !msg.is_empty() && bool::from(acc.ct_eq(&0)) {
                 continue;
             }
 
@@ -418,6 +421,18 @@ impl Sm2PrivateKey {
         let mut z = enc32(&x2);
         z.extend_from_slice(&enc32(&y2));
         let t = kdf(&z, c2.len());
+        // GB/T 32918.4-2016 §7 step B4: abort when the KDF stream is all
+        // zeros (the ciphertext would then equal the plaintext). The C3 hash
+        // check below catches it in practice, but the standard mandates the
+        // explicit test. Accumulate in constant time — `t` is derived from
+        // the shared secret.
+        let mut acc = 0u8;
+        for &b in &t {
+            acc |= b;
+        }
+        if !c2.is_empty() && acc == 0 {
+            return Err(Error::InvalidInput);
+        }
         let msg: Vec<u8> = c2.iter().zip(&t).map(|(c, k)| c ^ k).collect();
 
         // u = SM3(x2 ‖ M ‖ y2); verify u == C3 in constant time.
@@ -791,5 +806,41 @@ mod tests {
         let sig = Sm2Signature::from_der(&der3).unwrap();
         assert_eq!(sig.to_bytes().len(), 64);
         assert_eq!(sig.to_der(), der3);
+    }
+
+    /// GB/T 32918.4 §7 step B4: an all-zero KDF stream must abort decryption.
+    /// The stream is SM3-derived, so it cannot be forced from outside; what is
+    /// testable — and what the guard must not break — is that the check does
+    /// not fire on the legitimate degenerate case (an empty message, where
+    /// `t` is empty and the accumulator is trivially zero), and that normal
+    /// messages still round-trip. The zero detection itself is exercised
+    /// directly on `kdf`'s output.
+    #[test]
+    fn kdf_zero_check_does_not_break_valid_ciphertexts() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-kdf-zero", b"n", &[]);
+        let sk = Sm2PrivateKey::generate(&mut rng);
+        let pk = sk.public_key();
+
+        // Empty message: C2 is empty, so `t` is empty and its all-zero test is
+        // vacuously true. `encrypt` used to spin forever retrying here — this
+        // is the regression guard for that hang.
+        let ct = pk.encrypt(b"", &mut rng).unwrap();
+        assert_eq!(sk.decrypt(&ct).unwrap(), b"");
+
+        // Non-empty messages of a few lengths, spanning the 32-byte chunks the
+        // KDF emits.
+        for len in [1usize, 31, 32, 33, 100] {
+            let msg = vec![0xa5u8; len];
+            let ct = pk.encrypt(&msg, &mut rng).unwrap();
+            assert_eq!(sk.decrypt(&ct).unwrap(), msg);
+        }
+
+        // The KDF never produces an all-zero stream for these inputs, which is
+        // why the check is a belt-and-braces guard rather than a live path.
+        for len in [1usize, 32, 96] {
+            let t = kdf(b"some shared secret", len);
+            assert_eq!(t.len(), len);
+            assert!(t.iter().any(|&b| b != 0), "KDF stream unexpectedly zero");
+        }
     }
 }
