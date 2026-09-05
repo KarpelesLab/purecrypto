@@ -59,12 +59,13 @@ pub mod transport_params;
 pub(crate) mod varint;
 
 pub use connection::{
-    CloseInfo, CloseInitiator, CloseKind, QuicConfig, QuicConnection, QuicSession, Role,
+    CloseInfo, CloseInitiator, CloseKind, DEFAULT_MAX_IDLE_TIMEOUT_MS, QuicConfig, QuicConnection,
+    QuicSession, Role,
 };
 pub use ecn::EcnCodepoint;
 pub use peek::peek_initial_sni;
 // Re-export so callers can name the peek's return type from `quic` directly.
 pub use crate::tls::ClientHelloInfo;
-pub use server::QuicServer;
+pub use server::{DEFAULT_MAX_CONNECTIONS, QuicServer};
 pub use stream::StreamId;
 pub use transport_params::{PreferredAddress, TransportParameters};

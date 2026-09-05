@@ -156,7 +156,6 @@ pub enum Role {
 /// additional transport parameters, QUIC v2 negotiation) can be added
 /// as new fields without breaking downstream literal construction.
 /// Construct via `QuicConfig::default()` + field assignment.
-#[derive(Default)]
 #[non_exhaustive]
 pub struct QuicConfig {
     /// The TLS 1.3 client / server config to drive. The QUIC layer adds
@@ -234,6 +233,29 @@ pub struct QuicConfig {
     pub enable_early_data: bool,
 }
 
+impl Default for QuicConfig {
+    /// H-2: unlike a bare `TransportParameters::default()`, the default config
+    /// advertises a non-zero `max_idle_timeout` ([`DEFAULT_MAX_IDLE_TIMEOUT_MS`]).
+    /// Without one, a half-open connection created from a single spoofed
+    /// Initial never expires — neither side has advertised a timeout, so
+    /// nothing ever arms the RFC 9000 §10.1 idle close.
+    fn default() -> Self {
+        let transport_params = TransportParameters {
+            max_idle_timeout_ms: Some(DEFAULT_MAX_IDLE_TIMEOUT_MS),
+            ..TransportParameters::default()
+        };
+        Self {
+            tls: crate::tls::Config::default(),
+            transport_params,
+            require_retry: false,
+            retry_secret: None,
+            reset_key: None,
+            resumption: None,
+            enable_early_data: false,
+        }
+    }
+}
+
 /// Everything needed to resume a QUIC connection with 0-RTT.
 ///
 /// Take one from a completed client connection with
@@ -305,6 +327,16 @@ pub(crate) struct PathMigration {
     /// if validation fails, and retired once it succeeds (RFC 9000 §9.5).
     prev_cid: ConnectionId,
 }
+
+/// Default `max_idle_timeout` (RFC 9000 §18.2) advertised by
+/// [`QuicConfig::default`], in milliseconds.
+pub const DEFAULT_MAX_IDLE_TIMEOUT_MS: u64 = 30_000;
+
+/// Hard ceiling on how long a connection may sit idle when *neither* endpoint
+/// advertised a `max_idle_timeout`. RFC 9000 §10.1 leaves that case open-ended,
+/// which lets a single spoofed Initial pin server-side connection state
+/// forever; we close instead.
+const IDLE_TIMEOUT_CEILING: Duration = Duration::from_secs(30);
 
 /// RFC 9000 §14.1 — the smallest UDP payload a datagram carrying an Initial
 /// packet may have. A server MUST discard Initials received in anything
@@ -1783,7 +1815,10 @@ impl QuicConnection {
     /// the two non-zero `max_idle_timeout` advertisements (ours and, once the
     /// handshake surfaces them, the peer's), raised to at least three times the
     /// current PTO (§10.1) so loss recovery always gets a chance first.
-    /// `None` when neither endpoint advertised a (non-zero) idle timeout.
+    ///
+    /// When neither endpoint advertised a (non-zero) idle timeout the
+    /// [`IDLE_TIMEOUT_CEILING`] applies, so the result is always `Some`; the
+    /// `Option` is kept for the callers' convenience.
     fn effective_idle_timeout(&self) -> Option<Duration> {
         let local = self.our_params.max_idle_timeout_ms.filter(|&v| v != 0);
         let peer = self
@@ -1791,13 +1826,17 @@ impl QuicConnection {
             .as_ref()
             .and_then(|p| p.max_idle_timeout_ms)
             .filter(|&v| v != 0);
-        let chosen_ms = match (local, peer) {
-            (Some(a), Some(b)) => a.min(b),
-            (Some(a), None) => a,
-            (None, Some(b)) => b,
-            (None, None) => return None,
+        let base = match (local, peer) {
+            (Some(a), Some(b)) => Duration::from_millis(a.min(b)),
+            (Some(a), None) => Duration::from_millis(a),
+            (None, Some(b)) => Duration::from_millis(b),
+            // H-2: neither side advertised one. RFC 9000 §10.1 then imposes no
+            // deadline at all, which leaves half-open connections (a server
+            // accepting on a spoofed Initial never sees peer parameters) alive
+            // for the lifetime of the process. Fall back to a hard ceiling so
+            // every connection eventually expires.
+            (None, None) => IDLE_TIMEOUT_CEILING,
         };
-        let base = Duration::from_millis(chosen_ms);
         let floor = self.endpoint.loss.pto_period().saturating_mul(3);
         Some(base.max(floor))
     }
@@ -2612,6 +2651,22 @@ impl QuicConnection {
     /// start-relative timers into a common clock frame.
     pub(crate) fn started_at(&self) -> Instant {
         self.start
+    }
+
+    /// Test hook: moves the `t=0` anchor so timer deadlines can be reached
+    /// without the test sleeping.
+    #[cfg(test)]
+    pub(crate) fn set_start_for_test(&mut self, at: Instant) {
+        self.start = at;
+    }
+
+    /// Test hook: retires one of our local connection IDs, as a peer's
+    /// RETIRE_CONNECTION_ID frame would.
+    #[cfg(test)]
+    pub(crate) fn retire_local_cid_for_test(&mut self, seq: u64) {
+        if let Some(pool) = self.cid_local.as_mut() {
+            let _ = pool.retire(seq);
+        }
     }
 
     /// Queues `data` for transmission as an unreliable DATAGRAM frame
@@ -7577,6 +7632,40 @@ mod tests {
         assert!(
             s.addr_validation.bytes_sent <= s.addr_validation.bytes_recv * 3,
             "AMP budget must not be exceeded"
+        );
+    }
+
+    /// H-2 — `QuicConfig::default()` must advertise a non-zero
+    /// `max_idle_timeout`, and a connection where *neither* side advertised one
+    /// must still expire rather than pinning state forever.
+    #[test]
+    fn half_open_connection_always_has_an_idle_deadline() {
+        assert_eq!(
+            QuicConfig::default().transport_params.max_idle_timeout_ms,
+            Some(DEFAULT_MAX_IDLE_TIMEOUT_MS),
+            "the default config must advertise an idle timeout"
+        );
+
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: TransportParameters::default(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        assert!(
+            s.our_params.max_idle_timeout_ms.is_none() && s.peer_params.is_none(),
+            "test premise: no idle timeout on either side"
+        );
+        assert_eq!(
+            s.effective_idle_timeout(),
+            Some(IDLE_TIMEOUT_CEILING),
+            "the hard ceiling must apply when neither side advertised one"
+        );
+        s.on_timeout(IDLE_TIMEOUT_CEILING + Duration::from_secs(1));
+        assert!(
+            s.is_closed(),
+            "a half-open connection must eventually expire"
         );
     }
 

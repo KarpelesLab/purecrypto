@@ -92,7 +92,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::Instant;
 
-use crate::quic::connection::{QuicConfig, QuicConnection};
+use crate::quic::connection::{MIN_INITIAL_DATAGRAM, QuicConfig, QuicConnection};
 use crate::quic::ecn::EcnCodepoint;
 use crate::quic::pkt::{LongHeader, LongType, QUIC_V1, build_version_negotiation};
 use crate::quic::reset::{MIN_STATELESS_RESET_LEN, build_stateless_reset, stateless_reset_token};
@@ -128,10 +128,30 @@ fn parse_long_invariant(buf: &[u8]) -> Option<(u32, &[u8], &[u8])> {
     Some((version, &buf[6..dcid_end], &buf[scid_start..scid_end]))
 }
 
+/// Default value of [`QuicServer::max_connections`].
+///
+/// Accepting a connection means building a fresh [`QuicConfig`] (TLS config,
+/// certificate chain, private key) and a full [`QuicConnection`], all before
+/// the peer has proved anything. RFC 9000 §8.1 anti-amplification bounds the
+/// *bytes* such a peer can draw out of us but not the *state*, so the count is
+/// capped here as well.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
+
+/// Cap on [`QuicServer`]'s queue of connection-less responses (stateless
+/// resets and Version Negotiation packets). The queue is fed by
+/// unauthenticated inbound datagrams, so it needs an explicit bound; a host
+/// that drains with [`QuicServer::poll_transmit`] after every
+/// [`QuicServer::recv`] never comes close to it.
+const MAX_PENDING_DATAGRAMS: usize = 256;
+
 /// One hosted connection plus the peer address its outbound datagrams go to.
 struct Hosted {
     conn: QuicConnection,
     addr: SocketAddr,
+    /// The local connection IDs currently routed to this connection. Kept so
+    /// `by_cid` can drop the entries for CIDs the peer has retired instead of
+    /// growing without bound (M-5).
+    cids: Vec<ConnectionId>,
 }
 
 /// A sans-I/O QUIC server that demultiplexes inbound UDP datagrams to per-peer
@@ -153,6 +173,9 @@ struct Hosted {
 pub struct QuicServer {
     make_config: Box<dyn FnMut() -> Result<QuicConfig, Error>>,
     reset_key: [u8; 32],
+    /// Hard cap on hosted connections. An unrecognised Initial arriving while
+    /// the table is full is dropped rather than accepted (H-2).
+    max_connections: usize,
     conns: HashMap<u64, Hosted>,
     /// Our issued local CIDs → connection id (primary routing table).
     by_cid: HashMap<ConnectionId, u64>,
@@ -190,6 +213,7 @@ impl QuicServer {
         Ok(QuicServer {
             make_config: Box::new(make_config),
             reset_key,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
             conns: HashMap::new(),
             by_cid: HashMap::new(),
             by_addr: HashMap::new(),
@@ -202,6 +226,21 @@ impl QuicServer {
     /// Number of live connections currently hosted.
     pub fn connection_count(&self) -> usize {
         self.conns.len()
+    }
+
+    /// The cap on simultaneously hosted connections. Defaults to
+    /// [`DEFAULT_MAX_CONNECTIONS`].
+    pub fn max_connections(&self) -> usize {
+        self.max_connections
+    }
+
+    /// Sets the cap on simultaneously hosted connections (H-2). While the
+    /// table is full, an unrecognised Initial is dropped instead of allocating
+    /// a whole new [`QuicConnection`] — including the TLS config, certificate
+    /// chain and private key that `make_config` rebuilds per accept — for a
+    /// peer that has proved nothing. Existing connections are never evicted.
+    pub fn set_max_connections(&mut self, max: usize) {
+        self.max_connections = max;
     }
 
     /// Sets the coarse wall-clock seconds source used for Retry-token minting
@@ -242,8 +281,15 @@ impl QuicServer {
                 return Ok(());
             }
             if version != QUIC_V1 {
+                // RFC 9000 §14.1: "Servers MUST drop smaller packets that
+                // specify unsupported versions." M-3: without this a 7-byte
+                // spoofed datagram draws an 11-byte Version Negotiation at an
+                // arbitrary address — a small but free reflector.
+                if datagram.len() < MIN_INITIAL_DATAGRAM {
+                    return Ok(());
+                }
                 let vn = build_version_negotiation(inv_scid, inv_dcid, &[QUIC_V1]);
-                self.pending.push_back((from, EcnCodepoint::NotEct, vn));
+                self.push_pending(from, EcnCodepoint::NotEct, vn);
                 return Ok(());
             }
             // v1 — now the full type-aware parse is valid.
@@ -337,8 +383,19 @@ impl QuicServer {
 
     // ---- internals ----
 
+    /// Queues a connection-less response, dropping it if the queue is already
+    /// at [`MAX_PENDING_DATAGRAMS`]. The queue is driven by unauthenticated
+    /// inbound datagrams, so it must not be allowed to grow without bound
+    /// (M-3).
+    fn push_pending(&mut self, to: SocketAddr, ecn: EcnCodepoint, datagram: Vec<u8>) {
+        if self.pending.len() >= MAX_PENDING_DATAGRAMS {
+            return;
+        }
+        self.pending.push_back((to, ecn, datagram));
+    }
+
     fn feed(&mut self, id: u64, from: SocketAddr, ecn: EcnCodepoint, datagram: &[u8]) {
-        let cids = match self.conns.get_mut(&id) {
+        let (cids, prev_cids) = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2).
@@ -354,11 +411,22 @@ impl QuicServer {
                     self.by_addr.remove(&h.addr);
                     h.addr = addr;
                 }
-                h.conn.local_cids()
+                let cids = h.conn.local_cids();
+                let prev = core::mem::replace(&mut h.cids, cids.clone());
+                (cids, prev)
             }
             None => return,
         };
         self.by_addr.insert(self.conns[&id].addr, id);
+        // M-5: forget the CIDs this connection has stopped answering to. A
+        // peer that spams RETIRE_CONNECTION_ID makes us mint a replacement
+        // each time; inserting cumulatively left every superseded CID in the
+        // routing table for the life of the process.
+        for old in prev_cids {
+            if !cids.contains(&old) {
+                self.by_cid.remove(&old);
+            }
+        }
         // Learn any CIDs this connection now answers to (its SCID after the
         // first Initial, plus any issued via NEW_CONNECTION_ID).
         for cid in cids {
@@ -372,6 +440,18 @@ impl QuicServer {
         ecn: EcnCodepoint,
         datagram: &[u8],
     ) -> Result<(), Error> {
+        // H-2: reap first, so a table full of connections that have already
+        // closed (idle-timed-out or reset) does not lock out fresh peers, then
+        // refuse to allocate above the cap. Building the connection is
+        // expensive — `make_config` rebuilds the TLS config, certificate chain
+        // and private key — and nothing about an unrecognised Initial is
+        // authenticated, so the state it creates has to be bounded.
+        if self.conns.len() >= self.max_connections {
+            self.reap_closed();
+            if self.conns.len() >= self.max_connections {
+                return Ok(());
+            }
+        }
         let mut cfg = (self.make_config)()?;
         cfg.reset_key = Some(self.reset_key);
         let mut conn = QuicConnection::server(cfg)?;
@@ -379,7 +459,14 @@ impl QuicServer {
         conn.set_now_secs(self.now_secs);
         let id = self.next_id;
         self.next_id += 1;
-        self.conns.insert(id, Hosted { conn, addr: from });
+        self.conns.insert(
+            id,
+            Hosted {
+                conn,
+                addr: from,
+                cids: Vec::new(),
+            },
+        );
         self.by_addr.insert(from, id);
         self.feed(id, from, ecn, datagram);
         Ok(())
@@ -396,7 +483,7 @@ impl QuicServer {
         let token = stateless_reset_token(&self.reset_key, dcid);
         let len = (triggering_len - 1).max(MIN_STATELESS_RESET_LEN);
         let pkt = build_stateless_reset(&mut OsRng, &token, len);
-        self.pending.push_back((from, EcnCodepoint::NotEct, pkt));
+        self.push_pending(from, EcnCodepoint::NotEct, pkt);
     }
 
     fn reap_closed(&mut self) {
@@ -512,6 +599,127 @@ mod server_tests {
             })
         })
         .expect("server build")
+    }
+
+    /// H-2 — an unrecognised Initial used to allocate a whole `QuicConnection`
+    /// (rebuilding the TLS config, certificate chain and key) with no cap at
+    /// all, so a spoofed-source flood could exhaust memory. `max_connections`
+    /// now bounds the table; over the cap the Initial is dropped.
+    #[test]
+    fn max_connections_bounds_accepted_state() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x31; 32]);
+        srv.set_max_connections(2);
+        assert_eq!(srv.max_connections(), 2);
+        for i in 0..8u16 {
+            let mut c = client(&cert);
+            let dg = c.pop_datagram();
+            assert!(dg.len() >= 1200);
+            srv.recv(addr(41000 + i), EcnCodepoint::NotEct, &dg)
+                .unwrap();
+        }
+        assert_eq!(
+            srv.connection_count(),
+            2,
+            "the connection table must not grow past max_connections"
+        );
+    }
+
+    /// H-2 — a connection accepted from a spoofed Initial never sees peer
+    /// transport parameters, so before the fix `effective_idle_timeout()`
+    /// returned `None` and the entry never expired. It must now age out and be
+    /// reaped by `on_timeout`.
+    #[test]
+    fn half_open_connection_is_reaped_by_the_idle_timer() {
+        let (_, cert) = server_identity();
+        // Neither side advertises a `max_idle_timeout`: exactly the shape of a
+        // connection accepted from a spoofed Initial that never progresses.
+        let mut srv = QuicServer::with_reset_key([0x32; 32], || {
+            Ok(QuicConfig {
+                tls: server_identity().0,
+                transport_params: TransportParameters::default(),
+                ..QuicConfig::default()
+            })
+        })
+        .expect("server build");
+        let mut c = client(&cert);
+        let dg = c.pop_datagram();
+        srv.recv(addr(41100), EcnCodepoint::NotEct, &dg).unwrap();
+        assert_eq!(srv.connection_count(), 1);
+        // Drop everything the server wants to say; the "client" never answers.
+        while srv.poll_transmit().is_some() {}
+        // Rewind each hosted connection's clock so the idle deadline is in the
+        // past without the test having to sleep.
+        let past = Instant::now() - Duration::from_secs(600);
+        for h in srv.conns.values_mut() {
+            h.conn.set_start_for_test(past);
+        }
+        srv.on_timeout();
+        assert_eq!(
+            srv.connection_count(),
+            0,
+            "a half-open connection must expire on the idle timer"
+        );
+        assert!(srv.by_cid.is_empty(), "its routing entries must go too");
+    }
+
+    /// M-3 — RFC 9000 §14.1: a server MUST drop packets specifying an
+    /// unsupported version when they are carried in an undersized datagram.
+    /// Otherwise a 7-byte spoofed datagram draws an 11-byte Version
+    /// Negotiation at an address of the attacker's choosing.
+    #[test]
+    fn no_version_negotiation_for_undersized_datagram() {
+        let mut srv = server([0x33; 32]);
+        let mut pkt = alloc::vec![0xC0u8];
+        pkt.extend_from_slice(&0x1a2a_3a4au32.to_be_bytes());
+        pkt.push(0); // zero-length DCID
+        pkt.push(0); // zero-length SCID
+        assert!(pkt.len() < MIN_INITIAL_DATAGRAM);
+        srv.recv(addr(50002), EcnCodepoint::NotEct, &pkt).unwrap();
+        assert!(
+            srv.poll_transmit().is_none(),
+            "no reflected Version Negotiation for a tiny datagram"
+        );
+    }
+
+    /// M-5 — retiring a connection ID must remove it from the router's `by_cid`
+    /// table, not merely add its replacement.
+    #[test]
+    fn retired_cids_leave_the_routing_table() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x34; 32]);
+        let mut c = client(&cert);
+        let (ca, sa) = (addr(41200), addr(443));
+        // Drive the handshake to completion so both sides issue extra CIDs.
+        for _ in 0..64 {
+            let dg = c.pop_datagram();
+            if !dg.is_empty() {
+                srv.recv(ca, EcnCodepoint::NotEct, &dg).unwrap();
+            }
+            match srv.poll_transmit() {
+                Some((_, _, dg)) => c.feed_datagram_from(sa, &dg).unwrap(),
+                None if dg.is_empty() => break,
+                None => {}
+            }
+        }
+        assert!(c.is_handshake_complete(), "handshake must complete");
+        let before = srv.by_cid.len();
+        assert!(before >= 2, "server should have issued a spare CID");
+        // Retire the handshake CID, exactly as a peer's RETIRE_CONNECTION_ID
+        // for sequence 0 would.
+        let id = *srv.by_cid.values().next().expect("one connection");
+        srv.conns
+            .get_mut(&id)
+            .expect("hosted")
+            .conn
+            .retire_local_cid_for_test(0);
+        // Any subsequent feed refreshes the routing table.
+        srv.feed(id, ca, EcnCodepoint::NotEct, &[]);
+        assert_eq!(
+            srv.by_cid.len(),
+            before - 1,
+            "the retired CID must be dropped from the routing table"
+        );
     }
 
     /// Two clients sharing one `QuicServer` both complete the handshake (routed
@@ -690,7 +898,9 @@ mod server_tests {
         pkt.extend_from_slice(&dcid);
         pkt.push(scid.len() as u8);
         pkt.extend_from_slice(&scid);
-        pkt.extend_from_slice(&[0u8; 16]);
+        // RFC 9000 §14.1 — a server only answers datagrams of at least 1200
+        // bytes, so pad the filler out to a realistic size.
+        pkt.extend_from_slice(&[0u8; 1200]);
 
         srv.recv(addr(50001), EcnCodepoint::NotEct, &pkt).unwrap();
         let (to, _ecn, vn) = srv.poll_transmit().expect("a Version Negotiation reply");
