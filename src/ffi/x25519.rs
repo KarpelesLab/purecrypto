@@ -19,10 +19,14 @@ pub unsafe extern "C" fn pc_x25519(scalar: *const u8, peer: *const u8, out: *mut
         if out.is_null() {
             return PcStatus::NullPointer;
         }
-        let scalar: [u8; 32] = s.try_into().unwrap();
+        // Local copy of the caller's private scalar: `[u8; 32]` is `Copy`, so
+        // `from_bytes` below leaves this frame holding a second copy of the
+        // long-term secret. Wipe it on every exit path (the shared secret is
+        // already wiped for the same reason).
+        let mut scalar: [u8; 32] = s.try_into().unwrap();
         let peer: [u8; 32] = p.try_into().unwrap();
         let sk = X25519PrivateKey::from_bytes(scalar);
-        match sk.diffie_hellman(&peer) {
+        let result = match sk.diffie_hellman(&peer) {
             Ok(mut secret) => {
                 unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), out, 32) };
                 // Wipe the local copy of the shared secret before its array
@@ -32,7 +36,9 @@ pub unsafe extern "C" fn pc_x25519(scalar: *const u8, peer: *const u8, out: *mut
                 PcStatus::Ok
             }
             Err(_) => PcStatus::Verification,
-        }
+        };
+        wipe_array(&mut scalar);
+        result
     })
 }
 
@@ -50,10 +56,12 @@ pub unsafe extern "C" fn pc_x25519_public(scalar: *const u8, out: *mut u8) -> Pc
         if out.is_null() {
             return PcStatus::NullPointer;
         }
-        let scalar: [u8; 32] = s.try_into().unwrap();
+        // See `pc_x25519`: wipe this frame's copy of the private scalar.
+        let mut scalar: [u8; 32] = s.try_into().unwrap();
         let sk = X25519PrivateKey::from_bytes(scalar);
         let pk = sk.public_key();
         unsafe { core::ptr::copy_nonoverlapping(pk.as_ptr(), out, 32) };
+        wipe_array(&mut scalar);
         PcStatus::Ok
     })
 }
@@ -73,10 +81,14 @@ pub unsafe extern "C" fn pc_x448(scalar: *const u8, peer: *const u8, out: *mut u
         if out.is_null() {
             return PcStatus::NullPointer;
         }
-        let scalar: [u8; 56] = s.try_into().unwrap();
+        // Local copy of the caller's private scalar: `[u8; 56]` is `Copy`, so
+        // `from_bytes` below leaves this frame holding a second copy of the
+        // long-term secret. Wipe it on every exit path (the shared secret is
+        // already wiped for the same reason).
+        let mut scalar: [u8; 56] = s.try_into().unwrap();
         let peer: [u8; 56] = p.try_into().unwrap();
         let sk = X448PrivateKey::from_bytes(scalar);
-        match sk.diffie_hellman(&peer) {
+        let result = match sk.diffie_hellman(&peer) {
             Ok(mut secret) => {
                 unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), out, 56) };
                 // Wipe the local copy of the shared secret before its array
@@ -86,7 +98,9 @@ pub unsafe extern "C" fn pc_x448(scalar: *const u8, peer: *const u8, out: *mut u
                 PcStatus::Ok
             }
             Err(_) => PcStatus::Verification,
-        }
+        };
+        wipe_array(&mut scalar);
+        result
     })
 }
 
@@ -104,10 +118,12 @@ pub unsafe extern "C" fn pc_x448_public(scalar: *const u8, out: *mut u8) -> PcSt
         if out.is_null() {
             return PcStatus::NullPointer;
         }
-        let scalar: [u8; 56] = s.try_into().unwrap();
+        // See `pc_x448`: wipe this frame's copy of the private scalar.
+        let mut scalar: [u8; 56] = s.try_into().unwrap();
         let sk = X448PrivateKey::from_bytes(scalar);
         let pk = sk.public_key();
         unsafe { core::ptr::copy_nonoverlapping(pk.as_ptr(), out, 56) };
+        wipe_array(&mut scalar);
         PcStatus::Ok
     })
 }
