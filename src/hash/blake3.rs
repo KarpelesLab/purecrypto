@@ -703,8 +703,7 @@ mod tests {
                     }
                 }
                 if supported16() {
-                    let block: &[u8; 16 * CHUNK_LEN] =
-                        buf[..16 * CHUNK_LEN].try_into().unwrap();
+                    let block: &[u8; 16 * CHUNK_LEN] = buf[..16 * CHUNK_LEN].try_into().unwrap();
                     let got = hash_chunks16(block, &k, base, flags);
                     for (lane, g) in got.iter().enumerate() {
                         assert_eq!(

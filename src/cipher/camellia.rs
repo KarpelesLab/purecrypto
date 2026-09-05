@@ -167,6 +167,16 @@ fn ka_kb(kl: (u64, u64), kr: (u64, u64)) -> ((u64, u64), (u64, u64)) {
     e1 ^= f(e2, SIGMA[5]);
     let kb = (e1, e2);
 
+    // The Feistel temporaries hold KA and KB, from which the whole schedule
+    // (and, with KL, the key) follows; don't leave them in the frame.
+    d1 = 0;
+    d2 = 0;
+    e1 = 0;
+    e2 = 0;
+    for v in [&d1, &d2, &e1, &e2] {
+        let _ = core::hint::black_box(v);
+    }
+
     (ka, kb)
 }
 
@@ -188,7 +198,7 @@ impl Schedule {
     /// Builds the encryption schedule for a 128-bit key.
     fn new128(kl: (u64, u64)) -> Self {
         let kr = (0u64, 0u64);
-        let (ka, _kb) = ka_kb(kl, kr);
+        let (mut ka, _kb) = ka_kb(kl, kr);
         let kw = [
             rotl_hi(kl.0, kl.1, 0),
             rotl_lo(kl.0, kl.1, 0),
@@ -229,17 +239,21 @@ impl Schedule {
             0,
             0,
         ];
-        Schedule {
+        let sched = Schedule {
             kw,
             k,
             ke,
             rounds: 18,
-        }
+        };
+        // KA is key-equivalent; the schedule now owns everything needed.
+        ka = (0, 0);
+        let _ = core::hint::black_box(&ka);
+        sched
     }
 
     /// Builds the encryption schedule for a 192- or 256-bit key.
     fn new256(kl: (u64, u64), kr: (u64, u64)) -> Self {
-        let (ka, kb) = ka_kb(kl, kr);
+        let (mut ka, mut kb) = ka_kb(kl, kr);
         let kw = [
             rotl_hi(kl.0, kl.1, 0),
             rotl_lo(kl.0, kl.1, 0),
@@ -280,12 +294,18 @@ impl Schedule {
             rotl_hi(ka.0, ka.1, 77), // ke5
             rotl_lo(ka.0, ka.1, 77), // ke6
         ];
-        Schedule {
+        let sched = Schedule {
             kw,
             k,
             ke,
             rounds: 24,
-        }
+        };
+        // KA/KB are key-equivalent; the schedule now owns everything needed.
+        ka = (0, 0);
+        kb = (0, 0);
+        let _ = core::hint::black_box(&ka);
+        let _ = core::hint::black_box(&kb);
+        sched
     }
 
     /// Builds the decryption schedule by reversing the encryption schedule

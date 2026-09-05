@@ -173,6 +173,11 @@ impl Sm4 {
             k[2] = k[3];
             k[3] = next;
         }
+        // `k` is the running key state, seeded directly from the 128-bit key
+        // (MK ^ FK) — recovering it recovers the key. `rk` itself lives in the
+        // cipher, whose `Drop` zeroizes it.
+        k = [0u32; 4];
+        let _ = core::hint::black_box(&k);
         Sm4 { rk }
     }
 

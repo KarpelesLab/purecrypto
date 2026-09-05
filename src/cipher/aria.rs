@@ -217,11 +217,11 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
     };
 
     // Four 128-bit words W0..W3 (RFC 5794 §2.5.1).
-    let w0 = kl;
-    let w1 = xor_block(&fo(&w0, &ck1), &kr);
-    let w2 = xor_block(&fe(&w1, &ck2), &w0);
-    let w3 = xor_block(&fo(&w2, &ck3), &w1);
-    let w = [w0, w1, w2, w3];
+    let mut w0 = kl;
+    let mut w1 = xor_block(&fo(&w0, &ck1), &kr);
+    let mut w2 = xor_block(&fe(&w1, &ck2), &w0);
+    let mut w3 = xor_block(&fo(&w2, &ck3), &w1);
+    let mut w = [w0, w1, w2, w3];
 
     // 17 encryption round keys (we always fill 17 slots; only nr+1 are used).
     // ek(i+1) = W(i mod 4) ⊕ rotr( W((i+1) mod 4), r_i ) per RFC 5794 §2.5.2.
@@ -248,6 +248,21 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
         j += 1;
     }
     dk[nr] = ek[0];
+
+    // Best-effort wipe of the key-schedule intermediates: `w0` *is* KL, and
+    // W1..W3 recover it. The round keys themselves live in the cipher, whose
+    // `Drop` zeroizes them.
+    kl = [0u8; 16];
+    kr = [0u8; 16];
+    w0 = [0u8; 16];
+    w1 = [0u8; 16];
+    w2 = [0u8; 16];
+    w3 = [0u8; 16];
+    w = [[0u8; 16]; 4];
+    for v in [&kl, &kr, &w0, &w1, &w2, &w3] {
+        let _ = core::hint::black_box(v);
+    }
+    let _ = core::hint::black_box(&w);
 
     (ek, dk, nr)
 }

@@ -427,15 +427,17 @@ mod simd {
     #[target_feature(enable = "avx2")]
     unsafe fn blocks_avx2(st: &mut Poly1305, data: &[u8]) {
         unsafe {
-            // Powers of the evaluation point: r¹..r⁸.
-            let r1 = st.r;
-            let r2 = mul_mod(&r1, &r1);
-            let r3 = mul_mod(&r2, &r1);
-            let r4 = mul_mod(&r2, &r2);
-            let r5 = mul_mod(&r4, &r1);
-            let r6 = mul_mod(&r4, &r2);
-            let r7 = mul_mod(&r4, &r3);
-            let r8 = mul_mod(&r4, &r4);
+            // Powers of the evaluation point: r¹..r⁸. Every one of these is
+            // key-derived (r is half the Poly1305 one-time key), so they are
+            // wiped at the end of the function alongside `sum`/`lanes`.
+            let mut r1 = st.r;
+            let mut r2 = mul_mod(&r1, &r1);
+            let mut r3 = mul_mod(&r2, &r1);
+            let mut r4 = mul_mod(&r2, &r2);
+            let mut r5 = mul_mod(&r4, &r1);
+            let mut r6 = mul_mod(&r4, &r2);
+            let mut r7 = mul_mod(&r4, &r3);
+            let mut r8 = mul_mod(&r4, &r4);
 
             let times5 = |v| _mm256_add_epi64(v, _mm256_slli_epi64::<2>(v));
 
@@ -512,6 +514,14 @@ mod simd {
             let carry = (h0 >> 26) as u32;
             st.h = [(h0 as u32) & 0x03ff_ffff, h1 + carry, h2, h3, h4];
             let _ = core::hint::black_box(&sum);
+
+            // Best-effort wipe of the key-derived powers.
+            for p in [
+                &mut r1, &mut r2, &mut r3, &mut r4, &mut r5, &mut r6, &mut r7, &mut r8,
+            ] {
+                *p = [0u32; 5];
+                let _ = core::hint::black_box(&*p);
+            }
         }
     }
 }
