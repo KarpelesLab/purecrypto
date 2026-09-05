@@ -208,3 +208,40 @@ fn is_zero_works() {
     assert!(!Fpr::from_f64(1e-300).is_zero());
     assert!(!Fpr::from_f64(1.0).is_zero());
 }
+
+/// `rint` / `floor` / `trunc` negate the magnitude as `-(mag as i64)`. When the
+/// low 64 bits of the `u128` magnitude are exactly `0x8000_0000_0000_0000`, the
+/// cast lands on `i64::MIN` and the negation overflows — a panic under
+/// `overflow-checks`, and reachable from attacker bytes through
+/// `FalconPrivateKey::from_bytes` -> `recompute_g` -> `rint`. The conversion is
+/// already lossy at that magnitude (these are out-of-range values a malformed
+/// key produces, rejected right after), so it must wrap, not panic.
+#[test]
+fn round_to_int_never_panics_on_negate_overflow() {
+    // −2^63 exactly: |value| as u128 has low bits 0x8000_0000_0000_0000.
+    let v = Fpr::from_f64(-9_223_372_036_854_775_808.0);
+    assert_eq!(v.rint(), i64::MIN);
+    assert_eq!(v.floor(), i64::MIN);
+    assert_eq!(v.trunc(), i64::MIN);
+
+    // −2^127, whose truncated low 64 bits are zero, and −2^64 + something that
+    // lands on the same low pattern after the cast: all must return rather than
+    // panic.
+    for exp in [63i32, 64, 65, 96, 127, 128, 200, 1000] {
+        let mag = Fpr::from_f64(2.0f64.powi(exp));
+        let neg = mag.neg();
+        // The values are far out of `i64` range; the contract is only "does not
+        // panic" (the caller rejects the key afterwards).
+        let _ = core::hint::black_box(neg.rint());
+        let _ = core::hint::black_box(neg.floor());
+        let _ = core::hint::black_box(neg.trunc());
+        let _ = core::hint::black_box(mag.rint());
+        let _ = core::hint::black_box(mag.floor());
+        let _ = core::hint::black_box(mag.trunc());
+    }
+
+    // A fractional negative just below −2^63 exercises `floor`'s
+    // `intpart + has_frac` path at the same boundary.
+    let v = Fpr::from_f64(-9_223_372_036_854_775_808.0).sub(Fpr::from_f64(0.0));
+    assert_eq!(v.floor(), i64::MIN);
+}

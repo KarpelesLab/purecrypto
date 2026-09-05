@@ -463,10 +463,17 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
 /// A Falcon secret key: the NTRU polynomials `(f, g, F, G)`, the public key
 /// `h`, and a cached expanded form (FFT basis + LDL tree) for fast signing.
 ///
-/// Generation and signing require a CSPRNG. The secret polynomials are wiped on
-/// drop. The signing path is constant-time; key generation is one-time and
-/// best-effort (it samples and solves the NTRU equation with variable-time
-/// big-integer arithmetic).
+/// Generation and signing require a CSPRNG. The secret polynomials — including
+/// the expanded FFT basis and LDL tree, which are lossless representations of
+/// `(f, g, F, G)` — are wiped on drop.
+///
+/// Signing is **best-effort** constant-time, not strictly constant-time: the
+/// emulated `fpr` double under the sampler and the FFT/LDL arithmetic still
+/// branches on operand values (see the "Constant-time caveat" in `fpr`), and on
+/// the signing path those operands derive from secret data. A fully branchless
+/// FPEMU is future work. Key generation is likewise best-effort (it samples and
+/// solves the NTRU equation with variable-time big-integer arithmetic), but is
+/// one-time and runs on fresh entropy.
 pub struct FalconPrivateKey {
     degree: Degree,
     f: Vec<i64>,
@@ -516,7 +523,14 @@ impl FalconPrivateKey {
 
     /// Sign `msg`, returning an encoded Falcon signature (padded format,
     /// `header || salt || compressed-s`). Draws a fresh salt and sampler
-    /// randomness from `rng`; the per-signature path is constant-time.
+    /// randomness from `rng`.
+    ///
+    /// The per-signature path is **best-effort** constant-time, not strictly
+    /// constant-time: the emulated `fpr` arithmetic beneath `sampler_z` and
+    /// `ff_sampling` branches on operand values that derive from the secret key
+    /// (see the type-level note on [`FalconPrivateKey`]). Treat signing as
+    /// exposed to a floating-point timing side channel until the FPEMU is made
+    /// branchless.
     pub fn sign<R: crate::rng::RngCore + crate::rng::CryptoRng>(
         &self,
         msg: &[u8],

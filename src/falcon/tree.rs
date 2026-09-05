@@ -17,8 +17,8 @@
 //! (`L·D·L\* == G`); the full statistical behavior is exercised by the
 //! sign round-trip in a later phase.
 
-use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft};
-use super::fpr::Fpr;
+use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft, wipe_cplx};
+use super::fpr::{FPR_ZERO, Fpr};
 use super::sampler::{SamplerRng, sampler_z};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -38,6 +38,37 @@ pub(crate) enum FftTree {
         left: Box<FftTree>,
         right: Box<FftTree>,
     },
+}
+
+impl FftTree {
+    /// Overwrite the whole tree with zeros.
+    ///
+    /// Every node is a function of the secret basis `(f, g, F, G)` — the `L₁₀`
+    /// factors and the normalized leaf deviations both leak it — so the tree is
+    /// key-equivalent material and is scrubbed when the expanded key is
+    /// dropped. Recursion depth is `log₂ n` (≤ 10).
+    pub(crate) fn wipe(&mut self) {
+        match self {
+            FftTree::Leaf(sigma) => {
+                *sigma = FPR_ZERO;
+                let _ = core::hint::black_box(&*sigma);
+            }
+            FftTree::Node { l10, left, right } => {
+                wipe_cplx(l10);
+                left.wipe();
+                right.wipe();
+            }
+        }
+    }
+}
+
+/// Overwrite a 2×2 Gram / basis matrix of FFT arrays with zeros.
+pub(crate) fn wipe_gram(g: &mut Gram) {
+    for row in g.iter_mut() {
+        for cell in row.iter_mut() {
+            wipe_cplx(cell);
+        }
+    }
 }
 
 /// Compute the Gram matrix `G = B·B*` of the 2×2 basis

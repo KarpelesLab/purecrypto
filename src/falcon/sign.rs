@@ -19,10 +19,10 @@
 
 use super::Degree;
 use super::encode::compress;
-use super::fft::{Cplx, Fft, add_fft, mul_fft};
-use super::fpr::Fpr;
+use super::fft::{Cplx, Fft, add_fft, mul_fft, wipe_cplx};
+use super::fpr::{FPR_ZERO, Fpr, wipe_fpr};
 use super::sampler::SamplerRng;
-use super::tree::{FftTree, ff_sampling, ffldl, gram};
+use super::tree::{FftTree, ff_sampling, ffldl, gram, wipe_gram};
 use alloc::vec::Vec;
 
 /// Length of the salt prepended to the message before hashing.
@@ -39,6 +39,23 @@ pub(crate) struct ExpandedKey {
     d: Vec<Cplx>,
     tree: FftTree,
     sigmin: Fpr,
+}
+
+impl Drop for ExpandedKey {
+    fn drop(&mut self) {
+        // `b = FFT(−f)` (and `d = FFT(−F)`) is a *lossless* representation of
+        // the secret polynomial: one `ifft` plus `rint` recovers `f` exactly.
+        // The LDL tree is likewise a function of the whole secret basis. That
+        // is ~128 KB of key-equivalent material at n = 1024, and
+        // `FalconPrivateKey`'s own `Drop` never reached any of it.
+        for v in [&mut self.a, &mut self.b, &mut self.c, &mut self.d] {
+            wipe_cplx(v);
+        }
+        self.tree.wipe();
+        self.sigmin = FPR_ZERO;
+        let _ = core::hint::black_box(&self.sigmin);
+        // `fft` holds only the public roots of unity, and `degree` is public.
+    }
 }
 
 fn to_fpr(p: &[i64]) -> Vec<Fpr> {
@@ -75,13 +92,23 @@ pub(crate) fn expand_key(
 ) -> ExpandedKey {
     let n = degree.n();
     let fft = Fft::new(n);
-    let a = fft.fft(&to_fpr(g));
-    let b = fft.fft(&neg_fpr(f));
-    let c = fft.fft(&to_fpr(cap_g));
-    let d = fft.fft(&neg_fpr(cap_f));
-    let basis = [[a.clone(), b.clone()], [c.clone(), d.clone()]];
-    let g_gram = gram(&basis);
+    // Bind the coefficient buffers so they can be wiped: each is a plain copy
+    // of a secret polynomial, and as temporaries they would otherwise be freed
+    // in the clear.
+    let (mut gc, mut fc, mut cgc, mut cfc) = (to_fpr(g), neg_fpr(f), to_fpr(cap_g), neg_fpr(cap_f));
+    let a = fft.fft(&gc);
+    let b = fft.fft(&fc);
+    let c = fft.fft(&cgc);
+    let d = fft.fft(&cfc);
+    for v in [&mut gc, &mut fc, &mut cgc, &mut cfc] {
+        wipe_fpr(v);
+    }
+    let mut basis = [[a.clone(), b.clone()], [c.clone(), d.clone()]];
+    let mut g_gram = gram(&basis);
     let tree = ffldl(&fft, &g_gram, sigma_of(degree));
+    // The basis copy and the Gram matrix are both secret-derived.
+    wipe_gram(&mut basis);
+    wipe_gram(&mut g_gram);
     ExpandedKey {
         degree,
         fft,

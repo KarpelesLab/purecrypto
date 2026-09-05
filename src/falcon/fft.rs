@@ -17,7 +17,7 @@
 //! reference's table (so signing is validated by round-trip + the sampler KAT
 //! rather than byte-exact NIST sign vectors; see the module docs).
 
-use super::fpr::Fpr;
+use super::fpr::{FPR_ZERO, Fpr};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -26,6 +26,17 @@ use alloc::vec::Vec;
 pub(crate) struct Cplx {
     pub(crate) re: Fpr,
     pub(crate) im: Fpr,
+}
+
+/// Overwrite a secret-derived FFT array with zeros; see
+/// [`wipe_fpr`](super::fpr::wipe_fpr) for why the `black_box` is needed.
+#[inline]
+pub(crate) fn wipe_cplx(v: &mut [Cplx]) {
+    for c in v.iter_mut() {
+        c.re = FPR_ZERO;
+        c.im = FPR_ZERO;
+    }
+    let _ = core::hint::black_box(&*v);
 }
 
 impl Cplx {

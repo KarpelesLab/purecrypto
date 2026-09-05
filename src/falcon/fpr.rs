@@ -44,6 +44,21 @@ pub(crate) struct Fpr(pub(crate) u64);
 /// `+0.0`.
 pub(crate) const FPR_ZERO: Fpr = Fpr(0);
 
+/// Overwrite a slice of secret [`Fpr`] values with `+0.0`.
+///
+/// Routed through [`core::hint::black_box`] so the compiler cannot treat the
+/// stores as dead and elide them (the same pattern the private-key `Drop` impls
+/// use). Falcon's expanded key and the key-expansion temporaries are lossless
+/// representations of the NTRU secret, so they must not be handed back to the
+/// allocator in the clear.
+#[inline]
+pub(crate) fn wipe_fpr(v: &mut [Fpr]) {
+    for x in v.iter_mut() {
+        *x = FPR_ZERO;
+    }
+    let _ = core::hint::black_box(&*v);
+}
+
 impl Fpr {
     /// Reinterpret a host `f64` as an [`Fpr`] (pure bit reinterpretation — no
     /// float arithmetic, so this is valid in `no_std` and on no-FPU targets).
@@ -410,7 +425,11 @@ impl Fpr {
                 }
             }
         };
-        if s == 1 { -(mag as i64) } else { mag as i64 }
+        if s == 1 {
+            (mag as i64).wrapping_neg()
+        } else {
+            mag as i64
+        }
     }
 
     /// Floor (round toward −∞), returning an `i64`.
@@ -426,7 +445,11 @@ impl Fpr {
                 return if s == 1 { i64::MIN } else { i64::MAX };
             }
             let mag = m << e;
-            return if s == 1 { -(mag as i64) } else { mag as i64 };
+            return if s == 1 {
+                (mag as i64).wrapping_neg()
+            } else {
+                mag as i64
+            };
         }
         let sh = (-e) as u32;
         if sh >= 128 {
@@ -436,7 +459,7 @@ impl Fpr {
         let intpart = m >> sh;
         let has_frac = (m & ((1u128 << sh) - 1)) != 0;
         if s == 1 {
-            -((intpart + has_frac as u128) as i64)
+            ((intpart + has_frac as u128) as i64).wrapping_neg()
         } else {
             intpart as i64
         }
@@ -459,7 +482,11 @@ impl Fpr {
             let sh = (-e) as u32;
             if sh >= 128 { 0 } else { m >> sh }
         };
-        if s == 1 { -(mag as i64) } else { mag as i64 }
+        if s == 1 {
+            (mag as i64).wrapping_neg()
+        } else {
+            mag as i64
+        }
     }
 
     /// Total-order key: maps the IEEE bits to a `u64` whose unsigned ordering
