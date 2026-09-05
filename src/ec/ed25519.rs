@@ -239,13 +239,30 @@ impl Ed25519PublicKey {
         self.0
     }
 
-    /// Verifies `signature` over `message`. Uses the *cofactored* group
-    /// equation `[8S]B == [8R] + [8k]A` (ZIP-215 / FIPS-186-5 best practice),
-    /// which rejects any small-subgroup `A` or `R`: multiplying by the
-    /// cofactor 8 sends every 8-torsion point to the identity, so an
-    /// attacker can't smuggle in identity-encoded `A` (which would make
-    /// `[k]A == identity` for every `k` and let any `(R, S)` with
-    /// `R == [S]B` verify on every message — a universal forgery).
+    /// Verifies `signature` over `message`.
+    ///
+    /// This is **not** ZIP-215. The rule set actually implemented is:
+    ///
+    /// * the *cofactored* group equation `[8S]B == [8R] + [8k]A`;
+    /// * `S` must be canonical — reduced, `S < L`;
+    /// * `R` and `A` must be *canonically* encoded — `y < p`, and the sign
+    ///   bit must not select the non-existent negative zero. (ZIP-215
+    ///   deliberately *accepts* non-canonical `y ∈ [p, 2²⁵⁵)`; this
+    ///   implementation rejects them, which is the stricter behaviour. A
+    ///   ZIP-215 verifier and this one therefore disagree on that set of
+    ///   signatures — do not rely on this code for ZIP-215 consensus.)
+    /// * `A` must **not** be of small order; in particular the identity
+    ///   encoding is rejected.
+    ///
+    /// The explicit small-order check on `A` is what prevents the
+    /// identity-key universal forgery. Multiplying by the cofactor does *not*
+    /// reject small-subgroup keys — on the contrary, it makes `[8k]A` vanish
+    /// for every 8-torsion `A`, so without the check any `(R, S)` satisfying
+    /// `[8S]B == [8R]` (e.g. `R = enc(B)`, `S = 1`) would verify under
+    /// `A = identity` for *every* message. The check below is the one that
+    /// rules that out, matching libsodium's behaviour. `R` needs no such
+    /// check: it is not a claimed key, and forging with a small-order `R`
+    /// still requires solving for `S`.
     ///
     /// Returns [`Error::Verification`] on any failure (malformed inputs
     /// included).
@@ -270,6 +287,15 @@ impl Ed25519PublicKey {
         r_bytes.copy_from_slice(&signature.0[..32]);
         let r_point = f.decode(&r_bytes).ok_or(Error::Verification)?;
         let a_point = f.decode(&self.0).ok_or(Error::Verification)?;
+
+        // Reject small-order `A` (`[8]A == identity`), the identity encoding
+        // included: the cofactored equation below would otherwise annihilate
+        // `[8k]A` and turn any `(R, S)` with `[8S]B == [8R]` into a valid
+        // signature over every message under such a key.
+        let a8 = f.point_double(&f.point_double(&f.point_double(&a_point)));
+        if bool::from(f.point_ct_eq(&a8, &f.identity())) {
+            return Err(Error::Verification);
+        }
 
         // k = SHA-512(R ‖ A ‖ message) mod L.
         let mut hk = Sha512::new();
@@ -544,6 +570,12 @@ mod tests {
         let (Some(r_point), Some(a_point)) = (f.decode(&r_bytes), f.decode(&pk.0)) else {
             return false;
         };
+        // Same small-order rejection as `verify`, so the two paths implement
+        // the same rule set.
+        let a8 = f.point_double(&f.point_double(&f.point_double(&a_point)));
+        if bool::from(f.point_ct_eq(&a8, &f.identity())) {
+            return false;
+        }
         let mut hk = Sha512::new();
         hk.update(&r_bytes);
         hk.update(&pk.0);
@@ -620,5 +652,77 @@ mod tests {
         concat[..32].copy_from_slice(&r);
         concat[32..].copy_from_slice(&s);
         assert_eq!(concat, sig.to_bytes());
+    }
+
+    /// Regression test: an identity-encoded public key must not verify.
+    ///
+    /// With `A = enc(identity)` (`y = 1`, sign 0), `R = enc(B)` and `S = 1`,
+    /// the cofactored equation degenerates to `[8]B == [8]B + [8k]·O`, which
+    /// holds for *every* message — a universal forgery under a key nobody
+    /// owns. The small-order check on `A` in `verify` is what rules it out.
+    #[test]
+    fn identity_public_key_universal_forgery_rejected() {
+        let f = Field::new();
+        let r_enc = f.encode(&f.base());
+
+        let mut a = [0u8; 32];
+        a[0] = 1; // y = 1, sign bit 0 — the identity point.
+        let pk = Ed25519PublicKey::from_bytes(a);
+
+        let mut s_bytes = [0u8; 32];
+        s_bytes[0] = 1; // S = 1
+        let sig = Ed25519Signature::from_components(&r_enc, &s_bytes);
+
+        for msg in [
+            &b""[..],
+            b"hello world",
+            b"attacker-chosen message",
+            b"\x00\x01\x02\x03",
+        ] {
+            assert!(
+                pk.verify(msg, &sig).is_err(),
+                "identity public key forged a signature over {msg:?}"
+            );
+        }
+    }
+
+    /// Every point of small order (the full 8-torsion subgroup) must be
+    /// rejected as a public key, whatever the signature.
+    #[test]
+    fn small_order_public_keys_rejected() {
+        // The eight canonical encodings of the 8-torsion subgroup of
+        // edwards25519 (identity, the order-2 point, two order-4 and four
+        // order-8 points).
+        let small_order = [
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "0000000000000000000000000000000000000000000000000000000000000080",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+            "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+            "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa",
+        ];
+
+        let f = Field::new();
+        let r_enc = f.encode(&f.base());
+        let mut s_bytes = [0u8; 32];
+        s_bytes[0] = 1;
+        let sig = Ed25519Signature::from_components(&r_enc, &s_bytes);
+
+        for enc in small_order {
+            let a = from_hex::<32>(enc);
+            // Skip encodings this decoder rejects outright (non-canonical or
+            // off-curve); the point of the test is that none of them verify.
+            let pk = Ed25519PublicKey::from_bytes(a);
+            assert!(
+                pk.verify(b"small order", &sig).is_err(),
+                "small-order key {enc} accepted"
+            );
+            assert!(
+                pk.verify(b"", &sig).is_err(),
+                "small-order key {enc} accepted"
+            );
+        }
     }
 }

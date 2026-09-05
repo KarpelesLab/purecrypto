@@ -130,11 +130,24 @@ impl Ed448PrivateKey {
 
     /// Signs `message` with the given `context` string (≤ 255 bytes).
     ///
+    /// Prefer [`try_sign_ctx`](Self::try_sign_ctx) when `context` comes from a
+    /// peer or another untrusted source.
+    ///
     /// # Panics
     /// Panics if `context` is longer than 255 bytes (the `dom4` length field is
     /// a single octet).
     pub fn sign_ctx(&self, message: &[u8], context: &[u8]) -> Ed448Signature {
-        assert!(context.len() <= 255, "Ed448 context must be ≤ 255 bytes");
+        self.try_sign_ctx(message, context)
+            .expect("Ed448 context must be ≤ 255 bytes")
+    }
+
+    /// Fallible form of [`sign_ctx`](Self::sign_ctx): returns
+    /// [`Error::InvalidInput`] instead of panicking when `context` is longer
+    /// than 255 bytes (the `dom4` length field is a single octet).
+    pub fn try_sign_ctx(&self, message: &[u8], context: &[u8]) -> Result<Ed448Signature, Error> {
+        if context.len() > 255 {
+            return Err(Error::InvalidInput);
+        }
         let f = Field::new();
         let (s, prefix) = self.expand();
         let a_enc = f.encode(&f.scalar_mult(&s, &f.base()));
@@ -157,7 +170,7 @@ impl Ed448PrivateKey {
         let mut sb = [0u8; 56];
         sig_s.write_le_bytes(&mut sb);
         sig[57..113].copy_from_slice(&sb);
-        Ed448Signature(sig)
+        Ok(Ed448Signature(sig))
     }
 }
 
@@ -278,20 +291,33 @@ impl Ed448PublicKey {
 
     /// Verifies `signature` over `message` with the given `context` string.
     ///
-    /// Uses the *cofactored* group equation `[4S]B == [4R] + [4k]A`
-    /// (RFC 8032 §5.2.7 permits the cofactored check; it additionally rejects
-    /// any small-subgroup `A` or `R`). Returns [`Error::Verification`] on any
-    /// failure (malformed inputs included).
+    /// The rule set implemented is:
     ///
-    /// # Panics
-    /// Panics if `context` is longer than 255 bytes.
+    /// * the *cofactored* group equation `[4S]B == [4R] + [4k]A`
+    ///   (RFC 8032 §5.2.7 permits the cofactored check);
+    /// * `S` must be canonical — reduced, `S < L`, with the padding byte 0;
+    /// * `R` and `A` must be canonically encoded (`y < p`);
+    /// * `A` must **not** be of small order; in particular the identity
+    ///   encoding is rejected.
+    ///
+    /// The explicit small-order check on `A` is what prevents the identity-key
+    /// universal forgery: multiplying by the cofactor does *not* reject
+    /// small-subgroup keys, it makes `[4k]A` vanish, so without the check any
+    /// `(R, S)` with `[4S]B == [4R]` (e.g. `R = enc(B)`, `S = 1`) would verify
+    /// under `A = identity` over *every* message.
+    ///
+    /// Returns [`Error::Verification`] on any failure (malformed inputs
+    /// included), including a `context` longer than 255 bytes (the `dom4`
+    /// length field is a single octet).
     pub fn verify_ctx(
         &self,
         message: &[u8],
         signature: &Ed448Signature,
         context: &[u8],
     ) -> Result<(), Error> {
-        assert!(context.len() <= 255, "Ed448 context must be ≤ 255 bytes");
+        if context.len() > 255 {
+            return Err(Error::Verification);
+        }
         let f = Field::new();
 
         // Split R ‖ S. The 57th byte of S (signature byte 113) must be 0, and S
@@ -310,6 +336,15 @@ impl Ed448PublicKey {
 
         let r_point = f.decode(&r_bytes).ok_or(Error::Verification)?;
         let a_point = f.decode(&self.0).ok_or(Error::Verification)?;
+
+        // Reject small-order `A` (`[4]A == identity`), the identity encoding
+        // included: the cofactored equation below would otherwise annihilate
+        // `[4k]A` and turn any `(R, S)` with `[4S]B == [4R]` into a valid
+        // signature over every message under such a key.
+        let a4 = f.point_double(&f.point_double(&a_point));
+        if bool::from(f.point_ct_eq(&a4, &f.identity())) {
+            return Err(Error::Verification);
+        }
 
         // k = SHAKE256(dom4(0,ctx) ‖ R ‖ A ‖ M, 114) mod L.
         let k_hash = shake_dom4(context, &[&r_bytes, &self.0, message]);
@@ -570,5 +605,78 @@ mod tests {
         assert_eq!(sk2.to_bytes(), sk.to_bytes());
         // A wrong password must fail.
         assert!(Ed448PrivateKey::from_pkcs8_der_encrypted(&der, b"wrong").is_err());
+    }
+
+    /// Regression test: an identity-encoded public key must not verify.
+    ///
+    /// With `A = enc(identity)` (`y = 1`), `R = enc(B)` and `S = 1`, the
+    /// cofactored equation degenerates to `[4]B == [4]B + [4k]·O`, true for
+    /// *every* message. The small-order check on `A` in `verify_ctx` rules
+    /// it out.
+    #[test]
+    fn identity_public_key_universal_forgery_rejected() {
+        let f = Field::new();
+        let r_enc = f.encode(&f.base());
+
+        let mut a = [0u8; 57];
+        a[0] = 1; // y = 1, sign bit 0 — the identity point.
+        let pk = Ed448PublicKey::from_bytes(a);
+
+        let mut sig_bytes = [0u8; 114];
+        sig_bytes[..57].copy_from_slice(&r_enc);
+        sig_bytes[57] = 1; // S = 1
+        let sig = Ed448Signature::from_bytes(sig_bytes);
+
+        for msg in [
+            &b""[..],
+            b"hello world",
+            b"attacker-chosen message",
+            b"\x00\x01\x02\x03",
+        ] {
+            assert!(
+                pk.verify(msg, &sig).is_err(),
+                "identity public key forged a signature over {msg:?}"
+            );
+            assert!(pk.verify_ctx(msg, &sig, b"ctx").is_err());
+        }
+    }
+
+    /// The other small-order points of edwards448 (cofactor 4) must be
+    /// rejected as public keys too.
+    #[test]
+    fn small_order_public_keys_rejected() {
+        let f = Field::new();
+        let r_enc = f.encode(&f.base());
+        let mut sig_bytes = [0u8; 114];
+        sig_bytes[..57].copy_from_slice(&r_enc);
+        sig_bytes[57] = 1;
+        let sig = Ed448Signature::from_bytes(sig_bytes);
+
+        // identity (y = 1) and the order-2 point (y = p − 1 ≡ −1).
+        let mut identity = [0u8; 57];
+        identity[0] = 1;
+        let mut order2 = [0xffu8; 57];
+        order2[27] = 0xfe; // p = 2^448 − 2^224 − 1, so p − 1 has a 0xfe limb
+        order2[56] = 0x00;
+
+        for a in [identity, order2] {
+            let pk = Ed448PublicKey::from_bytes(a);
+            assert!(pk.verify(b"small order", &sig).is_err());
+            assert!(pk.verify(b"", &sig).is_err());
+        }
+    }
+
+    /// An over-long context must be reported, not panic.
+    #[test]
+    fn oversize_context_is_an_error_not_a_panic() {
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-ctx", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let long = [0x41u8; 256];
+
+        assert!(sk.try_sign_ctx(b"m", &long).is_err());
+        let sig = sk.sign_ctx(b"m", &long[..255]);
+        assert!(pk.verify_ctx(b"m", &sig, &long[..255]).is_ok());
+        assert!(pk.verify_ctx(b"m", &sig, &long).is_err());
     }
 }
