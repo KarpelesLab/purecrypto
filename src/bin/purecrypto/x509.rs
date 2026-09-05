@@ -1,7 +1,8 @@
 //! `purecrypto x509` — inspect, self-sign, or CA-sign certificates.
 
 use crate::pki::{
-    describe_key, format_dn, load_key, parse_sans, parse_subject, random_serial, validity_days,
+    Profile, default_extensions, describe_key, dns_general_names, format_dn, load_key, parse_sans,
+    parse_subject, random_serial, validity_days, verify_and_screen_csr,
 };
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::extension::Extension;
@@ -26,6 +27,42 @@ fn sans_from_args(args: &Args) -> Vec<String> {
         .or_else(|| args.value("-san"))
         .map(parse_sans)
         .unwrap_or_default()
+}
+
+/// The subjectAltName list `x509 -req` will certify.
+///
+/// A CSR's requested `subjectAltName` is the requester's claim, not a
+/// verified fact: copying it verbatim (which is what
+/// `Certificate::issue_from_csr` does) turns a request for
+/// `DNS:www.google.com` into a chain-valid certificate for that name. So the
+/// operator's own `-san`/`-addext` wins, the request's list is used only
+/// behind `-copy-csr-san`, and a loud warning names every copied entry.
+fn resolve_req_sans(args: &Args, csr: &CertificationRequest) -> Vec<String> {
+    let explicit = sans_from_args(args);
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let requested = csr.subject_alt_names().unwrap_or_default();
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    if args.flag("-copy-csr-san") || args.flag("--copy-csr-san") || args.flag("-allow-csr-san") {
+        eprintln!(
+            "purecrypto: WARNING: -copy-csr-san given — certifying {} subjectAltName(s) \
+             claimed by the request without any verification: {}",
+            requested.len(),
+            requested.join(", ")
+        );
+        return requested;
+    }
+    eprintln!(
+        "purecrypto: note: ignoring {} subjectAltName(s) requested by the CSR ({}); \
+         pass -san NAME[,NAME] to certify names you have verified, or -copy-csr-san \
+         to take the request's list as-is",
+        requested.len(),
+        requested.join(", ")
+    );
+    Vec::new()
 }
 
 /// Prints a human-readable certificate summary. When `with_ext` is true,
@@ -263,14 +300,36 @@ pub(crate) fn run(args: Args) {
             .subject()
             .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
+        // Verify the request's self-signature and screen it against the same
+        // policy `ca sign-csr` applies (no SHA-1/MD5 signature, RSA >= 2048).
+        verify_and_screen_csr(&csr);
+        let subject = csr
+            .subject()
+            .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
+        let subject_key = csr
+            .public_key()
+            .unwrap_or_else(|e| die(format!("bad CSR key: {e}")));
+
+        // `Certificate::issue_from_csr` would certify the request's own
+        // subjectAltName list verbatim and, under `-ca`, emit nothing but
+        // `basicConstraints{CA:true}` — an unconstrained sub-CA with no
+        // pathLen and no keyUsage. Build the extensions here instead:
+        //   * SANs come from the operator's `-san`/`-addext`, or from the
+        //     request only behind `-copy-csr-san` (with a stderr warning);
+        //   * `default_extensions` pins pathLen 0 + keyCertSign/cRLSign for
+        //     `-ca`, and keyUsage + EKU for a leaf.
+        let sans = resolve_req_sans(&args, &csr);
+        let profile = if is_ca { Profile::SubCa } else { Profile::Leaf };
+        let exts = default_extensions(profile, &dns_general_names(&sans));
         let cakey = load_key(cakey_path);
-        let cert = Certificate::issue_from_csr(
+        let cert = Certificate::issue_with_extensions(
             &cakey.signer(),
             &issuer,
-            &csr,
+            &subject,
+            &subject_key,
             &validity_days(days(&args)),
             serial(&args),
-            is_ca,
+            &exts,
         )
         .unwrap_or_else(|e| die(format!("cannot issue certificate: {e}")));
         write_output(args.value("-out"), cert.to_pem().as_bytes());
@@ -286,14 +345,22 @@ pub(crate) fn run(args: Args) {
         let key = load_key(key_path);
         let subject = parse_subject(subj);
         let sans = sans_from_args(&args);
-        let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
-        let cert = Certificate::self_signed_general(
+        // Same constrained default profile as the CA paths: an absent
+        // keyUsage means "any purpose" under RFC 5280 §4.2.1.3. A self-signed
+        // `-ca` is a root, so it keeps keyCertSign/cRLSign but takes no
+        // pathLen bound (it must be able to sign intermediates).
+        let profile = if is_ca {
+            Profile::RootCa
+        } else {
+            Profile::Leaf
+        };
+        let exts = default_extensions(profile, &dns_general_names(&sans));
+        let cert = Certificate::self_signed_with_extensions(
             &key.signer(),
             &subject,
             &validity_days(days(&args)),
             serial(&args),
-            is_ca,
-            &san_refs,
+            &exts,
         )
         .unwrap_or_else(|e| die(format!("cannot self-sign: {e}")));
         write_output(args.value("-out"), cert.to_pem().as_bytes());
@@ -302,7 +369,16 @@ pub(crate) fn run(args: Args) {
 
     // Inspect: -in cert.
     let path = args.value("-in").unwrap_or_else(|| {
-        die("usage: purecrypto x509 -in <cert.pem> -text [-ext] | -new ... | -req ...")
+        die(
+            "usage:\n  \
+             purecrypto x509 -in <cert.pem> -text [-ext]\n  \
+             purecrypto x509 -new -key <key.pem> -subj /CN=... [-san a,b] [-days N] [-ca] [-out f]\n  \
+             purecrypto x509 -req -in <csr.pem> -CA <ca.pem> -CAkey <cakey.pem> [-san a,b] \
+             [-copy-csr-san] [-days N] [-ca] [-out f]\n\n\
+             A CSR's requested subjectAltName is NOT certified unless -copy-csr-san is given; \
+             name the SANs with -san instead. -ca emits a pathLen:0 sub-CA with \
+             keyUsage=keyCertSign,cRLSign.",
+        )
     });
     let raw = read_input(Some(path));
     let cert = Certificate::from_pem(
