@@ -48,6 +48,31 @@ use crate::ct::ConstantTimeEq;
 #[cfg(feature = "std")]
 use std::sync::{Arc, Mutex};
 
+/// Upper bound on post-handshake `KeyUpdate` messages we will process from
+/// the client (RFC 8446 §4.6.3). Each one costs two HKDF-Expand-Label pairs
+/// plus an AEAD key schedule on both sides, and each `update_requested` makes
+/// us emit our own reply — five bytes of handshake message and a ~27-byte
+/// record — with no natural backpressure if the peer never reads. A peer
+/// streaming them back to back would otherwise grow our queued output without
+/// any ceiling. Sixty-four covers any plausible legitimate rekeying schedule
+/// (the per-key record cap is 2²³ records, so 64 peer-initiated updates span
+/// well over 500 million records).
+const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
+
+/// Floor on the ciphertext-byte budget for the RFC 8446 §4.2.10 "skip
+/// rejected early data" window. A client whose 0-RTT offer we decline is
+/// already streaming records we cannot decrypt; we discard up to this many
+/// bytes of them before treating a `bad_record_mac` as fatal again. The
+/// budget is `max(config.max_early_data_size, this)` — a server that never
+/// advertises early data can still be handed a ticket from a peer that did.
+const MIN_SKIP_EARLY_DATA_BUDGET: usize = 16 * 1024;
+
+/// Slack added to the skip budget for record framing and AEAD expansion
+/// (5-byte header + content-type byte + 16-byte tag per record), so a client
+/// that exactly fills `max_early_data_size` plaintext bytes is not cut off
+/// mid-flight.
+const SKIP_EARLY_DATA_OVERHEAD: usize = 4 * 1024;
+
 /// A shared anti-replay set for 0-RTT (RFC 8446 §8). Each connection that
 /// accepts a PSK binder records it here; a binder already in the set is
 /// refused for 0-RTT (the handshake proceeds with 1-RTT instead).
@@ -750,6 +775,9 @@ pub struct ServerConnection<R: RngCore> {
     /// in CH AND policy allows). Drives the early-read-key install and EOED
     /// expectation.
     early_data_accepted: bool,
+    /// Post-handshake `KeyUpdate` messages received from the client, capped
+    /// by [`MAX_KEY_UPDATES_RECEIVED`].
+    key_updates_received: u32,
     /// RFC 8446 §4.2.10: when 0-RTT is accepted, this tracks the remaining
     /// plaintext byte budget the client may consume under the early-data
     /// key. Initialized to `config.max_early_data_size` on 0-RTT acceptance;
@@ -927,6 +955,7 @@ impl<R: RngCore> ServerConnection<R> {
             rms: None,
             ks: None,
             early_data_accepted: false,
+            key_updates_received: 0,
             early_data_remaining: None,
             deferred_chts: None,
             client_cert_chain: Vec::new(),
@@ -1229,11 +1258,67 @@ impl<R: RngCore> ServerConnection<R> {
     }
 
     /// Sends application data (only valid once the handshake completes).
+    ///
+    /// Returns `Err(TooManyRecords)` if the write side hit the per-key
+    /// record-sequence cap and the record could not be protected — the bytes
+    /// were NOT transmitted. [`Self::maybe_auto_key_update`] normally rekeys
+    /// long before that point.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
             return Err(Error::InappropriateState);
         }
+        self.maybe_auto_key_update()?;
         self.core.send_application_data(data);
+        self.core.check_write_error()
+    }
+
+    /// Test hook: fast-forward the write-side record sequence counter so the
+    /// automatic-`KeyUpdate` threshold and the per-key cap can be exercised
+    /// without protecting 2²³ records first.
+    #[cfg(test)]
+    pub(crate) fn set_write_seq_for_test(&mut self, seq: u64) {
+        self.core.set_write_seq_for_test(seq);
+    }
+
+    /// Test hook: the write-side record sequence number, if keys are in.
+    #[cfg(test)]
+    pub(crate) fn write_seq_for_test(&self) -> Option<u64> {
+        self.core.write_seq()
+    }
+
+    /// Test hook: bytes still buffered in the handshake transcript. Zero once
+    /// the transcript has been sealed at the `Connected` transition.
+    #[cfg(test)]
+    pub(crate) fn transcript_len_for_test(&self) -> usize {
+        self.core.transcript.buffered_len()
+    }
+
+    /// Test hook: inject one decoded handshake message straight into the
+    /// state machine, bypassing the record layer. Used to exercise ordering
+    /// rules a well-behaved peer's record stream cannot reach.
+    #[cfg(test)]
+    pub(crate) fn handle_handshake_for_test(&mut self, msg: Vec<u8>) -> Result<(), Error> {
+        self.handle_handshake(msg)
+    }
+
+    /// RFC 8446 §5.5: initiate a `KeyUpdate` once the write side approaches
+    /// the per-key record-sequence cap, so `emit_record` never has to drop a
+    /// record. Silent no-op in QUIC mode (RFC 9001 §6 forbids TLS
+    /// `KeyUpdate`; QUIC rekeys via the Key Phase bit) and before the
+    /// application keys are installed.
+    fn maybe_auto_key_update(&mut self) -> Result<(), Error> {
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic
+            || self.server_app_secret.is_none()
+        {
+            return Ok(());
+        }
+        if self
+            .core
+            .write_seq()
+            .is_some_and(|seq| seq >= super::super::crypto::KEY_UPDATE_SOFT_LIMIT)
+        {
+            self.send_key_update(false)?;
+        }
         Ok(())
     }
 
@@ -1308,6 +1393,12 @@ impl<R: RngCore> ServerConnection<R> {
                     if self.state != State::Connected && self.early_data_remaining.is_none() {
                         self.core.send_alert(AlertDescription::UnexpectedMessage);
                         self.state = State::Closed;
+                        // `ConnectionCore` never buffered the plaintext (the
+                        // handshake is incomplete, so the peer is not
+                        // authenticated), but drop anything already queued so
+                        // an application draining on the error path cannot
+                        // read it.
+                        let _ = self.core.take_received();
                         return Err(Error::UnexpectedMessage);
                     }
                     // RFC 8446 §4.2.10: enforce `max_early_data_size`. A
@@ -1336,7 +1427,11 @@ impl<R: RngCore> ServerConnection<R> {
                     self.state = State::Closed;
                     return Err(Error::AlertReceived(alert.description));
                 }
-                Ok(None) => return Ok(()),
+                // A latched write-side failure (see
+                // `ConnectionCore::check_write_error`) means a record we
+                // believed we sent is not on the wire; surface it rather
+                // than reporting a clean drain.
+                Ok(None) => return self.core.check_write_error(),
                 Err(e) => {
                     self.core.send_alert(alert_for(&e));
                     self.state = State::Closed;
@@ -1358,6 +1453,23 @@ impl<R: RngCore> ServerConnection<R> {
                 // Under 0-RTT acceptance the client sends EndOfEarlyData
                 // (under the early key) before its Finished. Receiving it
                 // installs the client-handshake read key.
+                // RFC 8446 §4.5: when the server accepted early data the
+                // client MUST send EndOfEarlyData before its Finished. It is
+                // not optional — accepting a Finished straight off the early
+                // key would leave `early_data_routing` armed, so every byte
+                // of the client's authenticated 1-RTT stream would land in
+                // the replayable `early_in` quarantine instead of `app_in`.
+                //
+                // RFC 9001 §8.3 removes EndOfEarlyData from QUIC entirely
+                // (the 0-RTT packet number space ends the flight instead), so
+                // the requirement applies to the TLS/DTLS record path only.
+                if self.early_data_accepted
+                    && self.deferred_chts.is_some()
+                    && msg_type != hs_type::END_OF_EARLY_DATA
+                    && self.engine_mode != super::super::quic_hooks::EngineMode::Quic
+                {
+                    return Err(Error::UnexpectedMessage);
+                }
                 if msg_type == hs_type::END_OF_EARLY_DATA
                     && self.early_data_accepted
                     && self.deferred_chts.is_some()
@@ -1407,8 +1519,18 @@ impl<R: RngCore> ServerConnection<R> {
     /// the next `client_application_traffic_secret`, re-keys the read side,
     /// and replies with our own `KeyUpdate(not_requested)` if the peer
     /// requested it.
+    ///
+    /// Rate-limited by [`MAX_KEY_UPDATES_RECEIVED`]: each inbound
+    /// `KeyUpdate(update_requested)` costs us two HKDF-Expand-Label pairs, an
+    /// AEAD key schedule and an outbound record, and a peer that never reads
+    /// can stream them back to back. Past the bound the connection is failed
+    /// as `PeerMisbehaved`.
     fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
         let ku = KeyUpdate::decode(body)?;
+        self.key_updates_received = self.key_updates_received.saturating_add(1);
+        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+            return Err(Error::PeerMisbehaved);
+        }
         let suite = self.suite.ok_or(Error::IllegalParameter)?;
         let prev = self
             .client_app_secret
@@ -1448,7 +1570,10 @@ impl<R: RngCore> ServerConnection<R> {
 
     /// Requests a key update from the peer; symmetric to
     /// [`ClientConnection::request_key_update`](super::ClientConnection::request_key_update).
-    #[allow(dead_code)] // not yet surfaced by the public connection wrapper
+    // Not yet surfaced by the public `ServerConnection` wrapper (that type
+    // lives in `tls::connection`); the engine-side half is complete and the
+    // automatic rekey in `maybe_auto_key_update` uses the same machinery.
+    #[allow(dead_code)]
     pub fn request_key_update(&mut self) -> Result<(), Error> {
         if !matches!(self.state, State::Connected) {
             return Err(Error::InappropriateState);
@@ -1559,16 +1684,26 @@ impl<R: RngCore> ServerConnection<R> {
                 }
                 Err(Error::EchDecryptionFailed) => {
                     // The client offered ECH (we found and parsed an
-                    // outer-form extension) but HPKE failed: either an
-                    // unknown `config_id` or AEAD tag rejection. Continue
-                    // under the outer CH; EE will ship `retry_configs`.
+                    // outer-form extension) but it did not authenticate under
+                    // any of our keys: unknown `config_id`, unannounced HPKE
+                    // suite, or AEAD tag rejection. Continue under the outer
+                    // CH; EE will ship `retry_configs` so a client holding a
+                    // stale ECHConfig can refresh.
                     self.ech_state = Some(EchServerHandshakeState::Rejected);
                     None
                 }
+                Err(e @ Error::EchInnerMalformed) => {
+                    // The HPKE `open` SUCCEEDED — the peer holds the correct
+                    // config — and what came out of it is malformed. That is
+                    // a hard protocol error (draft-ietf-tls-esni-22 §7.1),
+                    // not a reason to fall back: silently continuing on the
+                    // outer CH here would hide a broken or hostile peer.
+                    return Err(e);
+                }
                 Err(_) => {
-                    // No ECH ext (or its body was malformed in a way
-                    // distinct from a HPKE failure). Treat as a non-ECH
-                    // CH — no state, no signal patch, no retry_configs.
+                    // No `encrypted_client_hello` extension at all. Treat as
+                    // a non-ECH CH — no state, no signal patch, no
+                    // retry_configs.
                     None
                 }
             }
@@ -1924,6 +2059,20 @@ impl<R: RngCore> ServerConnection<R> {
             }
             Some(cets)
         } else {
+            if client_offered_early && !self.skip_record_keys() {
+                // RFC 8446 §4.2.10: the client is already sending 0-RTT
+                // records we have no key for. A server that rejects early
+                // data MUST skip past those records — attempt to deprotect
+                // with the handshake key and discard what fails — rather
+                // than treat the first `bad_record_mac` as fatal, which
+                // would turn every intended 1-RTT fallback (stale ticket,
+                // rotated ticket key, replay-window hit, load-balanced pool)
+                // into a hard connection failure.
+                let budget = (self.config.max_early_data_size as usize)
+                    .max(MIN_SKIP_EARLY_DATA_BUDGET)
+                    .saturating_add(SKIP_EARLY_DATA_OVERHEAD);
+                self.core.begin_skip_early_data(budget);
+            }
             None
         };
         let _ = cets_for_read;
@@ -2656,6 +2805,21 @@ impl<R: RngCore> ServerConnection<R> {
         }
         // RFC 8446 §5: ChangeCipherSpec is no longer permitted after this point.
         self.core.close_ccs_window();
+        // Belt and braces for RFC 8446 §4.5: whatever route got us here, the
+        // 0-RTT window is over. Leaving `early_data_routing` set would divert
+        // the client's authenticated 1-RTT stream into the replayable
+        // early-data quarantine, and a stale byte budget would keep the
+        // pre-handshake ApplicationData gate open.
+        self.core.set_early_data_routing(false);
+        self.early_data_remaining = None;
+        // The peer is authenticated: received application plaintext may now
+        // be buffered for the application (see `ConnectionCore`).
+        self.core.set_app_data_allowed(true);
+        // No further transcript hash is needed (RMS was just derived), so
+        // stop buffering handshake bytes: post-handshake `KeyUpdate` /
+        // `NewSessionTicket` traffic must not grow the heap for the life of
+        // the connection.
+        self.core.transcript.seal();
         self.state = State::Connected;
 
         // Issue one NewSessionTicket if a ticket key is configured. We do
@@ -3058,7 +3222,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
-        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        Error::EchDecodeError | Error::EchInnerMalformed => AlertDescription::IllegalParameter,
         #[cfg(feature = "cert-compression")]
         Error::CertDecompressionFailed => AlertDescription::BadCertificate,
         _ => AlertDescription::HandshakeFailure,
@@ -3531,6 +3695,10 @@ mod tests {
         );
         assert_eq!(
             alert_for(&Error::EchDecodeError),
+            AlertDescription::IllegalParameter
+        );
+        assert_eq!(
+            alert_for(&Error::EchInnerMalformed),
             AlertDescription::IllegalParameter
         );
     }

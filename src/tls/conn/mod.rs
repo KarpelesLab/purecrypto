@@ -6802,3 +6802,453 @@ mod keylog_loopback_tests {
         );
     }
 }
+
+/// Regression tests for the TLS-engine security audit findings.
+#[cfg(test)]
+mod audit_regression_tests {
+    use super::{ClientConnection, ServerConfig, ServerConnection};
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+    use crate::rsa::BoxedRsaPrivateKey;
+    use crate::test_util::rsa_test_key_a;
+    use crate::tls::codec::{CipherSuite, NamedGroup};
+    use crate::tls::conn::ClientConfig;
+    use crate::tls::{Error, RootCertStore};
+    use crate::x509::{Certificate, DistinguishedName, Time, Validity};
+    use alloc::vec::Vec;
+
+    fn rsa_server() -> (ServerConfig, Vec<u8>) {
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        (ServerConfig::with_rsa(alloc::vec![der.clone()], boxed), der)
+    }
+
+    /// Drives both engines to the end of the handshake.
+    fn pump(client: &mut ClientConnection, server: &mut ServerConnection<HmacDrbg<Sha256>>) {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets().unwrap();
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets().unwrap();
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+    }
+
+    fn connected_pair(
+        server_config: ServerConfig,
+        cert_der: Vec<u8>,
+        tag: &[u8],
+    ) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
+        let srng = HmacDrbg::<Sha256>::new(tag, b"s", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        pump(&mut client, &mut server);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        (client, server)
+    }
+
+    /// MEDIUM 2(b) — the transcript must stop growing once the handshake is
+    /// done. Post-handshake `KeyUpdate` / `NewSessionTicket` bytes are not an
+    /// input to any transcript hash, so buffering them let a peer grow our
+    /// heap five bytes at a time for the life of the connection, with no
+    /// ceiling and nothing ever reclaimed.
+    #[test]
+    fn post_handshake_messages_do_not_grow_the_transcript() {
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"ku-transcript");
+
+        assert_eq!(
+            server.transcript_len_for_test(),
+            0,
+            "the transcript buffer is released at the Connected transition"
+        );
+        assert_eq!(client.transcript_len_for_test(), 0);
+
+        for _ in 0..8 {
+            client.request_key_update().unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            server.process_new_packets().unwrap();
+            let s = server.write_tls();
+            client.read_tls(&s);
+            client.process_new_packets().unwrap();
+        }
+        assert_eq!(server.transcript_len_for_test(), 0);
+        assert_eq!(client.transcript_len_for_test(), 0);
+    }
+
+    /// MEDIUM 2(a) — an unbounded `KeyUpdate` flood is amplification: each
+    /// inbound `update_requested` makes us derive two secrets, run an AEAD
+    /// key schedule and queue a reply the peer never has to read. Past a
+    /// small bound the connection must fail rather than keep answering.
+    #[test]
+    fn key_update_flood_is_rate_limited() {
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, mut server) = connected_pair(server_config, cert_der, b"ku-flood");
+
+        let mut err = None;
+        for _ in 0..200 {
+            client.request_key_update().unwrap();
+            let c = client.write_tls();
+            server.read_tls(&c);
+            if let Err(e) = server.process_new_packets() {
+                err = Some(e);
+                break;
+            }
+            // Keep the client's read key in step with the server's replies.
+            let s = server.write_tls();
+            client.read_tls(&s);
+            if client.process_new_packets().is_err() {
+                break;
+            }
+        }
+        assert!(
+            matches!(err, Some(Error::PeerMisbehaved)),
+            "a KeyUpdate flood must be refused, got {err:?}"
+        );
+    }
+
+    /// MEDIUM 4 — the write side used to drop records silently once the
+    /// per-key sequence cap was hit. It must now rekey itself before that
+    /// point (RFC 8446 §5.5) so a long-lived connection keeps transmitting.
+    #[test]
+    fn write_side_rekeys_before_the_per_key_record_cap() {
+        let (server_config, cert_der) = rsa_server();
+        let (client, mut server) = connected_pair(server_config, cert_der, b"auto-rekey");
+
+        let _ = &client;
+        let _ = server.write_tls();
+        // Park the server's write counter on the soft threshold.
+        server.set_write_seq_for_test(crate::tls::crypto::KEY_UPDATE_SOFT_LIMIT);
+        server.send_application_data(b"after the rekey").unwrap();
+        assert!(
+            server.write_seq_for_test().is_some_and(|s| s < 4),
+            "the automatic KeyUpdate must have reset the write sequence"
+        );
+
+        // Two records went out: the `KeyUpdate` under the old key, then the
+        // application data under the new one. (The peer's read counter is not
+        // fast-forwarded here, so the records are counted rather than fed
+        // back to the client engine.)
+        let out = server.write_tls();
+        let mut off = 0usize;
+        let mut records = 0usize;
+        while let Some(rec) = crate::tls::codec::read_record(&out[off..]).unwrap() {
+            off += rec.len;
+            records += 1;
+        }
+        assert_eq!(off, out.len());
+        assert_eq!(records, 2, "expected KeyUpdate + application data");
+    }
+
+    /// MEDIUM 4 — with rekeying impossible (the cap already reached), a send
+    /// must report the failure instead of returning `Ok(())` for bytes that
+    /// never left the process.
+    #[test]
+    fn write_past_the_cap_reports_instead_of_dropping() {
+        let (server_config, cert_der) = rsa_server();
+        let (_client, mut server) = connected_pair(server_config, cert_der, b"cap-report");
+
+        // Past the cap outright: `next_nonce` refuses, so even the automatic
+        // KeyUpdate cannot be emitted.
+        server.set_write_seq_for_test(1u64 << 23);
+        let r = server.send_application_data(b"never reaches the wire");
+        assert!(
+            matches!(r, Err(Error::TooManyRecords)),
+            "a record we could not protect must not report success, got {r:?}"
+        );
+    }
+
+    /// MEDIUM 3 — RFC 8446 §4.2.10: a server that declines a 0-RTT offer must
+    /// skip past the early-data records (they cannot be deprotected under the
+    /// handshake key) and complete a normal 1-RTT handshake. Before the fix
+    /// the first `bad_record_mac` was fatal, so every intended fallback —
+    /// stale ticket, rotated ticket key, replay-window hit, load-balanced
+    /// pool — was a hard connection failure.
+    #[test]
+    fn rejected_early_data_falls_back_to_one_rtt() {
+        // Phase 1: a server that grants 0-RTT issues a ticket.
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0xc3u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"skip-ed-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"skip-ed-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots.clone()),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        pump(&mut client, &mut server);
+        let session = client.take_session().expect("ticket");
+
+        // Phase 2: the same ticket, but this server does NOT grant early
+        // data (the ticket key still matches, so PSK resumption works). The
+        // client sends 0-RTT records the server has no key for.
+        let (server_config2, _) = rsa_server();
+        let server_config2 = server_config2.with_ticket_key([0xc3u8; 32]);
+        let srng2 = HmacDrbg::<Sha256>::new(b"skip-ed-s2", b"nonce", &[]);
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"skip-ed-c2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        client2
+            .write_early_data(b"0-RTT payload the server cannot read")
+            .unwrap();
+        pump(&mut client2, &mut server2);
+
+        assert!(
+            !server2.early_data_accepted(),
+            "this server does not grant early data"
+        );
+        assert!(
+            !client2.is_handshaking() && !server2.is_handshaking(),
+            "rejected 0-RTT must fall back to 1-RTT, not kill the connection"
+        );
+        assert!(
+            server2.take_early_data().is_empty(),
+            "the skipped records must never surface as early data"
+        );
+
+        // 1-RTT traffic flows normally in both directions afterwards.
+        client2.send_application_data(b"one-rtt ping").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert_eq!(server2.take_received_plaintext(), b"one-rtt ping");
+    }
+
+    /// LOW 9 — RFC 8446 §4.5: when the server accepted early data the client
+    /// MUST send `EndOfEarlyData` before its `Finished`. It was treated as
+    /// optional, and taking the Finished straight off the early key left the
+    /// 0-RTT routing armed, so the client's authenticated 1-RTT stream landed
+    /// in the replayable early-data quarantine. The gate must fire before the
+    /// Finished MAC is even considered.
+    #[test]
+    fn server_requires_end_of_early_data_before_finished() {
+        // Phase 1: obtain a 0-RTT-capable ticket.
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0xe5u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"eoed-req-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"eoed-req-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots.clone()),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        pump(&mut client, &mut server);
+        let session = client.take_session().expect("ticket");
+
+        // Phase 2: 0-RTT is accepted, so the server sits in
+        // `WaitClientFinished` expecting EndOfEarlyData.
+        let (server_config2, _) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0xe5u8; 32])
+            .with_max_early_data(16384);
+        let srng2 = HmacDrbg::<Sha256>::new(b"eoed-req-s2", b"nonce", &[]);
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-req-c2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        client2.write_early_data(b"replayable").unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert!(server2.early_data_accepted());
+
+        // A `Finished` that skips EndOfEarlyData is `unexpected_message` —
+        // and specifically NOT `handshake_failure`, which would mean the gate
+        // never ran and the MAC check rejected it instead.
+        let mut finished = alloc::vec![20u8, 0, 0, 32];
+        finished.extend_from_slice(&[0u8; 32]);
+        assert!(
+            matches!(
+                server2.handle_handshake_for_test(finished),
+                Err(Error::UnexpectedMessage)
+            ),
+            "Finished without EndOfEarlyData must be refused"
+        );
+    }
+
+    /// LOW 6 — RFC 5246 §7.4.4 permits exactly one `CertificateRequest`. The
+    /// TLS 1.2 client used to accept repeats without a state transition,
+    /// appending each to a transcript that buffers forever with no total cap:
+    /// a server could grow the client's heap 1:1 with what it sent,
+    /// indefinitely.
+    #[test]
+    fn tls12_client_refuses_a_second_certificate_request() {
+        use crate::tls::codec::{CertificateRequest12, SignatureScheme, write_record};
+        use crate::tls::conn::{
+            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
+        };
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let server_config = ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed);
+        let mut roots = RootCertStore::new();
+        roots.add_der(der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"cr12-dup-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"cr12-dup-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
+                .unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        // Server flight: SH, Certificate, ServerKeyExchange, ServerHelloDone,
+        // all in plaintext handshake records.
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+
+        // Split off the trailing ServerHelloDone record so the client stops
+        // in `WaitServerHelloDone`.
+        let mut boundaries = alloc::vec![0usize];
+        let mut off = 0usize;
+        while let Some(rec) = crate::tls::codec::read_record(&flight[off..]).unwrap() {
+            off += rec.len;
+            boundaries.push(off);
+        }
+        assert_eq!(off, flight.len());
+        let cut = boundaries[boundaries.len() - 2];
+        client.read_tls(&flight[..cut]);
+        client.process_new_packets().unwrap();
+
+        // One CertificateRequest is legal.
+        let cr = CertificateRequest12 {
+            cert_types: alloc::vec![1u8], // rsa_sign
+            sig_schemes: alloc::vec![SignatureScheme::RSA_PSS_RSAE_SHA256],
+            cas: Vec::new(),
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &cr,
+        );
+        client.read_tls(&rec);
+        client.process_new_packets().unwrap();
+
+        // A second one must be refused, not appended to the transcript.
+        client.read_tls(&rec);
+        assert!(
+            matches!(client.process_new_packets(), Err(Error::UnexpectedMessage)),
+            "a repeated CertificateRequest must be rejected"
+        );
+    }
+
+    /// LOW 9 — after the client's `Finished`, 1-RTT application data must
+    /// land in the regular receive buffer. Leaving the 0-RTT routing armed
+    /// diverted fully-authenticated bytes into the replayable early-data
+    /// quarantine: `recv()` returned nothing while `take_early_data()`
+    /// returned 1-RTT data mislabelled as replayable.
+    #[test]
+    fn accepted_early_data_does_not_capture_the_one_rtt_stream() {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0xd4u8; 32])
+            .with_max_early_data(16384);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"eoed-c1", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"eoed-s1", b"nonce", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots.clone()),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        pump(&mut client, &mut server);
+        let session = client.take_session().expect("ticket");
+
+        let (server_config2, _) = rsa_server();
+        let server_config2 = server_config2
+            .with_ticket_key([0xd4u8; 32])
+            .with_max_early_data(16384);
+        let srng2 = HmacDrbg::<Sha256>::new(b"eoed-s2", b"nonce", &[]);
+        let mut server2 = ServerConnection::new(server_config2, srng2);
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"eoed-c2", b"nonce", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        client2.write_early_data(b"replayable").unwrap();
+        pump(&mut client2, &mut server2);
+        assert!(server2.early_data_accepted(), "0-RTT should be accepted");
+        assert_eq!(server2.take_early_data(), b"replayable");
+
+        client2
+            .send_application_data(b"authenticated 1-RTT")
+            .unwrap();
+        let c = client2.write_tls();
+        server2.read_tls(&c);
+        server2.process_new_packets().unwrap();
+        assert!(
+            server2.take_early_data().is_empty(),
+            "1-RTT bytes must not be quarantined as replayable early data"
+        );
+        assert_eq!(server2.take_received_plaintext(), b"authenticated 1-RTT");
+    }
+}

@@ -18,7 +18,7 @@ pub(crate) mod ssl3;
 mod suite;
 
 #[allow(unused_imports)]
-pub(crate) use aead::{Aead, RecordCrypter};
+pub(crate) use aead::{Aead, KEY_UPDATE_SOFT_LIMIT, RecordCrypter};
 #[allow(unused_imports)]
 pub(crate) use hash::Transcript;
 // `HashAlg` is exposed publicly so callers can store it in resumption sessions.

@@ -43,6 +43,24 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
+
+/// Upper bound on post-handshake `KeyUpdate` messages we will process from
+/// the server (RFC 8446 §4.6.3). Each one costs two HKDF-Expand-Label pairs
+/// plus an AEAD key schedule, and each `update_requested` makes us emit our
+/// own reply — five bytes of handshake message and a ~27-byte record — with
+/// no natural backpressure if the peer never reads. A peer streaming them
+/// back to back would otherwise grow our queued output without any ceiling.
+/// Sixty-four covers any plausible legitimate rekeying schedule (the per-key
+/// record cap is 2²³ records, so 64 peer-initiated updates span well over
+/// 500 million records).
+const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
+
+/// Ceiling on `CertificateEntry` structures in a server `Certificate`
+/// message. A real chain is a leaf plus a handful of intermediates; RFC 8446
+/// sets no limit, but the message body is bounded only by the 128 KiB
+/// handshake-reassembly cap, which leaves room for ~26,000 zero-length
+/// entries to be collected and handed to path validation.
+const MAX_CERTIFICATE_ENTRIES: usize = 16;
 #[cfg(feature = "ech")]
 use crate::hpke::SenderContext;
 #[cfg(feature = "ech")]
@@ -644,6 +662,9 @@ pub struct ClientConnection {
     /// already-sent ClientHello to a TLS 1.2 engine. No alert is emitted and no
     /// state advances.
     downgrade_to_tls12: bool,
+    /// Post-handshake `KeyUpdate` messages received from the server, capped
+    /// by [`MAX_KEY_UPDATES_RECEIVED`].
+    key_updates_received: u32,
     /// The exact ClientHello handshake-message bytes we emitted (header
     /// included), retained so a 1.2 downgrade can seed the TLS 1.2 engine's
     /// transcript with them without re-encoding.
@@ -1245,6 +1266,7 @@ impl ClientConnection {
             cert_request_received: false,
             offer_tls12,
             downgrade_to_tls12: false,
+            key_updates_received: 0,
             sent_client_hello: Vec::new(),
             engine_mode,
             hooks,
@@ -1674,11 +1696,58 @@ impl ClientConnection {
     }
 
     /// Sends application data (only valid once the handshake completes).
+    ///
+    /// Returns `Err(TooManyRecords)` if the write side hit the per-key
+    /// record-sequence cap and the record could not be protected — the bytes
+    /// were NOT transmitted. [`Self::maybe_auto_key_update`] normally rekeys
+    /// long before that point.
     pub fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
             return Err(Error::InappropriateState);
         }
+        self.maybe_auto_key_update()?;
         self.core.send_application_data(data);
+        self.core.check_write_error()
+    }
+
+    /// Test hook: fast-forward the write-side record sequence counter so the
+    /// automatic-`KeyUpdate` threshold and the per-key cap can be exercised
+    /// without protecting 2²³ records first.
+    #[cfg(test)]
+    pub(crate) fn set_write_seq_for_test(&mut self, seq: u64) {
+        self.core.set_write_seq_for_test(seq);
+    }
+
+    /// Test hook: the write-side record sequence number, if keys are in.
+    #[cfg(test)]
+    pub(crate) fn write_seq_for_test(&self) -> Option<u64> {
+        self.core.write_seq()
+    }
+
+    /// Test hook: bytes still buffered in the handshake transcript. Zero once
+    /// the transcript has been sealed at the `Connected` transition.
+    #[cfg(test)]
+    pub(crate) fn transcript_len_for_test(&self) -> usize {
+        self.core.transcript.buffered_len()
+    }
+
+    /// RFC 8446 §5.5: initiate a `KeyUpdate` once the write side approaches
+    /// the per-key record-sequence cap, so `emit_record` never has to drop a
+    /// record. Silent no-op in QUIC mode (RFC 9001 §6 forbids TLS
+    /// `KeyUpdate`) and before the application keys are installed.
+    fn maybe_auto_key_update(&mut self) -> Result<(), Error> {
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic
+            || self.client_app_secret.is_none()
+        {
+            return Ok(());
+        }
+        if self
+            .core
+            .write_seq()
+            .is_some_and(|seq| seq >= super::super::crypto::KEY_UPDATE_SOFT_LIMIT)
+        {
+            self.send_key_update(false)?;
+        }
         Ok(())
     }
 
@@ -1735,6 +1804,12 @@ impl ClientConnection {
                     if self.state != State::Connected {
                         let e = Error::UnexpectedMessage;
                         self.fail(&e);
+                        // `ConnectionCore` never buffered the plaintext (the
+                        // handshake is incomplete, so the peer is not
+                        // authenticated), but drop anything already queued so
+                        // an application draining on the error path cannot
+                        // read it.
+                        let _ = self.core.take_received();
                         return Err(e);
                     }
                 }
@@ -1747,7 +1822,11 @@ impl ClientConnection {
                     self.state = State::Closed;
                     return Err(Error::AlertReceived(alert.description));
                 }
-                Ok(None) => return Ok(()),
+                // A latched write-side failure (see
+                // `ConnectionCore::check_write_error`) means a record we
+                // believed we sent is not on the wire; surface it rather
+                // than reporting a clean drain.
+                Ok(None) => return self.core.check_write_error(),
                 Err(e) => {
                     self.fail(&e);
                     return Err(e);
@@ -1828,6 +1907,14 @@ impl ClientConnection {
     /// (`update_not_requested`) and step the write side as well.
     fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
         let ku = KeyUpdate::decode(body)?;
+        // Rate limit (see `MAX_KEY_UPDATES_RECEIVED`): every inbound
+        // `KeyUpdate(update_requested)` costs two HKDF-Expand-Label pairs, an
+        // AEAD key schedule and an outbound record, and a peer that never
+        // reads our replies can stream them back to back with no ceiling.
+        self.key_updates_received = self.key_updates_received.saturating_add(1);
+        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+            return Err(Error::PeerMisbehaved);
+        }
         let suite = self.suite.ok_or(Error::IllegalParameter)?;
 
         // Read side: derive next server_app_secret and re-key.
@@ -3175,6 +3262,14 @@ impl ClientConnection {
         // RFC 8446 §5: ChangeCipherSpec is no longer expected after the
         // handshake completes.
         self.core.close_ccs_window();
+        // The server is authenticated: received application plaintext may now
+        // be buffered for the application (see `ConnectionCore`).
+        self.core.set_app_data_allowed(true);
+        // No further transcript hash is needed (RMS was just derived), so
+        // stop buffering handshake bytes: post-handshake `KeyUpdate` /
+        // `NewSessionTicket` traffic must not grow the heap for the life of
+        // the connection.
+        self.core.transcript.seal();
         self.state = State::Connected;
         Ok(())
     }
@@ -3500,7 +3595,7 @@ fn alert_for(error: &Error) -> AlertDescription {
         #[cfg(feature = "ech")]
         Error::EchDecryptionFailed => AlertDescription::DecryptError,
         #[cfg(feature = "ech")]
-        Error::EchDecodeError => AlertDescription::IllegalParameter,
+        Error::EchDecodeError | Error::EchInnerMalformed => AlertDescription::IllegalParameter,
         // draft-ietf-tls-esni-22 §11.2: `ech_required` (121). The named
         // variant is deliberately not added to the (exhaustive, public)
         // `AlertDescription` enum; the raw code is wire-identical.
@@ -3565,14 +3660,27 @@ fn parse_certificate_list(body: &[u8]) -> Result<Vec<CertificateEntry>, Error> {
     let mut entries = ReadCursor::new(list);
     let mut out: Vec<CertificateEntry> = Vec::new();
     while !entries.is_empty() {
+        // Bound the chain length. The body is only capped by
+        // `MAX_HANDSHAKE_REASSEMBLY` (128 KiB), so without this a peer can
+        // hand `verify_chain_with_crls` tens of thousands of zero-length
+        // entries. No legitimate chain is anywhere near this long.
+        if out.len() >= MAX_CERTIFICATE_ENTRIES {
+            return Err(Error::Decode);
+        }
         let cert = entries.vec_u24()?.to_vec();
         let exts_bytes = entries.vec_u16()?;
         // Parse the per-cert extensions into RawExtension tuples. The
         // RFC 8446 §4.2 rule that an extension type appears at most once
-        // applies here too.
+        // applies here too. The duplicate scan is quadratic, so cap the
+        // count exactly as `codec::handshake::parse_extensions` does —
+        // otherwise ~32,700 four-byte extensions inside the reassembly cap
+        // buy ~5·10⁸ comparisons for 128 KiB of input.
         let mut ext_c = ReadCursor::new(exts_bytes);
         let mut exts: Vec<crate::tls::codec::RawExtension> = Vec::new();
         while !ext_c.is_empty() {
+            if exts.len() >= crate::tls::codec::MAX_EXTENSIONS {
+                return Err(Error::Decode);
+            }
             let ty = crate::tls::codec::ExtensionType(ext_c.u16()?);
             let data = ext_c.vec_u16()?.to_vec();
             if exts.iter().any(|(t, _)| *t == ty) {

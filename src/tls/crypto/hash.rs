@@ -20,6 +20,9 @@ use alloc::vec::Vec;
 pub(crate) struct Transcript {
     alg: Option<HashAlg>,
     buf: Vec<u8>,
+    /// Set once the handshake completes: further [`update`](Self::update)
+    /// calls are ignored. See [`seal`](Self::seal).
+    sealed: bool,
 }
 
 impl Transcript {
@@ -28,7 +31,34 @@ impl Transcript {
         Transcript {
             alg: None,
             buf: Vec::new(),
+            sealed: false,
         }
+    }
+
+    /// Closes the transcript once the handshake is complete: the accumulated
+    /// bytes are released and every subsequent [`update`](Self::update) is a
+    /// no-op.
+    ///
+    /// Post-handshake handshake messages — `KeyUpdate` (RFC 8446 §4.6.3) and
+    /// `NewSessionTicket` (§4.6.1) — are not inputs to any transcript hash
+    /// this implementation computes: the last one needed is
+    /// `Hash(CH..client Finished)` for `resumption_master_secret`, taken at
+    /// the `Connected` transition. Continuing to buffer them would let a peer
+    /// grow our heap for the life of the connection (five bytes per inbound
+    /// `KeyUpdate`, never reclaimed) with no ceiling and no backpressure.
+    ///
+    /// A sealed transcript's [`current_hash`](Self::current_hash) is
+    /// meaningless; the state machines only seal at the point where no
+    /// further transcript hash is needed.
+    pub(crate) fn seal(&mut self) {
+        self.sealed = true;
+        self.buf = Vec::new();
+    }
+
+    /// The number of handshake bytes currently buffered.
+    #[cfg(test)]
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.buf.len()
     }
 
     /// Fixes the hash function once the cipher suite is negotiated.
@@ -36,8 +66,12 @@ impl Transcript {
         self.alg = Some(alg);
     }
 
-    /// Appends one handshake message's wire bytes (header included).
+    /// Appends one handshake message's wire bytes (header included). A no-op
+    /// once the transcript has been [`seal`](Self::seal)ed.
     pub(crate) fn update(&mut self, message: &[u8]) {
+        if self.sealed {
+            return;
+        }
         self.buf.extend_from_slice(message);
     }
 
@@ -88,6 +122,7 @@ impl Transcript {
     /// (set via [`set_alg`]) is preserved.
     #[cfg(feature = "ech")]
     pub(crate) fn replace_buf(&mut self, new_buf: Vec<u8>) {
+        debug_assert!(!self.sealed, "transcript rewritten after being sealed");
         self.buf = new_buf;
     }
 
@@ -127,6 +162,24 @@ mod tests {
             t.current_hash().as_slice(),
             Sha256::digest(b"hello world").as_ref()
         );
+    }
+
+    /// Sealing the transcript releases the buffer and makes further updates
+    /// no-ops, so post-handshake `KeyUpdate` / `NewSessionTicket` traffic
+    /// cannot grow the connection's heap without bound.
+    #[test]
+    fn seal_stops_growth_and_releases_the_buffer() {
+        let mut t = Transcript::new();
+        t.set_alg(HashAlg::Sha256);
+        t.update(b"client hello");
+        assert_eq!(t.buffered_len(), 12);
+        t.seal();
+        assert_eq!(t.buffered_len(), 0);
+        // A flood of post-handshake KeyUpdates adds nothing.
+        for _ in 0..10_000 {
+            t.update(&[24, 0, 0, 1, 1]);
+        }
+        assert_eq!(t.buffered_len(), 0);
     }
 
     #[test]

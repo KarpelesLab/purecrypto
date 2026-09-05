@@ -71,6 +71,25 @@ pub(crate) struct ConnectionCore {
     /// plaintext fragment we may send them. `None` means "unbounded" (default
     /// TLS 1.3 cap of 2¹⁴).
     peer_record_size_limit: Option<u16>,
+    /// Gates buffering of decrypted inner `ApplicationData` into `app_in`.
+    /// Set by the state machines when the handshake completes. Before that
+    /// the peer is not authenticated (under mTLS it may not have sent
+    /// `Certificate`/`CertificateVerify` yet), so plaintext must never reach
+    /// `take_received` even transiently — an application draining plaintext
+    /// on the error path would otherwise read unauthenticated bytes.
+    app_data_allowed: bool,
+    /// Sticky write-side failure. `emit_record` cannot return a `Result`
+    /// (`send_alert` / `send_close_notify` / `emit_handshake` are infallible
+    /// by construction), so a record we failed to protect — in practice
+    /// `TooManyRecords` once the per-key sequence cap is hit — latches here
+    /// and the engines surface it instead of silently transmitting nothing.
+    write_error: Option<Error>,
+    /// RFC 8446 §4.2.10 "skip rejected early data": while set, records that
+    /// fail the AEAD check are discarded (without consuming a read sequence
+    /// number) rather than failing the connection, up to this many remaining
+    /// ciphertext bytes. Armed by the server when it declines a 0-RTT offer
+    /// the client made; cleared by the first record that deprotects.
+    skip_early_data: Option<usize>,
 }
 
 impl ConnectionCore {
@@ -88,6 +107,60 @@ impl ConnectionCore {
             sent_close_notify: false,
             ccs_window_open: true,
             peer_record_size_limit: None,
+            app_data_allowed: false,
+            write_error: None,
+            skip_early_data: None,
+        }
+    }
+
+    /// Allows (or forbids) buffering of received application plaintext. The
+    /// state machines enable this on the transition to `Connected`; see the
+    /// `app_data_allowed` field.
+    pub(crate) fn set_app_data_allowed(&mut self, allowed: bool) {
+        self.app_data_allowed = allowed;
+    }
+
+    /// `Err(..)` if a previous `emit_record` failed. Engines call this from
+    /// `send_application_data` / `process_new_packets` so a caller learns the
+    /// record was not transmitted instead of seeing a bogus `Ok(())`. The
+    /// error is sticky: the record stream has a gap, so the connection cannot
+    /// meaningfully continue.
+    pub(crate) fn check_write_error(&self) -> Result<(), Error> {
+        match &self.write_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// The number of records already emitted under the current write key, or
+    /// `None` while the record layer is still in the clear. Drives the
+    /// automatic `KeyUpdate` before the per-key cap (RFC 8446 §5.5).
+    pub(crate) fn write_seq(&self) -> Option<u64> {
+        self.write.as_ref().map(|c| c.seq())
+    }
+
+    /// Arms the RFC 8446 §4.2.10 "skip rejected early data" mode with a
+    /// ciphertext-byte budget: records that fail to deprotect are discarded
+    /// instead of killing the connection until either one deprotects
+    /// (the client's real flight under the handshake key) or the budget runs
+    /// out. Without this a server that declines a 0-RTT offer would hard-fail
+    /// every intended 1-RTT fallback.
+    pub(crate) fn begin_skip_early_data(&mut self, budget: usize) {
+        self.skip_early_data = Some(budget);
+    }
+
+    /// Whether the "skip rejected early data" window is still open (test and
+    /// diagnostic hook).
+    #[cfg(test)]
+    pub(crate) fn skipping_early_data(&self) -> bool {
+        self.skip_early_data.is_some()
+    }
+
+    /// Test hook: fast-forward the write-side record sequence counter.
+    #[cfg(test)]
+    pub(crate) fn set_write_seq_for_test(&mut self, seq: u64) {
+        if let Some(c) = self.write.as_mut() {
+            c.set_seq_for_test(seq);
         }
     }
 
@@ -152,6 +225,13 @@ impl ConnectionCore {
 
     /// Updates the transcript with a handshake message and frames it for
     /// sending (encrypted if write keys are installed, else as plaintext).
+    ///
+    /// Once the transcript is sealed (see `Transcript::seal`, called at the
+    /// `Connected` transition) the update is a no-op: post-handshake messages
+    /// — `KeyUpdate`, `NewSessionTicket` — are not part of any transcript
+    /// hash this code computes, and appending them would let a peer grow our
+    /// heap without bound, five bytes per `KeyUpdate`, for the life of the
+    /// connection.
     pub(crate) fn emit_handshake(&mut self, message: Vec<u8>) {
         self.transcript.update(&message);
         self.emit_record(ContentType::Handshake, &message);
@@ -244,12 +324,17 @@ impl ConnectionCore {
         match &mut self.write {
             Some(crypter) => match crypter.encrypt(ct, payload) {
                 Ok(rec) => self.outbuf.extend_from_slice(&rec),
-                Err(_) => {
-                    // The only failures here are `TooManyRecords` (callers
-                    // should `request_key_update` first) and `RecordOverflow`
-                    // (callers must fragment). Both are programmer errors;
-                    // drop the record so the connection visibly stops making
-                    // progress rather than emitting garbage.
+                Err(e) => {
+                    // The only failures here are `TooManyRecords` (the
+                    // per-key sequence cap — the engines pre-empt it with an
+                    // automatic `KeyUpdate`, but a peer that never lets us
+                    // rekey can still get here) and `RecordOverflow` (a
+                    // caller failed to fragment). The record is NOT on the
+                    // wire, so silently returning would leave
+                    // `send_application_data` / `send_close_notify` as
+                    // no-ops that still report success. Latch the error so
+                    // the engines can surface it.
+                    self.write_error.get_or_insert(e);
                 }
             },
             None => write_record(&mut self.outbuf, ct, ProtocolVersion::TLSv1_2, payload),
@@ -298,9 +383,33 @@ impl ConnectionCore {
                     continue;
                 }
                 ContentType::ApplicationData if self.read.is_some() => {
-                    let (inner_ct, content) = self.decrypt(&fragment)?;
-                    if let Some(msg) = self.dispatch_inner(inner_ct, content)? {
-                        return Ok(Some(msg));
+                    match self.decrypt(&fragment) {
+                        Ok((inner_ct, content)) => {
+                            // A record that deprotects ends the RFC 8446
+                            // §4.2.10 skip window: we have reached the
+                            // client's real flight under the handshake key.
+                            self.skip_early_data = None;
+                            if let Some(msg) = self.dispatch_inner(inner_ct, content)? {
+                                return Ok(Some(msg));
+                            }
+                        }
+                        Err(Error::BadRecordMac) if self.skip_early_data.is_some() => {
+                            // RFC 8446 §4.2.10: a server that rejects early
+                            // data skips past it, discarding records that
+                            // fail to deprotect under the handshake key.
+                            // `decrypt` peeks the nonce, so the read sequence
+                            // number has NOT advanced — the next record is
+                            // tried at the same seq, which is exactly what
+                            // the client's real flight expects.
+                            let budget = self.skip_early_data.take().expect("armed");
+                            match budget.checked_sub(fragment.len()) {
+                                Some(rest) => self.skip_early_data = Some(rest),
+                                // Budget exhausted: this really is a bad
+                                // record, not skipped early data.
+                                None => return Err(Error::BadRecordMac),
+                            }
+                        }
+                        Err(e) => return Err(e),
                     }
                 }
                 ContentType::Handshake => {
@@ -362,9 +471,14 @@ impl ConnectionCore {
                     // Replayable 0-RTT bytes: quarantine away from `app_in`
                     // so `take_received` never mixes them with 1-RTT data.
                     self.early_in.extend_from_slice(&content);
-                } else {
+                } else if self.app_data_allowed {
                     self.app_in.extend_from_slice(&content);
                 }
+                // Otherwise the handshake has not completed: the peer is not
+                // yet authenticated, so the plaintext is dropped rather than
+                // buffered. The event is still reported so the state machine
+                // raises `unexpected_message` — but an application draining
+                // plaintext on the error path can never see these bytes.
                 Ok(Some(Incoming::ApplicationData(plaintext_len)))
             }
             ContentType::Alert => {
@@ -431,6 +545,180 @@ mod tests {
             core.quic_feed_handshake(&chunk),
             Err(Error::RecordOverflow)
         ));
+    }
+
+    /// Finding: the write side silently dropped records once the per-key
+    /// record-sequence cap was reached — `send_application_data`,
+    /// `send_alert` and `send_close_notify` all became no-ops while still
+    /// reporting success. The failure must latch and be observable.
+    #[test]
+    fn write_side_cap_latches_instead_of_silently_dropping() {
+        use crate::tls::crypto::AeadAlg;
+        use crate::tls::crypto::{HashAlg, RecordCrypter, Secret};
+
+        let mut core = ConnectionCore::new();
+        let secret = Secret::new(&[0x5au8; 32]);
+        let mut crypter = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+        // Park the counter one record below the cap: the first record still
+        // goes out, the second cannot be protected.
+        crypter.set_seq_for_test((1u64 << 23) - 1);
+        core.set_write(crypter);
+
+        core.send_application_data(b"last one through");
+        assert!(core.check_write_error().is_ok());
+        let queued = core.write_tls().len();
+        assert!(queued > 0, "the first record must reach the wire");
+
+        core.send_application_data(b"this one cannot be protected");
+        assert!(
+            matches!(core.check_write_error(), Err(Error::TooManyRecords)),
+            "a dropped record must surface, not be swallowed"
+        );
+        assert!(
+            core.write_tls().is_empty(),
+            "nothing was queued for the failed record"
+        );
+        // The latch is sticky: a close_notify after the cap is equally lost,
+        // and the caller must keep seeing the error.
+        core.send_close_notify();
+        assert!(matches!(
+            core.check_write_error(),
+            Err(Error::TooManyRecords)
+        ));
+    }
+
+    /// Finding: rejected 0-RTT killed the connection. RFC 8446 §4.2.10 wants
+    /// the undecryptable early-data records skipped, and — because
+    /// `RecordCrypter::decrypt` used to consume a sequence number before the
+    /// AEAD check — the skip must NOT advance the read sequence number, or
+    /// the peer's real flight would never line up again.
+    #[test]
+    fn skip_early_data_discards_records_without_burning_read_sequence_numbers() {
+        use crate::tls::crypto::AeadAlg;
+        use crate::tls::crypto::{HashAlg, RecordCrypter, Secret};
+
+        // Two independent keys: `real` is the handshake key both sides agree
+        // on, `stale` stands in for the 0-RTT key the server never installed.
+        let real_secret = Secret::new(&[0x11u8; 32]);
+        let stale_secret = Secret::new(&[0x22u8; 32]);
+        let mut peer_writer =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &real_secret);
+
+        let mut core = ConnectionCore::new();
+        core.set_read(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &real_secret,
+        ));
+        core.set_app_data_allowed(true);
+        core.begin_skip_early_data(64 * 1024);
+
+        // Three records the reader cannot decrypt (the "early data"), then a
+        // genuine record at read sequence number 0.
+        let mut wire = Vec::new();
+        let mut stale = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &stale_secret);
+        for _ in 0..3 {
+            wire.extend_from_slice(
+                &stale
+                    .encrypt(ContentType::ApplicationData, b"0-RTT bytes")
+                    .unwrap(),
+            );
+        }
+        wire.extend_from_slice(
+            &peer_writer
+                .encrypt(ContentType::ApplicationData, b"1-RTT hello")
+                .unwrap(),
+        );
+        core.read_tls(&wire);
+
+        assert!(matches!(
+            core.next_message(),
+            Ok(Some(Incoming::ApplicationData(11)))
+        ));
+        assert_eq!(core.take_received(), b"1-RTT hello");
+        assert!(
+            !core.skipping_early_data(),
+            "the first record that deprotects closes the skip window"
+        );
+
+        // With the window closed, a bad record is fatal again.
+        let mut junk = Vec::new();
+        junk.extend_from_slice(
+            &stale
+                .encrypt(ContentType::ApplicationData, b"late junk")
+                .unwrap(),
+        );
+        core.read_tls(&junk);
+        assert!(matches!(core.next_message(), Err(Error::BadRecordMac)));
+    }
+
+    /// The skip budget is finite: past it a `bad_record_mac` is fatal again,
+    /// so an attacker cannot make us burn unbounded work discarding records.
+    #[test]
+    fn skip_early_data_budget_is_bounded() {
+        use crate::tls::crypto::AeadAlg;
+        use crate::tls::crypto::{HashAlg, RecordCrypter, Secret};
+
+        let mut core = ConnectionCore::new();
+        core.set_read(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &Secret::new(&[0x11u8; 32]),
+        ));
+        core.begin_skip_early_data(64);
+        let mut stale = RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &Secret::new(&[0x22u8; 32]),
+        );
+        let mut wire = Vec::new();
+        for _ in 0..4 {
+            wire.extend_from_slice(
+                &stale
+                    .encrypt(ContentType::ApplicationData, b"0-RTT bytes")
+                    .unwrap(),
+            );
+        }
+        core.read_tls(&wire);
+        assert!(matches!(core.next_message(), Err(Error::BadRecordMac)));
+    }
+
+    /// Application plaintext must not be buffered before the state gate that
+    /// rejects it: under mTLS a peer that has completed key exchange but not
+    /// yet authenticated could otherwise deposit bytes an application reads
+    /// off the error path.
+    #[test]
+    fn application_data_is_not_buffered_before_the_handshake_completes() {
+        use crate::tls::crypto::AeadAlg;
+        use crate::tls::crypto::{HashAlg, RecordCrypter, Secret};
+
+        let secret = Secret::new(&[0x33u8; 32]);
+        let mut peer = RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &secret);
+        let mut core = ConnectionCore::new();
+        core.set_read(RecordCrypter::new(
+            HashAlg::Sha256,
+            AeadAlg::Aes128Gcm,
+            16,
+            &secret,
+        ));
+        // `app_data_allowed` is false until the state machine reaches
+        // Connected.
+        core.read_tls(
+            &peer
+                .encrypt(ContentType::ApplicationData, b"unauthenticated")
+                .unwrap(),
+        );
+        assert!(matches!(
+            core.next_message(),
+            Ok(Some(Incoming::ApplicationData(15)))
+        ));
+        assert!(
+            core.take_received().is_empty(),
+            "plaintext must not be readable before the handshake completes"
+        );
     }
 
     /// A single fragment claiming to be larger than the cap is rejected

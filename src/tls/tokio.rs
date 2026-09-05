@@ -239,7 +239,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for TlsStream<S> {
                     let mut fed = 0;
                     while fed < filled.len() {
                         fed += this.conn.feed(&filled[fed..]).map_err(ioerr)?;
+                        // Feeding can queue records the engine owes the peer:
+                        // a `KeyUpdate` reply (RFC 8446 §4.6.3), an alert, a
+                        // post-handshake flight. A read-only application never
+                        // calls `poll_write`, so without draining here that
+                        // queue grows for every inbound byte with no ceiling
+                        // and no backpressure — a peer streaming
+                        // `KeyUpdate(update_requested)` could grow it until
+                        // the process runs out of memory.
+                        this.wbuf
+                            .extend_from_slice(&this.conn.pop().map_err(ioerr)?);
                     }
+                    // Best-effort flush: if the socket is not writable right
+                    // now the bytes stay in `wbuf` and go out with the next
+                    // write or read. `poll_read` must not return `Pending` on
+                    // the write side's behalf, so the result is discarded.
+                    let _ = this.flush_wbuf(cx);
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,

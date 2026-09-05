@@ -55,22 +55,31 @@ impl Aead {
 
     /// Builds an AEAD for the given algorithm from a raw key. The key length
     /// must match `alg` (16 for AES-128, 32 for AES-256/ChaCha20).
+    ///
+    /// The stack copy of the key is wiped once the cipher has absorbed it, so
+    /// the raw record key is not left behind on the stack frame.
     pub(crate) fn from_key(alg: AeadAlg, key: &[u8]) -> Self {
         match alg {
             AeadAlg::Aes128Gcm => {
                 let mut k = [0u8; 16];
                 k.copy_from_slice(&key[..16]);
-                Aead::Aes128(Gcm::new(Aes128::new(&k)))
+                let a = Aead::Aes128(Gcm::new(Aes128::new(&k)));
+                wipe(&mut k);
+                a
             }
             AeadAlg::Aes256Gcm => {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&key[..32]);
-                Aead::Aes256(Gcm::new(Aes256::new(&k)))
+                let a = Aead::Aes256(Gcm::new(Aes256::new(&k)));
+                wipe(&mut k);
+                a
             }
             AeadAlg::ChaCha20Poly1305 => {
                 let mut k = [0u8; 32];
                 k.copy_from_slice(&key[..32]);
-                Aead::ChaCha20Poly1305(ChaCha20Poly1305::new(&k))
+                let a = Aead::ChaCha20Poly1305(ChaCha20Poly1305::new(&k));
+                wipe(&mut k);
+                a
             }
         }
     }
@@ -81,6 +90,12 @@ impl Aead {
 /// AES-GCM ≈ 2²⁴·⁵, AES-CCM_8 ≈ 2²³, ChaCha20-Poly1305 ≈ 2⁴⁸. We pick the
 /// most conservative bound that still leaves room for normal traffic.
 const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
+
+/// Soft threshold at which the write side should initiate a `KeyUpdate`
+/// (RFC 8446 §5.5: "before reaching" the limit). Leaving a margin of 2¹⁶
+/// records below [`MAX_RECORDS_PER_KEY`] gives the peer ample time to
+/// process our `KeyUpdate` while we keep transmitting under the old key.
+pub(crate) const KEY_UPDATE_SOFT_LIMIT: u64 = MAX_RECORDS_PER_KEY - (1 << 16);
 
 /// One direction's record protection: an AEAD keyed from a traffic secret,
 /// plus the static IV and a record sequence counter.
@@ -94,33 +109,28 @@ impl RecordCrypter {
     /// Derives the write/read key and IV from a traffic secret (RFC 8446 §7.3)
     /// and starts the sequence counter at zero. `alg` selects the AEAD; `key_len`
     /// is its key size in bytes (16 for AES-128, 32 for AES-256/ChaCha20).
+    ///
+    /// The derived key bytes are wiped as soon as the AEAD has absorbed them
+    /// (the heap `Vec` from `traffic_key_iv` and the stack copy alike), so a
+    /// `KeyUpdate` does not strew successive record keys through freed heap;
+    /// the static IV is wiped by [`RecordCrypter`]'s `Drop`.
     pub(crate) fn new(hash: HashAlg, alg: AeadAlg, key_len: usize, secret: &Secret) -> Self {
-        let (key, iv) = traffic_key_iv(hash, secret, key_len);
-        let aead = match alg {
-            AeadAlg::Aes128Gcm => {
-                let mut k = [0u8; 16];
-                k.copy_from_slice(&key[..16]);
-                Aead::Aes128(Gcm::new(Aes128::new(&k)))
-            }
-            AeadAlg::Aes256Gcm => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&key[..32]);
-                Aead::Aes256(Gcm::new(Aes256::new(&k)))
-            }
-            AeadAlg::ChaCha20Poly1305 => {
-                let mut k = [0u8; 32];
-                k.copy_from_slice(&key[..32]);
-                Aead::ChaCha20Poly1305(ChaCha20Poly1305::new(&k))
-            }
-        };
+        let (mut key, iv) = traffic_key_iv(hash, secret, key_len);
+        let aead = Aead::from_key(alg, &key);
+        wipe(&mut key);
         RecordCrypter { aead, iv, seq: 0 }
     }
 
-    /// The per-record nonce: static IV XOR the 64-bit big-endian sequence
-    /// number (right-aligned), then increments the counter. Returns
-    /// `Err(TooManyRecords)` if the per-key cap (RFC 8446 §5.5) has been
-    /// reached; callers should `KeyUpdate` first.
-    fn next_nonce(&mut self) -> Result<[u8; 12], Error> {
+    /// The per-record nonce for the *current* sequence number — static IV XOR
+    /// the 64-bit big-endian sequence number (right-aligned) — WITHOUT
+    /// advancing the counter. Returns `Err(TooManyRecords)` if the per-key cap
+    /// (RFC 8446 §5.5) has been reached; callers should `KeyUpdate` first.
+    ///
+    /// The read path deliberately peeks rather than consumes: a record that
+    /// fails the AEAD check was never accepted, and the RFC 8446 §4.2.10
+    /// "skip rejected early data" path must be able to discard it and try the
+    /// *same* sequence number against the next record.
+    fn peek_nonce(&self) -> Result<[u8; 12], Error> {
         if self.seq >= MAX_RECORDS_PER_KEY {
             return Err(Error::TooManyRecords);
         }
@@ -129,8 +139,31 @@ impl RecordCrypter {
         for i in 0..8 {
             nonce[4 + i] ^= seq[i];
         }
+        Ok(nonce)
+    }
+
+    /// [`Self::peek_nonce`] followed by the counter increment (the write-side
+    /// behaviour: a record we emit always consumes its sequence number).
+    fn next_nonce(&mut self) -> Result<[u8; 12], Error> {
+        let nonce = self.peek_nonce()?;
         self.seq += 1;
         Ok(nonce)
+    }
+
+    /// The number of records already protected/accepted under this key. Used
+    /// by the state machines to initiate a `KeyUpdate` before the per-key cap
+    /// ([`KEY_UPDATE_SOFT_LIMIT`]) turns every further `encrypt` into
+    /// `Err(TooManyRecords)`.
+    pub(crate) fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Test hook: fast-forward the sequence counter so the per-key cap and
+    /// the automatic-`KeyUpdate` threshold can be exercised without actually
+    /// protecting 2²³ records.
+    #[cfg(test)]
+    pub(crate) fn set_seq_for_test(&mut self, seq: u64) {
+        self.seq = seq;
     }
 
     /// Encrypts one record, returning the complete wire `TLSCiphertext`
@@ -235,10 +268,13 @@ impl RecordCrypter {
         tag.copy_from_slice(tag_bytes);
 
         let mut buf = ct.to_vec();
-        let nonce = self.next_nonce()?;
+        // Peek, don't consume: the sequence number advances only once the
+        // AEAD has actually accepted the record (see `peek_nonce`).
+        let nonce = self.peek_nonce()?;
         if !self.aead.decrypt(&nonce, header, &mut buf, &tag) {
             return Err(Error::BadRecordMac);
         }
+        self.seq += 1;
 
         // TLSInnerPlaintext: content || true_type || zeros*. The true
         // content type is the last non-zero byte. A naive backward
@@ -257,6 +293,21 @@ impl RecordCrypter {
         }
         Ok((content_type, buf))
     }
+}
+
+impl Drop for RecordCrypter {
+    /// Wipes the static per-direction IV on teardown (and on every
+    /// `KeyUpdate`, which drops the superseded crypter). The AEAD's own
+    /// expanded key schedule is owned by `crate::cipher` and wiped there.
+    fn drop(&mut self) {
+        wipe(&mut self.iv);
+    }
+}
+
+/// Best-effort zeroing of a key buffer, fenced with `black_box` so the
+/// stores are not elided (the crate's standard wipe pattern).
+fn wipe(buf: &mut [u8]) {
+    crate::tls::conn::wipe(buf);
 }
 
 /// Scans `buf` front-to-back in constant time and returns
