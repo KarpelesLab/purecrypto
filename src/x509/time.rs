@@ -15,15 +15,27 @@ pub struct Time {
 }
 
 impl Time {
-    /// Builds a time from UTC calendar components.
+    /// Builds a time from UTC calendar components, **without validating
+    /// them**.
     ///
     /// Years 1950–2049 are stored in the two-digit-year `UTCTime` form; any
     /// other year is stored in the four-digit-year `GeneralizedTime` form.
     /// Storing, say, 2080 as UTCTime would re-parse as 1980 under the
     /// RFC 5280 century rule, silently shifting the date by a century.
-    /// Years above 9999 are not representable in ASN.1 time types; the year
-    /// is reduced modulo 10000 (such values are nonsensical inputs, not
-    /// reachable from any parser).
+    ///
+    /// # Out-of-range components
+    ///
+    /// This constructor is infallible and does no calendar-range checking:
+    /// each component is emitted as two decimal digits *reduced modulo 100*
+    /// and the year modulo 10000. An impossible date (`2024-02-30`), an
+    /// out-of-range field (`hour = 25`), or a value ≥ 100 therefore yields a
+    /// `Time` that this crate's own parser rejects forever — a CA using it to
+    /// stamp `notBefore`/`notAfter` would issue certificates that never
+    /// validate, with no error at construction. Use
+    /// [`utc_checked`](Self::utc_checked) whenever the components come from
+    /// arithmetic or from outside the caller; the literals in this crate's
+    /// tests and in [`from_unix`](Self::from_unix) (whose civil-calendar
+    /// conversion cannot produce an invalid date) are already in range.
     pub fn utc(year: u64, month: u8, day: u8, hour: u8, minute: u8, second: u8) -> Time {
         let mut repr = String::with_capacity(15);
         if (1950..=2049).contains(&year) {
@@ -40,6 +52,39 @@ impl Time {
         push2(&mut repr, second);
         repr.push('Z');
         Time { repr }
+    }
+
+    /// Builds a time from UTC calendar components, rejecting any combination
+    /// that is not a real instant on the proleptic Gregorian calendar.
+    ///
+    /// Returns [`Error::Malformed`] when the year is outside 1..=9999, the
+    /// month is outside 1..=12, the day is outside the month's real length
+    /// (Feb 29 only in leap years), the hour exceeds 23, or the minute or
+    /// second exceeds 59 — i.e. exactly the range [`Time`]'s parser enforces,
+    /// so a value built here always round-trips. Prefer this over
+    /// [`utc`](Self::utc), whose silent modulo reduction can mint a `Time`
+    /// that no parser will ever accept.
+    pub fn utc_checked(
+        year: u64,
+        month: u8,
+        day: u8,
+        hour: u8,
+        minute: u8,
+        second: u8,
+    ) -> Result<Time, Error> {
+        if !(1..=9999).contains(&year) {
+            return Err(Error::Malformed);
+        }
+        if !(1..=12).contains(&month) {
+            return Err(Error::Malformed);
+        }
+        if !(1..=days_in_month(year as u16, month)).contains(&day) {
+            return Err(Error::Malformed);
+        }
+        if hour > 23 || minute > 59 || second > 59 {
+            return Err(Error::Malformed);
+        }
+        Ok(Time::utc(year, month, day, hour, minute, second))
     }
 
     /// Builds a time from a Unix timestamp (seconds since 1970-01-01 UTC).
@@ -462,6 +507,40 @@ mod tests {
         // ...and accepts a 2060 instant, which the century-shifted encoding
         // would have rejected.
         assert!(parsed.accepts(&Time::utc(2060, 6, 1, 0, 0, 0)));
+    }
+
+    /// `utc_checked` rejects exactly what the parser rejects, so anything it
+    /// builds round-trips; `utc` stays infallible (and silently modular).
+    #[test]
+    fn utc_checked_rejects_impossible_dates() {
+        // The unchecked constructor happily mints a Time no parser accepts.
+        assert!(Time::utc(2024, 2, 30, 0, 0, 0).components().is_none());
+        assert!(Time::utc(2024, 1, 1, 25, 0, 0).components().is_none());
+        // ...and reduces components modulo 100 (day 132 -> "32").
+        assert!(Time::utc(2024, 1, 132, 0, 0, 0).components().is_none());
+
+        // The checked one refuses them up front.
+        assert!(Time::utc_checked(2024, 2, 30, 0, 0, 0).is_err());
+        assert!(Time::utc_checked(2025, 2, 29, 0, 0, 0).is_err()); // not a leap year
+        assert!(Time::utc_checked(2024, 13, 1, 0, 0, 0).is_err());
+        assert!(Time::utc_checked(2024, 0, 1, 0, 0, 0).is_err());
+        assert!(Time::utc_checked(2024, 1, 0, 0, 0, 0).is_err());
+        assert!(Time::utc_checked(2024, 1, 1, 24, 0, 0).is_err());
+        assert!(Time::utc_checked(2024, 1, 1, 0, 60, 0).is_err());
+        assert!(Time::utc_checked(2024, 1, 1, 0, 0, 60).is_err());
+        assert!(Time::utc_checked(0, 1, 1, 0, 0, 0).is_err());
+        assert!(Time::utc_checked(10_000, 1, 1, 0, 0, 0).is_err());
+
+        // And what it accepts always round-trips through the parser.
+        for t in [
+            Time::utc_checked(2024, 2, 29, 23, 59, 59).unwrap(),
+            Time::utc_checked(2049, 12, 31, 0, 0, 0).unwrap(),
+            Time::utc_checked(2050, 1, 1, 0, 0, 0).unwrap(),
+            Time::utc_checked(1950, 1, 1, 0, 0, 0).unwrap(),
+            Time::utc_checked(1900, 1, 1, 0, 0, 0).unwrap(),
+        ] {
+            assert!(t.components().is_some(), "no round trip for {t:?}");
+        }
     }
 
     #[test]
