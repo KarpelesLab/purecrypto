@@ -59,6 +59,10 @@ pub fn peek_client_hello(buf: &[u8]) -> Result<Option<ClientHelloInfo>, Error> {
 /// QUIC carries in CRYPTO frames (RFC 9001) — so `crate::quic::peek_initial_sni`
 /// can reuse the exact same ClientHello parsing. `Ok(None)` = the handshake
 /// message isn't fully present yet.
+// Used by `crate::quic::peek_initial_sni` (RFC 9001 carries the ClientHello in
+// CRYPTO frames, with no TLS record framing); unreferenced in builds without
+// the `quic` feature.
+#[allow(dead_code)]
 pub(crate) fn client_hello_info_from_handshake(
     handshake: &[u8],
 ) -> Result<Option<ClientHelloInfo>, Error> {
@@ -107,31 +111,73 @@ pub(crate) fn peek_offers_tls13(buf: &[u8]) -> Result<Option<bool>, Error> {
 /// the message isn't fully buffered yet; `Err` = the first record isn't a
 /// handshake record or the first message isn't a ClientHello. The client's
 /// first flight is never encrypted, so no keys are involved.
+///
+/// # Work bound
+///
+/// A version-dispatching server front end calls this on *every* `feed` until
+/// the ClientHello resolves, so the incomplete case must stay cheap. It runs
+/// in two phases: a header-only pre-scan that walks the record framing without
+/// copying anything, and — only once the buffer actually holds the whole first
+/// handshake message — a single copy of exactly that message. Copying every
+/// buffered fragment on every call instead would be quadratic in the record
+/// count: with the caller's 64 KiB peek ceiling, ~10,900 six-byte records cost
+/// on the order of 360 MB of `memcpy` for 64 KiB of input.
 fn peek_decode_client_hello(buf: &[u8]) -> Result<Option<ClientHello>, Error> {
-    let mut handshake: Vec<u8> = Vec::new();
+    // Phase 1 — pre-scan. Walk record headers only: total the handshake bytes
+    // buffered so far and pick the 4-byte handshake header (which may itself
+    // straddle records) out of the leading fragments.
+    let mut header = [0u8; 4];
+    let mut header_len = 0usize;
+    let mut available = 0usize;
+    let mut needed: Option<usize> = None;
     let mut offset = 0usize;
     loop {
-        if let Some(ch) = decode_first_client_hello(&handshake)? {
-            return Ok(Some(ch));
+        // Not enough bytes for another full record — need more from the wire.
+        let Some(rec) = read_record(&buf[offset..])? else {
+            return Ok(None);
+        };
+        // The client's first flight is handshake records only.
+        if rec.content_type != ContentType::Handshake {
+            return Err(Error::UnexpectedMessage);
         }
-        match read_record(&buf[offset..])? {
-            // Not enough bytes for another full record — need more from the wire.
-            None => return Ok(None),
-            Some(rec) => {
-                // The client's first flight is handshake records only.
-                if rec.content_type != ContentType::Handshake {
-                    return Err(Error::UnexpectedMessage);
-                }
-                handshake.extend_from_slice(rec.fragment);
-                offset += rec.len;
+        for &b in rec.fragment.iter().take(4 - header_len) {
+            header[header_len] = b;
+            header_len += 1;
+        }
+        available += rec.fragment.len();
+        offset += rec.len;
+        if needed.is_none() && header_len == 4 {
+            if header[0] != hs_type::CLIENT_HELLO {
+                return Err(Error::UnexpectedMessage);
             }
+            let body_len =
+                ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | (header[3] as usize);
+            needed = Some(4 + body_len);
+        }
+        if needed.is_some_and(|n| available >= n) {
+            break;
         }
     }
+
+    // Phase 2 — the message is fully buffered; copy exactly its bytes.
+    let needed = needed.expect("the loop only breaks once `needed` is known");
+    let mut handshake: Vec<u8> = Vec::with_capacity(needed);
+    let mut offset = 0usize;
+    while handshake.len() < needed {
+        let rec = read_record(&buf[offset..])?.expect("records already validated in phase 1");
+        let take = core::cmp::min(rec.fragment.len(), needed - handshake.len());
+        handshake.extend_from_slice(&rec.fragment[..take]);
+        offset += rec.len;
+    }
+    Ok(Some(ClientHello::decode(&handshake[4..])?))
 }
 
 /// Decodes a complete ClientHello out of the accumulated handshake bytes.
 /// `Ok(None)` means more bytes are needed; `Err` means the first handshake
 /// message is malformed or isn't a ClientHello.
+// Reached only through `client_hello_info_from_handshake` (the QUIC peek
+// path); the record-framed path decodes in place after its pre-scan.
+#[allow(dead_code)]
 fn decode_first_client_hello(handshake: &[u8]) -> Result<Option<ClientHello>, Error> {
     // Handshake message header: msg_type(1) || length(3) || body.
     if handshake.len() < 4 {
@@ -229,6 +275,35 @@ mod tests {
         let info = peek_client_hello(&records(&msg, 4096)).unwrap().unwrap();
         assert_eq!(info.server_name, None);
         assert!(info.alpn_protocols.is_empty());
+    }
+
+    /// The incomplete-buffer path must not re-copy every buffered fragment on
+    /// each call (finding: quadratic re-parse). Feeding a long prefix of a
+    /// heavily-fragmented ClientHello one record at a time — the pattern the
+    /// version-auto server front end produces — has to stay fast; before the
+    /// pre-scan this loop copied O(n²) bytes.
+    #[test]
+    fn incremental_peek_of_a_fragmented_client_hello_is_not_quadratic() {
+        // ~1,200 six-byte fragments: enough that a quadratic implementation
+        // does hundreds of megabytes of copying and a linear one is instant.
+        let mut msg = sample_client_hello();
+        msg.resize(7000, 0);
+        // Fix up the declared body length so the message stays self-consistent
+        // (the trailing zeros are never decoded — we only ever ask for
+        // "more bytes" here).
+        let body_len = msg.len() - 4;
+        msg[1] = (body_len >> 16) as u8;
+        msg[2] = (body_len >> 8) as u8;
+        msg[3] = body_len as u8;
+        let full = records(&msg, 6);
+        // Every record boundary is a "need more bytes" call. Only strict
+        // prefixes are fed: the padded body is not a decodable ClientHello,
+        // and the point of the test is the incomplete path.
+        let mut offset = 11usize; // 5-byte record header + 6-byte fragment
+        while offset < full.len() {
+            assert_eq!(peek_client_hello(&full[..offset]).unwrap(), None);
+            offset += 11;
+        }
     }
 
     #[test]
