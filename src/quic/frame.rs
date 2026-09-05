@@ -295,6 +295,12 @@ impl<'a> Frame<'a> {
                 if buf.len() - p < length {
                     return Err(Error::Decode);
                 }
+                // RFC 9000 §19.7: "A client MUST treat receipt of a
+                // NEW_TOKEN frame with an empty Token field as a
+                // connection error of type FRAME_ENCODING_ERROR."
+                if length == 0 {
+                    return Err(Error::Decode);
+                }
                 let token = &buf[p..p + length];
                 p += length;
                 Ok((Frame::NewToken { token }, p))
@@ -316,6 +322,14 @@ impl<'a> Frame<'a> {
                 let data = if has_len {
                     let (length, n) = varint::decode(&buf[p..])?;
                     p += n;
+                    // RFC 9000 §19.8 — "The largest offset delivered on a
+                    // stream ... cannot exceed 2^62-1"; a frame that would
+                    // is a connection error of type FRAME_ENCODING_ERROR.
+                    // Mirrors the identical CRYPTO-frame check above.
+                    match offset.checked_add(length) {
+                        Some(end) if end <= varint::MAX => {}
+                        _ => return Err(Error::Decode),
+                    }
                     let length = length as usize;
                     if buf.len() - p < length {
                         return Err(Error::Decode);
@@ -325,6 +339,12 @@ impl<'a> Frame<'a> {
                     d
                 } else {
                     let d = &buf[p..];
+                    // Implicit-length form: the extent is the rest of the
+                    // packet payload, but the same §19.8 bound applies.
+                    match offset.checked_add(d.len() as u64) {
+                        Some(end) if end <= varint::MAX => {}
+                        _ => return Err(Error::Decode),
+                    }
                     p = buf.len();
                     d
                 };
