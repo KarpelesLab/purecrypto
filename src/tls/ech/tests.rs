@@ -1356,9 +1356,43 @@ fn decap_rejects_inner_ch_without_marker() {
     })
     .expect("seal");
 
+    // The HPKE `open` succeeded (the client used our real config), so a
+    // missing inner marker is a POST-authentication malformation: it must
+    // surface as the hard-error variant, never as `EchDecodeError`, which the
+    // server treats as "no ECH extension present" and silently falls back to
+    // the outer ClientHello.
     assert!(matches!(
         try_decap_inner(&sealed.outer_ch, &ring),
-        Err(Error::EchDecodeError)
+        Err(Error::EchInnerMalformed)
+    ));
+}
+
+/// An inner-form `encrypted_client_hello` in the OUTER ClientHello is a
+/// protocol violation by a peer that knows the ECH format, not an absent
+/// extension: it must be the hard-error variant so the server aborts instead
+/// of quietly proceeding as if no ECH had been offered.
+#[test]
+fn outer_ch_carrying_the_inner_marker_is_a_hard_error() {
+    let mut rng = drbg(b"outer-inner-marker");
+    let suites = alloc::vec![HpkeSymCipherSuite {
+        kdf_id: HpkeKdf::HkdfSha256.id(),
+        aead_id: HpkeAead::Aes128Gcm.id(),
+    }];
+    let pair = EchKeyPair::generate(
+        &mut rng,
+        HpkeKem::DhkemX25519HkdfSha256,
+        0x42,
+        b"public.example",
+        64,
+        suites,
+    )
+    .expect("generate");
+    let ring = EchKeyRing::from_pairs(alloc::vec![pair]);
+    // `[0x01]` is the inner-form ECH extension body.
+    let outer = build_outer_ch_with_ech(&alloc::vec![0x01u8]);
+    assert!(matches!(
+        try_decap_inner(&outer, &ring),
+        Err(Error::EchInnerMalformed)
     ));
 }
 

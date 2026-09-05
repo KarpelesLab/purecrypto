@@ -13,6 +13,7 @@
 use super::config::HpkeSymCipherSuite;
 use super::extension::EchExtension;
 use crate::rng::RngCore;
+use crate::tls::Error;
 use alloc::vec::Vec;
 
 /// Default GREASE `payload` length (bytes).
@@ -83,17 +84,55 @@ impl Default for GreaseParams {
     }
 }
 
+/// Smallest `payload_len` that can correspond to a real sealed inner CH:
+/// one byte of plaintext plus the 16-byte AEAD tag. A shorter GREASE payload
+/// is the exact length distinguisher [`DEFAULT_GREASE_PAYLOAD_LEN`] exists to
+/// eliminate — a passive censor can tell it apart from genuine ECH by size
+/// alone.
+pub const MIN_GREASE_PAYLOAD_LEN: usize = 17;
+
 impl GreaseParams {
+    /// Checks the lengths are representable on the wire and large enough to
+    /// pass for real ECH: `enc_len` and `payload_len` must fit a `u16`
+    /// (`opaque <0..2^16-1>`) and `payload_len` must be at least
+    /// [`MIN_GREASE_PAYLOAD_LEN`].
+    ///
+    /// The builders clamp to this range rather than emitting an extension
+    /// whose length prefix disagrees with its body, so a `GreaseParams` that
+    /// fails this check produces valid-but-not-what-you-asked-for bytes; call
+    /// it if you want a misconfiguration to be loud.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.enc_len > u16::MAX as usize
+            || self.payload_len > u16::MAX as usize
+            || self.payload_len < MIN_GREASE_PAYLOAD_LEN
+        {
+            return Err(Error::IllegalParameter);
+        }
+        Ok(())
+    }
+
+    /// The lengths actually emitted: clamped into the representable,
+    /// non-distinguishing range described by [`Self::validate`].
+    fn clamped_lens(&self) -> (usize, usize) {
+        (
+            self.enc_len.min(u16::MAX as usize),
+            self.payload_len
+                .clamp(MIN_GREASE_PAYLOAD_LEN, u16::MAX as usize),
+        )
+    }
+
     /// Build the outer-form `encrypted_client_hello` extension body.
     ///
     /// Calls into `rng` once to fill `enc` + `payload` (+ `config_id`
-    /// when strategy is `Random`).
+    /// when strategy is `Random`). Lengths outside the range
+    /// [`Self::validate`] accepts are clamped.
     pub(crate) fn build_extension<R: RngCore>(&self, rng: &mut R) -> EchExtension {
-        let mut enc = alloc::vec![0u8; self.enc_len];
+        let (enc_len, payload_len) = self.clamped_lens();
+        let mut enc = alloc::vec![0u8; enc_len];
         if !enc.is_empty() {
             rng.fill_bytes(&mut enc);
         }
-        let mut payload = alloc::vec![0u8; self.payload_len];
+        let mut payload = alloc::vec![0u8; payload_len];
         if !payload.is_empty() {
             rng.fill_bytes(&mut payload);
         }
@@ -138,8 +177,9 @@ impl GreaseParams {
     ) -> Vec<u8> {
         use crate::hash::Sha256;
         use crate::kdf::hkdf;
+        let (enc_len, payload_len) = self.clamped_lens();
         // Output: 1 byte (config_id selector) + enc_len + payload_len.
-        let mut out = alloc::vec![0u8; 1 + self.enc_len + self.payload_len];
+        let mut out = alloc::vec![0u8; 1 + enc_len + payload_len];
         // IKM = private seed; salt = CH random; info = label.
         hkdf::<Sha256>(ch_random, seed, b"ech grease", &mut out);
 
@@ -147,7 +187,7 @@ impl GreaseParams {
             GreaseConfigIdStrategy::Fixed(v) => v,
             GreaseConfigIdStrategy::Random => out[0],
         };
-        let (enc, payload) = out[1..].split_at(self.enc_len);
+        let (enc, payload) = out[1..].split_at(enc_len);
         let ext = super::extension::EchExtension::Outer {
             cipher_suite: self.cipher_suite,
             config_id,

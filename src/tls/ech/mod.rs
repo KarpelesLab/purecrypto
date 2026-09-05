@@ -27,11 +27,10 @@
 //!
 //! This module ships the ECH codec foundations (ECHConfig + extension
 //! codecs, HPKE wrappers, accept signal, key types, GREASE producer), the
-//! real-ECH inner/outer split, the server-side HPKE decap + inner-CH
-//! dispatch, and the retry_configs flow. The one piece still staged for a
-//! follow-up wave is the `ech_outer_extensions` compress/decompress
-//! primitive (see [`inner`]); it is unit-tested but not yet wired into the
-//! handshake, and carries its own scoped `#[allow(dead_code)]`.
+//! real-ECH inner/outer split, the `ech_outer_extensions`
+//! compress/decompress primitive (see [`inner`], wired into the client's
+//! inner-CH construction and the server's decap), the server-side HPKE
+//! decap + inner-CH dispatch, and the retry_configs flow.
 
 pub mod accept_signal;
 pub mod config;

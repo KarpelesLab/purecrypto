@@ -32,7 +32,7 @@
 //! back out.
 
 use super::config::{EchConfig, HpkeSymCipherSuite};
-use super::extension::{EchExtension, decode_outer_position};
+use super::extension::{EchExtension, TYPE_INNER, decode_outer_position};
 use super::hpke_setup::{map_sym_suite, setup_receiver, setup_sender};
 use crate::hpke::{ReceiverContext, SenderContext};
 use crate::rng::RngCore;
@@ -211,6 +211,15 @@ pub(crate) fn locate_payload_in_handshake(handshake_msg: &[u8]) -> Result<(usize
             // payload. We delegate to the codec helper to find
             // (payload_offset_in_body, payload_len).
             let ext_body = &body[body_start..body_end];
+            // An `encrypted_client_hello` extension IS present here. If it
+            // carries the INNER form (`[0x01]`), the peer knows the ECH
+            // format and put an inner-only marker in the outer ClientHello —
+            // a protocol violation (draft-ietf-tls-esni-22 §7.1), distinct
+            // from "no ECH extension", which is the only case allowed to fall
+            // back to a plain non-ECH handshake.
+            if ext_body.first() == Some(&TYPE_INNER) {
+                return Err(Error::EchInnerMalformed);
+            }
             let (pay_off_in_body, pay_len) = decode_outer_position(ext_body)?;
             // Convert to absolute offset into the handshake msg.
             let abs = 4 + body_start + pay_off_in_body;
@@ -330,15 +339,33 @@ pub(crate) fn try_decap_inner(
     }
     let ciphertext = handshake_msg[payload_off..payload_off + payload_len].to_vec();
 
+    // `locate_payload_in_handshake` succeeded, so an outer-form
+    // `encrypted_client_hello` extension IS present: the client is speaking
+    // ECH, and nothing below may be reported in a way that lets the caller
+    // fall back to the "no ECH extension" path. Failures split in two:
+    //
+    //  * before the AEAD `open` authenticates the client's config →
+    //    `EchDecryptionFailed`, i.e. an ECH *rejection*, so the server
+    //    continues on the outer CH and ships `retry_configs`. A client with a
+    //    stale ECHConfig can then refresh instead of being stuck failing to
+    //    this origin forever.
+    //  * after the `open` → `EchInnerMalformed`, a hard protocol error: the
+    //    peer holds the correct config and sent us garbage inside it.
+    //
     // Locate and parse the extension body so we recover (sym, config_id, enc).
-    let (sym, config_id, enc) = extract_outer_meta(handshake_msg)?;
+    let (sym, config_id, enc) = extract_outer_meta(handshake_msg).map_err(|e| match e {
+        // An inner-form marker in the OUTER CH is a protocol violation by a
+        // peer that knows the config format, not a rejectable mismatch.
+        Error::EchInnerMalformed => e,
+        _ => Error::EchDecryptionFailed,
+    })?;
 
     // Per draft-ietf-tls-esni-22 §7.1, the client's chosen HPKE
     // symmetric suite MUST be one the server published in this
     // ECHConfig's `cipher_suites`. If it isn't, treat the ECH as a
     // rejection (fall back to the outer ClientHello / retry_configs)
     // rather than attempting decap with an unannounced suite.
-    let (kdf, aead) = map_sym_suite(sym)?;
+    let (kdf, aead) = map_sym_suite(sym).map_err(|_| Error::EchDecryptionFailed)?;
     // The 8-bit `config_id` is only a hint: during key rotation two
     // distinct keys can share it. Per §7.1 the server SHOULD try every
     // config whose `config_id` matches before rejecting, so iterate the
@@ -375,13 +402,14 @@ pub(crate) fn try_decap_inner(
         // Padding consists of an arbitrary number of trailing zero
         // bytes; since a ClientHello body is length-prefixed, anything
         // past the declared length is padding.
-        let unpadded = strip_trailing_padding(&plaintext)?;
+        let unpadded = strip_trailing_padding(&plaintext).map_err(|_| Error::EchInnerMalformed)?;
         // Per draft §7.1, the recovered inner CH MUST carry an
         // `encrypted_client_hello` extension with the inner-form body
         // (`[0x01]`). Reject as malformed otherwise (maps to
         // illegal_parameter at the alert layer).
-        require_inner_marker(&unpadded)?;
-        let inner_ch_bytes = decompress_inner_against_outer(&unpadded, handshake_msg)?;
+        require_inner_marker(&unpadded).map_err(|_| Error::EchInnerMalformed)?;
+        let inner_ch_bytes = decompress_inner_against_outer(&unpadded, handshake_msg)
+            .map_err(|_| Error::EchInnerMalformed)?;
         return Ok(DecappedInner {
             inner_ch_bytes,
             receiver,
@@ -459,10 +487,12 @@ pub(crate) fn try_decap_inner_retry(
         .receiver
         .open(&aad, &ciphertext)
         .map_err(|_| Error::EchDecryptionFailed)?;
-    let unpadded = strip_trailing_padding(&plaintext)?;
+    // Post-`open`: the retained receiver authenticated this CH2, so every
+    // malformation below is a hard protocol error, not a rejection.
+    let unpadded = strip_trailing_padding(&plaintext).map_err(|_| Error::EchInnerMalformed)?;
     // Same inner-marker requirement as on the CH1 path (draft §7.1).
-    require_inner_marker(&unpadded)?;
-    decompress_inner_against_outer(&unpadded, handshake_msg)
+    require_inner_marker(&unpadded).map_err(|_| Error::EchInnerMalformed)?;
+    decompress_inner_against_outer(&unpadded, handshake_msg).map_err(|_| Error::EchInnerMalformed)
 }
 
 /// Walks the outer CH to find the `encrypted_client_hello` extension
@@ -520,7 +550,11 @@ fn extract_outer_meta(handshake_msg: &[u8]) -> Result<(HpkeSymCipherSuite, u8, V
                     enc,
                     ..
                 } => return Ok((cipher_suite, config_id, enc)),
-                EchExtension::Inner => return Err(Error::EchDecodeError),
+                // An inner-form marker in the OUTER ClientHello: the peer
+                // knows the ECH format and sent a structurally illegal
+                // message. Draft §7.1 makes this `illegal_parameter`, not a
+                // reason to fall back to a non-ECH handshake.
+                EchExtension::Inner => return Err(Error::EchInnerMalformed),
             }
         }
         p = body_end;

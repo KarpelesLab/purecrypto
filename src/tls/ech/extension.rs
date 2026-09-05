@@ -66,11 +66,19 @@ impl EchExtension {
                 out.push(TYPE_OUTER);
                 cipher_suite.encode_into(&mut out);
                 out.push(*config_id);
-                let enc_len: u16 = u16::try_from(enc.len()).unwrap_or(u16::MAX);
-                out.extend_from_slice(&enc_len.to_be_bytes());
+                // Both fields are `opaque <0..2^16-1>` on the wire. A value
+                // longer than that cannot be represented; emit the truncated
+                // bytes so the length prefix and the body that follows always
+                // agree. Clamping the prefix alone (the previous
+                // `unwrap_or(u16::MAX)`) desynchronised the two and produced
+                // an extension the peer decodes as a different structure
+                // entirely. Real ECH never comes close to 64 KiB; only a
+                // caller-constructed `EchExtension` can reach here.
+                let enc = &enc[..enc.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(enc.len() as u16).to_be_bytes());
                 out.extend_from_slice(enc);
-                let pl_len: u16 = u16::try_from(payload.len()).unwrap_or(u16::MAX);
-                out.extend_from_slice(&pl_len.to_be_bytes());
+                let payload = &payload[..payload.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
                 out.extend_from_slice(payload);
             }
             EchExtension::Inner => {
