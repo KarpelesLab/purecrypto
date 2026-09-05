@@ -113,7 +113,7 @@ impl<C: BlockCipher> Gcm<C> {
     }
 
     /// Computes the pre-counter block `J0` for a nonce of any length.
-    fn j0(&self, nonce: &[u8]) -> u128 {
+    pub(super) fn j0(&self, nonce: &[u8]) -> u128 {
         if nonce.len() == 12 {
             // Recommended case: J0 = IV ‖ 0³¹ ‖ 1.
             let mut block = [0u8; 16];
@@ -160,6 +160,45 @@ impl<C: BlockCipher> Gcm<C> {
         // Length block: [len(aad)]₆₄ ‖ [len(ct)]₆₄, in bits.
         let len_block = ((aad.len() as u128 * 8) << 64) | (ct.len() as u128 * 8);
         self.mul_h(x ^ len_block)
+    }
+
+    /// Folds `data` into the GHASH accumulator `x`, zero-padding a trailing
+    /// partial block, and returns the new accumulator.
+    ///
+    /// This is the streaming half of [`Self::ghash`]; [`super::Gmac`] drives it
+    /// a block at a time so it never has to buffer the message. Note that a
+    /// partial `data` terminates the block stream — GHASH is only associative
+    /// across whole 16-byte blocks — so callers that keep feeding must pass
+    /// whole blocks until the last call.
+    #[allow(unsafe_code)]
+    pub(super) fn ghash_fold(&self, mut x: u128, data: &[u8]) -> u128 {
+        #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let tail = if self.ghash_hw {
+            let full = data.len() & !15;
+            // SAFETY: `ghash_hw` is only set when `clmul::supported()` confirmed
+            // the carryless-multiply features `ghash_blocks` requires.
+            x = unsafe { super::clmul::ghash_blocks(x, &self.hpow, &data[..full]) };
+            &data[full..]
+        } else {
+            data
+        };
+        #[cfg(not(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64"))))]
+        let tail = data;
+        for chunk in tail.chunks(16) {
+            x = self.mul_h(x ^ load_block(chunk));
+        }
+        x
+    }
+
+    /// Absorbs the GHASH length block and returns the tag
+    /// `E_K(J0) ⊕ GHASH_H(...)`, given an accumulator `x` that already covers
+    /// `aad_len` bytes of AAD and `ct_len` bytes of ciphertext.
+    pub(super) fn tag_from_ghash(&self, j0: u128, x: u128, aad_len: u64, ct_len: u64) -> [u8; 16] {
+        let len_block = ((aad_len as u128 * 8) << 64) | (ct_len as u128 * 8);
+        let s = self.mul_h(x ^ len_block);
+        let mut ej0 = j0.to_be_bytes();
+        self.cipher.encrypt_block(&mut ej0);
+        (u128::from_be_bytes(ej0) ^ s).to_be_bytes()
     }
 
     /// XORs the GCTR keystream (counter increments only its low 32 bits) into
