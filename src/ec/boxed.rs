@@ -116,6 +116,9 @@ fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> Boxe
         rng.fill_bytes(&mut buf);
         buf[0] &= high_mask;
         let candidate = BoxedUint::from_be_bytes(&buf);
+        // The raw bytes are the secret scalar; don't leave them on the heap.
+        buf.fill(0);
+        let _ = core::hint::black_box(buf.as_slice());
         // Accept iff 1 ≤ candidate < n; non-short-circuiting `&` so the
         // candidate's low limbs don't shape the timing of a rejection.
         if bool::from(!candidate.ct_is_zero()) & candidate.lt(n) {
@@ -133,8 +136,8 @@ fn generate_k<D: Digest>(
     order_len: usize,
     qlen: usize,
 ) -> BoxedUint {
-    let d_oct = d.to_be_bytes(order_len);
-    let h_oct = bits2int(hash, qlen).reduce(n).to_be_bytes(order_len);
+    let mut d_oct = d.to_be_bytes(order_len);
+    let mut h_oct = bits2int(hash, qlen).reduce(n).to_be_bytes(order_len);
 
     let mut v = D::zeroed_output();
     for b in v.as_mut() {
@@ -152,22 +155,38 @@ fn generate_k<D: Digest>(
         v = Hmac::<D>::mac(k.as_ref(), v.as_ref());
     }
 
-    loop {
+    let candidate = loop {
         let mut t = Vec::with_capacity(order_len);
         while t.len() < order_len {
             v = Hmac::<D>::mac(k.as_ref(), v.as_ref());
             t.extend_from_slice(v.as_ref());
         }
         let candidate = bits2int(&t[..order_len], qlen);
+        t.fill(0);
+        let _ = core::hint::black_box(t.as_slice());
         if in_range(&candidate, n) {
-            return candidate;
+            break candidate;
         }
         let mut mac = Hmac::<D>::new(k.as_ref());
         mac.update(v.as_ref());
         mac.update(&[0x00]);
         k = mac.finalize();
         v = Hmac::<D>::mac(k.as_ref(), v.as_ref());
+    };
+
+    // `d_oct` is a verbatim copy of the long-term private scalar, and the
+    // HMAC-DRBG state (`k`, `v`) reproduces the nonce. Wipe all of it before
+    // the buffers are returned to the allocator.
+    d_oct.fill(0);
+    h_oct.fill(0);
+    for b in k.as_mut() {
+        *b = 0;
     }
+    for b in v.as_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((d_oct.as_slice(), h_oct.as_slice(), k.as_ref(), v.as_ref()));
+    candidate
 }
 
 impl BoxedEcdsaPublicKey {
@@ -376,13 +395,16 @@ impl BoxedEcdsaPrivateKey {
         let order_len = self.curve.order_len();
 
         let z = bits2int(prehash, n.bit_len()).reduce(&n);
-        let k = generate_k::<D>(&self.d, prehash, &n, order_len, n.bit_len());
+        let mut k = generate_k::<D>(&self.d, prehash, &n, order_len, n.bit_len());
 
-        let (full_x, full_y) = c
-            .to_affine(&c.mul_generator(&k))
-            .ok_or(Error::InvalidInput)?;
+        let affine = c.to_affine(&c.mul_generator(&k));
+        let Some((full_x, full_y)) = affine else {
+            k.zeroize();
+            return Err(Error::InvalidInput);
+        };
         let r = full_x.reduce(&n);
         if r.is_zero() {
+            k.zeroize();
             return Err(Error::InvalidInput);
         }
         // x_overflow: the affine x was ≥ n, so r = x − n and recovery must add
@@ -390,9 +412,15 @@ impl BoxedEcdsaPrivateKey {
         let x_overflow = !full_x.lt(&n);
         let y_is_odd = full_y.is_odd();
 
-        let k_inv = inv_mod(&fq, &k, &n);
-        let z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
+        let mut k_inv = inv_mod(&fq, &k, &n);
+        let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
         let s = fq.mul_mod(&k_inv, &z_rd);
+        // Wipe the per-signature secrets: `k` alone recovers the long-term
+        // key as `d = (s·k − z)·r⁻¹ mod n`. `BoxedUint::zeroize` carries its
+        // own `black_box` barrier.
+        k.zeroize();
+        k_inv.zeroize();
+        z_rd.zeroize();
         if s.is_zero() {
             return Err(Error::InvalidInput);
         }

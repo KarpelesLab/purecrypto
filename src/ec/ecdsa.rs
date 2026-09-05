@@ -109,34 +109,51 @@ impl EcdsaPrivateKey {
         let fq = MontModulus::new(n);
 
         let z = bits2int(prehash).reduce(&n);
-        let k = generate_k::<D>(&self.d, prehash, &n);
+        let mut k = generate_k::<D>(&self.d, prehash, &n);
 
-        // r = (k*G).x mod n
-        let r = curve
-            .to_affine(&curve.mul_generator(&k))
-            .ok_or(Error::InvalidInput)?
-            .0
-            .reduce(&n);
-        if bool::from(r.is_zero()) {
-            return Err(Error::InvalidInput);
-        }
+        // Single exit so the nonce and its derivatives are wiped on every
+        // path, including the two `r == 0` / `s == 0` rejections.
+        let out = match curve.to_affine(&curve.mul_generator(&k)) {
+            None => Err(Error::InvalidInput),
+            Some((x, _)) => {
+                // r = (k*G).x mod n
+                let r = x.reduce(&n);
+                if bool::from(r.is_zero()) {
+                    Err(Error::InvalidInput)
+                } else {
+                    // s = k^-1 (z + r*d) mod n.
+                    //
+                    // The nonce `k` is secret, so the inversion MUST be
+                    // constant time. We use Fermat's little theorem
+                    // (`k^{n-2} mod n`, where `n` is the prime order of the
+                    // base point) via the constant-time Montgomery ladder,
+                    // NOT the variable-time extended-Euclidean `inv_mod` —
+                    // leaking `k` through timing would let an attacker recover
+                    // the long-term key `d = (s·k − z)·r^{-1} mod n`
+                    // (Brumley–Tuveri, "Remote Timing Attacks Are Still
+                    // Practical").
+                    let mut k_inv = fq.inv_prime(&k);
+                    let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
+                    let s = fq.mul_mod(&k_inv, &z_rd);
+                    k_inv = Fe::ZERO;
+                    z_rd = Fe::ZERO;
+                    let _ = core::hint::black_box((&k_inv, &z_rd));
+                    if bool::from(s.is_zero()) {
+                        Err(Error::InvalidInput)
+                    } else {
+                        Ok(Signature { r, s })
+                    }
+                }
+            }
+        };
 
-        // s = k^-1 (z + r*d) mod n.
-        //
-        // The nonce `k` is secret, so the inversion MUST be constant time. We
-        // use Fermat's little theorem (`k^{n-2} mod n`, where `n` is the prime
-        // order of the base point) via the constant-time Montgomery ladder,
-        // NOT the variable-time extended-Euclidean `inv_mod` — leaking `k`
-        // through timing would let an attacker recover the long-term key
-        // `d = (s·k − z)·r^{-1} mod n` (Brumley–Tuveri, "Remote Timing Attacks
-        // Are Still Practical").
-        let k_inv = fq.inv_prime(&k);
-        let z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
-        let s = fq.mul_mod(&k_inv, &z_rd);
-        if bool::from(s.is_zero()) {
-            return Err(Error::InvalidInput);
-        }
-        Ok(Signature { r, s })
+        // Wipe the nonce. `k` alone yields the long-term key
+        // (`d = (s·k − z)·r⁻¹ mod n`); `k_inv` and `z_rd` are wiped above,
+        // where they go out of scope. The `black_box` barrier stops LLVM
+        // eliding the stores, matching this module's `Drop` impls.
+        k = Fe::ZERO;
+        let _ = core::hint::black_box(&k);
+        out
     }
 }
 
@@ -379,7 +396,7 @@ fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
         v = Hmac::<D>::mac(k.as_ref(), v.as_ref());
     }
 
-    loop {
+    let candidate = loop {
         // T = leftmost 256 bits of successive HMAC blocks.
         let mut t = [0u8; 32];
         let mut filled = 0;
@@ -391,15 +408,31 @@ fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
             filled += take;
         }
         let candidate = bits2int(&t);
+        t.fill(0);
+        let _ = core::hint::black_box(&t);
         if in_range(&candidate, n) {
-            return candidate;
+            break candidate;
         }
         let mut mac = Hmac::<D>::new(k.as_ref());
         mac.update(v.as_ref());
         mac.update(&[0x00]);
         k = mac.finalize();
         v = Hmac::<D>::mac(k.as_ref(), v.as_ref());
+    };
+
+    // `d_oct` is a verbatim copy of the long-term private scalar and the
+    // HMAC-DRBG state (`k`, `v`) reproduces the nonce; wipe all of it before
+    // the frame is released.
+    d_oct.fill(0);
+    h_oct.fill(0);
+    for b in k.as_mut() {
+        *b = 0;
     }
+    for b in v.as_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box((&d_oct, &h_oct, k.as_ref(), v.as_ref()));
+    candidate
 }
 
 #[cfg(test)]
