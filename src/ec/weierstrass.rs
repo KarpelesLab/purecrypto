@@ -219,12 +219,18 @@ impl Curve {
     /// so, as with the previous double-and-add-always ladder, the schedule
     /// depends only on the public order width.
     pub(crate) fn scalar_mul(&self, scalar: &BoxedUint, point: &Point) -> Point {
-        // The ladder iterates only over the order's limb width; callers must
-        // pre-reduce mod n so no higher scalar limbs are silently dropped.
-        debug_assert!(
-            scalar.bit_len() <= self.n.bit_len(),
-            "scalar_mul: scalar wider than curve order — higher limbs would be silently truncated"
-        );
+        // The ladder below iterates only over the order's limb width, so a
+        // scalar wider than `n` would have its high limbs silently dropped:
+        // the previous `debug_assert` caught that in debug builds only, and
+        // release quietly computed `[k mod 2^(64·order_limbs)]P`. Reduce
+        // unconditionally instead, making the precondition load-bearing. The
+        // reduction is constant-time long division whose iteration count
+        // depends only on the *allocated* limb width (never on the secret
+        // value), and it also normalises the result to exactly the order's
+        // limb width. All in-tree callers already pre-reduce, so this is a
+        // value-preserving pass costing a few hundred limb operations next to
+        // ~4·bits point operations below.
+        let scalar = scalar.reduce(&self.n);
         // table[j] = [j]P; table[0] is the identity.
         let mut table = alloc::vec::Vec::with_capacity(16);
         table.push(self.identity());
