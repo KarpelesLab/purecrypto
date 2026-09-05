@@ -544,6 +544,7 @@ mod tests {
     fn simd_matches_scalar() {
         use alloc::vec::Vec;
         if !super::simd::supported() {
+            std::eprintln!("poly1305: SKIPPED avx2 differential (no AVX2 on this CPU)");
             return;
         }
 

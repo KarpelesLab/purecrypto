@@ -165,6 +165,7 @@ mod tests {
     #[test]
     fn compress4_matches_scalar() {
         if !supported() {
+            std::eprintln!("sha512_mb compress4: SKIPPED (no AVX2 on this CPU)");
             return;
         }
         let mut s = 0x9e37_79b9_7f4a_7c15u64;

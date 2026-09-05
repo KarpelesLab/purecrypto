@@ -410,6 +410,7 @@ mod tests {
     #[allow(unsafe_code)]
     fn ghash_hardware_matches_software() {
         if !crate::cipher::clmul::supported() {
+            std::eprintln!("ghash: SKIPPED hardware/software differential (no carryless multiply)");
             return;
         }
         let mut s = 0x1234_5678_9abc_def0u64;
@@ -463,6 +464,7 @@ mod tests {
     fn aggregated_ghash_matches_serial_reference() {
         use std::vec::Vec;
         if !crate::cipher::clmul::supported() {
+            std::eprintln!("ghash: SKIPPED aggregated/serial differential (no carryless multiply)");
             return;
         }
         let key = from_hex::<16>("feffe9928665731c6d6a8f9467308308");

@@ -180,6 +180,65 @@ jobs:
              -lpthread -ldl -lm -o ffi_quic_smoke
           ./ffi_quic_smoke
 
+  avx512_sde:
+    name: AVX-512 kernels under Intel SDE
+    runs-on: ubuntu-latest
+    # The AVX-512 kernels — SHA-256 `compress16`, Keccak-p x8, BLAKE3
+    # `hash_chunks16`, the ChaCha20 16-block kernel and `transpose16_epi32` —
+    # are each pinned by a differential test against the scalar reference, but
+    # every one of those tests returns early when the CPU lacks the feature.
+    # No GitHub-hosted runner has AVX-512, so on the `test` job above they all
+    # pass vacuously: a green CI is not evidence those kernels are correct.
+    #
+    # Intel SDE emulates the ISA *and* CPUID, so `is_x86_feature_detected!`
+    # reports AVX-512 and the differential tests actually run. Read the log:
+    # this job is only meaningful if the RUNNING (not SKIPPED) lines appear.
+    #
+    # `continue-on-error` because SDE is fetched from a versioned Intel
+    # download URL that moves when Intel publishes a new build; a dead link
+    # must not gate merges. Treat a red X here as "look at the log", not
+    # "ignore me".
+    continue-on-error: true
+    env:
+      # Bump when Intel retires this build.
+      SDE_URL: https://downloadmirror.intel.com/850782/sde-external-9.44.0-2024-08-22-lin.tar.xz
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: sde
+
+      - name: Install Intel SDE
+        run: |
+          set -euxo pipefail
+          curl -fsSL -o sde.tar.xz "$SDE_URL"
+          mkdir -p "$HOME/sde"
+          tar -xf sde.tar.xz -C "$HOME/sde" --strip-components=1
+          echo "$HOME/sde" >> "$GITHUB_PATH"
+          # SDE injects itself with ptrace; Yama blocks that by default.
+          sudo sysctl -w kernel.yama.ptrace_scope=0 || true
+
+      # Build natively — only the *execution* needs emulating, and compiling
+      # rustc's output under SDE would take the better part of an hour.
+      - name: Build the unit-test binary natively
+        run: cargo test --all-features --lib --no-run
+
+      - name: Run the hash and cipher tests on an emulated AVX-512 CPU
+        run: |
+          set -euo pipefail
+          bin=$(cargo test --all-features --lib --no-run --message-format=json \
+                | jq -r 'select(.reason == "compiler-artifact" and .profile.test) | .executable' \
+                | grep -v null | head -n1)
+          echo "test binary: $bin"
+          # -spr = Sapphire Rapids: AVX-512F/BW/DQ/VL + VBMI/IFMA/VAES/GFNI.
+          sde64 -spr -- "$bin" --nocapture hash::
+          sde64 -spr -- "$bin" --nocapture cipher::
+
   docs:
     name: Docs build (warnings denied)
     runs-on: ubuntu-latest

@@ -342,6 +342,7 @@ mod tests {
     #[test]
     fn compress16_matches_scalar() {
         if !supported16() {
+            std::eprintln!("sha256_mb compress16: SKIPPED (no AVX-512F on this CPU)");
             return;
         }
         let mut s = 0x2545_f491_4f6c_dd1du64;
