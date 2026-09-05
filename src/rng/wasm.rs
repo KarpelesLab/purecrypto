@@ -13,6 +13,12 @@
 //!   other platforms' [`OsRng`]): the host glue MUST fill the whole buffer or
 //!   trap. If the import is absent the module fails to instantiate.
 //!
+//!   Because that import cannot signal failure, the buffer is pre-poisoned with
+//!   a sentinel pattern and checked afterwards, so glue that silently no-ops
+//!   panics instead of yielding keys derived from stale linear memory. Do not
+//!   rely on this as a randomness check — it only rejects "the host wrote
+//!   nothing".
+//!
 //! * **WASI preview 1** — `wasm32-wasip1` with the `wasi-getrandom` feature.
 //!   Calls `random_get` from the `wasi_snapshot_preview1` module; no host glue
 //!   is needed because the WASI runtime provides it.
@@ -57,11 +63,50 @@ mod backend {
         pub(super) fn random_get(ptr: *mut u8, len: usize);
     }
 
+    /// Byte written at index `i` before calling the host, so that "the host
+    /// wrote nothing" is distinguishable from a legitimate result. Position-
+    /// dependent so a host that memsets a constant is caught too.
+    #[inline]
+    fn sentinel(i: usize) -> u8 {
+        0xA5 ^ (i as u8)
+    }
+
     pub(super) fn fill(dest: &mut [u8]) {
+        // The host import has no return value, so a glue implementation that
+        // silently does nothing — a `try`/`catch` swallowing the `SecurityError`
+        // `crypto.getRandomValues` raises on a non-secure origin, an early
+        // return at the 65536-byte chunk boundary, a Node shim that forgets to
+        // write back — would hand us whatever was already in linear memory
+        // (zeros, for a fresh allocation) and `OsRng` would report success.
+        // Every sibling backend fails closed (Unix panics, WASI asserts on
+        // errno, Windows asserts, Apple's `arc4random_buf` aborts internally),
+        // so this one must too.
+        //
+        // Pre-poison the buffer with a known pattern and verify it changed.
+        // This is NOT a randomness test — it cannot detect a weak or repeated
+        // stream — but it catches the entire "host wrote nothing" class for the
+        // cost of one extra pass over the buffer.
+        for (i, b) in dest.iter_mut().enumerate() {
+            *b = sentinel(i);
+        }
         // SAFETY: `dest` is a valid, uniquely-borrowed slice of `dest.len()`
         // bytes living in linear memory; the host contract is to write exactly
         // that many bytes into it and nothing beyond.
         unsafe { random_get(dest.as_mut_ptr(), dest.len()) };
+
+        assert!(
+            dest.iter().enumerate().any(|(i, &b)| b != sentinel(i)),
+            "purecrypto.random_get host import wrote nothing: the entropy \
+             buffer still holds the pre-call sentinel pattern"
+        );
+        // A host that zeroes the buffer instead of filling it is the other
+        // common failure. Only check where a genuine all-zero draw is
+        // impossible in practice (2^-128 at 16 bytes); shorter draws would
+        // false-positive.
+        assert!(
+            dest.len() < 16 || dest.iter().any(|&b| b != 0),
+            "purecrypto.random_get host import returned all-zero bytes"
+        );
     }
 }
 
