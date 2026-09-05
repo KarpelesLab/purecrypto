@@ -16,6 +16,25 @@
 //!
 //! As with all nonce-based AEADs, a given (key, nonce) pair must **never** be
 //! reused.
+//!
+//! # Pick one tag length per key
+//!
+//! The 128-bit and 256-bit tags are two different linear functions of the same
+//! final state, so publishing both for messages under one key leaks relations
+//! between state words. `draft-irtf-cfrg-aegis-aead` therefore requires the tag
+//! length to be fixed per key. Nothing in this API enforces that — both pairs
+//! are inherent methods on the same keyed object — so it is the caller's job:
+//! choose [`encrypt`](Aegis128L::encrypt)/[`decrypt`](Aegis128L::decrypt) *or*
+//! [`encrypt_tag256`](Aegis128L::encrypt_tag256)/[`decrypt_tag256`](Aegis128L::decrypt_tag256)
+//! for a given key and never mix them.
+//!
+//! # Decryption without `alloc`
+//!
+//! Decryption trial-decrypts into a scratch buffer so a bad tag cannot
+//! overwrite the caller's ciphertext. With `alloc` that buffer is a `Vec` and
+//! there is no size limit; without it, it is a fixed 4 KiB array and a longer
+//! ciphertext is rejected with [`TagMismatch`] rather than panicking (the
+//! length is attacker-controlled, so aborting the process is not an option).
 
 use super::TagMismatch;
 use super::aes::aes_round;
@@ -249,6 +268,11 @@ impl Aegis128L {
     }
 
     /// Encrypts `buffer` in place, binding `aad`, and returns the 256-bit tag.
+    ///
+    /// A key must use either the 128-bit or the 256-bit tag, never both: the
+    /// two are different linear functions of the same final state, so
+    /// publishing both under one key leaks relations between state words
+    /// (`draft-irtf-cfrg-aegis-aead` forbids it).
     pub fn encrypt_tag256(&self, nonce: &[u8; 16], aad: &[u8], buffer: &mut [u8]) -> [u8; 32] {
         self.encrypt_inner(nonce, aad, buffer).tag256()
     }
@@ -303,6 +327,9 @@ impl Aegis128L {
     /// Verifies `tag` (128-bit) and, only if it matches, decrypts `buffer` in
     /// place. On mismatch the buffer is left as ciphertext and [`TagMismatch`]
     /// is returned. The tag check is constant time.
+    ///
+    /// Without the `alloc` feature a `buffer` longer than 4 KiB also returns
+    /// [`TagMismatch`]; see the module docs.
     pub fn decrypt(
         &self,
         nonce: &[u8; 16],
@@ -311,7 +338,10 @@ impl Aegis128L {
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
         // Decrypt into a scratch copy so a tag failure leaves `buffer` intact.
-        let mut scratch = ScratchVec::from_slice(buffer);
+        // Without `alloc` that copy is a fixed 4 KiB buffer; a longer
+        // ciphertext is *rejected*, not a panic — the length is under the
+        // attacker's control (see the module docs).
+        let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag128();
         if !bool::from(expected.ct_eq(tag)) {
@@ -323,6 +353,11 @@ impl Aegis128L {
 
     /// Verifies `tag` (256-bit) and, only if it matches, decrypts `buffer` in
     /// place. On mismatch the buffer is left as ciphertext.
+    ///
+    /// A key must use either the 128-bit or the 256-bit tag, never both — the
+    /// two tags are different linear functions of the same final state. Without
+    /// the `alloc` feature a `buffer` longer than 4 KiB returns
+    /// [`TagMismatch`]; see the module docs.
     pub fn decrypt_tag256(
         &self,
         nonce: &[u8; 16],
@@ -330,7 +365,7 @@ impl Aegis128L {
         buffer: &mut [u8],
         tag: &[u8; 32],
     ) -> Result<(), TagMismatch> {
-        let mut scratch = ScratchVec::from_slice(buffer);
+        let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag256();
         if !bool::from(expected.ct_eq(tag)) {
@@ -514,6 +549,11 @@ impl Aegis256 {
     }
 
     /// Encrypts `buffer` in place, binding `aad`, and returns the 256-bit tag.
+    ///
+    /// A key must use either the 128-bit or the 256-bit tag, never both: the
+    /// two are different linear functions of the same final state, so
+    /// publishing both under one key leaks relations between state words
+    /// (`draft-irtf-cfrg-aegis-aead` forbids it).
     pub fn encrypt_tag256(&self, nonce: &[u8; 32], aad: &[u8], buffer: &mut [u8]) -> [u8; 32] {
         self.encrypt_inner(nonce, aad, buffer).tag256()
     }
@@ -547,6 +587,9 @@ impl Aegis256 {
 
     /// Verifies `tag` (128-bit) and, only if it matches, decrypts `buffer` in
     /// place. On mismatch the buffer is left as ciphertext.
+    ///
+    /// Without the `alloc` feature a `buffer` longer than 4 KiB also returns
+    /// [`TagMismatch`]; see the module docs.
     pub fn decrypt(
         &self,
         nonce: &[u8; 32],
@@ -554,7 +597,7 @@ impl Aegis256 {
         buffer: &mut [u8],
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
-        let mut scratch = ScratchVec::from_slice(buffer);
+        let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag128();
         if !bool::from(expected.ct_eq(tag)) {
@@ -566,6 +609,11 @@ impl Aegis256 {
 
     /// Verifies `tag` (256-bit) and, only if it matches, decrypts `buffer` in
     /// place. On mismatch the buffer is left as ciphertext.
+    ///
+    /// A key must use either the 128-bit or the 256-bit tag, never both — the
+    /// two tags are different linear functions of the same final state. Without
+    /// the `alloc` feature a `buffer` longer than 4 KiB returns
+    /// [`TagMismatch`]; see the module docs.
     pub fn decrypt_tag256(
         &self,
         nonce: &[u8; 32],
@@ -573,7 +621,7 @@ impl Aegis256 {
         buffer: &mut [u8],
         tag: &[u8; 32],
     ) -> Result<(), TagMismatch> {
-        let mut scratch = ScratchVec::from_slice(buffer);
+        let mut scratch = ScratchVec::from_slice(buffer).ok_or(TagMismatch)?;
         let st = self.decrypt_inner_tag(nonce, aad, scratch.as_mut());
         let expected = st.tag256();
         if !bool::from(expected.ct_eq(tag)) {
@@ -593,32 +641,37 @@ impl Drop for Aegis256 {
 
 /// A small heap-free scratch buffer for trial decryption, so a tag mismatch
 /// never overwrites the caller's ciphertext. Uses `alloc` when available, and
-/// a fixed-size inline buffer otherwise (decryption inputs above the inline cap
-/// require `alloc`).
+/// a fixed-size inline buffer otherwise (decryption inputs above
+/// [`NO_ALLOC_SCRATCH`] require `alloc`).
 struct ScratchVec {
     #[cfg(feature = "alloc")]
     data: alloc::vec::Vec<u8>,
     #[cfg(not(feature = "alloc"))]
-    data: [u8; 4096],
+    data: [u8; NO_ALLOC_SCRATCH],
     #[cfg(not(feature = "alloc"))]
     len: usize,
 }
 
+/// Largest ciphertext an `alloc`-free build can decrypt in one call.
+#[cfg(not(feature = "alloc"))]
+const NO_ALLOC_SCRATCH: usize = 4096;
+
 impl ScratchVec {
+    /// Returns `None` when the input does not fit — never panics, because the
+    /// length is attacker-controlled on a decryption path.
     #[cfg(feature = "alloc")]
-    fn from_slice(s: &[u8]) -> Self {
-        ScratchVec { data: s.to_vec() }
+    fn from_slice(s: &[u8]) -> Option<Self> {
+        Some(ScratchVec { data: s.to_vec() })
     }
 
     #[cfg(not(feature = "alloc"))]
-    fn from_slice(s: &[u8]) -> Self {
-        assert!(
-            s.len() <= 4096,
-            "AEGIS decryption of >4096 bytes requires the `alloc` feature"
-        );
-        let mut data = [0u8; 4096];
+    fn from_slice(s: &[u8]) -> Option<Self> {
+        if s.len() > NO_ALLOC_SCRATCH {
+            return None;
+        }
+        let mut data = [0u8; NO_ALLOC_SCRATCH];
         data[..s.len()].copy_from_slice(s);
-        ScratchVec { data, len: s.len() }
+        Some(ScratchVec { data, len: s.len() })
     }
 
     #[cfg(feature = "alloc")]
@@ -638,6 +691,51 @@ impl Drop for ScratchVec {
             *b = 0;
         }
         let _ = core::hint::black_box(self.as_mut());
+    }
+}
+
+// Regression guard for the `alloc`-free scratch buffer. Only compiles (and
+// runs) in an allocator-free test build — `cargo test --no-default-features
+// --features aez` — which is exactly the configuration the limit applies to.
+#[cfg(all(test, not(feature = "alloc")))]
+mod no_alloc_tests {
+    use super::*;
+
+    /// A ciphertext longer than the inline scratch buffer must be *rejected*,
+    /// not panic: on a `no_std` target the length is attacker-supplied, and the
+    /// old `assert!` turned a 4097-byte AEGIS message into a process abort.
+    #[test]
+    fn oversized_ciphertext_is_rejected_not_a_panic() {
+        let cipher = Aegis128L::new(&[0x42u8; 16]);
+        let mut buf = [0u8; NO_ALLOC_SCRATCH + 1];
+        assert_eq!(
+            cipher.decrypt(&[0u8; 16], &[], &mut buf, &[0u8; 16]),
+            Err(TagMismatch)
+        );
+        assert_eq!(
+            cipher.decrypt_tag256(&[0u8; 16], &[], &mut buf, &[0u8; 32]),
+            Err(TagMismatch)
+        );
+
+        let cipher = Aegis256::new(&[0x42u8; 32]);
+        assert_eq!(
+            cipher.decrypt(&[0u8; 32], &[], &mut buf, &[0u8; 16]),
+            Err(TagMismatch)
+        );
+        assert_eq!(
+            cipher.decrypt_tag256(&[0u8; 32], &[], &mut buf, &[0u8; 32]),
+            Err(TagMismatch)
+        );
+    }
+
+    /// Right at the cap it must still decrypt correctly (round-trip).
+    #[test]
+    fn at_the_cap_still_round_trips() {
+        let cipher = Aegis128L::new(&[0x42u8; 16]);
+        let mut buf = [0x11u8; NO_ALLOC_SCRATCH];
+        let tag = cipher.encrypt(&[7u8; 16], b"ad", &mut buf);
+        assert!(cipher.decrypt(&[7u8; 16], b"ad", &mut buf, &tag).is_ok());
+        assert_eq!(buf, [0x11u8; NO_ALLOC_SCRATCH]);
     }
 }
 
