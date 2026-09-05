@@ -7,6 +7,13 @@
 //! directive**: when signing a CSR the template wins on key usage / EKU /
 //! basic constraints; only `subject_alt_name.from_csr = true` lets the CSR
 //! supply its requested SANs.
+//!
+//! No built-in profile sets `from_csr` any more. A requested `subjectAltName`
+//! is the requester's claim, not a verified fact — certifying it verbatim
+//! turns a request for `DNS:www.google.com` into a chain-valid certificate
+//! for that name — so the operator opts in per invocation with
+//! `ca sign-csr -copy-csr-san` (see [`CertTemplate::allowing_csr_sans`]), or
+//! names the SANs explicitly with `-san` / the template's own `dns = [...]`.
 
 #![allow(dead_code)]
 
@@ -230,6 +237,21 @@ impl CertTemplate {
         Ok(None)
     }
 
+    /// Turns on `subject_alt_name.from_csr` for this (owned) template copy.
+    ///
+    /// Certifying whatever `subjectAltName` a request asks for is a naming
+    /// decision, not a formatting one: a CSR asking for `DNS:www.google.com`
+    /// would otherwise come back as a chain-valid certificate for that name.
+    /// So no built-in template copies CSR SANs any more, and the operator
+    /// opts in per invocation (`ca sign-csr -copy-csr-san`), which routes
+    /// through here. The same setter marks the SAN list on `req` as
+    /// operator-supplied — there the "CSR SANs" are the caller's own `-san`
+    /// arguments, which need no such vetting.
+    pub(crate) fn allowing_csr_sans(mut self) -> Self {
+        self.san_from_csr = true;
+        self
+    }
+
     /// Builds the v3 extension list this template emits, given an optional
     /// CSR-supplied SAN list (for `subject_alt_name.from_csr = true`) and
     /// the issuer's SKI bytes / subject's SPKI BIT STRING contents (for
@@ -364,6 +386,22 @@ fn bad<T>(field: &str, reason: &str) -> Result<T, TemplateError> {
     })
 }
 
+/// Upper bound on the number of arcs in a template-supplied OID. X.660
+/// imposes no hard limit, but nothing in a certificate profile comes close;
+/// a cap keeps a pathological template from building a multi-megabyte OID.
+const MAX_OID_ARCS: usize = 32;
+
+/// Parses a dotted OID such as `1.3.6.1.4.1.99999.1` into its arcs, enforcing
+/// the X.690 §8.19.4 shape the DER encoder assumes.
+///
+/// `der::encode_oid_arcs` folds the first two arcs into one sub-identifier as
+/// `40·arc0 + arc1` (arc0 ∈ {0,1}) or `80 + arc1` (arc0 = 2) with **unchecked**
+/// arithmetic: an OID like `2.18446744073709551615` overflows that `u64` add,
+/// panicking in a debug build and silently encoding a *different* OID in a
+/// release build — a certificate policy / EKU OID that is not the one the
+/// operator wrote. `der/oid.rs` is library code we do not own here, so the
+/// range checks live at the CLI boundary instead: every arc that reaches the
+/// encoder is guaranteed to fold without wrapping.
 fn parse_oid_arcs(s: &str, field: &str) -> Result<Vec<u64>, TemplateError> {
     let mut out = Vec::new();
     for part in s.split('.') {
@@ -372,9 +410,41 @@ fn parse_oid_arcs(s: &str, field: &str) -> Result<Vec<u64>, TemplateError> {
             reason: format!("`{s}` is not a dotted OID"),
         })?;
         out.push(n);
+        if out.len() > MAX_OID_ARCS {
+            return bad(
+                field,
+                &format!("OID `{s}` has more than {MAX_OID_ARCS} arcs"),
+            );
+        }
     }
     if out.len() < 2 {
         return bad(field, &format!("OID `{s}` must have at least two arcs"));
+    }
+    // X.690 §8.19.4: the root arc is 0, 1, or 2 ...
+    if out[0] > 2 {
+        return bad(
+            field,
+            &format!(
+                "OID `{s}`: the first arc must be 0, 1, or 2 (got {})",
+                out[0]
+            ),
+        );
+    }
+    // ... and under roots 0 and 1 the second arc is limited to 0..=39, so
+    // `40 * arc0 + arc1` always fits. Under root 2 the second arc is
+    // unbounded in principle but must still survive `80 + arc1`.
+    if out[0] < 2 {
+        if out[1] >= 40 {
+            return bad(
+                field,
+                &format!(
+                    "OID `{s}`: the second arc must be < 40 under root {} (got {})",
+                    out[0], out[1]
+                ),
+            );
+        }
+    } else if out[1].checked_add(80).is_none() {
+        return bad(field, &format!("OID `{s}`: the second arc is out of range"));
     }
     Ok(out)
 }
@@ -582,7 +652,11 @@ mod tests {
 
     #[test]
     fn tls_server_emits_expected_extensions() {
-        let t = CertTemplate::builtin("tls-server").unwrap();
+        // `allowing_csr_sans` mirrors what `ca sign-csr -copy-csr-san` (or a
+        // `req -san` invocation) does; without it the profile emits no SAN.
+        let t = CertTemplate::builtin("tls-server")
+            .unwrap()
+            .allowing_csr_sans();
         let csr_sans = [GeneralName::Dns("host.example".into())];
         let ski_subject = [0u8; 65]; // pretend SPKI BIT STRING contents
         let exts = t.extensions(Some(&csr_sans), &[0xCC; 20], &ski_subject);
@@ -714,6 +788,87 @@ additional = ["1.3.6.1.4.1.99999.1"]
         let t = CertTemplate::from_toml(src).unwrap();
         assert_eq!(t.san_explicit.len(), 5);
         assert_eq!(t.extended_key_usage.len(), 2);
+    }
+
+    /// C-2: no built-in template may copy a CSR's requested SANs by default.
+    /// A request for `DNS:www.google.com` must not turn into a chain-valid
+    /// certificate for that name just because the profile was selected.
+    #[test]
+    fn no_builtin_copies_csr_sans_by_default() {
+        for n in builtin_names() {
+            let t = CertTemplate::builtin(n).unwrap();
+            assert!(
+                !t.san_from_csr,
+                "built-in template `{n}` still copies CSR SANs verbatim"
+            );
+            let csr_sans = [GeneralName::Dns("www.google.com".into())];
+            let exts = t.extensions(Some(&csr_sans), &[0xAA; 20], &[0x11; 65]);
+            assert!(
+                exts.iter().all(|e| e.oid != oid::SUBJECT_ALT_NAME),
+                "built-in template `{n}` certified a CSR-requested SAN"
+            );
+        }
+    }
+
+    /// ...and the explicit opt-in still works, for the operator who has
+    /// vetted the request (`ca sign-csr -copy-csr-san`).
+    #[test]
+    fn csr_sans_are_copied_after_explicit_opt_in() {
+        let t = CertTemplate::builtin("tls-server")
+            .unwrap()
+            .allowing_csr_sans();
+        let csr_sans = [GeneralName::Dns("host.example".into())];
+        let exts = t.extensions(Some(&csr_sans), &[0xAA; 20], &[0x11; 65]);
+        assert!(exts.iter().any(|e| e.oid == oid::SUBJECT_ALT_NAME));
+    }
+
+    /// C-8.1: an out-of-range OID arc must be rejected here, because
+    /// `der::encode_oid_arcs` folds the first two arcs with unchecked
+    /// arithmetic (debug panic / silently wrong OID in release).
+    #[test]
+    fn rejects_out_of_range_oid_arcs() {
+        let cases = [
+            // Root arc > 2.
+            "9.1.1",
+            // Second arc >= 40 under root 0/1.
+            "1.40",
+            "0.99",
+            // `80 + arc1` overflows u64 under root 2.
+            "2.18446744073709551615",
+        ];
+        for raw in cases {
+            let src = format!("name = \"x\"\n\n[certificate_policies]\npolicies = [\"{raw}\"]\n");
+            let err = CertTemplate::from_toml(&src)
+                .unwrap_err_or_panic(&format!("OID `{raw}` should be rejected"));
+            assert!(matches!(err, TemplateError::BadValue { .. }));
+        }
+        // Too many arcs.
+        let long = (0..64).map(|_| "1").collect::<Vec<_>>().join(".");
+        let src = format!("name = \"x\"\n\n[certificate_policies]\npolicies = [\"{long}\"]\n");
+        assert!(CertTemplate::from_toml(&src).is_err());
+        // A realistic OID still parses.
+        assert_eq!(
+            parse_oid_arcs("2.23.140.1.2.1", "t").unwrap(),
+            vec![2, 23, 140, 1, 2, 1]
+        );
+        assert_eq!(
+            parse_oid_arcs("1.3.6.1.4.1.99999.1", "t").unwrap(),
+            vec![1, 3, 6, 1, 4, 1, 99999, 1]
+        );
+    }
+
+    /// Helper: `Result::unwrap_err` with a caller-supplied message.
+    trait UnwrapErrOrPanic<T, E> {
+        fn unwrap_err_or_panic(self, msg: &str) -> E;
+    }
+
+    impl<T: std::fmt::Debug, E> UnwrapErrOrPanic<T, E> for Result<T, E> {
+        fn unwrap_err_or_panic(self, msg: &str) -> E {
+            match self {
+                Ok(v) => panic!("{msg}, got Ok({v:?})"),
+                Err(e) => e,
+            }
+        }
     }
 
     #[test]

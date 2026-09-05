@@ -13,7 +13,11 @@ digital_signature = true
 client_auth = true
 
 [subject_alt_name]
-from_csr = true
+# SECURITY: a CSR-requested subjectAltName is the requester's claim, not a
+# verified fact, so it is NOT certified by default. Either list the names
+# here (`dns = ["host.example"]`) or, after checking them, pass
+# `ca sign-csr -copy-csr-san` for a single issuance.
+from_csr = false
 
 [subject_key_identifier]
 include = true
