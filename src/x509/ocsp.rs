@@ -151,9 +151,20 @@ pub enum OcspCertStatus {
 pub struct OcspSingleResponse {
     /// OID arcs of the `CertID.hashAlgorithm` (typically `id-sha1`).
     pub hash_alg_oid: Vec<u64>,
-    /// Hash of the issuer's `subject` Name TLV's *value* (the `Name` body,
-    /// per RFC 6960 §4.1.1: the hash input is the DER-encoded `Name` value
-    /// excluding the tag and length octets — i.e. the body of the SEQUENCE).
+    /// Hash of the issuer's `subject` **`Name` TLV** — tag and length octets
+    /// included (RFC 6960 §4.1.1).
+    ///
+    /// The hash input is the complete DER `Name` element, which is what
+    /// OpenSSL and every deployed responder compute; an earlier version of
+    /// this comment claimed the tag and length were excluded, but the code
+    /// (see `hash_pair` / [`OcspResponse::find_response_for`]) has always
+    /// hashed the full TLV and is the correct side of that discrepancy.
+    ///
+    /// Note that no round-trip test can catch a "fix" in the other direction:
+    /// this crate's own [`OcspResponseBuilder`] would simply hash the shorter
+    /// input too and still match itself, while every real responder's
+    /// `CertID` would stop matching. Changing the hashed bytes here is an
+    /// interop break, not a bug fix.
     pub issuer_name_hash: Vec<u8>,
     /// Hash of the issuer's `subjectPublicKey` BIT STRING value (raw key bits,
     /// no unused-bits octet).
@@ -216,6 +227,7 @@ pub struct OcspCheckOptions<'a> {
     policy: &'a SignaturePolicy,
     now: Option<&'a Time>,
     nonce: Option<&'a [u8]>,
+    max_age: Option<u64>,
 }
 
 impl<'a> OcspCheckOptions<'a> {
@@ -229,6 +241,7 @@ impl<'a> OcspCheckOptions<'a> {
             policy,
             now: None,
             nonce: None,
+            max_age: None,
         }
     }
 
@@ -245,6 +258,27 @@ impl<'a> OcspCheckOptions<'a> {
     /// or mismatched nonce fails closed. Stapled-OCSP callers leave this unset.
     pub fn with_nonce(mut self, nonce: &'a [u8]) -> Self {
         self.nonce = Some(nonce);
+        self
+    }
+
+    /// Caps how old a response with **no `nextUpdate`** may be, in seconds.
+    ///
+    /// RFC 6960 §4.2.2.1 makes `nextUpdate` optional, and its absence means
+    /// "newer status information is always available" — a responder saying
+    /// the answer has no stated expiry. Without an upper bound such a
+    /// response never goes stale, so a single captured `good` staple stays
+    /// replayable for the life of the certificate. With `max_age` set, a
+    /// response whose `nextUpdate` is absent is rejected once
+    /// `now - thisUpdate` exceeds it.
+    ///
+    /// This only affects responses lacking `nextUpdate`: when the field is
+    /// present it remains the (stricter, responder-stated) bound. It also
+    /// requires a clock — [`with_time`](Self::with_time) must supply one, or
+    /// no freshness check runs at all. Leaving `max_age` unset preserves the
+    /// permissive default, which conformant responders that omit
+    /// `nextUpdate` rely on.
+    pub fn with_max_age(mut self, max_age: u64) -> Self {
+        self.max_age = Some(max_age);
         self
     }
 }
@@ -641,7 +675,8 @@ impl OcspResponse {
         //    saying it has no fresher response; we accept the staple
         //    anyway (mirroring the rustls and OpenSSL leniency rule, which
         //    treats the response as valid as long as it isn't in the
-        //    future and isn't past its claimed expiry).
+        //    future and isn't past its claimed expiry), unless the caller
+        //    set an explicit ceiling with `OcspCheckOptions::with_max_age`.
         if let Some(now) = now {
             let now_u = now.to_unix();
             // Fail closed on an unparsable thisUpdate: `to_unix` would coerce a
@@ -655,12 +690,27 @@ impl OcspResponse {
             if this_update > now_u {
                 return Err(Error::Malformed);
             }
-            if let Some(nu) = &single.next_update {
-                // Likewise: a present-but-malformed nextUpdate must reject,
-                // not be treated as "no expiry".
-                let next_update = nu.to_unix_checked().ok_or(Error::Malformed)?;
-                if now_u >= next_update {
-                    return Err(Error::Malformed);
+            match &single.next_update {
+                Some(nu) => {
+                    // Likewise: a present-but-malformed nextUpdate must reject,
+                    // not be treated as "no expiry".
+                    let next_update = nu.to_unix_checked().ok_or(Error::Malformed)?;
+                    if now_u >= next_update {
+                        return Err(Error::Malformed);
+                    }
+                }
+                // No nextUpdate: the responder states no expiry, so the
+                // response would otherwise be replayable forever. Apply the
+                // caller's own ceiling when one was configured via
+                // `OcspCheckOptions::with_max_age`. (Not a hard rejection —
+                // omitting nextUpdate is conformant, and refusing outright
+                // would break those responders.)
+                None => {
+                    if let Some(max_age) = opts.max_age
+                        && now_u.saturating_sub(this_update) > max_age
+                    {
+                        return Err(Error::Malformed);
+                    }
                 }
             }
         }
@@ -2137,6 +2187,70 @@ mod tests {
 
         let nonce_ok = handmade_response(&[], &[ext(oid::ID_PKIX_OCSP_NONCE, true)]);
         assert_eq!(nonce_ok.responses().unwrap().len(), 1);
+    }
+
+    /// LOW: a response with no `nextUpdate` states no expiry, so without an
+    /// explicit ceiling it stays replayable forever. `with_max_age` bounds it
+    /// against `thisUpdate`; the default (unset) stays permissive, since
+    /// omitting `nextUpdate` is conformant.
+    #[test]
+    fn missing_next_update_bounded_by_max_age() {
+        let (issuer, leaf, issuer_key) = issuer_and_leaf();
+        let signer = CertSigner::Rsa(&issuer_key);
+        let this_update = Time::utc(2026, 1, 1, 0, 0, 0);
+        let resp = OcspResponseBuilder::good(&leaf, &issuer, this_update.clone(), None)
+            .unwrap()
+            .sign(&signer)
+            .unwrap();
+
+        // Two days later.
+        let later = Time::utc(2026, 1, 3, 0, 0, 0);
+        let policy = SignaturePolicy::modern();
+
+        // No ceiling configured: accepted (unchanged, conformant-responder
+        // behavior).
+        let lenient = OcspCheckOptions::new(&policy).with_time(Some(&later));
+        assert_eq!(
+            resp.check_for_cert_with_options(&leaf, &issuer, &lenient)
+                .unwrap(),
+            OcspCertStatus::Good
+        );
+
+        // 1-day ceiling: the two-day-old staple is stale.
+        let strict = OcspCheckOptions::new(&policy)
+            .with_time(Some(&later))
+            .with_max_age(86_400);
+        assert!(matches!(
+            resp.check_for_cert_with_options(&leaf, &issuer, &strict),
+            Err(crate::x509::Error::Malformed)
+        ));
+
+        // 7-day ceiling: still fresh.
+        let generous = OcspCheckOptions::new(&policy)
+            .with_time(Some(&later))
+            .with_max_age(7 * 86_400);
+        assert_eq!(
+            resp.check_for_cert_with_options(&leaf, &issuer, &generous)
+                .unwrap(),
+            OcspCertStatus::Good
+        );
+
+        // `max_age` must not touch a response that states its own nextUpdate.
+        let with_nu = OcspResponseBuilder::good(
+            &leaf,
+            &issuer,
+            this_update,
+            Some(Time::utc(2026, 2, 1, 0, 0, 0)),
+        )
+        .unwrap()
+        .sign(&signer)
+        .unwrap();
+        assert_eq!(
+            with_nu
+                .check_for_cert_with_options(&leaf, &issuer, &strict)
+                .unwrap(),
+            OcspCertStatus::Good
+        );
     }
 
     #[test]
