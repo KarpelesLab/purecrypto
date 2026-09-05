@@ -66,6 +66,18 @@ pub struct ChaCha20 {
     key: [u32; 8],
 }
 
+impl Drop for ChaCha20 {
+    fn drop(&mut self) {
+        // The whole state *is* the 256-bit key, so without this a retired
+        // ChaCha20 traffic key (TLS 1.3 `KeyUpdate`, connection close) stays in
+        // freed memory — where the AES-GCM `RecordCrypter` scrubs its round
+        // keys and GHASH subkey. `black_box` keeps LLVM from eliding the
+        // writes as a dead store, matching `Aes*`/`Gcm`/`Poly1305`.
+        self.key = [0u32; 8];
+        let _ = core::hint::black_box(&self.key);
+    }
+}
+
 impl ChaCha20 {
     /// Creates a ChaCha20 cipher from a 32-byte key.
     pub fn new(key: &[u8; 32]) -> Self {

@@ -29,8 +29,12 @@ impl XChaCha20Poly1305 {
     fn inner(&self, nonce: &[u8; 24]) -> (ChaCha20Poly1305, [u8; 12]) {
         let mut n16 = [0u8; 16];
         n16.copy_from_slice(&nonce[..16]);
-        let subkey = hchacha20(&self.key, &n16);
+        let mut subkey = hchacha20(&self.key, &n16);
         let aead = ChaCha20Poly1305::new(&subkey);
+        // `subkey` is a full-strength key for the inner AEAD; don't leave a
+        // copy of it on the stack once the context owns it.
+        subkey = [0u8; 32];
+        let _ = core::hint::black_box(&subkey);
         let mut inner_nonce = [0u8; 12];
         inner_nonce[4..].copy_from_slice(&nonce[16..]);
         (aead, inner_nonce)

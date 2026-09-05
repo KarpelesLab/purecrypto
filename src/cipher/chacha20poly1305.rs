@@ -14,6 +14,11 @@ use super::poly1305::Poly1305;
 use crate::ct::ConstantTimeEq;
 
 /// A ChaCha20-Poly1305 AEAD context keyed with a 256-bit key.
+///
+/// The 256-bit key is wiped on drop: the only key material this type holds is
+/// the inner [`ChaCha20`], whose own `Drop` zeroizes it (the per-message
+/// Poly1305 one-time key is derived and dropped inside each call, and
+/// [`Poly1305`] wipes itself too).
 #[derive(Clone)]
 pub struct ChaCha20Poly1305 {
     cipher: ChaCha20,
