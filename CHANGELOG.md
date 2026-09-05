@@ -7,6 +7,92 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/KarpelesLab/purecrypto/compare/v0.8.0...v0.8.1) - 2026-09-05
+
+### Added
+
+- *(x509)* make Certificate::has_subject_alt_name public
+- *(x509)* Time::utc_checked, a validating calendar constructor
+- *(x509)* OcspCheckOptions::with_max_age for responses without nextUpdate
+- *(quic)* RFC 9000 §9.6 server preferred address
+- *(quic)* RFC 9001 §4.6 0-RTT — session resumption and early data
+- *(quic)* RFC 9000 §9 connection migration
+- *(quic)* graceful close (RFC 9000 §10.2) and a stream writability signal
+
+### Fixed
+
+- *(key)* append the Brainpool Algorithm variants instead of inserting them
+- *(ec)* SM2 all-zero KDF check on decrypt, and an encrypt hang on empty input
+- *(ec)* reduce over-wide scalars in weierstrass::scalar_mul
+- *(ec)* zeroize the ECDSA nonce and the RFC 6979 DRBG state
+- *(rsa)* fresh per-operation blinder, CT qInv export, RFC 8017 range check
+- *(ec)* bound r/s width when parsing DER ECDSA/SM2 signatures
+- *(ec)* reject small-order Ed25519/Ed448 public keys in verify
+- *(tls)* bound KeyUpdate, skip rejected 0-RTT, surface write-cap failures
+- *(tls/ech)* don't fall back to the outer CH on post-authentication failures
+- *(tls)* honour TLS_FALLBACK_SCSV in the TLS 1.2 server
+- *(tls)* reject a repeated TLS 1.2 CertificateRequest, and SSLv3+SHA-256 CBC
+- *(tls)* remove the secret-sized allocation from the Lucky13 equaliser
+- *(cli)* templates stop copying CSR SANs by default; validate OID arcs (C-2, C-8.1)
+- *(cli)* `rand -out FILE` must not be world-readable (C-7)
+- *(cli)* share the hardened file-write helpers from util.rs (C-6)
+- *(cli)* bound TOML value recursion and decode basic strings as UTF-8 (C-5, C-8.5)
+- *(cli)* constrain `x509 -req -ca` and stop certifying CSR SANs (C-2, C-3, C-4)
+- *(cli)* CA issuance hardening — random serials, SAN vetting, CSR policy (C-1, C-2, C-4, C-6, C-8)
+- *(ffi)* compute the scrypt cost ceiling without overflowing (F-1 follow-up)
+- *(rng)* fail closed when the wasm host entropy import writes nothing (F-3)
+- *(rng)* make the armv7 getrandom(2) backend actually compile (F-2)
+- *(ffi)* wipe the caller's private scalar in pc_x25519/pc_x448 (F-4)
+- *(ffi)* cap the memory-hard KDF cost parameters (F-1)
+- *(mldsa)* length-guard the hazmat decoders instead of panicking
+- *(falcon)* bound generated f, g, F to what the compact encoding holds
+- *(falcon)* pin the signature encoding to remove cross-format malleability
+- *(falcon)* wipe the expanded key, and correct the constant-time claims
+- *(pkcs12)* bound aggregate KDF work and bag counts on parse
+- *(der)* validate the joint first sub-identifier in encode_oid_arcs
+- *(der)* reject the X.690 high-tag-number identifier form
+- *(key)* report the real curve for Brainpool and SM2 EC keys
+- *(quic)* reject nonce-reusing Retry, degenerate preferred addresses, bogus RETIRE
+- *(quic)* drain bytes_in_flight, keep ACKs flowing, and validate paths
+- *(quic)* bound server-side connection state and always arm the idle timer
+- *(quic)* stop the Retry reflection amplifier and path-scope the AMP budget
+- wipe key-derived stack temporaries in Poly1305 AVX2 and 3 key schedules
+- *(des)* cache-line-align the S-boxes; wipe Cbc64's chaining value
+- *(aegis)* reject an oversized no-alloc ciphertext instead of aborting
+- *(blake2)* enforce the MAC output length in release builds
+- *(gmac)* stream the message into GHASH instead of buffering it
+- *(hmac)* wipe the key-derived constructor temporaries
+- *(ctr)* wipe the windowed keystream buffer before returning
+- *(chacha20)* zeroize the key on drop
+- *(keccak)* assert the wide-sponge absorb invariants in release builds
+- *(blake3)* type-enforce the SIMD chunk-kernel input length
+- *(x509)* cross-check CtLog.log_id against SHA-256(spki_der)
+- *(x509)* bound and tighten CRL extension parsing
+- *(x509)* reject an IssuingDistributionPoint CRL regardless of criticality
+- *(x509)* count distinct CT logs in verify_embedded_scts, not SCT elements
+- *(x509)* reject unrecognized critical OCSP extensions
+- *(pki)* bound peer-controlled CRL verification work in check_revocation
+- *(pki)* close the wildcard-SAN bypass of excluded name-constraint subtrees
+- *(pki)* ignore commonName whenever a subjectAltName extension is present
+- *(dtls)* security audit — clock fallback, cookie address binding, reassembly wedge
+- *(quic)* bound peer-driven MAX_STREAMS growth and retire closed streams
+- *(quic)* cap out-of-order receive buffering by bytes, not just fragments
+- *(quic)* reject empty NEW_TOKEN and out-of-range STREAM extents
+- *(quic)* harden the varint encoder against out-of-range values
+
+### Other
+
+- make the Intel SDE AVX-512 job manual-dispatch only
+- *(ec)* cover the true edwards448 4-torsion set
+- *(tls)* stop re-copying the buffered ClientHello on every peek
+- *(cli)* regression coverage for the CA/x509 findings; update docs for the new defaults
+- *(ffi)* declare the six undeclared exports in the public header (F-6)
+- cargo fmt
+- *(keccak)* wipe only the live prefix of the wide sponge state
+- correct three misleading security caveats
+- *(ascon)* describe what decrypt actually does to the caller's buffer
+- exercise the AVX-512 kernels under Intel SDE, and announce every skip
+
 ## [0.8.0](https://github.com/KarpelesLab/purecrypto/compare/v0.7.0...v0.8.0) - 2026-09-03
 
 ### Fixed
