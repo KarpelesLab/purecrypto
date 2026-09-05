@@ -725,7 +725,10 @@ impl Certificate {
     /// still SAN-bearing, and its commonName must be ignored — otherwise an
     /// IP-only certificate with a misleading `CN=login.bank.example` would
     /// authenticate that hostname.
-    pub(crate) fn has_subject_alt_name(&self) -> Result<bool, Error> {
+    ///
+    /// Callers doing their own identity matching want this predicate, not
+    /// `subject_alt_names().is_empty()`.
+    pub fn has_subject_alt_name(&self) -> Result<bool, Error> {
         let mut found = false;
         self.walk_extensions(|id, _critical, _value| {
             if id == oid::SUBJECT_ALT_NAME {
