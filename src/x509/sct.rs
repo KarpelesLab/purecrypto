@@ -70,6 +70,11 @@ pub struct Sct {
 pub struct CtLog {
     /// `LogID`: SHA-256 of `spki_der`. An SCT names its issuing log by this
     /// 32-byte id.
+    ///
+    /// The two fields are not independent: verification re-derives
+    /// `SHA-256(spki_der)` and ignores any entry whose `log_id` disagrees, so
+    /// a hand-assembled list cannot pair one log's id with another's key.
+    /// Prefer [`CtLog::from_spki_der`], which cannot get this wrong.
     pub log_id: [u8; 32],
     /// The log's `SubjectPublicKeyInfo` (DER) — used to verify SCT signatures.
     pub spki_der: Vec<u8>,
@@ -334,8 +339,16 @@ pub fn serialize_sct_list(scts: &[Sct]) -> Vec<u8> {
 
 /// Appends `data` to `out` with a 3-byte big-endian length prefix
 /// (`opaque<1..2^24-1>`).
+///
+/// `data.len()` must fit in 24 bits. A longer slice would have its length
+/// silently reduced modulo 2^24 while the full body is still appended,
+/// producing a corrupt (but internally length-mismatched, hence
+/// verification-failing) encoding. Every caller feeds a DER certificate or
+/// TBS body, so the bound is structural rather than checked at runtime; the
+/// `debug_assert!` documents and tests it.
 fn push_u24_vec(out: &mut Vec<u8>, data: &[u8]) {
     let n = data.len();
+    debug_assert!(n < (1 << 24), "opaque<1..2^24-1> body too long: {n}");
     out.push((n >> 16) as u8);
     out.push((n >> 8) as u8);
     out.push(n as u8);
@@ -343,9 +356,15 @@ fn push_u24_vec(out: &mut Vec<u8>, data: &[u8]) {
 }
 
 /// Appends `data` to `out` with a 2-byte big-endian length prefix.
+///
+/// `data.len()` must fit in 16 bits, for the same reason as
+/// [`push_u24_vec`]: an oversized slice would be written with a
+/// length-prefix reduced modulo 2^16.
 fn push_u16_vec(out: &mut Vec<u8>, data: &[u8]) {
-    out.push((data.len() >> 8) as u8);
-    out.push(data.len() as u8);
+    let n = data.len();
+    debug_assert!(n < (1 << 16), "opaque<..2^16-1> body too long: {n}");
+    out.push((n >> 8) as u8);
+    out.push(n as u8);
     out.extend_from_slice(data);
 }
 
@@ -478,6 +497,21 @@ pub fn verify_embedded_scts(
     Ok((results, valid_logs.len()))
 }
 
+/// Finds the trusted log whose `LogID` is `id`, rejecting an entry whose
+/// `log_id` does not actually equal `SHA-256(spki_der)`.
+///
+/// RFC 6962 §3.2 defines `LogID` as the SHA-256 of the log's SPKI, so a
+/// [`CtLog`]'s two fields are not independent. [`CtLog::from_spki_der`]
+/// derives one from the other, but the fields are public, so a caller
+/// assembling the log list by hand (or transcribing a log-list JSON) can pair
+/// log A's id with log B's key. Trusting such an entry would let a signature
+/// from B satisfy an SCT that names A, so a mislabelled entry is treated as
+/// no match at all.
+fn find_trusted_log<'a>(logs: &'a [CtLog], id: &[u8; 32]) -> Option<&'a CtLog> {
+    logs.iter()
+        .find(|l| &l.log_id == id && Sha256::digest(&l.spki_der) == l.log_id)
+}
+
 /// Verifies a single embedded SCT and classifies the result.
 fn verify_one(
     sct: &Sct,
@@ -489,7 +523,7 @@ fn verify_one(
     if sct.timestamp > now_ms {
         return SctVerification::FutureTimestamp;
     }
-    let Some(log) = logs.iter().find(|l| l.log_id == sct.log_id) else {
+    let Some(log) = find_trusted_log(logs, &sct.log_id) else {
         return SctVerification::UnknownLog;
     };
     let signed = sct.signed_data_for_precert(issuer_spki, tbs);
@@ -516,7 +550,7 @@ pub fn verify_standalone_sct(
     if sct.timestamp > now_ms {
         return SctVerification::FutureTimestamp;
     }
-    let Some(log) = logs.iter().find(|l| l.log_id == sct.log_id) else {
+    let Some(log) = find_trusted_log(logs, &sct.log_id) else {
         return SctVerification::UnknownLog;
     };
     let signed = sct.signed_data_for_x509(leaf_cert_der);
@@ -762,6 +796,48 @@ mod tests {
             vec![SctVerification::Valid, SctVerification::Valid]
         );
         assert_eq!(distinct2, 2);
+    }
+
+    /// LOW: a [`CtLog`] whose `log_id` is not `SHA-256(spki_der)` is
+    /// mislabelled and must not verify anything — otherwise a signature from
+    /// the key actually present would satisfy an SCT naming a different log.
+    #[test]
+    fn mislabelled_log_id_does_not_verify() {
+        let (_issuer, leaf) = issue_issuer_and_leaf();
+        let leaf_der = leaf.to_der().to_vec();
+        let real = make_test_log(b"real");
+        let other = make_test_log(b"other-key");
+        let ts = 1_700_000_000_000u64;
+        let now = ts + 1000;
+
+        let proto = Sct {
+            version: SctVersion::V1,
+            log_id: real.log.log_id,
+            timestamp: ts,
+            extensions: Vec::new(),
+            sig_hash: 4,
+            sig_alg: 3,
+            signature: Vec::new(),
+        };
+        let signed = proto.signed_data_for_x509(&leaf_der);
+        let sct = sign_sct(&real, ts, &signed);
+
+        // The honest entry verifies.
+        assert_eq!(
+            verify_standalone_sct(&sct, &leaf_der, core::slice::from_ref(&real.log), now),
+            SctVerification::Valid
+        );
+
+        // A hand-assembled entry pairing the real log's id with a different
+        // log's key is ignored, not consulted.
+        let mislabelled = CtLog {
+            log_id: real.log.log_id,
+            spki_der: other.log.spki_der.clone(),
+        };
+        assert_eq!(
+            verify_standalone_sct(&sct, &leaf_der, &[mislabelled], now),
+            SctVerification::UnknownLog
+        );
     }
 
     #[test]
