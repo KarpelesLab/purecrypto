@@ -18,9 +18,10 @@
 //!   * [`CtLog`] — a trusted log: its `LogID` (SHA-256 of the log's SPKI) and
 //!     the SPKI DER itself (used to verify SCT signatures).
 //!   * [`verify_embedded_scts`] — verify the embedded SCTs of a certificate against a
-//!     set of trusted logs at a given time, returning per-SCT validity and a
-//!     count of valid SCTs. The trust policy ("≥ N distinct logs") is the
-//!     caller's decision.
+//!     set of trusted logs at a given time, returning per-SCT validity and the
+//!     number of **distinct logs** that produced a valid SCT (duplicated
+//!     SCTs from one log count once). The trust policy ("≥ N distinct
+//!     logs") is the caller's decision.
 //!
 //! **Opt-in.** Nothing here runs in the default certificate-validation path;
 //! a caller must explicitly invoke it.
@@ -431,13 +432,23 @@ fn rebuild_tbs_without(tbs_der: &[u8], remove_oids: &[&[u64]]) -> Result<Vec<u8>
 
 /// Verifies the **embedded** SCTs of `cert` (the leaf) against `logs`, using
 /// `issuer` to compute the precert `issuer_key_hash`. Returns a vector of
-/// per-SCT [`SctVerification`] results in list order, plus the count of valid
-/// SCTs.
+/// per-SCT [`SctVerification`] results in list order, plus the number of
+/// **distinct logs** that produced a valid SCT.
+///
+/// The second element is deliberately a distinct-log count, not a count of
+/// valid list elements: nothing de-duplicates the
+/// `SignedCertificateTimestampList`, so a CA colluding with (or an attacker
+/// who compromised) a single log could embed that log's SCT twice and satisfy
+/// a caller's "≥ 2 logs" policy with one log — exactly the
+/// single-log-compromise case a multi-SCT policy exists to prevent. Repeated
+/// SCTs from the same `log_id` therefore contribute 1. The per-SCT `results`
+/// vector still reports every element individually, in list order.
 ///
 /// `now_ms` is the verification time in milliseconds since the Unix epoch; an
 /// SCT whose `timestamp` is after `now_ms` is reported [`SctVerification::
 /// FutureTimestamp`] and not counted as valid. The relying party decides
-/// whether the valid count meets its policy (e.g. ≥ 2 distinct logs).
+/// whether the distinct-log count meets its policy (e.g. ≥ 2 distinct
+/// logs).
 ///
 /// Returns `Ok((vec![], 0))` when the certificate carries no embedded-SCT
 /// extension.
@@ -455,15 +466,16 @@ pub fn verify_embedded_scts(
     let tbs = reconstruct_precert_tbs(cert)?;
 
     let mut results = Vec::with_capacity(scts.len());
-    let mut valid = 0usize;
+    // Count distinct logs, not list elements — see the doc comment.
+    let mut valid_logs: Vec<[u8; 32]> = Vec::new();
     for sct in &scts {
         let res = verify_one(sct, issuer_spki, &tbs, logs, now_ms);
-        if res == SctVerification::Valid {
-            valid += 1;
+        if res == SctVerification::Valid && !valid_logs.contains(&sct.log_id) {
+            valid_logs.push(sct.log_id);
         }
         results.push(res);
     }
-    Ok((results, valid))
+    Ok((results, valid_logs.len()))
 }
 
 /// Verifies a single embedded SCT and classifies the result.
@@ -660,6 +672,96 @@ mod tests {
             verify_standalone_sct(&sct, &leaf_der, core::slice::from_ref(&log.log), ts - 1),
             SctVerification::FutureTimestamp
         );
+    }
+
+    /// MEDIUM: `verify_embedded_scts` must report DISTINCT logs, not valid
+    /// list elements. Nothing de-duplicates the SCT list, so a CA colluding
+    /// with (or an attacker who compromised) one log could embed that log's
+    /// SCT twice and satisfy a caller's documented "≥ 2 distinct logs"
+    /// policy with a single log.
+    #[test]
+    fn duplicate_log_id_counts_once() {
+        let (issuer, _leaf) = issue_issuer_and_leaf();
+        let issuer_spki = issuer.spki_der().unwrap().to_vec();
+        let ca_key = rsa_test_key_a();
+        let ca_b = BoxedRsaPrivateKey::from_pkcs1_der(&ca_key.to_pkcs1_der()).unwrap();
+        let ts = 1_700_000_000_000u64;
+        let now = ts + 1000;
+
+        // Build the precert TBS the log will sign: the SCT-bearing leaf's TBS
+        // with the SCT extension stripped, which equals the SCT-free leaf's.
+        let base_exts = [
+            extension::basic_constraints(false, None),
+            extension::subject_alt_name(&[GeneralName::Dns("ct.example".into())]),
+        ];
+        let bare = Certificate::issue_with_extensions(
+            &CertSigner::Rsa(&ca_b),
+            &DistinguishedName::common_name("CT Issuer"),
+            &DistinguishedName::common_name("ct.example"),
+            &AnyPublicKey::Rsa(ca_b.public_key()),
+            &validity(),
+            2,
+            &base_exts,
+        )
+        .unwrap();
+        let tbs = reconstruct_precert_tbs(&bare).unwrap();
+
+        let log_a = make_test_log(b"dup-a");
+        let log_b = make_test_log(b"dup-b");
+        let sign_for = |log: &TestLog, timestamp: u64| {
+            let proto = Sct {
+                version: SctVersion::V1,
+                log_id: log.log.log_id,
+                timestamp,
+                extensions: Vec::new(),
+                sig_hash: 4,
+                sig_alg: 3,
+                signature: Vec::new(),
+            };
+            let signed = proto.signed_data_for_precert(&issuer_spki, &tbs);
+            sign_sct(log, timestamp, &signed)
+        };
+
+        let embed = |scts: &[Sct]| {
+            let list = serialize_sct_list(scts);
+            let mut exts = vec![
+                extension::basic_constraints(false, None),
+                extension::subject_alt_name(&[GeneralName::Dns("ct.example".into())]),
+            ];
+            exts.push(extension::sct_list(&list));
+            Certificate::issue_with_extensions(
+                &CertSigner::Rsa(&ca_b),
+                &DistinguishedName::common_name("CT Issuer"),
+                &DistinguishedName::common_name("ct.example"),
+                &AnyPublicKey::Rsa(ca_b.public_key()),
+                &validity(),
+                2,
+                &exts,
+            )
+            .unwrap()
+        };
+
+        // Two SCTs from ONE log (distinct timestamps, so they are not even
+        // byte-identical — de-duplication must key on `log_id`).
+        let dup = embed(&[sign_for(&log_a, ts), sign_for(&log_a, ts + 1)]);
+        let logs = vec![log_a.log.clone(), log_b.log.clone()];
+        let (results, distinct) = verify_embedded_scts(&dup, &issuer, &logs, now).unwrap();
+        // Both elements verify individually...
+        assert_eq!(
+            results,
+            vec![SctVerification::Valid, SctVerification::Valid]
+        );
+        // ...but they speak for a single log.
+        assert_eq!(distinct, 1);
+
+        // Two genuinely different logs do reach 2.
+        let two = embed(&[sign_for(&log_a, ts), sign_for(&log_b, ts)]);
+        let (results2, distinct2) = verify_embedded_scts(&two, &issuer, &logs, now).unwrap();
+        assert_eq!(
+            results2,
+            vec![SctVerification::Valid, SctVerification::Valid]
+        );
+        assert_eq!(distinct2, 2);
     }
 
     #[test]
