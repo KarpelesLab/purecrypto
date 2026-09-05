@@ -267,8 +267,12 @@ purecrypto req -in leaf.csr -verify       # check the CSR self-signature
 # Build a self-signed CA cert
 purecrypto x509 -new --ca -key ca.pem -subj "/CN=Internal CA" -out ca.crt
 
-# Issue a leaf certificate from a CSR
-purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem -out leaf.crt
+# Issue a leaf certificate from a CSR.
+# A CSR's requested subjectAltName is NOT certified by default — it is the
+# requester's claim, so name the SANs yourself with -san (or pass
+# -copy-csr-san to take the request's list as-is).
+purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
+                -san leaf.example,www.leaf.example -out leaf.crt
 
 # Inspect a certificate
 purecrypto x509 -in leaf.crt -text
@@ -383,7 +387,8 @@ purecrypto x509 -new --ca -key ca.pem -subj "/CN=My CA" -out ca.crt
 purecrypto genpkey -algorithm EC -curve P-256 -out leaf.pem
 purecrypto req -key leaf.pem -subj "/CN=leaf.example" \
                -addext "subjectAltName=DNS:leaf.example" -out leaf.csr
-purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem -out leaf.crt
+purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
+                -san leaf.example -out leaf.crt
 ```
 
 A post-quantum signature key and its public counterpart:
@@ -404,7 +409,8 @@ purecrypto x509 -new --ca -key ca.pem -subj "/CN=Local CA" -out ca.crt
 purecrypto genpkey -algorithm ED25519 -out server.pem
 purecrypto req -key server.pem -subj "/CN=127.0.0.1" \
                -addext "subjectAltName=DNS:127.0.0.1" -out server.csr
-purecrypto x509 -req -in server.csr -CA ca.crt -CAkey ca.pem -out server.crt
+purecrypto x509 -req -in server.csr -CA ca.crt -CAkey ca.pem \
+                -san 127.0.0.1 -out server.crt
 purecrypto genpkey -algorithm ED25519 -out client.pem
 purecrypto req -key client.pem -subj "/CN=alice" -out client.csr
 purecrypto x509 -req -in client.csr -CA ca.crt -CAkey ca.pem -out client.crt

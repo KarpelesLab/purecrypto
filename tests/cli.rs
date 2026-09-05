@@ -198,7 +198,9 @@ fn ca_workflow_genpkey_req_sign() {
     let (vout, ok) = run(&["req", "-in", &p("leaf.csr"), "-verify"], b"");
     assert!(ok && vout.contains("verify OK"));
 
-    // CA signs the CSR.
+    // CA signs the CSR. The SAN is named explicitly: a CSR's *requested*
+    // subjectAltName is no longer certified without `-copy-csr-san` (see
+    // `x509_req_ignores_csr_sans_without_opt_in`).
     assert!(
         run(
             &[
@@ -210,6 +212,8 @@ fn ca_workflow_genpkey_req_sign() {
                 &p("ca.pem"),
                 "-CAkey",
                 &p("ca_key.pem"),
+                "-san",
+                "leaf.test",
                 "-out",
                 &p("leaf.pem")
             ],
@@ -226,7 +230,10 @@ fn ca_workflow_genpkey_req_sign() {
         text.contains("Issuer:") && text.contains("CN=Test CA"),
         "{text}"
     );
-    assert!(text.contains("leaf.test"), "{text}");
+    assert!(
+        text.contains("Subject Alternative Names: leaf.test"),
+        "{text}"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -382,6 +389,28 @@ fn req_rejects_subject_with_newline() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Pulls the serial out of a `ca issue` / `ca sign-csr` stderr note
+/// ("issued serial 12345678901234567890 (0x…), index 1"). Serials are random
+/// 64-bit CSPRNG draws now (CA/Browser Forum BR 7.1), so a test cannot assume
+/// the old sequential 1, 2, 3, …
+fn issued_serial(stderr: &str) -> u64 {
+    let tail = stderr
+        .split("issued serial ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no `issued serial` note in stderr: {stderr}"));
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits
+        .parse()
+        .unwrap_or_else(|e| panic!("unparsable serial {digits:?}: {e}"))
+}
+
+/// The serial as the minimal big-endian magnitude a CRL entry carries.
+fn serial_be(serial: u64) -> Vec<u8> {
+    let b = serial.to_be_bytes();
+    let first = b.iter().position(|x| *x != 0).unwrap_or(b.len() - 1);
+    b[first..].to_vec()
+}
+
 /// End-to-end exercise of `purecrypto ca`: init → genpkey leaf → ca issue →
 /// x509 inspect → ca revoke → ca crl → verify the CRL revokes the leaf.
 #[test]
@@ -431,27 +460,25 @@ fn ca_subcommand_full_flow() {
     std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
 
     // CA issues a leaf.
-    assert!(
-        run(
-            &[
-                "ca",
-                "issue",
-                "-dir",
-                dir.to_str().unwrap(),
-                "-pubkey",
-                &p("leaf.pub"),
-                "-cn",
-                "host.example",
-                "-sans",
-                "host.example",
-                "-out",
-                &p("leaf.crt"),
-            ],
-            b""
-        )
-        .1,
-        "ca issue failed"
+    let (_out, issue_err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "host.example",
+            "-sans",
+            "host.example",
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
     );
+    assert!(ok, "ca issue failed: {issue_err}");
+    let leaf_serial = issued_serial(&issue_err);
 
     // x509 inspect: the issued cert has the right subject + issuer.
     let (text, ok) = run(&["x509", "-in", &p("leaf.crt"), "-text"], b"");
@@ -468,7 +495,8 @@ fn ca_subcommand_full_flow() {
     leaf.verify_signature_with(&root_key)
         .expect("leaf should verify under the CA key");
 
-    // Revoke the leaf (CA serial starts at 2).
+    // Revoke the leaf by the serial `ca issue` reported.
+    let serial_arg = leaf_serial.to_string();
     assert!(
         run(
             &[
@@ -477,7 +505,7 @@ fn ca_subcommand_full_flow() {
                 "-dir",
                 dir.to_str().unwrap(),
                 "-serial",
-                "2",
+                &serial_arg,
                 "-reason",
                 "key-compromise",
             ],
@@ -485,6 +513,38 @@ fn ca_subcommand_full_flow() {
         )
         .1,
         "ca revoke failed"
+    );
+
+    // A serial this CA never issued is refused (it would sit on the CRL
+    // forever), and revoking the same serial twice is a no-op rather than a
+    // duplicate CRL entry.
+    let (_o, _e, ok) = run_capture(
+        &[
+            "ca",
+            "revoke",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-serial",
+            "999999",
+        ],
+        b"",
+    );
+    assert!(!ok, "revoking a never-issued serial should fail");
+    let (dup_out, _e, ok) = run_capture(
+        &[
+            "ca",
+            "revoke",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-serial",
+            &serial_arg,
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert!(
+        dup_out.contains("already revoked"),
+        "duplicate revoke output: {dup_out}"
     );
 
     // Refresh the CRL.
@@ -509,8 +569,13 @@ fn ca_subcommand_full_flow() {
     let crl_pem = std::fs::read_to_string(dir.join("crl.pem")).unwrap();
     let crl = CertificateRevocationList::from_pem(&crl_pem).unwrap();
     assert!(
-        crl.is_revoked(&[2]).unwrap(),
-        "CRL should list serial 2 as revoked"
+        crl.is_revoked(&serial_be(leaf_serial)).unwrap(),
+        "CRL should list serial {leaf_serial} as revoked"
+    );
+    assert_eq!(
+        crl.entries().unwrap().len(),
+        1,
+        "the double revocation must not produce two CRL entries"
     );
     crl.verify_signature_with(&root_key)
         .expect("CRL signature should verify under the CA key");
@@ -523,6 +588,538 @@ fn ca_subcommand_full_flow() {
     assert!(show.contains("CN=Test CLI CA"), "show output: {show}");
     assert!(show.contains("Revoked:    1"), "show output: {show}");
     assert!(show.contains("CRL:        present"), "show output: {show}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Sets up a scratch CA plus a leaf key and its CSR. Returns the directory
+/// and a path helper. The CSR requests `DNS:www.google.com` — a name the
+/// requester plainly does not control — so the SAN-policy tests can check
+/// that it is not certified.
+fn ca_with_impersonating_csr(tag: &str) -> (std::path::PathBuf, impl Fn(&str) -> String) {
+    let dir = std::env::temp_dir().join(format!("pc_cli_{tag}_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let dir2 = dir.clone();
+    let p = move |name: &str| dir2.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &["ca", "init", "-dir", dir.to_str().unwrap(), "-cn", "SAN CA"],
+            b""
+        )
+        .1,
+        "ca init failed"
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey failed"
+    );
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=attacker.example",
+                "-addext",
+                "subjectAltName=DNS:www.google.com",
+                "-out",
+                &p("evil.csr"),
+            ],
+            b"",
+        )
+        .1,
+        "req failed"
+    );
+    // Sanity: the request really does ask for the name.
+    let (csr_text, ok) = run(&["req", "-in", &p("evil.csr")], b"");
+    assert!(ok && csr_text.contains("www.google.com"), "{csr_text}");
+    (dir, p)
+}
+
+/// C-2: a CSR-requested `subjectAltName` must NOT be certified. Signing a
+/// request for `DNS:www.google.com` used to hand back a chain-valid
+/// certificate for that name on all three paths (bare `ca sign-csr`, the
+/// templated one, and `x509 -req`).
+#[test]
+fn ca_sign_csr_ignores_csr_sans_without_opt_in() {
+    let (dir, p) = ca_with_impersonating_csr("sanpolicy");
+
+    let csr = p("evil.csr");
+    for (tag, extra) in [("bare", vec![]), ("tmpl", vec!["-template", "tls-server"])] {
+        let out = p(&format!("{tag}.crt"));
+        let mut args = vec![
+            "ca",
+            "sign-csr",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-in",
+            &csr,
+            "-out",
+            &out,
+        ];
+        args.extend(extra);
+        let (_o, err, ok) = run_capture(&args, b"");
+        assert!(ok, "{tag}: ca sign-csr failed: {err}");
+        assert!(
+            err.contains("ignoring"),
+            "{tag}: expected a note about the dropped SAN, got: {err}"
+        );
+        let (text, ok) = run(&["x509", "-in", &out, "-text", "-ext"], b"");
+        assert!(ok, "{tag}: {text}");
+        assert!(
+            !text.contains("www.google.com"),
+            "{tag}: the CA certified a SAN the CSR merely asked for:\n{text}"
+        );
+    }
+
+    // ...and the explicit opt-in still works, with a loud warning.
+    let out = p("optin.crt");
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-in",
+            &p("evil.csr"),
+            "-copy-csr-san",
+            "-out",
+            &out,
+        ],
+        b"",
+    );
+    assert!(ok, "opt-in sign failed: {err}");
+    assert!(err.contains("WARNING"), "expected a warning, got: {err}");
+    let (text, ok) = run(&["x509", "-in", &out, "-text"], b"");
+    assert!(ok && text.contains("www.google.com"), "{text}");
+
+    // An operator-supplied `-san` is certified without any opt-in: those
+    // names are the CA's own assertion, not the requester's claim.
+    let out = p("explicit.crt");
+    assert!(
+        run(
+            &[
+                "ca",
+                "sign-csr",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-in",
+                &p("evil.csr"),
+                "-san",
+                "vetted.example",
+                "-out",
+                &out,
+            ],
+            b"",
+        )
+        .1
+    );
+    let (text, ok) = run(&["x509", "-in", &out, "-text"], b"");
+    assert!(ok, "{text}");
+    assert!(text.contains("vetted.example"), "{text}");
+    assert!(!text.contains("www.google.com"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-2, third path: `x509 -req` has the same policy.
+#[test]
+fn x509_req_ignores_csr_sans_without_opt_in() {
+    let (dir, p) = ca_with_impersonating_csr("sanpolicy_x509");
+
+    let out = p("leaf.crt");
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            &p("evil.csr"),
+            "-CA",
+            &p("root.crt"),
+            "-CAkey",
+            &p("root.key"),
+            "-out",
+            &out,
+        ],
+        b"",
+    );
+    assert!(ok, "x509 -req failed: {err}");
+    let (text, ok) = run(&["x509", "-in", &out, "-text", "-ext"], b"");
+    assert!(ok, "{text}");
+    assert!(
+        !text.contains("www.google.com"),
+        "x509 -req certified a CSR-requested SAN:\n{text}"
+    );
+
+    let out = p("optin.crt");
+    let (_o, _err, ok) = run_capture(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            &p("evil.csr"),
+            "-CA",
+            &p("root.crt"),
+            "-CAkey",
+            &p("root.key"),
+            "-copy-csr-san",
+            "-out",
+            &out,
+        ],
+        b"",
+    );
+    assert!(ok);
+    let (text, ok) = run(&["x509", "-in", &out, "-text"], b"");
+    assert!(ok && text.contains("www.google.com"), "{text}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-3: `x509 -req -ca` used to emit `basicConstraints{CA:true}` and nothing
+/// else — an unconstrained sub-CA that could sign further CAs for any name,
+/// with no keyUsage to stop it being used for anything at all.
+#[test]
+fn x509_req_ca_emits_constrained_sub_ca() {
+    let (dir, p) = ca_with_impersonating_csr("subca");
+
+    let out = p("sub.crt");
+    assert!(
+        run(
+            &[
+                "x509",
+                "-req",
+                "-ca",
+                "-in",
+                &p("evil.csr"),
+                "-CA",
+                &p("root.crt"),
+                "-CAkey",
+                &p("root.key"),
+                "-out",
+                &out,
+            ],
+            b"",
+        )
+        .1,
+        "x509 -req -ca failed"
+    );
+    let (text, ok) = run(&["x509", "-in", &out, "-text", "-ext"], b"");
+    assert!(ok, "{text}");
+    assert!(text.contains("CA: true"), "not a CA cert:\n{text}");
+    assert!(
+        text.contains("pathLen present"),
+        "sub-CA has no pathLenConstraint:\n{text}"
+    );
+    assert!(
+        text.contains("keyCertSign") && text.contains("cRLSign"),
+        "sub-CA has no keyUsage:\n{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-1: certificate serials must be unpredictable, not a sequential counter
+/// (CA/Browser Forum BR 7.1 wants >= 64 bits of CSPRNG output). Two
+/// issuances from the same CA must differ and must be large — the exact
+/// 64-bit range is asserted rigorously by `pki::tests::
+/// random_serial_has_full_64_bits_of_entropy`, which can sample the
+/// generator directly.
+#[test]
+fn ca_serials_are_random_not_sequential() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_serial_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Serial CA"
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key"),
+            ],
+            b"",
+        )
+        .1
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+
+    let mut serials = Vec::new();
+    for i in 0..4 {
+        let out = p(&format!("leaf{i}.crt"));
+        let (_o, err, ok) = run_capture(
+            &[
+                "ca",
+                "issue",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-pubkey",
+                &p("leaf.pub"),
+                "-cn",
+                "host.example",
+                "-out",
+                &out,
+            ],
+            b"",
+        );
+        assert!(ok, "ca issue failed: {err}");
+        serials.push(issued_serial(&err));
+    }
+
+    // Distinct, and nothing like the old 01 02 03 04.
+    for (i, s) in serials.iter().enumerate() {
+        assert!(
+            !serials[..i].contains(s),
+            "duplicate serial {s} in {serials:?}"
+        );
+        // A 40-bit floor: a uniform 64-bit draw lands below this with
+        // probability 2^-24, so this is not a flaky assertion, and a
+        // sequential counter fails it every time.
+        assert!(
+            *s > 1 << 40,
+            "serial {s} is far too small to be 64 random bits: {serials:?}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-4: an undersized RSA key in a submitted CSR must be refused before
+/// anything is signed. `verify_self_signed` deliberately applies no
+/// key-size or digest-strength policy, so the CLI has to.
+#[test]
+fn ca_sign_csr_rejects_undersized_rsa_key() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_weakrsa_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "ca",
+                "init",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-cn",
+                "Policy CA"
+            ],
+            b""
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-bits",
+                "1024",
+                "--allow-weak",
+                "-out",
+                &p("weak.key"),
+            ],
+            b"",
+        )
+        .1,
+        "genpkey RSA-1024 failed"
+    );
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("weak.key"),
+                "-subj",
+                "/CN=weak.example",
+                "-out",
+                &p("weak.csr"),
+            ],
+            b"",
+        )
+        .1,
+        "req failed"
+    );
+
+    let weak_csr = p("weak.csr");
+    let weak_crt = p("weak.crt");
+    for extra in [vec![], vec!["-template", "tls-server"]] {
+        let mut args = vec![
+            "ca",
+            "sign-csr",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-in",
+            &weak_csr,
+            "-out",
+            &weak_crt,
+        ];
+        args.extend(extra);
+        let (_o, err, ok) = run_capture(&args, b"");
+        assert!(!ok, "a 1024-bit RSA CSR must be rejected");
+        assert!(
+            err.contains("1024-bit RSA") && err.contains("2048"),
+            "expected a key-size diagnostic, got: {err}"
+        );
+        assert!(!std::path::Path::new(&p("weak.crt")).exists());
+    }
+
+    // `x509 -req` shares the policy.
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            &p("weak.csr"),
+            "-CA",
+            &p("root.crt"),
+            "-CAkey",
+            &p("root.key"),
+            "-out",
+            &p("weak2.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "x509 -req must apply the same key-size policy");
+    assert!(err.contains("1024-bit RSA"), "{err}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-5: a template file that is nothing but `[` characters must produce a
+/// clean parse error, not a stack-overflow abort (exit 134). The parser
+/// itself is regression-tested in-process by
+/// `toml::tests::deeply_nested_arrays_error_instead_of_overflowing`; this
+/// checks the whole binary survives the same input.
+#[test]
+fn deeply_nested_template_file_does_not_crash_the_cli() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_deeptmpl_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    let bomb = format!("name = \"x\"\nbogus = {}\n", "[".repeat(20_000));
+    std::fs::write(p("bomb.toml"), bomb).unwrap();
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("k.pem"),
+            ],
+            b"",
+        )
+        .1
+    );
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "req",
+            "-key",
+            &p("k.pem"),
+            "-subj",
+            "/CN=x",
+            "-template-file",
+            &p("bomb.toml"),
+            "-out",
+            &p("x.csr"),
+        ],
+        b"",
+    );
+    assert!(!ok, "the bomb template should be rejected");
+    assert!(
+        err.contains("TOML error"),
+        "expected a parse error, got: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn rand_out_file_is_not_world_readable() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_cli_randmode_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    for (name, args) in [
+        ("hex.key", vec!["rand", "32"]),
+        ("bin.key", vec!["rand", "32", "--binary"]),
+    ] {
+        let out = p(name);
+        let mut argv = args.clone();
+        argv.push("-out");
+        argv.push(&out);
+        assert!(run(&argv, b"").1, "rand -out failed");
+        let mode = std::fs::metadata(&out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{name}: expected 0o600, got {mode:o}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// C-6: the CA state files must not be written through a pre-planted
+/// symlink. `ca init` creates each one with `create_new`, which the kernel
+/// refuses when a link (dangling or not) already sits at the path.
+#[cfg(unix)]
+#[test]
+fn ca_init_refuses_to_write_through_a_symlink() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_symlink_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let target = dir.join("victim.txt");
+    std::fs::write(&target, "important\n").unwrap();
+
+    let ca = dir.join("ca");
+    std::fs::create_dir_all(&ca).unwrap();
+    std::os::unix::fs::symlink(&target, ca.join("serial")).unwrap();
+
+    let (_o, err, ok) = run_capture(&["ca", "init", "-dir", ca.to_str().unwrap()], b"");
+    assert!(!ok, "ca init should refuse the pre-planted symlink: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "important\n",
+        "ca init overwrote the symlink target"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -3001,24 +3598,23 @@ fn crl_inspect_verify_serial() {
     let (pub_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
     assert!(ok);
     std::fs::write(dir.join("leaf.pub"), pub_pem).unwrap();
-    assert!(
-        run(
-            &[
-                "ca",
-                "issue",
-                "-dir",
-                dir.to_str().unwrap(),
-                "-pubkey",
-                &p("leaf.pub"),
-                "-cn",
-                "leaf.test",
-                "-out",
-                &p("leaf.crt"),
-            ],
-            b"",
-        )
-        .1
+    let (_out, issue_err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "leaf.test",
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
     );
+    assert!(ok, "ca issue failed: {issue_err}");
+    let leaf_serial = issued_serial(&issue_err).to_string();
     assert!(
         run(
             &[
@@ -3027,7 +3623,7 @@ fn crl_inspect_verify_serial() {
                 "-dir",
                 dir.to_str().unwrap(),
                 "-serial",
-                "2",
+                &leaf_serial,
                 "-reason",
                 "key-compromise",
             ],
@@ -3071,9 +3667,16 @@ fn crl_inspect_verify_serial() {
     assert!(ok, "{vout}");
     assert!(vout.contains("verify OK"), "{vout}");
 
-    // -is-revoked: serial 2 → revoked, serial 999 → not.
+    // -is-revoked: the issued serial → revoked, serial 999 → not.
     let (_o, ok) = run(
-        &["crl", "-in", &p("ca.crl"), "-serial", "2", "-is-revoked"],
+        &[
+            "crl",
+            "-in",
+            &p("ca.crl"),
+            "-serial",
+            &leaf_serial,
+            "-is-revoked",
+        ],
         b"",
     );
     assert!(ok);
