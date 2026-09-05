@@ -54,11 +54,25 @@ pub(crate) fn parse(input: &str) -> Result<TomlTable, TomlError> {
     parser.parse_document()
 }
 
+/// Maximum `[` nesting the value parser will follow before erroring out.
+///
+/// `parse_value` → `parse_array` → `parse_value` is mutually recursive with
+/// one stack frame per `[`, so an input of nothing but `[` characters used to
+/// exhaust the stack and abort the process (`fatal runtime error: stack
+/// overflow`, exit 134) — reachable through `ca issue`, `ca sign-csr` and
+/// `req -template-file` with any attacker-supplied template. The limit is
+/// checked *before* recursing. Templates never nest arrays at all (the array
+/// parser rejects a nested array outright), so anything under this ceiling is
+/// far more than legitimate input needs.
+const MAX_VALUE_DEPTH: usize = 32;
+
 struct Parser<'a> {
     src: &'a str,
     bytes: &'a [u8],
     pos: usize,
     line: usize,
+    /// Current `parse_value` recursion depth; see [`MAX_VALUE_DEPTH`].
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -68,6 +82,7 @@ impl<'a> Parser<'a> {
             bytes: src.as_bytes(),
             pos: 0,
             line: 1,
+            depth: 0,
         }
     }
 
@@ -273,23 +288,58 @@ impl<'a> Parser<'a> {
                             self.pos += 1;
                         }
                         Some(b'x') => {
-                            // \xHH — two hex digits.
+                            // \xHH — two hex digits, one Unicode scalar in
+                            // U+0000..=U+00FF (re-encoded as UTF-8 on push).
                             self.pos += 1;
-                            let h1 = self.expect_hex_digit()?;
-                            let h2 = self.expect_hex_digit()?;
-                            out.push(((h1 << 4) | h2) as char);
+                            let h1 = self.expect_hex_digit()? as u32;
+                            let h2 = self.expect_hex_digit()? as u32;
+                            out.push(char::from_u32((h1 << 4) | h2).expect("U+0000..=U+00FF"));
+                        }
+                        Some(b'u') => {
+                            self.pos += 1;
+                            let c = self.read_unicode_escape(4)?;
+                            out.push(c);
+                        }
+                        Some(b'U') => {
+                            self.pos += 1;
+                            let c = self.read_unicode_escape(8)?;
+                            out.push(c);
                         }
                         Some(other) => {
                             return self.err(format!("unknown escape '\\{}'", other as char));
                         }
                     }
                 }
-                Some(b) => {
-                    // Multi-byte UTF-8 sequences pass through unchanged.
-                    out.push(b as char);
-                    self.pos += 1;
+                Some(_) => {
+                    // Decode one whole UTF-8 scalar. `self.src` is a `&str`,
+                    // so slicing at `self.pos` (always a char boundary here:
+                    // every other arm advances by whole ASCII bytes or whole
+                    // characters) yields well-formed UTF-8 and `chars().next()`
+                    // gives the real character. Pushing the raw *byte* instead
+                    // would decode the input as Latin-1 and silently turn
+                    // "héllo" into a different string in the certificate.
+                    let Some(c) = self.src[self.pos..].chars().next() else {
+                        return self.err("unterminated string");
+                    };
+                    out.push(c);
+                    self.pos += c.len_utf8();
                 }
             }
+        }
+    }
+
+    /// Reads the `n` hex digits of a `\uXXXX` / `\UXXXXXXXX` escape and turns
+    /// them into one Unicode scalar (rejecting surrogates and out-of-range
+    /// code points, which `char::from_u32` screens for us). The result is
+    /// pushed as a `char`, i.e. re-encoded as UTF-8 — never as a raw byte.
+    fn read_unicode_escape(&mut self, n: usize) -> Result<char, TomlError> {
+        let mut v: u32 = 0;
+        for _ in 0..n {
+            v = (v << 4) | self.expect_hex_digit()? as u32;
+        }
+        match char::from_u32(v) {
+            Some(c) => Ok(c),
+            None => self.err(format!("\\u escape is not a Unicode scalar value: {v:#x}")),
         }
     }
 
@@ -367,7 +417,23 @@ impl<'a> Parser<'a> {
 
     fn parse_array(&mut self) -> Result<TomlValue, TomlError> {
         debug_assert_eq!(self.peek(), Some(b'['));
-        self.pos += 1;
+        // Bound the recursion BEFORE descending. The "nested arrays are not
+        // supported" check further down only runs once the inner
+        // `parse_value` has already returned, which is far too late to save
+        // the stack. See [`MAX_VALUE_DEPTH`].
+        if self.depth >= MAX_VALUE_DEPTH {
+            return self.err(format!(
+                "value nesting deeper than {MAX_VALUE_DEPTH} levels"
+            ));
+        }
+        self.depth += 1;
+        let r = self.parse_array_inner();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_array_inner(&mut self) -> Result<TomlValue, TomlError> {
+        self.pos += 1; // '['
         let mut out: Vec<TomlValue> = Vec::new();
         let mut element_kind: Option<&'static str> = None;
         loop {
@@ -720,5 +786,52 @@ x = 1
         let a = r["a"].as_table().unwrap();
         assert_eq!(a["b"].as_int().unwrap(), 1);
         assert_eq!(a["c"].as_int().unwrap(), 2);
+    }
+
+    /// C-5: a deeply nested `[[[[...` value must come back as a parse error
+    /// rather than overflowing the stack. The recursion is bounded *before*
+    /// descending, so this runs in-process — a regression here aborts the
+    /// whole test binary (SIGSEGV), which is exactly the failure we are
+    /// guarding against in `ca issue` / `ca sign-csr` / `req -template-file`.
+    #[test]
+    fn deeply_nested_arrays_error_instead_of_overflowing() {
+        for n in [MAX_VALUE_DEPTH + 1, 1_000, 20_000] {
+            let src = format!("a = {}", "[".repeat(n));
+            let err = parse(&src).expect_err("deep nesting must be rejected");
+            assert!(
+                err.message.contains("nesting"),
+                "expected a nesting-depth diagnostic, got: {err}"
+            );
+        }
+    }
+
+    /// The depth limit must not reject legitimate (flat) arrays, and a
+    /// two-level array is still refused by the nested-array rule.
+    #[test]
+    fn flat_arrays_still_parse_under_the_depth_limit() {
+        let r = t("a = [\"x\", \"y\"]\n");
+        assert_eq!(r["a"].as_array().unwrap().len(), 2);
+        assert!(parse("a = [[1]]").is_err());
+    }
+
+    /// C-8.5: basic strings are UTF-8, not Latin-1. Decoding byte-by-byte
+    /// turned "héllo" into "hÃ©llo" — a *different* string, silently baked
+    /// into the certificate subject/SAN a template supplies.
+    #[test]
+    fn basic_strings_decode_as_utf8() {
+        let r = t("a = \"héllo\"\nb = \"日本\"\nc = \"emoji 🔐\"\n");
+        assert_eq!(r["a"].as_str().unwrap(), "héllo");
+        assert_eq!(r["b"].as_str().unwrap(), "日本");
+        assert_eq!(r["c"].as_str().unwrap(), "emoji 🔐");
+    }
+
+    /// `\uXXXX` / `\UXXXXXXXX` escapes produce real Unicode scalars.
+    #[test]
+    fn unicode_escapes_decode_to_scalars() {
+        let r = t("a = \"\\u00e9\"\nb = \"\\U0001F510\"\n");
+        assert_eq!(r["a"].as_str().unwrap(), "é");
+        assert_eq!(r["b"].as_str().unwrap(), "🔐");
+        // Surrogates are not scalar values and must be rejected.
+        assert!(parse("a = \"\\ud800\"").is_err());
     }
 }
