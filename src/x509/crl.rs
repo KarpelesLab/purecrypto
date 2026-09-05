@@ -51,9 +51,10 @@ const OID_CRL_NUMBER: &[u64] = &[2, 5, 29, 20];
 /// critical (RFC 5280 §5.2.4). We do not implement delta-CRL processing, so a
 /// CRL bearing it MUST be rejected rather than silently treated as a base CRL.
 const OID_DELTA_CRL_INDICATOR: &[u64] = &[2, 5, 29, 27];
-/// `id-ce-issuingDistributionPoint` (2.5.29.28) — critical scoping extension
-/// (RFC 5280 §5.2.5). Recognized; see [`CertificateRevocationList::validate_extensions`]
-/// for the (conservative) handling.
+/// `id-ce-issuingDistributionPoint` (2.5.29.28) — scoping extension
+/// (RFC 5280 §5.2.5). Recognized but not evaluated, so a CRL bearing one is
+/// refused regardless of its critical bit; see
+/// [`CertificateRevocationList::validate_extensions`] for the reasoning.
 const OID_ISSUING_DISTRIBUTION_POINT: &[u64] = &[2, 5, 29, 28];
 
 /// `id-ce-authorityKeyIdentifier` (2.5.29.35) — non-critical (RFC 5280 §5.2.1).
@@ -502,10 +503,11 @@ impl CertificateRevocationList {
     /// * `deltaCRLIndicator` (2.5.29.27) is refused outright: this crate does
     ///   not implement delta-CRL processing, so applying a delta CRL as if it
     ///   were a base CRL would mis-state revocation status.
-    /// * A critical `issuingDistributionPoint` (2.5.29.28) is refused: the CRL
-    ///   validator treats a CRL as covering everything its issuer signed, but a
-    ///   critical IDP narrows that scope in ways we do not evaluate — honouring
-    ///   the CRL anyway risks reporting a revoked certificate as good.
+    /// * An `issuingDistributionPoint` (2.5.29.28) is refused whether or not
+    ///   it is marked critical: the CRL validator treats a CRL as covering
+    ///   everything its issuer signed, but an IDP narrows that scope in ways
+    ///   we do not evaluate — honouring the CRL anyway risks reporting a
+    ///   revoked certificate as good.
     /// * `cRLNumber` (2.5.29.20) and `authorityKeyIdentifier` (2.5.29.35) are
     ///   recognized; per RFC 5280 they MUST be non-critical, so a critical
     ///   instance is rejected.
@@ -547,11 +549,17 @@ impl CertificateRevocationList {
                 // critical flag (the RFC requires it to be critical anyway).
                 return Err(Error::UnsupportedAlgorithm);
             } else if id == OID_ISSUING_DISTRIBUTION_POINT {
-                // We do not evaluate the IDP scoping fields; a critical IDP
-                // must therefore be rejected (fail closed).
-                if critical {
-                    return Err(Error::UnsupportedAlgorithm);
-                }
+                // We do not evaluate the IDP scoping fields (onlySomeReasons,
+                // onlyContainsUserCerts / onlyContainsCACerts, indirectCRL),
+                // so we cannot know what this CRL actually covers — yet the
+                // validator treats a CRL as authoritative for everything its
+                // issuer signed. A non-critical IDP is just as scope-narrowing
+                // as a critical one: honouring a CRL scoped
+                // `onlyContainsCACerts` as if it covered end-entity certs
+                // turns a legitimately absent serial into "not revoked".
+                // Refuse regardless of the critical bit, exactly like
+                // `deltaCRLIndicator` above.
+                return Err(Error::UnsupportedAlgorithm);
             } else if id == OID_CRL_NUMBER || id == OID_AUTHORITY_KEY_IDENTIFIER {
                 // Recognized informational extensions. RFC 5280 mandates these
                 // be non-critical; a critical instance is malformed.
@@ -995,6 +1003,22 @@ mod tests {
         // A critical IDP narrows scope in ways we don't evaluate → fail closed.
         let idp = encode_sequence(&[]); // empty IssuingDistributionPoint SEQUENCE
         let der = crl_der_with_extensions(&ext(&[2, 5, 29, 28], true, &idp));
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    /// LOW: a **non-critical** IDP is just as scope-narrowing as a critical
+    /// one. A CRL scoped `onlyContainsCACerts` legitimately omits revoked
+    /// end-entity serials; treating it as authoritative for everything its
+    /// issuer signed turns that absence into "not revoked" — an
+    /// under-revocation the operator believed they had covered.
+    #[test]
+    fn rejects_noncritical_issuing_distribution_point() {
+        // IssuingDistributionPoint { onlyContainsCACerts [2] BOOLEAN TRUE }.
+        let idp = encode_sequence(&encode_tlv(tag::context(2), &[0xff]));
+        let der = crl_der_with_extensions(&ext(&[2, 5, 29, 28], false, &idp));
         assert!(matches!(
             CertificateRevocationList::from_der(der),
             Err(Error::UnsupportedAlgorithm)
