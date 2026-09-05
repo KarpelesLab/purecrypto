@@ -122,9 +122,20 @@ impl AsconAead128 {
 
     /// Verifies `tag` and, only if it matches, decrypts `buffer` in place.
     ///
-    /// The tag is checked in constant time. On mismatch the ciphertext is
-    /// **left untouched** (no unauthenticated plaintext is produced) and
-    /// [`TagMismatch`] is returned.
+    /// The tag is checked in constant time. On mismatch [`TagMismatch`] is
+    /// returned and `buffer` holds the original ciphertext on return: Ascon's
+    /// duplex construction cannot verify before it decrypts, so the full
+    /// blocks are decrypted in place first and a second pass re-encrypts them
+    /// when the tag turns out to be wrong. The plaintext tail is never written
+    /// unless the tag matched.
+    ///
+    /// The consequence is that unauthenticated plaintext genuinely exists in
+    /// `buffer` between those two passes. That is invisible to a caller that
+    /// owns the buffer, but it is observable — and therefore a real leak — if
+    /// `buffer` aliases memory another party can read concurrently (a
+    /// `MAP_SHARED` mapping, an `io_uring`/DMA region), and the restoring pass
+    /// does not run if a panic unwinds between them. Decrypt into private
+    /// memory and copy out after `Ok`.
     pub fn decrypt(
         &self,
         nonce: &[u8; 16],
@@ -135,8 +146,11 @@ impl AsconAead128 {
         let mut s = self.init(nonce);
         Self::absorb_ad(&mut s, aad);
 
-        // Decrypt into a scratch copy so the input buffer is untouched until the
-        // tag is verified. `n` full blocks plus one (possibly empty) partial.
+        // `n` full blocks plus one (possibly empty) partial. The full blocks
+        // are decrypted *in place* — the duplex state needs each ciphertext
+        // block absorbed before the next — and re-encrypted below if the tag
+        // turns out to be wrong; only the partial tail is held back in
+        // `plain` until after the check. See the doc comment above.
         let full = buffer.len() / RATE * RATE;
         let mut plain = [0u8; RATE];
 
@@ -173,7 +187,7 @@ impl AsconAead128 {
         s.0[1] = u64::from_le_bytes(rate_bytes[8..16].try_into().unwrap());
 
         let expected = self.finalize(&mut s);
-        if bool::from(expected.ct_eq(tag)) {
+        let result = if bool::from(expected.ct_eq(tag)) {
             // Authentic: commit the recovered plaintext tail.
             buffer[full..full + rem_len].copy_from_slice(&plain[..rem_len]);
             Ok(())
@@ -197,7 +211,15 @@ impl AsconAead128 {
                 k += RATE;
             }
             Err(TagMismatch)
-        }
+        };
+        // `plain` held the last recovered (and, on failure, unauthenticated)
+        // plaintext block and `rate_bytes` the squeezed rate; neither belongs
+        // in the caller's stack frame after the call.
+        plain = [0u8; RATE];
+        rate_bytes = [0u8; RATE];
+        let _ = core::hint::black_box(&plain);
+        let _ = core::hint::black_box(&rate_bytes);
+        result
     }
 }
 
