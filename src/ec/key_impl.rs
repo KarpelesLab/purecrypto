@@ -359,7 +359,9 @@ fn curve_alg(curve: CurveId) -> Algorithm {
 /// The curves whose boxed ECDSA / ECDH operations are supported here.
 fn ecdsa_alg(curve: CurveId) -> Option<Algorithm> {
     match curve {
-        CurveId::P256 | CurveId::P384 | CurveId::P521 | CurveId::Secp256k1 => Some(curve_alg(curve)),
+        CurveId::P256 | CurveId::P384 | CurveId::P521 | CurveId::Secp256k1 => {
+            Some(curve_alg(curve))
+        }
         _ => None,
     }
 }
