@@ -18,6 +18,17 @@
 //!
 //! Sectors must be at least 16 bytes (one full block); if their length is not
 //! a multiple of 16, ciphertext stealing is used on the trailing partial block.
+//!
+//! # Limits
+//!
+//! * IEEE 1619-2007 §5.1 and NIST SP 800-38E cap a **data unit** (a "sector"
+//!   here) at 2²⁰ blocks — 16 MiB. Beyond that the α-power sequence starts to
+//!   give distinguishing advantage, so a caller must split larger objects into
+//!   independently-tweaked data units rather than passing one giant `buf`.
+//!   This is not enforced: `encrypt_sector` will happily process more.
+//! * The data key and the tweak key must be **independent**. Reusing one key
+//!   for both collapses the XEX construction; [`Xts::new`] takes two already
+//!   keyed ciphers and so cannot check it.
 
 use super::{BlockCipher, InvalidLength};
 
@@ -47,9 +58,19 @@ pub struct Xts<C: BlockCipher> {
 }
 
 impl<C: BlockCipher> Xts<C> {
-    /// Creates an XTS context from two pre-keyed block ciphers. The two keys
-    /// must be independent; XTS-AES-128 has total key length 256 bits
-    /// (two 128-bit AES keys), XTS-AES-256 has 512 bits.
+    /// Creates an XTS context from two pre-keyed block ciphers. XTS-AES-128 has
+    /// total key length 256 bits (two 128-bit AES keys), XTS-AES-256 has 512
+    /// bits.
+    ///
+    /// **K1 and K2 must be independent.** With `K1 == K2` the XEX construction
+    /// degenerates (the tweak is then a function of the same permutation that
+    /// encrypts the data) and the mode loses its security argument; FIPS 140
+    /// implementation guidance requires implementations to reject it outright.
+    /// This constructor takes two *already keyed* ciphers, which expose no key
+    /// material, so it cannot check the condition — the caller must. Note that
+    /// IEEE 1619-2007 Annex B vector 1 deliberately violates it (both keys all
+    /// zero) purely to pin the arithmetic, which is why this is not a hard
+    /// reject here.
     pub fn new(cipher_data: C, cipher_tweak: C) -> Self {
         Self {
             cipher_data,
@@ -104,7 +125,7 @@ impl<C: BlockCipher> Xts<C> {
         // CC = XEX_T(P_{n-1})
         block.copy_from_slice(&buf[full_off..full_off + 16]);
         xex(&self.cipher_data, &mut block, &t, true);
-        let mut cc = block;
+        let cc = block;
 
         // Step the tweak by α: T → T'.
         double_tweak(&mut t);
@@ -120,7 +141,6 @@ impl<C: BlockCipher> Xts<C> {
         // Emit C_{n-1} = PP and C_partial = CC[..rem].
         buf[full_off..full_off + 16].copy_from_slice(&pp);
         // The trailing partial bytes get the truncated CC.
-        let _ = &mut cc; // silence unused-mut warnings on the slice borrow
         buf[full_off + 16..].copy_from_slice(&cc[..rem]);
 
         Ok(())

@@ -7,8 +7,18 @@
 //!
 //! The compression uses a fixed 256-byte substitution table (`PI`) plus a linear
 //! transform built at compile time from the published `A` constants. As with the
-//! other table-based hashes here, the lookups are not constant-time with respect
-//! to the (public) message bytes.
+//! other table-based hashes here, the lookups are not constant time: they are
+//! indexed by the state, so with an unkeyed digest they leak only the (public)
+//! message bytes.
+//!
+//! **Do not use this hash under [`Hmac`](crate::hash::Hmac).** The caveat above
+//! holds only while the state is a function of public data. `Hmac::new` seeds
+//! the state with `K' ^ ipad` / `K' ^ opad`, which makes every table index in
+//! the first compression a function of the *key*, so the lookups become
+//! secret-indexed and the cache-timing channel leaks key material. Nothing in
+//! the type system gates it — pick a constant-time digest (SHA-2, SHA-3,
+//! BLAKE2) for any keyed construction. The same applies to any other keyed use
+//! that puts secret material into the state.
 
 use super::Digest;
 

@@ -1,5 +1,17 @@
 //! HMAC — Hash-based Message Authentication Code (RFC 2104), generic over any
 //! [`Digest`].
+//!
+//! # Choose a constant-time digest
+//!
+//! `Hmac::new` seeds the hash state with `K' ^ ipad` / `K' ^ opad`, so the
+//! whole first compression is driven by the key. Under a table-driven digest —
+//! [`Md2`](super::Md2), [`Whirlpool`](super::Whirlpool),
+//! [`Streebog256`](super::Streebog256)/[`Streebog512`](super::Streebog512) —
+//! that turns the S-box lookups into *secret*-indexed table accesses, and the
+//! cache-timing channel those modules document as harmless for public message
+//! bytes then leaks key material instead. Nothing here gates it. Use a
+//! constant-time digest (SHA-2, SHA-3, BLAKE2) for HMAC; those three are for
+//! unkeyed interop hashing only.
 
 use super::{Digest, Mac};
 use crate::ct::{Choice, ConstantTimeEq};

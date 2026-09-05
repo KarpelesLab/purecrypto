@@ -14,10 +14,14 @@
 //! * **KW** (RFC 3394) — plaintext must be a whole number of 64-bit blocks,
 //!   `n ≥ 2`. Wrapped output is `n + 1` blocks. Integrity IV is
 //!   `0xA6A6A6A6A6A6A6A6`.
-//! * **KWP** (RFC 5649) — accepts any non-empty byte length (up to 2³²−1);
-//!   the plaintext is zero-padded to a multiple of 8 bytes and a length-aware
-//!   AIV `0xA659_59A6 ‖ len_u32_be` replaces the fixed IV. Wrapped output is
-//!   one block longer than the padded plaintext.
+//! * **KWP** (RFC 5649) — accepts any non-empty byte length; the plaintext is
+//!   zero-padded to a multiple of 8 bytes and a length-aware AIV
+//!   `0xA659_59A6 ‖ len_u32_be` replaces the fixed IV. Wrapped output is one
+//!   block longer than the padded plaintext. RFC 5649 allows up to 2³²−1
+//!   bytes, but [`AesKwp::wrap`]/[`AesKwp::unwrap`] here run on a 4096-byte
+//!   stack scratch buffer (no allocator) and return
+//!   [`KwError::InvalidLength`] above that — ample for key material, which is
+//!   all KWP is for.
 //!
 //! Both schemes use only the underlying [`BlockCipher`]'s `encrypt_block` /
 //! `decrypt_block`; no GF arithmetic. The final integrity check is performed

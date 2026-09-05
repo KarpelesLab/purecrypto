@@ -9,7 +9,17 @@
 //! table `C0` (the S-box composed with the MDS column), with the other seven
 //! tables obtained by byte rotation. The table is built at compile time from
 //! the S-box, so the module stays `no_std` and allocation-free. Lookups are not
-//! constant-time with respect to the (public) message bytes.
+//! constant time: they are indexed by the state, so with an unkeyed digest they
+//! leak only the (public) message bytes.
+//!
+//! **Do not use this hash under [`Hmac`](crate::hash::Hmac).** The caveat above
+//! holds only while the state is a function of public data. `Hmac::new` seeds
+//! the state with `K' ^ ipad` / `K' ^ opad`, which makes every table index in
+//! the first compression a function of the *key*, so the lookups become
+//! secret-indexed and the cache-timing channel leaks key material. Nothing in
+//! the type system gates it — pick a constant-time digest (SHA-2, SHA-3,
+//! BLAKE2) for any keyed construction. The same applies to any other keyed use
+//! that puts secret material into the state.
 
 use super::Digest;
 
