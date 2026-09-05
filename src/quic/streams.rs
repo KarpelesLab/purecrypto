@@ -50,6 +50,17 @@ use crate::tls::Error;
 const REPLENISH_RATIO_NUM: u64 = 1;
 const REPLENISH_RATIO_DEN: u64 = 2;
 
+/// Floor for the hard cap on how many streams may be alive in
+/// [`Streams::map`] at once (QUIC-A2). Peer-opened streams are already
+/// bounded by `self_max_bidi` / `self_max_uni`, and those limits now only
+/// advance as peer streams CLOSE (see
+/// [`Streams::maybe_replenish_streams`]), so a peer cannot inflate them.
+/// This is a belt-and-braces ceiling in case a future caller advertises an
+/// enormous `initial_max_streams_*`: the effective cap is the larger of
+/// this floor and what we ourselves advertised, so a conformant peer is
+/// never refused a stream it was authorized to open.
+const MIN_LIVE_STREAMS: usize = 4096;
+
 /// Frame produced by [`Streams::pop_frame`]. Owned so the packet packer
 /// can serialize it without juggling lifetimes against the borrow on
 /// the [`Streams`] map.
@@ -224,12 +235,24 @@ pub(crate) struct Streams {
     pub(crate) self_max_bidi_announced: u64,
     /// Most-recently-announced `self_max_uni`.
     pub(crate) self_max_uni_announced: u64,
-    /// Highest bidi stream the peer has actually opened. Used together
-    /// with `self_max_bidi_announced` to decide when to bump
-    /// `self_max_bidi` (RFC 9000 §4.6).
+    /// Highest bidi stream the peer has actually opened. Compared against
+    /// `self_max_bidi` to enforce STREAM_LIMIT (RFC 9000 §4.6).
     pub(crate) peer_bidi_used: u64,
     /// Highest uni stream the peer has actually opened.
     pub(crate) peer_uni_used: u64,
+    /// Peer-initiated bidi streams that have reached a terminal state and
+    /// been retired. Stream credit is anchored HERE, not on how many
+    /// streams the peer has opened — see [`Streams::maybe_replenish_streams`].
+    pub(crate) peer_bidi_closed: u64,
+    /// Peer-initiated uni streams that have been retired.
+    pub(crate) peer_uni_closed: u64,
+    /// Size of the bidi stream-credit window: the `initial_max_streams_bidi`
+    /// WE advertised. Fresh credit is granted as `peer_bidi_closed + window`,
+    /// so this stays FIXED for the connection's lifetime (unlike
+    /// `self_max_bidi_announced`, which grows and would compound).
+    pub(crate) self_max_bidi_window: u64,
+    /// Size of the uni stream-credit window. Same conventions.
+    pub(crate) self_max_uni_window: u64,
 
     /// Next bidi-stream ID this side will assign. Already includes the
     /// initiator + direction bit pattern.
@@ -348,6 +371,10 @@ impl Streams {
             self_max_uni_announced: our_params.initial_max_streams_uni.unwrap_or(0),
             peer_bidi_used: 0,
             peer_uni_used: 0,
+            peer_bidi_closed: 0,
+            peer_uni_closed: 0,
+            self_max_bidi_window: our_params.initial_max_streams_bidi.unwrap_or(0),
+            self_max_uni_window: our_params.initial_max_streams_uni.unwrap_or(0),
             next_local_bidi: next_bidi,
             next_local_uni: next_uni,
             opened_local_bidi: 0,
@@ -669,7 +696,21 @@ impl Streams {
         // those counters perturbed. This keeps the QUIC-3 audit fix
         // (conn-FC charged against the high-water mark, not contiguous
         // progress) but runs it strictly after stream admission.
-        self.ensure_remote_stream_exists(id)?;
+        if !self.ensure_remote_stream_exists(id)? {
+            // QUIC-A2: the stream reached a terminal state and was
+            // retired. Its final size is still recorded in
+            // `stream_high_offset`, so a late retransmit is discarded
+            // while a frame claiming bytes PAST the final size is still
+            // FINAL_SIZE_ERROR (RFC 9000 §4.5). No connection-level
+            // credit is charged: those bytes were charged (and returned)
+            // while the stream was live.
+            let end = offset.saturating_add(data.len() as u64);
+            let high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
+            if end > high {
+                return Err(Error::Decode);
+            }
+            return Ok(());
+        }
 
         // RFC 9000 §4.1 — connection-level flow control is charged
         // against the highest byte offset *ever observed* on each
@@ -728,6 +769,7 @@ impl Streams {
             self.maybe_replenish_conn();
         }
         self.refresh_readable(id);
+        self.reap_if_terminal(id);
         Ok(())
     }
 
@@ -757,7 +799,14 @@ impl Streams {
         app_error: u64,
         final_size: u64,
     ) -> Result<(), Error> {
-        self.ensure_remote_stream_exists(id)?;
+        if !self.ensure_remote_stream_exists(id)? {
+            // Retired stream (QUIC-A2): a duplicate or late RESET_STREAM
+            // for a stream that already reached a terminal state carries
+            // no new information. RFC 9000 §3.4 lets the receiver ignore
+            // it; the flow-control credit for those bytes was already
+            // charged and returned while the stream was live.
+            return Ok(());
+        }
         // RFC 9000 §4.5 — the declared final size counts against
         // connection-level flow control exactly like received bytes:
         // charge the delta above the stream's prior high offset.
@@ -802,6 +851,7 @@ impl Streams {
             self.maybe_replenish_conn();
         }
         self.refresh_readable(id);
+        self.reap_if_terminal(id);
         Ok(())
     }
 
@@ -819,7 +869,11 @@ impl Streams {
         // `map`). Mirror `on_reset` and lazily instantiate peer-initiated
         // streams; `ensure_remote_stream_exists` still rejects never-opened
         // locally-initiated ids as STREAM_STATE_ERROR (RFC 9000 §19.5).
-        self.ensure_remote_stream_exists(id)?;
+        if !self.ensure_remote_stream_exists(id)? {
+            // Retired stream (QUIC-A2): our send half is already finished,
+            // so there is nothing left to reset. Ignore.
+            return Ok(());
+        }
         let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.5: receiving STOP_SENDING for a receive-only stream
         // is a STREAM_STATE_ERROR.
@@ -857,7 +911,11 @@ impl Streams {
         // `on_reset`: lazily instantiate peer-initiated streams, while
         // `ensure_remote_stream_exists` keeps never-opened locally-initiated ids
         // a STREAM_STATE_ERROR (RFC 9000 §19.10).
-        self.ensure_remote_stream_exists(id)?;
+        if !self.ensure_remote_stream_exists(id)? {
+            // Retired stream (QUIC-A2): extra send credit for a finished
+            // send half is a no-op.
+            return Ok(());
+        }
         let stream = self.map.get_mut(&id).expect("just-ensured");
         // RFC 9000 §19.10: receiving MAX_STREAM_DATA on a recv-only
         // stream is a STREAM_STATE_ERROR.
@@ -938,6 +996,11 @@ impl Streams {
     pub(crate) fn read(&mut self, id: StreamId, into: &mut [u8]) -> Result<(usize, bool), Error> {
         let stream = self.map.get_mut(&id.0).ok_or(Error::InappropriateState)?;
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
+        // A read on a reset stream is the application observing the reset
+        // (RFC 9000 §3.2 `Reset Recvd` → `Reset Read`). Recording it lets
+        // the stream be retired — otherwise a peer could pin one stream
+        // slot per RESET_STREAM forever.
+        recv.ack_reset();
         let (copied, fin) = recv.read(into);
         // Track the per-stream cumulative connection-FC credit (L-3) so
         // the reset path credits only the not-yet-credited remainder.
@@ -961,6 +1024,7 @@ impl Streams {
         self.conn_consumed = self.conn_consumed.saturating_add(copied as u64);
         self.maybe_replenish_conn();
         self.refresh_readable(id.0);
+        self.reap_if_terminal(id.0);
         Ok((copied, fin))
     }
 
@@ -1283,6 +1347,7 @@ impl Streams {
         {
             send.on_range_acked(offset, len, fin);
         }
+        self.reap_if_terminal(id);
     }
 
     /// A packet carrying stream chunk `[offset, offset+len)` on stream
@@ -1335,10 +1400,6 @@ impl Streams {
         !self.ready_to_send.is_empty()
     }
 
-    /// When the connection observes a STREAM frame for stream `id` we
-    /// haven't seen before, materialize a recv-only or bidi entry. RFC
-    /// 9000 §3.2 — receiving the first STREAM frame implicitly opens the
-    /// stream.
     /// Guard for frames that target a local send half (STOP_SENDING,
     /// MAX_STREAM_DATA). A peer-initiated unidirectional stream has no local
     /// send half, so such a frame is a STREAM_STATE_ERROR (RFC 9000
@@ -1362,67 +1423,179 @@ impl Streams {
         Ok(())
     }
 
-    fn ensure_remote_stream_exists(&mut self, id: u64) -> Result<(), Error> {
+    /// True if `id` names a stream the PEER opens (as opposed to one we
+    /// open ourselves), per the initiator bit of RFC 9000 §2.1.
+    fn is_peer_initiated(&self, sid: StreamId) -> bool {
+        match self.role {
+            Role::Client => sid.is_server_initiated(),
+            Role::Server => sid.is_client_initiated(),
+        }
+    }
+
+    /// Effective ceiling on live entries in [`Self::map`] (QUIC-A2). The
+    /// larger of [`MIN_LIVE_STREAMS`] and the total stream count we
+    /// ourselves advertised, so a conformant peer is never refused a
+    /// stream it was authorized to open.
+    fn live_stream_cap(&self) -> usize {
+        let advertised = self
+            .self_max_bidi_window
+            .saturating_add(self.self_max_uni_window);
+        let advertised = usize::try_from(advertised).unwrap_or(usize::MAX);
+        advertised.max(MIN_LIVE_STREAMS)
+    }
+
+    /// Grants fresh peer stream credit, anchored on RETIRED streams.
+    ///
+    /// QUIC-A1: the previous version grew the limit by one window every
+    /// time the peer OPENED a stream, and read the window back out of the
+    /// (already grown) announced limit, so the value compounded without
+    /// bound — a peer could drive `self_max_*` to `u64::MAX` in a handful
+    /// of round trips and then panic the varint encoder with it. Credit is
+    /// now anchored exactly like the connection-level MAX_DATA credit in
+    /// [`Self::maybe_replenish_conn`]: on CONSUMPTION (here, stream
+    /// closure), against a FIXED window, and clamped to the largest legal
+    /// MAX_STREAMS value. That bounds the concurrently-live peer streams
+    /// at one window and bounds the announced limit at 2^60.
+    fn maybe_replenish_streams(&mut self, bidi: bool) {
+        let (window, closed, announced) = if bidi {
+            (
+                self.self_max_bidi_window,
+                self.peer_bidi_closed,
+                self.self_max_bidi_announced,
+            )
+        } else {
+            (
+                self.self_max_uni_window,
+                self.peer_uni_closed,
+                self.self_max_uni_announced,
+            )
+        };
+        if window == 0 {
+            return;
+        }
+        let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
+        if closed.saturating_add(threshold) <= announced {
+            return;
+        }
+        let new_max = closed
+            .saturating_add(window)
+            .min(crate::quic::frame::MAX_STREAMS_LIMIT);
+        if bidi {
+            if new_max > self.self_max_bidi {
+                self.self_max_bidi = new_max;
+                self.max_streams_bidi_pending = true;
+            }
+        } else if new_max > self.self_max_uni {
+            self.self_max_uni = new_max;
+            self.max_streams_uni_pending = true;
+        }
+    }
+
+    /// Retires `id` if both halves have reached a terminal state (QUIC-A2).
+    ///
+    /// Peer-opened streams used to live in [`Self::map`] forever, so a peer
+    /// could turn ~3 wire bytes into a permanent per-stream allocation. A
+    /// retired stream is dropped from `map`, `readable` and the ready
+    /// queue; its entry in [`Self::stream_high_offset`] is KEPT (and
+    /// force-created if absent) because that map is what tells a late frame
+    /// on a CLOSED stream apart from the first frame of a NEVER-OPENED one
+    /// — without it, retiring would let a peer resurrect a finished
+    /// stream and replay its bytes.
+    ///
+    /// Only peer-initiated streams are retired: a locally-opened id missing
+    /// from `map` is a STREAM_STATE_ERROR, and we must not turn a late
+    /// retransmit on one of our own finished streams into a
+    /// connection-fatal frame.
+    fn reap_if_terminal(&mut self, id: u64) {
+        let sid = StreamId(id);
+        if !self.is_peer_initiated(sid) {
+            return;
+        }
+        let Some(stream) = self.map.get(&id) else {
+            return;
+        };
+        if stream_needs_to_send(stream) {
+            return;
+        }
+        let recv_done = stream.recv.as_ref().is_none_or(|r| r.is_finished());
+        let send_done = stream.send.as_ref().is_none_or(|s| s.is_finished());
+        if !recv_done || !send_done {
+            return;
+        }
+        // Final size of the recv half, so a post-retirement retransmit can
+        // still be checked against it (RFC 9000 §4.5).
+        let high = stream
+            .recv
+            .as_ref()
+            .map(|r| r.fin_offset.unwrap_or(r.next_offset))
+            .unwrap_or(0);
+        let entry = self.stream_high_offset.entry(id).or_insert(0);
+        *entry = (*entry).max(high);
+        self.map.remove(&id);
+        self.readable.remove(&id);
+        if self.ready_set.remove(&id) {
+            self.ready_to_send.retain(|&q| q != id);
+        }
+        if sid.is_bidi() {
+            self.peer_bidi_closed = self.peer_bidi_closed.saturating_add(1);
+        } else {
+            self.peer_uni_closed = self.peer_uni_closed.saturating_add(1);
+        }
+        self.maybe_replenish_streams(sid.is_bidi());
+    }
+
+    /// Materializes the peer-initiated stream `id` if we have not seen it
+    /// before (RFC 9000 §3.2 — the first STREAM frame implicitly opens
+    /// the stream).
+    ///
+    /// Returns `Ok(true)` when `id` is live in [`Self::map`] afterwards and
+    /// `Ok(false)` when it names an ALREADY-RETIRED stream, in which case
+    /// the caller must ignore the frame rather than act on it.
+    fn ensure_remote_stream_exists(&mut self, id: u64) -> Result<bool, Error> {
         if self.map.contains_key(&id) {
-            return Ok(());
+            return Ok(true);
         }
         let sid = StreamId(id);
         // Streams we initiate can never first appear from the peer.
-        // Initiator bit of `id`: 0 → client, 1 → server.
-        let peer_initiated = match self.role {
-            Role::Client => sid.is_server_initiated(),
-            Role::Server => sid.is_client_initiated(),
-        };
-        if !peer_initiated {
+        // Initiator bit of `id`: 0 = client, 1 = server.
+        if !self.is_peer_initiated(sid) {
             // Peer is referencing a stream we should have opened — but
             // didn't. Per RFC 9000 §19.8 this is STREAM_STATE_ERROR.
             return Err(Error::Decode);
+        }
+        if self.stream_high_offset.contains_key(&id) {
+            // Retired by `reap_if_terminal`, not new.
+            return Ok(false);
+        }
+        // QUIC-A2 — hard ceiling on live stream state, independent of the
+        // per-direction stream limits below.
+        if self.map.len() >= self.live_stream_cap() {
+            return Err(Error::Decode); // STREAM_LIMIT_ERROR
         }
         // Stream-limit check (RFC 9000 §4.6).
         if sid.is_bidi() {
             // Stream number = (id - 1) / 4 + 1 for server-initiated bidi,
             // or id/4 + 1 for client-initiated bidi. We just compare the
             // count of streams the peer has opened.
-            self.peer_bidi_used = self.peer_bidi_used.max((id / 4) + 1);
-            if self.peer_bidi_used > self.self_max_bidi {
+            let used = self.peer_bidi_used.max((id / 4) + 1);
+            if used > self.self_max_bidi {
                 return Err(Error::Decode); // STREAM_LIMIT_ERROR
             }
+            self.peer_bidi_used = used;
             let peer_max_data = self.peer_initial_max_stream_data_bidi_local;
             let self_max_data = self.self_initial_max_stream_data_bidi_remote;
             self.map
                 .insert(id, Stream::new_bidi(sid, peer_max_data, self_max_data));
-            // Replenishment for self_max_bidi.
-            let window = self.self_max_bidi_announced;
-            if window > 0 {
-                let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
-                if self.peer_bidi_used + threshold > self.self_max_bidi_announced {
-                    self.self_max_bidi = self
-                        .self_max_bidi
-                        .saturating_add(window)
-                        .max(self.peer_bidi_used + window);
-                    self.max_streams_bidi_pending = true;
-                }
-            }
         } else {
-            self.peer_uni_used = self.peer_uni_used.max((id / 4) + 1);
-            if self.peer_uni_used > self.self_max_uni {
+            let used = self.peer_uni_used.max((id / 4) + 1);
+            if used > self.self_max_uni {
                 return Err(Error::Decode);
             }
+            self.peer_uni_used = used;
             let self_max_data = self.self_initial_max_stream_data_uni;
             self.map.insert(id, Stream::new_recv(sid, self_max_data));
-            let window = self.self_max_uni_announced;
-            if window > 0 {
-                let threshold = window * REPLENISH_RATIO_NUM / REPLENISH_RATIO_DEN.max(1);
-                if self.peer_uni_used + threshold > self.self_max_uni_announced {
-                    self.self_max_uni = self
-                        .self_max_uni
-                        .saturating_add(window)
-                        .max(self.peer_uni_used + window);
-                    self.max_streams_uni_pending = true;
-                }
-            }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -1465,6 +1638,158 @@ mod tests {
             initial_max_streams_uni: Some(max_streams),
             ..TransportParameters::default()
         }
+    }
+
+    /// QUIC-A1 regression: the peer must not be able to drive our
+    /// announced MAX_STREAMS limit past the RFC 9000 §19.11 ceiling of
+    /// 2^60. The old code grew `self_max_*` by a full window on every
+    /// stream the peer OPENED, read that window back out of the already
+    /// grown announced limit, and never clamped — so the value compounded
+    /// to `u64::MAX` within a handful of round trips, at which point
+    /// `varint::encode` (a release-mode `assert!` back then) aborted the
+    /// process while packing the MAX_STREAMS frame.
+    #[test]
+    fn max_streams_growth_stays_within_the_rfc_ceiling() {
+        let our = params_with(1 << 16, 1 << 24, 4);
+        let peer = params_with(1 << 16, 1 << 24, 4);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let mut buf = [0u8; 8];
+        let mut closed = 0u64;
+        for i in 0..500u64 {
+            // Client-initiated unidirectional ids: 2, 6, 10, ...
+            let id = i * 4 + 2;
+            if s.on_stream(id, 0, true, b"x").is_err() {
+                break;
+            }
+            let _ = s.read(StreamId(id), &mut buf);
+            closed += 1;
+            // The credit we would announce must always be encodable.
+            assert!(
+                s.self_max_uni <= crate::quic::frame::MAX_STREAMS_LIMIT,
+                "self_max_uni={} exceeds 2^60 after {closed} streams",
+                s.self_max_uni
+            );
+            let frame = PoppedFrame::MaxStreams {
+                dir: StreamDir::Uni,
+                limit: s.self_max_uni,
+            };
+            // 1 type byte + at most an 8-byte varint.
+            assert!(frame.encoded_len() <= 9);
+            // Drain the queued MAX_STREAMS so `_announced` tracks reality.
+            while s.pop_frame(64).is_some() {}
+        }
+        assert!(
+            closed >= 400,
+            "stream-credit replenishment stalled after {closed} streams"
+        );
+        // Growth is one stream per RETIRED stream, never a compounding
+        // multiple of the window.
+        assert!(
+            s.self_max_uni <= closed + 8,
+            "self_max_uni={}",
+            s.self_max_uni
+        );
+    }
+
+    /// QUIC-A1: the replenishment arithmetic clamps to the largest legal
+    /// MAX_STREAMS value instead of saturating at `u64::MAX`.
+    #[test]
+    fn stream_credit_is_clamped_to_the_max_streams_limit() {
+        let our = params_with(1 << 16, 1 << 24, 1 << 40);
+        let peer = params_with(1 << 16, 1 << 24, 1 << 40);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.peer_uni_closed = crate::quic::frame::MAX_STREAMS_LIMIT;
+        s.self_max_uni_announced = 0;
+        s.maybe_replenish_streams(false);
+        assert_eq!(s.self_max_uni, crate::quic::frame::MAX_STREAMS_LIMIT);
+        let frame = PoppedFrame::MaxStreams {
+            dir: StreamDir::Uni,
+            limit: s.self_max_uni,
+        };
+        assert_eq!(frame.encoded_len(), 9);
+
+        s.peer_bidi_closed = u64::MAX;
+        s.self_max_bidi_announced = 0;
+        s.maybe_replenish_streams(true);
+        assert_eq!(s.self_max_bidi, crate::quic::frame::MAX_STREAMS_LIMIT);
+    }
+
+    /// QUIC-A2 regression: a STREAM frame with `LEN=1, length=0, FIN=0`
+    /// charges no connection-level flow control (`end == 0`), yet each id
+    /// used to allocate a full `Stream` that was never freed *and* bumped
+    /// our MAX_STREAMS limit — roughly 3 wire bytes per permanent
+    /// allocation. Live peer-stream state must stay bounded by the stream
+    /// limit we ourselves advertised.
+    #[test]
+    fn zero_length_stream_flood_is_bounded_by_the_advertised_limit() {
+        let our = params_with(1 << 16, 1 << 20, 8);
+        let peer = params_with(1 << 16, 1 << 20, 8);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let mut opened = 0usize;
+        for i in 0..1000u64 {
+            // Client-initiated bidi ids: 0, 4, 8, ...
+            if s.on_stream(i * 4, 0, false, b"").is_err() {
+                break;
+            }
+            opened += 1;
+        }
+        assert!(
+            opened <= 8,
+            "peer opened {opened} streams against an advertised limit of 8"
+        );
+        assert!(s.map.len() <= 8, "map holds {} streams", s.map.len());
+        assert_eq!(
+            s.conn_recv_used, 0,
+            "zero-length frames must charge no connection credit"
+        );
+        // The limit was not inflated by merely opening streams.
+        assert_eq!(s.self_max_bidi, 8);
+    }
+
+    /// QUIC-A2: a peer stream that reaches a terminal state is dropped
+    /// from every per-stream structure, returns stream credit, and cannot
+    /// be resurrected by a late frame.
+    #[test]
+    fn completed_peer_stream_is_retired() {
+        let our = params_with(1 << 16, 1 << 20, 4);
+        let peer = params_with(1 << 16, 1 << 20, 4);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        // Client-initiated uni stream 2, two bytes with FIN.
+        s.on_stream(2, 0, true, b"hi").expect("stream");
+        assert_eq!(s.map.len(), 1);
+        let mut buf = [0u8; 8];
+        let (n, fin) = s.read(StreamId(2), &mut buf).expect("read");
+        assert_eq!((n, fin), (2, true));
+        assert!(s.map.is_empty(), "terminal stream not retired");
+        assert!(!s.readable.contains(&2));
+        assert_eq!(s.peer_uni_closed, 1);
+
+        // A late retransmit of the same bytes is ignored, not resurrected.
+        s.on_stream(2, 0, true, b"hi")
+            .expect("late retransmit ignored");
+        assert!(s.map.is_empty(), "retired stream was resurrected");
+        // A frame claiming bytes past the final size is FINAL_SIZE_ERROR.
+        assert!(s.on_stream(2, 0, false, b"hi!").is_err());
+        // A late RESET_STREAM / STOP_SENDING / MAX_STREAM_DATA is ignored.
+        s.on_reset(2, 1, 2).expect("late reset ignored");
+        assert!(s.map.is_empty());
+    }
+
+    /// QUIC-A2: RESET_STREAM must not pin a stream slot forever. Reading
+    /// the stream is the application observing the reset, after which the
+    /// stream retires and its credit comes back.
+    #[test]
+    fn reset_peer_stream_is_retired_once_observed() {
+        let our = params_with(1 << 16, 1 << 20, 4);
+        let peer = params_with(1 << 16, 1 << 20, 4);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(2, 0, false, b"hi").expect("stream");
+        s.on_reset(2, 7, 2).expect("reset");
+        assert_eq!(s.map.len(), 1);
+        let mut buf = [0u8; 8];
+        let _ = s.read(StreamId(2), &mut buf).expect("read");
+        assert!(s.map.is_empty(), "reset stream not retired");
+        assert_eq!(s.peer_uni_closed, 1);
     }
 
     #[test]

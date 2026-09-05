@@ -263,6 +263,29 @@ impl SendStream {
         };
         self.sent_chunks.retain(|c| !covered(c));
         self.rtx_queue.retain(|c| !covered(c));
+        // RFC 9000 §3.1 — once every carved byte and the FIN have been
+        // acknowledged the send half is in `Data Recvd`, a terminal state.
+        // Recording it lets `Streams` retire the stream's bookkeeping.
+        if self.fin_acked
+            && self.write_buf.is_empty()
+            && !self.has_unacked()
+            && !matches!(self.state, SendState::ResetSent | SendState::ResetRecvd)
+        {
+            self.state = SendState::DataRecvd;
+        }
+    }
+
+    /// True when the send half has no further work and never will: either
+    /// every byte plus the FIN has been acknowledged (`Data Recvd`), or a
+    /// RESET_STREAM has been emitted and nothing remains in flight
+    /// (`Reset Sent`/`Reset Recvd`). RFC 9000 §3.1.
+    pub(crate) fn is_finished(&self) -> bool {
+        if matches!(self.state, SendState::ResetSent | SendState::ResetRecvd) {
+            return !self.reset_pending && !self.has_unacked();
+        }
+        matches!(self.state, SendState::DataRecvd)
+            && self.write_buf.is_empty()
+            && !self.has_unacked()
     }
 
     /// The carrying packet of `[offset, offset + len)` was declared
@@ -776,6 +799,14 @@ impl RecvStream {
             self.state = RecvState::DataRead;
         }
         (copied, fin_seen)
+    }
+
+    /// True when the recv half has reached a terminal state (RFC 9000
+    /// §3.2 `Data Read` / `Reset Read`) and holds nothing the application
+    /// has yet to observe.
+    pub(crate) fn is_finished(&self) -> bool {
+        matches!(self.state, RecvState::DataRead | RecvState::ResetRead)
+            && self.delivered.is_empty()
     }
 
     /// Inbound RESET_STREAM (RFC 9000 §3.4). Transitions to ResetRecvd
