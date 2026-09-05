@@ -52,6 +52,17 @@ const KU_CRL_SIGN: u16 = 0x02;
 /// case at a few milliseconds of verification work.
 const MAX_CHAIN_LEN: usize = 10;
 
+/// Upper bound on the number of CRLs consulted for a single (certificate,
+/// issuer) pair. Each candidate CRL costs a public-key signature verification
+/// before any cheap filter can rule it out, and the candidate list is
+/// peer-controlled: a malicious TLS 1.3 server can staple hundreds of tiny
+/// CRLs sharing the leaf issuer's DN through the `CRL_RESPONSE` certificate-
+/// entry extension, multiplying by the chain length. Real deployments publish
+/// one CRL (occasionally a couple during a rollover) per issuer, so a low cap
+/// costs nothing and bounds the work at `MAX_CHAIN_LEN * MAX_CRLS_PER_ISSUER`
+/// verifications per handshake.
+const MAX_CRLS_PER_ISSUER: usize = 8;
+
 /// Verifies a certificate `chain` (end-entity first) against `store` and, on
 /// success, returns the end-entity (leaf) public key — the key whose possession
 /// the peer proves in its `CertificateVerify`.
@@ -329,6 +340,10 @@ fn verify_chain_inner(
 /// keyUsage *without* `cRLSign` cannot validly sign a CRL, so any matching
 /// CRL is skipped (fail closed, exactly as the invalid-signature path does)
 /// rather than being given the deciding vote.
+///
+/// At most [`MAX_CRLS_PER_ISSUER`] candidate CRLs reach the (expensive)
+/// signature verification; see that constant for why the peer-controlled
+/// candidate list must be bounded.
 fn check_revocation(
     cert: &Certificate,
     issuer_key: &AnyPublicKey,
@@ -340,6 +355,23 @@ fn check_revocation(
     let cert_issuer = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
     let serial = cert.serial_bytes().map_err(|_| Error::BadCertificate)?;
     let issuer_spki = issuer_key.to_spki_der();
+    // RFC 5280 §6.3.3: a key used to sign a CRL MUST assert `cRLSign` in its
+    // keyUsage extension when one is present. This is a property of the
+    // issuer alone, so evaluate it once: an issuer that cannot validly sign
+    // CRLs makes every candidate CRL inadmissible (fail closed, same as a
+    // forged-signature CRL) and there is nothing to verify.
+    if let Some(issuer) = issuer_cert
+        && let Some(mask) = issuer.key_usage().map_err(|_| Error::BadCertificate)?
+        && (mask & KU_CRL_SIGN) == 0
+    {
+        return Ok(());
+    }
+    // Budget for the expensive step (see `MAX_CRLS_PER_ISSUER`). Only CRLs
+    // that survive every cheap filter and reach the signature verification
+    // consume it, and the store lists locally configured CRLs before
+    // peer-stapled ones — so a peer cannot spend the budget to hide a CRL the
+    // relying party configured itself.
+    let mut verifications_left = MAX_CRLS_PER_ISSUER;
     for crl in crls.crls_with_issuer(cert_issuer) {
         // RFC 5280 §5.1.1.2: the CRL's `signatureAlgorithm` must be one we
         // accept under `policy` — the same whitelist that gates cert-chain
@@ -354,19 +386,17 @@ fn check_revocation(
         if !policy.permits(crl_algo, &issuer_spki) {
             continue;
         }
+        // Bound the peer-controlled public-key verification work. The
+        // signature check stays FIRST among the per-CRL work that can fail
+        // the chain, so the documented property above still holds: an
+        // attacker cannot make us reject a chain by injecting a CRL whose
+        // (unsigned, unauthenticated) body fails a later strict parse.
+        if verifications_left == 0 {
+            break;
+        }
+        verifications_left -= 1;
         // Skip CRLs not signed by this issuer.
         if crl.verify_signature_with(issuer_key).is_err() {
-            continue;
-        }
-        // RFC 5280 §6.3.3: a key used to sign a CRL MUST assert `cRLSign` in
-        // its keyUsage extension when one is present. An issuer cert that
-        // carries keyUsage without `cRLSign` cannot validly sign this CRL —
-        // skip it (fail closed, same as a forged-signature CRL) rather than
-        // honoring its revocation verdict.
-        if let Some(issuer) = issuer_cert
-            && let Some(mask) = issuer.key_usage().map_err(|_| Error::BadCertificate)?
-            && (mask & KU_CRL_SIGN) == 0
-        {
             continue;
         }
         // Skip CRLs that are not currently valid (advisory: stale CRL ≈ no CRL).
@@ -1513,35 +1543,6 @@ mod tests {
         assert!(verify_hostname(&email_cert, "login.bank.example").is_err());
     }
 
-    /// The name-constraint side of the SAN-presence rule must track
-    /// `verify_hostname`: an IP-only-SAN leaf has no dNSName for a dNSName
-    /// constraint to govern, and its CN is inert (never consulted for
-    /// hostname verification), so an excluded-only dNSName constraint cannot
-    /// be violated by it.
-    #[test]
-    fn name_constraints_cn_ignored_when_ip_only_san_present() {
-        use crate::x509::GeneralName;
-        let nc = crate::x509::extension::name_constraints(
-            &[],
-            &[GeneralName::Dns(".bad.example".into())],
-        );
-        let leaf_sans = [GeneralName::IpV4([10, 0, 0, 1])];
-        let (root, int, leaf) = build_chain_with_nc(nc, "host.bad.example", &leaf_sans);
-
-        let mut store = RootCertStore::new();
-        store.add_der(root.to_der().to_vec()).unwrap();
-        let now = Time::utc(2026, 1, 1, 0, 0, 0);
-        verify_chain(
-            &store,
-            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
-            Some(&now),
-            &policy(),
-        )
-        .unwrap();
-        // ...and the CN it carries authenticates nothing.
-        assert!(verify_hostname(&leaf, "host.bad.example").is_err());
-    }
-
     /// MEDIUM: an excluded dNSName subtree must not be escapable with a
     /// wildcard SAN. The classic delegation shape — `permitted = example.com`,
     /// `excluded = secure.example.com` — was defeated by a leaf carrying
@@ -1599,6 +1600,35 @@ mod tests {
             &policy(),
         )
         .unwrap();
+    }
+
+    /// The name-constraint side of the SAN-presence rule must track
+    /// `verify_hostname`: an IP-only-SAN leaf has no dNSName for a dNSName
+    /// constraint to govern, and its CN is inert (never consulted for
+    /// hostname verification), so an excluded-only dNSName constraint cannot
+    /// be violated by it.
+    #[test]
+    fn name_constraints_cn_ignored_when_ip_only_san_present() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let leaf_sans = [GeneralName::IpV4([10, 0, 0, 1])];
+        let (root, int, leaf) = build_chain_with_nc(nc, "host.bad.example", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+        // ...and the CN it carries authenticates nothing.
+        assert!(verify_hostname(&leaf, "host.bad.example").is_err());
     }
 
     /// Issuing and validating a self-signed ML-DSA-65 certificate through
@@ -2128,6 +2158,102 @@ mod tests {
             verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()),
             Err(Error::BadCertificate)
         ));
+    }
+
+    /// LOW: the candidate-CRL list is peer-controlled (TLS 1.3 stapled
+    /// `CRL_RESPONSE` entries), and each candidate costs a public-key
+    /// verification before anything cheap can rule it out. `check_revocation`
+    /// bounds that work at [`MAX_CRLS_PER_ISSUER`] verifications per chain
+    /// link. The cap must be comfortably above any real deployment: filler
+    /// below the cap must not hide a genuine revocation.
+    #[test]
+    fn crl_verification_budget_is_bounded_but_not_tight() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::tls::pki::CrlStore;
+        use crate::x509::{
+            CertSigner, CrlBuilder, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage},
+        };
+
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"crl-budget", b"n", &[]);
+        let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let junk_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let root_signer = CertSigner::Ecdsa(&root_key);
+        let junk_signer = CertSigner::Ecdsa(&junk_key);
+
+        let root_name = DistinguishedName::common_name("budget-root");
+        let leaf_name = DistinguishedName::common_name("budget-leaf");
+        let root = Certificate::self_signed_with_extensions(
+            &root_signer,
+            &root_name,
+            &validity(),
+            1,
+            &[
+                basic_constraints(true, None),
+                key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+            ],
+        )
+        .unwrap();
+        let leaf = Certificate::issue_with_extensions(
+            &root_signer,
+            &root_name,
+            &leaf_name,
+            &crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key()),
+            &validity(),
+            77,
+            &[
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+            ],
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let chain = alloc::vec![leaf.to_der().to_vec()];
+
+        // Well-formed, fresh, correctly-issuer-named CRLs signed by the WRONG
+        // key: each survives every cheap filter and burns one verification.
+        let junk = |serial: u8| {
+            let mut b = CrlBuilder::new(&root_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+            b.revoke(&[serial], Time::utc(2026, 1, 2, 0, 0, 0), None);
+            b.sign(&junk_signer).unwrap().to_der().to_vec()
+        };
+        // The genuine one, revoking the leaf.
+        let mut real = CrlBuilder::new(&root_name, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        real.revoke(&[77], Time::utc(2026, 1, 2, 0, 0, 0), None);
+        let real = real.sign(&root_signer).unwrap().to_der().to_vec();
+
+        // Filler up to one below the cap, genuine CRL last: still revoked.
+        let mut crls = CrlStore::new();
+        for i in 0..(MAX_CRLS_PER_ISSUER - 1) {
+            crls.add_der(junk(i as u8)).unwrap();
+        }
+        crls.add_der(real.clone()).unwrap();
+        assert!(matches!(
+            verify_chain_with_crls(&store, &crls, &chain, Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
+
+        // Sanity: the genuine CRL alone revokes (the filler above is inert).
+        let mut only_real = CrlStore::new();
+        only_real.add_der(real).unwrap();
+        assert!(matches!(
+            verify_chain_with_crls(&store, &only_real, &chain, Some(&now), &policy()),
+            Err(Error::BadCertificate)
+        ));
+
+        // A pure flood consults nothing valid and leaves the chain accepted —
+        // the budget bounds the work rather than changing the verdict.
+        let mut flood = CrlStore::new();
+        for i in 0..(MAX_CRLS_PER_ISSUER * 4) {
+            flood.add_der(junk(i as u8)).unwrap();
+        }
+        verify_chain_with_crls(&store, &flood, &chain, Some(&now), &policy()).unwrap();
     }
 
     /// A chain whose signature algorithm is in the registry but not on the
