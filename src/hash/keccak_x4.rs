@@ -376,7 +376,9 @@ impl<const L: usize> KeccakXn<L> {
     /// Best-effort wipe of the sponge states (for secret-seeded streams such as
     /// the CBD noise PRF).
     pub(crate) fn zeroize(&mut self) {
-        super::zeroize::zero_words(&mut self.state);
+        // Only the `25 * L` prefix is ever written; the rest of the
+        // widest-kernel-sized array stays at its initial zero.
+        super::zeroize::zero_words(&mut self.state[..25 * L]);
     }
 }
 
