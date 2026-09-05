@@ -4,6 +4,9 @@ on:
   push:
     branches: [master]
   pull_request:
+  # The AVX-512 SDE job below is opt-in: run it from the Actions tab
+  # ("Run workflow") after refreshing `SDE_URL`.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -245,13 +248,24 @@ jobs:
     # reports AVX-512 and the differential tests actually run. Read the log:
     # this job is only meaningful if the RUNNING (not SKIPPED) lines appear.
     #
-    # `continue-on-error` because SDE is fetched from a versioned Intel
-    # download URL that moves when Intel publishes a new build; a dead link
-    # must not gate merges. Treat a red X here as "look at the log", not
-    # "ignore me".
+    # MANUAL ONLY. Intel distributes SDE from a versioned download URL that
+    # moves when they publish a new build, and there is no official package
+    # or GitHub release to pin instead. The URL below is already dead (403),
+    # so running this on every push would paint master red for a reason that
+    # has nothing to do with the code.
+    #
+    # To use it: refresh SDE_URL from
+    # https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html
+    # then Actions -> CI -> "Run workflow". `continue-on-error` is kept so a
+    # stale URL still doesn't gate a manual run.
+    #
+    # Until then the AVX-512 kernels are exercised only on developer machines
+    # that actually have AVX-512 -- on any other host their differential tests
+    # skip, and now say so in the log.
+    if: github.event_name == 'workflow_dispatch'
     continue-on-error: true
     env:
-      # Bump when Intel retires this build.
+      # Bump when Intel retires this build (the pinned one already 403s).
       SDE_URL: https://downloadmirror.intel.com/850782/sde-external-9.44.0-2024-08-22-lin.tar.xz
     steps:
       - uses: actions/checkout@v6
