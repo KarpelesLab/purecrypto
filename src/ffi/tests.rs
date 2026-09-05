@@ -1019,6 +1019,43 @@ fn scrypt_rejects_oversized_cost() {
     }
 }
 
+/// The cost accounting must not overflow. `128 * r * n` reaches ~2^71 for `r`
+/// near `u32::MAX` and `n = 2^31`, so computing it in `u64` would wrap in
+/// release to a small value, sail past the ceiling, and reach the very
+/// allocation the cap exists to prevent. `p` counts too: scrypt's first PBKDF2
+/// expansion allocates `128 * r * p` bytes on top of the `V` array.
+#[test]
+fn scrypt_cost_check_does_not_overflow() {
+    let pw = b"password";
+    let salt = b"NaCl";
+    let mut out = [0u8; 32];
+    for (n, r, p) in [
+        (1u32 << 31, u32::MAX, 1u32),
+        (1u32 << 31, 1, u32::MAX),
+        (2, u32::MAX, u32::MAX),
+        (1u32 << 30, 0x0010_0000, 1),
+    ] {
+        let st = unsafe {
+            kdf::pc_scrypt(
+                pw.as_ptr(),
+                pw.len(),
+                salt.as_ptr(),
+                salt.len(),
+                n,
+                r,
+                p,
+                out.as_mut_ptr(),
+                out.len(),
+            )
+        };
+        assert_eq!(
+            st,
+            PcStatus::Unsupported,
+            "scrypt n={n} r={r} p={p} must be rejected, not allocated"
+        );
+    }
+}
+
 /// `r == 0` is degenerate (zero-sized working set) and must be rejected up
 /// front rather than reaching the implementation.
 #[test]

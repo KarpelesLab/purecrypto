@@ -293,11 +293,19 @@ pub unsafe extern "C" fn pc_scrypt(
         if n == 0 || !n.is_power_of_two() || r == 0 {
             return PcStatus::Unsupported;
         }
-        // scrypt's working set is 128 · r · n bytes (RFC 7914 §6, the `V`
-        // array). Reject before dispatch: an oversized `vec![0u8; ...]` aborts
-        // rather than unwinding, which `guard` cannot intercept.
-        let mem_kib = (128u64 * u64::from(r) * u64::from(n)).div_ceil(1024);
-        if mem_kib > PC_KDF_MAX_MEM_KIB {
+        // scrypt allocates a block size of 128 · r bytes, `n` of them for the
+        // `V` array (RFC 7914 §5), `p` of them for the first PBKDF2 expansion
+        // `B` (§2), and two more as BlockMix scratch. Reject before dispatch:
+        // an oversized `vec![0u8; ...]` aborts rather than unwinding, which
+        // `guard` cannot intercept.
+        //
+        // `u128` throughout, deliberately: `n` is a power of two up to 2^31 and
+        // `r`/`p` reach 2^32 − 1, so 128 · r · (n + p) is up to ~2^71 and would
+        // overflow a `u64` — wrapping in release to a small value that sails
+        // past the ceiling and reaches the very allocation this guards.
+        let block = 128u128 * u128::from(r);
+        let bytes = block.saturating_mul(u128::from(n) + u128::from(p) + 2);
+        if bytes > u128::from(PC_KDF_MAX_MEM_KIB) * 1024 || usize::try_from(bytes).is_err() {
             return PcStatus::Unsupported;
         }
         let log_n = n.trailing_zeros() as u8;
@@ -353,8 +361,12 @@ pub unsafe extern "C" fn pc_argon2(
         }
         // Argon2 allocates `m_cost · 1024` bytes; reject before dispatch so an
         // oversized request is a status code, not a `handle_alloc_error` abort
-        // that `guard` cannot catch.
-        if u64::from(m_cost) > PC_KDF_MAX_MEM_KIB {
+        // that `guard` cannot catch. The `usize` conversion additionally keeps
+        // the ceiling honest on 32-bit targets, where 4 GiB is not addressable
+        // at all.
+        if u64::from(m_cost) > PC_KDF_MAX_MEM_KIB
+            || usize::try_from(u64::from(m_cost) * 1024).is_err()
+        {
             return PcStatus::Unsupported;
         }
         let variant = match variant {
