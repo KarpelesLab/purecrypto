@@ -575,6 +575,17 @@ impl LossState {
         self.loss_detection_timer = Some(anchor.saturating_add(pto));
     }
 
+    /// The earliest pending time-threshold loss deadline across all spaces,
+    /// with the space it belongs to. The connection driver arms a timer on it
+    /// so RFC 9002 §6.1.2 loss detection fires on time rather than only when
+    /// the next ACK happens to arrive (H-6).
+    pub(crate) fn next_loss_time(&self) -> Option<(Duration, PnSpaceId)> {
+        match self.earliest_loss_time() {
+            (Some(t), Some(s)) => Some((t, s)),
+            _ => None,
+        }
+    }
+
     /// Earliest pending `loss_time` across all spaces, and the space.
     fn earliest_loss_time(&self) -> (Option<Duration>, Option<PnSpaceId>) {
         let mut earliest: Option<(Duration, PnSpaceId)> = None;
@@ -603,13 +614,24 @@ impl LossState {
     /// when Handshake keys derived; Handshake keys discarded when the
     /// handshake completes). Wipes the per-space sent-packets table and
     /// clears `loss_time` / `time_of_last_ack_eliciting_packet`.
-    pub(crate) fn discard_keys(&mut self, space: PnSpaceId) {
+    ///
+    /// Returns the packets that were still outstanding in the space. RFC 9002
+    /// §A.10 (`OnPacketNumberSpaceDiscarded`) requires the caller to subtract
+    /// their `sent_bytes` from the congestion controller's `bytes_in_flight`
+    /// — without a source of ACKs for a space whose keys are gone, those bytes
+    /// would otherwise stay counted for the life of the connection and
+    /// eventually wedge `can_send()` at `false` (H-6).
+    #[must_use = "the drained packets must be removed from bytes_in_flight (RFC 9002 §A.10)"]
+    pub(crate) fn discard_keys(&mut self, space: PnSpaceId) -> Vec<SentPacket> {
         let ps = &mut self.per_space[space as usize];
-        ps.sent_packets.clear();
+        let drained: Vec<SentPacket> = core::mem::take(&mut ps.sent_packets)
+            .into_values()
+            .collect();
         ps.largest_acked_packet = None;
         ps.loss_time = None;
         ps.time_of_last_ack_eliciting_packet = None;
         self.set_loss_detection_timer(Duration::ZERO);
+        drained
     }
 
     /// Returns whether a persistent-congestion event was detected since
@@ -1068,7 +1090,8 @@ mod tests {
     fn discard_keys_wipes_space() {
         let mut s = LossState::new();
         s.on_packet_sent(PnSpaceId::Initial, mk_packet(0, true, true, Duration::ZERO));
-        s.discard_keys(PnSpaceId::Initial);
+        let drained = s.discard_keys(PnSpaceId::Initial);
+        assert!(!drained.is_empty(), "outstanding packets must be returned");
         assert!(s.per_space[0].sent_packets.is_empty());
         assert!(s.per_space[0].largest_acked_packet.is_none());
         assert!(s.per_space[0].loss_time.is_none());

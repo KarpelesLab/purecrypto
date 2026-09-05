@@ -319,6 +319,13 @@ pub(crate) struct PathMigration {
     challenge: [u8; 8],
     /// Deadline for the PATH_RESPONSE (RFC 9000 §8.2.4 — at least 3x PTO).
     deadline: Duration,
+    /// When the single re-send of the challenge is due — halfway to
+    /// `deadline`. M-4: the re-send used to have no time gate at all, so every
+    /// `on_timeout` tick queued another 1200-byte probe at the unvalidated
+    /// address (and a `QuicServer` ticks every hosted connection).
+    retry_at: Duration,
+    /// Set once the challenge has been re-sent, so it happens exactly once.
+    retried: bool,
     /// True when the two addresses differ only in port. RFC 9000 §9.4 keeps
     /// the congestion controller and RTT estimator across such a change,
     /// since the path itself is very likely unchanged.
@@ -355,6 +362,26 @@ fn first_packet_is_initial(datagram: &[u8]) -> bool {
         return false;
     }
     matches!(LongHeader::parse(datagram), Ok(h) if h.typ == LongType::Initial)
+}
+
+/// What a packet may currently carry when [`QuicConnection::assemble_payload`]
+/// builds it.
+///
+/// Assembly is destructive — it carves CRYPTO, pops STREAM and DATAGRAM frames
+/// and drains the path / CID queues — so a restriction has to be applied
+/// *while* building rather than by discarding the finished payload.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum PayloadScope {
+    /// Everything the level permits.
+    Full,
+    /// RFC 9002 §2 / §7: the congestion window is exhausted, so only frames
+    /// that are not congestion controlled may go out — ACKs, plus the tiny
+    /// PATH_CHALLENGE / PATH_RESPONSE pair that keeps path validation alive
+    /// (H-6).
+    NotCongestionControlled,
+    /// RFC 9000 §9.1 / §21.5.3: the destination address has not been
+    /// validated, so only probing frames may be sent to it (H-4).
+    ProbingOnly,
 }
 
 /// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
@@ -735,6 +762,11 @@ pub(crate) struct PacketMeta {
     /// 9000 §8.2.1 requires the containing datagram to be expanded to at
     /// least 1200 bytes so path validation also probes the path MTU.
     pub(crate) has_path_frame: bool,
+    /// True if an ACK frame was actually written into this packet. The
+    /// space's pending-ACK state is only cleared when it was: a packet that
+    /// omitted the ACK — because the destination address is unvalidated and
+    /// ACK is a non-probing frame (RFC 9000 §9.1) — still owes it.
+    pub(crate) carried_ack: bool,
     /// True if any frame in this packet requires the peer to ack
     /// (RFC 9000 §13.2.1).
     pub(crate) ack_eliciting: bool,
@@ -1811,6 +1843,56 @@ impl QuicConnection {
         }
     }
 
+    /// RFC 9002 §6.1.2 — declare packets lost whose time-threshold deadline
+    /// has passed, for every packet-number space that has one.
+    ///
+    /// H-6: `detect_lost` was reachable only from the ACK handler, so
+    /// `bytes_in_flight` shrank only when an ACK arrived. A peer that simply
+    /// stopped acknowledging could therefore pin the congestion window closed
+    /// indefinitely. At most one space can be earliest, so the loop drains the
+    /// (at most three) spaces that expired in the same tick.
+    fn detect_lost_on_timer(&mut self, now: Duration) {
+        for _ in 0..3 {
+            let Some((deadline, space)) = self.endpoint.loss.next_loss_time() else {
+                return;
+            };
+            if deadline > now {
+                return;
+            }
+            let lost = self.endpoint.loss.detect_lost(space, now);
+            if lost.is_empty() {
+                // `detect_lost` recomputed (and cleared) this space's
+                // `loss_time`, so this cannot spin.
+                continue;
+            }
+            self.handle_lost_packets(&lost, now);
+        }
+    }
+
+    /// Feeds a batch of newly-declared-lost packets to congestion control and
+    /// re-queues the bytes they carried. Mirrors steps 5, 6 and 6b of the ACK
+    /// handler, for the timer-driven path which has no `Result` to propagate.
+    fn handle_lost_packets(&mut self, lost: &[SentPacket], now: Duration) {
+        let in_flight: Vec<SentPacket> = lost.iter().filter(|p| p.in_flight).cloned().collect();
+        if !in_flight.is_empty() {
+            self.endpoint.cc.on_packets_lost(&in_flight, now);
+        }
+        for pkt in lost {
+            if !pkt.retransmit_hint.is_empty() {
+                // A malformed hint can only come from our own encoder; drop it
+                // rather than tear down the connection from a timer callback.
+                let _ = self.requeue_from_hint(&pkt.retransmit_hint);
+            }
+        }
+        if let Some(streams) = self.streams.as_mut() {
+            for pkt in lost {
+                for h in &pkt.stream_hints {
+                    streams.on_chunk_lost(h.id, h.offset, h.length, h.fin);
+                }
+            }
+        }
+    }
+
     /// RFC 9000 §10.1.2: the idle timeout actually in force — the smaller of
     /// the two non-zero `max_idle_timeout` advertisements (ours and, once the
     /// handshake surfaces them, the peer's), raised to at least three times the
@@ -1864,6 +1946,15 @@ impl QuicConnection {
             (Some(a), None) => Some(a),
             (None, b) => b,
         };
+        // RFC 9002 §6.1.2 — the time-threshold loss deadline is a timer of its
+        // own. Without it, `detect_lost` only ever ran from the ACK handler, so
+        // a peer that stopped acknowledging left `bytes_in_flight` pinned
+        // forever (H-6).
+        let base = match (base, self.endpoint.loss.next_loss_time().map(|(t, _)| t)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        };
         // RFC 9000 §8.2.4 — a migration under validation has its own deadline.
         match (base, self.migration.as_ref().map(|m| m.deadline)) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -1879,6 +1970,9 @@ impl QuicConnection {
         // RFC 9001 §6.5 — drop retained previous-phase read keys once
         // 3×PTO has elapsed since the key-phase commit installed them.
         self.maybe_discard_prev_rx_keys(now_since_start);
+        // RFC 9002 §6.1.2 / Appendix A `OnLossDetectionTimeout` — run
+        // time-threshold loss detection on the timer (H-6).
+        self.detect_lost_on_timer(now_since_start);
         if self.endpoint.loss.has_fired(now_since_start) {
             // RFC 9002 §6.2.4: on PTO, send a probe — Phase 4 implements
             // this as "retransmit the last CRYPTO chunk at *every* level
@@ -1924,14 +2018,24 @@ impl QuicConnection {
 
         // RFC 9000 §9.3 / §8.2.4 — a migration whose PATH_CHALLENGE went
         // unanswered falls back to the address that was working. The challenge
-        // is re-sent once, halfway to the deadline, in case it was simply lost.
+        // is re-sent exactly once, at `retry_at` (halfway to the deadline), in
+        // case it was simply lost.
         if let Some(m) = self.migration.as_ref() {
             let deadline = m.deadline;
+            let retry_at = m.retry_at;
+            let retried = m.retried;
             let challenge = m.challenge;
             if now_since_start >= deadline {
                 self.abandon_migration();
-            } else if self.path.has_outstanding() && !self.path.has_pending_challenge() {
+            } else if !retried
+                && now_since_start >= retry_at
+                && self.path.has_outstanding()
+                && !self.path.has_pending_challenge()
+            {
                 self.path.requeue_challenge(challenge);
+                if let Some(m) = self.migration.as_mut() {
+                    m.retried = true;
+                }
             }
         }
 
@@ -2188,6 +2292,16 @@ impl QuicConnection {
         if self.our_params.disable_active_migration {
             return;
         }
+        // §9.3.3: a higher-numbered non-probing packet arriving from the
+        // address we migrated *away* from means the peer is still there — the
+        // move was an off-path attacker replaying our traffic from a spoofed
+        // source. Reverting to the original path is the only defence the RFC
+        // names against packet forwarding, and it has to be checked before the
+        // stacking guard below (M-2).
+        if self.migration.as_ref().is_some_and(|m| from == m.prev_addr) {
+            self.abandon_migration();
+            return;
+        }
         // Don't stack migrations: a second address change while the first is
         // still unvalidated would lose the original fallback.
         if self.migration.is_some() {
@@ -2228,6 +2342,8 @@ impl QuicConnection {
             prev_addr: from,
             challenge,
             deadline: now.saturating_add(timeout),
+            retry_at: now.saturating_add(timeout / 2),
+            retried: false,
             // §9.4: a port-only change is nearly always the same path through
             // a NAT, so the congestion and RTT state survives it.
             port_only: from.ip() == to.ip(),
@@ -3597,9 +3713,22 @@ impl QuicConnection {
             // Reset the per-level CRYPTO buffer so no outbound chunk remains to
             // be (re)transmitted and no inbound reassembly state lingers.
             *self.endpoint.bufs.at_mut(lvl) = crate::quic::crypto_buf::CryptoBuf::new();
-            // Clear loss-recovery state for the matching PN space (also drops
-            // any still-in-flight packets from `bytes_in_flight`).
-            self.endpoint.loss.discard_keys(pn_space_of_level(lvl));
+            // Clear loss-recovery state for the matching PN space. RFC 9002
+            // §A.10 (`OnPacketNumberSpaceDiscarded`): the packets that were
+            // still outstanding there can never be acknowledged now, so their
+            // bytes must come off `bytes_in_flight` — this is a bookkeeping
+            // removal, NOT a congestion event, so the window is left alone.
+            // (H-6: this used to be silently skipped, leaking every
+            // Initial/Handshake packet in flight at handshake completion into
+            // `bytes_in_flight` forever.)
+            let drained = self.endpoint.loss.discard_keys(pn_space_of_level(lvl));
+            let stranded: u64 = drained
+                .iter()
+                .filter(|p| p.in_flight)
+                .map(|p| p.sent_bytes as u64)
+                .sum();
+            self.endpoint.cc.bytes_in_flight =
+                self.endpoint.cc.bytes_in_flight.saturating_sub(stranded);
             // Reset the PN space's pending-ACK / largest-rx bookkeeping so a
             // late duplicate can't resurrect an ACK at a discarded level.
             *self.endpoint.pn.for_level(lvl) = crate::quic::pn::PnSpace::default();
@@ -4887,14 +5016,30 @@ impl QuicConnection {
         // and the AMP cap is the binding constraint on the server side.
         // Without this guard, an aggressive application could flood the
         // network ahead of any peer ACKs.
-        if matches!(level, Level::OneRtt) && !self.endpoint.cc.can_send() {
-            return None;
-        }
+        //
+        // H-6: the guard used to suppress the *whole* packet, ACK-only ones
+        // included. RFC 9002 §2 excludes ACK-only packets from congestion
+        // control, so a peer that stopped acknowledging could wedge us into a
+        // state where we could not even send the ACKs that would let it make
+        // progress. Restrict what the packet may carry instead of refusing to
+        // build one.
+        //
+        // H-4: RFC 9000 §21.5.3 — a client that has moved to a server-supplied
+        // preferred address MUST NOT send non-probing frames there until path
+        // validation succeeds. `peer_addr_validated` is what tracks that.
+        let scope =
+            if self.role == Role::Client && self.migration.is_some() && !self.peer_addr_validated {
+                PayloadScope::ProbingOnly
+            } else if matches!(level, Level::OneRtt) && !self.endpoint.cc.can_send() {
+                PayloadScope::NotCongestionControlled
+            } else {
+                PayloadScope::Full
+            };
         // For levels above Initial, also need our peer-CID to be the
         // right one. Handshake-level packets use the same CID pair as
         // Initial (peer's chosen SCID we observed on the server's first
         // long-header packet).
-        let (payload, meta) = self.assemble_payload(level)?;
+        let (payload, meta) = self.assemble_payload(level, scope)?;
         if payload.is_empty() {
             return None;
         }
@@ -5126,16 +5271,20 @@ impl QuicConnection {
             return Some(wire);
         };
 
-        // ACK has been emitted (if it was queued) — clear the
-        // ack-eliciting flag and pending list for this space.
-        let space = match level {
-            Level::Initial => &mut self.endpoint.pn.initial,
-            Level::Handshake => &mut self.endpoint.pn.handshake,
-            _ => &mut self.endpoint.pn.application,
-        };
-        space.pending_ack.clear();
-        space.ack_eliciting_pending = false;
-        space.largest_eliciting_arrival_us = None;
+        // Clear the ack-eliciting flag and pending list for this space, but
+        // only if an ACK frame really went into the packet. A probing-only
+        // packet (RFC 9000 §9.1 — sent to an address that is not yet
+        // validated) omits the ACK, and we still owe it.
+        if meta.carried_ack {
+            let space = match level {
+                Level::Initial => &mut self.endpoint.pn.initial,
+                Level::Handshake => &mut self.endpoint.pn.handshake,
+                _ => &mut self.endpoint.pn.application,
+            };
+            space.pending_ack.clear();
+            space.ack_eliciting_pending = false;
+            space.largest_eliciting_arrival_us = None;
+        }
 
         // RFC 9002 Appendix A — `OnPacketSent`. Record this packet for
         // loss detection + RTT estimation. We feed the NewReno controller
@@ -5171,9 +5320,14 @@ impl QuicConnection {
     /// [`PacketMeta`] is populated with per-frame flags used by
     /// [`build_packet_with_pad`] to register the resulting packet with
     /// the RFC 9002 loss-recovery state.
-    fn assemble_payload(&mut self, level: Level) -> Option<(Vec<u8>, PacketMeta)> {
+    fn assemble_payload(
+        &mut self,
+        level: Level,
+        scope: PayloadScope,
+    ) -> Option<(Vec<u8>, PacketMeta)> {
         let mut out: Vec<u8> = Vec::new();
         let mut meta = PacketMeta::default();
+        let full = scope == PayloadScope::Full;
 
         // ACK frame, if any. RFC 9000 §13.2.5: the `ack_delay` field is
         // the time the receiver delayed sending the ACK, in scaled units.
@@ -5196,7 +5350,10 @@ impl QuicConnection {
         };
         // RFC 9000 §12.4 Table 3: ACK is forbidden in 0-RTT packets. The
         // Application space's pending ACKs ride the 1-RTT packet instead.
-        if !matches!(level, Level::EarlyData)
+        // RFC 9000 §9.1: ACK is a *non-probing* frame, so it must not be sent
+        // to an address that has not been validated (§21.5.3).
+        if scope != PayloadScope::ProbingOnly
+            && !matches!(level, Level::EarlyData)
             && !space_ref.pending_ack.is_empty()
             && let Some((largest, first_range, raw)) = build_ack_ranges_raw(&space_ref.pending_ack)
         {
@@ -5220,6 +5377,7 @@ impl QuicConnection {
                 ecn,
             };
             ack.encode(&mut out);
+            meta.carried_ack = true;
             // ACK is NOT ack-eliciting; not in-flight on its own.
         }
 
@@ -5232,7 +5390,16 @@ impl QuicConnection {
         // (Initial + Handshake), not from multiple CRYPTO frames in one
         // packet. This keeps the assembly simple and predictable.
         const CRYPTO_CHUNK_CAP: usize = 1100;
-        if let Some((offset, data)) = self.endpoint.bufs.at_mut(level).carve(CRYPTO_CHUNK_CAP) {
+        // M-6: the carve budget must account for what the ACK frame already
+        // wrote. With 32 ACK ranges (~500 B) plus a full 1100-byte carve the
+        // packet used to overshoot 1200 bytes, black-holing the handshake
+        // against a peer that advertised `max_udp_payload_size = 1200` (the
+        // minimum §18.2 permits). The stream path below already does this.
+        let crypto_room = CRYPTO_CHUNK_CAP.saturating_sub(out.len());
+        if full
+            && crypto_room > 0
+            && let Some((offset, data)) = self.endpoint.bufs.at_mut(level).carve(crypto_room)
+        {
             let crypto = Frame::Crypto {
                 offset,
                 data: &data,
@@ -5290,7 +5457,7 @@ impl QuicConnection {
                 // RETIRE_CONNECTION_ID (RFC 9000 §19.16): for every
                 // sequence the local CID pool retired (peer's
                 // retire_prior_to advanced), emit a frame.
-                if let Some(pool) = self.cid_remote.as_mut() {
+                if full && let Some(pool) = self.cid_remote.as_mut() {
                     while let Some(seq) = pool.pop_pending_retire() {
                         Frame::RetireConnectionId { seq }.encode(&mut out);
                         meta.ack_eliciting = true;
@@ -5306,7 +5473,7 @@ impl QuicConnection {
                 // the peer up to the peer's `active_connection_id_limit`
                 // (default 2 — we have 1 from the handshake, so we send 1
                 // extra). Idempotent via `new_cids_issued`.
-                if self.handshake_complete && !self.new_cids_issued {
+                if full && self.handshake_complete && !self.new_cids_issued {
                     let prev_len = out.len();
                     self.issue_new_local_cids(&mut out);
                     if out.len() > prev_len {
@@ -5317,7 +5484,7 @@ impl QuicConnection {
                 }
             } // end 1-RTT-only path / CID housekeeping
 
-            if let Some(streams) = self.streams.as_mut() {
+            if full && let Some(streams) = self.streams.as_mut() {
                 // Target payload cap: ~1100 bytes to leave headroom for
                 // ACK/CRYPTO coalescing and the AEAD tag. The actual MTU
                 // sizing happens at the datagram-assembly layer.
@@ -5364,7 +5531,7 @@ impl QuicConnection {
             // emits the length-prefixed 0x31 form (so frames can be
             // followed by other frames without ambiguity).
             const ONERTT_PAYLOAD_CAP_DG: usize = 1100;
-            loop {
+            while full && !self.datagram_queues.outbound.is_empty() {
                 let remaining = ONERTT_PAYLOAD_CAP_DG.saturating_sub(out.len());
                 if remaining < 2 {
                     break;
@@ -6999,6 +7166,249 @@ mod tests {
             "a failed migration restores the old connection ID too"
         );
         let _ = &mut s;
+    }
+
+    /// H-4 — RFC 9000 §21.5.3: a client MUST NOT send non-probing frames to a
+    /// server-supplied preferred address before path validation succeeds.
+    /// `peer_addr_validated` used to be written in nine places and read
+    /// nowhere, so stream data, DATAGRAMs and ACKs all went straight to the
+    /// server-chosen address.
+    #[test]
+    fn client_sends_only_probing_frames_to_an_unvalidated_preferred_address() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let old_addr = ip4(192, 0, 2, 1, 2222);
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC2; 8],
+            stateless_reset_token: [0x55; 16],
+        };
+        let (mut c, _s) = migration_pair(old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        c.peer_params
+            .as_mut()
+            .expect("peer params")
+            .preferred_address = Some(pa.encode());
+        c.cid_remote.as_mut().expect("pool").entries.remove(&1);
+
+        // Queue application data and make sure an ACK is owed, so a `Full`
+        // packet would visibly carry non-probing frames.
+        let sid = c.open_bidi().expect("open");
+        c.write(sid, b"secret payload").expect("write");
+        assert!(
+            !c.endpoint.pn.application.pending_ack.is_empty(),
+            "test premise: an ACK is pending"
+        );
+
+        c.migrate_to_preferred_address().expect("migrate");
+        assert!(!c.peer_addr_validated, "the new address is unvalidated");
+        let deadline = c.migration.as_ref().expect("migrating").deadline;
+
+        let probe = c.pop_datagram();
+        assert_eq!(probe.len(), 1200, "the probe is expanded per 8.2.1");
+        assert!(
+            !c.endpoint.pn.application.pending_ack.is_empty(),
+            "ACK is non-probing and must not reach an unvalidated address"
+        );
+        assert!(
+            !c.has_unacked_streams(),
+            "no STREAM data may reach an unvalidated address"
+        );
+
+        // Validation fails, we fall back to the address that was working, and
+        // normal traffic resumes there.
+        c.on_timeout(deadline);
+        assert!(!c.is_migrating() && c.peer_addr_validated);
+        assert!(!c.is_closed(), "the idle timer must not have fired yet");
+        assert_eq!(c.peer_address(), Some(server_addr));
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty(), "traffic resumes on the validated path");
+        assert!(
+            c.has_unacked_streams(),
+            "the queued stream data goes out once the path is validated again"
+        );
+    }
+
+    /// M-4 — the migration PATH_CHALLENGE is re-sent at most once, halfway to
+    /// the deadline. Before the fix every `on_timeout` tick queued another
+    /// 1200-byte probe at the unvalidated address, and a `QuicServer` ticks
+    /// every hosted connection.
+    #[test]
+    fn migration_path_challenge_is_retried_only_once() {
+        let old_addr = ip4(192, 0, 2, 1, 3333);
+        let (mut c, _s) = migration_pair(old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        let target = ip4(203, 0, 113, 11, 4433);
+        c.begin_migration(server_addr, target);
+        let (retry_at, deadline) = {
+            let m = c.migration.as_ref().expect("migrating");
+            (m.retry_at, m.deadline)
+        };
+        assert!(retry_at < deadline);
+        // Send the initial challenge.
+        assert!(!c.pop_datagram().is_empty());
+
+        // Ticks before the retry point queue nothing.
+        c.on_timeout(Duration::ZERO);
+        assert!(!c.path.has_pending_challenge());
+
+        // Exactly one retry, at `retry_at`...
+        c.on_timeout(retry_at);
+        assert!(c.path.has_pending_challenge(), "one retry is expected");
+        assert!(!c.pop_datagram().is_empty());
+
+        // ...and no more, however many times the host ticks us.
+        for i in 1..8 {
+            c.on_timeout(retry_at + Duration::from_millis(i));
+            assert!(
+                !c.path.has_pending_challenge(),
+                "the challenge must not be regenerated on every tick"
+            );
+        }
+    }
+
+    /// H-6(a) — RFC 9002 §A.10 `OnPacketNumberSpaceDiscarded`: packets still
+    /// outstanding in a discarded packet-number space can never be
+    /// acknowledged, so their bytes must leave `bytes_in_flight`. They used to
+    /// leak there for the life of the connection.
+    #[test]
+    fn discarding_a_pn_space_drains_bytes_in_flight() {
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        for (space, pn) in [
+            (PnSpaceId::Initial, 0u64),
+            (PnSpaceId::Handshake, 0u64),
+            (PnSpaceId::Handshake, 1u64),
+        ] {
+            s.endpoint.loss.on_packet_sent(
+                space,
+                SentPacket {
+                    pn,
+                    sent_bytes: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    time_sent: Duration::ZERO,
+                    retransmit_hint: Vec::new(),
+                    stream_hints: Vec::new(),
+                },
+            );
+            s.endpoint.cc.on_packet_sent(1200);
+        }
+        assert_eq!(s.endpoint.cc.bytes_in_flight, 3600);
+        s.discard_handshake_levels();
+        assert_eq!(
+            s.endpoint.cc.bytes_in_flight, 0,
+            "a discarded space's bytes must leave bytes_in_flight"
+        );
+        assert!(s.endpoint.cc.can_send());
+    }
+
+    /// H-6(b) — time-threshold loss detection has to run on a timer. It used
+    /// to be reachable only from the ACK handler, so a peer that stopped
+    /// acknowledging pinned `bytes_in_flight` at its high-water mark forever.
+    #[test]
+    fn loss_detection_runs_on_the_timer() {
+        let (server_cfg_tls, _) = ed25519_server();
+        let mut s = QuicConnection::server(QuicConfig {
+            tls: server_cfg_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+        let app = PnSpaceId::Application;
+        for pn in 0..2u64 {
+            s.endpoint.loss.on_packet_sent(
+                app,
+                SentPacket {
+                    pn,
+                    sent_bytes: 1200,
+                    ack_eliciting: true,
+                    in_flight: true,
+                    time_sent: Duration::from_millis(100),
+                    retransmit_hint: Vec::new(),
+                    stream_hints: Vec::new(),
+                },
+            );
+        }
+        // Only pn 0 stays outstanding; pn 1 is acknowledged below.
+        s.endpoint.cc.on_packet_sent(1200);
+        // The peer acknowledges pn 1 and then goes quiet. pn 0 is neither
+        // packet-threshold lost (the gap is 1, kPacketThreshold is 3) nor yet
+        // past the time threshold, so a `loss_time` deadline is armed for it.
+        let _ = s.endpoint.loss.on_ack_received(
+            app,
+            &[1..=1],
+            Duration::ZERO,
+            Duration::from_millis(110),
+        );
+        assert!(
+            s.endpoint
+                .loss
+                .detect_lost(app, Duration::from_millis(110))
+                .is_empty()
+        );
+        let (loss_deadline, _) = s.endpoint.loss.next_loss_time().expect("loss timer armed");
+        assert!(
+            s.next_timeout().is_some_and(|t| t <= loss_deadline),
+            "next_timeout must surface the loss-detection deadline"
+        );
+
+        // No further ACK ever arrives; the timer alone must free the window.
+        s.on_timeout(Duration::from_secs(5));
+        assert!(
+            s.endpoint.loss.per_space[app as usize]
+                .sent_packets
+                .is_empty(),
+            "the timer must declare the outstanding packet lost"
+        );
+        assert_eq!(s.endpoint.cc.bytes_in_flight, 0);
+    }
+
+    /// H-6(c) — RFC 9002 §2: ACK-only packets are not congestion controlled.
+    /// The cwnd guard used to suppress the entire 1-RTT packet, so once
+    /// `bytes_in_flight` reached the window the endpoint could not even send
+    /// the ACKs that would have let the peer make progress.
+    #[test]
+    fn ack_only_packets_are_not_congestion_controlled() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        while !s.pop_datagram().is_empty() {}
+        while !c.pop_datagram().is_empty() {}
+
+        // Jam the server's congestion window shut.
+        s.endpoint.cc.bytes_in_flight = s.endpoint.cc.cwnd + 1;
+        assert!(!s.endpoint.cc.can_send());
+
+        // The client sends ack-eliciting data, so the server owes an ACK.
+        let sid = c.open_bidi().expect("open");
+        c.write(sid, b"ping").expect("write");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram(&dg).expect("server feed");
+        assert!(!s.endpoint.pn.application.pending_ack.is_empty());
+
+        let before_in_flight = s.endpoint.cc.bytes_in_flight;
+        let out = s.pop_datagram();
+        assert!(
+            !out.is_empty(),
+            "an ACK-only packet must go out even with a closed window"
+        );
+        assert!(
+            s.endpoint.pn.application.pending_ack.is_empty(),
+            "the pending ACK was actually emitted"
+        );
+        assert_eq!(
+            s.endpoint.cc.bytes_in_flight, before_in_flight,
+            "an ACK-only packet does not add to bytes_in_flight"
+        );
     }
 
     /// A server never has a preferred address to move to, and a client cannot
