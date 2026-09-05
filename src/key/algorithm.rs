@@ -29,12 +29,6 @@ pub enum Algorithm {
     X448,
     /// SM2 (GB/T 32918) signatures and public-key encryption.
     Sm2,
-    /// ECDSA / ECDH over brainpoolP256r1 (RFC 5639).
-    BrainpoolP256r1,
-    /// ECDSA / ECDH over brainpoolP384r1 (RFC 5639).
-    BrainpoolP384r1,
-    /// ECDSA / ECDH over brainpoolP512r1 (RFC 5639).
-    BrainpoolP512r1,
     /// Finite-field Diffie-Hellman over an RFC 3526 MODP group.
     DhModp,
     /// ML-DSA-44 (FIPS 204).
@@ -63,6 +57,17 @@ pub enum Algorithm {
     MlKem768,
     /// ML-KEM-1024 (FIPS 203).
     MlKem1024,
+    // New variants MUST be appended here, never inserted above. This enum has
+    // no `#[repr]`, so inserting shifts every following variant's implicit
+    // discriminant, which `cargo-semver-checks` reports as a breaking change
+    // (`enum_no_repr_variant_discriminant_changed`) and which would break any
+    // downstream `as isize` cast.
+    /// ECDSA / ECDH over brainpoolP256r1 (RFC 5639).
+    BrainpoolP256r1,
+    /// ECDSA / ECDH over brainpoolP384r1 (RFC 5639).
+    BrainpoolP384r1,
+    /// ECDSA / ECDH over brainpoolP512r1 (RFC 5639).
+    BrainpoolP512r1,
 }
 
 /// The asymmetric operation a key was asked to perform.
