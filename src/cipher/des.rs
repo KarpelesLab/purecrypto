@@ -42,6 +42,13 @@
 //! side-channel resistance matters; prefer the AEAD suites, which stay
 //! fully constant time.
 //!
+//! The one cheap mitigation that *is* applied: each 64-byte S-box is
+//! `#[repr(align(64))]`, so it occupies exactly one cache line instead of
+//! straddling two. An adversary who can observe cache-line granularity
+//! therefore learns nothing about which entry was read — without alignment,
+//! the split leaked roughly one extra bit of the secret index per lookup,
+//! 128 lookups per block.
+//!
 //! Parity bits in the 64-bit key encoding (bits 8, 16, 24, 32, 40, 48,
 //! 56, 64 per FIPS 46-3 §3) are silently ignored by the key schedule;
 //! callers should not rely on their value, but supplying odd-parity keys
@@ -139,68 +146,88 @@ const PC2: [u8; 48] = [
 /// to apply before extracting round key `i+1` from `(C_i, D_i)`.
 const SHIFTS: [u8; 16] = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1];
 
+/// One DES S-box, aligned to a cache line.
+///
+/// The lookups below are indexed by `E(R) ^ K`, i.e. by secret material, so
+/// each one leaks its index through the data cache. That is a documented
+/// trade-off for this interop-only cipher (see the module header), but a
+/// 64-byte table that straddles two cache lines leaks roughly one extra index
+/// bit for free. Forcing 64-byte alignment makes every sub-table occupy
+/// exactly one line, so an adversary observing line granularity learns nothing
+/// about which entry was read.
+#[repr(align(64))]
+struct SBox([u8; 64]);
+
+impl core::ops::Index<usize> for SBox {
+    type Output = u8;
+    #[inline]
+    fn index(&self, i: usize) -> &u8 {
+        &self.0[i]
+    }
+}
+
 /// The eight DES S-boxes (FIPS 46-3 §8.1, Tables 5–12). Each S-box maps
 /// a 6-bit input to a 4-bit output. The input is interpreted as
 /// `row = (b1 << 1) | b6` and `column = b2 b3 b4 b5`, indexing into a
 /// 4×16 table. We store them flat as `[row*16 + col]` of length 64.
 #[rustfmt::skip]
-const S: [[u8; 64]; 8] = [
+const S: [SBox; 8] = [
     // S1
-    [
+    SBox([
         14,  4, 13,  1,  2, 15, 11,  8,  3, 10,  6, 12,  5,  9,  0,  7,
          0, 15,  7,  4, 14,  2, 13,  1, 10,  6, 12, 11,  9,  5,  3,  8,
          4,  1, 14,  8, 13,  6,  2, 11, 15, 12,  9,  7,  3, 10,  5,  0,
         15, 12,  8,  2,  4,  9,  1,  7,  5, 11,  3, 14, 10,  0,  6, 13,
-    ],
+    ]),
     // S2
-    [
+    SBox([
         15,  1,  8, 14,  6, 11,  3,  4,  9,  7,  2, 13, 12,  0,  5, 10,
          3, 13,  4,  7, 15,  2,  8, 14, 12,  0,  1, 10,  6,  9, 11,  5,
          0, 14,  7, 11, 10,  4, 13,  1,  5,  8, 12,  6,  9,  3,  2, 15,
         13,  8, 10,  1,  3, 15,  4,  2, 11,  6,  7, 12,  0,  5, 14,  9,
-    ],
+    ]),
     // S3
-    [
+    SBox([
         10,  0,  9, 14,  6,  3, 15,  5,  1, 13, 12,  7, 11,  4,  2,  8,
         13,  7,  0,  9,  3,  4,  6, 10,  2,  8,  5, 14, 12, 11, 15,  1,
         13,  6,  4,  9,  8, 15,  3,  0, 11,  1,  2, 12,  5, 10, 14,  7,
          1, 10, 13,  0,  6,  9,  8,  7,  4, 15, 14,  3, 11,  5,  2, 12,
-    ],
+    ]),
     // S4
-    [
+    SBox([
          7, 13, 14,  3,  0,  6,  9, 10,  1,  2,  8,  5, 11, 12,  4, 15,
         13,  8, 11,  5,  6, 15,  0,  3,  4,  7,  2, 12,  1, 10, 14,  9,
         10,  6,  9,  0, 12, 11,  7, 13, 15,  1,  3, 14,  5,  2,  8,  4,
          3, 15,  0,  6, 10,  1, 13,  8,  9,  4,  5, 11, 12,  7,  2, 14,
-    ],
+    ]),
     // S5
-    [
+    SBox([
          2, 12,  4,  1,  7, 10, 11,  6,  8,  5,  3, 15, 13,  0, 14,  9,
         14, 11,  2, 12,  4,  7, 13,  1,  5,  0, 15, 10,  3,  9,  8,  6,
          4,  2,  1, 11, 10, 13,  7,  8, 15,  9, 12,  5,  6,  3,  0, 14,
         11,  8, 12,  7,  1, 14,  2, 13,  6, 15,  0,  9, 10,  4,  5,  3,
-    ],
+    ]),
     // S6
-    [
+    SBox([
         12,  1, 10, 15,  9,  2,  6,  8,  0, 13,  3,  4, 14,  7,  5, 11,
         10, 15,  4,  2,  7, 12,  9,  5,  6,  1, 13, 14,  0, 11,  3,  8,
          9, 14, 15,  5,  2,  8, 12,  3,  7,  0,  4, 10,  1, 13, 11,  6,
          4,  3,  2, 12,  9,  5, 15, 10, 11, 14,  1,  7,  6,  0,  8, 13,
-    ],
+    ]),
     // S7
-    [
+    SBox([
          4, 11,  2, 14, 15,  0,  8, 13,  3, 12,  9,  7,  5, 10,  6,  1,
         13,  0, 11,  7,  4,  9,  1, 10, 14,  3,  5, 12,  2, 15,  8,  6,
          1,  4, 11, 13, 12,  3,  7, 14, 10, 15,  6,  8,  0,  5,  9,  2,
          6, 11, 13,  8,  1,  4, 10,  7,  9,  5,  0, 15, 14,  2,  3, 12,
-    ],
+    ]),
     // S8
-    [
+    SBox([
         13,  2,  8,  4,  6, 15, 11,  1, 10,  9,  3, 14,  5,  0, 12,  7,
          1, 15, 13,  8, 10,  3,  7,  4, 12,  5,  6, 11,  0, 14,  9,  2,
          7, 11,  4,  1,  9, 12, 14,  2,  0,  6, 10, 13, 15,  3,  5,  8,
          2,  1, 14,  7,  4, 10,  8, 13, 15, 12,  9,  0,  3,  5,  6, 11,
-    ],
+    ]),
 ];
 
 // ---- Bit-level helpers -------------------------------------------------
@@ -543,6 +570,17 @@ impl<C: BlockCipher64> Cbc64<C> {
             self.chain = saved;
         }
         Ok(())
+    }
+}
+
+impl<C: BlockCipher64> Drop for Cbc64<C> {
+    fn drop(&mut self) {
+        // Best-effort wipe of the residual chaining block, matching the
+        // 128-bit `Cbc` (`cipher/cbc.rs`).
+        for b in self.chain.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.chain);
     }
 }
 
