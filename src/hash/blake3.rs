@@ -335,7 +335,10 @@ impl Blake3 {
             if supported16() {
                 while self.chunk_state.len() == 0 && input.len() > BULK16 {
                     let base = self.chunk_state.chunk_counter;
-                    let cvs = hash_chunks16(&input[..BULK16], &self.key, base, self.flags);
+                    let block: &[u8; BULK16] = input[..BULK16]
+                        .try_into()
+                        .expect("slice is exactly BULK16 bytes");
+                    let cvs = hash_chunks16(block, &self.key, base, self.flags);
                     for (k, cv) in cvs.iter().enumerate() {
                         self.add_chunk_cv(*cv, base + k as u64 + 1);
                     }
@@ -346,7 +349,10 @@ impl Blake3 {
             if supported() {
                 while self.chunk_state.len() == 0 && input.len() > BULK {
                     let base = self.chunk_state.chunk_counter;
-                    let cvs = hash_chunks8(&input[..BULK], &self.key, base, self.flags);
+                    let block: &[u8; BULK] = input[..BULK]
+                        .try_into()
+                        .expect("slice is exactly BULK bytes");
+                    let cvs = hash_chunks8(block, &self.key, base, self.flags);
                     for (k, cv) in cvs.iter().enumerate() {
                         self.add_chunk_cv(*cv, base + k as u64 + 1);
                     }
@@ -687,7 +693,8 @@ mod tests {
                     })
                     .collect();
                 if supported() {
-                    let got = hash_chunks8(&buf[..8 * CHUNK_LEN], &k, base, flags);
+                    let block: &[u8; 8 * CHUNK_LEN] = buf[..8 * CHUNK_LEN].try_into().unwrap();
+                    let got = hash_chunks8(block, &k, base, flags);
                     for (lane, g) in got.iter().enumerate() {
                         assert_eq!(
                             *g, want[lane],
@@ -696,7 +703,9 @@ mod tests {
                     }
                 }
                 if supported16() {
-                    let got = hash_chunks16(&buf, &k, base, flags);
+                    let block: &[u8; 16 * CHUNK_LEN] =
+                        buf[..16 * CHUNK_LEN].try_into().unwrap();
+                    let got = hash_chunks16(block, &k, base, flags);
                     for (lane, g) in got.iter().enumerate() {
                         assert_eq!(
                             *g, want[lane],
