@@ -4,23 +4,38 @@
 //!
 //! ```text
 //! root.key       (0600)  — PEM private key (algorithm-dependent format)
-//! root.crt       (0644)  — PEM self-signed CA certificate (serial = 1)
-//! serial         (0644)  — next-to-issue serial, single decimal u64
+//! root.crt       (0644)  — PEM self-signed CA certificate
+//! serial         (0644)  — monotonic issuance COUNTER (audit index), decimal u64
+//! crlnumber      (0644)  — monotonic CRL sequence counter, decimal u64
 //! issued.jsonl   (0644)  — JSON Lines, one record per issued cert
 //! revoked.jsonl  (0644)  — JSON Lines, one record per revocation
 //! crl.pem        (0644)  — last emitted CRL (re-written by `ca crl`)
 //! ```
+//!
+//! Certificate **serial numbers** are not taken from the `serial` file: every
+//! issuance (the root included) draws a fresh 64-bit CSPRNG serial via
+//! [`random_serial`], as CA/Browser Forum BR §7.1 requires. `serial` survives
+//! only as the human-facing issuance index recorded alongside each row in
+//! `issued.jsonl`.
+//!
+//! Every one of these files is created with `create_new` + an explicit mode
+//! and rewritten through a temp-file rename, so a pre-planted symlink at any
+//! of the paths is refused or replaced instead of being written through.
 //!
 //! Subcommands: `init`, `sign-csr`, `issue`, `revoke`, `crl`, `show`.
 
 use std::path::{Path, PathBuf};
 
 use crate::pki::{
-    describe_key, format_dn, issuer_ski_bytes, json_escape, parse_sans, parse_subject,
-    spki_bit_string_contents, validity_days,
+    MAX_X509_UNIX_TIME, Profile, default_extensions, describe_key, dns_general_names, format_dn,
+    issuer_ski_bytes, json_escape, parse_sans, parse_subject, random_serial,
+    spki_bit_string_contents, validity_days, verify_and_screen_csr,
 };
 use crate::template::{CertTemplate, builtin_names};
-use crate::util::{Args, SentinelLock, die, write_output, write_output_with_mode};
+use crate::util::{
+    Args, SentinelLock, atomic_overwrite, die, reject_symlink, write_new_file, write_output,
+    write_output_with_mode,
+};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
 use purecrypto::rng::OsRng;
 use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
@@ -59,7 +74,13 @@ impl CaDir {
     fn crl_pem(&self) -> PathBuf {
         self.dir.join("crl.pem")
     }
+    fn crl_number(&self) -> PathBuf {
+        self.dir.join("crlnumber")
+    }
 }
+
+/// Unix mode for the non-secret CA state files (everything but `root.key`).
+const CA_STATE_MODE: u32 = 0o644;
 
 fn now_unix() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,15 +99,30 @@ fn read_bytes(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| die(format!("cannot read {}: {e}", path.display())))
 }
 
-fn write_string(path: &Path, data: &str) {
-    std::fs::write(path, data)
-        .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())))
+/// Creates a CA state file that must not exist yet (`ca init`). `create_new`
+/// means a symlink pre-planted at the path is refused, never followed.
+fn create_state_file(path: &Path, data: &str) {
+    write_new_file(path, data.as_bytes(), CA_STATE_MODE);
 }
 
+/// Replaces a CA state file that legitimately changes over the CA's life —
+/// the issuance counter, the CRL number, the regenerated CRL. The temp-file
+/// rename replaces the directory entry, so a symlink at `path` is overwritten
+/// rather than written through, and no reader ever sees a torn file.
+fn replace_state_file(path: &Path, data: &str) {
+    atomic_overwrite(path, data.as_bytes(), CA_STATE_MODE);
+}
+
+/// Appends one ledger row. Append mode is the one open that *does* follow a
+/// symlink, so the path is screened first; the file itself is created by
+/// `ca init` with `create_new`, and re-created the same way if it is missing.
 fn append_line(path: &Path, line: &str) {
     use std::io::Write;
+    reject_symlink(path);
+    if !path.exists() {
+        write_new_file(path, b"", CA_STATE_MODE);
+    }
     let mut f = std::fs::OpenOptions::new()
-        .create(true)
         .append(true)
         .open(path)
         .unwrap_or_else(|e| die(format!("cannot open {}: {e}", path.display())));
@@ -153,20 +189,52 @@ fn bump_serial(ca: &CaDir, current: u64) {
     let next = current
         .checked_add(1)
         .unwrap_or_else(|| die("serial counter overflow (u64)"));
-    write_string(&ca.serial(), &format!("{next}\n"));
+    replace_state_file(&ca.serial(), &format!("{next}\n"));
 }
 
-/// Reads the current serial, hands it back, and bumps the on-disk counter
-/// — all under an inter-process [`SentinelLock`] so two racing
+/// Reads the current issuance index, hands it back, and bumps the on-disk
+/// counter — all under an inter-process [`SentinelLock`] so two racing
 /// `purecrypto ca` invocations cannot see the same value at `next_serial`,
-/// write the same `current + 1` back, and issue two certificates with the
-/// same serial (which would break the auditing / revocation invariants the
-/// CA depends on).
-fn allocate_serial(ca: &CaDir) -> u64 {
+/// write the same `current + 1` back, and record two certificates under one
+/// index (which would break the auditing invariants the ledger depends on).
+///
+/// NOTE: despite the file's historical name this is **not** the certificate
+/// serial number. A sequential 1-byte counter is exactly what CA/Browser
+/// Forum BR §7.1 forbids as a serial (it makes the to-be-signed bytes fully
+/// predictable, which is the entropy a chosen-prefix hash collision needs);
+/// serials come from [`random_serial`]. This counter survives purely as the
+/// audit index printed by `ca show` and stored in each `issued.jsonl` row.
+fn allocate_index(ca: &CaDir) -> u64 {
     let _lock = SentinelLock::acquire(ca.dir.join("serial.lock"), "`purecrypto ca`");
     let serial = next_serial(ca);
     bump_serial(ca, serial);
     serial
+}
+
+/// Reads, bumps, and returns the CRL sequence number (RFC 5280 §5.2.3's
+/// `cRLNumber` — monotonically increasing across every CRL this CA issues).
+/// Same inter-process lock as [`allocate_index`]; a pre-0.9 CA directory has
+/// no `crlnumber` file, so a missing one starts at 1.
+fn allocate_crl_number(ca: &CaDir) -> u64 {
+    let _lock = SentinelLock::acquire(ca.dir.join("serial.lock"), "`purecrypto ca`");
+    let path = ca.crl_number();
+    let current = if path.exists() {
+        read_string(&path)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_else(|_| die(format!("bad CRL number in {}", path.display())))
+    } else {
+        1
+    };
+    let next = current
+        .checked_add(1)
+        .unwrap_or_else(|| die("CRL number counter overflow (u64)"));
+    if path.exists() {
+        replace_state_file(&path, &format!("{next}\n"));
+    } else {
+        create_state_file(&path, &format!("{next}\n"));
+    }
+    current
 }
 
 fn serial_to_be_bytes(serial: u64) -> Vec<u8> {
@@ -212,7 +280,19 @@ fn run_init(args: Args) {
     let cn = args.value("-cn").unwrap_or("purecrypto Development CA");
     let algorithm = args.value("-algorithm").unwrap_or("EC");
     let curve = args.value("-curve").unwrap_or("P-256");
-    let days_n = days(&args);
+    // The `ca-root` profile carries `default_days = 3650`; honour it when the
+    // operator gives no `-days`, instead of quietly minting a root that
+    // expires in a year (and outlives nothing it signed).
+    let root_tmpl =
+        CertTemplate::builtin("ca-root").unwrap_or_else(|| die("missing ca-root template"));
+    let days_n = args
+        .value("-days")
+        .map(|d| {
+            d.parse::<u64>()
+                .unwrap_or_else(|_| die("invalid -days value"))
+        })
+        .or(root_tmpl.default_days.map(u64::from))
+        .unwrap_or(365);
 
     // Generate the key.
     let (key_pem, key_for_signer) = match algorithm.to_ascii_uppercase().as_str() {
@@ -254,32 +334,36 @@ fn run_init(args: Args) {
     let subject = DistinguishedName::common_name(cn);
     let validity = validity_days(days_n);
     let signer = key_for_signer.signer();
-    let root_tmpl =
-        CertTemplate::builtin("ca-root").unwrap_or_else(|| die("missing ca-root template"));
     let pubkey = signer.public_key();
     let spki_bits = spki_bit_string_contents(&pubkey);
     let exts: Vec<Extension> = root_tmpl.extensions(None, &[], &spki_bits);
-    let cert = Certificate::self_signed_with_extensions(
-        &signer, &subject, &validity, 1, // CA serial = 1
-        &exts,
-    )
-    .unwrap_or_else(|e| die(format!("cannot self-sign CA: {e}")));
+    // The root gets a CSPRNG serial like every other certificate: a hardcoded
+    // `1` is the most predictable serial there is, and the root is the one
+    // certificate whose forgery compromises the entire hierarchy.
+    let root_serial = random_serial();
+    let cert =
+        Certificate::self_signed_with_extensions(&signer, &subject, &validity, root_serial, &exts)
+            .unwrap_or_else(|e| die(format!("cannot self-sign CA: {e}")));
 
-    // Persist.
+    // Persist. Every file is created with `create_new` + an explicit mode, so
+    // a symlink pre-planted at any of these paths is refused rather than
+    // followed (`root.key` already had this via `write_output_with_mode`).
     write_output_with_mode(
         Some(ca.root_key().to_str().unwrap()),
         key_pem.as_bytes(),
         true,
     );
-    std::fs::write(ca.root_crt(), cert.to_pem())
-        .unwrap_or_else(|e| die(format!("cannot write root.crt: {e}")));
-    write_string(&ca.serial(), "2\n");
-    // Touch the JSONL files so they exist with valid mode.
-    write_string(&ca.issued(), "");
-    write_string(&ca.revoked(), "");
+    create_state_file(&ca.root_crt(), &cert.to_pem());
+    // The issuance counter starts at 1: it indexes rows in `issued.jsonl` and
+    // has nothing to do with the root's (random) serial.
+    create_state_file(&ca.serial(), "1\n");
+    create_state_file(&ca.crl_number(), "1\n");
+    // Touch the JSONL files so they exist with a known mode and owner.
+    create_state_file(&ca.issued(), "");
+    create_state_file(&ca.revoked(), "");
 
     println!(
-        "Initialized CA at {} (subject: {}, algorithm: {})",
+        "Initialized CA at {} (subject: {}, algorithm: {}, serial: {root_serial:#x}, valid {days_n} days)",
         ca.dir.display(),
         format_dn(&subject),
         algorithm
@@ -344,7 +428,6 @@ fn run_issue(args: Args) {
     };
 
     let sans = parse_sans_arg(&args);
-    let san_refs: Vec<&str> = sans.iter().map(String::as_str).collect();
 
     let root_key = load_root_key(&ca);
     let root_cert = load_root_cert(&ca);
@@ -352,15 +435,19 @@ fn run_issue(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
-    // Atomic read-modify-write of the serial counter under a sentinel
-    // file lock — see `SerialLock`.
-    let serial = allocate_serial(&ca);
+    // The certificate serial is a fresh 64-bit CSPRNG draw (BR §7.1); the
+    // on-disk counter is only the audit index recorded in `issued.jsonl`.
+    let index = allocate_index(&ca);
+    let serial = random_serial();
     let validity = validity_days(days_n);
 
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
         let subj_spki_bits = spki_bit_string_contents(&subject_key);
-        let csr_sans: Vec<GeneralName> = sans.iter().map(|s| GeneralName::Dns(s.clone())).collect();
+        // These SANs come from the operator's own `-sans` / `-addext` flags,
+        // not from a request, so the template is told to take them.
+        let tmpl = tmpl.allowing_csr_sans();
+        let csr_sans: Vec<GeneralName> = dns_general_names(&sans);
         let exts: Vec<Extension> = tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
         Certificate::issue_with_extensions(
             &root_key.signer(),
@@ -373,15 +460,23 @@ fn run_issue(args: Args) {
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
     } else {
-        Certificate::issue_general(
+        // No template: `default_extensions` supplies a constrained profile
+        // (keyUsage/EKU, pathLen-bounded CA) rather than the "any purpose"
+        // certificate an absent keyUsage would mean under RFC 5280 §4.2.1.3.
+        let profile = if is_ca_flag {
+            Profile::SubCa
+        } else {
+            Profile::Leaf
+        };
+        let exts = default_extensions(profile, &dns_general_names(&sans));
+        Certificate::issue_with_extensions(
             &root_key.signer(),
             &issuer_dn,
             &subject,
             &subject_key,
             &validity,
             serial,
-            is_ca_flag,
-            &san_refs,
+            &exts,
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert: {e}")))
     };
@@ -395,7 +490,8 @@ fn run_issue(args: Args) {
         .collect::<Vec<_>>()
         .join(",");
     let record = format!(
-        "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        index,
         serial,
         json_escape(&format_dn(&subject)),
         sans_json,
@@ -405,10 +501,10 @@ fn run_issue(args: Args) {
     append_line(&ca.issued(), &record);
 
     write_output(args.value("-out"), cert.to_pem().as_bytes());
-    if args.value("-out").is_none() {
-        // The PEM was written to stdout; emit a parenthetical to stderr.
-        eprintln!("issued serial {serial}");
-    }
+    // Serials are random now, so the operator cannot infer one: always say
+    // what was issued (on stderr, so `-out -` piping stays clean). `ca revoke
+    // -serial` accepts either form printed here.
+    eprintln!("issued serial {serial} ({serial:#x}), index {index}");
 }
 
 // ---------------------------------------------------------------------------
@@ -449,12 +545,14 @@ fn run_sign_csr(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
-    let serial = allocate_serial(&ca);
+    let index = allocate_index(&ca);
+    let serial = random_serial();
     let validity = validity_days(days_n);
 
-    // The CSR's self-signature MUST verify before we trust its subject/key.
-    csr.verify_self_signed()
-        .unwrap_or_else(|e| die(format!("CSR signature invalid: {e}")));
+    // The CSR's self-signature MUST verify before we trust its subject/key,
+    // and the request must clear the issuance policy (no SHA-1/MD5 signature,
+    // no undersized RSA key) before we countersign any of it.
+    verify_and_screen_csr(&csr);
     let subject_from_csr = csr
         .subject()
         .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
@@ -462,15 +560,22 @@ fn run_sign_csr(args: Args) {
         .public_key()
         .unwrap_or_else(|e| die(format!("bad CSR key: {e}")));
 
+    // Which names end up in the certificate. A CSR's `subjectAltName` is the
+    // requester's *claim* — certifying it verbatim turns a request for
+    // `DNS:www.google.com` into a chain-valid certificate for that name — so
+    // it is used only behind the explicit `-copy-csr-san` opt-in. Otherwise
+    // the operator names the SANs with `-san`/`-sans`/`-addext`, or the
+    // template lists them.
+    let sans = resolve_sign_csr_sans(&args, &csr);
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
         let subj_spki_bits = spki_bit_string_contents(&subject_key);
-        // CSR-supplied SANs honored only when the template asks for them.
-        let csr_dns = csr.subject_alt_names().unwrap_or_default();
-        let csr_sans: Vec<GeneralName> = csr_dns
-            .iter()
-            .map(|s| GeneralName::Dns(s.clone()))
-            .collect();
+        let tmpl = if sans.is_empty() {
+            tmpl
+        } else {
+            tmpl.allowing_csr_sans()
+        };
+        let csr_sans: Vec<GeneralName> = dns_general_names(&sans);
         let exts: Vec<Extension> = tmpl.extensions(Some(&csr_sans), &issuer_ski, &subj_spki_bits);
         Certificate::issue_with_extensions(
             &root_key.signer(),
@@ -483,26 +588,37 @@ fn run_sign_csr(args: Args) {
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
     } else {
-        Certificate::issue_from_csr(
+        // `Certificate::issue_from_csr` would copy the request's SANs and its
+        // `is_ca` bit into a bare basicConstraints; build the extensions here
+        // instead so the vetted SAN list and the default keyUsage/EKU profile
+        // apply.
+        let profile = if is_ca_flag {
+            Profile::SubCa
+        } else {
+            Profile::Leaf
+        };
+        let exts = default_extensions(profile, &dns_general_names(&sans));
+        Certificate::issue_with_extensions(
             &root_key.signer(),
             &issuer_dn,
-            &csr,
+            &subject_from_csr,
+            &subject_key,
             &validity,
             serial,
-            is_ca_flag,
+            &exts,
         )
         .unwrap_or_else(|e| die(format!("cannot issue cert from CSR: {e}")))
     };
 
     let subject = subject_from_csr;
-    let sans = csr.subject_alt_names().unwrap_or_default();
     let sans_json = sans
         .iter()
         .map(|s| format!("\"{}\"", json_escape(s)))
         .collect::<Vec<_>>()
         .join(",");
     let record = format!(
-        "{{\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        "{{\"index\":{},\"serial\":{},\"subject\":\"{}\",\"sans\":[{}],\"not_after\":\"{}\",\"issued_at\":{}}}",
+        index,
         serial,
         json_escape(&format_dn(&subject)),
         sans_json,
@@ -512,6 +628,43 @@ fn run_sign_csr(args: Args) {
     append_line(&ca.issued(), &record);
 
     write_output(args.value("-out"), cert.to_pem().as_bytes());
+    eprintln!("issued serial {serial} ({serial:#x}), index {index}");
+}
+
+/// The subjectAltName list `ca sign-csr` will certify.
+///
+/// Operator-supplied names (`-san` / `-sans` / `-addext`) always win. The
+/// CSR's own requested names are used only when `-copy-csr-san` is given, and
+/// then with a loud stderr warning naming every copied entry — the operator
+/// is asserting they checked that the requester controls those names. With
+/// neither, the request's names are dropped (and it is worth saying so, since
+/// pre-0.9 they were silently certified).
+fn resolve_sign_csr_sans(args: &Args, csr: &CertificationRequest) -> Vec<String> {
+    let explicit = parse_sans_arg(args);
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    let requested = csr.subject_alt_names().unwrap_or_default();
+    if requested.is_empty() {
+        return Vec::new();
+    }
+    if args.flag("-copy-csr-san") || args.flag("--copy-csr-san") || args.flag("-allow-csr-san") {
+        eprintln!(
+            "purecrypto: WARNING: -copy-csr-san given — certifying {} subjectAltName(s) \
+             claimed by the request without any verification: {}",
+            requested.len(),
+            requested.join(", ")
+        );
+        return requested;
+    }
+    eprintln!(
+        "purecrypto: note: ignoring {} subjectAltName(s) requested by the CSR ({}); \
+         pass -san NAME[,NAME] to certify names you have verified, or -copy-csr-san \
+         to take the request's list as-is",
+        requested.len(),
+        requested.join(", ")
+    );
+    Vec::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +696,14 @@ fn parse_serial_arg(raw: &str) -> u64 {
     }
 }
 
+/// The serials this CA has actually issued, read out of `issued.jsonl`.
+fn issued_serials(ca: &CaDir) -> Vec<u64> {
+    let raw = std::fs::read_to_string(ca.issued()).unwrap_or_default();
+    raw.lines()
+        .filter_map(|l| extract_u64(l, "\"serial\":"))
+        .collect()
+}
+
 fn run_revoke(args: Args) {
     let ca = ca_dir(&args);
     let serial = args
@@ -553,6 +714,29 @@ fn run_revoke(args: Args) {
         .value("-reason")
         .map(parse_reason)
         .unwrap_or(CrlReason::Unspecified);
+    let force = args.flag("-force") || args.flag("--force");
+
+    // A revocation for a serial this CA never issued puts a meaningless entry
+    // on the CRL forever (CRL entries are never removed) and usually means a
+    // typo in `-serial`. Refuse unless the operator insists — a CA directory
+    // restored without its ledger is the legitimate case for `-force`.
+    if !force && !issued_serials(&ca).contains(&serial) {
+        die(format!(
+            "serial {serial} ({serial:#x}) does not appear in {} — refusing to revoke a \
+             certificate this CA never issued (pass -force to override)",
+            ca.issued().display()
+        ));
+    }
+
+    // Revoking twice is a no-op, not a second CRL entry: duplicate entries for
+    // one serial are malformed-ish and make the CRL grow without bound.
+    if parse_revoked_jsonl(&ca.revoked())
+        .iter()
+        .any(|r| r.serial == serial)
+    {
+        println!("serial {serial} was already revoked; nothing to do");
+        return;
+    }
 
     let record = format!(
         "{{\"serial\":{},\"revoked_at\":{},\"reason\":\"{:?}\"}}",
@@ -638,20 +822,36 @@ fn run_crl(args: Args) {
 
     let this_update = Time::from_unix(now);
     // `days_n` is user-supplied (`-days N`); guard the * 86_400 + now
-    // arithmetic so a pathologically large value can't wrap the u64.
+    // arithmetic so a pathologically large value can't wrap the u64, and cap
+    // it at the last date an X.509 time can encode — `Time::utc` reduces the
+    // year modulo 10000, so a further-out nextUpdate would come back as a
+    // date in the *past* and the CRL would read as permanently stale.
     let next_update_unix = days_n
         .checked_mul(86_400)
         .and_then(|delta| now.checked_add(delta))
+        .filter(|end| *end <= MAX_X509_UNIX_TIME)
         .unwrap_or_else(|| {
             die(format!(
-                "-days {days_n} overflows when added to current time; pick a smaller value"
+                "-days {days_n} puts nextUpdate past the last representable X.509 date \
+                 (9999-12-31T23:59:59Z); pick a smaller value"
             ))
         });
     let next_update = Time::from_unix(next_update_unix);
     let mut b = CrlBuilder::new(&issuer_dn, this_update, Some(next_update));
 
+    // De-duplicate: a serial that appears twice in the ledger (an older
+    // directory, or a hand-edited file) must still produce exactly one
+    // `revokedCertificates` entry. The first record wins — it carries the
+    // earliest revocation date, which is the one relying parties need.
     let rows = parse_revoked_jsonl(&ca.revoked());
+    let mut seen: Vec<u64> = Vec::with_capacity(rows.len());
+    let mut emitted = 0usize;
     for r in &rows {
+        if seen.contains(&r.serial) {
+            continue;
+        }
+        seen.push(r.serial);
+        emitted += 1;
         b.revoke(
             &serial_to_be_bytes(r.serial),
             Time::from_unix(r.revoked_at),
@@ -662,18 +862,22 @@ fn run_crl(args: Args) {
             },
         );
     }
+    // RFC 5280 §5.2.3 makes `cRLNumber` a MUST on conforming CAs. The counter
+    // is allocated (and persisted) here so it advances once per emitted CRL,
+    // but `CrlBuilder` exposes no way to attach a crlExtension, so the number
+    // cannot yet reach the encoded CRL — see the note in `USAGE`/the report.
+    let crl_number = allocate_crl_number(&ca);
     let crl = b
         .sign(&root_key.signer())
         .unwrap_or_else(|e| die(format!("cannot sign CRL: {e}")));
     let pem = crl.to_pem();
-    write_string(&ca.crl_pem(), &pem);
+    replace_state_file(&ca.crl_pem(), &pem);
     if let Some(out) = args.value("-out") {
         write_output(Some(out), pem.as_bytes());
     } else {
         println!(
-            "wrote {} ({} revocations)",
+            "wrote {} (CRL number {crl_number}, {emitted} revocations)",
             ca.crl_pem().display(),
-            rows.len()
         );
     }
 }
@@ -696,8 +900,13 @@ fn run_show(args: Args) {
     let key = cert
         .subject_public_key()
         .unwrap_or_else(|e| die(format!("bad key: {e}")));
-    let next_serial = if ca.serial().exists() {
+    let next_index = if ca.serial().exists() {
         read_string(&ca.serial()).trim().to_string()
+    } else {
+        "?".into()
+    };
+    let next_crl_number = if ca.crl_number().exists() {
+        read_string(&ca.crl_number()).trim().to_string()
     } else {
         "?".into()
     };
@@ -716,7 +925,10 @@ fn run_show(args: Args) {
     println!("CA at {}", ca.dir.display());
     println!("    Subject:    {}", format_dn(&subject));
     println!("    Key:        {}", describe_key(&key));
-    println!("    Next serial: {next_serial}");
+    // Not "next serial": serials are random per issuance (BR §7.1). This is
+    // the audit index the next `issued.jsonl` row will carry.
+    println!("    Next index:  {next_index}");
+    println!("    Next CRL number: {next_crl_number}");
     println!("    Issued:     {issued}");
     println!("    Revoked:    {revoked}");
     println!(
@@ -769,11 +981,25 @@ purecrypto ca — manage a development CA
 USAGE:
     purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519|ED448] [-curve P-256] [-days N]
     purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH]
-    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-template NAME] [-template-file PATH]
-    purecrypto ca revoke  -dir DIR -serial 7|0x7 [-reason key-compromise|superseded|...]
+    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-template NAME] [-template-file PATH]
+    purecrypto ca revoke  -dir DIR -serial N|0xN [-reason key-compromise|superseded|...] [-force]
     purecrypto ca crl     -dir DIR [-out crl.pem] [-days N]
     purecrypto ca show    -dir DIR
     purecrypto ca list-templates
+
+NOTES:
+    Serial numbers are drawn fresh from the OS CSPRNG for every certificate,
+    the root included (CA/Browser Forum BR 7.1). `ca issue` / `ca sign-csr`
+    print the serial they used on stderr; `DIR/serial` is only an audit index.
+
+    A CSR's requested subjectAltName is NOT certified by default — it is the
+    requester's claim. Name the SANs yourself with `-san a,b`, or pass
+    `-copy-csr-san` to take the request's list as-is (a warning naming every
+    copied entry goes to stderr).
+
+    Submitted CSRs must carry a >= 2048-bit RSA key and a signature that is
+    not SHA-1/MD5-based; `ca revoke` refuses a serial that is absent from
+    DIR/issued.jsonl unless `-force` is given.
 ";
 
 pub(crate) fn run(args: Args) {
@@ -816,7 +1042,7 @@ pub(crate) fn run(args: Args) {
 mod tests {
     //! FFI-1 / FFI-2 regression coverage. The full `run_*` entry points
     //! shell out to `die()` (process exit) so we exercise the inner
-    //! helpers — `allocate_serial` (FFI-1) and the `run_crl` next-update
+    //! helpers — `allocate_index` (FFI-1) and the `run_crl` next-update
     //! arithmetic (FFI-2) — directly against scratch directories.
     use super::*;
     use std::collections::HashSet;
@@ -865,12 +1091,12 @@ mod tests {
         (ca, td)
     }
 
-    /// FFI-1: two threads racing `allocate_serial` against the same `serial`
+    /// FFI-1: two threads racing `allocate_index` against the same `serial`
     /// file must hand out distinct numbers — otherwise the CA could issue
     /// two certificates with the same serial, breaking revocation /
     /// auditing.
     #[test]
-    fn allocate_serial_is_atomic_across_threads() {
+    fn allocate_index_is_atomic_across_threads() {
         let (ca, _td) = fresh_ca(100, "atomic");
         let ca = Arc::new(ca);
         const THREADS: u32 = 8;
@@ -884,7 +1110,7 @@ mod tests {
                 barrier.wait();
                 let mut got = Vec::with_capacity(PER_THREAD as usize);
                 for _ in 0..PER_THREAD {
-                    got.push(allocate_serial(&ca));
+                    got.push(allocate_index(&ca));
                 }
                 got
             }));
@@ -928,7 +1154,7 @@ mod tests {
         });
         assert!(h.join().is_err(), "thread should have panicked");
         // Drop has run; the next allocator must succeed immediately.
-        let n = allocate_serial(&ca);
+        let n = allocate_index(&ca);
         assert_eq!(n, 7);
     }
 
@@ -936,7 +1162,7 @@ mod tests {
     /// hammer the same `serial` file while the main thread counts
     /// how many distinct values fell out.
     #[test]
-    fn allocate_serial_no_gaps_under_contention() {
+    fn allocate_index_no_gaps_under_contention() {
         let (ca, _td) = fresh_ca(1, "nogaps");
         let ca = Arc::new(ca);
         let count = Arc::new(AtomicU32::new(0));
@@ -948,7 +1174,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 let mut got = Vec::new();
                 while count.fetch_add(1, Ordering::Relaxed) < N {
-                    got.push(allocate_serial(&ca));
+                    got.push(allocate_index(&ca));
                 }
                 got
             }));
