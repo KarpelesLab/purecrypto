@@ -32,14 +32,27 @@ fn push_base128(out: &mut Vec<u8>, value: u64) {
 /// encoded value is `80 + arc1`. The decoder in [`parse_oid`] mirrors this.
 ///
 /// # Panics
-/// Panics if fewer than two arcs are given.
+/// This is an encoder for OIDs the caller owns, so an inexpressible OID is a
+/// programming error and panics rather than encoding something that would not
+/// round-trip. It panics if:
+///
+/// * fewer than two arcs are given;
+/// * `arcs[0] > 2` (X.690 §8.19.4 defines only the three top-level arcs);
+/// * `arcs[0] < 2` and `arcs[1] >= 40` — the joint value would collide with a
+///   different OID (`[1, 40]` would encode as `0x50`, which decodes back as
+///   `[2, 0]`);
+/// * the joint first sub-identifier overflows `u64`.
 pub fn encode_oid_arcs(arcs: &[u64]) -> Vec<u8> {
     assert!(arcs.len() >= 2, "OID needs at least two arcs");
+    assert!(arcs[0] <= 2, "OID arc 0 must be 0, 1 or 2");
     let mut body = Vec::new();
     let first = if arcs[0] < 2 {
+        assert!(arcs[1] < 40, "OID arc 1 must be < 40 when arc 0 is 0 or 1");
         40 * arcs[0] + arcs[1]
     } else {
-        80 + arcs[1]
+        80u64
+            .checked_add(arcs[1])
+            .expect("OID first sub-identifier overflows u64")
     };
     push_base128(&mut body, first);
     for &arc in &arcs[2..] {
@@ -190,6 +203,38 @@ mod tests {
         ] {
             let body = encode_oid_arcs(&arcs);
             assert_eq!(parse_oid(&body).unwrap(), arcs);
+        }
+    }
+
+    /// `40 * arcs[0] + arcs[1]` used to be unchecked: a huge `arcs[1]` panicked
+    /// on overflow in debug and wrapped in release, and `[1, 40]` encoded as
+    /// `0x50` — which decodes back as `[2, 0]`, a silent round-trip failure.
+    /// The encoder now rejects both up front, explicitly.
+    #[test]
+    #[should_panic(expected = "OID arc 1 must be < 40")]
+    fn rejects_arc1_at_or_above_40_under_arc0_below_2() {
+        encode_oid_arcs(&[1, 40]);
+    }
+
+    #[test]
+    #[should_panic(expected = "OID arc 0 must be 0, 1 or 2")]
+    fn rejects_arc0_above_2() {
+        encode_oid_arcs(&[3, 1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows u64")]
+    fn rejects_first_subidentifier_overflow() {
+        encode_oid_arcs(&[2, u64::MAX]);
+    }
+
+    #[test]
+    fn every_encodable_first_subidentifier_round_trips() {
+        for arc0 in 0u64..=1 {
+            for arc1 in 0u64..40 {
+                let arcs = alloc::vec![arc0, arc1, 7];
+                assert_eq!(parse_oid(&encode_oid_arcs(&arcs)).unwrap(), arcs);
+            }
         }
     }
 }
