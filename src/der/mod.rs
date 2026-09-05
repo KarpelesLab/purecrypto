@@ -165,10 +165,28 @@ impl<'a> Reader<'a> {
         Ok(len)
     }
 
+    /// Reads one identifier octet.
+    ///
+    /// X.690 §8.1.2.4: an identifier octet whose low five bits are all set
+    /// (`tag & 0x1f == 0x1f`) introduces the *high-tag-number* form, where the
+    /// tag number continues in one or more further octets. This reader models a
+    /// tag as a single byte, so it would consume the first continuation octet
+    /// as the LENGTH and assign a different element boundary than a conformant
+    /// parser would — and `read_element` hands those boundaries straight to
+    /// signature verification. No ASN.1 structure this crate supports uses a
+    /// tag number ≥ 31, so the form is rejected outright.
+    fn read_tag(&mut self) -> Result<u8, Error> {
+        let tag = self.read_u8()?;
+        if tag & 0x1f == 0x1f {
+            return Err(Error::Malformed);
+        }
+        Ok(tag)
+    }
+
     /// Reads a tag-length-value with the given `expected_tag`, returning the
     /// value bytes.
     pub fn read_tlv(&mut self, expected_tag: u8) -> Result<&'a [u8], Error> {
-        let tag = self.read_u8()?;
+        let tag = self.read_tag()?;
         if tag != expected_tag {
             return Err(Error::UnexpectedTag {
                 expected: expected_tag,
@@ -274,6 +292,11 @@ impl<'a> Reader<'a> {
 
     /// Returns the tag of the next value without consuming it, or `None` at end
     /// of input. Useful for optional / `DEFAULT` fields.
+    ///
+    /// This is the raw identifier octet; the high-tag-number form
+    /// (`tag & 0x1f == 0x1f`, X.690 §8.1.2.4) is not decoded here — it simply
+    /// will not match any tag this crate looks for, and the subsequent read
+    /// rejects it.
     #[inline]
     pub fn peek_tag(&self) -> Option<u8> {
         self.data.first().copied()
@@ -281,7 +304,7 @@ impl<'a> Reader<'a> {
 
     /// Reads a tag-length-value of any tag, returning `(tag, value)`.
     pub fn read_any(&mut self) -> Result<(u8, &'a [u8]), Error> {
-        let tag = self.read_u8()?;
+        let tag = self.read_tag()?;
         let len = self.read_length()?;
         Ok((tag, self.take(len)?))
     }
@@ -291,7 +314,7 @@ impl<'a> Reader<'a> {
     /// DER of a nested structure).
     pub fn read_element(&mut self) -> Result<&'a [u8], Error> {
         let start = self.data;
-        let _tag = self.read_u8()?;
+        let _tag = self.read_tag()?;
         let len = self.read_length()?;
         let header = start.len() - self.data.len();
         self.take(len)?;
@@ -402,5 +425,49 @@ mod tests {
         let n = encode_null();
         assert_eq!(n, vec![0x05, 0x00]);
         Reader::new(&n).read_null().unwrap();
+    }
+
+    /// X.690 §8.1.2.4: an identifier octet with the low five bits all set
+    /// introduces the high-tag-number form, where the tag number continues in
+    /// further octets. This reader models a tag as one byte, so accepting the
+    /// form would make it read the first continuation octet as the LENGTH and
+    /// carve a *different* element than a conformant parser — and
+    /// `read_element` is what scopes the bytes a signature covers. Reject it.
+    #[test]
+    fn rejects_high_tag_number_form() {
+        // `[0x3f, 0x81, 0x00, ...]`: conformant readers see tag number 128 with
+        // length 4; this reader would see length 0x81 -> 0x00 (long form).
+        // Either way, the two disagree, so it must not be parsed at all.
+        let ambiguous: &[u8] = &[0x3f, 0x81, 0x00, 0x02, 0x01, 0x01, 0xff];
+        assert_eq!(Reader::new(ambiguous).read_any(), Err(Error::Malformed));
+        assert_eq!(Reader::new(ambiguous).read_element(), Err(Error::Malformed));
+        assert_eq!(
+            Reader::new(ambiguous).read_tlv(tag::SEQUENCE),
+            Err(Error::Malformed)
+        );
+
+        // Every class/constructedness combination of the form is rejected.
+        for tag in [0x1fu8, 0x3f, 0x5f, 0x7f, 0x9f, 0xbf, 0xdf, 0xff] {
+            let buf = [tag, 0x01, 0x00, 0x00];
+            assert_eq!(
+                Reader::new(&buf).read_any(),
+                Err(Error::Malformed),
+                "tag {tag:#04x}"
+            );
+        }
+
+        // A high-tag element nested inside a SEQUENCE is rejected too, rather
+        // than silently mis-slicing the members.
+        let seq = encode_sequence(&[0x3f, 0x81, 0x00, 0x02, 0x01, 0x01]);
+        let mut r = Reader::new(&seq).read_sequence().unwrap();
+        assert_eq!(r.read_element(), Err(Error::Malformed));
+
+        // Low-tag-number tags are unaffected.
+        let ok = encode_integer(&[0x2a]);
+        assert_eq!(
+            Reader::new(&ok).read_any().unwrap(),
+            (tag::INTEGER, &[0x2a][..])
+        );
+        assert_eq!(Reader::new(&ok).read_element().unwrap(), &ok[..]);
     }
 }
