@@ -675,11 +675,30 @@ fn enforce_constraints_on_cert(
         return Ok(());
     }
 
+    // A wildcard SAN authorises every host under its suffix, so an excluded
+    // subtree that falls anywhere inside that span must count as a match.
+    // Comparing literally (`dns_in_subtree("*.example.com",
+    // "secure.example.com")` is false, because "*" is just a label) let the
+    // standard "delegate example.com but not secure.example.com" pattern be
+    // defeated: a leaf with `SAN = *.example.com` passed both the permitted
+    // and excluded checks and then authenticated `secure.example.com` via
+    // `dns_name_matches`. Normalise the wildcard to the subtree it covers.
+    //
+    // The permitted-subtree direction below needs no such treatment: a
+    // wildcard is permitted only when its literal suffix already sits inside
+    // a permitted base, which is the conservative answer.
+    let excluded_hit = |name: &str, base: &str| {
+        dns_in_subtree(name, base)
+            || name
+                .strip_prefix("*.")
+                .is_some_and(|apex| dns_in_subtree(base, apex))
+    };
+
     for nc in active {
         // Excluded subtrees: any match in any in-scope CA is fatal.
         for name in &dns {
             for base in &nc.excluded_dns {
-                if dns_in_subtree(name, base) {
+                if excluded_hit(name, base) {
                     return Err(Error::BadCertificate);
                 }
             }
@@ -1521,6 +1540,65 @@ mod tests {
         .unwrap();
         // ...and the CN it carries authenticates nothing.
         assert!(verify_hostname(&leaf, "host.bad.example").is_err());
+    }
+
+    /// MEDIUM: an excluded dNSName subtree must not be escapable with a
+    /// wildcard SAN. The classic delegation shape — `permitted = example.com`,
+    /// `excluded = secure.example.com` — was defeated by a leaf carrying
+    /// `SAN = *.example.com`: literal subtree comparison treats `*` as an
+    /// ordinary label, so the exclusion never matched, yet `dns_name_matches`
+    /// then happily authenticated `secure.example.com`.
+    #[test]
+    fn name_constraints_excluded_not_bypassed_by_wildcard_san() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns("example.com".into())],
+            &[GeneralName::Dns("secure.example.com".into())],
+        );
+        let leaf_sans = [GeneralName::Dns("*.example.com".into())];
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
+
+        // The wildcard really does cover the excluded host — that is the point.
+        assert!(dns_name_matches("*.example.com", "secure.example.com"));
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert!(matches!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            ),
+            Err(Error::BadCertificate)
+        ));
+    }
+
+    /// The wildcard normalisation above must not over-reject: a wildcard SAN
+    /// whose span does not reach the excluded subtree still verifies.
+    #[test]
+    fn name_constraints_wildcard_san_outside_excluded_subtree_accepted() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[GeneralName::Dns("example.com".into())],
+            &[GeneralName::Dns("secure.example.com".into())],
+        );
+        // "*.eu.example.com" spans only hosts under ".eu.example.com", which
+        // does not contain "secure.example.com".
+        let leaf_sans = [GeneralName::Dns("*.eu.example.com".into())];
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
     }
 
     /// Issuing and validating a self-signed ML-DSA-65 certificate through
