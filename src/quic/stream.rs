@@ -490,6 +490,14 @@ pub(crate) struct RecvStream {
     pub(crate) read_off: u64,
     /// Out-of-order fragments keyed by start offset.
     pub(crate) pending: BTreeMap<u64, Vec<u8>>,
+    /// Sum of `pending`'s value lengths. Overlapping fragments are each
+    /// stored in full, so the byte volume held here is NOT bounded by the
+    /// per-stream flow-control ceiling (which constrains each fragment's
+    /// END OFFSET, not the sum of fragment lengths): a peer replaying the
+    /// same range at descending offsets can hold `MAX_PENDING_FRAGMENTS`
+    /// near-window-sized copies while charging the window only once. This
+    /// running total lets [`RecvStream::on_data`] enforce a real byte cap.
+    pub(crate) pending_bytes: usize,
     /// Total stream length once the FIN bit is observed.
     pub(crate) fin_offset: Option<u64>,
     /// Local credit limit — the absolute byte count we have promised to
@@ -529,6 +537,7 @@ impl RecvStream {
             next_offset: 0,
             read_off: 0,
             pending: BTreeMap::new(),
+            pending_bytes: 0,
             fin_offset: None,
             max_data,
             max_data_announced: max_data,
@@ -570,7 +579,17 @@ impl RecvStream {
         fin: bool,
     ) -> Result<u64, crate::tls::Error> {
         if matches!(self.state, RecvState::ResetRecvd | RecvState::ResetRead) {
-            // Post-reset: drop silently.
+            // Post-reset the payload is discarded, but the final size is
+            // already known: RFC 9000 §4.5 still requires FINAL_SIZE_ERROR
+            // for a STREAM frame claiming bytes past it.
+            let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or(crate::tls::Error::Decode)?;
+            if let Some(fin) = self.fin_offset
+                && end > fin
+            {
+                return Err(crate::tls::Error::Decode);
+            }
             return Ok(0);
         }
         let end = offset
@@ -638,6 +657,7 @@ impl RecvStream {
                 && p_off <= self.next_offset
             {
                 let frag = self.pending.remove(&p_off).expect("just-peeked");
+                self.pending_bytes = self.pending_bytes.saturating_sub(frag.len());
                 let p_end = p_off + frag.len() as u64;
                 if p_end <= self.next_offset {
                     continue; // fully covered
@@ -692,6 +712,30 @@ impl RecvStream {
                         // `newly_contig` is 0 on this out-of-order path.
                         return Ok(newly_contig);
                     }
+                    // QUIC-A3: bound the per-stream out-of-order BYTE
+                    // volume, not just the fragment count. `end <= max_data`
+                    // (checked above) bounds each fragment's end offset, not
+                    // the sum of their lengths — fragments that overlap are
+                    // each stored in full, so descending-offset replays of a
+                    // window-sized range would otherwise buffer
+                    // `MAX_PENDING_FRAGMENTS` copies of it. The peer is only
+                    // ever entitled to `max_data - next_offset` bytes beyond
+                    // the contiguous point, so that is the budget; a
+                    // conformant sender never exceeds it, because its
+                    // non-overlapping fragments all live inside that span.
+                    // As with the fragment cap we DROP rather than error:
+                    // the excess is by construction redundant with data we
+                    // already hold, and the sender still owns it as unacked.
+                    let budget = self.max_data.saturating_sub(self.next_offset);
+                    let budget = usize::try_from(budget).unwrap_or(usize::MAX);
+                    let projected = self
+                        .pending_bytes
+                        .saturating_sub(existing)
+                        .saturating_add(data.len());
+                    if projected > budget {
+                        return Ok(newly_contig);
+                    }
+                    self.pending_bytes = projected;
                     self.pending.insert(offset, data.to_vec());
                 }
             }
@@ -745,6 +789,14 @@ impl RecvStream {
         if final_size < self.next_offset {
             return Err(crate::tls::Error::Decode);
         }
+        // RFC 9000 §4.5: "A receiver SHOULD treat receipt of a
+        // RESET_STREAM frame that ... violates the flow control limit
+        // ... as a connection error of type FLOW_CONTROL_ERROR." The
+        // declared final size counts against the stream's credit exactly
+        // like delivered bytes would.
+        if final_size > self.max_data {
+            return Err(crate::tls::Error::Decode);
+        }
         // G-2: tighten — pending out-of-order fragments may already
         // extend past `next_offset`. RESET_STREAM cannot declare a
         // final size that is below any byte the peer has *already*
@@ -766,6 +818,7 @@ impl RecvStream {
             return Ok(()); // idempotent
         }
         self.pending.clear();
+        self.pending_bytes = 0;
         // RFC 9000 §3.2 — on RESET_STREAM the receiver discards data it
         // already received but the application has not read. (This also
         // keeps the connection-level consumed accounting exact: the
@@ -1163,6 +1216,79 @@ mod tests {
         // final_size >= 150 is fine.
         let ok = r.on_reset(0, 200);
         assert!(ok.is_ok());
+    }
+
+    /// QUIC-A3 regression: `pending` had a fragment-COUNT cap but no
+    /// byte cap. The in-code justification ("per-stream flow control
+    /// bounds the buffered byte volume") was wrong: `end <= max_data`
+    /// bounds each fragment's END OFFSET, not the sum of the fragment
+    /// lengths, and overlapping fragments are each stored in full. 128
+    /// near-window-sized fragments in DESCENDING offset order therefore
+    /// all passed the flow-control check while buffering ~8.4 MB against
+    /// 64 KiB of announced credit — and the connection window was charged
+    /// only once, because every later frame had a smaller end offset.
+    #[test]
+    fn pending_bytes_are_capped_by_the_stream_window() {
+        const WINDOW: u64 = 65536;
+        let mut r = RecvStream::new(WINDOW);
+        let big = alloc::vec![0u8; 65408];
+        // Descending offsets: each fragment ends at or below `max_data`,
+        // none is covered by a previously stored fragment, and none makes
+        // the contiguous prefix advance (offset 0 is never sent).
+        for off in (1..=128u64).rev() {
+            r.on_data(off, &big, false).expect("no protocol violation");
+        }
+        let summed: usize = r.pending.values().map(|v| v.len()).sum();
+        assert_eq!(summed, r.pending_bytes, "pending_bytes accounting drifted");
+        assert!(
+            r.pending_bytes as u64 <= WINDOW,
+            "buffered {} bytes for a {WINDOW}-byte window",
+            r.pending_bytes
+        );
+        assert!(r.pending.len() < MAX_PENDING_FRAGMENTS);
+    }
+
+    /// The byte cap must not reject a conformant sender: non-overlapping
+    /// fragments always fit inside `max_data - next_offset`, and the
+    /// running total is maintained as they are absorbed.
+    #[test]
+    fn pending_byte_cap_admits_non_overlapping_fragments() {
+        let mut r = RecvStream::new(4096);
+        // 16 gaps of 8 bytes each, out of order, all within the window.
+        for i in (1..16u64).rev() {
+            r.on_data(i * 8, &[7u8; 8], false).expect("accepted");
+        }
+        assert_eq!(r.pending.len(), 15);
+        assert_eq!(r.pending_bytes, 15 * 8);
+        // Filling the hole absorbs everything and zeroes the total.
+        let got = r.on_data(0, &[7u8; 8], false).expect("accepted");
+        assert_eq!(got, 16 * 8);
+        assert_eq!(r.next_offset, 16 * 8);
+        assert!(r.pending.is_empty());
+        assert_eq!(r.pending_bytes, 0);
+    }
+
+    /// RFC 9000 §4.5 — a RESET_STREAM whose final size exceeds the
+    /// stream's flow-control limit is a FLOW_CONTROL_ERROR.
+    #[test]
+    fn reset_final_size_beyond_max_data_is_rejected() {
+        let mut r = RecvStream::new(100);
+        assert!(r.on_reset(1, 101).is_err());
+        r.on_reset(1, 100).expect("at the limit is legal");
+    }
+
+    /// RFC 9000 §4.5 — once RESET_STREAM has fixed the final size, a
+    /// STREAM frame claiming bytes past it is a FINAL_SIZE_ERROR even
+    /// though its payload is discarded.
+    #[test]
+    fn stream_frame_past_reset_final_size_is_rejected() {
+        let mut r = RecvStream::new(1000);
+        r.on_reset(1, 10).expect("reset");
+        // At or below the final size: silently discarded.
+        r.on_data(0, &[0u8; 10], false).expect("discarded");
+        // Past it: FINAL_SIZE_ERROR.
+        assert!(r.on_data(0, &[0u8; 11], false).is_err());
+        assert!(r.on_data(10, &[0u8; 1], false).is_err());
     }
 
     // QUIC-4 — RFC 9000 §4: per-stream pending-fragment count must be
