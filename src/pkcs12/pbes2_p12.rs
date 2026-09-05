@@ -62,7 +62,12 @@ impl CipherKind {
 /// Decrypts a PBES2 blob given its `algorithm` AlgorithmIdentifier DER (the
 /// full `SEQUENCE { OID id-PBES2, PBES2-params }`), the ciphertext, and the
 /// raw (UTF-8) password.
-pub(super) fn decrypt(alg: &[u8], ciphertext: &[u8], password: &[u8]) -> Result<Vec<u8>, Error> {
+pub(super) fn decrypt(
+    alg: &[u8],
+    ciphertext: &[u8],
+    password: &[u8],
+    budget: &mut super::Budget,
+) -> Result<Vec<u8>, Error> {
     let mut r = Reader::new(alg);
     let mut seq = r.read_sequence()?;
     let oid = parse_oid(seq.read_oid()?)?;
@@ -133,6 +138,15 @@ pub(super) fn decrypt(alg: &[u8], ciphertext: &[u8], password: &[u8]) -> Result<
     if key_len != cipher.key_len() {
         return Err(Error::UnsupportedAlgorithm);
     }
+
+    // Charge the aggregate work budget *before* running PBKDF2: the cost is
+    // `iterations` PRF rounds per output block. See `super::MAX_TOTAL_ITERATIONS`.
+    let out_len = match prf {
+        Prf::Sha1 => 20usize,
+        Prf::Sha256 => 32,
+        Prf::Sha512 => 64,
+    };
+    budget.charge(iterations, key_len.div_ceil(out_len) as u64)?;
 
     // Derive the key.
     let mut key = alloc::vec![0u8; key_len];

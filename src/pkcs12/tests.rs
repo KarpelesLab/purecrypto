@@ -149,3 +149,194 @@ fn dump_built_for_openssl() {
     let p12 = Pfx::build(KEY_PK8, &[CERT_DER], "hunter2", Some("pc built"), &mut r);
     std::fs::write("/tmp/purecrypto_built.p12", &p12).unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Aggregate key-derivation work budget
+//
+// `MAX_ITERATIONS` bounds each *individual* KDF run, but nothing bounded the
+// *number* of runs. A PFX with a valid MAC (the "import this .p12" scenario,
+// where the attacker knows the password) could pack thousands of ~125-byte
+// `pkcs8ShroudedKeyBag`s into one megabyte, each declaring
+// `iterationCount = 10_000_000` with `prf = hmacWithSHA512` — hours to days of
+// CPU per upload, with every bag decrypting fine so the `?` never short-
+// circuits. Two defences: a per-parse cumulative iteration budget, and a hard
+// cap on the number of bags / ContentInfos.
+// ---------------------------------------------------------------------------
+
+/// A real `pkcs8ShroudedKeyBag` bagValue: PBES2 (PBKDF2-HMAC-SHA-256 +
+/// AES-256-CBC) over the fixture key, at a caller-chosen iteration count. These
+/// decrypt successfully under [`PASSWORD`], which is the whole point — the
+/// published attack has the attacker knowing the password, so every bag
+/// succeeds and the `?` in the bag loop never short-circuits.
+fn shrouded_key_bag_value(iterations: u32, rng: &mut HmacDrbg<Sha256Hash>) -> Vec<u8> {
+    pbes2::encrypt(
+        KEY_PK8,
+        PASSWORD.as_bytes(),
+        &pbes2::Pbes2Params {
+            kdf: pbes2::KdfChoice::Pbkdf2HmacSha256 { iterations },
+            cipher: pbes2::CipherChoice::Aes256Cbc,
+            salt_len: 16,
+        },
+        rng,
+    )
+}
+
+/// Wraps `content_infos` (already-encoded ContentInfo DER, concatenated) into a
+/// complete, correctly MAC'd PFX under [`PASSWORD`]. The MAC is genuine, so the
+/// parser reaches the bag loop exactly as it would for a real archive.
+fn mac_sealed_pfx(content_infos: &[u8]) -> Vec<u8> {
+    let auth_safe = encode_sequence(content_infos);
+    let auth_safe_ci = encode_data_content_info(&auth_safe);
+    let pw_bmp = password_to_bmp(PASSWORD);
+    let mac_data = build_mac_data(&auth_safe, &pw_bmp, &[0x77; 8], 2048);
+    encode_sequence(&[encode_integer(&[0x03]), auth_safe_ci, mac_data].concat())
+}
+
+/// One `data` ContentInfo holding `n` shrouded key bags at `iterations` each.
+fn shrouded_bag_content_info(n: usize, iterations: u32) -> Vec<u8> {
+    let mut r = rng(b"pkcs12-budget-bags");
+    let mut bags = Vec::new();
+    for _ in 0..n {
+        bags.extend_from_slice(&encode_safe_bag(
+            OID_PKCS8_SHROUDED_KEY_BAG,
+            &shrouded_key_bag_value(iterations, &mut r),
+            None,
+            None,
+        ));
+    }
+    encode_data_content_info(&encode_sequence(&bags))
+}
+
+/// The aggregate budget must be shared across bags: several cheap-looking bags
+/// that together exceed the pool are rejected, and the rejection happens
+/// *before* the over-budget derivation is run. Driven through `parse_budgeted`
+/// with a tiny pool so the test does not have to burn `MAX_TOTAL_ITERATIONS`
+/// rounds of real PBKDF2 to prove the accounting works.
+#[test]
+fn aggregate_kdf_budget_is_shared_across_bags() {
+    // 4 bags x 2000 iterations x 1 PBKDF2 output block (a 32-byte AES-256 key
+    // from the 32-byte HMAC-SHA-256 PRF) = 8000 charged. Every bag decrypts
+    // fine, so nothing else stops the loop.
+    let pfx = mac_sealed_pfx(&shrouded_bag_content_info(4, 2000));
+    let pw_bmp = password_to_bmp(PASSWORD);
+
+    // A pool that covers only the first two bags: the third is refused, even
+    // though it is perfectly well-formed and would have decrypted.
+    assert_eq!(
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 5000 }).unwrap_err(),
+        Error::WorkBudgetExceeded,
+    );
+    // With room for all four, the same archive parses — so the budget is what
+    // rejected it above, not the archive being malformed.
+    let parsed = Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 8000 })
+        .expect("in budget");
+    assert_eq!(parsed.keys.len(), 4);
+}
+
+/// The same budget must span *ContentInfo* boundaries, not restart per
+/// ContentInfo.
+#[test]
+fn aggregate_kdf_budget_spans_content_infos() {
+    let mut cis = Vec::new();
+    for _ in 0..4 {
+        cis.extend_from_slice(&shrouded_bag_content_info(1, 2000));
+    }
+    let pfx = mac_sealed_pfx(&cis);
+    let pw_bmp = password_to_bmp(PASSWORD);
+    assert_eq!(
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 5000 }).unwrap_err(),
+        Error::WorkBudgetExceeded,
+    );
+    assert_eq!(
+        Pfx::parse_budgeted(&pfx, PASSWORD, &pw_bmp, Budget { remaining: 8000 })
+            .expect("in budget")
+            .keys
+            .len(),
+        4,
+    );
+}
+
+/// The published attack shape — thousands of tiny bags packed into one
+/// megabyte — is refused by the *default* `Pfx::parse` entry point on the bag
+/// cap alone, before the aggregate budget even matters. Uses bags that cost
+/// nothing to process, so this stays a fast test while still exercising the
+/// real entry point.
+#[test]
+fn safe_bag_count_is_capped() {
+    // certBags with an unknown certId are skipped entirely — no KDF at all.
+    let empty_cert_bag = encode_sequence(
+        &[
+            oid_tlv(&[1, 2, 3, 4]),
+            encode_context(0, &encode_octet_string(&[])),
+        ]
+        .concat(),
+    );
+    let mut bags = Vec::new();
+    for _ in 0..(MAX_SAFE_BAGS + 1) {
+        bags.extend_from_slice(&encode_safe_bag(OID_CERT_BAG, &empty_cert_bag, None, None));
+    }
+    let pfx = mac_sealed_pfx(&encode_data_content_info(&encode_sequence(&bags)));
+    assert_eq!(
+        Pfx::parse(&pfx, PASSWORD).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+
+    // One under the cap parses fine (the bags are simply ignored).
+    let mut ok_bags = Vec::new();
+    for _ in 0..MAX_SAFE_BAGS {
+        ok_bags.extend_from_slice(&encode_safe_bag(OID_CERT_BAG, &empty_cert_bag, None, None));
+    }
+    let pfx = mac_sealed_pfx(&encode_data_content_info(&encode_sequence(&ok_bags)));
+    let parsed = Pfx::parse(&pfx, PASSWORD).expect("at the cap, still parses");
+    assert!(parsed.certs.is_empty());
+}
+
+/// And the ContentInfo loop is capped too.
+#[test]
+fn content_info_count_is_capped() {
+    let empty_ci = encode_data_content_info(&encode_sequence(&[]));
+    let mut cis = Vec::new();
+    for _ in 0..(MAX_CONTENT_INFOS + 1) {
+        cis.extend_from_slice(&empty_ci);
+    }
+    let pfx = mac_sealed_pfx(&cis);
+    assert_eq!(
+        Pfx::parse(&pfx, PASSWORD).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+}
+
+/// The budget arithmetic itself: exact-fit succeeds, one more round does not,
+/// and a huge `iterations * passes` product saturates instead of wrapping.
+#[test]
+fn budget_charge_arithmetic() {
+    let mut b = Budget { remaining: 100 };
+    b.charge(40, 2).expect("80 of 100");
+    assert_eq!(b.remaining, 20);
+    b.charge(20, 1).expect("exact fit");
+    assert_eq!(b.remaining, 0);
+    assert_eq!(b.charge(1, 1).unwrap_err(), Error::WorkBudgetExceeded);
+
+    // `passes = 0` still charges one run's worth (never free).
+    let mut b = Budget { remaining: 10 };
+    assert_eq!(b.charge(11, 0).unwrap_err(), Error::WorkBudgetExceeded);
+
+    // No wrap on a hostile product.
+    let mut b = Budget::new();
+    assert_eq!(
+        b.charge(u32::MAX, u64::MAX).unwrap_err(),
+        Error::WorkBudgetExceeded
+    );
+    assert_eq!(
+        b.remaining, MAX_TOTAL_ITERATIONS,
+        "a refused charge spends nothing"
+    );
+}
+
+/// Real archives are nowhere near the budget — the existing OpenSSL fixtures
+/// must keep parsing.
+#[test]
+fn real_archives_stay_within_the_budget() {
+    Pfx::parse(P12_DEFAULT, PASSWORD).expect("OpenSSL 3 default within budget");
+    Pfx::parse(P12_LEGACY, PASSWORD).expect("OpenSSL legacy within budget");
+}

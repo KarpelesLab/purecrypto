@@ -112,6 +112,52 @@ const MAX_ITERATIONS: u32 = 10_000_000;
 /// a pre-authentication DoS.
 const MAX_PBMAC1_KEY_LEN: usize = 64;
 
+/// Cumulative KDF iteration budget for one [`Pfx::parse`] call.
+///
+/// [`MAX_ITERATIONS`] bounds each *individual* KDF run, but nothing bounded the
+/// *number* of runs: an archive whose AuthenticatedSafe holds thousands of tiny
+/// `pkcs8ShroudedKeyBag`s, each declaring `iterationCount = 10_000_000` with
+/// `prf = hmacWithSHA512`, multiplied out to days of CPU for a one-megabyte
+/// upload. Every derivation charges its iteration count (times the number of
+/// PRF passes it makes) against this budget, so total work is bounded no matter
+/// how the bags are arranged. Two runs at the individual ceiling still fit,
+/// which is far beyond what any real archive needs (OpenSSL emits 2048–600 000).
+const MAX_TOTAL_ITERATIONS: u64 = 20_000_000;
+
+/// Cap on the number of `ContentInfo`s in one `AuthenticatedSafe`.
+const MAX_CONTENT_INFOS: usize = 256;
+
+/// Cap on the number of `SafeBag`s in one `SafeContents`.
+const MAX_SAFE_BAGS: usize = 256;
+
+/// The remaining aggregate KDF work allowed while parsing one archive.
+///
+/// Threaded by `&mut` through the whole parse so that every password-based
+/// derivation draws from the same pool; see [`MAX_TOTAL_ITERATIONS`].
+struct Budget {
+    remaining: u64,
+}
+
+impl Budget {
+    fn new() -> Self {
+        Budget {
+            remaining: MAX_TOTAL_ITERATIONS,
+        }
+    }
+
+    /// Charges one KDF run of `iterations` rounds repeated over `passes` output
+    /// blocks. Returns [`Error::WorkBudgetExceeded`] once the pool runs dry —
+    /// *before* the expensive derivation runs, never after.
+    fn charge(&mut self, iterations: u32, passes: u64) -> Result<(), Error> {
+        let cost = u64::from(iterations).saturating_mul(passes.max(1));
+        self.remaining = self
+            .remaining
+            .checked_sub(cost)
+            .ok_or(Error::WorkBudgetExceeded)?;
+        Ok(())
+    }
+}
+
 /// Errors from PKCS#12 parsing and building.
 #[derive(Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -131,6 +177,10 @@ pub enum Error {
     Decryption,
     /// An attacker-controlled iteration count outside the accepted band.
     BadParameters,
+    /// The archive asked for more aggregate password-derivation work than one
+    /// parse is allowed to spend (too many encrypted bags, iteration counts too
+    /// high, or both). See `MAX_TOTAL_ITERATIONS`.
+    WorkBudgetExceeded,
 }
 
 impl core::fmt::Display for Error {
@@ -142,6 +192,9 @@ impl core::fmt::Display for Error {
             Error::UnsupportedAlgorithm => f.write_str("unsupported PKCS#12 algorithm"),
             Error::Decryption => f.write_str("PKCS#12 content decryption failed"),
             Error::BadParameters => f.write_str("PKCS#12 KDF parameters out of range"),
+            Error::WorkBudgetExceeded => {
+                f.write_str("PKCS#12 archive exceeds the aggregate key-derivation work budget")
+            }
         }
     }
 }
@@ -220,6 +273,19 @@ impl Pfx {
     }
 
     fn parse_inner(der: &[u8], password: &str, pw_bmp: &[u8]) -> Result<Parsed, Error> {
+        Self::parse_budgeted(der, password, pw_bmp, Budget::new())
+    }
+
+    /// The body of [`Pfx::parse`], with the aggregate KDF-work budget supplied
+    /// by the caller. Tests use a deliberately tiny budget so the accounting
+    /// can be exercised without actually burning [`MAX_TOTAL_ITERATIONS`]
+    /// rounds of PBKDF2.
+    fn parse_budgeted(
+        der: &[u8],
+        password: &str,
+        pw_bmp: &[u8],
+        mut budget: Budget,
+    ) -> Result<Parsed, Error> {
         // PFX ::= SEQUENCE { version INTEGER (3), authSafe ContentInfo,
         //                    macData MacData OPTIONAL }
         let mut reader = Reader::new(der);
@@ -258,7 +324,13 @@ impl Pfx {
         let mut safe_seq = safe_reader.read_sequence()?;
         safe_reader.finish()?;
 
+        let mut content_infos = 0usize;
+
         while !safe_seq.is_empty() {
+            content_infos += 1;
+            if content_infos > MAX_CONTENT_INFOS {
+                return Err(Error::WorkBudgetExceeded);
+            }
             // Each element is a ContentInfo.
             let mut ci = safe_seq.read_sequence()?;
             let ci_oid = parse_oid(ci.read_oid()?)?;
@@ -270,15 +342,15 @@ impl Pfx {
                 let body = ctx.read_tlv(tag::context(0))?;
                 let mut octet = Reader::new(body);
                 let safe_contents = octet.read_octet_string()?;
-                parse_safe_contents(safe_contents, pw_bmp, password, &mut out)?;
+                parse_safe_contents(safe_contents, pw_bmp, password, &mut out, &mut budget)?;
             } else if oid == OID_ENCRYPTED_DATA {
                 // [0] EXPLICIT EncryptedData ::= SEQUENCE { version,
                 //   EncryptedContentInfo }
                 let inner = ci.read_element()?;
                 let mut ctx = Reader::new(inner);
                 let body = ctx.read_tlv(tag::context(0))?;
-                let plain = decrypt_encrypted_data(body, pw_bmp, password)?;
-                parse_safe_contents(&plain, pw_bmp, password, &mut out)?;
+                let plain = decrypt_encrypted_data(body, pw_bmp, password, &mut budget)?;
+                parse_safe_contents(&plain, pw_bmp, password, &mut out, &mut budget)?;
             } else {
                 return Err(Error::UnsupportedAlgorithm);
             }
@@ -419,12 +491,18 @@ fn parse_safe_contents(
     pw_bmp: &[u8],
     password: &str,
     out: &mut Parsed,
+    budget: &mut Budget,
 ) -> Result<(), Error> {
     let mut reader = Reader::new(der);
     let mut seq = reader.read_sequence()?;
     reader.finish()?;
 
+    let mut bags = 0usize;
     while !seq.is_empty() {
+        bags += 1;
+        if bags > MAX_SAFE_BAGS {
+            return Err(Error::WorkBudgetExceeded);
+        }
         // SafeBag ::= SEQUENCE { bagId OID, bagValue [0] EXPLICIT, bagAttrs SET OPTIONAL }
         let mut bag = seq.read_sequence()?;
         let bag_oid = parse_oid(bag.read_oid()?)?;
@@ -448,7 +526,7 @@ fn parse_safe_contents(
             out.keys.push(bag_value.to_vec());
         } else if oid == OID_PKCS8_SHROUDED_KEY_BAG {
             // bagValue is an EncryptedPrivateKeyInfo — decrypt to PKCS#8.
-            let plain = decrypt_shrouded_key(bag_value, pw_bmp, password)?;
+            let plain = decrypt_shrouded_key(bag_value, pw_bmp, password, budget)?;
             out.keys.push(plain);
         } else if oid == OID_CERT_BAG {
             // certBag ::= SEQUENCE { certId OID, certValue [0] EXPLICIT OCTET STRING }
@@ -498,7 +576,12 @@ fn extract_friendly_name(attrs: &[u8]) -> Option<String> {
 /// `EncryptedData ::= SEQUENCE { version INTEGER, EncryptedContentInfo }` where
 /// `EncryptedContentInfo ::= SEQUENCE { contentType OID, contentEncryptionAlgorithm,
 ///   encryptedContent [0] IMPLICIT OCTET STRING OPTIONAL }`.
-fn decrypt_encrypted_data(der: &[u8], pw_bmp: &[u8], password: &str) -> Result<Vec<u8>, Error> {
+fn decrypt_encrypted_data(
+    der: &[u8],
+    pw_bmp: &[u8],
+    password: &str,
+    budget: &mut Budget,
+) -> Result<Vec<u8>, Error> {
     let mut reader = Reader::new(der);
     let mut ed = reader.read_sequence()?;
     let _version = ed.read_integer_bytes()?;
@@ -519,14 +602,19 @@ fn decrypt_encrypted_data(der: &[u8], pw_bmp: &[u8], password: &str) -> Result<V
     if alg_oid.as_slice() == OID_PBES2 {
         // PBES2 inside PKCS#12 (OpenSSL 3 default) is keyed on the raw UTF-8
         // password, not the BMP form.
-        return pbes2_p12::decrypt(alg, enc_content, password.as_bytes());
+        return pbes2_p12::decrypt(alg, enc_content, password.as_bytes(), budget);
     }
-    decrypt_pbe_blob(alg, enc_content, pw_bmp)
+    decrypt_pbe_blob(alg, enc_content, pw_bmp, budget)
 }
 
 /// Decrypts a `pkcs8ShroudedKeyBag` bagValue (an EncryptedPrivateKeyInfo) to
 /// the inner plaintext PKCS#8 DER.
-fn decrypt_shrouded_key(der: &[u8], pw_bmp: &[u8], password: &str) -> Result<Vec<u8>, Error> {
+fn decrypt_shrouded_key(
+    der: &[u8],
+    pw_bmp: &[u8],
+    password: &str,
+    budget: &mut Budget,
+) -> Result<Vec<u8>, Error> {
     // EncryptedPrivateKeyInfo ::= SEQUENCE { encryptionAlgorithm AlgorithmIdentifier,
     //                                        encryptedData OCTET STRING }
     let mut reader = Reader::new(der);
@@ -543,17 +631,22 @@ fn decrypt_shrouded_key(der: &[u8], pw_bmp: &[u8], password: &str) -> Result<Vec
         // field is the OCTET STRING ciphertext. PBES2 is keyed on the raw
         // UTF-8 password.
         let enc = epki.read_octet_string()?;
-        pbes2_p12::decrypt(alg, enc, password.as_bytes())
+        pbes2_p12::decrypt(alg, enc, password.as_bytes(), budget)
     } else {
         let enc = epki.read_octet_string()?;
-        decrypt_pbe_blob(alg, enc, pw_bmp)
+        decrypt_pbe_blob(alg, enc, pw_bmp, budget)
     }
 }
 
 /// Dispatches a content/key decryption on the AlgorithmIdentifier `alg`,
 /// covering the legacy `pbeWithSHAAnd3-KeyTripleDES-CBC`. (PBES2 is handled by
 /// the callers, which key it on the raw UTF-8 password.)
-fn decrypt_pbe_blob(alg: &[u8], ciphertext: &[u8], pw_bmp: &[u8]) -> Result<Vec<u8>, Error> {
+fn decrypt_pbe_blob(
+    alg: &[u8],
+    ciphertext: &[u8],
+    pw_bmp: &[u8],
+    budget: &mut Budget,
+) -> Result<Vec<u8>, Error> {
     let mut alg_r = Reader::new(alg);
     let mut alg_seq = alg_r.read_sequence()?;
     let alg_oid = parse_oid(alg_seq.read_oid()?)?;
@@ -567,6 +660,8 @@ fn decrypt_pbe_blob(alg: &[u8], ciphertext: &[u8], pw_bmp: &[u8]) -> Result<Vec<
         if !(MIN_ITERATIONS..=MAX_ITERATIONS).contains(&iterations) {
             return Err(Error::BadParameters);
         }
+        // Two RFC 7292 §B derivations run below (the 3DES key and the IV).
+        budget.charge(iterations, 2)?;
         return pbe_sha1_3des_decrypt(pw_bmp, &salt, iterations, ciphertext);
     }
     Err(Error::UnsupportedAlgorithm)
