@@ -148,6 +148,14 @@ fn abs_diff(a: u64, b: u64) -> u64 {
 ///
 /// Connection IDs are not supported in this commit; the `C` bit is always
 /// cleared on output.
+///
+/// Returns [`Error::RecordOverflow`] when an explicit length is requested
+/// (`omit_length == false`) for a payload that does not fit the 16-bit
+/// `length` field. That check must be a real runtime guard, not a
+/// `debug_assert!`: the field used to be filled with a silent
+/// `as u16` truncation, so a release build emitted a record whose declared
+/// length was smaller than its body — a framing desynchronisation on the
+/// wire.
 pub(crate) fn encode_record(
     out: &mut Vec<u8>,
     epoch: u16,
@@ -156,8 +164,11 @@ pub(crate) fn encode_record(
     omit_length: bool,
     encrypted_payload: &[u8],
     sn_mask: &[u8],
-) {
+) -> Result<(), Error> {
     debug_assert!(seq <= SEQ_MASK_48, "DTLS seq must fit in 48 bits");
+    if !omit_length && encrypted_payload.len() > u16::MAX as usize {
+        return Err(Error::RecordOverflow);
+    }
     let expected_mask_len = if seq_is_16bit { 2 } else { 1 };
     debug_assert_eq!(
         sn_mask.len(),
@@ -186,9 +197,11 @@ pub(crate) fn encode_record(
     }
 
     if !omit_length {
+        // Checked above, so the cast cannot truncate.
         out.extend_from_slice(&(encrypted_payload.len() as u16).to_be_bytes());
     }
     out.extend_from_slice(encrypted_payload);
+    Ok(())
 }
 
 /// Parses one DTLS 1.3 ciphertext record from the start of `buf`.
@@ -408,7 +421,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 1, 42, true, false, &ct, &mask);
+        encode_record(&mut out, 1, 42, true, false, &ct, &mask).unwrap();
 
         // first byte: 001_C=0_S=1_L=1_EE=01 = 0b0010_1101 = 0x2D
         assert_eq!(out[0], 0b0010_1101);
@@ -434,7 +447,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 1];
         let ct = dummy_ct();
-        encode_record(&mut out, 2, 0x0055, false, false, &ct, &mask);
+        encode_record(&mut out, 2, 0x0055, false, false, &ct, &mask).unwrap();
 
         // first byte: 001_0_0_1_10 — S=0, L=1, EE=10 — = 0b0010_0110 = 0x26
         assert_eq!(out[0], 0b0010_0110);
@@ -457,7 +470,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 7, true, true, &ct, &mask);
+        encode_record(&mut out, 0, 7, true, true, &ct, &mask).unwrap();
 
         // first byte: 001 0_0_0_00 with S=1 -> 0b0010_1000 = 0x28
         assert_eq!(out[0], 0b0010_1000);
@@ -505,7 +518,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 1, true, false, &ct, &mask);
+        encode_record(&mut out, 0, 1, true, false, &ct, &mask).unwrap();
         // Drop the last byte of the ciphertext.
         out.pop();
         match decode_record(&out, &mask) {
@@ -616,7 +629,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0xAA, 0x55];
         let ct = dummy_ct();
-        encode_record(&mut out, 3, 0x1234, true, false, &ct, &mask);
+        encode_record(&mut out, 3, 0x1234, true, false, &ct, &mask).unwrap();
 
         // On the wire the seq bytes are 0x12^0xAA, 0x34^0x55 = 0xB8, 0x61.
         assert_eq!(&out[1..3], &[0xB8, 0x61]);
@@ -630,7 +643,7 @@ mod tests {
         let mut out = Vec::new();
         let mask = [0u8; 2];
         let ct = dummy_ct();
-        encode_record(&mut out, 0, 9, true, false, &ct, &mask);
+        encode_record(&mut out, 0, 9, true, false, &ct, &mask).unwrap();
 
         let (hdr_len, body_len) = peek_header_layout(&out).unwrap();
         assert_eq!(hdr_len, 5);
@@ -638,7 +651,7 @@ mod tests {
 
         // L=0 path: body_len = remaining datagram bytes.
         let mut out2 = Vec::new();
-        encode_record(&mut out2, 0, 9, true, true, &ct, &mask);
+        encode_record(&mut out2, 0, 9, true, true, &ct, &mask).unwrap();
         let (hdr_len2, body_len2) = peek_header_layout(&out2).unwrap();
         assert_eq!(hdr_len2, 3);
         assert_eq!(body_len2, ct.len());
@@ -650,6 +663,6 @@ mod tests {
     fn encode_panics_on_oversized_seq() {
         let mut out = Vec::new();
         let mask = [0u8; 2];
-        encode_record(&mut out, 0, 1u64 << 48, true, false, b"", &mask);
+        encode_record(&mut out, 0, 1u64 << 48, true, false, b"", &mask).unwrap();
     }
 }

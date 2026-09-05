@@ -10,6 +10,30 @@
 //! epoch, a 48-bit sequence number, anti-replay sliding window, and the
 //! HelloVerifyRequest cookie that gates server resource allocation.
 
+use crate::x509::Time;
+
+/// The system clock, when available; `None` for `no_std`.
+///
+/// The DTLS client state machines fall back to this when
+/// `verification_time` is unset, so that certificate validity periods and
+/// CRL freshness are actually checked in the default configuration. On
+/// `no_std` there is no clock, so date checks remain disabled — exactly as
+/// in the TLS layer.
+#[cfg(feature = "std")]
+pub(crate) fn system_now() -> Option<Time> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| Time::from_unix(d.as_secs()))
+}
+
+/// The system clock, when available; `None` for `no_std`.
+#[cfg(not(feature = "std"))]
+pub(crate) fn system_now() -> Option<Time> {
+    None
+}
+
 pub(crate) mod ack;
 pub mod client12;
 pub mod client13;

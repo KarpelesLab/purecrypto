@@ -142,7 +142,19 @@ pub(crate) fn write_message(
     }
 }
 
-/// Partial-message buffer indexed by `message_seq`.
+/// Key identifying one reassembly candidate.
+///
+/// Deliberately more than just `message_seq`: a peer (or, on the epoch-0
+/// plaintext paths, an off-path spoofer) does not get to pin the
+/// `(msg_type, total_length)` pair for a `message_seq` with whichever
+/// fragment happens to arrive first. Competing claims for the same
+/// `message_seq` coexist as separate candidates and whichever completes
+/// first wins; the loser is evicted when the queue head advances. The tuple
+/// orders by `message_seq` first, so all candidates for one sequence number
+/// form a contiguous `BTreeMap` range.
+type CandidateKey = (u16, u8, u32);
+
+/// Partial-message buffer for one [`CandidateKey`].
 struct PartialMessage {
     msg_type: u8,
     total_length: u32,
@@ -194,23 +206,24 @@ impl PartialMessage {
 /// triggering a multi-MiB allocation per message_seq.
 const MAX_MESSAGE_LEN: u32 = 256 * 1024;
 
-/// Default upper bound on the number of distinct `message_seq` values held
-/// in the in-progress map. RFC allows up to 65 535; an attacker emitting
-/// one fragment for each would otherwise pin tens of GiB of allocations.
-/// Eight concurrent in-flight messages is more than any legitimate
-/// handshake flight needs.
+/// Default upper bound on the number of reassembly candidates held in the
+/// in-progress map. RFC allows `message_seq` up to 65 535; an attacker
+/// emitting one fragment for each would otherwise pin tens of GiB of
+/// allocations. Eight concurrent candidates is more than any legitimate
+/// handshake flight needs, while still leaving room for a spoofed claim and
+/// the genuine message to coexist at the same `message_seq`.
 const MAX_IN_PROGRESS: usize = 8;
 
 /// Handshake-message reassembler. Tracks one in-flight reassembly per
-/// outstanding `message_seq` and gates dispatch on the next-expected
-/// sequence number.
+/// `(message_seq, msg_type, total_length)` candidate and gates dispatch on
+/// the next-expected sequence number.
 pub(crate) struct Reassembler {
     expected_msg_seq: u16,
-    in_progress: BTreeMap<u16, PartialMessage>,
+    in_progress: BTreeMap<CandidateKey, PartialMessage>,
     /// Per-message ceiling on the claimed `total_length`; oversized claims
     /// are dropped before the dense buffer is allocated.
     max_message_len: u32,
-    /// Cap on concurrently in-progress `message_seq` values.
+    /// Cap on concurrently in-progress reassembly candidates.
     max_in_progress: usize,
 }
 
@@ -274,16 +287,24 @@ impl Reassembler {
         if frag.total_length > self.max_message_len {
             return None;
         }
-        if !self.in_progress.contains_key(&frag.message_seq)
-            && self.in_progress.len() >= self.max_in_progress
-        {
+        // Candidate key: `(message_seq, msg_type, total_length)`. Keying on
+        // `message_seq` alone let the FIRST fragment seen pin the type and
+        // length for that sequence number, so a single spoofed epoch-0
+        // fragment claiming `total_length = 32768` permanently starved the
+        // genuine message at the same `message_seq` — every real fragment
+        // mismatched and was dropped, with no eviction path. Distinct claims
+        // now become distinct candidates, bounded by `max_in_progress`;
+        // whichever completes first is dispatched and the rest are evicted
+        // when the queue head advances.
+        let total_length = frag.total_length;
+        let key: CandidateKey = (frag.message_seq, frag.msg_type, total_length);
+        if !self.in_progress.contains_key(&key) && self.in_progress.len() >= self.max_in_progress {
             return None;
         }
 
-        let total_length = frag.total_length;
         let entry = self
             .in_progress
-            .entry(frag.message_seq)
+            .entry(key)
             .or_insert_with(|| PartialMessage {
                 msg_type: frag.msg_type,
                 total_length,
@@ -291,13 +312,6 @@ impl Reassembler {
                 received: vec_bitmap_words(total_length as usize),
                 received_count: 0,
             });
-
-        // Cross-fragment consistency: every fragment of the same message
-        // must agree on msg_type and total_length. A mismatch is a peer bug
-        // — drop the fragment but keep the reassembly going.
-        if entry.msg_type != frag.msg_type || entry.total_length != total_length {
-            return None;
-        }
 
         let off = frag.fragment_offset as usize;
         // Bounds pre-check: `read_fragment` already verified offset + length
@@ -337,12 +351,38 @@ impl Reassembler {
         if entry.received_count == entry.total_length {
             // Only dispatch if this is the head of the queue.
             if frag.message_seq == self.expected_msg_seq {
-                let done = self.in_progress.remove(&frag.message_seq).unwrap();
+                let done = self.in_progress.remove(&key).expect("entry just inserted");
                 self.expected_msg_seq = self.expected_msg_seq.wrapping_add(1);
+                self.drop_stale_candidates();
                 return Some((done.msg_type, done.buf));
             }
         }
         None
+    }
+
+    /// Evicts candidates the queue head has moved past — including the
+    /// losing `(msg_type, total_length)` claims for the sequence number
+    /// just dispatched. Without this a competing (spoofed) candidate would
+    /// hold its slice of the `max_in_progress` budget for the rest of the
+    /// connection.
+    fn drop_stale_candidates(&mut self) {
+        let expected = self.expected_msg_seq;
+        // `expected == 0` means `message_seq` just wrapped; nothing is
+        // "below" it, so leave the map alone rather than clearing it.
+        if expected != 0 {
+            self.in_progress.retain(|k, _| k.0 >= expected);
+        }
+    }
+
+    /// Drops every in-progress reassembly, keeping `expected_msg_seq`.
+    ///
+    /// Called when the retransmit machine decides the peer's flight never
+    /// arrived and resends ours: the peer answers a retransmit by resending
+    /// its *whole* flight, so any half-assembled inbound message is stale
+    /// and holding on to it only preserves a poisoned candidate (and its
+    /// share of the `max_in_progress` budget) across the retry.
+    pub(crate) fn clear(&mut self) {
+        self.in_progress.clear();
     }
 
     /// Pops the next-expected message if it has already been fully
@@ -353,12 +393,18 @@ impl Reassembler {
     /// until `pop_ready` yields `None`, so that an arbitrary delivery
     /// order ultimately releases everything in protocol order.
     pub(crate) fn pop_ready(&mut self) -> Option<(u8, Vec<u8>)> {
-        let entry = self.in_progress.get(&self.expected_msg_seq)?;
-        if entry.received_count != entry.total_length {
-            return None;
-        }
-        let done = self.in_progress.remove(&self.expected_msg_seq)?;
+        // Several candidates may share `expected_msg_seq` (competing
+        // `(msg_type, total_length)` claims); the first one to complete
+        // wins.
+        let seq = self.expected_msg_seq;
+        let key = *self
+            .in_progress
+            .range((seq, 0u8, 0u32)..=(seq, u8::MAX, u32::MAX))
+            .find(|(_, v)| v.received_count == v.total_length)
+            .map(|(k, _)| k)?;
+        let done = self.in_progress.remove(&key)?;
         self.expected_msg_seq = self.expected_msg_seq.wrapping_add(1);
+        self.drop_stale_candidates();
         Some((done.msg_type, done.buf))
     }
 }

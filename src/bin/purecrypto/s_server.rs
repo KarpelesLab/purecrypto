@@ -350,8 +350,22 @@ fn run_udp(cfg: &Config, accept: &str, mtu: usize, quiet: bool) {
         .connect(peer)
         .unwrap_or_else(|e| die(format!("UDP connect to peer {peer}: {e}")));
 
+    // Bind the DTLS cookie to the source address we just learned. Without
+    // it a cookie-requiring server refuses to handshake at all (an
+    // address-independent cookie is replayable from any spoofed source),
+    // and with it the cookie becomes a real return-routability proof.
+    let mut cfg = cfg.clone();
+    cfg.peer_address = {
+        let mut a = Vec::with_capacity(18);
+        match peer.ip() {
+            std::net::IpAddr::V4(v4) => a.extend_from_slice(&v4.to_ipv6_mapped().octets()),
+            std::net::IpAddr::V6(v6) => a.extend_from_slice(&v6.octets()),
+        }
+        a.extend_from_slice(&peer.port().to_be_bytes());
+        a
+    };
     let mut conn =
-        Connection::server(cfg).unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
+        Connection::server(&cfg).unwrap_or_else(|e| die(format!("server config rejected: {e:?}")));
     let _ = conn.feed(&buf);
 
     drive_udp_handshake(&mut conn, &socket, mtu, Duration::from_secs(15));

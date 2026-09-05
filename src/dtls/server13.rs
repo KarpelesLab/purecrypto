@@ -51,7 +51,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::ack::{ACK_CONTENT_TYPE, RecordNumber, decode as decode_ack, encode as encode_ack};
+use super::ack::{
+    ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack, encode as encode_ack,
+};
 use super::client13::{
     decrypt_dtls13_record, derive_sn_key, encrypt_dtls13_record, sn_key_len_for,
 };
@@ -59,7 +61,7 @@ use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
     HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_message,
 };
-use super::record::{self, ParsedDtlsRecord};
+use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
 
@@ -76,7 +78,7 @@ const EXT_COOKIE: u16 = 0x002C;
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
 /// Ceiling on the claimed `total_length` of a ClientHello fed through the
-/// pre-state reassembler, paired with a single in-flight message. This is
+/// pre-state reassembler. This is
 /// the pre-cookie, pre-address-validation path: with the default
 /// reassembler limits (256 KiB × 8 messages) eight spoofed one-byte
 /// fragments with distinct `message_seq` values, each claiming the maximum
@@ -85,6 +87,20 @@ const DEFAULT_MAX_FRAGMENT: usize = 1100;
 /// ML-KEM-768 — is well under 16 KiB, and the post-HRR CH2 is a single
 /// `message_seq`.
 const PRE_COOKIE_MAX_CH_LEN: u32 = 32 * 1024;
+
+/// Number of concurrent reassembly candidates allowed on the pre-cookie
+/// path.
+///
+/// It cannot be 1. The reassembler keys candidates on
+/// `(message_seq, msg_type, total_length)` precisely so a spoofed claim and
+/// the genuine ClientHello can coexist — but with a budget of one, the
+/// spoofed candidate simply occupies the only slot and the genuine CH is
+/// still refused, which is the wedge we are closing. Four keeps the
+/// worst-case pinned memory at `4 × PRE_COOKIE_MAX_CH_LEN` = 128 KiB per
+/// connection object (the application allocates one per 4-tuple it chooses
+/// to answer), while giving the genuine CH room alongside a few bogus
+/// claims.
+const PRE_COOKIE_MAX_IN_PROGRESS: usize = 4;
 
 /// Configuration for a DTLS 1.3 server.
 ///
@@ -277,8 +293,23 @@ pub struct DtlsServerConnection13<R: RngCore> {
 }
 
 impl<R: RngCore> DtlsServerConnection13<R> {
-    /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
-    /// is the opaque identifier used by the cookie generator.
+    /// Creates a server awaiting a ClientHello from `peer_addr`.
+    ///
+    /// `peer_addr` is the peer's transport address in a **canonical binary**
+    /// encoding -- the recommended shape being 16 bytes of IPv6 address (an
+    /// IPv4 peer written as its v4-mapped form) followed by the 2-byte
+    /// big-endian port, as produced by
+    /// [`ConfigBuilder::peer_socket_addr`](crate::tls::ConfigBuilder::peer_socket_addr).
+    /// It is mixed into every cookie MAC, which is what makes the cookie a
+    /// proof of return-routability rather than merely a proof that someone
+    /// completed one round trip. A non-canonical (e.g. textual) encoding
+    /// would let an attacker mint several distinct cookies for one address
+    /// by varying the spelling.
+    ///
+    /// An empty `peer_addr` means "unknown"; combined with a required
+    /// cookie exchange the server then fails closed on the first
+    /// ClientHello rather than issuing a replayable, address-independent
+    /// cookie.
     pub(crate) fn new(config: Arc<ServerConfig13Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
         // Transcript hash is pinned later once we select a cipher suite from
         // the (cookie-validated) ClientHello — the buffer-everything design
@@ -369,11 +400,21 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         core::mem::take(&mut self.app_in)
     }
 
-    /// Encrypts application plaintext. Must be called only after the
-    /// handshake completes.
+    /// Encrypts application plaintext into a single DTLS record. Must be
+    /// called only after the handshake completes.
+    ///
+    /// `plaintext` may be at most 2^14 bytes (`TLSPlaintext.length`, RFC
+    /// 8446 §5.1); larger input is rejected with [`Error::RecordOverflow`]
+    /// rather than silently truncating the record's 16-bit length field.
+    /// Callers wanting to send more must chunk. Note that DTLS is a
+    /// datagram protocol: a record above the path MTU will be fragmented
+    /// or dropped by IP, so practical payloads are far smaller.
     pub fn send(&mut self, plaintext: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
             return Err(Error::InappropriateState);
+        }
+        if plaintext.len() > MAX_PLAINTEXT_LEN {
+            return Err(Error::RecordOverflow);
         }
         let dg = self.encrypt_protected_record(ContentType::ApplicationData, plaintext)?;
         self.out_dgrams.push(dg);
@@ -431,6 +472,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             super::reliability::Action::Retransmit => {
                 for dg in self.retransmit.in_flight_datagrams() {
                     self.out_dgrams.push(dg.to_vec());
+                }
+                // Handshake retransmit: the peer answers by resending its
+                // whole flight, so half-assembled inbound handshake
+                // messages are stale. Dropping them evicts any poisoned
+                // reassembly candidate seeded by a spoofed epoch-0
+                // fragment, which otherwise has no expiry at all. Only
+                // while still handshaking — an established connection's
+                // partials are AEAD-authenticated and must survive.
+                if self.state != State::Connected {
+                    self.pre_state_reasm = None;
+                    if let Some(r) = self.reassembler.as_mut() {
+                        r.clear();
+                    }
                 }
             }
             super::reliability::Action::GiveUp => {
@@ -608,6 +662,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // encrypted ping-pong.
         let is_handshake = matches!(inner_type, ContentType::Handshake);
         if is_handshake {
+            // Bounded queue: RFC 9147 §7.1 only requires acknowledging the
+            // current flight, so drop the oldest entry rather than growing
+            // one record number per AEAD-verified record forever.
+            if self.pending_acks.len() >= MAX_PENDING_ACKS {
+                self.pending_acks.remove(0);
+            }
             self.pending_acks.push(RecordNumber {
                 epoch: read_epoch as u64,
                 seq,
@@ -718,10 +778,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     // Catch up to whatever message_seq the client used
                     // (CH2 after a group-HRR is msg_seq=1, after a
                     // cookie-HRR is also msg_seq=1). Tight limits: this
-                    // is unauthenticated pre-cookie input, so cap the
-                    // claimed message size and allow only one in-flight
-                    // message (see `PRE_COOKIE_MAX_CH_LEN`).
-                    let mut r = Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, 1);
+                    // is unauthenticated pre-cookie input, so cap both the
+                    // claimed message size and the number of concurrent
+                    // reassembly candidates (see `PRE_COOKIE_MAX_CH_LEN`
+                    // and `PRE_COOKIE_MAX_IN_PROGRESS`).
+                    let mut r =
+                        Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, PRE_COOKIE_MAX_IN_PROGRESS);
                     for s in 0..msg_seq {
                         let mut buf = Vec::new();
                         write_message(&mut buf, hs_type::CLIENT_HELLO, s, b"", 0);
@@ -819,6 +881,21 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             return Err(Error::InappropriateState);
         }
         let cookie_required = self.config.require_cookie;
+        // Fail closed: a cookie that is not bound to the peer's transport
+        // address proves nothing about return-routability. It would only
+        // attest that *someone* completed one round trip with these
+        // ClientHello bytes, so an attacker can harvest one cookie from
+        // their own address and then replay that identical ~150-byte CH2
+        // from arbitrary SPOOFED sources for the cookie's whole lifetime --
+        // each replay costing the server an ephemeral keygen plus an
+        // asymmetric signature and emitting a multi-KB flight at the
+        // victim (~15-30x UDP reflection amplification). Refuse loudly
+        // instead, mirroring the "cookie required but no secret" posture
+        // above. Callers set the address via `Config::peer_address` /
+        // `ConfigBuilder::peer_socket_addr`.
+        if cookie_required && self.peer_addr.is_empty() {
+            return Err(Error::InappropriateState);
+        }
         // Look for an existing cookie extension in CH.
         let presented_cookie = ch
             .extensions
@@ -926,6 +1003,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let _ = msg_seq;
             return Ok(());
         }
+
+        // Set on the cookie-off CH2 path; applied to `self.transcript` only
+        // once the CH2 has passed every check that can still reject it.
+        let mut replay_group_hrr = false;
 
         if cookie_required {
             let cookie_bytes = presented_cookie
@@ -1058,11 +1139,20 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 // No HRR needed: pin the suite for the CH1 path below.
                 self.suite = Some(suite);
             } else {
-                // Cookie-off CH2 (post group-HRR). Replay the synthetic
-                // message_hash + HRR into the transcript.
-                self.transcript.replace_with_message_hash();
-                let hrr_bytes = self.build_hrr_bytes(None, self.hrr_selected_group);
-                self.transcript.update(&hrr_bytes);
+                // Cookie-off CH2 (post group-HRR): the transcript must be
+                // rewritten as `message_hash(CH1) ‖ HRR` (RFC 8446 §4.4.1).
+                // DO NOT do it here. `replace_with_message_hash()` is not
+                // idempotent, and the checks immediately below (does CH2
+                // actually carry a share for the group we demanded?) can
+                // still fail. On this cookie-off path those failures are
+                // silently swallowed as unauthenticated input, so a spoofed
+                // CH2 that failed the share check used to leave the
+                // transcript permanently rewritten — and the genuine CH2
+                // then rewrote it a second time, killing the handshake at
+                // Finished. Defer the mutation until after validation, the
+                // way the cookie-required branch above rebuilds a fresh
+                // `Transcript` only once it has authenticated the CH.
+                replay_group_hrr = true;
             }
         }
 
@@ -1081,6 +1171,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         };
 
         let suite = self.suite.ok_or(Error::InappropriateState)?;
+
+        // Every check that can still reject this CH2 has now passed, so it
+        // is safe to perform the non-idempotent transcript rewrite for the
+        // cookie-off group-HRR path (deferred from above).
+        if replay_group_hrr {
+            self.transcript.replace_with_message_hash();
+            let hrr_bytes = self.build_hrr_bytes(None, self.hrr_selected_group);
+            self.transcript.update(&hrr_bytes);
+        }
+
         self.client_random = Some(ch.random);
         // CH2 (or first-and-only CH when cookies are off) into the
         // transcript (TLS-shaped).
@@ -1544,7 +1644,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             omit_length,
             &alloc::vec![0u8; ct_len],
             &aad_zero_mask,
-        );
+        )?;
         let hdr_len = aad.len() - ct_len;
         aad.truncate(hdr_len);
 
@@ -1565,7 +1665,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             omit_length,
             &inner,
             mask,
-        );
+        )?;
         Ok(wire)
     }
 
@@ -1619,10 +1719,15 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             return;
         }
         let acks = core::mem::take(&mut self.pending_acks);
-        let body = encode_ack(&acks);
-        if let Ok(dg) = self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
-        {
-            self.out_dgrams.push(dg);
+        // `encode_ack` chunks: an ACK body's `u16` length prefix cannot
+        // describe more than 4095 record numbers, so an oversized queue
+        // becomes several ACK records instead of one truncated one.
+        for body in encode_ack(&acks) {
+            if let Ok(dg) =
+                self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
+            {
+                self.out_dgrams.push(dg);
+            }
         }
     }
 

@@ -1656,7 +1656,7 @@ fn build_dtls12_server(
     sc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsServerConnection12::new(
         alloc::sync::Arc::new(sc),
-        Vec::new(),
+        cfg.peer_address.clone(),
         config_rng(cfg)?,
     ))
 }
@@ -1684,7 +1684,7 @@ fn build_dtls13_server(
     sc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
-        Vec::new(),
+        cfg.peer_address.clone(),
         config_rng(cfg)?,
     ))
 }

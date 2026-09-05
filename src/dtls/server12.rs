@@ -30,7 +30,7 @@ use crate::tls::crypto::prf::{
     extended_master_secret, finished_verify_data, key_block, master_secret, tls12_exporter,
 };
 use crate::tls::keylog::KeyLog;
-use crate::tls::{ContentType, Error, ProtocolVersion};
+use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
@@ -275,8 +275,23 @@ impl<R: RngCore> Drop for DtlsServerConnection12<R> {
 }
 
 impl<R: RngCore> DtlsServerConnection12<R> {
-    /// Creates a server awaiting a ClientHello from `peer_addr`. `peer_addr`
-    /// is the opaque identifier used by the cookie generator.
+    /// Creates a server awaiting a ClientHello from `peer_addr`.
+    ///
+    /// `peer_addr` is the peer's transport address in a **canonical binary**
+    /// encoding -- the recommended shape being 16 bytes of IPv6 address (an
+    /// IPv4 peer written as its v4-mapped form) followed by the 2-byte
+    /// big-endian port, as produced by
+    /// [`ConfigBuilder::peer_socket_addr`](crate::tls::ConfigBuilder::peer_socket_addr).
+    /// It is mixed into every cookie MAC, which is what makes the cookie a
+    /// proof of return-routability rather than merely a proof that someone
+    /// completed one round trip. A non-canonical (e.g. textual) encoding
+    /// would let an attacker mint several distinct cookies for one address
+    /// by varying the spelling.
+    ///
+    /// An empty `peer_addr` means "unknown"; combined with a required
+    /// cookie exchange the server then fails closed on the first
+    /// ClientHello rather than issuing a replayable, address-independent
+    /// cookie.
     pub(crate) fn new(config: Arc<ServerConfig12Internal>, peer_addr: Vec<u8>, rng: R) -> Self {
         // Don't pin the transcript hash yet: the negotiated suite (SHA-256
         // or SHA-384) is unknown until we parse the cookie-validated CH and
@@ -426,6 +441,16 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 for dg in self.retransmit.flight_datagrams() {
                     self.out_dgrams.push(dg.clone());
                 }
+                // A handshake retransmit makes every half-assembled inbound
+                // message stale (the peer resends its whole flight), so
+                // drop them — evicting any poisoned reassembly candidate
+                // seeded by a spoofed epoch-0 fragment, which otherwise has
+                // no expiry. Established connections keep their partials.
+                if self.state != State::Connected
+                    && let Some(r) = self.reassembler.as_mut()
+                {
+                    r.clear();
+                }
             }
             super::reliability::Action::GiveUp => {
                 if self.state == State::Connected {
@@ -550,7 +575,38 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 self.app_in.extend_from_slice(&plain);
                 Ok(())
             }
-            ContentType::Alert => Ok(()),
+            ContentType::Alert => {
+                if self.read_epoch < 1 {
+                    // Epoch-0 alerts travel in plaintext and are therefore
+                    // trivially spoofable by any off-path attacker who can
+                    // guess the 4-tuple: honouring one would hand out a
+                    // one-datagram handshake teardown. Silent drop
+                    // (RFC 6347 §4.1.2.7), matching the DTLS 1.3 engine.
+                    return Ok(());
+                }
+                let combined = ((self.read_epoch as u64) << 48) | rec.seq;
+                let Some(c) = self.read_crypter.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(plain) = c.decrypt_dtls(combined, ContentType::Alert, rec.fragment) else {
+                    // AEAD failure: silent drop, window not advanced.
+                    return Ok(());
+                };
+                // AEAD verified: commit to the window only now.
+                self.replay.mark(rec.seq);
+                // Authenticated, so a malformed alert is a genuine peer
+                // fault (RFC 5246 §7.2: an alert is exactly two bytes).
+                if plain.len() != 2 {
+                    return Err(Error::Decode);
+                }
+                let desc = AlertDescription::from_u8(plain[1]);
+                self.state = State::Closed;
+                if desc == AlertDescription::CloseNotify {
+                    Ok(())
+                } else {
+                    Err(Error::AlertReceived(desc))
+                }
+            }
             // Unknown / unexpected content type: silent discard.
             _ => Ok(()),
         }
@@ -737,6 +793,21 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             return Err(Error::InappropriateState);
         }
         let cookie_required = self.config.require_cookie_exchange;
+        // Fail closed: a cookie that is not bound to the peer's transport
+        // address proves nothing about return-routability. It would only
+        // attest that *someone* completed one round trip with these
+        // ClientHello bytes, so an attacker can harvest one cookie from
+        // their own address and then replay that identical ~150-byte CH2
+        // from arbitrary SPOOFED sources for the cookie's whole lifetime --
+        // each replay costing the server an ephemeral keygen plus an
+        // asymmetric signature and emitting a multi-KB flight at the
+        // victim (~15-30x UDP reflection amplification). Refuse loudly
+        // instead, mirroring the "cookie required but no secret" posture
+        // above. Callers set the address via `Config::peer_address` /
+        // `ConfigBuilder::peer_socket_addr`.
+        if cookie_required && self.peer_addr.is_empty() {
+            return Err(Error::InappropriateState);
+        }
         let first_attempt = parsed.cookie.is_empty();
 
         // Bind the cookie MAC to the security-critical CH fields. An on-path

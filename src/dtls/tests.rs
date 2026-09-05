@@ -2658,3 +2658,553 @@ mod dtls12 {
         );
     }
 }
+
+/// Regression tests for the DTLS security audit (2026-09).
+///
+/// Each test in here maps to one audited finding; the comment above every
+/// group names the primitive it protects.
+mod security_regressions {
+    use super::*;
+    use crate::dtls::cookie::CookieGenerator;
+    use crate::dtls::reassembly::{Reassembler, read_fragment, write_message};
+    use crate::dtls::{
+        ClientConfig13Internal as PcClientConfig13, DtlsClientConnection13, DtlsServerConnection13,
+        ServerConfig13Internal as PcServerConfig13,
+    };
+    use crate::tls::Error;
+    use crate::tls::codec::hs_type;
+
+    /// Self-signed ECDSA P-256 leaf for `dtls.example` with a caller-chosen
+    /// validity window, so tests can build an EXPIRED certificate. Returns
+    /// `(cert_der, key_der)`.
+    fn cert_with_validity(
+        seed: &[u8],
+        not_before: Time,
+        not_after: Time,
+    ) -> (Vec<u8>, BoxedEcdsaPrivateKey) {
+        let mut rng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(not_before, not_after);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        (cert.to_der().to_vec(), key)
+    }
+
+    // ---------------------------------------------------------------
+    // HIGH 1 — DTLS clients must consult the system clock by default.
+    //
+    // `verification_time` defaults to `None`, and `verify_chain_inner`
+    // skips the whole notBefore/notAfter loop (and CRL freshness) when it
+    // is given `None`. Without an `.or_else(system_now)` fallback, ANY
+    // expired certificate chaining to a trusted root authenticated to a
+    // default-configured DTLS client.
+    // ---------------------------------------------------------------
+
+    /// Drives the DTLS 1.2 pair and returns the first error the CLIENT
+    /// raised while consuming the server's flight, if any.
+    fn pump_until_client_error<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection12,
+        server: &mut DtlsServerConnection12<R>,
+    ) -> Option<Error> {
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                if let Err(e) = client.feed_datagram(dg) {
+                    return Some(e);
+                }
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn expired_server_cert_rejected_by_default_client_12() {
+        let (der, key) = cert_with_validity(
+            b"dtls12-expired",
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2021, 1, 1, 0, 0, 0),
+        );
+
+        let server_cfg = PcServerConfig12::with_ecdsa(alloc::vec![der.clone()], key)
+            .require_cookie_exchange(false);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(der.clone()).unwrap();
+        // The point of the test: NO `with_verification_time`. This is the
+        // default configuration a caller gets from `tls::Config`.
+        let cfg = PcClientConfig12::new(roots, "dtls.example");
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-expired-client", b"nonce", &[]);
+        let mut client = DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-expired-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
+
+        let err = pump_until_client_error(&mut client, &mut server);
+        assert!(
+            err.is_some(),
+            "a default-configured DTLS 1.2 client must reject an expired chain"
+        );
+        assert!(!client.is_handshake_complete());
+    }
+
+    /// Control for the test above: the SAME expired certificate is accepted
+    /// when the caller explicitly pins a clock inside the validity window.
+    /// This proves the rejection comes from the date check and not from
+    /// some unrelated chain fault.
+    #[test]
+    fn expired_cert_accepted_when_clock_pinned_inside_validity_12() {
+        let (der, key) = cert_with_validity(
+            b"dtls12-expired",
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2021, 1, 1, 0, 0, 0),
+        );
+
+        let server_cfg = PcServerConfig12::with_ecdsa(alloc::vec![der.clone()], key)
+            .require_cookie_exchange(false);
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(der.clone()).unwrap();
+        let cfg = PcClientConfig12::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2020, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls12-pinned-client", b"nonce", &[]);
+        let mut client = DtlsClientConnection12::new(cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-pinned-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
+
+        assert!(pump_handshake(&mut client, &mut server));
+    }
+
+    #[test]
+    fn expired_server_cert_rejected_by_default_client_13() {
+        let (der, key) = cert_with_validity(
+            b"dtls13-expired",
+            Time::utc(2020, 1, 1, 0, 0, 0),
+            Time::utc(2021, 1, 1, 0, 0, 0),
+        );
+
+        let server_cfg =
+            PcServerConfig13::with_ecdsa(alloc::vec![der.clone()], key).with_no_cookie();
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(der.clone()).unwrap();
+        // No `with_verification_time` — the default configuration.
+        let cfg = PcClientConfig13::new(roots, "dtls.example");
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-expired-client", b"nonce", &[]);
+        let mut client = DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-expired-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
+
+        let mut saw_err = false;
+        'outer: for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                let _ = server.feed_datagram(dg);
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                if client.feed_datagram(dg).is_err() {
+                    saw_err = true;
+                    break 'outer;
+                }
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            saw_err,
+            "a default-configured DTLS 1.3 client must reject an expired chain"
+        );
+        assert!(!client.is_handshake_complete());
+    }
+
+    // ---------------------------------------------------------------
+    // HIGH 2 — the HVR / HRR cookie must be bound to the client address.
+    //
+    // An unbound cookie proves only that SOMEONE completed one round trip
+    // with these ClientHello bytes. An attacker harvests one from their
+    // own address and replays that CH2 from arbitrary spoofed sources for
+    // the cookie's lifetime, turning the server into a ~15-30x UDP
+    // reflector that burns one asymmetric signature per spoofed packet.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cookie_is_bound_to_peer_address() {
+        let cg = CookieGenerator::new([0x5c; 32]);
+        let random = [7u8; 32];
+        let fp = [9u8; 32];
+        let cookie = cg.generate(b"peer-a", &random, &fp, 100);
+        assert!(
+            cg.validate(b"peer-a", &random, &fp, 100, &cookie),
+            "cookie must validate for the address it was minted for"
+        );
+        assert!(
+            !cg.validate(b"peer-b", &random, &fp, 100, &cookie),
+            "a cookie minted for address A must NOT validate for address B"
+        );
+        // An empty address is just another address, not a wildcard.
+        assert!(!cg.validate(b"", &random, &fp, 100, &cookie));
+    }
+
+    #[test]
+    fn cookie_required_with_empty_peer_addr_fails_closed_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg
+            .with_cookie_secret([0xa5; 32])
+            .require_cookie_exchange(true);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls12-noaddr", b"nonce", &[]);
+        // Empty peer address: the caller never told us who this is.
+        let mut server = DtlsServerConnection12::new(Arc::new(server_cfg), Vec::new(), srng);
+
+        let c1 = client.pop_outbound_datagrams();
+        assert!(!c1.is_empty());
+        let mut saw_err = false;
+        for dg in &c1 {
+            if matches!(server.feed_datagram(dg), Err(Error::InappropriateState)) {
+                saw_err = true;
+            }
+        }
+        assert!(
+            saw_err,
+            "cookie-required server with no peer address must fail closed"
+        );
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "no cookie may be minted, and no flight emitted, without an address"
+        );
+    }
+
+    #[test]
+    fn cookie_required_with_empty_peer_addr_fails_closed_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13_local(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-noaddr", b"nonce", &[]);
+        let mut server = DtlsServerConnection13::new(Arc::new(server_cfg), Vec::new(), srng);
+
+        let c1 = client.pop_outbound_datagrams();
+        assert!(!c1.is_empty());
+        let mut saw_err = false;
+        for dg in &c1 {
+            if matches!(server.feed_datagram(dg), Err(Error::InappropriateState)) {
+                saw_err = true;
+            }
+        }
+        assert!(
+            saw_err,
+            "cookie-required server with no peer address must fail closed"
+        );
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "no cookie may be minted, and no flight emitted, without an address"
+        );
+    }
+
+    #[test]
+    fn cookie_harvested_at_one_address_is_useless_at_another_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = Arc::new(
+            server_cfg
+                .with_cookie_secret([0xa5; 32])
+                .require_cookie_exchange(true),
+        );
+        let mut client = make_client(&cert);
+
+        // The attacker's own connection: complete one honest round trip
+        // from `peer-a` to harvest a valid cookie.
+        let arng = HmacDrbg::<Sha256>::new(b"dtls12-addr-a", b"nonce", &[]);
+        let mut server_a =
+            DtlsServerConnection12::new(server_cfg.clone(), b"peer-a".to_vec(), arng);
+        for dg in &client.pop_outbound_datagrams() {
+            server_a.feed_datagram(dg).unwrap();
+        }
+        let hvr = server_a.pop_outbound_datagrams();
+        assert!(!hvr.is_empty(), "server should emit HelloVerifyRequest");
+        for dg in &hvr {
+            client.feed_datagram(dg).unwrap();
+        }
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(
+            !ch2.is_empty(),
+            "client should emit CH2 carrying the cookie"
+        );
+
+        // Now replay that exact CH2 at a server instance whose peer address
+        // is the SPOOFING VICTIM's. It must not be accepted, and above all
+        // must not produce a server flight aimed at that victim.
+        let brng = HmacDrbg::<Sha256>::new(b"dtls12-addr-b", b"nonce", &[]);
+        let mut server_b = DtlsServerConnection12::new(server_cfg, b"peer-b".to_vec(), brng);
+        for dg in &ch2 {
+            // Unauthenticated epoch-0 input: a cookie mismatch is a silent
+            // drop, never fatal.
+            server_b.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            server_b.pop_outbound_datagrams().is_empty(),
+            "a cookie minted for peer-a must not buy a flight aimed at peer-b"
+        );
+        assert!(!server_b.is_handshake_complete());
+    }
+
+    #[test]
+    fn cookie_harvested_at_one_address_is_useless_at_another_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = Arc::new(server_cfg.with_cookie_secret([0xa5; 32]));
+        let mut client = make_client13_local(&cert);
+
+        let arng = HmacDrbg::<Sha256>::new(b"dtls13-addr-a", b"nonce", &[]);
+        let mut server_a =
+            DtlsServerConnection13::new(server_cfg.clone(), b"peer-a".to_vec(), arng);
+        for dg in &client.pop_outbound_datagrams() {
+            server_a.feed_datagram(dg).unwrap();
+        }
+        let hrr = server_a.pop_outbound_datagrams();
+        assert!(!hrr.is_empty(), "server should emit a cookie HRR");
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        let ch2 = client.pop_outbound_datagrams();
+        assert!(
+            !ch2.is_empty(),
+            "client should emit CH2 carrying the cookie"
+        );
+
+        let brng = HmacDrbg::<Sha256>::new(b"dtls13-addr-b", b"nonce", &[]);
+        let mut server_b = DtlsServerConnection13::new(server_cfg, b"peer-b".to_vec(), brng);
+        for dg in &ch2 {
+            server_b.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            server_b.pop_outbound_datagrams().is_empty(),
+            "a cookie minted for peer-a must not buy a flight aimed at peer-b"
+        );
+        assert!(!server_b.is_handshake_complete());
+    }
+
+    // ---------------------------------------------------------------
+    // MEDIUM 3 — one spoofed fragment must not wedge reassembly forever.
+    //
+    // The in-progress map used to be keyed on `message_seq` alone, so the
+    // FIRST fragment seen pinned `(msg_type, total_length)` for that
+    // sequence number. A single spoofed epoch-0 fragment claiming a huge
+    // `total_length` therefore starved the genuine message permanently:
+    // every real fragment mismatched and was dropped, and nothing ever
+    // evicted the poisoned entry.
+    // ---------------------------------------------------------------
+
+    /// Builds one raw DTLS handshake fragment header + body.
+    fn raw_fragment(
+        msg_type: u8,
+        total_length: u32,
+        message_seq: u16,
+        fragment_offset: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(msg_type);
+        out.extend_from_slice(&total_length.to_be_bytes()[1..]);
+        out.extend_from_slice(&message_seq.to_be_bytes());
+        out.extend_from_slice(&fragment_offset.to_be_bytes()[1..]);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    #[test]
+    fn conflicting_first_fragment_does_not_wedge_reassembly() {
+        let mut r = Reassembler::new();
+
+        // Spoofed: message_seq 0 claiming a 32 KiB ClientHello, of which
+        // exactly one byte is ever delivered. It can never complete.
+        let poison = raw_fragment(hs_type::CLIENT_HELLO, 32 * 1024, 0, 0, &[0xAA]);
+        assert!(r.feed(read_fragment(&poison).unwrap()).is_none());
+
+        // Genuine message at the same message_seq, with the real length.
+        let mut good = Vec::new();
+        write_message(&mut good, hs_type::CLIENT_HELLO, 0, b"genuine-body", 0);
+        let got = r.feed(read_fragment(&good).unwrap());
+        assert_eq!(
+            got,
+            Some((hs_type::CLIENT_HELLO, b"genuine-body".to_vec())),
+            "a poisoned candidate must not starve the genuine message"
+        );
+
+        // The losing candidate is evicted once the queue head advances, so
+        // it cannot hold a slot of the `max_in_progress` budget forever.
+        let mut next = Vec::new();
+        write_message(&mut next, hs_type::CLIENT_HELLO, 1, b"second", 0);
+        assert_eq!(
+            r.feed(read_fragment(&next).unwrap()),
+            Some((hs_type::CLIENT_HELLO, b"second".to_vec()))
+        );
+    }
+
+    #[test]
+    fn conflicting_msg_type_claims_coexist() {
+        let mut r = Reassembler::new();
+        // Same message_seq, same length, different type: still two distinct
+        // candidates, so the genuine one still completes.
+        let poison = raw_fragment(0x63, 5, 0, 0, b"XX");
+        assert!(r.feed(read_fragment(&poison).unwrap()).is_none());
+        let mut good = Vec::new();
+        write_message(&mut good, hs_type::CLIENT_HELLO, 0, b"hello", 0);
+        assert_eq!(
+            r.feed(read_fragment(&good).unwrap()),
+            Some((hs_type::CLIENT_HELLO, b"hello".to_vec()))
+        );
+    }
+
+    #[test]
+    fn clear_drops_partials_but_keeps_expected_seq() {
+        let mut r = Reassembler::new();
+        let partial = raw_fragment(hs_type::CLIENT_HELLO, 8, 0, 0, b"abcd");
+        assert!(r.feed(read_fragment(&partial).unwrap()).is_none());
+        r.clear();
+        assert_eq!(r.expected_msg_seq(), 0);
+        // A fresh, complete message at the same seq still lands.
+        let mut good = Vec::new();
+        write_message(&mut good, hs_type::CLIENT_HELLO, 0, b"whole", 0);
+        assert_eq!(
+            r.feed(read_fragment(&good).unwrap()),
+            Some((hs_type::CLIENT_HELLO, b"whole".to_vec()))
+        );
+    }
+
+    /// End-to-end: a single spoofed epoch-0 ClientHello fragment injected
+    /// at the DTLS 1.3 server's pre-cookie reassembler (source address =
+    /// the victim client's) must not stop the genuine handshake.
+    #[test]
+    fn spoofed_ch_fragment_does_not_wedge_server_13() {
+        use crate::dtls::record;
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client13_local(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-wedge", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
+
+        // The poison datagram: message_seq 0, total_length 32 KiB, one byte.
+        let poison_frag = raw_fragment(hs_type::CLIENT_HELLO, 32 * 1024, 0, 0, &[0xAA]);
+        let mut poison_dg = Vec::new();
+        record::write_record(
+            &mut poison_dg,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            0,
+            &poison_frag,
+        );
+        server
+            .feed_datagram(&poison_dg)
+            .expect("spoofed epoch-0 input must never be fatal");
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "an incomplete CH must not produce any flight"
+        );
+
+        // Now the genuine handshake, on the very same connection.
+        assert!(
+            pump_handshake_13_local(&mut client, &mut server),
+            "a spoofed fragment must not wedge the genuine handshake"
+        );
+    }
+
+    // --- local copies of the DTLS 1.3 helpers (the ones in `mod dtls13`
+    // --- are private to that module).
+
+    fn make_server13_local() -> (PcServerConfig13, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-sec-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            PcServerConfig13::with_ecdsa(alloc::vec![der.clone()], key),
+            der,
+        )
+    }
+
+    fn make_client13_local(server_cert: &[u8]) -> DtlsClientConnection13 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        let cfg = PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0));
+        let mut crng = HmacDrbg::<Sha256>::new(b"dtls13-sec-client", b"nonce", &[]);
+        DtlsClientConnection13::new(cfg, b"client-addr".to_vec(), &mut crng)
+    }
+
+    fn pump_handshake_13_local<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection13,
+        server: &mut DtlsServerConnection13<R>,
+    ) -> bool {
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        client.is_handshake_complete() && server.is_handshake_complete()
+    }
+
+    // ---------------------------------------------------------------
+    // LOW 5 — DTLS 1.3 `send()` must cap the plaintext length rather than
+    // let the record's u16 length field truncate silently.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn oversized_send_is_rejected_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = make_client13_local(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"dtls13-oversize", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
+        assert!(pump_handshake_13_local(&mut client, &mut server));
+
+        let big = alloc::vec![0u8; (1 << 14) + 1];
+        assert!(matches!(client.send(&big), Err(Error::RecordOverflow)));
+        assert!(matches!(server.send(&big), Err(Error::RecordOverflow)));
+        // The boundary value itself is still accepted.
+        let ok = alloc::vec![0u8; 1 << 14];
+        assert!(client.send(&ok).is_ok());
+    }
+}

@@ -33,6 +33,16 @@ use alloc::vec::Vec;
 /// (`2^14 + 256`) because some legacy cipher suites add more overhead.
 pub(crate) const MAX_FRAGMENT: usize = (1 << 14) + 2048;
 
+/// Maximum *plaintext* a single record may carry: `2^14`
+/// (`TLSPlaintext.length`, RFC 8446 §5.1 / RFC 6347 §4.1.1.1).
+///
+/// The DTLS 1.2 AEAD layer already enforces this
+/// (`RecordCrypter12::encrypt_dtls`); the DTLS 1.3 `send()` paths enforce
+/// it explicitly so that an oversized payload is a clean
+/// [`crate::tls::Error::RecordOverflow`] rather than a record whose 16-bit
+/// `length` field silently truncates.
+pub(crate) const MAX_PLAINTEXT_LEN: usize = 1 << 14;
+
 /// Fixed DTLS record header length: 13 bytes.
 pub(crate) const HEADER_LEN: usize = 13;
 

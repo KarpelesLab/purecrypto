@@ -39,7 +39,7 @@ use crate::tls::crypto::prf::{
 use crate::tls::crypto::{Transcript, verify_signature};
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
-use crate::tls::{ContentType, Error, ProtocolVersion};
+use crate::tls::{AlertDescription, ContentType, Error, ProtocolVersion};
 use crate::x509::{AnyPublicKey, Certificate, Time};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -50,6 +50,7 @@ use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_mes
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, Retransmit};
 use super::replay::AntiReplayWindow;
+use super::system_now;
 
 #[allow(unused_imports)]
 use crate::ct::ConstantTimeEq;
@@ -386,6 +387,14 @@ impl DtlsClientConnection12 {
                 for dg in self.retransmit.flight_datagrams() {
                     self.out_dgrams.push(dg.clone());
                 }
+                // A handshake retransmit makes every half-assembled inbound
+                // message stale (the peer resends its whole flight), so
+                // drop them — evicting any poisoned reassembly candidate
+                // seeded by a spoofed epoch-0 fragment, which otherwise has
+                // no expiry. Established connections keep their partials.
+                if self.state != State::Connected {
+                    self.reassembler.clear();
+                }
             }
             super::reliability::Action::GiveUp => {
                 if self.state == State::Connected {
@@ -539,9 +548,36 @@ impl DtlsClientConnection12 {
                 Ok(())
             }
             ContentType::Alert => {
-                // Drop alerts silently in this subset; a hardened impl
-                // would surface them.
-                Ok(())
+                if self.read_epoch < 1 {
+                    // Epoch-0 alerts travel in plaintext and are therefore
+                    // trivially spoofable by any off-path attacker who can
+                    // guess the 4-tuple: honouring one would hand out a
+                    // one-datagram handshake teardown. Silent drop
+                    // (RFC 6347 §4.1.2.7), matching the DTLS 1.3 engine.
+                    return Ok(());
+                }
+                let combined = ((self.read_epoch as u64) << 48) | rec.seq;
+                let Some(c) = self.read_crypter.as_ref() else {
+                    return Ok(());
+                };
+                let Ok(plain) = c.decrypt_dtls(combined, ContentType::Alert, rec.fragment) else {
+                    // AEAD failure: silent drop, window not advanced.
+                    return Ok(());
+                };
+                // AEAD verified: commit to the window only now.
+                self.replay.mark(rec.seq);
+                // Authenticated, so a malformed alert is a genuine peer
+                // fault (RFC 5246 §7.2: an alert is exactly two bytes).
+                if plain.len() != 2 {
+                    return Err(Error::Decode);
+                }
+                let desc = AlertDescription::from_u8(plain[1]);
+                self.state = State::Closed;
+                if desc == AlertDescription::CloseNotify {
+                    Ok(())
+                } else {
+                    Err(Error::AlertReceived(desc))
+                }
             }
             // Unknown / unexpected content type: silent discard.
             _ => Ok(()),
@@ -832,7 +868,7 @@ impl DtlsClientConnection12 {
         leaf.check_well_formed()
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
-            let now = self.config.verification_time.clone();
+            let now = self.config.verification_time.clone().or_else(system_now);
             let key = verify_chain_with_crls(
                 &self.config.roots,
                 &self.config.crls,

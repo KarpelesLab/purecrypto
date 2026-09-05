@@ -325,7 +325,32 @@ pub struct Config {
     /// [`ConfigBuilder::no_cookie`] for the full warning; tests only.
     pub require_cookie: bool,
     /// Target MTU for emitted DTLS records (default ~1200).
+    ///
+    /// **Not yet honoured.** The DTLS engines fragment outbound handshake
+    /// messages at a fixed 1100 bytes and emit one record per
+    /// `write`/`send` call; this value is plumbed through but never read.
+    /// Application payloads are capped at 2^14 bytes per record regardless.
     pub max_record_size: usize,
+    /// DTLS server: canonical binary encoding of the peer's transport
+    /// address, bound into every HelloVerifyRequest / HelloRetryRequest
+    /// cookie so that the cookie proves the source address is actually
+    /// reachable (RFC 6347 §4.2.1, RFC 9147 §5.1).
+    ///
+    /// Empty (the default) means "unknown". A DTLS server built with
+    /// [`Self::require_cookie`] set and an empty `peer_address` **fails
+    /// closed**: it rejects the ClientHello with
+    /// [`Error::InappropriateState`](crate::tls::Error::InappropriateState) rather than minting an
+    /// address-independent cookie, because such a cookie is replayable from
+    /// any spoofed source and turns the server into a ~15-30x UDP
+    /// reflection amplifier.
+    ///
+    /// The value must be a *canonical* encoding — the recommended shape is
+    /// a 16-byte IPv6 address (IPv4 written as its v4-mapped form
+    /// `::ffff:a.b.c.d`) followed by the 2-byte big-endian port, as
+    /// produced by [`ConfigBuilder::peer_address`]. Never pass a textual
+    /// form: an attacker who can vary the spelling (`1.2.3.4:80` vs
+    /// `001.002.003.004:80`) can mint distinct cookies for one address.
+    pub peer_address: Vec<u8>,
 
     // ---- Observability ----
     /// Optional sink receiving every traffic / master secret as it is
@@ -431,6 +456,7 @@ impl Default for Config {
             cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
+            peer_address: Vec::new(),
             key_log: None,
             rng: None,
             signer: None,
@@ -639,6 +665,42 @@ impl ConfigBuilder {
     pub fn no_cookie(mut self) -> Self {
         self.inner.require_cookie = false;
         self
+    }
+    /// DTLS server: bind cookies to this peer transport address.
+    ///
+    /// `addr` must be the *canonical binary* encoding of the datagram
+    /// source the [`Connection`](crate::tls::Connection) will be fed from:
+    /// 16 bytes of IPv6 address (an IPv4 peer written as its v4-mapped
+    /// form `::ffff:a.b.c.d`) followed by the 2-byte big-endian port. Use
+    /// [`Self::peer_socket_addr`] to build it from a
+    /// [`std::net::SocketAddr`]. Passing a textual rendering instead would
+    /// let an attacker mint several distinct cookies for one address by
+    /// varying the spelling.
+    ///
+    /// Without this, the cookie proves only that *someone* completed a
+    /// round trip with these ClientHello bytes — not that the source
+    /// address is reachable — so a harvested cookie can be replayed from
+    /// arbitrary spoofed addresses for the cookie lifetime. A cookie-
+    /// requiring server with no peer address therefore refuses to handshake
+    /// at all; see [`Config::peer_address`].
+    pub fn peer_address(mut self, addr: Vec<u8>) -> Self {
+        self.inner.peer_address = addr;
+        self
+    }
+    /// DTLS server: bind cookies to `addr`, encoded canonically.
+    ///
+    /// Convenience wrapper over [`Self::peer_address`] that produces the
+    /// required 18-byte `v6-or-v4-mapped ‖ port_be` encoding.
+    #[cfg(feature = "std")]
+    pub fn peer_socket_addr(self, addr: std::net::SocketAddr) -> Self {
+        let ip = match addr.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(),
+            std::net::IpAddr::V6(v6) => v6.octets(),
+        };
+        let mut out = Vec::with_capacity(18);
+        out.extend_from_slice(&ip);
+        out.extend_from_slice(&addr.port().to_be_bytes());
+        self.peer_address(out)
     }
     /// DTLS: target MTU for emitted records.
     pub fn max_record_size(mut self, n: usize) -> Self {

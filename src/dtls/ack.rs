@@ -62,25 +62,48 @@ pub(crate) struct RecordNumber {
 /// Size of one `RecordNumber` on the wire: two `uint64`s.
 const RECORD_NUMBER_LEN: usize = 16;
 
-/// Encodes an ACK body: a `u16` vector-byte-length prefix followed by zero
-/// or more 16-byte `RecordNumber` entries, each `(epoch: u64, seq: u64)` in
-/// network byte order.
+/// Most `RecordNumber`s that fit one ACK body's `u16` byte-length prefix
+/// (`65535 / 16 = 4095`). Longer input is split across several bodies
+/// rather than truncated.
+const MAX_RECORDS_PER_ACK: usize = u16::MAX as usize / RECORD_NUMBER_LEN;
+
+/// Cap on how many record numbers an endpoint queues for acknowledgement.
 ///
-/// Returns a freshly allocated `Vec<u8>` so the caller can hand it directly
-/// to the record layer.
-pub(crate) fn encode(records: &[RecordNumber]) -> Vec<u8> {
-    // `records.len() * 16` cannot overflow a usize on any platform we
-    // support, but the wire format only has 16 bits to express the vector
-    // length. ACK bodies in practice carry a handful of entries per flight;
-    // capping at u16::MAX / 16 ≈ 4095 entries is well past anything sane.
-    let len_bytes = records.len() * RECORD_NUMBER_LEN;
-    debug_assert!(
-        len_bytes <= u16::MAX as usize,
-        "ACK record_numbers vector exceeds u16::MAX bytes"
-    );
+/// RFC 9147 §7.1 only requires acknowledging the records of the *current*
+/// flight, so a bounded queue is fully conformant. Without a cap the queue
+/// grew by one entry per AEAD-verified handshake record for the lifetime of
+/// the connection, and the ACK encoder's `u16` length field then truncated
+/// silently past 4095 entries. 64 is generous next to any real flight.
+pub(crate) const MAX_PENDING_ACKS: usize = 64;
+
+/// Encodes `records` into one or more ACK bodies: each is a `u16`
+/// vector-byte-length prefix followed by 16-byte `RecordNumber` entries,
+/// each `(epoch: u64, seq: u64)` in network byte order.
+///
+/// Always returns at least one body (an empty input yields a single empty
+/// ACK). Input longer than [`MAX_RECORDS_PER_ACK`] is **chunked** across
+/// several bodies; it must never be truncated into a length field that
+/// disagrees with the payload that follows it.
+pub(crate) fn encode(records: &[RecordNumber]) -> Vec<Vec<u8>> {
+    let mut bodies: Vec<Vec<u8>> = records
+        .chunks(MAX_RECORDS_PER_ACK)
+        .map(encode_one)
+        .collect();
+    // `chunks` yields nothing for an empty slice; emit one empty ACK.
+    if bodies.is_empty() {
+        bodies.push(encode_one(&[]));
+    }
+    bodies
+}
+
+/// Encodes one ACK body. `chunk` must hold at most [`MAX_RECORDS_PER_ACK`]
+/// entries, which is what makes the `as u16` below exact.
+fn encode_one(chunk: &[RecordNumber]) -> Vec<u8> {
+    debug_assert!(chunk.len() <= MAX_RECORDS_PER_ACK);
+    let len_bytes = chunk.len() * RECORD_NUMBER_LEN;
     let mut out = Vec::with_capacity(2 + len_bytes);
     out.extend_from_slice(&(len_bytes as u16).to_be_bytes());
-    for rn in records {
+    for rn in chunk {
         out.extend_from_slice(&rn.epoch.to_be_bytes());
         out.extend_from_slice(&rn.seq.to_be_bytes());
     }
@@ -131,7 +154,9 @@ mod tests {
 
     #[test]
     fn empty_ack_roundtrip() {
-        let encoded = encode(&[]);
+        let bodies = encode(&[]);
+        assert_eq!(bodies.len(), 1);
+        let encoded = bodies[0].clone();
         // Just the 2-byte length prefix of value 0.
         assert_eq!(encoded, vec![0x00, 0x00]);
         let decoded = decode(&encoded).expect("empty ack decodes");
@@ -141,7 +166,9 @@ mod tests {
     #[test]
     fn single_record_roundtrip() {
         let input = [RecordNumber { epoch: 3, seq: 100 }];
-        let encoded = encode(&input);
+        let bodies = encode(&input);
+        assert_eq!(bodies.len(), 1);
+        let encoded = bodies[0].clone();
         // 2 (length) + 16 (one record).
         assert_eq!(encoded.len(), 18);
         // Length prefix = 16.
@@ -168,7 +195,9 @@ mod tests {
                 seq: 999_999_999,
             },
         ];
-        let encoded = encode(&input);
+        let bodies = encode(&input);
+        assert_eq!(bodies.len(), 1);
+        let encoded = bodies[0].clone();
         assert_eq!(encoded.len(), 2 + 5 * 16);
         let decoded = decode(&encoded).expect("multi ack decodes");
         assert_eq!(decoded.as_slice(), &input);

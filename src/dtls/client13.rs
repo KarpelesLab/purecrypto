@@ -55,11 +55,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::ack::{ACK_CONTENT_TYPE, RecordNumber, decode as decode_ack, encode as encode_ack};
+use super::ack::{
+    ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack, encode as encode_ack,
+};
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
-use super::record::{self, ParsedDtlsRecord};
+use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
+use super::system_now;
 
 /// HelloRetryRequest sentinel `random` value (RFC 8446 §4.1.3).
 const HRR_RANDOM: [u8; 32] = [
@@ -90,6 +93,14 @@ pub(crate) struct ClientConfig13Internal {
     pub signature_policy: Arc<SignaturePolicy>,
     /// Suggested ceiling on emitted record size (default 1200, comfortably
     /// below typical 1500-byte path MTUs).
+    ///
+    /// **Currently inert.** Outbound handshake fragmentation uses the fixed
+    /// [`DEFAULT_MAX_FRAGMENT`] (1100 bytes) and `send()` emits one record
+    /// per call, capped at 2^14 by
+    /// [`MAX_PLAINTEXT_LEN`](super::record::MAX_PLAINTEXT_LEN). The field is
+    /// kept so `Config::max_record_size` has somewhere to land once
+    /// MTU-driven fragmentation is wired up; it does not affect the wire
+    /// today.
     pub max_record_size: usize,
     /// When `false`, the certificate chain is not validated. Intended for
     /// pinned-key and test scenarios.
@@ -414,11 +425,21 @@ impl DtlsClientConnection13 {
         self.alpn_negotiated.as_deref()
     }
 
-    /// Queues application plaintext for transmission. The handshake must
-    /// already be complete.
+    /// Queues application plaintext for transmission as a single DTLS
+    /// record. The handshake must already be complete.
+    ///
+    /// `plaintext` may be at most 2^14 bytes (`TLSPlaintext.length`, RFC
+    /// 8446 §5.1); larger input is rejected with [`Error::RecordOverflow`]
+    /// rather than silently truncating the record's 16-bit length field.
+    /// Callers wanting to send more must chunk. Note that DTLS is a
+    /// datagram protocol: a record above the path MTU will be fragmented
+    /// or dropped by IP, so practical payloads are far smaller.
     pub fn send(&mut self, plaintext: &[u8]) -> Result<(), Error> {
         if self.state != State::Connected {
             return Err(Error::InappropriateState);
+        }
+        if plaintext.len() > MAX_PLAINTEXT_LEN {
+            return Err(Error::RecordOverflow);
         }
         let dg = self.encrypt_protected_record(ContentType::ApplicationData, plaintext)?;
         self.out_dgrams.push(dg);
@@ -439,6 +460,14 @@ impl DtlsClientConnection13 {
             super::reliability::Action::Retransmit => {
                 for dg in self.retransmit.in_flight_datagrams() {
                     self.out_dgrams.push(dg.to_vec());
+                }
+                // See the matching comment in the DTLS 1.3 server: a
+                // handshake retransmit makes every half-assembled inbound
+                // message stale, so drop them and with them any poisoned
+                // reassembly candidate seeded by a spoofed epoch-0
+                // fragment. Established connections keep their partials.
+                if self.state != State::Connected {
+                    self.reassembler.clear();
                 }
             }
             super::reliability::Action::GiveUp => {
@@ -628,6 +657,12 @@ impl DtlsClientConnection13 {
         // encrypted ping-pong.
         let is_handshake = matches!(inner_type, ContentType::Handshake);
         if is_handshake {
+            // Bounded queue: RFC 9147 §7.1 only requires acknowledging the
+            // current flight, so drop the oldest entry rather than growing
+            // one record number per AEAD-verified record forever.
+            if self.pending_acks.len() >= MAX_PENDING_ACKS {
+                self.pending_acks.remove(0);
+            }
             self.pending_acks.push(RecordNumber {
                 epoch: read_epoch as u64,
                 seq,
@@ -1065,7 +1100,7 @@ impl DtlsClientConnection13 {
         leaf.check_well_formed()
             .map_err(|_| Error::BadCertificate)?;
         let leaf_key = if self.config.verify_certificates {
-            let now = self.config.verification_time.clone();
+            let now = self.config.verification_time.clone().or_else(system_now);
             let key = verify_chain_with_crls(
                 &self.config.roots,
                 &self.config.crls,
@@ -1370,7 +1405,7 @@ impl DtlsClientConnection13 {
             omit_length,
             &alloc::vec![0u8; ct_len],
             &aad_zero_mask,
-        );
+        )?;
         let hdr_len = aad.len() - ct_len;
         aad.truncate(hdr_len);
 
@@ -1393,7 +1428,7 @@ impl DtlsClientConnection13 {
             omit_length,
             &inner,
             mask,
-        );
+        )?;
         Ok(wire)
     }
 
@@ -1452,13 +1487,18 @@ impl DtlsClientConnection13 {
             return;
         }
         let acks = core::mem::take(&mut self.pending_acks);
-        let body = encode_ack(&acks);
-        // ACK uses its own content type (26).
-        if let Ok(dg) = self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
-        {
-            // ACK records are NOT retransmitted (RFC 9147 §7: only handshake
-            // and application records get tracked).
-            self.out_dgrams.push(dg);
+        // `encode_ack` chunks: an ACK body's `u16` length prefix cannot
+        // describe more than 4095 record numbers, so an oversized queue
+        // becomes several ACK records instead of one truncated one.
+        for body in encode_ack(&acks) {
+            // ACK uses its own content type (26).
+            if let Ok(dg) =
+                self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
+            {
+                // ACK records are NOT retransmitted (RFC 9147 §7: only
+                // handshake and application records get tracked).
+                self.out_dgrams.push(dg);
+            }
         }
     }
 
