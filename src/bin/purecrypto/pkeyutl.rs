@@ -231,83 +231,12 @@ fn parse_stateful(raw: &[u8]) -> Option<StatefulKey> {
     None
 }
 
-/// Atomically replaces `path`'s contents with `data` (write a sibling temp
-/// file, fsync, rename over the original, then fsync the containing
-/// directory). On Unix the temp file is created mode 0o600. Dies on any I/O
-/// failure — we must NOT emit a signature if persisting the advanced key
-/// failed.
+/// Atomically replaces the private-key file at `path` with `data`, mode 0o600.
+/// Thin wrapper over the shared [`crate::util::atomic_overwrite`] helper — the
+/// stateful-signature path must never emit a signature unless the advanced key
+/// reached the disk durably.
 fn atomic_overwrite(path: &str, data: &[u8]) {
-    use std::io::Write;
-    let tmp = format!("{path}.tmp.{}", std::process::id());
-    {
-        use std::fs::OpenOptions;
-        #[cfg(unix)]
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = OpenOptions::new();
-        // `create_new` refuses to clobber a pre-existing file or symlink at the
-        // temp path (defense in depth). If a stale temp survives a previous
-        // crashed run we remove it once and retry, then fail hard.
-        opts.create_new(true).write(true);
-        #[cfg(unix)]
-        opts.mode(0o600);
-        let mut f = match opts.open(&tmp) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                std::fs::remove_file(&tmp).unwrap_or_else(|e| {
-                    die(format!("cannot remove stale temp key file {tmp}: {e}"))
-                });
-                opts.open(&tmp)
-                    .unwrap_or_else(|e| die(format!("cannot create temp key file {tmp}: {e}")))
-            }
-            Err(e) => die(format!("cannot create temp key file {tmp}: {e}")),
-        };
-        f.write_all(data)
-            .unwrap_or_else(|e| die(format!("cannot write temp key file {tmp}: {e}")));
-        f.sync_all()
-            .unwrap_or_else(|e| die(format!("cannot fsync temp key file {tmp}: {e}")));
-    }
-    std::fs::rename(&tmp, path).unwrap_or_else(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        die(format!("cannot atomically replace key file {path}: {e}"))
-    });
-    // rename(2) only becomes durable once the containing directory's entry
-    // reaches disk. Without an fsync of the directory, a power loss after the
-    // signature is emitted can roll the key file back to the PREVIOUS one-time
-    // index — exactly the OTS-reuse class this whole function exists to
-    // prevent. So fsync the parent directory before returning (and before the
-    // caller releases the signature).
-    let dir = std::path::Path::new(path)
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    #[cfg(unix)]
-    {
-        // On Unix a directory can be opened read-only and fsync'd. This must
-        // succeed: dying here keeps the "no signature unless the advanced key
-        // is durable" contract.
-        let d = std::fs::File::open(dir).unwrap_or_else(|e| {
-            die(format!(
-                "cannot open directory {} to fsync key rename: {e}",
-                dir.display()
-            ))
-        });
-        d.sync_all().unwrap_or_else(|e| {
-            die(format!(
-                "cannot fsync directory {} after key rename: {e}",
-                dir.display()
-            ))
-        });
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows cannot fsync a directory through std (opening a directory
-        // requires FILE_FLAG_BACKUP_SEMANTICS, and FlushFileBuffers on a
-        // directory handle is not supported). Best-effort only; NTFS metadata
-        // journaling gives the rename reasonable ordering guarantees.
-        if let Ok(d) = std::fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
-    }
+    crate::util::atomic_overwrite(std::path::Path::new(path), data, 0o600);
 }
 
 /// Stateful `sign`: load, sign (advancing the index), persist the advanced key

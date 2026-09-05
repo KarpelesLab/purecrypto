@@ -299,6 +299,144 @@ fn write_private_file(path: &str, data: &[u8]) {
         .unwrap_or_else(|e| die(format!("cannot write {path}: {e}")));
 }
 
+/// Creates `path` fresh with the explicit Unix `mode` and writes `data`.
+///
+/// The open uses `create_new` (`O_CREAT | O_EXCL`), which the kernel refuses
+/// when *anything* already exists at the path — including a symbolic link,
+/// even a dangling one. That is what stops an attacker who can pre-plant
+/// `DIR/serial` (or any other CA state file) as a symlink from redirecting
+/// our write into an arbitrary file. Use this for every first-creation of a
+/// CA state file; use [`atomic_overwrite`] when a legitimate rewrite of an
+/// existing file is needed.
+pub(crate) fn write_new_file(path: &std::path::Path, data: &[u8], mode: u32) {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(not(unix))]
+    let _ = mode;
+
+    let mut opts = OpenOptions::new();
+    opts.create_new(true).write(true);
+    #[cfg(unix)]
+    opts.mode(mode);
+    let mut f = opts.open(path).unwrap_or_else(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            die(format!(
+                "refusing to overwrite existing file {} (delete it first)",
+                path.display()
+            ));
+        }
+        die(format!("cannot create {}: {e}", path.display()));
+    });
+    f.write_all(data)
+        .unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
+}
+
+/// Dies when `path` exists and is a symbolic link.
+///
+/// `create_new` (see [`write_new_file`]) and the rename in
+/// [`atomic_overwrite`] already refuse to *follow* a link, but an append-mode
+/// open has no such protection — `OpenOptions::append` follows a symlink and
+/// would extend whatever it points at. The append-style ledgers therefore
+/// screen the path first.
+pub(crate) fn reject_symlink(path: &std::path::Path) {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => die(format!(
+            "refusing to write through the symbolic link {} — remove it first",
+            path.display()
+        )),
+        _ => {}
+    }
+}
+
+/// Atomically replaces `path`'s contents with `data` (write a sibling temp
+/// file, fsync, rename over the original, then fsync the containing
+/// directory). The temp file is created with the explicit Unix `mode`.
+///
+/// The rename replaces the *directory entry*, so a symbolic link sitting at
+/// `path` is overwritten rather than written through, and a reader never
+/// observes a half-written file. Dies on any I/O failure — callers use this
+/// where a torn or lost write would break a security invariant (an advanced
+/// one-time-signature key, a CA serial counter, a regenerated CRL).
+pub(crate) fn atomic_overwrite(path: &std::path::Path, data: &[u8], mode: u32) {
+    let display = path.display().to_string();
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(format!(".tmp.{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    {
+        use std::fs::OpenOptions;
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(not(unix))]
+        let _ = mode;
+        let mut opts = OpenOptions::new();
+        // `create_new` refuses to clobber a pre-existing file or symlink at the
+        // temp path (defense in depth). If a stale temp survives a previous
+        // crashed run we remove it once and retry, then fail hard.
+        opts.create_new(true).write(true);
+        #[cfg(unix)]
+        opts.mode(mode);
+        let mut f = match opts.open(&tmp) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                std::fs::remove_file(&tmp).unwrap_or_else(|e| {
+                    die(format!(
+                        "cannot remove stale temp file {}: {e}",
+                        tmp.display()
+                    ))
+                });
+                opts.open(&tmp)
+                    .unwrap_or_else(|e| die(format!("cannot create {}: {e}", tmp.display())))
+            }
+            Err(e) => die(format!("cannot create temp file {}: {e}", tmp.display())),
+        };
+        f.write_all(data)
+            .unwrap_or_else(|e| die(format!("cannot write {}: {e}", tmp.display())));
+        f.sync_all()
+            .unwrap_or_else(|e| die(format!("cannot fsync {}: {e}", tmp.display())));
+    }
+    std::fs::rename(&tmp, path).unwrap_or_else(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        die(format!("cannot atomically replace {display}: {e}"))
+    });
+    // rename(2) only becomes durable once the containing directory's entry
+    // reaches disk. Without an fsync of the directory, a power loss after the
+    // caller has acted on the write (emitted a signature, handed out a serial)
+    // can roll the file back to its previous contents.
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    #[cfg(unix)]
+    {
+        // On Unix a directory can be opened read-only and fsync'd. This must
+        // succeed: dying here keeps the "no signature unless the advanced key
+        // is durable" contract the stateful-signature path depends on.
+        let d = std::fs::File::open(dir).unwrap_or_else(|e| {
+            die(format!(
+                "cannot open directory {} to fsync rename: {e}",
+                dir.display()
+            ))
+        });
+        d.sync_all().unwrap_or_else(|e| {
+            die(format!(
+                "cannot fsync directory {} after rename: {e}",
+                dir.display()
+            ))
+        });
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows cannot fsync a directory through std (opening a directory
+        // requires FILE_FLAG_BACKUP_SEMANTICS, and FlushFileBuffers on a
+        // directory handle is not supported). Best-effort only; NTFS metadata
+        // journaling gives the rename reasonable ordering guarantees.
+        if let Ok(d) = std::fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+}
+
 /// Lowercase hex encoding.
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
