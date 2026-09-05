@@ -713,6 +713,29 @@ impl Certificate {
         Ok(names)
     }
 
+    /// Whether the certificate carries a `subjectAltName` extension at all —
+    /// regardless of which `GeneralName` variants it holds.
+    ///
+    /// This is the predicate RFC 6125 §6.4.4 and the CA/Browser Forum Baseline
+    /// Requirements attach the commonName fallback to: the subject
+    /// commonName may stand in as a presented identifier **only** when the
+    /// certificate has NO subjectAltName extension. A certificate whose SAN
+    /// carries only `iPAddress` / `rfc822Name` / `uniformResourceIdentifier`
+    /// entries has an empty [`Certificate::subject_alt_names`] list but is
+    /// still SAN-bearing, and its commonName must be ignored — otherwise an
+    /// IP-only certificate with a misleading `CN=login.bank.example` would
+    /// authenticate that hostname.
+    pub(crate) fn has_subject_alt_name(&self) -> Result<bool, Error> {
+        let mut found = false;
+        self.walk_extensions(|id, _critical, _value| {
+            if id == oid::SUBJECT_ALT_NAME {
+                found = true;
+            }
+            Ok(())
+        })?;
+        Ok(found)
+    }
+
     /// The iPAddress entries of the `subjectAltName` extension, returned as
     /// the canonical 4-byte (IPv4) or 16-byte (IPv6) octet strings per
     /// RFC 5280 §4.2.1.6.

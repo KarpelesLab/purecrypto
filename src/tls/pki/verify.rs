@@ -625,21 +625,27 @@ fn enforce_constraints_on_cert(
     let ips = cert.subject_alt_ips().map_err(|_| Error::BadCertificate)?;
 
     // CN fallback parity with `verify_hostname` (which falls back to matching
-    // the subject commonName when a certificate has no dNSName SAN): a name
-    // constraint must govern every name a relying party might accept. When
-    // there is no dNSName SAN and the CN is plausible as a DNS name — judged
-    // by the same syntax checks `parse_dns_names` applies to SAN dNSName
-    // entries — the CN is evaluated against the permitted AND excluded
-    // dNSName subtrees exactly as if it were a dNSName (matching common
-    // practice, e.g. OpenSSL). Without this, a CA constrained by only
-    // EXCLUDED subtrees could issue a SAN-less leaf whose CN sits inside the
-    // excluded subtree and have it pass both this check and
-    // `verify_hostname`'s CN fallback. IP-shaped CNs are kept out of the
-    // dNSName evaluation; they are inert for hostname verification anyway —
+    // the subject commonName only when a certificate carries NO subjectAltName
+    // extension at all): a name constraint must govern every name a relying
+    // party might accept. When there is no SAN extension and the CN is
+    // plausible as a DNS name — judged by the same syntax checks
+    // `parse_dns_names` applies to SAN dNSName entries — the CN is evaluated
+    // against the permitted AND excluded dNSName subtrees exactly as if it
+    // were a dNSName (matching common practice, e.g. OpenSSL). Without this,
+    // a CA constrained by only EXCLUDED subtrees could issue a SAN-less leaf
+    // whose CN sits inside the excluded subtree and have it pass both this
+    // check and `verify_hostname`'s CN fallback. The condition is SAN-
+    // extension presence, NOT "the dNSName list is empty", so that the two
+    // functions stay in lockstep: `verify_hostname` ignores the CN of an
+    // IP-only-SAN certificate, so there is nothing for a dNSName constraint
+    // to govern there either. IP-shaped CNs are kept out of the dNSName
+    // evaluation; they are inert for hostname verification anyway —
     // `verify_hostname` never consults the CN for IP-literal hosts, and
     // `dns_name_matches` refuses IP-shaped patterns — so they are not checked
     // against iPAddress constraints either.
-    if dns.is_empty()
+    if !cert
+        .has_subject_alt_name()
+        .map_err(|_| Error::BadCertificate)?
         && let Some(cn) = cert
             .subject()
             .map_err(|_| Error::BadCertificate)?
@@ -836,9 +842,10 @@ fn names_differ(cert: &Certificate, issuer: &Certificate) -> Result<bool, Error>
     Ok(cert_issuer != issuer_subject)
 }
 
-/// Checks that the end-entity certificate identifies `host`. Prefers the
-/// `subjectAltName` dNSName entries (RFC 6125); if there are none, falls back
-/// to the subject common name.
+/// Checks that the end-entity certificate identifies `host`. Uses the
+/// `subjectAltName` entries (RFC 6125); the subject commonName is consulted
+/// only when the certificate carries **no subjectAltName extension at all**
+/// (see `Certificate::has_subject_alt_name`).
 pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Error> {
     // If the caller asked for an IP-literal host, the only spec-correct
     // SAN slot that can authorise it is iPAddress ([7]). Dispatch
@@ -857,10 +864,20 @@ pub(crate) fn verify_hostname(cert: &Certificate, host: &str) -> Result<(), Erro
             Err(Error::BadCertificate)
         };
     }
-    let sans = cert
-        .subject_alt_names()
-        .map_err(|_| Error::BadCertificate)?;
-    let matched = if !sans.is_empty() {
+    // RFC 6125 §6.4.4 / CA-Browser Forum BR: the commonName fallback is
+    // conditioned on the ABSENCE of a subjectAltName extension, not on the
+    // absence of dNSName entries inside it. A certificate whose SAN holds
+    // only iPAddress / rfc822Name / uniformResourceIdentifier entries is
+    // still SAN-bearing, so its CN must be ignored — otherwise a legitimately
+    // issued IP-only certificate carrying a misleading
+    // `CN=login.bank.example` would authenticate that hostname.
+    let matched = if cert
+        .has_subject_alt_name()
+        .map_err(|_| Error::BadCertificate)?
+    {
+        let sans = cert
+            .subject_alt_names()
+            .map_err(|_| Error::BadCertificate)?;
         sans.iter().any(|pattern| dns_name_matches(pattern, host))
     } else {
         cert.subject()
@@ -1423,6 +1440,87 @@ mod tests {
         .unwrap();
         verify_hostname(&cn_cert, "HOST.example").unwrap(); // case-insensitive
         assert!(verify_hostname(&cn_cert, "wrong.example").is_err());
+    }
+
+    /// MEDIUM: a certificate whose subjectAltName carries only `iPAddress`
+    /// entries has an empty dNSName list, but the extension IS present — so
+    /// RFC 6125 §6.4.4 and the CA/Browser Forum BRs forbid falling back to
+    /// the commonName. Otherwise a legitimately issued IP-only certificate
+    /// (private/internal CAs routinely validate only the SAN for IP
+    /// issuance) with `CN=login.bank.example` would authenticate that host.
+    #[test]
+    fn hostname_ip_only_san_does_not_fall_back_to_cn() {
+        use crate::x509::{
+            CertSigner, GeneralName, KeyUsageBits,
+            extension::{basic_constraints, key_usage, subject_alt_name},
+        };
+        let rsa_key = rsa_test_key_a().to_boxed();
+        let signer = CertSigner::Rsa(&rsa_key);
+        let exts = [
+            basic_constraints(false, None),
+            key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            // SAN present, but with no dNSName at all.
+            subject_alt_name(&[GeneralName::IpV4([203, 0, 113, 5])]),
+        ];
+        let cert = Certificate::self_signed_with_extensions(
+            &signer,
+            &DistinguishedName::common_name("login.bank.example"),
+            &validity(),
+            1,
+            &exts,
+        )
+        .unwrap();
+
+        // The misleading CN must NOT authenticate the hostname.
+        assert!(verify_hostname(&cert, "login.bank.example").is_err());
+        // The iPAddress SAN still works for the IP-literal reference identifier.
+        verify_hostname(&cert, "203.0.113.5").unwrap();
+        assert!(verify_hostname(&cert, "203.0.113.6").is_err());
+
+        // Same for an rfc822Name-only SAN: present ⇒ CN ignored.
+        let email_exts = [
+            basic_constraints(false, None),
+            key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+            subject_alt_name(&[GeneralName::Email("ops@bank.example".into())]),
+        ];
+        let email_cert = Certificate::self_signed_with_extensions(
+            &signer,
+            &DistinguishedName::common_name("login.bank.example"),
+            &validity(),
+            2,
+            &email_exts,
+        )
+        .unwrap();
+        assert!(verify_hostname(&email_cert, "login.bank.example").is_err());
+    }
+
+    /// The name-constraint side of the SAN-presence rule must track
+    /// `verify_hostname`: an IP-only-SAN leaf has no dNSName for a dNSName
+    /// constraint to govern, and its CN is inert (never consulted for
+    /// hostname verification), so an excluded-only dNSName constraint cannot
+    /// be violated by it.
+    #[test]
+    fn name_constraints_cn_ignored_when_ip_only_san_present() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns(".bad.example".into())],
+        );
+        let leaf_sans = [GeneralName::IpV4([10, 0, 0, 1])];
+        let (root, int, leaf) = build_chain_with_nc(nc, "host.bad.example", &leaf_sans);
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        verify_chain(
+            &store,
+            &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+            Some(&now),
+            &policy(),
+        )
+        .unwrap();
+        // ...and the CN it carries authenticates nothing.
+        assert!(verify_hostname(&leaf, "host.bad.example").is_err());
     }
 
     /// Issuing and validating a self-signed ML-DSA-65 certificate through
@@ -2176,12 +2274,18 @@ mod tests {
         )
         .unwrap();
 
-        let leaf_exts = [
+        // An EMPTY `leaf_sans` means "no subjectAltName extension at all", not
+        // "a SAN extension holding nothing": the CN fallback (here and in
+        // `verify_hostname`) keys off extension PRESENCE, so emitting an empty
+        // SAN would silently turn the CN-fallback tests into no-name tests.
+        let mut leaf_exts = alloc::vec![
             basic_constraints(false, None),
             key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
             extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
-            subject_alt_name(leaf_sans),
         ];
+        if !leaf_sans.is_empty() {
+            leaf_exts.push(subject_alt_name(leaf_sans));
+        }
         let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
         let leaf = Certificate::issue_with_extensions(
             &int_signer,
