@@ -25,6 +25,15 @@
 //! **Verification** takes only public inputs, never panics on malformed input
 //! (every access is bounds-checked), and returns `false`/`Err` instead.
 //!
+//! **Signature format.** Falcon standardizes two encodings of the same
+//! signature — padded (fixed length) and compressed/unpadded (variable length,
+//! what the NIST KAT vectors carry). Accepting both at once would make
+//! signatures malleable, so every verification entry point pins exactly one:
+//! [`verify`] and [`FalconPublicKey::verify`] require the [`Format::Padded`]
+//! form that [`FalconPrivateKey::sign`] emits, and
+//! [`verify_with_format`] / [`FalconPublicKey::verify_with_format`] let a caller
+//! ask for the compressed form instead.
+//!
 //! Verification needs only SHAKE-256 (for `HashToPoint`) and integer arithmetic
 //! modulo `q = 12289`.
 //!
@@ -224,13 +233,40 @@ impl FalconPublicKey {
         self.degree
     }
 
-    /// Verify `sig` over `msg` under this public key.
+    /// Verify `sig` over `msg` under this public key, requiring the
+    /// [`Format::Padded`] encoding that [`FalconPrivateKey::sign`] emits.
     ///
     /// Returns `Ok(true)` for a valid signature, `Ok(false)` for a
     /// well-formed-but-invalid one, and `Err` if the signature is structurally
     /// malformed (wrong length, bad header, non-canonical compression). Never
     /// panics.
+    ///
+    /// Falcon defines two encodings of the same signature, and accepting both
+    /// makes signatures malleable: an attacker can rewrite a valid compressed
+    /// signature into the padded form (or the reverse) and obtain a second,
+    /// distinct byte string that verifies for the same `(msg, pk)`. Anything
+    /// keyed on `H(signature)` — dedup caches, transaction ids, replay tables —
+    /// then sees one authenticated payload under two identities. So this
+    /// entry point pins one format. Use [`verify_with_format`] to verify
+    /// signatures produced elsewhere in the compressed encoding (the NIST KAT
+    /// vectors, for instance, carry that form).
+    ///
+    /// [`verify_with_format`]: FalconPublicKey::verify_with_format
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> Result<bool, Error> {
+        self.verify_with_format(msg, sig, Format::Padded)
+    }
+
+    /// Verify `sig` over `msg` under this public key, requiring exactly the
+    /// given signature [`Format`].
+    ///
+    /// A signature in the other encoding is rejected with `Err`, even if it
+    /// would otherwise be valid — that is the point: see [`Self::verify`].
+    pub fn verify_with_format(
+        &self,
+        msg: &[u8],
+        sig: &[u8],
+        format: Format,
+    ) -> Result<bool, Error> {
         let n = self.degree.n();
 
         // --- Parse signature header. ---
@@ -246,31 +282,32 @@ impl FalconPublicKey {
         //     `1 + 40 + |compressed-s|` bytes — this is what the NIST KAT
         //     vectors carry.
         //
-        // Both wrap `header || nonce(40) || compressed-s`. We accept either.
+        // Both wrap `header || nonce(40) || compressed-s`, and the *same*
+        // signature can be written either way — so accepting both at once would
+        // make signatures malleable. The caller pins one, and a header for the
+        // other format is rejected outright.
         let header = *sig.first().ok_or(Error::InvalidLength)?;
         if Degree::from_logn(header & 0x0F) != Some(self.degree) {
             return Err(Error::Malformed);
         }
-        match header & 0xF0 {
-            0x30 => {
-                // Padded: must be exactly sbytelen, with zero-byte tail (the
-                // trailing-bit-zero check in `decompress` enforces canonicality
-                // of that padding).
-                if sig.len() != self.degree.sig_len() {
-                    return Err(Error::InvalidLength);
-                }
-            }
-            0x20 => {
-                // Unpadded: just needs room for the header + nonce, and must
-                // not exceed the padded length.
-                if sig.len() <= 1 + NONCE_LEN || sig.len() > self.degree.sig_len() {
-                    return Err(Error::InvalidLength);
-                }
-            }
-            _ => return Err(Error::Malformed),
+        if header & 0xF0 != format.header_nibble() {
+            return Err(Error::Malformed);
         }
-
-        let is_padded = header & 0xF0 == 0x30;
+        let is_padded = format == Format::Padded;
+        if is_padded {
+            // Padded: must be exactly sbytelen, with zero-byte tail (the
+            // trailing-bit-zero check in `decompress` enforces canonicality
+            // of that padding).
+            if sig.len() != self.degree.sig_len() {
+                return Err(Error::InvalidLength);
+            }
+        } else {
+            // Unpadded: just needs room for the header + nonce, and must
+            // not exceed the padded length.
+            if sig.len() <= 1 + NONCE_LEN || sig.len() > self.degree.sig_len() {
+                return Err(Error::InvalidLength);
+            }
+        }
 
         let nonce = &sig[1..1 + NONCE_LEN];
         let s_bytes = &sig[1 + NONCE_LEN..];
@@ -460,6 +497,38 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
     Some((out, consumed_bits))
 }
 
+/// The on-the-wire encoding of a Falcon signature (spec §3.11.3 / §3.11.6).
+///
+/// Falcon standardizes two encodings of the *same* signature, and a valid one
+/// can be rewritten from either into the other. A verifier that accepts both at
+/// once therefore accepts two distinct byte strings for one `(msg, pk)` pair —
+/// signature malleability. Every verification entry point here pins exactly one
+/// format; [`FalconPrivateKey::sign`] emits [`Format::Padded`], which is what
+/// the default [`verify`] requires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Format {
+    /// Fixed length. Header byte `0011nnnn` (`0x30 | logn`); the whole
+    /// signature is exactly `Degree::sig_len()` bytes, with the compressed `s`
+    /// zero-padded up to that length. This is what
+    /// [`FalconPrivateKey::sign`] produces.
+    Padded,
+    /// Variable length ("compressed", or "unpadded"). Header byte `0010nnnn`
+    /// (`0x20 | logn`); the signature is exactly `1 + 40 + |compressed-s|`
+    /// bytes. The NIST KAT vectors use this form.
+    Compressed,
+}
+
+impl Format {
+    /// The high nibble of the header byte for this format.
+    const fn header_nibble(self) -> u8 {
+        match self {
+            Format::Padded => 0x30,
+            Format::Compressed => 0x20,
+        }
+    }
+}
+
 /// A Falcon secret key: the NTRU polynomials `(f, g, F, G)`, the public key
 /// `h`, and a cached expanded form (FFT basis + LDL tree) for fast signing.
 ///
@@ -617,9 +686,22 @@ impl Drop for FalconPrivateKey {
 /// Returns `true` iff the signature is valid. Any malformed input, length
 /// mismatch, non-canonical encoding, or failed bound check yields `false`.
 /// Never panics.
+///
+/// Only the [`Format::Padded`] encoding that [`FalconPrivateKey::sign`] emits
+/// is accepted, so one `(msg, pk)` pair has exactly one valid byte string; see
+/// [`FalconPublicKey::verify`] for why. To verify a signature produced
+/// elsewhere in the compressed encoding, use [`verify_with_format`].
 pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    verify_with_format(pk, msg, sig, Format::Padded)
+}
+
+/// Verify a Falcon signature in exactly the given [`Format`].
+///
+/// As [`verify`], but pins the signature encoding explicitly: a signature in
+/// the other format yields `false` even if it would otherwise be valid.
+pub fn verify_with_format(pk: &[u8], msg: &[u8], sig: &[u8], format: Format) -> bool {
     match FalconPublicKey::from_bytes(pk) {
-        Ok(key) => key.verify(msg, sig).unwrap_or(false),
+        Ok(key) => key.verify_with_format(msg, sig, format).unwrap_or(false),
         Err(_) => false,
     }
 }

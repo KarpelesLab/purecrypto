@@ -10,7 +10,7 @@
 //! `header || nonce(40) || compressed-s2` (the compressed / unpadded
 //! format, header `0x29` for Falcon-512 and `0x2A` for Falcon-1024).
 
-use super::{FalconPublicKey, verify};
+use super::{FalconPublicKey, Format, verify, verify_with_format};
 use crate::test_util::from_hex_vec;
 
 fn f512_pk() -> alloc::vec::Vec<u8> {
@@ -269,20 +269,28 @@ fn f1024_c1_sig() -> alloc::vec::Vec<u8> {
     ))
 }
 
+/// Every KAT vector below carries the NIST *compressed* (unpadded) encoding,
+/// so it is verified through `verify_with_format` with that format pinned. The
+/// default `verify` requires the padded form this crate's `sign` emits — see
+/// `padded_and_compressed_are_not_interchangeable`.
+fn verify_kat(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    verify_with_format(pk, msg, sig, Format::Compressed)
+}
+
 #[test]
 fn falcon512_kat_count1_accepts() {
-    assert!(verify(&f512_c1_pk(), &f512_c1_msg(), &f512_c1_sig()));
+    assert!(verify_kat(&f512_c1_pk(), &f512_c1_msg(), &f512_c1_sig()));
 }
 
 #[test]
 fn falcon1024_kat_count1_accepts() {
-    assert!(verify(&f1024_c1_pk(), &f1024_c1_msg(), &f1024_c1_sig()));
+    assert!(verify_kat(&f1024_c1_pk(), &f1024_c1_msg(), &f1024_c1_sig()));
 }
 
 #[test]
 fn falcon512_count1_sig_does_not_verify_under_count0_key() {
     // Different keypair: count=1 signature must fail under count=0's pk.
-    assert!(!verify(&f512_pk(), &f512_c1_msg(), &f512_c1_sig()));
+    assert!(!verify_kat(&f512_pk(), &f512_c1_msg(), &f512_c1_sig()));
 }
 
 #[test]
@@ -294,7 +302,7 @@ fn falcon512_kat_accepts_known_good() {
     let key = FalconPublicKey::from_bytes(&pk).expect("pk parses");
     assert_eq!(key.degree(), super::Degree::Falcon512);
     assert!(
-        verify(&pk, &msg, &sig),
+        verify_kat(&pk, &msg, &sig),
         "Falcon-512 KAT signature must verify"
     );
 }
@@ -307,7 +315,7 @@ fn falcon1024_kat_accepts_known_good() {
     let key = FalconPublicKey::from_bytes(&pk).expect("pk parses");
     assert_eq!(key.degree(), super::Degree::Falcon1024);
     assert!(
-        verify(&pk, &msg, &sig),
+        verify_kat(&pk, &msg, &sig),
         "Falcon-1024 KAT signature must verify"
     );
 }
@@ -321,7 +329,7 @@ fn falcon512_rejects_flipped_signature_bit() {
     let idx = 200;
     sig[idx] ^= 0x01;
     assert!(
-        !verify(&pk, &msg, &sig),
+        !verify_kat(&pk, &msg, &sig),
         "tampered signature must be rejected"
     );
 }
@@ -332,7 +340,10 @@ fn falcon512_rejects_wrong_message() {
     let mut msg = f512_msg();
     msg[0] ^= 0x01;
     let sig = f512_sig();
-    assert!(!verify(&pk, &msg, &sig), "wrong message must be rejected");
+    assert!(
+        !verify_kat(&pk, &msg, &sig),
+        "wrong message must be rejected"
+    );
 }
 
 #[test]
@@ -342,7 +353,7 @@ fn falcon1024_rejects_flipped_signature_bit() {
     let mut sig = f1024_sig();
     sig[300] ^= 0x02;
     assert!(
-        !verify(&pk, &msg, &sig),
+        !verify_kat(&pk, &msg, &sig),
         "tampered signature must be rejected"
     );
 }
@@ -353,7 +364,7 @@ fn rejects_wrong_parameter_set_pk() {
     let pk = f1024_pk();
     let msg = f512_msg();
     let sig = f512_sig();
-    assert!(!verify(&pk, &msg, &sig));
+    assert!(!verify_kat(&pk, &msg, &sig));
 }
 
 #[test]
@@ -362,15 +373,15 @@ fn rejects_truncated_inputs_without_panic() {
     let msg = f512_msg();
     let sig = f512_sig();
     for cut in [0usize, 1, 40, 41, sig.len() - 1] {
-        assert!(!verify(&pk, &msg, &sig[..cut]));
+        assert!(!verify_kat(&pk, &msg, &sig[..cut]));
     }
     for cut in [0usize, 1, pk.len() - 1] {
-        assert!(!verify(&pk[..cut], &msg, &sig));
+        assert!(!verify_kat(&pk[..cut], &msg, &sig));
     }
     // Empty / garbage never panics.
-    assert!(!verify(&[], &msg, &sig));
-    assert!(!verify(&[0u8; 4], &msg, &sig));
-    assert!(!verify(&pk, &msg, &[]));
+    assert!(!verify_kat(&[], &msg, &sig));
+    assert!(!verify_kat(&[0u8; 4], &msg, &sig));
+    assert!(!verify_kat(&pk, &msg, &[]));
 }
 
 #[test]
@@ -382,14 +393,17 @@ fn falcon512_unpadded_rejects_extra_trailing_zero_byte() {
     let pk = f512_c1_pk();
     let msg = f512_c1_msg();
     let sig = f512_c1_sig();
-    assert!(verify(&pk, &msg, &sig), "original unpadded sig must verify");
+    assert!(
+        verify_kat(&pk, &msg, &sig),
+        "original unpadded sig must verify"
+    );
 
     let mut padded = sig.clone();
     padded.push(0x00);
     // Stays within the padded length bound, so it reaches decompression.
     assert!(padded.len() <= super::Degree::Falcon512.sig_len());
     assert!(
-        !verify(&pk, &msg, &padded),
+        !verify_kat(&pk, &msg, &padded),
         "unpadded sig with an extra trailing zero byte must be rejected"
     );
 }
@@ -399,14 +413,106 @@ fn falcon1024_unpadded_rejects_extra_trailing_zero_byte() {
     let pk = f1024_c1_pk();
     let msg = f1024_c1_msg();
     let sig = f1024_c1_sig();
-    assert!(verify(&pk, &msg, &sig), "original unpadded sig must verify");
+    assert!(
+        verify_kat(&pk, &msg, &sig),
+        "original unpadded sig must verify"
+    );
 
     let mut padded = sig.clone();
     padded.push(0x00);
     assert!(padded.len() <= super::Degree::Falcon1024.sig_len());
     assert!(
-        !verify(&pk, &msg, &padded),
+        !verify_kat(&pk, &msg, &padded),
         "unpadded sig with an extra trailing zero byte must be rejected"
+    );
+}
+
+/// Falcon standardizes two encodings of the same signature, and the verifier
+/// used to accept both. That made signatures malleable: take a valid *unpadded*
+/// Falcon-512 signature (header `0x29`), rewrite byte 0 to `0x39` and zero-pad
+/// it out to exactly 666 bytes, and the padded arm accepted it — the degree
+/// nibble still matched, the padded arm only checked the length, the
+/// surplus-trailing-byte check was skipped for padded, `decompress` found every
+/// residual bit zero, and the norm was unchanged. Two distinct byte strings, one
+/// `(msg, pk)` pair; anything keyed on `H(signature)` sees one authenticated
+/// payload under two identities.
+#[test]
+fn padded_and_compressed_are_not_interchangeable() {
+    for (pk, msg, sig, degree) in [
+        (
+            f512_c1_pk(),
+            f512_c1_msg(),
+            f512_c1_sig(),
+            super::Degree::Falcon512,
+        ),
+        (
+            f1024_c1_pk(),
+            f1024_c1_msg(),
+            f1024_c1_sig(),
+            super::Degree::Falcon1024,
+        ),
+    ] {
+        // The KAT signature is the compressed form and verifies as such.
+        assert_eq!(sig[0] & 0xF0, 0x20, "KAT vectors are compressed");
+        assert!(verify_with_format(&pk, &msg, &sig, Format::Compressed));
+
+        // Build the padded twin: same nonce, same compressed `s`, restamped
+        // header, zero-padded to the fixed length.
+        let mut twin = sig.clone();
+        twin[0] = 0x30 | (twin[0] & 0x0F);
+        twin.resize(degree.sig_len(), 0x00);
+        assert_ne!(twin, sig, "the twin is a different byte string");
+
+        // Exactly one of the two must verify under any single entry point --
+        // never both, which is what the malleability was.
+        assert!(
+            !verify_with_format(&pk, &msg, &twin, Format::Compressed),
+            "a padded-header signature must not pass as compressed"
+        );
+        assert!(
+            !verify_with_format(&pk, &msg, &sig, Format::Padded),
+            "a compressed-header signature must not pass as padded"
+        );
+
+        // And the default entry point -- which pins the padded form this
+        // crate's `sign` emits -- accepts neither the KAT form nor its twin.
+        assert!(
+            !verify(&pk, &msg, &sig),
+            "default verify must not accept the compressed encoding"
+        );
+
+        // The twin is only well-formed enough to reach decompression; whether
+        // it verifies as padded is not the point. What matters is that no
+        // single format setting accepts both encodings of the same signature.
+        let a = verify_with_format(&pk, &msg, &sig, Format::Padded);
+        let b = verify_with_format(&pk, &msg, &twin, Format::Padded);
+        assert!(!(a && b), "one format must not accept both encodings");
+        let a = verify_with_format(&pk, &msg, &sig, Format::Compressed);
+        let b = verify_with_format(&pk, &msg, &twin, Format::Compressed);
+        assert!(!(a && b), "one format must not accept both encodings");
+    }
+}
+
+/// A signature this crate produces verifies under the default `verify`, and its
+/// compressed rewrite does not.
+#[test]
+fn generated_signature_is_padded_only() {
+    let mut r = TestRng(0x0F0F_0F0F_5EED_1234);
+    let sk = super::FalconPrivateKey::generate(super::Degree::Falcon512, &mut r);
+    let pk = sk.public_key_bytes();
+    let sig = sk.sign(b"pin the format", &mut r);
+
+    assert_eq!(sig[0] & 0xF0, 0x30, "sign emits the padded format");
+    assert!(verify(&pk, b"pin the format", &sig));
+    assert!(verify_with_format(
+        &pk,
+        b"pin the format",
+        &sig,
+        Format::Padded
+    ));
+    assert!(
+        !verify_with_format(&pk, b"pin the format", &sig, Format::Compressed),
+        "the padded signature must not also pass as compressed"
     );
 }
 
