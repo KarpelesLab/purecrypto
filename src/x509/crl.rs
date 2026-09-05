@@ -68,6 +68,18 @@ const OID_CERTIFICATE_ISSUER: &[u64] = &[2, 5, 29, 29];
 /// (RFC 5280 §5.3.2). Recognized and ignored.
 const OID_INVALIDITY_DATE: &[u64] = &[2, 5, 29, 24];
 
+/// Upper bound on the number of top-level `crlExtensions` entries accepted.
+///
+/// Duplicate detection in [`CertificateRevocationList::validate_extensions`]
+/// is a linear scan over the OIDs seen so far, so an extension block is
+/// quadratic in its entry count — and it is parsed BEFORE any signature is
+/// checked, from bytes a TLS peer can staple wholesale. A 128 KiB blob of
+/// distinct 8-byte OIDs would otherwise cost on the order of 10^8 slice
+/// comparisons. Real CRLs carry two to four top-level extensions
+/// (`cRLNumber`, `authorityKeyIdentifier`, occasionally an IDP), so 32 is far
+/// above anything conformant.
+const MAX_CRL_EXTENSIONS: usize = 32;
+
 /// Reasons a certificate may be revoked (RFC 5280 §5.3.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -508,6 +520,7 @@ impl CertificateRevocationList {
     ///   everything its issuer signed, but an IDP narrows that scope in ways
     ///   we do not evaluate — honouring the CRL anyway risks reporting a
     ///   revoked certificate as good.
+    /// * At most [`MAX_CRL_EXTENSIONS`] top-level extensions are accepted.
     /// * `cRLNumber` (2.5.29.20) and `authorityKeyIdentifier` (2.5.29.35) are
     ///   recognized; per RFC 5280 they MUST be non-critical, so a critical
     ///   instance is rejected.
@@ -533,6 +546,9 @@ impl CertificateRevocationList {
             let mut ext = exts.read_sequence()?;
             let id = parse_oid(ext.read_oid()?)?;
             if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+                return Err(Error::Malformed);
+            }
+            if seen.len() >= MAX_CRL_EXTENSIONS {
                 return Err(Error::Malformed);
             }
             seen.push(id.clone());
@@ -605,15 +621,31 @@ impl CertificateRevocationList {
                 // Extension); scan for the cRLReason entry.
                 if !entry.is_empty() {
                     let mut exts = entry.read_sequence()?;
+                    // Same strictness as the top-level `validate_extensions`:
+                    // a duplicate entry-extension OID is malformed. Without
+                    // this the loop was last-write-wins on a repeated
+                    // `cRLReason`, a parser differential on a *signed* object
+                    // (two implementations disagreeing on the revocation
+                    // reason of the same DER).
+                    let mut seen: Vec<Vec<u64>> = Vec::new();
                     while !exts.is_empty() {
                         let mut ext = exts.read_sequence()?;
                         let id = parse_oid(ext.read_oid()?)?;
+                        if seen.iter().any(|prior| prior.as_slice() == id.as_slice()) {
+                            return Err(Error::Malformed);
+                        }
+                        if seen.len() >= MAX_CRL_EXTENSIONS {
+                            return Err(Error::Malformed);
+                        }
+                        seen.push(id.clone());
                         let critical = if ext.peek_tag() == Some(tag::BOOLEAN) {
                             ext.read_boolean()?
                         } else {
                             false
                         };
                         let value = ext.read_octet_string()?;
+                        // No trailing bytes inside the Extension SEQUENCE.
+                        ext.finish()?;
                         let id = id.as_slice();
                         if id == oid::CRL_REASON_CODE {
                             let mut vr = Reader::new(value);
@@ -640,6 +672,9 @@ impl CertificateRevocationList {
                         // Unrecognized non-critical entry extensions: ignored.
                     }
                 }
+                // No trailing bytes after crlEntryExtensions (the last field
+                // of the entry SEQUENCE).
+                entry.finish()?;
                 out.push(RevokedCertificate {
                     serial,
                     revocation_date,
@@ -946,6 +981,44 @@ mod tests {
         assert!(matches!(crl.entries(), Err(Error::Malformed)));
     }
 
+    /// LOW: `entries()` used to be last-write-wins on a repeated `cRLReason`
+    /// and never called `finish()` on the entry or extension SEQUENCEs — a
+    /// parser differential on a *signed* object, and inconsistent with the
+    /// strict duplicate rejection `validate_extensions` applies to the
+    /// top-level block. Two implementations must not disagree on the
+    /// revocation reason carried by the same DER.
+    #[test]
+    fn rejects_duplicate_crl_entry_extension() {
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        let algid = algorithm_identifier(oid::SHA256_WITH_RSA, true);
+
+        // One entry carrying cRLReason TWICE: keyCompromise then unspecified.
+        let reason_ext = |code: u8| {
+            let mut body = oid_tlv(oid::CRL_REASON_CODE);
+            body.extend_from_slice(&encode_octet_string(&encode_tlv(0x0a, &[code])));
+            encode_sequence(&body)
+        };
+        let exts = encode_sequence(&[reason_ext(1), reason_ext(0)].concat());
+        let mut entry = encode_integer(&[0x07]);
+        entry.extend_from_slice(&Time::utc(2026, 1, 2, 0, 0, 0).to_der_choice());
+        entry.extend_from_slice(&exts);
+        let revoked_seq = encode_sequence(&encode_sequence(&entry));
+
+        let mut tbs_body = encode_integer(&[1]);
+        tbs_body.extend_from_slice(&algid);
+        tbs_body.extend_from_slice(&dn.to_der());
+        tbs_body.extend_from_slice(&Time::utc(2026, 1, 1, 0, 0, 0).to_der_choice());
+        tbs_body.extend_from_slice(&revoked_seq);
+        let tbs = encode_sequence(&tbs_body);
+        let sig = signer.sign(&tbs).unwrap();
+        let der = encode_sequence(&[tbs, algid, encode_bit_string(&sig)].concat());
+
+        let crl = CertificateRevocationList::from_der(der).unwrap();
+        assert!(matches!(crl.entries(), Err(Error::Malformed)));
+    }
+
     /// Encodes one `Extension ::= SEQUENCE { OID, critical?, OCTET STRING }`.
     fn ext(oid_arcs: &[u64], critical: bool, value: &[u8]) -> Vec<u8> {
         let mut body = oid_tlv(oid_arcs);
@@ -1022,6 +1095,23 @@ mod tests {
         assert!(matches!(
             CertificateRevocationList::from_der(der),
             Err(Error::UnsupportedAlgorithm)
+        ));
+    }
+
+    /// LOW: the top-level extension block is walked (with a quadratic
+    /// duplicate scan) before any signature is checked, from bytes a TLS peer
+    /// can staple. Cap the count.
+    #[test]
+    fn rejects_absurd_top_level_extension_count() {
+        let mut exts = Vec::new();
+        // Distinct, non-critical, unrecognized OIDs — individually harmless.
+        for i in 0..(MAX_CRL_EXTENSIONS as u64 + 1) {
+            exts.extend_from_slice(&ext(&[1, 3, 6, 1, 4, 1, 99999, i], false, &[0x05, 0x00]));
+        }
+        let der = crl_der_with_extensions(&exts);
+        assert!(matches!(
+            CertificateRevocationList::from_der(der),
+            Err(Error::Malformed)
         ));
     }
 
