@@ -124,6 +124,17 @@ pub mod x509;
 #[cfg(feature = "pkcs12")]
 pub mod pkcs12;
 
+#[cfg(any(
+    feature = "zkp-adaptor",
+    feature = "zkp-halfagg",
+    feature = "zkp-pedersen",
+    feature = "zkp-rangeproof",
+    feature = "zkp-sign-to-contract",
+    feature = "zkp-surjection",
+    feature = "zkp-whitelist"
+))]
+pub mod zkp;
+
 /// Shared test-only helpers.
 #[cfg(test)]
 pub(crate) mod test_util {

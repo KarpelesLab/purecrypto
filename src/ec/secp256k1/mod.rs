@@ -27,6 +27,9 @@
 //! same audited `MontModulus<4>` core P-256 uses) by the differential tests in
 //! `field_backend`; `GenericMont` remains as that oracle and a fallback.
 
+#[cfg(feature = "bip340")]
+pub mod schnorr;
+
 mod field_backend;
 mod group;
 

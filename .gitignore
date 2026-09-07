@@ -8,3 +8,4 @@
 
 # Claude Code session/worktree state
 .claude/
+tools/zkp-interop/oracle/

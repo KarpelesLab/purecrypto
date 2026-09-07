@@ -114,6 +114,36 @@ hazmat-edwards25519 = ["ec"]
 # hazmat), the natural FROST dependency. Shares the order-L `Scalar` with
 # `edwards25519::hazmat`.
 ristretto255 = ["ec", "hash", "rng"]
+# BIP340 Schnorr signatures over secp256k1 (x-only keys, tagged hashes).
+# A published, frozen standard with official test vectors -- unlike the `zkp-*`
+# features below, this one carries the normal semver guarantee. Pulls in the
+# secp256k1 arithmetic module, so the API lives at `ec::secp256k1::schnorr`.
+bip340 = ["hazmat-secp256k1", "hash", "rng"]
+
+# --- secp256k1 zero-knowledge extensions (ALL EXPERIMENTAL) ---
+# These mirror the module set of Blockstream's secp256k1-zkp. Every one of them
+# is EXPERIMENTAL: off by default, NO semver-stability guarantee, and the wire
+# formats of several are defined by a reference implementation rather than by a
+# normative specification. Implemented clean-room from papers and specs; see
+# `src/zkp/mod.rs` for the provenance record and the interop-oracle policy.
+#
+# ECDSA sign-to-contract: commit to arbitrary data in a signature's nonce.
+zkp-sign-to-contract = ["hazmat-secp256k1", "hash", "rng"]
+# ECDSA adaptor signatures ("encrypted signatures") for DLCs and atomic swaps.
+zkp-adaptor = ["hazmat-secp256k1", "hash", "rng", "alloc"]
+# Pedersen commitments over secp256k1 plus the second generator H.
+zkp-pedersen = ["hazmat-secp256k1", "hash", "rng"]
+# Borromean-ring range proofs over Pedersen commitments (Confidential Assets).
+zkp-rangeproof = ["zkp-pedersen", "alloc"]
+# Asset surjection proofs (Confidential Assets).
+zkp-surjection = ["zkp-pedersen", "alloc"]
+# Half-aggregation of BIP340 Schnorr signatures.
+zkp-halfagg = ["bip340", "alloc"]
+# Ring-signature address whitelisting (Elements/Liquid).
+zkp-whitelist = ["hazmat-secp256k1", "hash", "rng", "alloc"]
+# Umbrella: every experimental zkp module at once.
+zkp = ["zkp-sign-to-contract", "zkp-adaptor", "zkp-pedersen", "zkp-rangeproof", "zkp-surjection", "zkp-halfagg", "zkp-whitelist"]
+
 # ML-KEM-768 (FIPS 203). no_std + no-alloc core: only hashing (SHA-3/SHAKE) and
 # the RNG trait are required.
 mlkem = ["hash", "rng"]
