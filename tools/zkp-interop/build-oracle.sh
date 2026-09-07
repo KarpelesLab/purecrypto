@@ -23,6 +23,7 @@ cd "$repo"
   --enable-module-surjectionproof \
   --enable-module-whitelist \
   --enable-module-schnorrsig \
+  --enable-module-schnorrsig-halfagg \
   --enable-experimental \
   --enable-benchmark=no \
   --enable-tests=no \

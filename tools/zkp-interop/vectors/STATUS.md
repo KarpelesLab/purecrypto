@@ -12,5 +12,5 @@ directory is consumed by the crate's tests, which never link the oracle.
 | pedersen | Yes | **byte-exact** — `pedersen.json`: H, 12 commitments, 64 generators, 16 blinded generators, 8 asset commitments, 9 blind sums, 102 rejections |
 | rangeproof | **No** | pending |
 | surjection | **No** | pending |
-| halfagg | Draft only | pending |
+| halfagg | Draft only | **byte-exact** — `halfagg.json`, n = 0,1,2,3,5,10; also matches the draft's own `hacspec-halfagg` vectors |
 | whitelist | **No** | **byte-exact, bidirectional** — `whitelist.json`, 22 vectors; oracle proofs verify under us and ours verify under the oracle |
