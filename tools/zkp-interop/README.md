@@ -26,7 +26,14 @@ attribution. The clean-room route is a deliberate choice to keep this crate's
 ## Usage
 
     ./build-oracle.sh          # clone + build the oracle (network required)
-    ./gen-vectors.sh           # emit vectors/*.json
+
+Then compile and run the per-module generator you need, e.g.
+
+    cc gen-rangeproof-vectors.c -I oracle/include oracle/.libs/libsecp256k1.a \
+       -o gen-rangeproof && ./gen-rangeproof > vectors/rangeproof.json
+
+There is one `gen-*.c` per module that has vectors; each is self-contained
+and rewrites its own JSON file deterministically.
 
 Neither script runs in CI: CI consumes the committed JSON only, so the test
 suite stays hermetic and offline.
