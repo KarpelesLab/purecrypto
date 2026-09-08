@@ -156,6 +156,78 @@ impl ClientHello {
         out
     }
 
+    /// DTLS variant of [`Self::encode`] (RFC 6347 §4.2.1 / RFC 9147 §5.3):
+    /// the DTLS ClientHello carries a mandatory
+    /// `opaque legacy_cookie<0..2^8-1>` between `legacy_session_id` and
+    /// `cipher_suites`, so the two shapes are not byte-compatible. The
+    /// caller sets `legacy_version` to the DTLS 1.2 wire value `0xfefd`
+    /// (RFC 9147 §5.3: a DTLS 1.3 ClientHello MUST carry `{254, 253}`
+    /// there, with the real offer in `supported_versions`). In DTLS 1.3
+    /// `legacy_cookie` is always empty — the cookie travels in the
+    /// HelloRetryRequest `cookie` extension (RFC 9147 §5.1) — while DTLS
+    /// 1.2 echoes the HelloVerifyRequest cookie here.
+    #[cfg(feature = "dtls")]
+    pub(crate) fn encode_dtls(&self, legacy_cookie: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        put_u8(&mut out, hs_type::CLIENT_HELLO);
+        with_len_u24(&mut out, |b| {
+            put_u16(b, self.legacy_version);
+            b.extend_from_slice(&self.random);
+            with_len_u8(b, |b| b.extend_from_slice(&self.session_id));
+            with_len_u8(b, |b| b.extend_from_slice(legacy_cookie));
+            with_len_u16(b, |b| {
+                for cs in &self.cipher_suites {
+                    put_u16(b, cs.0);
+                }
+            });
+            with_len_u8(b, |b| b.push(0)); // compression: null only
+            encode_extensions(b, &self.extensions);
+        });
+        out
+    }
+
+    /// DTLS variant of [`Self::decode`]: reads the `legacy_cookie` field
+    /// (RFC 6347 §4.2.1 / RFC 9147 §5.3) and returns it alongside the
+    /// parsed hello. A TLS-shaped body (no cookie field) does not parse as
+    /// a DTLS ClientHello: the byte that should be the cookie length is
+    /// the high byte of `cipher_suites`' length, which mis-frames every
+    /// field after it. Unlike the TLS decoder, the `extensions` block is
+    /// mandatory — every DTLS version postdates it.
+    #[cfg(feature = "dtls")]
+    pub(crate) fn decode_dtls(body: &[u8]) -> Result<(Self, Vec<u8>), Error> {
+        let mut c = ReadCursor::new(body);
+        let legacy_version = c.u16()?;
+        let random = read_random(&mut c)?;
+        let session_id = c.vec_u8()?.to_vec();
+        let legacy_cookie = c.vec_u8()?.to_vec();
+        let cs_bytes = c.vec_u16()?;
+        if cs_bytes.len() % 2 != 0 {
+            return Err(Error::Decode);
+        }
+        let mut cs = ReadCursor::new(cs_bytes);
+        let mut cipher_suites = Vec::new();
+        while !cs.is_empty() {
+            cipher_suites.push(CipherSuite(cs.u16()?));
+        }
+        // RFC 9147 §5.3 / RFC 8446 §4.1.2: the list MUST contain null.
+        let compression = c.vec_u8()?;
+        if !compression.contains(&0) {
+            return Err(Error::IllegalParameter);
+        }
+        let extensions = parse_extensions(c.vec_u16()?)?;
+        c.expect_empty()?;
+        Ok((
+            ClientHello {
+                legacy_version,
+                random,
+                session_id,
+                cipher_suites,
+                extensions,
+            },
+            legacy_cookie,
+        ))
+    }
+
     /// Returns the `legacy_compression_methods` list of an encoded ClientHello
     /// body. `decode` deliberately drops it (TLS 1.2 tolerates any list that
     /// contains null); the TLS 1.3 server uses this to enforce RFC 8446
@@ -458,6 +530,50 @@ mod tests {
         let (ty, body) = read_handshake(&mut c).unwrap();
         assert_eq!(ty, hs_type::CLIENT_HELLO);
         assert_eq!(ClientHello::decode(body).unwrap(), ch);
+    }
+
+    /// RFC 6347 §4.2.1 / RFC 9147 §5.3: the DTLS ClientHello carries a
+    /// `legacy_cookie<0..2^8-1>` between `legacy_session_id` and
+    /// `cipher_suites`. The DTLS encoder/decoder round-trip it, and the
+    /// two shapes must not silently parse as each other.
+    #[cfg(feature = "dtls")]
+    #[test]
+    fn dtls_client_hello_roundtrip_and_shape_mismatch() {
+        let ch = ClientHello {
+            legacy_version: 0xfefd,
+            random: [0x33; 32],
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![
+                CipherSuite::AES_128_GCM_SHA256,
+                CipherSuite::CHACHA20_POLY1305_SHA256,
+            ],
+            extensions: alloc::vec![
+                (
+                    ExtensionType::SUPPORTED_VERSIONS,
+                    alloc::vec![0x02, 0xfe, 0xfc]
+                ),
+                (ExtensionType::KEY_SHARE, alloc::vec![1, 2, 3, 4]),
+            ],
+        };
+        for cookie in [&b""[..], &[0xaa; 32][..]] {
+            let bytes = ch.encode_dtls(cookie);
+            let mut c = ReadCursor::new(&bytes);
+            let (ty, body) = read_handshake(&mut c).unwrap();
+            assert_eq!(ty, hs_type::CLIENT_HELLO);
+            // Fixed offsets: version(2) ‖ random(32) ‖ sid_len(1)=0 ‖
+            // cookie_len(1).
+            assert_eq!(&body[..2], &[0xfe, 0xfd]);
+            assert_eq!(body[34], 0);
+            assert_eq!(body[35] as usize, cookie.len());
+            let (parsed, parsed_cookie) = ClientHello::decode_dtls(body).unwrap();
+            assert_eq!(parsed, ch);
+            assert_eq!(parsed_cookie, cookie);
+            // The TLS decoder mis-frames a DTLS body ...
+            assert!(ClientHello::decode(body).is_err());
+        }
+        // ... and the DTLS decoder mis-frames a TLS body.
+        let tls = ch.encode();
+        assert!(ClientHello::decode_dtls(&tls[4..]).is_err());
     }
 
     #[test]

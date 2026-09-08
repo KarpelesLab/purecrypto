@@ -8,7 +8,10 @@
 //! Mirror of [`super::client13::DtlsClientConnection13`]. The server:
 //!
 //! 1. Receives the first ClientHello over a plaintext DTLS 1.2-framed
-//!    record (epoch 0).
+//!    record (epoch 0). The hello is DTLS-shaped (RFC 9147 §5.3): it
+//!    carries a `legacy_cookie` field (which must be empty) and offers
+//!    `0xfefc` in `supported_versions`; the ServerHello / HRR select
+//!    `0xfefc` with `legacy_version = 0xfefd`.
 //! 2. If cookie validation is enabled (default), emits a
 //!    HelloRetryRequest with a `cookie` extension (RFC 9147 §5.1) and
 //!    DROPS all per-connection state — the next CH must echo the cookie
@@ -941,7 +944,22 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         if msg_seq > MAX_HS_MSG_SEQ {
             return Err(Error::IllegalParameter);
         }
-        let ch = ClientHello::decode(body)?;
+        // RFC 9147 §5.3: the DTLS ClientHello carries a `legacy_cookie`
+        // field a TLS-shaped hello lacks; a DTLS 1.3 client MUST send it
+        // empty (the HRR cookie travels in the `cookie` extension) and the
+        // server MUST abort with `illegal_parameter` otherwise.
+        let (ch, legacy_cookie) = ClientHello::decode_dtls(body)?;
+        if !legacy_cookie.is_empty() {
+            return Err(Error::IllegalParameter);
+        }
+        // RFC 9147 §5.3: only the DTLS 1.3 codepoint `0xfefc` may be
+        // selected. A hello that offers merely TLS 1.3 (`0x0304`) — or
+        // nothing at all (a DTLS 1.2 client) — cannot be served here.
+        let sv = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
+            .ok_or(Error::UnsupportedVersion)?;
+        if !super::client_offers_dtls13(sv)? {
+            return Err(Error::UnsupportedVersion);
+        }
         // Fail closed: a server that asks for cookie enforcement but never
         // supplied a `cookie_secret` MUST NOT silently degrade to the
         // no-cookie path (which would emit the full, expensive server flight
@@ -1299,10 +1317,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         self.reassembler = Some(reasm);
         self.server_random = Some(sr);
 
-        // ServerHello with the negotiated group's `key_share`.
+        // ServerHello with the negotiated group's `key_share`; selects
+        // DTLS 1.3 (`0xfefc`, RFC 9147 §5.3).
         let sh_extensions = alloc::vec![
             ext::server_key_share(selected_group, &server_pub),
-            ext::server_supported_versions(),
+            super::server_supported_versions_dtls13(),
         ];
         let sh_bytes = ServerHello {
             random: sr,
@@ -1604,7 +1623,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         cookie: Option<&[u8]>,
         group: Option<NamedGroup>,
     ) -> Vec<u8> {
-        let mut extensions = alloc::vec![ext::server_supported_versions(),];
+        // RFC 9147 §5.3: the HRR selects DTLS 1.3 (`0xfefc`).
+        let mut extensions = alloc::vec![super::server_supported_versions_dtls13(),];
         if let Some(g) = group {
             // HRR `key_share` body is just a u16 selected_group.
             let mut body = Vec::with_capacity(2);

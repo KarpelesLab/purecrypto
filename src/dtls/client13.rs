@@ -11,6 +11,10 @@
 //!   records, including encrypted sequence numbers (RFC 9147 §4.2.3).
 //! - Plaintext DTLS records (`super::record`) for the initial flight
 //!   (ClientHello / HelloRetryRequest), per RFC 9147 §4.1.
+//! - The DTLS-shaped ClientHello (RFC 9147 §5.3): `legacy_version =
+//!   0xfefd`, an empty `legacy_cookie` field, and `supported_versions`
+//!   offering `0xfefc`; the ServerHello / HelloRetryRequest must select
+//!   `0xfefc`.
 //! - DTLS handshake header (`Type ‖ Length ‖ MessageSeq ‖ FragmentOffset ‖
 //!   FragmentLength`) for handshake messages.
 //! - ACK-driven retransmission (`super::reliability13`) — every received
@@ -869,10 +873,11 @@ impl DtlsClientConnection13 {
         {
             return Err(Error::IllegalParameter);
         }
-        // Confirm supported_versions = TLS 1.3.
+        // RFC 9147 §5.3: the server MUST select DTLS 1.3 (`0xfefc`) in
+        // `supported_versions`; the TLS codepoint is not acceptable.
         let sv = ext::find(&sh.extensions, ExtensionType::SUPPORTED_VERSIONS)
             .ok_or(Error::UnsupportedVersion)?;
-        if ext::parse_selected_version(sv)? != ProtocolVersion::TLSv1_3 {
+        if ext::parse_selected_version(sv)? != ProtocolVersion::DTLSv1_3 {
             return Err(Error::UnsupportedVersion);
         }
         self.server_random = Some(sh.random);
@@ -971,9 +976,10 @@ impl DtlsClientConnection13 {
         if !self.config.cipher_suites.contains(&suite.suite) {
             return Err(Error::IllegalParameter);
         }
+        // RFC 9147 §5.3: the HRR, like the ServerHello, selects `0xfefc`.
         let sv = ext::find(&hrr.extensions, ExtensionType::SUPPORTED_VERSIONS)
             .ok_or(Error::UnsupportedVersion)?;
-        if ext::parse_selected_version(sv)? != ProtocolVersion::TLSv1_3 {
+        if ext::parse_selected_version(sv)? != ProtocolVersion::DTLSv1_3 {
             return Err(Error::UnsupportedVersion);
         }
 
@@ -1360,10 +1366,10 @@ impl DtlsClientConnection13 {
             extensions.insert(0, ext::server_name(name));
         }
         extensions.push(ext::signature_algorithms());
-        // Use DTLS 1.3 supported_versions (we still emit just TLS 1.3 here;
-        // peers also implementing DTLS 1.3 read the version from the record
-        // header / the wire-format alignment with TLS 1.3 is intentional).
-        extensions.push(ext::client_supported_versions());
+        // RFC 9147 §5.3: offer DTLS 1.3 (`0xfefc`) — the TLS codepoint
+        // `0x0304` is not a DTLS version and a conforming DTLS server would
+        // refuse to select it.
+        extensions.push(super::client_supported_versions_dtls13());
         extensions.push(ext::client_key_shares(&key_shares));
         if !self.config.alpn_protocols.is_empty() {
             let protos: Vec<&[u8]> = self
@@ -1378,17 +1384,22 @@ impl DtlsClientConnection13 {
             extensions.push((ExtensionType(EXT_COOKIE), cookie.clone()));
         }
 
+        // RFC 9147 §5.3: `legacy_version` is the DTLS 1.2 codepoint
+        // `0xfefd`; the DTLS-shaped body carries an (always empty in DTLS
+        // 1.3) `legacy_cookie` field — the HelloRetryRequest cookie rides in
+        // the `cookie` extension pushed above, never here.
         let ch = ClientHello {
-            legacy_version: 0x0303,
+            legacy_version: ProtocolVersion::DTLSv1_2.as_u16(),
             random: self.client_random,
             session_id: Vec::new(),
             // Offer the configured suites in descending preference order.
             cipher_suites: self.config.cipher_suites.clone(),
             extensions,
         }
-        .encode();
+        .encode_dtls(&[]);
 
-        // Transcript: include the entire TLS-shaped CH (4-byte header + body).
+        // Transcript: the 4-byte TLS handshake header + the DTLS-shaped body
+        // (RFC 9147 §5.2 — only the DTLS fragment fields are excluded).
         self.transcript.update(&ch);
 
         // Wrap as a DTLS handshake fragment.

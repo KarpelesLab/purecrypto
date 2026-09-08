@@ -3911,7 +3911,6 @@ mod audit_2026_09 {
     /// `key_share` for is illegal_parameter.
     #[test]
     fn client13_rejects_hrr_selecting_already_offered_group() {
-        use crate::tls::codec::extension as ext;
         use crate::tls::codec::{ExtensionType, ServerHello};
         const HRR_RANDOM: [u8; 32] = [
             0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65,
@@ -3932,7 +3931,8 @@ mod audit_2026_09 {
                 session_id: Vec::new(),
                 cipher_suite: CipherSuite(0x1301),
                 extensions: alloc::vec![
-                    ext::server_supported_versions(),
+                    // RFC 9147 §5.3: an HRR selects `0xfefc` (DTLS-I1).
+                    crate::dtls::server_supported_versions_dtls13(),
                     (ExtensionType::KEY_SHARE, ks),
                 ],
             }
