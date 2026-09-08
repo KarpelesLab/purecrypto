@@ -7194,6 +7194,77 @@ mod audit_regression_tests {
         );
     }
 
+    /// TLS-CORE-1 — RFC 5077 §3.3 permits exactly one `NewSessionTicket`
+    /// per handshake. The TLS 1.2 client used to accept repeats in
+    /// `WaitServerFinished` with no once-only flag, appending each to the
+    /// uncapped transcript buffer: an on-path peer could stream 60 KiB
+    /// tickets and grow the client's heap 1:1 with what it sent, forever.
+    #[test]
+    fn tls12_client_refuses_a_second_new_session_ticket() {
+        use crate::tls::codec::{NewSessionTicket12, write_record};
+        use crate::tls::conn::{
+            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
+        };
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let server_config = ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed);
+        let mut roots = RootCertStore::new();
+        roots.add_der(der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"nst12-dup-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"nst12-dup-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
+                .unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        // Full server flight; the client answers with CKE+CCS+Finished and
+        // parks in `WaitServerFinished`.
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+        client.read_tls(&flight);
+        client.process_new_packets().unwrap();
+        assert!(!client.write_tls().is_empty(), "client flight expected");
+
+        // One plaintext NewSessionTicket is legal here.
+        let nst = NewSessionTicket12 {
+            lifetime: 7200,
+            ticket: alloc::vec![0x41u8; 60_000],
+        }
+        .encode();
+        let mut rec = Vec::new();
+        for chunk in nst.chunks(16 * 1024) {
+            write_record(
+                &mut rec,
+                ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                chunk,
+            );
+        }
+        client.read_tls(&rec);
+        client.process_new_packets().unwrap();
+        assert!(client.is_handshaking());
+
+        // A second one must be refused, not appended to the transcript.
+        client.read_tls(&rec);
+        assert!(
+            matches!(client.process_new_packets(), Err(Error::UnexpectedMessage)),
+            "a repeated NewSessionTicket must be rejected"
+        );
+        assert!(!client.is_handshaking(), "the connection must be dead");
+    }
+
     /// LOW 9 — after the client's `Finished`, 1-RTT application data must
     /// land in the regular receive buffer. Leaving the 0-RTT routing armed
     /// diverted fully-authenticated bytes into the replayable early-data

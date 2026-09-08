@@ -574,6 +574,12 @@ pub struct ClientConnection12 {
     /// consumption (currently unused by the state machine).
     #[allow(dead_code)]
     received_ticket_lifetime: u32,
+    /// RFC 5077 §3.3 permits exactly one `NewSessionTicket` per handshake.
+    /// Set when the first one is consumed; a repeat is `unexpected_message`.
+    /// Without this a peer could stream NSTs for as long as it liked — each
+    /// is appended to the (uncapped) transcript buffer, so the client's heap
+    /// would grow 1:1 with what the peer sent.
+    nst_received: bool,
     /// RFC 5077: `true` when this handshake is being resumed (we presented
     /// a non-empty `session_ticket` extension and the server accepted it —
     /// detected by the server's `session_ticket` extension being absent in
@@ -738,6 +744,7 @@ impl ClientConnection12 {
             cert_request_received: false,
             received_ticket: None,
             received_ticket_lifetime: 0,
+            nst_received: false,
             resumed: false,
             // We always offer EMS (RFC 7627 §3); the flag captures that on
             // both the fresh and resumed paths so resumption-gating can
@@ -859,6 +866,7 @@ impl ClientConnection12 {
             cert_request_received: false,
             received_ticket: None,
             received_ticket_lifetime: 0,
+            nst_received: false,
             resumed: false,
             ems_offered: true,
             ems_negotiated: false,
@@ -2218,6 +2226,11 @@ impl ClientConnection12 {
             // a `NewSessionTicket` (plaintext, transcript-included) just before
             // its CCS+Finished. Consume it and keep waiting for the Finished.
             if msg_type == hs_type::NEW_SESSION_TICKET {
+                // RFC 5077 §3.3: exactly one per handshake.
+                if self.nst_received {
+                    return Err(Error::UnexpectedMessage);
+                }
+                self.nst_received = true;
                 let nst = NewSessionTicket12::decode(body)?;
                 if !nst.ticket.is_empty() {
                     self.received_ticket = Some(nst.ticket);
@@ -2243,6 +2256,13 @@ impl ClientConnection12 {
         // Finished and the server's CCS. It's a plaintext handshake message,
         // included in the transcript, that the server's Finished signs.
         if msg_type == hs_type::NEW_SESSION_TICKET {
+            // RFC 5077 §3.3: exactly one per handshake. A second one is a
+            // protocol violation — and, since every NST lands in the
+            // transcript buffer, an unbounded-memory vector if accepted.
+            if self.nst_received {
+                return Err(Error::UnexpectedMessage);
+            }
+            self.nst_received = true;
             let nst = NewSessionTicket12::decode(body)?;
             if !nst.ticket.is_empty() {
                 self.received_ticket = Some(nst.ticket);
