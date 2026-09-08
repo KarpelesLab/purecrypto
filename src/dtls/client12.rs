@@ -16,6 +16,14 @@
 //! - Anti-replay sliding window after CCS
 //! - Sans-I/O retransmit machine driven by `next_timeout`/`on_timeout`
 //!
+//! Post-handshake handshake messages are fatal (`UnexpectedMessage`), as
+//! they are in the TLS 1.2 engine: DTLS 1.2 has no KeyUpdate, and this
+//! client never offers the `session_ticket` extension, so a server that
+//! sends `NewSessionTicket` — at any point, including its RFC 5077 slot
+//! before `Finished` — violates RFC 5077 §3.3 ("the server MUST NOT send
+//! a NewSessionTicket unless the client sent the extension").
+//! Renegotiation (`HelloRequest`) is likewise unsupported.
+//!
 //! The state machine intentionally re-implements the TLS 1.2 client logic
 //! rather than wrapping `ClientConnection12` because DTLS's transcript rules
 //! (RFC 6347 §4.2.1 — drop the first CH + HVR; second CH carries cookie

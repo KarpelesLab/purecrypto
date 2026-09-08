@@ -128,7 +128,6 @@ fn pump12<R: crate::rng::RngCore>(
 }
 
 /// Exchanges one application-data round trip in both directions.
-#[allow(dead_code)] // used from DTLS-I2 onward
 fn app_data_round_trip<R: crate::rng::RngCore>(
     client: &mut DtlsClientConnection13,
     server: &mut DtlsServerConnection13<R>,
@@ -373,4 +372,293 @@ fn dtls12_client_hello_carries_version_and_cookie_field() {
 
     server.feed_datagram(&ch2).unwrap();
     assert!(pump12(&mut client, &mut server));
+}
+
+// ---------------------------------------------------------------------
+// DTLS-I2: post-handshake KeyUpdate / NewSessionTicket (RFC 9147 §8).
+// ---------------------------------------------------------------------
+
+fn connected_pair() -> (
+    DtlsClientConnection13,
+    DtlsServerConnection13<HmacDrbg<Sha256>>,
+) {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i2-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"i2-server");
+    assert!(pump13(&mut client, &mut server));
+    // Drain the trailing ACK exchange so nothing is in flight.
+    for _ in 0..4 {
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+    }
+    assert_eq!(client.write_epoch(), 3);
+    assert_eq!(server.write_epoch(), 3);
+    assert_eq!(client.read_epoch(), Some(3));
+    assert_eq!(server.read_epoch(), Some(3));
+    (client, server)
+}
+
+/// Server-initiated KeyUpdate: the server keeps writing under epoch 3
+/// until the client's ACK arrives, the client moves its read epoch to 4 on
+/// the KeyUpdate itself, still decrypts the straggling epoch-3 record, and
+/// data flows both ways afterwards.
+#[test]
+fn key_update_server_initiated_13() {
+    let (mut client, mut server) = connected_pair();
+    server.request_key_update(false).unwrap();
+    assert!(server.key_update_pending());
+    let ku = server.pop_outbound_datagrams();
+    assert_eq!(ku.len(), 1);
+    // RFC 9147 §8: no new-epoch traffic before the ACK — this record is
+    // still epoch 3 (low bits 0b11).
+    server.send(b"before-ack").unwrap();
+    let straggler = server.pop_outbound_datagrams().remove(0);
+    assert_eq!(straggler[0] & 0b11, 3);
+    assert_eq!(server.write_epoch(), 3);
+
+    for dg in &ku {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(client.read_epoch(), Some(4));
+    // The epoch-3 straggler arrives after the switch: previous-epoch keys
+    // are retained for it.
+    client.feed_datagram(&straggler).unwrap();
+    assert_eq!(client.take_received(), b"before-ack");
+
+    // Client ACK → server switches to epoch 4.
+    let acks = client.pop_outbound_datagrams();
+    assert!(!acks.is_empty());
+    for dg in &acks {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(!server.key_update_pending());
+    assert_eq!(server.write_epoch(), 4);
+    assert!(server.next_timeout().is_none(), "KeyUpdate released");
+    server.send(b"after").unwrap();
+    let rec = server.pop_outbound_datagrams().remove(0);
+    assert_eq!(rec[0] & 0b11, 0, "epoch 4 → low bits 00");
+    client.feed_datagram(&rec).unwrap();
+    assert_eq!(client.take_received(), b"after");
+    app_data_round_trip(&mut client, &mut server);
+    // The client did not update its own keys (update_not_requested).
+    assert_eq!(client.write_epoch(), 3);
+    assert_eq!(server.read_epoch(), Some(3));
+}
+
+/// Client-initiated KeyUpdate with `update_requested`: the server answers
+/// with its own KeyUpdate; both directions end up at epoch 4.
+#[test]
+fn key_update_client_initiated_with_request_13() {
+    let (mut client, mut server) = connected_pair();
+    client.request_key_update(true).unwrap();
+    // A second one while the first is unacknowledged is refused (§8).
+    assert_eq!(
+        client.request_key_update(false),
+        Err(crate::tls::Error::InappropriateState)
+    );
+    for _ in 0..6 {
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+    }
+    assert!(!client.key_update_pending());
+    assert!(!server.key_update_pending());
+    assert_eq!(client.write_epoch(), 4);
+    assert_eq!(server.write_epoch(), 4);
+    assert_eq!(client.read_epoch(), Some(4));
+    assert_eq!(server.read_epoch(), Some(4));
+    app_data_round_trip(&mut client, &mut server);
+    // Two more rounds: epochs keep advancing (5, 6) and nothing wedges.
+    for _ in 0..2 {
+        server.request_key_update(true).unwrap();
+        for _ in 0..6 {
+            for dg in &server.pop_outbound_datagrams() {
+                client.feed_datagram(dg).unwrap();
+            }
+            for dg in &client.pop_outbound_datagrams() {
+                server.feed_datagram(dg).unwrap();
+            }
+        }
+        app_data_round_trip(&mut client, &mut server);
+    }
+    assert_eq!(client.write_epoch(), 6);
+    assert_eq!(server.read_epoch(), Some(6));
+}
+
+/// A lost ACK: the server retransmits the KeyUpdate under the old epoch,
+/// the client (already at the new read epoch) decrypts it with the retained
+/// keys, ignores the stale message and re-ACKs; the server then switches.
+#[test]
+fn retransmitted_key_update_is_reacked_13() {
+    let (mut client, mut server) = connected_pair();
+    server.request_key_update(false).unwrap();
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(client.read_epoch(), Some(4));
+    let _lost_ack = client.pop_outbound_datagrams();
+    let t = server.next_timeout().expect("KeyUpdate in flight");
+    server.on_timeout(t);
+    let retx = server.pop_outbound_datagrams();
+    assert_eq!(retx.len(), 1);
+    assert_eq!(retx[0][0] & 0b11, 3, "retransmitted under epoch 3");
+    client.feed_datagram(&retx[0]).unwrap();
+    assert_eq!(
+        client.read_epoch(),
+        Some(4),
+        "stale KeyUpdate not re-applied"
+    );
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.write_epoch(), 4);
+    assert!(server.next_timeout().is_none());
+    app_data_round_trip(&mut client, &mut server);
+}
+
+/// The previous read epoch is retained only for a bounded window: after
+/// `PREV_EPOCH_GRACE_RECORDS` records under the new epoch, an old-epoch
+/// record is dropped.
+#[test]
+fn old_epoch_records_rejected_after_grace_window_13() {
+    use crate::dtls::epoch13::PREV_EPOCH_GRACE_RECORDS;
+    let (mut client, mut server) = connected_pair();
+    server.request_key_update(false).unwrap();
+    let ku = server.pop_outbound_datagrams();
+    server.send(b"old-epoch").unwrap();
+    let old = server.pop_outbound_datagrams().remove(0);
+    for dg in &ku {
+        client.feed_datagram(dg).unwrap();
+    }
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.write_epoch(), 4);
+    for _ in 0..PREV_EPOCH_GRACE_RECORDS {
+        server.send(b"x").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+    }
+    let _ = client.take_received();
+    // Past the window: silently dropped (never fatal — a stale datagram
+    // must not kill the connection).
+    assert_eq!(client.feed_datagram(&old), Ok(()));
+    assert!(client.take_received().is_empty());
+    app_data_round_trip(&mut client, &mut server);
+}
+
+/// A NewSessionTicket from the server is accepted (no resumption store:
+/// discarded) and acknowledged, so the server's retransmit timer clears.
+#[test]
+fn new_session_ticket_accepted_and_acked_13() {
+    let (mut client, mut server) = connected_pair();
+    let nst = crate::tls::codec::NewSessionTicket {
+        ticket_lifetime: 3600,
+        ticket_age_add: 0x1234_5678,
+        ticket_nonce: alloc::vec![0, 1],
+        ticket: alloc::vec![0xab; 64],
+        extensions: Vec::new(),
+    }
+    .encode();
+    server.send_handshake_for_test(hs_type::NEW_SESSION_TICKET, &nst[4..]);
+    assert!(server.next_timeout().is_some());
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    let acks = client.pop_outbound_datagrams();
+    assert!(!acks.is_empty(), "NST must be ACKed");
+    for dg in &acks {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.next_timeout().is_none(), "ACK released the NST");
+    app_data_round_trip(&mut client, &mut server);
+
+    // A malformed ticket from the authenticated server is still fatal.
+    server.send_handshake_for_test(hs_type::NEW_SESSION_TICKET, &[0u8; 13]);
+    for dg in &server.pop_outbound_datagrams() {
+        assert!(client.feed_datagram(dg).is_err());
+    }
+}
+
+/// Only the server issues tickets: one from the client is a protocol
+/// violation, as is any other post-handshake message type.
+#[test]
+fn server_rejects_client_post_handshake_junk_13() {
+    let (mut client, mut server) = connected_pair();
+    let nst = crate::tls::codec::NewSessionTicket {
+        ticket_lifetime: 1,
+        ticket_age_add: 0,
+        ticket_nonce: Vec::new(),
+        ticket: alloc::vec![1],
+        extensions: Vec::new(),
+    }
+    .encode();
+    client.send_handshake_for_test(hs_type::NEW_SESSION_TICKET, &nst[4..]);
+    for dg in &client.pop_outbound_datagrams() {
+        assert_eq!(
+            server.feed_datagram(dg),
+            Err(crate::tls::Error::UnexpectedMessage)
+        );
+    }
+    let (mut client, mut server) = connected_pair();
+    client.send_handshake_for_test(hs_type::FINISHED, &[0u8; 32]);
+    for dg in &client.pop_outbound_datagrams() {
+        assert_eq!(
+            server.feed_datagram(dg),
+            Err(crate::tls::Error::UnexpectedMessage)
+        );
+    }
+}
+
+/// An authenticated peer cannot grind key derivations forever: the 65th
+/// inbound KeyUpdate is refused.
+#[test]
+fn key_updates_received_are_bounded_13() {
+    use crate::dtls::epoch13::MAX_KEY_UPDATES_RECEIVED;
+    let (mut client, mut server) = connected_pair();
+    for i in 0..=MAX_KEY_UPDATES_RECEIVED {
+        server.request_key_update(false).unwrap();
+        let ku = server.pop_outbound_datagrams();
+        let res = client.feed_datagram(&ku[0]);
+        if i < MAX_KEY_UPDATES_RECEIVED {
+            res.unwrap();
+            for dg in &client.pop_outbound_datagrams() {
+                server.feed_datagram(dg).unwrap();
+            }
+            assert_eq!(server.write_epoch() as u32, 4 + i);
+        } else {
+            assert_eq!(res, Err(crate::tls::Error::PeerMisbehaved));
+        }
+    }
+}
+
+/// A KeyUpdate whose ACK never arrives closes the connection once the
+/// retransmit budget is spent (the peer may have moved on to the new epoch
+/// while we, per §8, may not).
+#[test]
+fn unacked_key_update_eventually_closes_13() {
+    let (mut client, _server) = connected_pair();
+    client.request_key_update(false).unwrap();
+    let _ = client.pop_outbound_datagrams();
+    for _ in 0..16 {
+        let Some(t) = client.next_timeout() else {
+            break;
+        };
+        client.on_timeout(t);
+        let _ = client.pop_outbound_datagrams();
+    }
+    assert!(!client.is_handshake_complete(), "closed after giving up");
+    assert_eq!(
+        client.send(b"x"),
+        Err(crate::tls::Error::InappropriateState)
+    );
 }

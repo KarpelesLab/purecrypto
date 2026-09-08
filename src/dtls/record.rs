@@ -57,9 +57,11 @@ const SEQ_MASK_48: u64 = (1u64 << 48) - 1;
 /// sequence number. The wire field is 48 bits, but — exactly as the TLS 1.3
 /// record layer does (`src/tls/crypto/aead.rs::MAX_RECORDS_PER_KEY = 1 << 23`)
 /// — we refuse to send long before that, well inside every AEAD's safe-record
-/// limit. DTLS has no KeyUpdate path here, so hitting the cap is
-/// connection-fatal: callers return `Error::TooManyRecords` rather than rely on
-/// the debug-only 48-bit assert that silently truncates in release builds.
+/// limit. Hitting the cap is connection-fatal: callers return
+/// `Error::TooManyRecords` rather than rely on the debug-only 48-bit assert
+/// that silently truncates in release builds. DTLS 1.3 endpoints can avoid
+/// it by rekeying first (`request_key_update`, RFC 9147 §8), which starts a
+/// fresh epoch with its own counter; DTLS 1.2 has no rekey path.
 pub(crate) const MAX_RECORDS_PER_EPOCH: u64 = 1 << 23;
 
 /// Returns `Err(TooManyRecords)` once `seq` reaches [`MAX_RECORDS_PER_EPOCH`].

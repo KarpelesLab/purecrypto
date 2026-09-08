@@ -42,13 +42,13 @@ use crate::rng::RngCore;
 use crate::signature_registry::SignaturePolicy;
 use crate::tls::codec::extension as ext;
 use crate::tls::codec::{
-    CipherSuite, ClientHello, ExtensionType, NamedGroup, Random, ReadCursor, ServerHello,
-    SignatureScheme, hs_type,
+    CipherSuite, ClientHello, ExtensionType, KeyUpdate, NamedGroup, NewSessionTicket, Random,
+    ReadCursor, ServerHello, SignatureScheme, hs_type,
 };
 use crate::tls::crypto::{
     AeadAlg, HashAlg, KeySchedule, RecordCrypter, Secret, SuiteParams, Transcript,
     certificate_verify_content, expand_label_dyn, finished_verify_data, lookup_suite,
-    supported_suites, verify_signature,
+    next_traffic_secret, supported_suites, verify_signature,
 };
 use crate::tls::keylog::KeyLog;
 use crate::tls::pki::{CrlStore, RootCertStore, verify_chain_with_crls, verify_hostname};
@@ -61,6 +61,9 @@ use core::time::Duration;
 
 use super::ack::{
     ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack, encode as encode_ack,
+};
+use super::epoch13::{
+    MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, ReadEpoch, select_read_epoch,
 };
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
@@ -242,11 +245,23 @@ pub struct DtlsClientConnection13 {
     enc_write_epoch: u16,
     /// Per-direction record sequence counter for protected records.
     enc_write_seq: u64,
-    /// Highest read seq seen, for sequence-number reconstruction.
-    enc_read_seq: u64,
-    /// RFC 9147 §4.5.1 anti-replay window for the current read epoch. Reset
-    /// at every epoch transition.
-    read_replay: crate::dtls::replay::AntiReplayWindow,
+    /// Current protected read epoch (keys, seq reconstruction state, replay
+    /// window). `None` until the ServerHello installs the handshake keys.
+    read: Option<ReadEpoch>,
+    /// The read epoch retired by the most recent epoch change, kept so
+    /// reordered / retransmitted records still protected under it decrypt
+    /// and get ACKed (RFC 9147 §4.2.2, §8). Dropped after
+    /// [`PREV_EPOCH_GRACE_RECORDS`] records arrive under `read`, or at the
+    /// next epoch change.
+    prev_read: Option<ReadEpoch>,
+    /// Records authenticated under `read` since `prev_read` was retired.
+    prev_read_grace: u32,
+    /// True while our own `KeyUpdate` is in flight: we keep writing under
+    /// the current epoch until the peer ACKs it (RFC 9147 §8).
+    key_update_pending: bool,
+    /// Number of peer `KeyUpdate`s accepted, bounded by
+    /// [`MAX_KEY_UPDATES_RECEIVED`].
+    key_updates_received: u32,
 
     /// Random + key material. All four keypairs are pre-generated so the
     /// matching `key_share` is ready regardless of which group the server
@@ -282,20 +297,14 @@ pub struct DtlsClientConnection13 {
 
     /// Active write-side RecordCrypter (post-handshake-keys).
     write_crypter: Option<RecordCrypter>,
-    /// Active read-side RecordCrypter.
-    read_crypter: Option<RecordCrypter>,
     /// Sequence-number protection key for outgoing records (key length
     /// matches the AEAD key length: 16 for AES-128-GCM, 32 for AES-256-GCM
     /// and ChaCha20-Poly1305, per RFC 9147 §4.2.3).
     write_sn_key: Option<Secret>,
-    /// Sequence-number protection key for incoming records.
-    read_sn_key: Option<Secret>,
-    /// Application read-side `sn_key`, ready to swap in at our Finished.
-    read_app_sn_key: Option<Secret>,
     /// Application write-side `sn_key`, ready to swap in at our Finished.
     write_app_sn_key: Option<Secret>,
-    /// Application-secret read crypter, parked until our Finished.
-    pending_read_app_crypter: Option<RecordCrypter>,
+    /// Application (epoch 3) read epoch, parked until our Finished.
+    pending_read_app: Option<ReadEpoch>,
     /// Application-secret write crypter, parked until our Finished.
     pending_write_app_crypter: Option<RecordCrypter>,
     /// The epoch-2 (handshake) write context, retained after the switch
@@ -354,8 +363,11 @@ impl DtlsClientConnection13 {
             plain_write_seq: 0,
             enc_write_epoch: 0,
             enc_write_seq: 0,
-            enc_read_seq: 0,
-            read_replay: crate::dtls::replay::AntiReplayWindow::new(),
+            read: None,
+            prev_read: None,
+            prev_read_grace: 0,
+            key_update_pending: false,
+            key_updates_received: 0,
             x25519,
             p256,
             p384,
@@ -373,12 +385,9 @@ impl DtlsClientConnection13 {
             client_app_secret: None,
             server_app_secret: None,
             write_crypter: None,
-            read_crypter: None,
             write_sn_key: None,
-            read_sn_key: None,
-            read_app_sn_key: None,
             write_app_sn_key: None,
-            pending_read_app_crypter: None,
+            pending_read_app: None,
             pending_write_app_crypter: None,
             hs_write: None,
             suite: None,
@@ -494,7 +503,7 @@ impl DtlsClientConnection13 {
                 }
             }
             super::reliability::Action::GiveUp => {
-                if self.state == State::Connected {
+                if self.state == State::Connected && !self.key_update_pending {
                     // A fully established connection must never self-close
                     // just because a stale handshake record was not
                     // explicitly ACKed (e.g. the server's final ACK was
@@ -503,6 +512,10 @@ impl DtlsClientConnection13 {
                     self.retransmit = Retransmit13::new();
                     self.hs_write = None;
                 } else {
+                    // An unacknowledged KeyUpdate is different: RFC 9147
+                    // §8 forbids moving to the new epoch without the ACK,
+                    // and the peer may already have — the epochs can no
+                    // longer be reconciled.
                     self.state = State::Closed;
                 }
             }
@@ -604,16 +617,21 @@ impl DtlsClientConnection13 {
             return Ok(total);
         }
 
-        // Compute the sn_mask from the read sn_key. A protected record that
-        // arrives before the protected read keys exist is unprocessable —
-        // skip it.
+        // A protected record that arrives before the protected read keys
+        // exist is unprocessable — skip it.
         let Some(suite) = self.suite else {
             return Ok(total);
         };
-        let Some(sn_key) = self.read_sn_key.as_ref() else {
+        // RFC 9147 §4.2.2: the unified header carries only the low two
+        // epoch bits. Resolve them against the current read epoch first,
+        // then the retained previous one; anything else is unreadable and
+        // dropped silently.
+        let Some((ctx, is_prev)) =
+            select_read_epoch(&mut self.read, &mut self.prev_read, buf[0] & 0b11)
+        else {
             return Ok(total);
         };
-        let Ok(mask_full) = sn_mask_for(suite, sn_key.as_slice(), body) else {
+        let Ok(mask_full) = sn_mask_for(suite, ctx.sn_key.as_slice(), body) else {
             return Ok(total);
         };
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
@@ -627,19 +645,9 @@ impl DtlsClientConnection13 {
         };
         let consumed = hdr.header_len + ct_body.len();
 
-        // Reconstruct full 48-bit seq and full epoch. Our epoch is whichever
-        // matches the low 2 bits. For this subset we know which read epoch
-        // is active (2 or 3); pick that one if its low 2 bits match.
-        let read_epoch = self.current_read_epoch();
-        if (read_epoch as u8 & 0b11) != hdr.epoch_low2 {
-            // Wrong epoch — drop silently.
-            return Ok(consumed);
-        }
-        let seq = reconstruct_seq(
-            hdr.seq_low,
-            hdr.seq_is_16bit,
-            self.enc_read_seq.wrapping_add(1),
-        );
+        // Reconstruct the full 48-bit seq against this epoch's high-water
+        // mark.
+        let seq = reconstruct_seq(hdr.seq_low, hdr.seq_is_16bit, ctx.seq.wrapping_add(1));
 
         // RFC 9147 §4.2.3: AAD is the unified header bytes prior to
         // sequence-number masking. Reconstruct by XOR'ing the wire seq
@@ -655,13 +663,11 @@ impl DtlsClientConnection13 {
         // too-old seq numbers without touching window state. The window
         // is `mark`-ed only after AEAD verification succeeds so a forged
         // packet that fails AEAD cannot burn a slot.
-        if !self.read_replay.check(seq) {
+        if !ctx.replay.check(seq) {
             return Ok(consumed);
         }
-        let Some(crypter) = self.read_crypter.as_mut() else {
-            return Ok(consumed);
-        };
-        let Ok((inner_type, plain)) = decrypt_dtls13_record(crypter, seq, &aad, ct_body) else {
+        let Ok((inner_type, plain)) = decrypt_dtls13_record(&mut ctx.crypter, seq, &aad, ct_body)
+        else {
             // AEAD authentication failed — a single spoofed datagram must
             // not kill the connection (RFC 9147 §4.5.2): silent drop. The
             // replay window was deliberately not advanced.
@@ -669,9 +675,19 @@ impl DtlsClientConnection13 {
         };
 
         // RFC 9147 §4.5.1: AEAD verified — commit to the window now.
-        self.read_replay.mark(seq);
-        if seq > self.enc_read_seq {
-            self.enc_read_seq = seq;
+        ctx.replay.mark(seq);
+        if seq > ctx.seq {
+            ctx.seq = seq;
+        }
+        let read_epoch = ctx.epoch;
+        // Grace accounting for the retired epoch: once enough traffic has
+        // arrived under the current epoch, nothing from the previous one is
+        // still plausibly in flight (RFC 9147 §4.2.2).
+        if !is_prev && self.prev_read.is_some() {
+            self.prev_read_grace += 1;
+            if self.prev_read_grace >= PREV_EPOCH_GRACE_RECORDS {
+                self.prev_read = None;
+            }
         }
         // Schedule an ACK for this protected record. Handshake records only
         // (RFC 9147 §7): application_data is skipped to reduce noise, alerts
@@ -711,10 +727,163 @@ impl DtlsClientConnection13 {
                     // Nothing left to retransmit under the retired keys.
                     self.hs_write = None;
                 }
+                self.complete_key_update_if_acked()?;
             }
             _ => return Err(Error::UnexpectedMessage),
         }
         Ok(consumed)
+    }
+
+    /// Initiates a key update (RFC 9147 §8 / RFC 8446 §4.6.3): sends a
+    /// `KeyUpdate` under the current write epoch and, once the server
+    /// acknowledges it, advances our write keys to the next epoch. Until
+    /// that ACK arrives [`Self::send`] keeps using the current keys — the
+    /// RFC forbids sending under the new epoch (or a further `KeyUpdate`)
+    /// before then, so a second call while one is in flight is refused
+    /// with [`Error::InappropriateState`]. With `request_peer` the server
+    /// is asked to update its own keys too.
+    ///
+    /// Must be called only after the handshake completes. A `KeyUpdate`
+    /// that is never acknowledged (six retransmits, RFC 9147 §5.8.1) closes
+    /// the connection: the peer may already have moved on, and the two
+    /// sides can no longer agree on an epoch.
+    pub fn request_key_update(&mut self, request_peer: bool) -> Result<(), Error> {
+        if self.state != State::Connected {
+            return Err(Error::InappropriateState);
+        }
+        if self.key_update_pending {
+            return Err(Error::InappropriateState);
+        }
+        if self.enc_write_epoch == u16::MAX {
+            return Err(Error::TooManyRecords);
+        }
+        let body = KeyUpdate {
+            request_update: request_peer,
+        }
+        .encode();
+        let msg_seq = self.out_msg_seq;
+        self.out_msg_seq += 1;
+        let mut frag_buf = Vec::new();
+        write_message(
+            &mut frag_buf,
+            hs_type::KEY_UPDATE,
+            msg_seq,
+            &body[4..],
+            DEFAULT_MAX_FRAGMENT,
+        );
+        self.emit_protected_handshake(frag_buf)?;
+        self.key_update_pending = true;
+        Ok(())
+    }
+
+    /// True while a `KeyUpdate` we sent is still waiting for the server's
+    /// ACK (our write epoch has not advanced yet).
+    pub fn key_update_pending(&self) -> bool {
+        self.key_update_pending
+    }
+
+    /// Current protected write epoch (3 for the first application keys;
+    /// one more per acknowledged `KeyUpdate` we sent).
+    pub fn write_epoch(&self) -> u16 {
+        self.enc_write_epoch
+    }
+
+    /// Current protected read epoch (3 for the first application keys; one
+    /// more per `KeyUpdate` received). `None` until the handshake keys are
+    /// installed.
+    pub fn read_epoch(&self) -> Option<u16> {
+        self.read.as_ref().map(|r| r.epoch)
+    }
+
+    /// RFC 9147 §8: once the peer has ACKed our `KeyUpdate` — i.e. no
+    /// `KeyUpdate` fragment remains in the in-flight set — switch the write
+    /// keys to the next epoch. Application secrets advance with
+    /// `HKDF-Expand-Label(secret, "traffic upd", "", Hash.length)`
+    /// (RFC 8446 §7.2); the sequence-number key is re-derived from the new
+    /// secret (RFC 9147 §4.2.3).
+    fn complete_key_update_if_acked(&mut self) -> Result<(), Error> {
+        if !self.key_update_pending {
+            return Ok(());
+        }
+        let still_in_flight = self
+            .retransmit
+            .in_flight()
+            .iter()
+            .any(|r| r.fragment.first() == Some(&hs_type::KEY_UPDATE));
+        if still_in_flight {
+            return Ok(());
+        }
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let cur = self
+            .client_app_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let next = next_traffic_secret(suite.hash, cur);
+        let sn_len = sn_key_len_for(suite.aead);
+        self.write_crypter = Some(RecordCrypter::new(
+            suite.hash,
+            suite.aead,
+            suite.key_len,
+            &next,
+        ));
+        self.write_sn_key = Some(derive_sn_key(suite.hash, &next, sn_len));
+        self.client_app_secret = Some(next);
+        self.enc_write_epoch += 1;
+        self.enc_write_seq = 0;
+        self.key_update_pending = false;
+        Ok(())
+    }
+
+    /// Post-handshake handshake messages from the server (RFC 9147 §8 /
+    /// RFC 8446 §4.6). The record was AEAD-authenticated and has already
+    /// been queued for ACK.
+    fn on_post_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
+        match msg_type {
+            hs_type::KEY_UPDATE => {
+                let ku = KeyUpdate::decode(body)?;
+                self.on_key_update_received(ku)
+            }
+            hs_type::NEW_SESSION_TICKET => {
+                // Accepted and acknowledged, then discarded: the DTLS
+                // engines have no resumption store, and a well-formed
+                // ticket from an authenticated server is not a protocol
+                // violation (RFC 8446 §4.6.1).
+                let _ = NewSessionTicket::decode(body)?;
+                Ok(())
+            }
+            _ => Err(Error::UnexpectedMessage),
+        }
+    }
+
+    /// RFC 9147 §8: the server's write epoch advances. Install the next read
+    /// epoch, retire the current one for the reordering / retransmit grace
+    /// window, and — when asked — answer with a `KeyUpdate` of our own
+    /// (`update_not_requested`, RFC 8446 §4.6.3) unless one is already in
+    /// flight, which will rotate our keys just the same.
+    fn on_key_update_received(&mut self, ku: KeyUpdate) -> Result<(), Error> {
+        self.key_updates_received += 1;
+        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+            return Err(Error::PeerMisbehaved);
+        }
+        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        let cur_epoch = self.read.as_ref().map(|r| r.epoch).unwrap_or(0);
+        if cur_epoch == u16::MAX {
+            return Err(Error::TooManyRecords);
+        }
+        let prev_secret = self
+            .server_app_secret
+            .as_ref()
+            .ok_or(Error::InappropriateState)?;
+        let next = next_traffic_secret(suite.hash, prev_secret);
+        let new_read = ReadEpoch::new(suite, cur_epoch + 1, &next);
+        self.server_app_secret = Some(next);
+        // Only the immediately previous epoch stays readable (§4.2.2).
+        self.prev_read = self.read.replace(new_read);
+        self.prev_read_grace = 0;
+        if ku.request_update && !self.key_update_pending {
+            self.request_key_update(false)?;
+        }
+        Ok(())
     }
 
     /// Handles an authenticated peer alert (RFC 9147 §4: once keys exist,
@@ -735,17 +904,6 @@ impl DtlsClientConnection13 {
             Ok(())
         } else {
             Err(Error::AlertReceived(desc))
-        }
-    }
-
-    /// The current protected-read epoch we expect (2 during handshake, 3
-    /// once we receive the server Finished). We track a single value
-    /// because the subset doesn't use KeyUpdate.
-    fn current_read_epoch(&self) -> u16 {
-        if matches!(self.state, State::Connected) {
-            3
-        } else {
-            2
         }
     }
 
@@ -837,7 +995,8 @@ impl DtlsClientConnection13 {
             State::WaitCertificate => self.on_certificate(msg_type, body, &raw),
             State::WaitCertificateVerify => self.on_certificate_verify(msg_type, body, &raw),
             State::WaitFinished => self.on_finished(msg_type, body, &raw),
-            State::Connected | State::Closed => Err(Error::UnexpectedMessage),
+            State::Connected => self.on_post_handshake(msg_type, body),
+            State::Closed => Err(Error::UnexpectedMessage),
         }
     }
 
@@ -932,16 +1091,13 @@ impl DtlsClientConnection13 {
 
         // Install protected crypters (epoch 2 for handshake).
         let w_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &chts);
-        let r_crypter = RecordCrypter::new(suite.hash, suite.aead, suite.key_len, &shts);
         self.write_crypter = Some(w_crypter);
-        self.read_crypter = Some(r_crypter);
         let sn_len = sn_key_len_for(suite.aead);
         self.write_sn_key = Some(derive_sn_key(suite.hash, &chts, sn_len));
-        self.read_sn_key = Some(derive_sn_key(suite.hash, &shts, sn_len));
         self.enc_write_epoch = 2;
         self.enc_write_seq = 0;
-        self.enc_read_seq = 0;
-        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
+        self.read = Some(ReadEpoch::new(suite, 2, &shts));
+        self.prev_read = None;
 
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
@@ -1247,15 +1403,9 @@ impl DtlsClientConnection13 {
             suite.key_len,
             &cats,
         ));
-        self.pending_read_app_crypter = Some(RecordCrypter::new(
-            suite.hash,
-            suite.aead,
-            suite.key_len,
-            &sats,
-        ));
+        self.pending_read_app = Some(ReadEpoch::new(suite, 3, &sats));
         let sn_len = sn_key_len_for(suite.aead);
         self.write_app_sn_key = Some(derive_sn_key(suite.hash, &cats, sn_len));
-        self.read_app_sn_key = Some(derive_sn_key(suite.hash, &sats, sn_len));
         self.client_app_secret = Some(cats);
         self.server_app_secret = Some(sats);
 
@@ -1302,13 +1452,11 @@ impl DtlsClientConnection13 {
             });
         }
         self.write_crypter = self.pending_write_app_crypter.take();
-        self.read_crypter = self.pending_read_app_crypter.take();
         self.write_sn_key = self.write_app_sn_key.take();
-        self.read_sn_key = self.read_app_sn_key.take();
         self.enc_write_epoch = 3;
         self.enc_write_seq = 0;
-        self.enc_read_seq = 0;
-        self.read_replay = crate::dtls::replay::AntiReplayWindow::new();
+        self.read = self.pending_read_app.take();
+        self.prev_read = None;
 
         self.state = State::Connected;
         Ok(())
@@ -1582,6 +1730,20 @@ impl DtlsClientConnection13 {
             .encrypt_protected_record(ContentType::Alert, &[level, description])
             .expect("protected write keys installed");
         self.out_dgrams.push(dg);
+    }
+
+    /// Test-only: sends an arbitrary handshake message (`msg_type` + body)
+    /// under the current protected write key and tracks it for
+    /// retransmission, so tests can exercise the peer's post-handshake
+    /// dispatch with messages this engine never emits itself.
+    #[cfg(test)]
+    pub(crate) fn send_handshake_for_test(&mut self, msg_type: u8, body: &[u8]) {
+        let msg_seq = self.out_msg_seq;
+        self.out_msg_seq += 1;
+        let mut frag_buf = Vec::new();
+        write_message(&mut frag_buf, msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT);
+        self.emit_protected_handshake(frag_buf)
+            .expect("protected write keys installed");
     }
 }
 

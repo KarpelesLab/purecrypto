@@ -105,6 +105,7 @@ pub(crate) mod ack;
 pub mod client12;
 pub mod client13;
 pub(crate) mod cookie;
+pub(crate) mod epoch13;
 pub(crate) mod reassembly;
 pub(crate) mod record;
 pub(crate) mod record13;
