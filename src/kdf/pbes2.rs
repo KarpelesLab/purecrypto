@@ -345,7 +345,7 @@ fn parse_kdf_algid(r: &mut Reader<'_>) -> Result<(KdfChoice, Vec<u8>), Error> {
         .map_err(|_| Error::BadEncoding)?
         .to_vec();
     let iter_bytes = p.read_integer_bytes().map_err(|_| Error::BadEncoding)?;
-    let iterations = integer_to_u32(iter_bytes)?;
+    let iterations = iteration_count_to_u32(iter_bytes)?;
     if iterations < MIN_PBKDF2_ITERATIONS {
         return Err(Error::WeakKdfParameters);
     }
@@ -433,8 +433,27 @@ fn parse_cipher_algid(r: &mut Reader<'_>) -> Result<(CipherChoice, Vec<u8>), Err
 }
 
 /// Converts a DER `INTEGER` body to `u32`, rejecting negatives, non-minimal
-/// encodings, and values that don't fit.
+/// encodings, and values that don't fit (all as [`Error::BadEncoding`]).
+///
+/// Used for the fields whose out-of-range value is simply a malformed
+/// envelope (keyLength, GCM ICV length); the iteration count goes through
+/// [`iteration_count_to_u32`] so that an absurd count is reported as a KDF
+/// parameter problem instead.
 fn integer_to_u32(bytes: &[u8]) -> Result<u32, Error> {
+    integer_to_u32_or(bytes, Error::BadEncoding)
+}
+
+/// [`integer_to_u32`] for the PBKDF2 iteration count: a value wider than 32
+/// bits is above any sane ceiling, so it is classified as
+/// [`Error::WeakKdfParameters`] (the parameter-problem variant) rather than a
+/// bare encoding error.
+fn iteration_count_to_u32(bytes: &[u8]) -> Result<u32, Error> {
+    integer_to_u32_or(bytes, Error::WeakKdfParameters)
+}
+
+/// Shared body of the two converters above; `too_big` is returned for a
+/// non-negative INTEGER that does not fit in `u32`.
+fn integer_to_u32_or(bytes: &[u8], too_big: Error) -> Result<u32, Error> {
     if bytes.is_empty() {
         return Err(Error::BadEncoding);
     }
@@ -457,7 +476,7 @@ fn integer_to_u32(bytes: &[u8]) -> Result<u32, Error> {
         bytes
     };
     if trimmed.len() > 4 {
-        return Err(Error::WeakKdfParameters); // way out of range; conservative.
+        return Err(too_big);
     }
     let mut acc: u32 = 0;
     for &b in trimmed {
@@ -960,11 +979,47 @@ mod tests {
         assert_eq!(integer_to_u32(&[0x00, 0x01, 0x00]), Err(Error::BadEncoding));
         // Empty body is rejected.
         assert_eq!(integer_to_u32(&[]), Err(Error::BadEncoding));
-        // Beyond u32::MAX.
+        // Beyond u32::MAX: a malformed field for keyLength/ICV, but the
+        // iteration count classifies it as a KDF-parameter problem.
         assert_eq!(
             integer_to_u32(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+            Err(Error::BadEncoding)
+        );
+        assert_eq!(
+            iteration_count_to_u32(&[0x01, 0x00, 0x00, 0x00, 0x00]),
             Err(Error::WeakKdfParameters)
         );
+        assert_eq!(iteration_count_to_u32(&[0x00, 0x9C, 0x40]), Ok(40_000));
+        assert_eq!(iteration_count_to_u32(&[0x80]), Err(Error::BadEncoding));
+    }
+
+    /// An over-wide keyLength INTEGER is a malformed envelope, not a weak
+    /// KDF parameter: the error used to be `WeakKdfParameters` for every
+    /// over-long INTEGER regardless of which field carried it.
+    #[test]
+    fn overlong_key_length_is_bad_encoding() {
+        let salt = [0u8; 16];
+        let prf =
+            encode_sequence(&[oid_tlv(OID_HMAC_WITH_SHA256), crate::der::encode_null()].concat());
+        let kdf_params = encode_sequence(
+            &[
+                encode_octet_string(&salt),
+                encode_integer(&10_000u32.to_be_bytes()),
+                // keyLength = 2^32 (five content bytes): does not fit u32.
+                encode_integer(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+                prf,
+            ]
+            .concat(),
+        );
+        let kdf_algid = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+        let iv = [0u8; 16];
+        let cipher_algid =
+            encode_sequence(&[oid_tlv(OID_AES256_CBC_PAD), encode_octet_string(&iv)].concat());
+        let pbes2_params = encode_sequence(&[kdf_algid, cipher_algid].concat());
+        let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
+        let ct = alloc::vec![0u8; 16];
+        let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
+        assert_eq!(decrypt(&blob, b"x"), Err(Error::BadEncoding));
     }
 
     /// Round-trip with an iteration count whose minimal encoding carries a
