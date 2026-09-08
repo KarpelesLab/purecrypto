@@ -76,34 +76,42 @@ impl Ed25519PrivateKey {
 
     /// Derives the secret scalar `a` (clamped) and the signing prefix from the
     /// seed hash.
+    ///
+    /// Both halves are secret; the caller wipes them ([`wipe`]) once done.
+    /// The 64-byte seed hash they are cut from is wiped here.
     fn expand(&self) -> ([u8; 32], [u8; 32]) {
-        let h = Sha512::digest(&self.seed);
+        let mut h = Sha512::digest(&self.seed);
         let mut a = [0u8; 32];
         a.copy_from_slice(&h[..32]);
         clamp(&mut a);
         let mut prefix = [0u8; 32];
         prefix.copy_from_slice(&h[32..]);
+        wipe(&mut h);
         (a, prefix)
     }
 
     /// The corresponding public key `A = [a]B`.
     pub fn public_key(&self) -> Ed25519PublicKey {
         let f = Field::new();
-        let (a, _) = self.expand();
-        Ed25519PublicKey(f.encode(&f.mul_base(&a)))
+        let (mut a, mut prefix) = self.expand();
+        let pk = Ed25519PublicKey(f.encode(&f.mul_base(&a)));
+        wipe(&mut a);
+        wipe(&mut prefix);
+        pk
     }
 
     /// Signs `message`, returning the 64-byte signature (RFC 8032 §5.1.6).
     pub fn sign(&self, message: &[u8]) -> Ed25519Signature {
         let f = Field::new();
-        let (a, prefix) = self.expand();
+        let (mut a, mut prefix) = self.expand();
         let a_enc = f.encode(&f.mul_base(&a));
 
         // r = SHA-512(prefix ‖ message) mod L; R = [r]B.
         let mut hr = Sha512::new();
         hr.update(&prefix);
         hr.update(message);
-        let r = scalar_reduce_wide(&hr.finalize(), &f.l8);
+        let mut r_hash = hr.finalize();
+        let mut r = scalar_reduce_wide(&r_hash, &f.l8);
         let mut r_bytes = [0u8; 32];
         r.write_le_bytes(&mut r_bytes);
         let r_enc = f.encode(&f.mul_base(&r_bytes));
@@ -114,14 +122,35 @@ impl Ed25519PrivateKey {
         hk.update(&a_enc);
         hk.update(message);
         let k = scalar_reduce_wide(&hk.finalize(), &f.l8);
-        let a_scalar = ScalarInt::from_le_bytes(&a);
+        let mut a_scalar = ScalarInt::from_le_bytes(&a);
         let s = scalar_muladd(&r, &k, &a_scalar, &f.l8);
 
         let mut sig = [0u8; 64];
         sig[..32].copy_from_slice(&r_enc);
         s.write_le_bytes(&mut sig[32..]);
+
+        // Wipe every transient secret: the clamped scalar `a` (in both its
+        // byte and limb forms), the signing prefix, and the nonce `r` (hash,
+        // limbs, bytes). Leaking `r` alone recovers `a` from `S = r + k·a`.
+        // `k` and `s` are public.
+        wipe(&mut a);
+        wipe(&mut prefix);
+        wipe(&mut r_hash);
+        wipe(&mut r_bytes);
+        r = ScalarInt::ZERO;
+        a_scalar = ScalarInt::ZERO;
+        let _ = core::hint::black_box((&r, &a_scalar));
         Ed25519Signature(sig)
     }
+}
+
+/// Best-effort wipe of a transient secret buffer: overwrite with zeros and
+/// route the read through a `black_box` barrier so LLVM cannot elide the
+/// stores as dead (the crate-wide manual-wipe convention).
+#[inline]
+fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    let _ = core::hint::black_box(&*buf);
 }
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization.

@@ -99,6 +99,9 @@ impl Ed448PrivateKey {
 
     /// Derives the secret scalar `s` (pruned, 57 bytes little-endian) and the
     /// 57-byte signing prefix from the seed hash (RFC 8032 §5.2.5).
+    ///
+    /// Both halves are secret; the caller wipes them ([`wipe`]) once done.
+    /// The 114-byte seed hash they are cut from is wiped here.
     fn expand(&self) -> ([u8; 57], [u8; 57]) {
         // h = SHAKE256(seed, 114). No dom4 prefix on the key-expansion hash.
         let mut h = Shake256::new();
@@ -112,14 +115,18 @@ impl Ed448PrivateKey {
         prune(&mut s);
         let mut prefix = [0u8; 57];
         prefix.copy_from_slice(&hbuf[57..]);
+        wipe(&mut hbuf);
         (s, prefix)
     }
 
     /// The corresponding public key `A = [s]B`.
     pub fn public_key(&self) -> Ed448PublicKey {
         let f = Field::new();
-        let (s, _) = self.expand();
-        Ed448PublicKey(f.encode(&f.scalar_mult(&s, &f.base())))
+        let (mut s, mut prefix) = self.expand();
+        let pk = Ed448PublicKey(f.encode(&f.scalar_mult(&s, &f.base())));
+        wipe(&mut s);
+        wipe(&mut prefix);
+        pk
     }
 
     /// Signs `message` with the empty context, returning the 114-byte signature
@@ -149,19 +156,19 @@ impl Ed448PrivateKey {
             return Err(Error::InvalidInput);
         }
         let f = Field::new();
-        let (s, prefix) = self.expand();
+        let (mut s, mut prefix) = self.expand();
         let a_enc = f.encode(&f.scalar_mult(&s, &f.base()));
 
         // r = SHAKE256(dom4(0,ctx) ‖ prefix ‖ M, 114) mod L; R = [r]B.
-        let r_hash = shake_dom4(context, &[&prefix, message]);
-        let r = scalar_reduce_wide(&r_hash, &f.l15);
-        let r_scalar = fe_to_scalar_bytes(&r);
+        let mut r_hash = shake_dom4(context, &[&prefix, message]);
+        let mut r = scalar_reduce_wide(&r_hash, &f.l15);
+        let mut r_scalar = fe_to_scalar_bytes(&r);
         let r_enc = f.encode(&f.scalar_mult(&r_scalar, &f.base()));
 
         // k = SHAKE256(dom4(0,ctx) ‖ R ‖ A ‖ M, 114) mod L; S = (r + k·s) mod L.
         let k_hash = shake_dom4(context, &[&r_enc, &a_enc, message]);
         let k = scalar_reduce_wide(&k_hash, &f.l15);
-        let s_scalar = Fe::from_le_bytes(&s[..56]); // s[56] == 0 after pruning
+        let mut s_scalar = Fe::from_le_bytes(&s[..56]); // s[56] == 0 after pruning
         let sig_s = scalar_muladd(&r, &k, &s_scalar, &f.l15);
 
         let mut sig = [0u8; 114];
@@ -170,8 +177,29 @@ impl Ed448PrivateKey {
         let mut sb = [0u8; 56];
         sig_s.write_le_bytes(&mut sb);
         sig[57..113].copy_from_slice(&sb);
+
+        // Wipe every transient secret: the pruned scalar `s` (bytes and
+        // limbs), the signing prefix, and the nonce `r` (hash, limbs, bytes).
+        // Leaking `r` alone recovers `s` from `S = r + k·s`. `k` and `S` are
+        // public.
+        wipe(&mut s);
+        wipe(&mut prefix);
+        wipe(&mut r_hash);
+        wipe(&mut r_scalar);
+        r = Fe::ZERO;
+        s_scalar = Fe::ZERO;
+        let _ = core::hint::black_box((&r, &s_scalar));
         Ok(Ed448Signature(sig))
     }
+}
+
+/// Best-effort wipe of a transient secret buffer: overwrite with zeros and
+/// route the read through a `black_box` barrier so LLVM cannot elide the
+/// stores as dead (the crate-wide manual-wipe convention).
+#[inline]
+fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    let _ = core::hint::black_box(&*buf);
 }
 
 /// Renders a scalar `< L` as the 57-byte little-endian buffer the point

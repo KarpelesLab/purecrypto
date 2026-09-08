@@ -103,7 +103,19 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
     // naturally returns 0 when z2 == 0, so the small-order /
     // contributory-failure case yields the all-zero output without a
     // data-dependent branch.
-    x2.mul(&z2.invert()).to_bytes()
+    let out = x2.mul(&z2.invert()).to_bytes();
+
+    // Wipe the clamped scalar copy and the ladder state: the projective
+    // coordinates are a function of the secret scalar, and (x2, z2, x3, z3)
+    // at the end of the ladder disclose it directly. The `black_box`
+    // barrier keeps LLVM from eliding the stores as dead.
+    k.fill(0);
+    x2 = Fe::ZERO;
+    z2 = Fe::ZERO;
+    x3 = Fe::ZERO;
+    z3 = Fe::ZERO;
+    let _ = core::hint::black_box((&k, &x2, &z2, &x3, &z3));
+    out
 }
 
 /// The X25519 base point (`u = 9`).

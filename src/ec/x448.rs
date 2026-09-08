@@ -65,10 +65,10 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     // Clamp the scalar (RFC 7748 §5): clear the bottom two bits and set the top
     // bit. Curve448's cofactor is 4, hence two low bits; 448 is a multiple of
     // 8, so there is no top-byte mask (unlike X25519's 255-bit field).
-    let mut k = *scalar;
-    k[0] &= 252;
-    k[55] |= 128;
-    let k = Fe::from_le_bytes(&k);
+    let mut k_bytes = *scalar;
+    k_bytes[0] &= 252;
+    k_bytes[55] |= 128;
+    let mut k = Fe::from_le_bytes(&k_bytes);
 
     // Decode the u-coordinate: reduce mod p (no top-bit mask — the full 56
     // bytes are significant for the 448-bit field).
@@ -126,12 +126,26 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
     // variable-time extended-Euclidean inverse — z2 depends on the secret
     // scalar. Fermat naturally returns 0 when z2 == 0, so the small-order case
     // yields the all-zero output without a data-dependent branch.
-    let z2_plain = fp.from_mont(&z2);
+    let mut z2_plain = fp.from_mont(&z2);
     let p_minus_2 = fp.modulus().wrapping_sub(&Fe::from_u64(2));
-    let z_inv = fp.pow(&z2_plain, &p_minus_2);
+    let mut z_inv = fp.pow(&z2_plain, &p_minus_2);
     let res = fp.mul_mod(&fp.from_mont(&x2), &z_inv);
     let mut out = [0u8; 56];
     res.write_le_bytes(&mut out);
+
+    // Wipe the clamped scalar (bytes and limbs) and the ladder state: the
+    // projective coordinates (x2, z2, x3, z3) and the inversion operands are
+    // a function of the secret scalar. The `black_box` barrier keeps LLVM
+    // from eliding the stores as dead.
+    k_bytes.fill(0);
+    k = Fe::ZERO;
+    x2 = Fe::ZERO;
+    z2 = Fe::ZERO;
+    x3 = Fe::ZERO;
+    z3 = Fe::ZERO;
+    z2_plain = Fe::ZERO;
+    z_inv = Fe::ZERO;
+    let _ = core::hint::black_box((&k_bytes, &k, &x2, &z2, &x3, &z3, &z2_plain, &z_inv));
     out
 }
 
