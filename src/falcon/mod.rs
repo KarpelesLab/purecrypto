@@ -458,13 +458,15 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
                 break;
             }
             high += 1;
-            // Guard against absurdly long runs (coefficient magnitudes are
-            // small in any valid signature); also prevents overflow.
-            if high > 2048 {
+            // Spec §3.11.2 / reference `comp_decode`: the unary part may not
+            // exceed 15, i.e. every coefficient magnitude is below 2¹¹ = 2048.
+            // Rejecting on the 16th zero matches the reference decoder exactly.
+            if high > 15 {
                 return None;
             }
         }
 
+        // `high ≤ 15`, `low < 128`: the magnitude is at most 2047.
         let magnitude = (high << 7) | low;
         // Canonical: reject the encoding "1 0000000 1" of zero (sign=1, mag=0),
         // i.e. a negative zero. (Spec §3.11.2 check 2 / Alg 18 lines 9-10.)
@@ -472,15 +474,11 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
             return None;
         }
         let val = if sign == 1 {
-            -(magnitude as i32)
+            -(magnitude as i16)
         } else {
-            magnitude as i32
+            magnitude as i16
         };
-        // Coefficients of a valid Falcon signature fit comfortably in i16.
-        if !(-(i16::MAX as i32)..=i16::MAX as i32).contains(&val) {
-            return None;
-        }
-        out.push(val as i16);
+        out.push(val);
     }
 
     // Bits consumed by the coefficient encoding proper, before the trailing

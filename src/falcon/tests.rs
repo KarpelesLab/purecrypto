@@ -606,3 +606,51 @@ fn from_bytes_rejects_corrupted_f_coefficient() {
         "a key violating the NTRU equation must be rejected"
     );
 }
+
+/// Builds a compressed-`s` byte string (spec §3.11.2) from `(sign, low, high)`
+/// triples: the sign bit, the 7 low magnitude bits MSB-first, `high` zeros,
+/// the terminating 1, then zero padding to a byte boundary.
+fn compressed_s(coeffs: &[(u8, u32, u32)]) -> alloc::vec::Vec<u8> {
+    let mut bits = alloc::vec::Vec::new();
+    for &(sign, low, high) in coeffs {
+        bits.push(sign);
+        for i in (0..7).rev() {
+            bits.push(((low >> i) & 1) as u8);
+        }
+        bits.extend(core::iter::repeat_n(0u8, high as usize));
+        bits.push(1);
+    }
+    while bits.len() % 8 != 0 {
+        bits.push(0);
+    }
+    bits.chunks(8)
+        .map(|c| c.iter().fold(0u8, |acc, &b| (acc << 1) | b))
+        .collect()
+}
+
+/// The unary high part is bounded at 15, so `|s_i| ≤ 2047`: a magnitude of
+/// exactly 2048 (16 zeros before the terminator) must be rejected, exactly as
+/// the reference `comp_decode` does, while 2047 is the largest accepted.
+#[test]
+fn decompress_rejects_magnitude_2048_accepts_2047() {
+    use super::decompress;
+
+    // +2047, −2047 (high 15, low 127) and a zero.
+    let ok = compressed_s(&[(0, 127, 15), (1, 127, 15), (0, 0, 0)]);
+    let (coeffs, consumed) = decompress(&ok, 3).expect("2047 is encodable");
+    assert_eq!(coeffs, [2047, -2047, 0]);
+    // Two 24-bit codes (sign, 7 low bits, 15 zeros, terminator) and one 9-bit zero.
+    assert_eq!(consumed, 24 * 2 + 9);
+
+    // 2048 = high 16, low 0: rejected on the 16th zero, either sign.
+    for sign in [0u8, 1] {
+        let bad = compressed_s(&[(sign, 0, 16), (0, 0, 0), (0, 0, 0)]);
+        assert!(
+            decompress(&bad, 3).is_none(),
+            "magnitude 2048 (sign {sign}) must be rejected"
+        );
+    }
+    // Any longer run is rejected too (previously admitted up to 2048 zeros).
+    let bad = compressed_s(&[(0, 5, 100), (0, 0, 0), (0, 0, 0)]);
+    assert!(decompress(&bad, 3).is_none());
+}
