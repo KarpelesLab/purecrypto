@@ -319,7 +319,10 @@ pub unsafe extern "C" fn pc_cert_free(cert: *mut PcCert) {
 
 /// Generates a self-signed ECDSA P-256 certificate using `key` (CN =
 /// `cn`, valid for `days` days from now). Returns the certificate as a
-/// `CERTIFICATE` PEM in `out`.
+/// `CERTIFICATE` PEM in `out`. A `days` that pushes `notAfter` past the
+/// last instant X.509 can encode (31 Dec 9999 23:59:59 UTC) is rejected
+/// with [`PcStatus::Unsupported`] — `Time::from_unix` would otherwise wrap
+/// the year modulo 10000 and silently emit an already-expired certificate.
 ///
 /// Convenience entry point used by the TLS/DTLS smoke tests: a single
 /// call materialises both a leaf cert (via `pc_tls_cfg_set_certificate`'s
@@ -350,10 +353,17 @@ pub unsafe extern "C" fn pc_ec_self_signed_pem(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(1_700_000_000);
-        let validity = Validity::new(
-            Time::from_unix(now),
-            Time::from_unix(now + (days as u64) * 86_400),
-        );
+        // Latest instant a GeneralizedTime can carry (mirrors the CLI's
+        // `MAX_X509_UNIX_TIME`; the bin crate's constant is not reachable
+        // from the library).
+        const MAX_X509_UNIX_TIME: u64 = 253_402_300_799;
+        let not_after = now
+            .checked_add(u64::from(days) * 86_400)
+            .filter(|end| *end <= MAX_X509_UNIX_TIME);
+        let Some(not_after) = not_after else {
+            return PcStatus::Unsupported;
+        };
+        let validity = Validity::new(Time::from_unix(now), Time::from_unix(not_after));
         let subject = DistinguishedName::common_name(cn);
         let cert =
             match Certificate::self_signed_general(&signer, &subject, &validity, 1, false, &[cn]) {

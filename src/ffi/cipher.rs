@@ -264,8 +264,9 @@ pub unsafe extern "C" fn pc_aead_encrypt(
 
 /// One-shot AEAD decrypt with tag verification. On success, `*pt_len` is set
 /// to `ct_and_tag_len - tag_size`. On tag mismatch, returns
-/// [`PcStatus::Verification`] and the buffer contents are unspecified (CCM
-/// wipes; GCM/ChaCha20-Poly1305 leave them).
+/// [`PcStatus::Verification`] and the caller's `pt` buffer is left untouched
+/// for every algorithm: decryption runs in an internal scratch buffer that is
+/// scrubbed on failure and copied out only after the tag verifies.
 ///
 /// # Safety
 /// All pointers must be valid for their lengths.

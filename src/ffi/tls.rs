@@ -58,7 +58,12 @@ pub enum Version {
 
 impl Version {
     fn from_i32(v: i32) -> Option<Self> {
-        Some(match v as u16 {
+        // Reject anything outside the 16-bit wire range outright: an `as
+        // u16` truncation would silently accept e.g. 0x1_0304 as TLS 1.3.
+        let Ok(v) = u16::try_from(v) else {
+            return None;
+        };
+        Some(match v {
             0x0303 => Version::Tls12,
             0x0304 => Version::Tls13,
             0xFEFD => Version::Dtls12,

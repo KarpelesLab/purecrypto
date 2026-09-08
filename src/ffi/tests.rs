@@ -1546,3 +1546,42 @@ fn tls_feed_reports_fatal_alert_by_name() {
     unsafe { tls::pc_tls_free(client) };
 }
 
+/// FC-7: `Version::from_i32` must not truncate with `as u16` — 0x1_0304 is
+/// not TLS 1.3, and a negative value is not a wire version either.
+#[test]
+fn tls_cfg_new_rejects_versions_outside_u16() {
+    for bad in [0x1_0304_i32, -1, i32::MIN, i32::MAX, 0x0305] {
+        let cfg = tls::pc_tls_cfg_new(0, bad);
+        assert!(cfg.is_null(), "version {bad:#x} must be rejected");
+    }
+    let cfg = tls::pc_tls_cfg_new(0, 0x0304);
+    assert!(!cfg.is_null());
+    unsafe { tls::pc_tls_cfg_free(cfg) };
+}
+
+/// FC-6: `pc_ec_self_signed_pem` must refuse a `days` whose notAfter cannot
+/// be encoded (year > 9999) instead of wrapping the year and emitting a
+/// certificate that expired centuries ago.
+#[test]
+fn ec_self_signed_pem_rejects_unencodable_days() {
+    let key = ec::pc_ec_generate(1 /* P-256 */);
+    assert!(!key.is_null());
+    let cn = b"days.example\0";
+    let cn_ptr = cn.as_ptr() as *const core::ffi::c_char;
+
+    let mut len = 0usize;
+    let st = unsafe {
+        x509::pc_ec_self_signed_pem(key, cn_ptr, u32::MAX, core::ptr::null_mut(), &mut len)
+    };
+    assert_eq!(st, PcStatus::Unsupported);
+
+    // The last encodable instant is 9999-12-31; ~3 million days from 2026
+    // overshoots it, 30 days does not.
+    let st = unsafe {
+        x509::pc_ec_self_signed_pem(key, cn_ptr, 3_000_000, core::ptr::null_mut(), &mut len)
+    };
+    assert_eq!(st, PcStatus::Unsupported);
+    let pem = read_out(|p, l| unsafe { x509::pc_ec_self_signed_pem(key, cn_ptr, 30, p, l) });
+    assert!(pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+    unsafe { ec::pc_ec_free(key) };
+}
