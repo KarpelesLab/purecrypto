@@ -7,6 +7,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/KarpelesLab/purecrypto/compare/v0.8.1...v0.9.0) - 2026-09-08
+
+### Added
+
+- *(x509)* CrlBuilder::crl_number emits the mandatory cRLNumber extension
+- *(zkp)* Borromean-ring range proofs, byte-exact with the reference
+- *(zkp)* implement asset surjection proofs (Confidential Assets)
+- *(zkp)* half-aggregation of BIP340 Schnorr signatures
+- *(zkp)* Pedersen commitments and Confidential Assets generators
+- *(zkp)* ECDSA sign-to-contract over secp256k1, byte-exact with secp256k1-zkp
+- *(zkp)* ECDSA adaptor signatures (encrypt/verify/decrypt/recover)
+- *(zkp)* ring-signature address whitelisting (Elements/Liquid)
+- *(secp256k1)* implement BIP340 Schnorr signatures
+- *(zkp)* scaffold secp256k1 zero-knowledge extension modules
+
+### Fixed
+
+- *(ffi)* mark PcStatus #[non_exhaustive]
+- *(dtls)* retransmit handshake records under fresh sequence numbers
+- *(dtls)* harden the DTLS 1.2 engines' ClientHello and final-flight paths
+- *(dtls)* harden the DTLS 1.3 engines' pre-key handshake paths
+- *(dtls)* bound reassembler admission to the flight window and add eviction
+- *(tls)* domain-separate session tickets and bind them to client authentication
+- *(tls)* tighten ClientHello/HRR/EE validation, ticket caching and secret Debug output
+- *(tls)* scan the version-peek buffer incrementally; reject zero-length handshake fragments
+- *(tls)* refuse handshake bytes that span a read-key change
+- *(tls)* reject early_data in EncryptedExtensions when the PSK was not selected
+- *(tls)* park the TLS 1.2 engines in Closed on a received fatal alert
+- *(tls)* TLS 1.2 client accepts exactly one NewSessionTicket per handshake
+- *(cli,web)* screen CSR before allocating an index; unconditional -insecure warning; fail-closed random_get
+- *(cli)* open the CA ledger and keylog with O_NOFOLLOW; refuse a permissive keylog
+- *(cli)* s_client and tls_get fail on TCP EOF without close_notify
+- *(ffi)* bound pc_ec_self_signed_pem validity; strict version range; AEAD doc
+- *(ffi)* surface close_notify and fatal alerts through the C ABI
+- *(ffi)* let DTLS cookie servers bind the peer address; refuse incomplete configs by name
+- *(rsa)* tighten key-import/keygen validation and wipe private-op scratch
+- *(dh)* interoperate with primitive-root generators; bound and speed up custom-group validation
+- *(bignum)* branch-free window-index compare in the modexp table gathers
+- *(pki)* cap the RFC 5280 policy tree and per-cert policy extension sizes
+- *(ech)* bound GREASE enc+payload to the HKDF-SHA-256 expansion limit
+- *(pki)* validate stapled OCSP against the leaf's real issuer, not cert_chain[1]
+- *(mldsa)* gate the `Vec` imports on the features that use them
+- *(slhdsa)* accept empty messages as FIPS 205 permits
+- *(falcon)* reject compressed coefficients with magnitude >= 2048
+- *(pqc)* zeroize secret temporaries in the ML-KEM, SLH-DSA, XMSS and LMS kernels
+- *(cipher)* enforce the RFC 5297 S2V component limit in AES-SIV
+- *(cipher)* wipe leftover key-material stack temporaries
+- *(aez)* scrub output on tag failure, never write the genuine tag, bound tau
+- *(cipher)* wipe ChaCha20 state and keystream stack temporaries
+- *(zkp)* surjection initialize fails fast when no input matches
+- *(zkp)* rangeproof::sign fails closed on a mismatched opening
+- *(zkp)* make rangeproof parameter selection constant time in the value
+- *(zkp)* wipe the remaining secret intermediates in the zkp provers
+- *(zkp)* redact and wipe rangeproof::Rewound
+- *(zkp)* reject an R on infinity in surjection and whitelist verify
+- *(zkp)* reject rangeproofs with unused sign-bit padding set
+- *(ec)* wipe scalar byte copies in 25519 hazmat mul; redact point Debug output
+- *(secp256k1)* derive field-reduction masks without a branch
+- *(secp256k1)* zeroise the BIP340 nonce hasher and the aux mask in sign()
+- *(zkp)* halfagg inc_aggregate rejects a non-canonical input aggregate
+- *(zkp)* wipe secret temporaries in Pedersen hash-to-curve and the RFC 6979 DRBG
+- *(zkp)* adaptor verify/recover reject r = 0, zero DLEQ scalars; branch-free low-S
+- *(zkp)* build the Pedersen generator H by construction, never by fallback
+- *(ec)* SM2 re-encoders stay total for wide components; wipe SM2 transient secrets
+- *(ec)* BoxedEcdhPrivateKey::curve() instead of recomputing d*G for the curve id
+- *(key)* Ed448 facade signs via try_sign_ctx; oversize context is an error
+- *(ec)* registry SPKI parsers reject trailing bytes like x509::pubkey does
+- *(ec)* non-short-circuiting range check on secret P-256 scalars
+- *(ec)* branch-free secret-index compare in the edwards25519 table gathers
+- *(ec)* Ed448 PKCS#8 parser skips v2 attributes/publicKey and rejects trailing bytes
+- *(ec)* wipe transient EdDSA / X25519 / X448 signing and DH secrets
+- *(rng)* chunk wasm host entropy requests and verify each chunk was filled
+- *(kdf)* report over-wide keyLength/ICV INTEGERs as BadEncoding
+- *(rng)* fail closed when getrandom(2) returns an impossible byte count
+- *(hash,kdf)* close secret-wiping gaps on the consuming finalize paths
+- *(hash)* re-check CPU features inside the safe SIMD kernel wrappers
+- *(hash)* validate the TurboSHAKE domain byte in release builds
+- *(hash)* reject ParallelHash block size B == 0
+- *(hash)* bound BLAKE2X output length and reject reads past it
+- *(quic)* bounds-check wire lengths in u64 before narrowing to usize
+- *(quic)* discard Retry after any server Initial/Handshake was processed
+
+### Other
+
+- *(mldsa)* negative tests for hint encoding, z-norm bound and context length
+- *(cipher)* pin the CTS, long-AAD CCM, non-96-bit-IV GCM and multi-block GCM-SIV KATs
+- *(cipher)* state the fused-path decrypt-then-restore caveat on Gcm::decrypt
+- *(secp256k1)* describe the actual scalar-mul window and the native field backend
+- *(ec)* reject non-canonical R/A encodings; document cofactored verify
+- *(ec)* X25519/X448 small-order peer tests cover every low-order u
+- *(zkp)* record rangeproof interop status; fix the harness README
+- *(zkp)* record surjection-proof interop status
+- *(zkp)* enable the halfagg module in the oracle build script
+
 ## [0.8.1](https://github.com/KarpelesLab/purecrypto/compare/v0.8.0...v0.8.1) - 2026-09-05
 
 ### Added
