@@ -547,14 +547,16 @@ fn run_sign_csr(args: Args) {
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
+    // The CSR's self-signature MUST verify before we trust its subject/key,
+    // and the request must clear the issuance policy (no SHA-1/MD5 signature,
+    // no undersized RSA key) before we countersign any of it. Screen before
+    // touching CA state: a rejected request must not consume an audit index.
+    verify_and_screen_csr(&csr);
+
     let index = allocate_index(&ca);
     let serial = random_serial();
     let validity = validity_days(days_n);
 
-    // The CSR's self-signature MUST verify before we trust its subject/key,
-    // and the request must clear the issuance policy (no SHA-1/MD5 signature,
-    // no undersized RSA key) before we countersign any of it.
-    verify_and_screen_csr(&csr);
     let subject_from_csr = csr
         .subject()
         .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));

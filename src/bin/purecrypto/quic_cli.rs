@@ -172,6 +172,13 @@ pub(crate) fn run_client(args: Args) {
 
     drive_quic_handshake(&mut qc, &socket, None, Duration::from_secs(30));
 
+    // Security-relevant, so it goes to stderr regardless of -quiet: an
+    // unattended `-quiet -insecure` pipeline must not be able to hide that
+    // the peer identity was never checked. Same string as s_client.
+    if insecure {
+        eprintln!("WARNING: certificate NOT verified (-insecure)");
+    }
+
     if !quiet {
         eprintln!(
             "connected: QUIC v1 / TLSv1.3{}",

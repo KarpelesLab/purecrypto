@@ -96,11 +96,25 @@ export function load(url) {
       // The crate's entropy backend for wasm32-unknown-unknown: fill `len`
       // bytes at `ptr` from the host CSPRNG. getRandomValues caps at 65536
       // bytes per call, so chunk larger draws.
+      //
+      // Fail closed, never throw: the Rust side (src/rng/wasm.rs) pre-poisons
+      // the buffer and traps if it comes back unchanged, so on any host
+      // failure (non-secure context, quota) we leave linear memory untouched
+      // and return. Throwing instead would unwind a JS exception through the
+      // wasm frames — past the crate's `guard` panic boundary — and a partial
+      // fill would defeat the sentinel check, hence the draw goes into a
+      // scratch buffer and is copied in only once it is complete.
       random_get(ptr, len) {
-        const buf = new Uint8Array(wasm.memory.buffer, ptr, len);
-        for (let off = 0; off < len; off += 65536) {
-          crypto.getRandomValues(buf.subarray(off, Math.min(off + 65536, len)));
+        const tmp = new Uint8Array(len);
+        try {
+          for (let off = 0; off < len; off += 65536) {
+            crypto.getRandomValues(tmp.subarray(off, Math.min(off + 65536, len)));
+          }
+        } catch (e) {
+          console.error('purecrypto.random_get: host CSPRNG unavailable', e);
+          return;
         }
+        new Uint8Array(wasm.memory.buffer, ptr, len).set(tmp);
       },
     },
   };
