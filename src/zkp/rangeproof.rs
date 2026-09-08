@@ -95,8 +95,9 @@
 //!
 //! with `n` rings and `N = Σ rsizes` members. The quadratic-residue convention
 //! for the packed bits is [`pedersen`](super::pedersen)'s, not SEC1 parity.
-//! The reserved bits (`0x80` of byte 0, `0xc0` of byte 1) must be clear and
-//! trailing bytes are refused, so every proof has exactly one encoding. The
+//! The reserved bits (`0x80` of byte 0, `0xc0` of byte 1) and the unused high
+//! bits of the last sign-bit byte must be clear, and trailing bytes are
+//! refused, so every proof has exactly one encoding. The
 //! largest shape the layout admits is [`MAX_PROOF_LEN`]; the largest a prover
 //! can actually reach is 5126 bytes (`mantissa = 64`, `min_value = 0`).
 //!
@@ -652,6 +653,12 @@ fn parse(
     }
 
     let body = &proof[header_len..header_len + body_len];
+    // The unused high bits of the last sign-bit byte are neither hashed nor
+    // read, so they must be clear or a proof would have up to 2^7 accepted
+    // encodings.
+    if !ncommit.is_multiple_of(8) && body[sign_bytes - 1] >> (ncommit % 8) != 0 {
+        return Err(Error::Malformed);
+    }
     let (points, encs) = parse_digit_commitments(body, ncommit, sign_bytes)?;
 
     let message = proof_message(
@@ -1527,18 +1534,63 @@ mod tests {
 
     #[test]
     fn a_tampered_proof_fails() {
+        // mantissa 3: two rings (4 + 2 members), one transmitted digit
+        // commitment and a sign byte with seven unused bits, so every byte
+        // class of the layout is present at the smallest size.
         let blind = blind_of(53);
         let nonce = nonce_of(53);
-        let commit = Commitment::new(77, &blind).unwrap();
-        let proof = sign(&commit, &blind, &nonce, 77, 0, 0, 8, &[], &[], &h()).unwrap();
+        let commit = Commitment::new(5, &blind).unwrap();
+        let proof = sign(&commit, &blind, &nonce, 5, 0, 0, 3, &[], &[], &h()).unwrap();
         assert!(verify(&commit, &proof, &[], &h()).is_ok());
         for i in 0..proof.len() {
-            let mut bad = proof.clone();
-            bad[i] ^= 0x01;
-            assert!(
-                verify(&commit, &bad, &[], &h()).is_err(),
-                "byte {i} flip verified"
+            for bit in 0..8 {
+                let mut bad = proof.clone();
+                bad[i] ^= 1 << bit;
+                assert!(
+                    verify(&commit, &bad, &[], &h()).is_err(),
+                    "byte {i} bit {bit} flip verified"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unused_sign_bits_are_rejected() {
+        // The packed sign-bit bytes carry one bit per transmitted digit
+        // commitment; the padding bits of the last byte are never read or
+        // hashed, so they must be refused or a proof has 2^k encodings.
+        for (idx, mantissa) in [3u32, 8, 9, 16, 21, 64].into_iter().enumerate() {
+            let blind = blind_of(idx as u8 + 70);
+            let nonce = nonce_of(idx as u8 + 70);
+            let commit = Commitment::new(1, &blind).unwrap();
+            let proof = sign(&commit, &blind, &nonce, 1, 0, 0, mantissa, &[], &[], &h()).unwrap();
+            assert!(verify(&commit, &proof, &[], &h()).is_ok());
+            assert!(rewind(&commit, &proof, &nonce, &[], &h()).is_ok());
+            let (params, header_len) = read_header(&proof).unwrap();
+            assert_eq!(params.mantissa, mantissa);
+            let (ncommit, sign_bytes) = Layout::new(mantissa).commitments();
+            assert!(sign_bytes > 0 && !ncommit.is_multiple_of(8));
+            let last = header_len + sign_bytes - 1;
+            assert_eq!(
+                proof[last] >> (ncommit % 8),
+                0,
+                "sign() must leave the padding bits clear"
             );
+            let unused: Vec<u32> = (0..8).filter(|&b| b >= (ncommit % 8) as u32).collect();
+            for bit in unused {
+                let mut bad = proof.clone();
+                bad[last] |= 1 << bit;
+                assert_eq!(
+                    verify(&commit, &bad, &[], &h()),
+                    Err(Error::Malformed),
+                    "mantissa {mantissa}: padding bit {bit} verified"
+                );
+                assert_eq!(
+                    rewind(&commit, &bad, &nonce, &[], &h()).unwrap_err(),
+                    Error::Malformed,
+                    "mantissa {mantissa}: padding bit {bit} rewound"
+                );
+            }
         }
     }
 
