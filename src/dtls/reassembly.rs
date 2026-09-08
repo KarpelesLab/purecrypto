@@ -166,6 +166,9 @@ struct PartialMessage {
     received: Vec<u64>,
     /// Count of set bits in `received`.
     received_count: u32,
+    /// Admission order (from [`Reassembler::admit_counter`]); drives the
+    /// FIFO eviction of [`Reassembler::with_fifo_eviction`].
+    admitted_at: u64,
 }
 
 impl PartialMessage {
@@ -214,9 +217,32 @@ const MAX_MESSAGE_LEN: u32 = 256 * 1024;
 /// the genuine message to coexist at the same `message_seq`.
 const MAX_IN_PROGRESS: usize = 8;
 
+/// How far ahead of `expected_msg_seq` a fragment's `message_seq` may be
+/// before it is refused outright. A legitimate DTLS flight is at most a
+/// handful of messages (the largest, the 1.2 server's `ServerHello ..
+/// ServerHelloDone`, is four), so any fragment more than this many
+/// messages ahead cannot belong to the flight we are waiting for. Without
+/// the bound, eight spoofed far-future candidates (`message_seq` 100..107)
+/// fill `max_in_progress` and starve the genuine head-of-queue message —
+/// `drop_stale_candidates` only ever evicts *below* `expected_msg_seq`.
+pub(crate) const MAX_SEQ_AHEAD: u16 = 8;
+
 /// Handshake-message reassembler. Tracks one in-flight reassembly per
 /// `(message_seq, msg_type, total_length)` candidate and gates dispatch on
 /// the next-expected sequence number.
+///
+/// Admission rules (all of them memory-DoS / starvation guards against a
+/// spoofing peer):
+///
+/// - `message_seq` must lie in `expected .. expected + MAX_SEQ_AHEAD`;
+///   older fragments belong to an already-dispatched message, far-future
+///   ones cannot be part of the current flight.
+/// - `total_length` is capped at `max_message_len`.
+/// - At most `max_in_progress` candidates are buffered. When the budget is
+///   exhausted, a fragment for the *head of the queue* (`message_seq ==
+///   expected`) evicts the highest-sequence candidate rather than being
+///   refused — the head is the only message that can make progress, so
+///   it must always be admissible.
 pub(crate) struct Reassembler {
     expected_msg_seq: u16,
     in_progress: BTreeMap<CandidateKey, PartialMessage>,
@@ -225,6 +251,12 @@ pub(crate) struct Reassembler {
     max_message_len: u32,
     /// Cap on concurrently in-progress reassembly candidates.
     max_in_progress: usize,
+    /// When `true`, a full map admits a new candidate by evicting the
+    /// least-recently admitted one instead of applying the head-of-queue
+    /// rule. See [`Self::with_fifo_eviction`].
+    fifo_eviction: bool,
+    /// Monotonic admission counter stamped on each new candidate.
+    admit_counter: u64,
 }
 
 impl Reassembler {
@@ -245,7 +277,25 @@ impl Reassembler {
             in_progress: BTreeMap::new(),
             max_message_len,
             max_in_progress,
+            fifo_eviction: false,
+            admit_counter: 0,
         }
+    }
+
+    /// Switches the full-map policy to FIFO: a new candidate evicts the
+    /// least-recently admitted one.
+    ///
+    /// For a pure fragment buffer with no meaningful head of queue — the
+    /// DTLS 1.3 server's pre-cookie ClientHello buffer, where `message_seq`
+    /// 0 and 1 are both legitimate and nothing else ever expires the
+    /// contents — this is what keeps a handful of spoofed partial claims
+    /// from blocking a genuine fragmented CH indefinitely: the genuine
+    /// client's retransmits churn the junk out. The default head-of-queue
+    /// rule is kept for the in-handshake reassemblers, where a competing
+    /// claim at the head must never be able to evict the genuine partial.
+    pub(crate) fn with_fifo_eviction(mut self) -> Self {
+        self.fifo_eviction = true;
+        self
     }
 
     /// The message sequence number this reassembler is currently waiting for.
@@ -282,6 +332,13 @@ impl Reassembler {
         if frag.message_seq < self.expected_msg_seq {
             return None;
         }
+        // Refuse fragments too far ahead of the head of the queue: they
+        // cannot belong to the flight in progress and would otherwise be
+        // able to pin the whole `max_in_progress` budget (see
+        // `MAX_SEQ_AHEAD`).
+        if frag.message_seq - self.expected_msg_seq >= MAX_SEQ_AHEAD {
+            return None;
+        }
         // Reject implausibly large messages and out-of-budget concurrency
         // (memory-DoS protection).
         if frag.total_length > self.max_message_len {
@@ -299,19 +356,45 @@ impl Reassembler {
         let total_length = frag.total_length;
         let key: CandidateKey = (frag.message_seq, frag.msg_type, total_length);
         if !self.in_progress.contains_key(&key) && self.in_progress.len() >= self.max_in_progress {
-            return None;
+            let victim = if self.fifo_eviction {
+                // Pure fragment buffer: recycle the least-recently admitted
+                // candidate.
+                self.in_progress
+                    .iter()
+                    .min_by_key(|(_, v)| v.admitted_at)
+                    .map(|(k, _)| *k)?
+            } else {
+                // Budget exhausted. A fragment for the head of the queue is
+                // the only thing that can make progress, so admit it by
+                // evicting the highest-sequence candidate — but never a
+                // competing claim at the head itself, otherwise a spoofer
+                // could churn the genuine partial out of the map with
+                // fresh head-seq claims.
+                if frag.message_seq != self.expected_msg_seq {
+                    return None;
+                }
+                self.in_progress
+                    .keys()
+                    .next_back()
+                    .copied()
+                    .filter(|k| k.0 > self.expected_msg_seq)?
+            };
+            self.in_progress.remove(&victim);
         }
 
-        let entry = self
-            .in_progress
-            .entry(key)
-            .or_insert_with(|| PartialMessage {
+        let admit_counter = &mut self.admit_counter;
+        let entry = self.in_progress.entry(key).or_insert_with(|| {
+            let admitted_at = *admit_counter;
+            *admit_counter += 1;
+            PartialMessage {
                 msg_type: frag.msg_type,
                 total_length,
                 buf: vec_zeroed(total_length as usize),
                 received: vec_bitmap_words(total_length as usize),
                 received_count: 0,
-            });
+                admitted_at,
+            }
+        });
 
         let off = frag.fragment_offset as usize;
         // Bounds pre-check: `read_fragment` already verified offset + length
@@ -405,6 +488,25 @@ impl Reassembler {
         let done = self.in_progress.remove(&key)?;
         self.expected_msg_seq = self.expected_msg_seq.wrapping_add(1);
         self.drop_stale_candidates();
+        Some((done.msg_type, done.buf))
+    }
+
+    /// Removes and returns a fully assembled candidate at exactly `seq`,
+    /// WITHOUT advancing `expected_msg_seq` or evicting anything.
+    ///
+    /// Used by the DTLS 1.3 server's pre-cookie ClientHello path, where the
+    /// reassembler is only a fragment buffer: both `message_seq` 0 (a first
+    /// CH) and 1 (a post-HelloRetryRequest CH2) are legitimate heads there,
+    /// and neither may be gated on the other — the server is stateless
+    /// across the HRR round trip, so it cannot know which one it is
+    /// waiting for.
+    pub(crate) fn take_complete(&mut self, seq: u16) -> Option<(u8, Vec<u8>)> {
+        let key = *self
+            .in_progress
+            .range((seq, 0u8, 0u32)..=(seq, u8::MAX, u32::MAX))
+            .find(|(_, v)| v.received_count == v.total_length)
+            .map(|(k, _)| k)?;
+        let done = self.in_progress.remove(&key)?;
         Some((done.msg_type, done.buf))
     }
 }
@@ -715,6 +817,125 @@ mod tests {
         rest.extend_from_slice(&[0x22; 10]);
         let out = r.feed(read_fragment(&rest).unwrap()).unwrap();
         assert_eq!(out.1.len(), 20);
+    }
+
+    /// DTLS-L6 regression: far-future candidates must not be able to fill
+    /// the in-progress budget and starve the head of the queue.
+    #[test]
+    fn far_future_candidates_cannot_starve_head_of_queue() {
+        let mut r = Reassembler::new();
+        // Eight junk candidates at message_seq 100..107 — every one is
+        // beyond MAX_SEQ_AHEAD and is refused before allocating.
+        for i in 0..8u16 {
+            let mut junk = Vec::new();
+            write_fragment_header(&mut junk, 11, 2, 100 + i, 0, 1);
+            junk.push(0x00);
+            assert!(r.feed(read_fragment(&junk).unwrap()).is_none());
+        }
+        assert!(r.in_progress.is_empty());
+        // The genuine head-of-queue message still dispatches.
+        let mut genuine = Vec::new();
+        write_message(&mut genuine, 2, 0, &[1, 2, 3], 0);
+        let got = r.feed(read_fragment(&genuine).unwrap()).unwrap();
+        assert_eq!(got, (2, alloc::vec![1, 2, 3]));
+    }
+
+    /// DTLS-L6 regression: near-future candidates inside the window can
+    /// fill the budget, but a head-of-queue fragment then evicts the
+    /// highest-sequence one instead of being refused.
+    #[test]
+    fn head_of_queue_fragment_evicts_highest_candidate_when_full() {
+        let mut r = Reassembler::with_limits(1024, 4);
+        // Four incomplete candidates at message_seq 1..=4 (inside the
+        // window) exhaust the budget.
+        for seq in 1..=4u16 {
+            let mut junk = Vec::new();
+            write_fragment_header(&mut junk, 11, 64, seq, 0, 1);
+            junk.push(0xAA);
+            assert!(r.feed(read_fragment(&junk).unwrap()).is_none());
+        }
+        assert_eq!(r.in_progress.len(), 4);
+        // A non-head fragment is still refused...
+        let mut more = Vec::new();
+        write_fragment_header(&mut more, 12, 64, 2, 0, 1);
+        more.push(0xBB);
+        assert!(r.feed(read_fragment(&more).unwrap()).is_none());
+        assert_eq!(r.in_progress.len(), 4);
+        // ...but the head (seq 0) evicts seq 4 and is admitted. Feed it in
+        // two halves so the admission (not just dispatch) is exercised.
+        let mut h0 = Vec::new();
+        write_fragment_header(&mut h0, 2, 4, 0, 0, 2);
+        h0.extend_from_slice(&[1, 2]);
+        assert!(r.feed(read_fragment(&h0).unwrap()).is_none());
+        assert_eq!(r.in_progress.len(), 4);
+        assert!(!r.in_progress.contains_key(&(4, 11, 64)));
+        assert!(r.in_progress.contains_key(&(0, 2, 4)));
+        let mut h1 = Vec::new();
+        write_fragment_header(&mut h1, 2, 4, 0, 2, 2);
+        h1.extend_from_slice(&[3, 4]);
+        let got = r.feed(read_fragment(&h1).unwrap()).unwrap();
+        assert_eq!(got, (2, alloc::vec![1, 2, 3, 4]));
+    }
+
+    /// The eviction never touches a competing claim at the head itself:
+    /// with the budget full of head-seq candidates, a fresh head-seq claim
+    /// is refused rather than churning the genuine partial out.
+    #[test]
+    fn eviction_never_removes_head_seq_candidates() {
+        let mut r = Reassembler::with_limits(1024, 2);
+        for total in [10u32, 20] {
+            let mut f = Vec::new();
+            write_fragment_header(&mut f, 1, total, 0, 0, 1);
+            f.push(0x11);
+            assert!(r.feed(read_fragment(&f).unwrap()).is_none());
+        }
+        let mut third = Vec::new();
+        write_fragment_header(&mut third, 1, 30, 0, 0, 1);
+        third.push(0x11);
+        assert!(r.feed(read_fragment(&third).unwrap()).is_none());
+        assert_eq!(r.in_progress.len(), 2);
+        assert!(r.in_progress.contains_key(&(0, 1, 10)));
+        assert!(r.in_progress.contains_key(&(0, 1, 20)));
+    }
+
+    #[test]
+    fn fifo_eviction_recycles_oldest_candidate_when_full() {
+        let mut r = Reassembler::with_limits(1024, 2).with_fifo_eviction();
+        // Two junk claims at message_seq 0 fill the buffer.
+        for total in [10u32, 20] {
+            let mut f = Vec::new();
+            write_fragment_header(&mut f, 1, total, 0, 0, 1);
+            f.push(0x11);
+            assert!(r.feed(read_fragment(&f).unwrap()).is_none());
+        }
+        // A third claim (even at the same seq) evicts the oldest (total 10).
+        let mut h0 = Vec::new();
+        write_fragment_header(&mut h0, 1, 4, 0, 0, 2);
+        h0.extend_from_slice(&[1, 2]);
+        assert!(r.feed(read_fragment(&h0).unwrap()).is_none());
+        assert_eq!(r.in_progress.len(), 2);
+        assert!(!r.in_progress.contains_key(&(0, 1, 10)));
+        assert!(r.in_progress.contains_key(&(0, 1, 4)));
+        // ...and the genuine message still completes.
+        let mut h1 = Vec::new();
+        write_fragment_header(&mut h1, 1, 4, 0, 2, 2);
+        h1.extend_from_slice(&[3, 4]);
+        assert_eq!(
+            r.feed(read_fragment(&h1).unwrap()),
+            Some((1, alloc::vec![1, 2, 3, 4]))
+        );
+    }
+
+    #[test]
+    fn take_complete_returns_candidate_without_advancing() {
+        let mut r = Reassembler::new();
+        let mut b1 = Vec::new();
+        write_message(&mut b1, 1, 1, b"one!", 0);
+        assert!(r.feed(read_fragment(&b1).unwrap()).is_none());
+        assert!(r.take_complete(0).is_none());
+        assert_eq!(r.take_complete(1), Some((1, b"one!".to_vec())));
+        assert_eq!(r.expected_msg_seq(), 0);
+        assert!(r.take_complete(1).is_none());
     }
 
     #[test]
