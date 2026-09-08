@@ -2,16 +2,17 @@
 //!
 //! The point arithmetic in [`super::group`] is generic over a [`FieldBackend`]
 //! so the base field `GF(p)` with `p = 2²⁵⁶ − 2³² − 977` can be implemented
-//! several ways behind one interface. This phase ships a single backend:
+//! several ways behind one interface. Two backends exist:
 //!
+//! - [`Secp256k1Field`] — the native pseudo-Mersenne backend the public API is
+//!   wired to (via the `Backend` alias in [`super`]): schoolbook 4×4 limb
+//!   multiplication followed by a reduction specialised to `2²⁵⁶ ≡ c (mod p)`
+//!   with `c = 2³² + 977`, all branch-free and mask-driven.
 //! - [`GenericMont`] — wraps the crate's generic 4-limb [`MontModulus`] CIOS
-//!   arithmetic. It reuses exactly the numeric core P-256 uses, so it is
-//!   trivially trustworthy, and the public API is wired to it.
-//!
-//! A native pseudo-Mersenne reduction specialised to secp256k1's prime is the
-//! natural next backend (it would slot in behind this same trait by changing
-//! one type alias in [`super`]); it is deliberately deferred so this exposure
-//! lands on the audited generic core first.
+//!   arithmetic, exactly the numeric core P-256 uses. It is the reference
+//!   oracle: the differential tests at the bottom of this file check the
+//!   native backend against it operation by operation, and it remains a
+//!   `pub(crate)` fallback that slots in by changing that one alias.
 //!
 //! Field elements are carried as plain (non-Montgomery) residues `< p`, stored
 //! as a [`Uint<4>`]; this is the representation the SEC1 codec serialises.

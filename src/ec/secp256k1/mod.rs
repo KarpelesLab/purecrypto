@@ -230,7 +230,11 @@ impl ProjectivePoint {
         ProjectivePoint(Point::negate(&field(), &self.0))
     }
 
-    /// Returns `scalar · self` via a constant-time double-and-add ladder.
+    /// Returns `scalar · self`, constant time in the scalar: a fixed 4-bit
+    /// window (4 doublings and one unconditional complete addition per nibble)
+    /// whose table entry is fetched by a masked scan of all 16 entries, so
+    /// neither the operation schedule nor any memory index depends on the
+    /// scalar.
     pub fn mul(&self, scalar: &Scalar) -> ProjectivePoint {
         ProjectivePoint(Point::mul(&field(), scalar.0.as_limbs(), &self.0))
     }
