@@ -1,38 +1,12 @@
-//! Emulated constant-time IEEE-754 binary64 (`fpr`).
+//! **Test-only reference: the previous, variable-time `fpr` implementation.**
 //!
-//! Falcon signing needs floating-point (FFT, the LDL tree, and the Gaussian
-//! sampler), but this crate is `#![no_std]` with no `libm`, and `core` exposes
-//! no float math (`f64::sqrt`/`exp` live in `std`/`libm`). More importantly, the
-//! signing path operates on *secret* values, so the arithmetic must be
-//! constant-time, and matching the official NIST KAT vectors requires bit-exact,
-//! platform-independent results. Hardware `f64` gives none of these guarantees
-//! (subnormal-operand timing leaks; non-reproducible rounding/FMA contraction).
-//!
-//! This module is the answer Falcon's reference calls *FPEMU*: an `f64`
-//! implemented entirely in integer arithmetic. [`Fpr`] stores the standard
-//! IEEE-754 binary64 bit pattern in a `u64`; every operation
-//! (`add`/`mul`/`div`/`sqrt`/…) reproduces correctly-rounded (round-to-nearest,
-//! ties-to-even) IEEE results using only integer ops and no wide-integer
-//! division/`sqrt` libcalls (a manual restoring divider and bit-by-bit integer
-//! sqrt run a fixed number of iterations). The point is portability and
-//! reproducibility: the result is identical on every target (including no-FPU
-//! `thumbv7em`) and bit-for-bit equal to a conforming hardware `f64` — exactly
-//! what the `#[cfg(test)]` differential harness in `fpr_tests.rs` checks against
-//! the host's real `f64` over millions of random operations.
-//!
-//! **Constant-time caveat.** The emulation is *best-effort* constant-time, not
-//! guaranteed branch-free: `pack` and `add` branch on operand values, and
-//! `mul`/`div`/`sqrt` take zero-operand early-outs — values that, on the signing
-//! path, derive from secret data. So while the emulation removes the
-//! subnormal-timing and FMA-contraction leaks of a hardware `f64`, it does not
-//! by itself make signing strictly constant-time; a fully branchless FPEMU is
-//! future work (mirroring the candid limits documented elsewhere in the crate).
-//!
-//! Falcon never produces NaN or infinities in normal operation and its analysis
-//! shows subnormals do not arise on the hot path; those edges are still handled
-//! conservatively (infinities saturate, deep underflow flushes to a signed zero)
-//! so the type is well-defined, but the values that matter for Falcon — normals
-//! and zero — are exact.
+//! This is a verbatim snapshot of `fpr.rs` as it stood before the constant-time
+//! rewrite (base commit 01be041), kept so the differential tests in
+//! `fpr_tests.rs` can prove the branch-free implementation is *bit-exact* with
+//! its predecessor on every finite input class Falcon exercises. It is never
+//! compiled into the library. Do not "fix" it: its value lies in being the old
+//! behaviour, warts and all.
+#![allow(dead_code, clippy::all)]
 
 /// An emulated IEEE-754 binary64 value, stored as its 64-bit bit pattern.
 ///
@@ -69,14 +43,14 @@ impl Fpr {
     }
 
     /// Reinterpret as a host `f64` (bit reinterpretation only).
-    #[cfg(test)]
+
     #[inline]
     pub(crate) const fn to_f64(self) -> f64 {
         f64::from_bits(self.0)
     }
 
     /// `true` iff the value is `+0.0` or `-0.0`.
-    #[cfg(test)]
+
     #[inline]
     pub(crate) fn is_zero(self) -> bool {
         (self.0 & 0x7FFF_FFFF_FFFF_FFFF) == 0
@@ -89,7 +63,7 @@ impl Fpr {
     }
 
     /// Absolute value: clear the sign bit.
-    #[cfg(test)]
+
     #[inline]
     pub(crate) fn abs(self) -> Fpr {
         Fpr(self.0 & 0x7FFF_FFFF_FFFF_FFFF)
@@ -506,17 +480,9 @@ impl Fpr {
     }
 
     /// `self <= other` by numeric value.
-    #[cfg(test)]
+
     #[inline]
     pub(crate) fn le(self, other: Fpr) -> bool {
         self.order_key() <= other.order_key()
     }
 }
-
-#[cfg(test)]
-#[path = "fpr_reference_vt.rs"]
-mod fpr_reference_vt;
-
-#[cfg(test)]
-#[path = "fpr_tests.rs"]
-mod fpr_tests;

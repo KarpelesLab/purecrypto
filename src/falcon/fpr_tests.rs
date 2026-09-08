@@ -245,3 +245,36 @@ fn round_to_int_never_panics_on_negate_overflow() {
     let v = Fpr::from_f64(-9_223_372_036_854_775_808.0).sub(Fpr::from_f64(0.0));
     assert_eq!(v.floor(), i64::MIN);
 }
+
+/// Per-operation throughput of the emulation (ignored by default; run with
+/// `cargo test --release --all-features falcon::fpr::fpr_tests::op_timing -- --ignored --nocapture`).
+#[test]
+#[ignore]
+fn op_timing() {
+    let mut rng = Sm64::new(0x0B0B_0B0B_0B0B_0B0B);
+    let n = 2_000_000u32;
+    let xs: std::vec::Vec<Fpr> = (0..1024)
+        .map(|_| Fpr::from_f64(rand_normal(&mut rng, -20, 20)))
+        .collect();
+    macro_rules! time {
+        ($label:expr, $body:expr) => {{
+            let start = std::time::Instant::now();
+            let mut acc = 0u64;
+            for i in 0..n {
+                let a = xs[(i as usize) & 1023];
+                let b = xs[((i as usize) * 7 + 3) & 1023];
+                let r: u64 = $body(a, b);
+                acc = acc.wrapping_add(r);
+            }
+            let el = start.elapsed();
+            core::hint::black_box(acc);
+            std::println!("{:>6}: {:?}/op", $label, el / n);
+        }};
+    }
+    time!("add", |a: Fpr, b: Fpr| a.add(b).0);
+    time!("mul", |a: Fpr, b: Fpr| a.mul(b).0);
+    time!("div", |a: Fpr, b: Fpr| a.div(b).0);
+    time!("sqrt", |a: Fpr, _b: Fpr| a.abs().sqrt().0);
+    time!("trunc", |a: Fpr, _b: Fpr| a.trunc() as u64);
+    time!("of_i64", |a: Fpr, _b: Fpr| Fpr::of_i64(a.0 as i64 >> 20).0);
+}

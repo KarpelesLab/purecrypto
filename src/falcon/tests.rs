@@ -654,3 +654,33 @@ fn decompress_rejects_magnitude_2048_accepts_2047() {
     let bad = compressed_s(&[(0, 5, 100), (0, 0, 0), (0, 0, 0)]);
     assert!(decompress(&bad, 3).is_none());
 }
+
+/// Wall-clock signing throughput (ignored by default; run with
+/// `cargo test --release --all-features falcon::tests::sign_timing -- --ignored --nocapture`).
+/// Used to track the cost of the constant-time `fpr` emulation.
+#[test]
+#[ignore]
+fn sign_timing() {
+    use super::{Degree, FalconPrivateKey};
+    for deg in [Degree::Falcon512, Degree::Falcon1024] {
+        let mut rng = TestRng(0x5157_1CE5_0000_0001);
+        let sk = FalconPrivateKey::generate(deg, &mut rng);
+        let pk = sk.public_key_bytes();
+        let msg = b"timing";
+        let iters = 50;
+        // Warm-up.
+        let sig = sk.sign(msg, &mut rng);
+        assert!(verify(&pk, msg, &sig));
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let sig = sk.sign(msg, &mut rng);
+            core::hint::black_box(&sig);
+        }
+        let el = start.elapsed();
+        std::println!(
+            "{deg:?}: sign x{iters}: {:?} total, {:?} per signature",
+            el,
+            el / iters
+        );
+    }
+}
