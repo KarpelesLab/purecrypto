@@ -197,6 +197,11 @@ enum ResolvedServer {
 struct ServerConnectionAuto {
     /// Raw wire bytes received before the version was resolved.
     buffered: Vec<u8>,
+    /// Incremental ClientHello reassembly over `buffered`. Keeps a cursor so
+    /// each wire byte is parsed once regardless of how the transport segments
+    /// them (re-scanning from offset 0 on every `feed` is quadratic in the
+    /// record count).
+    peeker: super::peek::ClientHelloPeeker,
     /// Owned config the selected engine is built from; taken (dropped) on
     /// resolution. `Config` is immutable, so this clone never diverges.
     config: Option<Config>,
@@ -230,9 +235,9 @@ impl ServerConnectionAuto {
     /// Once enough of the first ClientHello is buffered, select the version,
     /// build the one matching engine, and replay the buffered bytes into it.
     fn try_resolve(&mut self) -> Result<(), Error> {
-        let offers13 = match super::peek::peek_offers_tls13(&self.buffered)? {
+        let offers13 = match self.peeker.feed(&self.buffered)? {
             None => return Ok(()), // need more bytes; nothing to emit yet
-            Some(v) => v,
+            Some(ch) => super::peek::client_hello_offers_tls13(&ch)?,
         };
         let config = self.config.take().ok_or(Error::InappropriateState)?;
         let buffered = core::mem::take(&mut self.buffered);
@@ -667,6 +672,7 @@ impl Connection {
         {
             let inner = Engine::ServerTlsAuto(Box::new(ServerConnectionAuto {
                 buffered: Vec::new(),
+                peeker: super::peek::ClientHelloPeeker::default(),
                 config: Some(config.clone()),
                 resolved: None,
             }));
@@ -1940,6 +1946,69 @@ mod tests {
         assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_2));
         drive_pair(&mut client, &mut server);
         assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// Re-frames the single handshake record `rec` into records carrying
+    /// `chunk` payload bytes each.
+    fn refragment_handshake_record(rec: &[u8], chunk: usize) -> Vec<u8> {
+        let parsed = super::super::codec::read_record(rec).unwrap().unwrap();
+        assert_eq!(parsed.len, rec.len(), "expected exactly one record");
+        let mut out = Vec::new();
+        for frag in parsed.fragment.chunks(chunk) {
+            super::super::codec::write_record(
+                &mut out,
+                crate::tls::ContentType::Handshake,
+                ProtocolVersion::TLSv1_2,
+                frag,
+            );
+        }
+        out
+    }
+
+    /// TLS-CORE-5 — the deferred server used to re-parse its whole peek
+    /// buffer from offset 0 on every `feed`, so a ClientHello chopped into
+    /// one-byte-payload records and delivered a byte at a time cost
+    /// O(records²) header parses before it resolved. The peeker keeps a
+    /// cursor now; this drives that worst case end to end (a real 1.3
+    /// ClientHello is ~1.5 KB → ~1,500 records → ~9,000 one-byte feeds) and
+    /// checks the handshake still completes.
+    #[test]
+    fn auto_server_resolves_a_client_hello_in_one_byte_records_fed_bytewise() {
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut server = Connection::server(&auto_server_cfg()).unwrap();
+        let _ = client.handshake();
+        let ch = client.pop().unwrap();
+        let wire = refragment_handshake_record(&ch, 1);
+        assert!(wire.len() > 6 * 1000, "a fragmented CH of >1,000 records");
+
+        let started = std::time::Instant::now();
+        for b in &wire {
+            server.feed(core::slice::from_ref(b)).unwrap();
+        }
+        assert_eq!(server.negotiated_version(), Some(ProtocolVersion::TLSv1_3));
+        // Generous even for a debug build; the quadratic version took
+        // multiple seconds here.
+        assert!(
+            started.elapsed() < core::time::Duration::from_secs(5),
+            "ClientHello resolution must be linear in the record count"
+        );
+        drive_pair(&mut client, &mut server);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
+    }
+
+    /// TLS-CORE-5 — RFC 8446 §5.1: a zero-length handshake fragment is a
+    /// protocol violation; the deferred server refuses it instead of
+    /// spending parse budget on records that never advance the message.
+    #[test]
+    fn auto_server_rejects_zero_length_handshake_fragment() {
+        let mut client = Connection::client(&tls13_client_cfg(None)).unwrap();
+        let mut server = Connection::server(&auto_server_cfg()).unwrap();
+        let _ = client.handshake();
+        let ch = client.pop().unwrap();
+        let mut wire = alloc::vec![22u8, 0x03, 0x01, 0x00, 0x00];
+        wire.extend_from_slice(&ch);
+        assert!(matches!(server.feed(&wire), Err(Error::UnexpectedMessage)));
+        assert_eq!(server.negotiated_version(), None);
     }
 
     /// Auto server with an **Ed25519** leaf (which cannot sign TLS 1.2 suites):

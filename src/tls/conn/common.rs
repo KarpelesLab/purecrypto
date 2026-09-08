@@ -438,6 +438,12 @@ impl ConnectionCore {
                     if self.read.is_some() {
                         return Err(Error::UnexpectedMessage);
                     }
+                    // RFC 8446 §5.1: zero-length handshake fragments MUST
+                    // NOT be sent. Same treatment as the protected case in
+                    // `dispatch_inner` (§5.4): `unexpected_message`.
+                    if fragment.is_empty() {
+                        return Err(Error::UnexpectedMessage);
+                    }
                     self.append_handshake_bytes(&fragment)?;
                 }
                 ContentType::Alert => {

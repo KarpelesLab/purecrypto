@@ -86,23 +86,18 @@ fn extract_client_hello_info(ch: &ClientHello) -> Result<ClientHelloInfo, Error>
     Ok(info)
 }
 
-/// Selects the TLS server engine version from the first ClientHello, reusing the
-/// same non-consuming reassembly as [`peek_client_hello`]. `Ok(None)` = the
-/// ClientHello isn't fully buffered yet; `Ok(Some(true))` = the client offered
-/// TLS 1.3 in `supported_versions` (use the 1.3 engine); `Ok(Some(false))` = no
-/// 1.3 was offered (a legacy 1.2-only client — use the 1.2 / legacy engine).
-/// Mirrors the server's own selection: the 1.2 engine deliberately ignores the
-/// *content* of `supported_versions` and caps at TLS 1.2, so the only question
-/// here is whether 1.3 was offered at all.
-pub(crate) fn peek_offers_tls13(buf: &[u8]) -> Result<Option<bool>, Error> {
-    let Some(ch) = peek_decode_client_hello(buf)? else {
-        return Ok(None);
-    };
-    let offers13 = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS) {
-        Some(sv) => ext::client_offers_tls13(sv)?,
-        None => false,
-    };
-    Ok(Some(offers13))
+/// Whether a decoded ClientHello offers TLS 1.3 in `supported_versions`
+/// (RFC 8446 §4.1.1 / Appendix D.1). The deferred server front end feeds a
+/// [`ClientHelloPeeker`] and dispatches on this: `true` → the 1.3 engine;
+/// `false` → a legacy 1.2-only client → the 1.2 / legacy engine. Mirrors the
+/// server's own selection: the 1.2 engine deliberately ignores the *content*
+/// of `supported_versions` and caps at TLS 1.2, so the only question is
+/// whether 1.3 was offered at all.
+pub(crate) fn client_hello_offers_tls13(ch: &ClientHello) -> Result<bool, Error> {
+    match ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS) {
+        Some(sv) => ext::client_offers_tls13(sv),
+        None => Ok(false),
+    }
 }
 
 /// Reassembles the first handshake message from the leading handshake records of
@@ -112,64 +107,98 @@ pub(crate) fn peek_offers_tls13(buf: &[u8]) -> Result<Option<bool>, Error> {
 /// handshake record or the first message isn't a ClientHello. The client's
 /// first flight is never encrypted, so no keys are involved.
 ///
-/// # Work bound
-///
-/// A version-dispatching server front end calls this on *every* `feed` until
-/// the ClientHello resolves, so the incomplete case must stay cheap. It runs
-/// in two phases: a header-only pre-scan that walks the record framing without
-/// copying anything, and — only once the buffer actually holds the whole first
-/// handshake message — a single copy of exactly that message. Copying every
-/// buffered fragment on every call instead would be quadratic in the record
-/// count: with the caller's 64 KiB peek ceiling, ~10,900 six-byte records cost
-/// on the order of 360 MB of `memcpy` for 64 KiB of input.
+/// One-shot form of [`ClientHelloPeeker`]: every call starts from offset 0, so
+/// a caller that re-invokes it on a growing buffer pays for the whole prefix
+/// each time. A front end that feeds bytes incrementally should hold a
+/// `ClientHelloPeeker` instead so each byte is scanned exactly once.
 fn peek_decode_client_hello(buf: &[u8]) -> Result<Option<ClientHello>, Error> {
-    // Phase 1 — pre-scan. Walk record headers only: total the handshake bytes
-    // buffered so far and pick the 4-byte handshake header (which may itself
-    // straddle records) out of the leading fragments.
-    let mut header = [0u8; 4];
-    let mut header_len = 0usize;
-    let mut available = 0usize;
-    let mut needed: Option<usize> = None;
-    let mut offset = 0usize;
-    loop {
-        // Not enough bytes for another full record — need more from the wire.
-        let Some(rec) = read_record(&buf[offset..])? else {
-            return Ok(None);
-        };
-        // The client's first flight is handshake records only.
-        if rec.content_type != ContentType::Handshake {
-            return Err(Error::UnexpectedMessage);
-        }
-        for &b in rec.fragment.iter().take(4 - header_len) {
-            header[header_len] = b;
-            header_len += 1;
-        }
-        available += rec.fragment.len();
-        offset += rec.len;
-        if needed.is_none() && header_len == 4 {
-            if header[0] != hs_type::CLIENT_HELLO {
+    ClientHelloPeeker::default().feed(buf)
+}
+
+/// Incremental, non-consuming reassembly of the first ClientHello out of a
+/// buffer of TLS records that grows between calls.
+///
+/// A version-dispatching server front end has to look at the ClientHello
+/// before it can pick an engine, and it sees the wire bytes in whatever
+/// segments the transport delivers. Re-parsing the whole buffer from offset 0
+/// on every segment is quadratic in the record count: with the front end's
+/// 64 KiB ceiling, a ClientHello chopped into ~10,900 six-byte records and
+/// delivered a byte at a time would cost ~3.5 × 10⁸ record-header parses.
+/// This keeps a cursor instead — [`feed`](Self::feed) resumes where the
+/// previous call stopped, so every record is parsed once and every handshake
+/// byte is copied once.
+///
+/// The caller's buffer must only ever grow by appending; the cursor indexes
+/// into it.
+#[derive(Default)]
+pub(crate) struct ClientHelloPeeker {
+    /// Bytes of the caller's buffer already parsed into complete records.
+    scanned: usize,
+    /// Handshake bytes gathered so far (never more than `needed`).
+    handshake: Vec<u8>,
+    /// Total length of the first handshake message (header included), once
+    /// its 4-byte header has been seen.
+    needed: Option<usize>,
+    /// Number of complete records parsed so far (work counter for tests).
+    #[cfg(test)]
+    records_parsed: usize,
+}
+
+impl ClientHelloPeeker {
+    /// Continues scanning `buf` from where the previous call stopped. Returns
+    /// `Ok(None)` while the first handshake message is incomplete,
+    /// `Ok(Some(ch))` once it decodes, and `Err` if the leading bytes are not
+    /// a well-formed client first flight (a non-handshake record, a
+    /// zero-length handshake fragment — RFC 8446 §5.1 — or a first message
+    /// that isn't a ClientHello).
+    pub(crate) fn feed(&mut self, buf: &[u8]) -> Result<Option<ClientHello>, Error> {
+        loop {
+            if let Some(n) = self.needed
+                && self.handshake.len() >= n
+            {
+                return Ok(Some(ClientHello::decode(&self.handshake[4..n])?));
+            }
+            // Not enough bytes for another full record — need more from the
+            // wire. `read_record` only looks at the (at most) 5-byte header
+            // in this case, so an incomplete tail costs O(1) per call.
+            let Some(rec) = read_record(&buf[self.scanned..])? else {
+                return Ok(None);
+            };
+            // The client's first flight is handshake records only.
+            if rec.content_type != ContentType::Handshake {
                 return Err(Error::UnexpectedMessage);
             }
-            let body_len =
-                ((header[1] as usize) << 16) | ((header[2] as usize) << 8) | (header[3] as usize);
-            needed = Some(4 + body_len);
-        }
-        if needed.is_some_and(|n| available >= n) {
-            break;
+            // RFC 8446 §5.1: implementations MUST NOT send zero-length
+            // handshake fragments. Accepting them would let a peer spend our
+            // per-record parse budget without ever advancing the message.
+            if rec.fragment.is_empty() {
+                return Err(Error::UnexpectedMessage);
+            }
+            #[cfg(test)]
+            {
+                self.records_parsed += 1;
+            }
+            let take = match self.needed {
+                Some(n) => core::cmp::min(rec.fragment.len(), n - self.handshake.len()),
+                None => rec.fragment.len(),
+            };
+            self.handshake.extend_from_slice(&rec.fragment[..take]);
+            self.scanned += rec.len;
+            if self.needed.is_none() && self.handshake.len() >= 4 {
+                if self.handshake[0] != hs_type::CLIENT_HELLO {
+                    return Err(Error::UnexpectedMessage);
+                }
+                let body_len = ((self.handshake[1] as usize) << 16)
+                    | ((self.handshake[2] as usize) << 8)
+                    | (self.handshake[3] as usize);
+                let needed = 4 + body_len;
+                // The record that completed the header may carry bytes of
+                // whatever follows the ClientHello; keep only the message.
+                self.handshake.truncate(needed);
+                self.needed = Some(needed);
+            }
         }
     }
-
-    // Phase 2 — the message is fully buffered; copy exactly its bytes.
-    let needed = needed.expect("the loop only breaks once `needed` is known");
-    let mut handshake: Vec<u8> = Vec::with_capacity(needed);
-    let mut offset = 0usize;
-    while handshake.len() < needed {
-        let rec = read_record(&buf[offset..])?.expect("records already validated in phase 1");
-        let take = core::cmp::min(rec.fragment.len(), needed - handshake.len());
-        handshake.extend_from_slice(&rec.fragment[..take]);
-        offset += rec.len;
-    }
-    Ok(Some(ClientHello::decode(&handshake[4..])?))
 }
 
 /// Decodes a complete ClientHello out of the accumulated handshake bytes.
@@ -304,6 +333,67 @@ mod tests {
             assert_eq!(peek_client_hello(&full[..offset]).unwrap(), None);
             offset += 11;
         }
+    }
+
+    /// TLS-CORE-5 — RFC 8446 §5.1: zero-length handshake fragments MUST NOT
+    /// be sent; a peer that emits them is only spending our parse budget.
+    #[test]
+    fn zero_length_handshake_fragment_is_rejected() {
+        let mut buf = alloc::vec![22u8, 0x03, 0x01, 0x00, 0x00];
+        buf.extend_from_slice(&records(&sample_client_hello(), 4096));
+        assert!(matches!(
+            peek_client_hello(&buf),
+            Err(Error::UnexpectedMessage)
+        ));
+        // Also mid-message, not just as the first record.
+        let mut buf = records(&sample_client_hello(), 7);
+        let cut = 5 + 7; // after the first record
+        buf.splice(cut..cut, [22u8, 0x03, 0x01, 0x00, 0x00]);
+        assert!(matches!(
+            peek_client_hello(&buf),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
+    /// TLS-CORE-5 — the incremental peeker must parse each record exactly
+    /// once no matter how the transport segments the bytes. A ClientHello
+    /// padded to a few thousand bytes, chopped into one-byte-payload records
+    /// and delivered one byte at a time used to be re-scanned from offset 0
+    /// on every byte (quadratic in the record count).
+    #[test]
+    fn incremental_peeker_parses_each_record_once() {
+        // Pad with an unknown-type extension so the message stays decodable.
+        let msg = ClientHello {
+            legacy_version: 0x0303,
+            random: [0x42u8; 32],
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite(0x1301)],
+            extensions: alloc::vec![
+                ext::server_name("example.com"),
+                (ExtensionType(0x0015), alloc::vec![0u8; 3000]),
+            ],
+        }
+        .encode();
+        let full = records(&msg, 1);
+        let record_count = msg.len();
+
+        let mut peeker = ClientHelloPeeker::default();
+        let mut buffered: Vec<u8> = Vec::new();
+        let mut resolved = None;
+        for &b in &full {
+            buffered.push(b);
+            if let Some(ch) = peeker.feed(&buffered).unwrap() {
+                resolved = Some(ch);
+                break;
+            }
+        }
+        let ch = resolved.expect("the ClientHello must resolve");
+        assert_eq!(ch.extensions.len(), 2);
+        assert_eq!(
+            peeker.records_parsed, record_count,
+            "every record is parsed exactly once"
+        );
+        assert_eq!(peeker.scanned, full.len());
     }
 
     #[test]
