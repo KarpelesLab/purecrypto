@@ -7949,6 +7949,360 @@ mod audit_regression_tests {
         );
     }
 
+    // ----- TLS-CORE-4: ticket domain separation + client-auth binding -----
+
+    /// A self-signed Ed25519 client certificate (DER) and its key.
+    fn ed25519_client_cert(seed: &[u8]) -> (Vec<u8>, crate::ec::Ed25519PrivateKey) {
+        use crate::x509::CertSigner;
+        let mut rng = HmacDrbg::<Sha256>::new(seed, b"client-key", &[]);
+        let key = crate::ec::Ed25519PrivateKey::generate(&mut rng);
+        let name = DistinguishedName::common_name("audit-client");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["audit-client"],
+        )
+        .unwrap();
+        (cert.to_der().to_vec(), key)
+    }
+
+    /// Drives a TLS 1.3 pair, surfacing the first engine error.
+    fn pump_result(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection<HmacDrbg<Sha256>>,
+    ) -> Result<(), Error> {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets()?;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets()?;
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drives a TLS 1.2 pair, surfacing the first engine error.
+    fn pump_result12(
+        client: &mut crate::tls::conn::ClientConnection12,
+        server: &mut crate::tls::conn::ServerConnection12<HmacDrbg<Sha256>>,
+    ) -> Result<(), Error> {
+        for _ in 0..16 {
+            let c = client.write_tls();
+            if !c.is_empty() {
+                server.read_tls(&c);
+                server.process_new_packets()?;
+            }
+            let s = server.write_tls();
+            if !s.is_empty() {
+                client.read_tls(&s);
+                client.process_new_packets()?;
+            }
+            if c.is_empty() && s.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// TLS-CORE-4(c) — TLS 1.3: a ticket minted by a listener that did not
+    /// authenticate the client used to resume on an mTLS-required listener
+    /// sharing the ticket key, skipping `CertificateRequest` entirely. The
+    /// ticket now records the client-auth status; an mTLS-required listener
+    /// ignores a no-auth ticket and runs a full handshake, which still
+    /// demands (and validates) the client certificate.
+    #[test]
+    fn tls13_no_auth_ticket_does_not_resume_on_mtls_required_listener() {
+        use crate::tls::ClientCertConfig;
+
+        let ticket_key = [0x4au8; 32];
+        let (client_cert_der, client_key) = ed25519_client_cert(b"core4-13");
+
+        // Phase 1: a no-auth listener issues a ticket.
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, server) = connected_pair(
+            server_config.with_ticket_key(ticket_key),
+            cert_der.clone(),
+            b"c4-13-1",
+        );
+        assert!(server.peer_certificates().is_empty());
+        let session = client.take_session().expect("ticket issued");
+
+        let mtls_server = |tag: &[u8]| {
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            let (cfg, _) = rsa_server();
+            let cfg = cfg
+                .with_ticket_key(ticket_key)
+                .with_client_auth(server_roots, true);
+            ServerConnection::new(cfg, HmacDrbg::<Sha256>::new(tag, b"s", &[]))
+        };
+        let client_with = |tag: &[u8], cc: Option<ClientCertConfig>| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der.clone()).unwrap();
+            let mut cfg = ClientConfig::new(roots).with_session(session.clone());
+            if let Some(cc) = cc {
+                cfg = cfg.with_client_cert(cc);
+            }
+            let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
+            ClientConnection::new_with_offer(
+                cfg,
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            )
+        };
+
+        // Phase 2a: the ticket on an mTLS-required listener, client has no
+        // certificate → the server ignores the ticket, asks for one, and
+        // refuses the empty Certificate.
+        let mut server2 = mtls_server(b"c4-13-2");
+        let mut client2 = client_with(b"c4-13-2", None);
+        assert!(matches!(
+            pump_result(&mut client2, &mut server2),
+            Err(Error::CertificateRequired)
+        ));
+        assert!(!server2.psk_used(), "the no-auth ticket must not resume");
+
+        // Phase 2b: same ticket, client does hold a certificate → a full,
+        // client-authenticated handshake (not a resumption).
+        let mut server3 = mtls_server(b"c4-13-3");
+        let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der.clone()], client_key);
+        let mut client3 = client_with(b"c4-13-3", Some(cc));
+        pump_result(&mut client3, &mut server3).unwrap();
+        assert!(!client3.is_handshaking() && !server3.is_handshaking());
+        assert!(!server3.psk_used() && !client3.psk_accepted());
+        assert_eq!(server3.peer_certificates(), &[client_cert_der.clone()][..]);
+    }
+
+    /// TLS-CORE-4(c) — TLS 1.3: a ticket from a client-authenticated
+    /// handshake resumes on an mTLS-required listener and restores the
+    /// client leaf into `peer_certificates()`.
+    #[test]
+    fn tls13_mtls_ticket_resumes_and_restores_peer_certificates() {
+        use crate::tls::ClientCertConfig;
+
+        let ticket_key = [0x4bu8; 32];
+        // `ed25519_client_cert` is deterministic: the same seed yields the
+        // same cert + key, so each connection gets its own config.
+        let (client_cert_der, _) = ed25519_client_cert(b"core4-13m");
+        let cc = || {
+            let (der, key) = ed25519_client_cert(b"core4-13m");
+            ClientCertConfig::with_ed25519(alloc::vec![der], key)
+        };
+        let (server_cfg, cert_der) = rsa_server();
+
+        let mtls_cfg = |cfg: ServerConfig| {
+            let mut server_roots = RootCertStore::new();
+            server_roots.add_der(client_cert_der.clone()).unwrap();
+            cfg.with_ticket_key(ticket_key)
+                .with_client_auth(server_roots, true)
+        };
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+
+        // Phase 1: mTLS handshake, ticket issued.
+        let mut crng = HmacDrbg::<Sha256>::new(b"c4-13m-1", b"c", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots).with_client_cert(cc()),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(
+            mtls_cfg(server_cfg),
+            HmacDrbg::<Sha256>::new(b"c4-13m-1", b"s", &[]),
+        );
+        pump_result(&mut client, &mut server).unwrap();
+        assert_eq!(server.peer_certificates(), &[client_cert_der.clone()][..]);
+        let session = client.take_session().expect("ticket issued");
+
+        // Phase 2: resume on another mTLS-required listener.
+        let (server_cfg2, _) = rsa_server();
+        let mut roots2 = RootCertStore::new();
+        roots2.add_der(cert_der).unwrap();
+        let mut crng2 = HmacDrbg::<Sha256>::new(b"c4-13m-2", b"c", &[]);
+        let mut client2 = ClientConnection::new_with_offer(
+            ClientConfig::new(roots2)
+                .with_client_cert(cc())
+                .with_session(session),
+            "loopback.example",
+            &mut crng2,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server2 = ServerConnection::new(
+            mtls_cfg(server_cfg2),
+            HmacDrbg::<Sha256>::new(b"c4-13m-2", b"s", &[]),
+        );
+        pump_result(&mut client2, &mut server2).unwrap();
+        assert!(server2.psk_used() && client2.psk_accepted(), "must resume");
+        assert_eq!(
+            server2.peer_certificates(),
+            &[client_cert_der][..],
+            "the issuing handshake's client identity is restored"
+        );
+    }
+
+    /// TLS 1.2 server config (RSA) with a ticket key, optionally
+    /// mTLS-required against `client_root`.
+    fn server12_cfg(
+        ticket_key: [u8; 32],
+        client_root: Option<&[u8]>,
+    ) -> (crate::tls::conn::ServerConfig12, Vec<u8>) {
+        use crate::tls::conn::ServerConfig12;
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let mut cfg =
+            ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed).with_ticket_key(ticket_key);
+        if let Some(root) = client_root {
+            let mut roots = RootCertStore::new();
+            roots.add_der(root.to_vec()).unwrap();
+            cfg = cfg.with_client_auth(roots, true);
+        }
+        (cfg, der)
+    }
+
+    /// TLS-CORE-4(c) — TLS 1.2 twin of
+    /// `tls13_no_auth_ticket_does_not_resume_on_mtls_required_listener`.
+    #[test]
+    fn tls12_no_auth_ticket_does_not_resume_on_mtls_required_listener() {
+        use crate::tls::conn::{
+            ClientCertConfig, ClientConfig12, ClientConnection12, ServerConnection12,
+        };
+
+        let ticket_key = [0x4cu8; 32];
+        let (client_cert_der, client_key) = ed25519_client_cert(b"core4-12");
+
+        // Phase 1: no-auth listener issues a ticket.
+        let (cfg, server_der) = server12_cfg(ticket_key, None);
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_der.clone()).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"c4-12-1", b"c", &[]);
+        let mut client = ClientConnection12::new_with_offer(
+            ClientConfig12::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server =
+            ServerConnection12::new(cfg, HmacDrbg::<Sha256>::new(b"c4-12-1", b"s", &[]));
+        pump_result12(&mut client, &mut server).unwrap();
+        let session = client.take_session().expect("ticket issued");
+
+        let client_with = |tag: &[u8], cc: Option<ClientCertConfig>| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_der.clone()).unwrap();
+            let mut cfg = ClientConfig12::new(roots).with_session(session.clone());
+            if let Some(cc) = cc {
+                cfg = cfg.with_client_cert(cc);
+            }
+            let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
+            ClientConnection12::new_with_offer(
+                cfg,
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            )
+        };
+
+        // Phase 2a: mTLS-required listener, client without a certificate.
+        let (cfg2, _) = server12_cfg(ticket_key, Some(&client_cert_der));
+        let mut server2 =
+            ServerConnection12::new(cfg2, HmacDrbg::<Sha256>::new(b"c4-12-2", b"s", &[]));
+        let mut client2 = client_with(b"c4-12-2", None);
+        assert!(matches!(
+            pump_result12(&mut client2, &mut server2),
+            Err(Error::CertificateRequired)
+        ));
+        assert!(!server2.did_resume(), "the no-auth ticket must not resume");
+
+        // Phase 2b: same ticket, client holds a certificate → full mTLS
+        // handshake, not a resumption.
+        let (cfg3, _) = server12_cfg(ticket_key, Some(&client_cert_der));
+        let mut server3 =
+            ServerConnection12::new(cfg3, HmacDrbg::<Sha256>::new(b"c4-12-3", b"s", &[]));
+        let cc = ClientCertConfig::with_ed25519(alloc::vec![client_cert_der.clone()], client_key);
+        let mut client3 = client_with(b"c4-12-3", Some(cc));
+        pump_result12(&mut client3, &mut server3).unwrap();
+        assert!(!server3.did_resume() && !client3.did_resume());
+        assert_eq!(server3.peer_certificates(), &[client_cert_der][..]);
+    }
+
+    /// TLS-CORE-4(c) — TLS 1.2 twin of
+    /// `tls13_mtls_ticket_resumes_and_restores_peer_certificates`.
+    #[test]
+    fn tls12_mtls_ticket_resumes_and_restores_peer_certificates() {
+        use crate::tls::conn::{
+            ClientCertConfig, ClientConfig12, ClientConnection12, ServerConnection12,
+        };
+
+        let ticket_key = [0x4du8; 32];
+        let (client_cert_der, _) = ed25519_client_cert(b"core4-12m");
+
+        let run = |tag: &[u8], session: Option<crate::tls::conn::StoredSession12>| {
+            let (cfg, server_der) = server12_cfg(ticket_key, Some(&client_cert_der));
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_der).unwrap();
+            // Deterministic: same seed → same cert + key as `client_cert_der`.
+            let (der, key) = ed25519_client_cert(b"core4-12m");
+            let cc = ClientCertConfig::with_ed25519(alloc::vec![der], key);
+            let mut ccfg = ClientConfig12::new(roots).with_client_cert(cc);
+            if let Some(s) = session {
+                ccfg = ccfg.with_session(s);
+            }
+            let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
+            let mut client = ClientConnection12::new_with_offer(
+                ccfg,
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection12::new(cfg, HmacDrbg::<Sha256>::new(tag, b"s", &[]));
+            pump_result12(&mut client, &mut server).unwrap();
+            (client, server)
+        };
+
+        let (mut client, server) = run(b"c4-12m-1", None);
+        assert!(!server.did_resume());
+        assert_eq!(server.peer_certificates(), &[client_cert_der.clone()][..]);
+        let session = client.take_session().expect("ticket issued");
+
+        let (client2, server2) = run(b"c4-12m-2", Some(session));
+        assert!(server2.did_resume() && client2.did_resume(), "must resume");
+        assert_eq!(
+            server2.peer_certificates(),
+            &[client_cert_der][..],
+            "the issuing handshake's client identity is restored"
+        );
+    }
+
     /// LOW 9 — after the client's `Finished`, 1-RTT application data must
     /// land in the regular receive buffer. Leaving the 0-RTT routing armed
     /// diverted fully-authenticated bytes into the replayable early-data

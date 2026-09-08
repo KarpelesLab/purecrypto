@@ -493,6 +493,16 @@ impl ServerConfig {
     /// Enables session resumption: the server emits one NewSessionTicket
     /// after the handshake, encrypted under this 32-byte AEAD key. Without
     /// this, the server does not emit tickets and clients cannot resume.
+    ///
+    /// Tickets are sealed with AES-256-GCM under a fresh random 96-bit nonce
+    /// and a fixed, version-specific associated-data string (so a TLS 1.2
+    /// ticket minted by [`ServerConfig12`](super::ServerConfig12) under the
+    /// same key can never be presented here, and vice versa). Random nonces
+    /// bound the key's safe lifetime: **rotate the key well before 2^32
+    /// tickets have been issued under it** (NIST SP 800-38D §8.3 — at that
+    /// point the nonce-collision probability reaches 2^-32). The ticket
+    /// records whether the issuing handshake authenticated the client;
+    /// see [`Self::with_client_auth`].
     pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
         self.ticket_key = Some(key);
         self
@@ -544,6 +554,16 @@ impl ServerConfig {
     /// a peer that sends an empty `Certificate` aborts the handshake with
     /// `certificate_required`. When `required` is false, an absent client
     /// cert is allowed.
+    ///
+    /// Interaction with resumption: a PSK handshake skips `Certificate`, so
+    /// the client's identity is whatever the *issuing* handshake
+    /// established. A ticket therefore records whether that handshake
+    /// authenticated the client (and the leaf it presented, restored via
+    /// [`ServerConnection::peer_certificates`] on resumption). With
+    /// `required == true` a ticket issued by a handshake that did **not**
+    /// authenticate the client — e.g. by another listener sharing the
+    /// ticket key — is ignored and the client is put through a full
+    /// handshake with `CertificateRequest`.
     pub fn with_client_auth(mut self, roots: crate::tls::RootCertStore, required: bool) -> Self {
         self.client_auth = Some(ClientAuthPolicy { roots, required });
         self
@@ -2255,6 +2275,11 @@ impl<R: RngCore> ServerConnection<R> {
         // are mutually exclusive here.
         self.send_encrypted_extensions();
         self.psk_used = psk_state.is_some();
+        // Resumption carries the issuing handshake's client identity
+        // forward: restore the leaf so `peer_certificates()` reflects it.
+        if let Some(leaf) = psk_state.as_ref().and_then(|s| s.client_leaf.as_ref()) {
+            self.client_cert_chain = alloc::vec![leaf.clone()];
+        }
         if psk_state.is_none() {
             if self.config.client_auth.is_some() {
                 self.send_certificate_request();
@@ -2871,25 +2896,54 @@ impl<R: RngCore> ServerConnection<R> {
         self.rng.fill_bytes(&mut age_add_bytes);
         let ticket_age_add = u32::from_be_bytes(age_add_bytes);
 
-        // ticket plaintext.
+        // ticket plaintext (see `TicketPlaintext` for the layout). The
+        // client leaf is recorded when this handshake authenticated the
+        // client so a resumed connection can (a) prove it was client-
+        // authenticated to an mTLS-required listener and (b) restore
+        // `peer_certificates()`.
         let creation = system_now_u64();
         let alpn = self.alpn_negotiated.as_ref();
         let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
-        let mut plain = Vec::with_capacity(8 + 4 + hash_len + 1 + alpn_len as usize);
+        let client_leaf = self.client_cert_chain.first();
+        let mut plain = Vec::with_capacity(
+            1 + 8
+                + 4
+                + 1
+                + hash_len
+                + 1
+                + alpn_len as usize
+                + 1
+                + 2
+                + client_leaf.map(|c| c.len()).unwrap_or(0),
+        );
+        plain.push(TICKET13_FORMAT);
         plain.extend_from_slice(&creation.to_be_bytes());
         plain.extend_from_slice(&age_add_bytes);
+        plain.push(hash_len as u8);
         plain.extend_from_slice(&psk);
         plain.push(alpn_len);
         if let Some(a) = alpn {
             plain.extend_from_slice(a);
         }
+        match client_leaf {
+            Some(leaf) if leaf.len() <= u16::MAX as usize => {
+                plain.push(1);
+                plain.extend_from_slice(&(leaf.len() as u16).to_be_bytes());
+                plain.extend_from_slice(leaf);
+            }
+            _ => plain.push(0),
+        }
 
-        // Encrypt: 12-byte GCM nonce ‖ AES-256-GCM(plain) ‖ 16-byte tag.
+        // Encrypt: 12-byte GCM nonce ‖ AES-256-GCM(plain) ‖ 16-byte tag,
+        // bound to the TLS 1.3 ticket AAD.
         let mut nonce = [0u8; 12];
         self.rng.fill_bytes(&mut nonce);
         let gcm = Gcm::new(Aes256::new(&key));
         let mut buf = plain;
-        let tag = gcm.encrypt(&nonce, &[], &mut buf);
+        let tag = gcm.encrypt(&nonce, TICKET13_AAD, &mut buf);
+        // `buf` is ciphertext now; the PSK copy lives on in `psk`, which is
+        // dropped at the end of this function — scrub it explicitly.
+        super::wipe(&mut psk);
 
         let mut ticket = Vec::with_capacity(12 + buf.len() + 16);
         ticket.extend_from_slice(&nonce);
@@ -3005,6 +3059,9 @@ struct AcceptedPsk {
     /// to replay the same early-data flight past the window.
     #[cfg_attr(not(feature = "std"), allow(dead_code))]
     selected_binder: Vec<u8>,
+    /// The client leaf certificate (DER) the issuing handshake
+    /// authenticated, when it did; restored into `peer_certificates()`.
+    client_leaf: Option<Vec<u8>>,
 }
 
 /// RFC 8446 §8.2: maximum allowed deviation, in milliseconds, between the
@@ -3053,11 +3110,23 @@ impl<R: RngCore> ServerConnection<R> {
             let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
+            // A PSK handshake skips client authentication, so it can only
+            // stand in for the identity the issuing handshake established.
+            // When this listener requires a client certificate, a ticket
+            // from a handshake that never authenticated the client (another
+            // listener sharing the key) is not usable: ignore it and run a
+            // full handshake — which will demand the certificate.
+            if self.config.client_auth.as_ref().is_some_and(|p| p.required)
+                && decrypted.client_leaf.is_none()
+            {
+                continue;
+            }
             let TicketPlaintext {
                 psk,
                 alpn,
                 creation_secs,
                 age_add,
+                client_leaf,
             } = decrypted;
             let hash = match psk.len() {
                 32 => HashAlg::Sha256,
@@ -3113,26 +3182,54 @@ impl<R: RngCore> ServerConnection<R> {
                 age_fresh,
                 age_checked: now != 0,
                 selected_binder: presented.to_vec(),
+                client_leaf,
             }));
         }
         Ok(None)
     }
 }
 
+/// Associated data every TLS 1.3 ticket is sealed under. Distinct from the
+/// TLS 1.2 value (`ticket12::TICKET12_AAD`) so the two formats are
+/// cryptographically domain-separated even though `Config::ticket_key`
+/// feeds both engines: a ticket minted by one can never authenticate under
+/// the other, regardless of how the plaintext happens to parse.
+pub(crate) const TICKET13_AAD: &[u8] = b"purecrypto tls13 ticket v1";
+/// Leading byte of the TLS 1.3 ticket plaintext: format/version tag.
+const TICKET13_FORMAT: u8 = 0x13;
+
 /// Decoded ticket payload: the original PSK plus the ALPN protocol that was
 /// negotiated on the connection that issued the ticket (empty when none was),
-/// the issuance timestamp, and the `ticket_age_add` obfuscator — the latter
-/// two feed the RFC 8446 §8.2 ticket-age freshness check on 0-RTT.
+/// the issuance timestamp, the `ticket_age_add` obfuscator — the latter two
+/// feed the RFC 8446 §8.2 ticket-age freshness check on 0-RTT — and the
+/// client leaf certificate when the issuing handshake authenticated the
+/// client.
+///
+/// Plaintext layout (v1):
+///
+/// ```text
+/// format          u8      // TICKET13_FORMAT
+/// creation_time   u64     // unix seconds (server clock at issuance)
+/// ticket_age_add  u32
+/// psk_len         u8
+/// psk             psk_len bytes
+/// alpn_len        u8
+/// alpn            alpn_len bytes
+/// client_auth     u8      // 1 if the issuing handshake authenticated the client
+/// leaf_len        u16     // present iff client_auth == 1
+/// leaf            leaf_len bytes (DER)
+/// ```
 struct TicketPlaintext {
     psk: Vec<u8>,
     alpn: Vec<u8>,
     creation_secs: u64,
     age_add: u32,
+    client_leaf: Option<Vec<u8>>,
 }
 
 /// Decrypts a ticket bound to `key`. The wire layout is `nonce(12) ‖
-/// ciphertext ‖ tag(16)`, with `cleartext = creation_u64 ‖ age_add_u32 ‖
-/// psk(hash_len) ‖ alpn_len_u8 ‖ alpn`. Returns `None` on any structural or
+/// ciphertext ‖ tag(16)` sealed under [`TICKET13_AAD`], with the cleartext
+/// described on [`TicketPlaintext`]. Returns `None` on any structural or
 /// authentication failure.
 ///
 /// RFC 8446 §4.6.1 + §8.1: when `now_secs > 0`, the embedded
@@ -3158,16 +3255,16 @@ fn decrypt_ticket(
     let tag: &[u8; 16] = tag_slice.try_into().ok()?;
     let mut buf = ct.to_vec();
     let gcm = Gcm::new(Aes256::new(key));
-    if gcm.decrypt(nonce, &[], &mut buf, tag).is_err() {
+    if gcm.decrypt(nonce, TICKET13_AAD, &mut buf, tag).is_err() {
         return None;
     }
-    // Parse plaintext: 8-byte creation timestamp + 4-byte ticket_age_add +
-    // psk + alpn_len + alpn.
-    if buf.len() < 8 + 4 + 1 {
+    // Parse the plaintext (layout on `TicketPlaintext`).
+    let mut c = crate::tls::codec::ReadCursor::new(&buf);
+    if c.u8().ok()? != TICKET13_FORMAT {
         return None;
     }
-    let creation_secs = u64::from_be_bytes(buf[..8].try_into().ok()?);
-    let age_add = u32::from_be_bytes(buf[8..12].try_into().ok()?);
+    let creation_secs = c.u64().ok()?;
+    let age_add = c.u32().ok()?;
     // RFC 8446 §4.6.1 + §8.1: enforce ticket age. Skip the check when the
     // server has no wall clock (`now_secs == 0`, matching the TLS 1.2
     // fallback in `server12.rs::try_resume`) or when the lifetime is
@@ -3185,30 +3282,22 @@ fn decrypt_ticket(
             return None;
         }
     }
-    let rest = &buf[12..];
-    // PSK length: derived by total - 12 (creation + age_add) - 1 (alpn_len)
-    // - alpn_len. PSK length is either 32 or 48; alpn_len is the last layout
-    // field, so:
-    //   psk = rest[..psk_len]; alpn_len = rest[psk_len]; alpn = rest[psk_len+1..].
-    // We try 32 first, then 48. Either is uniquely identified by checking
-    // the length field's plausibility.
-    for &psk_len in &[32usize, 48usize] {
-        if rest.len() < psk_len + 1 {
-            continue;
-        }
-        let alpn_len = rest[psk_len] as usize;
-        if rest.len() == psk_len + 1 + alpn_len {
-            let psk = rest[..psk_len].to_vec();
-            let alpn = rest[psk_len + 1..].to_vec();
-            return Some(TicketPlaintext {
-                psk,
-                alpn,
-                creation_secs,
-                age_add,
-            });
-        }
-    }
-    None
+    let psk = c.vec_u8().ok()?.to_vec();
+    let alpn = c.vec_u8().ok()?.to_vec();
+    let client_leaf = match c.u8().ok()? {
+        0 => None,
+        1 => Some(c.vec_u16().ok()?.to_vec()),
+        _ => return None,
+    };
+    c.expect_empty().ok()?;
+    super::wipe(&mut buf);
+    Some(TicketPlaintext {
+        psk,
+        alpn,
+        creation_secs,
+        age_add,
+        client_leaf,
+    })
 }
 
 /// Maps an internal error to the alert to send the peer.
@@ -3320,22 +3409,66 @@ mod tests {
     /// a zero `ticket_age_add` and a 32-byte PSK; matches the layout emitted
     /// by `emit_session_ticket`.
     fn synth_ticket(key: &[u8; 32], creation_secs: u64, alpn: &[u8]) -> Vec<u8> {
+        synth_ticket_with_aad(key, creation_secs, alpn, super::TICKET13_AAD)
+    }
+
+    fn synth_ticket_with_aad(
+        key: &[u8; 32],
+        creation_secs: u64,
+        alpn: &[u8],
+        aad: &[u8],
+    ) -> Vec<u8> {
         use crate::cipher::{Aes256, Gcm};
-        let mut plain = Vec::with_capacity(8 + 4 + 32 + 1 + alpn.len());
+        let mut plain = Vec::with_capacity(1 + 8 + 4 + 1 + 32 + 1 + alpn.len() + 1);
+        plain.push(super::TICKET13_FORMAT);
         plain.extend_from_slice(&creation_secs.to_be_bytes());
         plain.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
+        plain.push(32);
         plain.extend_from_slice(&[0xABu8; 32]); // 32-byte PSK
         plain.push(alpn.len() as u8);
         plain.extend_from_slice(alpn);
+        plain.push(0); // not client-authenticated
         let nonce = [0x42u8; 12];
         let gcm = Gcm::new(Aes256::new(key));
         let mut buf = plain;
-        let tag = gcm.encrypt(&nonce, &[], &mut buf);
+        let tag = gcm.encrypt(&nonce, aad, &mut buf);
         let mut wire = Vec::with_capacity(12 + buf.len() + 16);
         wire.extend_from_slice(&nonce);
         wire.extend_from_slice(&buf);
         wire.extend_from_slice(&tag);
         wire
+    }
+
+    /// TLS-CORE-4 — tickets are domain-separated by version and format:
+    /// a TLS 1.2 ticket sealed under the same key (or a pre-v1 ticket sealed
+    /// with empty AAD) must not decrypt as a TLS 1.3 ticket, however its
+    /// plaintext happens to parse.
+    #[test]
+    fn decrypt_ticket_rejects_cross_format_and_legacy_tickets() {
+        let key = [0x5au8; 32];
+        let now = super::system_now_u64();
+        assert!(super::decrypt_ticket(&key, &synth_ticket(&key, now, b""), now, 0).is_some());
+
+        // Same plaintext, sealed under the TLS 1.2 AAD.
+        let t12 = synth_ticket_with_aad(&key, now, b"", super::super::ticket12::TICKET12_AAD);
+        assert!(super::decrypt_ticket(&key, &t12, now, 0).is_none());
+        // ... and under the empty AAD older builds used.
+        let legacy = synth_ticket_with_aad(&key, now, b"", &[]);
+        assert!(super::decrypt_ticket(&key, &legacy, now, 0).is_none());
+
+        // A real TLS 1.2 ticket (its own plaintext layout) under the same key.
+        let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"xfmt", b"nonce", &[]);
+        let plain12 = super::super::ticket12::Ticket12Plaintext {
+            cipher_suite: 0xC02F,
+            master_secret: [0x11; 48],
+            creation_time: now,
+            ems_used: true,
+            alpn: None,
+            client_leaf: None,
+        }
+        .encode();
+        let real12 = super::super::ticket12::seal_ticket(&mut rng, &key, &plain12);
+        assert!(super::decrypt_ticket(&key, &real12, now, 0).is_none());
     }
 
     /// E-2 (HIGH #7) — RFC 8446 §4.6.1 + §8.1: `decrypt_ticket` MUST reject

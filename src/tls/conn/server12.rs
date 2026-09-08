@@ -275,6 +275,16 @@ impl ServerConfig12 {
     /// `required` is `true`, a peer that presents an empty `Certificate`
     /// aborts the handshake with `certificate_required`. When `false`, an
     /// absent client cert is allowed.
+    ///
+    /// Interaction with resumption: an abbreviated (RFC 5077) handshake
+    /// performs no client authentication, so the peer's identity is whatever
+    /// the *issuing* handshake established. Tickets record whether that
+    /// handshake authenticated the client (and the leaf it presented, restored
+    /// via [`ServerConnection12::peer_certificates`] on resumption). With
+    /// `required == true` a ticket issued by a handshake that did **not**
+    /// authenticate the client — e.g. by another listener sharing the ticket
+    /// key — is ignored and the client is put through a full handshake with
+    /// `CertificateRequest`.
     pub fn with_client_auth(mut self, roots: RootCertStore, required: bool) -> Self {
         self.client_auth = Some(ClientAuthPolicy12 { roots, required });
         self
@@ -285,6 +295,15 @@ impl ServerConfig12 {
     /// AES-256-GCM key) and decrypts client-presented tickets to resume.
     /// Without this, the server does not emit tickets and clients cannot
     /// resume.
+    ///
+    /// Tickets are sealed under a fresh random 96-bit nonce and a fixed,
+    /// version-specific associated-data string (a TLS 1.3 ticket minted by
+    /// [`ServerConfig`](super::ServerConfig) under the same key can never be
+    /// presented here, and vice versa). Random nonces bound the key's safe
+    /// lifetime: **rotate the key well before 2^32 tickets have been issued
+    /// under it** (NIST SP 800-38D §8.3). The ticket records whether the
+    /// issuing handshake authenticated the client; see
+    /// [`Self::with_client_auth`].
     pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
         self.ticket_key = Some(key);
         self
@@ -1172,6 +1191,9 @@ impl<R: RngCore> ServerConnection12<R> {
             self.server_random = Some(server_random);
             self.master = Some(rs.master_secret);
             self.resumed = true;
+            // Resumption carries the issuing handshake's client identity
+            // forward: restore the leaf so `peer_certificates()` reflects it.
+            self.client_cert_chain = rs.client_leaf.iter().cloned().collect();
 
             if let Some(kl) = self.config.key_log.as_ref() {
                 kl.log("CLIENT_RANDOM", &ch.random, &rs.master_secret);
@@ -1679,6 +1701,17 @@ impl<R: RngCore> ServerConnection12<R> {
         // as soon as the structured copy exists (or the parse failed).
         super::wipe(&mut plain);
         let parsed = parsed?;
+        // An abbreviated handshake performs no client authentication, so it
+        // can only stand in for the identity the issuing handshake
+        // established. When this listener requires a client certificate, a
+        // ticket from a handshake that never authenticated the client
+        // (another listener sharing the key) is not usable: ignore it and
+        // run a full handshake — which will demand the certificate.
+        if self.config.client_auth.as_ref().is_some_and(|p| p.required)
+            && parsed.client_leaf.is_none()
+        {
+            return None;
+        }
         let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
         // The resumed suite MUST be one the client is still offering.
         if !offered.contains(&suite_code) {
@@ -1708,6 +1741,7 @@ impl<R: RngCore> ServerConnection12<R> {
             suite,
             master_secret: parsed.master_secret,
             ems_used: parsed.ems_used,
+            client_leaf: parsed.client_leaf.clone(),
         })
     }
 
@@ -2245,6 +2279,10 @@ impl<R: RngCore> ServerConnection12<R> {
             // enforce that EMS↔EMS and legacy↔legacy.
             ems_used: self.ems_negotiated,
             alpn: self.alpn_negotiated.clone(),
+            // Record the authenticated client leaf (if any) so a resumed
+            // handshake can prove it was client-authenticated and restore
+            // `peer_certificates()`.
+            client_leaf: self.client_cert_chain.first().cloned(),
         };
         // `encode()` serialises the master secret into a transient buffer;
         // scrub it once the AEAD-sealed ticket has been produced. (`plain`
@@ -2273,6 +2311,8 @@ struct ResumedState {
     /// RFC 7627 §5.3 — whether the originating session used Extended
     /// Master Secret. The resumed handshake's EMS negotiation MUST match.
     ems_used: bool,
+    /// The client leaf the issuing handshake authenticated, if any.
+    client_leaf: Option<Vec<u8>>,
 }
 
 // Carries the recovered master secret between ticket decryption and the

@@ -67,6 +67,13 @@ impl<'a> ReadCursor<'a> {
         Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
     }
 
+    pub(crate) fn u64(&mut self) -> Result<u64, Error> {
+        let b = self.take(8)?;
+        Ok(u64::from_be_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
     pub(crate) fn u24(&mut self) -> Result<usize, Error> {
         let b = self.take(3)?;
         Ok(((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize)

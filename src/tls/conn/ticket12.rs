@@ -11,13 +11,22 @@
 //! ticket itself is opaque to the peer):
 //!
 //! ```text
+//! format            u8         // TICKET12_FORMAT
 //! cipher_suite      u16
 //! master_secret     48 bytes
 //! creation_time     u64        // unix seconds (server clock at issuance)
 //! ems_used          u8         // 1 if EMS was negotiated, 0 otherwise (RFC 7627 §5.3)
 //! alpn_len          u8         // 0 if no ALPN negotiated
 //! alpn_bytes        alpn_len bytes
+//! client_auth       u8         // 1 if the issuing handshake authenticated the client
+//! leaf_len          u16        // present iff client_auth == 1
+//! leaf              leaf_len bytes (client leaf certificate, DER)
 //! ```
+//!
+//! The AEAD is bound to [`TICKET12_AAD`]: the TLS 1.3 engine seals its
+//! tickets under a different string, so a ticket from one engine can never
+//! authenticate under the other even when both are keyed from the same
+//! `Config::ticket_key`.
 //!
 //! Tickets have a server-configured lifetime; on decrypt we reject any whose
 //! `(now - creation_time) > lifetime` (server-side, with the server's
@@ -37,9 +46,14 @@ use alloc::vec::Vec;
 const NONCE_LEN: usize = 12;
 /// AES-256-GCM authentication tag length.
 const TAG_LEN: usize = 16;
-/// Minimum plaintext: 2 (suite) + 48 (master) + 8 (creation) + 1 (ems_used)
-/// + 1 (alpn_len).
-const MIN_PLAIN_LEN: usize = 2 + 48 + 8 + 1 + 1;
+/// Associated data every TLS 1.2 ticket is sealed under (see the module
+/// docs; the TLS 1.3 counterpart is `server::TICKET13_AAD`).
+pub(crate) const TICKET12_AAD: &[u8] = b"purecrypto tls12 ticket v1";
+/// Leading byte of the ticket plaintext: format/version tag.
+const TICKET12_FORMAT: u8 = 0x12;
+/// Minimum plaintext: 1 (format) + 2 (suite) + 48 (master) + 8 (creation)
+/// + 1 (ems_used) + 1 (alpn_len) + 1 (client_auth).
+const MIN_PLAIN_LEN: usize = 1 + 2 + 48 + 8 + 1 + 1 + 1;
 
 /// The TLS 1.2 ticket payload — what the server learns when it decrypts a
 /// returning client's ticket. `Debug` redacts the master secret.
@@ -65,6 +79,12 @@ pub(crate) struct Ticket12Plaintext {
     /// client re-offers ALPN in its CH and the server re-picks), but we keep
     /// it around for visibility and future cross-checks.
     pub(crate) alpn: Option<Vec<u8>>,
+    /// The client leaf certificate (DER) the issuing handshake
+    /// authenticated, when it did. A resumed handshake performs no client
+    /// authentication of its own, so this is the only record of who the
+    /// peer is: an mTLS-required listener refuses to resume without it, and
+    /// it is restored into `peer_certificates()` on resumption.
+    pub(crate) client_leaf: Option<Vec<u8>>,
 }
 
 impl core::fmt::Debug for Ticket12Plaintext {
@@ -75,6 +95,7 @@ impl core::fmt::Debug for Ticket12Plaintext {
             .field("creation_time", &self.creation_time)
             .field("ems_used", &self.ems_used)
             .field("alpn", &self.alpn)
+            .field("client_authenticated", &self.client_leaf.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -92,61 +113,86 @@ impl Ticket12Plaintext {
     /// Serialises the plaintext layout described in the module docs.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let alpn = self.alpn.as_deref().unwrap_or(&[]);
-        let mut out = Vec::with_capacity(MIN_PLAIN_LEN + alpn.len());
+        let leaf = self
+            .client_leaf
+            .as_deref()
+            .filter(|l| l.len() <= u16::MAX as usize);
+        let mut out =
+            Vec::with_capacity(MIN_PLAIN_LEN + alpn.len() + 2 + leaf.map_or(0, |l| l.len()));
+        out.push(TICKET12_FORMAT);
         out.extend_from_slice(&self.cipher_suite.to_be_bytes());
         out.extend_from_slice(&self.master_secret);
         out.extend_from_slice(&self.creation_time.to_be_bytes());
         out.push(if self.ems_used { 1 } else { 0 });
         out.push(alpn.len() as u8);
         out.extend_from_slice(alpn);
+        match leaf {
+            Some(l) => {
+                out.push(1);
+                out.extend_from_slice(&(l.len() as u16).to_be_bytes());
+                out.extend_from_slice(l);
+            }
+            None => out.push(0),
+        }
         out
     }
 
     /// Deserialises a plaintext buffer produced by `encode`. Returns `None`
-    /// on any structural inconsistency (length mismatch, oversized alpn).
+    /// on any structural inconsistency (wrong format tag, length mismatch,
+    /// oversized alpn, trailing bytes).
     pub(crate) fn decode(buf: &[u8]) -> Option<Self> {
         if buf.len() < MIN_PLAIN_LEN {
             return None;
         }
-        let cipher_suite = u16::from_be_bytes([buf[0], buf[1]]);
+        let mut c = crate::tls::codec::ReadCursor::new(buf);
+        if c.u8().ok()? != TICKET12_FORMAT {
+            return None;
+        }
+        let cipher_suite = c.u16().ok()?;
         let mut master_secret = [0u8; 48];
-        master_secret.copy_from_slice(&buf[2..50]);
-        let creation_time = u64::from_be_bytes([
-            buf[50], buf[51], buf[52], buf[53], buf[54], buf[55], buf[56], buf[57],
-        ]);
-        let ems_used = match buf[58] {
+        master_secret.copy_from_slice(c.take(48).ok()?);
+        let creation_time = c.u64().ok()?;
+        let ems_used = match c.u8().ok()? {
             0 => false,
             1 => true,
             // Reject other values; ems_used is a strict bool on the wire.
             _ => return None,
         };
-        let alpn_len = buf[59] as usize;
-        if buf.len() != MIN_PLAIN_LEN + alpn_len {
-            return None;
-        }
-        let alpn = if alpn_len == 0 {
+        let alpn = c.vec_u8().ok()?;
+        let alpn = if alpn.is_empty() {
             None
         } else {
-            Some(buf[60..60 + alpn_len].to_vec())
+            Some(alpn.to_vec())
         };
+        let client_leaf = match c.u8().ok()? {
+            0 => None,
+            1 => Some(c.vec_u16().ok()?.to_vec()),
+            _ => return None,
+        };
+        c.expect_empty().ok()?;
         Some(Ticket12Plaintext {
             cipher_suite,
             master_secret,
             creation_time,
             ems_used,
             alpn,
+            client_leaf,
         })
     }
 }
 
-/// Encrypts `plain` under `key` with a fresh random nonce. The on-wire layout
-/// is `nonce(12) ‖ ciphertext ‖ tag(16)`.
+/// Encrypts `plain` under `key` with a fresh random nonce, bound to
+/// [`TICKET12_AAD`]. The on-wire layout is `nonce(12) ‖ ciphertext ‖ tag(16)`.
+///
+/// Random 96-bit nonces bound the key's lifetime: the caller must rotate
+/// `key` well before 2^32 tickets have been sealed under it (NIST SP
+/// 800-38D §8.3).
 pub(crate) fn seal_ticket<R: RngCore>(rng: &mut R, key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
     let mut nonce = [0u8; NONCE_LEN];
     rng.fill_bytes(&mut nonce);
     let gcm = Gcm::new(Aes256::new(key));
     let mut buf = plain.to_vec();
-    let tag = gcm.encrypt(&nonce, &[], &mut buf);
+    let tag = gcm.encrypt(&nonce, TICKET12_AAD, &mut buf);
     let mut ticket = Vec::with_capacity(NONCE_LEN + buf.len() + TAG_LEN);
     ticket.extend_from_slice(&nonce);
     ticket.extend_from_slice(&buf);
@@ -166,7 +212,7 @@ pub(crate) fn open_ticket(key: &[u8; 32], ticket: &[u8]) -> Option<Vec<u8>> {
     let tag: &[u8; TAG_LEN] = tag_slice.try_into().ok()?;
     let mut buf = ct.to_vec();
     let gcm = Gcm::new(Aes256::new(key));
-    gcm.decrypt(nonce, &[], &mut buf, tag).ok()?;
+    gcm.decrypt(nonce, TICKET12_AAD, &mut buf, tag).ok()?;
     Some(buf)
 }
 
@@ -184,6 +230,7 @@ mod tests {
             creation_time: 0x1122334455667788,
             ems_used: true,
             alpn: None,
+            client_leaf: None,
         };
         let buf = p.encode();
         let dec = Ticket12Plaintext::decode(&buf).unwrap();
@@ -202,12 +249,14 @@ mod tests {
             creation_time: 1_700_000_000,
             ems_used: false,
             alpn: Some(b"h2".to_vec()),
+            client_leaf: Some(alloc::vec![0x30u8; 40]),
         };
         let buf = p.encode();
         let dec = Ticket12Plaintext::decode(&buf).unwrap();
         assert_eq!(dec.cipher_suite, p.cipher_suite);
         assert!(!dec.ems_used);
         assert_eq!(dec.alpn.as_deref(), Some(b"h2".as_ref()));
+        assert_eq!(dec.client_leaf.as_deref(), Some([0x30u8; 40].as_ref()));
     }
 
     #[test]
@@ -225,10 +274,58 @@ mod tests {
             creation_time: 1,
             ems_used: false,
             alpn: None,
+            client_leaf: None,
         };
         let mut buf = p.encode();
-        buf[58] = 2; // illegal ems_used value
+        buf[59] = 2; // illegal ems_used value
         assert!(Ticket12Plaintext::decode(&buf).is_none());
+    }
+
+    /// TLS-CORE-4 — the format tag, the client_auth flag and the exact
+    /// length are all enforced; a ticket from a TLS 1.3 server (different
+    /// AAD) never opens.
+    #[test]
+    fn decode_rejects_bad_format_flag_and_trailing_bytes() {
+        let p = Ticket12Plaintext {
+            cipher_suite: 0xC02F,
+            master_secret: [0x11; 48],
+            creation_time: 1,
+            ems_used: false,
+            alpn: None,
+            client_leaf: None,
+        };
+        let good = p.encode();
+        assert!(Ticket12Plaintext::decode(&good).is_some());
+        let mut bad = good.clone();
+        bad[0] = 0x13; // the TLS 1.3 tag
+        assert!(Ticket12Plaintext::decode(&bad).is_none());
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() = 2; // client_auth must be 0/1
+        assert!(Ticket12Plaintext::decode(&bad).is_none());
+        let mut bad = good.clone();
+        bad.push(0); // trailing byte
+        assert!(Ticket12Plaintext::decode(&bad).is_none());
+    }
+
+    #[test]
+    fn open_ticket_rejects_tls13_aad() {
+        use crate::cipher::{Aes256, Gcm};
+        let key = [0x42u8; 32];
+        let nonce = [7u8; 12];
+        let gcm = Gcm::new(Aes256::new(&key));
+        let mut buf = b"payload".to_vec();
+        let tag = gcm.encrypt(&nonce, super::super::server::TICKET13_AAD, &mut buf);
+        let mut ticket = nonce.to_vec();
+        ticket.extend_from_slice(&buf);
+        ticket.extend_from_slice(&tag);
+        assert!(open_ticket(&key, &ticket).is_none());
+        // And the pre-v1 empty AAD.
+        let mut buf = b"payload".to_vec();
+        let tag = gcm.encrypt(&nonce, &[], &mut buf);
+        let mut ticket = nonce.to_vec();
+        ticket.extend_from_slice(&buf);
+        ticket.extend_from_slice(&tag);
+        assert!(open_ticket(&key, &ticket).is_none());
     }
 
     #[test]
