@@ -5,159 +5,197 @@
 [![docs.rs](https://img.shields.io/docsrs/purecrypto)](https://docs.rs/purecrypto)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A cryptography toolkit written **entirely in Rust**, depending on no foreign
-code. `purecrypto` is built from the ground up — starting at constant-time
-primitives and working up through hashing, ciphers, bignum arithmetic, the
-classical and post-quantum asymmetric stacks, ASN.1, X.509 and TLS — and is
-usable three ways:
+A cryptography toolkit written **entirely in Rust**, with no foreign code.
+It is built from the ground up, from constant-time primitives through
+hashing, ciphers, bignum arithmetic, the classical and post-quantum
+asymmetric stacks, ASN.1, X.509, TLS, DTLS and QUIC, and it is usable three
+ways:
 
-- as a **Rust library**,
-- as a **C library** (`cdylib` with a C ABI), and
-- as a **standalone command-line tool** (`purecrypto`: hashing, randomness, key
-  generation including PQ, CSRs, a small CA, TLS / DTLS / QUIC test clients
-  and servers, …).
+- as a **Rust library** (`no_std` core, every layer feature-gated),
+- as a **C library** (`cdylib` / `staticlib` with a C ABI, also compiled to
+  WebAssembly), and
+- as a **command-line tool** (`purecrypto`: hashing, key generation
+  including post-quantum, CSRs, a small CA, TLS / DTLS / QUIC test clients
+  and servers).
 
-It's a **modular** toolkit with OpenSSL-like breadth — but unlike a monolithic
-binary dependency, every algorithm and protocol layer is feature-gated (over a
-`#![no_std]` core), so an application compiles in only the parts it needs.
+It has OpenSSL-like breadth, but unlike a monolithic binary dependency an
+application compiles in only the parts it needs.
+
+## Quick start
+
+Rust:
+
+```rust
+use purecrypto::hash::{Digest, Sha256};
+use purecrypto::ec::Ed25519PrivateKey;
+use purecrypto::mlkem::MlKem768DecapsKey;
+use purecrypto::rng::OsRng;
+
+let digest = Sha256::digest(b"abc");
+
+let sk = Ed25519PrivateKey::generate(&mut OsRng);
+let sig = sk.sign(b"hello");
+sk.public_key().verify(b"hello", &sig).unwrap();
+
+let (dk, ek) = MlKem768DecapsKey::generate(&mut OsRng);
+let (ct, ss_a) = ek.encapsulate(&mut OsRng);
+assert_eq!(dk.decapsulate(&ct), ss_a);
+```
+
+A TLS client that verifies against the embedded root store:
+
+```rust,no_run
+use purecrypto::rng::OsRng;
+use purecrypto::tls::{Config, Connection, RootCertStore};
+use std::sync::Arc;
+
+let cfg = Config::builder()
+    .tls_only()
+    .rng(Arc::new(OsRng))                 // no default: the entropy source is explicit
+    .roots(RootCertStore::with_embedded_roots())
+    .server_name("example.com")
+    .alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
+    .build();
+let mut conn = Connection::client(&cfg).unwrap();
+// Sans-I/O: pop wire bytes from `conn` and send them, feed received bytes
+// back. `tls::Stream` wraps this for blocking TCP; `tokio` / `mio` adapters
+// are behind features of the same name.
+```
+
+Command line:
+
+```sh
+cargo install purecrypto
+purecrypto hash sha256 file.txt
+purecrypto genpkey -algorithm ML-DSA-65 -out mldsa.pem
+purecrypto s_client -connect example.com:443 -alpn h2
+```
+
+C:
+
+```sh
+cargo rustc --lib --release --features ffi --crate-type staticlib
+cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
+```
 
 ## Documentation
 
-- **[Security policy](SECURITY.md)** — how to report a vulnerability; assurance status.
-- **[Validation & assurance matrix](docs/validation.md)** — per module: test
-  vectors, interop targets, fuzzing, negative-input coverage, constant-time
-  posture, known limitations.
-- **[Recommended usage](docs/recommended-usage.md)** — the opinionated *safe
-  path*: blessed defaults vs. compatibility-only vs. hazmat.
-- **[Threat model](docs/threat-model.md)** — what is and isn't defended against.
-- **[Benchmarks](docs/benchmarks.md)** — real per-algorithm numbers + the
-  constant-time tradeoffs behind them.
+- **[Command-line reference](docs/cli.md)**: every subcommand, with a
+  cookbook (CA setup, mTLS, PQC keys, password-based encryption).
+- **[Signature registry and policy](docs/signature-registry.md)**: which
+  signature algorithms X.509 and TLS verifiers accept, and how to change it.
+- **[Recommended usage](docs/recommended-usage.md)**: the opinionated safe
+  path, blessed defaults versus compatibility-only versus hazmat.
+- **[Validation and assurance matrix](docs/validation.md)**: per module,
+  test vectors, interop targets, fuzzing, negative-input coverage,
+  constant-time posture, known limitations.
+- **[Threat model](docs/threat-model.md)**: what is and is not defended
+  against.
+- **[Benchmarks](docs/benchmarks.md)**: per-algorithm numbers and the
+  constant-time trade-offs behind them.
+- **[Security policy](SECURITY.md)**: how to report a vulnerability, and the
+  audit status.
+- **[Demo site](https://karpeleslab.github.io/purecrypto/)**: the real
+  library running in the browser through the C ABI compiled to WebAssembly
+  (source in [`web/`](web/)).
+- **[API reference](https://docs.rs/purecrypto)** on docs.rs.
 
 ## Design principles
 
-- **No foreign code.** No C, no assembly pulled from other libraries, and no
-  third-party crypto crates. Everything is implemented here, in Rust.
+- **No foreign code.** No C, no assembly borrowed from other libraries, no
+  third-party crypto crates. Everything is implemented here, in Rust. The
+  only dependencies are two sibling pure-Rust `no_std` crates under the
+  same maintainership, `compcol` (the zlib codec for RFC 8879 certificate
+  compression) and `cacrt` (the embedded root bundle), plus the optional
+  `tokio` / `mio` I/O adapters.
 - **Constant time by default.** Secret-dependent values flow through the
-  [`ct`](src/ct) layer (branchless equality, selection, ordering) so higher
-  layers avoid timing side channels. Where an algorithm is intrinsically
-  non-constant-time (RSA keygen, modular inverse), it's used only on
-  one-time/key-generation paths and documented as such.
-- **`no_std` core.** The crate is `#![no_std]`; `alloc` and `std` are opt-in
-  features (`std` is the default and implies `alloc`).
-- **Validated.** Where a standard publishes test vectors we run them — RFC
-  8439, RFC 8032, RFC 8448, FIPS 203/204/205 ACVP — and cross-check the X.509
-  / TLS / PQC stacks against OpenSSL 3.5.
+  [`ct`](src/ct) layer (branchless equality, selection, ordering). Where an
+  algorithm is intrinsically variable-time (RSA key generation, the
+  extended-Euclid inverse), it is used only on one-time or key-generation
+  paths and documented as such.
+- **`no_std` core.** The crate is `#![no_std]`; `alloc` and `std` are
+  opt-in features (`std` is the default and implies `alloc`). Most
+  primitives, and the fixed-curve half of `ec`, need no allocator at all.
+- **Validated.** Where a standard publishes test vectors they run in CI
+  (RFC 8439, RFC 8032, RFC 8448, FIPS 203/204/205 ACVP, BIP340, and more),
+  and the X.509, TLS and PQC stacks are cross-checked against OpenSSL 3.5.
+  See [docs/validation.md](docs/validation.md).
 
-## Layout
+## What is inside
 
-Single crate, modules gated by Cargo features:
+Single crate, one Cargo feature per module. Details, test-vector sources and
+known limitations for each row live in [docs/validation.md](docs/validation.md).
 
-| Layer            | Module      | Status |
-| ---------------- | ----------- | ------ |
-| Constant-time    | `ct`        | implemented |
-| Hashing          | `hash`      | SHA-2, SHA-3 + Keccak-256, SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash, TurboSHAKE/KangarooTwelve/MarsupilamiFourteen, BLAKE2b/2s (+keyed/X), BLAKE3, SM3, Whirlpool (ISO/IEC 10118-3), Streebog-256/512 (GOST R 34.11-2012), MD2/MD4/MD5/SHA-1/RIPEMD-160; HMAC + `Mac` trait (constant-time verify, drop-zeroizing). Ascon-Hash256/XOF128/CXOF128 live in `ascon` |
-| Randomness       | `rng`       | RngCore/CryptoRng, HMAC-DRBG (NIST SP 800-90A), OsRng (Unix + Windows) |
-| Symmetric cipher | `cipher`    | AES-128/192/256 (constant-time, table-free); SM4 (GB/T 32907, constant-time, table-free); CBC/CFB/OFB/CTR; GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AEGIS-128L/256, AES-GCM-SIV (RFC 8452) and AES-SIV (RFC 5297, nonce-misuse-resistant) (AEAD); XTS (disk encryption); AES-KW + AES-KWP (RFC 3394 / 5649); DES + 3-DES (EDE3 / EDE2) with `Cbc64` for legacy interop. Ascon-AEAD128 lives in `ascon`, AEZ v5 (robust AE) in `aez` |
-| MAC              | `mac`       | AES-CMAC (RFC 4493); GMAC (NIST SP 800-38D); UMAC-64 / UMAC-128 (RFC 4418); HMAC lives in `hash` |
-| Bignum (CT)      | `bignum`    | `Uint<LIMBS>` and runtime-sized `BoxedUint`, widening mul, Montgomery modular arith, modexp, Fermat & extended-Euclid inverse |
-| Asymmetric keys  | `rsa`       | RSA keygen (compile-time + runtime, 512–65536 bits), raw, PKCS#1 v1.5 enc/sign, OAEP enc, PSS sign/verify, PKCS#1 DER/PEM |
-| Key derivation   | `kdf`       | PBKDF2, HKDF, scrypt (RFC 7914), Argon2id/2d/2i (RFC 9106), SP 800-108 KBKDF (counter + feedback, HMAC/CMAC PRF) |
-| Elliptic curve   | `ec`        | ECDSA/ECDH on P-256/P-384/P-521/secp256k1 (runtime multi-curve) + fast const-generic P-256, X25519, Ed25519 (EdDSA, RFC 8032), X448 (RFC 7748), Ed448 (EdDSA, RFC 8032), SM2 signature + encryption (GB/T 32918 / RFC 8998) |
-| Prime-order group | `ristretto255` | ristretto255 (RFC 9496), a stable prime-order group API; low-level scalar/point arithmetic for threshold/FROST callers also exposed via `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` (**no semver guarantee** on `hazmat-*`) |
-| Post-quantum KEM | `mlkem`     | ML-KEM-512 / 768 / 1024 (FIPS 203), `no_std`/no-alloc; OpenSSL-interop on -768 |
-| Post-quantum sig | `mldsa`     | ML-DSA-44/65/87 (FIPS 204); hedged + deterministic; FIPS 204 ACVP + OpenSSL-interop |
-| Post-quantum sig | `slhdsa`    | SLH-DSA, all 12 sets (FIPS 205, SHA-2/SHAKE × 128/192/256 × s/f); FIPS 205 ACVP + OpenSSL-interop |
-| Stateful HBS     | `lms`       | LMS / HSS (RFC 8554, NIST SP 800-208); LM-OTS W{1,2,4,8} × LMS H{5,10,15,20,25}; **stateful** advancing key; RFC 8554 KATs |
-| Stateful HBS     | `xmss`      | XMSS / XMSS^MT (RFC 8391, NIST SP 800-208); **stateful** advancing key; RFC 8391 / reference KATs |
-| Lightweight      | `ascon`     | Ascon (NIST SP 800-232): Ascon-AEAD128 + Ascon-Hash256 / XOF128 / CXOF128 from one 320-bit permutation |
-| Diffie-Hellman   | `dh`        | Finite-field DH over RFC 3526 MODP groups (group14..group18) + RFC 4419 group-exchange, for SSH / legacy TLS / IKE interop (new code: ECDH in `ec`) |
-| Unified keys     | `key`       | object-safe `PrivateKey`/`PublicKey` facade — `sign`/`decrypt`/`agree`, `verify`/`encrypt` — over every asymmetric key, with consume-checked params (unsupported params fail loudly) and generic PKCS#8/SPKI decoders (`AnyPrivateKey`/`AnyPublicKey`, which are facade keys themselves); stateful XMSS/LMS via `StatefulSigner`, KEMs via `Encapsulator`/`Decapsulator` |
-| ASN.1 / DER      | `der`       | DER reader/writer, base64, PEM |
-| X.509            | `x509`      | self-signed + CA issuance (RSA, ECDSA, Ed25519 & Ed448), PKCS#10 CSRs, parse, verify; PKIX SPKI; RFC 5280 nameConstraints enforcement across the chain; OpenSSL-interop |
-| TLS              | `tls`       | TLS 1.2 and 1.3, DTLS 1.2 and 1.3 client + server (sans-I/O core + blocking `Stream`); x25519/secp256r1 + X25519MLKEM768 hybrid (1.3); AES-GCM & ChaCha20-Poly1305; Ed25519/Ed448/ECDSA/RSA auth; ALPN, record_size_limit (RFC 8449), TLS-Exporter (RFC 5705); PSK session resumption + 0-RTT (early_data) with an anti-replay window (1.3); RFC 5077 session tickets (1.2); mTLS / client certificate authentication; HelloRetryRequest (client + server); bidirectional KeyUpdate; RFC 8448 KATs; DTLS HelloVerifyRequest / cookie DoS guard, handshake fragmentation + reassembly, 64-bit sliding-window anti-replay; DTLS 1.3 encrypted sequence numbers + ACK-driven retransmission. |
-| HPKE             | `hpke`     | RFC 9180 hybrid public-key encryption — 4 KEMs × 3 KDFs × 3 AEADs + ExportOnly, all four modes (Base/PSK/Auth/AuthPSK) |
-| ECH              | `ech`      | draft-ietf-tls-esni-22 Encrypted Client Hello — client + server, retry_configs, HRR confirmation signal, bit-shape GREASE |
-| QUIC             | `quic`     | QUIC v1 (RFC 9000) + QUIC-TLS (RFC 9001) + recovery / congestion (RFC 9002) + DATAGRAM extension (RFC 9221), sans-I/O |
-| Cert compression | `cert-compression` | RFC 8879 TLS 1.3 certificate compression (zlib via the `compcol` sibling crate) |
-| Legacy TLS       | `tls-legacy` | ⚠️ **deprecated/insecure, off by default** — SSL 3.0 / TLS 1.0 / TLS 1.1 (RFC 8996) with CBC MAC-then-encrypt suites (`TLS_RSA_*` static-RSA + `TLS_ECDHE_RSA_*` over AES-CBC-SHA/SHA256 + 3DES), client + server. Last-resort interop only (e.g. VoIP-phone provisioning); requires lowering `Config::min_version`. BEAST 1/n-1 split + constant-time CBC decrypt, but MD5/SHA-1 PRF, Lucky13 residual, and SSLv3 POODLE remain — do not use against modern peers. |
-| C ABI            | `ffi`       | hashing/HMAC + AES-CMAC + GMAC, KBKDF, RNG, AEAD (incl. AEGIS, Ascon) + AES-KW, RSA, ECDSA, Ed25519, Ed448, X25519, X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/XMSS, X.509, TLS / DTLS / QUIC (sans-I/O); opaque handles + caller buffers; `include/purecrypto.h` |
-| CLI              | (binary)    | `hash`/`dgst`, `mac`, `kdf`, `enc`, `rand`, `genpkey` (classical + PQ), `pkey`, `pkeyutl`, `kem`, `kex`, `req`, `x509`, `ca`, `crl`, `s_client`, `s_server`, `s_dtls_client`, `s_dtls_server`, `q_client`, `q_server` |
-
-## CLI + C-API coverage matrix
-
-Each functional area below is callable from the Rust library, the
-`purecrypto` CLI, and the C ABI (`include/purecrypto.h`).
-
-| Area                                  | CLI                                  | C API                                                              |
-| ------------------------------------- | ------------------------------------ | ------------------------------------------------------------------ |
-| Hashing (SHA-2/3, BLAKE2/3, SM3, Ascon, …) | `hash`                          | `pc_digest`, `pc_hash_*`, `pc_ascon_xof`/`pc_ascon_cxof`          |
-| HMAC (SHA-1, SHA-2, SHA-3, SM3, …)    | `mac`                                | `pc_hmac`                                                          |
-| AES-CMAC (RFC 4493)                   | `mac -alg cmac`                      | `pc_cmac`                                                          |
-| GMAC (NIST SP 800-38D)                | `mac -alg gmac -nonce …`             | `pc_gmac`                                                         |
-| KDFs (HKDF, PBKDF2, scrypt, Argon2)   | `kdf hkdf\|pbkdf2\|scrypt\|argon2`   | `pc_hkdf`, `pc_pbkdf2`, `pc_scrypt`, `pc_argon2`                   |
-| KBKDF (SP 800-108, counter/feedback)  | `kdf kbkdf`                          | `pc_kbkdf_counter`, `pc_kbkdf_feedback`                            |
-| AEAD (AES-GCM/CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256, Ascon-AEAD128) | `enc`                                | `pc_aead_encrypt`, `pc_aead_decrypt`                               |
-| AES key wrap (RFC 3394/5649)          | `enc -alg AES-KW\|AES-KWP`           | `pc_aes_kw_wrap/unwrap`, `pc_aes_kwp_wrap/unwrap`                  |
-| Randomness                            | `rand`                               | `pc_rand_bytes`                                                    |
-| RSA keygen + PKCS#1 sign/verify       | `genpkey`, `req`, `x509`, `pkeyutl`  | `pc_rsa_generate`, `pc_rsa_sign_pkcs1`, `pc_rsa_verify_pkcs1`      |
-| RSA-PSS sign/verify                   | `pkeyutl sign/verify -pkeyopt pss`   | `pc_rsa_sign_pss`, `pc_rsa_verify_pss`                             |
-| RSA-OAEP encrypt/decrypt              | `pkeyutl encrypt/decrypt -pkeyopt oaep` | `pc_rsa_encrypt_oaep`, `pc_rsa_decrypt_oaep`                    |
-| ECDSA keygen + sign/verify            | `genpkey -alg EC`, `pkeyutl`         | `pc_ec_generate`, `pc_ec_sign`, `pc_ec_verify`                     |
-| Ed25519 sign/verify                   | `genpkey -alg ED25519`, `pkeyutl`    | `pc_ed25519_*`                                                     |
-| Ed448 sign/verify                     | `genpkey -alg ED448`, `pkeyutl`      | `pc_ed448_*`                                                       |
-| SM2 sign/verify + encrypt/decrypt     | `genpkey -alg SM2`, `pkeyutl`        | `pc_sm2_*`                                                         |
-| ECDH on NIST curves                   | `kex -alg ECDH-P{256,384,521}`       | `pc_ecdh`                                                          |
-| X25519                                | `kex -alg X25519`                    | `pc_x25519`, `pc_x25519_public`                                    |
-| X448                                  | `kex -alg X448`                      | `pc_x448`, `pc_x448_public`                                        |
-| ML-KEM (FIPS 203)                     | `kem keygen\|encaps\|decaps`         | `pc_mlkem_*`                                                       |
-| ML-DSA (FIPS 204)                     | `pkeyutl sign/verify` (ML-DSA keys)  | `pc_mldsa_*`                                                       |
-| SLH-DSA (FIPS 205)                    | `pkeyutl sign/verify` (SLH-DSA keys) | `pc_slhdsa_*`                                                      |
-| LMS / HSS (RFC 8554, stateful)        | `genpkey -alg LMS-…\|HSS-…`, `pkeyutl` | `pc_lms_*`, `pc_hss_*`                                          |
-| XMSS / XMSS^MT (RFC 8391, stateful)   | `genpkey -alg XMSS-…\|XMSSMT-…`, `pkeyutl` | `pc_xmss_*`, `pc_xmssmt_*`                                  |
-| CSR (PKCS#10)                         | `req`                                | `pc_csr_create_rsa`, `pc_csr_from_pem`, `pc_csr_verify_self_signed`|
-| X.509 certificate parse + verify      | `x509`, `ca`                         | `pc_cert_*`, `pc_ec_self_signed_pem`                               |
-| CRL parse + verify                    | `crl`                                | `pc_crl_*`                                                         |
-| TLS 1.2 / 1.3 client + server         | `s_client`, `s_server`               | `pc_tls_cfg_*`, `pc_tls_*` (memory-BIO style)                      |
-| DTLS 1.2 / 1.3 client + server        | `s_dtls_client`, `s_dtls_server`     | `pc_tls_cfg_*` (`PC_DTLS_1_*` selector), `pc_dtls_next_timeout/on_timeout` |
-| QUIC v1 client + server               | `q_client`, `q_server`               | `pc_quic_cfg_*`, `pc_quic_*` (sans-I/O, datagram in/out + streams)  |
-
-The C ABI is sans-I/O for TLS/DTLS: the caller pumps wire bytes through
-`pc_tls_feed` / `pc_tls_pop` and application bytes through `pc_tls_send` /
-`pc_tls_recv` (mirrors OpenSSL's `BIO_s_mem`).
+| Feature | What it provides |
+| --- | --- |
+| `ct` (always on) | Branchless equality, selection, ordering, and `Choice` |
+| `hash` | SHA-2, SHA-3 / Keccak, SHAKE, cSHAKE, KMAC, TupleHash, ParallelHash, TurboSHAKE, KangarooTwelve, BLAKE2b/2s/2X, BLAKE3, SM3, Whirlpool, Streebog, MD2/4/5, SHA-1, RIPEMD-160; HMAC and the `Mac` trait |
+| `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA; CBC/CFB/OFB/CTR; AES-GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256; XTS; AES-KW/KWP; DES/3DES for legacy interop |
+| `mac` | AES-CMAC, GMAC, UMAC-64/128 |
+| `kdf` | HKDF, PBKDF2, scrypt, Argon2id/2d/2i, SP 800-108 KBKDF, PBES2 |
+| `rng` | `RngCore`/`CryptoRng`, HMAC-DRBG, `OsRng` (Unix, Linux `getrandom(2)`, Windows, Apple, WASI, browser wasm) |
+| `bignum` | Const-generic `Uint` and runtime `BoxedUint`, Montgomery arithmetic, constant-time modexp |
+| `rsa` | Key generation (512 to 65536 bits), PKCS#1 v1.5, OAEP, PSS, blinded CRT with fault check, PKCS#1 DER/PEM |
+| `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
+| `ec` | ECDSA/ECDH on P-256, P-384, P-521, secp256k1, Brainpool; X25519, X448, Ed25519, Ed448; SM2 signature and encryption |
+| `bip340` | BIP340 Schnorr signatures over secp256k1 |
+| `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
+| `ristretto255` | The RFC 9496 prime-order group (stable API) |
+| `hazmat-*` | Low-level secp256k1, edwards25519 and ML-DSA arithmetic for threshold / FROST work (no semver guarantee) |
+| `mlkem` | ML-KEM-512/768/1024 (FIPS 203), no allocator needed |
+| `mldsa` | ML-DSA-44/65/87 (FIPS 204), hedged and deterministic |
+| `slhdsa` | SLH-DSA, all 12 parameter sets (FIPS 205) |
+| `falcon` | Falcon-512/1024 (FN-DSA, FIPS 206 draft) with a constant-time emulated-float sampler |
+| `lms`, `xmss` | LMS/HSS and XMSS/XMSS^MT stateful hash-based signatures (SP 800-208) |
+| `ascon` | Ascon-AEAD128, Ascon-Hash256, XOF128, CXOF128 (SP 800-232) |
+| `aez` | AEZ v5 robust authenticated encryption |
+| `hpke` | RFC 9180: 4 KEMs, 3 KDFs, 3 AEADs, all four modes |
+| `key` | An `EVP_PKEY`-style `PrivateKey`/`PublicKey` facade over every asymmetric key, with generic PKCS#8/SPKI decoding |
+| `der` | DER reader/writer, base64, PEM |
+| `x509` | Certificates, CSRs, CRLs, OCSP, SCTs, chain building with name constraints and policy processing, CA issuance |
+| `pkcs12` | PKCS#12 / PFX archives, both directions |
+| `tls` | TLS 1.2 and 1.3, client and server, sans-I/O; mTLS, ALPN, resumption, 0-RTT, KeyUpdate, exporters, raw public keys, X25519MLKEM768 |
+| `dtls` | DTLS 1.2 and 1.3 (RFC 6347 / RFC 9147): cookies, fragmentation, replay windows, ACK-driven retransmission, KeyUpdate |
+| `quic` | QUIC v1 (RFC 9000/9001/9002) plus DATAGRAM (RFC 9221), sans-I/O |
+| `ech` | Encrypted Client Hello (draft-ietf-tls-esni-22), client and server |
+| `cert-compression` | RFC 8879 certificate compression |
+| `embedded-roots` | A curated root-certificate bundle (`RootCertStore::with_embedded_roots()`) |
+| `tls-legacy` | SSL 3.0 / TLS 1.0 / TLS 1.1 with CBC suites. **Deprecated and insecure**, off by default, for talking to legacy devices only |
+| `tokio`, `mio` | Async and non-blocking I/O adapters for `tls` |
+| `ffi` | The C ABI (`include/purecrypto.h`) |
+| `cli` | The `purecrypto` binary |
 
 ## Cargo features
 
-Default is `std + cli` with most modules on. A few are opt-in: `quic`, `hpke`,
-`ech`, `falcon`, `tls-legacy`, `ristretto255`, the `ffi` C ABI, and the
-`tokio` / `mio` I/O adapters. Disable defaults for a `no_std` build and
-re-enable only what you need:
+The default feature set is `std` plus most modules and the CLI. Opt-in
+features are `quic`, `hpke`, `ech`, `falcon`, `ristretto255`, `bip340`, the
+`zkp-*` set, the `hazmat-*` set, `tls-legacy`, `wasi-getrandom`, `ffi`,
+`tokio` and `mio`. Disable the defaults for a `no_std` build and re-enable
+only what you need:
 
 ```toml
-# Bare no_std, no allocator: just `ct` and primitives that fit.
-purecrypto = { version = "0.6", default-features = false }
+# Bare no_std, no allocator: `ct` plus whatever primitives you turn on.
+purecrypto = { version = "0.8", default-features = false, features = ["hash", "cipher"] }
 
-# no_std core + ML-KEM-768 (no alloc):
-purecrypto = { version = "0.6", default-features = false, features = ["mlkem"] }
+# no_std ML-KEM-768, no allocator:
+purecrypto = { version = "0.8", default-features = false, features = ["mlkem"] }
 
-# no_std elliptic curves, no allocator: P-256 ECDSA/ECDH, X25519, X448,
-# Ed25519, Ed448 and their fixed-size encodings. Add `alloc` for the runtime
-# multi-curve (P-384/P-521/secp256k1) path, SM2, and the DER/PEM codecs.
-purecrypto = { version = "0.6", default-features = false, features = ["ec"] }
+# no_std elliptic curves without an allocator: P-256 ECDSA/ECDH, X25519,
+# X448, Ed25519, Ed448. Add `alloc` for the runtime multi-curve path
+# (P-384/P-521/secp256k1/Brainpool), SM2, and the DER/PEM codecs.
+purecrypto = { version = "0.8", default-features = false, features = ["ec"] }
 
-# Library with PQ signing only:
-purecrypto = { version = "0.6", default-features = false, features = ["mldsa", "slhdsa"] }
+# Post-quantum signing only:
+purecrypto = { version = "0.8", default-features = false, features = ["mldsa", "slhdsa"] }
+
+# TLS engine for a no_std target with an allocator:
+purecrypto = { version = "0.8", default-features = false, features = ["tls", "dtls"] }
 ```
 
-Module gates: `hash`, `cipher`, `mac`, `kdf`, `bignum`, `rng`,
-`linux-getrandom`, `rsa`, `dh`, `der`, `ec`, `key`, `ristretto255`, `x509`,
-`pkcs12`, `tls`, `dtls`, `tls-legacy`, `quic`, `mlkem`, `mldsa`, `slhdsa`,
-`falcon`, `lms`, `xmss`, `ascon`, `aez`, `hpke`, `ech`, `cert-compression`,
-`embedded-roots`, `ffi`, `cli` (plus the `tokio` / `mio` I/O adapters) — plus
-the unstable `hazmat-secp256k1` / `hazmat-edwards25519` / `hazmat-mldsa` gates
-(no semver guarantee).
-Each pulls in only its own dependencies. `alloc` is required by anything that
-needs heap (most things except `ct`, `hash`, `cipher`, the no-alloc `mlkem`
-core, and the fixed-curve half of `ec`).
+Each feature pulls in only what it needs. `alloc` is required by anything
+that must size buffers at runtime (DH, X.509, TLS, the boxed RSA/EC paths);
+`ct`, `hash`, `cipher`, `kdf`, `mlkem`, `mldsa`, `slhdsa`, `lms`, `xmss`,
+`aez`, `rsa` and the fixed-curve half of `ec` build without it.
 
 ## Building
 
@@ -169,530 +207,199 @@ cargo test                                           # full suite
 cargo test --release -- --ignored                    # heavy KATs (SLH-DSA 's' sets, RSA keygen)
 ```
 
-Requires Rust 1.89+ (edition 2024); the MSRV is declared as `rust-version =
-"1.89"` and enforced in CI.
+Requires Rust 1.89 or newer (edition 2024); the MSRV is declared in
+`Cargo.toml` and enforced in CI, which also builds bare-metal
+(`thumbv7em-none-eabi`), 32-bit ARM, RISC-V, wasm32 and WASI targets.
+
+For WebAssembly, build the `ffi` feature as a `cdylib` for
+`wasm32-unknown-unknown`; the module imports one host function,
+`purecrypto.random_get`, for entropy. [`web/`](web/) is a complete example.
 
 ## Command-line tool
 
-The `purecrypto` binary (built by default; or `cargo build --features cli`).
-Every subcommand reads `stdin` when no `-in` is given and writes to `stdout`
-when no `-out` is given, so commands compose with pipes.
+One binary, OpenSSL-style subcommands. Every subcommand reads `stdin` when
+no `-in` is given and writes to `stdout` when no `-out` is given. Private
+material is written mode 0600 and never overwrites an existing file. The
+full reference with every flag is in [docs/cli.md](docs/cli.md).
 
-### `hash` — message digests
+| Subcommand | Purpose | Example |
+| --- | --- | --- |
+| `hash` / `dgst` | Message digests | `purecrypto hash sha3-256 file` |
+| `mac` | HMAC, AES-CMAC, GMAC | `purecrypto mac -alg hmac-sha256 -keyfile k -in msg` |
+| `kdf` | HKDF, PBKDF2, scrypt, Argon2, KBKDF | `purecrypto kdf argon2 -variant 2id -password-file - -salt HEX -t-cost 3 -m-cost 65536 -len 32` |
+| `enc` | AEAD encrypt/decrypt, AES key wrap | `purecrypto enc -alg AES-256-GCM -keyfile k -nonce HEX -in plain -out ct` |
+| `rand` | OS randomness | `purecrypto rand 32` |
+| `genpkey` | Keys: RSA, EC, SM2, Ed25519/448, ML-DSA, ML-KEM, SLH-DSA, LMS/HSS, XMSS | `purecrypto genpkey -algorithm EC -curve P-256 -out ec.pem` |
+| `pkey` | Inspect or convert a key | `purecrypto pkey -in key.pem -pubout` |
+| `pkeyutl` | Sign, verify, encrypt, decrypt with any key | `purecrypto pkeyutl sign -inkey k.pem -in msg -out msg.sig` |
+| `kem` | ML-KEM keygen / encaps / decaps | `purecrypto kem encaps -peer ek.bin -out-ct ct -out-ss ss` |
+| `kex` | X25519, X448, ECDH shared secrets | `purecrypto kex -alg X25519 -key my.pem -peer their.pub.pem` |
+| `req` | PKCS#10 CSRs | `purecrypto req -key leaf.pem -subj /CN=leaf -out leaf.csr` |
+| `x509` | Self-signed certs, issue from CSR, inspect | `purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem -san leaf.example -out leaf.crt` |
+| `ca` | A directory-backed development CA with revocation and CRLs | `purecrypto ca init -dir ./myca -cn "My CA"` |
+| `crl` | Parse, verify, query CRLs | `purecrypto crl -in x.crl -verify -CAfile ca.crt` |
+| `s_client`, `s_server` | TLS 1.3 / 1.2 test client and server (also DTLS and QUIC via flags) | `purecrypto s_client -connect example.com:443 -alpn h2` |
+| `s_dtls_client`, `s_dtls_server` | DTLS 1.2 / 1.3 | `purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert c.pem -key k.pem` |
+| `q_client`, `q_server` | QUIC v1 | `purecrypto q_client -connect localhost:4434 -alpn h3` |
 
-```sh
-purecrypto hash sha256 file.txt              # one-shot digest
-echo -n abc | purecrypto hash sha3-256       # any algorithm from the `hash` module
-```
-
-Algorithms: `sha224`, `sha256`, `sha384`, `sha512`, `sha512-224`, `sha512-256`,
-`sha3-224`, `sha3-256`, `sha3-384`, `sha3-512`, `keccak256`, `blake2b256`,
-`blake2b384`, `blake2b512`, `blake2s256`, `blake3`, `m14`, `sm3`, `whirlpool`,
-`streebog256`, `streebog512`, `ascon-hash256`, `sha1`, `md2`, `md4`, `md5`,
-`ripemd160` — i.e. every `hash::HashAlgorithm` name (common spellings such as
-`sha-256` or `sha512/256` are accepted too), plus Ascon and M14. (The XOFs
-`shake128`/`shake256` and the BLAKE2X/cSHAKE/KMAC variants are exposed through
-the Rust library, not the CLI.)
-
-### `rand` — randomness
-
-```sh
-purecrypto rand 32              # 32 random bytes as hex
-purecrypto rand 16 --binary     # raw bytes to stdout
-```
-
-### `genpkey` — key generation (classical and post-quantum)
-
-```sh
-# Classical
-purecrypto genpkey -algorithm RSA -bits 2048   -out rsa.pem    # also 3072, 4096
-purecrypto genpkey -algorithm RSA -bits 8192   -out rsa8k.pem  # any even size, 512..=65536
-purecrypto genpkey -algorithm EC  -curve P-256 -out ec.pem     # or P-384, P-521, secp256k1
-purecrypto genpkey -algorithm ED25519          -out ed.pem
-
-# Post-quantum signatures (FIPS 204 / FIPS 205)
-purecrypto genpkey -algorithm ML-DSA-44               -out mldsa44.pem
-purecrypto genpkey -algorithm ML-DSA-65               -out mldsa65.pem
-purecrypto genpkey -algorithm ML-DSA-87               -out mldsa87.pem
-purecrypto genpkey -algorithm SLH-DSA-SHA2-128f       -out slh128f.pem
-purecrypto genpkey -algorithm SLH-DSA-SHAKE-256s      -out slh256s.pem
-
-# Post-quantum KEM (FIPS 203) — all three security levels
-purecrypto genpkey -algorithm ML-KEM-512              -out mlkem512.pem
-purecrypto genpkey -algorithm ML-KEM-768              -out mlkem768.pem
-purecrypto genpkey -algorithm ML-KEM-1024             -out mlkem1024.pem
-```
-
-The full SLH-DSA matrix is supported:
-`SLH-DSA-{SHA2,SHAKE}-{128,192,256}{s,f}` (12 parameter sets).
-
-Output format:
-- RSA → `-----BEGIN RSA PRIVATE KEY-----` (PKCS#1)
-- EC → `-----BEGIN EC PRIVATE KEY-----` (SEC1)
-- Ed25519 / ML-DSA / ML-KEM / SLH-DSA → `-----BEGIN PRIVATE KEY-----` (PKCS#8,
-  algorithm identified by the embedded OID)
-
-> **PKCS#8 interop note.** Private keys use the LAMPS PQC encodings and are
-> fully interoperable with OpenSSL 3.5 in both directions. ML-DSA and ML-KEM
-> emit the `ML-DSA-PrivateKey` / `ML-KEM-PrivateKey` CHOICE `both`
-> (`SEQUENCE { seed, expandedKey }`) form — byte-for-byte identical to OpenSSL
-> 3.5's default `seed-priv` output — and the parser also accepts the `seed`,
-> `expandedKey`, and legacy raw-expanded forms. SLH-DSA uses the bare `OCTET
-> STRING` form, matching OpenSSL byte-for-byte. Public-key SPKI is fully
-> interoperable for every scheme.
-
-### `pkey` — inspect or convert a key
-
-```sh
-purecrypto pkey -in key.pem -text     # describe the key
-purecrypto pkey -in key.pem -pubout   # emit the SPKI public-key PEM
-purecrypto pkey < key.pem             # re-emit the private key (round-trip)
-```
-
-`pkey` auto-detects every supported flavor (RSA PKCS#1, EC SEC1, and the PKCS#8
-types above) and routes by the embedded OID for PKCS#8 inputs.
-
-### `req` — PKCS#10 certificate signing requests
-
-```sh
-purecrypto req -key leaf.pem -subj "/CN=leaf.example/O=Acme" \
-               -addext "subjectAltName=DNS:leaf.example,DNS:www.leaf.example" \
-               -out leaf.csr
-purecrypto req -in leaf.csr -verify       # check the CSR self-signature
-```
-
-### `x509` — self-signed certificates and a small CA
-
-```sh
-# Build a self-signed CA cert
-purecrypto x509 -new --ca -key ca.pem -subj "/CN=Internal CA" -out ca.crt
-
-# Issue a leaf certificate from a CSR.
-# A CSR's requested subjectAltName is NOT certified by default — it is the
-# requester's claim, so name the SANs yourself with -san (or pass
-# -copy-csr-san to take the request's list as-is).
-purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
-                -san leaf.example,www.leaf.example -out leaf.crt
-
-# Inspect a certificate
-purecrypto x509 -in leaf.crt -text
-```
-
-### `s_client` — TLS 1.3 test client
-
-```sh
-purecrypto s_client -connect example.com:443
-purecrypto s_client -connect 127.0.0.1:8443 -CAfile ca.crt -servername leaf.example
-purecrypto s_client -connect 127.0.0.1:8443 -insecure -quiet      # skip cert verify, stdin → server
-
-# Negotiate HTTP/2 (or fall back to http/1.1) via ALPN
-purecrypto s_client -connect example.com:443 -alpn h2,http/1.1
-
-# Dump the negotiated secrets in NSS SSLKEYLOGFILE format — Wireshark can
-# then decrypt the captured pcap.
-purecrypto s_client -connect example.com:443 -keylogfile sslkeys.log
-
-# Present a client certificate (mTLS). The key may be Ed25519 (PKCS#8) or
-# ECDSA (SEC1).
-purecrypto s_client -connect server:443 -cert client.pem -key client.key
-```
-
-The client offers `X25519MLKEM768` (post-quantum hybrid) first, then `x25519`
-and `secp256r1`; all three TLS 1.3 cipher suites
-(`TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`,
-`TLS_CHACHA20_POLY1305_SHA256`); and Ed25519, Ed448, ECDSA, and RSA peer signatures.
-
-### `s_server` — TLS 1.3 echo / `-www` server
-
-A one-shot test server: it binds, accepts one connection, performs the
-handshake, exchanges data, and exits.
-
-```sh
-# Plain TLS echo:
-purecrypto s_server -cert server.pem -key server.key -accept 4433
-
-# Serve a fixed HTTP response (text/plain) for one request:
-purecrypto s_server -cert server.pem -key server.key -accept 4433 -www
-
-# Negotiate ALPN, listen on 8443:
-purecrypto s_server -cert server.pem -key server.key -accept 8443 -alpn h2,http/1.1
-
-# mTLS: require + verify a client cert against the bundle in `client-ca.pem`.
-purecrypto s_server -cert server.pem -key server.key -accept 8443 \
-                    -Verify client-ca.pem
-```
-
-### TLS 1.2
-
-`s_client` / `s_server` default to TLS 1.3. Pass `-tls1_2` on either side
-to force TLS 1.2. The TLS 1.2 path is ECDHE-AEAD only (AES-GCM and
-ChaCha20-Poly1305) and supports mTLS plus RFC 5077 session tickets.
-
-```sh
-# Server (TLS 1.2)
-purecrypto s_server -tls1_2 -accept 0.0.0.0:4443 -cert cert.pem -key key.pem
-
-# Client (TLS 1.2)
-purecrypto s_client -tls1_2 -connect example.com:443 -CAfile roots.pem
-```
-
-### DTLS — `s_dtls_client` / `s_dtls_server`
-
-DTLS runs the TLS handshake over UDP. Either use the dedicated
-`s_dtls_client` / `s_dtls_server` binaries, or pass `-dtls1_2` / `-dtls1_3`
-to `s_client` / `s_server`. The two forms are equivalent.
-
-```sh
-# DTLS 1.2 echo
-purecrypto s_dtls_server -dtls1_2 -accept 0.0.0.0:5684 -cert cert.pem -key key.pem
-purecrypto s_dtls_client -dtls1_2 -connect localhost:5684
-
-# DTLS 1.3 echo
-purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.pem
-purecrypto s_dtls_client -dtls1_3 -connect localhost:5685
-
-# Equivalent via s_client / s_server with version flags
-purecrypto s_server -dtls1_3 -accept 0.0.0.0:5685 -cert cert.pem -key key.pem
-purecrypto s_client -dtls1_3 -connect localhost:5685
-```
-
-The DTLS server stands up a HelloVerifyRequest cookie exchange (1.2) or
-HelloRetryRequest cookie (1.3) before allocating any per-connection
-state, and both directions install a 64-bit sliding-window replay
-filter once the handshake-protected keys are in place. The default
-record size is 1200 bytes to stay below common path MTUs; override with
-`-mtu`.
-
-### QUIC — `q_client` / `q_server`
-
-QUIC v1 (RFC 9000) over UDP, secured by TLS 1.3 keys (RFC 9001). Either use
-the dedicated binaries, or pass `-quic` to `s_client` / `s_server` — the two
-forms are equivalent. The client drives one bidirectional stream
-(stdin → server, reply → stdout); the unreliable DATAGRAM extension
-(RFC 9221) is reachable through the library API.
-
-```sh
-purecrypto q_server -accept 0.0.0.0:4434 -cert cert.pem -key key.pem -alpn h3
-purecrypto q_client -connect localhost:4434 -alpn h3
-```
-
-### Cookbook
-
-End-to-end CA + leaf with EC keys:
-
-```sh
-purecrypto genpkey -algorithm EC -curve P-256 -out ca.pem
-purecrypto x509 -new --ca -key ca.pem -subj "/CN=My CA" -out ca.crt
-
-purecrypto genpkey -algorithm EC -curve P-256 -out leaf.pem
-purecrypto req -key leaf.pem -subj "/CN=leaf.example" \
-               -addext "subjectAltName=DNS:leaf.example" -out leaf.csr
-purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
-                -san leaf.example -out leaf.crt
-```
-
-A post-quantum signature key and its public counterpart:
-
-```sh
-purecrypto genpkey -algorithm ML-DSA-65 -out mldsa.pem
-purecrypto pkey -in mldsa.pem -text                       # ML-DSA-65 private key
-purecrypto pkey -in mldsa.pem -pubout > mldsa.pub.pem     # PKIX SPKI
-```
-
-A two-process mTLS handshake on a single host (client cert presented to the
-server, both keys Ed25519):
-
-```sh
-# CA + server cert + client cert
-purecrypto genpkey -algorithm ED25519 -out ca.pem
-purecrypto x509 -new --ca -key ca.pem -subj "/CN=Local CA" -out ca.crt
-purecrypto genpkey -algorithm ED25519 -out server.pem
-purecrypto req -key server.pem -subj "/CN=127.0.0.1" \
-               -addext "subjectAltName=DNS:127.0.0.1" -out server.csr
-purecrypto x509 -req -in server.csr -CA ca.crt -CAkey ca.pem \
-                -san 127.0.0.1 -out server.crt
-purecrypto genpkey -algorithm ED25519 -out client.pem
-purecrypto req -key client.pem -subj "/CN=alice" -out client.csr
-purecrypto x509 -req -in client.csr -CA ca.crt -CAkey ca.pem -out client.crt
-
-# In one terminal — server requires + verifies client certs against ca.crt:
-purecrypto s_server -cert server.crt -key server.pem -accept 8443 -Verify ca.crt -www
-
-# In another terminal — client presents its cert + key:
-purecrypto s_client -connect 127.0.0.1:8443 -CAfile ca.crt \
-                    -cert client.crt -key client.pem -alpn http/1.1 \
-                    -keylogfile keys.log
-```
+Two behaviours worth knowing: `s_client` verifies the server certificate by
+default (against the embedded roots or `-CAfile`) and prints a loud warning
+under `-insecure`, and a TCP close without a TLS `close_notify` is reported
+as a possible truncation with a non-zero exit.
 
 ## Library usage
 
-Idiomatic Rust API — see [docs.rs/purecrypto](https://docs.rs/purecrypto) for
-the full reference. A few common patterns:
+The idiomatic Rust API is documented on
+[docs.rs/purecrypto](https://docs.rs/purecrypto). Runtime algorithm
+selection is available where it helps:
 
 ```rust
-use purecrypto::hash::{Digest, Sha256};
-let d = Sha256::digest(b"abc");
-
-// Same hash, chosen at runtime: `HashAlgorithm` names every digest in the
-// crate and `Hasher` holds the state inline (no allocation). Both it and the
-// concrete hashers implement `hash::DynDigest`, so generic code can take a
-// `&mut dyn DynDigest` and not care which it got.
 use purecrypto::hash::HashAlgorithm;
-let alg: HashAlgorithm = "sha256".parse().unwrap();
-assert_eq!(alg.output_len(), 32);
-assert_eq!(alg.digest("abc").as_slice(), &d[..]);   // &str / String / Vec<u8> / [u8; N]
-assert_eq!(format!("{}", alg.digest("abc")).len(), 64); // hex via Display
 
-let mut h = alg.hasher();                            // also an io::Write + fmt::Write sink
+// `HashAlgorithm` names every digest in the crate; `Hasher` holds the state
+// inline (no allocation) and implements `hash::DynDigest`.
+let alg: HashAlgorithm = "sha256".parse().unwrap();
+let mut h = alg.hasher();                 // also an io::Write / fmt::Write sink
 h.update(b"a");
 h.update(b"bc");
-assert_eq!(h.finalize().as_slice(), &d[..]);
-
-use purecrypto::ec::Ed25519PrivateKey;
-use purecrypto::rng::OsRng;
-let sk = Ed25519PrivateKey::generate(&mut OsRng);
-let sig = sk.sign(b"hello");
-sk.public_key().verify(b"hello", &sig).unwrap();
-
-use purecrypto::mldsa::MlDsa65PrivateKey;
-let (sk, pk) = MlDsa65PrivateKey::generate(&mut OsRng);
-let sig = sk.sign(&mut OsRng, b"hello", b"").unwrap();
-assert!(pk.verify(&sig, b"hello", b""));
-
-use purecrypto::mlkem::MlKem768DecapsKey;
-let (dk, ek) = MlKem768DecapsKey::generate(&mut OsRng);
-let (ct, ss_a) = ek.encapsulate(&mut OsRng);
-let ss_b = dk.decapsulate(&ct);
-assert_eq!(ss_a, ss_b);
+assert_eq!(format!("{}", h.finalize()).len(), 64);   // hex via Display
 ```
 
-### Versions and transports
+### TLS, DTLS and QUIC configuration
 
-`purecrypto` ships both TLS (TCP) and DTLS (UDP) at two protocol
-versions each:
-
-All four versions (TLS 1.2, TLS 1.3, DTLS 1.2, DTLS 1.3) and both roles
-(client, server) share **one** public API: [`tls::Config`] +
-[`tls::Connection`]. The version is selected by
-`Config::builder().versions(min, max).build()`; the role is selected at
-connection-construction time via `Connection::client(&cfg)` or
-`Connection::server(&cfg)`.
-
-- **TLS 1.2** is ECDHE-AEAD only (AES-128/256-GCM, ChaCha20-Poly1305) —
-  no static RSA, no static DH, no CBC. Forward secrecy by construction.
-  Includes mTLS and RFC 5077 stateless session tickets.
-- **TLS 1.3** is the full RFC 8446 with PSK resumption, 0-RTT,
-  exporter, ALPN, mTLS, and downgrade-detection.
-- **DTLS 1.2** (RFC 6347) carries the TLS 1.2 handshake over UDP with
-  HelloVerifyRequest cookies, handshake fragmentation/reassembly,
-  replay protection, and retransmission. Negotiates the same
-  ECDHE-AEAD suites × groups × signature schemes the TLS 1.2 path
-  supports.
-- **DTLS 1.3** (RFC 9147) carries the TLS 1.3 handshake over UDP with
-  selective ACK reliability, encrypted sequence numbers, and a
-  HelloRetryRequest cookie. Negotiates the same TLS 1.3 suites,
-  groups (including `X25519MLKEM768`), and signature schemes as the
-  TLS 1.3 path.
-
-### TLS 1.3
-
-The `tls` module is a sans-I/O TLS 1.3 implementation with a thin
-`std::io::Read + Write` adapter for blocking TCP. The full feature surface,
-configured per side:
+All four handshake versions (TLS 1.2, TLS 1.3, DTLS 1.2, DTLS 1.3) and both
+roles share one API: `tls::Config` plus `tls::Connection`. The version range
+is chosen with `versions(min, max)` (or the `tls_only()` / `dtls()`
+shorthands); the role is chosen when the connection is built with
+`Connection::client(&cfg)` or `Connection::server(&cfg)`. QUIC reuses the
+same `Config` for its TLS layer.
 
 ```text
 // Client (TLS or DTLS, any version):
 Config::builder()
     .versions(ProtocolVersion::TLSv1_2, ProtocolVersion::TLSv1_3)
+    .rng(Arc::new(OsRng))                     // required; or a TPM/HSM EntropySource
     .roots(roots)
     .server_name("example.com")
     .alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
-    .record_size_limit(4096)             // RFC 8449
-    .identity(client_chain, client_key)  // mTLS (any SigningKey)
+    .record_size_limit(4096)                  // RFC 8449
+    .try_identity(client_chain, client_key)?  // mTLS; checks the key matches the leaf
     .build();
 
-// Server (TLS or DTLS, any version):
+// Server:
 Config::builder()
-    .tls_only()                          // shorthand for versions(TLSv1_2, TLSv1_3)
-    .identity(chain, SigningKey::Rsa(rsa) | SigningKey::Ecdsa(ec) | ...)
+    .tls_only()
+    .rng(Arc::new(OsRng))
+    .try_identity(chain, SigningKey::Ecdsa(key))?   // Rsa, Ecdsa, Ed25519, Ed448, MlDsa*, External
     .alpn(...)
-    .ticket_key([0u8; 32])               // enables NewSessionTicket emission
-    .max_early_data(16384)               // accept up to N bytes of 0-RTT
-    .client_auth(ClientAuth { roots, required: true }) // mTLS
+    .ticket_key([0u8; 32])                    // enables NewSessionTicket (rotate; see docs)
+    .max_early_data(16384)                    // accept up to N bytes of 0-RTT
+    .client_auth(ClientAuth { roots, required: true })   // mTLS
     .build();
 
-// DTLS variant:
+// DTLS server (one Connection per peer address):
 Config::builder()
-    .dtls()                              // shorthand for versions(DTLSv1_2, DTLSv1_3)
-    .identity(chain, key)
-    .cookie_secret([0u8; 32])            // amplification defense
-    .max_record_size(1200)               // MTU ceiling
+    .dtls()
+    .rng(Arc::new(OsRng))
+    .try_identity(chain, key)?
+    .cookie_secret(current)                   // amplification defence
+    .previous_cookie_secret(old)              // optional: honour cookies across a rotation
+    .peer_socket_addr(peer)                   // required whenever cookies are on
+    .max_record_size(1200)                    // MTU ceiling
     .build();
-
-let mut conn = Connection::client(&cfg)?;   // or Connection::server(&cfg)
 ```
+
+There is no implicit RNG: `Connection::client` / `Connection::server` return
+`MissingEntropySource` unless `rng(...)` was set, which is what lets a TPM or
+HSM supply entropy instead of the OS. `try_identity` and `try_private_key` fail at configuration time when the
+private key does not belong to the leaf certificate; the older `identity` /
+`private_key` builders skip that check. A cookie-requiring DTLS server needs
+`peer_socket_addr` (or `peer_address`), because the cookie binds the
+client's address; without it, `Connection::server` refuses to start rather
+than silently becoming a UDP reflection amplifier.
 
 After a handshake completes, both sides expose:
 
-- `connection.alpn_selected()` — the negotiated ALPN name, if any.
-- `connection.tls_exporter(label, context, out)` — RFC 8446 §7.5 / RFC 5705
-  application-layer keying material.
-- `connection.peer_certificates()` — the validated chain (leaf first).
-- (client) `connection.take_session()` — moves out a `ResumptionSession`
-  derived from the server's NewSessionTicket; pass it to
-  `Config::builder().resumption_session(...)` next time you connect to the
-  same server (TLS 1.3 PSK or TLS 1.2 RFC 5077 ticket).
-- (client) `connection.write_early_data(&[u8])` — sends application data
-  under the early-traffic key before `ServerHello` arrives, valid only on a
-  resumed connection whose session enabled 0-RTT.
+- `alpn_selected()`: the negotiated ALPN name, if any.
+- `tls_exporter(label, context, out)`: RFC 8446 §7.5 / RFC 5705 keying
+  material.
+- `peer_certificates()`: the validated chain, leaf first (also restored on a
+  resumed mTLS session).
+- `received_close_notify()`: whether the peer closed cleanly. A transport
+  EOF without it is a truncation.
+- Client only: `take_session()` returns a `ResumptionSession` derived from
+  the server's NewSessionTicket; pass it to `resumption_session(...)` next
+  time (TLS 1.3 PSK or TLS 1.2 RFC 5077 ticket). `write_early_data(&[u8])`
+  sends 0-RTT on such a resumed connection.
 
-**0-RTT replay caveat.** RFC 8446 §8: 0-RTT data is replayable by an active
-attacker, since the server cannot bind the early bytes to a unique
-client-server handshake instance. The provided `ReplayWindow` blocks repeated
-binders within a process, but cross-process / cross-server replay defenses
-are application-level. Mark any data sent via `write_early_data` as
-idempotent (a HEAD/GET, an idempotent RPC, …) and never as a state-changing
-write.
-
-```rust,no_run
-use purecrypto::tls::{Config, Connection, HandshakeStatus, RootCertStore};
-
-// Use the embedded root bundle (feature `embedded-roots`, on by default):
-// a curated first-party store built from the Mozilla root program and
-// others, following CA/Browser Forum rules. Or start from
-// `RootCertStore::new()` and add your own PEMs.
-let roots = RootCertStore::with_embedded_roots();
-let cfg = Config::builder()
-    .tls_only()
-    .roots(roots)
-    .server_name("example.com")
-    .alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()])
-    .build();
-let mut conn = Connection::client(&cfg).unwrap();
-
-// Drive the handshake: pop wire bytes from `conn`, send them, recv from
-// the peer, feed them back. The sans-I/O surface is the same for TLS and
-// DTLS — the only difference is "stream" vs "datagram" framing.
-# fn _h(_: Connection) -> std::io::Result<()> { Ok(()) }
-```
-
+**0-RTT replay caveat.** RFC 8446 §8: an active attacker can replay 0-RTT
+data. The built-in `ReplayWindow` blocks repeated binders within one
+process; cross-process defences are the application's job. Only send
+idempotent requests through `write_early_data`.
 
 ### Signature algorithms
 
-X.509 chain validation and TLS 1.3 `CertificateVerify` both dispatch through
-the [`signature_registry`](src/signature_registry.rs) module. Every signature
-primitive purecrypto can do appears as a registry entry; a strict whitelist
-[`SignaturePolicy`] controls which ones a verifier will accept.
-
-#### Registry
-
-| `id` (whitelist key)        | X.509 OID                       | TLS 1.3 scheme | Default `modern()` |
-| --------------------------- | ------------------------------- | -------------- | ------------------ |
-| `rsa-pkcs1-sha1`            | `1.2.840.113549.1.1.5`          | (none)         | opt-in |
-| `rsa-pkcs1-sha256`          | `1.2.840.113549.1.1.11`         | `0x0401`       | |
-| `rsa-pkcs1-sha384`          | `1.2.840.113549.1.1.12`         | `0x0501`       | |
-| `rsa-pkcs1-sha512`          | `1.2.840.113549.1.1.13`         | (none)         | opt-in |
-| `rsa-pss-rsae-sha256`       | `1.2.840.113549.1.1.11` (RSAE)  | `0x0804`       | |
-| `rsa-pss-rsae-sha384`       | `1.2.840.113549.1.1.12` (RSAE)  | `0x0805`       | |
-| `rsa-pss-rsae-sha512`       | `1.2.840.113549.1.1.13` (RSAE)  | `0x0806`       | |
-| `rsa-pss-pss-sha256`        | `1.2.840.113549.1.1.10` (PSS-keys) | (none)      | opt-in |
-| `ecdsa-with-sha256`         | `1.2.840.10045.4.3.2` (any curve) | (none)       | |
-| `ecdsa-with-sha384`         | `1.2.840.10045.4.3.3` (any curve) | (none)       | |
-| `ecdsa-with-sha512`         | `1.2.840.10045.4.3.4` (any curve) | (none)       | |
-| `ecdsa-secp256r1-sha256`    | (TLS-only — strict curve)       | `0x0403`       | |
-| `ecdsa-secp384r1-sha384`    | (TLS-only — strict curve)       | `0x0503`       | |
-| `ecdsa-secp521r1-sha512`    | (TLS-only — strict curve)       | `0x0603`       | |
-| `ecdsa-secp256r1-sha384/512`, `ecdsa-secp384r1-sha256/512`, `ecdsa-secp521r1-sha256/384` | cross-hash, policy-only | (none) | opt-in |
-| `ecdsa-secp256k1-sha256/384/512` | secp256k1, policy-only      | (none)         | opt-in |
-| `ed25519`                   | `1.3.101.112`                   | `0x0807`       | |
-| `ml-dsa-44` / `-65` / `-87` | `2.16.840.1.101.3.4.3.17/18/19` | `0x0904/05/06` | (NIST FIPS 204) |
-| `slh-dsa-sha2-128s/128f/192s/192f/256s/256f`, `slh-dsa-shake-128s/128f/192s/192f/256s/256f` | `2.16.840.1.101.3.4.3.20..31` | (none) | opt-in (FIPS 205) |
-
-The matched-curve / matched-hash ECDSA pairs (e.g. P-256 + SHA-256) have IANA
-TLS scheme codes; cross-hash pairs and all secp256k1 entries are reachable for
-chain dispatch via the OID-keyed `ecdsa-with-shaN` entries — which accept any
-supported curve — and as fine-grained policy-keyed entries for TLS opt-in.
-
-ML-DSA is on the default whitelist (the modern PQC future). SLH-DSA's twelve
-parameter sets are registered but never on the default whitelist: signatures
-are 7–50 KB and rarely the right default for X.509 leaves.
-
-#### Configuring the policy
+X.509 and TLS verification dispatch through a registry of signature
+algorithms gated by a strict whitelist, `SignaturePolicy`. The default
+(`modern()`) is the IANA-blessed set plus ML-DSA, with RSA keys of 2048 bits
+or more. To accept SHA-1 RSA for a legacy peer, or to go PQC-only:
 
 ```rust
 use purecrypto::signature_registry::SignaturePolicy;
 use purecrypto::tls::{Config, RootCertStore};
 
-let roots = RootCertStore::new();
-
-// Default — modern IANA-blessed set, RSA ≥ 2048 bits.
-let cfg = Config::builder().roots(roots).build();
-
-// Legacy interop: accept SHA-1 RSA and lower the RSA-bit floor to 1024.
-let roots = RootCertStore::new();
-let cfg = Config::builder()
-    .roots(roots)
-    .signature_policy(
-        SignaturePolicy::modern()
-            .permit("rsa-pkcs1-sha1")
-            .with_min_rsa_bits(1024),
-    )
+let legacy = Config::builder()
+    .roots(RootCertStore::new())
+    .signature_policy(SignaturePolicy::modern().permit("rsa-pkcs1-sha1").with_min_rsa_bits(1024))
     .build();
 
-// PQC-strict: only ML-DSA + Ed25519, refuse everything classical.
-let roots = RootCertStore::new();
-let cfg = Config::builder()
-    .roots(roots)
-    .signature_policy(
-        SignaturePolicy::empty()
-            .permit("ml-dsa-65")
-            .permit("ml-dsa-87")
-            .permit("ed25519"),
-    )
-    .build();
-
-// SLH-DSA chains: opt in to a single set the application expects.
-let roots = RootCertStore::new();
-let cfg = Config::builder()
-    .roots(roots)
-    .signature_policy(SignaturePolicy::modern().permit("slh-dsa-sha2-128f"))
+let pqc_only = Config::builder()
+    .roots(RootCertStore::new())
+    .signature_policy(SignaturePolicy::empty().permit("ml-dsa-65").permit("ed25519"))
     .build();
 ```
 
-`signature_policy` on the unified [`Config`] applies to both client and
-server roles — for the server it gates client-certificate validation under
-mTLS. The policy is a strict whitelist:
-adding an entry to the registry does NOT auto-permit it — the caller has to
-add the id explicitly.
+The full registry table and `try_permit` (for ids that come from
+configuration) are in [docs/signature-registry.md](docs/signature-registry.md).
 
 ## C library
 
-Prebuilt archives — the `purecrypto` CLI, the static (`.a`/`.lib`) and shared
-(`.so`/`.dylib`/`.dll`) C libraries, and the header — are attached to each
-[GitHub release](https://github.com/KarpelesLab/purecrypto/releases) for Linux,
-macOS, and Windows.
-
-The same code is callable from C via the `ffi` feature. Because the crate stays
-`rlib` by default (so the `no_std` build is unaffected), produce the C library
-with `cargo rustc`:
+Prebuilt archives (the CLI, the static and shared C libraries, and the
+header) are attached to each
+[GitHub release](https://github.com/KarpelesLab/purecrypto/releases) for
+Linux, macOS and Windows. To build them yourself:
 
 ```sh
-cargo rustc --lib --release --features ffi --crate-type cdylib    # → target/release/libpurecrypto.so
-cargo rustc --lib --release --features ffi --crate-type staticlib # → target/release/libpurecrypto.a
-
-# Static link (self-contained):
+cargo rustc --lib --release --features ffi --crate-type cdylib    # target/release/libpurecrypto.so
+cargo rustc --lib --release --features ffi --crate-type staticlib # target/release/libpurecrypto.a
 cc app.c -I include target/release/libpurecrypto.a -lpthread -ldl -lm -o app
 ```
 
-The API is declared in [`include/purecrypto.h`](include/purecrypto.h): one-shot
-and streaming hashing, HMAC, OS randomness, RSA/ECDSA/Ed25519 key generation,
-signing, verification and PEM I/O, ML-KEM (FIPS 203) / ML-DSA (FIPS 204) /
-SLH-DSA (FIPS 205) keys, X.509 parsing/verification, and a sans-I/O TLS /
-DTLS surface (`pc_tls_cfg_*`, `pc_tls_*`) including post-handshake
-accessors for the negotiated cipher suite and peer SNI. Functions return a
-`pc_status` code; variable-length output uses an in/out length buffer;
-stateful objects are opaque handles freed by the library; panics never
-cross the boundary.
+The API is declared in [`include/purecrypto.h`](include/purecrypto.h):
+hashing, HMAC/CMAC/GMAC, KDFs, randomness, AEADs and key wrap, RSA, ECDSA,
+Ed25519/Ed448, X25519/X448, SM2, ML-KEM, ML-DSA, SLH-DSA, LMS/HSS, XMSS,
+CSRs, X.509 and CRLs, and sans-I/O TLS, DTLS and QUIC. Every function returns
+a `PcStatus` (`PC_OK` or a negative code, for example `PC_CLOSED` once the
+peer's `close_notify` has been processed, or `PC_KEY_MISMATCH` when a
+certificate is configured with the wrong key). Variable-length output uses
+an in/out length buffer; stateful objects are opaque handles freed by the
+library; panics never cross the boundary.
+
+The TLS surface mirrors OpenSSL's memory BIO: the caller pumps wire bytes
+through `pc_tls_feed` / `pc_tls_pop` and application bytes through
+`pc_tls_send` / `pc_tls_recv`. A DTLS server with cookies enabled needs
+`pc_dtls_cfg_set_peer_addr` for each peer. The smoke tests in
+[`tests/`](tests/) (`ffi_smoke.c`, `ffi_tls_smoke.c`, `ffi_dtls_smoke.c`,
+`ffi_quic_smoke.c`) are complete, runnable examples.
+
+## Security status
+
+This crate has not had a third-party human audit and is not FIPS
+validated. Whole-codebase automated audits are run regularly and their
+fixes land on `master`; see [SECURITY.md](SECURITY.md) and
+[docs/validation.md](docs/validation.md) for what that does and does not
+cover, and report vulnerabilities privately through GitHub's security
+advisories.
 
 ## License
 
