@@ -229,7 +229,7 @@ pub type Aes256Xts = Xts<super::Aes256>;
 mod tests {
     use super::*;
     use crate::cipher::{Aes128, Aes256};
-    use crate::test_util::from_hex;
+    use crate::test_util::{from_hex, from_hex_vec};
 
     /// IEEE 1619-2007 Annex B Vector 1 (XTS-AES-128, two full blocks, sector 0).
     #[test]
@@ -281,6 +281,49 @@ mod tests {
         assert_eq!(buf, expected);
         xts.decrypt_sector(0xff, &mut buf).unwrap();
         assert_eq!(buf, pt);
+    }
+
+    /// IEEE 1619-2007 Annex B Vectors 15–18 (XTS-AES-128, data unit sequence
+    /// number `0x123456789a`): 17-, 18-, 19- and 20-byte units, so every one
+    /// exercises ciphertext stealing over a single full block plus a 1–4-byte
+    /// tail. These are the published CTS vectors; the round-trip test below
+    /// covers the remaining tail lengths against the implementation itself.
+    #[test]
+    fn ieee_1619_vectors_15_to_18_ciphertext_stealing() {
+        let k1 = from_hex::<16>("fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0");
+        let k2 = from_hex::<16>("bfbebdbcbbbab9b8b7b6b5b4b3b2b1b0");
+        let xts = Aes128Xts::new(Aes128::new(&k1), Aes128::new(&k2));
+        // IEEE prints the DUSN as the little-endian tweak bytes `9a 78 56 34
+        // 12 …`; as an integer that is 0x123456789a.
+        let sector: u128 = 0x12_3456_789a;
+
+        let cases: [(&str, &str); 4] = [
+            (
+                "000102030405060708090a0b0c0d0e0f10",
+                "6c1625db4671522d3d7599601de7ca09ed",
+            ),
+            (
+                "000102030405060708090a0b0c0d0e0f1011",
+                "d069444b7a7e0cab09e24447d24deb1fedbf",
+            ),
+            (
+                "000102030405060708090a0b0c0d0e0f101112",
+                "e5df1351c0544ba1350b3363cd8ef4beedbf9d",
+            ),
+            (
+                "000102030405060708090a0b0c0d0e0f10111213",
+                "9d84c813f719aa2c7be3f66171c7c5c2edbf9dac",
+            ),
+        ];
+        for (i, (pt_hex, ct_hex)) in cases.iter().enumerate() {
+            let pt = from_hex_vec(pt_hex);
+            let ct = from_hex_vec(ct_hex);
+            let mut buf = pt.clone();
+            xts.encrypt_sector(sector, &mut buf).unwrap();
+            assert_eq!(buf, ct, "vector {}", 15 + i);
+            xts.decrypt_sector(sector, &mut buf).unwrap();
+            assert_eq!(buf, pt, "vector {} decrypt", 15 + i);
+        }
     }
 
     /// Sector shorter than one block is rejected.

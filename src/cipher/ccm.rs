@@ -380,6 +380,32 @@ mod tests {
         assert_eq!(buf, pt);
     }
 
+    /// NIST SP 800-38C Example 4: M=14, 13-byte nonce, 32-byte payload and a
+    /// 65 536-byte AAD (`A[i] = i mod 256`). `Alen ≥ 0xff00`, so the AAD length
+    /// is encoded with the 6-byte `ff fe ‖ [Alen]₃₂` header — the only
+    /// published vector that takes that branch of the formatting function.
+    #[test]
+    fn nist_38c_example_4_m14_long_aad() {
+        let key = from_hex::<16>("404142434445464748494a4b4c4d4e4f");
+        let nonce = from_hex::<13>("101112131415161718191a1b1c");
+        let mut aad = [0u8; 65536];
+        for (i, a) in aad.iter_mut().enumerate() {
+            *a = i as u8;
+        }
+        let pt = from_hex::<32>("202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f");
+        let expected_ct =
+            from_hex::<32>("69915dad1e84c6376a68c2967e4dab615ae0fd1faec44cc484828529463ccf72");
+        let expected_tag = from_hex::<14>("b4ac6bec93e8598e7f0dadbcea5b");
+
+        let ccm: Ccm<Aes128, 14> = Ccm::new(Aes128::new(&key));
+        let mut buf = pt;
+        let tag = ccm.encrypt(&nonce, &aad, &mut buf);
+        assert_eq!(buf, expected_ct);
+        assert_eq!(tag, expected_tag);
+        ccm.decrypt(&nonce, &aad, &mut buf, &tag).unwrap();
+        assert_eq!(buf, pt);
+    }
+
     /// Round-trip for the M=16 case (the public Aes128Ccm alias); validates
     /// that the M=16 path differs from M=8 only in the truncation width, which
     /// is already exhaustively exercised by the published lower-M vectors.

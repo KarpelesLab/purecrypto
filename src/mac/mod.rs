@@ -9,9 +9,9 @@
 //! - [`Umac64`] — 8-byte tag (`UMAC-AES-128`, `iter = 2`).
 //! - [`Umac128`] — 16-byte tag (`UMAC-AES-128`, `iter = 4`).
 //!
-//! Both are keyed with a 16-byte AES key and accept an 8-, 12- or 16-byte
-//! nonce; messages are authenticated as a single value or in streaming
-//! chunks.
+//! Both are keyed with a 16-byte AES key and accept a nonce of 1 to 16 bytes
+//! (RFC 4418 §3.3.1; 8 bytes is the conventional choice); messages are
+//! authenticated as a single value or in streaming chunks.
 
 mod umac;
 

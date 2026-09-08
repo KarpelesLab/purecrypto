@@ -381,6 +381,37 @@ mod tests {
         );
     }
 
+    /// RFC 8452 Appendix C.1: AES-128-GCM-SIV, 64-byte plaintext (four full
+    /// POLYVAL blocks and four CTR blocks), no AAD. The shorter cases above
+    /// never leave the first block, so this is what pins the multi-block
+    /// POLYVAL chaining and the CTR counter increment.
+    #[test]
+    fn rfc8452_c1_64byte() {
+        let key = from_hex::<16>("01000000000000000000000000000000");
+        let nonce = from_hex::<12>("030000000000000000000000");
+        let siv = AesGcmSiv::new(&key);
+        let pt = from_hex::<64>(
+            "01000000000000000000000000000000\
+             02000000000000000000000000000000\
+             03000000000000000000000000000000\
+             04000000000000000000000000000000",
+        );
+        let mut buf = pt;
+        let tag = siv.encrypt(&nonce, &[], &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<64>(
+                "2433668f1058190f6d43e360f4f35cd8\
+                 e475127cfca7028ea8ab5c20f7ab2af0\
+                 2516a2bdcbc08d521be37ff28c152bba\
+                 36697f25b4cd169c6590d1dd39566d3f"
+            )
+        );
+        assert_eq!(tag, from_hex::<16>("8a263dd317aa88d56bdf3936dba75bb8"));
+        siv.decrypt(&nonce, &[], &mut buf, &tag).unwrap();
+        assert_eq!(buf, pt);
+    }
+
     // RFC 8452 Appendix C.1: AES-128-GCM-SIV with AAD (4 bytes AAD, 4 bytes pt).
     #[test]
     fn rfc8452_c1_with_aad() {

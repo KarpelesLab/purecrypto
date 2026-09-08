@@ -681,6 +681,60 @@ mod tests {
         assert_eq!(tag, from_hex::<16>("5bc94fbc3221a5db94fae95ae7121a47"));
     }
 
+    /// McGrew–Viega GCM spec Test Case 5: the same key/AAD/plaintext as TC4
+    /// with a 64-bit IV, so J0 goes through the GHASH derivation rather than
+    /// the `IV ‖ 0³¹ ‖ 1` shortcut.
+    #[test]
+    fn tc5_iv_8_bytes() {
+        let g = gcm128("feffe9928665731c6d6a8f9467308308");
+        let nonce = from_hex::<8>("cafebabefacedbad");
+        let aad = from_hex::<20>("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let plaintext = from_hex::<60>(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+             1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
+        let mut buf = plaintext;
+        let tag = g.encrypt(&nonce, &aad, &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<60>(
+                "61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c7423\
+                 73806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598"
+            )
+        );
+        assert_eq!(tag, from_hex::<16>("3612d2e79e3b0785561be14aaca2fccb"));
+        g.decrypt(&nonce, &aad, &mut buf, &tag).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
+    /// McGrew–Viega GCM spec Test Case 6: a 480-bit IV — several full GHASH
+    /// blocks plus a partial one in the J0 derivation.
+    #[test]
+    fn tc6_iv_60_bytes() {
+        let g = gcm128("feffe9928665731c6d6a8f9467308308");
+        let nonce = from_hex::<60>(
+            "9313225df88406e555909c5aff5269aa6a7a9538534f7da1e4c303d2a318a728\
+             c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b",
+        );
+        let aad = from_hex::<20>("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+        let plaintext = from_hex::<60>(
+            "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
+             1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39",
+        );
+        let mut buf = plaintext;
+        let tag = g.encrypt(&nonce, &aad, &mut buf);
+        assert_eq!(
+            buf,
+            from_hex::<60>(
+                "8ce24998625615b603a033aca13fb894be9112a5c3a211a8ba262a3cca7e2ca7\
+                 01e4a9a4fba43c90ccdcb281d48c7c6fd62875d2aca417034c34aee5"
+            )
+        );
+        assert_eq!(tag, from_hex::<16>("619cc5aefffe0bfa462af43c1699d050"));
+        g.decrypt(&nonce, &aad, &mut buf, &tag).unwrap();
+        assert_eq!(buf, plaintext);
+    }
+
     #[test]
     fn decrypt_roundtrip_and_reject() {
         let g = gcm128("feffe9928665731c6d6a8f9467308308");
