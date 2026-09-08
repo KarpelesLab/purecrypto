@@ -316,6 +316,9 @@ macro_rules! parallelhash {
         impl<const B: usize> $name<B> {
             /// Creates a ParallelHash with customization string `custom`.
             pub fn new(custom: &[u8]) -> Self {
+                // `update` takes `min(B - leaf_len, data.len())` bytes per
+                // pass; with `B == 0` that is always 0 and it never returns.
+                assert!(B > 0, "ParallelHash block size B must be > 0");
                 let (mut outer, _) = cshake_init($rate, b"ParallelHash", custom);
                 let mut b = [0u8; 9];
                 let n = left_encode(&mut b, B as u64);
@@ -610,5 +613,19 @@ mod tests {
         }
         p.finalize_into(&mut b);
         assert_eq!(a, b);
+    }
+
+    // A zero block size would make `update` loop forever (each pass takes
+    // `min(0, data.len())` bytes and never advances). Reject it up front.
+    #[test]
+    #[should_panic(expected = "ParallelHash block size B must be > 0")]
+    fn parallelhash128_rejects_zero_block_size() {
+        let _ = ParallelHash128::<0>::new(b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "ParallelHash block size B must be > 0")]
+    fn parallelhash256_rejects_zero_block_size() {
+        let _ = ParallelHash256::<0>::new(b"");
     }
 }
