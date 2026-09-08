@@ -266,8 +266,16 @@ fn sub_p_mask(r: &[u64; 4], hi: u64) -> ([u64; 4], u64) {
     }
     // The value is >= P iff there is a high carry bit, or no final borrow.
     let ge = (hi != 0) | (borrow == 0);
-    let mask = if ge { u64::MAX } else { 0 };
-    (out, mask)
+    (out, mask_from_bool(ge))
+}
+
+/// Expands a secret-derived condition into an all-ones / all-zeros limb mask
+/// without a branch: `wrapping_neg` of the 0/1 value, behind a `black_box`
+/// barrier so LLVM cannot turn the mask back into a conditional jump (the
+/// same idiom `ct::select` uses).
+#[inline(always)]
+fn mask_from_bool(cond: bool) -> u64 {
+    core::hint::black_box((cond as u64).wrapping_neg())
 }
 
 /// Selects `a` when `mask == 0` and `b` when `mask == 0xFFFF…FF`, per limb.
@@ -402,7 +410,7 @@ impl FieldBackend for Secp256k1Field {
             i += 1;
         }
         // On underflow, add p back (constant-time, mask-driven).
-        let mask = if borrow != 0 { u64::MAX } else { 0 };
+        let mask = mask_from_bool(borrow != 0);
         let mut out = [0u64; 4];
         let mut carry: u128 = 0;
         let mut j = 0;
@@ -431,8 +439,7 @@ impl FieldBackend for Secp256k1Field {
             borrow = (tmp >> 64) & 1;
             i += 1;
         }
-        let is_zero = (a[0] | a[1] | a[2] | a[3]) == 0;
-        let zero_mask = if is_zero { u64::MAX } else { 0 };
+        let zero_mask = mask_from_bool((a[0] | a[1] | a[2] | a[3]) == 0);
         let out = select(&r, &[0u64; 4], zero_mask);
         Fe::from_limbs(out)
     }
