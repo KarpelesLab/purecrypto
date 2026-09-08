@@ -27,6 +27,19 @@
 //! §9.3.1 amplification limit, reverting if the new path never answers.
 //! [`QuicConnection::peer_address`] is the authority on where output goes.
 //!
+//! The §8.1 anti-amplification limit is kept *per path*
+//! ([`Path`](crate::quic::path::Path)): the address currently in use has its
+//! own `{validated, bytes_recv, bytes_sent}` and every move to a new address —
+//! a client's migration (server side) or a client's move to the server's
+//! `preferred_address` (§9.6, client side) — starts a fresh, unvalidated
+//! budget, while the path moved away from is parked for the fallback. Only
+//! bytes that arrive from the address being sent to extend its budget, and a
+//! path whose validation times out is discarded along with whatever it had
+//! accumulated. On the client, whose paths are chosen from authenticated
+//! server input rather than from spoofable source addresses, datagrams whose
+//! count the state machine already bounds (path probes, the close frame) are
+//! exempt so validation itself can never be starved.
+//!
 //! RFC 9001 §4.6 0-RTT is wired on both sides. A client given a
 //! [`QuicSession`] through [`QuicConfig::resumption`] offers early data in its
 //! ClientHello and carries streams written before the handshake completes in
@@ -62,7 +75,7 @@ use crate::quic::frame::{EcnCounts, Frame, FrameIter, StreamDir, build_ack_range
 use crate::quic::loss::{
     CryptoHint, SentPacket, StreamHint, build_retransmit_hint, parse_retransmit_hint,
 };
-use crate::quic::path::PathChallengeState;
+use crate::quic::path::{Path, PathChallengeState};
 use crate::quic::pkt::{
     LongHeader, LongType, QUIC_V1, ShortHeader, apply_header_protection, build_long_header,
     build_retry, build_short_header, check_reserved_bits, remove_header_protection,
@@ -333,6 +346,10 @@ pub(crate) struct PathMigration {
     /// The Destination CID the old path used, restored alongside `prev_addr`
     /// if validation fails, and retired once it succeeds (RFC 9000 §9.5).
     prev_cid: ConnectionId,
+    /// The RFC 9000 §8.1 state of the path moved away from, restored with
+    /// `prev_addr` if validation fails. The new path starts from a fresh
+    /// unvalidated [`Path`] the moment the move begins (§9.3.1).
+    prev_path: Path,
 }
 
 /// Default `max_idle_timeout` (RFC 9000 §18.2) advertised by
@@ -536,9 +553,12 @@ pub struct QuicConnection {
     /// [`Self::feed_datagram`] entrypoint (e.g. loopback tests); the
     /// retry-token path won't work without a real address.
     peer_addr: Option<SocketAddr>,
-    /// RFC 9000 §8.1 anti-amplification state. Server-side only — the
-    /// client doesn't enforce AMP.
-    addr_validation: AddressValidation,
+    /// RFC 9000 §8.1 / §9.3.1 anti-amplification state of the path in use —
+    /// the one addressed by `peer_addr`. A server starts unvalidated (the
+    /// handshake address must prove itself); a client starts validated (it
+    /// chose the address). Every migration swaps in a fresh unvalidated
+    /// [`Path`], parking this one in [`PathMigration::prev_path`].
+    active_path: Path,
     /// Server-only — `true` when [`QuicConfig::require_retry`] was set
     /// AND a `retry_secret` was supplied. Determines whether the server
     /// emits a Retry on the very first Initial.
@@ -634,7 +654,9 @@ pub struct QuicConnection {
     pub(crate) migration: Option<PathMigration>,
     /// True while the address in `peer_addr` is known to belong to the peer:
     /// either it is the address the handshake ran on, or a migration to it
-    /// completed path validation. Drives the §9.3.1 amplification guard.
+    /// completed path validation. Gates non-probing frames on the client
+    /// (§9.6.2 / §21.5.3); the §9.3.1 amplification budget itself lives in
+    /// `active_path`.
     pub(crate) peer_addr_validated: bool,
     /// Source address of the datagram currently being processed, and its
     /// length — set by `feed_datagram_from*` for the duration of the call,
@@ -709,56 +731,6 @@ pub struct QuicConnection {
     /// handler (and the feed path) discard them once that window has
     /// elapsed. `None` while no previous-phase keys are retained.
     prev_rx_keys_installed_at: Option<Duration>,
-}
-
-/// RFC 9000 §8.1 anti-amplification window. Until the server has
-/// validated the peer's address (either via Retry or by completing the
-/// handshake), it MUST NOT send more than `3 × bytes_recv` bytes total.
-///
-/// On the client side, AMP enforcement is a no-op (the client doesn't
-/// face the reflection-amplification risk that the server does).
-#[derive(Default)]
-pub(crate) struct AddressValidation {
-    /// Bytes received from the peer at the unvalidated address.
-    pub(crate) bytes_recv: u64,
-    /// Bytes the server has sent to the unvalidated peer.
-    pub(crate) bytes_sent: u64,
-    /// Set once the address is validated (Handshake-level bytes received
-    /// from the peer, OR retry-token round-trip succeeded, OR handshake
-    /// completed).
-    pub(crate) validated: bool,
-}
-
-impl AddressValidation {
-    /// Server-side check: is there budget to send `n` more bytes to the
-    /// unvalidated peer? Per RFC 9000 §8.1, total outbound bytes MUST NOT
-    /// exceed 3× total inbound bytes.
-    #[inline]
-    pub(crate) fn can_send(&self, n: usize) -> bool {
-        if self.validated {
-            return true;
-        }
-        let budget = self.bytes_recv.saturating_mul(3);
-        self.bytes_sent.saturating_add(n as u64) <= budget
-    }
-
-    /// Records `n` outbound bytes against the AMP budget. No-op once
-    /// validated.
-    #[inline]
-    pub(crate) fn note_sent(&mut self, n: usize) {
-        if !self.validated {
-            self.bytes_sent = self.bytes_sent.saturating_add(n as u64);
-        }
-    }
-
-    /// Records `n` inbound bytes (extends the AMP budget). Bytes received
-    /// before validation give the server `3 × n` more outbound budget.
-    #[inline]
-    pub(crate) fn note_recv(&mut self, n: usize) {
-        if !self.validated {
-            self.bytes_recv = self.bytes_recv.saturating_add(n as u64);
-        }
-    }
 }
 
 enum EngineSide {
@@ -910,7 +882,9 @@ impl QuicConnection {
             server_name: Some(server_name.into()),
             streams: None,
             peer_addr: None,
-            addr_validation: AddressValidation::default(),
+            // The client picked the server's address itself; RFC 9000 §8.1's
+            // limit is a server-side defence.
+            active_path: Path::validated(),
             require_retry: false,
             retry_secret: None,
             retry_sent: false,
@@ -1033,7 +1007,7 @@ impl QuicConnection {
             server_name: None,
             streams: None,
             peer_addr: None,
-            addr_validation: AddressValidation::default(),
+            active_path: Path::default(),
             require_retry,
             retry_secret,
             retry_sent: false,
@@ -1223,25 +1197,26 @@ impl QuicConnection {
         }
 
         // RFC 9000 §8.1 — every byte received from an unvalidated peer
-        // expands the server's outbound AMP budget by 3×. Bytes that
-        // turn out to belong to a non-decryptable packet still count
-        // (a generous attacker could otherwise burn our budget without
-        // ever proving address ownership).
+        // expands the outbound AMP budget by 3×. Bytes that turn out to
+        // belong to a non-decryptable packet still count (a generous
+        // attacker could otherwise burn our budget without ever proving
+        // address ownership).
         //
-        // H-3: the budget is a *per-path* allowance (§8.1, §9.3.1), but
-        // `addr_validation` is a single connection-wide counter, so only
+        // H-3: the budget is a *per-path* allowance (§8.1, §9.3.1): only
         // datagrams that arrived from the address we are actually sending to
-        // may extend it. Without this, an attacker who learns the cleartext
-        // DCID can flood undecryptable datagrams from spoofed sources and
-        // credit a budget that is then spent on a migrated-to victim.
-        // `current_rx_addr` is `None` for plain `feed_datagram` callers (no
-        // address information at all), which keeps the legacy behaviour.
-        if self.role == Role::Server
-            && self
-                .current_rx_addr
-                .is_none_or(|a| Some(a) == self.peer_addr)
+        // extend `active_path`. Without this, an attacker who learns the
+        // cleartext DCID can flood undecryptable datagrams from spoofed
+        // sources and credit a budget that is then spent on a migrated-to
+        // victim. Datagrams from any other address belong to no path we are
+        // sending on and buy nothing. `current_rx_addr` is `None` for plain
+        // `feed_datagram` callers (no address information at all), which
+        // keeps the legacy behaviour. A no-op on a validated path, which is
+        // the client's normal state.
+        if self
+            .current_rx_addr
+            .is_none_or(|a| Some(a) == self.peer_addr)
         {
-            self.addr_validation.note_recv(datagram.len());
+            self.active_path.note_recv(datagram.len());
         }
 
         // Server-side stateless-retry decision: on the very first Initial
@@ -1253,7 +1228,7 @@ impl QuicConnection {
         if self.role == Role::Server
             && self.require_retry
             && !self.handshake_complete
-            && !self.addr_validation.validated
+            && !self.active_path.validated
             && let Some(consumed) = self.maybe_emit_retry(datagram)?
         {
             // Either: a Retry was just emitted (consumed), OR the
@@ -1428,7 +1403,7 @@ impl QuicConnection {
         match crate::quic::retry::validate(&secret, &addr_bytes, hdr.token, self.now_secs) {
             Ok(odcid) => {
                 // Address validated by the round-trip → exempt from AMP.
-                self.addr_validation.validated = true;
+                self.active_path.validated = true;
                 self.original_dcid = ConnectionId::from_slice(&odcid);
                 // On this retried Initial, the client used the
                 // Retry's SCID as its DCID. We discover that DCID
@@ -1475,11 +1450,11 @@ impl QuicConnection {
             // triggered the Retry is at least `MIN_INITIAL_DATAGRAM` bytes
             // (enforced in `feed_datagram`), so a legitimate client always
             // leaves ample budget for the ~74-byte Retry.
-            if !self.addr_validation.can_send(dg.len()) {
+            if !self.active_path.can_send(dg.len()) {
                 self.pending_retry_datagram = Some(dg);
                 return Vec::new();
             }
-            self.addr_validation.note_sent(dg.len());
+            self.active_path.note_sent(dg.len());
             self.endpoint.sent_first_datagram = true;
             return dg;
         }
@@ -1496,9 +1471,10 @@ impl QuicConnection {
         // the AMP budget, we'd be discarding state we can never
         // recover for DATAGRAM frames specifically.
         //
-        // Strategy: server pre-validation only. We compute the
-        // outbound budget and refuse to even start assembly if it
-        // can't cover at least one v1 minimum packet (1200 bytes for
+        // Strategy: unvalidated paths only (a server before address
+        // validation, either role while a migration is being validated).
+        // We compute the outbound budget and refuse to even start assembly
+        // if it can't cover at least one v1 minimum packet (1200 bytes for
         // the very first client Initial, smaller thereafter). Bytes
         // ACK / CRYPTO are RFC-permitted to retransmit, so a borderline
         // build that ends up just under the cap is still acceptable —
@@ -1508,7 +1484,7 @@ impl QuicConnection {
         // We use the worst-case datagram size (UDP MTU ≈ 1200 bytes
         // for the initial-PMTU floor of RFC 9000 §14) as a coarse
         // upper bound on what build_packet_with_pad might produce.
-        if self.role == Role::Server && !self.addr_validation.validated {
+        if !self.active_path.validated {
             // Worst case: the assembled datagram could be up to ~1500
             // bytes (max we ever pad to; in practice 1200 for the
             // first Initial, ≤ 1200 thereafter without explicit
@@ -1519,15 +1495,13 @@ impl QuicConnection {
             // small CRYPTO / ACK assemblies that *do* fit the budget
             // still go out.
             let outbound_snapshot = self.datagram_queues.outbound.clone();
-            let saved_bytes_sent = self.addr_validation.bytes_sent;
             let datagram = self.pop_datagram_inner();
             // If the inner call rejected (returned empty) but had
             // already mutated the DATAGRAM queue, restore the queue.
+            // (`bytes_sent` needs no restoring — the inner path only
+            // charges it on success.)
             if datagram.is_empty() && self.datagram_queues.outbound != outbound_snapshot {
                 self.datagram_queues.outbound = outbound_snapshot;
-                // Also restore bytes_sent — but the inner path only
-                // calls note_sent on success, so it's already correct.
-                let _ = saved_bytes_sent;
             }
             return datagram;
         }
@@ -1607,14 +1581,11 @@ impl QuicConnection {
         // QUIC datagram. §8.2.1 exempts an endpoint that would thereby exceed
         // its anti-amplification limit, which is exactly the server's state
         // on a freshly-migrated, not-yet-validated path — so we only ask for
-        // the expansion when the budget can cover it.
-        let path_frame_pending =
-            self.path.has_pending_response() || self.path.has_pending_challenge();
-        let onertt_pad = if path_frame_pending
-            && (self.role != Role::Server
-                || self
-                    .addr_validation
-                    .can_send(1200 - datagram.len().min(1200)))
+        // the expansion when the path's budget can cover it (a client's probe
+        // is exempt: see `path_budget_permits`).
+        let path_pending_before = self.path.pending_len();
+        let onertt_pad = if path_pending_before > 0
+            && self.path_budget_permits(1200 - datagram.len().min(1200), true)
         {
             Some((1200usize, datagram.len()))
         } else {
@@ -1623,6 +1594,9 @@ impl QuicConnection {
         if let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad) {
             datagram.extend_from_slice(&pkt);
         }
+        // A drop in the pending count means the 1-RTT packet just built
+        // carries a PATH_CHALLENGE / PATH_RESPONSE.
+        let carries_path_frame = self.path.pending_len() < path_pending_before;
 
         if datagram.is_empty() {
             return Vec::new();
@@ -1645,15 +1619,11 @@ impl QuicConnection {
             }
         }
 
-        // RFC 9000 §8.1 — server MUST NOT send more than 3× bytes_recv
-        // to an unvalidated peer. If this datagram would overflow the
-        // budget, drop it on the floor; the PTO will eventually re-fire
-        // and the client will retransmit, expanding our budget. (The
-        // client side has `validated == false` permanently — but it also
-        // gets a free pass since `bytes_recv` is never charged there;
-        // the field `validated` defaults `false` but we only consult it
-        // on the server.)
-        if self.role == Role::Server && !self.addr_validation.can_send(datagram.len()) {
+        // RFC 9000 §8.1 / §9.3.1 — an endpoint MUST NOT send more than 3×
+        // bytes_recv on an unvalidated path. If this datagram would overflow
+        // the path's budget, drop it on the floor; the PTO will eventually
+        // re-fire and the peer will retransmit, expanding the budget.
+        if !self.path_budget_permits(datagram.len(), carries_path_frame) {
             // Rewind any state mutations that the packet builders made:
             // chiefly the per-level PnSpace.next_tx was advanced. Worst
             // case we re-emit duplicate ACKs / CRYPTO chunks on the next
@@ -1661,9 +1631,7 @@ impl QuicConnection {
             // deduplicates by PN.
             return Vec::new();
         }
-        if self.role == Role::Server {
-            self.addr_validation.note_sent(datagram.len());
-        }
+        self.active_path.note_sent(datagram.len());
 
         self.endpoint.sent_first_datagram = true;
         // Arm the PTO if any CRYPTO chunk was actually carved in this
@@ -2329,16 +2297,12 @@ impl QuicConnection {
         }
 
         // §9.3: start sending to the new address immediately, and validate it.
+        // `begin_migration` opens a fresh unvalidated path, so the 3x
+        // anti-amplification budget of §8.1 applies again (§9.3.1) — an
+        // attacker who spoofs a victim's address must not be able to aim a
+        // flood at it. Credit the datagram that triggered the migration.
         self.begin_migration(current, from);
-        // §9.3.1: the new address is unvalidated, so the 3x anti-amplification
-        // budget of §8.1 applies again — an attacker who spoofs a victim's
-        // address must not be able to aim a flood at it. Credit the datagram
-        // that triggered the migration.
-        self.addr_validation = AddressValidation {
-            bytes_recv: self.current_rx_len as u64,
-            bytes_sent: 0,
-            validated: false,
-        };
+        self.active_path.note_recv(self.current_rx_len);
         // §9.5: a connection ID must not be reused across peer addresses, or
         // an observer could link the two paths to one connection. Retire the
         // one we were using and switch to a spare if the peer gave us any.
@@ -2368,6 +2332,10 @@ impl QuicConnection {
             // a NAT, so the congestion and RTT state survives it.
             port_only: from.ip() == to.ip(),
             prev_cid: self.endpoint.cids.peer,
+            // §9.3.1 / §8.1: the new address has proven nothing yet — it
+            // starts from an empty budget, and the old path's state is kept
+            // only for the fallback.
+            prev_path: core::mem::take(&mut self.active_path),
         });
         self.peer_addr = Some(to);
         self.peer_addr_validated = false;
@@ -2505,7 +2473,7 @@ impl QuicConnection {
         }
         // The peer has proven it receives at this address; §8.1's
         // amplification limit no longer applies to it.
-        self.addr_validation.validated = true;
+        self.active_path.validated = true;
         // §9.4: the new path's capacity and RTT are unknown, so the estimates
         // built on the old path MUST be discarded — unless only the port
         // changed, which almost always means the same path through a NAT.
@@ -2524,7 +2492,26 @@ impl QuicConnection {
         self.peer_addr = Some(m.prev_addr);
         self.endpoint.cids.peer = m.prev_cid;
         self.peer_addr_validated = true;
-        self.addr_validation.validated = true;
+        // The failed path's budget goes with it: whoever sends from that
+        // address next starts over from nothing (§9.3.1).
+        self.active_path = m.prev_path;
+    }
+
+    /// RFC 9000 §8.1 / §9.3.1 — may `n` more bytes go out on the path in use?
+    ///
+    /// Always on a validated path, and within the 3× budget on an unvalidated
+    /// one. `count_bounded` marks datagrams whose number the connection state
+    /// machine already limits — path probes (one PATH_CHALLENGE plus a single
+    /// re-send per migration, and PATH_RESPONSEs the peer had to spend a
+    /// datagram to elicit) and the CONNECTION_CLOSE. A *client* may send those
+    /// regardless of budget: its unvalidated paths come from the server's
+    /// authenticated `preferred_address`, never from a spoofable source
+    /// address, so they cannot be turned into a reflector against a third
+    /// party, whereas without the exemption a fresh path (nothing received
+    /// yet, budget zero) could never even be probed. A server gets no
+    /// exemption — §9.3.1 is written for exactly its situation.
+    fn path_budget_permits(&self, n: usize, count_bounded: bool) -> bool {
+        self.active_path.can_send(n) || (count_bounded && self.role == Role::Client)
     }
 
     // ============================================================
@@ -2707,16 +2694,14 @@ impl QuicConnection {
             None
         };
         // RFC 9000 §10.2.1 — the close packet still counts against the
-        // server's anti-amplification budget.
+        // path's anti-amplification budget.
         let Some(wire) = self.seal_packet(level, payload, pad, None) else {
             return Vec::new();
         };
-        if self.role == Role::Server {
-            if !self.addr_validation.can_send(wire.len()) {
-                return Vec::new();
-            }
-            self.addr_validation.note_sent(wire.len());
+        if !self.path_budget_permits(wire.len(), true) {
+            return Vec::new();
         }
+        self.active_path.note_sent(wire.len());
         self.endpoint.sent_first_datagram = true;
         wire
     }
@@ -4186,7 +4171,7 @@ impl QuicConnection {
         // first Initial round-trip far enough to install Handshake
         // keys.) After this point AMP enforcement is a no-op.
         if self.role == Role::Server && level == Level::Handshake {
-            self.addr_validation.validated = true;
+            self.active_path.validated = true;
         }
 
         // Parse frames. Dispatch on the cleartext.
@@ -7330,6 +7315,202 @@ mod tests {
         }
     }
 
+    /// RFC 9000 §8.1 / §9.3.1 — the anti-amplification budget is *per path*.
+    /// A packet from a new address opens an unvalidated path whose budget is
+    /// 3× the bytes received on it alone; the path moved away from keeps its
+    /// own (validated) state for the fallback; sends beyond the budget are
+    /// held until the PATH_RESPONSE validates the new path.
+    #[test]
+    fn migration_opens_a_fresh_per_path_amplification_budget() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        let handshake_path = s.active_path;
+        assert!(handshake_path.validated, "the handshake path is validated");
+
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, b"moving").expect("write");
+        let dg = c.pop_datagram();
+        assert!(!dg.is_empty());
+        s.feed_datagram_from(new_addr, &dg).expect("server feed");
+        assert!(s.is_migrating());
+        assert_eq!(
+            s.active_path,
+            Path {
+                validated: false,
+                bytes_recv: dg.len() as u64,
+                bytes_sent: 0,
+            },
+            "the new path's budget starts from the migrating datagram alone"
+        );
+        assert_eq!(
+            s.migration.as_ref().expect("migrating").prev_path,
+            handshake_path,
+            "the old path keeps its own state, untouched"
+        );
+
+        // The probe fits inside the budget and is charged to the new path.
+        let probe = s.pop_datagram();
+        assert!(!probe.is_empty(), "a PATH_CHALLENGE must be emitted");
+        assert!(probe.len() <= 3 * dg.len());
+        assert_eq!(s.active_path.bytes_sent, probe.len() as u64);
+
+        // Now the server has plenty to say — but a full-size datagram would
+        // blow the budget, so it is held back.
+        s.write(id, &[0x5a; 8192]).expect("server write");
+        let before = s.active_path;
+        assert!(
+            s.pop_datagram().is_empty(),
+            "§9.3.1: the unvalidated path is amplification-limited"
+        );
+        assert_eq!(s.active_path, before, "a held datagram is not charged");
+
+        // The client's echo validates the path; the budget stops applying.
+        c.feed_datagram(&probe).expect("client feed probe");
+        let response = c.pop_datagram();
+        assert!(!response.is_empty());
+        s.feed_datagram_from(new_addr, &response)
+            .expect("server feed response");
+        assert!(!s.is_migrating());
+        assert!(s.active_path.validated);
+        assert_eq!(
+            s.active_path.bytes_recv,
+            (dg.len() + response.len()) as u64,
+            "only bytes that arrived on this path were credited to it"
+        );
+        assert!(
+            !s.pop_datagram().is_empty(),
+            "traffic resumes once the path is validated"
+        );
+    }
+
+    /// RFC 9000 §9.3.1 — a path whose validation times out is abandoned
+    /// together with its budget. Nothing an off-path sender pushes at the
+    /// abandoned address buys credit, and a later genuine move to it starts
+    /// over from that packet alone.
+    #[test]
+    fn abandoned_path_takes_its_budget_with_it() {
+        let old_addr = ip4(192, 0, 2, 1, 1111);
+        let new_addr = ip4(198, 51, 100, 9, 2222);
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        let handshake_path = s.active_path;
+        assert!(handshake_path.validated);
+
+        // A big migrating datagram buys a big budget on the new path...
+        let id = c.open_bidi().expect("open bidi");
+        c.write(id, &[0x11; 1000]).expect("write");
+        let dg1 = c.pop_datagram();
+        assert!(dg1.len() > 1000);
+        s.feed_datagram_from(new_addr, &dg1).expect("server feed");
+        assert!(s.is_migrating());
+        assert_eq!(s.active_path.bytes_recv, dg1.len() as u64);
+        assert!(!s.pop_datagram().is_empty(), "the probe goes out");
+        assert!(s.active_path.bytes_sent > 0);
+
+        // ...which dies with the migration when nobody answers.
+        let deadline = s.migration.as_ref().expect("migrating").deadline;
+        s.on_timeout(deadline);
+        assert!(!s.is_migrating());
+        assert_eq!(s.peer_address(), Some(old_addr));
+        assert_eq!(
+            s.active_path, handshake_path,
+            "the fallback path's own state is restored"
+        );
+
+        // Junk from the abandoned address credits nothing: it is not the path
+        // we are sending on.
+        let junk = alloc::vec![0x40u8; 1200];
+        let _ = s.feed_datagram_from(new_addr, &junk);
+        assert_eq!(s.active_path, handshake_path);
+
+        // A genuine move there starts over from the new packet alone.
+        c.write(id, b"again").expect("write");
+        let dg2 = c.pop_datagram();
+        assert!(dg2.len() < dg1.len());
+        s.feed_datagram_from(new_addr, &dg2).expect("server feed");
+        assert!(s.is_migrating());
+        assert_eq!(
+            s.active_path,
+            Path {
+                validated: false,
+                bytes_recv: dg2.len() as u64,
+                bytes_sent: 0,
+            },
+            "the abandoned path's budget must not carry over"
+        );
+    }
+
+    /// RFC 9000 §9.6 / §8.1 — a client moving to the server's preferred
+    /// address opens a fresh path with an empty budget. Its PATH_CHALLENGE
+    /// still goes out (expanded per §8.2.1) and is charged to the path, but
+    /// nothing else may until the server's echo validates it — the client
+    /// used to bound this only structurally, with no accounting at all.
+    #[test]
+    fn client_probe_to_preferred_address_is_charged_but_never_starved() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let old_addr = ip4(192, 0, 2, 1, 5555);
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC3; 8],
+            stateless_reset_token: [0x66; 16],
+        };
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        c.peer_params
+            .as_mut()
+            .expect("peer params")
+            .preferred_address = Some(pa.encode());
+        c.cid_remote.as_mut().expect("pool").entries.remove(&1);
+        assert!(c.active_path.validated, "the configured address is trusted");
+
+        // Queue non-probing data so the budget has something to hold back.
+        let sid = c.open_bidi().expect("open");
+        c.write(sid, b"held back").expect("write");
+
+        let target = c.migrate_to_preferred_address().expect("migrate");
+        assert_eq!(
+            c.active_path,
+            Path::default(),
+            "a fresh path: nothing received, nothing sent, unvalidated"
+        );
+        assert_eq!(
+            c.migration.as_ref().expect("migrating").prev_path,
+            Path::validated()
+        );
+
+        // Budget zero — yet the probe goes out, and is charged.
+        let probe = c.pop_datagram();
+        assert_eq!(probe.len(), 1200, "§8.2.1: the probe is expanded");
+        assert_eq!(c.active_path.bytes_sent, 1200);
+        assert!(!c.active_path.can_send(1), "the budget is honoured");
+        assert!(
+            c.pop_datagram().is_empty(),
+            "nothing but probes may reach the unvalidated path"
+        );
+        assert!(!c.has_unacked_streams());
+
+        // The server's echo arrives from the preferred address.
+        s.feed_datagram_from(old_addr, &probe).expect("server feed");
+        let response = s.pop_datagram();
+        assert!(!response.is_empty());
+        c.feed_datagram_from(target, &response)
+            .expect("client feed");
+        assert!(!c.is_migrating());
+        assert!(c.active_path.validated);
+        assert_eq!(
+            c.active_path.bytes_recv,
+            response.len() as u64,
+            "the echo was credited to the path it arrived on"
+        );
+        assert!(!c.pop_datagram().is_empty(), "traffic resumes");
+        assert!(c.has_unacked_streams());
+    }
+
     /// H-6(a) — RFC 9002 §A.10 `OnPacketNumberSpaceDiscarded`: packets still
     /// outstanding in a discarded packet-number space can never be
     /// acknowledged, so their bytes must leave `bytes_in_flight`. They used to
@@ -8284,11 +8465,11 @@ mod tests {
         let retry = s.pop_datagram();
         assert!(!retry.is_empty(), "full-size Initial must draw a Retry");
         assert!(
-            s.addr_validation.bytes_sent >= retry.len() as u64,
+            s.active_path.bytes_sent >= retry.len() as u64,
             "the Retry must be charged against the AMP budget"
         );
         assert!(
-            s.addr_validation.bytes_sent <= s.addr_validation.bytes_recv * 3,
+            s.active_path.bytes_sent <= s.active_path.bytes_recv * 3,
             "AMP budget must not be exceeded"
         );
     }
@@ -8342,16 +8523,16 @@ mod tests {
         // question is only whether it bought the attacker any budget.
         let junk = alloc::vec![0x40u8; 1200];
 
-        let before = s.addr_validation.bytes_recv;
+        let before = s.active_path.bytes_recv;
         let _ = s.feed_datagram_from(spoofed, &junk);
         assert_eq!(
-            s.addr_validation.bytes_recv, before,
+            s.active_path.bytes_recv, before,
             "off-path datagram must not extend the AMP budget"
         );
 
         let _ = s.feed_datagram_from(peer, &junk);
         assert_eq!(
-            s.addr_validation.bytes_recv,
+            s.active_path.bytes_recv,
             before + junk.len() as u64,
             "on-path datagram must still extend the AMP budget"
         );
@@ -8572,7 +8753,7 @@ mod tests {
     ///       unvalidated;
     ///   (b) once the server's Handshake-level rx succeeds (server got
     ///       a valid Handshake-level packet from the client),
-    ///       `addr_validation.validated` flips to true and `can_send`
+    ///       `active_path.validated` flips to true and `can_send`
     ///       returns true regardless of budget.
     #[test]
     fn amp_limit_caps_initial_outbound() {
@@ -8580,8 +8761,8 @@ mod tests {
 
         // Pre-handshake: server has no inbound bytes → budget 0,
         // can't send anything.
-        assert!(!s.addr_validation.can_send(1));
-        assert!(s.addr_validation.can_send(0));
+        assert!(!s.active_path.can_send(1));
+        assert!(s.active_path.can_send(0));
 
         // Drive the handshake to completion. The AMP enforcement is
         // visible in the data path: every server outbound datagram is
@@ -8593,16 +8774,16 @@ mod tests {
         // After a successful Handshake-level rx, the server flipped
         // `validated = true` (RFC 9000 §8.1).
         assert!(
-            s.addr_validation.validated,
+            s.active_path.validated,
             "Handshake-level inbound must validate the peer's address"
         );
-        assert!(s.addr_validation.can_send(usize::MAX / 4));
+        assert!(s.active_path.can_send(usize::MAX / 4));
 
-        // Direct AMP arithmetic check: a fresh AddressValidation with
-        // bytes_recv = 100 caps total outbound to 300.
-        let mut amp = AddressValidation {
+        // Direct AMP arithmetic check: a fresh Path with bytes_recv = 100
+        // caps total outbound to 300.
+        let mut amp = Path {
             bytes_recv: 100,
-            ..AddressValidation::default()
+            ..Path::default()
         };
         assert!(amp.can_send(300));
         assert!(!amp.can_send(301));
@@ -10707,7 +10888,7 @@ mod tests {
     /// they can be sent the next time bytes_recv expands the budget.
     ///
     /// We construct the scenario directly: handshake complete (which
-    /// gives us 1-RTT keys), then artificially force the addr_validation
+    /// gives us 1-RTT keys), then artificially force the `active_path`
     /// state back to unvalidated with bytes_recv=100, bytes_sent=290.
     /// A datagram of any meaningful size will then exceed the 300-byte
     /// budget — the assembly is dropped, and the queue must be preserved.
@@ -10726,9 +10907,9 @@ mod tests {
         // budget. This is artificial — RFC 9000 §8.1 says a successful
         // Handshake-level rx validates the address — but it exactly
         // models the G-5 attacker scenario in the prompt.
-        s.addr_validation.validated = false;
-        s.addr_validation.bytes_recv = 100;
-        s.addr_validation.bytes_sent = 290;
+        s.active_path.validated = false;
+        s.active_path.bytes_recv = 100;
+        s.active_path.bytes_sent = 290;
 
         // Queue an "important" DATAGRAM. send_datagram requires
         // handshake_complete (already satisfied).
