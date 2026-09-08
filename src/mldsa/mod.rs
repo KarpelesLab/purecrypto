@@ -1599,6 +1599,162 @@ mod tests {
             assert_eq!(inf_norm(a), want, "inf_norm({})", a);
         }
     }
+
+    /// Offset of the hint region (`ω` position bytes ‖ `k` running counts)
+    /// inside an ML-DSA-44 signature.
+    const HINT_44: usize = P44.sig - (P44.omega + 4);
+
+    /// Deterministically signs messages until one yields a hint encoding
+    /// with at least two positions in the first polynomial and fewer than
+    /// `ω` positions in total, so every malformation below is constructible.
+    fn sig_with_hint_room(sk: &MlDsa44PrivateKey) -> (Vec<u8>, [u8; P44.sig]) {
+        for i in 0u8..=255 {
+            let msg = alloc::vec![i; 8];
+            let sig = sk.sign_deterministic(&msg, b"").unwrap();
+            let h = &sig[HINT_44..];
+            let count0 = h[P44.omega] as usize;
+            let total = h[P44.omega + 3] as usize;
+            if count0 >= 2 && total < P44.omega {
+                return (msg, sig);
+            }
+        }
+        panic!("no signature with hint room");
+    }
+
+    /// Every malformed hint encoding FIPS 204 Algorithm 21 rejects — a
+    /// duplicated position, positions out of order, a non-zero padding byte,
+    /// a running count above `ω`, and a running count that decreases across
+    /// polynomials — must make verification fail (each is a distinct
+    /// encoding of the same hint vector, so accepting one would make the
+    /// signature malleable).
+    #[test]
+    fn verify_rejects_malformed_hint_encodings() {
+        let (sk, pk) = MlDsa44PrivateKey::from_seed(&[5u8; SEED_SIZE]);
+        let (msg, sig) = sig_with_hint_room(&sk);
+        assert!(pk.verify(&sig, &msg, b""));
+        let omega = P44.omega;
+        let total = sig[HINT_44 + omega + 3] as usize;
+
+        let mut dup = sig;
+        dup[HINT_44 + 1] = dup[HINT_44];
+        assert!(!pk.verify(&dup, &msg, b""), "duplicate position");
+
+        let mut dec = sig;
+        dec.swap(HINT_44, HINT_44 + 1);
+        assert!(!pk.verify(&dec, &msg, b""), "decreasing positions");
+
+        let mut pad = sig;
+        pad[HINT_44 + total] = 1;
+        assert!(!pk.verify(&pad, &msg, b""), "non-zero padding byte");
+
+        let mut big = sig;
+        big[HINT_44 + omega + 3] = (omega + 1) as u8;
+        assert!(!pk.verify(&big, &msg, b""), "count byte = ω + 1");
+
+        let mut down = sig;
+        down[HINT_44 + omega + 1] = down[HINT_44 + omega] - 1;
+        assert!(
+            !pk.verify(&down, &msg, b""),
+            "count decreasing across polys"
+        );
+    }
+
+    /// Table test for the hint decoder itself (ML-DSA-44 shape, `ω = 80`,
+    /// `k = 4`): the accepted encodings and each rejection rule.
+    #[test]
+    fn unpack_hint_table() {
+        const OMEGA: usize = 80;
+        const K: usize = 4;
+        fn enc(pos: &[u8], counts: [u8; K]) -> [u8; OMEGA + K] {
+            let mut b = [0u8; OMEGA + K];
+            b[..pos.len()].copy_from_slice(pos);
+            b[OMEGA..].copy_from_slice(&counts);
+            b
+        }
+        fn run(b: &[u8]) -> Option<[Poly; K]> {
+            let mut h = [Poly::zero(); K];
+            unpack_hint(b, &mut h, OMEGA).then_some(h)
+        }
+
+        // Valid: poly 0 = {3, 7}, poly 2 = {0, 255}; polys 1 and 3 empty.
+        let h = run(&enc(&[3, 7, 0, 255], [2, 2, 4, 4])).expect("valid hint");
+        assert_eq!(h[0].c[3], 1);
+        assert_eq!(h[0].c[7], 1);
+        assert_eq!(h[2].c[0], 1);
+        assert_eq!(h[2].c[255], 1);
+        assert_eq!(count_ones(&h), 4);
+        // No hint at all.
+        assert!(run(&enc(&[], [0; K])).is_some());
+        // Exactly ω positions (no padding bytes left).
+        let full: Vec<u8> = (0..OMEGA as u8).collect();
+        assert!(run(&enc(&full, [OMEGA as u8; K])).is_some());
+
+        // Duplicate index.
+        assert!(run(&enc(&[3, 3], [2, 2, 2, 2])).is_none());
+        // Decreasing indices.
+        assert!(run(&enc(&[7, 3], [2, 2, 2, 2])).is_none());
+        // Non-zero byte in the padding after the last position.
+        let mut b = enc(&[3, 7], [2, 2, 2, 2]);
+        b[2] = 9;
+        assert!(run(&b).is_none());
+        let mut b = enc(&[3, 7], [2, 2, 2, 2]);
+        b[OMEGA - 1] = 1;
+        assert!(run(&b).is_none());
+        // Running count above ω.
+        assert!(run(&enc(&[], [0, 0, 0, OMEGA as u8 + 1])).is_none());
+        // Running count decreasing across polynomials.
+        assert!(run(&enc(&[3, 7], [2, 1, 2, 2])).is_none());
+        assert!(run(&enc(&[3, 7], [2, 2, 2, 0])).is_none());
+    }
+
+    /// `‖z‖∞ ≥ γ₁ − β` is rejected at the boundary itself (FIPS 204
+    /// Algorithm 8 line 23), for both signs of the coefficient.
+    #[test]
+    fn verify_rejects_z_at_norm_bound() {
+        use super::field::Q;
+        let (sk, pk) = MlDsa44PrivateKey::from_seed(&[7u8; SEED_SIZE]);
+        let msg = b"z-bound";
+        let sig = sk.sign_deterministic(msg, b"").unwrap();
+        assert!(pk.verify(&sig, msg, b""));
+
+        let bound = P44.gamma1 - P44.beta;
+        let z0 = P44.ctilde..P44.ctilde + P44.z_bytes();
+        let mut z = unpack_z17(&sig[z0.clone()]);
+        assert!(vec_inf_norm(core::slice::from_ref(&z)) < bound);
+
+        for v in [bound, Q - bound] {
+            z.c[0] = v;
+            let mut s = sig;
+            pack_z17(&z, &mut s[z0.clone()]);
+            let back = unpack_z17(&s[z0.clone()]);
+            assert_eq!(vec_inf_norm(core::slice::from_ref(&back)), bound);
+            assert!(!pk.verify(&s, msg, b""), "z coefficient at ±(γ₁ − β)");
+        }
+    }
+
+    /// The context string is at most 255 bytes: 255 is accepted by both
+    /// roles, 256 is refused by the signers and fails verification.
+    #[test]
+    fn context_longer_than_255_is_rejected() {
+        let (sk, pk) = MlDsa44PrivateKey::from_seed(&[9u8; SEED_SIZE]);
+        let ctx255 = [0x41u8; 255];
+        let ctx256 = [0x41u8; 256];
+        let sig = sk
+            .sign_deterministic(b"m", &ctx255)
+            .expect("255-byte context is the maximum");
+        assert!(pk.verify(&sig, b"m", &ctx255));
+
+        assert!(matches!(
+            sk.sign_deterministic(b"m", &ctx256),
+            Err(Error::ContextTooLong)
+        ));
+        let mut rng = HmacDrbg::<Sha256>::new(b"mldsa-ctx", b"nonce", &[]);
+        assert!(matches!(
+            sk.sign(&mut rng, b"m", &ctx256),
+            Err(Error::ContextTooLong)
+        ));
+        assert!(!pk.verify(&sig, b"m", &ctx256));
+    }
 }
 
 #[cfg(test)]
