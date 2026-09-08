@@ -107,7 +107,13 @@
 //! are extracted with public shifts of a secret word; every per-ring "which
 //! member do I know" decision is a constant-time select over all members, so
 //! the sequence of curve operations, hashes and memory writes in [`sign`] is
-//! the same for every value. The DRBG state, the per-ring secrets, the derived
+//! the same for every value. The parameter selection divides the value by
+//! `10^exp` with a constant-time restoring division and picks the mantissa
+//! width with constant-time comparisons; what it settles on (`exp`,
+//! `mantissa`, `min_value`) is a function of the value, but one the proof
+//! header publishes anyway. The only value-dependent branches are the
+//! fail-closed argument checks, which reveal that the arguments were invalid
+//! and nothing else. The DRBG state, the per-ring secrets, the derived
 //! nonces and the scratch buffers are wiped with a [`core::hint::black_box`]
 //! barrier. [`rewind`] is likewise branch-free in the recovered digits, and
 //! wipes its scratch on success; its early error returns (a proof that does
@@ -153,7 +159,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::ct::{
+    Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater, ConstantTimeLess,
+};
 use crate::ec::Error;
 use crate::ec::secp256k1::{ProjectivePoint, Scalar};
 use crate::hash::{Digest, HmacSha256, Sha256};
@@ -346,6 +354,24 @@ fn pow10(exp: i32) -> u64 {
     scale
 }
 
+/// `(delta / scale, delta % scale)` by restoring division, in time
+/// independent of `delta`.
+///
+/// `scale` is public and at most `10^18 < 2^60`, so the partial remainder
+/// (below `2·scale`) never overflows a `u64`.
+fn ct_divrem(delta: u64, scale: u64) -> (u64, u64) {
+    debug_assert!((1..1u64 << 63).contains(&scale));
+    let mut q = 0u64;
+    let mut r = 0u64;
+    for i in (0..64).rev() {
+        r = (r << 1) | ((delta >> i) & 1);
+        let fits = !r.ct_lt(&scale);
+        r = u64::conditional_select(&r.wrapping_sub(scale), &r, fits);
+        q |= u64::from(fits.unwrap_u8()) << i;
+    }
+    (q, r)
+}
+
 /// Computes `min_value + (2^mantissa − 1)·scale`, or `None` on overflow.
 fn span(min_value: u64, mantissa: u32, scale: u64) -> Option<u64> {
     let width = if mantissa >= 64 {
@@ -366,13 +392,19 @@ fn span(min_value: u64, mantissa: u32, scale: u64) -> Option<u64> {
 ///
 /// Returns the parameters and the mantissa value `m` with
 /// `value = min_value + m·10^exp`.
+///
+/// `value` is secret. Everything this returns except `m` ends up in the
+/// public proof header, so the loop below may branch on those results; what
+/// it must not do is branch on, or divide by hardware, the value itself. The
+/// argument checks fail closed and reveal only that the arguments were
+/// invalid.
 fn choose_params(
     value: u64,
     min_value: u64,
     exp: i32,
     min_bits: u32,
 ) -> Result<(Params, u64), Error> {
-    if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || min_value > value {
+    if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || bool::from(min_value.ct_gt(&value)) {
         return Err(Error::InvalidInput);
     }
     if exp == -1 {
@@ -390,22 +422,21 @@ fn choose_params(
     // The reference restricts a shifted or offset proof to [0, 2^63) so the
     // proven interval cannot run past 2^64; with min_value == 0 it silently
     // falls back to exp = 0 rather than failing.
-    let mut exp = exp;
-    if value > i64::MAX as u64 {
-        if min_value != 0 {
-            return Err(Error::InvalidInput);
-        }
-        exp = 0;
+    let big = value.ct_gt(&(i64::MAX as u64));
+    if min_value != 0 && bool::from(big) {
+        return Err(Error::InvalidInput);
     }
+    let mut exp = i32::conditional_select(&0, &exp, big);
     // The mantissa may not overlap min_value's high bits.
     let max_bits = 64 - bit_len(min_value);
-    let min_bits = min_bits.min(max_bits);
-    let delta = value - min_value;
+    let floor = min_bits.min(max_bits).max(1);
+    let delta = value.wrapping_sub(min_value);
     loop {
         let scale = pow10(exp);
-        let mantissa_value = delta / scale;
-        let effective_min = min_value + (delta - mantissa_value * scale);
-        let mantissa = bit_len(mantissa_value).max(min_bits).max(1);
+        let (mantissa_value, rem) = ct_divrem(delta, scale);
+        let effective_min = min_value + rem;
+        let width = bit_len(mantissa_value);
+        let mantissa = u32::conditional_select(&width, &floor, width.ct_gt(&floor));
         if let Some(max_value) = span(effective_min, mantissa, scale) {
             return Ok((
                 Params {
@@ -833,7 +864,11 @@ pub fn verify(
 /// interval fits in a `u64`. Use [`info`] on the result to see what was
 /// actually proven.
 ///
-/// Runs in time independent of `value`, `blind` and `nonce`.
+/// Runs in time independent of `value`, `blind` and `nonce`, with two
+/// qualifications: the argument checks fail closed (that `min_value <= value`,
+/// that a shifted proof stays below `2⁶³`) and so reveal that the arguments
+/// were invalid; and the chosen `exp`/`mantissa`/`min_value` depend on
+/// `value`, but the proof header publishes them anyway.
 // The argument list mirrors `secp256k1_rangeproof_sign`; keeping the same
 // shape is what makes the interop corpus a line-for-line translation.
 #[allow(clippy::too_many_arguments)]
@@ -1756,6 +1791,153 @@ mod tests {
         assert!(!rendered.contains("0x11"));
         assert!(!rendered.contains("do not print me"));
         assert!(rendered.contains(&alloc::format!("min_value: {}", out.min_value)));
+    }
+
+    // --- parameter selection ---
+
+    #[test]
+    fn ct_divrem_matches_hardware_division() {
+        let mut state = 0x243F6A8885A308D3u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for exp in 0..=MAX_EXP {
+            let scale = pow10(exp);
+            let mut values = vec![
+                0u64,
+                1,
+                scale - 1,
+                scale,
+                scale + 1,
+                2 * scale - 1,
+                2 * scale,
+                i64::MAX as u64,
+                1 << 63,
+                u64::MAX - 1,
+                u64::MAX,
+            ];
+            for _ in 0..64 {
+                let v = next();
+                values.push(v);
+                values.push(v % (scale.saturating_mul(4)).max(1));
+            }
+            for v in values {
+                assert_eq!(ct_divrem(v, scale), (v / scale, v % scale), "{v} / {scale}");
+            }
+        }
+    }
+
+    /// The reference's parameter selection, written the obvious (variable
+    /// time) way; `choose_params` must agree with it everywhere.
+    fn choose_params_plain(
+        value: u64,
+        min_value: u64,
+        exp: i32,
+        min_bits: u32,
+    ) -> Result<(Params, u64), Error> {
+        if !(-1..=MAX_EXP).contains(&exp) || min_bits > 64 || min_value > value {
+            return Err(Error::InvalidInput);
+        }
+        if exp == -1 {
+            return Ok((
+                Params {
+                    exp: -1,
+                    mantissa: 0,
+                    min_value: value,
+                    scale: 1,
+                    max_value: value,
+                },
+                0,
+            ));
+        }
+        let mut exp = exp;
+        if value > i64::MAX as u64 {
+            if min_value != 0 {
+                return Err(Error::InvalidInput);
+            }
+            exp = 0;
+        }
+        let max_bits = 64 - bit_len(min_value);
+        let min_bits = min_bits.min(max_bits);
+        let delta = value - min_value;
+        loop {
+            let scale = pow10(exp);
+            let mantissa_value = delta / scale;
+            let effective_min = min_value + (delta - mantissa_value * scale);
+            let mantissa = bit_len(mantissa_value).max(min_bits).max(1);
+            if let Some(max_value) = span(effective_min, mantissa, scale) {
+                return Ok((
+                    Params {
+                        exp,
+                        mantissa,
+                        min_value: effective_min,
+                        scale,
+                        max_value,
+                    },
+                    mantissa_value,
+                ));
+            }
+            if exp == 0 {
+                return Err(Error::InvalidInput);
+            }
+            exp -= 1;
+        }
+    }
+
+    #[test]
+    fn choose_params_agrees_with_the_plain_selection() {
+        let mut state = 0x13198A2E03707344u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut values = vec![
+            0u64,
+            1,
+            2,
+            3,
+            9,
+            10,
+            99,
+            100,
+            1000,
+            12345,
+            999_999_999_999_999_999,
+            1_000_000_000_000_000_000,
+            (i64::MAX as u64) - 1,
+            i64::MAX as u64,
+            1 << 63,
+            (1 << 63) + 1,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for _ in 0..32 {
+            values.push(next());
+            values.push(next() >> 32);
+            values.push(next() >> 50);
+        }
+        let mins = [0u64, 1, 7, 500, 1000, 1 << 32, 1 << 62, u64::MAX];
+        let mut checked = 0;
+        for &value in &values {
+            for &min_value in &mins {
+                for exp in -2..=MAX_EXP + 1 {
+                    for min_bits in [0u32, 1, 3, 8, 32, 63, 64, 65] {
+                        assert_eq!(
+                            choose_params(value, min_value, exp, min_bits),
+                            choose_params_plain(value, min_value, exp, min_bits),
+                            "value={value} min={min_value} exp={exp} min_bits={min_bits}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert!(checked > 10_000);
     }
 
     // --- no panics on hostile input ---
