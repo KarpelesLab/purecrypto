@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/KarpelesLab/purecrypto/compare/v0.8.3...v0.8.4) - 2026-09-08
+
+### Other
+
+- restructure the README; add CLI and signature-registry references
+
 ## [0.8.3](https://github.com/KarpelesLab/purecrypto/compare/v0.8.2...v0.8.3) - 2026-09-08
 
 ### Added
