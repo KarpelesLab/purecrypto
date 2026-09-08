@@ -42,7 +42,9 @@ impl EcdhPrivateKey {
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
         let d = Fe::from_be_bytes(bytes);
         let n = P256::order();
-        if !bool::from(d.is_zero()) && bool::from(d.ct_lt(&n)) {
+        // Non-short-circuiting `&` on the two `Choice`s: `d` is secret, so the
+        // zero test must not decide whether the range check runs.
+        if bool::from(!d.is_zero() & d.ct_lt(&n)) {
             Ok(EcdhPrivateKey { d })
         } else {
             Err(Error::InvalidInput)

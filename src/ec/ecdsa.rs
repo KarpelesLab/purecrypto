@@ -47,9 +47,11 @@ fn bits2int(hash: &[u8]) -> Fe {
     }
 }
 
-/// Returns true iff `1 <= v < n`.
+/// Returns true iff `1 <= v < n`. The two [`Choice`]s are combined with a
+/// non-short-circuiting `&` so a secret `v` (private-key import) does not
+/// shape the timing of a rejection.
 fn in_range(v: &Fe, n: &Fe) -> bool {
-    !bool::from(v.is_zero()) && bool::from(v.ct_lt(n))
+    bool::from(!v.is_zero() & v.ct_lt(n))
 }
 
 impl EcdsaPrivateKey {
