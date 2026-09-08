@@ -726,8 +726,14 @@ pub struct Blake2xbReader {
 
 impl Blake2xb {
     /// A BLAKE2Xb producing `out_len` output bytes in total.
+    ///
+    /// # Panics
+    /// Panics if `out_len` is 0 or exceeds `u32::MAX` (the width of the XOF
+    /// length field in the BLAKE2 parameter block).
     pub fn new(out_len: usize) -> Self {
-        let xof_len = out_len as u32;
+        assert!(out_len > 0, "Blake2xb output length must be > 0");
+        let xof_len = u32::try_from(out_len)
+            .expect("Blake2xb output length must fit in the 32-bit XOF length field");
         Blake2xb {
             state: Blake2bState::from_h(iv_from_param_b(&param_b(
                 64, 0, 1, 1, 0, 0, xof_len, 0, 0,
@@ -763,6 +769,12 @@ impl super::XofReader for Blake2xbReader {
     fn read(&mut self, out: &mut [u8]) {
         let mut i = 0;
         while i < out.len() {
+            // The total output length was declared up front; squeezing more
+            // would otherwise make `take` 0 and loop forever.
+            assert!(
+                self.pos < self.xof_len,
+                "Blake2xb: read past the declared XOF output length"
+            );
             let idx = self.pos / 64;
             let within = (self.pos % 64) as usize;
             if self.node_idx != idx {
@@ -822,8 +834,14 @@ pub struct Blake2xsReader {
 
 impl Blake2xs {
     /// A BLAKE2Xs producing `out_len` output bytes in total (≤ 65535).
+    ///
+    /// # Panics
+    /// Panics if `out_len` is 0 or exceeds `u16::MAX` (the width of the XOF
+    /// length field in the BLAKE2s parameter block).
     pub fn new(out_len: usize) -> Self {
-        let xof_len = out_len as u16;
+        assert!(out_len > 0, "Blake2xs output length must be > 0");
+        let xof_len = u16::try_from(out_len)
+            .expect("Blake2xs output length must fit in the 16-bit XOF length field");
         Blake2xs {
             state: Blake2sState::from_h(iv_from_param_s(&param_s(
                 32, 0, 1, 1, 0, 0, xof_len, 0, 0,
@@ -859,6 +877,12 @@ impl super::XofReader for Blake2xsReader {
     fn read(&mut self, out: &mut [u8]) {
         let mut i = 0;
         while i < out.len() {
+            // The total output length was declared up front; squeezing more
+            // would otherwise make `take` 0 and loop forever.
+            assert!(
+                self.pos < u32::from(self.xof_len),
+                "Blake2xs: read past the declared XOF output length"
+            );
             let idx = self.pos / 32;
             let within = (self.pos % 32) as usize;
             if self.node_idx != idx {
@@ -1113,5 +1137,84 @@ mod tests {
         m.finalize_into(&mut short);
 
         assert_ne!(&long[..16], &short[..]);
+    }
+
+    // The BLAKE2X output length is declared up front and folded into the
+    // parameter block, so the reader cannot produce more than that. It used
+    // to spin forever (a zero-length `take` that never advanced) on the first
+    // byte past the end; now it panics with a clear message.
+    #[test]
+    #[should_panic(expected = "Blake2xb: read past the declared XOF output length")]
+    fn blake2xb_reader_rejects_overread() {
+        use crate::hash::XofReader;
+        let mut r = Blake2xb::new(100).finalize_xof();
+        let mut out = [0u8; 100];
+        r.read(&mut out);
+        let mut extra = [0u8; 1];
+        r.read(&mut extra);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2xs: read past the declared XOF output length")]
+    fn blake2xs_reader_rejects_overread() {
+        use crate::hash::XofReader;
+        let mut r = Blake2xs::new(100).finalize_xof();
+        let mut out = [0u8; 100];
+        r.read(&mut out);
+        let mut extra = [0u8; 1];
+        r.read(&mut extra);
+    }
+
+    // Reading exactly the declared length, split across calls at a node
+    // boundary and at an odd offset, still works and matches the one-shot.
+    #[test]
+    fn blake2x_reader_exact_length_split_reads() {
+        use crate::hash::XofReader;
+        let mut whole = [0u8; 200];
+        Blake2xb::new(200).finalize_into(&mut whole);
+        let mut r = Blake2xb::new(200).finalize_xof();
+        let mut parts = [0u8; 200];
+        r.read(&mut parts[..64]);
+        r.read(&mut parts[64..131]);
+        r.read(&mut parts[131..200]);
+        r.read(&mut []); // zero-length read at the end is fine
+        assert_eq!(whole, parts);
+
+        let mut whole = [0u8; 100];
+        Blake2xs::new(100).finalize_into(&mut whole);
+        let mut r = Blake2xs::new(100).finalize_xof();
+        let mut parts = [0u8; 100];
+        r.read(&mut parts[..32]);
+        r.read(&mut parts[32..71]);
+        r.read(&mut parts[71..100]);
+        r.read(&mut []);
+        assert_eq!(whole, parts);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2xb output length must be > 0")]
+    fn blake2xb_rejects_zero_length() {
+        let _ = Blake2xb::new(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Blake2xs output length must be > 0")]
+    fn blake2xs_rejects_zero_length() {
+        let _ = Blake2xs::new(0);
+    }
+
+    // `out_len as u16` used to truncate silently, so `new(65536)` was a
+    // 0-byte XOF that then hung on the first read.
+    #[test]
+    #[should_panic(expected = "Blake2xs output length must fit in the 16-bit XOF length field")]
+    fn blake2xs_rejects_oversize_length() {
+        let _ = Blake2xs::new(1 << 16);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    #[should_panic(expected = "Blake2xb output length must fit in the 32-bit XOF length field")]
+    fn blake2xb_rejects_oversize_length() {
+        let _ = Blake2xb::new(1 << 32);
     }
 }
