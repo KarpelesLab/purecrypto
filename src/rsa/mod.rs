@@ -33,6 +33,25 @@ pub use prime::{is_prime, random_prime};
 
 pub use digest_info::Pkcs1Digest;
 
+/// Upper bound on the public exponent accepted by the parse paths (and by
+/// key generation): `e < 2^256`, the FIPS 186-5 §A.1.1 limit. The public
+/// operation costs one squaring per bit of `e`, so without a cap an SPKI or
+/// certificate carrying `e ≈ n` makes every signature *verification* as
+/// expensive as a private operation — a cheap CPU-exhaustion lever against
+/// anything that validates attacker-supplied certificates. Real-world
+/// exponents are 3, 17, or 65537; 256 bits is far above anything legitimate.
+pub(crate) const MAX_RSA_EXPONENT_BITS: usize = 256;
+
+/// Best-effort wipe of a buffer that held secret material (a decrypted
+/// encoded message, a blinder, a raw private-op output) before it is
+/// dropped. The `core::hint::black_box` fence keeps LLVM from eliding the
+/// stores as dead — the same idiom the key types' `Drop` impls use.
+#[inline]
+pub(crate) fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    let _ = core::hint::black_box(&buf);
+}
+
 /// Errors produced by RSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]

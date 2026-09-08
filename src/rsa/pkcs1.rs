@@ -91,7 +91,11 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; LIMBS * 8];
         let mut out = vec![0u8; LIMBS * 8];
-        let n = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out)?;
+        // `scratch` holds the decrypted EM (padding + plaintext); wipe it on
+        // every exit path before the Vec is freed.
+        let res = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = res?;
         out.truncate(n);
         Ok(out)
     }
@@ -124,7 +128,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     ) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; LIMBS * 8];
         let mut out = vec![0u8; expected_len];
-        emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out)?;
+        let res = emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        res?;
         Ok(out)
     }
 
@@ -136,7 +142,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; LIMBS * 8];
         let mut out = vec![0u8; LIMBS * 8];
-        let n = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out)?;
+        let res = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = res?;
         out.truncate(n);
         Ok(out)
     }

@@ -145,6 +145,10 @@ pub(crate) use crate::bignum::prime::is_prime_boxed;
 
 /// Generates a random (probable) prime of exactly `bits` bits as a
 /// [`BoxedUint`](crate::bignum::BoxedUint), with the top two bits and bit 0 set.
+///
+/// # Panics
+/// Panics if `bits < 2` — the two forced top bits need two bit positions
+/// (the index arithmetic below would underflow otherwise).
 #[cfg(feature = "alloc")]
 pub(crate) fn random_prime_boxed<R: RngCore>(
     rng: &mut R,
@@ -152,6 +156,7 @@ pub(crate) fn random_prime_boxed<R: RngCore>(
     rounds: usize,
 ) -> crate::bignum::BoxedUint {
     use crate::bignum::BoxedUint;
+    assert!(bits >= 2, "random_prime_boxed: bits must be >= 2");
     let nlimbs = bits.div_ceil(64);
     loop {
         let mut limbs = alloc::vec![0u64; nlimbs];
@@ -217,5 +222,26 @@ mod tests {
         let p = random_prime::<2, _>(&mut r, 96, 20);
         assert!(is_prime(&p, &mut r, 25));
         assert_eq!(p.as_limbs()[1] >> 31, 1, "bit 95 set, above cleared");
+    }
+
+    /// BN-5: `bits = 1` used to underflow the `bits - 2` bit index.
+    #[cfg(feature = "alloc")]
+    #[test]
+    #[should_panic(expected = "bits must be >= 2")]
+    fn random_prime_boxed_rejects_tiny_bits() {
+        let mut r = rng();
+        let _ = random_prime_boxed(&mut r, 1, 4);
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn random_prime_boxed_small_sizes() {
+        let mut r = rng();
+        for bits in [2usize, 3, 8, 64, 65, 128] {
+            let p = random_prime_boxed(&mut r, bits, 8);
+            assert_eq!(p.bit_len(), bits);
+            assert!(p.is_odd());
+            assert!(is_prime_boxed(&p, &mut r, 8));
+        }
     }
 }

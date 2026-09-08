@@ -64,7 +64,11 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// plaintext length is known in advance.
     pub fn decrypt_pkcs1v15_into(&self, ct: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         let mut scratch = KeyScratch::<LIMBS>::ZEROED;
-        super::emsa::decrypt_pkcs1v15(self, ct, scratch.as_flattened_mut(), out)
+        // The stack scratch holds the decrypted EM; wipe it before the frame
+        // is reused, on every exit path.
+        let res = super::emsa::decrypt_pkcs1v15(self, ct, scratch.as_flattened_mut(), out);
+        super::wipe(scratch.as_flattened_mut());
+        res
     }
 
     /// Constant-time PKCS#1 v1.5 decryption with implicit rejection, writing
@@ -73,7 +77,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// failure are indistinguishable to the caller.
     pub fn decrypt_pkcs1v15_session_into(&self, ct: &[u8], out: &mut [u8]) -> Result<(), Error> {
         let mut scratch = KeyScratch::<LIMBS>::ZEROED;
-        super::emsa::decrypt_pkcs1v15_session(self, ct, scratch.as_flattened_mut(), out)
+        let res = super::emsa::decrypt_pkcs1v15_session(self, ct, scratch.as_flattened_mut(), out);
+        super::wipe(scratch.as_flattened_mut());
+        res
     }
 
     /// Decrypts an RSAES-OAEP ciphertext into `out`, returning the plaintext
@@ -85,7 +91,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         out: &mut [u8],
     ) -> Result<usize, Error> {
         let mut scratch = KeyScratch::<LIMBS>::ZEROED;
-        super::emsa::decrypt_oaep::<D, _>(self, ct, label, scratch.as_flattened_mut(), out)
+        let res =
+            super::emsa::decrypt_oaep::<D, _>(self, ct, label, scratch.as_flattened_mut(), out);
+        super::wipe(scratch.as_flattened_mut());
+        res
     }
 }
 

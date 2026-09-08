@@ -254,6 +254,10 @@ fn derive_blinder_boxed(
     }
     blinder_bytes.truncate(k_bytes);
     let r_raw = BoxedUint::from_be_bytes(&blinder_bytes);
+    // The blinder is as secret as the private exponent it masks: wipe the
+    // byte form now that it lives in `r_raw` (a `BoxedUint`, which zeroizes
+    // itself on drop).
+    super::wipe(&mut blinder_bytes);
     let r = r_raw.reduce(&mont.modulus());
     if r.is_zero() || r == BoxedUint::from_u64(1) {
         BoxedUint::from_u64(2)
@@ -380,21 +384,38 @@ pub(crate) const MIN_RSA_BITS: usize = 1024;
 /// well above any legitimate use.
 pub(crate) const MAX_RSA_BITS: usize = 16384;
 
+use super::MAX_RSA_EXPONENT_BITS;
+
 /// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
 /// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
 /// enforce the structural shape: `n` odd (hence non-zero), `e ≥ 3`, `e` odd,
-/// and `e < n`. These rule out the degenerate values (`0`, `1`, even, oversized)
-/// that a malicious SPKI / certificate could otherwise smuggle through and break
-/// downstream sign / verify / encrypt math. The `n` odd check is load-bearing:
-/// an even (or zero) modulus reaches `BoxedMontModulus::new`, which asserts an
-/// odd modulus and would otherwise panic on attacker-controlled input.
+/// `e < n`, and `e < 2^MAX_RSA_EXPONENT_BITS`. These rule out the degenerate
+/// values (`0`, `1`, even, oversized) that a malicious SPKI / certificate
+/// could otherwise smuggle through and break downstream sign / verify /
+/// encrypt math or turn verification into a DoS lever. The `n` odd check is
+/// load-bearing: an even (or zero) modulus reaches `BoxedMontModulus::new`,
+/// which asserts an odd modulus and would otherwise panic on
+/// attacker-controlled input.
 fn validate_public_exponent(n: &BoxedUint, e: &BoxedUint) -> Result<(), Error> {
     // A zero modulus is even, so the odd check also rejects `n = 0`.
     if !n.is_odd() {
         return Err(Error::InvalidKey);
     }
     let three = BoxedUint::from_u64(3);
-    if e.lt(&three) || !e.is_odd() || !e.lt(n) {
+    if e.lt(&three) || !e.is_odd() || !e.lt(n) || e.bit_len() > MAX_RSA_EXPONENT_BITS {
+        return Err(Error::InvalidKey);
+    }
+    Ok(())
+}
+
+/// Validates the private exponent's range: `1 ≤ d < n`. `d = 0` turns every
+/// private operation into the constant `1`; `d ≥ n` is never what a
+/// well-formed PKCS#1 blob carries (RFC 8017 §3.2 defines `d` as a positive
+/// integer below `n`), and an oversized `d` widens the constant-time
+/// exponentiation past the modulus width — leaking, via timing, that the key
+/// is malformed and costing proportionally more per operation.
+fn validate_private_exponent(n: &BoxedUint, d: &BoxedUint) -> Result<(), Error> {
+    if d.is_zero() || !d.lt(n) {
         return Err(Error::InvalidKey);
     }
     Ok(())
@@ -625,6 +646,19 @@ impl BoxedRsaPrivateKey {
     /// public exponent `e` (commonly 65537). `bits` must be even; each prime is
     /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate.
     ///
+    /// # Panics
+    /// Panics on parameters that can never yield a usable key rather than
+    /// looping forever or producing a broken one:
+    /// * `bits < 512` or `bits` odd — the modulus size floor for anything
+    ///   the rest of the crate will accept back (`MIN_RSA_BITS` on parse is
+    ///   1024; 512 is the smallest size the prime generator's top-bit
+    ///   forcing is meaningful for), and an odd `bits` cannot split into
+    ///   two equal primes;
+    /// * `e < 3`, `e` even, or `e ≥ 2^256` — an even `e` is never coprime
+    ///   to `φ(n)` (the loop would spin forever), `e = 1` makes `d = 1`
+    ///   (encryption is the identity), and FIPS 186-5 §A.1.1 bounds `e`
+    ///   below `2^256`.
+    ///
     /// # Side channels
     /// Key generation deliberately uses the **variable-time** extended-Euclid
     /// modular inverse [`inv_mod_boxed`](crate::bignum::inv_mod_boxed) for
@@ -645,6 +679,14 @@ impl BoxedRsaPrivateKey {
         rounds: usize,
     ) -> Self {
         use crate::bignum::inv_mod_boxed;
+        assert!(
+            bits >= 512 && bits.is_multiple_of(2),
+            "RsaPrivateKey::generate: bits must be even and >= 512 (got {bits})"
+        );
+        assert!(
+            e.is_odd() && !e.lt(&BoxedUint::from_u64(3)) && e.bit_len() <= MAX_RSA_EXPONENT_BITS,
+            "RsaPrivateKey::generate: e must be odd, >= 3 and < 2^256"
+        );
         let one = BoxedUint::from_u64(1);
         let half = bits / 2;
         loop {
@@ -759,7 +801,11 @@ impl BoxedRsaPrivateKey {
     pub fn decrypt_pkcs1v15(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; self.k];
         let mut out = vec![0u8; self.k];
-        let n = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out)?;
+        // `scratch` holds the decrypted EM (padding + plaintext); wipe it on
+        // every exit path before the Vec is freed.
+        let res = emsa::decrypt_pkcs1v15(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = res?;
         out.truncate(n);
         Ok(out)
     }
@@ -793,7 +839,9 @@ impl BoxedRsaPrivateKey {
     ) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; self.k];
         let mut out = vec![0u8; expected_len];
-        emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out)?;
+        let res = emsa::decrypt_pkcs1v15_session(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        res?;
         Ok(out)
     }
 
@@ -802,7 +850,9 @@ impl BoxedRsaPrivateKey {
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {
         let mut scratch = vec![0u8; self.k];
         let mut out = vec![0u8; self.k];
-        let n = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out)?;
+        let res = emsa::decrypt_oaep::<D, _>(self, ct, label, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = res?;
         out.truncate(n);
         Ok(out)
     }
@@ -847,8 +897,11 @@ impl RawPrivate for BoxedRsaPrivateKey {
     }
     fn raw_private_in_place(&self, buf: &mut [u8]) {
         let c_uint = BoxedUint::from_be_bytes(buf);
-        let out = raw_private_blinded_boxed(self, &c_uint).to_be_bytes(self.k);
+        let mut out = raw_private_blinded_boxed(self, &c_uint).to_be_bytes(self.k);
         buf.copy_from_slice(&out);
+        // `out` is the raw private-op result (decrypted EM / signature
+        // representative): wipe the temporary before its Vec is freed.
+        super::wipe(&mut out);
     }
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
@@ -953,6 +1006,11 @@ impl BoxedRsaPrivateKey {
     /// public exponent, private exponent, and the prime factors (the CRT
     /// parameters `dP`/`dQ`/`qInv` are recomputed on export, so they need not
     /// round-trip). The primes enable base-blinding on the secret-side path.
+    ///
+    /// Rejects moduli outside `[MIN_RSA_BITS, MAX_RSA_BITS]`, degenerate
+    /// public exponents (`e < 3`, even, `≥ n`, or `≥ 2^256`), a private
+    /// exponent outside `[1, n)`, primes `≤ 1` or even, `p = q`, and
+    /// `p · q ≠ n`.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -972,6 +1030,7 @@ impl BoxedRsaPrivateKey {
             return Err(crate::der::Error::Malformed);
         }
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
+        validate_private_exponent(&n, &d).map_err(|_| crate::der::Error::Malformed)?;
         validate_private_components(&n, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
@@ -1281,6 +1340,113 @@ mod tests {
         let e = [0x01, 0x00, 0x01];
         let der = encode_sequence(&[encode_integer(&n), encode_integer(&e)].concat());
         assert!(BoxedRsaPublicKey::from_pkcs1_der(&der).is_err());
+    }
+
+    /// Big-endian bytes of a const-generic test-key component, for hand-built
+    /// PKCS#1 blobs.
+    fn be32(u: &crate::bignum::Uint<32>) -> Vec<u8> {
+        let mut b = vec![0u8; 256];
+        u.write_be_bytes(&mut b);
+        b
+    }
+
+    /// BN-6: an SPKI whose public exponent is wider than 256 bits (here
+    /// 2000 bits, still `< n`) must be rejected on every parse path — the
+    /// public op would otherwise cost ~2000 squarings per verification.
+    #[test]
+    fn rejects_public_exponent_above_256_bits() {
+        let (_, boxed) = boxed_pub();
+        let n = boxed.modulus().clone();
+        // 2000-bit odd e: 250 bytes, top bit set, low bit set.
+        let mut e_bytes = vec![0u8; 250];
+        e_bytes[0] = 0x80;
+        e_bytes[249] = 0x01;
+        let big_e = BoxedUint::from_be_bytes(&e_bytes);
+        assert_eq!(big_e.bit_len(), 2000);
+        assert!(big_e.lt(&n), "e must still be below n for this test");
+        assert!(matches!(
+            BoxedRsaPublicKey::try_new(n.clone(), big_e.clone()),
+            Err(Error::InvalidKey)
+        ));
+        // Through the unchecked constructor + encoder, then back through
+        // the SPKI and PKCS#1 parsers.
+        let unchecked = BoxedRsaPublicKey::new(n.clone(), big_e);
+        assert!(BoxedRsaPublicKey::from_spki_der(&unchecked.to_spki_der()).is_err());
+        assert!(BoxedRsaPublicKey::from_pkcs1_der(&unchecked.to_pkcs1_der()).is_err());
+        // A 256-bit odd e is the boundary and still accepted.
+        let mut e_bytes = vec![0u8; 32];
+        e_bytes[0] = 0x80;
+        e_bytes[31] = 0x01;
+        let e256 = BoxedUint::from_be_bytes(&e_bytes);
+        assert_eq!(e256.bit_len(), 256);
+        assert!(BoxedRsaPublicKey::try_new(n, e256).is_ok());
+    }
+
+    /// BN-9: the boxed PKCS#1 private-key parser must reject `d = 0` and
+    /// `d ≥ n`; the same blob with the genuine `d` parses.
+    #[test]
+    fn from_pkcs1_der_rejects_private_exponent_out_of_range() {
+        use crate::der::{encode_integer, encode_sequence};
+        let key = rsa_test_key_a();
+        let (p, q) = key.primes();
+        let blob = |d: &[u8]| {
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    encode_integer(&be32(key.modulus())),
+                    encode_integer(&be32(key.exponent())),
+                    encode_integer(d),
+                    encode_integer(&be32(p)),
+                    encode_integer(&be32(q)),
+                    encode_integer(&[1]),
+                    encode_integer(&[1]),
+                    encode_integer(&[1]),
+                ]
+                .concat(),
+            )
+        };
+        assert!(BoxedRsaPrivateKey::from_pkcs1_der(&blob(&be32(key.private_exponent()))).is_ok());
+        assert!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&blob(&[0])).is_err(),
+            "d = 0"
+        );
+        assert!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&blob(&be32(key.modulus()))).is_err(),
+            "d = n"
+        );
+        // d = n + 1, encoded one byte wider.
+        let np1 = BoxedUint::from_be_bytes(&be32(key.modulus()))
+            .add(&BoxedUint::from_u64(1))
+            .to_be_bytes(257);
+        assert!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&blob(&np1)).is_err(),
+            "d > n"
+        );
+    }
+
+    /// BN-5: an even public exponent can never be coprime to φ(n), so
+    /// `generate` must refuse it up front instead of looping forever.
+    #[test]
+    #[should_panic(expected = "e must be odd")]
+    fn generate_panics_on_even_exponent() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-keygen-bad-e", b"nonce", &[]);
+        let _ = BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(2), &mut r, 4);
+    }
+
+    /// BN-5: `e = 1` gives `d = 1` (the identity map); refused.
+    #[test]
+    #[should_panic(expected = "e must be odd")]
+    fn generate_panics_on_unit_exponent() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-keygen-bad-e", b"nonce", &[]);
+        let _ = BoxedRsaPrivateKey::generate(1024, BoxedUint::from_u64(1), &mut r, 4);
+    }
+
+    /// BN-5: `bits = 2` used to underflow inside the prime generator.
+    #[test]
+    #[should_panic(expected = "bits must be even and >= 512")]
+    fn generate_panics_on_tiny_modulus() {
+        let mut r = HmacDrbg::<Sha256>::new(b"boxed-keygen-bad-bits", b"nonce", &[]);
+        let _ = BoxedRsaPrivateKey::generate(2, BoxedUint::from_u64(65537), &mut r, 4);
     }
 
     /// The CRT fast path must be bit-for-bit identical to the plain

@@ -53,12 +53,14 @@ fn int_to_uint<const LIMBS: usize>(content: &[u8]) -> Result<Uint<LIMBS>, Error>
 /// Validates that `(n, e)` form a well-formed RSA public exponent. RFC 8017
 /// §3.1 requires `e` coprime to `λ(n)`; without the prime factors we can only
 /// enforce the structural shape: `n` odd (hence non-zero), `e ≥ 3`, `e` odd,
-/// and `e < n`. These rule out the degenerate values (`0`, `1`, even, oversized)
-/// that a malicious PKCS#1 / SPKI / certificate could otherwise smuggle through
-/// and break downstream sign / verify / encrypt math. The `n` odd check is
-/// load-bearing: an even (or zero) modulus reaches `MontModulus::new`, which
-/// asserts an odd modulus and would otherwise panic on attacker-controlled
-/// input. Mirrors the boxed-key validator in [`super::boxed`].
+/// `e < n`, and `e < 2^256` (FIPS 186-5 §A.1.1 — an `e ≈ n` would make every
+/// verification as expensive as a private operation). These rule out the
+/// degenerate values (`0`, `1`, even, oversized) that a malicious PKCS#1 /
+/// SPKI / certificate could otherwise smuggle through and break downstream
+/// sign / verify / encrypt math. The `n` odd check is load-bearing: an even
+/// (or zero) modulus reaches `MontModulus::new`, which asserts an odd modulus
+/// and would otherwise panic on attacker-controlled input. Mirrors the
+/// boxed-key validator in [`super::boxed`].
 fn validate_public_exponent<const LIMBS: usize>(
     n: &Uint<LIMBS>,
     e: &Uint<LIMBS>,
@@ -69,7 +71,42 @@ fn validate_public_exponent<const LIMBS: usize>(
     let e_ge_3 = !bool::from(e.ct_lt(&three));
     let e_odd = bool::from(e.is_odd());
     let e_lt_n = bool::from(e.ct_lt(n));
-    if !(n_odd && e_ge_3 && e_odd && e_lt_n) {
+    let e_bounded = e.bit_len() <= super::MAX_RSA_EXPONENT_BITS;
+    if !(n_odd && e_ge_3 && e_odd && e_lt_n && e_bounded) {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
+/// Validates the modulus width against the key type's fixed size. The
+/// const-generic keys size every buffer — `k`, the EMSA encoded-message
+/// length, the signature and ciphertext length — to `LIMBS * 8` octets on
+/// the assumption that `n` fills them (RFC 8017 defines `k` as the octet
+/// length of `n`). A narrower modulus parsed into a wider type (a 2000-bit
+/// key into `RsaPrivateKey<32>`) breaks that: the EM gets one more leading
+/// zero octet than the modulus can represent, the public/private ops are
+/// handed representatives `≥ n` (tripping the `to_mont` debug assertion),
+/// and the signatures/ciphertexts are simply wrong. So `n` must occupy the
+/// top octet: `n.bit_len() > LIMBS * 64 − 8`. The `MIN_RSA_BITS` floor is
+/// the same one the boxed parser enforces.
+fn validate_modulus_width<const LIMBS: usize>(n: &Uint<LIMBS>) -> Result<(), Error> {
+    let bits = n.bit_len();
+    if bits < super::boxed::MIN_RSA_BITS || bits <= (LIMBS * 64).saturating_sub(8) {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
+/// Validates the private exponent's range, `1 ≤ d < n`: `d = 0` makes every
+/// private operation return `1`, and RFC 8017 §3.2 defines `d` as a positive
+/// integer below `n`. Mirrors the boxed-key validator in [`super::boxed`].
+fn validate_private_exponent<const LIMBS: usize>(
+    n: &Uint<LIMBS>,
+    d: &Uint<LIMBS>,
+) -> Result<(), Error> {
+    let d_nonzero = !bool::from(d.ct_eq(&Uint::<LIMBS>::ZERO));
+    let d_lt_n = bool::from(d.ct_lt(n));
+    if !(d_nonzero && d_lt_n) {
         return Err(Error::Malformed);
     }
     Ok(())
@@ -120,10 +157,12 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     }
 
     /// Decodes a PKCS#1 `RSAPublicKey` DER structure. Rejects moduli below
-    /// `MIN_RSA_BITS` and degenerate public
-    /// exponents (even/zero `n`; `e < 3`, `e` even, `e ≥ n`) per the structural
-    /// shape check derived from RFC 8017 §3.1. The size floor mirrors the boxed
-    /// parser so the two import paths refuse the same attacker-injected moduli.
+    /// `MIN_RSA_BITS` or narrower than the `LIMBS * 64`-bit key type by more
+    /// than 7 bits (the const-generic keys assume `n` fills their top octet),
+    /// and degenerate public exponents (even/zero `n`; `e < 3`, `e` even,
+    /// `e ≥ n`, `e ≥ 2^256`) per the structural shape check derived from RFC
+    /// 8017 §3.1. The size floor mirrors the boxed parser so the two import
+    /// paths refuse the same attacker-injected moduli.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -131,9 +170,7 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
         let e = int_to_uint(seq.read_unsigned_integer_bytes()?)?;
         seq.finish()?;
         reader.finish()?;
-        if n.bit_len() < super::boxed::MIN_RSA_BITS {
-            return Err(Error::Malformed);
-        }
+        validate_modulus_width(&n)?;
         validate_public_exponent(&n, &e)?;
         Ok(RsaPublicKey::new(n, e))
     }
@@ -247,7 +284,11 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 
     /// Decodes a PKCS#1 `RSAPrivateKey` DER structure. The CRT parameters are
     /// read but not retained. Rejects:
-    /// - degenerate public exponents (`e < 3`, `e` even, `e ≥ n`),
+    /// - moduli below `MIN_RSA_BITS` or not filling the key type's top octet
+    ///   (`n.bit_len() ≤ LIMBS * 64 − 8`), which would make every buffer the
+    ///   fixed-size key sizes to `LIMBS * 8` octets one octet too wide,
+    /// - degenerate public exponents (`e < 3`, `e` even, `e ≥ n`, `e ≥ 2^256`),
+    /// - a private exponent outside `[1, n)`,
     /// - primes `≤ 1`,
     /// - `p = q` (resulting in a non-coprime `qInv`),
     /// - `p · q ≠ n` (corruption / fault injection — without this check, the
@@ -267,7 +308,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         let _qinv = seq.read_unsigned_integer_bytes()?;
         seq.finish()?;
         reader.finish()?;
+        validate_modulus_width(&n)?;
         validate_public_exponent(&n, &e)?;
+        validate_private_exponent(&n, &d)?;
         validate_private_components(&n, &p, &q)?;
         Ok(RsaPrivateKey::from_raw_parts(n, e, d, p, q))
     }
@@ -669,6 +712,173 @@ mod tests {
         );
         assert!(matches!(
             RsaPrivateKey::<32>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// Builds a structurally consistent (`p · q = n`, both odd and `> 1`)
+    /// PKCS#1 private-key blob with a modulus of roughly `2 × half_bits`
+    /// bits from two arbitrary odd half-width factors — primality is
+    /// irrelevant to the width gate under test. `d = e = 65537`.
+    fn synthetic_private_der(half_bits: usize) -> Vec<u8> {
+        let half_bytes = half_bits.div_ceil(8);
+        let mut p_raw = alloc::vec![0x5au8; half_bytes];
+        p_raw[0] |= 0x80;
+        p_raw[half_bytes - 1] |= 0x01;
+        let mut q_raw = alloc::vec![0xa5u8; half_bytes];
+        q_raw[0] |= 0x80;
+        q_raw[half_bytes - 1] |= 0x01;
+        let p = Uint::<32>::from_be_bytes(&p_raw);
+        let q = Uint::<32>::from_be_bytes(&q_raw);
+        let (n, hi) = p.mul_wide(&q);
+        assert_eq!(hi, Uint::<32>::ZERO);
+        let e = Uint::<32>::from_u64(65537);
+        encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&uint_be(&n)),
+                encode_integer(&uint_be(&e)),
+                encode_integer(&uint_be(&e)), // d
+                encode_integer(&uint_be(&p)),
+                encode_integer(&uint_be(&q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        )
+    }
+
+    /// BN-4: a 2000-bit modulus parsed into the 2048-bit `RsaPrivateKey<32>`
+    /// / `RsaPublicKey<32>` is rejected — every buffer the fixed-size key
+    /// derives from `LIMBS * 8` would be one octet wider than `n`, yielding
+    /// wrong signatures and a `to_mont` debug-assert. A 2048-bit modulus is
+    /// unaffected (see the round-trip tests), as is a 2041-bit one.
+    #[test]
+    fn const_generic_parsers_reject_modulus_narrower_than_limbs() {
+        let der = synthetic_private_der(1000);
+        // Sanity: the same blob would pass every other check.
+        let n_bits = {
+            let mut reader = Reader::new(&der);
+            let mut seq = reader.read_sequence().unwrap();
+            let _ = seq.read_integer_bytes().unwrap();
+            int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap())
+                .unwrap()
+                .bit_len()
+        };
+        assert!((1999..=2000).contains(&n_bits), "n has {n_bits} bits");
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+        // Public half: same n, e = 65537.
+        let mut reader = Reader::new(&der);
+        let mut seq = reader.read_sequence().unwrap();
+        let _ = seq.read_integer_bytes().unwrap();
+        let n_bytes = seq.read_unsigned_integer_bytes().unwrap().to_vec();
+        let pub_der =
+            encode_sequence(&[encode_integer(&n_bytes), encode_integer(&[1, 0, 1])].concat());
+        assert!(matches!(
+            RsaPublicKey::<32>::from_pkcs1_der(&pub_der),
+            Err(Error::Malformed)
+        ));
+        // A 2041-bit modulus still fills the top octet and parses.
+        let der = synthetic_private_der(1021);
+        let key = RsaPrivateKey::<32>::from_pkcs1_der(&der).expect("2041-bit n fills LIMBS*8");
+        assert!(key.modulus().bit_len() > 2040);
+    }
+
+    /// BN-9: the const-generic private parser applies the `MIN_RSA_BITS`
+    /// floor the public parser already had — a 512-bit key into
+    /// `RsaPrivateKey<8>` fills its limbs exactly but is still refused.
+    #[test]
+    fn const_generic_private_parser_enforces_min_bits() {
+        // Build a 512-bit blob directly in Uint<8> terms.
+        let mut p_raw = [0x5au8; 32];
+        p_raw[0] |= 0x80;
+        p_raw[31] |= 0x01;
+        let mut q_raw = [0xa5u8; 32];
+        q_raw[0] |= 0x80;
+        q_raw[31] |= 0x01;
+        let p = Uint::<8>::from_be_bytes(&p_raw);
+        let q = Uint::<8>::from_be_bytes(&q_raw);
+        let (n, hi) = p.mul_wide(&q);
+        assert_eq!(hi, Uint::<8>::ZERO);
+        assert_eq!(n.bit_len(), 512);
+        let e = Uint::<8>::from_u64(65537);
+        let der = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&uint_be(&n)),
+                encode_integer(&uint_be(&e)),
+                encode_integer(&uint_be(&e)),
+                encode_integer(&uint_be(&p)),
+                encode_integer(&uint_be(&q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<8>::from_pkcs1_der(&der),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// BN-9: `d = 0` and `d ≥ n` are rejected by the const-generic private
+    /// parser; the genuine `d` still parses.
+    #[test]
+    fn const_generic_from_pkcs1_der_rejects_private_exponent_out_of_range() {
+        let key = rsa_test_key_a();
+        let (p, q) = key.primes();
+        let blob = |d: &[u8]| {
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    encode_integer(&uint_be(key.modulus())),
+                    encode_integer(&uint_be(key.exponent())),
+                    encode_integer(d),
+                    encode_integer(&uint_be(p)),
+                    encode_integer(&uint_be(q)),
+                    encode_integer(&[1]),
+                    encode_integer(&[1]),
+                    encode_integer(&[1]),
+                ]
+                .concat(),
+            )
+        };
+        assert!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&blob(&uint_be(key.private_exponent()))).is_ok()
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&blob(&[0])),
+            Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&blob(&uint_be(key.modulus()))),
+            Err(Error::Malformed)
+        ));
+    }
+
+    /// BN-6: a 2000-bit public exponent (`< n`, odd) is rejected by the
+    /// const-generic public parsers.
+    #[test]
+    fn const_generic_from_spki_der_rejects_oversized_exponent() {
+        let pk = rsa_test_key_a().public_key();
+        let mut e_raw = [0u8; 250];
+        e_raw[0] = 0x80;
+        e_raw[249] = 0x01;
+        let big_e = Uint::<32>::from_be_bytes(&e_raw);
+        assert_eq!(big_e.bit_len(), 2000);
+        assert!(bool::from(big_e.ct_lt(pk.modulus())));
+        let bad = RsaPublicKey::<32>::new(*pk.modulus(), big_e);
+        assert!(matches!(
+            RsaPublicKey::<32>::from_spki_der(&bad.to_spki_der()),
+            Err(Error::Malformed)
+        ));
+        assert!(matches!(
+            RsaPublicKey::<32>::from_pkcs1_der(&bad.to_pkcs1_der()),
             Err(Error::Malformed)
         ));
     }

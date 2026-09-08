@@ -298,8 +298,12 @@ impl<const LIMBS: usize> super::emsa::RawPrivate for RsaPrivateKey<LIMBS> {
         self.modulus().bit_len()
     }
     fn raw_private_in_place(&self, buf: &mut [u8]) {
-        let out = self.raw(&Uint::<LIMBS>::from_be_bytes(buf));
+        let mut out = self.raw(&Uint::<LIMBS>::from_be_bytes(buf));
         out.write_be_bytes(buf);
+        // `out` is the raw private-op result (decrypted EM / signature
+        // representative) on the stack: wipe it before the frame is reused.
+        out = Uint::ZERO;
+        let _ = core::hint::black_box(&out);
     }
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
@@ -363,6 +367,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     ///
     /// `rounds` is the number of Miller-Rabin rounds per prime candidate.
     ///
+    /// # Panics
+    /// Panics if `e < 3`, `e` is even, or `e ≥ 2^256`: an even `e` is never
+    /// coprime to `φ(n)`, so the generation loop would spin forever; `e = 1`
+    /// yields `d = 1` (encryption is the identity); FIPS 186-5 §A.1.1 bounds
+    /// `e` below `2^256`.
+    ///
     /// # Side channels
     /// Key generation deliberately uses the **variable-time** extended-Euclid
     /// modular inverse [`inv_mod`](crate::bignum::inv_mod) for
@@ -376,6 +386,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     ///
     /// `rng` must be a cryptographically secure CSPRNG (see [`CryptoRng`]).
     pub fn generate<R: RngCore + CryptoRng>(e: Uint<LIMBS>, rng: &mut R, rounds: usize) -> Self {
+        assert!(
+            bool::from(e.is_odd())
+                && !bool::from(e.ct_lt(&Uint::<LIMBS>::from_u64(3)))
+                && e.bit_len() <= super::MAX_RSA_EXPONENT_BITS,
+            "RsaPrivateKey::generate: e must be odd, >= 3 and < 2^256"
+        );
         let half_bits = LIMBS * 32;
         loop {
             let p = random_prime::<LIMBS, R>(rng, half_bits, rounds);
@@ -608,6 +624,15 @@ mod tests {
             a.blinding_seed, b.blinding_seed,
             "distinct private keys must derive distinct blinding seeds"
         );
+    }
+
+    /// BN-5: an even `e` can never be inverted mod `φ(n)`; `generate` must
+    /// refuse it before drawing a single prime instead of looping forever.
+    #[test]
+    #[should_panic(expected = "e must be odd")]
+    fn generate_panics_on_even_exponent() {
+        let mut r = rng();
+        let _ = RsaPrivateKey::<16>::generate(Uint::from_u64(2), &mut r, 4);
     }
 
     // Generating a real RSA-2048 key is fast in release (~0.6s) but slow in an
