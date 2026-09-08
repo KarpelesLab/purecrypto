@@ -56,6 +56,14 @@ pub(super) enum Error {
     // allow, which keeps cross-target `-D warnings` builds green.
     #[allow(dead_code)]
     Other(i32),
+    /// The syscall reported success but returned an impossible byte count:
+    /// 0 for a non-empty request, or more than was asked for. `getrandom(2)`
+    /// never does either (it blocks, writes 1..=len bytes, or fails), so it
+    /// is treated as a kernel-level failure rather than retried — retrying
+    /// a 0 would spin forever on a broken kernel/sandbox shim. Treated as
+    /// fatal by the caller.
+    #[allow(dead_code)]
+    BadCount,
 }
 
 /// Fills `buf` with kernel CSPRNG bytes via `getrandom(2)`. Loops on short
@@ -72,20 +80,43 @@ pub(super) enum Error {
     )
 ))]
 pub(super) fn try_getrandom(buf: &mut [u8]) -> Result<(), Error> {
+    fill_with(buf, |ptr, len| {
+        // SAFETY: `ptr`/`len` describe the unfilled tail of `buf`, a valid,
+        // uniquely-borrowed range; the kernel writes at most `len` bytes
+        // into it.
+        unsafe {
+            getrandom_syscall(
+                ptr, len, 0, // flags = 0 — block until seeded, read from urandom pool.
+            )
+        }
+    })
+}
+
+/// The retry loop behind [`try_getrandom`], parameterised over the raw
+/// syscall so the error handling can be unit-tested without a kernel.
+/// `syscall(ptr, len)` must follow the `getrandom(2)` ABI: the number of
+/// bytes written, or `-errno`.
+#[cfg(all(
+    target_os = "linux",
+    not(miri),
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64",
+    )
+))]
+fn fill_with(
+    buf: &mut [u8],
+    mut syscall: impl FnMut(*mut u8, usize) -> isize,
+) -> Result<(), Error> {
     const ENOSYS: i32 = 38;
     const EINTR: i32 = 4;
 
     let mut filled = 0usize;
     while filled < buf.len() {
-        // SAFETY: We pass a valid pointer + length into the buffer; the
-        // kernel writes at most `remaining` bytes into the supplied range.
-        let ret = unsafe {
-            getrandom_syscall(
-                buf[filled..].as_mut_ptr(),
-                buf.len() - filled,
-                0, // flags = 0 — block until seeded, read from urandom pool.
-            )
-        };
+        let remaining = buf.len() - filled;
+        let ret = syscall(buf[filled..].as_mut_ptr(), remaining);
         if ret < 0 {
             let errno = -ret as i32;
             if errno == EINTR {
@@ -96,8 +127,14 @@ pub(super) fn try_getrandom(buf: &mut [u8]) -> Result<(), Error> {
             }
             return Err(Error::Other(errno));
         }
-        // ret > 0 here (ret == 0 would only happen on len == 0, but we
-        // entered the loop with filled < buf.len()).
+        // `getrandom(2)` returns 0 only for a zero-length request, and we
+        // entered the loop with `remaining > 0`. A 0 here means the kernel
+        // (or a seccomp/ptrace shim standing in for it) is misbehaving;
+        // fail closed instead of spinning on it forever. A count beyond the
+        // request is equally impossible and equally untrustworthy.
+        if ret == 0 || ret as usize > remaining {
+            return Err(Error::BadCount);
+        }
         filled += ret as usize;
     }
     Ok(())
@@ -259,5 +296,82 @@ mod tests {
             nonzero > 4096 * 9 / 10,
             "suspiciously many zeros: {nonzero}/4096"
         );
+    }
+
+    /// Regression for the retry loop: a syscall that returns 0 for a
+    /// non-empty request used to be added to `filled` (no progress) and
+    /// retried forever. It must fail closed instead.
+    #[cfg(all(
+        target_os = "linux",
+        not(miri),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+        )
+    ))]
+    #[test]
+    fn zero_return_fails_closed_instead_of_spinning() {
+        let mut buf = [0u8; 32];
+        let mut calls = 0;
+        let r = fill_with(&mut buf, |_, _| {
+            calls += 1;
+            0
+        });
+        assert_eq!(r, Err(Error::BadCount));
+        assert_eq!(calls, 1);
+
+        // A count beyond the request is rejected the same way.
+        let mut buf = [0u8; 32];
+        let r = fill_with(&mut buf, |_, len| len as isize + 1);
+        assert_eq!(r, Err(Error::BadCount));
+    }
+
+    /// The loop still handles the documented cases: EINTR is retried, short
+    /// reads are resumed at the right offset, ENOSYS maps to
+    /// `NotImplemented`, and any other errno is `Other`.
+    #[cfg(all(
+        target_os = "linux",
+        not(miri),
+        any(
+            target_arch = "x86_64",
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "riscv64",
+        )
+    ))]
+    #[test]
+    fn eintr_and_short_reads_are_resumed() {
+        let mut buf = [0u8; 10];
+        let mut step = 0;
+        let r = fill_with(&mut buf, |ptr, len| {
+            step += 1;
+            match step {
+                1 => -4, // EINTR: retry
+                2 => {
+                    // Short read of 4 bytes.
+                    assert_eq!(len, 10);
+                    // SAFETY: test-only mock honouring the callee contract.
+                    unsafe { core::ptr::write_bytes(ptr, 0xAA, 4) };
+                    4
+                }
+                _ => {
+                    assert_eq!(len, 6);
+                    // SAFETY: as above.
+                    unsafe { core::ptr::write_bytes(ptr, 0xBB, 6) };
+                    6
+                }
+            }
+        });
+        assert_eq!(r, Ok(()));
+        assert_eq!(&buf[..4], &[0xAA; 4]);
+        assert_eq!(&buf[4..], &[0xBB; 6]);
+
+        let mut buf = [0u8; 8];
+        assert_eq!(fill_with(&mut buf, |_, _| -38), Err(Error::NotImplemented));
+        assert_eq!(fill_with(&mut buf, |_, _| -14), Err(Error::Other(14)));
+        // Zero-length requests never call the syscall.
+        assert_eq!(fill_with(&mut [], |_, _| panic!("called")), Ok(()));
     }
 }

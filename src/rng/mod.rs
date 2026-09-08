@@ -210,6 +210,9 @@ impl RngCore for OsRng {
                 Err(linux_getrandom::Error::Other(e)) => {
                     panic!("getrandom(2) failed with errno {e}");
                 }
+                Err(linux_getrandom::Error::BadCount) => {
+                    panic!("getrandom(2) returned an impossible byte count");
+                }
             }
 
             urandom_fill(dest);
