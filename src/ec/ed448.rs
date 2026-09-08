@@ -232,10 +232,10 @@ impl Ed448PrivateKey {
 
     /// Parses a PKCS#8 `OneAsymmetricKey` DER structure.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, crate::der::Error> {
-        use crate::der::{Error, Reader, parse_oid};
+        use crate::der::{Error, Reader, parse_oid, tag};
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence()?;
-        seq.read_integer_bytes()?; // version (v1 = 0)
+        seq.read_integer_bytes()?; // version (v1 = 0, v2 = 1)
         let mut algid = seq.read_sequence()?;
         if parse_oid(algid.read_oid()?)?.as_slice() != ED448_OID {
             return Err(Error::Malformed);
@@ -247,6 +247,21 @@ impl Ed448PrivateKey {
         }
         let mut seed = [0u8; 57];
         seed.copy_from_slice(seed_bytes);
+        // RFC 5958 (PKCS#8 v2 / OneAsymmetricKey): an OPTIONAL `[0]` attributes
+        // (IMPLICIT SET, constructed) and an OPTIONAL `[1]` publicKey (IMPLICIT
+        // BIT STRING) may follow the privateKey OCTET STRING. The publicKey is
+        // a primitive BIT STRING, so its IMPLICIT tag is `0x81`; accept the
+        // constructed `0xA1` spelling too for robustness. Skip whichever are
+        // present, then assert the SEQUENCE and outer reader are fully consumed
+        // so genuine trailing garbage is rejected (mirrors Ed25519 / X448).
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_any()?;
+        }
+        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
+            seq.read_any()?;
+        }
+        seq.finish()?;
+        r.finish()?;
         Ok(Ed448PrivateKey { seed })
     }
 
@@ -717,5 +732,55 @@ mod tests {
         let sig = sk.sign_ctx(b"m", &long[..255]);
         assert!(pk.verify_ctx(b"m", &sig, &long[..255]).is_ok());
         assert!(pk.verify_ctx(b"m", &sig, &long).is_err());
+    }
+
+    #[cfg(all(feature = "der", feature = "alloc"))]
+    #[test]
+    fn pkcs8_rejects_trailing_garbage() {
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-pkcs8-junk", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let mut der = sk.to_pkcs8_der();
+        // Junk after the well-formed SEQUENCE must be rejected: the outer
+        // reader is asserted fully consumed.
+        der.push(0xff);
+        der.push(0x00);
+        assert!(Ed448PrivateKey::from_pkcs8_der(&der).is_err());
+
+        // Junk *inside* the SEQUENCE (after the privateKey OCTET STRING, with
+        // a tag that is neither `[0]` nor `[1]`) must be rejected too.
+        let der = sk.to_pkcs8_der();
+        let mut body = der[2..].to_vec();
+        body.extend_from_slice(&[0x05, 0x00]); // NULL
+        let bad = crate::der::encode_sequence(&body);
+        assert!(Ed448PrivateKey::from_pkcs8_der(&bad).is_err());
+    }
+
+    #[cfg(all(feature = "der", feature = "alloc"))]
+    #[test]
+    fn pkcs8_v2_with_public_key_parses() {
+        use crate::der::{encode_integer, encode_octet_string, encode_sequence, oid_tlv};
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-pkcs8-v2", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let seed = sk.to_bytes();
+        let pub_enc = sk.public_key().to_bytes();
+
+        // Hand-build a PKCS#8 v2 (RFC 5958) key with the OPTIONAL `[1]`
+        // publicKey present, encoded as a primitive IMPLICIT BIT STRING
+        // (tag 0x81) the way OpenSSL emits it: 0x00 unused-bits prefix
+        // followed by the 57-byte public key.
+        let version = encode_integer(&[1]);
+        let algid = encode_sequence(&oid_tlv(ED448_OID));
+        let privkey = encode_octet_string(&encode_octet_string(&seed));
+        let mut pub_bitstring = alloc::vec![0u8]; // 0 unused bits
+        pub_bitstring.extend_from_slice(&pub_enc);
+        let mut pubkey_field = alloc::vec![0x81u8];
+        // length is 58 (< 0x80), short form.
+        pubkey_field.push(pub_bitstring.len() as u8);
+        pubkey_field.extend_from_slice(&pub_bitstring);
+        let der = encode_sequence(&[version, algid, privkey, pubkey_field].concat());
+
+        let parsed = Ed448PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
+        assert_eq!(parsed.to_bytes(), seed);
+        assert_eq!(parsed.public_key().to_bytes(), pub_enc);
     }
 }
