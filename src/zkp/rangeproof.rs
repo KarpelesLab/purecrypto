@@ -866,9 +866,14 @@ pub fn verify(
 ///
 /// Runs in time independent of `value`, `blind` and `nonce`, with two
 /// qualifications: the argument checks fail closed (that `min_value <= value`,
-/// that a shifted proof stays below `2⁶³`) and so reveal that the arguments
-/// were invalid; and the chosen `exp`/`mantissa`/`min_value` depend on
+/// that `commit` opens to `(value, blind)`, that a shifted proof stays below
+/// `2⁶³`) and so reveal that the arguments were invalid; and the chosen `exp`/`mantissa`/`min_value` depend on
 /// `value`, but the proof header publishes them anyway.
+///
+/// # Errors
+/// [`Error::InvalidInput`] if the parameters are out of range, if `blind` is
+/// not a canonical scalar, if `commit` is not `value·generator + blind·G`, or
+/// if `message` exceeds [`message_capacity`].
 // The argument list mirrors `secp256k1_rangeproof_sign`; keeping the same
 // shape is what makes the interop corpus a line-for-line translation.
 #[allow(clippy::too_many_arguments)]
@@ -891,6 +896,11 @@ pub fn sign(
         return Err(Error::InvalidInput);
     }
     let blind_scalar = Scalar::from_bytes_be(blind)?;
+    // Fail closed if the opening does not match the commitment: a proof made
+    // from a mismatched opening can only ever fail verification.
+    if !bool::from(Commitment::with_generator(value, blind, generator)?.ct_eq(commit)) {
+        return Err(Error::InvalidInput);
+    }
 
     let mut proof = Vec::with_capacity(MAX_PROOF_LEN);
     write_header(&mut proof, &params);
@@ -1938,6 +1948,31 @@ mod tests {
             }
         }
         assert!(checked > 10_000);
+    }
+
+    #[test]
+    fn sign_rejects_a_mismatched_opening() {
+        let blind = blind_of(57);
+        let nonce = nonce_of(57);
+        let commit = Commitment::new(100, &blind).unwrap();
+        // Wrong value.
+        assert_eq!(
+            sign(&commit, &blind, &nonce, 101, 0, 0, 8, &[], &[], &h()).unwrap_err(),
+            Error::InvalidInput
+        );
+        // Wrong blinding factor.
+        assert_eq!(
+            sign(&commit, &blind_of(58), &nonce, 100, 0, 0, 8, &[], &[], &h()).unwrap_err(),
+            Error::InvalidInput
+        );
+        // Wrong generator.
+        let asset = Generator::from_asset_tag(&[3u8; 32]).unwrap();
+        assert_eq!(
+            sign(&commit, &blind, &nonce, 100, 0, 0, 8, &[], &[], &asset).unwrap_err(),
+            Error::InvalidInput
+        );
+        // The matching opening still signs.
+        assert!(sign(&commit, &blind, &nonce, 100, 0, 0, 8, &[], &[], &h()).is_ok());
     }
 
     // --- no panics on hostile input ---
