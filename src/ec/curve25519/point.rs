@@ -15,7 +15,7 @@
 
 use super::base_table::ED25519_BASE_TABLE;
 use super::field::{Fe, Field, ScalarInt};
-use crate::ct::{Choice, ConditionallySelectable, ConstantTimeLess};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 
 /// A curve point in extended homogeneous coordinates `(X:Y:Z:T)`.
 #[derive(Clone, Copy, Debug)]
@@ -210,10 +210,12 @@ impl Field {
 
             let byte = scalar[i / 2];
             let digit = (if i % 2 == 1 { byte >> 4 } else { byte & 0xf }) as usize;
-            // Constant-time gather of table[digit].
+            // Constant-time gather of table[digit]. The index comparison is
+            // the branch-free `ct_eq`, not `==`, so the secret digit never
+            // feeds a compare-and-branch the compiler could emit.
             let mut sel = table[0];
             for (j, entry) in table.iter().enumerate() {
-                sel = point_select(&sel, entry, Choice::from((j == digit) as u8));
+                sel = point_select(&sel, entry, j.ct_eq(&digit));
             }
             acc = self.point_add(&acc, &sel);
         }
@@ -244,7 +246,7 @@ impl Field {
             let mut sel = id;
             for (j, entry) in window.iter().enumerate() {
                 let cand = table_point(entry, self.one);
-                sel = point_select(&sel, &cand, Choice::from((j + 1 == digit) as u8));
+                sel = point_select(&sel, &cand, (j + 1).ct_eq(&digit));
             }
             acc = self.point_add(&acc, &sel);
         }
