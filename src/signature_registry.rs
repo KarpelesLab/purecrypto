@@ -210,7 +210,7 @@ pub fn find_by_id(id: &str) -> Option<&'static dyn SignatureAlgorithm> {
 
 #[cfg(feature = "alloc")]
 mod policy {
-    use super::{SignatureAlgorithm, find_by_id};
+    use super::{Error, SignatureAlgorithm, find_by_id};
     use alloc::vec::Vec;
 
     /// Compares two `&dyn SignatureAlgorithm` references for logical equality.
@@ -313,6 +313,12 @@ mod policy {
 
         /// Adds an algorithm by id, looking it up in [`super::ALGORITHMS`].
         /// Ignores unknown ids and duplicates.
+        ///
+        /// Because an unknown id is silently dropped, a typo in a hand-written
+        /// allow-list (`"ecdsa-secp256r1-sha255"`) leaves the policy quietly
+        /// narrower than intended. Use [`try_permit`](Self::try_permit) —
+        /// which fails on an unknown id — whenever the id comes from
+        /// configuration or user input rather than a literal in the source.
         pub fn permit(mut self, id: &str) -> Self {
             if let Some(algo) = find_by_id(id)
                 && !self.permitted.iter().any(|a| algo_eq(*a, algo))
@@ -320,6 +326,18 @@ mod policy {
                 self.permitted.push(algo);
             }
             self
+        }
+
+        /// [`permit`](Self::permit) that rejects an unknown id with
+        /// [`Error::UnsupportedAlgorithm`] instead of ignoring it, so a typo
+        /// in an allow-list is an error rather than an invisible narrowing of
+        /// the policy. Duplicates are still ignored. Prefer this for ids that
+        /// come from configuration files, CLI flags, or any other user input.
+        pub fn try_permit(self, id: &str) -> Result<Self, Error> {
+            if find_by_id(id).is_none() {
+                return Err(Error::UnsupportedAlgorithm);
+            }
+            Ok(self.permit(id))
         }
 
         /// Overrides the RSA-modulus-bit floor.
@@ -412,6 +430,36 @@ mod tests {
         assert!(!policy.permits(algo, &[]));
         let policy = policy.permit("ed25519");
         assert!(policy.permits(algo, &[]));
+    }
+
+    /// `permit` drops an unknown id on the floor (so a typo'd allow-list is
+    /// silently narrower than intended); `try_permit` reports it. Known ids
+    /// behave identically on both, duplicates included.
+    #[cfg(all(feature = "ec", feature = "alloc"))]
+    #[test]
+    fn try_permit_rejects_unknown_id() {
+        let algo = find_by_id("ed25519").unwrap();
+        // The silent form: the typo is invisible, the policy stays empty.
+        assert!(
+            !SignaturePolicy::empty()
+                .permit("ed25519-typo")
+                .permits(algo, &[])
+        );
+        assert!(matches!(
+            SignaturePolicy::empty().try_permit("ed25519-typo"),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+        assert!(matches!(
+            SignaturePolicy::empty().try_permit(""),
+            Err(Error::UnsupportedAlgorithm)
+        ));
+        let policy = SignaturePolicy::empty()
+            .try_permit("ed25519")
+            .unwrap()
+            .try_permit("ed25519")
+            .unwrap();
+        assert!(policy.permits(algo, &[]));
+        assert!(!policy.permits(find_by_id("ed448").unwrap(), &[]));
     }
 
     #[cfg(all(feature = "rsa", feature = "alloc"))]
