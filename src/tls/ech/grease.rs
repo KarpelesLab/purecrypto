@@ -91,11 +91,26 @@ impl Default for GreaseParams {
 /// alone.
 pub const MIN_GREASE_PAYLOAD_LEN: usize = 17;
 
+/// Upper bound on `1 + enc_len + payload_len`: the GREASE body is derived in
+/// one HKDF-SHA-256 expansion (the seeded builder used for every ClientHello),
+/// whose output is capped at `255 * HashLen = 8160` bytes by RFC 5869 §2.3
+/// (the crate's `hkdf` panics beyond it). The `u16` wire limit alone would
+/// admit `enc_len + payload_len` up to ~128 KiB, so a `GreaseParams` with,
+/// say, `payload_len = 9000` would otherwise pass [`GreaseParams::validate`]
+/// and then panic on every ClientHello built with it.
+pub const MAX_GREASE_TOTAL_LEN: usize = 255 * 32;
+
+/// Largest `enc_len` that still leaves room for a
+/// [`MIN_GREASE_PAYLOAD_LEN`]-byte payload under [`MAX_GREASE_TOTAL_LEN`].
+const MAX_GREASE_ENC_LEN: usize = MAX_GREASE_TOTAL_LEN - 1 - MIN_GREASE_PAYLOAD_LEN;
+
 impl GreaseParams {
-    /// Checks the lengths are representable on the wire and large enough to
-    /// pass for real ECH: `enc_len` and `payload_len` must fit a `u16`
-    /// (`opaque <0..2^16-1>`) and `payload_len` must be at least
-    /// [`MIN_GREASE_PAYLOAD_LEN`].
+    /// Checks the lengths are representable on the wire, derivable, and
+    /// large enough to pass for real ECH: `enc_len` and `payload_len` must
+    /// fit a `u16` (`opaque <0..2^16-1>`), `payload_len` must be at least
+    /// [`MIN_GREASE_PAYLOAD_LEN`], and `1 + enc_len + payload_len` must not
+    /// exceed [`MAX_GREASE_TOTAL_LEN`] (the single-HKDF-expansion bound the
+    /// seeded builder derives the body under).
     ///
     /// The builders clamp to this range rather than emitting an extension
     /// whose length prefix disagrees with its body, so a `GreaseParams` that
@@ -105,6 +120,7 @@ impl GreaseParams {
         if self.enc_len > u16::MAX as usize
             || self.payload_len > u16::MAX as usize
             || self.payload_len < MIN_GREASE_PAYLOAD_LEN
+            || 1 + self.enc_len + self.payload_len > MAX_GREASE_TOTAL_LEN
         {
             return Err(Error::IllegalParameter);
         }
@@ -112,13 +128,15 @@ impl GreaseParams {
     }
 
     /// The lengths actually emitted: clamped into the representable,
-    /// non-distinguishing range described by [`Self::validate`].
+    /// derivable, non-distinguishing range described by [`Self::validate`].
+    /// `enc_len` is cut first (to leave room for a minimum payload), then
+    /// `payload_len` to whatever remains under [`MAX_GREASE_TOTAL_LEN`].
     fn clamped_lens(&self) -> (usize, usize) {
-        (
-            self.enc_len.min(u16::MAX as usize),
-            self.payload_len
-                .clamp(MIN_GREASE_PAYLOAD_LEN, u16::MAX as usize),
-        )
+        let enc_len = self.enc_len.min(MAX_GREASE_ENC_LEN);
+        let payload_len = self
+            .payload_len
+            .clamp(MIN_GREASE_PAYLOAD_LEN, MAX_GREASE_TOTAL_LEN - 1 - enc_len);
+        (enc_len, payload_len)
     }
 
     /// Build the outer-form `encrypted_client_hello` extension body.
@@ -195,5 +213,86 @@ impl GreaseParams {
             payload: payload.to_vec(),
         };
         ext.encode()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hash::Sha256;
+    use crate::rng::HmacDrbg;
+
+    fn params(enc_len: usize, payload_len: usize) -> GreaseParams {
+        GreaseParams {
+            enc_len,
+            payload_len,
+            config_id_strategy: GreaseConfigIdStrategy::Fixed(0x2a),
+            ..GreaseParams::default()
+        }
+    }
+
+    /// Outer-form wire overhead: type(1) + cipher_suite(4) + config_id(1) +
+    /// two u16 length prefixes.
+    const OUTER_OVERHEAD: usize = 1 + 4 + 1 + 2 + 2;
+
+    /// PKI-2: `payload_len = 9000` fits a u16 (so it passed the old
+    /// `validate`) but `1 + 32 + 9000` exceeds the 8160-byte HKDF-SHA-256
+    /// expansion limit — the seeded builder used to panic on every
+    /// ClientHello. `validate` must now reject it, and both builders must
+    /// clamp instead of panicking.
+    #[test]
+    fn oversized_payload_is_rejected_and_clamped_not_panicking() {
+        let p = params(32, 9000);
+        assert_eq!(p.validate(), Err(Error::IllegalParameter));
+
+        let (enc_len, payload_len) = p.clamped_lens();
+        assert_eq!(enc_len, 32);
+        assert_eq!(payload_len, MAX_GREASE_TOTAL_LEN - 1 - 32);
+        assert_eq!(1 + enc_len + payload_len, MAX_GREASE_TOTAL_LEN);
+
+        let body = p.build_extension_from_seed(&[7u8; 32], &[9u8; 32]);
+        assert_eq!(body.len(), OUTER_OVERHEAD + enc_len + payload_len);
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"grease-clamp", b"nonce", &[]);
+        match p.build_extension(&mut rng) {
+            EchExtension::Outer { enc, payload, .. } => {
+                assert_eq!(enc.len(), enc_len);
+                assert_eq!(payload.len(), payload_len);
+            }
+            _ => panic!("GREASE builds the outer form"),
+        }
+    }
+
+    /// An `enc_len` that alone exhausts the budget is cut first, leaving room
+    /// for a minimum-size payload; the total stays derivable.
+    #[test]
+    fn oversized_enc_is_clamped_first() {
+        let p = params(u16::MAX as usize, DEFAULT_GREASE_PAYLOAD_LEN);
+        assert_eq!(p.validate(), Err(Error::IllegalParameter));
+        let (enc_len, payload_len) = p.clamped_lens();
+        assert_eq!(enc_len, MAX_GREASE_ENC_LEN);
+        assert_eq!(payload_len, MIN_GREASE_PAYLOAD_LEN);
+        assert_eq!(1 + enc_len + payload_len, MAX_GREASE_TOTAL_LEN);
+        let body = p.build_extension_from_seed(&[1u8; 32], &[2u8; 32]);
+        assert_eq!(body.len(), OUTER_OVERHEAD + enc_len + payload_len);
+    }
+
+    /// The exact ceiling is accepted, one byte over is not, and the defaults
+    /// (and every realistic KEM `enc` size) validate unchanged.
+    #[test]
+    fn total_len_boundary() {
+        assert!(GreaseParams::default().validate().is_ok());
+        for enc_len in [32usize, 65, 97, 133] {
+            assert!(
+                params(enc_len, DEFAULT_GREASE_PAYLOAD_LEN)
+                    .validate()
+                    .is_ok()
+            );
+        }
+        let at_limit = params(32, MAX_GREASE_TOTAL_LEN - 1 - 32);
+        assert!(at_limit.validate().is_ok());
+        assert_eq!(at_limit.clamped_lens(), (32, MAX_GREASE_TOTAL_LEN - 1 - 32));
+        let over = params(32, MAX_GREASE_TOTAL_LEN - 32);
+        assert_eq!(over.validate(), Err(Error::IllegalParameter));
     }
 }
