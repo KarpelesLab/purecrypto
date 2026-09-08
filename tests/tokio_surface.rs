@@ -192,3 +192,54 @@ async fn tls_stream_device_signer() {
 
     server.await.unwrap();
 }
+
+/// A handshake that fails on one end must deliver its fatal alert to the
+/// other end before the error surfaces: the client here trusts nothing, so
+/// its `handshake` fails on certificate verification and queues a fatal
+/// alert. The server's `handshake` must observe that alert
+/// (`Error::AlertReceived`) rather than a bare EOF — pre-fix, the client
+/// returned the error without ever writing the alert.
+#[tokio::test]
+async fn handshake_failure_delivers_alert_to_peer() {
+    let (key, leaf) = server_identity(b"tokio-alert", "tokio.example");
+    let server_cfg = Config::builder()
+        .tls_only()
+        .rng(Arc::new(OsRng))
+        .identity(vec![leaf], SigningKey::Ecdsa(key))
+        .build();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (sock, _) = listener.accept().await.unwrap();
+        let conn = Connection::server(&server_cfg).unwrap();
+        let Err(e) = TlsStream::handshake(conn, sock).await else {
+            panic!("the client's rejection must fail the server handshake");
+        };
+        e
+    });
+
+    // An empty trust store: the server's self-signed leaf is unknown.
+    let client_cfg = Config::builder()
+        .tls_only()
+        .rng(Arc::new(OsRng))
+        .roots(RootCertStore::new())
+        .server_name("tokio.example")
+        .build();
+    let sock = TcpStream::connect(addr).await.unwrap();
+    let conn = Connection::client(&client_cfg).unwrap();
+    let Err(client_err) = TlsStream::handshake(conn, sock).await else {
+        panic!("an untrusted server must fail the client handshake");
+    };
+    assert_eq!(client_err.kind(), std::io::ErrorKind::Other);
+
+    let server_err = server.await.unwrap();
+    let tls_err = server_err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<purecrypto::tls::Error>())
+        .unwrap_or_else(|| panic!("server saw a transport error, not the alert: {server_err}"));
+    assert!(
+        matches!(tls_err, purecrypto::tls::Error::AlertReceived(_)),
+        "server must receive the client's fatal alert, got {tls_err:?}"
+    );
+}

@@ -249,3 +249,58 @@ fn mio_drive_device_signer() {
 
     server.join().unwrap();
 }
+
+/// A handshake that fails on one end must deliver its fatal alert to the
+/// other end before `drive_handshake` returns the error: the client here
+/// trusts nothing, so it fails on certificate verification and queues a
+/// fatal alert. The server's `drive_handshake` must observe that alert
+/// (`Error::AlertReceived`) rather than a bare EOF — pre-fix, the client
+/// returned the error without ever writing the alert.
+#[test]
+fn mio_drive_handshake_failure_delivers_alert_to_peer() {
+    let (key, leaf) = server_identity(b"mio-alert", "mio.example");
+    let server_cfg = Config::builder()
+        .tls_only()
+        .rng(Arc::new(OsRng))
+        .identity(vec![leaf], SigningKey::Ecdsa(key))
+        .build();
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (std_sock, _) = listener.accept().unwrap();
+        std_sock.set_nonblocking(true).unwrap();
+        let mut sock = TcpStream::from_std(std_sock);
+        let mut conn = Connection::server(&server_cfg).unwrap();
+        let mut poll = Poll::new().unwrap();
+        drive_handshake(&mut conn, &mut sock, &mut poll, SOCK, SIGNER)
+            .expect_err("the client's rejection must fail the server handshake")
+    });
+
+    // An empty trust store: the server's self-signed leaf is unknown.
+    let client_cfg = Config::builder()
+        .tls_only()
+        .rng(Arc::new(OsRng))
+        .roots(RootCertStore::new())
+        .server_name("mio.example")
+        .build();
+    let mut sock = TcpStream::connect(addr).unwrap();
+    let mut conn = Connection::client(&client_cfg).unwrap();
+    let mut poll = Poll::new().unwrap();
+    let client_err = drive_handshake(&mut conn, &mut sock, &mut poll, SOCK, SIGNER)
+        .expect_err("an untrusted server must fail the client handshake");
+    assert_eq!(client_err.kind(), io::ErrorKind::Other);
+
+    // Hang up so a server that never got the alert sees EOF instead of
+    // waiting on this socket forever.
+    drop(sock);
+    let server_err = server.join().unwrap();
+    let tls_err = server_err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<purecrypto::tls::Error>())
+        .unwrap_or_else(|| panic!("server saw a transport error, not the alert: {server_err}"));
+    assert!(
+        matches!(tls_err, purecrypto::tls::Error::AlertReceived(_)),
+        "server must receive the client's fatal alert, got {tls_err:?}"
+    );
+}

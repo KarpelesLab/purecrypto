@@ -92,6 +92,27 @@ where
 
     let result = drive_loop(conn, sock, poll, &mut events, sock_token, signer_token);
 
+    // A protocol failure leaves the fatal alert describing it queued in the
+    // engine (`feed`/`drive` return before the loop's next `WantWrite`).
+    // Make one non-blocking attempt to put it on the wire so the peer learns
+    // *why* the handshake died instead of seeing a bare FIN; never block or
+    // mask the primary error for it.
+    if result.is_err()
+        && let Ok(out) = conn.pop()
+        && !out.is_empty()
+    {
+        let mut off = 0;
+        while off < out.len() {
+            match sock.write(&out[off..]) {
+                Ok(0) => break,
+                Ok(n) => off += n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = sock.flush();
+    }
+
     // Always leave the socket deregistered, regardless of outcome.
     let _ = poll.registry().deregister(sock);
     result
