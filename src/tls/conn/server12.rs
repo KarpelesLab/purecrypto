@@ -851,6 +851,14 @@ impl<R: RngCore> ServerConnection12<R> {
                     if !awaiting_finished || self.pending_client_crypter.is_none() {
                         return Err(Error::UnexpectedMessage);
                     }
+                    // RFC 5246 §6.2.1: handshake messages MUST NOT span a
+                    // change of cipher spec. Anything still in the
+                    // reassembly buffer was read in plaintext; it must not
+                    // be completed by (or consumed alongside) bytes read
+                    // under the new key.
+                    if !self.hs_pending.is_empty() {
+                        return Err(Error::UnexpectedMessage);
+                    }
                     // Install the read crypter; the next handshake record
                     // (Finished) will be encrypted under it.
                     self.client_crypter = self.pending_client_crypter.take();

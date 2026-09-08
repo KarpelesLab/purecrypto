@@ -7366,6 +7366,286 @@ mod audit_regression_tests {
         assert!(server.write_tls().is_empty() || !server.is_handshaking());
     }
 
+    /// A plaintext TLS 1.3 ServerHello record for `client`'s X25519 offer,
+    /// with `trailing` appended INSIDE the same record.
+    fn synthetic_sh_record_with_trailing(trailing: &[u8]) -> Vec<u8> {
+        use crate::tls::codec::{ExtensionType, ServerHello, write_record};
+        use crate::tls::{ContentType, ProtocolVersion};
+        // key_share: group x25519 ‖ vec_u16(32-byte u-coordinate). The
+        // curve base point is a perfectly good peer share.
+        let mut ks = Vec::new();
+        ks.extend_from_slice(&NamedGroup::X25519.0.to_be_bytes());
+        ks.extend_from_slice(&32u16.to_be_bytes());
+        ks.push(9);
+        ks.extend_from_slice(&[0u8; 31]);
+        let sh = ServerHello {
+            random: [0xAB; 32],
+            session_id: Vec::new(),
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType::KEY_SHARE, ks),
+            ],
+        };
+        let mut payload = sh.encode();
+        payload.extend_from_slice(trailing);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &payload,
+        );
+        rec
+    }
+
+    fn x25519_client(tag: &[u8]) -> ClientConnection {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(tag, b"nonce", &[]);
+        ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        )
+    }
+
+    /// TLS-CORE-2 — RFC 8446 §5.1: handshake messages MUST NOT span a key
+    /// change. The reassembly buffer was never checked when a read key was
+    /// installed, so plaintext bytes coalesced behind the ServerHello in
+    /// the same record were consumed as if they had been protected under
+    /// the freshly installed handshake key. Here a plaintext
+    /// EncryptedExtensions rides behind the SH and used to advance the
+    /// client to `WaitCertificate` without a single protected byte.
+    #[test]
+    fn client_rejects_plaintext_bytes_coalesced_behind_server_hello() {
+        // Control: the same ServerHello alone is fine.
+        let mut ok = x25519_client(b"sh-coalesce-ok");
+        let _ = ok.write_tls();
+        ok.read_tls(&synthetic_sh_record_with_trailing(&[]));
+        ok.process_new_packets().unwrap();
+        assert!(ok.is_handshaking());
+
+        // [ServerHello ‖ EncryptedExtensions] in ONE plaintext record.
+        let ee = [8u8, 0, 0, 2, 0, 0];
+        let mut client = x25519_client(b"sh-coalesce-bad");
+        let _ = client.write_tls();
+        client.read_tls(&synthetic_sh_record_with_trailing(&ee));
+        assert!(
+            matches!(client.process_new_packets(), Err(Error::UnexpectedMessage)),
+            "plaintext bytes after the key change must be refused"
+        );
+        assert!(!client.is_handshaking());
+    }
+
+    /// TLS-CORE-2 — server analogue: bytes coalesced behind the ClientHello
+    /// in the same plaintext record were carried across the install of the
+    /// client-handshake read key. A partial message is used so the old
+    /// behaviour (silently buffer it and wait for "more") is distinguishable
+    /// from the fix (`unexpected_message`).
+    #[test]
+    fn server_rejects_plaintext_bytes_coalesced_behind_client_hello() {
+        use crate::tls::codec::{read_record, write_record};
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let (server_config, _cert_der) = rsa_server();
+        let mut client = x25519_client(b"ch-coalesce-c");
+        let ch_rec = client.write_tls();
+        let rec = read_record(&ch_rec).unwrap().unwrap();
+        assert_eq!(rec.len, ch_rec.len());
+        let mut payload = rec.fragment.to_vec();
+        payload.extend_from_slice(&[0x0b, 0x00]); // start of a Certificate
+        let mut coalesced = Vec::new();
+        write_record(
+            &mut coalesced,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &payload,
+        );
+
+        let srng = HmacDrbg::<Sha256>::new(b"ch-coalesce-s", b"nonce", &[]);
+        let mut server = ServerConnection::new(server_config, srng);
+        server.read_tls(&coalesced);
+        assert!(
+            matches!(server.process_new_packets(), Err(Error::UnexpectedMessage)),
+            "plaintext bytes after the key change must be refused"
+        );
+        assert!(!server.is_handshaking());
+    }
+
+    /// Re-encrypts a captured TLS 1.3 server flight under `shts` so the
+    /// protected handshake messages can be regrouped into records. Returns
+    /// `(plaintext SH record ‖ CCS record, [EE, Certificate,
+    /// CertificateVerify, Finished] plaintexts)`.
+    fn split_server_flight(flight: &[u8], shts: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+        use crate::tls::ContentType;
+        use crate::tls::codec::read_record;
+        use crate::tls::crypto::{AeadAlg, HashAlg, RecordCrypter, Secret};
+
+        let mut reader =
+            RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &Secret::new(shts));
+        let mut prefix = Vec::new();
+        let mut messages = Vec::new();
+        let mut off = 0usize;
+        while let Some(rec) = read_record(&flight[off..]).unwrap() {
+            match rec.content_type {
+                ContentType::Handshake | ContentType::ChangeCipherSpec => {
+                    prefix.extend_from_slice(&flight[off..off + rec.len]);
+                }
+                ContentType::ApplicationData => {
+                    let mut header = [0u8; 5];
+                    header.copy_from_slice(&flight[off..off + 5]);
+                    let (ct, plain) = reader.decrypt(&header, rec.fragment).unwrap();
+                    assert_eq!(ct, ContentType::Handshake);
+                    messages.push(plain);
+                }
+                _ => panic!("unexpected record in the server flight"),
+            }
+            off += rec.len;
+        }
+        assert_eq!(off, flight.len());
+        assert_eq!(
+            messages.len(),
+            4,
+            "EE, Certificate, CertificateVerify, Finished"
+        );
+        (prefix, messages)
+    }
+
+    /// TLS-CORE-2 — bytes trailing the server's `Finished` inside the same
+    /// handshake-key record were carried across the switch to the
+    /// application read key and processed as post-handshake messages. A
+    /// NewSessionTicket riding behind Finished must be refused; the same
+    /// flight with Finished alone in its record still completes (control).
+    #[test]
+    fn client_rejects_handshake_bytes_trailing_finished_across_key_change() {
+        use crate::tls::ContentType;
+        use crate::tls::codec::NewSessionTicket;
+        use crate::tls::crypto::{AeadAlg, HashAlg, RecordCrypter, Secret};
+
+        let run = |tag: &[u8], trailing: &[u8]| -> (ClientConnection, Result<(), Error>) {
+            let (server_config, cert_der) = rsa_server();
+            let mut roots = RootCertStore::new();
+            roots.add_der(cert_der).unwrap();
+            let mut crng = HmacDrbg::<Sha256>::new(tag, b"c", &[]);
+            let srng = HmacDrbg::<Sha256>::new(tag, b"s", &[]);
+            let mut client = ClientConnection::new_with_offer(
+                ClientConfig::new(roots),
+                "loopback.example",
+                &mut crng,
+                &[CipherSuite::AES_128_GCM_SHA256],
+                &[NamedGroup::X25519],
+            );
+            let mut server = ServerConnection::new(server_config, srng);
+            server.read_tls(&client.write_tls());
+            server.process_new_packets().unwrap();
+            let flight = server.write_tls();
+            let shts = server.server_hs_secret_bytes();
+            let (prefix, messages) = split_server_flight(&flight, &shts);
+
+            // Regroup: EE, Cert, CV each in their own record; Finished
+            // shares a record with `trailing`.
+            let mut writer =
+                RecordCrypter::new(HashAlg::Sha256, AeadAlg::Aes128Gcm, 16, &Secret::new(&shts));
+            let mut wire = prefix;
+            for m in &messages[..3] {
+                wire.extend_from_slice(&writer.encrypt(ContentType::Handshake, m).unwrap());
+            }
+            let mut last = messages[3].clone();
+            last.extend_from_slice(trailing);
+            wire.extend_from_slice(&writer.encrypt(ContentType::Handshake, &last).unwrap());
+
+            client.read_tls(&wire);
+            let r = client.process_new_packets();
+            (client, r)
+        };
+
+        // Control: the regrouped flight is a valid handshake.
+        let (client, r) = run(b"fin-trail-ok", &[]);
+        r.unwrap();
+        assert!(!client.is_handshaking());
+
+        let nst = NewSessionTicket {
+            ticket_lifetime: 7200,
+            ticket_age_add: 0,
+            ticket_nonce: alloc::vec![0u8; 4],
+            ticket: alloc::vec![0x41u8; 32],
+            extensions: Vec::new(),
+        }
+        .encode();
+        let (mut client, r) = run(b"fin-trail-bad", &nst);
+        assert!(
+            matches!(r, Err(Error::UnexpectedMessage)),
+            "a NewSessionTicket riding behind Finished spans the key change"
+        );
+        assert!(!client.is_handshaking());
+        assert!(
+            client.take_session().is_none(),
+            "the smuggled ticket must not have been consumed"
+        );
+    }
+
+    /// TLS-CORE-2 — TLS 1.2 twin (RFC 5246 §6.2.1: handshake messages
+    /// MUST NOT span a change of cipher spec). A partial plaintext message
+    /// sitting in the reassembly buffer when the server's CCS arrives used
+    /// to be completed with bytes decrypted under the new key.
+    #[test]
+    fn tls12_client_rejects_handshake_fragment_spanning_ccs() {
+        use crate::tls::codec::write_record;
+        use crate::tls::conn::{
+            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12,
+        };
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let server_config = ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed);
+        let mut roots = RootCertStore::new();
+        roots.add_der(der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"ccs-span-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"ccs-span-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
+                .unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        client.read_tls(&server.write_tls());
+        client.process_new_packets().unwrap();
+        let _client_flight = client.write_tls();
+
+        // A partial NewSessionTicket header, then the server's CCS.
+        let mut wire = Vec::new();
+        write_record(
+            &mut wire,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &[0x04, 0x00],
+        );
+        write_record(
+            &mut wire,
+            ContentType::ChangeCipherSpec,
+            ProtocolVersion::TLSv1_2,
+            &[0x01],
+        );
+        client.read_tls(&wire);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
     /// LOW 9 — after the client's `Finished`, 1-RTT application data must
     /// land in the regular receive buffer. Leaving the 0-RTT routing armed
     /// diverted fully-authenticated bytes into the replayable early-data

@@ -194,8 +194,24 @@ impl ConnectionCore {
     }
 
     /// Installs the inbound (read) record-protection keys.
-    pub(crate) fn set_read(&mut self, crypter: RecordCrypter) {
+    ///
+    /// RFC 8446 §5.1: handshake messages MUST NOT span a key change, and an
+    /// implementation that receives a key change with an unfinished (or
+    /// unconsumed) handshake fragment MUST abort with `unexpected_message`.
+    /// The record layer pops one complete message at a time before reading
+    /// the next record, so anything still in `hs_pending` when the state
+    /// machine rotates the read key is trailing data from the record that
+    /// carried the message which triggered the rotation — bytes that were
+    /// read under the *old* epoch (e.g. plaintext coalesced behind a
+    /// ServerHello, or a NewSessionTicket riding behind Finished under the
+    /// handshake key). Letting them through would process them as if they
+    /// had been protected under the new key. Refuse instead.
+    pub(crate) fn set_read(&mut self, crypter: RecordCrypter) -> Result<(), Error> {
+        if !self.hs_pending.is_empty() {
+            return Err(Error::UnexpectedMessage);
+        }
         self.read = Some(crypter);
+        Ok(())
     }
 
     /// Installs the outbound (write) record-protection keys.
@@ -610,7 +626,8 @@ mod tests {
             AeadAlg::Aes128Gcm,
             16,
             &real_secret,
-        ));
+        ))
+        .unwrap();
         core.set_app_data_allowed(true);
         core.begin_skip_early_data(64 * 1024);
 
@@ -666,7 +683,8 @@ mod tests {
             AeadAlg::Aes128Gcm,
             16,
             &Secret::new(&[0x11u8; 32]),
-        ));
+        ))
+        .unwrap();
         core.begin_skip_early_data(64);
         let mut stale = RecordCrypter::new(
             HashAlg::Sha256,
@@ -703,7 +721,8 @@ mod tests {
             AeadAlg::Aes128Gcm,
             16,
             &secret,
-        ));
+        ))
+        .unwrap();
         // `app_data_allowed` is false until the state machine reaches
         // Connected.
         core.read_tls(

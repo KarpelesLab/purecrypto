@@ -1923,7 +1923,7 @@ impl ClientConnection {
             .as_ref()
             .ok_or(Error::IllegalParameter)?;
         let next = next_traffic_secret(suite.hash, prev);
-        self.core.set_read(suite.crypter(&next));
+        self.core.set_read(suite.crypter(&next))?;
         self.server_app_secret = Some(next);
 
         if ku.request_update {
@@ -2224,7 +2224,7 @@ impl ClientConnection {
         // later. In QUIC mode the record crypter is never installed (the
         // QUIC layer holds the AEAD state per encryption level).
         if !self.skip_record_keys() {
-            self.core.set_read(suite.crypter(&shts));
+            self.core.set_read(suite.crypter(&shts))?;
             if self.early_data_offered {
                 self.deferred_client_hs_secret = Some(chts.clone());
             } else {
@@ -3253,7 +3253,7 @@ impl ClientConnection {
         // layer holds 1-RTT AEAD state in its own crypto module).
         if !self.skip_record_keys() {
             self.core.set_write(suite.crypter(&cats));
-            self.core.set_read(suite.crypter(&sats));
+            self.core.set_read(suite.crypter(&sats))?;
         }
         // Retain both directions' app secrets so we can step them on KeyUpdate.
         self.client_app_secret = Some(cats);
