@@ -1,12 +1,15 @@
 //! TLS PKI: trust anchors and certificate-chain verification.
 
 mod crls;
+mod ocsp;
 mod policy;
 mod store;
 mod verify;
 
 #[allow(unused_imports)]
 pub use crls::CrlStore;
+#[allow(unused_imports)]
+pub(crate) use ocsp::check_stapled_ocsp;
 #[allow(unused_imports)]
 pub use policy::PolicyOptions;
 #[allow(unused_imports)]

@@ -63,6 +63,115 @@ const MAX_CHAIN_LEN: usize = 10;
 /// verifications per handshake.
 const MAX_CRLS_PER_ISSUER: usize = 8;
 
+/// The identity of the certificate that issued the end-entity certificate of
+/// a validated chain — what an OCSP `CertID` (RFC 6960 §4.1.1) and a
+/// delegated-responder check must be evaluated against.
+///
+/// The verifier closes the path at the FIRST certificate anchored by the
+/// store and discards everything the peer supplied above it. When the leaf
+/// anchors directly on a stored root, `chain[1]` (if present) is therefore an
+/// arbitrary, never-validated, peer-chosen blob and MUST NOT be used as the
+/// leaf's issuer; this value carries the *actual* issuer — the in-chain
+/// certificate that signed the leaf, or the matched trust anchor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LeafIssuer {
+    /// The issuer's subject `Name` — full DER TLV, byte-exact as encoded in
+    /// the issuing certificate (what `issuerNameHash` is computed over).
+    pub(crate) name_der: Vec<u8>,
+    /// The issuer's `SubjectPublicKeyInfo` — full DER TLV, byte-exact as
+    /// encoded in the issuing certificate (its `subjectPublicKey` BIT STRING
+    /// content is what `issuerKeyHash` is computed over).
+    pub(crate) spki_der: Vec<u8>,
+}
+
+impl LeafIssuer {
+    fn from_anchor(anchor: &TrustAnchor) -> Self {
+        LeafIssuer {
+            name_der: anchor.subject_der.clone(),
+            spki_der: anchor.spki_der.clone(),
+        }
+    }
+
+    fn from_cert(cert: &Certificate) -> Result<Self, Error> {
+        Ok(LeafIssuer {
+            name_der: cert
+                .subject_der()
+                .map_err(|_| Error::BadCertificate)?
+                .to_vec(),
+            spki_der: cert.spki_der().map_err(|_| Error::BadCertificate)?.to_vec(),
+        })
+    }
+}
+
+/// The result of a successful chain verification.
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedChain {
+    /// The end-entity (leaf) public key — the key whose possession the peer
+    /// proves in its `CertificateVerify`.
+    pub(crate) leaf_key: AnyPublicKey,
+    /// The leaf's actual issuer within the validated path (see
+    /// [`LeafIssuer`]).
+    // The TLS clients resolve the issuer via `leaf_issuer()` in a later
+    // handshake step; this field serves tests / future internal callers.
+    #[allow(dead_code)]
+    pub(crate) leaf_issuer: LeafIssuer,
+}
+
+/// Step (a) of the path walk: the first trust anchor in `store` whose subject
+/// `Name` byte-equals `cert`'s issuer (RFC 5280 §7.1) AND whose key verifies
+/// `cert`'s signature under `policy`. Several anchors may share a Name
+/// (cross-signed renewal), so the signature decides. `None` when `cert` is
+/// not directly anchored.
+///
+/// Shared by the verifier and by [`leaf_issuer`] so that both resolve the
+/// leaf's issuer identically.
+fn anchor_for<'a>(
+    store: &'a RootCertStore,
+    cert: &Certificate,
+    policy: &SignaturePolicy,
+) -> Result<Option<&'a TrustAnchor>, Error> {
+    let issuer_der = cert.issuer_der().map_err(|_| Error::BadCertificate)?;
+    Ok(store
+        .anchors_with_subject(issuer_der)
+        .find(|anchor| verify_cert_against_issuer(cert, &anchor.key, policy).is_ok()))
+}
+
+/// Resolves the issuer of `chain[0]` exactly as the chain verifier does —
+/// the matched trust anchor when the leaf anchors directly on the store,
+/// otherwise `chain[1]` (which must then verify the leaf's signature).
+///
+/// Intended for callers that hold an already-verified `chain` (the TLS
+/// clients validate the chain in one handshake step and the stapled OCSP
+/// response in another) and need the leaf's issuer without re-running full
+/// path validation. Because the verifier closes the path at the first
+/// anchored certificate, this is the ONLY correct way to obtain the leaf's
+/// issuer from a peer-supplied chain — `chain[1]` alone is peer-chosen and
+/// unvalidated whenever the leaf anchors directly.
+///
+/// Fails with `BadCertificate` when the leaf is neither anchored nor signed
+/// by `chain[1]` (i.e. when the chain would not have verified).
+pub(crate) fn leaf_issuer(
+    store: &RootCertStore,
+    chain: &[Vec<u8>],
+    policy: &SignaturePolicy,
+) -> Result<LeafIssuer, Error> {
+    let leaf_der = chain.first().ok_or(Error::BadCertificate)?;
+    let leaf = Certificate::from_der(leaf_der.clone()).map_err(|_| Error::BadCertificate)?;
+    if let Some(anchor) = anchor_for(store, &leaf, policy)? {
+        return Ok(LeafIssuer::from_anchor(anchor));
+    }
+    let issuer_der = chain.get(1).ok_or(Error::BadCertificate)?;
+    let issuer = Certificate::from_der(issuer_der.clone()).map_err(|_| Error::BadCertificate)?;
+    let issuer_key = issuer
+        .subject_public_key()
+        .map_err(|_| Error::BadCertificate)?;
+    verify_cert_against_issuer(&leaf, &issuer_key, policy)?;
+    if names_differ(&leaf, &issuer)? {
+        return Err(Error::BadCertificate);
+    }
+    LeafIssuer::from_cert(&issuer)
+}
+
 /// Verifies a certificate `chain` (end-entity first) against `store` and, on
 /// success, returns the end-entity (leaf) public key — the key whose possession
 /// the peer proves in its `CertificateVerify`.
@@ -105,6 +214,29 @@ pub(crate) fn verify_chain_with_crls(
     policy: &SignaturePolicy,
 ) -> Result<AnyPublicKey, Error> {
     verify_chain_with_crls_for_purpose(store, crls, chain, now, policy, ChainPurpose::Server)
+}
+
+/// Like [`verify_chain_with_crls`], but returns the full [`VerifiedChain`] —
+/// the leaf key *and* the leaf's actual issuer within the validated path —
+/// for callers that go on to evaluate revocation data (a stapled OCSP
+/// response) keyed on the issuer.
+#[allow(dead_code)] // useful for tests / future internal callers
+pub(crate) fn verify_chain_with_crls_verified(
+    store: &RootCertStore,
+    crls: &CrlStore,
+    chain: &[Vec<u8>],
+    now: Option<&Time>,
+    policy: &SignaturePolicy,
+) -> Result<VerifiedChain, Error> {
+    verify_chain_inner(
+        store,
+        crls,
+        chain,
+        now,
+        policy,
+        ChainPurpose::Server,
+        &super::policy::PolicyOptions::none(),
+    )
 }
 
 /// Whether the leaf is the *server* (verified by a TLS client) or the
@@ -154,7 +286,7 @@ pub(crate) fn verify_chain_with_policy(
     purpose: ChainPurpose,
     policy_opts: &super::policy::PolicyOptions,
 ) -> Result<AnyPublicKey, Error> {
-    verify_chain_inner(store, crls, chain, now, policy, purpose, policy_opts)
+    verify_chain_inner(store, crls, chain, now, policy, purpose, policy_opts).map(|v| v.leaf_key)
 }
 
 pub(crate) fn verify_chain_with_crls_for_purpose(
@@ -174,6 +306,7 @@ pub(crate) fn verify_chain_with_crls_for_purpose(
         purpose,
         &super::policy::PolicyOptions::none(),
     )
+    .map(|v| v.leaf_key)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,7 +318,7 @@ fn verify_chain_inner(
     policy: &SignaturePolicy,
     purpose: ChainPurpose,
     policy_opts: &super::policy::PolicyOptions,
-) -> Result<AnyPublicKey, Error> {
+) -> Result<VerifiedChain, Error> {
     if chain.is_empty() {
         return Err(Error::BadCertificate);
     }
@@ -223,20 +356,17 @@ fn verify_chain_inner(
     // anchor, and the anchor itself is not validity-checked).
     let mut anchor_at: Option<usize> = None;
     let mut matched_anchor: Option<&TrustAnchor> = None;
+    // The leaf's issuer within the validated path: the anchor when certs[0]
+    // anchors directly, else certs[1]. Recorded here — NOT read back from
+    // `chain[1]` by callers — because when the leaf anchors directly the
+    // rest of the supplied chain is discarded unvalidated (see below).
+    let mut leaf_issuer: Option<LeafIssuer> = None;
     for i in 0..certs.len() {
         // (a) Is certs[i] issued directly by a trusted anchor? Anchors match by
         //     byte-exact issuer/subject Name equality (RFC 5280 §7.1); several
         //     anchors may share a Name (cross-signed renewal), so accept the
         //     first whose key verifies certs[i]'s signature under `policy`.
-        let issuer_der = certs[i].issuer_der().map_err(|_| Error::BadCertificate)?;
-        let mut anchored: Option<&TrustAnchor> = None;
-        for anchor in store.anchors_with_subject(issuer_der) {
-            if verify_cert_against_issuer(&certs[i], &anchor.key, policy).is_ok() {
-                anchored = Some(anchor);
-                break;
-            }
-        }
-        if let Some(anchor) = anchored {
+        if let Some(anchor) = anchor_for(store, &certs[i], policy)? {
             // Path closes here: certs[0..=i] is the validated path. certs[i]
             // may still be revoked by a CRL signed by the anchor.
             // The anchor's full certificate is not retained by the store, so
@@ -245,6 +375,9 @@ fn verify_chain_inner(
             check_revocation(&certs[i], &anchor.key, None, crls, now, policy)?;
             anchor_at = Some(i + 1);
             matched_anchor = Some(anchor);
+            if i == 0 {
+                leaf_issuer = Some(LeafIssuer::from_anchor(anchor));
+            }
             break;
         }
 
@@ -262,6 +395,9 @@ fn verify_chain_inner(
             return Err(Error::BadCertificate);
         }
         check_revocation(&certs[i], &issuer_key, Some(issuer), crls, now, policy)?;
+        if i == 0 {
+            leaf_issuer = Some(LeafIssuer::from_cert(issuer)?);
+        }
     }
 
     // `anchor_at` is set whenever control reaches here: the loop either records
@@ -318,9 +454,16 @@ fn verify_chain_inner(
     // processing, so the default path is unaffected.
     super::policy::check_policies(path, policy_opts)?;
 
-    certs[0]
+    let leaf_key = certs[0]
         .subject_public_key()
-        .map_err(|_| Error::BadCertificate)
+        .map_err(|_| Error::BadCertificate)?;
+    // Set on the very first loop iteration on both the anchored and the
+    // in-chain branch (any other outcome returned early).
+    let leaf_issuer = leaf_issuer.ok_or(Error::BadCertificate)?;
+    Ok(VerifiedChain {
+        leaf_key,
+        leaf_issuer,
+    })
 }
 
 /// Consults `crls` for any CRL whose issuer name matches `cert.issuer_der()`

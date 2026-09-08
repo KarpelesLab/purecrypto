@@ -608,12 +608,39 @@ impl OcspResponse {
         issuer: &Certificate,
         opts: &OcspCheckOptions<'_>,
     ) -> Result<OcspCertStatus, Error> {
+        self.check_for_cert_with_issuer_info(leaf, issuer.subject_der()?, issuer.spki_der()?, opts)
+    }
+
+    /// [`check_for_cert_with_options`](Self::check_for_cert_with_options)
+    /// for an issuer known only by its identity rather than a full
+    /// certificate: `issuer_name_der` is the issuer's subject `Name` (full
+    /// DER TLV) and `issuer_spki_der` its `SubjectPublicKeyInfo` (full DER
+    /// TLV), both byte-exact as encoded in the issuing certificate.
+    ///
+    /// That is everything an OCSP check needs — the `CertID` hashes are
+    /// computed over the issuer Name TLV and the `subjectPublicKey` BIT STRING
+    /// content (RFC 6960 §4.1.1), and the issuer key verifies the response
+    /// (or a delegated responder certificate). It lets a relying party whose
+    /// leaf anchors *directly* on a trust anchor — of which only the Name and
+    /// SPKI are retained — validate the staple against the anchor instead of
+    /// against whatever unvalidated certificate the peer happened to send
+    /// after the leaf.
+    ///
+    /// Semantics are otherwise identical to `check_for_cert_with_options`.
+    pub fn check_for_cert_with_issuer_info(
+        &self,
+        leaf: &Certificate,
+        issuer_name_der: &[u8],
+        issuer_spki_der: &[u8],
+        opts: &OcspCheckOptions<'_>,
+    ) -> Result<OcspCertStatus, Error> {
         let policy = opts.policy;
         let now = opts.now;
         // 1. Signature. Try the issuer key first; fall back to a delegated
         //    responder cert if present. Both the BasicOCSPResponse signature
         //    and the responder cert's signature are gated by `policy`.
-        let issuer_key = issuer.subject_public_key()?;
+        let issuer_key = AnyPublicKey::from_spki_der(issuer_spki_der)?;
+        let issuer_key_bits = spki_key_bits(issuer_spki_der)?;
         if self
             .verify_signature_with_policy(&issuer_key, policy)
             .is_err()
@@ -667,7 +694,7 @@ impl OcspResponse {
 
         // 2. Locate the SingleResponse for this leaf.
         let single = self
-            .find_response_for(leaf, issuer)?
+            .find_response_for_issuer_info(leaf, issuer_name_der, issuer_key_bits)?
             .ok_or(Error::Malformed)?;
 
         // 3. Freshness. RFC 6960 §3.2: thisUpdate <= now < nextUpdate. The
@@ -778,8 +805,23 @@ impl OcspResponse {
         // TLV (tag + length + content), exactly as conformant responders
         // (OpenSSL, Let's Encrypt) compute it. `subject_der()` returns that
         // complete `Name` TLV.
-        let issuer_name_tlv = issuer.subject_der()?;
-        let issuer_key_bits = issuer.subject_public_key_bits()?;
+        self.find_response_for_issuer_info(
+            leaf,
+            issuer.subject_der()?,
+            issuer.subject_public_key_bits()?,
+        )
+    }
+
+    /// [`find_response_for`](Self::find_response_for) with the issuer given
+    /// as its subject `Name` TLV and raw `subjectPublicKey` BIT STRING content
+    /// (the two inputs of an RFC 6960 §4.1.1 `CertID`) instead of a full
+    /// certificate.
+    fn find_response_for_issuer_info(
+        &self,
+        leaf: &Certificate,
+        issuer_name_tlv: &[u8],
+        issuer_key_bits: &[u8],
+    ) -> Result<Option<OcspSingleResponse>, Error> {
         let serial = leaf.serial_bytes()?;
         // strict-DER canonical: a single leading 0x00 is the sign-protection
         // pad and not part of the magnitude. Comparison is on the magnitude
@@ -969,6 +1011,21 @@ fn hash_pair(hash_alg_oid: &[u64], name_tlv: &[u8], key_bits: &[u8]) -> Option<(
     } else {
         None
     }
+}
+
+/// The raw `subjectPublicKey` BIT STRING content of a DER
+/// `SubjectPublicKeyInfo` TLV — the bytes an OCSP `issuerKeyHash` is computed
+/// over (RFC 6960 §4.1.1: excluding the tag, length and unused-bits octets).
+/// The counterpart of `Certificate::subject_public_key_bits` for an SPKI held
+/// outside a certificate (a trust anchor).
+fn spki_key_bits(spki_der: &[u8]) -> Result<&[u8], Error> {
+    let mut r = Reader::new(spki_der);
+    let mut spki = r.read_sequence()?;
+    r.finish()?;
+    spki.read_sequence()?; // AlgorithmIdentifier
+    let bits = spki.read_bit_string()?;
+    spki.finish()?;
+    Ok(bits)
 }
 
 /// Strips a single permitted leading `0x00` (the strict-DER positive-sign

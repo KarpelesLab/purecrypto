@@ -18,6 +18,12 @@ use alloc::vec::Vec;
 pub(crate) struct TrustAnchor {
     pub(crate) subject_der: Vec<u8>,
     pub(crate) key: AnyPublicKey,
+    /// The anchor's `SubjectPublicKeyInfo` exactly as encoded in the root
+    /// certificate (full TLV). Retained so a leaf that anchors *directly* on
+    /// this root can be checked against an OCSP `CertID` — whose
+    /// `issuerKeyHash` is computed over the on-the-wire `subjectPublicKey`
+    /// BIT STRING (RFC 6960 §4.1.1), not over a re-encoding of `key`.
+    pub(crate) spki_der: Vec<u8>,
     pub(crate) name_constraints: Option<NameConstraints>,
 }
 
@@ -61,6 +67,7 @@ impl RootCertStore {
         let key = cert
             .subject_public_key()
             .map_err(|_| Error::BadCertificate)?;
+        let spki_der = cert.spki_der().map_err(|_| Error::BadCertificate)?.to_vec();
         let name_constraints = cert.name_constraints().map_err(|_| Error::BadCertificate)?;
         if let Some(nc) = &name_constraints
             && (nc.has_unenforceable_permitted || nc.has_unenforceable_excluded)
@@ -70,6 +77,7 @@ impl RootCertStore {
         self.anchors.push(TrustAnchor {
             subject_der,
             key,
+            spki_der,
             name_constraints,
         });
         Ok(())
@@ -137,10 +145,10 @@ impl RootCertStore {
     /// `name_der`. Multiple anchors may share a name (cross-signed renewal
     /// scenarios), so callers should try them all rather than stopping at
     /// the first hit.
-    pub(crate) fn anchors_with_subject<'a>(
+    pub(crate) fn anchors_with_subject<'a, 'n>(
         &'a self,
-        name_der: &'a [u8],
-    ) -> impl Iterator<Item = &'a TrustAnchor> + 'a {
+        name_der: &'n [u8],
+    ) -> impl Iterator<Item = &'a TrustAnchor> + use<'a, 'n> {
         self.anchors
             .iter()
             .filter(move |a| a.subject_der.as_slice() == name_der)

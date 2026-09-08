@@ -3035,31 +3035,20 @@ impl ClientConnection {
             verify_hostname(&leaf, reference_name)?;
             // RFC 6066 §8 / RFC 6960: a stapled OCSP response is only
             // meaningful once the chain is trusted. Validate now against the
-            // issuer; reject `revoked` or `unknown` outright.
-            if let Some(ocsp) = self.peer_ocsp_response.as_deref()
-                && self.cert_chain.len() >= 2
-            {
-                let issuer = Certificate::from_der(self.cert_chain[1].clone())
-                    .map_err(|_| Error::BadCertificate)?;
-                let resp = crate::x509::OcspResponse::from_der(ocsp.to_vec())
-                    .map_err(|_| Error::OcspResponseInvalid)?;
-                match resp
-                    .check_for_cert_with_options(
-                        &leaf,
-                        &issuer,
-                        &crate::x509::OcspCheckOptions::new(&self.config.signature_policy)
-                            .with_time(now.as_ref()),
-                    )
-                    .map_err(|_| Error::OcspResponseInvalid)?
-                {
-                    crate::x509::OcspCertStatus::Good => {}
-                    crate::x509::OcspCertStatus::Revoked { .. } => {
-                        return Err(Error::CertificateRevoked);
-                    }
-                    crate::x509::OcspCertStatus::Unknown => {
-                        return Err(Error::OcspResponseInvalid);
-                    }
-                }
+            // leaf's ACTUAL issuer within the validated path — the matched
+            // trust anchor when the leaf anchors directly, else the in-chain
+            // signer — never `cert_chain[1]`, which is peer-chosen and
+            // unvalidated when the path closed at the leaf. Rejects
+            // `revoked` or `unknown` outright.
+            if let Some(ocsp) = self.peer_ocsp_response.as_deref() {
+                crate::tls::pki::check_stapled_ocsp(
+                    &self.config.roots,
+                    &self.cert_chain,
+                    &leaf,
+                    ocsp,
+                    &self.config.signature_policy,
+                    now.as_ref(),
+                )?;
             }
             key
         } else {

@@ -1900,32 +1900,26 @@ impl ClientConnection12 {
             return Err(Error::UnexpectedMessage);
         }
         let ocsp = ext::parse_certificate_status(body)?;
-        // Validate the staple against the chain. With `verify_certificates`
-        // off (pinned-key flows), skip the check entirely — the caller has
-        // opted out of PKI altogether.
-        if self.config.verify_certificates && self.cert_chain.len() >= 2 {
-            let leaf = crate::x509::Certificate::from_der(self.cert_chain[0].clone())
-                .map_err(|_| Error::BadCertificate)?;
-            let issuer = crate::x509::Certificate::from_der(self.cert_chain[1].clone())
+        // Validate the staple against the chain (already verified by
+        // `on_certificate`) — against the leaf's ACTUAL issuer within the
+        // validated path (the matched trust anchor when the leaf anchors
+        // directly, else the in-chain signer), never `cert_chain[1]`, which
+        // is peer-chosen and unvalidated when the path closed at the leaf.
+        // With `verify_certificates` off (pinned-key flows), skip the check
+        // entirely — the caller has opted out of PKI altogether.
+        if self.config.verify_certificates {
+            let leaf_der = self.cert_chain.first().ok_or(Error::BadCertificate)?;
+            let leaf = crate::x509::Certificate::from_der(leaf_der.clone())
                 .map_err(|_| Error::BadCertificate)?;
             let now = self.config.verification_time.clone().or_else(system_now);
-            let resp = crate::x509::OcspResponse::from_der(ocsp.clone())
-                .map_err(|_| Error::OcspResponseInvalid)?;
-            match resp
-                .check_for_cert_with_options(
-                    &leaf,
-                    &issuer,
-                    &crate::x509::OcspCheckOptions::new(&self.config.signature_policy)
-                        .with_time(now.as_ref()),
-                )
-                .map_err(|_| Error::OcspResponseInvalid)?
-            {
-                crate::x509::OcspCertStatus::Good => {}
-                crate::x509::OcspCertStatus::Revoked { .. } => {
-                    return Err(Error::CertificateRevoked);
-                }
-                crate::x509::OcspCertStatus::Unknown => return Err(Error::OcspResponseInvalid),
-            }
+            crate::tls::pki::check_stapled_ocsp(
+                &self.config.roots,
+                &self.cert_chain,
+                &leaf,
+                &ocsp,
+                &self.config.signature_policy,
+                now.as_ref(),
+            )?;
         }
         self.peer_ocsp_response = Some(ocsp);
         self.transcript.update(raw);
