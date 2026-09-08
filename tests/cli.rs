@@ -789,6 +789,187 @@ fn x509_req_ignores_csr_sans_without_opt_in() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `x509 -req -CA leaf.crt -CAkey leaf.key`: the issuer must be a CA
+/// certificate (basicConstraints CA:TRUE + keyCertSign). A leaf used as the
+/// issuer is refused with a message saying why; `-force` (the CLI's existing
+/// override convention) signs anyway with a warning.
+#[test]
+fn x509_req_rejects_non_ca_issuer() {
+    let (dir, p) = ca_with_impersonating_csr("nonca");
+
+    // A self-signed LEAF (CA:false, no keyCertSign) for leaf.key.
+    assert!(
+        run(
+            &[
+                "x509",
+                "-new",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=not-a-ca",
+                "-out",
+                &p("leaf.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "x509 -new failed"
+    );
+    let args = [
+        "x509",
+        "-req",
+        "-in",
+        &p("evil.csr"),
+        "-CA",
+        &p("leaf.crt"),
+        "-CAkey",
+        &p("leaf.key"),
+        "-san",
+        "a.example",
+        "-out",
+        &p("signed.crt"),
+    ];
+    let (_out, err, ok) = run_capture(&args, b"");
+    assert!(!ok, "x509 -req must refuse a non-CA issuer");
+    assert!(
+        err.contains("is not a CA certificate") && err.contains("CA:FALSE"),
+        "expected a not-a-CA diagnostic, got stderr: {err}"
+    );
+    assert!(!dir.join("signed.crt").exists());
+
+    let mut forced = args.to_vec();
+    forced.push("-force");
+    let (_out, err, ok) = run_capture(&forced, b"");
+    assert!(ok, "-force should sign anyway: {err}");
+    assert!(err.contains("warning") && err.contains("not a CA"), "{err}");
+    assert!(dir.join("signed.crt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `x509 -req -CA root.crt -CAkey other.key`: a key that is not the CA
+/// certificate's own is refused (never overridable — the resulting
+/// signature could not verify under root.crt).
+#[test]
+fn x509_req_rejects_cakey_from_a_different_pair() {
+    let (dir, p) = ca_with_impersonating_csr("cakeymismatch");
+
+    let (csr, ca, cakey, out) = (p("evil.csr"), p("root.crt"), p("leaf.key"), p("signed.crt"));
+    for force in [false, true] {
+        let mut args = vec![
+            "x509",
+            "-req",
+            "-in",
+            &csr,
+            "-CA",
+            &ca,
+            "-CAkey",
+            &cakey,
+            "-san",
+            "a.example",
+            "-out",
+            &out,
+        ];
+        if force {
+            args.push("-force");
+        }
+        let (_out, err, ok) = run_capture(&args, b"");
+        assert!(
+            !ok,
+            "x509 -req must refuse a -CAkey from a different pair (force={force})"
+        );
+        assert!(
+            err.contains("does not match"),
+            "expected a key/cert mismatch diagnostic, got stderr: {err}"
+        );
+        assert!(!dir.join("signed.crt").exists());
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `ca sign-csr` / `ca issue` with a `root.key` that is not `root.crt`'s
+/// key (a swapped or restored-from-the-wrong-backup key file) must refuse
+/// rather than mint certificates whose signatures never verify.
+#[test]
+fn ca_sign_csr_rejects_swapped_root_key() {
+    let (dir, p) = ca_with_impersonating_csr("swappedkey");
+    // Sanity: the untouched CA signs fine.
+    assert!(
+        run(
+            &[
+                "ca",
+                "sign-csr",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-in",
+                &p("evil.csr"),
+                "-san",
+                "a.example",
+                "-out",
+                &p("ok.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "ca sign-csr failed on the intact CA"
+    );
+
+    // Swap root.key for a key from another pair.
+    std::fs::copy(p("leaf.key"), p("root.key")).unwrap();
+    let (_out, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-in",
+            &p("evil.csr"),
+            "-san",
+            "a.example",
+            "-out",
+            &p("bad.crt"),
+        ],
+        b"",
+    );
+    assert!(
+        !ok,
+        "ca sign-csr must refuse a root.key that is not root.crt's"
+    );
+    assert!(
+        err.contains("does not match"),
+        "expected a key/cert mismatch diagnostic, got stderr: {err}"
+    );
+    assert!(!dir.join("bad.crt").exists());
+
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(p("leaf.pub"), pubkey_pem).unwrap();
+    let (_out, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "issued.example",
+            "-out",
+            &p("bad2.crt"),
+        ],
+        b"",
+    );
+    assert!(
+        !ok,
+        "ca issue must refuse a root.key that is not root.crt's"
+    );
+    assert!(err.contains("does not match"), "{err}");
+    assert!(!dir.join("bad2.crt").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// C-3: `x509 -req -ca` used to emit `basicConstraints{CA:true}` and nothing
 /// else — an unconstrained sub-CA that could sign further CAs for any name,
 /// with no keyUsage to stop it being used for anything at all.

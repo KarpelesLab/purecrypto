@@ -2,7 +2,8 @@
 
 use crate::pki::{
     Profile, default_extensions, describe_key, dns_general_names, format_dn, load_key, parse_sans,
-    parse_subject, random_serial, validity_days, verify_and_screen_csr,
+    parse_subject, random_serial, require_ca_issuer, require_key_matches_cert, validity_days,
+    verify_and_screen_csr,
 };
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::extension::Extension;
@@ -300,6 +301,19 @@ pub(crate) fn run(args: Args) {
             .subject()
             .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
 
+        // The issuer must actually be a CA (basicConstraints CA:TRUE +
+        // keyCertSign) and `-CAkey` must be ITS key; either mistake otherwise
+        // produces a certificate that no relying party will accept.
+        let force = args.flag("-force") || args.flag("--force");
+        require_ca_issuer(&ca, &format!("-CA {ca_path}"), force);
+        let cakey = load_key(cakey_path);
+        require_key_matches_cert(
+            &ca,
+            &cakey.public_key(),
+            &format!("-CAkey {cakey_path}"),
+            &format!("-CA {ca_path}"),
+        );
+
         // Verify the request's self-signature and screen it against the same
         // policy `ca sign-csr` applies (no SHA-1/MD5 signature, RSA >= 2048).
         verify_and_screen_csr(&csr);
@@ -321,7 +335,6 @@ pub(crate) fn run(args: Args) {
         let sans = resolve_req_sans(&args, &csr);
         let profile = if is_ca { Profile::SubCa } else { Profile::Leaf };
         let exts = default_extensions(profile, &dns_general_names(&sans));
-        let cakey = load_key(cakey_path);
         let cert = Certificate::issue_with_extensions(
             &cakey.signer(),
             &issuer,
@@ -374,10 +387,11 @@ pub(crate) fn run(args: Args) {
              purecrypto x509 -in <cert.pem> -text [-ext]\n  \
              purecrypto x509 -new -key <key.pem> -subj /CN=... [-san a,b] [-days N] [-ca] [-out f]\n  \
              purecrypto x509 -req -in <csr.pem> -CA <ca.pem> -CAkey <cakey.pem> [-san a,b] \
-             [-copy-csr-san] [-days N] [-ca] [-out f]\n\n\
+             [-copy-csr-san] [-days N] [-ca] [-force] [-out f]\n\n\
              A CSR's requested subjectAltName is NOT certified unless -copy-csr-san is given; \
              name the SANs with -san instead. -ca emits a pathLen:0 sub-CA with \
-             keyUsage=keyCertSign,cRLSign.",
+             keyUsage=keyCertSign,cRLSign. -CA must be a CA certificate (basicConstraints CA:TRUE, \
+             keyUsage keyCertSign) and -CAkey must be its key; -force signs under a non-CA anyway.",
         )
     });
     let raw = read_input(Some(path));

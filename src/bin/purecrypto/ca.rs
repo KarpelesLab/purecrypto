@@ -28,8 +28,8 @@ use std::path::{Path, PathBuf};
 
 use crate::pki::{
     MAX_X509_UNIX_TIME, Profile, default_extensions, describe_key, dns_general_names, format_dn,
-    issuer_ski_bytes, json_escape, parse_sans, parse_subject, random_serial,
-    spki_bit_string_contents, validity_days, verify_and_screen_csr,
+    issuer_ski_bytes, json_escape, parse_sans, parse_subject, random_serial, require_ca_issuer,
+    require_key_matches_cert, spki_bit_string_contents, validity_days, verify_and_screen_csr,
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{
@@ -156,6 +156,38 @@ impl RootKey {
             RootKey::Ed448(k) => CertSigner::Ed448(k),
         }
     }
+
+    /// The public half, for matching against `root.crt`.
+    fn public_key(&self) -> AnyPublicKey {
+        match self {
+            RootKey::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
+            RootKey::Ec(k) => AnyPublicKey::Ecdsa(k.public_key()),
+            RootKey::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
+            RootKey::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
+        }
+    }
+}
+
+/// Loads `DIR/root.crt` + `DIR/root.key` for an issuance and refuses to
+/// proceed unless the certificate is a CA (basicConstraints CA:TRUE +
+/// keyCertSign — `-force` downgrades that to a warning) and the key is the
+/// certificate's own. A CA directory whose `root.key` was swapped, or whose
+/// `root.crt` was replaced by a leaf, would otherwise mint certificates that
+/// no relying party accepts, with no diagnostic at issuance time.
+fn load_root_identity(ca: &CaDir, args: &Args) -> (Certificate, RootKey) {
+    let root_key = load_root_key(ca);
+    let root_cert = load_root_cert(ca);
+    let force = args.flag("-force") || args.flag("--force");
+    let crt = ca.root_crt();
+    let key = ca.root_key();
+    require_ca_issuer(&root_cert, &crt.display().to_string(), force);
+    require_key_matches_cert(
+        &root_cert,
+        &root_key.public_key(),
+        &key.display().to_string(),
+        &crt.display().to_string(),
+    );
+    (root_cert, root_key)
 }
 
 fn load_root_key(ca: &CaDir) -> RootKey {
@@ -431,8 +463,7 @@ fn run_issue(args: Args) {
 
     let sans = parse_sans_arg(&args);
 
-    let root_key = load_root_key(&ca);
-    let root_cert = load_root_cert(&ca);
+    let (root_cert, root_key) = load_root_identity(&ca, &args);
     let issuer_dn = root_cert
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
@@ -541,8 +572,7 @@ fn run_sign_csr(args: Args) {
     let pem = core::str::from_utf8(&raw).unwrap_or_else(|_| die("CSR is not PEM"));
     let csr = CertificationRequest::from_pem(pem).unwrap_or_else(|e| die(format!("bad CSR: {e}")));
 
-    let root_key = load_root_key(&ca);
-    let root_cert = load_root_cert(&ca);
+    let (root_cert, root_key) = load_root_identity(&ca, &args);
     let issuer_dn = root_cert
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
@@ -984,8 +1014,8 @@ purecrypto ca — manage a development CA
 
 USAGE:
     purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519|ED448] [-curve P-256] [-days N]
-    purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH]
-    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-template NAME] [-template-file PATH]
+    purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH] [-force]
+    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-template NAME] [-template-file PATH] [-force]
     purecrypto ca revoke  -dir DIR -serial N|0xN [-reason key-compromise|superseded|...] [-force]
     purecrypto ca crl     -dir DIR [-out crl.pem] [-days N]
     purecrypto ca show    -dir DIR
@@ -1004,6 +1034,11 @@ NOTES:
     Submitted CSRs must carry a >= 2048-bit RSA key and a signature that is
     not SHA-1/MD5-based; `ca revoke` refuses a serial that is absent from
     DIR/issued.jsonl unless `-force` is given.
+
+    `ca issue` / `ca sign-csr` refuse to sign unless DIR/root.crt is a CA
+    certificate (basicConstraints CA:TRUE, keyUsage keyCertSign) — `-force`
+    signs under a non-CA anyway — and DIR/root.key is that certificate's key
+    (never overridable).
 ";
 
 pub(crate) fn run(args: Args) {

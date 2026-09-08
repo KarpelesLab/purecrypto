@@ -46,6 +46,74 @@ impl PrivateKey {
             PrivateKey::Ed25519(k) => CertSigner::Ed25519(k),
         }
     }
+
+    /// The public half, for [`require_key_matches_cert`].
+    pub(crate) fn public_key(&self) -> AnyPublicKey {
+        match self {
+            PrivateKey::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
+            PrivateKey::Ec(k) => AnyPublicKey::Ecdsa(k.public_key()),
+            PrivateKey::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
+        }
+    }
+}
+
+/// Refuses to issue under `cert` unless it is a CA certificate: RFC 5280
+/// §4.2.1.9 requires `basicConstraints{cA:TRUE}` on every certificate that
+/// signs other certificates, and §4.2.1.3 requires the `keyCertSign` bit
+/// whenever a `keyUsage` extension is present (an absent `keyUsage` places no
+/// restriction and is accepted). A certificate that fails either test would
+/// sign a chain no RFC 5280 path validator accepts — the failure only shows
+/// up later, at the relying party. `force` (the CLI's existing `-force`
+/// convention) downgrades the refusal to a stderr warning for deliberate
+/// experiments; the key/certificate match is never overridable.
+pub(crate) fn require_ca_issuer(cert: &Certificate, label: &str, force: bool) {
+    let problem = match cert.basic_constraints() {
+        Err(e) => die(format!("{label}: bad basicConstraints: {e}")),
+        Ok(Some((true, _))) => match cert.key_usage() {
+            Err(e) => die(format!("{label}: bad keyUsage: {e}")),
+            Ok(Some(bits)) if bits & KeyUsageBits::KEY_CERT_SIGN.0 == 0 => {
+                Some("its keyUsage lacks keyCertSign")
+            }
+            Ok(_) => None,
+        },
+        Ok(Some((false, _))) => Some("its basicConstraints say CA:FALSE"),
+        Ok(None) => Some("it has no basicConstraints{CA:TRUE} extension"),
+    };
+    if let Some(why) = problem {
+        if force {
+            eprintln!(
+                "purecrypto: warning: {label} is not a CA certificate ({why}); \
+                 signing anyway because -force was given"
+            );
+        } else {
+            die(format!(
+                "{label} is not a CA certificate ({why}); certificates it signs will not \
+                 validate. Issue from a certificate with basicConstraints CA:TRUE and \
+                 keyUsage keyCertSign, or pass -force to sign anyway"
+            ));
+        }
+    }
+}
+
+/// Dies unless `key` is the public key `cert` certifies (canonical-SPKI
+/// comparison, see [`Certificate::subject_public_key_matches`]). A CA key
+/// from a different pair would otherwise produce certificates whose
+/// signatures never verify under the CA certificate — silently, until a
+/// relying party rejects them.
+pub(crate) fn require_key_matches_cert(
+    cert: &Certificate,
+    key: &AnyPublicKey,
+    key_label: &str,
+    cert_label: &str,
+) {
+    match cert.subject_public_key_matches(key) {
+        Ok(true) => {}
+        Ok(false) => die(format!(
+            "{key_label} does not match {cert_label} (its public key differs from the \
+             certificate's SubjectPublicKeyInfo)"
+        )),
+        Err(e) => die(format!("{cert_label}: bad SubjectPublicKeyInfo: {e}")),
+    }
 }
 
 /// Loads a private key from `path`, dying on any error.
