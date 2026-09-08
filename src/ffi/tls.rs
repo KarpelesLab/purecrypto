@@ -9,6 +9,8 @@
 //!  - `WantHandshake` — application I/O attempted pre-handshake
 //!  - `Closed`     — peer (or local) sent close_notify
 //!  - `TlsAlert`   — a fatal TLS alert was received
+//!  - `BadConfig`  — `pc_tls_cfg_validate` found the configuration
+//!    incomplete (today: cookie-requiring DTLS server with no peer address)
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -72,6 +74,10 @@ impl Version {
             Version::Dtls13 => ProtocolVersion::DTLSv1_3,
         }
     }
+
+    fn is_dtls(self) -> bool {
+        matches!(self, Version::Dtls12 | Version::Dtls13)
+    }
 }
 
 /// Builder accumulating settings for a TLS/DTLS endpoint. Stores PEM blobs
@@ -90,6 +96,10 @@ pub struct PcTlsCfg {
     verify_certs: bool,
     cookie_secret: Option<[u8; 32]>,
     no_cookie: bool,
+    /// DTLS server: canonical `v6-or-v4-mapped ‖ port_be` encoding of the
+    /// peer this connection will be fed from (see
+    /// [`pc_dtls_cfg_set_peer_addr`]).
+    peer_addr: Option<[u8; 18]>,
 }
 
 impl Drop for PcTlsCfg {
@@ -142,7 +152,26 @@ impl PcTlsCfg {
             verify_certs: true,
             cookie_secret: None,
             no_cookie: false,
+            peer_addr: None,
         }
+    }
+
+    /// Consistency check shared by [`pc_tls_cfg_validate`] and
+    /// [`pc_tls_new`]. A cookie-requiring DTLS server (the default; only
+    /// [`pc_dtls_cfg_set_no_cookie`] opts out) needs both a cookie secret and
+    /// the peer's transport address — without the address the engine refuses
+    /// the first ClientHello (`Error::InappropriateState`, surfaced as a bare
+    /// `Internal` from `pc_tls_feed`), which is exactly the silent failure
+    /// this check turns into an up-front, named status.
+    fn validate(&self) -> PcStatus {
+        if self.role == Role::Server
+            && self.version.is_dtls()
+            && !self.no_cookie
+            && (self.cookie_secret.is_none() || self.peer_addr.is_none())
+        {
+            return PcStatus::BadConfig;
+        }
+        PcStatus::Ok
     }
 
     // The three `build_*` helpers re-parse PEM strings that were already
@@ -204,6 +233,9 @@ impl PcTlsCfg {
         }
         if self.no_cookie {
             b = b.no_cookie();
+        }
+        if let Some(addr) = &self.peer_addr {
+            b = b.peer_address(addr.to_vec());
         }
         if let Some(ck) = &self.cert {
             b = b.identity(ck.chain_der.clone(), ck.key.to_signing_key());
@@ -539,6 +571,73 @@ pub unsafe extern "C" fn pc_dtls_cfg_set_cookie_secret(
     })
 }
 
+/// DTLS server-only: binds the cookie exchange to the peer's transport
+/// address. `addr` is the raw address the datagrams arrive from — either 4
+/// bytes (IPv4) or 16 bytes (IPv6; an IPv4-mapped `::ffff:a.b.c.d` is fine);
+/// any other length is rejected with [`PcStatus::Unsupported`]. `port` is in
+/// host byte order. The address is stored in the canonical form the engine
+/// binds into every HelloVerifyRequest / HelloRetryRequest cookie
+/// (`ConfigBuilder::peer_socket_addr`), so the cookie proves the source is
+/// return-routable rather than merely that *someone* saw the ClientHello.
+///
+/// A connection is single-peer: each `pc_tls_new` built from this cfg serves
+/// exactly the address configured here. A server demultiplexing several
+/// clients on one socket sets the address (from `recvfrom`) on a fresh cfg —
+/// or re-sets it on the shared cfg — immediately before each `pc_tls_new`.
+///
+/// # Safety
+/// `cfg` valid; `addr` non-NULL and points to at least `addr_len` readable
+/// bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_dtls_cfg_set_peer_addr(
+    cfg: *mut PcTlsCfg,
+    addr: *const u8,
+    addr_len: usize,
+    port: u16,
+) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        let Some(bytes) = (unsafe { slice(addr, addr_len) }) else {
+            return PcStatus::NullPointer;
+        };
+        let mut canon = [0u8; 18];
+        match bytes.len() {
+            4 => {
+                // IPv4 → v4-mapped IPv6 (`::ffff:a.b.c.d`), the same canonical
+                // form `ConfigBuilder::peer_socket_addr` produces.
+                canon[10] = 0xff;
+                canon[11] = 0xff;
+                canon[12..16].copy_from_slice(bytes);
+            }
+            16 => canon[..16].copy_from_slice(bytes),
+            _ => return PcStatus::Unsupported,
+        }
+        canon[16..18].copy_from_slice(&port.to_be_bytes());
+        unsafe { &mut *cfg }.peer_addr = Some(canon);
+        PcStatus::Ok
+    })
+}
+
+/// Checks that the configuration is complete for its role. Returns `Ok`,
+/// or [`PcStatus::BadConfig`] when a cookie-requiring DTLS server config
+/// (any DTLS server without [`pc_dtls_cfg_set_no_cookie`]) lacks either its
+/// cookie secret or its peer address. [`pc_tls_new`] applies the same check
+/// and returns NULL on failure; call this first to learn why.
+///
+/// # Safety
+/// `cfg` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_cfg_validate(cfg: *const PcTlsCfg) -> PcStatus {
+    guard(|| {
+        if cfg.is_null() {
+            return PcStatus::NullPointer;
+        }
+        unsafe { &*cfg }.validate()
+    })
+}
+
 /// A TLS or DTLS connection handle, wrapping a [`crate::tls::Connection`].
 pub struct PcTls {
     inner: Connection,
@@ -563,8 +662,9 @@ impl Drop for PcTls {
 }
 
 /// Materialises a connection from a finished configuration. Returns NULL on a
-/// configuration that's missing required fields (e.g. server cert + key, or
-/// SNI for a client).
+/// configuration that's missing required fields (e.g. server cert + key, SNI
+/// for a client, or — for a cookie-requiring DTLS server — the cookie secret
+/// / peer address; [`pc_tls_cfg_validate`] reports that last class by name).
 ///
 /// # Safety
 /// `cfg` valid.
@@ -575,6 +675,9 @@ pub unsafe extern "C" fn pc_tls_new(cfg: *const PcTlsCfg) -> *mut PcTls {
             return core::ptr::null_mut();
         }
         let c = unsafe { &*cfg };
+        if c.validate() != PcStatus::Ok {
+            return core::ptr::null_mut();
+        }
         let config = match c.build_config() {
             Some(cfg) => cfg,
             None => return core::ptr::null_mut(),

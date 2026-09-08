@@ -24,6 +24,12 @@ const STATUS = {
   '-4': 'verification failed',
   '-5': 'unsupported',
   '-6': 'internal error',
+  '-7': 'want read',
+  '-8': 'want write',
+  '-9': 'want handshake',
+  '-10': 'closed',
+  '-11': 'TLS alert',
+  '-12': 'bad config',
 };
 
 export class PcError extends Error {

@@ -30,6 +30,9 @@ pub enum PcStatus {
     Closed = -10,
     /// Fatal TLS alert received from the peer.
     TlsAlert = -11,
+    /// The configuration is incomplete or inconsistent for the requested
+    /// role (e.g. a cookie-requiring DTLS server with no peer address).
+    BadConfig = -12,
 }
 
 /// Runs `f`, converting any panic into [`PcStatus::Internal`] so unwinding never

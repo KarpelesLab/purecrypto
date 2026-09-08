@@ -1179,3 +1179,218 @@ fn x448_preserves_caller_scalar_and_agrees() {
     assert_eq!(a_sk, [0x11u8; 56], "caller's scalar buffer must be intact");
     assert_eq!(b_sk, [0x22u8; 56], "caller's scalar buffer must be intact");
 }
+
+// ---- FC-1 / FC-2 / FC-6 / FC-7 (audit 2026-09) -----------------------------
+
+/// Builds a DTLS server cfg holding the loopback identity (no cookie
+/// settings applied). Caller frees.
+fn dtls_server_cfg(version: i32) -> *mut tls::PcTlsCfg {
+    let (chain_pem, key_pem) = loopback_identity();
+    let scfg = tls::pc_tls_cfg_new(1 /* server */, version);
+    assert!(!scfg.is_null());
+    let st = unsafe {
+        tls::pc_tls_cfg_set_certificate(
+            scfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            key_pem.as_ptr(),
+            key_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    scfg
+}
+
+/// FC-1: a DTLS server that keeps the (default) cookie exchange needs both
+/// the secret and the peer address; the FFI previously accepted the config
+/// and then failed every first ClientHello with a bare `Internal`.
+#[test]
+fn dtls_cookie_server_requires_secret_and_peer_addr() {
+    let scfg = dtls_server_cfg(0xFEFD_u32 as i32);
+
+    // Neither secret nor address: rejected by name, and pc_tls_new is NULL.
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_validate(scfg) },
+        PcStatus::BadConfig
+    );
+    assert!(unsafe { tls::pc_tls_new(scfg) }.is_null());
+
+    // Secret but no address (the audit's exact case): still BadConfig.
+    let secret = [0x5au8; 32];
+    assert_eq!(
+        unsafe { tls::pc_dtls_cfg_set_cookie_secret(scfg, secret.as_ptr(), secret.len()) },
+        PcStatus::Ok
+    );
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_validate(scfg) },
+        PcStatus::BadConfig
+    );
+    assert!(unsafe { tls::pc_tls_new(scfg) }.is_null());
+
+    // Address widths other than 4 / 16 are refused; NULL with a length too.
+    let five = [1u8; 5];
+    assert_eq!(
+        unsafe { tls::pc_dtls_cfg_set_peer_addr(scfg, five.as_ptr(), five.len(), 4433) },
+        PcStatus::Unsupported
+    );
+    assert_eq!(
+        unsafe { tls::pc_dtls_cfg_set_peer_addr(scfg, core::ptr::null(), 4, 4433) },
+        PcStatus::NullPointer
+    );
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_validate(scfg) },
+        PcStatus::BadConfig
+    );
+
+    // A 4-byte IPv4 address completes the config.
+    let v4 = [127u8, 0, 0, 1];
+    assert_eq!(
+        unsafe { tls::pc_dtls_cfg_set_peer_addr(scfg, v4.as_ptr(), v4.len(), 4433) },
+        PcStatus::Ok
+    );
+    assert_eq!(unsafe { tls::pc_tls_cfg_validate(scfg) }, PcStatus::Ok);
+    let server = unsafe { tls::pc_tls_new(scfg) };
+    assert!(!server.is_null());
+    unsafe { tls::pc_tls_free(server) };
+
+    // Opting out of cookies removes both requirements.
+    let scfg2 = dtls_server_cfg(0xFEFC_u32 as i32);
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_validate(scfg2) },
+        PcStatus::BadConfig
+    );
+    assert_eq!(
+        unsafe { tls::pc_dtls_cfg_set_no_cookie(scfg2) },
+        PcStatus::Ok
+    );
+    assert_eq!(unsafe { tls::pc_tls_cfg_validate(scfg2) }, PcStatus::Ok);
+
+    // A TLS (stream) server is never subject to the check.
+    let (chain_pem, key_pem) = loopback_identity();
+    let tcfg = tls::pc_tls_cfg_new(1, 0x0304);
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_certificate(
+                tcfg,
+                chain_pem.as_ptr(),
+                chain_pem.len(),
+                key_pem.as_ptr(),
+                key_pem.len()
+            ),
+            PcStatus::Ok
+        );
+        assert_eq!(tls::pc_tls_cfg_validate(tcfg), PcStatus::Ok);
+    }
+
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_validate(core::ptr::null()) },
+        PcStatus::NullPointer
+    );
+    unsafe {
+        tls::pc_tls_cfg_free(scfg);
+        tls::pc_tls_cfg_free(scfg2);
+        tls::pc_tls_cfg_free(tcfg);
+    }
+}
+
+/// Drives a DTLS loopback handshake with the cookie exchange ON (secret +
+/// peer address set through the new FFI), then exchanges application data
+/// both ways. `addr` is the raw 4- or 16-byte peer address handed to
+/// `pc_dtls_cfg_set_peer_addr`.
+fn dtls_cookie_loopback(version: i32, addr: &[u8]) {
+    let scfg = dtls_server_cfg(version);
+    let secret = [0x37u8; 32];
+    unsafe {
+        assert_eq!(
+            tls::pc_dtls_cfg_set_cookie_secret(scfg, secret.as_ptr(), secret.len()),
+            PcStatus::Ok
+        );
+        assert_eq!(
+            tls::pc_dtls_cfg_set_peer_addr(scfg, addr.as_ptr(), addr.len(), 5684),
+            PcStatus::Ok
+        );
+        assert_eq!(tls::pc_tls_cfg_validate(scfg), PcStatus::Ok);
+    }
+    let server = unsafe { tls::pc_tls_new(scfg) };
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+    assert!(!server.is_null());
+
+    let (chain_pem, _) = loopback_identity();
+    let ccfg = tls::pc_tls_cfg_new(0 /* client */, version);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_add_root_pem(ccfg, chain_pem.as_ptr(), chain_pem.len()),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+
+    // With cookies on, the first server flight is a HelloVerifyRequest /
+    // HelloRetryRequest and the client re-sends its ClientHello — one more
+    // round trip than the no-cookie smoke test.
+    for _ in 0..40 {
+        unsafe {
+            let _ = tls::pc_tls_handshake(client);
+            pump_wire(client, server);
+            let _ = tls::pc_tls_handshake(server);
+            pump_wire(server, client);
+        }
+        if unsafe { tls::pc_tls_is_handshake_complete(client) } == 1
+            && unsafe { tls::pc_tls_is_handshake_complete(server) } == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(client) }, 1);
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(server) }, 1);
+    let mut ver = 0u16;
+    assert_eq!(
+        unsafe { tls::pc_tls_negotiated_version(client, &mut ver) },
+        PcStatus::Ok
+    );
+    assert_eq!(i32::from(ver), version);
+
+    let ping = b"ping over cookie-protected dtls";
+    assert_eq!(
+        unsafe { tls::pc_tls_send(client, ping.as_ptr(), ping.len()) },
+        PcStatus::Ok
+    );
+    unsafe { pump_wire(client, server) };
+    let got = read_out(|p, l| unsafe { tls::pc_tls_recv(server, p, l) });
+    assert_eq!(got, ping);
+
+    let pong = b"pong";
+    assert_eq!(
+        unsafe { tls::pc_tls_send(server, pong.as_ptr(), pong.len()) },
+        PcStatus::Ok
+    );
+    unsafe { pump_wire(server, client) };
+    let got = read_out(|p, l| unsafe { tls::pc_tls_recv(client, p, l) });
+    assert_eq!(got, pong);
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
+/// FC-1: DTLS 1.2 with the HelloVerifyRequest cookie bound to an IPv4 peer.
+#[test]
+fn dtls12_cookie_loopback_completes_with_peer_addr() {
+    dtls_cookie_loopback(0xFEFD_u32 as i32, &[127, 0, 0, 1]);
+}
+
+/// FC-1: DTLS 1.3 with the HelloRetryRequest cookie bound to an IPv6 peer.
+#[test]
+fn dtls13_cookie_loopback_completes_with_peer_addr() {
+    let v6 = [0u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    dtls_cookie_loopback(0xFEFC_u32 as i32, &v6);
+}
+

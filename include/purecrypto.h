@@ -78,7 +78,8 @@ typedef enum {
   PC_WANT_WRITE = -8,      /* engine has bytes to send; drain via pc_tls_pop */
   PC_WANT_HANDSHAKE = -9,  /* application I/O attempted before handshake done */
   PC_CLOSED = -10,         /* peer or local sent close_notify */
-  PC_TLS_ALERT = -11       /* a fatal TLS alert was received */
+  PC_TLS_ALERT = -11,      /* a fatal TLS alert was received */
+  PC_BAD_CONFIG = -12      /* cfg incomplete for its role (pc_tls_cfg_validate) */
 } pc_status;
 
 /* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
@@ -684,6 +685,12 @@ void pc_crl_free(PcCrl *crl);
  *   5. pc_tls_close(ssl);
  *      pc_tls_free(ssl);
  *      pc_tls_cfg_free(cfg);
+ *
+ * DTLS servers additionally need, before pc_tls_new:
+ *      pc_dtls_cfg_set_cookie_secret(cfg, secret, 32);
+ *      pc_dtls_cfg_set_peer_addr(cfg, ip, 4 or 16, port);  // from recvfrom
+ * (or pc_dtls_cfg_set_no_cookie for tests); pc_tls_cfg_validate reports a
+ * missing piece as PC_BAD_CONFIG, and pc_tls_new returns NULL for it.
  * ========================================================================== */
 
 PcTlsCfg *pc_tls_cfg_new(int32_t role, int32_t version);
@@ -708,8 +715,22 @@ pc_status pc_tls_cfg_add_crl_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
 pc_status pc_dtls_cfg_set_cookie_secret(PcTlsCfg *cfg,
                                         const uint8_t *secret, size_t secret_len);
 /* DTLS server only: disable the cookie round-trip (HelloVerifyRequest / HRR
- * cookie). Recommended only for tests. */
+ * cookie). Recommended only for tests — without it a single spoofed
+ * ClientHello draws the full multi-KB server flight (15-30x reflection). */
 pc_status pc_dtls_cfg_set_no_cookie(PcTlsCfg *cfg);
+/* DTLS server only: the transport address the datagrams arrive from, bound
+ * into every cookie so the exchange proves return-routability. `addr` is
+ * 4 bytes (IPv4) or 16 bytes (IPv6, IPv4-mapped accepted); any other length
+ * is PC_UNSUPPORTED. `port` is host byte order. Stored canonically
+ * (v4-mapped IPv6 || port_be). A connection is single-peer: set the address
+ * (from recvfrom) immediately before each pc_tls_new that must serve it.
+ * Required whenever the cookie exchange is on (the default). */
+pc_status pc_dtls_cfg_set_peer_addr(PcTlsCfg *cfg,
+                                    const uint8_t *addr, size_t addr_len,
+                                    uint16_t port);
+/* PC_OK, or PC_BAD_CONFIG when a cookie-requiring DTLS server cfg lacks its
+ * cookie secret or peer address (pc_tls_new returns NULL for the same). */
+pc_status pc_tls_cfg_validate(const PcTlsCfg *cfg);
 
 PcTls *pc_tls_new(const PcTlsCfg *cfg);
 void pc_tls_free(PcTls *tls);
