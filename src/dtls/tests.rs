@@ -3221,7 +3221,7 @@ mod audit_2026_09 {
         ServerConfig13Internal as PcServerConfig13,
     };
     use crate::tls::codec::{CipherSuite, NamedGroup, hs_type};
-    use crate::tls::{ContentType, ProtocolVersion};
+    use crate::tls::{ContentType, Error, ProtocolVersion};
 
     fn make_server13_local() -> (PcServerConfig13, Vec<u8>) {
         let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-audit-key", b"nonce", &[]);
@@ -3516,6 +3516,204 @@ mod audit_2026_09 {
     }
 
     // -----------------------------------------------------------------
+    // DTLS-L2: the DTLS 1.2 server must validate a cookie-bearing CH2
+    // completely before touching the transcript / reassembler.
+    // -----------------------------------------------------------------
+
+    /// Locates the `extended_master_secret` extension inside a DTLS CH
+    /// datagram, returning `(ems_ext_offset, extensions_len_offset)`.
+    fn find_ems_in_dtls12_ch(ch: &[u8]) -> (usize, usize) {
+        // record(13) + hs header(12) = 25; then version(2) random(32).
+        let mut w = 25 + 2 + 32;
+        w += 1 + ch[w] as usize; // session id
+        w += 1 + ch[w] as usize; // cookie
+        let csl = u16::from_be_bytes([ch[w], ch[w + 1]]) as usize;
+        w += 2 + csl;
+        w += 1 + ch[w] as usize; // compression
+        let ext_len_at = w;
+        w += 2;
+        while w < ch.len() {
+            let ty = u16::from_be_bytes([ch[w], ch[w + 1]]);
+            let l = u16::from_be_bytes([ch[w + 2], ch[w + 3]]) as usize;
+            if ty == 0x0017 {
+                return (w, ext_len_at);
+            }
+            w += 4 + l;
+        }
+        panic!("no extended_master_secret extension");
+    }
+
+    fn bump16(b: &mut [u8], at: usize) {
+        let v = u16::from_be_bytes([b[at], b[at + 1]]) + 1;
+        b[at..at + 2].copy_from_slice(&v.to_be_bytes());
+    }
+
+    fn bump24(b: &mut [u8], at: usize) {
+        let v = (((b[at] as u32) << 16) | ((b[at + 1] as u32) << 8) | b[at + 2] as u32) + 1;
+        b[at] = (v >> 16) as u8;
+        b[at + 1] = (v >> 8) as u8;
+        b[at + 2] = v as u8;
+    }
+
+    /// A replayed CH2 (valid cookie) whose `extended_master_secret` body
+    /// was made non-empty used to be rejected only AFTER the transcript
+    /// had absorbed it, so the genuine CH2 then appended a second CH and
+    /// the client's Finished could never verify.
+    #[test]
+    fn replayed_ch2_variant_does_not_poison_transcript_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"l2-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        let c2 = client.pop_outbound_datagrams();
+        let ch2 = c2[0].clone();
+
+        // Attacker's variant: EMS extension (0x0017, len 0) -> len 1, body [0].
+        let (pos, ext_len_at) = find_ems_in_dtls12_ch(&ch2);
+        let mut bad = ch2.clone();
+        bad[pos + 3] = 1;
+        bad.insert(pos + 4, 0x00);
+        bump16(&mut bad, 11); // record length
+        bump24(&mut bad, 14); // handshake total_length
+        bump24(&mut bad, 22); // fragment_length
+        bump16(&mut bad, ext_len_at); // extensions length
+        assert_eq!(server.feed_datagram(&bad), Ok(()));
+        assert!(
+            server.pop_outbound_datagrams().is_empty(),
+            "variant must not produce a flight"
+        );
+
+        // Genuine CH2 → full handshake, both directions of app data.
+        for dg in &c2 {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(server.is_handshake_complete());
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(client.is_handshake_complete());
+        client.send(b"hello").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"hello");
+    }
+
+    // -----------------------------------------------------------------
+    // DTLS-L3: a lost final server flight (DTLS 1.2) must be recoverable.
+    // -----------------------------------------------------------------
+
+    /// The server's CCS+Finished is dropped. The client's retransmit timer
+    /// re-sends its own flight; the server must answer the retransmitted
+    /// Finished by re-sending its final flight (RFC 6347 §4.2.4), after
+    /// which the client completes.
+    #[test]
+    fn lost_final_server_flight_is_recovered_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"l3-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let s_final = server.pop_outbound_datagrams();
+        assert!(server.is_handshake_complete());
+        assert_eq!(s_final.len(), 2, "CCS + Finished");
+        drop(s_final); // lost on the wire
+
+        // Client timer fires → its flight is retransmitted.
+        let t = client.next_timeout().expect("client flight armed");
+        client.on_timeout(t);
+        let c_retx = client.pop_outbound_datagrams();
+        assert!(!c_retx.is_empty());
+        for dg in &c_retx {
+            server.feed_datagram(dg).unwrap();
+        }
+        let s_retx = server.pop_outbound_datagrams();
+        assert_eq!(s_retx.len(), 2, "server must re-send CCS + Finished");
+        for dg in &s_retx {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(client.is_handshake_complete());
+        assert!(client.next_timeout().is_none());
+
+        // The connection is fully usable in both directions afterwards.
+        client.send(b"after-loss").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"after-loss");
+        server.send(b"reply").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"reply");
+        // Application data from the client proved it holds our Finished:
+        // a replayed client Finished no longer triggers a re-send.
+        for dg in &c_retx {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(server.pop_outbound_datagrams().is_empty());
+    }
+
+    /// The re-send trigger is bounded: a captured client Finished replayed
+    /// over and over cannot make the server emit its final flight
+    /// indefinitely.
+    #[test]
+    fn final_flight_resend_is_bounded_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"l3b-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        let c_final = client.pop_outbound_datagrams();
+        for dg in &c_final {
+            server.feed_datagram(dg).unwrap();
+        }
+        let _ = server.pop_outbound_datagrams();
+        let mut resends = 0;
+        for _ in 0..20 {
+            for dg in &c_final {
+                server.feed_datagram(dg).unwrap();
+            }
+            if !server.pop_outbound_datagrams().is_empty() {
+                resends += 1;
+            }
+        }
+        assert!(resends > 0 && resends < 20, "resends = {resends}");
+        assert!(server.is_handshake_complete());
+    }
+
+    // -----------------------------------------------------------------
     // DTLS-L4: DTLS 1.3 client-side cipher-suite / HRR checks.
     // -----------------------------------------------------------------
 
@@ -3694,4 +3892,54 @@ mod audit_2026_09 {
         app_data_round_trip(&mut client, &mut server);
     }
 
+    // -----------------------------------------------------------------
+    // DTLS-I4: DTLS 1.2 engines must not deliver application data after
+    // close_notify.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn application_data_after_close_notify_is_rejected_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"i4-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake(&mut client, &mut server));
+
+        // Server → client: close_notify, then (a misbehaving peer's) data.
+        server.send_alert_record_for_test(1, 0);
+        let alert = server.pop_outbound_datagrams();
+        server.send(b"late").unwrap();
+        let late = server.pop_outbound_datagrams();
+        for dg in &alert {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(!client.is_handshake_complete());
+        for dg in &late {
+            assert_eq!(client.feed_datagram(dg), Err(Error::UnexpectedMessage));
+        }
+        assert!(client.take_received().is_empty());
+
+        // And the mirror image, client → server.
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"i4-server-2", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        assert!(pump_handshake(&mut client, &mut server));
+        client.send_alert_record_for_test(1, 0);
+        let alert = client.pop_outbound_datagrams();
+        client.send(b"late").unwrap();
+        let late = client.pop_outbound_datagrams();
+        for dg in &alert {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(!server.is_handshake_complete());
+        for dg in &late {
+            assert_eq!(server.feed_datagram(dg), Err(Error::UnexpectedMessage));
+        }
+        assert!(server.take_received().is_empty());
+    }
 }

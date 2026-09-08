@@ -73,6 +73,14 @@ pub(crate) struct CookieGenerator {
     max_age_minutes: u32,
 }
 
+// The generator is built per ClientHello from a copy of the long-lived
+// cookie secret; scrub that copy when it goes out of scope (DTLS-L7).
+impl Drop for CookieGenerator {
+    fn drop(&mut self) {
+        crate::tls::conn::wipe(&mut self.secret);
+    }
+}
+
 impl CookieGenerator {
     /// Creates a generator bound to `secret`. The caller is responsible for
     /// generating a high-entropy secret (e.g. via `crate::rng::OsRng`).

@@ -544,8 +544,23 @@ impl DtlsClientConnection12 {
                 };
                 // AEAD verified: commit to the window only now.
                 self.replay.mark(rec.seq);
-                self.app_in.extend_from_slice(&plain);
-                Ok(())
+                match self.state {
+                    State::Connected => {
+                        self.app_in.extend_from_slice(&plain);
+                        Ok(())
+                    }
+                    // The peer's close_notify ended the connection; data
+                    // after it is a genuine (authenticated) peer fault —
+                    // surface it instead of quietly delivering it, as the
+                    // DTLS 1.3 engine does (DTLS-I4).
+                    State::Closed => Err(Error::UnexpectedMessage),
+                    // Read keys exist but the handshake has not finished:
+                    // the client never sends application data before it
+                    // is Connected, so this can only be an early
+                    // (reordered ahead of the server's Finished) record —
+                    // benign under UDP, so drop it rather than abort.
+                    _ => Ok(()),
+                }
             }
             ContentType::Alert => {
                 if self.read_epoch < 1 {
@@ -946,7 +961,7 @@ impl DtlsClientConnection12 {
         // Complete ECDHE + derive master + key block.
         let group = self.peer_group.ok_or(Error::InappropriateState)?;
         let peer_point = self.peer_point.clone().ok_or(Error::InappropriateState)?;
-        let (premaster, our_point) = self.ecdhe(group, &peer_point)?;
+        let (mut premaster, our_point) = self.ecdhe(group, &peer_point)?;
 
         // Build the client's final flight: CKE, CCS, Finished.
         let mut flight = Flight::new();
@@ -984,6 +999,8 @@ impl DtlsClientConnection12 {
         } else {
             master_secret(suite.hash, &premaster, &cr, &sr)
         };
+        // The premaster is dead once the master secret exists (DTLS-L7).
+        crate::tls::conn::wipe(&mut premaster);
 
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
@@ -1003,6 +1020,10 @@ impl DtlsClientConnection12 {
         s_salt.copy_from_slice(&rest[4..8]);
         let write_crypter = RecordCrypter12::new(suite.aead, c_key, c_salt);
         let read_crypter = RecordCrypter12::new(suite.aead, s_key, s_salt);
+        // The crypters own the keys now; scrub the key block and salts.
+        crate::tls::conn::wipe(&mut kb);
+        crate::tls::conn::wipe(&mut c_salt);
+        crate::tls::conn::wipe(&mut s_salt);
         self.master = Some(master);
         self.write_crypter = Some(write_crypter);
         self.read_crypter = Some(read_crypter);
@@ -1045,6 +1066,16 @@ impl DtlsClientConnection12 {
         self.send_flight(flight);
         self.state = State::WaitServerFinished;
         Ok(())
+    }
+
+    /// Test-only: queues a raw 2-byte alert (`level ‖ description`) under
+    /// the current write key (see the server-side twin).
+    #[cfg(test)]
+    pub(crate) fn send_alert_record_for_test(&mut self, level: u8, description: u8) {
+        let dg = self
+            .encrypt_record_dtls(ContentType::Alert, &[level, description])
+            .expect("write keys installed");
+        self.out_dgrams.push(dg);
     }
 
     fn on_server_finished(&mut self, msg_type: u8, body: &[u8], raw: &[u8]) -> Result<(), Error> {

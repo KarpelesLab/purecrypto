@@ -49,6 +49,12 @@ use crate::ct::ConstantTimeEq;
 /// HelloVerifyRequest handshake type code (RFC 6347 §4.2.1).
 const HS_HELLO_VERIFY_REQUEST: u8 = 3;
 
+/// Cap on how many times the final CCS + Finished flight is re-sent in
+/// answer to a retransmitted client Finished. Bounds the work a captured
+/// client Finished replayed by an attacker can trigger (each re-send is
+/// two small records — no amplification, but not unbounded either).
+const MAX_FINAL_FLIGHT_RESENDS: u32 = 6;
+
 /// Default per-fragment payload size for outbound handshake messages.
 const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
@@ -251,6 +257,18 @@ pub struct DtlsServerConnection12<R: RngCore> {
 
     /// Last-built flight retransmit machine.
     retransmit: Retransmit,
+    /// Our final flight (CCS + Finished), kept after the handshake so it
+    /// can be re-sent when the client's retransmitted Finished shows we
+    /// were not heard (RFC 6347 §4.2.4: the last-flight sender
+    /// retransmits when the peer re-sends ITS flight). Released once the
+    /// client's first application-data record proves it holds our
+    /// Finished, or after `MAX_FINAL_FLIGHT_RESENDS` (DTLS-L3).
+    final_flight: Option<Flight>,
+    /// Re-sends of `final_flight` performed so far.
+    final_flight_resends: u32,
+    /// The client's Finished `verify_data`, so a retransmitted Finished
+    /// can be recognised as the genuine one.
+    client_finished: Option<[u8; 12]>,
     /// Current logical time the caller has reported.
     last_now: Duration,
     /// True once the caller has driven the clock via [`Self::set_now`] /
@@ -326,6 +344,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             pending_write_crypter: None,
             ccs_received: false,
             retransmit: Retransmit::new(),
+            final_flight: None,
+            final_flight_resends: 0,
+            client_finished: None,
             last_now: Duration::from_secs(0),
             clock_driven: false,
             ems_negotiated: false,
@@ -507,7 +528,19 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // retransmits. The window is `mark`-ed only after the AEAD tag
         // verifies (below).
         if self.read_epoch >= 1 && !self.replay.check(rec.seq) {
-            return Ok(());
+            // A duplicate handshake record while our final flight is still
+            // unconfirmed is exactly what a client that never received
+            // that flight sends: a verbatim retransmit of its Finished.
+            // Let it through to AEAD so `process_handshake_record` can
+            // recognise it (RFC 6347 §4.2.4) — decrypting a duplicate is
+            // harmless, and the window is not advanced. Everything else
+            // is a replay: silent drop.
+            let finished_retransmit = self.state == State::Connected
+                && self.final_flight.is_some()
+                && rec.content_type == ContentType::Handshake;
+            if !finished_retransmit {
+                return Ok(());
+            }
         }
         match rec.content_type {
             ContentType::ChangeCipherSpec => {
@@ -572,8 +605,27 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 };
                 // AEAD verified: commit to the window only now.
                 self.replay.mark(rec.seq);
-                self.app_in.extend_from_slice(&plain);
-                Ok(())
+                match self.state {
+                    State::Connected => {
+                        // The client only sends application data once it
+                        // has verified our Finished: the final flight is
+                        // implicitly acknowledged.
+                        self.final_flight = None;
+                        self.app_in.extend_from_slice(&plain);
+                        Ok(())
+                    }
+                    // The peer's close_notify ended the connection; data
+                    // after it is a genuine (authenticated) peer fault —
+                    // surface it instead of quietly delivering it, as the
+                    // DTLS 1.3 engine does (DTLS-I4).
+                    State::Closed => Err(Error::UnexpectedMessage),
+                    // Read keys exist (client CCS seen) but its Finished
+                    // has not been processed yet: a client only sends
+                    // application data once Connected, so this is a
+                    // record reordered ahead of its Finished — benign
+                    // under UDP, so drop it rather than abort.
+                    _ => Ok(()),
+                }
             }
             ContentType::Alert => {
                 if self.read_epoch < 1 {
@@ -667,6 +719,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 }
                 continue;
             }
+            if self.state == State::Connected && authenticated {
+                // RFC 6347 §4.2.4: an authenticated re-send of the
+                // client's Finished means our CCS + Finished never
+                // arrived — re-send them (DTLS-L3). Anything else from an
+                // established peer falls through to the ordinary path
+                // (stale sequence numbers are dropped by the reassembler;
+                // a genuinely new handshake message is fatal).
+                if self.on_retransmitted_client_finished(&frag) {
+                    return Ok(());
+                }
+            }
             // Owned reborrow.
             let frag = HandshakeFragment {
                 msg_type: frag.msg_type,
@@ -748,6 +811,38 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             }
         }
         Ok(())
+    }
+
+    /// Recognises a retransmitted client Finished (an unfragmented
+    /// `Finished` whose `verify_data` equals the one we accepted) and
+    /// re-sends our final flight in answer. Returns `true` when the
+    /// fragment was consumed this way.
+    fn on_retransmitted_client_finished(&mut self, frag: &HandshakeFragment<'_>) -> bool {
+        if frag.msg_type != hs_type::FINISHED
+            || frag.fragment_offset != 0
+            || frag.total_length != 12
+            || frag.fragment.len() != 12
+        {
+            return false;
+        }
+        let Some(expected) = self.client_finished.as_ref() else {
+            return false;
+        };
+        if !bool::from(expected.as_slice().ct_eq(frag.fragment)) {
+            return false;
+        }
+        if self.final_flight_resends >= MAX_FINAL_FLIGHT_RESENDS {
+            // Budget spent: stop keeping the flight around at all.
+            self.final_flight = None;
+            return true;
+        }
+        if let Some(flight) = self.final_flight.as_ref() {
+            for dg in &flight.datagrams {
+                self.out_dgrams.push(dg.clone());
+            }
+            self.final_flight_resends += 1;
+        }
+        true
     }
 
     fn dispatch_one(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
@@ -863,21 +958,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             }
         }
 
-        // Cookie validated (or skipped): proceed with the handshake. The
-        // transcript starts with this CH per RFC 6347 §4.2.1. Buffer the
-        // CH bytes BEFORE pinning the transcript hash — `Transcript`
-        // accumulates raw bytes and applies the hash on demand once
-        // `set_alg` is called, so the order of update / set_alg here is
-        // irrelevant as long as set_alg happens before `current_hash`.
-        self.client_random = Some(parsed.random);
-        let mut tls_ch = Vec::with_capacity(4 + body.len());
-        tls_ch.push(hs_type::CLIENT_HELLO);
-        let n = body.len() as u32;
-        tls_ch.push(((n >> 16) & 0xff) as u8);
-        tls_ch.push(((n >> 8) & 0xff) as u8);
-        tls_ch.push((n & 0xff) as u8);
-        tls_ch.extend_from_slice(body);
-        self.transcript.update(&tls_ch);
+        // ---- Validation phase ------------------------------------------
+        //
+        // Cookie validated (or skipped). Everything that can still reject
+        // this CH is decided into locals FIRST; `self` is only mutated in
+        // the commit phase below. Rejections on this path are silently
+        // dropped as unauthenticated input (see the caller), so a partial
+        // state change would be permanent: a replayed CH2 variant with a
+        // 1-byte `extended_master_secret` body used to append itself to the
+        // transcript before the EMS check rejected it, after which the
+        // genuine CH2 appended a second ClientHello and the client's
+        // Finished could never verify (DTLS-L2).
 
         // Suite selection — mirror the TLS 1.2 server (`src/tls/conn/server12.rs`):
         // walk SUITES_12 in OUR preference order, picking the first entry the
@@ -890,9 +981,6 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             .copied()
             .find(|p| parsed.cipher_suites.contains(&p.suite) && p.sig_kind == sig_kind)
             .ok_or(Error::HandshakeFailure)?;
-        // Pin the transcript hash now that the suite is known.
-        self.transcript.set_alg(suite.hash);
-        self.suite = Some(suite);
         // Pick the negotiated ECDHE group. Preference is X25519 > P-256,
         // mirroring `src/tls/conn/server12.rs::on_client_hello_initial`.
         let groups_body = ext::find(&parsed.extensions, ExtensionType::SUPPORTED_GROUPS)
@@ -907,15 +995,60 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         } else {
             return Err(Error::HandshakeFailure);
         };
-        self.group = Some(group);
 
         // RFC 7627 §5.1: detect the client's EMS offer (DTLS 1.2 inherits
         // the rules from TLS 1.2). Body MUST be empty.
-        if let Some(ems_body) = ext::find(&parsed.extensions, ExtensionType::EXTENDED_MASTER_SECRET)
+        let ems_negotiated =
+            match ext::find(&parsed.extensions, ExtensionType::EXTENDED_MASTER_SECRET) {
+                Some(ems_body) => {
+                    ext::parse_extended_master_secret(ems_body)?;
+                    true
+                }
+                None => false,
+            };
+
+        // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
+        // signalled secure renegotiation — either via the extension (whose
+        // body MUST be empty on an initial handshake) or the
+        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` pseudo-suite (0x00FF). Strict
+        // clients (OpenSSL) abort with `handshake_failure` otherwise.
+        let signalled_reneg = match ext::find(&parsed.extensions, ExtensionType::RENEGOTIATION_INFO)
         {
-            ext::parse_extended_master_secret(ems_body)?;
-            self.ems_negotiated = true;
-        }
+            Some(reneg) => {
+                // Reject a non-empty `renegotiated_connection` on an initial
+                // handshake (we never renegotiate).
+                if !ext::parse_renegotiation_info(reneg)?.is_empty() {
+                    return Err(Error::HandshakeFailure);
+                }
+                true
+            }
+            None => parsed.cipher_suites.contains(&CipherSuite(0x00ff)),
+        };
+
+        // ---- Commit phase ----------------------------------------------
+        // Nothing below can reject the CH any more.
+        //
+        // The transcript starts with this CH per RFC 6347 §4.2.1 — from a
+        // clean slate, so nothing a previously rejected (or replayed) CH
+        // could have left behind survives. `Transcript` accumulates raw
+        // bytes and applies the hash on demand once `set_alg` is called, so
+        // the order of update / set_alg is irrelevant as long as set_alg
+        // happens before `current_hash`.
+        self.client_random = Some(parsed.random);
+        let mut tls_ch = Vec::with_capacity(4 + body.len());
+        tls_ch.push(hs_type::CLIENT_HELLO);
+        let n = body.len() as u32;
+        tls_ch.push(((n >> 16) & 0xff) as u8);
+        tls_ch.push(((n >> 8) & 0xff) as u8);
+        tls_ch.push((n & 0xff) as u8);
+        tls_ch.extend_from_slice(body);
+        self.transcript = Transcript::new();
+        self.transcript.update(&tls_ch);
+        // Pin the transcript hash now that the suite is known.
+        self.transcript.set_alg(suite.hash);
+        self.suite = Some(suite);
+        self.group = Some(group);
+        self.ems_negotiated = ems_negotiated;
         // Initialise the reassembler at expected_msg_seq = msg_seq + 1
         // (the client's next handshake msg after CH).
         let mut reasm = Reassembler::new();
@@ -979,22 +1112,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             sh_exts.push(ext::extended_master_secret_empty());
         }
         // RFC 5746 §3.6: echo an empty `renegotiation_info` when the client
-        // signalled secure renegotiation — either via the extension (whose
-        // body MUST be empty on an initial handshake) or the
-        // `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` pseudo-suite (0x00FF). Strict
-        // clients (OpenSSL) abort with `handshake_failure` otherwise.
-        let signalled_reneg = match ext::find(&parsed.extensions, ExtensionType::RENEGOTIATION_INFO)
-        {
-            Some(reneg) => {
-                // Reject a non-empty `renegotiated_connection` on an initial
-                // handshake (we never renegotiate).
-                if !ext::parse_renegotiation_info(reneg)?.is_empty() {
-                    return Err(Error::HandshakeFailure);
-                }
-                true
-            }
-            None => parsed.cipher_suites.contains(&CipherSuite(0x00ff)),
-        };
+        // signalled secure renegotiation (decided in the validation phase).
         if signalled_reneg {
             sh_exts.push(ext::renegotiation_info_empty());
         }
@@ -1180,6 +1298,17 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         Ok(out)
     }
 
+    /// Test-only: queues a raw 2-byte alert (`level ‖ description`) under
+    /// the current write key, so loopback tests can exercise the peer's
+    /// authenticated-alert path without widening the public API.
+    #[cfg(test)]
+    pub(crate) fn send_alert_record_for_test(&mut self, level: u8, description: u8) {
+        let dg = self
+            .encrypt_record_dtls(ContentType::Alert, &[level, description])
+            .expect("write keys installed");
+        self.out_dgrams.push(dg);
+    }
+
     fn send_flight(&mut self, flight: Flight) {
         for dg in &flight.datagrams {
             self.out_dgrams.push(dg.clone());
@@ -1208,7 +1337,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         let group = self.group.ok_or(Error::InappropriateState)?;
         // Complete ECDHE on the negotiated group and derive the premaster.
         // Mirrors `src/tls/conn/server12.rs::on_client_key_exchange`.
-        let premaster: Vec<u8> = match group {
+        let mut premaster: Vec<u8> = match group {
             NamedGroup::X25519 => {
                 let sk = self.x25519.as_ref().ok_or(Error::InappropriateState)?;
                 let peer: [u8; 32] = cke.point.as_slice().try_into().map_err(|_| Error::Decode)?;
@@ -1247,6 +1376,8 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         } else {
             master_secret(suite.hash, &premaster, &cr, &sr)
         };
+        // The premaster is dead once the master secret exists (DTLS-L7).
+        crate::tls::conn::wipe(&mut premaster);
         if let Some(kl) = self.config.key_log.as_ref() {
             kl.log("CLIENT_RANDOM", &cr, &master);
         }
@@ -1263,6 +1394,10 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         s_salt.copy_from_slice(&rest[4..8]);
         self.pending_read_crypter = Some(RecordCrypter12::new(suite.aead, c_key, c_salt));
         self.pending_write_crypter = Some(RecordCrypter12::new(suite.aead, s_key, s_salt));
+        // The crypters own the keys now; scrub the key block and salts.
+        crate::tls::conn::wipe(&mut kb);
+        crate::tls::conn::wipe(&mut c_salt);
+        crate::tls::conn::wipe(&mut s_salt);
         self.master = Some(master);
         Ok(())
     }
@@ -1330,6 +1465,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             self.out_dgrams.push(dg.clone());
         }
         self.retransmit.on_peer_response();
+        // Keep the flight so a retransmitted client Finished can trigger
+        // a re-send (see `on_retransmitted_client_finished`).
+        let mut client_fin = [0u8; 12];
+        client_fin.copy_from_slice(body);
+        self.client_finished = Some(client_fin);
+        self.final_flight = Some(flight);
+        self.final_flight_resends = 0;
         self.state = State::Connected;
         Ok(())
     }
