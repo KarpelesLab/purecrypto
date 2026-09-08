@@ -292,6 +292,12 @@ fn dleq_verify(
     // Canonical (reduced) encodings only — see the module's Interop note.
     let b = Scalar::from_bytes_be(&b_raw).map_err(|_| Error::Verification)?;
     let c = Scalar::from_bytes_be(&c_raw).map_err(|_| Error::Verification)?;
+    // An honest prover never produces a zero challenge or response
+    // (probability ≈ 2⁻²⁵⁶ each); a zero `b` would also make the recomputed
+    // commitments independent of the statement. Reject, as the docs promise.
+    if bool::from(b.is_zero() | c.is_zero()) {
+        return Err(Error::Verification);
+    }
 
     let neg_b = b.negate();
     // A_G = c·G − b·X, A_Y = c·Y − b·Z. Both must be non-identity: the
@@ -507,7 +513,9 @@ fn encrypt_inner(
 /// # Errors
 /// [`Error::Malformed`] / [`Error::InvalidInput`] for an unparseable input and
 /// [`Error::Verification`] when the proof or the encrypted signature does not
-/// check out. Never panics, whatever the input bytes are.
+/// check out — including a zero DLEQ challenge or response, and an `R` whose
+/// `x(R) mod n` is zero (which would make the ECDSA equation independent of
+/// `pubkey`). Never panics, whatever the input bytes are.
 pub fn verify(
     adaptor_sig: &[u8; ADAPTOR_SIGNATURE_LEN],
     pubkey: &[u8; 33],
@@ -523,6 +531,13 @@ pub fn verify(
 
     let m = Scalar::from_bytes_be_reduce(msg32);
     let r = r_of(&p.r_point);
+    // `x(R) = n` is a valid curve abscissa, so `r = 0` *is* encodable. With
+    // `r = 0` the equation below degenerates to `s_a⁻¹·m·G == R_a`, which no
+    // longer involves `pubkey` at all — an attacker could satisfy it for any
+    // key. ECDSA requires `r ≠ 0`; enforce it here as `encrypt` does.
+    if bool::from(r.is_zero()) {
+        return Err(Error::Verification);
+    }
     let s_inv = p.s_a.invert();
     let u1 = s_inv.mul(&m);
     let u2 = s_inv.mul(&r);
@@ -565,17 +580,36 @@ pub fn decrypt(
     if bool::from(s.is_zero()) {
         return Err(Error::InvalidInput);
     }
-    let mut s_bytes = s.to_bytes_be();
-    // Low-S normalisation (BIP-62). `s` is part of the public output, so
-    // branching on its value leaks nothing about `y`.
-    if s_bytes > HALF_ORDER {
-        s_bytes = s.negate().to_bytes_be();
-    }
+    // Low-S normalisation (BIP-62), branch-free. `s` is a public output, so
+    // the flag itself is not secret, but selecting rather than branching keeps
+    // the decryption path free of data-dependent control flow by construction.
+    let s_be = s.to_bytes_be();
+    let neg_be = s.negate().to_bytes_be();
+    let high = ct_gt_mask(&s_be, &HALF_ORDER);
 
     let mut out = [0u8; 64];
     out[..32].copy_from_slice(&r_of(&p.r_point).to_bytes_be());
-    out[32..].copy_from_slice(&s_bytes);
+    for (o, (&lo, &hi)) in out[32..].iter_mut().zip(s_be.iter().zip(neg_be.iter())) {
+        *o = (lo & !high) | (hi & high);
+    }
     Ok(out)
+}
+
+/// Branch-free big-endian "greater than" over 32-byte values: returns `0xff`
+/// if `a > b`, else `0x00`. (Same helper as `sign_to_contract`'s; the two
+/// modules are independently feature-gated, so each carries its own copy.)
+fn ct_gt_mask(a: &[u8; 32], b: &[u8; 32]) -> u8 {
+    let mut gt = 0u8;
+    let mut eq = 1u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        // 1 iff x > y (the borrow bit of y − x).
+        let x_gt = (((y as u16).wrapping_sub(x as u16) >> 8) & 1) as u8;
+        // 1 iff x == y.
+        let x_eq = ((((x ^ y) as u16).wrapping_sub(1) >> 8) & 1) as u8;
+        gt |= x_gt & eq;
+        eq &= x_eq;
+    }
+    gt.wrapping_neg()
 }
 
 /// Recovers the decryption key `y` from an adaptor signature and the finished
@@ -614,6 +648,12 @@ pub fn recover(
     let s = Scalar::from_bytes_be(&s_raw)?;
     if bool::from(s.is_zero()) {
         return Err(Error::InvalidInput);
+    }
+    // `r = 0` is not a signature (and, because `x(R) = n` is encodable, it
+    // could still match this adaptor signature's `R` below); reject it as
+    // [`verify`] does.
+    if bool::from(r.is_zero()) {
+        return Err(Error::Verification);
     }
     // The signature must belong to this adaptor signature.
     if !bool::from(r.ct_eq(&r_of(&p.r_point))) {
@@ -1089,5 +1129,156 @@ mod tests {
             encrypt(&seckey, &enckey, &msg).unwrap(),
             encrypt(&seckey, &enckey, &msg2).unwrap()
         );
+    }
+
+    /// `x = n` is a valid secp256k1 abscissa, so an `R` with `r = x(R) mod n
+    /// = 0` is encodable. Build an adaptor signature around such an `R`, with
+    /// a *genuine* DLEQ proof (choose `k`, set `Y = k⁻¹·R`) and an `s_a`
+    /// chosen so that `s_a⁻¹·m·G == R_a`: without the `r ≠ 0` guard, `verify`
+    /// would accept it under any public key whatsoever.
+    #[test]
+    fn r_zero_adaptor_signature_is_rejected() {
+        // R = lift_x(n) (even-Y root); r = n mod n = 0.
+        let mut r_enc = [0u8; 33];
+        r_enc[0] = 0x02;
+        r_enc[1..].copy_from_slice(&unhex::<32>(
+            "fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+        ));
+        let r_point = AffinePoint::from_sec1(&r_enc).expect("x = n lies on the curve");
+        assert!(bool::from(r_of(&r_point).is_zero()));
+
+        let k_bytes = [5u8; 32];
+        let k = Scalar::from_bytes_be(&k_bytes).unwrap();
+        let r_a = ProjectivePoint::mul_generator(&k).to_affine().unwrap();
+        // Y = k⁻¹·R, so that R = k·Y and the DLEQ statement is true.
+        let y_point = r_point
+            .to_projective()
+            .mul(&k.invert())
+            .to_affine()
+            .unwrap();
+        let proof = dleq_prove(&k, &k_bytes, &r_a, &y_point, &r_point, None).unwrap();
+
+        let msg = [77u8; 32];
+        let m = Scalar::from_bytes_be_reduce(&msg);
+        // s_a = k⁻¹·m makes s_a⁻¹·m·G = k·G = R_a, the degenerate r = 0 check.
+        let s_a = k.invert().mul(&m);
+
+        let mut sig = [0u8; ADAPTOR_SIGNATURE_LEN];
+        sig[0..33].copy_from_slice(&r_point.to_sec1_compressed());
+        sig[33..66].copy_from_slice(&r_a.to_sec1_compressed());
+        sig[66..98].copy_from_slice(&s_a.to_bytes_be());
+        sig[98..162].copy_from_slice(&proof);
+        let enckey = y_point.to_sec1_compressed();
+
+        // The DLEQ half is genuinely valid ...
+        dleq_verify(&r_a, &y_point, &r_point, &proof).expect("the DLEQ proof is honest");
+        // ... yet the adaptor signature must be rejected under any key.
+        for sk in [[1u8; 32], [2u8; 32], [99u8; 32]] {
+            assert_eq!(
+                verify(&sig, &pubkey_of(&sk), &enckey, &msg).unwrap_err(),
+                Error::Verification
+            );
+        }
+
+        // `recover` with the matching r = 0 "signature" is rejected too.
+        let mut ecdsa_sig = [0u8; 64];
+        ecdsa_sig[32..].copy_from_slice(&s_a.to_bytes_be());
+        assert_eq!(
+            recover(&enckey, &sig, &ecdsa_sig).unwrap_err(),
+            Error::Verification
+        );
+    }
+
+    /// The documented rule: a DLEQ proof whose challenge `b` or response `c`
+    /// encodes zero is rejected (an honest prover never produces one).
+    #[test]
+    fn zero_dleq_scalars_are_rejected() {
+        let seckey = [51u8; 32];
+        let deckey = [52u8; 32];
+        let msg = [53u8; 32];
+        let pubkey = pubkey_of(&seckey);
+        let enckey = pubkey_of(&deckey);
+        let a = encrypt(&seckey, &enckey, &msg).unwrap();
+        let p = parse(&a).unwrap();
+        dleq_verify(&p.r_a, &enckey_point(&enckey), &p.r_point, &p.proof).unwrap();
+
+        let mut zero_b = p.proof;
+        zero_b[..32].fill(0);
+        assert_eq!(
+            dleq_verify(&p.r_a, &enckey_point(&enckey), &p.r_point, &zero_b).unwrap_err(),
+            Error::Verification
+        );
+        let mut zero_c = p.proof;
+        zero_c[32..].fill(0);
+        assert_eq!(
+            dleq_verify(&p.r_a, &enckey_point(&enckey), &p.r_point, &zero_c).unwrap_err(),
+            Error::Verification
+        );
+        // And through the public entry point.
+        let mut sig = a;
+        sig[98..130].fill(0);
+        assert_eq!(
+            verify(&sig, &pubkey, &enckey, &msg).unwrap_err(),
+            Error::Verification
+        );
+        let mut sig = a;
+        sig[130..162].fill(0);
+        assert_eq!(
+            verify(&sig, &pubkey, &enckey, &msg).unwrap_err(),
+            Error::Verification
+        );
+    }
+
+    fn enckey_point(enckey: &[u8; 33]) -> AffinePoint {
+        AffinePoint::from_sec1(enckey).unwrap()
+    }
+
+    #[test]
+    fn ct_gt_mask_matches_reference() {
+        let mut lo = HALF_ORDER;
+        lo[31] -= 1;
+        let mut hi = HALF_ORDER;
+        hi[31] += 1;
+        let cases: [([u8; 32], [u8; 32], u8); 6] = [
+            ([0u8; 32], [0u8; 32], 0x00),
+            (HALF_ORDER, HALF_ORDER, 0x00),
+            ([0xffu8; 32], HALF_ORDER, 0xff),
+            (lo, HALF_ORDER, 0x00),
+            (hi, HALF_ORDER, 0xff),
+            (HALF_ORDER, hi, 0x00),
+        ];
+        for (a, b, want) in cases {
+            assert_eq!(ct_gt_mask(&a, &b), want);
+            assert_eq!(ct_gt_mask(&a, &b) == 0xff, a > b);
+        }
+        // A difference in the most significant byte dominates the rest.
+        let mut a = [0u8; 32];
+        a[0] = 1;
+        let mut b = [0xffu8; 32];
+        b[0] = 0;
+        assert_eq!(ct_gt_mask(&a, &b), 0xff);
+        assert_eq!(ct_gt_mask(&b, &a), 0x00);
+    }
+
+    /// The branch-free low-S select agrees with the plain comparison.
+    #[test]
+    fn decrypt_low_s_select_matches_branching_reference() {
+        for i in 0..16u8 {
+            let seckey = [60 + i; 32];
+            let deckey = [90 + i; 32];
+            let msg = [120 + i; 32];
+            let enckey = pubkey_of(&deckey);
+            let a = encrypt(&seckey, &enckey, &msg).unwrap();
+            let sig = decrypt(&a, &deckey).unwrap();
+            let p = parse(&a).unwrap();
+            let y = Scalar::from_bytes_be(&deckey).unwrap();
+            let raw = p.s_a.mul(&y.invert());
+            let mut want = raw.to_bytes_be();
+            if want > HALF_ORDER {
+                want = raw.negate().to_bytes_be();
+            }
+            assert_eq!(&sig[32..], &want[..]);
+            assert!(ecdsa_verify(&pubkey_of(&seckey), &msg, &sig));
+        }
     }
 }
