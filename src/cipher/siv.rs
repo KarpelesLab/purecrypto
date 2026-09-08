@@ -104,6 +104,15 @@ impl AesSiv {
     /// `ad` are the associated-data headers `S1..Sm`; the plaintext `Sn` is the
     /// final string. Returns the 16-byte synthetic IV `V`.
     fn s2v(&self, ad: &[&[u8]], plaintext: &[u8]) -> [u8; 16] {
+        // RFC 5297 §2.4: S2V takes at most 127 strings — `n − 1 ≤ 126`
+        // headers plus the plaintext. Past that the `dbl()` chain reaches
+        // 2^127·D and the mixing argument no longer holds; the reference
+        // implementation refuses it, so do we (the same fail-loud style as the
+        // key-length check in `new`).
+        assert!(
+            ad.len() <= Self::MAX_ASSOCIATED_DATA,
+            "AES-SIV: at most 126 associated-data components (RFC 5297 §2.4)"
+        );
         // D = AES-CMAC(K, <zero>) where <zero> is one zero block.
         let mut d = self.cmac(&[0u8; 16]);
 
@@ -151,9 +160,19 @@ impl AesSiv {
         }
     }
 
+    /// RFC 5297 §2.4 caps S2V at 127 component strings; one of them is the
+    /// plaintext, so at most this many associated-data headers are accepted.
+    pub const MAX_ASSOCIATED_DATA: usize = 126;
+
     /// Deterministically encrypts `plaintext`, binding the `associated_data`
     /// headers, and returns `V ‖ ciphertext` (RFC 5297 §2.6). `V` is the
     /// 16-byte synthetic IV / tag prepended to the output.
+    ///
+    /// # Panics
+    /// If `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`]
+    /// (RFC 5297 §2.4).
+    ///
+    /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
     pub fn seal(&self, associated_data: &[&[u8]], plaintext: &[u8]) -> Vec<u8> {
         let v = self.s2v(associated_data, plaintext);
         let q = Self::ctr_iv(&v);
@@ -170,6 +189,12 @@ impl AesSiv {
     /// The synthetic IV is recomputed over the recovered plaintext and compared
     /// to the transmitted `V` in constant time; on mismatch no plaintext is
     /// returned and [`TagMismatch`] is produced.
+    ///
+    /// # Panics
+    /// If `associated_data.len()` exceeds [`MAX_ASSOCIATED_DATA`]
+    /// (RFC 5297 §2.4).
+    ///
+    /// [`MAX_ASSOCIATED_DATA`]: Self::MAX_ASSOCIATED_DATA
     pub fn open(&self, associated_data: &[&[u8]], input: &[u8]) -> Result<Vec<u8>, TagMismatch> {
         if input.len() < 16 {
             return Err(TagMismatch);
@@ -200,6 +225,38 @@ impl AesSiv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 5297 §2.4: S2V takes at most 127 strings, i.e. 126 headers plus
+    /// the plaintext. 126 is accepted, 127 refused.
+    #[test]
+    fn s2v_component_limit() {
+        let key = [0x11u8; 32];
+        let siv = AesSiv::new(&key);
+        let hdr: &[u8] = b"h";
+        let ad = alloc::vec![hdr; AesSiv::MAX_ASSOCIATED_DATA];
+        let sealed = siv.seal(&ad, b"pt");
+        assert_eq!(siv.open(&ad, &sealed).unwrap(), b"pt");
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 126 associated-data components")]
+    fn s2v_rejects_127_components() {
+        let key = [0x11u8; 32];
+        let siv = AesSiv::new(&key);
+        let hdr: &[u8] = b"h";
+        let ad = alloc::vec![hdr; AesSiv::MAX_ASSOCIATED_DATA + 1];
+        let _ = siv.seal(&ad, b"pt");
+    }
+
+    #[test]
+    #[should_panic(expected = "at most 126 associated-data components")]
+    fn open_rejects_127_components() {
+        let key = [0x11u8; 32];
+        let siv = AesSiv::new(&key);
+        let hdr: &[u8] = b"h";
+        let ad = alloc::vec![hdr; AesSiv::MAX_ASSOCIATED_DATA + 1];
+        let _ = siv.open(&ad, &[0u8; 20]);
+    }
     use crate::test_util::{from_hex, from_hex_vec};
 
     // RFC 5297 Appendix A.1: deterministic authenticated encryption, one AD
