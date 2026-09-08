@@ -384,9 +384,9 @@ impl SurjectionProof {
     /// # Errors
     /// [`Error::InvalidInput`] if `input_tags` is empty or longer than
     /// [`MAX_N_INPUTS`], if `n_used` is zero, greater than
-    /// [`MAX_USED_INPUTS`], or greater than the number of inputs, or if no
-    /// attempt covered an input carrying `output_tag` — which happens when no
-    /// input carries it at all, and otherwise with probability roughly
+    /// [`MAX_USED_INPUTS`], or greater than the number of inputs, if no input
+    /// carries `output_tag` at all (detected up front, without drawing), or if
+    /// no attempt covered an input carrying it — probability roughly
     /// `(1 − n_used/n_inputs)^max_iterations`.
     pub fn initialize(
         input_tags: &[[u8; 32]],
@@ -403,6 +403,12 @@ impl SurjectionProof {
         // Which tags match, computed once and in constant time. The result is
         // public: the caller already knows its own tags.
         let matches: Vec<Choice> = input_tags.iter().map(|t| t.ct_eq(output_tag)).collect();
+        // With no matching input no draw can ever succeed; fail now rather
+        // than after `max_iterations` fruitless attempts.
+        let any = matches.iter().fold(Choice::from(0), |acc, &hit| acc | hit);
+        if !bool::from(any) {
+            return Err(Error::InvalidInput);
+        }
 
         let mut rng = SelectRng::new(seed);
         // `limit` discards the tail of the byte range that would bias `% n`.
@@ -1131,6 +1137,21 @@ mod tests {
         // The same bytes through the parser.
         let parsed = SurjectionProof::parse(&proof.serialize()).unwrap();
         assert_eq!(parsed.verify(&gens, &out), Err(Error::Verification));
+    }
+
+    #[test]
+    fn initialize_fails_fast_when_no_input_matches() {
+        // Without the up-front check this would loop `usize::MAX` times.
+        let tags: Vec<[u8; 32]> = (0..4).map(tag).collect();
+        assert_eq!(
+            SurjectionProof::initialize(&tags, 2, &tag(9), usize::MAX, &[0u8; 32]).unwrap_err(),
+            Error::InvalidInput
+        );
+        // A matching input still goes through the normal selection.
+        let (proof, idx) =
+            SurjectionProof::initialize(&tags, 2, &tags[1], 1_000, &[0u8; 32]).unwrap();
+        assert_eq!(idx, 1);
+        assert!(proof.used_inputs().contains(&1));
     }
 
     #[test]
