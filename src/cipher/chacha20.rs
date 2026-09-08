@@ -13,6 +13,19 @@
 /// little-endian words (RFC 8439 §2.3).
 const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
+/// Best-effort wipe of a stack array of state/keystream words.
+///
+/// Zeros then `black_box`, the crate-wide idiom (`hash::zeroize`,
+/// `cipher::ctr::zero_keystream`) so LLVM cannot elide the writes as dead
+/// stores. Every ChaCha20 state matrix embeds the 256-bit key, and raw
+/// keystream is key-equivalent for the bytes it covers — neither should be
+/// left behind in a dead stack frame for a later caller to read.
+#[inline]
+fn wipe_words(w: &mut [u32; 16]) {
+    *w = [0u32; 16];
+    let _ = core::hint::black_box(w);
+}
+
 /// The ChaCha20 quarter-round on four words of the state (RFC 8439 §2.1).
 #[inline]
 fn quarter_round(s: &mut [u32; 16], a: usize, b: usize, c: usize, d: usize) {
@@ -57,6 +70,9 @@ pub(crate) fn hchacha20(key: &[u8; 32], nonce16: &[u8; 16]) -> [u8; 32] {
     for (i, &idx) in [0usize, 1, 2, 3, 12, 13, 14, 15].iter().enumerate() {
         out[i * 4..i * 4 + 4].copy_from_slice(&s[idx].to_le_bytes());
     }
+    // `s[4..12]` held the input key verbatim before the permutation and the
+    // rest of the matrix is the subkey; neither belongs in a dead frame.
+    wipe_words(&mut s);
     out
 }
 
@@ -102,7 +118,7 @@ impl ChaCha20 {
 
     /// Generates the 64-byte keystream block for `(nonce, counter)`.
     pub fn block(&self, nonce: &[u8; 12], counter: u32) -> [u8; 64] {
-        let initial = self.state(nonce, counter);
+        let mut initial = self.state(nonce, counter);
         let mut s = initial;
         // 20 rounds = 10 double-rounds (column rounds then diagonal rounds).
         for _ in 0..10 {
@@ -121,6 +137,10 @@ impl ChaCha20 {
             let word = s[i].wrapping_add(initial[i]);
             chunk.copy_from_slice(&word.to_le_bytes());
         }
+        // `initial[4..12]` is the key; `s` is the pre-feed-forward state
+        // (key-equivalent for this block).
+        wipe_words(&mut initial);
+        wipe_words(&mut s);
         out
     }
 
@@ -157,10 +177,14 @@ impl ChaCha20 {
         }
         let mut block_counter = counter;
         for block in buf.chunks_mut(64) {
-            let ks = self.block(nonce, block_counter);
+            let mut ks = self.block(nonce, block_counter);
             for (b, k) in block.iter_mut().zip(ks.iter()) {
                 *b ^= *k;
             }
+            // Don't leave raw keystream for this key in the stack frame — this
+            // runs on every ChaCha20 / ChaCha20-Poly1305 operation.
+            ks = [0u8; 64];
+            let _ = core::hint::black_box(&ks);
             block_counter = block_counter.wrapping_add(1);
         }
     }
@@ -227,6 +251,10 @@ mod simd512 {
 
             let mut ctr = counter;
             let mut off = 0usize;
+            // Hoisted out of the loop so one wipe at the end covers them; they
+            // are fully overwritten every pass.
+            let mut words = [[0u32; 16]; 16];
+            let mut ks = [0u8; 1024];
             while off < buf.len() {
                 let mut v = [
                     _mm512_set1_epi32(CONSTANTS[0] as i32),
@@ -246,7 +274,7 @@ mod simd512 {
                     _mm512_set1_epi32(n1 as i32),
                     _mm512_set1_epi32(n2 as i32),
                 ];
-                let init = v;
+                let mut init = v;
                 for _ in 0..10 {
                     qr(&mut v, 0, 4, 8, 12);
                     qr(&mut v, 1, 5, 9, 13);
@@ -257,7 +285,6 @@ mod simd512 {
                     qr(&mut v, 2, 7, 8, 13);
                     qr(&mut v, 3, 4, 9, 14);
                 }
-                let mut words = [[0u32; 16]; 16];
                 for i in 0..16 {
                     let added = _mm512_add_epi32(v[i], init[i]);
                     _mm512_storeu_si512(words[i].as_mut_ptr() as *mut _, added);
@@ -265,7 +292,6 @@ mod simd512 {
                 // Emit up to sixteen 64-byte keystream blocks (lane = block) and
                 // XOR the bytes still needed into `buf`.
                 let avail = (buf.len() - off).min(1024);
-                let mut ks = [0u8; 1024];
                 for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
                     for (i, word) in blk.chunks_exact_mut(4).enumerate() {
                         word.copy_from_slice(&words[i][b].to_le_bytes());
@@ -274,9 +300,26 @@ mod simd512 {
                 for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
                     *dst ^= *k;
                 }
+                // `init[4..12]` is the key broadcast across lanes and `v` the
+                // pre-feed-forward state; both are loop-scoped, so scrub them
+                // here rather than trusting the register allocator not to have
+                // spilled them.
+                for (a, b) in v.iter_mut().zip(init.iter_mut()) {
+                    *a = _mm512_setzero_si512();
+                    *b = _mm512_setzero_si512();
+                }
+                let _ = core::hint::black_box(&v);
+                let _ = core::hint::black_box(&init);
                 off += 1024;
                 ctr = ctr.wrapping_add(16);
             }
+            // Don't leave raw keystream for this key in the stack frame — this
+            // runs on every ChaCha20 / ChaCha20-Poly1305 operation. `words`
+            // and `ks` are the same 1 KiB of keystream in two layouts.
+            words = [[0u32; 16]; 16];
+            ks = [0u8; 1024];
+            let _ = core::hint::black_box(&words);
+            let _ = core::hint::black_box(&ks);
         }
     }
 }
@@ -331,6 +374,10 @@ mod simd {
 
             let mut ctr = counter;
             let mut off = 0usize;
+            // Hoisted out of the loop so one wipe at the end covers them; they
+            // are fully overwritten every pass.
+            let mut words = [[0u32; 8]; 16];
+            let mut ks = [0u8; 512];
             while off < buf.len() {
                 let mut v = [
                     _mm256_set1_epi32(CONSTANTS[0] as i32),
@@ -350,7 +397,7 @@ mod simd {
                     _mm256_set1_epi32(n1 as i32),
                     _mm256_set1_epi32(n2 as i32),
                 ];
-                let init = v;
+                let mut init = v;
                 for _ in 0..10 {
                     qr(&mut v, 0, 4, 8, 12);
                     qr(&mut v, 1, 5, 9, 13);
@@ -361,7 +408,6 @@ mod simd {
                     qr(&mut v, 2, 7, 8, 13);
                     qr(&mut v, 3, 4, 9, 14);
                 }
-                let mut words = [[0u32; 8]; 16];
                 for i in 0..16 {
                     let added = _mm256_add_epi32(v[i], init[i]);
                     _mm256_storeu_si256(words[i].as_mut_ptr() as *mut __m256i, added);
@@ -369,7 +415,6 @@ mod simd {
                 // Emit up to eight 64-byte keystream blocks (lane = block) and
                 // XOR the bytes still needed into `buf`.
                 let avail = (buf.len() - off).min(512);
-                let mut ks = [0u8; 512];
                 for (b, blk) in ks.chunks_exact_mut(64).enumerate() {
                     for (i, word) in blk.chunks_exact_mut(4).enumerate() {
                         word.copy_from_slice(&words[i][b].to_le_bytes());
@@ -378,9 +423,22 @@ mod simd {
                 for (dst, k) in buf[off..off + avail].iter_mut().zip(ks.iter()) {
                     *dst ^= *k;
                 }
+                // See the AVX-512 kernel: scrub the key-bearing vectors.
+                for (a, b) in v.iter_mut().zip(init.iter_mut()) {
+                    *a = _mm256_setzero_si256();
+                    *b = _mm256_setzero_si256();
+                }
+                let _ = core::hint::black_box(&v);
+                let _ = core::hint::black_box(&init);
                 off += 512;
                 ctr = ctr.wrapping_add(8);
             }
+            // Don't leave raw keystream for this key in the stack frame — this
+            // runs on every ChaCha20 / ChaCha20-Poly1305 operation.
+            words = [[0u32; 8]; 16];
+            ks = [0u8; 512];
+            let _ = core::hint::black_box(&words);
+            let _ = core::hint::black_box(&ks);
         }
     }
 }
