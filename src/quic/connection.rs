@@ -21,6 +21,14 @@
 //! [`QuicConnection::is_closed`] turns true. [`QuicConnection::close_info`]
 //! reports why any connection ended.
 //!
+//! Loss recovery follows RFC 9002: NewReno gates 1-RTT packets on the
+//! congestion window, except that a PTO expiry arms a credit of up to two
+//! probe packets (§6.2.4) that may leave while the window is full (§7.5) —
+//! retransmitted or fresh data, or a PING when nothing else ack-eliciting is
+//! available. Probes still count toward `bytes_in_flight` and are tracked
+//! for loss; the credit is spent per probe emitted and dropped on the first
+//! ACK that shows progress.
+//!
 //! RFC 9000 §9 connection migration is implemented on the server side: an
 //! authenticated, highest-numbered, non-probing 1-RTT packet from a new
 //! address moves the connection there (§9.3), under path validation and the
@@ -411,10 +419,10 @@ fn first_packet_is_initial(datagram: &[u8]) -> bool {
 enum PayloadScope {
     /// Everything the level permits.
     Full,
-    /// RFC 9002 §2 / §7: the congestion window is exhausted, so only frames
-    /// that are not congestion controlled may go out — ACKs, plus the tiny
-    /// PATH_CHALLENGE / PATH_RESPONSE pair that keeps path validation alive
-    /// (H-6).
+    /// RFC 9002 §2 / §7: the congestion window is exhausted and no PTO probe
+    /// credit (§7.5) is armed, so only frames that are not congestion
+    /// controlled may go out — ACKs, plus the tiny PATH_CHALLENGE /
+    /// PATH_RESPONSE pair that keeps path validation alive (H-6).
     NotCongestionControlled,
     /// RFC 9000 §9.1 / §21.5.3: the destination address has not been
     /// validated, so only probing frames may be sent to it (H-4).
@@ -1639,8 +1647,13 @@ impl QuicConnection {
         // the Phase-4 stand-in for RFC 9002's "in-flight ack-eliciting
         // packet" predicate. Phase 6: also arm when any stream has
         // unacked chunks.
+        // RFC 9002 §6.2.1: the timer is armed whenever ack-eliciting packets
+        // are in flight — a lone PATH_CHALLENGE, DATAGRAM or PING counts too,
+        // or the probe that would reveal its loss could never be sent.
         if !self.endpoint.loss.is_armed()
-            && (self.has_unconfirmed_crypto_last_sent() || self.has_unacked_streams())
+            && (self.has_unconfirmed_crypto_last_sent()
+                || self.has_unacked_streams()
+                || self.endpoint.loss.has_ack_eliciting_in_flight())
         {
             self.endpoint.loss.arm(Duration::ZERO);
         }
@@ -1728,6 +1741,10 @@ impl QuicConnection {
             }
             // Phase 8 — DATAGRAM frames awaiting transmission.
             if !self.datagram_queues.outbound.is_empty() {
+                return true;
+            }
+            // RFC 9002 §6.2.4 — a PTO probe still owed (PING if need be).
+            if self.endpoint.loss.probe_needs_ping() {
                 return true;
             }
         }
@@ -1968,7 +1985,10 @@ impl QuicConnection {
             // flight was dropped resends BOTH packets in one PTO event;
             // the client's peer needs both to derive Handshake-level
             // keys (from the ServerHello) and then read the rest of the
-            // server's Finished.
+            // server's Finished. `on_fire` also arms the §7.5 probe
+            // credit that lets the 1-RTT probes past a full congestion
+            // window (see `build_packet_with_pad`), with a PING as the
+            // fallback when nothing retransmittable is left.
             self.endpoint.loss.on_fire(now_since_start);
             for lvl in [Level::Initial, Level::Handshake] {
                 let _ = self
@@ -3823,6 +3843,10 @@ impl QuicConnection {
         if !self.datagram_queues.outbound.is_empty() {
             return true;
         }
+        // RFC 9002 §6.2.4 — a PTO probe still owed (PING if need be).
+        if self.endpoint.loss.probe_needs_ping() {
+            return true;
+        }
         false
     }
 
@@ -5029,7 +5053,16 @@ impl QuicConnection {
         // Phase 8 — DATAGRAM frames live only at the 1-RTT level.
         let has_datagrams = matches!(level, Level::OneRtt | Level::EarlyData)
             && !self.datagram_queues.outbound.is_empty();
-        if !has_crypto && !has_pending_ack && !has_streams && !has_path_or_cid && !has_datagrams {
+        // RFC 9002 §6.2.4 — a PTO probe owed with nothing else to carry it.
+        let has_probe_ping =
+            matches!(level, Level::OneRtt) && self.endpoint.loss.probe_needs_ping();
+        if !has_crypto
+            && !has_pending_ack
+            && !has_streams
+            && !has_path_or_cid
+            && !has_datagrams
+            && !has_probe_ping
+        {
             return None;
         }
         // Keys must be installed for this direction.
@@ -5070,10 +5103,16 @@ impl QuicConnection {
         // H-4: RFC 9000 §21.5.3 — a client that has moved to a server-supplied
         // preferred address MUST NOT send non-probing frames there until path
         // validation succeeds. `peer_addr_validated` is what tracks that.
+        //
+        // RFC 9002 §7.5: a PTO probe MUST NOT be blocked by the window. While
+        // the PTO credit is armed, 1-RTT packets are built at full scope even
+        // with `bytes_in_flight >= cwnd`; each ack-eliciting one spends a
+        // credit, so the bypass is worth exactly the §6.2.4 probe count.
+        let probing = matches!(level, Level::OneRtt) && self.endpoint.loss.probe_credit() > 0;
         let scope =
             if self.role == Role::Client && self.migration.is_some() && !self.peer_addr_validated {
                 PayloadScope::ProbingOnly
-            } else if matches!(level, Level::OneRtt) && !self.endpoint.cc.can_send() {
+            } else if matches!(level, Level::OneRtt) && !probing && !self.endpoint.cc.can_send() {
                 PayloadScope::NotCongestionControlled
             } else {
                 PayloadScope::Full
@@ -5085,6 +5124,9 @@ impl QuicConnection {
         let (payload, meta) = self.assemble_payload(level, scope)?;
         if payload.is_empty() {
             return None;
+        }
+        if probing && meta.ack_eliciting {
+            self.endpoint.loss.consume_probe_credit();
         }
         self.seal_packet(level, payload, pad, Some(meta))
     }
@@ -5199,6 +5241,15 @@ impl QuicConnection {
                 let extra = payload_needed - payload.len();
                 payload.extend(core::iter::repeat_n(0u8, extra));
             }
+        }
+        // RFC 9001 §5.4.2 — the header-protection sample starts 4 bytes past
+        // the packet number and must lie within the ciphertext + tag, so
+        // `pn_len + payload.len()` MUST be at least 4. A lone PING (one byte)
+        // is the only frame this engine builds that can fall short; PADDING
+        // makes up the difference.
+        let min_payload = 4usize.saturating_sub(pn_len as usize);
+        if payload.len() < min_payload {
+            payload.resize(min_payload, 0u8);
         }
 
         // Build the header.
@@ -5587,6 +5638,19 @@ impl QuicConnection {
                 // RFC 9221 §5: DATAGRAM is ack-eliciting and in-flight
                 // (but not retransmitted on loss — the loss-recovery
                 // path simply doesn't requeue datagrams).
+                meta.ack_eliciting = true;
+                meta.in_flight = true;
+            }
+
+            // RFC 9002 §6.2.4 — a PTO fired and no probe has gone out yet:
+            // the probe MUST be ack-eliciting, so if nothing above was, add
+            // a PING. (Non-probing per RFC 9000 §9.1, hence `full`.)
+            if matches!(level, Level::OneRtt)
+                && full
+                && !meta.ack_eliciting
+                && self.endpoint.loss.probe_needs_ping()
+            {
+                Frame::Ping.encode(&mut out);
                 meta.ack_eliciting = true;
                 meta.in_flight = true;
             }
@@ -7650,6 +7714,152 @@ mod tests {
         assert_eq!(
             s.endpoint.cc.bytes_in_flight, before_in_flight,
             "an ACK-only packet does not add to bytes_in_flight"
+        );
+    }
+
+    /// RFC 9002 §7.5 — a PTO probe MUST NOT be blocked by the congestion
+    /// window. With the window fully consumed and no ACKs coming back, the
+    /// PTO used to requeue data that the cwnd guard then refused to send:
+    /// nothing left, nothing was acknowledged, nothing was ever declared
+    /// lost. Now exactly the §6.2.4 probe credit leaves — every probe
+    /// ack-eliciting, counted in flight and loss-tracked — and the window
+    /// rules again until an ACK shows progress. Persistent-congestion
+    /// detection (§7.6) is untouched by the credit.
+    #[test]
+    fn pto_probes_bypass_a_full_congestion_window() {
+        use crate::quic::loss::K_PTO_PROBES;
+        let (mut c, mut s) = streams_loopback_pair_with_limits(256 * 1024, 1024 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+
+        // Fill the server's window with data the client never acknowledges.
+        let id = c.open_bidi().expect("open");
+        c.write(id, b"go").expect("write");
+        let dg = c.pop_datagram();
+        s.feed_datagram(&dg).expect("server feed");
+        s.write(id, &[0x33; 64 * 1024]).expect("server write");
+        let mut in_window = 0usize;
+        loop {
+            let out = s.pop_datagram();
+            if out.is_empty() {
+                break;
+            }
+            in_window += 1;
+        }
+        assert!(in_window > 1);
+        assert!(
+            !s.endpoint.cc.can_send(),
+            "test premise: the window is full"
+        );
+        assert_eq!(s.endpoint.loss.probe_credit(), 0);
+        assert!(
+            s.pop_datagram().is_empty(),
+            "test premise: the window holds everything back"
+        );
+
+        // PTO fires: the credit is armed and spent by exactly that many
+        // ack-eliciting probes, then the window closes the door again.
+        let before_in_flight = s.endpoint.cc.bytes_in_flight;
+        s.on_timeout(Duration::from_secs(5));
+        assert_eq!(s.endpoint.loss.probe_credit(), K_PTO_PROBES);
+        let mut probes: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let out = s.pop_datagram();
+            if out.is_empty() {
+                break;
+            }
+            probes.push(out);
+        }
+        assert_eq!(
+            probes.len(),
+            usize::from(K_PTO_PROBES),
+            "exactly the probe credit leaves past the window"
+        );
+        assert_eq!(s.endpoint.loss.probe_credit(), 0, "spent per probe emitted");
+        assert!(
+            s.endpoint.cc.bytes_in_flight > before_in_flight,
+            "probes count toward bytes_in_flight"
+        );
+        assert!(!s.endpoint.cc.can_send());
+        let sent = &s.endpoint.loss.per_space[PnSpaceId::Application as usize].sent_packets;
+        assert!(
+            sent.values()
+                .rev()
+                .take(probes.len())
+                .all(|p| p.ack_eliciting && p.in_flight),
+            "probes are ack-eliciting and loss-tracked like any packet"
+        );
+
+        // Two more silent PTOs: §7.6 persistent congestion is detected
+        // exactly as before.
+        s.on_timeout(Duration::from_secs(10));
+        s.on_timeout(Duration::from_secs(20));
+        assert_eq!(s.endpoint.loss.pto_count, 3);
+        assert!(s.endpoint.loss.take_persistent_congestion());
+
+        // The probes reach the client; its ACK shows progress, drops the
+        // unspent credit, reveals the earlier flight as lost and reopens the
+        // window — data flows again under normal congestion control.
+        assert_eq!(s.endpoint.loss.probe_credit(), K_PTO_PROBES);
+        for p in &probes {
+            c.feed_datagram(p).expect("client feed probe");
+        }
+        let ack = c.pop_datagram();
+        assert!(!ack.is_empty());
+        s.feed_datagram(&ack).expect("server feed ack");
+        assert_eq!(
+            s.endpoint.loss.probe_credit(),
+            0,
+            "an ACK clears the credit"
+        );
+        assert!(s.endpoint.cc.can_send(), "the ACK opened the window");
+        assert!(!s.pop_datagram().is_empty(), "data flows again");
+    }
+
+    /// RFC 9002 §6.2.4 — a probe must be ack-eliciting. When the only thing
+    /// in flight cannot be retransmitted (here a PATH_CHALLENGE), the PTO
+    /// used to send nothing at all; now the probe is a PING, which draws the
+    /// ACK that lets loss detection see what happened. With nothing in
+    /// flight the timer stays quiet — no PING keepalives out of thin air.
+    #[test]
+    fn pto_probe_sends_ping_when_nothing_is_retransmittable() {
+        let (mut c, mut s) = streams_loopback_pair_with_limits(64 * 1024, 256 * 1024);
+        drive_until_complete(&mut c, &mut s, 8);
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        let addr = ip4(192, 0, 2, 1, 1111);
+        quiesce(&mut c, &mut s, addr);
+        assert!(!s.endpoint.loss.has_ack_eliciting_in_flight());
+
+        // Nothing in flight: a PTO tick probes nothing.
+        s.on_timeout(Duration::from_secs(5));
+        assert_eq!(s.endpoint.loss.probe_credit(), 0);
+        assert!(
+            s.pop_datagram().is_empty(),
+            "no PING with nothing to probe for"
+        );
+
+        // A lone PATH_CHALLENGE goes out and is lost.
+        s.send_path_challenge().expect("challenge");
+        assert_eq!(s.pop_datagram().len(), 1200);
+        assert!(s.endpoint.loss.has_ack_eliciting_in_flight());
+        assert!(s.pop_datagram().is_empty());
+
+        // The PTO fires; with nothing to retransmit the probe is a PING.
+        s.on_timeout(Duration::from_secs(10));
+        assert!(s.endpoint.loss.probe_needs_ping());
+        let ping = s.pop_datagram();
+        assert!(!ping.is_empty(), "§6.2.4: at least one ack-eliciting probe");
+        assert!(ping.len() < 64, "a bare PING, not a padded probe");
+        assert!(
+            s.pop_datagram().is_empty(),
+            "one PING per PTO expiry, not a stream of them"
+        );
+        c.feed_datagram(&ping).expect("client feed");
+        assert!(
+            c.endpoint.pn.application.ack_eliciting_pending,
+            "the probe was ack-eliciting"
         );
     }
 

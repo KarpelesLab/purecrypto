@@ -44,6 +44,11 @@ pub(crate) const K_PERSISTENT_CONGESTION_THRESHOLD: u32 = 3;
 /// timer fires).
 pub(crate) const PTO_BACKOFF_CAP: u32 = 16;
 
+/// RFC 9002 §6.2.4 — probe packets one PTO expiry may send: "an endpoint
+/// MAY send up to two full-sized datagrams containing ack-eliciting
+/// packets". RFC 9002 §7.5 exempts these from the congestion window.
+pub(crate) const K_PTO_PROBES: u8 = 2;
+
 /// Bytes-and-metadata for one packet we have sent and are tracking until
 /// ack or loss. Per RFC 9002 §A.1.1 "Sent Packet Fields".
 #[derive(Debug, Clone)]
@@ -137,6 +142,15 @@ pub(crate) struct LossState {
     /// True once a PTO has fired without subsequent ack progress. Cleared
     /// by [`Self::on_ack_received`] when any newly-acked packet shows up.
     pub(crate) pto_outstanding: bool,
+    /// RFC 9002 §7.5 — ack-eliciting 1-RTT packets the sender may still
+    /// emit *past* the congestion window as PTO probes. Armed to
+    /// [`K_PTO_PROBES`] when a PTO fires with ack-eliciting application
+    /// data in flight, consumed one per probe packet actually emitted, and
+    /// cleared by ack progress. Probes still count toward `bytes_in_flight`
+    /// and are loss-tracked like any other packet; the credit only lets
+    /// them *leave* while the window is full, so a peer that stopped
+    /// acknowledging can be provoked into revealing what was lost.
+    probe_credit: u8,
     /// True once we have flagged a persistent-congestion event to the
     /// caller. Cleared once the caller has consumed
     /// [`Self::take_persistent_congestion`]. Used so the same event isn't
@@ -171,9 +185,41 @@ impl LossState {
             ],
             last_progress_time: None,
             pto_outstanding: false,
+            probe_credit: 0,
             persistent_congestion_pending: false,
             shim_armed_at: None,
         }
+    }
+
+    /// RFC 9002 §6.2.4 — a PTO fired: allow [`K_PTO_PROBES`] probe packets
+    /// past the congestion window, provided the application space has
+    /// ack-eliciting packets in flight for the probes to elicit an ACK
+    /// about. With nothing in flight there is nothing to probe for, and
+    /// arming would turn every idle timer tick into a PING.
+    fn arm_probe_credit(&mut self) {
+        if self.has_ack_eliciting_in_flight() {
+            self.probe_credit = K_PTO_PROBES;
+        }
+    }
+
+    /// Probe packets still permitted past the congestion window (§7.5).
+    #[inline]
+    pub(crate) fn probe_credit(&self) -> u8 {
+        self.probe_credit
+    }
+
+    /// An ack-eliciting 1-RTT probe packet was emitted; spend one credit.
+    #[inline]
+    pub(crate) fn consume_probe_credit(&mut self) {
+        self.probe_credit = self.probe_credit.saturating_sub(1);
+    }
+
+    /// True while a PTO has fired and *no* probe has gone out since: §6.2.4
+    /// requires at least one ack-eliciting packet, so if nothing else
+    /// ack-eliciting is available the packet builder adds a PING.
+    #[inline]
+    pub(crate) fn probe_needs_ping(&self) -> bool {
+        self.probe_credit == K_PTO_PROBES
     }
 
     /// Configure the peer's transport parameters (after the handshake
@@ -287,9 +333,12 @@ impl LossState {
         // congestion controller).
 
         // Progress: clear pto_count and PTO-outstanding flag (§A.6 / §6.2.2).
+        // Any unspent probe credit goes too — the window is the authority
+        // again now that the peer is acknowledging.
         if !newly_acked.is_empty() {
             self.pto_count = 0;
             self.pto_outstanding = false;
+            self.probe_credit = 0;
             self.persistent_congestion_pending = false;
             self.last_progress_time = Some(now);
             // Phase-4 shim: any ack progress also resets the shim
@@ -440,6 +489,7 @@ impl LossState {
         // probe packets").
         self.pto_count = self.pto_count.saturating_add(1);
         self.pto_outstanding = true;
+        self.arm_probe_credit();
         // Phase-4 shim accounting.
         if self.shim_armed_at.is_some() {
             self.shim_armed_at = Some(now);
@@ -684,6 +734,7 @@ impl LossState {
         self.shim_armed_at = None;
         self.pto_count = 0;
         self.pto_outstanding = false;
+        self.probe_credit = 0;
         self.persistent_congestion_pending = false;
     }
 
@@ -725,12 +776,22 @@ impl LossState {
 
     /// Phase-4 shim: records that the PTO fired. Bumps `pto_count`,
     /// caps at [`PTO_BACKOFF_CAP`], re-arms the shim anchor from
-    /// `now`, and flips `pto_outstanding` so the persistent-congestion
-    /// check can find it.
+    /// `now`, flips `pto_outstanding` so the persistent-congestion
+    /// check can find it, and arms the §7.5 probe credit.
     pub(crate) fn on_fire(&mut self, now: Duration) {
         self.pto_count = self.pto_count.saturating_add(1).min(PTO_BACKOFF_CAP);
         self.pto_outstanding = true;
+        self.arm_probe_credit();
         self.shim_armed_at = Some(now);
+    }
+
+    /// True iff the application space has ack-eliciting packets in flight —
+    /// the RFC 9002 §6.2.1 condition for the PTO timer to be armed at all.
+    pub(crate) fn has_ack_eliciting_in_flight(&self) -> bool {
+        self.per_space[PnSpaceId::Application as usize]
+            .sent_packets
+            .values()
+            .any(|p| p.ack_eliciting)
     }
 
     /// Phase-4 shim: ack-eliciting progress observed. Resets
@@ -738,6 +799,7 @@ impl LossState {
     pub(crate) fn on_handshake_progress(&mut self, now: Duration) {
         self.pto_count = 0;
         self.pto_outstanding = false;
+        self.probe_credit = 0;
         self.persistent_congestion_pending = false;
         self.last_progress_time = Some(now);
         self.shim_armed_at = Some(now);
