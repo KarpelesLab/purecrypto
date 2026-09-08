@@ -22,7 +22,10 @@ mod reduce;
 pub(crate) mod registry;
 mod sample;
 
-#[cfg(feature = "alloc")]
+// `Vec` is only consumed by the DER encoders (and the ACVP test module, which
+// imports it itself); gating on `alloc` alone leaves the import unused under
+// `--features std,mldsa`.
+#[cfg(all(feature = "alloc", feature = "der"))]
 use alloc::vec::Vec;
 
 use crate::rng::{CryptoRng, RngCore};
@@ -1222,6 +1225,7 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+    use alloc::vec::Vec;
 
     fn unhex(s: &str) -> Vec<u8> {
         let b = s.as_bytes();

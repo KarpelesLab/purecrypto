@@ -28,6 +28,7 @@
 // error type. Scope the lint allowance to this module.
 #![allow(clippy::result_unit_err)]
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 pub use super::Params;
