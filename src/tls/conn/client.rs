@@ -2726,6 +2726,16 @@ impl ClientConnection {
                         // Server cannot accept what we didn't offer.
                         return Err(Error::IllegalParameter);
                     }
+                    // RFC 8446 §4.2.10: early data is only meaningful under
+                    // the PSK it was offered with. A server that did not
+                    // select our `pre_shared_key` in ServerHello but still
+                    // claims to accept early data is misbehaving — the
+                    // client MUST abort with `illegal_parameter`. Accepting
+                    // would mark 0-RTT as "accepted" on a full handshake and
+                    // emit EndOfEarlyData under keys the server never had.
+                    if !self.psk_accepted {
+                        return Err(Error::IllegalParameter);
+                    }
                     early_data_in_ee = true;
                 } else if ty == crate::tls::codec::ExtensionType::SERVER_CERTIFICATE_TYPE.0 {
                     // RFC 7250 §4.2 server reply: a single byte picking the
@@ -3819,6 +3829,52 @@ mod tests {
             .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// TLS-CORE-6 — RFC 8446 §4.2.10: a server MUST NOT accept early data
+    /// unless it also selected the PSK the client offered it under. The
+    /// client used to take `early_data` in EncryptedExtensions at face
+    /// value after a ServerHello with no `pre_shared_key`, flipping
+    /// `early_data_accepted` on a full handshake.
+    #[test]
+    fn client_rejects_early_data_in_ee_without_psk_acceptance() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"ee-ed-nopsk", b"nonce", &[]);
+        let session = StoredSession {
+            server_name: "h".into(),
+            ticket: alloc::vec![0x41; 16],
+            psk: alloc::vec![0x5a; 32],
+            age_add: 0,
+            lifetime_seconds: 7200,
+            received_at: Time::from_unix(0),
+            max_early_data_size: Some(1024),
+            negotiated_alpn: None,
+            cipher_suite_hash: HashAlg::Sha256,
+        };
+        let config = ClientConfig::new(RootCertStore::new()).with_session(session);
+        let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
+        assert!(
+            client.early_data_offered,
+            "the session must trigger a 0-RTT offer"
+        );
+        // No ServerHello was processed: the PSK was not selected.
+        assert!(!client.psk_accepted);
+
+        // EE = extensions_len(2) || early_data(type 0x002a, empty body).
+        let mut exts = alloc::vec::Vec::new();
+        exts.extend_from_slice(&ExtensionType::EARLY_DATA.0.to_be_bytes());
+        exts.extend_from_slice(&0u16.to_be_bytes());
+        let mut body = alloc::vec::Vec::new();
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut raw = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0x00];
+        raw.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        raw.extend_from_slice(&body);
+
+        let err = client
+            .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
+            .unwrap_err();
+        assert!(matches!(err, Error::IllegalParameter));
+        assert!(!client.early_data_accepted());
     }
 
     /// The manual EncryptedExtensions walk caps the extension count at
