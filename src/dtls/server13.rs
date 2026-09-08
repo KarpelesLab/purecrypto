@@ -186,9 +186,7 @@ impl ServerConfig13Internal {
 
     /// Sets the pre-rotation cookie secret (see
     /// [`Self::previous_cookie_secret`]).
-    // Reached from `Config::previous_cookie_secret` once
-    // `connection.rs::build_dtls13_server` forwards it; tests use it today.
-    #[allow(dead_code)]
+    /// Forwarded from [`crate::tls::Config::previous_cookie_secret`].
     pub fn with_previous_cookie_secret(mut self, secret: [u8; 32]) -> Self {
         self.previous_cookie_secret = Some(secret);
         self

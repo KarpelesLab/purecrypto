@@ -1656,6 +1656,9 @@ fn build_dtls12_server(
     if let Some(secret) = cfg.cookie_secret {
         sc = sc.with_cookie_secret(secret);
     }
+    if let Some(previous) = cfg.previous_cookie_secret {
+        sc = sc.with_previous_cookie_secret(previous);
+    }
     if !cfg.require_cookie {
         sc = sc.require_cookie_exchange(false);
     }
@@ -1684,9 +1687,13 @@ fn build_dtls13_server(
     if let Some(secret) = cfg.cookie_secret {
         sc = sc.with_cookie_secret(secret);
     }
+    if let Some(previous) = cfg.previous_cookie_secret {
+        sc = sc.with_previous_cookie_secret(previous);
+    }
     if !cfg.require_cookie {
         sc = sc.with_no_cookie();
     }
+    sc.max_record_size = cfg.max_record_size;
     sc.key_log = cfg.key_log.clone();
     Ok(crate::dtls::DtlsServerConnection13::new(
         alloc::sync::Arc::new(sc),
