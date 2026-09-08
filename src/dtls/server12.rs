@@ -70,6 +70,14 @@ pub(crate) struct ServerConfig12Internal {
     /// HelloVerifyRequest entirely (useful for tests; a production
     /// configuration always sets this).
     cookie_secret: Option<[u8; 32]>,
+    /// The cookie secret in use before the last rotation, if any. Cookies
+    /// are only ever *minted* under `cookie_secret`, but are *accepted*
+    /// under either, so rotating the secret does not strand every client
+    /// whose HelloVerifyRequest cookie is in flight (the cookie's own
+    /// max-age still bounds how long the old secret stays useful — RFC 6347
+    /// §4.2.1). Keep at most one previous generation: a cookie minted two
+    /// rotations ago is refused.
+    previous_cookie_secret: Option<[u8; 32]>,
     /// When `true`, ALL clients must complete the cookie exchange before
     /// the server allocates any handshake state. When `false`, the cookie
     /// step is skipped — only safe for tests.
@@ -91,6 +99,7 @@ impl ServerConfig12Internal {
             cert_chain,
             key: ServerKey::Ecdsa(key),
             cookie_secret: None,
+            previous_cookie_secret: None,
             require_cookie_exchange: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
@@ -106,6 +115,7 @@ impl ServerConfig12Internal {
             cert_chain,
             key: ServerKey::Rsa(key),
             cookie_secret: None,
+            previous_cookie_secret: None,
             require_cookie_exchange: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
@@ -122,6 +132,7 @@ impl ServerConfig12Internal {
             cert_chain,
             key: ServerKey::External { schemes },
             cookie_secret: None,
+            previous_cookie_secret: None,
             require_cookie_exchange: true,
             signature_policy: SignaturePolicy::modern(),
             key_log: None,
@@ -132,6 +143,16 @@ impl ServerConfig12Internal {
     /// typically derive this from a long-lived high-entropy server secret.
     pub fn with_cookie_secret(mut self, secret: [u8; 32]) -> Self {
         self.cookie_secret = Some(secret);
+        self
+    }
+
+    /// Sets the pre-rotation cookie secret (see
+    /// [`Self::previous_cookie_secret`]).
+    // Reached from `Config::previous_cookie_secret` once
+    // `connection.rs::build_dtls12_server` forwards it; tests use it today.
+    #[allow(dead_code)]
+    pub fn with_previous_cookie_secret(mut self, secret: [u8; 32]) -> Self {
+        self.previous_cookie_secret = Some(secret);
         self
     }
 
@@ -964,13 +985,28 @@ impl<R: RngCore> DtlsServerConnection12<R> {
                 .ok_or(Error::InappropriateState)?;
             let cg = CookieGenerator::new(*secret);
             let now_min = self.cookie_now_minutes();
-            if !cg.validate(
+            // Current secret first; on a miss, the previous generation
+            // (DTLS-I6: a rotation must not invalidate in-flight cookies).
+            let valid = cg.validate(
                 &self.peer_addr,
                 &parsed.random,
                 &fp,
                 now_min,
                 &parsed.cookie,
-            ) {
+            ) || self
+                .config
+                .previous_cookie_secret
+                .as_ref()
+                .is_some_and(|prev| {
+                    CookieGenerator::new(*prev).validate(
+                        &self.peer_addr,
+                        &parsed.random,
+                        &fp,
+                        now_min,
+                        &parsed.cookie,
+                    )
+                });
+            if !valid {
                 return Err(Error::IllegalParameter);
             }
         }
@@ -1112,9 +1148,16 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // without HVR, message_seq starts at 0. Cookie-disabled path: HVR
         // was never sent, so message_seq starts at 0.
         if cookie_required {
-            // HVR was message_seq=0, so the next outbound message is 1.
-            // We already set this when we sent HVR; nothing more here.
-            // out_msg_seq is at 1.
+            // HVR was message_seq=0, so the next outbound message is 1
+            // (RFC 6347 §4.2.2). Set it here rather than relying on
+            // `emit_hello_verify_request`: the cookie is stateless by
+            // design, so the CH2 may land on a fresh server object that
+            // never sent the HVR (a restart, a rotated cookie secret, a
+            // stateless dispatcher) — one that still counted from 0 would
+            // send a ServerHello the client's reassembler treats as a
+            // stale duplicate of the HVR and the handshake would stall
+            // (DTLS-I6).
+            self.out_msg_seq = 1;
         } else {
             self.out_msg_seq = 0;
         }

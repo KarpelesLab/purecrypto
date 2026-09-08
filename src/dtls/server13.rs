@@ -138,6 +138,14 @@ pub(crate) struct ServerConfig13Internal {
     /// Cookie secret. When `None`, the cookie exchange is skipped (tests
     /// only). A production configuration always sets this.
     pub cookie_secret: Option<[u8; 32]>,
+    /// The cookie secret in use before the last rotation, if any. Cookies
+    /// are only ever *minted* under `cookie_secret`, but are *accepted*
+    /// under either, so rotating the secret does not strand every client
+    /// whose HelloRetryRequest cookie is in flight (the cookie's own
+    /// max-age still bounds how long the old secret stays useful — RFC 9147
+    /// §5.1). Keep at most one previous generation: a cookie minted two
+    /// rotations ago is refused.
+    pub previous_cookie_secret: Option<[u8; 32]>,
     /// When `true`, every client must complete the cookie exchange before
     /// the server allocates any per-connection handshake state. Default
     /// `true`.
@@ -168,11 +176,22 @@ impl ServerConfig13Internal {
             cert_chain,
             key,
             cookie_secret: None,
+            previous_cookie_secret: None,
             require_cookie: true,
             signature_policy: Arc::new(SignaturePolicy::modern()),
             key_log: None,
             max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
         }
+    }
+
+    /// Sets the pre-rotation cookie secret (see
+    /// [`Self::previous_cookie_secret`]).
+    // Reached from `Config::previous_cookie_secret` once
+    // `connection.rs::build_dtls13_server` forwards it; tests use it today.
+    #[allow(dead_code)]
+    pub fn with_previous_cookie_secret(mut self, secret: [u8; 32]) -> Self {
+        self.previous_cookie_secret = Some(secret);
+        self
     }
 
     /// Back-compat constructor that takes an ECDSA private key. Forwards to
@@ -1310,8 +1329,22 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             }
             let cookie = &cookie_bytes[2..];
             let now_min = self.cookie_now_minutes();
+            // Current secret first; on a miss, the previous generation
+            // (DTLS-I6: a rotation must not invalidate in-flight cookies).
+            // Only the outcome is secret-dependent — which of two
+            // legitimately issued cookies validated is not sensitive.
             let aux = cg
                 .validate_with_aux(&self.peer_addr, &ch.random, &ch_fp, now_min, cookie)
+                .or_else(|| {
+                    let prev = self.config.previous_cookie_secret.as_ref()?;
+                    CookieGenerator::new(*prev).validate_with_aux(
+                        &self.peer_addr,
+                        &ch.random,
+                        &ch_fp,
+                        now_min,
+                        cookie,
+                    )
+                })
                 .ok_or(Error::IllegalParameter)?;
 
             // Decode the aux payload: (suite_id, sel_group, hash_alg, Hash(CH1)).

@@ -884,3 +884,149 @@ fn huge_certificate_chain_respects_mtu_12() {
     }
     assert_eq!(server.take_received(), b"ping");
 }
+
+// ---------------------------------------------------------------------
+// DTLS-I6: cookie-secret rotation with one previous generation.
+// ---------------------------------------------------------------------
+
+const GEN1: [u8; 32] = [0x11; 32];
+const GEN2: [u8; 32] = [0x22; 32];
+const GEN3: [u8; 32] = [0x33; 32];
+
+/// DTLS 1.3: a cookie minted under the old secret validates on a server
+/// that has rotated to a new one and kept the old as `previous`; the same
+/// cookie is refused once the secret has rotated twice. The server is
+/// stateless across the HRR round trip, so the post-rotation server is a
+/// fresh connection object, exactly as a real deployment's would be.
+#[test]
+fn rotated_cookie_secret_accepts_previous_generation_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i6-client-13");
+    let mut issuer = server13(server_cfg.with_cookie_secret(GEN1), b"i6-issuer-13");
+    for dg in &client.pop_outbound_datagrams() {
+        issuer.feed_datagram(dg).unwrap();
+    }
+    for dg in &issuer.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    let ch2 = client.pop_outbound_datagrams();
+    assert!(!ch2.is_empty(), "client answers the HRR with CH2");
+
+    // Two generations stale: refused (silent drop, no server flight).
+    let (server_cfg, _) = server13_cfg();
+    let mut stale = server13(
+        server_cfg
+            .with_cookie_secret(GEN3)
+            .with_previous_cookie_secret(GEN2),
+        b"i6-stale-13",
+    );
+    for dg in &ch2 {
+        assert_eq!(stale.feed_datagram(dg), Ok(()));
+    }
+    assert!(stale.pop_outbound_datagrams().is_empty());
+
+    // One generation stale: accepted, handshake completes.
+    let (server_cfg, _) = server13_cfg();
+    let mut rotated = server13(
+        server_cfg
+            .with_cookie_secret(GEN2)
+            .with_previous_cookie_secret(GEN1),
+        b"i6-rotated-13",
+    );
+    for dg in &ch2 {
+        rotated.feed_datagram(dg).unwrap();
+    }
+    let flight = rotated.pop_outbound_datagrams();
+    assert!(
+        !flight.is_empty(),
+        "rotated server must serve the old cookie"
+    );
+    for dg in &flight {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(pump13(&mut client, &mut rotated));
+    app_data_round_trip(&mut client, &mut rotated);
+}
+
+/// DTLS 1.2 mirror of the above with the HelloVerifyRequest cookie.
+#[test]
+fn rotated_cookie_secret_accepts_previous_generation_12() {
+    let (server_cfg, cert) = server12_cfg();
+    let mut client = client12(&cert, b"i6-client-12");
+    let mut issuer = server12(
+        server_cfg
+            .with_cookie_secret(GEN1)
+            .require_cookie_exchange(true),
+        b"i6-issuer-12",
+    );
+    for dg in &client.pop_outbound_datagrams() {
+        issuer.feed_datagram(dg).unwrap();
+    }
+    for dg in &issuer.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    let ch2 = client.pop_outbound_datagrams();
+    assert!(!ch2.is_empty(), "client answers the HVR with CH2");
+
+    let (server_cfg, _) = server12_cfg();
+    let mut stale = server12(
+        server_cfg
+            .with_cookie_secret(GEN3)
+            .with_previous_cookie_secret(GEN2)
+            .require_cookie_exchange(true),
+        b"i6-stale-12",
+    );
+    for dg in &ch2 {
+        assert_eq!(stale.feed_datagram(dg), Ok(()));
+    }
+    assert!(stale.pop_outbound_datagrams().is_empty());
+
+    let (server_cfg, _) = server12_cfg();
+    let mut rotated = server12(
+        server_cfg
+            .with_cookie_secret(GEN2)
+            .with_previous_cookie_secret(GEN1)
+            .require_cookie_exchange(true),
+        b"i6-rotated-12",
+    );
+    for dg in &ch2 {
+        rotated.feed_datagram(dg).unwrap();
+    }
+    let flight = rotated.pop_outbound_datagrams();
+    assert!(
+        !flight.is_empty(),
+        "rotated server must serve the old cookie"
+    );
+    for dg in &flight {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(pump12(&mut client, &mut rotated));
+}
+
+/// Cookies are minted only under the current secret: a server holding
+/// `(GEN2, previous = GEN1)` issues cookies that a `(GEN1)`-only server
+/// does not accept.
+#[test]
+fn cookies_are_minted_under_current_secret_only_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i6-mint-client");
+    let mut issuer = server13(
+        server_cfg
+            .with_cookie_secret(GEN2)
+            .with_previous_cookie_secret(GEN1),
+        b"i6-mint-issuer",
+    );
+    for dg in &client.pop_outbound_datagrams() {
+        issuer.feed_datagram(dg).unwrap();
+    }
+    for dg in &issuer.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    let ch2 = client.pop_outbound_datagrams();
+    let (server_cfg, _) = server13_cfg();
+    let mut old = server13(server_cfg.with_cookie_secret(GEN1), b"i6-mint-old");
+    for dg in &ch2 {
+        assert_eq!(old.feed_datagram(dg), Ok(()));
+    }
+    assert!(old.pop_outbound_datagrams().is_empty());
+}

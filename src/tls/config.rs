@@ -381,6 +381,11 @@ pub struct Config {
     /// 32-byte secret for stateless cookie issuance / validation. `None` on
     /// the DTLS server = cookie exchange is skipped (test-only).
     pub cookie_secret: Option<[u8; 32]>,
+    /// The cookie secret in use before the last rotation. Cookies are
+    /// minted only under [`Self::cookie_secret`] but accepted under either,
+    /// so rotating does not strand clients whose cookie is in flight; one
+    /// generation only — a cookie from two rotations ago is refused.
+    pub previous_cookie_secret: Option<[u8; 32]>,
     /// When `true`, the DTLS server mandates a cookie round-trip before
     /// allocating per-connection state. Default `true` on server, ignored
     /// on client. **Setting this to `false` turns the server into a >3x
@@ -519,6 +524,7 @@ impl Default for Config {
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: super::cert_compression::default_algorithms(),
             cookie_secret: None,
+            previous_cookie_secret: None,
             require_cookie: true,
             max_record_size: 1200,
             peer_address: Vec::new(),
@@ -763,6 +769,14 @@ impl ConfigBuilder {
     pub fn cookie_secret(mut self, secret: [u8; 32]) -> Self {
         self.inner.cookie_secret = Some(secret);
         self.inner.require_cookie = true;
+        self
+    }
+    /// DTLS server: the cookie secret that [`Self::cookie_secret`] just
+    /// replaced. Cookies minted under it stay valid for their max-age, so
+    /// a rotation does not abort handshakes in flight
+    /// ([`Config::previous_cookie_secret`]).
+    pub fn previous_cookie_secret(mut self, secret: [u8; 32]) -> Self {
+        self.inner.previous_cookie_secret = Some(secret);
         self
     }
     /// DTLS server: disable the cookie exchange (tests only).
