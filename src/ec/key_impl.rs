@@ -442,13 +442,13 @@ impl PublicKey for BoxedEcdsaPublicKey {
 
 impl PrivateKey for BoxedEcdhPrivateKey {
     fn algorithm(&self) -> Algorithm {
-        curve_alg(self.public_key().curve())
+        curve_alg(self.curve())
     }
     fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
         Ok(Box::new(self.public_key()))
     }
     fn agree(&self, peer: &dyn PublicKey) -> Result<Secret, Error> {
-        let alg = ecdsa_alg(self.public_key().curve()).ok_or(Error::InvalidParams)?;
+        let alg = ecdsa_alg(self.curve()).ok_or(Error::InvalidParams)?;
         let peer = downcast_peer::<BoxedEcdsaPublicKey>(peer, alg)?;
         let shared = self.diffie_hellman(peer).map_err(|_| Error::KeyAgreement)?;
         Ok(Secret::from_bytes(shared))

@@ -887,6 +887,11 @@ impl BoxedEcdhPrivateKey {
         }
     }
 
+    /// The curve this key lives on.
+    pub fn curve(&self) -> CurveId {
+        self.curve
+    }
+
     /// The public key `d * G` to send to the peer.
     pub fn public_key(&self) -> BoxedEcdsaPublicKey {
         let c = self.curve.curve();
