@@ -199,6 +199,14 @@ const SQRT_MINUS3_BYTES: [u8; 32] =
 const SVDW_D_BYTES: [u8; 32] =
     hex32("851695d49a83f8ef919bb86153cbcb16630fb68aed0a766a3ec693d68e6afa40");
 
+/// Big-endian hex x-coordinate of `H` (the SHA-256 digest of `G`'s
+/// uncompressed encoding; identical to `H_BYTES[1..]`).
+const H_X_HEX: &str = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
+/// Big-endian hex y-coordinate of `H`: the even root of `x³ + 7`, which is the
+/// quadratic non-residue root (hence the `0x0b` prefix of
+/// [`Generator::H_BYTES`]).
+const H_Y_HEX: &str = "31d3c6863973926e049e637cb1b5f40a36dac28af1766968c30c2313f3a38904";
+
 /// Prefix byte of a serialized [`Commitment`] whose `y` is a quadratic residue.
 const COMMITMENT_TAG: u8 = 0x08;
 /// Prefix byte of a serialized [`Generator`] whose `y` is a quadratic residue.
@@ -497,14 +505,13 @@ impl Generator {
     /// Returns the fixed second generator `H` used by Confidential
     /// Transactions.
     pub fn h() -> Generator {
-        let f = Field::new();
-        // Infallible: `H_BYTES` is a checked constant. The fallback keeps this
-        // panic-free; `h_matches_derivation` asserts it is never taken, since
-        // it would make `h()` return `G` rather than `H`.
-        match parse_tagged(&f, &Self::H_BYTES, GENERATOR_TAG) {
-            Ok(p) => Generator(p),
-            Err(_) => Generator(AffinePoint::generator()),
-        }
+        // Built directly from the hard-coded affine coordinates, so there is
+        // nothing to parse and nothing that can fail: no error path, hence no
+        // fallback that could quietly hand out some other point (a fallback to
+        // `G` would turn every commitment into `(v + r)·G`, neither hiding nor
+        // binding). `h_matches_derivation` pins both coordinates to the
+        // derivation from `G` and to `H_BYTES`.
+        Generator(AffinePoint::from_hex_unchecked(H_X_HEX, H_Y_HEX))
     }
 
     /// Derives the Confidential Assets generator `H_a` for a 32-byte asset tag.
@@ -702,11 +709,12 @@ impl Commitment {
     /// Returns `−self`, the commitment to the negated value and blinding
     /// factor.
     pub fn negate(&self) -> Commitment {
-        // Negating a non-identity point cannot produce the identity.
-        match Commitment::from_point(&self.as_point().negate()) {
-            Ok(c) => c,
-            Err(_) => *self,
-        }
+        // Cannot fail: `self` is an affine (hence non-identity) point, and
+        // negation maps `(x, y)` to `(x, −y)`, which is never the identity. An
+        // `expect` rather than a silent fallback, so a regression in the point
+        // arithmetic can never make `−C` quietly evaluate to `C`.
+        Commitment::from_point(&self.as_point().negate())
+            .expect("negating a non-identity point cannot yield the identity")
     }
 
     /// Returns this commitment as a curve point.
@@ -987,6 +995,45 @@ mod tests {
         assert_eq!(Generator::h().serialize(), Generator::H_BYTES);
         // The x-coordinate is the digest itself: no counter/increment.
         assert_eq!(derived.x_bytes(), digest);
+
+        // `h()` is built from hard-coded affine coordinates without parsing;
+        // pin both coordinates to the derivation, and check that the constant
+        // really is a curve point (the SEC1 decoder validates the equation).
+        let h = Generator::h().0;
+        assert_eq!(h.x_bytes(), derived.x_bytes());
+        assert_eq!(h.y_bytes(), derived.y_bytes());
+        assert_eq!(h.y_bytes()[31] & 1, 0, "H has the even-y root");
+        let reparsed =
+            AffinePoint::from_sec1(&h.to_sec1_uncompressed()).expect("H is on the curve");
+        assert!(bool::from(
+            reparsed.to_projective().ct_eq(&h.to_projective())
+        ));
+        // And it is the same point the serialized form decodes to.
+        let parsed = parse_tagged(&f, &Generator::H_BYTES, GENERATOR_TAG).expect("H_BYTES parses");
+        assert!(bool::from(parsed.to_projective().ct_eq(&h.to_projective())));
+    }
+
+    #[test]
+    fn negate_is_an_involution_and_never_the_identity() {
+        let r = from_hex::<32>("1111111111111111111111111111111111111111111111111111111111111111");
+        let c = Commitment::new(42, &r).unwrap();
+        let neg = c.negate();
+        assert_ne!(neg, c);
+        assert_eq!(neg.negate(), c);
+        // −C + C is the identity, which `add` rejects.
+        assert_eq!(c.add(&neg).unwrap_err(), Error::InvalidInput);
+        // −C(v, r) == C(−v, −r): the commitment to the negated opening.
+        let neg_r = Scalar::from_bytes_be(&r).unwrap().negate();
+        let neg_v = value_scalar(42).negate();
+        let expect = Commitment::from_point(
+            &Generator::h()
+                .0
+                .to_projective()
+                .mul(&neg_v)
+                .add(&ProjectivePoint::mul_generator(&neg_r)),
+        )
+        .unwrap();
+        assert_eq!(neg, expect);
     }
 
     #[test]

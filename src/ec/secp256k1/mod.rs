@@ -270,6 +270,27 @@ impl AffinePoint {
         }
     }
 
+    /// Builds an affine point from big-endian hex coordinates **without**
+    /// validating that it lies on the curve.
+    ///
+    /// Crate-internal, for hard-coded nothing-up-my-sleeve constants (such as
+    /// the Pedersen generator `H`) whose correctness is pinned by a test that
+    /// re-derives them. Because nothing is parsed at run time, the constructor
+    /// cannot fail and therefore needs no fallback — which is the point: a
+    /// fallible parse of a constant invites a "fall back to `G`" branch that
+    /// would silently break the constant's security properties.
+    ///
+    /// A `debug_assert!` checks the curve equation in debug builds.
+    pub(crate) fn from_hex_unchecked(x_hex: &str, y_hex: &str) -> AffinePoint {
+        let x = fe_from_hex(x_hex);
+        let y = fe_from_hex(y_hex);
+        debug_assert!(
+            bool::from(Self::is_on_curve(&field(), &x, &y)),
+            "from_hex_unchecked: constant is not on the curve"
+        );
+        AffinePoint { x, y }
+    }
+
     /// Lifts this affine point into projective coordinates.
     pub fn to_projective(&self) -> ProjectivePoint {
         ProjectivePoint(Point::from_affine(&field(), &self.x, &self.y))
