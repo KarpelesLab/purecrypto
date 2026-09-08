@@ -1054,7 +1054,10 @@ pub fn sign(
 }
 
 /// What [`rewind`] recovers from a proof.
-#[derive(Clone, Debug)]
+///
+/// Everything but the interval bounds is secret: the [`Debug`] rendering
+/// redacts `value`, `blind` and `message`, and dropping the struct wipes them.
+#[derive(Clone)]
 pub struct Rewound {
     /// The exact committed value.
     pub value: u64,
@@ -1070,6 +1073,27 @@ pub struct Rewound {
     pub min_value: u64,
     /// The upper end of the proven interval, as [`verify`] reports it.
     pub max_value: u64,
+}
+
+impl core::fmt::Debug for Rewound {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Rewound")
+            .field("value", &"<redacted>")
+            .field("blind", &"<redacted>")
+            .field("message", &"<redacted>")
+            .field("min_value", &self.min_value)
+            .field("max_value", &self.max_value)
+            .finish()
+    }
+}
+
+impl Drop for Rewound {
+    fn drop(&mut self) {
+        self.value = 0;
+        self.blind = [0u8; 32];
+        self.message.fill(0);
+        let _ = core::hint::black_box((&self.value, &self.blind, &self.message));
+    }
 }
 
 /// Verifies a proof and, using the prover's `nonce`, recovers the value, the
@@ -1663,6 +1687,30 @@ mod tests {
         // A shifted proof of a value at or above 2^63 with a nonzero minimum.
         let big = Commitment::new(u64::MAX, &blind).unwrap();
         assert!(sign(&big, &blind, &nonce, u64::MAX, 1, 0, 0, &[], &[], &h()).is_err());
+    }
+
+    #[test]
+    fn rewound_debug_redacts_the_secrets() {
+        fn hex(bytes: &[u8]) -> alloc::string::String {
+            bytes.iter().map(|b| alloc::format!("{b:02x}")).collect()
+        }
+        let blind = blind_of(59);
+        let nonce = nonce_of(59);
+        let value = 4242u64;
+        let commit = Commitment::new(value, &blind).unwrap();
+        let msg = b"do not print me";
+        let proof = sign(&commit, &blind, &nonce, value, 0, 0, 32, msg, &[], &h()).unwrap();
+        let out = rewind(&commit, &proof, &nonce, &[], &h()).unwrap();
+        assert_eq!(out.blind, blind);
+        let rendered = alloc::format!("{out:?}");
+        assert!(rendered.contains("Rewound"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&hex(&blind)));
+        assert!(!rendered.contains(&hex(&blind).to_uppercase()));
+        assert!(!rendered.contains("4242"));
+        assert!(!rendered.contains("0x11"));
+        assert!(!rendered.contains("do not print me"));
+        assert!(rendered.contains(&alloc::format!("min_value: {}", out.min_value)));
     }
 
     // --- no panics on hostile input ---
