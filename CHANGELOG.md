@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.3](https://github.com/KarpelesLab/purecrypto/compare/v0.8.2...v0.8.3) - 2026-09-08
+
+### Added
+
+- *(dtls)* accept cookies under the previous cookie secret across a rotation
+- *(dtls)* DTLS 1.3 post-handshake KeyUpdate and NewSessionTicket
+
+### Fixed
+
+- *(falcon)* make the FPEMU branch-free (constant-time fpr arithmetic)
+- *(tls)* forward previous_cookie_secret and max_record_size to the DTLS engines
+- *(dtls)* fragment handshake messages across MTU-sized records; hard-error record overflow
+- *(dtls)* keep the epoch-2 read keys after the handshake so a retransmitted Finished is re-ACKed
+- *(dtls)* make the DTLS 1.3 hello wire format match RFC 9147 §5.3
+- *(tls)* surface truncation as UnexpectedEof in the blocking Stream adapter
+- *(tls)* deliver read-path replies and fatal alerts on the tokio/mio surfaces
+- *(tls)* bind the post-HRR PSK binder to the HRR-inclusive transcript
+- *(cli)* stamp the persisted crlnumber counter into emitted CRLs as cRLNumber
+- *(signature_registry)* add SignaturePolicy::try_permit for fallible allow-list ids
+- *(cli)* require a real CA cert + its own key for x509 -req and ca issue/sign-csr
+- *(tls)* verify the signing key matches the leaf certificate at config time
+- *(quic)* let PTO probes past a full congestion window (RFC 9002 §7.5)
+- *(quic)* per-path anti-amplification accounting (RFC 9000 §8.1, §9.3.1)
+
+### Other
+
+- *(falcon)* document the constant-time FPEMU contract
+- *(falcon)* snapshot the variable-time fpr as a test-only reference
+
 ## [0.8.2](https://github.com/KarpelesLab/purecrypto/compare/v0.8.1...v0.8.2) - 2026-09-08
 
 ### Added
