@@ -84,11 +84,12 @@ impl PrivateKey for Ed448PrivateKey {
         let mut p = params.reader();
         let context = p.context();
         p.finish()?;
-        let sig = if context.is_empty() {
-            self.sign(msg)
-        } else {
-            self.sign_ctx(msg, context)
-        };
+        // `try_sign_ctx` (not the panicking `sign_ctx`): a context longer
+        // than 255 bytes — the `dom4` length octet — is a caller parameter
+        // error, never a panic reachable through the facade.
+        let sig = self
+            .try_sign_ctx(msg, context)
+            .map_err(|_| Error::InvalidParams)?;
         Ok(sig.to_bytes().to_vec())
     }
 }

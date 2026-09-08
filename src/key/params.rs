@@ -210,6 +210,11 @@ impl<'a> SignParams<'a> {
     }
 
     /// Sets the context string (Ed448 / ML-DSA / SLH-DSA) or SM2 signer ID.
+    ///
+    /// Ed448, ML-DSA and SLH-DSA encode the context length in a single
+    /// octet, so a context longer than 255 bytes is rejected at signing time
+    /// with [`Error::InvalidParams`](crate::key::Error::InvalidParams) (it
+    /// never panics). SM2 accepts IDs up to 8191 bytes (`ENTLA` is 16 bits).
     pub fn context(mut self, context: &'a [u8]) -> Self {
         self.context = context;
         self.set |= F_CONTEXT;

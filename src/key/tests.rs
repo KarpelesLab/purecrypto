@@ -259,6 +259,29 @@ fn unsupported_param_is_rejected() {
         .expect("default params ok");
 }
 
+/// An Ed448 context longer than 255 bytes (the `dom4` length octet) must be
+/// reported as a parameter error through the facade, not panic.
+#[test]
+fn ed448_oversize_context_is_invalid_params_not_panic() {
+    let mut r = rng();
+    let sk = crate::ec::Ed448PrivateKey::generate(&mut r);
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let long = [0x41u8; 256];
+
+    let params = SignParams::new().context(&long);
+    match priv_dyn.sign(b"m", &params, &mut r) {
+        Err(Error::InvalidParams) => {}
+        other => panic!("expected InvalidParams, got {other:?}"),
+    }
+    // The 255-byte maximum is accepted and round-trips.
+    let params = SignParams::new().context(&long[..255]);
+    let sig = priv_dyn
+        .sign(b"m", &params, &mut r)
+        .expect("255-byte context");
+    let pub_dyn = priv_dyn.public_key().unwrap();
+    pub_dyn.verify(b"m", &sig, &params).expect("verify");
+}
+
 // ----------------------------------------------------------------------------
 // Generic decoders: PKCS#8 / SPKI -> Box<dyn ...>, then operate
 // ----------------------------------------------------------------------------
