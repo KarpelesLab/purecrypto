@@ -7265,6 +7265,107 @@ mod audit_regression_tests {
         assert!(!client.is_handshaking(), "the connection must be dead");
     }
 
+    /// TLS-CORE-3 — a received fatal alert returned `AlertReceived` from the
+    /// TLS 1.2 engines without parking them in `Closed`, so they kept
+    /// processing records and reporting `is_handshaking()`. The 1.3 core
+    /// closes; the 1.2 client must too.
+    #[test]
+    fn tls12_client_closes_on_fatal_alert() {
+        use crate::tls::codec::write_record;
+        use crate::tls::conn::{ClientConfig12, ClientConnection12};
+        use crate::tls::{AlertDescription, ContentType, ProtocolVersion};
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"alert12-c", b"nonce", &[]);
+        let mut client = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "loopback.example",
+            &mut crng,
+        )
+        .unwrap();
+        let _ch = client.write_tls();
+
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Alert,
+            ProtocolVersion::TLSv1_2,
+            &[2, AlertDescription::HandshakeFailure.as_u8()],
+        );
+        client.read_tls(&rec);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::AlertReceived(AlertDescription::HandshakeFailure))
+        ));
+        assert!(!client.is_handshaking(), "a fatal alert ends the handshake");
+        assert!(matches!(
+            client.send_application_data(b"x"),
+            Err(Error::InappropriateState)
+        ));
+
+        // Nothing further is processed: even a well-formed handshake record
+        // is refused now that the engine is closed.
+        let mut hs = Vec::new();
+        write_record(
+            &mut hs,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &[0u8, 0, 0, 0], // HelloRequest
+        );
+        client.read_tls(&hs);
+        assert!(client.process_new_packets().is_err());
+    }
+
+    /// TLS-CORE-3 — server-side twin of `tls12_client_closes_on_fatal_alert`.
+    #[test]
+    fn tls12_server_closes_on_fatal_alert() {
+        use crate::tls::codec::write_record;
+        use crate::tls::conn::{ServerConfig12, ServerConnection12};
+        use crate::tls::{AlertDescription, ContentType, ProtocolVersion};
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let server_config = ServerConfig12::with_rsa(alloc::vec![der], boxed);
+        let srng = HmacDrbg::<Sha256>::new(b"alert12-s", b"nonce", &[]);
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Alert,
+            ProtocolVersion::TLSv1_2,
+            &[2, AlertDescription::InternalError.as_u8()],
+        );
+        server.read_tls(&rec);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::AlertReceived(AlertDescription::InternalError))
+        ));
+        assert!(!server.is_handshaking());
+        assert!(matches!(
+            server.send_application_data(b"x"),
+            Err(Error::InappropriateState)
+        ));
+
+        // A ClientHello arriving afterwards must not start a handshake.
+        let mut crng = HmacDrbg::<Sha256>::new(b"alert12-c2", b"nonce", &[]);
+        let mut client = crate::tls::conn::ClientConnection12::new(
+            crate::tls::conn::ClientConfig12::new(RootCertStore::new()),
+            "loopback.example",
+            &mut crng,
+        )
+        .unwrap();
+        server.read_tls(&client.write_tls());
+        assert!(server.process_new_packets().is_err());
+        assert!(server.write_tls().is_empty() || !server.is_handshaking());
+    }
+
     /// LOW 9 — after the client's `Finished`, 1-RTT application data must
     /// land in the regular receive buffer. Leaving the 0-RTT routing armed
     /// diverted fully-authenticated bytes into the replayable early-data

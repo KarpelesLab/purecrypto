@@ -730,7 +730,16 @@ impl<R: RngCore> ServerConnection12<R> {
                         AlertDescription::UserCanceled | AlertDescription::NoRenegotiation => {
                             continue;
                         }
-                        _ => return Err(Error::AlertReceived(alert.description)),
+                        _ => {
+                            // Any other alert (fatal, or a warning we do not
+                            // recognise as benign) ends the connection: park
+                            // the engine in `Closed` so no further records
+                            // are processed and writes are refused
+                            // (RFC 5246 §7.2.2), matching the TLS 1.3 core.
+                            self.state = State::Closed;
+                            self.ccs_window_open = false;
+                            return Err(Error::AlertReceived(alert.description));
+                        }
                     }
                 }
                 Ok(None) => return Ok(()),
