@@ -2,7 +2,7 @@
 
 use super::MontModulus;
 use super::Uint;
-use crate::ct::{Choice, ConditionallySelectable};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 
 impl<const LIMBS: usize> MontModulus<LIMBS> {
     /// Computes `base^exp mod N` in constant time, for `base < N`.
@@ -58,10 +58,12 @@ impl<const LIMBS: usize> MontModulus<LIMBS> {
             // make the load address depend on the secret exponent.
             // Note the argument order: this crate's `conditional_select(a, b, c)`
             // returns `a` when `c` is true (inverted from the `subtle` crate),
-            // so the matching entry goes first.
+            // so the matching entry goes first. The index comparison itself
+            // goes through `ct_eq` (branch-free by construction) rather than a
+            // `==` the compiler is free to lower to a data-dependent branch.
             let mut sel = table[0];
             for (j, t) in table.iter().enumerate() {
-                sel = Uint::conditional_select(t, &sel, Choice::from((j == idx) as u8));
+                sel = Uint::conditional_select(t, &sel, j.ct_eq(&idx));
             }
             // Unconditional: a zero window multiplies by the Montgomery 1.
             acc = self.mont_mul(&acc, &sel);

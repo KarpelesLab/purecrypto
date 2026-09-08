@@ -8,7 +8,7 @@ use super::boxed::{BoxedUint, adc_limbs, sbb_limbs, select_limbs};
 use super::montgomery::inv_mod_2_64;
 use super::mul::mac;
 use super::uint::{Limb, adc, sbb};
-use crate::ct::{Choice, ConditionallySelectable};
+use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -366,10 +366,12 @@ impl BoxedMontModulus {
                 }
 
                 let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit].
+                // Constant-time gather of table[digit]. The index comparison
+                // goes through `ct_eq` (branch-free by construction) rather
+                // than a `==` the compiler may lower to a branch on the secret.
                 sel.copy_from_slice(&table[0]);
                 for (j, entry) in table.iter().enumerate() {
-                    let hit = Choice::from((j == digit) as u8);
+                    let hit = j.ct_eq(&digit);
                     for (s, e) in sel.iter_mut().zip(entry.iter()) {
                         *s = Limb::conditional_select(e, s, hit);
                     }
