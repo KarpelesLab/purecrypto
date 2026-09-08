@@ -33,6 +33,17 @@ use alloc::vec::Vec;
 /// An OID, as the arc vector the x509 layer produces.
 type Oid = Vec<u64>;
 
+/// Upper bound on the total number of nodes the `valid_policy_tree` may
+/// hold. RFC 5280 places no limit, but with `m` policies fully cross-mapped
+/// (`policyMappings` sending each of the `m` issuer-domain policies to all
+/// `m` subject-domain policies) every certificate multiplies the leaf row by
+/// `m`, giving `m^d` nodes at depth `d` — the CVE-2023-0464 shape. A validly
+/// signed chain of a handful of certificates is enough to exhaust memory.
+/// OpenSSL caps the tree at 1000 nodes after that CVE; so do we, failing
+/// closed with `BadCertificate`. Real-world paths carry a few nodes per
+/// level, so the cap is nowhere near legitimate use.
+const MAX_POLICY_TREE_NODES: usize = 1000;
+
 /// Caller-supplied initial conditions for policy processing (RFC 5280 §6.1.1
 /// inputs). Construct via [`PolicyOptions::require`]; the default
 /// [`PolicyOptions::none`] disables policy processing entirely.
@@ -311,6 +322,10 @@ fn process_certificate_policies(
         .collect();
 
     let mut new_nodes: Vec<Node> = Vec::new();
+    // Every node added below goes through this bound check (see
+    // `MAX_POLICY_TREE_NODES`): the check is per-push, not once at commit
+    // time, so the transient `new_nodes` row cannot itself grow unbounded.
+    let existing = tree.nodes.len();
 
     // (d)(1): for each policy P (not anyPolicy) in certificatePolicies:
     for p in &concrete {
@@ -324,12 +339,16 @@ fn process_certificate_policies(
                 .any(|e| e.as_slice() == p.as_slice())
             {
                 matched = true;
-                new_nodes.push(Node {
-                    valid_policy: (*p).clone(),
-                    expected_policy_set: alloc::vec![(*p).clone()],
-                    parent: pi,
-                    depth: new_depth,
-                });
+                push_node(
+                    existing,
+                    &mut new_nodes,
+                    Node {
+                        valid_policy: (*p).clone(),
+                        expected_policy_set: alloc::vec![(*p).clone()],
+                        parent: pi,
+                        depth: new_depth,
+                    },
+                )?;
             }
         }
         // (d)(1)(ii): if no node matched and a parent leaf has
@@ -337,12 +356,16 @@ fn process_certificate_policies(
         if !matched {
             for &pi in &parent_leaves {
                 if tree.nodes[pi].valid_policy.as_slice() == oid::ANY_POLICY {
-                    new_nodes.push(Node {
-                        valid_policy: (*p).clone(),
-                        expected_policy_set: alloc::vec![(*p).clone()],
-                        parent: pi,
-                        depth: new_depth,
-                    });
+                    push_node(
+                        existing,
+                        &mut new_nodes,
+                        Node {
+                            valid_policy: (*p).clone(),
+                            expected_policy_set: alloc::vec![(*p).clone()],
+                            parent: pi,
+                            depth: new_depth,
+                        },
+                    )?;
                 }
             }
         }
@@ -361,12 +384,16 @@ fn process_certificate_policies(
                     .iter()
                     .any(|nn| nn.parent == pi && nn.valid_policy == e);
                 if !already {
-                    new_nodes.push(Node {
-                        valid_policy: e.clone(),
-                        expected_policy_set: alloc::vec![e.clone()],
-                        parent: pi,
-                        depth: new_depth,
-                    });
+                    push_node(
+                        existing,
+                        &mut new_nodes,
+                        Node {
+                            valid_policy: e.clone(),
+                            expected_policy_set: alloc::vec![e.clone()],
+                            parent: pi,
+                            depth: new_depth,
+                        },
+                    )?;
                 }
             }
         }
@@ -377,6 +404,17 @@ fn process_certificate_policies(
         tree.nodes.push(node);
     }
     tree.depth = new_depth;
+    Ok(())
+}
+
+/// Appends `node` to the row under construction unless doing so would take
+/// the tree (the `existing` committed nodes plus this row) past
+/// [`MAX_POLICY_TREE_NODES`], in which case the path is rejected.
+fn push_node(existing: usize, new_nodes: &mut Vec<Node>, node: Node) -> Result<(), Error> {
+    if existing + new_nodes.len() >= MAX_POLICY_TREE_NODES {
+        return Err(Error::BadCertificate);
+    }
+    new_nodes.push(node);
     Ok(())
 }
 
@@ -929,5 +967,158 @@ mod tests {
         assert!(verify(&store, &chain, &PolicyOptions::none()).is_err());
         // Policy-aware path: processed; chain valid for POLICY_A.
         verify(&store, &chain, &PolicyOptions::require(&[POLICY_A])).unwrap();
+    }
+
+    /// Builds `[leaf, int_k, ..., int_1]` — `intermediates` CA certificates
+    /// below the anchor, each carrying `int_exts`, and a leaf carrying
+    /// `leaf_exts`. All CAs reuse key B (names differ per level), so the
+    /// path is signature-valid; only the policy extensions vary.
+    fn build_deep_chain(
+        intermediates: usize,
+        int_exts: &[Extension],
+        leaf_exts: &[Extension],
+    ) -> (RootCertStore, Vec<Vec<u8>>) {
+        let root_k = rsa_test_key_a();
+        let root_b = boxed(&root_k);
+        let ca_b = boxed(&rsa_test_key_b());
+        let root_name = DistinguishedName::common_name("Policy Root");
+        let root = Certificate::self_signed(&root_k, &root_name, &validity(), 1, true).unwrap();
+
+        let mut int_all = vec![extension::basic_constraints(true, None)];
+        int_all.extend_from_slice(int_exts);
+        let mut top_down: Vec<Vec<u8>> = Vec::new();
+        let mut issuer_name = root_name;
+        let mut signer: &BoxedRsaPrivateKey = &root_b;
+        for i in 0..intermediates {
+            let name = DistinguishedName::common_name(&alloc::format!("Policy Intermediate {i}"));
+            let cert = Certificate::issue_with_extensions(
+                &CertSigner::Rsa(signer),
+                &issuer_name,
+                &name,
+                &crate::x509::AnyPublicKey::Rsa(ca_b.public_key()),
+                &validity(),
+                2 + i as u64,
+                &int_all,
+            )
+            .unwrap();
+            top_down.push(cert.to_der().to_vec());
+            issuer_name = name;
+            signer = &ca_b;
+        }
+
+        let mut leaf_all = vec![
+            extension::basic_constraints(false, None),
+            extension::subject_alt_name(&[crate::x509::GeneralName::Dns("leaf.example".into())]),
+        ];
+        leaf_all.extend_from_slice(leaf_exts);
+        let leaf = Certificate::issue_with_extensions(
+            &CertSigner::Rsa(signer),
+            &issuer_name,
+            &DistinguishedName::common_name("leaf.example"),
+            &crate::x509::AnyPublicKey::Rsa(ca_b.public_key()),
+            &validity(),
+            100,
+            &leaf_all,
+        )
+        .unwrap();
+
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let mut chain = vec![leaf.to_der().to_vec()];
+        chain.extend(top_down.into_iter().rev());
+        (store, chain)
+    }
+
+    /// `m` distinct test policy OIDs.
+    fn policy_set(m: u64) -> Vec<Vec<u64>> {
+        (0..m)
+            .map(|i| vec![1, 3, 6, 1, 4, 1, 99999, 100 + i])
+            .collect()
+    }
+
+    /// PKI-3 (CVE-2023-0464 shape): every CA asserts `m` policies and maps
+    /// each of them to all `m` — the tree then has `m^d` nodes at depth `d`.
+    /// With m = 10 a path of three CAs plus the leaf would need
+    /// 1 + 10 + 100 + 1000 nodes; the 1000-node cap rejects it (quickly),
+    /// while the same construction one level shallower (111 nodes) is
+    /// still accepted, so the cap does not trip on moderate fan-out.
+    #[test]
+    fn exponential_policy_tree_is_capped() {
+        let policies = policy_set(10);
+        let refs: Vec<&[u64]> = policies.iter().map(|p| p.as_slice()).collect();
+        let pairs: Vec<(&[u64], &[u64])> = refs
+            .iter()
+            .flat_map(|a| refs.iter().map(move |b| (*a, *b)))
+            .collect();
+        assert_eq!(pairs.len(), 100);
+        let int_exts = [
+            extension::certificate_policies(&refs),
+            extension::policy_mappings(&pairs),
+        ];
+        let leaf_exts = [extension::certificate_policies(&refs)];
+
+        // 4-cert path: rejected by the node cap.
+        let (store, chain) = build_deep_chain(3, &int_exts, &leaf_exts);
+        assert_eq!(chain.len(), 4);
+        assert_eq!(
+            verify(&store, &chain, &PolicyOptions::require(&[refs[0]])),
+            Err(crate::tls::Error::BadCertificate)
+        );
+
+        // 2-cert path (111 nodes): the same policies validate.
+        let (store, chain) = build_deep_chain(1, &int_exts, &leaf_exts);
+        assert_eq!(chain.len(), 2);
+        verify(&store, &chain, &PolicyOptions::require(&[refs[0]])).unwrap();
+    }
+
+    /// PKI-3: 20 policies fully cross-mapped is 400 `policyMappings` pairs —
+    /// over the per-certificate parse cap — so the chain is rejected at parse
+    /// time before any tree is built. The parse caps themselves: 256 entries
+    /// accepted, 257 rejected, for both extensions.
+    #[test]
+    fn policy_extension_entry_caps() {
+        let policies = policy_set(20);
+        let refs: Vec<&[u64]> = policies.iter().map(|p| p.as_slice()).collect();
+        let pairs: Vec<(&[u64], &[u64])> = refs
+            .iter()
+            .flat_map(|a| refs.iter().map(move |b| (*a, *b)))
+            .collect();
+        assert_eq!(pairs.len(), 400);
+        let int_exts = [
+            extension::certificate_policies(&refs),
+            extension::policy_mappings(&pairs),
+        ];
+        let leaf_exts = [extension::certificate_policies(&refs)];
+        let (store, chain) = build_deep_chain(3, &int_exts, &leaf_exts);
+        assert_eq!(
+            verify(&store, &chain, &PolicyOptions::require(&[refs[0]])),
+            Err(crate::tls::Error::BadCertificate)
+        );
+
+        // Boundary of the parse caps, on a self-signed cert.
+        let key = boxed(&rsa_test_key_a());
+        let build = |exts: &[Extension]| {
+            Certificate::self_signed_with_extensions(
+                &CertSigner::Rsa(&key),
+                &DistinguishedName::common_name("Cap Test"),
+                &validity(),
+                1,
+                exts,
+            )
+            .unwrap()
+        };
+        let many = policy_set(257);
+        let many_refs: Vec<&[u64]> = many.iter().map(|p| p.as_slice()).collect();
+        let ok = build(&[extension::certificate_policies(&many_refs[..256])]);
+        assert_eq!(ok.certificate_policies().unwrap().unwrap().0.len(), 256);
+        let over = build(&[extension::certificate_policies(&many_refs)]);
+        assert!(over.certificate_policies().is_err());
+
+        let map_pairs: Vec<(&[u64], &[u64])> =
+            many_refs.iter().map(|p| (*p, many_refs[0])).collect();
+        let ok = build(&[extension::policy_mappings(&map_pairs[..256])]);
+        assert_eq!(ok.policy_mappings().unwrap().unwrap().0.len(), 256);
+        let over = build(&[extension::policy_mappings(&map_pairs)]);
+        assert!(over.policy_mappings().is_err());
     }
 }

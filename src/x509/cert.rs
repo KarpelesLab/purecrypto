@@ -20,6 +20,15 @@ use crate::rsa::{RsaPrivateKey, RsaPublicKey};
 
 const PEM_LABEL: &str = "CERTIFICATE";
 
+/// Upper bound on the `PolicyInformation` entries accepted in one
+/// `certificatePolicies` extension, and on the pairs accepted in one
+/// `policyMappings` extension. Both feed RFC 5280 §6.1 policy-tree
+/// processing, whose growth is the product of these counts across the path
+/// (see `tls::pki::policy::MAX_POLICY_TREE_NODES`); bounding the per-cert
+/// fan-out keeps the parse itself, and the transient work before the tree
+/// cap fires, small. Real certificates carry a handful of entries.
+const MAX_POLICY_ENTRIES: usize = 256;
+
 /// A parsed/owned X.509 certificate, stored as its DER encoding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Certificate {
@@ -845,6 +854,9 @@ impl Certificate {
     /// `policyIdentifier` of each `PolicyInformation` is needed for path
     /// validation). The second flag of the tuple reports whether the
     /// extension was marked critical.
+    ///
+    /// At most 256 `PolicyInformation` entries are accepted; a longer list is
+    /// rejected as malformed (it bounds RFC 5280 §6.1 policy-tree fan-out).
     #[allow(clippy::type_complexity)]
     pub fn certificate_policies(&self) -> Result<Option<(Vec<Vec<u64>>, bool)>, Error> {
         let mut out: Option<(Vec<Vec<u64>>, bool)> = None;
@@ -866,6 +878,9 @@ impl Certificate {
                         .iter()
                         .any(|p: &Vec<u64>| p.as_slice() == pid.as_slice())
                     {
+                        return Err(Error::Malformed);
+                    }
+                    if oids.len() >= MAX_POLICY_ENTRIES {
                         return Err(Error::Malformed);
                     }
                     oids.push(pid);
@@ -891,6 +906,9 @@ impl Certificate {
     ///
     /// RFC 5280 §4.2.1.5: a CA MUST NOT map to or from `anyPolicy`; such a
     /// mapping is rejected as malformed.
+    ///
+    /// At most 256 pairs are accepted; a longer list is rejected as
+    /// malformed (it bounds RFC 5280 §6.1 policy-tree fan-out).
     #[allow(clippy::type_complexity)]
     pub fn policy_mappings(&self) -> Result<Option<(Vec<(Vec<u64>, Vec<u64>)>, bool)>, Error> {
         let mut out: Option<(Vec<(Vec<u64>, Vec<u64>)>, bool)> = None;
@@ -911,6 +929,9 @@ impl Certificate {
                     // RFC 5280 §4.2.1.5: neither domain policy may be anyPolicy.
                     if issuer.as_slice() == oid::ANY_POLICY || subject.as_slice() == oid::ANY_POLICY
                     {
+                        return Err(Error::Malformed);
+                    }
+                    if pairs.len() >= MAX_POLICY_ENTRIES {
                         return Err(Error::Malformed);
                     }
                     pairs.push((issuer, subject));
