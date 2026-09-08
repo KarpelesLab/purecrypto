@@ -662,3 +662,114 @@ fn unacked_key_update_eventually_closes_13() {
         Err(crate::tls::Error::InappropriateState)
     );
 }
+
+// ---------------------------------------------------------------------
+// DTLS-I3: epoch-2 grace window at the end of the handshake
+// (RFC 9147 §5.8.3 / §8).
+// ---------------------------------------------------------------------
+
+/// The server's ACK of the client Finished is lost. The client's single
+/// timer-driven retransmission (still epoch 2, fresh record number) must be
+/// decrypted with the retained epoch-2 keys and re-ACKed, so the client
+/// completes without any further retransmit.
+#[test]
+fn server_reacks_retransmitted_client_finished_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i3-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"i3-server");
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+    // Server → client ACK: lost.
+    let lost = server.pop_outbound_datagrams();
+    assert!(!lost.is_empty());
+    assert!(client.next_timeout().is_some(), "Finished still in flight");
+
+    // One retransmit.
+    let t = client.next_timeout().unwrap();
+    client.on_timeout(t);
+    let retx = client.pop_outbound_datagrams();
+    assert_eq!(retx.len(), 1, "exactly the Finished is re-sent");
+    assert_eq!(retx[0][0] & 0b11, 2, "re-sent under epoch 2");
+    for dg in &retx {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(
+        server.is_handshake_complete(),
+        "duplicate Finished is harmless"
+    );
+    let reack = server.pop_outbound_datagrams();
+    assert!(
+        !reack.is_empty(),
+        "server must re-ACK the retransmitted Finished"
+    );
+    for dg in &reack {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(
+        client.next_timeout().is_none(),
+        "the re-ACK releases the Finished: no further retransmits"
+    );
+    app_data_round_trip(&mut client, &mut server);
+}
+
+/// Mirror image: the client's ACKs (and its Finished) are lost, so the
+/// server retransmits its epoch-2 flight. The already-connected client must
+/// decrypt those copies with the retained epoch-2 keys and ACK them rather
+/// than drop them — and must not be derailed by the duplicates. (The ACKs
+/// travel under epoch 3, which the server only starts reading once the
+/// client's Finished arrives; the Finished retransmit then implicitly
+/// acknowledges the whole server flight.)
+#[test]
+fn client_reacks_retransmitted_server_flight_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i3c-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"i3c-server");
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    let flight = server.pop_outbound_datagrams();
+    for dg in &flight {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    let _lost_client_output = client.pop_outbound_datagrams();
+
+    let t = server.next_timeout().expect("server flight in flight");
+    server.on_timeout(t);
+    let retx = server.pop_outbound_datagrams();
+    assert_eq!(retx.len(), flight.len(), "whole flight re-sent");
+    for dg in &retx {
+        client.feed_datagram(dg).unwrap();
+    }
+    let acks = client.pop_outbound_datagrams();
+    assert!(!acks.is_empty(), "client re-ACKs the epoch-2 copies");
+    assert!(
+        acks.iter().all(|dg| dg[0] >= 32 && (dg[0] & 0b11) == 3),
+        "only protected epoch-3 (ACK) records, no new handshake output"
+    );
+    assert!(client.is_handshake_complete(), "duplicates are harmless");
+    for dg in &acks {
+        server.feed_datagram(dg).unwrap();
+    }
+    // The client's Finished retransmit completes the server.
+    let t = client.next_timeout().unwrap();
+    client.on_timeout(t);
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.next_timeout().is_none());
+    app_data_round_trip(&mut client, &mut server);
+}

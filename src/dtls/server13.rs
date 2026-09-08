@@ -1721,13 +1721,20 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
         self.transcript.update(raw);
 
-        // Install application keys atomically.
+        // Install application keys atomically. The epoch-2 read keys are
+        // retired, not dropped (RFC 9147 §5.8.3 / §8): if our ACK for this
+        // Finished is lost, the client retransmits it under epoch 2, and
+        // that copy must still decrypt so we can re-ACK it — otherwise the
+        // client keeps retransmitting until its budget is spent (DTLS-I3).
+        // The reassembler recognises the duplicate `message_seq` and drops
+        // it; only the ACK matters.
         self.write_crypter = self.pending_write_app_crypter.take();
         self.write_sn_key = self.write_app_sn_key.take();
         self.enc_write_epoch = 3;
         self.enc_write_seq = 0;
-        self.read = self.pending_read_app.take();
-        self.prev_read = None;
+        let app_read = self.pending_read_app.take();
+        self.prev_read = core::mem::replace(&mut self.read, app_read);
+        self.prev_read_grace = 0;
         // RFC 9147 §7.1: the client's Finished is the responding flight to
         // our entire server flight — everything we sent is implicitly
         // acknowledged. Drop the in-flight set and disarm the retransmit

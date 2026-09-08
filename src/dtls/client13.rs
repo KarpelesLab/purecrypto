@@ -1455,8 +1455,15 @@ impl DtlsClientConnection13 {
         self.write_sn_key = self.write_app_sn_key.take();
         self.enc_write_epoch = 3;
         self.enc_write_seq = 0;
-        self.read = self.pending_read_app.take();
-        self.prev_read = None;
+        // The epoch-2 read keys are retired, not dropped (RFC 9147 §5.8.3
+        // / §8): if our ACKs for the server flight are lost, the server
+        // retransmits it under epoch 2, and those copies must still decrypt
+        // so we can re-ACK them instead of leaving the server to resend the
+        // whole flight on every backoff step (DTLS-I3). The reassembler
+        // drops the duplicate `message_seq`s; only the ACKs matter.
+        let app_read = self.pending_read_app.take();
+        self.prev_read = core::mem::replace(&mut self.read, app_read);
+        self.prev_read_grace = 0;
 
         self.state = State::Connected;
         Ok(())
