@@ -452,13 +452,12 @@ mod tests {
             "77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a",
         ));
         for (i, bad) in small_order.iter().enumerate() {
+            // Every entry is low-order, `u = 1` included: it is the order-4
+            // point (`2·(1, v) = (0, 0)`), and a clamped scalar is a multiple
+            // of 8, so the product is the identity and the output is zero.
             let r = sk.diffie_hellman(bad);
-            // The "u = 1" case is not low-order (it's the canonical edge); skip
-            // index 1 from the rejection assertion if its result is non-zero.
-            if i == 1 {
-                continue;
-            }
             assert_eq!(r, Err(X25519Error::SmallOrderPeer), "vector {i}");
+            assert_eq!(x25519(&sk.to_bytes(), bad), [0u8; 32], "vector {i}");
         }
     }
 }

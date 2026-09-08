@@ -516,4 +516,39 @@ mod tests {
             b.diffie_hellman(&a.public_key()).unwrap()
         );
     }
+
+    #[test]
+    fn rejects_small_order_peer() {
+        // The low-order u-coordinates on Curve448: u = 0 (the order-2 point)
+        // and u = ±1 (the order-4 points, on the curve or its twist), plus
+        // the non-canonical spellings u = p and u = p + 1 which reduce to 0
+        // and 1. A clamped scalar is a multiple of 4, so every product is
+        // the identity and `x448` yields the all-zero output, which
+        // `diffie_hellman` must surface as an error rather than returning
+        // silently (RFC 8446 §7.4.2).
+        let mut u_one = [0u8; 56];
+        u_one[0] = 1;
+        // p = 2^448 − 2^224 − 1: bytes 0..28 = ff, byte 28 = fe, 29..56 = ff.
+        let mut u_p = [0xffu8; 56];
+        u_p[28] = 0xfe;
+        let mut u_p_minus_1 = u_p;
+        u_p_minus_1[0] = 0xfe;
+        let mut u_p_plus_1 = [0u8; 56];
+        u_p_plus_1[28] = 0xff;
+        u_p_plus_1[29..].fill(0xff);
+        let small_order = [[0u8; 56], u_one, u_p_minus_1, u_p, u_p_plus_1];
+
+        let sk = X448PrivateKey::from_bytes(hex56(
+            "9a8f4925d1519f5775cf46b04b5800d4ee9ee8bae8bc5565d498c28d\
+             d9c9baf574a9419744897391006382a6f127ab1d9ac2d8c0a598726b",
+        ));
+        for (i, bad) in small_order.iter().enumerate() {
+            assert_eq!(x448(&sk.to_bytes(), bad), [0u8; 56], "vector {i}");
+            assert_eq!(
+                sk.diffie_hellman(bad),
+                Err(X448Error::SmallOrderPeer),
+                "vector {i}"
+            );
+        }
+    }
 }
