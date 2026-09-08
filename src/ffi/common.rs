@@ -38,6 +38,10 @@ pub enum PcStatus {
     /// The configuration is incomplete or inconsistent for the requested
     /// role (e.g. a cookie-requiring DTLS server with no peer address).
     BadConfig = -12,
+    /// The private key handed to `pc_tls_cfg_set_certificate` /
+    /// `pc_quic_cfg_set_certificate` is not the key the leaf certificate
+    /// certifies (both parsed fine — they just belong to different pairs).
+    KeyMismatch = -13,
 }
 
 /// Runs `f`, converting any panic into [`PcStatus::Internal`] so unwinding never

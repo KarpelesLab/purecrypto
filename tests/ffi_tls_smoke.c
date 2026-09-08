@@ -51,9 +51,22 @@ int main(void) {
     return fail("pc_ec_self_signed_pem");
   pc_ec_free(server_key);
 
-  /* 3. Server config: TLS 1.3, present (cert, key). */
+  /* 3. Server config: TLS 1.3, present (cert, key). A key from a different
+   * pair must be refused up front with PC_KEY_MISMATCH. */
   PcTlsCfg *scfg = pc_tls_cfg_new(PC_TLS_SERVER, PC_TLS_1_3);
   if (!scfg) return fail("pc_tls_cfg_new server");
+  {
+    PcEcKey *other_key = pc_ec_generate(PC_P256);
+    if (!other_key) return fail("pc_ec_generate (other)");
+    uint8_t other_pem[1024];
+    size_t other_pem_len = sizeof(other_pem);
+    if (pc_ec_private_to_pem(other_key, other_pem, &other_pem_len) != PC_OK)
+      return fail("pc_ec_private_to_pem (other)");
+    pc_ec_free(other_key);
+    if (pc_tls_cfg_set_certificate(scfg, cert_pem, cert_pem_len,
+                                   other_pem, other_pem_len) != PC_KEY_MISMATCH)
+      return fail("pc_tls_cfg_set_certificate accepted a mismatched key");
+  }
   if (pc_tls_cfg_set_certificate(scfg, cert_pem, cert_pem_len,
                                  key_pem, key_pem_len) != PC_OK)
     return fail("pc_tls_cfg_set_certificate");

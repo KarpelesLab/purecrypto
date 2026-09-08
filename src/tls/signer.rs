@@ -59,6 +59,21 @@ pub trait HandshakeSigner: Send + Sync {
     /// sign (the signer applies the scheme's own hash/padding); the engine has
     /// already framed them. Returns a non-blocking [`SignOp`] driving the work.
     fn start_sign(&self, scheme: u16, message: &[u8]) -> Result<Box<dyn SignOp>, Error>;
+
+    /// The DER `SubjectPublicKeyInfo` of the public half of this key, when the
+    /// signer can produce it.
+    ///
+    /// Used by
+    /// [`ConfigBuilder::try_private_key`](super::ConfigBuilder::try_private_key)
+    /// to verify up front that the key belongs to the leaf certificate it is
+    /// installed with, instead of letting the mismatch surface as an opaque
+    /// signature failure on the peer. The default is `None` ("unknown"), which
+    /// skips the check — a device driver that can read the public key back
+    /// (PKCS#11 `CKA_PUBLIC_KEY_INFO`, a TPM `ReadPublic`) should override it.
+    /// [`LocalSigner`] always returns it.
+    fn public_key_spki(&self) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 /// Former name of [`HandshakeSigner`].
@@ -277,6 +292,11 @@ impl HandshakeSigner for LocalSigner {
         let (_scheme, sig) =
             super::crypto::sign_certificate_verify(&server_key, message, &mut crate::rng::OsRng)?;
         Ok(Box::new(ReadySignOp { sig: Some(sig) }))
+    }
+
+    fn public_key_spki(&self) -> Option<Vec<u8>> {
+        // `None` only for the misuse case of wrapping `SigningKey::External`.
+        self.key.public_key().map(|pk| pk.to_spki_der())
     }
 }
 

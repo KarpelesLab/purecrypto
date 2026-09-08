@@ -236,7 +236,8 @@ pub(crate) fn run_server(args: Args) {
         let key = load_signing_key(&key_path);
         let mut builder = TlsConfig::builder()
             .versions(PcVersion::TLSv1_3, PcVersion::TLSv1_3)
-            .identity(chain, key)
+            .try_identity(chain, key)
+            .unwrap_or_else(|e| die(crate::util::identity_error(&cert_path, &key_path, e)))
             .alpn(alpn.clone());
         if let Some(sink) = keylog.clone() {
             builder = builder.key_log(sink);

@@ -30,6 +30,7 @@ const STATUS = {
   '-10': 'closed',
   '-11': 'TLS alert',
   '-12': 'bad config',
+  '-13': 'private key does not match certificate',
 };
 
 export class PcError extends Error {

@@ -155,7 +155,8 @@ pub(crate) fn run(args: Args) {
     let mut builder = Config::builder()
         .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
         .versions(version.to_pc_version(), version.to_pc_version())
-        .identity(chain, key)
+        .try_identity(chain, key)
+        .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)))
         .max_record_size(mtu);
     if let Some(a) = alpn {
         builder = builder.alpn(a);

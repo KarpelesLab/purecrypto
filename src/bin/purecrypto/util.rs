@@ -637,6 +637,19 @@ pub(crate) fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
     out
 }
 
+/// The diagnostic for a `ConfigBuilder::try_identity` failure: names both
+/// files and says plainly when the key belongs to a different pair. Shared by
+/// `s_server`, `s_client` (mTLS) and the QUIC driver.
+pub(crate) fn identity_error(cert_path: &str, key_path: &str, e: purecrypto::tls::Error) -> String {
+    match e {
+        purecrypto::tls::Error::IdentityKeyMismatch => format!(
+            "private key {key_path} does not match the certificate in {cert_path} \
+             (its public key differs from the leaf's SubjectPublicKeyInfo)"
+        ),
+        other => format!("cannot use {cert_path} + {key_path} as an identity: {other}"),
+    }
+}
+
 /// Opens `path` as the destination for an NSS `SSLKEYLOGFILE` dump. Unix mode
 /// `0o600`, append-only — multiple connections in the same process append to
 /// the same file. Shared by the TLS and QUIC drivers.

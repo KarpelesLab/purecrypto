@@ -94,12 +94,75 @@ pub struct Identity {
     pub key: SigningKey,
 }
 
+impl SigningKey {
+    /// The public half of this key as an algorithm-agnostic
+    /// [`AnyPublicKey`](crate::x509::AnyPublicKey), or `None` for
+    /// [`SigningKey::External`], which holds no key material in-process.
+    pub fn public_key(&self) -> Option<crate::x509::AnyPublicKey> {
+        use crate::x509::AnyPublicKey;
+        Some(match self {
+            SigningKey::Rsa(k) => AnyPublicKey::Rsa(k.public_key()),
+            SigningKey::Ecdsa(k) => AnyPublicKey::Ecdsa(k.public_key()),
+            SigningKey::Ed25519(k) => AnyPublicKey::Ed25519(k.public_key()),
+            SigningKey::Ed448(k) => AnyPublicKey::Ed448(k.public_key()),
+            #[cfg(feature = "mldsa")]
+            SigningKey::MlDsa44(k) => AnyPublicKey::MlDsa44(k.public_key()),
+            #[cfg(feature = "mldsa")]
+            SigningKey::MlDsa65(k) => AnyPublicKey::MlDsa65(k.public_key()),
+            #[cfg(feature = "mldsa")]
+            SigningKey::MlDsa87(k) => AnyPublicKey::MlDsa87(k.public_key()),
+            SigningKey::External { .. } => return None,
+        })
+    }
+}
+
 impl Identity {
     /// Construct an [`Identity`] from a cert chain (leaf first) and its
     /// signing key. Cross-crate-friendly alternative to literal construction,
     /// which is forbidden by `#[non_exhaustive]`.
+    ///
+    /// Performs no consistency check; call
+    /// [`check_key_matches_leaf`](Self::check_key_matches_leaf) (or build via
+    /// [`ConfigBuilder::try_identity`]) to verify the key belongs to the leaf.
     pub fn new(cert_chain: Vec<Vec<u8>>, key: SigningKey) -> Self {
         Self { cert_chain, key }
+    }
+
+    /// Verify that the signing key is the key the leaf certificate certifies.
+    ///
+    /// Compares the key's public half with the leaf's `SubjectPublicKeyInfo`
+    /// as canonical SPKI re-encodings (see
+    /// [`Certificate::subject_public_key_matches`](crate::x509::Certificate::subject_public_key_matches)),
+    /// so encoding differences such as `id-RSASSA-PSS` vs `rsaEncryption`
+    /// do not matter. Errors:
+    ///
+    /// * [`Error::IdentityKeyMismatch`](super::Error::IdentityKeyMismatch) —
+    ///   the key does not belong to the leaf;
+    /// * [`Error::BadCertificate`](super::Error::BadCertificate) — the chain
+    ///   is empty or the leaf (or its SPKI) does not parse.
+    ///
+    /// A [`SigningKey::External`] carries no key material and passes
+    /// unconditionally — the [`HandshakeSigner`](super::HandshakeSigner) path
+    /// checks the signer's declared public key instead (see
+    /// [`ConfigBuilder::try_private_key`]).
+    pub fn check_key_matches_leaf(&self) -> Result<(), super::Error> {
+        match self.key.public_key() {
+            Some(pk) => leaf_certifies(&self.cert_chain, &pk),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Shared body of [`Identity::check_key_matches_leaf`] and
+/// [`ConfigBuilder::try_private_key`]: does `chain[0]` certify `key`?
+fn leaf_certifies(chain: &[Vec<u8>], key: &crate::x509::AnyPublicKey) -> Result<(), super::Error> {
+    let leaf_der = chain.first().ok_or(super::Error::BadCertificate)?;
+    let leaf = crate::x509::Certificate::from_der(leaf_der.clone())
+        .map_err(|_| super::Error::BadCertificate)?;
+    match leaf.subject_public_key_matches(key) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(super::Error::IdentityKeyMismatch),
+        Err(_) => Err(super::Error::BadCertificate),
     }
 }
 
@@ -560,7 +623,14 @@ impl ConfigBuilder {
         self.inner.rng = Some(source);
         self
     }
-    /// Install a cert chain + signing key.
+    /// Install a cert chain + signing key **without** checking that the key
+    /// belongs to the leaf certificate.
+    ///
+    /// Prefer [`try_identity`](Self::try_identity): a key/cert mismatch
+    /// installed here is only detected by the *peer*, as a signature failure
+    /// after a full round trip. This unchecked form exists for callers that
+    /// already validated the pair (or hold a
+    /// [`SigningKey::External`], which cannot be checked here).
     pub fn identity(mut self, chain: Vec<Vec<u8>>, key: SigningKey) -> Self {
         self.inner.identity = Some(Identity {
             cert_chain: chain,
@@ -568,12 +638,31 @@ impl ConfigBuilder {
         });
         self
     }
+    /// Install a cert chain + signing key, first verifying that `key` is the
+    /// key `chain[0]` certifies.
+    ///
+    /// Fails with [`Error::IdentityKeyMismatch`](super::Error::IdentityKeyMismatch)
+    /// when the key's public half differs from the leaf's
+    /// `SubjectPublicKeyInfo` (compared as canonical SPKI, so `id-RSASSA-PSS`
+    /// vs `rsaEncryption` and other encoding differences are immaterial), or
+    /// with [`Error::BadCertificate`](super::Error::BadCertificate) when the
+    /// chain is empty or the leaf does not parse. A [`SigningKey::External`]
+    /// holds no key material and is installed unchecked. See
+    /// [`Identity::check_key_matches_leaf`].
+    pub fn try_identity(self, chain: Vec<Vec<u8>>, key: SigningKey) -> Result<Self, super::Error> {
+        let identity = Identity::new(chain, key);
+        identity.check_key_matches_leaf()?;
+        Ok(self.identity(identity.cert_chain, identity.key))
+    }
     /// Install a cert chain + a transparent pluggable [`HandshakeSigner`](super::HandshakeSigner)
     /// (TPM/HSM or in-process via [`LocalSigner`](super::LocalSigner)).
     ///
     /// The engine advertises `key.schemes()` and parks at the identity
     /// signature; [`super::Connection::drive`] then brokers the signature
     /// through `key` so the caller never hand-manages it.
+    ///
+    /// Performs no key/certificate consistency check; see
+    /// [`try_private_key`](Self::try_private_key).
     pub fn private_key(
         mut self,
         chain: Vec<Vec<u8>>,
@@ -587,6 +676,30 @@ impl ConfigBuilder {
         });
         self.inner.signer = Some(key);
         self
+    }
+    /// [`private_key`](Self::private_key) plus an up-front check that the
+    /// signer's key is the one `chain[0]` certifies.
+    ///
+    /// The signer declares its public half through
+    /// [`HandshakeSigner::public_key_spki`](super::HandshakeSigner::public_key_spki);
+    /// when it does, the SPKI must parse (else
+    /// [`Error::Decode`](super::Error::Decode)) and match the leaf's
+    /// (else [`Error::IdentityKeyMismatch`](super::Error::IdentityKeyMismatch);
+    /// an unparseable leaf is [`Error::BadCertificate`](super::Error::BadCertificate)).
+    /// A signer that returns `None` (the trait default — a device that cannot
+    /// read its public key back) is installed unchecked, exactly as
+    /// `private_key` would; the mismatch then surfaces on the peer.
+    pub fn try_private_key(
+        self,
+        chain: Vec<Vec<u8>>,
+        key: Arc<dyn super::signer::HandshakeSigner>,
+    ) -> Result<Self, super::Error> {
+        if let Some(spki) = key.public_key_spki() {
+            let declared = crate::x509::AnyPublicKey::from_spki_der(&spki)
+                .map_err(|_| super::Error::Decode)?;
+            leaf_certifies(&chain, &declared)?;
+        }
+        Ok(self.private_key(chain, key))
     }
     /// Replace the trust anchors.
     pub fn roots(mut self, store: RootCertStore) -> Self {
@@ -922,5 +1035,127 @@ impl SigningKey {
             SigningKey::Ecdsa(k) => Some(super::conn::ServerConfig12::with_ecdsa(chain, k.clone())),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ec::Ed25519PrivateKey;
+    use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+    use alloc::vec;
+
+    /// A self-signed Ed25519 leaf for `key`, as a one-element DER chain.
+    fn chain_for(key: &Ed25519PrivateKey) -> Vec<Vec<u8>> {
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(key),
+            &DistinguishedName::common_name("id.example"),
+            &validity,
+            1,
+            false,
+            &["id.example"],
+        )
+        .unwrap();
+        vec![cert.to_der().to_vec()]
+    }
+
+    /// `try_identity` accepts the key the leaf certifies and rejects any
+    /// other key with a distinct, config-time error (the mismatch used to be
+    /// visible only as a signature failure on the peer).
+    #[test]
+    fn try_identity_rejects_key_that_does_not_match_leaf() {
+        let right = Ed25519PrivateKey::from_bytes([0x11; 32]);
+        let wrong = Ed25519PrivateKey::from_bytes([0x22; 32]);
+        let chain = chain_for(&right);
+
+        assert!(
+            Config::builder()
+                .try_identity(chain.clone(), SigningKey::Ed25519(right.clone()))
+                .is_ok()
+        );
+        let err = Config::builder()
+            .try_identity(chain.clone(), SigningKey::Ed25519(wrong.clone()))
+            .err()
+            .expect("mismatched key must be rejected");
+        assert!(
+            matches!(err, super::super::Error::IdentityKeyMismatch),
+            "{err:?}"
+        );
+
+        // Same for the `Identity`-level check and for an empty / garbage chain.
+        assert!(
+            Identity::new(chain.clone(), SigningKey::Ed25519(right))
+                .check_key_matches_leaf()
+                .is_ok()
+        );
+        assert!(matches!(
+            Identity::new(chain, SigningKey::Ed25519(wrong.clone())).check_key_matches_leaf(),
+            Err(super::super::Error::IdentityKeyMismatch)
+        ));
+        assert!(matches!(
+            Identity::new(Vec::new(), SigningKey::Ed25519(wrong.clone())).check_key_matches_leaf(),
+            Err(super::super::Error::BadCertificate)
+        ));
+        assert!(matches!(
+            Identity::new(vec![vec![0x30, 0x00]], SigningKey::Ed25519(wrong))
+                .check_key_matches_leaf(),
+            Err(super::super::Error::BadCertificate)
+        ));
+        // An external key has nothing to compare and passes.
+        assert!(
+            Identity::new(
+                vec![vec![0x30, 0x00]],
+                SigningKey::External {
+                    schemes: vec![0x0807]
+                }
+            )
+            .check_key_matches_leaf()
+            .is_ok()
+        );
+    }
+
+    /// `try_private_key` checks the SPKI a `HandshakeSigner` declares
+    /// (`LocalSigner` always does) and skips the check for a signer that
+    /// declares none.
+    #[cfg(feature = "std")]
+    #[test]
+    fn try_private_key_checks_declared_spki() {
+        use super::super::signer::{HandshakeSigner, LocalSigner, SignOp};
+        let right = Ed25519PrivateKey::from_bytes([0x33; 32]);
+        let wrong = Ed25519PrivateKey::from_bytes([0x44; 32]);
+        let chain = chain_for(&right);
+
+        let ok: Arc<dyn HandshakeSigner> = Arc::new(LocalSigner::new(SigningKey::Ed25519(right)));
+        assert!(Config::builder().try_private_key(chain.clone(), ok).is_ok());
+
+        let bad: Arc<dyn HandshakeSigner> = Arc::new(LocalSigner::new(SigningKey::Ed25519(wrong)));
+        assert!(matches!(
+            Config::builder().try_private_key(chain.clone(), bad).err(),
+            Some(super::super::Error::IdentityKeyMismatch)
+        ));
+
+        /// A device-style signer that cannot read its public key back.
+        struct Opaque;
+        impl HandshakeSigner for Opaque {
+            fn schemes(&self) -> Vec<u16> {
+                vec![0x0807]
+            }
+            fn start_sign(
+                &self,
+                _scheme: u16,
+                _message: &[u8],
+            ) -> Result<alloc::boxed::Box<dyn SignOp>, super::super::Error> {
+                Err(super::super::Error::InappropriateState)
+            }
+        }
+        let cfg = Config::builder()
+            .try_private_key(chain, Arc::new(Opaque))
+            .expect("a signer with no declared SPKI is installed unchecked")
+            .build();
+        assert!(cfg.signer.is_some());
     }
 }

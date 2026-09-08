@@ -12,6 +12,8 @@
 //!  - `TlsAlert`   — a fatal TLS alert was received
 //!  - `BadConfig`  — `pc_tls_cfg_validate` found the configuration
 //!    incomplete (today: cookie-requiring DTLS server with no peer address)
+//!  - `KeyMismatch` — `pc_tls_cfg_set_certificate` was handed a private key
+//!    that is not the leaf certificate's key
 
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
@@ -386,9 +388,30 @@ pub unsafe extern "C" fn pc_tls_cfg_set_certificate(
         } else {
             return PcStatus::BadEncoding;
         };
+        // Both halves parsed; now make sure they are the SAME pair. Without
+        // this a wrong key is only detected by the peer, as a signature
+        // failure after a full handshake round trip.
+        if let Err(st) = check_key_matches_leaf(&chain_der, &key.to_signing_key()) {
+            return st;
+        }
         unsafe { &mut *cfg }.cert = Some(CertAndKey { chain_der, key });
         PcStatus::Ok
     })
+}
+
+/// Maps [`Identity::check_key_matches_leaf`](crate::tls::Identity::check_key_matches_leaf)
+/// onto the FFI status space: a key that belongs to a different pair is
+/// [`PcStatus::KeyMismatch`]; a leaf that does not parse is `BadEncoding`.
+pub(super) fn check_key_matches_leaf(
+    chain_der: &[Vec<u8>],
+    key: &SigningKey,
+) -> Result<(), PcStatus> {
+    use crate::tls::{Error, Identity};
+    match Identity::new(chain_der.to_vec(), key.clone()).check_key_matches_leaf() {
+        Ok(()) => Ok(()),
+        Err(Error::IdentityKeyMismatch) => Err(PcStatus::KeyMismatch),
+        Err(_) => Err(PcStatus::BadEncoding),
+    }
 }
 
 /// Sets the ALPN protocol list. `protocols` is an array of `n` NUL-terminated

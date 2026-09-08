@@ -79,7 +79,9 @@ typedef enum {
   PC_WANT_HANDSHAKE = -9,  /* application I/O attempted before handshake done */
   PC_CLOSED = -10,         /* peer's close_notify processed: TLS-level EOF */
   PC_TLS_ALERT = -11,      /* a fatal TLS alert was received */
-  PC_BAD_CONFIG = -12      /* cfg incomplete for its role (pc_tls_cfg_validate) */
+  PC_BAD_CONFIG = -12,     /* cfg incomplete for its role (pc_tls_cfg_validate) */
+  PC_KEY_MISMATCH = -13    /* private key is not the leaf certificate's key
+                              (pc_tls_cfg_set_certificate / pc_quic_cfg_set_certificate) */
 } pc_status;
 
 /* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
@@ -705,6 +707,10 @@ void pc_tls_cfg_free(PcTlsCfg *cfg);
 
 pc_status pc_tls_cfg_add_root_pem(PcTlsCfg *cfg, const uint8_t *pem, size_t len);
 pc_status pc_tls_cfg_set_server_name(PcTlsCfg *cfg, const char *sni);
+/* Installs the cert chain (PEM, leaf first) + its private key (PEM). The key
+ * MUST be the leaf's key: a key from a different pair is rejected up front
+ * with PC_KEY_MISMATCH (both still parse, so this is distinct from
+ * PC_BAD_ENCODING), instead of failing on the peer after a handshake. */
 pc_status pc_tls_cfg_set_certificate(PcTlsCfg *cfg,
                                      const uint8_t *chain_pem, size_t chain_len,
                                      const uint8_t *key_pem, size_t key_pem_len);
@@ -823,6 +829,8 @@ void       pc_quic_cfg_free(PcQuicCfg *cfg);
 
 pc_status pc_quic_cfg_add_root_pem(PcQuicCfg *cfg, const uint8_t *pem, size_t len);
 pc_status pc_quic_cfg_set_server_name(PcQuicCfg *cfg, const char *sni);
+/* As pc_tls_cfg_set_certificate: a key that is not the leaf's returns
+ * PC_KEY_MISMATCH. */
 pc_status pc_quic_cfg_set_certificate(PcQuicCfg *cfg,
                                       const uint8_t *chain_pem, size_t chain_len,
                                       const uint8_t *key_pem,  size_t key_len);

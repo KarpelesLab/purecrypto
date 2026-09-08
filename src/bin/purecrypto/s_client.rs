@@ -206,7 +206,7 @@ pub(crate) fn run(args: Args) {
         .parse()
         .unwrap_or_else(|_| die("-mtu expects a number"));
     let client_id = match (args.value("-cert"), args.value("-key")) {
-        (Some(c), Some(k)) => Some(load_client_identity(c, k)),
+        (Some(c), Some(k)) => Some((c, k, load_client_identity(c, k))),
         (Some(_), None) | (None, Some(_)) => die("both -cert and -key are required for mTLS"),
         _ => None,
     };
@@ -231,8 +231,10 @@ pub(crate) fn run(args: Args) {
     if let Some(a) = alpn {
         builder = builder.alpn(a);
     }
-    if let Some((chain, key)) = client_id {
-        builder = builder.identity(chain, key);
+    if let Some((cert_path, key_path, (chain, key))) = client_id {
+        builder = builder
+            .try_identity(chain, key)
+            .unwrap_or_else(|e| die(crate::util::identity_error(cert_path, key_path, e)));
     }
     if let Some(sink) = keylog {
         builder = builder.key_log(sink);

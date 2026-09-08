@@ -274,6 +274,11 @@ pub unsafe extern "C" fn pc_quic_cfg_set_certificate(
         } else {
             return PcStatus::BadEncoding;
         };
+        // Both halves parsed; now make sure they are the SAME pair (else the
+        // peer is the first to notice, as a CertificateVerify failure).
+        if let Err(st) = super::tls::check_key_matches_leaf(&chain_der, &key.to_signing_key()) {
+            return st;
+        }
         unsafe { &mut *cfg }.cert = Some(CertAndKey { chain_der, key });
         PcStatus::Ok
     })

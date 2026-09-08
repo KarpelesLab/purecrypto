@@ -261,6 +261,15 @@ pub enum Error {
     /// `.rng(alloc::sync::Arc::new(crate::rng::OsRng))` under `std`, or a
     /// hardware [`crate::tls::EntropySource`]). Fail-closed at construction.
     MissingEntropySource,
+    /// The signing key handed to
+    /// [`ConfigBuilder::try_identity`](crate::tls::ConfigBuilder::try_identity)
+    /// (or the public key a [`HandshakeSigner`](crate::tls::HandshakeSigner)
+    /// declares to
+    /// [`try_private_key`](crate::tls::ConfigBuilder::try_private_key)) is
+    /// not the key the leaf certificate certifies. Without this check the
+    /// mismatch only surfaces as an opaque signature failure on the *peer*
+    /// after the handshake has been running for a round trip.
+    IdentityKeyMismatch,
 }
 
 impl core::fmt::Display for Error {
@@ -306,6 +315,9 @@ impl core::fmt::Display for Error {
             }
             Error::MissingEntropySource => {
                 f.write_str("Config has no entropy source (set ConfigBuilder::rng)")
+            }
+            Error::IdentityKeyMismatch => {
+                f.write_str("signing key does not match the leaf certificate's public key")
             }
         }
     }

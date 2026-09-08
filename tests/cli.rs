@@ -1556,6 +1556,64 @@ fn s_client_s_server_roundtrip_alpn_keylog() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `s_server -cert X -key Y` where Y is a (valid) key from a different pair
+/// than X's leaf must exit up front with a message naming the mismatch,
+/// rather than start serving and fail every client's handshake.
+#[test]
+fn s_server_rejects_key_from_a_different_pair() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_s_server_mismatch_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let wrong_key_path = dir.join("other.key");
+
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let other = Ed25519PrivateKey::generate(&mut OsRng);
+    let validity = Validity::new(
+        Time::utc(2024, 1, 1, 0, 0, 0),
+        Time::utc(2034, 1, 1, 0, 0, 0),
+    );
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &validity,
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&wrong_key_path, other.to_pkcs8_pem()).unwrap();
+
+    let (_out, err, ok) = run_capture(
+        &[
+            "s_server",
+            "-cert",
+            cert_path.to_str().unwrap(),
+            "-key",
+            wrong_key_path.to_str().unwrap(),
+            "-accept",
+            "1",
+            "-www",
+            "-quiet",
+        ],
+        b"",
+    );
+    assert!(
+        !ok,
+        "s_server must refuse a key that is not the certificate's"
+    );
+    assert!(
+        err.contains("does not match the certificate"),
+        "expected a key/cert mismatch diagnostic, got stderr: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "requires network access"]
 fn s_client_live_cloudflare() {

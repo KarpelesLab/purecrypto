@@ -677,6 +677,67 @@ unsafe fn pump_wire(from: *mut tls::PcTls, to: *mut tls::PcTls) {
     }
 }
 
+/// A private key that parses fine but belongs to a different pair than the
+/// leaf certificate must be refused at `set_certificate` time with the
+/// dedicated `KeyMismatch` status (TLS and QUIC configs alike), not accepted
+/// and left for the peer to reject after a handshake.
+#[test]
+fn set_certificate_rejects_key_from_a_different_pair() {
+    use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    let (chain_pem, key_pem) = loopback_identity();
+    let mut rng = crate::rng::HmacDrbg::<crate::hash::Sha256>::new(b"ffi-other-key", b"n", &[]);
+    let other_pem = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng).to_sec1_pem();
+
+    let scfg = tls::pc_tls_cfg_new(1 /* server */, 0x0304);
+    assert!(!scfg.is_null());
+    let st = unsafe {
+        tls::pc_tls_cfg_set_certificate(
+            scfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            other_pem.as_ptr(),
+            other_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::KeyMismatch);
+    // The matching key is still accepted on the same cfg afterwards.
+    let st = unsafe {
+        tls::pc_tls_cfg_set_certificate(
+            scfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            key_pem.as_ptr(),
+            key_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+
+    let qcfg = quic::pc_quic_cfg_new(1 /* server */);
+    assert!(!qcfg.is_null());
+    let st = unsafe {
+        quic::pc_quic_cfg_set_certificate(
+            qcfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            other_pem.as_ptr(),
+            other_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::KeyMismatch);
+    let st = unsafe {
+        quic::pc_quic_cfg_set_certificate(
+            qcfg,
+            chain_pem.as_ptr(),
+            chain_pem.len(),
+            key_pem.as_ptr(),
+            key_pem.len(),
+        )
+    };
+    assert_eq!(st, PcStatus::Ok);
+    unsafe { quic::pc_quic_cfg_free(qcfg) };
+}
+
 #[test]
 fn tls_pop_and_recv_too_small_are_non_destructive() {
     let (chain_pem, key_pem) = loopback_identity();

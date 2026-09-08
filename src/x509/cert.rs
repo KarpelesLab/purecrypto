@@ -635,6 +635,27 @@ impl Certificate {
         super::AnyPublicKey::from_spki_der(self.spki_der()?)
     }
 
+    /// `true` when `key` is the subject public key this certificate certifies.
+    ///
+    /// Both sides are compared as their *canonical* `SubjectPublicKeyInfo`
+    /// re-encoding ([`AnyPublicKey::to_spki_der`]), so the answer is
+    /// independent of how the certificate happened to encode the key — an RSA
+    /// key certified under an `id-RSASSA-PSS` AlgorithmIdentifier still matches
+    /// the same key presented as plain `rsaEncryption`, and non-canonical
+    /// parameter encodings do not cause false negatives. Different algorithms
+    /// (or the same algorithm on a different curve / parameter set) never
+    /// match. Errors only when the certificate's SPKI cannot be parsed.
+    ///
+    /// This is the check behind "does this private key belong to this
+    /// certificate": derive the public key from the private key and pass it
+    /// here (e.g. before installing a TLS identity or signing with a CA key).
+    ///
+    /// [`AnyPublicKey::to_spki_der`]: super::AnyPublicKey::to_spki_der
+    pub fn subject_public_key_matches(&self, key: &super::AnyPublicKey) -> Result<bool, Error> {
+        let certified = self.subject_public_key()?.to_spki_der();
+        Ok(certified == key.to_spki_der())
+    }
+
     /// The DER `SubjectPublicKeyInfo` exactly as encoded in the certificate
     /// (the full tag-length-value), borrowed from the stored DER.
     ///
@@ -1614,6 +1635,35 @@ mod tests {
             Time::utc(2024, 1, 1, 0, 0, 0),
             Time::utc(2034, 1, 1, 0, 0, 0),
         )
+    }
+
+    /// `subject_public_key_matches` is a canonical-SPKI comparison: the
+    /// certified key matches itself and not a different key of the same
+    /// algorithm.
+    #[test]
+    fn subject_public_key_matches_distinguishes_keys() {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::x509::{AnyPublicKey, CertSigner};
+        let key_a = Ed25519PrivateKey::from_bytes([0x11; 32]);
+        let key_b = Ed25519PrivateKey::from_bytes([0x22; 32]);
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key_a),
+            &DistinguishedName::common_name("match.example"),
+            &validity(),
+            1,
+            false,
+            &["match.example"],
+        )
+        .unwrap();
+        assert!(
+            cert.subject_public_key_matches(&AnyPublicKey::Ed25519(key_a.public_key()))
+                .unwrap()
+        );
+        assert!(
+            !cert
+                .subject_public_key_matches(&AnyPublicKey::Ed25519(key_b.public_key()))
+                .unwrap()
+        );
     }
 
     /// Issue #25: `spki_der()` returns the certificate's on-the-wire
