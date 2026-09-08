@@ -3208,3 +3208,490 @@ mod security_regressions {
         assert!(client.send(&ok).is_ok());
     }
 }
+
+/// Regression tests for the DTLS security audit follow-up (2026-09,
+/// findings DTLS-M1 / L1..L7 / I4). Each test is the auditor's
+/// reproduction turned around: the exploit input is fed and the engine is
+/// required to keep working.
+mod audit_2026_09 {
+    use super::*;
+    use crate::dtls::record;
+    use crate::dtls::{
+        ClientConfig13Internal as PcClientConfig13, DtlsClientConnection13, DtlsServerConnection13,
+        ServerConfig13Internal as PcServerConfig13,
+    };
+    use crate::tls::codec::{CipherSuite, NamedGroup, hs_type};
+    use crate::tls::{ContentType, ProtocolVersion};
+
+    fn make_server13_local() -> (PcServerConfig13, Vec<u8>) {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dtls13-audit-key", b"nonce", &[]);
+        let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let name = DistinguishedName::common_name("dtls.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ecdsa(&key),
+            &name,
+            &validity,
+            1,
+            false,
+            &["dtls.example"],
+        )
+        .unwrap();
+        let der = cert.to_der().to_vec();
+        (
+            PcServerConfig13::with_ecdsa(alloc::vec![der.clone()], key),
+            der,
+        )
+    }
+
+    fn client13_cfg(server_cert: &[u8]) -> PcClientConfig13 {
+        let mut roots = RootCertStore::new();
+        roots.add_der(server_cert.to_vec()).unwrap();
+        PcClientConfig13::new(roots, "dtls.example")
+            .with_verification_time(Time::utc(2026, 6, 1, 0, 0, 0))
+    }
+
+    fn client13(cfg: PcClientConfig13, seed: &[u8]) -> DtlsClientConnection13 {
+        let mut crng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsClientConnection13::new(cfg, b"peer-a".to_vec(), &mut crng)
+    }
+
+    fn server13(cfg: PcServerConfig13, seed: &[u8]) -> DtlsServerConnection13<HmacDrbg<Sha256>> {
+        let srng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
+        DtlsServerConnection13::new(Arc::new(cfg), b"peer-a".to_vec(), srng)
+    }
+
+    fn pump13<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection13,
+        server: &mut DtlsServerConnection13<R>,
+    ) -> bool {
+        for _ in 0..32 {
+            let c_out = client.pop_outbound_datagrams();
+            for dg in &c_out {
+                server.feed_datagram(dg).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for dg in &s_out {
+                client.feed_datagram(dg).unwrap();
+            }
+            if c_out.is_empty() && s_out.is_empty() {
+                break;
+            }
+        }
+        client.is_handshake_complete() && server.is_handshake_complete()
+    }
+
+    /// Exchanges one application-data round trip in both directions.
+    fn app_data_round_trip<R: crate::rng::RngCore>(
+        client: &mut DtlsClientConnection13,
+        server: &mut DtlsServerConnection13<R>,
+    ) {
+        client.send(b"ping").unwrap();
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(server.take_received(), b"ping");
+        server.send(b"pong").unwrap();
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert_eq!(client.take_received(), b"pong");
+    }
+
+    /// Raw DTLS handshake fragment: 12-byte header + body.
+    fn raw_fragment(
+        msg_type: u8,
+        total_length: u32,
+        message_seq: u16,
+        fragment_offset: u32,
+        body: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(msg_type);
+        out.extend_from_slice(&total_length.to_be_bytes()[1..]);
+        out.extend_from_slice(&message_seq.to_be_bytes());
+        out.extend_from_slice(&fragment_offset.to_be_bytes()[1..]);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// Splits a plaintext record carrying several handshake fragments
+    /// (the client packs a fragmented CH into ONE record) into one
+    /// datagram per fragment, so a test can interleave other traffic.
+    fn split_record_fragments(dg: &[u8]) -> Vec<Vec<u8>> {
+        let body = &dg[13..];
+        let mut out = Vec::new();
+        let mut off = 0;
+        let mut seq = 100u64;
+        while off < body.len() {
+            let flen = ((body[off + 9] as usize) << 16)
+                | ((body[off + 10] as usize) << 8)
+                | body[off + 11] as usize;
+            let end = off + 12 + flen;
+            out.push(plain_record(seq, &body[off..end]));
+            seq += 1;
+            off = end;
+        }
+        out
+    }
+
+    /// Wraps `fragment` in one plaintext (epoch 0) DTLS record.
+    fn plain_record(seq: u64, fragment: &[u8]) -> Vec<u8> {
+        let mut dg = Vec::new();
+        record::write_record(
+            &mut dg,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            seq,
+            fragment,
+        );
+        dg
+    }
+
+    // -----------------------------------------------------------------
+    // DTLS-M1: a spoofed epoch-0 ClientHello fragment must not be able to
+    // seed the pre-cookie reassembler's expected message_seq.
+    // -----------------------------------------------------------------
+
+    /// One spoofed CH fragment with `message_seq` 1..=8 used to pin the
+    /// pre-cookie buffer's head at that value, after which the genuine
+    /// CH1 (seq 0) / CH2 (seq 1) were dropped as stale for ever.
+    #[test]
+    fn spoofed_msg_seq_fragment_does_not_wedge_pre_cookie_server_13() {
+        for poison_seq in 1..=8u16 {
+            let (server_cfg, cert) = make_server13_local();
+            let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+            let mut client = client13(client13_cfg(&cert), b"m1-client");
+            let mut server = server13(server_cfg, b"m1-server");
+
+            let poison = raw_fragment(hs_type::CLIENT_HELLO, 64, poison_seq, 0, &[0xAA]);
+            server.feed_datagram(&plain_record(0, &poison)).unwrap();
+            assert!(server.pop_outbound_datagrams().is_empty());
+
+            assert!(
+                pump13(&mut client, &mut server),
+                "poison message_seq {poison_seq} wedged the server"
+            );
+            app_data_round_trip(&mut client, &mut server);
+        }
+    }
+
+    /// Slot exhaustion: `PRE_COOKIE_MAX_IN_PROGRESS` spoofed partial
+    /// claims at BOTH legitimate sequence numbers (0 and 1), each with a
+    /// distinct claimed length so they are distinct candidates. A genuine
+    /// client whose ClientHello is fragmented (the default ML-KEM offer is
+    /// ~1.4 KiB, i.e. two fragments) must still complete: FIFO eviction
+    /// recycles the junk.
+    #[test]
+    fn pre_cookie_slot_exhaustion_does_not_wedge_server_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = client13(client13_cfg(&cert), b"m1b-client");
+        let mut server = server13(server_cfg, b"m1b-server");
+
+        // The genuine CH really is fragmented, otherwise the fast path
+        // would sidestep the buffer and prove nothing.
+        let ch_dg = client.pop_outbound_datagrams();
+        assert_eq!(ch_dg.len(), 1);
+        let ch = split_record_fragments(&ch_dg[0]);
+        assert!(ch.len() >= 2, "expected a fragmented ClientHello");
+
+        let mut seq = 0u64;
+        for msg_seq in [0u16, 1] {
+            for i in 0..4u32 {
+                let junk = raw_fragment(hs_type::CLIENT_HELLO, 2000 + i, msg_seq, 0, &[0xAA]);
+                server.feed_datagram(&plain_record(seq, &junk)).unwrap();
+                seq += 1;
+            }
+        }
+        assert!(server.pop_outbound_datagrams().is_empty());
+
+        for dg in &ch {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert!(
+            !hrr.is_empty(),
+            "server must answer the genuine fragmented CH with an HRR"
+        );
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump13(&mut client, &mut server));
+        app_data_round_trip(&mut client, &mut server);
+    }
+
+    /// A spoofed *complete* CH that fails validation (bogus cookie) must
+    /// not flush a genuine fragmented CH that is mid-reassembly.
+    #[test]
+    fn rejected_complete_ch_keeps_partial_genuine_ch_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = client13(client13_cfg(&cert), b"m1c-client");
+        let mut server = server13(server_cfg, b"m1c-server");
+
+        let ch_dg = client.pop_outbound_datagrams();
+        let ch = split_record_fragments(&ch_dg[0]);
+        assert!(ch.len() >= 2, "expected a fragmented ClientHello");
+        server.feed_datagram(&ch[0]).unwrap();
+        // Spoofed complete CH: body is garbage, so it fails to decode and
+        // is dropped silently.
+        let bogus = raw_fragment(hs_type::CLIENT_HELLO, 8, 0, 0, &[0xFF; 8]);
+        server.feed_datagram(&plain_record(99, &bogus)).unwrap();
+        assert!(server.pop_outbound_datagrams().is_empty());
+        for dg in &ch[1..] {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert!(!hrr.is_empty(), "genuine CH must still complete reassembly");
+        for dg in &hrr {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump13(&mut client, &mut server));
+    }
+
+    // -----------------------------------------------------------------
+    // DTLS-L1: the DTLS 1.3 server must not pin any state for a CH2
+    // that still fails key agreement.
+    // -----------------------------------------------------------------
+
+    /// A replayed CH2 (valid cookie) with the X25519 share zeroed fails
+    /// key agreement. Nothing may be pinned: the genuine CH2 must still be
+    /// accepted, and a follow-up spoofed plaintext handshake fragment must
+    /// be a silent drop, not a fatal error.
+    #[test]
+    fn corrupted_share_ch2_variant_does_not_pin_server_state_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut cfg = client13_cfg(&cert);
+        cfg.groups = alloc::vec![NamedGroup::X25519];
+        let mut client = client13(cfg, b"l1-client");
+        let mut server = server13(server_cfg, b"l1-server");
+
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        let c2 = client.pop_outbound_datagrams();
+        assert_eq!(c2.len(), 1);
+        let ch2 = c2[0].clone();
+        // key_share ext: 00 33 | len | shares_len | 00 1d | 00 20 | 32 bytes
+        let pos = ch2
+            .windows(4)
+            .position(|w| w == [0x00, 0x1d, 0x00, 0x20])
+            .expect("x25519 share");
+        let mut bad = ch2.clone();
+        for b in &mut bad[pos + 4..pos + 36] {
+            *b = 0;
+        }
+        assert_eq!(server.feed_datagram(&bad), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+
+        // A spoofed plaintext handshake fragment (which used to hit the
+        // prematurely allocated reassembler and surface UnexpectedMessage).
+        let spoof = raw_fragment(hs_type::FINISHED, 0, 2, 0, &[]);
+        assert_eq!(server.feed_datagram(&plain_record(9, &spoof)), Ok(()));
+        assert!(server.pop_outbound_datagrams().is_empty());
+
+        // Genuine CH2 now completes the handshake.
+        server.feed_datagram(&ch2).unwrap();
+        let flight = server.pop_outbound_datagrams();
+        assert!(!flight.is_empty(), "server must answer the genuine CH2");
+        for dg in &flight {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump13(&mut client, &mut server));
+
+        // Once the handshake state exists, plaintext handshake fragments
+        // are still a silent drop.
+        assert_eq!(server.feed_datagram(&plain_record(10, &spoof)), Ok(()));
+        app_data_round_trip(&mut client, &mut server);
+    }
+
+    // -----------------------------------------------------------------
+    // DTLS-L4: DTLS 1.3 client-side cipher-suite / HRR checks.
+    // -----------------------------------------------------------------
+
+    /// The client offers only AES-256-GCM; a ServerHello patched to select
+    /// AES-128-GCM (a crate-supported but NOT offered suite) must be
+    /// rejected.
+    #[test]
+    fn client13_rejects_non_offered_suite_in_server_hello() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut cfg = client13_cfg(&cert);
+        cfg.cipher_suites = alloc::vec![CipherSuite(0x1302)];
+        let mut client = client13(cfg, b"l4-client");
+        let mut server = server13(server_cfg, b"l4-server");
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let s = server.pop_outbound_datagrams();
+        let mut sh = s[0].clone();
+        assert_eq!(&sh[60..62], &[0x13, 0x02], "expected AES-256 suite in SH");
+        sh[60] = 0x13;
+        sh[61] = 0x01; // AES-128-GCM: never offered
+        // Plaintext (epoch 0) input: a rejected SH is a silent drop. The
+        // observable is that the CH retransmit timer stays armed — an
+        // accepted SH disarms it — and that the genuine SH is still
+        // accepted afterwards (nothing was pinned by the bad one).
+        assert!(client.next_timeout().is_some());
+        assert_eq!(client.feed_datagram(&sh), Ok(()));
+        assert!(
+            client.next_timeout().is_some(),
+            "patched ServerHello was accepted"
+        );
+        assert!(!client.is_handshake_complete());
+        client.feed_datagram(&s[0]).unwrap();
+        assert!(
+            client.next_timeout().is_none(),
+            "genuine SH must disarm the CH timer"
+        );
+        for dg in &s[1..] {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(pump13(&mut client, &mut server));
+    }
+
+    /// RFC 8446 §4.1.4: the ServerHello after an HRR must carry the same
+    /// suite the HRR did. The HRR is patched to a different (offered)
+    /// suite; the server's real SH then mismatches it.
+    #[test]
+    fn client13_rejects_server_hello_suite_differing_from_hrr() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut client = client13(client13_cfg(&cert), b"l4b-client");
+        let mut server = server13(server_cfg, b"l4b-server");
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let hrr = server.pop_outbound_datagrams();
+        assert_eq!(hrr.len(), 1);
+        let mut patched = hrr[0].clone();
+        // ServerHello body: version(2) random(32) sid_len(1) suite(2) —
+        // suite sits at 25 + 35.
+        assert_eq!(&patched[60..62], &[0x13, 0x01], "server picks AES-128");
+        patched[61] = 0x03; // ChaCha20-Poly1305: offered, but not what SH says
+        client.feed_datagram(&patched).unwrap();
+        // CH2 (with the cookie) → genuine SH with suite 0x1301.
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        let flight = server.pop_outbound_datagrams();
+        assert!(!flight.is_empty());
+        assert_eq!(&flight[0][60..62], &[0x13, 0x01]);
+        // Silent drop (plaintext input): the CH2 retransmit timer stays
+        // armed and the handshake never completes.
+        assert!(client.next_timeout().is_some());
+        assert_eq!(client.feed_datagram(&flight[0]), Ok(()));
+        assert!(
+            client.next_timeout().is_some(),
+            "ServerHello with a suite differing from the HRR was accepted"
+        );
+        for dg in &flight[1..] {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(!pump13(&mut client, &mut server));
+        assert!(!client.is_handshake_complete());
+    }
+
+    /// RFC 8446 §4.2.8: an HRR that selects a group CH1 already carried a
+    /// `key_share` for is illegal_parameter.
+    #[test]
+    fn client13_rejects_hrr_selecting_already_offered_group() {
+        use crate::tls::codec::extension as ext;
+        use crate::tls::codec::{ExtensionType, ServerHello};
+        const HRR_RANDOM: [u8; 32] = [
+            0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65,
+            0xB8, 0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2,
+            0xC8, 0xA8, 0x33, 0x9C,
+        ];
+        let (_, cert) = make_server13_local();
+        let mut cfg = client13_cfg(&cert);
+        cfg.groups = alloc::vec![NamedGroup::X25519, NamedGroup::SECP256R1];
+        let mut client = client13(cfg, b"l4c-client");
+        let _ = client.pop_outbound_datagrams(); // CH1 carries both shares
+
+        let build_hrr = |group: u16| -> Vec<u8> {
+            let mut ks = Vec::new();
+            ks.extend_from_slice(&group.to_be_bytes());
+            let hrr = ServerHello {
+                random: HRR_RANDOM,
+                session_id: Vec::new(),
+                cipher_suite: CipherSuite(0x1301),
+                extensions: alloc::vec![
+                    ext::server_supported_versions(),
+                    (ExtensionType::KEY_SHARE, ks),
+                ],
+            }
+            .encode_dtls();
+            let frag = raw_fragment(
+                hs_type::SERVER_HELLO,
+                (hrr.len() - 4) as u32,
+                0,
+                0,
+                &hrr[4..],
+            );
+            plain_record(0, &frag)
+        };
+        // X25519 was offered with a share: illegal. Plaintext input, so
+        // the rejection is a silent drop — no CH2 is produced and the CH1
+        // retransmit timer stays armed.
+        assert_eq!(
+            client.feed_datagram(&build_hrr(NamedGroup::X25519.0)),
+            Ok(())
+        );
+        assert!(
+            client.pop_outbound_datagrams().is_empty(),
+            "HRR selecting an already-offered group was accepted"
+        );
+        assert!(client.next_timeout().is_some());
+
+        // Control: with only a P-256 share offered, an HRR for X25519 is
+        // legitimate and yields a CH2 carrying exactly that share.
+        let mut cfg = client13_cfg(&cert);
+        cfg.groups = alloc::vec![NamedGroup::X25519, NamedGroup::SECP256R1];
+        cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        let mut client = client13(cfg, b"l4d-client");
+        let _ = client.pop_outbound_datagrams();
+        client
+            .feed_datagram(&build_hrr(NamedGroup::X25519.0))
+            .unwrap();
+        let ch2 = client.pop_outbound_datagrams();
+        assert_eq!(ch2.len(), 1);
+        assert!(ch2[0].windows(4).any(|w| w == [0x00, 0x1d, 0x00, 0x20]));
+    }
+
+    // -----------------------------------------------------------------
+    // DTLS-L5: cookie-required + group-change HRR must complete.
+    // -----------------------------------------------------------------
+
+    /// CH2 narrows `key_share` to the HRR-selected group (RFC 8446
+    /// §4.1.2), so a cookie fingerprint covering the offered share groups
+    /// could never validate CH2. `hrr_upgrades_group` only ran with
+    /// cookies off; this is the same scenario with a cookie secret.
+    #[test]
+    fn hrr_upgrades_group_with_cookie_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_cookie_secret([0xa5; 32]);
+        let mut cfg = client13_cfg(&cert);
+        cfg.groups = alloc::vec![
+            NamedGroup::X25519MLKEM768,
+            NamedGroup::X25519,
+            NamedGroup::SECP256R1,
+        ];
+        cfg.key_share_groups = Some(alloc::vec![NamedGroup::SECP256R1]);
+        let mut client = client13(cfg, b"l5-client");
+        let mut server = server13(server_cfg, b"l5-server");
+        assert!(pump13(&mut client, &mut server));
+        app_data_round_trip(&mut client, &mut server);
+    }
+
+}

@@ -102,6 +102,27 @@ const PRE_COOKIE_MAX_CH_LEN: u32 = 32 * 1024;
 /// claims.
 const PRE_COOKIE_MAX_IN_PROGRESS: usize = 4;
 
+/// Number of fragments the pre-cookie reassembler absorbs without
+/// completing a ClientHello before it is discarded wholesale.
+///
+/// The pre-cookie buffer has no other expiry: nothing is in flight on the
+/// server side while it waits for a ClientHello, so the retransmit timer
+/// (which clears reassembly state on every other path) never fires. A
+/// spoofed partial claim would otherwise sit in the buffer for the life of
+/// the connection object. A legitimate multi-share CH is two or three
+/// fragments; a client retransmitting it a few times stays well within
+/// this budget, while a spoofer's junk is flushed after at most this many
+/// fragments and the genuine client's next retransmit lands in a clean
+/// buffer.
+const PRE_COOKIE_MAX_FRAGMENTS: u32 = 32;
+
+/// Highest `message_seq` a pre-cookie ClientHello fragment may carry. A
+/// first ClientHello is `message_seq = 0`; the post-HelloRetryRequest CH2
+/// is `message_seq = 1` (RFC 9147 §5.2). Nothing higher is legitimate
+/// before the handshake state exists, and a spoofed higher value must not
+/// be allowed to influence which sequence numbers the server will accept.
+const PRE_COOKIE_MAX_MSG_SEQ: u16 = 1;
+
 /// Configuration for a DTLS 1.3 server.
 ///
 /// `pub(crate)`: external users build a [`crate::tls::Config`] and call
@@ -219,7 +240,15 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// ClientHello and post-HRR CH2. A multi-group offer (X25519 + P-256 +
     /// ML-KEM-768) overflows the per-record fragment budget, so CH may arrive
     /// in multiple records before we've allocated `reassembler`.
+    ///
+    /// Only a fragment buffer: its `expected_msg_seq` stays at 0 and is
+    /// never seeded from a peer-supplied `message_seq` (a spoofed
+    /// `message_seq = 3` fragment used to pin it there, after which the
+    /// genuine CH1/CH2 at 0/1 were dropped as stale for ever — DTLS-M1).
     pre_state_reasm: Option<Reassembler>,
+    /// Fragments fed to `pre_state_reasm` since it was created; see
+    /// [`PRE_COOKIE_MAX_FRAGMENTS`].
+    pre_state_reasm_fed: u32,
 
     out_dgrams: Vec<Vec<u8>>,
     app_in: Vec<u8>,
@@ -261,10 +290,10 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Sequence-number protection keys (length matches the AEAD key length:
     /// 16 for AES-128-GCM, 32 for AES-256-GCM and ChaCha20-Poly1305, per
     /// RFC 9147 §4.2.3).
-    write_sn_key: Option<Vec<u8>>,
-    read_sn_key: Option<Vec<u8>>,
-    read_app_sn_key: Option<Vec<u8>>,
-    write_app_sn_key: Option<Vec<u8>>,
+    write_sn_key: Option<crate::tls::crypto::Secret>,
+    read_sn_key: Option<crate::tls::crypto::Secret>,
+    read_app_sn_key: Option<crate::tls::crypto::Secret>,
+    write_app_sn_key: Option<crate::tls::crypto::Secret>,
     pending_read_app_crypter: Option<RecordCrypter>,
     pending_write_app_crypter: Option<RecordCrypter>,
     /// External-signing continuation; `Some` while suspended awaiting the
@@ -323,6 +352,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             out_msg_seq: 0,
             reassembler: None,
             pre_state_reasm: None,
+            pre_state_reasm_fed: 0,
             out_dgrams: Vec::new(),
             app_in: Vec::new(),
             plain_write_epoch: 0,
@@ -596,7 +626,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let Some(sn_key) = self.read_sn_key.as_ref() else {
             return Ok(total);
         };
-        let Ok(mask_full) = sn_mask_for(suite, sn_key, body) else {
+        let Ok(mask_full) = sn_mask_for(suite, sn_key.as_slice(), body) else {
             return Ok(total);
         };
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
@@ -755,57 +785,89 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     return Ok(());
                 }
                 let msg_seq = frag.message_seq;
-                // F3: reject an implausibly large `message_seq` BEFORE seeding
-                // the reassembler. This is the pre-cookie, epoch-0,
-                // unauthenticated path — a hostile ClientHello with
-                // message_seq=0xFFFF would otherwise force up to 65 535
-                // allocate/serialize/parse/feed cycles below. Spoofable
-                // input, so the rejection is a silent drop (RFC 9147
-                // §4.5.2), never connection-fatal.
-                if msg_seq > MAX_HS_MSG_SEQ {
+                // Only `message_seq` 0 (a first CH) or 1 (the post-HRR
+                // CH2) can be a legitimate pre-cookie ClientHello. This
+                // is the epoch-0, unauthenticated path, so the rejection
+                // is a silent drop (RFC 9147 §4.5.2), never fatal —
+                // and, crucially, the value never influences which
+                // sequence numbers the buffer below will accept (DTLS-M1).
+                if msg_seq > PRE_COOKIE_MAX_MSG_SEQ {
                     return Ok(());
                 }
-                let f = HandshakeFragment {
-                    msg_type: frag.msg_type,
-                    total_length: frag.total_length,
-                    message_seq: frag.message_seq,
-                    fragment_offset: frag.fragment_offset,
-                    fragment: frag.fragment,
-                    len: frag.len,
-                };
+                if frag.total_length > PRE_COOKIE_MAX_CH_LEN {
+                    return Ok(());
+                }
                 off += consumed;
-                let reasm = self.pre_state_reasm.get_or_insert_with(|| {
-                    // Catch up to whatever message_seq the client used
-                    // (CH2 after a group-HRR is msg_seq=1, after a
-                    // cookie-HRR is also msg_seq=1). Tight limits: this
-                    // is unauthenticated pre-cookie input, so cap both the
-                    // claimed message size and the number of concurrent
-                    // reassembly candidates (see `PRE_COOKIE_MAX_CH_LEN`
-                    // and `PRE_COOKIE_MAX_IN_PROGRESS`).
-                    let mut r =
-                        Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, PRE_COOKIE_MAX_IN_PROGRESS);
-                    for s in 0..msg_seq {
-                        let mut buf = Vec::new();
-                        write_message(&mut buf, hs_type::CLIENT_HELLO, s, b"", 0);
-                        if let Ok(empty) = read_fragment(&buf) {
-                            let _ = r.feed(empty);
-                        }
+                // Fast path: a complete, unfragmented CH never touches the
+                // fragment buffer, so no amount of buffered junk can keep
+                // it from being processed.
+                let complete =
+                    frag.fragment_offset == 0 && frag.fragment.len() as u32 == frag.total_length;
+                let body = if complete {
+                    frag.fragment.to_vec()
+                } else {
+                    let f = HandshakeFragment {
+                        msg_type: frag.msg_type,
+                        total_length: frag.total_length,
+                        message_seq: frag.message_seq,
+                        fragment_offset: frag.fragment_offset,
+                        fragment: frag.fragment,
+                        len: frag.len,
+                    };
+                    // Flush a buffer that has absorbed too many fragments
+                    // without ever completing a CH: nothing else expires
+                    // it (see `PRE_COOKIE_MAX_FRAGMENTS`).
+                    if self.pre_state_reasm_fed >= PRE_COOKIE_MAX_FRAGMENTS {
+                        self.pre_state_reasm = None;
                     }
-                    r
-                });
-                if let Some((_mt, body)) = reasm.feed(f) {
-                    self.pre_state_reasm = None;
-                    if let Err(e) = self.handle_pre_state_client_hello(msg_seq, &body) {
+                    let fed = &mut self.pre_state_reasm_fed;
+                    let reasm = self.pre_state_reasm.get_or_insert_with(|| {
+                        // Tight limits: unauthenticated pre-cookie input,
+                        // so cap both the claimed message size and the
+                        // number of concurrent reassembly candidates
+                        // (`PRE_COOKIE_MAX_CH_LEN`,
+                        // `PRE_COOKIE_MAX_IN_PROGRESS`). `expected_msg_seq`
+                        // stays at 0: the buffer is never seeded from the
+                        // peer's `message_seq`.
+                        *fed = 0;
+                        Reassembler::with_limits(PRE_COOKIE_MAX_CH_LEN, PRE_COOKIE_MAX_IN_PROGRESS)
+                            .with_fifo_eviction()
+                    });
+                    *fed += 1;
+                    // `feed` dispatches only the head (seq 0); a CH2 at
+                    // seq 1 is collected with `take_complete` so neither
+                    // sequence number gates the other.
+                    let done = match reasm.feed(f) {
+                        Some((_, body)) => Some(body),
+                        None => reasm.take_complete(msg_seq).map(|(_, body)| body),
+                    };
+                    match done {
+                        Some(body) => body,
+                        None => continue,
+                    }
+                };
+                match self.handle_pre_state_client_hello(msg_seq, &body) {
+                    Ok(()) => {
+                        // The CH was accepted (HRR emitted, or the real
+                        // handshake state bootstrapped): whatever the
+                        // fragment buffer still holds is stale.
+                        self.pre_state_reasm = None;
+                        self.pre_state_reasm_fed = 0;
+                    }
+                    Err(e) => {
                         // Everything on this path is unauthenticated,
                         // epoch-0, attacker-spoofable input (a forged
                         // cookie being the most reachable). Per RFC 9147
                         // §4.5.2 these faults are silently dropped so a
                         // single spoofed datagram on the 4-tuple can never
-                        // tear down a legitimate in-flight handshake. The
-                        // one exception is the local fail-closed
-                        // misconfiguration (cookie required but no
-                        // `cookie_secret`), which fires identically for
-                        // the genuine client and must stay loud.
+                        // tear down a legitimate in-flight handshake — and
+                        // a rejected CH leaves the fragment buffer alone,
+                        // so a spoofed complete CH cannot flush a genuine
+                        // fragmented one mid-reassembly. The one exception
+                        // is the local fail-closed misconfiguration (cookie
+                        // required but no `cookie_secret`), which fires
+                        // identically for the genuine client and must stay
+                        // loud.
                         if matches!(e, Error::InappropriateState) {
                             return Err(e);
                         }
@@ -813,6 +875,16 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                     }
                 }
                 continue;
+            }
+            if !authenticated {
+                // Once the handshake state exists, the only handshake
+                // message the client still owes us is its Finished, which
+                // travels in a protected (epoch 2) record. A plaintext
+                // handshake fragment here is therefore spoofed by
+                // construction: it must neither reach the reassembler
+                // (where it could pin `expected_msg_seq`) nor surface a
+                // fatal `UnexpectedMessage` from `dispatch_one` (DTLS-L1).
+                return Ok(());
             }
             let frag = HandshakeFragment {
                 msg_type: frag.msg_type,
@@ -1004,9 +1076,35 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             return Ok(());
         }
 
-        // Set on the cookie-off CH2 path; applied to `self.transcript` only
-        // once the CH2 has passed every check that can still reject it.
-        let mut replay_group_hrr = false;
+        // ---- Validation phase ------------------------------------------
+        //
+        // Everything from here to the commit marker below computes into
+        // locals; `self` is not touched until every check that can still
+        // reject this CH — cookie MAC, aux decoding, share lookup, key
+        // agreement — has passed. Failures on this path are silently
+        // dropped as unauthenticated input (see the caller), so a
+        // partially-applied state change would be permanent: a replayed
+        // CH2 variant with a corrupted `key_share` (the payload is not
+        // covered by the cookie fingerprint) used to pin the suite,
+        // transcript, `out_msg_seq` and a fresh reassembler before key
+        // agreement failed, after which the genuine CH2 was dropped as
+        // stale (DTLS-L1).
+
+        /// Where the post-CH transcript comes from at commit time.
+        enum TranscriptPlan {
+            /// Cookie path: a fully rebuilt `message_hash(CH1) ‖ HRR`.
+            Replace(Transcript),
+            /// Cookie-off group-HRR path: rewrite the CH1-only transcript
+            /// in place as `message_hash(CH1) ‖ HRR`.
+            ReplayGroupHrr,
+            /// Cookie-off, no HRR: start fresh under the picked suite.
+            Fresh,
+        }
+
+        let plan: TranscriptPlan;
+        let sel_suite: SuiteParams;
+        let hrr_group: Option<NamedGroup>;
+        let next_out_msg_seq: u16;
 
         if cookie_required {
             let cookie_bytes = presented_cookie
@@ -1070,11 +1168,6 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 Some(NamedGroup(parked_sel_group_id))
             };
 
-            // Now bootstrap the per-connection handshake state we
-            // deliberately deferred at CH1 time.
-            self.suite = Some(parked_suite);
-            self.hrr_selected_group = parked_sel_group;
-
             // Transcript: build `message_hash(CH1) || HRR` synthetically
             // from the cookie's `Hash(CH1)`. This matches what the
             // pin-then-replace flow does at CH2, but without ever buffering
@@ -1092,72 +1185,62 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             synthetic.push(h_len as u8);
             synthetic.extend_from_slice(parked_hash_ch1);
             t.update(&synthetic);
-            self.transcript = t;
-
-            // The HRR consumed our msg_seq=0 — bring out_msg_seq up to 1 so
-            // ServerHello goes out at msg_seq=1 below.
-            self.out_msg_seq = 1;
-
             // Re-derive the HRR bytes (the same bytes we sent at CH1 time)
-            // so we can update the transcript. We use the *explicit*
-            // builder rather than the `self.suite`-reading helper to make
-            // it explicit that the bytes are reconstructed from cookie aux,
-            // not from `self`.
+            // from the cookie aux, not from `self`.
             let hrr_bytes =
                 Self::build_hrr_bytes_explicit(parked_suite.suite, Some(cookie), parked_sel_group);
-            self.transcript.update(&hrr_bytes);
-        } else {
-            // Cookie-off path: this is CH1 — but we may still need to send a
-            // group-change HRR. Detect that here. If we already sent a
-            // group-change HRR, this is CH2 and we expect `hrr_selected_group`
-            // to be set.
-            if self.hrr_selected_group.is_none() {
-                // Brand-new CH: decide whether to HRR for group.
-                if preferred_share.is_none() {
-                    let group_needed = preferred_group.ok_or(Error::HandshakeFailure)?;
-                    self.suite = Some(suite);
-                    self.hrr_selected_group = Some(group_needed);
-                    // Transcript: stash CH1 hash, then we'll replay via
-                    // message_hash on CH2.
-                    let mut t = Transcript::new();
-                    t.set_alg(suite.hash);
-                    let mut tls_ch = Vec::with_capacity(4 + body.len());
-                    tls_ch.push(hs_type::CLIENT_HELLO);
-                    let n = body.len() as u32;
-                    tls_ch.push(((n >> 16) & 0xff) as u8);
-                    tls_ch.push(((n >> 8) & 0xff) as u8);
-                    tls_ch.push((n & 0xff) as u8);
-                    tls_ch.extend_from_slice(body);
-                    t.update(&tls_ch);
-                    self.transcript = t;
-                    self.emit_hello_retry_request(None)?;
-                    self.state = State::WaitSecondClientHello;
-                    self.out_msg_seq = 1;
-                    let _ = msg_seq;
-                    return Ok(());
-                }
-                // No HRR needed: pin the suite for the CH1 path below.
+            t.update(&hrr_bytes);
+
+            plan = TranscriptPlan::Replace(t);
+            sel_suite = parked_suite;
+            hrr_group = parked_sel_group;
+            // The HRR consumed our msg_seq=0 — ServerHello goes out at 1.
+            next_out_msg_seq = 1;
+        } else if self.hrr_selected_group.is_none() {
+            // Cookie-off path: this is CH1 — but we may still need to send
+            // a group-change HRR.
+            if preferred_share.is_none() {
+                let group_needed = preferred_group.ok_or(Error::HandshakeFailure)?;
                 self.suite = Some(suite);
-            } else {
-                // Cookie-off CH2 (post group-HRR): the transcript must be
-                // rewritten as `message_hash(CH1) ‖ HRR` (RFC 8446 §4.4.1).
-                // DO NOT do it here. `replace_with_message_hash()` is not
-                // idempotent, and the checks immediately below (does CH2
-                // actually carry a share for the group we demanded?) can
-                // still fail. On this cookie-off path those failures are
-                // silently swallowed as unauthenticated input, so a spoofed
-                // CH2 that failed the share check used to leave the
-                // transcript permanently rewritten — and the genuine CH2
-                // then rewrote it a second time, killing the handshake at
-                // Finished. Defer the mutation until after validation, the
-                // way the cookie-required branch above rebuilds a fresh
-                // `Transcript` only once it has authenticated the CH.
-                replay_group_hrr = true;
+                self.hrr_selected_group = Some(group_needed);
+                // Transcript: stash CH1 hash, then we'll replay via
+                // message_hash on CH2.
+                let mut t = Transcript::new();
+                t.set_alg(suite.hash);
+                let mut tls_ch = Vec::with_capacity(4 + body.len());
+                tls_ch.push(hs_type::CLIENT_HELLO);
+                let n = body.len() as u32;
+                tls_ch.push(((n >> 16) & 0xff) as u8);
+                tls_ch.push(((n >> 8) & 0xff) as u8);
+                tls_ch.push((n & 0xff) as u8);
+                tls_ch.extend_from_slice(body);
+                t.update(&tls_ch);
+                self.transcript = t;
+                self.emit_hello_retry_request(None)?;
+                self.state = State::WaitSecondClientHello;
+                self.out_msg_seq = 1;
+                let _ = msg_seq;
+                return Ok(());
             }
+            // No HRR needed: CH1 is the only CH; transcript starts fresh.
+            plan = TranscriptPlan::Fresh;
+            sel_suite = suite;
+            hrr_group = None;
+            next_out_msg_seq = 0;
+        } else {
+            // Cookie-off CH2 (post group-HRR): the transcript must be
+            // rewritten as `message_hash(CH1) ‖ HRR` (RFC 8446 §4.4.1).
+            // `replace_with_message_hash()` is not idempotent and the
+            // checks below can still fail, so the rewrite is deferred to
+            // the commit phase.
+            plan = TranscriptPlan::ReplayGroupHrr;
+            sel_suite = self.suite.ok_or(Error::InappropriateState)?;
+            hrr_group = self.hrr_selected_group;
+            next_out_msg_seq = self.out_msg_seq;
         }
 
         // Pick the actual group + share to use this round.
-        let (selected_group, client_pub) = if let Some(g) = self.hrr_selected_group {
+        let (selected_group, client_pub) = if let Some(g) = hrr_group {
             // CH2 path: must carry exactly the share we requested.
             let share = client_shares
                 .iter()
@@ -1169,18 +1252,32 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let (g, k) = preferred_share.ok_or(Error::HandshakeFailure)?;
             (g, k)
         };
+        let suite = sel_suite;
 
-        let suite = self.suite.ok_or(Error::InappropriateState)?;
+        // Ephemeral key share + shared secret for the selected group. The
+        // last fallible step: a corrupted client share fails here.
+        let (server_pub, mut shared) = self.key_agreement(selected_group, &client_pub)?;
+        let mut sr: Random = [0u8; 32];
+        self.rng.fill_bytes(&mut sr);
 
-        // Every check that can still reject this CH2 has now passed, so it
-        // is safe to perform the non-idempotent transcript rewrite for the
-        // cookie-off group-HRR path (deferred from above).
-        if replay_group_hrr {
-            self.transcript.replace_with_message_hash();
-            let hrr_bytes = self.build_hrr_bytes(None, self.hrr_selected_group);
-            self.transcript.update(&hrr_bytes);
+        // ---- Commit phase ----------------------------------------------
+        // Nothing below can reject the CH any more; apply the negotiated
+        // state in one go.
+        self.suite = Some(suite);
+        self.hrr_selected_group = hrr_group;
+        self.out_msg_seq = next_out_msg_seq;
+        match plan {
+            TranscriptPlan::Replace(t) => self.transcript = t,
+            TranscriptPlan::ReplayGroupHrr => {
+                self.transcript.replace_with_message_hash();
+                let hrr_bytes = self.build_hrr_bytes(None, hrr_group);
+                self.transcript.update(&hrr_bytes);
+            }
+            TranscriptPlan::Fresh => {
+                self.transcript = Transcript::new();
+                self.transcript.set_alg(suite.hash);
+            }
         }
-
         self.client_random = Some(ch.random);
         // CH2 (or first-and-only CH when cookies are off) into the
         // transcript (TLS-shaped).
@@ -1191,12 +1288,6 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         tls_ch.push(((n >> 8) & 0xff) as u8);
         tls_ch.push((n & 0xff) as u8);
         tls_ch.extend_from_slice(body);
-        if !cookie_required && self.hrr_selected_group.is_none() {
-            // Cookie-off, no-HRR path: this is CH1, transcript starts fresh
-            // under the just-picked suite's hash.
-            self.transcript = Transcript::new();
-            self.transcript.set_alg(suite.hash);
-        }
         self.transcript.update(&tls_ch);
 
         // Initialise the reassembler at msg_seq+1.
@@ -1208,13 +1299,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             let _ = reasm.feed(f);
         }
         self.reassembler = Some(reasm);
-
-        // Generate server random + ephemeral key share for the selected
-        // group, derive the shared secret.
-        let mut sr: Random = [0u8; 32];
-        self.rng.fill_bytes(&mut sr);
         self.server_random = Some(sr);
-        let (server_pub, shared) = self.key_agreement(selected_group, &client_pub)?;
 
         // ServerHello with the negotiated group's `key_share`.
         let sh_extensions = alloc::vec![
@@ -1248,6 +1333,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         // Derive handshake traffic secrets and install protected crypters.
         let mut ks = KeySchedule::new(suite.hash);
         ks.enter_handshake(&shared);
+        // The (EC)DHE / KEM shared secret is absorbed into the key
+        // schedule; scrub the heap copy (DTLS-L7).
+        crate::tls::conn::wipe(&mut shared);
         let th = self.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
@@ -1650,7 +1738,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
         encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
 
-        let mask_full = sn_mask_for(suite, sn_key, &inner)?;
+        let mask_full = sn_mask_for(suite, sn_key.as_slice(), &inner)?;
         let mask: &[u8] = if seq_is_16bit {
             &mask_full[..2]
         } else {
@@ -1756,12 +1844,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 let peer: [u8; 32] = client_pub.try_into().map_err(|_| Error::Decode)?;
                 // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject all-zero output.
-                let ss = sk
+                let mut ss = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
                 let pk = sk.public_key().to_vec();
                 self.x25519 = Some(sk);
-                Ok((pk, ss.to_vec()))
+                let out = ss.to_vec();
+                crate::tls::conn::wipe(&mut ss);
+                Ok((pk, out))
             }
             NamedGroup::SECP256R1 => {
                 let sk = BoxedEcdhPrivateKey::generate(CurveId::P256, &mut self.rng);
@@ -1795,10 +1885,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 // before any cryptographic operation on it.
                 let validated_ek = MlKem768EncapsKey::from_bytes_validated(ek)
                     .map_err(|_| Error::IllegalParameter)?;
-                let (ct, ml_ss) = validated_ek.encapsulate(&mut self.rng);
+                let (ct, mut ml_ss) = validated_ek.encapsulate(&mut self.rng);
                 let sk = X25519PrivateKey::generate(&mut self.rng);
                 // RFC 8446 §7.4.2: reject all-zero X25519 contribution.
-                let x_ss = sk
+                let mut x_ss = sk
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
                 // Server share: ML-KEM ciphertext ‖ X25519 key.
@@ -1808,6 +1898,10 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 let mut combined = Vec::with_capacity(64);
                 combined.extend_from_slice(&ml_ss);
                 combined.extend_from_slice(&x_ss);
+                // Only the combined copy survives (the caller wipes it once
+                // the key schedule has absorbed it); scrub the halves.
+                crate::tls::conn::wipe(&mut ml_ss);
+                crate::tls::conn::wipe(&mut x_ss);
                 Ok((share, combined))
             }
             _ => Err(Error::HandshakeFailure),
@@ -1816,10 +1910,19 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 }
 
 /// Builds the canonical CH-content fingerprint that the cookie HMAC binds
-/// to. Covers (cipher_suites, supported_groups, supported_versions,
-/// key_share groups) — every CH field that drives algorithm choice. CH2
-/// must reproduce these byte-for-byte, otherwise cookie validation fails
-/// and the handshake aborts (DTLS-5: cookie binds CH content).
+/// to. Covers (cipher_suites, supported_groups, supported_versions) —
+/// every CH field that drives algorithm choice. CH2 must reproduce these
+/// byte-for-byte, otherwise cookie validation fails and the handshake
+/// aborts (DTLS-5: cookie binds CH content).
+///
+/// `key_share` is deliberately NOT covered, not even the list of offered
+/// groups: RFC 8446 §4.1.2 requires CH2 to replace the `key_share` list
+/// with the single group the HelloRetryRequest selected, so with cookies
+/// required AND a group change the legitimate CH2 can never reproduce
+/// CH1's share list — it used to fail cookie validation for ever
+/// (DTLS-L5). Negotiation is still pinned: `supported_groups` is covered,
+/// and the group the HRR selected travels in the cookie's `aux` payload
+/// and is enforced on CH2.
 fn ch_fingerprint_dtls13(ch: &ClientHello) -> Vec<u8> {
     let mut cs_be = Vec::with_capacity(ch.cipher_suites.len() * 2);
     for cs in &ch.cipher_suites {
@@ -1827,22 +1930,7 @@ fn ch_fingerprint_dtls13(ch: &ClientHello) -> Vec<u8> {
     }
     let groups = ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS);
     let versions = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS);
-    // For `key_share`, we only fingerprint the offered groups (the u16
-    // NamedGroup IDs) — the ephemeral key payload legitimately changes
-    // between CH1 and CH2 when the server requests a different group via
-    // HRR, so it must not be in the fingerprint. The offered groups
-    // themselves, however, must stay constant.
-    let ks_groups = ext::find(&ch.extensions, ExtensionType::KEY_SHARE)
-        .and_then(|body| ext::parse_client_key_shares(body).ok())
-        .map(|shares| {
-            let mut out = Vec::with_capacity(shares.len() * 2);
-            for (g, _) in shares {
-                out.extend_from_slice(&g.0.to_be_bytes());
-            }
-            out
-        })
-        .unwrap_or_default();
-    build_ch_fingerprint(&cs_be, groups, versions, &ks_groups)
+    build_ch_fingerprint(&cs_be, groups, versions, &[])
 }
 
 /// Map [`HashAlg`] to its 1-byte aux tag. Compact, fixed, and reversible

@@ -252,6 +252,9 @@ pub struct DtlsClientConnection13 {
     hrr_selected_group: Option<NamedGroup>,
     /// Set true after one HRR has been processed; a second is rejected.
     hrr_processed: bool,
+    /// Groups CH1 carried a `key_share` for. An HRR selecting one of them
+    /// is a protocol violation (RFC 8446 §4.2.8).
+    offered_share_groups: Vec<NamedGroup>,
 
     /// Transcript hash carried through the handshake.
     transcript: Transcript,
@@ -270,13 +273,13 @@ pub struct DtlsClientConnection13 {
     /// Sequence-number protection key for outgoing records (key length
     /// matches the AEAD key length: 16 for AES-128-GCM, 32 for AES-256-GCM
     /// and ChaCha20-Poly1305, per RFC 9147 §4.2.3).
-    write_sn_key: Option<Vec<u8>>,
+    write_sn_key: Option<Secret>,
     /// Sequence-number protection key for incoming records.
-    read_sn_key: Option<Vec<u8>>,
+    read_sn_key: Option<Secret>,
     /// Application read-side `sn_key`, ready to swap in at our Finished.
-    read_app_sn_key: Option<Vec<u8>>,
+    read_app_sn_key: Option<Secret>,
     /// Application write-side `sn_key`, ready to swap in at our Finished.
-    write_app_sn_key: Option<Vec<u8>>,
+    write_app_sn_key: Option<Secret>,
     /// Application-secret read crypter, parked until our Finished.
     pending_read_app_crypter: Option<RecordCrypter>,
     /// Application-secret write crypter, parked until our Finished.
@@ -342,6 +345,7 @@ impl DtlsClientConnection13 {
             cookie_extension: None,
             hrr_selected_group: None,
             hrr_processed: false,
+            offered_share_groups: Vec::new(),
             transcript: Transcript::new(),
             ks: None,
             client_hs_secret: None,
@@ -589,7 +593,7 @@ impl DtlsClientConnection13 {
         let Some(sn_key) = self.read_sn_key.as_ref() else {
             return Ok(total);
         };
-        let Ok(mask_full) = sn_mask_for(suite, sn_key, body) else {
+        let Ok(mask_full) = sn_mask_for(suite, sn_key.as_slice(), body) else {
             return Ok(total);
         };
         let mask: &[u8] = if (buf[0] & 0b0000_1000) != 0 {
@@ -829,10 +833,21 @@ impl DtlsClientConnection13 {
         if !sh.session_id.is_empty() {
             return Err(Error::IllegalParameter);
         }
-        // The server must have picked one of the suites we offered.
+        // The server must have picked one of the suites WE offered — the
+        // configured list, not the crate-wide `supported_suites()` (which
+        // used to let a patched ServerHello select a suite this client
+        // had deliberately excluded — DTLS-L4).
         let suite = lookup_suite(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
-        if !supported_suites().iter().any(|s| s.suite == suite.suite) {
+        if !self.config.cipher_suites.contains(&suite.suite) {
             return Err(Error::HandshakeFailure);
+        }
+        // RFC 8446 §4.1.4: after a HelloRetryRequest the ServerHello MUST
+        // carry the same cipher suite the HRR did.
+        if self.hrr_processed
+            && let Some(hrr_suite) = self.suite
+            && hrr_suite.suite != suite.suite
+        {
+            return Err(Error::IllegalParameter);
         }
         // Confirm supported_versions = TLS 1.3.
         let sv = ext::find(&sh.extensions, ExtensionType::SUPPORTED_VERSIONS)
@@ -860,7 +875,7 @@ impl DtlsClientConnection13 {
         {
             return Err(Error::IllegalParameter);
         }
-        let shared = self.key_agreement(group, &server_pub)?;
+        let mut shared = self.key_agreement(group, &server_pub)?;
 
         // Commit the transcript to the negotiated hash (suite hash is fixed
         // by the ServerHello, RFC 8446 §4.4.1) and append SH.
@@ -870,6 +885,9 @@ impl DtlsClientConnection13 {
         // Derive handshake traffic secrets.
         let mut ks = KeySchedule::new(suite.hash);
         ks.enter_handshake(&shared);
+        // The (EC)DHE / KEM shared secret is absorbed into the key
+        // schedule; scrub the heap copy (DTLS-L7).
+        crate::tls::conn::wipe(&mut shared);
         let th = self.transcript.current_hash();
         let chts = ks.client_handshake_traffic_secret(th.as_slice());
         let shts = ks.server_handshake_traffic_secret(th.as_slice());
@@ -927,9 +945,10 @@ impl DtlsClientConnection13 {
             return Err(Error::IllegalParameter);
         }
         // HRR carries the same suite the eventual ServerHello will use
-        // (RFC 8446 §4.1.4). Accept any suite we offered.
+        // (RFC 8446 §4.1.4). Accept any suite we offered — checked against
+        // the configured list, not the crate-wide one (DTLS-L4).
         let suite = lookup_suite(hrr.cipher_suite).ok_or(Error::IllegalParameter)?;
-        if !supported_suites().iter().any(|s| s.suite == suite.suite) {
+        if !self.config.cipher_suites.contains(&suite.suite) {
             return Err(Error::IllegalParameter);
         }
         let sv = ext::find(&hrr.extensions, ExtensionType::SUPPORTED_VERSIONS)
@@ -950,6 +969,12 @@ impl DtlsClientConnection13 {
             Some(body) => {
                 let g = ext::parse_hrr_key_share(body)?;
                 if !self.config.groups.contains(&g) {
+                    return Err(Error::IllegalParameter);
+                }
+                // RFC 8446 §4.2.8: the client MUST abort with
+                // illegal_parameter if the HRR selects a group for which
+                // CH1 already carried a key_share (DTLS-L4).
+                if self.offered_share_groups.contains(&g) {
                     return Err(Error::IllegalParameter);
                 }
                 Some(g)
@@ -988,11 +1013,13 @@ impl DtlsClientConnection13 {
             NamedGroup::X25519 => {
                 let peer: [u8; 32] = server_pub.try_into().map_err(|_| Error::Decode)?;
                 // RFC 7748 §6.1 / RFC 8446 §7.4.2: reject all-zero output.
-                let ss = self
+                let mut ss = self
                     .x25519
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
-                Ok(ss.to_vec())
+                let out = ss.to_vec();
+                crate::tls::conn::wipe(&mut ss);
+                Ok(out)
             }
             NamedGroup::SECP256R1 => {
                 let peer = BoxedEcdsaPublicKey::from_sec1(CurveId::P256, server_pub)
@@ -1022,9 +1049,9 @@ impl DtlsClientConnection13 {
                 let peer: [u8; 32] = server_pub[CIPHERTEXT_BYTES..]
                     .try_into()
                     .map_err(|_| Error::Decode)?;
-                let ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
+                let mut ml_ss = self.mlkem.decapsulate(&MlKem768Ciphertext::from_bytes(ct));
                 // RFC 8446 §7.4.2: reject all-zero X25519 contribution.
-                let x_ss = self
+                let mut x_ss = self
                     .x25519
                     .diffie_hellman(&peer)
                     .map_err(|_| Error::IllegalParameter)?;
@@ -1032,6 +1059,10 @@ impl DtlsClientConnection13 {
                 let mut combined = Vec::with_capacity(64);
                 combined.extend_from_slice(&ml_ss);
                 combined.extend_from_slice(&x_ss);
+                // Only the combined copy survives (the caller wipes it once
+                // the key schedule has absorbed it); scrub the halves.
+                crate::tls::conn::wipe(&mut ml_ss);
+                crate::tls::conn::wipe(&mut x_ss);
                 Ok(combined)
             }
             _ => Err(Error::HandshakeFailure),
@@ -1290,6 +1321,10 @@ impl DtlsClientConnection13 {
             }
         }
 
+        if self.hrr_selected_group.is_none() {
+            self.offered_share_groups = key_shares.iter().map(|(g, _)| *g).collect();
+        }
+
         let mut extensions = alloc::vec![ext::supported_groups_list(&groups),];
         if let Some(name) = self.config.server_name.as_deref() {
             extensions.insert(0, ext::server_name(name));
@@ -1413,7 +1448,7 @@ impl DtlsClientConnection13 {
 
         // Compute sn_mask over the first 16 bytes of ciphertext+tag and
         // emit the on-wire record with the masked seq.
-        let mask_full = sn_mask_for(suite, sn_key, &inner)?;
+        let mask_full = sn_mask_for(suite, sn_key.as_slice(), &inner)?;
         let mask: &[u8] = if seq_is_16bit {
             &mask_full[..2]
         } else {
@@ -1541,10 +1576,13 @@ fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
 /// "sn", "", key_length)`). The key length matches the negotiated AEAD's
 /// key length (16 for AES-128-GCM, 32 for AES-256-GCM and
 /// ChaCha20-Poly1305).
-pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Vec<u8> {
+pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Secret {
     let mut out = alloc::vec![0u8; len];
     expand_label_dyn(hash, secret.as_slice(), b"sn", &[], &mut out);
-    out
+    // `Secret` wipes itself on drop; scrub the scratch `Vec` too.
+    let key = Secret::new(&out);
+    crate::tls::conn::wipe(&mut out);
+    key
 }
 
 /// Sequence-number key length for the given AEAD, per RFC 9147 §4.2.3:
