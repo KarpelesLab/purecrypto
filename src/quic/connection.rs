@@ -3218,8 +3218,19 @@ impl QuicConnection {
             // subsequent ones.
             return Ok(());
         }
-        if self.endpoint.sent_first_datagram {
-            // Good — we expected to have already sent our first Initial.
+        if self.peer_packet_seen {
+            // RFC 9000 §17.2.5.2: "After the client has received and
+            // processed an Initial or Handshake packet from the server,
+            // it MUST discard any subsequent Retry packets that it
+            // receives." The Retry integrity tag (RFC 9001 §5.8) is keyed
+            // by a published constant over the cleartext ODCID, so any
+            // on-path observer can forge a validly-tagged Retry after
+            // the ServerHello; acting on it would re-key Initial, rewind
+            // the Initial packet number, redirect `cids.peer` at the
+            // forger's SCID and then reject the genuine server's
+            // transport parameters (no `retry_source_connection_id`) —
+            // a one-packet handshake kill. Discard with no state change.
+            return Ok(());
         }
 
         // Verify integrity tag (RFC 9001 §5.8). The tag is the last 16
@@ -7551,6 +7562,77 @@ mod tests {
             c.endpoint.pn.initial.next_tx, next_tx_before,
             "the Initial packet-number space must not be rewound"
         );
+    }
+
+    /// RFC 9000 §17.2.5.2: "After the client has received and processed an
+    /// Initial or Handshake packet from the server, it MUST discard any
+    /// subsequent Retry packets that it receives." The Retry integrity tag is
+    /// computable by anyone who saw the cleartext ODCID, so without this rule
+    /// an on-path attacker could forge a Retry *after* the ServerHello: the
+    /// client would re-key Initial, rewind its Initial packet number, point
+    /// `cids.peer` at the attacker's SCID and then reject the genuine
+    /// server's transport parameters (missing `retry_source_connection_id`).
+    #[test]
+    fn retry_after_server_initial_is_discarded() {
+        let (mut c, mut s) = loopback_pair();
+
+        // Client Initial → server, server's first flight → client.
+        loop {
+            let dg = c.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            s.feed_datagram(&dg).expect("server feed");
+        }
+        loop {
+            let dg = s.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            c.feed_datagram(&dg).expect("client feed");
+        }
+        assert!(
+            c.peer_packet_seen,
+            "test premise: the client processed a server Initial/Handshake"
+        );
+
+        let odcid = c.original_dcid.expect("client picked a DCID");
+        let peer_before = c.endpoint.cids.peer;
+        let next_tx_before = c.endpoint.pn.initial.next_tx;
+        let attacker_scid = [0xEEu8; 8];
+        assert_ne!(peer_before.as_slice(), &attacker_scid[..]);
+
+        // Validly-tagged forged Retry addressed to us, steering the client
+        // at the attacker's SCID.
+        let forged = build_retry(
+            QUIC_V1,
+            c.endpoint.cids.local.as_slice(),
+            &attacker_scid,
+            b"forged-token",
+            odcid.as_slice(),
+        );
+        c.feed_datagram(&forged).expect("silently discarded");
+
+        assert!(
+            !c.retry_processed,
+            "a Retry after a processed server packet must be discarded"
+        );
+        assert!(c.retry_scid.is_none(), "no retry SCID must be recorded");
+        assert!(c.retry_token.is_empty(), "no retry token must be recorded");
+        assert_eq!(
+            c.endpoint.pn.initial.next_tx, next_tx_before,
+            "the Initial packet-number space must not be rewound"
+        );
+        assert_eq!(
+            c.endpoint.cids.peer.as_slice(),
+            peer_before.as_slice(),
+            "the peer CID must still be the genuine server's SCID"
+        );
+
+        // The genuine handshake still completes.
+        drive_until_complete(&mut c, &mut s, 4);
+        assert!(c.is_handshake_complete());
+        assert!(s.is_handshake_complete());
     }
 
     /// A server never has a preferred address to move to, and a client cannot
