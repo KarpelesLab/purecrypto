@@ -41,8 +41,11 @@ macro_rules! turboshake {
         impl $name {
             /// Creates a TurboSHAKE with domain-separation byte `domain`
             /// (`0x01..=0x7F`).
+            ///
+            /// # Panics
+            /// Panics if `domain` is outside `0x01..=0x7F`.
             pub fn new(domain: u8) -> Self {
-                debug_assert!(
+                assert!(
                     (0x01..=0x7F).contains(&domain),
                     "TurboSHAKE domain must be in 0x01..=0x7F"
                 );
@@ -549,5 +552,20 @@ mod tests {
         h.update(&buf);
         h.finalize_into(&mut b);
         assert_eq!(a, b);
+    }
+
+    // The domain byte doubles as the pad byte and must leave its top bit
+    // clear (the sponge's final `0x80` pad occupies it); it used to be
+    // checked only by `debug_assert!`.
+    #[test]
+    #[should_panic(expected = "TurboSHAKE domain must be in 0x01..=0x7F")]
+    fn turboshake128_rejects_zero_domain() {
+        let _ = TurboShake128::new(0x00);
+    }
+
+    #[test]
+    #[should_panic(expected = "TurboSHAKE domain must be in 0x01..=0x7F")]
+    fn turboshake256_rejects_high_bit_domain() {
+        let _ = TurboShake256::new(0x80);
     }
 }
