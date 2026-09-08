@@ -896,11 +896,12 @@ fn run_crl(args: Args) {
             },
         );
     }
-    // RFC 5280 §5.2.3 makes `cRLNumber` a MUST on conforming CAs. The counter
-    // is allocated (and persisted) here so it advances once per emitted CRL,
-    // but `CrlBuilder` exposes no way to attach a crlExtension, so the number
-    // cannot yet reach the encoded CRL — see the note in `USAGE`/the report.
+    // RFC 5280 §5.2.3 makes `cRLNumber` a MUST on conforming CAs: relying
+    // parties use it to tell a newer CRL from an older one. The persisted
+    // counter is allocated once per emitted CRL (monotonic across
+    // invocations) and stamped into the CRL's crlExtensions.
     let crl_number = allocate_crl_number(&ca);
+    b.crl_number(crl_number);
     let crl = b
         .sign(&root_key.signer())
         .unwrap_or_else(|e| die(format!("cannot sign CRL: {e}")));

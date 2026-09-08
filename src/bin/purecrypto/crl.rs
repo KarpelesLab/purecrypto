@@ -32,6 +32,13 @@ fn text(crl: &CertificateRevocationList) {
     if let Some(n) = next {
         println!("    Next Update: {}", n.as_str());
     }
+    // RFC 5280 §5.2.3 cRLNumber: an unsigned big-endian magnitude of up to
+    // 20 octets, so print it as hex rather than squeezing it into a u64.
+    match crl.crl_number() {
+        Ok(Some(n)) => println!("    CRL Number:  0x{}", crate::util::to_hex(&n)),
+        Ok(None) => println!("    CRL Number:  (absent)"),
+        Err(e) => die(format!("bad cRLNumber: {e}")),
+    }
     let entries = crl
         .entries()
         .unwrap_or_else(|e| die(format!("bad entries: {e}")));

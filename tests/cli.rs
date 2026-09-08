@@ -582,6 +582,44 @@ fn ca_subcommand_full_flow() {
     crl.check_signature_algid_consistent()
         .expect("CRL inner/outer algid should agree");
 
+    // RFC 5280 §5.2.3: the CRL carries the persisted `crlnumber` counter
+    // (`ca init` seeds it at 1) and it increases on every `ca crl`.
+    assert_eq!(
+        crl.crl_number().unwrap(),
+        Some(vec![1u8]),
+        "first CRL must carry cRLNumber 1"
+    );
+    let second_out = p("crl2.pem");
+    assert!(
+        run(
+            &[
+                "ca",
+                "crl",
+                "-dir",
+                dir.to_str().unwrap(),
+                "-out",
+                &second_out,
+            ],
+            b""
+        )
+        .1,
+        "second ca crl failed"
+    );
+    let crl2 = CertificateRevocationList::from_pem(&std::fs::read_to_string(&second_out).unwrap())
+        .unwrap();
+    assert_eq!(
+        crl2.crl_number().unwrap(),
+        Some(vec![2u8]),
+        "cRLNumber must increase across invocations"
+    );
+    assert!(crl2.is_revoked(&serial_be(leaf_serial)).unwrap());
+    let (text, ok) = run(&["crl", "-in", &second_out, "-text"], b"");
+    assert!(ok, "crl -text failed");
+    assert!(
+        text.contains("CRL Number:  0x02"),
+        "crl -text output: {text}"
+    );
+
     // `ca show` produces a usable summary.
     let (show, ok) = run(&["ca", "show", "-dir", dir.to_str().unwrap()], b"");
     assert!(ok, "ca show failed");
