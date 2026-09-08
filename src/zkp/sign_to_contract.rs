@@ -215,16 +215,21 @@ fn rfc6979_nonce(seckey: &[u8; 32], msg32_reduced: &[u8; 32], aux: &[u8; 32]) ->
     let mut v = [0x01u8; 32];
     let mut k = [0x00u8; 32];
 
+    // Every HMAC output below is the next DRBG `K` or `V` — i.e. the nonce's
+    // preimage — so each one is wiped as soon as it has been copied into
+    // place, rather than left as a dead temporary in the frame.
     // K = HMAC_K(V ‖ sep ‖ seed); V = HMAC_K(V), for sep in {0x00, 0x01}.
     for &sep in &[0x00u8, 0x01u8] {
         let mut mac = Hmac::<Sha256>::new(&k);
         mac.update(&v);
         mac.update(&[sep]);
         mac.update(&seed);
-        let out = mac.finalize();
-        k.copy_from_slice(out.as_ref());
-        let out = Hmac::<Sha256>::mac(&k, &v);
-        v.copy_from_slice(out.as_ref());
+        let mut out = mac.finalize();
+        k.copy_from_slice(&out);
+        wipe32(&mut out);
+        let mut out = Hmac::<Sha256>::mac(&k, &v);
+        v.copy_from_slice(&out);
+        wipe32(&mut out);
     }
 
     let mut retry = false;
@@ -233,20 +238,21 @@ fn rfc6979_nonce(seckey: &[u8; 32], msg32_reduced: &[u8; 32], aux: &[u8; 32]) ->
             let mut mac = Hmac::<Sha256>::new(&k);
             mac.update(&v);
             mac.update(&[0x00]);
-            let out = mac.finalize();
-            k.copy_from_slice(out.as_ref());
-            let out = Hmac::<Sha256>::mac(&k, &v);
-            v.copy_from_slice(out.as_ref());
+            let mut out = mac.finalize();
+            k.copy_from_slice(&out);
+            wipe32(&mut out);
+            let mut out = Hmac::<Sha256>::mac(&k, &v);
+            v.copy_from_slice(&out);
+            wipe32(&mut out);
         }
-        let out = Hmac::<Sha256>::mac(&k, &v);
-        v.copy_from_slice(out.as_ref());
+        let mut out = Hmac::<Sha256>::mac(&k, &v);
+        v.copy_from_slice(&out);
+        wipe32(&mut out);
         retry = true;
 
-        let mut candidate = [0u8; 32];
-        candidate.copy_from_slice(&v);
-        let parsed = Scalar::from_bytes_be(&candidate);
-        candidate.fill(0);
-        let _ = core::hint::black_box(&candidate);
+        // `v` *is* the nonce candidate; parse it in place rather than copying
+        // it into yet another buffer.
+        let parsed = Scalar::from_bytes_be(&v);
         if let Ok(scalar) = parsed
             && !bool::from(scalar.is_zero())
         {
@@ -262,6 +268,14 @@ fn rfc6979_nonce(seckey: &[u8; 32], msg32_reduced: &[u8; 32], aux: &[u8; 32]) ->
     v.fill(0);
     let _ = core::hint::black_box((&seed, &k, &v));
     nonce
+}
+
+/// Best-effort wipe of a 32-byte secret buffer, with an optimisation barrier
+/// so the stores are not elided.
+#[inline]
+fn wipe32(buf: &mut [u8; 32]) {
+    buf.fill(0);
+    let _ = core::hint::black_box(&buf);
 }
 
 /// Branch-free big-endian "greater than" over 32-byte values: returns `0xff`

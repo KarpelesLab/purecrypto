@@ -440,18 +440,29 @@ fn hash_to_curve(f: &Field, tag: &[u8; 32]) -> Result<ProjectivePoint, Error> {
     let mut buf = [0u8; 48];
     buf[..16].copy_from_slice(GEN_PREFIX_1);
     buf[16..].copy_from_slice(tag);
-    let h1 = sha256(&buf);
+    let mut h1 = sha256(&buf);
     buf[..16].copy_from_slice(GEN_PREFIX_2);
-    let h2 = sha256(&buf);
+    let mut h2 = sha256(&buf);
     // The tag is secret in Confidential Assets; do not leave it on the stack.
     buf = [0u8; 48];
     let _ = core::hint::black_box(&buf);
 
-    let t1 = Fe::from_be_bytes(&h1).reduce(f.p());
-    let t2 = Fe::from_be_bytes(&h2).reduce(f.p());
+    let mut t1 = Fe::from_be_bytes(&h1).reduce(f.p());
+    let mut t2 = Fe::from_be_bytes(&h2).reduce(f.p());
 
-    let (x1, y1) = shallue_van_de_woestijne(f, &t1)?;
-    let (x2, y2) = shallue_van_de_woestijne(f, &t2)?;
+    let r1 = shallue_van_de_woestijne(f, &t1);
+    let r2 = shallue_van_de_woestijne(f, &t2);
+    // The digests and the field elements derived from them are functions of
+    // the secret tag alone (the domain separators are public), so a leftover
+    // copy is as good as the tag itself. Wipe them on every exit path.
+    h1 = [0u8; 32];
+    h2 = [0u8; 32];
+    t1 = Fe::ZERO;
+    t2 = Fe::ZERO;
+    let _ = core::hint::black_box((&h1, &h2, &t1, &t2));
+
+    let (x1, y1) = r1?;
+    let (x2, y2) = r2?;
     let p1 = affine_from_xy(&x1, &y1)?.to_projective();
     let p2 = affine_from_xy(&x2, &y2)?.to_projective();
     Ok(p1.add(&p2))
@@ -469,7 +480,12 @@ fn hash_to_curve(f: &Field, tag: &[u8; 32]) -> Result<ProjectivePoint, Error> {
 pub fn value_scalar(value: u64) -> Scalar {
     let mut bytes = [0u8; 32];
     bytes[24..].copy_from_slice(&value.to_be_bytes());
-    Scalar::from_bytes_be_reduce(&bytes)
+    let scalar = Scalar::from_bytes_be_reduce(&bytes);
+    // The value is the secret a commitment hides; do not leave a plaintext
+    // copy of it on the stack (`Scalar` wipes itself on drop).
+    bytes.fill(0);
+    let _ = core::hint::black_box(&bytes);
+    scalar
 }
 
 /// Decodes a 32-byte blinding factor, rejecting any value `≥ n`.
