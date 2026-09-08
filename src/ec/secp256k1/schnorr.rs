@@ -98,6 +98,32 @@ pub fn tagged_hash(tag: &str, msgs: &[&[u8]]) -> [u8; 32] {
     result
 }
 
+/// [`tagged_hash`] for a *secret* preimage: the hasher that absorbed the input
+/// is explicitly zeroised instead of being consumed by `finalize`, so neither
+/// the buffered block (which holds the last partial input) nor the chaining
+/// state survives in the dead frame.
+///
+/// Used for the nonce hash, whose input `t` equals the secret key masked with
+/// the aux hash — for all-zero aux (`sign_deterministic`) that mask is a public
+/// constant, so leaking `t` would leak `d` outright.
+fn tagged_hash_secret(tag: &str, msgs: &[&[u8]]) -> [u8; 32] {
+    let tag_hash = Sha256::digest(tag.as_bytes());
+    let mut h = Sha256::new();
+    h.update(tag_hash.as_ref());
+    h.update(tag_hash.as_ref());
+    for m in msgs {
+        h.update(m);
+    }
+    // Finalise a clone and zeroise the original, whose lifetime this function
+    // controls; the consumed clone is the hash module's responsibility.
+    let mut out = h.clone().finalize();
+    h.zeroize();
+    let mut result = [0u8; 32];
+    result.copy_from_slice(out.as_ref());
+    wipe(&mut out);
+    result
+}
+
 /// Best-effort wipe of a 32-byte secret buffer, with an optimization barrier so
 /// the stores are not elided (the idiom used by `ecdsa` and `secp256k1::Scalar`).
 #[inline]
@@ -195,14 +221,18 @@ pub fn sign(seckey: &[u8; 32], msg: &[u8], aux_rand: &[u8; 32]) -> Result<[u8; 6
 
     // t = bytes(d) XOR hash_BIP0340/aux(a).
     let mut t = d.to_bytes_be();
-    let aux = tagged_hash(TAG_AUX, &[aux_rand]);
+    let mut aux = tagged_hash(TAG_AUX, &[aux_rand]);
     for (tb, ab) in t.iter_mut().zip(aux.iter()) {
         *tb ^= *ab;
     }
 
     // rand = hash_BIP0340/nonce(t ‖ bytes(P) ‖ m); k' = int(rand) mod n.
-    let mut rand = tagged_hash(TAG_NONCE, &[&t, &px, msg]);
+    // `t` is the secret key under a mask that `aux` reveals (and that is a
+    // public constant for all-zero aux), so both go through the wiping hash
+    // path and are wiped themselves.
+    let mut rand = tagged_hash_secret(TAG_NONCE, &[&t, &px, msg]);
     wipe(&mut t);
+    wipe(&mut aux);
     let k0 = Scalar::from_bytes_be_reduce(&rand);
     wipe(&mut rand);
     if bool::from(k0.is_zero()) {
