@@ -46,7 +46,8 @@ pub enum Error {
     InvalidKey,
     /// The context string exceeded 255 bytes.
     ContextTooLong,
-    /// The message was empty (SLH-DSA does not sign empty messages here).
+    /// Retained for API compatibility: empty messages are accepted (FIPS 205
+    /// places no lower bound on `M`), so this variant is no longer returned.
     EmptyMessage,
     /// A DER/PEM structure was malformed.
     Malformed,
@@ -1862,9 +1863,6 @@ impl PrivateKey {
         ctx: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        if msg.is_empty() {
-            return Err(Error::EmptyMessage);
-        }
         if ctx.len() > MAX_CONTEXT {
             return Err(Error::ContextTooLong);
         }
@@ -1894,9 +1892,6 @@ impl PrivateKey {
         ctx: &[u8],
         out: &mut [u8],
     ) -> Result<usize, Error> {
-        if msg.is_empty() {
-            return Err(Error::EmptyMessage);
-        }
         if ctx.len() > MAX_CONTEXT {
             return Err(Error::ContextTooLong);
         }
@@ -2075,7 +2070,7 @@ impl PublicKey {
     /// Verifies `sig` over `msg` with optional `ctx`.
     pub fn verify(&self, sig: &[u8], msg: &[u8], ctx: &[u8]) -> bool {
         let p = self.set.params();
-        if msg.is_empty() || ctx.len() > MAX_CONTEXT || sig.len() != p.sig_size {
+        if ctx.len() > MAX_CONTEXT || sig.len() != p.sig_size {
             return false;
         }
         let n = p.n as usize;
@@ -2390,6 +2385,31 @@ mod nobuf_tests {
 
         assert!(pk.verify(&sig[..n], b"firmware", b""));
         assert!(!pk.verify(&sig[..n], b"other", b""));
+    }
+
+    /// FIPS 205 places no lower bound on the message length: the empty
+    /// message signs and verifies like any other, in both signing modes, and
+    /// is not confused with a one-byte message or a different context.
+    #[test]
+    fn empty_message_signs_and_verifies() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"slhdsa-empty", b"nonce", &[]);
+        let (sk, pk) = PrivateKey::generate(ParamSet::Sha2_128f, &mut rng);
+        let n = sk.signature_len();
+
+        let mut sig = [0u8; 17088];
+        let written = sk
+            .sign_into(&mut rng, b"", b"", &mut sig[..n])
+            .expect("empty message must sign");
+        assert_eq!(written, n);
+        assert!(pk.verify(&sig[..n], b"", b""));
+        assert!(!pk.verify(&sig[..n], b"\0", b""));
+        assert!(!pk.verify(&sig[..n], b"", b"ctx"));
+
+        let mut det = [0u8; 17088];
+        sk.sign_deterministic_into(b"", b"ctx", &mut det[..n])
+            .expect("empty message must sign deterministically");
+        assert!(pk.verify(&det[..n], b"", b"ctx"));
+        assert!(!pk.verify(&det[..n], b"", b""));
     }
 
     /// Deterministic signing is reproducible and binds the context.
