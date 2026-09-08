@@ -645,10 +645,13 @@ enum State {
 
 /// Snapshot of CH1 extensions that RFC 8446 §4.1.4 requires CH2 to echo
 /// unchanged after a HelloRetryRequest. `None`-valued slots in CH1 must
-/// stay `None` in CH2; present slots must compare byte-equal. The PSK
-/// path is intentionally omitted here — the binders MUST be recomputed
-/// against the new transcript, so a byte-equality test would falsely
-/// reject every PSK retry; PSK + HRR is left to a follow-up.
+/// stay `None` in CH2; present slots must compare byte-equal. The
+/// `pre_shared_key` extension is intentionally not compared: §4.1.4 lets
+/// the client recompute `obfuscated_ticket_age` and the binders and drop
+/// PSKs incompatible with the HRR-selected suite, so a byte-equality test
+/// would falsely reject every PSK retry. The CH2 offer is instead
+/// re-verified from scratch by `try_accept_psk` against the HRR-inclusive
+/// transcript (§4.2.11.2), which is what actually binds it.
 #[derive(Clone)]
 struct Ch1Immutable {
     random: Random,
@@ -660,8 +663,6 @@ struct Ch1Immutable {
     server_name: Option<Vec<u8>>,
     alpn: Option<Vec<u8>>,
     psk_key_exchange_modes: Option<Vec<u8>>,
-    /// Pre-share modes parity matters even before PSK is supported under
-    /// HRR — the client must not flip this on the retry.
     cert_compression: Option<Vec<u8>>,
 }
 
@@ -1784,14 +1785,16 @@ impl<R: RngCore> ServerConnection<R> {
 
         // PSK resumption: process pre_shared_key + psk_key_exchange_modes
         // before suite negotiation so we can constrain the suite to the PSK's
-        // hash. Hard-fail on binder mismatch (decrypt_error). Skipped on
-        // retry: PSK + HRR requires binders recomputed against the new
-        // transcript, which is left to a follow-up commit (the HRR
-        // pre-check below refuses to emit HRR when PSK is being negotiated).
+        // hash. Hard-fail on binder mismatch (decrypt_error). On the retry
+        // ClientHello the binder is bound to the HRR-inclusive transcript
+        // (RFC 8446 §4.2.11.2): the running transcript at this point holds
+        // exactly `message_hash(Hash(CH1)) ‖ HRR` (CH2 is appended further
+        // down), which is the prefix the binder hash needs. On CH1 the
+        // transcript is still empty, so the prefix is empty as well.
         let psk_state = if is_retry {
-            None
+            self.try_accept_psk(&ch, raw, self.core.transcript.buffered_bytes())?
         } else {
-            self.try_accept_psk(&ch, raw)?
+            self.try_accept_psk(&ch, raw, &[])?
         };
 
         // 0-RTT acceptance precondition: PSK was selected, the client
@@ -1842,7 +1845,15 @@ impl<R: RngCore> ServerConnection<R> {
         // byte-identical to CH1's, so re-negotiation would produce the same
         // result, but using the cached value avoids any risk of drift.
         let suite = if is_retry {
-            self.suite.ok_or(Error::HandshakeFailure)?
+            let suite = self.suite.ok_or(Error::HandshakeFailure)?;
+            // RFC 8446 §4.1.4: the client may only keep PSKs compatible
+            // with the HRR-indicated cipher suite; a CH2 PSK whose hash
+            // disagrees with the pinned suite is a protocol violation, not
+            // a reason to renegotiate the suite.
+            if psk_state.as_ref().is_some_and(|s| s.hash != suite.hash) {
+                return Err(Error::IllegalParameter);
+            }
+            suite
         } else if let Some(ref s) = psk_state {
             supported_suites()
                 .iter()
@@ -2023,16 +2034,15 @@ impl<R: RngCore> ServerConnection<R> {
         // RFC 8446 §4.1.4 HRR pre-check: if the deployment named a preferred
         // key-exchange group, the client advertised it in
         // `supported_groups`, and the client did NOT include a share for
-        // that group, ask the client to retry. PSK + HRR is intentionally
-        // declined here (HRR binder recomputation is handled in a follow-up
-        // commit); ECH + HRR is *supported* (draft §7.2.1 / §7.2.2), and
-        // `emit_hello_retry_request` patches the
-        // `hrr_accept_confirmation` signal into the HRR
+        // that group, ask the client to retry. PSK + HRR is supported: the
+        // suite chosen above is already pinned to the PSK's hash, and CH2's
+        // recomputed binder is verified against the HRR-inclusive transcript
+        // (§4.2.11.2) when it arrives; 0-RTT is refused after an HRR
+        // (§4.2.10, `accept_early` is gated on `!is_retry`). ECH + HRR is
+        // supported too (draft §7.2.1 / §7.2.2): `emit_hello_retry_request`
+        // patches the `hrr_accept_confirmation` signal into the HRR
         // `encrypted_client_hello` extension when CH1 accepted ECH.
-        if !is_retry
-            && psk_state.is_none()
-            && let Some(preferred_pub) = self.config.preferred_key_exchange_group
-        {
+        if !is_retry && let Some(preferred_pub) = self.config.preferred_key_exchange_group {
             let preferred = preferred_pub.to_wire();
             let supported = match ext::find(&ch.extensions, ExtensionType::SUPPORTED_GROUPS) {
                 Some(sg_body) => ext::parse_supported_groups(sg_body)?,
@@ -2047,6 +2057,19 @@ impl<R: RngCore> ServerConnection<R> {
                     None => Vec::new(),
                 };
             if supported.contains(&preferred) && !shared_groups.contains(&preferred) {
+                // A 0-RTT client has early-data records on the wire right
+                // behind CH1 (RFC 8446 §4.2.10). No early-traffic key is
+                // installed (the offer is refused by the HRR), so they
+                // would be unreadable ciphertext to the record layer: arm
+                // the skip window so they are discarded — up to the same
+                // budget the post-CH2 fallback uses — instead of killing
+                // the retry with `unexpected_message`.
+                if client_offered_early && !self.skip_record_keys() {
+                    let budget = (self.config.max_early_data_size as usize)
+                        .max(MIN_SKIP_EARLY_DATA_BUDGET)
+                        .saturating_add(SKIP_EARLY_DATA_OVERHEAD);
+                    self.core.begin_skip_early_data(budget);
+                }
                 self.emit_hello_retry_request(&ch, suite, preferred)?;
                 return Ok(());
             }
@@ -3078,7 +3101,20 @@ impl<R: RngCore> ServerConnection<R> {
     /// * `Ok(None)` — no offered PSK we recognize; fall back to 1-RTT.
     /// * `Err(Error::DecryptError)` — a ticket decrypted but its binder is
     ///   wrong: an active attacker or a tampered CH. Reject hard.
-    fn try_accept_psk(&self, ch: &ClientHello, raw: &[u8]) -> Result<Option<AcceptedPsk>, Error> {
+    ///
+    /// `transcript_prefix` is the handshake transcript preceding this
+    /// ClientHello: empty for CH1, and `message_hash(Hash(CH1)) ‖ HRR` for
+    /// the retry ClientHello after a HelloRetryRequest. RFC 8446 §4.2.11.2
+    /// defines the binder over `Transcript-Hash(Truncate(ClientHello1))` on
+    /// the first flight and over `Transcript-Hash(ClientHello1,
+    /// HelloRetryRequest, Truncate(ClientHello2))` on the retry — a CH2
+    /// binder computed over the truncated CH2 alone is rejected.
+    fn try_accept_psk(
+        &self,
+        ch: &ClientHello,
+        raw: &[u8],
+        transcript_prefix: &[u8],
+    ) -> Result<Option<AcceptedPsk>, Error> {
         let Some(ticket_key) = self.config.ticket_key.as_ref() else {
             return Ok(None);
         };
@@ -3145,7 +3181,14 @@ impl<R: RngCore> ServerConnection<R> {
             let ks = KeySchedule::with_psk(hash, &psk);
             let res_bk = ks.binder_key(b"res binder");
             let fk = binder_finished_key(hash, &res_bk);
-            let th = hash.hash(truncated);
+            let th = if transcript_prefix.is_empty() {
+                hash.hash(truncated)
+            } else {
+                let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated.len());
+                tbuf.extend_from_slice(transcript_prefix);
+                tbuf.extend_from_slice(truncated);
+                hash.hash(&tbuf)
+            };
             let expected: Vec<u8> = match hash {
                 HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
                     .as_ref()
@@ -3647,7 +3690,7 @@ mod tests {
         );
 
         let accepted = server
-            .try_accept_psk(&ch, &raw)
+            .try_accept_psk(&ch, &raw, &[])
             .expect("try_accept_psk should not error")
             .expect("the index-1 ticket should be accepted");
 

@@ -219,6 +219,15 @@ impl ConnectionCore {
         self.write = Some(crypter);
     }
 
+    /// Drops the outbound record-protection keys, returning the write side
+    /// to plaintext. Used by the client on HelloRetryRequest after a 0-RTT
+    /// offer: the early-traffic write key installed at CH1 time must not
+    /// protect CH2 (RFC 8446 §4.1.4 — CH2 is a plaintext handshake record),
+    /// and no further early data may be sent (§4.2.10).
+    pub(crate) fn clear_write(&mut self) {
+        self.write = None;
+    }
+
     /// Drains any received application plaintext. Never includes 0-RTT
     /// early data — that is quarantined in its own buffer (see
     /// [`Self::take_early_data`]).
@@ -426,6 +435,21 @@ impl ConnectionCore {
                             }
                         }
                         Err(e) => return Err(e),
+                    }
+                }
+                ContentType::ApplicationData if self.skip_early_data.is_some() => {
+                    // No read key at all, yet a protected record arrived and
+                    // the skip window is armed: the server answered a 0-RTT
+                    // ClientHello with a HelloRetryRequest and the client's
+                    // early-data records were already in flight (RFC 8446
+                    // §4.2.10 / §4.1.4). They can never be deprotected — no
+                    // early-traffic key was ever installed — so discard
+                    // them against the same byte budget the post-CH2 skip
+                    // uses; exhausting it is a real protocol violation.
+                    let budget = self.skip_early_data.take().expect("armed");
+                    match budget.checked_sub(fragment.len()) {
+                        Some(rest) => self.skip_early_data = Some(rest),
+                        None => return Err(Error::UnexpectedMessage),
                     }
                 }
                 ContentType::Handshake => {

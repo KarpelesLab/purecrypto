@@ -1379,6 +1379,7 @@ impl ClientConnection {
                 share_groups,
                 &[],
                 None,
+                None,
             ),
         };
         #[cfg(not(feature = "ech"))]
@@ -1389,6 +1390,7 @@ impl ClientConnection {
             groups,
             share_groups,
             &[],
+            None,
             None,
         );
 
@@ -1453,6 +1455,15 @@ impl ClientConnection {
     /// is computed over the truncated ClientHello and patched in place. The
     /// returned bytes are ready to emit to the wire and to feed to the
     /// transcript.
+    ///
+    /// `hrr_transcript` is `None` for the first ClientHello and `Some(bytes)`
+    /// when building the retry ClientHello after a HelloRetryRequest, where
+    /// `bytes` is the running transcript at that point —
+    /// `message_hash(Hash(CH1)) ‖ HRR` (RFC 8446 §4.4.1). It changes two
+    /// things (§4.1.4): the `early_data` extension is omitted (0-RTT is not
+    /// permitted after an HRR, §4.2.10), and the PSK binder is computed
+    /// over `Transcript-Hash(bytes ‖ truncated CH2)` instead of
+    /// `Transcript-Hash(truncated CH1)` (§4.2.11.2).
     #[allow(clippy::too_many_arguments)]
     fn build_client_hello(
         &self,
@@ -1463,6 +1474,7 @@ impl ClientConnection {
         share_only: &[NamedGroup],
         extra_extensions: &[crate::tls::codec::RawExtension],
         ech_override: Option<&[u8]>,
+        hrr_transcript: Option<&[u8]>,
     ) -> Vec<u8> {
         // Without the `ech` feature there's no place where we'd consult
         // `ech_override`; mark it as deliberately unused so the rest of
@@ -1631,7 +1643,9 @@ impl ClientConnection {
         let mut psk_binder_info: Option<(HashAlg, Vec<u8>, usize)> = None;
         if let Some(session) = &self.config.session {
             extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
-            if matches!(session.max_early_data_size, Some(n) if n > 0) {
+            // RFC 8446 §4.1.4 / §4.2.10: `early_data` MUST NOT appear in
+            // the retry ClientHello — 0-RTT is over once an HRR arrives.
+            if hrr_transcript.is_none() && matches!(session.max_early_data_size, Some(n) if n > 0) {
                 extensions.push(ext::early_data_empty());
             }
             let hash = session.cipher_suite_hash;
@@ -1654,10 +1668,18 @@ impl ClientConnection {
         }
         .encode();
 
-        // Patch the binder: HMAC(binder_finished_key, Hash(truncated_CH)).
+        // Patch the binder: HMAC(binder_finished_key, Transcript-Hash(
+        // [message_hash(CH1) ‖ HRR ‖] truncated_CH)) — the bracketed prefix
+        // only on the post-HRR retry (RFC 8446 §4.2.11.2).
         if let Some((hash, psk, binders_len)) = psk_binder_info {
             let truncated_len = bytes.len().saturating_sub(binders_len);
-            patch_psk_binder(&mut bytes, truncated_len, hash, &psk);
+            patch_psk_binder(
+                &mut bytes,
+                truncated_len,
+                hash,
+                &psk,
+                hrr_transcript.unwrap_or(&[]),
+            );
         }
         bytes
     }
@@ -2450,8 +2472,28 @@ impl ClientConnection {
         self.core.transcript.replace_with_message_hash();
         self.core.transcript.update(raw);
 
+        // RFC 8446 §4.2.10: "A client MUST NOT include the early_data
+        // extension in its followup ClientHello" and early data is not
+        // permitted after an HRR. Tear the 0-RTT offer down before CH2 is
+        // built: the early-traffic write key installed at CH1 time would
+        // otherwise protect CH2 (which must be a plaintext handshake
+        // record), `write_early_data` must start refusing, and the
+        // handshake keys must install at ServerHello like a non-0-RTT
+        // handshake (no EndOfEarlyData is ever sent, §4.5). Any early-data
+        // records already on the wire are skipped by the server.
+        if self.early_data_offered {
+            self.early_data_offered = false;
+            self.cets = None;
+            if !self.skip_record_keys() {
+                self.core.clear_write();
+            }
+        }
+
         // Build CH2: same client_random, same offered_suites/groups, narrow
         // the key_share list to the selected group, echo the cookie verbatim.
+        // The PSK binder (if any) is bound to the HRR-inclusive transcript
+        // (§4.2.11.2) — `build_client_hello` reads the running transcript
+        // `message_hash(Hash(CH1)) ‖ HRR` through `hrr_transcript`.
         let share_only: alloc::vec::Vec<NamedGroup> = selected_group.into_iter().collect();
         let extras: alloc::vec::Vec<crate::tls::codec::RawExtension> =
             cookie_ext.into_iter().collect();
@@ -2500,6 +2542,7 @@ impl ClientConnection {
                 &share_only,
                 &extras,
                 None,
+                Some(self.core.transcript.buffered_bytes()),
             );
             (ch, None)
         };
@@ -2514,6 +2557,7 @@ impl ClientConnection {
                 &share_only,
                 &extras,
                 None,
+                Some(self.core.transcript.buffered_bytes()),
             ),
             None,
         );
@@ -2618,6 +2662,7 @@ impl ClientConnection {
             share_only,
             extras,
             Some(&inner_marker),
+            Some(self.core.transcript.buffered_bytes()),
         );
         let inner_sni_len = server_name.len();
         let padded =
@@ -2635,6 +2680,7 @@ impl ClientConnection {
             share_only,
             extras,
             Some(&outer_body),
+            Some(self.core.transcript.buffered_bytes()),
         );
 
         // Take the retained sender (it never goes back into state —
@@ -3537,6 +3583,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         share_groups,
         &[],
         Some(&inner_marker),
+        None,
     );
     let inner_sni_len = server_name.len();
     let suites_owned = effective_suites.to_vec();
@@ -3564,6 +3611,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         Some(&crate::tls::ech::outer::build_outer_ext_body(
             sym, config_id, &[0u8; 32], 100,
         )),
+        None,
     );
     let (canonical_inner, inner_to_seal) = match (
         ClientHello::decode(inner_ch.get(4..)?),
@@ -3611,6 +3659,7 @@ fn seal_real_ech_on_ch1<R: RngCore>(
                 &share_groups_owned,
                 &[],
                 Some(&outer_body),
+                None,
             )
         },
     )
@@ -3677,30 +3726,38 @@ fn suite_hash(s: CipherSuite) -> Option<HashAlg> {
 /// Patches a single PSK binder into the ClientHello bytes built by
 /// [`ClientConnection::build_client_hello`].
 ///
-/// TODO(RFC 8446 §4.2.11.2): the binder's transcript input is only correct
-/// for the *first* ClientHello. After a HelloRetryRequest the binder in CH2
-/// MUST be computed over `Transcript-Hash(message_hash(CH1) ‖ HRR ‖
-/// truncated CH2)`, but this helper hashes the truncated CH2 alone, so a
-/// PSK offer that survives an HRR round produces a binder the server will
-/// reject (`decrypt_error`) — resumption after HRR currently fails closed
-/// rather than open. The fix is to thread the running transcript (with the
-/// §4.4.1 message_hash rewrite already applied) into the HRR rebuild path
-/// and hash `transcript ‖ ch[..truncated_len]` there; left for a change
-/// that can be validated against an interop peer.
-///
 /// `ch[..truncated_len]` is the truncated CH (everything before the
 /// `pre_shared_key` binders field). The remaining `ch[truncated_len..]` is
 /// the binders field laid out as `u16 outer_len ‖ u8 inner_len ‖ binder_bytes`,
 /// where `binder_bytes` is currently `hash_len` zeros. The function computes
 /// `binder = HMAC(binder_finished_key(binder_key("res binder")),
-/// Transcript-Hash(truncated_CH))` and overwrites the trailing `hash_len`
-/// bytes of `ch` in place.
-fn patch_psk_binder(ch: &mut [u8], truncated_len: usize, hash: HashAlg, psk: &[u8]) {
+/// Transcript-Hash(transcript_prefix ‖ truncated_CH))` and overwrites the
+/// trailing `hash_len` bytes of `ch` in place.
+///
+/// `transcript_prefix` is empty for the first ClientHello. For the retry
+/// ClientHello after a HelloRetryRequest it is the running transcript
+/// `message_hash(Hash(CH1)) ‖ HRR` (RFC 8446 §4.4.1), because §4.2.11.2
+/// defines the CH2 binder over `Transcript-Hash(ClientHello1,
+/// HelloRetryRequest, Truncate(ClientHello2))`.
+fn patch_psk_binder(
+    ch: &mut [u8],
+    truncated_len: usize,
+    hash: HashAlg,
+    psk: &[u8],
+    transcript_prefix: &[u8],
+) {
     let hash_len = hash.output_len();
     let ks = KeySchedule::with_psk(hash, psk);
     let res_bk = ks.binder_key(b"res binder");
     let fk = binder_finished_key(hash, &res_bk);
-    let th = hash.hash(&ch[..truncated_len]);
+    let th = if transcript_prefix.is_empty() {
+        hash.hash(&ch[..truncated_len])
+    } else {
+        let mut tbuf = Vec::with_capacity(transcript_prefix.len() + truncated_len);
+        tbuf.extend_from_slice(transcript_prefix);
+        tbuf.extend_from_slice(&ch[..truncated_len]);
+        hash.hash(&tbuf)
+    };
     let binder: Vec<u8> = match hash {
         HashAlg::Sha256 => Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
             .as_ref()

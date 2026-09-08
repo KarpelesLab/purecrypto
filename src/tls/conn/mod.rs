@@ -8360,4 +8360,231 @@ mod audit_regression_tests {
         );
         assert_eq!(server2.take_received_plaintext(), b"authenticated 1-RTT");
     }
+    // ---- TLS-CORE-7 leftovers: PSK resumption across a HelloRetryRequest ----
+
+    /// Phase 1 of the HRR+PSK tests: a plain handshake that mints a ticket.
+    /// `max_early_data` > 0 makes the ticket 0-RTT capable.
+    fn hrr_psk_session(seed: &[u8], max_early_data: u32) -> (super::StoredSession, Vec<u8>) {
+        let (server_config, cert_der) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x7cu8; 32])
+            .with_max_early_data(max_early_data);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der.clone()).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(seed, b"c1", &[]);
+        let srng = HmacDrbg::<Sha256>::new(seed, b"s1", &[]);
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519],
+        );
+        let mut server = ServerConnection::new(server_config, srng);
+        pump_result(&mut client, &mut server).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        let session = client.take_session().expect("ticket issued");
+        (session, cert_der)
+    }
+
+    /// Phase 2 setup: a server that insists on SECP256R1 (so the client's
+    /// X25519-only share triggers an HRR) and a resuming client that
+    /// advertises both groups but ships a share only for X25519.
+    fn hrr_psk_pair(
+        seed: &[u8],
+        session: super::StoredSession,
+        cert_der: Vec<u8>,
+        max_early_data: u32,
+    ) -> (ClientConnection, ServerConnection<HmacDrbg<Sha256>>) {
+        let (server_config, _) = rsa_server();
+        let server_config = server_config
+            .with_ticket_key([0x7cu8; 32])
+            .with_max_early_data(max_early_data)
+            .with_preferred_key_exchange_group(crate::tls::NamedGroup::Secp256r1);
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(seed, b"c2", &[]);
+        let srng = HmacDrbg::<Sha256>::new(seed, b"s2", &[]);
+        let client = ClientConnection::new_with_offer_partial_shares(
+            ClientConfig::new(roots).with_session(session),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            &[NamedGroup::X25519],
+        );
+        let server = ServerConnection::new(server_config, srng);
+        (client, server)
+    }
+
+    /// A plaintext handshake record carrying one ServerHello-shaped message:
+    /// true iff its `random` is the HelloRetryRequest sentinel.
+    fn is_hrr_record(rec: &[u8]) -> bool {
+        // record header (5) + handshake header (4) + legacy_version (2).
+        rec.len() >= 5 + 4 + 2 + 32
+            && rec[0] == 0x16
+            && rec[5] == crate::tls::codec::hs_type::SERVER_HELLO
+            && rec[11..43] == crate::tls::codec::HRR_RANDOM
+    }
+
+    /// Decodes the ClientHello inside a plaintext handshake record.
+    fn decode_ch_record(rec: &[u8]) -> crate::tls::codec::ClientHello {
+        use crate::tls::codec::{ClientHello, ReadCursor, read_handshake};
+        assert_eq!(rec[0], 0x16, "CH2 must be a plaintext handshake record");
+        let mut c = ReadCursor::new(&rec[5..]);
+        let (ty, body) = read_handshake(&mut c).unwrap();
+        assert_eq!(ty, crate::tls::codec::hs_type::CLIENT_HELLO);
+        ClientHello::decode(body).unwrap()
+    }
+
+    /// Drives CH1 → HRR → CH2 by hand and returns the CH2 record, leaving
+    /// the server just before it consumes CH2.
+    fn hrr_psk_ch2(
+        client: &mut ClientConnection,
+        server: &mut ServerConnection<HmacDrbg<Sha256>>,
+    ) -> Vec<u8> {
+        let ch1 = client.write_tls();
+        server.read_tls(&ch1);
+        server.process_new_packets().unwrap();
+        let hrr = server.write_tls();
+        assert!(is_hrr_record(&hrr), "server must answer CH1 with an HRR");
+        client.read_tls(&hrr);
+        client.process_new_packets().unwrap();
+        let ch2 = client.write_tls();
+        assert!(!ch2.is_empty(), "client must emit CH2");
+        ch2
+    }
+
+    /// RFC 8446 §4.2.11.2 / §4.1.4: resumption survives a HelloRetryRequest.
+    /// The CH2 binder is computed over `message_hash(CH1) ‖ HRR ‖ truncated
+    /// CH2` on the client and verified over the same transcript on the
+    /// server; the PSK is selected in CH2 and the handshake completes as a
+    /// resumption.
+    #[test]
+    fn psk_resumption_survives_hello_retry_request() {
+        use crate::tls::codec::{ExtensionType, extension as ext};
+
+        let (session, cert_der) = hrr_psk_session(b"hrr-psk", 0);
+        let (mut client, mut server) = hrr_psk_pair(b"hrr-psk", session, cert_der, 0);
+        let ch2_rec = hrr_psk_ch2(&mut client, &mut server);
+
+        let ch2 = decode_ch_record(&ch2_rec);
+        assert!(
+            ext::find(&ch2.extensions, ExtensionType::PRE_SHARED_KEY).is_some(),
+            "CH2 must still offer the PSK"
+        );
+        let shares = ext::parse_client_key_shares(
+            ext::find(&ch2.extensions, ExtensionType::KEY_SHARE).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].0, NamedGroup::SECP256R1);
+
+        server.read_tls(&ch2_rec);
+        server
+            .process_new_packets()
+            .expect("server must accept the HRR-transcript-bound CH2 binder");
+        pump_result(&mut client, &mut server).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(server.psk_used(), "server must resume in CH2");
+        assert!(client.psk_accepted(), "client must see PSK acceptance");
+
+        client.send_application_data(b"hrr-resumed").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"hrr-resumed");
+        server.send_application_data(b"ack").unwrap();
+        let s = server.write_tls();
+        client.read_tls(&s);
+        client.process_new_packets().unwrap();
+        assert_eq!(client.take_received_plaintext(), b"ack");
+    }
+
+    /// The pre-fix client computed the CH2 binder over `Hash(truncated CH2)`
+    /// alone. Rebuild that binder by hand into the real CH2 and confirm the
+    /// server rejects it with `decrypt_error` — the binder must be bound to
+    /// the HRR-inclusive transcript.
+    #[test]
+    fn hrr_ch2_with_ch2_only_binder_is_rejected() {
+        use crate::hash::Hmac;
+        use crate::tls::crypto::{HashAlg, KeySchedule, binder_finished_key};
+
+        let (session, cert_der) = hrr_psk_session(b"hrr-psk-old", 0);
+        let psk = session.psk.clone();
+        assert_eq!(session.cipher_suite_hash, HashAlg::Sha256);
+        let (mut client, mut server) = hrr_psk_pair(b"hrr-psk-old", session, cert_der, 0);
+        let mut ch2_rec = hrr_psk_ch2(&mut client, &mut server);
+
+        // One identity, SHA-256 binder: the trailer is
+        // `u16 binders_len ‖ u8 binder_len ‖ binder(32)` = 35 bytes.
+        let msg_start = 5;
+        let truncated_len = ch2_rec.len() - 35;
+        let ks = KeySchedule::with_psk(HashAlg::Sha256, &psk);
+        let fk = binder_finished_key(HashAlg::Sha256, &ks.binder_key(b"res binder"));
+        let th = HashAlg::Sha256.hash(&ch2_rec[msg_start..truncated_len]);
+        let old_binder = Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice());
+        let n = ch2_rec.len();
+        assert_ne!(
+            &ch2_rec[n - 32..],
+            old_binder.as_ref(),
+            "the fixed client must not produce the CH2-only binder"
+        );
+        ch2_rec[n - 32..].copy_from_slice(old_binder.as_ref());
+
+        server.read_tls(&ch2_rec);
+        assert!(
+            matches!(server.process_new_packets(), Err(Error::DecryptError)),
+            "a binder over the truncated CH2 alone must be rejected"
+        );
+    }
+
+    /// RFC 8446 §4.2.10: a 0-RTT offer that meets a HelloRetryRequest. The
+    /// early-data records already on the wire are skipped by the server, CH2
+    /// carries no `early_data` extension and goes out in plaintext, further
+    /// early writes are refused, and the handshake still resumes (1-RTT).
+    #[test]
+    fn zero_rtt_offer_then_hello_retry_request_resumes_without_early_data() {
+        use crate::tls::codec::{ExtensionType, extension as ext};
+
+        let (session, cert_der) = hrr_psk_session(b"hrr-0rtt", 16384);
+        assert_eq!(session.max_early_data_size, Some(16384));
+        let (mut client, mut server) = hrr_psk_pair(b"hrr-0rtt", session, cert_der, 16384);
+
+        // Early data rides right behind CH1 — before the HRR can arrive.
+        client.write_early_data(b"replayable-0rtt").unwrap();
+        let ch2_rec = hrr_psk_ch2(&mut client, &mut server);
+
+        let ch2 = decode_ch_record(&ch2_rec);
+        assert!(
+            ext::find(&ch2.extensions, ExtensionType::EARLY_DATA).is_none(),
+            "CH2 MUST NOT carry early_data after an HRR"
+        );
+        assert!(
+            ext::find(&ch2.extensions, ExtensionType::PRE_SHARED_KEY).is_some(),
+            "CH2 must still offer the PSK"
+        );
+        assert!(
+            matches!(
+                client.write_early_data(b"late"),
+                Err(Error::InappropriateState)
+            ),
+            "no early data may be written after an HRR"
+        );
+
+        server.read_tls(&ch2_rec);
+        server.process_new_packets().unwrap();
+        pump_result(&mut client, &mut server).unwrap();
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+        assert!(server.psk_used() && client.psk_accepted(), "must resume");
+        assert!(!server.early_data_accepted(), "0-RTT is refused after HRR");
+        assert!(!client.early_data_accepted(), "0-RTT is refused after HRR");
+        assert!(server.take_early_data().is_empty());
+
+        client.send_application_data(b"1-rtt").unwrap();
+        let c = client.write_tls();
+        server.read_tls(&c);
+        server.process_new_packets().unwrap();
+        assert_eq!(server.take_received_plaintext(), b"1-rtt");
+    }
 }
