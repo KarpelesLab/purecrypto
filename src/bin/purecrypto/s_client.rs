@@ -397,10 +397,28 @@ fn drive_tcp_data(conn: &mut Connection, sock: &mut TcpStream) {
     let mut buf = [0u8; 4096];
     loop {
         match sock.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                // A TCP EOF is only a clean end of stream if the peer's
+                // close_notify came first (RFC 8446 §6.1 / RFC 5246 §7.2.1).
+                // Without it, the stream was cut — by the server, or by an
+                // on-path attacker injecting a FIN — and whatever we printed
+                // may be a truncated response. Say so and fail, like
+                // `openssl s_client` reporting "unexpected eof while reading".
+                if !conn.received_close_notify() {
+                    let _ = stdout.flush();
+                    eprintln!(
+                        "WARNING: connection closed without close_notify (possible truncation)"
+                    );
+                    std::process::exit(1);
+                }
+                break;
+            }
             Ok(n) => {
-                if conn.feed(&buf[..n]).is_err() {
-                    break;
+                if let Err(e) = conn.feed(&buf[..n]) {
+                    // A record that fails to decrypt / a fatal alert
+                    // mid-stream is a broken session, not a clean end.
+                    let _ = stdout.flush();
+                    die(format!("TLS error after handshake: {e:?}"));
                 }
                 let plain = conn.recv().unwrap_or_default();
                 if !plain.is_empty() && stdout.write_all(&plain).is_err() {

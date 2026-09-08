@@ -1223,6 +1223,101 @@ fn s_client_loopback() {
     );
 }
 
+/// FC-3: a server that drops the TCP connection *without* sending
+/// close_notify has truncated the stream (or an on-path attacker has). The
+/// data received so far is still printed, but s_client must warn and exit
+/// non-zero instead of reporting success.
+#[test]
+fn s_client_reports_truncation_without_close_notify() {
+    use purecrypto::rsa::{BoxedRsaPrivateKey, RsaPrivateKey};
+    use purecrypto::tls::{Config, Connection, HandshakeStatus, SigningKey};
+    use purecrypto::x509::{Certificate, DistinguishedName, Time, Validity};
+    use std::net::TcpListener;
+
+    const KEY: &str = include_str!("../testdata/rsa2048_test_a.pem");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut sock, _) = listener.accept().expect("accept");
+        let signing = RsaPrivateKey::<32>::from_pkcs1_pem(KEY).unwrap();
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(
+            &signing,
+            &DistinguishedName::common_name("127.0.0.1"),
+            &validity,
+            1,
+            false,
+        )
+        .unwrap();
+        let key = BoxedRsaPrivateKey::from_pkcs1_pem(KEY).unwrap();
+        let cfg = Config::builder()
+            .tls_only()
+            .rng(std::sync::Arc::new(purecrypto::rng::OsRng))
+            .identity(vec![cert.to_der().to_vec()], SigningKey::Rsa(key))
+            .build();
+        let mut conn = Connection::server(&cfg).expect("server config");
+        let mut read_buf = [0u8; 8192];
+        loop {
+            let out = conn.pop().unwrap_or_default();
+            if !out.is_empty() {
+                sock.write_all(&out).unwrap();
+            }
+            match conn.handshake().unwrap() {
+                HandshakeStatus::Complete => break,
+                HandshakeStatus::WantWrite => continue,
+                HandshakeStatus::WantRead => {
+                    let n = sock.read(&mut read_buf).expect("read");
+                    if n == 0 {
+                        panic!("peer closed during handshake");
+                    }
+                    conn.feed(&read_buf[..n]).expect("feed");
+                }
+            }
+        }
+        let mut got = conn.recv().unwrap_or_default();
+        while got.is_empty() {
+            let n = sock.read(&mut read_buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            conn.feed(&read_buf[..n]).unwrap();
+            got = conn.recv().unwrap_or_default();
+        }
+        // Reply, then cut the TCP stream WITHOUT close_notify — the
+        // truncation an attacker who can inject a FIN produces.
+        conn.send(b"PONG-TRUNCATED").unwrap();
+        let out = conn.pop().unwrap_or_default();
+        sock.write_all(&out).unwrap();
+        sock.flush().unwrap();
+        let _ = sock.shutdown(std::net::Shutdown::Write);
+    });
+
+    let (out, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            &format!("127.0.0.1:{port}"),
+            "-insecure",
+            "-quiet",
+        ],
+        b"PING",
+    );
+    server.join().unwrap();
+    assert!(!ok, "s_client must exit non-zero on a truncated stream");
+    assert!(
+        out.contains("PONG-TRUNCATED"),
+        "data received before the cut is still printed, got: {out:?}"
+    );
+    assert!(
+        err.contains("closed without close_notify"),
+        "expected truncation warning on stderr, got: {err:?}"
+    );
+}
+
 /// s_client and s_server round-trip over a local TCP port, exercising
 /// ALPN negotiation and `-keylogfile` capture (NSS `SSLKEYLOGFILE`
 /// format).

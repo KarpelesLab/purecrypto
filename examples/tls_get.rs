@@ -67,10 +67,23 @@ fn main() {
     let mut response = Vec::new();
     loop {
         match sock.read(&mut read_buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                // TCP EOF is only a clean end of the response if the
+                // server's close_notify was processed first; otherwise the
+                // stream was truncated (RFC 8446 §6.1) and the bytes below
+                // must not be trusted as complete.
+                if !conn.received_close_notify() {
+                    eprintln!(
+                        "WARNING: connection closed without close_notify (possible truncation)"
+                    );
+                    std::process::exit(1);
+                }
+                break;
+            }
             Ok(n) => {
-                if conn.feed(&read_buf[..n]).is_err() {
-                    break;
+                if let Err(e) = conn.feed(&read_buf[..n]) {
+                    eprintln!("TLS error after handshake: {e:?}");
+                    std::process::exit(1);
                 }
                 let plain = conn.recv().unwrap_or_default();
                 response.extend_from_slice(&plain);
