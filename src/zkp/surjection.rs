@@ -183,10 +183,12 @@ type CompressedPoint = [u8; 33];
 
 /// Compressed serialization of a point, or 33 zero bytes for the identity.
 ///
-/// The identity has no SEC1 encoding. It only arises here with negligible
-/// probability (an `R` value that lands on infinity), and the substitute keeps
-/// the transcript well defined instead of panicking; such a proof then fails
-/// verification.
+/// The identity has no SEC1 encoding. Only the prover uses this substitute,
+/// and only on values it discards (the chain positions before the signer's)
+/// or on a nonce commitment that is the identity with negligible probability;
+/// it keeps the constant-time walk well defined instead of panicking.
+/// [`SurjectionProof::verify`] never substitutes: an `R` on infinity is
+/// rejected outright, as the reference does.
 fn ser_point(p: &ProjectivePoint) -> CompressedPoint {
     match p.to_affine() {
         Some(a) => a.to_sec1_compressed(),
@@ -691,8 +693,9 @@ impl SurjectionProof {
     /// [`Error::InvalidInput`] if the number of generators does not match
     /// [`n_inputs`](SurjectionProof::n_inputs);
     /// [`Error::Verification`] if the anonymity set is empty, if a scalar in
-    /// the proof is not canonical (`>= n`), or if the ring does not close.
-    /// Never panics, whatever the proof contains.
+    /// the proof is not canonical (`>= n`), if an `R` value is the point at
+    /// infinity, or if the ring does not close. Never panics, whatever the
+    /// proof contains.
     pub fn verify(
         &self,
         input_generators: &[Generator],
@@ -717,7 +720,13 @@ impl SurjectionProof {
             let s = Scalar::from_bytes_be(&self.s[j]).map_err(|_| Error::Verification)?;
             let key = out_point.add(&input_generators[u].as_point().negate());
             let es = Scalar::from_bytes_be_reduce(&e);
-            r = ser_point(&ProjectivePoint::mul_generator(&s).add(&key.mul(&es)));
+            // An `R` on infinity has no encoding to hash; a prover reaches it
+            // only with a zero nonce, and the reference rejects such a proof.
+            r = ProjectivePoint::mul_generator(&s)
+                .add(&key.mul(&es))
+                .to_affine()
+                .ok_or(Error::Verification)?
+                .to_sec1_compressed();
             if j + 1 < ring {
                 e = challenge(&r, &m, 0, (j + 1) as u32);
             }
@@ -1081,6 +1090,44 @@ mod tests {
         assert!(SurjectionProof::initialize(&big, 3, &tags[0], 100, &seed).is_err());
         // no input carries the output tag
         assert!(SurjectionProof::initialize(&tags, 2, &tag(9), 100, &seed).is_err());
+    }
+
+    #[test]
+    fn rejects_an_r_on_infinity() {
+        // A prover with nonce k = 0 in a one-member ring: R = k·G is the
+        // identity, and s = 0 − e·secret makes the verifier's
+        // R = s·G + e·K land on infinity too. Serializing that as 33 zero
+        // bytes would close the ring; the reference cannot encode it and
+        // rejects, so must we.
+        let (_tags, gens, out, ob) = setup(1, 0);
+        let m = message(&gens, &out);
+        let secret = Scalar::from_bytes_be(&ob)
+            .unwrap()
+            .sub(&Scalar::from_bytes_be(&blind(0)).unwrap());
+        let key = out.as_point().add(&gens[0].as_point().negate());
+        assert!(bool::from(
+            ProjectivePoint::mul_generator(&secret).ct_eq(&key)
+        ));
+
+        let e0 = close(&[0u8; 33], &m);
+        let e = Scalar::from_bytes_be_reduce(&challenge(&e0, &m, 0, 0));
+        let s0 = Scalar::ZERO.sub(&e.mul(&secret));
+        let r = ProjectivePoint::mul_generator(&s0).add(&key.mul(&e));
+        assert!(
+            r.to_affine().is_none(),
+            "the construction must hit infinity"
+        );
+
+        let proof = SurjectionProof {
+            n_inputs: 1,
+            used: vec![0x01],
+            e0,
+            s: vec![s0.to_bytes_be()],
+        };
+        assert_eq!(proof.verify(&gens, &out), Err(Error::Verification));
+        // The same bytes through the parser.
+        let parsed = SurjectionProof::parse(&proof.serialize()).unwrap();
+        assert_eq!(parsed.verify(&gens, &out), Err(Error::Verification));
     }
 
     #[test]

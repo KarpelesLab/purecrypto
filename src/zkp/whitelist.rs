@@ -96,11 +96,14 @@
 //! sets are committed as vectors (`source: "oracle"` and
 //! `source: "purecrypto"`). Signatures are randomized, so the two sides do not
 //! produce identical bytes for the same statement; what is byte-exact is the
-//! encoding and the transcript, which is what cross-verification establishes. Two behaviours are *inferred*
-//! rather than observed, because they occur with probability about `2^-128`
-//! and cannot be triggered: how upstream treats a challenge hash `e` that is
+//! encoding and the transcript, which is what cross-verification establishes.
+//! Two behaviours are *inferred* rather than observed, because they occur with
+//! probability about `2^-128` for an honest signer and cannot be triggered
+//! through the oracle's API: how upstream treats a challenge hash `e` that is
 //! `>= n` (we reduce it modulo `n`) and an `R` that is the point at infinity
-//! (we serialize 33 zero bytes, which makes verification fail).
+//! (upstream cannot serialize it and fails; [`verify`] rejects it outright —
+//! a dishonest signer *can* force it, with a zero nonce, so it is not left to
+//! chance).
 
 use alloc::vec::Vec;
 
@@ -198,10 +201,13 @@ fn check_scalar(b: &[u8; 32]) -> Result<(), Error> {
 
 /// Compressed serialization of a point, or 33 zero bytes for the identity.
 ///
-/// The identity has no SEC1 encoding. It only arises here with negligible
-/// probability (an `R` value that lands on infinity), and the substitute keeps
-/// the transcript well defined instead of panicking; such a proof then fails
-/// verification.
+/// The identity has no SEC1 encoding. Only the signer uses this substitute,
+/// on values it discards (the chain positions before its own), on a nonce
+/// commitment that is the identity with negligible probability, and on the
+/// deliberately accepted degenerate tweak point `Q_i + W = O`; it keeps the
+/// constant-time walk well defined instead of panicking. [`verify`] never
+/// substitutes for an `R`: one on infinity is rejected outright, as upstream
+/// does.
 fn ser_point(p: &ProjectivePoint) -> CompressedPoint {
     match p.to_affine() {
         Some(a) => a.to_sec1_compressed(),
@@ -402,7 +408,8 @@ pub fn sign<R: RngCore + CryptoRng>(
 /// or longer than [`MAX_KEYS`], or if a public key is not a valid curve point;
 /// [`Error::Malformed`] if a public key has a bad length or SEC1 tag;
 /// [`Error::Verification`] if the proof's ring size does not match the key
-/// lists or the ring does not close.
+/// lists, if an `R` value is the point at infinity, or if the ring does not
+/// close.
 pub fn verify(
     proof: &Whitelist,
     online_pubkeys: &[CompressedPoint],
@@ -422,7 +429,13 @@ pub fn verify(
         // scalars, but fail closed rather than unwrap.
         let s = Scalar::from_bytes_be(si).map_err(|_| Error::Verification)?;
         let es = Scalar::from_bytes_be_reduce(&e);
-        r = ser_point(&ProjectivePoint::mul_generator(&s).add(&ki.mul(&es)));
+        // An `R` on infinity has no encoding to hash; a signer reaches it only
+        // with a zero nonce, and upstream rejects such a proof.
+        r = ProjectivePoint::mul_generator(&s)
+            .add(&ki.mul(&es))
+            .to_affine()
+            .ok_or(Error::Verification)?
+            .to_sec1_compressed();
         if i + 1 < n {
             e = challenge(&r, &m, 0, (i + 1) as u32);
         }
@@ -671,6 +684,44 @@ mod tests {
         for cut in 0..bytes.len() {
             assert!(Whitelist::from_bytes(&bytes[..cut]).is_err());
         }
+    }
+
+    #[test]
+    fn rejects_an_r_on_infinity() {
+        // A signer with nonce k = 0 in a one-member ring: R = k·G is the
+        // identity, and s = 0 − e·secret makes the verifier's
+        // R = s·G + e·K land on infinity too. Serializing that as 33 zero
+        // bytes would close the ring; upstream cannot encode it and rejects,
+        // so must we.
+        let (on, off, sub, osk, ssk) = ring(1, 0);
+        let (keys, m) = ring_keys(&on, &off, &sub).unwrap();
+        let online = Scalar::from_bytes_be(&osk).unwrap();
+        let summed = Scalar::from_bytes_be(&ssk).unwrap();
+        let tweak = Scalar::from_bytes_be_reduce(&Sha256::digest(&ser_point(
+            &ProjectivePoint::mul_generator(&summed),
+        )));
+        let secret = online.add(&tweak.mul(&summed));
+        assert!(bool::from(
+            ProjectivePoint::mul_generator(&secret).ct_eq(&keys[0])
+        ));
+
+        let e0 = close(&[0u8; 33], &m);
+        let e = Scalar::from_bytes_be_reduce(&challenge(&e0, &m, 0, 0));
+        let s0 = Scalar::ZERO.sub(&e.mul(&secret));
+        let r = ProjectivePoint::mul_generator(&s0).add(&keys[0].mul(&e));
+        assert!(
+            r.to_affine().is_none(),
+            "the construction must hit infinity"
+        );
+
+        let proof = Whitelist {
+            e0,
+            s: vec![s0.to_bytes_be()],
+        };
+        assert_eq!(verify(&proof, &on, &off, &sub), Err(Error::Verification));
+        // The same bytes through the parser.
+        let parsed = Whitelist::from_bytes(&proof.to_bytes()).unwrap();
+        assert_eq!(verify(&parsed, &on, &off, &sub), Err(Error::Verification));
     }
 
     #[test]
