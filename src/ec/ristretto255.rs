@@ -80,8 +80,31 @@ impl R255 {
 /// Internally an edwards25519 point; equality is the ristretto equivalence
 /// (RFC 9496 §4.3.3), **not** a raw coordinate comparison, so two
 /// representatives of the same ristretto element compare equal.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct RistrettoPoint(Point);
+
+impl core::fmt::Debug for RistrettoPoint {
+    /// Prints the canonical ristretto255 encoding rather than the underlying
+    /// Edwards coordinates: those differ between representatives of the same
+    /// element (so are misleading in a diff) and, for a point derived from a
+    /// secret, can leak more than the public encoding does.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RistrettoPoint(")?;
+        for b in self.compress().to_bytes() {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// Best-effort wipe of a scalar's plaintext byte copy, with an optimisation
+/// barrier so the stores are not elided. The scalar fed to `mul`/`mul_base`
+/// is usually a private key or nonce.
+#[inline]
+fn wipe_scalar_bytes(b: &mut [u8; 32]) {
+    b.fill(0);
+    let _ = core::hint::black_box(&b);
+}
 
 /// The canonical 32-byte encoding of a [`RistrettoPoint`] (RFC 9496 §4.3.1).
 #[derive(Clone, Copy, Debug)]
@@ -117,16 +140,20 @@ impl RistrettoPoint {
     /// Scalar multiplication `[scalar]·self`, constant-time.
     pub fn mul(&self, scalar: &Scalar) -> RistrettoPoint {
         let f = Field::new();
-        let bytes = scalar.to_bytes();
-        RistrettoPoint(f.scalar_mult(&bytes, &self.0))
+        let mut bytes = scalar.to_bytes();
+        let out = RistrettoPoint(f.scalar_mult(&bytes, &self.0));
+        wipe_scalar_bytes(&mut bytes);
+        out
     }
 
     /// Scalar multiplication of the generator `[scalar]·B`, constant-time
     /// (precomputed fixed-base comb).
     pub fn mul_base(scalar: &Scalar) -> RistrettoPoint {
         let f = Field::new();
-        let bytes = scalar.to_bytes();
-        RistrettoPoint(f.mul_base(&bytes))
+        let mut bytes = scalar.to_bytes();
+        let out = RistrettoPoint(f.mul_base(&bytes));
+        wipe_scalar_bytes(&mut bytes);
+        out
     }
 
     /// Constant-time ristretto equality (RFC 9496 §4.3.3): two points `P`, `Q`
@@ -556,5 +583,58 @@ mod tests {
         let mut b = [0u8; 64];
         b[..8].copy_from_slice(&k.to_le_bytes());
         Scalar::from_bytes_mod_order(&b)
+    }
+
+    /// `Debug` shows the canonical ristretto encoding, not the Edwards
+    /// coordinates: two representatives of the same element print
+    /// identically, and the output is exactly the hex of `compress()`.
+    #[test]
+    fn debug_prints_canonical_encoding() {
+        use core::fmt::Write;
+
+        /// A fixed-size `fmt::Write` sink, so the test needs no allocator.
+        struct Sink {
+            buf: [u8; 96],
+            len: usize,
+        }
+        impl Write for Sink {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let b = s.as_bytes();
+                self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+                self.len += b.len();
+                Ok(())
+            }
+        }
+        fn render(args: core::fmt::Arguments<'_>) -> ([u8; 96], usize) {
+            let mut s = Sink {
+                buf: [0u8; 96],
+                len: 0,
+            };
+            s.write_fmt(args).unwrap();
+            (s.buf, s.len)
+        }
+
+        let b = RistrettoPoint::basepoint();
+        // [2]B via addition and via the fixed-base comb: same element,
+        // different internal coordinates.
+        let p = b.add(&b);
+        let q = RistrettoPoint::mul_base(&scalar_small(2));
+        assert_eq!(p, q);
+        let (dp, lp) = render(format_args!("{p:?}"));
+        let (dq, lq) = render(format_args!("{q:?}"));
+        assert_eq!(&dp[..lp], &dq[..lq]);
+
+        let mut want = Sink {
+            buf: [0u8; 96],
+            len: 0,
+        };
+        want.write_str("RistrettoPoint(").unwrap();
+        for byte in p.compress().to_bytes() {
+            write!(want, "{byte:02x}").unwrap();
+        }
+        want.write_str(")").unwrap();
+        assert_eq!(&dp[..lp], &want.buf[..want.len]);
+        // And that is the RFC 9496 vector for [2]B.
+        assert_eq!(p.compress().to_bytes(), from_hex::<32>(MULTIPLES[2]));
     }
 }

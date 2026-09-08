@@ -139,8 +139,22 @@ impl core::fmt::Debug for Scalar {
 ///
 /// Compression / decompression follow RFC 8032 §5.1.2–5.1.3 (32 bytes, sign
 /// bit in the top bit of the last byte).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct EdwardsPoint(pub(crate) Point);
+
+impl core::fmt::Debug for EdwardsPoint {
+    /// Prints the canonical RFC 8032 encoding rather than the raw projective
+    /// `(X:Y:Z:T)` coordinates: those differ between representatives of the
+    /// same point (so are misleading in a diff) and, for a point derived from
+    /// a secret, can leak more than the public encoding does.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("EdwardsPoint(")?;
+        for b in self.compress() {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
 
 impl EdwardsPoint {
     /// The edwards25519 basepoint `B` (RFC 8032).
@@ -177,16 +191,20 @@ impl EdwardsPoint {
     /// `[scalar]·self`, constant-time.
     pub fn mul(&self, scalar: &Scalar) -> EdwardsPoint {
         let f = Field::new();
-        let bytes = scalar_bytes(&scalar.0);
-        EdwardsPoint(f.scalar_mult(&bytes, &self.0))
+        let mut bytes = scalar_bytes(&scalar.0);
+        let out = EdwardsPoint(f.scalar_mult(&bytes, &self.0));
+        wipe_scalar_bytes(&mut bytes);
+        out
     }
 
     /// `[scalar]·B` (scalar times the basepoint), constant-time (precomputed
     /// fixed-base comb).
     pub fn mul_base(scalar: &Scalar) -> EdwardsPoint {
         let f = Field::new();
-        let bytes = scalar_bytes(&scalar.0);
-        EdwardsPoint(f.mul_base(&bytes))
+        let mut bytes = scalar_bytes(&scalar.0);
+        let out = EdwardsPoint(f.mul_base(&bytes));
+        wipe_scalar_bytes(&mut bytes);
+        out
     }
 
     /// `[8]self` — multiply by the curve cofactor.
@@ -270,6 +288,15 @@ fn scalar_bytes(v: &ScalarInt) -> [u8; 32] {
     b
 }
 
+/// Best-effort wipe of a scalar's plaintext byte copy, with an optimisation
+/// barrier so the stores are not elided (the idiom `Scalar::drop` uses). The
+/// scalar fed to `mul`/`mul_base` is usually a private key or nonce.
+#[inline]
+fn wipe_scalar_bytes(b: &mut [u8; 32]) {
+    b.fill(0);
+    let _ = core::hint::black_box(&b);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +347,57 @@ mod tests {
         let g3 = g2.add(&g);
         let three = two.add(&Scalar::ONE);
         assert_eq!(EdwardsPoint::mul_base(&three), g3);
+    }
+
+    /// `Debug` shows the canonical encoding, not projective coordinates: two
+    /// representatives of the same point print identically, and the output is
+    /// exactly the hex of `compress()`.
+    #[test]
+    fn debug_prints_canonical_encoding() {
+        use core::fmt::Write;
+
+        /// A fixed-size `fmt::Write` sink, so the test needs no allocator.
+        struct Sink {
+            buf: [u8; 96],
+            len: usize,
+        }
+        impl Write for Sink {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                let b = s.as_bytes();
+                self.buf[self.len..self.len + b.len()].copy_from_slice(b);
+                self.len += b.len();
+                Ok(())
+            }
+        }
+        fn render(args: core::fmt::Arguments<'_>) -> ([u8; 96], usize) {
+            let mut s = Sink {
+                buf: [0u8; 96],
+                len: 0,
+            };
+            s.write_fmt(args).unwrap();
+            (s.buf, s.len)
+        }
+
+        let g = EdwardsPoint::generator();
+        let two = Scalar::ONE.add(&Scalar::ONE);
+        // [2]B via doubling and via the ladder have different (X:Y:Z:T).
+        let a = g.double();
+        let b = g.mul(&two);
+        assert_eq!(a, b);
+        let (da, la) = render(format_args!("{a:?}"));
+        let (db, lb) = render(format_args!("{b:?}"));
+        assert_eq!(&da[..la], &db[..lb]);
+
+        let mut want = Sink {
+            buf: [0u8; 96],
+            len: 0,
+        };
+        want.write_str("EdwardsPoint(").unwrap();
+        for byte in a.compress() {
+            write!(want, "{byte:02x}").unwrap();
+        }
+        want.write_str(")").unwrap();
+        assert_eq!(&da[..la], &want.buf[..want.len]);
     }
 
     #[test]
