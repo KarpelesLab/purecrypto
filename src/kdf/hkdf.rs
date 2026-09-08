@@ -93,6 +93,9 @@ pub fn try_hkdf_expand_parts<D: Digest>(
         filled += take;
         counter = counter.wrapping_add(1);
     }
+    // `prev` still holds the last T(i), a suffix of which may not even have
+    // been copied to `out`; wipe it (`prf` is wiped by its own `Drop`).
+    super::wipe(prev.as_mut());
     Ok(())
 }
 
@@ -147,6 +150,9 @@ pub fn try_hkdf_expand<D: Digest>(
         counter = counter.wrapping_add(1);
     }
 
+    // `prev` still holds the last T(i), a suffix of which may not even have
+    // been copied to `out`; wipe it (`prf` is wiped by its own `Drop`).
+    super::wipe(prev.as_mut());
     Ok(())
 }
 

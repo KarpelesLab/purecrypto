@@ -45,6 +45,10 @@ macro_rules! keccak_hash {
                 let mut out = [0u8; $out];
                 self.keccak.finalize($pad);
                 self.keccak.squeeze(&mut out);
+                // `self` is consumed and has no `Drop`; the sponge (which
+                // still holds the absorbed tail via the invertible
+                // permutation) is wiped before returning.
+                self.keccak.zeroize();
                 out
             }
             #[inline]

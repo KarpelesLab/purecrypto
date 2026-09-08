@@ -35,3 +35,13 @@ pub use kbkdf::{
     HmacSha512Prf, Prf, kbkdf_counter, kbkdf_counter_fixed, kbkdf_feedback, kbkdf_feedback_fixed,
 };
 pub use pbkdf2::pbkdf2;
+
+/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence with
+/// `core::hint::black_box` so the writes are not elided as dead stores.
+#[inline]
+pub(crate) fn wipe(buf: &mut [u8]) {
+    for b in buf.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(buf);
+}

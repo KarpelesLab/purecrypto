@@ -290,7 +290,11 @@ impl Blake3 {
         ctx.update(context.as_bytes());
         let mut context_key = [0u8; 32];
         ctx.finalize_into_slice(&mut context_key);
-        Self::from_key_words(words_from_key(&context_key), DERIVE_KEY_MATERIAL)
+        let hasher = Self::from_key_words(words_from_key(&context_key), DERIVE_KEY_MATERIAL);
+        // The context key is key material; it now lives only in the hasher's
+        // key words (wiped on drop), so clear the stack copy.
+        super::zeroize::zero_bytes(&mut context_key);
+        hasher
     }
 
     fn push_cv(&mut self, cv: [u32; 8]) {

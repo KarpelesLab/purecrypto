@@ -181,7 +181,12 @@ impl State256 {
         self.block[56..64].copy_from_slice(&bit_len.to_be_bytes());
         compress256(&mut self.h, &self.block);
 
-        self.h
+        // `self` is consumed here and has no `Drop`; the partial block still
+        // holds the tail of the message (possibly key material when used
+        // under HMAC/KDFs), so wipe it and the state words before returning.
+        let out = self.h;
+        self.zeroize();
+        out
     }
 }
 

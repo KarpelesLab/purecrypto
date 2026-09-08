@@ -261,7 +261,7 @@ pub fn kbkdf_counter_fixed<P: Prf>(ki: &[u8], fixed: &[u8], out: &mut [u8]) -> R
         out[filled..filled + take].copy_from_slice(&block[..take]);
         filled += take;
     }
-    block.iter_mut().for_each(|b| *b = 0);
+    super::wipe(&mut block);
     Ok(())
 }
 
@@ -303,8 +303,8 @@ pub fn kbkdf_feedback_fixed<P: Prf>(
         out[filled..filled + take].copy_from_slice(&block[..take]);
         filled += take;
     }
-    prev.iter_mut().for_each(|b| *b = 0);
-    block.iter_mut().for_each(|b| *b = 0);
+    super::wipe(&mut prev);
+    super::wipe(&mut block);
     Ok(())
 }
 
@@ -356,7 +356,7 @@ pub fn kbkdf_counter<P: Prf>(
         out[filled..filled + take].copy_from_slice(&block[..take]);
         filled += take;
     }
-    block.iter_mut().for_each(|b| *b = 0);
+    super::wipe(&mut block);
     Ok(())
 }
 
@@ -397,8 +397,8 @@ pub fn kbkdf_feedback<P: Prf>(
         out[filled..filled + take].copy_from_slice(&block[..take]);
         filled += take;
     }
-    prev.iter_mut().for_each(|b| *b = 0);
-    block.iter_mut().for_each(|b| *b = 0);
+    super::wipe(&mut prev);
+    super::wipe(&mut block);
     Ok(())
 }
 

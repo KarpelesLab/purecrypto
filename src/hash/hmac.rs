@@ -94,9 +94,12 @@ impl<D: Digest> Hmac<D> {
     pub fn finalize(mut self) -> D::Output {
         // Extract the hashers rather than moving them out of `self`, which the
         // `Drop` impl forbids; the leftover fresh hashers are wiped on drop.
-        let inner = core::mem::replace(&mut self.inner, D::new()).finalize();
+        let mut inner = core::mem::replace(&mut self.inner, D::new()).finalize();
         let mut outer = core::mem::replace(&mut self.outer, D::new());
         outer.update(inner.as_ref());
+        // The inner digest is keyed intermediate state (H(K ^ ipad || m)),
+        // not the tag; wipe it once it has been folded into the outer hash.
+        super::zeroize::zero_bytes(inner.as_mut());
         outer.finalize()
     }
 
