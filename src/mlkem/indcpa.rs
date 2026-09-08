@@ -302,6 +302,13 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
         dk[i * POLYBYTES..(i + 1) * POLYBYTES].copy_from_slice(&poly::to_bytes(&s[i]));
     }
 
+    // Wipe the secret polynomials: the sampled `s ‖ e` pair and the NTT-domain
+    // copies of `s` (the private key itself) and `e` (which with the public
+    // `t̂` and `Â` gives `ŝ` back). `t̂` and `Â` are public.
+    wipe_polys(se.as_flattened_mut());
+    wipe_polys(&mut s);
+    wipe_polys(&mut e);
+
     // Wipe the transient secrets: the G input (a copy of the seed `d`, which
     // alone reconstructs the whole key), the G output, and the noise seed σ.
     // ρ is public (it is serialized into `ek`).
@@ -339,7 +346,7 @@ pub(crate) fn encrypt<
     let mut rho = [0u8; 32];
     rho.copy_from_slice(&ek[POLYBYTES * K..]);
 
-    let mu = poly::from_msg(m);
+    let mut mu = poly::from_msg(m);
     let at = gen_matrix::<K>(&rho, true);
 
     // r̂ uses PRF_η₁ (nonces 0..K); e₁ ‖ e₂ is one run of K+1 PRF_η₂ streams
@@ -349,8 +356,8 @@ pub(crate) fn encrypt<
     fill_noise::<ETA1>(coins, 0, &mut sp);
     let mut ep_epp = [[Poly::zero(); K]; 2];
     fill_noise::<ETA2>(coins, K as u8, &mut ep_epp.as_flattened_mut()[..K + 1]);
-    let ep = ep_epp[0];
-    let epp = ep_epp[1][0];
+    let mut ep = ep_epp[0];
+    let mut epp = ep_epp[1][0];
 
     vec_ntt::<K>(&mut sp);
 
@@ -378,6 +385,17 @@ pub(crate) fn encrypt<
         poly::compress::<DU>(&u[i], &mut ct[i * du_b..(i + 1) * du_b]);
     }
     poly::compress::<DV>(&v, &mut ct[du_b * K..du_b * K + dv_b]);
+
+    // Wipe the encryption randomness (`r̂`, `e₁`, `e₂` — with the ciphertext
+    // they reveal the message) and the message polynomial `μ`; `u`/`v` are
+    // the uncompressed ciphertext, whose dropped low bits are the noise.
+    wipe_polys(&mut sp);
+    wipe_polys(ep_epp.as_flattened_mut());
+    wipe_polys(&mut ep);
+    wipe_polys(core::slice::from_mut(&mut epp));
+    wipe_polys(core::slice::from_mut(&mut mu));
+    wipe_polys(&mut u);
+    wipe_polys(core::slice::from_mut(&mut v));
 }
 
 /// K-PKE.Decrypt (FIPS 203 Algorithm 15). Returns the recovered message.
@@ -411,7 +429,28 @@ pub(crate) fn decrypt<const K: usize, const DU: usize, const DV: usize>(
     let mut m_poly = Poly::zero();
     m_poly.sub(&v, &w);
     m_poly.reduce();
-    poly::to_msg(&m_poly)
+    let m = poly::to_msg(&m_poly);
+
+    // Wipe the private key polynomials, the `ŝᵀ ∘ û` product (secret-derived)
+    // and the recovered message polynomial; `û` is the transformed ciphertext,
+    // wiped alongside as it was consumed with `ŝ`.
+    wipe_polys(&mut s);
+    wipe_polys(core::slice::from_mut(&mut w));
+    wipe_polys(&mut u);
+    wipe_polys(core::slice::from_mut(&mut m_poly));
+    m
+}
+
+/// Zeroizes the coefficient memory of every polynomial in `v` before it
+/// drops; `black_box` keeps the writes from being eliminated as dead stores
+/// (same wipe pattern as the byte-buffer epilogues in this module).
+fn wipe_polys(v: &mut [Poly]) {
+    for p in v.iter_mut() {
+        for c in p.c.iter_mut() {
+            *c = 0;
+        }
+    }
+    let _ = core::hint::black_box(&*v);
 }
 
 #[cfg(test)]

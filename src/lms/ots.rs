@@ -209,6 +209,13 @@ mod lmots_x8 {
         k_hash.update(&q.to_be_bytes());
         k_hash.update(&D_PBLC.to_be_bytes());
 
+        // Lane buffers are declared once and reused (not shadowed) so that
+        // every copy of the seed / chain secrets lives in memory that is wiped
+        // before returning.
+        let mut blocks = [[0u8; 64]; L];
+        let mut states = [H256; L];
+        let mut tmps = [[0u8; N]; L];
+
         let mut c0 = 0usize;
         while c0 < p {
             let lanes = (p - c0).min(L);
@@ -216,26 +223,23 @@ mod lmots_x8 {
             // derive_x for the lanes of this group. Lanes beyond `lanes`
             // duplicate the first chain of the group so the kernel stays in
             // bounds; their outputs are never consumed.
-            let mut blocks = [[0u8; 64]; L];
             for (l, blk) in blocks.iter_mut().enumerate() {
                 let chain = if l < lanes { c0 + l } else { c0 };
                 *blk = block55(i_id, q, chain as u16, 0xff, seed);
             }
-            let mut states = [H256; L];
+            states = [H256; L];
             compress(&mut states, &blocks);
-            let mut tmps = [[0u8; N]; L];
             for (l, tmp) in tmps.iter_mut().enumerate() {
                 *tmp = state_be(&states[l]);
             }
 
             // Run the chains in lockstep over the full 0..max range.
             for j in 0..max {
-                let mut blocks = [[0u8; 64]; L];
                 for (l, blk) in blocks.iter_mut().enumerate() {
                     let chain = if l < lanes { c0 + l } else { c0 };
                     *blk = block55(i_id, q, chain as u16, j as u8, &tmps[l]);
                 }
-                let mut states = [H256; L];
+                states = [H256; L];
                 compress(&mut states, &blocks);
                 for (l, tmp) in tmps.iter_mut().enumerate() {
                     *tmp = state_be(&states[l]);
@@ -248,6 +252,15 @@ mod lmots_x8 {
             }
             c0 += lanes;
         }
+
+        // `blocks` embedded the master seed (derive_x) and every chain
+        // intermediate; `states`/`tmps` held the private x values.
+        super::super::wipe(blocks.as_flattened_mut());
+        super::super::wipe(tmps.as_flattened_mut());
+        for w in states.as_flattened_mut() {
+            *w = 0;
+        }
+        let _ = core::hint::black_box(&states);
 
         k_hash.finalize()
     }

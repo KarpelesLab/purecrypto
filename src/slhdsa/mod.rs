@@ -29,6 +29,15 @@ use params::{MAX_CONTEXT, MAX_K, MAX_M, MAX_N, MAX_WOTS_LEN, Params, SETS};
 use crate::ct::ConstantTimeEq;
 use crate::rng::{CryptoRng, RngCore};
 
+/// Zeroizes `v` before it drops; `black_box` keeps the writes from being
+/// eliminated as dead stores (the wipe idiom used by the key epilogues below).
+fn wipe(v: &mut [u8]) {
+    for b in v.iter_mut() {
+        *b = 0;
+    }
+    let _ = core::hint::black_box(&*v);
+}
+
 /// Errors from SLH-DSA operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -365,8 +374,8 @@ mod wots_x8 {
                 io.copy_from_slice(&tmp[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
+            let mut b1 = [[0u8; 64]; L];
             for step in 0..15u32 {
-                let mut b1 = [[0u8; 64]; L];
                 for (l, slot) in b1.iter_mut().enumerate() {
                     // Remainder lanes duplicate the first active chain.
                     let chain = if l < lanes { c0 + l } else { c0 };
@@ -385,6 +394,10 @@ mod wots_x8 {
             for (l, io) in inout.iter().enumerate().take(lanes) {
                 tmp[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
             }
+            // The lane buffers carried the secret chain starts and every
+            // intermediate value; wipe them before the next group / return.
+            super::wipe(inout.as_flattened_mut());
+            super::wipe(b1.as_flattened_mut());
             c0 += lanes;
         }
     }
@@ -505,10 +518,14 @@ mod wots_shake_x4 {
                 a.set_chain(chain as u32);
                 msg_len = fill_msg::<N>(m, pk_seed, a.bytes(), &[&sk_seed[..N]]);
             }
-            let outs = shake_n::<N, L>(&msgs, msg_len);
+            let mut outs = shake_n::<N, L>(&msgs, msg_len);
             for (l, o) in outs.iter().enumerate().take(lanes) {
                 tmp[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(o);
             }
+            // The lane messages embed SK.seed and the outputs are the secret
+            // chain starts (the caller owns the copies in `tmp`).
+            super::wipe(msgs.as_flattened_mut());
+            super::wipe(outs.as_flattened_mut());
             c0 += lanes;
         }
     }
@@ -551,8 +568,8 @@ mod wots_shake_x4 {
                 io.copy_from_slice(&tmp[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
+            let mut msgs = [[0u8; RATE]; L];
             for step in 0..15u32 {
-                let mut msgs = [[0u8; RATE]; L];
                 let mut msg_len = 0;
                 for (l, m) in msgs.iter_mut().enumerate() {
                     // Remainder lanes duplicate the first active chain.
@@ -568,6 +585,10 @@ mod wots_shake_x4 {
             for (l, io) in inout.iter().enumerate().take(lanes) {
                 tmp[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
             }
+            // The lane buffers carried the secret chain starts and every
+            // intermediate value; wipe them before the next group / return.
+            super::wipe(inout.as_flattened_mut());
+            super::wipe(msgs.as_flattened_mut());
             c0 += lanes;
         }
     }
@@ -992,6 +1013,8 @@ fn fors_node_scalar(
         addr.set_tree_height(0);
         addr.set_tree_index(node_id);
         hash::f(p, pk_seed, addr.bytes(), &sk[..n], out);
+        // The FORS secret value is revealed only for the signed leaf; wipe it.
+        wipe(&mut sk);
     } else {
         let mut lnode = [0u8; MAX_N];
         let mut rnode = [0u8; MAX_N];
@@ -1114,11 +1137,21 @@ mod fors_x4 {
             addr.set_tree_index(leaf0 + l as u32);
             *slot = block1_f(addr.bytes(), &nodes[l]);
         }
-        let mut st = [*mid256; 8];
+        // Reuse (rather than shadow) `st` so the PRF-output states do not
+        // linger on the stack next to the wiped blocks.
+        st = [*mid256; 8];
         compress8(&mut st, &blocks);
         for (l, node) in nodes.iter_mut().enumerate() {
             state_be(&st[l], node);
         }
+        // `blocks` embedded SK.seed (first pass) and the secret FORS values
+        // (second pass); `nodes` was overwritten in place with the public
+        // leaves. Wipe the blocks and the compression states.
+        super::wipe(blocks.as_flattened_mut());
+        for w in st.as_flattened_mut() {
+            *w = 0;
+        }
+        let _ = core::hint::black_box(&st);
         nodes
     }
 
@@ -1312,6 +1345,8 @@ mod fors_shake_x4 {
         let mut sk_addr = *addr;
         sk_addr.set_type_and_clear(AdrsType::ForsPrf);
         sk_addr.copy_key_pair(addr);
+        // Every lane message below embeds a secret (SK.seed, then the FORS
+        // secret values); each batch is wiped once absorbed.
         let mut sk_nodes = [[0u8; N]; 8];
         if crate::hash::keccak_x4::supported8() {
             let mut msgs = [[0u8; RATE]; 8];
@@ -1321,6 +1356,7 @@ mod fors_shake_x4 {
                 msg_len = fill_msg::<N>(m, pk_seed, sk_addr.bytes(), &[&sk_seed[..N]]);
             }
             sk_nodes = shake_n::<N, 8>(&msgs, msg_len);
+            super::wipe(msgs.as_flattened_mut());
         } else {
             for (half, out4) in sk_nodes.chunks_exact_mut(4).enumerate() {
                 let mut msgs = [[0u8; RATE]; 4];
@@ -1330,6 +1366,7 @@ mod fors_shake_x4 {
                     msg_len = fill_msg::<N>(m, pk_seed, sk_addr.bytes(), &[&sk_seed[..N]]);
                 }
                 out4.copy_from_slice(&shake_n::<N, 4>(&msgs, msg_len));
+                super::wipe(msgs.as_flattened_mut());
             }
         }
 
@@ -1343,6 +1380,7 @@ mod fors_shake_x4 {
                 msg_len = fill_msg::<N>(m, pk_seed, addr.bytes(), &[&sk_nodes[l]]);
             }
             nodes = shake_n::<N, 8>(&msgs, msg_len);
+            super::wipe(msgs.as_flattened_mut());
         } else {
             for (half, out4) in nodes.chunks_exact_mut(4).enumerate() {
                 let mut msgs = [[0u8; RATE]; 4];
@@ -1352,8 +1390,10 @@ mod fors_shake_x4 {
                     msg_len = fill_msg::<N>(m, pk_seed, addr.bytes(), &[&sk_nodes[half * 4 + l]]);
                 }
                 out4.copy_from_slice(&shake_n::<N, 4>(&msgs, msg_len));
+                super::wipe(msgs.as_flattened_mut());
             }
         }
+        super::wipe(sk_nodes.as_flattened_mut());
         nodes
     }
 

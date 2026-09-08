@@ -398,6 +398,12 @@ mod wots_x8 {
         b0[32..64].copy_from_slice(&sk_seed[..N]);
         let mut keygen_mid = H256;
         compress256_soft(&mut keygen_mid, &b0);
+        // `b0` is a copy of SK_SEED; the midstate is wiped on the way out
+        // (it derives every WOTS+ secret of the key, like the seed itself).
+        for b in b0.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&b0);
 
         // block2 = padding for a 128-byte message: 0x80 then the bit length
         // (1024) in the trailing u64. Identical across all eight lanes.
@@ -438,6 +444,10 @@ mod wots_x8 {
         if p.wots_len > 0 {
             addr.set_chain((p.wots_len - 1) as u32);
         }
+        for w in keygen_mid.iter_mut() {
+            *w = 0;
+        }
+        let _ = core::hint::black_box(&keygen_mid);
     }
 }
 
@@ -1007,18 +1017,20 @@ fn core_keygen(p: &Params, seed: &[u8]) -> (Vec<u8>, Vec<u8>, SubtreeNodes) {
     sk[p.index_bytes..p.index_bytes + 2 * n].copy_from_slice(&seed[..2 * n]); // SK_SEED ‖ SK_PRF
     sk[p.index_bytes + 3 * n..p.index_bytes + 4 * n].copy_from_slice(&seed[2 * n..3 * n]); // PUB_SEED
 
-    // Compute the top-most subtree root.
-    let sk_seed = seed[..n].to_vec();
-    let pub_seed = seed[2 * n..3 * n].to_vec();
+    // Compute the top-most subtree root. Borrow the seeds from the caller's
+    // buffer rather than copying SK_SEED into a heap allocation that would
+    // never be wiped.
+    let sk_seed = &seed[..n];
+    let pub_seed = &seed[2 * n..3 * n];
     let mut top_addr = Adrs::new();
     top_addr.set_layer(p.d - 1);
-    let levels = build_subtree(p, &sk_seed, &pub_seed, &top_addr);
+    let levels = build_subtree(p, sk_seed, pub_seed, &top_addr);
     let th = p.tree_height as usize;
     sk[p.index_bytes + 2 * n..p.index_bytes + 3 * n].copy_from_slice(&levels[th][..n]);
 
     let mut pk = vec![0u8; p.pk_bytes()];
     pk[..n].copy_from_slice(&levels[th][..n]);
-    pk[n..2 * n].copy_from_slice(&pub_seed);
+    pk[n..2 * n].copy_from_slice(pub_seed);
     // Hand the just-built top subtree to the caller so it can seed the signer's
     // cache (the top layer's tree is always tree 0, so this is reused on every
     // signature; for single-tree XMSS it means signing never rebuilds the tree).
