@@ -78,13 +78,58 @@ impl DhGroup {
     /// [`from_custom_unchecked`]: Self::from_custom_unchecked
     pub const MIN_CUSTOM_GROUP_BITS: usize = 2048;
 
-    /// Miller-Rabin rounds used by [`from_custom`](Self::from_custom) on each
-    /// of `p` and `(p − 1) / 2`. A composite survives one round with
-    /// probability ≤ 1/4 even when adversarially chosen (the bases are not
-    /// under attacker control), so 64 rounds bound the false-accept
-    /// probability at `4⁻⁶⁴ = 2⁻¹²⁸` — the worst-case guidance for untrusted
-    /// candidates (FIPS 186-5 §B.3, RFC 4419 §3 server-supplied groups).
+    /// Maximum bit length accepted by [`from_custom`](Self::from_custom) and
+    /// [`from_custom_unchecked`](Self::from_custom_unchecked).
+    ///
+    /// The prime is peer-chosen in RFC 4419 group exchange, and every
+    /// operation on it — the Montgomery precomputation, each Miller-Rabin
+    /// exponentiation, every `g^x mod p` — is quadratic to cubic in its
+    /// width. Without a cap a malicious server can hand over a
+    /// megabit "prime" and pin the client's CPU for minutes before the
+    /// primality test even finishes (a 65536-bit modulus already costs
+    /// ~90 s to validate). 16384 bits is twice the largest RFC 3526 group
+    /// (group18, 8192 bits) and matches the RSA modulus cap; 8192 is the
+    /// largest size any deployment should actually accept, and RFC 4419
+    /// clients bound the size they *ask* for anyway (`max` in the request).
+    pub const MAX_CUSTOM_GROUP_BITS: usize = 16384;
+
+    /// Miller-Rabin rounds [`from_custom`](Self::from_custom) spends on
+    /// `q = (p − 1) / 2` for primes of at most 3072 bits. A composite
+    /// survives one round with probability ≤ 1/4 even when adversarially
+    /// chosen (the bases are HMAC-DRBG-derived from `p` itself, so the
+    /// attacker cannot pick a composite that fools bases chosen after it),
+    /// so 64 rounds bound the false-accept probability at
+    /// `4⁻⁶⁴ = 2⁻¹²⁸` — the worst-case guidance for untrusted candidates
+    /// (FIPS 186-5 §B.3, RFC 4419 §3 server-supplied groups).
+    ///
+    /// `p` itself needs no Miller-Rabin rounds: with `p − 1 = 2q` fully
+    /// factored it is *proved* prime by a Lucas / Pocklington witness (about
+    /// two exponentiations; see `bignum::prime::is_safe_prime_boxed`).
     pub const CUSTOM_GROUP_MR_ROUNDS: usize = 64;
+
+    /// Miller-Rabin rounds for primes wider than 3072 bits: 32, i.e. a
+    /// `4⁻³² = 2⁻⁶⁴` false-accept bound per candidate. Each round on an
+    /// 8192-bit prime is a full 8192-bit exponentiation (~0.17 s), so the
+    /// 2⁻¹²⁸ target would cost ~11 s per group; 2⁻⁶⁴ is far below any
+    /// practical attack budget against a *single* group-exchange peer and
+    /// keeps group18-sized validation around 5 s. The 1/4-per-round bound
+    /// holds for these sizes for the same reason as above (bases derived
+    /// from `p`, not attacker-chosen).
+    pub const CUSTOM_GROUP_MR_ROUNDS_LARGE: usize = 32;
+
+    /// The Miller-Rabin round count [`from_custom`](Self::from_custom) uses
+    /// for a `bits`-bit prime: [`CUSTOM_GROUP_MR_ROUNDS`] up to 3072 bits,
+    /// [`CUSTOM_GROUP_MR_ROUNDS_LARGE`] above.
+    ///
+    /// [`CUSTOM_GROUP_MR_ROUNDS`]: Self::CUSTOM_GROUP_MR_ROUNDS
+    /// [`CUSTOM_GROUP_MR_ROUNDS_LARGE`]: Self::CUSTOM_GROUP_MR_ROUNDS_LARGE
+    pub fn custom_group_mr_rounds(bits: usize) -> usize {
+        if bits <= 3072 {
+            Self::CUSTOM_GROUP_MR_ROUNDS
+        } else {
+            Self::CUSTOM_GROUP_MR_ROUNDS_LARGE
+        }
+    }
 
     /// Builds a custom group from a caller-supplied `(p, g)` pair. Used for
     /// RFC 4419 SSH group-exchange where the server transmits the prime and
@@ -93,75 +138,100 @@ impl DhGroup {
     /// This constructor checks:
     /// * `p` is odd (Montgomery arithmetic requires an odd modulus, and any
     ///   safe prime is odd anyway);
-    /// * `p.bit_len() ≥ MIN_CUSTOM_GROUP_BITS` (default 2048) — below that
-    ///   threshold the DLP is broken in practice, see RFC 4419 §3 and the
-    ///   LogJam precomputation results. Pinned legacy interop can bypass
-    ///   via [`from_custom_unchecked`](Self::from_custom_unchecked);
+    /// * `MIN_CUSTOM_GROUP_BITS ≤ p.bit_len() ≤ MAX_CUSTOM_GROUP_BITS`
+    ///   (2048..=16384) — below the floor the DLP is broken in practice, see
+    ///   RFC 4419 §3 and the LogJam precomputation results; above the cap a
+    ///   peer-chosen prime is a CPU-exhaustion vector. Pinned legacy interop
+    ///   can bypass the floor (not the cap) via
+    ///   [`from_custom_unchecked`](Self::from_custom_unchecked);
     /// * `g ∈ [2, p - 2]` (the only excluded values are 0, 1, and `p - 1`,
     ///   which are tiny-order elements);
-    /// * `p` is a **safe prime**: both `p` and `q = (p − 1) / 2` pass
-    ///   [`CUSTOM_GROUP_MR_ROUNDS`] rounds of Miller-Rabin. The runtime
-    ///   subgroup-confinement check in `shared_secret` (`y^q == 1`) only
-    ///   prevents small-subgroup attacks when `p` is a safe prime — for a
-    ///   non-safe `p` with smooth `(p − 1) / 2`, a malicious group leaks the
-    ///   private exponent modulo the small factors. The Miller-Rabin bases
-    ///   are drawn from an HMAC-DRBG seeded with `p` itself: the verdict is
-    ///   deterministic per group, while an adversary cannot precompute a
-    ///   composite that fools bases it can't choose independently of `p`.
+    /// * `p` is a **safe prime**: `q = (p − 1) / 2` passes trial division
+    ///   and [`custom_group_mr_rounds`] rounds of Miller-Rabin, then `p` is
+    ///   proved prime by a Lucas witness over the now-known factorization
+    ///   `p − 1 = 2q`. The runtime subgroup-confinement check in
+    ///   `shared_secret` (`y^q ∈ {1, p − 1}`) only prevents small-subgroup
+    ///   attacks when `p` is a safe prime — for a non-safe `p` with smooth
+    ///   `(p − 1) / 2`, a malicious group leaks the private exponent modulo
+    ///   the small factors. The Miller-Rabin bases are drawn from an
+    ///   HMAC-DRBG seeded with `p` itself: the verdict is deterministic per
+    ///   group, while an adversary cannot precompute a composite that fools
+    ///   bases it can't choose independently of `p`;
+    /// * `g` has order `q` or `2q`, i.e. `g^q ∈ {1, p − 1}` — anything else
+    ///   is impossible for a genuine safe prime and would mean the group is
+    ///   not what it claims to be. Both orders are accepted: OpenSSH's
+    ///   `moduli` file ships generators that are primitive roots
+    ///   (`g = 2` with `p ≡ 3 (mod 8)`, `g = 5`), whose public values fall
+    ///   outside the order-`q` subgroup for every odd private exponent.
     ///
-    /// It does **not** verify that `g` generates the order-`q` subgroup
-    /// (`g` may also generate the full order-`2q` group; `shared_secret`
-    /// confines *peer* values to the order-`q` subgroup either way).
+    /// The validation costs `custom_group_mr_rounds(bits) + ~3` modular
+    /// exponentiations (about 0.2 s for a 2048-bit group, ~5 s for an
+    /// 8192-bit one in an optimized build), so RFC 4419 group-exchange
+    /// callers should validate a server-supplied group once and cache the
+    /// result rather than re-validating on every handshake.
     ///
-    /// The safe-prime test costs roughly `2 × CUSTOM_GROUP_MR_ROUNDS`
-    /// modular exponentiations, so RFC 4419 group-exchange callers should
-    /// validate a server-supplied group once and cache the result rather
-    /// than re-validating on every handshake.
-    ///
-    /// [`CUSTOM_GROUP_MR_ROUNDS`]: Self::CUSTOM_GROUP_MR_ROUNDS
+    /// [`custom_group_mr_rounds`]: Self::custom_group_mr_rounds
     pub fn from_custom(p: BoxedUint, g: BoxedUint, priv_bits: usize) -> Result<Self, Error> {
-        use crate::bignum::prime::is_prime_boxed;
+        use crate::bignum::BoxedMontModulus;
+        use crate::bignum::prime::is_safe_prime_boxed;
         use crate::hash::Sha256;
         use crate::rng::HmacDrbg;
 
-        if p.bit_len() < Self::MIN_CUSTOM_GROUP_BITS {
+        // Size gates first — before any arithmetic on a peer-chosen width.
+        let bits = p.bit_len();
+        if !(Self::MIN_CUSTOM_GROUP_BITS..=Self::MAX_CUSTOM_GROUP_BITS).contains(&bits) {
             return Err(Error::InvalidGroup);
         }
         let group = Self::from_custom_unchecked(p, g, priv_bits)?;
 
-        // Safe-prime validation: p and q = (p - 1) / 2 must both be
-        // (probable) primes. Bases come from an HMAC-DRBG seeded with the
-        // candidate itself — no ambient RNG is plumbed through this API, and
-        // deriving the bases from `p` denies an adversary the fixed bases a
-        // precomputed Miller-Rabin pseudoprime would need.
+        // Safe-prime validation: q = (p - 1) / 2 must be a (probable) prime
+        // and p must then be prime. Bases come from an HMAC-DRBG seeded with
+        // the candidate itself — no ambient RNG is plumbed through this API,
+        // and deriving the bases from `p` denies an adversary the fixed
+        // bases a precomputed Miller-Rabin pseudoprime would need.
         let mut rng = HmacDrbg::<Sha256>::new(
             &group.p.to_be_bytes(group.byte_size()),
             b"purecrypto-dh-custom-group-mr-bases",
             &[],
         );
-        let q = group.p.sub(&BoxedUint::from_u64(1)).shr_bits(1);
-        if !is_prime_boxed(&group.p, &mut rng, Self::CUSTOM_GROUP_MR_ROUNDS)
-            || !is_prime_boxed(&q, &mut rng, Self::CUSTOM_GROUP_MR_ROUNDS)
-        {
+        if !is_safe_prime_boxed(&group.p, &mut rng, Self::custom_group_mr_rounds(bits)) {
+            return Err(Error::InvalidGroup);
+        }
+
+        // Generator order: for a safe prime every element other than 0, ±1
+        // has order q or 2q, i.e. g^q ∈ {1, p − 1}. (The range check in
+        // `from_custom_unchecked` already excluded 0, 1 and p − 1.)
+        let one = BoxedUint::from_u64(1);
+        let p_minus_one = group.p.sub(&one);
+        let q = p_minus_one.shr_bits(1);
+        let g_to_q = BoxedMontModulus::new(&group.p).pow(&group.g, &q);
+        if g_to_q != one && g_to_q != p_minus_one {
             return Err(Error::InvalidGroup);
         }
         Ok(group)
     }
 
     /// Like [`from_custom`](Self::from_custom) but without the
-    /// [`MIN_CUSTOM_GROUP_BITS`](Self::MIN_CUSTOM_GROUP_BITS) floor or the
-    /// safe-prime (Miller-Rabin) validation — intended only for tests and
-    /// pinned legacy interop where the caller has documented why a
-    /// sub-2048-bit or externally validated prime is acceptable. The
-    /// structural checks (odd modulus, generator in range, sane
-    /// private-exponent bit budget) still apply. Note that the small-subgroup
-    /// defense in `shared_secret` assumes a safe prime; the caller owns that
-    /// property here.
+    /// [`MIN_CUSTOM_GROUP_BITS`](Self::MIN_CUSTOM_GROUP_BITS) floor, the
+    /// safe-prime (Miller-Rabin) validation, or the generator-order check —
+    /// intended only for tests and pinned legacy interop where the caller
+    /// has documented why a sub-2048-bit or externally validated prime is
+    /// acceptable. The structural checks (odd modulus no wider than
+    /// [`MAX_CUSTOM_GROUP_BITS`](Self::MAX_CUSTOM_GROUP_BITS), generator in
+    /// range, sane private-exponent bit budget) still apply. Note that the
+    /// small-subgroup defense in `shared_secret` assumes a safe prime; the
+    /// caller owns that property here.
     pub fn from_custom_unchecked(
         p: BoxedUint,
         g: BoxedUint,
         priv_bits: usize,
     ) -> Result<Self, Error> {
+        // Width cap before any arithmetic: `p.sub` below and the Montgomery
+        // precomputation later are the first things a huge modulus would
+        // make expensive.
+        if p.bit_len() > Self::MAX_CUSTOM_GROUP_BITS {
+            return Err(Error::InvalidGroup);
+        }
         if !p.is_odd() || p.bit_len() < 3 {
             return Err(Error::InvalidGroup);
         }
@@ -422,13 +492,15 @@ pub fn group14() -> DhGroup {
 
 /// Constructs a [`DhGroup`] for RFC 3526 group15 (3072-bit prime).
 ///
-/// `priv_bits = 256` (AES-128 equivalent symmetric strength).
+/// `priv_bits = 288`: RFC 7919 §5.2 / Appendix A recommends at least 275
+/// bits of private exponent for a 3072-bit prime (twice the ~137-bit
+/// security estimate), rounded up to a whole number of 32-bit words.
 pub fn group15() -> DhGroup {
     DhGroup {
         name: "group15",
         p: BoxedUint::from_be_bytes(&GROUP15_P),
         g: BoxedUint::from_u64(2),
-        priv_bits: 256,
+        priv_bits: 288,
     }
 }
 
@@ -487,6 +559,30 @@ mod tests {
         let g = group15();
         assert_eq!(g.bit_size(), 3072);
         assert!(g.p().is_odd());
+        // RFC 7919 §A: ≥ 275 bits of private exponent for a 3072-bit prime.
+        assert!(g.priv_bits() >= 275);
+        assert_eq!(g.priv_bits(), 288);
+    }
+
+    /// Every named group's private-exponent budget meets the RFC 7919
+    /// Appendix A minimum for its prime size (225/275/325/375/400 bits for
+    /// 2048/3072/4096/6144/8192-bit primes).
+    #[test]
+    fn named_group_priv_bits_meet_rfc7919() {
+        for (g, floor) in [
+            (group14(), 225),
+            (group15(), 275),
+            (group16(), 325),
+            (group17(), 375),
+            (group18(), 400),
+        ] {
+            assert!(
+                g.priv_bits() >= floor,
+                "{}: priv_bits {} < RFC 7919 floor {floor}",
+                g.name(),
+                g.priv_bits()
+            );
+        }
     }
 
     #[test]
@@ -569,5 +665,98 @@ mod tests {
         assert!(DhGroup::from_custom_unchecked(p_2047, BoxedUint::from_u64(2), 256).is_ok());
         // group14 (2048 bits exactly) is accepted.
         assert!(DhGroup::from_custom(group14().p().clone(), BoxedUint::from_u64(2), 256).is_ok());
+    }
+
+    /// BN-2: a peer-chosen prime wider than `MAX_CUSTOM_GROUP_BITS` must be
+    /// rejected *before* any primality arithmetic — a 16385-bit odd `p`
+    /// fails fast on both constructors, a 16384-bit one reaches the checks.
+    #[test]
+    fn from_custom_enforces_max_bits() {
+        // 16385 bits = 2049 bytes with only the top bit of the first byte set
+        // (bit index 16384), odd.
+        let mut p_bytes = alloc::vec![0u8; 2049];
+        p_bytes[0] = 0x01;
+        p_bytes[2048] = 0x01;
+        let p = BoxedUint::from_be_bytes(&p_bytes);
+        assert_eq!(p.bit_len(), 16385);
+        // Both rejections happen before any primality arithmetic, so this
+        // runs in microseconds even though `p` is far beyond group18.
+        assert!(matches!(
+            DhGroup::from_custom(p.clone(), BoxedUint::from_u64(2), 512),
+            Err(Error::InvalidGroup)
+        ));
+        assert!(matches!(
+            DhGroup::from_custom_unchecked(p, BoxedUint::from_u64(2), 512),
+            Err(Error::InvalidGroup)
+        ));
+        // Exactly 16384 bits passes the size gate on the unchecked path
+        // (2048 bytes, top bit set, odd).
+        let mut p_bytes = alloc::vec![0u8; 2048];
+        p_bytes[0] = 0x80;
+        p_bytes[2047] = 0x01;
+        let p = BoxedUint::from_be_bytes(&p_bytes);
+        assert_eq!(p.bit_len(), DhGroup::MAX_CUSTOM_GROUP_BITS);
+        assert!(DhGroup::from_custom_unchecked(p, BoxedUint::from_u64(2), 512).is_ok());
+    }
+
+    #[test]
+    fn mr_round_schedule() {
+        assert_eq!(DhGroup::custom_group_mr_rounds(2048), 64);
+        assert_eq!(DhGroup::custom_group_mr_rounds(3072), 64);
+        assert_eq!(DhGroup::custom_group_mr_rounds(4096), 32);
+        assert_eq!(DhGroup::custom_group_mr_rounds(8192), 32);
+    }
+
+    /// BN-1: `from_custom` accepts generators of either order `q` or `2q`
+    /// (for a genuine safe prime every element of `[2, p − 2]` has one of
+    /// the two, so the `g^q ∈ {1, p − 1}` check can only fire on a modulus
+    /// that is not what it claims to be). Both orders on group14's modulus:
+    /// `g = 2` is a quadratic residue (order `q`) and `p − 2 ≡ −2` is a
+    /// non-residue (order `2q`: `−1` is a non-residue for `p ≡ 3 mod 4`,
+    /// `2` is a residue for `p ≡ 7 mod 8`).
+    #[test]
+    fn from_custom_accepts_both_generator_orders() {
+        let p = group14().p().clone();
+        let one = BoxedUint::from_u64(1);
+        let q = p.sub(&one).shr_bits(1);
+        let m = crate::bignum::BoxedMontModulus::new(&p);
+        let two = BoxedUint::from_u64(2);
+        let minus_two = p.sub(&two);
+        assert_eq!(m.pow(&two, &q), one, "2 is a QR mod group14 p");
+        assert_eq!(
+            m.pow(&minus_two, &q),
+            p.sub(&one),
+            "−2 is a QNR mod group14 p"
+        );
+        assert!(DhGroup::from_custom(p.clone(), two, 256).is_ok());
+        assert!(DhGroup::from_custom(p, minus_two, 256).is_ok());
+    }
+
+    /// All five RFC 3526 named groups must pass `from_custom` — they are the
+    /// canonical safe primes, so the safe-prime validation must accept them.
+    /// Ignored by default because the 6144- and 8192-bit validations are
+    /// slow in a debug build; run with `cargo test --release -- --ignored
+    /// --nocapture` to see per-group timings.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "std")]
+    fn named_groups_pass_from_custom() {
+        for (name, g) in [
+            ("group14", group14()),
+            ("group15", group15()),
+            ("group16", group16()),
+            ("group17", group17()),
+            ("group18", group18()),
+        ] {
+            let start = std::time::Instant::now();
+            let custom = DhGroup::from_custom(g.p().clone(), g.g().clone(), g.priv_bits())
+                .unwrap_or_else(|e| panic!("{name} must pass from_custom: {e:?}"));
+            assert_eq!(custom.bit_size(), g.bit_size());
+            std::println!(
+                "from_custom({name}, {} bits): {:?}",
+                g.bit_size(),
+                start.elapsed()
+            );
+        }
     }
 }

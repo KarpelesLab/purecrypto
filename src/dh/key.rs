@@ -170,23 +170,34 @@ impl DhPrivateKey {
     /// Computes the shared secret `peer.y ^ x mod p`.
     ///
     /// Rejects:
-    /// * `peer.y < 2` or `peer.y ≥ p - 1` — coarse range check: the
-    ///   only values in this range are 0, 1, and `p - 1`, all of which
-    ///   are tiny-order elements;
-    /// * `peer.y ^ q mod p ≠ 1` where `q = (p - 1) / 2` — subgroup-
-    ///   confinement (NIST SP 800-56A §5.6.2.3.2 "Full Public-Key
-    ///   Validation"). Without this check an attacker can submit a peer
-    ///   value lying in a small subgroup of size `t | (p - 1)` and recover
-    ///   `x mod t` by exhaustive search of the resulting shared secret. For
-    ///   the RFC 3526 / RFC 7919 safe-prime groups (`p = 2q + 1`, `q`
-    ///   prime), the order-`q` subgroup is the only large subgroup and this
-    ///   test confines `peer.y` to it. This defense is complete only for a
-    ///   safe prime: when `q = (p - 1) / 2` is composite, the order-`q`
-    ///   subgroup itself contains small subgroups, so confinement to it does
-    ///   not stop the attack. [`DhGroup::from_custom`] therefore verifies
-    ///   that both `p` and `q` are (probable) primes; only
-    ///   [`DhGroup::from_custom_unchecked`] groups can reach this code with
-    ///   a non-safe modulus, and those callers own that risk;
+    /// * `peer.y < 2` or `peer.y ≥ p - 1` — range check: the only values
+    ///   outside `[2, p − 2]` are 0, 1, `p - 1` and out-of-range integers,
+    ///   the first three being the elements of order 1 and 2. For a **safe
+    ///   prime** `p = 2q + 1` (every RFC 3526 / RFC 7919 group, and every
+    ///   group [`DhGroup::from_custom`] lets through) this is already the
+    ///   complete small-subgroup defense: the multiplicative group has
+    ///   order `2q`, so every remaining element has order `q` or `2q` and
+    ///   there is no small subgroup to confine `x` into. This is the
+    ///   validation NIST SP 800-56A Rev 3 §5.6.2.3.1 prescribes for
+    ///   safe-prime groups;
+    /// * `peer.y ^ q mod p ∉ {1, p − 1}` where `q = (p − 1) / 2` — a
+    ///   consistency check that, by Euler's criterion, can only fail when
+    ///   `p` is not prime at all. It costs one full-width exponentiation and
+    ///   exists so that a modulus smuggled in through
+    ///   [`DhGroup::from_custom_unchecked`] without the primality test still
+    ///   cannot silently confine `x` to a subgroup of a composite "prime".
+    ///   Note it does **not** protect an unchecked group whose `p` is a
+    ///   prime with smooth `(p − 1) / 2`: those callers own that risk. Both
+    ///   values are accepted deliberately — `y^q ≡ p − 1` means `y` has
+    ///   order `2q` (a generator of the whole group), which is exactly what
+    ///   an honest peer with an odd private exponent sends whenever `g` is
+    ///   a primitive root, as the RFC 4419 groups in OpenSSH's `moduli`
+    ///   file are (`g = 2` with `p ≡ 3 (mod 8)`, or `g = 5`). Insisting on
+    ///   `y^q ≡ 1` would reject half of all honest peers on such groups.
+    ///   The price is the standard, accepted one: for an order-`2q` peer
+    ///   value the shared secret reveals the parity of `x` (one bit of a
+    ///   ≥ 256-bit exponent), which does not affect the DLP hardness the
+    ///   exchange rests on;
     /// * a resulting shared secret of 0 or 1 — contributory-failure
     ///   rejection per NIST SP 800-56A §5.6.2.3.
     pub fn shared_secret(&self, peer: &DhPublicKey) -> Result<SharedSecret, Error> {
@@ -200,20 +211,17 @@ impl DhPrivateKey {
 
         let m = BoxedMontModulus::new(p);
 
-        // Subgroup-confinement: peer.y ^ q mod p must equal 1, where
-        // q = (p - 1) / 2. For a safe prime `p = 2q + 1` (RFC 3526, RFC
-        // 7919, every safe-prime SSH group-exchange responder), `q` is
-        // the order of the prime subgroup; any element of order > 1
-        // outside that subgroup has order 2 (i.e. is `p - 1`), already
-        // ruled out by the coarse range check above. This check assumes a
-        // safe prime — `DhGroup::from_custom` enforces that with a
-        // Miller-Rabin test on both p and q; a `from_custom_unchecked`
-        // group with composite q is NOT protected against small subgroups
-        // inside the order-q subgroup.
+        // peer.y ^ q mod p ∈ {1, p − 1}, q = (p − 1) / 2. For a safe prime
+        // this holds for every y in [2, p − 2] (order q → 1, order 2q →
+        // p − 1) and the range check above is the whole subgroup defense;
+        // only a composite modulus from `from_custom_unchecked` can fail
+        // here. Accepting p − 1 (order-2q peer values) is what keeps
+        // primitive-root generators — the RFC 4419 / OpenSSH `moduli`
+        // groups — interoperable; see the doc comment.
         let q = p_minus_one.shr_bits(1);
         let one = BoxedUint::from_u64(1);
         let y_to_q = m.pow(&peer.y, &q);
-        if !bool::from(y_to_q.ct_eq(&one)) {
+        if !bool::from(y_to_q.ct_eq(&one) | y_to_q.ct_eq(&p_minus_one)) {
             return Err(Error::InvalidPublicKey);
         }
 
@@ -475,47 +483,130 @@ mod tests {
         assert_eq!(s.as_bytes().len(), group14().p().bit_len().div_ceil(8));
     }
 
-    /// DH-1 (subgroup confinement): a peer public value of order 2 — the
-    /// canonical value `p - 1` would be caught by the coarse `[2, p - 2]`
-    /// range check, so we use a custom *non*-safe prime whose group order
-    /// has a small factor, and submit the small-order element. The
-    /// `Y^q mod p == 1` check must reject it.
-    ///
-    /// `p = 11`, `q = (p - 1) / 2 = 5`. The element `10 = p - 1` has order
-    /// 2 (and is filtered by the range check); the element `3` has order 5
-    /// (since `3^5 mod 11 = 243 mod 11 = 1`), so it lies *inside* the
-    /// order-q subgroup and would pass `Y^q == 1`. To get something that
-    /// passes the range check but fails subgroup confinement we use a
-    /// non-safe prime: `p = 7`, `(p - 1)/2 = 3`. The cyclic group has order
-    /// 6 = 2·3. Element `6 = p - 1` has order 2 — filtered out. Element
-    /// `2` has order 3 (`2^3 mod 7 = 1`), lies in the order-3 subgroup.
-    /// Element `5` has order 6 (generator); `5^3 mod 7 = 6 ≠ 1`, so `5`
-    /// would be rejected by the subgroup-confinement check.
+    /// DH-1 / BN-1 (subgroup check semantics on an unchecked group): `p = 7`
+    /// is a safe prime (`q = 3`). The multiplicative group has order 6;
+    /// `6 = p − 1` (order 2) is filtered by the range check, `2` and `4`
+    /// have order 3 (`2^3 mod 7 = 1`) and `3`, `5` have order 6 —
+    /// generators, with `5^3 mod 7 = 6 = p − 1`. Both kinds are honest
+    /// public values (an odd exponent on a primitive-root generator yields
+    /// an order-6 value), so both must be accepted.
     #[test]
-    fn shared_secret_rejects_non_subgroup_element() {
+    fn shared_secret_accepts_order_q_and_order_2q_elements() {
         let p = BoxedUint::from_u64(7);
-        let g = BoxedUint::from_u64(3); // 3 generates the order-3 subgroup.
+        let g = BoxedUint::from_u64(3); // primitive root mod 7.
         let group = DhGroup::from_custom_unchecked(p, g, 2).unwrap();
         let alice = DhPrivateKey::from_bytes(group.clone(), &[2u8]).unwrap();
-        // Build a peer public key holding `5` — order-6 generator,
-        // outside the order-q subgroup since `5^3 mod 7 = 6 ≠ 1`.
-        let peer = DhPublicKey {
+        // `5`: order 6, `5^q = 5^3 ≡ 6 = p − 1`. Accepted.
+        let order_2q = DhPublicKey {
             group: group.clone(),
             y: BoxedUint::from_u64(5),
         };
-        assert!(
-            matches!(alice.shared_secret(&peer), Err(Error::InvalidPublicKey)),
-            "subgroup-confinement check must reject Y with Y^q mod p != 1"
+        // 5^2 mod 7 = 4.
+        assert_eq!(
+            alice.shared_secret(&order_2q).unwrap().as_bytes(),
+            &[4u8],
+            "order-2q peer value (y^q = p − 1) must be accepted"
         );
-        // Sanity: the same peer expressed as a subgroup element (`2`,
-        // order 3, in the q-subgroup) must succeed.
-        let in_subgroup = DhPublicKey {
+        // `2`: order 3, `2^3 ≡ 1`. Accepted; 2^2 mod 7 = 4.
+        let order_q = DhPublicKey {
             group,
             y: BoxedUint::from_u64(2),
         };
-        alice
-            .shared_secret(&in_subgroup)
-            .expect("y=2 is in the order-q subgroup, must succeed");
+        assert_eq!(alice.shared_secret(&order_q).unwrap().as_bytes(), &[4u8]);
+    }
+
+    /// The `y^q ∈ {1, p − 1}` check is exactly the condition every element
+    /// of a prime field satisfies (Euler's criterion), so the only thing it
+    /// can reject is a value on a **composite** modulus that
+    /// `from_custom_unchecked` let through: `p = 15` (`q = 7`), `y = 2`:
+    /// `2^7 mod 15 = 128 mod 15 = 8 ∉ {1, 14}`.
+    #[test]
+    fn shared_secret_rejects_element_of_composite_modulus() {
+        let p = BoxedUint::from_u64(15);
+        let group = DhGroup::from_custom_unchecked(p, BoxedUint::from_u64(4), 2).unwrap();
+        let alice = DhPrivateKey::from_bytes(group.clone(), &[3u8]).unwrap();
+        let peer = DhPublicKey {
+            group,
+            y: BoxedUint::from_u64(2),
+        };
+        assert!(
+            matches!(alice.shared_secret(&peer), Err(Error::InvalidPublicKey)),
+            "y^q ∉ {{1, p − 1}} must be rejected"
+        );
+    }
+
+    /// BN-1: a primitive-root generator (the RFC 4419 / OpenSSH `moduli`
+    /// shape) must interoperate for *every* private exponent, odd ones
+    /// included — with the old `y^q == 1` rule every odd `x` produced a
+    /// rejected public value. `p = 23` (`q = 11`), `g = 5`:
+    /// `5^11 mod 23 = 22 = p − 1`, so 5 is a quadratic non-residue and a
+    /// primitive root. All `x ∈ 1..=10` on both sides must succeed and
+    /// agree.
+    #[test]
+    fn primitive_root_generator_interoperates_for_all_exponents() {
+        let p = BoxedUint::from_u64(23);
+        let g = BoxedUint::from_u64(5);
+        let m = BoxedMontModulus::new(&p);
+        assert_eq!(
+            m.pow(&g, &BoxedUint::from_u64(11)),
+            BoxedUint::from_u64(22),
+            "5 must be a primitive root mod 23"
+        );
+        let group = DhGroup::from_custom_unchecked(p, g, 4).unwrap();
+        for xa in 1u8..=10 {
+            let alice = DhPrivateKey::from_bytes(group.clone(), &[xa]).unwrap();
+            let a_pub = alice.public_key();
+            for xb in 1u8..=10 {
+                let bob = DhPrivateKey::from_bytes(group.clone(), &[xb]).unwrap();
+                let b_pub = bob.public_key();
+                let a = alice
+                    .shared_secret(&b_pub)
+                    .unwrap_or_else(|e| panic!("alice x={xa}, bob x={xb}: {e:?}"));
+                let b = bob
+                    .shared_secret(&a_pub)
+                    .unwrap_or_else(|e| panic!("bob x={xb}, alice x={xa}: {e:?}"));
+                assert_eq!(a.as_bytes(), b.as_bytes(), "x_a={xa} x_b={xb}");
+                // 5^(xa·xb) mod 23 by hand.
+                let mut expected = 1u64;
+                for _ in 0..(xa as u64 * xb as u64) {
+                    expected = expected * 5 % 23;
+                }
+                assert_eq!(a.as_bytes(), &[expected as u8]);
+            }
+        }
+    }
+
+    /// BN-1 at production size: group14's modulus with a quadratic
+    /// non-residue generator (`p − 2 ≡ −2`; `−1` is a non-residue for
+    /// `p ≡ 3 mod 4` and `2` a residue for `p ≡ 7 mod 8`) round-trips with
+    /// odd private exponents on both sides, i.e. with both public values of
+    /// order `2q`.
+    #[test]
+    fn qnr_generator_on_group14_modulus_round_trips() {
+        let p = group14().p().clone();
+        let one = BoxedUint::from_u64(1);
+        let g = p.sub(&BoxedUint::from_u64(2));
+        let q = p.sub(&one).shr_bits(1);
+        let m = BoxedMontModulus::new(&p);
+        assert_eq!(m.pow(&g, &q), p.sub(&one), "p − 2 must be a QNR");
+        let group = DhGroup::from_custom_unchecked(p, g, 256).unwrap();
+
+        let mut xa = vec![0u8; 32];
+        xa[31] = 0x0f; // 15: odd
+        let mut xb = vec![0u8; 32];
+        xb[0] = 0x80;
+        xb[31] = 0x01; // 2^255 + 1: odd
+        let alice = DhPrivateKey::from_bytes(group.clone(), &xa).unwrap();
+        let bob = DhPrivateKey::from_bytes(group, &xb).unwrap();
+        let a_pub = alice.public_key();
+        let b_pub = bob.public_key();
+        // Both public values have order 2q.
+        assert_eq!(m.pow(a_pub.y(), &q), group14().p().sub(&one));
+        assert_eq!(m.pow(b_pub.y(), &q), group14().p().sub(&one));
+        let a = alice.shared_secret(&b_pub).expect("order-2q peer value");
+        let b = bob.shared_secret(&a_pub).expect("order-2q peer value");
+        assert_eq!(a.as_bytes(), b.as_bytes());
+        assert_eq!(a.as_bytes().len(), 256);
     }
 
     /// All five RFC 3526 named groups are safe primes, so every well-formed
