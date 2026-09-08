@@ -387,12 +387,14 @@ pub struct Config {
     /// traffic amplifier toward spoofed source addresses** — see
     /// [`ConfigBuilder::no_cookie`] for the full warning; tests only.
     pub require_cookie: bool,
-    /// Target MTU for emitted DTLS records (default ~1200).
-    ///
-    /// **Not yet honoured.** The DTLS engines fragment outbound handshake
-    /// messages at a fixed 1100 bytes and emit one record per
-    /// `write`/`send` call; this value is plumbed through but never read.
-    /// Application payloads are capped at 2^14 bytes per record regardless.
+    /// Ceiling on the size of an emitted DTLS handshake record, header
+    /// included (default 1200; RFC 9147 §4.4). The DTLS 1.3 engines
+    /// fragment every outbound handshake message so that each fragment,
+    /// framed as its own record and datagram, fits within it, and size
+    /// their ACK records to it as well. Application payloads are not
+    /// fragmented: one record per `send` call, capped at 2^14 bytes, so
+    /// callers keep payloads under the path MTU themselves. DTLS 1.2 uses
+    /// a fixed 1100-byte fragment (one record each) irrespective of this.
     pub max_record_size: usize,
     /// DTLS server: canonical binary encoding of the peer's transport
     /// address, bound into every HelloVerifyRequest / HelloRetryRequest

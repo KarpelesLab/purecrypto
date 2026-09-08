@@ -54,7 +54,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
+use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
@@ -997,17 +997,16 @@ impl DtlsClientConnection12 {
         let cke_body = &cke[4..];
         let cke_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut cke_frag_buf = Vec::new();
-        write_message(
-            &mut cke_frag_buf,
+        // Transcript: TLS-shaped (no DTLS headers).
+        self.transcript.update(&cke);
+        for frag in write_fragments(
             hs_type::CLIENT_KEY_EXCHANGE,
             cke_msg_seq,
             cke_body,
             DEFAULT_MAX_FRAGMENT,
-        );
-        // Transcript: TLS-shaped (no DTLS headers).
-        self.transcript.update(&cke);
-        flight.push_record(ContentType::Handshake, 0, cke_frag_buf);
+        ) {
+            flight.push_record(ContentType::Handshake, 0, frag);
+        }
 
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
@@ -1071,15 +1070,14 @@ impl DtlsClientConnection12 {
         // DTLS handshake fragment.
         let fin_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut fin_frag_buf = Vec::new();
-        write_message(
-            &mut fin_frag_buf,
+        for frag in write_fragments(
             hs_type::FINISHED,
             fin_msg_seq,
             &fin_body,
             DEFAULT_MAX_FRAGMENT,
-        );
-        flight.push_record(ContentType::Handshake, 1, fin_frag_buf);
+        ) {
+            flight.push_record(ContentType::Handshake, 1, frag);
+        }
 
         self.send_flight(flight)?;
         self.state = State::WaitServerFinished;
@@ -1222,22 +1220,23 @@ impl DtlsClientConnection12 {
         // by the caller flow — but here we have to do it explicitly since the
         // CH is a one-message flight.
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
+        let mut flight = Flight::new();
+        // One record per fragment (RFC 6347 §4.2.3): a hello that outgrows
+        // the MTU is split across datagrams rather than IP-fragmented.
+        for frag in write_fragments(
             hs_type::CLIENT_HELLO,
             ch_msg_seq,
             &body,
             DEFAULT_MAX_FRAGMENT,
-        );
-        let mut flight = Flight::new();
-        flight.push_record(ContentType::Handshake, 0, frag_buf);
+        ) {
+            flight.push_record(ContentType::Handshake, 0, frag);
+        }
         flight
     }
 
     /// Wraps a plaintext fragment in an epoch-0 DTLS record header with the
     /// next epoch-0 sequence number.
-    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
+    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         record::write_record(
             &mut out,
@@ -1246,9 +1245,9 @@ impl DtlsClientConnection12 {
             0,
             self.plain_write_seq,
             fragment,
-        );
+        )?;
         self.plain_write_seq += 1;
-        out
+        Ok(out)
     }
 
     /// Frames one stored flight record for the wire under a FRESH sequence
@@ -1258,7 +1257,7 @@ impl DtlsClientConnection12 {
     /// the peer's replay window would discard (DTLS-L3).
     fn encode_flight_record(&mut self, rec: &FlightRecord) -> Result<Vec<u8>, Error> {
         if rec.epoch == 0 {
-            Ok(self.wrap_plain_record(rec.content_type, &rec.plaintext))
+            self.wrap_plain_record(rec.content_type, &rec.plaintext)
         } else if rec.epoch == self.write_epoch {
             self.encrypt_record_dtls(rec.content_type, &rec.plaintext)
         } else {
@@ -1288,7 +1287,7 @@ impl DtlsClientConnection12 {
             self.write_epoch,
             self.write_seq_in_epoch,
             &fragment,
-        );
+        )?;
         self.write_seq_in_epoch += 1;
         Ok(out)
     }

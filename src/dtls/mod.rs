@@ -34,7 +34,12 @@
 //!   post-handshake handshake messages; anything after `Finished` is fatal.
 //! - **Path MTU.** Outbound handshake messages are fragmented so that no
 //!   record exceeds the configured `max_record_size` (default 1200 bytes,
-//!   RFC 9147 §4.4); each fragment is its own record and datagram.
+//!   RFC 9147 §4.4); each fragment is its own record and datagram, and
+//!   DTLS 1.3 ACK records are sized to the same ceiling. DTLS 1.2 uses a
+//!   fixed 1100-byte fragment (one record each). A record that would
+//!   overflow the 16-bit length field is a hard `RecordOverflow` error.
+//!   Application data is not fragmented: one record per `send`, capped at
+//!   2^14 bytes.
 
 use crate::tls::codec::{ExtensionType, RawExtension, ReadCursor, put_u16, with_len_u8};
 use crate::tls::{Error, ProtocolVersion};

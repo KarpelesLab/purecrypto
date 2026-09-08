@@ -142,6 +142,53 @@ pub(crate) fn write_message(
     }
 }
 
+/// Like [`write_message`], but returns each fragment (12-byte header +
+/// chunk) as its own buffer so the caller can frame every fragment into
+/// its own record and datagram — a handshake message larger than the path
+/// MTU must be split *across* datagrams, not merely fragmented inside one
+/// record (RFC 9147 §4.4 / RFC 6347 §4.1.1). A `max_fragment_size` of
+/// zero, or one larger than the body, yields exactly one fragment.
+pub(crate) fn write_fragments(
+    msg_type: u8,
+    message_seq: u16,
+    full_message_body: &[u8],
+    max_fragment_size: usize,
+) -> Vec<Vec<u8>> {
+    let total = full_message_body.len();
+    debug_assert!(
+        total <= 0xFF_FFFF,
+        "handshake message exceeds the 24-bit length field",
+    );
+    let chunk = if max_fragment_size == 0 || max_fragment_size >= total {
+        total.max(1)
+    } else {
+        max_fragment_size
+    };
+    if total == 0 {
+        let mut out = Vec::with_capacity(HEADER_LEN);
+        write_fragment_header(&mut out, msg_type, 0, message_seq, 0, 0);
+        return alloc::vec![out];
+    }
+    let mut fragments = Vec::with_capacity(total.div_ceil(chunk));
+    let mut offset = 0usize;
+    while offset < total {
+        let n = core::cmp::min(chunk, total - offset);
+        let mut out = Vec::with_capacity(HEADER_LEN + n);
+        write_fragment_header(
+            &mut out,
+            msg_type,
+            total as u32,
+            message_seq,
+            offset as u32,
+            n as u32,
+        );
+        out.extend_from_slice(&full_message_body[offset..offset + n]);
+        fragments.push(out);
+        offset += n;
+    }
+    fragments
+}
+
 /// Key identifying one reassembly candidate.
 ///
 /// Deliberately more than just `message_seq`: a peer (or, on the epoch-0

@@ -84,11 +84,30 @@ pub(crate) const MAX_PENDING_ACKS: usize = 64;
 /// ACK). Input longer than [`MAX_RECORDS_PER_ACK`] is **chunked** across
 /// several bodies; it must never be truncated into a length field that
 /// disagrees with the payload that follows it.
+#[cfg(test)]
 pub(crate) fn encode(records: &[RecordNumber]) -> Vec<Vec<u8>> {
-    let mut bodies: Vec<Vec<u8>> = records
-        .chunks(MAX_RECORDS_PER_ACK)
-        .map(encode_one)
-        .collect();
+    encode_with_limit(records, MAX_RECORDS_PER_ACK)
+}
+
+/// Per-record overhead around an ACK body in a DTLS 1.3 protected record:
+/// 5-byte unified header (flags ‖ 16-bit seq ‖ length), the inner content
+/// type byte, the 16-byte AEAD tag, and the ACK's own 2-byte length prefix.
+const ACK_RECORD_OVERHEAD: usize = 5 + 1 + 16 + 2;
+
+/// Number of record numbers one ACK record may carry so that the whole
+/// record stays within `max_record_size` bytes (RFC 9147 §4.4 — an ACK
+/// covering a large fragmented flight can otherwise outgrow the MTU).
+/// Always at least one.
+pub(crate) fn entries_per_record(max_record_size: usize) -> usize {
+    (max_record_size.saturating_sub(ACK_RECORD_OVERHEAD) / RECORD_NUMBER_LEN)
+        .clamp(1, MAX_RECORDS_PER_ACK)
+}
+
+/// [`encode`] with at most `per_ack` record numbers per body (see
+/// [`entries_per_record`]).
+pub(crate) fn encode_with_limit(records: &[RecordNumber], per_ack: usize) -> Vec<Vec<u8>> {
+    let per_ack = per_ack.clamp(1, MAX_RECORDS_PER_ACK);
+    let mut bodies: Vec<Vec<u8>> = records.chunks(per_ack).map(encode_one).collect();
     // `chunks` yields nothing for an empty slice; emit one empty ACK.
     if bodies.is_empty() {
         bodies.push(encode_one(&[]));
@@ -151,6 +170,30 @@ pub(crate) fn decode(body: &[u8]) -> Result<Vec<RecordNumber>, Error> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// DTLS-I5: ACK records are sized to the record ceiling, so a large
+    /// fragmented flight is acknowledged across several MTU-sized ACKs.
+    #[test]
+    fn ack_bodies_respect_record_ceiling() {
+        // 1200-byte records: (1200 - 24) / 16 = 73 entries each.
+        assert_eq!(entries_per_record(1200), 73);
+        assert_eq!(entries_per_record(600), 36);
+        assert_eq!(entries_per_record(0), 1, "never zero");
+        assert_eq!(entries_per_record(usize::MAX), MAX_RECORDS_PER_ACK);
+        let input: Vec<RecordNumber> = (0..100u64)
+            .map(|seq| RecordNumber { epoch: 3, seq })
+            .collect();
+        let bodies = encode_with_limit(&input, entries_per_record(600));
+        assert_eq!(bodies.len(), 3); // 36 + 36 + 28
+        for body in &bodies {
+            assert!(body.len() + ACK_RECORD_OVERHEAD - 2 <= 600);
+        }
+        let mut all = Vec::new();
+        for body in &bodies {
+            all.extend(decode(body).unwrap());
+        }
+        assert_eq!(all, input);
+    }
 
     #[test]
     fn empty_ack_roundtrip() {

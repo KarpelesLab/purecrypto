@@ -46,6 +46,33 @@ pub(crate) const MAX_PLAINTEXT_LEN: usize = 1 << 14;
 /// Fixed DTLS record header length: 13 bytes.
 pub(crate) const HEADER_LEN: usize = 13;
 
+/// Default ceiling on the size of an emitted record (header included):
+/// RFC 9147 §4.4 recommends staying well inside the 1280-byte IPv6 minimum
+/// MTU minus IP/UDP headers, and RFC 6347 §4.1.1.1 the same for IPv4.
+pub(crate) const DEFAULT_MAX_RECORD_SIZE: usize = 1200;
+
+/// Worst-case per-record overhead around one handshake fragment body:
+/// 13-byte record header (the DTLS 1.3 unified header is at most 5, the
+/// legacy epoch-0 header 13), 12-byte handshake fragment header, and — for
+/// protected records — the 1-byte inner content type plus a 16-byte AEAD
+/// tag (DTLS 1.2 AEAD records spend 8 + 16 bytes on the explicit nonce
+/// and tag instead, one byte less).
+const FRAGMENT_OVERHEAD: usize = HEADER_LEN + 12 + 1 + 16;
+
+/// Smallest fragment body we are willing to emit, so a nonsensical
+/// `max_record_size` cannot explode a certificate into thousands of
+/// records.
+const MIN_FRAGMENT: usize = 64;
+
+/// Handshake fragment body size that keeps every emitted record within
+/// `max_record_size` bytes, clamped to `[MIN_FRAGMENT, 2^14 - overhead]`
+/// so the result can never overflow a record whatever the caller passes.
+pub(crate) fn max_fragment_for(max_record_size: usize) -> usize {
+    max_record_size
+        .saturating_sub(FRAGMENT_OVERHEAD)
+        .clamp(MIN_FRAGMENT, MAX_PLAINTEXT_LEN - FRAGMENT_OVERHEAD)
+}
+
 /// The mask for a 48-bit sequence number. `write_record` debug-asserts that
 /// callers respect this bound.
 const SEQ_MASK_48: u64 = (1u64 << 48) - 1;
@@ -129,6 +156,13 @@ pub(crate) fn read_record(buf: &[u8]) -> Result<Option<ParsedDtlsRecord<'_>>, Er
 ///
 /// `seq` must fit in 48 bits. In debug builds this is asserted; release
 /// builds silently truncate the top 16 bits.
+///
+/// A `fragment` longer than [`MAX_FRAGMENT`] is refused with
+/// [`Error::RecordOverflow`] — a real check, not a `debug_assert!`: the
+/// 16-bit `length` field used to be filled with a silent `as u16`, so a
+/// release build handed a >64 KiB handshake record (a two-certificate
+/// SLH-DSA chain, say) would have emitted a record whose declared length
+/// was smaller than its body and desynchronised framing on the wire.
 pub(crate) fn write_record(
     out: &mut Vec<u8>,
     ct: ContentType,
@@ -136,15 +170,14 @@ pub(crate) fn write_record(
     epoch: u16,
     seq: u64,
     fragment: &[u8],
-) {
+) -> Result<(), Error> {
     debug_assert!(
         seq <= SEQ_MASK_48,
         "DTLS sequence numbers are 48-bit; caller must rekey before overflow",
     );
-    debug_assert!(
-        fragment.len() <= MAX_FRAGMENT,
-        "DTLS record fragment exceeds RFC 6347 §4.1.1.1 maximum",
-    );
+    if fragment.len() > MAX_FRAGMENT {
+        return Err(Error::RecordOverflow);
+    }
     let seq = seq & SEQ_MASK_48;
 
     out.push(ct.as_u8());
@@ -156,8 +189,10 @@ pub(crate) fn write_record(
     out.push((seq >> 16) as u8);
     out.push((seq >> 8) as u8);
     out.push(seq as u8);
+    // Checked above (MAX_FRAGMENT < 2^16), so the cast cannot truncate.
     out.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
     out.extend_from_slice(fragment);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -175,7 +210,8 @@ mod tests {
             0,
             42,
             b"hi",
-        );
+        )
+        .unwrap();
         // 13-byte header + 2-byte fragment.
         assert_eq!(out.len(), HEADER_LEN + 2);
         // Expected header bytes:
@@ -212,7 +248,8 @@ mod tests {
             7,
             max_seq,
             b"x",
-        );
+        )
+        .unwrap();
         let rec = read_record(&out).unwrap().unwrap();
         assert_eq!(rec.content_type, ContentType::ApplicationData);
         assert_eq!(rec.epoch, 7);
@@ -231,7 +268,8 @@ mod tests {
             0,
             1,
             b"hello",
-        );
+        )
+        .unwrap();
         for cut in 0..out.len() {
             assert!(
                 read_record(&out[..cut]).unwrap().is_none(),
@@ -288,7 +326,7 @@ mod tests {
     fn write_record_panics_on_oversized_seq() {
         let mut out = Vec::new();
         // 1 << 48 is the first illegal value.
-        write_record(
+        let _ = write_record(
             &mut out,
             ContentType::Handshake,
             ProtocolVersion::DTLSv1_2,
@@ -296,5 +334,55 @@ mod tests {
             1u64 << 48,
             b"",
         );
+    }
+
+    /// DTLS-I5: the fragment budget tracks `max_record_size` minus the
+    /// per-record overhead, and is clamped so no configuration can produce
+    /// a record above 2^14 plaintext bytes or a pathological fragment size.
+    #[test]
+    fn max_fragment_for_tracks_record_ceiling_and_clamps() {
+        assert_eq!(max_fragment_for(1200), 1200 - FRAGMENT_OVERHEAD);
+        assert_eq!(max_fragment_for(600), 600 - FRAGMENT_OVERHEAD);
+        assert_eq!(max_fragment_for(0), MIN_FRAGMENT);
+        assert_eq!(max_fragment_for(FRAGMENT_OVERHEAD + 1), MIN_FRAGMENT);
+        assert_eq!(
+            max_fragment_for(usize::MAX),
+            MAX_PLAINTEXT_LEN - FRAGMENT_OVERHEAD
+        );
+        assert!(max_fragment_for(usize::MAX) + FRAGMENT_OVERHEAD <= MAX_FRAGMENT);
+    }
+
+    /// DTLS-I5: an oversized fragment is a hard `RecordOverflow`, in
+    /// release builds too — never a silently truncated `length` field.
+    #[test]
+    fn write_record_rejects_oversized_fragment() {
+        let mut out = Vec::new();
+        let ok = alloc::vec![0u8; MAX_FRAGMENT];
+        write_record(
+            &mut out,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            0,
+            &ok,
+        )
+        .unwrap();
+        assert_eq!(out.len(), HEADER_LEN + MAX_FRAGMENT);
+        for len in [MAX_FRAGMENT + 1, u16::MAX as usize + 1, 70_000] {
+            let mut out = Vec::new();
+            let big = alloc::vec![0u8; len];
+            assert!(matches!(
+                write_record(
+                    &mut out,
+                    ContentType::Handshake,
+                    ProtocolVersion::DTLSv1_2,
+                    0,
+                    0,
+                    &big,
+                ),
+                Err(Error::RecordOverflow)
+            ));
+            assert!(out.is_empty(), "nothing written on overflow");
+        }
     }
 }

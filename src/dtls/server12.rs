@@ -37,7 +37,7 @@ use core::time::Duration;
 
 use super::cookie::{CookieGenerator, build_ch_fingerprint};
 use super::reassembly::{
-    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_message,
+    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_fragments, write_message,
 };
 use super::record::{self, ParsedDtlsRecord};
 use super::reliability::{Flight, FlightRecord, Retransmit};
@@ -1146,15 +1146,13 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         self.transcript.update(&sh);
         // Strip for DTLS fragment wrapping.
         let sh_body = &sh[4..];
-        let sh_frag = self.handshake_fragment(hs_type::SERVER_HELLO, sh_body);
-        flight.push_record(ContentType::Handshake, 0, sh_frag);
+        self.push_handshake(&mut flight, hs_type::SERVER_HELLO, sh_body);
 
         // Certificate.
         let cert_msg = build_certificate_msg(&self.config.cert_chain);
         self.transcript.update(&cert_msg);
         let cert_body = &cert_msg[4..];
-        let cert_frag = self.handshake_fragment(hs_type::CERTIFICATE, cert_body);
-        flight.push_record(ContentType::Handshake, 0, cert_frag);
+        self.push_handshake(&mut flight, hs_type::CERTIFICATE, cert_body);
 
         // ServerKeyExchange. The SKE signature hash tracks the key's curve
         // for ECDSA (RFC 5246 §7.4.1.4.1 lets the server pick any acceptable
@@ -1217,16 +1215,14 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         .encode();
         self.transcript.update(&ske);
         let ske_body = &ske[4..];
-        let ske_frag = self.handshake_fragment(hs_type::SERVER_KEY_EXCHANGE, ske_body);
-        flight.push_record(ContentType::Handshake, 0, ske_frag);
+        self.push_handshake(&mut flight, hs_type::SERVER_KEY_EXCHANGE, ske_body);
 
         // ServerHelloDone (empty body).
         let mut shd = Vec::with_capacity(4);
         shd.push(hs_type::SERVER_HELLO_DONE);
         shd.extend_from_slice(&[0, 0, 0]);
         self.transcript.update(&shd);
-        let shd_frag = self.handshake_fragment(hs_type::SERVER_HELLO_DONE, &[]);
-        flight.push_record(ContentType::Handshake, 0, shd_frag);
+        self.push_handshake(&mut flight, hs_type::SERVER_HELLO_DONE, &[]);
 
         self.send_flight(flight)?;
         self.state = State::WaitClientFlight;
@@ -1261,7 +1257,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // also continues from message_seq=1.
         let mut frag_buf = Vec::new();
         write_message(&mut frag_buf, HS_HELLO_VERIFY_REQUEST, 0, &body, 0);
-        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
+        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf)?;
         self.out_dgrams.push(dgram);
         // The server's out_msg_seq advances regardless of whether the
         // cookie path was taken — the next outbound message is 1.
@@ -1269,20 +1265,22 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         Ok(())
     }
 
-    /// Allocates the next outbound `message_seq` and returns the DTLS
-    /// handshake fragment(s) for `msg_type` / `body`, ready to be framed
-    /// into a record.
-    fn handshake_fragment(&mut self, msg_type: u8, body: &[u8]) -> Vec<u8> {
+    /// Allocates the next outbound `message_seq`, fragments `msg_type` /
+    /// `body` to [`DEFAULT_MAX_FRAGMENT`], and appends every fragment to
+    /// `flight` as its own epoch-0 record — a Certificate larger than the
+    /// path MTU must be split across datagrams, not merely fragmented
+    /// inside one record (RFC 6347 §4.1.1 / §4.2.3).
+    fn push_handshake(&mut self, flight: &mut Flight, msg_type: u8, body: &[u8]) {
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag = Vec::new();
-        write_message(&mut frag, msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT);
-        frag
+        for frag in write_fragments(msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT) {
+            flight.push_record(ContentType::Handshake, 0, frag);
+        }
     }
 
     /// Frames a plaintext (epoch 0) record with the next epoch-0 sequence
     /// number.
-    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
+    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         record::write_record(
             &mut out,
@@ -1291,9 +1289,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             0,
             self.plain_write_seq,
             fragment,
-        );
+        )?;
         self.plain_write_seq += 1;
-        out
+        Ok(out)
     }
 
     /// Frames one stored flight record for the wire under a FRESH sequence
@@ -1303,7 +1301,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     /// the peer's replay window would discard (DTLS-L3).
     fn encode_flight_record(&mut self, rec: &FlightRecord) -> Result<Vec<u8>, Error> {
         if rec.epoch == 0 {
-            Ok(self.wrap_plain_record(rec.content_type, &rec.plaintext))
+            self.wrap_plain_record(rec.content_type, &rec.plaintext)
         } else if rec.epoch == self.write_epoch {
             self.encrypt_record_dtls(rec.content_type, &rec.plaintext)
         } else {
@@ -1331,7 +1329,7 @@ impl<R: RngCore> DtlsServerConnection12<R> {
             self.write_epoch,
             self.write_seq_in_epoch,
             &fragment,
-        );
+        )?;
         self.write_seq_in_epoch += 1;
         Ok(out)
     }
@@ -1480,15 +1478,9 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         // DTLS handshake fragment with the next out_msg_seq.
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut fin_frag_buf = Vec::new();
-        write_message(
-            &mut fin_frag_buf,
-            hs_type::FINISHED,
-            msg_seq,
-            &fin_body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        flight.push_record(ContentType::Handshake, 1, fin_frag_buf);
+        for frag in write_fragments(hs_type::FINISHED, msg_seq, &fin_body, DEFAULT_MAX_FRAGMENT) {
+            flight.push_record(ContentType::Handshake, 1, frag);
+        }
 
         // This CCS + Finished is the LAST flight of the handshake: no
         // responding flight from the client will ever arrive to cancel a

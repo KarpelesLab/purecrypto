@@ -3116,7 +3116,8 @@ mod security_regressions {
             0,
             0,
             &poison_frag,
-        );
+        )
+        .unwrap();
         server
             .feed_datagram(&poison_dg)
             .expect("spoofed epoch-0 input must never be fatal");
@@ -3352,7 +3353,8 @@ mod audit_2026_09 {
             0,
             seq,
             fragment,
-        );
+        )
+        .unwrap();
         dg
     }
 
@@ -3398,11 +3400,13 @@ mod audit_2026_09 {
         let mut server = server13(server_cfg, b"m1b-server");
 
         // The genuine CH really is fragmented, otherwise the fast path
-        // would sidestep the buffer and prove nothing.
-        let ch_dg = client.pop_outbound_datagrams();
-        assert_eq!(ch_dg.len(), 1);
-        let ch = split_record_fragments(&ch_dg[0]);
+        // would sidestep the buffer and prove nothing. Since DTLS-I5 each
+        // fragment is its own record and datagram.
+        let ch = client.pop_outbound_datagrams();
         assert!(ch.len() >= 2, "expected a fragmented ClientHello");
+        for dg in &ch {
+            assert_eq!(split_record_fragments(dg).len(), 1);
+        }
 
         let mut seq = 0u64;
         for msg_seq in [0u16, 1] {
@@ -3438,8 +3442,8 @@ mod audit_2026_09 {
         let mut client = client13(client13_cfg(&cert), b"m1c-client");
         let mut server = server13(server_cfg, b"m1c-server");
 
-        let ch_dg = client.pop_outbound_datagrams();
-        let ch = split_record_fragments(&ch_dg[0]);
+        // One record (and datagram) per fragment since DTLS-I5.
+        let ch = client.pop_outbound_datagrams();
         assert!(ch.len() >= 2, "expected a fragmented ClientHello");
         server.feed_datagram(&ch[0]).unwrap();
         // Spoofed complete CH: body is garbage, so it fails to decode and
@@ -3839,6 +3843,11 @@ mod audit_2026_09 {
             server.feed_datagram(dg).unwrap();
         }
         let s = server.pop_outbound_datagrams();
+        // The plaintext ServerHello (its ML-KEM share outgrows one MTU-sized
+        // fragment, so since DTLS-I5 it spans the leading epoch-0 records);
+        // the protected flight follows.
+        let n_sh = s.iter().take_while(|dg| dg[0] < 32).count();
+        assert!(n_sh >= 1);
         let mut sh = s[0].clone();
         assert_eq!(&sh[60..62], &[0x13, 0x02], "expected AES-256 suite in SH");
         sh[60] = 0x13;
@@ -3849,17 +3858,22 @@ mod audit_2026_09 {
         // accepted afterwards (nothing was pinned by the bad one).
         assert!(client.next_timeout().is_some());
         assert_eq!(client.feed_datagram(&sh), Ok(()));
+        for dg in &s[1..n_sh] {
+            assert_eq!(client.feed_datagram(dg), Ok(()));
+        }
         assert!(
             client.next_timeout().is_some(),
             "patched ServerHello was accepted"
         );
         assert!(!client.is_handshake_complete());
-        client.feed_datagram(&s[0]).unwrap();
+        for dg in &s[..n_sh] {
+            client.feed_datagram(dg).unwrap();
+        }
         assert!(
             client.next_timeout().is_none(),
             "genuine SH must disarm the CH timer"
         );
-        for dg in &s[1..] {
+        for dg in &s[n_sh..] {
             client.feed_datagram(dg).unwrap();
         }
         assert!(pump13(&mut client, &mut server));

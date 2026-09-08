@@ -59,13 +59,11 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::ack::{
-    ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack, encode as encode_ack,
-};
+use super::ack::{ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack};
 use super::epoch13::{
     MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, ReadEpoch, select_read_epoch,
 };
-use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
+use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
 use super::reliability13::{InFlightRecord, Retransmit13};
@@ -80,13 +78,6 @@ const HRR_RANDOM: [u8; 32] = [
 /// `cookie` extension type (RFC 8446 §4.2.2).
 const EXT_COOKIE: u16 = 0x002C;
 
-/// Default per-fragment payload size for outbound handshake messages.
-const DEFAULT_MAX_FRAGMENT: usize = 1100;
-
-/// Maximum overall record size (handshake + record header overhead) the
-/// caller wants us to emit.
-const DEFAULT_MAX_RECORD_SIZE: usize = 1200;
-
 /// Configuration for a DTLS 1.3 client connection.
 pub(crate) struct ClientConfig13Internal {
     /// Trust anchors for the server's certificate chain.
@@ -98,16 +89,14 @@ pub(crate) struct ClientConfig13Internal {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// Allowed signature algorithms (chain + CertificateVerify).
     pub signature_policy: Arc<SignaturePolicy>,
-    /// Suggested ceiling on emitted record size (default 1200, comfortably
-    /// below typical 1500-byte path MTUs).
-    ///
-    /// **Currently inert.** Outbound handshake fragmentation uses the fixed
-    /// [`DEFAULT_MAX_FRAGMENT`] (1100 bytes) and `send()` emits one record
-    /// per call, capped at 2^14 by
-    /// [`MAX_PLAINTEXT_LEN`](super::record::MAX_PLAINTEXT_LEN). The field is
-    /// kept so `Config::max_record_size` has somewhere to land once
-    /// MTU-driven fragmentation is wired up; it does not affect the wire
-    /// today.
+    /// Ceiling on the size of an emitted handshake record, header included
+    /// (default 1200, comfortably below typical path MTUs — RFC 9147 §4.4).
+    /// Every outbound handshake message is fragmented so that each
+    /// fragment, framed as its own record and datagram, fits within it.
+    /// Application data is not fragmented: `send()` emits one record per
+    /// call, capped at 2^14 by
+    /// [`MAX_PLAINTEXT_LEN`](super::record::MAX_PLAINTEXT_LEN), so callers
+    /// should keep payloads under the path MTU themselves.
     pub max_record_size: usize,
     /// When `false`, the certificate chain is not validated. Intended for
     /// pinned-key and test scenarios.
@@ -152,7 +141,7 @@ impl ClientConfig13Internal {
             },
             alpn_protocols: Vec::new(),
             signature_policy: Arc::new(SignaturePolicy::modern()),
-            max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
             verify_certificates: true,
             verification_time: None,
             crls: CrlStore::new(),
@@ -402,9 +391,19 @@ impl DtlsClientConnection13 {
         // Transcript hash is pinned later once ServerHello arrives — TLS 1.3
         // (and DTLS 1.3) buffer the handshake bytes and only commit to a hash
         // after suite selection.
-        let frag = conn.build_client_hello();
-        conn.emit_plaintext(frag);
+        for frag in conn.build_client_hello() {
+            // Fragments are bounded by `max_fragment()`, so framing them
+            // cannot overflow a record.
+            conn.emit_plaintext(frag)
+                .expect("ClientHello fragments are bounded by max_fragment()");
+        }
         conn
+    }
+
+    /// Largest handshake fragment body that keeps every record we emit
+    /// within the configured `max_record_size` (RFC 9147 §4.4).
+    fn max_fragment(&self) -> usize {
+        record::max_fragment_for(self.config.max_record_size)
     }
 
     /// Returns true once the handshake completes.
@@ -763,15 +762,14 @@ impl DtlsClientConnection13 {
         .encode();
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
+        for frag in write_fragments(
             hs_type::KEY_UPDATE,
             msg_seq,
             &body[4..],
-            DEFAULT_MAX_FRAGMENT,
-        );
-        self.emit_protected_handshake(frag_buf)?;
+            self.max_fragment(),
+        ) {
+            self.emit_protected_handshake(frag)?;
+        }
         self.key_update_pending = true;
         Ok(())
     }
@@ -1183,8 +1181,9 @@ impl DtlsClientConnection13 {
         self.retransmit = Retransmit13::new();
 
         // Build and send CH2 (cookie + narrowed key_share, per HRR).
-        let frag = self.build_client_hello();
-        self.emit_plaintext(frag);
+        for frag in self.build_client_hello() {
+            self.emit_plaintext(frag)?;
+        }
         Ok(())
     }
 
@@ -1429,15 +1428,14 @@ impl DtlsClientConnection13 {
 
         let fin_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
+        for frag in write_fragments(
             hs_type::FINISHED,
             fin_msg_seq,
             &fin_body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        self.emit_protected_handshake(frag_buf)?;
+            self.max_fragment(),
+        ) {
+            self.emit_protected_handshake(frag)?;
+        }
 
         // Swap in application keys. The handshake write context is
         // retired, not dropped: our Finished is still in flight and a
@@ -1469,11 +1467,13 @@ impl DtlsClientConnection13 {
         Ok(())
     }
 
-    /// Builds the current ClientHello as a DTLS plaintext record. If
-    /// `self.cookie_extension` is set, the CH includes a `cookie` extension.
-    /// If `self.hrr_selected_group` is set (post-HRR retry), the `key_share`
-    /// list is narrowed to that single group per RFC 8446 §4.1.4.
-    fn build_client_hello(&mut self) -> Vec<u8> {
+    /// Builds the current ClientHello as DTLS handshake fragments, one per
+    /// record to emit (RFC 9147 §4.4: a multi-share hello exceeds the MTU).
+    /// If `self.cookie_extension` is set, the CH includes a `cookie`
+    /// extension. If `self.hrr_selected_group` is set (post-HRR retry), the
+    /// `key_share` list is narrowed to that single group per RFC 8446
+    /// §4.1.4.
+    fn build_client_hello(&mut self) -> Vec<Vec<u8>> {
         let groups = self.config.groups.clone();
         let mut key_shares: Vec<(NamedGroup, Vec<u8>)> = Vec::new();
         for &g in &groups {
@@ -1557,22 +1557,14 @@ impl DtlsClientConnection13 {
         // (RFC 9147 §5.2 — only the DTLS fragment fields are excluded).
         self.transcript.update(&ch);
 
-        // Wrap as a DTLS handshake fragment.
+        // Wrap as DTLS handshake fragments.
         let ch_body = &ch[4..];
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
-            hs_type::CLIENT_HELLO,
-            msg_seq,
-            ch_body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        frag_buf
+        write_fragments(hs_type::CLIENT_HELLO, msg_seq, ch_body, self.max_fragment())
     }
 
-    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
+    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         record::write_record(
             &mut out,
@@ -1581,9 +1573,9 @@ impl DtlsClientConnection13 {
             self.plain_write_epoch,
             self.plain_write_seq,
             fragment,
-        );
+        )?;
         self.plain_write_seq += 1;
-        out
+        Ok(out)
     }
 
     /// Encrypts and frames a protected DTLS 1.3 record. The returned
@@ -1612,8 +1604,8 @@ impl DtlsClientConnection13 {
 
     /// Frames `fragment` as a plaintext (epoch 0) handshake record, sends
     /// it and registers it with the retransmit machine.
-    fn emit_plaintext(&mut self, fragment: Vec<u8>) {
-        let datagram = self.wrap_plain_record(ContentType::Handshake, &fragment);
+    fn emit_plaintext(&mut self, fragment: Vec<u8>) -> Result<(), Error> {
+        let datagram = self.wrap_plain_record(ContentType::Handshake, &fragment)?;
         let record_number = RecordNumber {
             epoch: self.plain_write_epoch as u64,
             seq: self.plain_write_seq.saturating_sub(1),
@@ -1623,6 +1615,7 @@ impl DtlsClientConnection13 {
             InFlightRecord::new(record_number, self.plain_write_epoch, fragment),
             self.last_now,
         );
+        Ok(())
     }
 
     /// Encrypts `fragment` as a handshake record under the current write
@@ -1653,12 +1646,14 @@ impl DtlsClientConnection13 {
                 (r.epoch, r.fragment.clone())
             };
             let framed = if epoch == self.plain_write_epoch {
-                let dg = self.wrap_plain_record(ContentType::Handshake, &fragment);
-                let rn = RecordNumber {
-                    epoch: epoch as u64,
-                    seq: self.plain_write_seq.saturating_sub(1),
-                };
-                Ok((dg, rn))
+                self.wrap_plain_record(ContentType::Handshake, &fragment)
+                    .map(|dg| {
+                        let rn = RecordNumber {
+                            epoch: epoch as u64,
+                            seq: self.plain_write_seq.saturating_sub(1),
+                        };
+                        (dg, rn)
+                    })
             } else if epoch == self.enc_write_epoch {
                 self.encrypt_protected_record(ContentType::Handshake, &fragment)
                     .map(|dg| {
@@ -1713,10 +1708,11 @@ impl DtlsClientConnection13 {
             return;
         }
         let acks = core::mem::take(&mut self.pending_acks);
-        // `encode_ack` chunks: an ACK body's `u16` length prefix cannot
-        // describe more than 4095 record numbers, so an oversized queue
-        // becomes several ACK records instead of one truncated one.
-        for body in encode_ack(&acks) {
+        // Chunked so every ACK record stays within `max_record_size` (a
+        // fragmented multi-KB flight is dozens of record numbers), which
+        // also keeps each body's `u16` length prefix exact.
+        let per_ack = super::ack::entries_per_record(self.config.max_record_size);
+        for body in super::ack::encode_with_limit(&acks, per_ack) {
             // ACK uses its own content type (26).
             if let Ok(dg) =
                 self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
@@ -1747,10 +1743,10 @@ impl DtlsClientConnection13 {
     pub(crate) fn send_handshake_for_test(&mut self, msg_type: u8, body: &[u8]) {
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(&mut frag_buf, msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT);
-        self.emit_protected_handshake(frag_buf)
-            .expect("protected write keys installed");
+        for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
+            self.emit_protected_handshake(frag)
+                .expect("protected write keys installed");
+        }
     }
 }
 

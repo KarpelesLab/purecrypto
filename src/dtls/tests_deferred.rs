@@ -773,3 +773,114 @@ fn client_reacks_retransmitted_server_flight_13() {
     assert!(client.next_timeout().is_none());
     app_data_round_trip(&mut client, &mut server);
 }
+
+// ---------------------------------------------------------------------
+// DTLS-I5: MTU-bounded handshake fragmentation (RFC 9147 §4.4 /
+// RFC 6347 §4.1.1).
+// ---------------------------------------------------------------------
+
+/// A "certificate chain" whose second entry is 70 000 opaque bytes: the
+/// Certificate message alone exceeds the 16-bit record length field, so it
+/// used to hit the silent `as u16` truncation. With verification off the
+/// client only parses the leaf, so the padding may be arbitrary.
+const JUNK_CERT_LEN: usize = 70_000;
+
+fn oversized_chain(leaf: &[u8]) -> Vec<Vec<u8>> {
+    alloc::vec![leaf.to_vec(), alloc::vec![0x5a; JUNK_CERT_LEN]]
+}
+
+/// Drives a DTLS 1.3 handshake with a >64 KiB Certificate at the given
+/// record ceiling, asserting that no datagram from either side exceeds it.
+fn huge_chain_handshake_13(max_record_size: usize) {
+    let (key, leaf) = server_identity(b"i5-key-13");
+    let mut server_cfg = PcServerConfig13::with_ecdsa(oversized_chain(&leaf), key).with_no_cookie();
+    server_cfg.max_record_size = max_record_size;
+    let mut client_cfg = client13_cfg(&leaf).without_certificate_verification();
+    client_cfg.max_record_size = max_record_size;
+    let mut client = client13(client_cfg, b"i5-client-13");
+    let mut server = server13(server_cfg, b"i5-server-13");
+    let mut records = 0usize;
+    for _ in 0..32 {
+        let c_out = client.pop_outbound_datagrams();
+        for dg in &c_out {
+            assert!(
+                dg.len() <= max_record_size,
+                "client datagram {} > {max_record_size}",
+                dg.len()
+            );
+            server.feed_datagram(dg).unwrap();
+        }
+        let s_out = server.pop_outbound_datagrams();
+        for dg in &s_out {
+            assert!(
+                dg.len() <= max_record_size,
+                "server datagram {} > {max_record_size}",
+                dg.len()
+            );
+            client.feed_datagram(dg).unwrap();
+        }
+        records += c_out.len() + s_out.len();
+        if c_out.is_empty() && s_out.is_empty() {
+            break;
+        }
+    }
+    assert!(client.is_handshake_complete());
+    assert!(server.is_handshake_complete());
+    assert!(
+        records > JUNK_CERT_LEN / max_record_size,
+        "the chain must have been split across many datagrams"
+    );
+    assert_eq!(client.peer_certificates().len(), 2);
+    assert_eq!(client.peer_certificates()[1].len(), JUNK_CERT_LEN);
+    app_data_round_trip(&mut client, &mut server);
+}
+
+#[test]
+fn huge_certificate_chain_respects_default_mtu_13() {
+    huge_chain_handshake_13(record::DEFAULT_MAX_RECORD_SIZE);
+}
+
+#[test]
+fn huge_certificate_chain_respects_small_mtu_13() {
+    huge_chain_handshake_13(600);
+}
+
+/// Same for DTLS 1.2: every fragment of the server's Certificate is its
+/// own record and datagram, none above the 1200-byte default ceiling.
+#[test]
+fn huge_certificate_chain_respects_mtu_12() {
+    let (key, leaf) = server_identity(b"i5-key-12");
+    let server_cfg =
+        PcServerConfig12::with_ecdsa(oversized_chain(&leaf), key).require_cookie_exchange(false);
+    let mut roots = RootCertStore::new();
+    roots.add_der(leaf.clone()).unwrap();
+    let cfg = PcClientConfig12::new(roots, "dtls.example").without_certificate_verification();
+    let mut crng = HmacDrbg::<Sha256>::new(b"i5-client-12", b"nonce", &[]);
+    let mut client = DtlsClientConnection12::new(cfg, b"peer-a".to_vec(), &mut crng);
+    let mut server = server12(server_cfg, b"i5-server-12");
+    let mut records = 0usize;
+    for _ in 0..32 {
+        let c_out = client.pop_outbound_datagrams();
+        for dg in &c_out {
+            assert!(dg.len() <= record::DEFAULT_MAX_RECORD_SIZE);
+            server.feed_datagram(dg).unwrap();
+        }
+        let s_out = server.pop_outbound_datagrams();
+        for dg in &s_out {
+            assert!(dg.len() <= record::DEFAULT_MAX_RECORD_SIZE);
+            client.feed_datagram(dg).unwrap();
+        }
+        records += c_out.len() + s_out.len();
+        if c_out.is_empty() && s_out.is_empty() {
+            break;
+        }
+    }
+    assert!(client.is_handshake_complete());
+    assert!(server.is_handshake_complete());
+    assert!(records > JUNK_CERT_LEN / record::DEFAULT_MAX_RECORD_SIZE);
+    client.send(b"ping").unwrap();
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.take_received(), b"ping");
+}

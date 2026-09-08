@@ -54,9 +54,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use super::ack::{
-    ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack, encode as encode_ack,
-};
+use super::ack::{ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack};
 use super::client13::{
     decrypt_dtls13_record, derive_sn_key, encrypt_protected_record_with, sn_key_len_for,
 };
@@ -65,7 +63,7 @@ use super::epoch13::{
     MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, ReadEpoch, select_read_epoch,
 };
 use super::reassembly::{
-    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_message,
+    HandshakeFragment, MAX_HS_MSG_SEQ, Reassembler, read_fragment, write_fragments, write_message,
 };
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
 use super::record13::{self, peek_header_layout, reconstruct_seq, sn_mask_for};
@@ -79,9 +77,6 @@ const HRR_RANDOM: [u8; 32] = [
 
 /// `cookie` extension type (RFC 8446 §4.2.2).
 const EXT_COOKIE: u16 = 0x002C;
-
-/// Default per-fragment payload size for outbound handshake messages.
-const DEFAULT_MAX_FRAGMENT: usize = 1100;
 
 /// Ceiling on the claimed `total_length` of a ClientHello fed through the
 /// pre-state reassembler. This is
@@ -154,6 +149,14 @@ pub(crate) struct ServerConfig13Internal {
     pub signature_policy: Arc<SignaturePolicy>,
     /// Optional [`KeyLog`] sink (NSS `SSLKEYLOGFILE` format).
     pub key_log: Option<Arc<dyn KeyLog>>,
+    /// Ceiling on the size of an emitted handshake record, header included
+    /// (default 1200 — RFC 9147 §4.4). Every outbound handshake message
+    /// (the multi-KB Certificate above all) is fragmented so that each
+    /// fragment, framed as its own record and datagram, fits within it.
+    /// Application data is not fragmented: `send()` emits one record per
+    /// call, capped at 2^14, so callers keep payloads under the path MTU
+    /// themselves.
+    pub max_record_size: usize,
 }
 
 impl ServerConfig13Internal {
@@ -168,6 +171,7 @@ impl ServerConfig13Internal {
             require_cookie: true,
             signature_policy: Arc::new(SignaturePolicy::modern()),
             key_log: None,
+            max_record_size: record::DEFAULT_MAX_RECORD_SIZE,
         }
     }
 
@@ -410,6 +414,12 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     /// Returns true once the handshake completes.
     pub fn is_handshake_complete(&self) -> bool {
         self.state == State::Connected
+    }
+
+    /// Largest handshake fragment body that keeps every record we emit
+    /// within the configured `max_record_size` (RFC 9147 §4.4).
+    fn max_fragment(&self) -> usize {
+        record::max_fragment_for(self.config.max_record_size)
     }
 
     /// IANA cipher-suite identifier of the negotiated suite, or `None`
@@ -1486,19 +1496,18 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         .encode_dtls();
         self.transcript.update(&sh_bytes);
 
-        // Send SH as a plaintext DTLS record (epoch 0).
+        // Send SH as plaintext DTLS record(s) (epoch 0).
         let sh_body = &sh_bytes[4..];
         let sh_msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
+        for frag in write_fragments(
             hs_type::SERVER_HELLO,
             sh_msg_seq,
             sh_body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        self.emit_plaintext(frag_buf);
+            self.max_fragment(),
+        ) {
+            self.emit_plaintext(frag)?;
+        }
 
         // Derive handshake traffic secrets and install protected crypters.
         let mut ks = KeySchedule::new(suite.hash);
@@ -1802,18 +1811,13 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         let body = &bytes[4..];
         // HRR is a ServerHello with the magic random; msg_seq=0 (this is
         // the server's first outbound handshake message).
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
-            hs_type::SERVER_HELLO,
-            0,
-            body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
-        // HRR is plaintext — push directly. We don't track it in the
-        // retransmit machine since we'll drop all state if no CH2 arrives.
-        self.out_dgrams.push(dgram);
+        for frag in write_fragments(hs_type::SERVER_HELLO, 0, body, self.max_fragment()) {
+            let dgram = self.wrap_plain_record(ContentType::Handshake, &frag)?;
+            // HRR is plaintext — push directly. We don't track it in the
+            // retransmit machine since we'll drop all state if no CH2
+            // arrives.
+            self.out_dgrams.push(dgram);
+        }
         Ok(())
     }
 
@@ -1832,20 +1836,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
     ) -> Result<(), Error> {
         let bytes = Self::build_hrr_bytes_explicit(suite_id, Some(cookie), group);
         let body = &bytes[4..];
-        let mut frag_buf = Vec::new();
-        write_message(
-            &mut frag_buf,
-            hs_type::SERVER_HELLO,
-            0,
-            body,
-            DEFAULT_MAX_FRAGMENT,
-        );
-        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
-        self.out_dgrams.push(dgram);
+        for frag in write_fragments(hs_type::SERVER_HELLO, 0, body, self.max_fragment()) {
+            let dgram = self.wrap_plain_record(ContentType::Handshake, &frag)?;
+            self.out_dgrams.push(dgram);
+        }
         Ok(())
     }
 
-    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
+    fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         record::write_record(
             &mut out,
@@ -1854,9 +1852,9 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             self.plain_write_epoch,
             self.plain_write_seq,
             fragment,
-        );
+        )?;
         self.plain_write_seq += 1;
-        out
+        Ok(out)
     }
 
     fn encrypt_protected_record(
@@ -1882,8 +1880,8 @@ impl<R: RngCore> DtlsServerConnection13<R> {
 
     /// Frames `fragment` as a plaintext (epoch 0) handshake record, sends
     /// it and registers it with the retransmit machine.
-    fn emit_plaintext(&mut self, fragment: Vec<u8>) {
-        let datagram = self.wrap_plain_record(ContentType::Handshake, &fragment);
+    fn emit_plaintext(&mut self, fragment: Vec<u8>) -> Result<(), Error> {
+        let datagram = self.wrap_plain_record(ContentType::Handshake, &fragment)?;
         let record_number = RecordNumber {
             epoch: self.plain_write_epoch as u64,
             seq: self.plain_write_seq.saturating_sub(1),
@@ -1893,6 +1891,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             InFlightRecord::new(record_number, self.plain_write_epoch, fragment),
             self.last_now,
         );
+        Ok(())
     }
 
     /// Re-frames every in-flight handshake record under a FRESH record
@@ -1908,12 +1907,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                 (r.epoch, r.fragment.clone())
             };
             let framed = if epoch == self.plain_write_epoch {
-                let dg = self.wrap_plain_record(ContentType::Handshake, &fragment);
-                let rn = RecordNumber {
-                    epoch: epoch as u64,
-                    seq: self.plain_write_seq.saturating_sub(1),
-                };
-                Ok((dg, rn))
+                self.wrap_plain_record(ContentType::Handshake, &fragment)
+                    .map(|dg| {
+                        let rn = RecordNumber {
+                            epoch: epoch as u64,
+                            seq: self.plain_write_seq.saturating_sub(1),
+                        };
+                        (dg, rn)
+                    })
             } else if epoch == self.enc_write_epoch {
                 self.encrypt_protected_record(ContentType::Handshake, &fragment)
                     .map(|dg| {
@@ -1933,25 +1934,26 @@ impl<R: RngCore> DtlsServerConnection13<R> {
         }
     }
 
-    /// Builds an encrypted handshake record carrying `msg_type` / `body`
-    /// (DTLS handshake header wrapped, single fragment). Pushes the record
-    /// to the outbound queue AND registers it with the ACK-driven retransmit
-    /// machine.
+    /// Fragments the handshake message `msg_type` / `body` to the
+    /// configured record ceiling and emits every fragment as its own
+    /// encrypted record (RFC 9147 §4.4: a Certificate spans many
+    /// datagrams). Each record is pushed to the outbound queue AND
+    /// registered individually with the ACK-driven retransmit machine.
     fn emit_encrypted_handshake(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
         let msg_seq = self.out_msg_seq;
         self.out_msg_seq += 1;
-        let mut frag_buf = Vec::new();
-        write_message(&mut frag_buf, msg_type, msg_seq, body, DEFAULT_MAX_FRAGMENT);
-        let dg = self.encrypt_protected_record(ContentType::Handshake, &frag_buf)?;
-        let record_number = RecordNumber {
-            epoch: self.enc_write_epoch as u64,
-            seq: self.enc_write_seq.saturating_sub(1),
-        };
-        self.out_dgrams.push(dg);
-        self.retransmit.on_record_sent(
-            InFlightRecord::new(record_number, self.enc_write_epoch, frag_buf),
-            self.last_now,
-        );
+        for frag in write_fragments(msg_type, msg_seq, body, self.max_fragment()) {
+            let dg = self.encrypt_protected_record(ContentType::Handshake, &frag)?;
+            let record_number = RecordNumber {
+                epoch: self.enc_write_epoch as u64,
+                seq: self.enc_write_seq.saturating_sub(1),
+            };
+            self.out_dgrams.push(dg);
+            self.retransmit.on_record_sent(
+                InFlightRecord::new(record_number, self.enc_write_epoch, frag),
+                self.last_now,
+            );
+        }
         Ok(())
     }
 
@@ -1963,10 +1965,11 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             return;
         }
         let acks = core::mem::take(&mut self.pending_acks);
-        // `encode_ack` chunks: an ACK body's `u16` length prefix cannot
-        // describe more than 4095 record numbers, so an oversized queue
-        // becomes several ACK records instead of one truncated one.
-        for body in encode_ack(&acks) {
+        // Chunked so every ACK record stays within `max_record_size` (a
+        // fragmented multi-KB flight is dozens of record numbers), which
+        // also keeps each body's `u16` length prefix exact.
+        let per_ack = super::ack::entries_per_record(self.config.max_record_size);
+        for body in super::ack::encode_with_limit(&acks, per_ack) {
             if let Ok(dg) =
                 self.encrypt_protected_record(ContentType::Unknown(ACK_CONTENT_TYPE), &body)
             {
