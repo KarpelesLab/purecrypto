@@ -15,6 +15,11 @@
 //! The field, point, and scalar arithmetic live in the shared `curve25519`
 //! backend, which this module consumes; the same backend powers the
 //! `edwards25519::hazmat` and `ristretto255` exposures.
+//!
+//! **Verification is cofactored** (`[8S]B == [8R] + [8k]A`): it may accept
+//! some torsion-tainted signatures that a cofactorless verifier rejects (never
+//! the reverse for canonical inputs), so implementations disagree on those
+//! edge cases — do not use this for consensus-critical validation.
 
 use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
@@ -752,6 +757,47 @@ mod tests {
                 pk.verify(b"", &sig).is_err(),
                 "small-order key {enc} accepted"
             );
+        }
+    }
+
+    /// Non-canonical encodings of `R` and `A` must be rejected by the
+    /// decoder, and hence by `verify`: `y ≥ p` (`y = p`, `y = 2²⁵⁵ − 1`) and
+    /// the "negative zero" encodings (`x = 0`, i.e. `y = ±1`, with the sign
+    /// bit set). ZIP-215 accepts the `y ≥ p` set; this verifier is stricter.
+    #[test]
+    fn non_canonical_r_and_a_encodings_rejected() {
+        let f = Field::new();
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed25519-noncanon", b"n", &[]);
+        let sk = Ed25519PrivateKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let msg = b"non-canonical encodings";
+        let sig = sk.sign(msg);
+        pk.verify(msg, &sig).unwrap();
+
+        let bad_encodings = [
+            // y = p, sign 0.
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            // y = 2^255 − 1, sign 0 — the largest non-canonical residue.
+            "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            // y = p, sign 1.
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            // y = 1 (x = 0) with the sign bit set: "negative zero".
+            "0100000000000000000000000000000000000000000000000000000000000080",
+            // y = p − 1 (x = 0) with the sign bit set.
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ];
+
+        for enc in bad_encodings {
+            let bad = from_hex::<32>(enc);
+            assert!(f.decode(&bad).is_none(), "decoder accepted {enc}");
+
+            // As R.
+            let bad_r = Ed25519Signature::from_components(&bad, &sig.s_bytes());
+            assert!(pk.verify(msg, &bad_r).is_err(), "R = {enc} accepted");
+
+            // As A.
+            let bad_pk = Ed25519PublicKey::from_bytes(bad);
+            assert!(bad_pk.verify(msg, &sig).is_err(), "A = {enc} accepted");
         }
     }
 }

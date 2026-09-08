@@ -18,6 +18,11 @@
 //! supplied via [`Ed448PrivateKey::sign_ctx`] / [`Ed448PublicKey::verify_ctx`];
 //! the no-context [`sign`](Ed448PrivateKey::sign) /
 //! [`verify`](Ed448PublicKey::verify) entry points use the empty context.
+//!
+//! **Verification is cofactored** (`[4S]B == [4R] + [4k]A`): it may accept
+//! some torsion-tainted signatures that a cofactorless verifier rejects (never
+//! the reverse for canonical inputs), so implementations disagree on those
+//! edge cases — do not use this for consensus-critical validation.
 
 use crate::ct::ConstantTimeLess;
 use crate::ec::Error;
@@ -782,5 +787,52 @@ mod tests {
         let parsed = Ed448PrivateKey::from_pkcs8_der(&der).expect("v2 parse");
         assert_eq!(parsed.to_bytes(), seed);
         assert_eq!(parsed.public_key().to_bytes(), pub_enc);
+    }
+
+    /// Non-canonical encodings of `R` and `A` must be rejected by the
+    /// decoder, and hence by `verify`: `y ≥ p` (`y = p`, `y = 2⁴⁴⁸ − 1`),
+    /// non-zero low bits in the padding byte, and the "negative zero"
+    /// encodings (`x = 0`, i.e. `y = ±1`, with the sign bit set).
+    #[test]
+    fn non_canonical_r_and_a_encodings_rejected() {
+        let f = Field::new();
+        let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"ed448-noncanon", b"n", &[]);
+        let sk = Ed448PrivateKey::generate(&mut rng);
+        let pk = sk.public_key();
+        let msg = b"non-canonical encodings";
+        let sig = sk.sign(msg);
+        pk.verify(msg, &sig).unwrap();
+
+        // y = p (bytes 0..28 = ff, byte 28 = fe, bytes 29..56 = ff, pad 0).
+        let mut y_eq_p = [0xffu8; 57];
+        y_eq_p[28] = 0xfe;
+        y_eq_p[56] = 0x00;
+        // y = 2⁴⁴⁸ − 1, the largest non-canonical residue.
+        let mut y_max = [0xffu8; 57];
+        y_max[56] = 0x00;
+        // y = 1 (x = 0) with the sign bit set: "negative zero".
+        let mut neg_zero_one = [0u8; 57];
+        neg_zero_one[0] = 1;
+        neg_zero_one[56] = 0x80;
+        // y = p − 1 (x = 0) with the sign bit set.
+        let mut neg_zero_m1 = [0xffu8; 57];
+        neg_zero_m1[0] = 0xfe;
+        neg_zero_m1[28] = 0xfe;
+        neg_zero_m1[56] = 0x80;
+        // The padding byte's low seven bits must be zero.
+        let mut pad_bits = pk.to_bytes();
+        pad_bits[56] |= 0x01;
+
+        for bad in [y_eq_p, y_max, neg_zero_one, neg_zero_m1, pad_bits] {
+            assert!(f.decode(&bad).is_none(), "decoder accepted {bad:02x?}");
+
+            // As R.
+            let bad_r = Ed448Signature::from_components(&bad, &sig.s_bytes());
+            assert!(pk.verify(msg, &bad_r).is_err());
+
+            // As A.
+            let bad_pk = Ed448PublicKey::from_bytes(bad);
+            assert!(bad_pk.verify(msg, &sig).is_err());
+        }
     }
 }
