@@ -882,6 +882,15 @@ impl<R: RngCore> ServerConnection12<R> {
                         .as_mut()
                         .ok_or(Error::UnexpectedMessage)?;
                     let (_ct, plain) = c.decrypt(&header, &fragment)?;
+                    // Only buffer application data once the handshake has
+                    // completed (the client's Finished has verified). Before
+                    // that the peer — under mTLS, its certificate — is not
+                    // authenticated, so the plaintext must never reach
+                    // `take_received_plaintext`, even on the error path.
+                    // Mirrors `ConnectionCore::app_data_allowed` (1.3).
+                    if self.state != State::Connected {
+                        return Err(Error::UnexpectedMessage);
+                    }
                     self.app_in.extend_from_slice(&plain);
                     return Ok(Some(Incoming::ApplicationData));
                 }

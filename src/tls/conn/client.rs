@@ -459,7 +459,11 @@ impl ClientConfig {
 /// A resumable session, returned by [`ClientConnection::take_session`] after a
 /// completed handshake. Pass it back via [`ClientConfig::with_session`] to
 /// attempt PSK resumption on the next connection to the same server.
-#[derive(Clone, Debug)]
+///
+/// The `Debug` output redacts the PSK and the ticket bytes: the PSK is a
+/// long-lived secret (anyone holding it can resume the session and decrypt
+/// its 0-RTT data) and the ticket identifies it on the wire.
+#[derive(Clone)]
 pub struct StoredSession {
     /// The server we connected to (used to scope sessions in the caller's
     /// cache; the wire identity is the ticket bytes alone).
@@ -485,6 +489,24 @@ pub struct StoredSession {
     /// Hash function of the original cipher suite (PSK binders and key
     /// schedule are tied to it).
     pub cipher_suite_hash: HashAlg,
+}
+
+impl core::fmt::Debug for StoredSession {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StoredSession")
+            .field("server_name", &self.server_name)
+            .field(
+                "ticket",
+                &format_args!("<{} bytes, redacted>", self.ticket.len()),
+            )
+            .field("psk", &format_args!("<{} bytes, redacted>", self.psk.len()))
+            .field("lifetime_seconds", &self.lifetime_seconds)
+            .field("received_at", &self.received_at)
+            .field("max_early_data_size", &self.max_early_data_size)
+            .field("negotiated_alpn", &self.negotiated_alpn)
+            .field("cipher_suite_hash", &self.cipher_suite_hash)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The current time from the system clock, when available.
@@ -561,6 +583,11 @@ pub struct ClientConnection {
     client_random: Random,
     offered_suites: Vec<CipherSuite>,
     offered_groups: Vec<NamedGroup>,
+    /// The groups CH1 actually carried a `key_share` for (a subset of
+    /// `offered_groups`). RFC 8446 §4.1.4: a HelloRetryRequest that selects
+    /// one of these is a protocol violation — the server already had a
+    /// usable share — and the client MUST abort with `illegal_parameter`.
+    ch1_share_groups: Vec<NamedGroup>,
     /// Set to `true` after a single HelloRetryRequest has been processed; a
     /// second one is rejected (RFC 8446 §4.1.4).
     hrr_processed: bool,
@@ -1236,6 +1263,20 @@ impl ClientConnection {
             client_random: random,
             offered_suites: effective_suites.clone(),
             offered_groups: groups.to_vec(),
+            ch1_share_groups: groups
+                .iter()
+                .copied()
+                .filter(|g| share_groups.is_empty() || share_groups.contains(g))
+                .filter(|g| {
+                    matches!(
+                        g,
+                        &NamedGroup::X25519
+                            | &NamedGroup::SECP256R1
+                            | &NamedGroup::SECP384R1
+                            | &NamedGroup::X25519MLKEM768
+                    )
+                })
+                .collect(),
             hrr_processed: false,
             hrr_selected_group: None,
             hrr_selected_suite: None,
@@ -1726,6 +1767,14 @@ impl ClientConnection {
 
     /// Test hook: bytes still buffered in the handshake transcript. Zero once
     /// the transcript has been sealed at the `Connected` transition.
+    /// Test hook: feed one complete handshake message straight into the
+    /// state machine, bypassing the record layer. Used to exercise
+    /// post-handshake rules a well-behaved peer's record stream cannot reach.
+    #[cfg(test)]
+    pub(crate) fn handle_handshake_for_test(&mut self, msg: Vec<u8>) -> Result<(), Error> {
+        self.handle_handshake(msg)
+    }
+
     #[cfg(test)]
     pub(crate) fn transcript_len_for_test(&self) -> usize {
         self.core.transcript.buffered_len()
@@ -1871,6 +1920,11 @@ impl ClientConnection {
                 let nst = NstWire::decode(body)?;
                 let received = ReceivedSessionTicket::from_wire(nst.clone())?;
                 self.last_ticket = Some(received.clone());
+                // RFC 8446 §4.6.1: a `ticket_lifetime` of zero means the
+                // ticket must be discarded immediately — never offer it.
+                if received.lifetime_seconds == 0 {
+                    return Ok(());
+                }
 
                 // Derive the PSK and build a StoredSession ready for the next
                 // connection. Requires `resumption_master_secret` (set when our
@@ -2290,6 +2344,11 @@ impl ClientConnection {
                     if !self.offered_groups.contains(&g) {
                         return Err(Error::IllegalParameter);
                     }
+                    // RFC 8446 §4.1.4: the selected group MUST NOT be one
+                    // CH1 already supplied a key_share for.
+                    if self.ch1_share_groups.contains(&g) {
+                        return Err(Error::IllegalParameter);
+                    }
                     Some(g)
                 }
                 None => None,
@@ -2681,6 +2740,9 @@ impl ClientConnection {
             let body = &raw[4..];
             let mut c = ReadCursor::new(body);
             let exts_bytes = c.vec_u16()?;
+            // RFC 8446 §4.3.1: the body is exactly the extensions vector;
+            // trailing bytes are a malformed message, not padding.
+            c.expect_empty()?;
             let mut ec = ReadCursor::new(exts_bytes);
             // RFC 8446 §4.2: every extension type may appear at most once
             // in a single handshake message. Track types we've seen and
@@ -3615,6 +3677,17 @@ fn suite_hash(s: CipherSuite) -> Option<HashAlg> {
 /// Patches a single PSK binder into the ClientHello bytes built by
 /// [`ClientConnection::build_client_hello`].
 ///
+/// TODO(RFC 8446 §4.2.11.2): the binder's transcript input is only correct
+/// for the *first* ClientHello. After a HelloRetryRequest the binder in CH2
+/// MUST be computed over `Transcript-Hash(message_hash(CH1) ‖ HRR ‖
+/// truncated CH2)`, but this helper hashes the truncated CH2 alone, so a
+/// PSK offer that survives an HRR round produces a binder the server will
+/// reject (`decrypt_error`) — resumption after HRR currently fails closed
+/// rather than open. The fix is to thread the running transcript (with the
+/// §4.4.1 message_hash rewrite already applied) into the HRR rebuild path
+/// and hash `transcript ‖ ch[..truncated_len]` there; left for a change
+/// that can be validated against an interop peer.
+///
 /// `ch[..truncated_len]` is the truncated CH (everything before the
 /// `pre_shared_key` binders field). The remaining `ch[truncated_len..]` is
 /// the binders field laid out as `u16 outer_len ‖ u8 inner_len ‖ binder_bytes`,
@@ -3829,6 +3902,29 @@ mod tests {
             .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
             .unwrap_err();
         assert!(matches!(err, Error::IllegalParameter));
+    }
+
+    /// TLS-CORE-7(b) — RFC 8446 §4.3.1: EncryptedExtensions is exactly one
+    /// extensions vector; bytes after it are a malformed message.
+    #[test]
+    fn client_rejects_trailing_bytes_after_ee_extensions() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"ee-trailing", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
+        // EE body = extensions_len(2)=0 ‖ one stray byte.
+        let body = [0u8, 0, 0xFF];
+        let mut raw = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0x00, 0x00, body.len() as u8];
+        raw.extend_from_slice(&body);
+        assert!(
+            client
+                .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw)
+                .is_err()
+        );
+        // Control: the same message without the stray byte parses.
+        let raw_ok = alloc::vec![hs_type::ENCRYPTED_EXTENSIONS, 0x00, 0x00, 0x02, 0x00, 0x00];
+        client
+            .on_encrypted_extensions(hs_type::ENCRYPTED_EXTENSIONS, &raw_ok)
+            .unwrap();
     }
 
     /// TLS-CORE-6 — RFC 8446 §4.2.10: a server MUST NOT accept early data

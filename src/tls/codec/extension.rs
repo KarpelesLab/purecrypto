@@ -506,6 +506,7 @@ pub(crate) fn parse_signature_algorithms(body: &[u8]) -> Result<Vec<SignatureSch
 pub(crate) fn client_offers_tls13(body: &[u8]) -> Result<bool, Error> {
     let mut outer = ReadCursor::new(body);
     let list = outer.vec_u8()?;
+    outer.expect_empty()?;
     let mut c = ReadCursor::new(list);
     let mut found = false;
     while !c.is_empty() {
@@ -669,6 +670,16 @@ pub(crate) fn parse_server_pre_shared_key(body: &[u8]) -> Result<u16, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TLS-CORE-7(b) — `supported_versions` is exactly one length-prefixed
+    /// list; trailing bytes are a malformed extension, not padding.
+    #[test]
+    fn client_offers_tls13_rejects_trailing_bytes() {
+        // len=2, [0x0304]
+        assert!(client_offers_tls13(&[2, 0x03, 0x04]).unwrap());
+        assert!(client_offers_tls13(&[2, 0x03, 0x04, 0x00]).is_err());
+        assert!(!client_offers_tls13(&[2, 0x03, 0x03]).unwrap());
+    }
 
     /// Round-trip a single host_name through `server_name` ↔ `parse_server_name`.
     #[test]

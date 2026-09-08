@@ -1843,6 +1843,14 @@ impl<R: RngCore> ServerConnection<R> {
         if !ext::client_offers_tls13(sv)? {
             return Err(Error::UnsupportedVersion);
         }
+        // RFC 8446 §4.1.2: a TLS 1.3 ClientHello MUST carry exactly one
+        // `legacy_compression_method`, null (0); a server negotiating 1.3
+        // MUST abort with `illegal_parameter` otherwise. Checked only once
+        // the offer is known to be 1.3 so a 1.2-only client offering
+        // DEFLATE still gets the (more useful) `protocol_version` alert.
+        if ClientHello::legacy_compression_methods(body)? != [0] {
+            return Err(Error::IllegalParameter);
+        }
 
         // The client must accept a signature scheme our key can produce —
         // unless PSK is being used, in which case we sign nothing. For an

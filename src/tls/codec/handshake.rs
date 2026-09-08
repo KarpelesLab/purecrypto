@@ -156,6 +156,19 @@ impl ClientHello {
         out
     }
 
+    /// Returns the `legacy_compression_methods` list of an encoded ClientHello
+    /// body. `decode` deliberately drops it (TLS 1.2 tolerates any list that
+    /// contains null); the TLS 1.3 server uses this to enforce RFC 8446
+    /// §4.1.2, which requires the list to be exactly `[0]`.
+    pub(crate) fn legacy_compression_methods(body: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut c = ReadCursor::new(body);
+        let _legacy_version = c.u16()?;
+        let _random = read_random(&mut c)?;
+        let _session_id = c.vec_u8()?;
+        let _cipher_suites = c.vec_u16()?;
+        Ok(c.vec_u8()?.to_vec())
+    }
+
     /// Decodes a `ClientHello` from a handshake message body.
     pub(crate) fn decode(body: &[u8]) -> Result<Self, Error> {
         let mut c = ReadCursor::new(body);

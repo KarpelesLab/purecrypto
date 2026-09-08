@@ -2856,13 +2856,15 @@ mod loopback_tests {
         roots.add_der(cert_der).unwrap();
 
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr-client", b"nonce", &[]);
-        // Offer X25519 and SECP256R1; the server will "demand" SECP256R1.
-        let mut client = ClientConnection::new_with_offer(
+        // Offer X25519 and SECP256R1 but ship a share only for X25519; the
+        // server will "demand" SECP256R1.
+        let mut client = ClientConnection::new_with_offer_partial_shares(
             ClientConfig::new(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            &[NamedGroup::X25519],
         );
 
         // Drop the initial ClientHello so we can inspect the retry independently.
@@ -2903,12 +2905,13 @@ mod loopback_tests {
         roots.add_der(cert_der).unwrap();
 
         let mut crng = HmacDrbg::<Sha256>::new(b"hrr2-client", b"nonce", &[]);
-        let mut client = ClientConnection::new_with_offer(
+        let mut client = ClientConnection::new_with_offer_partial_shares(
             ClientConfig::new(roots),
             "loopback.example",
             &mut crng,
             &[CipherSuite::AES_128_GCM_SHA256],
             &[NamedGroup::X25519, NamedGroup::SECP256R1],
+            &[NamedGroup::X25519],
         );
         let _ch1 = client.write_tls();
 
@@ -3040,7 +3043,7 @@ mod loopback_tests {
             let mut roots = RootCertStore::new();
             roots.add_der(cert_der).unwrap();
             let mut crng = HmacDrbg::<Sha256>::new(seed, b"nonce", &[]);
-            ClientConnection::new_with_offer(
+            ClientConnection::new_with_offer_partial_shares(
                 ClientConfig::new(roots),
                 "loopback.example",
                 &mut crng,
@@ -3049,6 +3052,7 @@ mod loopback_tests {
                     CipherSuite::AES_256_GCM_SHA384,
                 ],
                 &[NamedGroup::X25519, NamedGroup::SECP256R1],
+                &[NamedGroup::X25519],
             )
         };
 
@@ -6803,6 +6807,33 @@ mod keylog_loopback_tests {
     }
 }
 
+/// A plaintext HelloRetryRequest record (AES_128_GCM_SHA256, TLS 1.3) whose
+/// `key_share` selects `selected_group`. Shared by the audit regression tests.
+#[cfg(test)]
+fn synthetic_hrr_record_for_audit(selected_group: crate::tls::codec::NamedGroup) -> Vec<u8> {
+    use crate::tls::codec::{CipherSuite, ExtensionType, ServerHello, put_u16, write_record};
+    let mut ks_body = Vec::new();
+    put_u16(&mut ks_body, selected_group.0);
+    let sh = ServerHello {
+        random: crate::tls::codec::HRR_RANDOM,
+        session_id: Vec::new(),
+        cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+        extensions: alloc::vec![
+            (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+            (ExtensionType::KEY_SHARE, ks_body),
+        ],
+    };
+    let body = sh.encode();
+    let mut out = Vec::new();
+    write_record(
+        &mut out,
+        crate::tls::ContentType::Handshake,
+        crate::tls::ProtocolVersion::TLSv1_2,
+        &body,
+    );
+    out
+}
+
 /// Regression tests for the TLS-engine security audit findings.
 #[cfg(test)]
 mod audit_regression_tests {
@@ -7644,6 +7675,278 @@ mod audit_regression_tests {
             client.process_new_packets(),
             Err(Error::UnexpectedMessage)
         ));
+    }
+
+    /// TLS-CORE-7(a) — RFC 8446 §4.1.2: a TLS 1.3 ClientHello's
+    /// `legacy_compression_methods` MUST be exactly `[0]`; the server MUST
+    /// abort with `illegal_parameter` otherwise. The list was decoded and
+    /// discarded.
+    #[test]
+    fn tls13_server_rejects_non_null_compression_methods() {
+        use crate::tls::codec::{read_record, write_record};
+        use crate::tls::{ContentType, ProtocolVersion};
+
+        let (server_config, _cert_der) = rsa_server();
+        let mut client = x25519_client(b"compress-c");
+        let ch_rec = client.write_tls();
+        let rec = read_record(&ch_rec).unwrap().unwrap();
+        let mut msg = rec.fragment.to_vec();
+        // msg = type(1) ‖ len(3) ‖ version(2) ‖ random(32) ‖ sid_len(1)=0 ‖
+        //       cs_len(2) ‖ suites ‖ comp_len(1) ‖ comp ‖ …
+        assert_eq!(msg[38], 0, "this client offers an empty session id");
+        let cs_len = u16::from_be_bytes([msg[39], msg[40]]) as usize;
+        let comp_off = 41 + cs_len;
+        assert_eq!(&msg[comp_off..comp_off + 2], &[1, 0]);
+        // Offer null AND deflate: [0, 1].
+        msg[comp_off] = 2;
+        msg.insert(comp_off + 2, 1);
+        let body_len = msg.len() - 4;
+        msg[1..4].copy_from_slice(&[
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ]);
+        let mut wire = Vec::new();
+        write_record(
+            &mut wire,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &msg,
+        );
+
+        let srng = HmacDrbg::<Sha256>::new(b"compress-s", b"nonce", &[]);
+        let mut server = ServerConnection::new(server_config, srng);
+        server.read_tls(&wire);
+        assert!(matches!(
+            server.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+    }
+
+    /// TLS-CORE-7(c) — RFC 8446 §4.1.4: a HelloRetryRequest MUST NOT select
+    /// a group the ClientHello already carried a `key_share` for; the client
+    /// MUST abort with `illegal_parameter` instead of re-sending a share the
+    /// server already had.
+    #[test]
+    fn client_rejects_hrr_selecting_an_already_shared_group() {
+        let (_server_config, cert_der) = rsa_server();
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut crng = HmacDrbg::<Sha256>::new(b"hrr-shared-c", b"nonce", &[]);
+        // Shares for BOTH offered groups.
+        let mut client = ClientConnection::new_with_offer(
+            ClientConfig::new(roots),
+            "loopback.example",
+            &mut crng,
+            &[CipherSuite::AES_128_GCM_SHA256],
+            &[NamedGroup::X25519, NamedGroup::SECP256R1],
+        );
+        let _ch1 = client.write_tls();
+        let hrr = super::synthetic_hrr_record_for_audit(NamedGroup::SECP256R1);
+        client.read_tls(&hrr);
+        assert!(matches!(
+            client.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+        // Only the fatal alert goes out — no CH2.
+        let out = client.write_tls();
+        assert_eq!(out.first(), Some(&crate::tls::ContentType::Alert.as_u8()));
+        assert_eq!(out.len(), 5 + 2, "exactly one alert record, no CH2");
+    }
+
+    /// TLS-CORE-7(d) — RFC 8446 §4.6.1: `ticket_lifetime == 0` means the
+    /// ticket must be discarded immediately. It was cached and offered on
+    /// the next connection like any other.
+    #[test]
+    fn client_does_not_cache_a_zero_lifetime_ticket() {
+        use crate::tls::codec::NewSessionTicket;
+
+        let (server_config, cert_der) = rsa_server();
+        let (mut client, _server) = connected_pair(server_config, cert_der, b"nst-zero");
+        assert!(client.take_session().is_none(), "no ticket key configured");
+
+        let nst = |lifetime: u32| {
+            NewSessionTicket {
+                ticket_lifetime: lifetime,
+                ticket_age_add: 7,
+                ticket_nonce: alloc::vec![0u8; 4],
+                ticket: alloc::vec![0x41u8; 32],
+                extensions: Vec::new(),
+            }
+            .encode()
+        };
+        client.handle_handshake_for_test(nst(0)).unwrap();
+        assert!(
+            client.take_session().is_none(),
+            "a zero-lifetime ticket must not be cached"
+        );
+        // Control: a positive lifetime is cached as before.
+        client.handle_handshake_for_test(nst(3600)).unwrap();
+        assert!(client.take_session().is_some());
+    }
+
+    /// TLS-CORE-7(e) — the resumption secrets must not leak through
+    /// `Debug` (log lines, panic messages, `{:?}` in error paths).
+    #[test]
+    fn stored_sessions_redact_secrets_in_debug() {
+        use crate::tls::conn::{StoredSession, StoredSession12};
+        use crate::tls::crypto::HashAlg;
+        use crate::x509::Time;
+
+        let s = StoredSession {
+            server_name: "h".into(),
+            ticket: alloc::vec![0xAB; 16],
+            psk: alloc::vec![0xCD; 32],
+            age_add: 0,
+            lifetime_seconds: 60,
+            received_at: Time::from_unix(0),
+            max_early_data_size: None,
+            negotiated_alpn: None,
+            cipher_suite_hash: HashAlg::Sha256,
+        };
+        let d = alloc::format!("{s:?}");
+        assert!(d.contains("redacted"), "{d}");
+        assert!(!d.contains("205") && !d.contains("cd"), "psk leaked: {d}");
+        assert!(
+            !d.contains("171") && !d.contains("ab"),
+            "ticket leaked: {d}"
+        );
+
+        let s12 = StoredSession12 {
+            ticket: alloc::vec![0xAB; 16],
+            master_secret: [0xEE; 48],
+            cipher_suite: 0xC02F,
+            alpn: None,
+            received_at: None,
+            ems_used: true,
+        };
+        let d = alloc::format!("{s12:?}");
+        assert!(d.contains("redacted"), "{d}");
+        assert!(
+            !d.contains("238") && !d.contains("ee"),
+            "master secret leaked: {d}"
+        );
+        assert!(!d.contains("171"), "ticket leaked: {d}");
+    }
+
+    /// TLS-CORE-7(f) — the TLS 1.2 client buffered decrypted application
+    /// data into its receive buffer *before* checking the handshake had
+    /// completed, so bytes the unauthenticated server sent between its CCS
+    /// and its Finished were readable via `take_received_plaintext()` on
+    /// the error path. Mirrors `app_data_allowed` on the 1.3 core.
+    #[test]
+    fn tls12_client_drops_application_data_received_before_finished() {
+        use crate::tls::codec::{read_record, write_record};
+        use crate::tls::conn::{
+            ClientConfig12, ClientConnection12, ServerConfig12, ServerConnection12, lookup_suite_12,
+        };
+        use crate::tls::crypto::aead12::RecordCrypter12;
+        use crate::tls::crypto::prf::key_block;
+        use crate::tls::keylog::KeyLog;
+        use crate::tls::{ContentType, ProtocolVersion};
+        use std::sync::Mutex;
+
+        // Capture the master secret so the test can play the server's
+        // record layer itself.
+        struct Capture(Mutex<Option<[u8; 48]>>);
+        impl KeyLog for Capture {
+            fn log(&self, label: &str, _client_random: &[u8; 32], secret: &[u8]) {
+                if label == "CLIENT_RANDOM" {
+                    let mut m = [0u8; 48];
+                    m.copy_from_slice(secret);
+                    *self.0.lock().unwrap() = Some(m);
+                }
+            }
+        }
+        let capture = alloc::sync::Arc::new(Capture(Mutex::new(None)));
+
+        let key = rsa_test_key_a();
+        let name = DistinguishedName::common_name("loopback.example");
+        let validity = Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let cert = Certificate::self_signed(&key, &name, &validity, 1, false).unwrap();
+        let der = cert.to_der().to_vec();
+        let boxed = BoxedRsaPrivateKey::from_pkcs1_der(&key.to_pkcs1_der()).unwrap();
+        let mut server_config = ServerConfig12::with_rsa(alloc::vec![der.clone()], boxed);
+        server_config.key_log = Some(capture.clone());
+        let mut roots = RootCertStore::new();
+        roots.add_der(der).unwrap();
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"appdata12-c", b"nonce", &[]);
+        let srng = HmacDrbg::<Sha256>::new(b"appdata12-s", b"nonce", &[]);
+        let mut client =
+            ClientConnection12::new(ClientConfig12::new(roots), "loopback.example", &mut crng)
+                .unwrap();
+        let mut server = ServerConnection12::new(server_config, srng);
+
+        let ch = client.write_tls();
+        server.read_tls(&ch);
+        server.process_new_packets().unwrap();
+        let flight = server.write_tls();
+        client.read_tls(&flight);
+        client.process_new_packets().unwrap();
+        assert!(
+            client.is_handshaking(),
+            "client waits for the server Finished"
+        );
+        // Let the server derive (and log) the master secret from the
+        // client's ClientKeyExchange; its own flight is discarded — the
+        // test plays the server's record layer from here on.
+        server.read_tls(&client.write_tls());
+        server.process_new_packets().unwrap();
+        let _server_flight = server.write_tls();
+
+        // Randoms + negotiated suite from the wire; master from the key log.
+        let ch_body = &read_record(&ch).unwrap().unwrap().fragment[4..];
+        let sh_body = &read_record(&flight).unwrap().unwrap().fragment[4..];
+        let mut cr = [0u8; 32];
+        cr.copy_from_slice(&ch_body[2..34]);
+        let mut sr = [0u8; 32];
+        sr.copy_from_slice(&sh_body[2..34]);
+        let sid_len = sh_body[34] as usize;
+        let suite = CipherSuite(u16::from_be_bytes([
+            sh_body[35 + sid_len],
+            sh_body[36 + sid_len],
+        ]));
+        let suite = lookup_suite_12(suite).expect("negotiated suite");
+        let master = capture.0.lock().unwrap().expect("master secret logged");
+
+        // Server write key + salt, then an application record at seq 0 —
+        // the position the server's Finished would normally occupy.
+        let mut kb = alloc::vec![0u8; 2 * suite.key_len + 8];
+        key_block(suite.hash, &master, &sr, &cr, &mut kb);
+        let s_key = &kb[suite.key_len..2 * suite.key_len];
+        let mut s_salt = [0u8; 4];
+        s_salt.copy_from_slice(&kb[2 * suite.key_len + 4..2 * suite.key_len + 8]);
+        let mut server_writer = RecordCrypter12::new(suite.aead, s_key, s_salt);
+        // `encrypt` yields the fragment (`explicit_nonce ‖ ct ‖ tag`); the
+        // record header is framed here, as the engine would.
+        let app = server_writer
+            .encrypt(ContentType::ApplicationData, b"unauthenticated bytes")
+            .unwrap();
+
+        let mut wire = Vec::new();
+        write_record(
+            &mut wire,
+            ContentType::ChangeCipherSpec,
+            ProtocolVersion::TLSv1_2,
+            &[0x01],
+        );
+        write_record(
+            &mut wire,
+            ContentType::ApplicationData,
+            ProtocolVersion::TLSv1_2,
+            &app,
+        );
+        client.read_tls(&wire);
+        let r = client.process_new_packets();
+        assert!(matches!(r, Err(Error::UnexpectedMessage)), "got {r:?}");
+        assert!(
+            client.take_received_plaintext().is_empty(),
+            "application data sent before Finished must never surface"
+        );
     }
 
     /// LOW 9 — after the client's `Finished`, 1-RTT application data must

@@ -301,7 +301,9 @@ pub(crate) const TLS_FALLBACK_SCSV: u16 = 0x5600;
 /// A resumable session for the TLS 1.2 client (RFC 5077). Persist this
 /// across connections; pass it back via [`ClientConfig12::with_session`] to
 /// attempt resumption.
-#[derive(Clone, Debug)]
+///
+/// The `Debug` output redacts the master secret and the ticket bytes.
+#[derive(Clone)]
 pub struct StoredSession12 {
     /// The opaque ticket bytes received in `NewSessionTicket`. We re-present
     /// these unchanged in the next ClientHello's `session_ticket` extension.
@@ -323,6 +325,22 @@ pub struct StoredSession12 {
     /// it MUST NOT. Cross-EMS resumption is rejected with
     /// `IllegalParameter`.
     pub ems_used: bool,
+}
+
+impl core::fmt::Debug for StoredSession12 {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StoredSession12")
+            .field(
+                "ticket",
+                &format_args!("<{} bytes, redacted>", self.ticket.len()),
+            )
+            .field("master_secret", &format_args!("<48 bytes, redacted>"))
+            .field("cipher_suite", &format_args!("{:#06x}", self.cipher_suite))
+            .field("alpn", &self.alpn)
+            .field("received_at", &self.received_at)
+            .field("ems_used", &self.ems_used)
+            .finish_non_exhaustive()
+    }
 }
 
 // A stored session is the long-lived home of a connection's master secret
@@ -1355,6 +1373,15 @@ impl ClientConnection12 {
                         .as_mut()
                         .ok_or(Error::UnexpectedMessage)?;
                     let (_ct, plain) = c.decrypt(&header, &fragment)?;
+                    // Application data is only acceptable once the
+                    // handshake has completed: before the server's
+                    // Finished the peer is not authenticated, so the
+                    // plaintext must never reach `take_received_plaintext`
+                    // — not even transiently on the error path. Mirrors
+                    // `ConnectionCore::app_data_allowed` on the 1.3 path.
+                    if self.state != State::Connected {
+                        return Err(Error::UnexpectedMessage);
+                    }
                     self.app_in.extend_from_slice(&plain);
                     return Ok(Some(Incoming::ApplicationData));
                 }

@@ -42,8 +42,8 @@ const TAG_LEN: usize = 16;
 const MIN_PLAIN_LEN: usize = 2 + 48 + 8 + 1 + 1;
 
 /// The TLS 1.2 ticket payload — what the server learns when it decrypts a
-/// returning client's ticket.
-#[derive(Clone, Debug)]
+/// returning client's ticket. `Debug` redacts the master secret.
+#[derive(Clone)]
 pub(crate) struct Ticket12Plaintext {
     /// The cipher suite the ticket was issued for. The resumed handshake MUST
     /// pick the same suite (RFC 5077 §3.4 / RFC 5246 §F.1.4).
@@ -65,6 +65,18 @@ pub(crate) struct Ticket12Plaintext {
     /// client re-offers ALPN in its CH and the server re-picks), but we keep
     /// it around for visibility and future cross-checks.
     pub(crate) alpn: Option<Vec<u8>>,
+}
+
+impl core::fmt::Debug for Ticket12Plaintext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Ticket12Plaintext")
+            .field("cipher_suite", &format_args!("{:#06x}", self.cipher_suite))
+            .field("master_secret", &format_args!("<48 bytes, redacted>"))
+            .field("creation_time", &self.creation_time)
+            .field("ems_used", &self.ems_used)
+            .field("alpn", &self.alpn)
+            .finish_non_exhaustive()
+    }
 }
 
 // The decoded ticket payload carries the 48-byte master secret; scrub it
