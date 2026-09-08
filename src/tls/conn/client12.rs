@@ -2513,6 +2513,9 @@ impl super::stream::ConnectionIo for ClientConnection12 {
     fn take_received_plaintext(&mut self) -> Vec<u8> {
         ClientConnection12::take_received_plaintext(self)
     }
+    fn received_close_notify(&self) -> bool {
+        ClientConnection12::received_close_notify(self)
+    }
 }
 
 #[cfg(test)]

@@ -2468,6 +2468,9 @@ impl<R: RngCore> super::stream::ConnectionIo for ServerConnection12<R> {
     fn take_received_plaintext(&mut self) -> Vec<u8> {
         ServerConnection12::take_received_plaintext(self)
     }
+    fn received_close_notify(&self) -> bool {
+        ServerConnection12::received_close_notify(self)
+    }
 }
 
 #[cfg(test)]

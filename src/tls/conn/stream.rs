@@ -28,6 +28,8 @@ pub trait ConnectionIo {
     fn send_application_data(&mut self, data: &[u8]) -> Result<(), TlsError>;
     /// Removes and returns any received application plaintext.
     fn take_received_plaintext(&mut self) -> Vec<u8>;
+    /// True once the peer's `close_notify` alert has been processed.
+    fn received_close_notify(&self) -> bool;
 }
 
 impl ConnectionIo for ClientConnection {
@@ -49,6 +51,9 @@ impl ConnectionIo for ClientConnection {
     fn take_received_plaintext(&mut self) -> Vec<u8> {
         ClientConnection::take_received_plaintext(self)
     }
+    fn received_close_notify(&self) -> bool {
+        ClientConnection::received_close_notify(self)
+    }
 }
 
 impl<R: RngCore> ConnectionIo for ServerConnection<R> {
@@ -69,6 +74,9 @@ impl<R: RngCore> ConnectionIo for ServerConnection<R> {
     }
     fn take_received_plaintext(&mut self) -> Vec<u8> {
         ServerConnection::take_received_plaintext(self)
+    }
+    fn received_close_notify(&self) -> bool {
+        ServerConnection::received_close_notify(self)
     }
 }
 
@@ -140,7 +148,19 @@ impl<C: ConnectionIo, T: Read + Write> Read for Stream<'_, C, T> {
         }
         while self.pending.is_empty() {
             if self.read_and_process()? == 0 {
-                return Ok(0); // clean EOF
+                // Transport EOF. RFC 8446 §6.1: only a received
+                // `close_notify` makes this a clean end of stream. Without
+                // one the TLS stream was cut short — an attacker can strip
+                // the tail of an EOF-delimited response by injecting a
+                // FIN/RST — so surface it as an error (rustls does the same)
+                // rather than a clean `Ok(0)`.
+                if self.conn.received_close_notify() {
+                    return Ok(0);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "peer closed connection without close_notify (possible truncation attack)",
+                ));
             }
         }
         let n = self.pending.len().min(buf.len());
@@ -225,5 +245,67 @@ mod tests {
         assert_eq!(&buf[..n], b"200 OK");
 
         server.join().unwrap();
+    }
+
+    /// Runs a loopback where the server answers one request and then ends
+    /// the connection — gracefully (close_notify first) or by just dropping
+    /// the socket — and returns the client's read result after the response.
+    fn eof_after_response(graceful: bool) -> io::Result<usize> {
+        let (server_config, cert_der) = rsa_server();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut conn = ServerConnection::new(server_config, OsRng);
+            let mut tls = Stream::new(&mut conn, &mut sock);
+            tls.complete_handshake().unwrap();
+            let mut buf = [0u8; 32];
+            let n = tls.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], b"GET /");
+            // `write` only queues the record in `conn`; release the adapter
+            // so the engine can be driven directly for the close sequence.
+            tls.write_all(b"200 OK").unwrap();
+            drop(tls);
+            if graceful {
+                conn.send_close_notify();
+            }
+            let out = conn.write_tls();
+            sock.write_all(&out).unwrap();
+            sock.flush().unwrap();
+            // Dropping `sock` sends the FIN.
+        });
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let mut conn =
+            ClientConnection::new(ClientConfig::new(roots), "localhost", &mut OsRng).unwrap();
+        let mut tls = Stream::new(&mut conn, &mut sock);
+        tls.complete_handshake().unwrap();
+        tls.write_all(b"GET /").unwrap();
+        tls.flush().unwrap();
+        let mut buf = [0u8; 32];
+        let n = tls.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"200 OK");
+        let result = tls.read(&mut buf);
+        server.join().unwrap();
+        result
+    }
+
+    /// RFC 8446 §6.1: a transport EOF without a preceding close_notify is
+    /// a truncation, not a clean end of stream — `read` must fail with
+    /// `UnexpectedEof` rather than report `Ok(0)`.
+    #[test]
+    fn eof_without_close_notify_is_unexpected_eof() {
+        let err = eof_after_response(false).expect_err("truncated stream must not read as EOF");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// A close_notify followed by the transport EOF is the graceful case:
+    /// `read` reports `Ok(0)`.
+    #[test]
+    fn eof_after_close_notify_is_clean() {
+        assert_eq!(eof_after_response(true).unwrap(), 0);
     }
 }
