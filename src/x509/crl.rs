@@ -38,8 +38,8 @@ use alloc::vec::Vec;
 use super::time::read_time;
 use super::{AnyPublicKey, CertSigner, DistinguishedName, Error, SignatureAlgId, Time, oid};
 use crate::der::{
-    Reader, encode_bit_string, encode_integer, encode_octet_string, encode_sequence, encode_tlv,
-    oid_tlv, parse_oid, pem_decode, pem_encode, tag,
+    Reader, encode_bit_string, encode_context, encode_integer, encode_octet_string,
+    encode_sequence, encode_tlv, oid_tlv, parse_oid, pem_decode, pem_encode, tag,
 };
 
 const PEM_LABEL: &str = "X509 CRL";
@@ -154,17 +154,39 @@ pub struct CrlBuilder {
     this_update: Time,
     next_update: Option<Time>,
     entries: Vec<RevokedCertificate>,
+    /// `cRLNumber` as an unsigned big-endian magnitude, when set.
+    crl_number: Option<Vec<u8>>,
 }
 
 impl CrlBuilder {
     /// Starts a new CRL keyed by `issuer`.
+    ///
+    /// RFC 5280 §5.2.3 requires conforming CRL issuers to include a
+    /// `cRLNumber` extension; set one with [`crl_number`](Self::crl_number)
+    /// (a CRL built without it is still well-formed and parses, but is not
+    /// conformant).
     pub fn new(issuer: &DistinguishedName, this_update: Time, next_update: Option<Time>) -> Self {
         CrlBuilder {
             issuer_der: issuer.to_der(),
             this_update,
             next_update,
             entries: Vec::new(),
+            crl_number: None,
         }
+    }
+
+    /// Sets the `cRLNumber` extension (RFC 5280 §5.2.3): a monotonically
+    /// increasing sequence number for CRLs issued by this CA, emitted
+    /// non-critical as the RFC mandates. Call it with the issuer's persisted
+    /// counter; calling again replaces the earlier value.
+    pub fn crl_number(&mut self, number: u64) -> &mut Self {
+        // Unsigned big-endian magnitude without leading zero octets (the DER
+        // INTEGER encoder adds the sign pad when the top bit is set); zero
+        // is the single octet 0x00.
+        let be = number.to_be_bytes();
+        let start = be.iter().position(|&b| b != 0).unwrap_or(be.len() - 1);
+        self.crl_number = Some(be[start..].to_vec());
+        self
     }
 
     /// Adds a revoked entry. `serial_be` is the raw big-endian serial number
@@ -193,6 +215,7 @@ impl CrlBuilder {
             &self.this_update,
             self.next_update.as_ref(),
             &self.entries,
+            self.crl_number.as_deref(),
             &algid,
         );
         let sig = signer.sign(&tbs)?;
@@ -215,6 +238,7 @@ impl CrlBuilder {
             &self.this_update,
             self.next_update.as_ref(),
             &self.entries,
+            self.crl_number.as_deref(),
             &algid,
         );
         PreparedCrl { tbs, algid }
@@ -274,13 +298,24 @@ fn encode_revoked(entry: &RevokedCertificate) -> Vec<u8> {
     encode_sequence(&body)
 }
 
+/// Encodes the non-critical `cRLNumber` top-level extension carrying the
+/// unsigned big-endian `number` as a DER INTEGER.
+fn crl_number_extension(number: &[u8]) -> Vec<u8> {
+    let mut ext = oid_tlv(OID_CRL_NUMBER);
+    // `critical` defaults to FALSE and is omitted under DER.
+    ext.extend_from_slice(&encode_octet_string(&encode_integer(number)));
+    encode_sequence(&ext)
+}
+
 /// Encodes a `TBSCertList`, with the inner `signature` algid set to `algid`
-/// (DER bytes — the outer `signatureAlgorithm` must equal this).
+/// (DER bytes — the outer `signatureAlgorithm` must equal this) and, when
+/// `crl_number` is given, a `crlExtensions` block holding the `cRLNumber`.
 fn encode_tbs_cert_list(
     issuer_der: &[u8],
     this_update: &Time,
     next_update: Option<&Time>,
     entries: &[RevokedCertificate],
+    crl_number: Option<&[u8]>,
     algid: &[u8],
 ) -> Vec<u8> {
     let mut body = Vec::new();
@@ -299,7 +334,11 @@ fn encode_tbs_cert_list(
         }
         body.extend_from_slice(&encode_sequence(&list));
     }
-    // `crlExtensions [0] EXPLICIT Extensions OPTIONAL` — none emitted here.
+    // `crlExtensions [0] EXPLICIT Extensions OPTIONAL`.
+    if let Some(number) = crl_number {
+        let exts = encode_sequence(&crl_number_extension(number));
+        body.extend_from_slice(&encode_context(0, &exts));
+    }
     encode_sequence(&body)
 }
 
@@ -590,6 +629,39 @@ impl CertificateRevocationList {
             // Unrecognized non-critical extensions are ignored.
         }
         Ok(())
+    }
+
+    /// The `cRLNumber` extension value (RFC 5280 §5.2.3) as an unsigned
+    /// big-endian magnitude (no sign pad; up to 20 octets per the RFC), or
+    /// `None` when the CRL carries no such extension. The value is the one
+    /// [`CrlBuilder::crl_number`] set.
+    pub fn crl_number(&self) -> Result<Option<Vec<u8>>, Error> {
+        let mut seq = self.tbs_at_crl_extensions()?;
+        if seq.peek_tag() != Some(tag::context(0)) {
+            return Ok(None);
+        }
+        let wrapper = seq.read_tlv(tag::context(0))?;
+        let mut outer = Reader::new(wrapper);
+        let mut exts = outer.read_sequence()?;
+        outer.finish()?;
+        // Structure and criticality were vetted by `validate_extensions` at
+        // construction; only locate the value here.
+        while !exts.is_empty() {
+            let mut ext = exts.read_sequence()?;
+            let id = parse_oid(ext.read_oid()?)?;
+            if ext.peek_tag() == Some(tag::BOOLEAN) {
+                ext.read_boolean()?;
+            }
+            let value = ext.read_octet_string()?;
+            ext.finish()?;
+            if id == OID_CRL_NUMBER {
+                let mut r = Reader::new(value);
+                let n = r.read_unsigned_integer_bytes()?;
+                r.finish()?;
+                return Ok(Some(strip_leading_sign_zero(n).to_vec()));
+            }
+        }
+        Ok(None)
     }
 
     /// Iterates the `revokedCertificates` entries. Returns an empty list if
@@ -895,6 +967,7 @@ mod tests {
             &Time::utc(2026, 1, 1, 0, 0, 0),
             None,
             &[],
+            None,
             &inner_algid,
         );
         let sig = signer.sign(&tbs).unwrap();
@@ -1125,6 +1198,55 @@ mod tests {
         let crl = CertificateRevocationList::from_der(der).expect("known exts accepted");
         // And the parsed CRL still behaves normally.
         assert!(crl.entries().unwrap().is_empty());
+        assert_eq!(crl.crl_number().unwrap(), Some(alloc::vec![0x2a]));
+    }
+
+    /// `CrlBuilder::crl_number` emits a non-critical `cRLNumber`
+    /// (RFC 5280 §5.2.3) that survives sign → parse → verify, alongside the
+    /// revoked entries; a CRL built without it reports `None`.
+    #[test]
+    fn builder_emits_crl_number() {
+        let key = rsa_a();
+        let signer = CertSigner::Rsa(&key);
+        let dn = issuer_dn();
+        for (number, magnitude) in [
+            (0u64, alloc::vec![0x00u8]),
+            (0x2a, alloc::vec![0x2a]),
+            (0x80, alloc::vec![0x80]),
+            (0x1_0000, alloc::vec![0x01, 0x00, 0x00]),
+            (u64::MAX, alloc::vec![0xff; 8]),
+        ] {
+            let mut b = CrlBuilder::new(
+                &dn,
+                Time::utc(2026, 1, 1, 0, 0, 0),
+                Some(Time::utc(2026, 12, 31, 0, 0, 0)),
+            );
+            b.crl_number(number);
+            b.revoke(&[0x07], Time::utc(2026, 2, 1, 0, 0, 0), None);
+            let crl = b.sign(&signer).unwrap();
+            // Re-parse from DER (runs `validate_extensions`) and verify.
+            let parsed = CertificateRevocationList::from_der(crl.to_der().to_vec()).unwrap();
+            parsed.verify_signature_with(&signer.public_key()).unwrap();
+            assert_eq!(parsed.crl_number().unwrap(), Some(magnitude));
+            assert!(parsed.is_revoked(&[0x07]).unwrap());
+            assert_eq!(parsed.entries().unwrap().len(), 1);
+        }
+
+        // The two-phase path carries it too, and a later call replaces the
+        // earlier value.
+        let mut b = CrlBuilder::new(&dn, Time::utc(2026, 1, 1, 0, 0, 0), None);
+        b.crl_number(1).crl_number(5);
+        let prepared = b.prepare(SignatureAlgId::RsaPkcs1Sha256);
+        let sig = signer.sign(prepared.tbs()).unwrap();
+        let crl = prepared.finish(&sig);
+        let parsed = CertificateRevocationList::from_der(crl.to_der().to_vec()).unwrap();
+        assert_eq!(parsed.crl_number().unwrap(), Some(alloc::vec![0x05]));
+
+        // No number set → none reported.
+        let crl = CrlBuilder::new(&dn, Time::utc(2026, 1, 1, 0, 0, 0), None)
+            .sign(&signer)
+            .unwrap();
+        assert_eq!(crl.crl_number().unwrap(), None);
     }
 
     #[test]
