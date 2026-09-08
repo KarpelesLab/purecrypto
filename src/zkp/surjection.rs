@@ -629,6 +629,9 @@ impl SurjectionProof {
 
         // s_pos = nonce − e_pos·secret, written without revealing `pos`.
         let signer = nonce.sub(&Scalar::from_bytes_be_reduce(&e_signer).mul(&secret));
+        // The signer's challenge identifies `pos`.
+        e_signer = [0u8; 32];
+        let _ = core::hint::black_box(&e_signer);
         let mut signer_bytes = signer.to_bytes_be();
         let mut out = Vec::with_capacity(ring);
         for (j, sj) in s.iter().enumerate() {

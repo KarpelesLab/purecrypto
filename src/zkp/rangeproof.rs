@@ -109,7 +109,9 @@
 //! the sequence of curve operations, hashes and memory writes in [`sign`] is
 //! the same for every value. The DRBG state, the per-ring secrets, the derived
 //! nonces and the scratch buffers are wiped with a [`core::hint::black_box`]
-//! barrier. [`rewind`] is likewise branch-free in the recovered digits.
+//! barrier. [`rewind`] is likewise branch-free in the recovered digits, and
+//! wipes its scratch on success; its early error returns (a proof that does
+//! not verify, a wrong nonce) drop the DRBG output without an explicit wipe.
 //!
 //! [`verify`] and [`info`] see only public data and are deliberately
 //! variable-time. They never panic: every byte string either parses or returns
@@ -860,8 +862,11 @@ pub fn sign(
 
     let commit_enc = point_enc(&commit.serialize());
     let generator_enc = point_enc(&generator.serialize());
-    let (seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, &proof);
+    let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, &proof);
     let mut rng = Drbg::new(&seed[..seed_len]);
+    // The seed's first 32 bytes are the nonce.
+    seed.fill(0);
+    let _ = core::hint::black_box(&seed);
 
     // --- the prover's randomness -------------------------------------
     //
@@ -909,18 +914,26 @@ pub fn sign(
         for chunk in 1..4 {
             marker[8 * chunk..8 * (chunk + 1)].copy_from_slice(&mantissa_value.to_be_bytes());
         }
-        let known = (layout.starts[last_ring] as u64) + digits[last_ring];
+        let mut known = (layout.starts[last_ring] as u64) + digits[last_ring];
         let at_end = known.ct_eq(&((layout.npub - 1) as u64));
-        let tail: [u8; 32] = prep[32 * (layout.npub - 1)..].try_into().unwrap();
-        let prev: [u8; 32] = prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)]
+        let mut tail: [u8; 32] = prep[32 * (layout.npub - 1)..].try_into().unwrap();
+        let mut prev: [u8; 32] = prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)]
             .try_into()
             .unwrap();
         // When the final ring's known member is the very last slot, the marker
         // moves one slot earlier; both writes always happen.
-        let new_tail = <[u8; 32]>::conditional_select(&tail, &marker, at_end);
-        let new_prev = <[u8; 32]>::conditional_select(&marker, &prev, at_end);
+        let mut new_tail = <[u8; 32]>::conditional_select(&tail, &marker, at_end);
+        let mut new_prev = <[u8; 32]>::conditional_select(&marker, &prev, at_end);
         prep[32 * (layout.npub - 1)..].copy_from_slice(&new_tail);
         prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)].copy_from_slice(&new_prev);
+        // All of these carry the mantissa value or the known-member position.
+        marker = [0u8; 32];
+        tail = [0u8; 32];
+        prev = [0u8; 32];
+        new_tail = [0u8; 32];
+        new_prev = [0u8; 32];
+        known = 0;
+        let _ = core::hint::black_box((&marker, &tail, &prev, &new_tail, &new_prev, &known));
     }
 
     let mut s = vec![[0u8; 32]; layout.npub];
@@ -1030,6 +1043,9 @@ pub fn sign(
             let is_known = (j as u64).ct_eq(&digits[i]);
             s[start + j] = <[u8; 32]>::conditional_select(&closing, &s[start + j], is_known);
         }
+        // The challenge at the known member identifies the digit.
+        e_known = [0u8; 32];
+        let _ = core::hint::black_box(&e_known);
     }
 
     proof.extend_from_slice(&body);
@@ -1119,13 +1135,16 @@ pub fn rewind(
 
     let commit_enc = point_enc(&commit.serialize());
     let generator_enc = point_enc(&generator.serialize());
-    let (seed, seed_len) = drbg_seed(
+    let (mut seed, seed_len) = drbg_seed(
         nonce,
         &commit_enc,
         &generator_enc,
         &proof[..parsed.header_len],
     );
     let mut rng = Drbg::new(&seed[..seed_len]);
+    // The seed's first 32 bytes are the nonce.
+    seed.fill(0);
+    let _ = core::hint::black_box(&seed);
 
     let mut sec = vec![[0u8; 32]; layout.rings];
     let mut raw = vec![[0u8; 32]; layout.npub];
@@ -1185,9 +1204,9 @@ pub fn rewind(
             for b in 0..32 {
                 folded[b] = parsed.s[slot][b] ^ raw[slot][b];
             }
-            let first = u64::from_be_bytes(folded[8..16].try_into().unwrap());
-            let second = u64::from_be_bytes(folded[16..24].try_into().unwrap());
-            let third = u64::from_be_bytes(folded[24..32].try_into().unwrap());
+            let mut first = u64::from_be_bytes(folded[8..16].try_into().unwrap());
+            let mut second = u64::from_be_bytes(folded[16..24].try_into().unwrap());
+            let mut third = u64::from_be_bytes(folded[24..32].try_into().unwrap());
             let shaped = folded[0].ct_eq(&0x80)
                 & folded[1..8].ct_eq(&[0u8; 7][..])
                 & first.ct_eq(&second)
@@ -1195,6 +1214,11 @@ pub fn rewind(
             let take = shaped & !have_marker;
             mantissa_value = u64::conditional_select(&first, &mantissa_value, take);
             have_marker |= shaped;
+            folded = [0u8; 32];
+            first = 0;
+            second = 0;
+            third = 0;
+            let _ = core::hint::black_box((&folded, &first, &second, &third));
         }
     }
     if params.mantissa != 0 && !bool::from(have_marker) {
@@ -1215,7 +1239,7 @@ pub fn rewind(
     // read by scanning the ring rather than indexing it.
     let last_start = layout.starts[last_ring];
     let last_size = layout.rsizes[last_ring];
-    let known = (last_start as u64) + digits[last_ring];
+    let mut known = (last_start as u64) + digits[last_ring];
     let mut k_bytes = [0u8; 32];
     let mut s_bytes = [0u8; 32];
     let mut e_bytes = [0u8; 32];
@@ -1262,7 +1286,7 @@ pub fn rewind(
     // Every slot but the last ring's known member and the marker is
     // recoverable. Which two those are is secret, so the last ring's chunks
     // are emitted by a constant-time scan rather than an indexed skip.
-    let marker_slot = u64::conditional_select(
+    let mut marker_slot = u64::conditional_select(
         &(layout.npub.saturating_sub(2) as u64),
         &(layout.npub.saturating_sub(1) as u64),
         known.ct_eq(&(layout.npub.saturating_sub(1) as u64)),
@@ -1290,11 +1314,32 @@ pub fn rewind(
         return Err(Error::Verification);
     }
 
-    for buf in sec.iter_mut().chain(raw.iter_mut()) {
+    for buf in sec
+        .iter_mut()
+        .chain(raw.iter_mut())
+        .chain(folded.iter_mut())
+    {
         *buf = [0u8; 32];
     }
     digits = [0u64; MAX_RINGS];
-    let _ = core::hint::black_box((&sec, &raw, &digits));
+    k_bytes = [0u8; 32];
+    s_bytes = [0u8; 32];
+    e_bytes = [0u8; 32];
+    mantissa_value = 0;
+    known = 0;
+    marker_slot = 0;
+    let _ = core::hint::black_box((
+        &sec,
+        &raw,
+        &folded,
+        &digits,
+        &k_bytes,
+        &s_bytes,
+        &e_bytes,
+        &mantissa_value,
+        &known,
+        &marker_slot,
+    ));
 
     Ok(Rewound {
         value,

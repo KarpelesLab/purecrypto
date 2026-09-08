@@ -386,6 +386,9 @@ pub fn sign<R: RngCore + CryptoRng>(
 
     // s_index = nonce - e_index * secret.
     let signer_s = nonce.sub(&Scalar::from_bytes_be_reduce(&e_signer).mul(&secret));
+    // The signer's challenge identifies `index`.
+    e_signer = [0u8; 32];
+    let _ = core::hint::black_box(&e_signer);
     let mut signer_bytes = signer_s.to_bytes_be();
     let mut out = Vec::with_capacity(n);
     for (i, si) in s.iter().enumerate() {
