@@ -7,7 +7,8 @@
 //!  - `WantRead`  — engine needs more wire bytes before it can make progress
 //!  - `WantWrite` — engine has wire bytes to be sent before progress
 //!  - `WantHandshake` — application I/O attempted pre-handshake
-//!  - `Closed`     — peer (or local) sent close_notify
+//!  - `Closed`     — peer's close_notify has been processed and no plaintext
+//!    is pending (`pc_tls_recv`), or a feed/handshake hit the closed state
 //!  - `TlsAlert`   — a fatal TLS alert was received
 //!  - `BadConfig`  — `pc_tls_cfg_validate` found the configuration
 //!    incomplete (today: cookie-requiring DTLS server with no peer address)
@@ -20,8 +21,8 @@ use super::common::{PcStatus, guard, out_write, slice, wipe_array, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
-    ClientAuth, Config, ConfigBuilder, Connection, CrlStore, HandshakeStatus, ProtocolVersion,
-    RootCertStore, SigningKey,
+    AlertDescription, ClientAuth, Config, ConfigBuilder, Connection, CrlStore, Error,
+    HandshakeStatus, ProtocolVersion, RootCertStore, SigningKey,
 };
 
 /// TLS / DTLS role.
@@ -710,6 +711,17 @@ pub unsafe extern "C" fn pc_tls_free(tls: *mut PcTls) {
 
 // ---- Wire / app I/O -------------------------------------------------------
 
+/// Maps an engine error to the status the header documents: a received
+/// close_notify is `Closed`, any other received alert is `TlsAlert`, and
+/// everything else stays `Internal`.
+fn status_for_error(e: &Error) -> PcStatus {
+    match e {
+        Error::AlertReceived(AlertDescription::CloseNotify) => PcStatus::Closed,
+        Error::AlertReceived(_) => PcStatus::TlsAlert,
+        _ => PcStatus::Internal,
+    }
+}
+
 /// Push `len` wire bytes received from the peer into the engine. For DTLS
 /// the input is one datagram; for TLS it is any contiguous stream slice.
 ///
@@ -722,10 +734,15 @@ pub unsafe extern "C" fn pc_tls_free(tls: *mut PcTls) {
 /// Returns:
 ///   * `Ok` — bytes accepted; the engine may need more (call `feed` again)
 ///     or be ready to make progress (call `handshake` / `pop` / `recv`).
-///   * `Internal` — the engine produced a fatal error while processing the
-///     bytes that were already buffered. `*consumed` reflects what was
-///     accepted before the failure (today: the whole slice — `read_tls`
-///     buffers eagerly, the diagnostic is raised by post-buffer processing).
+///   * `TlsAlert` — the buffered bytes carried a fatal alert from the peer;
+///     the connection is dead. `Closed` — likewise for a close_notify
+///     surfaced as an error (a close_notify processed normally returns `Ok`
+///     and is observable via [`pc_tls_received_close_notify`]).
+///   * `Internal` — the engine produced any other fatal error while
+///     processing the bytes that were already buffered. For every error
+///     status `*consumed` reflects what was accepted before the failure
+///     (today: the whole slice — `read_tls` buffers eagerly, the diagnostic
+///     is raised by post-buffer processing).
 ///   * `NullPointer` — `tls` is NULL, or `wire_in` is NULL with non-zero
 ///     `in_len`.
 ///
@@ -766,14 +783,14 @@ pub unsafe extern "C" fn pc_tls_feed(
                 write_consumed(n);
                 PcStatus::Ok
             }
-            Err(_) => {
+            Err(e) => {
                 // The TLS engines `read_tls(wire_in)` before
                 // `process_new_packets()` errors, so every byte the caller
                 // handed in is already inside the engine's input buffer.
                 // Reporting that lets the caller advance its read cursor
                 // and avoid double-feeding the tail.
                 write_consumed(in_len);
-                PcStatus::Internal
+                status_for_error(&e)
             }
         }
     })
@@ -817,7 +834,8 @@ pub unsafe extern "C" fn pc_tls_pop(
 }
 
 /// Encrypts `len` application bytes for transmission. Returns
-/// [`PcStatus::WantHandshake`] when called before the handshake completes.
+/// [`PcStatus::WantHandshake`] when called before the handshake completes
+/// and [`PcStatus::Closed`] once the peer's close_notify has been received.
 ///
 /// # Safety
 /// All pointers valid for their declared lengths.
@@ -838,15 +856,25 @@ pub unsafe extern "C" fn pc_tls_send(
         if !conn.is_handshake_complete() {
             return PcStatus::WantHandshake;
         }
+        if conn.received_close_notify() {
+            return PcStatus::Closed;
+        }
         match conn.send(b) {
             Ok(()) => PcStatus::Ok,
-            Err(_) => PcStatus::Internal,
+            Err(e) => status_for_error(&e),
         }
     })
 }
 
 /// Drains decrypted application bytes. Writes `*out_len = 0` when nothing is
 /// pending.
+///
+/// Returns [`PcStatus::Closed`] (with `*out_len = 0`) once no plaintext is
+/// pending AND the peer's close_notify has been processed — the TLS-level
+/// EOF. Plaintext received before the close_notify is always delivered
+/// first. A transport EOF observed *without* this status means the stream
+/// was truncated (RFC 8446 §6.1); see [`pc_tls_received_close_notify`].
+/// DTLS engines never report `Closed` (no close_notify exchange).
 ///
 /// A [`PcStatus::BufferTooSmall`] return (including the size-query call with
 /// zero capacity) is non-destructive: the plaintext is retained and re-served
@@ -875,10 +903,34 @@ pub unsafe extern "C" fn pc_tls_recv(
         if st == PcStatus::Ok {
             // Delivered: scrub our copy of the plaintext before dropping it.
             wipe_vec(&mut bytes);
+            // Nothing pending and the peer has said goodbye: report the
+            // TLS-level EOF so the caller can tell it apart from a bare
+            // transport close (truncation).
+            if bytes.is_empty() && handle.inner.received_close_notify() {
+                return PcStatus::Closed;
+            }
         } else {
             handle.pending_recv = Some(bytes);
         }
         st
+    })
+}
+
+/// Returns 1 once the peer's close_notify alert has been processed, 0
+/// otherwise, and -1 when `tls` is NULL. After a transport EOF, 0 means the
+/// peer (or an on-path attacker injecting a FIN/RST) cut the stream without
+/// the closure alert — a truncation attack for EOF-delimited application
+/// framing. Always 0 for DTLS engines.
+///
+/// # Safety
+/// `tls` valid.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn pc_tls_received_close_notify(tls: *const PcTls) -> i32 {
+    crate::ffi::common::guard_i32(-1, || {
+        if tls.is_null() {
+            return -1;
+        }
+        i32::from(unsafe { &*tls }.inner.received_close_notify())
     })
 }
 
@@ -888,6 +940,8 @@ pub unsafe extern "C" fn pc_tls_recv(
 ///    call `pc_tls_pop` and send them to the peer)
 ///  - `WantRead`  when the engine needs more wire bytes (caller should
 ///    receive from the peer and call `pc_tls_feed`)
+///  - `TlsAlert` / `Closed` when the engine failed on a received fatal alert
+///    / close_notify; `Internal` on any other engine error
 ///
 /// # Safety
 /// `tls` valid.
@@ -902,7 +956,7 @@ pub unsafe extern "C" fn pc_tls_handshake(tls: *mut PcTls) -> PcStatus {
             Ok(HandshakeStatus::Complete) => PcStatus::Ok,
             Ok(HandshakeStatus::WantWrite) => PcStatus::WantWrite,
             Ok(HandshakeStatus::WantRead) => PcStatus::WantRead,
-            Err(_) => PcStatus::Internal,
+            Err(e) => status_for_error(&e),
         }
     })
 }

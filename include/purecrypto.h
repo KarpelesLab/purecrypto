@@ -77,7 +77,7 @@ typedef enum {
   PC_WANT_READ = -7,       /* engine has nothing to emit; feed more bytes */
   PC_WANT_WRITE = -8,      /* engine has bytes to send; drain via pc_tls_pop */
   PC_WANT_HANDSHAKE = -9,  /* application I/O attempted before handshake done */
-  PC_CLOSED = -10,         /* peer or local sent close_notify */
+  PC_CLOSED = -10,         /* peer's close_notify processed: TLS-level EOF */
   PC_TLS_ALERT = -11,      /* a fatal TLS alert was received */
   PC_BAD_CONFIG = -12      /* cfg incomplete for its role (pc_tls_cfg_validate) */
 } pc_status;
@@ -681,10 +681,17 @@ void pc_crl_free(PcCrl *crl);
  *   4. pc_tls_send(ssl, app_in, n);             // post-handshake
  *      pc_tls_pop(ssl, wire_out, &m);           // drain & transmit
  *      pc_tls_feed(ssl, wire_in, k, NULL);      // peer's reply
- *      pc_tls_recv(ssl, app_out, &j);           // decrypted bytes
+ *      pc_tls_recv(ssl, app_out, &j);           // decrypted bytes;
+ *                                               // PC_CLOSED = TLS-level EOF
  *   5. pc_tls_close(ssl);
  *      pc_tls_free(ssl);
  *      pc_tls_cfg_free(cfg);
+ *
+ * Truncation: a TCP EOF is only a clean end of stream if the peer's
+ * close_notify was seen first — pc_tls_recv returned PC_CLOSED, or
+ * pc_tls_received_close_notify(ssl) == 1. EOF without it means the stream
+ * was cut (RFC 8446 §6.1) and EOF-delimited application data must not be
+ * trusted.
  *
  * DTLS servers additionally need, before pc_tls_new:
  *      pc_dtls_cfg_set_cookie_secret(cfg, secret, 32);
@@ -740,17 +747,33 @@ void pc_tls_free(PcTls *tls);
  * before this call returns — including on the error path (today the engines
  * buffer eagerly, so on error `*consumed == in_len`). Callers MUST consult
  * `*consumed` after a non-`Ok` return so they neither re-feed already-
- * buffered bytes nor lose the still-unbuffered tail. */
+ * buffered bytes nor lose the still-unbuffered tail.
+ * A fatal alert from the peer returns PC_TLS_ALERT (PC_CLOSED for a
+ * close_notify the engine surfaces as an error); other engine failures are
+ * PC_INTERNAL. A close_notify processed normally returns PC_OK and is then
+ * visible through pc_tls_recv / pc_tls_received_close_notify. */
 pc_status pc_tls_feed(PcTls *tls, const uint8_t *wire_in, size_t in_len, size_t *consumed);
 /* pc_tls_pop / pc_tls_recv: a PC_BUFFER_TOO_SMALL return (including the
  * size-query call with *out_len == 0) is non-destructive — the pending
  * chunk is retained and re-served by the next call, with *out_len set to
  * the required length. */
 pc_status pc_tls_pop(PcTls *tls, uint8_t *wire_out, size_t *out_len);
+/* PC_WANT_HANDSHAKE before the handshake completes; PC_CLOSED once the
+ * peer's close_notify has been received. */
 pc_status pc_tls_send(PcTls *tls, const uint8_t *app_in, size_t in_len);
+/* PC_CLOSED (with *out_len == 0) once no plaintext is pending AND the
+ * peer's close_notify has been processed — the TLS-level EOF. Plaintext
+ * received before the close_notify is always delivered first. Never
+ * PC_CLOSED for DTLS (no close_notify exchange). */
 pc_status pc_tls_recv(PcTls *tls, uint8_t *app_out, size_t *out_len);
+/* PC_OK complete, PC_WANT_WRITE / PC_WANT_READ to keep pumping, PC_TLS_ALERT
+ * / PC_CLOSED / PC_INTERNAL on engine failure (see pc_tls_feed). */
 pc_status pc_tls_handshake(PcTls *tls);
 pc_status pc_tls_close(PcTls *tls);
+/* 1 once the peer's close_notify has been processed, 0 otherwise, -1 on a
+ * NULL handle. A transport EOF with 0 here is a truncated stream. Always 0
+ * for DTLS. */
+int pc_tls_received_close_notify(const PcTls *tls);
 
 int pc_tls_is_handshake_complete(const PcTls *tls);
 pc_status pc_tls_negotiated_version(const PcTls *tls, uint16_t *out);

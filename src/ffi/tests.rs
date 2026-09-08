@@ -1394,3 +1394,155 @@ fn dtls13_cookie_loopback_completes_with_peer_addr() {
     dtls_cookie_loopback(0xFEFC_u32 as i32, &v6);
 }
 
+/// Builds a handshaken TLS 1.3 loopback pair `(client, server)`; the client
+/// skips certificate verification. Caller frees both.
+fn tls13_loopback_pair() -> (*mut tls::PcTls, *mut tls::PcTls) {
+    let (chain_pem, key_pem) = loopback_identity();
+    let scfg = tls::pc_tls_cfg_new(1, 0x0304);
+    assert!(!scfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_certificate(
+                scfg,
+                chain_pem.as_ptr(),
+                chain_pem.len(),
+                key_pem.as_ptr(),
+                key_pem.len()
+            ),
+            PcStatus::Ok
+        );
+    }
+    let server = unsafe { tls::pc_tls_new(scfg) };
+    unsafe { tls::pc_tls_cfg_free(scfg) };
+    assert!(!server.is_null());
+
+    let ccfg = tls::pc_tls_cfg_new(0, 0x0304);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+
+    for _ in 0..20 {
+        unsafe {
+            let _ = tls::pc_tls_handshake(client);
+            pump_wire(client, server);
+            let _ = tls::pc_tls_handshake(server);
+            pump_wire(server, client);
+        }
+        if unsafe { tls::pc_tls_is_handshake_complete(client) } == 1
+            && unsafe { tls::pc_tls_is_handshake_complete(server) } == 1
+        {
+            break;
+        }
+    }
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(client) }, 1);
+    assert_eq!(unsafe { tls::pc_tls_is_handshake_complete(server) }, 1);
+    (client, server)
+}
+
+/// FC-2: the peer's close_notify is observable — `pc_tls_recv` returns
+/// `Closed` once the plaintext that preceded it has been drained, and
+/// `pc_tls_received_close_notify` flips to 1. Before the alert both report
+/// "still open", so a C caller can now tell a clean TLS EOF from a
+/// truncated stream.
+#[test]
+fn tls_recv_reports_closed_after_peer_close_notify() {
+    let (client, server) = tls13_loopback_pair();
+
+    // Open connection: nothing pending is a plain Ok / 0, not Closed.
+    assert_eq!(unsafe { tls::pc_tls_received_close_notify(client) }, 0);
+    let mut len = 0usize;
+    assert_eq!(
+        unsafe { tls::pc_tls_recv(client, core::ptr::null_mut(), &mut len) },
+        PcStatus::Ok
+    );
+    assert_eq!(len, 0);
+
+    // Server: last words, then close_notify, in one wire flight.
+    let bye = b"goodbye";
+    assert_eq!(
+        unsafe { tls::pc_tls_send(server, bye.as_ptr(), bye.len()) },
+        PcStatus::Ok
+    );
+    assert_eq!(unsafe { tls::pc_tls_close(server) }, PcStatus::Ok);
+    unsafe { pump_wire(server, client) };
+
+    // Plaintext queued before the alert is delivered first...
+    assert_eq!(unsafe { tls::pc_tls_received_close_notify(client) }, 1);
+    let got = read_out(|p, l| unsafe { tls::pc_tls_recv(client, p, l) });
+    assert_eq!(got, bye);
+    // ...then the TLS-level EOF, repeatably.
+    for _ in 0..2 {
+        let mut len = 7usize;
+        let mut buf = [0u8; 7];
+        assert_eq!(
+            unsafe { tls::pc_tls_recv(client, buf.as_mut_ptr(), &mut len) },
+            PcStatus::Closed
+        );
+        assert_eq!(len, 0);
+    }
+    // Writing into a half-closed connection is refused by name.
+    assert_eq!(
+        unsafe { tls::pc_tls_send(client, bye.as_ptr(), bye.len()) },
+        PcStatus::Closed
+    );
+    // The closing side has not received anything: still 0.
+    assert_eq!(unsafe { tls::pc_tls_received_close_notify(server) }, 0);
+    assert_eq!(
+        unsafe { tls::pc_tls_received_close_notify(core::ptr::null()) },
+        -1
+    );
+    unsafe {
+        tls::pc_tls_free(client);
+        tls::pc_tls_free(server);
+    }
+}
+
+/// FC-2: a fatal alert from the peer surfaces as `TlsAlert`, not a generic
+/// `Internal`. A plaintext `handshake_failure` in reply to the ClientHello
+/// is the simplest such record.
+#[test]
+fn tls_feed_reports_fatal_alert_by_name() {
+    let ccfg = tls::pc_tls_cfg_new(0, 0x0304);
+    assert!(!ccfg.is_null());
+    unsafe {
+        assert_eq!(
+            tls::pc_tls_cfg_set_verify_certificates(ccfg, 0),
+            PcStatus::Ok
+        );
+        let sni = b"loopback.example\0";
+        assert_eq!(
+            tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char),
+            PcStatus::Ok
+        );
+    }
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+    assert_eq!(
+        unsafe { tls::pc_tls_handshake(client) },
+        PcStatus::WantWrite
+    );
+    let ch = read_out(|p, l| unsafe { tls::pc_tls_pop(client, p, l) });
+    assert!(!ch.is_empty());
+
+    // Alert record: level fatal (2), description handshake_failure (40).
+    let alert = [0x15u8, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+    let mut consumed = 0usize;
+    let st = unsafe { tls::pc_tls_feed(client, alert.as_ptr(), alert.len(), &mut consumed) };
+    assert_eq!(st, PcStatus::TlsAlert);
+    assert_eq!(consumed, alert.len());
+    unsafe { tls::pc_tls_free(client) };
+}
+

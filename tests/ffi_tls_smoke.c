@@ -179,9 +179,30 @@ int main(void) {
     return fail("pc_tls_peer_certificate");
   if (peer_der_len == 0) return fail("peer cert empty");
 
-  /* 12. Clean shutdown. */
+  /* 12. close_notify visibility: before the server closes, the client
+   * reports an open connection; once the server's close_notify is fed,
+   * pc_tls_recv reports the TLS-level EOF (PC_CLOSED), the query flips to
+   * 1, and writes are refused by name. A caller that sees TCP EOF without
+   * this is looking at a truncated stream. */
+  if (pc_tls_received_close_notify(client) != 0)
+    return fail("close_notify reported before any close");
+  if (pc_tls_close(server) != PC_OK) return fail("pc_tls_close server");
+  n = sizeof(buf);
+  if (pc_tls_pop(server, buf, &n) != PC_OK) return fail("pop close_notify");
+  if (n == 0) return fail("server emitted no close_notify");
+  if (pc_tls_feed(client, buf, n, NULL) != PC_OK) return fail("feed close_notify");
+  if (pc_tls_received_close_notify(client) != 1)
+    return fail("client did not see close_notify");
+  app_len = sizeof(app);
+  if (pc_tls_recv(client, app, &app_len) != PC_CLOSED || app_len != 0)
+    return fail("pc_tls_recv should report PC_CLOSED");
+  if (pc_tls_send(client, hi, sizeof(hi) - 1) != PC_CLOSED)
+    return fail("pc_tls_send should report PC_CLOSED");
+  if (pc_tls_received_close_notify(server) != 0)
+    return fail("server should not report a received close_notify");
+
+  /* 13. Clean shutdown. */
   pc_tls_close(client);
-  pc_tls_close(server);
 
   pc_tls_free(client);
   pc_tls_free(server);
