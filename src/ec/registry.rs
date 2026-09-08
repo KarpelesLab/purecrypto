@@ -61,7 +61,12 @@ fn parse_ecdsa_spki(spki: &[u8]) -> Result<(CurveId, BoxedEcdsaPublicKey), Error
     } else {
         return Err(Error::UnsupportedAlgorithm);
     };
+    // RFC 5480 §2.1.1: nothing may follow the namedCurve OID; and nothing
+    // may follow the subjectPublicKey BIT STRING (mirrors
+    // `x509::pubkey::from_spki_der`).
+    algid.finish()?;
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     let key = BoxedEcdsaPublicKey::from_sec1(curve, key_bits).map_err(|_| Error::Malformed)?;
     Ok((curve, key))
 }
@@ -75,7 +80,10 @@ fn parse_ed25519_spki(spki: &[u8]) -> Result<Ed25519PublicKey, Error> {
     if alg.as_slice() != oid::ID_ED25519 {
         return Err(Error::UnsupportedAlgorithm);
     }
+    // RFC 8410 §3: the AlgorithmIdentifier is the bare OID, no parameters.
+    algid.finish()?;
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     let bytes: [u8; 32] = key_bits.try_into().map_err(|_| Error::Malformed)?;
     Ok(Ed25519PublicKey::from_bytes(bytes))
 }
@@ -89,7 +97,10 @@ fn parse_ed448_spki(spki: &[u8]) -> Result<Ed448PublicKey, Error> {
     if alg.as_slice() != oid::ID_ED448 {
         return Err(Error::UnsupportedAlgorithm);
     }
+    // RFC 8410 §3: the AlgorithmIdentifier is the bare OID, no parameters.
+    algid.finish()?;
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     let bytes: [u8; 57] = key_bits.try_into().map_err(|_| Error::Malformed)?;
     Ok(Ed448PublicKey::from_bytes(bytes))
 }
@@ -305,7 +316,9 @@ fn parse_sm2_spki(spki: &[u8]) -> Result<Sm2PublicKey, Error> {
     if curve_arcs.as_slice() != oid::SM2_P256V1 {
         return Err(Error::UnsupportedAlgorithm);
     }
+    algid.finish()?;
     let key_bits = outer.read_bit_string()?;
+    outer.finish()?;
     Sm2PublicKey::from_sec1(key_bits).map_err(|_| Error::Malformed)
 }
 
@@ -421,6 +434,105 @@ mod tests {
         // The strict-pair P-384 entry must reject a P-256 SPKI.
         let algo = find_by_id("ecdsa-secp384r1-sha384").unwrap();
         assert!(algo.verify(&spki, b"hi", &sig).is_err());
+    }
+
+    /// Re-encodes `spki` with `extra` appended inside the AlgorithmIdentifier
+    /// SEQUENCE (`inner`) or after the subjectPublicKey BIT STRING (`!inner`).
+    fn spki_with_junk(spki: &[u8], extra: &[u8], inner: bool) -> alloc::vec::Vec<u8> {
+        use crate::der::encode_sequence;
+        let mut outer = Reader::new(spki).read_sequence().unwrap();
+        let (_, algid_body) = outer.read_any().unwrap();
+        let (_, key_bits) = outer.read_any().unwrap();
+        // `read_any` returns the body; rebuild each TLV.
+        let mut algid_body = Reader::new(algid_body);
+        let mut algid_items = alloc::vec::Vec::new();
+        while !algid_body.is_empty() {
+            let (tag, body) = algid_body.read_any().unwrap();
+            algid_items.push(tag);
+            algid_items.push(body.len() as u8);
+            algid_items.extend_from_slice(body);
+        }
+        if inner {
+            algid_items.extend_from_slice(extra);
+        }
+        let mut body = encode_sequence(&algid_items);
+        body.push(0x03);
+        body.push(key_bits.len() as u8);
+        body.extend_from_slice(key_bits);
+        if !inner {
+            body.extend_from_slice(extra);
+        }
+        encode_sequence(&body)
+    }
+
+    /// The registry SPKI parsers must be as strict as `x509::pubkey`: a
+    /// trailing NULL inside the AlgorithmIdentifier, or junk after the key
+    /// BIT STRING, is rejected for ECDSA, SM2, Ed25519 and Ed448 alike.
+    #[test]
+    fn spki_trailing_junk_rejected() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"reg-spki-junk", b"n", &[]);
+        let null = [0x05u8, 0x00];
+
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let spki = AnyPublicKey::Ecdsa(sk.public_key()).to_spki_der();
+        let sig = sk.sign::<Sha256>(b"hi").unwrap().to_der(CurveId::P256);
+        for id in ["ecdsa-secp256r1-sha256", "ecdsa-with-sha256"] {
+            let algo = find_by_id(id).unwrap();
+            algo.verify(&spki, b"hi", &sig).unwrap();
+            assert!(
+                algo.verify(&spki_with_junk(&spki, &null, true), b"hi", &sig)
+                    .is_err()
+            );
+            assert!(
+                algo.verify(&spki_with_junk(&spki, &null, false), b"hi", &sig)
+                    .is_err()
+            );
+        }
+
+        let sk = crate::ec::Sm2PrivateKey::generate(&mut rng);
+        let spki = sk.public_key().to_spki_der();
+        let sig = sk
+            .sign(b"hi", crate::ec::sm2::DEFAULT_ID, &mut rng)
+            .unwrap()
+            .to_der();
+        let algo = find_by_id("sm2-with-sm3").unwrap();
+        algo.verify(&spki, b"hi", &sig).unwrap();
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, true), b"hi", &sig)
+                .is_err()
+        );
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, false), b"hi", &sig)
+                .is_err()
+        );
+
+        let sk = crate::ec::Ed25519PrivateKey::generate(&mut rng);
+        let spki = AnyPublicKey::Ed25519(sk.public_key()).to_spki_der();
+        let sig = sk.sign(b"hi").to_bytes();
+        let algo = find_by_id("ed25519").unwrap();
+        algo.verify(&spki, b"hi", &sig).unwrap();
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, true), b"hi", &sig)
+                .is_err()
+        );
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, false), b"hi", &sig)
+                .is_err()
+        );
+
+        let sk = crate::ec::Ed448PrivateKey::generate(&mut rng);
+        let spki = AnyPublicKey::Ed448(sk.public_key()).to_spki_der();
+        let sig = sk.sign(b"hi").to_bytes();
+        let algo = find_by_id("ed448").unwrap();
+        algo.verify(&spki, b"hi", &sig).unwrap();
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, true), b"hi", &sig)
+                .is_err()
+        );
+        assert!(
+            algo.verify(&spki_with_junk(&spki, &null, false), b"hi", &sig)
+                .is_err()
+        );
     }
 
     /// secp256k1 entries are registered but not on the modern() whitelist;
