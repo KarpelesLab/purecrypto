@@ -27,9 +27,18 @@ pub(crate) fn supported() -> bool {
 
 /// Applies one SHA-512 block compression to each of the four `(state, block)`
 /// lanes in parallel: `states[l]` is folded with `blocks[l]` for every lane `l`.
+///
+/// Callers are expected to have checked [`supported`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without AVX2, so the function is safe to call unconditionally.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn compress4(states: &mut [[u64; 8]; LANES], blocks: &[[u8; 128]; LANES]) {
-    // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
+    assert!(
+        supported(),
+        "sha512_mb::compress4 called on a CPU without AVX2; check supported() first"
+    );
+    // SAFETY: `supported()` just confirmed AVX2 on this CPU, and the kernel
+    // has no other preconditions (the array types fix the lengths).
     unsafe { avx2::compress4(states, blocks) }
 }
 

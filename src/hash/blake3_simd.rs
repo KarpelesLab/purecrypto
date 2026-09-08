@@ -33,7 +33,10 @@ pub(super) fn supported16() -> bool {
 
 /// Compresses `DEGREE16` consecutive full 1024-byte chunks in parallel.
 ///
-/// Same contract as [`hash_chunks8`], sixteen lanes wide.
+/// Same contract as [`hash_chunks8`], sixteen lanes wide. Callers are
+/// expected to have checked [`supported16`]; this re-checks the (cached) CPU
+/// feature flag and panics rather than executing the kernel on a CPU without
+/// AVX-512F, so the function is safe to call unconditionally.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn hash_chunks16(
     input: &[u8; DEGREE16 * CHUNK_LEN],
@@ -41,9 +44,13 @@ pub(super) fn hash_chunks16(
     counter_base: u64,
     flags: u32,
 ) -> [[u32; 8]; 16] {
-    // SAFETY: `supported16()` (checked by the caller) confirmed AVX-512F. The
-    // array type pins the length the kernel reads, so no unchecked load can
-    // run off the end of `input`.
+    assert!(
+        supported16(),
+        "blake3 hash_chunks16 called on a CPU without AVX-512F; check supported16() first"
+    );
+    // SAFETY: `supported16()` just confirmed AVX-512F on this CPU. The array
+    // type pins the length the kernel reads, so no unchecked load can run off
+    // the end of `input`.
     unsafe { avx512::hash_chunks16(input, key, counter_base, flags) }
 }
 
@@ -58,6 +65,10 @@ pub(super) fn supported() -> bool {
 /// `input` is exactly `DEGREE * CHUNK_LEN` bytes; chunk `k` uses counter
 /// `counter_base + k`. Returns the eight chunk chaining values (each the first
 /// eight words of the chunk's final compression).
+///
+/// Callers are expected to have checked [`supported`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without AVX2, so the function is safe to call unconditionally.
 #[cfg(target_arch = "x86_64")]
 pub(super) fn hash_chunks8(
     input: &[u8; DEGREE * CHUNK_LEN],
@@ -65,9 +76,13 @@ pub(super) fn hash_chunks8(
     counter_base: u64,
     flags: u32,
 ) -> [[u32; 8]; 8] {
-    // SAFETY: `supported()` (checked by the caller) confirmed AVX2. The array
-    // type pins the length the kernel reads, so no unchecked load can run off
-    // the end of `input`.
+    assert!(
+        supported(),
+        "blake3 hash_chunks8 called on a CPU without AVX2; check supported() first"
+    );
+    // SAFETY: `supported()` just confirmed AVX2 on this CPU. The array type
+    // pins the length the kernel reads, so no unchecked load can run off the
+    // end of `input`.
     unsafe { avx2::hash_chunks8(input, key, counter_base, flags) }
 }
 

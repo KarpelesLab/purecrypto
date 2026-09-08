@@ -38,9 +38,16 @@ pub(crate) fn supported8() -> bool {
 /// Keccak-p[1600, `rounds`] applied to eight interleaved states: lane `i` of
 /// stream `l` lives at `state[8 * i + l]`.
 ///
-/// Callers must have checked [`supported8`].
+/// Callers are expected to have checked [`supported8`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without AVX-512F, so the function is safe to call unconditionally.
 pub(crate) fn keccak_p_x8(state: &mut [u64; MAX_STATE], rounds: usize) {
-    // SAFETY: `supported8()` (checked by the caller) confirmed AVX-512F.
+    assert!(
+        supported8(),
+        "keccak_p_x8 called on a CPU without AVX-512F; check supported8() first"
+    );
+    // SAFETY: `supported8()` just confirmed AVX-512F on this CPU, and the
+    // kernel has no other preconditions (the array type fixes the length).
     unsafe { avx512::keccak_p_x8(state, rounds) }
 }
 
@@ -55,9 +62,16 @@ pub(crate) fn supported() -> bool {
 /// Keccak-p[1600, `rounds`] applied to four interleaved states: lane `i` of
 /// stream `l` lives at `state[4 * i + l]`.
 ///
-/// Callers must have checked [`supported`].
+/// Callers are expected to have checked [`supported`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without AVX2, so the function is safe to call unconditionally.
 pub(crate) fn keccak_p_x4(state: &mut [u64; 100], rounds: usize) {
-    // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
+    assert!(
+        supported(),
+        "keccak_p_x4 called on a CPU without AVX2; check supported() first"
+    );
+    // SAFETY: `supported()` just confirmed AVX2 on this CPU, and the kernel
+    // has no other preconditions (the array type fixes the length).
     unsafe { avx2::keccak_p_x4(state, rounds) }
 }
 

@@ -36,9 +36,18 @@ pub(crate) fn supported16() -> bool {
 
 /// Applies one SHA-256 block compression to each of the sixteen
 /// `(state, block)` lanes in parallel. Same contract as [`compress8`].
+///
+/// Callers are expected to have checked [`supported16`]; this re-checks the
+/// (cached) CPU feature flags and panics rather than executing the kernel on
+/// a CPU without AVX-512F+BW, so the function is safe to call unconditionally.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn compress16(states: &mut [[u32; 8]; LANES16], blocks: &[[u8; 64]; LANES16]) {
-    // SAFETY: `supported16()` (checked by the caller) confirmed AVX-512F+BW.
+    assert!(
+        supported16(),
+        "sha256_mb::compress16 called on a CPU without AVX-512F+BW; check supported16() first"
+    );
+    // SAFETY: `supported16()` just confirmed AVX-512F+BW on this CPU, and the
+    // kernel has no other preconditions (the array types fix the lengths).
     unsafe { avx512::compress16(states, blocks) }
 }
 
@@ -50,9 +59,18 @@ pub(crate) fn supported() -> bool {
 
 /// Applies one SHA-256 block compression to each of the eight `(state, block)`
 /// lanes in parallel: `states[l]` is folded with `blocks[l]` for every lane `l`.
+///
+/// Callers are expected to have checked [`supported`]; this re-checks the
+/// (cached) CPU feature flag and panics rather than executing the kernel on
+/// a CPU without AVX2, so the function is safe to call unconditionally.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn compress8(states: &mut [[u32; 8]; LANES], blocks: &[[u8; 64]; LANES]) {
-    // SAFETY: `supported()` (checked by the caller) confirmed AVX2.
+    assert!(
+        supported(),
+        "sha256_mb::compress8 called on a CPU without AVX2; check supported() first"
+    );
+    // SAFETY: `supported()` just confirmed AVX2 on this CPU, and the kernel
+    // has no other preconditions (the array types fix the lengths).
     unsafe { avx2::compress8(states, blocks) }
 }
 
