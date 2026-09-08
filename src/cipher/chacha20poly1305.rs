@@ -83,9 +83,14 @@ impl ChaCha20Poly1305 {
             (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
             "ChaCha20-Poly1305 plaintext exceeds 2^32 − 1 blocks (RFC 8439 §2.8)"
         );
-        let otk = self.poly_key(nonce);
+        let mut otk = self.poly_key(nonce);
         self.cipher.apply_keystream(nonce, 1, buffer);
-        self.tag(&otk, aad, buffer)
+        let tag = self.tag(&otk, aad, buffer);
+        // The one-time key forges tags for this nonce; `Poly1305` wipes its
+        // own copy on drop, so this frame's is the only leftover.
+        otk = [0u8; 32];
+        let _ = core::hint::black_box(&otk);
+        tag
     }
 
     /// Verifies `tag` and, only if it matches, decrypts `buffer` in place.
@@ -106,8 +111,10 @@ impl ChaCha20Poly1305 {
             (buffer.len() as u64) <= Self::MAX_PLAINTEXT_LEN,
             "ChaCha20-Poly1305 ciphertext exceeds 2^32 − 1 blocks (RFC 8439 §2.8)"
         );
-        let otk = self.poly_key(nonce);
+        let mut otk = self.poly_key(nonce);
         let expected = self.tag(&otk, aad, buffer);
+        otk = [0u8; 32];
+        let _ = core::hint::black_box(&otk);
         if !bool::from(expected.ct_eq(tag)) {
             return Err(TagMismatch);
         }

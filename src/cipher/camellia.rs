@@ -196,7 +196,7 @@ struct Schedule {
 
 impl Schedule {
     /// Builds the encryption schedule for a 128-bit key.
-    fn new128(kl: (u64, u64)) -> Self {
+    fn new128(mut kl: (u64, u64)) -> Self {
         let kr = (0u64, 0u64);
         let (mut ka, _kb) = ka_kb(kl, kr);
         let kw = [
@@ -245,14 +245,17 @@ impl Schedule {
             ke,
             rounds: 18,
         };
-        // KA is key-equivalent; the schedule now owns everything needed.
+        // KA is key-equivalent and KL *is* the key; the schedule now owns
+        // everything needed.
         ka = (0, 0);
+        kl = (0, 0);
         let _ = core::hint::black_box(&ka);
+        let _ = core::hint::black_box(&kl);
         sched
     }
 
     /// Builds the encryption schedule for a 192- or 256-bit key.
-    fn new256(kl: (u64, u64), kr: (u64, u64)) -> Self {
+    fn new256(mut kl: (u64, u64), mut kr: (u64, u64)) -> Self {
         let (mut ka, mut kb) = ka_kb(kl, kr);
         let kw = [
             rotl_hi(kl.0, kl.1, 0),
@@ -300,11 +303,16 @@ impl Schedule {
             ke,
             rounds: 24,
         };
-        // KA/KB are key-equivalent; the schedule now owns everything needed.
+        // KA/KB are key-equivalent and KL‖KR *is* the key; the schedule now
+        // owns everything needed.
         ka = (0, 0);
         kb = (0, 0);
+        kl = (0, 0);
+        kr = (0, 0);
         let _ = core::hint::black_box(&ka);
         let _ = core::hint::black_box(&kb);
+        let _ = core::hint::black_box(&kl);
+        let _ = core::hint::black_box(&kr);
         sched
     }
 

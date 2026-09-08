@@ -64,6 +64,21 @@ pub(super) unsafe fn decrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
     }
 }
 
+/// Best-effort wipe of a preloaded `__m128i` schedule (or block group) before
+/// the frame is released: zero every lane, then `black_box` so LLVM cannot
+/// drop the stores as dead. The vectors are usually in registers, but with 15
+/// keys plus 8 pipelined blocks the allocator does spill, and the spill slots
+/// would otherwise keep the round keys (from which the AES key is trivially
+/// recovered) alive on the stack. Same idiom as the `Aes*` round-key `Drop`.
+#[inline]
+#[target_feature(enable = "sse2")]
+unsafe fn wipe(v: &mut [__m128i]) {
+    for x in v.iter_mut() {
+        *x = _mm_setzero_si128();
+    }
+    let _ = core::hint::black_box(v);
+}
+
 /// Forward permutation over independent 16-byte blocks, pipelining 8 at a time
 /// so the AESENC latency is hidden. `blocks.len()` must be a multiple of 16.
 #[target_feature(enable = "aes,sse2")]
@@ -76,8 +91,10 @@ pub(super) unsafe fn encrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
         }
 
         let mut wide = blocks.chunks_exact_mut(16 * 8);
+        // Hoisted so the wipe below covers the last group's outputs (raw
+        // keystream when the caller is a CTR mode).
+        let mut b = [_mm_setzero_si128(); 8];
         for c in &mut wide {
-            let mut b = [_mm_setzero_si128(); 8];
             for (j, bj) in b.iter_mut().enumerate() {
                 *bj = _mm_loadu_si128(c.as_ptr().add(j * 16) as *const __m128i);
             }
@@ -106,6 +123,8 @@ pub(super) unsafe fn encrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
             s = _mm_aesenclast_si128(s, ks[nr]);
             _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, s);
         }
+        wipe(&mut ks);
+        wipe(&mut b);
     }
 }
 
@@ -123,8 +142,8 @@ pub(super) unsafe fn decrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
         }
 
         let mut wide = blocks.chunks_exact_mut(16 * 8);
+        let mut b = [_mm_setzero_si128(); 8];
         for c in &mut wide {
-            let mut b = [_mm_setzero_si128(); 8];
             for (j, bj) in b.iter_mut().enumerate() {
                 *bj = _mm_loadu_si128(c.as_ptr().add(j * 16) as *const __m128i);
             }
@@ -153,5 +172,10 @@ pub(super) unsafe fn decrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
             s = _mm_aesdeclast_si128(s, ks[0]);
             _mm_storeu_si128(block.as_mut_ptr() as *mut __m128i, s);
         }
+        // This is the only copy of the AESIMC-transformed inverse schedule
+        // anywhere — the cipher struct keeps just the forward keys — so its
+        // spill slots are the only place it could survive.
+        wipe(&mut ks);
+        wipe(&mut b);
     }
 }

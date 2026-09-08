@@ -202,9 +202,12 @@ fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
     out[..key.len()].copy_from_slice(key);
 
     let mut rcon = 1u8;
+    // The temporary word is (a transform of) the previous round-key word;
+    // hoisted so one wipe after the loop covers it.
+    let mut t: [u8; 4];
     for i in nk..total_words {
         let prev = i - 1;
-        let mut t = [
+        t = [
             out[prev * 4],
             out[prev * 4 + 1],
             out[prev * 4 + 2],
@@ -232,6 +235,8 @@ fn key_expansion(key: &[u8], nk: usize, nr: usize, out: &mut [u8]) {
             out[base + j] = out[src + j] ^ t[j];
         }
     }
+    t = [0u8; 4];
+    let _ = core::hint::black_box(&t);
 }
 
 /// Encrypts one block using the expanded round keys.

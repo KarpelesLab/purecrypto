@@ -303,20 +303,31 @@ fn feistel_f(r: u32, round_key: u64) -> u32 {
 fn key_schedule(key: u64) -> [u64; 16] {
     // PC-1: 64 → 56 bits, right-justified. Input `key` is also
     // right-justified 64-bit (`load_be` of an 8-byte key).
-    let pc1 = permute(key, 64, &PC1, 56);
+    let mut pc1 = permute(key, 64, &PC1, 56);
     // Split into C (FIPS bits 1..28 → u64 bits 55..28) and D (FIPS
     // bits 29..56 → u64 bits 27..0).
     let mask28 = (1u32 << 28) - 1;
     let mut c = ((pc1 >> 28) as u32) & mask28;
     let mut d = (pc1 as u32) & mask28;
     let mut rk = [0u64; 16];
+    let mut cd: u64;
     for i in 0..16 {
         c = rol28(c, SHIFTS[i] as u32);
         d = rol28(d, SHIFTS[i] as u32);
         // Re-pack C || D as a 56-bit right-justified u64 for PC-2.
-        let cd = ((c as u64) << 28) | (d as u64);
+        cd = ((c as u64) << 28) | (d as u64);
         rk[i] = permute(cd, 56, &PC2, 48);
     }
+    // `pc1` and the rotating halves are the 56 effective key bits (PC-1 is a
+    // permutation, so the key is read straight off them); scrub the frame.
+    pc1 = 0;
+    c = 0;
+    d = 0;
+    cd = 0;
+    let _ = core::hint::black_box(&pc1);
+    let _ = core::hint::black_box(&c);
+    let _ = core::hint::black_box(&d);
+    let _ = core::hint::black_box(&cd);
     rk
 }
 
@@ -424,6 +435,9 @@ impl TdesEde3 {
         let k2 = key_schedule(load_be(&k));
         k.copy_from_slice(&key[16..24]);
         let k3 = key_schedule(load_be(&k));
+        // `k` still holds K3 verbatim.
+        k = [0u8; 8];
+        let _ = core::hint::black_box(&k);
         Self { k1, k2, k3 }
     }
 }
@@ -477,6 +491,9 @@ impl TdesEde2 {
         let k1 = key_schedule(load_be(&k));
         k.copy_from_slice(&key[8..16]);
         let k2 = key_schedule(load_be(&k));
+        // `k` still holds K2 verbatim.
+        k = [0u8; 8];
+        let _ = core::hint::black_box(&k);
         Self { k1, k2 }
     }
 }

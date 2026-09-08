@@ -143,9 +143,10 @@ impl AesGcmSiv {
         let enc_blocks = self.key_len / 8; // 2 for AES-128, 4 for AES-256.
 
         // Counters 0,1 -> auth key; 2.. -> encryption key.
+        let mut b: [u8; 16];
         for counter in 0u32..(2 + enc_blocks as u32) {
             block[..4].copy_from_slice(&counter.to_le_bytes());
-            let mut b = block;
+            b = block;
             self.cipher.encrypt_block(&mut b);
             let half = &b[..8];
             let idx = counter as usize;
@@ -156,6 +157,9 @@ impl AesGcmSiv {
                 enc_key[j * 8..j * 8 + 8].copy_from_slice(half);
             }
         }
+        // The last AES output block holds half of the encryption key.
+        b = [0u8; 16];
+        let _ = core::hint::black_box(&b);
 
         let enc_cipher = match self.key_len {
             16 => Cipher::Aes128(Aes128::new(enc_key[..16].try_into().unwrap())),
@@ -270,9 +274,13 @@ impl AesGcmSiv {
     /// 2^36 bytes.
     pub fn encrypt(&self, nonce: &[u8; 12], aad: &[u8], buffer: &mut [u8]) -> [u8; 16] {
         Self::validate(aad, buffer);
-        let (auth_key, enc_cipher) = self.derive_keys(nonce);
+        let (mut auth_key, enc_cipher) = self.derive_keys(nonce);
         let tag = Self::make_tag(&auth_key, &enc_cipher, nonce, aad, buffer);
         Self::ctr(&enc_cipher, &tag, buffer);
+        // The per-nonce POLYVAL key forges tags for this nonce; `enc_cipher`
+        // scrubs its own round keys on drop, so this is the only leftover.
+        auth_key = [0u8; 16];
+        let _ = core::hint::black_box(&auth_key);
         tag
     }
 
@@ -293,10 +301,12 @@ impl AesGcmSiv {
         tag: &[u8; 16],
     ) -> Result<(), TagMismatch> {
         Self::validate(aad, buffer);
-        let (auth_key, enc_cipher) = self.derive_keys(nonce);
+        let (mut auth_key, enc_cipher) = self.derive_keys(nonce);
         // CTR-decrypt first (POLYVAL is over the plaintext).
         Self::ctr(&enc_cipher, tag, buffer);
         let expected = Self::make_tag(&auth_key, &enc_cipher, nonce, aad, buffer);
+        auth_key = [0u8; 16];
+        let _ = core::hint::black_box(&auth_key);
         if bool::from(expected.ct_eq(tag)) {
             Ok(())
         } else {

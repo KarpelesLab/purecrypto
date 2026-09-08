@@ -250,7 +250,7 @@ mod x86 {
             for (i, k) in ks.iter_mut().enumerate().take(nr + 1) {
                 *k = _mm_loadu_si128(round_keys.as_ptr().add(i * 16) as *const __m128i);
             }
-            let h = load_hpow(hpow);
+            let mut h = load_hpow(hpow);
             let ab = acc.to_le_bytes();
             let mut acc = _mm_loadu_si128(ab.as_ptr() as *const __m128i);
 
@@ -264,9 +264,11 @@ mod x86 {
             let n = buf.len();
             let base = buf.as_mut_ptr();
             let mut off = 0;
+            // Hoisted out of the loop so the wipe below covers the last
+            // group's raw keystream.
+            let mut b = [_mm_setzero_si128(); 8];
             while off < n {
                 // Eight counter blocks through the AES rounds, 8-wide.
-                let mut b = [_mm_setzero_si128(); 8];
                 for bj in b.iter_mut() {
                     let cb = (ctr_hi | ctr_lo.wrapping_add(blk) as u128).to_be_bytes();
                     *bj = _mm_xor_si128(_mm_loadu_si128(cb.as_ptr() as *const __m128i), ks[0]);
@@ -306,6 +308,16 @@ mod x86 {
             let p = bswap(acc);
             let mut out = [0u8; 16];
             _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, p);
+            // Round keys, GHASH key powers and the last keystream group are
+            // all key material (H alone forges tags); with 15 + 8 + 8 vectors
+            // live the allocator spills, so scrub the frame rather than trust
+            // it. Zero stores + `black_box`, the crate-wide zeroize idiom.
+            for v in ks.iter_mut().chain(h.iter_mut()).chain(b.iter_mut()) {
+                *v = _mm_setzero_si128();
+            }
+            let _ = core::hint::black_box(&ks);
+            let _ = core::hint::black_box(&h);
+            let _ = core::hint::black_box(&b);
             u128::from_be_bytes(out)
         }
     }
