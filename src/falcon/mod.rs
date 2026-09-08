@@ -11,17 +11,20 @@
 //! `libm`, and the signing path is secret-dependent. So all FP runs in a
 //! software-emulated IEEE-754 double (`fpr`, the approach Falcon's reference
 //! calls FPEMU): pure integer ops, no FPU required, identical on every target,
-//! and bit-reproducible. The emulation is *best-effort* constant-time — some
-//! operations still branch on operand values (see `fpr`) — so it is not
-//! guaranteed free of data-dependent branches.
+//! and bit-reproducible. The emulation is **branch-free by construction**:
+//! every operation is straight-line mask arithmetic with fixed-trip loops (see
+//! the "Constant-time contract" in `fpr`), so no operand value ever selects a
+//! branch, a memory address, or a shift count.
 //!
-//! **Constant-time scope.** The **signing path is best-effort constant-time**:
-//! the sampler and the FFT/tree arithmetic on secrets are written to be
-//! data-oblivious, but the underlying FPEMU (`fpr`) retains some value-dependent
-//! branches on operands that derive from secret data, so strictly branchless
-//! constant-time signing is future work. **Key generation is best-effort** —
-//! NTRUSolve's big-integer arithmetic and the Gaussian-rejection retries are
-//! variable-time (as in the reference); keygen is one-time, on fresh entropy.
+//! **Constant-time scope.** The **per-signature path is constant-time** at the
+//! source level: the FPEMU beneath the sampler and the FFT/tree arithmetic has
+//! no value-dependent branches, and the sampler and `ff_sampling` are
+//! data-oblivious apart from what the Falcon design itself leaks (the number
+//! of rejection-sampling rounds and `ber_exp` byte comparisons, which depend on
+//! fresh randomness — the same trade-off the reference implementation makes).
+//! **Key generation is best-effort** — NTRUSolve's big-integer arithmetic and
+//! the Gaussian-rejection retries are variable-time (as in the reference);
+//! keygen is one-time, on fresh entropy.
 //! **Verification** takes only public inputs, never panics on malformed input
 //! (every access is bounds-checked), and returns `false`/`Err` instead.
 //!
@@ -534,13 +537,13 @@ impl Format {
 /// the expanded FFT basis and LDL tree, which are lossless representations of
 /// `(f, g, F, G)` — are wiped on drop.
 ///
-/// Signing is **best-effort** constant-time, not strictly constant-time: the
-/// emulated `fpr` double under the sampler and the FFT/LDL arithmetic still
-/// branches on operand values (see the "Constant-time caveat" in `fpr`), and on
-/// the signing path those operands derive from secret data. A fully branchless
-/// FPEMU is future work. Key generation is likewise best-effort (it samples and
-/// solves the NTRU equation with variable-time big-integer arithmetic), but is
-/// one-time and runs on fresh entropy.
+/// Signing is constant-time at the source level: the emulated `fpr` double
+/// under the sampler and the FFT/LDL arithmetic is branch-free by construction
+/// (see the "Constant-time contract" in `fpr`), so the secret-derived operands
+/// on the signing path never select a branch, a memory address or a shift
+/// count. Key generation is best-effort (it samples and solves the NTRU
+/// equation with variable-time big-integer arithmetic), but is one-time and
+/// runs on fresh entropy.
 pub struct FalconPrivateKey {
     degree: Degree,
     f: Vec<i64>,
@@ -592,12 +595,13 @@ impl FalconPrivateKey {
     /// `header || salt || compressed-s`). Draws a fresh salt and sampler
     /// randomness from `rng`.
     ///
-    /// The per-signature path is **best-effort** constant-time, not strictly
-    /// constant-time: the emulated `fpr` arithmetic beneath `sampler_z` and
-    /// `ff_sampling` branches on operand values that derive from the secret key
-    /// (see the type-level note on [`FalconPrivateKey`]). Treat signing as
-    /// exposed to a floating-point timing side channel until the FPEMU is made
-    /// branchless.
+    /// The per-signature path is constant-time at the source level: the
+    /// emulated `fpr` arithmetic beneath `sampler_z` and `ff_sampling` is
+    /// branch-free by construction (see the type-level note on
+    /// [`FalconPrivateKey`] and the "Constant-time contract" in `fpr`). What
+    /// remains observable is what Falcon's design itself exposes — the number
+    /// of rejection-sampling rounds, driven by fresh randomness, as in the
+    /// reference implementation.
     pub fn sign<R: crate::rng::RngCore + crate::rng::CryptoRng>(
         &self,
         msg: &[u8],

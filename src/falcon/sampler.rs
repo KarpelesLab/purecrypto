@@ -17,10 +17,14 @@
 //!   rejection exponent, then `ber_exp`.
 //!
 //! All floating-point work is done in the emulated [`Fpr`], so the sampler is
-//! bit-reproducible across targets. It is **not** data-oblivious: `Fpr` is
-//! best-effort constant time, not branch-free (see its "Constant-time caveat"),
-//! so a residual timing side channel remains on this secret-dependent path.
-//! Validated against the
+//! bit-reproducible across targets, and `Fpr` is branch-free by construction
+//! (see its "Constant-time contract"), so the secret centre `μ`, `σ'` and the
+//! candidate `z` never select a branch. What remains variable is what the
+//! Falcon design itself leaves so: the number of rejection rounds and of
+//! `ber_exp` byte comparisons. Both are driven by the fresh random bytes, and
+//! the sampler's construction (base sampling at `σ_max`, the `ccs` rescaling)
+//! makes their distribution independent of the secret — the same argument the
+//! reference implementation relies on. Validated against the
 //! reference `samplerz` KAT vectors in `sampler_tests.rs`, which pin both the
 //! output distribution and the exact random-byte consumption.
 
