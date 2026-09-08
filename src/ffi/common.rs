@@ -3,6 +3,11 @@
 
 /// Result code returned by `purecrypto` C functions. `0` is success; negative
 /// values are errors. Mirrors `PcStatus` in `include/purecrypto.h`.
+///
+/// New codes may be added in minor releases (each is additive for C callers,
+/// which only ever see an `int`), so Rust callers must not match on this enum
+/// exhaustively.
+#[non_exhaustive]
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PcStatus {
