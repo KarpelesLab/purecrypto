@@ -130,7 +130,7 @@ impl Aez {
     /// 48-byte key is used directly as `I‖J‖L`; any other length is run through
     /// BLAKE2b to a 48-byte digest first.
     pub fn new(key: &[u8]) -> Self {
-        let ek: [u8; 48] = if key.len() == 48 {
+        let mut ek: [u8; 48] = if key.len() == 48 {
             let mut e = [0u8; 48];
             e.copy_from_slice(key);
             e
@@ -153,7 +153,22 @@ impl Aez {
         l[5] = xor16(&l[4], &l[1]); // 5L
         l[6] = mult_block(2, &l[3]); // 6L
         l[7] = xor16(&l[6], &l[1]); // 7L
+        // `ek` is the raw `I‖J‖L`; the state now owns everything needed.
+        ek = [0u8; 48];
+        let _ = core::hint::black_box(&ek);
         Aez { i, j, l }
+    }
+
+    /// The authenticator length in bits, as the `u32` AEZ-hash tweak.
+    ///
+    /// # Panics
+    /// If `tau ≥ 2^29` bytes: `tau · 8` would no longer fit the 32-bit tweak
+    /// word, silently aliasing two different expansions. No real use is
+    /// anywhere near a 512 MiB authenticator.
+    fn tau_bits(tau: usize) -> u32 {
+        tau.checked_mul(8)
+            .and_then(|bits| u32::try_from(bits).ok())
+            .expect("AEZ: tau must be < 2^29 bytes")
     }
 
     /// The scaled-down tweakable block cipher `E_K^{j,i}` for `j ≠ -1`:
@@ -237,13 +252,35 @@ impl Aez {
 
     /// AEZ-prf: keystream `(E^{-1,3}(Δ) ‖ E^{-1,3}(Δ⊕1) ‖ …)[..tau]`.
     fn aez_prf(&self, delta: &Block, out: &mut [u8]) {
-        let tau = out.len();
+        self.aez_prf_blocks(delta, out.len(), |off, blk| {
+            let n = (out.len() - off).min(BLOCK);
+            out[off..off + n].copy_from_slice(&blk[..n]);
+        });
+    }
+
+    /// Constant-time check that `c` equals the `c.len()`-byte AEZ-prf output
+    /// for `delta`, without ever materialising the genuine authenticator
+    /// anywhere but a private block on this stack frame.
+    fn aez_prf_eq(&self, delta: &Block, c: &[u8]) -> bool {
+        let mut acc = 0u8;
+        self.aez_prf_blocks(delta, c.len(), |off, blk| {
+            let n = (c.len() - off).min(BLOCK);
+            for (x, y) in blk[..n].iter().zip(&c[off..off + n]) {
+                acc |= x ^ y;
+            }
+        });
+        bool::from(acc.ct_eq(&0))
+    }
+
+    /// Drives the AEZ-prf counter: calls `f(offset, block)` for each 16-byte
+    /// output block covering `len` bytes, then scrubs the block.
+    fn aez_prf_blocks(&self, delta: &Block, len: usize, mut f: impl FnMut(usize, &Block)) {
         let mut ctr = ZERO;
         let mut off = 0;
-        while off < tau {
-            let buf = self.aes10(&self.l[3], &xor16(delta, &ctr)); // E(-1,3)
-            let n = (tau - off).min(BLOCK);
-            out[off..off + n].copy_from_slice(&buf[..n]);
+        let mut buf: Block;
+        while off < len {
+            buf = self.aes10(&self.l[3], &xor16(delta, &ctr)); // E(-1,3)
+            f(off, &buf);
             // ctr += 1 (big-endian, 128-bit)
             let mut k = 15;
             loop {
@@ -258,6 +295,8 @@ impl Aez {
             }
             off += BLOCK;
         }
+        buf = ZERO;
+        let _ = core::hint::black_box(&buf);
     }
 
     /// AEZ-core pass 1 (in place over the i-blocks): computes `X` and writes the
@@ -518,6 +557,9 @@ impl Aez {
     /// `ad`, with a `tau`-byte expansion. Returns `m.len() + tau` ciphertext
     /// bytes. A given `(key, nonce)` should be unique, though AEZ degrades
     /// gracefully on reuse.
+    ///
+    /// # Panics
+    /// If `tau ≥ 2^29` (the bit length must fit the 32-bit AEZ-hash tweak).
     #[cfg(feature = "alloc")]
     pub fn encrypt(&self, nonce: &[u8], ad: &[&[u8]], tau: usize, m: &[u8]) -> Vec<u8> {
         let mut out = alloc::vec![0u8; m.len() + tau];
@@ -529,10 +571,11 @@ impl Aez {
     /// ciphertext into `out`, which must be exactly `m.len() + tau` octets.
     ///
     /// # Panics
-    /// If `out.len() != m.len() + tau`.
+    /// If `out.len() != m.len() + tau`, or if `tau ≥ 2^29`.
     pub fn encrypt_into(&self, nonce: &[u8], ad: &[&[u8]], tau: usize, m: &[u8], out: &mut [u8]) {
+        let tau_bits = Self::tau_bits(tau);
         assert_eq!(out.len(), m.len() + tau, "AEZ encrypt: wrong output length");
-        let delta = self.aez_hash(nonce, ad, (tau * 8) as u32);
+        let delta = self.aez_hash(nonce, ad, tau_bits);
         out.fill(0);
         if m.is_empty() {
             self.aez_prf(&delta, out);
@@ -545,7 +588,12 @@ impl Aez {
 
     /// Verifies and decrypts `c` (which must be `plaintext_len + tau` bytes),
     /// returning the plaintext on success and [`TagMismatch`] if authentication
-    /// fails. The accept/reject check is constant-time.
+    /// fails. The accept/reject check is constant-time, and on failure no
+    /// deciphered bytes escape: the scratch buffer is scrubbed before it is
+    /// freed (see [`decrypt_into`](Self::decrypt_into)).
+    ///
+    /// # Panics
+    /// If `tau ≥ 2^29`.
     #[cfg(feature = "alloc")]
     pub fn decrypt(
         &self,
@@ -570,8 +618,16 @@ impl Aez {
     /// deciphered in place before the trailing expansion is checked, so the
     /// buffer is sized by the ciphertext, not the plaintext.
     ///
+    /// On `Err`, `out[..c.len()]` is **all zero**: AEZ (like any SIV-style
+    /// scheme) cannot verify before it deciphers, so the unauthenticated
+    /// candidate plaintext briefly exists in `out` and is scrubbed before
+    /// returning. For an empty message (`c.len() == tau`) the genuine
+    /// authenticator is compared against `c` in a private block and never
+    /// written to `out`, so a rejected call leaks neither plaintext nor a
+    /// valid tag through the caller's buffer.
+    ///
     /// # Panics
-    /// If `out.len() < c.len()`.
+    /// If `out.len() < c.len()`, or if `tau ≥ 2^29`.
     pub fn decrypt_into(
         &self,
         nonce: &[u8],
@@ -580,18 +636,21 @@ impl Aez {
         c: &[u8],
         out: &mut [u8],
     ) -> Result<usize, TagMismatch> {
+        let tau_bits = Self::tau_bits(tau);
         if c.len() < tau {
             return Err(TagMismatch);
         }
         assert!(out.len() >= c.len(), "AEZ decrypt: output buffer too small");
-        let delta = self.aez_hash(nonce, ad, (tau * 8) as u32);
+        let delta = self.aez_hash(nonce, ad, tau_bits);
         if c.len() == tau {
-            // Empty plaintext: ciphertext is exactly the PRF tag.
-            let prf = &mut out[..tau];
-            self.aez_prf(&delta, prf);
-            if bool::from(prf.ct_eq(c)) {
+            // Empty plaintext: ciphertext is exactly the PRF tag. Compare
+            // block-by-block in a private buffer — writing the genuine tag
+            // into `out` first would hand a forger the authenticator for the
+            // empty message on every rejected call.
+            if self.aez_prf_eq(&delta, c) {
                 return Ok(0);
             }
+            Self::scrub(&mut out[..tau]);
             return Err(TagMismatch);
         }
         let buf = &mut out[..c.len()];
@@ -608,8 +667,19 @@ impl Aez {
         if bool::from(acc.ct_eq(&0)) {
             Ok(m_len)
         } else {
+            // Unauthenticated plaintext must not reach the caller.
+            Self::scrub(buf);
             Err(TagMismatch)
         }
+    }
+
+    /// Zeros `buf` and pins the writes with `black_box` (the crate-wide
+    /// zeroize idiom) so LLVM cannot drop them as dead stores.
+    fn scrub(buf: &mut [u8]) {
+        for b in buf.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(buf);
     }
 }
 
@@ -792,6 +862,84 @@ mod nobuf_tests {
             aez.decrypt_into(b"n", &[b"ad".as_slice()], tau, &ct, &mut pt)
                 .is_err()
         );
+    }
+
+    /// A rejected ciphertext leaves nothing of the candidate plaintext in the
+    /// caller's buffer: `out[..c.len()]` is all zero on `Err`.
+    #[test]
+    fn rejected_ciphertext_scrubs_output() {
+        let aez = Aez::new(b"k");
+        let tau = 16;
+        let m = b"attack at dawn, or maybe a bit later than that";
+        let mut ct = [0u8; 46 + 16];
+        aez.encrypt_into(b"n", &[], tau, m, &mut ct);
+
+        let mut bad = ct;
+        bad[3] ^= 0x80;
+        let mut out = [0xaau8; 70];
+        assert!(aez.decrypt_into(b"n", &[], tau, &bad, &mut out).is_err());
+        assert!(out[..bad.len()].iter().all(|&b| b == 0), "plaintext leaked");
+        // Bytes past `c.len()` are the caller's and are untouched.
+        assert!(out[bad.len()..].iter().all(|&b| b == 0xaa));
+
+        // Wrong AD, same shape.
+        let mut out = [0xaau8; 62];
+        assert!(
+            aez.decrypt_into(b"n", &[b"x".as_slice()], tau, &ct, &mut out)
+                .is_err()
+        );
+        assert!(out.iter().all(|&b| b == 0));
+    }
+
+    /// A `tau`-length ciphertext that is *not* the PRF tag is rejected without
+    /// the genuine authenticator ever being written to the caller's buffer
+    /// (it used to be computed straight into `out` before the compare).
+    #[test]
+    fn rejected_empty_message_leaks_no_tag() {
+        let aez = Aez::new(b"k");
+        let tau = 16;
+        let mut genuine = [0u8; 16];
+        aez.encrypt_into(b"n", &[], tau, b"", &mut genuine);
+
+        let mut forged = genuine;
+        forged[0] ^= 1;
+        let mut out = [0x55u8; 20];
+        assert!(aez.decrypt_into(b"n", &[], tau, &forged, &mut out).is_err());
+        assert_ne!(out[..16], genuine, "genuine tag written to caller buffer");
+        assert!(out[..16].iter().all(|&b| b == 0));
+        assert!(out[16..].iter().all(|&b| b == 0x55));
+
+        // The genuine tag still verifies, so the private-buffer compare is
+        // not simply rejecting everything.
+        assert_eq!(
+            aez.decrypt_into(b"n", &[], tau, &genuine, &mut out)
+                .expect("ok"),
+            0
+        );
+    }
+
+    /// `tau · 8` must fit the 32-bit AEZ-hash tweak.
+    #[test]
+    #[should_panic(expected = "tau must be < 2^29")]
+    fn encrypt_rejects_tau_overflow() {
+        let aez = Aez::new(b"k");
+        let mut out = [0u8; 0];
+        aez.encrypt_into(b"n", &[], 1 << 29, b"", &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "tau must be < 2^29")]
+    fn decrypt_rejects_tau_overflow() {
+        let aez = Aez::new(b"k");
+        let mut out = [0u8; 0];
+        let _ = aez.decrypt_into(b"n", &[], 1 << 29, b"", &mut out);
+    }
+
+    /// The largest legal `tau` is accepted by the tweak encoding (the buffers
+    /// here are tiny, so only the length check is exercised).
+    #[test]
+    fn tau_just_below_limit_passes_tweak_check() {
+        assert_eq!(Aez::tau_bits((1 << 29) - 1), 0xffff_fff8);
     }
 
     /// The empty-plaintext case is the bare PRF tag, and round-trips to zero
