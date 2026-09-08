@@ -344,7 +344,9 @@ pub fn aggregate(entries: &[PubkeyMsgSig]) -> Result<Vec<u8>, Error> {
 ///
 /// # Errors
 /// [`Error::InvalidInput`] if the combined count exceeds [`MAX_AGGREGATED`].
-/// [`Error::Malformed`] if `agg` is not `32·(aggregated.len() + 1)` bytes.
+/// [`Error::Malformed`] if `agg` is not `32·(aggregated.len() + 1)` bytes, if
+/// its aggregate scalar is not canonical (`≥ n`), or if `aggregated` is empty
+/// and `agg` is not the all-zero seed (the only aggregate over no signatures).
 pub fn inc_aggregate(
     agg: &[u8],
     aggregated: &[PubkeyMsg],
@@ -361,6 +363,14 @@ pub fn inc_aggregate(
     if agg.len() != (v + 1) * 32 {
         return Err(Error::Malformed);
     }
+    // The aggregate scalar must be canonical (`< n`), exactly as
+    // `verify_aggregate` demands of the final result; silently reducing a
+    // non-canonical `s` would let a malformed prefix fold into a well-formed
+    // output. For an empty prefix the only aggregate is the all-zero seed.
+    let mut s = Scalar::from_bytes_be(&chunk32(agg, v)).map_err(|_| Error::Malformed)?;
+    if v == 0 && !bool::from(s.is_zero()) {
+        return Err(Error::Malformed);
+    }
 
     let mut out = Vec::with_capacity((v + u + 1) * 32);
     out.extend_from_slice(&agg[..v * 32]);
@@ -371,7 +381,6 @@ pub fn inc_aggregate(
     for (i, (pk, msg)) in aggregated.iter().enumerate() {
         rz.skip(&chunk32(agg, i), pk, msg);
     }
-    let mut s = Scalar::from_bytes_be_reduce(&chunk32(agg, v));
 
     for (j, (pk, msg, sig)) in to_add.iter().enumerate() {
         let mut r = [0u8; 32];
@@ -723,6 +732,58 @@ mod tests {
             pms[i].1[0] ^= 0xff;
             assert!(verify_aggregate(&pms, &agg).is_err(), "message {i} changed");
         }
+    }
+
+    /// `inc_aggregate` is as strict about its input aggregate as
+    /// `verify_aggregate` is about its output: a non-canonical scalar, or a
+    /// non-zero "empty" aggregate, is `Malformed` rather than reduced.
+    #[test]
+    fn inc_aggregate_rejects_non_canonical_prefix() {
+        let e = entries(4);
+        let pms = strip(&e);
+        let agg = aggregate(&e).expect("aggregate");
+
+        // Empty prefix: only the all-zero seed is an aggregate over nothing.
+        let mut seed = [0u8; 32];
+        seed[31] = 1;
+        assert_eq!(inc_aggregate(&seed, &[], &e).unwrap_err(), Error::Malformed);
+        assert_eq!(
+            inc_aggregate(&[0xffu8; 32], &[], &e).unwrap_err(),
+            Error::Malformed
+        );
+        // The all-zero seed is still accepted, and equals `aggregate`.
+        assert_eq!(inc_aggregate(&[0u8; 32], &[], &e).unwrap(), agg);
+
+        // Non-empty prefix whose scalar is >= n: all-ones, and n itself.
+        let head = aggregate(&e[..2]).expect("head");
+        let mut oob = head.clone();
+        oob[2 * 32..].copy_from_slice(&[0xffu8; 32]);
+        assert_eq!(
+            inc_aggregate(&oob, &pms[..2], &e[2..]).unwrap_err(),
+            Error::Malformed
+        );
+        let n: [u8; 32] = [
+            0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b, 0xbf, 0xd2, 0x5e, 0x8c,
+            0xd0, 0x36, 0x41, 0x41,
+        ];
+        let mut at_n = head.clone();
+        at_n[2 * 32..].copy_from_slice(&n);
+        assert_eq!(
+            inc_aggregate(&at_n, &pms[..2], &e[2..]).unwrap_err(),
+            Error::Malformed
+        );
+        // n − 1 is canonical and therefore accepted (the result is simply an
+        // aggregate that will not verify).
+        let mut n_minus_1 = n;
+        n_minus_1[31] -= 1;
+        let mut canonical = head.clone();
+        canonical[2 * 32..].copy_from_slice(&n_minus_1);
+        let folded = inc_aggregate(&canonical, &pms[..2], &e[2..]).expect("canonical prefix");
+        assert_eq!(folded.len(), agg.len());
+        assert!(verify_aggregate(&pms, &folded).is_err());
+        // And the honest prefix still folds to the honest aggregate.
+        assert_eq!(inc_aggregate(&head, &pms[..2], &e[2..]).unwrap(), agg);
     }
 
     #[test]
