@@ -657,7 +657,9 @@ impl RecvStream {
         }
         // Trim already-delivered prefix.
         if offset < self.next_offset {
-            let skip = (self.next_offset - offset) as usize;
+            // `usize::MAX` on a 32-bit target when the gap exceeds the
+            // address space: the fragment is then entirely stale.
+            let skip = usize::try_from(self.next_offset - offset).unwrap_or(usize::MAX);
             if skip >= data.len() {
                 // Fully duplicate; nothing new. Still might transition
                 // to DataRecvd if FIN-only.

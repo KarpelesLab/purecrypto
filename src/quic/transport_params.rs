@@ -319,10 +319,7 @@ impl TransportParameters {
             }
             let (length, n) = varint::decode(&buf[p..])?;
             p += n;
-            let length = length as usize;
-            if buf.len() - p < length {
-                return Err(Error::Decode);
-            }
+            let length = varint::bounded_len(length, buf.len() - p)?;
             let value = &buf[p..p + length];
             p += length;
 
@@ -547,5 +544,28 @@ mod tests {
         assert_eq!(buf[0], 0x20);
         let decoded = TransportParameters::decode(&buf).expect("decode");
         assert_eq!(decoded.max_datagram_frame_size, Some(1200));
+    }
+
+    /// QUIC-2 regression: a parameter length varint whose high 32 bits are
+    /// set must be rejected on every target — `length as usize` on a 32-bit
+    /// target would truncate `(1 << 32) + 4` to `4` and accept it.
+    #[test]
+    fn oversized_param_length_is_rejected_before_narrowing() {
+        // original_destination_connection_id (id 0x00), length (1 << 32) + 4,
+        // then exactly 4 value bytes.
+        let mut bad = alloc::vec![0x00, 0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04];
+        bad.extend_from_slice(&[0xAB; 4]);
+        assert!(matches!(
+            TransportParameters::decode(&bad),
+            Err(Error::Decode)
+        ));
+
+        // Sanity: the honest 1-byte length decodes.
+        let good = alloc::vec![0x00, 0x04, 0xAB, 0xAB, 0xAB, 0xAB];
+        let tp = TransportParameters::decode(&good).expect("decode");
+        assert_eq!(
+            tp.original_destination_connection_id.as_deref(),
+            Some(&[0xAB; 4][..])
+        );
     }
 }

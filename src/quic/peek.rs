@@ -88,9 +88,9 @@ pub fn peek_initial_sni(datagram: &[u8]) -> Result<Option<ClientHelloInfo>, Erro
         }
 
         // RFC 9000 §17.2: `length` covers PN + payload + tag.
-        let pkt_total = hdr
-            .payload_off
-            .checked_add(hdr.length as usize)
+        let pkt_total = usize::try_from(hdr.length)
+            .ok()
+            .and_then(|len| hdr.payload_off.checked_add(len))
             .ok_or(Error::Decode)?;
         if rest.len() < pkt_total {
             // The (first) packet isn't fully buffered — ask for more.
@@ -368,5 +368,24 @@ mod tests {
         let dg = seal_initial(&dcid, &mut pt);
         let info = peek_initial_sni(&dg).expect("ok").expect("complete CH");
         assert_eq!(info.server_name.as_deref(), Some("split.example"));
+    }
+
+    /// QUIC-2 regression: an Initial whose Length field has its high 32 bits
+    /// set must never be treated as a complete packet. `hdr.length as usize`
+    /// on a 32-bit target would truncate `(1 << 32) + 40` to `40` and run the
+    /// AEAD over a mis-framed slice.
+    #[test]
+    fn oversized_packet_length_never_yields_a_client_hello() {
+        let dcid = [0x11u8; 8];
+        let mut dg = alloc::vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x08];
+        dg.extend_from_slice(&dcid);
+        dg.extend_from_slice(&[0x00, 0x00]); // scid_len = 0, token_len = 0
+        // Length = (1 << 32) + 40, followed by exactly 40 bytes.
+        dg.extend_from_slice(&[0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x28]);
+        dg.extend_from_slice(&[0u8; 40]);
+        // Either "incomplete" (64-bit: the declared length exceeds the
+        // buffer) or a decode error (32-bit: the length does not fit a
+        // usize) — never a parsed ClientHello, and never a panic.
+        assert!(!matches!(peek_initial_sni(&dg), Ok(Some(_))));
     }
 }

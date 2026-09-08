@@ -96,9 +96,42 @@ pub(crate) fn decode(buf: &[u8]) -> Result<(u64, usize), Error> {
     Ok((value, len))
 }
 
+/// Narrows a decoded varint `length` to a `usize` slice length, checking it
+/// against `available` (the bytes remaining in the buffer) **before** the
+/// narrowing.
+///
+/// A plain `length as usize` truncates on 32-bit targets (wasm32, i686): an
+/// attacker-supplied length with its high 32 bits set would then pass the
+/// bounds check with a small low-word value and silently mis-frame the
+/// buffer. Every decoder that slices a buffer by a wire length goes through
+/// this helper so the comparison happens in `u64`.
+#[inline]
+pub(crate) fn bounded_len(length: u64, available: usize) -> Result<usize, Error> {
+    usize::try_from(length)
+        .ok()
+        .filter(|&len| len <= available)
+        .ok_or(Error::Decode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_len_rejects_lengths_wider_than_usize() {
+        assert_eq!(bounded_len(0, 0), Ok(0));
+        assert_eq!(bounded_len(5, 5), Ok(5));
+        assert!(matches!(bounded_len(6, 5), Err(Error::Decode)));
+        // High 32 bits set: must be rejected on every target, including
+        // those where `(1 << 32) + 4` truncates to 4.
+        assert!(matches!(bounded_len((1 << 32) + 4, 4), Err(Error::Decode)));
+        // A length that fits `u64` but not `usize` is rejected only where
+        // `usize` is narrower — i.e. exactly on 32-bit targets.
+        assert_eq!(
+            bounded_len(u64::from(u32::MAX) + 1, usize::MAX).is_ok(),
+            usize::BITS >= 64
+        );
+    }
 
     const BOUNDARIES: &[(u64, usize)] = &[
         (0, 1),

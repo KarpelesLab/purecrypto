@@ -210,10 +210,7 @@ impl<'a> LongHeader<'a> {
             LongType::Initial => {
                 let (tlen, n) = varint::decode(&buf[p..])?;
                 p += n;
-                let tlen = tlen as usize;
-                if buf.len() < p + tlen {
-                    return Err(Error::Decode);
-                }
+                let tlen = varint::bounded_len(tlen, buf.len() - p)?;
                 let token = &buf[p..p + tlen];
                 p += tlen;
                 let (length, n) = varint::decode(&buf[p..])?;
@@ -1010,5 +1007,29 @@ mod tests {
         //   c000000001088394c8f03e5157080000449e7b9aec34
         let expected_header = hex("c000000001088394c8f03e5157080000449e7b9aec34");
         assert_eq!(&wire[..expected_header.len()], expected_header.as_slice());
+    }
+
+    /// QUIC-2 regression: an Initial whose Token Length varint has its high
+    /// 32 bits set must fail to parse on every target — `tlen as usize` on a
+    /// 32-bit target would truncate `(1 << 32) + 4` to `4` and accept it.
+    #[test]
+    fn initial_oversized_token_length_is_rejected_before_narrowing() {
+        let mut bad = alloc::vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00];
+        // Token Length = (1 << 32) + 4, then exactly 4 token bytes, then a
+        // plausible Length field and payload.
+        bad.extend_from_slice(&[0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04]);
+        bad.extend_from_slice(b"tokn");
+        bad.push(0x14);
+        bad.extend_from_slice(&[0u8; 20]);
+        assert!(matches!(LongHeader::parse(&bad), Err(Error::Decode)));
+
+        // Sanity: the honest 1-byte token length parses.
+        let mut good = alloc::vec![0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04];
+        good.extend_from_slice(b"tokn");
+        good.push(0x14);
+        good.extend_from_slice(&[0u8; 20]);
+        let hdr = LongHeader::parse(&good).expect("parse");
+        assert_eq!(hdr.token, b"tokn");
+        assert_eq!(hdr.length, 20);
     }
 }

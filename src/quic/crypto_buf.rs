@@ -123,7 +123,9 @@ impl CryptoBuf {
     pub(crate) fn on_crypto(&mut self, mut offset: u64, mut data: &[u8]) -> Result<Vec<u8>, Error> {
         // Trim any bytes already delivered.
         if offset < self.next_offset {
-            let skip = (self.next_offset - offset) as usize;
+            // `usize::MAX` on a 32-bit target when the gap exceeds the
+            // address space: the fragment is then entirely stale.
+            let skip = usize::try_from(self.next_offset - offset).unwrap_or(usize::MAX);
             if skip >= data.len() {
                 // Entirely already delivered.
                 return Ok(Vec::new());

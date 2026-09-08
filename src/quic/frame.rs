@@ -280,10 +280,7 @@ impl<'a> Frame<'a> {
                     Some(end) if end <= varint::MAX => {}
                     _ => return Err(Error::Decode),
                 }
-                let length = length as usize;
-                if buf.len() - p < length {
-                    return Err(Error::Decode);
-                }
+                let length = varint::bounded_len(length, buf.len() - p)?;
                 let data = &buf[p..p + length];
                 p += length;
                 Ok((Frame::Crypto { offset, data }, p))
@@ -291,10 +288,7 @@ impl<'a> Frame<'a> {
             0x07 => {
                 let (length, n) = varint::decode(&buf[p..])?;
                 p += n;
-                let length = length as usize;
-                if buf.len() - p < length {
-                    return Err(Error::Decode);
-                }
+                let length = varint::bounded_len(length, buf.len() - p)?;
                 // RFC 9000 §19.7: "A client MUST treat receipt of a
                 // NEW_TOKEN frame with an empty Token field as a
                 // connection error of type FRAME_ENCODING_ERROR."
@@ -330,10 +324,7 @@ impl<'a> Frame<'a> {
                         Some(end) if end <= varint::MAX => {}
                         _ => return Err(Error::Decode),
                     }
-                    let length = length as usize;
-                    if buf.len() - p < length {
-                        return Err(Error::Decode);
-                    }
+                    let length = varint::bounded_len(length, buf.len() - p)?;
                     let d = &buf[p..p + length];
                     p += length;
                     d
@@ -485,10 +476,7 @@ impl<'a> Frame<'a> {
                 };
                 let (reason_len, n) = varint::decode(&buf[p..])?;
                 p += n;
-                let reason_len = reason_len as usize;
-                if buf.len() - p < reason_len {
-                    return Err(Error::Decode);
-                }
+                let reason_len = varint::bounded_len(reason_len, buf.len() - p)?;
                 let reason = &buf[p..p + reason_len];
                 p += reason_len;
                 Ok((
@@ -509,10 +497,7 @@ impl<'a> Frame<'a> {
             0x31 => {
                 let (length, n) = varint::decode(&buf[p..])?;
                 p += n;
-                let length = length as usize;
-                if buf.len() - p < length {
-                    return Err(Error::Decode);
-                }
+                let length = varint::bounded_len(length, buf.len() - p)?;
                 let data = &buf[p..p + length];
                 p += length;
                 Ok((Frame::Datagram { data }, p))
@@ -1167,5 +1152,40 @@ mod tests {
         assert_eq!(it.next().unwrap().unwrap(), Frame::MaxData(1024));
         assert_eq!(it.next().unwrap().unwrap(), Frame::HandshakeDone);
         assert!(it.next().is_none());
+    }
+
+    /// QUIC-2 regression: a length varint whose high 32 bits are set must
+    /// be rejected on every target. A plain `length as usize` on a 32-bit
+    /// target truncates `(1 << 32) + 4` to `4`, which the subsequent bounds
+    /// check happily accepts — mis-framing the buffer.
+    #[test]
+    fn oversized_length_varints_are_rejected_before_narrowing() {
+        // 8-byte varint encoding of (1 << 32) + 4.
+        const BIG: [u8; 8] = [0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x04];
+        // (prefix, suffix) — the length varint goes between them and the
+        // suffix is exactly 4 bytes, matching the truncated low word.
+        let cases: [(&[u8], &str); 5] = [
+            (&[0x06, 0x00], "CRYPTO"),
+            (&[0x07], "NEW_TOKEN"),
+            (&[0x0A, 0x04], "STREAM (LEN bit)"),
+            (&[0x1C, 0x00, 0x00], "CONNECTION_CLOSE reason"),
+            (&[0x31], "DATAGRAM (length)"),
+        ];
+        for (prefix, name) in cases {
+            let mut bad = prefix.to_vec();
+            bad.extend_from_slice(&BIG);
+            bad.extend_from_slice(b"abcd");
+            assert!(
+                matches!(Frame::decode(&bad), Err(Error::Decode)),
+                "{name}: (1 << 32) + 4 length must be rejected"
+            );
+            // Sanity: the same frame with the honest 1-byte length decodes
+            // and consumes the whole buffer.
+            let mut good = prefix.to_vec();
+            good.push(0x04);
+            good.extend_from_slice(b"abcd");
+            let (_, used) = Frame::decode(&good).expect(name);
+            assert_eq!(used, good.len(), "{name}: honest length consumes all");
+        }
     }
 }

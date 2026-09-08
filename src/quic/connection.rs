@@ -4076,9 +4076,12 @@ impl QuicConnection {
         // Compute the *total* packet length on the wire. For Initial /
         // Handshake / 0-RTT this is `payload_off + length` because
         // `length` covers PN + payload + tag (RFC 9000 §17.2).
-        let pkt_total_len = hdr
-            .payload_off
-            .checked_add(hdr.length as usize)
+        // The Length field is an attacker-controlled u64 varint; narrow
+        // it with `try_from` (not `as`) so a value with its high bits set
+        // is rejected rather than truncated on 32-bit targets.
+        let pkt_total_len = usize::try_from(hdr.length)
+            .ok()
+            .and_then(|len| hdr.payload_off.checked_add(len))
             .ok_or(Error::Decode)?;
         if datagram.len() < pkt_total_len {
             return Err(Error::Decode);
@@ -7633,6 +7636,27 @@ mod tests {
         drive_until_complete(&mut c, &mut s, 4);
         assert!(c.is_handshake_complete());
         assert!(s.is_handshake_complete());
+    }
+
+    /// QUIC-2 regression: a long-header packet whose Length field has its
+    /// high 32 bits set is rejected with `Error::Decode` on every target.
+    /// `hdr.length as usize` on a 32-bit target would truncate
+    /// `(1 << 32) + 40` to `40`, pass the datagram bounds check, and hand a
+    /// mis-framed slice to header-protection removal.
+    #[test]
+    fn oversized_long_header_length_is_rejected_before_narrowing() {
+        let (mut c, _s) = loopback_pair();
+        let _ = c.pop_datagram();
+        let mut dg = alloc::vec![0xC0, 0x00, 0x00, 0x00, 0x01];
+        dg.push(c.endpoint.cids.local.len() as u8);
+        dg.extend_from_slice(c.endpoint.cids.local.as_slice());
+        dg.push(8);
+        dg.extend_from_slice(&[0x22u8; 8]);
+        dg.push(0x00); // token_len = 0
+        // Length = (1 << 32) + 40, followed by exactly 40 bytes.
+        dg.extend_from_slice(&[0xC0, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x28]);
+        dg.extend_from_slice(&[0u8; 40]);
+        assert!(matches!(c.feed_datagram(&dg), Err(Error::Decode)));
     }
 
     /// A server never has a preferred address to move to, and a client cannot
