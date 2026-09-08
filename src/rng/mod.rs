@@ -35,6 +35,11 @@ mod linux_getrandom;
     )
 ))]
 mod wasm;
+// Chunked, sentinel-checked filling for the browser/generic-host import
+// backend. Pure logic, so it is also compiled natively under `test` to keep
+// its fail-closed checks unit-tested with mock hosts.
+#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
+mod host_fill;
 #[cfg(all(
     target_arch = "wasm32",
     any(
