@@ -69,16 +69,34 @@ fn random_scalar<R: RngCore>(n: &BoxedUint, rng: &mut R) -> BoxedUint {
         let mut buf = vec![0u8; bytes];
         rng.fill_bytes(&mut buf);
         buf[0] &= high_mask;
-        let candidate = BoxedUint::from_be_bytes(&buf);
+        let mut candidate = BoxedUint::from_be_bytes(&buf);
+        // The raw bytes are the secret scalar; don't leave them on the heap.
+        wipe(&mut buf);
         if in_range(&candidate, n) {
             return candidate;
         }
+        candidate.zeroize();
     }
 }
 
+/// Best-effort wipe of a heap buffer holding secret material (a scalar's raw
+/// bytes, a KDF key stream, the shared point `x2 ‖ y2`): overwrite with zeros
+/// and route the read through a `black_box` barrier so LLVM cannot elide the
+/// stores as dead. Mirrors `boxed::random_scalar`.
+fn wipe(buf: &mut [u8]) {
+    buf.fill(0);
+    let _ = core::hint::black_box(&*buf);
+}
+
 /// The 32-byte big-endian encoding of a field element / scalar.
+///
+/// Widened when `v` genuinely needs more than 32 bytes — a signature built
+/// through [`Sm2Signature::from_components`] from arbitrary integers — so the
+/// re-encoders (`to_bytes`, `to_der`) stay total instead of panicking in
+/// `BoxedUint::to_be_bytes`; the verifier's range check is what rejects such
+/// a value (mirrors `boxed::enc_len`).
 fn enc32(v: &BoxedUint) -> Vec<u8> {
-    v.to_be_bytes(32)
+    v.to_be_bytes(super::boxed::enc_len(v, 32))
 }
 
 /// An SM2 public key: an affine point `PA = (xA, yA)` on `sm2p256v1`.
@@ -147,9 +165,15 @@ fn kdf(z: &[u8], klen: usize) -> Vec<u8> {
         let mut h = Sm3::new();
         h.update(z);
         h.update(&ct.to_be_bytes());
-        out.extend_from_slice(h.finalize().as_ref());
+        let mut ha = h.finalize();
+        out.extend_from_slice(ha.as_ref());
+        // The per-block output is key stream; wipe the stack copy.
+        wipe(ha.as_mut());
         ct = ct.wrapping_add(1);
     }
+    // The bytes past `klen` stay in the Vec's capacity after `truncate`;
+    // zero them first so no key stream outlives the returned length.
+    wipe(&mut out[klen..]);
     out.truncate(klen);
     out
 }
@@ -238,21 +262,24 @@ impl Sm2PublicKey {
         let n = c.order().clone();
         let point = c.lift_affine(&self.x, &self.y);
         loop {
-            let k = random_scalar(&n, rng);
+            let mut k = random_scalar(&n, rng);
             // C1 = [k]G (uncompressed point).
             let (x1, y1) = c
                 .to_affine(&c.mul_generator(&k))
                 .ok_or(Error::InvalidInput)?;
             // [k]PA = (x2, y2). PA has order n (cofactor 1), so this is never
             // the identity for k in [1, n-1].
-            let (x2, y2) = c
+            let (mut x2, mut y2) = c
                 .to_affine(&c.scalar_mul(&k, &point))
                 .ok_or(Error::InvalidInput)?;
+            // `k` has done its work; the shared point (x2, y2) is what the
+            // rest of the encryption derives from.
+            k.zeroize();
 
             // t = KDF(x2 ‖ y2, mlen); retry if all-zero.
             let mut z = enc32(&x2);
             z.extend_from_slice(&enc32(&y2));
-            let t = kdf(&z, msg.len());
+            let mut t = kdf(&z, msg.len());
             // GB/T 32918.4 requires retrying when the whole key stream is zero.
             // `t` is derived from the shared secret, so fold every byte into one
             // accumulator instead of using a short-circuiting `all()`, whose
@@ -266,6 +293,10 @@ impl Sm2PublicKey {
             // trivially zero and the retry would never terminate; the zero-key
             // rule only makes sense for a stream that actually masks something.
             if !msg.is_empty() && bool::from(acc.ct_eq(&0)) {
+                wipe(&mut z);
+                wipe(&mut t);
+                x2.zeroize();
+                y2.zeroize();
                 continue;
             }
 
@@ -273,10 +304,17 @@ impl Sm2PublicKey {
             let c2: Vec<u8> = msg.iter().zip(&t).map(|(m, k)| m ^ k).collect();
             // C3 = SM3(x2 ‖ M ‖ y2).
             let mut h = Sm3::new();
-            h.update(&enc32(&x2));
+            h.update(&z[..32]);
             h.update(msg);
-            h.update(&enc32(&y2));
+            h.update(&z[32..]);
             let c3 = h.finalize();
+
+            // The shared point and the key stream are secret; wipe them now
+            // that C2 and C3 are computed.
+            wipe(&mut z);
+            wipe(&mut t);
+            x2.zeroize();
+            y2.zeroize();
 
             // Output C1 ‖ C3 ‖ C2 (RFC 8998 §3).
             let flen = CURVE.field_len();
@@ -337,8 +375,11 @@ impl Sm2PrivateKey {
     ) -> Result<Sm2Signature, Error> {
         let n = CURVE.curve().order().clone();
         loop {
-            let k = random_scalar(&n, rng);
-            match self.sign_with_k(msg, id, &k) {
+            let mut k = random_scalar(&n, rng);
+            let out = self.sign_with_k(msg, id, &k);
+            // The nonce alone recovers the private key; wipe it on every path.
+            k.zeroize();
+            match out {
                 Ok(sig) => return Ok(sig),
                 // Degenerate nonce (r == 0, r + k == n, or s == 0): resample.
                 Err(Error::InvalidInput) => continue,
@@ -375,10 +416,14 @@ impl Sm2PrivateKey {
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
         let one = BoxedUint::from_u64(1);
-        let d_plus_1_inv = inv_mod(&fq, &fq.add_mod(&one, &self.d), &n);
-        let rd = fq.mul_mod(&r, &self.d);
-        let k_minus_rd = fq.sub_mod(k, &rd);
+        let mut d_plus_1_inv = inv_mod(&fq, &fq.add_mod(&one, &self.d), &n);
+        let mut rd = fq.mul_mod(&r, &self.d);
+        let mut k_minus_rd = fq.sub_mod(k, &rd);
         let s = fq.mul_mod(&d_plus_1_inv, &k_minus_rd);
+        // Each intermediate is a function of `dA` or `k`; wipe them.
+        d_plus_1_inv.zeroize();
+        rd.zeroize();
+        k_minus_rd.zeroize();
         if s.is_zero() {
             return Err(Error::InvalidInput);
         }
@@ -413,14 +458,16 @@ impl Sm2PrivateKey {
         // [dB]C1 = (x2, y2). With cofactor 1 and C1 on the curve, the only way
         // this is the identity is C1 = identity (already rejected by the SEC1
         // 0x04 parse) — guard anyway.
-        let (x2, y2) = c
+        let (mut x2, mut y2) = c
             .to_affine(&c.scalar_mul(&self.d, &c1))
             .ok_or(Error::InvalidInput)?;
 
         // t = KDF(x2 ‖ y2, |C2|); M = C2 ⊕ t.
         let mut z = enc32(&x2);
         z.extend_from_slice(&enc32(&y2));
-        let t = kdf(&z, c2.len());
+        x2.zeroize();
+        y2.zeroize();
+        let mut t = kdf(&z, c2.len());
         // GB/T 32918.4-2016 §7 step B4: abort when the KDF stream is all
         // zeros (the ciphertext would then equal the plaintext). The C3 hash
         // check below catches it in practice, but the standard mandates the
@@ -430,22 +477,29 @@ impl Sm2PrivateKey {
         for &b in &t {
             acc |= b;
         }
-        if !c2.is_empty() && acc == 0 {
-            return Err(Error::InvalidInput);
-        }
-        let msg: Vec<u8> = c2.iter().zip(&t).map(|(c, k)| c ^ k).collect();
-
-        // u = SM3(x2 ‖ M ‖ y2); verify u == C3 in constant time.
-        let mut h = Sm3::new();
-        h.update(&enc32(&x2));
-        h.update(&msg);
-        h.update(&enc32(&y2));
-        let u = h.finalize();
-        if bool::from(u.as_ref().ct_eq(c3)) {
-            Ok(msg)
+        let result = if !c2.is_empty() && bool::from(acc.ct_eq(&0)) {
+            Err(Error::InvalidInput)
         } else {
-            Err(Error::Verification)
-        }
+            let mut msg: Vec<u8> = c2.iter().zip(&t).map(|(c, k)| c ^ k).collect();
+
+            // u = SM3(x2 ‖ M ‖ y2); verify u == C3 in constant time.
+            let mut h = Sm3::new();
+            h.update(&z[..32]);
+            h.update(&msg);
+            h.update(&z[32..]);
+            let u = h.finalize();
+            if bool::from(u.as_ref().ct_eq(c3)) {
+                Ok(msg)
+            } else {
+                // A rejected decryption must not leak the candidate plaintext.
+                wipe(&mut msg);
+                Err(Error::Verification)
+            }
+        };
+        // The shared point and the key stream are secret on every path.
+        wipe(&mut z);
+        wipe(&mut t);
+        result
     }
 }
 
@@ -684,6 +738,32 @@ mod tests {
         let bad =
             Sm2Signature::from_components(sig.r().clone(), sig.s().add(&BoxedUint::from_u64(1)));
         assert!(pk.verify(b"message digest", &bad, DEFAULT_ID).is_err());
+    }
+
+    /// `from_components` accepts arbitrary integers; the re-encoders must
+    /// stay total (widen) rather than panic in `to_be_bytes(32)`, and the
+    /// verifier's range check is what rejects the value.
+    #[test]
+    fn oversize_components_reencode_without_panic() {
+        let wide = BoxedUint::from_be_bytes(&[0xffu8; 40]);
+        let sig = Sm2Signature::from_components(wide.clone(), BoxedUint::from_u64(1));
+        let bytes = sig.to_bytes();
+        assert_eq!(bytes.len(), 40 + 32);
+        assert_eq!(&bytes[..40], &[0xffu8; 40]);
+        #[cfg(feature = "der")]
+        {
+            let der = sig.to_der();
+            let back = Sm2Signature::from_der(&der);
+            // A 40-byte `r` is wider than the group order: strict parse rejects.
+            assert!(back.is_err());
+        }
+        // And the verifier rejects it (r ∉ [1, n-1]).
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-wide", b"n", &[]);
+        let pk = Sm2PrivateKey::generate(&mut rng).public_key();
+        assert!(pk.verify(b"m", &sig, DEFAULT_ID).is_err());
+        let sig = Sm2Signature::from_components(BoxedUint::from_u64(1), wide);
+        assert_eq!(sig.to_bytes().len(), 32 + 40);
+        assert!(pk.verify(b"m", &sig, DEFAULT_ID).is_err());
     }
 
     #[test]

@@ -26,7 +26,7 @@ use alloc::vec::Vec;
 /// when the two were never paired (a signature parsed for one curve and
 /// re-encoded for a narrower one). Widening keeps those re-encoders total; the
 /// verifier's range check is what rejects the value.
-fn enc_len(v: &BoxedUint, len: usize) -> usize {
+pub(crate) fn enc_len(v: &BoxedUint, len: usize) -> usize {
     len.max(v.bit_len().div_ceil(8))
 }
 
