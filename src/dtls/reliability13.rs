@@ -37,7 +37,7 @@
 //!
 //! ```text
 //! // After putting a protected record on the wire:
-//! r13.on_record_sent(InFlightRecord { record_number, datagram }, now);
+//! r13.on_record_sent(InFlightRecord::new(record_number, epoch, fragment), now);
 //!
 //! // When an ACK arrives from the peer:
 //! let acks = ack::decode(body)?;
@@ -47,7 +47,10 @@
 //! if let Some(deadline) = r13.next_timeout() {
 //!     if clock.now() >= deadline {
 //!         match r13.on_timeout(clock.now()) {
-//!             Action::Retransmit => transport.send_all(r13.in_flight_datagrams()),
+//!             Action::Retransmit => {
+//!                 // Re-frame every `r13.in_flight()` record under a FRESH
+//!                 // record number, then `r13.note_resent(idx, new_number)`.
+//!             }
 //!             Action::GiveUp     => return Err(Error::HandshakeTimeout),
 //!             Action::Idle       => {},
 //!         }
@@ -81,11 +84,28 @@ type Instant = Duration;
 /// incoming ACKs) and the original wire bytes (so it can put the record
 /// back on the wire on a timeout).
 pub(crate) struct InFlightRecord {
-    /// (epoch, seq) the receiver will reference in any ACK.
-    pub(crate) record_number: RecordNumber,
-    /// The exact datagram (or single-record slice of one) that was sent;
-    /// resent verbatim on retransmit.
-    pub(crate) datagram: Vec<u8>,
+    /// Every record number this handshake record has been sent under: the
+    /// original first, then one per retransmission. An ACK for ANY of them
+    /// releases the record (RFC 9147 §7: the peer acknowledges whichever
+    /// copy reached it).
+    pub(crate) record_numbers: Vec<RecordNumber>,
+    /// Epoch the record is protected under (0 = plaintext).
+    pub(crate) epoch: u16,
+    /// The handshake fragment bytes (12-byte DTLS header + body). Kept as
+    /// plaintext so a retransmission is re-framed / re-encrypted under a
+    /// FRESH record number — RFC 9147 §4.5.3 forbids reusing one, and the
+    /// peer's replay window would reject a verbatim copy (DTLS-L3).
+    pub(crate) fragment: Vec<u8>,
+}
+
+impl InFlightRecord {
+    pub(crate) fn new(record_number: RecordNumber, epoch: u16, fragment: Vec<u8>) -> Self {
+        Self {
+            record_numbers: alloc::vec![record_number],
+            epoch,
+            fragment,
+        }
+    }
 }
 
 /// DTLS 1.3 retransmit state machine for one endpoint.
@@ -148,7 +168,8 @@ impl Retransmit13 {
         }
         // O(n*m) is fine here: ACK bodies and in-flight sets are both
         // bounded by the number of records in a single flight (a handful).
-        self.in_flight.retain(|r| !acks.contains(&r.record_number));
+        self.in_flight
+            .retain(|r| !r.record_numbers.iter().any(|rn| acks.contains(rn)));
         if self.in_flight.is_empty() {
             self.deadline = None;
             self.timeout = INITIAL_TIMEOUT;
@@ -167,7 +188,7 @@ impl Retransmit13 {
         if self.in_flight.is_empty() {
             return;
         }
-        self.in_flight.retain(|r| r.record_number.epoch != epoch);
+        self.in_flight.retain(|r| r.epoch as u64 != epoch);
         if self.in_flight.is_empty() {
             self.deadline = None;
             self.timeout = INITIAL_TIMEOUT;
@@ -186,7 +207,8 @@ impl Retransmit13 {
     /// - [`Action::Idle`] if no records are in flight, or the caller polled
     ///   before the deadline.
     /// - [`Action::Retransmit`] if the deadline elapsed and attempts remain.
-    ///   The caller resends every byte slice in [`Self::in_flight_datagrams`]
+    ///   The caller re-frames every record in [`Self::in_flight`] under a
+    ///   fresh record number (registering it with [`Self::note_resent`])
     ///   and the next deadline is armed at `now + 2 * previous_timeout`
     ///   (capped at `MAX_TIMEOUT`).
     /// - [`Action::GiveUp`] once `MAX_RETRANSMITS` retransmits have happened
@@ -218,8 +240,27 @@ impl Retransmit13 {
     /// Returns the byte slices of every still-in-flight record. The
     /// caller iterates this on every [`Action::Retransmit`] and puts each
     /// slice back on the wire.
-    pub(crate) fn in_flight_datagrams(&self) -> impl Iterator<Item = &[u8]> {
-        self.in_flight.iter().map(|r| r.datagram.as_slice())
+    pub(crate) fn in_flight(&self) -> &[InFlightRecord] {
+        &self.in_flight
+    }
+
+    /// Records that the in-flight entry at `idx` was just re-sent under
+    /// `record_number`, so a later ACK naming that copy releases it.
+    pub(crate) fn note_resent(&mut self, idx: usize, record_number: RecordNumber) {
+        if let Some(r) = self.in_flight.get_mut(idx) {
+            r.record_numbers.push(record_number);
+        }
+    }
+
+    /// True when nothing is in flight.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.in_flight.is_empty()
+    }
+
+    /// The in-flight fragments, in send order.
+    #[cfg(test)]
+    pub(crate) fn in_flight_fragments(&self) -> impl Iterator<Item = &[u8]> {
+        self.in_flight.iter().map(|r| r.fragment.as_slice())
     }
 
     /// Number of records currently in the in-flight set. Useful for tests
@@ -242,10 +283,20 @@ mod tests {
     use alloc::vec;
 
     fn rec(epoch: u64, seq: u64, datagram: &[u8]) -> InFlightRecord {
-        InFlightRecord {
-            record_number: RecordNumber { epoch, seq },
-            datagram: datagram.to_vec(),
-        }
+        InFlightRecord::new(RecordNumber { epoch, seq }, epoch as u16, datagram.to_vec())
+    }
+
+    /// An ACK naming the record number of a RETRANSMITTED copy releases
+    /// the record just like one naming the original.
+    #[test]
+    fn ack_of_retransmitted_copy_releases_record() {
+        let mut r = Retransmit13::new();
+        r.on_record_sent(rec(2, 0, b"fin"), Duration::from_secs(0));
+        assert_eq!(r.on_timeout(Duration::from_secs(1)), Action::Retransmit);
+        r.note_resent(0, RecordNumber { epoch: 2, seq: 7 });
+        r.on_ack(&[RecordNumber { epoch: 2, seq: 7 }]);
+        assert!(r.is_empty());
+        assert_eq!(r.next_timeout(), None);
     }
 
     #[test]
@@ -289,7 +340,7 @@ mod tests {
         assert!(r.next_timeout().is_some());
 
         // Surviving entries are 10 and 12, in original order.
-        let remaining: Vec<&[u8]> = r.in_flight_datagrams().collect();
+        let remaining: Vec<&[u8]> = r.in_flight_fragments().collect();
         assert_eq!(remaining, vec![b"x".as_slice(), b"z".as_slice()]);
     }
 
@@ -343,7 +394,7 @@ mod tests {
         // At the deadline, Retransmit fires and the in-flight slice is
         // available for the caller to put back on the wire.
         assert_eq!(r.on_timeout(Duration::from_secs(1)), Action::Retransmit);
-        let datagrams: Vec<&[u8]> = r.in_flight_datagrams().collect();
+        let datagrams: Vec<&[u8]> = r.in_flight_fragments().collect();
         assert_eq!(datagrams, vec![b"alpha".as_slice(), b"beta".as_slice()]);
         // Next deadline doubled.
         assert_eq!(r.next_timeout(), Some(Duration::from_secs(3)));
@@ -401,7 +452,7 @@ mod tests {
         r.release_epoch(0);
         assert_eq!(r.in_flight_len(), 2);
         assert!(r.next_timeout().is_some());
-        let remaining: Vec<&[u8]> = r.in_flight_datagrams().collect();
+        let remaining: Vec<&[u8]> = r.in_flight_fragments().collect();
         assert_eq!(remaining, vec![b"enc0".as_slice(), b"enc1".as_slice()]);
 
         // Releasing the remaining epoch drains the set and cancels the timer.

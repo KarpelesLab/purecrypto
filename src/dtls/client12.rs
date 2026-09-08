@@ -48,7 +48,7 @@ use core::time::Duration;
 
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_message};
 use super::record::{self, ParsedDtlsRecord};
-use super::reliability::{Flight, Retransmit};
+use super::reliability::{Flight, FlightRecord, Retransmit};
 use super::replay::AntiReplayWindow;
 use super::system_now;
 
@@ -184,6 +184,11 @@ pub struct DtlsClientConnection12 {
     /// Record-layer sequence numbers. One counter per epoch / direction.
     write_epoch: u16,
     write_seq_in_epoch: u64,
+    /// Record sequence counter for epoch-0 (plaintext) records — kept
+    /// separate from `write_seq_in_epoch` so the ClientKeyExchange and
+    /// ChangeCipherSpec of the final flight can be re-framed after the
+    /// write epoch moved to 1 (RFC 6347 §4.1: one counter per epoch).
+    plain_write_seq: u64,
     read_epoch: u16,
 
     /// Anti-replay window for the current encrypted read epoch.
@@ -288,6 +293,7 @@ impl DtlsClientConnection12 {
             app_in: Vec::new(),
             write_epoch: 0,
             write_seq_in_epoch: 0,
+            plain_write_seq: 0,
             read_epoch: 0,
             replay: AntiReplayWindow::new(),
             x25519,
@@ -320,7 +326,8 @@ impl DtlsClientConnection12 {
         // suite (received in ServerHello) decides between SHA-256 and SHA-384,
         // so we buffer raw bytes and call `set_alg` later.
         let flight = conn.build_client_hello_flight();
-        conn.send_flight(flight);
+        // A plaintext-only flight: framing cannot fail.
+        let _ = conn.send_flight(flight);
         conn
     }
 
@@ -384,8 +391,14 @@ impl DtlsClientConnection12 {
         self.last_now = now;
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
-                for dg in self.retransmit.flight_datagrams() {
-                    self.out_dgrams.push(dg.clone());
+                // Re-frame (and re-encrypt) every record under a fresh
+                // sequence number: the peer's replay window would reject a
+                // verbatim copy of a record it already saw (DTLS-L3).
+                let records = self.retransmit.flight_records().to_vec();
+                for rec in &records {
+                    if let Ok(dg) = self.encode_flight_record(rec) {
+                        self.out_dgrams.push(dg);
+                    }
                 }
                 // A handshake retransmit makes every half-assembled inbound
                 // message stale (the peer resends its whole flight), so
@@ -828,7 +841,7 @@ impl DtlsClientConnection12 {
         self.transcript = Transcript::new();
 
         let flight = self.build_client_hello_flight();
-        self.send_flight(flight);
+        self.send_flight(flight)?;
         // A genuine HVR is now consumed; any subsequent HVR is a duplicate or
         // spoof and must be ignored (handled at the top of this function).
         self.hvr_consumed = true;
@@ -986,8 +999,7 @@ impl DtlsClientConnection12 {
         );
         // Transcript: TLS-shaped (no DTLS headers).
         self.transcript.update(&cke);
-        let cke_dgram = self.wrap_plain_record(ContentType::Handshake, &cke_frag_buf);
-        flight.push(cke_dgram);
+        flight.push_record(ContentType::Handshake, 0, cke_frag_buf);
 
         let cr = self.client_random;
         let sr = self.server_random.ok_or(Error::InappropriateState)?;
@@ -1029,8 +1041,7 @@ impl DtlsClientConnection12 {
         self.read_crypter = Some(read_crypter);
 
         // ChangeCipherSpec — its own DTLS record, plaintext, epoch 0, content_type 20.
-        let ccs_dgram = self.wrap_plain_record(ContentType::ChangeCipherSpec, &[0x01]);
-        flight.push(ccs_dgram);
+        flight.push_record(ContentType::ChangeCipherSpec, 0, alloc::vec![0x01]);
 
         // Bump our write epoch — the next record (Finished) is encrypted
         // under the new write crypter at epoch 1.
@@ -1060,10 +1071,9 @@ impl DtlsClientConnection12 {
             &fin_body,
             DEFAULT_MAX_FRAGMENT,
         );
-        let fin_dgram = self.encrypt_record_dtls(ContentType::Handshake, &fin_frag_buf)?;
-        flight.push(fin_dgram);
+        flight.push_record(ContentType::Handshake, 1, fin_frag_buf);
 
-        self.send_flight(flight);
+        self.send_flight(flight)?;
         self.state = State::WaitServerFinished;
         Ok(())
     }
@@ -1212,27 +1222,40 @@ impl DtlsClientConnection12 {
             &body,
             DEFAULT_MAX_FRAGMENT,
         );
-        let dgram = self.wrap_plain_record(ContentType::Handshake, &frag_buf);
         let mut flight = Flight::new();
-        flight.push(dgram);
+        flight.push_record(ContentType::Handshake, 0, frag_buf);
         flight
     }
 
-    /// Wraps a plaintext fragment in a DTLS record header at the current
-    /// write epoch (must be 0 for plaintext records). Bumps the write
-    /// sequence in the current epoch.
+    /// Wraps a plaintext fragment in an epoch-0 DTLS record header with the
+    /// next epoch-0 sequence number.
     fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         record::write_record(
             &mut out,
             ct,
             ProtocolVersion::DTLSv1_2,
-            self.write_epoch,
-            self.write_seq_in_epoch,
+            0,
+            self.plain_write_seq,
             fragment,
         );
-        self.write_seq_in_epoch += 1;
+        self.plain_write_seq += 1;
         out
+    }
+
+    /// Frames one stored flight record for the wire under a FRESH sequence
+    /// number: plaintext for epoch 0, encrypted under the current write
+    /// crypter otherwise. Used both for the initial send and for every
+    /// retransmission, so a re-sent record is never a byte-for-byte copy
+    /// the peer's replay window would discard (DTLS-L3).
+    fn encode_flight_record(&mut self, rec: &FlightRecord) -> Result<Vec<u8>, Error> {
+        if rec.epoch == 0 {
+            Ok(self.wrap_plain_record(rec.content_type, &rec.plaintext))
+        } else if rec.epoch == self.write_epoch {
+            self.encrypt_record_dtls(rec.content_type, &rec.plaintext)
+        } else {
+            Err(Error::InappropriateState)
+        }
     }
 
     /// Encrypts `payload` under the current write epoch's crypter and wraps
@@ -1262,12 +1285,15 @@ impl DtlsClientConnection12 {
         Ok(out)
     }
 
-    /// Sends each datagram in `flight` and arms the retransmit timer.
-    fn send_flight(&mut self, flight: Flight) {
-        for dg in &flight.datagrams {
-            self.out_dgrams.push(dg.clone());
+    /// Frames and sends each record in `flight`, then arms the retransmit
+    /// timer.
+    fn send_flight(&mut self, flight: Flight) -> Result<(), Error> {
+        for rec in &flight.records {
+            let dg = self.encode_flight_record(rec)?;
+            self.out_dgrams.push(dg);
         }
         self.retransmit.set_flight(flight, self.last_now);
+        Ok(())
     }
 }
 

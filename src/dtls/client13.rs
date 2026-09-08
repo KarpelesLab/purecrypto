@@ -199,6 +199,16 @@ enum State {
     Closed,
 }
 
+/// A write context retired by an epoch change but kept for retransmitting
+/// the records sent under it (see `DtlsClientConnection13::hs_write`).
+struct RetiredWrite {
+    epoch: u16,
+    crypter: RecordCrypter,
+    sn_key: Secret,
+    /// Next sequence number in that epoch.
+    seq: u64,
+}
+
 /// A DTLS 1.3 client connection.
 pub struct DtlsClientConnection13 {
     config: ClientConfig13Internal,
@@ -284,6 +294,12 @@ pub struct DtlsClientConnection13 {
     pending_read_app_crypter: Option<RecordCrypter>,
     /// Application-secret write crypter, parked until our Finished.
     pending_write_app_crypter: Option<RecordCrypter>,
+    /// The epoch-2 (handshake) write context, retained after the switch
+    /// to application keys for as long as our Finished may still have to
+    /// be retransmitted: RFC 9147 §4.2.1 requires a retransmission to use
+    /// the epoch of the original record, and §4.5.3 a fresh record number
+    /// (DTLS-L3). Dropped once the in-flight set drains.
+    hs_write: Option<RetiredWrite>,
     /// Negotiated cipher suite parameters (set when ServerHello arrives).
     suite: Option<SuiteParams>,
     /// `exporter_master_secret` (RFC 8446 §7.5), retained after the
@@ -360,6 +376,7 @@ impl DtlsClientConnection13 {
             write_app_sn_key: None,
             pending_read_app_crypter: None,
             pending_write_app_crypter: None,
+            hs_write: None,
             suite: None,
             exporter_secret: None,
             cert_chain: Vec::new(),
@@ -372,8 +389,8 @@ impl DtlsClientConnection13 {
         // Transcript hash is pinned later once ServerHello arrives — TLS 1.3
         // (and DTLS 1.3) buffer the handshake bytes and only commit to a hash
         // after suite selection.
-        let dgram = conn.build_client_hello();
-        conn.emit_plaintext(dgram);
+        let frag = conn.build_client_hello();
+        conn.emit_plaintext(frag);
         conn
     }
 
@@ -462,9 +479,7 @@ impl DtlsClientConnection13 {
         self.last_now = now;
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
-                for dg in self.retransmit.in_flight_datagrams() {
-                    self.out_dgrams.push(dg.to_vec());
-                }
+                self.retransmit_in_flight();
                 // See the matching comment in the DTLS 1.3 server: a
                 // handshake retransmit makes every half-assembled inbound
                 // message stale, so drop them and with them any poisoned
@@ -482,6 +497,7 @@ impl DtlsClientConnection13 {
                     // lost). Drop the leftover in-flight state and stay
                     // Connected; only an in-progress handshake times out.
                     self.retransmit = Retransmit13::new();
+                    self.hs_write = None;
                 } else {
                     self.state = State::Closed;
                 }
@@ -687,6 +703,10 @@ impl DtlsClientConnection13 {
             ContentType::Unknown(t) if t == ACK_CONTENT_TYPE => {
                 let acks = decode_ack(&plain)?;
                 self.retransmit.on_ack(&acks);
+                if self.retransmit.is_empty() {
+                    // Nothing left to retransmit under the retired keys.
+                    self.hs_write = None;
+                }
             }
             _ => return Err(Error::UnexpectedMessage),
         }
@@ -1001,8 +1021,8 @@ impl DtlsClientConnection13 {
         self.retransmit = Retransmit13::new();
 
         // Build and send CH2 (cookie + narrowed key_share, per HRR).
-        let dgram = self.build_client_hello();
-        self.emit_plaintext(dgram);
+        let frag = self.build_client_hello();
+        self.emit_plaintext(frag);
         Ok(())
     }
 
@@ -1261,10 +1281,20 @@ impl DtlsClientConnection13 {
             &fin_body,
             DEFAULT_MAX_FRAGMENT,
         );
-        let fin_dgram = self.encrypt_protected_record(ContentType::Handshake, &frag_buf)?;
-        self.emit_protected(fin_dgram, true);
+        self.emit_protected_handshake(frag_buf)?;
 
-        // Swap in application keys.
+        // Swap in application keys. The handshake write context is
+        // retired, not dropped: our Finished is still in flight and a
+        // retransmission must be re-encrypted under epoch 2.
+        if let (Some(crypter), Some(sn_key)) = (self.write_crypter.take(), self.write_sn_key.take())
+        {
+            self.hs_write = Some(RetiredWrite {
+                epoch: self.enc_write_epoch,
+                crypter,
+                sn_key,
+                seq: self.enc_write_seq,
+            });
+        }
         self.write_crypter = self.pending_write_app_crypter.take();
         self.read_crypter = self.pending_read_app_crypter.take();
         self.write_sn_key = self.write_app_sn_key.take();
@@ -1373,7 +1403,7 @@ impl DtlsClientConnection13 {
             ch_body,
             DEFAULT_MAX_FRAGMENT,
         );
-        self.wrap_plain_record(ContentType::Handshake, &frag_buf)
+        frag_buf
     }
 
     fn wrap_plain_record(&mut self, ct: ContentType, fragment: &[u8]) -> Vec<u8> {
@@ -1398,9 +1428,6 @@ impl DtlsClientConnection13 {
         ct: ContentType,
         payload: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        // RFC 9147 §4.2.3: the additional data is the unified-header bytes
-        // PRIOR to sequence-number masking. Build the header, compute the
-        // AEAD with that AAD, then compute and apply the sn_mask.
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let crypter = self
             .write_crypter
@@ -1412,101 +1439,99 @@ impl DtlsClientConnection13 {
             .ok_or(Error::InappropriateState)?;
         let epoch = self.enc_write_epoch;
         let seq = self.enc_write_seq;
-        // Refuse to reuse an AEAD nonce: the DTLS 1.3 nonce is `IV XOR seq`, so
-        // cap the per-epoch record count well below the 48-bit field (see
-        // `record::MAX_RECORDS_PER_EPOCH`). Connection-fatal — no rekey path.
-        record::check_seq_cap(seq)?;
+        let wire = encrypt_protected_record_with(suite, crypter, sn_key, epoch, seq, ct, payload)?;
         self.enc_write_seq += 1;
-        // Always emit 16-bit seq + explicit length (the simpler subset).
-        let seq_is_16bit = true;
-        let omit_length = false;
-
-        // Inner = payload || true_content_type (TLS 1.3 InnerPlaintext,
-        // no extra padding).
-        let mut inner = Vec::with_capacity(payload.len() + 1);
-        inner.extend_from_slice(payload);
-        inner.push(ct.as_u8());
-
-        // AAD bytes: encode the header against a placeholder ciphertext
-        // of the known final size, then truncate to the header length.
-        let mut aad = Vec::new();
-        let aad_zero_mask = [0u8; 2];
-        let ct_len = inner.len() + 16;
-        record13::encode_record(
-            &mut aad,
-            epoch,
-            seq,
-            seq_is_16bit,
-            omit_length,
-            &alloc::vec![0u8; ct_len],
-            &aad_zero_mask,
-        )?;
-        let hdr_len = aad.len() - ct_len;
-        aad.truncate(hdr_len);
-
-        encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
-
-        // Compute sn_mask over the first 16 bytes of ciphertext+tag and
-        // emit the on-wire record with the masked seq.
-        let mask_full = sn_mask_for(suite, sn_key.as_slice(), &inner)?;
-        let mask: &[u8] = if seq_is_16bit {
-            &mask_full[..2]
-        } else {
-            &mask_full[..1]
-        };
-        let mut wire = Vec::new();
-        record13::encode_record(
-            &mut wire,
-            epoch,
-            seq,
-            seq_is_16bit,
-            omit_length,
-            &inner,
-            mask,
-        )?;
         Ok(wire)
     }
 
-    /// Pushes a freshly-built plaintext datagram to the outbound queue and
-    /// registers it with the retransmit machine at the current epoch's
-    /// `(epoch, seq)` (we use seq-1 because we just bumped).
-    fn emit_plaintext(&mut self, datagram: Vec<u8>) {
-        let seq = self.plain_write_seq.saturating_sub(1);
+    /// Frames `fragment` as a plaintext (epoch 0) handshake record, sends
+    /// it and registers it with the retransmit machine.
+    fn emit_plaintext(&mut self, fragment: Vec<u8>) {
+        let datagram = self.wrap_plain_record(ContentType::Handshake, &fragment);
         let record_number = RecordNumber {
             epoch: self.plain_write_epoch as u64,
-            seq,
+            seq: self.plain_write_seq.saturating_sub(1),
         };
-        // Push to output and to in-flight set.
-        self.out_dgrams.push(datagram.clone());
+        self.out_dgrams.push(datagram);
         self.retransmit.on_record_sent(
-            InFlightRecord {
-                record_number,
-                datagram,
-            },
+            InFlightRecord::new(record_number, self.plain_write_epoch, fragment),
             self.last_now,
         );
     }
 
-    /// Pushes a freshly-built protected datagram. If `track` is true, the
-    /// record is registered with the retransmit machine (handshake records).
-    /// Application records do not get retransmitted.
-    fn emit_protected(&mut self, datagram: Vec<u8>, track: bool) {
-        if track {
-            let seq = self.enc_write_seq.saturating_sub(1);
-            let record_number = RecordNumber {
-                epoch: self.enc_write_epoch as u64,
-                seq,
+    /// Encrypts `fragment` as a handshake record under the current write
+    /// epoch, sends it and registers it with the retransmit machine.
+    /// (Application records are never retransmitted and bypass this.)
+    fn emit_protected_handshake(&mut self, fragment: Vec<u8>) -> Result<(), Error> {
+        let datagram = self.encrypt_protected_record(ContentType::Handshake, &fragment)?;
+        let record_number = RecordNumber {
+            epoch: self.enc_write_epoch as u64,
+            seq: self.enc_write_seq.saturating_sub(1),
+        };
+        self.out_dgrams.push(datagram);
+        self.retransmit.on_record_sent(
+            InFlightRecord::new(record_number, self.enc_write_epoch, fragment),
+            self.last_now,
+        );
+        Ok(())
+    }
+
+    /// Re-frames every in-flight handshake record under a FRESH record
+    /// number — plaintext for epoch 0, re-encrypted under the epoch's keys
+    /// otherwise — and registers the new number so the peer's ACK for
+    /// this copy releases the record (RFC 9147 §4.5.3 / §7; DTLS-L3).
+    fn retransmit_in_flight(&mut self) {
+        for i in 0..self.retransmit.in_flight().len() {
+            let (epoch, fragment) = {
+                let r = &self.retransmit.in_flight()[i];
+                (r.epoch, r.fragment.clone())
             };
-            self.out_dgrams.push(datagram.clone());
-            self.retransmit.on_record_sent(
-                InFlightRecord {
-                    record_number,
-                    datagram,
-                },
-                self.last_now,
-            );
-        } else {
-            self.out_dgrams.push(datagram);
+            let framed = if epoch == self.plain_write_epoch {
+                let dg = self.wrap_plain_record(ContentType::Handshake, &fragment);
+                let rn = RecordNumber {
+                    epoch: epoch as u64,
+                    seq: self.plain_write_seq.saturating_sub(1),
+                };
+                Ok((dg, rn))
+            } else if epoch == self.enc_write_epoch {
+                self.encrypt_protected_record(ContentType::Handshake, &fragment)
+                    .map(|dg| {
+                        let rn = RecordNumber {
+                            epoch: epoch as u64,
+                            seq: self.enc_write_seq.saturating_sub(1),
+                        };
+                        (dg, rn)
+                    })
+            } else if let (Some(suite), Some(ctx)) = (self.suite, self.hs_write.as_mut())
+                && ctx.epoch == epoch
+            {
+                let seq = ctx.seq;
+                encrypt_protected_record_with(
+                    suite,
+                    &mut ctx.crypter,
+                    &ctx.sn_key,
+                    epoch,
+                    seq,
+                    ContentType::Handshake,
+                    &fragment,
+                )
+                .map(|dg| {
+                    ctx.seq += 1;
+                    (
+                        dg,
+                        RecordNumber {
+                            epoch: epoch as u64,
+                            seq,
+                        },
+                    )
+                })
+            } else {
+                Err(Error::InappropriateState)
+            };
+            if let Ok((dg, rn)) = framed {
+                self.out_dgrams.push(dg);
+                self.retransmit.note_resent(i, rn);
+            }
         }
     }
 
@@ -1583,6 +1608,78 @@ pub(crate) fn derive_sn_key(hash: HashAlg, secret: &Secret, len: usize) -> Secre
     let key = Secret::new(&out);
     crate::tls::conn::wipe(&mut out);
     key
+}
+
+/// Encrypts and frames one protected DTLS 1.3 record under an explicit
+/// write context `(crypter, sn_key, epoch, seq)`. Shared by both engines
+/// and by the retransmit path, which must re-encrypt a retired epoch's
+/// records with that epoch's keys (RFC 9147 §4.2.1) under a fresh `seq`.
+/// The caller owns the sequence counter and must advance it on success.
+///
+/// RFC 9147 §4.2.3: the additional data is the unified-header bytes PRIOR
+/// to sequence-number masking. Build the header, compute the AEAD with
+/// that AAD, then compute and apply the sn_mask.
+pub(crate) fn encrypt_protected_record_with(
+    suite: SuiteParams,
+    crypter: &mut RecordCrypter,
+    sn_key: &Secret,
+    epoch: u16,
+    seq: u64,
+    ct: ContentType,
+    payload: &[u8],
+) -> Result<Vec<u8>, Error> {
+    // Refuse to reuse an AEAD nonce: the DTLS 1.3 nonce is `IV XOR seq`, so
+    // cap the per-epoch record count well below the 48-bit field (see
+    // `record::MAX_RECORDS_PER_EPOCH`). Connection-fatal — no rekey path.
+    record::check_seq_cap(seq)?;
+    // Always emit 16-bit seq + explicit length (the simpler subset).
+    let seq_is_16bit = true;
+    let omit_length = false;
+
+    // Inner = payload || true_content_type (TLS 1.3 InnerPlaintext,
+    // no extra padding).
+    let mut inner = Vec::with_capacity(payload.len() + 1);
+    inner.extend_from_slice(payload);
+    inner.push(ct.as_u8());
+
+    // AAD bytes: encode the header against a placeholder ciphertext
+    // of the known final size, then truncate to the header length.
+    let mut aad = Vec::new();
+    let aad_zero_mask = [0u8; 2];
+    let ct_len = inner.len() + 16;
+    record13::encode_record(
+        &mut aad,
+        epoch,
+        seq,
+        seq_is_16bit,
+        omit_length,
+        &alloc::vec![0u8; ct_len],
+        &aad_zero_mask,
+    )?;
+    let hdr_len = aad.len() - ct_len;
+    aad.truncate(hdr_len);
+
+    encrypt_dtls13_record(crypter, seq, &aad, &mut inner)?;
+
+    // Compute sn_mask over the first 16 bytes of ciphertext+tag and
+    // emit the on-wire record with the masked seq.
+    let mask_full = sn_mask_for(suite, sn_key.as_slice(), &inner)?;
+    let mask: &[u8] = if seq_is_16bit {
+        &mask_full[..2]
+    } else {
+        &mask_full[..1]
+    };
+    let mut wire = Vec::new();
+    record13::encode_record(
+        &mut wire,
+        epoch,
+        seq,
+        seq_is_16bit,
+        omit_length,
+        &inner,
+        mask,
+    )?;
+    Ok(wire)
 }
 
 /// Sequence-number key length for the given AEAD, per RFC 9147 §4.2.3:

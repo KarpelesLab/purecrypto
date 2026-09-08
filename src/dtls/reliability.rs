@@ -44,6 +44,7 @@
 //!
 //! Consumed by the DTLS 1.2 client / server state machines.
 
+use crate::tls::ContentType;
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -70,33 +71,58 @@ type Instant = Duration;
 /// One flight worth of datagrams to retransmit. Each entry is one full
 /// DTLS record (record header + protected fragment) ready to put on the
 /// wire — the reliability layer does not look inside.
+/// One record of a flight, kept as PLAINTEXT plus the epoch it belongs
+/// to, so a retransmission can be re-framed — and, for a protected epoch,
+/// re-encrypted — under a FRESH record sequence number.
+///
+/// Re-emitting the stored wire bytes verbatim (same epoch/seq) is what an
+/// earlier version did; the peer's anti-replay window then rejected every
+/// retransmission of a record it had already seen once, which made a lost
+/// final flight unrecoverable (RFC 6347 §4.1.2.6 requires a new sequence
+/// number per transmitted record — DTLS-L3).
+#[derive(Clone)]
+pub(crate) struct FlightRecord {
+    pub(crate) content_type: ContentType,
+    pub(crate) epoch: u16,
+    pub(crate) plaintext: Vec<u8>,
+}
+
 #[derive(Default)]
 pub(crate) struct Flight {
-    pub(crate) datagrams: Vec<Vec<u8>>,
+    pub(crate) records: Vec<FlightRecord>,
 }
 
 impl Flight {
     /// Creates an empty flight.
     pub(crate) fn new() -> Self {
         Self {
-            datagrams: Vec::new(),
+            records: Vec::new(),
         }
     }
 
     /// Appends a single datagram to this flight.
-    pub(crate) fn push(&mut self, datagram: Vec<u8>) {
-        self.datagrams.push(datagram);
+    pub(crate) fn push_record(
+        &mut self,
+        content_type: ContentType,
+        epoch: u16,
+        plaintext: Vec<u8>,
+    ) {
+        self.records.push(FlightRecord {
+            content_type,
+            epoch,
+            plaintext,
+        });
     }
 
     /// Returns `true` if the flight contains no datagrams.
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.datagrams.is_empty()
+        self.records.is_empty()
     }
 
     /// Drops all datagrams.
     pub(crate) fn clear(&mut self) {
-        self.datagrams.clear();
+        self.records.clear();
     }
 }
 
@@ -198,8 +224,8 @@ impl Retransmit {
 
     /// Returns the datagrams of the last-sent flight. The caller resends
     /// every entry on a `Retransmit` action.
-    pub(crate) fn flight_datagrams(&self) -> &[Vec<u8>] {
-        &self.last_flight.datagrams
+    pub(crate) fn flight_records(&self) -> &[FlightRecord] {
+        &self.last_flight.records
     }
 }
 
@@ -217,7 +243,7 @@ mod tests {
     fn flight_of(datagrams: &[&[u8]]) -> Flight {
         let mut f = Flight::new();
         for d in datagrams {
-            f.push(d.to_vec());
+            f.push_record(ContentType::Handshake, 0, d.to_vec());
         }
         f
     }
@@ -288,7 +314,7 @@ mod tests {
         assert!(r.next_timeout().is_some());
         r.on_peer_response();
         assert_eq!(r.next_timeout(), None);
-        assert!(r.flight_datagrams().is_empty());
+        assert!(r.flight_records().is_empty());
     }
 
     #[test]
@@ -317,16 +343,18 @@ mod tests {
         let dg1: Vec<u8> = vec![0x16, 0xfe, 0xfd, 0xaa];
         let dg2: Vec<u8> = vec![0x16, 0xfe, 0xfd, 0xbb];
         let mut flight = Flight::new();
-        flight.push(dg1.clone());
-        flight.push(dg2.clone());
+        flight.push_record(ContentType::Handshake, 0, dg1.clone());
+        flight.push_record(ContentType::Handshake, 1, dg2.clone());
 
         let mut r = Retransmit::new();
         r.set_flight(flight, Duration::from_secs(0));
         assert_eq!(r.on_timeout(Duration::from_secs(1)), Action::Retransmit);
-        let out = r.flight_datagrams();
+        let out = r.flight_records();
         assert_eq!(out.len(), 2);
-        assert_eq!(&out[0], &dg1);
-        assert_eq!(&out[1], &dg2);
+        assert_eq!(&out[0].plaintext, &dg1);
+        assert_eq!(out[0].epoch, 0);
+        assert_eq!(&out[1].plaintext, &dg2);
+        assert_eq!(out[1].epoch, 1);
     }
 
     #[test]
@@ -344,7 +372,7 @@ mod tests {
     fn flight_helpers() {
         let mut f = Flight::new();
         assert!(f.is_empty());
-        f.push(vec![1, 2, 3]);
+        f.push_record(ContentType::Handshake, 0, vec![1, 2, 3]);
         assert!(!f.is_empty());
         f.clear();
         assert!(f.is_empty());

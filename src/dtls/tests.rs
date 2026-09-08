@@ -1446,12 +1446,15 @@ mod dtls13 {
             retransmitted.len(),
             s1.len()
         );
-        // Sanity: at least one of the retransmitted bytes matches the
-        // dropped record (it's the only one still in the in-flight set).
-        let contains_dropped = retransmitted.iter().any(|dg| dg == &dropped);
-        assert!(
-            contains_dropped,
-            "retransmitted set should include the dropped server Finished"
+        // Exactly the dropped server Finished is re-sent — re-encrypted
+        // under a FRESH record number (RFC 9147 §4.5.3), so it is the same
+        // size as the original but never a byte-for-byte copy (which the
+        // client's replay window would have discarded — DTLS-L3).
+        assert_eq!(retransmitted.len(), 1);
+        assert_eq!(retransmitted[0].len(), dropped.len());
+        assert_ne!(
+            retransmitted[0], dropped,
+            "retransmit reused the record number"
         );
         // Deliver the retransmit and finish the handshake.
         for dg in &retransmitted {
@@ -3641,7 +3644,7 @@ mod audit_2026_09 {
         let s_final = server.pop_outbound_datagrams();
         assert!(server.is_handshake_complete());
         assert_eq!(s_final.len(), 2, "CCS + Finished");
-        drop(s_final); // lost on the wire
+        // ...lost on the wire (kept only to compare record headers below).
 
         // Client timer fires → its flight is retransmitted.
         let t = client.next_timeout().expect("client flight armed");
@@ -3653,6 +3656,19 @@ mod audit_2026_09 {
         }
         let s_retx = server.pop_outbound_datagrams();
         assert_eq!(s_retx.len(), 2, "server must re-send CCS + Finished");
+        // Fresh record sequence numbers (RFC 6347 §4.1.2.6): the header's
+        // 48-bit seq (bytes 5..11) must differ from the originals'.
+        assert_ne!(&s_retx[0][5..11], &s_final[0][5..11], "CCS reused its seq");
+        assert_ne!(
+            &s_retx[1][5..11],
+            &s_final[1][5..11],
+            "Finished reused its seq"
+        );
+        assert_eq!(
+            &s_retx[1][3..5],
+            &s_final[1][3..5],
+            "Finished must stay in epoch 1"
+        );
         for dg in &s_retx {
             client.feed_datagram(dg).unwrap();
         }
@@ -3711,6 +3727,97 @@ mod audit_2026_09 {
         }
         assert!(resends > 0 && resends < 20, "resends = {resends}");
         assert!(server.is_handshake_complete());
+    }
+
+    /// DTLS 1.3: the client's Finished (epoch 2) is lost AFTER the client
+    /// switched its write keys to epoch 3. The retransmission must be
+    /// re-encrypted under the retained epoch-2 keys with a fresh record
+    /// number (RFC 9147 §4.2.1 / §4.5.3); the server then completes and
+    /// its ACK for the re-sent copy releases the client's in-flight set.
+    #[test]
+    fn lost_client_finished_is_recovered_13() {
+        let (server_cfg, cert) = make_server13_local();
+        let server_cfg = server_cfg.with_no_cookie();
+        let mut client = client13(client13_cfg(&cert), b"l3c-client");
+        let mut server = server13(server_cfg, b"l3c-server");
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(client.is_handshake_complete());
+        // Client output: ACKs + its Finished. Drop it all.
+        let lost = client.pop_outbound_datagrams();
+        assert!(!lost.is_empty());
+        assert!(!server.is_handshake_complete());
+
+        let t = client.next_timeout().expect("Finished in flight");
+        client.on_timeout(t);
+        let retx = client.pop_outbound_datagrams();
+        assert_eq!(retx.len(), 1, "only the Finished is retransmitted");
+        let fin_original = lost
+            .iter()
+            .find(|dg| dg.len() == retx[0].len())
+            .expect("Finished");
+        assert_ne!(
+            &retx[0], fin_original,
+            "retransmit reused the record number"
+        );
+        for dg in &retx {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            server.is_handshake_complete(),
+            "server must accept the re-encrypted Finished"
+        );
+        // The server's ACK names the re-sent copy; it must release it.
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(
+            client.next_timeout().is_none(),
+            "ACK of the re-sent copy must disarm the timer"
+        );
+        app_data_round_trip(&mut client, &mut server);
+    }
+
+    /// DTLS 1.2: the client's final flight (CKE + CCS + Finished) is lost;
+    /// the timer-driven retransmission carries fresh epoch-0 sequence
+    /// numbers for CKE/CCS and a fresh epoch-1 number for Finished, and
+    /// the server completes on it.
+    #[test]
+    fn lost_client_final_flight_is_recovered_12() {
+        let (server_cfg, cert) = make_server();
+        let server_cfg = server_cfg.require_cookie_exchange(false);
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"l3d-server", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+        for dg in &client.pop_outbound_datagrams() {
+            server.feed_datagram(dg).unwrap();
+        }
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        let lost = client.pop_outbound_datagrams();
+        assert_eq!(lost.len(), 3, "CKE + CCS + Finished");
+        let t = client.next_timeout().expect("flight armed");
+        client.on_timeout(t);
+        let retx = client.pop_outbound_datagrams();
+        assert_eq!(retx.len(), 3);
+        for (a, b) in retx.iter().zip(lost.iter()) {
+            assert_eq!(&a[3..5], &b[3..5], "epoch must be preserved");
+            assert_ne!(&a[5..11], &b[5..11], "record seq must be fresh");
+        }
+        for dg in &retx {
+            server.feed_datagram(dg).unwrap();
+        }
+        assert!(server.is_handshake_complete());
+        for dg in &server.pop_outbound_datagrams() {
+            client.feed_datagram(dg).unwrap();
+        }
+        assert!(client.is_handshake_complete());
     }
 
     // -----------------------------------------------------------------
