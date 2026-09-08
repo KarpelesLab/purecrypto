@@ -372,9 +372,23 @@ impl<C: BlockCipher> Gcm<C> {
 
     /// Verifies `tag` and, only if it matches, decrypts `buffer` in place.
     ///
-    /// The tag is checked in constant time. On mismatch the ciphertext is
-    /// **left untouched** (no unauthenticated plaintext is produced) and
-    /// [`TagMismatch`] is returned.
+    /// The tag is checked in constant time. On mismatch [`TagMismatch`] is
+    /// returned and `buffer` holds the original ciphertext on return.
+    ///
+    /// How that is achieved depends on the code path. The portable two-pass
+    /// implementation hashes first and never touches `buffer` unless the tag
+    /// matched. The fused AES-NI + PCLMULQDQ path (the default on x86_64 with
+    /// `std`) decrypts *while* it hashes, so the full buffer is decrypted in
+    /// place first and a second CTR pass re-encrypts it when the tag turns out
+    /// to be wrong.
+    ///
+    /// The consequence is that on that path unauthenticated plaintext genuinely
+    /// exists in `buffer` between those two passes. That is invisible to a
+    /// caller that owns the buffer, but it is observable — and therefore a
+    /// real leak — if `buffer` aliases memory another party can read
+    /// concurrently (a `MAP_SHARED` mapping, an `io_uring`/DMA region), and
+    /// the restoring pass does not run if a panic unwinds between them.
+    /// Decrypt into private memory and copy out after `Ok`.
     ///
     /// # Panics
     /// Panics if `nonce.is_empty()` or `buffer.len()` exceeds the NIST cap.
