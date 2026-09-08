@@ -33,7 +33,7 @@ use crate::pki::{
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{
-    Args, SentinelLock, atomic_overwrite, die, reject_symlink, write_new_file, write_output,
+    Args, SentinelLock, atomic_overwrite, die, open_nofollow, write_new_file, write_output,
     write_output_with_mode,
 };
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed448PrivateKey, Ed25519PrivateKey};
@@ -114,17 +114,19 @@ fn replace_state_file(path: &Path, data: &str) {
 }
 
 /// Appends one ledger row. Append mode is the one open that *does* follow a
-/// symlink, so the path is screened first; the file itself is created by
-/// `ca init` with `create_new`, and re-created the same way if it is missing.
+/// symlink, so the open goes through `open_nofollow` (kernel-enforced
+/// `O_NOFOLLOW` plus a regular-file check on the opened descriptor — a bare
+/// pre-check would leave a swap-the-link race); the file itself is created
+/// by `ca init` with `create_new`, and re-created the same way if it is
+/// missing.
 fn append_line(path: &Path, line: &str) {
     use std::io::Write;
-    reject_symlink(path);
     if !path.exists() {
         write_new_file(path, b"", CA_STATE_MODE);
     }
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true);
+    let mut f = open_nofollow(&mut opts, path)
         .unwrap_or_else(|e| die(format!("cannot open {}: {e}", path.display())));
     writeln!(f, "{line}").unwrap_or_else(|e| die(format!("cannot write {}: {e}", path.display())));
 }

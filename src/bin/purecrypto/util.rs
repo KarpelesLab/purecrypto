@@ -349,6 +349,86 @@ pub(crate) fn reject_symlink(path: &std::path::Path) {
     }
 }
 
+/// The platform's `O_NOFOLLOW` open flag, or `None` where its value is not
+/// known here (the caller then relies on [`reject_symlink`] alone). Kept as
+/// literals so the CLI stays free of a `libc` dependency; the values are the
+/// kernels' ABI constants, which do not change.
+#[cfg(unix)]
+fn o_nofollow() -> Option<i32> {
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos"
+    ))]
+    {
+        Some(0o400000)
+    }
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        Some(0x0100)
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "solaris",
+        target_os = "illumos",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        None
+    }
+}
+
+/// Opens `path` with `opts` while refusing to write through a symbolic link.
+///
+/// [`reject_symlink`] alone is a check-then-use race: an attacker who can
+/// swap the path between the `lstat` and the `open` still gets the write
+/// redirected. So on the Unix platforms whose `O_NOFOLLOW` value is known
+/// the flag is passed to the kernel (the open itself fails with `ELOOP` on a
+/// link), and afterwards the *opened* descriptor is checked to be a regular
+/// file — which also catches a FIFO or device planted at the path. The
+/// pre-check stays as the portable first line and for clearer diagnostics.
+pub(crate) fn open_nofollow(
+    opts: &mut std::fs::OpenOptions,
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    reject_symlink(path);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(flag) = o_nofollow() {
+            opts.custom_flags(flag);
+        }
+    }
+    let f = opts.open(path)?;
+    if !f.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    Ok(f)
+}
+
 /// Atomically replaces `path`'s contents with `data` (write a sibling temp
 /// file, fsync, rename over the original, then fsync the containing
 /// directory). The temp file is created with the explicit Unix `mode`.
@@ -560,6 +640,12 @@ pub(crate) fn load_cert_chain(path: &str) -> Vec<Vec<u8>> {
 /// Opens `path` as the destination for an NSS `SSLKEYLOGFILE` dump. Unix mode
 /// `0o600`, append-only — multiple connections in the same process append to
 /// the same file. Shared by the TLS and QUIC drivers.
+///
+/// The file receives every traffic secret of the session, so it is opened
+/// without following symlinks (see [`open_nofollow`]) and, on Unix, a
+/// pre-existing file that is group- or world-accessible is refused rather
+/// than silently appended to — `mode(0o600)` only governs *creation*, and a
+/// permissive file someone else planted would hand them the secrets.
 pub(crate) fn open_keylog(path: &str) -> std::sync::Arc<dyn purecrypto::tls::KeyLog> {
     use std::fs::OpenOptions;
     #[cfg(unix)]
@@ -569,8 +655,22 @@ pub(crate) fn open_keylog(path: &str) -> std::sync::Arc<dyn purecrypto::tls::Key
     opts.create(true).append(true);
     #[cfg(unix)]
     opts.mode(0o600);
-    let f = opts
-        .open(path)
+    let f = open_nofollow(&mut opts, std::path::Path::new(path))
         .unwrap_or_else(|e| die(format!("cannot open keylog {path}: {e}")));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let mode = f
+            .metadata()
+            .unwrap_or_else(|e| die(format!("cannot stat keylog {path}: {e}")))
+            .mode()
+            & 0o777;
+        if mode & 0o077 != 0 {
+            die(format!(
+                "refusing to write TLS secrets to {path}: it is group/other-accessible \
+                 (mode {mode:o}); `chmod 600 {path}` or point -keylogfile at a new file"
+            ));
+        }
+    }
     std::sync::Arc::new(purecrypto::tls::WriterKeyLog::new(f))
 }

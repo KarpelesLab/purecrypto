@@ -1318,6 +1318,144 @@ fn s_client_reports_truncation_without_close_notify() {
     );
 }
 
+/// FC-5: `-keylogfile` receives every traffic secret, so a pre-existing
+/// group/world-readable file is refused rather than appended to (the
+/// `0600` mode only governs creation). The keylog is opened before the
+/// TCP connect, so the unreachable port is never touched.
+#[cfg(unix)]
+#[test]
+fn s_client_refuses_world_readable_keylog() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("pc_cli_keylog_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("keys.log");
+    std::fs::write(&log, "").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            "127.0.0.1:1",
+            "-insecure",
+            "-keylogfile",
+            log.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(!ok, "s_client must refuse a permissive keylog: {err}");
+    assert!(
+        err.contains("group/other-accessible"),
+        "expected the keylog permission refusal, got: {err:?}"
+    );
+
+    // A symlink at the keylog path is refused too (O_NOFOLLOW).
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "").unwrap();
+    std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = dir.join("link.log");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "s_client",
+            "-connect",
+            "127.0.0.1:1",
+            "-insecure",
+            "-keylogfile",
+            link.to_str().unwrap(),
+        ],
+        b"",
+    );
+    assert!(!ok, "s_client must refuse a symlinked keylog: {err}");
+    assert!(
+        err.contains("symbolic link") || err.contains("cannot open keylog"),
+        "expected the symlink refusal, got: {err:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// FC-4: the `issued.jsonl` ledger is opened in append mode, the one open
+/// that follows symlinks. A link planted at the path after `ca init` must
+/// be refused (kernel `O_NOFOLLOW` + regular-file check on the opened
+/// descriptor), and the link target left untouched.
+#[cfg(unix)]
+#[test]
+fn ca_issue_refuses_symlinked_ledger() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_ledger_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let ca = dir.join("ca");
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "ca",
+                "init",
+                "-dir",
+                ca.to_str().unwrap(),
+                "-cn",
+                "Ledger CA"
+            ],
+            b""
+        )
+        .1,
+        "ca init failed"
+    );
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key"),
+            ],
+            b""
+        )
+        .1,
+        "genpkey failed"
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok, "pkey -pubout failed");
+    std::fs::write(dir.join("leaf.pub"), pubkey_pem).unwrap();
+
+    // Swap the ledger for a symlink to a file the CA must not touch.
+    let victim = dir.join("victim.txt");
+    std::fs::write(&victim, "important\n").unwrap();
+    let ledger = ca.join("issued.jsonl");
+    let _ = std::fs::remove_file(&ledger);
+    std::os::unix::fs::symlink(&victim, &ledger).unwrap();
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            ca.to_str().unwrap(),
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "host.example",
+            "-out",
+            &p("leaf.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "ca issue must refuse the symlinked ledger: {err}");
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "important\n",
+        "ca issue wrote through the symlink"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// s_client and s_server round-trip over a local TCP port, exercising
 /// ALPN negotiation and `-keylogfile` capture (NSS `SSLKEYLOGFILE`
 /// format).
