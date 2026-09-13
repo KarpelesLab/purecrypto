@@ -24,6 +24,11 @@
 //!   scalar type**, also re-exported by [`crate::ec::ristretto255`].
 //! - [`EdwardsPoint`] — a point on edwards25519 in the full group (cofactor 8),
 //!   with RFC 8032 32-byte compression.
+#![cfg_attr(
+    not(feature = "ristretto255"),
+    doc = "",
+    doc = "[`crate::ec::ristretto255`]: crate"
+)]
 
 use crate::ct::{Choice, ConstantTimeEq, ConstantTimeLess};
 use crate::ec::curve25519::field::{Field, ScalarInt};
@@ -41,6 +46,11 @@ use crate::ec::curve25519::scalar::{
 ///
 /// Because the value is zeroized on drop, `Scalar` is [`Clone`] but not
 /// `Copy`; pass it by reference or clone it explicitly.
+#[cfg_attr(
+    not(feature = "ristretto255"),
+    doc = "",
+    doc = "[`crate::ec::ristretto255`]: crate"
+)]
 #[derive(Clone)]
 pub struct Scalar(pub(crate) ScalarInt);
 
