@@ -145,6 +145,38 @@ fn validate_private_components<const LIMBS: usize>(
     Ok(())
 }
 
+/// Validates that `d` really inverts `e` in both prime fields:
+/// `e·(d mod (p−1)) ≡ 1 (mod p−1)` and likewise for `q` (RFC 8017 §3.2) —
+/// the relation the CRT recombination depends on. A `d` that violates it
+/// (corrupted key file, fault-injected blob) otherwise produces wrong
+/// signatures whose halves can reveal a factor of `n`.
+///
+/// The products are computed with `mul_wide`; if the high half is non-zero
+/// the operands are too wide for the fixed-width reduction to check (only
+/// possible for a pathological key whose "prime" is nearly the width of `n`,
+/// which `validate_private_components` has already tied to `p · q = n`), and
+/// the check is skipped rather than rejecting a key it cannot evaluate.
+fn validate_crt_consistency<const LIMBS: usize>(
+    e: &Uint<LIMBS>,
+    d: &Uint<LIMBS>,
+    p: &Uint<LIMBS>,
+    q: &Uint<LIMBS>,
+) -> Result<(), Error> {
+    let one = Uint::<LIMBS>::ONE;
+    for prime in [p, q] {
+        let pm1 = prime.wrapping_sub(&one);
+        let dx = d.reduce(&pm1);
+        let (lo, hi) = e.reduce(&pm1).mul_wide(&dx);
+        if !bool::from(hi.ct_eq(&Uint::<LIMBS>::ZERO)) {
+            continue; // not checkable at this width; see the doc comment
+        }
+        if !bool::from(lo.reduce(&pm1).ct_eq(&one)) {
+            return Err(Error::Malformed);
+        }
+    }
+    Ok(())
+}
+
 impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// Encodes the key as a PKCS#1 `RSAPublicKey` DER structure.
     pub fn to_pkcs1_der(&self) -> Vec<u8> {
@@ -293,7 +325,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// - `p = q` (resulting in a non-coprime `qInv`),
     /// - `p · q ≠ n` (corruption / fault injection — without this check, the
     ///   CRT recombination path silently produces wrong signatures and can
-    ///   leak `d` mod one factor).
+    ///   leak `d` mod one factor),
+    /// - a `d` that does not invert `e` in either prime field
+    ///   (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`).
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, Error> {
         let mut reader = Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -312,6 +346,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         validate_public_exponent(&n, &e)?;
         validate_private_exponent(&n, &d)?;
         validate_private_components(&n, &p, &q)?;
+        validate_crt_consistency(&e, &d, &p, &q)?;
         Ok(RsaPrivateKey::from_raw_parts(n, e, d, p, q))
     }
 
@@ -716,10 +751,12 @@ mod tests {
         ));
     }
 
-    /// Builds a structurally consistent (`p · q = n`, both odd and `> 1`)
-    /// PKCS#1 private-key blob with a modulus of roughly `2 × half_bits`
-    /// bits from two arbitrary odd half-width factors — primality is
-    /// irrelevant to the width gate under test. `d = e = 65537`.
+    /// Builds a structurally consistent (`p · q = n`, both odd and `> 1`,
+    /// `e·d ≡ 1` in both prime fields) PKCS#1 private-key blob with a modulus
+    /// of roughly `2 × half_bits` bits from two arbitrary odd half-width
+    /// factors — primality is irrelevant to the width gate under test, but
+    /// `d` must invert `e` mod `p−1` and `q−1` or the parser's CRT
+    /// consistency check rejects the blob before the width gate.
     fn synthetic_private_der(half_bits: usize) -> Vec<u8> {
         let half_bytes = half_bits.div_ceil(8);
         let mut p_raw = alloc::vec![0x5au8; half_bytes];
@@ -730,15 +767,28 @@ mod tests {
         q_raw[half_bytes - 1] |= 0x01;
         let p = Uint::<32>::from_be_bytes(&p_raw);
         let q = Uint::<32>::from_be_bytes(&q_raw);
-        let (n, hi) = p.mul_wide(&q);
-        assert_eq!(hi, Uint::<32>::ZERO);
         let e = Uint::<32>::from_u64(65537);
+        // `d = e^-1 mod (p−1)(q−1)` satisfies the parser's per-prime check.
+        // Nudge `p` upward (staying odd) until `e` is invertible mod φ.
+        let (p, q, n, d) = {
+            let one = Uint::<32>::ONE;
+            let mut p = p;
+            loop {
+                let (n, hi) = p.mul_wide(&q);
+                assert_eq!(hi, Uint::<32>::ZERO);
+                let phi = p.wrapping_sub(&one).mul_wide(&q.wrapping_sub(&one)).0;
+                if let Some(d) = crate::bignum::inv_mod(&e, &phi) {
+                    break (p, q, n, d);
+                }
+                p = p.wrapping_add(&Uint::<32>::from_u64(2));
+            }
+        };
         encode_sequence(
             &[
                 encode_integer(&[0]),
                 encode_integer(&uint_be(&n)),
                 encode_integer(&uint_be(&e)),
-                encode_integer(&uint_be(&e)), // d
+                encode_integer(&uint_be(&d)),
                 encode_integer(&uint_be(&p)),
                 encode_integer(&uint_be(&q)),
                 encode_integer(&[1]),
@@ -747,6 +797,45 @@ mod tests {
             ]
             .concat(),
         )
+    }
+
+    /// A `d` that does not invert `e` in the prime fields is refused at parse
+    /// time: the CRT recombination assumes `e·dP ≡ 1 mod p−1` (and the same
+    /// for `q`), and a key that violates it emits wrong signatures whose
+    /// halves can reveal a factor of `n`.
+    #[test]
+    fn const_generic_parser_rejects_inconsistent_private_exponent() {
+        // Take a valid blob and bump `d` by 2 (keeping every other field).
+        let der = synthetic_private_der(1024);
+        let mut reader = Reader::new(&der);
+        let mut seq = reader.read_sequence().unwrap();
+        let _ = seq.read_integer_bytes().unwrap();
+        let n = int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap()).unwrap();
+        let e = int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap()).unwrap();
+        let d = int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap()).unwrap();
+        let p = int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap()).unwrap();
+        let q = int_to_uint::<32>(seq.read_unsigned_integer_bytes().unwrap()).unwrap();
+        RsaPrivateKey::<32>::from_pkcs1_der(&der).expect("the honest blob parses");
+
+        let bad_d = d.wrapping_sub(&Uint::<32>::from_u64(2));
+        let bad = encode_sequence(
+            &[
+                encode_integer(&[0]),
+                encode_integer(&uint_be(&n)),
+                encode_integer(&uint_be(&e)),
+                encode_integer(&uint_be(&bad_d)),
+                encode_integer(&uint_be(&p)),
+                encode_integer(&uint_be(&q)),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+                encode_integer(&[1]),
+            ]
+            .concat(),
+        );
+        assert!(matches!(
+            RsaPrivateKey::<32>::from_pkcs1_der(&bad),
+            Err(Error::Malformed)
+        ));
     }
 
     /// BN-4: a 2000-bit modulus parsed into the 2048-bit `RsaPrivateKey<32>`

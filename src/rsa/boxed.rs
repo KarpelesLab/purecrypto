@@ -354,39 +354,15 @@ fn raw_private_crt_blinded(
     m
 }
 
-/// Base-blinded raw RSA private op for the runtime-sized key.
-///
-/// With CRT parameters available this runs [`raw_private_crt_blinded`] and
-/// fault-checks the result with the (cheap, public-exponent) `m^e ≡ c mod n`
-/// before releasing it, so a faulted CRT half can never escape
-/// (Boneh–DeMillo–Lipton). On mismatch it falls back to the full-width path
-/// below: for a well-formed key that recomputes the correct `c^d mod n`; a
-/// key imported with primes that don't actually factor `n` gets exactly what
-/// it got before the CRT path existed (garbage in, garbage out — but never a
-/// factorable half-fault).
-fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUint {
+/// The full-width (non-CRT) base-blinded private op, `c^d mod n`.
+fn raw_private_full_width(key: &BoxedRsaPrivateKey, nonce: u32, salt: &[u8; 16], c: &BoxedUint) -> BoxedUint {
     let mont = &key.mont;
-    // One counter bump per private operation. `Relaxed` is enough: the value
-    // only has to differ between operations, it orders nothing else.
-    let nonce = key.blind_counter.fetch_add(1, Ordering::Relaxed);
-    let salt = super::keys::per_op_blind_salt(&key.blind_salt);
-    if let Some(crt) = key.crt.as_deref() {
-        let m = raw_private_crt_blinded(key, crt, nonce, &salt, c);
-        // `c` is public in every caller (a ciphertext or an EMSA-encoded
-        // digest), so the variable-time `lt` shortcut leaks nothing.
-        let n = mont.modulus();
-        let c_mod_n = if c.lt(&n) { c.clone() } else { c.reduce(&n) };
-        if mont.pow_public(&m, &key.e) == c_mod_n {
-            return m;
-        }
-    }
-
     let phi_n_minus_1 = match key.phi_n_minus_1.as_ref() {
         Some(v) => v,
         None => return mont.pow(c, &key.d), // imported key without primes
     };
 
-    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, &salt, c);
+    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, salt, c);
     // `e` is public, so the exponent-length ladder applies (still branchless
     // and constant-time in the secret base `r`).
     let r_e = mont.pow_public(&r, &key.e);
@@ -394,6 +370,45 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
     let c_blind = mont.mul_mod(c, &r_e);
     let m_blind = mont.pow(&c_blind, &key.d);
     mont.mul_mod(&m_blind, &r_inv)
+}
+
+/// Base-blinded raw RSA private op for the runtime-sized key.
+///
+/// With CRT parameters available this runs [`raw_private_crt_blinded`] and
+/// fault-checks the result with the (cheap, public-exponent) `m^e ≡ c mod n`
+/// before releasing it, so a faulted CRT half can never escape
+/// (Boneh–DeMillo–Lipton). On mismatch it recomputes with the full-width
+/// path — and fault-checks *that* too: releasing an unverified full-width
+/// result would hand back exactly the value the CRT check just refused to
+/// trust. If the recomputation also fails to verify (a transient fault on
+/// both attempts, or a key whose `e`, `d` and `n` are not consistent), the
+/// op returns zero: a value that cannot be a valid signature or a
+/// well-padded plaintext, so every caller fails closed instead of emitting
+/// something an attacker could use to factor `n`.
+fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUint {
+    let mont = &key.mont;
+    // One counter bump per private operation. `Relaxed` is enough: the value
+    // only has to differ between operations, it orders nothing else.
+    let nonce = key.blind_counter.fetch_add(1, Ordering::Relaxed);
+    let salt = super::keys::per_op_blind_salt(&key.blind_salt);
+    let Some(crt) = key.crt.as_deref() else {
+        return raw_private_full_width(key, nonce, &salt, c);
+    };
+
+    let m = raw_private_crt_blinded(key, crt, nonce, &salt, c);
+    // `c` is public in every caller (a ciphertext or an EMSA-encoded
+    // digest), so the variable-time `lt` shortcut leaks nothing.
+    let n = mont.modulus();
+    let c_mod_n = if c.lt(&n) { c.clone() } else { c.reduce(&n) };
+    if mont.pow_public(&m, &key.e) == c_mod_n {
+        return m;
+    }
+    let mut m2 = raw_private_full_width(key, nonce, &salt, c);
+    if mont.pow_public(&m2, &key.e) == c_mod_n {
+        return m2;
+    }
+    m2.zeroize();
+    BoxedUint::zero(1)
 }
 
 /// Lower bound for `BoxedRsaPublicKey` parsing entry points. Anything smaller
@@ -471,6 +486,30 @@ fn validate_private_components(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> R
     }
     if &p.mul(q) != n {
         return Err(Error::InvalidKey);
+    }
+    Ok(())
+}
+
+/// Validates that the private exponent really inverts `e` in both prime
+/// fields: `e·(d mod (p−1)) ≡ 1 (mod p−1)` and likewise for `q`
+/// (RFC 8017 §3.2). This is exactly the relation the CRT half-exponentiations
+/// rely on, and a `d` that violates it — a corrupted key file, a
+/// fault-injected blob, or a deliberately inconsistent one — otherwise
+/// silently produces wrong signatures whose CRT halves can reveal a factor of
+/// `n`. Cheap: two reductions and two multiplications, once per parse.
+fn validate_crt_consistency(
+    e: &BoxedUint,
+    d: &BoxedUint,
+    p: &BoxedUint,
+    q: &BoxedUint,
+) -> Result<(), Error> {
+    let one = BoxedUint::from_u64(1);
+    for prime in [p, q] {
+        let pm1 = prime.sub(&one);
+        let dx = d.reduce(&pm1);
+        if e.mul(&dx).reduce(&pm1) != one {
+            return Err(Error::InvalidKey);
+        }
     }
     Ok(())
 }
@@ -1076,8 +1115,10 @@ impl BoxedRsaPrivateKey {
     ///
     /// Rejects moduli outside `[MIN_RSA_BITS, MAX_RSA_BITS]`, degenerate
     /// public exponents (`e < 3`, even, `≥ n`, or `≥ 2^256`), a private
-    /// exponent outside `[1, n)`, primes `≤ 1` or even, `p = q`, and
-    /// `p · q ≠ n`.
+    /// exponent outside `[1, n)`, primes `≤ 1` or even, `p = q`,
+    /// `p · q ≠ n`, and a `d` that does not invert `e` in both prime fields
+    /// (`e·dP ≢ 1 mod p−1`, `e·dQ ≢ 1 mod q−1`) — the relation the CRT path
+    /// depends on.
     pub fn from_pkcs1_der(der: &[u8]) -> Result<Self, crate::der::Error> {
         let mut reader = crate::der::Reader::new(der);
         let mut seq = reader.read_sequence()?;
@@ -1099,6 +1140,7 @@ impl BoxedRsaPrivateKey {
         validate_public_exponent(&n, &e).map_err(|_| crate::der::Error::Malformed)?;
         validate_private_exponent(&n, &d).map_err(|_| crate::der::Error::Malformed)?;
         validate_private_components(&n, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
+        validate_crt_consistency(&e, &d, &p, &q).map_err(|_| crate::der::Error::Malformed)?;
         let k = n.bit_len().div_ceil(8);
         let mont = BoxedMontModulus::new(&n);
         let (phi_n_minus_1, blinding_seed) = derive_blinding_boxed(&p, &q, &d);
@@ -1583,6 +1625,77 @@ mod tests {
         key.public_key()
             .verify_pkcs1v15::<Sha256>(b"fault me", &sig)
             .unwrap();
+    }
+
+    /// When *both* the CRT path and the full-width recomputation fail the
+    /// `m^e ≡ c mod n` fault check — here because the key's `d` is not the
+    /// inverse of `e`, which is what a fault on the exponent looks like — the
+    /// private op must fail closed (return zero) rather than release an
+    /// unchecked result. Before, the full-width fallback was emitted without
+    /// any verification at all.
+    #[test]
+    fn unverifiable_private_op_fails_closed() {
+        let good = rsa_test_key_a().to_boxed();
+        // Same modulus and primes, but a `d` that inverts nothing.
+        let mut key = BoxedRsaPrivateKey::from_components_with_primes(
+            good.n.clone(),
+            good.e.clone(),
+            good.d.sub(&BoxedUint::from_u64(2)),
+            good.p.clone(),
+            good.q.clone(),
+        );
+        assert!(key.crt.is_some());
+        let c = BoxedUint::from_u64(0x1234_5678);
+        assert!(
+            raw_private_blinded_boxed(&key, &c).is_zero(),
+            "an unverifiable private-op result must not be released"
+        );
+        // A signature from such a key is the all-zero representative, which
+        // no verifier accepts.
+        let sig = key.sign_pkcs1v15::<Sha256>(b"broken key").unwrap();
+        assert!(
+            good.public_key()
+                .verify_pkcs1v15::<Sha256>(b"broken key", &sig)
+                .is_err()
+        );
+        // Sanity: with the correct `d` the same path still works.
+        key = good;
+        let sig = key.sign_pkcs1v15::<Sha256>(b"broken key").unwrap();
+        key.public_key()
+            .verify_pkcs1v15::<Sha256>(b"broken key", &sig)
+            .unwrap();
+    }
+
+    /// A PKCS#1 blob whose `d` does not invert `e` in the prime fields is
+    /// rejected at parse time (RFC 8017 §3.2) rather than producing a key
+    /// whose CRT halves disagree at signing time.
+    #[test]
+    fn from_pkcs1_der_rejects_inconsistent_private_exponent() {
+        use crate::der::{encode_integer, encode_sequence};
+        let key = rsa_test_key_a().to_boxed();
+        let be = |v: &BoxedUint| v.to_be_bytes(v.bit_len().div_ceil(8).max(1));
+        let der = |d: &BoxedUint| {
+            encode_sequence(
+                &[
+                    encode_integer(&[0]),
+                    encode_integer(&be(&key.n)),
+                    encode_integer(&be(&key.e)),
+                    encode_integer(&be(d)),
+                    encode_integer(&be(&key.p)),
+                    encode_integer(&be(&key.q)),
+                    encode_integer(&[0]),
+                    encode_integer(&[0]),
+                    encode_integer(&[0]),
+                ]
+                .concat(),
+            )
+        };
+        // The honest key round-trips…
+        BoxedRsaPrivateKey::from_pkcs1_der(&der(&key.d)).expect("valid key must parse");
+        // …a corrupted private exponent does not.
+        assert!(
+            BoxedRsaPrivateKey::from_pkcs1_der(&der(&key.d.sub(&BoxedUint::from_u64(2)))).is_err()
+        );
     }
 
     #[test]
