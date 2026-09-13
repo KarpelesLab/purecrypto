@@ -430,6 +430,8 @@ mod tests {
     /// range used by `to_msg` (D = 1) and `compress` (D = 4, 5, 10, 11 are
     /// the FIPS 203 values for `du` and `dv`). One bad row would silently
     /// flip a message bit or a ciphertext bit.
+    // The D = 11 sample set is a heap vector; the code under test is not.
+    #[cfg(feature = "alloc")]
     #[test]
     fn barrett_div_matches_division() {
         for d in [1u32, 4, 5, 10, 11] {
@@ -483,25 +485,28 @@ mod tests {
         }
         // Validate each FIPS 203-used D against its expected error bound.
         let cases: &[(usize, i16)] = &[(4, 120), (5, 60), (10, 2), (11, 1)];
+        // One fixed scratch buffer sized for the widest D, sliced per case, so
+        // the test needs no allocator either.
+        let mut scratch = [0u8; N * 11 / 8];
         for &(d, max_err) in cases {
-            let mut buf = alloc::vec![0u8; N * d / 8];
+            let buf = &mut scratch[..N * d / 8];
             let mut r = Poly::zero();
             match d {
                 4 => {
-                    compress::<4>(&p, &mut buf);
-                    decompress::<4>(&buf, &mut r);
+                    compress::<4>(&p, buf);
+                    decompress::<4>(buf, &mut r);
                 }
                 5 => {
-                    compress::<5>(&p, &mut buf);
-                    decompress::<5>(&buf, &mut r);
+                    compress::<5>(&p, buf);
+                    decompress::<5>(buf, &mut r);
                 }
                 10 => {
-                    compress::<10>(&p, &mut buf);
-                    decompress::<10>(&buf, &mut r);
+                    compress::<10>(&p, buf);
+                    decompress::<10>(buf, &mut r);
                 }
                 11 => {
-                    compress::<11>(&p, &mut buf);
-                    decompress::<11>(&buf, &mut r);
+                    compress::<11>(&p, buf);
+                    decompress::<11>(buf, &mut r);
                 }
                 _ => unreachable!(),
             }

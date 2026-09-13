@@ -555,7 +555,9 @@ ml_kem_set!(
     ML_KEM_1024
 );
 
-#[cfg(test)]
+// ML-KEM itself is allocator-free; the KAT fixtures here are variable-length
+// hex strings decoded into `Vec`s, so the tests need a heap.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::hash::Sha256;
