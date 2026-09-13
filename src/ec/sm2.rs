@@ -49,13 +49,47 @@ fn in_range(v: &BoxedUint, n: &BoxedUint) -> bool {
     bool::from(!v.ct_is_zero()) & v.lt(n)
 }
 
+/// `1 <= d <= n-2` — the GB/T 32918.1 §6.1 private-key range. `d = n-1`
+/// is excluded because signing inverts `1 + d`, which is `0 mod n` there:
+/// every signature would come out with `s = 0` and the signer could never
+/// produce one. Non-short-circuiting, like [`in_range`].
+fn in_key_range(d: &BoxedUint, n: &BoxedUint) -> bool {
+    let n_minus_1 = n.sub(&BoxedUint::from_u64(1));
+    in_range(d, &n_minus_1)
+}
+
+/// `id` must fit the two-byte `ENTLA` bit-length field of `ZA`: at most
+/// `(2^16 - 1) / 8 = 8191` bytes.
+fn id_len_ok(id: &[u8]) -> bool {
+    id.len()
+        .checked_mul(8)
+        .is_some_and(|b| b <= u16::MAX as usize)
+}
+
+/// Upper bound on nonce resamples in [`Sm2PrivateKey::sign`]. A degenerate
+/// nonce occurs with probability about `3/n ≈ 2^-254` per draw, so hitting
+/// this cap means the RNG is broken (e.g. stuck), not bad luck; failing
+/// beats spinning forever.
+const MAX_SIGN_ATTEMPTS: usize = 64;
+
+/// Why an internal signing attempt did not produce a signature.
+enum SignFailure {
+    /// The nonce was degenerate (`r == 0`, `r + k == n`, or `s == 0`); a
+    /// fresh nonce may succeed.
+    Retry,
+    /// A permanent error (bad identity length, out-of-range nonce) that no
+    /// amount of resampling fixes.
+    Fatal(Error),
+}
+
 /// Modular inverse `a^-1 mod m` for prime `m`, via Fermat (`a^(m-2) mod m`).
 fn inv_mod(fm: &BoxedMontModulus, a: &BoxedUint, m: &BoxedUint) -> BoxedUint {
     fm.pow(a, &m.sub(&BoxedUint::from_u64(2)))
 }
 
 /// A uniformly random scalar in `[1, n-1]` via rejection sampling, masking the
-/// high byte to `n.bit_len()` bits to keep the rejection rate low.
+/// high byte to `n.bit_len()` bits to keep the rejection rate low. Pass
+/// `n - 1` as `n` to draw a private key from `[1, n-2]`.
 fn random_scalar<R: RngCore>(n: &BoxedUint, rng: &mut R) -> BoxedUint {
     let bytes = CURVE.order_len();
     let nbits = n.bit_len();
@@ -106,7 +140,7 @@ pub struct Sm2PublicKey {
     y: BoxedUint,
 }
 
-/// An SM2 private key: a scalar `dA ∈ [1, n-1]`. The scalar is wiped on drop.
+/// An SM2 private key: a scalar `dA ∈ [1, n-2]` (GB/T 32918.1 §6.1). The scalar is wiped on drop.
 #[derive(Clone)]
 pub struct Sm2PrivateKey {
     d: BoxedUint,
@@ -124,11 +158,10 @@ pub struct Sm2Signature {
 /// `ENTLA` is the two-byte big-endian bit length of `id` (so `id` is limited to
 /// `2^16 - 1` bits = 8191 bytes; longer ids are rejected by the callers).
 fn za(id: &[u8], x: &BoxedUint, y: &BoxedUint) -> Result<[u8; 32], Error> {
-    let bitlen = id
-        .len()
-        .checked_mul(8)
-        .filter(|&b| b <= u16::MAX as usize)
-        .ok_or(Error::InvalidInput)?;
+    if !id_len_ok(id) {
+        return Err(Error::InvalidInput);
+    }
+    let bitlen = id.len() * 8;
     let c = CURVE.curve();
     // a, b in plain (non-Montgomery) form, 32-byte big-endian.
     let (a, b) = c.coefficients();
@@ -331,13 +364,15 @@ impl Sm2PublicKey {
 
 impl Sm2PrivateKey {
     /// Creates a private key from a big-endian scalar, checking it is in
-    /// `[1, n-1]`.
+    /// `[1, n-2]` (GB/T 32918.1 §6.1; `n-1` cannot sign, see
+    /// [`in_key_range`]).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let d = BoxedUint::from_be_bytes(bytes);
+        let mut d = BoxedUint::from_be_bytes(bytes);
         let n = CURVE.curve().order().clone();
-        if in_range(&d, &n) {
+        if in_key_range(&d, &n) {
             Ok(Sm2PrivateKey { d })
         } else {
+            d.zeroize();
             Err(Error::InvalidInput)
         }
     }
@@ -345,8 +380,10 @@ impl Sm2PrivateKey {
     /// Generates a new SM2 private key from `rng` (a CSPRNG).
     pub fn generate<R: RngCore + CryptoRng>(rng: &mut R) -> Self {
         let n = CURVE.curve().order().clone();
+        // Draw from [1, n-2]: bound the sampler by n-1.
+        let n_minus_1 = n.sub(&BoxedUint::from_u64(1));
         Sm2PrivateKey {
-            d: random_scalar(&n, rng),
+            d: random_scalar(&n_minus_1, rng),
         }
     }
 
@@ -360,7 +397,7 @@ impl Sm2PrivateKey {
         let c = CURVE.curve();
         let (x, y) = c
             .to_affine(&c.mul_generator(&self.d))
-            .expect("d in [1,n-1] so d*G is not the identity");
+            .expect("d in [1,n-2] so d*G is not the identity");
         Sm2PublicKey { x, y }
     }
 
@@ -373,19 +410,27 @@ impl Sm2PrivateKey {
         id: &[u8],
         rng: &mut R,
     ) -> Result<Sm2Signature, Error> {
+        // Permanent failures must surface before the resampling loop, or
+        // it would spin forever on them.
+        if !id_len_ok(id) {
+            return Err(Error::InvalidInput);
+        }
         let n = CURVE.curve().order().clone();
-        loop {
+        let za = self.public_key().za(id)?;
+        for _ in 0..MAX_SIGN_ATTEMPTS {
             let mut k = random_scalar(&n, rng);
-            let out = self.sign_with_k(msg, id, &k);
+            let out = self.sign_digest_with_k(&za, msg, &k);
             // The nonce alone recovers the private key; wipe it on every path.
             k.zeroize();
             match out {
                 Ok(sig) => return Ok(sig),
                 // Degenerate nonce (r == 0, r + k == n, or s == 0): resample.
-                Err(Error::InvalidInput) => continue,
-                Err(e) => return Err(e),
+                Err(SignFailure::Retry) => continue,
+                Err(SignFailure::Fatal(e)) => return Err(e),
             }
         }
+        // Only a broken RNG gets here (see `MAX_SIGN_ATTEMPTS`).
+        Err(Error::InvalidInput)
     }
 
     /// Signs `msg` under identity `id` with an explicit nonce `k`
@@ -396,23 +441,36 @@ impl Sm2PrivateKey {
     /// `k` MUST be a secret, uniformly-random value in `[1, n-1]` — reusing or
     /// leaking it discloses the private key.
     pub fn sign_with_k(&self, msg: &[u8], id: &[u8], k: &BoxedUint) -> Result<Sm2Signature, Error> {
+        let za = self.public_key().za(id)?;
+        self.sign_digest_with_k(&za, msg, k).map_err(|f| match f {
+            SignFailure::Retry => Error::InvalidInput,
+            SignFailure::Fatal(e) => e,
+        })
+    }
+
+    /// The signing core: `ZA` already computed, failures split into
+    /// retryable (degenerate nonce) and permanent.
+    fn sign_digest_with_k(
+        &self,
+        za: &[u8; 32],
+        msg: &[u8],
+        k: &BoxedUint,
+    ) -> Result<Sm2Signature, SignFailure> {
         let c = CURVE.curve();
         let n = c.order().clone();
         let fq = BoxedMontModulus::new(&n);
         if !in_range(k, &n) {
-            return Err(Error::InvalidInput);
+            return Err(SignFailure::Fatal(Error::InvalidInput));
         }
-        let za = self.public_key().za(id)?;
-        let e = message_hash(&za, msg).reduce(&n);
+        let e = message_hash(za, msg).reduce(&n);
 
-        // (x1, _) = [k]G.
-        let (x1, _) = c
-            .to_affine(&c.mul_generator(k))
-            .ok_or(Error::InvalidInput)?;
+        // (x1, _) = [k]G. k ∈ [1, n-1] and G has prime order n, so this is
+        // never the identity; treat it as retryable regardless.
+        let (x1, _) = c.to_affine(&c.mul_generator(k)).ok_or(SignFailure::Retry)?;
         // r = (e + x1) mod n; reject r == 0 or r + k == n.
         let r = fq.add_mod(&e, &x1.reduce(&n));
         if r.is_zero() || fq.add_mod(&r, k).is_zero() {
-            return Err(Error::InvalidInput);
+            return Err(SignFailure::Retry);
         }
         // s = ((1 + dA)^-1 · (k − r·dA)) mod n.
         let one = BoxedUint::from_u64(1);
@@ -425,7 +483,7 @@ impl Sm2PrivateKey {
         rd.zeroize();
         k_minus_rd.zeroize();
         if s.is_zero() {
-            return Err(Error::InvalidInput);
+            return Err(SignFailure::Retry);
         }
         Ok(Sm2Signature { r, s })
     }
@@ -886,6 +944,58 @@ mod tests {
         let sig = Sm2Signature::from_der(&der3).unwrap();
         assert_eq!(sig.to_bytes().len(), 64);
         assert_eq!(sig.to_der(), der3);
+    }
+
+    /// An identity too long for `ENTLA` is a permanent failure: `sign` must
+    /// return an error instead of resampling nonces forever.
+    #[test]
+    fn sign_rejects_oversize_id() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-long-id", b"n", &[]);
+        let sk = Sm2PrivateKey::generate(&mut rng);
+        let id = vec![0x41u8; 8192];
+        assert!(matches!(
+            sk.sign(b"m", &id, &mut rng),
+            Err(Error::InvalidInput)
+        ));
+        // 8191 bytes is the longest legal id and still works.
+        let id = vec![0x41u8; 8191];
+        let sig = sk.sign(b"m", &id, &mut rng).unwrap();
+        sk.public_key().verify(b"m", &sig, &id).unwrap();
+    }
+
+    /// `d = n-1` makes `1 + d ≡ 0`, so no signature can ever be produced;
+    /// GB/T 32918.1 limits keys to `[1, n-2]` and import must enforce it.
+    #[test]
+    fn private_key_n_minus_1_rejected() {
+        let n = CURVE.curve().order().clone();
+        let one = BoxedUint::from_u64(1);
+        let n1 = n.sub(&one).to_be_bytes(32);
+        assert!(matches!(
+            Sm2PrivateKey::from_bytes(&n1),
+            Err(Error::InvalidInput)
+        ));
+        let n2 = n.sub(&BoxedUint::from_u64(2)).to_be_bytes(32);
+        let sk = Sm2PrivateKey::from_bytes(&n2).unwrap();
+        let mut rng = HmacDrbg::<Sha256>::new(b"sm2-n-2", b"n", &[]);
+        let sig = sk.sign(b"m", DEFAULT_ID, &mut rng).unwrap();
+        sk.public_key().verify(b"m", &sig, DEFAULT_ID).unwrap();
+        assert!(Sm2PrivateKey::from_bytes(&n.to_be_bytes(32)).is_err());
+        assert!(Sm2PrivateKey::from_bytes(&[0u8; 32]).is_err());
+        #[cfg(feature = "der")]
+        {
+            use crate::der::{
+                encode_context, encode_integer, encode_octet_string, encode_sequence, oid_tlv,
+            };
+            let der = encode_sequence(
+                &[
+                    encode_integer(&[1]),
+                    encode_octet_string(&n1),
+                    encode_context(0, &oid_tlv(CURVE.named_curve_oid())),
+                ]
+                .concat(),
+            );
+            assert!(Sm2PrivateKey::from_sec1_der(&der).is_err());
+        }
     }
 
     /// GB/T 32918.4 §7 step B4: an all-zero KDF stream must abort decryption.
