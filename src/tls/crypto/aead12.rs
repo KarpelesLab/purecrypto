@@ -30,11 +30,23 @@ use super::suite::AeadAlg;
 use crate::tls::{ContentType, Error};
 use alloc::vec::Vec;
 
-/// The same per-key sequence cap we use for TLS 1.3. Far below the GCM safe
-/// bound (≈ 2³² records per key), and well below ChaCha20-Poly1305's much
-/// higher bound — leaves plenty of headroom while still triggering a key
-/// rotation long before either AEAD becomes risky.
-const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
+/// AES-GCM's safe per-key record bound, RFC 8446 §5.5 / RFC 9001 §6.6:
+/// 2^24.5 ≈ 23 726 566 records. TLS 1.2 has no `KeyUpdate`, so a connection
+/// that reaches this must be torn down rather than rekeyed.
+const MAX_RECORDS_GCM: u64 = 23_726_566;
+
+/// ChaCha20-Poly1305 has no comparable confidentiality/integrity limit (RFC
+/// 8446 §5.5 imposes none); the only ceiling is the 64-bit sequence number
+/// itself, which also bounds the unique explicit nonce space.
+const MAX_RECORDS_CHACHA: u64 = u64::MAX;
+
+/// The per-key record cap for `alg`.
+fn max_records_for(alg: AeadAlg) -> u64 {
+    match alg {
+        AeadAlg::Aes128Gcm | AeadAlg::Aes256Gcm => MAX_RECORDS_GCM,
+        AeadAlg::ChaCha20Poly1305 => MAX_RECORDS_CHACHA,
+    }
+}
 
 /// One direction's TLS 1.2 record protection: an AEAD keyed from the
 /// `key_block` slice for this direction, the 4-byte implicit `salt`, and a
@@ -46,6 +58,8 @@ const MAX_RECORDS_PER_KEY: u64 = 1 << 23;
 #[allow(dead_code)]
 pub(crate) struct RecordCrypter12 {
     aead: Aead,
+    /// Per-key record cap for the negotiated AEAD (see `max_records_for`).
+    max_records: u64,
     /// 4-byte implicit nonce ("salt") drawn from the `key_block`.
     salt: [u8; 4],
     /// Record sequence number, monotonically incremented per record. In TLS
@@ -62,6 +76,7 @@ impl RecordCrypter12 {
     pub(crate) fn new(alg: AeadAlg, key: &[u8], salt: [u8; 4]) -> Self {
         RecordCrypter12 {
             aead: Aead::from_key(alg, key),
+            max_records: max_records_for(alg),
             salt,
             seq: 0,
         }
@@ -179,7 +194,8 @@ impl RecordCrypter12 {
     /// `content_type` is the true content type — TLS 1.2 records carry it
     /// in the cleartext header (there is no `TLSInnerPlaintext` byte).
     ///
-    /// Returns `Err(TooManyRecords)` once the per-key record cap is hit and
+    /// Returns `Err(TooManyRecords)` once the AEAD's per-key record cap is
+    /// hit (a closing alert is still allowed through) and
     /// `Err(RecordOverflow)` if the payload is larger than the 2^14 TLS
     /// plaintext fragment limit (RFC 5246 §6.2.1).
     #[allow(dead_code)]
@@ -191,7 +207,13 @@ impl RecordCrypter12 {
         if payload.len() > (1usize << 14) {
             return Err(Error::RecordOverflow);
         }
-        if self.seq >= MAX_RECORDS_PER_KEY {
+        // The cap never blocks a closing alert: TLS 1.2 cannot rekey, so the
+        // only thing left to do at the limit is shut the connection down —
+        // and `close_notify` is exactly how that is signalled (a peer that
+        // never sees it must treat the stream as truncated). Two bytes of
+        // alert cost nothing against the AEAD's safety margin.
+        let closing_alert = content_type == ContentType::Alert && payload.len() == 2;
+        if self.seq >= self.max_records && !closing_alert {
             return Err(Error::TooManyRecords);
         }
 
@@ -231,7 +253,11 @@ impl RecordCrypter12 {
         if fragment.len() < 8 + 16 {
             return Err(Error::Decode);
         }
-        if self.seq >= MAX_RECORDS_PER_KEY {
+        // Same exception as on the write side: the peer's closing alert must
+        // still be readable at the cap.
+        let closing_alert = ContentType::from_u8(record_header[0]) == ContentType::Alert
+            && fragment.len() == 8 + 2 + 16;
+        if self.seq >= self.max_records && !closing_alert {
             return Err(Error::TooManyRecords);
         }
 
@@ -385,6 +411,51 @@ mod tests {
             assert_eq!(got, expected_seq.to_be_bytes());
         }
         assert_eq!(enc.seq(), 5);
+    }
+
+    /// Test hook: fast-forward the sequence counter to exercise the per-key
+    /// cap without protecting tens of millions of records first.
+    impl RecordCrypter12 {
+        fn set_seq_for_test(&mut self, seq: u64) {
+            self.seq = seq;
+        }
+    }
+
+    /// The per-key record cap is the AEAD's own bound: 2^24.5 for AES-GCM,
+    /// effectively unbounded for ChaCha20-Poly1305 (RFC 8446 §5.5). A closing
+    /// alert is always allowed past the cap so the connection can be shut
+    /// down cleanly — TLS 1.2 cannot rekey.
+    #[test]
+    fn per_aead_record_caps_and_the_closing_alert_exception() {
+        let salt = [0u8; 4];
+        let key = alloc::vec![0x11u8; 32];
+
+        let mut gcm = RecordCrypter12::new(AeadAlg::Aes256Gcm, &key, salt);
+        gcm.set_seq_for_test(MAX_RECORDS_GCM - 1);
+        assert!(gcm.encrypt(ContentType::ApplicationData, &[0u8; 8]).is_ok());
+        assert!(matches!(
+            gcm.encrypt(ContentType::ApplicationData, &[0u8; 8]),
+            Err(Error::TooManyRecords)
+        ));
+        // close_notify (level warning, description 0) still goes out.
+        let alert = gcm.encrypt(ContentType::Alert, &[1u8, 0u8]).unwrap();
+        assert_eq!(alert.len(), 8 + 2 + 16);
+
+        // ChaCha20-Poly1305 has no such limit: the old shared 2^23 cap does
+        // not apply to it.
+        let mut chacha = RecordCrypter12::new(AeadAlg::ChaCha20Poly1305, &key, salt);
+        chacha.set_seq_for_test((1 << 23) + 1);
+        assert!(
+            chacha
+                .encrypt(ContentType::ApplicationData, &[0u8; 8])
+                .is_ok()
+        );
+        chacha.set_seq_for_test(MAX_RECORDS_GCM + 1);
+        assert!(
+            chacha
+                .encrypt(ContentType::ApplicationData, &[0u8; 8])
+                .is_ok()
+        );
     }
 
     /// Decrypting a fragment shorter than `explicit_nonce + tag` (8 + 16
