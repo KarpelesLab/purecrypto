@@ -174,6 +174,7 @@ pub(crate) struct CidEntry {
 /// RFC 9000 §5.1.2: when the peer's `retire_prior_to` advances, all
 /// sequences strictly below it are retired automatically; the retiring
 /// side emits a RETIRE_CONNECTION_ID frame per dropped sequence.
+#[derive(Clone)]
 pub(crate) struct CidPool {
     /// All CIDs in this pool, keyed by sequence. Always non-empty after
     /// construction (the handshake CID is at sequence 0).

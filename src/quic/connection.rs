@@ -553,6 +553,20 @@ pub struct CloseInfo {
     pub reason: String,
 }
 
+/// The pieces of outbound state that packet assembly drains destructively
+/// and that no retransmission path would ever recover: DATAGRAM frames (RFC
+/// 9221 §5 forbids retransmitting them), the PATH_CHALLENGE / PATH_RESPONSE
+/// queues, the CID pools and the one-shot NEW_CONNECTION_ID issuance.
+/// Snapshotted around a build that the RFC 9000 §8.1 anti-amplification cap
+/// may discard (L-9).
+struct OneShotState {
+    datagrams: alloc::collections::VecDeque<Vec<u8>>,
+    path: PathChallengeState,
+    cid_local: Option<CidPool>,
+    cid_remote: Option<CidPool>,
+    new_cids_issued: bool,
+}
+
 /// A CONNECTION_CLOSE we initiated and must (re)transmit while in the
 /// closing state (RFC 9000 §10.2.1).
 pub(crate) struct PendingClose {
@@ -1566,6 +1580,11 @@ impl QuicConnection {
         if self.pending_close.is_some() {
             return self.pop_close_datagram();
         }
+        // RFC 9000 §8.2.2 — a PATH_RESPONSE belongs on the path its
+        // PATH_CHALLENGE arrived on. Debts owed on any other path can never
+        // be paid from here, so drop them rather than let them be
+        // misdelivered to whatever address we are currently sending to (L-6).
+        self.path.retain_responses_for(self.peer_addr);
         // Server-side: if a Retry packet is pending, emit it first
         // (and only it — Retry is its own datagram per RFC 9000 §17.2.5,
         // not coalesced with anything else).
@@ -1622,18 +1641,43 @@ impl QuicConnection {
             // snapshot path rather than refuse-up-front so that
             // small CRYPTO / ACK assemblies that *do* fit the budget
             // still go out.
-            let outbound_snapshot = self.datagram_queues.outbound.clone();
+            let snapshot = self.snapshot_one_shot_state();
             let datagram = self.pop_datagram_inner();
-            // If the inner call rejected (returned empty) but had
-            // already mutated the DATAGRAM queue, restore the queue.
-            // (`bytes_sent` needs no restoring — the inner path only
+            // If the inner call rejected (returned empty) but had already
+            // drained state that is never retransmitted — DATAGRAM frames
+            // (RFC 9221 §5), PATH_RESPONSE, RETIRE_CONNECTION_ID and the
+            // one-shot NEW_CONNECTION_ID issuance — put it back. Frames the
+            // loss recovery owns (CRYPTO, STREAM, ACK) need no restoring.
+            // (`bytes_sent` needs no restoring either — the inner path only
             // charges it on success.)
-            if datagram.is_empty() && self.datagram_queues.outbound != outbound_snapshot {
-                self.datagram_queues.outbound = outbound_snapshot;
+            if datagram.is_empty() {
+                self.restore_one_shot_state(snapshot);
             }
             return datagram;
         }
         self.pop_datagram_inner()
+    }
+
+    /// Captures the outbound state that [`Self::pop_datagram_inner`] drains
+    /// destructively and that nothing would ever retransmit, so a build the
+    /// anti-amplification cap then discards does not lose it (L-9).
+    fn snapshot_one_shot_state(&self) -> OneShotState {
+        OneShotState {
+            datagrams: self.datagram_queues.outbound.clone(),
+            path: self.path.clone(),
+            cid_local: self.cid_local.clone(),
+            cid_remote: self.cid_remote.clone(),
+            new_cids_issued: self.new_cids_issued,
+        }
+    }
+
+    /// Puts back what [`Self::snapshot_one_shot_state`] captured.
+    fn restore_one_shot_state(&mut self, snapshot: OneShotState) {
+        self.datagram_queues.outbound = snapshot.datagrams;
+        self.path = snapshot.path;
+        self.cid_local = snapshot.cid_local;
+        self.cid_remote = snapshot.cid_remote;
+        self.new_cids_issued = snapshot.new_cids_issued;
     }
 
     /// G-5: the original body of [`Self::pop_datagram`], extracted so
@@ -1712,9 +1756,12 @@ impl QuicConnection {
         // the expansion when the path's budget can cover it (a client's probe
         // is exempt: see `path_budget_permits`).
         let path_pending_before = self.path.pending_len();
+        let challenge_pending_before = self.path.pending_challenge_len();
         let onertt_pad = if path_pending_before > 0
-            && self.path_budget_permits(1200 - datagram.len().min(1200), true)
-        {
+            && self.path_budget_permits(
+                1200 - datagram.len().min(1200),
+                challenge_pending_before > 0,
+            ) {
             Some((1200usize, datagram.len()))
         } else {
             None
@@ -1722,9 +1769,13 @@ impl QuicConnection {
         if let Some(pkt) = self.build_packet_with_pad(Level::OneRtt, onertt_pad) {
             datagram.extend_from_slice(&pkt);
         }
-        // A drop in the pending count means the 1-RTT packet just built
-        // carries a PATH_CHALLENGE / PATH_RESPONSE.
-        let carries_path_frame = self.path.pending_len() < path_pending_before;
+        // L-6: only a drop in the *challenge* count exempts this datagram
+        // from the §8.1 budget. A PATH_RESPONSE is elicited by the peer, so
+        // treating it as "count-bounded" let anyone who can get a
+        // PATH_CHALLENGE to us pull an unmetered 1200-byte datagram out of
+        // this endpoint, aimed wherever it is currently sending — a ~34x
+        // reflector off a 35-byte probe.
+        let carries_own_challenge = self.path.pending_challenge_len() < challenge_pending_before;
 
         if datagram.is_empty() {
             return Vec::new();
@@ -1751,7 +1802,7 @@ impl QuicConnection {
         // bytes_recv on an unvalidated path. If this datagram would overflow
         // the path's budget, drop it on the floor; the PTO will eventually
         // re-fire and the peer will retransmit, expanding the budget.
-        if !self.path_budget_permits(datagram.len(), carries_path_frame) {
+        if !self.path_budget_permits(datagram.len(), carries_own_challenge) {
             // Rewind any state mutations that the packet builders made:
             // chiefly the per-level PnSpace.next_tx was advanced. Worst
             // case we re-emit duplicate ACKs / CRYPTO chunks on the next
@@ -5087,9 +5138,11 @@ impl QuicConnection {
                 Frame::PathChallenge(data) => {
                     // RFC 9000 §8.2.2: every PATH_CHALLENGE elicits a
                     // PATH_RESPONSE carrying the same 8 bytes on the next
-                    // outbound 1-RTT packet.
+                    // outbound 1-RTT packet — sent "on the network path
+                    // where the PATH_CHALLENGE was received", hence the
+                    // source address being recorded alongside it (L-6).
                     ack_eliciting = true;
-                    self.path.on_challenge(data);
+                    self.path.on_challenge(data, self.current_rx_addr);
                 }
                 Frame::PathResponse(data) => {
                     // RFC 9000 §8.2.3: a PATH_RESPONSE matching an
@@ -5843,8 +5896,10 @@ impl QuicConnection {
             if matches!(level, Level::OneRtt) {
                 // PATH_RESPONSE (RFC 9000 §8.2.2): emit one per pending
                 // request before everything else. They're tiny (9 bytes
-                // each) and high-priority.
-                while let Some(data) = self.path.pop_outbound_response() {
+                // each) and high-priority. Only the ones owed on the path
+                // this datagram is bound for — see `pop_outbound_response`.
+                let to = self.peer_addr;
+                while let Some(data) = self.path.pop_outbound_response(to) {
                     Frame::PathResponse(data).encode(&mut out);
                     meta.ack_eliciting = true;
                     meta.in_flight = true;
@@ -7829,6 +7884,69 @@ mod tests {
     /// nothing else may until the server's echo validates it — the client
     /// used to bound this only structurally, with no accounting at all.
     #[test]
+    /// L-6 — a PATH_RESPONSE is elicited by whoever sends a PATH_CHALLENGE,
+    /// so it must not be a free, unmetered, 1200-byte-padded datagram aimed
+    /// at wherever this endpoint happens to be sending. Two rules: it goes
+    /// out only on the path its challenge arrived on, and it is charged
+    /// against the RFC 9000 §8.1 budget (only this endpoint's *own* probes,
+    /// which the state machine bounds to one per migration plus a re-send,
+    /// keep the exemption).
+    #[test]
+    fn path_response_is_bound_to_its_path_and_charged() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let old_addr = ip4(192, 0, 2, 1, 5556);
+        let pa = PreferredAddress {
+            ipv4: Some(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 4433)),
+            ipv6: None,
+            connection_id: alloc::vec![0xC4; 8],
+            stateless_reset_token: [0x67; 16],
+        };
+        let (mut c, mut s) = migration_pair(old_addr);
+        quiesce(&mut c, &mut s, old_addr);
+        let server_addr = ip4(198, 51, 100, 1, 443);
+        c.set_peer_addr(server_addr);
+        c.peer_params
+            .as_mut()
+            .expect("peer params")
+            .preferred_address = Some(pa.encode());
+        c.cid_remote.as_mut().expect("pool").entries.remove(&1);
+        let target = c.migrate_to_preferred_address().expect("migrate");
+        // Our own probe is exempt and goes out, exhausting the fresh path's
+        // (zero) budget.
+        assert_eq!(c.pop_datagram().len(), 1200, "§8.2.1: the probe is padded");
+        assert!(!c.active_path.can_send(1));
+
+        // A challenge that arrived on another path is never answered here.
+        c.path.on_challenge([0xa1; 8], Some(server_addr));
+        assert!(
+            c.pop_datagram().is_empty(),
+            "§8.2.2: a response belongs on the path its challenge arrived on"
+        );
+        assert!(
+            !c.path.has_pending_response(),
+            "an unpayable debt is dropped, not retained"
+        );
+
+        // One that did arrive here is still subject to the 3x budget.
+        c.path.on_challenge([0xb2; 8], Some(target));
+        assert!(
+            c.pop_datagram().is_empty(),
+            "no unmetered reflection off an unvalidated path"
+        );
+        assert!(
+            c.path.has_pending_response(),
+            "L-9: the dropped datagram's one-shot frames are not lost"
+        );
+        // Credit the path and it goes out.
+        c.active_path.note_recv(1200);
+        assert_eq!(
+            c.pop_datagram().len(),
+            1200,
+            "within budget the response goes out, padded per §8.2.1"
+        );
+        let _ = &mut s;
+    }
+
     fn client_probe_to_preferred_address_is_charged_but_never_starved() {
         use std::net::{Ipv4Addr, SocketAddrV4};
         let old_addr = ip4(192, 0, 2, 1, 5555);
@@ -9900,7 +10018,7 @@ mod tests {
 
         // Inject the challenge directly into the server's path state
         // (simulating receipt of a PATH_CHALLENGE on the wire).
-        s.path.on_challenge(chal);
+        s.path.on_challenge(chal, None);
         assert!(s.path.has_pending_response());
 
         // The server emits a PATH_RESPONSE on the next outbound 1-RTT

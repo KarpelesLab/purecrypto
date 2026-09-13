@@ -23,6 +23,7 @@
 
 use alloc::vec::Vec;
 use core::time::Duration;
+use std::net::SocketAddr;
 
 use crate::rng::RngCore;
 
@@ -98,6 +99,7 @@ impl Path {
 /// doesn't get to allocate unbounded memory. The Phase 7 cap is 8 entries
 /// in each direction; this is conservative (a healthy connection rarely
 /// has more than 1 outstanding challenge at a time).
+#[derive(Clone)]
 pub(crate) struct PathChallengeState {
     /// Challenges we've sent: `(data, sent_at)`. The peer's PATH_RESPONSE
     /// must echo `data` byte-for-byte (RFC 9000 §8.2.2).
@@ -106,8 +108,15 @@ pub(crate) struct PathChallengeState {
     /// `QuicConnection::assemble_payload` into PATH_CHALLENGE frames.
     pending_challenge: Vec<[u8; 8]>,
     /// Challenges the peer sent us; we owe a PATH_RESPONSE carrying the
-    /// same 8 bytes on the next outbound 1-RTT packet (RFC 9000 §8.2.2).
-    pending_response: Vec<[u8; 8]>,
+    /// same 8 bytes on the next outbound 1-RTT packet (RFC 9000 §8.2.2),
+    /// each paired with the source address it arrived from. RFC 9000 §8.2.2
+    /// requires the response to be sent "on the network path where the
+    /// PATH_CHALLENGE was received", so the address is part of the debt:
+    /// answering on a different path both fails to validate that path and
+    /// turns this endpoint into a reflector aimed wherever it is currently
+    /// sending. `None` means the caller supplied no address information
+    /// (the plain `feed_datagram` entrypoint), which matches any path.
+    pending_response: Vec<([u8; 8], Option<SocketAddr>)>,
 }
 
 /// Bound on either-direction in-flight challenges. Tiny by design — a
@@ -157,17 +166,18 @@ impl PathChallengeState {
         }
     }
 
-    /// Records that the peer sent us a PATH_CHALLENGE. We owe them a
-    /// PATH_RESPONSE carrying `data` on the next outbound 1-RTT packet.
+    /// Records that the peer sent us a PATH_CHALLENGE from `from`. We owe
+    /// them a PATH_RESPONSE carrying `data`, on that same path, in the next
+    /// outbound 1-RTT packet (RFC 9000 §8.2.2).
     ///
     /// If the response queue is full, the new challenge is dropped (RFC
     /// 9000 §8.2 allows the responder to discard challenges it cannot
     /// keep up with).
-    pub(crate) fn on_challenge(&mut self, data: [u8; 8]) {
+    pub(crate) fn on_challenge(&mut self, data: [u8; 8], from: Option<SocketAddr>) {
         if self.pending_response.len() < PATH_CHALLENGE_CAP {
             // Avoid duplicating an identical outstanding response.
-            if !self.pending_response.contains(&data) {
-                self.pending_response.push(data);
+            if !self.pending_response.iter().any(|(d, a)| *d == data && *a == from) {
+                self.pending_response.push((data, from));
             }
         }
     }
@@ -191,15 +201,36 @@ impl PathChallengeState {
         }
     }
 
-    /// Pops the next PATH_RESPONSE bytes we owe the peer (FIFO order),
-    /// or `None` if none. The caller wires the returned bytes into a
-    /// PATH_RESPONSE frame.
-    pub(crate) fn pop_outbound_response(&mut self) -> Option<[u8; 8]> {
-        if self.pending_response.is_empty() {
-            None
-        } else {
-            Some(self.pending_response.remove(0))
+    /// Drops every PATH_RESPONSE debt owed on a path other than the one
+    /// addressed by `to`. Those can never be paid — a sans-I/O engine only
+    /// ever writes to the address it is currently sending on — and keeping
+    /// them would leave the connection permanently "pending" (RFC 9000
+    /// §8.2.2).
+    pub(crate) fn retain_responses_for(&mut self, to: Option<SocketAddr>) {
+        if to.is_none() {
+            return;
         }
+        self.pending_response
+            .retain(|(_, from)| from.is_none() || *from == to);
+    }
+
+    /// Pops the next PATH_RESPONSE bytes we owe *on the path addressed by
+    /// `to`* (FIFO order), or `None` if none. The caller wires the returned
+    /// bytes into a PATH_RESPONSE frame in a datagram bound for `to`.
+    ///
+    /// RFC 9000 §8.2.2: the response belongs on the path the challenge
+    /// arrived on. This engine can only address the path it is currently
+    /// sending on, so a debt owed anywhere else can never be paid — it is
+    /// discarded here rather than left to be misdelivered (which would make
+    /// this endpoint a reflector) or retained forever.
+    pub(crate) fn pop_outbound_response(&mut self, to: Option<SocketAddr>) -> Option<[u8; 8]> {
+        while !self.pending_response.is_empty() {
+            let (data, from) = self.pending_response.remove(0);
+            if from.is_none() || to.is_none() || from == to {
+                return Some(data);
+            }
+        }
+        None
     }
 
     /// Pops the next PATH_CHALLENGE bytes awaiting transmission (FIFO), or
@@ -215,6 +246,15 @@ impl PathChallengeState {
     /// True iff a PATH_CHALLENGE is waiting to be written into a packet.
     pub(crate) fn has_pending_challenge(&self) -> bool {
         !self.pending_challenge.is_empty()
+    }
+
+    /// Number of PATH_CHALLENGE frames this endpoint has issued and not yet
+    /// written into a packet. A drop between two readings means the datagram
+    /// built in between carries one of *our own* probes — which, unlike a
+    /// PATH_RESPONSE, the connection state machine bounds to one per
+    /// migration plus a single re-send.
+    pub(crate) fn pending_challenge_len(&self) -> usize {
+        self.pending_challenge.len()
     }
 
     /// Number of PATH_CHALLENGE + PATH_RESPONSE frames still waiting to be
@@ -304,23 +344,55 @@ mod tests {
     fn path_challenge_queues_response() {
         let mut p = PathChallengeState::new();
         let chal = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
-        p.on_challenge(chal);
+        p.on_challenge(chal, None);
         assert!(p.has_pending_response());
-        let popped = p.pop_outbound_response().expect("response queued");
+        let popped = p.pop_outbound_response(None).expect("response queued");
         assert_eq!(popped, chal);
         assert!(!p.has_pending_response());
         // After pop, the next pop returns None.
-        assert!(p.pop_outbound_response().is_none());
+        assert!(p.pop_outbound_response(None).is_none());
     }
 
     #[test]
     fn path_challenge_dedups_pending_response() {
         let mut p = PathChallengeState::new();
         let chal = [0u8, 1, 2, 3, 4, 5, 6, 7];
-        p.on_challenge(chal);
-        p.on_challenge(chal); // duplicate, should not enqueue twice
-        let _ = p.pop_outbound_response().expect("one response");
-        assert!(p.pop_outbound_response().is_none());
+        p.on_challenge(chal, None);
+        p.on_challenge(chal, None); // duplicate, should not enqueue twice
+        let _ = p.pop_outbound_response(None).expect("one response");
+        assert!(p.pop_outbound_response(None).is_none());
+    }
+
+    /// L-6 / RFC 9000 §8.2.2 — a PATH_RESPONSE belongs on the path its
+    /// challenge arrived on: it is popped only for that address, and a debt
+    /// owed elsewhere is discarded rather than misdelivered.
+    #[test]
+    fn path_response_is_bound_to_the_path_it_arrived_on() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let here = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 443);
+        let elsewhere = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7)), 443);
+        let mut p = PathChallengeState::new();
+        p.on_challenge([0xa; 8], Some(elsewhere));
+        p.on_challenge([0xb; 8], Some(here));
+        // Only the one owed here may go out on this path.
+        assert_eq!(p.pop_outbound_response(Some(here)), Some([0xb; 8]));
+        assert_eq!(p.pop_outbound_response(Some(here)), None);
+        // The other was discarded on the way past, not misdelivered.
+        assert!(!p.has_pending_response());
+
+        // A caller with no address information (plain `feed_datagram`) is
+        // unaffected: every debt matches.
+        let mut p = PathChallengeState::new();
+        p.on_challenge([0xc; 8], None);
+        assert_eq!(p.pop_outbound_response(Some(here)), Some([0xc; 8]));
+
+        // And the bulk prune drops only the foreign ones.
+        let mut p = PathChallengeState::new();
+        p.on_challenge([0xd; 8], Some(elsewhere));
+        p.on_challenge([0xe; 8], Some(here));
+        p.retain_responses_for(Some(here));
+        assert_eq!(p.pop_outbound_response(Some(here)), Some([0xe; 8]));
+        assert!(!p.has_pending_response());
     }
 
     #[test]
