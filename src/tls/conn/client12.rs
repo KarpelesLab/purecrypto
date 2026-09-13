@@ -20,8 +20,10 @@
 //! [`ClientCertConfig`] type as the TLS 1.3 client) and RFC 5077 session
 //! tickets via [`ClientConfig12::with_session`]. The abbreviated resumed
 //! handshake (RFC 5077 §3.4) skips Certificate / SKE / SHDone on both sides.
-//! Session resumption via the legacy `session_id` path is not implemented;
-//! we send an empty session_id and never accept a non-empty echo.
+//! Session resumption via the legacy `session_id` path is not implemented:
+//! we send an empty session_id and ignore whatever the server echoes (a
+//! server-assigned session_id can never resume here, since only a
+//! `session_ticket` carries resumable state).
 //!
 //! # Record-layer note
 //!
@@ -1268,7 +1270,11 @@ impl ClientConnection12 {
                             self.state = State::Closed;
                             return Ok(());
                         }
-                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation => {
+                        // Only at warning level: RFC 5246 §7.2.2 makes every
+                        // fatal-level alert fatal, whatever its description.
+                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation
+                            if !alert.fatal =>
+                        {
                             // Non-fatal warning — stay connected.
                             continue;
                         }
@@ -2382,6 +2388,13 @@ impl ClientConnection12 {
             if msg_type != hs_type::FINISHED {
                 return Err(Error::UnexpectedMessage);
             }
+            // RFC 5246 §7.4.9: the server's Finished is the first message
+            // under the new cipher spec. Without a read crypter installed by
+            // its ChangeCipherSpec, this Finished arrived in the clear —
+            // refuse it rather than complete an unprotected handshake.
+            if self.server_crypter.is_none() {
+                return Err(Error::UnexpectedMessage);
+            }
             let master = self.master.expect("master set");
             let expected = self.legacy_verify_data(&master, false);
             if body.len() != expected.len() || !bool::from(expected.as_slice().ct_eq(body)) {
@@ -2417,6 +2430,12 @@ impl ClientConnection12 {
         }
         if body.len() != 12 {
             return Err(Error::Decode);
+        }
+        // RFC 5246 §7.4.9: the server's Finished must arrive under the new
+        // cipher spec — i.e. after its ChangeCipherSpec installed our read
+        // crypter. A plaintext Finished is not a handshake we can complete.
+        if self.server_crypter.is_none() {
+            return Err(Error::UnexpectedMessage);
         }
         let suite = self.suite.expect("suite set");
         let master = self.master.expect("master set");
@@ -2956,6 +2975,82 @@ mod tests {
             partial.len(),
             "only the incomplete trailing record stays buffered"
         );
+    }
+
+    /// A fatal-level `user_canceled` / `no_renegotiation` alert is fatal:
+    /// only the warning level is the benign case RFC 5246 §7.2.1 describes.
+    #[test]
+    fn client12_treats_fatal_level_warning_alerts_as_fatal() {
+        use crate::tls::codec::write_record;
+        for (level, fatal) in [(1u8, false), (2u8, true)] {
+            let mut rng = HmacDrbg::<Sha256>::new(b"c12-alert-level", b"nonce", &[]);
+            let mut c = ClientConnection12::new(
+                ClientConfig12::new(RootCertStore::new()),
+                "example.com",
+                &mut rng,
+            )
+            .unwrap();
+            let _ = c.write_tls();
+            let mut rec = Vec::new();
+            write_record(
+                &mut rec,
+                ContentType::Alert,
+                ProtocolVersion::TLSv1_2,
+                &[level, AlertDescription::UserCanceled.as_u8()],
+            );
+            c.read_tls(&rec);
+            let r = c.process_new_packets();
+            if fatal {
+                assert!(matches!(
+                    r,
+                    Err(Error::AlertReceived(AlertDescription::UserCanceled))
+                ));
+                assert!(!c.is_handshake_complete());
+            } else {
+                // Warning level: ignored, the handshake is still running.
+                r.unwrap();
+                assert!(c.is_handshaking());
+            }
+        }
+    }
+
+    /// RFC 5246 §7.4.9: the server's Finished arrives under the new cipher
+    /// spec. A plaintext Finished — no ChangeCipherSpec, so no read crypter
+    /// installed — must be refused outright (`unexpected_message`), not run
+    /// through the verify_data comparison as if it could complete.
+    #[test]
+    fn client12_rejects_server_finished_without_change_cipher_spec() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-finished-no-ccs", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = c.write_tls();
+        // Move the engine to where the server's Finished is expected.
+        c.state = State::WaitServerFinished;
+        c.suite = lookup_suite_12(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256);
+        c.master = Some([0u8; 48]);
+        c.transcript.set_alg(c.suite.expect("suite set").hash);
+        assert!(c.server_crypter.is_none());
+
+        let mut msg = alloc::vec![hs_type::FINISHED, 0, 0, 12];
+        msg.extend_from_slice(&[0u8; 12]);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &msg,
+        );
+        c.read_tls(&rec);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+        assert!(!c.is_handshake_complete());
     }
 
     // ---- opt-in legacy (TLS 1.0/1.1) ServerHello hardening ---------------

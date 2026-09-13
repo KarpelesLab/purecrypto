@@ -789,7 +789,11 @@ impl<R: RngCore> ServerConnection12<R> {
                             self.state = State::Closed;
                             return Ok(());
                         }
-                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation => {
+                        // Only at warning level: a fatal-level alert is fatal
+                        // whatever its description (RFC 5246 §7.2.2).
+                        AlertDescription::UserCanceled | AlertDescription::NoRenegotiation
+                            if !alert.fatal =>
+                        {
                             continue;
                         }
                         _ => {
