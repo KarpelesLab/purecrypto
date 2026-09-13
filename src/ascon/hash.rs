@@ -304,7 +304,9 @@ impl Drop for AsconCxof128 {
     }
 }
 
-#[cfg(test)]
+// The SP 800-232 KAT files are variable-length messages and 512-bit XOF
+// outputs, decoded into `Vec`s; the sponge itself needs no allocator.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::test_util::{from_hex, from_hex_vec};

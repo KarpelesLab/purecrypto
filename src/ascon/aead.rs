@@ -246,7 +246,9 @@ impl Drop for AsconAead128 {
 
 impl ZeroizeOnDrop for AsconAead128 {}
 
-#[cfg(test)]
+// The SP 800-232 KAT file carries variable-length AAD/plaintext/ciphertext
+// fixtures, decoded into `Vec`s; `AsconAead128` itself needs no allocator.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::test_util::from_hex;
