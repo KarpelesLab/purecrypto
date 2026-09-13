@@ -70,7 +70,7 @@ pub use poly1305::Poly1305;
 pub use siv::AesSiv;
 pub use sm4::Sm4;
 pub use xchacha20poly1305::XChaCha20Poly1305;
-pub use xts::{Aes128Xts, Aes256Xts, Xts};
+pub use xts::{Aes128Xts, Aes256Xts, Xts, XtsError};
 
 /// A block cipher: a keyed, invertible permutation on fixed-size blocks.
 pub trait BlockCipher {

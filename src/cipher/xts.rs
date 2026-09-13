@@ -25,12 +25,65 @@
 //!   here) at 2²⁰ blocks — 16 MiB. Beyond that the α-power sequence starts to
 //!   give distinguishing advantage, so a caller must split larger objects into
 //!   independently-tweaked data units rather than passing one giant `buf`.
-//!   This is not enforced: `encrypt_sector` will happily process more.
+//!   [`Xts::encrypt_sector`] / [`Xts::decrypt_sector`] do not enforce it;
+//!   [`Xts::encrypt_sector_checked`] / [`Xts::decrypt_sector_checked`] do,
+//!   returning [`XtsError::DataUnitTooLong`].
 //! * The data key and the tweak key must be **independent**. Reusing one key
 //!   for both collapses the XEX construction; [`Xts::new`] takes two already
-//!   keyed ciphers and so cannot check it.
+//!   keyed ciphers and so cannot check it. Prefer the byte-key constructors
+//!   ([`Aes128Xts::from_keys`], [`Aes128Xts::new_from_key_bytes`] and their
+//!   [`Aes256Xts`] counterparts), which reject `K1 == K2` in constant time.
+//!
+//! ```
+//! use purecrypto::cipher::{Aes128Xts, XtsError};
+//!
+//! let xts = Aes128Xts::from_keys(&[0x11; 16], &[0x22; 16]).unwrap();
+//! let mut sector = [0u8; 512];
+//! xts.encrypt_sector_checked(7, &mut sector).unwrap();
+//!
+//! // The same key for both halves is refused.
+//! assert!(matches!(
+//!     Aes128Xts::from_keys(&[0x11; 16], &[0x11; 16]),
+//!     Err(XtsError::RepeatedKey)
+//! ));
+//! ```
 
 use super::{BlockCipher, InvalidLength};
+use crate::ct::ConstantTimeEq;
+
+/// Errors from the validating XTS entry points (the byte-key constructors and
+/// the `*_checked` sector methods).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum XtsError {
+    /// The data key `K1` and the tweak key `K2` are identical, which voids
+    /// XTS's security argument (IEEE 1619-2007 §5.1; FIPS 140 implementation
+    /// guidance requires rejecting it).
+    RepeatedKey,
+    /// The data unit is shorter than one 16-byte block.
+    InvalidLength,
+    /// The data unit is longer than the 2²⁰-block (16 MiB) maximum of IEEE
+    /// 1619-2007 §5.1 / NIST SP 800-38E.
+    DataUnitTooLong,
+}
+
+impl core::fmt::Display for XtsError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            XtsError::RepeatedKey => "XTS data key and tweak key must differ",
+            XtsError::InvalidLength => "XTS data unit shorter than one block",
+            XtsError::DataUnitTooLong => "XTS data unit exceeds 2^20 blocks",
+        })
+    }
+}
+
+impl core::error::Error for XtsError {}
+
+impl From<InvalidLength> for XtsError {
+    fn from(_: InvalidLength) -> Self {
+        XtsError::InvalidLength
+    }
+}
 
 /// Doubles a 128-bit XTS tweak in place under the IEEE 1619 polynomial.
 ///
@@ -76,6 +129,46 @@ impl<C: BlockCipher> Xts<C> {
             cipher_data,
             cipher_tweak,
         }
+    }
+
+    /// Maximum number of 16-byte blocks in one data unit (IEEE 1619-2007
+    /// §5.1, NIST SP 800-38E): 2²⁰, i.e. 16 MiB. A trailing partial block
+    /// counts as a block.
+    pub const MAX_DATA_UNIT_BLOCKS: usize = 1 << 20;
+
+    /// Checks a data-unit length against the IEEE 1619 bounds.
+    fn check_data_unit(len: usize) -> Result<(), XtsError> {
+        if len < 16 {
+            return Err(XtsError::InvalidLength);
+        }
+        if len.div_ceil(16) > Self::MAX_DATA_UNIT_BLOCKS {
+            return Err(XtsError::DataUnitTooLong);
+        }
+        Ok(())
+    }
+
+    /// Like [`encrypt_sector`](Self::encrypt_sector), but also enforces the
+    /// 2²⁰-block data-unit limit ([`MAX_DATA_UNIT_BLOCKS`](Self::MAX_DATA_UNIT_BLOCKS)).
+    /// `buf` is left untouched on error.
+    pub fn encrypt_sector_checked(
+        &self,
+        sector_index: u128,
+        buf: &mut [u8],
+    ) -> Result<(), XtsError> {
+        Self::check_data_unit(buf.len())?;
+        Ok(self.encrypt_sector(sector_index, buf)?)
+    }
+
+    /// Like [`decrypt_sector`](Self::decrypt_sector), but also enforces the
+    /// 2²⁰-block data-unit limit ([`MAX_DATA_UNIT_BLOCKS`](Self::MAX_DATA_UNIT_BLOCKS)).
+    /// `buf` is left untouched on error.
+    pub fn decrypt_sector_checked(
+        &self,
+        sector_index: u128,
+        buf: &mut [u8],
+    ) -> Result<(), XtsError> {
+        Self::check_data_unit(buf.len())?;
+        Ok(self.decrypt_sector(sector_index, buf)?)
     }
 
     /// Derives the initial tweak T₀ = AES_{K2}(sector_index_le).
@@ -225,11 +318,132 @@ pub type Aes128Xts = Xts<super::Aes128>;
 /// XTS-AES-256 — total key length 512 bits (two 256-bit AES keys).
 pub type Aes256Xts = Xts<super::Aes256>;
 
+macro_rules! xts_byte_key_ctors {
+    ($cipher:ty, $half:literal, $full:literal, $alias:literal) => {
+        impl Xts<$cipher> {
+            #[doc = concat!("Creates an ", $alias, " context from the data key `k1` and the tweak key `k2`.")]
+            ///
+            /// Returns [`XtsError::RepeatedKey`] if `k1 == k2`; the comparison
+            /// is constant time, so it reveals nothing about the keys beyond
+            /// the verdict.
+            pub fn from_keys(k1: &[u8; $half], k2: &[u8; $half]) -> Result<Self, XtsError> {
+                if bool::from(k1.ct_eq(k2)) {
+                    return Err(XtsError::RepeatedKey);
+                }
+                Ok(Self::new(<$cipher>::new(k1), <$cipher>::new(k2)))
+            }
+
+            #[doc = concat!("Creates an ", $alias, " context from the ", stringify!($full), "-byte concatenated key `K1 \u{2016} K2`")]
+            /// (data key first, tweak key second — the IEEE 1619 / NIST
+            /// SP 800-38E key layout).
+            ///
+            /// Returns [`XtsError::RepeatedKey`] if the two halves are equal,
+            /// compared in constant time.
+            pub fn new_from_key_bytes(key: &[u8; $full]) -> Result<Self, XtsError> {
+                let (k1, k2) = key.split_at($half);
+                let k1: &[u8; $half] = k1.try_into().expect("half-length split");
+                let k2: &[u8; $half] = k2.try_into().expect("half-length split");
+                Self::from_keys(k1, k2)
+            }
+        }
+    };
+}
+
+xts_byte_key_ctors!(super::Aes128, 16, 32, "XTS-AES-128");
+xts_byte_key_ctors!(super::Aes256, 32, 64, "XTS-AES-256");
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cipher::{Aes128, Aes256};
     use crate::test_util::{from_hex, from_hex_vec};
+
+    /// The byte-key constructors refuse `K1 == K2` and otherwise build the
+    /// same context as [`Xts::new`] (checked against IEEE 1619 vectors 2/10).
+    #[test]
+    fn byte_key_ctors_reject_repeated_key() {
+        assert_eq!(
+            Aes128Xts::from_keys(&[0u8; 16], &[0u8; 16]).err(),
+            Some(XtsError::RepeatedKey)
+        );
+        assert_eq!(
+            Aes128Xts::new_from_key_bytes(&[0x5a; 32]).err(),
+            Some(XtsError::RepeatedKey)
+        );
+        assert_eq!(
+            Aes256Xts::from_keys(&[7u8; 32], &[7u8; 32]).err(),
+            Some(XtsError::RepeatedKey)
+        );
+        assert_eq!(
+            Aes256Xts::new_from_key_bytes(&[0xa5; 64]).err(),
+            Some(XtsError::RepeatedKey)
+        );
+        // Keys differing in a single bit are accepted.
+        let mut k2 = [0u8; 16];
+        k2[15] = 1;
+        assert!(Aes128Xts::from_keys(&[0u8; 16], &k2).is_ok());
+        let mut k = [0u8; 64];
+        k[0] = 0x80;
+        assert!(Aes256Xts::new_from_key_bytes(&k).is_ok());
+
+        // IEEE 1619-2007 vector 2 through the concatenated-key constructor.
+        let key =
+            from_hex::<32>("1111111111111111111111111111111122222222222222222222222222222222");
+        let xts = Aes128Xts::new_from_key_bytes(&key).unwrap();
+        let mut buf =
+            from_hex::<32>("4444444444444444444444444444444444444444444444444444444444444444");
+        xts.encrypt_sector_checked(0x3333333333, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<32>("c454185e6a16936e39334038acef838bfb186fff7480adc4289382ecd6d394f0")
+        );
+
+        // IEEE 1619-2007 vector 10 (XTS-AES-256) through `from_keys`.
+        let k1 = from_hex::<32>("2718281828459045235360287471352662497757247093699959574966967627");
+        let k2 = from_hex::<32>("3141592653589793238462643383279502884197169399375105820974944592");
+        let xts = Aes256Xts::from_keys(&k1, &k2).unwrap();
+        let mut buf =
+            from_hex::<32>("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+        xts.encrypt_sector(0xff, &mut buf).unwrap();
+        assert_eq!(
+            buf,
+            from_hex::<32>("1c3b3a102f770386e4836c99e370cf9bea00803f5e482357a4ae12d414a3e63b")
+        );
+    }
+
+    /// The checked sector methods enforce the 2²⁰-block data-unit cap (a
+    /// trailing partial block counts) and the one-block minimum, and leave
+    /// the buffer untouched when they refuse.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn checked_sector_enforces_data_unit_limit() {
+        let xts = Aes128Xts::from_keys(&[1u8; 16], &[2u8; 16]).unwrap();
+        let max = Aes128Xts::MAX_DATA_UNIT_BLOCKS * 16;
+
+        let mut short = [0u8; 15];
+        assert_eq!(
+            xts.encrypt_sector_checked(0, &mut short),
+            Err(XtsError::InvalidLength)
+        );
+
+        let mut over = alloc::vec![0x33u8; max + 1];
+        assert_eq!(
+            xts.encrypt_sector_checked(0, &mut over),
+            Err(XtsError::DataUnitTooLong)
+        );
+        assert_eq!(
+            xts.decrypt_sector_checked(0, &mut over),
+            Err(XtsError::DataUnitTooLong)
+        );
+        assert!(over.iter().all(|&b| b == 0x33), "buffer touched on refusal");
+
+        // Exactly 2²⁰ blocks is allowed and round-trips.
+        over.truncate(max);
+        xts.encrypt_sector_checked(9, &mut over).unwrap();
+        assert!(over.iter().any(|&b| b != 0x33));
+        xts.decrypt_sector_checked(9, &mut over).unwrap();
+        assert!(over.iter().all(|&b| b == 0x33));
+    }
 
     /// IEEE 1619-2007 Annex B Vector 1 (XTS-AES-128, two full blocks, sector 0).
     #[test]
