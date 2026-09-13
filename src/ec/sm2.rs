@@ -364,8 +364,8 @@ impl Sm2PublicKey {
 
 impl Sm2PrivateKey {
     /// Creates a private key from a big-endian scalar, checking it is in
-    /// `[1, n-2]` (GB/T 32918.1 §6.1; `n-1` cannot sign, see
-    /// [`in_key_range`]).
+    /// `[1, n-2]` (GB/T 32918.1 §6.1; `d = n-1` makes `1 + d` zero modulo
+    /// the order, so it can never produce a signature).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         let mut d = BoxedUint::from_be_bytes(bytes);
         let n = CURVE.curve().order().clone();

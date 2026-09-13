@@ -364,8 +364,8 @@ fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
 ///
 /// # Nonces
 ///
-/// The nonce and the decoy `s` values are *hedged*: derived by
-/// [`derive_nonces`] from the ring secret, the transcript, `index` and 32
+/// The nonce and the decoy `s` values are *hedged*: derived by hashing
+/// a domain separator with the ring secret, the transcript, `index` and 32
 /// fresh bytes from `rng`, rather than taken from `rng` directly. A repeated
 /// RNG output alone therefore cannot repeat a nonce across two different
 /// statements, which in a ring signature would disclose the signer's secret
