@@ -927,10 +927,21 @@ fn enforce_constraints_on_cert(
 ///   NOT "example.com" itself (this leading-dot convention is widely
 ///   implemented for "all subdomains, not the apex").
 ///
-/// Case-insensitive compare per RFC 4343 §2.
+/// Case-insensitive compare per RFC 4343 §2. A single trailing dot (the
+/// fully-qualified "root" form, `host.example.com.`) is stripped from both
+/// sides first — see [`strip_trailing_dot`].
 fn dns_in_subtree(name: &str, base: &str) -> bool {
-    let name_l = name.to_ascii_lowercase();
-    let base_l = base.to_ascii_lowercase();
+    let name_l = strip_trailing_dot(name).to_ascii_lowercase();
+    let base_l = strip_trailing_dot(base).to_ascii_lowercase();
+    // RFC 5280 §4.2.1.10: a dNSName constraint matches every name built by
+    // adding labels to its left, and the empty string is a left-extension of
+    // every DNS name. So an empty base matches all DNS names — `permitted:
+    // dNSName ""` permits every host, `excluded: dNSName ""` (the CA/Browser
+    // Forum "no DNS names at all" technically-constrained sub-CA form) forbids
+    // every host.
+    if base_l.is_empty() {
+        return true;
+    }
     if let Some(suffix) = base_l.strip_prefix('.') {
         // ".example.com" → match strict subdomains only.
         if name_l.len() <= suffix.len() {
@@ -1170,10 +1181,32 @@ fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Strips a single trailing dot from a DNS name, if present.
+///
+/// `host.example.com.` and `host.example.com` denote the same name (the
+/// trailing dot just makes the FQDN explicit). Both the reference identifier a
+/// caller passes to [`verify_hostname`] and the names inside a certificate
+/// (SAN dNSName entries, nameConstraints bases) may carry it, so every DNS
+/// comparison in this module normalizes it away first. Without that, a leaf
+/// whose SAN reads `secure.example.com.` escaped an `excluded` name constraint
+/// on `secure.example.com` while still matching a hostname check for
+/// `secure.example.com.`. A bare `"."` (the root) is left alone — stripping it
+/// would produce the empty name.
+fn strip_trailing_dot(name: &str) -> &str {
+    match name.strip_suffix('.') {
+        Some(stripped) if !stripped.is_empty() => stripped,
+        _ => name,
+    }
+}
+
 /// Matches a certificate dNSName `pattern` against `host`, case-insensitively,
 /// allowing a single leftmost-label `*` wildcard (`*.example.com` matches
-/// `a.example.com` but not `example.com` or `a.b.example.com`).
+/// `a.example.com` but not `example.com` or `a.b.example.com`). A single
+/// trailing dot on either side is normalized away first
+/// ([`strip_trailing_dot`]).
 fn dns_name_matches(pattern: &str, host: &str) -> bool {
+    let pattern = strip_trailing_dot(pattern);
+    let host = strip_trailing_dot(host);
     // RFC 6125 §6.5.2: dNSName / CN-fallback matching MUST NOT be used
     // for IP-literal hosts. If either side looks IP-shaped, refuse the
     // match — IPs belong in the iPAddress SAN slot and have a separate
@@ -1186,6 +1219,14 @@ fn dns_name_matches(pattern: &str, host: &str) -> bool {
         // cover exactly one label, and the wildcard label MUST NOT be
         // partial (`f*.example.com` is forbidden — already prevented by
         // requiring the prefix `*.`).
+        //
+        // The remainder must also keep at least two labels: `*.com` (or
+        // `*.co.uk`-shaped public suffixes, which we cannot enumerate) would
+        // otherwise let one certificate speak for an entire TLD. Requiring a
+        // dot in the remainder is the same floor browsers apply.
+        if !suffix.contains('.') {
+            return false;
+        }
         match host.split_once('.') {
             Some((label, rest)) => {
                 !label.is_empty() && !rest.is_empty() && rest.eq_ignore_ascii_case(suffix)
@@ -2529,6 +2570,23 @@ mod tests {
             "f*.example.com",
             "foo.example.com"
         ));
+        // A single trailing dot on either side denotes the same name.
+        assert!(super::dns_name_matches("example.com", "example.com."));
+        assert!(super::dns_name_matches("example.com.", "example.com"));
+        assert!(super::dns_name_matches(
+            "*.example.com.",
+            "host.example.com"
+        ));
+        assert!(super::dns_name_matches(
+            "*.example.com",
+            "host.example.com."
+        ));
+        assert!(!super::dns_name_matches("example.com.", "other.com"));
+        // A wildcard must leave at least two labels: `*.com` must not
+        // authenticate an entire TLD.
+        assert!(!super::dns_name_matches("*.com", "example.com"));
+        assert!(!super::dns_name_matches("*.com.", "example.com"));
+        assert!(!super::dns_name_matches("*.", "example"));
     }
 
     // ----------------------------------------------------------------------
@@ -2548,6 +2606,92 @@ mod tests {
         assert!(!super::dns_in_subtree("example.com", ".example.com"));
         // Case-insensitive.
         assert!(super::dns_in_subtree("FOO.Example.Com", "example.com"));
+        // A single trailing dot (the explicit-FQDN form) is normalized away on
+        // both sides: it must not let a name escape a subtree.
+        assert!(super::dns_in_subtree("example.com.", "example.com"));
+        assert!(super::dns_in_subtree("foo.example.com.", "example.com"));
+        assert!(super::dns_in_subtree("example.com", "example.com."));
+        assert!(super::dns_in_subtree("foo.example.com.", ".example.com"));
+        assert!(!super::dns_in_subtree("notexample.com.", "example.com"));
+        // RFC 5280 §4.2.1.10: an empty base is a left-extension of every DNS
+        // name, so it matches everything (the CA/B "no DNS names" form).
+        assert!(super::dns_in_subtree("anything.example", ""));
+        assert!(super::dns_in_subtree("example.com", ""));
+    }
+
+    /// Regression: a SAN dNSName with a trailing dot used to slip past an
+    /// `excluded` dNSName subtree while still authenticating the same host.
+    #[test]
+    fn trailing_dot_san_cannot_escape_excluded_subtree() {
+        use crate::x509::GeneralName;
+        let nc = crate::x509::extension::name_constraints(
+            &[],
+            &[GeneralName::Dns("secure.example.com".into())],
+        );
+        let leaf_sans = [GeneralName::Dns("secure.example.com.".into())];
+        let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", &leaf_sans);
+
+        // The trailing-dot SAN still names the excluded host...
+        assert_eq!(
+            super::verify_hostname(&leaf, "secure.example.com."),
+            Ok(()),
+            "trailing-dot reference identifier matches the trailing-dot SAN"
+        );
+        assert_eq!(
+            super::verify_hostname(&leaf, "secure.example.com"),
+            Ok(()),
+            "and the same host without the dot"
+        );
+        // ...so the chain must be rejected by the excluded subtree.
+        let mut store = RootCertStore::new();
+        store.add_der(root.to_der().to_vec()).unwrap();
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        assert_eq!(
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            )
+            .map(|_| ()),
+            Err(Error::BadCertificate)
+        );
+    }
+
+    /// An empty `excluded` dNSName constraint (CA/Browser Forum
+    /// technically-constrained sub-CA, "this CA may not issue for any DNS
+    /// name") parses and forbids every DNS name; an empty `permitted` one
+    /// allows every DNS name.
+    #[test]
+    fn empty_dns_name_constraint_matches_all_names() {
+        use crate::x509::GeneralName;
+        let mut store_and_chain = |nc: crate::x509::Extension, sans: &[GeneralName]| {
+            let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", sans);
+            let mut store = RootCertStore::new();
+            store.add_der(root.to_der().to_vec()).unwrap();
+            let now = Time::utc(2026, 1, 1, 0, 0, 0);
+            verify_chain(
+                &store,
+                &[leaf.to_der().to_vec(), int.to_der().to_vec()],
+                Some(&now),
+                &policy(),
+            )
+            .map(|_| ())
+        };
+        // Excluded "" → no DNS name may be issued.
+        let excluded_all =
+            crate::x509::extension::name_constraints(&[], &[GeneralName::Dns("".into())]);
+        assert_eq!(
+            store_and_chain(excluded_all, &[GeneralName::Dns("host.example".into())]),
+            Err(Error::BadCertificate)
+        );
+        // Permitted "" → every DNS name is inside the subtree.
+        let permitted_all =
+            crate::x509::extension::name_constraints(&[GeneralName::Dns("".into())], &[]);
+        assert_eq!(
+            store_and_chain(permitted_all, &[GeneralName::Dns("host.example".into())]),
+            Ok(())
+        );
     }
 
     #[test]

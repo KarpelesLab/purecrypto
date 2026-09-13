@@ -1527,14 +1527,20 @@ fn parse_subtrees(
         match t {
             // dNSName [2] IMPLICIT IA5String → primitive context 0x82.
             0x82 => {
-                // Mirror the SAN dNSName validation in `parse_dns_names`:
-                // reject empty entries and any byte outside printable ASCII
-                // (control chars, NUL, DEL). An embedded NUL or newline in a
-                // constraint string can confuse a downstream name matcher or
-                // log sink just as it can in a SAN.
-                if value.is_empty() {
-                    return Err(Error::Malformed);
-                }
+                // Mirror the SAN dNSName validation in `parse_dns_names` for
+                // the byte repertoire: any byte outside printable ASCII
+                // (control chars, NUL, DEL) is rejected — an embedded NUL or
+                // newline in a constraint string can confuse a downstream name
+                // matcher or log sink just as it can in a SAN.
+                //
+                // Unlike a SAN entry, an EMPTY dNSName is legal here and
+                // meaningful: RFC 5280 §4.2.1.10 matches a dNSName constraint
+                // against any name obtained by adding labels to its left, and
+                // the empty string is a suffix of every name. CA/Browser Forum
+                // technically-constrained sub-CAs use `excluded: dNSName ""`
+                // to forbid DNS names entirely (and a permitted `""` allows
+                // them all). It is accepted with exactly those semantics
+                // rather than making the certificate Malformed.
                 for &b in value {
                     if !(0x20..=0x7E).contains(&b) {
                         return Err(Error::Malformed);
@@ -2669,11 +2675,7 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
     fn name_constraint_dns_subtree_rejects_control_chars() {
         // A nameConstraints dNSName subtree carrying an embedded NUL (or other
         // control char) must be rejected, mirroring the SAN dNSName parser.
-        for bad in [
-            b"evil\x00.example".as_slice(),
-            b"evil\n.example".as_slice(),
-            b"".as_slice(),
-        ] {
+        for bad in [b"evil\x00.example".as_slice(), b"evil\n.example".as_slice()] {
             let body = dns_subtree(bad);
             let mut dns = alloc::vec::Vec::new();
             let mut ip = alloc::vec::Vec::new();
@@ -2683,6 +2685,17 @@ ychU4nzuraYi2jNpgZhSF+plk2mEygHvRKTdSsvVFUfuVRIu\n\
                 "should reject {bad:?}"
             );
         }
+        // ...but an EMPTY dNSName is legal (RFC 5280 §4.2.1.10: it is a
+        // left-extension of every name, so it matches all DNS names — the
+        // CA/Browser Forum technically-constrained sub-CA form). It must parse
+        // and be carried through to the matcher, not rejected as Malformed.
+        let body = dns_subtree(b"");
+        let mut dns = alloc::vec::Vec::new();
+        let mut ip = alloc::vec::Vec::new();
+        let mut unenforceable = false;
+        super::parse_subtrees(&body, &mut dns, &mut ip, &mut unenforceable).unwrap();
+        assert_eq!(dns, alloc::vec![alloc::string::String::new()]);
+        assert!(!unenforceable);
     }
 
     #[test]
