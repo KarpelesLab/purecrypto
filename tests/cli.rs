@@ -2139,6 +2139,68 @@ fn s_server_rejects_key_from_a_different_pair() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The DTLS engines fail closed on client authentication, so `-Verify` with a
+/// DTLS version used to surface as a bare `UnsupportedVersion` from
+/// `Connection::server`. It must be refused up front with a message naming
+/// the actual limitation.
+#[test]
+fn s_server_rejects_client_auth_for_dtls() {
+    use purecrypto::ec::Ed25519PrivateKey;
+    use purecrypto::rng::OsRng;
+    use purecrypto::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
+
+    let dir = std::env::temp_dir().join(format!("pc_s_server_dtls_verify_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let cert_path = dir.join("server.pem");
+    let key_path = dir.join("server.key");
+
+    let key = Ed25519PrivateKey::generate(&mut OsRng);
+    let cert = Certificate::self_signed_general(
+        &CertSigner::Ed25519(&key),
+        &DistinguishedName::common_name("127.0.0.1"),
+        &Validity::new(
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        ),
+        1,
+        false,
+        &["127.0.0.1"],
+    )
+    .unwrap();
+    std::fs::write(&cert_path, cert.to_pem()).unwrap();
+    std::fs::write(&key_path, key.to_pkcs8_pem()).unwrap();
+
+    for version in ["-dtls1_2", "-dtls1_3"] {
+        let (_out, err, ok) = run_capture(
+            &[
+                "s_server",
+                "-cert",
+                cert_path.to_str().unwrap(),
+                "-key",
+                key_path.to_str().unwrap(),
+                version,
+                "-Verify",
+                cert_path.to_str().unwrap(),
+                "-accept",
+                "127.0.0.1:1",
+                "-quiet",
+            ],
+            b"",
+        );
+        assert!(!ok, "{version}: -Verify must be refused for DTLS");
+        assert!(
+            err.contains("not supported for DTLS"),
+            "{version}: expected a DTLS client-auth diagnostic, got stderr: {err}"
+        );
+        assert!(
+            !err.contains("UnsupportedVersion"),
+            "{version}: the raw engine error leaked: {err}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 #[ignore = "requires network access"]
 fn s_client_live_cloudflare() {
@@ -4019,8 +4081,8 @@ fn pkeyutl_rsa_pkcs1_warns_and_uniform_decrypt_error() {
     );
     assert!(ok, "pkcs1 decrypt failed: {err}");
     assert!(
-        err.contains("padding oracle") && err.contains("untrusted ciphertexts"),
-        "expected pkcs1 decrypt oracle warning, got stderr: {err}"
+        err.contains("implicit rejection") && err.contains("pseudo-random plaintext"),
+        "expected pkcs1 decrypt implicit-rejection warning, got stderr: {err}"
     );
     assert_eq!(
         std::fs::read(dir.join("rt.bin")).unwrap(),
@@ -4028,6 +4090,10 @@ fn pkeyutl_rsa_pkcs1_warns_and_uniform_decrypt_error() {
     );
 
     // Failure 1: bit-flipped ciphertext (padding failure inside the modulus).
+    // With implicit rejection (RFC 8017 §7.2.2) there is no failure to report:
+    // the command succeeds and hands back a deterministic pseudo-random
+    // message. That is the point — no padding oracle is exposed at all, at the
+    // cost of not being able to tell "bad padding" from "wrong key".
     let mut bad = std::fs::read(dir.join("ct.bin")).unwrap();
     bad[40] ^= 0x55;
     std::fs::write(dir.join("bad.bin"), &bad).unwrap();
@@ -4044,9 +4110,40 @@ fn pkeyutl_rsa_pkcs1_warns_and_uniform_decrypt_error() {
         ],
         b"",
     );
-    assert!(!ok);
+    assert!(
+        ok,
+        "implicit rejection must not surface a decrypt failure: {err_pad}"
+    );
+    assert!(
+        !err_pad.contains("decrypt failed"),
+        "padding failure leaked a decrypt error: {err_pad}"
+    );
+    let implicit = std::fs::read(dir.join("rt2.bin")).unwrap();
+    assert_ne!(
+        implicit, b"pkcs1 warning round trip",
+        "a corrupted ciphertext must not recover the plaintext"
+    );
+    // Deterministic: the same bad ciphertext yields the same pseudo-random
+    // message, so retrying is not an oracle either.
+    let (_out, _err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "decrypt",
+            "-inkey",
+            &p("rsa.key"),
+            "-in",
+            &p("bad.bin"),
+            "-out",
+            &p("rt2b.bin"),
+        ],
+        b"",
+    );
+    assert!(ok);
+    assert_eq!(implicit, std::fs::read(dir.join("rt2b.bin")).unwrap());
 
-    // Failure 2: wrong-length garbage (a length failure, not a padding one).
+    // Failure 2: wrong-length garbage. A ciphertext that is not exactly
+    // `modulus_len` bytes is a structural error the caller made, not an
+    // oracle, and it still reports the single fixed string.
     std::fs::write(dir.join("short.bin"), b"way too short").unwrap();
     let (_out, err_len, ok) = run_capture(
         &[
@@ -4062,22 +4159,13 @@ fn pkeyutl_rsa_pkcs1_warns_and_uniform_decrypt_error() {
         b"",
     );
     assert!(!ok);
-
-    // Both failures print the fixed string with no cause detail, and the two
-    // stderr transcripts are byte-identical (warning + uniform error).
-    for err in [&err_pad, &err_len] {
-        assert!(
-            err.contains("purecrypto: decrypt failed"),
-            "expected uniform decrypt error, got stderr: {err}"
-        );
-        assert!(
-            !err.contains("PKCS1 decrypt failed"),
-            "cause-specific decrypt error leaked: {err}"
-        );
-    }
-    assert_eq!(
-        err_pad, err_len,
-        "padding vs length failures must be indistinguishable"
+    assert!(
+        err_len.contains("purecrypto: decrypt failed"),
+        "expected uniform decrypt error, got stderr: {err_len}"
+    );
+    assert!(
+        !err_len.contains("PKCS1 decrypt failed"),
+        "cause-specific decrypt error leaked: {err_len}"
     );
 
     // OAEP must NOT trigger the pkcs1 warning, and its failures collapse into

@@ -138,6 +138,16 @@ pub(crate) fn run(args: Args) {
         .value("-key")
         .unwrap_or_else(|| die("-key is required"));
     let verify_ca = args.value("-Verify");
+    // The DTLS engines fail closed on client authentication: a config that
+    // asks for it is rejected by `Connection::server` with a bare
+    // `UnsupportedVersion`, which tells the operator nothing. Refuse here,
+    // before any key material is loaded or a connection is built.
+    if verify_ca.is_some() && matches!(version, ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13) {
+        die(
+            "-Verify (client certificate authentication) is not supported for DTLS; \
+             use -tls1_2/-tls1_3 over TCP, or drop -Verify",
+        );
+    }
     let alpn = args.value("-alpn").map(parse_alpn);
     let www = args.flag("-www") || args.flag("--www");
     let quiet = args.flag("-quiet") || args.flag("--quiet");
@@ -206,11 +216,7 @@ pub(crate) fn run(args: Args) {
             run_tcp(&mut conn, &mut sock, www, quiet);
         }
         ProtocolVersion::Dtls12 | ProtocolVersion::Dtls13 => {
-            if verify_ca.is_some() {
-                die(
-                    "DTLS server does not yet implement client authentication (-Verify unsupported)",
-                );
-            }
+            // `-Verify` was already rejected above, before the config was built.
             let accept = args.value("-accept").unwrap_or("127.0.0.1:4434");
             run_udp(&cfg, accept, mtu, quiet);
         }

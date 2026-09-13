@@ -419,9 +419,11 @@ fn try_load_sm2_public(path: &str) -> Option<Sm2PublicKey> {
 fn warn_pkcs1_padding(decrypt: bool) {
     if decrypt {
         eprintln!(
-            "purecrypto: warning: rsa_padding_mode:pkcs1 (the default) decryption is a \
-             Bleichenbacher padding oracle; do not expose this command to untrusted \
-             ciphertexts in a loop. Prefer -pkeyopt rsa_padding_mode:oaep"
+            "purecrypto: warning: rsa_padding_mode:pkcs1 (the default) is legacy and \
+             historically a Bleichenbacher padding oracle; decryption therefore uses \
+             implicit rejection, so a corrupt ciphertext or the wrong key yields \
+             pseudo-random plaintext instead of an error — this command cannot tell you \
+             a decrypt went wrong. Prefer -pkeyopt rsa_padding_mode:oaep"
         );
     } else {
         eprintln!(
@@ -533,6 +535,14 @@ fn run_decrypt(args: Args) {
     // underlying detail: distinguishing bad-padding from bad-length (etc.) is
     // exactly the Bleichenbacher / Manger oracle, and anyone wrapping this
     // one-shot CLI in a network-facing loop would hand it to the attacker.
+    //
+    // PKCS#1 v1.5 goes further and uses implicit rejection
+    // (`decrypt_pkcs1v15_implicit`): a padding failure yields a deterministic
+    // pseudo-random message of a pseudo-random length derived from the key and
+    // the ciphertext, so there is no failure signal to observe at all. The
+    // trade-off — flagged by `warn_pkcs1_padding` above — is that this command
+    // can no longer distinguish "bad padding" from "wrong key"; it just hands
+    // back plaintext that does not decode. That is the point.
     let pt = match padding {
         "oaep" => {
             dispatch_digest!(oaep_md(&opts), |D| {
@@ -541,7 +551,7 @@ fn run_decrypt(args: Args) {
             }, _ => die("unsupported rsa_oaep_md"))
         }
         "pkcs1" => rsa
-            .decrypt_pkcs1v15(&ct)
+            .decrypt_pkcs1v15_implicit(&ct)
             .unwrap_or_else(|_| die("decrypt failed")),
         other => die(format!("unsupported rsa_padding_mode: {other}")),
     };
