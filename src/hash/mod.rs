@@ -271,14 +271,22 @@ pub trait Mac: Clone {
     /// Consumes the MAC and checks the tag against `expected` in constant time.
     ///
     /// The comparison time depends only on the (public) tag length, not on
-    /// where a mismatch occurs. The default implementation supports tags up to
-    /// 64 bytes; for longer tags use [`finalize_into`](Mac::finalize_into) with
-    /// [`ConstantTimeEq`](crate::ct::ConstantTimeEq) directly.
+    /// where a mismatch occurs.
     ///
-    /// For variable-output MACs (`OUTPUT_LEN == None`) the tag is recomputed at
-    /// the caller-provided `expected.len()` and compared at that length. An
-    /// empty `expected` is always rejected, but the caller is responsible for
-    /// enforcing a minimum truncation length appropriate to their protocol.
+    /// For variable-output MACs (`OUTPUT_LEN == None`) the tag length is the
+    /// caller-provided `expected.len()`, which on a verification path is
+    /// **attacker-supplied**: a one-byte tag would be guessable with
+    /// probability 1/256. The default implementation therefore rejects any
+    /// `expected` shorter than [`MIN_VARIABLE_TAG_LEN`] (16 bytes) outright,
+    /// without recomputing the MAC. A protocol that genuinely needs shorter
+    /// tags must pin the length itself — [`finalize_into`](Mac::finalize_into)
+    /// at that fixed length plus
+    /// [`ConstantTimeEq`](crate::ct::ConstantTimeEq) — rather than taking the
+    /// length from the wire.
+    ///
+    /// Tags longer than 64 bytes are supported when the crate is built with
+    /// the `alloc` feature (the recomputed tag is buffered on the heap);
+    /// without `alloc` they are rejected, since the tag cannot be materialized.
     fn verify(self, expected: &[u8]) -> crate::ct::Choice {
         use crate::ct::ConstantTimeEq;
         // For fixed-output MACs, compare against the *full* tag: comparing only
@@ -287,17 +295,22 @@ pub trait Mac: Clone {
         // exact length match closes that off. `ct_eq` fails closed on the
         // length mismatch, so the early reject does not leak timing.
         let n = match Self::OUTPUT_LEN {
-            Some(len) => len.min(64),
+            Some(len) => len,
             None => {
+                // The tag length is public, so rejecting on it leaks nothing.
                 // A zero-length tag would compare zero bytes and trivially
-                // succeed — an unconditional bypass. Reject it outright; the
-                // tag length is public, so this branch leaks nothing.
-                if expected.is_empty() {
+                // succeed (an unconditional bypass); anything under
+                // `MIN_VARIABLE_TAG_LEN` is a brute-forceable tag the attacker
+                // chose the length of.
+                if expected.len() < MIN_VARIABLE_TAG_LEN {
                     return crate::ct::Choice::from(0u8);
                 }
-                expected.len().min(64)
+                expected.len()
             }
         };
+        if n > 64 {
+            return verify_long_tag(self, expected, n);
+        }
         let mut buf = [0u8; 64];
         self.finalize_into(&mut buf[..n]);
         // `ct_eq` fails closed when `n != expected.len()` (length mismatch).
@@ -307,9 +320,96 @@ pub trait Mac: Clone {
     }
 }
 
+/// Shortest tag the default [`Mac::verify`] accepts from a variable-output MAC
+/// (`OUTPUT_LEN == None`, e.g. [`Kmac128`]/[`Kmac256`]), where the tag length
+/// is whatever the verifier was handed. 16 bytes bounds a blind forgery at
+/// 2⁻¹²⁸; shorter tags are rejected as a verification failure.
+pub const MIN_VARIABLE_TAG_LEN: usize = 16;
+
+/// The `n > 64` arm of the default [`Mac::verify`]: recomputes an over-long tag
+/// in a heap buffer and compares it in constant time.
+#[cfg(feature = "alloc")]
+fn verify_long_tag<M: Mac>(mac: M, expected: &[u8], n: usize) -> crate::ct::Choice {
+    use crate::ct::ConstantTimeEq;
+    let mut buf = alloc::vec![0u8; n];
+    mac.finalize_into(&mut buf);
+    // Fails closed when `n != expected.len()`.
+    let eq = buf[..].ct_eq(expected);
+    zeroize::zero_bytes(&mut buf);
+    eq
+}
+
+/// Without `alloc` there is nowhere to materialize a tag longer than the
+/// 64-byte stack buffer, so such a tag cannot be verified: fail closed.
+#[cfg(not(feature = "alloc"))]
+fn verify_long_tag<M: Mac>(_mac: M, _expected: &[u8], _n: usize) -> crate::ct::Choice {
+    crate::ct::Choice::from(0u8)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Kmac128, Kmac256, Mac};
+    use super::{Kmac128, Kmac256, MIN_VARIABLE_TAG_LEN, Mac};
+
+    // The tag length of a variable-output MAC is whatever the verifier is
+    // handed, so a short tag is an attacker-chosen work factor: a 1-byte tag
+    // is guessed with probability 1/256. `verify` must reject anything below
+    // `MIN_VARIABLE_TAG_LEN`, for every possible tag value.
+    #[test]
+    fn mac_verify_rejects_short_variable_tags() {
+        let key = [0x42u8; 32];
+        let data = b"a short tag must never verify";
+
+        for guess in 0..=255u8 {
+            let mut m = Kmac128::new(&key, b"");
+            Mac::update(&mut m, data);
+            assert!(
+                !bool::from(Mac::verify(m, &[guess])),
+                "1-byte tag {guess:#04x} was accepted"
+            );
+        }
+
+        // Every length below the floor is rejected, including the *correct*
+        // tag of that length (the floor is a policy, not a comparison result).
+        for len in 1..MIN_VARIABLE_TAG_LEN {
+            let mut m = Kmac256::new(&key, b"App");
+            Mac::update(&mut m, data);
+            let mut tag = [0u8; MIN_VARIABLE_TAG_LEN];
+            Mac::finalize_into(m.clone(), &mut tag[..len]);
+            assert!(
+                !bool::from(Mac::verify(m, &tag[..len])),
+                "tag of len {len} was accepted"
+            );
+        }
+
+        // At the floor, a genuine tag still verifies and a flipped bit does not.
+        let mut m = Kmac256::new(&key, b"App");
+        Mac::update(&mut m, data);
+        let mut tag = [0u8; MIN_VARIABLE_TAG_LEN];
+        Mac::finalize_into(m.clone(), &mut tag);
+        assert!(bool::from(Mac::verify(m.clone(), &tag)));
+        tag[0] ^= 1;
+        assert!(!bool::from(Mac::verify(m, &tag)));
+    }
+
+    // Tags longer than the 64-byte stack buffer used to be rejected outright,
+    // even when correct. With `alloc` they must verify.
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn mac_verify_accepts_long_tags() {
+        let key = [0x11u8; 32];
+        let data = b"long tags are legitimate for a variable-output MAC";
+
+        for len in [65usize, 96, 128, 200] {
+            let mut m = Kmac128::new(&key, b"");
+            Mac::update(&mut m, data);
+            let mut tag = alloc::vec![0u8; len];
+            Mac::finalize_into(m.clone(), &mut tag);
+            assert!(bool::from(Mac::verify(m.clone(), &tag)), "len {len}");
+
+            tag[len - 1] ^= 0x80;
+            assert!(!bool::from(Mac::verify(m, &tag)), "len {len} (flipped)");
+        }
+    }
 
     // A variable-output MAC (`OUTPUT_LEN == None`) must reject an empty
     // expected tag: comparing zero bytes would otherwise succeed

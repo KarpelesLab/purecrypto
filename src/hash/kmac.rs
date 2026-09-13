@@ -171,7 +171,13 @@ macro_rules! kmac {
                 self.keccak.squeeze(out);
             }
             /// Consumes the MAC and checks it against `expected` in constant
-            /// time (tags up to 64 bytes; see [`Mac::verify`](super::Mac::verify)).
+            /// time.
+            ///
+            /// KMAC's tag length is the caller's, so `expected.len()` decides
+            /// what is recomputed and compared: tags shorter than
+            /// [`MIN_VARIABLE_TAG_LEN`](super::MIN_VARIABLE_TAG_LEN) are
+            /// rejected rather than compared, and tags longer than 64 bytes
+            /// need the `alloc` feature. See [`Mac::verify`](super::Mac::verify).
             pub fn verify(self, expected: &[u8]) -> crate::ct::Choice {
                 super::Mac::verify(self, expected)
             }
