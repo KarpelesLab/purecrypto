@@ -45,17 +45,15 @@ impl ChaCha20Poly1305 {
     /// bytes (RFC 8439 §2.6) so the unused half-block of secret keystream
     /// doesn't linger on the stack.
     ///
-    /// A plain store plus a `black_box` barrier rather than
-    /// [`crate::zeroize::Zeroize`]: this runs once per AEAD record, and the
-    /// 96 per-byte volatile stores it and the `otk` wipes in
-    /// `encrypt`/`decrypt` would issue measured ~3% slower on a 1 KiB record
-    /// than the two vector stores the plain assignment compiles to.
+    /// Wiped through [`crate::zeroize::Zeroize`]. This runs once per AEAD
+    /// record; the word-at-a-time volatile wipe makes it free (a per-byte
+    /// version measured ~3% slower on a 1 KiB record, which is why this was
+    /// once a plain store plus a `black_box` barrier).
     fn poly_key(&self, nonce: &[u8; 12]) -> [u8; 32] {
         let mut block0 = self.cipher.block(nonce, 0);
         let mut otk = [0u8; 32];
         otk.copy_from_slice(&block0[..32]);
-        block0 = [0u8; 64];
-        let _ = core::hint::black_box(&block0);
+        crate::zeroize::Zeroize::zeroize(&mut block0);
         otk
     }
 
@@ -95,8 +93,7 @@ impl ChaCha20Poly1305 {
         // The one-time key forges tags for this nonce; `Poly1305` wipes its
         // own copy on drop, so this frame's is the only leftover. Plain store
         // plus a barrier, for the per-record cost noted on `poly_key`.
-        otk = [0u8; 32];
-        let _ = core::hint::black_box(&otk);
+        crate::zeroize::Zeroize::zeroize(&mut otk);
         tag
     }
 
@@ -120,8 +117,7 @@ impl ChaCha20Poly1305 {
         );
         let mut otk = self.poly_key(nonce);
         let expected = self.tag(&otk, aad, buffer);
-        otk = [0u8; 32];
-        let _ = core::hint::black_box(&otk);
+        crate::zeroize::Zeroize::zeroize(&mut otk);
         if !bool::from(expected.ct_eq(tag)) {
             return Err(TagMismatch);
         }

@@ -232,26 +232,19 @@ impl Poly1305 {
 
 impl Drop for Poly1305 {
     fn drop(&mut self) {
-        // Best-effort secret wipe: zero every field that's derived from the
-        // one-time key, then apply the standard `black_box` optimisation
-        // barrier so LLVM doesn't elide the writes as a dead store.
-        //
-        // Deliberately not `crate::zeroize::Zeroize`: ChaCha20-Poly1305
-        // builds and drops a fresh `Poly1305` for every record, and the
-        // per-limb volatile stores measured ~+30 ns per AEAD call (~7% on a
-        // 1 KiB record) — they keep the whole state pinned in memory instead
-        // of letting the MAC arithmetic live in registers.
-        self.r = [0; 5];
-        self.s = [0; 4];
-        self.h = [0; 5];
-        self.pad = [0; 4];
-        self.buffer = [0u8; 16];
-        self.leftover = 0;
-        let _ = core::hint::black_box(&self.r);
-        let _ = core::hint::black_box(&self.s);
-        let _ = core::hint::black_box(&self.h);
-        let _ = core::hint::black_box(&self.pad);
-        let _ = core::hint::black_box(&self.buffer);
+        // Wipe every field derived from the one-time key. ChaCha20-Poly1305
+        // builds and drops a fresh `Poly1305` per record, so this is on the
+        // per-record path: with the word-at-a-time volatile wipe it costs
+        // nothing measurable (an earlier per-limb version cost ~7% on a 1 KiB
+        // record, which is why this used to be a plain store plus a
+        // `black_box` barrier).
+        use crate::zeroize::Zeroize;
+        self.r.zeroize();
+        self.s.zeroize();
+        self.h.zeroize();
+        self.pad.zeroize();
+        self.buffer.zeroize();
+        self.leftover.zeroize();
     }
 }
 

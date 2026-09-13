@@ -22,10 +22,12 @@ use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 /// dead stack frame for a later caller to read.
 ///
 /// This is deliberately **not** [`crate::zeroize::Zeroize`]: `block` runs once
-/// per 64 bytes on the scalar path, and the sixteen per-word volatile stores
-/// cost a measured ~7% of that kernel's throughput where the plain store plus
-/// a `black_box` barrier compiles to a single vector store. Per-operation
-/// wipes elsewhere in the crate use `Zeroize`; this one is in the inner loop.
+/// per 64 bytes on the scalar path, and volatile stores are never merged into
+/// the single vector store the plain assignment compiles to — measured at ~7%
+/// of that kernel's throughput. `Zeroize`'s word-at-a-time path narrows the
+/// gap but cannot close it, since this is per-block rather than per-operation.
+/// Per-operation wipes elsewhere in the crate (including this cipher's own
+/// one-time key and Poly1305 state) do use `Zeroize`.
 #[inline]
 fn wipe_words(w: &mut [u32; 16]) {
     *w = [0u32; 16];

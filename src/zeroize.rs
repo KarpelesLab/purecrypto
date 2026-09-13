@@ -78,6 +78,26 @@ pub trait Zeroize {
     /// Overwrites `self` with zeros using volatile stores that the compiler
     /// cannot elide.
     fn zeroize(&mut self);
+
+    /// Wipes a whole slice of `Self`.
+    ///
+    /// This exists so that [`Zeroize for [Z]`](Zeroize#impl-Zeroize-for-%5BZ%5D)
+    /// can pick a better strategy per element type than "call
+    /// [`zeroize`](Zeroize::zeroize) on each element" — which costs one
+    /// compiler fence per element. Plain-data types go through
+    /// [`DefaultIsZeroes::zeroize_slice_impl`] instead, which fences once for
+    /// the whole slice. Not part of the stable surface; override
+    /// `DefaultIsZeroes::zeroize_slice_impl` rather than this.
+    #[doc(hidden)]
+    #[inline]
+    fn zeroize_slice(slice: &mut [Self])
+    where
+        Self: Sized,
+    {
+        for z in slice.iter_mut() {
+            z.zeroize();
+        }
+    }
 }
 
 /// Marker for types that wipe their secrets when dropped.
@@ -95,11 +115,41 @@ pub trait ZeroizeOnDrop {}
 /// of integers, say) gives them [`Zeroize`] for free through the blanket impl.
 /// It is deliberately **not** implemented for arrays, which are wiped
 /// element-wise by their own [`Zeroize`] impl.
-pub trait DefaultIsZeroes: Copy + Default {}
+pub trait DefaultIsZeroes: Copy + Default {
+    /// Wipes a whole slice of `Self` with a single compiler fence at the end.
+    ///
+    /// The default body stores [`Default::default()`] into each element, which
+    /// is sound for any implementor. The primitives below override it with a
+    /// word-at-a-time raw-byte wipe: a volatile store is never merged or
+    /// vectorized by the compiler, so a byte-typed slice would otherwise cost
+    /// one store per byte. Override this only if `Self`'s all-zero *bit
+    /// pattern* is a valid value (it is for plain integers and `#[repr(C)]`
+    /// structs of them) — and see [`volatile::zero_bytes_of`] for the exact
+    /// contract. Not part of the stable surface.
+    #[doc(hidden)]
+    #[inline]
+    fn zeroize_slice_impl(slice: &mut [Self]) {
+        for z in slice.iter_mut() {
+            volatile::write_unfenced(z, Self::default());
+        }
+        volatile::fence();
+    }
+}
 
 macro_rules! impl_default_is_zeroes {
     ($($t:ty),+ $(,)?) => {$(
-        impl DefaultIsZeroes for $t {}
+        impl DefaultIsZeroes for $t {
+            // Scoped opt-in, as the crate's `unsafe_code = "deny"` policy
+            // requires: the only `unsafe` is the call below.
+            #[allow(unsafe_code)]
+            #[inline]
+            fn zeroize_slice_impl(slice: &mut [Self]) {
+                // SAFETY: `$t` is a primitive (integer, `bool`, `char`, `f32`
+                // or `f64`) whose all-zero bit pattern is both a valid value
+                // and its `Default`: `0`, `false`, `'\0'`, `0.0`.
+                unsafe { volatile::zero_bytes_of(slice) }
+            }
+        }
     )+};
 }
 
@@ -112,12 +162,27 @@ impl_default_is_zeroes!(
 /// private keys, ECDSA nonces) are `Uint`s, and their `Drop` impls want a
 /// volatile wipe rather than a plain assignment.
 #[cfg(feature = "bignum")]
-impl<const LIMBS: usize> DefaultIsZeroes for crate::bignum::Uint<LIMBS> {}
+impl<const LIMBS: usize> DefaultIsZeroes for crate::bignum::Uint<LIMBS> {
+    // Scoped opt-in, as above.
+    #[allow(unsafe_code)]
+    #[inline]
+    fn zeroize_slice_impl(slice: &mut [Self]) {
+        // SAFETY: `Uint<LIMBS>` is a `#[repr(transparent)]` wrapper over
+        // `[Limb; LIMBS]`, i.e. plain integers, so the all-zero bit pattern is
+        // a valid value and is its `Default` (the zero integer).
+        unsafe { volatile::zero_bytes_of(slice) }
+    }
+}
 
 impl<Z: DefaultIsZeroes> Zeroize for Z {
     #[inline]
     fn zeroize(&mut self) {
         volatile::write(self, Z::default());
+    }
+
+    #[inline]
+    fn zeroize_slice(slice: &mut [Self]) {
+        Z::zeroize_slice_impl(slice);
     }
 }
 
@@ -131,9 +196,7 @@ impl<Z: Zeroize, const N: usize> Zeroize for [Z; N] {
 impl<Z: Zeroize> Zeroize for [Z] {
     #[inline]
     fn zeroize(&mut self) {
-        for z in self.iter_mut() {
-            z.zeroize();
-        }
+        Z::zeroize_slice(self);
     }
 }
 
@@ -330,6 +393,79 @@ mod volatile {
         fence();
     }
 
+    /// Volatile-stores `value` into `dst` **without** a trailing fence.
+    ///
+    /// For wiping many values in a row: volatile stores are never reordered
+    /// among themselves, so one fence after the last one is enough to keep the
+    /// whole run in place.
+    #[inline]
+    pub(super) fn write_unfenced<T: Copy>(dst: &mut T, value: T) {
+        // SAFETY: as in `write`; only the fence is deferred to the caller.
+        unsafe { core::ptr::write_volatile(dst, value) };
+    }
+
+    /// Volatile-stores zero over every byte of `slice`, a machine word at a
+    /// time where alignment allows, then fences once.
+    ///
+    /// A volatile store is never merged or vectorized, so wiping an `[u8]`
+    /// element-wise costs one store instruction per byte; going through
+    /// `usize` cuts that by a factor of `size_of::<usize>()` while keeping
+    /// every store volatile.
+    ///
+    /// # Safety
+    ///
+    /// The all-zero bit pattern must be a valid value of `T` — true for plain
+    /// integers, `bool`, `char`, `f32`/`f64` and `#[repr(C)]` aggregates of
+    /// them, but not for a type with a niche (a `NonZero*`, a reference, or an
+    /// enum without a zero discriminant), where it would be undefined
+    /// behaviour.
+    #[inline]
+    pub(super) unsafe fn zero_bytes_of<T>(slice: &mut [T]) {
+        const W: usize = core::mem::size_of::<usize>();
+
+        let len = core::mem::size_of_val(slice);
+        let ptr = slice.as_mut_ptr().cast::<u8>();
+        let mut i = 0usize;
+
+        // Head: single bytes until the cursor is `usize`-aligned. When `T` is
+        // already word-aligned the condition is a compile-time constant, so
+        // this whole prologue folds away.
+        let misalign = if core::mem::align_of::<T>() >= W {
+            0
+        } else {
+            (ptr as usize) % W
+        };
+        if misalign != 0 {
+            let head = core::cmp::min(W - misalign, len);
+            while i < head {
+                // SAFETY: `i < len`, and `slice` is a live exclusive borrow of
+                // `len` contiguous bytes from `ptr`, so `ptr.add(i)` is in
+                // bounds and trivially aligned for `u8`. Writing a zero byte
+                // is valid for `T` by this function's contract.
+                unsafe { core::ptr::write_volatile(ptr.add(i), 0u8) };
+                i += 1;
+            }
+        }
+
+        // Middle: one machine word per store.
+        while i + W <= len {
+            // SAFETY: `i + W <= len` keeps the whole word in bounds, and `i`
+            // is now a multiple of `W` away from a `W`-aligned address, so the
+            // `*mut usize` is properly aligned.
+            unsafe { core::ptr::write_volatile(ptr.add(i).cast::<usize>(), 0usize) };
+            i += W;
+        }
+
+        // Tail: the remaining bytes.
+        while i < len {
+            // SAFETY: as in the head loop.
+            unsafe { core::ptr::write_volatile(ptr.add(i), 0u8) };
+            i += 1;
+        }
+
+        fence();
+    }
+
     /// Volatile-stores zero bytes over every byte of `slice`, which may be
     /// uninitialised (hence `MaybeUninit`, which has no validity invariant to
     /// uphold).
@@ -431,6 +567,41 @@ mod tests {
 
         let mut empty: [u8; 0] = [];
         empty.zeroize();
+    }
+
+    /// The word-at-a-time path splits a slice into an unaligned head, a run of
+    /// machine words and a tail, so walk every combination of start offset and
+    /// length around the word size and check that exactly the requested range
+    /// is wiped and nothing either side of it is touched.
+    #[test]
+    fn wordwise_wipe_covers_every_alignment_and_length() {
+        const PAD: usize = 8;
+        for start in 0..16usize {
+            for len in 0..40usize {
+                let mut buf = [0xA5u8; PAD + 16 + 40 + PAD];
+                let from = PAD + start;
+                buf[from..from + len].zeroize();
+
+                assert!(
+                    buf[from..from + len].iter().all(|&b| b == 0),
+                    "start {start} len {len}: range not fully wiped"
+                );
+                assert!(
+                    buf[..from].iter().all(|&b| b == 0xA5)
+                        && buf[from + len..].iter().all(|&b| b == 0xA5),
+                    "start {start} len {len}: wiped outside the range"
+                );
+            }
+        }
+
+        // Same, for a wider element type: the tail path runs when the byte
+        // length is not a whole number of machine words.
+        for len in 0..10usize {
+            let mut buf = [0xDEAD_BEEFu32; 12];
+            buf[1..1 + len].zeroize();
+            assert!(buf[1..1 + len].iter().all(|&w| w == 0));
+            assert!(buf[1 + len..].iter().all(|&w| w == 0xDEAD_BEEF));
+        }
     }
 
     #[test]
