@@ -58,6 +58,41 @@
 //! modules therefore document their interop status explicitly, and where
 //! byte-exact compatibility has not been established against the oracle they
 //! say so rather than implying it.
+#![cfg_attr(
+    not(feature = "zkp-adaptor"),
+    doc = "",
+    doc = "[`adaptor`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-halfagg"),
+    doc = "",
+    doc = "[`halfagg`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-pedersen"),
+    doc = "",
+    doc = "[`pedersen`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-sign-to-contract"),
+    doc = "",
+    doc = "[`sign_to_contract`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-rangeproof"),
+    doc = "",
+    doc = "[`rangeproof`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-surjection"),
+    doc = "",
+    doc = "[`surjection`]: crate::zkp"
+)]
+#![cfg_attr(
+    not(feature = "zkp-whitelist"),
+    doc = "",
+    doc = "[`whitelist`]: crate::zkp"
+)]
 
 #[cfg(feature = "zkp-adaptor")]
 pub mod adaptor;

@@ -194,9 +194,10 @@ impl X25519PrivateKey {
 /// An X25519 public key — the 32-byte u-coordinate sent to a peer.
 ///
 /// A thin newtype over the raw bytes so X25519 keys can participate in the
-/// unified [`key`](crate::key) traits, which pass peer public keys as
+/// unified [`key`][crate::key] traits, which pass peer public keys as
 /// `&dyn PublicKey`. The low-level [`X25519PrivateKey::public_key`] and
 /// [`X25519PrivateKey::diffie_hellman`] still take and return raw `[u8; 32]`.
+#[cfg_attr(not(feature = "key"), doc = "", doc = "[crate::key]: crate")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X25519PublicKey([u8; 32]);
 

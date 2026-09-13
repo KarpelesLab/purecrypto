@@ -15,7 +15,7 @@
 //! scalars, ignoring the on-curve / identity checks, comparing secret points
 //! with non-constant-time code, etc. — can silently break security. The caller
 //! owns correctness and constant-time discipline. Prefer the high-level
-//! [`secp256k1_ecdsa`](crate::ec::secp256k1_ecdsa) / [`boxed`](crate::ec::boxed)
+//! [`secp256k1_ecdsa`](crate::ec::secp256k1_ecdsa) / [`boxed`][crate::ec::boxed]
 //! paths unless you are building a protocol that genuinely needs raw group
 //! arithmetic.
 //!
@@ -31,6 +31,11 @@
 //! byte-for-byte against the generic Montgomery reference `GenericMont` (the
 //! same audited `MontModulus<4>` core P-256 uses) by the differential tests in
 //! `field_backend`; `GenericMont` remains as that oracle and a fallback.
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[crate::ec::boxed]: crate::ec#without-alloc"
+)]
 
 #[cfg(feature = "bip340")]
 pub mod schnorr;

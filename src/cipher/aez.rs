@@ -565,11 +565,16 @@ impl Aez {
         out
     }
 
-    /// Allocation-free counterpart of [`encrypt`](Self::encrypt): writes the
+    /// Allocation-free counterpart of [`encrypt`][Self::encrypt]: writes the
     /// ciphertext into `out`, which must be exactly `m.len() + tau` octets.
     ///
     /// # Panics
     /// If `out.len() != m.len() + tau`, or if `tau ≥ 2^29`.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::encrypt]: crate#no_std"
+    )]
     pub fn encrypt_into(&self, nonce: &[u8], ad: &[&[u8]], tau: usize, m: &[u8], out: &mut [u8]) {
         let tau_bits = Self::tau_bits(tau);
         assert_eq!(out.len(), m.len() + tau, "AEZ encrypt: wrong output length");
@@ -609,7 +614,7 @@ impl Aez {
         Ok(buf)
     }
 
-    /// Allocation-free counterpart of [`decrypt`](Self::decrypt): deciphers into
+    /// Allocation-free counterpart of [`decrypt`][Self::decrypt]: deciphers into
     /// `out` and returns the plaintext length (`c.len() - tau`).
     ///
     /// `out` must be at least `c.len()` octets — the whole ciphertext is
@@ -626,6 +631,11 @@ impl Aez {
     ///
     /// # Panics
     /// If `out.len() < c.len()`, or if `tau ≥ 2^29`.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::decrypt]: crate#no_std"
+    )]
     pub fn decrypt_into(
         &self,
         nonce: &[u8],

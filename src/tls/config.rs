@@ -439,9 +439,14 @@ pub struct Config {
     /// Optional entropy source for all randomness this endpoint draws (server
     /// random, ephemeral (EC)DHE / ML-KEM key shares, RSA-PSS salts, ML-DSA
     /// hedging, session-ticket nonces). `None` (the default) uses the platform
-    /// [`OsRng`](crate::rng::OsRng). Supply an [`EntropySource`] to route
+    /// [`OsRng`][crate::rng::OsRng]. Supply an [`EntropySource`] to route
     /// entropy through a hardware device (TPM/HSM). Shared (`Arc`) across every
     /// connection built from this `Config`.
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[crate::rng::OsRng]: crate#no_std"
+    )]
     pub rng: Option<Arc<dyn EntropySource>>,
 
     /// Transparent pluggable private key (TPM/HSM or in-process), installed via
@@ -465,7 +470,12 @@ pub struct Config {
 /// nonces, and signature salts. `fill` takes `&self` (not `&mut self`) so one
 /// source can be shared across connections behind an `Arc`; the implementation
 /// owns any interior synchronization. It must fill the whole buffer or abort:
-/// there is no short-read or error return, matching [`OsRng`](crate::rng::OsRng).
+/// there is no short-read or error return, matching [`OsRng`][crate::rng::OsRng].
+#[cfg_attr(
+    not(feature = "std"),
+    doc = "",
+    doc = "[crate::rng::OsRng]: crate#no_std"
+)]
 pub trait EntropySource: Send + Sync {
     /// Fills `dest` entirely with cryptographically secure random bytes.
     fn fill(&self, dest: &mut [u8]);
@@ -633,8 +643,13 @@ impl ConfigBuilder {
         self
     }
     /// Routes all of this endpoint's randomness through `source` (e.g. a
-    /// TPM/HSM RNG) instead of the platform [`OsRng`](crate::rng::OsRng). See
+    /// TPM/HSM RNG) instead of the platform [`OsRng`][crate::rng::OsRng]. See
     /// [`Config::rng`] / [`EntropySource`].
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[crate::rng::OsRng]: crate#no_std"
+    )]
     pub fn rng(mut self, source: Arc<dyn EntropySource>) -> Self {
         self.inner.rng = Some(source);
         self
@@ -671,7 +686,7 @@ impl ConfigBuilder {
         Ok(self.identity(identity.cert_chain, identity.key))
     }
     /// Install a cert chain + a transparent pluggable [`HandshakeSigner`](super::HandshakeSigner)
-    /// (TPM/HSM or in-process via [`LocalSigner`](super::LocalSigner)).
+    /// (TPM/HSM or in-process via [`LocalSigner`][super::LocalSigner]).
     ///
     /// The engine advertises `key.schemes()` and parks at the identity
     /// signature; [`super::Connection::drive`] then brokers the signature
@@ -679,6 +694,11 @@ impl ConfigBuilder {
     ///
     /// Performs no key/certificate consistency check; see
     /// [`try_private_key`](Self::try_private_key).
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[super::LocalSigner]: crate#no_std"
+    )]
     pub fn private_key(
         mut self,
         chain: Vec<Vec<u8>>,
@@ -820,6 +840,12 @@ impl ConfigBuilder {
     /// arbitrary spoofed addresses for the cookie lifetime. A cookie-
     /// requiring server with no peer address therefore refuses to handshake
     /// at all; see [`Config::peer_address`].
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[`Self::peer_socket_addr`]: crate#no_std",
+        doc = "[`std::net::SocketAddr`]: crate#no_std"
+    )]
     pub fn peer_address(mut self, addr: Vec<u8>) -> Self {
         self.inner.peer_address = addr;
         self
@@ -871,6 +897,11 @@ impl ConfigBuilder {
     /// non-idempotent actions. Without a wall clock (`no_std`) the
     /// freshness check is skipped and the replay window is the only
     /// anti-replay protection.
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[`Self::replay_window`]: crate#no_std"
+    )]
     pub fn max_early_data(mut self, max: u32) -> Self {
         self.inner.max_early_data_size = max;
         self
@@ -1021,6 +1052,11 @@ impl ConfigBuilder {
     /// secret as the engine derives it. The format is NSS
     /// `SSLKEYLOGFILE`. Use [`super::WriterKeyLog`] for a ready-made
     /// implementation over any `std::io::Write`.
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[`super::WriterKeyLog`]: crate#no_std"
+    )]
     pub fn key_log(mut self, sink: Arc<dyn KeyLog>) -> Self {
         self.inner.key_log = Some(sink);
         self

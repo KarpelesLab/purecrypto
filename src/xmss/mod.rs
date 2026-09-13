@@ -11,10 +11,10 @@
 //! all security.** Two distinct messages signed from the same `idx` let an
 //! attacker forge signatures. To use XMSS safely you MUST:
 //!
-//! - **Persist the serialized key after *every* [`sign`](XmssPrivateKey::sign)**
+//! - **Persist the serialized key after *every* [`sign`][XmssPrivateKey::sign]**
 //!   — `sign` takes `&mut self`, advances `idx`, and the new `idx` must reach
 //!   stable storage *before* the produced signature is released. Serialize with
-//!   [`to_bytes`](XmssPrivateKey::to_bytes) and write it out on each signature.
+//!   [`to_bytes`][XmssPrivateKey::to_bytes] and write it out on each signature.
 //! - **Never sign twice from the same `idx`.** Do not roll the index back, do
 //!   not restore an old serialized copy and keep signing, and do not run two
 //!   signers from the same key file.
@@ -22,8 +22,8 @@
 //!   *not* [`Clone`]; copying the secret material and signing from each copy
 //!   reuses indices. Keep exactly one live signer per key.
 //! - **Handle exhaustion.** After `2^h` signatures the key is spent;
-//!   [`sign`](XmssPrivateKey::sign) returns [`Error::KeyExhausted`] rather than
-//!   reusing the final index. Check [`remaining`](XmssPrivateKey::remaining).
+//!   [`sign`][XmssPrivateKey::sign] returns [`Error::KeyExhausted`] rather than
+//!   reusing the final index. Check [`remaining`][XmssPrivateKey::remaining].
 //!
 //! Secret material is wiped on drop.
 //!
@@ -44,7 +44,13 @@
 //! assert!(pk.verify(b"hello", &sig));
 //! # }
 //! ```
-
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[XmssPrivateKey::sign]: crate#no_std",
+    doc = "[XmssPrivateKey::to_bytes]: crate#no_std",
+    doc = "[XmssPrivateKey::remaining]: crate#no_std"
+)]
 // The tree routines thread params, seeds, addresses, and several buffers
 // explicitly, as faithful ports of the reference C.
 #![allow(clippy::too_many_arguments)]

@@ -15,9 +15,15 @@ pub enum HpkeAead {
     /// `0x0003` — ChaCha20-Poly1305.
     ChaCha20Poly1305,
     /// `0xFFFF` — Export-Only: `seal`/`open` are unsupported; only
-    /// [`SenderContext::export`](super::SenderContext::export) /
-    /// [`ReceiverContext::export`](super::ReceiverContext::export) are
+    /// [`SenderContext::export`][super::SenderContext::export] /
+    /// [`ReceiverContext::export`][super::ReceiverContext::export] are
     /// available.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[super::SenderContext::export]: crate::hpke#alloc",
+        doc = "[super::ReceiverContext::export]: crate::hpke#alloc"
+    )]
     ExportOnly,
 }
 

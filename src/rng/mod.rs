@@ -17,6 +17,7 @@
 //!   Supported arches: x86_64, aarch64, armv7, riscv64; other Linux arches
 //!   transparently fall through to `/dev/urandom`.
 //! * **Other Unix** (FreeBSD, OpenBSD, NetBSD, etc.): `/dev/urandom`.
+#![cfg_attr(not(feature = "std"), doc = "", doc = "[`OsRng`]: crate#no_std")]
 
 mod hmac_drbg;
 #[cfg(all(feature = "linux-getrandom", target_os = "linux"))]

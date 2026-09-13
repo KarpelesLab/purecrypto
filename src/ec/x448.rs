@@ -225,9 +225,10 @@ impl X448PrivateKey {
 /// An X448 public key — the 56-byte u-coordinate sent to a peer.
 ///
 /// A thin newtype over the raw bytes so X448 keys can participate in the
-/// unified [`key`](crate::key) traits, which pass peer public keys as
+/// unified [`key`][crate::key] traits, which pass peer public keys as
 /// `&dyn PublicKey`. The low-level [`X448PrivateKey::public_key`] and
 /// [`X448PrivateKey::diffie_hellman`] still take and return raw `[u8; 56]`.
+#[cfg_attr(not(feature = "key"), doc = "", doc = "[crate::key]: crate")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct X448PublicKey([u8; 56]);
 

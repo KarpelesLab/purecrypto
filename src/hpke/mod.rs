@@ -59,7 +59,16 @@
 //! [`crate::cipher`] for the AEADs. No new cryptographic code lives
 //! under this module — only HPKE-specific framing, labels, and a key
 //! schedule.
-
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`open`]: crate::hpke#alloc",
+    doc = "[`seal`]: crate::hpke#alloc",
+    doc = "[`setup_sender`]: crate::hpke#alloc",
+    doc = "[`SenderContext::seal`]: crate::hpke#alloc",
+    doc = "[`HpkeKem::DhkemP384HkdfSha384`]: crate::hpke#alloc",
+    doc = "[`HpkeKem::DhkemP521HkdfSha512`]: crate::hpke#alloc"
+)]
 #![allow(missing_docs)]
 
 #[cfg(feature = "alloc")]
@@ -109,6 +118,12 @@ pub enum Error {
     /// The selected suite identifies the `ExportOnly` AEAD; `seal` /
     /// `open` are unsupported. Use [`SenderContext::export`] /
     /// [`ReceiverContext::export`] instead.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`SenderContext::export`]: crate::hpke#alloc",
+        doc = "[`ReceiverContext::export`]: crate::hpke#alloc"
+    )]
     ExportOnly,
     /// `enc` (encapsulated key) did not have the length the KEM
     /// expects.

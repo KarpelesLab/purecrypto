@@ -46,8 +46,10 @@ use super::error::Error;
 ///
 /// `&self` (not `&mut self`) so one key can be shared across connections behind
 /// an `Arc`; per-signature state lives in the [`SignOp`] returned by
-/// `start_sign`. In-process keys can be obtained from a [`SigningKey`] via
+/// `start_sign`. In-process keys can be obtained from a
+/// [`SigningKey`](super::config::SigningKey) via
 /// [`LocalSigner`].
+#[cfg_attr(not(feature = "std"), doc = "", doc = "[`LocalSigner`]: crate#no_std")]
 pub trait HandshakeSigner: Send + Sync {
     /// The IANA `SignatureScheme` code points (RFC 8446 §4.2.3) this key can
     /// produce, most-preferred first. Advertised to the peer; the engine
@@ -71,6 +73,7 @@ pub trait HandshakeSigner: Send + Sync {
     /// skips the check — a device driver that can read the public key back
     /// (PKCS#11 `CKA_PUBLIC_KEY_INFO`, a TPM `ReadPublic`) should override it.
     /// [`LocalSigner`] always returns it.
+    #[cfg_attr(not(feature = "std"), doc = "", doc = "[`LocalSigner`]: crate#no_std")]
     fn public_key_spki(&self) -> Option<Vec<u8>> {
         None
     }
@@ -116,18 +119,26 @@ pub enum SignProgress {
 /// On unix it wraps a raw file descriptor. Two ways to use it, neither of which
 /// reveals what device is behind it:
 ///
-/// - **Synchronous** callers block on it with [`wait`](Self::wait) — no fd ever
+/// - **Synchronous** callers block on it with [`wait`][Self::wait] — no fd ever
 ///   surfaces.
 /// - **Asynchronous** callers register it with their reactor through the std fd
-///   traits: `Readiness` implements [`AsFd`](std::os::fd::AsFd) and
-///   [`AsRawFd`](std::os::fd::AsRawFd) (unix), so it drops straight into
+///   traits: `Readiness` implements [`AsFd`][std::os::fd::AsFd] and
+///   [`AsRawFd`][std::os::fd::AsRawFd] (unix), so it drops straight into
 ///   `tokio::io::unix::AsyncFd::new(readiness)` or `mio::unix::SourceFd`. The
 ///   reactor then signals readability and the caller re-enters
 ///   [`Connection::drive`](super::Connection::drive).
 ///
 /// The descriptor is owned by the [`SignOp`] and remains valid until the next
-/// [`resume`](SignOp::resume); a [`BorrowedFd`](std::os::fd::BorrowedFd)
-/// obtained from [`AsFd`](std::os::fd::AsFd) must not outlive that.
+/// [`resume`](SignOp::resume); a [`BorrowedFd`][std::os::fd::BorrowedFd]
+/// obtained from [`AsFd`][std::os::fd::AsFd] must not outlive that.
+#[cfg_attr(
+    not(feature = "std"),
+    doc = "",
+    doc = "[Self::wait]: crate#no_std",
+    doc = "[std::os::fd::AsFd]: crate#no_std",
+    doc = "[std::os::fd::AsRawFd]: crate#no_std",
+    doc = "[std::os::fd::BorrowedFd]: crate#no_std"
+)]
 #[derive(Clone, Copy)]
 pub struct Readiness {
     #[cfg(all(feature = "std", unix))]

@@ -51,6 +51,8 @@
 //! interop, and never expose it where an adversary controls a chosen-plaintext
 //! timing/oracle channel. Prefer TLS 1.2+ AEAD, which this crate keeps fully
 //! constant-time.
+#![cfg_attr(not(feature = "dtls"), doc = "", doc = "[`crate::dtls`]: crate")]
+#![cfg_attr(not(feature = "quic"), doc = "", doc = "[`crate::quic`]: crate")]
 
 #[cfg(feature = "cert-compression")]
 #[doc(hidden)]

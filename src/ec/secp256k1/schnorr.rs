@@ -1,6 +1,6 @@
 //! BIP340 Schnorr signatures over secp256k1 (x-only public keys).
 //!
-//! Unlike the [`zkp`](crate::zkp) modules, BIP340 is a frozen published
+//! Unlike the [`zkp`][crate::zkp] modules, BIP340 is a frozen published
 //! standard with official test vectors, and carries this crate's normal
 //! semver guarantee.
 //!
@@ -50,6 +50,19 @@
 //! the frame is released.
 //!
 //! [`verify`] operates purely on public data, so it takes no such precautions.
+#![cfg_attr(
+    not(any(
+        feature = "zkp-adaptor",
+        feature = "zkp-halfagg",
+        feature = "zkp-pedersen",
+        feature = "zkp-rangeproof",
+        feature = "zkp-sign-to-contract",
+        feature = "zkp-surjection",
+        feature = "zkp-whitelist"
+    )),
+    doc = "",
+    doc = "[crate::zkp]: crate"
+)]
 
 use super::field_backend::FieldBackend;
 use super::{AffinePoint, ProjectivePoint, Scalar};

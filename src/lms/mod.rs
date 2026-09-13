@@ -32,6 +32,15 @@
 //! single LMS tree, `H5`/`W8`) and Test Case 2 (a two-level HSS key,
 //! `H10`/`W4` over `H5`/`W8`). Both the public-key/root derivation and the
 //! full signature bytes are reproduced from the vectors' seed material.
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`LmsPrivateKey::sign`]: crate#no_std",
+    doc = "[`HssPrivateKey::sign`]: crate#no_std",
+    doc = "[`HssPrivateKey::to_bytes`]: crate#no_std",
+    doc = "[`LmsPrivateKey::to_bytes`]: crate#no_std",
+    doc = "[`HssPrivateKey::remaining`]: crate#no_std"
+)]
 
 #[cfg(feature = "key")]
 mod key_impl;
@@ -79,6 +88,11 @@ pub enum Error {
     /// derives. Both mean the key file was modified after it was written, which
     /// for a multi-level key is a *forgery* vector (see
     /// [`HssPrivateKey::from_bytes`]), so the key is refused rather than loaded.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`HssPrivateKey::from_bytes`]: crate#no_std"
+    )]
     Tampered,
 }
 
@@ -132,8 +146,14 @@ pub struct LmsPublicKey {
 ///
 /// **Stateful** — see the [module documentation](crate::lms). The next unused
 /// leaf index `q` is part of the key state and is advanced by every
-/// [`sign`](Self::sign). Re-persist [`to_bytes`](Self::to_bytes) after each
+/// [`sign`][Self::sign]. Re-persist [`to_bytes`][Self::to_bytes] after each
 /// signature. Not [`Clone`] by design.
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[Self::sign]: crate#no_std",
+    doc = "[Self::to_bytes]: crate#no_std"
+)]
 pub struct LmsPrivateKey {
     lms_type: LmsType,
     ots_type: LmotsType,
@@ -265,10 +285,11 @@ impl LmsPrivateKey {
 
     /// Signs `message` into `out` (exactly [`signature_len`](Self::signature_len)
     /// octets), advancing `q`. Allocation-free counterpart of
-    /// [`sign`](Self::sign).
+    /// [`sign`][Self::sign].
     ///
     /// **Persist [`to_bytes_array`](Self::to_bytes_array) before releasing the
     /// signature** — see the [module documentation](crate::lms).
+    #[cfg_attr(not(feature = "alloc"), doc = "", doc = "[Self::sign]: crate#no_std")]
     pub fn sign_into<R: RngCore>(
         &mut self,
         rng: &mut R,
@@ -297,11 +318,16 @@ impl LmsPrivateKey {
         self.to_bytes_array().to_vec()
     }
 
-    /// Allocation-free counterpart of [`to_bytes`](Self::to_bytes): the encoding
+    /// Allocation-free counterpart of [`to_bytes`][Self::to_bytes]: the encoding
     /// is a fixed [`PRIVKEY_LEN`] octets, so it needs no heap at all.
     ///
     /// This is the value to persist after **every** signature — see the
     /// [module documentation](crate::lms).
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::to_bytes]: crate#no_std"
+    )]
     pub fn to_bytes_array(&self) -> [u8; PRIVKEY_LEN] {
         let mut v = [0u8; PRIVKEY_LEN];
         v[..4].copy_from_slice(&self.lms_type.typecode().to_be_bytes());
@@ -313,7 +339,7 @@ impl LmsPrivateKey {
         v
     }
 
-    /// Parses a private key produced by [`to_bytes`](Self::to_bytes), resuming
+    /// Parses a private key produced by [`to_bytes`][Self::to_bytes], resuming
     /// at the persisted `q`.
     ///
     /// Length-discriminated and backward compatible:
@@ -338,6 +364,11 @@ impl LmsPrivateKey {
     /// would cost a full keygen and buy nothing: an attacker able to rewrite the
     /// key file could already force catastrophic LM-OTS reuse, which is far
     /// worse. So the stored root is taken as-is and deliberately NOT recomputed.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::to_bytes]: crate#no_std"
+    )]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         const LEGACY_LEN: usize = 4 + 4 + 16 + N + 4;
         const NEW_LEN: usize = LEGACY_LEN + N;

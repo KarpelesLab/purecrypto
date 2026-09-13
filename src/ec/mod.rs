@@ -36,6 +36,13 @@
 //!   …). These are gated on `alloc` in *both* directions: the `der` encoders and
 //!   its OID parser allocate, so `from_pkcs8_der` needs `alloc` as much as
 //!   `to_pkcs8_der` does.
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`boxed`]: crate::ec#without-alloc",
+    doc = "[`CurveId`]: crate::ec#without-alloc",
+    doc = "[`sm2`]: crate::ec#without-alloc"
+)]
 
 #[cfg(feature = "alloc")]
 pub mod boxed;

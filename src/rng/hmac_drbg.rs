@@ -7,7 +7,7 @@ use crate::hash::{Digest, Hmac};
 /// HMAC-DRBG instantiated with hash function `D`.
 ///
 /// Seed it with [`new`](HmacDrbg::new) from a high-entropy source (e.g.
-/// [`OsRng`](super::OsRng)), then draw bytes via [`RngCore`]. Given the same
+/// [`OsRng`][super::OsRng]), then draw bytes via [`RngCore`]. Given the same
 /// seed it is fully deterministic, which is what makes it testable against the
 /// NIST known-answer vectors.
 ///
@@ -30,20 +30,21 @@ use crate::hash::{Digest, Hmac};
 ///   that the child inherits) generates the *same* output stream on
 ///   both sides of the fork. The two processes will then produce
 ///   colliding nonces, blinding factors, or session secrets. Either
-///   re-seed in the child via [`OsRng`](super::OsRng) before any draw,
-///   or use [`OsRng`](super::OsRng) directly in fork-prone code paths.
+///   re-seed in the child via [`OsRng`][super::OsRng] before any draw,
+///   or use [`OsRng`][super::OsRng] directly in fork-prone code paths.
 /// * **Initial entropy.** Seeding from a low-entropy source (e.g. a
 ///   constant or a millisecond timestamp) leaks the entire stream to
 ///   anyone who can guess the seed. Production callers MUST seed from
-///   the operating system CSPRNG, typically [`OsRng`](super::OsRng).
+///   the operating system CSPRNG, typically [`OsRng`][super::OsRng].
 /// * **Long-running processes.** Per SP 800-90A §10.1.2.4 the DRBG must
 ///   be reseeded before the counter exceeds `2^48` draws; this type
 ///   panics on overflow but the caller is responsible for *invoking*
 ///   [`reseed`](Self::reseed) with fresh entropy before that point.
 ///
 /// For one-shot key generation, signatures, and other transient secrets
-/// in a single-process context, [`OsRng`](super::OsRng) is the simpler
+/// in a single-process context, [`OsRng`][super::OsRng] is the simpler
 /// choice. Reach for `HmacDrbg` when you specifically need determinism.
+#[cfg_attr(not(feature = "std"), doc = "", doc = "[super::OsRng]: crate#no_std")]
 #[derive(Clone)]
 pub struct HmacDrbg<D: Digest> {
     /// HMAC key.

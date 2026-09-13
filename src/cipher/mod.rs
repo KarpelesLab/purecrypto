@@ -44,6 +44,8 @@
 //!   private memory and copy out only after `Ok`.
 //! * Releasing even a *verified* plaintext is the caller's decision to make
 //!   once; never process a buffer twice "to see" whether the tag matches.
+#![cfg_attr(not(feature = "aez"), doc = "", doc = "[`Aez`]: crate")]
+#![cfg_attr(not(feature = "alloc"), doc = "", doc = "[`AesSiv`]: crate#no_std")]
 
 mod aegis;
 mod aes;

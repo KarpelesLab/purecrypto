@@ -7,6 +7,12 @@
 //!  - [`scrypt`] — RFC 7914, memory-hard PBKDF (requires `alloc`).
 //!  - [`bcrypt_pbkdf`] — OpenSSH's PBKDF over Blowfish, used to protect
 //!    new-format SSH private keys (requires `alloc`).
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`scrypt`]: crate#no_std",
+    doc = "[`bcrypt_pbkdf`]: crate#no_std"
+)]
 
 #[cfg(feature = "alloc")]
 pub mod argon2;

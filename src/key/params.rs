@@ -32,8 +32,13 @@ use crate::key::Error;
 /// facade RSA and ECDSA take SHA-1 and SHA-224/256/384/512, and anything else
 /// fails with [`Error::UnsupportedParam`](crate::key::Error::UnsupportedParam)
 /// naming `hash`. The generic per-algorithm APIs (e.g.
-/// [`sign_pss::<D>`](crate::rsa::RsaPrivateKey::sign_pss)) remain open to any
+/// [`sign_pss::<D>`][crate::rsa::RsaPrivateKey::sign_pss]) remain open to any
 /// [`Digest`](crate::hash::Digest).
+#[cfg_attr(
+    not(feature = "rsa"),
+    doc = "",
+    doc = "[crate::rsa::RsaPrivateKey::sign_pss]: crate"
+)]
 pub use crate::hash::HashAlgorithm as Hash;
 
 /// Runs `$body` with `$d` aliased to the concrete digest type named by a

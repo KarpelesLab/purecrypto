@@ -35,6 +35,7 @@
 //! enforce the standard subgroup-confinement check `2 ≤ y < p - 1`, and
 //! the shared secret is screened against the contributory-failure values
 //! `0` and `1` (NIST SP 800-56A §5.6.2.3).
+#![cfg_attr(not(feature = "ec"), doc = "", doc = "[`crate::ec`]: crate")]
 
 pub mod groups;
 mod key;

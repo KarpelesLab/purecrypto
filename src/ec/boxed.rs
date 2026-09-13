@@ -493,7 +493,8 @@ impl BoxedEcdsaSignature {
 
     /// The widest group order this crate supports, in bytes (P-521, 521 bits
     /// → 66 bytes). Signature components parsed by
-    /// [`from_der`](Self::from_der) are bounded by this.
+    /// [`from_der`][Self::from_der] are bounded by this.
+    #[cfg_attr(not(feature = "der"), doc = "", doc = "[Self::from_der]: crate")]
     pub const MAX_ORDER_LEN: usize = 66;
 
     /// The `r` component encoded big-endian, left-padded to

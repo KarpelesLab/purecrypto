@@ -197,6 +197,13 @@
 //! `alloc` it falls back to one ladder per term, which is slower but uses no
 //! scratch memory at all beyond a single accumulator. Neither choice changes
 //! what verifies.
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`inc_aggregate`]: crate#no_std",
+    doc = "[`aggregate`]: crate#no_std",
+    doc = "[`Vec`]: crate#no_std"
+)]
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -244,10 +251,16 @@ pub const fn aggregate_len(n: usize) -> Option<usize> {
 /// A `(32-byte x-only public key, 32-byte message)` pair, as fed to
 /// [`verify_aggregate`] and identifying an already-aggregated entry for
 /// [`inc_aggregate`].
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`inc_aggregate`]: crate#no_std"
+)]
 pub type PubkeyMsg = ([u8; 32], [u8; 32]);
 
 /// A `(32-byte x-only public key, 32-byte message, 64-byte BIP340 signature)`
 /// triple, the unit [`aggregate`] consumes.
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`aggregate`]: crate#no_std")]
 pub type PubkeyMsgSig = ([u8; 32], [u8; 32], [u8; 64]);
 
 // =====================================================================
@@ -357,6 +370,7 @@ pub fn aggregate(entries: &[PubkeyMsgSig]) -> Result<Vec<u8>, Error> {
 /// # Errors
 /// [`Error::InvalidInput`] if `entries.len()` exceeds [`MAX_AGGREGATED`] or
 /// `out` is too short.
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`aggregate`]: crate#no_std")]
 pub fn aggregate_into(entries: &[PubkeyMsgSig], out: &mut [u8]) -> Result<usize, Error> {
     inc_aggregate_into(&[0u8; 32], &[], entries, out)
 }
@@ -411,6 +425,11 @@ pub fn inc_aggregate(
 ///
 /// # Errors
 /// As [`inc_aggregate`], plus [`Error::InvalidInput`] if `out` is too short.
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`inc_aggregate`]: crate#no_std"
+)]
 pub fn inc_aggregate_into(
     agg: &[u8],
     aggregated: &[PubkeyMsg],

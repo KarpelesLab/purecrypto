@@ -81,10 +81,15 @@ pub enum Step {
     /// them to the peer.
     WantWrite,
     /// The signing device needs servicing. If `Some`, wait on the
-    /// [`Readiness`](super::signer::Readiness) (sync: [`wait`](super::signer::Readiness::wait);
+    /// [`Readiness`](super::signer::Readiness) (sync: [`wait`][super::signer::Readiness::wait];
     /// async: register its fd with your reactor), then call
     /// [`drive`](Connection::drive) again. `None` means the op has no waitable
     /// descriptor — just call `drive` again. In-process keys never yield this.
+    #[cfg_attr(
+        not(feature = "std"),
+        doc = "",
+        doc = "[super::signer::Readiness::wait]: crate#no_std"
+    )]
     WantSigner(Option<super::signer::Readiness>),
     /// The handshake is complete; application data may flow.
     Complete,

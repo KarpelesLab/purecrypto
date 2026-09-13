@@ -291,6 +291,12 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// immediately, but every subsequent public operation
     /// ([`Self::raw`], `verify_*`, `encrypt_*`) will panic in
     /// `MontModulus::new`, which requires an odd modulus.
+    #[cfg_attr(
+        not(all(feature = "der", feature = "alloc")),
+        doc = "",
+        doc = "[`Self::from_pkcs1_der`]: crate",
+        doc = "[`Self::from_spki_der`]: crate"
+    )]
     pub fn new(n: Uint<LIMBS>, e: Uint<LIMBS>) -> Self {
         RsaPublicKey { n, e }
     }
@@ -316,6 +322,12 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     /// ([`Self::from_pkcs1_der`] / [`Self::from_spki_der`]) are pre-validated
     /// and never trip this; only a key assembled from unchecked components
     /// via [`Self::new`] can.
+    #[cfg_attr(
+        not(all(feature = "der", feature = "alloc")),
+        doc = "",
+        doc = "[`Self::from_pkcs1_der`]: crate",
+        doc = "[`Self::from_spki_der`]: crate"
+    )]
     pub fn raw(&self, m: &Uint<LIMBS>) -> Uint<LIMBS> {
         // `e` is public, so use the public-exponent ladder (~17 squarings for
         // e = 65537) rather than the secret-width constant-time `pow`.
@@ -501,6 +513,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// the components first. A key built here with an even (or zero) modulus
     /// panics in `MontModulus::new` on every private operation
     /// ([`Self::raw`], `sign_*`, `decrypt_*`).
+    #[cfg_attr(
+        not(all(feature = "der", feature = "alloc")),
+        doc = "",
+        doc = "[`Self::from_pkcs1_der`]: crate",
+        doc = "[`Self::from_pkcs8_der`]: crate"
+    )]
     pub fn from_components(n: Uint<LIMBS>, e: Uint<LIMBS>, d: Uint<LIMBS>) -> Self {
         let (phi_n_minus_1, blinding_seed) =
             derive_blinding(&Uint::<LIMBS>::ZERO, &Uint::<LIMBS>::ZERO, &d);

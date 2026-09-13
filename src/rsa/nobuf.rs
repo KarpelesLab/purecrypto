@@ -22,7 +22,12 @@ use crate::rng::{CryptoRng, RngCore};
 impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Signs `msg` with PKCS#1 v1.5 into `out`, which must be exactly
     /// `LIMBS * 8` octets. Allocation-free counterpart of
-    /// [`sign_pkcs1v15`](Self::sign_pkcs1v15).
+    /// [`sign_pkcs1v15`][Self::sign_pkcs1v15].
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::sign_pkcs1v15]: crate#no_std"
+    )]
     pub fn sign_pkcs1v15_into<D: Pkcs1Digest>(
         &self,
         msg: &[u8],
@@ -33,7 +38,12 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
 
     /// Signs `msg` with RSA-PSS into `out` (exactly `LIMBS * 8` octets), using a
     /// salt of `D`'s output length. Allocation-free counterpart of
-    /// [`sign_pss`](Self::sign_pss).
+    /// [`sign_pss`][Self::sign_pss].
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::sign_pss]: crate#no_std"
+    )]
     pub fn sign_pss_into<D: Digest, R: RngCore>(
         &self,
         msg: &[u8],
@@ -59,9 +69,14 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// holding any valid plaintext.
     ///
     /// Carries the same padding-oracle caveat as
-    /// [`decrypt_pkcs1v15`](Self::decrypt_pkcs1v15): the returned length is
+    /// [`decrypt_pkcs1v15`][Self::decrypt_pkcs1v15]: the returned length is
     /// observable. Prefer [`Self::decrypt_pkcs1v15_session_into`] where the
     /// plaintext length is known in advance.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::decrypt_pkcs1v15]: crate#no_std"
+    )]
     pub fn decrypt_pkcs1v15_into(&self, ct: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         let mut scratch = KeyScratch::<LIMBS>::ZEROED;
         // The stack scratch holds the decrypted EM; wipe it before the frame
@@ -120,8 +135,13 @@ impl<const LIMBS: usize> RsaPublicKey<LIMBS> {
     ///
     /// Needs no caller buffer and no allocator: both `k`-octet scratch buffers
     /// are stack-allocated here, so this has the same signature as the
-    /// `alloc` build's [`verify_pkcs1v15`](Self::verify_pkcs1v15) — that method
+    /// `alloc` build's [`verify_pkcs1v15`][Self::verify_pkcs1v15] — that method
     /// is simply this one under a different name when `alloc` is on.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::verify_pkcs1v15]: crate#no_std"
+    )]
     pub fn verify_pkcs1v15_noalloc<D: Pkcs1Digest>(
         &self,
         msg: &[u8],

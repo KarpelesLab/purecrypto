@@ -4,7 +4,7 @@
 //! module for the Bitcoin / Ethereum curve. It is built on the stack-only
 //! native secp256k1 arithmetic (a pseudo-Mersenne base field and the
 //! Renes–Costello–Batina complete formulas), so — unlike the runtime
-//! multi-curve [`boxed`](crate::ec::boxed) path, which reaches secp256k1 over
+//! multi-curve [`boxed`][crate::ec::boxed] path, which reaches secp256k1 over
 //! heap-backed bignums — it needs **no allocator**: every type here is a
 //! fixed-size value and the module builds with `--no-default-features
 //! --features ec` on bare-metal targets.
@@ -59,6 +59,11 @@
 //! assert_eq!(sig.recover::<Sha256>(b"hello", recid).unwrap(), pk);
 //! # }
 //! ```
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[crate::ec::boxed]: crate::ec#without-alloc"
+)]
 
 use super::field_backend::{Fe, p};
 use super::{AffinePoint, ProjectivePoint, Scalar};

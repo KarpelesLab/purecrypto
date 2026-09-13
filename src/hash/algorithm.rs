@@ -144,7 +144,7 @@ impl core::fmt::Display for HashOutput {
 /// runtime-selected [`Hasher`].
 ///
 /// Implemented by every fixed-output hasher in [`crate::hash`] (plus
-/// [`AsconHash256`](crate::ascon::AsconHash256) when the `ascon` feature is on)
+/// [`AsconHash256`][crate::ascon::AsconHash256] when the `ascon` feature is on)
 /// and by [`Hasher`]. Use `<Sha256 as Digest>::new()` for a compile-time
 /// algorithm or [`Hasher::new`] for a runtime-selected one.
 ///
@@ -158,6 +158,11 @@ impl core::fmt::Display for HashOutput {
 /// A concrete hasher implements both traits, so with `Digest` *and* `DynDigest`
 /// in scope a bare `h.update(…)` is ambiguous. Disambiguate with
 /// `Digest::update(&mut h, …)`, or import only the one being used.
+#[cfg_attr(
+    not(feature = "ascon"),
+    doc = "",
+    doc = "[crate::ascon::AsconHash256]: crate"
+)]
 pub trait DynDigest {
     /// The digest output length, in bytes.
     fn output_len(&self) -> usize;

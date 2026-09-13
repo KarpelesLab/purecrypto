@@ -96,7 +96,12 @@
 //! use purecrypto::falcon::verify;
 //! let ok = verify(public_key, message, signature);
 //! ```
-
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`FalconPrivateKey::generate`]: crate::falcon#memory",
+    doc = "[`FalconPrivateKey::sign`]: crate::falcon#memory"
+)]
 #![allow(clippy::needless_range_loop)]
 
 // Everything below the verification path needs a heap: see the "Memory" section
@@ -146,6 +151,13 @@ pub enum Error {
     /// [`FalconPrivateKey::from_bytes`] accepted; the budget exists so that a
     /// degenerate basis fails instead of looping forever. See
     /// [`FalconPrivateKey::try_sign`].
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`FalconPrivateKey::generate`]: crate::falcon#memory",
+        doc = "[`FalconPrivateKey::from_bytes`]: crate::falcon#memory",
+        doc = "[`FalconPrivateKey::try_sign`]: crate::falcon#memory"
+    )]
     SamplingFailed,
 }
 
@@ -326,6 +338,11 @@ impl FalconPublicKey {
     /// vectors, for instance, carry that form).
     ///
     /// [`verify_with_format`]: FalconPublicKey::verify_with_format
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`FalconPrivateKey::sign`]: crate::falcon#memory"
+    )]
     pub fn verify(&self, msg: &[u8], sig: &[u8]) -> Result<bool, Error> {
         self.verify_with_format(msg, sig, Format::Padded)
     }
@@ -581,6 +598,11 @@ fn decompress(s_bytes: &[u8], out: &mut [i16]) -> Option<usize> {
 /// signature malleability. Every verification entry point here pins exactly one
 /// format; [`FalconPrivateKey::sign`] emits [`Format::Padded`], which is what
 /// the default [`verify`] requires.
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`FalconPrivateKey::sign`]: crate::falcon#memory"
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Format {
@@ -588,6 +610,11 @@ pub enum Format {
     /// signature is exactly `Degree::sig_len()` bytes, with the compressed `s`
     /// zero-padded up to that length. This is what
     /// [`FalconPrivateKey::sign`] produces.
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[`FalconPrivateKey::sign`]: crate::falcon#memory"
+    )]
     Padded,
     /// Variable length ("compressed", or "unpadded"). Header byte `0010nnnn`
     /// (`0x20 | logn`); the signature is exactly `1 + 40 + |compressed-s|`
@@ -825,6 +852,11 @@ impl Drop for FalconPrivateKey {
 /// is accepted, so one `(msg, pk)` pair has exactly one valid byte string; see
 /// [`FalconPublicKey::verify`] for why. To verify a signature produced
 /// elsewhere in the compressed encoding, use [`verify_with_format`].
+#[cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`FalconPrivateKey::sign`]: crate::falcon#memory"
+)]
 pub fn verify(pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
     verify_with_format(pk, msg, sig, Format::Padded)
 }

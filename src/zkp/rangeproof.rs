@@ -171,6 +171,12 @@
 //! instead, so the two would diverge on an input no one will ever find. The
 //! exponent/mantissa/`min_value` selection was cross-checked against the
 //! oracle over 7040 parameter combinations, including every rejection.
+#![cfg_attr(
+    not(feature = "alloc"),
+    doc = "",
+    doc = "[`sign`]: crate#no_std",
+    doc = "[`Vec`]: crate#no_std"
+)]
 
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
@@ -194,10 +200,12 @@ use super::pedersen::{Commitment, Generator, value_scalar};
 /// A given proof usually holds less; [`message_capacity`] gives the exact
 /// capacity for one set of parameters. This is the value the reference
 /// exposes as `SECP256K1_RANGEPROOF_MAX_MESSAGE_LEN`, for buffer sizing.
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`sign`]: crate#no_std")]
 pub const MAX_MESSAGE_LEN: usize = 3968;
 
 /// An upper bound on the size of a proof, matching the reference's documented
 /// maximum. The largest proof [`sign`] actually produces is 5126 bytes.
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`sign`]: crate#no_std")]
 pub const MAX_PROOF_LEN: usize = 5134;
 
 /// The largest `exp` [`sign`] accepts (`-1` is the smallest).
@@ -881,6 +889,7 @@ pub fn info(proof: &[u8]) -> Result<(i32, u32, u64, u64), Error> {
 /// given parameters produce.
 ///
 /// Returns an error for parameters [`sign`] itself would reject.
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`sign`]: crate#no_std")]
 pub fn message_capacity(
     value: u64,
     min_value: u64,
@@ -988,6 +997,7 @@ pub fn sign(
 /// # Errors
 /// As [`sign`], plus [`Error::InvalidInput`] if `out` is shorter than
 /// [`MAX_PROOF_LEN`].
+#[cfg_attr(not(feature = "alloc"), doc = "", doc = "[`sign`]: crate#no_std")]
 #[allow(clippy::too_many_arguments)]
 pub fn sign_into(
     commit: &Commitment,

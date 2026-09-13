@@ -1,6 +1,6 @@
 //! Standalone message authentication codes.
 //!
-//! The [`hash`](crate::hash) module already ships HMAC; this module collects
+//! The [`hash`][crate::hash] module already ships HMAC; this module collects
 //! MAC primitives that don't fit there because they are built on a block
 //! cipher rather than a hash function.
 //!
@@ -12,6 +12,7 @@
 //! Both are keyed with a 16-byte AES key and accept a nonce of 1 to 16 bytes
 //! (RFC 4418 §3.3.1; 8 bytes is the conventional choice); messages are
 //! authenticated as a single value or in streaming chunks.
+#![cfg_attr(not(feature = "hash"), doc = "", doc = "[crate::hash]: crate")]
 
 mod umac;
 

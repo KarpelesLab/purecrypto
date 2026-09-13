@@ -1850,10 +1850,11 @@ impl PrivateKey {
 
     /// Signs `msg` into `out` (exactly [`signature_len`](Self::signature_len)
     /// octets), returning the number written. Allocation-free counterpart of
-    /// [`sign`](Self::sign).
+    /// [`sign`][Self::sign].
     ///
     /// SLH-DSA signatures are large — from ~7.8 KiB to ~49 KiB depending on the
     /// parameter set — so the buffer is the caller's to place.
+    #[cfg_attr(not(feature = "alloc"), doc = "", doc = "[Self::sign]: crate#no_std")]
     pub fn sign_into<R: RngCore>(
         &self,
         rng: &mut R,
@@ -1883,7 +1884,12 @@ impl PrivateKey {
     }
 
     /// Signs `msg` deterministically into `out`. Allocation-free counterpart of
-    /// [`sign_deterministic`](Self::sign_deterministic).
+    /// [`sign_deterministic`][Self::sign_deterministic].
+    #[cfg_attr(
+        not(feature = "alloc"),
+        doc = "",
+        doc = "[Self::sign_deterministic]: crate#no_std"
+    )]
     pub fn sign_deterministic_into(
         &self,
         msg: &[u8],

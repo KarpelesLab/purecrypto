@@ -602,6 +602,11 @@ impl OcspResponse {
     /// even if the signature would otherwise verify. This closes the
     /// revocation-path downgrade where a staple's signature was accepted under
     /// a weaker algorithm than the chain it speaks for.
+    #[cfg_attr(
+        not(feature = "tls"),
+        doc = "",
+        doc = "[`crate::tls::Error::OcspResponseInvalid`]: crate"
+    )]
     pub fn check_for_cert_with_options(
         &self,
         leaf: &Certificate,

@@ -104,7 +104,8 @@ pub trait Zeroize {
 ///
 /// This is purely documentary — it carries no methods — and lets generic code
 /// and readers see at a glance that a type takes care of its own cleanup.
-/// [`Zeroizing`] implements it; so does [`key::Secret`](crate::key::Secret).
+/// [`Zeroizing`] implements it; so does [`key::Secret`][crate::key::Secret].
+#[cfg_attr(not(feature = "key"), doc = "", doc = "[crate::key::Secret]: crate")]
 pub trait ZeroizeOnDrop {}
 
 /// Marker for `Copy` types whose [`Default`] value is the all-zero bit
