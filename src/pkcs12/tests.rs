@@ -142,6 +142,7 @@ fn sha_based_mac_matches_openssl_tag() {
     assert_eq!(computed, stored, "RFC 7292 §B SHA-256 MAC matches OpenSSL");
 }
 
+#[cfg(feature = "std")]
 #[test]
 #[ignore = "writes /tmp/purecrypto_built.p12 for manual openssl interop check"]
 fn dump_built_for_openssl() {
