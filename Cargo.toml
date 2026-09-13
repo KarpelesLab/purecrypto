@@ -232,7 +232,7 @@ mio = ["tls", "std", "dep:mio"]
 # the policy would burn ~2-3 kLoC of review surface for no security gain, since
 # compcol sits outside the cryptographic trust boundary.
 [dependencies]
-compcol = { version = "0.4", default-features = false, features = ["zlib"], optional = true }
+compcol = { version = "0.6", default-features = false, features = ["zlib"], optional = true }
 # Embedded root-CA bundle (curated from the Mozilla root program and others
 # per CA/Browser Forum rules, parsed at build time into static DER).
 # First-party (Karpeles Lab), `no_std`/no-alloc, fully-safe Rust with a
