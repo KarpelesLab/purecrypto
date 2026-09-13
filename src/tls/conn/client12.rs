@@ -731,6 +731,7 @@ impl ClientConnection12 {
             crate::rng::HmacDrbg::<crate::hash::Sha256>::new(&seed, b"tls12-legacy-client", &[])
         };
 
+        let config_max_version = config.max_version;
         let mut conn = ClientConnection12 {
             config,
             server_name: String::from(server_name),
@@ -770,10 +771,13 @@ impl ClientConnection12 {
             received_ticket_lifetime: 0,
             nst_received: false,
             resumed: false,
-            // We always offer EMS (RFC 7627 §3); the flag captures that on
-            // both the fresh and resumed paths so resumption-gating can
-            // compare it against the stored session's `ems_used`.
-            ems_offered: true,
+            // We offer EMS (RFC 7627 §3) on every non-legacy ClientHello;
+            // the flag captures that on both the fresh and resumed paths so
+            // resumption-gating can compare it against the stored session's
+            // `ems_used`. A pure-legacy client (max < TLS 1.2) emits no EMS
+            // extension, so the flag must mirror that — the require-EMS
+            // checks key off it.
+            ems_offered: config_max_version.as_u16() >= ProtocolVersion::TLSv1_2.as_u16(),
             ems_negotiated: false,
             ems_session_hash: None,
             server_echoed_ocsp_staple: false,
@@ -1505,6 +1509,14 @@ impl ClientConnection12 {
         if sh_version < 0x0303 {
             return self.on_server_hello_legacy(sh, raw, sh_version);
         }
+        // A client pinned below TLS 1.2 (opt-in legacy) must not be pulled
+        // UP to 1.2 by the server either: it never offered 1.2 suites or
+        // `signature_algorithms`, so a 1.2 ServerHello is a protocol
+        // violation, not a negotiation.
+        #[cfg(feature = "tls-legacy")]
+        if self.config.max_version.as_u16() < ProtocolVersion::TLSv1_2.as_u16() {
+            return Err(Error::UnsupportedVersion);
+        }
 
         // RFC 8446 §4.1.3: a TLS-1.3-aware server that downgraded to TLS 1.2
         // (or 1.1) sets the last 8 bytes of `server_random` to a sentinel.
@@ -1743,7 +1755,39 @@ impl ClientConnection12 {
         {
             return Err(Error::UnsupportedVersion);
         }
+        // RFC 8446 §4.1.3: a server capable of TLS 1.2/1.3 that negotiates
+        // TLS 1.1 or below marks `server_random` with `DOWNGRD\x00`
+        // (`DOWNGRD\x01` for a 1.3→1.2 downgrade). Apply the same policy the
+        // TLS 1.2 path does — reject unless the caller opted into accepting
+        // downgrade markers.
+        let tail: &[u8] = &sh.random[24..];
+        if (tail == DOWNGRADE_SENTINEL_TLS12 || tail == DOWNGRADE_SENTINEL_TLS11_OR_BELOW)
+            && !self.config.accept_downgrade_sentinel
+        {
+            return Err(Error::IllegalParameter);
+        }
         if !self.offered_suites.contains(&sh.cipher_suite) {
+            return Err(Error::HandshakeFailure);
+        }
+        // RFC 5746 §3.4: our ClientHello always carries `renegotiation_info`,
+        // so the ServerHello MUST echo it with an empty body — exactly as the
+        // TLS 1.2 path requires. Its absence is the pre-RFC-5746 renegotiation
+        // hole; a non-empty body would only be valid mid-renegotiation, which
+        // we never initiate.
+        let reneg = ext::find(&sh.extensions, ExtensionType::RENEGOTIATION_INFO)
+            .ok_or(Error::HandshakeFailure)?;
+        if !ext::parse_renegotiation_info(reneg)?.is_empty() {
+            return Err(Error::HandshakeFailure);
+        }
+        // RFC 7627: the legacy derivation cannot produce an extended master
+        // secret. A server echoing the extension on a pre-1.2 ServerHello is
+        // asking for a key schedule we did not offer here; and a client that
+        // DID offer EMS (max_version ≥ 1.2) must not silently lose it by
+        // being pushed onto the legacy path.
+        if ext::find(&sh.extensions, ExtensionType::EXTENDED_MASTER_SECRET).is_some() {
+            return Err(Error::IllegalParameter);
+        }
+        if self.ems_offered && self.config.require_ems {
             return Err(Error::HandshakeFailure);
         }
         let ls = lookup_legacy_cbc(sh.cipher_suite).ok_or(Error::HandshakeFailure)?;
@@ -2810,6 +2854,178 @@ mod tests {
             ),
         ];
         let sh = synth_sh_record(CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, exts);
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::UnsupportedVersion)
+        ));
+    }
+
+    // ---- opt-in legacy (TLS 1.0/1.1) ServerHello hardening ---------------
+
+    /// A pre-1.2 ServerHello record with an explicit `server_version`.
+    #[cfg(feature = "tls-legacy")]
+    fn synth_legacy_sh_record(
+        version: u16,
+        random: [u8; 32],
+        suite: CipherSuite,
+        exts: Vec<(ExtensionType, Vec<u8>)>,
+    ) -> Vec<u8> {
+        use crate::tls::codec::write_record;
+        let sh = crate::tls::codec::ServerHello {
+            random,
+            session_id: Vec::new(),
+            cipher_suite: suite,
+            extensions: exts,
+        };
+        let body = sh.encode_versioned(version);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_0,
+            &body,
+        );
+        rec
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_client(cfg: ClientConfig12, label: &[u8]) -> ClientConnection12 {
+        let mut rng = HmacDrbg::<Sha256>::new(label, b"nonce", &[]);
+        let mut c = ClientConnection12::new(cfg, "example.com", &mut rng).unwrap();
+        let _ = c.write_tls();
+        c
+    }
+
+    #[cfg(feature = "tls-legacy")]
+    fn legacy_only_cfg() -> ClientConfig12 {
+        ClientConfig12::new(RootCertStore::new())
+            .with_min_version(ProtocolVersion::TLSv1_0)
+            .with_max_version(ProtocolVersion::TLSv1_0)
+    }
+
+    /// RFC 5746 §3.4 on the legacy path: our ClientHello always carries
+    /// `renegotiation_info`, so a pre-1.2 ServerHello that fails to echo it
+    /// must be rejected exactly as on the TLS 1.2 path.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_client_rejects_missing_renegotiation_info() {
+        let mut c = legacy_client(legacy_only_cfg(), b"c12-legacy-noreneg");
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            [0x11u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            Vec::new(),
+        );
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::HandshakeFailure)
+        ));
+
+        // With the echo present the same ServerHello is accepted.
+        let mut c = legacy_client(legacy_only_cfg(), b"c12-legacy-reneg-ok");
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            [0x11u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])],
+        );
+        c.read_tls(&sh);
+        c.process_new_packets().unwrap();
+        assert_eq!(c.state, State::WaitCertificate);
+    }
+
+    /// RFC 8446 §4.1.3 on the legacy path: the `DOWNGRD` marker in
+    /// `server_random` is honoured the same way the TLS 1.2 path honours it —
+    /// rejected when the caller has not opted into accepting downgrades.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_client_honours_the_downgrade_sentinel() {
+        let mut random = [0x22u8; 32];
+        random[24..].copy_from_slice(&DOWNGRADE_SENTINEL_TLS11_OR_BELOW);
+        let exts = alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])];
+
+        let mut strict = legacy_client(
+            legacy_only_cfg().with_accept_downgrade_sentinel(false),
+            b"c12-legacy-downgrd",
+        );
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            random,
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            exts.clone(),
+        );
+        strict.read_tls(&sh);
+        assert!(matches!(
+            strict.process_new_packets(),
+            Err(Error::IllegalParameter)
+        ));
+
+        // The default (a legacy-only client that never offered 1.2/1.3)
+        // accepts the marker, so our own legacy server stays interoperable.
+        let mut lenient = legacy_client(legacy_only_cfg(), b"c12-legacy-downgrd-ok");
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            random,
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            exts,
+        );
+        lenient.read_tls(&sh);
+        lenient.process_new_packets().unwrap();
+    }
+
+    /// A client that offered TLS 1.2 (and therefore `extended_master_secret`)
+    /// must not lose the EMS requirement by being pushed onto the legacy
+    /// path, which cannot derive an extended master secret.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_server_hello_cannot_strip_required_ems() {
+        let spanning =
+            || ClientConfig12::new(RootCertStore::new()).with_min_version(ProtocolVersion::TLSv1_0);
+        let exts = alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])];
+
+        let mut c = legacy_client(spanning(), b"c12-legacy-ems");
+        assert!(c.ems_offered);
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            [0x33u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            exts.clone(),
+        );
+        c.read_tls(&sh);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::HandshakeFailure)
+        ));
+
+        // Opting out of the EMS requirement keeps the legacy path usable.
+        let mut c = legacy_client(spanning().with_require_ems(false), b"c12-legacy-ems-off");
+        let sh = synth_legacy_sh_record(
+            0x0301,
+            [0x33u8; 32],
+            CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA,
+            exts,
+        );
+        c.read_tls(&sh);
+        c.process_new_packets().unwrap();
+        assert_eq!(c.state, State::WaitCertificate);
+
+        // A legacy-only client never offers EMS, so the requirement cannot
+        // fire there.
+        let c = legacy_client(legacy_only_cfg(), b"c12-legacy-ems-pure");
+        assert!(!c.ems_offered);
+    }
+
+    /// A client pinned below TLS 1.2 must not be pulled UP to 1.2 either.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_only_client_rejects_a_tls12_server_hello() {
+        let mut c = legacy_client(legacy_only_cfg(), b"c12-legacy-upgrade");
+        let sh = synth_sh_record(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])],
+        );
         c.read_tls(&sh);
         assert!(matches!(
             c.process_new_packets(),

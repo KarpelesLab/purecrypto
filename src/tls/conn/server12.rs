@@ -1397,6 +1397,12 @@ impl<R: RngCore> ServerConnection12<R> {
 
         let mut server_random: Random = [0u8; 32];
         self.rng.fill_bytes(&mut server_random);
+        // RFC 8446 §4.1.3: a server that supports TLS 1.2 (this engine always
+        // does — the legacy path is reached only because the *client* offered
+        // a pre-1.2 version) and negotiates TLS 1.1 or below MUST set the
+        // `DOWNGRD\x00` sentinel in the last 8 bytes of `server_random`, so a
+        // client that really offered 1.2/1.3 can detect the downgrade.
+        apply_downgrade_sentinel_legacy(&mut server_random);
 
         self.legacy_suite = Some(ls);
         self.group = group;
@@ -2510,6 +2516,15 @@ fn apply_downgrade_sentinel(sr: &mut [u8; 32]) {
     sr[24..].copy_from_slice(&SENTINEL);
 }
 
+/// RFC 8446 §4.1.3, the TLS 1.1-or-below variant: a server that can speak
+/// TLS 1.2 (or 1.3) but negotiated TLS 1.1/1.0/SSLv3 sets `DOWNGRD\x00`.
+#[cfg(feature = "tls-legacy")]
+fn apply_downgrade_sentinel_legacy(sr: &mut [u8; 32]) {
+    // "DOWNGRD\x00"
+    const SENTINEL: [u8; 8] = [0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00];
+    sr[24..].copy_from_slice(&SENTINEL);
+}
+
 /// Maps an internal error to the alert to send the peer.
 fn alert_for(error: &Error) -> AlertDescription {
     match error {
@@ -3026,6 +3041,47 @@ mod tests {
         assert_eq!(s.client_cert_chain.len(), 1);
         assert!(s.client_leaf_key.is_some());
         assert_eq!(s.state, State::WaitClientKeyExchange);
+    }
+
+    /// RFC 8446 §4.1.3: a server that can speak TLS 1.2 but negotiates
+    /// TLS 1.0/1.1 must mark `server_random` with `DOWNGRD\x00`, so a client
+    /// that really offered 1.2/1.3 can detect the forced downgrade.
+    #[cfg(feature = "tls-legacy")]
+    #[test]
+    fn legacy_server_sets_the_downgrade_sentinel() {
+        let cfg = test_rsa_server_config().with_min_version(ProtocolVersion::TLSv1_0);
+        let srng = HmacDrbg::<Sha256>::new(b"s12-legacy-downgrd", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, srng);
+
+        let mut crng = HmacDrbg::<Sha256>::new(b"s12-legacy-downgrd-c", b"nonce", &[]);
+        let mut random = [0u8; 32];
+        crng.fill_bytes(&mut random);
+        let ch = ClientHello {
+            legacy_version: 0x0301,
+            random,
+            session_id: Vec::new(),
+            cipher_suites: alloc::vec![CipherSuite::TLS_RSA_WITH_AES_128_CBC_SHA],
+            extensions: Vec::new(),
+        }
+        .encode();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_0,
+            &ch,
+        );
+        s.read_tls(&rec);
+        s.process_new_packets().unwrap();
+        let sr = s.server_random.expect("server_random set");
+        assert_eq!(
+            &sr[24..],
+            &[0x44, 0x4F, 0x57, 0x4E, 0x47, 0x52, 0x44, 0x00],
+            "legacy ServerHello must carry the DOWNGRD\\x00 sentinel",
+        );
+        // And the 1.2 path keeps its own sentinel policy: a pinned 1.2 server
+        // (not 1.3-capable) sets none.
+        assert!(!s.config.supports_tls13);
     }
 
     /// Drives a legacy TLS 1.0 static-RSA handshake up to `ClientKeyExchange`
