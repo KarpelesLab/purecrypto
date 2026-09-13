@@ -127,7 +127,9 @@ mod select_suites_tests {
     }
 }
 
-#[cfg(test)]
+// The `QuicHooks` bridge is `Send`, so the shared capture state uses
+// `std::sync::Mutex`; QUIC mode itself is a `std` feature.
+#[cfg(all(test, feature = "std"))]
 mod quic_mode_tests {
     //! QUIC-mode (RFC 9001) loopback. Drives a TLS 1.3 handshake through
     //! the same `ClientConnection` / `ServerConnection` engines but with
@@ -1606,6 +1608,9 @@ mod loopback_tests {
     /// Phase 2: a new client connection seeds itself with that session,
     /// presents `pre_shared_key`, and resumes — bypassing
     /// Certificate / CertificateVerify in the server flight.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn psk_resumption_two_phase() {
         let (server_config, cert_der) = rsa_server();
@@ -1994,6 +1999,7 @@ mod loopback_tests {
     /// Server presents an ML-DSA-65 leaf and signs its `CertificateVerify`
     /// with the same key. Client validates the chain (under the default
     /// `modern()` policy, which permits ML-DSA) and reaches `Connected`.
+    #[cfg(feature = "mldsa")]
     #[test]
     fn tls_mldsa_server_cert() {
         let mut rng = HmacDrbg::<Sha256>::new(b"tls-mldsa-server-key", b"nonce", &[]);
@@ -2025,6 +2031,7 @@ mod loopback_tests {
     /// mTLS with an ML-DSA-65 client cert: server requires client auth, the
     /// client presents a self-signed ML-DSA-65 leaf, both sides reach
     /// `Connected`.
+    #[cfg(feature = "mldsa")]
     #[test]
     fn tls_mtls_mldsa_client_cert() {
         use crate::tls::{ClientCertConfig, RootCertStore};
@@ -2105,6 +2112,9 @@ mod loopback_tests {
     /// 0-RTT round-trip: phase 1 establishes a ticket with
     /// `max_early_data_size > 0`; phase 2 writes early data which the server
     /// reads under the early traffic key, before the handshake completes.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_echo() {
         let (server_config, cert_der) = rsa_server();
@@ -2212,6 +2222,9 @@ mod loopback_tests {
     /// protocol selected on the new connection differs from the one in
     /// use on the connection that issued the ticket. The refusal is NOT
     /// an abort — the 1-RTT resumption handshake completes normally.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_rejected_on_alpn_mismatch() {
         // Phase 1: establish a ticket on a connection that negotiated "h2".
@@ -2319,6 +2332,9 @@ mod loopback_tests {
     /// Tampering with the session's `age_add` skews the reported age by
     /// ~60 s; 0-RTT must be refused while the resumption handshake itself
     /// completes.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_rejected_on_stale_ticket_age() {
         let (server_config, cert_der) = rsa_server();
@@ -2416,6 +2432,8 @@ mod loopback_tests {
     /// servers, a second connection presenting the same binder is refused
     /// 0-RTT (the handshake still completes via the regular PSK path, so
     /// the replayed early data is silently dropped).
+    // `ReplayWindow` is a shared, locked set and so is `std`-only.
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_replay_detected() {
         use crate::tls::ReplayWindow;
@@ -2516,6 +2534,9 @@ mod loopback_tests {
     /// `max_early_data_size` budget MUST be terminated with
     /// `unexpected_message`. Regression guard for the byte-budget enforcement
     /// that lives in `process_new_packets`.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn server_rejects_excess_early_data() {
         // Phase 1: establish a session with a tight 0-RTT budget.
@@ -2598,6 +2619,9 @@ mod loopback_tests {
     /// E-1 negative control: when 0-RTT data is split into multiple records
     /// whose plaintexts sum to exactly the budget, the server still accepts
     /// them (boundary case — `consumed == remaining`).
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn server_accepts_early_data_exactly_at_budget() {
         const BUDGET: u32 = 64;
@@ -2684,6 +2708,9 @@ mod loopback_tests {
     /// The pre-`Connected` accept gate keys off the *live* early-data
     /// condition (`early_data_remaining`), not the sticky `early_data_accepted`
     /// flag, so this window is closed once EOED is processed.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn server_rejects_app_data_after_eoed_before_finished() {
         use crate::tls::ContentType;
@@ -2807,6 +2834,9 @@ mod loopback_tests {
 
     /// A PSK binder that's been tampered with: the server must reject with
     /// `decrypt_error` (RFC 8446 §4.2.11.2).
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn psk_binder_mismatch_rejected() {
         let (server_config, cert_der) = rsa_server();
@@ -5613,6 +5643,9 @@ mod tls12_loopback_tests {
 
     /// Two-phase resumption: a fresh handshake yields a session, a second
     /// connection resumes via the abbreviated flow.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_resumption_round_trip() {
         let (server_config, server_cert_der) = rsa_server12();
@@ -5702,6 +5735,9 @@ mod tls12_loopback_tests {
 
     /// A tampered ticket falls back to a fresh full handshake (the server's
     /// AEAD decrypt fails and it ignores the ticket).
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_resumption_falls_back_on_bad_ticket() {
         let (server_config, server_cert_der) = rsa_server12();
@@ -6299,6 +6335,9 @@ mod tls12_loopback_tests {
     }
 
     /// RFC 7627 §5.3 happy path: an EMS-bound session resumes under EMS.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_resumption_ems_to_ems() {
         let ticket_key = [0x77u8; 32];
@@ -6376,6 +6415,9 @@ mod tls12_loopback_tests {
     /// RFC 7627 §5.3: an EMS-bound session that resumes against a server
     /// stripping the EMS echo MUST abort with `IllegalParameter`. This is
     /// the cross-EMS-resumption guard.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_resumption_cross_ems_aborts() {
         let ticket_key = [0x77u8; 32];
@@ -6467,6 +6509,9 @@ mod tls12_loopback_tests {
 
     /// RFC 7627 §5.3: a legacy session (no EMS) resumes under legacy
     /// derivation; the EMS bit stays `false` on both sides.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_resumption_legacy_to_legacy() {
         let ticket_key = [0x77u8; 32];
@@ -6700,7 +6745,8 @@ mod tls12_loopback_tests {
     }
 }
 
-#[cfg(test)]
+// `WriterKeyLog` writes through `std::io::Write`.
+#[cfg(all(test, feature = "std"))]
 mod keylog_loopback_tests {
     //! Loopback tests for the SSLKEYLOGFILE plumbing on TLS 1.2 and TLS 1.3.
 
@@ -7131,6 +7177,9 @@ mod audit_regression_tests {
     /// the first `bad_record_mac` was fatal, so every intended fallback —
     /// stale ticket, rotated ticket key, replay-window hit, load-balanced
     /// pool — was a hard connection failure.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn rejected_early_data_falls_back_to_one_rtt() {
         // Phase 1: a server that grants 0-RTT issues a ticket.
@@ -7200,6 +7249,9 @@ mod audit_regression_tests {
     /// 0-RTT routing armed, so the client's authenticated 1-RTT stream landed
     /// in the replayable early-data quarantine. The gate must fire before the
     /// Finished MAC is even considered.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn server_requires_end_of_early_data_before_finished() {
         // Phase 1: obtain a 0-RTT-capable ticket.
@@ -7947,6 +7999,8 @@ mod audit_regression_tests {
     /// completed, so bytes the unauthenticated server sent between its CCS
     /// and its Finished were readable via `take_received_plaintext()` on
     /// the error path. Mirrors `app_data_allowed` on the 1.3 core.
+    // Captures the master secret through a `Mutex`-backed `KeyLog`.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_client_drops_application_data_received_before_finished() {
         use crate::tls::codec::{read_record, write_record};
@@ -8065,6 +8119,8 @@ mod audit_regression_tests {
     // ----- TLS-CORE-4: ticket domain separation + client-auth binding -----
 
     /// A self-signed Ed25519 client certificate (DER) and its key.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn ed25519_client_cert(seed: &[u8]) -> (Vec<u8>, crate::ec::Ed25519PrivateKey) {
         use crate::x509::CertSigner;
         let mut rng = HmacDrbg::<Sha256>::new(seed, b"client-key", &[]);
@@ -8087,6 +8143,8 @@ mod audit_regression_tests {
     }
 
     /// Drives a TLS 1.3 pair, surfacing the first engine error.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn pump_result(
         client: &mut ClientConnection,
         server: &mut ServerConnection<HmacDrbg<Sha256>>,
@@ -8110,6 +8168,8 @@ mod audit_regression_tests {
     }
 
     /// Drives a TLS 1.2 pair, surfacing the first engine error.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn pump_result12(
         client: &mut crate::tls::conn::ClientConnection12,
         server: &mut crate::tls::conn::ServerConnection12<HmacDrbg<Sha256>>,
@@ -8138,6 +8198,9 @@ mod audit_regression_tests {
     /// ticket now records the client-auth status; an mTLS-required listener
     /// ignores a no-auth ticket and runs a full handshake, which still
     /// demands (and validates) the client certificate.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls13_no_auth_ticket_does_not_resume_on_mtls_required_listener() {
         use crate::tls::ClientCertConfig;
@@ -8206,6 +8269,9 @@ mod audit_regression_tests {
     /// TLS-CORE-4(c) — TLS 1.3: a ticket from a client-authenticated
     /// handshake resumes on an mTLS-required listener and restores the
     /// client leaf into `peer_certificates()`.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls13_mtls_ticket_resumes_and_restores_peer_certificates() {
         use crate::tls::ClientCertConfig;
@@ -8275,6 +8341,8 @@ mod audit_regression_tests {
 
     /// TLS 1.2 server config (RSA) with a ticket key, optionally
     /// mTLS-required against `client_root`.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn server12_cfg(
         ticket_key: [u8; 32],
         client_root: Option<&[u8]>,
@@ -8301,6 +8369,9 @@ mod audit_regression_tests {
 
     /// TLS-CORE-4(c) — TLS 1.2 twin of
     /// `tls13_no_auth_ticket_does_not_resume_on_mtls_required_listener`.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_no_auth_ticket_does_not_resume_on_mtls_required_listener() {
         use crate::tls::conn::{
@@ -8369,6 +8440,9 @@ mod audit_regression_tests {
 
     /// TLS-CORE-4(c) — TLS 1.2 twin of
     /// `tls13_mtls_ticket_resumes_and_restores_peer_certificates`.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn tls12_mtls_ticket_resumes_and_restores_peer_certificates() {
         use crate::tls::conn::{
@@ -8421,6 +8495,9 @@ mod audit_regression_tests {
     /// diverted fully-authenticated bytes into the replayable early-data
     /// quarantine: `recv()` returned nothing while `take_early_data()`
     /// returned 1-RTT data mislabelled as replayable.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn accepted_early_data_does_not_capture_the_one_rtt_stream() {
         let (server_config, cert_der) = rsa_server();
@@ -8477,6 +8554,8 @@ mod audit_regression_tests {
 
     /// Phase 1 of the HRR+PSK tests: a plain handshake that mints a ticket.
     /// `max_early_data` > 0 makes the ticket 0-RTT capable.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn hrr_psk_session(seed: &[u8], max_early_data: u32) -> (super::StoredSession, Vec<u8>) {
         let (server_config, cert_der) = rsa_server();
         let server_config = server_config
@@ -8503,6 +8582,8 @@ mod audit_regression_tests {
     /// Phase 2 setup: a server that insists on SECP256R1 (so the client's
     /// X25519-only share triggers an HRR) and a resuming client that
     /// advertises both groups but ships a share only for X25519.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn hrr_psk_pair(
         seed: &[u8],
         session: super::StoredSession,
@@ -8532,6 +8613,8 @@ mod audit_regression_tests {
 
     /// A plaintext handshake record carrying one ServerHello-shaped message:
     /// true iff its `random` is the HelloRetryRequest sentinel.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn is_hrr_record(rec: &[u8]) -> bool {
         // record header (5) + handshake header (4) + legacy_version (2).
         rec.len() >= 5 + 4 + 2 + 32
@@ -8541,6 +8624,8 @@ mod audit_regression_tests {
     }
 
     /// Decodes the ClientHello inside a plaintext handshake record.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn decode_ch_record(rec: &[u8]) -> crate::tls::codec::ClientHello {
         use crate::tls::codec::{ClientHello, ReadCursor, read_handshake};
         assert_eq!(rec[0], 0x16, "CH2 must be a plaintext handshake record");
@@ -8552,6 +8637,8 @@ mod audit_regression_tests {
 
     /// Drives CH1 → HRR → CH2 by hand and returns the CH2 record, leaving
     /// the server just before it consumes CH2.
+    // Only the `std`-gated resumption cases use this.
+    #[cfg(feature = "std")]
     fn hrr_psk_ch2(
         client: &mut ClientConnection,
         server: &mut ServerConnection<HmacDrbg<Sha256>>,
@@ -8573,6 +8660,9 @@ mod audit_regression_tests {
     /// CH2` on the client and verified over the same transcript on the
     /// server; the PSK is selected in CH2 and the handshake completes as a
     /// resumption.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn psk_resumption_survives_hello_retry_request() {
         use crate::tls::codec::{ExtensionType, extension as ext};
@@ -8618,6 +8708,9 @@ mod audit_regression_tests {
     /// alone. Rebuild that binder by hand into the real CH2 and confirm the
     /// server rejects it with `decrypt_error` — the binder must be bound to
     /// the HRR-inclusive transcript.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn hrr_ch2_with_ch2_only_binder_is_rejected() {
         use crate::hash::Hmac;
@@ -8656,6 +8749,9 @@ mod audit_regression_tests {
     /// early-data records already on the wire are skipped by the server, CH2
     /// carries no `early_data` extension and goes out in plaintext, further
     /// early writes are refused, and the handshake still resumes (1-RTT).
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn zero_rtt_offer_then_hello_retry_request_resumes_without_early_data() {
         use crate::tls::codec::{ExtensionType, extension as ext};

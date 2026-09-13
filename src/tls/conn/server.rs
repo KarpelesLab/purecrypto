@@ -1390,7 +1390,7 @@ impl<R: RngCore> ServerConnection<R> {
     /// Test hook: inject one decoded handshake message straight into the
     /// state machine, bypassing the record layer. Used to exercise ordering
     /// rules a well-behaved peer's record stream cannot reach.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "std"))]
     pub(crate) fn handle_handshake_for_test(&mut self, msg: Vec<u8>) -> Result<(), Error> {
         self.handle_handshake(msg)
     }

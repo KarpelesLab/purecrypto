@@ -1037,6 +1037,10 @@ impl ConfigBuilder {
 impl SigningKey {
     /// Construct a per-(version, role) [`super::conn::ServerKey`] from this
     /// signing key (TLS 1.3 server).
+    ///
+    /// Only the `std`-gated `LocalSigner` and the DTLS 1.3 server builder
+    /// call this, so it is compiled with them.
+    #[cfg(any(feature = "std", feature = "dtls"))]
     pub(crate) fn to_server_key_13(&self) -> super::conn::ServerKey {
         match self {
             SigningKey::Rsa(k) => super::conn::ServerKey::Rsa(k.clone()),

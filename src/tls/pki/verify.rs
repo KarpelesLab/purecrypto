@@ -1871,6 +1871,7 @@ mod tests {
     /// Issuing and validating a self-signed ML-DSA-65 certificate through
     /// the full `verify_chain` path. ML-DSA is on the default whitelist as
     /// of commit 3, so no policy tuning is needed.
+    #[cfg(feature = "mldsa")]
     #[test]
     fn mldsa_self_signed_chain() {
         use crate::hash::Sha256;
@@ -1928,6 +1929,7 @@ mod tests {
 
     /// A self-signed SLH-DSA-SHA2-128f cert validates only under a policy
     /// that explicitly permits SLH-DSA (the default `modern()` does not).
+    #[cfg(feature = "slhdsa")]
     #[test]
     fn slhdsa_chain_under_extended_policy() {
         use crate::hash::Sha256;

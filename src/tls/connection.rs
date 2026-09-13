@@ -760,6 +760,7 @@ impl Connection {
     /// signature, or the device transport.
     ///
     /// ```no_run
+    /// # #[cfg(feature = "std")] {
     /// # use purecrypto::tls::{Connection, Step};
     /// # fn run(conn: &mut Connection, sock: &mut std::net::TcpStream) -> std::io::Result<()> {
     /// use std::io::{Read, Write};
@@ -780,6 +781,7 @@ impl Connection {
     ///     }
     /// }
     /// # Ok(())
+    /// # }
     /// # }
     /// ```
     pub fn drive(&mut self) -> Result<Step, Error> {
@@ -1798,18 +1800,24 @@ fn client_cert_from_signing(id: &super::config::Identity) -> Option<super::conn:
     })
 }
 
-#[cfg(test)]
+// The `Connection` loopback harness seeds its configs from `rng::OsRng` and
+// the external-signer cases model a device over unix fds, so the suite as a
+// whole needs `std`. The engine itself does not.
+#[cfg(all(test, feature = "std"))]
 mod tests {
     use super::super::config::EntropySource;
     use super::*;
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
-    use crate::tls::{AlertDescription, RootCertStore};
+    use crate::tls::AlertDescription;
+    #[cfg(feature = "dtls")]
+    use crate::tls::RootCertStore;
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
     /// Build a minimal DTLS server [`Config`] (P-256 ECDSA leaf, self-signed)
     /// with `require_cookie` defaulted to true and `cookie_secret = None`.
+    #[cfg(feature = "dtls")]
     fn dtls_server_cfg_without_cookie_secret(max_version: ProtocolVersion) -> Config {
         let mut rng = HmacDrbg::<Sha256>::new(b"h3-dtls-cookie", b"nonce", &[]);
         let key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
@@ -2347,6 +2355,8 @@ mod tests {
     // forgot to wire a cookie secret used to silently downgrade to "no
     // cookies" — the AND-combine of `require_cookie && cookie_secret`.
     // Fail-closed: refuse to construct the engine.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn dtls_server_refuses_construction_without_cookie_secret() {
         // DTLS 1.2 path.
@@ -2381,6 +2391,8 @@ mod tests {
     /// The DTLS engines never emit a `CertificateRequest`, so a `client_auth`
     /// configuration on a DTLS server would be silently ignored — access
     /// control failing open. Construction must fail closed instead.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn dtls_server_refuses_client_auth() {
         for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
@@ -2418,6 +2430,8 @@ mod tests {
     /// verification *off* there is nothing to verify against, so a name is
     /// optional (e.g. connecting to a device by IP); the engines simply omit the
     /// SNI extension. This holds across every TLS/DTLS engine path.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn client_server_name_required_only_when_verifying() {
         for v in [
@@ -2675,6 +2689,8 @@ mod tests {
     /// The sans-I/O engine never invents entropy: a `Config` with no
     /// `EntropySource` fails closed at construction rather than reaching for a
     /// hidden `OsRng`. Covers both roles across TLS and DTLS.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn construction_requires_an_entropy_source() {
         for v in [
@@ -2905,6 +2921,8 @@ mod tests {
     /// A DTLS 1.3 server using `SigningKey::External` completes the handshake
     /// when the caller fulfils `signature_request` out-of-band — the
     /// suspend/resume path works over the datagram engine too.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn dtls13_server_external_signing_round_trips() {
         const ECDSA_SECP256R1_SHA256: u16 = 0x0403;
@@ -2975,6 +2993,8 @@ mod tests {
     /// suspend/resume seam sits at a different point in the flight than 1.3.
     /// Drive a full loopback handshake where the server's identity is an
     /// `External` ECDSA key and the test "HSM" signs the SKE bytes out-of-band.
+    // Exercises the DTLS engine paths.
+    #[cfg(feature = "dtls")]
     #[test]
     fn dtls12_server_external_signing_round_trips() {
         const ECDSA_SECP256R1_SHA256: u16 = 0x0403;

@@ -4608,6 +4608,9 @@ mod tests {
     /// that issued it and to its lifetime. Since a resumed handshake
     /// carries no certificate, offering the PSK to another name — or long
     /// after it expired — must not happen.
+    // Session tickets / PSK resumption need a wall clock: without `std`,
+    // `now()` is 0, no ticket is issued and the age check never runs.
+    #[cfg(feature = "std")]
     #[test]
     fn client_only_offers_a_session_to_its_own_server_within_its_lifetime() {
         fn session(name: &str, age_secs: u64) -> StoredSession {

@@ -1289,6 +1289,7 @@ mod dtls13 {
     /// DTLS 1.3 + ML-DSA-65 server certificate (draft-ietf-tls-mldsa):
     /// covers the post-quantum signing path in DTLS, mirroring the TLS
     /// `tls_mldsa_server_cert` test.
+    #[cfg(feature = "mldsa")]
     #[test]
     fn loopback_mldsa65_cert() {
         use crate::tls::conn::ServerKey;
@@ -1335,6 +1336,8 @@ mod dtls13 {
     /// TLS 1.3 label twice (once per peer) with matching secret bytes.
     /// Confirms DTLS picks up the keylog wiring through the shared
     /// `tls::Config` plumbing without a separate code path.
+    // `WriterKeyLog` writes through `std::io::Write`.
+    #[cfg(feature = "std")]
     #[test]
     fn keylog_loopback_agrees() {
         use crate::tls::WriterKeyLog;
@@ -2787,6 +2790,8 @@ mod security_regressions {
     /// a rejection is a silent drop (never a fatal error, which a spoofed
     /// datagram could then trigger at will): the refusal shows up as the
     /// client never answering and the handshake never completing.
+    // Only the `std`-gated expired-certificate cases use this.
+    #[cfg(feature = "std")]
     fn client_refuses_server_flight<R: crate::rng::RngCore>(
         client: &mut DtlsClientConnection12,
         server: &mut DtlsServerConnection12<R>,
@@ -2807,6 +2812,9 @@ mod security_regressions {
         !client.is_handshake_complete()
     }
 
+    // Certificate expiry is judged against the wall clock, which only
+    // exists in a `std` build.
+    #[cfg(feature = "std")]
     #[test]
     fn expired_server_cert_rejected_by_default_client_12() {
         let (der, key) = cert_with_validity(
@@ -2864,6 +2872,9 @@ mod security_regressions {
         assert!(pump_handshake(&mut client, &mut server));
     }
 
+    // Certificate expiry is judged against the wall clock, which only
+    // exists in a `std` build.
+    #[cfg(feature = "std")]
     #[test]
     fn expired_server_cert_rejected_by_default_client_13() {
         let (der, key) = cert_with_validity(
