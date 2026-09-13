@@ -1823,6 +1823,8 @@ mod tests {
     /// Full encrypted-PKCS#8 round trip on a real RSA key: encrypt to PEM
     /// with PBES2 (AES-256-GCM + PBKDF2-HMAC-SHA256), parse back, and
     /// verify the recovered key signs identically.
+    // PBES2 (the shrouded-key wrapper) lives in `kdf`.
+    #[cfg(feature = "kdf")]
     #[test]
     fn rsa_encrypted_pkcs8_pem_roundtrip() {
         let sk = gen_small_key(b"rsa-pkcs8-pem-enc");
@@ -1859,6 +1861,7 @@ mod tests {
 
     /// Same round trip via AES-256-CBC (PKCS#7 padded), the other PBES2
     /// cipher we support.
+    #[cfg(feature = "kdf")]
     #[test]
     fn rsa_encrypted_pkcs8_der_roundtrip_cbc() {
         let sk = gen_small_key(b"rsa-pkcs8-der-cbc");
