@@ -7,6 +7,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/KarpelesLab/purecrypto/compare/v0.8.3...v0.8.4) - 2026-09-13
+
+### Added
+
+- *(tls)* honour RFC 5937 trust-anchor self-constraints
+- *(xts)* byte-key constructors that reject K1 == K2, plus checked sectors
+- *(key)* facade impls for the fixed-curve secp256k1 ECDSA keys
+- *(ec)* allocation-free secp256k1 ECDSA (`ec::secp256k1_ecdsa`)
+- *(ct)* subtle-compatible select helper, ConditionallyNegatable, CtOption combinators
+- *(zeroize)* add a public volatile-store `zeroize` module
+
+### Fixed
+
+- *(cli)* pkeyutl decrypt uses implicit rejection; s_server refuses -Verify under DTLS
+- *(tls)* bound TLS 1.3 ticket lifetimes and bind tickets to the client-auth trust config
+- *(quic)* hold back 0.5-RTT data when a client certificate is required
+- *(quic)* scope stateless-reset detection, reject over-large stream limits
+- *(quic)* enforce the final-size rule and charge flow control last
+- *(quic)* bind PATH_RESPONSE to its path and charge it to the budget
+- *(quic)* bound half-open connections in QuicServer
+- *(quic)* harden the Retry path (bind the Retry SCID, shorter token life)
+- *(quic)* only adopt keys and connection IDs from packets that authenticate
+- *(quic)* close the connection on protocol and TLS errors
+- *(quic)* never process 1-RTT packets before the handshake completes
+- *(pqc)* wipe secret-derived intermediates on the signing and keygen paths
+- *(xmss)* XmssMt::remaining() over-reported by one for the h=40 sets
+- *(mldsa)* validate hazmat parameter inputs and overwrite the hint buffer
+- *(falcon)* validate imported secret keys and bound the signing retry loop
+- *(lms)* authenticate the HSS private-key file against child-level tampering
+- *(tls)* keep the EMS-offered flag cfg-correct without the tls-legacy feature
+- *(tls)* require the server's CCS before its Finished; fatal alerts are fatal
+- *(tls)* per-AEAD record caps for TLS 1.2, and always allow the closing alert
+- *(tls)* reject empty 1.2 handshake fragments and drain inbuf once per call
+- *(tls)* harden the opt-in legacy (TLS 1.0/1.1) ServerHello path
+- *(tls)* bind TLS 1.2 session tickets to the listener's trust config and clock
+- *(tls)* fail closed when a DTLS server config carries client_auth
+- *(tls)* never report a completed handshake after a pre-handshake close_notify
+- *(tls)* wipe PSK/ticket secrets and scope sessions to their verification context
+- *(tls)* tighten TLS 1.3 CertificateVerify / Certificate validation
+- *(tls)* redact+wipe ECH private keys, bound the exporter's inputs
+- *(tls)* bind 0-RTT to the ticket's cipher suite; reject KeyUpdate in QUIC
+- *(tls)* authenticate client raw public keys against a server allowlist
+- *(tls)* bound peer-influenced ClientHello inputs (HRR cookie, ticket, PSK scope)
+- *(dtls)* expire retired 1.3 read epochs, refuse app data under epoch 2
+- *(dtls)* drop spoofed epoch-0 server-flight messages at the 1.2 client
+- *(dtls)* a spoofed ClientKeyExchange no longer drops the 1.2 server flight
+- *(dtls)* commit the 1.3 client's ServerHello choices only after key agreement
+- *(dtls)* a rejected spoofed ClientHello no longer wedges the 1.3 pre-cookie buffer
+- *(x509)* reject trailing data in Validity and in PEM certificates
+- *(tls)* normalize trailing dots and tighten dNSName matching
+- *(tls)* correct RFC 5280 §6.1.5 policy wrap-up and intersection
+- *(pkcs12)* enforce RFC 9579 PBMAC1 keyLength and PRF
+- *(ffi)* wipe AEAD plaintext on every exit, harden slice(), zero wasm secrets
+- *(cli)* refuse aliased stateful keys and stop leaking sentinel locks
+- *(cli)* refuse to certify a requester-chosen host name via the CSR commonName
+- *(rsa,rng,dh)* PSS-restricted keys, empty DRBG reseed, MR-base claim
+- *(rsa)* never release an unverified private-op result; check e·d at parse
+- *(dh)* reject a peer public key from another group
+- *(dh)* require a >= 224-bit private exponent in DhGroup::from_custom
+- *(rsa)* clamp Miller-Rabin rounds up to a FIPS-derived floor in keygen
+- *(bignum,rsa,dh)* wipe secret moduli and exponents before free
+- *(rsa)* mix fresh randomness into the private-op blinders
+- *(rsa)* checked arithmetic for oversized PSS salt lengths
+- *(key)* implicit rejection for facade PKCS#1 v1.5 decrypt; reject foreign MGF1
+- *(rsa)* fold the expected-length check into PKCS#1 v1.5 implicit rejection
+- *(ec)* validate the optional fields of SEC1 / PKCS#8 EC private keys
+- *(zkp)* hedge the whitelist ring nonce against RNG failure
+- *(zkp)* derive the asset generator without a parity branch
+- *(ec)* branch-free window gathers and volatile wiping in scalar mult
+- *(sm2)* stop signing from looping forever on permanent failures
+- *(kdf)* cheap parameter validation for scrypt, KBKDF and PBES2
+- *(hash,kdf)* wipe secret intermediates left by finalization
+- *(hash)* floor the tag length the default Mac::verify accepts, and
+- *(hash)* skip the BLAKE2 key block for an empty MAC key
+- *(kdf)* key every KBKDF HMAC block from the same keyed state
+- *(cipher,hpke)* wipe secret intermediates left on the stack and heap
+- *(mac)* make UMAC's POLY and L3 arithmetic constant time
+- *(gcm)* validate the untrusted hw AES schedule before the fused kernel
+
+### Other
+
+- *(zeroize)* wipe slices a machine word at a time
+- *(cipher)* keep the ChaCha20-Poly1305 per-record OTK wipe non-volatile
+- *(falcon,zkp,ffi,pkcs12)* wipe the last hand-rolled secret clears
+- *(pqc,kdf,bignum)* wipe secrets through Zeroize
+- *(ec)* wipe scalars, nonces and ladder state through Zeroize
+- *(cipher)* wipe key schedules and mode state through Zeroize
+- *(zeroize)* route the remaining local `wipe` helpers through Zeroize
+- *(cli)* document CSR subject/SAN vetting, -subj, -allow-cn-hostname
+- *(quic)* rustfmt, misplaced test attributes, export DEFAULT_MAX_HALF_OPEN
+- *(tls)* rustfmt the new DTLS client-auth and close_notify tests
+- *(dtls)* a mid-handshake close_notify can never report a complete handshake
+- *(dtls)* keep the record-count grace test unchanged
+- *(rsa)* rustfmt + clippy fixes for the audit changes
+- *(ec,zkp)* drop two intra-doc links to private items
+- *(hash)* make the hardware SHA backends unsafe fns
+- *(cipher)* state the single AEAD buffer contract on tag failure
+- *(deps)* bump compcol to 0.6
+- *(cli)* widen the q_client retry window on the QUIC loopback test
+- build docs.rs with all features; fix a default-features intra-doc link
+- restructure the README; add CLI and signature-registry references
+
 ## [0.8.3](https://github.com/KarpelesLab/purecrypto/compare/v0.8.2...v0.8.3) - 2026-09-08
 
 ### Added
