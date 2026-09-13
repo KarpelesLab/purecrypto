@@ -43,16 +43,18 @@
  *  - Every entry point catches panics (returned as PC_INTERNAL).
  *
  * Threading:
- *   The opaque handles minted by this library (pc_hash, pc_hmac_ctx,
- *   pc_aead_ctx, pc_rsa, pc_ec, pc_mlkem, pc_mldsa, pc_slhdsa, pc_csr,
- *   pc_cert, pc_crl, pc_tls_cfg, pc_tls, pc_quic_cfg, pc_quic, ...) are
- *   NOT safe for concurrent use from multiple threads. The underlying
- *   Rust types are !Sync. Callers using the library from a threaded
- *   program MUST serialize every call that touches the same handle
- *   (e.g. with pthread_mutex_t). Different handles are independent and
- *   may be used concurrently on separate threads. The pc_rand_bytes
- *   entry point is the only stateless exception — it draws from the
- *   OS CSPRNG directly and is safe to call from any thread.
+ *   The opaque handles minted by this library (PcHash, PcRsaKey, PcEcKey,
+ *   PcEd25519Key, PcEd448Key, PcMlKem, PcMlDsa, PcSlhDsa, PcSm2, PcLms,
+ *   PcHss, PcXmss, PcXmssMt, PcCsr, PcCert, PcCrl, PcTlsCfg, PcTls,
+ *   PcQuicCfg, PcQuic) are NOT safe for concurrent use from multiple
+ *   threads. The underlying Rust types are !Sync. Callers using the
+ *   library from a threaded program MUST serialize every call that
+ *   touches the same handle (e.g. with pthread_mutex_t). Different
+ *   handles are independent and may be used concurrently on separate
+ *   threads. The one-shot entry points that take no handle at all
+ *   (pc_digest, pc_hmac, pc_cmac, pc_gmac, the pc_aead_* / pc_aes_kw_* /
+ *   pc_aes_kwp_* calls, the KDFs, pc_rand_bytes) keep no state between
+ *   calls and are safe to call from any thread.
  */
 #ifndef PURECRYPTO_H
 #define PURECRYPTO_H

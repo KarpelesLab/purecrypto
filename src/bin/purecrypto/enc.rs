@@ -66,6 +66,23 @@ fn parse_alg(name: &str) -> Option<Algo> {
     })
 }
 
+/// Whether reusing a nonce under `alg` is catastrophic rather than merely
+/// bad practice.
+///
+/// The counter-mode AEADs (GCM, CCM, ChaCha20/XChaCha20-Poly1305, AEGIS,
+/// Ascon) derive their keystream from (key, nonce) alone: a repeat XORs two
+/// plaintexts together and, for the polynomial MACs, leaks the authentication
+/// key outright, so an attacker can forge arbitrary further messages. The
+/// SIV constructions (AES-GCM-SIV, AES-SIV) are nonce-misuse resistant by
+/// design — a repeat leaks only that the two plaintexts were equal — and are
+/// deliberately not warned about.
+fn nonce_reuse_is_catastrophic(alg: Algo) -> bool {
+    !matches!(
+        alg,
+        Algo::Aes128GcmSiv | Algo::Aes256GcmSiv | Algo::Aes128Siv | Algo::Aes256Siv
+    )
+}
+
 fn key_size(alg: Algo) -> usize {
     match alg {
         Algo::Aes128Gcm
@@ -479,6 +496,21 @@ pub(crate) fn run(args: Args) {
             if nonce.is_empty() {
                 zero_buf(&mut key);
                 die("-nonce must not be empty");
+            }
+            // The nonce comes from the user, so nothing here can stop them
+            // reusing one. For the counter-mode AEADs that is not a
+            // degradation but a total break: a repeated (key, nonce) under
+            // GCM or ChaCha20-Poly1305 XORs two plaintexts under one
+            // keystream and leaks the polynomial authentication key, which
+            // forges further messages. The misuse-resistant modes (GCM-SIV,
+            // AES-SIV) and the nonce-hiding ones are not warned about.
+            if !decrypt && nonce_reuse_is_catastrophic(alg) {
+                eprintln!(
+                    "purecrypto: warning: {alg_name} needs a nonce that is NEVER reused with \
+                     the same key — a repeat reveals both plaintexts and the authentication \
+                     key. Draw a fresh one per message with `purecrypto rand {}`.",
+                    nonce.len()
+                );
             }
             if decrypt {
                 aead_decrypt(alg, &key, &nonce, &aad, &input)

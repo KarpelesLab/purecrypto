@@ -98,6 +98,45 @@ fn aead_tag_size(alg: i32) -> usize {
     }
 }
 
+/// Whether `len` is an acceptable nonce length for `alg`.
+///
+/// Checked *before* the caller's plaintext is copied into the working buffer:
+/// the per-algorithm length checks used to live inside the algorithm match,
+/// after `p.to_vec()`, so a wrong nonce length returned `PC_UNSUPPORTED` with
+/// a full unwiped copy of the plaintext handed straight back to the
+/// allocator. (AES-SIV is excluded: there the `nonce` argument is an
+/// associated-data header of any length, not a nonce.)
+fn aead_nonce_ok(alg: i32, len: usize) -> bool {
+    match alg {
+        // GCM accepts any non-empty nonce (96 bits is the canonical size).
+        aead_id::AES128_GCM | aead_id::AES256_GCM => len != 0,
+        // RFC 3610 §2: 7..=13 octets.
+        aead_id::AES128_CCM | aead_id::AES256_CCM | aead_id::AES128_CCM8 | aead_id::AES256_CCM8 => {
+            (7..=13).contains(&len)
+        }
+        aead_id::CHACHA20_POLY1305 | aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => len == 12,
+        aead_id::XCHACHA20_POLY1305 => len == 24,
+        aead_id::AEGIS128L | aead_id::ASCON_AEAD128 => len == 16,
+        aead_id::AEGIS256 => len == 32,
+        // AES-SIV's `nonce` argument is an AD header: any length goes.
+        aead_id::AES128_SIV | aead_id::AES256_SIV => true,
+        _ => false,
+    }
+}
+
+/// The in-place AEAD working buffer, scrubbed on **every** exit path.
+///
+/// `pc_aead_encrypt` copies the caller's plaintext in here before the cipher
+/// runs; without a `Drop` scrub, any early `return` (or a caught panic) would
+/// return that copy to the allocator intact.
+struct AeadBuf(Vec<u8>);
+
+impl Drop for AeadBuf {
+    fn drop(&mut self) {
+        wipe_vec(&mut self.0);
+    }
+}
+
 /// One-shot AEAD encrypt. `pt` and `ct_and_tag` MUST NOT overlap. On success,
 /// `*ct_and_tag_len` is set to `pt_len + tag_size`.
 ///
@@ -133,6 +172,13 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         if k.len() != expected_key {
             return PcStatus::Unsupported;
         }
+        // Screen the nonce BEFORE the plaintext is copied anywhere: the
+        // length checks used to sit inside the match below, so a wrong nonce
+        // length freed an unwiped plaintext copy. Everything past this point
+        // has a nonce the chosen algorithm accepts.
+        if !aead_nonce_ok(alg, n.len()) {
+            return PcStatus::Unsupported;
+        }
         // AES-SIV uses a single-AD form (the `nonce` argument is the AD header)
         // and emits `V ‖ ciphertext`, so it does not fit the append-tag shape.
         if is_siv(alg) {
@@ -143,24 +189,22 @@ pub unsafe extern "C" fn pc_aead_encrypt(
             return unsafe { out_write(&out, ct_and_tag, ct_and_tag_len) };
         }
         let tag_size = aead_tag_size(alg);
-        let mut buf: Vec<u8> = p.to_vec();
+        // `AeadBuf` scrubs on drop, so the caller's plaintext never reaches
+        // the allocator intact — not on the success path, not on an early
+        // return, not on a caught panic.
+        let mut work = AeadBuf(p.to_vec());
+        let buf = &mut work.0;
         let tag: Vec<u8> = match alg {
             aead_id::AES128_GCM => {
-                if n.is_empty() {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 Aes128Gcm::new(Aes128::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::AES256_GCM => {
-                if n.is_empty() {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 Aes256Gcm::new(Aes256::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::CHACHA20_POLY1305 => {
@@ -170,43 +214,31 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Err(_) => return PcStatus::Unsupported,
                 };
                 ChaCha20Poly1305::new(key.r())
-                    .encrypt(&nonce, a, &mut buf)
+                    .encrypt(&nonce, a, buf)
                     .to_vec()
             }
             aead_id::AES128_CCM => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 Aes128Ccm::new(Aes128::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::AES256_CCM => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 Aes256Ccm::new(Aes256::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::AES128_CCM8 => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<16>(k.try_into().unwrap());
                 Aes128Ccm8::new(Aes128::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::AES256_CCM8 => {
-                if !(7..=13).contains(&n.len()) {
-                    return PcStatus::Unsupported;
-                }
                 let key = KeyBuf::<32>(k.try_into().unwrap());
                 Aes256Ccm8::new(Aes256::new(key.r()))
-                    .encrypt(n, a, &mut buf)
+                    .encrypt(n, a, buf)
                     .to_vec()
             }
             aead_id::AES128_GCM_SIV | aead_id::AES256_GCM_SIV => {
@@ -214,7 +246,7 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                AesGcmSiv::new(k).encrypt(&nonce, a, &mut buf).to_vec()
+                AesGcmSiv::new(k).encrypt(&nonce, a, buf).to_vec()
             }
             aead_id::XCHACHA20_POLY1305 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
@@ -223,7 +255,7 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Err(_) => return PcStatus::Unsupported,
                 };
                 XChaCha20Poly1305::new(key.r())
-                    .encrypt(&nonce, a, &mut buf)
+                    .encrypt(&nonce, a, buf)
                     .to_vec()
             }
             aead_id::AEGIS128L => {
@@ -232,9 +264,7 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                Aegis128L::new(key.r())
-                    .encrypt(&nonce, a, &mut buf)
-                    .to_vec()
+                Aegis128L::new(key.r()).encrypt(&nonce, a, buf).to_vec()
             }
             aead_id::AEGIS256 => {
                 let key = KeyBuf::<32>(k.try_into().unwrap());
@@ -242,7 +272,7 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                Aegis256::new(key.r()).encrypt(&nonce, a, &mut buf).to_vec()
+                Aegis256::new(key.r()).encrypt(&nonce, a, buf).to_vec()
             }
             aead_id::ASCON_AEAD128 => {
                 let key = KeyBuf::<16>(k.try_into().unwrap());
@@ -250,15 +280,13 @@ pub unsafe extern "C" fn pc_aead_encrypt(
                     Ok(v) => v,
                     Err(_) => return PcStatus::Unsupported,
                 };
-                AsconAead128::new(key.r())
-                    .encrypt(&nonce, a, &mut buf)
-                    .to_vec()
+                AsconAead128::new(key.r()).encrypt(&nonce, a, buf).to_vec()
             }
             _ => return PcStatus::Unsupported,
         };
         debug_assert_eq!(tag.len(), tag_size);
         buf.extend_from_slice(&tag);
-        unsafe { out_write(&buf, ct_and_tag, ct_and_tag_len) }
+        unsafe { out_write(buf, ct_and_tag, ct_and_tag_len) }
     })
 }
 

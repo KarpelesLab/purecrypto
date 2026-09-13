@@ -40,12 +40,35 @@ export class PcError extends Error {
   }
 }
 
+// wasm32 pointers arrive as i32, so anything at or above 2 GiB comes back
+// negative. Normalize to an unsigned offset before it is ever used to index
+// or slice linear memory.
+const addr = (ptr) => ptr >>> 0;
+
 function malloc(size) {
   const p = wasm.pc_malloc(size || 1);
   if (!p) throw new Error('purecrypto: out of memory');
-  return p;
+  return addr(p);
 }
 const free = (ptr, size) => wasm.pc_free(ptr, size || 1);
+
+// Zero `len` bytes of linear memory at `ptr`. Every buffer holding key
+// material, a plaintext, a shared secret, or a private-key PEM goes through
+// this before pc_free: the allocator reuses the chunk, and anything left in
+// it stays readable to later code (and to a heap snapshot) for the lifetime
+// of the page. Best-effort by nature — wasm linear memory cannot be locked
+// or protected — but it closes the window that costs nothing to close.
+function wipe(ptr, len) {
+  if (!len) return;
+  const p = addr(ptr);
+  u8().fill(0, p, p + len);
+}
+
+// wipe + free, for any allocation that held a secret.
+function freeSecret(ptr, len) {
+  wipe(ptr, len);
+  free(ptr, len);
+}
 
 // Copy `bytes` into a fresh linear-memory allocation; returns [ptr, len].
 function put(bytes) {
@@ -58,7 +81,13 @@ function put(bytes) {
 // Call an out-buffer entry point following the capacity-in / length-out
 // convention. `call(outPtr, lenPtr)` returns a PcStatus; on BufferTooSmall we
 // grow to the required size and retry once. Returns a copy of the output.
-function withOutput(cap, call) {
+//
+// Pass `secret = true` whenever the output is key material (a private-key
+// PEM, a recovered plaintext, a shared secret): the linear-memory buffer is
+// then zeroed before it goes back to the allocator, including on the
+// grow-and-retry path, where a too-small buffer may already hold a partial
+// copy of the secret.
+function withOutput(cap, call, secret = false) {
   let capacity = cap;
   for (;;) {
     const outPtr = malloc(capacity);
@@ -66,20 +95,22 @@ function withOutput(cap, call) {
     dv().setUint32(lenPtr, capacity, true);
     const status = call(outPtr, lenPtr);
     const need = dv().getUint32(lenPtr, true);
-    if (status === BUFFER_TOO_SMALL) {
+    const release = () => {
+      if (secret) wipe(outPtr, capacity);
       free(outPtr, capacity);
       free(lenPtr, 4);
+    };
+    if (status === BUFFER_TOO_SMALL) {
+      release();
       capacity = need;
       continue;
     }
     if (status !== OK) {
-      free(outPtr, capacity);
-      free(lenPtr, 4);
+      release();
       throw new PcError(status);
     }
-    const out = u8().slice(outPtr, outPtr + need);
-    free(outPtr, capacity);
-    free(lenPtr, 4);
+    const out = u8().slice(addr(outPtr), addr(outPtr) + need);
+    release();
     return out;
   }
 }
@@ -176,17 +207,21 @@ export function aeadEncrypt(alg, key, nonce, aad, pt) {
     return withOutput(pl + 16, (o, l) =>
       wasm.pc_aead_encrypt(alg, kp, kl, np, nl, ap, al, pp, pl, o, l));
   } finally {
-    free(kp, kl); free(np, nl); free(ap, al); free(pp, pl);
+    // The AEAD key and the plaintext are the secrets here; the nonce and AAD
+    // are public, and the output is ciphertext.
+    freeSecret(kp, kl); free(np, nl); free(ap, al); freeSecret(pp, pl);
   }
 }
 
 export function aeadDecrypt(alg, key, nonce, aad, ctAndTag) {
   const [kp, kl] = put(key), [np, nl] = put(nonce), [ap, al] = put(aad), [cp, cl] = put(ctAndTag);
   try {
+    // The output is recovered plaintext: wipe the linear-memory copy once it
+    // has been handed back as a JS array.
     return withOutput(Math.max(cl - 16, 1), (o, l) =>
-      wasm.pc_aead_decrypt(alg, kp, kl, np, nl, ap, al, cp, cl, o, l));
+      wasm.pc_aead_decrypt(alg, kp, kl, np, nl, ap, al, cp, cl, o, l), true);
   } finally {
-    free(kp, kl); free(np, nl); free(ap, al); free(cp, cl);
+    freeSecret(kp, kl); free(np, nl); free(ap, al); free(cp, cl);
   }
 }
 
@@ -197,7 +232,8 @@ export function ed25519() {
   if (!h) throw new Error('purecrypto: Ed25519 keygen failed');
   return {
     publicPem: () => fromUtf8(withOutput(256, (o, l) => wasm.pc_ed25519_public_to_pem(h, o, l))),
-    privatePem: () => fromUtf8(withOutput(256, (o, l) => wasm.pc_ed25519_private_to_pem(h, o, l))),
+    privatePem: () =>
+      fromUtf8(withOutput(256, (o, l) => wasm.pc_ed25519_private_to_pem(h, o, l), true)),
     sign(msg) {
       const [mp, ml] = put(msg);
       try { return withOutput(64, (o, l) => wasm.pc_ed25519_sign(h, mp, ml, o, l)); }
@@ -232,7 +268,7 @@ export function mlkem(set) {
         const st = wasm.pc_mlkem_decaps(h, cp, cl, ssPtr);
         if (st !== OK) throw new PcError(st);
         return u8().slice(ssPtr, ssPtr + 32);
-      } finally { free(cp, cl); free(ssPtr, 32); }
+      } finally { free(cp, cl); freeSecret(ssPtr, 32); }
     },
     free: () => wasm.pc_mlkem_free(h),
   };
@@ -246,7 +282,7 @@ export function mlkemEncaps(set, ekDer) {
     const ct = withOutput(1600, (o, l) => wasm.pc_mlkem_encaps(set, ep, el, o, l, ssPtr));
     const ss = u8().slice(ssPtr, ssPtr + 32);
     return { ct, ss };
-  } finally { free(ep, el); free(ssPtr, 32); }
+  } finally { free(ep, el); freeSecret(ssPtr, 32); }
 }
 
 // ---- ML-DSA (post-quantum signature) -------------------------------------
@@ -353,7 +389,9 @@ export function generateKey(kind, param = 0) {
     kind,
     csrType: impl.csr,
     handle: h,
-    privatePem: () => fromUtf8(withOutput(6144, (o, l) => impl.pr(h, o, l))),
+    // The private-key PEM is the one output that must not be left lying in
+    // linear memory after it has been handed to JS.
+    privatePem: () => fromUtf8(withOutput(6144, (o, l) => impl.pr(h, o, l), true)),
     publicPem: () => fromUtf8(withOutput(6144, (o, l) => impl.pu(h, o, l))),
     free: () => impl.fr(h),
   };
@@ -377,7 +415,8 @@ export function loadPrivatePem(csrType, pem) {
     if (!h) throw new Error(`could not parse a ${csrType} private key from that PEM`);
     return { handle: h, free: () => FREE_BY[csrType](h) };
   } finally {
-    free(p, l);
+    // `p` holds a private-key PEM: zero it before the allocator reuses it.
+    freeSecret(p, l);
   }
 }
 

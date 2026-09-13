@@ -3069,6 +3069,85 @@ fn kdf_hex_out_file_is_private() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `enc` takes the nonce from the user, so nothing can stop them reusing
+/// one — and for the counter-mode AEADs a repeat is a total break, not a
+/// degradation. Encryption must say so on stderr (without changing what it
+/// does), and must stay quiet for the misuse-resistant SIV modes and on the
+/// decrypt path, where a repeated nonce is expected.
+#[test]
+fn enc_warns_about_nonce_reuse_for_counter_mode_aeads() {
+    let dir = std::env::temp_dir().join(format!("pc_enc_noncewarn_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+    std::fs::write(dir.join("pt.bin"), b"hello purecrypto").unwrap();
+
+    let key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    let nonce = "010203040506070809101112";
+    let enc = |alg: &str, out: &str| {
+        run_capture(
+            &[
+                "enc",
+                "-alg",
+                alg,
+                "-key",
+                key,
+                "-nonce",
+                nonce,
+                "-in",
+                &p("pt.bin"),
+                "-out",
+                &p(out),
+            ],
+            b"",
+        )
+    };
+
+    for alg in ["AES-256-GCM", "CHACHA20-POLY1305"] {
+        let (_o, err, ok) = enc(alg, "ct.bin");
+        assert!(ok, "{alg}: {err}");
+        assert!(
+            err.contains("NEVER reused"),
+            "{alg}: expected a nonce-reuse warning, got: {err}"
+        );
+        std::fs::remove_file(dir.join("ct.bin")).ok();
+    }
+
+    // AES-GCM-SIV is nonce-misuse resistant: no warning.
+    let (_o, err, ok) = enc("AES-256-GCM-SIV", "siv.bin");
+    assert!(ok, "{err}");
+    assert!(!err.contains("NEVER reused"), "{err}");
+
+    // Decrypting with the same nonce is expected, not a warning.
+    let (_o, _err, ok) = enc("AES-256-GCM", "ct.bin");
+    assert!(ok);
+    let (_o, err, ok) = run_capture(
+        &[
+            "enc",
+            "-d",
+            "-alg",
+            "AES-256-GCM",
+            "-key",
+            key,
+            "-nonce",
+            nonce,
+            "-in",
+            &p("ct.bin"),
+            "-out",
+            &p("rt.bin"),
+        ],
+        b"",
+    );
+    assert!(ok, "{err}");
+    assert!(!err.contains("NEVER reused"), "{err}");
+    assert_eq!(
+        std::fs::read(dir.join("rt.bin")).unwrap(),
+        b"hello purecrypto"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn enc_aes_gcm_roundtrip() {
     let dir = std::env::temp_dir().join(format!("pc_enc_gcm_{}", std::process::id()));

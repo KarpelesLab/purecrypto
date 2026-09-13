@@ -4,8 +4,69 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::common::PcStatus;
-use super::{ec, hash, kdf, lms, mldsa, mlkem, quic, rsa, tls, x509, x25519, xmss};
+use super::{cipher, ec, hash, kdf, lms, mldsa, mlkem, quic, rsa, tls, x509, x25519, xmss};
 use crate::der::pem_decode;
+
+/// A nonce of the wrong length must be rejected *before* `pc_aead_encrypt`
+/// copies the caller's plaintext into its working buffer: the per-algorithm
+/// length checks used to sit after that copy, so a rejected call returned
+/// `PC_UNSUPPORTED` with a full unwiped plaintext copy handed back to the
+/// allocator. A rejected call must also write nothing to the output buffer.
+#[test]
+fn aead_encrypt_rejects_bad_nonce_lengths() {
+    use cipher::{aead_id, pc_aead_encrypt};
+
+    let key = [0x42u8; 32]; // every algorithm below takes a 32-byte key
+    let pt = b"top secret plaintext";
+    // (algorithm, an accepted nonce length, rejected nonce lengths)
+    let cases: &[(i32, usize, &[usize])] = &[
+        (aead_id::AES256_GCM, 12, &[0]),
+        (aead_id::CHACHA20_POLY1305, 12, &[0, 11, 13, 24]),
+        (aead_id::XCHACHA20_POLY1305, 24, &[0, 12, 23, 25]),
+        (aead_id::AES256_CCM, 12, &[0, 6, 14]),
+        (aead_id::AES256_CCM8, 7, &[6, 14]),
+        (aead_id::AES256_GCM_SIV, 12, &[0, 11, 13]),
+        (aead_id::AEGIS256, 32, &[0, 16, 31]),
+    ];
+    let call = |alg: i32, n: &[u8], out: &mut [u8]| -> PcStatus {
+        let mut out_len = out.len();
+        unsafe {
+            pc_aead_encrypt(
+                alg,
+                key.as_ptr(),
+                key.len(),
+                n.as_ptr(),
+                n.len(),
+                core::ptr::null(),
+                0,
+                pt.as_ptr(),
+                pt.len(),
+                out.as_mut_ptr(),
+                &mut out_len,
+            )
+        }
+    };
+    for &(alg, good, bads) in cases {
+        let mut out = vec![0u8; pt.len() + 16];
+        assert_eq!(
+            call(alg, &vec![0u8; good], &mut out),
+            PcStatus::Ok,
+            "algorithm {alg} rejected a {good}-byte nonce it should accept"
+        );
+        for &bad in bads {
+            let mut out = vec![0u8; pt.len() + 16];
+            assert_eq!(
+                call(alg, &vec![0u8; bad], &mut out),
+                PcStatus::Unsupported,
+                "algorithm {alg} accepted a {bad}-byte nonce"
+            );
+            assert!(
+                out.iter().all(|b| *b == 0),
+                "algorithm {alg} wrote output for a rejected {bad}-byte nonce"
+            );
+        }
+    }
+}
 
 /// Sets a single ALPN protocol ("test") on a QUIC config. ALPN is
 /// mandatory for QUIC (RFC 9001 §8.1) — `pc_quic_new` rejects a config

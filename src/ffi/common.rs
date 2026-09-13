@@ -67,6 +67,16 @@ pub(super) fn guard_i32(sentinel: i32, f: impl FnOnce() -> i32) -> i32 {
 /// Borrows `len` bytes at `ptr` as a slice. A zero length yields an empty slice
 /// (even if `ptr` is NULL); a NULL pointer with non-zero length yields `None`.
 ///
+/// Two further lengths are refused rather than turned into a slice, because
+/// `core::slice::from_raw_parts` declares both of them undefined behaviour and
+/// a C caller can reach them by accident (a negative `ssize_t` widened to
+/// `size_t`, or a length computed past the end of a buffer):
+///
+///   * `len > isize::MAX`, which no single Rust allocation may span; and
+///   * `ptr + len` wrapping past the end of the address space.
+///
+/// Returning `None` turns both into the caller's `PC_NULL_POINTER` status.
+///
 /// # Safety
 /// `ptr` must point to `len` valid, initialized bytes that outlive the call.
 pub(super) unsafe fn slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
@@ -76,6 +86,13 @@ pub(super) unsafe fn slice<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     if ptr.is_null() {
         return None;
     }
+    if len > isize::MAX as usize {
+        return None;
+    }
+    // `ptr + len` must not wrap: the object would not be contiguous, and
+    // `from_raw_parts`'s safety contract requires the whole range to lie in
+    // one allocation.
+    (ptr as usize).checked_add(len)?;
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
@@ -158,5 +175,26 @@ mod tests {
     fn guard_i32_passes_value_through() {
         let v = super::guard_i32(-1, || 5);
         assert_eq!(v, 5);
+    }
+
+    /// `slice` must refuse the two lengths `from_raw_parts` calls UB, both of
+    /// which a C caller reaches by accident (a negative `ssize_t` widened to
+    /// `size_t`, a length computed past the end of a buffer).
+    #[test]
+    fn slice_rejects_oversized_and_wrapping_lengths() {
+        let buf = [1u8, 2, 3];
+        // Sane cases still work.
+        assert_eq!(unsafe { super::slice(buf.as_ptr(), 3) }, Some(&buf[..]));
+        assert_eq!(unsafe { super::slice(core::ptr::null(), 0) }, Some(&[][..]));
+        assert_eq!(unsafe { super::slice(core::ptr::null(), 1) }, None);
+        // A negative ssize_t widened to size_t: > isize::MAX.
+        assert_eq!(unsafe { super::slice(buf.as_ptr(), usize::MAX) }, None);
+        assert_eq!(
+            unsafe { super::slice(buf.as_ptr(), isize::MAX as usize + 1) },
+            None
+        );
+        // ptr + len wraps the address space.
+        let high = usize::MAX - 8;
+        assert_eq!(unsafe { super::slice(high as *const u8, 64) }, None);
     }
 }
