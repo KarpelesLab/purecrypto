@@ -1547,10 +1547,7 @@ BBBB
                 c.client_auth_required = true;
                 assert_eq!(c.validate(), PcStatus::Unsupported);
             }
-            assert_eq!(
-                unsafe { pc_tls_cfg_validate(cfg) },
-                PcStatus::Unsupported
-            );
+            assert_eq!(unsafe { pc_tls_cfg_validate(cfg) }, PcStatus::Unsupported);
             assert!(unsafe { pc_tls_new(cfg) }.is_null());
             unsafe { pc_tls_cfg_free(cfg) };
         }

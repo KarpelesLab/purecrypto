@@ -1803,9 +1803,9 @@ mod tests {
     use super::super::config::EntropySource;
     use super::*;
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
-    use crate::tls::{AlertDescription, RootCertStore};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+    use crate::tls::{AlertDescription, RootCertStore};
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
 
     /// Build a minimal DTLS server [`Config`] (P-256 ECDSA leaf, self-signed)
