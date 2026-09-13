@@ -1295,8 +1295,7 @@ impl<R: RngCore> ServerConnection<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
-        tls_exporter(suite.hash, ems, label, context, out);
-        Ok(())
+        tls_exporter(suite.hash, ems, label, context, out)
     }
 
     /// Sends application data (only valid once the handshake completes).

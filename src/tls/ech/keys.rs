@@ -13,7 +13,10 @@ use alloc::vec::Vec;
 
 /// One server-side HPKE recipient key paired with the `ECHConfig`
 /// the matching client will use.
-#[derive(Clone, Debug)]
+///
+/// The `Debug` output redacts the private key, and the key bytes are
+/// wiped when the pair is dropped.
+#[derive(Clone)]
 pub struct EchKeyPair {
     /// HPKE KEM choice for this key.
     pub(crate) kem: HpkeKem,
@@ -23,6 +26,28 @@ pub struct EchKeyPair {
     /// `public_key`, `kem_id`, and the announced symmetric cipher
     /// suites all come from this struct.
     pub(crate) config: EchConfig,
+}
+
+impl core::fmt::Debug for EchKeyPair {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EchKeyPair")
+            .field("kem", &self.kem)
+            .field(
+                "private_key",
+                &format_args!("<{} bytes, redacted>", self.private_key.len()),
+            )
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+// The HPKE recipient key is the secret that decrypts every inner
+// ClientHello sealed to this config: scrub it when the pair (or the ring
+// holding it) goes away.
+impl Drop for EchKeyPair {
+    fn drop(&mut self) {
+        crate::zeroize::Zeroize::zeroize(&mut self.private_key);
+    }
 }
 
 impl EchKeyPair {

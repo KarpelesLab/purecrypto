@@ -26,6 +26,7 @@
 
 use crate::hash::{Digest, Hmac, Sha256, Sha384};
 use crate::kdf::{hkdf_expand, hkdf_extract};
+use crate::tls::Error;
 use alloc::vec::Vec;
 
 /// The largest secret the schedule holds: the 64-byte concatenated shared
@@ -332,13 +333,35 @@ pub(crate) fn binder_finished_key(alg: HashAlg, binder_key: &Secret) -> Secret {
 /// RFC 8446 §7.5 TLS-Exporter: derives application-layer keying material
 /// from `exporter_master_secret`. Two-step HKDF: first an intermediate
 /// `Secret_export`, then the caller-controlled output.
+///
+/// `out` and `label` are caller-supplied, so both bounds the wire format
+/// imposes are checked here rather than left to the encoder:
+///
+/// * `out.len()` must fit HKDF-Expand's `255 * HashLen` ceiling and
+///   `HkdfLabel.length`'s `u16` (the underlying `hkdf_expand` panics past
+///   the first; `expand_label` past the second);
+/// * `label.len()` must leave room for the `"tls13 "` prefix inside
+///   `HkdfLabel.label`'s `u8` length — a longer label used to be truncated
+///   silently by an `as u8` cast, producing a keystream that disagrees with
+///   the peer's for no visible reason.
+///
+/// Either violation returns [`Error::IllegalParameter`] with nothing
+/// written.
 pub(crate) fn tls_exporter(
     alg: HashAlg,
     exporter_master_secret: &Secret,
     label: &[u8],
     context: &[u8],
     out: &mut [u8],
-) {
+) -> Result<(), Error> {
+    if out.len() > 255 * alg.output_len() || out.len() > u16::MAX as usize {
+        return Err(Error::IllegalParameter);
+    }
+    // `HkdfLabel.label` is `opaque label<7..255>` and always carries the
+    // 6-byte "tls13 " prefix.
+    if label.len() > 255 - 6 {
+        return Err(Error::IllegalParameter);
+    }
     let empty_hash = alg.hash(&[]);
     // Secret_export = HKDF-Expand-Label(EMS, label, Hash(""), Hash.length)
     let mut export = [0u8; MAX_SECRET];
@@ -353,6 +376,7 @@ pub(crate) fn tls_exporter(
     // Output = HKDF-Expand-Label(Secret_export, "exporter", Hash(context), L)
     let ctx_hash = alg.hash(context);
     expand_label_dyn(alg, &export[..n], b"exporter", ctx_hash.as_slice(), out);
+    Ok(())
 }
 
 /// Derives `application_traffic_secret_{N+1}` from the previous-generation
@@ -510,5 +534,39 @@ mod tests {
         let mut psk_other = [0u8; 32];
         psk_from_resumption(alg, &rms, &[1, 2, 3, 5], &mut psk_other);
         assert_ne!(psk_out, psk_other);
+    }
+
+    /// RFC 8446 §7.5: the exporter's `out` and `label` are caller-supplied.
+    /// An output past HKDF's `255 * HashLen` ceiling used to panic inside
+    /// `hkdf_expand`, and a label longer than 249 bytes was silently
+    /// truncated by an `as u8` cast (producing a keystream no peer could
+    /// reproduce). Both must be refused instead.
+    #[test]
+    fn tls_exporter_rejects_out_of_range_output_and_label() {
+        let alg = HashAlg::Sha256;
+        let ems = Secret::new(&[0x42u8; 32]);
+        let hash_len = alg.output_len();
+
+        // Largest legal output still works.
+        let mut ok = alloc::vec![0u8; 255 * hash_len];
+        assert!(tls_exporter(alg, &ems, b"EXPORTER-test", b"ctx", &mut ok).is_ok());
+        assert!(ok.iter().any(|b| *b != 0));
+
+        // One byte past the HKDF ceiling.
+        let mut too_long = alloc::vec![0u8; 255 * hash_len + 1];
+        assert!(matches!(
+            tls_exporter(alg, &ems, b"EXPORTER-test", b"ctx", &mut too_long),
+            Err(Error::IllegalParameter)
+        ));
+        assert!(too_long.iter().all(|b| *b == 0), "nothing may be written");
+
+        // Longest legal label (249 = 255 - len("tls13 ")) still works; one
+        // byte more is refused rather than truncated.
+        let mut out = [0u8; 32];
+        assert!(tls_exporter(alg, &ems, &alloc::vec![b'x'; 249], b"", &mut out).is_ok());
+        assert!(matches!(
+            tls_exporter(alg, &ems, &alloc::vec![b'x'; 250], b"", &mut out),
+            Err(Error::IllegalParameter)
+        ));
     }
 }

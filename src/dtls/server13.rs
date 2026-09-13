@@ -473,8 +473,7 @@ impl<R: RngCore> DtlsServerConnection13<R> {
             .as_ref()
             .ok_or(Error::InappropriateState)?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
-        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out);
-        Ok(())
+        crate::tls::crypto::tls_exporter(suite.hash, ems, label, context, out)
     }
 
     /// Drains pending UDP datagrams. Also drains any pending ACKs.
