@@ -97,13 +97,13 @@ impl core::fmt::Debug for RistrettoPoint {
     }
 }
 
-/// Best-effort wipe of a scalar's plaintext byte copy, with an optimisation
-/// barrier so the stores are not elided. The scalar fed to `mul`/`mul_base`
-/// is usually a private key or nonce.
+/// Best-effort wipe of a scalar's plaintext byte copy through
+/// [`crate::zeroize::Zeroize`]: volatile stores plus a compiler fence, so the
+/// stores are not elided. The scalar fed to `mul`/`mul_base` is usually a
+/// private key or nonce.
 #[inline]
 fn wipe_scalar_bytes(b: &mut [u8; 32]) {
-    b.fill(0);
-    let _ = core::hint::black_box(&b);
+    crate::zeroize::Zeroize::zeroize(b);
 }
 
 /// The canonical 32-byte encoding of a [`RistrettoPoint`] (RFC 9496 §4.3.1).

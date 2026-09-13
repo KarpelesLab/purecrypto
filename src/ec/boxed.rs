@@ -17,6 +17,7 @@ use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -117,8 +118,7 @@ fn random_scalar<R: RngCore>(curve: CurveId, n: &BoxedUint, rng: &mut R) -> Boxe
         buf[0] &= high_mask;
         let candidate = BoxedUint::from_be_bytes(&buf);
         // The raw bytes are the secret scalar; don't leave them on the heap.
-        buf.fill(0);
-        let _ = core::hint::black_box(buf.as_slice());
+        buf.zeroize();
         // Accept iff 1 ≤ candidate < n; non-short-circuiting `&` so the
         // candidate's low limbs don't shape the timing of a rejection.
         if bool::from(!candidate.ct_is_zero()) & candidate.lt(n) {
@@ -162,8 +162,7 @@ fn generate_k<D: Digest>(
             t.extend_from_slice(v.as_ref());
         }
         let candidate = bits2int(&t[..order_len], qlen);
-        t.fill(0);
-        let _ = core::hint::black_box(t.as_slice());
+        t.zeroize();
         if in_range(&candidate, n) {
             break candidate;
         }
@@ -177,15 +176,10 @@ fn generate_k<D: Digest>(
     // `d_oct` is a verbatim copy of the long-term private scalar, and the
     // HMAC-DRBG state (`k`, `v`) reproduces the nonce. Wipe all of it before
     // the buffers are returned to the allocator.
-    d_oct.fill(0);
-    h_oct.fill(0);
-    for b in k.as_mut() {
-        *b = 0;
-    }
-    for b in v.as_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((d_oct.as_slice(), h_oct.as_slice(), k.as_ref(), v.as_ref()));
+    d_oct.zeroize();
+    h_oct.zeroize();
+    k.as_mut().zeroize();
+    v.as_mut().zeroize();
     candidate
 }
 
@@ -416,8 +410,8 @@ impl BoxedEcdsaPrivateKey {
         let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
         let s = fq.mul_mod(&k_inv, &z_rd);
         // Wipe the per-signature secrets: `k` alone recovers the long-term
-        // key as `d = (s·k − z)·r⁻¹ mod n`. `BoxedUint::zeroize` carries its
-        // own `black_box` barrier.
+        // key as `d = (s·k − z)·r⁻¹ mod n`. `BoxedUint::zeroize` uses the
+        // crate's volatile stores.
         k.zeroize();
         k_inv.zeroize();
         z_rd.zeroize();

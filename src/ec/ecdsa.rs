@@ -6,6 +6,7 @@ use crate::bignum::MontModulus;
 use crate::ct::{ConstantTimeEq, ConstantTimeLess};
 use crate::hash::{Digest, Hmac};
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A P-256 ECDSA private key (a scalar in `[1, n-1]`).
 #[derive(Clone)]
@@ -15,13 +16,13 @@ pub struct EcdsaPrivateKey {
 
 impl Drop for EcdsaPrivateKey {
     fn drop(&mut self) {
-        // Best-effort wipe of the secret scalar with a `black_box` barrier so
-        // the store is not elided (mirrors `secp256k1::Scalar` and the boxed
-        // EC key types).
-        self.d = Fe::ZERO;
-        let _ = core::hint::black_box(&self.d);
+        // Best-effort wipe of the secret scalar through `Zeroize` (a
+        // volatile store plus a compiler fence, so it is not elided).
+        self.d.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for EcdsaPrivateKey {}
 
 /// A P-256 ECDSA public key (an affine curve point).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,9 +142,8 @@ impl EcdsaPrivateKey {
                     let mut k_inv = fq.inv_prime(&k);
                     let mut z_rd = fq.add_mod(&z, &fq.mul_mod(&r, &self.d));
                     let s = fq.mul_mod(&k_inv, &z_rd);
-                    k_inv = Fe::ZERO;
-                    z_rd = Fe::ZERO;
-                    let _ = core::hint::black_box((&k_inv, &z_rd));
+                    k_inv.zeroize();
+                    z_rd.zeroize();
                     if bool::from(s.is_zero()) {
                         Err(Error::InvalidInput)
                     } else {
@@ -155,10 +155,9 @@ impl EcdsaPrivateKey {
 
         // Wipe the nonce. `k` alone yields the long-term key
         // (`d = (s·k − z)·r⁻¹ mod n`); `k_inv` and `z_rd` are wiped above,
-        // where they go out of scope. The `black_box` barrier stops LLVM
-        // eliding the stores, matching this module's `Drop` impls.
-        k = Fe::ZERO;
-        let _ = core::hint::black_box(&k);
+        // where they go out of scope. `Zeroize` issues a volatile store, so
+        // LLVM cannot elide it, matching this module's `Drop` impls.
+        k.zeroize();
         out
     }
 }
@@ -415,8 +414,7 @@ pub(super) fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
             filled += take;
         }
         let candidate = bits2int(&t);
-        t.fill(0);
-        let _ = core::hint::black_box(&t);
+        t.zeroize();
         if in_range(&candidate, n) {
             break candidate;
         }
@@ -430,15 +428,10 @@ pub(super) fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
     // `d_oct` is a verbatim copy of the long-term private scalar and the
     // HMAC-DRBG state (`k`, `v`) reproduces the nonce; wipe all of it before
     // the frame is released.
-    d_oct.fill(0);
-    h_oct.fill(0);
-    for b in k.as_mut() {
-        *b = 0;
-    }
-    for b in v.as_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&d_oct, &h_oct, k.as_ref(), v.as_ref()));
+    d_oct.zeroize();
+    h_oct.zeroize();
+    k.as_mut().zeroize();
+    v.as_mut().zeroize();
     candidate
 }
 

@@ -8,6 +8,7 @@
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::ec::curve25519::field::Fe;
 use crate::rng::RngCore;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// An X25519 Diffie-Hellman failure mode. Currently only one: the peer
 /// supplied a low-order public key whose product with our scalar is the
@@ -107,14 +108,12 @@ pub fn x25519(scalar: &[u8; 32], point: &[u8; 32]) -> [u8; 32] {
 
     // Wipe the clamped scalar copy and the ladder state: the projective
     // coordinates are a function of the secret scalar, and (x2, z2, x3, z3)
-    // at the end of the ladder disclose it directly. The `black_box`
-    // barrier keeps LLVM from eliding the stores as dead.
-    k.fill(0);
-    x2 = Fe::ZERO;
-    z2 = Fe::ZERO;
-    x3 = Fe::ZERO;
-    z3 = Fe::ZERO;
-    let _ = core::hint::black_box((&k, &x2, &z2, &x3, &z3));
+    // at the end of the ladder disclose it directly. `Zeroize` issues
+    // volatile stores, so LLVM cannot elide them as dead.
+    k.zeroize();
+    for v in [&mut x2, &mut z2, &mut x3, &mut z3] {
+        v.zeroize();
+    }
     out
 }
 
@@ -133,17 +132,15 @@ pub struct X25519PrivateKey {
 
 // Best-effort zeroize on drop: the 32-byte scalar is full secret material
 // and would otherwise be returned to the allocator/stack frame intact.
-// Overwrite the bytes and route the read through `core::hint::black_box`
-// so LLVM cannot eliminate the writes as dead stores (same pattern as
-// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+// `Zeroize` overwrites it with volatile stores plus a compiler fence, so LLVM
+// cannot eliminate the writes as dead stores.
 impl Drop for X25519PrivateKey {
     fn drop(&mut self) {
-        for b in self.scalar.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.scalar);
+        self.scalar.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for X25519PrivateKey {}
 
 impl X25519PrivateKey {
     /// Generates a new private key from `rng`.

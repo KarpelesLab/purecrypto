@@ -37,18 +37,27 @@ use crate::ec::curve25519::scalar::{
 ///
 /// Stored as a canonical residue in `[0, L)`. This is the shared scalar field
 /// for both edwards25519 and [`crate::ec::ristretto255`]. The value is wiped on
-/// drop with the crate's `black_box`-guarded best-effort pattern.
+/// drop with the crate's volatile [`zeroize`](crate::zeroize) stores.
 ///
 /// Because the value is zeroized on drop, `Scalar` is [`Clone`] but not
 /// `Copy`; pass it by reference or clone it explicitly.
 #[derive(Clone)]
 pub struct Scalar(pub(crate) ScalarInt);
 
+impl crate::zeroize::Zeroize for Scalar {
+    /// Wipes the secret limbs with volatile stores the optimizer may not
+    /// elide (a plain assignment plus a `black_box` read is only a hint).
+    #[inline]
+    fn zeroize(&mut self) {
+        crate::zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
+
+impl crate::zeroize::ZeroizeOnDrop for Scalar {}
+
 impl Drop for Scalar {
     fn drop(&mut self) {
-        // Best-effort wipe; the black_box barrier keeps LLVM from eliding it.
-        self.0 = ScalarInt::ZERO;
-        let _ = core::hint::black_box(&self.0);
+        crate::zeroize::Zeroize::zeroize(self);
     }
 }
 
@@ -288,13 +297,12 @@ fn scalar_bytes(v: &ScalarInt) -> [u8; 32] {
     b
 }
 
-/// Best-effort wipe of a scalar's plaintext byte copy, with an optimisation
-/// barrier so the stores are not elided (the idiom `Scalar::drop` uses). The
+/// Best-effort wipe of a scalar's plaintext byte copy through
+/// [`crate::zeroize::Zeroize`] (the volatile stores `Scalar::drop` uses). The
 /// scalar fed to `mul`/`mul_base` is usually a private key or nonce.
 #[inline]
 fn wipe_scalar_bytes(b: &mut [u8; 32]) {
-    b.fill(0);
-    let _ = core::hint::black_box(&b);
+    crate::zeroize::Zeroize::zeroize(b);
 }
 
 #[cfg(test)]

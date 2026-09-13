@@ -371,6 +371,15 @@ impl ConstantTimeEq for Fe {
     }
 }
 
+impl crate::zeroize::Zeroize for Fe {
+    /// Wipes the limbs: ladder and point intermediates are as secret as the
+    /// scalar that produced them.
+    #[inline]
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
 /// The edwards25519 field context: curve constants (compile-time literals,
 /// verified by an always-on test) plus the order-`L` integers for the scalar
 /// side. Constructing it is trivial — no field ops are performed.

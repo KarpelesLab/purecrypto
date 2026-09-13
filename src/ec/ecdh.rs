@@ -18,13 +18,13 @@ pub struct EcdhPrivateKey {
 
 impl Drop for EcdhPrivateKey {
     fn drop(&mut self) {
-        // Best-effort wipe of the secret scalar with a `black_box` barrier so
-        // the store is not elided (mirrors `secp256k1::Scalar` and the boxed
-        // EC key types).
-        self.d = Fe::ZERO;
-        let _ = core::hint::black_box(&self.d);
+        // Best-effort wipe of the secret scalar through `Zeroize` (a
+        // volatile store plus a compiler fence, so it is not elided).
+        crate::zeroize::Zeroize::zeroize(&mut self.d);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for EcdhPrivateKey {}
 
 impl EcdhPrivateKey {
     /// Generates a fresh ephemeral key from `rng`. The RNG must be a

@@ -65,15 +65,14 @@ pub struct Ed448PrivateKey {
 
 impl Drop for Ed448PrivateKey {
     fn drop(&mut self) {
-        // Best-effort wipe of the seed before it leaves the stack; the
-        // `black_box` barrier prevents LLVM from eliding the writes as a dead
-        // store (mirrors the Ed25519 convention).
-        for b in self.seed.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.seed);
+        // Best-effort wipe of the seed before it leaves the stack, through
+        // `Zeroize` (volatile stores plus a compiler fence, so LLVM cannot
+        // elide the writes as a dead store).
+        wipe(&mut self.seed);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for Ed448PrivateKey {}
 
 /// An Ed448 public key — a 57-byte compressed point.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -191,9 +190,8 @@ impl Ed448PrivateKey {
         wipe(&mut prefix);
         wipe(&mut r_hash);
         wipe(&mut r_scalar);
-        r = Fe::ZERO;
-        s_scalar = Fe::ZERO;
-        let _ = core::hint::black_box((&r, &s_scalar));
+        crate::zeroize::Zeroize::zeroize(&mut r);
+        crate::zeroize::Zeroize::zeroize(&mut s_scalar);
         Ok(Ed448Signature(sig))
     }
 }

@@ -69,8 +69,8 @@ use crate::zeroize::Zeroize;
 
 /// A secp256k1 ECDSA private key (a scalar in `[1, n-1]`).
 ///
-/// Wiped on drop (the inner `Scalar` zeroises its limbs behind a `black_box`
-/// barrier).
+/// Wiped on drop (the inner `Scalar` zeroises its limbs with the crate's
+/// volatile [`zeroize`](crate::zeroize) stores).
 #[derive(Clone)]
 pub struct Secp256k1EcdsaPrivateKey {
     d: Scalar,
@@ -182,7 +182,7 @@ impl Secp256k1EcdsaPrivateKey {
         let z = Scalar(bits2int(prehash).reduce(&n));
 
         // The nonce and every value derived from it are held in `Scalar`s,
-        // whose `Drop` wipes the limbs behind a `black_box` barrier — so they
+        // whose `Drop` wipes the limbs with volatile stores — so they
         // are zeroised on every exit path, including the `r == 0` / `s == 0`
         // rejections. `generate_k` wipes its own HMAC-DRBG state and the
         // octet copy of `d` before returning.

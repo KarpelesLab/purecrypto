@@ -46,7 +46,8 @@
 //! odd `Y`, `k = n − k'` when `R` has odd `Y`) are done with a constant-time
 //! byte select, and all point/scalar arithmetic uses the constant-time
 //! [`Scalar`] / [`ProjectivePoint`] operations. Every secret intermediate is
-//! wiped with a [`core::hint::black_box`] barrier before the frame is released.
+//! wiped with the crate's volatile [`zeroize`](crate::zeroize) stores before
+//! the frame is released.
 //!
 //! [`verify`] operates purely on public data, so it takes no such precautions.
 

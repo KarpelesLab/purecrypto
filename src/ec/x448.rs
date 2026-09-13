@@ -17,6 +17,7 @@
 use crate::bignum::{MontModulus, Uint};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
 use crate::rng::RngCore;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// An X448 Diffie-Hellman failure mode: the shared secret is the canonical
 /// all-zero u-coordinate (the peer supplied a small-order / degenerate public
@@ -135,17 +136,20 @@ pub fn x448(scalar: &[u8; 56], point: &[u8; 56]) -> [u8; 56] {
 
     // Wipe the clamped scalar (bytes and limbs) and the ladder state: the
     // projective coordinates (x2, z2, x3, z3) and the inversion operands are
-    // a function of the secret scalar. The `black_box` barrier keeps LLVM
-    // from eliding the stores as dead.
-    k_bytes.fill(0);
-    k = Fe::ZERO;
-    x2 = Fe::ZERO;
-    z2 = Fe::ZERO;
-    x3 = Fe::ZERO;
-    z3 = Fe::ZERO;
-    z2_plain = Fe::ZERO;
-    z_inv = Fe::ZERO;
-    let _ = core::hint::black_box((&k_bytes, &k, &x2, &z2, &x3, &z3, &z2_plain, &z_inv));
+    // a function of the secret scalar. `Zeroize` issues volatile stores, so
+    // LLVM cannot elide them as dead.
+    k_bytes.zeroize();
+    for v in [
+        &mut k,
+        &mut x2,
+        &mut z2,
+        &mut x3,
+        &mut z3,
+        &mut z2_plain,
+        &mut z_inv,
+    ] {
+        v.zeroize();
+    }
     out
 }
 
@@ -162,17 +166,16 @@ pub struct X448PrivateKey {
     scalar: [u8; 56],
 }
 
-// Best-effort zeroize on drop: the scalar is full secret material. Overwrite
-// the bytes and route the read through `core::hint::black_box` so LLVM cannot
-// eliminate the writes as dead stores (same pattern as X25519).
+// Best-effort zeroize on drop: the scalar is full secret material.
+// `Zeroize` overwrites it with volatile stores plus a compiler fence, so LLVM
+// cannot eliminate the writes as dead stores (same pattern as X25519).
 impl Drop for X448PrivateKey {
     fn drop(&mut self) {
-        for b in self.scalar.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.scalar);
+        self.scalar.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for X448PrivateKey {}
 
 impl X448PrivateKey {
     /// Generates a new private key from `rng`.
