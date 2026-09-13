@@ -951,6 +951,11 @@ pub struct ServerConnection<R: RngCore> {
 /// patch the accept signal into `random[24..32]`) and
 /// `EncryptedExtensions` (to ship `retry_configs` on rejection).
 #[cfg(feature = "ech")]
+// `Accepted` is large because the retained `ReceiverContext` keeps the HPKE
+// key schedule in fixed-size stack arrays (so `hpke` builds without `alloc`).
+// Boxing it would move per-handshake state to the heap for no benefit: exactly
+// one of these exists per connection, and it is replaced, not passed around.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum EchServerHandshakeState {
     /// The outer CH carried a syntactically valid `encrypted_client_hello`
     /// extension AND HPKE-decap succeeded AND the recovered plaintext

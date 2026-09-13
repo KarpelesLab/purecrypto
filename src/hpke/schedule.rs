@@ -9,9 +9,17 @@
 
 use super::Error;
 use super::aead::HpkeAead;
+use super::kdf::HpkeKdf;
 use super::labeled::{labeled_expand, labeled_extract};
 use super::suite::CipherSuite;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
+
+/// The largest `Nk` across the wired AEADs (AES-256-GCM / ChaCha20-Poly1305).
+pub(crate) const MAX_AEAD_KEY: usize = 32;
+
+/// The largest `Nn` across the wired AEADs (12 for all of them).
+pub(crate) const MAX_AEAD_NONCE: usize = 12;
 
 /// HPKE operation mode (RFC 9180 §5.1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -69,11 +77,51 @@ fn verify_psk_inputs(mode: Mode, psk: &[u8], psk_id: &[u8]) -> Result<(), Error>
     Ok(())
 }
 
-/// Outputs of [`key_schedule`]: `(key, base_nonce, exporter_secret)`.
-type KeyScheduleOutput = (Vec<u8>, Vec<u8>, Vec<u8>);
+/// The `KeySchedule` outputs, in fixed-capacity buffers sized by the widest
+/// wired AEAD and KDF. Only the leading `Nk` / `Nn` / `Nh` bytes of each are
+/// meaningful; the rest stay zero.
+///
+/// All three are secret, and this struct's `Drop` wipes them — which is what
+/// makes the contexts that embed it zeroize-on-drop.
+struct ScheduleKeys {
+    key: [u8; MAX_AEAD_KEY],
+    base_nonce: [u8; MAX_AEAD_NONCE],
+    exporter_secret: [u8; HpkeKdf::MAX_OUTPUT],
+}
+
+impl ScheduleKeys {
+    const fn zeroed() -> Self {
+        Self {
+            key: [0u8; MAX_AEAD_KEY],
+            base_nonce: [0u8; MAX_AEAD_NONCE],
+            exporter_secret: [0u8; HpkeKdf::MAX_OUTPUT],
+        }
+    }
+}
+
+impl Drop for ScheduleKeys {
+    fn drop(&mut self) {
+        // Best-effort wipe of the key-schedule secrets (the AEAD key, the base
+        // nonce, and the exporter secret), with the crate's volatile `zeroize`
+        // stores, which the optimizer may not elide.
+        super::wipe(&mut self.key);
+        super::wipe(&mut self.base_nonce);
+        super::wipe(&mut self.exporter_secret);
+    }
+}
+
+impl crate::zeroize::ZeroizeOnDrop for ScheduleKeys {}
 
 /// `KeySchedule(mode, shared_secret, info, psk, psk_id)` (RFC 9180
-/// §5.1): produces `(key, base_nonce, exporter_secret)`.
+/// §5.1): fills `out` in place.
+///
+/// The outputs are written through `&mut` rather than returned so the caller
+/// can build them directly inside the context that owns (and wipes) them —
+/// no intermediate copy of the key material.
+///
+/// Each `LabeledExpand` below targets a slice of exactly the suite's length,
+/// never the whole backing array: `L` is bound into the expander's input, so
+/// an over-long target would silently derive different keys.
 fn key_schedule(
     suite: CipherSuite,
     mode: Mode,
@@ -81,73 +129,71 @@ fn key_schedule(
     info: &[u8],
     psk: &[u8],
     psk_id: &[u8],
-) -> Result<KeyScheduleOutput, Error> {
+    out: &mut ScheduleKeys,
+) -> Result<(), Error> {
     verify_psk_inputs(mode, psk, psk_id)?;
 
     let suite_id = suite.suite_id();
     let kdf = suite.kdf;
 
-    let psk_id_hash = labeled_extract(kdf, b"", &suite_id, b"psk_id_hash", psk_id);
-    let info_hash = labeled_extract(kdf, b"", &suite_id, b"info_hash", info);
+    let psk_id_hash = labeled_extract(kdf, b"", &suite_id, b"psk_id_hash", &[psk_id]);
+    let info_hash = labeled_extract(kdf, b"", &suite_id, b"info_hash", &[info]);
 
-    let mut key_schedule_context = Vec::with_capacity(1 + psk_id_hash.len() + info_hash.len());
-    key_schedule_context.push(mode.tag());
-    key_schedule_context.extend_from_slice(&psk_id_hash);
-    key_schedule_context.extend_from_slice(&info_hash);
+    // `key_schedule_context = mode || psk_id_hash || info_hash`, fed to the
+    // expander as parts rather than concatenated into a buffer.
+    let mode_tag = [mode.tag()];
+    let ks_context: [&[u8]; 3] = [&mode_tag, psk_id_hash.as_slice(), info_hash.as_slice()];
 
-    let mut secret = labeled_extract(kdf, shared_secret, &suite_id, b"secret", psk);
+    // `secret` is the extract-stage PRK all three outputs are expanded from,
+    // so it is as sensitive as the key itself; its `Drop` wipes it with the
+    // crate's volatile `zeroize` stores, which the optimizer may not elide.
+    let secret = labeled_extract(kdf, shared_secret, &suite_id, b"secret", &[psk]);
 
-    let mut key = alloc::vec![0u8; suite.aead.key_len()];
-    if !key.is_empty() {
+    let nk = suite.aead.key_len();
+    if nk != 0 {
         labeled_expand(
             kdf,
-            &secret,
+            secret.as_slice(),
             &suite_id,
             b"key",
-            &key_schedule_context,
-            &mut key,
+            &ks_context,
+            &mut out.key[..nk],
         );
     }
-    let mut base_nonce = alloc::vec![0u8; suite.aead.nonce_len()];
-    if !base_nonce.is_empty() {
+    let nn = suite.aead.nonce_len();
+    if nn != 0 {
         labeled_expand(
             kdf,
-            &secret,
+            secret.as_slice(),
             &suite_id,
             b"base_nonce",
-            &key_schedule_context,
-            &mut base_nonce,
+            &ks_context,
+            &mut out.base_nonce[..nn],
         );
     }
-    let mut exporter_secret = alloc::vec![0u8; kdf.output_len()];
     labeled_expand(
         kdf,
-        &secret,
+        secret.as_slice(),
         &suite_id,
         b"exp",
-        &key_schedule_context,
-        &mut exporter_secret,
+        &ks_context,
+        &mut out.exporter_secret[..kdf.output_len()],
     );
 
-    // Wipe the `secret` PRK intermediate before it goes out of scope — it is
-    // the extract-stage secret all three outputs are expanded from, so it is
-    // as sensitive as the key itself. Uses the crate's volatile
-    // `zeroize` stores, which the optimizer may not elide.
-    super::wipe(&mut secret);
-
-    Ok((key, base_nonce, exporter_secret))
+    Ok(())
 }
 
 /// `ComputeNonce(seq)`: XOR of `base_nonce` and the `Nn`-byte big-endian
-/// encoding of `seq`.
-fn compute_nonce(base_nonce: &[u8], seq: u64) -> Vec<u8> {
+/// encoding of `seq`. Only `out[..nn]` is meaningful.
+fn compute_nonce(base_nonce: &[u8], seq: u64) -> [u8; MAX_AEAD_NONCE] {
     let nn = base_nonce.len();
-    let mut nonce = alloc::vec![0u8; nn];
+    debug_assert!(nn <= MAX_AEAD_NONCE);
+    let mut nonce = [0u8; MAX_AEAD_NONCE];
     // I2OSP(seq, Nn): big-endian, right-justified.
     let seq_be = seq.to_be_bytes();
     let copy = nn.min(seq_be.len());
-    nonce[nn - copy..].copy_from_slice(&seq_be[seq_be.len() - copy..]);
-    for (n, b) in nonce.iter_mut().zip(base_nonce.iter()) {
+    nonce[nn - copy..nn].copy_from_slice(&seq_be[seq_be.len() - copy..]);
+    for (n, b) in nonce[..nn].iter_mut().zip(base_nonce.iter()) {
         *n ^= *b;
     }
     nonce
@@ -158,15 +204,14 @@ fn compute_nonce(base_nonce: &[u8], seq: u64) -> Vec<u8> {
 /// `setup_sender_*` family in [`crate::hpke`].
 pub struct SenderContext {
     suite: CipherSuite,
-    key: Vec<u8>,
-    base_nonce: Vec<u8>,
+    /// The `(key, base_nonce, exporter_secret)` triple; wiped on drop.
+    keys: ScheduleKeys,
     seq: u64,
     /// Sticky poison flag: set once the per-suite message limit is reached.
     /// Once set, all further `seal` calls fail without recomputing or using
     /// a nonce, preventing catastrophic AEAD nonce reuse if a caller ignores
     /// the first [`Error::MessageLimitReached`].
     exhausted: bool,
-    exporter_secret: Vec<u8>,
 }
 
 /// HPKE receiver context: stateful open/export complement to
@@ -174,12 +219,11 @@ pub struct SenderContext {
 /// [`crate::hpke`].
 pub struct ReceiverContext {
     suite: CipherSuite,
-    key: Vec<u8>,
-    base_nonce: Vec<u8>,
+    /// The `(key, base_nonce, exporter_secret)` triple; wiped on drop.
+    keys: ScheduleKeys,
     seq: u64,
     /// Sticky poison flag — see [`SenderContext::exhausted`].
     exhausted: bool,
-    exporter_secret: Vec<u8>,
 }
 
 impl SenderContext {
@@ -191,21 +235,34 @@ impl SenderContext {
         psk: &[u8],
         psk_id: &[u8],
     ) -> Result<Self, Error> {
-        let (key, base_nonce, exporter_secret) =
-            key_schedule(suite, mode, shared_secret, info, psk, psk_id)?;
-        Ok(Self {
+        // Built zeroed first so a `key_schedule` failure still drops a context
+        // whose `ScheduleKeys` wipes whatever was written.
+        let mut this = Self {
             suite,
-            key,
-            base_nonce,
+            keys: ScheduleKeys::zeroed(),
             seq: 0,
             exhausted: false,
-            exporter_secret,
-        })
+        };
+        key_schedule(
+            suite,
+            mode,
+            shared_secret,
+            info,
+            psk,
+            psk_id,
+            &mut this.keys,
+        )?;
+        Ok(this)
     }
 
     /// `Seal(aad, pt)`: encrypts under the current nonce and increments
-    /// the sequence. Returns `ciphertext || tag`.
-    pub fn seal(&mut self, aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
+    /// the sequence, writing `ciphertext || tag` into `out` and returning
+    /// its length.
+    ///
+    /// `out` must hold at least `pt.len() + suite.aead.tag_len()` bytes;
+    /// a shorter buffer yields [`Error::BufferTooSmall`] and leaves the
+    /// sequence untouched.
+    pub fn seal_into(&mut self, aad: &[u8], pt: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         if self.suite.aead.is_export_only() {
             return Err(Error::ExportOnly);
         }
@@ -215,37 +272,66 @@ impl SenderContext {
         if self.exhausted {
             return Err(Error::MessageLimitReached);
         }
-        let nonce = compute_nonce(&self.base_nonce, self.seq);
-        let ct = self.suite.aead.seal(&self.key, &nonce, aad, pt)?;
+        let nn = self.suite.aead.nonce_len();
+        let nk = self.suite.aead.key_len();
+        let nonce = compute_nonce(&self.keys.base_nonce[..nn], self.seq);
+        let n = self
+            .suite
+            .aead
+            .seal(&self.keys.key[..nk], &nonce[..nn], aad, pt, out)?;
         if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
             self.exhausted = true;
             return Err(e);
         }
-        Ok(ct)
+        Ok(n)
     }
 
-    /// `Export(exporter_context, L)` (RFC 9180 §5.3): derives `L` bytes
-    /// of secret material from this context's exporter key.
+    /// `Seal(aad, pt)`, returning a freshly allocated `ciphertext || tag`.
     ///
-    /// Returns [`Error::ExportLengthExceeded`] when `length` is larger than
-    /// the underlying KDF can produce (`255·Nh`), per RFC 9180 §5.3, rather
-    /// than panicking in the HKDF-Expand layer.
+    /// Convenience wrapper over [`seal_into`](Self::seal_into) for callers
+    /// that have a heap.
+    #[cfg(feature = "alloc")]
+    pub fn seal(&mut self, aad: &[u8], pt: &[u8]) -> Result<Vec<u8>, Error> {
+        if self.suite.aead.is_export_only() {
+            return Err(Error::ExportOnly);
+        }
+        let mut out = alloc::vec![0u8; pt.len() + self.suite.aead.tag_len()];
+        let n = self.seal_into(aad, pt, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// `Export(exporter_context, L)` (RFC 9180 §5.3): derives `out.len()`
+    /// bytes of secret material from this context's exporter key into `out`.
+    ///
+    /// Returns [`Error::ExportLengthExceeded`] when `out` is larger than the
+    /// underlying KDF can produce (`255·Nh`, capped at `u16::MAX`), per
+    /// RFC 9180 §5.3, rather than panicking in the HKDF-Expand layer.
+    pub fn export_into(&self, exporter_context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        export_into(
+            self.suite,
+            &self.keys.exporter_secret,
+            exporter_context,
+            out,
+        )
+    }
+
+    /// `Export(exporter_context, L)`, returning a freshly allocated buffer.
+    ///
+    /// Convenience wrapper over [`export_into`](Self::export_into).
+    #[cfg(feature = "alloc")]
     pub fn export(&self, exporter_context: &[u8], length: usize) -> Result<Vec<u8>, Error> {
-        export(self.suite, &self.exporter_secret, exporter_context, length)
+        export(
+            self.suite,
+            &self.keys.exporter_secret,
+            exporter_context,
+            length,
+        )
     }
 }
 
-impl Drop for SenderContext {
-    fn drop(&mut self) {
-        // Best-effort wipe of the key-schedule secrets (the AEAD key, the
-        // base nonce, and the exporter secret) before their heap buffers are
-        // freed, with the crate's volatile `zeroize` stores.
-        super::wipe(&mut self.key);
-        super::wipe(&mut self.base_nonce);
-        super::wipe(&mut self.exporter_secret);
-    }
-}
-
+// `keys` wipes itself on drop (see `ScheduleKeys`), which is the whole of this
+// context's secret state.
 impl crate::zeroize::ZeroizeOnDrop for SenderContext {}
 
 impl ReceiverContext {
@@ -257,67 +343,136 @@ impl ReceiverContext {
         psk: &[u8],
         psk_id: &[u8],
     ) -> Result<Self, Error> {
-        let (key, base_nonce, exporter_secret) =
-            key_schedule(suite, mode, shared_secret, info, psk, psk_id)?;
-        Ok(Self {
+        let mut this = Self {
             suite,
-            key,
-            base_nonce,
+            keys: ScheduleKeys::zeroed(),
             seq: 0,
             exhausted: false,
-            exporter_secret,
-        })
+        };
+        key_schedule(
+            suite,
+            mode,
+            shared_secret,
+            info,
+            psk,
+            psk_id,
+            &mut this.keys,
+        )?;
+        Ok(this)
     }
 
-    /// `Open(aad, ct)`: verifies the tag, decrypts, and increments the
-    /// sequence. Sequence is not incremented when the AEAD rejects.
-    pub fn open(&mut self, aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, Error> {
+    /// `Open(aad, ct)`: verifies the tag, decrypts into `out`, and increments
+    /// the sequence, returning the plaintext length. The sequence is not
+    /// incremented when the AEAD rejects.
+    ///
+    /// `out` must hold at least `ct.len() - suite.aead.tag_len()` bytes; a
+    /// shorter buffer yields [`Error::BufferTooSmall`].
+    pub fn open_into(&mut self, aad: &[u8], ct: &[u8], out: &mut [u8]) -> Result<usize, Error> {
         if self.suite.aead.is_export_only() {
             return Err(Error::ExportOnly);
         }
-        // Sticky limit — symmetric to [`SenderContext::seal`].
+        // Sticky limit — symmetric to [`SenderContext::seal_into`].
         if self.exhausted {
             return Err(Error::MessageLimitReached);
         }
-        let nonce = compute_nonce(&self.base_nonce, self.seq);
-        let pt = self.suite.aead.open(&self.key, &nonce, aad, ct)?;
+        let nn = self.suite.aead.nonce_len();
+        let nk = self.suite.aead.key_len();
+        let nonce = compute_nonce(&self.keys.base_nonce[..nn], self.seq);
+        let n = self
+            .suite
+            .aead
+            .open(&self.keys.key[..nk], &nonce[..nn], aad, ct, out)?;
         if let Err(e) = increment_seq(&mut self.seq, self.suite.aead) {
             self.exhausted = true;
             return Err(e);
         }
-        Ok(pt)
+        Ok(n)
+    }
+
+    /// `Open(aad, ct)`, returning a freshly allocated plaintext.
+    ///
+    /// Convenience wrapper over [`open_into`](Self::open_into).
+    #[cfg(feature = "alloc")]
+    pub fn open(&mut self, aad: &[u8], ct: &[u8]) -> Result<Vec<u8>, Error> {
+        if self.suite.aead.is_export_only() {
+            return Err(Error::ExportOnly);
+        }
+        let tag_len = self.suite.aead.tag_len();
+        if ct.len() < tag_len {
+            return Err(Error::AeadError);
+        }
+        let mut out = alloc::vec![0u8; ct.len() - tag_len];
+        let n = self.open_into(aad, ct, &mut out)?;
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// `Export(exporter_context, L)` — symmetric to
+    /// [`SenderContext::export_into`].
+    pub fn export_into(&self, exporter_context: &[u8], out: &mut [u8]) -> Result<(), Error> {
+        export_into(
+            self.suite,
+            &self.keys.exporter_secret,
+            exporter_context,
+            out,
+        )
     }
 
     /// `Export(exporter_context, L)` — symmetric to
     /// [`SenderContext::export`].
+    #[cfg(feature = "alloc")]
     pub fn export(&self, exporter_context: &[u8], length: usize) -> Result<Vec<u8>, Error> {
-        export(self.suite, &self.exporter_secret, exporter_context, length)
+        export(
+            self.suite,
+            &self.keys.exporter_secret,
+            exporter_context,
+            length,
+        )
     }
 }
 
-impl Drop for ReceiverContext {
-    fn drop(&mut self) {
-        // Best-effort wipe of the key-schedule secrets — symmetric to
-        // [`SenderContext`]'s `Drop`.
-        super::wipe(&mut self.key);
-        super::wipe(&mut self.base_nonce);
-        super::wipe(&mut self.exporter_secret);
-    }
-}
-
+// Symmetric to [`SenderContext`]: `keys` wipes itself on drop.
 impl crate::zeroize::ZeroizeOnDrop for ReceiverContext {}
 
 /// Shared `Export` implementation (RFC 9180 §5.3): a single
 /// `LabeledExpand` from this context's `exporter_secret`.
-fn export(
+///
+/// `exporter_secret` is the context's full backing array; only its leading
+/// `Nh` bytes are the PRK.
+fn export_into(
     suite: CipherSuite,
-    exporter_secret: &[u8],
+    exporter_secret: &[u8; HpkeKdf::MAX_OUTPUT],
     exporter_context: &[u8],
-    length: usize,
-) -> Result<Vec<u8>, Error> {
+    out: &mut [u8],
+) -> Result<(), Error> {
     // HKDF-Expand can emit at most 255·Nh bytes; LabeledExpand additionally
     // encodes L as I2OSP(L, 2), so L must also fit in u16. Reject over-long
     // requests cleanly (RFC 9180 §5.3) instead of letting hkdf_expand panic.
+    let nh = suite.kdf.output_len();
+    let max = nh.saturating_mul(255).min(u16::MAX as usize);
+    if out.len() > max {
+        return Err(Error::ExportLengthExceeded);
+    }
+    let suite_id = suite.suite_id();
+    labeled_expand(
+        suite.kdf,
+        &exporter_secret[..nh],
+        &suite_id,
+        b"sec",
+        &[exporter_context],
+        out,
+    );
+    Ok(())
+}
+
+/// Allocating `Export`: see [`export_into`].
+#[cfg(feature = "alloc")]
+fn export(
+    suite: CipherSuite,
+    exporter_secret: &[u8; HpkeKdf::MAX_OUTPUT],
+    exporter_context: &[u8],
+    length: usize,
+) -> Result<Vec<u8>, Error> {
     let max = suite
         .kdf
         .output_len()
@@ -326,16 +481,8 @@ fn export(
     if length > max {
         return Err(Error::ExportLengthExceeded);
     }
-    let suite_id = suite.suite_id();
     let mut out = alloc::vec![0u8; length];
-    labeled_expand(
-        suite.kdf,
-        exporter_secret,
-        &suite_id,
-        b"sec",
-        exporter_context,
-        &mut out,
-    );
+    export_into(suite, exporter_secret, exporter_context, &mut out)?;
     Ok(out)
 }
 
@@ -378,11 +525,9 @@ mod tests {
     fn sender_at(suite: CipherSuite, seq: u64) -> SenderContext {
         SenderContext {
             suite,
-            key: alloc::vec![0u8; suite.aead.key_len()],
-            base_nonce: alloc::vec![0u8; suite.aead.nonce_len()],
+            keys: ScheduleKeys::zeroed(),
             seq,
             exhausted: false,
-            exporter_secret: alloc::vec![0u8; suite.kdf.output_len()],
         }
     }
 

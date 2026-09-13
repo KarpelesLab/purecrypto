@@ -2,8 +2,9 @@
 
 use super::{
     CipherSuite, Error, HpkeAead, HpkeKdf, HpkeKem, Mode, SenderContext, open as oneshot_open,
-    seal as oneshot_seal, setup_receiver, setup_receiver_auth, setup_receiver_auth_psk,
-    setup_receiver_psk, setup_sender, setup_sender_auth, setup_sender_auth_psk, setup_sender_psk,
+    open_into, seal as oneshot_seal, seal_into, setup_receiver, setup_receiver_auth,
+    setup_receiver_auth_psk, setup_receiver_psk, setup_sender, setup_sender_auth,
+    setup_sender_auth_psk, setup_sender_into, setup_sender_psk,
 };
 use crate::rng::{HmacDrbg, RngCore};
 
@@ -405,4 +406,410 @@ fn rfc9180_appendix_a1_base_x25519_aes128() {
     // The derived AEAD key is verified implicitly: matching the
     // Encryption[0] ciphertext bit-for-bit means the (key, base_nonce)
     // pair is correct, since AES-128-GCM is deterministic given inputs.
+}
+
+/// RFC 9180 Appendix A.3.1: DHKEM(P-256, HKDF-SHA256) + HKDF-SHA256
+/// + AES-128-GCM, mode_base.
+///
+/// This is the gate on the allocation-free P-256 KEM path: `DeriveKeyPair`'s
+/// rejection sampling, `SerializePublicKey`, and `DH` all run on the
+/// fixed-width [`crate::ec::ecdh`] backend rather than the heap-backed
+/// `ec::boxed` one.
+#[test]
+fn rfc9180_appendix_a3_base_p256_aes128() {
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex("4270e54ffd08d79d5928020af4686d8f6b7d35dbe470265f1f5aa22816ce860e");
+    let pk_em = hex(
+        "04a92719c6195d5085104f469a8b9814d5838ff72b60501e2c4466e5e67b325\
+         ac98536d7b61a1af4b78e5b7f951c0900be863c403ce65c9bfcb9382657222d18c4",
+    );
+    let sk_em = hex("4995788ef4b9d6132b249ce59a77281493eb39af373d236a1fe415cb0c2d7beb");
+    let ikm_r = hex("668b37171f1072f3cf12ea8a236a45df23fc13b82af3609ad1e354f6ef817550");
+    let pk_rm = hex(
+        "04fe8c19ce0905191ebc298a9245792531f26f0cece2460639e8bc39cb7f706\
+         a826a779b4cf969b8a0e539c7f62fb3d30ad6aa8f80e30f1d128aafd68a2ce72ea0",
+    );
+    let sk_rm = hex("f3ce7fdae57e1a310d87f1ebbde6f328be0a99cdbcadf4d6589cf29de4b8ffd2");
+
+    let kem = HpkeKem::DhkemP256HkdfSha256;
+    // DeriveKeyPair over both the ephemeral and the recipient ikm.
+    let (sk_derived, pk_derived) = kem.derive_key_pair(&ikm_e).unwrap();
+    assert_eq!(sk_derived, sk_em, "DeriveKeyPair(ikmE) skEm");
+    assert_eq!(pk_derived, pk_em, "DeriveKeyPair(ikmE) pkEm");
+    let (sk_derived, pk_derived) = kem.derive_key_pair(&ikm_r).unwrap();
+    assert_eq!(sk_derived, sk_rm, "DeriveKeyPair(ikmR) skRm");
+    assert_eq!(pk_derived, pk_rm, "DeriveKeyPair(ikmR) pkRm");
+
+    let suite = CipherSuite::new(kem, HpkeKdf::HkdfSha256, HpkeAead::Aes128Gcm);
+    let mut rng = ScriptRng::new(&ikm_e);
+    let (enc, mut sender) = setup_sender(&mut rng, suite, &pk_rm, &info).unwrap();
+    assert_eq!(enc, pk_em, "encap enc matches pkEm");
+
+    let mut receiver = setup_receiver(suite, &enc, &sk_rm, &info).unwrap();
+
+    // Encryption[0] and [1] (the RFC lists both ciphertexts verbatim).
+    let pt = hex("4265617574792069732074727574682c20747275746820626561757479");
+    let ct0 = sender.seal(&hex("436f756e742d30"), &pt).unwrap();
+    assert_eq!(
+        ct0,
+        hex(
+            "5ad590bb8baa577f8619db35a36311226a896e7342a6d836d8b7bcd2f20b6c7f\
+             9076ac232e3ab2523f39513434"
+        ),
+        "Encryption[0] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d30"), &ct0).unwrap(), pt);
+
+    let ct1 = sender.seal(&hex("436f756e742d31"), &pt).unwrap();
+    assert_eq!(
+        ct1,
+        hex(
+            "fa6f037b47fc21826b610172ca9637e82d6e5801eb31cbd3748271affd4ecb06\
+             646e0329cbdf3c3cd655b28e82"
+        ),
+        "Encryption[1] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d31"), &ct1).unwrap(), pt);
+
+    // Exported values (A.3.1.2).
+    assert_eq!(
+        sender.export(b"", 32).unwrap(),
+        hex("5e9bc3d236e1911d95e65b576a8a86d478fb827e8bdfe77b741b289890490d4d")
+    );
+    assert_eq!(
+        sender.export(&[0x00u8], 32).unwrap(),
+        hex("6cff87658931bda83dc857e6353efe4987a201b849658d9b047aab4cf216e796")
+    );
+    assert_eq!(
+        receiver.export(&hex("54657374436f6e74657874"), 32).unwrap(),
+        hex("d8f1ea7942adbba7412c6d431c62d01371ea476b823eb697e1f6e6cae1dab85a")
+    );
+}
+
+/// RFC 9180 Appendix A.3.3: DHKEM(P-256, …), mode_auth. Exercises
+/// `AuthEncap` / `AuthDecap` — two DH operations plus the three-part
+/// `kem_context` — on the allocation-free P-256 path.
+#[test]
+fn rfc9180_appendix_a3_auth_p256_aes128() {
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex("798d82a8d9ea19dbc7f2c6dfa54e8a6706f7cdc119db0813dacf8440ab37c857");
+    let pk_em = hex(
+        "042224f3ea800f7ec55c03f29fc9865f6ee27004f818fcbdc6dc68932c1e52\
+         e15b79e264a98f2c535ef06745f3d308624414153b22c7332bc1e691cb4af4d53454",
+    );
+    let pk_rm = hex(
+        "04423e363e1cd54ce7b7573110ac121399acbc9ed815fae03b72ffbd4c18b0\
+         1836835c5a09513f28fc971b7266cfde2e96afe84bb0f266920e82c4f53b36e1a78d",
+    );
+    let sk_rm = hex("d929ab4be2e59f6954d6bedd93e638f02d4046cef21115b00cdda2acb2a4440e");
+    let pk_sm = hex(
+        "04a817a0902bf28e036d66add5d544cc3a0457eab150f104285df1e293b5c1\
+         0eef8651213e43d9cd9086c80b309df22cf37609f58c1127f7607e85f210b2804f73",
+    );
+    let sk_sm = hex("1120ac99fb1fccc1e8230502d245719d1b217fe20505c7648795139d177f0de9");
+
+    let suite = CipherSuite::new(
+        HpkeKem::DhkemP256HkdfSha256,
+        HpkeKdf::HkdfSha256,
+        HpkeAead::Aes128Gcm,
+    );
+    let mut rng = ScriptRng::new(&ikm_e);
+    let (enc, mut sender) = setup_sender_auth(&mut rng, suite, &pk_rm, &info, &sk_sm).unwrap();
+    assert_eq!(enc, pk_em, "auth_encap enc matches pkEm");
+
+    let mut receiver = setup_receiver_auth(suite, &enc, &sk_rm, &info, &pk_sm).unwrap();
+
+    let pt = hex("4265617574792069732074727574682c20747275746820626561757479");
+    let ct0 = sender.seal(&hex("436f756e742d30"), &pt).unwrap();
+    assert_eq!(
+        ct0,
+        hex(
+            "82ffc8c44760db691a07c5627e5fc2c08e7a86979ee79b494a17cc3405446ac2\
+             bdb8f265db4a099ed3289ffe19"
+        ),
+        "Encryption[0] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d30"), &ct0).unwrap(), pt);
+
+    let ct1 = sender.seal(&hex("436f756e742d31"), &pt).unwrap();
+    assert_eq!(
+        ct1,
+        hex(
+            "b0a705a54532c7b4f5907de51c13dffe1e08d55ee9ba59686114b05945494d96\
+             725b239468f1229e3966aa1250"
+        ),
+        "Encryption[1] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d31"), &ct1).unwrap(), pt);
+}
+
+/// RFC 9180 Appendix A.6.1: DHKEM(P-521, HKDF-SHA512) + HKDF-SHA512 +
+/// AES-256-GCM, mode_base. Covers the widest suite (`Nh` = 64, `Nenc` = 133,
+/// `Nsk` = 66, and the `0x01` `DeriveKeyPair` bitmask) and the heap-backed
+/// KEM variant that stays behind `alloc`.
+#[test]
+fn rfc9180_appendix_a6_base_p521_aes256() {
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex(
+        "7f06ab8215105fc46aceeb2e3dc5028b44364f960426eb0d8e4026c2f8b5d7\
+         e7a986688f1591abf5ab753c357a5d6f0440414b4ed4ede71317772ac98d9239f709\
+         04",
+    );
+    let pk_em = hex(
+        "040138b385ca16bb0d5fa0c0665fbbd7e69e3ee29f63991d3e9b5fa740aab8\
+         900aaeed46ed73a49055758425a0ce36507c54b29cc5b85a5cee6bae0cf1c21f2731\
+         ece2013dc3fb7c8d21654bb161b463962ca19e8c654ff24c94dd2898de12051f1ed0\
+         692237fb02b2f8d1dc1c73e9b366b529eb436e98a996ee522aef863dd5739d2f29b0",
+    );
+    let sk_em = hex(
+        "014784c692da35df6ecde98ee43ac425dbdd0969c0c72b42f2e708ab9d5354\
+         15a8569bdacfcc0a114c85b8e3f26acf4d68115f8c91a66178cdbd03b7bcc5291e37\
+         4b",
+    );
+    let pk_rm = hex(
+        "0401b45498c1714e2dce167d3caf162e45e0642afc7ed435df7902ccae0e84\
+         ba0f7d373f646b7738bbbdca11ed91bdeae3cdcba3301f2457be452f271fa6837580\
+         e661012af49583a62e48d44bed350c7118c0d8dc861c238c72a2bda17f64704f464b\
+         57338e7f40b60959480c0e58e6559b190d81663ed816e523b6b6a418f66d2451ec64",
+    );
+    let sk_rm = hex(
+        "01462680369ae375e4b3791070a7458ed527842f6a98a79ff5e0d4cbde83c2\
+         7196a3916956655523a6a2556a7af62c5cadabe2ef9da3760bb21e005202f7b24628\
+         47",
+    );
+
+    let kem = HpkeKem::DhkemP521HkdfSha512;
+    let (sk_derived, pk_derived) = kem.derive_key_pair(&ikm_e).unwrap();
+    assert_eq!(sk_derived, sk_em, "DeriveKeyPair(ikmE) skEm");
+    assert_eq!(pk_derived, pk_em, "DeriveKeyPair(ikmE) pkEm");
+
+    let suite = CipherSuite::new(kem, HpkeKdf::HkdfSha512, HpkeAead::Aes256Gcm);
+    let mut rng = ScriptRng::new(&ikm_e);
+    let (enc, mut sender) = setup_sender(&mut rng, suite, &pk_rm, &info).unwrap();
+    assert_eq!(enc, pk_em, "encap enc matches pkEm");
+
+    let mut receiver = setup_receiver(suite, &enc, &sk_rm, &info).unwrap();
+
+    let pt = hex("4265617574792069732074727574682c20747275746820626561757479");
+    let ct0 = sender.seal(&hex("436f756e742d30"), &pt).unwrap();
+    assert_eq!(
+        ct0,
+        hex(
+            "170f8beddfe949b75ef9c387e201baf4132fa7374593dfafa90768788b7b2b20\
+             0aafcc6d80ea4c795a7c5b841a"
+        ),
+        "Encryption[0] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d30"), &ct0).unwrap(), pt);
+
+    let ct1 = sender.seal(&hex("436f756e742d31"), &pt).unwrap();
+    assert_eq!(
+        ct1,
+        hex(
+            "d9ee248e220ca24ac00bbbe7e221a832e4f7fa64c4fbab3945b6f3af0c5ecd5e\
+             16815b328be4954a05fd352256"
+        ),
+        "Encryption[1] ciphertext"
+    );
+    assert_eq!(receiver.open(&hex("436f756e742d31"), &ct1).unwrap(), pt);
+}
+
+/// RFC 9180 Appendix A.7.1: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 +
+/// Export-Only AEAD, mode_base. `Nk` = `Nn` = 0, so the key schedule skips
+/// both AEAD expansions and only the exporter secret is derived.
+#[test]
+fn rfc9180_appendix_a7_base_x25519_export_only() {
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex("55bc245ee4efda25d38f2d54d5bb6665291b99f8108a8c4b686c2b14893ea5d9");
+    let pk_em = hex("e5e8f9bfff6c2f29791fc351d2c25ce1299aa5eaca78a757c0b4fb4bcd830918");
+    let pk_rm = hex("194141ca6c3c3beb4792cd97ba0ea1faff09d98435012345766ee33aae2d7664");
+    let sk_rm = hex("33d196c830a12f9ac65d6e565a590d80f04ee9b19c83c87f2c170d972a812848");
+
+    let suite = CipherSuite::new(
+        HpkeKem::DhkemX25519HkdfSha256,
+        HpkeKdf::HkdfSha256,
+        HpkeAead::ExportOnly,
+    );
+    let mut rng = ScriptRng::new(&ikm_e);
+    let (enc, sender) = setup_sender(&mut rng, suite, &pk_rm, &info).unwrap();
+    assert_eq!(enc, pk_em, "encap enc matches pkEm");
+    let receiver = setup_receiver(suite, &enc, &sk_rm, &info).unwrap();
+
+    for (ctx, want) in [
+        (
+            alloc::vec::Vec::new(),
+            "7a36221bd56d50fb51ee65edfd98d06a23c4dc87085aa5866cb7087244bd2a36",
+        ),
+        (
+            hex("00"),
+            "d5535b87099c6c3ce80dc112a2671c6ec8e811a2f284f948cec6dd1708ee33f0",
+        ),
+        (
+            hex("54657374436f6e74657874"),
+            "ffaabc85a776136ca0c378e5d084c9140ab552b78f039d2e8775f26efff4c70e",
+        ),
+    ] {
+        assert_eq!(sender.export(&ctx, 32).unwrap(), hex(want));
+        assert_eq!(receiver.export(&ctx, 32).unwrap(), hex(want));
+    }
+}
+
+// -------------------------------------------------------------------
+// Allocation-free (`_into`) API.
+// -------------------------------------------------------------------
+
+/// The `_into` entry points are the code the no-alloc build runs; the
+/// `Vec`-returning twins are thin wrappers over them. Drive RFC 9180 A.3.1
+/// (P-256, the path that changed) end to end through caller buffers only and
+/// assert the same vector bytes come out.
+#[test]
+fn into_api_reproduces_rfc9180_a3_vector() {
+    const KEM: HpkeKem = HpkeKem::DhkemP256HkdfSha256;
+    let info = hex("4f6465206f6e2061204772656369616e2055726e");
+    let ikm_e = hex("4270e54ffd08d79d5928020af4686d8f6b7d35dbe470265f1f5aa22816ce860e");
+    let ikm_r = hex("668b37171f1072f3cf12ea8a236a45df23fc13b82af3609ad1e354f6ef817550");
+
+    // DeriveKeyPair through caller buffers sized from the KEM's const fns.
+    let mut sk_r = [0u8; KEM.n_sk()];
+    let mut pk_r = [0u8; KEM.n_pk()];
+    let (n_sk, n_pk) = KEM
+        .derive_key_pair_into(&ikm_r, &mut sk_r, &mut pk_r)
+        .unwrap();
+    assert_eq!((n_sk, n_pk), (32, 65));
+    assert_eq!(
+        sk_r[..],
+        hex("f3ce7fdae57e1a310d87f1ebbde6f328be0a99cdbcadf4d6589cf29de4b8ffd2")[..]
+    );
+
+    let suite = CipherSuite::new(KEM, HpkeKdf::HkdfSha256, HpkeAead::Aes128Gcm);
+    let mut rng = ScriptRng::new(&ikm_e);
+    let mut enc = [0u8; KEM.n_enc()];
+    let (n_enc, mut sender) = setup_sender_into(&mut rng, suite, &pk_r, &info, &mut enc).unwrap();
+    assert_eq!(n_enc, 65);
+    assert_eq!(
+        enc[..],
+        hex(
+            "04a92719c6195d5085104f469a8b9814d5838ff72b60501e2c4466e5e67b325\
+             ac98536d7b61a1af4b78e5b7f951c0900be863c403ce65c9bfcb9382657222d18c4"
+        )[..]
+    );
+
+    let pt = hex("4265617574792069732074727574682c20747275746820626561757479");
+    let aad = hex("436f756e742d30");
+    let mut ct = [0u8; 29 + 16];
+    let n_ct = sender.seal_into(&aad, &pt, &mut ct).unwrap();
+    assert_eq!(n_ct, ct.len());
+    assert_eq!(
+        ct[..],
+        hex(
+            "5ad590bb8baa577f8619db35a36311226a896e7342a6d836d8b7bcd2f20b6c7f\
+             9076ac232e3ab2523f39513434"
+        )[..]
+    );
+
+    let mut receiver = setup_receiver(suite, &enc[..n_enc], &sk_r, &info).unwrap();
+    let mut back = [0u8; 29];
+    let n_pt = receiver.open_into(&aad, &ct, &mut back).unwrap();
+    assert_eq!(&back[..n_pt], &pt[..]);
+
+    // Export through a caller buffer: `L` is the buffer length.
+    let mut exported = [0u8; 32];
+    sender.export_into(b"", &mut exported).unwrap();
+    assert_eq!(
+        exported[..],
+        hex("5e9bc3d236e1911d95e65b576a8a86d478fb827e8bdfe77b741b289890490d4d")[..]
+    );
+}
+
+/// The single-shot `_into` pair round-trips, and undersized buffers are
+/// reported rather than panicking or silently truncating.
+#[test]
+fn one_shot_into_roundtrip_and_short_buffers() {
+    const KEM: HpkeKem = HpkeKem::DhkemX25519HkdfSha256;
+    let suite = CipherSuite::new(KEM, HpkeKdf::HkdfSha256, HpkeAead::ChaCha20Poly1305);
+    let mut rng = drbg();
+
+    let mut sk_r = [0u8; KEM.n_sk()];
+    let mut pk_r = [0u8; KEM.n_pk()];
+    KEM.generate_key_pair_into(&mut rng, &mut sk_r, &mut pk_r)
+        .unwrap();
+
+    let pt = b"hello, allocator-free world";
+    let mut enc = [0u8; KEM.n_enc()];
+    let mut ct = [0u8; 27 + 16];
+    let (n_enc, n_ct) = seal_into(
+        &mut rng, suite, &pk_r, b"info", b"aad", pt, &mut enc, &mut ct,
+    )
+    .unwrap();
+    assert_eq!((n_enc, n_ct), (32, pt.len() + 16));
+
+    let mut back = [0u8; 27];
+    let n = open_into(
+        suite,
+        &enc[..n_enc],
+        &sk_r,
+        b"info",
+        b"aad",
+        &ct[..n_ct],
+        &mut back,
+    )
+    .unwrap();
+    assert_eq!(&back[..n], pt);
+
+    // One byte short in each direction.
+    let mut short_enc = [0u8; KEM.n_enc() - 1];
+    assert_eq!(
+        setup_sender_into(&mut rng, suite, &pk_r, b"info", &mut short_enc).map(|_| ()),
+        Err(Error::BufferTooSmall)
+    );
+    let (_, mut sender) = setup_sender_into(&mut rng, suite, &pk_r, b"info", &mut enc).unwrap();
+    let mut short_ct = [0u8; 27 + 15];
+    assert_eq!(
+        sender.seal_into(b"aad", pt, &mut short_ct),
+        Err(Error::BufferTooSmall)
+    );
+    let mut receiver = setup_receiver(suite, &enc, &sk_r, b"info").unwrap();
+    let mut short_pt = [0u8; 26];
+    assert_eq!(
+        receiver.open_into(b"aad", &ct[..n_ct], &mut short_pt),
+        Err(Error::BufferTooSmall)
+    );
+
+    // The rejected seal must not have advanced the sender's sequence: the
+    // very next seal is still Encryption[0] for this context, so a freshly
+    // built receiver at seq 0 opens it.
+    let mut ct2 = [0u8; 27 + 16];
+    let n2 = sender.seal_into(b"aad", pt, &mut ct2).unwrap();
+    let mut receiver2 = setup_receiver(suite, &enc, &sk_r, b"info").unwrap();
+    let mut back2 = [0u8; 27];
+    let n3 = receiver2.open_into(b"aad", &ct2[..n2], &mut back2).unwrap();
+    assert_eq!(&back2[..n3], pt);
+}
+
+/// An over-long `out` would change every derived byte (RFC 9180 binds `L`
+/// into `LabeledExpand`'s input), so `export_into` must be length-exact:
+/// asking for 16 bytes is the 16-byte export, not a prefix of the 32-byte one.
+#[test]
+fn export_length_is_bound_into_the_derivation() {
+    let suite = CipherSuite::new(
+        HpkeKem::DhkemX25519HkdfSha256,
+        HpkeKdf::HkdfSha256,
+        HpkeAead::Aes128Gcm,
+    );
+    let mut rng = drbg();
+    let (_sk_r, pk_r) = suite.kem.generate_key_pair(&mut rng).unwrap();
+    let (_enc, sender) = setup_sender(&mut rng, suite, &pk_r, b"i").unwrap();
+
+    let mut short = [0u8; 16];
+    sender.export_into(b"ctx", &mut short).unwrap();
+    let mut long = [0u8; 32];
+    sender.export_into(b"ctx", &mut long).unwrap();
+    assert_ne!(
+        short[..],
+        long[..16],
+        "L must be bound into the export derivation"
+    );
+    // And the allocating twin agrees with the caller-buffer form.
+    assert_eq!(sender.export(b"ctx", 16).unwrap()[..], short[..]);
+    assert_eq!(sender.export(b"ctx", 32).unwrap()[..], long[..]);
 }

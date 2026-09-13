@@ -1,13 +1,17 @@
 //! HPKE KDF dispatcher: runtime selection of HKDF-SHA-{256,384,512}
 //! (RFC 9180 §7.2).
 //!
-//! Wraps [`crate::kdf::hkdf_extract`] / [`crate::kdf::hkdf_expand`] in
-//! a small enum so suite-id-driven call sites don't have to be
-//! generic over [`crate::hash::Digest`].
+//! Wraps [`crate::kdf::hkdf_extract_parts`] /
+//! [`crate::kdf::try_hkdf_expand_parts`] in a small enum so suite-id-driven
+//! call sites don't have to be generic over [`crate::hash::Digest`].
+//!
+//! Both wrappers take their input as a *sequence of parts* hashed as if
+//! concatenated, and both write into caller-provided storage, so the whole
+//! HPKE KDF layer runs without a heap.
 
 use crate::hash::{Digest, Sha256, Sha384, Sha512};
-use crate::kdf::{hkdf_expand, hkdf_extract};
-use alloc::vec::Vec;
+use crate::kdf::{hkdf_extract_parts, try_hkdf_expand_parts};
+use crate::zeroize::Zeroize;
 
 /// HPKE KDF identifiers (RFC 9180 §7.2).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -21,6 +25,12 @@ pub enum HpkeKdf {
 }
 
 impl HpkeKdf {
+    /// The largest `Nh` across the wired KDFs (HKDF-SHA-512's 64 bytes).
+    ///
+    /// Every HPKE PRK / exporter secret fits in a `[u8; MAX_OUTPUT]` on the
+    /// stack, which is what lets the key schedule run without a heap.
+    pub const MAX_OUTPUT: usize = 64;
+
     /// The IANA-assigned KDF id.
     pub const fn id(self) -> u16 {
         match self {
@@ -39,25 +49,34 @@ impl HpkeKdf {
         }
     }
 
-    /// HKDF-Extract, returning an `Nh`-byte PRK.
-    pub(crate) fn extract(self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+    /// HKDF-Extract over a sequence of `ikm` parts (bound exactly as if they
+    /// were concatenated), writing the `Nh`-byte PRK into the leading bytes of
+    /// the returned `[u8; MAX_OUTPUT]`. Bytes past
+    /// [`output_len`](Self::output_len) are left zero.
+    pub(crate) fn extract_parts(self, salt: &[u8], ikm: &[&[u8]]) -> [u8; Self::MAX_OUTPUT] {
+        let mut out = [0u8; Self::MAX_OUTPUT];
         match self {
             HpkeKdf::HkdfSha256 => {
-                let prk = hkdf_extract::<Sha256>(salt, ikm);
-                prk.as_ref().to_vec()
+                let mut prk = hkdf_extract_parts::<Sha256>(salt, ikm);
+                out[..Sha256::OUTPUT_LEN].copy_from_slice(prk.as_ref());
+                prk.as_mut().zeroize();
             }
             HpkeKdf::HkdfSha384 => {
-                let prk = hkdf_extract::<Sha384>(salt, ikm);
-                prk.as_ref().to_vec()
+                let mut prk = hkdf_extract_parts::<Sha384>(salt, ikm);
+                out[..Sha384::OUTPUT_LEN].copy_from_slice(prk.as_ref());
+                prk.as_mut().zeroize();
             }
             HpkeKdf::HkdfSha512 => {
-                let prk = hkdf_extract::<Sha512>(salt, ikm);
-                prk.as_ref().to_vec()
+                let mut prk = hkdf_extract_parts::<Sha512>(salt, ikm);
+                out[..Sha512::OUTPUT_LEN].copy_from_slice(prk.as_ref());
+                prk.as_mut().zeroize();
             }
         }
+        out
     }
 
-    /// HKDF-Expand into `out`.
+    /// HKDF-Expand into `out`, with the `info` context supplied as a sequence
+    /// of parts bound exactly as if they were concatenated.
     ///
     /// `prk` must be exactly [`output_len`](Self::output_len) bytes and
     /// `out.len()` must not exceed `255 * output_len` (the RFC 5869 maximum).
@@ -69,7 +88,7 @@ impl HpkeKdf {
     /// rather than panicking on untrusted input; a `debug_assert` flags the
     /// contract violation in debug builds. Callers that need the output ignore
     /// the boolean for valid inputs (where it is always `true`).
-    pub(crate) fn expand(self, prk: &[u8], info: &[u8], out: &mut [u8]) -> bool {
+    pub(crate) fn expand_parts(self, prk: &[u8], info: &[&[u8]], out: &mut [u8]) -> bool {
         let nh = self.output_len();
         debug_assert_eq!(
             prk.len(),
@@ -85,23 +104,29 @@ impl HpkeKdf {
         if prk.len() != nh || out.len() > 255 * nh {
             return false;
         }
+        // The `prk` copy below is key material: wipe it before returning.
         match self {
             HpkeKdf::HkdfSha256 => {
                 let mut p = <Sha256 as Digest>::zeroed_output();
                 p.as_mut().copy_from_slice(prk);
-                hkdf_expand::<Sha256>(&p, info, out);
+                let ok = try_hkdf_expand_parts::<Sha256>(&p, info, out).is_ok();
+                p.as_mut().zeroize();
+                ok
             }
             HpkeKdf::HkdfSha384 => {
                 let mut p = <Sha384 as Digest>::zeroed_output();
                 p.as_mut().copy_from_slice(prk);
-                hkdf_expand::<Sha384>(&p, info, out);
+                let ok = try_hkdf_expand_parts::<Sha384>(&p, info, out).is_ok();
+                p.as_mut().zeroize();
+                ok
             }
             HpkeKdf::HkdfSha512 => {
                 let mut p = <Sha512 as Digest>::zeroed_output();
                 p.as_mut().copy_from_slice(prk);
-                hkdf_expand::<Sha512>(&p, info, out);
+                let ok = try_hkdf_expand_parts::<Sha512>(&p, info, out).is_ok();
+                p.as_mut().zeroize();
+                ok
             }
         }
-        true
     }
 }

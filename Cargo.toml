@@ -200,7 +200,11 @@ xmss = ["hash", "rng"]
 # 3 KDFs (HKDF-SHA-{256,384,512}) × 3 AEADs (AES-128/256-GCM,
 # ChaCha20-Poly1305) + ExportOnly, in all 4 modes (Base, PSK, Auth,
 # AuthPSK).
-hpke = ["hash", "kdf", "ec", "cipher", "rng", "alloc"]
+# no_std + no-alloc: the whole key schedule, the labeled HKDF layer and the
+# AEAD wrappers run on caller-supplied buffers. Only the P-384 / P-521 KEM
+# variants need `alloc` (their group arithmetic is heap-backed); P-256 and
+# X25519 do not.
+hpke = ["hash", "kdf", "ec", "cipher", "rng"]
 # Encrypted Client Hello (draft-ietf-tls-esni-22). Hides the inner
 # ClientHello (including SNI and ALPN) under an HPKE-sealed envelope
 # bound to a public_name from a published `ECHConfigList`. Provides
