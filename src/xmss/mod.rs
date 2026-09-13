@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```
-//! # #[cfg(feature = "xmss")] {
+//! # #[cfg(all(feature = "xmss", feature = "alloc"))] {
 //! use purecrypto::xmss::{XmssParamSet, XmssPrivateKey};
 //! use purecrypto::rng::HmacDrbg;
 //! use purecrypto::hash::Sha256;
