@@ -116,6 +116,51 @@ pub trait CryptoRngCore: RngCore + CryptoRng {}
 
 impl<T: RngCore + CryptoRng + ?Sized> CryptoRngCore for T {}
 
+/// Best-effort OS entropy for defence-in-depth paths that must stay
+/// infallible (currently the RSA blinding salts).
+///
+/// Fills `dest` and returns `true` when the target has an [`OsRng`] — `std`
+/// on unix / windows / `fullrust`, or one of the wasm host backends. On a
+/// bare-metal `no_std` build it returns `false` without touching `dest` and
+/// the caller must fall back to its deterministic derivation. Deliberately
+/// not a `Result`: these callers cannot be made fallible without a breaking
+/// change, and a missing OS CSPRNG must degrade to the previous (still
+/// constant-time) behaviour rather than abort an operation.
+#[cfg(any(
+    all(feature = "std", any(unix, windows, target_os = "fullrust")),
+    all(
+        target_arch = "wasm32",
+        any(
+            target_os = "unknown",
+            all(target_os = "wasi", feature = "wasi-getrandom"),
+        )
+    )
+))]
+#[cfg_attr(not(any(feature = "rsa", feature = "dh")), allow(dead_code))]
+pub(crate) fn try_os_entropy(dest: &mut [u8]) -> bool {
+    let mut rng = OsRng;
+    rng.fill_bytes(dest);
+    true
+}
+
+/// No OS CSPRNG on this target (bare-metal `no_std`): the caller keeps its
+/// deterministic fallback. See the `cfg`-enabled sibling for the contract.
+#[cfg(not(any(
+    all(feature = "std", any(unix, windows, target_os = "fullrust")),
+    all(
+        target_arch = "wasm32",
+        any(
+            target_os = "unknown",
+            all(target_os = "wasi", feature = "wasi-getrandom"),
+        )
+    )
+)))]
+#[cfg_attr(not(any(feature = "rsa", feature = "dh")), allow(dead_code))]
+pub(crate) fn try_os_entropy(dest: &mut [u8]) -> bool {
+    let _ = dest;
+    false
+}
+
 /// Operating-system entropy source.
 ///
 /// Reads from `/dev/urandom`. Available on Unix targets with the `std` feature.

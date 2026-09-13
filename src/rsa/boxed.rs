@@ -34,10 +34,13 @@ pub struct BoxedRsaPublicKey {
 ///
 /// When the prime factors are known the raw private operation runs Coron's
 /// base blinding (see [`RsaPrivateKey`](super::RsaPrivateKey) for the full
-/// recipe). The blinder is `HMAC-SHA256(seed, counter ‖ c)` — keyed by a
-/// digest of `d`, so unpredictable without the private key, and mixed with a
+/// recipe). The blinder is `HMAC-SHA256(seed, counter ‖ salt ‖ c)` — keyed by
+/// a digest of `d`, so unpredictable without the private key, mixed with a
 /// per-key operation counter, so replaying a ciphertext does not replay a
-/// byte-identical computation. That freshness is what stops an attacker from
+/// byte-identical computation, and with a random salt (fresh per operation
+/// where the target has an OS CSPRNG, else per key instance) so that the
+/// sequence is not predictable from the counter alone and clones / forks do
+/// not replay each other. That freshness is what stops an attacker from
 /// averaging many traces of the same exponentiation; without it the residual
 /// data-dependent signal accumulates coherently while noise falls as
 /// `1/√N`. This does not make the exponentiation trace-proof, it removes the
@@ -68,6 +71,10 @@ pub struct BoxedRsaPrivateKey {
     /// `u64`) because 64-bit atomics do not exist on the 32-bit bare-metal
     /// targets this crate builds for.
     blind_counter: AtomicU32,
+    /// Per-instance blinding salt (see the struct docs): random on any target
+    /// with an OS CSPRNG, all-zero on bare-metal `no_std`. Re-drawn on
+    /// `Clone`.
+    blind_salt: [u8; 16],
 }
 
 // Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
@@ -86,6 +93,8 @@ impl Clone for BoxedRsaPrivateKey {
             crt: self.crt.clone(),
             blinding_seed: self.blinding_seed,
             blind_counter: AtomicU32::new(self.blind_counter.load(Ordering::Relaxed)),
+            // Fresh salt: a clone must not replay the original's blinders.
+            blind_salt: super::keys::fresh_blind_salt(),
         }
     }
 }
@@ -122,7 +131,11 @@ impl Drop for BoxedRsaPrivateKey {
         for b in self.blinding_seed.iter_mut() {
             *b = 0;
         }
+        for b in self.blind_salt.iter_mut() {
+            *b = 0;
+        }
         let _ = core::hint::black_box(&self.blinding_seed);
+        let _ = core::hint::black_box(&self.blind_salt);
     }
 }
 
@@ -145,8 +158,11 @@ fn derive_blinding_boxed(
     let mut h = Sha256::new();
     h.update(b"purecrypto-rsa-blinding-seed-v1");
     // `d` is variable-width; serialize big-endian byte-for-byte.
-    let d_bytes = d.to_be_bytes(d.bit_len().div_ceil(8).max(1));
+    let mut d_bytes = d.to_be_bytes(d.bit_len().div_ceil(8).max(1));
     h.update(&d_bytes);
+    // `d_bytes` is the private exponent in the clear: wipe it before the
+    // `Vec` is freed.
+    super::wipe(&mut d_bytes);
     let digest = h.finalize();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(digest.as_ref());
@@ -227,7 +243,7 @@ fn derive_crt_boxed(
     }))
 }
 
-/// Derives the per-call blinder `r` — `HMAC-SHA256(seed, nonce ‖ c)`, keyed by
+/// Derives the per-call blinder `r` — `HMAC-SHA256(seed, nonce ‖ salt ‖ c)`, keyed by
 /// the key-bound seed — reduced into `[2, n)`. `nonce` is the caller's
 /// per-operation counter: it is what makes two operations on the *same*
 /// ciphertext use different blinders, so an attacker cannot replay a
@@ -237,6 +253,7 @@ fn derive_blinder_boxed(
     blinding_seed: &[u8; 32],
     k_bytes: usize,
     nonce: u32,
+    salt: &[u8; 16],
     c: &BoxedUint,
 ) -> BoxedUint {
     let c_bytes = c.to_be_bytes(k_bytes);
@@ -247,6 +264,10 @@ fn derive_blinder_boxed(
         m.update(b"r");
         m.update(&counter.to_be_bytes());
         m.update(&nonce.to_be_bytes());
+        // Random salt (see the struct docs): the counter is predictable and
+        // copied by `Clone` / inherited across `fork(2)`, so on its own it
+        // does not make the blinder sequence unpredictable.
+        m.update(salt);
         m.update(&c_bytes);
         let tag = m.finalize();
         blinder_bytes.extend_from_slice(tag.as_ref());
@@ -287,10 +308,11 @@ fn raw_private_crt_blinded(
     key: &BoxedRsaPrivateKey,
     crt: &BoxedRsaCrt,
     nonce: u32,
+    salt: &[u8; 16],
     c: &BoxedUint,
 ) -> BoxedUint {
     let mont = &key.mont;
-    let mut r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, c);
+    let mut r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, salt, c);
     let mut r_e = mont.pow_public(&r, &key.e);
     let mut c_blind = mont.mul_mod(c, &r_e);
 
@@ -344,8 +366,9 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
     // One counter bump per private operation. `Relaxed` is enough: the value
     // only has to differ between operations, it orders nothing else.
     let nonce = key.blind_counter.fetch_add(1, Ordering::Relaxed);
+    let salt = super::keys::per_op_blind_salt(&key.blind_salt);
     if let Some(crt) = key.crt.as_deref() {
-        let m = raw_private_crt_blinded(key, crt, nonce, c);
+        let m = raw_private_crt_blinded(key, crt, nonce, &salt, c);
         // `c` is public in every caller (a ciphertext or an EMSA-encoded
         // digest), so the variable-time `lt` shortcut leaks nothing.
         let n = mont.modulus();
@@ -360,7 +383,7 @@ fn raw_private_blinded_boxed(key: &BoxedRsaPrivateKey, c: &BoxedUint) -> BoxedUi
         None => return mont.pow(c, &key.d), // imported key without primes
     };
 
-    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, c);
+    let r = derive_blinder_boxed(mont, &key.blinding_seed, key.k, nonce, &salt, c);
     // `e` is public, so the exponent-length ladder applies (still branchless
     // and constant-time in the secret base `r`).
     let r_e = mont.pow_public(&r, &key.e);
@@ -601,6 +624,7 @@ impl BoxedRsaPrivateKey {
             crt: None,
             blinding_seed,
             blind_counter: AtomicU32::new(0),
+            blind_salt: super::keys::fresh_blind_salt(),
         }
     }
 
@@ -639,6 +663,7 @@ impl BoxedRsaPrivateKey {
             crt,
             blinding_seed,
             blind_counter: AtomicU32::new(0),
+            blind_salt: super::keys::fresh_blind_salt(),
         }
     }
 
@@ -725,6 +750,7 @@ impl BoxedRsaPrivateKey {
                     crt,
                     blinding_seed,
                     blind_counter: AtomicU32::new(0),
+                    blind_salt: super::keys::fresh_blind_salt(),
                 };
             }
         }
@@ -1084,6 +1110,7 @@ impl BoxedRsaPrivateKey {
             crt,
             blinding_seed,
             blind_counter: AtomicU32::new(0),
+            blind_salt: super::keys::fresh_blind_salt(),
         })
     }
 
@@ -2049,9 +2076,15 @@ mod tests {
     fn blinder_differs_between_operations_on_the_same_ciphertext() {
         let sk = gen_small_key(b"rsa-blind-nonce");
         let c = BoxedUint::from_u64(0x1234_5678_9abc_def0);
-        let r0 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 0, &c);
-        let r1 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 1, &c);
+        let salt = [0u8; 16];
+        let r0 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 0, &salt, &c);
+        let r1 = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 1, &salt, &c);
         assert_ne!(r0, r1, "blinder must depend on the operation counter");
+        // …and on the random salt, which is what makes the sequence
+        // unpredictable (the counter is public and replayable).
+        let other_salt = [0xa5u8; 16];
+        let r0b = derive_blinder_boxed(&sk.mont, &sk.blinding_seed, sk.k, 0, &other_salt, &c);
+        assert_ne!(r0, r0b, "blinder must depend on the random salt");
 
         // …and the operation itself still produces the same plaintext twice.
         let mut rng = HmacDrbg::<Sha256>::new(b"rsa-blind-nonce-ct", b"n", &[]);

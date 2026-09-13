@@ -38,13 +38,20 @@ pub struct RsaPublicKey<const LIMBS: usize> {
 /// many traces of a byte-identical computation, which is the measurement
 /// primitive the Marvin / Brumley-class attacks are built on.
 ///
+/// The counter alone is predictable (it starts at 0 on every parse, is copied
+/// by `Clone`, and is inherited across `fork(2)`), so a 16-byte *salt* is
+/// mixed in alongside it: freshly drawn from the OS CSPRNG for every private
+/// operation where the target has one, and otherwise — bare-metal `no_std`,
+/// which has no ambient entropy — drawn once per key instance (and re-drawn
+/// on `Clone`), falling back to the purely deterministic
+/// seed-plus-counter derivation when even that is unavailable. So the
+/// blinder sequence is unpredictable on any hosted build, two clones of a key
+/// never replay each other's sequence, and the no-entropy targets keep
+/// exactly the previous (still constant-time) behaviour rather than failing.
+///
 /// This defeats Bleichenbacher- / Manger-style chosen-ciphertext timing
 /// attacks and raises the cost of trace averaging. It is *not* a claim of
-/// resistance to an attacker with unlimited power/EM traces: the counter is
-/// not a random nonce, it never repeats for a given key instance (wrapping
-/// only after 2³² operations) but it is predictable, so the blinder sequence
-/// is fresh rather than secret-seeded-fresh. `Clone`ing a key copies the
-/// counter, so clones repeat each other's sequence.
+/// resistance to an attacker with unlimited power/EM traces.
 ///
 /// Blinding requires φ(n), which is only known when the key was generated
 /// here (so `p`, `q` are non-zero). Keys imported via
@@ -69,6 +76,10 @@ pub struct RsaPrivateKey<const LIMBS: usize> {
     /// targets this crate builds for; wrapping after 2³² private operations on
     /// one key instance is acceptable.
     blind_counter: AtomicU32,
+    /// Per-instance blinding salt (see the struct docs): random on any target
+    /// with an OS CSPRNG, all-zero on bare-metal `no_std`. Re-drawn on
+    /// `Clone` so a cloned key does not replay the original's blinders.
+    blind_salt: [u8; 16],
 }
 
 // Manual `Clone`: `AtomicU32` is not `Clone`. The clone starts from the
@@ -84,7 +95,30 @@ impl<const LIMBS: usize> Clone for RsaPrivateKey<LIMBS> {
             phi_n_minus_1: self.phi_n_minus_1,
             blinding_seed: self.blinding_seed,
             blind_counter: AtomicU32::new(self.blind_counter.load(Ordering::Relaxed)),
+            // Fresh salt: two clones must not produce the same blinder
+            // sequence (the counter alone is copied).
+            blind_salt: fresh_blind_salt(),
         }
+    }
+}
+
+/// A per-key-instance blinding salt: 16 bytes of OS entropy where the target
+/// has an OS CSPRNG, all-zero otherwise (bare-metal `no_std`, where the
+/// blinder stays the pre-existing deterministic seed-plus-counter value).
+pub(super) fn fresh_blind_salt() -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    let _ = crate::rng::try_os_entropy(&mut salt);
+    salt
+}
+
+/// The salt mixed into one private operation's blinder: fresh OS entropy when
+/// available, else the key's per-instance salt.
+pub(super) fn per_op_blind_salt(instance: &[u8; 16]) -> [u8; 16] {
+    let mut salt = [0u8; 16];
+    if crate::rng::try_os_entropy(&mut salt) {
+        salt
+    } else {
+        *instance
     }
 }
 
@@ -131,7 +165,7 @@ fn derive_blinding<const LIMBS: usize>(
 /// of Kocher / Messerges blinding):
 ///
 /// ```text
-///   r        = HMAC-SHA256(blinding_seed, nonce ‖ c)   // reduced mod n
+///   r        = HMAC-SHA256(blinding_seed, nonce ‖ salt ‖ c)  // reduced mod n
 ///   r_e      = r^e mod n                        // public exponent, cheap
 ///   r_inv    = r^{φ(n)-1} mod n                 // Fermat inverse, constant time
 ///   c_blind  = (c · r_e) mod n
@@ -148,6 +182,7 @@ fn raw_private_blinded<const LIMBS: usize>(
     phi_n_minus_1: &Uint<LIMBS>,
     blinding_seed: &[u8; 32],
     nonce: u32,
+    salt: &[u8; 16],
     c: &Uint<LIMBS>,
 ) -> Uint<LIMBS> {
     use crate::hash::HmacSha256;
@@ -178,6 +213,11 @@ fn raw_private_blinded<const LIMBS: usize>(
         // pure function of `(key, c)`, so replaying `c` reproduces every
         // intermediate bit-for-bit and lets an attacker average traces.
         m.update(&nonce.to_be_bytes());
+        // Per-operation (or at least per-key-instance) random salt: the
+        // counter above is predictable and shared by clones and forks, so on
+        // its own it does not stop an attacker from predicting — or making a
+        // second key instance replay — the blinder sequence.
+        m.update(salt);
         // Stream the ciphertext limb-by-limb (BE) into the HMAC.
         for i in 0..LIMBS {
             let limb_bytes = c.as_limbs()[LIMBS - 1 - i].to_be_bytes();
@@ -353,6 +393,10 @@ impl<const LIMBS: usize> Drop for RsaPrivateKey<LIMBS> {
         for b in self.blinding_seed.iter_mut() {
             *b = 0;
         }
+        for b in self.blind_salt.iter_mut() {
+            *b = 0;
+        }
+        let _ = core::hint::black_box(&self.blind_salt);
         let _ = core::hint::black_box(&self.d);
         let _ = core::hint::black_box(&self.p);
         let _ = core::hint::black_box(&self.q);
@@ -433,6 +477,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
                     phi_n_minus_1,
                     blinding_seed,
                     blind_counter: AtomicU32::new(0),
+                    blind_salt: fresh_blind_salt(),
                 };
             }
         }
@@ -465,6 +510,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             phi_n_minus_1,
             blinding_seed,
             blind_counter: AtomicU32::new(0),
+            blind_salt: fresh_blind_salt(),
         }
     }
 
@@ -546,6 +592,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             phi_n_minus_1,
             blinding_seed,
             blind_counter: AtomicU32::new(0),
+            blind_salt: fresh_blind_salt(),
         }
     }
 
@@ -566,6 +613,7 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             &self.phi_n_minus_1,
             &self.blinding_seed,
             self.blind_counter.fetch_add(1, Ordering::Relaxed),
+            &per_op_blind_salt(&self.blind_salt),
             c,
         )
     }
@@ -613,6 +661,41 @@ mod tests {
         let n = *key.modulus();
         let c = Uint::<32>::from_be_bytes(b"deterministic-c-bytes-here-xxxxx").reduce(&n);
         assert_eq!(key.raw(&c), key.raw(&c));
+    }
+
+    /// The blinding salt must carry real entropy on any target with an OS
+    /// CSPRNG: the operation counter alone starts at 0 on every parse, is
+    /// copied by `Clone`, and is inherited across `fork(2)`, so without the
+    /// salt the whole blinder sequence is predictable and replayable.
+    #[cfg(all(feature = "std", any(unix, windows, target_os = "fullrust")))]
+    #[test]
+    fn blind_salts_are_random_where_an_os_csprng_exists() {
+        let a = fresh_blind_salt();
+        let b = fresh_blind_salt();
+        assert_ne!(a, [0u8; 16], "salt must not be all-zero on a hosted build");
+        assert_ne!(a, b, "per-instance salts must differ");
+        let instance = [0x5au8; 16];
+        assert_ne!(
+            per_op_blind_salt(&instance),
+            instance,
+            "per-operation salt must be fresh, not the instance fallback"
+        );
+    }
+
+    /// A cloned key gets its own salt but still computes the same results.
+    #[cfg(all(feature = "alloc", feature = "der"))]
+    #[test]
+    fn cloned_key_blinds_independently_but_agrees() {
+        let key = crate::test_util::rsa_test_key_a();
+        let clone = key.clone();
+        #[cfg(all(feature = "std", any(unix, windows, target_os = "fullrust")))]
+        assert_ne!(
+            key.blind_salt, clone.blind_salt,
+            "a clone must not replay the original's blinder sequence"
+        );
+        let n = *key.modulus();
+        let c = Uint::<32>::from_be_bytes(b"clone-blinding-check-bytes-1234x").reduce(&n);
+        assert_eq!(key.raw(&c), clone.raw(&c));
     }
 
     #[cfg(all(feature = "alloc", feature = "der"))]
