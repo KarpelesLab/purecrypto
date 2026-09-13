@@ -139,6 +139,33 @@ mod tests {
         }
     }
 
+    /// An oversized `salt_len` must be an error, never a panic. The bound
+    /// checks used to be `em_len < h_len + s_len + 2` (sign) and
+    /// `db_len < n + 1` (verify), both of which wrap for a `salt_len` near
+    /// `usize::MAX` — the sign path then panicked slicing
+    /// `em[db_len - s_len..]` and the verify path indexed `db[ps_len]` out of
+    /// bounds. Both are reachable from caller-supplied parameters
+    /// (`SaltLen::Fixed`, X.509 `RSASSA-PSS-params`).
+    #[test]
+    fn oversized_salt_len_errors_instead_of_panicking() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-pss-huge-salt", b"nonce", &[]);
+        let sig = key.sign_pss::<Sha256, _>(b"m", &mut r).unwrap();
+        for &slen in &[usize::MAX, usize::MAX - 1, usize::MAX / 2, 1 << 40, 300] {
+            assert_eq!(
+                key.sign_pss_with_salt_len::<Sha256, _>(b"m", slen, &mut r),
+                Err(Error::MessageTooLong),
+                "sign with sLen={slen}"
+            );
+            assert_eq!(
+                pk.verify_pss_with_salt_len::<Sha256>(b"m", &sig, slen),
+                Err(Error::Verification),
+                "verify with sLen={slen}"
+            );
+        }
+    }
+
     #[test]
     fn strict_verify_rejects_nonstandard_salt() {
         // A signature made with sLen != hLen must be rejected by the strict

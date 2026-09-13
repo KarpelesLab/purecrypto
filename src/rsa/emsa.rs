@@ -966,7 +966,15 @@ fn emsa_pss_encode<D: Digest, R: RngCore>(
     let h_len = D::OUTPUT_LEN;
     let s_len = salt_len;
     let em_len = em_bits.div_ceil(8);
-    if em_len < h_len + s_len + 2 {
+    // Checked arithmetic: `salt_len` is caller-supplied and a huge value
+    // (`usize::MAX - 1`, say) made `h_len + s_len + 2` wrap, passing the
+    // bound check and then panicking on the `em[db_len - s_len..]` slice.
+    // RFC 8017 §9.1.1 step 3 says "emLen < hLen + sLen + 2 ⇒ encoding error".
+    let min_len = h_len
+        .checked_add(s_len)
+        .and_then(|v| v.checked_add(2))
+        .ok_or(Error::MessageTooLong)?;
+    if em_len < min_len {
         return Err(Error::MessageTooLong);
     }
     if em.len() != em_len {
@@ -1051,7 +1059,10 @@ fn emsa_pss_verify<D: Digest>(
     let salt: &[u8] = match salt_len {
         Some(n) => {
             // Fixed salt length: the 0x01 separator sits at a known offset.
-            if db_len < n + 1 {
+            // `n` is caller-supplied, so `n + 1` must not wrap — an
+            // `usize::MAX` salt length used to wrap to 0, pass this bound
+            // check, and then index `db[ps_len]` out of bounds.
+            if n.checked_add(1).is_none_or(|need| db_len < need) {
                 return Err(Error::Verification);
             }
             let ps_len = db_len - n - 1;
