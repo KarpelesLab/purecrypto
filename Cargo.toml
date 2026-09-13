@@ -136,7 +136,7 @@ bip340 = ["hazmat-secp256k1", "hash", "rng"]
 # ECDSA sign-to-contract: commit to arbitrary data in a signature's nonce.
 zkp-sign-to-contract = ["hazmat-secp256k1", "hash", "rng"]
 # ECDSA adaptor signatures ("encrypted signatures") for DLCs and atomic swaps.
-zkp-adaptor = ["hazmat-secp256k1", "hash", "rng", "alloc"]
+zkp-adaptor = ["hazmat-secp256k1", "hash", "rng"]
 # Pedersen commitments over secp256k1 plus the second generator H.
 zkp-pedersen = ["hazmat-secp256k1", "hash", "rng"]
 # Borromean-ring range proofs over Pedersen commitments (Confidential Assets).

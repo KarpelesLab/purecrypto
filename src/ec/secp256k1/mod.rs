@@ -305,6 +305,7 @@ impl AffinePoint {
     /// would silently break the constant's security properties.
     ///
     /// A `debug_assert!` checks the curve equation in debug builds.
+    #[cfg(any(feature = "zkp-pedersen", test))]
     pub(crate) fn from_hex_unchecked(x_hex: &str, y_hex: &str) -> AffinePoint {
         let x = fe_from_hex(x_hex);
         let y = fe_from_hex(y_hex);
@@ -347,6 +348,7 @@ impl AffinePoint {
     /// secret (the Confidential Assets per-asset generator is derived from a
     /// secret asset tag). Only the validation failures branch, and a caller
     /// that has just computed a point on the curve never hits them.
+    #[cfg(any(feature = "zkp-pedersen", test))]
     pub(crate) fn from_xy_be_bytes(x: &[u8; 32], y: &[u8; 32]) -> Result<AffinePoint, Error> {
         let f = field();
         let x = f
