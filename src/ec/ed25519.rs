@@ -149,13 +149,12 @@ impl Ed25519PrivateKey {
     }
 }
 
-/// Best-effort wipe of a transient secret buffer: overwrite with zeros and
-/// route the read through a `black_box` barrier so LLVM cannot elide the
-/// stores as dead (the crate-wide manual-wipe convention).
+/// Best-effort wipe of a transient secret buffer via
+/// [`crate::zeroize::Zeroize`]: volatile stores plus a compiler fence, so
+/// LLVM cannot elide them as dead stores.
 #[inline]
 fn wipe(buf: &mut [u8]) {
-    buf.fill(0);
-    let _ = core::hint::black_box(&*buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// PKCS#8 v1 (RFC 8410) private-key serialization.

@@ -114,12 +114,12 @@ fn random_scalar<R: RngCore>(n: &BoxedUint, rng: &mut R) -> BoxedUint {
 }
 
 /// Best-effort wipe of a heap buffer holding secret material (a scalar's raw
-/// bytes, a KDF key stream, the shared point `x2 ‖ y2`): overwrite with zeros
-/// and route the read through a `black_box` barrier so LLVM cannot elide the
-/// stores as dead. Mirrors `boxed::random_scalar`.
+/// bytes, a KDF key stream, the shared point `x2 ‖ y2`) via
+/// [`crate::zeroize::Zeroize`]: volatile stores plus a compiler fence, so LLVM
+/// cannot elide them as dead stores. Mirrors `boxed::random_scalar`.
+#[inline]
 fn wipe(buf: &mut [u8]) {
-    buf.fill(0);
-    let _ = core::hint::black_box(&*buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// The 32-byte big-endian encoding of a field element / scalar.

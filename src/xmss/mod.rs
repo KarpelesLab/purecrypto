@@ -1158,12 +1158,12 @@ fn validate_raw_sk(p: &Params, raw: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// Wipes a secret byte buffer through [`crate::zeroize::Zeroize`]: volatile
+/// stores plus a compiler fence, so the writes cannot be elided as dead stores.
 #[cfg(feature = "alloc")]
+#[inline]
 fn wipe(v: &mut [u8]) {
-    for b in v.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&v);
+    crate::zeroize::Zeroize::zeroize(v);
 }
 
 // ---------------------------------------------------------------------------

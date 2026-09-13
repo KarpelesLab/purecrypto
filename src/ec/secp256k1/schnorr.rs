@@ -124,12 +124,12 @@ fn tagged_hash_secret(tag: &str, msgs: &[&[u8]]) -> [u8; 32] {
     result
 }
 
-/// Best-effort wipe of a 32-byte secret buffer, with an optimization barrier so
-/// the stores are not elided (the idiom used by `ecdsa` and `secp256k1::Scalar`).
+/// Best-effort wipe of a 32-byte secret buffer via
+/// [`crate::zeroize::Zeroize`]: volatile stores plus a compiler fence, so the
+/// stores cannot be elided as dead.
 #[inline]
 fn wipe(buf: &mut [u8; 32]) {
-    buf.fill(0);
-    let _ = core::hint::black_box(&buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// BIP340 `lift_x`: the point `P` with `x(P) = x` and even `Y`.

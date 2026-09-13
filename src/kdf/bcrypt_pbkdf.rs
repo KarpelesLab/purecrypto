@@ -129,14 +129,12 @@ pub fn bcrypt_pbkdf(
     Ok(out)
 }
 
-/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
-/// with `core::hint::black_box` so the writes are not elided as dead
-/// stores.
+/// Best-effort wipe of a secret buffer via [`crate::zeroize::Zeroize`]
+/// (volatile stores plus a compiler fence, so the writes are not elided as
+/// dead stores).
+#[inline]
 fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// Inner PRF: 32-byte output from a 64-byte `sha2pass` "key" and a

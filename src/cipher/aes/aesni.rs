@@ -65,8 +65,10 @@ pub(super) unsafe fn decrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
 }
 
 /// Best-effort wipe of a preloaded `__m128i` schedule (or block group) before
-/// the frame is released: zero every lane, then `black_box` so LLVM cannot
-/// drop the stores as dead. The vectors are usually in registers, but with 15
+/// the frame is released: a **volatile** zero store per lane followed by a
+/// compiler fence, the same contract as [`crate::zeroize::Zeroize`] (which
+/// cannot be used directly: `__m128i` is a vendor vector type, not a
+/// `DefaultIsZeroes` scalar). The vectors are usually in registers, but with 15
 /// keys plus 8 pipelined blocks the allocator does spill, and the spill slots
 /// would otherwise keep the round keys (from which the AES key is trivially
 /// recovered) alive on the stack. Same idiom as the `Aes*` round-key `Drop`.
@@ -74,9 +76,13 @@ pub(super) unsafe fn decrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
 #[target_feature(enable = "sse2")]
 unsafe fn wipe(v: &mut [__m128i]) {
     for x in v.iter_mut() {
-        *x = _mm_setzero_si128();
+        // SAFETY: `x` is a live `&mut __m128i`, hence non-null, properly
+        // aligned and exclusively held; a volatile store of a zero vector
+        // through it is what `*x = _mm_setzero_si128()` does, minus the
+        // optimizer's licence to treat it as a dead store.
+        unsafe { core::ptr::write_volatile(x, _mm_setzero_si128()) };
     }
-    let _ = core::hint::black_box(v);
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 }
 
 /// Forward permutation over independent 16-byte blocks, pipelining 8 at a time

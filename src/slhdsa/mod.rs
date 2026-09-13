@@ -29,13 +29,12 @@ use params::{MAX_CONTEXT, MAX_K, MAX_M, MAX_N, MAX_WOTS_LEN, Params, SETS};
 use crate::ct::ConstantTimeEq;
 use crate::rng::{CryptoRng, RngCore};
 
-/// Zeroizes `v` before it drops; `black_box` keeps the writes from being
-/// eliminated as dead stores (the wipe idiom used by the key epilogues below).
+/// Zeroizes `v` before it drops, via [`crate::zeroize::Zeroize`]: volatile
+/// stores plus a compiler fence, so the writes cannot be eliminated as dead
+/// stores (the wipe idiom used by the key epilogues below).
+#[inline]
 fn wipe(v: &mut [u8]) {
-    for b in v.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&*v);
+    crate::zeroize::Zeroize::zeroize(v);
 }
 
 /// Errors from SLH-DSA operations.

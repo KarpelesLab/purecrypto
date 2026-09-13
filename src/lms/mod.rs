@@ -92,12 +92,11 @@ pub enum Error {
 /// public root and imposes no height limit.
 const LEGACY_RECOMPUTE_MAX_H: u32 = 15;
 
-/// Wipes a byte buffer in a way the optimizer cannot elide.
+/// Wipes a byte buffer through [`crate::zeroize::Zeroize`]: volatile stores
+/// plus a compiler fence, so the optimizer cannot elide them.
+#[inline]
 fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 // ===================================================================
