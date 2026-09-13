@@ -19,6 +19,9 @@ use super::ecdh::EcdhPrivateKey;
 use super::ecdsa::{EcdsaPrivateKey, EcdsaPublicKey, Signature};
 use super::ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 use super::ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
+use super::secp256k1_ecdsa::{
+    Secp256k1EcdsaPrivateKey, Secp256k1EcdsaPublicKey, Secp256k1EcdsaSignature,
+};
 use super::sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 use super::x448::{X448PrivateKey, X448PublicKey};
 use super::x25519::{X25519PrivateKey, X25519PublicKey};
@@ -172,6 +175,75 @@ impl PublicKey for EcdsaPublicKey {
                 Signature::from_bytes(&bytes)
             }
             SigEncoding::Der => Signature::from_der(sig).map_err(|_| Error::Signature)?,
+        };
+        if prehashed {
+            self.verify_prehash(msg, &signature)
+        } else {
+            dispatch_hash!(hash, |D| { self.verify::<D>(msg, &signature) })
+        }
+        .map_err(|_| Error::Signature)
+    }
+}
+
+// ----------------------------------------------------------------------------
+// ECDSA over secp256k1 (fixed, no-alloc path) — honours hash, prehashed,
+// sig_encoding. Same shape as the P-256 block above.
+// ----------------------------------------------------------------------------
+
+impl PrivateKey for Secp256k1EcdsaPrivateKey {
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::Secp256k1
+    }
+    fn public_key(&self) -> Result<Box<dyn PublicKey>, Error> {
+        Ok(Box::new(self.public_key()))
+    }
+    fn sign(
+        &self,
+        msg: &[u8],
+        params: &SignParams<'_>,
+        _rng: &mut dyn CryptoRngCore,
+    ) -> Result<Vec<u8>, Error> {
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let sig = dispatch_hash!(hash, |D| {
+            if prehashed {
+                self.sign_prehash::<D>(msg)
+            } else {
+                self.sign::<D>(msg)
+            }
+        })
+        .map_err(|_| Error::Signature)?;
+        Ok(match enc {
+            SigEncoding::Raw => sig.to_bytes().to_vec(),
+            SigEncoding::Der => sig.to_der(),
+        })
+    }
+}
+
+impl PublicKey for Secp256k1EcdsaPublicKey {
+    fn algorithm(&self) -> Algorithm {
+        Algorithm::Secp256k1
+    }
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn verify(&self, msg: &[u8], sig: &[u8], params: &SignParams<'_>) -> Result<(), Error> {
+        let mut p = params.reader();
+        let hash = p.hash();
+        let prehashed = p.prehashed();
+        let enc = p.sig_encoding();
+        p.finish()?;
+        let signature = match enc {
+            SigEncoding::Raw => {
+                let bytes: [u8; 64] = sig.try_into().map_err(|_| Error::Signature)?;
+                Secp256k1EcdsaSignature::from_bytes(&bytes)
+            }
+            SigEncoding::Der => {
+                Secp256k1EcdsaSignature::from_der(sig).map_err(|_| Error::Signature)?
+            }
         };
         if prehashed {
             self.verify_prehash(msg, &signature)

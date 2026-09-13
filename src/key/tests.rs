@@ -502,11 +502,17 @@ fn heterogeneous_private_keys_are_object_safe() {
         Box::new(crate::ec::Ed25519PrivateKey::generate(&mut r)),
         Box::new(crate::ec::ecdsa::EcdsaPrivateKey::generate(&mut r)),
         Box::new(crate::ec::X25519PrivateKey::generate(&mut r)),
+        Box::new(crate::ec::Secp256k1EcdsaPrivateKey::generate(&mut r)),
     ];
     let algs: Vec<Algorithm> = keys.iter().map(|k| k.algorithm()).collect();
     assert_eq!(
         algs,
-        alloc::vec![Algorithm::Ed25519, Algorithm::P256, Algorithm::X25519]
+        alloc::vec![
+            Algorithm::Ed25519,
+            Algorithm::P256,
+            Algorithm::X25519,
+            Algorithm::Secp256k1
+        ]
     );
 }
 
