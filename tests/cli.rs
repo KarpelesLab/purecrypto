@@ -4267,9 +4267,11 @@ fn q_client_q_server_roundtrip() {
     // before the server is ready. `q_server` stays up ~30s and is one-shot, and
     // a run that yields no body means no handshake completed — so the server is
     // still listening and the client can safely be retried until it answers.
-    // (The retries fit well inside the server's 30s `overall_deadline`.)
+    // (The retries fit well inside the server's 30s `overall_deadline`: 40
+    // attempts of a 200ms sleep plus a fast-failing client run stay under it,
+    // and 15 attempts proved too few on a loaded Windows runner.)
     let mut out = String::new();
-    for _ in 0..15 {
+    for _ in 0..40 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let (o, _ok) = run(
             &[
