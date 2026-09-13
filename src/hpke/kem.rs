@@ -15,6 +15,7 @@ use super::{Error, HpkeKdf};
 use crate::ec::boxed::BoxedEcdhPrivateKey;
 use crate::ec::{BoxedEcdsaPublicKey, CurveId};
 use crate::rng::RngCore;
+use crate::zeroize::Zeroizing;
 use alloc::vec::Vec;
 
 /// HPKE KEM identifiers (RFC 9180 §7.1).
@@ -158,6 +159,7 @@ impl HpkeKem {
                 let mut s = [0u8; 32];
                 s.copy_from_slice(sk);
                 let pk = crate::ec::x25519::X25519PrivateKey::from_bytes(s);
+                super::wipe(&mut s);
                 Ok(pk.public_key().to_vec())
             }
         }
@@ -187,10 +189,14 @@ impl HpkeKem {
                 s.copy_from_slice(sk);
                 let mut p = [0u8; 32];
                 p.copy_from_slice(pk);
-                crate::ec::x25519::X25519PrivateKey::from_bytes(s)
+                let out = crate::ec::x25519::X25519PrivateKey::from_bytes(s)
                     .diffie_hellman(&p)
                     .map(|out| out.to_vec())
-                    .map_err(|_| Error::InvalidDhOutput)
+                    .map_err(|_| Error::InvalidDhOutput);
+                // `s` is a copy of the private scalar (`from_bytes` takes it by
+                // value, and `[u8; 32]` is `Copy`): wipe our copy.
+                super::wipe(&mut s);
+                out
             }
         }
     }
@@ -202,7 +208,9 @@ impl HpkeKem {
     pub(crate) fn derive_key_pair(self, ikm: &[u8]) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let suite_id = kem_suite_id(self.id());
         let kdf = self.kdf();
-        let dkp_prk = labeled_extract(kdf, b"", &suite_id, b"dkp_prk", ikm);
+        // `dkp_prk` keys every candidate expansion below: wipe it on every
+        // exit path, including the error ones.
+        let dkp_prk = Zeroizing::new(labeled_extract(kdf, b"", &suite_id, b"dkp_prk", ikm));
 
         match self.nist_curve() {
             Some(curve) => {
@@ -227,14 +235,23 @@ impl HpkeKem {
                         let pk = sk.public_key().to_sec1();
                         return Ok((bytes, pk));
                     }
+                    // A rejected candidate is still key-derived material:
+                    // wipe it rather than letting the allocation be freed
+                    // with the bytes intact.
+                    super::wipe(&mut bytes);
                 }
                 Err(Error::DeriveKeyPair)
             }
             None => {
                 let mut sk = alloc::vec![0u8; 32];
                 labeled_expand(kdf, &dkp_prk, &suite_id, b"sk", b"", &mut sk);
-                let pk = self.pk_from_sk(&sk)?;
-                Ok((sk, pk))
+                match self.pk_from_sk(&sk) {
+                    Ok(pk) => Ok((sk, pk)),
+                    Err(e) => {
+                        super::wipe(&mut sk);
+                        Err(e)
+                    }
+                }
             }
         }
     }
@@ -245,7 +262,10 @@ impl HpkeKem {
     pub fn generate_key_pair<R: RngCore>(self, rng: &mut R) -> Result<(Vec<u8>, Vec<u8>), Error> {
         let mut ikm = alloc::vec![0u8; self.n_sk()];
         rng.fill_bytes(&mut ikm);
-        self.derive_key_pair(&ikm)
+        let out = self.derive_key_pair(&ikm);
+        // The seed derives the private key: wipe it on every path.
+        super::wipe(&mut ikm);
+        out
     }
 
     /// `ExtractAndExpand(dh, kem_context)` (RFC 9180 §4.1): the DHKEM

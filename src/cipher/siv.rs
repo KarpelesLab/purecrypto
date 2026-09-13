@@ -17,6 +17,7 @@ use super::cmac::Cmac;
 use super::ctr::Ctr;
 use super::{Aes128, Aes256, TagMismatch};
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, Zeroizing};
 
 /// Doubles a 128-bit value in GF(2¹²⁸) per RFC 5297 §2.3 (same field and
 /// big-endian convention as CMAC's `dbl`).
@@ -119,16 +120,18 @@ impl AesSiv {
         for s in ad {
             // D = dbl(D) xor AES-CMAC(K, Si)
             d = dbl(d);
-            let cs = self.cmac(s);
+            let mut cs = self.cmac(s);
             for i in 0..16 {
                 d[i] ^= cs[i];
             }
+            cs.zeroize();
         }
 
         // Final string Sn = plaintext.
-        if plaintext.len() >= 16 {
-            // T = Sn xorend D, then V = AES-CMAC(K, T).
-            let mut t = plaintext.to_vec();
+        let v = if plaintext.len() >= 16 {
+            // T = Sn xorend D, then V = AES-CMAC(K, T). `t` is a copy of the
+            // plaintext, so it is wiped when the guard drops.
+            let mut t = Zeroizing::new(plaintext.to_vec());
             xorend(&mut t, &d);
             self.cmac(&t)
         } else {
@@ -138,8 +141,13 @@ impl AesSiv {
                 t[i] ^= *b;
             }
             t[plaintext.len()] ^= 0x80;
-            self.cmac(&t)
-        }
+            let v = self.cmac(&t);
+            t.zeroize();
+            v
+        };
+        // `D` is CMAC output under the S2V key.
+        d.zeroize();
+        v
     }
 
     /// Builds the CTR IV `Q` from `V` by clearing bit 31 and bit 63 of the
@@ -209,10 +217,9 @@ impl AesSiv {
         if bool::from(expected.ct_eq(&v)) {
             Ok(plaintext)
         } else {
-            // Discard the unauthenticated plaintext.
-            for b in plaintext.iter_mut() {
-                *b = 0;
-            }
+            // Discard the unauthenticated plaintext (volatile wipe, so the
+            // stores cannot be elided as dead).
+            plaintext.zeroize();
             Err(TagMismatch)
         }
     }

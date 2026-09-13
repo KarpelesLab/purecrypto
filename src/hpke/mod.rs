@@ -120,15 +120,11 @@ impl core::error::Error for Error {}
 
 pub use schedule::{ReceiverContext, SenderContext};
 
-/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence
-/// with `core::hint::black_box` so the writes are not elided as dead
-/// stores. Same pattern the rest of the crate uses for secret
-/// intermediates.
+/// Best-effort wipe of a secret buffer, through the crate's
+/// [`zeroize`](crate::zeroize) helpers: volatile stores plus a compiler
+/// fence, so the writes cannot be elided as dead stores.
 fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// `SetupBaseS`: derive a [`SenderContext`] for the given recipient

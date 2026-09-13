@@ -72,6 +72,16 @@ impl Polyval {
     }
 }
 
+impl Drop for Polyval {
+    fn drop(&mut self) {
+        // `h` is the per-message POLYVAL key and `acc` the running hash: both
+        // are secret, so wipe them rather than leaving them on the stack.
+        use crate::zeroize::Zeroize;
+        self.h.zeroize();
+        self.acc.zeroize();
+    }
+}
+
 /// The two block-cipher choices GCM-SIV is instantiated over.
 enum Cipher {
     Aes128(Aes128),

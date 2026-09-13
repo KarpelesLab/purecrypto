@@ -71,6 +71,16 @@ impl<'a, C: BlockCipher> CbcMac<'a, C> {
     }
 }
 
+impl<C: BlockCipher> Drop for CbcMac<'_, C> {
+    fn drop(&mut self) {
+        // The chaining value is the in-progress CBC-MAC (the CCM tag before
+        // masking) and `pending` holds plaintext bytes: wipe both.
+        use crate::zeroize::Zeroize;
+        self.state.zeroize();
+        self.pending.zeroize();
+    }
+}
+
 /// AES-CCM context with a `M`-byte tag.
 ///
 /// `M` must be one of `{4, 6, 8, 10, 12, 14, 16}`; instantiating with any
@@ -261,6 +271,8 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
             *byte ^= ks[pos];
             pos += 1;
         }
+        // The last block of keystream would otherwise stay on the stack.
+        crate::zeroize::Zeroize::zeroize(&mut ks);
     }
 }
 

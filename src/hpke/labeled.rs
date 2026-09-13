@@ -6,6 +6,7 @@
 //! may happen on the same `ikm` byte string.
 
 use super::HpkeKdf;
+use crate::zeroize::Zeroizing;
 use alloc::vec::Vec;
 
 /// HPKE version tag (RFC 9180 §4.0). The string is the same for every
@@ -25,8 +26,13 @@ pub(crate) fn labeled_extract(
     label: &[u8],
     ikm: &[u8],
 ) -> Vec<u8> {
-    let mut labeled_ikm =
-        Vec::with_capacity(HPKE_VERSION.len() + suite_id.len() + label.len() + ikm.len());
+    // `ikm` is key material (a DH output, a PSK, a DeriveKeyPair seed), so the
+    // concatenation buffer holds a copy of a secret: wipe it on the way out.
+    // The capacity is reserved up front so the `Vec` never reallocates and
+    // leaves an unwiped copy behind.
+    let mut labeled_ikm = Zeroizing::new(Vec::with_capacity(
+        HPKE_VERSION.len() + suite_id.len() + label.len() + ikm.len(),
+    ));
     labeled_ikm.extend_from_slice(HPKE_VERSION);
     labeled_ikm.extend_from_slice(suite_id);
     labeled_ikm.extend_from_slice(label);

@@ -64,6 +64,8 @@ impl<C: BlockCipher> Cmac<C> {
         cipher.encrypt_block(&mut l);
         let k1 = dbl(l);
         let k2 = dbl(k1);
+        // `L = E_K(0)` is as secret as the subkeys derived from it.
+        crate::zeroize::Zeroize::zeroize(&mut l);
         Cmac {
             cipher,
             k1,
