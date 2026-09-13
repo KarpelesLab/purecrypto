@@ -322,6 +322,15 @@ impl ServerConnectionAuto {
         }
     }
 
+    /// `true` only once a resolved engine actually completed its handshake.
+    fn is_handshake_complete(&self) -> bool {
+        match &self.resolved {
+            Some(ResolvedServer::Tls13(c)) => c.is_handshake_complete(),
+            Some(ResolvedServer::Tls12(c)) => c.is_handshake_complete(),
+            None => false,
+        }
+    }
+
     fn received_close_notify(&self) -> bool {
         match &self.resolved {
             Some(ResolvedServer::Tls13(c)) => c.received_close_notify(),
@@ -533,6 +542,14 @@ impl ClientConnectionAuto {
         }
     }
 
+    /// `true` only once the live engine actually completed its handshake.
+    fn is_handshake_complete(&self) -> bool {
+        match &self.inner {
+            ClientInner::Tls13(c) => c.is_handshake_complete(),
+            ClientInner::Tls12(c) => c.is_handshake_complete(),
+        }
+    }
+
     fn received_close_notify(&self) -> bool {
         match &self.inner {
             ClientInner::Tls13(c) => c.received_close_notify(),
@@ -712,6 +729,13 @@ impl Connection {
     pub fn handshake(&mut self) -> Result<HandshakeStatus, Error> {
         if self.is_handshake_complete() {
             return Ok(HandshakeStatus::Complete);
+        }
+        // The engine closed without completing (a failed handshake, or a peer
+        // alert such as an injected `close_notify`). Never report progress —
+        // a caller that ignored the original error must not be able to loop
+        // back in here and be told the handshake is fine.
+        if self.handshake_failed() {
+            return Err(Error::InappropriateState);
         }
         // Refill DTLS pending queue.
         #[cfg(feature = "dtls")]
@@ -1073,12 +1097,18 @@ impl Connection {
     /// True once the handshake has completed.
     pub fn is_handshake_complete(&self) -> bool {
         match &self.inner {
-            Engine::ClientTls13(c) => !c.is_handshaking(),
-            Engine::ClientTls12(c) => !c.is_handshaking(),
-            Engine::ServerTls13(c) => !c.is_handshaking(),
-            Engine::ServerTls12(c) => !c.is_handshaking(),
-            Engine::ServerTlsAuto(c) => !c.is_handshaking(),
-            Engine::ClientTlsAuto(c) => !c.is_handshaking(),
+            // NOT `!is_handshaking()`: the engines also park in their closed
+            // state when the handshake *fails* (a protocol error, or a peer
+            // alert — including an injected pre-handshake `close_notify`).
+            // Completion must be reported only for a handshake that really
+            // finished, so an attacker cannot make an unauthenticated
+            // connection look established.
+            Engine::ClientTls13(c) => c.is_handshake_complete(),
+            Engine::ClientTls12(c) => c.is_handshake_complete(),
+            Engine::ServerTls13(c) => c.is_handshake_complete(),
+            Engine::ServerTls12(c) => c.is_handshake_complete(),
+            Engine::ServerTlsAuto(c) => c.is_handshake_complete(),
+            Engine::ClientTlsAuto(c) => c.is_handshake_complete(),
             #[cfg(feature = "dtls")]
             Engine::ClientDtls12(c) => c.is_handshake_complete(),
             #[cfg(feature = "dtls")]
@@ -1087,6 +1117,25 @@ impl Connection {
             Engine::ServerDtls12(c) => c.is_handshake_complete(),
             #[cfg(feature = "dtls")]
             Engine::ServerDtls13(c) => c.is_handshake_complete(),
+        }
+    }
+
+    /// True when a TLS engine has closed without ever completing its
+    /// handshake — i.e. the handshake failed (protocol error, or a peer alert
+    /// such as an injected pre-handshake `close_notify`).
+    fn handshake_failed(&self) -> bool {
+        match &self.inner {
+            Engine::ClientTls13(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            Engine::ClientTls12(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            Engine::ServerTls13(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            Engine::ServerTls12(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            Engine::ServerTlsAuto(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            Engine::ClientTlsAuto(c) => !c.is_handshaking() && !c.is_handshake_complete(),
+            #[cfg(feature = "dtls")]
+            Engine::ClientDtls12(_)
+            | Engine::ClientDtls13(_)
+            | Engine::ServerDtls12(_)
+            | Engine::ServerDtls13(_) => false,
         }
     }
 
@@ -1742,6 +1791,7 @@ mod tests {
     use super::super::config::EntropySource;
     use super::*;
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+    use crate::tls::AlertDescription;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
@@ -3173,5 +3223,104 @@ mod tests {
             client.is_handshake_complete() && server.is_handshake_complete(),
             "device-signed handshake must complete and verify"
         );
+    }
+
+    /// A plaintext `close_notify` record injected before the handshake
+    /// completes must be a hard error on every engine, and must never make
+    /// the connection report a completed (i.e. peer-authenticated) handshake
+    /// — not even when the caller ignores the error and drives again.
+    #[test]
+    fn injected_close_notify_before_handshake_never_completes() {
+        // A warning-level close_notify in a TLS 1.2 plaintext record.
+        const CLOSE_NOTIFY: &[u8] = &[21, 0x03, 0x03, 0, 2, 1, 0];
+
+        let clients = [
+            ("client-1.2", tls12_client_cfg()),
+            ("client-1.3", tls13_client_cfg(None)),
+            ("client-auto", auto_client_cfg()),
+        ];
+        for (name, cfg) in clients {
+            let mut c = Connection::client(&cfg).unwrap();
+            // Drain the ClientHello so `drive` cannot report `WantWrite`.
+            let _ = c.pop().unwrap();
+            assert!(
+                matches!(
+                    c.feed(CLOSE_NOTIFY),
+                    Err(Error::AlertReceived(AlertDescription::CloseNotify))
+                ),
+                "{name}: pre-handshake close_notify must be fatal"
+            );
+            assert!(!c.is_handshake_complete(), "{name}");
+            assert!(!c.received_close_notify(), "{name}");
+            assert!(c.peer_certificates().is_empty(), "{name}");
+            // A caller that ignores the error must not be told all is well.
+            assert!(c.handshake().is_err(), "{name}");
+            assert!(c.drive().is_err(), "{name}");
+            assert!(c.send(b"secret").is_err(), "{name}");
+        }
+
+        let servers = [
+            ("server-1.2", tls12_server_cfg()),
+            ("server-1.3", tls13_server_cfg(false)),
+        ];
+        for (name, cfg) in servers {
+            let mut s = Connection::server(&cfg).unwrap();
+            assert!(
+                matches!(
+                    s.feed(CLOSE_NOTIFY),
+                    Err(Error::AlertReceived(AlertDescription::CloseNotify))
+                ),
+                "{name}: pre-handshake close_notify must be fatal"
+            );
+            assert!(!s.is_handshake_complete(), "{name}");
+            assert!(!s.received_close_notify(), "{name}");
+            assert!(s.handshake().is_err(), "{name}");
+            assert!(s.drive().is_err(), "{name}");
+            assert!(s.send(b"secret").is_err(), "{name}");
+        }
+
+        // The version-spanning server never even resolves an engine: it must
+        // report neither completion nor progress.
+        let mut auto = Connection::server(&auto_server_cfg()).unwrap();
+        let _ = auto.feed(CLOSE_NOTIFY);
+        assert!(!auto.is_handshake_complete());
+        assert!(auto.send(b"secret").is_err());
+    }
+
+    /// The same injection *mid-handshake* (after the ServerHello flight, while
+    /// the client is still waiting for the server's Finished) is equally fatal.
+    #[test]
+    fn close_notify_mid_handshake_is_fatal() {
+        const CLOSE_NOTIFY: &[u8] = &[21, 0x03, 0x03, 0, 2, 1, 0];
+        let mut client = Connection::client(&tls12_client_cfg()).unwrap();
+        let mut server = Connection::server(&tls12_server_cfg()).unwrap();
+        let _ = client.handshake();
+        let ch = client.pop().unwrap();
+        server.feed(&ch).unwrap();
+        let flight = server.pop().unwrap();
+        client.feed(&flight).unwrap();
+        assert!(!client.is_handshake_complete());
+        assert!(matches!(
+            client.feed(CLOSE_NOTIFY),
+            Err(Error::AlertReceived(AlertDescription::CloseNotify))
+        ));
+        assert!(!client.is_handshake_complete());
+        assert!(client.handshake().is_err());
+    }
+
+    /// A close_notify *after* the handshake completed is still the graceful
+    /// shutdown it always was.
+    #[test]
+    fn close_notify_after_handshake_is_graceful() {
+        let mut client = Connection::client(&tls12_client_cfg()).unwrap();
+        let mut server = Connection::server(&tls12_server_cfg()).unwrap();
+        drive_pair(&mut client, &mut server);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
+        server.close().unwrap();
+        let bye = server.pop().unwrap();
+        client.feed(&bye).unwrap();
+        assert!(client.received_close_notify());
+        // Completion reporting is sticky: the handshake really did complete.
+        assert!(client.is_handshake_complete());
     }
 }

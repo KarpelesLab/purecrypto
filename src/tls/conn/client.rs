@@ -633,6 +633,10 @@ pub struct ClientConnection {
     /// transport close (truncation attack) — `state` alone can't, since
     /// `fail()` also parks the connection in [`State::Closed`].
     received_close_notify: bool,
+    /// True once the handshake actually completed (the engine reached
+    /// [`State::Connected`]). Sticky across a later close, and — unlike
+    /// `!is_handshaking()` — never set by a pre-completion failure or alert.
+    handshake_completed: bool,
 
     x25519: X25519PrivateKey,
     p256: BoxedEcdhPrivateKey,
@@ -1360,6 +1364,7 @@ impl ClientConnection {
             state: State::WaitServerHello,
             pending_flight: None,
             received_close_notify: false,
+            handshake_completed: false,
             x25519,
             p256,
             p384,
@@ -1853,6 +1858,13 @@ impl ClientConnection {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the handshake has actually completed (peer authenticated).
+    /// Unlike `!is_handshaking()`, this stays `false` when the connection was
+    /// closed — by an error or a peer alert — before completion.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_completed
+    }
+
     /// True once a ServerHello selecting TLS 1.2 has flagged a downgrade (only
     /// possible when this client offered 1.2). The version-spanning front-end
     /// then hands [`sent_client_hello`](Self::sent_client_hello) to a TLS 1.2
@@ -2018,6 +2030,14 @@ impl ClientConnection {
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
                     if alert.description == AlertDescription::CloseNotify {
+                        // Before the handshake completes the peer is not
+                        // authenticated (and an unprotected alert is trivially
+                        // injectable): a close_notify there is a handshake
+                        // failure, never a graceful shutdown.
+                        if !self.handshake_completed {
+                            self.state = State::Closed;
+                            return Err(Error::AlertReceived(AlertDescription::CloseNotify));
+                        }
                         self.received_close_notify = true;
                         self.state = State::Closed;
                         return Ok(());
@@ -3564,6 +3584,7 @@ impl ClientConnection {
         // the connection.
         self.core.transcript.seal();
         self.state = State::Connected;
+        self.handshake_completed = true;
         Ok(())
     }
 

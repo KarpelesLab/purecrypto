@@ -508,6 +508,11 @@ pub struct ClientConnection12 {
     /// transport close (truncation attack) — `state` alone can't, since
     /// failure paths also park the connection in [`State::Closed`].
     received_close_notify: bool,
+    /// True once the handshake has actually completed (the server's Finished
+    /// verified and the engine entered [`State::Connected`]). Sticky: it stays
+    /// set after a later transition to [`State::Closed`], and — unlike
+    /// `!is_handshaking()` — is never set by a pre-completion failure or alert.
+    handshake_completed: bool,
 
     /// Inbound TLS bytes to parse into records.
     inbuf: Vec<u8>,
@@ -731,6 +736,7 @@ impl ClientConnection12 {
             server_name: String::from(server_name),
             state: State::WaitServerHello,
             received_close_notify: false,
+            handshake_completed: false,
             inbuf: Vec::new(),
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
@@ -853,6 +859,7 @@ impl ClientConnection12 {
             server_name: String::from(server_name),
             state: State::WaitServerHello,
             received_close_notify: false,
+            handshake_completed: false,
             inbuf: Vec::new(),
             outbuf: Vec::new(), // ClientHello already sent by the 1.3 engine.
             hs_pending: Vec::new(),
@@ -1137,6 +1144,14 @@ impl ClientConnection12 {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the handshake has actually completed: the server's Finished
+    /// verified. Unlike `!is_handshaking()`, this stays `false` when the
+    /// connection was closed (by an error or a peer alert) before completion,
+    /// so it is the signal to base "peer authenticated" decisions on.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_completed
+    }
+
     /// True once the peer's close_notify alert has been processed.
     ///
     /// After transport EOF, a `false` here means the TLS stream was cut
@@ -1214,6 +1229,16 @@ impl ClientConnection12 {
                     // and we accept (logging via the consumer) rather than
                     // tear the connection down.
                     match alert.description {
+                        // A close_notify before the handshake completed is
+                        // not a graceful shutdown: the peer was never
+                        // authenticated (and a plaintext alert is trivially
+                        // injectable). Fail the handshake hard so no caller
+                        // mistakes the closed engine for a completed one.
+                        AlertDescription::CloseNotify if !self.handshake_completed => {
+                            self.state = State::Closed;
+                            self.ccs_window_open = false;
+                            return Err(Error::AlertReceived(AlertDescription::CloseNotify));
+                        }
                         AlertDescription::CloseNotify => {
                             self.received_close_notify = true;
                             self.state = State::Closed;
@@ -2293,6 +2318,7 @@ impl ClientConnection12 {
             }
             self.transcript.update(raw);
             self.state = State::Connected;
+            self.handshake_completed = true;
             return Ok(());
         }
 
@@ -2372,6 +2398,7 @@ impl ClientConnection12 {
         // No more ChangeCipherSpec allowed.
         self.ccs_window_open = false;
         self.state = State::Connected;
+        self.handshake_completed = true;
         Ok(())
     }
 
@@ -2506,6 +2533,9 @@ impl super::stream::ConnectionIo for ClientConnection12 {
     }
     fn is_handshaking(&self) -> bool {
         ClientConnection12::is_handshaking(self)
+    }
+    fn is_handshake_complete(&self) -> bool {
+        ClientConnection12::is_handshake_complete(self)
     }
     fn send_application_data(&mut self, data: &[u8]) -> Result<(), Error> {
         ClientConnection12::send_application_data(self, data)

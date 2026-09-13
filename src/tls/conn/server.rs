@@ -812,6 +812,10 @@ pub struct ServerConnection<R: RngCore> {
     /// transport close (truncation attack) — `state` alone can't, since
     /// failure paths also park the connection in [`State::Closed`].
     received_close_notify: bool,
+    /// True once the handshake actually completed (the engine reached
+    /// [`State::Connected`]). Sticky across a later close, and — unlike
+    /// `!is_handshaking()` — never set by a pre-completion failure or alert.
+    handshake_completed: bool,
 
     suite: Option<SuiteParams>,
     client_hs_secret: Option<Secret>,
@@ -1010,6 +1014,7 @@ impl<R: RngCore> ServerConnection<R> {
             rng,
             state: State::WaitClientHello,
             received_close_notify: false,
+            handshake_completed: false,
             negotiated_sig_scheme: None,
             pending_flight: None,
             suite: None,
@@ -1263,6 +1268,13 @@ impl<R: RngCore> ServerConnection<R> {
         !matches!(self.state, State::Connected | State::Closed)
     }
 
+    /// True once the handshake has actually completed (peer authenticated).
+    /// Unlike `!is_handshaking()`, this stays `false` when the connection was
+    /// closed — by an error or a peer alert — before completion.
+    pub fn is_handshake_complete(&self) -> bool {
+        self.handshake_completed
+    }
+
     /// True once the peer's close_notify alert has been processed.
     ///
     /// After transport EOF, a `false` here means the TLS stream was cut
@@ -1488,6 +1500,14 @@ impl<R: RngCore> ServerConnection<R> {
                 }
                 Ok(Some(Incoming::Alert(alert))) => {
                     if alert.description == AlertDescription::CloseNotify {
+                        // Before the handshake completes the peer is not
+                        // authenticated (and an unprotected alert is trivially
+                        // injectable): a close_notify there is a handshake
+                        // failure, never a graceful shutdown.
+                        if !self.handshake_completed {
+                            self.state = State::Closed;
+                            return Err(Error::AlertReceived(AlertDescription::CloseNotify));
+                        }
                         self.received_close_notify = true;
                         self.state = State::Closed;
                         return Ok(());
@@ -2985,6 +3005,7 @@ impl<R: RngCore> ServerConnection<R> {
         // the connection.
         self.core.transcript.seal();
         self.state = State::Connected;
+        self.handshake_completed = true;
 
         // Issue one NewSessionTicket if a ticket key is configured. We do
         // this immediately on transition to Connected so the ticket rides

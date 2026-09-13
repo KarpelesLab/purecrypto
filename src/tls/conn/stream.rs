@@ -24,6 +24,10 @@ pub trait ConnectionIo {
     fn process_new_packets(&mut self) -> Result<(), TlsError>;
     /// Whether the handshake is still in progress.
     fn is_handshaking(&self) -> bool;
+    /// Whether the handshake actually completed (peer authenticated). Distinct
+    /// from `!is_handshaking()`, which is also true for a connection that was
+    /// closed — by an error or a peer alert — before completion.
+    fn is_handshake_complete(&self) -> bool;
     /// Queues application data for sending.
     fn send_application_data(&mut self, data: &[u8]) -> Result<(), TlsError>;
     /// Removes and returns any received application plaintext.
@@ -44,6 +48,9 @@ impl ConnectionIo for ClientConnection {
     }
     fn is_handshaking(&self) -> bool {
         ClientConnection::is_handshaking(self)
+    }
+    fn is_handshake_complete(&self) -> bool {
+        ClientConnection::is_handshake_complete(self)
     }
     fn send_application_data(&mut self, data: &[u8]) -> Result<(), TlsError> {
         ClientConnection::send_application_data(self, data)
@@ -68,6 +75,9 @@ impl<R: RngCore> ConnectionIo for ServerConnection<R> {
     }
     fn is_handshaking(&self) -> bool {
         ServerConnection::is_handshaking(self)
+    }
+    fn is_handshake_complete(&self) -> bool {
+        ServerConnection::is_handshake_complete(self)
     }
     fn send_application_data(&mut self, data: &[u8]) -> Result<(), TlsError> {
         ServerConnection::send_application_data(self, data)
@@ -136,6 +146,15 @@ impl<'a, C: ConnectionIo, T: Read + Write> Stream<'a, C, T> {
                     "peer closed during handshake",
                 ));
             }
+        }
+        // The loop also exits when the connection closed *before* completing
+        // (e.g. a peer alert). Never hand back a stream whose peer was never
+        // authenticated.
+        if !self.conn.is_handshake_complete() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TLS connection closed before the handshake completed",
+            ));
         }
         self.flush_tls()
     }
@@ -307,5 +326,44 @@ mod tests {
     #[test]
     fn eof_after_close_notify_is_clean() {
         assert_eq!(eof_after_response(true).unwrap(), 0);
+    }
+
+    /// A `close_notify` injected before the handshake completes must fail the
+    /// adapter's handshake, not hand back a "ready" stream whose peer was
+    /// never authenticated.
+    #[test]
+    fn close_notify_during_handshake_fails_the_adapter() {
+        let (_server_config, cert_der) = rsa_server();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A hostile "server": read the ClientHello, answer with a plaintext
+        // close_notify alert record, then drop the socket.
+        let attacker = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).unwrap();
+            let _ = sock.write_all(&[21, 0x03, 0x03, 0, 2, 1, 0]);
+            let _ = sock.flush();
+        });
+
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let mut sock = TcpStream::connect(addr).unwrap();
+        let mut conn =
+            ClientConnection::new(ClientConfig::new(roots), "localhost", &mut OsRng).unwrap();
+        {
+            let mut tls = Stream::new(&mut conn, &mut sock);
+            let err = tls
+                .complete_handshake()
+                .expect_err("an injected close_notify must fail the handshake");
+            assert!(matches!(
+                err.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof
+            ));
+        }
+        assert!(!conn.is_handshake_complete());
+        assert!(conn.peer_certificates().is_empty());
+        attacker.join().unwrap();
     }
 }
