@@ -112,6 +112,7 @@ use crate::ec::Error;
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 
 /// Largest ring (number of whitelist entries) the encoding can express.
 ///
@@ -267,7 +268,65 @@ fn ring_keys(
     Ok((keys, hasher.finalize()))
 }
 
+/// Domain separator for this module's hedged nonce derivation.
+const NONCE_TAG: &[u8] = b"purecrypto/zkp-whitelist/nonce";
+
+/// Derives the ring nonce `k` and the decoy `s` values from the ring secret,
+/// the transcript, the signer's position and fresh RNG output.
+///
+/// A ring signature loses the signer's key outright if two different messages
+/// are signed with the same nonce, so the nonce must never repeat; drawing it
+/// from the RNG alone puts the key at the mercy of the entropy source (a
+/// VM-snapshot rollback, a fork, a broken CSPRNG). Hedging folds the secret
+/// and the whole transcript into the seed: the derivation is as strong as the
+/// RNG when the RNG is good, and still gives distinct nonces for distinct
+/// statements when it is not.
+///
+/// ```text
+/// seed = SHA256( "purecrypto/zkp-whitelist/nonce" ‖ secret ‖ m32
+///                ‖ BE32(index) ‖ BE32(n) ‖ rng32 )
+/// s_i  = SHA256( seed ‖ BE32(i) )       i = 0 … n−1
+/// k    = SHA256( seed ‖ BE32(0xffffffff) )
+/// ```
+///
+/// each read big-endian and reduced modulo the group order. The values are
+/// private prover randomness, so this changes neither the proof encoding nor
+/// what [`verify`] accepts.
+fn derive_nonces<R: RngCore + CryptoRng>(
+    secret: &Scalar,
+    m: &[u8; 32],
+    index: usize,
+    n: usize,
+    rng: &mut R,
+) -> (Scalar, Vec<Scalar>) {
+    let mut rand = [0u8; 32];
+    rng.fill_bytes(&mut rand);
+    let mut secret_bytes = secret.to_bytes_be();
+    let mut h = Sha256::new();
+    h.update(NONCE_TAG);
+    h.update(&secret_bytes);
+    h.update(m);
+    h.update(&(index as u32).to_be_bytes());
+    h.update(&(n as u32).to_be_bytes());
+    h.update(&rand);
+    let mut seed = h.finalize();
+    secret_bytes.zeroize();
+    rand.zeroize();
+
+    let derive = |counter: u32| {
+        let mut h = Sha256::new();
+        h.update(&seed);
+        h.update(&counter.to_be_bytes());
+        Scalar::from_bytes_be_reduce(&h.finalize())
+    };
+    let s: Vec<Scalar> = (0..n).map(|i| derive(i as u32)).collect();
+    let nonce = derive(u32::MAX);
+    seed.zeroize();
+    (nonce, s)
+}
+
 /// Draws a uniform nonzero scalar by rejection sampling.
+#[cfg(test)]
 fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
     // The rejection probability is about 2^-128 per draw; the bound only exists
     // so a broken RNG cannot spin forever.
@@ -303,12 +362,21 @@ fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
 /// keys are canonical and nonzero, and that they actually match the ring entry
 /// at `index`.
 ///
+/// # Nonces
+///
+/// The nonce and the decoy `s` values are *hedged*: derived by
+/// [`derive_nonces`] from the ring secret, the transcript, `index` and 32
+/// fresh bytes from `rng`, rather than taken from `rng` directly. A repeated
+/// RNG output alone therefore cannot repeat a nonce across two different
+/// statements, which in a ring signature would disclose the signer's secret
+/// key. The proof encoding and what [`verify`] accepts are unchanged.
+///
 /// # Errors
 /// [`Error::InvalidInput`] if the key lists have different lengths, are empty
 /// or longer than [`MAX_KEYS`], if a public key is not a valid curve point, if
 /// `index` is out of range, if either secret key is not a canonical
-/// nonzero scalar, if the secret keys do not correspond to ring position
-/// `index`, or if `rng` fails to produce a usable scalar;
+/// nonzero scalar, or if the secret keys do not correspond to ring position
+/// `index`;
 /// [`Error::Malformed`] if a public key has a bad length or SEC1 tag.
 pub fn sign<R: RngCore + CryptoRng>(
     online_seckey: &[u8; 32],
@@ -349,13 +417,12 @@ pub fn sign<R: RngCore + CryptoRng>(
         return Err(Error::InvalidInput);
     }
 
-    // Random `s` for every position (the signer's own is overwritten last) and
-    // the nonce `k`, whose commitment closes the ring.
-    let mut s: Vec<Scalar> = Vec::with_capacity(n);
-    for _ in 0..n {
-        s.push(random_scalar(rng)?);
-    }
-    let nonce = random_scalar(rng)?;
+    // The decoy `s` for every position (the signer's own is overwritten last)
+    // and the nonce `k`, whose commitment closes the ring. Both are hedged:
+    // derived from the ring secret, the transcript, the signer's position and
+    // fresh RNG output, so a repeated or predictable RNG output alone does not
+    // repeat a nonce (which in a ring signature leaks the secret key).
+    let (nonce, s) = derive_nonces(&secret, &m, index, n, rng);
     let nonce_commit = ser_point(&ProjectivePoint::mul_generator(&nonce));
 
     // Forward walk. Positions at or before `index` compute garbage that is
@@ -526,6 +593,48 @@ mod tests {
                 verify(&parsed, &on, &off, &sub).unwrap();
             }
         }
+    }
+
+    /// The nonce is hedged: a stuck RNG (every draw identical) must still
+    /// produce verifying proofs, and must not reuse the nonce across
+    /// different statements — nonce reuse in a ring signature discloses the
+    /// signer's key. Two proofs of different statements therefore differ,
+    /// while the proof itself stays a valid, wire-compatible whitelist proof.
+    struct StuckRng;
+    impl RngCore for StuckRng {
+        fn next_u32(&mut self) -> u32 {
+            0
+        }
+        fn next_u64(&mut self) -> u64 {
+            0
+        }
+        fn fill_bytes(&mut self, dst: &mut [u8]) {
+            dst.fill(0xAB);
+        }
+    }
+    impl CryptoRng for StuckRng {}
+
+    #[test]
+    fn hedged_nonce_survives_a_stuck_rng() {
+        let (on, off, sub, osk, ssk) = ring(4, 2);
+        let p1 = sign(&osk, &ssk, &on, &off, &sub, 2, &mut StuckRng).unwrap();
+        verify(&p1, &on, &off, &sub).unwrap();
+        // Same statement, same (stuck) RNG: reproducible.
+        let p2 = sign(&osk, &ssk, &on, &off, &sub, 2, &mut StuckRng).unwrap();
+        assert_eq!(p1, p2);
+
+        // A different statement (different destination key) must not reuse the
+        // nonce, i.e. must not produce the same ring values.
+        let (on2, off2, sub2, osk2, ssk2) = ring(4, 3);
+        let p3 = sign(&osk2, &ssk2, &on2, &off2, &sub2, 3, &mut StuckRng).unwrap();
+        verify(&p3, &on2, &off2, &sub2).unwrap();
+        assert_ne!(p1.to_bytes(), p3.to_bytes());
+
+        // And a working RNG randomizes the proof.
+        let mut rng = DetRng(0xBEEF);
+        let p4 = sign(&osk, &ssk, &on, &off, &sub, 2, &mut rng).unwrap();
+        verify(&p4, &on, &off, &sub).unwrap();
+        assert_ne!(p1.to_bytes(), p4.to_bytes());
     }
 
     #[test]
