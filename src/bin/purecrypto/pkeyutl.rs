@@ -235,8 +235,64 @@ fn parse_stateful(raw: &[u8]) -> Option<StatefulKey> {
 /// Thin wrapper over the shared [`crate::util::atomic_overwrite`] helper — the
 /// stateful-signature path must never emit a signature unless the advanced key
 /// reached the disk durably.
-fn atomic_overwrite(path: &str, data: &[u8]) {
-    crate::util::atomic_overwrite(std::path::Path::new(path), data, 0o600);
+fn atomic_overwrite(path: &std::path::Path, data: &[u8]) {
+    crate::util::atomic_overwrite(path, data, 0o600);
+}
+
+/// Resolves `key_path` to the one file whose one-time-signature state this
+/// invocation is allowed to advance, refusing every *aliasing* shape.
+///
+/// A stateful key's security rests on "one name, one state, one lock". Two
+/// names for the same bytes break all three:
+///
+///   * a **symbolic link**: the read follows it, but
+///     [`crate::util::atomic_overwrite`] renames over the *link's* directory
+///     entry — so the advanced key lands in a brand-new regular file while
+///     the link's old target keeps the state at the index we just used. The
+///     next signature through the target reuses that one-time key, which for
+///     LMS/XMSS is a total break of the key.
+///   * a **hard link** (`nlink > 1` on Unix): both names are one inode, but
+///     the [`SentinelLock`] is `{path}.lock`, so the two names take two
+///     different locks and the serialization that stops two concurrent
+///     signers from sharing an index disappears.
+///   * anything that is not a regular file (a FIFO, a device) can neither
+///     hold state nor be atomically replaced.
+///
+/// What survives the screen is canonicalized, so different spellings of the
+/// same file (`./k` vs `/abs/k`, or a symlinked *directory* on the way) agree
+/// on both the lock name and the rewrite target.
+fn stateful_key_path(key_path: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(key_path);
+    let md = std::fs::symlink_metadata(p)
+        .unwrap_or_else(|e| die(format!("cannot stat {key_path}: {e}")));
+    if md.file_type().is_symlink() {
+        die(format!(
+            "refusing to sign with the stateful key {key_path}: it is a symbolic link. \
+             Advancing the key rewrites the link's own directory entry, leaving the \
+             link's target at the one-time index just consumed — the next signature \
+             made through the target would REUSE that one-time key. Point -inkey at \
+             the real key file"
+        ));
+    }
+    if !md.file_type().is_file() {
+        die(format!(
+            "refusing to sign with the stateful key {key_path}: it is not a regular file"
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if md.nlink() > 1 {
+            die(format!(
+                "refusing to sign with the stateful key {key_path}: it has {} hard links. \
+                 Each name takes its own `<name>.lock`, so two concurrent signers under \
+                 two names would both advance from the same one-time index and REUSE it. \
+                 Remove the extra link(s) first",
+                md.nlink()
+            ));
+        }
+    }
+    std::fs::canonicalize(p).unwrap_or_else(|e| die(format!("cannot resolve {key_path}: {e}")))
 }
 
 /// Stateful `sign`: load, sign (advancing the index), persist the advanced key
@@ -246,15 +302,27 @@ fn atomic_overwrite(path: &str, data: &[u8]) {
 /// [`SentinelLock`] (`{key_path}.lock`). Without it, two concurrent
 /// invocations would both read index `N`, both emit signatures under the
 /// same one-time key, and the on-disk state would still end self-consistent
-/// — the catastrophic OTS reuse would be invisible after the fact.
+/// — the catastrophic OTS reuse would be invisible after the fact. Both the
+/// lock name and the rewrite target come from [`stateful_key_path`], which
+/// refuses the link shapes that would fork the state behind the lock's back.
 fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
+    let key_file = stateful_key_path(key_path);
+    let mut lock_path = key_file.clone().into_os_string();
+    lock_path.push(".lock");
     let _lock = SentinelLock::acquire(
-        std::path::PathBuf::from(format!("{key_path}.lock")),
+        std::path::PathBuf::from(lock_path),
         "`purecrypto pkeyutl sign`",
     );
+    // Re-screen under the lock: the checks above raced anything that could
+    // have relinked the path between the stat and the lock acquisition.
+    let key_file = stateful_key_path(
+        key_file
+            .to_str()
+            .unwrap_or_else(|| die("stateful key path is not valid UTF-8")),
+    );
     crate::util::warn_if_world_readable_key(key_path);
-    let raw =
-        std::fs::read(key_path).unwrap_or_else(|e| die(format!("cannot read {key_path}: {e}")));
+    let raw = std::fs::read(&key_file)
+        .unwrap_or_else(|e| die(format!("cannot read {}: {e}", key_file.display())));
     let key = parse_stateful(&raw)
         .unwrap_or_else(|| die("not a recognized LMS/HSS/XMSS/XMSS^MT private key"));
 
@@ -288,7 +356,7 @@ fn stateful_sign(key_path: &str, msg: &[u8]) -> Vec<u8> {
 
     // Persist the advanced state BEFORE the signature is emitted. If this fails,
     // `atomic_overwrite` exits non-zero and the signature is never written.
-    atomic_overwrite(key_path, &advanced);
+    atomic_overwrite(&key_file, &advanced);
     eprintln!(
         "purecrypto: warning: stateful key {key_path} has ADVANCED to its next \
          one-time index and been rewritten in place. The previous key state is \
@@ -504,11 +572,16 @@ fn run_sign(args: Args) {
     if let Ok(raw) = std::fs::read(inkey)
         && parse_stateful(&raw).is_some()
     {
-        let sig = stateful_sign(inkey, &msg);
+        // Resolve `-out` BEFORE signing. A stateful signature consumes a
+        // one-time index irreversibly; dying on a missing `-out` afterwards
+        // would burn that index and hand back nothing.
         let out_path = args
             .value("-out")
             .or_else(|| args.value("--out"))
-            .unwrap_or_else(|| die("missing -out FILE"));
+            .unwrap_or_else(|| {
+                die("missing -out FILE (required before a stateful LMS/XMSS key is advanced)")
+            });
+        let sig = stateful_sign(inkey, &msg);
         write_output(Some(out_path), &sig);
         return;
     }

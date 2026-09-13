@@ -975,6 +975,91 @@ fn ca_sign_csr_refuses_host_shaped_csr_cn() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `die()` exits through `std::process::exit`, which skips every destructor —
+/// including the `SentinelLock` guard around the CA issuance counter. A
+/// failure *while holding* the lock (here: a corrupt `serial` file) used to
+/// leave `DIR/serial.lock` behind, so every later `ca` run burned the full
+/// 30 s retry budget and then failed on a lock nobody held.
+#[test]
+fn ca_failure_under_lock_does_not_leak_the_sentinel() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_lockleak_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(run(&["ca", "init", "-dir", &d, "-cn", "Lock CA"], b"").1);
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
+            b""
+        )
+        .1
+    );
+    let (pubkey_pem, ok) = run(&["pkey", "-in", &p("leaf.key"), "-pubout"], b"");
+    assert!(ok);
+    std::fs::write(p("leaf.pub"), pubkey_pem).unwrap();
+
+    // Corrupt the counter: `allocate_index` dies with the lock held.
+    std::fs::write(dir.join("serial"), "not-a-number\n").unwrap();
+    let started = std::time::Instant::now();
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "Lock Test",
+            "-out",
+            &p("x.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "a corrupt serial file must fail the issuance");
+    assert!(err.contains("bad serial"), "{err}");
+    assert!(
+        !dir.join("serial.lock").exists(),
+        "the sentinel lock survived a die() while it was held"
+    );
+
+    // A second run must fail the same way *immediately*, not after the 30 s
+    // stale-lock retry budget.
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "issue",
+            "-dir",
+            &d,
+            "-pubkey",
+            &p("leaf.pub"),
+            "-cn",
+            "Lock Test",
+            "-out",
+            &p("y.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("bad serial"), "expected the same error: {err}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "the second run waited on a leaked lock"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// C-2, third path: `x509 -req` has the same policy.
 #[test]
 fn x509_req_ignores_csr_sans_without_opt_in() {
@@ -4871,6 +4956,161 @@ fn lms_genpkey_sign_verify_advances_key() {
     );
     assert!(ok, "LMS verify failed: {out}");
     assert!(out.contains("verified"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stateful key reached through a *second name* forks its one-time-signature
+/// state, which is a total break of the key:
+///
+///   * through a **symlink**, the read follows the link but the atomic rewrite
+///     renames over the link's own directory entry — the advanced key becomes
+///     a new regular file and the link's old target is left sitting at the
+///     index just consumed, ready to reuse it;
+///   * through a **hard link**, the two names take two different
+///     `{path}.lock` sentinels, so the lock no longer serializes concurrent
+///     signers.
+///
+/// Both must be refused outright, and the real key must be untouched.
+#[cfg(unix)]
+#[test]
+fn stateful_key_refuses_symlink_and_hard_link() {
+    let dir = std::env::temp_dir().join(format!("pc_lms_alias_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "LMS-SHA256-H5",
+                "-out",
+                &p("real.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    std::fs::write(dir.join("msg.bin"), b"alias probe").unwrap();
+    let pristine = std::fs::read(dir.join("real.key")).unwrap();
+
+    std::os::unix::fs::symlink(dir.join("real.key"), dir.join("link.key")).unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "sign",
+            "-inkey",
+            &p("link.key"),
+            "-in",
+            &p("msg.bin"),
+            "-out",
+            &p("sig1.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok, "signing through a symlinked stateful key must fail");
+    assert!(err.contains("symbolic link"), "{err}");
+    assert!(!dir.join("sig1.bin").exists());
+    assert_eq!(
+        std::fs::read(dir.join("real.key")).unwrap(),
+        pristine,
+        "the refused run must not advance the key"
+    );
+
+    std::fs::hard_link(dir.join("real.key"), dir.join("hard.key")).unwrap();
+    for name in ["hard.key", "real.key"] {
+        let (_o, err, ok) = run_capture(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p(name),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig2.bin"),
+            ],
+            b"",
+        );
+        assert!(!ok, "signing a hard-linked stateful key ({name}) must fail");
+        assert!(err.contains("hard link"), "{err}");
+        assert!(!dir.join("sig2.bin").exists());
+    }
+    assert_eq!(std::fs::read(dir.join("real.key")).unwrap(), pristine);
+
+    // Once the alias is gone the key signs normally again.
+    std::fs::remove_file(dir.join("hard.key")).unwrap();
+    std::fs::remove_file(dir.join("link.key")).unwrap();
+    assert!(
+        run(
+            &[
+                "pkeyutl",
+                "sign",
+                "-inkey",
+                &p("real.key"),
+                "-in",
+                &p("msg.bin"),
+                "-out",
+                &p("sig3.bin"),
+            ],
+            b"",
+        )
+        .1,
+        "an unaliased stateful key must still sign"
+    );
+    assert_ne!(std::fs::read(dir.join("real.key")).unwrap(), pristine);
+    // The lock file is derived from the canonical path and must be released.
+    assert!(!dir.join("real.key.lock").exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stateful signature consumes a one-time index irreversibly, so every
+/// argument it needs must be validated first: a missing `-out` used to burn
+/// an index and then exit with "missing -out FILE", leaving nothing behind.
+#[test]
+fn stateful_sign_validates_out_before_advancing() {
+    let dir = std::env::temp_dir().join(format!("pc_lms_out_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n).to_str().unwrap().to_string();
+
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "LMS-SHA256-H5",
+                "-out",
+                &p("lms.key")
+            ],
+            b"",
+        )
+        .1
+    );
+    std::fs::write(dir.join("msg.bin"), b"no -out here").unwrap();
+    let before = std::fs::read(dir.join("lms.key")).unwrap();
+
+    let (_o, err, ok) = run_capture(
+        &[
+            "pkeyutl",
+            "sign",
+            "-inkey",
+            &p("lms.key"),
+            "-in",
+            &p("msg.bin"),
+        ],
+        b"",
+    );
+    assert!(!ok);
+    assert!(err.contains("-out"), "{err}");
+    assert_eq!(
+        std::fs::read(dir.join("lms.key")).unwrap(),
+        before,
+        "a run that could not emit a signature must not advance the key"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
 

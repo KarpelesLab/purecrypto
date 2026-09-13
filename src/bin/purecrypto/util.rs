@@ -3,9 +3,39 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::exit;
+use std::sync::{LazyLock, Mutex, MutexGuard};
+
+/// Sentinel-lock files this process currently holds.
+///
+/// [`die`] ends the process with `std::process::exit`, which does **not** run
+/// destructors — so a [`SentinelLock`] alive anywhere up the stack (the CA
+/// `serial` counter, a stateful LMS/XMSS signing key) would have its sentinel
+/// file survive the failure. Every later invocation then spends the full 30 s
+/// retry budget waiting on a lock nobody holds and finally fails, which for a
+/// stateful key means no signature can be made at all until someone deletes
+/// the file by hand. Registering the paths here lets `die` release them.
+static HELD_LOCKS: LazyLock<Mutex<Vec<PathBuf>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// The lock registry, ignoring poisoning: a poisoned mutex still holds the
+/// paths we must clean up, and we only ever push/remove/drain.
+fn held_locks() -> MutexGuard<'static, Vec<PathBuf>> {
+    HELD_LOCKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Unlinks every sentinel lock this process still holds. Best-effort: a lock
+/// we cannot remove is no worse than the pre-existing behaviour.
+fn release_held_locks() {
+    for path in held_locks().drain(..) {
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 /// Prints `purecrypto: <msg>` to stderr and exits with status 1.
+///
+/// Releases any held [`SentinelLock`] first: `exit` skips `Drop`, and a
+/// leaked sentinel blocks every subsequent run for 30 s before failing.
 pub(crate) fn die(msg: impl AsRef<str>) -> ! {
+    release_held_locks();
     eprintln!("purecrypto: {}", msg.as_ref());
     exit(1);
 }
@@ -88,7 +118,9 @@ impl Args {
 /// sleep. Bounded retry (~3 s) so a stale lock from a crashed peer eventually
 /// surfaces a clear error rather than hanging forever. The lock file is
 /// removed on `Drop` (including unwind), so a panicking holder unblocks the
-/// next caller immediately.
+/// next caller immediately. A holder that exits through [`die`] has no `Drop`
+/// run at all, so the path is also registered in [`HELD_LOCKS`] and released
+/// from there.
 pub(crate) struct SentinelLock {
     path: PathBuf,
 }
@@ -115,7 +147,13 @@ impl SentinelLock {
                 .create_new(true)
                 .open(&path)
             {
-                Ok(_f) => return SentinelLock { path },
+                Ok(_f) => {
+                    // Register before handing the guard out: from here on the
+                    // file exists, so every exit path — `Drop`, unwind, or
+                    // `die`'s `exit` — must be able to find and unlink it.
+                    held_locks().push(path.clone());
+                    return SentinelLock { path };
+                }
                 // `AlreadyExists`: another caller currently holds the lock.
                 // `PermissionDenied`: on Windows, a lock file that a peer is
                 // concurrently unlinking enters a "delete-pending" state in
@@ -146,6 +184,15 @@ impl SentinelLock {
 
 impl Drop for SentinelLock {
     fn drop(&mut self) {
+        // Deregister first, so a `die` further up an unwinding stack does not
+        // try to unlink a path this guard has already released (which by then
+        // may belong to a different holder).
+        {
+            let mut held = held_locks();
+            if let Some(i) = held.iter().rposition(|p| *p == self.path) {
+                held.remove(i);
+            }
+        }
         // Best-effort: if the unlink fails (e.g. another process already
         // raced to remove it), there's nothing useful to recover.
         let _ = std::fs::remove_file(&self.path);
