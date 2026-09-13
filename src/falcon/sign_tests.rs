@@ -36,7 +36,7 @@ fn round_trip(n: usize, degree: Degree, logn: u8, seed: u64) {
         let msg = [m, m ^ 0xAA, 0x5C, m.wrapping_add(7)];
         let mut salt = [0u8; 40];
         rng.fill(&mut salt);
-        let sig = sign_internal(&key, &msg, &salt, &mut rng);
+        let sig = sign_internal(&key, &msg, &salt, &mut rng).expect("sampler must converge");
         assert_eq!(sig.len(), degree.sig_len(), "signature length");
         assert!(
             verify(&pk, &msg, &sig),

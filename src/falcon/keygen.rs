@@ -377,12 +377,29 @@ fn gs_norm(f: &[i64], g: &[i64], n: usize) -> Fpr {
     }
 }
 
+/// The Gram-Schmidt rejection bound `1.17²·q` that [`ntru_gen`] enforces.
+fn gs_bound() -> Fpr {
+    Fpr::of_i64(Q).mul(Fpr::from_f64(1.17 * 1.17))
+}
+
+/// `true` iff `(f, g)` satisfies the Gram-Schmidt norm bound that key
+/// generation rejects on (spec Alg. 5 line 9).
+///
+/// Key *import* checks it too. Without it a crafted secret key — the extreme
+/// case is `f = 1, g = 0, F = 0, G = q`, which satisfies the NTRU equation and
+/// has an invertible `f` — is accepted, and the basis it expands to is so
+/// skewed that the sampler never produces a vector inside the signature norm
+/// bound: [`super::sign::sign_internal`] would then resample forever.
+pub(crate) fn gs_norm_ok(f: &[i64], g: &[i64], n: usize) -> bool {
+    !gs_bound().lt(gs_norm(f, g, n))
+}
+
 /// Generate Falcon NTRU polynomials `(f, g, F, G)` with `f·G − g·F = q`, plus
 /// the public key `h = g·f⁻¹ mod q`. Loops until the rejection conditions pass
 /// and the NTRU equation is solvable.
 pub(crate) fn ntru_gen<R: SamplerRng>(n: usize, rng: &mut R) -> RawNtruKey {
     // Rejection bound (1.17²·q).
-    let bound = Fpr::of_i64(Q).mul(Fpr::from_f64(1.17 * 1.17));
+    let bound = gs_bound();
     loop {
         let f = gen_poly(n, rng);
         let g = gen_poly(n, rng);

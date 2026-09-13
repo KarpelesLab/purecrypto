@@ -10,12 +10,11 @@
 //! Algorithms 9 & 11) and `tprest/falcon.py` (`ffldl_fft` / `normalize_tree` /
 //! `ffsampling_fft`).
 //!
-//! Everything runs in the emulated [`Fpr`]. Note that this does not make the
-//! sign-time path data-oblivious: `Fpr` is best-effort constant time, not
-//! branch-free (see its "Constant-time caveat"). The LDL math is checked by
-//! `tree_tests.rs`
-//! (`L·D·L\* == G`); the full statistical behavior is exercised by the
-//! sign round-trip in a later phase.
+//! Everything runs in the emulated [`Fpr`], which is branch-free by
+//! construction (see the "Constant-time contract" in `fpr`), so the
+//! secret-derived tree walk here selects no branch, address or shift count from
+//! its operands. The LDL math is checked by `tree_tests.rs` (`L·D·L\* == G`);
+//! the statistical behavior is exercised by the sign round-trip tests.
 
 use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft, wipe_cplx};
 use super::fpr::{FPR_ZERO, Fpr};

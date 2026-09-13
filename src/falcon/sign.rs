@@ -11,11 +11,13 @@
 //!
 //! The expansion and the per-signature sampling run entirely in the emulated
 //! [`Fpr`], which removes the subnormal-timing and FMA-contraction leaks of a
-//! hardware `f64`. That is **not** the same as being data-oblivious: `Fpr` is
-//! best-effort constant time, not branch-free (see its "Constant-time caveat"),
-//! and this is the secret-dependent path, so a residual floating-point timing
-//! side channel remains. A fully branchless FPEMU is the fix and is future
-//! work; until then, treat Falcon signing as not strictly constant time.
+//! hardware `f64`. That emulation is **branch-free by construction** (see the
+//! "Constant-time contract" in `fpr`): every operation is straight-line mask
+//! arithmetic over fixed-trip loops, so no secret-derived operand selects a
+//! branch, a memory address, or a shift count. What remains observable is what
+//! Falcon's design itself exposes — the number of rejection-sampling rounds and
+//! the sampler's `ber_exp` comparisons, both driven by fresh randomness, as in
+//! the reference implementation.
 
 use super::Degree;
 use super::encode::compress;
@@ -121,15 +123,27 @@ pub(crate) fn expand_key(
     }
 }
 
+/// Hard cap on resampling rounds in [`sign_internal`].
+///
+/// A well-formed key accepts a candidate with probability well above 1/2 per
+/// round, so reaching even a few hundred rounds is already impossible in
+/// practice; the cap exists purely so that a *degenerate* basis — one whose
+/// Gram-Schmidt norm is far outside the bound key generation enforces, for
+/// which no sampled vector can ever satisfy the signature bound — turns an
+/// unbounded hang into a clean failure. [`FalconPrivateKey::from_bytes`] now
+/// rejects such keys up front; this is the belt-and-braces second line.
+const MAX_SIGN_ATTEMPTS: u32 = 1_000_000;
+
 /// Produce a Falcon signature `header || salt || compress(s₁)` over `msg`,
 /// using the given 40-byte `salt` and a sampler randomness source `rng`.
-/// Loops (resampling) until the norm bound and compression both succeed.
+/// Resamples until the norm bound and compression both succeed, or `None` after
+/// [`MAX_SIGN_ATTEMPTS`] rounds (see that constant).
 pub(crate) fn sign_internal<R: SamplerRng>(
     key: &ExpandedKey,
     msg: &[u8],
     salt: &[u8; SALT_LEN],
     rng: &mut R,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let n = key.degree.n();
     let logn = n.trailing_zeros() as u8;
     let sig_bound = key.degree.sig_bound();
@@ -143,7 +157,7 @@ pub(crate) fn sign_internal<R: SamplerRng>(
     let inv_q = Fpr::from_f64(1.0).div(Fpr::of_i64(super::Q as i64));
     let neg_inv_q = inv_q.neg();
 
-    loop {
+    for _ in 0..MAX_SIGN_ATTEMPTS {
         // Target: t0 = c·d/q, t1 = −c·b/q (FFT domain).
         let pd = mul_fft(&point_fft, &key.d);
         let t0: Vec<Cplx> = pd.iter().map(|z| z.scale(inv_q)).collect();
@@ -172,9 +186,10 @@ pub(crate) fn sign_internal<R: SamplerRng>(
             out.push(0x30 | logn); // padded format header
             out.extend_from_slice(salt);
             out.extend_from_slice(&enc);
-            return out;
+            return Some(out);
         }
     }
+    None
 }
 
 #[cfg(test)]

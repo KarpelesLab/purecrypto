@@ -9,10 +9,20 @@ use alloc::vec::Vec;
 
 /// Compress the signature polynomial `s` into exactly `slen` bytes, or `None`
 /// if it does not fit (the caller resamples). Mirrors the reference `compress`.
+///
+/// A coefficient of magnitude `>= 2048` is rejected with `None` rather than
+/// encoded: its unary high part would be 16 zeros or more, which the verifier's
+/// `decompress` (and the reference `comp_decode`) refuses outright — so emitting
+/// it would produce a signature that can never verify, and the unary run would
+/// also let one wild coefficient balloon the bit buffer. Returning `None` makes
+/// the signer resample, which is exactly what the reference does.
 pub(crate) fn compress(s: &[i16], slen: usize) -> Option<Vec<u8>> {
     let mut bits: Vec<u8> = Vec::with_capacity(s.len() * 9);
     for &coef in s {
         let c = coef as i32;
+        if c.unsigned_abs() >= 2048 {
+            return None;
+        }
         bits.push((c < 0) as u8);
         let a = c.unsigned_abs();
         // 7 low bits, most-significant first.
@@ -137,6 +147,12 @@ pub(crate) fn encode_privkey(f: &[i64], g: &[i64], cap_f: &[i64], logn: u8) -> O
 
 /// Decode the compact secret key into `(f, g, F)`; returns `None` on a bad
 /// header or length. `G` must be recomputed by the caller.
+///
+/// Every field is additionally required to be in the *symmetric* range
+/// [`fits_reference_signed`] describes — the most-negative `w`-bit value
+/// (`-2^(w-1)`) is forbidden, matching the reference `Zf(trim_i8_decode)`, which
+/// returns failure on exactly that pattern. Key generation never emits it, so
+/// this only ever rejects keys the reference implementation would reject too.
 pub(crate) fn decode_privkey(bytes: &[u8], n: usize) -> Option<(Vec<i64>, Vec<i64>, Vec<i64>)> {
     let w = fg_bits(n);
     let fg_len = n * w as usize / 8;
@@ -149,6 +165,12 @@ pub(crate) fn decode_privkey(bytes: &[u8], n: usize) -> Option<(Vec<i64>, Vec<i6
     let f = unpack_signed(&body[..fg_len], n, w)?;
     let g = unpack_signed(&body[fg_len..2 * fg_len], n, w)?;
     let cap_f = unpack_signed(&body[2 * fg_len..], n, 8)?;
+    if !fits_reference_signed(&f, w)
+        || !fits_reference_signed(&g, w)
+        || !fits_reference_signed(&cap_f, 8)
+    {
+        return None;
+    }
     Some((f, g, cap_f))
 }
 

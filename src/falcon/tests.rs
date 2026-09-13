@@ -607,6 +607,80 @@ fn from_bytes_rejects_corrupted_f_coefficient() {
     );
 }
 
+/// SECURITY REGRESSION (crafted secret key → unbounded signing loop).
+///
+/// `f = 1, g = 0, F = 0, G = q` satisfies the NTRU equation `f·G − g·F = q`
+/// exactly and has an invertible `f`, so the equation check alone accepts it.
+/// Its Gram-Schmidt norm is `q²`, roughly four orders of magnitude past the
+/// `1.17²·q` bound, and no sampled vector from that basis can reach the
+/// signature norm bound — `sign` would resample forever. Import must reject it.
+#[test]
+fn from_bytes_rejects_degenerate_basis() {
+    use super::{Degree, Error, FalconPrivateKey, encode, keygen};
+    let n = Degree::Falcon512.n();
+
+    let mut f = alloc::vec![0i64; n];
+    f[0] = 1;
+    let g = alloc::vec![0i64; n];
+    let cap_f = alloc::vec![0i64; n];
+
+    // Sanity: the trap really does pass every *other* check.
+    let cap_g = keygen::recompute_g(&f, &g, &cap_f, n);
+    assert!(keygen::check_ntru(&f, &g, &cap_f, &cap_g), "NTRU eq holds");
+    assert!(keygen::compute_h(&f, &g, n).is_some(), "f is invertible");
+    assert!(!keygen::gs_norm_ok(&f, &g, n), "but the GS norm is way out");
+
+    let bad = encode::encode_privkey(&f, &g, &cap_f, Degree::Falcon512.logn()).expect("encodable");
+    assert!(
+        matches!(FalconPrivateKey::from_bytes(&bad), Err(Error::Malformed)),
+        "a degenerate basis must be rejected at import, not hang the signer"
+    );
+}
+
+/// The secret-key decoder must refuse the most-negative value of each packed
+/// field, exactly as the reference `Zf(trim_i8_decode)` does.
+#[test]
+fn decode_privkey_rejects_most_negative_coefficient() {
+    use super::{Degree, encode};
+    let n = Degree::Falcon512.n();
+    let w = encode::fg_bits(n);
+    let most_neg = -(1i64 << (w - 1));
+
+    // A key generator never emits it, so build the packed bytes by hand from a
+    // benign key and then splice the forbidden value into `f[0]`.
+    let mut rng = TestRng(0x5EED_0BAD_C0DE_1111);
+    let sk = super::FalconPrivateKey::generate(Degree::Falcon512, &mut rng);
+    let skb = sk.to_bytes();
+    let (mut f, g, cap_f) = encode::decode_privkey(&skb, n).expect("decode");
+    assert!(f.iter().all(|&c| c != most_neg), "keygen avoids it");
+
+    f[0] = most_neg;
+    // `pack_signed` accepts the two's-complement range, so the bytes exist...
+    let bad = encode::encode_privkey(&f, &g, &cap_f, Degree::Falcon512.logn())
+        .expect("the packer allows the full two's-complement range");
+    // ...but the decoder must refuse them.
+    assert!(
+        encode::decode_privkey(&bad, n).is_none(),
+        "the most-negative coefficient must be rejected"
+    );
+    assert!(super::FalconPrivateKey::from_bytes(&bad).is_err());
+}
+
+/// `compress` must refuse a coefficient the verifier's `decompress` would
+/// reject (|x| >= 2048, i.e. a unary run of 16 or more), so the signer
+/// resamples instead of emitting an unverifiable signature.
+#[test]
+fn compress_rejects_out_of_range_coefficient() {
+    use super::encode::compress;
+    let mut s = alloc::vec![0i16; 512];
+    s[3] = 2047;
+    assert!(compress(&s, 658).is_some(), "2047 is encodable");
+    s[3] = 2048;
+    assert!(compress(&s, 658).is_none(), "2048 must be refused");
+    s[3] = -2048;
+    assert!(compress(&s, 658).is_none(), "-2048 must be refused");
+}
+
 /// Builds a compressed-`s` byte string (spec §3.11.2) from `(sign, low, high)`
 /// triples: the sign bit, the 7 low magnitude bits MSB-first, `high` zeros,
 /// the terminating 1, then zero padding to a byte boundary.

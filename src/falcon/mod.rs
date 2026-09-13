@@ -92,6 +92,12 @@ pub enum Error {
     InvalidLength,
     /// A header byte, packing, or encoding was structurally invalid.
     Malformed,
+    /// Signing exhausted its rejection-sampling retry budget. Unreachable for a
+    /// key that [`FalconPrivateKey::generate`] produced or
+    /// [`FalconPrivateKey::from_bytes`] accepted; the budget exists so that a
+    /// degenerate basis fails instead of looping forever. See
+    /// [`FalconPrivateKey::try_sign`].
+    SamplingFailed,
 }
 
 /// A Falcon parameter set (degree).
@@ -602,15 +608,38 @@ impl FalconPrivateKey {
     /// remains observable is what Falcon's design itself exposes — the number
     /// of rejection-sampling rounds, driven by fresh randomness, as in the
     /// reference implementation.
+    /// # Panics
+    ///
+    /// Only if the rejection sampler fails a million consecutive rounds, which
+    /// a key that passed [`generate`](Self::generate) or
+    /// [`from_bytes`](Self::from_bytes) cannot do — both enforce the
+    /// Gram-Schmidt norm bound that makes the acceptance probability per round
+    /// better than one half. Use [`try_sign`](Self::try_sign) to get an error
+    /// instead of a panic.
     pub fn sign<R: crate::rng::RngCore + crate::rng::CryptoRng>(
         &self,
         msg: &[u8],
         rng: &mut R,
     ) -> Vec<u8> {
+        self.try_sign(msg, rng)
+            .expect("a key that passed the Gram-Schmidt bound cannot exhaust the resampling cap")
+    }
+
+    /// As [`sign`](Self::sign), but returns [`Error::SamplingFailed`] instead of
+    /// panicking if the rejection sampler exhausts its retry budget.
+    ///
+    /// That budget exists so a degenerate secret basis cannot turn signing into
+    /// an unbounded loop. Keys produced by [`generate`](Self::generate) or
+    /// accepted by [`from_bytes`](Self::from_bytes) never reach it.
+    pub fn try_sign<R: crate::rng::RngCore + crate::rng::CryptoRng>(
+        &self,
+        msg: &[u8],
+        rng: &mut R,
+    ) -> Result<Vec<u8>, Error> {
         let mut salt = [0u8; NONCE_LEN];
         rng.fill_bytes(&mut salt);
         let mut src = RngBytes(rng);
-        sign::sign_internal(&self.expanded, msg, &salt, &mut src)
+        sign::sign_internal(&self.expanded, msg, &salt, &mut src).ok_or(Error::SamplingFailed)
     }
 
     /// The matching public key.
@@ -642,6 +671,15 @@ impl FalconPrivateKey {
     /// Parse a compact secret-key encoding, recomputing `G` and `h` and
     /// rebuilding the expanded form. Returns `Err` if the key is malformed or
     /// `f` is not invertible mod `q`.
+    ///
+    /// Every check key generation applies is re-applied here, because a secret
+    /// key is attacker-supplied input in some deployments: the coefficient
+    /// ranges (`decode_privkey` rejects the most-negative value of each field,
+    /// exactly as the reference `trim_i8_decode` does), the Gram-Schmidt norm
+    /// bound, invertibility of `f`, and the NTRU equation itself. Skipping the
+    /// norm bound would admit degenerate bases — `f = 1, g = 0, F = 0, G = q`
+    /// passes the NTRU equation — for which the sampler can never reach the
+    /// signature norm bound, so signing would loop indefinitely.
     pub fn from_bytes(sk: &[u8]) -> Result<FalconPrivateKey, Error> {
         let header = *sk.first().ok_or(Error::InvalidLength)?;
         if header & 0xF0 != 0x50 {
@@ -650,6 +688,10 @@ impl FalconPrivateKey {
         let degree = Degree::from_logn(header & 0x0F).ok_or(Error::Malformed)?;
         let n = degree.n();
         let (f, g, cap_f) = encode::decode_privkey(sk, n).ok_or(Error::InvalidLength)?;
+        // Cheapest structural check first (O(n log n)), before the O(n²) `h`.
+        if !keygen::gs_norm_ok(&f, &g, n) {
+            return Err(Error::Malformed);
+        }
         let h = keygen::compute_h(&f, &g, n).ok_or(Error::Malformed)?;
         let cap_g = keygen::recompute_g(&f, &g, &cap_f, n);
         // Validate the NTRU equation `f·G − g·F ≡ q (mod xⁿ+1)`: a corrupted but
