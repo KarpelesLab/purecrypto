@@ -121,6 +121,14 @@ pub trait BlockCipher {
     /// AES pipeline and the carryless multiplier in a single fused loop.
     /// `None` (the default, and the only sensible answer for anything that is
     /// not hardware-backed AES) selects the generic two-pass path.
+    ///
+    /// The answer is *not* trusted: the mode validates that the round count is
+    /// one of AES's 10/12/14 and that the slice really holds
+    /// `16 * (nr + 1)` bytes, and independently re-checks that the CPU
+    /// implements the AES instruction-set extension, falling back to the
+    /// generic path otherwise. Overriding this with anything but a genuine
+    /// FIPS-197 schedule therefore cannot cause unsoundness — it just yields
+    /// wrong ciphertext, or is ignored.
     #[doc(hidden)]
     fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
         None

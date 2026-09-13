@@ -48,6 +48,16 @@ fn inc32(block: u128) -> u128 {
     (block & !0xffff_ffffu128) | ctr as u128
 }
 
+/// Sanity-checks the `(round_keys, nr)` pair a [`BlockCipher`] hands to the
+/// fused GCM kernel. The hook is a public (if `#[doc(hidden)]`) overridable
+/// trait method, so a safe third-party implementation could return anything;
+/// the kernel dereferences the schedule through a raw pointer for
+/// `16 * (nr + 1)` bytes, so nothing may be taken on trust.
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
+fn fused_schedule_ok(rk: &[u8], nr: usize) -> bool {
+    matches!(nr, 10 | 12 | 14) && rk.len() >= 16 * (nr + 1)
+}
+
 /// AES-GCM context, parameterized over the underlying block cipher.
 #[derive(Clone)]
 pub struct Gcm<C: BlockCipher> {
@@ -269,6 +279,15 @@ impl<C: BlockCipher> Gcm<C> {
             return None;
         }
         let (rk, nr) = self.cipher.hw_aes_schedule()?;
+        // `hw_aes_schedule` is an overridable trait method, so its answer is
+        // untrusted: a third-party `BlockCipher` could hand back a short
+        // schedule, a bogus round count, or claim hardware AES on a CPU
+        // without it. The kernel below reads `16 * (nr + 1)` bytes through a
+        // raw pointer and executes AES-NI instructions, so validate all of it
+        // and fall back to the generic two-pass path on any mismatch.
+        if !fused_schedule_ok(rk, nr) || !std::is_x86_feature_detected!("aes") {
+            return None;
+        }
         let total_len = buffer.len();
 
         // AAD prefix of the GHASH (outside the bulk loop).
@@ -278,9 +297,10 @@ impl<C: BlockCipher> Gcm<C> {
         let fused = total_len & !127;
         let ctr0 = inc32(j0);
         if fused > 0 {
-            // SAFETY: `ghash_hw` plus `hw_aes_schedule()` returning `Some`
-            // confirmed the AES-NI + PCLMULQDQ features the kernel requires;
-            // `rk` is the cipher's own `16 * (nr + 1)`-byte schedule.
+            // SAFETY: `ghash_hw` confirmed PCLMULQDQ/SSE2/SSSE3 and the
+            // runtime check above confirmed AES-NI — the features the kernel
+            // requires; `fused_schedule_ok` checked `nr ∈ {10, 12, 14}` and
+            // `rk.len() >= 16 * (nr + 1)`.
             x = unsafe {
                 super::clmul::ctr_ghash_fused(
                     rk,
@@ -617,6 +637,65 @@ mod tests {
             // AES-256 exercises the 14-round schedule in the fused kernel.
             for &len in &[0usize, 96, 127, 128, 129, 1024, 4096] {
                 check(&fused256, &plain256, &nonce, &aad, len);
+            }
+        }
+    }
+
+    /// A third-party `BlockCipher` can override `hw_aes_schedule` (it is
+    /// `pub`, merely `#[doc(hidden)]`) and return a bogus schedule from safe
+    /// code. The fused kernel reads `16 * (nr + 1)` bytes through a raw
+    /// pointer, so GCM must validate the pair and fall back to the generic
+    /// path instead of reading out of bounds. Under Miri/ASan a regression
+    /// here is an OOB read; without them it still shows up as a wrong tag.
+    #[cfg(all(feature = "std", target_arch = "x86_64"))]
+    #[test]
+    fn bogus_hw_schedule_falls_back() {
+        use std::vec::Vec;
+
+        /// Claims hardware AES with a schedule far too short for its round
+        /// count (and, in one variant, an impossible round count).
+        struct Liar {
+            inner: Aes128,
+            rk: std::vec::Vec<u8>,
+            nr: usize,
+        }
+        impl crate::cipher::BlockCipher for Liar {
+            const BLOCK_SIZE: usize = 16;
+            const KEY_SIZE: usize = 16;
+            fn encrypt_block(&self, block: &mut [u8; 16]) {
+                self.inner.encrypt_block(block);
+            }
+            fn decrypt_block(&self, block: &mut [u8; 16]) {
+                self.inner.decrypt_block(block);
+            }
+            fn hw_aes_schedule(&self) -> Option<(&[u8], usize)> {
+                Some((&self.rk[..], self.nr))
+            }
+        }
+
+        let key = from_hex::<16>("feffe9928665731c6d6a8f9467308308");
+        let nonce = from_hex::<12>("cafebabefacedbaddecaf888");
+        let reference = Gcm::new(Aes128::new_software(&key));
+
+        // (schedule length, claimed rounds): short schedule, absurd round
+        // count, zero rounds, empty schedule.
+        for &(len, nr) in &[(16usize, 14usize), (176, 14), (176, 99), (176, 0), (0, 10)] {
+            let g = Gcm::new(Liar {
+                inner: Aes128::new_software(&key),
+                rk: std::vec![0u8; len],
+                nr,
+            });
+            for &msg_len in &[0usize, 16, 128, 256, 1024] {
+                let pt: Vec<u8> = (0..msg_len).map(|i| (i as u8).wrapping_mul(53)).collect();
+                let aad = b"header";
+                let mut a = pt.clone();
+                let mut b = pt.clone();
+                let ta = g.encrypt(&nonce, aad, &mut a);
+                let tb = reference.encrypt(&nonce, aad, &mut b);
+                assert_eq!(a, b, "ciphertext len={msg_len} rk_len={len} nr={nr}");
+                assert_eq!(ta, tb, "tag len={msg_len} rk_len={len} nr={nr}");
+                g.decrypt(&nonce, aad, &mut a, &ta).unwrap();
+                assert_eq!(a, pt);
             }
         }
     }

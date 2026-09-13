@@ -244,6 +244,14 @@ mod x86 {
         encrypt: bool,
     ) -> u128 {
         debug_assert_eq!(buf.len() % 128, 0);
+        // Defence in depth: the schedule comes from an overridable trait
+        // method, and the loads below are raw-pointer reads of
+        // `16 * (nr + 1)` bytes. The caller already validates this; the check
+        // costs one comparison per call and keeps the kernel sound on its own.
+        assert!(
+            nr <= 14 && round_keys.len() >= 16 * (nr + 1),
+            "AES round-key schedule too short for the round count"
+        );
         unsafe {
             // Preload the schedule once (≤ 15 round keys for AES-256).
             let mut ks = [_mm_setzero_si128(); 15];
