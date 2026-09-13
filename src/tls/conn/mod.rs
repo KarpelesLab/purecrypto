@@ -7907,12 +7907,13 @@ mod audit_regression_tests {
         let s = StoredSession {
             server_name: "h".into(),
             ticket: alloc::vec![0xAB; 16],
-            psk: alloc::vec![0xCD; 32],
+            psk: crate::zeroize::Zeroizing::new(alloc::vec![0xCD; 32]),
             age_add: 0,
             lifetime_seconds: 60,
             received_at: Time::from_unix(0),
             max_early_data_size: None,
             negotiated_alpn: None,
+            verify_certificates: true,
             cipher_suite_hash: HashAlg::Sha256,
             cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
         };

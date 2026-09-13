@@ -43,6 +43,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::Zeroizing;
 
 /// Upper bound on post-handshake `KeyUpdate` messages we will process from
 /// the server (RFC 8446 §4.6.3). Each one costs two HKDF-Expand-Label pairs
@@ -515,8 +516,12 @@ pub struct StoredSession {
     /// The ticket bytes (`identity` in the wire format), to be re-presented in
     /// the next ClientHello.
     pub ticket: Vec<u8>,
-    /// The PSK derived from `resumption_master_secret` and the ticket's nonce.
-    pub psk: Vec<u8>,
+    /// The PSK derived from `resumption_master_secret` and the ticket's
+    /// nonce. Held in a [`Zeroizing`] buffer: a stored session outlives the
+    /// connection that minted it (it sits in a cache waiting for a resume),
+    /// and anyone holding this value can resume the session and read its
+    /// 0-RTT data.
+    pub psk: Zeroizing<Vec<u8>>,
     /// Randomizer the server added; XORed into the reported ticket age to
     /// avoid linkability across resumptions.
     pub age_add: u32,
@@ -533,6 +538,12 @@ pub struct StoredSession {
     /// Hash function of the original cipher suite (PSK binders and key
     /// schedule are tied to it).
     pub cipher_suite_hash: HashAlg,
+    /// Whether the connection that issued this ticket actually verified the
+    /// server's certificate chain. A resumed handshake presents no
+    /// certificate at all, so a session minted with verification off carries
+    /// no authenticated identity: it is never offered by a connection that
+    /// does verify.
+    pub verify_certificates: bool,
     /// IANA id of the cipher suite negotiated on the originating connection.
     /// RFC 8446 §4.6.1: 0-RTT is keyed under this suite, so early data is
     /// only offered — and only accepted — when the resumed handshake lands
@@ -553,6 +564,7 @@ impl core::fmt::Debug for StoredSession {
             .field("received_at", &self.received_at)
             .field("max_early_data_size", &self.max_early_data_size)
             .field("negotiated_alpn", &self.negotiated_alpn)
+            .field("verify_certificates", &self.verify_certificates)
             .field("cipher_suite_hash", &self.cipher_suite_hash)
             .field("cipher_suite", &format_args!("{:#06x}", self.cipher_suite))
             .finish_non_exhaustive()
@@ -860,8 +872,8 @@ pub(crate) enum EchOutcome {
 /// PSK selection and seed the key schedule when the PSK is accepted.
 struct PskOfferState {
     /// The PSK bytes (derived from a prior session's
-    /// `resumption_master_secret`).
-    psk: Vec<u8>,
+    /// `resumption_master_secret`), wiped when the connection drops.
+    psk: Zeroizing<Vec<u8>>,
     /// The hash function fixed by the original session's cipher suite.
     hash: HashAlg,
 }
@@ -1314,8 +1326,14 @@ impl ClientConnection {
                 now.saturating_sub(session.received_at.to_unix())
                     > u64::from(session.lifetime_seconds)
             });
+            // A session minted without certificate verification proves
+            // nothing about who the peer is; resuming it under a config that
+            // *does* verify would silently inherit that weaker context (the
+            // resumed handshake sends no certificate to check).
+            let weaker_verification = config.verify_certificates && !session.verify_certificates;
             if !session.server_name.eq_ignore_ascii_case(server_name)
                 || expired
+                || weaker_verification
                 || session.ticket.len() > MAX_SESSION_TICKET_LEN
             {
                 config.session = None;
@@ -1747,7 +1765,10 @@ impl ClientConnection {
         // PSK resumption: psk_key_exchange_modes, optional early_data,
         // pre_shared_key (must be LAST per RFC 8446 §4.2.11). The binder is
         // patched after we know the truncated CH bytes.
-        let mut psk_binder_info: Option<(HashAlg, Vec<u8>, usize)> = None;
+        // The binder PSK copy is `Zeroizing`: it is a clone of the stored
+        // session's long-lived resumption secret and must not outlive this
+        // function on the stack.
+        let mut psk_binder_info: Option<(HashAlg, Zeroizing<Vec<u8>>, usize)> = None;
         if let Some(session) = &self.config.session {
             extensions.push(ext::psk_key_exchange_modes(&[1])); // psk_dhe_ke
             // RFC 8446 §4.1.4 / §4.2.10: `early_data` MUST NOT appear in
@@ -2072,7 +2093,7 @@ impl ClientConnection {
                 // Finished completed) and the negotiated suite hash.
                 if let (Some(rms), Some(suite)) = (self.rms.as_ref(), self.suite) {
                     let hash_len = suite.hash.output_len();
-                    let mut psk = alloc::vec![0u8; hash_len];
+                    let mut psk = Zeroizing::new(alloc::vec![0u8; hash_len]);
                     psk_from_resumption(suite.hash, rms, &nst.ticket_nonce, &mut psk);
                     let received_at = system_now()
                         .or_else(|| self.handshake_start.clone())
@@ -2086,6 +2107,7 @@ impl ClientConnection {
                         received_at,
                         max_early_data_size: received.max_early_data_size,
                         negotiated_alpn: self.alpn_negotiated.clone(),
+                        verify_certificates: self.config.verify_certificates,
                         cipher_suite_hash: suite.hash,
                         cipher_suite: suite.suite.0,
                     });
@@ -4172,7 +4194,7 @@ mod tests {
         let session = StoredSession {
             server_name: "h".into(),
             ticket: alloc::vec![0x41; 16],
-            psk: alloc::vec![0x5a; 32],
+            psk: crate::zeroize::Zeroizing::new(alloc::vec![0x5a; 32]),
             age_add: 0,
             lifetime_seconds: 7200,
             // Must be "now": a session past `received_at + lifetime_seconds`
@@ -4180,6 +4202,7 @@ mod tests {
             received_at: system_now().unwrap_or_else(|| Time::from_unix(0)),
             max_early_data_size: Some(1024),
             negotiated_alpn: None,
+            verify_certificates: true,
             cipher_suite_hash: HashAlg::Sha256,
             cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
         };
@@ -4571,12 +4594,13 @@ mod tests {
             StoredSession {
                 server_name: name.into(),
                 ticket: alloc::vec![0x41; 16],
-                psk: alloc::vec![0x5a; 32],
+                psk: crate::zeroize::Zeroizing::new(alloc::vec![0x5a; 32]),
                 age_add: 0,
                 lifetime_seconds: 3600,
                 received_at: Time::from_unix(now.saturating_sub(age_secs)),
                 max_early_data_size: None,
                 negotiated_alpn: None,
+                verify_certificates: true,
                 cipher_suite_hash: HashAlg::Sha256,
                 cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
             }
@@ -4600,5 +4624,11 @@ mod tests {
         let mut huge = session("h.example", 10);
         huge.ticket = alloc::vec![0x41; MAX_SESSION_TICKET_LEN + 1];
         assert!(!offers_psk(huge, "h.example"));
+        // Minted without certificate verification: a verifying connection
+        // must not inherit that weaker context (a resumed handshake presents
+        // no certificate at all).
+        let mut unverified = session("h.example", 10);
+        unverified.verify_certificates = false;
+        assert!(!offers_psk(unverified, "h.example"));
     }
 }

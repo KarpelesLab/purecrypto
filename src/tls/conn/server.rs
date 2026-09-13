@@ -281,6 +281,17 @@ pub(crate) struct ServerConfig {
     pub(crate) preferred_key_exchange_group: Option<crate::tls::NamedGroup>,
 }
 
+// The ticket key seals (and unseals) every resumption ticket this server
+// issues: a leak lets an attacker mint tickets and recover their PSKs, so
+// scrub it when the configuration is dropped.
+impl Drop for ServerConfig {
+    fn drop(&mut self) {
+        if let Some(key) = self.ticket_key.as_mut() {
+            super::wipe(key);
+        }
+    }
+}
+
 impl ServerConfig {
     /// Shared constructor: a default configuration presenting `cert_chain`
     /// (leaf first) and signing with `key`. The `with_*` helpers differ only
@@ -3006,7 +3017,7 @@ impl<R: RngCore> ServerConnection<R> {
 
         // PSK = HKDF-Expand-Label(rms, "resumption", ticket_nonce).
         let hash_len = suite.hash.output_len();
-        let mut psk = alloc::vec![0u8; hash_len];
+        let mut psk = crate::zeroize::Zeroizing::new(alloc::vec![0u8; hash_len]);
         psk_from_resumption(suite.hash, &rms, &ticket_nonce, &mut psk);
 
         // ticket_age_add: 4 random bytes. Generated before the plaintext is
@@ -3169,7 +3180,8 @@ fn system_now() -> Option<crate::x509::Time> {
 /// PSK accepted from the client's ClientHello: the recovered PSK bytes and
 /// the hash function that pinned them.
 struct AcceptedPsk {
-    psk: Vec<u8>,
+    /// The resumption PSK recovered from the ticket, wiped on drop.
+    psk: crate::zeroize::Zeroizing<Vec<u8>>,
     hash: HashAlg,
     /// ALPN protocol negotiated on the connection that issued the ticket
     /// (empty when none was). RFC 8446 §4.2.10: 0-RTT may only be accepted
@@ -3392,7 +3404,8 @@ const TICKET13_FORMAT_SUITE: u8 = 0x14;
 /// leaf            leaf_len bytes (DER)
 /// ```
 struct TicketPlaintext {
-    psk: Vec<u8>,
+    /// The resumption PSK the ticket carries, wiped on drop.
+    psk: crate::zeroize::Zeroizing<Vec<u8>>,
     alpn: Vec<u8>,
     creation_secs: u64,
     age_add: u32,
@@ -3430,7 +3443,10 @@ fn decrypt_ticket(
     let body = &ticket[12..];
     let (ct, tag_slice) = body.split_at(body.len() - 16);
     let tag: &[u8; 16] = tag_slice.try_into().ok()?;
-    let mut buf = ct.to_vec();
+    // `Zeroizing`, not a manual wipe at the end: every `?`/`return None`
+    // below (a malformed plaintext, an expired ticket) used to leave the
+    // decrypted PSK sitting in this buffer.
+    let mut buf = crate::zeroize::Zeroizing::new(ct.to_vec());
     let gcm = Gcm::new(Aes256::new(key));
     if gcm.decrypt(nonce, TICKET13_AAD, &mut buf, tag).is_err() {
         return None;
@@ -3465,7 +3481,7 @@ fn decrypt_ticket(
             return None;
         }
     }
-    let psk = c.vec_u8().ok()?.to_vec();
+    let psk = crate::zeroize::Zeroizing::new(c.vec_u8().ok()?.to_vec());
     let alpn = c.vec_u8().ok()?.to_vec();
     let client_leaf = match c.u8().ok()? {
         0 => None,
@@ -3473,7 +3489,6 @@ fn decrypt_ticket(
         _ => return None,
     };
     c.expect_empty().ok()?;
-    super::wipe(&mut buf);
     Some(TicketPlaintext {
         psk,
         alpn,
