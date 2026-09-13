@@ -320,3 +320,47 @@ jobs:
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features
+
+  lean_features:
+    # Every other clippy/doc run here uses `--all-features`, which hides a whole
+    # class of breakage: test code that needs `alloc` in a module that does not,
+    # test helpers that only exist under some features, and intra-doc links to
+    # items absent from a lean build. All of it was broken for nearly every
+    # feature until 2026-09-13 and nothing noticed. Check-only, so it is cheap.
+    name: Lean feature checks (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings -D rustdoc::broken-intra-doc-links
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with Cargo.toml's [features] when adding a feature.
+        include:
+          - shard: primitives
+            features: hash cipher kdf mac bignum rng der ec rsa dh ascon aez hpke ristretto255 bip340 key linux-getrandom hazmat-secp256k1 hazmat-edwards25519
+          - shard: pqc-and-protocols
+            features: mlkem mldsa hazmat-mldsa slhdsa lms xmss falcon x509 pkcs12 tls dtls quic tls-legacy ech cli
+          - shard: zkp
+            features: zkp-rangeproof zkp-halfagg zkp-surjection zkp-whitelist zkp-adaptor zkp-pedersen zkp-sign-to-contract zkp
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: lean-${{ matrix.shard }}
+
+      - name: clippy + rustdoc, one feature at a time
+        run: |
+          set -euo pipefail
+          for f in ${{ matrix.features }}; do
+            echo "::group::$f"
+            cargo clippy --no-default-features --features "$f" --all-targets -- -D warnings
+            cargo doc --no-deps --no-default-features --features "$f"
+            echo "::endgroup::"
+          done
