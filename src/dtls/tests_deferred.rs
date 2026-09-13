@@ -724,6 +724,41 @@ fn prev_read_epoch_expires_on_the_clock_13() {
     app_data_round_trip(&mut client, &mut server);
 }
 
+/// A close_notify received BEFORE the handshake completes must leave the
+/// connection closed for good: the engine must never report a complete
+/// (i.e. authenticated) handshake afterwards, whatever the peer sends next.
+#[test]
+fn close_notify_before_handshake_completion_never_completes_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i7-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"i7-server");
+
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    // Hold back the encrypted part of the server flight and slip an
+    // (authenticated, epoch-2) close_notify in behind the ServerHello, so
+    // the client is mid-handshake with the handshake keys installed.
+    let flight = server.pop_outbound_datagrams();
+    server.send_alert_record_for_test(1, 0);
+    let alert = server.pop_outbound_datagrams();
+    client.feed_datagram(&flight[0]).unwrap();
+    for dg in &alert {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(!client.is_handshake_complete());
+
+    // The rest of the handshake can never revive the connection.
+    for dg in &flight[1..] {
+        let _ = client.feed_datagram(dg);
+    }
+    assert!(!client.is_handshake_complete());
+    assert_eq!(
+        client.send(b"x"),
+        Err(crate::tls::Error::InappropriateState)
+    );
+}
+
 /// A KeyUpdate whose ACK never arrives closes the connection once the
 /// retransmit budget is spent (the peer may have moved on to the new epoch
 /// while we, per §8, may not).
