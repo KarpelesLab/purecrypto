@@ -278,14 +278,38 @@ name = "purecrypto"
 path = "src/bin/purecrypto/main.rs"
 required-features = ["cli"]
 
+# Every example below declares `required-features` so that a lean
+# `--no-default-features --features <module>` build (and, crucially,
+# `cargo clippy --all-targets` over one) skips the examples it cannot compile
+# instead of failing the whole check.
 [[example]]
 name = "tls_ech_loopback"
-required-features = ["ech"]
+required-features = ["ech", "std"]
+
+# Verifies an OpenSSL-generated RSA-PSS signature from disk.
+[[example]]
+name = "pss_interop"
+required-features = ["rsa", "der", "hash", "std"]
+
+# Builds a self-signed RSA certificate end to end.
+[[example]]
+name = "selfsigned_cert"
+required-features = ["bignum", "rng", "rsa", "x509", "std"]
+
+# Minimal blocking HTTPS client over `std::net::TcpStream`.
+[[example]]
+name = "tls_get"
+required-features = ["tls", "rng", "std"]
+
+# In-process client/server TLS handshake over a memory pipe.
+[[example]]
+name = "tls_loopback"
+required-features = ["tls", "rsa", "x509", "rng", "std"]
 
 # External (TPM/HSM) identity signing via the suspend/resume seam.
 [[example]]
 name = "tls_external_signing"
-required-features = ["tls"]
+required-features = ["tls", "std"]
 
 # Transparent pluggable private keys: one drive() loop for in-process or
 # device (TPM/HSM) keys. Models the device with a unix-socket-backed thread.
