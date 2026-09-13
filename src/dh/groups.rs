@@ -78,6 +78,18 @@ impl DhGroup {
     /// [`from_custom_unchecked`]: Self::from_custom_unchecked
     pub const MIN_CUSTOM_GROUP_BITS: usize = 2048;
 
+    /// Minimum private-exponent bit length accepted by
+    /// [`from_custom`](Self::from_custom).
+    ///
+    /// The exponent must be at least twice the target security level (RFC
+    /// 7919 §A, NIST SP 800-56A Rev 3 §5.6.1.1): the best generic attack on
+    /// the exponent is Pollard rho / BSGS at `2^(priv_bits/2)` work, so a
+    /// 224-bit exponent buys the 112 bits of security a 2048-bit prime is
+    /// worth and anything shorter makes the exponent — not the prime — the
+    /// weakest part of the exchange. `from_custom_unchecked` keeps the old
+    /// permissive floor (any non-zero value) for pinned legacy interop.
+    pub const MIN_CUSTOM_PRIV_BITS: usize = 224;
+
     /// Maximum bit length accepted by [`from_custom`](Self::from_custom) and
     /// [`from_custom_unchecked`](Self::from_custom_unchecked).
     ///
@@ -146,6 +158,9 @@ impl DhGroup {
     ///   [`from_custom_unchecked`](Self::from_custom_unchecked);
     /// * `g ∈ [2, p - 2]` (the only excluded values are 0, 1, and `p - 1`,
     ///   which are tiny-order elements);
+    /// * `priv_bits ≥ MIN_CUSTOM_PRIV_BITS` (224) — a short private exponent
+    ///   is attackable in `2^(priv_bits/2)` work regardless of how strong the
+    ///   prime is;
     /// * `p` is a **safe prime**: `q = (p − 1) / 2` passes trial division
     ///   and [`custom_group_mr_rounds`] rounds of Miller-Rabin, then `p` is
     ///   proved prime by a Lucas witness over the now-known factorization
@@ -180,6 +195,11 @@ impl DhGroup {
         // Size gates first — before any arithmetic on a peer-chosen width.
         let bits = p.bit_len();
         if !(Self::MIN_CUSTOM_GROUP_BITS..=Self::MAX_CUSTOM_GROUP_BITS).contains(&bits) {
+            return Err(Error::InvalidGroup);
+        }
+        // A short private exponent undoes the prime's security: the generic
+        // attack costs only `2^(priv_bits/2)`.
+        if priv_bits < Self::MIN_CUSTOM_PRIV_BITS {
             return Err(Error::InvalidGroup);
         }
         let group = Self::from_custom_unchecked(p, g, priv_bits)?;
@@ -697,6 +717,34 @@ mod tests {
         let p = BoxedUint::from_be_bytes(&p_bytes);
         assert_eq!(p.bit_len(), DhGroup::MAX_CUSTOM_GROUP_BITS);
         assert!(DhGroup::from_custom_unchecked(p, BoxedUint::from_u64(2), 512).is_ok());
+    }
+
+    /// A degenerate private-exponent budget must be refused by the checked
+    /// constructor: `priv_bits = 1` used to be accepted, making the exponent
+    /// (not the 2048-bit prime) the weakest link — recoverable in
+    /// `2^(priv_bits/2)` work. The unchecked constructor stays permissive for
+    /// pinned legacy interop.
+    #[test]
+    fn from_custom_enforces_private_exponent_floor() {
+        let p = group14().p().clone();
+        let g = BoxedUint::from_u64(2);
+        for short in [1usize, 8, 128, DhGroup::MIN_CUSTOM_PRIV_BITS - 1] {
+            assert!(
+                matches!(
+                    DhGroup::from_custom(p.clone(), g.clone(), short),
+                    Err(Error::InvalidGroup)
+                ),
+                "priv_bits = {short} must be rejected"
+            );
+            // …but the unchecked path still accepts it.
+            assert!(DhGroup::from_custom_unchecked(p.clone(), g.clone(), short).is_ok());
+        }
+        // The floor itself, and the RFC 7919 value for this group, pass.
+        assert!(
+            DhGroup::from_custom(p.clone(), g.clone(), DhGroup::MIN_CUSTOM_PRIV_BITS).is_ok(),
+            "the floor value itself must be accepted"
+        );
+        assert!(DhGroup::from_custom(p, g, 256).is_ok());
     }
 
     #[test]
