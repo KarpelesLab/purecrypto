@@ -694,26 +694,29 @@ impl DtlsClientConnection12 {
             };
             off += consumed;
             // On the unauthenticated (epoch-0, plaintext) path a single
-            // spoofed ServerHello must never abort OR derail the handshake.
-            // The silent-drop is scoped to the pre-ServerHello states
-            // (`WaitServerHelloOrHvr` / `WaitServerHello`): the only message
-            // dispatched there is the ServerHello, and a forged one that fails
-            // handshake-layer validation (e.g. a non-offered suite →
-            // HandshakeFailure) is exactly the spoofable derail this guards.
-            // Once the genuine ServerHello is accepted and we advance to
-            // `WaitCertificate`+, dispatch faults are real peer/auth faults
-            // (e.g. a certificate that doesn't match the requested host) and
-            // MUST stay fatal even though that flight is still epoch-0
-            // plaintext. The authenticated (epoch ≥ 1) path always stays fatal.
+            // spoofed handshake message must never abort OR derail the
+            // handshake. The whole DTLS 1.2 server flight — ServerHello,
+            // Certificate, ServerKeyExchange, ServerHelloDone — travels in
+            // plaintext, so every one of those messages is forgeable by an
+            // off-path attacker who can guess the 4-tuple; a fatal error
+            // there was a one-datagram handshake kill (mirroring the
+            // already-silent epoch-0 alert and HelloVerifyRequest paths).
+            // All four are therefore dropped silently, keeping only our own
+            // `InappropriateState` misconfiguration fatal. The handlers
+            // commit no state (transcript included) before validating, so a
+            // dropped message leaves nothing behind and the genuine
+            // retransmit is processed normally. A genuine fault (an
+            // untrusted certificate, a bad ServerKeyExchange signature)
+            // keeps failing on every retransmit and the handshake fails
+            // closed when the retransmit budget runs out — no error is
+            // reported early, but none is ever bypassed. The authenticated
+            // (epoch ≥ 1) path, i.e. the server Finished, always stays
+            // fatal.
             // `feed`/`pop_ready` advance `expected_msg_seq` BEFORE dispatch, so
             // on a silent drop we also rewind the reassembler: otherwise a
             // spoofed ServerHello would pin `expected_msg_seq` past the genuine
             // SH (same message_seq), which would then be rejected as stale.
-            let pre_sh = matches!(
-                self.state,
-                State::WaitServerHelloOrHvr | State::WaitServerHello
-            );
-            let spoofable = !authenticated && pre_sh;
+            let spoofable = !authenticated && self.plaintext_flight_state();
             let snapshot = self.reassembler.expected_msg_seq();
             if let Some((msg_type, body)) = self.reassembler.feed(frag) {
                 match self.dispatch_one(msg_type, &body) {
@@ -730,11 +733,7 @@ impl DtlsClientConnection12 {
             // Drain any further messages whose fragments were buffered
             // before earlier ones (out-of-order record delivery).
             loop {
-                let pre_sh = matches!(
-                    self.state,
-                    State::WaitServerHelloOrHvr | State::WaitServerHello
-                );
-                let spoofable = !authenticated && pre_sh;
+                let spoofable = !authenticated && self.plaintext_flight_state();
                 let snapshot = self.reassembler.expected_msg_seq();
                 let Some((msg_type, body)) = self.reassembler.pop_ready() else {
                     break;
@@ -752,6 +751,22 @@ impl DtlsClientConnection12 {
             }
         }
         Ok(())
+    }
+
+    /// True while the messages this client still expects arrive as epoch-0
+    /// plaintext — i.e. anything up to and including ServerHelloDone. A
+    /// dispatch fault in one of those states is attacker-spoofable and is
+    /// dropped silently; from `WaitServerFinished` on, the peer's messages
+    /// are AEAD-protected and every fault is a genuine peer fault.
+    fn plaintext_flight_state(&self) -> bool {
+        matches!(
+            self.state,
+            State::WaitServerHelloOrHvr
+                | State::WaitServerHello
+                | State::WaitCertificate
+                | State::WaitServerKeyExchange
+                | State::WaitServerHelloDone
+        )
     }
 
     fn dispatch_one(&mut self, msg_type: u8, body: &[u8]) -> Result<(), Error> {
@@ -977,12 +992,15 @@ impl DtlsClientConnection12 {
         if msg_type != hs_type::SERVER_HELLO_DONE {
             return Err(Error::UnexpectedMessage);
         }
-        self.transcript.update(raw);
-
-        // Complete ECDHE + derive master + key block.
+        // Complete ECDHE + derive master + key block. Everything that can
+        // fail happens BEFORE the transcript is touched: this message is
+        // unauthenticated epoch-0 input, and a dispatch fault here is
+        // silently dropped, so a half-applied transcript would poison the
+        // genuine retransmit.
         let group = self.peer_group.ok_or(Error::InappropriateState)?;
         let peer_point = self.peer_point.clone().ok_or(Error::InappropriateState)?;
         let (mut premaster, our_point) = self.ecdhe(group, &peer_point)?;
+        self.transcript.update(raw);
 
         // Build the client's final flight: CKE, CCS, Finished.
         let mut flight = Flight::new();

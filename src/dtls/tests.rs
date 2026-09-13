@@ -164,18 +164,22 @@ fn rejects_certificate_with_mismatched_hostname_12() {
     }
     // Server flight (SH/Cert/SKE/SHDone). Feeding the Certificate must make the
     // client fail closed because the leaf does not match "wrong.example".
+    // The whole DTLS 1.2 server flight is unauthenticated epoch-0 plaintext,
+    // so the rejection is a silent drop (a fatal error there would be a
+    // one-spoofed-datagram handshake kill): the client never advances, never
+    // answers with its own flight, and the handshake fails closed on the
+    // retransmit budget. `accepts_certificate_with_matching_hostname_12` is
+    // the control that proves the hostname check is what stops it.
     let s1 = server.pop_outbound_datagrams();
     assert!(!s1.is_empty(), "server should have emitted flight");
-    let mut saw_err = false;
     for dg in &s1 {
-        if client.feed_datagram(dg).is_err() {
-            saw_err = true;
-        }
+        assert_eq!(client.feed_datagram(dg), Ok(()));
     }
     assert!(
-        saw_err,
-        "client must reject a certificate that does not match the requested host"
+        client.pop_outbound_datagrams().is_empty(),
+        "client must not answer a certificate that does not match the requested host"
     );
+    assert!(!pump_handshake(&mut client, &mut server));
     assert!(
         !client.is_handshake_complete(),
         "handshake must not complete with a mismatched server certificate"
@@ -809,6 +813,34 @@ fn spoofed_server_hello_does_not_abort_client_12() {
     assert_eq!(client.feed_datagram(&forged_sh), Ok(()));
 
     // The handshake still completes with the genuine server.
+    assert!(pump_handshake(&mut client, &mut server));
+}
+
+/// Regression (off-path one-datagram DoS): the DTLS 1.2 server flight is
+/// unauthenticated epoch-0 plaintext all the way to ServerHelloDone, so a
+/// spoofed Certificate/ServerKeyExchange/ServerHelloDone must be dropped
+/// silently instead of tearing the handshake down. Here a forged
+/// Certificate is buffered at message_seq 1 before the genuine ServerHello
+/// arrives; dispatching it used to return BadCertificate fatally out of
+/// `feed_datagram`.
+#[test]
+fn spoofed_certificate_does_not_abort_client_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-spoof-cert", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // Forged Certificate (type 11) at the server's message_seq 1: a
+    // 3-byte list length of 1 with no certificate bytes behind it.
+    let forged = dtls12_plaintext_handshake_record(11, 1, &[0x00, 0x00, 0x01]);
+    assert_eq!(client.feed_datagram(&forged), Ok(()));
+
+    // The genuine handshake still completes: the buffered forgery is
+    // dispatched (and dropped) the moment the real ServerHello lands, and
+    // the reassembler is rewound so the genuine Certificate at the same
+    // message_seq is still accepted.
     assert!(pump_handshake(&mut client, &mut server));
 }
 
@@ -2750,12 +2782,15 @@ mod security_regressions {
     // default-configured DTLS client.
     // ---------------------------------------------------------------
 
-    /// Drives the DTLS 1.2 pair and returns the first error the CLIENT
-    /// raised while consuming the server's flight, if any.
-    fn pump_until_client_error<R: crate::rng::RngCore>(
+    /// Drives the DTLS 1.2 pair and reports whether the CLIENT refused the
+    /// server's flight. The flight is unauthenticated epoch-0 plaintext, so
+    /// a rejection is a silent drop (never a fatal error, which a spoofed
+    /// datagram could then trigger at will): the refusal shows up as the
+    /// client never answering and the handshake never completing.
+    fn client_refuses_server_flight<R: crate::rng::RngCore>(
         client: &mut DtlsClientConnection12,
         server: &mut DtlsServerConnection12<R>,
-    ) -> Option<Error> {
+    ) -> bool {
         for _ in 0..32 {
             let c_out = client.pop_outbound_datagrams();
             for dg in &c_out {
@@ -2763,15 +2798,13 @@ mod security_regressions {
             }
             let s_out = server.pop_outbound_datagrams();
             for dg in &s_out {
-                if let Err(e) = client.feed_datagram(dg) {
-                    return Some(e);
-                }
+                assert_eq!(client.feed_datagram(dg), Ok(()));
             }
             if c_out.is_empty() && s_out.is_empty() {
                 break;
             }
         }
-        None
+        !client.is_handshake_complete()
     }
 
     #[test]
@@ -2796,9 +2829,8 @@ mod security_regressions {
         let mut server =
             DtlsServerConnection12::new(Arc::new(server_cfg), b"peer-a".to_vec(), srng);
 
-        let err = pump_until_client_error(&mut client, &mut server);
         assert!(
-            err.is_some(),
+            client_refuses_server_flight(&mut client, &mut server),
             "a default-configured DTLS 1.2 client must reject an expired chain"
         );
         assert!(!client.is_handshake_complete());
