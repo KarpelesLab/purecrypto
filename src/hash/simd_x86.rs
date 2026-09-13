@@ -1,6 +1,7 @@
 //! Shared x86_64 SIMD helpers for the wide hash backends.
 //!
-//! Both the multi-buffer SHA-256 kernel ([`super::sha256_mb`]) and the 8-way
+//! Both the multi-buffer SHA-256 kernel (`sha256_mb`, compiled only for the
+//! hash-based signature schemes) and the 8-way
 //! BLAKE3 kernel ([`super::blake3_simd`]) load eight independent lanes as the
 //! rows of an 8×8 matrix of 32-bit words and need the same transpose to move
 //! between lane-major and word-major layouts. Keep that one intrinsic
