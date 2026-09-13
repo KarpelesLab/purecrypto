@@ -194,6 +194,11 @@ fn random_base<R: RngCore>(n: &BoxedUint, n_minus_1: &BoxedUint, rng: &mut R) ->
 /// would cost — with the false-accept probability *improved* to
 /// `4^-rounds` for the whole pair (the only way in is a composite `q`
 /// surviving its rounds). Not constant time: only feed it public candidates.
+///
+/// Only `dh` (custom-group validation) calls this; `rsa` keygen uses
+/// [`is_prime_boxed`]. Kept under `test` so the exactness tests below still
+/// run in an `rsa`-only build.
+#[cfg(any(feature = "dh", test))]
 pub(crate) fn is_safe_prime_boxed<R: RngCore>(p: &BoxedUint, rng: &mut R, rounds: usize) -> bool {
     let one = BoxedUint::from_u64(1);
     // p ≥ 7 (the smallest safe prime with q > 2 is 7 = 2·3 + 1; 5 = 2·2 + 1
