@@ -430,11 +430,11 @@ impl Certificate {
         Ok(Certificate { der })
     }
 
-    /// Parses a PEM `CERTIFICATE` document.
+    /// Parses a PEM `CERTIFICATE` document. The decoded body goes through the
+    /// same structural check as [`Certificate::from_der`]: a single SEQUENCE
+    /// with no trailing bytes.
     pub fn from_pem(pem: &str) -> Result<Certificate, Error> {
-        Ok(Certificate {
-            der: pem_decode(pem, PEM_LABEL)?,
-        })
+        Certificate::from_der(pem_decode(pem, PEM_LABEL)?)
     }
 
     /// The DER encoding.
@@ -1710,6 +1710,23 @@ tvee2FY=\n\
             &expected_pin,
             "SHA-256(spki_der) must match the OpenSSL/curl public-key pin",
         );
+    }
+
+    /// `from_pem` must apply the same structural check as `from_der`: the
+    /// decoded body is one SEQUENCE with nothing after it. Otherwise a PEM
+    /// blob with appended junk would hash/pin differently from what a peer
+    /// parsed out of it.
+    #[test]
+    fn from_pem_rejects_trailing_data() {
+        let name = DistinguishedName::common_name("pem trailing data");
+        let cert =
+            Certificate::self_signed(&rsa_test_key_a(), &name, &validity(), 1, true).unwrap();
+        assert_eq!(Certificate::from_pem(&cert.to_pem()).unwrap(), cert);
+        let mut der = cert.to_der().to_vec();
+        der.push(0x00);
+        let pem = pem_encode(PEM_LABEL, &der);
+        assert!(Certificate::from_pem(&pem).is_err());
+        assert!(Certificate::from_der(der).is_err());
     }
 
     #[test]

@@ -385,6 +385,10 @@ impl Validity {
         let mut seq = reader.read_sequence()?;
         let not_before = read_time(&mut seq)?;
         let not_after = read_time(&mut seq)?;
+        // Strict DER (X.690 §11): the Validity SEQUENCE holds exactly the two
+        // Times. Trailing bytes inside it would otherwise be silently ignored,
+        // letting two parsers disagree about what was signed.
+        seq.finish()?;
         Ok(Validity {
             not_before,
             not_after,
@@ -640,6 +644,20 @@ mod tests {
         let der = encode_sequence(&body);
         let v = Validity::decode(&mut Reader::new(&der)).unwrap();
         assert!(v.accepts(&Time::utc(2026, 5, 26, 12, 0, 0)));
+    }
+
+    /// Strict DER: the Validity SEQUENCE holds exactly notBefore + notAfter.
+    /// Anything after them (a third Time, junk) must be rejected, not ignored.
+    #[test]
+    fn validity_rejects_trailing_bytes() {
+        let body = [
+            encode_string(tag::UTC_TIME, "240101000000Z"),
+            encode_string(tag::UTC_TIME, "340101000000Z"),
+            encode_string(tag::UTC_TIME, "300101000000Z"),
+        ]
+        .concat();
+        let der = encode_sequence(&body);
+        assert!(Validity::decode(&mut Reader::new(&der)).is_err());
     }
 
     #[test]
