@@ -168,13 +168,19 @@ pub fn hkdf<D: Digest>(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
 #[cfg(test)]
 mod parts_tests {
     use super::*;
-    use crate::hash::{Sha256, Sha512};
+    use crate::hash::Sha256;
 
     /// The multi-part forms must be byte-identical to the concatenating ones —
     /// that equivalence is the whole contract, and it is what lets callers drop
     /// a heap buffer that existed only to be hashed.
+    ///
+    /// The reference side of the comparison is the concatenating form, so the
+    /// test (not `hkdf_extract_parts`) needs a heap to build the joined input.
+    #[cfg(feature = "alloc")]
     #[test]
     fn extract_parts_matches_concatenated() {
+        use crate::hash::Sha512;
+
         let parts: [&[u8]; 4] = [
             b"HPKE-v1",
             b"KEM\x00\x20",
@@ -192,6 +198,8 @@ mod parts_tests {
         }
     }
 
+    /// Same reason as above: the joined reference input is heap-built.
+    #[cfg(feature = "alloc")]
     #[test]
     fn expand_parts_matches_concatenated() {
         let prk = hkdf_extract::<Sha256>(b"salt", b"ikm");
@@ -215,7 +223,9 @@ mod parts_tests {
         assert_eq!(a.as_ref(), b.as_ref());
     }
 
-    /// The length guard is shared with the single-slice form.
+    /// The length guard is shared with the single-slice form. Needs a heap:
+    /// the over-long output buffer is 8 KiB + 1.
+    #[cfg(feature = "alloc")]
     #[test]
     fn expand_parts_rejects_over_long_output() {
         let prk = hkdf_extract::<Sha256>(b"", b"");

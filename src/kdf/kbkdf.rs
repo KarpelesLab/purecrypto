@@ -619,27 +619,31 @@ mod tests {
     #[test]
     fn cmac_wrong_key_length_is_an_error() {
         let mut out = [0u8; 32];
+        // Sliced out of one fixed buffer rather than a `Vec` per length, so
+        // the case also runs in an allocator-free build.
+        let key_bytes = [0x11u8; 64];
         for bad in [0usize, 1, 15, 17, 32, 64] {
-            let ki = alloc::vec![0x11u8; bad];
+            let ki = &key_bytes[..bad];
             assert_eq!(
-                kbkdf_counter::<CmacAes128Prf>(&ki, b"l", b"c", &mut out),
+                kbkdf_counter::<CmacAes128Prf>(ki, b"l", b"c", &mut out),
                 Err(Error::InvalidKeyLength),
                 "AES-128 key of {bad} bytes"
             );
             assert_eq!(
-                kbkdf_counter_fixed::<CmacAes128Prf>(&ki, b"fixed", &mut out),
+                kbkdf_counter_fixed::<CmacAes128Prf>(ki, b"fixed", &mut out),
                 Err(Error::InvalidKeyLength)
             );
         }
+        let key_bytes = [0x22u8; 33];
         for bad in [0usize, 16, 31, 33] {
-            let ki = alloc::vec![0x22u8; bad];
+            let ki = &key_bytes[..bad];
             assert_eq!(
-                kbkdf_feedback::<CmacAes256Prf>(&ki, b"iv", b"l", b"c", &mut out),
+                kbkdf_feedback::<CmacAes256Prf>(ki, b"iv", b"l", b"c", &mut out),
                 Err(Error::InvalidKeyLength),
                 "AES-256 key of {bad} bytes"
             );
             assert_eq!(
-                kbkdf_feedback_fixed::<CmacAes256Prf>(&ki, b"iv", b"fixed", &mut out),
+                kbkdf_feedback_fixed::<CmacAes256Prf>(ki, b"iv", b"fixed", &mut out),
                 Err(Error::InvalidKeyLength)
             );
         }
