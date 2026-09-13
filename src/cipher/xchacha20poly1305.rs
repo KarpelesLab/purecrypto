@@ -10,6 +10,7 @@
 use super::TagMismatch;
 use super::chacha20::hchacha20;
 use super::chacha20poly1305::ChaCha20Poly1305;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// An XChaCha20-Poly1305 AEAD context keyed with a 256-bit key.
 #[derive(Clone)]
@@ -33,8 +34,7 @@ impl XChaCha20Poly1305 {
         let aead = ChaCha20Poly1305::new(&subkey);
         // `subkey` is a full-strength key for the inner AEAD; don't leave a
         // copy of it on the stack once the context owns it.
-        subkey = [0u8; 32];
-        let _ = core::hint::black_box(&subkey);
+        subkey.zeroize();
         let mut inner_nonce = [0u8; 12];
         inner_nonce[4..].copy_from_slice(&nonce[16..]);
         (aead, inner_nonce)
@@ -65,11 +65,13 @@ impl XChaCha20Poly1305 {
 
 impl Drop for XChaCha20Poly1305 {
     fn drop(&mut self) {
-        // Best-effort wipe of the key, matching the AES round-key drop.
-        self.key = [0u8; 32];
-        let _ = core::hint::black_box(&self.key);
+        // Best-effort wipe of the key through `Zeroize` (volatile stores plus
+        // a compiler fence, so LLVM cannot elide them as dead stores).
+        self.key.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for XChaCha20Poly1305 {}
 
 // Uses the `alloc`-gated hex helpers.
 #[cfg(all(test, feature = "alloc"))]

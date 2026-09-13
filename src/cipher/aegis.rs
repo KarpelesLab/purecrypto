@@ -39,6 +39,7 @@
 use super::TagMismatch;
 use super::aes::aes_round;
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// AEGIS constant `C0` (`draft-irtf-cfrg-aegis-aead`, derived from the
 /// Fibonacci sequence modulo 256).
@@ -198,8 +199,7 @@ impl State128L {
 
 impl Drop for State128L {
     fn drop(&mut self) {
-        self.s = [[0u8; 16]; 8];
-        let _ = core::hint::black_box(&self.s);
+        self.s.zeroize();
     }
 }
 
@@ -378,10 +378,11 @@ impl Aegis128L {
 
 impl Drop for Aegis128L {
     fn drop(&mut self) {
-        self.key = [0u8; 16];
-        let _ = core::hint::black_box(&self.key);
+        self.key.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for Aegis128L {}
 
 // ===========================================================================
 // AEGIS-256
@@ -495,8 +496,7 @@ impl State256 {
 
 impl Drop for State256 {
     fn drop(&mut self) {
-        self.s = [[0u8; 16]; 6];
-        let _ = core::hint::black_box(&self.s);
+        self.s.zeroize();
     }
 }
 
@@ -634,10 +634,11 @@ impl Aegis256 {
 
 impl Drop for Aegis256 {
     fn drop(&mut self) {
-        self.key = [0u8; 32];
-        let _ = core::hint::black_box(&self.key);
+        self.key.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for Aegis256 {}
 
 /// A small heap-free scratch buffer for trial decryption, so a tag mismatch
 /// never overwrites the caller's ciphertext. Uses `alloc` when available, and
@@ -687,6 +688,10 @@ impl ScratchVec {
 
 impl Drop for ScratchVec {
     fn drop(&mut self) {
+        // The buffer is as long as the message, so this stays a plain
+        // (memset-able) zeroing loop plus `black_box` rather than
+        // `crate::zeroize::Zeroize`'s per-byte volatile stores, which would
+        // put a byte-at-a-time pass over every decrypted message.
         for b in self.as_mut().iter_mut() {
             *b = 0;
         }

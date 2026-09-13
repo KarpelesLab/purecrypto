@@ -15,6 +15,7 @@
 
 use super::BlockCipher;
 use super::gcm::Gcm;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A GMAC context: GCM in MAC-only mode over a fixed nonce.
 ///
@@ -123,14 +124,15 @@ impl<C: BlockCipher> Drop for Gmac<C> {
         // The message and the running accumulator are not themselves secret,
         // but wipe them along with the nonce, mirroring the other MAC drops in
         // this module. (`Gcm`'s own `Drop` handles H and its powers.)
-        self.nonce = [0u8; 12];
-        self.block = [0u8; 16];
-        self.acc = 0;
-        let _ = core::hint::black_box(&self.nonce);
-        let _ = core::hint::black_box(&self.block);
-        let _ = core::hint::black_box(&self.acc);
+        // `Zeroize` gives volatile stores plus a compiler fence, so LLVM
+        // cannot elide them as dead stores.
+        self.nonce.zeroize();
+        self.block.zeroize();
+        self.acc.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Gmac<C> {}
 
 // The `Mac` trait lives in the `hash` module, so this impl is only available
 // when that module is compiled in.

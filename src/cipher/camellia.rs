@@ -24,6 +24,7 @@
 
 use super::BlockCipher;
 use super::aes::gf::sub_byte;
+use crate::zeroize::Zeroize;
 
 // --- S-boxes, computed table-free via the AES S-box ------------------------
 
@@ -169,12 +170,8 @@ fn ka_kb(kl: (u64, u64), kr: (u64, u64)) -> ((u64, u64), (u64, u64)) {
 
     // The Feistel temporaries hold KA and KB, from which the whole schedule
     // (and, with KL, the key) follows; don't leave them in the frame.
-    d1 = 0;
-    d2 = 0;
-    e1 = 0;
-    e2 = 0;
-    for v in [&d1, &d2, &e1, &e2] {
-        let _ = core::hint::black_box(v);
+    for v in [&mut d1, &mut d2, &mut e1, &mut e2] {
+        v.zeroize();
     }
 
     (ka, kb)
@@ -247,10 +244,9 @@ impl Schedule {
         };
         // KA is key-equivalent and KL *is* the key; the schedule now owns
         // everything needed.
-        ka = (0, 0);
-        kl = (0, 0);
-        let _ = core::hint::black_box(&ka);
-        let _ = core::hint::black_box(&kl);
+        for v in [&mut ka.0, &mut ka.1, &mut kl.0, &mut kl.1] {
+            v.zeroize();
+        }
         sched
     }
 
@@ -305,14 +301,11 @@ impl Schedule {
         };
         // KA/KB are key-equivalent and KL‖KR *is* the key; the schedule now
         // owns everything needed.
-        ka = (0, 0);
-        kb = (0, 0);
-        kl = (0, 0);
-        kr = (0, 0);
-        let _ = core::hint::black_box(&ka);
-        let _ = core::hint::black_box(&kb);
-        let _ = core::hint::black_box(&kl);
-        let _ = core::hint::black_box(&kr);
+        for v in [
+            &mut ka.0, &mut ka.1, &mut kb.0, &mut kb.1, &mut kl.0, &mut kl.1, &mut kr.0, &mut kr.1,
+        ] {
+            v.zeroize();
+        }
         sched
     }
 
@@ -416,15 +409,16 @@ macro_rules! camellia_variant {
 
         impl Drop for $name {
             fn drop(&mut self) {
+                // Volatile stores plus a compiler fence, via `Zeroize`.
                 for s in [&mut self.enc, &mut self.dec] {
-                    s.kw = [0u64; 4];
-                    s.k = [0u64; 24];
-                    s.ke = [0u64; 6];
+                    s.kw.zeroize();
+                    s.k.zeroize();
+                    s.ke.zeroize();
                 }
-                core::hint::black_box(&self.enc.k);
-                core::hint::black_box(&self.dec.k);
             }
         }
+
+        impl crate::zeroize::ZeroizeOnDrop for $name {}
     };
 }
 

@@ -25,6 +25,7 @@
 
 use super::BlockCipher;
 use super::aes::gf::{gf_inv, inv_sub_byte, sub_byte};
+use crate::zeroize::Zeroize;
 
 // --- S-boxes, computed table-free from the GF(2⁸) inverse -------------------
 
@@ -252,17 +253,10 @@ fn expand(master: &[u8; 32], key_bytes: usize) -> ([[u8; 16]; 17], [[u8; 16]; 17
     // Best-effort wipe of the key-schedule intermediates: `w0` *is* KL, and
     // W1..W3 recover it. The round keys themselves live in the cipher, whose
     // `Drop` zeroizes them.
-    kl = [0u8; 16];
-    kr = [0u8; 16];
-    w0 = [0u8; 16];
-    w1 = [0u8; 16];
-    w2 = [0u8; 16];
-    w3 = [0u8; 16];
-    w = [[0u8; 16]; 4];
-    for v in [&kl, &kr, &w0, &w1, &w2, &w3] {
-        let _ = core::hint::black_box(v);
+    for v in [&mut kl, &mut kr, &mut w0, &mut w1, &mut w2, &mut w3] {
+        v.zeroize();
     }
-    let _ = core::hint::black_box(&w);
+    w.zeroize();
 
     (ek, dk, nr)
 }
@@ -326,13 +320,13 @@ macro_rules! aria_variant {
 
         impl Drop for $name {
             fn drop(&mut self) {
-                for w in self.ek.iter_mut().chain(self.dk.iter_mut()) {
-                    *w = [0u8; 16];
-                }
-                core::hint::black_box(&self.ek);
-                core::hint::black_box(&self.dk);
+                // Volatile stores plus a compiler fence, via `Zeroize`.
+                self.ek.zeroize();
+                self.dk.zeroize();
             }
         }
+
+        impl crate::zeroize::ZeroizeOnDrop for $name {}
     };
 }
 

@@ -10,6 +10,7 @@
 
 use super::{BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// GF(2¹²⁸) reduction constant `R = 11100001 ‖ 0¹²⁰` in the GCM bit ordering.
 const R: u128 = 0xe1000000000000000000000000000000;
@@ -447,18 +448,19 @@ impl<C: BlockCipher> Drop for Gcm<C> {
     fn drop(&mut self) {
         // Best-effort wipe of the GHASH subkey `H = E_K(0¹²⁸)` and its
         // precomputed powers, which are secret-equivalent (they let an
-        // attacker forge tags, and nonce reuse already leaks H). Same
-        // `core::hint::black_box`-guarded zeroing as the AES round-key drop
-        // in `cipher/aes/mod.rs`.
-        self.h = 0;
-        let _ = core::hint::black_box(&self.h);
+        // attacker forge tags, and nonce reuse already leaks H). `Zeroize`
+        // gives volatile stores plus a compiler fence, so LLVM cannot elide
+        // them as dead stores; the key itself lives in `cipher`, whose own
+        // `Drop` wipes it.
+        self.h.zeroize();
         #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
         {
-            self.hpow = [0u128; 8];
-            let _ = core::hint::black_box(&self.hpow);
+            self.hpow.zeroize();
         }
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Gcm<C> {}
 
 /// AES-128 in GCM mode.
 pub type Aes128Gcm = Gcm<super::Aes128>;

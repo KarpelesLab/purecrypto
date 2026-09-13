@@ -6,6 +6,7 @@
 //! separate methods. A (key, IV) pair must never be reused.
 
 use super::BlockCipher;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// CFB-128 mode wrapper around a block cipher.
 #[derive(Clone)]
@@ -71,14 +72,14 @@ impl<C: BlockCipher> Cfb<C> {
 
 impl<C: BlockCipher> Drop for Cfb<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the residual key-stream block. Same
-        // `core::hint::black_box`-guarded zeroing as `cipher/aes/mod.rs`.
-        for b in self.keystream.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.keystream);
+        // Best-effort wipe of the residual key-stream block, through
+        // `Zeroize` (volatile stores plus a compiler fence, so LLVM cannot
+        // elide them as dead stores).
+        self.keystream.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Cfb<C> {}
 
 #[cfg(test)]
 mod tests {

@@ -13,6 +13,7 @@
 
 use super::BlockCipher;
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The GF(2¹²⁸) reduction polynomial constant for the `dbl` operation
 /// (`x⁷ + x² + x + 1`, RFC 4493 §2.3).
@@ -153,19 +154,18 @@ impl<C: BlockCipher> Cmac<C> {
 
 impl<C: BlockCipher> Drop for Cmac<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the secret subkeys and chaining/buffer state, the
-        // same `core::hint::black_box`-guarded zeroing used by the AES round-key
-        // drop in `cipher/aes/mod.rs`.
-        self.k1 = [0u8; 16];
-        self.k2 = [0u8; 16];
-        self.state = [0u8; 16];
-        self.pending = [0u8; 16];
-        let _ = core::hint::black_box(&self.k1);
-        let _ = core::hint::black_box(&self.k2);
-        let _ = core::hint::black_box(&self.state);
-        let _ = core::hint::black_box(&self.pending);
+        // Best-effort wipe of the secret subkeys and chaining/buffer state
+        // through `Zeroize` (volatile stores plus a compiler fence, so LLVM
+        // cannot elide them as dead stores). The key itself lives in
+        // `cipher`, whose own `Drop` wipes it.
+        self.k1.zeroize();
+        self.k2.zeroize();
+        self.state.zeroize();
+        self.pending.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Cmac<C> {}
 
 // The `Mac` trait lives in the `hash` module, so this impl is only available
 // when that module is compiled in.

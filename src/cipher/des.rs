@@ -59,6 +59,7 @@
 //! - NIST SP 800-67 Rev 2 (2017) — TDES specification.
 
 use super::{BlockCipher64, InvalidLength};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 // ---- DES tables (FIPS 46-3 §8) ----------------------------------------
 
@@ -310,7 +311,7 @@ fn key_schedule(key: u64) -> [u64; 16] {
     let mut c = ((pc1 >> 28) as u32) & mask28;
     let mut d = (pc1 as u32) & mask28;
     let mut rk = [0u64; 16];
-    let mut cd: u64;
+    let mut cd = 0u64;
     for i in 0..16 {
         c = rol28(c, SHIFTS[i] as u32);
         d = rol28(d, SHIFTS[i] as u32);
@@ -320,14 +321,10 @@ fn key_schedule(key: u64) -> [u64; 16] {
     }
     // `pc1` and the rotating halves are the 56 effective key bits (PC-1 is a
     // permutation, so the key is read straight off them); scrub the frame.
-    pc1 = 0;
-    c = 0;
-    d = 0;
-    cd = 0;
-    let _ = core::hint::black_box(&pc1);
-    let _ = core::hint::black_box(&c);
-    let _ = core::hint::black_box(&d);
-    let _ = core::hint::black_box(&cd);
+    pc1.zeroize();
+    c.zeroize();
+    d.zeroize();
+    cd.zeroize();
     rk
 }
 
@@ -402,12 +399,12 @@ impl BlockCipher64 for Des {
 
 impl Drop for Des {
     fn drop(&mut self) {
-        for k in self.rk.iter_mut() {
-            *k = 0;
-        }
-        core::hint::black_box(&self.rk);
+        // Volatile stores plus a compiler fence, via `Zeroize`.
+        self.rk.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for Des {}
 
 /// 3-key Triple-DES (DES-EDE3) — 24-byte key as `K1 || K2 || K3`.
 /// Encryption is `E_K3(D_K2(E_K1(P)))`; decryption is its inverse.
@@ -436,8 +433,7 @@ impl TdesEde3 {
         k.copy_from_slice(&key[16..24]);
         let k3 = key_schedule(load_be(&k));
         // `k` still holds K3 verbatim.
-        k = [0u8; 8];
-        let _ = core::hint::black_box(&k);
+        k.zeroize();
         Self { k1, k2, k3 }
     }
 }
@@ -462,14 +458,14 @@ impl BlockCipher64 for TdesEde3 {
 
 impl Drop for TdesEde3 {
     fn drop(&mut self) {
+        // Volatile stores plus a compiler fence, via `Zeroize`.
         for ks in [&mut self.k1, &mut self.k2, &mut self.k3] {
-            for k in ks.iter_mut() {
-                *k = 0;
-            }
-            core::hint::black_box(&*ks);
+            ks.zeroize();
         }
     }
 }
+
+impl ZeroizeOnDrop for TdesEde3 {}
 
 /// 2-key Triple-DES (DES-EDE2) — 16-byte key as `K1 || K2`, executed
 /// as `E_K1(D_K2(E_K1(P)))`. Equivalent to [`TdesEde3`] with `K3 = K1`.
@@ -492,8 +488,7 @@ impl TdesEde2 {
         k.copy_from_slice(&key[8..16]);
         let k2 = key_schedule(load_be(&k));
         // `k` still holds K2 verbatim.
-        k = [0u8; 8];
-        let _ = core::hint::black_box(&k);
+        k.zeroize();
         Self { k1, k2 }
     }
 }
@@ -518,14 +513,14 @@ impl BlockCipher64 for TdesEde2 {
 
 impl Drop for TdesEde2 {
     fn drop(&mut self) {
+        // Volatile stores plus a compiler fence, via `Zeroize`.
         for ks in [&mut self.k1, &mut self.k2] {
-            for k in ks.iter_mut() {
-                *k = 0;
-            }
-            core::hint::black_box(&*ks);
+            ks.zeroize();
         }
     }
 }
+
+impl ZeroizeOnDrop for TdesEde2 {}
 
 // ---- CBC mode for 64-bit blocks ----------------------------------------
 
@@ -592,14 +587,13 @@ impl<C: BlockCipher64> Cbc64<C> {
 
 impl<C: BlockCipher64> Drop for Cbc64<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the residual chaining block, matching the
-        // 128-bit `Cbc` (`cipher/cbc.rs`).
-        for b in self.chain.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.chain);
+        // Best-effort wipe of the residual chaining block through `Zeroize`,
+        // matching the 128-bit `Cbc` (`cipher/cbc.rs`).
+        self.chain.zeroize();
     }
 }
+
+impl<C: BlockCipher64> ZeroizeOnDrop for Cbc64<C> {}
 
 #[cfg(test)]
 mod tests {

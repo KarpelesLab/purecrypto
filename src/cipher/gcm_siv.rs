@@ -13,6 +13,7 @@
 
 use super::{Aes128, Aes256, BlockCipher, TagMismatch};
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// POLYVAL's `dot(a, b) = a · b · x⁻¹²⁸` (RFC 8452 §3): the field operation that
 /// actually drives the POLYVAL iteration `S_j = dot(S_{j-1} ⊕ X_j, H)`.
@@ -153,7 +154,7 @@ impl AesGcmSiv {
         let enc_blocks = self.key_len / 8; // 2 for AES-128, 4 for AES-256.
 
         // Counters 0,1 -> auth key; 2.. -> encryption key.
-        let mut b: [u8; 16];
+        let mut b = [0u8; 16];
         for counter in 0u32..(2 + enc_blocks as u32) {
             block[..4].copy_from_slice(&counter.to_le_bytes());
             b = block;
@@ -168,16 +169,14 @@ impl AesGcmSiv {
             }
         }
         // The last AES output block holds half of the encryption key.
-        b = [0u8; 16];
-        let _ = core::hint::black_box(&b);
+        b.zeroize();
 
         let enc_cipher = match self.key_len {
             16 => Cipher::Aes128(Aes128::new(enc_key[..16].try_into().unwrap())),
             _ => Cipher::Aes256(Aes256::new(&enc_key)),
         };
         // Wipe the derived encryption-key bytes from the stack.
-        enc_key = [0u8; 32];
-        let _ = core::hint::black_box(&enc_key);
+        enc_key.zeroize();
         (auth_key, enc_cipher)
     }
 
@@ -289,8 +288,7 @@ impl AesGcmSiv {
         Self::ctr(&enc_cipher, &tag, buffer);
         // The per-nonce POLYVAL key forges tags for this nonce; `enc_cipher`
         // scrubs its own round keys on drop, so this is the only leftover.
-        auth_key = [0u8; 16];
-        let _ = core::hint::black_box(&auth_key);
+        auth_key.zeroize();
         tag
     }
 
@@ -315,14 +313,12 @@ impl AesGcmSiv {
         // CTR-decrypt first (POLYVAL is over the plaintext).
         Self::ctr(&enc_cipher, tag, buffer);
         let expected = Self::make_tag(&auth_key, &enc_cipher, nonce, aad, buffer);
-        auth_key = [0u8; 16];
-        let _ = core::hint::black_box(&auth_key);
+        auth_key.zeroize();
         if bool::from(expected.ct_eq(tag)) {
             Ok(())
         } else {
-            for b in buffer.iter_mut() {
-                *b = 0;
-            }
+            // Unauthenticated plaintext must not reach the caller.
+            buffer.zeroize();
             Err(TagMismatch)
         }
     }
@@ -330,11 +326,13 @@ impl AesGcmSiv {
 
 impl Drop for AesGcmSiv {
     fn drop(&mut self) {
-        // Best-effort wipe of the retained key-generating key.
-        self.kgk = [0u8; 32];
-        let _ = core::hint::black_box(&self.kgk);
+        // Best-effort wipe of the retained key-generating key, through
+        // `Zeroize` (volatile stores plus a compiler fence).
+        self.kgk.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for AesGcmSiv {}
 
 /// AES-128-GCM-SIV (16-byte key).
 pub type Aes128GcmSiv = AesGcmSiv;

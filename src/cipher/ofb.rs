@@ -6,6 +6,7 @@
 //! pair must never be reused.
 
 use super::BlockCipher;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// OFB-mode stream wrapper around a block cipher.
 #[derive(Clone)]
@@ -51,14 +52,14 @@ impl<C: BlockCipher> Ofb<C> {
 
 impl<C: BlockCipher> Drop for Ofb<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the residual key-stream block. Same
-        // `core::hint::black_box`-guarded zeroing as `cipher/aes/mod.rs`.
-        for b in self.block.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.block);
+        // Best-effort wipe of the residual key-stream block, through
+        // `Zeroize` (volatile stores plus a compiler fence, so LLVM cannot
+        // elide them as dead stores).
+        self.block.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Ofb<C> {}
 
 #[cfg(test)]
 mod tests {

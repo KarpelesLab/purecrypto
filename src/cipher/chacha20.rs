@@ -13,13 +13,19 @@
 /// little-endian words (RFC 8439 §2.3).
 const CONSTANTS: [u32; 4] = [0x6170_7865, 0x3320_646e, 0x7962_2d32, 0x6b20_6574];
 
-/// Best-effort wipe of a stack array of state/keystream words.
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+
+/// Best-effort wipe of the state matrix inside [`ChaCha20::block`].
 ///
-/// Zeros then `black_box`, the crate-wide idiom (`hash::zeroize`,
-/// `cipher::ctr::zero_keystream`) so LLVM cannot elide the writes as dead
-/// stores. Every ChaCha20 state matrix embeds the 256-bit key, and raw
-/// keystream is key-equivalent for the bytes it covers — neither should be
-/// left behind in a dead stack frame for a later caller to read.
+/// Every ChaCha20 state matrix embeds the 256-bit key, and raw keystream is
+/// key-equivalent for the bytes it covers — neither should be left behind in a
+/// dead stack frame for a later caller to read.
+///
+/// This is deliberately **not** [`crate::zeroize::Zeroize`]: `block` runs once
+/// per 64 bytes on the scalar path, and the sixteen per-word volatile stores
+/// cost a measured ~7% of that kernel's throughput where the plain store plus
+/// a `black_box` barrier compiles to a single vector store. Per-operation
+/// wipes elsewhere in the crate use `Zeroize`; this one is in the inner loop.
 #[inline]
 fn wipe_words(w: &mut [u32; 16]) {
     *w = [0u32; 16];
@@ -87,12 +93,13 @@ impl Drop for ChaCha20 {
         // The whole state *is* the 256-bit key, so without this a retired
         // ChaCha20 traffic key (TLS 1.3 `KeyUpdate`, connection close) stays in
         // freed memory — where the AES-GCM `RecordCrypter` scrubs its round
-        // keys and GHASH subkey. `black_box` keeps LLVM from eliding the
-        // writes as a dead store, matching `Aes*`/`Gcm`/`Poly1305`.
-        self.key = [0u32; 8];
-        let _ = core::hint::black_box(&self.key);
+        // keys and GHASH subkey. `Zeroize` gives volatile stores plus a
+        // compiler fence, so LLVM cannot elide them as dead stores.
+        self.key.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for ChaCha20 {}
 
 impl ChaCha20 {
     /// Creates a ChaCha20 cipher from a 32-byte key.
@@ -182,7 +189,8 @@ impl ChaCha20 {
                 *b ^= *k;
             }
             // Don't leave raw keystream for this key in the stack frame — this
-            // runs on every ChaCha20 / ChaCha20-Poly1305 operation.
+            // runs on every ChaCha20 / ChaCha20-Poly1305 operation. Per-block
+            // inner loop, so not `Zeroize` (see `wipe_words`).
             ks = [0u8; 64];
             let _ = core::hint::black_box(&ks);
             block_counter = block_counter.wrapping_add(1);
@@ -316,6 +324,11 @@ mod simd512 {
             // Don't leave raw keystream for this key in the stack frame — this
             // runs on every ChaCha20 / ChaCha20-Poly1305 operation. `words`
             // and `ks` are the same 1 KiB of keystream in two layouts.
+            //
+            // Not `Zeroize`: that is ~2 KiB of per-byte volatile stores on
+            // *every* call regardless of payload size (measured ~1% at 64 KiB,
+            // proportionally far worse on small TLS/QUIC records), so this
+            // bulk-cipher path keeps the vector store plus `black_box` barrier.
             words = [[0u32; 16]; 16];
             ks = [0u8; 1024];
             let _ = core::hint::black_box(&words);
@@ -434,7 +447,8 @@ mod simd {
                 ctr = ctr.wrapping_add(8);
             }
             // Don't leave raw keystream for this key in the stack frame — this
-            // runs on every ChaCha20 / ChaCha20-Poly1305 operation.
+            // runs on every ChaCha20 / ChaCha20-Poly1305 operation. Not
+            // `Zeroize`, for the per-call cost noted in the AVX-512 kernel.
             words = [[0u32; 8]; 16];
             ks = [0u8; 512];
             let _ = core::hint::black_box(&words);

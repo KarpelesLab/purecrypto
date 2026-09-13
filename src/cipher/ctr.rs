@@ -10,6 +10,7 @@
 //! must never be reused.
 
 use super::BlockCipher;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// CTR-mode stream wrapper around a block cipher.
 #[derive(Clone)]
@@ -97,15 +98,14 @@ impl<C: BlockCipher> Ctr<C> {
 
 impl<C: BlockCipher> Drop for Ctr<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the residual key-stream block. Uses the same
-        // `core::hint::black_box`-guarded zeroing as the AES round-key drop
-        // (`cipher/aes/mod.rs`) so LLVM cannot elide the writes as dead stores.
-        for b in self.keystream.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.keystream);
+        // Best-effort wipe of the residual key-stream block, through
+        // `Zeroize` (volatile stores plus a compiler fence, so LLVM cannot
+        // elide the writes as dead stores).
+        self.keystream.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Ctr<C> {}
 
 /// Increments a 16-byte big-endian counter in place, wrapping at 2¹²⁸.
 #[inline]
@@ -157,20 +157,15 @@ pub(crate) fn windowed_ctr(
     zero_keystream(&mut ks[..ks_used]);
     // The final counter block is key-independent (a nonce/counter), but the
     // caller's `block` copy is dead here either way.
-    block = [0u8; 16];
-    let _ = core::hint::black_box(&block);
+    block.zeroize();
 }
 
-/// Best-effort wipe of a stack keystream buffer.
-///
-/// Zeros then `black_box`, the crate-wide idiom (`hash::zeroize`) — that
-/// module's helpers are `pub(in crate::hash)`, so this is the local twin.
+/// Best-effort wipe of a stack keystream buffer, through
+/// [`crate::zeroize::Zeroize`]: volatile stores plus a compiler fence, so the
+/// writes cannot be elided as dead stores.
 #[inline]
 fn zero_keystream(ks: &mut [u8]) {
-    for b in ks.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(ks);
+    ks.zeroize();
 }
 
 #[cfg(test)]

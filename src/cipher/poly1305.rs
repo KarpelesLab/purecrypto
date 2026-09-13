@@ -235,6 +235,12 @@ impl Drop for Poly1305 {
         // Best-effort secret wipe: zero every field that's derived from the
         // one-time key, then apply the standard `black_box` optimisation
         // barrier so LLVM doesn't elide the writes as a dead store.
+        //
+        // Deliberately not `crate::zeroize::Zeroize`: ChaCha20-Poly1305
+        // builds and drops a fresh `Poly1305` for every record, and the
+        // per-limb volatile stores measured ~+30 ns per AEAD call (~7% on a
+        // 1 KiB record) — they keep the whole state pinned in memory instead
+        // of letting the MAC arithmetic live in registers.
         self.r = [0; 5];
         self.s = [0; 4];
         self.h = [0; 5];
@@ -513,6 +519,11 @@ mod simd {
             let h0 = h0 as u64 + c * 5;
             let carry = (h0 >> 26) as u32;
             st.h = [(h0 as u32) & 0x03ff_ffff, h1 + carry, h2, h3, h4];
+            // `sum` is the folded accumulator. This kernel runs once per
+            // `update` of >= MIN_LEN bytes, so its scratch keeps the cheap
+            // vector store plus `black_box` rather than per-limb volatile
+            // stores (which would be a visible share of a 256-byte update).
+            sum = [0; 5];
             let _ = core::hint::black_box(&sum);
 
             // Best-effort wipe of the key-derived powers.

@@ -29,6 +29,7 @@
 
 use super::{BlockCipher, TagMismatch};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeGreater};
+use crate::zeroize::Zeroize;
 
 /// Errors returned by AES key wrap operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,10 +253,7 @@ impl<C: BlockCipher> AesKwp<C> {
             let result = wrap_w(&self.cipher, aiv, &padded[..padded_len], out);
             // Best-effort wipe of the scratch buffer regardless of outcome:
             // it held a copy of the plaintext key material.
-            for b in &mut padded[..padded_len] {
-                *b = 0;
-            }
-            let _ = core::hint::black_box(&padded);
+            padded[..padded_len].zeroize();
             result
         }
     }
@@ -343,10 +341,7 @@ impl<C: BlockCipher> AesKwp<C> {
             // Wipe scratch before returning the error. Returning a single
             // generic error variant deliberately does not distinguish prefix /
             // length / padding failure to the caller.
-            for b in scratch.iter_mut() {
-                *b = 0;
-            }
-            let _ = core::hint::black_box(&scratch);
+            scratch[..padded_len].zeroize();
             return Err(KwError::IntegrityCheck);
         }
 
@@ -358,10 +353,7 @@ impl<C: BlockCipher> AesKwp<C> {
         for b in &mut out[mli..] {
             *b = 0;
         }
-        for b in scratch.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&scratch);
+        scratch[..padded_len].zeroize();
         Ok(mli)
     }
 }

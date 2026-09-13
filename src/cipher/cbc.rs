@@ -6,6 +6,7 @@
 //! A (key, IV) pair must never be reused, and the IV must be unpredictable.
 
 use super::{BlockCipher, InvalidLength};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// CBC-mode wrapper around a block cipher.
 #[derive(Clone)]
@@ -68,14 +69,15 @@ impl<C: BlockCipher> Cbc<C> {
 
 impl<C: BlockCipher> Drop for Cbc<C> {
     fn drop(&mut self) {
-        // Best-effort wipe of the residual chaining block. Same
-        // `core::hint::black_box`-guarded zeroing as `cipher/aes/mod.rs`.
-        for b in self.chain.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.chain);
+        // Best-effort wipe of the residual chaining block, through
+        // `Zeroize` (volatile stores plus a compiler fence, so LLVM cannot
+        // elide them as dead stores). The key itself lives in `cipher`,
+        // whose own `Drop` wipes it.
+        self.chain.zeroize();
     }
 }
+
+impl<C: BlockCipher> ZeroizeOnDrop for Cbc<C> {}
 
 #[cfg(test)]
 mod tests {

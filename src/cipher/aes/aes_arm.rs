@@ -72,16 +72,17 @@ unsafe fn load_schedule(round_keys: &[u8], nr: usize) -> [uint8x16_t; 15] {
     }
 }
 
-/// Best-effort wipe of a preloaded schedule before the frame is released: a
-/// **volatile** zero store per lane followed by a compiler fence, the same
-/// contract as [`crate::zeroize::Zeroize`] (which cannot be used directly:
-/// `uint8x16_t` is a vendor vector type, not a `DefaultIsZeroes` scalar).
+/// Best-effort wipe of a preloaded schedule (or block group) before the frame
+/// is released: a **volatile** zero store per lane followed by a compiler
+/// fence, the same contract as [`crate::zeroize::Zeroize`] (which cannot be
+/// used directly: `uint8x16_t` is a vendor vector type, not a
+/// `DefaultIsZeroes` scalar).
 /// The 15 key vectors plus 4 pipelined blocks exceed what stays in registers
 /// on every core, and the spill slots would otherwise keep the round keys on
 /// the stack. Same idiom as the `Aes*` round-key `Drop`.
 #[inline]
 #[target_feature(enable = "aes")]
-unsafe fn wipe_schedule(ks: &mut [uint8x16_t; 15]) {
+unsafe fn wipe(ks: &mut [uint8x16_t]) {
     for k in ks.iter_mut() {
         // SAFETY: `k` is a live `&mut uint8x16_t`, hence non-null, properly
         // aligned and exclusively held; a volatile store of a zero vector
@@ -114,7 +115,7 @@ pub(super) unsafe fn encrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
         let mut ks = load_schedule(round_keys, nr);
         let s = enc_core(&ks, nr, vld1q_u8(block.as_ptr()));
         vst1q_u8(block.as_mut_ptr(), s);
-        wipe_schedule(&mut ks);
+        wipe(&mut ks);
     }
 }
 
@@ -125,7 +126,7 @@ pub(super) unsafe fn decrypt_block(round_keys: &[u8], nr: usize, block: &mut [u8
         let mut ks = load_schedule(round_keys, nr);
         let s = dec_core(&ks, nr, vld1q_u8(block.as_ptr()));
         vst1q_u8(block.as_mut_ptr(), s);
-        wipe_schedule(&mut ks);
+        wipe(&mut ks);
     }
 }
 
@@ -151,11 +152,8 @@ pub(super) unsafe fn encrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
             let s = enc_core(&ks, nr, vld1q_u8(block.as_ptr()));
             vst1q_u8(block.as_mut_ptr(), s);
         }
-        wipe_schedule(&mut ks);
-        for bj in b.iter_mut() {
-            *bj = vdupq_n_u8(0);
-        }
-        let _ = core::hint::black_box(&b);
+        wipe(&mut ks);
+        wipe(&mut b);
     }
 }
 
@@ -179,6 +177,6 @@ pub(super) unsafe fn decrypt_blocks(round_keys: &[u8], nr: usize, blocks: &mut [
             let s = dec_core(&ks, nr, vld1q_u8(block.as_ptr()));
             vst1q_u8(block.as_mut_ptr(), s);
         }
-        wipe_schedule(&mut ks);
+        wipe(&mut ks);
     }
 }

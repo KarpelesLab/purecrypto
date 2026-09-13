@@ -20,6 +20,7 @@
 //! to claw most of that back.
 
 use super::BlockCipher;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// System parameter `FK` (GB/T 32907 §7.3.2).
 const FK: [u32; 4] = [0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc];
@@ -176,8 +177,7 @@ impl Sm4 {
         // `k` is the running key state, seeded directly from the 128-bit key
         // (MK ^ FK) — recovering it recovers the key. `rk` itself lives in the
         // cipher, whose `Drop` zeroizes it.
-        k = [0u32; 4];
-        let _ = core::hint::black_box(&k);
+        k.zeroize();
         Sm4 { rk }
     }
 
@@ -233,11 +233,13 @@ impl BlockCipher for Sm4 {
 
 impl Drop for Sm4 {
     fn drop(&mut self) {
-        // Best-effort wipe of the round keys, mirroring the AES round-key drop.
-        self.rk = [0u32; 32];
-        let _ = core::hint::black_box(&self.rk);
+        // Best-effort wipe of the round keys through `Zeroize` (volatile
+        // stores plus a compiler fence), mirroring the AES round-key drop.
+        self.rk.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for Sm4 {}
 
 #[cfg(test)]
 mod tests {

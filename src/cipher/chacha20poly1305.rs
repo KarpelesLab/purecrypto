@@ -12,6 +12,7 @@ use super::TagMismatch;
 use super::chacha20::ChaCha20;
 use super::poly1305::Poly1305;
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::Zeroize;
 
 /// A ChaCha20-Poly1305 AEAD context keyed with a 256-bit key.
 ///
@@ -48,8 +49,7 @@ impl ChaCha20Poly1305 {
         let mut block0 = self.cipher.block(nonce, 0);
         let mut otk = [0u8; 32];
         otk.copy_from_slice(&block0[..32]);
-        block0 = [0u8; 64];
-        let _ = core::hint::black_box(&block0);
+        block0.zeroize();
         otk
     }
 
@@ -88,8 +88,7 @@ impl ChaCha20Poly1305 {
         let tag = self.tag(&otk, aad, buffer);
         // The one-time key forges tags for this nonce; `Poly1305` wipes its
         // own copy on drop, so this frame's is the only leftover.
-        otk = [0u8; 32];
-        let _ = core::hint::black_box(&otk);
+        otk.zeroize();
         tag
     }
 
@@ -113,8 +112,7 @@ impl ChaCha20Poly1305 {
         );
         let mut otk = self.poly_key(nonce);
         let expected = self.tag(&otk, aad, buffer);
-        otk = [0u8; 32];
-        let _ = core::hint::black_box(&otk);
+        otk.zeroize();
         if !bool::from(expected.ct_eq(tag)) {
             return Err(TagMismatch);
         }

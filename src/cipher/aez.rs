@@ -34,6 +34,7 @@ use super::TagMismatch;
 use super::aes::aes_round;
 use crate::ct::ConstantTimeEq;
 use crate::hash::{Blake2b384, Digest};
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
@@ -113,17 +114,14 @@ pub struct Aez {
 
 impl Drop for Aez {
     fn drop(&mut self) {
-        for b in self
-            .i
-            .iter_mut()
-            .chain(self.j.iter_mut())
-            .chain(self.l.iter_mut())
-        {
-            *b = ZERO;
-        }
-        core::hint::black_box(&self.i);
+        // Volatile stores plus a compiler fence, via `Zeroize`.
+        self.i.zeroize();
+        self.j.zeroize();
+        self.l.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for Aez {}
 
 impl Aez {
     /// Derives the AEZ subkeys from a key of any length (AEZ `Extract`): a
@@ -154,8 +152,7 @@ impl Aez {
         l[6] = mult_block(2, &l[3]); // 6L
         l[7] = xor16(&l[6], &l[1]); // 7L
         // `ek` is the raw `I‖J‖L`; the state now owns everything needed.
-        ek = [0u8; 48];
-        let _ = core::hint::black_box(&ek);
+        ek.zeroize();
         Aez { i, j, l }
     }
 
@@ -277,7 +274,7 @@ impl Aez {
     fn aez_prf_blocks(&self, delta: &Block, len: usize, mut f: impl FnMut(usize, &Block)) {
         let mut ctr = ZERO;
         let mut off = 0;
-        let mut buf: Block;
+        let mut buf: Block = ZERO;
         while off < len {
             buf = self.aes10(&self.l[3], &xor16(delta, &ctr)); // E(-1,3)
             f(off, &buf);
@@ -295,8 +292,7 @@ impl Aez {
             }
             off += BLOCK;
         }
-        buf = ZERO;
-        let _ = core::hint::black_box(&buf);
+        buf.zeroize();
     }
 
     /// AEZ-core pass 1 (in place over the i-blocks): computes `X` and writes the
@@ -673,13 +669,10 @@ impl Aez {
         }
     }
 
-    /// Zeros `buf` and pins the writes with `black_box` (the crate-wide
-    /// zeroize idiom) so LLVM cannot drop them as dead stores.
+    /// Zeros `buf` through [`crate::zeroize::Zeroize`] (volatile stores plus
+    /// a compiler fence) so LLVM cannot drop the writes as dead stores.
     fn scrub(buf: &mut [u8]) {
-        for b in buf.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(buf);
+        buf.zeroize();
     }
 }
 

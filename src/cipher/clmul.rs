@@ -319,13 +319,16 @@ mod x86 {
             // Round keys, GHASH key powers and the last keystream group are
             // all key material (H alone forges tags); with 15 + 8 + 8 vectors
             // live the allocator spills, so scrub the frame rather than trust
-            // it. Zero stores + `black_box`, the crate-wide zeroize idiom.
+            // it. A volatile zero store per lane plus a compiler fence, the
+            // same contract as `crate::zeroize::Zeroize` (which cannot take
+            // the vendor `__m128i` type directly).
             for v in ks.iter_mut().chain(h.iter_mut()).chain(b.iter_mut()) {
-                *v = _mm_setzero_si128();
+                // SAFETY: `v` is a live `&mut __m128i`, hence non-null,
+                // aligned and exclusively held; this is `*v = zero` with the
+                // store marked volatile so it cannot be elided.
+                core::ptr::write_volatile(v, _mm_setzero_si128());
             }
-            let _ = core::hint::black_box(&ks);
-            let _ = core::hint::black_box(&h);
-            let _ = core::hint::black_box(&b);
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
             u128::from_be_bytes(out)
         }
     }
