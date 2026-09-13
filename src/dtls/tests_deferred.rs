@@ -532,8 +532,13 @@ fn old_epoch_records_rejected_after_grace_window_13() {
     let (mut client, mut server) = connected_pair();
     server.request_key_update(false).unwrap();
     let ku = server.pop_outbound_datagrams();
+    // Two records under the old (epoch 3) keys, captured before the client
+    // rotates: one to spend inside the window, one after it.
     server.send(b"old-epoch").unwrap();
-    let old = server.pop_outbound_datagrams().remove(0);
+    server.send(b"old-epoch-2").unwrap();
+    let mut old_dgs = server.pop_outbound_datagrams();
+    let old = old_dgs.remove(0);
+    let old_late = old_dgs.remove(0);
     for dg in &ku {
         client.feed_datagram(dg).unwrap();
     }
@@ -639,6 +644,89 @@ fn key_updates_received_are_bounded_13() {
             assert_eq!(res, Err(crate::tls::Error::PeerMisbehaved));
         }
     }
+}
+
+/// RFC 9147 4.2.2 / RFC 8446 4.6: application data is never protected with
+/// the handshake keys. Epoch 2 stays readable after the handshake only so a
+/// retransmitted peer flight can be re-ACKed; application data arriving
+/// under it must be refused, not delivered.
+#[test]
+fn application_data_under_handshake_epoch_rejected_13() {
+    let (server_cfg, cert) = server13_cfg();
+    let mut client = client13(small_client13_cfg(&cert), b"i6-client");
+    let mut server = server13(server_cfg.with_no_cookie(), b"i6-server");
+
+    // CH -> server flight -> client Finished, held back so the server still
+    // writes under the handshake epoch (2).
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    for dg in &server.pop_outbound_datagrams() {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(client.is_handshake_complete());
+    let client_flight = client.pop_outbound_datagrams();
+    assert_eq!(server.write_epoch(), 2);
+    server.send_app_data_for_test(b"epoch-2-data");
+    let epoch2_data = server.pop_outbound_datagrams();
+    assert_eq!(epoch2_data.len(), 1);
+
+    // Now let the server complete; the client retires epoch 2 into
+    // `prev_read` but must still refuse the record above.
+    for dg in &client_flight {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert!(server.is_handshake_complete());
+    assert_eq!(
+        client.feed_datagram(&epoch2_data[0]),
+        Err(crate::tls::Error::UnexpectedMessage)
+    );
+    assert!(client.take_received().is_empty());
+}
+
+/// A retired read epoch is dropped once its grace period has elapsed on the
+/// caller's clock, even on a connection far too quiet to reach
+/// `PREV_EPOCH_GRACE_RECORDS`: old keys must not live for the whole
+/// connection.
+#[test]
+fn prev_read_epoch_expires_on_the_clock_13() {
+    use crate::dtls::epoch13::PREV_EPOCH_GRACE_TIME;
+    use core::time::Duration;
+
+    let (mut client, mut server) = connected_pair();
+    server.request_key_update(false).unwrap();
+    let ku = server.pop_outbound_datagrams();
+    // Two records under the old (epoch 3) keys, captured before the client
+    // rotates: one to spend inside the window, one after it.
+    server.send(b"old-epoch").unwrap();
+    server.send(b"old-epoch-2").unwrap();
+    let mut old_dgs = server.pop_outbound_datagrams();
+    let old = old_dgs.remove(0);
+    let old_late = old_dgs.remove(0);
+    for dg in &ku {
+        client.feed_datagram(dg).unwrap();
+    }
+    for dg in &client.pop_outbound_datagrams() {
+        server.feed_datagram(dg).unwrap();
+    }
+    assert_eq!(server.write_epoch(), 4);
+
+    // Inside the window the reordered epoch-3 record is still delivered.
+    client.feed_datagram(&old).unwrap();
+    assert_eq!(client.take_received(), b"old-epoch");
+
+    // First clock tick arms the deadline, the second one is past it.
+    let t0 = Duration::from_secs(1_000);
+    client.on_timeout(t0);
+    client.on_timeout(t0 + PREV_EPOCH_GRACE_TIME + Duration::from_secs(1));
+
+    // The second (never-seen, so not replay-blocked) epoch-3 record is now
+    // undecryptable: silently dropped, never fatal.
+    assert_eq!(client.feed_datagram(&old_late), Ok(()));
+    assert!(client.take_received().is_empty());
+
+    // The current epoch keeps working.
+    app_data_round_trip(&mut client, &mut server);
 }
 
 /// A KeyUpdate whose ACK never arrives closes the connection once the

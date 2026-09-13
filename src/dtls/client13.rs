@@ -61,7 +61,8 @@ use core::time::Duration;
 
 use super::ack::{ACK_CONTENT_TYPE, MAX_PENDING_ACKS, RecordNumber, decode as decode_ack};
 use super::epoch13::{
-    MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, ReadEpoch, select_read_epoch,
+    KEY_UPDATE_WINDOW, MAX_KEY_UPDATES_RECEIVED, PREV_EPOCH_GRACE_RECORDS, PREV_EPOCH_GRACE_TIME,
+    ReadEpoch, select_read_epoch,
 };
 use super::reassembly::{HandshakeFragment, Reassembler, read_fragment, write_fragments};
 use super::record::{self, MAX_PLAINTEXT_LEN, ParsedDtlsRecord};
@@ -245,12 +246,23 @@ pub struct DtlsClientConnection13 {
     prev_read: Option<ReadEpoch>,
     /// Records authenticated under `read` since `prev_read` was retired.
     prev_read_grace: u32,
+    /// Caller-clock deadline after which `prev_read` is dropped even if the
+    /// record count never reaches [`PREV_EPOCH_GRACE_RECORDS`]. `None` when
+    /// no epoch is retired, or while the caller has not driven the clock
+    /// yet (it is armed at the first clock observation).
+    prev_read_deadline: Option<Duration>,
     /// True while our own `KeyUpdate` is in flight: we keep writing under
     /// the current epoch until the peer ACKs it (RFC 9147 §8).
     key_update_pending: bool,
-    /// Number of peer `KeyUpdate`s accepted, bounded by
-    /// [`MAX_KEY_UPDATES_RECEIVED`].
+    /// Peer `KeyUpdate`s accepted in the current [`KEY_UPDATE_WINDOW`],
+    /// bounded by [`MAX_KEY_UPDATES_RECEIVED`].
     key_updates_received: u32,
+    /// Start of the current KeyUpdate rate-limit window on the caller's
+    /// clock.
+    key_update_window_start: Duration,
+    /// True once the caller has driven the sans-I/O clock, i.e. once
+    /// `last_now` means anything.
+    clock_driven: bool,
 
     /// Random + key material. All four keypairs are pre-generated so the
     /// matching `key_share` is ready regardless of which group the server
@@ -355,8 +367,11 @@ impl DtlsClientConnection13 {
             read: None,
             prev_read: None,
             prev_read_grace: 0,
+            prev_read_deadline: None,
             key_update_pending: false,
             key_updates_received: 0,
+            key_update_window_start: Duration::from_secs(0),
+            clock_driven: false,
             x25519,
             p256,
             p384,
@@ -489,6 +504,8 @@ impl DtlsClientConnection13 {
     /// `pop_outbound_datagrams`.
     pub fn on_timeout(&mut self, now: Duration) {
         self.last_now = now;
+        self.clock_driven = true;
+        self.expire_prev_read();
         match self.retransmit.on_timeout(now) {
             super::reliability::Action::Retransmit => {
                 self.retransmit_in_flight();
@@ -686,8 +703,13 @@ impl DtlsClientConnection13 {
             self.prev_read_grace += 1;
             if self.prev_read_grace >= PREV_EPOCH_GRACE_RECORDS {
                 self.prev_read = None;
+                self.prev_read_deadline = None;
             }
         }
+        // Wall-clock backstop for a connection too quiet to reach the
+        // record count (see `PREV_EPOCH_GRACE_TIME`).
+        self.expire_prev_read();
+
         // Schedule an ACK for this protected record. Handshake records only
         // (RFC 9147 §7): application_data is skipped to reduce noise, alerts
         // are not handshake messages, and ACK records themselves MUST NOT
@@ -714,6 +736,15 @@ impl DtlsClientConnection13 {
             ContentType::Handshake => self.process_handshake_record(&plain, true)?,
             ContentType::ApplicationData => {
                 if self.state != State::Connected {
+                    return Err(Error::UnexpectedMessage);
+                }
+                // RFC 9147 §4.2.2 / RFC 8446 §4.6: application data is
+                // never protected with the handshake keys. Epoch 2 is only
+                // still readable as the retired epoch, kept so a
+                // retransmitted server flight can be re-ACKed; accepting
+                // app data under it would extend the handshake keys'
+                // reach over the connection's data.
+                if read_epoch == 2 {
                     return Err(Error::UnexpectedMessage);
                 }
                 self.app_in.extend_from_slice(&plain);
@@ -853,16 +884,68 @@ impl DtlsClientConnection13 {
         }
     }
 
+    /// Arms the wall-clock expiry of the read epoch just retired into
+    /// `prev_read` (see [`PREV_EPOCH_GRACE_TIME`]). While the caller has
+    /// not driven the clock the deadline stays unarmed and is set at the
+    /// first clock observation, so a caller whose clock starts far from
+    /// zero cannot retire the epoch the instant it first calls in.
+    fn arm_prev_read_expiry(&mut self) {
+        self.prev_read_grace = 0;
+        self.prev_read_deadline = self
+            .clock_driven
+            .then(|| self.last_now.saturating_add(PREV_EPOCH_GRACE_TIME));
+    }
+
+    /// Drops the retired read epoch once its grace period has elapsed:
+    /// nothing the peer may still be retransmitting under it can plausibly
+    /// be in flight any more, and stale keys should not outlive their use
+    /// (RFC 9147 §4.2.2).
+    fn expire_prev_read(&mut self) {
+        if self.prev_read.is_none() {
+            self.prev_read_deadline = None;
+            return;
+        }
+        if !self.clock_driven {
+            return;
+        }
+        match self.prev_read_deadline {
+            None => {
+                self.prev_read_deadline = Some(self.last_now.saturating_add(PREV_EPOCH_GRACE_TIME));
+            }
+            Some(deadline) if self.last_now >= deadline => {
+                self.prev_read = None;
+                self.prev_read_deadline = None;
+            }
+            Some(_) => {}
+        }
+    }
+
+    /// Rate-limits inbound `KeyUpdate`s to [`MAX_KEY_UPDATES_RECEIVED`] per
+    /// [`KEY_UPDATE_WINDOW`] instead of capping them for the life of the
+    /// connection: an authenticated peer must not be able to burn our CPU
+    /// on key schedules, but a long-lived connection that rekeys at a sane
+    /// rate must not be torn down either.
+    fn note_key_update_received(&mut self) -> Result<(), Error> {
+        if self.clock_driven
+            && self.last_now.saturating_sub(self.key_update_window_start) >= KEY_UPDATE_WINDOW
+        {
+            self.key_update_window_start = self.last_now;
+            self.key_updates_received = 0;
+        }
+        self.key_updates_received += 1;
+        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
+            return Err(Error::PeerMisbehaved);
+        }
+        Ok(())
+    }
+
     /// RFC 9147 §8: the server's write epoch advances. Install the next read
     /// epoch, retire the current one for the reordering / retransmit grace
     /// window, and — when asked — answer with a `KeyUpdate` of our own
     /// (`update_not_requested`, RFC 8446 §4.6.3) unless one is already in
     /// flight, which will rotate our keys just the same.
     fn on_key_update_received(&mut self, ku: KeyUpdate) -> Result<(), Error> {
-        self.key_updates_received += 1;
-        if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
-            return Err(Error::PeerMisbehaved);
-        }
+        self.note_key_update_received()?;
         let suite = self.suite.ok_or(Error::InappropriateState)?;
         let cur_epoch = self.read.as_ref().map(|r| r.epoch).unwrap_or(0);
         if cur_epoch == u16::MAX {
@@ -877,7 +960,7 @@ impl DtlsClientConnection13 {
         self.server_app_secret = Some(next);
         // Only the immediately previous epoch stays readable (§4.2.2).
         self.prev_read = self.read.replace(new_read);
-        self.prev_read_grace = 0;
+        self.arm_prev_read_expiry();
         if ku.request_update && !self.key_update_pending {
             self.request_key_update(false)?;
         }
@@ -1101,6 +1184,7 @@ impl DtlsClientConnection13 {
         self.enc_write_seq = 0;
         self.read = Some(ReadEpoch::new(suite, 2, &shts));
         self.prev_read = None;
+        self.prev_read_deadline = None;
 
         self.ks = Some(ks);
         self.client_hs_secret = Some(chts);
@@ -1466,7 +1550,7 @@ impl DtlsClientConnection13 {
         // drops the duplicate `message_seq`s; only the ACKs matter.
         let app_read = self.pending_read_app.take();
         self.prev_read = core::mem::replace(&mut self.read, app_read);
-        self.prev_read_grace = 0;
+        self.arm_prev_read_expiry();
 
         self.state = State::Connected;
         Ok(())

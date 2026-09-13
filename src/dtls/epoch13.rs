@@ -39,13 +39,32 @@ use super::client13::{derive_sn_key, sn_key_len_for};
 /// recovered by a single re-ACK rather than by the peer giving up.
 pub(crate) const PREV_EPOCH_GRACE_RECORDS: u32 = 4096;
 
+/// Wall-clock lifetime of a retired read epoch, as a backstop for
+/// [`PREV_EPOCH_GRACE_RECORDS`] on a connection that carries too little
+/// traffic to reach the record count. Twice the maximum retransmit timeout
+/// (RFC 9147 §5.8.1 caps the backoff at 60 s), after which no record the
+/// peer may still be retransmitting can plausibly be in flight — and the
+/// old epoch's keys have no reason to stay in memory.
+///
+/// The expiry runs off the caller-driven sans-I/O clock (`on_timeout` /
+/// `set_now`) and on authenticated records, so it only fires for callers
+/// that drive the clock; the record-count bound still covers the rest.
+pub(crate) const PREV_EPOCH_GRACE_TIME: core::time::Duration = core::time::Duration::from_secs(120);
+
 /// Upper bound on the number of `KeyUpdate` messages accepted from the
-/// peer over the life of a connection. Mirrors the TLS 1.3 engines'
+/// peer within [`KEY_UPDATE_WINDOW`]. Mirrors the TLS 1.3 engines'
 /// `MAX_KEY_UPDATES_RECEIVED`: each update costs a key derivation and two
 /// AEAD schedules, so an unbounded stream of them is a cheap way for an
 /// authenticated peer to burn CPU; nothing legitimate updates more often
-/// than the per-epoch record cap forces it to.
+/// than the per-epoch record cap forces it to. It is a rate limit rather
+/// than a lifetime cap so that a long-lived, well-behaved connection is
+/// never torn down for rekeying often enough.
 pub(crate) const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
+
+/// Window over which [`MAX_KEY_UPDATES_RECEIVED`] is counted. Measured on
+/// the caller-driven clock; a caller that never advances it keeps the old
+/// behaviour of a per-connection cap (fail-closed, never fail-open).
+pub(crate) const KEY_UPDATE_WINDOW: core::time::Duration = core::time::Duration::from_secs(60);
 
 /// Read-side record protection state for one epoch: the AEAD, the
 /// sequence-number encryption key (RFC 9147 §4.2.3), the highest sequence
