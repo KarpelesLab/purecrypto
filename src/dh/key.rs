@@ -37,12 +37,19 @@ pub enum Error {
     /// A scalar passed to [`DhPrivateKey::from_bytes`] was outside
     /// `[1, p - 1]`.
     InvalidScalar,
+    /// The peer's public key lives on a different group (`p` or `g` differs)
+    /// than this private key. Computing `y^x mod p` across groups silently
+    /// uses the local prime with a foreign public value, which is not a
+    /// Diffie-Hellman exchange at all — and lets a peer that chooses both
+    /// halves steer the result.
+    GroupMismatch,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::InvalidPublicKey => f.write_str("invalid Diffie-Hellman public value"),
+            Error::GroupMismatch => f.write_str("Diffie-Hellman peer key is on another group"),
             Error::ContributoryFailure => {
                 f.write_str("Diffie-Hellman shared secret failed contributory check")
             }
@@ -203,8 +210,17 @@ impl DhPrivateKey {
     ///   ≥ 256-bit exponent), which does not affect the DLP hardness the
     ///   exchange rests on;
     /// * a resulting shared secret of 0 or 1 — contributory-failure
-    ///   rejection per NIST SP 800-56A §5.6.2.3.
+    ///   rejection per NIST SP 800-56A §5.6.2.3;
+    /// * a peer key on a different group ([`Error::GroupMismatch`]) — the
+    ///   computation would otherwise use the *local* prime with a foreign
+    ///   public value, which is not an exchange with that peer.
     pub fn shared_secret(&self, peer: &DhPublicKey) -> Result<SharedSecret, Error> {
+        // Both keys must live on the same group: `p` and `g` are what define
+        // it (the private-exponent budget is a local policy knob, and an
+        // honest peer may legitimately have chosen a different one).
+        if self.group.p() != peer.group.p() || self.group.g() != peer.group.g() {
+            return Err(Error::GroupMismatch);
+        }
         let p = self.group.p();
         // [2, p - 2]  ⇔  y ≥ 2 AND y < p - 1.
         let two = BoxedUint::from_u64(2);
@@ -306,6 +322,27 @@ mod tests {
     use super::*;
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
+
+    /// A peer key from another group must be refused, not silently
+    /// exponentiated with the local prime — including through the `key`
+    /// facade, whose `agree` had no group check at all.
+    #[test]
+    fn shared_secret_rejects_cross_group_peer() {
+        let mut rng = HmacDrbg::<Sha256>::new(b"dh-cross-group", b"nonce", &[]);
+        let alice = DhPrivateKey::generate(group14(), &mut rng);
+        let bob = DhPrivateKey::generate(group15(), &mut rng);
+        assert!(matches!(
+            alice.shared_secret(&bob.public_key()),
+            Err(Error::GroupMismatch)
+        ));
+        assert!(matches!(
+            bob.shared_secret(&alice.public_key()),
+            Err(Error::GroupMismatch)
+        ));
+        // Same group still works.
+        let carol = DhPrivateKey::generate(group14(), &mut rng);
+        assert!(alice.shared_secret(&carol.public_key()).is_ok());
+    }
 
     #[test]
     fn group14_keyx_roundtrip() {
