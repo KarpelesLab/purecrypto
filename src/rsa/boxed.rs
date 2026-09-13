@@ -672,7 +672,9 @@ impl BoxedRsaPrivateKey {
 
     /// Generates a runtime-sized RSA key pair with a `bits`-bit modulus and
     /// public exponent `e` (commonly 65537). `bits` must be even; each prime is
-    /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate.
+    /// `bits/2` bits. `rounds` is the Miller-Rabin count per candidate; it is
+    /// clamped *up* to a size-appropriate floor (FIPS 186-5 Table B.1; see
+    /// `prime::min_mr_rounds`), so passing 0 cannot yield a composite factor.
     ///
     /// # Panics
     /// Panics on parameters that can never yield a usable key rather than

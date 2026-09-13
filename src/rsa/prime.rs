@@ -106,10 +106,39 @@ fn mask_to_bits(limbs: &mut [u64], bits: usize) {
     }
 }
 
+/// The minimum number of Miller-Rabin rounds a `bits`-bit RSA prime
+/// candidate is tested with, regardless of what the caller asked for.
+///
+/// `rounds = 0` (or 1, or 2) accepts composites with overwhelming
+/// probability, and the round count reaches the prime generators from the
+/// public `generate` APIs — a caller who passes 0, whether by mistake or to
+/// "speed up" key generation, must not end up with a composite modulus. The
+/// floors below meet or exceed the FIPS 186-5 Table B.1 minimums for RSA
+/// prime generation (which bottom out around 4–5 rounds for 1024-bit and
+/// larger primes, at a 2⁻¹⁰⁰ error target) and add margin at the small,
+/// non-RSA-sized values the table does not cover, where each round is cheap
+/// anyway. Callers asking for *more* rounds always get what they asked for.
+pub(crate) const fn min_mr_rounds(bits: usize) -> usize {
+    if bits >= 1024 {
+        5
+    } else if bits >= 512 {
+        8
+    } else if bits >= 256 {
+        16
+    } else if bits >= 128 {
+        24
+    } else {
+        32
+    }
+}
+
 /// Generates a random (probable) prime of exactly `bits` bits. The top two
 /// bits and bit 0 are forced set: bit 0 makes it odd, and setting both
 /// `bits-1` and `bits-2` ensures the product of two such primes is a full
 /// `2*bits`-bit modulus (the standard RSA construction).
+///
+/// `rounds` is clamped up to [`min_mr_rounds`] for the requested size, so a
+/// caller passing 0 still gets a properly tested prime.
 ///
 /// # Panics
 /// Panics if `bits` is not in `2..=LIMBS*64`.
@@ -119,6 +148,7 @@ pub fn random_prime<const LIMBS: usize, R: RngCore>(
     rounds: usize,
 ) -> Uint<LIMBS> {
     assert!(bits >= 2 && bits <= LIMBS * 64, "bits out of range");
+    let rounds = rounds.max(min_mr_rounds(bits));
     loop {
         let mut limbs = [0u64; LIMBS];
         for limb in &mut limbs {
@@ -146,6 +176,8 @@ pub(crate) use crate::bignum::prime::is_prime_boxed;
 /// Generates a random (probable) prime of exactly `bits` bits as a
 /// [`BoxedUint`](crate::bignum::BoxedUint), with the top two bits and bit 0 set.
 ///
+/// `rounds` is clamped up to [`min_mr_rounds`] for the requested size.
+///
 /// # Panics
 /// Panics if `bits < 2` — the two forced top bits need two bit positions
 /// (the index arithmetic below would underflow otherwise).
@@ -157,6 +189,7 @@ pub(crate) fn random_prime_boxed<R: RngCore>(
 ) -> crate::bignum::BoxedUint {
     use crate::bignum::BoxedUint;
     assert!(bits >= 2, "random_prime_boxed: bits must be >= 2");
+    let rounds = rounds.max(min_mr_rounds(bits));
     let nlimbs = bits.div_ceil(64);
     loop {
         let mut limbs = alloc::vec![0u64; nlimbs];
@@ -231,6 +264,28 @@ mod tests {
     fn random_prime_boxed_rejects_tiny_bits() {
         let mut r = rng();
         let _ = random_prime_boxed(&mut r, 1, 4);
+    }
+
+    /// `rounds = 0` must not produce a composite: the generators clamp the
+    /// caller's round count up to the size-appropriate FIPS floor.
+    #[test]
+    fn random_prime_clamps_zero_rounds() {
+        let mut r = rng();
+        for _ in 0..3 {
+            let p = random_prime::<2, _>(&mut r, 96, 0);
+            assert!(is_prime(&p, &mut r, 40), "generated a composite with rounds=0");
+        }
+        assert!(min_mr_rounds(1024) >= 5);
+        assert!(min_mr_rounds(512) >= min_mr_rounds(1024));
+        assert!(min_mr_rounds(64) >= min_mr_rounds(512));
+    }
+
+    #[cfg(feature = "alloc")]
+    #[test]
+    fn random_prime_boxed_clamps_zero_rounds() {
+        let mut r = rng();
+        let p = random_prime_boxed(&mut r, 128, 0);
+        assert!(is_prime_boxed(&p, &mut r, 40));
     }
 
     #[cfg(feature = "alloc")]

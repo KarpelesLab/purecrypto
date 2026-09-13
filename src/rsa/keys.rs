@@ -409,7 +409,9 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Generates an RSA key pair with an `LIMBS * 64`-bit modulus and the given
     /// public exponent `e` (commonly 65537).
     ///
-    /// `rounds` is the number of Miller-Rabin rounds per prime candidate.
+    /// `rounds` is the number of Miller-Rabin rounds per prime candidate. It
+    /// is clamped *up* to a size-appropriate floor (FIPS 186-5 Table B.1; see
+    /// `prime::min_mr_rounds`), so passing 0 cannot yield a composite factor.
     ///
     /// # Panics
     /// Panics if `e < 3`, `e` is even, or `e ≥ 2^256`: an even `e` is never
