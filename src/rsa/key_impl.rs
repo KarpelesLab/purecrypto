@@ -19,12 +19,30 @@
 //! `sig_encoding`, so the reader's `finish()` rejects them if the caller set
 //! them. [`SaltLen::Max`] has no signing API here and maps to
 //! [`Error::InvalidParams`].
+//!
+//! # PKCS#1 v1.5 decryption is implicitly rejecting
+//!
+//! [`RsaEncPadding::Pkcs1v15`] decryption through this facade routes to
+//! `decrypt_pkcs1v15_implicit`, **not** to the plain `decrypt_pkcs1v15`: bad
+//! padding yields a key-bound pseudo-random plaintext of pseudo-random length
+//! rather than [`Error::Decryption`]. A `Box<dyn PrivateKey>` is handed to
+//! protocol code that has no way to know the padding outcome is secret, so the
+//! error-vs-success distinction would be a ready-made Bleichenbacher / ROBOT
+//! oracle (the ciphertext is attacker-chosen by definition). Callers that
+//! genuinely want the failure reported — and that have audited their own
+//! behaviour for the oracle — can call
+//! [`BoxedRsaPrivateKey::decrypt_pkcs1v15`] directly.
+//!
+//! OAEP honours the `mgf1` hash only when it equals the label hash (the
+//! profile PKCS#1 v2.2 and every real deployment use); any other combination
+//! is rejected with [`Error::UnsupportedParam`] rather than silently
+//! decrypting with the wrong mask generator.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::key::{
-    Algorithm, DecryptParams, EncryptParams, Error, PrivateKey, PublicKey, RsaEncPadding,
+    Algorithm, DecryptParams, EncryptParams, Error, Hash, PrivateKey, PublicKey, RsaEncPadding,
     RsaSigPadding, SaltLen, Secret, SignParams,
 };
 use crate::rng::CryptoRngCore;
@@ -35,6 +53,17 @@ use super::keys::{RsaPrivateKey, RsaPublicKey};
 // The runtime-hash -> concrete-digest bridge, and the facade's accepted-digest
 // policy, live once in `key::params`.
 use crate::key::dispatch_key_hash as dispatch_hash;
+
+/// The RSA OAEP implementations use one digest for both the label hash and
+/// MGF1. A caller asking for a different MGF1 digest must be told so rather
+/// than silently getting an incompatible ciphertext / a decryption failure.
+fn check_oaep_mgf1(hash: Hash, mgf1: Hash) -> Result<(), Error> {
+    if hash == mgf1 {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedParam { param: "mgf1" })
+    }
+}
 
 // ----------------------------------------------------------------------------
 // BoxedRsaPrivateKey
@@ -77,10 +106,13 @@ impl PrivateKey for BoxedRsaPrivateKey {
         let label = p.label();
         p.finish()?;
         let pt = match padding {
-            RsaEncPadding::Oaep { hash, .. } => {
+            RsaEncPadding::Oaep { hash, mgf1 } => {
+                check_oaep_mgf1(hash, mgf1)?;
                 dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, label) })
             }
-            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
+            // Implicit rejection, never the error-reporting variant: see the
+            // module docs.
+            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15_implicit(ct),
         }
         .map_err(|_| Error::Decryption)?;
         Ok(Secret::from_bytes(pt))
@@ -130,7 +162,8 @@ impl PublicKey for BoxedRsaPublicKey {
         p.finish()?;
         let mut rng = rng;
         match padding {
-            RsaEncPadding::Oaep { hash, .. } => {
+            RsaEncPadding::Oaep { hash, mgf1 } => {
+                check_oaep_mgf1(hash, mgf1)?;
                 dispatch_hash!(hash, |D| { self.encrypt_oaep::<D, _>(pt, label, &mut rng) })
             }
             RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),
@@ -180,10 +213,13 @@ impl<const LIMBS: usize> PrivateKey for RsaPrivateKey<LIMBS> {
         let label = p.label();
         p.finish()?;
         let pt = match padding {
-            RsaEncPadding::Oaep { hash, .. } => {
+            RsaEncPadding::Oaep { hash, mgf1 } => {
+                check_oaep_mgf1(hash, mgf1)?;
                 dispatch_hash!(hash, |D| { self.decrypt_oaep::<D>(ct, label) })
             }
-            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15(ct),
+            // Implicit rejection, never the error-reporting variant: see the
+            // module docs.
+            RsaEncPadding::Pkcs1v15 => self.decrypt_pkcs1v15_implicit(ct),
         }
         .map_err(|_| Error::Decryption)?;
         Ok(Secret::from_bytes(pt))
@@ -233,7 +269,8 @@ impl<const LIMBS: usize> PublicKey for RsaPublicKey<LIMBS> {
         p.finish()?;
         let mut rng = rng;
         match padding {
-            RsaEncPadding::Oaep { hash, .. } => {
+            RsaEncPadding::Oaep { hash, mgf1 } => {
+                check_oaep_mgf1(hash, mgf1)?;
                 dispatch_hash!(hash, |D| { self.encrypt_oaep::<D, _>(pt, label, &mut rng) })
             }
             RsaEncPadding::Pkcs1v15 => self.encrypt_pkcs1v15(pt, &mut rng),

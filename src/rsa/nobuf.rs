@@ -82,6 +82,23 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         res
     }
 
+    /// Constant-time PKCS#1 v1.5 decryption with implicit rejection **and** a
+    /// pseudo-random output length, for callers that cannot pin an expected
+    /// length: on padding failure `out` receives a key-bound pseudo-random
+    /// message of pseudo-random length instead of an error, so neither the
+    /// outcome nor the length is an oracle. `out` must be at least
+    /// `LIMBS * 8 - 11` octets; the recovered length is returned.
+    pub fn decrypt_pkcs1v15_implicit_into(
+        &self,
+        ct: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, Error> {
+        let mut scratch = KeyScratch::<LIMBS>::ZEROED;
+        let res = super::emsa::decrypt_pkcs1v15_implicit(self, ct, scratch.as_flattened_mut(), out);
+        super::wipe(scratch.as_flattened_mut());
+        res
+    }
+
     /// Decrypts an RSAES-OAEP ciphertext into `out`, returning the plaintext
     /// length.
     pub fn decrypt_oaep_into<D: Digest>(

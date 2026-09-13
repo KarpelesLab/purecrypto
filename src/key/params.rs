@@ -116,10 +116,22 @@ pub enum RsaEncPadding {
     Oaep {
         /// The OAEP label/digest hash.
         hash: Hash,
-        /// The MGF1 hash (commonly the same as `hash`).
+        /// The MGF1 hash. The RSA keys only implement `mgf1 == hash` (the
+        /// universal profile); any other value is rejected with
+        /// [`Error::UnsupportedParam`](crate::key::Error::UnsupportedParam).
         mgf1: Hash,
     },
     /// RSAES-PKCS1-v1_5 (PKCS#1 v1.5).
+    ///
+    /// **Decryption uses implicit rejection.** Through the
+    /// [`PrivateKey::decrypt`](crate::key::PrivateKey::decrypt) facade a
+    /// ciphertext with malformed padding does *not* produce an error: it
+    /// decrypts to a pseudo-random message of pseudo-random length derived
+    /// from the ciphertext and a key-bound secret (the RFC 8017 §7.2.2 Note /
+    /// "Marvin" countermeasure). Reporting the failure would hand any
+    /// protocol built on `Box<dyn PrivateKey>` a Bleichenbacher / ROBOT
+    /// padding oracle. Protocols must authenticate the recovered plaintext by
+    /// other means; prefer [`Oaep`](Self::Oaep) for new designs.
     Pkcs1v15,
 }
 

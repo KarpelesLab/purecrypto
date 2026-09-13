@@ -133,6 +133,83 @@ fn rsa_sign_verify_and_encrypt_decrypt_via_facade() {
     assert_eq!(pt.as_bytes(), b"secret");
 }
 
+/// The facade's PKCS#1 v1.5 decryption must be **implicitly rejecting**: a
+/// garbage ciphertext yields a pseudo-random plaintext of pseudo-random
+/// length, never `Error::Decryption`. Returning the error would give any
+/// protocol built on `Box<dyn PrivateKey>` a Bleichenbacher / ROBOT oracle.
+#[test]
+fn rsa_pkcs1v15_decrypt_via_facade_is_implicitly_rejecting() {
+    use crate::key::RsaEncPadding;
+    let mut r = rng();
+    let sk = crate::test_util::rsa_test_key_a();
+    let pk = sk.public_key();
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let pub_dyn: Box<dyn PublicKey> = Box::new(pk);
+
+    let ep = EncryptParams::new().padding(RsaEncPadding::Pkcs1v15);
+    let dp = DecryptParams::new().padding(RsaEncPadding::Pkcs1v15);
+
+    // A real ciphertext still round-trips exactly.
+    let ct = pub_dyn.encrypt(b"secret", &ep, &mut r).expect("encrypt");
+    let pt = priv_dyn.decrypt(&ct, &dp).expect("decrypt");
+    assert_eq!(pt.as_bytes(), b"secret");
+
+    // Tampered / garbage ciphertexts do NOT error: they decrypt to a
+    // key-bound pseudo-random message, deterministic per ciphertext.
+    let mut bad = ct.clone();
+    bad[7] ^= 0x01;
+    let a = priv_dyn.decrypt(&bad, &dp).expect("no padding oracle");
+    let b = priv_dyn.decrypt(&bad, &dp).expect("no padding oracle");
+    assert_eq!(a.as_bytes(), b.as_bytes(), "must be deterministic");
+    assert_ne!(a.as_bytes(), b"secret");
+
+    // The synthetic length varies with the ciphertext (it is not pinned to
+    // some fixed value an attacker could recognize).
+    let mut lens = alloc::vec::Vec::new();
+    for i in 0..8u8 {
+        let mut c = ct.clone();
+        c[3] ^= i | 0x40;
+        let pt = priv_dyn.decrypt(&c, &dp).expect("no padding oracle");
+        assert!(pt.as_bytes().len() <= 245);
+        lens.push(pt.as_bytes().len());
+    }
+    assert!(
+        lens.iter().any(|l| *l != lens[0]),
+        "synthetic lengths must not be constant: {lens:?}"
+    );
+
+    // An out-of-range ciphertext (c >= n) is also absorbed silently.
+    priv_dyn
+        .decrypt(&[0xffu8; 256], &dp)
+        .expect("out-of-range ciphertext must not surface an error");
+}
+
+/// OAEP with an MGF1 digest different from the label digest is not
+/// implemented, and must be refused rather than silently using `hash` for
+/// both.
+#[test]
+fn rsa_oaep_mismatched_mgf1_is_rejected() {
+    use crate::key::RsaEncPadding;
+    let mut r = rng();
+    let sk = crate::test_util::rsa_test_key_a();
+    let pk = sk.public_key();
+    let priv_dyn: Box<dyn PrivateKey> = Box::new(sk);
+    let pub_dyn: Box<dyn PublicKey> = Box::new(pk);
+
+    let padding = RsaEncPadding::Oaep {
+        hash: Hash::Sha256,
+        mgf1: Hash::Sha1,
+    };
+    match pub_dyn.encrypt(b"x", &EncryptParams::new().padding(padding), &mut r) {
+        Err(Error::UnsupportedParam { param: "mgf1" }) => {}
+        other => panic!("expected UnsupportedParam(mgf1), got {other:?}"),
+    }
+    match priv_dyn.decrypt(&[0u8; 256], &DecryptParams::new().padding(padding)) {
+        Err(Error::UnsupportedParam { param: "mgf1" }) => {}
+        other => panic!("expected UnsupportedParam(mgf1), got {other:?}"),
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Key agreement: X25519 + ECDH P-256 equality, and peer-mismatch rejection
 // ----------------------------------------------------------------------------

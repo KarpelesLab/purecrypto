@@ -847,6 +847,40 @@ impl BoxedRsaPrivateKey {
         Ok(out)
     }
 
+    /// Decrypts a PKCS#1 v1.5 ciphertext with **implicit rejection** and a
+    /// pseudo-random output length — the mitigation for callers that cannot
+    /// pin an expected plaintext length the way
+    /// [`decrypt_pkcs1v15_session`](Self::decrypt_pkcs1v15_session) requires.
+    ///
+    /// On malformed padding (or an out-of-range ciphertext) this returns a
+    /// pseudo-random message of pseudo-random length, both derived from the
+    /// ciphertext and a secret bound to this key, instead of an error. An
+    /// adaptive chosen-ciphertext attacker therefore learns nothing from the
+    /// success/failure distinction *or* from the returned length, closing the
+    /// Bleichenbacher / Marvin / ROBOT oracle that
+    /// [`decrypt_pkcs1v15`](Self::decrypt_pkcs1v15) leaves open. The
+    /// application must authenticate the recovered plaintext by other means
+    /// (as every sound PKCS#1 v1.5 protocol already does).
+    ///
+    /// # Errors
+    /// Only [`Error::InvalidLength`] when `ct.len()` does not equal the
+    /// modulus octet length.
+    pub fn decrypt_pkcs1v15_implicit(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut scratch = vec![0u8; self.k];
+        let mut out = vec![0u8; self.k];
+        let res = emsa::decrypt_pkcs1v15_implicit(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => {
+                super::wipe(&mut out);
+                return Err(e);
+            }
+        };
+        out.truncate(n);
+        Ok(out)
+    }
+
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` and
     /// `label` must match those used at encryption.
     pub fn decrypt_oaep<D: Digest>(&self, ct: &[u8], label: &[u8]) -> Result<Vec<u8>, Error> {

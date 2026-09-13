@@ -125,6 +125,11 @@ pub trait PrivateKey {
 
     /// Decrypts `ct` under `params`, returning the recovered plaintext as a
     /// zeroize-on-drop [`Secret`]. Default: [`Error::Unsupported`].
+    ///
+    /// RSA PKCS#1 v1.5 ([`RsaEncPadding::Pkcs1v15`]) decryption is
+    /// **implicitly rejecting**: malformed padding yields a pseudo-random
+    /// plaintext rather than an error, so this method never acts as a
+    /// Bleichenbacher padding oracle. See the variant docs.
     fn decrypt(&self, ct: &[u8], params: &DecryptParams<'_>) -> Result<Secret, Error> {
         let _ = (ct, params);
         Err(Error::unsupported(Operation::Decrypt, self.algorithm()))

@@ -136,6 +136,39 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
         Ok(out)
     }
 
+    /// Decrypts a PKCS#1 v1.5 ciphertext with **implicit rejection** and a
+    /// pseudo-random output length — the mitigation for callers that cannot
+    /// pin an expected plaintext length the way
+    /// [`decrypt_pkcs1v15_session`](Self::decrypt_pkcs1v15_session) requires.
+    ///
+    /// On malformed padding (or an out-of-range ciphertext) this returns a
+    /// pseudo-random message of pseudo-random length, both derived from the
+    /// ciphertext and a secret bound to this key, instead of an error. An
+    /// adaptive chosen-ciphertext attacker therefore learns nothing from the
+    /// success/failure distinction *or* from the returned length, closing the
+    /// Bleichenbacher / Marvin / ROBOT oracle that
+    /// [`decrypt_pkcs1v15`](Self::decrypt_pkcs1v15) leaves open. The
+    /// application must authenticate the recovered plaintext by other means
+    /// (as every sound PKCS#1 v1.5 protocol already does).
+    ///
+    /// # Errors
+    /// Only [`Error::InvalidLength`] when `ct.len() != LIMBS*8`.
+    pub fn decrypt_pkcs1v15_implicit(&self, ct: &[u8]) -> Result<Vec<u8>, Error> {
+        let mut scratch = vec![0u8; LIMBS * 8];
+        let mut out = vec![0u8; LIMBS * 8];
+        let res = emsa::decrypt_pkcs1v15_implicit(self, ct, &mut scratch, &mut out);
+        super::wipe(&mut scratch);
+        let n = match res {
+            Ok(n) => n,
+            Err(e) => {
+                super::wipe(&mut out);
+                return Err(e);
+            }
+        };
+        out.truncate(n);
+        Ok(out)
+    }
+
     /// Decrypts an RSAES-OAEP ciphertext (RFC 8017 §7.1.2). Hash `D` must match
     /// the one used at encryption; `label` must match the encryptor's label
     /// (empty by default). The padding-check path is constant-time over the
@@ -362,6 +395,54 @@ mod tests {
         let msg48 = [0x5au8; 48];
         let ct48 = pk.encrypt_pkcs1v15(&msg48, &mut r).unwrap();
         assert_eq!(key.decrypt_pkcs1v15_session(&ct48, 48).unwrap(), msg48);
+    }
+
+    // ---- implicit rejection with pseudo-random length ----
+
+    /// Every plaintext length round-trips exactly through the
+    /// implicit-rejection decrypt.
+    #[test]
+    fn implicit_decrypt_roundtrips_every_length() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-implicit-rt", b"nonce", &[]);
+        for len in [0usize, 1, 16, 48, 200, 245] {
+            let msg = vec![0x2bu8; len];
+            let ct = pk.encrypt_pkcs1v15(&msg, &mut r).unwrap();
+            assert_eq!(key.decrypt_pkcs1v15_implicit(&ct).unwrap(), msg, "len {len}");
+            // The allocation-free variant agrees.
+            let mut out = [0u8; 256];
+            let n = key.decrypt_pkcs1v15_implicit_into(&ct, &mut out).unwrap();
+            assert_eq!(&out[..n], &msg[..]);
+        }
+    }
+
+    /// Bad padding never surfaces an error, and the synthetic plaintext's
+    /// length varies with the ciphertext — the property the plain
+    /// `decrypt_pkcs1v15` lacks (its length reveals the separator position).
+    #[test]
+    fn implicit_decrypt_hides_padding_failures() {
+        let key = rsa_test_key_a();
+        let mut lens = Vec::new();
+        for i in 0..16u8 {
+            let bogus = [0x11u8 ^ i; 256];
+            let out = key.decrypt_pkcs1v15_implicit(&bogus).unwrap();
+            assert!(out.len() <= 245);
+            // Deterministic per ciphertext.
+            assert_eq!(out, key.decrypt_pkcs1v15_implicit(&bogus).unwrap());
+            lens.push(out.len());
+        }
+        assert!(
+            lens.iter().any(|l| *l != lens[0]),
+            "synthetic lengths must not be constant: {lens:?}"
+        );
+        // Out-of-range (c >= n) is absorbed the same way.
+        assert!(key.decrypt_pkcs1v15_implicit(&[0xffu8; 256]).is_ok());
+        // A wrong-size ciphertext is public information and still errors.
+        assert_eq!(
+            key.decrypt_pkcs1v15_implicit(&[0u8; 255]),
+            Err(Error::InvalidLength)
+        );
     }
 
     /// `Error::InvalidLength` is the only failure surfaced (ciphertext

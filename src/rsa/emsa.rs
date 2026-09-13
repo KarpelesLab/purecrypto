@@ -369,6 +369,163 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     Ok(())
 }
 
+/// Folds every bit of a constant-time "bad" accumulator down to an all-ones /
+/// all-zeros byte mask (`0xff` when any bit was set).
+#[inline]
+fn bad_to_mask(bad: u8) -> u8 {
+    let mut fold = bad;
+    fold |= fold >> 4;
+    fold |= fold >> 2;
+    fold |= fold >> 1;
+    0u8.wrapping_sub(fold & 1)
+}
+
+/// Derives the pseudo-random *length* of the synthetic plaintext returned by
+/// [`decrypt_pkcs1v15_implicit`] on a padding failure: a value in
+/// `[0, max_len]` that is a deterministic function of the key-bound secret and
+/// the ciphertext, and unpredictable without the private key.
+///
+/// Rejection sampling, unrolled and branch-free: 256 candidates are drawn from
+/// the HMAC stream, each masked down to the smallest `2^b − 1 >= max_len`, and
+/// the first one in range is kept. Each candidate is in range with probability
+/// > 1/2, so the "no candidate matched" fallback (length 0) is reached with
+/// probability below 2⁻²⁵⁶.
+fn synthetic_len(secret: &[u8; 32], ct: &[u8], max_len: usize) -> u32 {
+    use crate::hash::HmacSha256;
+
+    let max = max_len as u32;
+    // Smallest all-ones mask that can represent `max` (2^b − 1 >= max).
+    let mask = if max == 0 {
+        0
+    } else {
+        u32::MAX >> max.leading_zeros()
+    };
+    let mut chosen: u32 = 0;
+    let mut found: u32 = 0; // all-ones once a candidate has been accepted
+    for counter in 0..16u32 {
+        let mut h = HmacSha256::new(secret);
+        h.update(b"purecrypto-rsa-pkcs1v15-implicit-reject-len-v1");
+        h.update(ct);
+        h.update(&counter.to_be_bytes());
+        let tag = h.finalize();
+        for pair in tag.as_ref().chunks_exact(2) {
+            let raw = ((pair[0] as u32) << 8) | pair[1] as u32;
+            let v = raw & mask;
+            // `v <= max` ⇔ `v < max + 1`; `max + 1` cannot overflow (it is
+            // bounded by the modulus size in octets).
+            let in_range = 0u32.wrapping_sub(v.ct_lt(&(max + 1)).unwrap_u8() as u32);
+            chosen |= v & in_range & !found;
+            found |= in_range;
+        }
+    }
+    chosen
+}
+
+/// Constant-time PKCS#1 v1.5 decryption with **implicit rejection**, for
+/// callers that do not know the plaintext length in advance (RFC 8017 §7.2.2
+/// Note; the construction specified by
+/// `draft-irtf-cfrg-rsa-guidance` and shipped as OpenSSL 3.2's default
+/// `RSA_PKCS1_WITH_TLS_PADDING`-less behaviour).
+///
+/// Unlike [`decrypt_pkcs1v15`] this never reports a padding failure. On bad
+/// padding (or an out-of-range ciphertext) it returns a pseudo-random message
+/// of pseudo-random length, both derived from the ciphertext and a key-bound
+/// secret ([`RawPrivate::secret_seed`]) — so neither the success/failure
+/// distinction nor the returned length gives a Bleichenbacher / Marvin / ROBOT
+/// attacker an oracle. Unlike [`decrypt_pkcs1v15_session`] the caller need not
+/// pin an expected length.
+///
+/// `scratch` must be exactly `key_size()` octets and `out` at least
+/// `key_size() - 11` (the longest plaintext PKCS#1 v1.5 can carry); the
+/// recovered length is returned.
+///
+/// # Errors
+/// Only [`Error::InvalidLength`], for buffer sizes — all of which are public.
+pub(crate) fn decrypt_pkcs1v15_implicit<K: RawPrivate>(
+    key: &K,
+    ct: &[u8],
+    scratch: &mut [u8],
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    use crate::hash::HmacSha256;
+
+    let k = key.key_size();
+    if ct.len() != k || scratch.len() != k || k < 11 {
+        return Err(Error::InvalidLength);
+    }
+    let max_len = k - 11;
+    if out.len() < max_len {
+        return Err(Error::InvalidLength);
+    }
+
+    // RFC 8017 §7.2.2 step 1's `0 <= c < n` check. As in
+    // `decrypt_pkcs1v15_session` it must not surface as an error: an
+    // out-of-range ciphertext has to be indistinguishable from bad padding,
+    // so we skip the private operation and let the padding check fail.
+    // `ct` is public, so the branch leaks nothing.
+    key.modulus_be_into(scratch);
+    if ct_lt_be(ct, scratch) {
+        scratch.copy_from_slice(ct);
+        key.raw_private_in_place(scratch);
+    } else {
+        scratch.fill(0xff);
+    }
+
+    let (bad, sep_idx) = pkcs1v15_padding_check(scratch);
+    let bad_mask = bad_to_mask(bad);
+    let bad_mask32 = 0u32.wrapping_sub((bad_mask & 1) as u32);
+
+    let key_secret = key.secret_seed();
+    let real_len = (k as u32).wrapping_sub(sep_idx.wrapping_add(1));
+    let synth_len = synthetic_len(&key_secret, ct, max_len);
+    // `real_len <= max_len` whenever the padding is good (the check enforces
+    // `sep_idx >= 10`), and `synth_len <= max_len` by construction.
+    let final_len = (synth_len & bad_mask32) | (real_len & !bad_mask32);
+
+    // Overwrite the decrypted block with the synthetic message when the
+    // padding was bad. Done in place, a digest block at a time, so no extra
+    // `k`-byte buffer is needed; every byte is touched either way.
+    let mut counter: u32 = 0;
+    let mut off = 0;
+    while off < k {
+        let mut h = HmacSha256::new(&key_secret);
+        h.update(b"purecrypto-rsa-pkcs1v15-implicit-reject-msg-v1");
+        h.update(ct);
+        h.update(&counter.to_be_bytes());
+        let tag = h.finalize();
+        let take = core::cmp::min(tag.as_ref().len(), k - off);
+        for (slot, &b) in scratch[off..off + take].iter_mut().zip(tag.as_ref()) {
+            *slot = (b & bad_mask) | (*slot & !bad_mask);
+        }
+        off += take;
+        counter += 1;
+    }
+
+    // The message occupies the last `final_len` octets of the block, i.e. it
+    // starts at the secret offset `k - final_len`. Reading it with that offset
+    // would be a secret-dependent load (a cache side channel that re-opens the
+    // oracle), so shift the whole block left by `k - final_len` with a
+    // branch-free barrel shifter: O(k log k) fixed loads at public addresses.
+    let shift = (k as u32).wrapping_sub(final_len);
+    let mut step = 1usize;
+    let mut bit_idx = 0u32;
+    while step <= k {
+        let m = 0u8.wrapping_sub(((shift >> bit_idx) & 1) as u8);
+        for i in 0..k {
+            // Ascending `i`: `scratch[i + step]` is always read before it is
+            // itself overwritten, so the in-place shift is correct.
+            let src = if i + step < k { scratch[i + step] } else { 0 };
+            scratch[i] = (src & m) | (scratch[i] & !m);
+        }
+        step <<= 1;
+        bit_idx += 1;
+    }
+
+    let n = final_len as usize;
+    out[..n].copy_from_slice(&scratch[..n]);
+    Ok(n)
+}
+
 /// Signs into `out`, which must be exactly `key_size()` octets.
 pub(crate) fn sign_pkcs1v15<D: Pkcs1Digest, K: RawPrivate>(
     key: &K,
