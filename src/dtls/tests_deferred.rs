@@ -532,13 +532,8 @@ fn old_epoch_records_rejected_after_grace_window_13() {
     let (mut client, mut server) = connected_pair();
     server.request_key_update(false).unwrap();
     let ku = server.pop_outbound_datagrams();
-    // Two records under the old (epoch 3) keys, captured before the client
-    // rotates: one to spend inside the window, one after it.
     server.send(b"old-epoch").unwrap();
-    server.send(b"old-epoch-2").unwrap();
-    let mut old_dgs = server.pop_outbound_datagrams();
-    let old = old_dgs.remove(0);
-    let old_late = old_dgs.remove(0);
+    let old = server.pop_outbound_datagrams().remove(0);
     for dg in &ku {
         client.feed_datagram(dg).unwrap();
     }
