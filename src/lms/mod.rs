@@ -42,6 +42,8 @@ mod tree;
 pub use params::{LmotsType, LmsType};
 
 #[cfg(feature = "alloc")]
+use crate::ct::ConstantTimeEq;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 use params::N;
 
@@ -71,6 +73,13 @@ pub enum Error {
     /// regenerating it — removes the limit; the new format loads any height
     /// instantly.
     LegacyKeyTooTall,
+    /// A serialized HSS private key failed its integrity check: either the
+    /// authentication tag of the current (`v2`) format did not verify, or a
+    /// stored child-level root disagreed with the root that level's own seed
+    /// derives. Both mean the key file was modified after it was written, which
+    /// for a multi-level key is a *forgery* vector (see
+    /// [`HssPrivateKey::from_bytes`]), so the key is refused rather than loaded.
+    Tampered,
 }
 
 /// Maximum tree height for which the LEGACY (root-less, 60-byte / `4 + L*60`)
@@ -437,6 +446,39 @@ impl Drop for HssLevel {
     }
 }
 
+/// Length of the integrity tag appended by [`HssPrivateKey::to_bytes`].
+#[cfg(feature = "alloc")]
+const HSS_TAG_LEN: usize = 32;
+
+/// Domain separator for the HSS private-key integrity tag, so the tag can never
+/// be confused with any other value derived from the same seed (the RFC 8554
+/// `derive_x` / `derive_c` preimages all start with `I(16) || u32(q)` and are
+/// plain SHA-256, not HMAC).
+#[cfg(feature = "alloc")]
+const HSS_TAG_DOMAIN: &[u8] = b"purecrypto/lms/hss-privkey-v2";
+
+/// `HMAC-SHA-256(seed0, HSS_TAG_DOMAIN || I0 || body)` — the integrity tag of a
+/// serialized [`HssPrivateKey`].
+///
+/// The key is the **top** level's seed, deliberately: it is the only secret in
+/// the file that an attacker cannot substitute, because replacing it changes the
+/// top-level root and therefore the HSS public key (signatures then simply fail
+/// to verify — a self-DoS, not a forgery). Every other byte of the file,
+/// including each lower level's `(typecodes, I, seed, root)`, is covered by the
+/// tag, so an adversary who can write the file but not read it cannot mount the
+/// substituted-child-level forgery described on [`HssPrivateKey::from_bytes`].
+/// An adversary who *can* read the file already holds every seed and needs no
+/// attack at all, so keying the tag from in-file material loses nothing.
+#[cfg(feature = "alloc")]
+fn hss_tag(body: &[u8], i0: &[u8; 16], seed0: &[u8; N]) -> [u8; HSS_TAG_LEN] {
+    use crate::hash::{Hmac, Sha256};
+    let mut m = Hmac::<Sha256>::new(seed0);
+    m.update(HSS_TAG_DOMAIN);
+    m.update(i0);
+    m.update(body);
+    m.finalize()
+}
+
 #[cfg(feature = "alloc")]
 /// An HSS public (verification) key: `u32(L) || lms_public_key`.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -718,12 +760,12 @@ impl HssPrivateKey {
         Ok(out)
     }
 
-    /// Serializes the private key **including every level's live leaf index**
-    /// and that level's cached public root.
+    /// Serializes the private key **including every level's live leaf index**,
+    /// that level's cached public root, and a trailing integrity tag.
     ///
-    /// Layout: `u32(L) || for each level { u32(lms_type) || u32(ots_type) ||
-    /// I(16) || seed(32) || u32(q) || root(32) }`. This embeds the full state
-    /// that MUST be persisted after each signature.
+    /// Layout (`v2`): `u32(L) || for each level { u32(lms_type) ||
+    /// u32(ots_type) || I(16) || seed(32) || u32(q) || root(32) } || tag(32)`.
+    /// This embeds the full state that MUST be persisted after each signature.
     ///
     /// Each appended root is the public value `T[1]` of that level's tree (the
     /// child key the parent level signs); storing it lets
@@ -731,9 +773,20 @@ impl HssPrivateKey {
     /// recomputing every level's root via a full `O(2^h)` keygen pass. The
     /// per-level block is a pure superset of the legacy 60-byte block (the root
     /// is appended at its end).
+    ///
+    /// # The tag (and why it is not optional)
+    ///
+    /// `tag` is `HMAC-SHA-256` over every preceding byte, keyed by the **top
+    /// level's secret seed** — the one piece of the file an attacker cannot
+    /// replace without also invalidating the public key. Without it, an
+    /// adversary who can *write* the key file (but not read it) can swap in a
+    /// lower level whose `(I, seed)` they chose themselves; the pinned top-level
+    /// one-time key then signs that attacker-controlled child public key, which
+    /// is a complete forgery chain. See [`from_bytes`](Self::from_bytes) for the
+    /// full argument and for how older, untagged files are handled.
     pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.levels.len();
-        let mut v = Vec::with_capacity(4 + l * (4 + 4 + 16 + N + 4 + N));
+        let mut v = Vec::with_capacity(4 + l * (4 + 4 + 16 + N + 4 + N) + HSS_TAG_LEN);
         v.extend_from_slice(&(l as u32).to_be_bytes());
         for (i, lv) in self.levels.iter().enumerate() {
             v.extend_from_slice(&lv.lms_type.typecode().to_be_bytes());
@@ -743,6 +796,9 @@ impl HssPrivateKey {
             v.extend_from_slice(&self.q[i].to_be_bytes());
             v.extend_from_slice(&self.roots[i]);
         }
+        let top = &self.levels[0];
+        let tag = hss_tag(&v, &top.i_id, &top.seed);
+        v.extend_from_slice(&tag);
         v
     }
 
@@ -750,26 +806,58 @@ impl HssPrivateKey {
     /// at each persisted per-level `q`.
     ///
     /// Length-discriminated and backward compatible (per-level stride):
-    /// * `4 + L*92` — the current root-bearing format. Each level's stored root
-    ///   is read directly and **trusted** (no recompute); a key of any height
-    ///   loads in constant time.
+    /// * `4 + L*92 + 32` — the current (`v2`) tagged root-bearing format. The
+    ///   trailing tag is verified first (against the top level's seed); every
+    ///   stored root is then trusted, so a key of any height loads in constant
+    ///   time. A modified file is rejected with [`Error::Tampered`].
+    /// * `4 + L*92` — the untagged root-bearing format written by earlier
+    ///   releases. There is no tag to check, so for `L >= 2` **every non-top
+    ///   level's root is recomputed from that level's own seed** and compared
+    ///   with the stored one; a mismatch is [`Error::Tampered`]. That costs
+    ///   about one signature's worth of hashing per level (signing already walks
+    ///   the whole tree), and is capped at `H15` (`LEGACY_RECOMPUTE_MAX_H`) per
+    ///   recomputed level to deny a CPU-DoS from an untrusted file.
     /// * `4 + L*60` — the LEGACY root-less format. Each level's root is
-    ///   recomputed (an `O(2^h)` pass), capped per level at `H15`
-    ///   (`LEGACY_RECOMPUTE_MAX_H`) — taller levels return
-    ///   [`Error::LegacyKeyTooTall`] to deny a CPU-DoS from an untrusted file.
+    ///   recomputed (an `O(2^h)` pass), capped per level at `H15` — taller
+    ///   levels return [`Error::LegacyKeyTooTall`].
     /// * any other length — [`Error::Malformed`].
     ///
-    /// # Trusting the stored roots is safe (fast path)
+    /// Re-save any key loaded from one of the two older formats: `to_bytes`
+    /// always emits the tagged `v2` form, which both loads faster and is the
+    /// only form with full tamper detection (see below).
     ///
-    /// A root is NOT secret — `roots[i]` is the public value `T[1]` of level
-    /// `i`'s tree, and for `i + 1` it is exactly the child public key the parent
-    /// level signs. A tampered `roots[i+1]` makes the HSS signature's embedded
-    /// child key disagree with the seed-derived subtree, so verification fails:
-    /// fail-closed, never a forgery (the attacker lacks the seeds). Re-deriving
-    /// every root on load to validate a public value would cost a full keygen
-    /// and buy nothing — an attacker able to rewrite the file could already
-    /// force catastrophic LM-OTS reuse — so the stored roots are taken as-is and
-    /// deliberately NOT recomputed.
+    /// # Why the stored roots must NOT simply be trusted
+    ///
+    /// A root is not secret, but in a multi-level key it is *signed*: under this
+    /// implementation's fail-closed mitigation every level above the bottom is
+    /// pinned at leaf `q = 0` and re-signs `typecode || typecode || I || root`
+    /// of the level below on **every** call to [`sign`](Self::sign). That value
+    /// therefore has to be identical on every call, forever — an LM-OTS key is
+    /// one-time, and signing two distinct messages with it reveals enough
+    /// Winternitz pre-images to forge a third.
+    ///
+    /// All four fields of that signed child public key come straight out of the
+    /// key file. An adversary who can *write* the file therefore has two
+    /// distinct attacks, neither of which is fail-closed:
+    ///
+    /// 1. Flip a bit in a child level's stored root, `I`, or typecode. The next
+    ///    `sign()` emits a second, different top-level LM-OTS signature under
+    ///    the same `q = 0` key — classic one-time-key reuse.
+    /// 2. Replace a whole child level with `(I', seed')` of the adversary's own
+    ///    choosing and the matching root. The key then loads perfectly
+    ///    self-consistently, and the very first signature it produces hands the
+    ///    adversary a genuine top-level signature over a child public key whose
+    ///    seed *they* hold — a complete forgery chain, from a single signature.
+    ///
+    /// Recomputing the child roots from their seeds stops (1) but not (2): the
+    /// adversary knows the seed they substituted. Only the `v2` tag, keyed by a
+    /// secret the adversary does not have, stops both. Hence: `v2` files are
+    /// authenticated, older files get the recompute check as a best effort, and
+    /// the key material itself must still be protected at rest.
+    ///
+    /// No tag can stop a *wholesale rollback* to an older file that this code
+    /// genuinely wrote (its bottom `q` would replay used leaves); preventing
+    /// that is the storage layer's job and inherent to every stateful scheme.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() < 4 {
             return Err(Error::Malformed);
@@ -780,18 +868,37 @@ impl HssPrivateKey {
         }
         const LEGACY_PER: usize = 4 + 4 + 16 + N + 4;
         const NEW_PER: usize = LEGACY_PER + N;
-        let (per, has_root) = if bytes.len() == 4 + l * NEW_PER {
-            (NEW_PER, true)
+        // `Tagged` also carries the roots; it just authenticates them as well.
+        let (per, has_root, tagged) = if bytes.len() == 4 + l * NEW_PER + HSS_TAG_LEN {
+            (NEW_PER, true, true)
+        } else if bytes.len() == 4 + l * NEW_PER {
+            (NEW_PER, true, false)
         } else if bytes.len() == 4 + l * LEGACY_PER {
-            (LEGACY_PER, false)
+            (LEGACY_PER, false, false)
         } else {
             return Err(Error::Malformed);
         };
+        let body = &bytes[..bytes.len() - if tagged { HSS_TAG_LEN } else { 0 }];
+        if tagged {
+            // Authenticate the whole body before interpreting any of it. The
+            // top level's `I` and `seed` sit at fixed offsets in level 0's
+            // block (`4 + 8` and `4 + 24`), ahead of anything variable.
+            let mut i0 = [0u8; 16];
+            i0.copy_from_slice(&body[12..28]);
+            let mut seed0 = [0u8; N];
+            seed0.copy_from_slice(&body[28..28 + N]);
+            let want = hss_tag(body, &i0, &seed0);
+            wipe(&mut seed0);
+            let ok: bool = want[..].ct_eq(&bytes[body.len()..]).into();
+            if !ok {
+                return Err(Error::Tampered);
+            }
+        }
         let mut levels = Vec::with_capacity(l);
         let mut roots = Vec::with_capacity(l);
         let mut q = Vec::with_capacity(l);
         let mut off = 4;
-        for _ in 0..l {
+        for level in 0..l {
             let lms_type = LmsType::from_u32(u32::from_be_bytes([
                 bytes[off],
                 bytes[off + 1],
@@ -820,9 +927,25 @@ impl HssPrivateKey {
                 return Err(Error::Malformed);
             }
             let root = if has_root {
-                // Fast path: trust the stored public root (see method docs).
                 let mut r = [0u8; N];
                 r.copy_from_slice(&bytes[off + 28 + N..off + 28 + N + N]);
+                // A `v2` root is authenticated by the tag checked above. An
+                // untagged root of a level that a parent signs (any level but
+                // the top) MUST agree with what its own seed derives, or the
+                // pinned parent one-time key would sign a second, different
+                // child public key (see method docs). The top-level root is
+                // only ever the public key, so a bad one is a self-DoS and
+                // needs no check.
+                if !tagged && level > 0 {
+                    if lms_type.h() > LEGACY_RECOMPUTE_MAX_H {
+                        return Err(Error::LegacyKeyTooTall);
+                    }
+                    let derived = tree::compute_root(lms_type, ots_type, &i_id, &seed);
+                    let same: bool = derived[..].ct_eq(&r[..]).into();
+                    if !same {
+                        return Err(Error::Tampered);
+                    }
+                }
                 r
             } else {
                 // Legacy path: recompute, but refuse a CPU-DoS-sized tree.
@@ -841,6 +964,7 @@ impl HssPrivateKey {
             q.push(qi);
             off += per;
         }
+        debug_assert_eq!(off, body.len());
         // Fail-closed invariant: under the multi-level mitigation every higher
         // level stays pinned at leaf 0 (only the bottom level advances). A
         // persisted multi-level key with any non-bottom q != 0 can only be a

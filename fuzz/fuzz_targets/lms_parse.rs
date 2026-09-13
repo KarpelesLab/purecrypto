@@ -71,19 +71,35 @@ fn level_is_h5(rec: &[u8]) -> bool {
         && u32::from_be_bytes([rec[0], rec[1], rec[2], rec[3]]) == LmsType::Sha256M32H5 as u32
 }
 
-/// True when every level record of a serialized `HssPrivateKey`
-/// (`u32(L) || L * level_record`) is H5. Structurally-invalid inputs
-/// return true — they die in the real parser's framing checks before
-/// any tree is computed.
+/// A root-bearing level record: `LEVEL_RECORD || root(32)`.
+const LEVEL_RECORD_ROOTED: usize = LEVEL_RECORD + 32;
+
+/// True when every level record of a serialized `HssPrivateKey` is H5.
+///
+/// Covers all three strides the parser accepts — the legacy root-less
+/// `u32(L) || L * LEVEL_RECORD`, the untagged root-bearing
+/// `u32(L) || L * LEVEL_RECORD_ROOTED` (whose non-top levels are
+/// root-recomputed on load), and the tagged form that appends 32 bytes.
+/// Structurally-invalid inputs return true — they die in the real parser's
+/// framing checks before any tree is computed.
 fn hss_levels_are_h5(data: &[u8]) -> bool {
     if data.len() < 4 {
         return true;
     }
     let l = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-    if !(1..=8).contains(&l) || data.len() != 4 + l * LEVEL_RECORD {
+    if !(1..=8).contains(&l) {
         return true;
     }
-    (0..l).all(|i| level_is_h5(&data[4 + i * LEVEL_RECORD..]))
+    let stride = if data.len() == 4 + l * LEVEL_RECORD {
+        LEVEL_RECORD
+    } else if data.len() == 4 + l * LEVEL_RECORD_ROOTED
+        || data.len() == 4 + l * LEVEL_RECORD_ROOTED + 32
+    {
+        LEVEL_RECORD_ROOTED
+    } else {
+        return true;
+    };
+    (0..l).all(|i| level_is_h5(&data[4 + i * stride..]))
 }
 
 fuzz_target!(|data: &[u8]| {

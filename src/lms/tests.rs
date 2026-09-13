@@ -375,13 +375,16 @@ fn hss_bottom_rollover_fails_closed() {
     .unwrap();
     let pk = sk.public_key();
     let mut bytes = sk.to_bytes();
-    // Layout: u32(L) then per level [type(4) ots(4) I(16) seed(32) q(4) root(32)].
-    // Park the bottom level on its last leaf (q=31), top q stays 0. The q field
-    // sits right after seed (before the appended root).
+    // Layout: u32(L) then per level [type(4) ots(4) I(16) seed(32) q(4) root(32)],
+    // then the 32-byte integrity tag. Park the bottom level on its last leaf
+    // (q=31), top q stays 0. The q field sits right after seed (before the
+    // appended root); editing bytes invalidates the tag, so drop it and load
+    // through the untagged root-bearing path.
     let per = 4 + 4 + 16 + N + 4 + N;
     let q_in_level = 4 + 4 + 16 + N;
     let bottom_q_off = 4 + per + q_in_level;
     bytes[bottom_q_off..bottom_q_off + 4].copy_from_slice(&31u32.to_be_bytes());
+    bytes.truncate(4 + 2 * per);
     let mut key = HssPrivateKey::from_bytes(&bytes).unwrap();
     assert_eq!(key.remaining(), 1);
 
@@ -466,14 +469,114 @@ fn hss_from_bytes_rejects_advanced_higher_level() {
     .unwrap();
     let mut bytes = sk.to_bytes();
     // Set the TOP level q to 1 (a state the mitigation never produces). The q
-    // field is after seed (before the appended root).
+    // field is after seed (before the appended root). Editing the body breaks
+    // the integrity tag, so drop it: the reuse-prone state must be caught by
+    // the state invariant itself, not only by the tag.
     let top_q_off = 4 + (4 + 4 + 16 + N);
     bytes[top_q_off..top_q_off + 4].copy_from_slice(&1u32.to_be_bytes());
+    let untagged_len = 4 + 2 * (4 + 4 + 16 + N + 4 + N);
+    bytes.truncate(untagged_len);
     assert_eq!(
         HssPrivateKey::from_bytes(&bytes).err(),
         Some(Error::Malformed),
         "advanced higher-level q must be rejected as a reuse-prone state"
     );
+}
+
+/// SECURITY REGRESSION (HSS key-file tampering → top-level LM-OTS double-sign).
+///
+/// Every non-top level's `(typecode, typecode, I, root)` is the message the
+/// pinned `q = 0` parent one-time key signs on *every* `sign()`. Flipping any of
+/// those bytes in a stored key would make that one-time key sign a second,
+/// different message — LM-OTS reuse, hence forgery. Loading MUST refuse.
+#[test]
+fn hss_from_bytes_rejects_tampered_child_level() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-tamper", b"n", &[]);
+    let sk = HssPrivateKey::generate(
+        &[
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+            (LmsType::Sha256M32H5, LmotsType::Sha256N32W8),
+        ],
+        &mut rng,
+    )
+    .unwrap();
+    let good = sk.to_bytes();
+    let per = 4 + 4 + 16 + N + 4 + N;
+    assert_eq!(good.len(), 4 + 2 * per + 32, "tagged HSS serialization");
+    assert!(HssPrivateKey::from_bytes(&good).is_ok());
+
+    // Byte offsets inside the level-1 (child) block: LMS typecode, LM-OTS
+    // typecode, I, and the stored root — every field of the signed child key.
+    let child = 4 + per;
+    let targets = [
+        ("lms typecode", child + 3),
+        ("ots typecode", child + 7),
+        ("I", child + 8),
+        ("I (last byte)", child + 23),
+        ("root", child + 4 + 4 + 16 + N + 4),
+        ("root (last byte)", child + per - 1),
+        ("seed", child + 24),
+    ];
+    for (what, off) in targets {
+        // (a) tagged format: the integrity tag catches every edit.
+        let mut tampered = good.clone();
+        tampered[off] ^= 0x01;
+        assert!(
+            matches!(
+                HssPrivateKey::from_bytes(&tampered),
+                Err(Error::Tampered) | Err(Error::Malformed)
+            ),
+            "tagged: flipping the child {what} must be refused"
+        );
+
+        // (b) untagged root-bearing format: the seed-derived root recompute
+        // still catches a changed typecode / I / root.
+        if what == "seed" {
+            continue; // a changed seed is only caught by the tag (see docs)
+        }
+        let mut untagged = good[..4 + 2 * per].to_vec();
+        untagged[off] ^= 0x01;
+        assert!(
+            matches!(
+                HssPrivateKey::from_bytes(&untagged),
+                Err(Error::Tampered) | Err(Error::Malformed)
+            ),
+            "untagged: flipping the child {what} must be refused"
+        );
+    }
+
+    // The untruncated, unmodified untagged form still loads (compatibility).
+    let untagged = good[..4 + 2 * per].to_vec();
+    let loaded = HssPrivateKey::from_bytes(&untagged).expect("untagged v1 key must still load");
+    assert_eq!(
+        loaded.public_key().to_bytes(),
+        sk.public_key().to_bytes(),
+        "untagged reload must reproduce the public key"
+    );
+}
+
+/// A truncated or extended tag is rejected, and the tag itself is authenticated.
+#[test]
+fn hss_tag_must_verify() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"hss-tag", b"n", &[]);
+    let sk = HssPrivateKey::generate(&[(LmsType::Sha256M32H5, LmotsType::Sha256N32W8)], &mut rng)
+        .unwrap();
+    let good = sk.to_bytes();
+    for i in [0usize, 7, 31] {
+        let mut bad = good.clone();
+        let n = bad.len();
+        bad[n - 32 + i] ^= 0x80;
+        assert_eq!(
+            HssPrivateKey::from_bytes(&bad).err(),
+            Some(Error::Tampered),
+            "a corrupted tag byte {i} must be refused"
+        );
+    }
+    // Even a single-level key's top root is authenticated by the tag.
+    let mut bad = good.clone();
+    let root_off = 4 + 4 + 4 + 16 + N + 4;
+    bad[root_off] ^= 0x01;
+    assert_eq!(HssPrivateKey::from_bytes(&bad).err(), Some(Error::Tampered));
 }
 
 // ===================================================================
@@ -604,7 +707,11 @@ fn hss_new_format_roundtrip() {
     let _ = sk.sign(&mut rng, b"warmup").unwrap();
 
     let bytes = sk.to_bytes();
-    assert_eq!(bytes.len(), 4 + 2 * 92, "new HSS per-level stride is 92");
+    assert_eq!(
+        bytes.len(),
+        4 + 2 * 92 + 32,
+        "new HSS per-level stride is 92, plus the 32-byte integrity tag"
+    );
     let mut reloaded = HssPrivateKey::from_bytes(&bytes).unwrap();
     assert_eq!(
         reloaded.public_key().to_bytes(),
@@ -635,7 +742,7 @@ fn hss_legacy_load() {
     // legacy 60-byte-per-level layout.
     let new = sk.to_bytes();
     let l = 2usize;
-    assert_eq!(new.len(), 4 + l * 92);
+    assert_eq!(new.len(), 4 + l * 92 + 32);
     let mut legacy = Vec::with_capacity(4 + l * 60);
     legacy.extend_from_slice(&new[..4]);
     for i in 0..l {

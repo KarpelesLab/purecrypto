@@ -85,8 +85,9 @@ fn lms_sig_len(lms: LmsType, ots: LmotsType) -> usize {
 /// [`HssPrivateKey`] does not expose its per-level parameter sets, so they
 /// are recovered from the self-describing private serialization. The current
 /// format is `u32(L) || per level { u32(lms) || u32(ots) || I(16) ||
-/// seed(32) || u32(q) || root(32) }` (per-level = 92); the legacy root-less
-/// form (per-level = 60) is also accepted. The copy contains the master
+/// seed(32) || u32(q) || root(32) } || tag(32)` (per-level = 92); the older
+/// untagged root-bearing form and the legacy root-less form (per-level = 60)
+/// are also accepted. The copy contains the master
 /// seeds and is wiped before returning. Returns `None` only on a malformed
 /// serialization (which would indicate an internal bug, not user input).
 fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
@@ -97,17 +98,21 @@ fn hss_sig_len(key: &HssPrivateKey) -> Option<usize> {
 }
 
 fn hss_sig_len_from_private_bytes(ser: &[u8]) -> Option<usize> {
-    // Only the type fields at the start of each level block are read, so both
-    // the legacy 60-byte stride and the current root-bearing 92-byte stride are
-    // length-discriminated and handled. `to_bytes()` now emits the 92 stride;
-    // both are accepted for robustness (kept in sync with `HssPrivateKey`).
+    // Only the type fields at the start of each level block are read, so every
+    // stride the library has ever emitted is length-discriminated and handled:
+    // the current tagged 92-byte stride (what `to_bytes()` writes), the older
+    // untagged 92-byte stride, and the legacy 60-byte one (kept in sync with
+    // `HssPrivateKey`).
     const LEGACY_LEVEL_BYTES: usize = 4 + 4 + 16 + N + 4;
     const NEW_LEVEL_BYTES: usize = LEGACY_LEVEL_BYTES + N;
+    const TAG_BYTES: usize = 32;
     let l = u32::from_be_bytes(ser.get(..4)?.try_into().ok()?) as usize;
     if l == 0 {
         return None;
     }
-    let level_bytes = if ser.len() == 4 + l * NEW_LEVEL_BYTES {
+    let level_bytes = if ser.len() == 4 + l * NEW_LEVEL_BYTES + TAG_BYTES
+        || ser.len() == 4 + l * NEW_LEVEL_BYTES
+    {
         NEW_LEVEL_BYTES
     } else if ser.len() == 4 + l * LEGACY_LEVEL_BYTES {
         LEGACY_LEVEL_BYTES
