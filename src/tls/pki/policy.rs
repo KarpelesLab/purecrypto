@@ -269,9 +269,14 @@ pub(crate) fn check_policies(path: &[Certificate], opts: &PolicyOptions) -> Resu
     }
 
     // --- §6.1.5 wrap-up procedure ---
-    // (a)/(b): decrement/handle explicit_policy for the final certificate.
-    // policyConstraints with requireExplicitPolicy == 0 on the final cert sets
-    // explicit_policy to 0.
+    // (a): "If explicit_policy is not 0, decrement explicit_policy by 1."
+    // Without this decrement a `policyConstraints{requireExplicitPolicy = 1}`
+    // on the last intermediate never reaches 0, so the constraint it imposes
+    // on the leaf was silently dropped (off by one). `saturating_sub` gives
+    // the "not 0" guard for free.
+    explicit_policy = explicit_policy.saturating_sub(1);
+    // (b): policyConstraints with requireExplicitPolicy == 0 on the final cert
+    // sets explicit_policy to 0.
     if let Some((require, _inhibit, _crit)) = path[0]
         .policy_constraints()
         .map_err(|_| Error::BadCertificate)?
@@ -537,31 +542,58 @@ fn apply_policy_mappings(tree: &mut PolicyTree, mappings: &[(Oid, Oid)]) {
 /// valid for).
 ///
 /// The set of policies the path is valid for, expressed in the
-/// trust-anchor/user domain, is carried by the **depth-1** nodes — the
-/// policies asserted by the certificate just below the anchor, before any
-/// policy mapping rewrote their `expected_policy_set` further down. Because
-/// dead branches are pruned after each certificate, every surviving depth-1
-/// node has a descendant in the leaf row, so its `valid_policy` is genuinely
-/// valid for the whole path. (Using the leaf-row `valid_policy` instead would
-/// report subject-domain policies and break policy-mapping translation.)
+/// trust-anchor/user domain, is read off the surviving **leaf-row** branches:
+/// for each node of the deepest row, walk down its ancestor chain from depth 1
+/// and take the first `valid_policy` that is not `anyPolicy`. That is exactly
+/// RFC 5280 §6.1.5(g)(iii)(1)'s `valid_policy_node_set` (the nodes whose parent
+/// asserts `anyPolicy`, the root included) restricted to branches that actually
+/// reach the leaf. Reading depth 1 alone would be wrong in both directions: an
+/// `anyPolicy`-only depth-1 node would hide the concrete policy its descendants
+/// carry, and — the bug this replaces — an `anyPolicy` node at depth 1 would
+/// wrongly expand to the caller's entire required set even when the leaf
+/// constrains the path to something else. `anyPolicy` expansion (§6.1.5(g)(iii)
+/// step 3) is only permitted when an `anyPolicy` node survives in the *leaf*
+/// row, which can only happen when every node on that branch is `anyPolicy`.
+/// Using the leaf-row `valid_policy` directly would instead report
+/// subject-domain policies and break policy-mapping translation, so the walk
+/// stops at the shallowest non-`anyPolicy` ancestor.
 fn intersect_with_user_set(tree: &PolicyTree, user_set: Option<&[Oid]>) -> Vec<Oid> {
     // When the path has only the root row (no certificate asserted any policy
-    // — i.e. depth 0), there are no valid policies. Otherwise the
-    // domain-level policies live at depth 1.
-    let domain_depth = if tree.depth >= 1 { 1 } else { tree.depth };
-    let domain_indices: Vec<usize> = (0..tree.nodes.len())
-        .filter(|&i| tree.nodes[i].depth == domain_depth)
-        .collect();
-    // anyPolicy may survive at depth 1 (e.g. a single anyPolicy-asserting cert
-    // not yet constrained); treat it as the wildcard.
-    let any_present = domain_indices
-        .iter()
-        .any(|&i| tree.nodes[i].valid_policy.as_slice() == oid::ANY_POLICY);
-    let mut effective: Vec<Oid> = domain_indices
-        .iter()
-        .map(|&i| tree.nodes[i].valid_policy.clone())
-        .filter(|p| p.as_slice() != oid::ANY_POLICY)
-        .collect();
+    // — i.e. depth 0), or the tree was emptied, there are no valid policies.
+    if tree.nodes.is_empty() || tree.depth == 0 {
+        return Vec::new();
+    }
+    let mut effective: Vec<Oid> = Vec::new();
+    // Whether a branch made entirely of `anyPolicy` nodes reaches the leaf row
+    // (equivalently: a leaf-row node with `valid_policy == anyPolicy`).
+    let mut any_present = false;
+    for leaf in tree.leaf_indices() {
+        // Collect the branch leaf -> depth 1, then read it anchor-first.
+        let mut branch = Vec::new();
+        let mut cur = leaf;
+        loop {
+            branch.push(cur);
+            let node = &tree.nodes[cur];
+            if node.depth <= 1 || node.parent == usize::MAX || node.parent >= tree.nodes.len() {
+                break;
+            }
+            cur = node.parent;
+        }
+        match branch
+            .iter()
+            .rev()
+            .map(|&i| &tree.nodes[i].valid_policy)
+            .find(|p| p.as_slice() != oid::ANY_POLICY)
+        {
+            Some(p) => {
+                if !effective.iter().any(|e| e.as_slice() == p.as_slice()) {
+                    effective.push(p.clone());
+                }
+            }
+            // Every node from depth 1 down to the leaf asserts anyPolicy.
+            None => any_present = true,
+        }
+    }
 
     match user_set {
         // user-initial-policy-set == any-policy: every effective policy is
@@ -745,6 +777,69 @@ mod tests {
             &[extension::certificate_policies(&[POLICY_A])],
         );
         verify(&store, &chain, &PolicyOptions::require(&[POLICY_A])).unwrap();
+    }
+
+    /// Regression (RFC 5280 §6.1.5(g)(iii)): an `anyPolicy` node at depth 1
+    /// must NOT expand to the caller's whole required set — the leaf still
+    /// constrains the path. Only an `anyPolicy` node surviving in the *leaf*
+    /// row licenses the expansion.
+    #[test]
+    fn any_policy_at_depth_one_does_not_satisfy_unrelated_policy() {
+        // Intermediate asserts anyPolicy, leaf asserts POLICY_A only. The path
+        // is valid for POLICY_A, not for POLICY_B.
+        let int_exts = [extension::certificate_policies(&[oid::ANY_POLICY])];
+        let leaf_exts = [extension::certificate_policies(&[POLICY_A])];
+        let (store, chain) = build_chain(&int_exts, &leaf_exts);
+        assert!(verify(&store, &chain, &PolicyOptions::require(&[POLICY_B])).is_err());
+        // ... while the policy the leaf really asserts is still accepted.
+        let (store2, chain2) = build_chain(&int_exts, &leaf_exts);
+        verify(&store2, &chain2, &PolicyOptions::require(&[POLICY_A])).unwrap();
+    }
+
+    /// The converse: when the whole path (intermediate *and* leaf) asserts
+    /// anyPolicy, an anyPolicy node survives in the leaf row and the
+    /// user-initial-policy-set is accepted wholesale.
+    #[test]
+    fn any_policy_through_leaf_expands_to_user_set() {
+        let (store, chain) = build_chain(
+            &[extension::certificate_policies(&[oid::ANY_POLICY])],
+            &[extension::certificate_policies(&[oid::ANY_POLICY])],
+        );
+        verify(&store, &chain, &PolicyOptions::require(&[POLICY_B])).unwrap();
+    }
+
+    /// Regression (RFC 5280 §6.1.5(a)): the wrap-up decrement of
+    /// `explicit_policy` was missing, so a `requireExplicitPolicy = 1` on the
+    /// last intermediate — which constrains exactly the leaf — never reached 0
+    /// and the requirement was silently dropped.
+    #[test]
+    fn require_explicit_policy_one_applies_to_the_leaf() {
+        let opts = PolicyOptions {
+            initial_policies: Some(vec![POLICY_A.to_vec()]),
+            require_explicit_policy: false,
+            inhibit_policy_mapping: false,
+            inhibit_any_policy: false,
+        };
+        // Intermediate: policies A + requireExplicitPolicy = 1 (i.e. "from the
+        // next certificate on, a policy is required"). Leaf asserts only
+        // POLICY_B → no acceptable policy → reject.
+        let (store, chain) = build_chain(
+            &[
+                extension::certificate_policies(&[POLICY_A]),
+                extension::policy_constraints(Some(1), None),
+            ],
+            &[extension::certificate_policies(&[POLICY_B])],
+        );
+        assert!(verify(&store, &chain, &opts).is_err());
+        // Same constraint, leaf carries POLICY_A → accepted.
+        let (store2, chain2) = build_chain(
+            &[
+                extension::certificate_policies(&[POLICY_A]),
+                extension::policy_constraints(Some(1), None),
+            ],
+            &[extension::certificate_policies(&[POLICY_A])],
+        );
+        verify(&store2, &chain2, &opts).unwrap();
     }
 
     #[test]
