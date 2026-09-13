@@ -706,6 +706,11 @@ fn ca_sign_csr_ignores_csr_sans_without_opt_in() {
             dir.to_str().unwrap(),
             "-in",
             &csr,
+            // The CSR's own `CN=attacker.example` is host-shaped and the
+            // issuance names no SAN, so the commonName screen
+            // (`ca_sign_csr_refuses_host_shaped_csr_cn`) would refuse it.
+            // This test is about the SAN policy, so opt past that one.
+            "-allow-cn-hostname",
             "-out",
             &out,
         ];
@@ -774,6 +779,202 @@ fn ca_sign_csr_ignores_csr_sans_without_opt_in() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The CSR's *subject commonName* is the requester's claim just as much as
+/// its subjectAltName is. Dropping the requested SANs is not enough on its
+/// own: with no SAN extension at all, RFC 6125 §6.4.4 hostname verification
+/// falls back to the commonName, so `CN=*.bank.example` in a CSR used to come
+/// back as a chain-valid certificate for `*.bank.example`. Both signing paths
+/// must refuse that, and must keep issuing once a name is actually vetted.
+#[test]
+fn ca_sign_csr_refuses_host_shaped_csr_cn() {
+    let dir = std::env::temp_dir().join(format!("pc_cli_cnpolicy_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_str().unwrap().to_string();
+    let p = |name: &str| dir.join(name).to_str().unwrap().to_string();
+
+    assert!(run(&["ca", "init", "-dir", &d, "-cn", "CN Policy CA"], b"").1);
+    assert!(
+        run(
+            &[
+                "genpkey",
+                "-algorithm",
+                "EC",
+                "-curve",
+                "P-256",
+                "-out",
+                &p("leaf.key")
+            ],
+            b""
+        )
+        .1
+    );
+    // No -addext: the request carries a host-shaped CN and nothing else.
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=*.bank.example",
+                "-out",
+                &p("wild.csr"),
+            ],
+            b"",
+        )
+        .1
+    );
+
+    // 1. `ca sign-csr` refuses, and does not consume an audit index.
+    let serial_before = std::fs::read_to_string(dir.join("serial")).unwrap();
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            &d,
+            "-in",
+            &p("wild.csr"),
+            "-out",
+            &p("wild.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "ca sign-csr certified a requester-chosen commonName");
+    assert!(
+        err.contains("commonName") && err.contains("*.bank.example"),
+        "expected a commonName diagnostic, got: {err}"
+    );
+    assert!(!dir.join("wild.crt").exists());
+    assert_eq!(
+        std::fs::read_to_string(dir.join("serial")).unwrap(),
+        serial_before,
+        "a refused request must not consume an audit index"
+    );
+
+    // 2. `x509 -req` applies the same policy.
+    let (_o, err, ok) = run_capture(
+        &[
+            "x509",
+            "-req",
+            "-in",
+            &p("wild.csr"),
+            "-CA",
+            &p("root.crt"),
+            "-CAkey",
+            &p("root.key"),
+            "-out",
+            &p("wild2.crt"),
+        ],
+        b"",
+    );
+    assert!(!ok, "x509 -req certified a requester-chosen commonName");
+    assert!(err.contains("commonName"), "{err}");
+
+    // 3. A vetted `-san` makes the CN inert (the SAN is what gets matched),
+    //    so issuance proceeds.
+    assert!(
+        run(
+            &[
+                "ca",
+                "sign-csr",
+                "-dir",
+                &d,
+                "-in",
+                &p("wild.csr"),
+                "-san",
+                "vetted.example",
+                "-out",
+                &p("ok1.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "an operator-vetted -san must still issue"
+    );
+
+    // 4. `-subj` replaces the requester's subject with the operator's.
+    assert!(
+        run(
+            &[
+                "ca",
+                "sign-csr",
+                "-dir",
+                &d,
+                "-in",
+                &p("wild.csr"),
+                "-subj",
+                "/CN=vetted.example",
+                "-out",
+                &p("ok2.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "-subj must override the request's subject"
+    );
+    let (text, ok) = run(&["x509", "-in", &p("ok2.crt"), "-text"], b"");
+    assert!(ok, "{text}");
+    assert!(text.contains("CN=vetted.example"), "{text}");
+    assert!(!text.contains("bank.example"), "{text}");
+
+    // 5. ...and the explicit override still issues, with a loud warning.
+    let (_o, err, ok) = run_capture(
+        &[
+            "ca",
+            "sign-csr",
+            "-dir",
+            &d,
+            "-in",
+            &p("wild.csr"),
+            "-allow-cn-hostname",
+            "-out",
+            &p("ok3.crt"),
+        ],
+        b"",
+    );
+    assert!(ok, "-allow-cn-hostname must still issue: {err}");
+    assert!(err.contains("WARNING"), "expected a warning, got: {err}");
+
+    // 6. An organizational CN is not host-shaped and needs no opt-in — the
+    //    screen must not break client/e-mail issuance.
+    assert!(
+        run(
+            &[
+                "req",
+                "-key",
+                &p("leaf.key"),
+                "-subj",
+                "/CN=Alice Smith/O=Acme",
+                "-out",
+                &p("person.csr"),
+            ],
+            b"",
+        )
+        .1
+    );
+    assert!(
+        run(
+            &[
+                "ca",
+                "sign-csr",
+                "-dir",
+                &d,
+                "-in",
+                &p("person.csr"),
+                "-out",
+                &p("person.crt"),
+            ],
+            b"",
+        )
+        .1,
+        "a non-host commonName must issue without any opt-in"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// C-2, third path: `x509 -req` has the same policy.
 #[test]
 fn x509_req_ignores_csr_sans_without_opt_in() {
@@ -790,6 +991,9 @@ fn x509_req_ignores_csr_sans_without_opt_in() {
             &p("root.crt"),
             "-CAkey",
             &p("root.key"),
+            // See the note in `ca_sign_csr_ignores_csr_sans_without_opt_in`:
+            // the host-shaped CSR commonName is screened separately.
+            "-allow-cn-hostname",
             "-out",
             &out,
         ],
@@ -1004,6 +1208,23 @@ fn ca_sign_csr_rejects_swapped_root_key() {
     );
     assert!(err.contains("does not match"), "{err}");
     assert!(!dir.join("bad2.crt").exists());
+
+    // `ca crl` signs with the same key: a CRL under the wrong key verifies
+    // nowhere, which relying parties read as "no revocations" — refuse too.
+    let (_out, err, ok) = run_capture(
+        &[
+            "ca",
+            "crl",
+            "-dir",
+            dir.to_str().unwrap(),
+            "-out",
+            &p("bad.crl"),
+        ],
+        b"",
+    );
+    assert!(!ok, "ca crl must refuse a root.key that is not root.crt's");
+    assert!(err.contains("does not match"), "{err}");
+    assert!(!dir.join("bad.crl").exists());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

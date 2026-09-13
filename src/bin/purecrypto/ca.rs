@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
 
 use crate::pki::{
     MAX_X509_UNIX_TIME, Profile, default_extensions, describe_key, dns_general_names, format_dn,
-    issuer_ski_bytes, json_escape, parse_sans, parse_subject, random_serial, require_ca_issuer,
-    require_key_matches_cert, spki_bit_string_contents, validity_days, verify_and_screen_csr,
+    guard_requester_chosen_cn, issuer_ski_bytes, json_escape, parse_sans, parse_subject,
+    random_serial, require_ca_issuer, require_key_matches_cert, spki_bit_string_contents,
+    validity_days, verify_and_screen_csr,
 };
 use crate::template::{CertTemplate, builtin_names};
 use crate::util::{
@@ -583,16 +584,19 @@ fn run_sign_csr(args: Args) {
     // touching CA state: a rejected request must not consume an audit index.
     verify_and_screen_csr(&csr);
 
-    let index = allocate_index(&ca);
-    let serial = random_serial();
-    let validity = validity_days(days_n);
-
-    let subject_from_csr = csr
-        .subject()
-        .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
     let subject_key = csr
         .public_key()
         .unwrap_or_else(|e| die(format!("bad CSR key: {e}")));
+
+    // The subject DN. An operator `-subj /CN=.../O=...` replaces the
+    // request's own DN outright — the names in the issued certificate are
+    // then the CA's assertion, not the requester's claim.
+    let subject_from_csr = csr
+        .subject()
+        .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
+    let subject_override = args.value("-subj").map(parse_subject);
+    let subject_is_operators = subject_override.is_some();
+    let subject_from_csr = subject_override.unwrap_or(subject_from_csr);
 
     // Which names end up in the certificate. A CSR's `subjectAltName` is the
     // requester's *claim* — certifying it verbatim turns a request for
@@ -601,6 +605,28 @@ fn run_sign_csr(args: Args) {
     // the operator names the SANs with `-san`/`-sans`/`-addext`, or the
     // template lists them.
     let sans = resolve_sign_csr_sans(&args, &csr);
+
+    // ...and the subject `commonName` is the requester's claim too. With no
+    // vetted SAN list at all the issued leaf carries NO subjectAltName, and
+    // hostname verification then falls back to the CN — so a CSR asking for
+    // `CN=*.bank.example` would be certified for that name. Screen before
+    // `allocate_index`: a refused request must not consume an audit index.
+    let tmpl_names_sans = template
+        .as_ref()
+        .is_some_and(|t| !t.san_explicit.is_empty());
+    if !is_ca_flag && !subject_is_operators {
+        guard_requester_chosen_cn(
+            &subject_from_csr,
+            !sans.is_empty() || tmpl_names_sans,
+            args.flag("-allow-cn-hostname") || args.flag("--allow-cn-hostname"),
+            "ca sign-csr",
+        );
+    }
+
+    let index = allocate_index(&ca);
+    let serial = random_serial();
+    let validity = validity_days(days_n);
+
     let cert = if let Some(tmpl) = template {
         let issuer_ski = issuer_ski_bytes(&root_cert);
         let subj_spki_bits = spki_bit_string_contents(&subject_key);
@@ -848,8 +874,12 @@ fn run_crl(args: Args) {
     let days_n = days(&args);
     let now = now_unix();
 
-    let root_key = load_root_key(&ca);
-    let root_cert = load_root_cert(&ca);
+    // A CRL is as security-critical as a certificate: signed with the wrong
+    // key it silently fails to verify at every relying party, which reads as
+    // "no revocations known" rather than as an error. Load the pair through
+    // the same screen `issue` / `sign-csr` use, so a swapped `root.key` (or a
+    // `root.crt` replaced by a leaf) is caught here too.
+    let (root_cert, root_key) = load_root_identity(&ca, &args);
     let issuer_dn = root_cert
         .subject()
         .unwrap_or_else(|e| die(format!("bad CA subject: {e}")));
@@ -1016,7 +1046,7 @@ purecrypto ca — manage a development CA
 USAGE:
     purecrypto ca init    -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519|ED448] [-curve P-256] [-days N]
     purecrypto ca issue   -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH] [-force]
-    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-template NAME] [-template-file PATH] [-force]
+    purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-subj /CN=...] [-allow-cn-hostname] [-template NAME] [-template-file PATH] [-force]
     purecrypto ca revoke  -dir DIR -serial N|0xN [-reason key-compromise|superseded|...] [-force]
     purecrypto ca crl     -dir DIR [-out crl.pem] [-days N]
     purecrypto ca show    -dir DIR
@@ -1031,6 +1061,13 @@ NOTES:
     requester's claim. Name the SANs yourself with `-san a,b`, or pass
     `-copy-csr-san` to take the request's list as-is (a warning naming every
     copied entry goes to stderr).
+
+    The same goes for the request's subject commonName: `ca sign-csr` refuses
+    to issue a leaf with NO vetted subjectAltName when the CSR's CN looks like
+    a DNS name, wildcard, or IP literal, because hostname verification falls
+    back to the commonName exactly when a certificate has no SAN. Pass `-san`,
+    `-copy-csr-san`, `-subj /CN=...` (which replaces the request's whole
+    subject with your own), or `-allow-cn-hostname` to certify it anyway.
 
     Submitted CSRs must carry a >= 2048-bit RSA key and a signature that is
     not SHA-1/MD5-based; `ca revoke` refuses a serial that is absent from

@@ -467,6 +467,94 @@ pub(crate) fn parse_sans(spec: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether `cn` reads as a *host identifier* — a dNSName, a `*.` wildcard
+/// pattern, or an IP literal — rather than a human-facing organizational
+/// name ("Acme Inc", "Test CA", "R3").
+///
+/// This is the shape that RFC 6125 §6.4.4's deprecated commonName fallback
+/// still matches: a relying party (this crate's own `tls::pki::verify`
+/// included) that finds *no* subjectAltName extension falls back to the
+/// subject CN, so a CN of this shape in a SAN-less certificate authenticates
+/// that name.
+pub(crate) fn cn_is_host_identifier(cn: &str) -> bool {
+    let cn = cn.trim();
+    if cn.is_empty() {
+        return false;
+    }
+    // IP literal, bare or in the `[::1]` bracketed form.
+    let ip = cn
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(cn);
+    if ip.parse::<core::net::IpAddr>().is_ok() {
+        return true;
+    }
+    // The one dotless name a browser will actually resolve and match.
+    if cn.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // dNSName shape: two or more LDH labels separated by dots, optionally
+    // with a wildcard in the leftmost label and an absolute trailing dot.
+    let host = cn.strip_suffix('.').unwrap_or(cn);
+    let labels: Vec<&str> = host.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    labels.iter().enumerate().all(|(i, l)| {
+        !l.is_empty()
+            && l.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || (i == 0 && b == b'*')
+            })
+    })
+}
+
+/// Refuses to certify a **requester-chosen** `commonName` as a hostname.
+///
+/// A CSR's subject DN is copied verbatim into the certificate it is signed
+/// into, and with no operator-vetted SAN list the issued certificate carries
+/// no subjectAltName extension at all — which is exactly the condition under
+/// which hostname verification falls back to the CN (RFC 6125 §6.4.4). A
+/// request for `CN=*.bank.example` would therefore come back as a chain-valid
+/// certificate for `*.bank.example` that the operator never vetted.
+///
+/// `sans_vetted` says whether the issuance will carry an operator-approved
+/// subjectAltName (an explicit `-san`, `-copy-csr-san`, or a template's own
+/// list); a SAN-bearing certificate's CN is inert. `allow` is the explicit
+/// `-allow-cn-hostname` override. `label` names the flags the caller offers.
+pub(crate) fn guard_requester_chosen_cn(
+    subject: &DistinguishedName,
+    sans_vetted: bool,
+    allow: bool,
+    label: &str,
+) {
+    if sans_vetted {
+        return;
+    }
+    let Some(cn) = subject.common_name.as_deref() else {
+        return;
+    };
+    if !cn_is_host_identifier(cn) {
+        return;
+    }
+    if allow {
+        eprintln!(
+            "purecrypto: WARNING: -allow-cn-hostname given — certifying the request's own \
+             commonName `{cn}` in a certificate with no subjectAltName. Relying parties that \
+             still honour the RFC 6125 §6.4.4 commonName fallback will accept this \
+             certificate for the host `{cn}`."
+        );
+        return;
+    }
+    die(format!(
+        "refusing to certify the CSR's own commonName `{cn}` as a host name: it looks like a \
+         DNS name / IP literal, the certificate would carry no subjectAltName, and hostname \
+         verification then falls back to the commonName — so the requester, not you, would \
+         have chosen the name this certificate authenticates. Name the SANs you verified with \
+         `-san NAME[,NAME]`, take the request's list with `-copy-csr-san`, replace the subject \
+         with `-subj /CN=...`, or pass `-allow-cn-hostname` to certify it anyway ({label})"
+    ));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,5 +692,45 @@ mod tests {
         let names = dns_general_names(&["a.example".to_string(), "b.example".to_string()]);
         let exts = default_extensions(Profile::Leaf, &names);
         assert!(exts.iter().any(|e| e.oid == oid::SUBJECT_ALT_NAME));
+    }
+
+    /// The commonName screen must catch every CN shape the RFC 6125 §6.4.4
+    /// fallback would match, and must not fire on an organizational name (a
+    /// false positive there would break legitimate client/e-mail issuance).
+    #[test]
+    fn cn_host_identifier_classification() {
+        for host in [
+            "bank.example",
+            "*.bank.example",
+            "www.google.com",
+            "attacker.example",
+            "LOGIN.Bank.Example",
+            "example.com.",
+            "under_score.example",
+            "localhost",
+            "LocalHost",
+            "10.0.0.1",
+            "::1",
+            "[::1]",
+            "2001:db8::1",
+        ] {
+            assert!(cn_is_host_identifier(host), "missed host-shaped CN: {host}");
+        }
+        for name in [
+            "",
+            "Test CA",
+            "Acme Inc.",
+            "R3",
+            "Alice Smith",
+            "purecrypto development root",
+            "Acme, Inc. Issuing CA",
+            "CN with space.example",
+            "alice@example.com",
+        ] {
+            assert!(
+                !cn_is_host_identifier(name),
+                "organizational CN misread as a host: {name}"
+            );
+        }
     }
 }

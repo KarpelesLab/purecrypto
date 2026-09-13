@@ -1,9 +1,9 @@
 //! `purecrypto x509` — inspect, self-sign, or CA-sign certificates.
 
 use crate::pki::{
-    Profile, default_extensions, describe_key, dns_general_names, format_dn, load_key, parse_sans,
-    parse_subject, random_serial, require_ca_issuer, require_key_matches_cert, validity_days,
-    verify_and_screen_csr,
+    Profile, default_extensions, describe_key, dns_general_names, format_dn,
+    guard_requester_chosen_cn, load_key, parse_sans, parse_subject, random_serial,
+    require_ca_issuer, require_key_matches_cert, validity_days, verify_and_screen_csr,
 };
 use crate::util::{Args, die, read_input, write_output};
 use purecrypto::x509::extension::Extension;
@@ -317,9 +317,14 @@ pub(crate) fn run(args: Args) {
         // Verify the request's self-signature and screen it against the same
         // policy `ca sign-csr` applies (no SHA-1/MD5 signature, RSA >= 2048).
         verify_and_screen_csr(&csr);
-        let subject = csr
+        let csr_subject = csr
             .subject()
             .unwrap_or_else(|e| die(format!("bad CSR subject: {e}")));
+        // An operator `-subj /CN=.../O=...` replaces the request's whole
+        // subject DN: the names then come from the CA, not the requester.
+        let subject_override = args.value("-subj").map(parse_subject);
+        let subject_is_operators = subject_override.is_some();
+        let subject = subject_override.unwrap_or(csr_subject);
         let subject_key = csr
             .public_key()
             .unwrap_or_else(|e| die(format!("bad CSR key: {e}")));
@@ -334,6 +339,18 @@ pub(crate) fn run(args: Args) {
         //     `-ca`, and keyUsage + EKU for a leaf.
         let sans = resolve_req_sans(&args, &csr);
         let profile = if is_ca { Profile::SubCa } else { Profile::Leaf };
+        // With no vetted SAN the leaf carries no subjectAltName extension at
+        // all — the one condition under which hostname verification falls
+        // back to the subject commonName (RFC 6125 §6.4.4). Certifying the
+        // request's own CN there would let the requester pick the name.
+        if !is_ca && !subject_is_operators {
+            guard_requester_chosen_cn(
+                &subject,
+                !sans.is_empty(),
+                args.flag("-allow-cn-hostname") || args.flag("--allow-cn-hostname"),
+                "x509 -req",
+            );
+        }
         let exts = default_extensions(profile, &dns_general_names(&sans));
         let cert = Certificate::issue_with_extensions(
             &cakey.signer(),
@@ -387,9 +404,13 @@ pub(crate) fn run(args: Args) {
              purecrypto x509 -in <cert.pem> -text [-ext]\n  \
              purecrypto x509 -new -key <key.pem> -subj /CN=... [-san a,b] [-days N] [-ca] [-out f]\n  \
              purecrypto x509 -req -in <csr.pem> -CA <ca.pem> -CAkey <cakey.pem> [-san a,b] \
-             [-copy-csr-san] [-days N] [-ca] [-force] [-out f]\n\n\
+             [-copy-csr-san] [-subj /CN=...] [-allow-cn-hostname] [-days N] [-ca] [-force] \
+             [-out f]\n\n\
              A CSR's requested subjectAltName is NOT certified unless -copy-csr-san is given; \
-             name the SANs with -san instead. -ca emits a pathLen:0 sub-CA with \
+             name the SANs with -san instead. A leaf with no vetted SAN whose CSR commonName \
+             looks like a host name is refused (the CN fallback would certify it): pass -san, \
+             -copy-csr-san, -subj to supply your own subject, or -allow-cn-hostname. \
+             -ca emits a pathLen:0 sub-CA with \
              keyUsage=keyCertSign,cRLSign. -CA must be a CA certificate (basicConstraints CA:TRUE, \
              keyUsage keyCertSign) and -CAkey must be its key; -force signs under a non-CA anyway.",
         )
