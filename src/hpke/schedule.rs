@@ -509,7 +509,9 @@ fn increment_seq(seq: &mut u64, aead: HpkeAead) -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
+// The context API these cases drive (`seal` / `open` / `export`) returns owned
+// buffers and so only exists with `alloc`.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::hpke::{HpkeAead, HpkeKdf, HpkeKem};
