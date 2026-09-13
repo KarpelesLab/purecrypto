@@ -149,7 +149,8 @@ pub(crate) fn sign_internal<R: SamplerRng>(
     let slen = key.degree.sig_len() - 1 - SALT_LEN;
 
     // c = HashToPoint(salt || msg); fft(c).
-    let c = super::hash_to_point(salt, msg, n);
+    let mut c: Vec<u16> = alloc::vec![0u16; n];
+    super::hash_to_point_into(salt, msg, &mut c);
     let c_fpr: Vec<Fpr> = c.iter().map(|&x| Fpr::of_i64(x as i64)).collect();
     let point_fft = key.fft.fft(&c_fpr);
 

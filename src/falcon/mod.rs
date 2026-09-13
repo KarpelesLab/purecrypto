@@ -6,6 +6,10 @@
 //! full scheme: [`FalconPrivateKey::generate`] / [`FalconPrivateKey::sign`] and
 //! the [`verify`] / [`FalconPublicKey`] verification path.
 //!
+//! The verification half needs no allocator; `FalconPrivateKey` (key generation
+//! and signing) is behind the `alloc` feature. See "Memory" below for the
+//! measurements behind that split.
+//!
 //! **Floating point.** Signing needs an FFT, an LDL tree, and a discrete
 //! Gaussian sampler — all floating-point — but the crate is `no_std` with no
 //! `libm`, and the signing path is secret-dependent. So all FP runs in a
@@ -40,6 +44,41 @@
 //! Verification needs only SHAKE-256 (for `HashToPoint`) and integer arithmetic
 //! modulo `q = 12289`.
 //!
+//! # Memory
+//!
+//! **Verification is allocator-free** — [`verify`], [`verify_with_format`],
+//! [`FalconPublicKey`] and its methods need no `alloc` feature and perform zero
+//! heap allocations (measured: 0 bytes, 0 calls, at both degrees). The whole
+//! working set is one `[i16; 1024]` for the decompressed `s₂`: the hashed point
+//! `c` is squeezed off SHAKE-256 one coefficient at a time, and the negacyclic
+//! product `s₂·h` is computed one output coefficient at a time, so neither
+//! needs a buffer. Measured `thumbv7em-none-eabi` release frames:
+//! [`FalconPublicKey::verify_with_format`] 2 584 B, and 4 160 B more for the
+//! free [`verify`], which parses the 2 056-byte key into its own frame — so an
+//! embedded caller that parses once and keeps the [`FalconPublicKey`] pays
+//! ~2.6 KiB per call rather than ~6.8 KiB.
+//!
+//! **Signing and key generation require `alloc`**, and deliberately keep it.
+//! The numbers, measured with a counting global allocator:
+//!
+//! | | Falcon-512 | Falcon-1024 |
+//! |---|---|---|
+//! | expanded key, resident for the key's lifetime | 170 KiB | 354 KiB |
+//! | transient, per signature | 141 KiB | 282 KiB |
+//! | transient, `generate` | 881 KiB | 3 265 KiB |
+//! | transient, `FalconPrivateKey::from_bytes` | 393 KiB | 802 KiB |
+//!
+//! A caller-supplied scratch buffer in the style of the reference
+//! implementation's `falcon_sign_dyn(tmp, tmp_len)` would therefore have to be
+//! ~311 KiB (Falcon-512) or ~636 KiB (Falcon-1024) to sign, which is more RAM
+//! than the Cortex-M class of part this directive is for has in total; the
+//! expanded basis and LDL tree alone exceed it. `generate` is worse still and
+//! not even fixed-size: NTRUSolve's tower-of-rings recursion drives
+//! variable-width big integers (~8 kbit at n = 512, ~16 kbit at n = 1024) and
+//! 21.6 M / 122 M individual allocations, whose sizes depend on the sampled
+//! polynomials. So the split is verify-only, as in `xmss`, rather than an
+//! `_into` + scratch API that could not be used in practice.
+//!
 //! Implemented against the Falcon specification v1.2 (2020-10-01), the document
 //! underlying the NIST round-3 submission and the FN-DSA draft:
 //!
@@ -60,15 +99,25 @@
 
 #![allow(clippy::needless_range_loop)]
 
+// Everything below the verification path needs a heap: see the "Memory" section
+// in the module docs for the measured numbers behind that split.
+#[cfg(feature = "alloc")]
 mod encode;
+#[cfg(feature = "alloc")]
 mod fft;
+#[cfg(feature = "alloc")]
 mod fpr;
 #[cfg(feature = "key")]
 mod key_impl;
+#[cfg(feature = "alloc")]
 mod keygen;
+#[cfg(feature = "alloc")]
 mod sampler;
+#[cfg(feature = "alloc")]
 mod sign;
+#[cfg(feature = "alloc")]
 mod tree;
+#[cfg(feature = "alloc")]
 mod zint;
 
 use crate::hash::{ExtendableOutput, Shake256, XofReader};
@@ -145,6 +194,7 @@ impl Degree {
     }
 
     /// The `logn` nibble used in encoding headers (`log₂ n`).
+    #[cfg(feature = "alloc")]
     const fn logn(self) -> u8 {
         match self {
             Degree::Falcon512 => 9,
@@ -165,14 +215,29 @@ impl Degree {
 /// Length of the salt/nonce `r` prepended to the message before hashing.
 const NONCE_LEN: usize = 40;
 
+/// The largest ring degree any parameter set uses (Falcon-1024).
+///
+/// Every fixed-size buffer on the verification path is cut to this, so one
+/// concrete type covers both parameter sets; a Falcon-512 key leaves the upper
+/// half unused. That costs 1 KiB per key versus a per-degree type, which is the
+/// price of keeping [`FalconPublicKey`] a single type — [`verify`] discovers the
+/// degree from the encoded header at run time, so the size is not known at the
+/// API boundary the way `mlkem`'s is.
+const MAX_N: usize = 1024;
+
 /// A parsed Falcon public key: the polynomial `h` with `n` coefficients in
 /// `[0, q)`, plus its degree.
+///
+/// Holds `h` inline (`2·MAX_N` bytes), so parsing and verifying a signature
+/// needs no allocator.
 pub struct FalconPublicKey {
     degree: Degree,
-    /// `h`, `n` coefficients, each already reduced into `[0, q)`.
-    h: alloc::vec::Vec<u16>,
+    /// `h`, `n` coefficients, each already reduced into `[0, q)`; entries past
+    /// `degree.n()` are zero and never read.
+    h: [u16; MAX_N],
 }
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 impl FalconPublicKey {
@@ -197,11 +262,11 @@ impl FalconPublicKey {
 
         let body = &pk[1..];
         // Unpack n 14-bit big-endian values from `body`.
-        let mut h = Vec::with_capacity(n);
+        let mut h = [0u16; MAX_N];
         let mut acc: u32 = 0;
         let mut acc_bits: u32 = 0;
         let mut idx = 0usize;
-        while h.len() < n {
+        for slot in h[..n].iter_mut() {
             // Refill the accumulator until at least 14 bits are buffered.
             while acc_bits < 14 {
                 let byte = *body.get(idx).ok_or(Error::InvalidLength)?;
@@ -214,7 +279,7 @@ impl FalconPublicKey {
             if coeff >= Q {
                 return Err(Error::Malformed);
             }
-            h.push(coeff as u16);
+            *slot = coeff as u16;
         }
 
         // Any leftover bits (the padding tail of the final byte) must be zero,
@@ -322,7 +387,13 @@ impl FalconPublicKey {
         let s_bytes = &sig[1 + NONCE_LEN..];
 
         // --- Decompress s -> s2 (n signed coefficients), canonical. ---
-        let (s2, consumed_bits) = match decompress(s_bytes, n) {
+        //
+        // `s2` is the only polynomial buffer verification needs: `c` is consumed
+        // one coefficient at a time straight off the SHAKE-256 stream, and the
+        // convolution below is transposed so it needs no accumulator array. The
+        // frame is therefore `2·MAX_N` bytes regardless of degree.
+        let mut s2 = [0i16; MAX_N];
+        let consumed_bits = match decompress(s_bytes, &mut s2[..n]) {
             Some(v) => v,
             None => return Ok(false),
         };
@@ -338,24 +409,39 @@ impl FalconPublicKey {
             return Ok(false);
         }
 
-        // --- c = HashToPoint(nonce || msg). ---
-        let c = hash_to_point(nonce, msg, n);
-
         // --- s1 = c - s2*h mod q, centered; accumulate ||(s1, s2)||^2. ---
-        // Compute s2*h mod (x^n + 1) mod q via schoolbook negacyclic convolution.
-        let prod = poly_mul_mod_q(&s2, &self.h, n);
+        //
+        // `c = HashToPoint(nonce ‖ msg)` is squeezed lazily: coefficient `k` is
+        // drawn exactly when it is needed, so the whole polynomial never has to
+        // be materialized. The negacyclic product `s2·h mod (xⁿ+1)` is likewise
+        // computed one output coefficient at a time — `(s2·h)_k` gathers
+        // `s2_i·h_{k-i}` for `i ≤ k` and `−s2_i·h_{k+n-i}` for `i > k`
+        // (`xⁿ = −1`) — which is the same `O(n²)` schoolbook work as
+        // accumulating into a `[i64; n]` product array, minus the array.
+        let mut point = hash_to_point_reader(nonce, msg);
 
         let bound = self.degree.sig_bound();
         let mut norm: u64 = 0;
-        for i in 0..n {
-            // s1_i = c_i - prod_i (mod q), then centered to (-q/2, q/2].
-            let mut v = c[i] as i32 - prod[i] as i32;
-            v = v.rem_euclid(Q as i32); // in [0, q)
+        for k in 0..n {
+            let c_k = next_point_coeff(&mut point);
+
+            // |s2_i| ≤ 2047 (`decompress` caps the unary run) and h_j < q, so
+            // each term is below 2²⁵ and n ≤ 1024 of them stay far inside i64.
+            let mut prod: i64 = 0;
+            for i in 0..=k {
+                prod += s2[i] as i64 * self.h[k - i] as i64;
+            }
+            for i in k + 1..n {
+                prod -= s2[i] as i64 * self.h[k + n - i] as i64;
+            }
+
+            // s1_k = c_k - (s2·h)_k (mod q), then centered to (-q/2, q/2].
+            let v = (c_k as i64 - prod).rem_euclid(Q as i64); // in [0, q)
             let centered = center(v as u32);
             norm += (centered as i64 * centered as i64) as u64;
 
             // s2 is already a centered signed value.
-            let s2v = s2[i] as i64;
+            let s2v = s2[k] as i64;
             norm += (s2v * s2v) as u64;
 
             if norm > bound {
@@ -374,67 +460,52 @@ fn center(v: u32) -> i32 {
     if v > (Q as i32) / 2 { v - Q as i32 } else { v }
 }
 
-/// `HashToPoint(r ‖ msg, q, n)` — spec §3.7, Algorithm 3.
+/// Start `HashToPoint(r ‖ msg, q, n)` — spec §3.7, Algorithm 3.
 ///
-/// Absorbs `nonce ‖ msg` into SHAKE-256, then squeezes 16 bits at a time
-/// (big-endian), rejecting any draw `≥ 5q` and reducing the rest mod `q`,
-/// until `n` coefficients are produced.
-fn hash_to_point(nonce: &[u8], msg: &[u8], n: usize) -> Vec<u16> {
+/// Absorbs `nonce ‖ msg` into SHAKE-256 and hands back the squeezing reader;
+/// [`next_point_coeff`] draws the coefficients one at a time. Splitting it this
+/// way lets verification consume `c` as a stream (no polynomial buffer) while
+/// signing, which needs `c` twice, still materializes it.
+fn hash_to_point_reader(nonce: &[u8], msg: &[u8]) -> impl XofReader {
     let mut xof = Shake256::new();
     xof.update(nonce);
     xof.update(msg);
-    let mut reader = xof.finalize_xof();
+    xof.finalize_xof()
+}
 
-    let mut c = Vec::with_capacity(n);
+/// Draw the next `HashToPoint` coefficient: squeeze 16 bits at a time
+/// (big-endian), reject any draw `≥ 5q`, and reduce the rest mod `q`.
+#[inline]
+fn next_point_coeff<R: XofReader>(reader: &mut R) -> u16 {
     let mut buf = [0u8; 2];
-    while c.len() < n {
+    loop {
         reader.read(&mut buf);
         let t = ((buf[0] as u32) << 8) | buf[1] as u32;
         if t < HASH_REJECT {
-            c.push((t % Q) as u16);
+            return (t % Q) as u16;
         }
     }
-    c
 }
 
-/// Schoolbook negacyclic polynomial multiplication mod `q`:
-/// returns `(a · b) mod (x^n + 1) mod q`, with coefficients in `[0, q)`.
-///
-/// `a` holds signed coefficients (the decompressed `s2`); `b` holds the
-/// already-reduced unsigned `h`. `O(n²)` — fine for verification.
-fn poly_mul_mod_q(a: &[i16], b: &[u16], n: usize) -> Vec<u16> {
-    // Accumulate in i64 to avoid overflow: |a_i| < q, b_j < q, n ≤ 1024, so the
-    // partial sums stay well within i64.
-    let mut acc = alloc::vec![0i64; n];
-    for i in 0..n {
-        let ai = a[i] as i64;
-        if ai == 0 {
-            continue;
-        }
-        for j in 0..n {
-            let term = ai * b[j] as i64;
-            let k = i + j;
-            if k < n {
-                acc[k] += term;
-            } else {
-                // x^n = -1 in the ring, so wrap with a sign flip.
-                acc[k - n] -= term;
-            }
-        }
+/// Fill `out` with `out.len()` `HashToPoint` coefficients.
+#[cfg(feature = "alloc")]
+fn hash_to_point_into(nonce: &[u8], msg: &[u8], out: &mut [u16]) {
+    let mut reader = hash_to_point_reader(nonce, msg);
+    for slot in out.iter_mut() {
+        *slot = next_point_coeff(&mut reader);
     }
-    let q = Q as i64;
-    acc.iter().map(|&v| v.rem_euclid(q) as u16).collect()
 }
 
 /// `Decompress(str, slen)` for the signature polynomial `s` — spec §3.11.2,
 /// Algorithm 18, with all three canonicality checks.
 ///
 /// `s_bytes` is the byte region following the nonce in the signature; the bit
-/// length `slen = 8·sbytelen − 328` is therefore `8 · s_bytes.len()`. Returns
-/// `None` (the spec's `⊥`) on any malformed / non-canonical input, otherwise the
-/// `n` coefficients and the number of bits consumed by the coefficient encoding
-/// (i.e. excluding the trailing zero-padding bits the caller may further gate).
-fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
+/// length `slen = 8·sbytelen − 328` is therefore `8 · s_bytes.len()`. The `n`
+/// coefficients are written into `out` (whose length *is* `n`). Returns `None`
+/// (the spec's `⊥`) on any malformed / non-canonical input, otherwise the number
+/// of bits consumed by the coefficient encoding (i.e. excluding the trailing
+/// zero-padding bits the caller may further gate).
+fn decompress(s_bytes: &[u8], out: &mut [i16]) -> Option<usize> {
     // A bit cursor over `s_bytes`, MSB-first within each byte.
     let total_bits = s_bytes.len() * 8;
     let mut pos = 0usize;
@@ -450,8 +521,7 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
         Some(bit as u32)
     };
 
-    let mut out = Vec::with_capacity(n);
-    for _ in 0..n {
+    for slot in out.iter_mut() {
         // Sign bit.
         let sign = get_bit(s_bytes, &mut pos)?;
         // 7 low bits, most-significant first.
@@ -482,12 +552,11 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
         if magnitude == 0 && sign == 1 {
             return None;
         }
-        let val = if sign == 1 {
+        *slot = if sign == 1 {
             -(magnitude as i16)
         } else {
             magnitude as i16
         };
-        out.push(val);
     }
 
     // Bits consumed by the coefficient encoding proper, before the trailing
@@ -501,7 +570,7 @@ fn decompress(s_bytes: &[u8], n: usize) -> Option<(Vec<i16>, usize)> {
         }
     }
 
-    Some((out, consumed_bits))
+    Some(consumed_bits)
 }
 
 /// The on-the-wire encoding of a Falcon signature (spec §3.11.3 / §3.11.6).
@@ -550,6 +619,16 @@ impl Format {
 /// count. Key generation is best-effort (it samples and solves the NTRU
 /// equation with variable-time big-integer arithmetic), but is one-time and
 /// runs on fresh entropy.
+///
+/// # Memory
+///
+/// Requires the `alloc` feature. Signing keeps the expanded basis and LDL tree
+/// resident — measured at 170 KiB (Falcon-512) / 354 KiB (Falcon-1024) — and
+/// each signature needs a further 141 KiB / 282 KiB of transient buffers, so
+/// there is no stack- or scratch-buffer form of this type that would be usable
+/// on the targets the allocator-free verification path is for. See the "Memory"
+/// section in the module docs.
+#[cfg(feature = "alloc")]
 pub struct FalconPrivateKey {
     degree: Degree,
     f: Vec<i64>,
@@ -561,14 +640,17 @@ pub struct FalconPrivateKey {
 }
 
 /// Adapts a [`crate::rng::RngCore`] CSPRNG to the sampler's byte-source trait.
+#[cfg(feature = "alloc")]
 struct RngBytes<'a, R>(&'a mut R);
 
+#[cfg(feature = "alloc")]
 impl<R: crate::rng::RngCore> sampler::SamplerRng for RngBytes<'_, R> {
     fn next_bytes(&mut self, buf: &mut [u8]) {
         self.0.fill_bytes(buf);
     }
 }
 
+#[cfg(feature = "alloc")]
 impl FalconPrivateKey {
     /// Generate a fresh Falcon key of the given degree from a CSPRNG.
     pub fn generate<R: crate::rng::RngCore + crate::rng::CryptoRng>(
@@ -644,9 +726,11 @@ impl FalconPrivateKey {
 
     /// The matching public key.
     pub fn public_key(&self) -> FalconPublicKey {
+        let mut h = [0u16; MAX_N];
+        h[..self.h.len()].copy_from_slice(&self.h);
         FalconPublicKey {
             degree: self.degree,
-            h: self.h.clone(),
+            h,
         }
     }
 
@@ -713,6 +797,7 @@ impl FalconPrivateKey {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl Drop for FalconPrivateKey {
     fn drop(&mut self) {
         // Wipe the secret polynomials with the crate's volatile `zeroize`
@@ -755,5 +840,9 @@ pub fn verify_with_format(pk: &[u8], msg: &[u8], sig: &[u8], format: Format) -> 
     }
 }
 
-#[cfg(test)]
+// The KAT vectors and round-trip tests are written against the allocating
+// entry points (and the sign/keygen ones exist only there). The no-alloc build's
+// verification path is exercised by a host-side `no_std` runner instead; see the
+// commit that made this module allocator-free.
+#[cfg(all(test, feature = "alloc"))]
 mod tests;

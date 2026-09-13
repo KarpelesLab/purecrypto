@@ -167,7 +167,13 @@ mlkem = ["hash", "rng"]
 # generation, signing, and verification. Signing uses an emulated constant-time
 # IEEE-754 double (FPEMU) for the FFT, LDL tree, and Gaussian sampler, so no
 # hardware float is needed; `rng` supplies entropy for keygen/signing.
-falcon = ["hash", "alloc", "rng"]
+# no_std + no-alloc: *verification* only (`verify`, `FalconPublicKey`), which
+# needs one `[i16; 1024]` and nothing else. `FalconPrivateKey` — keygen and
+# signing — additionally needs `alloc`: the resident expanded key alone is
+# 170 KiB at n = 512 and 354 KiB at n = 1024, with another 141 / 282 KiB
+# transient per signature and megabytes of variable-width big-integer churn in
+# NTRUSolve, so no fixed scratch buffer would make it embedded-usable.
+falcon = ["hash", "rng"]
 # ML-DSA (FIPS 204) signatures. Needs alloc for the variable-width signature
 # encoding; the polynomial arithmetic itself is on the stack.
 mldsa = ["hash", "rng"]

@@ -711,7 +711,8 @@ fn decompress_rejects_magnitude_2048_accepts_2047() {
 
     // +2047, −2047 (high 15, low 127) and a zero.
     let ok = compressed_s(&[(0, 127, 15), (1, 127, 15), (0, 0, 0)]);
-    let (coeffs, consumed) = decompress(&ok, 3).expect("2047 is encodable");
+    let mut coeffs = [0i16; 3];
+    let consumed = decompress(&ok, &mut coeffs).expect("2047 is encodable");
     assert_eq!(coeffs, [2047, -2047, 0]);
     // Two 24-bit codes (sign, 7 low bits, 15 zeros, terminator) and one 9-bit zero.
     assert_eq!(consumed, 24 * 2 + 9);
@@ -720,13 +721,13 @@ fn decompress_rejects_magnitude_2048_accepts_2047() {
     for sign in [0u8, 1] {
         let bad = compressed_s(&[(sign, 0, 16), (0, 0, 0), (0, 0, 0)]);
         assert!(
-            decompress(&bad, 3).is_none(),
+            decompress(&bad, &mut coeffs).is_none(),
             "magnitude 2048 (sign {sign}) must be rejected"
         );
     }
     // Any longer run is rejected too (previously admitted up to 2048 zeros).
     let bad = compressed_s(&[(0, 5, 100), (0, 0, 0), (0, 0, 0)]);
-    assert!(decompress(&bad, 3).is_none());
+    assert!(decompress(&bad, &mut coeffs).is_none());
 }
 
 /// Wall-clock signing throughput (ignored by default; run with
