@@ -7,6 +7,7 @@
 use super::encode::{unpack_z17, unpack_z19};
 use super::field::{N, Poly, Q, sub};
 use crate::hash::{ExtendableOutput, Shake128, Shake256, XofReader};
+#[cfg(all(feature = "std", target_arch = "x86_64"))]
 use crate::zeroize::Zeroize;
 
 /// The SHAKE128 rate — the matrix-XOF squeeze block (a multiple of 3).
