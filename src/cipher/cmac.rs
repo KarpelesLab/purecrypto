@@ -331,7 +331,9 @@ mod tests {
     }
 
     // The crate `Mac` trait routes through the same finalize and constant-time
-    // verify as the inherent methods.
+    // verify as the inherent methods. The trait lives in `hash`, so this case
+    // only exists when that module is compiled in.
+    #[cfg(feature = "hash")]
     #[test]
     fn mac_trait_verify() {
         use crate::hash::Mac;

@@ -50,6 +50,10 @@ mod aes;
 #[cfg(feature = "aez")]
 mod aez;
 mod aria;
+// Blowfish is not exposed as a cipher of its own: it exists purely as the core
+// of `kdf::bcrypt_pbkdf`, which itself needs `alloc`. Outside that combination
+// every item in the module is dead code.
+#[cfg(all(feature = "kdf", feature = "alloc"))]
 pub(crate) mod blowfish;
 mod camellia;
 mod cbc;
@@ -68,6 +72,9 @@ mod gmac;
 mod kw;
 mod ofb;
 mod poly1305;
+// Likewise Salsa20/8: only `kdf::scrypt` (also `alloc`-gated) uses its core
+// permutation.
+#[cfg(all(feature = "kdf", feature = "alloc"))]
 pub(crate) mod salsa20;
 mod sm4;
 // AES-SIV returns variable-length `Vec` output (RFC 5297), so it needs `alloc`.

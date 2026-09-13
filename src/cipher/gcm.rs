@@ -516,6 +516,10 @@ mod tests {
     /// length block — every step a single `gf_mul` by `h`. Deliberately *not*
     /// the aggregated-reduction path, so it cross-checks the hardware
     /// `ghash_blocks` 4-block grouping + serial remainder.
+    ///
+    /// Gated like its only caller below: without the carryless-multiply
+    /// backend there is no aggregated path to cross-check.
+    #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn ghash_serial_ref(h: u128, aad: &[u8], ct: &[u8]) -> u128 {
         let mut x = 0u128;
         for chunk in aad.chunks(16) {

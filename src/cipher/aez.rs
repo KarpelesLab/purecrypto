@@ -21,11 +21,13 @@
 //! at software-AES speed).
 //!
 //! ```
+//! # #[cfg(feature = "alloc")] {
 //! use purecrypto::cipher::Aez;
 //! let aez = Aez::new(b"a 16, 32, or 48-byte key, or any length");
 //! let ct = aez.encrypt(b"nonce", &[b"associated data".as_slice()], 16, b"hello");
 //! let pt = aez.decrypt(b"nonce", &[b"associated data".as_slice()], 16, &ct).unwrap();
 //! assert_eq!(pt, b"hello");
+//! # }
 //! ```
 //!
 //! [`AEGIS`]: super::Aegis128L

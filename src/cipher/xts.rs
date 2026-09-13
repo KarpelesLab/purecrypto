@@ -356,7 +356,7 @@ xts_byte_key_ctors!(super::Aes256, 32, 64, "XTS-AES-256");
 mod tests {
     use super::*;
     use crate::cipher::{Aes128, Aes256};
-    use crate::test_util::{from_hex, from_hex_vec};
+    use crate::test_util::from_hex;
 
     /// The byte-key constructors refuse `K1 == K2` and otherwise build the
     /// same context as [`Xts::new`] (checked against IEEE 1619 vectors 2/10).
@@ -502,8 +502,14 @@ mod tests {
     /// exercises ciphertext stealing over a single full block plus a 1–4-byte
     /// tail. These are the published CTS vectors; the round-trip test below
     /// covers the remaining tail lengths against the implementation itself.
+    ///
+    /// The four vectors have four different lengths, so the fixtures are
+    /// decoded into `Vec`s; only the test needs the heap, not `Xts` itself.
+    #[cfg(feature = "alloc")]
     #[test]
     fn ieee_1619_vectors_15_to_18_ciphertext_stealing() {
+        use crate::test_util::from_hex_vec;
+
         let k1 = from_hex::<16>("fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0");
         let k2 = from_hex::<16>("bfbebdbcbbbab9b8b7b6b5b4b3b2b1b0");
         let xts = Aes128Xts::new(Aes128::new(&k1), Aes128::new(&k2));
