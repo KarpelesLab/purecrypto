@@ -11,6 +11,39 @@
 //! Also provides the [`ChaCha20`] stream cipher and [`Poly1305`] authenticator,
 //! combined as the [`ChaCha20Poly1305`] AEAD (RFC 8439) — both inherently
 //! constant time, built from 32-bit ARX and 130-bit limb arithmetic.
+//!
+//! # AEAD buffer contract on tag failure
+//!
+//! Every in-place AEAD `decrypt` in this crate returns
+//! [`TagMismatch`] **without handing the caller any unauthenticated
+//! plaintext**. What is left in the buffer instead differs by mode, and
+//! callers must not rely on either shape:
+//!
+//! | mode | buffer after `Err(TagMismatch)` |
+//! | --- | --- |
+//! | [`Gcm`], [`ChaCha20Poly1305`], [`XChaCha20Poly1305`], [`Aegis128L`] / [`Aegis256`], `AsconAead128` | unchanged — still the ciphertext |
+//! | [`Ccm`], [`AesGcmSiv`] | zeroed |
+//! | [`Aez`] (`decrypt_into`) | the `out` region it wrote is zeroed; the input `c` is a separate slice and is untouched |
+//! | [`AesSiv`] (`open`) | no buffer: the plaintext `Vec` is wiped and dropped |
+//!
+//! The only guarantee to code against is the negative one: after an error the
+//! buffer holds **no plaintext**. Treat its contents as unspecified, and if
+//! you need the ciphertext afterwards (for a retry, a log, a second key) keep
+//! your own copy.
+//!
+//! Two further caveats hold across the "unchanged" modes, and are repeated on
+//! the individual methods:
+//!
+//! * Some of those modes reach that state by decrypting in place and
+//!   re-encrypting on failure ([`Gcm`]'s stitched AES-NI path, `AsconAead128`),
+//!   so unauthenticated plaintext genuinely exists in the buffer *during* the
+//!   call. That is invisible to a caller that owns the buffer, but it is a
+//!   real leak if the buffer aliases memory another party can read
+//!   concurrently (a `MAP_SHARED` mapping, an `io_uring`/DMA region), and the
+//!   restoring pass does not run if a panic unwinds mid-call. Decrypt into
+//!   private memory and copy out only after `Ok`.
+//! * Releasing even a *verified* plaintext is the caller's decision to make
+//!   once; never process a buffer twice "to see" whether the tag matches.
 
 mod aegis;
 mod aes;
