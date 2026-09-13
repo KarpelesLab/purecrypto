@@ -398,7 +398,14 @@ impl QuicServer {
         let (cids, prev_cids) = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
-                // packet, keep the connection (RFC 9000 §5.2).
+                // packet, keep the connection (RFC 9000 §5.2). A *fatal*
+                // error — one raised by a packet that authenticated, so a
+                // protocol violation or a TLS failure — has already put the
+                // connection into the closing state and queued its
+                // CONNECTION_CLOSE (see `QuicConnection::feed_datagram`), which
+                // `poll_transmit` sends and `reap_closed` cleans up after; the
+                // application observes it through
+                // `connections_mut()` + `close_info()`.
                 let _ = h.conn.feed_datagram_from_with_ecn(from, ecn, datagram);
                 // RFC 9000 §9 — the *connection* decides where replies go. It
                 // follows the peer to a new address only after an

@@ -101,8 +101,8 @@ use crate::quic::tls_glue::HookHandle;
 use crate::quic::transport_params::{PreferredAddress, TransportParameters};
 use crate::quic::varint;
 use crate::rng::{OsRng, RngCore};
-use crate::tls::Error;
 use crate::tls::conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
+use crate::tls::{AlertDescription, Error};
 use crate::tls::quic_hooks::{Direction, Level};
 
 /// Maps a TLS encryption level to its QUIC packet-number space
@@ -434,6 +434,59 @@ enum PayloadScope {
 /// the application close frame type (0x1d) is forbidden (§10.2.3).
 const ERROR_APPLICATION_ERROR: u64 = 0x0c;
 
+/// RFC 9000 §20.1 — `FLOW_CONTROL_ERROR`.
+pub(crate) const ERROR_FLOW_CONTROL: u64 = 0x03;
+/// RFC 9000 §20.1 — `FINAL_SIZE_ERROR`.
+pub(crate) const ERROR_FINAL_SIZE: u64 = 0x06;
+/// RFC 9000 §20.1 — `FRAME_ENCODING_ERROR`.
+const ERROR_FRAME_ENCODING: u64 = 0x07;
+/// RFC 9000 §20.1 — `TRANSPORT_PARAMETER_ERROR`.
+const ERROR_TRANSPORT_PARAMETER: u64 = 0x08;
+/// RFC 9000 §20.1 — `PROTOCOL_VIOLATION`.
+const ERROR_PROTOCOL_VIOLATION: u64 = 0x0a;
+/// RFC 9000 §20.1 — the `CRYPTO_ERROR` range (`0x0100`-`0x01ff`): RFC 9001
+/// §4.8 maps a TLS alert of description `d` to `0x0100 | d`.
+const ERROR_CRYPTO_BASE: u64 = 0x0100;
+
+/// RFC 9001 §4.8 — the `CRYPTO_ERROR` code for a TLS-layer failure. QUIC has
+/// no alert records, so the alert this engine *would* have sent over TLS is
+/// carried in the CONNECTION_CLOSE error code instead. The mapping mirrors
+/// the `alert_for` tables in `tls::conn`.
+fn crypto_error_code(err: &Error) -> u64 {
+    let alert = match err {
+        Error::AlertReceived(a) => *a,
+        Error::Decode => AlertDescription::DecodeError,
+        Error::UnexpectedMessage => AlertDescription::UnexpectedMessage,
+        Error::BadRecordMac => AlertDescription::BadRecordMac,
+        Error::UnsupportedVersion => AlertDescription::ProtocolVersion,
+        Error::BadCertificate | Error::CertificateRevoked | Error::OcspResponseInvalid => {
+            AlertDescription::BadCertificate
+        }
+        Error::PeerMisbehaved | Error::InappropriateState | Error::IllegalParameter => {
+            AlertDescription::IllegalParameter
+        }
+        Error::RecordOverflow => AlertDescription::RecordOverflow,
+        Error::TooManyRecords => AlertDescription::InternalError,
+        Error::NoApplicationProtocol => AlertDescription::NoApplicationProtocol,
+        Error::DecryptError => AlertDescription::DecryptError,
+        Error::CertificateRequired => AlertDescription::CertificateRequired,
+        _ => AlertDescription::HandshakeFailure,
+    };
+    ERROR_CRYPTO_BASE + u64::from(alert.as_u8())
+}
+
+/// RFC 9000 §20.1 — the transport error code to report for a QUIC-layer
+/// failure that is not a TLS alert. Frame-decoding failures are
+/// `FRAME_ENCODING_ERROR`; everything else defaults to `PROTOCOL_VIOLATION`,
+/// which §11 permits for any violation an endpoint does not attribute to a
+/// more specific code.
+fn transport_error_code(err: &Error) -> u64 {
+    match err {
+        Error::Decode => ERROR_FRAME_ENCODING,
+        _ => ERROR_PROTOCOL_VIOLATION,
+    }
+}
+
 /// Cap on the reason phrase we send or retain, in bytes. RFC 9000 sets no
 /// limit; this keeps a hostile peer's reason from being retained unboundedly
 /// and keeps our own close frame comfortably inside one packet.
@@ -739,6 +792,18 @@ pub struct QuicConnection {
     /// handler (and the feed path) discard them once that window has
     /// elapsed. `None` while no previous-phase keys are retained.
     prev_rx_keys_installed_at: Option<Duration>,
+    /// True once the packet currently being processed has been
+    /// AEAD-authenticated. An error raised *before* that point comes from
+    /// unauthenticated bytes — RFC 9000 §12.2 / RFC 9001 §5 require those to
+    /// be dropped, never to close the connection — whereas an error raised
+    /// after it is a genuine protocol violation by the peer and terminates
+    /// the connection with a CONNECTION_CLOSE (RFC 9000 §10.2).
+    rx_packet_authenticated: bool,
+    /// The transport error code to report for the error currently
+    /// propagating out of the receive path, when the raising site knows a
+    /// more specific one than [`transport_error_code`] can infer (chiefly
+    /// `CRYPTO_ERROR` from the TLS engine and the stream-level codes).
+    pending_error_code: Option<u64>,
 }
 
 enum EngineSide {
@@ -934,6 +999,8 @@ impl QuicConnection {
             ecn_tx: EcnValidation::default(),
             ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
+            rx_packet_authenticated: false,
+            pending_error_code: None,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1057,6 +1124,8 @@ impl QuicConnection {
             ecn_tx: EcnValidation::default(),
             ecn_acked: EcnCounts::default(),
             prev_rx_keys_installed_at: None,
+            rx_packet_authenticated: false,
+            pending_error_code: None,
         })
     }
 
@@ -1253,7 +1322,34 @@ impl QuicConnection {
         // constant as we walk coalesced packets within it.
         let udp_datagram_len = datagram.len();
         while !rest.is_empty() {
-            let consumed = self.feed_one_packet(rest, udp_datagram_len)?;
+            self.rx_packet_authenticated = false;
+            self.pending_error_code = None;
+            let consumed = match self.feed_one_packet(rest, udp_datagram_len) {
+                Ok(n) => n,
+                Err(e) => {
+                    // RFC 9000 §10.2 / §11: an error in a packet that
+                    // authenticated is the peer's protocol violation (or a
+                    // TLS failure) and MUST end the connection — enter the
+                    // closing state and queue a CONNECTION_CLOSE carrying the
+                    // matching transport error code, exactly as `close` does
+                    // for an application close. Returning the error without
+                    // that left the connection half-alive: never closed, never
+                    // telling the peer, and still accepting further packets.
+                    //
+                    // An error raised before authentication (a malformed
+                    // header, a truncated packet) comes from bytes anyone can
+                    // forge, so it only discards the rest of this datagram.
+                    if self.rx_packet_authenticated {
+                        let code = self
+                            .pending_error_code
+                            .take()
+                            .unwrap_or_else(|| transport_error_code(&e));
+                        self.close_with_transport_error(code);
+                    }
+                    self.pending_error_code = None;
+                    return Err(e);
+                }
+            };
             // RFC 9000 §10.2.2 — a CONNECTION_CLOSE in one of the coalesced
             // packets ends the connection; the packets behind it belong to
             // state that no longer exists.
@@ -1274,14 +1370,14 @@ impl QuicConnection {
             // from the ServerHello, so we have to install them between
             // those two packets, not after both.
             //
-            // RFC 9000 §7.3 — if the peer's transport-parameters fail
-            // the CID-echo validation (forged-Retry attack signature)
-            // or the role-restricted field check, the connection MUST
-            // be closed with a TRANSPORT_PARAMETER_ERROR. We mark
-            // `closed = true` so subsequent `pop_datagram` returns
-            // nothing, and propagate the error to the caller.
+            // RFC 9000 §7.3 / §18.2 — if the peer's transport parameters
+            // fail the CID-echo validation (forged-Retry attack signature),
+            // the role-restricted field check or a range check, the
+            // connection MUST be closed with a TRANSPORT_PARAMETER_ERROR.
+            // Enter the closing state (so the peer learns why and nothing
+            // else is sent) and propagate the error to the caller.
             if let Err(e) = self.drain_engine_outputs() {
-                self.closed = true;
+                self.close_with_transport_error(ERROR_TRANSPORT_PARAMETER);
                 return Err(e);
             }
             rest = &rest[consumed..];
@@ -2637,6 +2733,63 @@ impl QuicConnection {
             reason: decode_reason(reason),
         });
         Ok(())
+    }
+
+    /// RFC 9000 §10.2 — immediate close initiated by the engine itself on a
+    /// fatal error: queues a *transport* CONNECTION_CLOSE (frame type 0x1c)
+    /// carrying `error_code` and enters the closing state, exactly like
+    /// [`Self::close`] does for an application close.
+    ///
+    /// The frame goes out at the highest level whose write keys are
+    /// installed (1-RTT only once the handshake is complete, §10.2.3). The
+    /// frame-type field is 0 ("unknown") and no reason phrase is sent, so no
+    /// internal detail leaks to the peer. With no write keys at all the
+    /// connection is closed locally without sending anything. A no-op on a
+    /// connection that is already closing, draining or closed.
+    pub(crate) fn close_with_transport_error(&mut self, error_code: u64) {
+        if self.closed || self.draining || self.pending_close.is_some() {
+            return;
+        }
+        let info = CloseInfo {
+            initiator: CloseInitiator::Local,
+            kind: CloseKind::Transport,
+            error_code,
+            frame_type: Some(0),
+            reason: String::new(),
+        };
+        let onertt_ready =
+            self.handshake_complete && self.endpoint.crypto.at(Level::OneRtt).tx.is_some();
+        let level = if onertt_ready {
+            Some(Level::OneRtt)
+        } else {
+            [Level::Handshake, Level::Initial]
+                .into_iter()
+                .find(|&l| self.endpoint.crypto.at(l).tx.is_some())
+        };
+        let Some(level) = level else {
+            self.closed = true;
+            self.close_info.get_or_insert(info);
+            return;
+        };
+        let mut encoded = Vec::new();
+        Frame::ConnectionClose {
+            error: error_code,
+            frame_type: Some(0),
+            reason: &[],
+        }
+        .encode(&mut encoded);
+        self.pending_close = Some(PendingClose {
+            frame: encoded,
+            level,
+            armed: true,
+        });
+        self.close_rx_since_send = 0;
+        self.close_resend_threshold = 1;
+        self.close_deadline = Some(
+            self.now_since_start()
+                .saturating_add(self.endpoint.loss.pto_period().saturating_mul(3)),
+        );
+        self.close_info.get_or_insert(info);
     }
 
     /// Why the connection terminated, or `None` while it is still live.
@@ -4169,6 +4322,9 @@ impl QuicConnection {
             let _ = self.bump_rx_aead_failure(level)?;
             return Ok(pkt_total_len);
         }
+        // From here on the packet is authentic: any error is the peer's and
+        // closes the connection (see `feed_datagram`).
+        self.rx_packet_authenticated = true;
 
         // RFC 9000 §17.2 — the long-header reserved bits (0x0c) MUST be
         // zero after header-protection removal; non-zero is a connection
@@ -4360,6 +4516,9 @@ impl QuicConnection {
         } else {
             false
         };
+        // Authenticated (under the primary or previous-phase keys): errors
+        // past this point close the connection (see `feed_datagram`).
+        self.rx_packet_authenticated = true;
 
         // RFC 9000 §17.3.1 — the short-header reserved bits (0x18) MUST
         // be zero after header-protection removal; non-zero is a
@@ -4982,11 +5141,16 @@ impl QuicConnection {
     /// Hands `bytes` (already in-order, just released by the per-level
     /// `CryptoBuf`) to the TLS engine at `level`.
     fn feed_handshake_bytes(&mut self, level: Level, bytes: &[u8]) -> Result<(), Error> {
-        match &mut self.engine {
-            EngineSide::Client(c) => c.process_quic_handshake_bytes(level, bytes)?,
-            EngineSide::Server(s) => s.process_quic_handshake_bytes(level, bytes)?,
+        let result = match &mut self.engine {
+            EngineSide::Client(c) => c.process_quic_handshake_bytes(level, bytes),
+            EngineSide::Server(s) => s.process_quic_handshake_bytes(level, bytes),
+        };
+        if let Err(e) = &result {
+            // RFC 9001 §4.8 — a TLS failure is reported as CRYPTO_ERROR
+            // carrying the alert the TLS engine would have sent.
+            self.pending_error_code = Some(crypto_error_code(e));
         }
-        Ok(())
+        result
     }
 
     /// Parses a [`SentPacket::retransmit_hint`] blob and re-queues the
@@ -10423,15 +10587,27 @@ mod tests {
             res
         );
         assert!(
-            c.is_closed(),
-            "client must mark connection closed after TP violation"
+            c.is_closing(),
+            "client must enter the closing state after a TP violation"
+        );
+        let info = c.close_info().expect("close info recorded");
+        assert_eq!(info.initiator, CloseInitiator::Local);
+        assert_eq!(info.kind, CloseKind::Transport);
+        assert_eq!(
+            info.error_code, ERROR_TRANSPORT_PARAMETER,
+            "RFC 9000 §7.3 — TRANSPORT_PARAMETER_ERROR"
         );
         assert!(
             !c.is_handshake_complete(),
             "handshake must NOT complete after TP violation"
         );
-        // A subsequent pop_datagram on a closed connection returns
-        // nothing.
+        // RFC 9000 §10.2.1 — the peer is told why: the next datagram is the
+        // CONNECTION_CLOSE, and nothing else follows it until the resend
+        // backoff re-arms.
+        assert!(
+            !c.pop_datagram().is_empty(),
+            "a CONNECTION_CLOSE must be emitted"
+        );
         assert!(c.pop_datagram().is_empty());
     }
 
@@ -11537,6 +11713,100 @@ mod tests {
             rest = &rest[n..];
         }
         (long, rest.to_vec())
+    }
+
+    /// A server that REQUIRES a client certificate, against a client that has
+    /// none: the cert-less flight must fail the handshake, close the
+    /// connection with `CRYPTO_ERROR` + `certificate_required` (RFC 9001 §4.8)
+    /// and deliver nothing to the application. Before the fix the TLS error
+    /// was returned to the caller and then dropped on the floor — no
+    /// CONNECTION_CLOSE, no closing state — while the client's 1-RTT stream
+    /// data was delivered anyway (RFC 9001 §5.7).
+    #[test]
+    fn server_requiring_a_client_certificate_closes_and_delivers_nothing() {
+        let (mut server_tls, cert_der) = ed25519_server();
+        let mut ca_roots = RootCertStore::new();
+        ca_roots.add_der(cert_der.clone()).unwrap();
+        server_tls.client_auth = Some(crate::tls::ClientAuth {
+            roots: ca_roots,
+            required: true,
+        });
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            server.feed_datagram(&dg).expect("server feed CH");
+        }
+        loop {
+            let dg = server.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            client.feed_datagram(&dg).expect("client feed");
+        }
+        // The client is happy — it is not the one doing the authenticating.
+        assert!(client.is_handshake_complete());
+        let sid = client.open_bidi().expect("open");
+        client.write(sid, b"GET /admin").expect("write");
+
+        let mut saw_err = false;
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            if server.feed_datagram(&dg).is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(saw_err, "the cert-less flight must fail the handshake");
+        assert!(
+            !server.is_handshake_complete(),
+            "the handshake must not complete without the required certificate"
+        );
+        assert_eq!(
+            server.readable_streams().count(),
+            0,
+            "no application data from an unauthenticated client"
+        );
+        assert!(server.is_closing(), "the connection must be torn down");
+        let info = server.close_info().expect("close info");
+        assert_eq!(info.kind, CloseKind::Transport);
+        assert_eq!(
+            info.error_code,
+            ERROR_CRYPTO_BASE + u64::from(AlertDescription::CertificateRequired.as_u8()),
+            "RFC 9001 §4.8 — CRYPTO_ERROR carrying the certificate_required alert"
+        );
+        assert!(
+            !server.pop_datagram().is_empty(),
+            "the client is told why with a CONNECTION_CLOSE"
+        );
     }
 
     /// RFC 9001 §5.7: "a server MUST NOT process incoming 1-RTT protected
