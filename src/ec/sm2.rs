@@ -921,6 +921,7 @@ mod tests {
 
     /// An SM2 DER signature with an over-wide `r`/`s` must be rejected at
     /// parse rather than panicking in `enc32` when re-encoded.
+    #[cfg(feature = "der")]
     #[test]
     fn oversize_der_signature_rejected_at_parse() {
         use crate::der::{encode_integer, encode_sequence};

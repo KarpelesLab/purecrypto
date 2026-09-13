@@ -305,7 +305,7 @@ impl AffinePoint {
     /// would silently break the constant's security properties.
     ///
     /// A `debug_assert!` checks the curve equation in debug builds.
-    #[cfg(any(feature = "zkp-pedersen", test))]
+    #[cfg(feature = "zkp-pedersen")]
     pub(crate) fn from_hex_unchecked(x_hex: &str, y_hex: &str) -> AffinePoint {
         let x = fe_from_hex(x_hex);
         let y = fe_from_hex(y_hex);

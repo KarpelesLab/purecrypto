@@ -1156,6 +1156,8 @@ mod tests {
     // arithmetic and ECDSA verify path against an independent reference. RFC
     // 6979 itself carries no Brainpool deterministic vectors, so a verify-only
     // KAT against an external suite is the strongest pin available.
+    // The fixtures are DER-encoded signatures, so the case needs the codec.
+    #[cfg(feature = "der")]
     #[test]
     fn brainpool_wycheproof_kat() {
         // All three groups use tcId 2: msg = "Msg" (0x4d7367), result "valid".

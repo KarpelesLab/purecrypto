@@ -39,6 +39,7 @@
 //! signing entry points, which normalise to low-S themselves.
 //!
 //! ```
+//! # #[cfg(feature = "std")] {
 //! use purecrypto::ec::secp256k1_ecdsa::{Secp256k1EcdsaPrivateKey, Secp256k1EcdsaPublicKey};
 //! use purecrypto::hash::Sha256;
 //! use purecrypto::rng::OsRng;
@@ -56,6 +57,7 @@
 //! let (sig, recid) = sk.sign_recoverable::<Sha256>(b"hello").unwrap();
 //! assert!(sig.is_low_s());
 //! assert_eq!(sig.recover::<Sha256>(b"hello", recid).unwrap(), pk);
+//! # }
 //! ```
 
 use super::field_backend::{Fe, p};
@@ -533,7 +535,7 @@ impl Secp256k1EcdsaSignature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::{Sha256, Sha512};
+    use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
 
     /// Decodes exactly `N` bytes of hex (no `alloc`).
@@ -652,8 +654,8 @@ mod tests {
                 bsig.to_bytes(curve),
                 "sha256 ({i})"
             );
-            let sig512 = sk.sign::<Sha512>(&msg).unwrap();
-            let bsig512 = boxed.sign::<Sha512>(&msg).unwrap();
+            let sig512 = sk.sign::<crate::hash::Sha512>(&msg).unwrap();
+            let bsig512 = boxed.sign::<crate::hash::Sha512>(&msg).unwrap();
             assert_eq!(
                 sig512.to_bytes().to_vec(),
                 bsig512.to_bytes(curve),
