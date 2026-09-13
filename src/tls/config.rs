@@ -326,6 +326,13 @@ pub struct Config {
     /// be established out-of-band. Hostname verification is skipped under
     /// RawPublicKey.
     pub expected_raw_public_keys: Vec<Vec<u8>>,
+    /// Server: allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted
+    /// as a *client's* identity when `RawPublicKey` is the negotiated
+    /// `client_certificate_type` (mTLS, RFC 7250 §4.4). A raw key has no
+    /// chain to validate, so this list is the entire trust root for that
+    /// path; while it is empty the server never negotiates `RawPublicKey`
+    /// for the client direction.
+    pub expected_client_raw_public_keys: Vec<Vec<u8>>,
 
     // ---- TLS 1.3 key exchange (RFC 8446 §4.1.4) ----
     /// Server preference for the (EC)DHE group used in key exchange.
@@ -516,6 +523,7 @@ impl Default for Config {
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
             expected_raw_public_keys: Vec::new(),
+            expected_client_raw_public_keys: Vec::new(),
             preferred_key_exchange_group: None,
             #[cfg(feature = "ech")]
             ech: None,
@@ -926,6 +934,16 @@ impl ConfigBuilder {
     /// is the entire trust root.
     pub fn add_expected_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
         self.inner.expected_raw_public_keys.push(spki_der);
+        self
+    }
+    /// Server: appends an accepted bare `SubjectPublicKeyInfo` DER to the
+    /// allowlist of *client* raw public keys (mTLS, RFC 7250 §4.4). A client
+    /// `Certificate` carrying a raw key is accepted only if it constant-time
+    /// matches one of these entries. While the list is empty the server
+    /// refuses to negotiate `RawPublicKey` for the client direction, since
+    /// there would be nothing to authenticate the key against.
+    pub fn add_expected_client_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.inner.expected_client_raw_public_keys.push(spki_der);
         self
     }
     /// Verification clock (use this on `no_std` targets or for reproducible

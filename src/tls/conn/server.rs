@@ -248,6 +248,13 @@ pub(crate) struct ServerConfig {
     /// server-cert type. MUST encode the public key matching this server's
     /// signing key, or the client's `CertificateVerify` check will fail.
     raw_public_key_spki: Option<Vec<u8>>,
+    /// Allowlist of bare `SubjectPublicKeyInfo` DER bytes accepted as a
+    /// client's identity when `RawPublicKey` is the negotiated
+    /// `client_certificate_type` (RFC 7250 §4.4). There is no PKI to fall
+    /// back on for a raw key, so this list is the entire trust root for that
+    /// path: an empty list means the server refuses to negotiate
+    /// `RawPublicKey` for the client direction at all.
+    expected_client_raw_public_keys: Vec<Vec<u8>>,
     /// RFC 8879 `CertificateCompressionAlgorithm` IDs the server can
     /// DECOMPRESS (for mTLS client certs) and is willing to USE when
     /// compressing the server `Certificate` it sends. Default `[1]`
@@ -298,6 +305,7 @@ impl ServerConfig {
             server_cert_type_preference: alloc::vec![0u8],
             client_cert_type_preference: alloc::vec![0u8],
             raw_public_key_spki: None,
+            expected_client_raw_public_keys: Vec::new(),
             #[cfg(feature = "cert-compression")]
             cert_compression_algorithms: crate::tls::cert_compression::default_algorithms(),
             #[cfg(feature = "ech")]
@@ -442,6 +450,19 @@ impl ServerConfig {
     /// `CertificateVerify` check will fail.
     pub fn with_raw_public_key_spki(mut self, spki_der: Vec<u8>) -> Self {
         self.raw_public_key_spki = Some(spki_der);
+        self
+    }
+
+    /// Appends a bare `SubjectPublicKeyInfo` DER to the allowlist of client
+    /// raw public keys accepted for mTLS (RFC 7250 §4.4). A client
+    /// `Certificate` carrying a raw key must constant-time match one of
+    /// these entries; a raw key has no chain to validate, so without this
+    /// list the server would be authenticating an arbitrary key. While the
+    /// list is empty the server never selects `RawPublicKey` as the
+    /// `client_certificate_type` (it falls back to X.509, or fails the
+    /// handshake if the client offered nothing else).
+    pub fn add_expected_client_raw_public_key(mut self, spki_der: Vec<u8>) -> Self {
+        self.expected_client_raw_public_keys.push(spki_der);
         self
     }
 
@@ -1995,6 +2016,16 @@ impl<R: RngCore> ServerConnection<R> {
             self.peer_offered_client_cert_type = true;
             let mut chosen: Option<u8> = None;
             for ct in &offered {
+                // Fail closed: a client raw public key has no chain to
+                // validate, so it can only be authenticated against the
+                // configured allowlist. With no allowlist there is nothing to
+                // check it against — never select `RawPublicKey` for the
+                // client direction (RFC 7250 §4.4).
+                if *ct == crate::tls::codec::cert_type::RAW_PUBLIC_KEY
+                    && self.config.expected_client_raw_public_keys.is_empty()
+                {
+                    continue;
+                }
                 if self.config.client_cert_type_preference.contains(ct) {
                     chosen = Some(*ct);
                     break;
@@ -2761,6 +2792,23 @@ impl<R: RngCore> ServerConnection<R> {
                 return Err(Error::BadCertificate);
             }
             let spki = &chain[0];
+            // RFC 7250 §4.4 leaves trust establishment to the application —
+            // for a server that means the configured allowlist, since there
+            // is no chain and no PKI behind a raw key. Without a match any
+            // key pair a client generates on the spot would satisfy
+            // `client_auth.required` (and be stamped into resumption
+            // tickets), so fail closed. The comparison is constant time and
+            // length-independent (lengths are public).
+            let trusted = self
+                .config
+                .expected_client_raw_public_keys
+                .iter()
+                .any(|allowed| {
+                    allowed.len() == spki.len() && bool::from(allowed.as_slice().ct_eq(spki))
+                });
+            if !trusted {
+                return Err(Error::BadCertificate);
+            }
             let leaf_key = crate::x509::AnyPublicKey::from_spki_der(spki)
                 .map_err(|_| Error::BadCertificate)?;
             self.client_cert_chain = chain;

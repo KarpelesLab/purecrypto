@@ -1519,6 +1519,9 @@ fn build_tls13_server(cfg: &Config) -> Result<super::conn::ServerConnection<Conf
     if let Some(spki) = cfg.raw_public_key_spki.clone() {
         sc = sc.with_raw_public_key_spki(spki);
     }
+    for spki in &cfg.expected_client_raw_public_keys {
+        sc = sc.add_expected_client_raw_public_key(spki.clone());
+    }
     sc = sc.with_signature_policy(cfg.signature_policy.clone());
     #[cfg(feature = "cert-compression")]
     {

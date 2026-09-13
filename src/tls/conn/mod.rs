@@ -1004,13 +1004,16 @@ mod loopback_tests {
         let client_spki = AnyPublicKey::Ed25519(client_key.public_key()).to_spki_der();
 
         // Server: require client auth and accept RawPublicKey. RPK skips PKI,
-        // so the client-auth root store is unused — pass an empty one.
+        // so the client-auth root store is unused — pass an empty one; the
+        // client's raw key is authenticated against the SPKI allowlist
+        // instead (without one the server refuses to negotiate RPK at all).
         let server_config = server_config
             .with_client_auth(RootCertStore::new(), true)
             .with_client_cert_type_preference(alloc::vec![
                 cert_type::RAW_PUBLIC_KEY,
                 cert_type::X509,
-            ]);
+            ])
+            .add_expected_client_raw_public_key(client_spki.clone());
 
         // Client: trust the server cert; present RPK (no X.509 chain sent).
         let mut roots = RootCertStore::new();
@@ -1056,6 +1059,92 @@ mod loopback_tests {
         server.read_tls(&c);
         server.process_new_packets().unwrap();
         assert_eq!(server.take_received_plaintext(), b"crpk-ping");
+    }
+
+    /// RFC 7250 §4.4 fail-closed: a client raw public key carries no chain,
+    /// so the only thing that can authenticate it is the server's SPKI
+    /// allowlist. A client key that is not on the list must be rejected —
+    /// it used to satisfy `client_auth.required` outright. And with no
+    /// allowlist configured the server must not even negotiate
+    /// `client_certificate_type = RawPublicKey`.
+    #[test]
+    fn server_rejects_untrusted_client_raw_public_key() {
+        use crate::tls::codec::cert_type;
+        use crate::tls::{ClientCertConfig, RootCertStore};
+        use crate::x509::AnyPublicKey;
+
+        // `allowlist`: what the server is configured to trust (empty = none).
+        // Returns whether the handshake completed with the server having
+        // authenticated the client.
+        fn attempt(allowlist: Option<Vec<u8>>) -> bool {
+            let (server_config, server_cert_der) = rsa_server();
+            let mut ckeygen = HmacDrbg::<Sha256>::new(b"crpk-untrusted-key", b"nonce", &[]);
+            let client_key = Ed25519PrivateKey::generate(&mut ckeygen);
+            let client_spki = AnyPublicKey::Ed25519(client_key.public_key()).to_spki_der();
+
+            let mut server_config = server_config
+                .with_client_auth(RootCertStore::new(), true)
+                .with_client_cert_type_preference(alloc::vec![
+                    cert_type::RAW_PUBLIC_KEY,
+                    cert_type::X509,
+                ]);
+            if let Some(spki) = allowlist {
+                server_config = server_config.add_expected_client_raw_public_key(spki);
+            }
+
+            let mut roots = RootCertStore::new();
+            roots.add_der(server_cert_der).unwrap();
+            let cc = ClientCertConfig::with_ed25519(alloc::vec::Vec::new(), client_key);
+            let client_cfg = ClientConfig::new(roots)
+                .with_client_cert(cc)
+                .with_client_cert_type_preference(alloc::vec![
+                    cert_type::RAW_PUBLIC_KEY,
+                    cert_type::X509,
+                ])
+                .with_client_raw_public_key_spki(client_spki);
+
+            let mut crng = HmacDrbg::<Sha256>::new(b"crpk-untrusted-c", b"nonce", &[]);
+            let srng = HmacDrbg::<Sha256>::new(b"crpk-untrusted-s", b"nonce", &[]);
+            let mut client =
+                ClientConnection::new(client_cfg, "loopback.example", &mut crng).unwrap();
+            let mut server = ServerConnection::new(server_config, srng);
+            for _ in 0..16 {
+                let c = client.write_tls();
+                if !c.is_empty() {
+                    server.read_tls(&c);
+                    if server.process_new_packets().is_err() {
+                        return false;
+                    }
+                }
+                let s = server.write_tls();
+                if !s.is_empty() {
+                    client.read_tls(&s);
+                    if client.process_new_packets().is_err() {
+                        return false;
+                    }
+                }
+                if c.is_empty() && s.is_empty() {
+                    break;
+                }
+            }
+            !client.is_handshaking() && !server.is_handshaking()
+        }
+
+        // A key the server does not know: rejected.
+        let mut other_rng = HmacDrbg::<Sha256>::new(b"crpk-other-key", b"nonce", &[]);
+        let other_spki =
+            AnyPublicKey::Ed25519(Ed25519PrivateKey::generate(&mut other_rng).public_key())
+                .to_spki_der();
+        assert!(
+            !attempt(Some(other_spki)),
+            "a client raw public key outside the allowlist must not authenticate"
+        );
+        // No allowlist at all: RawPublicKey must not be selected, and the
+        // client has no X.509 chain to fall back to, so the handshake fails.
+        assert!(
+            !attempt(None),
+            "RawPublicKey must not be negotiated for the client direction without an allowlist"
+        );
     }
 
     /// RFC 7250 SPKI allowlist mismatch: the client offers RawPublicKey and
