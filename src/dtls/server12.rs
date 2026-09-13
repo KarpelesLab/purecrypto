@@ -1406,12 +1406,6 @@ impl<R: RngCore> DtlsServerConnection12<R> {
     }
 
     fn on_client_key_exchange(&mut self, body: &[u8], raw: &[u8]) -> Result<(), Error> {
-        // RFC 6347 §4.2.4: receipt of the client's responding flight
-        // implicitly acknowledges our ServerHello..ServerHelloDone flight.
-        // Cancel its retransmit timer (mirrors the client's
-        // `on_server_hello`); leaving it armed would keep re-emitting the
-        // flight on every backoff step.
-        self.retransmit.on_peer_response();
         let cke = ClientKeyExchange::decode(body)?;
         let group = self.group.ok_or(Error::InappropriateState)?;
         // Complete ECDHE on the negotiated group and derive the premaster.
@@ -1478,6 +1472,18 @@ impl<R: RngCore> DtlsServerConnection12<R> {
         crate::tls::conn::wipe(&mut c_salt);
         crate::tls::conn::wipe(&mut s_salt);
         self.master = Some(master);
+        // RFC 6347 §4.2.4: receipt of the client's responding flight
+        // implicitly acknowledges our ServerHello..ServerHelloDone flight.
+        // Cancel its retransmit timer (mirrors the client's
+        // `on_server_hello`); leaving it armed would keep re-emitting the
+        // flight on every backoff step.
+        //
+        // Only once the key agreement has succeeded: this message arrives
+        // at epoch 0, unauthenticated, so a spoofed garbage CKE would
+        // otherwise drop the stored flight (and disarm its timer) and the
+        // genuine client would wait out the handshake with nothing left to
+        // retransmit to it.
+        self.retransmit.on_peer_response();
         Ok(())
     }
 

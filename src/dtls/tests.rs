@@ -812,6 +812,45 @@ fn spoofed_server_hello_does_not_abort_client_12() {
     assert!(pump_handshake(&mut client, &mut server));
 }
 
+/// Regression (off-path flight-eviction DoS): a spoofed plaintext
+/// ClientKeyExchange that fails to decode must NOT cancel the DTLS 1.2
+/// server's ServerHello..ServerHelloDone retransmit state. The flight is
+/// only implicitly acknowledged (RFC 6347 §4.2.4) by a CKE that actually
+/// completes the key agreement.
+#[test]
+fn spoofed_client_key_exchange_keeps_server_flight_12() {
+    let (server_cfg, cert) = make_server();
+    let server_cfg = server_cfg.require_cookie_exchange(false);
+    let mut client = make_client(&cert);
+    let srng = HmacDrbg::<Sha256>::new(b"dtls12-spoof-cke", b"nonce", &[]);
+    let mut server =
+        DtlsServerConnection12::new(Arc::new(server_cfg), b"client-addr".to_vec(), srng);
+
+    // CH → server flight (ServerHello..ServerHelloDone), timer armed.
+    let ch = client.pop_outbound_datagrams();
+    for dg in &ch {
+        server.feed_datagram(dg).unwrap();
+    }
+    let flight = server.pop_outbound_datagrams();
+    assert!(!flight.is_empty());
+    assert!(server.next_timeout().is_some());
+
+    // Spoofed CKE at the client's next message_seq (1): the ECDH point's
+    // length prefix lies, so `ClientKeyExchange::decode` fails.
+    let forged = dtls12_plaintext_handshake_record(16, 1, &[0x05, 0x01]);
+    assert_eq!(server.feed_datagram(&forged), Ok(()));
+    assert!(
+        server.next_timeout().is_some(),
+        "a spoofed CKE must not clear the server's stored flight"
+    );
+
+    // The genuine handshake still completes.
+    for dg in &flight {
+        client.feed_datagram(dg).unwrap();
+    }
+    assert!(pump_handshake(&mut client, &mut server));
+}
+
 /// RFC 5705 §4 — DTLS 1.2 exporter agrees on both sides for a given
 /// `(label, context)`, and the no-context vs empty-context branches differ.
 #[test]
