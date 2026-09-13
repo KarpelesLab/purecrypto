@@ -7,7 +7,11 @@
 //!
 //! The API follows the well-established [`Choice`] / [`ConstantTimeEq`] /
 //! [`ConditionallySelectable`] pattern, reimplemented from scratch with no
-//! external dependencies.
+//! external dependencies, and is close enough to the `subtle` crate to replace
+//! it. One deliberate difference: [`ConditionallySelectable::conditional_select`]
+//! returns `a` when the choice is true (`subtle` returns `b`); see
+//! [`ConditionallySelectable::conditional_select_b_if_true`] for the `subtle`
+//! order.
 //!
 //! # What "constant time" means here
 //!
@@ -22,10 +26,12 @@
 //! *variable-time* operation — do it only once a value is no longer secret.
 
 mod eq;
+mod negate;
 mod ord;
 mod select;
 
 pub use eq::ConstantTimeEq;
+pub use negate::ConditionallyNegatable;
 pub use ord::{ConstantTimeGreater, ConstantTimeLess};
 pub use select::ConditionallySelectable;
 
@@ -187,6 +193,67 @@ impl<T> CtOption<T> {
     pub fn map<U, F: FnOnce(T) -> U>(self, f: F) -> CtOption<U> {
         CtOption::new(f(self.value), self.is_some)
     }
+
+    /// Applies `f` to the wrapped value and flattens the result: the outcome
+    /// is present only if both `self` and the `CtOption` returned by `f` are.
+    ///
+    /// `f` runs unconditionally (including in the "none" case, on the
+    /// materialized placeholder value), keeping the operation constant time.
+    #[inline]
+    pub fn and_then<U, F: FnOnce(T) -> CtOption<U>>(self, f: F) -> CtOption<U> {
+        let inner = f(self.value);
+        CtOption::new(inner.value, self.is_some & inner.is_some)
+    }
+
+    /// Returns the contained value, panicking if none is present.
+    ///
+    /// **Not constant time in the failure case** — deliberately so: a panic
+    /// is an observable event anyway. Use it only once the presence flag is
+    /// no longer secret (it is the analogue of [`Option::unwrap`]), or where a
+    /// "none" is a programming error rather than an attacker-controlled
+    /// outcome.
+    ///
+    /// # Panics
+    ///
+    /// If [`is_some`](Self::is_some) is false.
+    #[inline]
+    #[track_caller]
+    pub fn unwrap(self) -> T {
+        assert!(
+            self.is_some.unwrap_u8() == 1,
+            "called `CtOption::unwrap` on a `None` value"
+        );
+        self.value
+    }
+
+    /// Returns the contained value, panicking with `msg` if none is present.
+    ///
+    /// Same caveat as [`unwrap`](Self::unwrap): the failure path is not
+    /// constant time.
+    ///
+    /// # Panics
+    ///
+    /// If [`is_some`](Self::is_some) is false.
+    #[inline]
+    #[track_caller]
+    pub fn expect(self, msg: &str) -> T {
+        assert!(self.is_some.unwrap_u8() == 1, "{msg}");
+        self.value
+    }
+
+    /// Converts to a plain [`Option`].
+    ///
+    /// **Variable time**: this branches on the presence flag, so call it only
+    /// once that flag is public (typically at the very end of a computation,
+    /// to hand the result to non-constant-time code).
+    #[inline]
+    pub fn into_option(self) -> Option<T> {
+        if bool::from(self.is_some) {
+            Some(self.value)
+        } else {
+            None
+        }
+    }
 }
 
 impl<T: ConditionallySelectable> CtOption<T> {
@@ -196,6 +263,31 @@ impl<T: ConditionallySelectable> CtOption<T> {
     pub fn unwrap_or(self, default: T) -> T {
         // Pick the contained value when present, the default otherwise.
         T::conditional_select(&self.value, &default, self.is_some)
+    }
+
+    /// Returns the contained value if present, otherwise the result of `f`.
+    ///
+    /// `f` is called unconditionally, so the running time does not depend on
+    /// whether a value is present; the two candidates are then selected
+    /// between in constant time.
+    #[inline]
+    pub fn unwrap_or_else<F: FnOnce() -> T>(self, f: F) -> T {
+        let fallback = f();
+        T::conditional_select(&self.value, &fallback, self.is_some)
+    }
+
+    /// Returns `self` if it holds a value, otherwise the `CtOption` produced
+    /// by `f`.
+    ///
+    /// `f` is called unconditionally and the result is selected in constant
+    /// time; the outcome is present if either side is.
+    #[inline]
+    pub fn or_else<F: FnOnce() -> CtOption<T>>(self, f: F) -> CtOption<T> {
+        let alt = f();
+        CtOption::new(
+            T::conditional_select(&self.value, &alt.value, self.is_some),
+            self.is_some | alt.is_some,
+        )
     }
 }
 
@@ -266,5 +358,104 @@ mod tests {
         assert_eq!(some.unwrap_or(99), 7);
         assert_eq!(none.unwrap_or(99), 99);
         assert_eq!(some.map(|v| v + 1).unwrap_or(0), 8);
+    }
+
+    #[test]
+    fn ct_option_unwrap_and_expect() {
+        let some = CtOption::new(7u32, Choice::from(1));
+        assert_eq!(some.unwrap(), 7);
+        assert_eq!(some.expect("present"), 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "called `CtOption::unwrap` on a `None` value")]
+    fn ct_option_unwrap_none_panics() {
+        let none = CtOption::new(7u32, Choice::from(0));
+        let _ = none.unwrap();
+    }
+
+    #[test]
+    #[should_panic(expected = "custom message")]
+    fn ct_option_expect_none_panics() {
+        let none = CtOption::new(7u32, Choice::from(0));
+        let _ = none.expect("custom message");
+    }
+
+    #[test]
+    fn ct_option_unwrap_or_else() {
+        let some = CtOption::new(7u32, Choice::from(1));
+        let none = CtOption::new(7u32, Choice::from(0));
+        let mut calls = 0;
+        assert_eq!(
+            some.unwrap_or_else(|| {
+                calls += 1;
+                99
+            }),
+            7
+        );
+        assert_eq!(
+            none.unwrap_or_else(|| {
+                calls += 1;
+                99
+            }),
+            99
+        );
+        // The fallback closure runs in both cases (timing independence).
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn ct_option_and_then() {
+        let some = CtOption::new(7u32, Choice::from(1));
+        let none = CtOption::new(7u32, Choice::from(0));
+        let to_some = |v: u32| CtOption::new(v * 2, Choice::from(1));
+        let to_none = |v: u32| CtOption::new(v * 2, Choice::from(0));
+
+        let r = some.and_then(to_some);
+        assert!(truthy(r.is_some()));
+        assert_eq!(r.unwrap_or(0), 14);
+
+        assert!(truthy(some.and_then(to_none).is_none()));
+        assert!(truthy(none.and_then(to_some).is_none()));
+        assert!(truthy(none.and_then(to_none).is_none()));
+
+        let mut calls = 0;
+        let _ = none.and_then(|v| {
+            calls += 1;
+            CtOption::new(v, Choice::from(1))
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn ct_option_or_else() {
+        let some = CtOption::new(7u32, Choice::from(1));
+        let none = CtOption::new(7u32, Choice::from(0));
+        let alt_some = || CtOption::new(42u32, Choice::from(1));
+        let alt_none = || CtOption::new(42u32, Choice::from(0));
+
+        let r = some.or_else(alt_some);
+        assert!(truthy(r.is_some()));
+        assert_eq!(r.unwrap_or(0), 7);
+        let r = some.or_else(alt_none);
+        assert!(truthy(r.is_some()));
+        assert_eq!(r.unwrap_or(0), 7);
+        let r = none.or_else(alt_some);
+        assert!(truthy(r.is_some()));
+        assert_eq!(r.unwrap_or(0), 42);
+        assert!(truthy(none.or_else(alt_none).is_none()));
+
+        let mut calls = 0;
+        let _ = some.or_else(|| {
+            calls += 1;
+            CtOption::new(0u32, Choice::from(0))
+        });
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn ct_option_into_option() {
+        assert_eq!(CtOption::new(7u32, Choice::from(1)).into_option(), Some(7));
+        assert_eq!(CtOption::new(7u32, Choice::from(0)).into_option(), None);
     }
 }

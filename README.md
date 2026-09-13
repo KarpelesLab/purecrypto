@@ -266,6 +266,21 @@ h.update(b"bc");
 assert_eq!(format!("{}", h.finalize()).len(), 64);   // hex via Display
 ```
 
+### Replacing `subtle` and `zeroize`
+
+`purecrypto::ct` mirrors the `subtle` crate (`Choice`, `CtOption`,
+`ConstantTimeEq`, `ConstantTimeGreater`/`Less`, `ConditionallySelectable`,
+`ConditionallyNegatable`) and `purecrypto::zeroize` mirrors the `zeroize` crate
+(`Zeroize`, `ZeroizeOnDrop`, `Zeroizing<T>`, `DefaultIsZeroes`), so a project
+that already depends on this crate needs neither. Two differences to know:
+
+- `ct::ConditionallySelectable::conditional_select(a, b, choice)` returns `a`
+  when `choice` is true — the opposite of `subtle`. Ported code should call
+  `conditional_select_b_if_true`, which has `subtle`'s argument order.
+- There is no `#[derive(Zeroize)]`: implement `Zeroize` by wiping each field,
+  add a two-line `Drop` that calls `self.zeroize()`, or hold secret fields as
+  `Zeroizing<T>` and let them wipe themselves.
+
 ### TLS, DTLS and QUIC configuration
 
 All four handshake versions (TLS 1.2, TLS 1.3, DTLS 1.2, DTLS 1.3) and both
