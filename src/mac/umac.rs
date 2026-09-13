@@ -19,10 +19,12 @@
 //! 5. **PDF** — XOR the tag with an AES-derived per-nonce pad.
 //!
 //! The whole pipeline runs without table lookups (NH uses arithmetic only,
-//! AES uses [`Aes128`]'s constant-time GF(2⁸) S-box), so the only data-
-//! dependent timing arises from the POLY marker branch (RFC 4418 §6, noted
-//! by the RFC itself as a narrow timing concern; the leak is constrained to
-//! detection of a 32-bit boundary in the L1 output).
+//! AES uses [`Aes128`]'s constant-time GF(2⁸) S-box) and without
+//! secret-dependent branches: the modular reductions use masked conditional
+//! subtraction, the POLY marker case (RFC 4418 §6, which the RFC itself flags
+//! as a timing concern) evaluates both sequences and selects with a mask, and
+//! L3-HASH reduces modulo 2³⁶−5 by folding rather than with `%`. Only the
+//! message length steers control flow.
 //!
 //! # Example
 //!
@@ -144,18 +146,46 @@ fn l1_chunk(key: &[u8; L1_KEY_LEN], data: &[u8], bit_length: u64) -> u64 {
 //  Modular arithmetic for POLY
 // ---------------------------------------------------------------------------
 
+/// All-ones iff `flag` is true, zero otherwise — the usual branchless mask.
+/// `flag` comes from `overflowing_*`/comparison results that depend on secret
+/// intermediates, so it must never steer a branch.
+#[inline]
+fn mask64(flag: bool) -> u64 {
+    (flag as u64).wrapping_neg()
+}
+
+#[inline]
+fn mask128(flag: bool) -> u128 {
+    (flag as u128).wrapping_neg()
+}
+
+/// Constant-time `x mod p` for `x < 2·p`: subtracts `p` iff that does not
+/// borrow.
+#[inline]
+fn csub_p64(x: u64) -> u64 {
+    let (d, borrow) = x.overflowing_sub(P64);
+    // borrow ⇒ keep `x`; no borrow ⇒ take `d`.
+    (d & !mask64(borrow)) | (x & mask64(borrow))
+}
+
+#[inline]
+fn csub_p128(x: u128) -> u128 {
+    let (d, borrow) = x.overflowing_sub(P128);
+    (d & !mask128(borrow)) | (x & mask128(borrow))
+}
+
 #[inline]
 fn add_mod_p64(a: u64, b: u64) -> u64 {
     let (s, carry) = a.overflowing_add(b);
-    let s = if carry { s.wrapping_add(OFFSET_64) } else { s };
-    if s >= P64 { s - P64 } else { s }
+    let s = s.wrapping_add(OFFSET_64 & mask64(carry));
+    csub_p64(s)
 }
 
 #[inline]
 fn add_mod_p128(a: u128, b: u128) -> u128 {
     let (s, carry) = a.overflowing_add(b);
-    let s = if carry { s.wrapping_add(OFFSET_128) } else { s };
-    if s >= P128 { s - P128 } else { s }
+    let s = s.wrapping_add(OFFSET_128 & mask128(carry));
+    csub_p128(s)
 }
 
 /// `(a * b) mod (2⁶⁴ − 59)`. Uses the identity `2⁶⁴ ≡ 59 (mod p)` to fold
@@ -170,8 +200,8 @@ fn mul_mod_p64(a: u64, b: u64) -> u64 {
     let lift1_hi = (lift1 >> 64) as u64; // < 60
     // Second reduction: lift1 ≡ lift1_lo + 59·lift1_hi (mod p64).
     let (r, carry) = lift1_lo.overflowing_add(OFFSET_64.wrapping_mul(lift1_hi));
-    let r = if carry { r.wrapping_add(OFFSET_64) } else { r };
-    if r >= P64 { r - P64 } else { r }
+    let r = r.wrapping_add(OFFSET_64 & mask64(carry));
+    csub_p64(r)
 }
 
 /// `(a * b) mod (2¹²⁸ − 159)`. Schoolbook-multiplies into four 64-bit limbs,
@@ -223,41 +253,75 @@ fn mul_mod_p128(a: u128, b: u128) -> u128 {
     let high = (mid_hi as u128) + (r1_hi as u128); // < 2⁹
     let extra = high * OFFSET_128;
     let (sum, overflow) = low128.overflowing_add(extra);
-    let sum = if overflow {
-        sum.wrapping_add(OFFSET_128)
-    } else {
-        sum
-    };
-    if sum >= P128 { sum - P128 } else { sum }
+    let sum = sum.wrapping_add(OFFSET_128 & mask128(overflow));
+    csub_p128(sum)
 }
 
 /// POLY-64 step (RFC 4418 §5.3.2). Inputs at or above `MAXWR_64` are split
 /// into a marker followed by `m − OFFSET_64` so the input always reduces
 /// modulo `p64`.
+///
+/// `m` is an L1-HASH output, i.e. a secret, so the marker case must not be
+/// distinguishable by timing: **both** sequences are evaluated and the result
+/// is selected with a mask. The extra two modular multiplies per 1024 bytes of
+/// message are negligible next to NH's 128 multiplies over the same bytes.
 #[inline]
 fn poly64_step(k64: u64, acc: &mut u64, m: u64) {
-    if m >= MAXWR_64 {
-        *acc = add_mod_p64(mul_mod_p64(k64, *acc), P64 - 1);
-        *acc = add_mod_p64(mul_mod_p64(k64, *acc), m - OFFSET_64);
-    } else {
-        *acc = add_mod_p64(mul_mod_p64(k64, *acc), m);
-    }
+    let marker = mask64(m >= MAXWR_64);
+    let first = mul_mod_p64(k64, *acc);
+    // Non-marker sequence: one step with `m` itself.
+    let plain = add_mod_p64(first, m);
+    // Marker sequence: a `p64 − 1` marker word, then `m − OFFSET_64`.
+    let marked = add_mod_p64(
+        mul_mod_p64(k64, add_mod_p64(first, P64 - 1)),
+        m.wrapping_sub(OFFSET_64),
+    );
+    *acc = (marked & marker) | (plain & !marker);
 }
 
-/// POLY-128 step (RFC 4418 §5.3.2). Same shape as [`poly64_step`].
+/// POLY-128 step (RFC 4418 §5.3.2). Same shape as [`poly64_step`], including
+/// the branchless marker handling.
 #[inline]
 fn poly128_step(k128: u128, acc: &mut u128, m: u128) {
-    if m >= MAXWR_128 {
-        *acc = add_mod_p128(mul_mod_p128(k128, *acc), P128 - 1);
-        *acc = add_mod_p128(mul_mod_p128(k128, *acc), m - OFFSET_128);
-    } else {
-        *acc = add_mod_p128(mul_mod_p128(k128, *acc), m);
-    }
+    let marker = mask128(m >= MAXWR_128);
+    let first = mul_mod_p128(k128, *acc);
+    let plain = add_mod_p128(first, m);
+    let marked = add_mod_p128(
+        mul_mod_p128(k128, add_mod_p128(first, P128 - 1)),
+        m.wrapping_sub(OFFSET_128),
+    );
+    *acc = (marked & marker) | (plain & !marker);
 }
 
 // ---------------------------------------------------------------------------
 //  L3-HASH
 // ---------------------------------------------------------------------------
+
+/// Constant-time `x mod (2³⁶ − 5)` for `x < 2⁵⁵`.
+///
+/// A `%` on a secret is variable time on many targets (and the hardware
+/// divider's latency is operand-dependent even where it is not a libcall), so
+/// fold instead: `2³⁶ ≡ 5 (mod p36)`, hence `x ≡ (x mod 2³⁶) + 5·(x >> 36)`.
+/// Two folds bring any `x < 2⁵⁵` below `2³⁶ + 5`, and two conditional
+/// subtractions finish the reduction.
+#[inline]
+fn reduce_p36(x: u64) -> u64 {
+    const LOW36: u64 = (1u64 << 36) - 1;
+    // x < 2⁵⁵ ⇒ hi < 2¹⁹ ⇒ r1 < 2³⁶ + 5·2¹⁹ < 2³⁷.
+    let r1 = (x & LOW36) + 5 * (x >> 36);
+    // r1 < 2³⁷ ⇒ r2 < 2³⁶ + 5.
+    let r2 = (r1 & LOW36) + 5 * (r1 >> 36);
+    // r2 − p36 < p36, so at most two conditional subtractions are needed.
+    let r3 = csub_p36(r2);
+    csub_p36(r3)
+}
+
+/// Subtracts `p36` iff that does not borrow (branchless).
+#[inline]
+fn csub_p36(x: u64) -> u64 {
+    let (d, borrow) = x.overflowing_sub(P36);
+    (d & !mask64(borrow)) | (x & mask64(borrow))
+}
 
 /// L3-HASH (RFC 4418 §5.4.1). `k1_reduced` is the 8-word K1 already reduced
 /// modulo `p36`, `k2` is the 4-byte K2 (raw, XORed at the end), and `b` is
@@ -269,7 +333,7 @@ fn l3_hash(k1_reduced: &[u64; 8], k2: &[u8; 4], b: &[u8; 16]) -> [u8; 4] {
         let m_i = u16::from_be_bytes([b[i * 2], b[i * 2 + 1]]) as u64;
         sum = sum.wrapping_add(m_i.wrapping_mul(k1_reduced[i]));
     }
-    let y = (sum % P36) as u32; // y mod 2³² takes the low 32 bits
+    let y = reduce_p36(sum) as u32; // y mod 2³² takes the low 32 bits
     let k2_u32 = u32::from_be_bytes(*k2);
     (y ^ k2_u32).to_be_bytes()
 }
@@ -983,5 +1047,122 @@ mod tests {
         }
         let streamed = state.finalize(nonce);
         assert_eq!(one_shot, streamed);
+    }
+
+    /// The branchless POLY steps and the folded `mod p36` must agree with the
+    /// textbook branchy/`%` forms on every input class, in particular the rare
+    /// marker range `m >= MAXWR` that the RFC vectors never reach.
+    #[test]
+    fn branchless_arithmetic_matches_reference() {
+        fn poly64_ref(k: u64, acc: u64, m: u64) -> u64 {
+            fn add(a: u64, b: u64) -> u64 {
+                let (s, c) = a.overflowing_add(b);
+                let s = if c { s.wrapping_add(OFFSET_64) } else { s };
+                if s >= P64 { s - P64 } else { s }
+            }
+            if m >= MAXWR_64 {
+                let t = add(mul_mod_p64(k, acc), P64 - 1);
+                add(mul_mod_p64(k, t), m - OFFSET_64)
+            } else {
+                add(mul_mod_p64(k, acc), m)
+            }
+        }
+        fn poly128_ref(k: u128, acc: u128, m: u128) -> u128 {
+            fn add(a: u128, b: u128) -> u128 {
+                let (s, c) = a.overflowing_add(b);
+                let s = if c { s.wrapping_add(OFFSET_128) } else { s };
+                if s >= P128 { s - P128 } else { s }
+            }
+            if m >= MAXWR_128 {
+                let t = add(mul_mod_p128(k, acc), P128 - 1);
+                add(mul_mod_p128(k, t), m - OFFSET_128)
+            } else {
+                add(mul_mod_p128(k, acc), m)
+            }
+        }
+
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+
+        // Edge cases around the marker threshold and the moduli.
+        let edges64 = [
+            0u64,
+            1,
+            MAXWR_64 - 1,
+            MAXWR_64,
+            MAXWR_64 + 1,
+            P64 - 1,
+            P64,
+            P64 + 1,
+            u64::MAX,
+        ];
+        for &m in &edges64 {
+            for &acc in &[0u64, 1, P64 - 1, u64::MAX / 3] {
+                let k = 0x0123_4567_89ab_cdefu64 & MASK64;
+                let mut got = acc;
+                poly64_step(k, &mut got, m);
+                assert_eq!(got, poly64_ref(k, acc, m), "poly64 m={m:#x} acc={acc:#x}");
+            }
+        }
+        let edges128 = [
+            0u128,
+            1,
+            MAXWR_128 - 1,
+            MAXWR_128,
+            MAXWR_128 + 1,
+            P128 - 1,
+            P128,
+            P128 + 1,
+            u128::MAX,
+        ];
+        for &m in &edges128 {
+            for &acc in &[0u128, 1, P128 - 1, u128::MAX / 3] {
+                let k = 0x0123_4567_89ab_cdef_0123_4567_89ab_cdefu128 & MASK128;
+                let mut got = acc;
+                poly128_step(k, &mut got, m);
+                assert_eq!(got, poly128_ref(k, acc, m), "poly128 m={m:#x}");
+            }
+        }
+
+        for _ in 0..5_000 {
+            let k = next() & MASK64;
+            let acc = next() % P64;
+            // Half the inputs land in the marker range.
+            let m = if next() & 1 == 0 {
+                next()
+            } else {
+                MAXWR_64 | (next() & 0xffff_ffff)
+            };
+            let mut got = acc;
+            poly64_step(k, &mut got, m);
+            assert_eq!(got, poly64_ref(k, acc, m), "poly64 rand m={m:#x}");
+
+            let k128 = (((next() as u128) << 64) | next() as u128) & MASK128;
+            let acc128 = (((next() as u128) << 64) | next() as u128) % P128;
+            let m128 = if next() & 1 == 0 {
+                ((next() as u128) << 64) | next() as u128
+            } else {
+                MAXWR_128 | ((next() as u128) & 0xffff_ffff)
+            };
+            let mut got128 = acc128;
+            poly128_step(k128, &mut got128, m128);
+            assert_eq!(
+                got128,
+                poly128_ref(k128, acc128, m128),
+                "poly128 rand m={m128:#x}"
+            );
+
+            // L3-HASH inputs are < 2⁵⁵.
+            let x = next() >> 9;
+            assert_eq!(reduce_p36(x), x % P36, "reduce_p36 x={x:#x}");
+        }
+        for &x in &[0u64, 1, P36 - 1, P36, P36 + 1, 1 << 36, (1u64 << 55) - 1] {
+            assert_eq!(reduce_p36(x), x % P36, "reduce_p36 edge x={x:#x}");
+        }
     }
 }
