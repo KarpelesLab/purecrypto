@@ -142,10 +142,20 @@ zkp-pedersen = ["hazmat-secp256k1", "hash", "rng"]
 # Borromean-ring range proofs over Pedersen commitments (Confidential Assets).
 zkp-rangeproof = ["zkp-pedersen"]
 # Asset surjection proofs (Confidential Assets).
+# STAYS alloc-gated, by design, not oversight. `SurjectionProof` is a ring of
+# up to 256 scalars (`MAX_USED_INPUTS`), so the fixed-array form is an 8.3 KiB
+# value and `generate` a ~43 KiB frame -- while a real Liquid proof uses an
+# anonymity set of about three and is ~160 bytes. The ceiling is two orders of
+# magnitude above the working set, which is exactly the case a heap handles
+# better than a stack. Same category as `dh`, `x509` and `tls`.
 zkp-surjection = ["zkp-pedersen", "alloc"]
 # Half-aggregation of BIP340 Schnorr signatures.
 zkp-halfagg = ["bip340"]
 # Ring-signature address whitelisting (Elements/Liquid).
+# STAYS alloc-gated for the same reason as `zkp-surjection`: a `Whitelist` is
+# one scalar per ring member, up to `MAX_KEYS` = 255, so 8.2 KiB as a fixed
+# array, and `sign` would need a ~41 KiB frame (the 255 derived ring keys alone
+# are 24 KiB).
 zkp-whitelist = ["hazmat-secp256k1", "hash", "rng", "alloc"]
 # Umbrella: every experimental zkp module at once.
 zkp = ["zkp-sign-to-contract", "zkp-adaptor", "zkp-pedersen", "zkp-rangeproof", "zkp-surjection", "zkp-halfagg", "zkp-whitelist"]

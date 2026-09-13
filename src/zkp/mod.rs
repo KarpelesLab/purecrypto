@@ -31,6 +31,25 @@
 //! from, so a reviewer can check the implementation against its source of
 //! truth rather than against another implementation.
 //!
+//! # Allocation
+//!
+//! Most of these modules need **no allocator**:
+//! [`sign_to_contract`], [`adaptor`], [`pedersen`], [`halfagg`] and
+//! [`rangeproof`] all build with `default-features = false` and no `alloc`.
+//! Where a result's length is a runtime choice rather than a fixed one, they
+//! follow the crate's usual shape: a `*_into` function writing into a
+//! caller-supplied buffer and returning the length, with the `Vec`-returning
+//! spelling kept as a convenience behind the `alloc` feature.
+//!
+//! [`surjection`] and [`whitelist`] are the exceptions, and deliberately so.
+//! Both are ring signatures whose proof *is* a vector of one scalar per ring
+//! member, with a ceiling — 256 and 255 respectively — set by the wire format
+//! rather than by anything a caller picks. A fixed-maximum array would make
+//! every proof value 8.2 KiB and every prover frame around 40 KiB, while the
+//! rings actually used in Liquid hold a handful of members and serialize to a
+//! few hundred bytes. That is the one shape a heap genuinely suits, so those
+//! two features keep `alloc`.
+//!
 //! # A caveat on wire formats
 //!
 //! Range proofs, surjection proofs and whitelisting have **no normative
