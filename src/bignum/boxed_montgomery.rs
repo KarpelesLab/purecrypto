@@ -43,12 +43,41 @@ fn sub_mod_limbs(n: &[Limb], a: &[Limb], b: &[Limb]) -> Vec<Limb> {
 }
 
 /// Runtime-width Montgomery parameters for an odd modulus.
-#[derive(Clone, Debug)]
+///
+/// The modulus is frequently a *secret*: the RSA CRT path builds one context
+/// per prime factor, so `n` here is `p` or `q`. Consequently this type wipes
+/// its buffers on drop and its `Debug` never prints them.
+#[derive(Clone)]
 pub struct BoxedMontModulus {
     n: Vec<Limb>,
     n_prime: Limb,
     r2: Vec<Limb>,
     limbs: usize,
+}
+
+// The modulus may be a secret prime (RSA CRT), so never format the limbs:
+// the derived `Debug` printed `n` (= p or q) and `r2` into any log line that
+// formatted a key-bearing struct. The impl is kept — dropping the trait would
+// be a breaking change for downstream code that derives `Debug` on a type
+// holding one.
+impl core::fmt::Debug for BoxedMontModulus {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("BoxedMontModulus")
+            .field("limbs", &self.limbs)
+            .finish_non_exhaustive()
+    }
+}
+
+// Best-effort wipe: `n` and `r2` are secret whenever the modulus is (the RSA
+// CRT contexts hold `p` and `q`), and `Vec<Limb>` returns its buffer to the
+// allocator with the limbs intact otherwise.
+impl Drop for BoxedMontModulus {
+    fn drop(&mut self) {
+        zeroize_limbs(&mut self.n);
+        zeroize_limbs(&mut self.r2);
+        self.n_prime = 0;
+        let _ = core::hint::black_box(&self.n_prime);
+    }
 }
 
 impl BoxedMontModulus {
@@ -465,6 +494,23 @@ impl BoxedMontModulus {
 mod tests {
     use super::*;
     use crate::bignum::{MontModulus, Uint};
+
+    /// The modulus is a secret whenever it is an RSA prime factor (the CRT
+    /// path builds one context per prime), so `Debug` must not print the
+    /// limbs — the derived impl used to dump `n` and `r2`.
+    #[test]
+    fn debug_does_not_print_the_modulus() {
+        let modulus = BoxedUint::from_be_bytes(&[0xC0, 0x05, 0x00, 0x01, 0x23, 0x45, 0x67, 0x89]);
+        let m = BoxedMontModulus::new(&modulus);
+        let s = alloc::format!("{m:?}");
+        assert!(!s.contains("13836218847371372169"), "leaked n: {s}");
+        for limb in m.n.iter().chain(m.r2.iter()) {
+            assert!(
+                !s.contains(&alloc::format!("{limb}")),
+                "Debug leaked a limb: {s}"
+            );
+        }
+    }
 
     #[test]
     fn pow_public_matches_pow() {

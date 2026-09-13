@@ -197,6 +197,9 @@ impl Drop for BoxedRsaCrt {
         self.qinv.zeroize();
         self.pm2.zeroize();
         self.qm2.zeroize();
+        // `mont_p` / `mont_q` hold `p` and `q` (plus their R² values) and are
+        // wiped by `BoxedMontModulus`'s own `Drop`, which runs right after
+        // this one.
     }
 }
 

@@ -141,6 +141,10 @@ impl DhPrivateKey {
         bytes[0] &= mask;
         bytes[0] |= 1 << (high_bits - 1);
         let x = BoxedUint::from_be_bytes(&bytes);
+        // `bytes` is the private exponent in the clear; wipe it before the
+        // `Vec` goes back to the allocator (`x` keeps the only live copy, and
+        // `BoxedUint` zeroizes itself on drop).
+        crate::zeroize::Zeroize::zeroize(&mut bytes[..]);
         DhPrivateKey { group, x }
     }
 
