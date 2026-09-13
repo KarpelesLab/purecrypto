@@ -94,22 +94,27 @@ pub(super) fn fill_chunked(dest: &mut [u8], mut host: impl FnMut(&mut [u8])) {
     }
 }
 
-#[cfg(test)]
+// The mock host records every request length in a `Vec`, and two of the cases
+// need buffers larger than `MAX_CHUNK` (64 KiB) to cross a chunk boundary at
+// all, so the tests — not the module under test — need a heap.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// A deterministic stand-in for a working host CSPRNG (xorshift32).
     struct MockHost {
         state: u32,
         /// Sizes of every request received, in order.
-        requests: alloc::vec::Vec<usize>,
+        requests: Vec<usize>,
     }
 
     impl MockHost {
         fn new() -> Self {
             MockHost {
                 state: 0x1234_5678,
-                requests: alloc::vec::Vec::new(),
+                requests: Vec::new(),
             }
         }
         fn next(&mut self) -> u8 {
@@ -137,7 +142,7 @@ mod tests {
         // Three chunks: two full ones and a short tail, so both the chunk
         // boundaries and the final partial request are exercised.
         let len = 2 * MAX_CHUNK + 100;
-        let mut dest = alloc::vec![0u8; len];
+        let mut dest = vec![0u8; len];
         let mut host = MockHost::new();
         fill_chunked(&mut dest, |chunk| {
             host.requests.push(chunk.len());
@@ -173,7 +178,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wrote nothing")]
     fn host_that_stops_after_first_chunk_is_rejected() {
-        let mut dest = alloc::vec![0u8; MAX_CHUNK + 100];
+        let mut dest = vec![0u8; MAX_CHUNK + 100];
         let mut host = MockHost::new();
         let mut served = 0usize;
         fill_chunked(&mut dest, |chunk| {
@@ -190,7 +195,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "wrote only a prefix")]
     fn host_that_writes_a_partial_chunk_is_rejected() {
-        let mut dest = alloc::vec![0u8; 4096];
+        let mut dest = vec![0u8; 4096];
         let mut host = MockHost::new();
         fill_chunked(&mut dest, |chunk| {
             let n = chunk.len() / 2;

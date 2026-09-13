@@ -37,8 +37,13 @@ mod linux_getrandom;
 mod wasm;
 // Chunked, sentinel-checked filling for the browser/generic-host import
 // backend. Pure logic, so it is also compiled natively under `test` to keep
-// its fail-closed checks unit-tested with mock hosts.
-#[cfg(any(all(target_arch = "wasm32", target_os = "unknown"), test))]
+// its fail-closed checks unit-tested with mock hosts — but only where those
+// tests exist, i.e. with `alloc` (the mock host needs a `Vec`); otherwise
+// nothing on a native target would reference it.
+#[cfg(any(
+    all(target_arch = "wasm32", target_os = "unknown"),
+    all(test, feature = "alloc")
+))]
 mod host_fill;
 #[cfg(all(
     target_arch = "wasm32",
@@ -136,7 +141,7 @@ impl<T: RngCore + CryptoRng + ?Sized> CryptoRngCore for T {}
         )
     )
 ))]
-#[cfg_attr(not(any(feature = "rsa", feature = "dh")), allow(dead_code))]
+#[cfg_attr(not(feature = "rsa"), allow(dead_code))]
 pub(crate) fn try_os_entropy(dest: &mut [u8]) -> bool {
     let mut rng = OsRng;
     rng.fill_bytes(dest);
@@ -155,7 +160,7 @@ pub(crate) fn try_os_entropy(dest: &mut [u8]) -> bool {
         )
     )
 )))]
-#[cfg_attr(not(any(feature = "rsa", feature = "dh")), allow(dead_code))]
+#[cfg_attr(not(feature = "rsa"), allow(dead_code))]
 pub(crate) fn try_os_entropy(dest: &mut [u8]) -> bool {
     let _ = dest;
     false
