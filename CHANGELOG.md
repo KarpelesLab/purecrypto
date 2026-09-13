@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/KarpelesLab/purecrypto/compare/v0.8.3...v0.8.4) - 2026-09-13
+
+### Added
+
+- *(key)* facade impls for the fixed-curve secp256k1 ECDSA keys
+- *(ec)* allocation-free secp256k1 ECDSA (`ec::secp256k1_ecdsa`)
+- *(ct)* subtle-compatible select helper, ConditionallyNegatable, CtOption combinators
+- *(zeroize)* add a public volatile-store `zeroize` module
+
+### Other
+
+- *(cli)* widen the q_client retry window on the QUIC loopback test
+- build docs.rs with all features; fix a default-features intra-doc link
+- restructure the README; add CLI and signature-registry references
+
 ## [0.8.3](https://github.com/KarpelesLab/purecrypto/compare/v0.8.2...v0.8.3) - 2026-09-08
 
 ### Added
