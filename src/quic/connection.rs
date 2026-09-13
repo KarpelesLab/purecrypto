@@ -4211,6 +4211,29 @@ impl QuicConnection {
     }
 
     fn feed_short_header_packet(&mut self, datagram: &[u8]) -> Result<usize, Error> {
+        // RFC 9001 §5.7 — "a server MUST NOT process incoming 1-RTT protected
+        // packets before the TLS handshake is complete": the client is not
+        // authenticated until its Finished has been verified, so anything the
+        // 1-RTT keys open before that point is data from a peer whose identity
+        // (and, with `client_auth.required`, whose certificate) has not been
+        // established. Delivering it to the application is a client-certificate
+        // bypass — a client can simply drop its Handshake flight and send
+        // stream data in 1-RTT instead.
+        //
+        // The client's Finished may sit in an earlier *coalesced* packet of
+        // this very datagram (Handshake + 1-RTT share a datagram), and
+        // `feed_datagram` only re-evaluates completion after the whole
+        // datagram, so ask again here before deciding.
+        if self.role == Role::Server && !self.handshake_complete {
+            self.check_handshake_complete();
+            if !self.handshake_complete {
+                // Drop, don't buffer: the packet is unacknowledged, so the
+                // client's loss recovery retransmits it once the handshake
+                // completes. A short-header packet is always last in its
+                // datagram, so the whole remainder is consumed.
+                return Ok(datagram.len());
+            }
+        }
         // RFC 9001 §6.5 — even if the application never ticks
         // `on_timeout`, expired previous-phase read keys must not be
         // used to open packets. Check before any fallback decrypt.
@@ -4423,6 +4446,17 @@ impl QuicConnection {
             // would still hold the original-generation rx keys and
             // the next peer-initiated update would fail to decrypt.
             self.refresh_phase_chains_post_confirm(current_phase);
+        }
+
+        // RFC 9001 §4.9.3 — "the server MUST discard 0-RTT keys when it
+        // successfully processes a 1-RTT packet": the client has moved on, so
+        // the replayable early-data keys have no further use and must not be
+        // retained for the life of the connection.
+        if self.role == Role::Server && !self.early_keys_discarded {
+            self.early_keys_discarded = true;
+            let lk = self.endpoint.crypto.at_mut(Level::EarlyData);
+            lk.tx = None;
+            lk.rx = None;
         }
 
         let cleartext: Vec<u8> = payload.to_vec();
@@ -11485,5 +11519,83 @@ mod tests {
         // delivered queue).
         let (n3, _) = c.read(sid, &mut b2).expect("client read 2");
         assert_eq!(n3, 0, "PN replay must not deliver duplicate bytes");
+    }
+
+    /// Splits a datagram into (coalesced long-header prefix, short-header
+    /// tail). Used by the RFC 9001 §5.7 tests to deliver a client's 1-RTT
+    /// packet to the server while withholding its Handshake flight.
+    fn split_long_and_short(datagram: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut rest: &[u8] = datagram;
+        let mut long = Vec::new();
+        while !rest.is_empty() && rest[0] & 0x80 != 0 {
+            let h = crate::quic::pkt::LongHeader::parse(rest).expect("long header");
+            let n = h.payload_off + h.length as usize;
+            if n == 0 || n > rest.len() {
+                break;
+            }
+            long.extend_from_slice(&rest[..n]);
+            rest = &rest[n..];
+        }
+        (long, rest.to_vec())
+    }
+
+    /// RFC 9001 §5.7: "a server MUST NOT process incoming 1-RTT protected
+    /// packets before the TLS handshake is complete".
+    ///
+    /// A client gets its 1-RTT *write* keys as soon as it has processed the
+    /// server's Finished, so it can send application data one flight early. If
+    /// it then withholds its own Handshake flight the server never
+    /// authenticates it — yet before this fix the server decrypted the 1-RTT
+    /// packet anyway and handed the payload to `readable_streams()` / `read()`
+    /// with `is_handshake_complete() == false`. With `client_auth.required`
+    /// that is a straight client-certificate bypass.
+    #[test]
+    fn server_ignores_1rtt_stream_data_before_handshake_completion() {
+        let (mut client, mut server) = loopback_pair();
+        // Client Initial -> server, server flight -> client.
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            server.feed_datagram(&dg).expect("server feed");
+        }
+        loop {
+            let dg = server.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            client.feed_datagram(&dg).expect("client feed");
+        }
+        assert!(client.is_handshake_complete(), "client completes first");
+        assert!(!server.is_handshake_complete());
+
+        let sid = client.open_bidi().expect("open");
+        client.write(sid, b"unauthenticated-request").expect("write");
+
+        // Deliver only the 1-RTT packets; drop every long-header packet (the
+        // client's Handshake-level Finished among them).
+        let mut fed_short = false;
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            let (_long, short) = split_long_and_short(&dg);
+            if !short.is_empty() {
+                server.feed_datagram(&short).expect("short-header feed");
+                fed_short = true;
+            }
+        }
+        assert!(fed_short, "the client produced a 1-RTT packet");
+        assert!(
+            !server.is_handshake_complete(),
+            "the server never saw the client's Finished"
+        );
+        assert_eq!(
+            server.readable_streams().count(),
+            0,
+            "1-RTT stream data must not be delivered before the handshake completes"
+        );
     }
 }
