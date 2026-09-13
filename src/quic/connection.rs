@@ -804,6 +804,10 @@ pub struct QuicConnection {
     /// more specific one than [`transport_error_code`] can infer (chiefly
     /// `CRYPTO_ERROR` from the TLS engine and the stream-level codes).
     pending_error_code: Option<u64>,
+    /// The caller pinned `stateless_reset_token` in its transport
+    /// parameters, so the engine must not re-derive it when the handshake
+    /// CID turns out to be the Retry SCID (L-8).
+    reset_token_pinned: bool,
 }
 
 enum EngineSide {
@@ -1001,6 +1005,7 @@ impl QuicConnection {
             prev_rx_keys_installed_at: None,
             rx_packet_authenticated: false,
             pending_error_code: None,
+            reset_token_pinned: false,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1057,6 +1062,7 @@ impl QuicConnection {
         });
         let pending_scid = crate::quic::server::random_default_scid();
         let mut params = cfg.transport_params.clone();
+        let reset_token_pinned = params.stateless_reset_token.is_some();
         // Advertise a derivable seq-0 reset token unless the caller pinned one.
         if params.stateless_reset_token.is_none() {
             params.stateless_reset_token = Some(crate::quic::reset::stateless_reset_token(
@@ -1126,6 +1132,7 @@ impl QuicConnection {
             prev_rx_keys_installed_at: None,
             rx_packet_authenticated: false,
             pending_error_code: None,
+            reset_token_pinned,
         })
     }
 
@@ -1464,7 +1471,6 @@ impl QuicConnection {
             };
             let addr_bytes = encode_retry_addr(&peer_addr);
             let odcid_bytes = hdr.dcid.to_vec();
-            let token = crate::quic::retry::mint(&secret, &addr_bytes, &odcid_bytes, self.now_secs);
 
             // Pick a fresh SCID for the Retry. The client will use this
             // value as the DCID on its retried Initial. Both sides will
@@ -1473,6 +1479,17 @@ impl QuicConnection {
             // matching keys when processing the retried Initial).
             let mut rng = OsRng;
             let retry_scid = ConnectionId::random(&mut rng, crate::quic::server::DEFAULT_SCID_LEN);
+            // L-8: the token binds the Retry SCID, so the DCID of the retried
+            // Initial — which the server adopts as its own SCID and echoes as
+            // `retry_source_connection_id` — is a value *we* chose, not one
+            // the client (or whoever replayed the token) picked.
+            let token = crate::quic::retry::mint(
+                &secret,
+                &addr_bytes,
+                &odcid_bytes,
+                retry_scid.as_slice(),
+                self.now_secs,
+            );
 
             // Build the Retry packet. ODCID is the *original* DCID the
             // client wrote on this first Initial.
@@ -1505,14 +1522,21 @@ impl QuicConnection {
         };
         let addr_bytes = encode_retry_addr(&peer_addr);
         match crate::quic::retry::validate(&secret, &addr_bytes, hdr.token, self.now_secs) {
-            Ok(odcid) => {
+            Ok((odcid, retry_scid)) => {
+                // L-8: the retried Initial MUST be addressed to the SCID we
+                // put in the Retry packet, which the token binds. Without the
+                // check the server took the client's DCID on trust — adopting
+                // it as its own SCID and as `retry_source_connection_id`,
+                // and deriving the Initial keys from it — so a token holder
+                // could pick the server's connection ID (and desynchronise
+                // the seq-0 stateless-reset token, which is derived from it).
+                if hdr.dcid != retry_scid.as_slice() {
+                    return Ok(Some(datagram.len()));
+                }
                 // Address validated by the round-trip → exempt from AMP.
                 self.active_path.validated = true;
                 self.original_dcid = ConnectionId::from_slice(&odcid);
-                // On this retried Initial, the client used the
-                // Retry's SCID as its DCID. We discover that DCID
-                // from the current header (it equals hdr.dcid).
-                self.retry_scid = ConnectionId::from_slice(hdr.dcid);
+                self.retry_scid = ConnectionId::from_slice(&retry_scid);
                 self.retry_sent = true;
                 // Continue normal Initial processing.
                 Ok(None)
@@ -4076,9 +4100,23 @@ impl QuicConnection {
         let peer_scid = ConnectionId::from_slice(scid).ok_or(Error::Decode)?;
         let our_scid = if let Some(retry_scid) = self.retry_scid.as_ref() {
             // Retry path: reuse the SCID we picked for the Retry packet. This
-            // is exactly `dcid` of the retried Initial; we use the stored
-            // value so the bookkeeping matches the Retry-time decision.
-            *retry_scid
+            // is exactly `dcid` of the retried Initial (the token binds it);
+            // we use the stored value so the bookkeeping matches the
+            // Retry-time decision.
+            let retry_scid = *retry_scid;
+            // L-8: our seq-0 stateless-reset token is derived from the CID we
+            // actually answer to. Before a Retry that is `pending_scid`, and
+            // the token advertised at construction was derived from it — but
+            // after a Retry the handshake CID is the Retry SCID instead, so
+            // the advertised token has to be re-derived or the client would
+            // never recognise a reset for this connection (RFC 9000 §10.3.1).
+            // A caller-pinned token is left alone.
+            if !self.reset_token_pinned {
+                self.our_params.stateless_reset_token = Some(
+                    crate::quic::reset::stateless_reset_token(&self.reset_key, &retry_scid),
+                );
+            }
+            retry_scid
         } else {
             // No-Retry path: reuse the SCID chosen at construction (so it
             // matches the seq-0 stateless-reset token already advertised in
@@ -4187,10 +4225,18 @@ impl QuicConnection {
             // RFC 9000 §17.2.5 / RFC 9001 §5.8 — client-side Retry handling.
             // The server-side `maybe_emit_retry` covers the outbound
             // direction; here we handle a Retry the client receives.
+            let was_processed = self.retry_processed;
             self.process_retry_packet(datagram, &hdr)?;
-            // G-4: Retry is a non-VN packet; processing it commits us
-            // to v1 and disqualifies subsequent VN per RFC 9000 §6.2.
-            self.note_peer_packet_processed();
+            // G-4: Retry is a non-VN packet; *processing* it commits us to v1
+            // and disqualifies subsequent VN per RFC 9000 §6.2 — but only a
+            // Retry that was actually accepted counts. Marking every Retry
+            // -shaped datagram as processed let a forgery with a junk
+            // integrity tag set `peer_packet_seen`, after which the genuine
+            // Retry was discarded by the §17.2.5.2 guard and the handshake
+            // stalled until it timed out.
+            if self.retry_processed && !was_processed {
+                self.note_peer_packet_processed();
+            }
             // Retry packets are single-packet datagrams (RFC 9000 §12.2:
             // "Coalescing only applies to long header packets ... Retry
             // packets cannot be coalesced"). Consume the rest of the
@@ -9128,9 +9174,188 @@ mod tests {
         );
     }
 
+    /// L-8 — the server's seq-0 stateless-reset token must be derived from
+    /// the connection ID it actually answers to. After a Retry that is the
+    /// Retry SCID, not the `pending_scid` picked at construction, so the
+    /// token advertised in the transport parameters had to be re-derived —
+    /// otherwise the client would never recognise a reset for this
+    /// connection (RFC 9000 §10.3.1).
+    #[test]
+    fn retry_reset_token_matches_the_handshake_cid() {
+        let secret = [0x4au8; 32];
+        let (mut c, mut s) = retry_loopback_pair(secret);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        s.set_peer_addr(addr);
+        s.set_now_secs(1_000);
+        c.set_peer_addr(addr);
+        for _ in 0..8 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+        let handshake_cid = s.endpoint.cids.local;
+        assert_eq!(
+            Some(handshake_cid.as_slice()),
+            s.retry_scid(),
+            "after a Retry the server answers to the Retry SCID"
+        );
+        let expected = crate::quic::reset::stateless_reset_token(&s.reset_key, &handshake_cid);
+        assert_eq!(
+            s.our_params.stateless_reset_token,
+            Some(expected),
+            "the advertised reset token must be derivable from the handshake CID"
+        );
+        // And the client stored exactly that token against the peer's seq-0
+        // CID, so a reset would be recognised.
+        let pool = c.cid_remote.as_ref().expect("client remote CID pool");
+        assert_eq!(
+            pool.entries.get(&0).and_then(|e| e.reset_token),
+            Some(expected),
+            "client must hold the same seq-0 reset token"
+        );
+    }
+
+    /// L-8 — the retried Initial's DCID becomes the server's own SCID and its
+    /// `retry_source_connection_id`, so it may not be taken on trust: the
+    /// token binds the Retry SCID and a mismatch is dropped. Before the fix
+    /// any holder of a (replayable, address-bound) token could hand the
+    /// server a connection ID of its own choosing.
+    #[test]
+    fn retried_initial_with_a_foreign_dcid_is_dropped() {
+        let secret = [0x4bu8; 32];
+        let (mut c, mut s) = retry_loopback_pair(secret);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        s.set_peer_addr(addr);
+        s.set_now_secs(1_000);
+        c.set_peer_addr(addr);
+
+        let first = c.pop_datagram();
+        s.feed_datagram_from(addr, &first).expect("server feed");
+        let retry_dg = s.pop_datagram();
+        assert!(!retry_dg.is_empty(), "server must emit a Retry");
+        c.feed_datagram(&retry_dg).expect("client retry");
+        let genuine_scid = s.retry_scid().expect("server chose a Retry SCID").to_vec();
+
+        // The retried, token-bearing Initial — with its DCID swapped for one
+        // the attacker chose. The token itself is untouched and still valid.
+        let retried = c.pop_datagram();
+        assert!(!retried.is_empty());
+        let mut tampered = retried.clone();
+        let dcid_len = tampered[5] as usize;
+        assert_eq!(dcid_len, genuine_scid.len());
+        for b in tampered[6..6 + dcid_len].iter_mut() {
+            *b ^= 0xff;
+        }
+        s.feed_datagram_from(addr, &tampered)
+            .expect("mismatched DCID is dropped silently");
+        assert_eq!(
+            s.retry_scid(),
+            Some(&genuine_scid[..]),
+            "a foreign DCID must not become the server's connection ID"
+        );
+        assert!(s.pop_datagram().is_empty(), "and draws no response");
+
+        // The genuine retried Initial still works.
+        s.feed_datagram_from(addr, &retried).expect("server feed");
+        for _ in 0..8 {
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+    }
+
+    /// L-5 — a Retry whose integrity tag does not verify must leave no trace.
+    /// `note_peer_packet_processed` ran for every Retry-shaped datagram, so a
+    /// forged one set `peer_packet_seen`, and the RFC 9000 §17.2.5.2 guard
+    /// ("discard Retry after processing a server packet") then dropped the
+    /// *genuine* Retry — a one-datagram handshake stall.
+    #[test]
+    fn forged_retry_does_not_block_the_genuine_one() {
+        let secret = [0x4cu8; 32];
+        let (mut c, mut s) = retry_loopback_pair(secret);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 4433);
+        s.set_peer_addr(addr);
+        s.set_now_secs(1_000);
+        c.set_peer_addr(addr);
+
+        let first = c.pop_datagram();
+        s.feed_datagram_from(addr, &first).expect("server feed");
+        let retry_dg = s.pop_datagram();
+        assert!(!retry_dg.is_empty(), "server must emit a Retry");
+
+        // Off-path forgery: Retry-shaped, junk token, junk integrity tag.
+        let mut forged = alloc::vec![0xf0u8];
+        forged.extend_from_slice(&QUIC_V1.to_be_bytes());
+        forged.push(8);
+        forged.extend_from_slice(&[0x11u8; 8]);
+        forged.push(8);
+        forged.extend_from_slice(&[0xaau8; 8]);
+        forged.extend_from_slice(&[0x77u8; 40]);
+        c.feed_datagram(&forged).expect("forged Retry is dropped");
+        assert!(!c.retry_processed, "a bad integrity tag processes nothing");
+        assert!(
+            !c.peer_packet_seen,
+            "and must not count as a packet from the server"
+        );
+
+        // The genuine Retry still lands and the handshake completes.
+        c.feed_datagram(&retry_dg).expect("client retry");
+        assert!(c.retry_processed, "the genuine Retry must be accepted");
+        for _ in 0..8 {
+            loop {
+                let dg = c.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                s.feed_datagram_from(addr, &dg).expect("server feed");
+            }
+            loop {
+                let dg = s.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                c.feed_datagram(&dg).expect("client feed");
+            }
+            if c.is_handshake_complete() && s.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete() && s.is_handshake_complete());
+    }
+
     /// Test 10 — retry token expiry: an out-of-date token is silently
     /// dropped. The server set `now_secs = 1000` when minting; advancing
-    /// to `now_secs = 1000 + 301` (just past `MAX_TOKEN_AGE_SECS`) makes
+    /// past `MAX_TOKEN_AGE_SECS` makes
     /// any retried Initial unprocessable, and the connection stalls.
     #[test]
     fn retry_token_expired_drops_packet() {
@@ -9152,7 +9377,7 @@ mod tests {
         // Deliver Retry to the client.
         c.feed_datagram(&retry_dg).expect("client retry");
 
-        // Now jump the server's clock past MAX_TOKEN_AGE_SECS (300s).
+        // Now jump the server's clock past MAX_TOKEN_AGE_SECS.
         s.set_now_secs(1_000 + crate::quic::retry::MAX_TOKEN_AGE_SECS + 1);
 
         // Client re-emits its (token-bearing) Initial. The server's
