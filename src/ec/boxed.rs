@@ -12,6 +12,7 @@ use super::curves::CurveId;
 /// `id-ecPublicKey` (`1.2.840.10045.2.1`) — the PKCS#8 / SPKI algorithm OID for
 /// elliptic-curve keys. Defined locally because `ec` cannot depend on `x509`
 /// (which depends on `ec`).
+#[cfg(feature = "der")]
 const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
 use crate::bignum::{BoxedMontModulus, BoxedUint};
 use crate::ct::ConstantTimeEq;
