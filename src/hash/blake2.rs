@@ -152,6 +152,11 @@ impl Blake2bState {
     }
 
     /// Keyed init: the key is processed as a zero-padded first block.
+    ///
+    /// RFC 7693 §3.3 prepends that block only when `keylen > 0`; an empty key
+    /// must hash exactly like the unkeyed function of the same output length,
+    /// so the zero block is skipped (feeding it would add a whole extra
+    /// compression and change every digest).
     fn with_key(outlen: usize, key: &[u8]) -> Self {
         let mut s = Self::from_h(iv_from_param_b(&param_b(
             outlen as u8,
@@ -164,9 +169,12 @@ impl Blake2bState {
             0,
             0,
         )));
-        let mut block = [0u8; 128];
-        block[..key.len()].copy_from_slice(key);
-        s.update(&block);
+        if !key.is_empty() {
+            let mut block = [0u8; 128];
+            block[..key.len()].copy_from_slice(key);
+            s.update(&block);
+            super::zeroize::zero_bytes(&mut block);
+        }
         s
     }
 
@@ -350,6 +358,9 @@ impl Blake2sState {
     }
 
     /// Keyed init: the key is processed as a zero-padded first block.
+    ///
+    /// As for BLAKE2b, RFC 7693 §3.3 prepends that block only when
+    /// `keylen > 0`; an empty key must hash exactly like the unkeyed function.
     fn with_key(outlen: usize, key: &[u8]) -> Self {
         let mut s = Self::from_h(iv_from_param_s(&param_s(
             outlen as u8,
@@ -362,9 +373,12 @@ impl Blake2sState {
             0,
             0,
         )));
-        let mut block = [0u8; 64];
-        block[..key.len()].copy_from_slice(key);
-        s.update(&block);
+        if !key.is_empty() {
+            let mut block = [0u8; 64];
+            block[..key.len()].copy_from_slice(key);
+            s.update(&block);
+            super::zeroize::zero_bytes(&mut block);
+        }
         s
     }
 
@@ -531,6 +545,10 @@ pub struct Blake2bMac {
 impl Blake2bMac {
     /// A keyed BLAKE2b producing `out_len` bytes (1..=64); `key` ≤ 64 bytes.
     ///
+    /// An empty `key` gives exactly the unkeyed BLAKE2b of that output length
+    /// (RFC 7693 §3.3 prepends the key block only when `keylen > 0`), i.e. the
+    /// same value as [`new_unkeyed`](Self::new_unkeyed).
+    ///
     /// # Panics
     /// Panics if `out_len` is 0 or > 64, or if `key.len() > 64`. RFC 7693
     /// §2.5 restricts the digest length to that range; an out-of-range
@@ -632,6 +650,9 @@ pub struct Blake2sMac {
 
 impl Blake2sMac {
     /// A keyed BLAKE2s producing `out_len` bytes (1..=32); `key` ≤ 32 bytes.
+    ///
+    /// An empty `key` gives exactly the unkeyed BLAKE2s of that output length
+    /// (RFC 7693 §3.3 prepends the key block only when `keylen > 0`).
     ///
     /// # Panics
     /// Panics if `out_len` is 0 or > 32, or if `key.len() > 32`. RFC 7693
@@ -1007,6 +1028,38 @@ mod tests {
             out,
             from_hex::<32>("48a8997da407876b3d79c0d92325ad3b89cbb754d86ab71aee047ad345fd2c49")
         );
+    }
+
+    // RFC 7693 §3.3: the zero-padded key block is prepended only when
+    // `keylen > 0`. With an empty key the MAC must therefore be *exactly* the
+    // unkeyed hash of the same output length — an extra all-zero compression
+    // would make it a different function from every other BLAKE2.
+    #[test]
+    fn empty_key_mac_equals_unkeyed_hash() {
+        for msg in [b"".as_slice(), b"abc".as_slice(), &[0x5au8; 300][..]] {
+            let mut out = [0u8; 64];
+            let mut m = Blake2bMac::new(b"", 64);
+            m.update(msg);
+            m.finalize_into(&mut out);
+            assert_eq!(out, blake2b512(msg), "blake2b, msg len {}", msg.len());
+
+            // ... and the same value the unkeyed variable-length constructor gives.
+            let mut out2 = [0u8; 48];
+            let mut m = Blake2bMac::new(b"", 48);
+            m.update(msg);
+            m.finalize_into(&mut out2);
+            let mut want = [0u8; 48];
+            let mut u = Blake2bMac::new_unkeyed(48);
+            u.update(msg);
+            u.finalize_into(&mut want);
+            assert_eq!(out2, want, "blake2b-384, msg len {}", msg.len());
+
+            let mut out = [0u8; 32];
+            let mut m = Blake2sMac::new(b"", 32);
+            m.update(msg);
+            m.finalize_into(&mut out);
+            assert_eq!(out, blake2s256(msg), "blake2s, msg len {}", msg.len());
+        }
     }
 
     #[test]
