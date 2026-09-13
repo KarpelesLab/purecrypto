@@ -59,6 +59,16 @@ pub(crate) fn install_initial_keys(endpoint: &mut Endpoint, client_dcid: &[u8]) 
         Some(derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret));
 }
 
+/// Derives just the *receive* direction of the Initial keys for a client
+/// DCID, without installing anything (RFC 9001 §5.2). Lets a server open a
+/// first Initial under keys it has not yet committed to, so a forged packet
+/// cannot pin the connection's Initial keys to an attacker-chosen DCID —
+/// see `QuicConnection::commit_first_initial`.
+pub(crate) fn initial_rx_keys(client_dcid: &[u8]) -> crate::quic::crypto::DirKeys {
+    let (client_secret, _server_secret) = derive_initial_secrets(client_dcid);
+    derive_dir_keys(AeadAlg::Aes128Gcm, &client_secret)
+}
+
 /// Constructs a placeholder [`Endpoint`] with unset CIDs. The server's
 /// CIDs are filled in by [`set_cids_from_first_initial`] on receipt of
 /// the first client Initial.
@@ -152,6 +162,11 @@ struct Hosted {
     /// `by_cid` can drop the entries for CIDs the peer has retired instead of
     /// growing without bound (M-5).
     cids: Vec<ConnectionId>,
+    /// Pre-handshake connection IDs this connection answers to at `addr`:
+    /// the client's own first-Initial DCID and, after a Retry, the SCID it
+    /// was redirected to. Routed as `(addr, cid)` pairs, never by address
+    /// alone (M-3).
+    initial_cids: Vec<ConnectionId>,
 }
 
 /// A sans-I/O QUIC server that demultiplexes inbound UDP datagrams to per-peer
@@ -179,9 +194,20 @@ pub struct QuicServer {
     conns: HashMap<u64, Hosted>,
     /// Our issued local CIDs → connection id (primary routing table).
     by_cid: HashMap<ConnectionId, u64>,
-    /// Source address → connection id. Fallback used before a CID is associated
-    /// (e.g. a retransmitted first Initial still carrying the client's DCID).
+    /// Source address → connection id. Fallback for short-header packets
+    /// whose DCID we no longer recognise.
     by_addr: HashMap<SocketAddr, u64>,
+    /// `(source address, DCID)` → connection id, for the packets of a
+    /// handshake that has not yet installed a server-issued CID: a
+    /// retransmitted first Initial, a 0-RTT packet, or a retried Initial
+    /// addressed to the SCID of our Retry.
+    ///
+    /// M-3: this used to be `by_addr` alone, which meant an attacker who got
+    /// a forged Initial in first (or simply a second client behind the same
+    /// NAT) had the genuine client's Initials delivered into the wrong
+    /// connection. The DCID is part of the key, so a packet only reaches a
+    /// connection that has actually seen that CID.
+    by_initial: HashMap<(SocketAddr, ConnectionId), u64>,
     /// Connection-less datagrams (resets, Version Negotiation) awaiting send.
     pending: VecDeque<(SocketAddr, EcnCodepoint, Vec<u8>)>,
     next_id: u64,
@@ -217,6 +243,7 @@ impl QuicServer {
             conns: HashMap::new(),
             by_cid: HashMap::new(),
             by_addr: HashMap::new(),
+            by_initial: HashMap::new(),
             pending: VecDeque::new(),
             next_id: 0,
             now_secs: 0,
@@ -303,7 +330,7 @@ impl QuicServer {
             };
             if let Some(&id) = self.by_cid.get(&dcid) {
                 self.feed(id, from, ecn, datagram);
-            } else if let Some(&id) = self.by_addr.get(&from) {
+            } else if let Some(&id) = self.by_initial.get(&(from, dcid)) {
                 self.feed(id, from, ecn, datagram);
             } else if hdr.typ == LongType::Initial {
                 self.accept(from, ecn, datagram)?;
@@ -395,7 +422,7 @@ impl QuicServer {
     }
 
     fn feed(&mut self, id: u64, from: SocketAddr, ecn: EcnCodepoint, datagram: &[u8]) {
-        let (cids, prev_cids) = match self.conns.get_mut(&id) {
+        let (cids, prev_cids, initial_cids, prev_initial) = match self.conns.get_mut(&id) {
             Some(h) => {
                 // Per-packet decode/auth errors are non-fatal: drop the bad
                 // packet, keep the connection (RFC 9000 §5.2). A *fatal*
@@ -420,11 +447,25 @@ impl QuicServer {
                 }
                 let cids = h.conn.local_cids();
                 let prev = core::mem::replace(&mut h.cids, cids.clone());
-                (cids, prev)
+                // Pre-handshake routing keys: the client's own first-Initial
+                // DCID, plus the Retry SCID when one was issued. They drop
+                // out once the handshake completes (M-3).
+                let initial_cids = h.conn.pre_handshake_cids();
+                let prev_initial = core::mem::replace(&mut h.initial_cids, initial_cids.clone());
+                (cids, prev, initial_cids, prev_initial)
             }
             None => return,
         };
-        self.by_addr.insert(self.conns[&id].addr, id);
+        let addr = self.conns[&id].addr;
+        self.by_addr.insert(addr, id);
+        for old in prev_initial {
+            if !initial_cids.contains(&old) {
+                self.by_initial.retain(|(_, c), v| *v != id || *c != old);
+            }
+        }
+        for cid in initial_cids {
+            self.by_initial.insert((addr, cid), id);
+        }
         // M-5: forget the CIDs this connection has stopped answering to. A
         // peer that spams RETIRE_CONNECTION_ID makes us mint a replacement
         // each time; inserting cumulatively left every superseded CID in the
@@ -472,6 +513,7 @@ impl QuicServer {
                 conn,
                 addr: from,
                 cids: Vec::new(),
+                initial_cids: Vec::new(),
             },
         );
         self.by_addr.insert(from, id);
@@ -504,6 +546,7 @@ impl QuicServer {
             self.conns.remove(&id);
             self.by_cid.retain(|_, v| *v != id);
             self.by_addr.retain(|_, v| *v != id);
+            self.by_initial.retain(|_, v| *v != id);
         }
     }
 }
@@ -686,6 +729,55 @@ mod server_tests {
         assert!(
             srv.poll_transmit().is_none(),
             "no reflected Version Negotiation for a tiny datagram"
+        );
+    }
+
+    /// M-3 — a forged Initial from a spoofed source used to poison the
+    /// address-keyed routing fallback: the connection it allocated then
+    /// swallowed every later Initial from that address, so the genuine
+    /// client's handshake (keyed to a different DCID) could never complete.
+    /// Routing pre-handshake Initials by `(address, DCID)` keeps them apart.
+    #[test]
+    fn forged_initial_does_not_capture_a_later_client_from_the_same_address() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x55; 32]);
+        let (ca, sa) = (addr(41300), addr(443));
+
+        // An undecryptable Initial with an attacker-chosen DCID.
+        let mut forged = alloc::vec![0xc3u8];
+        forged.extend_from_slice(&QUIC_V1.to_be_bytes());
+        forged.push(8);
+        forged.extend_from_slice(&[0x77u8; 8]);
+        forged.push(8);
+        forged.extend_from_slice(&[0x88u8; 8]);
+        forged.push(0);
+        let body = MIN_INITIAL_DATAGRAM - (forged.len() + 2);
+        crate::quic::varint::encode(body as u64, &mut forged);
+        forged.extend(core::iter::repeat_n(0x5au8, body));
+        srv.recv(ca, EcnCodepoint::NotEct, &forged).unwrap();
+
+        // The genuine client, from the very same address.
+        let mut c = client(&cert);
+        for _ in 0..64 {
+            loop {
+                let d = c.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                srv.recv(ca, EcnCodepoint::NotEct, &d).unwrap();
+            }
+            while let Some((to, _ecn, d)) = srv.poll_transmit() {
+                if to == ca {
+                    let _ = c.feed_datagram_from(sa, &d);
+                }
+            }
+            if c.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            c.is_handshake_complete(),
+            "a forged Initial must not capture the genuine client's handshake"
         );
     }
 

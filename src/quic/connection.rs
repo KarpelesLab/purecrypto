@@ -92,8 +92,8 @@ use crate::quic::pkt::{
 use crate::quic::pn::{PnSpaceId, decode_packet_number, encode_packet_number_length};
 use crate::quic::retry::encode_addr as encode_retry_addr;
 use crate::quic::server::{
-    build_pending_endpoint, build_tls_engine as build_server_engine, install_initial_keys,
-    random_default_scid, set_cids_from_first_initial,
+    build_pending_endpoint, build_tls_engine as build_server_engine, initial_rx_keys,
+    install_initial_keys, random_default_scid, set_cids_from_first_initial,
 };
 use crate::quic::stream::StreamId;
 use crate::quic::streams::Streams;
@@ -2946,6 +2946,28 @@ impl QuicConnection {
             .unwrap_or_default()
     }
 
+    /// Server-side: the connection IDs a *pre-handshake* client packet may
+    /// still be addressed by — the DCID it chose for its first Initial and,
+    /// after a Retry, the SCID we told it to switch to. Neither is a CID we
+    /// issued through [`Self::local_cids`], so a [`QuicServer`] needs them to
+    /// route a retransmitted or retried Initial without falling back to
+    /// "whatever connection last used this source address" (M-3).
+    pub(crate) fn pre_handshake_cids(&self) -> Vec<ConnectionId> {
+        let mut out = Vec::new();
+        if self.role != Role::Server || self.handshake_complete {
+            return out;
+        }
+        if let Some(cid) = self.original_dcid {
+            out.push(cid);
+        }
+        if let Some(cid) = self.retry_scid
+            && !out.contains(&cid)
+        {
+            out.push(cid);
+        }
+        out
+    }
+
     /// The monotonic instant this connection was constructed — the `t=0`
     /// anchor for [`Self::next_timeout`] / [`Self::on_timeout`]. A
     /// [`QuicServer`] uses it to translate each hosted connection's
@@ -4043,6 +4065,55 @@ impl QuicConnection {
         Ok(false)
     }
 
+    /// Server-side: commits the state the client's first *authenticated*
+    /// Initial dictates — the Initial keys (RFC 9001 §5.2), the CID pair
+    /// (RFC 9000 §7.2), the original destination CID, both CID pools, and
+    /// the server-only transport parameters that echo them (§7.3).
+    ///
+    /// Called only after the packet's AEAD tag has verified, so an off-path
+    /// forgery cannot pin any of it (M-3).
+    fn commit_first_initial(&mut self, dcid: &[u8], scid: &[u8]) -> Result<(), Error> {
+        let peer_scid = ConnectionId::from_slice(scid).ok_or(Error::Decode)?;
+        let our_scid = if let Some(retry_scid) = self.retry_scid.as_ref() {
+            // Retry path: reuse the SCID we picked for the Retry packet. This
+            // is exactly `dcid` of the retried Initial; we use the stored
+            // value so the bookkeeping matches the Retry-time decision.
+            *retry_scid
+        } else {
+            // No-Retry path: reuse the SCID chosen at construction (so it
+            // matches the seq-0 stateless-reset token already advertised in
+            // our transport parameters) and capture the ODCID for the
+            // transport-param echo (RFC 9000 §7.3).
+            self.original_dcid = ConnectionId::from_slice(dcid);
+            self.pending_scid.unwrap_or_else(random_default_scid)
+        };
+        set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
+        install_initial_keys(&mut self.endpoint, dcid);
+        // Seed the local CID pool with our SCID at sequence 0, carrying the
+        // exact stateless-reset token we advertised in our transport
+        // parameters (RFC 9000 §10.3.1) so server and client agree on it.
+        if self.cid_local.is_none() {
+            self.cid_local = Some(CidPool::new(
+                our_scid,
+                self.our_params.stateless_reset_token,
+            ));
+        }
+        // Seed the remote CID pool with the peer's SCID at sequence 0, and
+        // propagate OUR advertised `active_connection_id_limit` (RFC 9000
+        // §5.1.1 / §18.2 — the cap applies to CIDs *the peer issues for us*,
+        // so it must match what we advertised, not the pool's default).
+        if self.cid_remote.is_none() {
+            let mut pool = CidPool::new(peer_scid, None);
+            pool.set_limit(our_active_cid_limit(&self.our_params));
+            self.cid_remote = Some(pool);
+        }
+        // Populate the ODCID + RetrySCID + ISCID transport params we
+        // advertise to the client. RFC 9000 §7.3: these are server-only
+        // fields that the client cross-checks against what it observed.
+        self.populate_server_only_tp();
+        Ok(())
+    }
+
     fn feed_long_header_packet(
         &mut self,
         datagram: &[u8],
@@ -4165,75 +4236,25 @@ impl QuicConnection {
         //   * No-Retry  → our SCID is a fresh random; ODCID = hdr.dcid.
         //   * Retry-yes → our SCID = retry_scid (set in maybe_emit_retry);
         //                  ODCID = original_dcid (set in maybe_emit_retry).
-        if self.role == Role::Server
+        //
+        // M-3: none of this is committed until the packet has been
+        // AEAD-opened. The keys derived from `hdr.dcid` are what decrypts the
+        // packet, so they are derived *into a local* and only installed —
+        // together with the CIDs, the ODCID and the transport-parameter echo
+        // they imply — once the tag verifies. Installing them up front let a
+        // single forged Initial from any source address pin this connection's
+        // Initial keys, CIDs and ODCID to an attacker-chosen DCID, which
+        // black-holes the genuine client's handshake.
+        let tentative_first_initial = self.role == Role::Server
             && level == Level::Initial
-            && self.endpoint.crypto.at(Level::Initial).rx.is_none()
-        {
-            let peer_scid = ConnectionId::from_slice(hdr.scid).ok_or(Error::Decode)?;
-            let our_scid = if let Some(retry_scid) = self.retry_scid.as_ref() {
-                // Retry path: reuse the SCID we picked for the Retry
-                // packet. This is exactly `hdr.dcid` of the retried
-                // Initial; we use the stored value so the bookkeeping
-                // matches the Retry-time decision exactly.
-                *retry_scid
-            } else {
-                // No-Retry path: reuse the SCID chosen at construction (so it
-                // matches the seq-0 stateless-reset token already advertised in
-                // our transport parameters) and capture the ODCID for the
-                // transport-param echo (RFC 9000 §7.3).
-                self.original_dcid = ConnectionId::from_slice(hdr.dcid);
-                self.pending_scid.unwrap_or_else(random_default_scid)
-            };
-            set_cids_from_first_initial(&mut self.endpoint, peer_scid, our_scid);
-            install_initial_keys(&mut self.endpoint, hdr.dcid);
-            // Seed the local CID pool with our SCID at sequence 0, carrying the
-            // exact stateless-reset token we advertised in our transport
-            // parameters (RFC 9000 §10.3.1) so server and client agree on it.
-            if self.cid_local.is_none() {
-                self.cid_local = Some(CidPool::new(
-                    our_scid,
-                    self.our_params.stateless_reset_token,
-                ));
-            }
-            // Seed the remote CID pool with the peer's SCID at sequence
-            // 0, and propagate OUR advertised
-            // `active_connection_id_limit` (RFC 9000 §5.1.1 / §18.2 —
-            // the cap applies to CIDs *the peer issues for us*, so it
-            // must match what we advertised, not the pool's default).
-            if self.cid_remote.is_none() {
-                let mut pool = CidPool::new(peer_scid, None);
-                pool.set_limit(our_active_cid_limit(&self.our_params));
-                self.cid_remote = Some(pool);
-            }
-            // Populate the ODCID + RetrySCID + ISCID transport params we
-            // advertise to the client. RFC 9000 §7.3: these are server-
-            // only fields that the client cross-checks against what it
-            // observed.
-            self.populate_server_only_tp();
-        }
-
-        // Client-side: the first long-header packet we receive carries
-        // the server's chosen SCID; from now on we use it as DCID. Also
-        // seed cid_remote (the server-issued CID pool).
-        if self.role == Role::Client
-            && self.cid_remote.is_none()
-            && let Some(peer_cid) = ConnectionId::from_slice(hdr.scid)
-        {
-            // Update the connection's DCID for outbound to the
-            // server's actual SCID (the engine has been writing
-            // `endpoint.cids.peer` into DCID since the first
-            // outbound; on first inbound we sync to the server's
-            // chosen SCID).
-            self.endpoint.cids.peer = peer_cid;
-            // Propagate OUR `active_connection_id_limit` to the pool
-            // bound (RFC 9000 §5.1.1). Without this, the pool's
-            // default of 2 would reject any third NEW_CONNECTION_ID
-            // the server emits per the limit we advertised, tearing
-            // down the connection with `IllegalParameter`.
-            let mut pool = CidPool::new(peer_cid, None);
-            pool.set_limit(our_active_cid_limit(&self.our_params));
-            self.cid_remote = Some(pool);
-        }
+            && self.endpoint.crypto.at(Level::Initial).rx.is_none();
+        let tentative_rx_keys = if tentative_first_initial {
+            // Reject a malformed SCID now, before spending an AEAD open on it.
+            ConnectionId::from_slice(hdr.scid).ok_or(Error::Decode)?;
+            Some(initial_rx_keys(hdr.dcid))
+        } else {
+            None
+        };
 
         // Compute the *total* packet length on the wire. For Initial /
         // Handshake / 0-RTT this is `payload_off + length` because
@@ -4259,15 +4280,20 @@ impl QuicConnection {
         if sample_end > pkt.len() {
             return Err(Error::Decode);
         }
-        // Borrow the rx keys for this level.
-        let dir_keys_ref = match self.endpoint.crypto.at(level).rx.as_ref() {
+        // Borrow the rx keys for this level — the not-yet-installed ones
+        // derived from this Initial's DCID when this is a server's first
+        // Initial (see `tentative_rx_keys`).
+        let dir_keys_ref = match tentative_rx_keys.as_ref() {
             Some(k) => k,
-            None => {
-                // Keys for this level aren't installed yet. RFC 9001
-                // §5.7 says we MAY buffer; Phase 4 simplification is to
-                // drop the packet (and the rest of the datagram).
-                return Ok(datagram.len());
-            }
+            None => match self.endpoint.crypto.at(level).rx.as_ref() {
+                Some(k) => k,
+                None => {
+                    // Keys for this level aren't installed yet. RFC 9001
+                    // §5.7 says we MAY buffer; Phase 4 simplification is to
+                    // drop the packet (and the rest of the datagram).
+                    return Ok(datagram.len());
+                }
+            },
         };
         let sample_arr: [u8; 16] = pkt[sample_start..sample_end]
             .try_into()
@@ -4332,6 +4358,44 @@ impl QuicConnection {
         // AEAD tag verified, so a forged packet cannot tear the
         // connection down (it is silently dropped above instead).
         check_reserved_bits(first_byte, true)?;
+
+        // M-3: the packet is authentic, so the CID state it dictates may now
+        // be committed — our Initial keys, the CID pair, the ODCID and the
+        // server-only transport parameters that echo it (RFC 9000 §7.3).
+        if tentative_rx_keys.is_some() {
+            self.commit_first_initial(hdr.dcid, hdr.scid)?;
+        }
+
+        // Client-side: the first long-header packet that AUTHENTICATES
+        // carries the server's chosen SCID; from now on we use it as DCID.
+        // Also seeds `cid_remote` (the server-issued CID pool).
+        //
+        // M-3: this used to run on the first long-header packet of *any*
+        // type, before header protection was even removed. A 90-byte forged
+        // Handshake-shaped datagram was therefore enough to pin `cids.peer`
+        // (and the seq-0 remote CID) to an attacker-chosen value, after
+        // which the genuine server's `initial_source_connection_id` failed
+        // the RFC 9000 §7.3 echo check and the handshake died. Only a packet
+        // that opened under keys the server proved it holds may move it.
+        if self.role == Role::Client
+            && self.cid_remote.is_none()
+            && let Some(peer_cid) = ConnectionId::from_slice(hdr.scid)
+        {
+            // Update the connection's DCID for outbound to the
+            // server's actual SCID (the engine has been writing
+            // `endpoint.cids.peer` into DCID since the first
+            // outbound; on first inbound we sync to the server's
+            // chosen SCID).
+            self.endpoint.cids.peer = peer_cid;
+            // Propagate OUR `active_connection_id_limit` to the pool
+            // bound (RFC 9000 §5.1.1). Without this, the pool's
+            // default of 2 would reject any third NEW_CONNECTION_ID
+            // the server emits per the limit we advertised, tearing
+            // down the connection with `IllegalParameter`.
+            let mut pool = CidPool::new(peer_cid, None);
+            pool.set_limit(our_active_cid_limit(&self.our_params));
+            self.cid_remote = Some(pool);
+        }
 
         // RFC 9001 §9.5 — per-key PN replay. A successfully-AEAD'd
         // packet with a PN we've already accepted under the same key
@@ -11713,6 +11777,89 @@ mod tests {
             rest = &rest[n..];
         }
         (long, rest.to_vec())
+    }
+
+    /// Builds a syntactically valid but undecryptable v1 long-header packet of
+    /// `typ`, padded so the whole datagram is `MIN_INITIAL_DATAGRAM` bytes (a
+    /// server discards anything smaller, RFC 9000 §14.1).
+    fn forged_long_header(typ: u8, dcid: &[u8; 8], scid: &[u8; 8]) -> Vec<u8> {
+        let mut out = alloc::vec![0xc0u8 | (typ << 4) | 0x03];
+        out.extend_from_slice(&QUIC_V1.to_be_bytes());
+        out.push(dcid.len() as u8);
+        out.extend_from_slice(dcid);
+        out.push(scid.len() as u8);
+        out.extend_from_slice(scid);
+        if typ == 0 {
+            out.push(0); // empty token (Initial only)
+        }
+        let header = out.len() + 2; // + the 2-byte Length varint
+        let body = MIN_INITIAL_DATAGRAM - header;
+        crate::quic::varint::encode(body as u64, &mut out);
+        out.extend(core::iter::repeat_n(0x55u8, body));
+        assert_eq!(out.len(), MIN_INITIAL_DATAGRAM);
+        out
+    }
+
+    /// M-3 — a client must not adopt a connection ID from a packet it has not
+    /// authenticated. The first long-header packet of *any* type used to
+    /// overwrite `cids.peer` and seed the remote CID pool before header
+    /// protection was even removed, so one forged datagram made the genuine
+    /// server's `initial_source_connection_id` fail the RFC 9000 §7.3 echo
+    /// check and killed the handshake.
+    #[test]
+    fn client_ignores_cids_from_an_unauthenticated_long_header() {
+        let (mut client, mut server) = loopback_pair();
+        let first = client.pop_datagram();
+        assert!(!first.is_empty());
+        // Off-path forgery, delivered before the server's flight.
+        let forged = forged_long_header(2, &[0x11; 8], &[0xAA; 8]);
+        client.feed_datagram(&forged).expect("forgery is dropped");
+        server.feed_datagram(&first).expect("server feed");
+        for _ in 0..8 {
+            loop {
+                let dg = server.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                client.feed_datagram(&dg).expect("client feed");
+            }
+            loop {
+                let dg = client.pop_datagram();
+                if dg.is_empty() {
+                    break;
+                }
+                server.feed_datagram(&dg).expect("server feed");
+            }
+            if client.is_handshake_complete() && server.is_handshake_complete() {
+                break;
+            }
+        }
+        assert!(
+            client.is_handshake_complete() && server.is_handshake_complete(),
+            "a forged long header must not disturb the handshake"
+        );
+    }
+
+    /// M-3 — the server side of the same rule: the first Initial installs
+    /// Initial keys, the CID pair, the ODCID and the transport-parameter echo
+    /// derived from an *unauthenticated* DCID. A forged Initial must leave
+    /// none of it behind, or the genuine client's Initial can never be
+    /// decrypted by this connection.
+    #[test]
+    fn server_ignores_keys_and_cids_from_an_unauthenticated_initial() {
+        let (mut client, mut server) = loopback_pair();
+        let forged = forged_long_header(0, &[0x22; 8], &[0xBB; 8]);
+        server.feed_datagram(&forged).expect("forgery is dropped");
+        assert!(
+            server.original_dcid().is_none(),
+            "a forged Initial must not pin the ODCID"
+        );
+        assert!(
+            server.local_cids().is_empty(),
+            "a forged Initial must not seed the CID pools"
+        );
+        drive_until_complete(&mut client, &mut server, 8);
+        assert!(client.is_handshake_complete() && server.is_handshake_complete());
     }
 
     /// A server that REQUIRES a client certificate, against a client that has
