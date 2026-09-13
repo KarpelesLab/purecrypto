@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6](https://github.com/KarpelesLab/purecrypto/compare/v0.8.5...v0.8.6) - 2026-09-13
+
+### Added
+
+- *(falcon)* [**breaking**] verify without alloc; keep sign/keygen gated
+
+### Fixed
+
+- *(hash)* compile keccak_x4 only for ML-KEM, ML-DSA and SLH-DSA
+- *(key)* compile dispatch_key_hash only with ec or rsa
+- *(bignum)* compile is_safe_prime_boxed only for dh and tests
+- *(hash)* compile the multi-buffer kernels only for their consumers
+- *(cipher)* build and test cleanly without kdf, hash or alloc
+
+### Other
+
+- check clippy and rustdoc on every feature built on its own
+- *(cli)* make the cli feature enable mldsa and slhdsa
+- *(ec)* keep hazmat-edwards25519's ristretto255 links resolvable
+- *(mldsa)* gate the hazmat packing tests on alloc
+- keep intra-doc links resolvable in lean feature builds
+- *(zkp)* gate the Vec-based zkp test suites on alloc
+- *(tls)* gate tests on the features they exercise
+- *(pkcs12)* gate the /tmp interop dump on std
+- *(hpke)* gate the key-schedule tests on alloc
+- *(ascon)* gate the SP 800-232 KAT suites on alloc
+- *(xmss)* gate the signing doctest on alloc
+- *(mlkem)* make the polynomial tests build without alloc
+- *(rsa)* gate the encrypted-PKCS#8 round trips on kdf
+- *(ec)* gate der- and std-dependent ec tests on those features
+- *(kdf)* make kdf tests build without alloc
+- *(zeroize)* run the Zeroizing<Vec<u8>> doctest only with alloc
+- *(rng)* compile host_fill's native tests only with alloc
+- let the shared hex decoders be unused in lean builds
+- *(examples)* declare required-features for every example
+
 ## [0.8.5](https://github.com/KarpelesLab/purecrypto/compare/v0.8.4...v0.8.5) - 2026-09-13
 
 ### Added
