@@ -157,39 +157,65 @@ pub(crate) fn sign_internal<R: SamplerRng>(
     let inv_q = Fpr::from_f64(1.0).div(Fpr::of_i64(super::Q as i64));
     let neg_inv_q = inv_q.neg();
 
+    let mut result = None;
     for _ in 0..MAX_SIGN_ATTEMPTS {
         // Target: t0 = c·d/q, t1 = −c·b/q (FFT domain).
-        let pd = mul_fft(&point_fft, &key.d);
-        let t0: Vec<Cplx> = pd.iter().map(|z| z.scale(inv_q)).collect();
-        let pb = mul_fft(&point_fft, &key.b);
-        let t1: Vec<Cplx> = pb.iter().map(|z| z.scale(neg_inv_q)).collect();
+        let mut pd = mul_fft(&point_fft, &key.d);
+        let mut t0: Vec<Cplx> = pd.iter().map(|z| z.scale(inv_q)).collect();
+        let mut pb = mul_fft(&point_fft, &key.b);
+        let mut t1: Vec<Cplx> = pb.iter().map(|z| z.scale(neg_inv_q)).collect();
 
-        let (z0, z1) = ff_sampling(&key.fft, &t0, &t1, &key.tree, key.sigmin, rng);
+        let (mut z0, mut z1) = ff_sampling(&key.fft, &t0, &t1, &key.tree, key.sigmin, rng);
 
         // v = z·B; s = (c, 0) − v.
-        let v0 = key
+        let mut v0 = key
             .fft
             .ifft(&add_fft(&mul_fft(&z0, &key.a), &mul_fft(&z1, &key.c)));
-        let v1 = key
+        let mut v1 = key
             .fft
             .ifft(&add_fft(&mul_fft(&z0, &key.b), &mul_fft(&z1, &key.d)));
-        let s0: Vec<i64> = (0..n).map(|i| c[i] as i64 - v0[i].rint()).collect();
-        let s1: Vec<i64> = (0..n).map(|i| -v1[i].rint()).collect();
+        let mut s0: Vec<i64> = (0..n).map(|i| c[i] as i64 - v0[i].rint()).collect();
+        let mut s1: Vec<i64> = (0..n).map(|i| -v1[i].rint()).collect();
 
         let norm: u64 = s0.iter().chain(s1.iter()).map(|&x| (x * x) as u64).sum();
-        if norm > sig_bound {
-            continue;
+        if norm <= sig_bound {
+            let mut s1_i16: Vec<i16> = s1.iter().map(|&x| x as i16).collect();
+            let enc = compress(&s1_i16, slen);
+            for x in s1_i16.iter_mut() {
+                *x = 0;
+            }
+            let _ = core::hint::black_box(&s1_i16);
+            if let Some(enc) = enc {
+                let mut out = Vec::with_capacity(key.degree.sig_len());
+                out.push(0x30 | logn); // padded format header
+                out.extend_from_slice(salt);
+                out.extend_from_slice(&enc);
+                result = Some(out);
+            }
         }
-        let s1_i16: Vec<i16> = s1.iter().map(|&x| x as i16).collect();
-        if let Some(enc) = compress(&s1_i16, slen) {
-            let mut out = Vec::with_capacity(key.degree.sig_len());
-            out.push(0x30 | logn); // padded format header
-            out.extend_from_slice(salt);
-            out.extend_from_slice(&enc);
-            return Some(out);
+
+        // Every buffer above is a function of the secret basis: `t0`/`t1` are
+        // the target expressed in it, `z0`/`z1` the sampled lattice point,
+        // `v0`/`v1` = z·B, and `s0`/`s1` a rejected (or accepted) short vector.
+        // The accepted `s1` survives only inside the compressed signature; none
+        // of the raw buffers may be freed in the clear, on any exit path.
+        for v in [&mut pd, &mut pb, &mut t0, &mut t1, &mut z0, &mut z1] {
+            wipe_cplx(v);
+        }
+        for v in [&mut v0, &mut v1] {
+            wipe_fpr(v);
+        }
+        for v in [&mut s0, &mut s1] {
+            for x in v.iter_mut() {
+                *x = 0;
+            }
+            let _ = core::hint::black_box(&*v);
+        }
+        if result.is_some() {
+            break;
         }
     }
-    None
+    result
 }
 
 #[cfg(test)]

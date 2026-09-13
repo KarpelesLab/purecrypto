@@ -12,8 +12,8 @@
 //! Key generation is one-time and operates on fresh, non-secret-dependent
 //! entropy, so it favors clarity over constant-time.
 
-use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft};
-use super::fpr::Fpr;
+use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, wipe_cplx};
+use super::fpr::{Fpr, wipe_fpr};
 use super::sampler::{SamplerRng, sampler_z};
 use super::zint::{Zint, ext_gcd};
 use alloc::vec::Vec;
@@ -109,19 +109,36 @@ fn negacyclic_interp(
 pub(crate) fn recompute_g(f: &[i64], g: &[i64], cap_f: &[i64], n: usize) -> Vec<i64> {
     let fft = Fft::new(n);
     let to_fpr = |p: &[i64]| -> Vec<Fpr> { p.iter().map(|&c| Fpr::of_i64(c)).collect() };
-    let f_fft = fft.fft(&to_fpr(f));
-    let g_fft = fft.fft(&to_fpr(g));
-    let cf_fft = fft.fft(&to_fpr(cap_f));
+    // Bind the coefficient copies so they can be wiped: each is a verbatim
+    // copy of a secret polynomial and would otherwise be freed in the clear.
+    let (mut ff, mut gf_c, mut cff) = (to_fpr(f), to_fpr(g), to_fpr(cap_f));
+    let mut f_fft = fft.fft(&ff);
+    let mut g_fft = fft.fft(&gf_c);
+    let mut cf_fft = fft.fft(&cff);
     let qf = Fpr::of_i64(Q);
     // num = q + g·F (the constant polynomial q has FFT equal to q everywhere).
-    let num: Vec<Cplx> = (0..n)
+    let mut num: Vec<Cplx> = (0..n)
         .map(|i| {
             let gf = g_fft[i].mul(cf_fft[i]);
             Cplx::new(gf.re.add(qf), gf.im)
         })
         .collect();
-    let g_cap_fft = div_fft(&num, &f_fft);
-    fft.ifft(&g_cap_fft).iter().map(|x| x.rint()).collect()
+    let mut g_cap_fft = div_fft(&num, &f_fft);
+    let mut out_fpr = fft.ifft(&g_cap_fft);
+    let out: Vec<i64> = out_fpr.iter().map(|x| x.rint()).collect();
+    for v in [
+        &mut f_fft,
+        &mut g_fft,
+        &mut cf_fft,
+        &mut num,
+        &mut g_cap_fft,
+    ] {
+        wipe_cplx(v);
+    }
+    for v in [&mut ff, &mut gf_c, &mut cff, &mut out_fpr] {
+        wipe_fpr(v);
+    }
+    out
 }
 
 /// Verify the NTRU equation `f·G − g·F ≡ q (mod xⁿ+1)` exactly over ℤ.
@@ -328,21 +345,28 @@ fn gen_poly<R: SamplerRng>(n: usize, rng: &mut R) -> Vec<i64> {
     let sigmin = Fpr::from_f64(1.43300980528773 - 0.001);
     let zero = Fpr::from_f64(0.0);
     let total = 4096;
-    let samples: Vec<i64> = (0..total)
+    let mut samples: Vec<i64> = (0..total)
         .map(|_| sampler_z(zero, SIGMA_FG, sigmin, rng))
         .collect();
     let k = total / n;
-    (0..n)
+    let out: Vec<i64> = (0..n)
         .map(|i| (0..k).map(|j| samples[i * k + j]).sum())
-        .collect()
+        .collect();
+    // `samples` is the raw Gaussian material the secret polynomial is the sum
+    // of — strictly more information about the key than the key itself.
+    for s in samples.iter_mut() {
+        *s = 0;
+    }
+    let _ = core::hint::black_box(&samples);
+    out
 }
 
 /// Squared Gram-Schmidt norm of the NTRU basis `[[g, −f], [G, −F]]`
 /// (spec Alg. 5 line 9), in the emulated FFT.
 fn gs_norm(f: &[i64], g: &[i64], n: usize) -> Fpr {
     let fft = Fft::new(n);
-    let ff: Vec<Fpr> = f.iter().map(|&c| Fpr::of_i64(c)).collect();
-    let gf: Vec<Fpr> = g.iter().map(|&c| Fpr::of_i64(c)).collect();
+    let mut ff: Vec<Fpr> = f.iter().map(|&c| Fpr::of_i64(c)).collect();
+    let mut gf: Vec<Fpr> = g.iter().map(|&c| Fpr::of_i64(c)).collect();
 
     let sqnorm_fg = {
         let mut s = Fpr::from_f64(0.0);
@@ -353,22 +377,31 @@ fn gs_norm(f: &[i64], g: &[i64], n: usize) -> Fpr {
         s
     };
 
-    let f_fft = fft.fft(&ff);
-    let g_fft = fft.fft(&gf);
+    let mut f_fft = fft.fft(&ff);
+    let mut g_fft = fft.fft(&gf);
     // ffgg = f·adj(f) + g·adj(g).
-    let ffgg = add_fft(
+    let mut ffgg = add_fft(
         &mul_fft(&f_fft, &adj_fft(&f_fft)),
         &mul_fft(&g_fft, &adj_fft(&g_fft)),
     );
     // Ft = adj(g)/ffgg, Gt = adj(f)/ffgg, then back to coefficients.
-    let ft = fft.ifft(&div_fft(&adj_fft(&g_fft), &ffgg));
-    let gt = fft.ifft(&div_fft(&adj_fft(&f_fft), &ffgg));
+    let mut ft = fft.ifft(&div_fft(&adj_fft(&g_fft), &ffgg));
+    let mut gt = fft.ifft(&div_fft(&adj_fft(&f_fft), &ffgg));
     let mut s_ftgt = Fpr::from_f64(0.0);
     for c in ft.iter().chain(gt.iter()) {
         s_ftgt = s_ftgt.add(c.mul(*c));
     }
     let qsq = Fpr::of_i64(Q * Q);
     let sqnorm_cap = qsq.mul(s_ftgt);
+
+    // Only the scalar norm leaves; every array here is the secret basis (or an
+    // invertible function of it) and must not be freed in the clear.
+    for v in [&mut f_fft, &mut g_fft, &mut ffgg] {
+        wipe_cplx(v);
+    }
+    for v in [&mut ff, &mut gf, &mut ft, &mut gt] {
+        wipe_fpr(v);
+    }
 
     if sqnorm_fg.lt(sqnorm_cap) {
         sqnorm_cap

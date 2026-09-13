@@ -136,6 +136,9 @@ pub(crate) fn public_key_scalar(t: LmotsType, i_id: &[u8; 16], seed: &[u8; N], q
         }
         k_hash.update(&tmp);
     }
+    // `tmp` last held a chain end (public), but it walked through every private
+    // element `x[chain]` on the way; wipe it once, outside the hash loops.
+    super::wipe(&mut tmp);
     k_hash.finalize()
 }
 
@@ -341,6 +344,10 @@ pub(crate) fn sign(
         let off = 4 + N + chain * N;
         out[off..off + N].copy_from_slice(&tmp);
     }
+    // Each iteration loaded the private element `x[chain]` into `tmp` before
+    // walking it forward `a` steps; the last one is still there. Wipe once per
+    // signature rather than inside the per-hash loop.
+    super::wipe(&mut tmp);
 }
 
 /// Computes the LM-OTS public-key candidate `Kc` from a signature and message

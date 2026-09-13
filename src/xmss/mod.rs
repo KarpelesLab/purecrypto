@@ -319,17 +319,25 @@ mod wots_x8 {
 
         let steps = p.wots_w - 1;
         let mut c0 = 0usize;
+        // The lane buffers are declared once and reused (never shadowed inside
+        // the step loop) so that every copy of a secret chain value lives in
+        // memory that is wiped before this function returns.
+        let mut inout = [[0u8; N]; L];
+        let mut keyb1 = [[0u8; 64]; L];
+        let mut bmb1 = [[0u8; 64]; L];
+        let mut fb0 = [[0u8; 64]; L];
+        let mut fb1 = [[0u8; 64]; L];
+        let mut ks = [prf_mid; L];
+        let mut bs = [prf_mid; L];
+        let mut fs = [H256; L];
         while c0 < p.wots_len {
             let lanes = (p.wots_len - c0).min(L);
-            let mut inout = [[0u8; N]; L];
             for (l, io) in inout.iter_mut().enumerate().take(lanes) {
                 io.copy_from_slice(&pk[(c0 + l) * N..(c0 + l) * N + N]);
             }
 
             for step in 0..steps {
                 // KEY = PRF(.., keyAndMask=0); BM = PRF(.., keyAndMask=1).
-                let mut keyb1 = [[0u8; 64]; L];
-                let mut bmb1 = [[0u8; 64]; L];
                 for l in 0..L {
                     let chain = if l < lanes { c0 + l } else { c0 };
                     let mut a = *addr;
@@ -340,14 +348,13 @@ mod wots_x8 {
                     a.set_key_and_mask(1);
                     bmb1[l] = block1_96(&a.to_bytes());
                 }
-                let mut ks = [prf_mid; L];
+                ks = [prf_mid; L];
                 compress(&mut ks, &keyb1);
-                let mut bs = [prf_mid; L];
+                bs = [prf_mid; L];
                 compress(&mut bs, &bmb1);
 
                 // F(KEY, inout ⊕ BM) = SHA-256(toByte(0,32) ‖ KEY ‖ masked).
-                let mut fb0 = [[0u8; 64]; L];
-                let mut fb1 = [[0u8; 64]; L];
+                fb0 = [[0u8; 64]; L];
                 for l in 0..L {
                     let key = state_be(&ks[l]);
                     let bm = state_be(&bs[l]);
@@ -357,8 +364,9 @@ mod wots_x8 {
                         masked[j] = inout[l][j] ^ bm[j];
                     }
                     fb1[l] = block1_96(&masked);
+                    super::wipe(&mut masked);
                 }
-                let mut fs = [H256; L];
+                fs = [H256; L];
                 compress(&mut fs, &fb0);
                 compress(&mut fs, &fb1);
                 for (l, io) in inout.iter_mut().enumerate().take(lanes) {
@@ -370,6 +378,21 @@ mod wots_x8 {
                 pk[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(io);
             }
             c0 += lanes;
+        }
+        // `inout` held the secret chain starts and every intermediate, `fb1`
+        // the masked chain values, and `fs` the hash state over them. Only the
+        // chain *ends* were copied out, so wipe the rest rather than leave it
+        // on the stack. (`keyb1`/`bmb1`/`ks`/`bs`/`fb0` derive only from the
+        // public PUB_SEED and address, but wiping them too costs nothing.)
+        super::wipe(inout.as_flattened_mut());
+        for b in [&mut keyb1, &mut bmb1, &mut fb0, &mut fb1] {
+            super::wipe(b.as_flattened_mut());
+        }
+        for s in [&mut ks, &mut bs, &mut fs] {
+            for w in s.as_flattened_mut() {
+                *w = 0;
+            }
+            let _ = core::hint::black_box(&*s);
         }
     }
 
@@ -436,6 +459,12 @@ mod wots_x8 {
             for (l, st) in states.iter().enumerate().take(lanes) {
                 out[(c0 + l) * N..(c0 + l) * N + N].copy_from_slice(&state_be(st));
             }
+            // `states` *is* the WOTS+ secret chain starts (the caller keeps its
+            // own copy in `out`); the padding lanes hold a duplicate of one.
+            for w in states.as_flattened_mut() {
+                *w = 0;
+            }
+            let _ = core::hint::black_box(&states);
             c0 += lanes;
         }
 

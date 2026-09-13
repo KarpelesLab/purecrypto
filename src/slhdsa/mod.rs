@@ -467,7 +467,13 @@ mod wots_shake_x4 {
         let mut x = KeccakXn::<L>::new(RATE, refs, 0x1F);
         let mut blocks = [[0u8; MAX_RATE]; L];
         x.squeeze_blocks(&mut blocks);
-        core::array::from_fn(|l| blocks[l][..N].try_into().unwrap())
+        let out: [[u8; N]; L] = core::array::from_fn(|l| blocks[l][..N].try_into().unwrap());
+        // The absorbed messages carry SK.seed (PRF) or a secret chain value
+        // (F), so the sponge state and the squeezed rate blocks are secret
+        // too — the caller only ever keeps the first N bytes. `KeccakXn` wipes
+        // its own state in `Drop`; the squeezed blocks are wiped here.
+        super::wipe(blocks.as_flattened_mut());
+        out
     }
 
     /// Fills `tmp` with the per-chain secret start values `PRF(pk_seed,

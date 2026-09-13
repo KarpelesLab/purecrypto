@@ -79,10 +79,14 @@ pub(crate) fn gram(b: &[[Vec<Cplx>; 2]; 2]) -> Gram {
             // G[i][j] = Σ_k B[i][k] · adj(B[j][k]).
             let mut acc = vec_zero(b[0][0].len());
             for k in 0..2 {
-                let term = mul_fft(&b[i][k], &adj_fft(&b[j][k]));
-                for (a, t) in acc.iter_mut().zip(term) {
-                    *a = a.add(t);
+                let mut adj = adj_fft(&b[j][k]);
+                let mut term = mul_fft(&b[i][k], &adj);
+                for (a, t) in acc.iter_mut().zip(term.iter()) {
+                    *a = a.add(*t);
                 }
+                // Both are products of secret basis polynomials.
+                wipe_cplx(&mut term);
+                wipe_cplx(&mut adj);
             }
             *gij = acc;
         }
@@ -102,22 +106,25 @@ fn vec_zero(m: usize) -> Vec<Cplx> {
 pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
     let m = g[0][0].len();
     // LDL*: D00 = G00; L10 = G10 / G00; D11 = G11 − L10·adj(L10)·G00.
-    let d00 = g[0][0].clone();
+    let mut d00 = g[0][0].clone();
     let l10 = div_fft(&g[1][0], &g[0][0]);
-    let tmp = mul_fft(&mul_fft(&l10, &adj_fft(&l10)), &g[0][0]);
-    let d11 = sub_fft(&g[1][1], &tmp);
+    let mut adj_l10 = adj_fft(&l10);
+    let mut tmp = mul_fft(&mul_fft(&l10, &adj_l10), &g[0][0]);
+    let mut d11 = sub_fft(&g[1][1], &tmp);
 
-    if m > 2 {
+    let node = if m > 2 {
         // Bisect each diagonal block and recurse.
         let (d00a, d00b) = fft.split_fft(&d00);
         let (d11a, d11b) = fft.split_fft(&d11);
-        let g0: Gram = [[d00a.clone(), d00b.clone()], [adj_fft(&d00b), d00a]];
-        let g1: Gram = [[d11a.clone(), d11b.clone()], [adj_fft(&d11b), d11a]];
-        FftTree::Node {
-            l10,
-            left: Box::new(ffldl(fft, &g0, sigma)),
-            right: Box::new(ffldl(fft, &g1, sigma)),
-        }
+        let mut g0: Gram = [[d00a.clone(), d00b.clone()], [adj_fft(&d00b), d00a]];
+        let mut g1: Gram = [[d11a.clone(), d11b.clone()], [adj_fft(&d11b), d11a]];
+        let left = Box::new(ffldl(fft, &g0, sigma));
+        let right = Box::new(ffldl(fft, &g1, sigma));
+        // The bisected diagonal blocks are as key-equivalent as the tree they
+        // build; only the tree itself (wiped by `FftTree::wipe`) may survive.
+        wipe_gram(&mut g0);
+        wipe_gram(&mut g1);
+        FftTree::Node { l10, left, right }
     } else {
         // m == 2: the two diagonal entries become normalized leaves.
         let leaf0 = sigma.div(d00[0].re.sqrt());
@@ -127,7 +134,11 @@ pub(crate) fn ffldl(fft: &Fft, g: &Gram, sigma: Fpr) -> FftTree {
             left: Box::new(FftTree::Leaf(leaf0)),
             right: Box::new(FftTree::Leaf(leaf1)),
         }
+    };
+    for v in [&mut d00, &mut d11, &mut tmp, &mut adj_l10] {
+        wipe_cplx(v);
     }
+    node
 }
 
 /// Fast-Fourier sampling: given the target `(t0, t1)` (length-`m` FFT arrays)
@@ -153,15 +164,25 @@ pub(crate) fn ff_sampling<R: SamplerRng>(
         }
         FftTree::Node { l10, left, right } => {
             // Sample the second coordinate first (split → recurse → merge).
-            let (t1a, t1b) = fft.split_fft(t1);
-            let (z1a, z1b) = ff_sampling(fft, &t1a, &t1b, right, sigmin, rng);
+            let (mut t1a, mut t1b) = fft.split_fft(t1);
+            let (mut z1a, mut z1b) = ff_sampling(fft, &t1a, &t1b, right, sigmin, rng);
             let z1 = fft.merge_fft(&z1a, &z1b);
             // t0' = t0 + (t1 − z1)·L10.
-            let diff = sub_fft(t1, &z1);
-            let t0b = add_fft(t0, &mul_fft(&diff, l10));
-            let (t0a, t0bb) = fft.split_fft(&t0b);
-            let (z0a, z0b) = ff_sampling(fft, &t0a, &t0bb, left, sigmin, rng);
+            let mut diff = sub_fft(t1, &z1);
+            let mut t0b = add_fft(t0, &mul_fft(&diff, l10));
+            let (mut t0a, mut t0bb) = fft.split_fft(&t0b);
+            let (mut z0a, mut z0b) = ff_sampling(fft, &t0a, &t0bb, left, sigmin, rng);
             let z0 = fft.merge_fft(&z0a, &z0b);
+            // Every split half, sub-result and the L10-corrected target are
+            // functions of the secret basis and of the sampled lattice point;
+            // only the merged `(z0, z1)` leave this frame, so the rest is wiped
+            // rather than freed in the clear.
+            for v in [
+                &mut t1a, &mut t1b, &mut z1a, &mut z1b, &mut diff, &mut t0b, &mut t0a, &mut t0bb,
+                &mut z0a, &mut z0b,
+            ] {
+                wipe_cplx(v);
+            }
             (z0, z1)
         }
     }
