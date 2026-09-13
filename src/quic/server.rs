@@ -147,6 +147,28 @@ fn parse_long_invariant(buf: &[u8]) -> Option<(u32, &[u8], &[u8])> {
 /// capped here as well.
 pub const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
+/// Default value of [`QuicServer::max_half_open`].
+///
+/// A connection is *half-open* until its peer proves it receives at the
+/// source address it claimed — by sending a Handshake packet, or by
+/// returning a Retry token (RFC 9000 §8.1). Everything a half-open
+/// connection holds was allocated for an address that may not exist, so a
+/// source-address flood otherwise fills the whole `max_connections` table
+/// with state no legitimate peer will ever claim, and fills it faster than
+/// the idle timer empties it. Half-open connections get their own, much
+/// smaller budget, and the oldest is evicted to make room for a new arrival
+/// — so a flood costs an attacker a continuous packet rate and still leaves
+/// completed connections untouched.
+pub const DEFAULT_MAX_HALF_OPEN: usize = 1024;
+
+/// How long a connection may stay half-open before the server discards it.
+///
+/// Short by design: a real handshake finishes in a round trip or two. The
+/// per-connection idle timeout (30 s when neither side advertised one) is
+/// the wrong tool here — it is a *live connection's* timer, and waiting that
+/// long lets a spoofing peer keep 30 seconds' worth of arrivals resident.
+const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Cap on [`QuicServer`]'s queue of connection-less responses (stateless
 /// resets and Version Negotiation packets). The queue is fed by
 /// unauthenticated inbound datagrams, so it needs an explicit bound; a host
@@ -191,6 +213,8 @@ pub struct QuicServer {
     /// Hard cap on hosted connections. An unrecognised Initial arriving while
     /// the table is full is dropped rather than accepted (H-2).
     max_connections: usize,
+    /// Cap on connections whose peer address is still unvalidated (M-4).
+    max_half_open: usize,
     conns: HashMap<u64, Hosted>,
     /// Our issued local CIDs → connection id (primary routing table).
     by_cid: HashMap<ConnectionId, u64>,
@@ -240,6 +264,7 @@ impl QuicServer {
             make_config: Box::new(make_config),
             reset_key,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_half_open: DEFAULT_MAX_HALF_OPEN,
             conns: HashMap::new(),
             by_cid: HashMap::new(),
             by_addr: HashMap::new(),
@@ -268,6 +293,34 @@ impl QuicServer {
     /// peer that has proved nothing. Existing connections are never evicted.
     pub fn set_max_connections(&mut self, max: usize) {
         self.max_connections = max;
+    }
+
+    /// Number of hosted connections whose peer address is not yet validated
+    /// (RFC 9000 §8.1) — the state a source-address flood can create.
+    pub fn half_open_count(&self) -> usize {
+        self.conns.values().filter(|h| Self::is_half_open(h)).count()
+    }
+
+    /// The cap on simultaneously half-open connections. Defaults to
+    /// [`DEFAULT_MAX_HALF_OPEN`].
+    pub fn max_half_open(&self) -> usize {
+        self.max_half_open
+    }
+
+    /// Sets the cap on simultaneously half-open connections (M-4). Once it is
+    /// reached, accepting a new Initial evicts the *oldest* half-open
+    /// connection rather than refusing the new one: a flood of spoofed
+    /// Initials then costs an attacker a sustained packet rate and cannot
+    /// lock legitimate peers out, while connections that completed their
+    /// handshake are never touched.
+    pub fn set_max_half_open(&mut self, max: usize) {
+        self.max_half_open = max;
+    }
+
+    /// True while this connection's peer has proved nothing: no Handshake
+    /// packet, no Retry token, no completed handshake.
+    fn is_half_open(h: &Hosted) -> bool {
+        !h.conn.is_handshake_complete() && !h.conn.is_address_validated()
     }
 
     /// Sets the coarse wall-clock seconds source used for Retry-token minting
@@ -381,9 +434,17 @@ impl QuicServer {
         self.conns
             .values()
             .filter_map(|h| {
-                h.conn
-                    .next_timeout()
-                    .map(|d| (h.conn.started_at() + d).saturating_duration_since(now))
+                // M-4: a half-open connection also has its own, shorter
+                // deadline — the host must be woken for it even when the
+                // connection itself has no timer armed.
+                let half_open = Self::is_half_open(h).then_some(HALF_OPEN_TIMEOUT);
+                let conn = h.conn.next_timeout();
+                let deadline = match (conn, half_open) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (Some(a), None) => Some(a),
+                    (None, b) => b,
+                }?;
+                Some((h.conn.started_at() + deadline).saturating_duration_since(now))
             })
             .min()
     }
@@ -397,6 +458,9 @@ impl QuicServer {
             h.conn.on_timeout(elapsed);
         }
         self.reap_closed();
+        // M-4: half-open connections get a much shorter deadline than the
+        // connection-level idle timeout.
+        self.reap_half_open(now);
     }
 
     /// Iterates the hosted connections mutably, each paired with its peer
@@ -500,6 +564,18 @@ impl QuicServer {
                 return Ok(());
             }
         }
+        // M-4: bound the *half-open* population separately. Nothing about
+        // this Initial is authenticated — the source address may not even
+        // exist — so a flood of them must not be able to fill the whole
+        // connection table with state no peer will ever claim. Over the
+        // budget, the oldest unvalidated connection makes way for the new
+        // arrival; a validated or completed connection is never evicted.
+        if self.half_open_count() >= self.max_half_open {
+            self.reap_half_open(Instant::now());
+            if self.half_open_count() >= self.max_half_open && !self.evict_oldest_half_open() {
+                return Ok(());
+            }
+        }
         let mut cfg = (self.make_config)()?;
         cfg.reset_key = Some(self.reset_key);
         let mut conn = QuicConnection::server(cfg)?;
@@ -543,11 +619,55 @@ impl QuicServer {
             .map(|(&id, _)| id)
             .collect();
         for id in dead {
-            self.conns.remove(&id);
-            self.by_cid.retain(|_, v| *v != id);
-            self.by_addr.retain(|_, v| *v != id);
-            self.by_initial.retain(|_, v| *v != id);
+            self.remove_conn(id);
         }
+    }
+
+    /// M-4: drops every connection that has been half-open for longer than
+    /// [`HALF_OPEN_TIMEOUT`]. A handshake takes a round trip or two; anything
+    /// still unvalidated after ten seconds is a spoofed or abandoned
+    /// arrival, and waiting for the (much longer) idle timer to reach it
+    /// lets an attacker keep that many seconds of arrivals resident.
+    fn reap_half_open(&mut self, now: Instant) {
+        let dead: Vec<u64> = self
+            .conns
+            .iter()
+            .filter(|(_, h)| {
+                Self::is_half_open(h)
+                    && now.saturating_duration_since(h.conn.started_at()) >= HALF_OPEN_TIMEOUT
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for id in dead {
+            self.remove_conn(id);
+        }
+    }
+
+    /// Drops the oldest half-open connection, returning whether one was
+    /// found. Oldest-first: it is the one whose peer has had the longest to
+    /// prove itself and has not.
+    fn evict_oldest_half_open(&mut self) -> bool {
+        let victim = self
+            .conns
+            .iter()
+            .filter(|(_, h)| Self::is_half_open(h))
+            .min_by_key(|(_, h)| h.conn.started_at())
+            .map(|(&id, _)| id);
+        match victim {
+            Some(id) => {
+                self.remove_conn(id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes a hosted connection and every routing entry pointing at it.
+    fn remove_conn(&mut self, id: u64) {
+        self.conns.remove(&id);
+        self.by_cid.retain(|_, v| *v != id);
+        self.by_addr.retain(|_, v| *v != id);
+        self.by_initial.retain(|_, v| *v != id);
     }
 }
 
@@ -730,6 +850,100 @@ mod server_tests {
             srv.poll_transmit().is_none(),
             "no reflected Version Negotiation for a tiny datagram"
         );
+    }
+
+    /// M-4 — a spoofed-source Initial flood must not fill the connection
+    /// table with state no peer will ever claim. Half-open connections have
+    /// their own budget, and a new arrival evicts the oldest of them.
+    #[test]
+    fn half_open_connections_are_bounded_and_evicted_oldest_first() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x56; 32]);
+        srv.set_max_half_open(3);
+        assert_eq!(srv.max_half_open(), 3);
+        for i in 0..16u16 {
+            let mut c = client(&cert);
+            let dg = c.pop_datagram();
+            assert!(dg.len() >= MIN_INITIAL_DATAGRAM);
+            srv.recv(addr(42000 + i), EcnCodepoint::NotEct, &dg)
+                .unwrap();
+            // Never let the server's own flight validate anything.
+            while srv.poll_transmit().is_some() {}
+        }
+        assert_eq!(
+            srv.half_open_count(),
+            3,
+            "half-open state must stay inside its budget"
+        );
+        assert_eq!(srv.connection_count(), 3);
+    }
+
+    /// M-4 — a validated connection is never evicted to make room, and a
+    /// half-open one that goes quiet is reaped well before the idle timeout.
+    #[test]
+    fn half_open_eviction_spares_established_connections() {
+        let (_, cert) = server_identity();
+        let mut srv = server([0x57; 32]);
+        srv.set_max_half_open(1);
+        let (ca, sa) = (addr(42100), addr(443));
+        let mut c = client(&cert);
+        for _ in 0..64 {
+            loop {
+                let d = c.pop_datagram();
+                if d.is_empty() {
+                    break;
+                }
+                srv.recv(ca, EcnCodepoint::NotEct, &d).unwrap();
+            }
+            while let Some((to, _ecn, d)) = srv.poll_transmit() {
+                if to == ca {
+                    let _ = c.feed_datagram_from(sa, &d);
+                }
+            }
+            let server_done = srv
+                .connections_mut()
+                .next()
+                .is_some_and(|(_, conn)| conn.is_handshake_complete());
+            if c.is_handshake_complete() && server_done {
+                break;
+            }
+        }
+        assert!(c.is_handshake_complete());
+        assert_eq!(srv.half_open_count(), 0, "the handshake validated it");
+
+        // A flood of spoofed Initials now churns only half-open state.
+        for i in 0..8u16 {
+            let mut spoof = client(&cert);
+            let dg = spoof.pop_datagram();
+            srv.recv(addr(42200 + i), EcnCodepoint::NotEct, &dg).unwrap();
+            while srv.poll_transmit().is_some() {}
+        }
+        assert_eq!(srv.connection_count(), 2, "one established + one half-open");
+        assert!(
+            srv.connections_mut()
+                .any(|(a, conn)| a == ca && conn.is_handshake_complete()),
+            "the established connection survives the flood"
+        );
+
+        // And the survivor of the flood ages out on the half-open timer,
+        // long before the 30 s idle ceiling.
+        let past = Instant::now() - Duration::from_secs(11);
+        let ids: Vec<u64> = srv
+            .conns
+            .iter()
+            .filter(|(_, h)| QuicServer::is_half_open(h))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in ids {
+            srv.conns
+                .get_mut(&id)
+                .expect("hosted")
+                .conn
+                .set_start_for_test(past);
+        }
+        srv.on_timeout();
+        assert_eq!(srv.half_open_count(), 0, "half-open state must age out");
+        assert_eq!(srv.connection_count(), 1);
     }
 
     /// M-3 — a forged Initial from a spoofed source used to poison the

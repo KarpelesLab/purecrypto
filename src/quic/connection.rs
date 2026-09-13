@@ -2970,6 +2970,15 @@ impl QuicConnection {
             .unwrap_or_default()
     }
 
+    /// True once the peer has proven it receives at the address this
+    /// connection sends to — by completing the RFC 9000 §8.1 handshake far
+    /// enough to send a Handshake packet, or by returning a Retry token.
+    /// Until then the connection is *half-open*: everything it holds was
+    /// allocated for a peer that may not exist (a spoofed source address).
+    pub(crate) fn is_address_validated(&self) -> bool {
+        self.active_path.validated
+    }
+
     /// Server-side: the connection IDs a *pre-handshake* client packet may
     /// still be addressed by — the DCID it chose for its first Initial and,
     /// after a Retry, the SCID we told it to switch to. Neither is a CID we
