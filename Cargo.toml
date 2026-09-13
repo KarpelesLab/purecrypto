@@ -140,7 +140,7 @@ zkp-adaptor = ["hazmat-secp256k1", "hash", "rng"]
 # Pedersen commitments over secp256k1 plus the second generator H.
 zkp-pedersen = ["hazmat-secp256k1", "hash", "rng"]
 # Borromean-ring range proofs over Pedersen commitments (Confidential Assets).
-zkp-rangeproof = ["zkp-pedersen", "alloc"]
+zkp-rangeproof = ["zkp-pedersen"]
 # Asset surjection proofs (Confidential Assets).
 zkp-surjection = ["zkp-pedersen", "alloc"]
 # Half-aggregation of BIP340 Schnorr signatures.

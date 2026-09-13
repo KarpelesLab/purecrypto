@@ -121,8 +121,24 @@
 //!
 //! [`verify`] and [`info`] see only public data and are deliberately
 //! variable-time. They never panic: every byte string either parses or returns
-//! an error, and every peer-driven length is bounded before anything is
-//! allocated.
+//! an error, and every peer-driven length is bounded before any buffer is
+//! indexed.
+//!
+//! # Allocation
+//!
+//! This module needs **no allocator**. Every runtime length here is bounded by
+//! the proof layout — at most 32 rings of 4 members, so at most 128 ring
+//! members — and each scratch buffer is a fixed array of that size. A proof is
+//! at most [`MAX_PROOF_LEN`] bytes, so [`sign_into`] writes into a
+//! caller-supplied buffer and returns the length; [`sign`], which returns a
+//! [`Vec`], is a convenience behind the `alloc` feature. [`verify`], [`info`]
+//! and [`rewind`] already worked on byte slices and still do.
+//!
+//! The fixed arrays cost stack rather than heap: about 4 KiB for [`verify`],
+//! 19 KiB for [`sign_into`] and 21 KiB for [`rewind`], whatever the proof's
+//! actual shape. A typical 32-bit-mantissa proof needs half of that, so the
+//! ceiling is roughly a factor of two above the common case — the same data
+//! an allocator would otherwise have had to find on a heap.
 //!
 //! # Interop
 //!
@@ -156,7 +172,7 @@
 //! exponent/mantissa/`min_value` selection was cross-checked against the
 //! oracle over 7040 parameter combinations, including every rejection.
 
-use alloc::vec;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::ct::{
@@ -189,6 +205,26 @@ const MAX_EXP: i32 = 18;
 
 /// `ceil(64 / 2)`, the most rings a proof can have.
 const MAX_RINGS: usize = 32;
+
+/// The most ring members a proof can have: [`MAX_RINGS`] rings of four.
+///
+/// Every per-member scratch array is sized by this, so nothing here needs an
+/// allocator; at 128 slots the arrays are a few kilobytes, and the shape a
+/// typical 32-bit-mantissa proof uses is only half that.
+const MAX_NPUB: usize = 4 * MAX_RINGS;
+
+/// The most bytes [`rewind`] can hand back, `32·(MAX_NPUB − 2)`.
+///
+/// Larger than [`MAX_MESSAGE_LEN`] because the two slots a prover cannot use
+/// are the *last* ring's, and [`sign`] refuses that whole ring.
+const MAX_REWOUND_LEN: usize = 32 * (MAX_NPUB - 2);
+
+/// The most bytes a proof header can occupy: flags, mantissa and `min_value`.
+const MAX_HEADER_LEN: usize = 1 + 1 + 8;
+
+/// The most bytes the digit-commitment body can occupy: the packed sign bits
+/// of `MAX_RINGS − 1` commitments followed by their x-coordinates.
+const MAX_BODY_LEN: usize = (MAX_RINGS - 1).div_ceil(8) + 32 * (MAX_RINGS - 1);
 
 // =====================================================================
 // RFC 6979 HMAC-SHA256 DRBG
@@ -456,8 +492,10 @@ fn choose_params(
     }
 }
 
-/// Serializes the header bytes of a proof.
-fn write_header(out: &mut Vec<u8>, params: &Params) {
+/// Serializes the header bytes of a proof, returning the buffer and its used
+/// length.
+fn write_header(params: &Params) -> ([u8; MAX_HEADER_LEN], usize) {
+    let mut out = [0u8; MAX_HEADER_LEN];
     let mut flags = 0u8;
     if params.exp >= 0 {
         flags |= 0x40 | (params.exp as u8);
@@ -465,13 +503,17 @@ fn write_header(out: &mut Vec<u8>, params: &Params) {
     if params.min_value != 0 {
         flags |= 0x20;
     }
-    out.push(flags);
+    out[0] = flags;
+    let mut len = 1;
     if params.exp >= 0 {
-        out.push((params.mantissa - 1) as u8);
+        out[len] = (params.mantissa - 1) as u8;
+        len += 1;
     }
     if params.min_value != 0 {
-        out.extend_from_slice(&params.min_value.to_be_bytes());
+        out[len..len + 8].copy_from_slice(&params.min_value.to_be_bytes());
+        len += 8;
     }
+    (out, len)
 }
 
 /// Reads a proof header. Returns the parameters and the header length.
@@ -624,51 +666,80 @@ fn member_pubkey(
     }
 }
 
-/// Recovers the digit commitments from a proof body and returns them together
-/// with their 33-byte hash encodings.
+/// Recovers the first `count` digit commitments from a proof body into
+/// `points`, along with their 33-byte hash encodings in `encs`.
 ///
 /// `body` is the proof from the end of the header to the start of `e₀`.
 fn parse_digit_commitments(
     body: &[u8],
     count: usize,
     sign_bytes: usize,
-) -> Result<(Vec<ProjectivePoint>, Vec<[u8; 33]>), Error> {
-    let mut points = Vec::with_capacity(count);
-    let mut encs = Vec::with_capacity(count);
+    points: &mut [ProjectivePoint; MAX_RINGS],
+    encs: &mut [[u8; 33]; MAX_RINGS],
+) -> Result<(), Error> {
     for i in 0..count {
         let bit = (body[i / 8] >> (i % 8)) & 1;
         let mut tagged = [0u8; 33];
         tagged[0] = 0x08 | bit;
         tagged[1..].copy_from_slice(&body[sign_bytes + 32 * i..sign_bytes + 32 * (i + 1)]);
-        points.push(Commitment::parse(&tagged)?.as_point());
-        encs.push(point_enc(&tagged));
+        points[i] = Commitment::parse(&tagged)?.as_point();
+        encs[i] = point_enc(&tagged);
     }
-    Ok((points, encs))
+    Ok(())
 }
 
 /// The pieces of a parsed proof that both [`verify`] and [`rewind`] need.
-struct Parsed {
+///
+/// The ring member public keys are *not* stored: 128 of them would be 12 KiB,
+/// and every one is `Cᵢ − j·4ⁱ·scale·H`, derivable from its ring's digit
+/// commitment. [`Parsed::member`] recomputes one on demand, and each caller
+/// uses each member exactly once. The ring scalars likewise stay in the
+/// caller's proof buffer rather than being copied out.
+struct Parsed<'a> {
     params: Params,
     layout: Layout,
-    /// Ring member public keys, flat and ring-major.
-    pubs: Vec<ProjectivePoint>,
+    /// The per-ring digit commitments `Cᵢ`, the last one recovered rather than
+    /// carried by the proof.
+    digit_commits: [ProjectivePoint; MAX_RINGS],
+    /// The proof's generator, as a point.
+    gen_point: ProjectivePoint,
     /// The bound message every hash covers.
     message: [u8; 32],
     /// The shared Borromean challenge.
     e0: [u8; 32],
-    /// The ring scalars, flat and ring-major.
-    s: Vec<[u8; 32]>,
+    /// The ring scalars, flat and ring-major: `32·npub` bytes of the proof.
+    s: &'a [u8],
     /// The header bytes, for reseeding the DRBG on a rewind.
     header_len: usize,
 }
 
+impl Parsed<'_> {
+    /// Ring member `j` of ring `i`'s public key.
+    fn member(&self, i: usize, j: usize) -> ProjectivePoint {
+        member_pubkey(
+            &self.digit_commits[i],
+            j as u64,
+            i,
+            self.params.scale,
+            &self.gen_point,
+        )
+    }
+
+    /// The flat ring scalar at `slot`, `0 <= slot < layout.npub`.
+    fn scalar(&self, slot: usize) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&self.s[32 * slot..32 * (slot + 1)]);
+        out
+    }
+}
+
 /// Parses and structurally validates a proof, without checking the signature.
-fn parse(
+fn parse<'a>(
     commit: &Commitment,
-    proof: &[u8],
+    proof: &'a [u8],
     extra_commit: &[u8],
     generator: &Generator,
-) -> Result<Parsed, Error> {
+) -> Result<Parsed<'a>, Error> {
     let (params, header_len) = read_header(proof)?;
     let layout = Layout::new(params.mantissa);
     let (ncommit, sign_bytes) = layout.commitments();
@@ -692,13 +763,17 @@ fn parse(
     if !ncommit.is_multiple_of(8) && body[sign_bytes - 1] >> (ncommit % 8) != 0 {
         return Err(Error::Malformed);
     }
-    let (points, encs) = parse_digit_commitments(body, ncommit, sign_bytes)?;
+    // `ncommit <= MAX_RINGS - 1`, so the last ring's recovered commitment
+    // always has a slot.
+    let mut digit_commits = [ProjectivePoint::identity(); MAX_RINGS];
+    let mut encs = [[0u8; 33]; MAX_RINGS];
+    parse_digit_commitments(body, ncommit, sign_bytes, &mut digit_commits, &mut encs)?;
 
     let message = proof_message(
         &point_enc(&commit.serialize()),
         &point_enc(&generator.serialize()),
         &proof[..header_len],
-        &encs,
+        &encs[..ncommit],
         extra_commit,
     );
 
@@ -708,46 +783,32 @@ fn parse(
     if params.min_value != 0 {
         last = last.add(&gen_point.mul(&value_scalar(params.min_value)).negate());
     }
-    for point in &points {
+    for point in &digit_commits[..ncommit] {
         last = last.add(&point.negate());
     }
 
-    let mut digit_commits = points;
-    digit_commits.push(last);
-    if digit_commits.len() != layout.rings {
+    if ncommit + 1 != layout.rings {
         return Err(Error::Malformed);
     }
-
-    let mut pubs = Vec::with_capacity(layout.npub);
-    for (i, digit_commit) in digit_commits.iter().enumerate() {
-        for j in 0..layout.rsizes[i] {
-            pubs.push(member_pubkey(
-                digit_commit,
-                j as u64,
-                i,
-                params.scale,
-                &gen_point,
-            ));
-        }
-    }
+    digit_commits[ncommit] = last;
 
     let sig = &proof[header_len + body_len..];
     let e0: [u8; 32] = sig[..32].try_into().map_err(|_| Error::Malformed)?;
-    let mut s = Vec::with_capacity(layout.npub);
+    let s = &sig[32..32 + 32 * layout.npub];
     for i in 0..layout.npub {
-        let chunk: [u8; 32] = sig[32 + 32 * i..32 + 32 * (i + 1)]
+        let chunk: [u8; 32] = s[32 * i..32 * (i + 1)]
             .try_into()
             .map_err(|_| Error::Malformed)?;
         // Reject over-large scalars rather than reducing them, so a proof has
         // exactly one encoding.
         Scalar::from_bytes_be(&chunk).map_err(|_| Error::Malformed)?;
-        s.push(chunk);
     }
 
     Ok(Parsed {
         params,
         layout,
-        pubs,
+        digit_commits,
+        gen_point,
         message,
         e0,
         s,
@@ -757,21 +818,27 @@ fn parse(
 
 /// Replays the Borromean ring signature.
 ///
-/// Returns the per-member challenges `e_{i,j}` on success — [`rewind`] needs
-/// them to solve for the last ring's blinding share. Public data only, so this
-/// is variable time.
-fn borromean_verify(parsed: &Parsed) -> Result<Vec<[u8; 32]>, Error> {
+/// Writes the per-member challenges `e_{i,j}` into `challenges` when one is
+/// supplied — [`rewind`] needs them to solve for the last ring's blinding
+/// share, [`verify`] does not and passes `None` rather than reserving 4 KiB
+/// for them. Public data only, so this is variable time.
+fn borromean_verify(
+    parsed: &Parsed,
+    mut challenges: Option<&mut [[u8; 32]; MAX_NPUB]>,
+) -> Result<(), Error> {
     let layout = &parsed.layout;
-    let mut challenges = vec![[0u8; 32]; layout.npub];
     let mut e0h = Sha256::new();
     for i in 0..layout.rings {
         let start = layout.starts[i];
         let mut e = borromean_hash(&parsed.message, &parsed.e0, i as u32, 0);
         for j in 0..layout.rsizes[i] {
-            challenges[start + j] = e;
-            let s = Scalar::from_bytes_be(&parsed.s[start + j]).map_err(|_| Error::Malformed)?;
+            if let Some(out) = challenges.as_deref_mut() {
+                out[start + j] = e;
+            }
+            let s =
+                Scalar::from_bytes_be(&parsed.scalar(start + j)).map_err(|_| Error::Malformed)?;
             let scalar = Scalar::from_bytes_be_reduce(&e);
-            let r = ProjectivePoint::mul_generator(&s).add(&parsed.pubs[start + j].mul(&scalar));
+            let r = ProjectivePoint::mul_generator(&s).add(&parsed.member(i, j).mul(&scalar));
             let affine = r.to_affine().ok_or(Error::Verification)?;
             let ser = affine.to_sec1_compressed();
             if j + 1 < layout.rsizes[i] {
@@ -786,7 +853,7 @@ fn borromean_verify(parsed: &Parsed) -> Result<Vec<[u8; 32]>, Error> {
     if !bool::from(recomputed.ct_eq(&parsed.e0)) {
         return Err(Error::Verification);
     }
-    Ok(challenges)
+    Ok(())
 }
 
 // =====================================================================
@@ -838,7 +905,7 @@ pub fn verify(
     generator: &Generator,
 ) -> Result<(u64, u64), Error> {
     let parsed = parse(commit, proof, extra_commit, generator)?;
-    borromean_verify(&parsed)?;
+    borromean_verify(&parsed, None)?;
     Ok((parsed.params.min_value, parsed.params.max_value))
 }
 
@@ -877,6 +944,7 @@ pub fn verify(
 // The argument list mirrors `secp256k1_rangeproof_sign`; keeping the same
 // shape is what makes the interop corpus a line-for-line translation.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "alloc")]
 pub fn sign(
     commit: &Commitment,
     blind: &[u8; 32],
@@ -889,6 +957,54 @@ pub fn sign(
     extra_commit: &[u8],
     generator: &Generator,
 ) -> Result<Vec<u8>, Error> {
+    let mut out = alloc::vec![0u8; MAX_PROOF_LEN];
+    let len = sign_into(
+        commit,
+        blind,
+        nonce,
+        value,
+        min_value,
+        exp,
+        min_bits,
+        message,
+        extra_commit,
+        generator,
+        &mut out,
+    )?;
+    out.truncate(len);
+    Ok(out)
+}
+
+/// [`sign`] writing into a caller-supplied buffer instead of allocating.
+///
+/// `out` must be at least [`MAX_PROOF_LEN`] bytes — the proof's exact length
+/// depends on the shape [`sign`] picks, which is not known until it has run —
+/// and the number of bytes actually written is returned. Trailing bytes of
+/// `out` are left alone.
+///
+/// On any error `out` is left in an unspecified state. It never receives
+/// anything secret: what lands there is the proof, which is published.
+///
+/// # Errors
+/// As [`sign`], plus [`Error::InvalidInput`] if `out` is shorter than
+/// [`MAX_PROOF_LEN`].
+#[allow(clippy::too_many_arguments)]
+pub fn sign_into(
+    commit: &Commitment,
+    blind: &[u8; 32],
+    nonce: &[u8; 32],
+    value: u64,
+    min_value: u64,
+    exp: i32,
+    min_bits: u32,
+    message: &[u8],
+    extra_commit: &[u8],
+    generator: &Generator,
+    out: &mut [u8],
+) -> Result<usize, Error> {
+    if out.len() < MAX_PROOF_LEN {
+        return Err(Error::InvalidInput);
+    }
     let (params, mantissa_value) = choose_params(value, min_value, exp, min_bits)?;
     let layout = Layout::new(params.mantissa);
     let (ncommit, sign_bytes) = layout.commitments();
@@ -902,12 +1018,12 @@ pub fn sign(
         return Err(Error::InvalidInput);
     }
 
-    let mut proof = Vec::with_capacity(MAX_PROOF_LEN);
-    write_header(&mut proof, &params);
+    let (header_buf, header_len) = write_header(&params);
+    let header = &header_buf[..header_len];
 
     let commit_enc = point_enc(&commit.serialize());
     let generator_enc = point_enc(&generator.serialize());
-    let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, &proof);
+    let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, header);
     let mut rng = Drbg::new(&seed[..seed_len]);
     // The seed's first 32 bytes are the nonce.
     seed.zeroize();
@@ -918,11 +1034,11 @@ pub fn sign(
     // (the last ring's share is whatever balances the total), then one draw
     // per ring member. The draw at the member the prover knows becomes that
     // ring's Borromean nonce k; the rest are the forged scalars.
-    let mut sec = vec![[0u8; 32]; layout.rings];
-    let mut raw = vec![[0u8; 32]; layout.npub];
+    let mut sec = [[0u8; 32]; MAX_RINGS];
+    let mut raw = [[0u8; 32]; MAX_NPUB];
     let mut acc = Scalar::ZERO;
     let mut slot = 0;
-    for (i, share) in sec.iter_mut().enumerate() {
+    for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
         if i + 1 < layout.rings {
             let mut tmp = [0u8; 32];
             rng.generate(&mut tmp);
@@ -944,7 +1060,8 @@ pub fn sign(
     // occupies the leading slots; the last slot that is not the final ring's
     // known member carries the mantissa value, which is how `rewind` learns
     // the top digit it cannot derive from the digit commitments.
-    let mut prep = vec![0u8; 32 * layout.npub];
+    let mut prep_buf = [0u8; 32 * MAX_NPUB];
+    let prep = &mut prep_buf[..32 * layout.npub];
     prep[..message.len()].copy_from_slice(message);
     let last_ring = layout.rings - 1;
     let mut digits = [0u64; MAX_RINGS];
@@ -978,7 +1095,7 @@ pub fn sign(
         known.zeroize();
     }
 
-    let mut s = vec![[0u8; 32]; layout.npub];
+    let mut s = [[0u8; 32]; MAX_NPUB];
     for i in 0..layout.npub {
         for b in 0..32 {
             s[i][b] = raw[i][b] ^ prep[32 * i + b];
@@ -986,7 +1103,7 @@ pub fn sign(
     }
     // k_i is the draw at the member the prover knows, chosen without a
     // secret-dependent index.
-    let mut nonces = vec![[0u8; 32]; layout.rings];
+    let mut nonces = [[0u8; 32]; MAX_RINGS];
     for i in 0..layout.rings {
         let mut k = [0u8; 32];
         for j in 0..layout.rsizes[i] {
@@ -998,39 +1115,38 @@ pub fn sign(
 
     // --- digit commitments and ring public keys ----------------------
     let gen_point = generator.as_point();
-    let mut digit_commits = Vec::with_capacity(layout.rings);
+    let mut digit_commits = [ProjectivePoint::identity(); MAX_RINGS];
     for i in 0..layout.rings {
         let offset = value_scalar(member_offset(digits[i], i, params.scale));
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        digit_commits.push(
-            gen_point
-                .mul(&offset)
-                .add(&ProjectivePoint::mul_generator(&share)),
-        );
+        digit_commits[i] = gen_point
+            .mul(&offset)
+            .add(&ProjectivePoint::mul_generator(&share));
     }
-    let mut encs = Vec::with_capacity(ncommit);
-    let mut body = vec![0u8; sign_bytes + 32 * ncommit];
+    let mut encs = [[0u8; 33]; MAX_RINGS];
+    let mut body_buf = [0u8; MAX_BODY_LEN];
+    let body = &mut body_buf[..sign_bytes + 32 * ncommit];
     for (i, digit_commit) in digit_commits.iter().enumerate().take(ncommit) {
         let tagged = Commitment::from_point(digit_commit)?.serialize();
         body[i / 8] |= (tagged[0] & 1) << (i % 8);
         body[sign_bytes + 32 * i..sign_bytes + 32 * (i + 1)].copy_from_slice(&tagged[1..]);
-        encs.push(point_enc(&tagged));
+        encs[i] = point_enc(&tagged);
     }
 
-    let mut pubs = Vec::with_capacity(layout.npub);
-    for (i, digit_commit) in digit_commits.iter().enumerate() {
-        for j in 0..layout.rsizes[i] {
-            pubs.push(member_pubkey(
-                digit_commit,
-                j as u64,
-                i,
-                params.scale,
-                &gen_point,
-            ));
-        }
-    }
+    // Ring member keys are recomputed on demand rather than kept in a
+    // 128-entry table; see `Parsed::member` for the same trade in the
+    // verifier.
+    let member = |i: usize, j: usize| {
+        member_pubkey(&digit_commits[i], j as u64, i, params.scale, &gen_point)
+    };
 
-    let m = proof_message(&commit_enc, &generator_enc, &proof, &encs, extra_commit);
+    let m = proof_message(
+        &commit_enc,
+        &generator_enc,
+        header,
+        &encs[..ncommit],
+        extra_commit,
+    );
 
     // --- Borromean signature, forward pass ---------------------------
     //
@@ -1051,7 +1167,7 @@ pub fn sign(
                 let e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
                 let e = Scalar::from_bytes_be_reduce(&e);
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j + 1]);
-                r = ProjectivePoint::mul_generator(&sj).add(&pubs[start + j + 1].mul(&e));
+                r = ProjectivePoint::mul_generator(&sj).add(&member(i, j + 1).mul(&e));
             }
         }
         let affine = r.to_affine().ok_or(Error::InvalidInput)?;
@@ -1071,7 +1187,7 @@ pub fn sign(
             if j + 1 < layout.rsizes[i] {
                 let scalar = Scalar::from_bytes_be_reduce(&e);
                 let sj = Scalar::from_bytes_be_reduce(&s[start + j]);
-                let r = ProjectivePoint::mul_generator(&sj).add(&pubs[start + j].mul(&scalar));
+                let r = ProjectivePoint::mul_generator(&sj).add(&member(i, j).mul(&scalar));
                 e = borromean_hash(&m, &sec1(&r), i as u32, (j + 1) as u32);
             }
         }
@@ -1089,10 +1205,18 @@ pub fn sign(
         e_known.zeroize();
     }
 
-    proof.extend_from_slice(&body);
-    proof.extend_from_slice(&e0);
-    for chunk in &s {
-        proof.extend_from_slice(chunk);
+    let total = header.len() + body.len() + 32 + 32 * layout.npub;
+    // `MAX_PROOF_LEN` bounds every shape, and `out` was checked against it.
+    debug_assert!(total <= MAX_PROOF_LEN);
+    out[..header.len()].copy_from_slice(header);
+    let mut at = header.len();
+    out[at..at + body.len()].copy_from_slice(body);
+    at += body.len();
+    out[at..at + 32].copy_from_slice(&e0);
+    at += 32;
+    for chunk in &s[..layout.npub] {
+        out[at..at + 32].copy_from_slice(chunk);
+        at += 32;
     }
 
     // Wipe everything that would reveal the value or the blinding factor.
@@ -1103,10 +1227,10 @@ pub fn sign(
     {
         buf.zeroize();
     }
-    prep.zeroize();
+    prep_buf.zeroize();
     digits.zeroize();
 
-    Ok(proof)
+    Ok(at)
 }
 
 /// What [`rewind`] recovers from a proof.
@@ -1119,16 +1243,29 @@ pub struct Rewound {
     pub value: u64,
     /// The blinding factor `r` with `commit = value·generator + r·G`.
     pub blind: [u8; 32],
+    /// The lower end of the proven interval, as [`verify`] reports it.
+    pub min_value: u64,
+    /// The upper end of the proven interval, as [`verify`] reports it.
+    pub max_value: u64,
+    /// The embedded message, zero-padded to the proof's recoverable capacity.
+    ///
+    /// Read it through [`Rewound::message`] rather than touching this: only
+    /// the first `message_len` bytes are meaningful. It is a fixed
+    /// `MAX_REWOUND_LEN`-byte array so that rewinding needs no allocator.
+    message: [u8; MAX_REWOUND_LEN],
+    /// How much of `message` the proof's shape actually carries.
+    message_len: usize,
+}
+
+impl Rewound {
     /// The embedded message, zero-padded to the proof's recoverable capacity.
     ///
     /// This is the reference's `message_out[..outlen]`: bytes past the message
     /// the prover supplied are zero, so a caller that knows its own framing can
     /// trim it.
-    pub message: Vec<u8>,
-    /// The lower end of the proven interval, as [`verify`] reports it.
-    pub min_value: u64,
-    /// The upper end of the proven interval, as [`verify`] reports it.
-    pub max_value: u64,
+    pub fn message(&self) -> &[u8] {
+        &self.message[..self.message_len]
+    }
 }
 
 impl core::fmt::Debug for Rewound {
@@ -1168,7 +1305,8 @@ pub fn rewind(
     generator: &Generator,
 ) -> Result<Rewound, Error> {
     let parsed = parse(commit, proof, extra_commit, generator)?;
-    let challenges = borromean_verify(&parsed)?;
+    let mut challenges = [[0u8; 32]; MAX_NPUB];
+    borromean_verify(&parsed, Some(&mut challenges))?;
     let layout = &parsed.layout;
     let params = &parsed.params;
 
@@ -1184,11 +1322,11 @@ pub fn rewind(
     // The seed's first 32 bytes are the nonce.
     seed.zeroize();
 
-    let mut sec = vec![[0u8; 32]; layout.rings];
-    let mut raw = vec![[0u8; 32]; layout.npub];
+    let mut sec = [[0u8; 32]; MAX_RINGS];
+    let mut raw = [[0u8; 32]; MAX_NPUB];
     let mut acc = Scalar::ZERO;
     let mut slot = 0;
-    for (i, share) in sec.iter_mut().enumerate() {
+    for (i, share) in sec.iter_mut().enumerate().take(layout.rings) {
         if i + 1 < layout.rings {
             let mut tmp = [0u8; 32];
             rng.generate(&mut tmp);
@@ -1209,8 +1347,10 @@ pub fn rewind(
     let mut digits = [0u64; MAX_RINGS];
     for i in 0..layout.rings - 1 {
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
-        let target =
-            parsed.pubs[layout.starts[i]].add(&ProjectivePoint::mul_generator(&share).negate());
+        // Member 0 of ring `i` is the digit commitment itself.
+        let target = parsed
+            .member(i, 0)
+            .add(&ProjectivePoint::mul_generator(&share).negate());
         let mut found = Choice::from(0u8);
         for j in 0..layout.rsizes[i] {
             let offset = member_offset(j as u64, i, params.scale);
@@ -1237,9 +1377,9 @@ pub fn rewind(
     let mut have_marker = Choice::from(0u8);
     if layout.npub >= 2 {
         for slot in [layout.npub - 1, layout.npub - 2] {
-            let mut folded = [0u8; 32];
+            let mut folded = parsed.scalar(slot);
             for b in 0..32 {
-                folded[b] = parsed.s[slot][b] ^ raw[slot][b];
+                folded[b] ^= raw[slot][b];
             }
             let mut first = u64::from_be_bytes(folded[8..16].try_into().unwrap());
             let mut second = u64::from_be_bytes(folded[16..24].try_into().unwrap());
@@ -1283,7 +1423,7 @@ pub fn rewind(
         let slot = last_start + j;
         let hit = (j as u64).ct_eq(&digits[last_ring]);
         k_bytes = <[u8; 32]>::conditional_select(&raw[slot], &k_bytes, hit);
-        s_bytes = <[u8; 32]>::conditional_select(&parsed.s[slot], &s_bytes, hit);
+        s_bytes = <[u8; 32]>::conditional_select(&parsed.scalar(slot), &s_bytes, hit);
         e_bytes = <[u8; 32]>::conditional_select(&challenges[slot], &e_bytes, hit);
     }
     let e = Scalar::from_bytes_be_reduce(&e_bytes);
@@ -1303,16 +1443,16 @@ pub fn rewind(
     // Undo the stream fold on every slot. A forged scalar carries its embedded
     // bytes directly; the known member of a ring carries them inside its
     // closing equation. Both forms are computed and one is selected.
-    let mut folded = vec![[0u8; 32]; layout.npub];
+    let mut folded = [[0u8; 32]; MAX_NPUB];
     for i in 0..layout.rings {
         let share = Scalar::from_bytes_be_reduce(&sec[i]);
         for j in 0..layout.rsizes[i] {
             let slot = layout.starts[i] + j;
-            let s = Scalar::from_bytes_be_reduce(&parsed.s[slot]);
+            let s = Scalar::from_bytes_be_reduce(&parsed.scalar(slot));
             let e = Scalar::from_bytes_be_reduce(&challenges[slot]);
             let closing = s.add(&e.mul(&share)).to_bytes_be();
             let is_known = (j as u64).ct_eq(&digits[i]);
-            let chosen = <[u8; 32]>::conditional_select(&closing, &parsed.s[slot], is_known);
+            let chosen = <[u8; 32]>::conditional_select(&closing, &parsed.scalar(slot), is_known);
             for b in 0..32 {
                 folded[slot][b] = chosen[b] ^ raw[slot][b];
             }
@@ -1327,9 +1467,11 @@ pub fn rewind(
         &(layout.npub.saturating_sub(1) as u64),
         known.ct_eq(&(layout.npub.saturating_sub(1) as u64)),
     );
-    let mut message = Vec::with_capacity(32 * layout.npub.saturating_sub(2));
+    let mut message = [0u8; MAX_REWOUND_LEN];
+    let mut message_len = 0;
     for chunk in folded.iter().take(last_start) {
-        message.extend_from_slice(chunk);
+        message[message_len..message_len + 32].copy_from_slice(chunk);
+        message_len += 32;
     }
     for p in 0..last_size.saturating_sub(2) {
         let mut out = [0u8; 32];
@@ -1341,7 +1483,8 @@ pub fn rewind(
             out = <[u8; 32]>::conditional_select(&folded[last_start + j], &out, hit);
             rank = u64::conditional_select(&(rank + 1), &rank, !excluded);
         }
-        message.extend_from_slice(&out);
+        message[message_len..message_len + 32].copy_from_slice(&out);
+        message_len += 32;
     }
 
     // The recovered opening must actually open the commitment.
@@ -1368,9 +1511,10 @@ pub fn rewind(
     Ok(Rewound {
         value,
         blind,
-        message,
         min_value: params.min_value,
         max_value: params.max_value,
+        message,
+        message_len,
     })
 }
 
@@ -1382,6 +1526,8 @@ pub fn rewind(
 mod tests {
     use super::*;
     use crate::test_util::{from_hex, from_hex_vec};
+    use alloc::vec;
+    use alloc::vec::Vec;
 
     /// The oracle-generated interop corpus. See `tools/zkp-interop/README.md`.
     const VECTORS: &str = include_str!("../../tools/zkp-interop/vectors/rangeproof.json");
@@ -1517,6 +1663,97 @@ mod tests {
         }
     }
 
+    /// The allocator-free entry point must produce exactly the bytes `sign`
+    /// does, over every shape, and must refuse a buffer that could not hold
+    /// the largest proof.
+    #[test]
+    fn sign_into_matches_sign_byte_for_byte() {
+        for (i, &(value, min_value, exp, min_bits, msg)) in [
+            (0u64, 0u64, 0i32, 0u32, &b""[..]),
+            (1, 0, 0, 1, b""),
+            (u64::MAX, 0, 0, 64, b"msg"),
+            (12345, 12345, -1, 0, b""),
+            (1_000_000, 1000, 3, 32, b"msg"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let blind = blind_of(90 + i as u8);
+            let nonce = nonce_of(90 + i as u8);
+            let commit = Commitment::new(value, &blind).unwrap();
+            let want = sign(
+                &commit,
+                &blind,
+                &nonce,
+                value,
+                min_value,
+                exp,
+                min_bits,
+                msg,
+                b"aad",
+                &h(),
+            )
+            .unwrap();
+
+            let mut buf = [0xaau8; MAX_PROOF_LEN];
+            let n = sign_into(
+                &commit,
+                &blind,
+                &nonce,
+                value,
+                min_value,
+                exp,
+                min_bits,
+                msg,
+                b"aad",
+                &h(),
+                &mut buf,
+            )
+            .unwrap();
+            assert_eq!(n, want.len());
+            assert_eq!(&buf[..n], &want[..]);
+
+            let mut short = [0u8; MAX_PROOF_LEN - 1];
+            assert_eq!(
+                sign_into(
+                    &commit,
+                    &blind,
+                    &nonce,
+                    value,
+                    min_value,
+                    exp,
+                    min_bits,
+                    msg,
+                    b"aad",
+                    &h(),
+                    &mut short,
+                ),
+                Err(Error::InvalidInput)
+            );
+        }
+    }
+
+    /// The fixed scratch arrays are the whole cost of dropping `alloc`; keep
+    /// them honest so a future layout change cannot quietly blow up an
+    /// embedded caller's stack.
+    #[test]
+    fn parsed_and_rewound_stay_small() {
+        assert_eq!(MAX_NPUB, 128);
+        assert_eq!(MAX_REWOUND_LEN, 4032);
+        // `Parsed` holds 32 digit commitments, the generator and the layout:
+        // no 128-entry point table.
+        assert!(
+            core::mem::size_of::<Parsed>() < 5 * 1024,
+            "Parsed grew to {}",
+            core::mem::size_of::<Parsed>()
+        );
+        assert!(
+            core::mem::size_of::<Rewound>() < 5 * 1024,
+            "Rewound grew to {}",
+            core::mem::size_of::<Rewound>()
+        );
+    }
+
     #[test]
     fn exact_value_proof_reveals_the_value() {
         let blind = blind_of(11);
@@ -1539,8 +1776,8 @@ mod tests {
         let out = rewind(&commit, &proof, &nonce, b"aad", &h()).unwrap();
         assert_eq!(out.value, value);
         assert_eq!(out.blind, blind);
-        assert_eq!(&out.message[..msg.len()], msg);
-        assert!(out.message[msg.len()..].iter().all(|&b| b == 0));
+        assert_eq!(&out.message()[..msg.len()], msg);
+        assert!(out.message()[msg.len()..].iter().all(|&b| b == 0));
         assert!(out.min_value <= value && value <= out.max_value);
     }
 
@@ -1598,7 +1835,7 @@ mod tests {
         let msg: Vec<u8> = (0..cap).map(|i| (i % 251) as u8).collect();
         let proof = sign(&commit, &blind, &nonce, 9, 0, 0, 32, &msg, &[], &h()).unwrap();
         let out = rewind(&commit, &proof, &nonce, &[], &h()).unwrap();
-        assert_eq!(&out.message[..cap], &msg[..]);
+        assert_eq!(&out.message()[..cap], &msg[..]);
         // One byte more must be refused rather than silently truncated.
         let mut over = msg.clone();
         over.push(0);
@@ -2107,8 +2344,11 @@ mod tests {
             let out = rewind(&commit, &proof, &nonce, &extra, &generator).unwrap();
             assert_eq!(out.value, unsigned(obj, "rewind_value"));
             assert_eq!(out.blind, from_hex::<32>(text(obj, "rewind_blind")));
-            assert_eq!(out.message.len(), unsigned(obj, "rewind_outlen") as usize);
-            assert_eq!(out.message, from_hex_vec(text(obj, "rewind_message")));
+            assert_eq!(out.message().len(), unsigned(obj, "rewind_outlen") as usize);
+            assert_eq!(
+                out.message(),
+                &from_hex_vec(text(obj, "rewind_message"))[..]
+            );
         }
     }
 
