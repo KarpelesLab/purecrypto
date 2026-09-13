@@ -712,6 +712,40 @@ impl BoxedEcdsaSignature {
     }
 }
 
+/// Checks the OPTIONAL `[1] EXPLICIT BIT STRING` publicKey of a SEC1
+/// `ECPrivateKey` against the scalar that was just parsed, consuming it when
+/// present.
+///
+/// A private key whose embedded public key belongs to a *different* scalar is
+/// not a key at all: whichever half the application reads, the other half is
+/// wrong, and a signature made with `d` would be checked against a public key
+/// nobody holds. Reject it at parse time instead of letting the mismatch
+/// surface as an unverifiable signature later.
+#[cfg(feature = "der")]
+fn check_embedded_public_key(
+    seq: &mut crate::der::Reader<'_>,
+    key: &BoxedEcdsaPrivateKey,
+) -> Result<(), Error> {
+    use crate::der::{Reader, tag};
+    if seq.peek_tag() != Some(tag::context(1)) {
+        // Absent: the field is OPTIONAL, so this is a perfectly good key.
+        return Ok(());
+    }
+    let field = seq
+        .read_tlv(tag::context(1))
+        .map_err(|_| Error::Malformed)?;
+    let mut pr = Reader::new(field);
+    let bits = pr.read_bit_string().map_err(|_| Error::Malformed)?;
+    pr.finish().map_err(|_| Error::Malformed)?;
+    let embedded = BoxedEcdsaPublicKey::from_sec1(key.curve, bits)?;
+    // Compare the canonical uncompressed encodings, so a compressed embedded
+    // key matches the derived one.
+    if embedded.to_sec1() != key.public_key().to_sec1() {
+        return Err(Error::InvalidInput);
+    }
+    Ok(())
+}
+
 /// SEC1 `ECPrivateKey` DER/PEM (`EC PRIVATE KEY`), the format OpenSSL emits for
 /// EC keys.
 #[cfg(feature = "der")]
@@ -739,6 +773,10 @@ impl BoxedEcdsaPrivateKey {
 
     /// Parses a SEC1 `ECPrivateKey` DER structure (the named curve must be one
     /// of the supported curves).
+    ///
+    /// The OPTIONAL `[1]` publicKey is checked against the private scalar when
+    /// present (a key that disagrees with itself is rejected), and trailing
+    /// data after the structure is rejected.
     pub fn from_sec1_der(der: &[u8]) -> Result<Self, Error> {
         use crate::der::{Reader, parse_oid, tag};
         let mut outer = Reader::new(der);
@@ -754,8 +792,13 @@ impl BoxedEcdsaPrivateKey {
         let mut pr = Reader::new(params);
         let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
+        pr.finish().map_err(|_| Error::Malformed)?;
         let curve = CurveId::from_named_curve_oid(&arcs).ok_or(Error::Malformed)?;
-        Self::from_bytes(curve, priv_bytes)
+        let key = Self::from_bytes(curve, priv_bytes)?;
+        check_embedded_public_key(&mut seq, &key)?;
+        seq.finish().map_err(|_| Error::Malformed)?;
+        outer.finish().map_err(|_| Error::Malformed)?;
+        Ok(key)
     }
 
     /// Parses a SEC1 PEM EC private key.
@@ -788,10 +831,16 @@ impl BoxedEcdsaPrivateKey {
 
     /// Parses an unencrypted PKCS#8 `PrivateKeyInfo` (RFC 5958) wrapping a SEC1
     /// EC private key. The curve is taken from the `privateKeyAlgorithm`
-    /// named-curve parameter; the inner SEC1 structure's optional `[0]`
-    /// parameters / `[1]` publicKey are ignored.
+    /// named-curve parameter.
+    ///
+    /// The inner SEC1 structure's OPTIONAL fields are no longer skipped
+    /// blindly: a `[0]` namedCurve must name the same curve as the PKCS#8
+    /// algorithm parameter, and a `[1]` publicKey must be the public key of
+    /// the private scalar. Trailing data after either structure is rejected;
+    /// the RFC 5958 `[0]` attributes / `[1]` publicKey of the *outer*
+    /// `OneAsymmetricKey` are still accepted and skipped.
     pub fn from_pkcs8_der(der: &[u8]) -> Result<Self, Error> {
-        use crate::der::{Reader, parse_oid};
+        use crate::der::{Reader, parse_oid, tag};
         let mut r = Reader::new(der);
         let mut seq = r.read_sequence().map_err(|_| Error::Malformed)?;
         seq.read_integer_bytes().map_err(|_| Error::Malformed)?; // version (0)
@@ -804,13 +853,46 @@ impl BoxedEcdsaPrivateKey {
         let curve_arcs = parse_oid(algid.read_oid().map_err(|_| Error::Malformed)?)
             .map_err(|_| Error::Malformed)?;
         let curve = CurveId::from_named_curve_oid(&curve_arcs).ok_or(Error::Malformed)?;
+        algid.finish().map_err(|_| Error::Malformed)?;
         let inner = seq.read_octet_string().map_err(|_| Error::Malformed)?;
-        // inner = SEC1 ECPrivateKey { version, privateKey OCTET STRING, ... }.
+        // inner = SEC1 ECPrivateKey { version, privateKey OCTET STRING,
+        //                             [0] parameters OPTIONAL,
+        //                             [1] publicKey OPTIONAL }.
         let mut ir = Reader::new(inner);
         let mut iseq = ir.read_sequence().map_err(|_| Error::Malformed)?;
         iseq.read_integer_bytes().map_err(|_| Error::Malformed)?; // SEC1 version (1)
         let priv_bytes = iseq.read_octet_string().map_err(|_| Error::Malformed)?;
-        Self::from_bytes(curve, priv_bytes)
+        if iseq.peek_tag() == Some(tag::context(0)) {
+            // RFC 5915 §3 requires this to be omitted inside PKCS#8; if it is
+            // there anyway it must agree with the outer parameter, otherwise
+            // the two halves of the file describe different curves.
+            let params = iseq
+                .read_tlv(tag::context(0))
+                .map_err(|_| Error::Malformed)?;
+            let mut pr = Reader::new(params);
+            let arcs = parse_oid(pr.read_oid().map_err(|_| Error::Malformed)?)
+                .map_err(|_| Error::Malformed)?;
+            pr.finish().map_err(|_| Error::Malformed)?;
+            if CurveId::from_named_curve_oid(&arcs) != Some(curve) {
+                return Err(Error::Malformed);
+            }
+        }
+        let key = Self::from_bytes(curve, priv_bytes)?;
+        check_embedded_public_key(&mut iseq, &key)?;
+        iseq.finish().map_err(|_| Error::Malformed)?;
+        ir.finish().map_err(|_| Error::Malformed)?;
+        // RFC 5958: OPTIONAL `[0]` attributes (IMPLICIT SET) and `[1]`
+        // publicKey (IMPLICIT BIT STRING, so the primitive tag `0x81`; accept
+        // the constructed spelling too) may follow, as in `Ed25519PrivateKey`.
+        if seq.peek_tag() == Some(tag::context(0)) {
+            seq.read_any().map_err(|_| Error::Malformed)?;
+        }
+        if matches!(seq.peek_tag(), Some(t) if t == tag::context(1) || t == (0x80 | 1)) {
+            seq.read_any().map_err(|_| Error::Malformed)?;
+        }
+        seq.finish().map_err(|_| Error::Malformed)?;
+        r.finish().map_err(|_| Error::Malformed)?;
+        Ok(key)
     }
 
     /// Parses an unencrypted PKCS#8 PEM private key
@@ -1260,6 +1342,92 @@ mod tests {
             let parsed_der = BoxedEcdsaPrivateKey::from_pkcs8_der(&sk.to_pkcs8_der()).unwrap();
             assert_eq!(parsed_der.public_key().to_sec1(), sk.public_key().to_sec1());
         }
+    }
+
+    /// A SEC1 / PKCS#8 EC key must agree with itself: an embedded `[1]`
+    /// publicKey belonging to a different scalar, an inner `[0]` naming a
+    /// different curve, and trailing data are all rejected — while keys
+    /// without the optional fields still load.
+    #[cfg(feature = "der")]
+    #[test]
+    fn ec_private_key_optional_fields_are_validated() {
+        use crate::der::{
+            encode_bit_string, encode_context, encode_integer, encode_octet_string,
+            encode_sequence, oid_tlv,
+        };
+        let mut rng = HmacDrbg::<Sha256>::new(b"pkcs8-strict", b"n", &[]);
+        let sk = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+        let other = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+
+        // Builds a SEC1 ECPrivateKey with the given optional fields.
+        let sec1 = |params: Option<CurveId>, pubkey: Option<&BoxedEcdsaPrivateKey>| {
+            let mut body = encode_integer(&[1]);
+            body.extend_from_slice(&encode_octet_string(
+                &sk.d.to_be_bytes(CurveId::P256.order_len()),
+            ));
+            if let Some(c) = params {
+                body.extend_from_slice(&encode_context(0, &oid_tlv(c.named_curve_oid())));
+            }
+            if let Some(k) = pubkey {
+                body.extend_from_slice(&encode_context(
+                    1,
+                    &encode_bit_string(&k.public_key().to_sec1()),
+                ));
+            }
+            encode_sequence(&body)
+        };
+        let pkcs8 = |inner: Vec<u8>| {
+            let algid = encode_sequence(
+                &[
+                    oid_tlv(EC_PUBLIC_KEY_OID),
+                    oid_tlv(CurveId::P256.named_curve_oid()),
+                ]
+                .concat(),
+            );
+            encode_sequence(&[encode_integer(&[0]), algid, encode_octet_string(&inner)].concat())
+        };
+
+        // Baseline: with and without the optional public key.
+        for der in [
+            sec1(Some(CurveId::P256), Some(&sk)),
+            sec1(Some(CurveId::P256), None),
+        ] {
+            let k = BoxedEcdsaPrivateKey::from_sec1_der(&der).unwrap();
+            assert_eq!(k.public_key().to_sec1(), sk.public_key().to_sec1());
+        }
+        for inner in [
+            sec1(None, None),
+            sec1(None, Some(&sk)),
+            sec1(Some(CurveId::P256), Some(&sk)),
+        ] {
+            let k = BoxedEcdsaPrivateKey::from_pkcs8_der(&pkcs8(inner)).unwrap();
+            assert_eq!(k.public_key().to_sec1(), sk.public_key().to_sec1());
+        }
+
+        // A public key belonging to a different scalar: rejected either way.
+        let mismatched = sec1(Some(CurveId::P256), Some(&other));
+        assert!(BoxedEcdsaPrivateKey::from_sec1_der(&mismatched).is_err());
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_der(&pkcs8(mismatched.clone())).is_err());
+
+        // An inner [0] naming a different curve than the PKCS#8 parameter.
+        let wrong_curve = sec1(Some(CurveId::P384), Some(&sk));
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_der(&pkcs8(wrong_curve)).is_err());
+
+        // Trailing data after either structure.
+        let mut trailing = sec1(Some(CurveId::P256), Some(&sk));
+        trailing.push(0x00);
+        assert!(BoxedEcdsaPrivateKey::from_sec1_der(&trailing).is_err());
+        let mut trailing8 = pkcs8(sec1(None, None));
+        trailing8.extend_from_slice(&[0x00, 0x00]);
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_der(&trailing8).is_err());
+        // ... and inside the SEC1 structure wrapped by PKCS#8.
+        let mut inner_trailing = sec1(None, None);
+        inner_trailing.push(0x05);
+        assert!(BoxedEcdsaPrivateKey::from_pkcs8_der(&pkcs8(inner_trailing)).is_err());
+
+        // The keys this crate emits still load.
+        BoxedEcdsaPrivateKey::from_sec1_der(&sk.to_sec1_der()).unwrap();
+        BoxedEcdsaPrivateKey::from_pkcs8_der(&sk.to_pkcs8_der()).unwrap();
     }
 
     /// Interop: load a P-256 PKCS#8 key generated by OpenSSL 3.x, both the
