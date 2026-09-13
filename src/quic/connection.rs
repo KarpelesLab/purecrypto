@@ -3423,9 +3423,17 @@ impl QuicConnection {
     /// RFC 9000 §10.3.1 — detect an incoming stateless reset.
     ///
     /// A stateless reset is a UDP datagram whose last 16 bytes equal a
-    /// stateless_reset_token the peer previously issued us. We scan
-    /// `cid_remote` for any token match. The leading bytes are
-    /// random / unrelated; we don't validate header structure.
+    /// stateless_reset_token the peer previously issued us. The leading
+    /// bytes are random / unrelated; we don't validate header structure.
+    ///
+    /// §10.3.1 also says an endpoint "MUST NOT check for any connection ID
+    /// [it has] not used": only the CID currently in use as our
+    /// Destination Connection ID — and, while a migration is in flight, the
+    /// one the previous path used — may be matched. Comparing against every
+    /// CID the peer ever issued widens the window in which a random-looking
+    /// datagram can kill the connection, and means a token for a CID we
+    /// never put on the wire (so the peer could not have generated a reset
+    /// for it) would nonetheless be honoured.
     fn detect_stateless_reset(&self, datagram: &[u8]) -> bool {
         if datagram.len() < 21 {
             // RFC 9000 §10.3: a stateless reset MUST be at least
@@ -3441,7 +3449,12 @@ impl QuicConnection {
             None => return false,
         };
         use crate::ct::ConstantTimeEq;
+        let in_use = self.endpoint.cids.peer;
+        let previous = self.migration.as_ref().map(|m| m.prev_cid);
         for entry in pool.entries.values() {
+            if entry.cid != in_use && Some(entry.cid) != previous {
+                continue;
+            }
             if let Some(tok) = entry.reset_token.as_ref()
                 && bool::from(tok.ct_eq(&tail))
             {
@@ -3849,6 +3862,20 @@ impl QuicConnection {
         // max_udp_payload_size (0x03): if present, MUST be >= 1200.
         // RFC 9000 §18.2.
         if parsed.max_udp_payload_size.is_some_and(|v| v < 1200) {
+            return Err(Error::IllegalParameter);
+        }
+        // initial_max_streams_bidi (0x08) / _uni (0x09): RFC 9000 §18.2 —
+        // "a value greater than 2^60 ... MUST be treated as a connection
+        // error of type TRANSPORT_PARAMETER_ERROR", because stream IDs are
+        // varints and a larger limit could not be encoded.
+        const MAX_STREAMS_LIMIT: u64 = 1 << 60;
+        if parsed
+            .initial_max_streams_bidi
+            .is_some_and(|v| v > MAX_STREAMS_LIMIT)
+            || parsed
+                .initial_max_streams_uni
+                .is_some_and(|v| v > MAX_STREAMS_LIMIT)
+        {
             return Err(Error::IllegalParameter);
         }
 
@@ -10324,16 +10351,17 @@ mod tests {
         for _ in 0..4 {
             let _ = pump(&mut c, &mut s);
         }
-        // Pull a reset token the server issued to the client (a token
-        // sitting on the client's cid_remote pool).
+        // Pull the reset token for the CID the client is actually using as
+        // its Destination Connection ID — RFC 9000 §10.3.1 only permits
+        // checking against that one (see the companion test below).
         let token = {
+            let in_use = c.endpoint.cids.peer;
             let pool = c.cid_remote.as_ref().expect("cid_remote");
-            let entry = pool
-                .entries
+            pool.entries
                 .values()
-                .find(|e| e.reset_token.is_some())
-                .expect("at least one entry with a token");
-            entry.reset_token.unwrap()
+                .find(|e| e.cid == in_use)
+                .and_then(|e| e.reset_token)
+                .expect("the CID in use carries a token")
         };
         // Build a fabricated reset datagram: random leading bytes +
         // the known reset token as the trailing 16 bytes. RFC 9000
@@ -10350,6 +10378,40 @@ mod tests {
         assert!(c.recv_datagram().is_none());
         let r = c.send_datagram(b"nope");
         assert!(matches!(r, Err(Error::InappropriateState)));
+    }
+
+    /// RFC 9000 §10.3.1 — "An endpoint MUST NOT check for stateless reset
+    /// tokens associated with connection IDs it has not used". A token for a
+    /// spare CID the peer issued but we never addressed cannot have produced
+    /// a reset, so honouring it only widens the window in which a
+    /// random-looking datagram tears the connection down.
+    #[test]
+    fn stateless_reset_token_of_an_unused_cid_is_ignored() {
+        let (mut c, mut s) = loopback_pair();
+        drive_until_complete(&mut c, &mut s, 8);
+        for _ in 0..4 {
+            let _ = pump(&mut c, &mut s);
+        }
+        let in_use = c.endpoint.cids.peer;
+        let spare = {
+            let pool = c.cid_remote.as_ref().expect("cid_remote");
+            pool.entries
+                .values()
+                .find(|e| e.cid != in_use && e.reset_token.is_some())
+                .map(|e| e.reset_token.expect("checked"))
+        };
+        let Some(token) = spare else {
+            panic!("test premise: the server issued a spare CID with a token");
+        };
+        let mut fake = alloc::vec![0xCDu8; 5];
+        fake.extend_from_slice(&token);
+        // Not recognised as a reset, so it falls through to the packet
+        // parser and is discarded there like any other garbage datagram.
+        let _ = c.feed_datagram(&fake);
+        assert!(
+            !c.is_closed() && !c.is_closing() && !c.is_draining(),
+            "a token for a CID we never used must not close the connection"
+        );
     }
 
     /// Test — out-of-order phase delivery (RFC 9001 §6.2). Server
@@ -11133,6 +11195,14 @@ mod tests {
             ("max_udp_payload_size<1200", |tp| {
                 tp.max_udp_payload_size = Some(1199);
             }),
+            // RFC 9000 §18.2 — stream limits above 2^60 cannot be encoded as
+            // stream IDs and are a TRANSPORT_PARAMETER_ERROR.
+            ("initial_max_streams_bidi>2^60", |tp| {
+                tp.initial_max_streams_bidi = Some((1 << 60) + 1);
+            }),
+            ("initial_max_streams_uni>2^60", |tp| {
+                tp.initial_max_streams_uni = Some((1 << 60) + 1);
+            }),
         ];
         for (name, mutate) in cases {
             let (mut c, mut s) = loopback_pair();
@@ -11172,6 +11242,8 @@ mod tests {
             max_ack_delay_ms: Some((1 << 14) - 1),
             active_connection_id_limit: Some(2),
             max_udp_payload_size: Some(1200),
+            initial_max_streams_bidi: Some(1 << 60),
+            initial_max_streams_uni: Some(1 << 60),
             ..TransportParameters::default()
         };
         s.validate_peer_transport_params(&good_tp)
