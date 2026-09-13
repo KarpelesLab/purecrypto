@@ -340,6 +340,10 @@ impl Reassembler {
     /// client's retransmits churn the junk out. The default head-of-queue
     /// rule is kept for the in-handshake reassemblers, where a competing
     /// claim at the head must never be able to evict the genuine partial.
+    ///
+    /// A FIFO buffer is also dispatch-free: `feed` never returns a message
+    /// and never advances `expected_msg_seq`; completed messages are
+    /// collected with [`Self::take_complete`].
     pub(crate) fn with_fifo_eviction(mut self) -> Self {
         self.fifo_eviction = true;
         self
@@ -479,8 +483,14 @@ impl Reassembler {
         // of the one zero-length fragment, which `received_count` happens to
         // capture as 0 == total_length=0.
         if entry.received_count == entry.total_length {
-            // Only dispatch if this is the head of the queue.
-            if frag.message_seq == self.expected_msg_seq {
+            // Only dispatch if this is the head of the queue. A pure
+            // fragment buffer (`fifo_eviction`) never dispatches from
+            // `feed`: its caller collects completed messages with
+            // `take_complete`, so peer input can never move
+            // `expected_msg_seq` (a spoofed, rejected seq-0 message would
+            // otherwise leave the buffer expecting seq 1 and drop every
+            // later seq-0 fragment as stale).
+            if !self.fifo_eviction && frag.message_seq == self.expected_msg_seq {
                 let done = self.in_progress.remove(&key).expect("entry just inserted");
                 self.expected_msg_seq = self.expected_msg_seq.wrapping_add(1);
                 self.drop_stale_candidates();
@@ -963,14 +973,35 @@ mod tests {
         assert_eq!(r.in_progress.len(), 2);
         assert!(!r.in_progress.contains_key(&(0, 1, 10)));
         assert!(r.in_progress.contains_key(&(0, 1, 4)));
-        // ...and the genuine message still completes.
+        // ...and the genuine message still completes (collected with
+        // `take_complete`: a FIFO buffer never dispatches from `feed`).
         let mut h1 = Vec::new();
         write_fragment_header(&mut h1, 1, 4, 0, 2, 2);
         h1.extend_from_slice(&[3, 4]);
-        assert_eq!(
-            r.feed(read_fragment(&h1).unwrap()),
-            Some((1, alloc::vec![1, 2, 3, 4]))
-        );
+        assert!(r.feed(read_fragment(&h1).unwrap()).is_none());
+        assert_eq!(r.expected_msg_seq(), 0);
+        assert_eq!(r.take_complete(0), Some((1, alloc::vec![1, 2, 3, 4])));
+    }
+
+    #[test]
+    fn fifo_buffer_rejected_head_does_not_wedge_seq_zero() {
+        // A completed (spoofed) seq-0 message that the caller takes and
+        // rejects must not leave the buffer refusing later seq-0 fragments.
+        let mut r = Reassembler::with_limits(1024, 4).with_fifo_eviction();
+        let mut junk = Vec::new();
+        write_message(&mut junk, 1, 0, b"junk", 0);
+        assert!(r.feed(read_fragment(&junk).unwrap()).is_none());
+        assert_eq!(r.take_complete(0), Some((1, b"junk".to_vec())));
+        assert_eq!(r.expected_msg_seq(), 0);
+        let mut g0 = Vec::new();
+        write_fragment_header(&mut g0, 1, 4, 0, 0, 2);
+        g0.extend_from_slice(b"ok");
+        assert!(r.feed(read_fragment(&g0).unwrap()).is_none());
+        let mut g1 = Vec::new();
+        write_fragment_header(&mut g1, 1, 4, 0, 2, 2);
+        g1.extend_from_slice(b"!!");
+        assert!(r.feed(read_fragment(&g1).unwrap()).is_none());
+        assert_eq!(r.take_complete(0), Some((1, b"ok!!".to_vec())));
     }
 
     #[test]

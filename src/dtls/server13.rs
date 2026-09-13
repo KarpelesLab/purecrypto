@@ -271,7 +271,9 @@ pub struct DtlsServerConnection13<R: RngCore> {
     /// Only a fragment buffer: its `expected_msg_seq` stays at 0 and is
     /// never seeded from a peer-supplied `message_seq` (a spoofed
     /// `message_seq = 3` fragment used to pin it there, after which the
-    /// genuine CH1/CH2 at 0/1 were dropped as stale for ever — DTLS-M1).
+    /// genuine CH1/CH2 at 0/1 were dropped as stale for ever — DTLS-M1),
+    /// nor advanced by a completed-then-rejected (spoofed) CH: the FIFO
+    /// buffer never dispatches from `feed`.
     pre_state_reasm: Option<Reassembler>,
     /// Fragments fed to `pre_state_reasm` since it was created; see
     /// [`PRE_COOKIE_MAX_FRAGMENTS`].
@@ -1015,13 +1017,14 @@ impl<R: RngCore> DtlsServerConnection13<R> {
                             .with_fifo_eviction()
                     });
                     *fed += 1;
-                    // `feed` dispatches only the head (seq 0); a CH2 at
-                    // seq 1 is collected with `take_complete` so neither
-                    // sequence number gates the other.
-                    let done = match reasm.feed(f) {
-                        Some((_, body)) => Some(body),
-                        None => reasm.take_complete(msg_seq).map(|(_, body)| body),
-                    };
+                    // The FIFO buffer never dispatches from `feed` (and so
+                    // never advances `expected_msg_seq`): both a first CH
+                    // (seq 0) and a CH2 (seq 1) are collected with
+                    // `take_complete`, so neither sequence number gates the
+                    // other and a rejected spoofed CH cannot leave the
+                    // buffer refusing the genuine seq-0 fragments.
+                    let _ = reasm.feed(f);
+                    let done = reasm.take_complete(msg_seq).map(|(_, body)| body);
                     match done {
                         Some(body) => body,
                         None => continue,
@@ -2273,6 +2276,58 @@ mod f3_msg_seq_tests {
         let mut server = new_server();
         assert_eq!(server.feed_datagram(&dgram), Ok(()));
         assert!(server.pop_outbound_datagrams().is_empty());
+    }
+
+    #[test]
+    fn spoofed_complete_hello_does_not_wedge_pre_cookie_buffer() {
+        // One spoofed record carrying two fragments of an undecodable
+        // ClientHello at message_seq 0. Completing it used to advance the
+        // pre-cookie buffer's expected_msg_seq to 1, so every fragment of
+        // the genuine (fragmented, X25519MLKEM768) CH was dropped as stale.
+        let (cfg, cert) = make_server_cfg();
+        let mut client = make_client(&cert);
+        let srng = HmacDrbg::<Sha256>::new(b"f3-dtls13-ok", b"nonce", &[]);
+        let mut server =
+            DtlsServerConnection13::new(alloc::sync::Arc::new(cfg), b"client-addr".to_vec(), srng);
+        let mut frags = Vec::new();
+        frags.extend_from_slice(&[hs_type::CLIENT_HELLO, 0, 0, 10, 0, 0, 0, 0, 1, 0, 0, 9]);
+        frags.extend_from_slice(&[0xAA; 9]);
+        frags.extend_from_slice(&[hs_type::CLIENT_HELLO, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 1]);
+        frags.push(0xAA);
+        let mut dg = Vec::new();
+        record::write_record(
+            &mut dg,
+            ContentType::Handshake,
+            ProtocolVersion::DTLSv1_2,
+            0,
+            99,
+            &frags,
+        )
+        .unwrap();
+        assert_eq!(server.feed_datagram(&dg), Ok(()));
+        let mut pending = client.pop_outbound_datagrams();
+        assert!(pending.len() >= 2, "default CH should be fragmented");
+        let mut t = 0u64;
+        for _ in 0..40 {
+            for d in &pending {
+                server.feed_datagram(d).unwrap();
+            }
+            let s_out = server.pop_outbound_datagrams();
+            for d in &s_out {
+                let _ = client.feed_datagram(d);
+            }
+            pending = client.pop_outbound_datagrams();
+            if server.is_handshake_complete() && client.is_handshake_complete() {
+                break;
+            }
+            if pending.is_empty() && s_out.is_empty() {
+                t += 70;
+                client.on_timeout(core::time::Duration::from_secs(t));
+                pending = client.pop_outbound_datagrams();
+            }
+        }
+        assert!(server.is_handshake_complete());
+        assert!(client.is_handshake_complete());
     }
 
     #[test]
