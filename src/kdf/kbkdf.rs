@@ -96,36 +96,25 @@ pub trait Prf {
 /// Use the [`HmacSha256Prf`] / [`HmacSha384Prf`] / [`HmacSha512Prf`] aliases
 /// for the common instantiations.
 pub struct HmacPrf<D: Digest> {
-    key: [u8; MAX_HMAC_BLOCK],
-    key_len: usize,
+    /// A keyed-but-unfed HMAC, cloned once per PRF block. Keeping the keyed
+    /// *state* (rather than a copy of the key) is what makes every block use
+    /// exactly the key schedule `Hmac::new(KI)` derived — including for hashes
+    /// whose block is not 128 bytes, where re-deriving from a stashed,
+    /// length-reduced key copy would silently key later blocks differently.
+    template: Hmac<D>,
     mac: Hmac<D>,
 }
-
-// The longest HMAC block among the supported hashes is 128 bytes (SHA-384/512).
-// We stash the key so the PRF can be re-keyed between blocks without the caller
-// re-supplying it.
-const MAX_HMAC_BLOCK: usize = 128;
 
 impl<D: Digest> Prf for HmacPrf<D> {
     const OUTPUT_LEN: usize = D::OUTPUT_LEN;
 
     fn init(ki: &[u8]) -> Self {
-        // `Hmac::new` reduces an over-long key (> one hash block) to
-        // `D::digest(key)` before use. To re-key identically between blocks we
-        // must stash that *reduced* key rather than asserting on length; the
-        // digest is `OUTPUT_LEN <= MAX_HMAC_BLOCK` bytes, so it always fits.
-        let mut key = [0u8; MAX_HMAC_BLOCK];
-        let key_len = if ki.len() > MAX_HMAC_BLOCK {
-            let hashed = D::digest(ki);
-            let h = hashed.as_ref();
-            key[..h.len()].copy_from_slice(h);
-            h.len()
-        } else {
-            key[..ki.len()].copy_from_slice(ki);
-            ki.len()
-        };
-        let mac = Hmac::<D>::new(ki);
-        HmacPrf { key, key_len, mac }
+        // Key once; `Hmac` reduces an over-long key (> `D::BLOCK_LEN`) to
+        // `D::digest(key)` internally, so cloning the keyed state reproduces
+        // whatever reduction it applied, for any digest's block length.
+        let template = Hmac::<D>::new(ki);
+        let mac = template.clone();
+        HmacPrf { template, mac }
     }
 
     fn update(&mut self, data: &[u8]) {
@@ -134,20 +123,12 @@ impl<D: Digest> Prf for HmacPrf<D> {
 
     fn finalize(&mut self, out: &mut [u8]) {
         // Swap in a freshly keyed MAC for the next block, finalizing the old one.
-        let next = Hmac::<D>::new(&self.key[..self.key_len]);
+        let next = self.template.clone();
         let done = core::mem::replace(&mut self.mac, next);
         let tag = done.finalize();
         let t = tag.as_ref();
         debug_assert_eq!(t.len(), Self::OUTPUT_LEN);
         out.copy_from_slice(t);
-    }
-}
-
-impl<D: Digest> Drop for HmacPrf<D> {
-    fn drop(&mut self) {
-        // Wipe the stashed key copy.
-        self.key = [0u8; MAX_HMAC_BLOCK];
-        let _ = core::hint::black_box(&self.key);
     }
 }
 
@@ -636,5 +617,78 @@ mod tests {
         kbkdf_counter_fixed::<HmacSha256Prf>(&long_key, fixed, &mut a).unwrap();
         kbkdf_counter_fixed::<HmacSha256Prf>(reduced.as_ref(), fixed, &mut b).unwrap();
         assert_eq!(a, b, "over-long key must behave as its digest");
+    }
+
+    // Every PRF block must be keyed with the *same* HMAC key, for any digest —
+    // including the SHA-3 family, whose block length (144 bytes for SHA3-224,
+    // 136 for SHA3-256) is not the 128 bytes of SHA-2. A key between 128 and
+    // `D::BLOCK_LEN` bytes is used verbatim by HMAC, so blocks 2.. must not be
+    // re-keyed from a hashed copy of it.
+    #[test]
+    fn sha3_prf_multiblock_matches_plain_hmac() {
+        use crate::hash::{Hmac, Sha3_224, Sha3_256};
+
+        // 140 bytes: over SHA-2's 128-byte block, under SHA3-224's 144-byte one.
+        let ki: [u8; 140] = core::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(3));
+        let fixed = b"fixed input data for the SHA-3 PRF";
+
+        // Reference: K(i) = HMAC(KI, [i]_32 ‖ fixed), keyed straight from `ki`.
+        fn reference<D: crate::hash::Digest>(ki: &[u8], fixed: &[u8], out: &mut [u8]) {
+            let mut filled = 0;
+            let mut i = 1u32;
+            while filled < out.len() {
+                let mut mac = Hmac::<D>::new(ki);
+                mac.update(&i.to_be_bytes());
+                mac.update(fixed);
+                let tag = mac.finalize();
+                let t = tag.as_ref();
+                let take = (out.len() - filled).min(t.len());
+                out[filled..filled + take].copy_from_slice(&t[..take]);
+                filled += take;
+                i += 1;
+            }
+        }
+
+        // SHA3-224: 28-byte blocks, so 96 bytes spans four PRF blocks.
+        let mut got = [0u8; 96];
+        kbkdf_counter_fixed::<HmacPrf<Sha3_224>>(&ki, fixed, &mut got).unwrap();
+        let mut want = [0u8; 96];
+        reference::<Sha3_224>(&ki, fixed, &mut want);
+        assert_eq!(got, want, "HMAC-SHA3-224 KBKDF re-keyed blocks 2.. wrongly");
+
+        // SHA3-256 (136-byte block) with a 136-byte key: still verbatim.
+        let ki136 = &ki[..136];
+        let mut got = [0u8; 96];
+        kbkdf_counter_fixed::<HmacPrf<Sha3_256>>(ki136, fixed, &mut got).unwrap();
+        let mut want = [0u8; 96];
+        reference::<Sha3_256>(ki136, fixed, &mut want);
+        assert_eq!(got, want, "HMAC-SHA3-256 KBKDF re-keyed blocks 2.. wrongly");
+
+        // Feedback mode shares the PRF, so it is covered by the same fix.
+        let mut got = [0u8; 96];
+        kbkdf_feedback_fixed::<HmacPrf<Sha3_224>>(&ki, b"iv", fixed, &mut got).unwrap();
+        let mut want = [0u8; 96];
+        {
+            let mut prev: [u8; 28] = [0u8; 28];
+            let mut filled = 0;
+            let mut i = 1u32;
+            while filled < want.len() {
+                let mut mac = Hmac::<Sha3_224>::new(&ki);
+                if i == 1 {
+                    mac.update(b"iv");
+                } else {
+                    mac.update(&prev);
+                }
+                mac.update(&i.to_be_bytes());
+                mac.update(fixed);
+                let tag = mac.finalize();
+                prev.copy_from_slice(tag.as_ref());
+                let take = (want.len() - filled).min(prev.len());
+                want[filled..filled + take].copy_from_slice(&prev[..take]);
+                filled += take;
+                i += 1;
+            }
+        }
+        assert_eq!(got, want, "HMAC-SHA3-224 KBKDF feedback mode re-keyed wrongly");
     }
 }
