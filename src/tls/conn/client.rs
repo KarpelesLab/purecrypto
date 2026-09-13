@@ -507,6 +507,11 @@ pub struct StoredSession {
     /// Hash function of the original cipher suite (PSK binders and key
     /// schedule are tied to it).
     pub cipher_suite_hash: HashAlg,
+    /// IANA id of the cipher suite negotiated on the originating connection.
+    /// RFC 8446 §4.6.1: 0-RTT is keyed under this suite, so early data is
+    /// only offered — and only accepted — when the resumed handshake lands
+    /// on it again. `0` means "unknown" and simply disables 0-RTT.
+    pub cipher_suite: u16,
 }
 
 impl core::fmt::Debug for StoredSession {
@@ -523,6 +528,7 @@ impl core::fmt::Debug for StoredSession {
             .field("max_early_data_size", &self.max_early_data_size)
             .field("negotiated_alpn", &self.negotiated_alpn)
             .field("cipher_suite_hash", &self.cipher_suite_hash)
+            .field("cipher_suite", &format_args!("{:#06x}", self.cipher_suite))
             .finish_non_exhaustive()
     }
 }
@@ -690,6 +696,11 @@ pub struct ClientConnection {
     /// side is keyed from this for the early-data records and the trailing
     /// `EndOfEarlyData` message.
     cets: Option<Secret>,
+    /// The cipher suite the early-data keys were derived under (the stored
+    /// session's suite). RFC 8446 §4.6.1: a server that accepts early data
+    /// must be running that same suite, or our 0-RTT records are keyed
+    /// wrong. `None` when no 0-RTT was offered.
+    early_data_suite: Option<CipherSuite>,
     /// Cached client-handshake-traffic-secret to install after we send EOED
     /// (or right at EE time if 0-RTT was rejected). Otherwise we install it
     /// at SH time.
@@ -1353,6 +1364,7 @@ impl ClientConnection {
             early_data_offered: false,
             early_data_accepted: false,
             cets: None,
+            early_data_suite: None,
             deferred_client_hs_secret: None,
             cert_request_received: false,
             offer_tls12,
@@ -1374,7 +1386,11 @@ impl ClientConnection {
                 psk: session.psk.clone(),
                 hash: session.cipher_suite_hash,
             });
-            if matches!(session.max_early_data_size, Some(n) if n > 0) {
+            // 0-RTT is keyed under the suite that issued the ticket, so it
+            // can only be offered when that suite is still in our offer.
+            if matches!(session.max_early_data_size, Some(n) if n > 0)
+                && effective_suites.contains(&CipherSuite(session.cipher_suite))
+            {
                 conn.early_data_offered = true;
             }
         }
@@ -1475,9 +1491,15 @@ impl ClientConnection {
         // single hash-matched suite is in effective_suites when the session
         // is set).
         if conn.early_data_offered
-            && let (Some(psk_state), Some(first_suite)) =
-                (conn.psk_offered.as_ref(), effective_suites.first())
-            && let Some(suite) = lookup_suite(*first_suite)
+            && let (Some(psk_state), Some(session_suite)) = (
+                conn.psk_offered.as_ref(),
+                conn.config.session.as_ref().map(|s| s.cipher_suite),
+            )
+            // RFC 8446 §4.6.1: the early-data keys come from the *stored
+            // session's* suite. Deriving them from whatever suite happens to
+            // lead our offer would key the 0-RTT records under a suite the
+            // server may never select.
+            && let Some(suite) = lookup_suite(CipherSuite(session_suite))
         {
             let ks = KeySchedule::with_psk(psk_state.hash, &psk_state.psk);
             let th = conn.core.transcript.current_hash();
@@ -1500,6 +1522,7 @@ impl ClientConnection {
                 conn.core.set_write(suite.crypter(&cets));
             }
             conn.cets = Some(cets);
+            conn.early_data_suite = Some(suite.suite);
         }
         conn
     }
@@ -2039,6 +2062,7 @@ impl ClientConnection {
                         max_early_data_size: received.max_early_data_size,
                         negotiated_alpn: self.alpn_negotiated.clone(),
                         cipher_suite_hash: suite.hash,
+                        cipher_suite: suite.suite.0,
                     });
                 }
                 Ok(())
@@ -2053,6 +2077,15 @@ impl ClientConnection {
     /// to update too (`update_requested == 1`), emit our own `KeyUpdate`
     /// (`update_not_requested`) and step the write side as well.
     fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
+        // RFC 9001 §6: QUIC carries no TLS `KeyUpdate` — key updates happen
+        // in the QUIC layer via the Key Phase bit. A peer sending one over a
+        // QUIC handshake stream is misbehaving; reject it with
+        // `unexpected_message` rather than re-keying a record layer that
+        // isn't there (and, when it asks for a reply, walking into
+        // `send_key_update`'s QUIC refusal).
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
+            return Err(Error::UnexpectedMessage);
+        }
         let ku = KeyUpdate::decode(body)?;
         // Rate limit (see `MAX_KEY_UPDATES_RECEIVED`): every inbound
         // `KeyUpdate(update_requested)` costs two HKDF-Expand-Label pairs, an
@@ -2090,7 +2123,6 @@ impl ClientConnection {
         // 1-RTT short-header. Refuse to emit one in QUIC mode rather than
         // produce a malformed flight.
         if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
-            debug_assert!(false, "RFC 9001 §6 forbids TLS KeyUpdate in QUIC mode");
             return Err(Error::InappropriateState);
         }
         let suite = self.suite.ok_or(Error::InappropriateState)?;
@@ -2928,6 +2960,13 @@ impl ClientConnection {
                     // would mark 0-RTT as "accepted" on a full handshake and
                     // emit EndOfEarlyData under keys the server never had.
                     if !self.psk_accepted {
+                        return Err(Error::IllegalParameter);
+                    }
+                    // RFC 8446 §4.6.1: our 0-RTT records were protected
+                    // under the stored session's cipher suite. A server
+                    // that accepts them while negotiating a different
+                    // (even hash-compatible) suite cannot have read them.
+                    if self.suite.map(|s| s.suite) != self.early_data_suite {
                         return Err(Error::IllegalParameter);
                     }
                     early_data_in_ee = true;
@@ -4099,6 +4138,7 @@ mod tests {
             max_early_data_size: Some(1024),
             negotiated_alpn: None,
             cipher_suite_hash: HashAlg::Sha256,
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
         };
         let config = ClientConfig::new(RootCertStore::new()).with_session(session);
         let mut client = ClientConnection::new(config, "h", &mut rng).unwrap();
@@ -4495,6 +4535,7 @@ mod tests {
                 max_early_data_size: None,
                 negotiated_alpn: None,
                 cipher_suite_hash: HashAlg::Sha256,
+                cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
             }
         }
         fn offers_psk(session: StoredSession, connect_to: &str) -> bool {

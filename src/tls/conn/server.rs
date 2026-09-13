@@ -1568,6 +1568,15 @@ impl<R: RngCore> ServerConnection<R> {
     /// can stream them back to back. Past the bound the connection is failed
     /// as `PeerMisbehaved`.
     fn handle_key_update(&mut self, body: &[u8]) -> Result<(), Error> {
+        // RFC 9001 §6: QUIC carries no TLS `KeyUpdate` — key updates happen
+        // in the QUIC layer via the Key Phase bit. A peer sending one over a
+        // QUIC handshake stream is misbehaving; reject it with
+        // `unexpected_message` rather than re-keying a record layer that
+        // isn't there (and, when it asks for a reply, walking into
+        // `send_key_update`'s QUIC refusal).
+        if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
+            return Err(Error::UnexpectedMessage);
+        }
         let ku = KeyUpdate::decode(body)?;
         self.key_updates_received = self.key_updates_received.saturating_add(1);
         if self.key_updates_received > MAX_KEY_UPDATES_RECEIVED {
@@ -1592,7 +1601,6 @@ impl<R: RngCore> ServerConnection<R> {
         // RFC 9001 §6: TLS 1.3 `KeyUpdate` is not used in QUIC — refuse
         // rather than produce a malformed flight.
         if self.engine_mode == super::super::quic_hooks::EngineMode::Quic {
-            debug_assert!(false, "RFC 9001 §6 forbids TLS KeyUpdate in QUIC mode");
             return Err(Error::InappropriateState);
         }
         let suite = self.suite.ok_or(Error::InappropriateState)?;
@@ -1876,10 +1884,25 @@ impl<R: RngCore> ServerConnection<R> {
             }
             suite
         } else if let Some(ref s) = psk_state {
+            // Prefer the suite the ticket was issued under when the client
+            // still offers it: RFC 8446 §4.2.11 only constrains the KDF hash,
+            // but 0-RTT keys are derived under the issuing suite, so picking
+            // a hash-compatible *different* suite would needlessly refuse
+            // early data below.
             supported_suites()
                 .iter()
                 .copied()
-                .find(|sp| ch.cipher_suites.contains(&sp.suite) && sp.hash == s.hash)
+                .find(|sp| {
+                    Some(sp.suite) == s.suite
+                        && ch.cipher_suites.contains(&sp.suite)
+                        && sp.hash == s.hash
+                })
+                .or_else(|| {
+                    supported_suites()
+                        .iter()
+                        .copied()
+                        .find(|sp| ch.cipher_suites.contains(&sp.suite) && sp.hash == s.hash)
+                })
                 .ok_or(Error::HandshakeFailure)?
         } else {
             supported_suites()
@@ -1888,6 +1911,17 @@ impl<R: RngCore> ServerConnection<R> {
                 .find(|s| ch.cipher_suites.contains(&s.suite))
                 .ok_or(Error::HandshakeFailure)?
         };
+
+        // RFC 8446 §4.6.1 / §4.2.10: early data is protected with keys
+        // derived from the PSK *under the cipher suite the ticket was issued
+        // with* — the client has already encrypted its 0-RTT records that
+        // way. Accepting early data under any other suite (including a
+        // hash-compatible one) would key it wrong, so refuse 0-RTT unless
+        // the negotiated suite is exactly the ticket's. A legacy ticket that
+        // records no suite is never 0-RTT eligible.
+        if accept_early && psk_state.as_ref().and_then(|s| s.suite) != Some(suite.suite) {
+            accept_early = false;
+        }
 
         // Require TLS 1.3.
         let sv = ext::find(&ch.extensions, ExtensionType::SUPPORTED_VERSIONS)
@@ -2979,6 +3013,7 @@ impl<R: RngCore> ServerConnection<R> {
         let mut plain = Vec::with_capacity(
             1 + 8
                 + 4
+                + 2
                 + 1
                 + hash_len
                 + 1
@@ -2987,9 +3022,13 @@ impl<R: RngCore> ServerConnection<R> {
                 + 2
                 + client_leaf.map(|c| c.len()).unwrap_or(0),
         );
-        plain.push(TICKET13_FORMAT);
+        plain.push(TICKET13_FORMAT_SUITE);
         plain.extend_from_slice(&creation.to_be_bytes());
         plain.extend_from_slice(&age_add_bytes);
+        // RFC 8446 §4.6.1: 0-RTT runs under the suite the ticket was issued
+        // with; record it so a resumed handshake that lands on a different
+        // suite can still resume but never accepts early data.
+        plain.extend_from_slice(&suite.suite.0.to_be_bytes());
         plain.push(hash_len as u8);
         plain.extend_from_slice(&psk);
         plain.push(alpn_len);
@@ -3122,6 +3161,11 @@ struct AcceptedPsk {
     /// anti-replay protection, so 0-RTT is only safe if a `ReplayWindow`
     /// is installed (see the 0-RTT acceptance floor in `process_client_hello`).
     age_checked: bool,
+    /// The cipher suite the issuing handshake used, when the ticket records
+    /// one. 0-RTT is refused unless this handshake negotiates the very same
+    /// suite (the early-data keys are derived under it); `None` (a legacy
+    /// ticket) therefore never carries early data.
+    suite: Option<CipherSuite>,
     /// The binder of the identity that was *actually selected* (the first one
     /// whose ticket decrypted cleanly), not necessarily identity index 0. The
     /// 0-RTT [`ReplayWindow`] MUST be keyed on this binder: keying on
@@ -3210,6 +3254,7 @@ impl<R: RngCore> ServerConnection<R> {
                 alpn,
                 creation_secs,
                 age_add,
+                suite,
                 client_leaf,
             } = decrypted;
             let hash = match psk.len() {
@@ -3272,6 +3317,7 @@ impl<R: RngCore> ServerConnection<R> {
                 alpn,
                 age_fresh,
                 age_checked: now != 0,
+                suite,
                 selected_binder: presented.to_vec(),
                 client_leaf,
             }));
@@ -3287,7 +3333,13 @@ impl<R: RngCore> ServerConnection<R> {
 /// the other, regardless of how the plaintext happens to parse.
 pub(crate) const TICKET13_AAD: &[u8] = b"purecrypto tls13 ticket v1";
 /// Leading byte of the TLS 1.3 ticket plaintext: format/version tag.
+/// `0x13` is the original layout; `0x14` adds the issuing `cipher_suite`
+/// right after `ticket_age_add` (RFC 8446 §4.6.1: 0-RTT is keyed under the
+/// suite the ticket was issued with, so a ticket that does not name one
+/// cannot be used for early data).
 const TICKET13_FORMAT: u8 = 0x13;
+/// Current ticket format: like [`TICKET13_FORMAT`] plus `cipher_suite u16`.
+const TICKET13_FORMAT_SUITE: u8 = 0x14;
 
 /// Decoded ticket payload: the original PSK plus the ALPN protocol that was
 /// negotiated on the connection that issued the ticket (empty when none was),
@@ -3299,9 +3351,11 @@ const TICKET13_FORMAT: u8 = 0x13;
 /// Plaintext layout (v1):
 ///
 /// ```text
-/// format          u8      // TICKET13_FORMAT
+/// format          u8      // TICKET13_FORMAT_SUITE (0x13 = the older
+///                         // layout, which omits `cipher_suite`)
 /// creation_time   u64     // unix seconds (server clock at issuance)
 /// ticket_age_add  u32
+/// cipher_suite    u16     // present iff format == TICKET13_FORMAT_SUITE
 /// psk_len         u8
 /// psk             psk_len bytes
 /// alpn_len        u8
@@ -3315,6 +3369,11 @@ struct TicketPlaintext {
     alpn: Vec<u8>,
     creation_secs: u64,
     age_add: u32,
+    /// The cipher suite of the handshake that issued this ticket. `None` for
+    /// a legacy (`TICKET13_FORMAT`) ticket, which still resumes but is never
+    /// eligible for 0-RTT — early data is keyed under the issuing suite and
+    /// we cannot tell what it was.
+    suite: Option<CipherSuite>,
     client_leaf: Option<Vec<u8>>,
 }
 
@@ -3351,11 +3410,17 @@ fn decrypt_ticket(
     }
     // Parse the plaintext (layout on `TicketPlaintext`).
     let mut c = crate::tls::codec::ReadCursor::new(&buf);
-    if c.u8().ok()? != TICKET13_FORMAT {
+    let format = c.u8().ok()?;
+    if format != TICKET13_FORMAT && format != TICKET13_FORMAT_SUITE {
         return None;
     }
     let creation_secs = c.u64().ok()?;
     let age_add = c.u32().ok()?;
+    let suite = if format == TICKET13_FORMAT_SUITE {
+        Some(CipherSuite(c.u16().ok()?))
+    } else {
+        None
+    };
     // RFC 8446 §4.6.1 + §8.1: enforce ticket age. Skip the check when the
     // server has no wall clock (`now_secs == 0`, matching the TLS 1.2
     // fallback in `server12.rs::try_resume`) or when the lifetime is
@@ -3387,6 +3452,7 @@ fn decrypt_ticket(
         alpn,
         creation_secs,
         age_add,
+        suite,
         client_leaf,
     })
 }
@@ -3528,6 +3594,47 @@ mod tests {
         wire.extend_from_slice(&buf);
         wire.extend_from_slice(&tag);
         wire
+    }
+
+    /// RFC 8446 §4.6.1: a ticket now records the cipher suite its issuing
+    /// handshake ran, because 0-RTT keys are derived under it. A legacy
+    /// (`TICKET13_FORMAT`) ticket still resumes, but names no suite and is
+    /// therefore never 0-RTT eligible.
+    #[test]
+    fn ticket_records_issuing_cipher_suite() {
+        use crate::cipher::{Aes256, Gcm};
+        let key = [0x5au8; 32];
+        let now = super::system_now_u64();
+
+        // Legacy layout: decodes, but carries no suite.
+        let legacy = super::decrypt_ticket(&key, &synth_ticket(&key, now, b""), now, 0)
+            .expect("legacy ticket still resumes");
+        assert!(
+            legacy.suite.is_none(),
+            "a ticket with no recorded suite must not be 0-RTT eligible"
+        );
+
+        // Current layout: the suite round-trips.
+        let suite = CipherSuite::AES_256_GCM_SHA384;
+        let mut plain = Vec::new();
+        plain.push(super::TICKET13_FORMAT_SUITE);
+        plain.extend_from_slice(&now.to_be_bytes());
+        plain.extend_from_slice(&0u32.to_be_bytes());
+        plain.extend_from_slice(&suite.0.to_be_bytes());
+        plain.push(32);
+        plain.extend_from_slice(&[0xABu8; 32]);
+        plain.push(0); // no alpn
+        plain.push(0); // not client-authenticated
+        let nonce = [0x42u8; 12];
+        let gcm = Gcm::new(Aes256::new(&key));
+        let mut buf = plain;
+        let tag = gcm.encrypt(&nonce, super::TICKET13_AAD, &mut buf);
+        let mut wire = Vec::with_capacity(12 + buf.len() + 16);
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&buf);
+        wire.extend_from_slice(&tag);
+        let decoded = super::decrypt_ticket(&key, &wire, now, 0).expect("v2 ticket decodes");
+        assert_eq!(decoded.suite, Some(suite));
     }
 
     /// TLS-CORE-4 — tickets are domain-separated by version and format:

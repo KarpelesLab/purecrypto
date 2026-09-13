@@ -592,6 +592,31 @@ mod quic_mode_tests {
         // the record stream is never used (covered by the loopback test).
     }
 
+    /// RFC 9001 §6: QUIC does not use the TLS 1.3 `KeyUpdate` message —
+    /// key updates ride the Key Phase bit instead. A peer sending one over
+    /// the QUIC handshake stream must be rejected with `unexpected_message`
+    /// on both sides (it used to be silently accepted in release builds,
+    /// re-keying a record layer QUIC does not use, and a
+    /// `KeyUpdate(update_requested)` then walked into `send_key_update`'s
+    /// `debug_assert!(false)`).
+    #[test]
+    fn quic_mode_rejects_tls_key_update() {
+        let (mut client, mut server, _ch, _sh, _c_hist, _s_hist) =
+            run_quic_handshake(CipherSuite::AES_128_GCM_SHA256, NamedGroup::X25519);
+        assert!(!client.is_handshaking() && !server.is_handshaking());
+
+        // `KeyUpdate(update_requested)`: type 24, length 1, body `0x01`.
+        let ku: Vec<u8> = alloc::vec![24, 0x00, 0x00, 0x01, 0x01];
+        assert!(matches!(
+            client.handle_handshake_for_test(ku.clone()),
+            Err(crate::tls::Error::UnexpectedMessage)
+        ));
+        assert!(matches!(
+            server.handle_handshake_for_test(ku),
+            Err(crate::tls::Error::UnexpectedMessage)
+        ));
+    }
+
     /// The 0x39 extension survives a round-trip through ClientHello,
     /// AND through EncryptedExtensions (the other test asserts equality
     /// of the captured bodies). This test additionally encodes a CH
@@ -7889,6 +7914,7 @@ mod audit_regression_tests {
             max_early_data_size: None,
             negotiated_alpn: None,
             cipher_suite_hash: HashAlg::Sha256,
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256.0,
         };
         let d = alloc::format!("{s:?}");
         assert!(d.contains("redacted"), "{d}");
