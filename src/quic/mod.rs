@@ -66,6 +66,6 @@ pub use ecn::EcnCodepoint;
 pub use peek::peek_initial_sni;
 // Re-export so callers can name the peek's return type from `quic` directly.
 pub use crate::tls::ClientHelloInfo;
-pub use server::{DEFAULT_MAX_CONNECTIONS, QuicServer};
+pub use server::{DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HALF_OPEN, QuicServer};
 pub use stream::StreamId;
 pub use transport_params::{PreferredAddress, TransportParameters};

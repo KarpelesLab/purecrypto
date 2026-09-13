@@ -102,8 +102,8 @@ use crate::quic::transport_params::{PreferredAddress, TransportParameters};
 use crate::quic::varint;
 use crate::rng::{OsRng, RngCore};
 use crate::tls::conn::{ClientConfig, ClientConnection, ServerConfig, ServerConnection};
-use crate::tls::{AlertDescription, Error};
 use crate::tls::quic_hooks::{Direction, Level};
+use crate::tls::{AlertDescription, Error};
 
 /// Maps a TLS encryption level to its QUIC packet-number space
 /// (RFC 9000 §12.3). 0-RTT and 1-RTT share the Application space.
@@ -7920,12 +7920,6 @@ mod tests {
         );
     }
 
-    /// RFC 9000 §9.6 / §8.1 — a client moving to the server's preferred
-    /// address opens a fresh path with an empty budget. Its PATH_CHALLENGE
-    /// still goes out (expanded per §8.2.1) and is charged to the path, but
-    /// nothing else may until the server's echo validates it — the client
-    /// used to bound this only structurally, with no accounting at all.
-    #[test]
     /// L-6 — a PATH_RESPONSE is elicited by whoever sends a PATH_CHALLENGE,
     /// so it must not be a free, unmetered, 1200-byte-padded datagram aimed
     /// at wherever this endpoint happens to be sending. Two rules: it goes
@@ -7989,6 +7983,12 @@ mod tests {
         let _ = &mut s;
     }
 
+    /// RFC 9000 §9.6 / §8.1 — a client moving to the server's preferred
+    /// address opens a fresh path with an empty budget. Its PATH_CHALLENGE
+    /// still goes out (expanded per §8.2.1) and is charged to the path, but
+    /// nothing else may until the server's echo validates it — the client
+    /// used to bound this only structurally, with no accounting at all.
+    #[test]
     fn client_probe_to_preferred_address_is_charged_but_never_starved() {
         use std::net::{Ipv4Addr, SocketAddrV4};
         let old_addr = ip4(192, 0, 2, 1, 5555);
@@ -12427,7 +12427,9 @@ mod tests {
         assert!(!server.is_handshake_complete());
 
         let sid = client.open_bidi().expect("open");
-        client.write(sid, b"unauthenticated-request").expect("write");
+        client
+            .write(sid, b"unauthenticated-request")
+            .expect("write");
 
         // Deliver only the 1-RTT packets; drop every long-header packet (the
         // client's Handshake-level Finished among them).

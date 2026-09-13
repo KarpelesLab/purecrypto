@@ -176,7 +176,11 @@ impl PathChallengeState {
     pub(crate) fn on_challenge(&mut self, data: [u8; 8], from: Option<SocketAddr>) {
         if self.pending_response.len() < PATH_CHALLENGE_CAP {
             // Avoid duplicating an identical outstanding response.
-            if !self.pending_response.iter().any(|(d, a)| *d == data && *a == from) {
+            if !self
+                .pending_response
+                .iter()
+                .any(|(d, a)| *d == data && *a == from)
+            {
                 self.pending_response.push((data, from));
             }
         }

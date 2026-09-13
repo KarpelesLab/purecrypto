@@ -2393,12 +2393,6 @@ mod tests {
         assert!(s.stream_high_offset.is_empty());
     }
 
-    /// A STREAM frame on a peer-initiated stream ID that exceeds the
-    /// advertised stream limit (STREAM_LIMIT_ERROR) must be rejected
-    /// WITHOUT charging connection-level flow-control credit or
-    /// recording a high-water mark — admission runs before the FC
-    /// charge.
-    #[test]
     /// RFC 9000 §4.1 — connection-level flow-control credit must not be
     /// charged for a frame the stream layer goes on to reject. The charge
     /// (and the stream's high-water mark) used to be committed *before*
@@ -2443,6 +2437,11 @@ mod tests {
         assert_eq!(s.take_error_code(), Some(ERROR_FINAL_SIZE));
     }
 
+    /// A STREAM frame on a peer-initiated stream ID that exceeds the
+    /// advertised stream limit (STREAM_LIMIT_ERROR) must be rejected
+    /// WITHOUT charging connection-level flow-control credit or
+    /// recording a high-water mark — admission runs before the FC
+    /// charge.
     #[test]
     fn stream_limit_violation_does_not_charge_conn_fc() {
         let our = TransportParameters {

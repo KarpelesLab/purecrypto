@@ -298,7 +298,10 @@ impl QuicServer {
     /// Number of hosted connections whose peer address is not yet validated
     /// (RFC 9000 §8.1) — the state a source-address flood can create.
     pub fn half_open_count(&self) -> usize {
-        self.conns.values().filter(|h| Self::is_half_open(h)).count()
+        self.conns
+            .values()
+            .filter(|h| Self::is_half_open(h))
+            .count()
     }
 
     /// The cap on simultaneously half-open connections. Defaults to
@@ -915,7 +918,8 @@ mod server_tests {
         for i in 0..8u16 {
             let mut spoof = client(&cert);
             let dg = spoof.pop_datagram();
-            srv.recv(addr(42200 + i), EcnCodepoint::NotEct, &dg).unwrap();
+            srv.recv(addr(42200 + i), EcnCodepoint::NotEct, &dg)
+                .unwrap();
             while srv.poll_transmit().is_some() {}
         }
         assert_eq!(srv.connection_count(), 2, "one established + one half-open");
