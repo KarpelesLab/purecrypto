@@ -30,11 +30,11 @@ use crate::kdf::pbkdf2;
 #[non_exhaustive]
 pub enum Error {
     /// One of `log_n`, `r`, `p`, or `dkLen` is outside the enforced range:
-    /// `log_n` must be in `1..64`, `r ≥ 1`, `p ≥ 1`, `r·N < 2³⁰`, and
-    /// `p · ⌈dkLen/32⌉ ≤ (2³² − 1)`. Note `r·N < 2³⁰` is the bound this
-    /// implementation enforces; it is sound but is *not* the RFC 7914 §1
-    /// relation `N < 2^(128·r/8)`, which is not separately checked. `p` has
-    /// no independent upper bound (see [`scrypt`]).
+    /// `log_n` must be in `1..64`, `r ≥ 1`, `p ≥ 1`, `r·N < 2³⁰`,
+    /// `N < 2^(16·r)` (RFC 7914 §1), `p ≤ ((2³² − 1)·32)/(128·r)` (RFC 7914
+    /// §2), and `p · ⌈dkLen/32⌉ ≤ (2³² − 1)`. Beyond those, total work still
+    /// scales with `p`, so untrusted parameters need a caller-side clamp (see
+    /// [`scrypt`]).
     InvalidParam,
 }
 
@@ -51,18 +51,21 @@ impl core::error::Error for Error {}
 ///
 /// # Enforced bounds
 ///
-/// The memory/CPU bound this function checks is `r·N < 2³⁰` (with
-/// `N = 2^log_n`), which caps the `128·r·N`-byte ROMix allocation. This is
-/// *not* the RFC 7914 §1 relation `N < 2^(128·r/8)`; that relation is not
-/// separately enforced.
+/// - `r·N < 2³⁰` (with `N = 2^log_n`), which caps the `128·r·N`-byte ROMix
+///   allocation;
+/// - `N < 2^(16·r)`, the RFC 7914 §1 relation (`N < 2^(128·r/8)`) — for
+///   `r = 1` it limits `N` to `2^15`;
+/// - `p ≤ ((2³² − 1)·32)/(128·r)` and `p · ⌈dkLen/32⌉ ≤ 2³² − 1`, the RFC 7914
+///   §2 constraints that keep both PBKDF2 expansions inside their 32-bit block
+///   counters.
 ///
 /// # Untrusted parameters
 ///
-/// `p` has **no independent upper bound** here: total work scales with `p`,
-/// so a large `p` (with `log_n`/`r` each individually small enough to pass
-/// the `r·N` check) is a CPU-exhaustion DoS vector. Callers that derive
-/// `(log_n, r, p)` from untrusted input (e.g. a parsed PHC `$scrypt$`
-/// string) MUST clamp them to sane maxima themselves before calling.
+/// Those are *structural* bounds, not a work cap: total work still scales with
+/// `p` (and with `r·N`), so a large `p` that satisfies them all is still a
+/// CPU-exhaustion DoS vector. Callers that derive `(log_n, r, p)` from
+/// untrusted input (e.g. a parsed PHC `$scrypt$` string) MUST clamp them to
+/// sane maxima themselves before calling.
 pub fn scrypt(
     password: &[u8],
     salt: &[u8],
@@ -76,6 +79,13 @@ pub fn scrypt(
         return Err(Error::InvalidParam);
     }
     let n: u64 = 1u64 << log_n;
+    // RFC 7914 §1: N < 2^(128·r/8) = 2^(16·r). Only binding for r = 1 (N <
+    // 2^15) and r = 2 (N < 2^32); for r ≥ 4 the r·N bound below is stricter.
+    // Enforced so a caller cannot ask for a parameter set the specification
+    // does not define.
+    if 16u64.saturating_mul(r as u64) <= log_n as u64 {
+        return Err(Error::InvalidParam);
+    }
     // r · N < 2³⁰
     let rn = (r as u64).checked_mul(n).ok_or(Error::InvalidParam)?;
     if rn >= (1u64 << 30) {
@@ -102,10 +112,10 @@ pub fn scrypt(
         return Err(Error::InvalidParam);
     }
     // The first expansion derives p·128·r bytes = 4·r·p blocks, which must
-    // also fit the 32-bit block counter (RFC 7914 §2:
-    // p ≤ ((2³² − 1) · hLen) / MFLen). Checked here, before the b/v
-    // allocations, so violating params return InvalidParam rather than
-    // aborting on a huge allocation or panicking inside pbkdf2.
+    // also fit the 32-bit block counter: this is exactly RFC 7914 §2's
+    // p ≤ ((2³² − 1) · hLen) / MFLen = ((2³² − 1)·32) / (128·r). Checked here,
+    // before the b/v allocations, so violating params return InvalidParam
+    // rather than aborting on a huge allocation or panicking inside pbkdf2.
     if 4u64 * (r as u64) * (p as u64) > u32::MAX as u64 {
         return Err(Error::InvalidParam);
     }
@@ -278,6 +288,16 @@ mod tests {
             scrypt(b"p", b"s", 30, 1, 1, &mut out),
             Err(Error::InvalidParam)
         );
+        // RFC 7914 §1: N < 2^(16·r). With r = 1 that caps N at 2^15, so
+        // log_n = 16 is out of range even though r·N is well under 2³⁰ …
+        assert_eq!(
+            scrypt(b"p", b"s", 16, 1, 1, &mut out),
+            Err(Error::InvalidParam)
+        );
+        // … while the largest in-range N for r = 1 still works, and r = 2
+        // lifts the ceiling (N = 2^16 is then fine).
+        assert!(scrypt(b"p", b"s", 15, 1, 1, &mut out).is_ok());
+        assert!(scrypt(b"p", b"s", 16, 2, 1, &mut out).is_ok());
         // p · ⌈dkLen/32⌉ > 2³² − 1 → reject (documented bound) — must
         // return InvalidParam before any allocation / PBKDF2 panic.
         let mut out64 = [0u8; 64];

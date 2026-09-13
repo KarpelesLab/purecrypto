@@ -52,6 +52,10 @@ pub enum Error {
     /// The requested output length cannot be produced because the number of
     /// PRF blocks would overflow the 32-bit counter `i`.
     OutputTooLong,
+    /// `KI` is not a valid key for the chosen PRF. Only the fixed-key-size
+    /// PRFs can return this: AES-CMAC needs exactly 16 (`CmacAes128Prf`) or 32
+    /// (`CmacAes256Prf`) bytes, while HMAC accepts any key length.
+    InvalidKeyLength,
 }
 
 impl core::fmt::Display for Error {
@@ -59,6 +63,7 @@ impl core::fmt::Display for Error {
         match self {
             Error::ZeroLength => f.write_str("KBKDF output length must be non-zero"),
             Error::OutputTooLong => f.write_str("KBKDF output length exceeds 2^32-1 PRF blocks"),
+            Error::InvalidKeyLength => f.write_str("KBKDF key length invalid for this PRF"),
         }
     }
 }
@@ -80,7 +85,26 @@ pub trait Prf {
     const OUTPUT_LEN: usize;
 
     /// Creates a PRF instance keyed with `ki`.
+    ///
+    /// # Panics
+    /// Implementations with a fixed key size (AES-CMAC) panic if `ki` is the
+    /// wrong length. Use [`try_init`](Prf::try_init) — which the KBKDF entry
+    /// points themselves call — when the key length is not statically known.
     fn init(ki: &[u8]) -> Self;
+
+    /// Fallible [`init`](Prf::init): returns [`Error::InvalidKeyLength`]
+    /// instead of panicking when `ki` cannot key this PRF.
+    ///
+    /// The default implementation accepts every key length, which is correct
+    /// for HMAC; the fixed-key-size PRFs override it. Every `kbkdf_*` entry
+    /// point keys through this method, so a runtime-supplied `KI` of the wrong
+    /// length is reported as an error rather than aborting the process.
+    fn try_init(ki: &[u8]) -> Result<Self, Error>
+    where
+        Self: Sized,
+    {
+        Ok(Self::init(ki))
+    }
 
     /// Feeds input bytes for the current PRF block.
     fn update(&mut self, data: &[u8]);
@@ -174,10 +198,11 @@ pub struct CmacAes256Prf(CmacPrf<Aes256>);
 impl Prf for CmacAes128Prf {
     const OUTPUT_LEN: usize = 16;
     fn init(ki: &[u8]) -> Self {
-        assert_eq!(ki.len(), 16, "CMAC-AES-128 key must be 16 bytes");
-        let mut key = [0u8; 16];
-        key.copy_from_slice(ki);
-        CmacAes128Prf(CmacPrf::from_cipher(Aes128::new(&key)))
+        Self::try_init(ki).expect("CMAC-AES-128 key must be 16 bytes")
+    }
+    fn try_init(ki: &[u8]) -> Result<Self, Error> {
+        let key: [u8; 16] = ki.try_into().map_err(|_| Error::InvalidKeyLength)?;
+        Ok(CmacAes128Prf(CmacPrf::from_cipher(Aes128::new(&key))))
     }
     fn update(&mut self, data: &[u8]) {
         self.0.update(data);
@@ -190,10 +215,11 @@ impl Prf for CmacAes128Prf {
 impl Prf for CmacAes256Prf {
     const OUTPUT_LEN: usize = 16;
     fn init(ki: &[u8]) -> Self {
-        assert_eq!(ki.len(), 32, "CMAC-AES-256 key must be 32 bytes");
-        let mut key = [0u8; 32];
-        key.copy_from_slice(ki);
-        CmacAes256Prf(CmacPrf::from_cipher(Aes256::new(&key)))
+        Self::try_init(ki).expect("CMAC-AES-256 key must be 32 bytes")
+    }
+    fn try_init(ki: &[u8]) -> Result<Self, Error> {
+        let key: [u8; 32] = ki.try_into().map_err(|_| Error::InvalidKeyLength)?;
+        Ok(CmacAes256Prf(CmacPrf::from_cipher(Aes256::new(&key))))
     }
     fn update(&mut self, data: &[u8]) {
         self.0.update(data);
@@ -230,7 +256,7 @@ fn block_count(out_len: usize, prf_out: usize) -> Result<u32, Error> {
 /// if more than `2^32 - 1` PRF blocks would be required.
 pub fn kbkdf_counter_fixed<P: Prf>(ki: &[u8], fixed: &[u8], out: &mut [u8]) -> Result<(), Error> {
     let blocks = block_count(out.len(), P::OUTPUT_LEN)?;
-    let mut prf = P::init(ki);
+    let mut prf = P::try_init(ki)?;
     let mut block = [0u8; MAX_PRF_OUTPUT];
     let h = P::OUTPUT_LEN;
     let mut filled = 0;
@@ -263,7 +289,7 @@ pub fn kbkdf_feedback_fixed<P: Prf>(
     out: &mut [u8],
 ) -> Result<(), Error> {
     let blocks = block_count(out.len(), P::OUTPUT_LEN)?;
-    let mut prf = P::init(ki);
+    let mut prf = P::try_init(ki)?;
     let h = P::OUTPUT_LEN;
     // K(i-1): K(0) = IV is fed from the caller's slice (any length); every
     // subsequent K(i) is exactly `h` bytes.
@@ -325,7 +351,7 @@ pub fn kbkdf_counter<P: Prf>(
 ) -> Result<(), Error> {
     let blocks = block_count(out.len(), P::OUTPUT_LEN)?;
     let l_bits = output_len_bits(out.len())?;
-    let mut prf = P::init(ki);
+    let mut prf = P::try_init(ki)?;
     let mut block = [0u8; MAX_PRF_OUTPUT];
     let h = P::OUTPUT_LEN;
     let mut filled = 0;
@@ -359,7 +385,7 @@ pub fn kbkdf_feedback<P: Prf>(
 ) -> Result<(), Error> {
     let blocks = block_count(out.len(), P::OUTPUT_LEN)?;
     let l_bits = output_len_bits(out.len())?;
-    let mut prf = P::init(ki);
+    let mut prf = P::try_init(ki)?;
     let h = P::OUTPUT_LEN;
     let mut prev = [0u8; MAX_PRF_OUTPUT];
     let mut block = [0u8; MAX_PRF_OUTPUT];
@@ -586,6 +612,42 @@ mod tests {
         let mut short = [0u8; 50];
         kbkdf_counter_fixed::<HmacSha256Prf>(ki, fixed, &mut short).unwrap();
         assert_eq!(short, full[..50]);
+    }
+
+    // A wrong-length CMAC key is a runtime input (it can come from a config
+    // file or the wire), so it must be an error rather than a panic.
+    #[test]
+    fn cmac_wrong_key_length_is_an_error() {
+        let mut out = [0u8; 32];
+        for bad in [0usize, 1, 15, 17, 32, 64] {
+            let ki = alloc::vec![0x11u8; bad];
+            assert_eq!(
+                kbkdf_counter::<CmacAes128Prf>(&ki, b"l", b"c", &mut out),
+                Err(Error::InvalidKeyLength),
+                "AES-128 key of {bad} bytes"
+            );
+            assert_eq!(
+                kbkdf_counter_fixed::<CmacAes128Prf>(&ki, b"fixed", &mut out),
+                Err(Error::InvalidKeyLength)
+            );
+        }
+        for bad in [0usize, 16, 31, 33] {
+            let ki = alloc::vec![0x22u8; bad];
+            assert_eq!(
+                kbkdf_feedback::<CmacAes256Prf>(&ki, b"iv", b"l", b"c", &mut out),
+                Err(Error::InvalidKeyLength),
+                "AES-256 key of {bad} bytes"
+            );
+            assert_eq!(
+                kbkdf_feedback_fixed::<CmacAes256Prf>(&ki, b"iv", b"fixed", &mut out),
+                Err(Error::InvalidKeyLength)
+            );
+        }
+        // Correct lengths still derive.
+        assert!(kbkdf_counter::<CmacAes128Prf>(&[0x11; 16], b"l", b"c", &mut out).is_ok());
+        assert!(kbkdf_counter::<CmacAes256Prf>(&[0x22; 32], b"l", b"c", &mut out).is_ok());
+        // HMAC keeps accepting any key length.
+        assert!(kbkdf_counter::<HmacSha256Prf>(b"", b"l", b"c", &mut out).is_ok());
     }
 
     // Zero-length output is rejected.

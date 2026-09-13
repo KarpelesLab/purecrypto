@@ -97,7 +97,8 @@ pub enum Error {
     /// derived key was somehow wrong. Returned as one variant to avoid a
     /// padding oracle.
     Decryption,
-    /// Iteration count below the floor we accept (currently 10_000).
+    /// KDF parameters below the floor we accept: an iteration count under
+    /// 10_000, or an empty PBKDF2 salt.
     WeakKdfParameters,
     /// Iteration count above the ceiling we accept (currently
     /// 10_000_000). The count is attacker-controlled on decrypt; without
@@ -220,7 +221,9 @@ pub fn encrypt(
 /// `10_000 ..= 10_000_000`; counts below the floor are rejected as
 /// [`Error::WeakKdfParameters`], counts above the ceiling as
 /// [`Error::ExcessiveKdfParameters`] (the count is attacker-controlled,
-/// so an uncapped value is a CPU-exhaustion vector).
+/// so an uncapped value is a CPU-exhaustion vector). The PBKDF2 salt must
+/// also be present: an empty one is rejected as
+/// [`Error::WeakKdfParameters`].
 pub fn decrypt(encrypted_pkcs8_der: &[u8], password: &[u8]) -> Result<Vec<u8>, Error> {
     // ---- Outer SEQUENCE ----
     let mut reader = Reader::new(encrypted_pkcs8_der);
@@ -344,6 +347,15 @@ fn parse_kdf_algid(r: &mut Reader<'_>) -> Result<(KdfChoice, Vec<u8>), Error> {
         .read_octet_string()
         .map_err(|_| Error::BadEncoding)?
         .to_vec();
+    // An empty salt makes the derived key a pure function of the password, so
+    // one precomputed table breaks every file encrypted with this envelope.
+    // RFC 8018 §4.1 requires a salt; reject its absence like any other
+    // below-floor KDF parameter. (Only emptiness is rejected: real-world
+    // envelopes use 8- or 16-byte salts, and `encrypt` asserts ≥ 8, but a
+    // short-yet-present salt is left to interoperate.)
+    if salt.is_empty() {
+        return Err(Error::WeakKdfParameters);
+    }
     let iter_bytes = p.read_integer_bytes().map_err(|_| Error::BadEncoding)?;
     let iterations = iteration_count_to_u32(iter_bytes)?;
     if iterations < MIN_PBKDF2_ITERATIONS {
@@ -786,6 +798,39 @@ mod tests {
         let ct = alloc::vec![0u8; 16];
         let blob = encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat());
         assert_eq!(decrypt(&blob, b"x"), Err(Error::WeakKdfParameters));
+    }
+
+    /// An envelope whose PBKDF2 salt is absent (a zero-length OCTET STRING)
+    /// makes the derived key a pure function of the password — one rainbow
+    /// table for every such file — so it must be rejected outright, with a
+    /// well-formed 16-byte salt otherwise identical envelope accepted.
+    #[test]
+    fn reject_empty_pbkdf2_salt() {
+        let build = |salt: &[u8]| {
+            let prf = encode_sequence(
+                &[oid_tlv(OID_HMAC_WITH_SHA256), crate::der::encode_null()].concat(),
+            );
+            let kdf_params = encode_sequence(
+                &[
+                    encode_octet_string(salt),
+                    encode_integer(&20_000u32.to_be_bytes()),
+                    prf,
+                ]
+                .concat(),
+            );
+            let kdf_algid = encode_sequence(&[oid_tlv(OID_PBKDF2), kdf_params].concat());
+            let iv = [0u8; 16];
+            let cipher_algid =
+                encode_sequence(&[oid_tlv(OID_AES256_CBC_PAD), encode_octet_string(&iv)].concat());
+            let pbes2_params = encode_sequence(&[kdf_algid, cipher_algid].concat());
+            let outer_algid = encode_sequence(&[oid_tlv(OID_PBES2), pbes2_params].concat());
+            let ct = alloc::vec![0u8; 16];
+            encode_sequence(&[outer_algid, encode_octet_string(&ct)].concat())
+        };
+        assert_eq!(decrypt(&build(&[]), b"x"), Err(Error::WeakKdfParameters));
+        // With a salt the parameters pass, and the (garbage) ciphertext then
+        // fails the decryption check instead.
+        assert_eq!(decrypt(&build(&[7u8; 16]), b"x"), Err(Error::Decryption));
     }
 
     /// Handcraft an EncryptedPrivateKeyInfo with PBKDF2 iterations far
