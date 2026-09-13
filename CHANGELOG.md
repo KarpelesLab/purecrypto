@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/KarpelesLab/purecrypto/compare/v0.8.4...v0.9.0) - 2026-09-13
+
+### Added
+
+- *(hpke)* [**breaking**] build without alloc
+- *(zkp)* zkp-rangeproof no longer requires alloc
+- *(zkp)* zkp-halfagg no longer requires alloc
+
+### Fixed
+
+- *(ec)* gate EC_PUBLIC_KEY_OID on the der feature
+- *(zkp)* zkp-adaptor no longer requires alloc
+
+### Other
+
+- *(zkp)* record which modules need an allocator and why
+
 ## [0.8.4](https://github.com/KarpelesLab/purecrypto/compare/v0.8.3...v0.8.4) - 2026-09-13
 
 ### Added
