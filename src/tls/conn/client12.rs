@@ -738,7 +738,12 @@ impl ClientConnection12 {
             crate::rng::HmacDrbg::<crate::hash::Sha256>::new(&seed, b"tls12-legacy-client", &[])
         };
 
-        let config_max_version = config.max_version;
+        // Without the legacy opt-in this engine always tops out at TLS 1.2,
+        // so the ClientHello always carries `extended_master_secret`.
+        #[cfg(feature = "tls-legacy")]
+        let offers_ems = config.max_version.as_u16() >= ProtocolVersion::TLSv1_2.as_u16();
+        #[cfg(not(feature = "tls-legacy"))]
+        let offers_ems = true;
         let mut conn = ClientConnection12 {
             config,
             server_name: String::from(server_name),
@@ -785,7 +790,7 @@ impl ClientConnection12 {
             // `ems_used`. A pure-legacy client (max < TLS 1.2) emits no EMS
             // extension, so the flag must mirror that — the require-EMS
             // checks key off it.
-            ems_offered: config_max_version.as_u16() >= ProtocolVersion::TLSv1_2.as_u16(),
+            ems_offered: offers_ems,
             ems_negotiated: false,
             ems_session_hash: None,
             server_echoed_ocsp_staple: false,
