@@ -112,6 +112,10 @@ const MAX_ITERATIONS: u32 = 10_000_000;
 /// a pre-authentication DoS.
 const MAX_PBMAC1_KEY_LEN: usize = 64;
 
+/// Lower bound on the PBMAC1 PBKDF2 `keyLength`: the HMAC-SHA-256 output
+/// length, as RFC 9579 §5 requires (OpenSSL 3.4 enforces the same floor).
+const PBMAC1_MIN_KEY_LEN: usize = 32;
+
 /// Cumulative KDF iteration budget for one [`Pfx::parse`] call.
 ///
 /// [`MAX_ITERATIONS`] bounds each *individual* KDF run, but nothing bounded the
@@ -866,23 +870,27 @@ fn pbmac1_compute(alg: &mut Reader<'_>, password: &str, content: &[u8]) -> Resul
     let mut p = kdf.read_sequence()?;
     let salt = p.read_octet_string()?.to_vec();
     let iterations = read_iterations(&mut p)?;
-    // Optional keyLength.
-    let mut key_len = 32usize;
-    if let Some(t) = p.peek_tag()
-        && t == tag::INTEGER
-    {
-        key_len = read_iterations(&mut p)? as usize;
-        // Bound the attacker-controlled keyLength *before* allocating or
-        // running PBKDF2: this is processed pre-MAC-verification, so an
-        // unbounded value is a pre-auth memory/CPU DoS. A key longer than
-        // the HMAC-SHA-256 block buys no security anyway.
-        if key_len == 0 || key_len > MAX_PBMAC1_KEY_LEN {
-            return Err(Error::BadParameters);
-        }
+    // keyLength: RFC 9579 §5 says it MUST be present and set to the output
+    // length of the HMAC. It is attacker-controlled and consulted *before*
+    // the MAC is verified, so it must be pinned from below as well as above:
+    // a 1-byte key would make the password effectively 8 bits wide (a forged
+    // archive would then "verify" under ~1/256 of all passwords). We require
+    // at least the HMAC-SHA-256 output length (32) and cap it at the PRF block
+    // size (pre-auth DoS guard, see [`MAX_PBMAC1_KEY_LEN`]).
+    if p.peek_tag() != Some(tag::INTEGER) {
+        return Err(Error::BadParameters);
     }
-    // Optional PRF: must be HMAC-SHA-256 if present.
-    if let Some(t) = p.peek_tag()
-        && t == tag::SEQUENCE
+    let key_len = read_iterations(&mut p)? as usize;
+    if !(PBMAC1_MIN_KEY_LEN..=MAX_PBMAC1_KEY_LEN).contains(&key_len) {
+        return Err(Error::BadParameters);
+    }
+    // PRF: RFC 9579 §5 requires it to match the messageAuthScheme HMAC. An
+    // absent PRF means the PKCS#5 DEFAULT (hmacWithSHA1), which can never
+    // match the only wired MAC (HMAC-SHA-256), so it is rejected rather than
+    // silently reinterpreted as SHA-256.
+    if p.peek_tag() != Some(tag::SEQUENCE) {
+        return Err(Error::UnsupportedAlgorithm);
+    }
     {
         let mut prf = p.read_sequence()?;
         let prf_oid = parse_oid(prf.read_oid()?)?;

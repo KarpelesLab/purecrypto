@@ -340,3 +340,117 @@ fn real_archives_stay_within_the_budget() {
     Pfx::parse(P12_DEFAULT, PASSWORD).expect("OpenSSL 3 default within budget");
     Pfx::parse(P12_LEGACY, PASSWORD).expect("OpenSSL legacy within budget");
 }
+
+// ---------------------------------------------------------------------------
+// PBMAC1 (RFC 9579) parameter validation
+// ---------------------------------------------------------------------------
+
+/// Builds a PBMAC1 `MacData` over `content`. `key_len`/`with_prf` let tests
+/// omit or weaken the PBKDF2 parameters; `tag_key_len` is the key length the
+/// tag is actually computed under (what a forger would use).
+fn pbmac1_mac_data(
+    content: &[u8],
+    password: &str,
+    key_len: Option<u32>,
+    with_prf: bool,
+    tag_key_len: usize,
+) -> Vec<u8> {
+    let salt = [0x42u8; 16];
+    let iterations = 1u32;
+    let hmac_alg = encode_sequence(&[oid_tlv(OID_HMAC_SHA256), crate::der::encode_null()].concat());
+    let mut kdf_params = encode_octet_string(&salt);
+    kdf_params.extend_from_slice(&encode_integer(&iterations.to_be_bytes()));
+    if let Some(k) = key_len {
+        kdf_params.extend_from_slice(&encode_integer(&k.to_be_bytes()));
+    }
+    if with_prf {
+        kdf_params.extend_from_slice(&hmac_alg);
+    }
+    let kdf = encode_sequence(&[oid_tlv(OID_PBKDF2), encode_sequence(&kdf_params)].concat());
+    let params = encode_sequence(&[kdf, hmac_alg].concat());
+    let alg = encode_sequence(&[oid_tlv(OID_PBMAC1), params].concat());
+
+    let mut key = vec![0u8; tag_key_len];
+    crate::kdf::pbkdf2::<Sha256>(password.as_bytes(), &salt, iterations, &mut key);
+    let tag = Hmac::<Sha256>::mac(&key, content);
+    let digest_info = encode_sequence(&[alg, encode_octet_string(tag.as_ref())].concat());
+    encode_sequence(
+        &[
+            digest_info,
+            encode_octet_string(&[0u8; 8]),
+            encode_integer(&[0x01]),
+        ]
+        .concat(),
+    )
+}
+
+fn pbmac1_verify(mac: &[u8], content: &[u8], password: &str) -> Result<(), Error> {
+    verify_mac(mac, content, password, &password_to_bmp(password))
+}
+
+#[test]
+fn pbmac1_well_formed_verifies() {
+    let content = b"authenticated safe";
+    let mac = pbmac1_mac_data(content, "hunter2", Some(32), true, 32);
+    assert_eq!(pbmac1_verify(&mac, content, "hunter2"), Ok(()));
+    assert_eq!(
+        pbmac1_verify(&mac, content, "hunter3"),
+        Err(Error::MacMismatch)
+    );
+}
+
+/// Regression: a forged archive declaring `keyLength = 1` used to verify under
+/// roughly 1/256 of all passwords (a 1-byte HMAC key). RFC 9579 requires the
+/// key length to equal the HMAC output length, so short keys are refused.
+#[test]
+fn pbmac1_short_key_length_rejected() {
+    let content = b"forged";
+    for k in [1u32, 16, 20, 31] {
+        let mac = pbmac1_mac_data(content, "any", Some(k), true, k as usize);
+        assert_eq!(
+            pbmac1_verify(&mac, content, "any"),
+            Err(Error::BadParameters),
+            "keyLength {k}"
+        );
+    }
+    // Original PoC shape: count passwords a 1-byte-key forgery verifies under.
+    let mac = pbmac1_mac_data(content, "attacker", Some(1), true, 1);
+    let accepted = (0..500)
+        .filter(|i| pbmac1_verify(&mac, content, &alloc::format!("pw{i}")).is_ok())
+        .count();
+    assert_eq!(accepted, 0);
+}
+
+#[test]
+fn pbmac1_missing_key_length_rejected() {
+    let content = b"x";
+    let mac = pbmac1_mac_data(content, "pw", None, true, 32);
+    assert_eq!(
+        pbmac1_verify(&mac, content, "pw"),
+        Err(Error::BadParameters)
+    );
+}
+
+#[test]
+fn pbmac1_missing_prf_rejected() {
+    // An absent PRF is the PKCS#5 default hmacWithSHA1, which cannot match
+    // the HMAC-SHA-256 messageAuthScheme.
+    let content = b"x";
+    let mac = pbmac1_mac_data(content, "pw", Some(32), false, 32);
+    assert_eq!(
+        pbmac1_verify(&mac, content, "pw"),
+        Err(Error::UnsupportedAlgorithm)
+    );
+}
+
+#[test]
+fn pbmac1_oversized_key_length_rejected() {
+    let content = b"x";
+    let mac = pbmac1_mac_data(content, "pw", Some(65), true, 65);
+    assert_eq!(
+        pbmac1_verify(&mac, content, "pw"),
+        Err(Error::BadParameters)
+    );
+    let mac = pbmac1_mac_data(content, "pw", Some(64), true, 64);
+    assert_eq!(pbmac1_verify(&mac, content, "pw"), Ok(()));
+}
