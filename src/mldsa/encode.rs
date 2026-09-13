@@ -269,8 +269,17 @@ pub(crate) fn pack_hint(hints: &[Poly], omega: usize, out: &mut [u8]) {
 
 /// Unpacks the hint into `hints`, rejecting malformed encodings (non-increasing
 /// positions, out-of-range counts, or non-zero padding).
+///
+/// `hints` is fully **overwritten**: every polynomial is cleared first, so the
+/// decoded hint is exactly what `b` encodes and never the union of `b` with
+/// whatever the caller's buffer happened to hold. (The `hazmat` surface hands
+/// this buffer to the caller, and OR-ing into a reused one would let a stale
+/// hint bit change which high-bit correction `use_hint` applies.)
 pub(crate) fn unpack_hint(b: &[u8], hints: &mut [Poly], omega: usize) -> bool {
     let k = hints.len();
+    for h in hints.iter_mut() {
+        *h = Poly::zero();
+    }
     let mut idx = 0usize;
     for i in 0..k {
         let limit = b[omega + i] as usize;

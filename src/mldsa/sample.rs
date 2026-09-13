@@ -79,6 +79,13 @@ pub(crate) fn sample_ntt_xn<const L: usize>(rho: &[u8], sr: [(u8, u8); L]) -> [P
 /// RejBoundedPoly (Algorithm 31): coefficients in `[−η, η]` from
 /// `SHAKE256(seed ‖ nonce)`.
 pub(crate) fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
+    // FIPS 204 defines RejBoundedPoly only for eta in {2, 4}; the `else` arm
+    // below is the eta = 4 rule, so any other value would silently sample the
+    // wrong distribution. Reachable from `hazmat` with a caller-built `Params`.
+    assert!(
+        eta == 2 || eta == 4,
+        "ML-DSA eta must be 2 or 4 (FIPS 204 Table 1), got {eta}"
+    );
     let mut xof = Shake256::new();
     xof.update(seed);
     xof.update(&[nonce as u8, (nonce >> 8) as u8]);
@@ -124,6 +131,15 @@ pub(crate) fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
 
 /// SampleInBall (Algorithm 29): a challenge with `tau` coefficients in `{−1, 1}`.
 pub(crate) fn sample_challenge(seed: &[u8], tau: usize) -> Poly {
+    // `N - tau` underflows for tau > N, which in a release build wraps to a
+    // huge value, makes the loop below iterate zero times, and silently returns
+    // the ZERO polynomial as the challenge — with which any `z` verifies.
+    // `tau` is public (a parameter-set constant), so asserting leaks nothing;
+    // it is reachable from `hazmat` with a caller-built `Params`.
+    assert!(
+        tau <= N,
+        "ML-DSA tau must not exceed N = {N} (FIPS 204 Table 1), got {tau}"
+    );
     let mut xof = Shake256::new();
     xof.update(seed);
     let mut reader = xof.finalize_xof();
@@ -152,6 +168,13 @@ pub(crate) fn sample_challenge(seed: &[u8], tau: usize) -> Poly {
 /// ExpandMask (Algorithm 34): the masking vector polynomial from
 /// `SHAKE256(seed)`, with `gamma1_bits` of 17 or 19.
 pub(crate) fn expand_mask(seed: &[u8], gamma1_bits: u32) -> Poly {
+    // Only 17 and 19 are defined (FIPS 204 Table 1); the `else` arm is the
+    // gamma1 = 2^19 rule, so any other width would silently produce the wrong
+    // mask. Reachable from `hazmat` with a caller-built `Params`.
+    assert!(
+        gamma1_bits == 17 || gamma1_bits == 19,
+        "ML-DSA gamma1 bit width must be 17 or 19, got {gamma1_bits}"
+    );
     let mut xof = Shake256::new();
     xof.update(seed);
     let mut reader = xof.finalize_xof();

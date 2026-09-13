@@ -120,23 +120,59 @@ pub fn power2_round(r: u32) -> (u32, u32) {
     super::reduce::power2_round(r)
 }
 
+/// Panics unless `gamma2` is one of the two standardized values.
+///
+/// The rounding helpers are written as `if gamma2 == GAMMA2_32 { … } else { … }`
+/// with the `else` arm hard-coded to the `γ₂ = (q−1)/88` constants, so any other
+/// value would silently compute a *different* function rather than fail — for
+/// `make_hint`/`use_hint` that is a signature-validity bug, not just a wrong
+/// number. The check lives here, on the public boundary, and not inside the
+/// per-coefficient helpers themselves, which run in the hot signing loop.
+#[inline]
+fn check_gamma2(gamma2: u32) {
+    assert!(
+        gamma2 == GAMMA2_32 || gamma2 == GAMMA2_88,
+        "ML-DSA gamma2 must be GAMMA2_32 or GAMMA2_88 (FIPS 204 Table 1)"
+    );
+}
+
 /// HighBits (Algorithm 37) for the given `γ₂`.
+///
+/// # Panics
+///
+/// If `gamma2` is neither [`GAMMA2_32`] nor [`GAMMA2_88`].
 pub fn high_bits(r: u32, gamma2: u32) -> u32 {
+    check_gamma2(gamma2);
     super::reduce::high_bits(r, gamma2)
 }
 
 /// Decompose (Algorithm 36): `(HighBits(r), LowBits(r))`, with signed low part.
+///
+/// # Panics
+///
+/// If `gamma2` is neither [`GAMMA2_32`] nor [`GAMMA2_88`].
 pub fn decompose(r: u32, gamma2: u32) -> (u32, i32) {
+    check_gamma2(gamma2);
     super::reduce::decompose(r, gamma2)
 }
 
 /// MakeHint (Algorithm 39): `1` iff adding `z` changes the high bits of `r`.
+///
+/// # Panics
+///
+/// If `gamma2` is neither [`GAMMA2_32`] nor [`GAMMA2_88`].
 pub fn make_hint(z: u32, r: u32, gamma2: u32) -> u32 {
+    check_gamma2(gamma2);
     super::reduce::make_hint(z, r, gamma2)
 }
 
 /// UseHint (Algorithm 40): recovers the corrected high bits from `hint` and `r`.
+///
+/// # Panics
+///
+/// If `gamma2` is neither [`GAMMA2_32`] nor [`GAMMA2_88`].
 pub fn use_hint(hint: u32, r: u32, gamma2: u32) -> u32 {
+    check_gamma2(gamma2);
     super::reduce::use_hint(hint, r, gamma2)
 }
 
@@ -155,17 +191,35 @@ pub fn sample_ntt_poly(rho: &[u8], s: u8, r: u8) -> Poly {
 
 /// RejBoundedPoly / ExpandS (Algorithm 31): coefficients in `[−η, η]` from
 /// `SHAKE256(seed ‖ nonce)`.
+///
+/// # Panics
+///
+/// If `eta` is neither 2 nor 4 — the only values FIPS 204 defines. Any other
+/// value would otherwise silently sample the `η = 4` distribution.
 pub fn sample_bounded_poly(seed: &[u8], eta: u32, nonce: u16) -> Poly {
     super::sample::sample_bounded_poly(seed, eta, nonce)
 }
 
 /// SampleInBall (Algorithm 29): a challenge with `tau` coefficients in `{−1, 1}`.
+///
+/// # Panics
+///
+/// If `tau > N`. The sampler fills positions `N − tau ..< N`, so a larger `tau`
+/// would underflow that subtraction and — in a release build, where the
+/// underflow wraps rather than panicking — return the all-zero polynomial as
+/// the "challenge", which every `z` satisfies. `tau` is a public parameter, so
+/// the check leaks nothing.
 pub fn sample_challenge(seed: &[u8], tau: usize) -> Poly {
     super::sample::sample_challenge(seed, tau)
 }
 
 /// ExpandMask (Algorithm 34): the masking-vector polynomial from
 /// `SHAKE256(seed)`, with `gamma1_bits` of 17 or 19.
+///
+/// # Panics
+///
+/// If `gamma1_bits` is neither 17 nor 19; any other width would silently
+/// produce the `γ₁ = 2¹⁹` encoding.
 pub fn expand_mask(seed: &[u8], gamma1_bits: u32) -> Poly {
     super::sample::expand_mask(seed, gamma1_bits)
 }
@@ -224,6 +278,11 @@ pub fn unpack_t0(b: &[u8]) -> Option<Poly> {
 }
 
 /// Packs an `η = 2` secret coefficient vector (3 bits each, 96 bytes).
+///
+/// **Precondition:** every coefficient is a valid `η = 2` value, i.e. lies in
+/// `{q−2, q−1, 0, 1, 2}` (what [`sample_bounded_poly`] and [`unpack_eta2`]
+/// produce). The packer writes 3-bit fields with no range check, so a
+/// coefficient outside that set overflows into its neighbours.
 #[cfg(feature = "alloc")]
 pub fn pack_eta2(f: &Poly) -> Vec<u8> {
     let mut v = alloc::vec![0u8; N * 3 / 8];
@@ -242,6 +301,10 @@ pub fn unpack_eta2(b: &[u8]) -> Result<Poly, ()> {
 }
 
 /// Packs an `η = 4` secret coefficient vector (4 bits each, 128 bytes).
+///
+/// **Precondition:** every coefficient is a valid `η = 4` value, i.e. lies in
+/// `{q−4, …, q−1, 0, …, 4}`. The packer writes 4-bit fields with no range
+/// check, so a coefficient outside that set overflows into its neighbours.
 #[cfg(feature = "alloc")]
 pub fn pack_eta4(f: &Poly) -> Vec<u8> {
     let mut v = alloc::vec![0u8; N * 4 / 8];
@@ -294,6 +357,10 @@ pub fn unpack_z19(b: &[u8]) -> Option<Poly> {
 }
 
 /// Packs `w1` with 4 bits per coefficient (ML-DSA-65/87, 128 bytes).
+///
+/// **Precondition:** every coefficient is in `0..16` (the range [`high_bits`]
+/// and [`use_hint`] return for `γ₂ = GAMMA2_32`). The packer writes 4-bit
+/// fields with no range check, so a larger value overflows into its neighbour.
 #[cfg(feature = "alloc")]
 pub fn pack_w1_4(f: &Poly) -> Vec<u8> {
     let mut v = alloc::vec![0u8; N * 4 / 8];
@@ -302,6 +369,10 @@ pub fn pack_w1_4(f: &Poly) -> Vec<u8> {
 }
 
 /// Packs `w1` with 6 bits per coefficient (ML-DSA-44, 192 bytes).
+///
+/// **Precondition:** every coefficient is in `0..44` (the range [`high_bits`]
+/// and [`use_hint`] return for `γ₂ = GAMMA2_88`). The packer writes 6-bit
+/// fields with no range check, so a larger value overflows into its neighbour.
 #[cfg(feature = "alloc")]
 pub fn pack_w1_6(f: &Poly) -> Vec<u8> {
     let mut v = alloc::vec![0u8; N * 6 / 8];
@@ -316,8 +387,15 @@ pub fn pack_w1_6(f: &Poly) -> Vec<u8> {
 /// total. The underlying packer writes positions into the first `omega` bytes
 /// without checking, so an over-full hint would corrupt the running-count
 /// region and then panic past the end of the buffer.
+///
+/// Also returns `None` for `omega > 255`: the running counts are single bytes,
+/// so a larger `ω` would truncate them and produce an encoding that decodes to
+/// a different hint. Every standardized level uses `ω ≤ 75`.
 #[cfg(feature = "alloc")]
 pub fn pack_hint(hints: &[Poly], omega: usize) -> Option<Vec<u8>> {
+    if omega > 255 {
+        return None;
+    }
     let total: usize = hints
         .iter()
         .map(|h| h.c.iter().filter(|&&c| c != 0).count())
@@ -343,9 +421,42 @@ pub fn unpack_hint(b: &[u8], hints: &mut [Poly], omega: usize) -> bool {
 
 // --- Params-dispatched packing helpers ---
 
+/// Panics unless `p.eta` is one of the two standardized values.
+///
+/// Every `η`-dispatched routine is an `if p.eta == 2 { … } else { … }` whose
+/// `else` arm is the `η = 4` encoding, so an out-of-range `η` in a caller-built
+/// [`Params`] silently selects the wrong one instead of failing.
+#[inline]
+fn check_eta(p: &Params) {
+    assert!(
+        p.eta == 2 || p.eta == 4,
+        "ML-DSA eta must be 2 or 4 (FIPS 204 Table 1)"
+    );
+}
+
+/// Panics unless `p.gamma1_bits` is 17 or 19 (same reasoning as [`check_eta`]).
+#[inline]
+fn check_gamma1(p: &Params) {
+    assert!(
+        p.gamma1_bits == 17 || p.gamma1_bits == 19,
+        "ML-DSA gamma1 bit width must be 17 or 19 (FIPS 204 Table 1)"
+    );
+}
+
 /// Packs the secret coefficient vector `f` with the `η` width selected by `p`.
+///
+/// Every coefficient must already be a valid `η`-bounded value — that is, in
+/// `{q−η, …, q−1} ∪ {0, …, η}` — which is what [`sample_bounded_poly`] and
+/// [`unpack_eta`] produce. The packer writes fixed-width fields without
+/// checking, so an out-of-range coefficient corrupts its neighbours in the
+/// output rather than being reported.
+///
+/// # Panics
+///
+/// If `p.eta` is neither 2 nor 4.
 #[cfg(feature = "alloc")]
 pub fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
+    check_eta(p);
     let mut v = alloc::vec![0u8; if p.eta == 2 { N * 3 / 8 } else { N * 4 / 8 }];
     super::pack_eta(f, p, &mut v);
     v
@@ -354,7 +465,12 @@ pub fn pack_eta(f: &Poly, p: &Params) -> Vec<u8> {
 /// Unpacks an `η`-encoded coefficient vector for the level described by `p`,
 /// returning [`super::Error::Malformed`] on an out-of-range encoding or a `b`
 /// whose length is not the [`ETA2_LEN`] / [`ETA4_LEN`] the level requires.
+///
+/// # Panics
+///
+/// If `p.eta` is neither 2 nor 4.
 pub fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, super::Error> {
+    check_eta(p);
     let need = if p.eta == 2 { ETA2_LEN } else { ETA4_LEN };
     if b.len() != need {
         return Err(super::Error::Malformed);
@@ -363,8 +479,13 @@ pub fn unpack_eta(b: &[u8], p: &Params) -> Result<Poly, super::Error> {
 }
 
 /// Packs `z` with the `γ₁` width selected by `p`.
+///
+/// # Panics
+///
+/// If `p.gamma1_bits` is neither 17 nor 19.
 #[cfg(feature = "alloc")]
 pub fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
+    check_gamma1(p);
     let mut v = alloc::vec![0u8; if p.gamma1_bits == 17 { N * 18 / 8 } else { N * 20 / 8 }];
     super::pack_z(f, p, &mut v);
     v
@@ -374,7 +495,12 @@ pub fn pack_z(f: &Poly, p: &Params) -> Vec<u8> {
 ///
 /// Returns `None` unless `b` is exactly the [`Z17_LEN`] / [`Z19_LEN`] the
 /// level's `γ₁` requires.
+///
+/// # Panics
+///
+/// If `p.gamma1_bits` is neither 17 nor 19.
 pub fn unpack_z(b: &[u8], p: &Params) -> Option<Poly> {
+    check_gamma1(p);
     let need = if p.gamma1_bits == 17 {
         Z17_LEN
     } else {
@@ -387,8 +513,19 @@ pub fn unpack_z(b: &[u8], p: &Params) -> Option<Poly> {
 }
 
 /// Packs `w1` with the width selected by `p`.
+///
+/// Every coefficient must already be a valid `w1` high-bits value for this
+/// level — `0..16` for `γ₂ = GAMMA2_32`, `0..44` for `GAMMA2_88`, which is what
+/// [`high_bits`] and [`use_hint`] return. The packer writes fixed-width fields
+/// without checking, so a larger coefficient corrupts its neighbours in the
+/// output rather than being reported.
+///
+/// # Panics
+///
+/// If `p.gamma2` is neither [`GAMMA2_32`] nor [`GAMMA2_88`].
 #[cfg(feature = "alloc")]
 pub fn pack_w1(f: &Poly, p: &Params) -> Vec<u8> {
+    check_gamma2(p.gamma2);
     let mut v = alloc::vec![0u8; if p.gamma2 == super::GAMMA2_88 { N * 6 / 8 } else { N * 4 / 8 }];
     super::pack_w1(f, p, &mut v);
     v
@@ -594,5 +731,102 @@ mod tests {
             over[i % k].c[i] = 1;
         }
         assert!(pack_hint(&over, omega).is_none());
+
+        // The running counts are single bytes, so omega > 255 would truncate.
+        assert!(pack_hint(&alloc::vec![Poly::zero(); k], 256).is_none());
+    }
+
+    /// `unpack_hint` used to OR into the caller's polynomials, so decoding into
+    /// a reused buffer produced the union of the old and new hints — extra
+    /// `use_hint` corrections the signature never authorized.
+    #[test]
+    fn unpack_hint_overwrites_the_caller_buffer() {
+        let omega = ML_DSA_44.params.omega;
+        let k = ML_DSA_44.k;
+
+        let mut hints = alloc::vec![Poly::zero(); k];
+        hints[0].c[5] = 1;
+        hints[1].c[200] = 1;
+        let packed = pack_hint(&hints, omega).expect("fits");
+
+        // Decode into a buffer that is dirty in positions the encoding does not
+        // mention; they must be gone afterwards.
+        let mut dirty = alloc::vec![Poly::zero(); k];
+        dirty[0].c[9] = 1;
+        dirty[2].c[77] = 1;
+        assert!(unpack_hint(&packed, &mut dirty, omega));
+        assert_eq!(dirty, hints, "decode must overwrite, never OR");
+    }
+
+    /// `tau > N` underflowed `N - tau`; in release the wrap made the fill loop
+    /// empty and silently returned the ZERO challenge, which every `z`
+    /// satisfies. It must panic instead.
+    #[test]
+    #[should_panic(expected = "tau must not exceed")]
+    fn sample_challenge_rejects_oversized_tau() {
+        let _ = sample_challenge(&[0u8; 32], N + 1);
+    }
+
+    /// `tau == N` is the largest legal value and must still work.
+    #[test]
+    fn sample_challenge_accepts_tau_up_to_n() {
+        let c = sample_challenge(&[3u8; 32], N);
+        assert!(c.c.iter().any(|&x| x != 0), "challenge must not be zero");
+    }
+
+    /// Out-of-range `eta` / `gamma1_bits` / `gamma2` select the *other* branch
+    /// of a two-way dispatch rather than failing, so each entry point asserts.
+    // `catch_unwind` needs `std`; the assertions themselves are unconditional.
+    #[cfg(feature = "std")]
+    #[test]
+    fn parameter_dispatch_rejects_undefined_values() {
+        fn panics(f: impl FnOnce() + core::panic::UnwindSafe) -> bool {
+            std::panic::catch_unwind(f).is_err()
+        }
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(alloc::boxed::Box::new(|_| {}));
+
+        assert!(panics(|| {
+            let _ = sample_bounded_poly(&[0u8; 64], 3, 0);
+        }));
+        assert!(panics(|| {
+            let _ = expand_mask(&[0u8; 66], 18);
+        }));
+        assert!(panics(|| {
+            let _ = high_bits(0, 12345);
+        }));
+        assert!(panics(|| {
+            let _ = decompose(0, 12345);
+        }));
+        assert!(panics(|| {
+            let _ = make_hint(0, 0, 12345);
+        }));
+        assert!(panics(|| {
+            let _ = use_hint(1, 0, 12345);
+        }));
+
+        let mut bad = ML_DSA_44.params;
+        bad.eta = 3;
+        assert!(panics(move || {
+            let _ = pack_eta(&Poly::zero(), &bad);
+        }));
+        assert!(panics(move || {
+            let _ = unpack_eta(&[0u8; ETA2_LEN], &bad);
+        }));
+        let mut bad_g1 = ML_DSA_44.params;
+        bad_g1.gamma1_bits = 18;
+        assert!(panics(move || {
+            let _ = pack_z(&Poly::zero(), &bad_g1);
+        }));
+        assert!(panics(move || {
+            let _ = unpack_z(&[0u8; Z17_LEN], &bad_g1);
+        }));
+        let mut bad_g2 = ML_DSA_44.params;
+        bad_g2.gamma2 = 7;
+        assert!(panics(move || {
+            let _ = pack_w1(&Poly::zero(), &bad_g2);
+        }));
+
+        std::panic::set_hook(hook);
     }
 }
