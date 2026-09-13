@@ -338,6 +338,36 @@ impl AffinePoint {
         y2.ct_eq(&rhs)
     }
 
+    /// Builds an affine point from big-endian coordinate bytes, validating
+    /// that both are `< p`, that the point is on the curve and that it is not
+    /// the identity.
+    ///
+    /// Unlike [`from_sec1`](Self::from_sec1) this takes `y` explicitly and
+    /// never inspects its parity, so it is usable when the coordinates are
+    /// secret (the Confidential Assets per-asset generator is derived from a
+    /// secret asset tag). Only the validation failures branch, and a caller
+    /// that has just computed a point on the curve never hits them.
+    pub(crate) fn from_xy_be_bytes(x: &[u8; 32], y: &[u8; 32]) -> Result<AffinePoint, Error> {
+        let f = field();
+        let x = f
+            .from_bytes_be(x)
+            .into_option()
+            .ok_or(Error::InvalidInput)?;
+        let y = f
+            .from_bytes_be(y)
+            .into_option()
+            .ok_or(Error::InvalidInput)?;
+        if !bool::from(Self::is_on_curve(&f, &x, &y)) {
+            return Err(Error::InvalidInput);
+        }
+        // The identity has no affine representation; `(0, 0)` is how a caller
+        // would try to spell it.
+        if bool::from(x.is_zero() & y.is_zero()) {
+            return Err(Error::InvalidInput);
+        }
+        Ok(AffinePoint { x, y })
+    }
+
     // --- SEC1 codec ---
 
     /// Encodes as a 33-byte compressed SEC1 point: `0x02`/`0x03 || X`, where the
@@ -394,11 +424,12 @@ impl AffinePoint {
                 let y_bytes = f.to_bytes_be(&y);
                 let want_odd = tag & 1;
                 let have_odd = y_bytes[31] & 1;
-                let y = if have_odd == want_odd {
-                    y
-                } else {
-                    f.negate(&y)
-                };
+                // Branch-free: `conditional_select(a, b, c)` returns `a` when
+                // `c` is true (inverted from the `subtle` crate), so keep the
+                // root when the parities already match. A plain `if` here
+                // would leak the parity of a secret-derived `y` through
+                // control flow.
+                let y = Fe::conditional_select(&y, &f.negate(&y), have_odd.ct_eq(&want_odd));
                 let pt = AffinePoint { x, y };
                 // y == 0 would make both parities identical; reject (no such
                 // point exists on secp256k1, but the guard is cheap).

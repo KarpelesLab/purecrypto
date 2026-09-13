@@ -143,6 +143,7 @@ use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLes
 use crate::ec::Error;
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use crate::hash::sha256;
+use crate::zeroize::Zeroize;
 
 // =====================================================================
 // Constants
@@ -302,15 +303,20 @@ impl Field {
 
 /// Builds an [`AffinePoint`] from field coordinates, validating on-curve-ness.
 ///
-/// Goes through the SEC1 decoder because that is the only public constructor;
-/// the parity byte selects exactly the `y` supplied here.
+/// Passes both coordinates straight to the point constructor rather than
+/// round-tripping through the compressed SEC1 form: the SEC1 path would
+/// discard `y`, recover it from `x` and then pick a root by parity, and the
+/// coordinates here can be secret (the per-asset generator is a hash of the
+/// asset tag), so a parity-dependent branch would leak bits of the tag.
 fn affine_from_xy(x: &Fe, y: &Fe) -> Result<AffinePoint, Error> {
+    let mut x_bytes = [0u8; 32];
     let mut y_bytes = [0u8; 32];
+    x.write_be_bytes(&mut x_bytes);
     y.write_be_bytes(&mut y_bytes);
-    let mut sec1 = [0u8; 33];
-    sec1[0] = 0x02 | (y_bytes[31] & 1);
-    x.write_be_bytes(&mut sec1[1..]);
-    AffinePoint::from_sec1(&sec1)
+    let point = AffinePoint::from_xy_be_bytes(&x_bytes, &y_bytes);
+    x_bytes.zeroize();
+    y_bytes.zeroize();
+    point
 }
 
 /// Encodes a point in the 33-byte Confidential Transactions form under `tag`

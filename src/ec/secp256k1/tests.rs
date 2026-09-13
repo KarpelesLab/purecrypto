@@ -208,6 +208,38 @@ fn sec1_recovers_both_parities() {
     }
 }
 
+#[test]
+fn from_xy_be_bytes_matches_sec1_and_validates() {
+    for &(k, _, _) in KG {
+        for aff in [
+            ProjectivePoint::mul_generator(&scalar_from_u64(k))
+                .to_affine()
+                .unwrap(),
+            ProjectivePoint::mul_generator(&scalar_from_u64(k))
+                .negate()
+                .to_affine()
+                .unwrap(),
+        ] {
+            let pt = AffinePoint::from_xy_be_bytes(&aff.x_bytes(), &aff.y_bytes()).unwrap();
+            assert_eq!(pt.to_sec1_uncompressed(), aff.to_sec1_uncompressed());
+            let via_sec1 = AffinePoint::from_sec1(&aff.to_sec1_compressed()).unwrap();
+            assert_eq!(pt.to_sec1_uncompressed(), via_sec1.to_sec1_uncompressed());
+        }
+    }
+    let g = AffinePoint::generator();
+    // Off-curve (y flipped).
+    let mut y = g.y_bytes();
+    y[31] ^= 1;
+    assert!(AffinePoint::from_xy_be_bytes(&g.x_bytes(), &y).is_err());
+    // x = p is out of range.
+    let mut pb = [0u8; 32];
+    p().write_be_bytes(&mut pb);
+    assert!(AffinePoint::from_xy_be_bytes(&pb, &g.y_bytes()).is_err());
+    assert!(AffinePoint::from_xy_be_bytes(&g.x_bytes(), &pb).is_err());
+    // The "(0, 0)" identity spelling.
+    assert!(AffinePoint::from_xy_be_bytes(&[0u8; 32], &[0u8; 32]).is_err());
+}
+
 // --- scalar arithmetic ---
 
 #[test]
