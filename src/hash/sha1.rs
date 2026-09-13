@@ -25,10 +25,15 @@ pub(crate) const K1: [u32; 4] = [0x5a82_7999, 0x6ed9_eba1, 0x8f1b_bcdc, 0xca62_c
 /// aarch64) when the CPU supports them, falling back to the portable software
 /// path otherwise. Both produce identical state and are constant-time.
 #[inline]
+#[cfg_attr(
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unsafe_code)
+)]
 fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha1_supported() {
-        super::sha_hw::compress_sha1(state, block);
+        // SAFETY: guarded by the `sha1_supported()` feature check.
+        unsafe { super::sha_hw::compress_sha1(state, block) };
         return;
     }
     compress_soft(state, block);
@@ -41,11 +46,16 @@ fn compress(state: &mut [u32; 5], block: &[u8; 64]) {
 /// avoiding the per-block spill/reload of repeated [`compress`] calls — and
 /// otherwise loops the software compression.
 #[inline]
+#[cfg_attr(
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unsafe_code)
+)]
 fn compress_blocks(state: &mut [u32; 5], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha1_supported() {
-        super::sha_hw::compress_sha1_blocks(state, data);
+        // SAFETY: guarded by the `sha1_supported()` feature check.
+        unsafe { super::sha_hw::compress_sha1_blocks(state, data) };
         return;
     }
     for block in data.chunks_exact(64) {
@@ -147,6 +157,7 @@ mod tests {
     /// combinations exercised here. Runs only where the extension exists.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
+    #[allow(unsafe_code)] // calls the `unsafe` hardware backend directly
     fn sha1_hardware_matches_software() {
         // Say which path was taken: these tests self-skip on CPUs without the
         // extension, so under `--nocapture` a skip is otherwise indistinguishable
@@ -181,7 +192,8 @@ mod tests {
             let mut a = h_sw;
             let mut b = h_hw;
             compress_soft(&mut a, &block);
-            super::super::sha_hw::compress_sha1(&mut b, &block);
+            // SAFETY: the `sha1_supported()` check above returned early.
+            unsafe { super::super::sha_hw::compress_sha1(&mut b, &block) };
             assert_eq!(a, b, "HW/soft mismatch");
         }
         // Multi-block kernel: the register-resident `compress_sha1_blocks` over a
@@ -199,7 +211,8 @@ mod tests {
                 *b = (next() >> 24) as u8;
             }
             let mut h_hw = start;
-            super::super::sha_hw::compress_sha1_blocks(&mut h_hw, &blocks);
+            // SAFETY: the `sha1_supported()` check above returned early.
+            unsafe { super::super::sha_hw::compress_sha1_blocks(&mut h_hw, &blocks) };
             let mut h_sw = start;
             for chunk in blocks.chunks_exact(64) {
                 compress_soft(&mut h_sw, chunk.try_into().unwrap());

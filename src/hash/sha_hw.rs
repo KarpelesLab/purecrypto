@@ -25,8 +25,14 @@ pub(super) fn sha256_supported() -> bool {
 }
 
 /// SHA-256 compression of one 64-byte block, dispatched to the active backend.
-pub(super) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
-    compress256_blocks(h, block);
+///
+/// # Safety
+/// The caller must have checked [`sha256_supported`]; this executes the SHA
+/// extension instructions unconditionally, and they fault with SIGILL on a CPU
+/// without them.
+pub(super) unsafe fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
+    // SAFETY: the caller's obligation is exactly this function's.
+    unsafe { compress256_blocks(h, block) }
 }
 
 /// SHA-256 compression of `data` (a whole number of 64-byte blocks), dispatched
@@ -34,8 +40,12 @@ pub(super) fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
 /// and keeps it there across every block, so a single multi-block call avoids
 /// the per-block state spill/reload and dispatch overhead that repeated
 /// [`compress256`] calls incur — a measurable throughput win on bulk input.
-pub(super) fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
+///
+/// # Safety
+/// The caller must have checked [`sha256_supported`] (see [`compress256`]).
+pub(super) unsafe fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
+    debug_assert!(sha256_supported(), "hardware SHA-256 backend not available");
     if data.is_empty() {
         return;
     }
@@ -61,9 +71,14 @@ pub(super) fn sha512_supported() -> bool {
 
 /// SHA-512 compression of one 128-byte block (aarch64 hardware only; never
 /// called on x86, where [`sha512_supported`] is `false`).
+///
+/// # Safety
+/// The caller must have checked [`sha512_supported`]; FEAT_SHA512 instructions
+/// fault with SIGILL on a CPU without the extension.
 #[cfg(target_arch = "aarch64")]
-pub(super) fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
-    // SAFETY: only called after `sha512_supported()` confirmed FEAT_SHA512.
+pub(super) unsafe fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
+    debug_assert!(sha512_supported(), "hardware SHA-512 backend not available");
+    // SAFETY: the caller guarantees FEAT_SHA512 is present.
     unsafe { arm::compress512(h, block) }
 }
 
@@ -87,8 +102,13 @@ pub(super) fn sha1_supported() -> bool {
 }
 
 /// SHA-1 compression of one 64-byte block, dispatched to the active backend.
-pub(super) fn compress_sha1(h: &mut [u32; 5], block: &[u8; 64]) {
-    compress_sha1_blocks(h, block);
+///
+/// # Safety
+/// The caller must have checked [`sha1_supported`]; this executes the SHA
+/// extension instructions unconditionally.
+pub(super) unsafe fn compress_sha1(h: &mut [u32; 5], block: &[u8; 64]) {
+    // SAFETY: the caller's obligation is exactly this function's.
+    unsafe { compress_sha1_blocks(h, block) }
 }
 
 /// SHA-1 compression of `data` (a whole number of 64-byte blocks), dispatched to
@@ -96,8 +116,12 @@ pub(super) fn compress_sha1(h: &mut [u32; 5], block: &[u8; 64]) {
 /// state into registers once and keeps it there across every block, so a single
 /// multi-block call avoids the per-block state spill/reload and dispatch overhead
 /// of repeated [`compress_sha1`] calls.
-pub(super) fn compress_sha1_blocks(h: &mut [u32; 5], data: &[u8]) {
+///
+/// # Safety
+/// The caller must have checked [`sha1_supported`] (see [`compress_sha1`]).
+pub(super) unsafe fn compress_sha1_blocks(h: &mut [u32; 5], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
+    debug_assert!(sha1_supported(), "hardware SHA-1 backend not available");
     if data.is_empty() {
         return;
     }

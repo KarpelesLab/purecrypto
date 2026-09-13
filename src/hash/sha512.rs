@@ -243,10 +243,12 @@ const fn rotr(x: u64, n: u32) -> u64 {
 /// the portable software path. Both produce identical state and are
 /// constant-time. (x86 has no broadly-available SHA-512 instruction.)
 #[inline]
+#[cfg_attr(all(feature = "std", target_arch = "aarch64"), allow(unsafe_code))]
 fn compress512(h: &mut [u64; 8], block: &[u8; 128]) {
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     if super::sha_hw::sha512_supported() {
-        super::sha_hw::compress512(h, block);
+        // SAFETY: guarded by the `sha512_supported()` feature check.
+        unsafe { super::sha_hw::compress512(h, block) };
         return;
     }
     compress512_soft(h, block);
@@ -402,6 +404,7 @@ mod tests {
     /// for every block. Runs only where the extension exists.
     #[cfg(all(feature = "std", target_arch = "aarch64"))]
     #[test]
+    #[allow(unsafe_code)] // calls the `unsafe` hardware backend directly
     fn sha512_hardware_matches_software() {
         // See the note in `sha1.rs`: report skip-vs-run so a green suite is not
         // mistaken for evidence that the hardware kernel ran. On x86 this is the
@@ -433,7 +436,8 @@ mod tests {
             let mut a = sw;
             let mut b = hw;
             compress512_soft(&mut a, &block);
-            super::super::sha_hw::compress512(&mut b, &block);
+            // SAFETY: the `sha512_supported()` check above returned early.
+            unsafe { super::super::sha_hw::compress512(&mut b, &block) };
             assert_eq!(a, b, "sha512 HW/soft mismatch");
         }
         // Dispatched digest must equal a pure-software digest of the same data.

@@ -209,10 +209,15 @@ const fn rotr(x: u32, n: u32) -> u32 {
 /// aarch64) when the CPU supports it, falling back to the portable software path
 /// otherwise. Both produce identical state and are constant-time.
 #[inline]
+#[cfg_attr(
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unsafe_code)
+)]
 fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha256_supported() {
-        super::sha_hw::compress256(h, block);
+        // SAFETY: guarded by the `sha256_supported()` feature check.
+        unsafe { super::sha_hw::compress256(h, block) };
         return;
     }
     compress256_soft(h, block);
@@ -225,11 +230,16 @@ fn compress256(h: &mut [u32; 8], block: &[u8; 64]) {
 /// avoiding the per-block spill/reload of repeated [`compress256`] calls — and
 /// otherwise loops the software compression.
 #[inline]
+#[cfg_attr(
+    all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(unsafe_code)
+)]
 fn compress256_blocks(h: &mut [u32; 8], data: &[u8]) {
     debug_assert!(data.len().is_multiple_of(64));
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     if super::sha_hw::sha256_supported() {
-        super::sha_hw::compress256_blocks(h, data);
+        // SAFETY: guarded by the `sha256_supported()` feature check.
+        unsafe { super::sha_hw::compress256_blocks(h, data) };
         return;
     }
     for block in data.chunks_exact(64) {
@@ -409,6 +419,7 @@ mod tests {
     /// exercised here. Runs only where the extension exists.
     #[cfg(all(feature = "std", any(target_arch = "x86_64", target_arch = "aarch64")))]
     #[test]
+    #[allow(unsafe_code)] // calls the `unsafe` hardware backend directly
     fn sha256_hardware_matches_software() {
         // See the note in `sha1.rs`: report skip-vs-run so a green suite is not
         // mistaken for evidence that the hardware kernel ran.
@@ -440,7 +451,8 @@ mod tests {
             let mut a = h_sw;
             let mut b = h_hw;
             compress256_soft(&mut a, &block);
-            super::super::sha_hw::compress256(&mut b, &block);
+            // SAFETY: the `sha256_supported()` check above returned early.
+            unsafe { super::super::sha_hw::compress256(&mut b, &block) };
             assert_eq!(a, b, "HW/soft mismatch");
         }
         // Multi-block kernel: the register-resident `compress256_blocks` over a
@@ -457,7 +469,8 @@ mod tests {
                 *b = (next() >> 24) as u8;
             }
             let mut h_hw = start;
-            super::super::sha_hw::compress256_blocks(&mut h_hw, &blocks);
+            // SAFETY: the `sha256_supported()` check above returned early.
+            unsafe { super::super::sha_hw::compress256_blocks(&mut h_hw, &blocks) };
             let mut h_sw = start;
             for chunk in blocks.chunks_exact(64) {
                 compress256_soft(&mut h_sw, chunk.try_into().unwrap());
