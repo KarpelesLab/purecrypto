@@ -516,6 +516,11 @@ pub struct ClientConnection12 {
 
     /// Inbound TLS bytes to parse into records.
     inbuf: Vec<u8>,
+    /// Read cursor into `inbuf`: bytes before it have been consumed. Records
+    /// are parsed at this offset and the buffer is compacted ONCE per
+    /// `process_new_packets` call, instead of draining from the front per
+    /// record (which is quadratic in the number of buffered records).
+    in_off: usize,
     /// Outbound TLS bytes ready to send.
     outbuf: Vec<u8>,
     /// Reassembly buffer for handshake messages spanning records.
@@ -739,6 +744,7 @@ impl ClientConnection12 {
             received_close_notify: false,
             handshake_completed: false,
             inbuf: Vec::new(),
+            in_off: 0,
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
             app_in: Vec::new(),
@@ -865,6 +871,7 @@ impl ClientConnection12 {
             received_close_notify: false,
             handshake_completed: false,
             inbuf: Vec::new(),
+            in_off: 0,
             outbuf: Vec::new(), // ClientHello already sent by the 1.3 engine.
             hs_pending: Vec::new(),
             app_in: Vec::new(),
@@ -1211,6 +1218,19 @@ impl ClientConnection12 {
     /// Processes all buffered records, advancing the handshake. On a protocol
     /// error it queues a fatal alert and returns the error.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
+        let r = self.process_buffered_records();
+        // One compaction per call (see `in_off`), on both the success and
+        // the error path.
+        if self.in_off != 0 {
+            self.inbuf.drain(..self.in_off);
+            self.in_off = 0;
+        }
+        r
+    }
+
+    /// Drains every complete buffered record, advancing the state machine.
+    /// The inbound read cursor is compacted by the caller.
+    fn process_buffered_records(&mut self) -> Result<(), Error> {
         loop {
             match self.next_message() {
                 Ok(Some(Incoming::Handshake(msg))) => {
@@ -1322,7 +1342,7 @@ impl ClientConnection12 {
                 version,
                 fragment,
                 len,
-            }) = read_record(&self.inbuf)?
+            }) = read_record(&self.inbuf[self.in_off..])?
             else {
                 return Ok(None);
             };
@@ -1334,9 +1354,9 @@ impl ClientConnection12 {
             }
             // Snapshot the 5-byte header for the decrypt AAD before we drain.
             let mut header = [0u8; 5];
-            header.copy_from_slice(&self.inbuf[..5]);
+            header.copy_from_slice(&self.inbuf[self.in_off..self.in_off + 5]);
             let fragment = fragment.to_vec();
-            self.inbuf.drain(..len);
+            self.in_off += len;
 
             match content_type {
                 ContentType::ChangeCipherSpec => {
@@ -1393,6 +1413,13 @@ impl ClientConnection12 {
                         }
                         self.append_handshake_bytes(&plain)?;
                     } else {
+                        // RFC 5246 §6.2.1 / RFC 8446 §5.1: zero-length
+                        // handshake fragments MUST NOT be sent — the same
+                        // rule the protected branch above enforces, and the
+                        // 1.3 core enforces in `ConnectionCore`.
+                        if fragment.is_empty() {
+                            return Err(Error::UnexpectedMessage);
+                        }
                         self.append_handshake_bytes(&fragment)?;
                     }
                 }
@@ -2859,6 +2886,76 @@ mod tests {
             c.process_new_packets(),
             Err(Error::UnsupportedVersion)
         ));
+    }
+
+    /// RFC 5246 §6.2.1: a zero-length plaintext Handshake fragment must be
+    /// rejected, not silently absorbed into the reassembly buffer (an
+    /// attacker could otherwise stream empty records for free).
+    #[test]
+    fn client12_rejects_empty_handshake_fragment() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-empty-hs", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = c.write_tls();
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &[],
+        );
+        c.read_tls(&rec);
+        assert!(matches!(
+            c.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
+    }
+
+    /// The inbound buffer is compacted once per `process_new_packets` call,
+    /// so a partially received record stays buffered while the bytes already
+    /// consumed are dropped exactly once.
+    #[test]
+    fn client12_compacts_the_inbound_buffer_once_per_call() {
+        use crate::tls::codec::write_record;
+        let mut rng = HmacDrbg::<Sha256>::new(b"c12-compact", b"nonce", &[]);
+        let mut c = ClientConnection12::new(
+            ClientConfig12::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = c.write_tls();
+        // Two complete (rejected-later) records plus a truncated third.
+        let sh = synth_sh_record(
+            CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            alloc::vec![(ExtensionType::RENEGOTIATION_INFO, alloc::vec![0u8])],
+        );
+        let mut partial = Vec::new();
+        write_record(
+            &mut partial,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &[hs_type::SERVER_HELLO, 0, 0, 16],
+        );
+        partial.truncate(7);
+        let mut wire = sh.clone();
+        wire.extend_from_slice(&partial);
+        c.read_tls(&wire);
+        // The SH is processed (and fails verification later in the flight);
+        // whatever the outcome, the consumed prefix is dropped and the
+        // partial record is kept for the next call.
+        let _ = c.process_new_packets();
+        assert_eq!(c.in_off, 0, "the read cursor is reset by compaction");
+        assert_eq!(
+            c.inbuf.len(),
+            partial.len(),
+            "only the incomplete trailing record stays buffered"
+        );
     }
 
     // ---- opt-in legacy (TLS 1.0/1.1) ServerHello hardening ---------------

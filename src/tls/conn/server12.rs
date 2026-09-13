@@ -396,6 +396,11 @@ pub struct ServerConnection12<R: RngCore> {
 
     /// Inbound TLS bytes to parse into records.
     inbuf: Vec<u8>,
+    /// Read cursor into `inbuf`: bytes before it have been consumed. Records
+    /// are parsed at this offset and the buffer is compacted ONCE per
+    /// `process_new_packets` call, instead of draining from the front per
+    /// record (which is quadratic in the number of buffered records).
+    in_off: usize,
     /// Outbound TLS bytes ready to send.
     outbuf: Vec<u8>,
     /// Reassembly buffer for handshake messages spanning records.
@@ -521,6 +526,7 @@ impl<R: RngCore> ServerConnection12<R> {
             received_close_notify: false,
             handshake_completed: false,
             inbuf: Vec::new(),
+            in_off: 0,
             outbuf: Vec::new(),
             hs_pending: Vec::new(),
             app_in: Vec::new(),
@@ -736,6 +742,19 @@ impl<R: RngCore> ServerConnection12<R> {
 
     /// Processes all buffered records, advancing the handshake.
     pub fn process_new_packets(&mut self) -> Result<(), Error> {
+        let r = self.process_buffered_records();
+        // One compaction per call (see `in_off`), on both the success and
+        // the error path.
+        if self.in_off != 0 {
+            self.inbuf.drain(..self.in_off);
+            self.in_off = 0;
+        }
+        r
+    }
+
+    /// Drains every complete buffered record, advancing the state machine.
+    /// The inbound read cursor is compacted by the caller.
+    fn process_buffered_records(&mut self) -> Result<(), Error> {
         loop {
             match self.next_message() {
                 Ok(Some(Incoming::Handshake(msg))) => {
@@ -853,7 +872,7 @@ impl<R: RngCore> ServerConnection12<R> {
                 version,
                 fragment,
                 len,
-            }) = read_record(&self.inbuf)?
+            }) = read_record(&self.inbuf[self.in_off..])?
             else {
                 return Ok(None);
             };
@@ -865,9 +884,9 @@ impl<R: RngCore> ServerConnection12<R> {
                 return Err(Error::UnsupportedVersion);
             }
             let mut header = [0u8; 5];
-            header.copy_from_slice(&self.inbuf[..5]);
+            header.copy_from_slice(&self.inbuf[self.in_off..self.in_off + 5]);
             let fragment = fragment.to_vec();
-            self.inbuf.drain(..len);
+            self.in_off += len;
 
             match content_type {
                 ContentType::ChangeCipherSpec => {
@@ -916,6 +935,13 @@ impl<R: RngCore> ServerConnection12<R> {
                         }
                         self.append_handshake_bytes(&plain)?;
                     } else {
+                        // RFC 5246 §6.2.1 / RFC 8446 §5.1: zero-length
+                        // handshake fragments MUST NOT be sent — the same
+                        // rule the protected branch above enforces, and the
+                        // 1.3 core enforces in `ConnectionCore`.
+                        if fragment.is_empty() {
+                            return Err(Error::UnexpectedMessage);
+                        }
                         self.append_handshake_bytes(&fragment)?;
                     }
                 }
@@ -2927,6 +2953,27 @@ mod tests {
                 hs_type::SERVER_HELLO_DONE,
             ],
         );
+    }
+
+    /// RFC 5246 §6.2.1: a zero-length plaintext Handshake fragment must be
+    /// rejected rather than absorbed into the reassembly buffer.
+    #[test]
+    fn server12_rejects_empty_handshake_fragment() {
+        let cfg = test_rsa_server_config();
+        let rng = HmacDrbg::<Sha256>::new(b"s12-empty-hs", b"nonce", &[]);
+        let mut s = ServerConnection12::new(cfg, rng);
+        let mut rec = Vec::new();
+        write_record(
+            &mut rec,
+            ContentType::Handshake,
+            ProtocolVersion::TLSv1_2,
+            &[],
+        );
+        s.read_tls(&rec);
+        assert!(matches!(
+            s.process_new_packets(),
+            Err(Error::UnexpectedMessage)
+        ));
     }
 
     /// Builds a TLS 1.2 `Certificate` handshake message (header + body) and
