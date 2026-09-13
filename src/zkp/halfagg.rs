@@ -30,19 +30,24 @@
 //! use purecrypto::ec::secp256k1::schnorr;
 //! use purecrypto::zkp::halfagg;
 //!
-//! let mut entries = Vec::new();
-//! for i in 1u8..=3 {
+//! // No allocator needed: the aggregate is `32 * (n + 1)` bytes.
+//! let mut entries = [([0u8; 32], [0u8; 32], [0u8; 64]); 3];
+//! for (i, e) in entries.iter_mut().enumerate() {
+//!     let i = i as u8 + 1;
 //!     let sk = [i; 32];
 //!     let msg = [i + 1; 32];
-//!     let pk = schnorr::public_key(&sk).unwrap();
-//!     let sig = schnorr::sign(&sk, &msg, &[i + 2; 32]).unwrap();
-//!     entries.push((pk, msg, sig));
+//!     *e = (
+//!         schnorr::public_key(&sk).unwrap(),
+//!         msg,
+//!         schnorr::sign(&sk, &msg, &[i + 2; 32]).unwrap(),
+//!     );
 //! }
 //!
-//! let agg = halfagg::aggregate(&entries).unwrap();
-//! assert_eq!(agg.len(), 3 * 32 + 32);
+//! let mut agg = [0u8; 4 * 32];
+//! let n = halfagg::aggregate_into(&entries, &mut agg).unwrap();
+//! assert_eq!(n, 3 * 32 + 32);
 //!
-//! let pms: Vec<_> = entries.iter().map(|(p, m, _)| (*p, *m)).collect();
+//! let pms: [_; 3] = core::array::from_fn(|i| (entries[i].0, entries[i].1));
 //! halfagg::verify_aggregate(&pms, &agg).unwrap();
 //! # }
 //! ```
@@ -177,8 +182,23 @@
 //! No input can make these functions panic. Every length is checked before it
 //! is used, the number of aggregated signatures is capped at
 //! [`MAX_AGGREGATED`] (`2^16 - 1`, the draft's limit) *before* anything is
-//! allocated, and every parse failure returns [`Error`].
+//! written, and every parse failure returns [`Error`].
+//!
+//! # Allocation
+//!
+//! This module needs **no allocator**. An aggregate is a flat byte string of
+//! [`aggregate_len`] bytes, so [`aggregate_into`] and [`inc_aggregate_into`]
+//! write into a caller-supplied buffer, and [`verify_aggregate`] works
+//! directly on a byte slice. [`aggregate`] and [`inc_aggregate`], which return
+//! a [`Vec`], are conveniences behind the `alloc` feature.
+//!
+//! Verification folds the terms of its aggregate equation with an interleaved
+//! multi-scalar multiplication whose scratch tables live on the heap; without
+//! `alloc` it falls back to one ladder per term, which is slower but uses no
+//! scratch memory at all beyond a single accumulator. Neither choice changes
+//! what verifies.
 
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
 use crate::ec::Error;
@@ -195,8 +215,8 @@ const TAG_CHALLENGE: &str = "BIP0340/challenge";
 ///
 /// The draft caps aggregation at `2^16 - 1` signatures — a deliberately
 /// conservative bound that keeps every index and length computation far from
-/// overflowing. It is enforced here *before* any allocation, so a peer-supplied
-/// count cannot drive an unbounded [`Vec`].
+/// overflowing. It is enforced *before* any buffer is sized, so a peer-supplied
+/// count cannot drive an unbounded allocation.
 pub const MAX_AGGREGATED: usize = (1 << 16) - 1;
 
 /// The exact serialized length of an aggregate over `n` signatures,
@@ -323,8 +343,22 @@ fn chunk32(buf: &[u8], index: usize) -> [u8; 32] {
 ///
 /// # Errors
 /// [`Error::InvalidInput`] if `entries.len()` exceeds [`MAX_AGGREGATED`].
+#[cfg(feature = "alloc")]
 pub fn aggregate(entries: &[PubkeyMsgSig]) -> Result<Vec<u8>, Error> {
     inc_aggregate(&[0u8; 32], &[], entries)
+}
+
+/// [`aggregate`] writing into a caller-supplied buffer instead of allocating.
+///
+/// `out` must be at least [`aggregate_len(entries.len())`](aggregate_len)
+/// bytes; that many bytes are written and the count returned. Any trailing
+/// bytes of `out` are left alone.
+///
+/// # Errors
+/// [`Error::InvalidInput`] if `entries.len()` exceeds [`MAX_AGGREGATED`] or
+/// `out` is too short.
+pub fn aggregate_into(entries: &[PubkeyMsgSig], out: &mut [u8]) -> Result<usize, Error> {
+    inc_aggregate_into(&[0u8; 32], &[], entries, out)
 }
 
 /// Folds additional signatures into an existing half-aggregate signature.
@@ -347,14 +381,45 @@ pub fn aggregate(entries: &[PubkeyMsgSig]) -> Result<Vec<u8>, Error> {
 /// [`Error::Malformed`] if `agg` is not `32·(aggregated.len() + 1)` bytes, if
 /// its aggregate scalar is not canonical (`≥ n`), or if `aggregated` is empty
 /// and `agg` is not the all-zero seed (the only aggregate over no signatures).
+#[cfg(feature = "alloc")]
 pub fn inc_aggregate(
     agg: &[u8],
     aggregated: &[PubkeyMsg],
     to_add: &[PubkeyMsgSig],
 ) -> Result<Vec<u8>, Error> {
+    let n = aggregate_len(
+        aggregated
+            .len()
+            .checked_add(to_add.len())
+            .ok_or(Error::InvalidInput)?,
+    )
+    .ok_or(Error::InvalidInput)?;
+    let mut out = alloc::vec![0u8; n];
+    inc_aggregate_into(agg, aggregated, to_add, &mut out)?;
+    Ok(out)
+}
+
+/// [`inc_aggregate`] writing into a caller-supplied buffer instead of
+/// allocating.
+///
+/// `out` must be at least
+/// [`aggregate_len(aggregated.len() + to_add.len())`](aggregate_len) bytes;
+/// that many bytes are written and the count returned.
+///
+/// On any error `out` is left in an unspecified (possibly partially written)
+/// state; nothing secret ever reaches it, since every input here is public.
+///
+/// # Errors
+/// As [`inc_aggregate`], plus [`Error::InvalidInput`] if `out` is too short.
+pub fn inc_aggregate_into(
+    agg: &[u8],
+    aggregated: &[PubkeyMsg],
+    to_add: &[PubkeyMsgSig],
+    out: &mut [u8],
+) -> Result<usize, Error> {
     let v = aggregated.len();
     let u = to_add.len();
-    // Bound the total before touching any length arithmetic or allocating.
+    // Bound the total before touching any length arithmetic or writing.
     // `MAX_AGGREGATED` is far below `usize::MAX / 32`, so `v + u` and the
     // byte lengths below cannot overflow once this passes.
     if v > MAX_AGGREGATED || u > MAX_AGGREGATED || v + u > MAX_AGGREGATED {
@@ -362,6 +427,10 @@ pub fn inc_aggregate(
     }
     if agg.len() != (v + 1) * 32 {
         return Err(Error::Malformed);
+    }
+    let written = (v + u + 1) * 32;
+    if out.len() < written {
+        return Err(Error::InvalidInput);
     }
     // The aggregate scalar must be canonical (`< n`), exactly as
     // `verify_aggregate` demands of the final result; silently reducing a
@@ -372,8 +441,7 @@ pub fn inc_aggregate(
         return Err(Error::Malformed);
     }
 
-    let mut out = Vec::with_capacity((v + u + 1) * 32);
-    out.extend_from_slice(&agg[..v * 32]);
+    out[..v * 32].copy_from_slice(&agg[..v * 32]);
 
     // Replay the already-aggregated prefix into the randomizer hash, and start
     // from the aggregate scalar already present in `agg`.
@@ -388,7 +456,7 @@ pub fn inc_aggregate(
         let mut si = [0u8; 32];
         si.copy_from_slice(&sig[32..]);
 
-        out.extend_from_slice(&r);
+        out[(v + j) * 32..(v + j + 1) * 32].copy_from_slice(&r);
         let z = rz.push(v + j, &r, pk, msg);
         // The draft reads `s_i = int(sig_i[32:64])` without a range check;
         // aggregation is not a security boundary and accepts arbitrary input
@@ -396,8 +464,8 @@ pub fn inc_aggregate(
         s = s.add(&z.mul(&Scalar::from_bytes_be_reduce(&si)));
     }
 
-    out.extend_from_slice(&s.to_bytes_be());
-    Ok(out)
+    out[(v + u) * 32..written].copy_from_slice(&s.to_bytes_be());
+    Ok(written)
 }
 
 // =====================================================================
@@ -410,7 +478,53 @@ pub fn inc_aggregate(
 /// Each term costs a 15-entry precomputed table, so this caps the scratch
 /// memory of verification at a constant regardless of how many signatures a
 /// peer claims to have aggregated; larger inputs are folded batch by batch.
+#[cfg(feature = "alloc")]
 const MSM_BATCH: usize = 64;
+
+/// Running `Σ kᵢ·Pᵢ`, fed one term at a time.
+///
+/// With an allocator the terms are buffered and folded [`MSM_BATCH`] at a time
+/// by [`msm`], which shares its doublings across the whole batch. Without one
+/// there is nowhere to put the per-term tables that makes that worthwhile —
+/// they are 1.5 KiB each — so every term gets its own ladder and the
+/// accumulator holds a single point. The sum is identical either way.
+struct Accumulator {
+    acc: ProjectivePoint,
+    #[cfg(feature = "alloc")]
+    batch: Vec<(Scalar, ProjectivePoint)>,
+}
+
+impl Accumulator {
+    fn new() -> Accumulator {
+        Accumulator {
+            acc: ProjectivePoint::identity(),
+            #[cfg(feature = "alloc")]
+            batch: Vec::with_capacity(MSM_BATCH),
+        }
+    }
+
+    #[cfg(feature = "alloc")]
+    fn push(&mut self, k: Scalar, p: ProjectivePoint) {
+        self.batch.push((k, p));
+        if self.batch.len() >= MSM_BATCH {
+            self.acc = self.acc.add(&msm(&self.batch));
+            self.batch.clear();
+        }
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    fn push(&mut self, k: Scalar, p: ProjectivePoint) {
+        self.acc = self.acc.add(&p.mul(&k));
+    }
+
+    fn finish(self) -> ProjectivePoint {
+        #[cfg(feature = "alloc")]
+        if !self.batch.is_empty() {
+            return self.acc.add(&msm(&self.batch));
+        }
+        self.acc
+    }
+}
 
 /// Verifies a half-aggregate signature over `entries`.
 ///
@@ -444,8 +558,7 @@ pub fn verify_aggregate(entries: &[PubkeyMsg], agg: &[u8]) -> Result<(), Error> 
     // s = int(agg[u*32 .. (u+1)*32]); fail if s >= n.
     let s = Scalar::from_bytes_be(&chunk32(agg, u)).map_err(|_| Error::Malformed)?;
 
-    let mut acc = ProjectivePoint::identity();
-    let mut batch: Vec<(Scalar, ProjectivePoint)> = Vec::with_capacity(MSM_BATCH);
+    let mut terms = Accumulator::new();
     let mut rz = Randomizers::new();
 
     for (i, (pk, msg)) in entries.iter().enumerate() {
@@ -456,16 +569,10 @@ pub fn verify_aggregate(entries: &[PubkeyMsg], agg: &[u8]) -> Result<(), Error> 
         let z = rz.push(i, &r, pk, msg);
 
         // z_i·R_i + (z_i·e_i)·P_i
-        batch.push((z.mul(&e), big_p));
-        batch.push((z, big_r));
-        if batch.len() >= MSM_BATCH {
-            acc = acc.add(&msm(&batch));
-            batch.clear();
-        }
+        terms.push(z.mul(&e), big_p);
+        terms.push(z, big_r);
     }
-    if !batch.is_empty() {
-        acc = acc.add(&msm(&batch));
-    }
+    let acc = terms.finish();
 
     if bool::from(ProjectivePoint::mul_generator(&s).ct_eq(&acc)) {
         Ok(())
@@ -483,6 +590,7 @@ pub fn verify_aggregate(entries: &[PubkeyMsg], agg: &[u8]) -> Result<(), Error> 
 /// ladder per term, and it is sound here precisely because every input is
 /// public: the digit tests and the skip on a zero digit are data-dependent by
 /// design.
+#[cfg(feature = "alloc")]
 fn msm(terms: &[(Scalar, ProjectivePoint)]) -> ProjectivePoint {
     let mut tables: Vec<[ProjectivePoint; 15]> = Vec::with_capacity(terms.len());
     let mut scalars: Vec<[u8; 32]> = Vec::with_capacity(terms.len());
@@ -604,6 +712,40 @@ mod tests {
             for (i, (_, _, sig)) in e.iter().enumerate() {
                 assert_eq!(&agg[i * 32..(i + 1) * 32], &sig[..32]);
             }
+        }
+    }
+
+    /// The allocator-free entry points must produce exactly the same bytes as
+    /// the `Vec`-returning conveniences, and must refuse a short buffer
+    /// without writing past it.
+    #[test]
+    fn into_variants_match_and_respect_buffer_length() {
+        for n in [0u8, 1, 2, 7] {
+            let e = entries(n);
+            let want = aggregate(&e).expect("aggregate");
+
+            let mut buf = vec![0xaau8; want.len() + 5];
+            let written = aggregate_into(&e, &mut buf).expect("aggregate_into");
+            assert_eq!(written, want.len());
+            assert_eq!(&buf[..written], &want[..]);
+            // Trailing bytes are untouched.
+            assert!(buf[written..].iter().all(|&b| b == 0xaa));
+
+            if !want.is_empty() {
+                let mut short = vec![0u8; want.len() - 1];
+                assert_eq!(aggregate_into(&e, &mut short), Err(Error::InvalidInput));
+            }
+
+            // Split the same entries into a prefix and a suffix and fold them
+            // incrementally through the `_into` API.
+            let cut = usize::from(n) / 2;
+            let (head, tail) = e.split_at(cut);
+            let base = aggregate(head).expect("aggregate head");
+            let mut inc = vec![0u8; want.len()];
+            let written =
+                inc_aggregate_into(&base, &strip(head), tail, &mut inc).expect("inc_into");
+            assert_eq!(written, want.len());
+            assert_eq!(inc, want);
         }
     }
 

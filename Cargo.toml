@@ -144,7 +144,7 @@ zkp-rangeproof = ["zkp-pedersen", "alloc"]
 # Asset surjection proofs (Confidential Assets).
 zkp-surjection = ["zkp-pedersen", "alloc"]
 # Half-aggregation of BIP340 Schnorr signatures.
-zkp-halfagg = ["bip340", "alloc"]
+zkp-halfagg = ["bip340"]
 # Ring-signature address whitelisting (Elements/Liquid).
 zkp-whitelist = ["hazmat-secp256k1", "hash", "rng", "alloc"]
 # Umbrella: every experimental zkp module at once.
