@@ -138,9 +138,18 @@ pub mod pkcs12;
 pub mod zkp;
 
 /// Shared test-only helpers.
+///
+/// The two hex decoders are used by the tests of almost every module, but
+/// *which* modules is a function of the enabled feature set — a lean
+/// `--no-default-features --features der` build compiles no caller of
+/// `from_hex` at all. Rather than mirror a `#[cfg(any(...))]` list of every
+/// feature with such a test (which would silently go stale), those two opt out
+/// of `dead_code`. The feature-specific fixtures below stay gated to exactly
+/// their callers.
 #[cfg(test)]
 pub(crate) mod test_util {
     /// Decodes a hex string into a fixed-size byte array.
+    #[allow(dead_code)]
     pub(crate) fn from_hex<const N: usize>(s: &str) -> [u8; N] {
         let bytes = s.as_bytes();
         assert_eq!(bytes.len(), 2 * N, "hex string has wrong length");
@@ -160,6 +169,7 @@ pub(crate) mod test_util {
     /// Decodes a hex string (ignoring ASCII whitespace) into a byte vector,
     /// for variable-length fixtures such as the RFC 8448 record traces.
     #[cfg(feature = "alloc")]
+    #[allow(dead_code)]
     pub(crate) fn from_hex_vec(s: &str) -> alloc::vec::Vec<u8> {
         let digits: alloc::vec::Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         assert_eq!(digits.len() % 2, 0, "hex string has odd length");
