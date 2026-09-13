@@ -280,6 +280,39 @@ fn xmssmt_h40_index_does_not_wrap_to_zero() {
     let mut sk_sentinel =
         XmssMtPrivateKey::from_bytes(&at_sentinel).expect("sentinel idx loads as exhausted");
     assert_eq!(sk_sentinel.sign(b"nope"), Err(Error::KeyExhausted));
+    assert_eq!(sk_sentinel.remaining(), 0);
+}
+
+/// `remaining()` must agree with `sign()`: for the `h = 40` sets the last leaf
+/// is sacrificed so the spent sentinel stays representable, so a fresh key has
+/// `2^40 - 1` signatures, not `2^40`. It used to report one too many — a caller
+/// budgeting from it would hit `KeyExhausted` a signature early.
+#[test]
+fn xmssmt_remaining_matches_the_exhaustion_threshold() {
+    let mut rng = HmacDrbg::<Sha256>::new(b"xmssmt", b"remaining", &[]);
+
+    // h = 40 with a 40-bit index field: one leaf is given up.
+    let set = XmssMtParamSet::Sha2_40_8_256;
+    let p = set.params();
+    assert_eq!(p.index_bytes * 8, p.full_height as usize);
+    let sk = XmssMtPrivateKey::generate(set, &mut rng);
+    assert_eq!(sk.remaining(), (1u64 << 40) - 1);
+
+    // At the last signable index exactly one signature is left, and it works.
+    let mut blob = sk.to_bytes();
+    idx_to_bytes((1u64 << 40) - 2, &mut blob[8..8 + p.index_bytes]);
+    let mut last = XmssMtPrivateKey::from_bytes(&blob).expect("loads");
+    assert_eq!(last.remaining(), 1);
+    assert!(last.sign(b"final").is_ok());
+    assert_eq!(last.remaining(), 0);
+    assert_eq!(last.sign(b"after"), Err(Error::KeyExhausted));
+
+    // h = 20 with a wider (24-bit) index field: no leaf is sacrificed.
+    let set20 = XmssMtParamSet::Sha2_20_4_256;
+    let p20 = set20.params();
+    assert!(p20.index_bytes * 8 > p20.full_height as usize);
+    let sk20 = XmssMtPrivateKey::generate(set20, &mut rng);
+    assert_eq!(sk20.remaining(), 1u64 << p20.full_height);
 }
 
 #[test]

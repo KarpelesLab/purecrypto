@@ -1407,15 +1407,20 @@ impl XmssMtPrivateKey {
         bytes_to_idx(&self.bytes[..p.index_bytes])
     }
 
-    /// The number of one-time keys still available (`2^h − idx`).
+    /// The number of one-time keys still available.
+    ///
+    /// This is exactly the number of times [`sign`](Self::sign) will still
+    /// succeed, so it uses the same exhaustion threshold `sign` does: normally
+    /// `2^h − idx`, but `2^h − 1 − idx` for the `h = 40` sets, whose index field
+    /// is exactly `h` bits wide and therefore cannot hold the `2^h` spent
+    /// sentinel — there the last leaf is sacrificed (see
+    /// `Params::exhausted_index`). Reporting `2^h − idx` for those sets claimed
+    /// one signature more than the key can actually issue.
     pub fn remaining(&self) -> u64 {
         let p = self.set.params();
-        let total = if p.full_height >= 64 {
-            u64::MAX
-        } else {
-            1u64 << p.full_height
-        };
-        total.saturating_sub(self.index())
+        p.exhausted_index()
+            .unwrap_or(u64::MAX)
+            .saturating_sub(self.index())
     }
 
     /// Signs `msg`, consuming the current one-time key and advancing the index.
