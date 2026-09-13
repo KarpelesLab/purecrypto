@@ -273,12 +273,14 @@ impl Zeroize for Box<str> {
 /// [`ct::ConstantTimeEq`](crate::ct::ConstantTimeEq) instead.
 ///
 /// ```
+/// # #[cfg(feature = "alloc")] {
 /// use purecrypto::zeroize::Zeroizing;
 ///
 /// let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(64));
 /// buf.extend_from_slice(b"shared secret");
 /// assert_eq!(&buf[..6], b"shared");
 /// // dropped here: contents and spare capacity wiped
+/// # }
 /// ```
 pub struct Zeroizing<Z: Zeroize>(Z);
 
