@@ -171,6 +171,14 @@ Ed25519/Ed448, ML-DSA, SLH-DSA, LMS/HSS and XMSS keys are routed by key type.
 An SM2 key routes to SM2-DSA for sign/verify and SM2-PKE for
 encrypt/decrypt; `-id STR` overrides the default signer identity.
 
+RSA encryption defaults to `rsa_padding_mode:pkcs1`, which prints a warning;
+prefer `oaep`. PKCS#1 v1.5 decryption uses implicit rejection (RFC 8017
+§7.2.2): a corrupt ciphertext, or one encrypted to a different key, does
+**not** produce an error — it produces a deterministic pseudo-random
+plaintext, so no padding oracle is exposed. The command therefore cannot tell
+you a PKCS#1 decrypt went wrong; validate the recovered plaintext yourself.
+Every other decrypt failure prints the single fixed string `decrypt failed`.
+
 ## `kem`
 
 ```sh
@@ -211,6 +219,11 @@ purecrypto x509 -new -ca -key ca.pem -subj "/CN=Internal CA" -out ca.crt
 purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
                 -san leaf.example,www.leaf.example -out leaf.crt
 
+# Replace the request's whole subject with one you chose, rather than
+# certifying the name the requester asked for.
+purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
+                -subj "/CN=Leaf, Inc." -san leaf.example -out leaf.crt
+
 # Inspect a certificate
 purecrypto x509 -in leaf.crt -text [-ext]
 ```
@@ -221,6 +234,23 @@ always an error, and `-force` signs under a non-CA certificate anyway. `-ca`
 on `-req` emits a pathLen:0 sub-CA. Serial numbers are drawn from the OS
 CSPRNG for every certificate.
 
+### Subject and SAN vetting on `-req`
+
+| Flag | Effect |
+| --- | --- |
+| `-san a,b` | Certify exactly these SANs — the operator's list, not the request's. |
+| `-copy-csr-san` | Take the CSR's requested SAN list as-is (each copied entry is named in a stderr warning). |
+| `-subj "/CN=..."` | Replace the request's **whole** subject with this one. |
+| `-allow-cn-hostname` | Escape hatch: certify a host-like CSR commonName with no vetted SAN anyway. |
+
+A leaf with **no** vetted subjectAltName whose CSR commonName looks like a
+DNS name, a wildcard, or an IP literal is **refused**. Hostname verification
+falls back to the commonName exactly when a certificate carries no SAN, so
+issuing such a certificate would silently certify a host name the requester
+picked. Supply your own names with `-san`, accept the request's with
+`-copy-csr-san`, replace the subject with `-subj /CN=...`, or override the
+check with `-allow-cn-hostname`.
+
 ## `ca`
 
 A small development CA that keeps its state in a directory.
@@ -228,7 +258,7 @@ A small development CA that keeps its state in a directory.
 ```text
 purecrypto ca init     -dir DIR [-cn NAME] [-algorithm EC|RSA|ED25519|ED448] [-curve P-256] [-days N]
 purecrypto ca issue    -dir DIR -pubkey leaf.pub -cn NAME [-sans a,b] [-days N] [-out cert.pem] [-ca] [-template NAME] [-template-file PATH] [-force]
-purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-template NAME] [-template-file PATH] [-force]
+purecrypto ca sign-csr -dir DIR -in csr.pem [-out cert.pem] [-days N] [-ca] [-san a,b] [-copy-csr-san] [-subj /CN=...] [-allow-cn-hostname] [-template NAME] [-template-file PATH] [-force]
 purecrypto ca revoke   -dir DIR -serial N|0xN [-reason key-compromise|superseded|...] [-force]
 purecrypto ca crl      -dir DIR [-out crl.pem] [-days N]
 purecrypto ca show     -dir DIR
@@ -239,6 +269,17 @@ Issued and revoked certificates are appended to JSON-lines ledgers in `DIR`
 (opened without following symlinks). `ca crl` emits a CRL carrying a
 monotonic `cRLNumber` from `DIR/crlnumber`. The same CA-certificate and key
 checks as `x509 -req` apply.
+
+`ca sign-csr` applies the same subject and SAN vetting as
+[`x509 -req`](#subject-and-san-vetting-on--req): the request's
+subjectAltName is not certified unless `-copy-csr-san` is given, and a leaf
+with no vetted SAN whose CSR commonName looks like a DNS name, wildcard, or
+IP literal is refused. `-subj "/CN=..."` replaces the request's whole subject
+with an operator-supplied one; `-allow-cn-hostname` is the escape hatch that
+certifies the host-like commonName anyway.
+
+Submitted CSRs must also carry a >= 2048-bit RSA key and a signature that is
+not SHA-1/MD5-based.
 
 ## `crl`
 
@@ -286,6 +327,9 @@ Behaviour worth knowing:
 - A TCP close without a TLS `close_notify` is reported as a possible
   truncation on stderr and the client exits non-zero.
 - `-key` must match `-cert`; a mismatch is refused before listening.
+- `-Verify` (client certificate authentication) is TLS-only: combined with
+  `-dtls1_2` / `-dtls1_3` it is refused up front, because the DTLS server
+  does not support client authentication.
 - `-keylogfile` is opened without following symlinks and refused if the
   file is readable by others.
 
@@ -342,6 +386,11 @@ purecrypto req -key leaf.pem -subj "/CN=leaf.example" \
 purecrypto x509 -req -in leaf.csr -CA ca.crt -CAkey ca.pem \
                 -san leaf.example -out leaf.crt
 ```
+
+The `-san` here is what makes the issuance valid: without a vetted SAN the
+CSR's `/CN=leaf.example` looks like a host name and the command refuses. Add
+`-copy-csr-san` to certify the request's own list, `-subj` to substitute your
+own subject, or `-allow-cn-hostname` to override.
 
 ### The same with the `ca` subcommand, plus revocation
 

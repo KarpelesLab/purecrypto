@@ -243,10 +243,15 @@ full reference with every flag is in [docs/cli.md](docs/cli.md).
 | `s_dtls_client`, `s_dtls_server` | DTLS 1.2 / 1.3 | `purecrypto s_dtls_server -dtls1_3 -accept 0.0.0.0:5685 -cert c.pem -key k.pem` |
 | `q_client`, `q_server` | QUIC v1 | `purecrypto q_client -connect localhost:4434 -alpn h3` |
 
-Two behaviours worth knowing: `s_client` verifies the server certificate by
+Behaviours worth knowing: `s_client` verifies the server certificate by
 default (against the embedded roots or `-CAfile`) and prints a loud warning
 under `-insecure`, and a TCP close without a TLS `close_notify` is reported
-as a possible truncation with a non-zero exit.
+as a possible truncation with a non-zero exit. When issuing from a CSR
+(`x509 -req`, `ca sign-csr`) the request's subjectAltName is not certified
+unless you pass `-copy-csr-san`, and a leaf with no vetted SAN whose CSR
+commonName looks like a DNS name, wildcard, or IP literal is refused: name
+the SANs with `-san`, replace the subject with `-subj /CN=...`, or override
+with `-allow-cn-hostname`. See [docs/cli.md](docs/cli.md#subject-and-san-vetting-on--req).
 
 ## Library usage
 
