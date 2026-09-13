@@ -245,6 +245,9 @@ pub(crate) fn decrypt_pkcs1v15<K: RawPrivate>(
 /// that every call on the same key sees the same fallback seed but an
 /// attacker without the private key cannot predict it.
 ///
+/// A recovered plaintext whose length differs from `out.len()` counts as a
+/// failure and yields the synthetic output too (RFC 5246 §7.4.7.1).
+///
 /// # Errors
 /// Only [`Error::InvalidLength`] when the ciphertext length is wrong (this is
 /// public, not secret-dependent). All padding outcomes return `Ok` — either
@@ -286,7 +289,22 @@ pub(crate) fn decrypt_pkcs1v15_session<K: RawPrivate>(
     let em: &[u8] = scratch;
 
     // Same constant-time padding check as decrypt_pkcs1v15.
-    let (bad, sep_idx) = pkcs1v15_padding_check(em);
+    let (mut bad, sep_idx) = pkcs1v15_padding_check(em);
+
+    // RFC 5246 §7.4.7.1 (and the RFC 8017 §7.2.2 Note construction): a
+    // ciphertext that decrypts to *valid* padding but a plaintext of the
+    // wrong length must be rejected exactly like malformed padding. Without
+    // this fold, a validly-padded short message yields `msg ‖ 00…` (the merge
+    // below leaves the unmatched tail positions at zero), which is a
+    // distinguisher — the TLS 1.2 static-RSA premaster path in particular
+    // relies on the length check being folded in, since a 47-byte premaster
+    // must produce a random 48-byte secret rather than a 47-byte one padded
+    // with a zero. `out.len()` and `k` are public; only `sep_idx` is secret,
+    // so the comparison below is constant time in the secret part.
+    let real_len = (k as u32).wrapping_sub(sep_idx.wrapping_add(1));
+    let len_ok = real_len.ct_eq(&(out.len() as u32)).unwrap_u8();
+    bad |= 0u8.wrapping_sub(len_ok ^ 1);
+    let bad = bad;
 
     // Derive the synthetic fallback: HMAC(key_secret, ct) expanded to expected_len.
     // The derivation is keyed by the long-term private value so the attacker

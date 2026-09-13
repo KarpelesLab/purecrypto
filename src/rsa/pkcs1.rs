@@ -112,11 +112,13 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// oracle when the caller's downstream behavior would otherwise leak
     /// the padding outcome.
     ///
-    /// On success the returned `Vec` is **truncated or padded** to
-    /// `expected_len`: PKCS#1 v1.5 padding alone cannot recover the
-    /// intended plaintext length, so the protocol must agree on it (e.g.
-    /// TLS RSA key transport: `expected_len = 48` for the 48-byte
-    /// pre-master secret).
+    /// The returned `Vec` is always exactly `expected_len` bytes: PKCS#1
+    /// v1.5 padding alone cannot recover the intended plaintext length, so
+    /// the protocol must agree on it (e.g. TLS RSA key transport:
+    /// `expected_len = 48` for the 48-byte pre-master secret). A ciphertext
+    /// that decrypts to valid padding but a plaintext of a *different*
+    /// length is treated exactly like malformed padding and yields the
+    /// synthetic output (RFC 5246 §7.4.7.1).
     ///
     /// # Errors
     /// Only [`Error::InvalidLength`] when `ct.len() != LIMBS*8`. All other
@@ -334,6 +336,32 @@ mod tests {
         let a = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
         let b = key.decrypt_pkcs1v15_session(&bogus_ct, 48).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// A ciphertext with **valid** padding but a plaintext of the wrong
+    /// length must be rejected exactly like bad padding: RFC 5246 §7.4.7.1
+    /// requires a random premaster whenever the recovered length is not 48.
+    /// Before the length check was folded into the constant-time `bad`
+    /// mask, a 47-byte message came back as `msg ‖ 00`, which is both a
+    /// padding oracle and a protocol bug.
+    #[test]
+    fn session_decrypt_rejects_valid_padding_with_wrong_length() {
+        let key = rsa_test_key_a();
+        let pk = key.public_key();
+        let mut r = HmacDrbg::<Sha256>::new(b"rsa-session-len", b"nonce", &[]);
+        let msg = [0x5au8; 47]; // one byte short of a premaster secret
+        let ct = pk.encrypt_pkcs1v15(&msg, &mut r).unwrap();
+        let out = key.decrypt_pkcs1v15_session(&ct, 48).unwrap();
+        assert_eq!(out.len(), 48);
+        assert_ne!(&out[..47], &msg[..], "must not leak the short plaintext");
+        assert_ne!(out[47], 0, "must not be the zero-padded real plaintext");
+        // Deterministic, like every other implicit-rejection outcome.
+        let again = key.decrypt_pkcs1v15_session(&ct, 48).unwrap();
+        assert_eq!(out, again);
+        // And the correctly-sized message still round-trips.
+        let msg48 = [0x5au8; 48];
+        let ct48 = pk.encrypt_pkcs1v15(&msg48, &mut r).unwrap();
+        assert_eq!(key.decrypt_pkcs1v15_session(&ct48, 48).unwrap(), msg48);
     }
 
     /// `Error::InvalidLength` is the only failure surfaced (ciphertext

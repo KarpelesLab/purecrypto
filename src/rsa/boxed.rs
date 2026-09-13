@@ -822,11 +822,13 @@ impl BoxedRsaPrivateKey {
     /// oracle when the caller's downstream behavior would otherwise leak
     /// the padding outcome.
     ///
-    /// On success the returned `Vec` is **truncated or padded** to
-    /// `expected_len`: PKCS#1 v1.5 padding alone cannot recover the
-    /// intended plaintext length, so the protocol must agree on it (e.g.
-    /// TLS RSA key transport: `expected_len = 48` for the 48-byte
-    /// pre-master secret).
+    /// The returned `Vec` is always exactly `expected_len` bytes: PKCS#1
+    /// v1.5 padding alone cannot recover the intended plaintext length, so
+    /// the protocol must agree on it (e.g. TLS RSA key transport:
+    /// `expected_len = 48` for the 48-byte pre-master secret). A ciphertext
+    /// that decrypts to valid padding but a plaintext of a *different*
+    /// length is treated exactly like malformed padding and yields the
+    /// synthetic output (RFC 5246 §7.4.7.1).
     ///
     /// # Errors
     /// Only [`Error::InvalidLength`] when `ct.len()` does not equal the
