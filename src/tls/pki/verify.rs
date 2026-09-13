@@ -449,6 +449,12 @@ fn verify_chain_inner(
     // extKeyUsage), over the validated path.
     enforce_constraints(path, purpose)?;
 
+    // RFC 5937 — honour the constraints the matched trust anchor declared on
+    // itself (pathLenConstraint, extKeyUsage), when it declared any.
+    if let Some(anchor) = matched_anchor {
+        enforce_anchor_constraints(path, anchor, purpose)?;
+    }
+
     // RFC 5280 §6.1.2–§6.1.5 — certificate-policy-tree processing. A no-op
     // (returns immediately) when `policy_opts` does not enable policy
     // processing, so the default path is unaffected.
@@ -604,12 +610,10 @@ const ANY_EXTENDED_KEY_USAGE: &[u64] = &[2, 5, 29, 37, 0];
 ///   * if the leaf carries `keyUsage`, `digitalSignature` (bit 0) must be set;
 ///   * if the leaf carries `extKeyUsage`, it must include the required purpose.
 ///
-/// NOTE: the trust anchor's *own* `pathLenConstraint` is not enforced here —
-/// the anchor is not part of `certs` (it lives in the [`RootCertStore`] and is
-/// excluded from validity/constraint processing per RFC 5280 §6.1), and the
-/// store currently retains only the anchor's name constraints, not its
-/// `basicConstraints`. Honoring the anchor's pathLen would require the store to
-/// keep that field; in-chain CA pathLen *is* enforced below.
+/// The trust anchor's *own* `pathLenConstraint` / `extKeyUsage` are not
+/// enforced here — the anchor is not part of `certs` (it lives in the
+/// [`RootCertStore`] and is excluded from processing per RFC 5280 §6.1) — but
+/// they are enforced separately by [`enforce_anchor_constraints`].
 fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(), Error> {
     let required = match purpose {
         ChainPurpose::Server => oid::ID_KP_SERVER_AUTH,
@@ -689,6 +693,55 @@ fn enforce_constraints(certs: &[Certificate], purpose: ChainPurpose) -> Result<(
             .any(|o| o.as_slice() == required || o.as_slice() == ANY_EXTENDED_KEY_USAGE)
     {
         return Err(Error::BadCertificate);
+    }
+    Ok(())
+}
+
+/// RFC 5937 — constraints the trust anchor declares on *itself*.
+///
+/// RFC 5280 §6.1 deliberately excludes the anchor's certificate from path
+/// processing (the anchor is "a name and a key"), so a root that says
+/// `basicConstraints: CA:TRUE, pathlen:0` or `extKeyUsage: codeSigning` was
+/// previously unconstrained in practice. RFC 5937 lets a relying party apply
+/// such constraints, and OpenSSL — which keeps the root in the chain — does.
+/// Both checks fire **only when the anchor actually carries the extension**,
+/// so an ordinary root (the overwhelming majority: of the 117 embedded roots,
+/// two carry a pathLen and none carries an EKU) validates exactly as before.
+///
+/// * `pathLenConstraint = N` bounds the number of non-self-issued
+///   intermediates between the anchor and the leaf — here, everything in
+///   `path` above the leaf (RFC 5280 §4.2.1.9 / §6.1.4(h)).
+/// * a non-empty `extKeyUsage` must permit the purpose being validated for,
+///   or `anyExtendedKeyUsage`, mirroring the in-chain CA rule.
+fn enforce_anchor_constraints(
+    path: &[Certificate],
+    anchor: &super::store::TrustAnchor,
+    purpose: ChainPurpose,
+) -> Result<(), Error> {
+    if let Some(plc) = anchor.path_len_constraint {
+        let intermediates_below = path[1..]
+            .iter()
+            .filter(|c| match (c.subject_der(), c.issuer_der()) {
+                (Ok(s), Ok(i)) => s != i,
+                _ => true,
+            })
+            .count();
+        if (plc as usize) < intermediates_below {
+            return Err(Error::BadCertificate);
+        }
+    }
+    if !anchor.extended_key_usages.is_empty() {
+        let required = match purpose {
+            ChainPurpose::Server => oid::ID_KP_SERVER_AUTH,
+            ChainPurpose::Client => oid::ID_KP_CLIENT_AUTH,
+        };
+        if !anchor
+            .extended_key_usages
+            .iter()
+            .any(|o| o.as_slice() == required || o.as_slice() == ANY_EXTENDED_KEY_USAGE)
+        {
+            return Err(Error::BadCertificate);
+        }
     }
     Ok(())
 }
@@ -2619,6 +2672,147 @@ mod tests {
         assert!(super::dns_in_subtree("example.com", ""));
     }
 
+    /// RFC 5937 trust-anchor constraints: a root that declares
+    /// `pathLenConstraint` / `extKeyUsage` on itself has them honoured, while
+    /// a root declaring neither is unconstrained exactly as before.
+    #[test]
+    fn anchor_self_constraints_are_honoured() {
+        use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
+        use crate::rng::HmacDrbg;
+        use crate::x509::{
+            CertSigner, DistinguishedName, Extension, GeneralName, KeyUsageBits,
+            extension::{basic_constraints, extended_key_usage, key_usage, subject_alt_name},
+        };
+
+        // `root_exts` varies per case; everything below the root is fixed:
+        // root -> intermediate -> leaf, plus a leaf issued directly by the root.
+        let build = |root_exts: &[Extension]| {
+            let mut rng = HmacDrbg::<crate::hash::Sha256>::new(b"anchor-constraints", b"n", &[]);
+            let root_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+            let int_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+            let leaf_key = BoxedEcdsaPrivateKey::generate(CurveId::P256, &mut rng);
+            let root_signer = CertSigner::Ecdsa(&root_key);
+            let int_signer = CertSigner::Ecdsa(&int_key);
+            let root_name = DistinguishedName::common_name("anchor-root");
+            let int_name = DistinguishedName::common_name("anchor-intermediate");
+            let root = Certificate::self_signed_with_extensions(
+                &root_signer,
+                &root_name,
+                &validity(),
+                1,
+                root_exts,
+            )
+            .unwrap();
+            let int = Certificate::issue_with_extensions(
+                &root_signer,
+                &root_name,
+                &int_name,
+                &crate::x509::AnyPublicKey::Ecdsa(int_key.public_key()),
+                &validity(),
+                2,
+                &[
+                    basic_constraints(true, None),
+                    key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN),
+                ],
+            )
+            .unwrap();
+            let leaf_exts = [
+                basic_constraints(false, None),
+                key_usage(KeyUsageBits::DIGITAL_SIGNATURE),
+                extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+                subject_alt_name(&[GeneralName::Dns("leaf.example".into())]),
+            ];
+            let leaf_pub = crate::x509::AnyPublicKey::Ecdsa(leaf_key.public_key());
+            let deep = Certificate::issue_with_extensions(
+                &int_signer,
+                &int_name,
+                &DistinguishedName::common_name("leaf.example"),
+                &leaf_pub,
+                &validity(),
+                3,
+                &leaf_exts,
+            )
+            .unwrap();
+            let direct = Certificate::issue_with_extensions(
+                &root_signer,
+                &root_name,
+                &DistinguishedName::common_name("leaf.example"),
+                &leaf_pub,
+                &validity(),
+                4,
+                &leaf_exts,
+            )
+            .unwrap();
+            (root, int, deep, direct)
+        };
+        let check = |root: &Certificate, chain: alloc::vec::Vec<alloc::vec::Vec<u8>>| {
+            let mut store = RootCertStore::new();
+            store.add_der(root.to_der().to_vec()).unwrap();
+            let now = Time::utc(2026, 1, 1, 0, 0, 0);
+            verify_chain(&store, &chain, Some(&now), &policy()).map(|_| ())
+        };
+
+        let ku = key_usage(KeyUsageBits::KEY_CERT_SIGN | KeyUsageBits::CRL_SIGN);
+        // Baseline: no pathLen, no EKU on the root → both chains validate.
+        let (root, int, deep, direct) = build(&[basic_constraints(true, None), ku.clone()]);
+        assert_eq!(
+            check(
+                &root,
+                alloc::vec![deep.to_der().to_vec(), int.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+        assert_eq!(check(&root, alloc::vec![direct.to_der().to_vec()]), Ok(()));
+
+        // pathlen:0 on the root → no intermediate may sit below it.
+        let (root, int, deep, direct) = build(&[basic_constraints(true, Some(0)), ku.clone()]);
+        assert_eq!(
+            check(
+                &root,
+                alloc::vec![deep.to_der().to_vec(), int.to_der().to_vec()]
+            ),
+            Err(Error::BadCertificate)
+        );
+        assert_eq!(check(&root, alloc::vec![direct.to_der().to_vec()]), Ok(()));
+
+        // pathlen:1 leaves room for exactly that one intermediate.
+        let (root, int, deep, _direct) = build(&[basic_constraints(true, Some(1)), ku.clone()]);
+        assert_eq!(
+            check(
+                &root,
+                alloc::vec![deep.to_der().to_vec(), int.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+
+        // An EKU-scoped root must permit the purpose being validated for.
+        let (root, int, deep, _direct) = build(&[
+            basic_constraints(true, None),
+            ku.clone(),
+            extended_key_usage(&[oid::ID_KP_CLIENT_AUTH]),
+        ]);
+        assert_eq!(
+            check(
+                &root,
+                alloc::vec![deep.to_der().to_vec(), int.to_der().to_vec()]
+            ),
+            Err(Error::BadCertificate),
+            "clientAuth-only root must not anchor a serverAuth chain"
+        );
+        let (root, int, deep, _direct) = build(&[
+            basic_constraints(true, None),
+            ku,
+            extended_key_usage(&[oid::ID_KP_SERVER_AUTH]),
+        ]);
+        assert_eq!(
+            check(
+                &root,
+                alloc::vec![deep.to_der().to_vec(), int.to_der().to_vec()]
+            ),
+            Ok(())
+        );
+    }
+
     /// Regression: a SAN dNSName with a trailing dot used to slip past an
     /// `excluded` dNSName subtree while still authenticating the same host.
     #[test]
@@ -2665,7 +2859,7 @@ mod tests {
     #[test]
     fn empty_dns_name_constraint_matches_all_names() {
         use crate::x509::GeneralName;
-        let mut store_and_chain = |nc: crate::x509::Extension, sans: &[GeneralName]| {
+        let store_and_chain = |nc: crate::x509::Extension, sans: &[GeneralName]| {
             let (root, int, leaf) = build_chain_with_nc(nc, "nc-leaf", sans);
             let mut store = RootCertStore::new();
             store.add_der(root.to_der().to_vec()).unwrap();

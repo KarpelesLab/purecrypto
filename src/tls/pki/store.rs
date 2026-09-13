@@ -25,6 +25,18 @@ pub(crate) struct TrustAnchor {
     /// BIT STRING (RFC 6960 §4.1.1), not over a re-encoding of `key`.
     pub(crate) spki_der: Vec<u8>,
     pub(crate) name_constraints: Option<NameConstraints>,
+    /// The anchor's own `basicConstraints.pathLenConstraint`, when it declared
+    /// one. RFC 5280 §6.1 does not process the anchor's certificate at all,
+    /// but RFC 5937 ("Using Trust Anchor Constraints during Certification Path
+    /// Processing") allows a relying party to honour constraints the anchor
+    /// carries — and OpenSSL does. Enforced only when actually present, so
+    /// anchors without the field behave exactly as before.
+    pub(crate) path_len_constraint: Option<u32>,
+    /// The anchor's own `extKeyUsage` OIDs, empty when it declared none. Like
+    /// `path_len_constraint`, enforced only when non-empty (RFC 5937): an
+    /// EKU-scoped root must permit the purpose the chain is being validated
+    /// for, the same rule in-chain CAs obey.
+    pub(crate) extended_key_usages: Vec<Vec<u64>>,
 }
 
 /// A set of trusted root certificates against which peer chains are verified.
@@ -74,11 +86,25 @@ impl RootCertStore {
         {
             return Err(Error::BadCertificate);
         }
+        // RFC 5937 anchor constraints: keep the anchor's own
+        // `pathLenConstraint` and `extKeyUsage`, when it declares them, so the
+        // validator can honour them (see [`TrustAnchor`]). Both are optional
+        // fields; an anchor that carries neither is unconstrained exactly as
+        // before. A malformed extension is fail-closed like nameConstraints.
+        let path_len_constraint = cert
+            .basic_constraints()
+            .map_err(|_| Error::BadCertificate)?
+            .and_then(|(is_ca, plc)| if is_ca { plc } else { None });
+        let extended_key_usages = cert
+            .extended_key_usages()
+            .map_err(|_| Error::BadCertificate)?;
         self.anchors.push(TrustAnchor {
             subject_der,
             key,
             spki_der,
             name_constraints,
+            path_len_constraint,
+            extended_key_usages,
         });
         Ok(())
     }
@@ -170,6 +196,24 @@ mod embedded_roots_tests {
             store.len()
         );
         assert!(!store.is_empty());
+    }
+
+    /// RFC 5937 anchor constraints are enforced only when the anchor declares
+    /// them, so they must not disturb the embedded bundle: no embedded root
+    /// carries an `extKeyUsage`, and the handful that carry a
+    /// `pathLenConstraint` all leave room for at least one intermediate.
+    #[test]
+    fn embedded_roots_carry_no_blocking_self_constraints() {
+        let store = RootCertStore::with_embedded_roots();
+        for anchor in &store.anchors {
+            assert!(
+                anchor.extended_key_usages.is_empty(),
+                "an embedded root declares an EKU; revisit RFC 5937 enforcement"
+            );
+            if let Some(plc) = anchor.path_len_constraint {
+                assert!(plc >= 1, "an embedded root declares pathlen:0");
+            }
+        }
     }
 
     #[test]
