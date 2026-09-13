@@ -11,6 +11,7 @@
 use super::permutation::State;
 use crate::cipher::TagMismatch;
 use crate::ct::ConstantTimeEq;
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Ascon-AEAD128 initialization value (SP 800-232 §4.1.1, Alg. 3): the 64-bit
 /// constant placed in `S0` before `Ascon-p[12]`.
@@ -215,10 +216,8 @@ impl AsconAead128 {
         // `plain` held the last recovered (and, on failure, unauthenticated)
         // plaintext block and `rate_bytes` the squeezed rate; neither belongs
         // in the caller's stack frame after the call.
-        plain = [0u8; RATE];
-        rate_bytes = [0u8; RATE];
-        let _ = core::hint::black_box(&plain);
-        let _ = core::hint::black_box(&rate_bytes);
+        Zeroize::zeroize(&mut plain);
+        Zeroize::zeroize(&mut rate_bytes);
         result
     }
 }
@@ -238,13 +237,14 @@ fn load_padded_rate(rem: &[u8]) -> (u64, u64) {
 
 impl Drop for AsconAead128 {
     fn drop(&mut self) {
-        // Best-effort wipe of the secret key words.
-        self.k0 = 0;
-        self.k1 = 0;
-        let _ = core::hint::black_box(&self.k0);
-        let _ = core::hint::black_box(&self.k1);
+        // Best-effort wipe of the secret key words, with volatile stores the
+        // optimizer may not elide.
+        self.k0.zeroize();
+        self.k1.zeroize();
     }
 }
+
+impl ZeroizeOnDrop for AsconAead128 {}
 
 #[cfg(test)]
 mod tests {

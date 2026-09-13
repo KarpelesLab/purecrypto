@@ -304,8 +304,8 @@ impl Drop for RecordCrypter {
     }
 }
 
-/// Best-effort zeroing of a key buffer, fenced with `black_box` so the
-/// stores are not elided (the crate's standard wipe pattern).
+/// Best-effort zeroing of a key buffer with the crate's volatile
+/// [`zeroize`](crate::zeroize) stores, which are not elided.
 fn wipe(buf: &mut [u8]) {
     crate::tls::conn::wipe(buf);
 }

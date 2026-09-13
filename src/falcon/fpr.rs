@@ -100,17 +100,22 @@ const NAN_BITS: u64 = 0x7FF8_0000_0000_0000;
 
 /// Overwrite a slice of secret [`Fpr`] values with `+0.0`.
 ///
-/// Routed through [`core::hint::black_box`] so the compiler cannot treat the
-/// stores as dead and elide them (the same pattern the private-key `Drop` impls
-/// use). Falcon's expanded key and the key-expansion temporaries are lossless
-/// representations of the NTRU secret, so they must not be handed back to the
-/// allocator in the clear.
+/// Uses [`crate::zeroize::Zeroize`], whose volatile stores the compiler may
+/// not treat as dead and elide. Falcon's expanded key and the key-expansion
+/// temporaries are lossless representations of the NTRU secret, so they must
+/// not be handed back to the allocator in the clear.
 #[inline]
 pub(crate) fn wipe_fpr(v: &mut [Fpr]) {
-    for x in v.iter_mut() {
-        *x = FPR_ZERO;
+    crate::zeroize::Zeroize::zeroize(v);
+}
+
+impl crate::zeroize::Zeroize for Fpr {
+    /// Volatile-stores `+0.0` over the value.
+    #[inline]
+    fn zeroize(&mut self) {
+        crate::zeroize::Zeroize::zeroize(&mut self.0);
+        debug_assert_eq!(self.0, FPR_ZERO.0);
     }
-    let _ = core::hint::black_box(&*v);
 }
 
 // ---------------------------------------------------------------------------

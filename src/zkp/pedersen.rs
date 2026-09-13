@@ -108,7 +108,7 @@
 //! to a full scalar and multiplied with the same 256-bit ladder regardless of
 //! its magnitude, and the hash-to-curve candidate selection uses constant-time
 //! selects rather than branches. Blinding factors held in local buffers are
-//! wiped with a [`core::hint::black_box`] barrier.
+//! wiped with the crate's volatile [`zeroize`](crate::zeroize) stores.
 //!
 //! Parsing branches on attacker-supplied bytes, which are public by
 //! construction, and never panics: every 33-byte input either parses or returns
@@ -450,8 +450,7 @@ fn hash_to_curve(f: &Field, tag: &[u8; 32]) -> Result<ProjectivePoint, Error> {
     buf[..16].copy_from_slice(GEN_PREFIX_2);
     let mut h2 = sha256(&buf);
     // The tag is secret in Confidential Assets; do not leave it on the stack.
-    buf = [0u8; 48];
-    let _ = core::hint::black_box(&buf);
+    buf.zeroize();
 
     let mut t1 = Fe::from_be_bytes(&h1).reduce(f.p());
     let mut t2 = Fe::from_be_bytes(&h2).reduce(f.p());
@@ -461,11 +460,10 @@ fn hash_to_curve(f: &Field, tag: &[u8; 32]) -> Result<ProjectivePoint, Error> {
     // The digests and the field elements derived from them are functions of
     // the secret tag alone (the domain separators are public), so a leftover
     // copy is as good as the tag itself. Wipe them on every exit path.
-    h1 = [0u8; 32];
-    h2 = [0u8; 32];
-    t1 = Fe::ZERO;
-    t2 = Fe::ZERO;
-    let _ = core::hint::black_box((&h1, &h2, &t1, &t2));
+    h1.zeroize();
+    h2.zeroize();
+    t1.zeroize();
+    t2.zeroize();
 
     let (x1, y1) = r1?;
     let (x2, y2) = r2?;
@@ -489,8 +487,7 @@ pub fn value_scalar(value: u64) -> Scalar {
     let scalar = Scalar::from_bytes_be_reduce(&bytes);
     // The value is the secret a commitment hides; do not leave a plaintext
     // copy of it on the stack (`Scalar` wipes itself on drop).
-    bytes.fill(0);
-    let _ = core::hint::black_box(&bytes);
+    bytes.zeroize();
     scalar
 }
 

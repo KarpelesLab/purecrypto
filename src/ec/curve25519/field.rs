@@ -516,6 +516,18 @@ impl Field {
 mod tests {
     use super::*;
     use crate::bignum::MontModulus;
+    use crate::zeroize::Zeroize as _;
+
+    /// `Fe`'s `Zeroize` must clear every unsaturated limb: ladder and point
+    /// intermediates are wiped through it.
+    #[test]
+    fn fe_zeroize_clears_limbs() {
+        let mut x = Fe::from_u64(0x1234_5678_9abc_def0);
+        x = x.mul(&x);
+        assert!(x.0.iter().any(|&l| l != 0));
+        x.zeroize();
+        assert_eq!(x.0, [0u64; 5]);
+    }
     use crate::hash::Sha256;
     use crate::rng::{HmacDrbg, RngCore};
 

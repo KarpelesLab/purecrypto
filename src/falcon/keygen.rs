@@ -354,10 +354,7 @@ fn gen_poly<R: SamplerRng>(n: usize, rng: &mut R) -> Vec<i64> {
         .collect();
     // `samples` is the raw Gaussian material the secret polynomial is the sum
     // of — strictly more information about the key than the key itself.
-    for s in samples.iter_mut() {
-        *s = 0;
-    }
-    let _ = core::hint::black_box(&samples);
+    crate::zeroize::Zeroize::zeroize(samples.as_mut_slice());
     out
 }
 

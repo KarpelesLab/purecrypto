@@ -122,26 +122,23 @@ pub(super) unsafe fn out_write(data: &[u8], out: *mut u8, out_len: *mut usize) -
     PcStatus::Ok
 }
 
-/// Overwrites `buf` with zeros and routes the read through
-/// `core::hint::black_box` so LLVM cannot eliminate the writes as dead stores.
-/// Used to scrub recovered plaintext / shared secrets before their backing
-/// storage is returned to the allocator (mirrors the in-house pattern in
-/// `src/ffi/rsa.rs` and `src/mlkem/mod.rs`).
+/// Overwrites `buf` with zeros through [`crate::zeroize::Zeroize`] (volatile
+/// stores plus a compiler fence, so LLVM cannot eliminate the writes as dead
+/// stores). Used to scrub recovered plaintext / shared secrets before their
+/// backing storage is returned to the allocator.
+///
+/// Wipes the live bytes in place and **keeps the vector's length**, so a
+/// caller may still inspect it afterwards (`pc_tls_recv` reads `is_empty()`
+/// on the buffer it has just delivered and scrubbed). `Vec::zeroize` would
+/// empty it instead.
 pub(super) fn wipe_vec(buf: &mut alloc::vec::Vec<u8>) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
+    crate::zeroize::Zeroize::zeroize(buf.as_mut_slice());
 }
 
-/// [`wipe_vec`] for stack-allocated buffers: zeros `buf` behind a
-/// `black_box` barrier so a shared secret copied out to the caller does
-/// not linger in the local array after the frame is popped.
+/// [`wipe_vec`] for stack-allocated buffers, so a shared secret copied out to
+/// the caller does not linger in the local array after the frame is popped.
 pub(super) fn wipe_array(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 #[cfg(test)]

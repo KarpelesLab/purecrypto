@@ -347,8 +347,8 @@ impl core::fmt::Debug for StoredSession12 {
 
 // A stored session is the long-lived home of a connection's master secret
 // (it outlives the connection that derived it, waiting for resumption).
-// Scrub the secret when the session is dropped — overwrite + `black_box`,
-// the crate's standard wipe pattern.
+// Scrub the secret when the session is dropped, with the crate's volatile
+// `zeroize` stores.
 impl Drop for StoredSession12 {
     fn drop(&mut self) {
         super::wipe(&mut self.master_secret);
@@ -642,8 +642,8 @@ pub struct ClientConnection12 {
 // Unlike the TLS 1.3 schedule (whose secrets are consumed as the handshake
 // ratchets forward), the TLS 1.2 master secret lives for the whole
 // connection — it feeds resumption, exporters and Finished verification.
-// Scrub it on drop so it does not linger in freed memory (overwrite +
-// `black_box`, the crate's standard wipe pattern).
+// Scrub it on drop so it does not linger in freed memory (the crate's
+// volatile `zeroize` stores).
 impl Drop for ClientConnection12 {
     fn drop(&mut self) {
         if let Some(m) = self.master.as_mut() {

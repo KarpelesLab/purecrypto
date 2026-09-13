@@ -38,8 +38,8 @@ const MAX_SECRET: usize = 64;
 /// or a (possibly hybrid) (EC)DHE shared secret (≤ 64 bytes). Avoids heap
 /// allocation.
 ///
-/// Deliberately NOT `Copy`: the buffer is wiped on drop (zero-overwrite
-/// fenced with `black_box`, the crate's standard wipe pattern), so
+/// Deliberately NOT `Copy`: the buffer is wiped on drop (the crate's
+/// volatile [`zeroize`](crate::zeroize) stores), so
 /// long-lived holders — `KeySchedule.secret`, the `Option<Secret>`
 /// traffic/exporter/resumption fields on the TLS 1.3 / DTLS 1.3 / QUIC
 /// engines — do not retain key material after teardown. (Like every

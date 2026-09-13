@@ -102,7 +102,7 @@ impl core::fmt::Debug for Ticket12Plaintext {
 
 // The decoded ticket payload carries the 48-byte master secret; scrub it
 // when the payload is dropped so the secret does not linger on the heap /
-// stack frame (same overwrite + `black_box` pattern as `X25519PrivateKey`).
+// stack frame (the same volatile-store wipe as `X25519PrivateKey`).
 impl Drop for Ticket12Plaintext {
     fn drop(&mut self) {
         super::wipe(&mut self.master_secret);

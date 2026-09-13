@@ -233,10 +233,7 @@ pub struct Parsed {
 impl Drop for Parsed {
     fn drop(&mut self) {
         for k in self.keys.iter_mut() {
-            for b in k.iter_mut() {
-                *b = 0;
-            }
-            let _ = core::hint::black_box(&k);
+            crate::zeroize::Zeroize::zeroize(k);
         }
     }
 }
@@ -269,10 +266,7 @@ impl Pfx {
         let mut pw_bmp = password_to_bmp(password);
         let result = Self::parse_inner(der, password, &pw_bmp);
         // Wipe the BMP password copy regardless of outcome.
-        for b in pw_bmp.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&pw_bmp);
+        crate::zeroize::Zeroize::zeroize(&mut pw_bmp);
         result
     }
 
@@ -451,10 +445,7 @@ impl Pfx {
 
         // Wipe the BMP password copy.
         let mut pw_bmp = pw_bmp;
-        for b in pw_bmp.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&pw_bmp);
+        crate::zeroize::Zeroize::zeroize(&mut pw_bmp);
 
         pfx
     }
@@ -693,10 +684,7 @@ fn pbe_sha1_3des_decrypt(
     let mut buf = ciphertext.to_vec();
     let mut cbc = Cbc64::new(TdesEde3::new(&key), &iv);
     // Wipe key material now that the cipher object owns its schedule.
-    for b in key.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&key);
+    crate::zeroize::Zeroize::zeroize(&mut key);
     cbc.decrypt(&mut buf).map_err(|_| Error::Decryption)?;
 
     strip_pkcs7(buf, 8)
@@ -739,10 +727,7 @@ fn strip_pkcs7(mut buf: Vec<u8>, block: usize) -> Result<Vec<u8>, Error> {
     if (range_ok & bytes_ok) != 0xFF {
         // Wrong-key / tampered result — wipe the recovered bytes before the
         // rejection so they don't linger in freed memory.
-        for x in buf.iter_mut() {
-            *x = 0;
-        }
-        let _ = core::hint::black_box(&buf);
+        crate::zeroize::Zeroize::zeroize(&mut buf);
         return Err(Error::Decryption);
     }
     buf.truncate(n - last as usize);
@@ -839,18 +824,14 @@ fn sha_based_hmac(
             let mut key = [0u8; 20];
             derive(hash, pw_bmp, salt, iterations, ID_MAC, &mut key);
             let tag = Hmac::<Sha1>::mac(&key, content);
-            for b in key.iter_mut() {
-                *b = 0;
-            }
+            crate::zeroize::Zeroize::zeroize(&mut key);
             tag.as_ref().to_vec()
         }
         PkcsHash::Sha256 => {
             let mut key = [0u8; 32];
             derive(hash, pw_bmp, salt, iterations, ID_MAC, &mut key);
             let tag = Hmac::<Sha256>::mac(&key, content);
-            for b in key.iter_mut() {
-                *b = 0;
-            }
+            crate::zeroize::Zeroize::zeroize(&mut key);
             tag.as_ref().to_vec()
         }
     }
@@ -912,9 +893,7 @@ fn pbmac1_compute(alg: &mut Reader<'_>, password: &str, content: &[u8]) -> Resul
     let mut key = vec![0u8; key_len];
     crate::kdf::pbkdf2::<Sha256>(password.as_bytes(), &salt, iterations, &mut key);
     let tag = Hmac::<Sha256>::mac(&key, content);
-    for b in key.iter_mut() {
-        *b = 0;
-    }
+    crate::zeroize::Zeroize::zeroize(&mut key);
     Ok(tag.as_ref().to_vec())
 }
 

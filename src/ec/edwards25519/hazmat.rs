@@ -309,6 +309,18 @@ fn wipe_scalar_bytes(b: &mut [u8; 32]) {
 mod tests {
     use super::*;
     use crate::ec::curve25519::field::Field;
+    use crate::zeroize::Zeroize as _;
+
+    /// The scalar's `Zeroize` (and hence its `Drop`) must leave every limb
+    /// zero — the limbs are the private key in `ec::ristretto255` and the
+    /// hazmat exposures.
+    #[test]
+    fn zeroize_clears_limbs() {
+        let mut s = Scalar::from_bytes_mod_order(&[0xAB; 64]);
+        assert!(s.0.as_limbs().iter().any(|&l| l != 0));
+        s.zeroize();
+        assert!(s.0.as_limbs().iter().all(|&l| l == 0));
+    }
 
     // Reference [s]B straight off the backend, mirroring how Ed25519's
     // `public_key` computes A = [a]B, so we cross-check mul_base against it.

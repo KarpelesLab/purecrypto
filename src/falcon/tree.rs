@@ -17,7 +17,7 @@
 //! the statistical behavior is exercised by the sign round-trip tests.
 
 use super::fft::{Cplx, Fft, add_fft, adj_fft, div_fft, mul_fft, sub_fft, wipe_cplx};
-use super::fpr::{FPR_ZERO, Fpr};
+use super::fpr::Fpr;
 use super::sampler::{SamplerRng, sampler_z};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -49,8 +49,7 @@ impl FftTree {
     pub(crate) fn wipe(&mut self) {
         match self {
             FftTree::Leaf(sigma) => {
-                *sigma = FPR_ZERO;
-                let _ = core::hint::black_box(&*sigma);
+                crate::zeroize::Zeroize::zeroize(sigma);
             }
             FftTree::Node { l10, left, right } => {
                 wipe_cplx(l10);

@@ -22,7 +22,7 @@
 use super::Degree;
 use super::encode::compress;
 use super::fft::{Cplx, Fft, add_fft, mul_fft, wipe_cplx};
-use super::fpr::{FPR_ZERO, Fpr, wipe_fpr};
+use super::fpr::{Fpr, wipe_fpr};
 use super::sampler::SamplerRng;
 use super::tree::{FftTree, ff_sampling, ffldl, gram, wipe_gram};
 use alloc::vec::Vec;
@@ -54,8 +54,7 @@ impl Drop for ExpandedKey {
             wipe_cplx(v);
         }
         self.tree.wipe();
-        self.sigmin = FPR_ZERO;
-        let _ = core::hint::black_box(&self.sigmin);
+        crate::zeroize::Zeroize::zeroize(&mut self.sigmin);
         // `fft` holds only the public roots of unity, and `degree` is public.
     }
 }
@@ -181,10 +180,7 @@ pub(crate) fn sign_internal<R: SamplerRng>(
         if norm <= sig_bound {
             let mut s1_i16: Vec<i16> = s1.iter().map(|&x| x as i16).collect();
             let enc = compress(&s1_i16, slen);
-            for x in s1_i16.iter_mut() {
-                *x = 0;
-            }
-            let _ = core::hint::black_box(&s1_i16);
+            crate::zeroize::Zeroize::zeroize(s1_i16.as_mut_slice());
             if let Some(enc) = enc {
                 let mut out = Vec::with_capacity(key.degree.sig_len());
                 out.push(0x30 | logn); // padded format header
@@ -206,10 +202,7 @@ pub(crate) fn sign_internal<R: SamplerRng>(
             wipe_fpr(v);
         }
         for v in [&mut s0, &mut s1] {
-            for x in v.iter_mut() {
-                *x = 0;
-            }
-            let _ = core::hint::black_box(&*v);
+            crate::zeroize::Zeroize::zeroize(v.as_mut_slice());
         }
         if result.is_some() {
             break;

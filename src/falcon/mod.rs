@@ -715,13 +715,11 @@ impl FalconPrivateKey {
 
 impl Drop for FalconPrivateKey {
     fn drop(&mut self) {
-        // Wipe the secret polynomials; route through black_box so the writes are
-        // not elided (same pattern as the RSA/ML-DSA private keys).
+        // Wipe the secret polynomials with the crate's volatile `zeroize`
+        // stores, which are not elided (same pattern as the RSA/ML-DSA
+        // private keys).
         for v in [&mut self.f, &mut self.g, &mut self.cap_f, &mut self.cap_g] {
-            for x in v.iter_mut() {
-                *x = 0;
-            }
-            let _ = core::hint::black_box(&*v);
+            crate::zeroize::Zeroize::zeroize(v.as_mut_slice());
         }
     }
 }

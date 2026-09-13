@@ -87,8 +87,8 @@
 //! only that the arguments were invalid — that the index is in range, that it
 //! is in the proof's anonymity set (which is public, being part of the proof),
 //! and that the two blinding factors really open that ring position.
-//! Blinding factors and ring secrets held in local buffers are wiped with a
-//! [`core::hint::black_box`] barrier.
+//! Blinding factors and ring secrets held in local buffers are wiped with the
+//! crate's volatile [`zeroize`](crate::zeroize) stores.
 //!
 //! [`SurjectionProof::initialize`] is **not** constant time, and cannot be: it
 //! draws candidate anonymity sets until one covers an input whose asset tag
@@ -155,6 +155,7 @@ use crate::ec::Error;
 use crate::ec::secp256k1::{ProjectivePoint, Scalar};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 use crate::zkp::pedersen::Generator;
 
 /// Largest number of input assets a proof can be over.
@@ -248,8 +249,7 @@ fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
         let mut b = [0u8; 32];
         rng.fill_bytes(&mut b);
         let candidate = Scalar::from_bytes_be(&b);
-        b = [0u8; 32];
-        let _ = core::hint::black_box(&b);
+        b.zeroize();
         if let Ok(s) = candidate
             && !bool::from(s.is_zero())
         {
@@ -636,8 +636,7 @@ impl SurjectionProof {
         // s_pos = nonce − e_pos·secret, written without revealing `pos`.
         let signer = nonce.sub(&Scalar::from_bytes_be_reduce(&e_signer).mul(&secret));
         // The signer's challenge identifies `pos`.
-        e_signer = [0u8; 32];
-        let _ = core::hint::black_box(&e_signer);
+        e_signer.zeroize();
         let mut signer_bytes = signer.to_bytes_be();
         let mut out = Vec::with_capacity(ring);
         for (j, sj) in s.iter().enumerate() {
@@ -647,8 +646,7 @@ impl SurjectionProof {
                 j.ct_eq(&pos),
             ));
         }
-        signer_bytes = [0u8; 32];
-        let _ = core::hint::black_box(&signer_bytes);
+        signer_bytes.zeroize();
 
         self.e0 = e0;
         self.s = out;
@@ -673,8 +671,7 @@ impl SurjectionProof {
         h.update(&self.used);
         h.update(&(pos as u32).to_be_bytes());
         let mut seed = h.finalize();
-        secret_bytes = [0u8; 32];
-        let _ = core::hint::black_box(&secret_bytes);
+        secret_bytes.zeroize();
 
         let derive = |counter: u32| {
             let mut h = Sha256::new();
@@ -685,8 +682,7 @@ impl SurjectionProof {
         let s: Vec<Scalar> = (0..ring).map(|j| derive(j as u32)).collect();
         let nonce = derive(u32::MAX);
 
-        seed = [0u8; 32];
-        let _ = core::hint::black_box(&seed);
+        seed.zeroize();
         (nonce, s)
     }
 

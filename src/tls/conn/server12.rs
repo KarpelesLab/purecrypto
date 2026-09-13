@@ -505,8 +505,8 @@ pub struct ServerConnection12<R: RngCore> {
 // Unlike the TLS 1.3 schedule (whose secrets are consumed as the handshake
 // ratchets forward), the TLS 1.2 master secret lives for the whole
 // connection — it feeds tickets, exporters and Finished verification.
-// Scrub it on drop so it does not linger in freed memory (overwrite +
-// `black_box`, the crate's standard wipe pattern).
+// Scrub it on drop so it does not linger in freed memory (the crate's
+// volatile `zeroize` stores).
 impl<R: RngCore> Drop for ServerConnection12<R> {
     fn drop(&mut self) {
         if let Some(m) = self.master.as_mut() {

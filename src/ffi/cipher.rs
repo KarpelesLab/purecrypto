@@ -16,9 +16,10 @@ use crate::cipher::{
 /// one-shot AEAD / key-wrap / MAC arm copies the caller's key slice into a
 /// fixed-size array to satisfy the cipher constructors' `&[u8; N]` signature;
 /// the cipher keeps its own expanded schedule, so this copy is redundant once
-/// constructed and must not linger in the frame. `Drop` zeroizes it behind a
-/// `black_box` barrier on every exit path (including the mid-arm nonce/tag
-/// `try_into` early returns), so no `key`/`kk` copy survives the call.
+/// constructed and must not linger in the frame. `Drop` zeroizes it with the
+/// crate's volatile [`zeroize`](crate::zeroize) stores on every exit path
+/// (including the mid-arm nonce/tag `try_into` early returns), so no
+/// `key`/`kk` copy survives the call.
 struct KeyBuf<const N: usize>([u8; N]);
 
 impl<const N: usize> KeyBuf<N> {
@@ -31,12 +32,11 @@ impl<const N: usize> KeyBuf<N> {
 
 impl<const N: usize> Drop for KeyBuf<N> {
     fn drop(&mut self) {
-        for b in self.0.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.0);
+        crate::zeroize::Zeroize::zeroize(&mut self.0);
     }
 }
+
+impl<const N: usize> crate::zeroize::ZeroizeOnDrop for KeyBuf<N> {}
 
 /// AEAD algorithm identifiers (mirror `PcAead` in `purecrypto.h`).
 pub mod aead_id {

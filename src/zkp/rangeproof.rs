@@ -114,8 +114,8 @@
 //! header publishes anyway. The only value-dependent branches are the
 //! fail-closed argument checks, which reveal that the arguments were invalid
 //! and nothing else. The DRBG state, the per-ring secrets, the derived
-//! nonces and the scratch buffers are wiped with a [`core::hint::black_box`]
-//! barrier. [`rewind`] is likewise branch-free in the recovered digits, and
+//! nonces and the scratch buffers are wiped with the crate's volatile
+//! [`zeroize`](crate::zeroize) stores. [`rewind`] is likewise branch-free in the recovered digits, and
 //! wipes its scratch on success; its early error returns (a proof that does
 //! not verify, a wrong nonce) drop the DRBG output without an explicit wipe.
 //!
@@ -165,6 +165,7 @@ use crate::ct::{
 use crate::ec::Error;
 use crate::ec::secp256k1::{ProjectivePoint, Scalar};
 use crate::hash::{Digest, HmacSha256, Sha256};
+use crate::zeroize::Zeroize;
 
 use super::pedersen::{Commitment, Generator, value_scalar};
 
@@ -247,9 +248,8 @@ impl Drbg {
 
 impl Drop for Drbg {
     fn drop(&mut self) {
-        self.k = [0u8; 32];
-        self.v = [0u8; 32];
-        let _ = core::hint::black_box((&self.k, &self.v));
+        self.k.zeroize();
+        self.v.zeroize();
     }
 }
 
@@ -910,8 +910,7 @@ pub fn sign(
     let (mut seed, seed_len) = drbg_seed(nonce, &commit_enc, &generator_enc, &proof);
     let mut rng = Drbg::new(&seed[..seed_len]);
     // The seed's first 32 bytes are the nonce.
-    seed.fill(0);
-    let _ = core::hint::black_box(&seed);
+    seed.zeroize();
 
     // --- the prover's randomness -------------------------------------
     //
@@ -930,8 +929,7 @@ pub fn sign(
             rng.generate(&mut tmp);
             *share = tmp;
             acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
-            tmp = [0u8; 32];
-            let _ = core::hint::black_box(&tmp);
+            tmp.zeroize();
         }
         for _ in 0..layout.rsizes[i] {
             rng.generate(&mut raw[slot]);
@@ -972,13 +970,12 @@ pub fn sign(
         prep[32 * (layout.npub - 1)..].copy_from_slice(&new_tail);
         prep[32 * (layout.npub - 2)..32 * (layout.npub - 1)].copy_from_slice(&new_prev);
         // All of these carry the mantissa value or the known-member position.
-        marker = [0u8; 32];
-        tail = [0u8; 32];
-        prev = [0u8; 32];
-        new_tail = [0u8; 32];
-        new_prev = [0u8; 32];
-        known = 0;
-        let _ = core::hint::black_box((&marker, &tail, &prev, &new_tail, &new_prev, &known));
+        marker.zeroize();
+        tail.zeroize();
+        prev.zeroize();
+        new_tail.zeroize();
+        new_prev.zeroize();
+        known.zeroize();
     }
 
     let mut s = vec![[0u8; 32]; layout.npub];
@@ -1089,8 +1086,7 @@ pub fn sign(
             s[start + j] = <[u8; 32]>::conditional_select(&closing, &s[start + j], is_known);
         }
         // The challenge at the known member identifies the digit.
-        e_known = [0u8; 32];
-        let _ = core::hint::black_box(&e_known);
+        e_known.zeroize();
     }
 
     proof.extend_from_slice(&body);
@@ -1105,11 +1101,10 @@ pub fn sign(
         .chain(raw.iter_mut())
         .chain(nonces.iter_mut())
     {
-        *buf = [0u8; 32];
+        buf.zeroize();
     }
-    prep.iter_mut().for_each(|b| *b = 0);
-    digits = [0u64; MAX_RINGS];
-    let _ = core::hint::black_box((&sec, &raw, &nonces, &prep, &digits));
+    prep.zeroize();
+    digits.zeroize();
 
     Ok(proof)
 }
@@ -1150,10 +1145,9 @@ impl core::fmt::Debug for Rewound {
 
 impl Drop for Rewound {
     fn drop(&mut self) {
-        self.value = 0;
-        self.blind = [0u8; 32];
-        self.message.fill(0);
-        let _ = core::hint::black_box((&self.value, &self.blind, &self.message));
+        self.value.zeroize();
+        self.blind.zeroize();
+        self.message.zeroize();
     }
 }
 
@@ -1188,8 +1182,7 @@ pub fn rewind(
     );
     let mut rng = Drbg::new(&seed[..seed_len]);
     // The seed's first 32 bytes are the nonce.
-    seed.fill(0);
-    let _ = core::hint::black_box(&seed);
+    seed.zeroize();
 
     let mut sec = vec![[0u8; 32]; layout.rings];
     let mut raw = vec![[0u8; 32]; layout.npub];
@@ -1202,8 +1195,7 @@ pub fn rewind(
             rng.generate(&mut tmp);
             *share = tmp;
             acc = acc.add(&Scalar::from_bytes_be_reduce(&tmp));
-            tmp = [0u8; 32];
-            let _ = core::hint::black_box(&tmp);
+            tmp.zeroize();
         }
         for _ in 0..layout.rsizes[i] {
             rng.generate(&mut raw[slot]);
@@ -1259,11 +1251,10 @@ pub fn rewind(
             let take = shaped & !have_marker;
             mantissa_value = u64::conditional_select(&first, &mantissa_value, take);
             have_marker |= shaped;
-            folded = [0u8; 32];
-            first = 0;
-            second = 0;
-            third = 0;
-            let _ = core::hint::black_box((&folded, &first, &second, &third));
+            folded.zeroize();
+            first.zeroize();
+            second.zeroize();
+            third.zeroize();
         }
     }
     if params.mantissa != 0 && !bool::from(have_marker) {
@@ -1364,27 +1355,15 @@ pub fn rewind(
         .chain(raw.iter_mut())
         .chain(folded.iter_mut())
     {
-        *buf = [0u8; 32];
+        buf.zeroize();
     }
-    digits = [0u64; MAX_RINGS];
-    k_bytes = [0u8; 32];
-    s_bytes = [0u8; 32];
-    e_bytes = [0u8; 32];
-    mantissa_value = 0;
-    known = 0;
-    marker_slot = 0;
-    let _ = core::hint::black_box((
-        &sec,
-        &raw,
-        &folded,
-        &digits,
-        &k_bytes,
-        &s_bytes,
-        &e_bytes,
-        &mantissa_value,
-        &known,
-        &marker_slot,
-    ));
+    digits.zeroize();
+    k_bytes.zeroize();
+    s_bytes.zeroize();
+    e_bytes.zeroize();
+    mantissa_value.zeroize();
+    known.zeroize();
+    marker_slot.zeroize();
 
     Ok(Rewound {
         value,

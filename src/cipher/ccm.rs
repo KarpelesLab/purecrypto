@@ -156,9 +156,7 @@ impl<C: BlockCipher, const M: usize> Ccm<C, M> {
         } else {
             // Wipe the (now-decrypted) buffer so a caller can't accidentally
             // use unauthenticated plaintext after ignoring the error.
-            for b in buffer.iter_mut() {
-                *b = 0;
-            }
+            crate::zeroize::Zeroize::zeroize(buffer);
             Err(TagMismatch)
         }
     }

@@ -121,9 +121,7 @@ impl<C: BlockCipher> AesKw<C> {
         } else {
             // Wipe the candidate plaintext on failure so a caller can't leak
             // it by ignoring the error.
-            for b in out.iter_mut() {
-                *b = 0;
-            }
+            out.zeroize();
             Err(KwError::IntegrityCheck)
         }
     }

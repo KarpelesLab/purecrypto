@@ -124,6 +124,7 @@ use crate::ec::Error;
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use crate::hash::{Digest, Sha256};
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 
 /// Length in bytes of the serialised adaptor signature
 /// (`R ‖ R_a ‖ s_a ‖ b ‖ c`).
@@ -187,8 +188,7 @@ fn hardened_nonce(
     }
     let out = tagged_hash(algo, &[&t, pk33.as_slice(), msg32]);
     // `t` is the (possibly masked) signing key / nonce; wipe it.
-    t.fill(0);
-    let _ = core::hint::black_box(&t);
+    t.zeroize();
     out
 }
 
@@ -250,8 +250,7 @@ fn dleq_prove(
     };
     let mut a_bytes = hardened_nonce(ALGO_DLEQ, k_bytes, &y.to_sec1_compressed(), &inner, aux);
     let a = Scalar::from_bytes_be(&a_bytes);
-    a_bytes.fill(0);
-    let _ = core::hint::black_box(&a_bytes);
+    a_bytes.zeroize();
     let a = a?;
     if bool::from(a.is_zero()) {
         return Err(Error::InvalidInput);
@@ -429,8 +428,7 @@ pub fn encrypt_with_rng<R: RngCore + CryptoRng>(
     let mut aux = [0u8; 32];
     rng.fill_bytes(&mut aux);
     let out = encrypt_inner(seckey, enckey, msg32, Some(&aux));
-    aux.fill(0);
-    let _ = core::hint::black_box(&aux);
+    aux.zeroize();
     out
 }
 
@@ -491,9 +489,8 @@ fn encrypt_inner(
     })();
 
     // `Scalar`'s own `Drop` wipes `x` and `k`; the raw nonce bytes need an
-    // explicit store plus a `black_box` barrier so LLVM cannot elide it.
-    k_bytes.fill(0);
-    let _ = core::hint::black_box(&k_bytes);
+    // explicit volatile store so LLVM cannot elide it.
+    k_bytes.zeroize();
     out
 }
 

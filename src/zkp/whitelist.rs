@@ -334,8 +334,7 @@ fn random_scalar<R: RngCore + CryptoRng>(rng: &mut R) -> Result<Scalar, Error> {
         let mut b = [0u8; 32];
         rng.fill_bytes(&mut b);
         let candidate = Scalar::from_bytes_be(&b);
-        b = [0u8; 32];
-        let _ = core::hint::black_box(&b);
+        b.zeroize();
         if let Ok(s) = candidate
             && !bool::from(s.is_zero())
         {
@@ -454,8 +453,7 @@ pub fn sign<R: RngCore + CryptoRng>(
     // s_index = nonce - e_index * secret.
     let signer_s = nonce.sub(&Scalar::from_bytes_be_reduce(&e_signer).mul(&secret));
     // The signer's challenge identifies `index`.
-    e_signer = [0u8; 32];
-    let _ = core::hint::black_box(&e_signer);
+    e_signer.zeroize();
     let mut signer_bytes = signer_s.to_bytes_be();
     let mut out = Vec::with_capacity(n);
     for (i, si) in s.iter().enumerate() {
@@ -465,8 +463,7 @@ pub fn sign<R: RngCore + CryptoRng>(
             i.ct_eq(&index),
         ));
     }
-    signer_bytes = [0u8; 32];
-    let _ = core::hint::black_box(&signer_bytes);
+    signer_bytes.zeroize();
 
     Ok(Whitelist { e0, s: out })
 }

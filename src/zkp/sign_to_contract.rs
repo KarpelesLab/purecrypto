@@ -98,6 +98,7 @@ use crate::ct::ConstantTimeEq;
 use crate::ec::Error;
 use crate::ec::secp256k1::{AffinePoint, ProjectivePoint, Scalar};
 use crate::hash::{Digest, Hmac, Sha256};
+use crate::zeroize::Zeroize;
 
 /// Tag for the nonce tweak `t = H(ser(R₁) ‖ data)`.
 const TAG_POINT: &[u8] = b"s2c/ecdsa/point";
@@ -261,21 +262,19 @@ fn rfc6979_nonce(seckey: &[u8; 32], msg32_reduced: &[u8; 32], aux: &[u8; 32]) ->
     };
 
     // The seed is a verbatim copy of the private key and the DRBG state
-    // reproduces the nonce; wipe both, with a `black_box` barrier so the
-    // stores are not elided (the idiom used by `ec::ecdsa::generate_k`).
-    seed.fill(0);
-    k.fill(0);
-    v.fill(0);
-    let _ = core::hint::black_box((&seed, &k, &v));
+    // reproduces the nonce; wipe both, with the crate's volatile `zeroize`
+    // stores so they are not elided (as `ec::ecdsa::generate_k` does).
+    seed.zeroize();
+    k.zeroize();
+    v.zeroize();
     nonce
 }
 
-/// Best-effort wipe of a 32-byte secret buffer, with an optimisation barrier
-/// so the stores are not elided.
+/// Best-effort wipe of a 32-byte secret buffer through
+/// [`crate::zeroize::Zeroize`], whose volatile stores are not elided.
 #[inline]
 fn wipe32(buf: &mut [u8; 32]) {
-    buf.fill(0);
-    let _ = core::hint::black_box(&buf);
+    buf.zeroize();
 }
 
 /// Branch-free big-endian "greater than" over 32-byte values: returns `0xff`
@@ -321,7 +320,7 @@ pub fn sign_with_commitment(
     msg32: &[u8; 32],
     data32: &[u8; 32],
 ) -> Result<([u8; 64], Opening), Error> {
-    // `Scalar` wipes its limbs in `Drop` with a `black_box` barrier, so the
+    // `Scalar` wipes its limbs in `Drop` with volatile stores, so the
     // private key `d` and both nonces `k1` / `k2` are zeroized on every exit
     // path below, including the early `?` returns.
     let d = Scalar::from_bytes_be(seckey)?;

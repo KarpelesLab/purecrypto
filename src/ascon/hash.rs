@@ -104,10 +104,10 @@ impl Sponge {
     }
 
     fn zeroize(&mut self) {
-        self.state.0 = [0u64; 5];
-        self.buf = [0u8; RATE];
+        use crate::zeroize::Zeroize as _;
+        self.state.0.zeroize();
+        self.buf.zeroize();
         self.buf_len = 0;
-        let _ = core::hint::black_box(&self.state.0);
     }
 }
 
