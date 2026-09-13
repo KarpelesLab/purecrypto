@@ -30,6 +30,7 @@ The crate exposes a lot. Most of it you should not reach for. Three tiers:
 | Password hashing / KDF | **Argon2id** | `crate::kdf`; scrypt acceptable |
 | Transport | **TLS 1.3** | set `min_version` to 1.3 |
 | Load a key of unknown type | `key::AnyKey::from_pkcs8_der` / `_pem` → operate via the `key` facade | type-honest, covers KEM keys too |
+| Wipe secrets you hold yourself | `zeroize::Zeroizing<T>`, or `Zeroize` in your `Drop` | `crate::zeroize`; volatile stores, so the wipe survives optimisation (best-effort against copies elsewhere) |
 
 ## Per-domain
 

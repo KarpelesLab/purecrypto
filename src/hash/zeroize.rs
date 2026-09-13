@@ -1,28 +1,22 @@
-//! Best-effort secret wiping, without `unsafe` or external dependencies.
+//! Thin wrappers over [`crate::zeroize::Zeroize`] for the hasher states.
 //!
-//! The values are overwritten with zeros and then passed through
-//! [`core::hint::black_box`], the same optimization barrier the
-//! [`ct`](crate::ct) module relies on, to discourage the compiler from
-//! eliminating the writes as a dead store. This is best-effort: a true
-//! guarantee would require volatile writes, but those need `unsafe`, which this
-//! crate forbids.
+//! Kept so the per-algorithm `Digest::zeroize` impls read as
+//! `zero_words(&mut self.h); zero_bytes(&mut self.block)`; the wiping itself
+//! is the volatile-store one from the public [`zeroize`](crate::zeroize)
+//! module.
+
+use crate::zeroize::Zeroize;
 
 /// Overwrites `bytes` with zeros.
 #[inline]
 pub(super) fn zero_bytes(bytes: &mut [u8]) {
-    for b in bytes.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(bytes);
+    bytes.zeroize();
 }
 
 /// Overwrites a slice of integer words with zeros.
 #[inline]
-pub(super) fn zero_words<T: Default + Copy>(words: &mut [T]) {
-    for w in words.iter_mut() {
-        *w = T::default();
-    }
-    let _ = core::hint::black_box(words);
+pub(super) fn zero_words<T: Zeroize>(words: &mut [T]) {
+    words.zeroize();
 }
 
 #[cfg(test)]

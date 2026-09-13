@@ -36,12 +36,10 @@ pub use kbkdf::{
 };
 pub use pbkdf2::pbkdf2;
 
-/// Best-effort wipe of a secret buffer: overwrite with zeros, then fence with
-/// `core::hint::black_box` so the writes are not elided as dead stores.
+/// Best-effort wipe of a secret buffer via [`crate::zeroize::Zeroize`]
+/// (volatile stores plus a compiler fence, so the writes are not elided as
+/// dead stores).
 #[inline]
 pub(crate) fn wipe(buf: &mut [u8]) {
-    for b in buf.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }

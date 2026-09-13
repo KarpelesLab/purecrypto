@@ -44,12 +44,11 @@ pub(crate) const MAX_RSA_EXPONENT_BITS: usize = 256;
 
 /// Best-effort wipe of a buffer that held secret material (a decrypted
 /// encoded message, a blinder, a raw private-op output) before it is
-/// dropped. The `core::hint::black_box` fence keeps LLVM from eliding the
-/// stores as dead — the same idiom the key types' `Drop` impls use.
+/// dropped, via [`crate::zeroize::Zeroize`] (volatile stores plus a compiler
+/// fence, so LLVM cannot elide the stores as dead).
 #[inline]
 pub(crate) fn wipe(buf: &mut [u8]) {
-    buf.fill(0);
-    let _ = core::hint::black_box(&buf);
+    crate::zeroize::Zeroize::zeroize(buf);
 }
 
 /// Errors produced by RSA operations.

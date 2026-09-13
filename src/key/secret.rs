@@ -2,6 +2,8 @@
 
 use alloc::vec::Vec;
 
+use crate::zeroize::{Zeroize, ZeroizeOnDrop};
+
 /// A heap buffer of secret bytes that is wiped when dropped.
 ///
 /// Returned by the operations that produce raw secret material — key agreement
@@ -10,9 +12,10 @@ use alloc::vec::Vec;
 /// KEM decapsulation ([`Decapsulator::decapsulate`](crate::key::Decapsulator::decapsulate))
 /// — so the plaintext/shared-secret does not linger on the heap after use.
 ///
-/// The wipe is the same `core::hint::black_box`-guarded zeroing the rest of the
-/// crate uses; it is best-effort (the compiler/allocator may still have copied
-/// the bytes), not a guarantee against a determined attacker with memory access.
+/// The wipe is [`Zeroize`] from the [`zeroize`](crate::zeroize) module
+/// (volatile stores over the whole capacity); it is best-effort (the
+/// compiler/allocator may still have copied the bytes), not a guarantee against
+/// a determined attacker with memory access.
 pub struct Secret {
     bytes: Vec<u8>,
 }
@@ -49,14 +52,19 @@ impl Secret {
     }
 }
 
-impl Drop for Secret {
-    fn drop(&mut self) {
-        for b in self.bytes.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.bytes);
+impl Zeroize for Secret {
+    fn zeroize(&mut self) {
+        self.bytes.zeroize();
     }
 }
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Secret {}
 
 impl core::fmt::Debug for Secret {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

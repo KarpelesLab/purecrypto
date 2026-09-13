@@ -129,6 +129,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | Feature | What it provides |
 | --- | --- |
 | `ct` (always on) | Branchless equality, selection, ordering, and `Choice` |
+| `zeroize` (always on) | `Zeroize` / `ZeroizeOnDrop` traits and the `Zeroizing<T>` guard: volatile-store secret wiping, a drop-in for the `zeroize` crate |
 | `hash` | SHA-2, SHA-3 / Keccak, SHAKE, cSHAKE, KMAC, TupleHash, ParallelHash, TurboSHAKE, KangarooTwelve, BLAKE2b/2s/2X, BLAKE3, SM3, Whirlpool, Streebog, MD2/4/5, SHA-1, RIPEMD-160; HMAC and the `Mac` trait |
 | `cipher` | AES (constant-time, table-free), SM4, Camellia, ARIA; CBC/CFB/OFB/CTR; AES-GCM, CCM, ChaCha20-Poly1305, XChaCha20-Poly1305, AES-GCM-SIV, AES-SIV, AEGIS-128L/256; XTS; AES-KW/KWP; DES/3DES for legacy interop |
 | `mac` | AES-CMAC, GMAC, UMAC-64/128 |
