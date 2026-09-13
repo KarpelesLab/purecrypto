@@ -1690,6 +1690,12 @@ fn build_dtls12_server(
     if cfg.require_cookie && cfg.cookie_secret.is_none() {
         return Err(Error::InappropriateState);
     }
+    // The DTLS 1.2 server never emits a `CertificateRequest`, so a configured
+    // `client_auth` would be silently ignored — access control would fail
+    // OPEN, admitting every anonymous client. Refuse to build instead.
+    if cfg.client_auth.is_some() {
+        return Err(Error::UnsupportedVersion);
+    }
     let chain = id.cert_chain.clone();
     let mut sc = match &id.key {
         super::config::SigningKey::Ecdsa(k) => {
@@ -1732,6 +1738,12 @@ fn build_dtls13_server(
     // of `build_dtls12_server`.
     if cfg.require_cookie && cfg.cookie_secret.is_none() {
         return Err(Error::InappropriateState);
+    }
+    // As in `build_dtls12_server`: the DTLS 1.3 server does not request client
+    // certificates, so honouring a `client_auth` configuration is impossible —
+    // fail closed rather than admit unauthenticated clients.
+    if cfg.client_auth.is_some() {
+        return Err(Error::UnsupportedVersion);
     }
     let chain = id.cert_chain.clone();
     let server_key = id.key.to_server_key_13();
@@ -1791,7 +1803,7 @@ mod tests {
     use super::super::config::EntropySource;
     use super::*;
     use crate::ec::{BoxedEcdsaPrivateKey, CurveId};
-    use crate::tls::AlertDescription;
+    use crate::tls::{AlertDescription, RootCertStore};
     use crate::hash::Sha256;
     use crate::rng::HmacDrbg;
     use crate::x509::{CertSigner, Certificate, DistinguishedName, Time, Validity};
@@ -2364,6 +2376,37 @@ mod tests {
         let mut cfg = dtls_server_cfg_without_cookie_secret(ProtocolVersion::DTLSv1_3);
         cfg.require_cookie = false;
         assert!(Connection::server(&cfg).is_ok());
+    }
+
+    /// The DTLS engines never emit a `CertificateRequest`, so a `client_auth`
+    /// configuration on a DTLS server would be silently ignored — access
+    /// control failing open. Construction must fail closed instead.
+    #[test]
+    fn dtls_server_refuses_client_auth() {
+        for version in [ProtocolVersion::DTLSv1_2, ProtocolVersion::DTLSv1_3] {
+            let mut cfg = dtls_server_cfg_without_cookie_secret(version);
+            cfg.require_cookie = false;
+            // Sanity: without client auth the same config builds.
+            assert!(Connection::server(&cfg).is_ok());
+
+            cfg.client_auth = Some(super::super::config::ClientAuth {
+                roots: RootCertStore::new(),
+                required: true,
+            });
+            match Connection::server(&cfg) {
+                Err(Error::UnsupportedVersion) => {}
+                Err(e) => panic!("expected UnsupportedVersion, got {e:?}"),
+                Ok(_) => panic!("{version:?} server must refuse a client_auth config"),
+            }
+
+            // Even the non-`required` (request-only) form is refused: we
+            // cannot request anything.
+            cfg.client_auth = Some(super::super::config::ClientAuth {
+                roots: RootCertStore::new(),
+                required: false,
+            });
+            assert!(Connection::server(&cfg).is_err());
+        }
     }
 
     /// `server_name` is required only when certificate verification is on.
