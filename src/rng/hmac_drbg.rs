@@ -118,7 +118,20 @@ impl<D: Digest> HmacDrbg<D> {
     }
 
     /// Reseeds with fresh `entropy` and optional `additional` input.
+    ///
+    /// # Panics
+    /// Panics if `entropy` is empty, matching [`new`](Self::new): SP 800-90A
+    /// §9.2 requires a reseed to take fresh entropy input, and an empty one
+    /// silently turns the reseed into a no-op that also resets the reseed
+    /// counter — so a caller that believes it re-seeded (e.g. after `fork(2)`)
+    /// keeps drawing the parent's stream while the `2^48` guard is pushed back
+    /// out of reach. Pass at least the generator's security strength in bytes;
+    /// `additional` input alone is not entropy.
     pub fn reseed(&mut self, entropy: &[u8], additional: &[u8]) {
+        assert!(
+            !entropy.is_empty(),
+            "HMAC-DRBG reseed requires non-empty entropy input (SP 800-90A §9.2)"
+        );
         self.update(&[entropy, additional]);
         self.reseed_counter = 1;
     }
@@ -274,6 +287,16 @@ mod tests {
     #[should_panic(expected = "non-empty entropy")]
     fn empty_entropy_rejected() {
         let _ = HmacDrbg::<Sha256>::new(b"", b"nonce", b"pers");
+    }
+
+    /// …and at reseed, where an empty input used to be accepted: it left the
+    /// state on the old (possibly forked / exhausted) stream while resetting
+    /// the reseed counter, so the caller believed it had re-seeded.
+    #[test]
+    #[should_panic(expected = "non-empty entropy")]
+    fn empty_reseed_entropy_rejected() {
+        let mut d = HmacDrbg::<Sha256>::new(b"seed", b"nonce", &[]);
+        d.reseed(b"", b"additional-input-is-not-entropy");
     }
 
     /// A fill larger than SP 800-90A's 65_536-byte per-request cap is

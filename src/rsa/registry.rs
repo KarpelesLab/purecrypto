@@ -13,9 +13,15 @@ use crate::rsa::BoxedRsaPublicKey;
 use crate::signature_registry::SignatureAlgorithm;
 use crate::x509::{Error, oid};
 
-/// Parses the SPKI to extract an RSA public key. Accepts both the common
-/// `rsaEncryption` OID and the PSS-key-restricted `id-RSASSA-PSS` OID
-/// (RFC 4055 §1.2).
+/// Parses the SPKI to extract an RSA public key. Accepts the common
+/// `rsaEncryption` OID always, and the PSS-key-restricted `id-RSASSA-PSS`
+/// OID (RFC 4055 §1.2) only when `allow_pss_key` is set.
+///
+/// RFC 4055 §1.2 makes `id-RSASSA-PSS` a *key restriction*: "the key MUST
+/// only be used with RSASSA-PSS". So the PKCS#1 v1.5 registry entries pass
+/// `false` — verifying a v1.5 signature under a PSS-restricted key would
+/// ignore the very restriction the issuer encoded — while the PSS entries
+/// pass `true`.
 ///
 /// For `rsaEncryption` the explicit `NULL` parameters are required
 /// (RFC 3279 §2.3.1). For `id-RSASSA-PSS` the parameters are either absent
@@ -25,7 +31,7 @@ use crate::x509::{Error, oid};
 /// any other restriction is rejected rather than silently verified with
 /// the wrong parameters. Trailing junk inside the AlgorithmIdentifier
 /// SEQUENCE or after the BIT STRING is rejected (strict DER).
-fn parse_rsa_spki(spki: &[u8]) -> Result<BoxedRsaPublicKey, Error> {
+fn parse_rsa_spki(spki: &[u8], allow_pss_key: bool) -> Result<BoxedRsaPublicKey, Error> {
     let mut reader = Reader::new(spki);
     let mut outer = reader.read_sequence()?;
     let mut algid = outer.read_sequence()?;
@@ -34,6 +40,11 @@ fn parse_rsa_spki(spki: &[u8]) -> Result<BoxedRsaPublicKey, Error> {
         algid.read_null()?;
         algid.finish()?;
     } else if alg.as_slice() == oid::ID_RSASSA_PSS {
+        if !allow_pss_key {
+            // RFC 4055 §1.2: a PSS-restricted key must not verify PKCS#1
+            // v1.5 signatures.
+            return Err(Error::UnsupportedAlgorithm);
+        }
         if !algid.is_empty() {
             check_rsassa_pss_params(&mut algid)?;
         }
@@ -121,9 +132,11 @@ fn check_hash_algid(der: &[u8], want: &[u64]) -> Result<(), Error> {
     Ok(())
 }
 
-/// Returns the modulus length, in bits, of the RSA key inside `spki`.
-fn rsa_bits(spki: &[u8]) -> Option<u32> {
-    parse_rsa_spki(spki)
+/// Returns the modulus length, in bits, of the RSA key inside `spki` — or
+/// `None` when this entry would not accept the key at all, so the key-size
+/// policy hook agrees with `verify`.
+fn rsa_bits(spki: &[u8], allow_pss_key: bool) -> Option<u32> {
+    parse_rsa_spki(spki, allow_pss_key)
         .ok()
         .map(|k| k.modulus().bit_len() as u32)
 }
@@ -138,10 +151,12 @@ macro_rules! rsa_pkcs1_entry {
             fn x509_oids(&self) -> &'static [&'static [u64]] { &[$oid] }
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-                let key = parse_rsa_spki(spki)?;
+                // `false`: RFC 4055 §1.2 forbids verifying PKCS#1 v1.5 under
+                // an `id-RSASSA-PSS` (PSS-restricted) key.
+                let key = parse_rsa_spki(spki, false)?;
                 key.verify_pkcs1v15::<$digest>(message, signature).map_err(Error::Rsa)
             }
-            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki) }
+            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, false) }
         }
     };
 }
@@ -156,10 +171,10 @@ macro_rules! rsa_pss_entry {
             fn x509_oids(&self) -> &'static [&'static [u64]] { $oids }
             fn tls_schemes(&self) -> &'static [u16] { $tls }
             fn verify(&self, spki: &[u8], message: &[u8], signature: &[u8]) -> Result<(), Error> {
-                let key = parse_rsa_spki(spki)?;
+                let key = parse_rsa_spki(spki, true)?;
                 key.verify_pss::<$digest>(message, signature).map_err(Error::Rsa)
             }
-            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki) }
+            fn rsa_modulus_bits(&self, spki: &[u8]) -> Option<u32> { rsa_bits(spki, true) }
         }
     };
 }
@@ -412,6 +427,33 @@ mod tests {
         assert_eq!(algo.rsa_modulus_bits(&pss_spki(None)), Some(2048));
         let bad_hash = pss_params(oid::ID_SHA384, oid::ID_SHA256, 32);
         assert_eq!(algo.rsa_modulus_bits(&pss_spki(Some(bad_hash))), None);
+    }
+
+    /// RFC 4055 §1.2: an `id-RSASSA-PSS` SPKI is a *restricted* key — "the
+    /// key MUST only be used with RSASSA-PSS". The PKCS#1 v1.5 entries used
+    /// to accept it (they shared the permissive SPKI parser), verifying v1.5
+    /// signatures under a key whose issuer restricted it to PSS.
+    #[test]
+    fn pkcs1_entries_reject_pss_restricted_keys() {
+        let key = rsa_test_key_a();
+        let spki = pss_spki(None); // id-RSASSA-PSS, unrestricted parameters
+        let sig = key.sign_pkcs1v15::<Sha256>(b"hi").unwrap();
+        for id in ["rsa-pkcs1-sha256", "rsa-pkcs1-sha384", "rsa-pkcs1-sha1"] {
+            let algo = find_by_id(id).unwrap();
+            assert!(
+                algo.verify(&spki, b"hi", &sig).is_err(),
+                "{id} must refuse a PSS-restricted key"
+            );
+            // The key-size hook agrees with `verify` rather than reporting a
+            // modulus for a key this entry would never accept.
+            assert_eq!(algo.rsa_modulus_bits(&spki), None, "{id}");
+        }
+        // The same signature under an `rsaEncryption` SPKI still verifies.
+        let rsa_spki = AnyPublicKey::Rsa(boxed_pk_from_rsa_test_key()).to_spki_der();
+        find_by_id("rsa-pkcs1-sha256")
+            .unwrap()
+            .verify(&rsa_spki, b"hi", &sig)
+            .unwrap();
     }
 
     #[test]

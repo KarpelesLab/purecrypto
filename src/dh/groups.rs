@@ -106,13 +106,24 @@ impl DhGroup {
     pub const MAX_CUSTOM_GROUP_BITS: usize = 16384;
 
     /// Miller-Rabin rounds [`from_custom`](Self::from_custom) spends on
-    /// `q = (p − 1) / 2` for primes of at most 3072 bits. A composite
-    /// survives one round with probability ≤ 1/4 even when adversarially
-    /// chosen (the bases are HMAC-DRBG-derived from `p` itself, so the
-    /// attacker cannot pick a composite that fools bases chosen after it),
-    /// so 64 rounds bound the false-accept probability at
-    /// `4⁻⁶⁴ = 2⁻¹²⁸` — the worst-case guidance for untrusted candidates
-    /// (FIPS 186-5 §B.3, RFC 4419 §3 server-supplied groups).
+    /// `q = (p − 1) / 2` for primes of at most 3072 bits. For a candidate
+    /// that was not built against this specific test, a composite survives
+    /// one round with probability ≤ 1/4, so 64 rounds bound the false-accept
+    /// probability at `4⁻⁶⁴ = 2⁻¹²⁸` — the worst-case guidance for untrusted
+    /// candidates (FIPS 186-5 §B.3, RFC 4419 §3 server-supplied groups).
+    ///
+    /// The bases are HMAC-DRBG-derived from `p` itself (no ambient RNG is
+    /// plumbed through this API, and the verdict must be deterministic per
+    /// group). That derivation is **public**, so this is not an adversarial
+    /// bound: an attacker who grinds candidates can, in principle, search for
+    /// a composite tailored to the bases its own `p` derives (the
+    /// Arnault-style pseudoprime construction) — expensive, and steeply more
+    /// so per round, but not provably out of reach. What keeps the verdict
+    /// sound is the structure around the test: `p` itself is *proved* prime
+    /// by a Lucas / Pocklington witness over the factorization `p − 1 = 2q`,
+    /// so only `q`'s primality rests on Miller-Rabin. Treat a peer-supplied
+    /// group as validated, not certified, and prefer the named RFC 3526
+    /// groups where the choice is yours.
     ///
     /// `p` itself needs no Miller-Rabin rounds: with `p − 1 = 2q` fully
     /// factored it is *proved* prime by a Lucas / Pocklington witness (about
@@ -169,9 +180,10 @@ impl DhGroup {
     ///   attacks when `p` is a safe prime — for a non-safe `p` with smooth
     ///   `(p − 1) / 2`, a malicious group leaks the private exponent modulo
     ///   the small factors. The Miller-Rabin bases are drawn from an
-    ///   HMAC-DRBG seeded with `p` itself: the verdict is deterministic per
-    ///   group, while an adversary cannot precompute a composite that fools
-    ///   bases it can't choose independently of `p`;
+    ///   HMAC-DRBG seeded with `p` itself, which makes the verdict
+    ///   deterministic per group but also *public* — see
+    ///   [`CUSTOM_GROUP_MR_ROUNDS`](Self::CUSTOM_GROUP_MR_ROUNDS) for what
+    ///   that does and does not rule out;
     /// * `g` has order `q` or `2q`, i.e. `g^q ∈ {1, p − 1}` — anything else
     ///   is impossible for a genuine safe prime and would mean the group is
     ///   not what it claims to be. Both orders are accepted: OpenSSH's
@@ -204,11 +216,13 @@ impl DhGroup {
         }
         let group = Self::from_custom_unchecked(p, g, priv_bits)?;
 
-        // Safe-prime validation: q = (p - 1) / 2 must be a (probable) prime
-        // and p must then be prime. Bases come from an HMAC-DRBG seeded with
-        // the candidate itself — no ambient RNG is plumbed through this API,
-        // and deriving the bases from `p` denies an adversary the fixed
-        // bases a precomputed Miller-Rabin pseudoprime would need.
+        // Safe-prime validation: q = (p - 1) / 2 must be a (probable) prime,
+        // and p is then *proved* prime by a Lucas/Pocklington witness over
+        // p - 1 = 2q. Bases come from an HMAC-DRBG seeded with the candidate
+        // itself — no ambient RNG is plumbed through this API and the verdict
+        // has to be reproducible — but that derivation is public, so the
+        // Miller-Rabin half is not an adversarial bound; see
+        // `CUSTOM_GROUP_MR_ROUNDS`.
         let mut rng = HmacDrbg::<Sha256>::new(
             &group.p.to_be_bytes(group.byte_size()),
             b"purecrypto-dh-custom-group-mr-bases",
