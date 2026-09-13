@@ -1710,6 +1710,62 @@ impl<R: RngCore> ServerConnection12<R> {
         }
     }
 
+    /// The clock this engine uses for session tickets: the configured
+    /// [`ServerConfig12::with_verification_time`] when set, else the system
+    /// clock. `None` when neither is available (a `no_std` build without an
+    /// explicit verification time) — tickets are then disabled outright
+    /// rather than issued with a `creation_time` of 0, which could never
+    /// expire and would turn every ticket into a permanent bearer token.
+    fn ticket_now(&self) -> Option<u64> {
+        self.config
+            .verification_time
+            .clone()
+            .or_else(system_now)
+            .and_then(|t| t.to_unix_checked())
+            .filter(|t| *t != 0)
+    }
+
+    /// Whether this engine can issue / accept RFC 5077 tickets: a key must be
+    /// configured *and* a clock must be available to bound their lifetime.
+    fn tickets_available(&self) -> bool {
+        self.config.ticket_key.is_some() && self.ticket_now().is_some()
+    }
+
+    /// The effective ticket-sealing key: the configured `ticket_key` bound to
+    /// this listener's client-auth trust configuration (present/absent, the
+    /// `required` flag, and every trust anchor's subject + SPKI).
+    ///
+    /// Two listeners that share a `ticket_key` but trust different client
+    /// roots therefore derive different sealing keys, so a ticket minted by
+    /// one simply fails to open at the other and the handshake falls back to
+    /// a full one. Without this binding a ticket that records "the client was
+    /// authenticated" is honoured by any listener holding the key, no matter
+    /// whose CA signed that client — a cross-listener authentication bypass.
+    /// Tickets in the pre-binding format likewise fail to open (never fail
+    /// open) and fall back to a full handshake.
+    fn ticket_seal_key(&self) -> Option<[u8; 32]> {
+        use crate::hash::Hmac;
+        let key = self.config.ticket_key.as_ref()?;
+        let mut mac = Hmac::<Sha256>::new(key);
+        mac.update(b"purecrypto tls12 ticket client-auth binding v1");
+        match self.config.client_auth.as_ref() {
+            None => mac.update(&[0u8]),
+            Some(policy) => {
+                mac.update(&[1u8, u8::from(policy.required)]);
+                for (subject, spki) in policy.roots.anchor_identities() {
+                    mac.update(&(subject.len() as u32).to_be_bytes());
+                    mac.update(subject);
+                    mac.update(&(spki.len() as u32).to_be_bytes());
+                    mac.update(spki);
+                }
+            }
+        }
+        let out = mac.finalize();
+        let mut bound = [0u8; 32];
+        bound.copy_from_slice(out.as_ref());
+        Some(bound)
+    }
+
     /// RFC 5077 §3.4: try to decrypt the client's ticket, recover its
     /// `Ticket12Plaintext`, and check it against the client's offered cipher
     /// suites and our configured lifetime. Returns `None` on any failure —
@@ -1719,8 +1775,12 @@ impl<R: RngCore> ServerConnection12<R> {
         ticket: &[u8],
         offered: &[crate::tls::codec::CipherSuite],
     ) -> Option<ResumedState> {
-        let key = self.config.ticket_key.as_ref()?;
-        let mut plain = open_ticket(key, ticket)?;
+        // No clock ⇒ no way to expire the ticket: refuse to resume.
+        let now = self.ticket_now()?;
+        let mut key = self.ticket_seal_key()?;
+        let opened = open_ticket(&key, ticket);
+        super::wipe(&mut key);
+        let mut plain = opened?;
         let parsed = Ticket12Plaintext::decode(&plain);
         // The decrypted plaintext buffer holds the master secret — scrub it
         // as soon as the structured copy exists (or the parse failed).
@@ -1737,6 +1797,18 @@ impl<R: RngCore> ServerConnection12<R> {
         {
             return None;
         }
+        // The recorded client identity must still be valid *now*: a resumed
+        // handshake re-uses the issuing handshake's authentication, and an
+        // expired (or not-yet-valid, or unparsable) certificate must not be
+        // carried across it. Fall back to a full handshake, which re-verifies
+        // the chain from scratch.
+        if let Some(leaf) = parsed.client_leaf.as_ref() {
+            let cert = crate::x509::Certificate::from_der(leaf.clone()).ok()?;
+            let validity = cert.validity().ok()?;
+            if !validity.accepts(&crate::x509::Time::from_unix(now)) {
+                return None;
+            }
+        }
         let suite_code = crate::tls::codec::CipherSuite(parsed.cipher_suite);
         // The resumed suite MUST be one the client is still offering.
         if !offered.contains(&suite_code) {
@@ -1748,11 +1820,11 @@ impl<R: RngCore> ServerConnection12<R> {
         if suite.sig_kind != self.config.sig_kind() {
             return None;
         }
-        // Expiry: ticket_lifetime seconds from creation.
-        let now = system_now_u64();
-        if now != 0
-            && parsed.creation_time != 0
-            && now.saturating_sub(parsed.creation_time) > self.config.ticket_lifetime as u64
+        // Expiry: ticket_lifetime seconds from creation. Every ticket this
+        // engine issues carries a real timestamp (we refuse to issue without
+        // a clock), so a zero `creation_time` is itself a reason to refuse.
+        if parsed.creation_time == 0
+            || now.saturating_sub(parsed.creation_time) > self.config.ticket_lifetime as u64
         {
             return None;
         }
@@ -1800,7 +1872,7 @@ impl<R: RngCore> ServerConnection12<R> {
         // ticket. On a successful resume we do NOT issue a new ticket this
         // round (simplifies the flow); the extension is therefore absent in
         // SH on resume.
-        if self.peer_offered_session_ticket && !self.resumed && self.config.ticket_key.is_some() {
+        if self.peer_offered_session_ticket && !self.resumed && self.tickets_available() {
             extensions.push(ext::session_ticket(&[]));
         }
         // RFC 6066 §8: echo an empty `status_request` in SH only when the
@@ -2230,7 +2302,7 @@ impl<R: RngCore> ServerConnection12<R> {
         // RFC 5077 §3.3: NewSessionTicket comes AFTER the client's Finished
         // but BEFORE our CCS. Emit it under the plaintext (pre-CCS) write
         // path so the wire ordering matches the spec.
-        if self.peer_offered_session_ticket && self.config.ticket_key.is_some() {
+        if self.peer_offered_session_ticket && self.tickets_available() {
             self.emit_session_ticket(suite, &master)?;
         }
 
@@ -2293,15 +2365,21 @@ impl<R: RngCore> ServerConnection12<R> {
         suite: SuiteParams12,
         master: &[u8; 48],
     ) -> Result<(), Error> {
-        let key = self
-            .config
-            .ticket_key
-            .as_ref()
-            .ok_or(Error::InappropriateState)?;
+        // Bound to this listener's client-auth trust configuration, so the
+        // ticket can only be resumed by a listener with the same roots.
+        let mut key = self.ticket_seal_key().ok_or(Error::InappropriateState)?;
+        // We never issue a ticket we cannot expire (see `ticket_now`).
+        let creation_time = match self.ticket_now() {
+            Some(t) => t,
+            None => {
+                super::wipe(&mut key);
+                return Ok(());
+            }
+        };
         let plain = Ticket12Plaintext {
             cipher_suite: suite.suite.0,
             master_secret: *master,
-            creation_time: system_now_u64(),
+            creation_time,
             // RFC 7627 §5.3: record the EMS status so resumption can
             // enforce that EMS↔EMS and legacy↔legacy.
             ems_used: self.ems_negotiated,
@@ -2315,8 +2393,9 @@ impl<R: RngCore> ServerConnection12<R> {
         // scrub it once the AEAD-sealed ticket has been produced. (`plain`
         // itself wipes on drop.)
         let mut plain_bytes = plain.encode();
-        let ticket = seal_ticket(&mut self.rng, key, &plain_bytes);
+        let ticket = seal_ticket(&mut self.rng, &key, &plain_bytes);
         super::wipe(&mut plain_bytes);
+        super::wipe(&mut key);
         let nst = NewSessionTicket12 {
             lifetime: self.config.ticket_lifetime,
             ticket,
@@ -2348,22 +2427,6 @@ impl Drop for ResumedState {
     fn drop(&mut self) {
         super::wipe(&mut self.master_secret);
     }
-}
-
-/// Current wall-clock time as a Unix timestamp under `std`; zero otherwise
-/// (used for ticket creation_time + expiry — the AEAD is the real auth).
-#[cfg(feature = "std")]
-fn system_now_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-#[cfg(not(feature = "std"))]
-fn system_now_u64() -> u64 {
-    0
 }
 
 /// The system clock as an [`crate::x509::Time`] when available; `None` for
@@ -3059,5 +3122,200 @@ mod tests {
     fn legacy_rsa_premaster_version_rollback_implicitly_rejected() {
         let (derived, honest) = run_legacy_rsa_cke(0x0303);
         assert_ne!(derived, honest);
+    }
+
+    // ---- RFC 5077 ticket binding (session-ticket hardening) --------------
+
+    /// A self-signed client leaf valid over `[from, to]`, plus a root store
+    /// trusting it.
+    fn ticket_test_client_leaf(
+        label: &[u8],
+        from: crate::x509::Time,
+        to: crate::x509::Time,
+    ) -> Vec<u8> {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::x509::{CertSigner, Certificate, DistinguishedName, Validity};
+        let mut seed = HmacDrbg::<Sha256>::new(label, b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        let name = DistinguishedName::common_name("ticket-client");
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &Validity::new(from, to),
+            1,
+            false,
+            &["ticket-client"],
+        )
+        .unwrap();
+        cert.to_der().to_vec()
+    }
+
+    const TICKET_SUITE: CipherSuite = CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
+
+    /// Seals a ticket the way `emit_session_ticket` does, under `engine`'s
+    /// own (client-auth-bound) sealing key.
+    fn seal_test_ticket(
+        engine: &mut ServerConnection12<HmacDrbg<Sha256>>,
+        client_leaf: Option<Vec<u8>>,
+        creation_time: u64,
+    ) -> Vec<u8> {
+        let key = engine.ticket_seal_key().expect("ticket key configured");
+        let plain = Ticket12Plaintext {
+            cipher_suite: TICKET_SUITE.0,
+            master_secret: [0x5au8; 48],
+            creation_time,
+            ems_used: false,
+            alpn: None,
+            client_leaf,
+        };
+        seal_ticket(&mut engine.rng, &key, &plain.encode())
+    }
+
+    fn ticket_engine(config: ServerConfig12) -> ServerConnection12<HmacDrbg<Sha256>> {
+        ServerConnection12::new(config, HmacDrbg::<Sha256>::new(b"ticket-s12", b"n", &[]))
+    }
+
+    /// A ticket issued by a listener that trusts client-auth root A must NOT
+    /// resume at a listener that shares the ticket key but trusts root B:
+    /// the recorded "client was authenticated" claim was made against a
+    /// different CA. The mismatched listener falls back to a full handshake.
+    #[test]
+    fn tls12_ticket_is_bound_to_the_client_auth_trust_config() {
+        use crate::x509::Time;
+        let now = Time::utc(2026, 1, 1, 0, 0, 0);
+        let leaf_a = ticket_test_client_leaf(
+            b"ticket-root-a",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let leaf_b = ticket_test_client_leaf(
+            b"ticket-root-b",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2034, 1, 1, 0, 0, 0),
+        );
+        let key = [0x33u8; 32];
+
+        let cfg = |leaf: &Vec<u8>| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(leaf.clone()).unwrap();
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, true)
+                .with_verification_time(now.clone())
+        };
+
+        let mut issuer = ticket_engine(cfg(&leaf_a));
+        let created = issuer.ticket_now().unwrap();
+        let ticket = seal_test_ticket(&mut issuer, Some(leaf_a.clone()), created);
+
+        // Same trust configuration: resumption works.
+        let mut same = ticket_engine(cfg(&leaf_a));
+        assert!(same.try_resume(&ticket, &[TICKET_SUITE]).is_some());
+
+        // Different client-auth roots: must not resume.
+        let mut other = ticket_engine(cfg(&leaf_b));
+        assert!(
+            other.try_resume(&ticket, &[TICKET_SUITE]).is_none(),
+            "a listener trusting different client roots must not honour the ticket"
+        );
+
+        // No client auth at all: also a different trust configuration.
+        let mut anon = ticket_engine(
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_verification_time(now),
+        );
+        assert!(anon.try_resume(&ticket, &[TICKET_SUITE]).is_none());
+    }
+
+    /// Tickets in the pre-binding format (sealed under the bare `ticket_key`)
+    /// must fall back to a full handshake, never fail open.
+    #[test]
+    fn tls12_ticket_old_format_falls_back_to_full_handshake() {
+        use crate::x509::Time;
+        let key = [0x21u8; 32];
+        let cfg = || {
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_verification_time(Time::utc(2026, 1, 1, 0, 0, 0))
+        };
+        let mut engine = ticket_engine(cfg());
+        let created = engine.ticket_now().unwrap();
+        let plain = Ticket12Plaintext {
+            cipher_suite: TICKET_SUITE.0,
+            master_secret: [0x11u8; 48],
+            creation_time: created,
+            ems_used: false,
+            alpn: None,
+            client_leaf: None,
+        };
+        // Sealed under the raw configured key, as the old code did.
+        let legacy_ticket = seal_ticket(&mut engine.rng, &key, &plain.encode());
+        let mut server = ticket_engine(cfg());
+        assert!(server.try_resume(&legacy_ticket, &[TICKET_SUITE]).is_none());
+    }
+
+    /// The recorded client leaf must still be inside its validity period at
+    /// resumption: an expired certificate cannot be carried across a resumed
+    /// handshake.
+    #[test]
+    fn tls12_ticket_rechecks_client_leaf_validity() {
+        use crate::x509::Time;
+        let leaf = ticket_test_client_leaf(
+            b"ticket-expiring",
+            Time::utc(2024, 1, 1, 0, 0, 0),
+            Time::utc(2026, 6, 1, 0, 0, 0),
+        );
+        let key = [0x44u8; 32];
+        let cfg = |at: Time| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(leaf.clone()).unwrap();
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, true)
+                .with_verification_time(at)
+        };
+
+        // In-window: resumption is allowed.
+        let mut issuer = ticket_engine(cfg(Time::utc(2026, 1, 1, 0, 0, 0)));
+        let created = issuer.ticket_now().unwrap();
+        let ticket = seal_test_ticket(&mut issuer, Some(leaf.clone()), created);
+        let mut ok = ticket_engine(cfg(Time::utc(2026, 1, 1, 1, 0, 0)));
+        assert!(ok.try_resume(&ticket, &[TICKET_SUITE]).is_some());
+
+        // After the leaf expired: refused (the full handshake will re-verify).
+        let mut late =
+            ticket_engine(cfg(Time::utc(2026, 7, 1, 0, 0, 0)).with_ticket_lifetime(7 * 24 * 3600));
+        let created_late = late.ticket_now().unwrap();
+        let ticket_late = seal_test_ticket(&mut late, Some(leaf), created_late);
+        assert!(late.try_resume(&ticket_late, &[TICKET_SUITE]).is_none());
+    }
+
+    /// Expiry is enforced against the configured verification time, so a
+    /// clock-less (`no_std`) build no longer accepts tickets forever. A
+    /// ticket older than `ticket_lifetime` is refused.
+    #[test]
+    fn tls12_ticket_expiry_uses_the_configured_clock() {
+        use crate::x509::Time;
+        let key = [0x55u8; 32];
+        let cfg = || {
+            test_rsa_server_config()
+                .with_ticket_key(key)
+                .with_ticket_lifetime(3600)
+                .with_verification_time(Time::utc(2026, 1, 1, 12, 0, 0))
+        };
+        let mut engine = ticket_engine(cfg());
+        let now = engine.ticket_now().unwrap();
+
+        let fresh = seal_test_ticket(&mut engine, None, now - 60);
+        assert!(engine.try_resume(&fresh, &[TICKET_SUITE]).is_some());
+
+        let stale = seal_test_ticket(&mut engine, None, now - 3601);
+        assert!(engine.try_resume(&stale, &[TICKET_SUITE]).is_none());
+
+        // A ticket with no timestamp at all (what a clock-less build used to
+        // mint) is refused outright rather than living forever.
+        let timeless = seal_test_ticket(&mut engine, None, 0);
+        assert!(engine.try_resume(&timeless, &[TICKET_SUITE]).is_none());
     }
 }

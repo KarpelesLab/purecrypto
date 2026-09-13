@@ -179,6 +179,19 @@ impl RootCertStore {
             .iter()
             .filter(move |a| a.subject_der.as_slice() == name_der)
     }
+
+    /// Identity material for each trust anchor, in insertion order: the
+    /// anchor's subject `Name` DER and its `SubjectPublicKeyInfo` DER.
+    ///
+    /// Used to derive a stable digest of "which roots does this store
+    /// trust" — e.g. to bind a session ticket to the exact client-auth
+    /// trust configuration of the listener that issued it, so a listener
+    /// with different roots cannot resume it.
+    pub(crate) fn anchor_identities(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.anchors
+            .iter()
+            .map(|a| (a.subject_der.as_slice(), a.spki_der.as_slice()))
+    }
 }
 
 #[cfg(all(test, feature = "embedded-roots"))]
