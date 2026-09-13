@@ -5079,8 +5079,17 @@ impl QuicConnection {
                     data,
                 } => {
                     ack_eliciting = true;
-                    if let Some(streams) = self.streams.as_mut() {
-                        streams.on_stream(id, offset, fin, data)?;
+                    let result = match self.streams.as_mut() {
+                        Some(streams) => streams.on_stream(id, offset, fin, data),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        // RFC 9000 §4.1 / §4.5 — report the violation the
+                        // stream layer identified (FLOW_CONTROL_ERROR,
+                        // FINAL_SIZE_ERROR) rather than a blanket code.
+                        self.pending_error_code =
+                            self.streams.as_mut().and_then(|s| s.take_error_code());
+                        return Err(e);
                     }
                 }
                 Frame::ResetStream {
@@ -5089,8 +5098,14 @@ impl QuicConnection {
                     final_size,
                 } => {
                     ack_eliciting = true;
-                    if let Some(streams) = self.streams.as_mut() {
-                        streams.on_reset(id, code, final_size)?;
+                    let result = match self.streams.as_mut() {
+                        Some(streams) => streams.on_reset(id, code, final_size),
+                        None => Ok(()),
+                    };
+                    if let Err(e) = result {
+                        self.pending_error_code =
+                            self.streams.as_mut().and_then(|s| s.take_error_code());
+                        return Err(e);
                     }
                 }
                 Frame::StopSending { id, code } => {

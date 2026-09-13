@@ -25,6 +25,8 @@
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
+use crate::quic::connection::{ERROR_FINAL_SIZE, ERROR_FLOW_CONTROL};
+
 /// Public stream identifier, RFC 9000 §2.1.
 ///
 /// The 62-bit value has two interpretive bits:
@@ -550,6 +552,11 @@ pub(crate) struct RecvStream {
     /// exactly once per byte and never leaks nor double-counts. Equals
     /// `read_off` whenever no bytes were discarded out-of-band.
     pub(crate) conn_fc_credited: u64,
+    /// RFC 9000 §20.1 transport error code for the most recent rejection
+    /// (`FINAL_SIZE_ERROR`, `FLOW_CONTROL_ERROR`), read back by
+    /// [`crate::quic::streams::Streams`] so the CONNECTION_CLOSE names the
+    /// actual violation.
+    pub(crate) last_error_code: Option<u64>,
 }
 
 impl RecvStream {
@@ -569,6 +576,7 @@ impl RecvStream {
             stop_sending_sent: false,
             max_data_pending: false,
             conn_fc_credited: 0,
+            last_error_code: None,
         }
     }
 
@@ -605,22 +613,22 @@ impl RecvStream {
             // Post-reset the payload is discarded, but the final size is
             // already known: RFC 9000 §4.5 still requires FINAL_SIZE_ERROR
             // for a STREAM frame claiming bytes past it.
-            let end = offset
-                .checked_add(data.len() as u64)
-                .ok_or(crate::tls::Error::Decode)?;
+            let Some(end) = offset.checked_add(data.len() as u64) else {
+                return Err(self.fail(ERROR_FINAL_SIZE));
+            };
             if let Some(fin) = self.fin_offset
                 && end > fin
             {
-                return Err(crate::tls::Error::Decode);
+                return Err(self.fail(ERROR_FINAL_SIZE));
             }
             return Ok(0);
         }
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or(crate::tls::Error::Decode)?;
+        let Some(end) = offset.checked_add(data.len() as u64) else {
+            return Err(self.fail(ERROR_FINAL_SIZE));
+        };
         // Flow-control check (RFC 9000 §4.2).
         if end > self.max_data {
-            return Err(crate::tls::Error::Decode);
+            return Err(self.fail(ERROR_FLOW_CONTROL));
         }
         // G-2: RFC 9000 §4.5 — once the final size is known (a FIN was
         // observed), any STREAM frame whose payload extends at or beyond
@@ -632,21 +640,35 @@ impl RecvStream {
         if let Some(prev_fin) = self.fin_offset {
             // A frame whose extent exceeds the known final size is
             // illegal regardless of whether it carries FIN.
-            if end > prev_fin {
-                return Err(crate::tls::Error::Decode);
-            }
             // A FIN-bearing frame whose end disagrees with the recorded
             // final size is also illegal.
-            if fin && end != prev_fin {
-                return Err(crate::tls::Error::Decode);
+            if end > prev_fin || (fin && end != prev_fin) {
+                return Err(self.fail(ERROR_FINAL_SIZE));
             }
         }
         // FIN final-size consistency (RFC 9000 §4.5, §19.8) — record the
         // final size on the first FIN we see.
         if fin {
             let fin_off = end;
+            // RFC 9000 §4.5: "the final size ... MUST NOT be smaller than any
+            // offset the endpoint has already received" — a FIN that declares
+            // the stream shorter than bytes already accepted is a
+            // FINAL_SIZE_ERROR. Without this check a peer could retroactively
+            // truncate a stream: `fin_offset` went below `next_offset`, so
+            // `read` never reported the FIN (it compares `read_off == fin`)
+            // and the stream hung in `SizeKnown` forever, its buffered bytes
+            // undeliverable.
+            let highest_pending = self
+                .pending
+                .iter()
+                .map(|(&p_off, p_data)| p_off + p_data.len() as u64)
+                .max()
+                .unwrap_or(0);
+            if fin_off < self.next_offset || fin_off < highest_pending {
+                return Err(self.fail(ERROR_FINAL_SIZE));
+            }
             match self.fin_offset {
-                Some(prev) if prev != fin_off => return Err(crate::tls::Error::Decode),
+                Some(prev) if prev != fin_off => return Err(self.fail(ERROR_FINAL_SIZE)),
                 _ => self.fin_offset = Some(fin_off),
             }
         }
@@ -820,7 +842,7 @@ impl RecvStream {
         // the contiguous-prefix `next_offset` alone undercounts when
         // we've buffered a later fragment.
         if final_size < self.next_offset {
-            return Err(crate::tls::Error::Decode);
+            return Err(self.fail(ERROR_FINAL_SIZE));
         }
         // RFC 9000 §4.5: "A receiver SHOULD treat receipt of a
         // RESET_STREAM frame that ... violates the flow control limit
@@ -828,7 +850,7 @@ impl RecvStream {
         // declared final size counts against the stream's credit exactly
         // like delivered bytes would.
         if final_size > self.max_data {
-            return Err(crate::tls::Error::Decode);
+            return Err(self.fail(ERROR_FLOW_CONTROL));
         }
         // G-2: tighten — pending out-of-order fragments may already
         // extend past `next_offset`. RESET_STREAM cannot declare a
@@ -836,16 +858,19 @@ impl RecvStream {
         // committed to (RFC 9000 §4.5). Scan all pending entries —
         // overlap suppression is not strict enough to guarantee the
         // last-key entry has the maximal end.
-        for (&p_off, p_data) in self.pending.iter() {
-            let p_end = p_off + p_data.len() as u64;
-            if final_size < p_end {
-                return Err(crate::tls::Error::Decode);
-            }
+        let highest_pending = self
+            .pending
+            .iter()
+            .map(|(&p_off, p_data)| p_off + p_data.len() as u64)
+            .max()
+            .unwrap_or(0);
+        if final_size < highest_pending {
+            return Err(self.fail(ERROR_FINAL_SIZE));
         }
         if let Some(fin) = self.fin_offset
             && final_size != fin
         {
-            return Err(crate::tls::Error::Decode);
+            return Err(self.fail(ERROR_FINAL_SIZE));
         }
         if matches!(self.state, RecvState::ResetRecvd | RecvState::ResetRead) {
             return Ok(()); // idempotent
@@ -862,6 +887,17 @@ impl RecvStream {
         self.fin_offset = Some(final_size);
         self.state = RecvState::ResetRecvd;
         Ok(())
+    }
+
+    /// Records the RFC 9000 §20.1 transport error code for the violation
+    /// about to be reported and returns the error to propagate with it. The
+    /// code is read back by [`crate::quic::streams::Streams`] and ends up in
+    /// the CONNECTION_CLOSE frame, so a peer learns whether it broke flow
+    /// control or the final-size rule rather than a blanket
+    /// PROTOCOL_VIOLATION.
+    fn fail(&mut self, code: u64) -> crate::tls::Error {
+        self.last_error_code = Some(code);
+        crate::tls::Error::Decode
     }
 
     /// Notes the application has consumed the reset signal.
@@ -1227,6 +1263,34 @@ mod tests {
     }
 
     /// G-2: FIN at offset 0..100; another FIN at 0..120 is contradictory.
+    /// RFC 9000 §4.5 — "the final size ... MUST NOT be smaller than any
+    /// offset the endpoint has already received". A FIN that truncates the
+    /// stream below data already accepted used to be recorded verbatim,
+    /// which left `fin_offset < next_offset`: `read` never reported the FIN
+    /// (it wants `read_off == fin`), so the stream hung in `SizeKnown` with
+    /// its delivered bytes unfinishable.
+    #[test]
+    fn recv_fin_below_received_data_errors() {
+        let mut r = RecvStream::new(1024);
+        r.on_data(0, b"hello world", false).expect("in-order data");
+        assert_eq!(r.next_offset, 11);
+        // A FIN claiming the stream ends at 4 contradicts 11 bytes received.
+        assert!(r.on_data(0, b"hell", true).is_err());
+        assert_eq!(r.last_error_code, Some(ERROR_FINAL_SIZE));
+        assert_eq!(r.fin_offset, None, "the bogus final size is not recorded");
+        // Out-of-order bytes count too: a FIN below a buffered fragment's
+        // end is equally illegal.
+        let mut r = RecvStream::new(1024);
+        r.on_data(100, b"later", false).expect("out-of-order data");
+        assert!(r.on_data(0, b"abc", true).is_err());
+        assert_eq!(r.last_error_code, Some(ERROR_FINAL_SIZE));
+        // The legitimate case still works: FIN at or above everything seen.
+        let mut r = RecvStream::new(1024);
+        r.on_data(0, b"hello", false).expect("data");
+        r.on_data(5, b" world", true).expect("fin at 11");
+        assert_eq!(r.fin_offset, Some(11));
+    }
+
     #[test]
     fn recv_contradictory_fin_errors() {
         let mut r = RecvStream::new(1024);

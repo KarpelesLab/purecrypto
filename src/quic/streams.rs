@@ -35,7 +35,7 @@
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 
-use crate::quic::connection::Role;
+use crate::quic::connection::{ERROR_FINAL_SIZE, ERROR_FLOW_CONTROL, Role};
 use crate::quic::frame::{Frame, StreamDir};
 use crate::quic::stream::{RecvState, SendState, Stream, StreamId};
 use crate::quic::transport_params::TransportParameters;
@@ -344,6 +344,12 @@ pub(crate) struct Streams {
     pub(crate) self_initial_max_stream_data_uni: u64,
 
     pub(crate) role: Role,
+
+    /// RFC 9000 §20.1 transport error code for the most recent rejection —
+    /// `FLOW_CONTROL_ERROR`, `FINAL_SIZE_ERROR` — taken by the connection's
+    /// frame dispatcher so the CONNECTION_CLOSE it sends names the actual
+    /// violation instead of a blanket PROTOCOL_VIOLATION.
+    pub(crate) last_error_code: Option<u64>,
 }
 
 impl Streams {
@@ -411,7 +417,15 @@ impl Streams {
                 .unwrap_or(0),
             self_initial_max_stream_data_uni: our_params.initial_max_stream_data_uni.unwrap_or(0),
             role,
+            last_error_code: None,
         }
+    }
+
+    /// Takes the RFC 9000 §20.1 transport error code recorded for the most
+    /// recent rejection, if any. Consumed by the connection's frame
+    /// dispatcher when a stream frame is refused.
+    pub(crate) fn take_error_code(&mut self) -> Option<u64> {
+        self.last_error_code.take()
     }
 
     /// Mark `id` as ready to send. No-op if already queued.
@@ -722,17 +736,19 @@ impl Streams {
         let end = offset.saturating_add(data.len() as u64);
         let prev_high = self.stream_high_offset.get(&id).copied().unwrap_or(0);
         let new_high = end.saturating_sub(prev_high);
-        if new_high > 0 {
+        let projected = if new_high > 0 {
             // Cap-check FIRST so that a frame that would overflow the
             // peer's MAX_DATA is rejected before we mutate any state.
             let projected = self.conn_recv_used.saturating_add(new_high);
             if projected > self.conn_recv_max {
                 // FLOW_CONTROL_ERROR equivalent (RFC 9000 §11.2).
+                self.last_error_code = Some(ERROR_FLOW_CONTROL);
                 return Err(Error::Decode);
             }
-            self.conn_recv_used = projected;
-            self.stream_high_offset.insert(id, end);
-        }
+            Some(projected)
+        } else {
+            None
+        };
 
         let stream = self.map.get_mut(&id).expect("just-ensured");
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
@@ -740,7 +756,26 @@ impl Streams {
         // connection level — the QUIC-3 fix above already charged
         // conn-level credit against the high-water mark. The per-stream
         // FC check inside `on_data` is still required.
-        recv.on_data(offset, data, fin)?;
+        //
+        // The connection-level charge is committed only once `on_data` has
+        // accepted the frame: a frame it rejects (per-stream flow control, a
+        // final-size violation) is a connection error, but until the caller
+        // acts on that the counters must not be left perturbed by a frame
+        // that was never applied.
+        let on_data = recv.on_data(offset, data, fin);
+        if on_data.is_err() {
+            // RFC 9000 §4.5 / §4.1 — `on_data` recorded whether this was a
+            // final-size or a flow-control violation.
+            let code = recv.last_error_code.take();
+            self.last_error_code = code;
+            return on_data.map(|_| ());
+        }
+        if let Some(projected) = projected {
+            self.conn_recv_used = projected;
+            self.stream_high_offset.insert(id, end);
+        }
+        let stream = self.map.get_mut(&id).expect("just-ensured");
+        let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         // L-3: if we have already sent STOP_SENDING on this stream,
         // `on_data` silently DROPS the payload (returns Ok(0)) — but the
         // high-water bytes (`new_high`) were just charged to
@@ -814,18 +849,24 @@ impl Streams {
         if final_size < prev_high {
             // FINAL_SIZE_ERROR — final size below an offset already
             // observed on the stream (RFC 9000 §4.5).
+            self.last_error_code = Some(ERROR_FINAL_SIZE);
             return Err(Error::Decode);
         }
         let new_high = final_size - prev_high;
         let projected = self.conn_recv_used.saturating_add(new_high);
         if projected > self.conn_recv_max {
             // FLOW_CONTROL_ERROR (RFC 9000 §11.2).
+            self.last_error_code = Some(ERROR_FLOW_CONTROL);
             return Err(Error::Decode);
         }
         let stream = self.map.get_mut(&id).expect("just-ensured");
         let recv = stream.recv.as_mut().ok_or(Error::InappropriateState)?;
         let already_reset = matches!(recv.state, RecvState::ResetRecvd | RecvState::ResetRead);
-        recv.on_reset(app_error, final_size)?;
+        if let Err(e) = recv.on_reset(app_error, final_size) {
+            let code = recv.last_error_code.take();
+            self.last_error_code = code;
+            return Err(e);
+        }
         // The application will never read the discarded remainder of
         // the stream; count it as consumed exactly once, so the
         // connection-level window does not leak. Credit only the bytes
@@ -2357,6 +2398,51 @@ mod tests {
     /// WITHOUT charging connection-level flow-control credit or
     /// recording a high-water mark — admission runs before the FC
     /// charge.
+    #[test]
+    /// RFC 9000 §4.1 — connection-level flow-control credit must not be
+    /// charged for a frame the stream layer goes on to reject. The charge
+    /// (and the stream's high-water mark) used to be committed *before*
+    /// `RecvStream::on_data` ran, so a frame refused for a per-stream
+    /// flow-control or final-size violation still moved `conn_recv_used`.
+    #[test]
+    fn rejected_stream_frame_does_not_charge_conn_fc() {
+        let our = TransportParameters {
+            initial_max_data: Some(1 << 20),
+            // Tiny per-stream window; the connection-level one is huge.
+            initial_max_stream_data_bidi_local: Some(16),
+            initial_max_stream_data_bidi_remote: Some(16),
+            initial_max_stream_data_uni: Some(16),
+            initial_max_streams_bidi: Some(10),
+            initial_max_streams_uni: Some(3),
+            ..TransportParameters::default()
+        };
+        let peer = params_with(1 << 16, 1 << 20, 10);
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        let before = s.conn_recv_used;
+        // 100 bytes blows the 16-byte per-stream window.
+        assert!(s.on_stream(0, 0, false, &[0u8; 100]).is_err());
+        assert_eq!(
+            s.conn_recv_used, before,
+            "a rejected frame must not charge connection-level credit"
+        );
+        assert!(
+            !s.stream_high_offset.contains_key(&0),
+            "nor move the stream's high-water mark"
+        );
+        assert_eq!(s.take_error_code(), Some(ERROR_FLOW_CONTROL));
+
+        // Same for a final-size violation.
+        let mut s = Streams::new(Role::Server, &our, &peer);
+        s.on_stream(0, 0, false, &[0u8; 8]).expect("in-window data");
+        let before = s.conn_recv_used;
+        assert!(
+            s.on_stream(0, 0, true, &[0u8; 2]).is_err(),
+            "a FIN below data already received is a FINAL_SIZE_ERROR"
+        );
+        assert_eq!(s.conn_recv_used, before);
+        assert_eq!(s.take_error_code(), Some(ERROR_FINAL_SIZE));
+    }
+
     #[test]
     fn stream_limit_violation_does_not_charge_conn_fc() {
         let our = TransportParameters {
