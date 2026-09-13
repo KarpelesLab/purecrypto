@@ -7,7 +7,7 @@
 //! constant-time `curve25519` backend.
 //!
 //! The exposure is gated behind the `hazmat-edwards25519` feature and lives in
-//! the [`hazmat`] submodule; see its module documentation for the stability
+//! the `hazmat` submodule; see its module documentation for the stability
 //! and constant-time contract.
 
 // The hazmat surface is available when either the edwards25519 hazmat feature

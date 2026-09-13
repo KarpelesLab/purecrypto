@@ -17,6 +17,11 @@ license = "MIT"
 keywords = ["crypto", "cryptography", "no-std", "constant-time"]
 categories = ["cryptography", "no-std::no-alloc"]
 
+[package.metadata.docs.rs]
+# Document every opt-in module (quic, hpke, ech, falcon, zkp, hazmat, ffi, ...)
+# rather than just the default set. Mirrors the CI docs job.
+all-features = true
+
 [lib]
 name = "purecrypto"
 
