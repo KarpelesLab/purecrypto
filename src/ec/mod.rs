@@ -5,8 +5,10 @@
 //! addition formulas (branch-free, correct for all inputs including the
 //! identity):
 //!
-//! - a fast **const-generic P-256** path ([`ecdsa`], [`ecdh`]), for callers who
-//!   know the curve at compile time; and
+//! - fast **fixed-curve** paths for callers who know the curve at compile
+//!   time: const-generic P-256 ([`ecdsa`], [`ecdh`]) and secp256k1 ECDSA on a
+//!   native pseudo-Mersenne field ([`secp256k1_ecdsa`], with Bitcoin /
+//!   Ethereum public-key recovery); and
 //! - a **runtime multi-curve** path ([`boxed`]) over heap-backed `BoxedUint`,
 //!   selecting P-256/P-384/P-521/secp256k1 at runtime via [`CurveId`] — used by
 //!   the TLS and X.509 layers, where the peer's curve is known only at parse
@@ -19,10 +21,11 @@
 //!
 //! This module does **not** require the `alloc` feature. An allocator-free build
 //! (`--no-default-features --features ec`) provides the fixed-curve primitives —
-//! key generation, ECDH, and sign/verify for P-256 ([`ecdsa`], [`ecdh`]), X25519,
+//! key generation, ECDH, and sign/verify for P-256 ([`ecdsa`], [`ecdh`]) and
+//! secp256k1 ([`secp256k1_ecdsa`], including recoverable signing), X25519,
 //! X448, Ed25519 and Ed448 — together with their fixed-size byte encodings
-//! (`to_bytes` / `from_bytes`, and SEC1 for P-256). Everything there works on
-//! bare-metal targets with no global allocator.
+//! (`to_bytes` / `from_bytes`, and SEC1 for P-256 and secp256k1). Everything
+//! there works on bare-metal targets with no global allocator.
 //!
 //! Enabling `alloc` additionally provides:
 //!
@@ -52,8 +55,17 @@ mod p256_gtable;
 pub(crate) mod registry;
 #[cfg(feature = "ristretto255")]
 pub mod ristretto255;
+// The secp256k1 arithmetic is always compiled: it backs the allocation-free
+// ECDSA in [`secp256k1_ecdsa`] (and BIP340 under `bip340`). Only the *hazmat*
+// surface — the raw `Scalar` / point API — is gated on `hazmat-secp256k1`;
+// without it the module is crate-private (so its `pub` items are unreachable
+// by design) and the group operations that the hazmat surface exposes but the
+// in-crate callers do not use are dead.
 #[cfg(feature = "hazmat-secp256k1")]
 pub mod secp256k1;
+#[cfg(not(feature = "hazmat-secp256k1"))]
+#[allow(dead_code, unreachable_pub)]
+pub(crate) mod secp256k1;
 #[cfg(feature = "alloc")]
 pub mod sm2;
 #[cfg(feature = "alloc")]
@@ -69,6 +81,12 @@ pub use boxed::{
 pub use curves::CurveId;
 pub use ed448::{Ed448PrivateKey, Ed448PublicKey, Ed448Signature};
 pub use ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
+/// ECDSA over secp256k1 on the stack-only native arithmetic (no `alloc`);
+/// see [`secp256k1_ecdsa`] for the full API.
+pub use secp256k1::ecdsa as secp256k1_ecdsa;
+pub use secp256k1_ecdsa::{
+    Secp256k1EcdsaPrivateKey, Secp256k1EcdsaPublicKey, Secp256k1EcdsaSignature,
+};
 #[cfg(feature = "alloc")]
 pub use sm2::{Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 pub use x448::{X448PrivateKey, X448PublicKey};

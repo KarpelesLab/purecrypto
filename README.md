@@ -138,7 +138,7 @@ known limitations for each row live in [docs/validation.md](docs/validation.md).
 | `bignum` | Const-generic `Uint` and runtime `BoxedUint`, Montgomery arithmetic, constant-time modexp |
 | `rsa` | Key generation (512 to 65536 bits), PKCS#1 v1.5, OAEP, PSS, blinded CRT with fault check, PKCS#1 DER/PEM |
 | `dh` | Finite-field DH over RFC 3526 groups 14 to 18 plus RFC 4419 group exchange |
-| `ec` | ECDSA/ECDH on P-256, P-384, P-521, secp256k1, Brainpool; X25519, X448, Ed25519, Ed448; SM2 signature and encryption |
+| `ec` | ECDSA/ECDH on P-256, P-384, P-521, secp256k1, Brainpool; X25519, X448, Ed25519, Ed448; SM2 signature and encryption (P-256 and secp256k1 ECDSA — with Bitcoin/Ethereum key recovery — need no `alloc`) |
 | `bip340` | BIP340 Schnorr signatures over secp256k1 |
 | `zkp-*` | Experimental secp256k1 extensions mirroring `secp256k1-zkp`: sign-to-contract, ECDSA adaptor signatures, Pedersen commitments, Borromean range proofs, asset surjection proofs, half-aggregation, ring-signature whitelisting (`zkp` enables all; no semver guarantee) |
 | `ristretto255` | The RFC 9496 prime-order group (stable API) |

@@ -15,8 +15,13 @@
 //! scalars, ignoring the on-curve / identity checks, comparing secret points
 //! with non-constant-time code, etc. — can silently break security. The caller
 //! owns correctness and constant-time discipline. Prefer the high-level
-//! [`ecdsa`](crate::ec::ecdsa) / [`boxed`](crate::ec::boxed) paths unless you
-//! are building a protocol that genuinely needs raw group arithmetic.
+//! [`secp256k1_ecdsa`](crate::ec::secp256k1_ecdsa) / [`boxed`](crate::ec::boxed)
+//! paths unless you are building a protocol that genuinely needs raw group
+//! arithmetic.
+//!
+//! The arithmetic itself is always compiled under the `ec` feature (it backs
+//! the allocation-free secp256k1 ECDSA in [`ecdsa`] and BIP340 in `schnorr`);
+//! the feature only controls whether this raw surface is exported.
 //!
 //! ## Backend
 //!
@@ -30,6 +35,7 @@
 #[cfg(feature = "bip340")]
 pub mod schnorr;
 
+pub mod ecdsa;
 mod field_backend;
 mod group;
 
@@ -194,6 +200,10 @@ pub struct AffinePoint {
     y: Fe,
 }
 
+// The `to_*` conversions take `&self` for consistency with the other
+// by-reference point operations (and with `group::Point`); the lint only sees
+// them once the module is crate-private, where they are not an exported API.
+#[allow(clippy::wrong_self_convention)]
 impl ProjectivePoint {
     /// The identity element (point at infinity).
     pub fn identity() -> ProjectivePoint {
@@ -265,6 +275,8 @@ impl ConditionallySelectable for ProjectivePoint {
     }
 }
 
+// See the note on `impl ProjectivePoint` above.
+#[allow(clippy::wrong_self_convention)]
 impl AffinePoint {
     /// The generator (base point) `G`.
     pub fn generator() -> AffinePoint {

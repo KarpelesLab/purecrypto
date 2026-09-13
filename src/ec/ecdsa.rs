@@ -39,7 +39,11 @@ pub struct Signature {
 
 /// Interprets the leftmost 256 bits of `hash` as an integer (RFC 6979
 /// `bits2int` for a 256-bit group).
-fn bits2int(hash: &[u8]) -> Fe {
+///
+/// Shared with the secp256k1 path (`super::secp256k1::ecdsa`): both curves
+/// have a 256-bit order held in a [`Uint<4>`](crate::bignum::Uint), so this
+/// and the nonce derivation below are curve-generic in `n`.
+pub(super) fn bits2int(hash: &[u8]) -> Fe {
     if hash.len() >= 32 {
         Fe::from_be_bytes(&hash[..32])
     } else {
@@ -50,7 +54,7 @@ fn bits2int(hash: &[u8]) -> Fe {
 /// Returns true iff `1 <= v < n`. The two [`Choice`]s are combined with a
 /// non-short-circuiting `&` so a secret `v` (private-key import) does not
 /// shape the timing of a rejection.
-fn in_range(v: &Fe, n: &Fe) -> bool {
+pub(super) fn in_range(v: &Fe, n: &Fe) -> bool {
     bool::from(!v.is_zero() & v.ct_lt(n))
 }
 
@@ -356,7 +360,7 @@ impl Signature {
 /// Right-aligns a strict-DER unsigned INTEGER's magnitude (stripping the
 /// single permitted leading `0x00`, if any) into a 32-byte slot.
 #[cfg(all(feature = "der", feature = "alloc"))]
-fn left_pad_32(int: &[u8], out: &mut [u8]) -> Result<(), Error> {
+pub(super) fn left_pad_32(int: &[u8], out: &mut [u8]) -> Result<(), Error> {
     // After `read_unsigned_integer_bytes` strict-DER validation, `int` is
     // either `[0x00]` (value zero), `[0x00, b, ...]` with `b & 0x80 != 0`,
     // or `[b, ...]` with `b & 0x80 == 0`. Strip the at-most-one leading
@@ -373,8 +377,9 @@ fn left_pad_32(int: &[u8], out: &mut [u8]) -> Result<(), Error> {
     Ok(())
 }
 
-/// RFC 6979 deterministic nonce generation for a 256-bit group, using HMAC-`D`.
-fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
+/// RFC 6979 deterministic nonce generation for a 256-bit group of order `n`,
+/// using HMAC-`D`. Curve-generic: P-256 and secp256k1 both call it.
+pub(super) fn generate_k<D: Digest>(d: &Fe, hash: &[u8], n: &Fe) -> Fe {
     let mut d_oct = [0u8; 32];
     d.write_be_bytes(&mut d_oct);
     // bits2octets(hash) = (bits2int(hash) mod n), 32 bytes.
