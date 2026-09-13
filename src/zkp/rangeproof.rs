@@ -1522,7 +1522,9 @@ pub fn rewind(
 // Tests
 // =====================================================================
 
-#[cfg(test)]
+// The Borromean signer (`sign`) and the JSON interop corpus reader are both
+// `Vec`-based; the verifier under test is not.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::test_util::{from_hex, from_hex_vec};

@@ -626,7 +626,9 @@ fn msm(terms: &[(Scalar, ProjectivePoint)]) -> ProjectivePoint {
     acc
 }
 
-#[cfg(test)]
+// The aggregation API (`aggregate` / `inc_aggregate`) and every fixture helper
+// here are `Vec`-based, so the whole suite is alloc-only.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
     use crate::ec::secp256k1::schnorr;

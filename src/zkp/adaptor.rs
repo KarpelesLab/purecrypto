@@ -1006,6 +1006,9 @@ mod tests {
     }
 
     /// Malformed input must produce `Err`, never a panic.
+    ///
+    /// The corruption corpus is built on the heap; `verify` is not.
+    #[cfg(feature = "alloc")]
     #[test]
     fn no_panic_on_malformed_input() {
         let seckey = [5u8; 32];
