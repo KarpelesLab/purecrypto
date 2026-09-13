@@ -65,6 +65,7 @@ use crate::ec::Error;
 use crate::ec::ecdsa::{bits2int, generate_k, in_range};
 use crate::hash::Digest;
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 
 /// A secp256k1 ECDSA private key (a scalar in `[1, n-1]`).
 ///
@@ -100,12 +101,13 @@ fn random_scalar<R: RngCore>(rng: &mut R) -> Scalar {
         for limb in &mut limbs {
             *limb = rng.next_u64();
         }
-        let d = Fe::from_limbs(limbs);
-        limbs.fill(0);
-        let _ = core::hint::black_box(&limbs);
+        let mut d = Fe::from_limbs(limbs);
+        limbs.zeroize();
         if in_range(&d, &n) {
             return Scalar(d);
         }
+        // A rejected candidate is still raw CSPRNG output; wipe it too.
+        d.zeroize();
     }
 }
 
@@ -113,10 +115,12 @@ impl Secp256k1EcdsaPrivateKey {
     /// Creates a private key from a 32-byte big-endian scalar, checking it is
     /// in `[1, n-1]`.
     pub fn from_bytes(bytes: &[u8; 32]) -> Result<Self, Error> {
-        let d = Fe::from_be_bytes(bytes);
+        let mut d = Fe::from_be_bytes(bytes);
         if in_range(&d, &Scalar::order()) {
             Ok(Secp256k1EcdsaPrivateKey { d: Scalar(d) })
         } else {
+            // Out of range, but still caller-supplied key material.
+            d.zeroize();
             Err(Error::InvalidInput)
         }
     }

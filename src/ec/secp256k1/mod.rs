@@ -172,12 +172,20 @@ impl Scalar {
     }
 }
 
+impl crate::zeroize::Zeroize for Scalar {
+    /// Wipes the secret limbs with the crate's volatile
+    /// [`zeroize`](crate::zeroize) stores, which the optimizer may not elide
+    /// (a plain assignment plus a `black_box` read is only a hint).
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl crate::zeroize::ZeroizeOnDrop for Scalar {}
+
 impl Drop for Scalar {
     fn drop(&mut self) {
-        // Best-effort wipe of the secret limbs with a black_box barrier so the
-        // stores are not elided (mirrors the crate's no-foreign-code pattern).
-        self.0 = Fe::ZERO;
-        let _ = core::hint::black_box(&self.0);
+        crate::zeroize::Zeroize::zeroize(self);
     }
 }
 

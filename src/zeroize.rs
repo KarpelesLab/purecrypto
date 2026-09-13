@@ -107,6 +107,13 @@ impl_default_is_zeroes!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool, char, f32, f64
 );
 
+/// A fixed-width big integer is a plain array of limbs whose `Default` is
+/// zero, so it wipes through the blanket impl below. Secret scalars (EC
+/// private keys, ECDSA nonces) are `Uint`s, and their `Drop` impls want a
+/// volatile wipe rather than a plain assignment.
+#[cfg(feature = "bignum")]
+impl<const LIMBS: usize> DefaultIsZeroes for crate::bignum::Uint<LIMBS> {}
+
 impl<Z: DefaultIsZeroes> Zeroize for Z {
     #[inline]
     fn zeroize(&mut self) {
@@ -302,6 +309,7 @@ impl<Z: Zeroize> core::fmt::Debug for Zeroizing<Z> {
 mod volatile {
     #![allow(unsafe_code)]
 
+    #[cfg(feature = "alloc")]
     use core::mem::MaybeUninit;
     use core::sync::atomic::{Ordering, compiler_fence};
 
@@ -325,6 +333,12 @@ mod volatile {
     /// Volatile-stores zero bytes over every byte of `slice`, which may be
     /// uninitialised (hence `MaybeUninit`, which has no validity invariant to
     /// uphold).
+    ///
+    /// Only the `alloc` container impls (`Vec`, `String`, `Box<str>`) wipe
+    /// spare capacity, so without `alloc` this would be dead code and trip
+    /// `-D warnings` on a no-alloc build (`--no-default-features --features
+    /// ec`).
+    #[cfg(feature = "alloc")]
     #[inline]
     pub(super) fn zero_uninit<T>(slice: &mut [MaybeUninit<T>]) {
         let len = slice

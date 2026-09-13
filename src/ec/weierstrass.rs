@@ -27,6 +27,14 @@ impl Point {
             z: BoxedUint::conditional_select(&a.z, &b.z, choice),
         }
     }
+
+    /// Wipes the coordinates (a scalar-multiplication intermediate is as
+    /// secret as the scalar that produced it).
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.z.zeroize();
+    }
 }
 
 /// A prime-order short-Weierstrass curve `y² = x³ + a·x + b (mod p)` with a
@@ -110,7 +118,10 @@ impl Curve {
     /// the identity. The `z`-inverse uses Fermat's little theorem
     /// (`z^(p-2) mod p`).
     pub(crate) fn to_affine(&self, point: &Point) -> Option<(BoxedUint, BoxedUint)> {
-        if point.z.is_zero() {
+        // `z` is secret-derived (it is the tail of a scalar multiplication),
+        // so the identity test must not short-circuit on the first non-zero
+        // limb the way `BoxedUint::is_zero` does: fold every limb first.
+        if bool::from(point.z.ct_is_zero()) {
             return None;
         }
         let z = self.fp.from_mont(&point.z);
@@ -230,7 +241,7 @@ impl Curve {
         // limb width. All in-tree callers already pre-reduce, so this is a
         // value-preserving pass costing a few hundred limb operations next to
         // ~4·bits point operations below.
-        let scalar = scalar.reduce(&self.n);
+        let mut scalar = scalar.reduce(&self.n);
         // table[j] = [j]P; table[0] is the identity.
         let mut table = alloc::vec::Vec::with_capacity(16);
         table.push(self.identity());
@@ -255,13 +266,26 @@ impl Curve {
                 acc = self.double(&acc);
 
                 let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit].
+                // Constant-time gather of table[digit]: touch every entry in a
+                // fixed order and keep the matching one. The index comparison
+                // goes through `ct_eq` rather than a `==` the compiler is free
+                // to lower to a branch on the secret window digit (the same
+                // convention as `bignum::modpow`). Note the argument order —
+                // this crate's `conditional_select(a, b, c)` returns `a` when
+                // `c` is true, inverted from the `subtle` crate.
                 let mut sel = table[0].clone();
                 for (j, entry) in table.iter().enumerate() {
-                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                    sel = Point::conditional_select(entry, &sel, j.ct_eq(&digit));
                 }
                 acc = self.point_add(&acc, &sel);
+                sel.zeroize();
             }
+        }
+        // The reduced scalar and the multiples of `P` are secret whenever the
+        // scalar is; wipe them rather than leaving them in freed heap memory.
+        scalar.zeroize();
+        for entry in table.iter_mut() {
+            entry.zeroize();
         }
         acc
     }

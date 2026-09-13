@@ -10,6 +10,7 @@ use super::p256_gtable::P256_GEN_TABLE;
 use crate::bignum::Uint;
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq, ConstantTimeLess};
 use crate::rng::RngCore;
+use crate::zeroize::Zeroize;
 
 /// Field elements and scalars are four 64-bit limbs (256 bits).
 pub(crate) type Fe = Uint<4>;
@@ -72,6 +73,17 @@ impl ConditionallySelectable for Point {
             y: Fe::conditional_select(&a.y, &b.y, choice),
             z: Fe::conditional_select(&a.z, &b.z, choice),
         }
+    }
+}
+
+impl Zeroize for Point {
+    /// Wipes the coordinates: a scalar-multiplication intermediate is as
+    /// secret as the scalar that produced it.
+    #[inline]
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.z.zeroize();
     }
 }
 
@@ -293,14 +305,20 @@ impl P256 {
                 acc = self.double(&acc);
 
                 let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit].
+                // Constant-time gather of table[digit]: the index comparison
+                // goes through `ct_eq` rather than a `==` the compiler may
+                // lower to a branch on the secret window digit.
                 let mut sel = table[0];
                 for (j, entry) in table.iter().enumerate() {
-                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                    sel = Point::conditional_select(entry, &sel, j.ct_eq(&digit));
                 }
                 acc = self.point_add(&acc, &sel);
+                sel.zeroize();
             }
         }
+        // The table holds the multiples [j]P; with a secret scalar those are
+        // secret intermediates, so do not leave them on the stack.
+        table.zeroize();
         acc
     }
 
@@ -328,9 +346,10 @@ impl P256 {
                     y: Fe::from_limbs([entry[4], entry[5], entry[6], entry[7]]),
                     z: Fe::ONE,
                 };
-                sel = Point::conditional_select(&cand, &sel, Choice::from((j + 1 == digit) as u8));
+                sel = Point::conditional_select(&cand, &sel, (j + 1).ct_eq(&digit));
             }
             acc = self.point_add(&acc, &sel);
+            sel.zeroize();
         }
         acc
     }

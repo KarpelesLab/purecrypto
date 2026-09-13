@@ -11,6 +11,7 @@
 
 use super::field_backend::{Fe, FieldBackend};
 use crate::ct::{Choice, ConditionallySelectable, ConstantTimeEq};
+use crate::zeroize::Zeroize;
 
 /// The curve constant `b3 = 3·b = 21` for `b = 7`.
 const B3: u64 = 21;
@@ -32,6 +33,17 @@ impl ConditionallySelectable for Point {
             y: Fe::conditional_select(&a.y, &b.y, choice),
             z: Fe::conditional_select(&a.z, &b.z, choice),
         }
+    }
+}
+
+impl Zeroize for Point {
+    /// Wipes the coordinates: a scalar-multiplication intermediate is as
+    /// secret as the scalar that produced it.
+    #[inline]
+    fn zeroize(&mut self) {
+        self.x.zeroize();
+        self.y.zeroize();
+        self.z.zeroize();
     }
 }
 
@@ -177,14 +189,23 @@ impl Point {
                 acc = Point::double(f, &acc);
 
                 let digit = ((limb >> shift) & 0xf) as usize;
-                // Constant-time gather of table[digit].
+                // Constant-time gather of table[digit]: the index comparison
+                // goes through `ct_eq` rather than a `==` the compiler may
+                // lower to a branch on the secret window digit (this path
+                // carries both the ECDSA nonce `k` and the private key `d`).
                 let mut sel = table[0];
                 for (j, entry) in table.iter().enumerate() {
-                    sel = Point::conditional_select(entry, &sel, Choice::from((j == digit) as u8));
+                    sel = Point::conditional_select(entry, &sel, j.ct_eq(&digit));
                 }
                 acc = Point::add(f, &acc, &sel);
+                sel.zeroize();
             }
         }
+        // The window table holds the multiples [j]P of the input point; with a
+        // secret scalar (an ECDSA nonce, a private key) the running accumulator
+        // and the table are secret intermediates. Wipe the table before the
+        // stack frame goes away.
+        table.zeroize();
         acc
     }
 
