@@ -77,8 +77,9 @@ const MAX_SESSION_TICKET_LEN: usize = 16 * 1024;
 /// message. A real chain is a leaf plus a handful of intermediates; RFC 8446
 /// sets no limit, but the message body is bounded only by the 128 KiB
 /// handshake-reassembly cap, which leaves room for ~26,000 zero-length
-/// entries to be collected and handed to path validation.
-const MAX_CERTIFICATE_ENTRIES: usize = 16;
+/// entries to be collected and handed to path validation. Shared with the
+/// server, which applies the same ceiling to a client's `Certificate`.
+pub(super) const MAX_CERTIFICATE_ENTRIES: usize = 16;
 #[cfg(feature = "ech")]
 use crate::hpke::SenderContext;
 #[cfg(feature = "ech")]
@@ -202,6 +203,31 @@ impl ClientCertConfig {
 
     fn signature_scheme(&self) -> SignatureScheme {
         Self::signature_scheme_for(&self.key)
+    }
+
+    /// The scheme this client cert may sign a TLS 1.3 `CertificateVerify`
+    /// with, or `None` when the key cannot produce one.
+    ///
+    /// Two constraints narrow [`Self::signature_scheme`], which also serves
+    /// the TLS 1.2 path: RFC 8446 §4.4.3 forbids `rsa_pkcs1_*` in a 1.3
+    /// `CertificateVerify` (an external signer must not be asked for one),
+    /// and the `ecdsa_secp*` code points each name a specific NIST curve, so
+    /// a key on secp256k1 / SM2 / Brainpool has no scheme to sign under —
+    /// the P-curve code point [`Self::signature_scheme`] returns for them is
+    /// a TLS 1.2-era approximation no conformant peer would verify.
+    fn tls13_signature_scheme(&self) -> Option<SignatureScheme> {
+        if let ClientKey::Ecdsa(k) = &self.key
+            && !matches!(k.curve(), CurveId::P256 | CurveId::P384 | CurveId::P521)
+        {
+            return None;
+        }
+        match &self.key {
+            ClientKey::External { schemes } => schemes.iter().copied().find(|s| !s.is_rsa_pkcs1()),
+            _ => {
+                let s = self.signature_scheme();
+                (!s.is_rsa_pkcs1()).then_some(s)
+            }
+        }
     }
 
     /// Internal helper exposed to the TLS 1.2 client: the IANA-blessed
@@ -3089,7 +3115,14 @@ impl ClientConnection {
                 return Err(Error::UnexpectedMessage);
             }
             let mut c = ReadCursor::new(body);
-            let _ctx = c.vec_u8()?;
+            let ctx = c.vec_u8()?;
+            // RFC 8446 §4.3.2: in handshake authentication
+            // `certificate_request_context` MUST be zero length (a non-empty
+            // one belongs to post-handshake auth, which we never opted into
+            // via `post_handshake_auth`).
+            if !ctx.is_empty() {
+                return Err(Error::IllegalParameter);
+            }
             let _exts = c.vec_u16()?;
             c.expect_empty()?;
             self.cert_request_received = true;
@@ -3195,6 +3228,13 @@ impl ClientConnection {
         // in `signature_algorithms_cert` only). Reject before any
         // verification work.
         if scheme.is_rsa_pkcs1() {
+            return Err(Error::IllegalParameter);
+        }
+        // RFC 8446 §4.4.3: "The receiver of a CertificateVerify message MUST
+        // verify that the signature algorithm was one offered in
+        // `signature_algorithms`." A scheme we never advertised is a
+        // protocol violation — reject it before any verification work.
+        if !ext::offered_signature_schemes().contains(&scheme) {
             return Err(Error::IllegalParameter);
         }
 
@@ -3432,7 +3472,7 @@ impl ClientConnection {
                 // External mTLS key: stash the flight continuation and yield;
                 // the caller signs and resumes via `provide_signature`.
                 let cc = self.config.client_cert.as_ref().expect("client cert");
-                let scheme = cc.signature_scheme();
+                let scheme = cc.tls13_signature_scheme().ok_or(Error::HandshakeFailure)?;
                 let th = self.core.transcript.current_hash();
                 let content = certificate_verify_content(false, th.as_slice());
                 self.pending_flight = Some(PendingClientFlight {
@@ -3566,7 +3606,7 @@ impl ClientConnection {
             .ok_or(Error::InappropriateState)?;
         let th = self.core.transcript.current_hash();
         let content = certificate_verify_content(false, th.as_slice());
-        let scheme = cc.signature_scheme();
+        let scheme = cc.tls13_signature_scheme().ok_or(Error::HandshakeFailure)?;
         let signature = match &cc.key {
             ClientKey::Rsa(_) => {
                 // The CertificateVerify needs an RNG; reuse our handshake one
@@ -3915,7 +3955,11 @@ type CertificateEntry = (Vec<u8>, Vec<crate::tls::codec::RawExtension>);
 /// `(cert_der, extensions)` tuples (end-entity first).
 fn parse_certificate_list(body: &[u8]) -> Result<Vec<CertificateEntry>, Error> {
     let mut c = ReadCursor::new(body);
-    let _context = c.vec_u8()?; // certificate_request_context
+    // RFC 8446 §4.4.2: `certificate_request_context` SHALL be zero length
+    // when the Certificate authenticates the server.
+    if !c.vec_u8()?.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
     let list = c.vec_u24()?;
     c.expect_empty()?;
 

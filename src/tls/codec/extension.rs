@@ -70,6 +70,19 @@ pub(crate) fn parse_supported_groups(body: &[u8]) -> Result<Vec<NamedGroup>, Err
 /// list — those schemes are reserved for chain signatures and must be
 /// offered via `signature_algorithms_cert` (RFC 8446 §4.2.3) if needed.
 pub(crate) fn signature_algorithms() -> RawExtension {
+    let mut body = Vec::new();
+    with_len_u16(&mut body, |b| {
+        for s in offered_signature_schemes() {
+            put_u16(b, s.0);
+        }
+    });
+    (ExtensionType::SIGNATURE_ALGORITHMS, body)
+}
+
+/// The `SignatureScheme`s [`signature_algorithms`] advertises, in wire
+/// order. Peers may only sign a `CertificateVerify` with one of these
+/// (RFC 8446 §4.4.3), so the receiving side checks against this list.
+pub(crate) fn offered_signature_schemes() -> Vec<SignatureScheme> {
     let base = [
         SignatureScheme::ED25519,
         SignatureScheme::ED448,
@@ -91,13 +104,7 @@ pub(crate) fn signature_algorithms() -> RawExtension {
     #[cfg(not(feature = "mldsa"))]
     let mldsa: [SignatureScheme; 0] = [];
 
-    let mut body = Vec::new();
-    with_len_u16(&mut body, |b| {
-        for s in base.iter().chain(mldsa.iter()) {
-            put_u16(b, s.0);
-        }
-    });
-    (ExtensionType::SIGNATURE_ALGORITHMS, body)
+    base.iter().chain(mldsa.iter()).copied().collect()
 }
 
 /// `application_layer_protocol_negotiation` (RFC 7301): a list of

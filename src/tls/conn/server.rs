@@ -626,13 +626,29 @@ impl ServerConfig {
     /// advertised scheme the client also offered. `None` means no overlap —
     /// the caller aborts with `handshake_failure`.
     fn negotiate_sig_scheme(&self, offered: &[SignatureScheme]) -> Option<SignatureScheme> {
+        // RFC 8446 §4.4.3: `rsa_pkcs1_*` is forbidden in a TLS 1.3
+        // `CertificateVerify` — those code points only ever describe chain
+        // signatures (`signature_algorithms_cert`). A client that offers one
+        // must not be taken up on it: an external signer would be asked for a
+        // PKCS#1 v1.5 signature the peer is required to reject.
+        //
+        // RFC 8446 §4.2.3: the `ecdsa_secp*` schemes each name one NIST
+        // curve. A key on secp256k1 / SM2 / Brainpool cannot produce a
+        // signature any conformant peer verifies under them, so refuse
+        // rather than advertise a scheme we cannot honour.
+        if let ServerKey::Ecdsa(k) = &self.key
+            && !matches!(k.curve(), CurveId::P256 | CurveId::P384 | CurveId::P521)
+        {
+            return None;
+        }
         match &self.key {
-            ServerKey::External { schemes } => {
-                schemes.iter().copied().find(|s| offered.contains(s))
-            }
+            ServerKey::External { schemes } => schemes
+                .iter()
+                .copied()
+                .find(|s| offered.contains(s) && !s.is_rsa_pkcs1()),
             _ => {
                 let s = self.signature_scheme();
-                offered.contains(&s).then_some(s)
+                (offered.contains(&s) && !s.is_rsa_pkcs1()).then_some(s)
             }
         }
     }
@@ -3090,13 +3106,25 @@ impl<R: RngCore> ServerConnection<R> {
 /// certificates (end-entity first). Mirrors the client-side helper.
 fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut c = ReadCursor::new(body);
-    let _context = c.vec_u8()?; // certificate_request_context
+    // RFC 8446 §4.4.2: the context echoes the `CertificateRequest`'s, which
+    // is always empty for handshake authentication (see
+    // `send_certificate_request`).
+    if !c.vec_u8()?.is_empty() {
+        return Err(Error::IllegalParameter);
+    }
     let list = c.vec_u24()?;
     c.expect_empty()?;
 
     let mut entries = ReadCursor::new(list);
     let mut certs = Vec::new();
     while !entries.is_empty() {
+        // Bound the chain length: the body is capped only by the handshake
+        // reassembly limit, so without this an unauthenticated client can
+        // hand chain validation tens of thousands of entries. Mirrors the
+        // client-side `MAX_CERTIFICATE_ENTRIES`.
+        if certs.len() >= super::client::MAX_CERTIFICATE_ENTRIES {
+            return Err(Error::Decode);
+        }
         let cert = entries.vec_u24()?.to_vec();
         let _exts = entries.vec_u16()?; // per-certificate extensions
         certs.push(cert);
