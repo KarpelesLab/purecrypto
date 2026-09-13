@@ -55,6 +55,24 @@ use crate::ct::ConstantTimeEq;
 /// 500 million records).
 const MAX_KEY_UPDATES_RECEIVED: u32 = 64;
 
+/// Upper bound on a HelloRetryRequest `cookie` we are willing to echo in the
+/// retry ClientHello (RFC 8446 §4.2.2). The wire vector allows up to 2^16-1
+/// bytes, but the cookie has to fit *inside* CH2 alongside the key shares,
+/// the session ticket and — under ECH — a second, sealed copy of the whole
+/// hello. A pre-auth peer that sent a 64 KiB cookie would otherwise push the
+/// encoder past the `u16` extensions-block length. Real stateless-HRR cookies
+/// are a transcript hash plus a little state (tens to a few hundred bytes);
+/// 8 KiB is ample and keeps CH2 well inside the wire limits.
+const MAX_HRR_COOKIE_LEN: usize = 8 * 1024;
+
+/// Upper bound on a `NewSessionTicket.ticket` we will keep for resumption.
+/// The ticket is re-presented verbatim in a later ClientHello's
+/// `pre_shared_key` identity, so an oversized one is a hello we could never
+/// encode. RFC 8446 puts no cap on the field; real tickets run from a few
+/// hundred bytes to a couple of KiB. Larger ones are simply not stored (the
+/// handshake that carried them is unaffected).
+const MAX_SESSION_TICKET_LEN: usize = 16 * 1024;
+
 /// Ceiling on `CertificateEntry` structures in a server `Certificate`
 /// message. A real chain is a leaf plus a handful of intermediates; RFC 8446
 /// sets no limit, but the message body is bounded only by the 128 KiB
@@ -1236,6 +1254,38 @@ impl ClientConnection {
         #[cfg(feature = "ech")]
         rng.fill_bytes(&mut ech_grease_seed);
 
+        // RFC 8446 §4.6.1 / §2.2: a stored session is scoped to the server
+        // it was issued by and to its advertised lifetime. Offering a PSK
+        // also means the resumed handshake carries no certificate at all, so
+        // a session must never be presented to a different name than the one
+        // whose certificate authenticated it, nor after it has expired. Drop
+        // the offer (the handshake then proceeds as a full one) when:
+        //
+        //  * the requested `server_name` differs from the stored one
+        //    (ASCII-case-insensitive, as host names are),
+        //  * a clock is available and `received_at + lifetime_seconds` has
+        //    passed, or
+        //  * the ticket is too large to fit a ClientHello at all
+        //    (see `MAX_SESSION_TICKET_LEN`).
+        let mut config = config;
+        if let Some(session) = config.session.as_ref() {
+            let now = config
+                .verification_time
+                .clone()
+                .or_else(system_now)
+                .map(|t| t.to_unix());
+            let expired = now.is_some_and(|now| {
+                now.saturating_sub(session.received_at.to_unix())
+                    > u64::from(session.lifetime_seconds)
+            });
+            if !session.server_name.eq_ignore_ascii_case(server_name)
+                || expired
+                || session.ticket.len() > MAX_SESSION_TICKET_LEN
+            {
+                config.session = None;
+            }
+        }
+
         // If resuming, restrict the cipher-suite offer to suites whose hash
         // matches the session's. The PSK binder and handshake key schedule
         // are tied to that hash.
@@ -1371,7 +1421,25 @@ impl ClientConnection {
                 });
                 outer_ch
             }
-            None => conn.build_client_hello(
+            None => conn
+                .build_client_hello(
+                    random,
+                    String::from(server_name),
+                    &effective_suites,
+                    groups,
+                    share_groups,
+                    &[],
+                    None,
+                    None,
+                )
+                // Every input to CH1 is locally configured — the resumption
+                // ticket is length-checked before the session is adopted, so
+                // nothing a peer controls can overflow the encoder here.
+                .expect("locally configured ClientHello exceeds the TLS wire limits"),
+        };
+        #[cfg(not(feature = "ech"))]
+        let hello = conn
+            .build_client_hello(
                 random,
                 String::from(server_name),
                 &effective_suites,
@@ -1380,19 +1448,10 @@ impl ClientConnection {
                 &[],
                 None,
                 None,
-            ),
-        };
-        #[cfg(not(feature = "ech"))]
-        let hello = conn.build_client_hello(
-            random,
-            String::from(server_name),
-            &effective_suites,
-            groups,
-            share_groups,
-            &[],
-            None,
-            None,
-        );
+            )
+            // See the `ech` arm above: CH1 carries only locally configured
+            // material, so this cannot be driven by a peer.
+            .expect("locally configured ClientHello exceeds the TLS wire limits");
 
         // Pre-set the transcript alg so the CH update settles the
         // ClientEarlyTrafficSecret derivation below at the right hash.
@@ -1475,7 +1534,7 @@ impl ClientConnection {
         extra_extensions: &[crate::tls::codec::RawExtension],
         ech_override: Option<&[u8]>,
         hrr_transcript: Option<&[u8]>,
-    ) -> Vec<u8> {
+    ) -> Result<Vec<u8>, Error> {
         // Without the `ech` feature there's no place where we'd consult
         // `ech_override`; mark it as deliberately unused so the rest of
         // this function is identical across feature combinations.
@@ -1652,11 +1711,15 @@ impl ClientConnection {
             let hash_len = hash.output_len();
             let age = self.compute_obfuscated_age(session);
             let (ext_with_zeros, binders_len) =
-                ext::client_pre_shared_key_placeholder(&[(session.ticket.clone(), age)], hash_len);
+                ext::client_pre_shared_key_placeholder(&[(session.ticket.clone(), age)], hash_len)?;
             extensions.push(ext_with_zeros);
             psk_binder_info = Some((hash, session.psk.clone(), binders_len));
         }
 
+        // `try_encode` rather than `encode`: the extension list can carry
+        // peer-influenced bytes — an HRR `cookie` echoed verbatim and a
+        // server-issued session ticket — so an overlong hello must surface as
+        // an error instead of tripping the encoder's length assertion.
         let mut bytes = ClientHello {
             // RFC 8446 §4.1.2: TLS 1.3 keeps `legacy_version = 0x0303` and
             // signals the real version via `supported_versions`.
@@ -1666,7 +1729,7 @@ impl ClientConnection {
             cipher_suites: suites.to_vec(),
             extensions,
         }
-        .encode();
+        .try_encode()?;
 
         // Patch the binder: HMAC(binder_finished_key, Transcript-Hash(
         // [message_hash(CH1) ‖ HRR ‖] truncated_CH)) — the bracketed prefix
@@ -1681,7 +1744,7 @@ impl ClientConnection {
                 hrr_transcript.unwrap_or(&[]),
             );
         }
-        bytes
+        Ok(bytes)
     }
 
     /// Computes the obfuscated ticket age (RFC 8446 §4.2.11.1): elapsed
@@ -1945,6 +2008,14 @@ impl ClientConnection {
                 // RFC 8446 §4.6.1: a `ticket_lifetime` of zero means the
                 // ticket must be discarded immediately — never offer it.
                 if received.lifetime_seconds == 0 {
+                    return Ok(());
+                }
+
+                // A ticket too large to fit a later ClientHello is useless
+                // for resumption (and would otherwise be carried all the way
+                // to the encoder): keep it visible via `last_session_ticket`
+                // but never build a resumable session from it.
+                if received.ticket.len() > MAX_SESSION_TICKET_LEN {
                     return Ok(());
                 }
 
@@ -2383,6 +2454,14 @@ impl ClientConnection {
             .iter()
             .find(|(t, _)| t.0 == 0x002c) // cookie
             .cloned();
+        // RFC 8446 §4.2.2: the cookie is echoed verbatim in CH2. Bound it
+        // (see `MAX_HRR_COOKIE_LEN`) so a pre-auth peer cannot hand us a
+        // cookie no ClientHello could carry.
+        if let Some((_, body)) = cookie_ext.as_ref()
+            && body.len() > MAX_HRR_COOKIE_LEN
+        {
+            return Err(Error::IllegalParameter);
+        }
         if selected_group.is_none() && cookie_ext.is_none() {
             return Err(Error::IllegalParameter);
         }
@@ -2543,7 +2622,7 @@ impl ClientConnection {
                 &extras,
                 None,
                 Some(self.core.transcript.buffered_bytes()),
-            );
+            )?;
             (ch, None)
         };
 
@@ -2558,7 +2637,7 @@ impl ClientConnection {
                 &extras,
                 None,
                 Some(self.core.transcript.buffered_bytes()),
-            ),
+            )?,
             None,
         );
 
@@ -2663,7 +2742,7 @@ impl ClientConnection {
             extras,
             Some(&inner_marker),
             Some(self.core.transcript.buffered_bytes()),
-        );
+        )?;
         let inner_sni_len = server_name.len();
         let padded =
             crate::tls::ech::outer::pad_inner(&inner_ch2, inner_sni_len, maximum_name_length);
@@ -2672,6 +2751,13 @@ impl ClientConnection {
         // its own retained CH1 setup, not the wire.
         let outer_body =
             crate::tls::ech::outer::build_outer_ext_body(sym, config_id, &[][..], padded.len());
+        // The sealed inner CH rides inside the outer hello's
+        // `encrypted_client_hello` payload, which is a `u16` vector: refuse
+        // (rather than assert) when the padded inner CH — whose size an
+        // oversized HRR cookie inflates — cannot be framed.
+        if padded.len() + crate::tls::ech::outer::HPKE_TAG_LEN > 0xFFFF {
+            return Err(Error::IllegalParameter);
+        }
         let skeleton = self.build_client_hello(
             random,
             public_name_str,
@@ -2681,7 +2767,7 @@ impl ClientConnection {
             extras,
             Some(&outer_body),
             Some(self.core.transcript.buffered_bytes()),
-        );
+        )?;
 
         // Take the retained sender (it never goes back into state —
         // after CH2 no more CH-level HPKE seals happen) and seal.
@@ -3575,16 +3661,18 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // outer-extensions that gets compressed across the seam, so the
     // inner and outer CHs MUST present the same `key_share` bytes —
     // route `share_groups` into both build calls.
-    let inner_ch = conn.build_client_hello(
-        random,
-        String::from(server_name),
-        effective_suites,
-        groups,
-        share_groups,
-        &[],
-        Some(&inner_marker),
-        None,
-    );
+    let inner_ch = conn
+        .build_client_hello(
+            random,
+            String::from(server_name),
+            effective_suites,
+            groups,
+            share_groups,
+            &[],
+            Some(&inner_marker),
+            None,
+        )
+        .ok()?;
     let inner_sni_len = server_name.len();
     let suites_owned = effective_suites.to_vec();
     let groups_owned = groups.to_vec();
@@ -3601,18 +3689,20 @@ fn seal_real_ech_on_ch1<R: RngCore>(
     // extensions are byte-identical to the real outer (same suites/groups —
     // only SNI and the ECH extension itself differ). On any parse hiccup we
     // fall back to sealing the inner CH verbatim (correct, just larger).
-    let reference_outer = conn.build_client_hello(
-        random,
-        public_name_str.clone(),
-        effective_suites,
-        groups,
-        share_groups,
-        &[],
-        Some(&crate::tls::ech::outer::build_outer_ext_body(
-            sym, config_id, &[0u8; 32], 100,
-        )),
-        None,
-    );
+    let reference_outer = conn
+        .build_client_hello(
+            random,
+            public_name_str.clone(),
+            effective_suites,
+            groups,
+            share_groups,
+            &[],
+            Some(&crate::tls::ech::outer::build_outer_ext_body(
+                sym, config_id, &[0u8; 32], 100,
+            )),
+            None,
+        )
+        .ok()?;
     let (canonical_inner, inner_to_seal) = match (
         ClientHello::decode(inner_ch.get(4..)?),
         ClientHello::decode(reference_outer.get(4..)?),
@@ -3651,16 +3741,21 @@ fn seal_real_ech_on_ch1<R: RngCore>(
         |enc, padded_len| {
             let outer_body =
                 crate::tls::ech::outer::build_outer_ext_body(sym, config_id, enc, padded_len);
-            conn_for_closure.build_client_hello(
-                random,
-                public_name_closure.clone(),
-                &suites_owned,
-                &groups_owned,
-                &share_groups_owned,
-                &[],
-                Some(&outer_body),
-                None,
-            )
+            // An un-encodable skeleton yields empty bytes, which
+            // `seal_into_skeleton` rejects — the caller then falls back to a
+            // plain (non-ECH) CH1 rather than panicking.
+            conn_for_closure
+                .build_client_hello(
+                    random,
+                    public_name_closure.clone(),
+                    &suites_owned,
+                    &groups_owned,
+                    &share_groups_owned,
+                    &[],
+                    Some(&outer_body),
+                    None,
+                )
+                .unwrap_or_default()
         },
     )
     .ok()?;
@@ -3998,7 +4093,9 @@ mod tests {
             psk: alloc::vec![0x5a; 32],
             age_add: 0,
             lifetime_seconds: 7200,
-            received_at: Time::from_unix(0),
+            // Must be "now": a session past `received_at + lifetime_seconds`
+            // is dropped from the offer (RFC 8446 §4.6.1).
+            received_at: system_now().unwrap_or_else(|| Time::from_unix(0)),
             max_early_data_size: Some(1024),
             negotiated_alpn: None,
             cipher_suite_hash: HashAlg::Sha256,
@@ -4268,5 +4365,156 @@ mod tests {
             .find(|(t, _)| t.0 == 0x002c)
             .expect("CH2 echoes the cookie");
         assert_eq!(echoed.1, alloc::vec![0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    /// A HelloRetryRequest cookie is echoed verbatim in CH2, so an
+    /// oversized one used to make the ClientHello encoder overflow its
+    /// `u16` extensions-block length and panic — a pre-auth remote crash.
+    /// It must be rejected with `illegal_parameter` instead.
+    #[test]
+    fn client_rejects_oversized_hrr_cookie() {
+        use crate::tls::codec::{CipherSuite, HRR_RANDOM, ServerHello};
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"hrr-big-cookie", b"nonce", &[]);
+        let mut client = ClientConnection::new(
+            ClientConfig::new(RootCertStore::new()),
+            "example.com",
+            &mut rng,
+        )
+        .unwrap();
+        let _ = client.write_tls();
+
+        let mut cookie_body = alloc::vec![0xFDu8, 0xE8]; // opaque cookie<...>: 65000
+        cookie_body.extend(core::iter::repeat_n(0x41u8, 65_000));
+        let hrr = ServerHello {
+            random: HRR_RANDOM,
+            session_id: alloc::vec![],
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (ExtensionType(0x002c), cookie_body),
+            ],
+        };
+        let raw = hrr.encode();
+        let mut c = ReadCursor::new(&raw);
+        assert_eq!(c.u8().unwrap(), hs_type::SERVER_HELLO);
+        let body = c.vec_u24().unwrap();
+        assert!(matches!(
+            client.on_server_hello(hs_type::SERVER_HELLO, body, &raw),
+            Err(Error::IllegalParameter)
+        ));
+
+        // Control: a small cookie is still accepted and echoed.
+        let mut rng2 = HmacDrbg::<Sha256>::new(b"hrr-ok-cookie", b"nonce", &[]);
+        let mut client2 = ClientConnection::new(
+            ClientConfig::new(RootCertStore::new()),
+            "example.com",
+            &mut rng2,
+        )
+        .unwrap();
+        let _ = client2.write_tls();
+        let hrr_ok = ServerHello {
+            random: HRR_RANDOM,
+            session_id: alloc::vec![],
+            cipher_suite: CipherSuite::AES_128_GCM_SHA256,
+            extensions: alloc::vec![
+                (ExtensionType::SUPPORTED_VERSIONS, alloc::vec![0x03, 0x04]),
+                (
+                    ExtensionType(0x002c),
+                    alloc::vec![0x00, 0x04, 0xde, 0xad, 0xbe, 0xef]
+                ),
+            ],
+        };
+        let raw_ok = hrr_ok.encode();
+        let mut c2 = ReadCursor::new(&raw_ok);
+        assert_eq!(c2.u8().unwrap(), hs_type::SERVER_HELLO);
+        let body_ok = c2.vec_u24().unwrap();
+        client2
+            .on_server_hello(hs_type::SERVER_HELLO, body_ok, &raw_ok)
+            .expect("a normal-sized cookie is processable");
+    }
+
+    /// A `NewSessionTicket` carrying a ticket too large to fit any
+    /// ClientHello must not be turned into a resumable session: offering
+    /// it back would overflow the `pre_shared_key` encoder.
+    #[test]
+    fn client_does_not_store_oversized_session_ticket() {
+        fn nst(ticket_len: usize) -> Vec<u8> {
+            let mut body = Vec::new();
+            body.extend_from_slice(&3600u32.to_be_bytes()); // ticket_lifetime
+            body.extend_from_slice(&0u32.to_be_bytes()); // ticket_age_add
+            body.push(8); // nonce<0..255>
+            body.extend_from_slice(&[0u8; 8]);
+            body.extend_from_slice(&(ticket_len as u16).to_be_bytes());
+            body.extend(core::iter::repeat_n(0x5Au8, ticket_len));
+            body.extend_from_slice(&[0, 0]); // no extensions
+            let mut msg = alloc::vec![hs_type::NEW_SESSION_TICKET];
+            let l = body.len();
+            msg.extend_from_slice(&[(l >> 16) as u8, (l >> 8) as u8, l as u8]);
+            msg.extend_from_slice(&body);
+            msg
+        }
+
+        let mut rng = HmacDrbg::<Sha256>::new(b"nst-big-ticket", b"nonce", &[]);
+        let mut client =
+            ClientConnection::new(ClientConfig::new(RootCertStore::new()), "h", &mut rng).unwrap();
+        let _ = client.write_tls();
+        // Park the engine where post-handshake messages are processed and
+        // give it what a completed handshake would have left behind.
+        client.state = State::Connected;
+        client.suite = lookup_suite(CipherSuite::AES_128_GCM_SHA256);
+        client.rms = Some(Secret::new(&[0x11u8; 32]));
+
+        client
+            .handle_handshake_for_test(nst(MAX_SESSION_TICKET_LEN + 1))
+            .unwrap();
+        assert!(
+            client.take_session().is_none(),
+            "an unofferable ticket must not become a resumable session"
+        );
+        // Control: a normal-sized ticket still resumes.
+        client.handle_handshake_for_test(nst(64)).unwrap();
+        assert!(client.take_session().is_some());
+    }
+
+    /// RFC 8446 §4.6.1 / §2.2: a stored session is scoped to the server
+    /// that issued it and to its lifetime. Since a resumed handshake
+    /// carries no certificate, offering the PSK to another name — or long
+    /// after it expired — must not happen.
+    #[test]
+    fn client_only_offers_a_session_to_its_own_server_within_its_lifetime() {
+        fn session(name: &str, age_secs: u64) -> StoredSession {
+            let now = system_now().map(|t| t.to_unix()).unwrap_or(1_700_000_000);
+            StoredSession {
+                server_name: name.into(),
+                ticket: alloc::vec![0x41; 16],
+                psk: alloc::vec![0x5a; 32],
+                age_add: 0,
+                lifetime_seconds: 3600,
+                received_at: Time::from_unix(now.saturating_sub(age_secs)),
+                max_early_data_size: None,
+                negotiated_alpn: None,
+                cipher_suite_hash: HashAlg::Sha256,
+            }
+        }
+        fn offers_psk(session: StoredSession, connect_to: &str) -> bool {
+            let mut rng = HmacDrbg::<Sha256>::new(b"psk-scope", connect_to.as_bytes(), &[]);
+            let config = ClientConfig::new(RootCertStore::new()).with_session(session);
+            let client = ClientConnection::new(config, connect_to, &mut rng).unwrap();
+            client.psk_offered.is_some()
+        }
+
+        // Control: same name, fresh ticket.
+        assert!(offers_psk(session("h.example", 10), "h.example"));
+        // Host names are ASCII-case-insensitive.
+        assert!(offers_psk(session("H.Example", 10), "h.example"));
+        // Different server: never offer it.
+        assert!(!offers_psk(session("other.example", 10), "h.example"));
+        // Past `received_at + lifetime_seconds`.
+        assert!(!offers_psk(session("h.example", 7200), "h.example"));
+        // Too large to ever fit a ClientHello.
+        let mut huge = session("h.example", 10);
+        huge.ticket = alloc::vec![0x41; MAX_SESSION_TICKET_LEN + 1];
+        assert!(!offers_psk(huge, "h.example"));
     }
 }

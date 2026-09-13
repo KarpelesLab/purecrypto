@@ -561,10 +561,26 @@ pub(crate) fn early_data_with_size(max: u32) -> RawExtension {
 /// The caller can subtract this length from the assembled ClientHello bytes
 /// to obtain the "truncated ClientHello" that the binders are HMAC'd over
 /// (RFC 8446 §4.2.11.2).
+///
+/// Returns `Err(HandshakeFailure)` when the identities or binders would
+/// overflow their `u16` wire vectors (the ticket bytes are server-issued, so
+/// their size is peer-influenced and must not reach the encoder's length
+/// assertion).
 pub(crate) fn client_pre_shared_key_placeholder(
     identities: &[(Vec<u8>, u32)],
     hash_len: usize,
-) -> (RawExtension, usize) {
+) -> Result<(RawExtension, usize), Error> {
+    let ids_len = identities
+        .iter()
+        .fold(0usize, |acc, (id, _)| acc.saturating_add(2 + id.len() + 4));
+    let binders_len = identities.len().saturating_mul(1 + hash_len);
+    if ids_len > 0xFFFF
+        || binders_len > 0xFFFF
+        || hash_len > 0xFF
+        || identities.iter().any(|(id, _)| id.len() > 0xFFFF)
+    {
+        return Err(Error::HandshakeFailure);
+    }
     let mut body = Vec::new();
     // identities<7..2^16-1>
     with_len_u16(&mut body, |list| {
@@ -582,7 +598,7 @@ pub(crate) fn client_pre_shared_key_placeholder(
         }
     });
     let binders_len = body.len() - binders_start;
-    ((ExtensionType::PRE_SHARED_KEY, body), binders_len)
+    Ok(((ExtensionType::PRE_SHARED_KEY, body), binders_len))
 }
 
 /// A parsed `pre_shared_key` extension from a ClientHello: a list of offered

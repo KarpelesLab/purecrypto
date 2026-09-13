@@ -89,6 +89,23 @@ fn encode_extensions(out: &mut Vec<u8>, extensions: &[RawExtension]) {
     });
 }
 
+/// Whether `extensions` fit the `Extension extensions<0..2^16-1>` wire
+/// vector: every body must fit its own `u16` length and the whole block
+/// (4 bytes of type + length per entry, plus bodies) must fit the outer
+/// `u16`. Encoders that may carry peer-influenced bytes (an HRR cookie, a
+/// server-issued ticket) check this first so an oversized input surfaces as
+/// an error instead of tripping the [`with_len_u16`] assertion.
+pub(crate) fn extensions_fit(extensions: &[RawExtension]) -> bool {
+    let mut total: usize = 0;
+    for (_, data) in extensions {
+        if data.len() > 0xFFFF {
+            return false;
+        }
+        total = total.saturating_add(4 + data.len());
+    }
+    total <= 0xFFFF
+}
+
 /// Upper bound on the number of extensions accepted in a single handshake
 /// message. Real hellos carry well under 30 even with GREASE + ECH + QUIC
 /// transport parameters; the cap keeps the linear duplicate scan below from
@@ -154,6 +171,20 @@ impl ClientHello {
             encode_extensions(b, &self.extensions);
         });
         out
+    }
+
+    /// Fallible [`Self::encode`]: returns `Err(HandshakeFailure)` instead of
+    /// panicking when a field would overflow its wire length prefix. Use
+    /// whenever the hello carries bytes a peer can influence (an HRR
+    /// `cookie`, a server-issued session ticket).
+    pub(crate) fn try_encode(&self) -> Result<Vec<u8>, Error> {
+        if self.session_id.len() > 0xFF
+            || self.cipher_suites.len() > 0xFFFF / 2
+            || !extensions_fit(&self.extensions)
+        {
+            return Err(Error::HandshakeFailure);
+        }
+        Ok(self.encode())
     }
 
     /// DTLS variant of [`Self::encode`] (RFC 6347 §4.2.1 / RFC 9147 §5.3):
