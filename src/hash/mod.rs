@@ -69,7 +69,14 @@ mod block;
 mod hmac;
 mod k12;
 mod keccak;
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
+// Batched Keccak for the matrix / tree expansion of ML-KEM, ML-DSA and
+// SLH-DSA-SHAKE; like the multi-buffer SHA-2 kernels below, nothing else calls
+// it.
+#[cfg(all(
+    feature = "std",
+    target_arch = "x86_64",
+    any(feature = "mlkem", feature = "mldsa", feature = "slhdsa")
+))]
 pub(crate) mod keccak_x4;
 mod kmac;
 mod md2;
