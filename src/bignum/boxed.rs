@@ -143,15 +143,15 @@ impl BoxedUint {
 
     /// Best-effort wipe of the limb storage, for use in `Drop` impls that
     /// hold secret material (e.g. RSA private exponents and prime factors,
-    /// EC private scalars). Mirrors the `core::hint::black_box` pattern used
-    /// by [`Aes128`] / [`Poly1305`] and the in-crate [`hash::zeroize`]
-    /// helpers so LLVM does not elide the writes as a dead store.
+    /// EC private scalars). Uses [`crate::zeroize::Zeroize`]: volatile stores
+    /// plus a compiler fence, so LLVM may not elide them as dead stores.
+    ///
+    /// The limbs are wiped in place and the `Vec` keeps its length, unlike
+    /// `Vec::zeroize` (which also empties it) — a `BoxedUint` must stay a
+    /// valid zero of the same width.
     #[inline]
     pub(crate) fn zeroize(&mut self) {
-        for limb in self.limbs.iter_mut() {
-            *limb = 0;
-        }
-        let _ = core::hint::black_box(&self.limbs);
+        crate::zeroize::Zeroize::zeroize(self.limbs.as_mut_slice());
     }
 
     /// The bit length (most-significant set bit + 1); zero for zero.
@@ -365,18 +365,15 @@ impl Eq for BoxedUint {}
 
 // Best-effort zeroize on drop: every BoxedUint may carry secret material
 // (RSA `d`/`p`/`q`, ECDSA/ECDH scalars, blinding intermediates, …) and the
-// limb Vec is returned to the allocator otherwise unchanged. Overwrite the
-// limbs and route the read through `core::hint::black_box` so LLVM cannot
-// eliminate the writes as dead stores (same pattern as ML-DSA/ML-KEM in
-// `src/mldsa/mod.rs` and `src/mlkem/mod.rs`, avoiding a `zeroize` dep).
+// limb Vec is returned to the allocator otherwise unchanged. The volatile
+// stores in `crate::zeroize` cannot be eliminated as dead stores.
 impl Drop for BoxedUint {
     fn drop(&mut self) {
-        for l in self.limbs.iter_mut() {
-            *l = 0;
-        }
-        let _ = core::hint::black_box(&self.limbs);
+        self.zeroize();
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for BoxedUint {}
 
 #[cfg(test)]
 mod tests {

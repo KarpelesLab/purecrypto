@@ -388,6 +388,8 @@ impl Drop for LmsPrivateKey {
     }
 }
 
+impl crate::zeroize::ZeroizeOnDrop for LmsPrivateKey {}
+
 impl LmsPublicKey {
     /// The encoded public key (`u32(lms_type) || u32(ots_type) || I || T[1]`).
     pub fn to_bytes(&self) -> &[u8] {
@@ -570,7 +572,7 @@ impl HssPrivateKey {
         let sk = Self::from_levels(&levels);
         // `from_levels` has copied every level's `(i_id, seed)`; wipe the master
         // seeds left in the heap `Vec` before it frees — each reconstructs that
-        // level's signing capability. (`wipe` routes through `black_box` so the
+        // level's signing capability. (`wipe` uses volatile stores, so the
         // writes survive the imminent drop.)
         for lvl in levels.iter_mut() {
             wipe(&mut lvl.2);

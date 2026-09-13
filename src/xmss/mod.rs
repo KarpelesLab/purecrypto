@@ -389,10 +389,7 @@ mod wots_x8 {
             super::wipe(b.as_flattened_mut());
         }
         for s in [&mut ks, &mut bs, &mut fs] {
-            for w in s.as_flattened_mut() {
-                *w = 0;
-            }
-            let _ = core::hint::black_box(&*s);
+            crate::zeroize::Zeroize::zeroize(s.as_flattened_mut());
         }
     }
 
@@ -423,10 +420,7 @@ mod wots_x8 {
         compress256_soft(&mut keygen_mid, &b0);
         // `b0` is a copy of SK_SEED; the midstate is wiped on the way out
         // (it derives every WOTS+ secret of the key, like the seed itself).
-        for b in b0.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&b0);
+        crate::zeroize::Zeroize::zeroize(&mut b0);
 
         // block2 = padding for a 128-byte message: 0x80 then the bit length
         // (1024) in the trailing u64. Identical across all eight lanes.
@@ -461,10 +455,7 @@ mod wots_x8 {
             }
             // `states` *is* the WOTS+ secret chain starts (the caller keeps its
             // own copy in `out`); the padding lanes hold a duplicate of one.
-            for w in states.as_flattened_mut() {
-                *w = 0;
-            }
-            let _ = core::hint::black_box(&states);
+            crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
             c0 += lanes;
         }
 
@@ -473,10 +464,7 @@ mod wots_x8 {
         if p.wots_len > 0 {
             addr.set_chain((p.wots_len - 1) as u32);
         }
-        for w in keygen_mid.iter_mut() {
-            *w = 0;
-        }
-        let _ = core::hint::black_box(&keygen_mid);
+        crate::zeroize::Zeroize::zeroize(&mut keygen_mid);
     }
 }
 
@@ -1322,6 +1310,9 @@ impl Drop for XmssPrivateKey {
     }
 }
 
+#[cfg(feature = "alloc")]
+impl crate::zeroize::ZeroizeOnDrop for XmssPrivateKey {}
+
 impl XmssPublicKey {
     /// The parameter set this key belongs to.
     pub fn parameter_set(&self) -> XmssParamSet {
@@ -1514,6 +1505,9 @@ impl Drop for XmssMtPrivateKey {
         wipe(&mut self.bytes);
     }
 }
+
+#[cfg(feature = "alloc")]
+impl crate::zeroize::ZeroizeOnDrop for XmssMtPrivateKey {}
 
 impl XmssMtPublicKey {
     /// The parameter set this key belongs to.

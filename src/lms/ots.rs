@@ -260,10 +260,7 @@ mod lmots_x8 {
         // intermediate; `states`/`tmps` held the private x values.
         super::super::wipe(blocks.as_flattened_mut());
         super::super::wipe(tmps.as_flattened_mut());
-        for w in states.as_flattened_mut() {
-            *w = 0;
-        }
-        let _ = core::hint::black_box(&states);
+        crate::zeroize::Zeroize::zeroize(states.as_flattened_mut());
 
         k_hash.finalize()
     }

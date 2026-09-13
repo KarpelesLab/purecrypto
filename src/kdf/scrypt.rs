@@ -149,7 +149,10 @@ pub fn scrypt(
 
     // Wipe the password-derived ROMix scratch before it drops. No early returns
     // follow the allocations above, so this single pass covers every non-panic
-    // exit; `black_box` keeps the writes from being elided.
+    // exit; `black_box` keeps the writes from being elided. (A plain store
+    // loop rather than `crate::zeroize::Zeroize`: `v` alone is `N·128·r`
+    // bytes — up to hundreds of megabytes — and volatile per-byte stores
+    // would not vectorize.)
     b.iter_mut().for_each(|byte| *byte = 0);
     v.iter_mut().for_each(|byte| *byte = 0);
     x.iter_mut().for_each(|byte| *byte = 0);

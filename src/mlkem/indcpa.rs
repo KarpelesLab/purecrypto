@@ -12,6 +12,7 @@
 
 use super::poly::{self, N, Poly};
 use crate::hash::{ExtendableOutput, Shake128, XofReader, shake256};
+use crate::zeroize::Zeroize;
 
 /// Bytes per `ByteEncode₁₂` polynomial.
 pub(crate) const POLYBYTES: usize = 384;
@@ -138,10 +139,8 @@ fn getnoise<const ETA: usize>(seed: &[u8; 32], nonce: u8) -> Poly {
     let out = poly::cbd::<ETA>(&buf[..need]);
     // Wipe the PRF input (a copy of the secret noise seed) and output (the
     // raw bits the secret noise polynomial is read from) before they drop.
-    for b in input.iter_mut().chain(buf.iter_mut()) {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&input, &buf));
+    Zeroize::zeroize(&mut input);
+    Zeroize::zeroize(&mut buf);
     out
 }
 
@@ -182,15 +181,9 @@ fn getnoise_xn<const ETA: usize, const L: usize>(seed: &[u8; 32], nonces: [u8; L
     // Wipe everything derived from the secret noise seed: the PRF inputs,
     // the sponge states, and the raw CBD bit buffers.
     x4.zeroize();
-    for b in msgs
-        .iter_mut()
-        .flatten()
-        .chain(bufs.iter_mut().flatten())
-        .chain(blocks.iter_mut().flatten())
-    {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&msgs, &bufs, &blocks));
+    Zeroize::zeroize(&mut msgs);
+    Zeroize::zeroize(&mut bufs);
+    Zeroize::zeroize(&mut blocks);
     out
 }
 
@@ -312,14 +305,9 @@ pub(crate) fn keygen<const K: usize, const ETA1: usize>(
     // Wipe the transient secrets: the G input (a copy of the seed `d`, which
     // alone reconstructs the whole key), the G output, and the noise seed σ.
     // ρ is public (it is serialized into `ek`).
-    for b in g_in
-        .iter_mut()
-        .chain(g.iter_mut())
-        .chain(sigma32.iter_mut())
-    {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&g_in, &g, &sigma32));
+    Zeroize::zeroize(&mut g_in);
+    Zeroize::zeroize(&mut g);
+    Zeroize::zeroize(&mut sigma32);
 }
 
 /// K-PKE.Encrypt (FIPS 203 Algorithm 14). Writes the ciphertext into `ct`.
@@ -442,15 +430,13 @@ pub(crate) fn decrypt<const K: usize, const DU: usize, const DV: usize>(
 }
 
 /// Zeroizes the coefficient memory of every polynomial in `v` before it
-/// drops; `black_box` keeps the writes from being eliminated as dead stores
-/// (same wipe pattern as the byte-buffer epilogues in this module).
+/// drops, through [`crate::zeroize::Zeroize`]: volatile stores plus a
+/// compiler fence, so the writes cannot be eliminated as dead stores (same
+/// wipe pattern as the byte-buffer epilogues in this module).
 fn wipe_polys(v: &mut [Poly]) {
     for p in v.iter_mut() {
-        for c in p.c.iter_mut() {
-            *c = 0;
-        }
+        Zeroize::zeroize(&mut p.c);
     }
-    let _ = core::hint::black_box(&*v);
 }
 
 #[cfg(test)]

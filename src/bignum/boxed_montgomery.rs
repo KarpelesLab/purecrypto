@@ -14,17 +14,13 @@ use alloc::vec::Vec;
 
 /// Best-effort wipe of a secret-dependent `Vec<Limb>` scratch buffer.
 ///
-/// Mirrors the `core::hint::black_box`-guarded zeroing used by
-/// [`BoxedUint::zeroize`](super::boxed::BoxedUint) and the AEAD/MAC drop paths
-/// in `src/cipher`: the writes are unconditional (no data-dependent branch, so
-/// the constant-time property is preserved) and the `black_box` fence prevents
-/// LLVM from eliding them as a dead store.
+/// Mirrors [`BoxedUint::zeroize`](super::boxed::BoxedUint): the writes are
+/// unconditional (no data-dependent branch, so the constant-time property is
+/// preserved) and [`crate::zeroize::Zeroize`]'s volatile stores plus compiler
+/// fence keep LLVM from eliding them as dead stores.
 #[inline]
 fn zeroize_limbs(v: &mut [Limb]) {
-    for limb in v.iter_mut() {
-        *limb = 0;
-    }
-    let _ = core::hint::black_box(&v);
+    crate::zeroize::Zeroize::zeroize(v);
 }
 
 /// `(a + b) mod n` for equal-length `a, b < n`.
@@ -75,10 +71,11 @@ impl Drop for BoxedMontModulus {
     fn drop(&mut self) {
         zeroize_limbs(&mut self.n);
         zeroize_limbs(&mut self.r2);
-        self.n_prime = 0;
-        let _ = core::hint::black_box(&self.n_prime);
+        crate::zeroize::Zeroize::zeroize(&mut self.n_prime);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for BoxedMontModulus {}
 
 impl BoxedMontModulus {
     /// Builds parameters for an odd `modulus`.

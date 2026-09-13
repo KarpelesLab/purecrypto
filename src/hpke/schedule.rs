@@ -131,12 +131,9 @@ fn key_schedule(
 
     // Wipe the `secret` PRK intermediate before it goes out of scope — it is
     // the extract-stage secret all three outputs are expanded from, so it is
-    // as sensitive as the key itself. Same `core::hint::black_box`-guarded
-    // zeroing the rest of the crate uses for secret intermediates.
-    for b in secret.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&secret);
+    // as sensitive as the key itself. Uses the crate's volatile
+    // `zeroize` stores, which the optimizer may not elide.
+    super::wipe(&mut secret);
 
     Ok((key, base_nonce, exporter_secret))
 }
@@ -242,22 +239,14 @@ impl Drop for SenderContext {
     fn drop(&mut self) {
         // Best-effort wipe of the key-schedule secrets (the AEAD key, the
         // base nonce, and the exporter secret) before their heap buffers are
-        // freed. Same `core::hint::black_box`-guarded zeroing the rest of the
-        // crate uses for secret material.
-        for b in self.key.iter_mut() {
-            *b = 0;
-        }
-        for b in self.base_nonce.iter_mut() {
-            *b = 0;
-        }
-        for b in self.exporter_secret.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.key);
-        let _ = core::hint::black_box(&self.base_nonce);
-        let _ = core::hint::black_box(&self.exporter_secret);
+        // freed, with the crate's volatile `zeroize` stores.
+        super::wipe(&mut self.key);
+        super::wipe(&mut self.base_nonce);
+        super::wipe(&mut self.exporter_secret);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for SenderContext {}
 
 impl ReceiverContext {
     pub(super) fn new(
@@ -310,20 +299,13 @@ impl Drop for ReceiverContext {
     fn drop(&mut self) {
         // Best-effort wipe of the key-schedule secrets — symmetric to
         // [`SenderContext`]'s `Drop`.
-        for b in self.key.iter_mut() {
-            *b = 0;
-        }
-        for b in self.base_nonce.iter_mut() {
-            *b = 0;
-        }
-        for b in self.exporter_secret.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.key);
-        let _ = core::hint::black_box(&self.base_nonce);
-        let _ = core::hint::black_box(&self.exporter_secret);
+        super::wipe(&mut self.key);
+        super::wipe(&mut self.base_nonce);
+        super::wipe(&mut self.exporter_secret);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for ReceiverContext {}
 
 /// Shared `Export` implementation (RFC 9180 §5.3): a single
 /// `LabeledExpand` from this context's `exporter_secret`.

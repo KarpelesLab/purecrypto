@@ -25,6 +25,7 @@ use alloc::vec::Vec;
 
 use crate::cipher::blowfish::Blowfish;
 use crate::hash::{Digest, Sha512};
+use crate::zeroize::Zeroize;
 
 /// Maximum permitted output length, mirroring OpenSSH's cap.
 const MAX_KEYLEN: usize = 1024;
@@ -190,14 +191,9 @@ fn bcrypt_hash(sha2pass: &[u8; 64], sha2salt: &[u8; 64]) -> [u8; BCRYPT_HASHSIZE
 
     // The expanded Blowfish key schedule and the enciphered state words are
     // both password-derived; wipe them before they go out of scope.
-    state.p.iter_mut().for_each(|w| *w = 0);
-    for sbox in state.s.iter_mut() {
-        sbox.iter_mut().for_each(|w| *w = 0);
-    }
-    let _ = core::hint::black_box(&state.p);
-    let _ = core::hint::black_box(&state.s);
-    cdata.iter_mut().for_each(|w| *w = 0);
-    let _ = core::hint::black_box(&cdata);
+    Zeroize::zeroize(&mut state.p);
+    Zeroize::zeroize(&mut state.s);
+    Zeroize::zeroize(&mut cdata);
 
     out
 }

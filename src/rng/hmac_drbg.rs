@@ -194,18 +194,15 @@ impl<D: Digest> HmacDrbg<D> {
 impl<D: Digest> Drop for HmacDrbg<D> {
     fn drop(&mut self) {
         // Wipe the secret HMAC key and chaining value so they do not linger
-        // in freed memory. Mirrors the `black_box`-fenced overwrite used by
-        // `HmacPrf` in `kdf::kbkdf`.
-        for b in self.k.as_mut() {
-            *b = 0;
-        }
-        for b in self.v.as_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(self.k.as_ref());
-        let _ = core::hint::black_box(self.v.as_ref());
+        // in freed memory, with the volatile stores in `crate::zeroize`
+        // (which LLVM may not elide), as `HmacPrf` in `kdf::kbkdf` does.
+        use crate::zeroize::Zeroize;
+        self.k.as_mut().zeroize();
+        self.v.as_mut().zeroize();
     }
 }
+
+impl<D: Digest> crate::zeroize::ZeroizeOnDrop for HmacDrbg<D> {}
 
 impl<D: Digest> RngCore for HmacDrbg<D> {
     #[inline]

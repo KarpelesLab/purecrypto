@@ -163,11 +163,9 @@ fn derive_with<D: Digest>(
         }
     }
 
-    // Best-effort wipe of the working buffer (holds password-derived state).
-    for byte in i_buf.iter_mut() {
-        *byte = 0;
-    }
-    let _ = core::hint::black_box(&i_buf);
+    // Best-effort wipe of the working buffer (holds password-derived state),
+    // with volatile stores the optimizer may not elide.
+    crate::zeroize::Zeroize::zeroize(&mut i_buf);
 }
 
 /// Pads `data` by repeating it (truncating the last copy) to the smallest

@@ -120,24 +120,20 @@ impl Drop for BoxedRsaPrivateKey {
         // Best-effort wipe of every secret-bearing field. `n`, `e`, `mont`,
         // and `k` are public; `d`, `p`, `q`, `phi_n_minus_1`, and the
         // HMAC-SHA256 blinding seed all leak information about the secret
-        // key and must be cleared. The `black_box` barrier inside
-        // `BoxedUint::zeroize` keeps LLVM from eliding the writes.
+        // key and must be cleared. The volatile stores inside
+        // `BoxedUint::zeroize` keep LLVM from eliding the writes.
         self.d.zeroize();
         self.p.zeroize();
         self.q.zeroize();
         if let Some(phi) = self.phi_n_minus_1.as_mut() {
             phi.zeroize();
         }
-        for b in self.blinding_seed.iter_mut() {
-            *b = 0;
-        }
-        for b in self.blind_salt.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.blinding_seed);
-        let _ = core::hint::black_box(&self.blind_salt);
+        crate::zeroize::Zeroize::zeroize(&mut self.blinding_seed);
+        crate::zeroize::Zeroize::zeroize(&mut self.blind_salt);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for BoxedRsaPrivateKey {}
 
 /// Computes `phi(n) − 1` from the primes (if both are nonzero) and the
 /// blinding HMAC key (always).

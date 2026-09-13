@@ -29,6 +29,7 @@ mod sample;
 use alloc::vec::Vec;
 
 use crate::rng::{CryptoRng, RngCore};
+use crate::zeroize::Zeroize;
 use encode::*;
 use field::{D, N, Poly, ntt_mul, sub};
 use reduce::{
@@ -306,15 +307,13 @@ fn count_ones(v: &[Poly]) -> usize {
 }
 
 /// Zeroizes the coefficient memory of every polynomial in `v` before it
-/// drops; `black_box` keeps the writes from being eliminated as dead stores
-/// (same wipe pattern as the byte-buffer epilogues in this module).
+/// drops, through [`crate::zeroize::Zeroize`]: volatile stores plus a
+/// compiler fence, so the writes cannot be eliminated as dead stores (same
+/// wipe pattern as the byte-buffer epilogues in this module).
 fn wipe_polys(v: &mut [Poly]) {
     for poly in v.iter_mut() {
-        for c in poly.c.iter_mut() {
-            *c = 0;
-        }
+        Zeroize::zeroize(&mut poly.c);
     }
-    let _ = core::hint::black_box(&*v);
 }
 
 /// Samples the public matrix `Â` (NTT domain) from `rho`.
@@ -431,13 +430,9 @@ pub(crate) fn keygen<const K: usize, const L: usize>(
     }
     debug_assert_eq!(skc.done(), p.privkey);
     // Wipe the expanded seed material (rho' and the signing key K live in
-    // here) before it drops; `black_box` keeps the writes from being
-    // eliminated as dead stores. Same for the unpacked secret vectors
+    // here) before it drops. Same for the unpacked secret vectors
     // s1 / s2 / t0 and the NTT copy of s1 (t1 is the public key).
-    for b in expanded.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&expanded);
+    Zeroize::zeroize(&mut expanded);
     wipe_polys(&mut s1);
     wipe_polys(&mut s1_ntt);
     wipe_polys(&mut s2);
@@ -628,12 +623,9 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     // carries a copy of it), the unpacked secret vectors s1 / s2 / t0 and
     // their NTT copies, the accepted candidate's mask vectors y / y_ntt, and
     // the secret-derived w / r0 / ct0. mu, w1, c, ctilde, hints and z are
-    // public or part of the signature. `black_box` keeps the writes from
-    // being eliminated as dead stores.
-    for b in rho_prime.iter_mut().chain(seed_buf.iter_mut()) {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&rho_prime, &seed_buf));
+    // public or part of the signature.
+    Zeroize::zeroize(&mut rho_prime);
+    Zeroize::zeroize(&mut seed_buf);
     wipe_polys(&mut s1);
     wipe_polys(&mut s1_ntt);
     wipe_polys(&mut s2);
@@ -646,11 +638,8 @@ pub(crate) fn sign_internal<const K: usize, const L: usize>(
     wipe_polys(&mut z);
     wipe_polys(&mut ct0);
     for row in r0.iter_mut() {
-        for c in row.iter_mut() {
-            *c = 0;
-        }
+        Zeroize::zeroize(row);
     }
-    let _ = core::hint::black_box(&r0);
 }
 
 /// ML-DSA.Verify_internal (FIPS 204 Algorithm 8).
@@ -871,12 +860,8 @@ macro_rules! ml_dsa_level {
                 let pair = Self::from_seed(&seed);
                 // The returned key retains its own copy of the seed (zeroized on
                 // drop) so it can be exported in the LAMPS seed-priv PKCS#8 form;
-                // wipe this local copy regardless. `black_box` keeps the writes
-                // from being eliminated as dead stores.
-                for b in seed.iter_mut() {
-                    *b = 0;
-                }
-                let _ = core::hint::black_box(&seed);
+                // wipe this local copy regardless.
+                crate::zeroize::Zeroize::zeroize(&mut seed);
                 pair
             }
 
@@ -1091,23 +1076,16 @@ macro_rules! ml_dsa_level {
         }
 
         // FIPS 204 expects the ML-DSA expanded private key to be wiped
-        // before deallocation. Overwrite the bytes and route them through
-        // `core::hint::black_box` so LLVM cannot eliminate the writes as
-        // dead stores (the alternative is the `zeroize` crate, which
-        // would add a runtime dependency the crate otherwise avoids).
+        // before deallocation. `crate::zeroize::Zeroize` overwrites the
+        // bytes with volatile stores plus a compiler fence, so LLVM cannot
+        // eliminate the writes as dead stores.
         impl Drop for $sk {
             fn drop(&mut self) {
-                for b in self.0.iter_mut() {
-                    *b = 0;
-                }
-                let _ = core::hint::black_box(&self.0);
+                crate::zeroize::Zeroize::zeroize(&mut self.0);
                 // The retained generation seed reconstructs the whole key, so it
                 // is just as sensitive — wipe it too.
                 if let Some(seed) = &mut self.1 {
-                    for b in seed.iter_mut() {
-                        *b = 0;
-                    }
-                    let _ = core::hint::black_box(&seed);
+                    crate::zeroize::Zeroize::zeroize(seed);
                 }
             }
         }

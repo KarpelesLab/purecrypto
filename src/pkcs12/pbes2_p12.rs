@@ -157,10 +157,7 @@ pub(super) fn decrypt(
     }
 
     let result = decrypt_cipher(cipher, &key, &iv, ciphertext);
-    for b in key.iter_mut() {
-        *b = 0;
-    }
-    let _ = core::hint::black_box(&key);
+    crate::zeroize::Zeroize::zeroize(&mut key);
     result
 }
 

@@ -230,8 +230,9 @@ pub fn argon2(
     // Wipe the password-derived working buffers before they drop. There are no
     // early returns past the `mem` allocation above, so this single pass covers
     // every non-panic exit; `black_box` keeps the writes from being elided.
-    // (A plain store loop rather than `wipe`: the matrix is up to gigabytes and
-    // the volatile per-byte stores of `wipe` would not vectorize.)
+    // (A plain store loop rather than `wipe`/`crate::zeroize::Zeroize`: the
+    // matrix is up to gigabytes and the volatile per-byte stores would not
+    // vectorize.)
     c.iter_mut().for_each(|b| *b = 0);
     mem.iter_mut().for_each(|b| *b = 0);
     let _ = core::hint::black_box(&c);

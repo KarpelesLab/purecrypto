@@ -113,15 +113,14 @@ impl SharedSecret {
 impl Drop for SharedSecret {
     fn drop(&mut self) {
         // Best-effort wipe of the raw finite-field shared secret before its
-        // heap buffer is freed. Same `core::hint::black_box`-guarded zeroing
-        // the rest of the crate uses (e.g. `cipher/cfb.rs`), mirroring the
-        // explicit wipe `DhPrivateKey::drop` performs on the exponent `x`.
-        for b in self.bytes.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.bytes);
+        // heap buffer is freed, with the volatile stores the rest of the
+        // crate uses, mirroring the explicit wipe `DhPrivateKey::drop`
+        // performs on the exponent `x`. Wipes the spare capacity too.
+        crate::zeroize::Zeroize::zeroize(&mut self.bytes);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for SharedSecret {}
 
 impl DhPrivateKey {
     /// Generates a fresh private exponent of `group.priv_bits()` bits.

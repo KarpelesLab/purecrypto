@@ -7,6 +7,7 @@
 use super::encode::{unpack_z17, unpack_z19};
 use super::field::{N, Poly, Q, sub};
 use crate::hash::{ExtendableOutput, Shake128, Shake256, XofReader};
+use crate::zeroize::Zeroize;
 
 /// The SHAKE128 rate — the matrix-XOF squeeze block (a multiple of 3).
 const NTT_XOF_BLOCK: usize = 168;
@@ -292,15 +293,9 @@ fn expand_mask_xn<const L: usize>(
     // Wipe everything derived from the secret rho'': the XOF inputs, the
     // sponge states, and the raw packed-mask buffers.
     x4.zeroize();
-    for b in msgs
-        .iter_mut()
-        .flatten()
-        .chain(bufs.iter_mut().flatten())
-        .chain(blocks.iter_mut().flatten())
-    {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&msgs, &bufs, &blocks));
+    Zeroize::zeroize(&mut msgs);
+    Zeroize::zeroize(&mut bufs);
+    Zeroize::zeroize(&mut blocks);
     out
 }
 

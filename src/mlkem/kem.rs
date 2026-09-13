@@ -7,6 +7,7 @@
 use super::indcpa::{self, POLYBYTES, du_bytes, dv_bytes};
 use crate::ct::{ConditionallySelectable, ConstantTimeEq};
 use crate::hash::{ExtendableOutput, Shake256, XofReader, sha3_256, sha3_512};
+use crate::zeroize::Zeroize;
 
 /// Encapsulation-key bytes = K-PKE encryption key.
 pub(crate) const fn ek_bytes(k: usize) -> usize {
@@ -79,12 +80,10 @@ pub(crate) fn encaps<
     // Wipe the transient secrets (the G input containing `m`, the G output
     // containing both the shared secret and the coins, and the coins copy)
     // before they drop — same hygiene as `decaps`. `shared` is the caller's
-    // return value; `black_box` keeps the writes from being eliminated as
-    // dead stores.
-    for b in g_in.iter_mut().chain(g.iter_mut()).chain(r.iter_mut()) {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&g_in, &g, &r));
+    // return value.
+    Zeroize::zeroize(&mut g_in);
+    Zeroize::zeroize(&mut g);
+    Zeroize::zeroize(&mut r);
     shared
 }
 
@@ -145,18 +144,13 @@ pub(crate) fn decaps<
     // key/coins derived from it, the implicit-rejection secret K̄ — `out`
     // already holds its own copy — and the re-encryption buffer, which on the
     // reject path is a deterministic function of the secret m') before they
-    // drop; `black_box` keeps the writes from being eliminated as dead stores.
-    for b in m_prime
-        .iter_mut()
-        .chain(g_in.iter_mut())
-        .chain(g.iter_mut())
-        .chain(k_prime.iter_mut())
-        .chain(r_prime.iter_mut())
-        .chain(k_bar.iter_mut())
-        .chain(ct_cmp.iter_mut())
-    {
-        *b = 0;
-    }
-    let _ = core::hint::black_box((&m_prime, &g_in, &g, &k_prime, &r_prime, &k_bar, &ct_cmp));
+    // drop.
+    Zeroize::zeroize(&mut m_prime);
+    Zeroize::zeroize(&mut g_in);
+    Zeroize::zeroize(&mut g);
+    Zeroize::zeroize(&mut k_prime);
+    Zeroize::zeroize(&mut r_prime);
+    Zeroize::zeroize(&mut k_bar);
+    Zeroize::zeroize(&mut ct_cmp);
     out
 }

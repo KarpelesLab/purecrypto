@@ -352,8 +352,7 @@ impl<const LIMBS: usize> super::emsa::RawPrivate for RsaPrivateKey<LIMBS> {
         out.write_be_bytes(buf);
         // `out` is the raw private-op result (decrypted EM / signature
         // representative) on the stack: wipe it before the frame is reused.
-        out = Uint::ZERO;
-        let _ = core::hint::black_box(&out);
+        crate::zeroize::Zeroize::zeroize(&mut out);
     }
     fn secret_seed(&self) -> [u8; 32] {
         self.blinding_seed
@@ -391,29 +390,21 @@ impl<const LIMBS: usize> KeyScratch<LIMBS> {
 // blinding `phi_n_minus_1`, and the HMAC seed all live in fixed-size
 // stack arrays that would otherwise be returned to the allocator (or the
 // stack frame, for stack-allocated keys) with the secret bytes intact.
-// Overwrite the limbs and route the read through `core::hint::black_box`
-// so LLVM cannot eliminate the writes as dead stores (same pattern as
-// ML-DSA/ML-KEM in `src/mldsa/mod.rs` and `src/mlkem/mod.rs`).
+// `crate::zeroize::Zeroize` overwrites them with volatile stores plus a
+// compiler fence, so LLVM cannot eliminate the writes as dead stores.
 impl<const LIMBS: usize> Drop for RsaPrivateKey<LIMBS> {
     fn drop(&mut self) {
-        self.d = Uint::ZERO;
-        self.p = Uint::ZERO;
-        self.q = Uint::ZERO;
-        self.phi_n_minus_1 = Uint::ZERO;
-        for b in self.blinding_seed.iter_mut() {
-            *b = 0;
-        }
-        for b in self.blind_salt.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.blind_salt);
-        let _ = core::hint::black_box(&self.d);
-        let _ = core::hint::black_box(&self.p);
-        let _ = core::hint::black_box(&self.q);
-        let _ = core::hint::black_box(&self.phi_n_minus_1);
-        let _ = core::hint::black_box(&self.blinding_seed);
+        use crate::zeroize::Zeroize;
+        self.d.zeroize();
+        self.p.zeroize();
+        self.q.zeroize();
+        self.phi_n_minus_1.zeroize();
+        self.blinding_seed.zeroize();
+        self.blind_salt.zeroize();
     }
 }
+
+impl<const LIMBS: usize> crate::zeroize::ZeroizeOnDrop for RsaPrivateKey<LIMBS> {}
 
 impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
     /// Generates an RSA key pair with an `LIMBS * 64`-bit modulus and the given

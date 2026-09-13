@@ -130,10 +130,8 @@ macro_rules! ml_kem_set {
                 // The returned key retains its own copy of `d‖z` (zeroized on
                 // drop) so it can be exported in the LAMPS seed-priv PKCS#8 form;
                 // wipe these local copies regardless.
-                for b in d.iter_mut().chain(z.iter_mut()) {
-                    *b = 0;
-                }
-                let _ = core::hint::black_box((&d, &z));
+                crate::zeroize::Zeroize::zeroize(&mut d);
+                crate::zeroize::Zeroize::zeroize(&mut z);
                 pair
             }
 
@@ -211,23 +209,16 @@ macro_rules! ml_kem_set {
         }
 
         // FIPS 203 §3.3 mandates that decapsulation-key material be
-        // zeroed before deallocation. We avoid pulling in the `zeroize`
-        // crate by overwriting the bytes and routing them through
-        // `core::hint::black_box`, which prevents LLVM from eliminating
-        // the writes as dead stores.
+        // zeroed before deallocation. `crate::zeroize::Zeroize` overwrites
+        // the bytes with volatile stores plus a compiler fence, which the
+        // optimizer may not eliminate as dead stores.
         impl Drop for $dk_name {
             fn drop(&mut self) {
-                for b in self.0.iter_mut() {
-                    *b = 0;
-                }
-                let _ = core::hint::black_box(&self.0);
+                crate::zeroize::Zeroize::zeroize(&mut self.0);
                 // The retained seed `d‖z` reconstructs the whole key, so it is
                 // just as sensitive — wipe it too.
                 if let Some(seed) = &mut self.1 {
-                    for b in seed.iter_mut() {
-                        *b = 0;
-                    }
-                    let _ = core::hint::black_box(&seed);
+                    crate::zeroize::Zeroize::zeroize(seed);
                 }
             }
         }
@@ -254,10 +245,7 @@ macro_rules! ml_kem_set {
                 let out = self.encapsulate_deterministic(&m);
                 // `m` (with the public `H(ek)`) fully determines the shared
                 // secret; wipe it before it drops, mirroring `generate`.
-                for b in m.iter_mut() {
-                    *b = 0;
-                }
-                let _ = core::hint::black_box(&m);
+                crate::zeroize::Zeroize::zeroize(&mut m);
                 out
             }
 

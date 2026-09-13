@@ -1154,10 +1154,7 @@ mod fors_x4 {
         // (second pass); `nodes` was overwritten in place with the public
         // leaves. Wipe the blocks and the compression states.
         super::wipe(blocks.as_flattened_mut());
-        for w in st.as_flattened_mut() {
-            *w = 0;
-        }
-        let _ = core::hint::black_box(&st);
+        crate::zeroize::Zeroize::zeroize(st.as_flattened_mut());
         nodes
     }
 
@@ -1814,12 +1811,8 @@ impl PrivateKey {
         rng.fill_bytes(&mut seeds[..3 * n]);
         let keys = Self::from_seeds(set, &seeds[..n], &seeds[n..2 * n], &seeds[2 * n..3 * n]);
         // Wipe the stack copy of SK.seed / SK.prf / PK.seed before
-        // returning; `black_box` keeps the writes from being eliminated
-        // as dead stores.
-        for b in seeds.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&seeds);
+        // returning.
+        wipe(&mut seeds);
         keys
     }
 
@@ -2041,18 +2034,16 @@ impl PrivateKey {
 }
 
 // FIPS 205 expects the SLH-DSA private key (`SK.seed ‖ SK.prf ‖
-// PK.seed ‖ PK.root`) to be wiped before deallocation. Overwrite the
-// bytes and pass them through `core::hint::black_box` so LLVM cannot
-// eliminate the writes as dead stores. We avoid adding the `zeroize`
-// crate as a dependency.
+// PK.seed ‖ PK.root`) to be wiped before deallocation. `wipe` uses the
+// crate's volatile [`zeroize`](crate::zeroize) stores, which LLVM cannot
+// eliminate as dead stores.
 impl Drop for PrivateKey {
     fn drop(&mut self) {
-        for b in self.bytes.iter_mut() {
-            *b = 0;
-        }
-        let _ = core::hint::black_box(&self.bytes);
+        wipe(&mut self.bytes);
     }
 }
+
+impl crate::zeroize::ZeroizeOnDrop for PrivateKey {}
 
 impl ParamSet {
     /// Finds the parameter set matching an algorithm OID, if any.
