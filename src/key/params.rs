@@ -51,6 +51,7 @@ pub use crate::hash::HashAlgorithm as Hash;
 ///
 /// The expansion `return`s on the unsupported arm, so every use must sit in a
 /// function returning `Result<_, crate::key::Error>`.
+#[cfg(any(feature = "ec", feature = "rsa"))]
 macro_rules! dispatch_key_hash {
     ($h:expr, |$d:ident| $body:block) => {
         match $h {
@@ -81,6 +82,7 @@ macro_rules! dispatch_key_hash {
     };
 }
 
+#[cfg(any(feature = "ec", feature = "rsa"))]
 pub(crate) use dispatch_key_hash;
 
 /// RSA signature padding scheme.

@@ -84,7 +84,9 @@ pub use params::{
     RsaSigPadding, SaltLen, SigEncoding, SignParams, SignParamsReader,
 };
 // The shared runtime-hash -> concrete-digest bridge for the per-algorithm
-// facade impls (`rsa::key_impl`, `ec::key_impl`).
+// facade impls (`rsa::key_impl`, `ec::key_impl`) — and so only compiled when
+// at least one of those exists.
+#[cfg(any(feature = "ec", feature = "rsa"))]
 pub(crate) use params::dispatch_key_hash;
 pub use secret::Secret;
 
