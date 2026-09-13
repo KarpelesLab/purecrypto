@@ -427,6 +427,11 @@ enum PayloadScope {
     /// RFC 9000 §9.1 / §21.5.3: the destination address has not been
     /// validated, so only probing frames may be sent to it (H-4).
     ProbingOnly,
+    /// RFC 9001 §4.6.1 / §5.7: this is a server writing 0.5-RTT data to a
+    /// client it has required a certificate from and not yet authenticated.
+    /// Acknowledgements and path validation may go out; application data
+    /// may not, until the client's Finished proves who it is.
+    NoApplicationData,
 }
 
 /// RFC 9000 §20.1 — `APPLICATION_ERROR`, the transport error code used when an
@@ -822,6 +827,11 @@ pub struct QuicConnection {
     /// parameters, so the engine must not re-derive it when the handshake
     /// CID turns out to be the Retry SCID (L-8).
     reset_token_pinned: bool,
+    /// Server-only — the TLS config requires a client certificate, so this
+    /// connection's peer is unauthenticated until the handshake completes
+    /// and no application data may be written to it in the meantime
+    /// (0.5-RTT, RFC 9001 §4.6.1).
+    require_client_auth: bool,
 }
 
 enum EngineSide {
@@ -1020,6 +1030,7 @@ impl QuicConnection {
             rx_packet_authenticated: false,
             pending_error_code: None,
             reset_token_pinned: false,
+            require_client_auth: false,
         };
 
         // RFC 9001 §4.6.1 — with 0-RTT in play the client must apply the
@@ -1077,6 +1088,9 @@ impl QuicConnection {
         let pending_scid = crate::quic::server::random_default_scid();
         let mut params = cfg.transport_params.clone();
         let reset_token_pinned = params.stateless_reset_token.is_some();
+        // RFC 9001 §4.6.1 — a server that requires a client certificate must
+        // hold back 0.5-RTT application data (see `build_packet_with_pad`).
+        let require_client_auth = cfg.tls.client_auth.as_ref().is_some_and(|ca| ca.required);
         // Advertise a derivable seq-0 reset token unless the caller pinned one.
         if params.stateless_reset_token.is_none() {
             params.stateless_reset_token = Some(crate::quic::reset::stateless_reset_token(
@@ -1147,6 +1161,7 @@ impl QuicConnection {
             rx_packet_authenticated: false,
             pending_error_code: None,
             reset_token_pinned,
+            require_client_auth,
         })
     }
 
@@ -5521,9 +5536,21 @@ impl QuicConnection {
         // with `bytes_in_flight >= cwnd`; each ack-eliciting one spends a
         // credit, so the bypass is worth exactly the §6.2.4 probe count.
         let probing = matches!(level, Level::OneRtt) && self.endpoint.loss.probe_credit() > 0;
+        // RFC 9001 §4.6.1: 0.5-RTT data — what a server may send between its
+        // own Finished and the client's — goes to a peer that has not
+        // authenticated. That is fine for a server that asked for no
+        // certificate, but when one is *required* the application's data must
+        // not reach the client until the handshake completes (the receive
+        // side is gated in `feed_short_header_packet`).
+        let unauthenticated_peer = self.role == Role::Server
+            && !self.handshake_complete
+            && self.require_client_auth
+            && matches!(level, Level::OneRtt | Level::EarlyData);
         let scope =
             if self.role == Role::Client && self.migration.is_some() && !self.peer_addr_validated {
                 PayloadScope::ProbingOnly
+            } else if unauthenticated_peer {
+                PayloadScope::NoApplicationData
             } else if matches!(level, Level::OneRtt) && !probing && !self.endpoint.cc.can_send() {
                 PayloadScope::NotCongestionControlled
             } else {
@@ -12392,6 +12419,106 @@ mod tests {
         assert!(
             !server.pop_datagram().is_empty(),
             "the client is told why with a CONNECTION_CLOSE"
+        );
+    }
+
+    /// RFC 9001 §4.6.1 — 0.5-RTT data goes to a peer that has not yet
+    /// authenticated. A server that *requires* a client certificate must
+    /// therefore hold application data back until the handshake completes,
+    /// rather than hand it to whoever opened the connection.
+    #[test]
+    fn server_holds_back_05rtt_data_when_a_client_certificate_is_required() {
+        let (mut server_tls, cert_der) = ed25519_server();
+        let mut ca_roots = RootCertStore::new();
+        ca_roots.add_der(cert_der.clone()).unwrap();
+        server_tls.client_auth = Some(crate::tls::ClientAuth {
+            roots: ca_roots,
+            required: true,
+        });
+        let mut roots = RootCertStore::new();
+        roots.add_der(cert_der).unwrap();
+        let client_cfg = Config {
+            roots,
+            alpn_protocols: alloc::vec![b"test".to_vec()],
+            max_version: crate::tls::ProtocolVersion::TLSv1_3,
+            min_version: crate::tls::ProtocolVersion::TLSv1_3,
+            ..Config::default()
+        };
+        let mut client = QuicConnection::client(
+            QuicConfig {
+                tls: client_cfg,
+                transport_params: loopback_params(),
+                ..QuicConfig::default()
+            },
+            "loopback.example",
+        )
+        .expect("client build");
+        let mut server = QuicConnection::server(QuicConfig {
+            tls: server_tls,
+            transport_params: loopback_params(),
+            ..QuicConfig::default()
+        })
+        .expect("server build");
+
+        loop {
+            let dg = client.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            server.feed_datagram(&dg).expect("server feed CH");
+        }
+        // The server has 1-RTT write keys now, and the application writes.
+        assert!(!server.is_handshake_complete());
+        let sid = server.open_uni().expect("open uni");
+        server.write(sid, &[0x41u8; 300]).expect("write");
+        // Its flight must carry the handshake and nothing else.
+        let mut flight = Vec::new();
+        loop {
+            let dg = server.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            flight.push(dg);
+        }
+        assert!(!flight.is_empty(), "the server still sends its handshake");
+        for dg in &flight {
+            let (_long, short) = split_long_and_short(dg);
+            assert!(
+                short.len() < 200,
+                "no 0.5-RTT application data to an unauthenticated client"
+            );
+        }
+        assert!(
+            !server.has_unacked_streams(),
+            "the stream data is still queued, not sent"
+        );
+
+        // Control: a server that does NOT require a certificate may still
+        // use 0.5-RTT, so the gate above is about authentication and not
+        // about 1-RTT keys being unavailable.
+        let (mut c2, mut s2) = loopback_pair();
+        loop {
+            let dg = c2.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            s2.feed_datagram(&dg).expect("server feed CH");
+        }
+        assert!(!s2.is_handshake_complete());
+        let sid = s2.open_uni().expect("open uni");
+        s2.write(sid, &[0x41u8; 300]).expect("write");
+        let mut saw_app_data = false;
+        loop {
+            let dg = s2.pop_datagram();
+            if dg.is_empty() {
+                break;
+            }
+            let (_long, short) = split_long_and_short(&dg);
+            saw_app_data |= short.len() >= 200;
+        }
+        assert!(
+            saw_app_data,
+            "0.5-RTT is permitted when no client certificate is required"
         );
     }
 
