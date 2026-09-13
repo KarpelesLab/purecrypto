@@ -535,6 +535,15 @@ impl ServerConfig {
     /// point the nonce-collision probability reaches 2^-32). The ticket
     /// records whether the issuing handshake authenticated the client;
     /// see [`Self::with_client_auth`].
+    ///
+    /// The effective sealing key is additionally bound to this listener's
+    /// client-auth trust configuration, so two listeners sharing a ticket key
+    /// but trusting different client CAs cannot resume each other's sessions.
+    ///
+    /// A clock is required: tickets carry a creation timestamp and are
+    /// expired against it, so if neither [`Self::with_verification_time`] nor
+    /// a system clock (`std`) is available, no ticket is issued and none is
+    /// accepted — a ticket that can never expire is a permanent bearer token.
     pub fn with_ticket_key(mut self, key: [u8; 32]) -> Self {
         self.ticket_key = Some(key);
         self
@@ -3010,7 +3019,9 @@ impl<R: RngCore> ServerConnection<R> {
         // Issue one NewSessionTicket if a ticket key is configured. We do
         // this immediately on transition to Connected so the ticket rides
         // out in the same write_tls() drain as our Finished's responses.
-        if self.config.ticket_key.is_some() {
+        // A ticket we cannot expire (no clock configured) is a permanent
+        // bearer token, so `tickets_available()` also gates on the clock.
+        if self.tickets_available() {
             self.pending_nst = true;
             self.emit_session_ticket()?;
         }
@@ -3025,7 +3036,16 @@ impl<R: RngCore> ServerConnection<R> {
         if !self.pending_nst {
             return Ok(());
         }
-        let key = self.config.ticket_key.expect("ticket key present");
+        // Bound to this listener's client-auth trust configuration, so the
+        // ticket can only be resumed by a listener with the same roots.
+        let key = crate::zeroize::Zeroizing::new(
+            self.ticket_seal_key().ok_or(Error::InappropriateState)?,
+        );
+        // We never issue a ticket we cannot expire (see `ticket_now`).
+        let Some(creation) = self.ticket_now() else {
+            self.pending_nst = false;
+            return Ok(());
+        };
         let suite = self.suite.expect("suite set");
 
         // resumption_master_secret over Hash(CH..client Finished); set on
@@ -3053,7 +3073,6 @@ impl<R: RngCore> ServerConnection<R> {
         // client so a resumed connection can (a) prove it was client-
         // authenticated to an mTLS-required listener and (b) restore
         // `peer_certificates()`.
-        let creation = system_now_u64();
         let alpn = self.alpn_negotiated.as_ref();
         let alpn_len = alpn.map(|a| a.len()).unwrap_or(0) as u8;
         let client_leaf = self.client_cert_chain.first();
@@ -3164,23 +3183,6 @@ fn parse_certificate_list(body: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     Ok(certs)
 }
 
-/// Current wall-clock time as a Unix timestamp, when the `std` feature is
-/// available; otherwise zero (ticket timestamps degrade gracefully but
-/// `with_ticket_key` is typically server-side `std` anyway).
-#[cfg(feature = "std")]
-fn system_now_u64() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-#[cfg(not(feature = "std"))]
-fn system_now_u64() -> u64 {
-    0
-}
-
 /// The system clock as an [`crate::x509::Time`] when available; `None` for
 /// `no_std`. Used as the default verification time for client-cert validity
 /// checks under mTLS.
@@ -3246,6 +3248,62 @@ struct AcceptedPsk {
 const MAX_TICKET_AGE_DEVIATION_MS: u64 = 10_000;
 
 impl<R: RngCore> ServerConnection<R> {
+    /// The clock this engine uses for session tickets: the configured
+    /// [`ServerConfig::with_verification_time`] when set, else the system
+    /// clock. `None` when neither is available (a `no_std` build without an
+    /// explicit verification time) — tickets are then disabled outright
+    /// rather than issued with a `creation_time` of 0, which could never
+    /// expire and would turn every ticket into a permanent bearer token.
+    fn ticket_now(&self) -> Option<u64> {
+        self.config
+            .verification_time
+            .clone()
+            .or_else(system_now)
+            .and_then(|t| t.to_unix_checked())
+            .filter(|t| *t != 0)
+    }
+
+    /// Whether this engine can issue / accept RFC 8446 §4.6.1 tickets: a key
+    /// must be configured *and* a clock must be available to bound their
+    /// lifetime.
+    fn tickets_available(&self) -> bool {
+        self.config.ticket_key.is_some() && self.ticket_now().is_some()
+    }
+
+    /// The effective ticket-sealing key: the configured `ticket_key` bound to
+    /// this listener's client-auth trust configuration (present/absent, the
+    /// `required` flag, and every trust anchor's subject + SPKI).
+    ///
+    /// Two listeners that share a `ticket_key` but trust different client
+    /// roots therefore derive different sealing keys, so a ticket minted by
+    /// one simply fails to open at the other and the handshake falls back to
+    /// a full one. Without this binding a ticket that records "the client was
+    /// authenticated" is honoured by any listener holding the key, no matter
+    /// whose CA signed that client — a cross-listener authentication bypass.
+    /// Tickets in the pre-binding format likewise fail to open (never fail
+    /// open) and fall back to a full handshake.
+    fn ticket_seal_key(&self) -> Option<[u8; 32]> {
+        let key = self.config.ticket_key.as_ref()?;
+        let mut mac = Hmac::<Sha256>::new(key);
+        mac.update(b"purecrypto tls13 ticket client-auth binding v1");
+        match self.config.client_auth.as_ref() {
+            None => mac.update(&[0u8]),
+            Some(policy) => {
+                mac.update(&[1u8, u8::from(policy.required)]);
+                for (subject, spki) in policy.roots.anchor_identities() {
+                    mac.update(&(subject.len() as u32).to_be_bytes());
+                    mac.update(subject);
+                    mac.update(&(spki.len() as u32).to_be_bytes());
+                    mac.update(spki);
+                }
+            }
+        }
+        let out = mac.finalize();
+        let mut bound = [0u8; 32];
+        bound.copy_from_slice(out.as_ref());
+        Some(bound)
+    }
+
     /// Tries to accept a `pre_shared_key` offer from the ClientHello.
     ///
     /// Returns:
@@ -3267,9 +3325,19 @@ impl<R: RngCore> ServerConnection<R> {
         raw: &[u8],
         transcript_prefix: &[u8],
     ) -> Result<Option<AcceptedPsk>, Error> {
-        let Some(ticket_key) = self.config.ticket_key.as_ref() else {
+        // No clock ⇒ no way to expire a ticket: refuse to resume rather than
+        // honour a permanent bearer token (see `ticket_now`).
+        let Some(now) = self.ticket_now() else {
             return Ok(None);
         };
+        // Sealed under the key bound to this listener's client-auth trust
+        // configuration, so a ticket minted by a listener with different
+        // client roots simply fails to open (full handshake).
+        let Some(ticket_key) = self.ticket_seal_key() else {
+            return Ok(None);
+        };
+        // Wipe the derived key on every exit path (including the `?`s below).
+        let ticket_key = crate::zeroize::Zeroizing::new(ticket_key);
         let Some(modes_body) = ext::find(&ch.extensions, ExtensionType::PSK_KEY_EXCHANGE_MODES)
         else {
             return Ok(None);
@@ -3284,18 +3352,15 @@ impl<R: RngCore> ServerConnection<R> {
         };
         let (identities, binders) = ext::parse_client_pre_shared_key(psk_body)?;
 
-        // RFC 8446 §4.6.1 + §8.1: enforce ticket expiry on decrypt. We pass
-        // the configured `ticket_lifetime` and the system clock through;
-        // `decrypt_ticket` treats `now_secs == 0` as "no clock — skip the
-        // age check", mirroring the TLS 1.2 `try_resume` behavior so the
-        // no_std build degrades gracefully.
-        let now = system_now_u64();
+        // RFC 8446 §4.6.1 + §8.1: enforce ticket expiry on decrypt. The
+        // clock is guaranteed non-zero here, so the age check is
+        // unconditional — a clock-less build never reaches this point.
         let ticket_lifetime = self.config.ticket_lifetime;
 
         // RFC 8446 §4.2.11: pick the first identity whose ticket decrypts
         // cleanly. Then verify its binder; mismatch is fatal.
         for (idx, (ticket, obfuscated_age)) in identities.iter().enumerate() {
-            let Some(decrypted) = decrypt_ticket(ticket_key, ticket, now, ticket_lifetime) else {
+            let Some(decrypted) = decrypt_ticket(&ticket_key, ticket, now, ticket_lifetime) else {
                 continue;
             };
             // A PSK handshake skips client authentication, so it can only
@@ -3361,12 +3426,9 @@ impl<R: RngCore> ServerConnection<R> {
             // de-obfuscate it and require agreement with our own view
             // (now − issuance) within a small window. A stale or
             // forward-dated report marks the PSK as unfit for 0-RTT —
-            // resumption itself is unaffected. With no wall clock
-            // (`now == 0`, no_std) the check is skipped, matching the
-            // ticket-lifetime fallback above.
-            let age_fresh = if now == 0 {
-                true
-            } else {
+            // resumption itself is unaffected. A clock is guaranteed here
+            // (`ticket_now()` returned `Some`), so the check always runs.
+            let age_fresh = {
                 let client_age_ms = obfuscated_age.wrapping_sub(age_add) as u64;
                 let expected_age_ms = now.saturating_sub(creation_secs).saturating_mul(1000);
                 client_age_ms.abs_diff(expected_age_ms) <= MAX_TICKET_AGE_DEVIATION_MS
@@ -3376,7 +3438,7 @@ impl<R: RngCore> ServerConnection<R> {
                 hash,
                 alpn,
                 age_fresh,
-                age_checked: now != 0,
+                age_checked: true,
                 suite,
                 selected_binder: presented.to_vec(),
                 client_leaf,
@@ -3443,14 +3505,15 @@ struct TicketPlaintext {
 /// described on [`TicketPlaintext`]. Returns `None` on any structural or
 /// authentication failure.
 ///
-/// RFC 8446 §4.6.1 + §8.1: when `now_secs > 0`, the embedded
-/// `creation_unix_time_u64` is enforced against `ticket_lifetime_secs`
-/// (with a ±60 s clock-skew tolerance). A ticket older than
-/// `ticket_lifetime_secs + 60` or minted more than 60 s in the future is
-/// rejected — silent fallback to a fresh 1-RTT handshake, matching the
-/// TLS 1.2 `try_resume` policy. `now_secs == 0` (no clock configured) or
-/// `ticket_lifetime_secs == 0` (lifetime enforcement disabled) skips the
-/// age check.
+/// RFC 8446 §4.6.1 + §8.1: the embedded `creation_unix_time_u64` is enforced
+/// against `ticket_lifetime_secs` (with a ±60 s clock-skew tolerance). A
+/// ticket older than `ticket_lifetime_secs + 60`, one minted more than 60 s
+/// in the future, or one carrying no timestamp at all (`creation_time == 0`)
+/// is rejected — silent fallback to a fresh 1-RTT handshake, matching the
+/// TLS 1.2 `try_resume` policy. Only `ticket_lifetime_secs == 0` (lifetime
+/// enforcement explicitly disabled) skips the age comparison; the caller is
+/// responsible for supplying a real `now_secs` (see
+/// `ServerConnection::ticket_now`).
 fn decrypt_ticket(
     key: &[u8; 32],
     ticket: &[u8],
@@ -3485,11 +3548,17 @@ fn decrypt_ticket(
     } else {
         None
     };
-    // RFC 8446 §4.6.1 + §8.1: enforce ticket age. Skip the check when the
-    // server has no wall clock (`now_secs == 0`, matching the TLS 1.2
-    // fallback in `server12.rs::try_resume`) or when the lifetime is
-    // explicitly zeroed.
-    if now_secs != 0 && ticket_lifetime_secs != 0 {
+    // Every ticket this engine issues carries a real timestamp (we refuse to
+    // issue without a clock), so a zero `creation_time` — what a clock-less
+    // build used to mint, and what could never be expired — is itself a
+    // reason to refuse.
+    if creation_secs == 0 {
+        return None;
+    }
+    // RFC 8446 §4.6.1 + §8.1: enforce ticket age. The caller always supplies
+    // a real clock (`try_accept_psk` bails out without one); the check is
+    // skipped only when the lifetime is explicitly zeroed.
+    if ticket_lifetime_secs != 0 {
         const SKEW_SECS: u64 = 60;
         // Past: now - creation must not exceed lifetime + skew.
         if now_secs.saturating_sub(creation_secs) > ticket_lifetime_secs as u64 + SKEW_SECS {
@@ -3625,6 +3694,11 @@ mod tests {
         );
     }
 
+    /// A fixed wall-clock anchor for the ticket tests: `decrypt_ticket` now
+    /// enforces expiry unconditionally, so the tests pin their own clock
+    /// instead of reading the host's.
+    const TEST_TICKET_NOW: u64 = 1_800_000_000;
+
     /// Build a synthetic ticket whose plaintext header carries `creation_secs`,
     /// a zero `ticket_age_add` and a 32-byte PSK; matches the layout emitted
     /// by `emit_session_ticket`.
@@ -3667,7 +3741,7 @@ mod tests {
     fn ticket_records_issuing_cipher_suite() {
         use crate::cipher::{Aes256, Gcm};
         let key = [0x5au8; 32];
-        let now = super::system_now_u64();
+        let now = TEST_TICKET_NOW;
 
         // Legacy layout: decodes, but carries no suite.
         let legacy = super::decrypt_ticket(&key, &synth_ticket(&key, now, b""), now, 0)
@@ -3707,7 +3781,7 @@ mod tests {
     #[test]
     fn decrypt_ticket_rejects_cross_format_and_legacy_tickets() {
         let key = [0x5au8; 32];
-        let now = super::system_now_u64();
+        let now = TEST_TICKET_NOW;
         assert!(super::decrypt_ticket(&key, &synth_ticket(&key, now, b""), now, 0).is_some());
 
         // Same plaintext, sealed under the TLS 1.2 AAD.
@@ -3745,8 +3819,15 @@ mod tests {
 
         let wire = synth_ticket(&key, creation, b"");
 
-        // Fresh decode (no clock): accepted.
-        assert!(super::decrypt_ticket(&key, &wire, 0, 7200).is_some());
+        // Lifetime enforcement disabled: accepted.
+        assert!(super::decrypt_ticket(&key, &wire, creation, 0).is_some());
+
+        // A ticket carrying no timestamp at all (what a clock-less build used
+        // to mint, and which could never be expired) is refused outright,
+        // even with lifetime enforcement disabled.
+        let timeless = synth_ticket(&key, 0, b"");
+        assert!(super::decrypt_ticket(&key, &timeless, creation, 0).is_none());
+        assert!(super::decrypt_ticket(&key, &timeless, creation, 7200).is_none());
 
         // Within lifetime: accepted.
         assert!(super::decrypt_ticket(&key, &wire, creation + 30, 7200).is_some());
@@ -3821,10 +3902,22 @@ mod tests {
     #[test]
     fn try_accept_psk_keys_replay_on_selected_identity_not_index_zero() {
         let ticket_key = [0xAAu8; 32];
+        let mut cfg = test_server_config();
+        cfg.ticket_key = Some(ticket_key);
+        cfg.verification_time = Some(Time::from_unix(TEST_TICKET_NOW));
+        let server = ServerConnection::new(
+            cfg,
+            ScriptedRng {
+                data: alloc::vec![0u8; 64],
+                pos: 0,
+            },
+        );
+        // Tickets are sealed under the client-auth-bound key, not the raw
+        // configured one.
+        let seal_key = server.ticket_seal_key().expect("ticket key configured");
         // Real ticket at index 1; PSK is the synth_ticket's fixed `[0xAB; 32]`.
-        // Stamp it with the current wall clock (or 0 under no clock) so it is
-        // not rejected as expired against the server's `system_now_u64()`.
-        let real_ticket = synth_ticket(&ticket_key, super::system_now_u64(), b"");
+        // Stamp it with the engine's own clock so it is not rejected as expired.
+        let real_ticket = synth_ticket(&seal_key, TEST_TICKET_NOW, b"");
         let psk = [0xABu8; 32];
         // Junk ticket at index 0: won't decrypt under `ticket_key`, so the
         // selection loop skips it via `continue`.
@@ -3896,16 +3989,6 @@ mod tests {
 
         // Reassemble with the correct real binder (same lengths → same truncation).
         let (raw, ch) = assemble(&junk_binder, &real_binder);
-
-        let mut cfg = test_server_config();
-        cfg.ticket_key = Some(ticket_key);
-        let server = ServerConnection::new(
-            cfg,
-            ScriptedRng {
-                data: alloc::vec![0u8; 64],
-                pos: 0,
-            },
-        );
 
         let accepted = server
             .try_accept_psk(&ch, &raw, &[])
@@ -4225,5 +4308,225 @@ mod tests {
         assert_eq!(s.client_cert_chain.len(), 1);
         assert!(s.client_leaf_key.is_some());
         assert!(s.state == State::WaitClientCertVerify);
+    }
+
+    /// Builds a single-identity `pre_shared_key` ClientHello carrying
+    /// `ticket`, with the correct `res binder` for `psk` computed over the
+    /// truncated transcript (what `try_accept_psk` recomputes).
+    fn psk_client_hello(ticket: &[u8], psk: &[u8], obfuscated_age: u32) -> (Vec<u8>, ClientHello) {
+        let assemble = |binder: &[u8]| -> (Vec<u8>, ClientHello) {
+            let mut ids = Vec::new();
+            ids.extend_from_slice(&(ticket.len() as u16).to_be_bytes());
+            ids.extend_from_slice(ticket);
+            ids.extend_from_slice(&obfuscated_age.to_be_bytes());
+            let mut bins = Vec::new();
+            bins.push(binder.len() as u8);
+            bins.extend_from_slice(binder);
+            let mut psk_body = Vec::new();
+            psk_body.extend_from_slice(&(ids.len() as u16).to_be_bytes());
+            psk_body.extend_from_slice(&ids);
+            psk_body.extend_from_slice(&(bins.len() as u16).to_be_bytes());
+            psk_body.extend_from_slice(&bins);
+            let modes_body: Vec<u8> = alloc::vec![1u8, 1u8];
+            let ch = ClientHello {
+                legacy_version: 0x0303,
+                random: [0x11; 32],
+                session_id: Vec::new(),
+                cipher_suites: alloc::vec![CipherSuite::AES_128_GCM_SHA256],
+                extensions: alloc::vec![
+                    (ExtensionType::PSK_KEY_EXCHANGE_MODES, modes_body),
+                    (ExtensionType::PRE_SHARED_KEY, psk_body),
+                ],
+            };
+            let raw = ch.encode();
+            (raw, ch)
+        };
+        // The binder length is fixed (32), so a placeholder yields the same
+        // truncation as the final assembly.
+        let placeholder = alloc::vec![0u8; 32];
+        let (raw, _) = assemble(&placeholder);
+        let binders_field_len = 2 + 1 + placeholder.len();
+        let truncated = &raw[..raw.len() - binders_field_len];
+        let ks = KeySchedule::with_psk(HashAlg::Sha256, psk);
+        let res_bk = ks.binder_key(b"res binder");
+        let fk = binder_finished_key(HashAlg::Sha256, &res_bk);
+        let th = HashAlg::Sha256.hash(truncated);
+        let binder = Hmac::<Sha256>::mac(fk.as_slice(), th.as_slice())
+            .as_ref()
+            .to_vec();
+        assemble(&binder)
+    }
+
+    /// A self-signed Ed25519 certificate, used as a client-auth trust anchor.
+    fn ticket_test_anchor(label: &[u8]) -> Vec<u8> {
+        use crate::ec::Ed25519PrivateKey;
+        use crate::rng::HmacDrbg;
+        use crate::x509::CertSigner;
+        let mut seed = HmacDrbg::<crate::hash::Sha256>::new(label, b"nonce", &[]);
+        let key = Ed25519PrivateKey::generate(&mut seed);
+        let name = DistinguishedName::common_name("ticket-client-ca");
+        let cert = Certificate::self_signed_general(
+            &CertSigner::Ed25519(&key),
+            &name,
+            &Validity::new(
+                Time::utc(2024, 1, 1, 0, 0, 0),
+                Time::utc(2034, 1, 1, 0, 0, 0),
+            ),
+            1,
+            false,
+            &["ticket-client-ca"],
+        )
+        .unwrap();
+        cert.to_der().to_vec()
+    }
+
+    fn ticket_engine(cfg: ServerConfig) -> ServerConnection<ScriptedRng> {
+        ServerConnection::new(
+            cfg,
+            ScriptedRng {
+                data: alloc::vec![0u8; 64],
+                pos: 0,
+            },
+        )
+    }
+
+    /// A ticket issued by a listener that trusts client-auth root A must NOT
+    /// resume at a listener that shares the ticket key but trusts root B: the
+    /// recorded "the client was authenticated" claim was made against a
+    /// different CA. The mismatched listener falls back to a full handshake
+    /// (`Ok(None)`) — never a hard failure, and never a fail-open.
+    #[test]
+    fn tls13_ticket_is_bound_to_the_client_auth_trust_config() {
+        use crate::tls::pki::RootCertStore;
+        let anchor_a = ticket_test_anchor(b"tls13-ticket-root-a");
+        let anchor_b = ticket_test_anchor(b"tls13-ticket-root-b");
+        let key = [0x33u8; 32];
+        let cfg = |anchor: &Vec<u8>| {
+            let mut roots = RootCertStore::new();
+            roots.add_der(anchor.clone()).unwrap();
+            test_server_config()
+                .with_ticket_key(key)
+                .with_client_auth(roots, false)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW))
+        };
+
+        let issuer = ticket_engine(cfg(&anchor_a));
+        let seal_a = issuer.ticket_seal_key().unwrap();
+        let ticket = synth_ticket(&seal_a, TEST_TICKET_NOW, b"");
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+
+        // Same trust configuration: the PSK is accepted.
+        let same = ticket_engine(cfg(&anchor_a));
+        assert!(
+            same.try_accept_psk(&ch, &raw, &[]).unwrap().is_some(),
+            "the issuing listener must still accept its own ticket"
+        );
+
+        // Different client-auth roots: must not resume.
+        let other = ticket_engine(cfg(&anchor_b));
+        assert!(
+            other.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
+            "a listener trusting different client roots must not honour the ticket"
+        );
+
+        // No client auth at all: also a different trust configuration.
+        let anon = ticket_engine(
+            test_server_config()
+                .with_ticket_key(key)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW)),
+        );
+        assert!(anon.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+
+        // A ticket sealed under the bare `ticket_key` (the pre-binding format)
+        // falls back to a full handshake rather than failing open.
+        let legacy = synth_ticket(&key, TEST_TICKET_NOW, b"");
+        let (raw_legacy, ch_legacy) = psk_client_hello(&legacy, &[0xABu8; 32], 0);
+        let server = ticket_engine(cfg(&anchor_a));
+        assert!(
+            server
+                .try_accept_psk(&ch_legacy, &raw_legacy, &[])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Ticket expiry is enforced against the configured `verification_time`,
+    /// so it no longer depends on a `std` wall clock: a ticket older than
+    /// `ticket_lifetime` is refused and the handshake falls back to 1-RTT.
+    #[test]
+    fn tls13_ticket_expiry_uses_the_configured_clock() {
+        let key = [0x55u8; 32];
+        let cfg = || {
+            test_server_config()
+                .with_ticket_key(key)
+                .with_ticket_lifetime(3600)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW))
+        };
+        let engine = ticket_engine(cfg());
+        assert_eq!(engine.ticket_now(), Some(TEST_TICKET_NOW));
+        let seal = engine.ticket_seal_key().unwrap();
+
+        let fresh = synth_ticket(&seal, TEST_TICKET_NOW - 60, b"");
+        let (raw, ch) = psk_client_hello(&fresh, &[0xABu8; 32], 60_000);
+        assert!(engine.try_accept_psk(&ch, &raw, &[]).unwrap().is_some());
+
+        // Past the lifetime plus the 60 s skew tolerance: refused.
+        let stale = synth_ticket(&seal, TEST_TICKET_NOW - 3600 - 61, b"");
+        let (raw, ch) = psk_client_hello(&stale, &[0xABu8; 32], 0);
+        assert!(engine.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+
+        // A ticket with no timestamp at all (what a clock-less build used to
+        // mint) is refused outright rather than living forever.
+        let timeless = synth_ticket(&seal, 0, b"");
+        let (raw, ch) = psk_client_hello(&timeless, &[0xABu8; 32], 0);
+        assert!(engine.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+
+        // The configured clock is what is honoured: the same ticket that the
+        // in-window engine accepts is refused by one whose `verification_time`
+        // has moved past the lifetime.
+        let ticket = synth_ticket(&seal, TEST_TICKET_NOW, b"");
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+        assert!(engine.try_accept_psk(&ch, &raw, &[]).unwrap().is_some());
+        let late = ticket_engine(
+            test_server_config()
+                .with_ticket_key(key)
+                .with_ticket_lifetime(3600)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW + 4 * 3600)),
+        );
+        assert!(late.try_accept_psk(&ch, &raw, &[]).unwrap().is_none());
+    }
+
+    /// With no usable clock (a `no_std` build, modelled here by a verification
+    /// time that maps to Unix 0) the server issues no ticket and accepts none:
+    /// a ticket that can never expire is a permanent bearer token.
+    #[test]
+    fn tls13_without_a_clock_no_ticket_is_issued_or_accepted() {
+        let key = [0x66u8; 32];
+        let clocked = ticket_engine(
+            test_server_config()
+                .with_ticket_key(key)
+                .with_verification_time(Time::from_unix(TEST_TICKET_NOW)),
+        );
+        assert!(clocked.tickets_available());
+        let seal = clocked.ticket_seal_key().unwrap();
+        let ticket = synth_ticket(&seal, TEST_TICKET_NOW, b"");
+        let (raw, ch) = psk_client_hello(&ticket, &[0xABu8; 32], 0);
+        assert!(clocked.try_accept_psk(&ch, &raw, &[]).unwrap().is_some());
+
+        // Same key, same ticket — but this listener has no clock.
+        let clockless = ticket_engine(
+            test_server_config()
+                .with_ticket_key(key)
+                .with_verification_time(Time::from_unix(0)),
+        );
+        assert_eq!(clockless.ticket_now(), None);
+        assert!(
+            !clockless.tickets_available(),
+            "no clock must disable ticket issuance"
+        );
+        assert!(
+            clockless.try_accept_psk(&ch, &raw, &[]).unwrap().is_none(),
+            "a clock-less listener must not accept resumption tickets"
+        );
     }
 }
