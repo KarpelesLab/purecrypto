@@ -1037,8 +1037,6 @@ impl DtlsClientConnection13 {
         if ext::parse_selected_version(sv)? != ProtocolVersion::DTLSv1_3 {
             return Err(Error::UnsupportedVersion);
         }
-        self.server_random = Some(sh.random);
-        self.suite = Some(suite);
 
         // ECDHE / KEM from the server's key share. The server must have
         // picked a group we offered (RFC 8446 §4.2.8).
@@ -1058,6 +1056,13 @@ impl DtlsClientConnection13 {
             return Err(Error::IllegalParameter);
         }
         let mut shared = self.key_agreement(group, &server_pub)?;
+        // Only commit the ServerHello's choices once every check and the key
+        // agreement have succeeded: this is unauthenticated epoch-0 input,
+        // and a spoofed ServerHello that is silently dropped must not leave
+        // `self.suite` (pinned against the HRR suite above) or
+        // `server_random` changed for the genuine one.
+        self.server_random = Some(sh.random);
+        self.suite = Some(suite);
 
         // Commit the transcript to the negotiated hash (suite hash is fixed
         // by the ServerHello, RFC 8446 §4.4.1) and append SH.
