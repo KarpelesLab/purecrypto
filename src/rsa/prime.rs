@@ -137,8 +137,9 @@ pub(crate) const fn min_mr_rounds(bits: usize) -> usize {
 /// `bits-1` and `bits-2` ensures the product of two such primes is a full
 /// `2*bits`-bit modulus (the standard RSA construction).
 ///
-/// `rounds` is clamped up to [`min_mr_rounds`] for the requested size, so a
-/// caller passing 0 still gets a properly tested prime.
+/// `rounds` is clamped up to a size-appropriate floor (FIPS 186-5 Table B.1;
+/// see `min_mr_rounds`), so a caller passing 0 still gets a properly tested
+/// prime.
 ///
 /// # Panics
 /// Panics if `bits` is not in `2..=LIMBS*64`.
@@ -176,7 +177,8 @@ pub(crate) use crate::bignum::prime::is_prime_boxed;
 /// Generates a random (probable) prime of exactly `bits` bits as a
 /// [`BoxedUint`](crate::bignum::BoxedUint), with the top two bits and bit 0 set.
 ///
-/// `rounds` is clamped up to [`min_mr_rounds`] for the requested size.
+/// `rounds` is clamped up to the same size-appropriate floor as
+/// [`random_prime`].
 ///
 /// # Panics
 /// Panics if `bits < 2` — the two forced top bits need two bit positions
@@ -273,7 +275,10 @@ mod tests {
         let mut r = rng();
         for _ in 0..3 {
             let p = random_prime::<2, _>(&mut r, 96, 0);
-            assert!(is_prime(&p, &mut r, 40), "generated a composite with rounds=0");
+            assert!(
+                is_prime(&p, &mut r, 40),
+                "generated a composite with rounds=0"
+            );
         }
         assert!(min_mr_rounds(1024) >= 5);
         assert!(min_mr_rounds(512) >= min_mr_rounds(1024));

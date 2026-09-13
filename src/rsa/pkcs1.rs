@@ -409,7 +409,11 @@ mod tests {
         for len in [0usize, 1, 16, 48, 200, 245] {
             let msg = vec![0x2bu8; len];
             let ct = pk.encrypt_pkcs1v15(&msg, &mut r).unwrap();
-            assert_eq!(key.decrypt_pkcs1v15_implicit(&ct).unwrap(), msg, "len {len}");
+            assert_eq!(
+                key.decrypt_pkcs1v15_implicit(&ct).unwrap(),
+                msg,
+                "len {len}"
+            );
             // The allocation-free variant agrees.
             let mut out = [0u8; 256];
             let n = key.decrypt_pkcs1v15_implicit_into(&ct, &mut out).unwrap();

@@ -111,6 +111,17 @@ pub(super) fn fresh_blind_salt() -> [u8; 16] {
     salt
 }
 
+/// The freshness inputs to one private operation's blinder: the per-key
+/// operation counter (public, monotone) and a random salt (see
+/// [`per_op_blind_salt`]). Bundled so the derivation keeps a readable
+/// argument list.
+pub(super) struct BlindNonce {
+    /// Per-key operation counter.
+    pub counter: u32,
+    /// Random salt: fresh per operation where the target has an OS CSPRNG.
+    pub salt: [u8; 16],
+}
+
 /// The salt mixed into one private operation's blinder: fresh OS entropy when
 /// available, else the key's per-instance salt.
 pub(super) fn per_op_blind_salt(instance: &[u8; 16]) -> [u8; 16] {
@@ -181,8 +192,7 @@ fn raw_private_blinded<const LIMBS: usize>(
     d: &Uint<LIMBS>,
     phi_n_minus_1: &Uint<LIMBS>,
     blinding_seed: &[u8; 32],
-    nonce: u32,
-    salt: &[u8; 16],
+    nonce: &BlindNonce,
     c: &Uint<LIMBS>,
 ) -> Uint<LIMBS> {
     use crate::hash::HmacSha256;
@@ -212,12 +222,12 @@ fn raw_private_blinded<const LIMBS: usize>(
         // Per-operation nonce: without it the whole blinded computation is a
         // pure function of `(key, c)`, so replaying `c` reproduces every
         // intermediate bit-for-bit and lets an attacker average traces.
-        m.update(&nonce.to_be_bytes());
+        m.update(&nonce.counter.to_be_bytes());
         // Per-operation (or at least per-key-instance) random salt: the
         // counter above is predictable and shared by clones and forks, so on
         // its own it does not stop an attacker from predicting — or making a
         // second key instance replay — the blinder sequence.
-        m.update(salt);
+        m.update(&nonce.salt);
         // Stream the ciphertext limb-by-limb (BE) into the HMAC.
         for i in 0..LIMBS {
             let limb_bytes = c.as_limbs()[LIMBS - 1 - i].to_be_bytes();
@@ -614,8 +624,10 @@ impl<const LIMBS: usize> RsaPrivateKey<LIMBS> {
             &self.d,
             &self.phi_n_minus_1,
             &self.blinding_seed,
-            self.blind_counter.fetch_add(1, Ordering::Relaxed),
-            &per_op_blind_salt(&self.blind_salt),
+            &BlindNonce {
+                counter: self.blind_counter.fetch_add(1, Ordering::Relaxed),
+                salt: per_op_blind_salt(&self.blind_salt),
+            },
             c,
         )
     }

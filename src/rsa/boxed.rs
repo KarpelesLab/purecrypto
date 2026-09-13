@@ -355,7 +355,12 @@ fn raw_private_crt_blinded(
 }
 
 /// The full-width (non-CRT) base-blinded private op, `c^d mod n`.
-fn raw_private_full_width(key: &BoxedRsaPrivateKey, nonce: u32, salt: &[u8; 16], c: &BoxedUint) -> BoxedUint {
+fn raw_private_full_width(
+    key: &BoxedRsaPrivateKey,
+    nonce: u32,
+    salt: &[u8; 16],
+    c: &BoxedUint,
+) -> BoxedUint {
     let mont = &key.mont;
     let phi_n_minus_1 = match key.phi_n_minus_1.as_ref() {
         Some(v) => v,

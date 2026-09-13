@@ -388,8 +388,8 @@ fn bad_to_mask(bad: u8) -> u8 {
 /// Rejection sampling, unrolled and branch-free: 256 candidates are drawn from
 /// the HMAC stream, each masked down to the smallest `2^b − 1 >= max_len`, and
 /// the first one in range is kept. Each candidate is in range with probability
-/// > 1/2, so the "no candidate matched" fallback (length 0) is reached with
-/// probability below 2⁻²⁵⁶.
+/// at least 1/2, so the "no candidate matched" fallback (length 0) is reached
+/// with probability below 2⁻²⁵⁶.
 fn synthetic_len(secret: &[u8; 32], ct: &[u8], max_len: usize) -> u32 {
     use crate::hash::HmacSha256;
 
