@@ -228,6 +228,14 @@ impl Blake2bState {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         out.copy_from_slice(&bytes[..out.len()]);
+
+        // Finalization is terminal. The chaining value is the full untruncated
+        // digest (and, keyed, key-derived), the buffer holds the message tail,
+        // and `bytes` carries digest bytes past `out.len()`; wipe all three
+        // rather than leaving them for the caller's (possibly `Drop`-less)
+        // hasher.
+        super::zeroize::zero_bytes(&mut bytes);
+        self.zeroize();
     }
 }
 
@@ -430,6 +438,11 @@ impl Blake2sState {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         out.copy_from_slice(&bytes[..out.len()]);
+
+        // Terminal: wipe the chaining value, message tail and spare digest
+        // bytes (see `Blake2bState::finalize_into`).
+        super::zeroize::zero_bytes(&mut bytes);
+        self.zeroize();
     }
 }
 

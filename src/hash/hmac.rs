@@ -45,9 +45,13 @@ impl<D: Digest> Hmac<D> {
         let mut block = D::zeroed_block();
         let buf = block.as_mut();
         if key.len() > buf.len() {
-            let hashed = D::digest(key);
+            // `H(key)` *is* the effective HMAC key for a long key; wipe this
+            // copy once it has been folded into the block (which is wiped
+            // below).
+            let mut hashed = D::digest(key);
             let h = hashed.as_ref();
             buf[..h.len()].copy_from_slice(h);
+            super::zeroize::zero_bytes(hashed.as_mut());
         } else {
             buf[..key.len()].copy_from_slice(key);
         }

@@ -129,7 +129,13 @@ impl<const W: usize> MdState<W> {
         self.block[56..64].copy_from_slice(&len_bytes);
         (self.compress)(&mut self.h, &self.block);
 
-        self.h
+        // `self` is consumed here and has no `Drop`. The partial block still
+        // holds the message tail, and under HMAC the outer hasher finalized
+        // here carries the `K' ^ opad` midstate — key-equivalent material — so
+        // wipe the block and state words before returning, as SHA-2 does.
+        let out = self.h;
+        self.zeroize();
+        out
     }
 }
 

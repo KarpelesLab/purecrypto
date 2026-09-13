@@ -689,6 +689,9 @@ mod tests {
                 i += 1;
             }
         }
-        assert_eq!(got, want, "HMAC-SHA3-224 KBKDF feedback mode re-keyed wrongly");
+        assert_eq!(
+            got, want,
+            "HMAC-SHA3-224 KBKDF feedback mode re-keyed wrongly"
+        );
     }
 }

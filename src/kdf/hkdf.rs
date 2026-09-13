@@ -158,8 +158,11 @@ pub fn try_hkdf_expand<D: Digest>(
 
 /// One-shot HKDF: `Extract` then `Expand` into `out`.
 pub fn hkdf<D: Digest>(salt: &[u8], ikm: &[u8], info: &[u8], out: &mut [u8]) {
-    let prk = hkdf_extract::<D>(salt, ikm);
+    let mut prk = hkdf_extract::<D>(salt, ikm);
     hkdf_expand::<D>(&prk, info, out);
+    // The PRK is as sensitive as the IKM it came from and the caller never
+    // sees it; wipe it rather than leaving it in this frame.
+    super::wipe(prk.as_mut());
 }
 
 #[cfg(test)]

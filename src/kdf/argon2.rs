@@ -183,9 +183,11 @@ pub fn argon2(
     let block_off = |i: usize, j: usize| -> usize { (i * q + j) * 1024 };
 
     // --- Initialize B[i][0] and B[i][1] for each lane i ---
+    // `input` embeds H0, so it is as password-derived as H0 itself; it is
+    // hoisted out of the loop and wiped alongside it below.
+    let mut input = [0u8; 64 + 8];
     for i in 0..p {
         // B[i][0] = H'(H0 ‖ LE32(0) ‖ LE32(i), 1024)
-        let mut input = [0u8; 64 + 8];
         input[..64].copy_from_slice(&h0);
         input[64..68].copy_from_slice(&0u32.to_le_bytes());
         input[68..72].copy_from_slice(&(i as u32).to_le_bytes());
@@ -198,10 +200,10 @@ pub fn argon2(
         h_prime(&input, &mut mem[off..off + 1024]);
     }
 
-    // H0 is password-derived and only needed for lane initialization; wipe
-    // it before the long main loop runs.
-    h0.iter_mut().for_each(|b| *b = 0);
-    let _ = core::hint::black_box(&h0);
+    // H0 (and the `H0 ‖ …` block fed to H′) is password-derived and only
+    // needed for lane initialization; wipe both before the long main loop runs.
+    super::wipe(&mut h0);
+    super::wipe(&mut input);
 
     // --- Main loop: t passes × 4 slices × p lanes × seg_len blocks ---
     for pass in 0..params.t_cost as usize {
@@ -228,6 +230,8 @@ pub fn argon2(
     // Wipe the password-derived working buffers before they drop. There are no
     // early returns past the `mem` allocation above, so this single pass covers
     // every non-panic exit; `black_box` keeps the writes from being elided.
+    // (A plain store loop rather than `wipe`: the matrix is up to gigabytes and
+    // the volatile per-byte stores of `wipe` would not vectorize.)
     c.iter_mut().for_each(|b| *b = 0);
     mem.iter_mut().for_each(|b| *b = 0);
     let _ = core::hint::black_box(&c);
@@ -271,6 +275,11 @@ fn fill_segment(
     // segment and wiped once at the end (they hold password-derived state).
     let mut prev_buf = [0u8; 1024];
     let mut ref_buf = [0u8; 1024];
+    // G's working blocks live here rather than in `g_compress`'s own frame, so
+    // that they too can be wiped once per segment instead of on every one of
+    // the millions of block compressions (a per-call volatile wipe of 2 KiB
+    // would cost more than the compression itself).
+    let mut scratch = GScratch::new();
 
     #[allow(clippy::needless_range_loop)]
     for i_seg in start_idx..seg_len {
@@ -307,13 +316,13 @@ fn fill_segment(
             &ref_buf,
             &mut mem[dst_off..dst_off + 1024],
             xor_into,
+            &mut scratch,
         );
     }
 
-    prev_buf.iter_mut().for_each(|b| *b = 0);
-    ref_buf.iter_mut().for_each(|b| *b = 0);
-    let _ = core::hint::black_box(&prev_buf);
-    let _ = core::hint::black_box(&ref_buf);
+    super::wipe(&mut prev_buf);
+    super::wipe(&mut ref_buf);
+    scratch.wipe();
 }
 
 /// Argon2i / Argon2id (first-half) pseudo-random address generation. Produces
@@ -331,6 +340,7 @@ fn compute_addresses(
     let zero_block = [0u8; 1024];
     let mut input = [0u8; 1024];
     let mut addr_block = [0u8; 1024];
+    let mut scratch = GScratch::new();
 
     // Each ADDR_BLOCK gives 128 (J1, J2) pairs.
     let mut counter: u64 = 0;
@@ -350,9 +360,11 @@ fn compute_addresses(
         input[48..56].copy_from_slice(&counter.to_le_bytes());
 
         // ADDR_BLOCK = G(zero, G(zero, INPUT_BLOCK))
+        // Nothing here is password-derived (the inputs are the public segment
+        // parameters), so this scratch needs no wipe.
         let mut tmp = [0u8; 1024];
-        g_compress(&zero_block, &input, &mut tmp, false);
-        g_compress(&zero_block, &tmp, &mut addr_block, false);
+        g_compress(&zero_block, &input, &mut tmp, false, &mut scratch);
+        g_compress(&zero_block, &tmp, &mut addr_block, false, &mut scratch);
 
         for chunk_idx in 0..128 {
             if pairs.len() >= seg_len {
@@ -450,8 +462,8 @@ fn h_prime(input: &[u8], out: &mut [u8]) {
 
     let r = out.len().div_ceil(32) - 2;
     let mut written = 32;
+    let mut next = [0u8; 64];
     for _ in 1..r {
-        let mut next = [0u8; 64];
         let mut mac = Blake2bMac::new_unkeyed(64);
         mac.update(&v);
         mac.finalize_into(&mut next);
@@ -464,6 +476,13 @@ fn h_prime(input: &[u8], out: &mut [u8]) {
     let mut mac = Blake2bMac::new_unkeyed(final_len);
     mac.update(&v);
     mac.finalize_into(&mut out[written..]);
+
+    // `v`/`next` hold whole V_i blocks, of which only the leading 32 bytes
+    // reach `out`; the rest is unpublished keying material. Wipe both — H′ runs
+    // once per lane plus once at the end, not per memory block, so this is off
+    // the hot path.
+    super::wipe(&mut v);
+    super::wipe(&mut next);
 }
 
 // --------------------------------------------------------------------------
@@ -496,12 +515,39 @@ fn p_round(v: &mut [u64; 16]) {
     gb(v, 3, 4, 9, 14);
 }
 
+/// `G`'s working blocks `R` and `Z`, owned by the caller.
+///
+/// They hold password-derived data on the main fill path, so they must be
+/// wiped — but `G` runs once per 1 KiB memory block (millions of times for
+/// realistic parameters), and a volatile wipe of 2 KiB per call would dominate
+/// the compression itself. Keeping them in the caller's frame lets the whole
+/// segment share one buffer that is wiped once, in [`fill_segment`].
+struct GScratch {
+    r: [u64; 128],
+    z: [u64; 128],
+}
+
+impl GScratch {
+    fn new() -> Self {
+        GScratch {
+            r: [0u64; 128],
+            z: [0u64; 128],
+        }
+    }
+
+    fn wipe(&mut self) {
+        use crate::zeroize::Zeroize;
+        self.r.zeroize();
+        self.z.zeroize();
+    }
+}
+
 /// `G(X, Y)` writes the resulting 1024-byte block to `out`. If `xor_into` is
 /// true, the result is XORed into the existing contents of `out` (Argon2 v1.3
-/// pass > 0 behavior).
-fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool) {
-    let mut r = [0u64; 128];
-    let mut z = [0u64; 128];
+/// pass > 0 behavior). `s` supplies the `R`/`Z` working blocks; its previous
+/// contents are fully overwritten.
+fn g_compress(x: &[u8; 1024], y: &[u8; 1024], out: &mut [u8], xor_into: bool, s: &mut GScratch) {
+    let (r, z) = (&mut s.r, &mut s.z);
     for i in 0..128 {
         let xi = u64::from_le_bytes(x[i * 8..i * 8 + 8].try_into().unwrap());
         let yi = u64::from_le_bytes(y[i * 8..i * 8 + 8].try_into().unwrap());
