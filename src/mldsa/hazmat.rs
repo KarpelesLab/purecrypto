@@ -531,7 +531,9 @@ pub fn pack_w1(f: &Poly, p: &Params) -> Vec<u8> {
     v
 }
 
-#[cfg(test)]
+// The packing round-trips below go through the `Vec`-returning `pack_*`
+// wrappers, which only exist with `alloc`.
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;
 
