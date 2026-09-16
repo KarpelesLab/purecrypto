@@ -8,7 +8,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::ec::sm2::{DEFAULT_ID, Sm2PrivateKey, Sm2PublicKey, Sm2Signature};
 use crate::rng::OsRng;
 
@@ -67,7 +67,7 @@ pub unsafe extern "C" fn pc_sm2_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -77,7 +77,8 @@ pub unsafe extern "C" fn pc_sm2_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the PKIX SPKI (`PUBLIC KEY`) PEM for the public key.
@@ -90,13 +91,14 @@ pub unsafe extern "C" fn pc_sm2_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = unsafe { &*k }.0.public_key().to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// SM2-DSA sign: signs `msg` under identity `id` (NULL / 0 selects the default
@@ -114,7 +116,7 @@ pub unsafe extern "C" fn pc_sm2_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -128,7 +130,8 @@ pub unsafe extern "C" fn pc_sm2_sign(
             Err(_) => return PcStatus::Internal,
         };
         unsafe { out_write(&sig.to_der(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// SM2-DSA verify: checks the DER `Ecdsa-Sig-Value` `sig` over `msg` under the
@@ -185,7 +188,7 @@ pub unsafe extern "C" fn pc_sm2_encrypt(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(spki), Some(p)) = (unsafe { slice(spki, spki_len) }, unsafe {
             slice(pt, pt_len)
         }) else {
@@ -200,7 +203,8 @@ pub unsafe extern "C" fn pc_sm2_encrypt(
             Err(_) => return PcStatus::Internal,
         };
         unsafe { out_write(&ct, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// SM2 PKE decrypt: decrypts a `C1 ‖ C3 ‖ C2` ciphertext with the private key,
@@ -216,7 +220,7 @@ pub unsafe extern "C" fn pc_sm2_decrypt(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -234,7 +238,8 @@ pub unsafe extern "C" fn pc_sm2_decrypt(
         let st = unsafe { out_write(&pt, out, out_len) };
         wipe_vec(&mut pt);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Frees an SM2 key handle. NULL is ignored.

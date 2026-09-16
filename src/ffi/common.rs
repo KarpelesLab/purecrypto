@@ -148,6 +148,26 @@ pub(super) unsafe fn out_write(data: &[u8], out: *mut u8, out_len: *mut usize) -
     PcStatus::Ok
 }
 
+/// Applies the out-length contract the header documents to the status an
+/// entry point is about to return. `Ok` and [`PcStatus::BufferTooSmall`]
+/// have already set `*out_len` (the delivered / required length); on every
+/// other status `*out_len` is reset to `0`, so a caller can never mistake
+/// the capacity it passed in — or a stale value from an earlier call — for
+/// a length. A NULL `out_len` is left alone (the entry point has already
+/// answered `NullPointer` for it).
+///
+/// Wrap the `guard`ed body: `let st = guard(|| { ... }); settle_out_len(out_len, st)`
+/// — so the reset also covers a caught panic (`Internal`).
+///
+/// # Safety
+/// `out_len` is NULL or points to a writable `usize`.
+pub(super) unsafe fn settle_out_len(out_len: *mut usize, st: PcStatus) -> PcStatus {
+    if !matches!(st, PcStatus::Ok | PcStatus::BufferTooSmall) && !out_len.is_null() {
+        unsafe { *out_len = 0 };
+    }
+    st
+}
+
 /// Overwrites `buf` with zeros through [`crate::zeroize::Zeroize`] (volatile
 /// stores plus a compiler fence, so LLVM cannot eliminate the writes as dead
 /// stores). Used to scrub recovered plaintext / shared secrets before their

@@ -89,6 +89,22 @@ typedef enum {
                               (pc_tls_cfg_set_certificate / pc_quic_cfg_set_certificate) */
 } pc_status;
 
+/* Out-parameter contract.
+ *
+ * Every out-parameter a function takes is written before it returns,
+ * whatever the status, so a caller never reads an uninitialised value:
+ *
+ *   - In/out lengths (`size_t *out_len` and the like: capacity on entry,
+ *     length on return) hold the delivered length on PC_OK, the required
+ *     length on PC_BUFFER_TOO_SMALL, and 0 on every other status. A stale
+ *     capacity is never left behind as if it were a length.
+ *   - Every other scalar out-parameter (`int32_t *`, `uint64_t *`,
+ *     `uint16_t *`, `size_t *written_out`, ...) is 0 on every non-OK status.
+ *   - The one exception is the out-parameter that is itself NULL: the call
+ *     returns PC_NULL_POINTER and, having nowhere to write, writes nothing.
+ *
+ * Output *buffers* (`uint8_t *out`) are only written on PC_OK. */
+
 /* AEAD algorithm identifiers (for pc_aead_encrypt / pc_aead_decrypt). */
 typedef enum {
   PC_AEAD_AES128_GCM = 1,
@@ -904,6 +920,11 @@ pc_status pc_quic_stream_finish(PcQuic *q, uint64_t id);
 /* Bytes pc_quic_stream_write would accept right now (0 = flow-control
  * blocked; poll again after a pop/feed cycle surfaces fresh credit). */
 pc_status pc_quic_stream_send_capacity(const PcQuic *q, uint64_t id, size_t *out);
+/* *out_len is capacity in, bytes copied out; *fin_seen becomes 1 once every
+ * byte through FIN has been delivered. On any non-OK status *fin_seen == 0
+ * and *out_len == 0 — except PC_BUFFER_TOO_SMALL (a capacity above the
+ * 1 MiB per-call ceiling), where *out_len is that ceiling. An unknown
+ * stream id is PC_INTERNAL. */
 pc_status pc_quic_stream_read(PcQuic *q, uint64_t id,
                               uint8_t *out, size_t *out_len,
                               int32_t *fin_seen);

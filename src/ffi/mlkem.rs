@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_array, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_array, wipe_vec};
 use crate::mlkem::{
     MlKem512Ciphertext, MlKem512DecapsKey, MlKem512EncapsKey, MlKem768Ciphertext,
     MlKem768DecapsKey, MlKem768EncapsKey, MlKem1024Ciphertext, MlKem1024DecapsKey,
@@ -90,7 +90,7 @@ pub unsafe extern "C" fn pc_mlkem_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -105,7 +105,8 @@ pub unsafe extern "C" fn pc_mlkem_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the matching encapsulation key as a PKIX SPKI PEM to `out`.
@@ -118,7 +119,7 @@ pub unsafe extern "C" fn pc_mlkem_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -128,7 +129,8 @@ pub unsafe extern "C" fn pc_mlkem_public_to_pem(
             PcMlKem::K1024(sk) => sk.encapsulation_key().to_spki_pem(),
         };
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the matching encapsulation key as a PKIX SPKI DER blob to `out`.
@@ -142,7 +144,7 @@ pub unsafe extern "C" fn pc_mlkem_public_to_der(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -152,7 +154,8 @@ pub unsafe extern "C" fn pc_mlkem_public_to_der(
             PcMlKem::K1024(sk) => sk.encapsulation_key().to_spki_der(),
         };
         unsafe { out_write(&der, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Encapsulates against an encapsulation key supplied as a PKIX SPKI DER,
@@ -171,7 +174,7 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
     ct_len: *mut usize,
     ss: *mut u8,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let Some(spki) = (unsafe { slice(ek_spki, ek_spki_len) }) else {
             return PcStatus::NullPointer;
         };
@@ -235,7 +238,8 @@ pub unsafe extern "C" fn pc_mlkem_encaps(
         unsafe { core::ptr::copy_nonoverlapping(secret.as_ptr(), ss, 32) };
         wipe_array(&mut secret);
         PcStatus::Ok
-    })
+    });
+    unsafe { settle_out_len(ct_len, st) }
 }
 
 /// Decapsulates `ct` under `k`, writing the 32-byte shared secret to `ss`.

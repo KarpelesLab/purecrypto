@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::ec::{
     BoxedEcdhPrivateKey, BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId,
     Ed448PrivateKey, Ed448Signature, Ed25519PrivateKey, Ed25519Signature,
@@ -81,7 +81,7 @@ pub unsafe extern "C" fn pc_ec_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -91,7 +91,8 @@ pub unsafe extern "C" fn pc_ec_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the public key as a PKIX `PUBLIC KEY` (SPKI) PEM string to `out`.
@@ -104,13 +105,14 @@ pub unsafe extern "C" fn pc_ec_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = AnyPublicKey::Ecdsa(unsafe { &*key }.0.public_key()).to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` with `key`, writing a DER `Ecdsa-Sig-Value` to `out`. The digest
@@ -127,7 +129,7 @@ pub unsafe extern "C" fn pc_ec_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -147,7 +149,8 @@ pub unsafe extern "C" fn pc_ec_sign(
             Ok(s) => unsafe { out_write(&s.to_der(curve), out, out_len) },
             Err(_) => PcStatus::Internal,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies a DER `Ecdsa-Sig-Value` `sig` over `msg` under the SPKI (PKIX
@@ -258,7 +261,7 @@ pub unsafe extern "C" fn pc_ed25519_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -268,7 +271,8 @@ pub unsafe extern "C" fn pc_ed25519_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the public key as a PKIX `PUBLIC KEY` (SPKI) PEM string to `out`.
@@ -281,13 +285,14 @@ pub unsafe extern "C" fn pc_ed25519_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = AnyPublicKey::Ed25519(unsafe { &*key }.0.public_key()).to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` with `key`, writing the raw 64-byte Ed25519 signature to `out`.
@@ -302,7 +307,7 @@ pub unsafe extern "C" fn pc_ed25519_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -311,7 +316,8 @@ pub unsafe extern "C" fn pc_ed25519_sign(
         };
         let sig = unsafe { &*key }.0.sign(m);
         unsafe { out_write(&sig.to_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies a raw 64-byte Ed25519 signature `sig` over `msg` under the SPKI
@@ -404,7 +410,7 @@ pub unsafe extern "C" fn pc_ed448_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -414,7 +420,8 @@ pub unsafe extern "C" fn pc_ed448_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the public key as a PKIX `PUBLIC KEY` (SPKI) PEM string to `out`.
@@ -427,13 +434,14 @@ pub unsafe extern "C" fn pc_ed448_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = AnyPublicKey::Ed448(unsafe { &*key }.0.public_key()).to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` with `key`, writing the raw 114-byte Ed448 signature to `out`.
@@ -449,7 +457,7 @@ pub unsafe extern "C" fn pc_ed448_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -458,7 +466,8 @@ pub unsafe extern "C" fn pc_ed448_sign(
         };
         let sig = unsafe { &*key }.0.sign(m);
         unsafe { out_write(&sig.to_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies a raw 114-byte Ed448 signature `sig` over `msg` under the SPKI
@@ -526,7 +535,7 @@ pub unsafe extern "C" fn pc_ecdh(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let Some(curve) = curve_from_id(curve_id) else {
             return PcStatus::Unsupported;
         };
@@ -556,5 +565,6 @@ pub unsafe extern "C" fn pc_ecdh(
         let st = unsafe { out_write(&secret, out, out_len) };
         wipe_vec(&mut secret);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }

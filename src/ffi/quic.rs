@@ -22,7 +22,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed25519PrivateKey};
 use crate::quic::{
     CloseInitiator, CloseKind, QuicConfig, QuicConnection, Role as QuicRole, StreamId,
@@ -624,7 +624,7 @@ pub unsafe extern "C" fn pc_quic_pop_datagram(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null() {
             return PcStatus::NullPointer;
         }
@@ -640,7 +640,8 @@ pub unsafe extern "C" fn pc_quic_pop_datagram(
             handle.pending_pop = Some(dg);
         }
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// `Some(Closed)` once the connection can no longer carry application data
@@ -690,6 +691,9 @@ pub unsafe extern "C" fn pc_quic_is_handshake_complete(
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
+        // Written before the engine is consulted, so a caught panic
+        // (`Internal`) still leaves a defined `*out`.
+        unsafe { *out = 0 };
         unsafe {
             *out = if (*q).inner.is_handshake_complete() {
                 1
@@ -720,6 +724,11 @@ pub unsafe extern "C" fn pc_quic_next_timeout(
     guard(|| {
         if q.is_null() || seconds_out.is_null() || nanos_out.is_null() || has_timeout.is_null() {
             return PcStatus::NullPointer;
+        }
+        unsafe {
+            *seconds_out = 0;
+            *nanos_out = 0;
+            *has_timeout = 0;
         }
         let conn = unsafe { &*q };
         match conn.inner.next_timeout() {
@@ -915,6 +924,11 @@ pub unsafe extern "C" fn pc_quic_stream_finish(q: *mut PcQuic, id: u64) -> PcSta
 /// the buffer capacity; on return it is the number of bytes copied.
 /// `*fin_seen = 1` once every byte through FIN has been delivered.
 ///
+/// On every non-`Ok` return both out-parameters are defined: `*fin_seen = 0`
+/// always, and `*out_len = 0` — except for [`PcStatus::BufferTooSmall`],
+/// where it is the capacity ceiling the call will accept. A read on an
+/// unknown stream id (or one whose receive side is gone) is `Internal`.
+///
 /// # Safety
 /// All pointers valid for their declared lengths.
 #[unsafe(no_mangle)]
@@ -925,10 +939,13 @@ pub unsafe extern "C" fn pc_quic_stream_read(
     out_len: *mut usize,
     fin_seen: *mut i32,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null() || out_len.is_null() || fin_seen.is_null() {
             return PcStatus::NullPointer;
         }
+        // Defined on every path from here on: `settle_out_len` below resets
+        // `*out_len` on error, and `*fin_seen` is rewritten only on success.
+        unsafe { *fin_seen = 0 };
         let cap = unsafe { *out_len };
         // Cap the caller-controlled capacity to defend against a
         // pathological / hostile `*out_len`. 1 MiB matches the largest
@@ -971,7 +988,8 @@ pub unsafe extern "C" fn pc_quic_stream_read(
         // dropping it — matches `pc_quic_recv_datagram` / `pc_tls_recv`.
         wipe_vec(&mut tmp);
         PcStatus::Ok
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Aborts the send side of `id` with the given application error code.
@@ -1074,7 +1092,7 @@ pub unsafe extern "C" fn pc_quic_recv_datagram(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1093,7 +1111,8 @@ pub unsafe extern "C" fn pc_quic_recv_datagram(
             handle.pending_recv = Some(payload);
         }
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 // ---- Connection close (RFC 9000 §10.2) -----------------------------------
@@ -1151,6 +1170,7 @@ pub unsafe extern "C" fn pc_quic_is_closed(q: *const PcQuic, out: *mut i32) -> P
         if q.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *out = 0 };
         unsafe { *out = i32::from((*q).inner.is_closed()) };
         PcStatus::Ok
     })
@@ -1178,7 +1198,7 @@ pub unsafe extern "C" fn pc_quic_close_info(
     reason: *mut u8,
     reason_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null()
             || code_out.is_null()
             || initiator_out.is_null()
@@ -1186,6 +1206,13 @@ pub unsafe extern "C" fn pc_quic_close_info(
             || reason_len.is_null()
         {
             return PcStatus::NullPointer;
+        }
+        // Defined on every path: `WantRead` (nothing to report yet) and
+        // `BufferTooSmall` leave all three at 0.
+        unsafe {
+            *code_out = 0;
+            *initiator_out = 0;
+            *is_app_out = 0;
         }
         let Some(info) = unsafe { &*q }.inner.close_info() else {
             return PcStatus::WantRead;
@@ -1205,7 +1232,8 @@ pub unsafe extern "C" fn pc_quic_close_info(
             *is_app_out = i32::from(info.kind == CloseKind::Application);
         }
         PcStatus::Ok
-    })
+    });
+    unsafe { settle_out_len(reason_len, st) }
 }
 
 // ---- Key update (RFC 9001 §6) --------------------------------------------
@@ -1298,7 +1326,7 @@ pub unsafe extern "C" fn pc_quic_negotiated_alpn(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1307,7 +1335,8 @@ pub unsafe extern "C" fn pc_quic_negotiated_alpn(
         // selected one yet.
         let alpn: &[u8] = unsafe { &*q }.inner.alpn_protocol().unwrap_or(&[]);
         unsafe { out_write(alpn, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the peer's leaf certificate DER to `out`, or
@@ -1322,7 +1351,7 @@ pub unsafe extern "C" fn pc_quic_peer_certificate(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if q.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1334,7 +1363,8 @@ pub unsafe extern "C" fn pc_quic_peer_certificate(
             return PcStatus::BadEncoding;
         };
         unsafe { out_write(leaf, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 // ---- Helpers --------------------------------------------------------------

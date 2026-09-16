@@ -20,7 +20,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::rng::OsRng;
 use crate::xmss::{
     XmssMtParamSet, XmssMtPrivateKey, XmssMtPublicKey, XmssParamSet, XmssPrivateKey, XmssPublicKey,
@@ -95,7 +95,7 @@ pub unsafe extern "C" fn pc_xmss_private_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -105,7 +105,8 @@ pub unsafe extern "C" fn pc_xmss_private_to_bytes(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the self-describing XMSS public key (`oid || root || PUB_SEED`).
@@ -118,14 +119,15 @@ pub unsafe extern "C" fn pc_xmss_public_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pk = unsafe { &*k }.0.public_key();
         let blob = tag_public(pk.parameter_set().oid(), pk.to_bytes());
         unsafe { out_write(&blob, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
@@ -154,7 +156,7 @@ pub unsafe extern "C" fn pc_xmss_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
@@ -182,7 +184,8 @@ pub unsafe extern "C" fn pc_xmss_sign(
         };
         debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an XMSS signature `sig` over `msg` under the self-describing public
@@ -280,7 +283,7 @@ pub unsafe extern "C" fn pc_xmssmt_private_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -290,7 +293,8 @@ pub unsafe extern "C" fn pc_xmssmt_private_to_bytes(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the self-describing XMSS^MT public key (`oid || root || PUB_SEED`).
@@ -303,14 +307,15 @@ pub unsafe extern "C" fn pc_xmssmt_public_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pk = unsafe { &*k }.0.public_key();
         let blob = tag_public(pk.parameter_set().oid(), pk.to_bytes());
         unsafe { out_write(&blob, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
@@ -339,7 +344,7 @@ pub unsafe extern "C" fn pc_xmssmt_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
@@ -367,7 +372,8 @@ pub unsafe extern "C" fn pc_xmssmt_sign(
         };
         debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an XMSS^MT signature `sig` over `msg` under the self-describing

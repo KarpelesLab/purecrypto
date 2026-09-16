@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice};
 use super::rsa::PcRsaKey;
 use crate::x509::{CertSigner, CertificationRequest, DistinguishedName};
 
@@ -144,13 +144,14 @@ pub unsafe extern "C" fn pc_csr_create_rsa_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if rsa_key.is_null() {
             return PcStatus::NullPointer;
         }
         let signer = CertSigner::Rsa(super::rsa::pc_rsa_inner_key(unsafe { &*rsa_key }));
         unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Creates an ECDSA-signed CSR and writes its PEM to `out`. See [`create_csr_pem`].
@@ -167,13 +168,14 @@ pub unsafe extern "C" fn pc_csr_create_ec_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if ec_key.is_null() {
             return PcStatus::NullPointer;
         }
         let signer = CertSigner::Ecdsa(super::ec::pc_ec_inner_key(unsafe { &*ec_key }));
         unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Creates an Ed25519-signed CSR and writes its PEM to `out`. See [`create_csr_pem`].
@@ -190,13 +192,14 @@ pub unsafe extern "C" fn pc_csr_create_ed25519_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if ed_key.is_null() {
             return PcStatus::NullPointer;
         }
         let signer = CertSigner::Ed25519(super::ec::pc_ed25519_inner_key(unsafe { &*ed_key }));
         unsafe { create_csr_pem(&signer, cn, cn_len, sans, sans_len, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Parses a CSR from PEM.
@@ -229,13 +232,14 @@ pub unsafe extern "C" fn pc_csr_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if csr.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = unsafe { &*csr }.0.to_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies the CSR's self-signature (the public key inside the request
@@ -268,7 +272,7 @@ pub unsafe extern "C" fn pc_csr_subject_cn(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if csr.is_null() {
             return PcStatus::NullPointer;
         }
@@ -280,7 +284,8 @@ pub unsafe extern "C" fn pc_csr_subject_cn(
             return PcStatus::BadEncoding;
         };
         unsafe { out_write(cn.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Frees a CSR. NULL is ignored.

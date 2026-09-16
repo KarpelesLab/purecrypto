@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::mldsa::{
     MlDsa44PrivateKey, MlDsa44PublicKey, MlDsa65PrivateKey, MlDsa65PublicKey, MlDsa87PrivateKey,
     MlDsa87PublicKey,
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn pc_mldsa_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -103,7 +103,8 @@ pub unsafe extern "C" fn pc_mldsa_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// PKIX SPKI PEM for the public verification key.
@@ -116,7 +117,7 @@ pub unsafe extern "C" fn pc_mldsa_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -126,7 +127,8 @@ pub unsafe extern "C" fn pc_mldsa_public_to_pem(
             PcMlDsa::L87(sk) => sk.public_key().to_spki_pem(),
         };
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` (hedged via OsRng), writing the signature to `out`. ML-DSA
@@ -143,7 +145,7 @@ pub unsafe extern "C" fn pc_mldsa_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -165,7 +167,8 @@ pub unsafe extern "C" fn pc_mldsa_sign(
             },
         };
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an ML-DSA signature `sig` over `msg` under the SPKI DER in

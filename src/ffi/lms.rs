@@ -20,7 +20,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::lms::{HssPrivateKey, LmotsType, LmsPrivateKey, LmsType, verify_hss, verify_lms};
 use crate::rng::OsRng;
 
@@ -126,7 +126,7 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -136,7 +136,8 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Like [`pc_lms_private_to_bytes`] but in the cached form: the serialization
@@ -155,7 +156,7 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes_with_cache(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -163,7 +164,8 @@ pub unsafe extern "C" fn pc_lms_private_to_bytes_with_cache(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the raw LMS public key (self-describing: typecodes embedded).
@@ -176,13 +178,14 @@ pub unsafe extern "C" fn pc_lms_public_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pk = unsafe { &*k }.0.public_key();
         unsafe { out_write(pk.to_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg`, ADVANCING the handle's in-memory one-time-key index. After this
@@ -213,7 +216,7 @@ pub unsafe extern "C" fn pc_lms_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
@@ -241,7 +244,8 @@ pub unsafe extern "C" fn pc_lms_sign(
         };
         debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an LMS signature `sig` over `msg` under the raw LMS public key
@@ -336,7 +340,7 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -346,7 +350,8 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Like [`pc_hss_private_to_bytes`] but in the cached form (see
@@ -362,7 +367,7 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes_with_cache(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -370,7 +375,8 @@ pub unsafe extern "C" fn pc_hss_private_to_bytes_with_cache(
         let st = unsafe { out_write(&ser, out, out_len) };
         wipe_vec(&mut ser);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the raw HSS public key (self-describing).
@@ -383,13 +389,14 @@ pub unsafe extern "C" fn pc_hss_public_to_bytes(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pk = unsafe { &*k }.0.public_key();
         unsafe { out_write(pk.to_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg`, ADVANCING the handle's in-memory state. Persist via
@@ -418,7 +425,7 @@ pub unsafe extern "C" fn pc_hss_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() || out_len.is_null() {
             return PcStatus::NullPointer;
         }
@@ -446,7 +453,8 @@ pub unsafe extern "C" fn pc_hss_sign(
         };
         debug_assert_eq!(sig.len(), expected);
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an HSS signature `sig` over `msg` under the raw HSS public key.

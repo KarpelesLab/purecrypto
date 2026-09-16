@@ -6,7 +6,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 
-use super::common::{PcStatus, guard, out_write, slice};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice};
 use crate::ec::CurveId;
 use crate::x509::{AnyPublicKey, Certificate, DistinguishedName, SanIp};
 
@@ -67,13 +67,14 @@ pub unsafe extern "C" fn pc_cert_to_der(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if cert.is_null() {
             return PcStatus::NullPointer;
         }
         let der = unsafe { &*cert }.0.to_der();
         unsafe { out_write(der, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the certificate subject's public key as PKIX `SubjectPublicKeyInfo`
@@ -87,7 +88,7 @@ pub unsafe extern "C" fn pc_cert_public_key_spki(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if cert.is_null() {
             return PcStatus::NullPointer;
         }
@@ -95,7 +96,8 @@ pub unsafe extern "C" fn pc_cert_public_key_spki(
             Ok(k) => unsafe { out_write(&k.to_spki_der(), out, out_len) },
             Err(_) => PcStatus::BadEncoding,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 // --- certificate analysis (JSON summary) ----------------------------------
@@ -217,7 +219,7 @@ pub unsafe extern "C" fn pc_cert_analyze(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if cert.is_null() {
             return PcStatus::NullPointer;
         }
@@ -281,7 +283,8 @@ pub unsafe extern "C" fn pc_cert_analyze(
         );
 
         unsafe { out_write(json.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies that `cert`'s signature was produced by `issuer`'s public key.

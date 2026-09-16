@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use super::hash::id;
 use crate::bignum::Uint;
 use crate::der::{pem_decode, pem_encode};
@@ -108,7 +108,7 @@ pub unsafe extern "C" fn pc_rsa_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -118,7 +118,8 @@ pub unsafe extern "C" fn pc_rsa_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the public key as a PKIX `PUBLIC KEY` (SPKI) PEM to `out`.
@@ -131,13 +132,14 @@ pub unsafe extern "C" fn pc_rsa_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = AnyPublicKey::Rsa(unsafe { &*key }.key.public_key()).to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` with PKCS#1 v1.5 under the hash `alg` (SHA-224/256/384/512),
@@ -154,7 +156,7 @@ pub unsafe extern "C" fn pc_rsa_sign_pkcs1(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -173,7 +175,8 @@ pub unsafe extern "C" fn pc_rsa_sign_pkcs1(
             Ok(s) => unsafe { out_write(&s, out, out_len) },
             Err(_) => PcStatus::Internal,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies a PKCS#1 v1.5 signature `sig` over `msg` under the SPKI DER in
@@ -244,7 +247,7 @@ pub unsafe extern "C" fn pc_rsa_sign_pss(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -263,7 +266,8 @@ pub unsafe extern "C" fn pc_rsa_sign_pss(
             Ok(s) => unsafe { out_write(&s, out, out_len) },
             Err(_) => PcStatus::Internal,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an RSA-PSS signature `sig` over `msg` under the SPKI DER in
@@ -326,7 +330,7 @@ pub unsafe extern "C" fn pc_rsa_encrypt_oaep(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(spki), Some(lbl), Some(pt)) = (
             unsafe { slice(spki, spki_len) },
             unsafe { slice(label, label_len) },
@@ -350,7 +354,8 @@ pub unsafe extern "C" fn pc_rsa_encrypt_oaep(
             Ok(c) => unsafe { out_write(&c, out, out_len) },
             Err(_) => PcStatus::Internal,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Decrypts an RSA-OAEP ciphertext under `key`. Constant-time on
@@ -370,7 +375,7 @@ pub unsafe extern "C" fn pc_rsa_decrypt_oaep(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if key.is_null() {
             return PcStatus::NullPointer;
         }
@@ -399,5 +404,6 @@ pub unsafe extern "C" fn pc_rsa_decrypt_oaep(
             }
             Err(_) => PcStatus::Verification,
         }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }

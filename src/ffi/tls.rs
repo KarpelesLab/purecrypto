@@ -19,7 +19,7 @@ use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_array, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_array, wipe_vec};
 use crate::ec::{BoxedEcdsaPrivateKey, Ed448PrivateKey, Ed25519PrivateKey};
 use crate::rsa::BoxedRsaPrivateKey;
 use crate::tls::{
@@ -880,7 +880,7 @@ pub unsafe extern "C" fn pc_tls_pop(
     wire_out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
@@ -896,7 +896,8 @@ pub unsafe extern "C" fn pc_tls_pop(
             handle.pending_pop = Some(bytes);
         }
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Encrypts `len` application bytes for transmission. Returns
@@ -964,7 +965,7 @@ pub unsafe extern "C" fn pc_tls_recv(
     app_out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
@@ -989,7 +990,8 @@ pub unsafe extern "C" fn pc_tls_recv(
             handle.pending_recv = Some(bytes);
         }
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Returns 1 once the peer's close_notify alert has been processed, 0
@@ -1065,6 +1067,7 @@ pub unsafe extern "C" fn pc_tls_negotiated_version(tls: *const PcTls, out: *mut 
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *out = 0 };
         let v = unsafe { &*tls }
             .inner
             .negotiated_version()
@@ -1095,6 +1098,7 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite(
         if tls.is_null() || out.is_null() {
             return PcStatus::NullPointer;
         }
+        unsafe { *out = 0 };
         let v = unsafe { &*tls }
             .inner
             .negotiated_cipher_suite()
@@ -1118,7 +1122,7 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite_name(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1128,7 +1132,8 @@ pub unsafe extern "C" fn pc_tls_negotiated_cipher_suite_name(
             .map(str::as_bytes)
             .unwrap_or(&[]);
         unsafe { out_write(name, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Server-side: writes the SNI host_name the client offered in its
@@ -1145,7 +1150,7 @@ pub unsafe extern "C" fn pc_tls_peer_server_name(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1155,7 +1160,8 @@ pub unsafe extern "C" fn pc_tls_peer_server_name(
             .map(str::as_bytes)
             .unwrap_or(&[]);
         unsafe { out_write(name, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the negotiated ALPN protocol bytes (if any) to `out`. With no ALPN
@@ -1169,13 +1175,14 @@ pub unsafe extern "C" fn pc_tls_alpn_selected(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
         let alpn: &[u8] = unsafe { &*tls }.inner.alpn_selected().unwrap_or(&[]);
         unsafe { out_write(alpn, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Writes the peer's leaf certificate DER to `out`, or
@@ -1189,7 +1196,7 @@ pub unsafe extern "C" fn pc_tls_peer_certificate(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if tls.is_null() {
             return PcStatus::NullPointer;
         }
@@ -1198,7 +1205,8 @@ pub unsafe extern "C" fn pc_tls_peer_certificate(
             return PcStatus::BadEncoding;
         };
         unsafe { out_write(leaf, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Queues a close_notify (TLS; DTLS engines exchange none) and marks the
@@ -1223,7 +1231,8 @@ pub unsafe extern "C" fn pc_tls_close(tls: *mut PcTls) -> PcStatus {
 
 /// DTLS: returns the next retransmission timeout in `(seconds, nanos)`, with
 /// `has_timeout` set to 1 if a timeout is currently scheduled and 0
-/// otherwise. Returns [`PcStatus::Unsupported`] for TLS connections.
+/// otherwise. Returns [`PcStatus::Unsupported`] for TLS connections (all
+/// three outputs are then 0).
 ///
 /// # Safety
 /// All pointers valid.
@@ -1237,6 +1246,11 @@ pub unsafe extern "C" fn pc_dtls_next_timeout(
     guard(|| {
         if tls.is_null() || seconds_out.is_null() || nanos_out.is_null() || has_timeout.is_null() {
             return PcStatus::NullPointer;
+        }
+        unsafe {
+            *seconds_out = 0;
+            *nanos_out = 0;
+            *has_timeout = 0;
         }
         let conn = unsafe { &*tls };
         let v = conn.inner.negotiated_version();

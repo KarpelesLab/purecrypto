@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::rng::OsRng;
 use crate::slhdsa::{ParamSet, PrivateKey};
 use crate::x509::AnyPublicKey;
@@ -88,7 +88,7 @@ pub unsafe extern "C" fn pc_slhdsa_private_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -98,7 +98,8 @@ pub unsafe extern "C" fn pc_slhdsa_private_to_pem(
         let st = unsafe { out_write(&pem, out, out_len) };
         wipe_vec(&mut pem);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// PKIX SPKI PEM for the public verification key.
@@ -111,13 +112,14 @@ pub unsafe extern "C" fn pc_slhdsa_public_to_pem(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
         let pem = unsafe { &*k }.0.public_key().to_spki_pem();
         unsafe { out_write(pem.as_bytes(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Signs `msg` (hedged via OsRng), writing the signature to `out`.
@@ -132,7 +134,7 @@ pub unsafe extern "C" fn pc_slhdsa_sign(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if k.is_null() {
             return PcStatus::NullPointer;
         }
@@ -144,7 +146,8 @@ pub unsafe extern "C" fn pc_slhdsa_sign(
             Err(_) => return PcStatus::Internal,
         };
         unsafe { out_write(&sig, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Verifies an SLH-DSA signature `sig` over `msg` under the SPKI DER in `spki`.

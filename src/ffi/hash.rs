@@ -3,7 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, slice_mut};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, slice_mut};
 use crate::ascon::{AsconCxof128, AsconHash256, AsconXof128};
 use crate::hash::{
     Digest, ExtendableOutput, HashAlgorithm, Hasher, Hmac, HmacSha224, HmacSha256, HmacSha384,
@@ -119,7 +119,7 @@ pub unsafe extern "C" fn pc_digest(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let Some(input) = (unsafe { slice(data, data_len) }) else {
             return PcStatus::NullPointer;
         };
@@ -128,7 +128,8 @@ pub unsafe extern "C" fn pc_digest(
         };
         h.update(input);
         unsafe { out_write(&h.finish(), out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Creates a streaming hash context for `alg`, or NULL if `alg` is unknown.
@@ -170,13 +171,14 @@ pub unsafe extern "C" fn pc_hash_finish(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         if h.is_null() {
             return PcStatus::NullPointer;
         }
         let digest = unsafe { &*h }.0.finish();
         unsafe { out_write(&digest, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Frees a hash context. NULL is ignored.
@@ -207,7 +209,7 @@ pub unsafe extern "C" fn pc_hmac(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(m)) = (unsafe { slice(key, key_len) }, unsafe {
             slice(msg, msg_len)
         }) else {
@@ -234,7 +236,8 @@ pub unsafe extern "C" fn pc_hmac(
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Ascon-XOF128 (NIST SP 800-232 §5.2): squeezes exactly `out_len` bytes of

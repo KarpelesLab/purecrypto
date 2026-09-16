@@ -2194,3 +2194,139 @@ fn quic_send_paths_after_local_close_report_closed() {
         quic::pc_quic_free(server);
     }
 }
+
+// ---- Out-parameters are defined on every return path ----------------------
+
+/// `pc_quic_stream_read` used to return `Internal` for an unknown stream
+/// without touching `*out_len` / `*fin_seen`, so a C caller that trusted the
+/// documented "bytes copied" meaning read whatever was in the variables. Both
+/// are now defined on every path (the size-capped `BufferTooSmall` included).
+#[test]
+fn quic_stream_read_defines_out_params_on_error() {
+    use core::ffi::c_char;
+    let cfg = quic::pc_quic_cfg_new(0);
+    assert!(!cfg.is_null());
+    let sni = b"loopback.example\0";
+    assert_eq!(
+        unsafe { quic::pc_quic_cfg_set_server_name(cfg, sni.as_ptr() as *const c_char) },
+        PcStatus::Ok
+    );
+    let _ = unsafe { quic::pc_quic_cfg_set_verify_certificates(cfg, 0) };
+    set_test_alpn(cfg);
+    let q = unsafe { quic::pc_quic_new(cfg) };
+    unsafe { quic::pc_quic_cfg_free(cfg) };
+    assert!(!q.is_null());
+
+    // Unknown stream (no handshake, no streams): Internal, both zeroed.
+    let mut buf = [0u8; 16];
+    let mut out_len = buf.len();
+    let mut fin = 7i32;
+    let st = unsafe { quic::pc_quic_stream_read(q, 4, buf.as_mut_ptr(), &mut out_len, &mut fin) };
+    assert_eq!(st, PcStatus::Internal);
+    assert_eq!(out_len, 0, "*out_len must be 0, not the capacity passed in");
+    assert_eq!(fin, 0);
+
+    // Oversized capacity: BufferTooSmall reports the ceiling, fin is 0.
+    let mut out_len = usize::MAX;
+    let mut fin = 7i32;
+    let st =
+        unsafe { quic::pc_quic_stream_read(q, 4, core::ptr::null_mut(), &mut out_len, &mut fin) };
+    assert_eq!(st, PcStatus::BufferTooSmall);
+    assert_eq!(out_len, 1 << 20);
+    assert_eq!(fin, 0);
+
+    // Non-zero capacity with a NULL buffer: NullPointer, both zeroed.
+    let mut out_len = 16usize;
+    let mut fin = 7i32;
+    let st =
+        unsafe { quic::pc_quic_stream_read(q, 4, core::ptr::null_mut(), &mut out_len, &mut fin) };
+    assert_eq!(st, PcStatus::NullPointer);
+    assert_eq!(out_len, 0);
+    assert_eq!(fin, 0);
+
+    // The scalar out-parameters of the other query calls follow suit.
+    let mut written = 9usize;
+    let st = unsafe { quic::pc_quic_stream_write(q, 4, buf.as_ptr(), 4, &mut written) };
+    assert_eq!(st, PcStatus::Internal);
+    assert_eq!(written, 0);
+    let mut cap = 9usize;
+    assert_eq!(
+        unsafe { quic::pc_quic_stream_send_capacity(q, 4, &mut cap) },
+        PcStatus::Internal
+    );
+    assert_eq!(cap, 0);
+    let (mut code, mut initiator, mut is_app, mut rlen) = (9u64, 9i32, 9i32, 9usize);
+    let st = unsafe {
+        quic::pc_quic_close_info(
+            q,
+            &mut code,
+            &mut initiator,
+            &mut is_app,
+            core::ptr::null_mut(),
+            &mut rlen,
+        )
+    };
+    assert_eq!(st, PcStatus::WantRead);
+    assert_eq!((code, initiator, is_app, rlen), (0, 0, 0, 0));
+    // No peer certificate yet: BadEncoding, length zeroed.
+    let mut len = 64usize;
+    assert_eq!(
+        unsafe { quic::pc_quic_peer_certificate(q, core::ptr::null_mut(), &mut len) },
+        PcStatus::BadEncoding
+    );
+    assert_eq!(len, 0);
+
+    unsafe { quic::pc_quic_free(q) };
+}
+
+/// The in/out length convention across the rest of the ABI: on any status
+/// other than `Ok` / `BufferTooSmall`, `*out_len` is 0 rather than the
+/// capacity the caller passed in.
+#[test]
+fn out_len_is_zeroed_on_error_paths() {
+    // Unsupported algorithm id.
+    let mut out = [0u8; 64];
+    let mut len = out.len();
+    let st = unsafe { hash::pc_digest(0x7fff_ffff, b"x".as_ptr(), 1, out.as_mut_ptr(), &mut len) };
+    assert_eq!(st, PcStatus::Unsupported);
+    assert_eq!(len, 0);
+
+    // NULL handle.
+    let mut len = out.len();
+    let st = unsafe {
+        ec::pc_ec_sign(
+            core::ptr::null(),
+            b"m".as_ptr(),
+            1,
+            out.as_mut_ptr(),
+            &mut len,
+        )
+    };
+    assert_eq!(st, PcStatus::NullPointer);
+    assert_eq!(len, 0);
+
+    // A TLS handle before any handshake: no peer certificate, no timeout.
+    let ccfg = tls::pc_tls_cfg_new(0, 0x0304);
+    assert!(!ccfg.is_null());
+    let sni = b"loopback.example\0";
+    assert_eq!(
+        unsafe { tls::pc_tls_cfg_set_server_name(ccfg, sni.as_ptr() as *const core::ffi::c_char) },
+        PcStatus::Ok
+    );
+    let client = unsafe { tls::pc_tls_new(ccfg) };
+    unsafe { tls::pc_tls_cfg_free(ccfg) };
+    assert!(!client.is_null());
+    let mut len = out.len();
+    assert_eq!(
+        unsafe { tls::pc_tls_peer_certificate(client, out.as_mut_ptr(), &mut len) },
+        PcStatus::BadEncoding
+    );
+    assert_eq!(len, 0);
+    let (mut s, mut ns, mut has) = (9u64, 9u32, 9i32);
+    assert_eq!(
+        unsafe { tls::pc_dtls_next_timeout(client, &mut s, &mut ns, &mut has) },
+        PcStatus::Unsupported
+    );
+    assert_eq!((s, ns, has), (0, 0, 0));
+    unsafe { tls::pc_tls_free(client) };
+}

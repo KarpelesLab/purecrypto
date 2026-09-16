@@ -4,7 +4,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::common::{PcStatus, guard, out_write, slice, wipe_vec};
+use super::common::{PcStatus, guard, out_write, settle_out_len, slice, wipe_vec};
 use crate::ascon::AsconAead128;
 use crate::cipher::{
     AeadError, Aegis128L, Aegis256, Aes128, Aes128Ccm, Aes128Ccm8, Aes128Gcm, Aes128Kw, Aes128Kwp,
@@ -170,7 +170,7 @@ pub unsafe extern "C" fn pc_aead_encrypt(
     ct_and_tag: *mut u8,
     ct_and_tag_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let Some(expected_key) = aead_key_size(alg) else {
             return PcStatus::Unsupported;
         };
@@ -317,7 +317,8 @@ pub unsafe extern "C" fn pc_aead_encrypt(
         debug_assert_eq!(tag.len(), tag_size);
         buf.extend_from_slice(&tag);
         unsafe { out_write(buf, ct_and_tag, ct_and_tag_len) }
-    })
+    });
+    unsafe { settle_out_len(ct_and_tag_len, st) }
 }
 
 /// One-shot AEAD decrypt with tag verification. On success, `*pt_len` is set
@@ -342,7 +343,7 @@ pub unsafe extern "C" fn pc_aead_decrypt(
     pt: *mut u8,
     pt_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let Some(expected_key) = aead_key_size(alg) else {
             return PcStatus::Unsupported;
         };
@@ -516,7 +517,8 @@ pub unsafe extern "C" fn pc_aead_decrypt(
         // pc_rsa_decrypt_oaep).
         wipe_vec(&mut buf);
         st
-    })
+    });
+    unsafe { settle_out_len(pt_len, st) }
 }
 
 /// AES key wrap (RFC 3394). `key_len` must be a multiple of 8 and ≥ 16.
@@ -534,7 +536,7 @@ pub unsafe extern "C" fn pc_aes_kw_wrap(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(pt)) = (unsafe { slice(kek, kek_len) }, unsafe {
             slice(key, key_len)
         }) else {
@@ -556,7 +558,8 @@ pub unsafe extern "C" fn pc_aes_kw_wrap(
             return PcStatus::BadEncoding;
         }
         unsafe { out_write(&wrapped, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// AES key unwrap (RFC 3394). Verifies the integrity IV.
@@ -572,7 +575,7 @@ pub unsafe extern "C" fn pc_aes_kw_unwrap(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(c)) = (unsafe { slice(kek, kek_len) }, unsafe { slice(ct, ct_len) })
         else {
             return PcStatus::NullPointer;
@@ -602,7 +605,8 @@ pub unsafe extern "C" fn pc_aes_kw_unwrap(
         // returned to the allocator.
         wipe_vec(&mut plain);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// AES key wrap with padding (RFC 5649).
@@ -618,7 +622,7 @@ pub unsafe extern "C" fn pc_aes_kwp_wrap(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(pt)) = (unsafe { slice(kek, kek_len) }, unsafe {
             slice(key, key_len)
         }) else {
@@ -641,7 +645,8 @@ pub unsafe extern "C" fn pc_aes_kwp_wrap(
             return PcStatus::BadEncoding;
         }
         unsafe { out_write(&wrapped, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// AES key unwrap with padding (RFC 5649). Recovers the original plaintext
@@ -658,7 +663,7 @@ pub unsafe extern "C" fn pc_aes_kwp_unwrap(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(c)) = (unsafe { slice(kek, kek_len) }, unsafe { slice(ct, ct_len) })
         else {
             return PcStatus::NullPointer;
@@ -694,7 +699,8 @@ pub unsafe extern "C" fn pc_aes_kwp_unwrap(
         // before its backing storage is returned to the allocator.
         wipe_vec(&mut plain);
         st
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Computes the AES-CMAC tag (RFC 4493 / NIST SP 800-38B) of `msg` under `key`,
@@ -712,7 +718,7 @@ pub unsafe extern "C" fn pc_cmac(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(m)) = (unsafe { slice(key, key_len) }, unsafe {
             slice(msg, msg_len)
         }) else {
@@ -734,7 +740,8 @@ pub unsafe extern "C" fn pc_cmac(
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
 
 /// Computes the GMAC tag (NIST SP 800-38D) of `data` under `key` with the
@@ -755,7 +762,7 @@ pub unsafe extern "C" fn pc_gmac(
     out: *mut u8,
     out_len: *mut usize,
 ) -> PcStatus {
-    guard(|| {
+    let st = guard(|| {
         let (Some(k), Some(n), Some(m)) = (
             unsafe { slice(key, key_len) },
             unsafe { slice(nonce, nonce_len) },
@@ -783,5 +790,6 @@ pub unsafe extern "C" fn pc_gmac(
             _ => return PcStatus::Unsupported,
         };
         unsafe { out_write(&tag, out, out_len) }
-    })
+    });
+    unsafe { settle_out_len(out_len, st) }
 }
