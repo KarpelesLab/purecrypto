@@ -153,6 +153,10 @@ impl<'a> Parser<'a> {
         // `current` is the path of the table currently receiving bare-key/value
         // pairs (empty == root).
         let mut current_path: Vec<String> = Vec::new();
+        // TOML forbids defining a table twice: a repeated `[a]` header
+        // would silently merge (or overwrite) keys, so a template with two
+        // `[key_usage]` sections could end up with a union nobody wrote.
+        let mut seen_headers: Vec<Vec<String>> = Vec::new();
 
         loop {
             self.skip_blank();
@@ -162,6 +166,13 @@ impl<'a> Parser<'a> {
             if self.peek() == Some(b'[') {
                 // [section.sub] header
                 current_path = self.parse_header()?;
+                if seen_headers.contains(&current_path) {
+                    return self.err(format!(
+                        "table `{}` is defined more than once",
+                        current_path.join(".")
+                    ));
+                }
+                seen_headers.push(current_path.clone());
                 // Pre-create the table.
                 ensure_table_path(&mut root, &current_path)?;
                 self.expect_eol()?;
@@ -285,6 +296,16 @@ impl<'a> Parser<'a> {
                         }
                         Some(b'\\') => {
                             out.push('\\');
+                            self.pos += 1;
+                        }
+                        // TOML v1.0 §String: `\b` (U+0008) and `\f` (U+000C)
+                        // are valid escapes alongside `\t` / `\n` / `\r`.
+                        Some(b'b') => {
+                            out.push('\u{0008}');
+                            self.pos += 1;
+                        }
+                        Some(b'f') => {
+                            out.push('\u{000c}');
                             self.pos += 1;
                         }
                         Some(b'x') => {
@@ -636,6 +657,25 @@ mod tests {
     fn parses_empty_document() {
         let r = t("");
         assert!(r.is_empty());
+    }
+
+    /// `\b` and `\f` are valid TOML basic-string escapes (they used to be
+    /// rejected as "unknown escape").
+    #[test]
+    fn backspace_and_formfeed_escapes() {
+        let r = t(r#"s = "a\bb\fc""#);
+        assert_eq!(r["s"].as_str(), Some("a\u{8}b\u{c}c"));
+    }
+
+    /// A table header may appear only once; a repeat used to merge silently.
+    #[test]
+    fn duplicate_table_header_is_an_error() {
+        let err = parse("[a]\nx = 1\n[a]\ny = 2\n").unwrap_err();
+        assert!(err.message.contains("defined more than once"), "{err}");
+        assert_eq!(err.line, 3);
+        // Distinct sub-tables and a super-table defined after its child are
+        // still fine.
+        assert!(parse("[a.b]\nx = 1\n[a]\ny = 2\n").is_ok());
     }
 
     #[test]

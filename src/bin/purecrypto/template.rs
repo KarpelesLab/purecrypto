@@ -573,69 +573,16 @@ fn parse_san(tbl: &TomlTable) -> Result<(bool, Vec<GeneralName>), TemplateError>
     Ok((from_csr, out))
 }
 
+/// Parses an IP literal with the standard library's strict parsers. The
+/// hand-rolled ones they replace accepted `+1.2.3.4` (via `u8::from_str`)
+/// and `1:2:3:4:5:6:7:8::` / `1:+2::3`, and rejected the RFC 4291 embedded
+/// IPv4 form `::ffff:1.2.3.4`.
 fn parse_ip(s: &str) -> Result<GeneralName, TemplateError> {
-    if let Some(v4) = parse_ipv4(s) {
-        return Ok(GeneralName::IpV4(v4));
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => Ok(GeneralName::IpV4(v4.octets())),
+        Ok(std::net::IpAddr::V6(v6)) => Ok(GeneralName::IpV6(v6.octets())),
+        Err(_) => bad("subject_alt_name.ip", &format!("invalid IP literal `{s}`")),
     }
-    if let Some(v6) = parse_ipv6(s) {
-        return Ok(GeneralName::IpV6(v6));
-    }
-    bad("subject_alt_name.ip", &format!("invalid IP literal `{s}`"))
-}
-
-fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
-    let mut out = [0u8; 4];
-    for (i, p) in parts.iter().enumerate() {
-        out[i] = p.parse().ok()?;
-    }
-    Some(out)
-}
-
-fn parse_ipv6(s: &str) -> Option<[u8; 16]> {
-    // Minimal IPv6 parser: supports `::` and hex groups, no embedded IPv4.
-    let (head, tail) = match s.find("::") {
-        Some(i) => (&s[..i], &s[i + 2..]),
-        None => (s, ""),
-    };
-    let head_groups: Vec<&str> = if head.is_empty() {
-        Vec::new()
-    } else {
-        head.split(':').collect()
-    };
-    let tail_groups: Vec<&str> = if tail.is_empty() {
-        Vec::new()
-    } else {
-        tail.split(':').collect()
-    };
-    if s.contains("::") {
-        if head_groups.len() + tail_groups.len() > 8 {
-            return None;
-        }
-    } else if head_groups.len() != 8 {
-        return None;
-    }
-    let mut full: Vec<u16> = Vec::with_capacity(8);
-    for g in &head_groups {
-        full.push(u16::from_str_radix(g, 16).ok()?);
-    }
-    let zeros = 8 - head_groups.len() - tail_groups.len();
-    full.resize(full.len() + zeros, 0);
-    for g in &tail_groups {
-        full.push(u16::from_str_radix(g, 16).ok()?);
-    }
-    if full.len() != 8 {
-        return None;
-    }
-    let mut out = [0u8; 16];
-    for (i, w) in full.iter().enumerate() {
-        out[2 * i] = (w >> 8) as u8;
-        out[2 * i + 1] = (w & 0xff) as u8;
-    }
-    Some(out)
 }
 
 fn parse_name_constraints(
